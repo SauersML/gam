@@ -100,11 +100,19 @@ impl SymmetricMatrix {
     /// No LDLT/LBLT route and no diagonal jitter is admitted: dense matrices
     /// must pass an unperturbed Cholesky factorization, while sparse matrices
     /// use the existing exact sparse-SPD factorization.
-    pub fn factorize_spd(&self) -> Result<Box<dyn FactorizedSystem>, String> {
+    ///
+    /// `assembly` declares how a dense matrix was built, which fixes the
+    /// symmetry band [`crate::utils::validate_finite_symmetric_matrix`]
+    /// enforces; a sparse matrix stores one triangle and needs no band.
+    pub fn factorize_spd(
+        &self,
+        assembly: crate::roundoff::SymmetricAssembly,
+    ) -> Result<Box<dyn FactorizedSystem>, String> {
         match self {
             Self::Dense(matrix) => {
                 crate::utils::validate_finite_symmetric_matrix(
                     matrix,
+                    assembly,
                     "Dense SymmetricMatrix strict SPD factorization",
                 )
                 .map_err(|error| error.to_string())?;
@@ -526,7 +534,8 @@ pub(crate) fn xt_diag_x_symmetric(
             // same at every pool width. (Chunks sized from the pool width made
             // them follow `RAYON_NUM_THREADS`.)
             let avg_row_nnz = vals.len().checked_div(n).unwrap_or(0);
-            let min_parallel_work = super::SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
+            let min_parallel_work =
+                super::SPARSE_ROW_PARALLEL_MIN_FLOPS.min(usize::MAX as u64) as usize;
             let acc = match crate::parallel::row_reduction_chunk_rows(
                 n,
                 avg_row_nnz.saturating_mul(avg_row_nnz),
@@ -612,9 +621,17 @@ mod tests {
         // against the largest diagonal, gamma_(4)·1e16 exceeds the second pivot
         // 1, so the matrix was refused as numerically singular.
         let badly_scaled = SymmetricMatrix::Dense(array![[1.0e16_f64, 0.0], [0.0, 1.0]]);
-        assert!(badly_scaled.factorize_spd().is_ok());
+        assert!(
+            badly_scaled
+                .factorize_spd(crate::roundoff::SymmetricAssembly::Mirrored)
+                .is_ok()
+        );
         // Control: `dense2x2` has the exact null vector (2, -1) and stays refused.
-        assert!(dense2x2().factorize_spd().is_err());
+        assert!(
+            dense2x2()
+                .factorize_spd(crate::roundoff::SymmetricAssembly::Mirrored)
+                .is_err()
+        );
     }
 
     // ── variant dispatch ──────────────────────────────────────────────────────
@@ -887,7 +904,6 @@ mod tests {
         }
     }
 
-
     // ── symmetrization_defect_2norm (#2748) ──────────────────────────────────
 
     /// An exactly symmetric matrix has no defect: the measurement must read
@@ -987,8 +1003,7 @@ mod tests {
         let got = xt_diag_x_symmetric(&design, &w)
             .expect("xt_diag_x_symmetric should assemble X^T W X for SPD weights")
             .to_dense();
-        let wx =
-            ndarray::Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| w[i] * x[[i, j]]);
+        let wx = ndarray::Array2::from_shape_fn((x.nrows(), x.ncols()), |(i, j)| w[i] * x[[i, j]]);
         let expected = x.t().dot(&wx);
 
         let mut max_sym_err: f64 = 0.0;

@@ -6,6 +6,7 @@ use crate::faer_ndarray::{
 use crate::faer_ndarray::{FaerCholesky, FaerEigh};
 use crate::matrix::symmetrize_in_place;
 use crate::pcg::{PcgCoreResult, PcgDiagnostics, PcgStop, pcg_core};
+use crate::roundoff::{SymmetricAssembly, symmetric_assembly_band};
 use faer::Side;
 use ndarray::{
     Array1, Array2, Array3, ArrayBase, ArrayView1, ArrayView2, ArrayView3, Data, Dimension, s,
@@ -59,7 +60,8 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// (largest-admissible, hence smoothest) value gives `τ₀ = floor/ln2 ≈ 1.443e-8`,
 /// so the absolute perturbation is `P·floor` — exactly the deflation floor
 /// relative to the operator's own curvature scale.
-pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 = SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 =
+    SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
 
 /// Homogeneity-preserving smooth replacement for `prefactor · max(x, 0)` on a
 /// dimensionless `x` (`prefactor ≥ 0`), at the temperature
@@ -425,7 +427,7 @@ pub enum CertifiedSymmetricSolveError {
     },
     #[error(
         "{label}: matrix is not symmetric at ({row}, {col}): {lower:?} versus {upper:?} \
-         (defect {defect:.3e} exceeds {tolerance:.3e})"
+         (defect {defect:.3e} exceeds the {assembly:?} assembly band {tolerance:.3e})"
     )]
     NotSymmetric {
         label: String,
@@ -435,6 +437,17 @@ pub enum CertifiedSymmetricSolveError {
         upper: f64,
         defect: f64,
         tolerance: f64,
+        assembly: SymmetricAssembly,
+    },
+    #[error(
+        "{label}: diagonal entry {row} is {value:?}, but the matrix was declared a depth-{depth} \
+         accumulation of PSD pieces, whose diagonal is a sum of non-negative terms"
+    )]
+    NegativePsdAccumulationDiagonal {
+        label: String,
+        row: usize,
+        value: f64,
+        depth: usize,
     },
     #[error("{label}: unperturbed symmetric factorization failed: {reason}")]
     Factorization { label: String, reason: String },
@@ -466,27 +479,22 @@ pub enum CertifiedSymmetricSolveError {
     },
 }
 
-const SYMMETRY_ULP_ALLOWANCE: f64 = 32.0;
 const SOLVE_ROUNDOFF_OPS_PER_DIMENSION: f64 = 256.0;
 
-#[inline]
-fn positive_ulp(value: f64) -> f64 {
-    assert!(value.is_finite() && value >= 0.0);
-    if value == 0.0 {
-        return f64::from_bits(1);
-    }
-    let next = f64::from_bits(value.to_bits() + 1);
-    if next.is_finite() {
-        next - value
-    } else {
-        value - f64::from_bits(value.to_bits() - 1)
-    }
-}
-
-/// Validate a non-empty finite square matrix and reject material asymmetry with
-/// a pairwise ULP-scaled test. Returns its exact max-entry norm.
+/// Validate a non-empty finite square matrix and refuse any disagreement
+/// between its triangles larger than the band its declared `assembly` can
+/// produce ([`crate::roundoff::symmetric_assembly_band`], #4350). Returns its
+/// exact max-entry norm.
+///
+/// The band is derived, per entry, from how the matrix was assembled, which
+/// only the caller can see: exactly zero for a mirrored matrix, and
+/// `2γ_d·√(A_ii·A_jj)/(1 − γ_d)` for a depth-`d` accumulation of PSD pieces.
+/// A PSD accumulation cannot produce a negative diagonal entry — a sum of
+/// non-negative floating-point terms is non-negative — so one is refused as a
+/// contradiction of the declared provenance rather than scored against it.
 pub fn validate_finite_symmetric_matrix(
     matrix: &Array2<f64>,
+    assembly: SymmetricAssembly,
     label: &str,
 ) -> Result<f64, CertifiedSymmetricSolveError> {
     let (rows, cols) = matrix.dim();
@@ -509,49 +517,29 @@ pub fn validate_finite_symmetric_matrix(
         }
         matrix_max_abs = matrix_max_abs.max(value.abs());
     }
+    if let SymmetricAssembly::PsdAccumulation { depth } = assembly
+        && let Some((row, &value)) = matrix
+            .diag()
+            .iter()
+            .enumerate()
+            .find(|(_, value)| **value < 0.0)
+    {
+        return Err(
+            CertifiedSymmetricSolveError::NegativePsdAccumulationDiagonal {
+                label: label.to_string(),
+                row,
+                value,
+                depth,
+            },
+        );
+    }
     for row in 0..rows {
         for col in 0..row {
             let lower = matrix[[row, col]];
             let upper = matrix[[col, row]];
             let defect = (lower - upper).abs();
-            // Scale the allowance to the magnitude the entry's ACCUMULATION ran
-            // at, not to the magnitude that survived it.
-            //
-            // The two triangles of an assembled symmetric matrix
-            // (`XᵀWX + S_λ + ridge·I`) are separate inner products whenever the
-            // Gram is built by a full GEMM instead of a mirrored triangular
-            // update — `CrossprodStructure::{Full, SymmetricLower}`, which that
-            // enum documents as producing identical output. Summation order
-            // therefore differs between `A[i,j]` and `A[j,i]`, and the resulting
-            // difference is bounded by `Σ_k |X_ki W_k X_kj|`, i.e. by the scale
-            // of the terms being summed. It is NOT bounded by `|A_ij|`, which is
-            // free to cancel to nothing.
-            //
-            // Scoring the defect against `ulp(|A_ij|)` alone therefore demands
-            // the most precision from exactly the entries carrying the least
-            // information. Measured on this crate's own failing fits: an entry
-            // that cancelled to `2.06e-11` inside a Hessian whose diagonal at
-            // those rows is `94.8` and `125.3` was asked to agree to `1.03e-25`
-            // — about 38 significant digits, unreachable in binary64 by any
-            // assembly whatsoever. That bound is unsatisfiable, not strict.
-            //
-            // Cauchy–Schwarz supplies the honest scale: `|A_ij| ≤ √(A_ii·A_jj)`
-            // is the largest this entry could legitimately have been, and it is
-            // the scale its accumulation actually ran at. Using it keeps the
-            // test scale-COVARIANT (`A ↦ cA` scales the bound by `c`, so the
-            // verdict is invariant under uniform rescaling) and LOCAL to the
-            // `(i, j)` block rather than a global matrix norm, so a well-scaled
-            // block inside a badly-scaled matrix still gets a tight bound.
-            //
-            // `pair_scale` stays in the maximum: this validator also admits
-            // indefinite symmetric systems, where the diagonal can vanish while
-            // the off-diagonal does not, and Cauchy–Schwarz does not apply.
-            // Each factor is square-rooted before multiplying so a large finite
-            // diagonal cannot overflow the product.
-            let pair_scale = lower.abs().max(upper.abs());
-            let gram_scale =
-                (matrix[[row, row]].abs().sqrt() * matrix[[col, col]].abs().sqrt()).min(f64::MAX);
-            let tolerance = SYMMETRY_ULP_ALLOWANCE * positive_ulp(pair_scale.max(gram_scale));
+            let tolerance =
+                symmetric_assembly_band(assembly, matrix[[row, row]], matrix[[col, col]]);
             if defect > tolerance {
                 return Err(CertifiedSymmetricSolveError::NotSymmetric {
                     label: label.to_string(),
@@ -561,6 +549,7 @@ pub fn validate_finite_symmetric_matrix(
                     upper,
                     defect,
                     tolerance,
+                    assembly,
                 });
             }
         }
@@ -720,10 +709,11 @@ pub fn certify_linear_system_residual(
 
 fn certified_symmetric_matrix_solve(
     matrix: &Array2<f64>,
+    assembly: SymmetricAssembly,
     rhs: &Array2<f64>,
     label: &str,
 ) -> Result<(Array2<f64>, SymmetricSolveCertificate), CertifiedSymmetricSolveError> {
-    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, label)?;
+    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, assembly, label)?;
     if rhs.nrows() != matrix.nrows() {
         return Err(CertifiedSymmetricSolveError::InvalidRhsShape {
             label: label.to_string(),
@@ -758,15 +748,18 @@ fn certified_symmetric_matrix_solve(
 /// Solve `matrix * x = rhs` without adding a ridge, dropping a rank, or
 /// changing the supplied estimand.  Singular and numerically unrepresentable
 /// systems are errors; success carries an a posteriori backward-error proof.
+/// `assembly` declares how `matrix` was built, which fixes the symmetry band
+/// [`validate_finite_symmetric_matrix`] enforces.
 pub fn certified_symmetric_solve(
     matrix: &Array2<f64>,
+    assembly: SymmetricAssembly,
     rhs: &Array1<f64>,
     label: &str,
 ) -> Result<CertifiedSymmetricSolution, CertifiedSymmetricSolveError> {
     let mut rhs_matrix = Array2::<f64>::zeros((rhs.len(), 1));
     rhs_matrix.column_mut(0).assign(rhs);
     let (solution_matrix, certificate) =
-        certified_symmetric_matrix_solve(matrix, &rhs_matrix, label)?;
+        certified_symmetric_matrix_solve(matrix, assembly, &rhs_matrix, label)?;
     Ok(CertifiedSymmetricSolution {
         solution: solution_matrix.column(0).to_owned(),
         certificate,
@@ -775,11 +768,14 @@ pub fn certified_symmetric_solve(
 
 /// Strictly factor a finite symmetric positive-definite matrix without
 /// diagonal jitter, spectral repair, or an indefinite LDLT/LBLT route.
+/// `assembly` declares how `matrix` was built, which fixes the symmetry band
+/// [`validate_finite_symmetric_matrix`] enforces.
 pub fn certified_spd_factorize<'a>(
     matrix: &'a Array2<f64>,
+    assembly: SymmetricAssembly,
     label: &str,
 ) -> Result<CertifiedSpdFactor<'a>, CertifiedSymmetricSolveError> {
-    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, label)?;
+    let matrix_max_abs = validate_finite_symmetric_matrix(matrix, assembly, label)?;
     let factor = matrix.cholesky(Side::Lower).map_err(|error| {
         CertifiedSymmetricSolveError::NotPositiveDefinite {
             label: label.to_string(),
@@ -804,9 +800,10 @@ pub fn certified_spd_factorize<'a>(
 /// LDLT/LBLT factorization that could bless an indefinite covariance.
 pub fn certified_spd_inverse(
     matrix: &Array2<f64>,
+    assembly: SymmetricAssembly,
     label: &str,
 ) -> Result<CertifiedSpdInverse, CertifiedSymmetricSolveError> {
-    certified_spd_factorize(matrix, label)?.inverse()
+    certified_spd_factorize(matrix, assembly, label)?.inverse()
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1415,7 +1412,6 @@ impl RankCertifiedPsdPseudoinverse {
     pub fn into_pseudoinverse(self) -> Array2<f64> {
         self.pseudoinverse
     }
-
 }
 
 /// Compute a declared rank-truncated PSD pseudoinverse from one strict,
@@ -1426,8 +1422,11 @@ impl RankCertifiedPsdPseudoinverse {
 /// space. A negative eigenvalue is admitted only within the dimension-scaled
 /// eigensolver roundoff bound; material indefiniteness is an error. No absolute
 /// floor, repaired eigendecomposition, or fallback rank is hidden here.
+/// `assembly` declares how `penalty` was built, which fixes the symmetry band
+/// [`validate_finite_symmetric_matrix`] enforces before the decomposition.
 pub fn rank_certified_psd_pseudoinverse(
     penalty: &Array2<f64>,
+    assembly: SymmetricAssembly,
     relative_cutoff: f64,
 ) -> Result<RankCertifiedPsdPseudoinverse, LinalgError> {
     if !relative_cutoff.is_finite() || !(0.0..1.0).contains(&relative_cutoff) {
@@ -1435,7 +1434,7 @@ pub fn rank_certified_psd_pseudoinverse(
             "PSD pseudoinverse relative cutoff must be finite in [0, 1), got {relative_cutoff:?}"
         )));
     }
-    let (eigs, vecs) = strict_symmetric_eigh(penalty, Side::Lower)
+    let (eigs, vecs) = strict_symmetric_eigh(penalty, assembly, Side::Lower)
         .map_err(|error| LinalgError::InvalidInput(error.to_string()))?;
     let max_abs = eigs
         .iter()
@@ -1479,13 +1478,14 @@ pub fn rank_certified_psd_pseudoinverse(
 
 /// Solve a symmetric dense block system `H x = rhs` (single right-hand side)
 /// via the Cholesky-with-fallback factorization, returning the solution vector.
-/// `context` labels errors.
+/// `context` labels errors; `assembly` declares how `hessian` was built.
 pub fn solve_dense_block_system(
     hessian: &Array2<f64>,
+    assembly: SymmetricAssembly,
     rhs: &Array1<f64>,
     context: &str,
 ) -> Result<Array1<f64>, String> {
-    certified_symmetric_solve(hessian, rhs, context)
+    certified_symmetric_solve(hessian, assembly, rhs, context)
         .map(CertifiedSymmetricSolution::into_solution)
         .map_err(|error| error.to_string())
 }
@@ -1494,32 +1494,49 @@ pub fn solve_dense_block_system(
 mod certified_inverse_tests {
     use super::{
         CertifiedSymmetricSolveError, certified_spd_factorize, certified_spd_inverse,
-        certified_symmetric_solve, positive_ulp, rank_certified_psd_pseudoinverse,
+        certified_symmetric_solve, rank_certified_psd_pseudoinverse,
         validate_finite_symmetric_matrix,
     };
+    use crate::roundoff::SymmetricAssembly;
     use ndarray::array;
 
-    /// The symmetry allowance must be read at the scale the entry's
-    /// accumulation ran at (Cauchy-Schwarz, `sqrt(A_ii*A_jj)`), not at the
-    /// magnitude that survived cancellation.
+    /// The binary64 spacing just above a non-negative `value`.
+    fn positive_ulp(value: f64) -> f64 {
+        assert!(value.is_finite() && value >= 0.0);
+        if value == 0.0 {
+            return f64::from_bits(1);
+        }
+        let next = f64::from_bits(value.to_bits() + 1);
+        if next.is_finite() {
+            next - value
+        } else {
+            value - f64::from_bits(value.to_bits() - 1)
+        }
+    }
+
+    /// A depth-64 accumulation of PSD pieces: the two triangles of every
+    /// entry are separate sums of at most 64 non-negative-diagonal terms.
+    const DEPTH_64: SymmetricAssembly = SymmetricAssembly::PsdAccumulation { depth: 64 };
+
+    /// The symmetry band must be read at the scale the entry's accumulation
+    /// ran at (Cauchy-Schwarz, `sqrt(A_ii*A_jj)`), not at the magnitude that
+    /// survived cancellation.
     ///
     /// Both matrices below carry the SAME absolute defect `8.518e-15` on the
     /// same off-diagonal, and both are the real numbers measured off a failing
     /// `bc=anchored` REML fit. They differ only in the diagonal at those two
-    /// rows, and that is what decides the verdict:
+    /// rows, and that is what decides the verdict under the depth-64 band
+    /// `2γ_64·sqrt(A_ii·A_jj)/(1 − γ_64)`:
     ///
-    /// * order-100 diagonal -> the defect is 0.6 ULP of `sqrt(A_ii*A_jj)`, i.e.
-    ///   ordinary GEMM summation-order roundoff, and must be ACCEPTED. Under the
-    ///   superseded entry-relative bound this case demanded agreement to
-    ///   `1.03e-25` -- roughly 38 significant digits, which no assembly can
-    ///   reach in binary64, so the bound was unsatisfiable rather than strict;
-    /// * order-1e-11 diagonal -> the same defect is now the whole scale of the
-    ///   block and must still be REJECTED.
+    /// * order-100 diagonal -> band `1.55e-12`, so the defect is ordinary
+    ///   summation-order roundoff and must be ACCEPTED;
+    /// * order-1e-11 diagonal -> band `3.5e-25`, so the same defect is the
+    ///   whole scale of the block and must be REJECTED.
     ///
-    /// The pair is what pins LOCALITY: a bound taken against the global matrix
-    /// norm would accept both, and the entry-relative bound rejects both.
+    /// The pair pins LOCALITY: a band taken against the global matrix norm
+    /// would accept both, and one taken against `|A_ij|` would reject both.
     #[test]
-    fn symmetry_allowance_follows_the_block_scale_not_the_cancelled_entry() {
+    fn symmetry_band_follows_the_block_scale_not_the_cancelled_entry() {
         let lower = 2.062188620938984e-11_f64;
         let upper = 2.0613368342631325e-11_f64;
         let defect = (lower - upper).abs();
@@ -1533,8 +1550,8 @@ mod certified_inverse_tests {
             [lower, 1.253071e2, 0.0],
             [0.0, 0.0, 1.0]
         ];
-        validate_finite_symmetric_matrix(&accumulated_at_order_100, "order-100 block")
-            .expect("roundoff below one ULP of the block's own Cauchy-Schwarz scale is symmetric");
+        validate_finite_symmetric_matrix(&accumulated_at_order_100, DEPTH_64, "order-100 block")
+            .expect("roundoff inside the block's own depth-64 band is symmetric");
 
         let accumulated_at_the_defect_scale = array![
             [2.0e-11, upper, 0.0],
@@ -1545,6 +1562,7 @@ mod certified_inverse_tests {
             matches!(
                 validate_finite_symmetric_matrix(
                     &accumulated_at_the_defect_scale,
+                    DEPTH_64,
                     "defect-scale block"
                 ),
                 Err(CertifiedSymmetricSolveError::NotSymmetric { row: 1, col: 0, .. })
@@ -1554,9 +1572,9 @@ mod certified_inverse_tests {
     }
 
     /// The verdict must not depend on the units the matrix is expressed in.
-    /// Every term in the bound is homogeneous of degree one in the matrix, so
-    /// scaling by any exact power of two -- across 400 binades, well past where
-    /// an absolute floor would take over -- must leave both verdicts fixed.
+    /// The band is homogeneous of degree one in the matrix, so scaling by any
+    /// exact power of two -- across 400 binades -- must leave both verdicts
+    /// fixed.
     #[test]
     fn symmetry_verdict_is_invariant_under_uniform_rescaling() {
         let benign = array![
@@ -1566,12 +1584,17 @@ mod certified_inverse_tests {
         let asymmetric = array![[2.0, 0.25], [0.5, 2.0]];
         for exponent in [-200_i32, -37, 0, 37, 200] {
             let scale = 2.0_f64.powi(exponent);
-            validate_finite_symmetric_matrix(&(&benign * scale), "rescaled benign").unwrap_or_else(
-                |error| panic!("benign roundoff rejected at 2^{exponent}: {error}"),
-            );
+            validate_finite_symmetric_matrix(&(&benign * scale), DEPTH_64, "rescaled benign")
+                .unwrap_or_else(|error| {
+                    panic!("benign roundoff rejected at 2^{exponent}: {error}")
+                });
             assert!(
                 matches!(
-                    validate_finite_symmetric_matrix(&(&asymmetric * scale), "rescaled asymmetric"),
+                    validate_finite_symmetric_matrix(
+                        &(&asymmetric * scale),
+                        DEPTH_64,
+                        "rescaled asymmetric"
+                    ),
                     Err(CertifiedSymmetricSolveError::NotSymmetric { .. })
                 ),
                 "genuine asymmetry accepted at 2^{exponent}"
@@ -1579,26 +1602,73 @@ mod certified_inverse_tests {
         }
     }
 
-    /// Cauchy-Schwarz does not apply to the indefinite systems this validator
-    /// also admits, so the entry's own magnitude has to stay in the maximum:
-    /// a hollow symmetric matrix has a zero diagonal and a non-zero
-    /// off-diagonal, and dropping `pair_scale` would score it against
-    /// `ulp(0)` and refuse every one of them.
+    /// A mirrored matrix has bitwise-equal triangles, so its band is exactly
+    /// zero: a hollow indefinite system (zero diagonal, where no
+    /// Cauchy-Schwarz scale exists) is accepted when it is exactly symmetric
+    /// and refused at a one-ULP disagreement, which a mirrored producer cannot
+    /// make.
     #[test]
-    fn hollow_indefinite_systems_keep_the_entry_relative_floor() {
-        // Four ULP of roundoff on the off-diagonal of a matrix whose diagonal
-        // is exactly zero. `sqrt(A_ii*A_jj)` is 0 here, so this is accepted
-        // only because the entry's own magnitude stays in the maximum; scoring
-        // it against `ulp(0)` would demand bit-equality and refuse every
-        // hollow system that ever saw a rounding.
-        let upper = 2.0_f64 + 4.0 * (f64::EPSILON * 2.0);
-        let hollow = array![[0.0, upper], [2.0, 0.0]];
-        assert!(
-            (upper - 2.0) > 0.0,
-            "fixture must carry a real roundoff on the off-diagonal"
+    fn mirrored_assembly_admits_exact_symmetry_only() {
+        let hollow = array![[0.0, 2.0], [2.0, 0.0]];
+        validate_finite_symmetric_matrix(&hollow, SymmetricAssembly::Mirrored, "hollow mirrored")
+            .expect("an exactly symmetric hollow system is symmetric");
+        let one_ulp_off = array![[0.0, 2.0_f64.next_up()], [2.0, 0.0]];
+        assert!(matches!(
+            validate_finite_symmetric_matrix(
+                &one_ulp_off,
+                SymmetricAssembly::Mirrored,
+                "hollow one ulp off"
+            ),
+            Err(CertifiedSymmetricSolveError::NotSymmetric { row: 1, col: 0, tolerance, .. })
+                if tolerance == 0.0
+        ));
+    }
+
+    /// The band is exactly the triangle-accumulation bound: a defect of `8u`
+    /// (u = 2^-53) on a unit-diagonal block sits just inside
+    /// `2γ_4/(1 − γ_4) > 8u` and just outside `2γ_3/(1 − γ_3) ≈ 6u`.
+    #[test]
+    fn psd_accumulation_band_is_the_depth_bound() {
+        let unit_roundoff = f64::EPSILON / 2.0;
+        let lower = 0.5 + 8.0 * unit_roundoff;
+        assert_eq!(
+            lower - 0.5,
+            8.0 * unit_roundoff,
+            "fixture offset must be exact"
         );
-        validate_finite_symmetric_matrix(&hollow, "hollow indefinite")
-            .expect("ULP-level roundoff on a zero-diagonal system is symmetric");
+        let matrix = array![[1.0, 0.5], [lower, 1.0]];
+        validate_finite_symmetric_matrix(
+            &matrix,
+            SymmetricAssembly::PsdAccumulation { depth: 4 },
+            "depth-4 block",
+        )
+        .expect("an 8u defect is inside the depth-4 band");
+        assert!(matches!(
+            validate_finite_symmetric_matrix(
+                &matrix,
+                SymmetricAssembly::PsdAccumulation { depth: 3 },
+                "depth-3 block"
+            ),
+            Err(CertifiedSymmetricSolveError::NotSymmetric { row: 1, col: 0, .. })
+        ));
+    }
+
+    /// A sum of PSD pieces has a non-negative diagonal in floating point, so a
+    /// negative diagonal contradicts that provenance and is refused; the same
+    /// matrix declared mirrored is an ordinary indefinite system.
+    #[test]
+    fn psd_accumulation_refuses_a_negative_diagonal() {
+        let indefinite = array![[-1.0, 0.0], [0.0, 1.0]];
+        assert!(matches!(
+            validate_finite_symmetric_matrix(&indefinite, DEPTH_64, "negative diagonal"),
+            Err(CertifiedSymmetricSolveError::NegativePsdAccumulationDiagonal { row: 0, .. })
+        ));
+        validate_finite_symmetric_matrix(
+            &indefinite,
+            SymmetricAssembly::Mirrored,
+            "mirrored indefinite",
+        )
+        .expect("a mirrored indefinite matrix is symmetric");
     }
 
     /// The property under test is that no ridge is added to the diagonal, and
@@ -1621,7 +1691,9 @@ mod certified_inverse_tests {
         const INVERSE_ENTRY_ULPS: f64 = 4.0;
         let tiny = 2.0_f64.powi(-40);
         let matrix = array![[8.0, 0.0], [0.0, tiny]];
-        let certified = certified_spd_inverse(&matrix, "unperturbed diagonal").unwrap();
+        let certified =
+            certified_spd_inverse(&matrix, SymmetricAssembly::Mirrored, "unperturbed diagonal")
+                .unwrap();
         let inverse = certified.inverse();
         let defect = (inverse[[0, 0]] - 0.125).abs();
         assert!(
@@ -1642,7 +1714,11 @@ mod certified_inverse_tests {
     fn spd_inverse_rejects_invertible_indefinite_covariance() {
         let indefinite = array![[1.0, 2.0], [2.0, 1.0]];
         assert!(matches!(
-            certified_spd_inverse(&indefinite, "indefinite covariance"),
+            certified_spd_inverse(
+                &indefinite,
+                SymmetricAssembly::Mirrored,
+                "indefinite covariance"
+            ),
             Err(CertifiedSymmetricSolveError::NotPositiveDefinite { .. })
         ));
     }
@@ -1650,12 +1726,20 @@ mod certified_inverse_tests {
     #[test]
     fn singular_system_fails_deterministically_without_rank_truncation() {
         let singular = array![[1.0, 1.0], [1.0, 1.0]];
-        let first = certified_spd_inverse(&singular, "singular covariance")
-            .unwrap_err()
-            .to_string();
-        let second = certified_spd_inverse(&singular, "singular covariance")
-            .unwrap_err()
-            .to_string();
+        let first = certified_spd_inverse(
+            &singular,
+            SymmetricAssembly::Mirrored,
+            "singular covariance",
+        )
+        .unwrap_err()
+        .to_string();
+        let second = certified_spd_inverse(
+            &singular,
+            SymmetricAssembly::Mirrored,
+            "singular covariance",
+        )
+        .unwrap_err()
+        .to_string();
         assert_eq!(first, second);
         assert!(first.contains("not strictly positive definite"));
     }
@@ -1664,13 +1748,13 @@ mod certified_inverse_tests {
     fn finite_and_symmetry_validation_reports_first_bad_coordinate() {
         let non_finite = array![[1.0, f64::NAN], [f64::NAN, 1.0]];
         assert!(matches!(
-            certified_spd_inverse(&non_finite, "non-finite"),
+            certified_spd_inverse(&non_finite, SymmetricAssembly::Mirrored, "non-finite"),
             Err(CertifiedSymmetricSolveError::NonFiniteMatrix { row: 0, col: 1, .. })
         ));
 
         let asymmetric = array![[2.0, 0.25], [0.5, 2.0]];
         assert!(matches!(
-            certified_spd_inverse(&asymmetric, "asymmetric"),
+            certified_spd_inverse(&asymmetric, SymmetricAssembly::Mirrored, "asymmetric"),
             Err(CertifiedSymmetricSolveError::NotSymmetric { row: 1, col: 0, .. })
         ));
     }
@@ -1680,7 +1764,8 @@ mod certified_inverse_tests {
         let scale = 2.0_f64.powi(500);
         let matrix = array![[4.0 * scale, scale], [scale, 3.0 * scale]];
         let rhs = array![scale, -2.0 * scale];
-        let factor = certified_spd_factorize(&matrix, "scaled solve").unwrap();
+        let factor =
+            certified_spd_factorize(&matrix, SymmetricAssembly::Mirrored, "scaled solve").unwrap();
         let solved = factor.solve(&rhs).unwrap();
         assert!(
             solved.certificate().max_norm_backward_error
@@ -1694,7 +1779,13 @@ mod certified_inverse_tests {
     fn exact_symmetric_solve_admits_nonsingular_indefinite_system_without_fallback() {
         let matrix = array![[0.0, 2.0], [2.0, 0.0]];
         let rhs = array![4.0, 6.0];
-        let solved = certified_symmetric_solve(&matrix, &rhs, "indefinite equation").unwrap();
+        let solved = certified_symmetric_solve(
+            &matrix,
+            SymmetricAssembly::Mirrored,
+            &rhs,
+            "indefinite equation",
+        )
+        .unwrap();
         assert_eq!(solved.solution(), &array![3.0, 2.0]);
         assert_eq!(solved.certificate().residual_max_abs, 0.0);
     }
@@ -1702,7 +1793,8 @@ mod certified_inverse_tests {
     #[test]
     fn psd_pseudoinverse_rejects_material_indefiniteness_instead_of_repairing_it() {
         let matrix = array![[1.0, 0.0], [0.0, -1.0e-4]];
-        let error = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap_err();
+        let error = rank_certified_psd_pseudoinverse(&matrix, SymmetricAssembly::Mirrored, 1.0e-10)
+            .unwrap_err();
         assert!(error.to_string().contains("indefinite"));
     }
 }
@@ -1924,7 +2016,10 @@ mod tests {
 
 #[cfg(test)]
 mod pure_fn_tests {
-    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
+    use super::{
+        inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic,
+        stable_softplus,
+    };
 
     // -----------------------------------------------------------------------
     // stable_softplus: log(1 + exp(x))
@@ -2075,7 +2170,7 @@ mod condition_number_tests {
 mod certified_log_det_tests {
     use super::certified_spd_factorize;
     use crate::faer_ndarray::FaerEigh;
-    use crate::roundoff::accumulation_growth;
+    use crate::roundoff::{SymmetricAssembly, accumulation_growth};
     use faer::Side;
     use ndarray::{Array2, array};
 
@@ -2089,16 +2184,19 @@ mod certified_log_det_tests {
         let largest = values.iter().copied().fold(0.0_f64, f64::max);
         let dim = matrix.nrows();
         (dim * dim) as f64 * accumulation_growth(3 * dim + 1) * largest / smallest
-            + accumulation_growth(2 * dim) * dim as f64 * smallest.ln().abs().max(largest.ln().abs())
+            + accumulation_growth(2 * dim)
+                * dim as f64
+                * smallest.ln().abs().max(largest.ln().abs())
     }
 
     #[test]
     fn log_det_matches_an_exact_integer_determinant() {
         // Cofactor expansion along the first row: 4·(5·6 − 3·3) − 2·(2·6 − 3·1) + 1·(2·3 − 5·1) = 84 − 18 + 1 = 67.
         let matrix = array![[4.0, 2.0, 1.0], [2.0, 5.0, 3.0], [1.0, 3.0, 6.0]];
-        let log_det = certified_spd_factorize(&matrix, "integer fixture")
-            .expect("SPD fixture")
-            .log_det();
+        let log_det =
+            certified_spd_factorize(&matrix, SymmetricAssembly::Mirrored, "integer fixture")
+                .expect("SPD fixture")
+                .log_det();
         let reference = 67.0_f64.ln();
         let band = log_det_band(&matrix) + accumulation_growth(1) * reference;
         assert!(
@@ -2110,9 +2208,13 @@ mod certified_log_det_tests {
         // exactly 67.015625. The band resolves that change, and the factor reads the new value.
         let mut raised = matrix.clone();
         raised[[2, 2]] += 1.0 / 1024.0;
-        let raised_log_det = certified_spd_factorize(&raised, "raised integer fixture")
-            .expect("SPD fixture")
-            .log_det();
+        let raised_log_det = certified_spd_factorize(
+            &raised,
+            SymmetricAssembly::Mirrored,
+            "raised integer fixture",
+        )
+        .expect("SPD fixture")
+        .log_det();
         let raised_reference = 67.015625_f64.ln();
         let raised_band = log_det_band(&raised) + accumulation_growth(1) * raised_reference;
         assert!(

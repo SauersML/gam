@@ -86,7 +86,16 @@ use crate::description_length::{
     BirthMdlPrescreen, BirthProposalPriority, birth_proposal_priority,
 };
 use crate::frames::GrassmannFrame;
-use crate::manifold::{AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind, SAE_AMBIENT_SPHERE_DEFAULT_DEGREE, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS, SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho, SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition, amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty, anisotropic_flat_product_torus_penalty_aspect_derivative, embedded_donut_torus_reference_penalty, embedded_donut_torus_reference_penalty_aspect_derivative};
+use crate::manifold::{
+    AssignmentMode, AtlasSeamKind, AtlasTopologyReadout, GraphCompressionKind,
+    SAE_AMBIENT_SPHERE_DEFAULT_DEGREE, SAE_EUCLIDEAN_PATCH_MAX_DEGREE, SAE_MAX_PERIODIC_HARMONICS,
+    SaeAtomBasisKind, SaeAtomGeometryPlan, SaeBasisResolution, SaeManifoldAtom, SaeManifoldRho,
+    SaeManifoldTerm, SaeReferenceMetricPlan, SphereChartTransition, UnitSpeedChartTransition,
+    amplitude_concentration_certificate, anisotropic_flat_product_torus_penalty,
+    anisotropic_flat_product_torus_penalty_aspect_derivative,
+    embedded_donut_torus_reference_penalty,
+    embedded_donut_torus_reference_penalty_aspect_derivative,
+};
 use crate::migration_ledger::SaeMigrationLedger;
 use crate::null_sampler::{NULL_REPLICATES, coactivation_exceedance_for_pairs};
 use gam_linalg::faer_ndarray::FaerSvd;
@@ -1399,15 +1408,9 @@ fn unit_speed_glue_certificate(
     } else {
         ChartGlueOutcome::RegisterAtlas
     };
-    let transition = UnitSpeedChartTransition::new(
-        b,
-        a,
-        sign,
-        seam.offset,
-        seam.period,
-        AtlasSeamKind::Regular,
-    )
-    .ok()?;
+    let transition =
+        UnitSpeedChartTransition::new(b, a, sign, seam.offset, seam.period, AtlasSeamKind::Regular)
+            .ok()?;
     Some((
         log_e,
         CertifiedGlue {
@@ -1809,7 +1812,10 @@ fn is_sphere_pair(term: &SaeManifoldTerm, a: usize, b: usize) -> bool {
     let ambient_sphere = |atom: usize| -> bool {
         ambient_sphere_degree(&term.atoms[atom]).is_some()
             && matches!(
-                term.assignment.coords.get(atom).map(|block| block.manifold()),
+                term.assignment
+                    .coords
+                    .get(atom)
+                    .map(|block| block.manifold()),
                 Some(LatentManifold::Sphere { dim: 3 })
             )
     };
@@ -2055,9 +2061,7 @@ fn harvest_glue_proposals(
             // rather than a pair to leave out of the screened count.
             let alignment = fa
                 .max_principal_angle(fb.frame())
-                .map_err(|error| {
-                    format!("harvest_glue_proposals: atoms {a} and {b}: {error}")
-                })?
+                .map_err(|error| format!("harvest_glue_proposals: atoms {a} and {b}: {error}"))?
                 .cos();
             if !alignment.is_finite() {
                 continue;
@@ -2512,9 +2516,7 @@ pub(crate) fn remove_atoms(
     // variable-K boundary and must return a useful error rather than partially
     // compacting a malformed warm state and then panicking on an indexed gather.
     let n = term.assignment.logits.nrows();
-    if term.assignment.logits.ncols() != k
-        || term.assignment.coords.len() != k
-    {
+    if term.assignment.logits.ncols() != k || term.assignment.coords.len() != k {
         return Err(format!(
             "remove_atoms: atom-indexed assignment shape mismatch: atoms={k}, \
              logits={:?}, coords={}",
@@ -3061,14 +3063,18 @@ struct CandidateBases<'a> {
 impl<'a> CandidateBases<'a> {
     /// The full pair. Every production race has both in scope.
     fn with_ambient(seed: ArrayView2<'a, f64>, ambient: ArrayView2<'a, f64>) -> Self {
-        Self { seed, ambient: Some(ambient) }
+        Self {
+            seed,
+            ambient: Some(ambient),
+        }
     }
 
     /// The ambient rows, only when row-aligned with the seed. A chart indexes
     /// rows of both identically, so a row-count mismatch would silently pair
     /// unrelated observations — refuse rather than pair them.
     fn aligned_ambient(&self) -> Option<ArrayView2<'a, f64>> {
-        self.ambient.filter(|ambient| ambient.nrows() == self.seed.nrows())
+        self.ambient
+            .filter(|ambient| ambient.nrows() == self.seed.nrows())
     }
 }
 
@@ -3246,7 +3252,11 @@ fn topology_candidates_for_dim(
             var += (coords[[row, col]] - mean).powi(2);
         }
         let sd = (var / n as f64).sqrt();
-        let scale = if sd > 0.0 && sd.is_finite() { 1.0 / sd } else { 1.0 };
+        let scale = if sd > 0.0 && sd.is_finite() {
+            1.0 / sd
+        } else {
+            1.0
+        };
         for row in 0..n {
             out[row] = (coords[[row, col]] - mean) * scale;
         }
@@ -3433,29 +3443,29 @@ fn topology_candidates_for_dim(
             // and it is the same guard the birth site already applies as
             // `n_pcs >= 3`.
             if d_seed >= 3 {
-            specs.push(TopologyCandidateSpec::new(
-                AutoTopologyKind::Sphere,
-                SaeAtomGeometryPlan::new(
-                    SaeAtomBasisKind::Sphere,
-                    3,
-                    SaeBasisResolution::AmbientSphereHarmonics {
-                        degree: SAE_AMBIENT_SPHERE_DEFAULT_DEGREE,
-                    },
-                    SaeReferenceMetricPlan::RoundSphere,
-                )?,
-                // The sphere candidate races as an actual sphere: an ambient
-                // unit 3-vector, whose retraction has no cut and no boundary and
-                // whose uniform metric restricts to the round metric. The
-                // superseded `(lat, lon)` chart raced a CYLINDER -- the pole was
-                // an `Interval` bound the optimiser could not cross, the trust
-                // region was wrong by `cos²(lat)`, and the fixed 7-column block
-                // was not closed under `SO(3)`, so the candidate's achievable
-                // fit depended on where the chart's pole happened to fall
-                // relative to the data. Degree 2 spans all five `l = 2`
-                // harmonics, where the chart held only three of them.
-                LatentManifold::Sphere { dim: 3 },
-                sphere_coords_ambient(),
-            )?);
+                specs.push(TopologyCandidateSpec::new(
+                    AutoTopologyKind::Sphere,
+                    SaeAtomGeometryPlan::new(
+                        SaeAtomBasisKind::Sphere,
+                        3,
+                        SaeBasisResolution::AmbientSphereHarmonics {
+                            degree: SAE_AMBIENT_SPHERE_DEFAULT_DEGREE,
+                        },
+                        SaeReferenceMetricPlan::RoundSphere,
+                    )?,
+                    // The sphere candidate races as an actual sphere: an ambient
+                    // unit 3-vector, whose retraction has no cut and no boundary and
+                    // whose uniform metric restricts to the round metric. The
+                    // superseded `(lat, lon)` chart raced a CYLINDER -- the pole was
+                    // an `Interval` bound the optimiser could not cross, the trust
+                    // region was wrong by `cos²(lat)`, and the fixed 7-column block
+                    // was not closed under `SO(3)`, so the candidate's achievable
+                    // fit depended on where the chart's pole happened to fall
+                    // relative to the data. Degree 2 spans all five `l = 2`
+                    // harmonics, where the chart held only three of them.
+                    LatentManifold::Sphere { dim: 3 },
+                    sphere_coords_ambient(),
+                )?);
             }
             // `RP²` is `S²/{u ~ -u}`, so it needs the sphere's three seed
             // directions for the same reason and is gated with it.
@@ -3680,9 +3690,7 @@ fn evaluate_constant_curvature_profile(
         .build_reference_penalty_kappa_derivative()
         .map_err(ObjectiveEvalError::fatal)?
         .ok_or_else(|| {
-            ObjectiveEvalError::fatal(
-                "constant-curvature profile did not materialize dS/dkappa",
-            )
+            ObjectiveEvalError::fatal("constant-curvature profile did not materialize dS/dkappa")
         })?;
     let fit = gaussian_reml_multi_shared_dispersion_closed_form(
         phi,
@@ -3731,9 +3739,8 @@ fn fit_constant_curvature_metric_candidate(
         .ok_or_else(|| "constant-curvature candidate has no curvature metric".to_string())?;
     let evaluator = spec.geometry.build_evaluator()?;
     let (phi, _) = evaluator.evaluate(spec.coords.view())?;
-    let evaluate = |kappa: f64| {
-        evaluate_constant_curvature_profile(spec, phi.view(), target, weights, kappa)
-    };
+    let evaluate =
+        |kappa: f64| evaluate_constant_curvature_profile(spec, phi.view(), target, weights, kappa);
     let lower_sample = evaluate(lower)
         .map_err(|error| profile_refusal("constant-curvature lower-endpoint profile", &error))?;
     let upper_sample = evaluate(upper)
@@ -4017,10 +4024,12 @@ fn optimize_torus_metric_coordinate(
                     .map(|magnitude| coordinate_gradient / magnitude)
                     .map_err(ObjectiveEvalError::fatal)
             };
-            let lower_aspect = aspect_residual(lower, lower_gradient)
-                .map_err(|error| format!("{family:?} torus lower-endpoint aspect residual: {error}"))?;
-            let upper_aspect = aspect_residual(upper, upper_gradient)
-                .map_err(|error| format!("{family:?} torus upper-endpoint aspect residual: {error}"))?;
+            let lower_aspect = aspect_residual(lower, lower_gradient).map_err(|error| {
+                format!("{family:?} torus lower-endpoint aspect residual: {error}")
+            })?;
+            let upper_aspect = aspect_residual(upper, upper_gradient).map_err(|error| {
+                format!("{family:?} torus upper-endpoint aspect residual: {error}")
+            })?;
             // The tolerance follows the residual into its new scale; reusing the
             // coordinate-scaled one would be the same mismatch in the other
             // direction.
@@ -5177,7 +5186,10 @@ fn log_atlas_evidence_agreement(atlas: Option<&AtlasTopologyReadout>, ranking: &
     let Some(atlas) = atlas else {
         return;
     };
-    let Some(measured) = atlas.observed_manifold().and_then(observed_kind_to_auto_topology) else {
+    let Some(measured) = atlas
+        .observed_manifold()
+        .and_then(observed_kind_to_auto_topology)
+    else {
         return;
     };
     let Some(winner) = ranking.first().copied() else {
@@ -6090,7 +6102,10 @@ fn sheet_specs_on_local_chart(
     // An axis whose spread sits within the numerical-rank resolution `max(rows, 2)·ε`
     // of the larger axis cannot be told from zero at the chart's precision.
     let resolution = rows.len().max(2) as f64 * f64::EPSILON * sd[0].max(sd[1]);
-    if sd.iter().any(|&spread| !spread.is_finite() || spread <= resolution) {
+    if sd
+        .iter()
+        .any(|&spread| !spread.is_finite() || spread <= resolution)
+    {
         return Ok(None);
     }
     let mut coords = Array2::<f64>::zeros((target.nrows(), 2));
@@ -7071,7 +7086,10 @@ const ESTIMATION_FRACTION: f64 = 0.6;
 /// rows (contiguous) are the estimation set, the remainder is partitioned into
 /// `n_shards` contiguous held-out evaluation blocks. Deterministic — contiguous
 /// blocks, no shuffle. Each shard shares the full target by reference.
-pub(crate) fn estimation_eval_split(target: ArrayView2<'_, f64>, n_shards: usize) -> EstimationEvalSplit {
+pub(crate) fn estimation_eval_split(
+    target: ArrayView2<'_, f64>,
+    n_shards: usize,
+) -> EstimationEvalSplit {
     let n = target.nrows();
     if n == 0 {
         return EstimationEvalSplit {
@@ -7127,7 +7145,6 @@ pub struct StructureSearchResult {
 }
 
 impl StructureSearchResult {
-
     /// Assemble a result AND thread the #2233 closed-form birth pre-screen
     /// predictions into the unified ledger. `birth_predictions[i]` maps a birth
     /// candidate index to its predicted ΔMDL (bits) for round `i` (parallel to
@@ -7813,7 +7830,8 @@ fn curl_candidates(
     let fitted = term
         .try_fitted()
         .map_err(|error| format!("curl_candidates: the term's reconstruction failed: {error}"))?;
-    let rms_fitted = (fitted.iter().map(|value| value * value).sum::<f64>() / (n * p) as f64).sqrt();
+    let rms_fitted =
+        (fitted.iter().map(|value| value * value).sum::<f64>() / (n * p) as f64).sqrt();
     let sigma = rms_residual.max(f64::EPSILON * rms_fitted);
 
     let census_frames: Vec<crate::manifold::AtomFrame<'_>> = frames
@@ -7835,7 +7853,8 @@ fn curl_candidates(
         null_replicates: 0,
         fdr_alpha: cfg.fdr_alpha,
     };
-    let census = crate::manifold::census_shattered_circles(&census_frames, n, p, sigma, &census_cfg)?;
+    let census =
+        crate::manifold::census_shattered_circles(&census_frames, n, p, sigma, &census_cfg)?;
 
     let mut cands: Vec<CurlCandidate> = Vec::new();
     for pair in &census.pairs {
@@ -7974,8 +7993,12 @@ fn principal_image_plane(
             k_mat[[j, i]] = v;
         }
     }
-    let (lambda, u) = strict_symmetric_eigh(&k_mat, faer::Side::Lower)
-        .map_err(|e| format!("flatten: decoder Gram spectrum failed: {e}"))?;
+    let (lambda, u) = strict_symmetric_eigh(
+        &k_mat,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .map_err(|e| format!("flatten: decoder Gram spectrum failed: {e}"))?;
     // L = U·Λ^{1/2}. K is PSD by construction; `max(0)` only removes the
     // EVD's roundoff below zero, it never changes a resolved eigenvalue.
     let mut l_mat = u;
@@ -7992,8 +8015,12 @@ fn principal_image_plane(
             s_mat[[j, i]] = v;
         }
     }
-    let (mu, w) = strict_symmetric_eigh(&s_mat, faer::Side::Lower)
-        .map_err(|e| format!("flatten: image Gram spectrum failed: {e}"))?;
+    let (mu, w) = strict_symmetric_eigh(
+        &s_mat,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        faer::Side::Lower,
+    )
+    .map_err(|e| format!("flatten: image Gram spectrum failed: {e}"))?;
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&x, &y| mu[y].total_cmp(&mu[x]));
     if !(mu[order[0]] > 0.0) {

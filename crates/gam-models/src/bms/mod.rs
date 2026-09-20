@@ -11,8 +11,8 @@ use crate::custom_family::{
 use crate::exact_mode_branch::ExactCoefficientModeBranch;
 use crate::fit_orchestration::drivers::{
     ExactJointEfsEvaluation, ExactJointEvaluation, ExactJointHyperSetup, SpatialFitProvenance,
-    build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
-    spatial_length_scale_term_indices,
+    build_term_collection_designs_and_freeze_joint,
+    optimize_spatial_length_scale_exact_joint_typed, spatial_length_scale_term_indices,
 };
 use crate::inference::predict_io::FittedLatentScoreMap;
 use crate::marginal_slope_shared::{
@@ -63,7 +63,9 @@ mod alo_replay;
 pub mod deviation_runtime;
 pub mod gpu;
 pub(crate) use alo_replay::exact_runtime_from_saved;
-pub use alo_replay::{BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry};
+pub use alo_replay::{
+    BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloRowGeometry,
+};
 pub(crate) use alo_replay::{
     BernoulliMarginalSlopeSavedAloReplayInput, replay_saved_bernoulli_marginal_slope_alo,
 };
@@ -189,11 +191,10 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// Conditional location-scale calibration of the latent score (#905),
     /// `Some(_)` only under the declared `conditional-location-scale` law when
     /// its `E[z|C]`/`Var(z|C)` Rao test fired: the training z was then replaced
-    /// in place by `ζ = (z − m(C))/√v(C)` (via
-    /// [`LatentZConditionalCalibration::apply`]) before any downstream consumer
-    /// saw it, and the residual is anchored on its empirical law. Persisted so
-    /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
-    /// applies the identical map.
+    /// in place by `ζ = (z − m(C))/√v(C)` (through the fitted latent score map,
+    /// gam#3016) before any downstream consumer saw it, and the residual is
+    /// anchored on its empirical law. Persisted so prediction rebuilds `a(C)` from
+    /// the (reproducible) marginal design and applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     /// The latent score of each training row as the kernel consumed it: the raw
     /// score through the fitted score map (the saved normalisation, then the
@@ -523,8 +524,8 @@ impl AnchorNoiseGram {
         }
         let (eigenvalues, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(&full, faer::Side::Lower)
             .map_err(|error| {
-                format!("closed-form certificate noise Gram eigendecomposition failed: {error:?}")
-            })?;
+            format!("closed-form certificate noise Gram eigendecomposition failed: {error:?}")
+        })?;
         if let Some(eigenvalue) = eigenvalues.iter().find(|l| !l.is_finite()) {
             return Err(format!(
                 "closed-form certificate noise Gram has a non-finite eigenvalue {eigenvalue}"
@@ -610,7 +611,11 @@ impl ClosedFormAnchorResidual {
             nodes,
             null_p_value: Some(null_p_value),
             null_p_value_relative_error: Some(relative_error),
-            null_modes: Some(if sum_sq > 0.0 { sum * sum / sum_sq } else { 0.0 }),
+            null_modes: Some(if sum_sq > 0.0 {
+                sum * sum / sum_sq
+            } else {
+                0.0
+            }),
             closed_form_chosen,
         })
     }
@@ -666,23 +671,30 @@ pub(crate) fn closed_form_certificate_pass<const K: usize, W>(
     let atoms = law_weights.len();
     let partials = (0..rows.div_ceil(CERTIFICATE_ROW_CHUNK))
         .into_par_iter()
-        .map(|chunk| -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
-            let mut workspace = init()?;
-            let mut noise = AnchorNoiseGram::new(atoms);
-            let start = chunk * CERTIFICATE_ROW_CHUNK;
-            let end = (start + CERTIFICATE_ROW_CHUNK).min(rows);
-            let mut measured = Vec::with_capacity((end - start) * K);
-            for row in start..end {
-                let weight = row_weights[row];
-                for (residual, law_sd, scale, probabilities) in measure(&mut workspace, row)? {
-                    if weight > 0.0 && scale > 0.0 {
-                        noise.add_anchor(weight / scale, law_weights, &probabilities, effective_n)?;
+        .map(
+            |chunk| -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
+                let mut workspace = init()?;
+                let mut noise = AnchorNoiseGram::new(atoms);
+                let start = chunk * CERTIFICATE_ROW_CHUNK;
+                let end = (start + CERTIFICATE_ROW_CHUNK).min(rows);
+                let mut measured = Vec::with_capacity((end - start) * K);
+                for row in start..end {
+                    let weight = row_weights[row];
+                    for (residual, law_sd, scale, probabilities) in measure(&mut workspace, row)? {
+                        if weight > 0.0 && scale > 0.0 {
+                            noise.add_anchor(
+                                weight / scale,
+                                law_weights,
+                                &probabilities,
+                                effective_n,
+                            )?;
+                        }
+                        measured.push((residual, law_sd / root_n, scale, weight));
                     }
-                    measured.push((residual, law_sd / root_n, scale, weight));
                 }
-            }
-            Ok((measured, noise))
-        })
+                Ok((measured, noise))
+            },
+        )
         .collect::<Result<Vec<_>, String>>()?;
     let mut measured = Vec::with_capacity(rows * K);
     let mut noise = AnchorNoiseGram::new(atoms);
@@ -1113,8 +1125,10 @@ impl LatentMeasureKind {
                         "{context} local empirical latent measure needs centers"
                     ));
                 }
-                let pooled_grids =
-                    usize::from(matches!(mixture, LocalLawMixture::VanishingAtTruncation { .. }));
+                let pooled_grids = usize::from(matches!(
+                    mixture,
+                    LocalLawMixture::VanishingAtTruncation { .. }
+                ));
                 if grids.len() != centers.len() + pooled_grids {
                     return Err(format!(
                         "{context} local empirical latent measure center/grid length mismatch: \
@@ -1807,8 +1821,11 @@ impl LatentZConditionalCalibration {
 
     /// Apply `ζ = (z − m(C))/√v(C)` to a batch. `a_block` is the marginal
     /// design (`n × basis_ncols`); `z` is the (normalized) latent score. Used
-    /// at both training and predict time, so the map is identical.
-    pub fn apply(
+    /// at both training and predict time, so the map is identical. Crate-private:
+    /// every reader goes through the fitted latent score map
+    /// (`FittedLatentScoreMap`, gam#3016), outside the crate through
+    /// `FittedModel::fitted_latent_score`.
+    pub(crate) fn apply(
         &self,
         z: ArrayView1<'_, f64>,
         a_block: ArrayView2<'_, f64>,
@@ -2142,8 +2159,10 @@ pub(crate) fn preconditioned_normal_pseudoinverse(
             m_scaled[[i, j]] *= scale[i] * scale[j];
         }
     }
+    // Symmetrized, then scaled by the commutative `scale[i]·scale[j]`: mirrored.
     let mut pinv = gam_linalg::utils::rank_certified_psd_pseudoinverse(
         &m_scaled,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         jacobi_scaled_normal_relative_cutoff(rows, p),
     )
     .map_err(|e| format!("stacked first-stage sandwich pseudo-inverse failed: {e}"))?
@@ -2355,8 +2374,10 @@ pub(crate) fn weighted_ridge_sandwich_cov(
             meat_scaled[[i, j]] *= s;
         }
     }
+    // Symmetrized, then scaled by the commutative `scale[i]·scale[j]`: mirrored.
     let m_pinv = gam_linalg::utils::rank_certified_psd_pseudoinverse(
         &m_scaled,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         jacobi_scaled_normal_relative_cutoff(n, p),
     )
     .map_err(|e| format!("conditional latent calibration sandwich pseudo-inverse failed: {e}"))?
@@ -2470,8 +2491,13 @@ pub(crate) fn robust_score_contributions_pvalue(
         * omega.diag().sum()
         / omega_max_diagonal
         + r as f64 * f64::EPSILON;
-    let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(&omega, relative_cutoff)
-        .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
+    // `fast_ata` accumulates one triangle and mirrors it.
+    let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(
+        &omega,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        relative_cutoff,
+    )
+    .map_err(|e| format!("conditional score test pseudo-inverse failed: {e}"))?;
     let rank = omega_geometry.rank();
     let omega_pinv = omega_geometry.into_pseudoinverse();
     if rank == 0 {
@@ -2759,8 +2785,8 @@ pub(crate) fn fit_conditional_latent_calibration(
 
     // Sanity-check post-correction moments on the training sample, whose
     // calibrated score is the fitted score map's (gam#3016).
-    let calibrated = FittedLatentScoreMap::conditional_only(&calibration)
-        .calibrate(z.view(), Some(a_block))?;
+    let calibrated =
+        FittedLatentScoreMap::conditional_only(&calibration).calibrate(z.view(), Some(a_block))?;
     let post_mean = weighted_mean(
         calibrated
             .as_slice()
@@ -3327,9 +3353,8 @@ fn normal_screen_bounds(n: f64, policy: &LatentZPolicy) -> Result<NormalScreenBo
     };
     let root_n = n.sqrt();
     let ks = kolmogorov_upper_quantile(alpha) / (root_n + 0.12 + 0.11 / root_n);
-    let tail = |sigma: f64| {
-        poisson_upper_quantile(n * normal_two_sided_probability(sigma), alpha) / n
-    };
+    let tail =
+        |sigma: f64| poisson_upper_quantile(n * normal_two_sided_probability(sigma), alpha) / n;
     // 1 − (1 − α)^{1/n}: the per-draw exceedance that n draws reach with
     // probability α.
     let per_draw = -((-alpha).ln_1p() / n).exp_m1();
@@ -3670,8 +3695,6 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 pub(crate) mod block_specs;
 pub mod conditional_score_covariance;
 pub(crate) mod estimated_latent_law;
-pub(crate) mod local_law_resolution;
-pub(crate) mod moving_law_rule;
 pub(crate) mod exact_eval_cache;
 mod expected_information;
 pub(crate) mod family;
@@ -3680,6 +3703,8 @@ pub(crate) mod gradient_paths;
 pub(crate) mod hessian_paths;
 mod information_third;
 pub(crate) mod install_flex;
+pub(crate) mod local_law_resolution;
+pub(crate) mod moving_law_rule;
 pub mod residual_repair;
 mod residual_repair_kernel;
 pub(crate) mod row_kernel;
@@ -3866,22 +3891,22 @@ mod stacked_first_stage_sandwich_2484_tests {
     }
 }
 
+#[cfg(test)]
+mod anchor_law_2926_tests;
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
+#[cfg(test)]
+mod closed_form_certificate_2926_tests;
 #[cfg(test)]
 mod conditional_law_gate_tests;
 #[cfg(test)]
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
-#[cfg(test)]
-mod anchor_law_2926_tests;
+pub(crate) mod empirical_measure_sensitivity;
 #[cfg(test)]
 mod normal_screen_2926_tests;
-#[cfg(test)]
-mod closed_form_certificate_2926_tests;
 mod standard_normal_flex_fifth;
-pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT
 // lift + cell base-moment jets). A bare `#[cfg(test)] mod` with an allowed name
 // so the build.rs ban-scanner exempts it; shared by its own FD gates and the
@@ -3931,17 +3956,17 @@ pub(crate) use block_specs::fit_bernoulli_marginal_slope_terms;
 pub use conditional_score_covariance::{
     ConditionalScoreCoordinate, ConditionalScoreCovariance, ScoreCovarianceField,
 };
-pub use residual_repair::{
-    RESIDUAL_BLOCK_NAME, ResidualBlockRuntime, ResidualRepairGeometry,
-    ResidualRepairRefusal, ResidualRepairSpec,
-};
-pub(crate) use residual_repair::residual_row_index;
 pub use gradient_paths::{
     MarginalSlopeCovariance, MarginalSlopeCovarianceShape, marginal_slope_covariance_from_scores,
     padded_deviation_seed,
 };
 pub use install_flex::CrossBlockIdentifiabilityWarning;
 pub(crate) use install_flex::FlexCompileOutcome;
+pub(crate) use residual_repair::residual_row_index;
+pub use residual_repair::{
+    RESIDUAL_BLOCK_NAME, ResidualBlockRuntime, ResidualRepairGeometry, ResidualRepairRefusal,
+    ResidualRepairSpec,
+};
 
 // pub(crate) re-exports for internal callers:
 pub(crate) use block_specs::push_deviation_aux_blockspecs;

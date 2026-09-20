@@ -243,6 +243,7 @@
 
 use faer::Side;
 use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_math::probability::{chi_square_sf, fisher_snedecor_sf};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
@@ -344,7 +345,11 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
         input.design_gram,
     )?;
     let rank = geometry.basis.ncols();
-    let statistic = geometry.projected.iter().map(|value| value * value).sum::<f64>();
+    let statistic = geometry
+        .projected
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
     let statistic = statistic / input.dispersion;
     if !statistic.is_finite() || statistic < 0.0 {
         return None;
@@ -663,7 +668,11 @@ pub fn conditional_basis_adequacy_test(
     let third = &null_fit.third;
     let fourth = &null_fit.fourth;
     // `h = diag(H)` and `A_d = diag(LLᵀ)`, `H = X̄X̄ᵀ = X G⁻ Xᵀ`.
-    let leverage: Array1<f64> = whitened.rows().into_iter().map(|row| row.dot(&row)).collect();
+    let leverage: Array1<f64> = whitened
+        .rows()
+        .into_iter()
+        .map(|row| row.dot(&row))
+        .collect();
     let enrichment_leverage: Array1<f64> = basis_rows
         .rows()
         .into_iter()
@@ -679,7 +688,11 @@ pub fn conditional_basis_adequacy_test(
     // `D₁ − D₂ = Lᵀ diag(W₂∘h − W₁∘H(W₁∘h)) L`.
     let diagonal_weight = &(fourth * &leverage) - &(third * &smoothed_skew);
     let mut weighted_rows = basis_rows.clone();
-    for (mut row, &weight) in weighted_rows.rows_mut().into_iter().zip(diagonal_weight.iter()) {
+    for (mut row, &weight) in weighted_rows
+        .rows_mut()
+        .into_iter()
+        .zip(diagonal_weight.iter())
+    {
         row.iter_mut().for_each(|value| *value *= weight);
     }
     let mut curvature = basis_rows.t().dot(&weighted_rows);
@@ -881,9 +894,7 @@ fn enrichment_geometry(
         residualized -= &design
             .slice(ndarray::s![start..stop, ..])
             .dot(&coefficient_shift);
-        u += &residualized
-            .t()
-            .dot(&score.slice(ndarray::s![start..stop]));
+        u += &residualized.t().dot(&score.slice(ndarray::s![start..stop]));
         let mut weighted = residualized.clone();
         for local in 0..rows {
             let weight = score_weights[start + local];
@@ -917,7 +928,7 @@ fn enrichment_geometry(
     // larger than the fine tail, so that version still plateaued at about 32
     // d.f. while the alternative grew from 60 to 156 columns.
     let (information_values, information_vectors) =
-        strict_symmetric_eigh(&symmetric, Side::Lower).ok()?;
+        strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower).ok()?;
     let information_max = information_values.iter().cloned().fold(0.0_f64, f64::max);
     if !(information_max > 0.0) {
         return None;
@@ -953,7 +964,8 @@ fn enrichment_geometry(
     if retained.iter().any(|value| !value.is_finite()) {
         return None;
     }
-    let (raw_energy_per_residual, rotation) = strict_symmetric_eigh(&retained, Side::Lower).ok()?;
+    let (raw_energy_per_residual, rotation) =
+        strict_symmetric_eigh(&retained, SymmetricAssembly::Mirrored, Side::Lower).ok()?;
     let raw_energy_scale = raw_energy_per_residual
         .iter()
         .map(|value| value.abs())
@@ -1124,7 +1136,8 @@ impl DesignGramFactor {
             });
         }
         let symmetric = 0.5 * (&owned + &owned.t());
-        let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&symmetric, Side::Lower).ok()?;
+        let (eigenvalues, eigenvectors) =
+            strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower).ok()?;
         let largest = eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
         if !(largest > 0.0) {
             return None;
@@ -1140,12 +1153,10 @@ impl DesignGramFactor {
                 root[(row, slot)] = eigenvectors[(row, index)] * scale;
             }
         }
-        root.iter()
-            .all(|value| value.is_finite())
-            .then_some(Self {
-                kind: DesignGramFactorKind::SpectralPseudoInverse(root),
-                dimension,
-            })
+        root.iter().all(|value| value.is_finite()).then_some(Self {
+            kind: DesignGramFactorKind::SpectralPseudoInverse(root),
+            dimension,
+        })
     }
 
     /// Side length of the factored Gram, i.e. the design's column count.
@@ -1251,7 +1262,13 @@ mod tests {
             for index in 0..p {
                 hessian[(index, index)] += ridge;
             }
-            let beta = invert_symmetric(&hessian).dot(&design.t().dot(&y));
+            let beta = invert_symmetric(
+                &hessian,
+                SymmetricAssembly::PsdAccumulation {
+                    depth: design.nrows(),
+                },
+            )
+            .dot(&design.t().dot(&y));
             let score = &y - &design.dot(&beta);
             Self {
                 design,
@@ -1278,8 +1295,9 @@ mod tests {
         }
     }
 
-    fn invert_symmetric(matrix: &Array2<f64>) -> Array2<f64> {
-        let (values, vectors) = strict_symmetric_eigh(matrix, Side::Lower)
+    /// `assembly` is the GEMM Gram's depth: `XᵀX` accumulates `nrows` products.
+    fn invert_symmetric(matrix: &Array2<f64>, assembly: SymmetricAssembly) -> Array2<f64> {
+        let (values, vectors) = strict_symmetric_eigh(matrix, assembly, Side::Lower)
             .expect("test harness matrix is symmetric positive definite");
         let mut inverse = Array2::<f64>::zeros(matrix.raw_dim());
         for (index, &value) in values.iter().enumerate() {
@@ -1809,7 +1827,13 @@ mod tests {
             y[row] = 0.5 + 2.0 * x + 0.4 * x * x + 0.3 * rng.next_normal();
         }
         let residual_sum = |columns: &Array2<f64>| {
-            let beta = invert_symmetric(&columns.t().dot(columns)).dot(&columns.t().dot(&y));
+            let beta = invert_symmetric(
+                &columns.t().dot(columns),
+                SymmetricAssembly::PsdAccumulation {
+                    depth: columns.nrows(),
+                },
+            )
+            .dot(&columns.t().dot(&y));
             let residual = &y - &columns.dot(&beta);
             residual.dot(&residual)
         };
@@ -1938,7 +1962,10 @@ mod tests {
         );
         let count = p_values.len() as f64;
         let ks = kolmogorov_smirnov_uniform_p_value(p_values);
-        assert!(ks > 1e-3, "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates");
+        assert!(
+            ks > 1e-3,
+            "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates"
+        );
         for level in [0.01, 0.05, 0.10] {
             let size = p_values.iter().filter(|&&value| value <= level).count() as f64 / count;
             let standard_error = (level * (1.0 - level) / count).sqrt();
@@ -2132,7 +2159,11 @@ mod tests {
             let mut rng = Lcg(20_260_921);
             let response = harness.draw(&missing, &mut rng);
             let out = harness.p_value(&response).expect("measured");
-            assert!(out.p_value < 1e-8, "{family:?}: p = {:.3e} under a missing sin(20x)", out.p_value);
+            assert!(
+                out.p_value < 1e-8,
+                "{family:?}: p = {:.3e} under a missing sin(20x)",
+                out.p_value
+            );
         }
     }
 
@@ -2159,22 +2190,23 @@ mod tests {
         )
         .expect("interior MLE");
         let gradient = harness.design.t().dot(&fit.score);
-        let scale = harness.design.iter().map(|value| value.abs()).fold(0.0_f64, f64::max);
+        let scale = harness
+            .design
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
         assert!(
-            gradient.iter().all(|value| value.abs() < 1e-6 * scale * 300.0),
+            gradient
+                .iter()
+                .all(|value| value.abs() < 1e-6 * scale * 300.0),
             "score equation residual {gradient:?}"
         );
     }
 
     #[test]
     fn canonical_null_fit_refuses_inadmissible_responses() {
-        let harness = CanonicalHarness::new(
-            20,
-            2,
-            3,
-            &[0.0],
-            CanonicalExponentialFamily::PoissonLog,
-        );
+        let harness =
+            CanonicalHarness::new(20, 2, 3, &[0.0], CanonicalExponentialFamily::PoissonLog);
         let mut response = Array1::<f64>::ones(20);
         response[3] = -1.0;
         assert!(

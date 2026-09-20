@@ -125,8 +125,8 @@ def expected_resolution_budget(
     """Expected observations to cross the ``1 / alpha`` evidence threshold.
 
     ``growth_nats_per_obs`` is the selected probe's expected per-observation
-    log-evidence growth. Returns ``None`` for invalid levels or non-positive
-    growth.
+    log-evidence growth. Returns ``None`` for non-positive growth; raises
+    ``ValueError`` for a level outside ``(0, 1)`` or a NaN growth rate.
     """
     return rust_module().expected_resolution_budget(
         float(alpha),
@@ -148,7 +148,8 @@ def plan_probe_for_contested_claim(
     output-Fisher metric, then reports both the from-scratch and remaining
     observation budgets after accounting for ``current_log_e`` already banked
     in the claim's e-process. Returns ``None`` when steering cannot distinguish
-    the candidate hypotheses.
+    the candidate hypotheses; raises ``ValueError`` for malformed inputs (an
+    ``alpha`` outside ``(0, 1)`` or a NaN ``current_log_e``).
     """
     return rust_module().plan_probe_for_contested_claim(
         delta,

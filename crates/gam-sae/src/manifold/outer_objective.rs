@@ -1342,13 +1342,13 @@ impl SaeManifoldOuterObjective {
                 let solver = DeflatedArrowSolver::plain(&evaluation.cache);
                 self.term
                     .analytic_outer_rho_gradient_components_arrow_orbit(
-                    self.target.view(),
-                    rho,
-                    &evaluation.loss,
-                    &evaluation.cache,
-                    &solver,
-                    geometry,
-                )?
+                        self.target.view(),
+                        rho,
+                        &evaluation.loss,
+                        &evaluation.cache,
+                        &solver,
+                        geometry,
+                    )?
             }
             OuterEvaluationArtifacts::Dense(geometry) => {
                 let lambda_smooth = rho
@@ -2543,16 +2543,16 @@ impl SaeManifoldOuterObjective {
         let criterion = self
             .term
             .penalized_quasi_laplace_criterion_priced_with_lane(
-            self.target.view(),
-            &rho,
-            self.registry.as_ref(),
-            self.inner_max_iter,
-            self.learning_rate,
-            self.ridge_ext_coord,
-            self.ridge_beta,
-            true,
-            self.surrogate_lane.as_mut(),
-        );
+                self.target.view(),
+                &rho,
+                self.registry.as_ref(),
+                self.inner_max_iter,
+                self.learning_rate,
+                self.ridge_ext_coord,
+                self.ridge_beta,
+                true,
+                self.surrogate_lane.as_mut(),
+            );
         let (penalized_quasi_laplace_cost, loss, priced) = match criterion {
             Ok(evaluated) => evaluated,
             Err(SaeCriterionError::VanishedAtoms(atoms)) => {
@@ -3048,9 +3048,9 @@ impl SaeManifoldOuterObjective {
             && let Some(reason) = certificates
                 .iter()
                 .find_map(|certificate| match certificate {
-                FixedPointCoordinateCertificate::Uncovered { reason } => Some(reason.as_str()),
-                FixedPointCoordinateCertificate::Covered { .. } => None,
-            })
+                    FixedPointCoordinateCertificate::Uncovered { reason } => Some(reason.as_str()),
+                    FixedPointCoordinateCertificate::Covered { .. } => None,
+                })
         {
             log::debug!("SAE EFS evaluation refused (cost = +inf): {reason}");
         }
@@ -3532,9 +3532,13 @@ fn reactive_smooth_curvature_scale(
             atom.smooth_penalty().dim()
         ));
     }
-    let penalty_geometry =
-        gam_linalg::utils::rank_certified_psd_pseudoinverse(atom.smooth_penalty(), 1.0e-10)
-            .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
+    let penalty_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(
+        atom.smooth_penalty(),
+        // A declared penalty: callers supply it exactly symmetric.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        1.0e-10,
+    )
+    .map_err(|error| format!("reactive rho domain penalty spectrum failed: {error}"))?;
     let rank = penalty_geometry.rank();
     let penalty_pinv = penalty_geometry.into_pseudoinverse();
     if rank == 0 {
@@ -3548,9 +3552,13 @@ fn reactive_smooth_curvature_scale(
     // retaining the largest `rank` eigenpairs here reuses that decision without
     // reviving tiny numerical eigenvalues in the null space. This second EVD is
     // strict too: no jitter may change the retained range.
-    let (pinv_eigenvalues, pinv_eigenvectors) =
-        gam_linalg::faer_ndarray::strict_symmetric_eigh(&penalty_pinv, Side::Lower)
-            .map_err(|error| format!("reactive rho domain P⁺ spectrum failed: {error}"))?;
+    let (pinv_eigenvalues, pinv_eigenvectors) = gam_linalg::faer_ndarray::strict_symmetric_eigh(
+        &penalty_pinv,
+        // `into_pseudoinverse` symmetrizes its output in place.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .map_err(|error| format!("reactive rho domain P⁺ spectrum failed: {error}"))?;
     if !pinv_eigenvalues.iter().all(|value| value.is_finite()) {
         return Err(format!(
             "reactive rho domain: atom {atom_idx} P⁺ spectrum is non-finite"
@@ -4150,52 +4158,52 @@ impl OuterObjective for SaeManifoldOuterObjective {
             None => self.evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false),
         };
         let evaluation = match criterion {
-                Ok(evaluated) => evaluated,
-                Err(SaeCriterionError::VanishedAtoms(atoms)) => {
+            Ok(evaluated) => evaluated,
+            Err(SaeCriterionError::VanishedAtoms(atoms)) => {
                 log::trace!("SAE analytic evaluation reached fixed-K structural boundary: {atoms}");
-                    self.probe_telemetry.infeasible_criterion_evals += 1;
-                    return Ok(OuterEval::infeasible(rho.len()));
-                }
-                // A non-PD per-row/cross-row/Schur factor has no defined Laplace
-                // evidence at this ρ. Return the objective contract's typed
-                // infeasible evaluation so the optimizer rejects/backtracks. A
-                // finite sentinel here would be a different objective. Genuine
-                // evaluation defects still hard-error below.
-                Err(SaeCriterionError::Numerical(err))
-                    if Self::is_recoverable_value_probe_refusal(&err) =>
-                {
-                    self.probe_telemetry.record_refusal_kind(&err);
-                    log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
-                    self.probe_telemetry.infeasible_criterion_evals += 1;
-                    return Ok(OuterEval::infeasible(rho.len()));
-                }
-                // #2336 — an indefinite exact `A` leaves the Laplace normaliser
-                // `½log|A|` UNDEFINED at this ρ, so this evaluation is INFEASIBLE, not
-                // defective. That is the same class `is_recoverable_value_probe_refusal`
-                // already maps to `+inf`, for the reason its #1782 note gives: the
-                // indefinite basin is adjacent to the PD optimum, so the outer solver
-                // must read `+∞` and steer back into the PD region rather than abort the
-                // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
-                // what made this reachable — the majorizer `B` was PD by construction and
-                // could never trip it. The criterion prices directions its bounded ARD concave
-                // clamp explains (λ + vᵀEv ≥ −floor), and on the dense route it first descends
-                // each remaining refused direction inside the same gate-frozen evaluation
-                // (#2080). A refusal that reaches here is a saddle no refused direction can
-                // descend by more than the material floor, so this probe stays infeasible.
-                Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
-                    self.probe_telemetry.record_refusal_kind(&err.to_string());
-                    log::trace!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
-                    self.probe_telemetry.infeasible_criterion_evals += 1;
-                    return Ok(OuterEval::infeasible(rho.len()));
-                }
-                Err(SaeCriterionError::Numerical(err)) => {
-                    return Err(EstimationError::RemlOptimizationFailed(err));
-                }
-                // #2234 — a missing route capability, fatal at every ρ rather than infeasible here.
-                Err(err @ SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { .. }) => {
-                    return Err(EstimationError::RemlOptimizationFailed(err.to_string()));
-                }
-            };
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
+            // A non-PD per-row/cross-row/Schur factor has no defined Laplace
+            // evidence at this ρ. Return the objective contract's typed
+            // infeasible evaluation so the optimizer rejects/backtracks. A
+            // finite sentinel here would be a different objective. Genuine
+            // evaluation defects still hard-error below.
+            Err(SaeCriterionError::Numerical(err))
+                if Self::is_recoverable_value_probe_refusal(&err) =>
+            {
+                self.probe_telemetry.record_refusal_kind(&err);
+                log::trace!("SAE criterion eval mapped refusal to +inf: {err}");
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
+            // #2336 — an indefinite exact `A` leaves the Laplace normaliser
+            // `½log|A|` UNDEFINED at this ρ, so this evaluation is INFEASIBLE, not
+            // defective. That is the same class `is_recoverable_value_probe_refusal`
+            // already maps to `+inf`, for the reason its #1782 note gives: the
+            // indefinite basin is adjacent to the PD optimum, so the outer solver
+            // must read `+∞` and steer back into the PD region rather than abort the
+            // whole fit. #2330 Phase-2a made `½log|A|` the ranked value, which is
+            // what made this reachable — the majorizer `B` was PD by construction and
+            // could never trip it. The criterion prices directions its bounded ARD concave
+            // clamp explains (λ + vᵀEv ≥ −floor), and on the dense route it first descends
+            // each remaining refused direction inside the same gate-frozen evaluation
+            // (#2080). A refusal that reaches here is a saddle no refused direction can
+            // descend by more than the material floor, so this probe stays infeasible.
+            Err(err @ SaeCriterionError::IndefiniteObservedInformation { .. }) => {
+                self.probe_telemetry.record_refusal_kind(&err.to_string());
+                log::trace!("SAE criterion mapped indefinite-A refusal to +inf: {err}");
+                self.probe_telemetry.infeasible_criterion_evals += 1;
+                return Ok(OuterEval::infeasible(rho.len()));
+            }
+            Err(SaeCriterionError::Numerical(err)) => {
+                return Err(EstimationError::RemlOptimizationFailed(err));
+            }
+            // #2234 — a missing route capability, fatal at every ρ rather than infeasible here.
+            Err(err @ SaeCriterionError::OrbitCriterionUnavailableOnArrowRoute { .. }) => {
+                return Err(EstimationError::RemlOptimizationFailed(err.to_string()));
+            }
+        };
         let cost = evaluation.cost;
         self.record_fit_data_collapse_verdict(&rho_state)
             .map_err(EstimationError::RemlOptimizationFailed)?;

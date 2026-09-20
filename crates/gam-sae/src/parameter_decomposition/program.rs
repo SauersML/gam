@@ -1224,6 +1224,48 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         value
     }
 
+    /// Whether every control `body_id` reaches resolves to exactly `1` where it runs:
+    /// a node's own controls at `path`, and a called, composed or refined body's at the
+    /// path its invocation pushes, so a scope set on a deeper invocation is seen.
+    fn all_on_below(&self, body_id: BodyId, path: &mut Vec<CallSite>) -> bool {
+        let program = self.program;
+        let within = |site: CallSite, callee: BodyId, path: &mut Vec<CallSite>| {
+            path.push(site);
+            let reached = self.all_on_below(callee, path);
+            path.pop();
+            reached
+        };
+        program.parts.bodies[body_id.index()].nodes.iter().enumerate().all(|(i, node)| {
+            let site = CallSite { body: body_id, node: NodeId(i as u32), stage: 0 };
+            match node {
+                Node::Input { .. } | Node::Read { .. } | Node::Write { .. } => true,
+                Node::Native { primitive, .. } => {
+                    let coordinates: &[ControlId] = match primitive {
+                        NativePrimitive::CoordinateMask { controls } => controls,
+                        _ => &[],
+                    };
+                    coordinates.iter().all(|&control| self.resolve(control, path) == 1.0)
+                        && primitive.parameters().iter().all(|parameter| {
+                            program.parts.parameters[parameter.index()]
+                                .controls
+                                .iter()
+                                .all(|&control| self.resolve(control, path) == 1.0)
+                        })
+                }
+                Node::Sum { terms } => terms
+                    .iter()
+                    .all(|term| term.control.is_none_or(|control| self.resolve(control, path) == 1.0)),
+                Node::Compose { stages, .. } => stages.iter().enumerate().all(|(k, stage)| {
+                    stage.control.is_none_or(|control| self.resolve(control, path) == 1.0)
+                        && within(CallSite { stage: k as u32, ..site }, stage.body, path)
+                }),
+                Node::Call { body: callee, .. } | Node::Refine { mechanism: callee, .. } => {
+                    within(site, *callee, path)
+                }
+            }
+        })
+    }
+
     fn parameter_controls(&self, parameter: ParameterSlot, path: &[CallSite]) -> Vec<f64> {
         self.program.parts.parameters[parameter.index()]
             .controls
@@ -1567,10 +1609,7 @@ impl<'a, S: ParameterSource> Executor<'a, S> {
         arguments: Vec<NodeValue>,
         path: &mut Vec<CallSite>,
     ) -> Result<NodeValue, ExecutionError<S::Error>> {
-        let program = self.program;
-        let all_on = program.controls_below[mechanism.index()]
-            .iter()
-            .all(|&control| self.resolve(control, path) == 1.0);
+        let all_on = self.all_on_below(mechanism, path);
         if self.residuals.is_none() {
             let chosen = if all_on { native } else { mechanism };
             return self.body(chosen, arguments, path);
@@ -3218,6 +3257,86 @@ mod tests {
             .expect("residual execution");
         assert!(!half_residuals[0].all_on);
         assert_eq!(*half_execution.output, run(&program, &source, &half, &x));
+    }
+
+    #[test]
+    fn a_refinement_resolves_each_reached_control_at_the_invocation_where_it_runs() {
+        // The native body is `2 x`. The mechanism reaches the shared body's one term
+        // control `m`, `m x`, through a call or through a composition's second stage, so
+        // that control runs one invocation below the refinement.
+        let build = |mechanism: Body, stage: Vec<Body>| {
+            let mut bodies = vec![
+                body(
+                    "entry",
+                    1,
+                    vec![
+                        Node::Input { port: 0 },
+                        Node::Refine { native: BodyId(1), mechanism: BodyId(2), arguments: vec![NodeId(0)] },
+                    ],
+                ),
+                body("native", 1, vec![Node::Input { port: 0 }, Node::Sum { terms: vec![term(0, None), term(0, None)] }]),
+                mechanism,
+                body("shared", 1, vec![Node::Input { port: 0 }, Node::Sum { terms: vec![term(0, Some(0))] }]),
+            ];
+            bodies.extend(stage);
+            Program::new(ProgramParts {
+                parameters: Vec::new(),
+                slots: Vec::new(),
+                controls: named_controls(1),
+                mask_groups: singleton_groups(1),
+                bodies,
+                entry: BodyId(0),
+            })
+            .expect("a valid program")
+        };
+        let called = build(
+            body("mechanism", 1, vec![Node::Input { port: 0 }, Node::Call { body: BodyId(3), arguments: vec![NodeId(0)] }]),
+            Vec::new(),
+        );
+        let composed = build(
+            body(
+                "mechanism",
+                1,
+                vec![
+                    Node::Input { port: 0 },
+                    Node::Compose {
+                        value: NodeId(0),
+                        stages: vec![
+                            ComposeStage { body: BodyId(4), control: None },
+                            ComposeStage { body: BodyId(3), control: None },
+                        ],
+                    },
+                ],
+            ),
+            vec![body("identity", 1, vec![Node::Input { port: 0 }, Node::Sum { terms: vec![term(0, None)] }])],
+        );
+        let source = DenseParameters::new(Vec::new());
+        let x = array![[1.0, -2.0]];
+        let refinement = CallSite { body: BodyId(0), node: NodeId(1), stage: 0 };
+        let mechanism_node = CallSite { body: BodyId(2), node: NodeId(1), stage: 0 };
+        for (program, inner) in [(&called, mechanism_node), (&composed, CallSite { stage: 1, ..mechanism_node })] {
+            let deep = vec![refinement, inner];
+            assert_eq!(run(program, &source, &MaskAssignment::all_on(), &x), &x * 2.0);
+            // A scope on the refinement reaches the control below it.
+            let mut shallow = MaskAssignment::all_on();
+            shallow.set(MaskGroupId(0), vec![refinement], 0.5).expect("a new scope");
+            assert_eq!(run(program, &source, &shallow, &x), &x * 0.5);
+            // A scope on the invocation where the control runs deletes it there, so the
+            // mechanism runs, and the residual records the refinement as not all-on.
+            let mut deleted = MaskAssignment::all_on();
+            deleted.set(MaskGroupId(0), deep.clone(), 0.0).expect("a new scope");
+            assert_eq!(run(program, &source, &deleted, &x), array![[0.0, 0.0]]);
+            let (execution, residuals) = program
+                .refinement_residuals(&source, &deleted, vec![x.clone()], Vec::new(), &row_positions(&x))
+                .expect("residual execution");
+            assert_eq!(*execution.output, array![[0.0, 0.0]]);
+            assert!(!residuals[0].all_on);
+            // A deeper scope of `1` overrides the global value where the control runs,
+            // so every reached control is on and the native body runs.
+            let mut restored = global(&[(0, 0.5)]);
+            restored.set(MaskGroupId(0), deep, 1.0).expect("a new scope");
+            assert_eq!(run(program, &source, &restored, &x), &x * 2.0);
+        }
     }
 
     #[test]

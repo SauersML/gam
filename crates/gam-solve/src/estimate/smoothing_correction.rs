@@ -248,13 +248,17 @@ pub(crate) enum SmoothingCorrectionUnavailable {
     OuterHessian {
         error: String,
     },
-    OuterHessianInverse { error: String },
+    OuterHessianInverse {
+        error: String,
+    },
     PenaltyDimension {
         rho: usize,
         lambdas: usize,
         canonical_penalties: usize,
     },
-    PenaltyStructure { error: String },
+    PenaltyStructure {
+        error: String,
+    },
     NonFiniteCorrection,
 }
 
@@ -377,12 +381,9 @@ fn smoothing_correction_factor(
     let active_directions: Vec<usize> = classifications
         .iter()
         .enumerate()
-        .filter_map(|(index, class)| {
-            matches!(class, EigenClassification::Active).then_some(index)
-        })
+        .filter_map(|(index, class)| matches!(class, EigenClassification::Active).then_some(index))
         .collect();
-    let mut factor_trans =
-        Array2::<f64>::zeros((jacobian_trans.nrows(), active_directions.len()));
+    let mut factor_trans = Array2::<f64>::zeros((jacobian_trans.nrows(), active_directions.len()));
     for (factor_column, &eigen_index) in active_directions.iter().enumerate() {
         let eigenvalue = eigenvalues[eigen_index];
         assert!(
@@ -569,6 +570,12 @@ pub(crate) fn eigenpair_residual_bounds(
 /// excludes no coordinate; [`invert_identified_rho_hessian_off_railed`] takes
 /// the certificate's railed set and excludes it through that same call, which
 /// is what the fitted-model correction does.
+///
+/// The ρ-Hessian must be exactly symmetric ([`RHO_HESSIAN_ASSEMBLY`]): its two
+/// triangles are separate accumulations of the same mixed partial, so their
+/// difference is assembly error rather than rounding, and the caller
+/// symmetrizes and forwards that measured defect through
+/// `caller_measured_hessian_error` instead of having it judged here as noise.
 pub fn invert_identified_rho_hessian(
     hessian_rho: &Array2<f64>,
     expected_structural_nullity: usize,
@@ -585,6 +592,12 @@ pub fn invert_identified_rho_hessian(
         caller_measured_hessian_error,
     )
 }
+
+/// Assembly provenance of the ρ-Hessian both entry points take: symmetrized
+/// by the caller (Clairaut), whose skew part is forwarded as a measured
+/// `‖δH‖₂` component (#2748), so the matrix handed in is exactly mirrored.
+pub const RHO_HESSIAN_ASSEMBLY: gam_linalg::roundoff::SymmetricAssembly =
+    gam_linalg::roundoff::SymmetricAssembly::Mirrored;
 
 /// [`invert_identified_rho_hessian`] judged off the coordinates the outer
 /// certificate railed, the face the certificate itself judged on.
@@ -624,8 +637,12 @@ pub fn invert_identified_rho_hessian_off_railed(
     // Reject a non-finite Hessian before the eigensolver sees it: a NaN spectrum
     // would otherwise classify as "unresolvable" rather than as the hard input
     // defect it is.
-    gam_linalg::utils::validate_finite_symmetric_matrix(hessian_rho, "rho Hessian")
-        .map_err(|error| error.to_string())?;
+    gam_linalg::utils::validate_finite_symmetric_matrix(
+        hessian_rho,
+        RHO_HESSIAN_ASSEMBLY,
+        "rho Hessian",
+    )
+    .map_err(|error| error.to_string())?;
 
     // #2676: the criterion is EXACTLY constant along `diag(lambda)^{-1} null(G)`,
     // so the curvature there is `sum_k g_k t_k^2` — the chain-rule term, not a
@@ -698,7 +715,8 @@ pub fn invert_identified_rho_hessian_off_railed(
     };
     let removed = judged.as_ref().and_then(|basis| {
         let mut kept = Array2::<f64>::zeros((n, basis.ncols() + railed_dimension));
-        kept.slice_mut(ndarray::s![.., ..basis.ncols()]).assign(basis);
+        kept.slice_mut(ndarray::s![.., ..basis.ncols()])
+            .assign(basis);
         kept.slice_mut(ndarray::s![.., basis.ncols()..])
             .assign(&railed_axes);
         crate::penalty_invariance::deflated_directions(n, &kept)
@@ -748,10 +766,11 @@ pub fn invert_identified_rho_hessian_off_railed(
         eigenpair_backward_error_bound(work, &judged_eigenvalues, &judged_eigenvectors)?
             .resolution()
     };
-    let mut measured_hessian_error = vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
-        "eigensolver backward error",
-        eigensolver_backward_error,
-    )];
+    let mut measured_hessian_error =
+        vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
+            "eigensolver backward error",
+            eigensolver_backward_error,
+        )];
     // Whatever the caller measured on the SAME matrix at the same point. The
     // assembly's own error is not visible from inside this function -- it only
     // ever sees the finished matrix -- so a caller that holds an exactly-zero
@@ -759,12 +778,10 @@ pub fn invert_identified_rho_hessian_off_railed(
     // here rather than throwing it away.
     measured_hessian_error.extend_from_slice(caller_measured_hessian_error);
     if let Some(value) = assembly_inconsistency {
-        measured_hessian_error.push(
-            gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                "penalty-map invariance residual |T'(H_rho - diag(g_rho))T|_2",
-                value,
-            ),
-        );
+        measured_hessian_error.push(gam_linalg::curvature_resolution::MeasuredHessianError::new(
+            "penalty-map invariance residual |T'(H_rho - diag(g_rho))T|_2",
+            value,
+        ));
     }
     let curvature_resolution =
         gam_linalg::curvature_resolution::CurvatureResolution::analytic_weyl_from_components(
@@ -966,9 +983,12 @@ pub fn invert_identified_rho_hessian_off_railed(
     // today moves by a single ulp — the eigen route below engages only where the
     // old code aborted.
     if active_rank == n {
-        let certified =
-            gam_linalg::utils::certified_spd_inverse(hessian_rho, "unperturbed rho Hessian")
-                .map_err(|error| error.to_string())?;
+        let certified = gam_linalg::utils::certified_spd_inverse(
+            hessian_rho,
+            RHO_HESSIAN_ASSEMBLY,
+            "unperturbed rho Hessian",
+        )
+        .map_err(|error| error.to_string())?;
         return Ok(InvertedRhoHessian {
             inverse: certified.into_inverse(),
             active_rank: n,
@@ -1012,7 +1032,9 @@ pub fn invert_identified_rho_hessian_off_railed(
     // gradient, at the one site whose whole purpose is to stop doing that.
     let (certify_matrix, certify_inverse, certify_projector) = match judged.as_ref() {
         Some(basis) => (
-            compressed.clone().expect("a judged basis implies a compression"),
+            compressed
+                .clone()
+                .expect("a judged basis implies a compression"),
             basis.t().dot(&inverse).dot(basis),
             basis.t().dot(&projector).dot(basis),
         ),
@@ -1020,6 +1042,9 @@ pub fn invert_identified_rho_hessian_off_railed(
     };
     let matrix_max_abs = gam_linalg::utils::validate_finite_symmetric_matrix(
         &certify_matrix,
+        // Either the caller's mirrored ρ-Hessian or its judged-subspace
+        // compression, which `compress_to_judged_subspace` symmetrizes.
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         "structurally singular rho Hessian",
     )
     .map_err(|error| error.to_string())?;
@@ -1270,10 +1295,7 @@ fn dump_indefinite_rho_hessian_diagnostic(
             intrinsic.push(eigenvalues_ref[i] - signed);
             floor.push(absolute);
         }
-        log::debug!(
-            "[INDEF-HESS] outer_gradient={:?}",
-            outer_gradient.to_vec(),
-        );
+        log::debug!("[INDEF-HESS] outer_gradient={:?}", outer_gradient.to_vec(),);
         log::debug!(
             "[INDEF-HESS] reparam_split sigma={sigma:?} reparam=sum_k g_k v_k^2={reparam:?} \
              intrinsic=sigma-reparam={intrinsic:?} gradient_floor=sum_k |g_k| v_k^2={floor:?} \
@@ -1606,23 +1628,22 @@ pub(crate) fn compute_smoothing_correction(
             ),
         };
     }
-    let invariance =
-        match crate::penalty_invariance::PenaltyMapInvariance::from_canonical_penalties(
-            &original_applied,
-            reml_state.p,
-        ) {
-            Ok(invariance) => invariance,
-            Err(error) => {
-                return SmoothingCorrectionComputation {
-                    factor: None,
-                    rho_covariance: None,
-                    active_rank: None,
-                    status: SmoothingCorrectionStatus::Unavailable(
-                        SmoothingCorrectionUnavailable::PenaltyStructure { error },
-                    ),
-                };
-            }
-        };
+    let invariance = match crate::penalty_invariance::PenaltyMapInvariance::from_canonical_penalties(
+        &original_applied,
+        reml_state.p,
+    ) {
+        Ok(invariance) => invariance,
+        Err(error) => {
+            return SmoothingCorrectionComputation {
+                factor: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::PenaltyStructure { error },
+                ),
+            };
+        }
+    };
     let structural_nullity = invariance.dimension();
     let lifted_invariance = invariance.theta_directions(lambdas, n_rho, 0);
 
@@ -1761,23 +1782,26 @@ pub(crate) fn compute_smoothing_correction(
     // penalty block, and skip structurally inactive columns. Exact on a
     // block-decoupled Hessian (entries outside the cone are identically zero)
     // and identical to the full joint solve on a fully coupled Hessian.
-    let jacobian_trans =
-        match sensitivity.mode_response_coned(h_trans.view(), dg_drho_trans.view(), &col_supports) {
-            Some(jacobian) => jacobian,
-            None => {
-                log::debug!(
-                    "IFT beta-rho sensitivity solve failed for smoothing correction; skipping."
-                );
-                return SmoothingCorrectionComputation {
-                    factor: None,
-                    rho_covariance: None,
-                    active_rank: None,
-                    status: SmoothingCorrectionStatus::Unavailable(
-                        SmoothingCorrectionUnavailable::SensitivitySolve,
-                    ),
-                };
-            }
-        };
+    let jacobian_trans = match sensitivity.mode_response_coned(
+        h_trans.view(),
+        dg_drho_trans.view(),
+        &col_supports,
+    ) {
+        Some(jacobian) => jacobian,
+        None => {
+            log::debug!(
+                "IFT beta-rho sensitivity solve failed for smoothing correction; skipping."
+            );
+            return SmoothingCorrectionComputation {
+                factor: None,
+                rho_covariance: None,
+                active_rank: None,
+                status: SmoothingCorrectionStatus::Unavailable(
+                    SmoothingCorrectionUnavailable::SensitivitySolve,
+                ),
+            };
+        }
+    };
 
     // Step 2: Build V_rho by inverting the LAML Hessian in rho-space.
     // The authoritative inner-strategy path chooses the rho-space Hessian
@@ -1909,26 +1933,21 @@ pub(crate) fn compute_smoothing_correction(
         lifted_invariance.as_ref(),
         railed,
         &{
-            let mut components =
-                vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                    "rho-Hessian symmetrization defect |(H - H')/2|_2",
-                    symmetrization_defect,
-                )];
+            let mut components = vec![gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                "rho-Hessian symmetrization defect |(H - H')/2|_2",
+                symmetrization_defect,
+            )];
             if let Some(defect) = assembly_reevaluation_defect {
-                components.push(
-                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                        "outer-vs-correction rho-Hessian re-assembly defect |H_correction - H_outer|_2",
-                        defect,
-                    ),
-                );
+                components.push(gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                    "outer-vs-correction rho-Hessian re-assembly defect |H_correction - H_outer|_2",
+                    defect,
+                ));
             }
             if let Some(defect) = gradient_reevaluation_defect {
-                components.push(
-                    gam_linalg::curvature_resolution::MeasuredHessianError::new(
-                        "outer-gradient re-evaluation defect max_k |g_fresh - g_outer|",
-                        defect,
-                    ),
-                );
+                components.push(gam_linalg::curvature_resolution::MeasuredHessianError::new(
+                    "outer-gradient re-evaluation defect max_k |g_fresh - g_outer|",
+                    defect,
+                ));
             }
             // #2748: whatever standard the OUTER certificate judged this same
             // matrix at this same point against, so this gate does not re-decide
@@ -2037,7 +2056,11 @@ pub(crate) fn compute_smoothing_correction(
 
     // Validate the result: every diagonal entry `‖b_i‖²` of `C = B Bᵀ` finite,
     // which bounds every off-diagonal entry `|b_iᵀ b_j| ≤ ‖b_i‖‖b_j‖` as well.
-    if !factor_orig.rows().into_iter().all(|row| row.dot(&row).is_finite()) {
+    if !factor_orig
+        .rows()
+        .into_iter()
+        .all(|row| row.dot(&row).is_finite())
+    {
         log::debug!("Non-finite values in smoothing correction matrix; skipping.");
         return SmoothingCorrectionComputation {
             factor: None,
@@ -2064,17 +2087,10 @@ mod smoothing_correction_gram_tests {
     #[test]
     fn zero_mode_response_produces_bit_exact_zero_covariance_2490() {
         let jacobian = Array2::<f64>::zeros((3, 2));
-        let qs = array![
-            [1.0_f64, 0.25, -0.5],
-            [0.0, 0.75, 0.125],
-            [0.5, -0.25, 1.0],
-        ];
+        let qs = array![[1.0_f64, 0.25, -0.5], [0.0, 0.75, 0.125], [0.5, -0.25, 1.0],];
         let eigenvalues = array![0.5_f64, 2.0];
         let eigenvectors = Array2::<f64>::eye(2);
-        let classifications = vec![
-            EigenClassification::Active,
-            EigenClassification::Active,
-        ];
+        let classifications = vec![EigenClassification::Active, EigenClassification::Active];
 
         let correction = smoothing_correction_gram(&smoothing_correction_factor(
             &jacobian,
@@ -2096,26 +2112,12 @@ mod smoothing_correction_gram_tests {
 
     #[test]
     fn factor_gram_matches_dense_congruence_with_nonnegative_diagonal_2490() {
-        let jacobian = array![
-            [1.0_f64, -2.0],
-            [3.0, 4.0],
-            [-5.0, 6.0],
-        ];
-        let qs = array![
-            [1.0_f64, 0.0, 0.0],
-            [0.0, 0.8, -0.6],
-            [0.0, 0.6, 0.8],
-        ];
+        let jacobian = array![[1.0_f64, -2.0], [3.0, 4.0], [-5.0, 6.0],];
+        let qs = array![[1.0_f64, 0.0, 0.0], [0.0, 0.8, -0.6], [0.0, 0.6, 0.8],];
         let inv_sqrt_two = 2.0_f64.sqrt().recip();
-        let eigenvectors = array![
-            [inv_sqrt_two, -inv_sqrt_two],
-            [inv_sqrt_two, inv_sqrt_two],
-        ];
+        let eigenvectors = array![[inv_sqrt_two, -inv_sqrt_two], [inv_sqrt_two, inv_sqrt_two],];
         let eigenvalues = array![0.25_f64, 4.0];
-        let classifications = vec![
-            EigenClassification::Active,
-            EigenClassification::Active,
-        ];
+        let classifications = vec![EigenClassification::Active, EigenClassification::Active];
 
         let correction = smoothing_correction_gram(&smoothing_correction_factor(
             &jacobian,

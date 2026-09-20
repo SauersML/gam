@@ -53,7 +53,11 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
     state.record_value(value_only, &theta, warm(1.0), true);
     state.record_value(value_only, &theta, warm(9.0), false);
     let (_, candidates) = state.candidates(value_only, &theta, &rho);
-    assert_eq!(candidates.len(), 1, "one start per evaluation, never a cold solve beside it");
+    assert_eq!(
+        candidates.len(),
+        1,
+        "one start per evaluation, never a cold solve beside it"
+    );
     assert_eq!(anchor_beta(&candidates), 1.0);
     state.record_value(value_only, &theta, warm(2.0), true);
 
@@ -106,7 +110,11 @@ pub(crate) fn exact_ctn_mode_branch_anchors_on_the_accepted_iterate_2765() {
         "the accepted iterate at θ keeps its own certified mode"
     );
     let (_, candidates) = state.candidates(value_only, &array![2.0], &rho);
-    assert_eq!(anchor_beta(&candidates), 10.0, "a θ no iterate owns starts from the anchor");
+    assert_eq!(
+        anchor_beta(&candidates),
+        10.0,
+        "a θ no iterate owns starts from the anchor"
+    );
 
     // A branch that has never seen a mode solves cold at its first iterate.
     let mut cold =
@@ -210,7 +218,11 @@ pub(crate) fn a_gradient_bearing_trial_the_optimizer_did_not_accept_leaves_the_a
     );
     state.record_value(with_gradient, &array![3.0], warm(7.0), true);
     let (_, candidates) = state.candidates(value_only, &array![3.1], &rho);
-    assert_eq!(anchor_beta(&candidates), 7.0, "the new walk's starting iterate anchors at once");
+    assert_eq!(
+        anchor_beta(&candidates),
+        7.0,
+        "the new walk's starting iterate anchors at once"
+    );
 }
 
 pub(crate) fn dense_first_order_psi_hessian(terms: &ExactNewtonJointPsiTerms) -> Array2<f64> {
@@ -285,10 +297,7 @@ pub(crate) fn prebuilt_ctn_family_uses_explicit_rho_without_reseeding() {
     let supplied = family
         .block_spec(&explicit)
         .expect("explicit-rho coefficient block");
-    assert!(beta_bits_match(
-        &supplied.initial_log_lambdas,
-        &explicit,
-    ));
+    assert!(beta_bits_match(&supplied.initial_log_lambdas, &explicit,));
     assert!(beta_bits_match(
         supplied.initial_beta.as_ref().expect("initial beta"),
         &family.initial_beta,
@@ -396,7 +405,10 @@ pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
     let (val_basis, deriv_basis, response_penalties, knots, transform) =
         build_response_basis(&response, &config).expect("response basis builds");
     let n_response = response_penalties.len();
-    assert!(n_response >= 1, "toy config must carry a response roughness penalty");
+    assert!(
+        n_response >= 1,
+        "toy config must carry a response roughness penalty"
+    );
     let p_shape = val_basis.ncols() - 1;
     let affine = affine_shape_direction(knots.view(), config.response_degree, p_shape)
         .expect("affine shape direction");
@@ -454,14 +466,16 @@ pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
     // The double penalty is the full-rank shape-row ridge shape_resp ⊗ I_cov:
     // its covariate factor MUST be the identity (not the rank-deficient G_x), so
     // it pins weakly-identified shape×covariate directions (no rank_deficient_H_pen).
-    let PenaltyMatrix::KroneckerFactored { left, right } =
-        &family.tensor_penalties[double_index]
+    let PenaltyMatrix::KroneckerFactored { left, right } = &family.tensor_penalties[double_index]
     else {
         panic!("double penalty must be Kronecker-factored");
     };
     for ((i, j), &value) in right.indexed_iter() {
         let want: f64 = if i == j { 1.0 } else { 0.0 };
-        assert_eq!(value, want, "double penalty covariate factor must be identity");
+        assert_eq!(
+            value, want,
+            "double penalty covariate factor must be identity"
+        );
     }
     // The shape-row ridge is the ORTHOGONAL PROJECTOR onto the shape rows minus
     // the affine direction, not the bare identity (gam#2600): a ridge that
@@ -499,8 +513,7 @@ pub(crate) fn ctn_tensor_penalty_layout_orders_covariate_response_double() {
 pub(crate) fn ctn_response_penalty_gx_first_order_kappa_derivative_matches_fd() {
     let psi = array![0.15, -0.10];
     let h = 1e-6;
-    let (family, blocks, _state, _spec) =
-        toy_family_and_derivatives_with_penalty_mode(&psi, true);
+    let (family, blocks, _state, _spec) = toy_family_and_derivatives_with_penalty_mode(&psi, true);
     let p_total = family.p_total();
     let n_pen = family.tensor_penalties.len();
     assert!(
@@ -554,8 +567,7 @@ pub(crate) fn ctn_response_penalty_gx_first_order_kappa_derivative_matches_fd() 
 pub(crate) fn ctn_response_penalty_gx_second_order_kappa_derivative_matches_fd() {
     let psi = array![0.15, -0.10];
     let h = 1e-5;
-    let (family, _blocks, _state, _spec) =
-        toy_family_and_derivatives_with_penalty_mode(&psi, true);
+    let (family, _blocks, _state, _spec) = toy_family_and_derivatives_with_penalty_mode(&psi, true);
     let p_total = family.p_total();
     let n_pen = family.tensor_penalties.len();
     let lambdas = Array1::<f64>::ones(n_pen);
@@ -1104,8 +1116,10 @@ pub(crate) fn warm_start_absorbs_offset_into_affine_seed() {
     let expected_h: Array1<f64> = response.mapv(|y| {
         (y - location) / scale + TRANSFORMATION_MONOTONICITY_EPS * (y - family.response_median())
     });
-    let expected_h_prime =
-        Array1::from_elem(response.len(), 1.0 / scale + TRANSFORMATION_MONOTONICITY_EPS);
+    let expected_h_prime = Array1::from_elem(
+        response.len(),
+        1.0 / scale + TRANSFORMATION_MONOTONICITY_EPS,
+    );
 
     for i in 0..expected_h.len() {
         assert!(
@@ -2690,8 +2704,7 @@ pub(crate) fn ctn_response_penalty_is_exact_ispline_function_roughness() {
     for r in 0..p_shape {
         for c in 0..p_shape {
             assert!(
-                (block[[r, c]] - expected[[r, c]]).abs()
-                    <= 1e-12 * expected[[r, c]].abs().max(1.0),
+                (block[[r, c]] - expected[[r, c]]).abs() <= 1e-12 * expected[[r, c]].abs().max(1.0),
                 "shape block ({r},{c}) = {:.6e} but exact function roughness = {:.6e}",
                 block[[r, c]],
                 expected[[r, c]],
@@ -2701,12 +2714,14 @@ pub(crate) fn ctn_response_penalty_is_exact_ispline_function_roughness() {
 
     // Discriminator: the retired coefficient-difference operator is a DIFFERENT
     // matrix, so the cutover genuinely changed the penalized metric.
-    let difference =
-        gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
+    let difference = gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
     let mut max_rel = 0.0_f64;
     for r in 0..p_shape {
         for c in 0..p_shape {
-            let scale = expected[[r, c]].abs().max(difference[[r, c]].abs()).max(1e-9);
+            let scale = expected[[r, c]]
+                .abs()
+                .max(difference[[r, c]].abs())
+                .max(1e-9);
             max_rel = max_rel.max((expected[[r, c]] - difference[[r, c]]).abs() / scale);
         }
     }
@@ -2736,7 +2751,10 @@ pub(crate) fn ctn_response_penalty_matches_direct_function_roughness_quadrature(
     beta.slice_mut(s![1..]).assign(&beta_shape);
 
     let quad_form = beta.dot(&penalties[0].dot(&beta));
-    assert!(quad_form > 0.0, "roughness of a nontrivial shape must be positive");
+    assert!(
+        quad_form > 0.0,
+        "roughness of a nontrivial shape must be positive"
+    );
 
     // Direct Simpson quadrature of the m-th derivative squared over the full
     // knot support.
@@ -2769,8 +2787,7 @@ pub(crate) fn ctn_response_penalty_matches_direct_function_roughness_quadrature(
 
     // The scale-free difference operator does NOT reproduce the function-space
     // roughness — this is exactly why the difference operator was wrong.
-    let difference =
-        gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
+    let difference = gam_linalg_test_support::coefficient_difference_penalty(p_shape, order);
     let difference_form = beta_shape.dot(&difference.dot(&beta_shape));
     let diff_rel = (difference_form - integral).abs() / integral.abs();
     assert!(
@@ -2825,7 +2842,10 @@ pub(crate) fn ctn_covariate_penalty_is_response_mass_gram_function_roughness() {
     let PenaltyMatrix::KroneckerFactored { left, right } = &family.tensor_penalties[0] else {
         panic!("covariate-direction penalty must be Kronecker-factored");
     };
-    assert_eq!(right, &s_cov, "right factor must be the covariate roughness Gram");
+    assert_eq!(
+        right, &s_cov,
+        "right factor must be the covariate roughness Gram"
+    );
     assert_eq!(left.dim(), (p_resp, p_resp));
     for ((r, c), &value) in left.indexed_iter() {
         let want = expected_g_resp[[r, c]];
@@ -3264,8 +3284,7 @@ pub(crate) fn ctn_hessian_beta_derivatives_are_derivatives_of_the_value_hessian_
     let analytic_d2h = family
         .scop_hessian_second_directional_derivative(&state.beta, &u, &v, &quantities)
         .expect("dense SCOP d2H");
-    let fd_d2h = (directional_at(&shifted(&v, step), &u)
-        - directional_at(&shifted(&v, -step), &u))
+    let fd_d2h = (directional_at(&shifted(&v, step), &u) - directional_at(&shifted(&v, -step), &u))
         / (2.0 * step);
     assert_matrix_derivativefd_rel(
         &fd_d2h,
@@ -3384,7 +3403,10 @@ pub(crate) fn ctn_scop_curvature_producers_match_exact_derivatives_of_the_likeli
                                 HyperDual<HyperDual<f64, f64>, f64>,
                             )| {
                                 let mut coefficients: Vec<HyperDual<HyperDual<f64, f64>, f64>> =
-                                    point.iter().map(|&value| HyperDual::from_re(value)).collect();
+                                    point
+                                        .iter()
+                                        .map(|&value| HyperDual::from_re(value))
+                                        .collect();
                                 coefficients[a] = x;
                                 coefficients[b] = y;
                                 scop_negative_log_likelihood(&family, cov, &coefficients)
@@ -3440,8 +3462,16 @@ pub(crate) fn ctn_scop_curvature_producers_match_exact_derivatives_of_the_likeli
     // `∇²f` with its directional derivatives.
     for a in 0..p_total {
         assert_close(&format!("score[{a}]"), produced_score[a], -score[a]);
-        assert_close(&format!("scop_gradient[{a}]"), produced_gradient[a], -score[a]);
-        assert_close(&format!("diagonal[{a}]"), produced_diagonal[a], hessian[[a, a]]);
+        assert_close(
+            &format!("scop_gradient[{a}]"),
+            produced_gradient[a],
+            -score[a],
+        );
+        assert_close(
+            &format!("diagonal[{a}]"),
+            produced_diagonal[a],
+            hessian[[a, a]],
+        );
         assert_close(&format!("matvec[{a}]"), produced_matvec[a], exact_matvec[a]);
         for b in 0..p_total {
             assert_close(
@@ -3449,7 +3479,11 @@ pub(crate) fn ctn_scop_curvature_producers_match_exact_derivatives_of_the_likeli
                 produced_information[[a, b]],
                 hessian[[a, b]],
             );
-            assert_close(&format!("dH[u][{a},{b}]"), produced_u[[a, b]], hessian_u[[a, b]]);
+            assert_close(
+                &format!("dH[u][{a},{b}]"),
+                produced_u[[a, b]],
+                hessian_u[[a, b]],
+            );
             assert_close(
                 &format!("d2H[u,v][{a},{b}]"),
                 produced_uv[[a, b]],
@@ -3458,7 +3492,11 @@ pub(crate) fn ctn_scop_curvature_producers_match_exact_derivatives_of_the_likeli
         }
     }
     // Every compared channel has to carry curvature, or the comparison is vacuous.
-    let peak = |matrix: &Array2<f64>| matrix.iter().fold(0.0_f64, |acc, value| acc.max(value.abs()));
+    let peak = |matrix: &Array2<f64>| {
+        matrix
+            .iter()
+            .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+    };
     for (label, matrix) in [
         ("information", &hessian),
         ("dH[u]", &hessian_u),
@@ -3536,7 +3574,11 @@ pub(crate) fn ctn_penalized_objective_is_coercive_in_the_location_column_2600() 
     // shape is the affine transformation that standardizes the response, which
     // is where an honest fit sits.
     let mean = response.sum() / n as f64;
-    let variance = response.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n as f64;
+    let variance = response
+        .iter()
+        .map(|y| (y - mean) * (y - mean))
+        .sum::<f64>()
+        / n as f64;
     let base_slope = 1.0 / variance.sqrt();
     let penalized_objective = |kappa: f64| -> f64 {
         let mut beta = Array1::<f64>::zeros(p_resp);
@@ -3635,7 +3677,8 @@ pub(crate) fn ctn_observed_information_is_positive_semidefinite_2600() {
             .scop_gradient_and_negative_hessian(&beta, &quantities)
             .expect("exact SCOP information at a feasible point");
         let (eigenvalues, _) =
-            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
+            // Mirrored `fast_xt_diag_x` blocks, placed with their transposes.
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, gam_linalg::roundoff::SymmetricAssembly::Mirrored, faer::Side::Lower)
                 .expect("symmetric eigendecomposition of the observed information");
         let largest = eigenvalues.iter().fold(0.0_f64, |a, v| a.max(v.abs()));
         let smallest = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
@@ -3717,7 +3760,11 @@ pub(crate) fn ctn_penalized_objective_never_prefers_the_constant_transformation_
     // The standardizing affine transformation `h ≈ (y − ȳ)/sd(y)`, and the same
     // transformation scaled down by a millionfold, which is the collapse.
     let mean = response.sum() / n as f64;
-    let variance = response.iter().map(|y| (y - mean) * (y - mean)).sum::<f64>() / n as f64;
+    let variance = response
+        .iter()
+        .map(|y| (y - mean) * (y - mean))
+        .sum::<f64>()
+        / n as f64;
     let reference_slope = 1.0 / variance.sqrt();
     let penalized_objective = |slope: f64| -> (f64, f64) {
         let mut beta = Array1::<f64>::zeros(p_resp);

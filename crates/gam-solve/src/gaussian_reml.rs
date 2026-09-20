@@ -6,13 +6,12 @@ use gam_linalg::faer_ndarray::{
     FaerArrayView, FaerCholesky, FaerEigh, FaerSvd, default_rrqr_rank_alpha, fast_ab, fast_atb,
     fast_xt_diag_x, fast_xt_diag_y, rrqr_with_permutation,
 };
+use gam_linalg::matrix::array2_bits_fingerprint;
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_problem::{DeclaredHessianForm, Derivative, HessianValue, OuterEval, StationarityStandard};
 use gam_terms::construction::CanonicalPenalty;
 use gam_terms::smooth::BlockwisePenalty;
-use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s,
-};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, Axis, s};
 use opt::{DecrementBands, ObjectiveEvalError, SecondOrderSample};
 use rayon::prelude::*;
 
@@ -325,8 +324,10 @@ impl GaussianRemlBlocksDomain {
 
         let xtwx = fast_xt_diag_x(&design, &weights);
         let normal = self.normal_matrix(&xtwx, lambdas)?;
+        // `normal_matrix` symmetrizes `XᵀWX + Σ λ_k S_k` before returning it.
         gam_linalg::utils::certified_spd_factorize(
             &normal,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "block Gaussian REML penalized normal matrix",
         )
         .map_err(|error| {
@@ -669,10 +670,15 @@ pub fn gaussian_reml_fit_blocks_exact(
             offsets[block]..offsets[block + 1],
             penalties[block].clone(),
         ));
-        canonical_keys.push(fnv1a_mix(
-            matrix_fingerprint(designs[block].view()),
-            matrix_fingerprint(penalties[block].view()),
-        ));
+        let mut key = std::collections::hash_map::DefaultHasher::new();
+        std::hash::Hash::hash(
+            &(
+                array2_bits_fingerprint(&designs[block]),
+                array2_bits_fingerprint(&penalties[block]),
+            ),
+            &mut key,
+        );
+        canonical_keys.push(std::hash::Hasher::finish(&key));
     }
     let domain = GaussianRemlBlocksDomain::from_blockwise_penalties(p_total, &blockwise_penalties)?;
     let unit_lambdas = Array1::<f64>::ones(f_blocks);
@@ -692,8 +698,10 @@ pub fn gaussian_reml_fit_blocks_exact(
         // delegating so this block entry point rejects a singular Gram with
         // the certified factorization's diagnosis.
         let xtwx = fast_xt_diag_x(&design.view(), &weight.view());
+        // `fast_xt_diag_x` mirrors its Gram on every backend.
         gam_linalg::utils::certified_spd_factorize(
             &xtwx,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "one-block Gaussian REML unpenalized normal matrix",
         )
         .map_err(|error| {
@@ -1289,8 +1297,13 @@ fn gaussian_reml_dispersion_term(
     nu: f64,
     rho: f64,
 ) -> TermDerivs {
-    let parts =
-        dispersion_residual_parts(cache, unpenalized_residual, projected_rhs_squared, output, rho);
+    let parts = dispersion_residual_parts(
+        cache,
+        unpenalized_residual,
+        projected_rhs_squared,
+        output,
+        rho,
+    );
     let dp = parts.unpenalized_residual + parts.penalized_residual;
     let value = 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln());
     // #2729. `dp` is built from components of the rotated response, whose rounding is
@@ -1620,7 +1633,7 @@ fn prepare_block_orthogonal(
             lower,
             penalty.view(),
             None,
-            matrix_fingerprint(dense_xt_diag_x(design.view(), weight).view()),
+            array2_bits_fingerprint(&dense_xt_diag_x(design.view(), weight)),
         )?;
         projected_rhs.push(dense_atb(
             cache.eigenvectors.view(),
@@ -1922,19 +1935,15 @@ fn block_orthogonal_profile_jet(
     let mut gradient = Array1::<f64>::zeros(blocks);
     let mut gradient_band = Array1::<f64>::zeros(blocks);
     for (block, eval) in evals.iter().enumerate() {
-        gradient[block] =
-            block_orthogonal_scale_objective(eval, scale_precision.view())
-                .grad;
+        gradient[block] = block_orthogonal_scale_objective(eval, scale_precision.view()).grad;
         let scaled_energy = scale_precision
             .iter()
             .zip(eval.penalty_energy.iter())
             .map(|(scale, energy)| scale * energy)
             .sum::<f64>();
-        gradient_band[block] = growth
-            * (0.5 * outputs * eval.range_shrinkage + scaled_energy);
+        gradient_band[block] = growth * (0.5 * outputs * eval.range_shrinkage + scaled_energy);
     }
-    let hessian =
-        block_orthogonal_profile_hessian(&evals, scale_precision.view(), nu)?;
+    let hessian = block_orthogonal_profile_hessian(&evals, scale_precision.view(), nu)?;
     let mut hessian_magnitude = Array2::<f64>::zeros((blocks, blocks));
     for left in 0..blocks {
         let fixed_scale = scale_precision
@@ -2834,13 +2843,13 @@ fn validate_gaussian_reml_forward_fit(
             "Gaussian REML backward requires a finite forward state with positive profiled scales"
         );
     }
-    let penalty_fingerprint = matrix_fingerprint(penalty);
+    let penalty_fingerprint = array2_bits_fingerprint(&penalty);
     if fit.cache.penalty_fingerprint != penalty_fingerprint {
         crate::bail_invalid_estim!("Gaussian REML backward forward-state penalty mismatch");
     }
     let weight = gaussian_reml_weights(n, weights)?;
     let xtwx = dense_xt_diag_x(x, weight.view());
-    if fit.cache.xtwx_fingerprint != matrix_fingerprint(xtwx.view()) {
+    if fit.cache.xtwx_fingerprint != array2_bits_fingerprint(&xtwx) {
         crate::bail_invalid_estim!("Gaussian REML backward forward-state X'WX mismatch");
     }
     Ok(())
@@ -3393,7 +3402,9 @@ fn gaussian_reml_penalty_pseudoinverse_from_cache(
     // Divide only on the natural penalty range. A positive roundoff mode in
     // its nullspace must never enter this inverse (#2739/#2740).
     let spectrum = PenaltyRangeSpectrum::of(cache);
-    let selected: Vec<usize> = (0..data_rank).filter(|eig| spectrum.get(*eig) > 0.0).collect();
+    let selected: Vec<usize> = (0..data_rank)
+        .filter(|eig| spectrum.get(*eig) > 0.0)
+        .collect();
     if selected.len() != cache.penalty_rank {
         crate::bail_invalid_estim!(
             "Gaussian REML penalty pseudoinverse: the cache reports penalty_rank={} but {} of its \
@@ -3473,20 +3484,6 @@ fn dense_xt_diag_y(
     fast_xt_diag_y(&x, &w, &y)
 }
 
-fn matrix_fingerprint(matrix: ArrayView2<'_, f64>) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
-    hash = fnv1a_mix(hash, matrix.nrows() as u64);
-    hash = fnv1a_mix(hash, matrix.ncols() as u64);
-    for &value in matrix {
-        hash = fnv1a_mix(hash, value.to_bits());
-    }
-    hash
-}
-
-fn fnv1a_mix(hash: u64, value: u64) -> u64 {
-    (hash ^ value).wrapping_mul(0x100000001b3)
-}
-
 /// Build eigen caches for K problems that share the same penalty matrix in a
 /// single phased pipeline. X'WX construction is batched by the caller; each
 /// cache then uses the same Cholesky/eigendecomposition implementation as the
@@ -3502,10 +3499,7 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     if k == 0 {
         return Vec::new();
     }
-    let fingerprints: Vec<u64> = xtwx_matrices
-        .iter()
-        .map(|m| matrix_fingerprint(m.view()))
-        .collect();
+    let fingerprints: Vec<u64> = xtwx_matrices.iter().map(array2_bits_fingerprint).collect();
 
     let p = xtwx_matrices[0].nrows();
     let uniform_square = p > 0 && xtwx_matrices.iter().all(|matrix| matrix.dim() == (p, p));
@@ -3537,7 +3531,8 @@ pub fn build_gaussian_reml_eigen_cache_batched(
         }
     }
 
-    xtwx_matrices.into_iter()
+    xtwx_matrices
+        .into_iter()
         .map(|xtwx| gaussian_reml_eigen_cache_from_xtwx(xtwx, penalty, nullspace_dim))
         .collect()
 }
@@ -3583,7 +3578,10 @@ pub(crate) fn build_gaussian_reml_eigen_cache_with_nullspace_dim(
     // The Gram matrix remains the cache identity, never the factorization input.
     let range = weighted_design_range(x, weight.view())?;
     gaussian_reml_eigen_cache_from_design_range(
-        &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+        &range,
+        penalty,
+        nullspace_dim,
+        array2_bits_fingerprint(&xtwx),
     )
 }
 
@@ -3603,11 +3601,12 @@ fn weighted_design_qr(
     weight: ArrayView1<'_, f64>,
 ) -> Result<WeightedDesignQr, EstimationError> {
     // Factor the weighted design before squaring its condition number in X'WX.
-    let weighted_design = Array2::from_shape_fn(x.dim(), |(row, col)| {
-        weight[row].sqrt() * x[[row, col]]
-    });
+    let weighted_design =
+        Array2::from_shape_fn(x.dim(), |(row, col)| weight[row].sqrt() * x[[row, col]]);
     let weighted_view = FaerArrayView::new(&weighted_design);
-    sign_normalized_design_qr(gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref()))
+    sign_normalized_design_qr(gam_linalg::faer_ndarray::HouseholderQr::new(
+        weighted_view.as_ref(),
+    ))
 }
 
 fn householder_upper(qr: &gam_linalg::faer_ndarray::HouseholderQr) -> Array2<f64> {
@@ -3622,7 +3621,9 @@ fn sign_normalized_design_qr(
 ) -> Result<WeightedDesignQr, EstimationError> {
     let mut upper = householder_upper(&qr);
     if upper.nrows() != upper.ncols() || upper.diag().iter().any(|v| !v.is_finite() || *v == 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     let mut row_signs = vec![1.0; upper.nrows()];
     for row in 0..upper.nrows() {
@@ -3631,7 +3632,11 @@ fn sign_normalized_design_qr(
             row_signs[row] = -1.0;
         }
     }
-    Ok(WeightedDesignQr { qr, upper, row_signs })
+    Ok(WeightedDesignQr {
+        qr,
+        upper,
+        row_signs,
+    })
 }
 
 /// The column space of the weighted design `A = W½X` of rank `r ≤ min(n, p)`.
@@ -3661,14 +3666,15 @@ fn weighted_design_range(
     weight: ArrayView1<'_, f64>,
 ) -> Result<WeightedDesignRange, EstimationError> {
     let p = x.ncols();
-    let weighted_design = Array2::from_shape_fn(x.dim(), |(row, col)| {
-        weight[row].sqrt() * x[[row, col]]
-    });
+    let weighted_design =
+        Array2::from_shape_fn(x.dim(), |(row, col)| weight[row].sqrt() * x[[row, col]]);
     let weighted_view = FaerArrayView::new(&weighted_design);
     let qr = gam_linalg::faer_ndarray::HouseholderQr::new(weighted_view.as_ref());
     let upper = householder_upper(&qr);
     if upper.iter().any(|value| !value.is_finite()) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     let (null_basis, rank) = gam_linalg::faer_ndarray::rrqr_nullspace_basis(
         &upper.t().to_owned(),
@@ -3676,7 +3682,9 @@ fn weighted_design_range(
     )
     .map_err(EstimationError::LinearSystemSolveFailed)?;
     if rank == 0 {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     if rank == p {
         return Ok(WeightedDesignRange {
@@ -3690,7 +3698,9 @@ fn weighted_design_range(
             .map_err(EstimationError::LinearSystemSolveFailed)?;
     if null_basis.dim() != (p, p - rank) || null_rank != p - rank || range_basis.dim() != (p, rank)
     {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     let factor = weighted_design_qr(dense_ab(x, range_basis.view()).view(), weight)?;
     Ok(WeightedDesignRange {
@@ -3731,37 +3741,61 @@ fn gaussian_reml_eigen_cache_from_design_range(
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
     let lower = range.factor.upper.t().to_owned();
     let Some(range_basis) = range.range_basis.as_ref() else {
-        return gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint);
+        return gaussian_reml_eigen_cache_from_lower(
+            lower,
+            penalty,
+            nullspace_dim,
+            xtwx_fingerprint,
+        );
     };
     let null_basis = &range.null_basis;
-    let unidentified = || EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY };
+    let unidentified = || EstimationError::ModelIsIllConditioned {
+        condition_number: f64::INFINITY,
+    };
     let (natural_eigenvalues, _) = penalty.eigh(Side::Lower).map_err(|_| unidentified())?;
     let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
-    if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
+    if natural_eigenvalues
+        .iter()
+        .any(|&value| value < -natural_tolerance)
+    {
         crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
     }
     let penalty_on_null = dense_ab(penalty, null_basis.view());
-    let null_block = canonicalize_penalty(dense_atb(null_basis.view(), penalty_on_null.view()).view());
+    let null_block =
+        canonicalize_penalty(dense_atb(null_basis.view(), penalty_on_null.view()).view());
     let (null_eigenvalues, null_eigenvectors) =
         null_block.eigh(Side::Lower).map_err(|_| unidentified())?;
     // Identification certificate: the penalty must reach every data-null direction,
     // at the same rank convention that classifies the penalty's own spectrum.
-    if null_eigenvalues.iter().any(|&value| !(value > natural_tolerance)) {
+    if null_eigenvalues
+        .iter()
+        .any(|&value| !(value > natural_tolerance))
+    {
         return Err(unidentified());
     }
     let cross_block = dense_atb(penalty_on_null.view(), range_basis.view());
     let mut null_inverse_cross = dense_atb(null_eigenvectors.view(), cross_block.view());
-    for (mut row, &value) in null_inverse_cross.rows_mut().into_iter().zip(null_eigenvalues.iter()) {
+    for (mut row, &value) in null_inverse_cross
+        .rows_mut()
+        .into_iter()
+        .zip(null_eigenvalues.iter())
+    {
         row.mapv_inplace(|entry| entry / value);
     }
     let null_inverse_cross = dense_ab(null_eigenvectors.view(), null_inverse_cross.view());
-    let range_block = dense_atb(range_basis.view(), dense_ab(penalty, range_basis.view()).view());
+    let range_block = dense_atb(
+        range_basis.view(),
+        dense_ab(penalty, range_basis.view()).view(),
+    );
     let schur = canonicalize_penalty(
         (&range_block - &dense_atb(cross_block.view(), null_inverse_cross.view())).view(),
     );
     let transform = range_basis - &dense_ab(null_basis.view(), null_inverse_cross.view());
     let mut data_null_basis = dense_ab(null_basis.view(), null_eigenvectors.view());
-    for (mut column, &value) in data_null_basis.columns_mut().into_iter().zip(null_eigenvalues.iter())
+    for (mut column, &value) in data_null_basis
+        .columns_mut()
+        .into_iter()
+        .zip(null_eigenvalues.iter())
     {
         column.mapv_inplace(|entry| entry / value.sqrt());
     }
@@ -3791,7 +3825,7 @@ fn gaussian_reml_eigen_cache_from_design_range(
         - null_eigenvalues.iter().map(|value| value.ln()).sum::<f64>();
     cache.coefficient_basis = dense_ab(transform.view(), cache.coefficient_basis.view());
     cache.data_null_basis = data_null_basis;
-    cache.penalty_fingerprint = matrix_fingerprint(penalty);
+    cache.penalty_fingerprint = array2_bits_fingerprint(&penalty);
     Ok(cache)
 }
 
@@ -3906,7 +3940,7 @@ fn gaussian_reml_eigen_cache_from_xtwx(
     penalty: ArrayView2<'_, f64>,
     nullspace_dim: Option<usize>,
 ) -> Result<GaussianRemlEigenCache, EstimationError> {
-    let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+    let xtwx_fingerprint = array2_bits_fingerprint(&xtwx);
     let lower = gaussian_reml_cholesky_lower(xtwx)?;
     gaussian_reml_eigen_cache_from_lower(lower, penalty, nullspace_dim, xtwx_fingerprint)
 }
@@ -3943,15 +3977,21 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
     if lower.ncols() != p {
         crate::bail_invalid_estim!("Gaussian REML Cholesky factor must be square");
     }
-    let penalty_fingerprint = matrix_fingerprint(penalty);
+    let penalty_fingerprint = array2_bits_fingerprint(&penalty);
     let logdet_xtwx = 2.0 * lower.diag().iter().map(|v| v.ln()).sum::<f64>();
     // Congruence preserves rank. Determine it in the supplied penalty's frame:
     // data whitening can give even S=I a 1e12 spectral spread (#2833).
-    let (natural_eigenvalues, natural_eigenvectors) = penalty.eigh(Side::Lower).map_err(|_| {
-        EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-    })?;
+    let (natural_eigenvalues, natural_eigenvectors) =
+        penalty
+            .eigh(Side::Lower)
+            .map_err(|_| EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            })?;
     let natural_tolerance = penalty_range_tolerance(natural_eigenvalues.view());
-    if natural_eigenvalues.iter().any(|&value| value < -natural_tolerance) {
+    if natural_eigenvalues
+        .iter()
+        .any(|&value| value < -natural_tolerance)
+    {
         crate::bail_invalid_estim!("Gaussian REML penalty is not positive semidefinite");
     }
     let penalty_rank = natural_eigenvalues
@@ -3959,32 +3999,37 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
         .filter(|&&value| value > natural_tolerance)
         .count();
     let nullity = p - penalty_rank;
-    let (mut penalty_eigenvalues, eigenvectors) = match precomputed_transform {
-        Some(transformed) => transformed.eigh(Side::Lower).map_err(|_| {
-            EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-        })?,
-        None => {
-            // S = C'C. Singular values of C L^-T preserve relative accuracy
-            // without forming the ill-conditioned squared operator L^-1 S L^-T.
-            let root_transpose = Array2::from_shape_fn((p, p), |(row, col)| {
-                if col < nullity {
-                    0.0
-                } else {
-                    natural_eigenvectors[[row, col]] * natural_eigenvalues[col].sqrt()
+    let (mut penalty_eigenvalues, eigenvectors) =
+        match precomputed_transform {
+            Some(transformed) => transformed.eigh(Side::Lower).map_err(|_| {
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
                 }
-            });
-            let whitened_root = solve_lower_triangular_matrix(&lower, &root_transpose)?;
-            let (_, singular, vt) = whitened_root.t().svd(false, true).map_err(|_| {
-                EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY }
-            })?;
-            let vt = vt.ok_or_else(|| EstimationError::ModelIsIllConditioned {
-                condition_number: f64::INFINITY,
-            })?;
-            let values = Array1::from_shape_fn(p, |col| singular[p - 1 - col].powi(2));
-            let vectors = Array2::from_shape_fn((p, p), |(row, col)| vt[[p - 1 - col, row]]);
-            (values, vectors)
-        }
-    };
+            })?,
+            None => {
+                // S = C'C. Singular values of C L^-T preserve relative accuracy
+                // without forming the ill-conditioned squared operator L^-1 S L^-T.
+                let root_transpose = Array2::from_shape_fn((p, p), |(row, col)| {
+                    if col < nullity {
+                        0.0
+                    } else {
+                        natural_eigenvectors[[row, col]] * natural_eigenvalues[col].sqrt()
+                    }
+                });
+                let whitened_root = solve_lower_triangular_matrix(&lower, &root_transpose)?;
+                let (_, singular, vt) = whitened_root.t().svd(false, true).map_err(|_| {
+                    EstimationError::ModelIsIllConditioned {
+                        condition_number: f64::INFINITY,
+                    }
+                })?;
+                let vt = vt.ok_or_else(|| EstimationError::ModelIsIllConditioned {
+                    condition_number: f64::INFINITY,
+                })?;
+                let values = Array1::from_shape_fn(p, |col| singular[p - 1 - col].powi(2));
+                let vectors = Array2::from_shape_fn((p, p), |(row, col)| vt[[p - 1 - col, row]]);
+                (values, vectors)
+            }
+        };
     // Rank tolerance must be RELATIVE to the largest eigenvalue — never
     // floored at an absolute value. The old `.max(1.0)` clamped the
     // tolerance up whenever max|eig| < 1, classifying genuine modes as
@@ -4005,8 +4050,14 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
             );
         }
     }
-    if penalty_eigenvalues.iter().skip(nullity).any(|&value| value <= 0.0) {
-        return Err(EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY });
+    if penalty_eigenvalues
+        .iter()
+        .skip(nullity)
+        .any(|&value| value <= 0.0)
+    {
+        return Err(EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        });
     }
     penalty_eigenvalues.slice_mut(s![..nullity]).fill(0.0);
     if let Some(expected_nullity) = nullspace_dim
@@ -4016,8 +4067,11 @@ fn gaussian_reml_eigen_cache_from_lower_with_transform(
             "Gaussian REML penalty nullspace mismatch: expected {expected_nullity}, inferred {nullity}"
         );
     }
-    let logdet_penalty_positive = natural_eigenvalues.iter().skip(nullity)
-        .map(|value| value.ln()).sum();
+    let logdet_penalty_positive = natural_eigenvalues
+        .iter()
+        .skip(nullity)
+        .map(|value| value.ln())
+        .sum();
     let coefficient_basis = solve_upper_triangular_matrix(&lower.t().to_owned(), &eigenvectors)?;
 
     Ok(GaussianRemlEigenCache {
@@ -4046,7 +4100,9 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     }
     xtwx.cholesky(Side::Lower)
         .map(|chol| chol.lower_triangular())
-        .map_err(|_| EstimationError::ModelIsIllConditioned { condition_number: f64::INFINITY })
+        .map_err(|_| EstimationError::ModelIsIllConditioned {
+            condition_number: f64::INFINITY,
+        })
 }
 
 fn validate_gaussian_reml_eigen_cache(
@@ -4093,10 +4149,20 @@ fn validate_gaussian_reml_eigen_cache(
                 .to_string(),
         );
     }
-    if cache.penalty_eigenvalues.windows(2).into_iter().any(|pair| pair[0] > pair[1]) {
+    if cache
+        .penalty_eigenvalues
+        .windows(2)
+        .into_iter()
+        .any(|pair| pair[0] > pair[1])
+    {
         crate::bail_invalid_estim!("Gaussian REML eigen cache spectrum must be ascending");
     }
-    if cache.penalty_eigenvalues.iter().take(cache.nullity).any(|&value| value != 0.0) {
+    if cache
+        .penalty_eigenvalues
+        .iter()
+        .take(cache.nullity)
+        .any(|&value| value != 0.0)
+    {
         crate::bail_invalid_estim!("Gaussian REML eigen cache null modes must be exactly zero");
     }
     // All declared range directions must remain positive after whitening.
@@ -4166,11 +4232,11 @@ fn prepare_gaussian_reml(
                     cache.coefficient_basis.ncols()
                 );
             }
-            let xtwx_fingerprint = matrix_fingerprint(xtwx.view());
+            let xtwx_fingerprint = array2_bits_fingerprint(&xtwx);
             if cache.xtwx_fingerprint != xtwx_fingerprint {
                 crate::bail_invalid_estim!("Gaussian REML eigen cache X'WX mismatch");
             }
-            let penalty_fingerprint = matrix_fingerprint(penalty);
+            let penalty_fingerprint = array2_bits_fingerprint(&penalty);
             if cache.penalty_fingerprint != penalty_fingerprint {
                 crate::bail_invalid_estim!("Gaussian REML eigen cache penalty mismatch");
             }
@@ -4185,7 +4251,10 @@ fn prepare_gaussian_reml(
             cache.clone()
         }
         None => gaussian_reml_eigen_cache_from_design_range(
-            &range, penalty, nullspace_dim, matrix_fingerprint(xtwx.view()),
+            &range,
+            penalty,
+            nullspace_dim,
+            array2_bits_fingerprint(&xtwx),
         )?,
     };
     let factor = range.factor;
@@ -4342,8 +4411,13 @@ fn validate_reml_profile_residuals(
         // Checking the domain through a different form while the search evaluates
         // this one lets a fit be refused for a residual that is strictly positive,
         // or admitted for one that is not.
-        let parts =
-            dispersion_residual_parts(cache, unpenalized_residual, projected_rhs_squared, output, rho);
+        let parts = dispersion_residual_parts(
+            cache,
+            unpenalized_residual,
+            projected_rhs_squared,
+            output,
+            rho,
+        );
         let residual = parts.unpenalized_residual + parts.penalized_residual;
         let resolution = profile_residual_resolution(cache, ywy[output]);
         if !(residual.is_finite() && residual > resolution) {
@@ -5494,6 +5568,67 @@ mod tests {
     use ndarray::array;
 
     #[test]
+    fn eigen_cache_refuses_the_design_with_a_negated_column() {
+        // Negating column j of X maps XᵀWX to D·XᵀWX·D bit-exactly (D = diag
+        // with -1 at j): every off-diagonal entry of row and column j flips its
+        // sign bit, an even count. The fit reads coefficients through the
+        // cache's basis, so a cache built for X must be refused for X·D; the
+        // identity guarding that must separate the two Grams.
+        let x = array![
+            [1.0, 0.3, -0.2],
+            [1.0, 1.1, 0.5],
+            [1.0, -0.7, 1.3],
+            [1.0, 2.0, -0.4],
+            [1.0, 0.4, 0.9],
+            [1.0, -1.5, -1.1],
+        ];
+        let y = array![[0.2], [1.4], [-0.3], [2.2], [0.9], [-1.0]];
+        let penalty = array![[0.0, 0.0, 0.0], [0.0, 1.0, 0.3], [0.0, 0.3, 1.0]];
+        let cache = build_gaussian_reml_eigen_cache_with_nullspace_dim(
+            x.view(),
+            penalty.view(),
+            None,
+            None,
+        )
+        .expect("the design is full rank");
+        gaussian_reml_multi_closed_form_with_cache(
+            x.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+            Some(&cache),
+        )
+        .expect("the cache's own design is accepted");
+
+        let mut negated = x.clone();
+        negated.column_mut(1).mapv_inplace(|value| -value);
+        let xtwx = negated.t().dot(&negated);
+        let mut conjugate = x.t().dot(&x);
+        conjugate.row_mut(1).mapv_inplace(|value| -value);
+        conjugate.column_mut(1).mapv_inplace(|value| -value);
+        assert_eq!(
+            xtwx.mapv(f64::to_bits),
+            conjugate.mapv(f64::to_bits),
+            "the negated design's Gram is the sign conjugate"
+        );
+        assert_ne!(
+            array2_bits_fingerprint(&xtwx),
+            array2_bits_fingerprint(&x.t().dot(&x))
+        );
+        let error = gaussian_reml_multi_closed_form_with_cache(
+            negated.view(),
+            y.view(),
+            penalty.view(),
+            None,
+            None,
+            Some(&cache),
+        )
+        .expect_err("a cache built for X must not serve X·D");
+        assert!(error.to_string().contains("X'WX mismatch"), "{error}");
+    }
+
+    #[test]
     fn block_profile_large_penalties_preserve_the_data_nullspace_fit() {
         let n = 24;
         let design = Array2::from_shape_fn((n, 4), |(row, column)| {
@@ -6208,7 +6343,11 @@ mod tests {
 
         // The fit leaves the limit at the rate the penalty releases the range
         // space, `e^{-ρ}` in the least-penalized block.
-        let min_log_lambda = boundary.log_lambdas.iter().copied().fold(f64::INFINITY, f64::min);
+        let min_log_lambda = boundary
+            .log_lambdas
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min);
         let scale = y.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
         let tolerance = scale * (-min_log_lambda).exp();
         let limit_difference = boundary
@@ -6575,7 +6714,7 @@ mod tests {
             lower,
             penalty.view(),
             None,
-            matrix_fingerprint(gram.view()),
+            array2_bits_fingerprint(gram),
         )
         .unwrap();
         let projected = dense_atb(cache.eigenvectors.view(), head.view());
@@ -6636,8 +6775,7 @@ mod tests {
                 center.gradient[coordinate]
             );
             for other in 0..2 {
-                let curvature =
-                    (upper.gradient[other] - lower.gradient[other]) / (2.0 * step);
+                let curvature = (upper.gradient[other] - lower.gradient[other]) / (2.0 * step);
                 assert!(
                     (hessian[[other, coordinate]] - curvature).abs()
                         <= 1.0e-6 * hessian[[other, coordinate]].abs().max(1.0),
@@ -6720,8 +6858,7 @@ mod tests {
             for (b, design) in designs.iter().enumerate() {
                 let strength = 10f64.powf(uniform() * 4.0 - 2.0) * (b as f64 + 1.0);
                 for j in 0..design.ncols() {
-                    let coef =
-                        strength * normal(&mut uniform) * (j as f64 / design.ncols() as f64);
+                    let coef = strength * normal(&mut uniform) * (j as f64 / design.ncols() as f64);
                     for i in 0..n {
                         y[[i, o]] += coef * design[[i, j]];
                     }
@@ -6856,9 +6993,7 @@ mod tests {
             .collect::<Vec<_>>();
         let scale =
             block_orthogonal_conditional_scale(&evals, unpenalized_residual.view(), nu).unwrap();
-        let analytic =
-            block_orthogonal_profile_hessian(&evals, scale.view(), nu)
-                .unwrap();
+        let analytic = block_orthogonal_profile_hessian(&evals, scale.view(), nu).unwrap();
         let step = 1.0e-4;
         let center = profile_value(rhos.view());
         let mut numerical = Array2::<f64>::zeros((2, 2));
@@ -6952,8 +7087,9 @@ mod tests {
             y.view(),
         )
         .expect("the orthogonal blocks factor");
-        let jet = block_orthogonal_profile_jet(&prepared, result.log_lambdas.view(), &[2, 2], nu, 1)
-            .expect("profiled jet at the minted rho");
+        let jet =
+            block_orthogonal_profile_jet(&prepared, result.log_lambdas.view(), &[2, 2], nu, 1)
+                .expect("profiled jet at the minted rho");
         let verdict = opt::newton_decrement_verdict(
             jet.sample.hessian.as_ref().expect("exact Hessian"),
             &jet.sample.gradient,
@@ -7066,8 +7202,12 @@ mod tests {
             let y_norm = y.iter().map(|value| value * value).sum::<f64>().sqrt();
 
             let mut concatenated = Array2::<f64>::zeros((n, p));
-            concatenated.slice_mut(s![.., 0..p_block]).assign(&designs[0]);
-            concatenated.slice_mut(s![.., p_block..p]).assign(&designs[1]);
+            concatenated
+                .slice_mut(s![.., 0..p_block])
+                .assign(&designs[0]);
+            concatenated
+                .slice_mut(s![.., p_block..p])
+                .assign(&designs[1]);
             let (u, sigma, _) = concatenated.svd(true, false).expect("design SVD");
             let u = u.expect("left singular vectors");
             let basis = u.slice(s![.., 0..p]).to_owned();
@@ -7127,8 +7267,7 @@ mod tests {
             let second_order = (gamma * (sigma_max / sigma_min) * residual_scale + along).powi(2);
             let largest_mode = lambda / (sigma_min * sigma_min);
             let u_max = largest_mode / (1.0 + largest_mode);
-            let penalized_band =
-                u_max * 2.0 * gamma * (1.0 + (p as f64).sqrt()) * y_norm * y_norm;
+            let penalized_band = u_max * 2.0 * gamma * (1.0 + (p as f64).sqrt()) * y_norm * y_norm;
             let band = 2.0 * (first_order + second_order + penalized_band);
             println!(
                 "[2280-block-residual] block_condition=1e{exponent} planted={planted:.9e} \
@@ -7586,9 +7725,13 @@ mod tests {
         let xtwx = dense_xt_diag_x(x, w);
         let h = &xtwx + &(penalty.to_owned() * lambda);
         let (h_eig, h_vec) = h.eigh(Side::Lower).expect("dense H eigendecomposition");
-        assert!(h_eig.iter().all(|&e| e > 0.0), "fixture H must be positive definite");
-        let inverse_hessian =
-            h_vec.dot(&Array2::from_diag(&h_eig.mapv(f64::recip))).dot(&h_vec.t());
+        assert!(
+            h_eig.iter().all(|&e| e > 0.0),
+            "fixture H must be positive definite"
+        );
+        let inverse_hessian = h_vec
+            .dot(&Array2::from_diag(&h_eig.mapv(f64::recip)))
+            .dot(&h_vec.t());
         let xtwy = x.t().dot(&(&w * &y));
         let coefficients = inverse_hessian.dot(&xtwy);
         let residual = &y - &x.dot(&coefficients);
@@ -7596,7 +7739,11 @@ mod tests {
             + lambda * coefficients.dot(&penalty.dot(&coefficients));
         let (s_eig, _) = penalty.to_owned().eigh(Side::Lower).expect("penalty eigh");
         let s_max = s_eig.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
-        let positive: Vec<f64> = s_eig.iter().copied().filter(|&e| e > 1.0e-9 * s_max).collect();
+        let positive: Vec<f64> = s_eig
+            .iter()
+            .copied()
+            .filter(|&e| e > 1.0e-9 * s_max)
+            .collect();
         let logdet_s = positive.iter().map(|e| e.ln()).sum::<f64>() + positive.len() as f64 * rho;
         let n_pos = w.iter().filter(|&&v| v > 0.0).count();
         let nu = (n_pos - (x.ncols() - positive.len())) as f64;
@@ -7608,7 +7755,12 @@ mod tests {
             + 0.5 * nu * (1.0 + (2.0 * std::f64::consts::PI * dp / nu).ln())
             - 0.5 * log_weights;
         let edf = (&inverse_hessian * &xtwx).sum();
-        DenseRemlReference { score, coefficients, inverse_hessian, edf }
+        DenseRemlReference {
+            score,
+            coefficients,
+            inverse_hessian,
+            edf,
+        }
     }
 
     fn assert_rank_deficient_fit_matches_dense_reference(
@@ -7623,7 +7775,11 @@ mod tests {
         let p = x.ncols();
         let data_rank = fit.cache.coefficient_basis.ncols();
         assert!(data_rank < p, "{label}: fixture must have a singular Gram");
-        assert_eq!(fit.cache.data_null_basis.dim(), (p, p - data_rank), "{label}");
+        assert_eq!(
+            fit.cache.data_null_basis.dim(),
+            (p, p - data_rank),
+            "{label}"
+        );
 
         let dense = dense_reml_reference(x, y.column(0), penalty, w, fit.rho);
         let scale = 1.0 + dense.score.abs();
@@ -7633,7 +7789,10 @@ mod tests {
             fit.reml_score,
             dense.score
         );
-        let beta_scale = dense.coefficients.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let beta_scale = dense
+            .coefficients
+            .iter()
+            .fold(0.0_f64, |a, &b| a.max(b.abs()));
         for j in 0..p {
             assert!(
                 (fit.coefficients[[j, 0]] - dense.coefficients[j]).abs() <= 1.0e-8 * beta_scale,
@@ -7648,8 +7807,14 @@ mod tests {
             fit.edf,
             dense.edf
         );
-        let inverse = fit.cache.inverse_hessian(fit.lambda).expect("cache inverse Hessian");
-        let inv_scale = dense.inverse_hessian.iter().fold(0.0_f64, |a, &b| a.max(b.abs()));
+        let inverse = fit
+            .cache
+            .inverse_hessian(fit.lambda)
+            .expect("cache inverse Hessian");
+        let inv_scale = dense
+            .inverse_hessian
+            .iter()
+            .fold(0.0_f64, |a, &b| a.max(b.abs()));
         for ((i, j), &value) in inverse.indexed_iter() {
             assert!(
                 (value - dense.inverse_hessian[[i, j]]).abs() <= 1.0e-9 * inv_scale,
@@ -7662,8 +7827,15 @@ mod tests {
         let dense_slope = adaptive_central_difference(|delta| {
             dense_reml_reference(x, y.column(0), penalty, w, fit.rho + delta).score
         });
-        assert_fd_close(&format!("{label}: reml_grad_rho"), fit.reml_grad_rho, dense_slope);
-        assert!(dense_slope.abs() <= 1.0e-6, "{label}: dense slope {dense_slope:.3e} at rho-hat");
+        assert_fd_close(
+            &format!("{label}: reml_grad_rho"),
+            fit.reml_grad_rho,
+            dense_slope,
+        );
+        assert!(
+            dense_slope.abs() <= 1.0e-6,
+            "{label}: dense slope {dense_slope:.3e} at rho-hat"
+        );
     }
 
     #[test]
@@ -7726,7 +7898,13 @@ mod tests {
                 one_hot_backward(x.view(), y.view(), penalty.view(), weights.view(), target);
             let fd_x = adaptive_central_difference(|delta| {
                 let candidate = &x + &(&x_direction * delta);
-                one_hot_objective(candidate.view(), y.view(), penalty.view(), weights.view(), target)
+                one_hot_objective(
+                    candidate.view(),
+                    y.view(),
+                    penalty.view(),
+                    weights.view(),
+                    target,
+                )
             });
             assert_fd_close(
                 &format!("p>n target={target:?} X direction"),
@@ -7735,7 +7913,13 @@ mod tests {
             );
             let fd_y = adaptive_central_difference(|delta| {
                 let candidate = &y + &(&y_direction * delta);
-                one_hot_objective(x.view(), candidate.view(), penalty.view(), weights.view(), target)
+                one_hot_objective(
+                    x.view(),
+                    candidate.view(),
+                    penalty.view(),
+                    weights.view(),
+                    target,
+                )
             });
             assert_fd_close(
                 &format!("p>n target={target:?} y direction"),
@@ -7972,7 +8156,10 @@ mod tests {
         let blind_penalty = array![[1.0, 1.0], [1.0, 1.0]];
         assert!(matches!(
             build_gaussian_reml_eigen_cache_with_nullspace_dim(
-                design.view(), blind_penalty.view(), None, None,
+                design.view(),
+                blind_penalty.view(),
+                None,
+                None,
             ),
             Err(EstimationError::ModelIsIllConditioned { .. })
         ));
@@ -8671,8 +8858,10 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
 
     let penalties = domain.local_penalties();
     let pinvs = domain.penalty_pseudoinverses()?;
+    // `certify_joint_coefficient_map` returns the symmetrized normal matrix.
     let r = gam_linalg::utils::certified_spd_inverse(
         &k_matrix,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
         "block Gaussian REML penalized normal matrix",
     )
     .map(gam_linalg::utils::CertifiedSpdInverse::into_inverse)
@@ -8888,6 +9077,7 @@ pub fn gaussian_reml_fit_blocks_backward_analytic(
         }
         let rho_adj = gam_linalg::utils::certified_symmetric_solve(
             &outer_h,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             &alpha,
             "block Gaussian REML outer-rho adjoint",
         )
@@ -9067,7 +9257,15 @@ pub fn dense_fisher_gaussian_fit(
     add_block_diagonal_penalty(&mut hessian, penalty, lambda, n_outputs)?;
     let rhs = crate::pirls::dense_block_xtwy(design, fisher_w, y, Some(row_weights))?;
     let beta_vec =
-        gam_linalg::utils::solve_dense_block_system(&hessian, &rhs, "dense Fisher Gaussian")
+        // `dense_block_xtwx` writes each Gram entry into both mirrored
+        // positions and `add_block_diagonal_penalty` adds the symmetrized
+        // `λ (S + Sᵀ)/2` to both, so the system is exactly mirrored.
+        gam_linalg::utils::solve_dense_block_system(
+            &hessian,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            &rhs,
+            "dense Fisher Gaussian",
+        )
             .map_err(EstimationError::InvalidInput)?;
     let mut coefficients = Array2::<f64>::zeros((k, n_outputs));
     for output in 0..n_outputs {
@@ -9398,14 +9596,26 @@ mod perfect_fit_refusal_tests {
         let y = Array2::from_shape_fn((n, 1), |(row, _)| ((row as f64) * 0.11).cos());
         let penalty = Array2::<f64>::eye(p);
         let words = |width: usize| {
-            let pool = rayon::ThreadPoolBuilder::new().num_threads(width).build().expect("pool");
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .expect("pool");
             pool.install(|| {
                 let prepared =
                     prepare_gaussian_reml(x.view(), y.view(), penalty.view(), None, None, None)
                         .expect("a finite full-rank design");
-                let mut words: Vec<u64> =
-                    prepared.unpenalized_residual.iter().map(|value| value.to_bits()).collect();
-                words.extend(prepared.cache.coefficient_basis.iter().map(|value| value.to_bits()));
+                let mut words: Vec<u64> = prepared
+                    .unpenalized_residual
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect();
+                words.extend(
+                    prepared
+                        .cache
+                        .coefficient_basis
+                        .iter()
+                        .map(|value| value.to_bits()),
+                );
                 words
             })
         };
@@ -9440,11 +9650,14 @@ mod perfect_fit_refusal_tests {
                 * (std::f64::consts::PI * (row as f64 + 0.5) * (col as f64 + 0.5) / size as f64)
                     .cos()
         };
-        let singular: Vec<f64> =
-            (0..p).map(|k| 10.0_f64.powf(-12.0 * k as f64 / (p - 1) as f64)).collect();
+        let singular: Vec<f64> = (0..p)
+            .map(|k| 10.0_f64.powf(-12.0 * k as f64 / (p - 1) as f64))
+            .collect();
         // `X = U·Σ·Vᵀ` with a dense `V`, so every column carries the smallest directions.
         let x = Array2::from_shape_fn((n, p), |(row, col)| {
-            (0..p).map(|k| dct(n, row, k) * singular[k] * dct(p, col, k)).sum::<f64>()
+            (0..p)
+                .map(|k| dct(n, row, k) * singular[k] * dct(p, col, k))
+                .sum::<f64>()
         });
         // `y = X·β + ρ·e` with `β = V·1`, so `X·β = U·Σ·1` and `‖β‖ = √p`.
         let residual_norm = 1.0e-4;
@@ -9541,25 +9754,35 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         for scale in [1e-8, 1.0, 1e8] {
             let penalty = Array2::eye(5) * scale;
             let cache = build_gaussian_reml_eigen_cache_with_nullspace_dim(
-                x.view(), penalty.view(), Some(0), None,
-            ).expect("data conditioning cannot change the identity penalty's rank");
+                x.view(),
+                penalty.view(),
+                Some(0),
+                None,
+            )
+            .expect("data conditioning cannot change the identity penalty's rank");
             assert_eq!(cache.penalty_rank, 5);
             assert_eq!(cache.nullity, 0);
             validate_gaussian_reml_eigen_cache(&cache, 5).unwrap();
             let mut invalid = cache.clone();
             invalid.penalty_rank = 4;
             invalid.nullity = 1;
-            assert!(validate_gaussian_reml_eigen_cache(&invalid, 5).is_err(),
-                "a supplied cache cannot silently discard a positive natural penalty mode");
-            assert!(cache.penalty_eigenvalues[0] <
-                penalty_range_tolerance(cache.penalty_eigenvalues.view()));
+            assert!(
+                validate_gaussian_reml_eigen_cache(&invalid, 5).is_err(),
+                "a supplied cache cannot silently discard a positive natural penalty mode"
+            );
+            assert!(
+                cache.penalty_eigenvalues[0]
+                    < penalty_range_tolerance(cache.penalty_eigenvalues.view())
+            );
             let inverse = gaussian_reml_penalty_pseudoinverse_from_cache(&cache).unwrap();
             for row in 0..5 {
                 for col in 0..5 {
                     let expected = if row == col { 1.0 } else { 0.0 };
-                    assert!((scale * inverse[[row, col]] - expected).abs() < 1e-7,
+                    assert!(
+                        (scale * inverse[[row, col]] - expected).abs() < 1e-7,
                         "natural inverse ({row},{col}) = {} at scale {scale}",
-                        scale * inverse[[row, col]]);
+                        scale * inverse[[row, col]]
+                    );
                 }
             }
         }
@@ -9589,7 +9812,6 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
             nullity: 3,
         }
     }
-
 
     /// The classification and the rank are the same question asked once.
     #[test]
@@ -9644,8 +9866,12 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         // This is an algebraic lambda -> infinity oracle, independent of the
         // optimizer's finite resolvability window. Saturate even the smallest
         // positive roundoff mode to distinguish the two range predicates.
-        let smallest_positive = cache.penalty_eigenvalues.iter().copied()
-            .filter(|&value| value > 0.0).fold(f64::INFINITY, f64::min);
+        let smallest_positive = cache
+            .penalty_eigenvalues
+            .iter()
+            .copied()
+            .filter(|&value| value > 0.0)
+            .fold(f64::INFINITY, f64::min);
         let limit_rho = (100.0 / smallest_positive).ln();
         let lambda = limit_rho.exp();
         let n_outputs = 1.0_f64;
@@ -9692,4 +9918,3 @@ mod eigenvalue_range_predicate_agreement_2740_tests {
         );
     }
 }
-

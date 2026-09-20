@@ -317,18 +317,18 @@ impl<'a> RemlState<'a> {
             self.without_persistent_warm_start_store(|| self.compute_cost_and_gradient(rho))
                 .map_err(|error| error.to_string())
         };
-        let outcome = match escalator.rho_posterior_adequacy(
-            final_rho,
-            &outer_hessian,
-            &|rho| continuation.value(rho, cost, cost_and_gradient),
-        ) {
+        let outcome = match escalator.rho_posterior_adequacy(final_rho, &outer_hessian, &|rho| {
+            continuation.value(rho, cost, cost_and_gradient)
+        }) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
             Ok(None) => RhoPosteriorOutcome::NotApplicable,
             // The grade is a post-fit diagnostic of a fit the outer
             // optimizer already certified, so a refusal publishes the fit and
             // carries its typed reason with it.
             Err(refusal) => {
-                log::debug!("rho-posterior adequacy diagnostic refused at the converged rho: {refusal}");
+                log::debug!(
+                    "rho-posterior adequacy diagnostic refused at the converged rho: {refusal}"
+                );
                 RhoPosteriorOutcome::Refused(refusal)
             }
         };
@@ -368,22 +368,18 @@ impl<'a> RemlState<'a> {
                 // #3293 — the tiers are then placed on the density they
                 // sample, not on the criterion's: see
                 // `sampled_density_laplace_geometry`.
-                let geometry = sampled_density_laplace_geometry(
-                    final_rho,
-                    &outer_hessian,
-                    |rho| {
-                        let (laml, gradient) =
-                            continuation.value_and_gradient(rho, cost_and_gradient)?;
-                        let correction = self
-                            .rho_prior_distribution_correction(rho)
-                            .map_err(|error| error.to_string())?;
-                        Ok((
-                            laml + correction.cost,
-                            gradient + &correction.gradient,
-                            correction.hessian_diagonal,
-                        ))
-                    },
-                );
+                let geometry = sampled_density_laplace_geometry(final_rho, &outer_hessian, |rho| {
+                    let (laml, gradient) =
+                        continuation.value_and_gradient(rho, cost_and_gradient)?;
+                    let correction = self
+                        .rho_prior_distribution_correction(rho)
+                        .map_err(|error| error.to_string())?;
+                    Ok((
+                        laml + correction.cost,
+                        gradient + &correction.gradient,
+                        correction.hessian_diagonal,
+                    ))
+                });
                 Some(match geometry {
                     Ok((mode, hessian)) => escalator.escalate_rho_posterior(
                         &mode,
@@ -456,10 +452,12 @@ impl<'a> RemlState<'a> {
             caller_measured_hessian_error,
         );
         let outcome = match first_order.status {
-            SmoothingCorrectionStatus::Unavailable(reason) => SmoothingCorrectionOutcome::Unavailable {
-                reason,
-                rho_covariance: first_order.rho_covariance,
-            },
+            SmoothingCorrectionStatus::Unavailable(reason) => {
+                SmoothingCorrectionOutcome::Unavailable {
+                    reason,
+                    rho_covariance: first_order.rho_covariance,
+                }
+            }
             _ => {
                 let method = first_order.factor.as_ref().map(|_| {
                     SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
@@ -530,6 +528,12 @@ fn sampled_density_laplace_geometry(
     mut density: impl FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>, Array1<f64>), String>,
 ) -> Result<(Array1<f64>, Array2<f64>), String> {
     use opt::{BacktrackConfig, backtracking_line_search, constants::ARMIJO_C1};
+    // The Laplace geometry reads only the quadratic form of the ρ-Hessian,
+    // which is its symmetric part (Clairaut); the two triangles may come from
+    // different derivative formulas, so the curvature is symmetrized once and
+    // certified as mirrored. Adding the diagonal keeps it mirrored (#4350).
+    let mut laml_hessian = laml_hessian.clone();
+    gam_linalg::matrix::symmetrize_in_place(&mut laml_hessian);
     let curvature_at = |correction_curvature: &Array1<f64>| {
         let mut hessian = laml_hessian.clone();
         for (index, &c) in correction_curvature.iter().enumerate() {
@@ -540,13 +544,16 @@ fn sampled_density_laplace_geometry(
     let (mut cost, mut gradient, mut correction_curvature) = density(rho_hat)
         .map_err(|detail| format!("the sampled density is unavailable at rho_hat: {detail}"))?;
     if !cost.is_finite() || gradient.iter().any(|g| !g.is_finite()) {
-        return Err(format!("the sampled density at rho_hat is {cost} with gradient {gradient}"));
+        return Err(format!(
+            "the sampled density at rho_hat is {cost} with gradient {gradient}"
+        ));
     }
     let mut rho = rho_hat.clone();
     loop {
         let hessian = curvature_at(&correction_curvature);
         let factor = gam_linalg::utils::certified_spd_factorize(
             &hessian,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             "sampled rho density Laplace curvature",
         )
         .map_err(|error| error.to_string())?;
@@ -854,9 +861,11 @@ mod smoothing_correction_outcome_tests {
                 "an identified stationary ρ̂ must yield the analytic first-order \
                  correction; got {outcome_description}"
             );
-            crate::estimate::smoothing_correction::smoothing_correction_gram(&factor.unwrap_or_else(
-                || panic!("first-order outcome carries no matrix: {outcome_description}"),
-            ))
+            crate::estimate::smoothing_correction::smoothing_correction_gram(
+                &factor.unwrap_or_else(|| {
+                    panic!("first-order outcome carries no matrix: {outcome_description}")
+                }),
+            )
         };
 
         let c = 1000.0_f64;
@@ -872,7 +881,11 @@ mod smoothing_correction_outcome_tests {
             frob1.is_finite() && frob1 > 0.0,
             "scale-1 correction must be finite and non-zero (‖corr‖={frob1:.3e})"
         );
-        assert_eq!(corr1.dim(), corrc.dim(), "correction shape mismatch across scales");
+        assert_eq!(
+            corr1.dim(),
+            corrc.dim(),
+            "correction shape mismatch across scales"
+        );
 
         // Property under test: every entry scales by exactly c² (never c⁴).
         let mut worst_rel = 0.0_f64;

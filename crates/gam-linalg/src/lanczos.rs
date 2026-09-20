@@ -2,6 +2,7 @@ use faer::Side;
 use ndarray::{Array1, Array2, Axis};
 
 use crate::faer_ndarray::{FaerEigh, strict_symmetric_eigh};
+use crate::roundoff::SymmetricAssembly;
 
 fn tridiagonal_eigenpairs(
     diagonal: &[f64],
@@ -16,7 +17,8 @@ fn tridiagonal_eigenpairs(
         ));
     }
     let matrix = tridiagonal_from_coefficients(diagonal, off_diagonal);
-    strict_symmetric_eigh(&matrix, Side::Lower)
+    // One coefficient is written to both off-diagonal positions.
+    strict_symmetric_eigh(&matrix, SymmetricAssembly::Mirrored, Side::Lower)
         .map_err(|error| format!("tridiagonal eigendecomposition failed: {error:?}"))
 }
 
@@ -439,8 +441,7 @@ pub fn symmetric_extreme_lanczos_eigenpairs(
                     && completed_index.is_multiple_of(options.check_every)));
         if checkpoint {
             let (values, vectors) = tridiagonal_eigenpairs(&alphas, &betas)?;
-            let selected_indices =
-                mgcv_largest_magnitude_indices(&values, options.target_rank);
+            let selected_indices = mgcv_largest_magnitude_indices(&values, options.target_rank);
             let residual_scale = if exhausted { 0.0 } else { beta };
             let selected_operator_scale = selected_indices
                 .iter()

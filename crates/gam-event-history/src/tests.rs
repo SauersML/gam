@@ -21,10 +21,10 @@ use super::forecast::{
 };
 use super::marginal::{SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
-use gam_model_api::families::custom_family::BlockwiseFitOptions;
-use gam_problem::ParameterBlockState;
 use gam_math::jet_scalar::{OneSeed, TwoSeed};
 use gam_math::nested_dual::JetField;
+use gam_model_api::families::custom_family::BlockwiseFitOptions;
+use gam_problem::ParameterBlockState;
 use gam_terms::smooth::{
     LinearCoefficientGeometry, LinearTermSpec, TermCollectionSpec, build_term_collection_design,
 };
@@ -109,7 +109,9 @@ fn assert_rank_stop_explained(fit: &EventHistoryFit, spec: &EventHistorySpec) ->
     .expect("the rank path's stop must be explained");
     assert_eq!(
         fit.unresolved_growth().is_some(),
-        fit.rank_path.last().is_some_and(|step| step.growth_unresolved.is_some())
+        fit.rank_path
+            .last()
+            .is_some_and(|step| step.growth_unresolved.is_some())
     );
     emit(&format!("[rank-stop] rank {}: {stop}", fit.rank()));
     stop
@@ -1370,7 +1372,14 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     let started = std::time::Instant::now();
     let fit = fit_event_history(&mut cohort, &spec).expect("fit");
     let truth_covariance = truth.dot(&truth.t());
-    let (truth_eigenvalues, _) = super::covariance::eigenmodes(&truth_covariance).expect("eigen");
+    // A GEMM Gram over the `rank` loading columns.
+    let (truth_eigenvalues, _) = super::covariance::eigenmodes(
+        &truth_covariance,
+        gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+            depth: truth.ncols(),
+        },
+    )
+    .expect("eigen");
     emit(&format!(
         "[four] {:.1}s rank={} path={:?}",
         started.elapsed().as_secs_f64(),
@@ -1477,7 +1486,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     // (`family::rate_from_chart`), which reaches the fast wall only as u → ∞.
     use super::scalar::Tangent;
     let marks = 4;
-    let (order, refinement) = (fit.quadrature.gauss_hermite_order, fit.quadrature.mesh_refinement);
+    let (order, refinement) = (
+        fit.quadrature.gauss_hermite_order,
+        fit.quadrature.mesh_refinement,
+    );
     emit(&format!(
         "[four] certified at Gauss-Hermite order {order}, mesh refinement {refinement}, mesh ceiling {}",
         cohort.mesh_refinement_ceiling()
@@ -1490,7 +1502,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         refinement + 2 <= cohort.mesh_refinement_ceiling(),
         "certified at mesh refinement {refinement}, less than two rungs below the mesh ceiling, so convergence cannot be measured"
     );
-    let mark_width: usize = fit.fit.block_states[..marks].iter().map(|s| s.beta.len()).sum();
+    let mark_width: usize = fit.fit.block_states[..marks]
+        .iter()
+        .map(|s| s.beta.len())
+        .sum();
     let band = fit.family.rate_band();
     // Per coefficient, how far the residual at the returned state lets its
     // mode sit from the exact one.
@@ -1518,7 +1533,14 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
             .map(|(g, s)| (g - s).abs() + f64::EPSILON * (g.abs() + s.abs()))
             .collect();
         (0..gradient.len())
-            .map(|q| covariance.row(q).iter().zip(&residual).map(|(v, r)| v.abs() * r).sum::<f64>())
+            .map(|q| {
+                covariance
+                    .row(q)
+                    .iter()
+                    .zip(&residual)
+                    .map(|(v, r)| v.abs() * r)
+                    .sum::<f64>()
+            })
             .collect()
     };
     // The free rates in the gauge's order, each with its posterior sd and its
@@ -1534,7 +1556,8 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
                 continue;
             }
             let q = mark_width + slot;
-            let jet = super::family::rate_from_chart(band, &Tangent::<1>::seeded(latent[slot], [1.0]));
+            let jet =
+                super::family::rate_from_chart(band, &Tangent::<1>::seeded(latent[slot], [1.0]));
             rates.push((
                 jet.value,
                 jet.grad[0].abs() * covariance[[q, q]].max(0.0).sqrt(),
@@ -1580,20 +1603,32 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         let scale: Vec<f64> = (0..width)
             .map(|q| covariance[[q, q]].max(0.0).sqrt().recip())
             .collect();
-        let equilibrated =
-            Array2::from_shape_fn((width, width), |(p, q)| scale[p] * covariance[[p, q]] * scale[q]);
-        let lower = gam_linalg::faer_ndarray::FaerCholesky::cholesky(&equilibrated, faer::Side::Lower)
-            .expect("equilibrated posterior Cholesky")
-            .lower_triangular()
-            .mapv(f64::abs);
+        // Read from the lower triangle, the one the Cholesky below reads, so the
+        // equilibrated matrix is mirrored.
+        let equilibrated = Array2::from_shape_fn((width, width), |(p, q)| {
+            let (row, col) = (p.max(q), p.min(q));
+            scale[row] * covariance[[row, col]] * scale[col]
+        });
+        let lower =
+            gam_linalg::faer_ndarray::FaerCholesky::cholesky(&equilibrated, faer::Side::Lower)
+                .expect("equilibrated posterior Cholesky")
+                .lower_triangular()
+                .mapv(f64::abs);
         let steps = (3 * width + 1) as f64;
         let gamma = steps * f64::EPSILON / (1.0 - steps * f64::EPSILON);
         let rp = gamma * frobenius(&lower.dot(&lower.t())) / frobenius(&equilibrated);
-        let (spectrum, _) = super::covariance::eigenmodes(&equilibrated).expect("equilibrated spectrum");
+        let (spectrum, _) = super::covariance::eigenmodes(
+            &equilibrated,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        )
+        .expect("equilibrated spectrum");
         let largest = spectrum.iter().fold(0.0_f64, |m, x| m.max(x.abs()));
         let smallest = spectrum.iter().fold(f64::INFINITY, |m, x| m.min(x.abs()));
         let kappa = largest / smallest;
-        emit(&format!("[four] posterior solve: κ(V_eq) = {kappa}, rp = {rp}, κ·rp = {}", kappa * rp));
+        emit(&format!(
+            "[four] posterior solve: κ(V_eq) = {kappa}, rp = {rp}, κ·rp = {}",
+            kappa * rp
+        ));
         assert!(
             kappa * rp < 1.0,
             "the posterior solve is unresolved: κ(V_eq) = {kappa}, rp = {rp}"
@@ -1606,8 +1641,14 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
             for k in 0..atoms {
                 let (qd, qe) = (mark_width + d * atoms + k, mark_width + e * atoms + k);
                 let product = latent[d * atoms + k] * latent[e * atoms + k];
-                let (share_de, share_ed) = (product + covariance[[qd, qe]], product + covariance[[qe, qd]]);
-                let (mu_de, mu_ed) = (product.abs() + share_de.abs(), product.abs() + share_ed.abs());
+                let (share_de, share_ed) = (
+                    product + covariance[[qd, qe]],
+                    product + covariance[[qe, qd]],
+                );
+                let (mu_de, mu_ed) = (
+                    product.abs() + share_de.abs(),
+                    product.abs() + share_ed.abs(),
+                );
                 let symmetric = share_de + share_ed;
                 let mu_symmetric = mu_de + mu_ed + symmetric.abs();
                 let half = 0.5 * symmetric;
@@ -1667,7 +1708,8 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
                 for k in 0..atoms {
                     let projection: f64 = (0..marks).map(|d| v[d] * latent[d * atoms + k]).sum();
                     for d in 0..marks {
-                        propagated += (2.0 * v[d] * projection).abs() * bands[mark_width + d * atoms + k];
+                        propagated +=
+                            (2.0 * v[d] * projection).abs() * bands[mark_width + d * atoms + k];
                     }
                 }
                 propagated + spread + solve + assembly + radius[j].0 + f64::EPSILON * radius[j].1
@@ -1676,7 +1718,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     };
     let rates = free_rates(&fit);
     for (rate, sd, _) in &rates {
-        emit(&format!("[four] free rate {rate}: wall distance {}, posterior sd {sd}", band.1 - rate));
+        emit(&format!(
+            "[four] free rate {rate}: wall distance {}, posterior sd {sd}",
+            band.1 - rate
+        ));
     }
     // Off the wall, in the likelihood: for every free rate, the likelihood at
     // the mode exceeds the likelihood with that rate moved to the band's fast
@@ -1704,9 +1749,17 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     // correct fit on this cohort (job 1215973: rate 2.064, wall distance
     // 1.986, posterior sd 1.596). The sd and the distance are printed, not
     // asserted.
-    let mode = fit.family.joint_evaluation(&fit.fit.block_states).expect("joint evaluation at the mode");
+    let mode = fit
+        .family
+        .joint_evaluation(&fit.fit.block_states)
+        .expect("joint evaluation at the mode");
     let mode_bands = resolution(&fit);
-    let certificate_mode: f64 = mode.gradient.iter().zip(&mode_bands).map(|(g, b)| g.abs() * b).sum();
+    let certificate_mode: f64 = mode
+        .gradient
+        .iter()
+        .zip(&mode_bands)
+        .map(|(g, b)| g.abs() * b)
+        .sum();
     let mut slot = marks * fit.rank();
     for (atom, held) in fit.family.rate_held().into_iter().enumerate() {
         if held {
@@ -1715,7 +1768,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         let q = mark_width + slot;
         let mut wall = fit.fit.block_states.clone();
         wall[marks].beta[slot] = super::family::rate_chart(band, band.1);
-        let at_wall = fit.family.joint_evaluation(&wall).expect("joint evaluation at the wall");
+        let at_wall = fit
+            .family
+            .joint_evaluation(&wall)
+            .expect("joint evaluation at the wall");
         let certificate_wall: f64 = at_wall
             .gradient
             .iter()
@@ -1725,8 +1781,8 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
             .map(|(_, (g, b))| g.abs() * b)
             .sum();
         let difference = mode.log_likelihood - at_wall.log_likelihood;
-        let rounding =
-            f64::EPSILON * (mode.log_likelihood.abs() + at_wall.log_likelihood.abs() + difference.abs());
+        let rounding = f64::EPSILON
+            * (mode.log_likelihood.abs() + at_wall.log_likelihood.abs() + difference.abs());
         let bar = certificate_mode + certificate_wall + rounding;
         emit(&format!(
             "[four] atom {atom}: ℓ at the mode {}, at the fast wall {}, difference {difference}, resolution {bar} (mode certificate {certificate_mode}, wall certificate {certificate_wall}, subtraction {rounding})",
@@ -1739,7 +1795,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         slot += 1;
     }
     let start = RankStart::carried(
-        fit.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+        fit.fit.block_states[..marks]
+            .iter()
+            .map(|s| s.beta.clone())
+            .collect(),
         fit.loadings.iter().copied().collect(),
         fit.log_rates.clone(),
         fit.atom_log_lambdas.clone(),
@@ -1750,11 +1809,28 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     // carry none, so `rho0` is empty) and no outer strength is re-optimised,
     // so each fit's inner band is its whole coefficient resolution.
     // Without reference strata the reference refinement is never read.
-    emit(&format!("[four] reference strata present: {}", spec.reference.is_some()));
-    assert!(spec.reference.is_none(), "this cohort has no reference population");
+    emit(&format!(
+        "[four] reference strata present: {}",
+        spec.reference.is_some()
+    ));
+    assert!(
+        spec.reference.is_none(),
+        "this cohort has no reference population"
+    );
     let refit_at = |mesh: usize| {
-        super::family::fit_at_rank(&cohort, &spec, fit.rank(), Some(&start), Some((order, mesh)), None, mesh, 2)
-            .unwrap_or_else(|error| panic!("the certified model refitted at mesh refinement {mesh}: {error}"))
+        super::family::fit_at_rank(
+            &cohort,
+            &spec,
+            fit.rank(),
+            Some(&start),
+            Some((order, mesh)),
+            None,
+            mesh,
+            2,
+        )
+        .unwrap_or_else(|error| {
+            panic!("the certified model refitted at mesh refinement {mesh}: {error}")
+        })
     };
     let certified = refit_at(refinement);
     let one_up = refit_at(refinement + 1);
@@ -1793,7 +1869,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
                 refinement + 1,
                 refinement + 2
             );
-            let (reach, spread) = (first_move - first_resolution, second_move + second_resolution);
+            let (reach, spread) = (
+                first_move - first_resolution,
+                second_move + second_resolution,
+            );
             let mu_reach = mu_first_move + mu_first_resolution + reach.abs();
             let mu_spread = mu_second_move + mu_second_resolution + spread.abs();
             let margin = reach - spread;
@@ -1817,7 +1896,10 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
         }
     };
     let coefficients = models.map(|model| {
-        model.fit.block_states[..marks].iter().flat_map(|s| s.beta.iter().copied()).collect::<Vec<f64>>()
+        model.fit.block_states[..marks]
+            .iter()
+            .flat_map(|s| s.beta.iter().copied())
+            .collect::<Vec<f64>>()
     });
     let bands = models.map(|model| resolution(model));
     for q in 0..mark_width {
@@ -1831,7 +1913,11 @@ fn a_multi_mark_rank_two_cohort_does_not_run_away() {
     for j in 0..fit.rank() {
         converges(
             &format!("eigenvalue {j} of C(0)"),
-            [models[0].eigenvalues[j], models[1].eigenvalues[j], models[2].eigenvalues[j]],
+            [
+                models[0].eigenvalues[j],
+                models[1].eigenvalues[j],
+                models[2].eigenvalues[j],
+            ],
             [eigen_bands[0][j], eigen_bands[1][j], eigen_bands[2][j]],
         );
     }
@@ -2157,7 +2243,10 @@ fn effective_rank_is_invariant_to_extreme_covariance_units() {
         let rank = super::covariance::effective_rank(&(&covariance * scale));
         assert!((rank - 1.6).abs() < 1.0e-14);
     }
-    assert_eq!(super::covariance::effective_rank(&Array2::zeros((2, 2))), 0.0);
+    assert_eq!(
+        super::covariance::effective_rank(&Array2::zeros((2, 2))),
+        0.0
+    );
 }
 
 #[test]
@@ -2751,7 +2840,10 @@ impl gam_model_api::families::custom_family::CustomFamily for Traced {
         &self,
         block_states: &[ParameterBlockState],
         specs: &[gam_problem::ParameterBlockSpec],
-    ) -> Result<Option<gam_model_api::families::custom_family::ExactNewtonJointGradientEvaluation>, String> {
+    ) -> Result<
+        Option<gam_model_api::families::custom_family::ExactNewtonJointGradientEvaluation>,
+        String,
+    > {
         self.0
             .exact_newton_joint_gradient_evaluation(block_states, specs)
     }
@@ -3026,10 +3118,13 @@ fn traced_fixed_lambda_inner_solve_on_the_loaded_cohort_reports_its_cost() {
                 ));
             }
         }
-        Err(error) => emit(&format!(
-            "[cost] error after {:.1}s: {error}",
+        // `fit_custom_family_fixed_log_lambdas` returns `Ok` only for a
+        // converged inner mode, so a refusal is the stall this trace reports;
+        // it fails the test instead of being printed and passed.
+        Err(error) => panic!(
+            "fixed-λ inner solve on the loaded cohort must converge; it refused after {:.1}s: {error}",
             clock.elapsed().as_secs_f64()
-        )),
+        ),
     }
 }
 
@@ -3127,9 +3222,13 @@ fn an_observed_score_enters_as_a_penalised_slope_surface() {
     let mut cohort = simulate_score_cohort(300, 6.0, -0.5, &truth, 1.0, 19);
     let events: usize = cohort.subjects.iter().map(|s| s.events.len()).sum();
     let started = std::time::Instant::now();
-    let fit =
-        fit_event_history_formulas(&mut cohort, &[formula], BlockwiseFitOptions::default(), None)
-            .expect("fit with a declining score effect");
+    let fit = fit_event_history_formulas(
+        &mut cohort,
+        &[formula],
+        BlockwiseFitOptions::default(),
+        None,
+    )
+    .expect("fit with a declining score effect");
     let slope = fitted_score_slope(&fit, &times);
     emit(&format!(
         "[score-slope] declining arm: {events} events, {:.1}s, outer_iterations={} log_lambdas={:?}",
@@ -3386,8 +3485,11 @@ fn terminal_forecasts_match_the_constant_hazard_solution() {
     let mut cohort = competing_risks_cohort(64);
     let spec = EventHistorySpec::new(vec![intercept_only_spec()]);
     let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
-    assert!(fit.rank_path.iter().all(|step| step.proposed_rate.is_finite()
-        && step.proposed_rate >= 0.0));
+    assert!(
+        fit.rank_path
+            .iter()
+            .all(|step| step.proposed_rate.is_finite() && step.proposed_rate >= 0.0)
+    );
     // The maximum-likelihood rates: events over exposure, per mark.
     let exposure: f64 = cohort.subjects.iter().map(|s| s.exit - s.entry).sum();
     let counts: Vec<f64> = (0..3)
@@ -3542,7 +3644,12 @@ fn constant_hazard_fit() -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
     let mut cohort = competing_risks_cohort(64);
     let spec = EventHistorySpec::new(vec![intercept_only_spec()]);
     let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
-    assert_eq!(fit.rank(), 0, "the constant-hazard fixture must be rank zero: {:?}", fit.rank_path);
+    assert_eq!(
+        fit.rank(),
+        0,
+        "the constant-hazard fixture must be rank zero: {:?}",
+        fit.rank_path
+    );
     let rates = (0..3).map(|d| fit.mark_coefficients(d)[0].exp()).collect();
     (cohort, fit, rates)
 }
@@ -3607,7 +3714,10 @@ fn a_long_forecast_window_keeps_survival_and_terminal_incidence_summing_to_one()
         + f.expected_count_errors[[0, 0]]
         + f.expected_count_errors[[0, 1]]
         + oracle_rounding(mass, 2);
-    assert!(bar < 1.0, "the checked error {bar} does not resolve a probability");
+    assert!(
+        bar < 1.0,
+        "the checked error {bar} does not resolve a probability"
+    );
     assert!(
         (mass - 1.0).abs() <= bar,
         "survival plus terminal incidence at integrated hazard 100 is {mass}, not one within {bar}"
@@ -3618,7 +3728,10 @@ fn a_long_forecast_window_keeps_survival_and_terminal_incidence_summing_to_one()
         // The closed form is five operations deep (exp, add, expm1, div, mul).
         let closed = rates[d] / total_terminal * decrement;
         let bar = f.expected_count_errors[[0, d]] + oracle_rounding(closed, 5);
-        assert!(closed > bar, "mark {d}: closed form {closed} is not above its bar {bar}");
+        assert!(
+            closed > bar,
+            "mark {d}: closed form {closed} is not above its bar {bar}"
+        );
         assert!(
             (f.expected_counts[[0, d]] - closed).abs() <= bar,
             "mark {d}: expected count {} vs closed form {closed}, bar {bar}",
@@ -3664,7 +3777,10 @@ fn reporting_horizons_do_not_change_an_existing_forecast() {
     // and agrees within the two forecasts' checked errors.
     for d in 0..3 {
         let bar = alone.expected_count_errors[[0, d]] + full.expected_count_errors[[49, d]];
-        assert!(full.expected_counts[[49, d]] > bar, "mark {d}: count below its bar {bar}");
+        assert!(
+            full.expected_counts[[49, d]] > bar,
+            "mark {d}: count below its bar {bar}"
+        );
         assert!(
             (alone.expected_counts[[0, d]] - full.expected_counts[[49, d]]).abs() <= bar,
             "mark {d} at integrated hazard 50: {} alone, {} among one hundred horizons",
@@ -3687,7 +3803,10 @@ fn constant_hazard_forecasts_are_exact_at_every_horizon() {
     // Long windows are the mass test's. Here every compared value stays above
     // its bar: the magnitude floor a two-route comparison needs.
     let hazards = [0.5, 2.0, 10.0];
-    let horizons: Vec<f64> = hazards.iter().map(|h| censored.exit + h / total_terminal).collect();
+    let horizons: Vec<f64> = hazards
+        .iter()
+        .map(|h| censored.exit + h / total_terminal)
+        .collect();
     let f = forecast(
         &fit,
         &cohort,
@@ -3707,13 +3826,18 @@ fn constant_hazard_forecasts_are_exact_at_every_horizon() {
             f.survival[i],
             (-hazard).exp(),
             f.expected_counts.row(i).to_vec(),
-            (0..3).map(|d| rates[d] / total_terminal * decrement).collect::<Vec<_>>()
+            (0..3)
+                .map(|d| rates[d] / total_terminal * decrement)
+                .collect::<Vec<_>>()
         ));
         // The closed survival is five operations deep (exp, add, sub, mul, exp),
         // the closed counts seven (then expm1, div, mul).
         let survival = (-hazard).exp();
         let bar = f.survival_error[i] + oracle_rounding(survival, 5);
-        assert!(survival > bar, "survival {survival} is not above its bar {bar}");
+        assert!(
+            survival > bar,
+            "survival {survival} is not above its bar {bar}"
+        );
         assert!(
             (f.survival[i] - survival).abs() <= bar,
             "survival at integrated hazard {hazard}: {} vs {survival}, bar {bar}",
@@ -3722,7 +3846,10 @@ fn constant_hazard_forecasts_are_exact_at_every_horizon() {
         for d in 0..3 {
             let closed = rates[d] / total_terminal * decrement;
             let bar = f.expected_count_errors[[i, d]] + oracle_rounding(closed, 7);
-            assert!(closed > bar, "mark {d}: closed form {closed} is not above its bar {bar}");
+            assert!(
+                closed > bar,
+                "mark {d}: closed form {closed} is not above its bar {bar}"
+            );
             assert!(
                 (f.expected_counts[[i, d]] - closed).abs() <= bar,
                 "mark {d} at integrated hazard {hazard}: {} vs closed form {closed}, bar {bar}",
@@ -4504,10 +4631,14 @@ fn per_mark_formulas_give_each_mark_its_own_terms() {
     assert_eq!(fit.mark_coefficients(0).len(), 2, "intercept and x");
     assert_eq!(fit.mark_coefficients(1).len(), 1, "intercept alone");
     assert_eq!(fit.mark_coefficients(2).len(), 2);
-    let refused =
-        fit_event_history_formulas(&mut cohort, &["x", "1"], BlockwiseFitOptions::default(), None)
-            .err()
-            .expect("two formulas for three marks must be refused");
+    let refused = fit_event_history_formulas(
+        &mut cohort,
+        &["x", "1"],
+        BlockwiseFitOptions::default(),
+        None,
+    )
+    .err()
+    .expect("two formulas for three marks must be refused");
     assert!(refused.to_string().contains("one per mark"), "{refused}");
 }
 
@@ -4516,23 +4647,45 @@ fn per_mark_formulas_give_each_mark_its_own_terms() {
 fn static_frailty_reference(eta0: f64, loading: f64, times: &[f64]) -> (Vec<f64>, Vec<f64>) {
     let points = 2001;
     let step = 18.0 / (points - 1) as f64;
-    let activity: Vec<f64> = (0..points).map(|i| (loading * (-9.0 + step * i as f64)).exp()).collect();
-    let phi: Vec<f64> = (0..points).map(|i| (-0.5 * (-9.0 + step * i as f64).powi(2)).exp()).collect();
+    let activity: Vec<f64> = (0..points)
+        .map(|i| (loading * (-9.0 + step * i as f64)).exp())
+        .collect();
+    let phi: Vec<f64> = (0..points)
+        .map(|i| (-0.5 * (-9.0 + step * i as f64).powi(2)).exp())
+        .collect();
     let total: f64 = phi.iter().sum();
-    let mass = |h: f64| -> f64 { activity.iter().zip(&phi).map(|(r, p)| p * (-h * r).exp()).sum::<f64>() / total };
+    let mass = |h: f64| -> f64 {
+        activity
+            .iter()
+            .zip(&phi)
+            .map(|(r, p)| p * (-h * r).exp())
+            .sum::<f64>()
+            / total
+    };
     let mut normalisers = Vec::new();
     let mut masses = Vec::new();
     for &t in times {
         let target = (-eta0.exp() * t).exp();
         let mut upper = 1.0;
-        while mass(upper) > target { upper *= 2.0; }
+        while mass(upper) > target {
+            upper *= 2.0;
+        }
         let mut lower = 0.0;
         for _ in 0..55 {
             let middle = 0.5 * (lower + upper);
-            if mass(middle) > target { lower = middle; } else { upper = middle; }
+            if mass(middle) > target {
+                lower = middle;
+            } else {
+                upper = middle;
+            }
         }
         let h = 0.5 * (lower + upper);
-        let tilted: f64 = activity.iter().zip(&phi).map(|(r, p)| p * r * (-h * r).exp()).sum::<f64>() / total;
+        let tilted: f64 = activity
+            .iter()
+            .zip(&phi)
+            .map(|(r, p)| p * r * (-h * r).exp())
+            .sum::<f64>()
+            / total;
         normalisers.push((tilted / target).ln());
         masses.push(target.ln());
     }
@@ -4552,7 +4705,10 @@ fn the_risk_set_normaliser_matches_an_independent_quadrature_of_the_population()
         .map(|n| horizon * n as f64 / (nodes - 1) as f64)
         .collect();
     let gaps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    let grid = ReferenceGrid { times: times.clone(), gaps };
+    let grid = ReferenceGrid {
+        times: times.clone(),
+        gaps,
+    };
     let gh = GaussHermite::new(15).expect("quadrature");
     let eta0 = vec![eta0_value; nodes];
     let out = stratum_normalisers(
@@ -4566,8 +4722,7 @@ fn the_risk_set_normaliser_matches_an_independent_quadrature_of_the_population()
         1,
     )
     .expect("reference population");
-    let (expected, expected_mass) =
-        static_frailty_reference(eta0_value, loading, &times);
+    let (expected, expected_mass) = static_frailty_reference(eta0_value, loading, &times);
     let gap = out
         .log_normaliser
         .iter()
@@ -4646,10 +4801,7 @@ fn without_loadings_the_two_centrings_are_the_same_model() {
     let nodes = 9;
     let times: Vec<f64> = (0..nodes).map(|n| n as f64 * 0.5).collect();
     let gaps: Vec<f64> = times.windows(2).map(|w| w[1] - w[0]).collect();
-    let grid = ReferenceGrid {
-        times,
-        gaps,
-    };
+    let grid = ReferenceGrid { times, gaps };
     let gh = GaussHermite::new(9).expect("quadrature");
     let eta0: Vec<f64> = (0..nodes * 2).map(|i| -1.0 - 0.01 * i as f64).collect();
     let out = stratum_normalisers(
@@ -4807,12 +4959,26 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
         !centred.reference_refinements.is_empty(),
         "a risk-set centred fit must have refreshed its normaliser at least once"
     );
-    assert!(centred.reference_certificate.is_some_and(|certificate| certificate <= spec.quadrature_tolerance));
-    let reevaluated = centred.family.refresh_normaliser(&centred.fit.block_states).unwrap();
-    assert_eq!(centred.centring.as_ref().unwrap().log_normaliser, reevaluated.log_normaliser);
-    assert_eq!(centred.centring.as_ref().unwrap().log_risk_mass, reevaluated.log_risk_mass);
     assert!(
-        !centred.centring.as_ref().unwrap().log_risk_mass.is_empty() && centred.centring.as_ref().unwrap().masks > 0,
+        centred
+            .reference_certificate
+            .is_some_and(|certificate| certificate <= spec.quadrature_tolerance)
+    );
+    let reevaluated = centred
+        .family
+        .refresh_normaliser(&centred.fit.block_states)
+        .unwrap();
+    assert_eq!(
+        centred.centring.as_ref().unwrap().log_normaliser,
+        reevaluated.log_normaliser
+    );
+    assert_eq!(
+        centred.centring.as_ref().unwrap().log_risk_mass,
+        reevaluated.log_risk_mass
+    );
+    assert!(
+        !centred.centring.as_ref().unwrap().log_risk_mass.is_empty()
+            && centred.centring.as_ref().unwrap().masks > 0,
         "the fit must publish the reference population's own risk mass"
     );
     // The empirical hazard falls over follow-up, which is the selection the
@@ -4849,31 +5015,68 @@ fn finite_combined_log_rate_preserves_value_and_derivatives() {
     use super::marginal::node_likelihood;
     use super::scalar::Tangent;
     let like = Tangent::<1>::seeded(0.0, [0.0]);
-    let grid = Grid::new(&GaussHermite::new(3).unwrap(),
-        &[like.constant_like(800.0)], &[like.constant_like(1.0)], &like);
-    let value = node_likelihood(&grid, &[like.constant_like(-800.0)],
-        &[Tangent::seeded(1.0, [1.0])], &[0.0], &[1.0], None,
-        Some(&[like]), 1, 1, false);
+    let grid = Grid::new(
+        &GaussHermite::new(3).unwrap(),
+        &[like.constant_like(800.0)],
+        &[like.constant_like(1.0)],
+        &like,
+    );
+    let value = node_likelihood(
+        &grid,
+        &[like.constant_like(-800.0)],
+        &[Tangent::seeded(1.0, [1.0])],
+        &[0.0],
+        &[1.0],
+        None,
+        Some(&[like]),
+        1,
+        1,
+        false,
+    );
     assert!((value.ell[1].value + 1.0).abs() < 1e-12);
     assert!((value.ell[1].grad[0] + 800.0).abs() < 1e-9);
-    assert!(value.ell.iter().all(|value| value.value.is_finite() && value.grad[0].is_finite()));
+    assert!(
+        value
+            .ell
+            .iter()
+            .all(|value| value.value.is_finite() && value.grad[0].is_finite())
+    );
 }
 
 #[test]
 fn reference_endpoints_are_supported_and_extrapolation_is_rejected() {
-    let grid = ReferenceGrid { times: vec![0.0, 1.0], gaps: vec![1.0] };
+    let grid = ReferenceGrid {
+        times: vec![0.0, 1.0],
+        gaps: vec![1.0],
+    };
     assert_eq!(grid.locate(0.0).unwrap(), (0, 0.0));
     assert_eq!(grid.locate(1.0).unwrap(), (0, 1.0));
-    for t in [-0.01, 1.01, f64::NAN, f64::INFINITY] { assert!(grid.locate(t).is_err()); }
-    assert!(ReferenceGrid { times: vec![], gaps: vec![] }.locate(0.0).is_err());
+    for t in [-0.01, 1.01, f64::NAN, f64::INFINITY] {
+        assert!(grid.locate(t).is_err());
+    }
+    assert!(
+        ReferenceGrid {
+            times: vec![],
+            gaps: vec![]
+        }
+        .locate(0.0)
+        .is_err()
+    );
 }
 
 #[test]
 fn reference_grid_and_strata_round_trip_without_changing_positions() {
-    let grid = ReferenceGrid { times: vec![0.1, 1.7, 2.9], gaps: vec![1.7 - 0.1, 2.9 - 1.7] };
-    let strata = ReferenceStrata { rows: (0..12).rev().collect(), subject: vec![10, 2, 11, 0] };
-    let restored: (ReferenceGrid, ReferenceStrata) = serde_json::from_str(
-        &serde_json::to_string(&(grid.clone(), strata.clone())).unwrap()).unwrap();
+    let grid = ReferenceGrid {
+        times: vec![0.1, 1.7, 2.9],
+        gaps: vec![1.7 - 0.1, 2.9 - 1.7],
+    };
+    let strata = ReferenceStrata {
+        rows: (0..12).rev().collect(),
+        subject: vec![10, 2, 11, 0],
+    };
+    let restored: (ReferenceGrid, ReferenceStrata) =
+        serde_json::from_str(&serde_json::to_string(&(grid.clone(), strata.clone())).unwrap())
+            .unwrap();
     assert_eq!(grid.times, restored.0.times);
     assert_eq!(grid.gaps, restored.0.gaps);
     assert_eq!(strata, restored.1);
@@ -4888,10 +5091,24 @@ fn production_reference_grid_converges_to_the_survival_identity() {
     let mut errors = Vec::new();
     // These are the production grid's initial resolution and two refinements.
     for intervals in [36, 72, 144] {
-        let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
-        let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
-        let out = stratum_normalisers(&grid, &vec![baseline; intervals + 1], &[0.9], &[1e-8],
-            1.0, &gh, &[MarkKind::Once], 1).unwrap();
+        let times: Vec<f64> = (0..=intervals)
+            .map(|n| 6.0 * n as f64 / intervals as f64)
+            .collect();
+        let grid = ReferenceGrid {
+            gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+            times,
+        };
+        let out = stratum_normalisers(
+            &grid,
+            &vec![baseline; intervals + 1],
+            &[0.9],
+            &[1e-8],
+            1.0,
+            &gh,
+            &[MarkKind::Once],
+            1,
+        )
+        .unwrap();
         errors.push((out.log_risk_mass.last().unwrap().exp() - target).abs());
     }
     emit(&format!("continuous-time survival errors: {errors:?}"));
@@ -4924,10 +5141,16 @@ fn reference_midpoint_resolves_the_documented_cohort_2627() {
         covariates[[i, 0]] = prs;
         let mut events = Vec::new();
         if disease < exit {
-            events.push(Event { time: disease, mark: 0 });
+            events.push(Event {
+                time: disease,
+                mark: 0,
+            });
         }
         if death < 4.0 {
-            events.push(Event { time: death, mark: 1 });
+            events.push(Event {
+                time: death,
+                mark: 1,
+            });
         }
         subjects.push(SubjectHistory {
             id: format!("s{i}"),
@@ -4952,8 +5175,13 @@ fn reference_midpoint_resolves_the_documented_cohort_2627() {
         BlockwiseFitOptions::default(),
         Some(ReferenceStrata::single(0, n)),
     )
-    .unwrap_or_else(|error| panic!("the documented cohort must fit under risk-set centring: {error}"));
-    assert!(fit.reference_certificate.is_some(), "a risk-set centred fit publishes its reference certificate");
+    .unwrap_or_else(|error| {
+        panic!("the documented cohort must fit under risk-set centring: {error}")
+    });
+    assert!(
+        fit.reference_certificate.is_some(),
+        "a risk-set centred fit publishes its reference certificate"
+    );
 }
 
 /// The reference midpoint step refuses exactly where its map does not contract (#2627). One once-only mark and one
@@ -4964,13 +5192,35 @@ fn reference_midpoint_resolves_the_documented_cohort_2627() {
 fn reference_midpoint_refuses_only_a_step_that_does_not_contract_2627() {
     let gh = GaussHermite::new(9).expect("rule");
     let evolve = |intervals: usize, loading: f64| {
-        let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
-        let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
-        stratum_normalisers(&grid, &vec![0.0; intervals + 1], &[loading], &[1e-6], 1.0, &gh, &[MarkKind::Once], 1)
+        let times: Vec<f64> = (0..=intervals)
+            .map(|n| 6.0 * n as f64 / intervals as f64)
+            .collect();
+        let grid = ReferenceGrid {
+            gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+            times,
+        };
+        stratum_normalisers(
+            &grid,
+            &vec![0.0; intervals + 1],
+            &[loading],
+            &[1e-6],
+            1.0,
+            &gh,
+            &[MarkKind::Once],
+            1,
+        )
     };
     match evolve(2, 2.0) {
-        Err(super::cohort::EventHistoryError::ReferenceStep { interval, change, contraction, band }) => {
-            assert_eq!(interval, 0, "the first step is the one that does not contract");
+        Err(super::cohort::EventHistoryError::ReferenceStep {
+            interval,
+            change,
+            contraction,
+            band,
+        }) => {
+            assert_eq!(
+                interval, 0,
+                "the first step is the one that does not contract"
+            );
             assert!(
                 contraction >= 1.0 && change > 2.0 * band,
                 "refused at ratio {contraction} and change {change} against rounding band {band}"
@@ -4983,9 +5233,17 @@ fn reference_midpoint_refuses_only_a_step_that_does_not_contract_2627() {
     }
     for (intervals, loading) in [(2, 1.0), (6, 2.0), (12, 2.0)] {
         let out = evolve(intervals, loading).unwrap_or_else(|error| {
-            panic!("step {} at loading {loading} contracts: {error}", 6.0 / intervals as f64)
+            panic!(
+                "step {} at loading {loading} contracts: {error}",
+                6.0 / intervals as f64
+            )
         });
-        assert!(out.log_normaliser.iter().chain(&out.log_risk_mass).all(|x| x.is_finite()));
+        assert!(
+            out.log_normaliser
+                .iter()
+                .chain(&out.log_risk_mass)
+                .all(|x| x.is_finite())
+        );
     }
 }
 
@@ -5000,8 +5258,13 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
     use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
     let gh = GaussHermite::new(9).expect("rule");
     let intervals = 6usize;
-    let times: Vec<f64> = (0..=intervals).map(|n| 6.0 * n as f64 / intervals as f64).collect();
-    let grid = ReferenceGrid { gaps: times.windows(2).map(|w| w[1] - w[0]).collect(), times };
+    let times: Vec<f64> = (0..=intervals)
+        .map(|n| 6.0 * n as f64 / intervals as f64)
+        .collect();
+    let grid = ReferenceGrid {
+        gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
+        times,
+    };
     let evolve = |baseline: Tangent<1>, loading: Tangent<1>| -> Vec<Tangent<1>> {
         stratum_normalisers(
             &grid,
@@ -5017,23 +5280,33 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
         .log_normaliser
     };
     let at = |baseline: f64, loading: f64| -> Vec<f64> {
-        evolve(Tangent::seeded(baseline, [0.0]), Tangent::seeded(loading, [0.0]))
-            .iter()
-            .map(|x| x.value)
-            .collect()
+        evolve(
+            Tangent::seeded(baseline, [0.0]),
+            Tangent::seeded(loading, [0.0]),
+        )
+        .iter()
+        .map(|x| x.value)
+        .collect()
     };
     let h = 1e-3;
     for (name, direction) in [("baseline", [1.0, 0.0]), ("loading", [0.0, 1.0])] {
-        let jets = evolve(Tangent::seeded(0.0, [direction[0]]), Tangent::seeded(2.0, [direction[1]]));
+        let jets = evolve(
+            Tangent::seeded(0.0, [direction[0]]),
+            Tangent::seeded(2.0, [direction[1]]),
+        );
         let central = |step: f64| -> Vec<f64> {
             let plus = at(step * direction[0], 2.0 + step * direction[1]);
             let minus = at(-step * direction[0], 2.0 - step * direction[1]);
-            plus.iter().zip(&minus).map(|(p, m)| (p - m) / (2.0 * step)).collect()
+            plus.iter()
+                .zip(&minus)
+                .map(|(p, m)| (p - m) / (2.0 * step))
+                .collect()
         };
         let (coarse, fine) = (central(h), central(0.5 * h));
         let mut moves = false;
         for (n, jet) in jets.iter().enumerate() {
-            let band = 4.0 * accumulation_growth(gh.order + 1) + UNIT_ROUNDOFF * (1.0 + jet.value.abs());
+            let band =
+                4.0 * accumulation_growth(gh.order + 1) + UNIT_ROUNDOFF * (1.0 + jet.value.abs());
             let bar = (coarse[n] - fine[n]).abs() + 2.0 * (2.0 * intervals as f64 * band) / h;
             assert!(
                 (jet.grad[0] - fine[n]).abs() <= bar,
@@ -5043,7 +5316,10 @@ fn reference_midpoint_derivative_channels_converge_with_the_value_2627() {
             );
             moves |= jet.grad[0].abs() > bar;
         }
-        assert!(moves, "no log normaliser moves along the {name} by more than its bar, so the agreement is vacuous");
+        assert!(
+            moves,
+            "no log normaliser moves along the {name} by more than its bar, so the agreement is vacuous"
+        );
     }
 }
 
@@ -5104,7 +5380,10 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
     );
     let carried = |model: &EventHistoryFit| {
         RankStart::carried(
-            model.fit.block_states[..marks].iter().map(|s| s.beta.clone()).collect(),
+            model.fit.block_states[..marks]
+                .iter()
+                .map(|s| s.beta.clone())
+                .collect(),
             model.loadings.iter().copied().collect(),
             model.log_rates.clone(),
             model.atom_log_lambdas.clone(),
@@ -5113,7 +5392,12 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
     };
     let solved = |model: &EventHistoryFit| {
         (
-            model.fit.block_states.iter().map(|s| s.beta.to_vec()).collect::<Vec<_>>(),
+            model
+                .fit
+                .block_states
+                .iter()
+                .map(|s| s.beta.to_vec())
+                .collect::<Vec<_>>(),
             model.fit.log_lambdas.to_vec(),
             (
                 model.fit.outer_iterations,
@@ -5124,12 +5408,23 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
         )
     };
     let setting_of = |model: &EventHistoryFit| {
-        (model.quadrature.gauss_hermite_order, model.quadrature.mesh_refinement)
+        (
+            model.quadrature.gauss_hermite_order,
+            model.quadrature.mesh_refinement,
+        )
     };
     let clock = std::time::Instant::now();
-    let candidate =
-        super::family::fit_at_rank(&cohort, &spec, 1, Some(&start), Some(setting), None, setting.1, 2)
-            .expect("the candidate at the ladder's first setting");
+    let candidate = super::family::fit_at_rank(
+        &cohort,
+        &spec,
+        1,
+        Some(&start),
+        Some(setting),
+        None,
+        setting.1,
+        2,
+    )
+    .expect("the candidate at the ladder's first setting");
     let candidate_seconds = clock.elapsed().as_secs_f64();
     let admitted = solved(&candidate);
     let certify_from = carried(&candidate);
@@ -5246,24 +5541,53 @@ fn a_reference_grid_is_certified_by_the_geometric_tail_of_its_steps_2986() {
     let exact = |value: f64| Shift { value, band: 0.0 };
     let tail = |first: Shift, second: Shift| {
         let certificate = reference_tail(first, second);
-        emit(&format!("[2986 tail] {first:?}, {second:?}: {certificate:?}"));
+        emit(&format!(
+            "[2986 tail] {first:?}, {second:?}: {certificate:?}"
+        ));
         certificate
     };
     let halving = tail(exact(1.0), exact(0.5)).expect("a contracting pair");
-    let banded = tail(Shift { value: 1.25, band: 0.25 }, Shift { value: 0.25, band: 0.25 }).expect("a banded pair");
+    let banded = tail(
+        Shift {
+            value: 1.25,
+            band: 0.25,
+        },
+        Shift {
+            value: 0.25,
+            band: 0.25,
+        },
+    )
+    .expect("a banded pair");
     let flat = tail(exact(0.5), exact(0.5)).expect("a pair that does not contract");
     let unread = tail(exact(0.0), exact(0.0)).expect("an unread grid");
-    let inside = tail(Shift { value: 1e-3, band: 1e-3 }, exact(1e-4));
+    let inside = tail(
+        Shift {
+            value: 1e-3,
+            band: 1e-3,
+        },
+        exact(1e-4),
+    );
     let vanished = tail(exact(0.0), exact(1e-4));
     // 1 + (1/2)/(1/2).
     assert_eq!(halving, Some(2.0), "the tail of steps 1 and 1/2 is 2");
     // (5/4 + 1/4) + (1/4 + 1/4)/(1 − (1/2)/(5/4 − 1/4)): the bands are charged.
-    assert_eq!(banded, Some(2.5), "the tail of banded steps reads each at its band's edge");
+    assert_eq!(
+        banded,
+        Some(2.5),
+        "the tail of banded steps reads each at its band's edge"
+    );
     assert_eq!(flat, None, "steps that do not contract have no tail");
-    assert_eq!(unread, Some(0.0), "a grid the objective does not read is certified at zero");
+    assert_eq!(
+        unread,
+        Some(0.0),
+        "a grid the objective does not read is certified at zero"
+    );
     for (label, refusal) in [("inside its band", inside), ("vanished", vanished)] {
         assert!(
-            matches!(refusal, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+            matches!(
+                refusal,
+                Err(super::cohort::EventHistoryError::NumericalFailure { .. })
+            ),
             "a first step {label} leaves the ratio unresolved and must be refused: {refusal:?}"
         );
     }
@@ -5291,14 +5615,38 @@ fn the_reference_grid_is_the_first_whose_tail_certifies_2986() {
             })
     })
     .expect("a grid certifies within the fixture's steps");
-    let expected = reference_tail(Shift { value: steps[2], band: 0.0 }, Shift { value: steps[3], band: 0.0 })
-        .expect("grid 4's tail")
-        .expect("grid 4's steps contract");
-    emit(&format!("[2986 select] chose grid {chosen} at {certificate:e} (expected {expected:e}); asked {asked:?}; read {read:?}"));
-    assert_eq!(chosen, 4, "the chosen grid must be the first whose tail certifies, grid 4");
-    assert_eq!(certificate, expected, "the chosen grid's certificate must be its tail");
-    assert_eq!(asked, vec![2, 3, 4, 5], "each step is asked once, in order, and none past the chosen grid's second");
-    assert_eq!(read.iter().map(|step| step.value).collect::<Vec<_>>(), steps.to_vec());
+    let expected = reference_tail(
+        Shift {
+            value: steps[2],
+            band: 0.0,
+        },
+        Shift {
+            value: steps[3],
+            band: 0.0,
+        },
+    )
+    .expect("grid 4's tail")
+    .expect("grid 4's steps contract");
+    emit(&format!(
+        "[2986 select] chose grid {chosen} at {certificate:e} (expected {expected:e}); asked {asked:?}; read {read:?}"
+    ));
+    assert_eq!(
+        chosen, 4,
+        "the chosen grid must be the first whose tail certifies, grid 4"
+    );
+    assert_eq!(
+        certificate, expected,
+        "the chosen grid's certificate must be its tail"
+    );
+    assert_eq!(
+        asked,
+        vec![2, 3, 4, 5],
+        "each step is asked once, in order, and none past the chosen grid's second"
+    );
+    assert_eq!(
+        read.iter().map(|step| step.value).collect::<Vec<_>>(),
+        steps.to_vec()
+    );
 }
 
 /// A grid whose own steps do not contract is charged its step and certified by
@@ -5324,28 +5672,68 @@ fn a_grid_whose_steps_do_not_contract_is_charged_its_step_2986() {
                 })
         })
         .expect("a grid certifies within the fixture's steps");
-        emit(&format!("[2986 charged] steps {steps:?}: chose grid {} at {:e}; asked {asked:?}", selected.0, selected.1));
+        emit(&format!(
+            "[2986 charged] steps {steps:?}: chose grid {} at {:e}; asked {asked:?}",
+            selected.0, selected.1
+        ));
         (selected.0, selected.1, asked)
     };
     let tail_of = |first: f64, second: f64| {
-        reference_tail(Shift { value: first, band: 0.0 }, Shift { value: second, band: 0.0 })
-            .expect("a resolved first step")
-            .expect("contracting steps")
+        reference_tail(
+            Shift {
+                value: first,
+                band: 0.0,
+            },
+            Shift {
+                value: second,
+                band: 0.0,
+            },
+        )
+        .expect("a resolved first step")
+        .expect("contracting steps")
     };
     let flat = [1.0 / 64.0, 1.0 / 64.0, 1.0 / 128.0];
     assert_eq!(
-        reference_tail(Shift { value: flat[0], band: 0.0 }, Shift { value: flat[1], band: 0.0 }).expect("resolved"),
+        reference_tail(
+            Shift {
+                value: flat[0],
+                band: 0.0
+            },
+            Shift {
+                value: flat[1],
+                band: 0.0
+            }
+        )
+        .expect("resolved"),
         None,
         "grid 2's own steps do not contract"
     );
     let (chosen, certificate, asked) = select(flat);
-    assert_eq!(chosen, 2, "the fitted grid is certified through grid 3's tail, not refitted at grid 3");
-    assert_eq!(certificate, 3.0 / 64.0, "grid 2 is charged its step plus grid 3's tail");
-    assert_eq!(asked, vec![2, 3, 4], "no step past the one after the grid whose tail certifies");
+    assert_eq!(
+        chosen, 2,
+        "the fitted grid is certified through grid 3's tail, not refitted at grid 3"
+    );
+    assert_eq!(
+        certificate,
+        3.0 / 64.0,
+        "grid 2 is charged its step plus grid 3's tail"
+    );
+    assert_eq!(
+        asked,
+        vec![2, 3, 4],
+        "no step past the one after the grid whose tail certifies"
+    );
     let steep = [1.0 / 32.0, 1.0 / 32.0, 1.0 / 128.0];
     let (chosen, certificate, _) = select(steep);
-    assert_eq!(chosen, 3, "a charge past the tolerance leaves the coarsest certified grid, grid 3");
-    assert_eq!(certificate, tail_of(steep[1], steep[2]), "grid 3 is certified at its own tail");
+    assert_eq!(
+        chosen, 3,
+        "a charge past the tolerance leaves the coarsest certified grid, grid 3"
+    );
+    assert_eq!(
+        certificate,
+        tail_of(steep[1], steep[2]),
+        "grid 3 is certified at its own tail"
+    );
 }
 
 /// A refinement's coefficient move is `max_q |(V (g′ − g))_q| / sd_q` with its
@@ -5358,16 +5746,26 @@ fn a_refinement_shift_is_the_posterior_move_with_its_rounding_band_2986() {
     use super::family::refinement_shift;
     let covariance = array![[4.0, 2.0], [2.0, 9.0]];
     let sd = [2.0, 3.0];
-    let shift = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5, -0.25]).expect("a finite move");
+    let shift =
+        refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5, -0.25]).expect("a finite move");
     let poisoned = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[f64::NAN, -0.25]);
     let short = refinement_shift(&covariance, &sd, &[0.0, 0.0], &[0.5]);
-    emit(&format!("[2986 shift] {shift:?}; poisoned {poisoned:?}; short {short:?}"));
+    emit(&format!(
+        "[2986 shift] {shift:?}; poisoned {poisoned:?}; short {short:?}"
+    ));
     // V δ = (3/2, −5/4): 3/4 and 5/12 posterior sd.
     assert_eq!(shift.value, 0.75, "the move is the largest |V δ| / sd");
     // Σ |V δ| / sd = (5/2)/2 and (13/4)/3.
-    assert_eq!(shift.band, 1.25 * gam_math::roundoff::accumulation_growth(5), "the band is γ_(p+3) max Σ|V δ| / sd");
+    assert_eq!(
+        shift.band,
+        1.25 * gam_math::roundoff::accumulation_growth(5),
+        "the band is γ_(p+3) max Σ|V δ| / sd"
+    );
     assert!(
-        matches!(poisoned, Err(super::cohort::EventHistoryError::NumericalFailure { .. })),
+        matches!(
+            poisoned,
+            Err(super::cohort::EventHistoryError::NumericalFailure { .. })
+        ),
         "a refined gradient that is not finite must be a typed failure: {poisoned:?}"
     );
     assert!(
@@ -5382,7 +5780,8 @@ fn a_refinement_shift_is_the_posterior_move_with_its_rounding_band_2986() {
 /// is then known exactly, which is what lets an independent quadrature of the
 /// same model serve as its oracle.
 fn inject_one_atom(fit: &mut EventHistoryFit, loadings: [f64; 3], nu: f64) {
-    fit.loadings = Array2::from_shape_vec((3, 1), loadings.to_vec()).expect("one column of loadings");
+    fit.loadings =
+        Array2::from_shape_vec((3, 1), loadings.to_vec()).expect("one column of loadings");
     fit.log_rates = vec![nu.ln()];
     assert_eq!(fit.rank(), 1);
 }
@@ -5395,8 +5794,17 @@ fn constant_hazard_fit_at(order: usize) -> (EventHistoryCohort, EventHistoryFit,
     let mut spec = EventHistorySpec::new(vec![intercept_only_spec()]);
     spec.gauss_hermite_order = order;
     let fit = fit_event_history(&mut cohort, &spec).expect("intercept-only fit");
-    assert_eq!(fit.rank(), 0, "the constant-hazard fixture must be rank zero: {:?}", fit.rank_path);
-    assert_eq!(fit.family.gauss_hermite_order(), order, "the fit left Gauss-Hermite order {order}");
+    assert_eq!(
+        fit.rank(),
+        0,
+        "the constant-hazard fixture must be rank zero: {:?}",
+        fit.rank_path
+    );
+    assert_eq!(
+        fit.family.gauss_hermite_order(),
+        order,
+        "the fit left Gauss-Hermite order {order}"
+    );
     let rates = (0..3).map(|d| fit.mark_coefficients(d)[0].exp()).collect();
     (cohort, fit, rates)
 }
@@ -5467,7 +5875,9 @@ fn static_factor_oracle(
         let z = -reach + step * j as f64;
         let ends = if j == 0 || j == n { 0.5 } else { 1.0 };
         let weight = ends * step * (log_weight(z) - peak).exp();
-        let lambda: Vec<f64> = (0..3).map(|d| one_atom_intensity(rates, loadings, d, z)).collect();
+        let lambda: Vec<f64> = (0..3)
+            .map(|d| one_atom_intensity(rates, loadings, d, z))
+            .collect();
         let killing = lambda[0] + lambda[1];
         let decrement = -(-killing * h).exp_m1();
         let ratios = [
@@ -5497,8 +5907,14 @@ fn static_factor_oracle(
         values[q] = numerators[q] / denominator;
         rounding[q] = f64::EPSILON
             * values[q].abs()
-            * (numerator_bounds[q] / numerators[q].abs() + denominator_bound / denominator.abs() + 1.0);
-        let numerator_tail = if q == 3 { outside(recurrent_scale, loadings[2]) } else { outside(1.0, 0.0) };
+            * (numerator_bounds[q] / numerators[q].abs()
+                + denominator_bound / denominator.abs()
+                + 1.0);
+        let numerator_tail = if q == 3 {
+            outside(recurrent_scale, loadings[2])
+        } else {
+            outside(1.0, 0.0)
+        };
         tails[q] = numerator_tail / denominator + values[q].abs() * denominator_tail / denominator;
     }
     (values, rounding, tails)
@@ -5515,11 +5931,16 @@ fn static_factor_reference(
     h: f64,
     step: f64,
 ) -> ([f64; 4], [f64; 4]) {
-    let (coarse, coarse_rounding, coarse_tail) = static_factor_oracle(rates, loadings, events, follow_up, h, 2.0 * step);
+    let (coarse, coarse_rounding, coarse_tail) =
+        static_factor_oracle(rates, loadings, events, follow_up, h, 2.0 * step);
     let (value, rounding, tail) = static_factor_oracle(rates, loadings, events, follow_up, h, step);
     let mut error = [0.0; 4];
     for q in 0..4 {
-        error[q] = (coarse[q] - value[q]).abs() + coarse_rounding[q] + rounding[q] + coarse_tail[q] + tail[q];
+        error[q] = (coarse[q] - value[q]).abs()
+            + coarse_rounding[q]
+            + rounding[q]
+            + coarse_tail[q]
+            + tail[q];
     }
     (value, error)
 }
@@ -5541,19 +5962,32 @@ fn spectral_oracle(
     steps: usize,
 ) -> [f64; 4] {
     let rule = gam_math::quadrature::gauss_hermite_rule(order).expect("Gauss-Hermite rule");
-    let z: Vec<f64> = rule.nodes.iter().map(|x| std::f64::consts::SQRT_2 * x).collect();
-    let v: Vec<f64> = rule.weights.iter().map(|w| w / std::f64::consts::PI.sqrt()).collect();
+    let z: Vec<f64> = rule
+        .nodes
+        .iter()
+        .map(|x| std::f64::consts::SQRT_2 * x)
+        .collect();
+    let v: Vec<f64> = rule
+        .weights
+        .iter()
+        .map(|w| w / std::f64::consts::PI.sqrt())
+        .collect();
     // basis[n][i] = ψ_n(z_i), with ψ_{n+1} = (z ψ_n − √n ψ_{n−1}) / √(n+1).
     let mut basis = vec![vec![0.0; order]; order];
     for i in 0..order {
         basis[0][i] = 1.0;
         basis[1][i] = z[i];
         for n in 1..order - 1 {
-            basis[n + 1][i] = (z[i] * basis[n][i] - (n as f64).sqrt() * basis[n - 1][i]) / ((n + 1) as f64).sqrt();
+            basis[n + 1][i] = (z[i] * basis[n][i] - (n as f64).sqrt() * basis[n - 1][i])
+                / ((n + 1) as f64).sqrt();
         }
     }
     let lambda: Vec<Vec<f64>> = (0..3)
-        .map(|d| z.iter().map(|&zi| one_atom_intensity(rates, loadings, d, zi)).collect())
+        .map(|d| {
+            z.iter()
+                .map(|&zi| one_atom_intensity(rates, loadings, d, zi))
+                .collect()
+        })
         .collect();
     let densities = |p: &[f64]| -> [f64; 3] {
         let mut m = [0.0; 3];
@@ -5564,8 +5998,12 @@ fn spectral_oracle(
     };
     let run = |steps: usize| -> [f64; 4] {
         let dt = h / steps as f64;
-        let half_kill: Vec<f64> = (0..order).map(|i| (-(lambda[0][i] + lambda[1][i]) * 0.5 * dt).exp()).collect();
-        let decay: Vec<f64> = (0..order).map(|n| (-(n as f64) * kappa_per_time * dt).exp()).collect();
+        let half_kill: Vec<f64> = (0..order)
+            .map(|i| (-(lambda[0][i] + lambda[1][i]) * 0.5 * dt).exp())
+            .collect();
+        let decay: Vec<f64> = (0..order)
+            .map(|n| (-(n as f64) * kappa_per_time * dt).exp())
+            .collect();
         let mut p = vec![1.0; order];
         let mut counts = [0.0; 3];
         let mut previous = densities(&p);
@@ -5577,7 +6015,10 @@ fn spectral_oracle(
                 .map(|n| (0..order).map(|i| v[i] * p[i] * basis[n][i]).sum::<f64>() * decay[n])
                 .collect();
             for i in 0..order {
-                p[i] = (0..order).map(|n| coefficients[n] * basis[n][i]).sum::<f64>() * half_kill[i];
+                p[i] = (0..order)
+                    .map(|n| coefficients[n] * basis[n][i])
+                    .sum::<f64>()
+                    * half_kill[i];
             }
             let current = densities(&p);
             for d in 0..3 {
@@ -5585,7 +6026,12 @@ fn spectral_oracle(
             }
             previous = current;
         }
-        [(0..order).map(|i| v[i] * p[i]).sum(), counts[0], counts[1], counts[2]]
+        [
+            (0..order).map(|i| v[i] * p[i]).sum(),
+            counts[0],
+            counts[1],
+            counts[2],
+        ]
     };
     let coarse = run(steps);
     let fine = run(2 * steps);
@@ -5601,7 +6047,12 @@ fn spectral_oracle(
 /// resolutions, both consecutive changes summed. At these resolutions both sit
 /// at the oracle's rounding floor (probe 1230171: 3.8e-14, then 6.3e-14), so
 /// the finer one being the closer is not assumed.
-fn spectral_reference(rates: &[f64], loadings: &[f64; 3], kappa_per_time: f64, h: f64) -> ([f64; 4], [f64; 4]) {
+fn spectral_reference(
+    rates: &[f64],
+    loadings: &[f64; 3],
+    kappa_per_time: f64,
+    h: f64,
+) -> ([f64; 4], [f64; 4]) {
     let coarse = spectral_oracle(rates, loadings, kappa_per_time, h, 40, 400);
     let value = spectral_oracle(rates, loadings, kappa_per_time, h, 56, 800);
     let fine = spectral_oracle(rates, loadings, kappa_per_time, h, 72, 1600);
@@ -5616,7 +6067,12 @@ fn spectral_reference(rates: &[f64], loadings: &[f64; 3], kappa_per_time: f64, h
 /// checked errors.
 fn forecast_quantities(f: &super::forecast::Forecast, i: usize) -> ([f64; 4], [f64; 4]) {
     (
-        [f.survival[i], f.expected_counts[[i, 0]], f.expected_counts[[i, 1]], f.expected_counts[[i, 2]]],
+        [
+            f.survival[i],
+            f.expected_counts[[i, 0]],
+            f.expected_counts[[i, 1]],
+            f.expected_counts[[i, 2]],
+        ],
         [
             f.survival_error[i],
             f.expected_count_errors[[i, 0]],
@@ -5645,9 +6101,18 @@ fn rank_zero_quantities(rates: &[f64], h: f64) -> [f64; 4] {
 /// error and the oracle's error together. Agreement with the oracle within that
 /// error is then not agreement with the rank-zero model, and an error inflated
 /// past the factor's own effect fails here.
-fn assert_the_factor_is_resolved(label: &str, h: f64, rates: &[f64], errors: [f64; 4], oracle: [f64; 4], oracle_error: [f64; 4]) {
+fn assert_the_factor_is_resolved(
+    label: &str,
+    h: f64,
+    rates: &[f64],
+    errors: [f64; 4],
+    oracle: [f64; 4],
+    oracle_error: [f64; 4],
+) {
     let rank_zero = rank_zero_quantities(rates, h);
-    emit(&format!("[2963 {label}] h {h:.4}: rank-zero model {rank_zero:?}"));
+    emit(&format!(
+        "[2963 {label}] h {h:.4}: rank-zero model {rank_zero:?}"
+    ));
     for q in 0..4 {
         assert!(
             (oracle[q] - rank_zero[q]).abs() > errors[q] + oracle_error[q],
@@ -5662,9 +6127,19 @@ fn assert_the_factor_is_resolved(label: &str, h: f64, rates: &[f64], errors: [f6
 
 /// Assert that a one-atom forecast is covered by its checked error against an
 /// oracle, above the magnitude floor of [`assert_the_factor_is_resolved`].
-fn assert_covered(label: &str, f: &super::forecast::Forecast, i: usize, h: f64, rates: &[f64], oracle: [f64; 4], oracle_error: [f64; 4]) {
+fn assert_covered(
+    label: &str,
+    f: &super::forecast::Forecast,
+    i: usize,
+    h: f64,
+    rates: &[f64],
+    oracle: [f64; 4],
+    oracle_error: [f64; 4],
+) {
     let (forecast, errors) = forecast_quantities(f, i);
-    emit(&format!("[2963 {label}] h {h:.4}: forecast {forecast:?} errors {errors:?} oracle {oracle:?} oracle error {oracle_error:?}"));
+    emit(&format!(
+        "[2963 {label}] h {h:.4}: forecast {forecast:?} errors {errors:?} oracle {oracle:?} oracle error {oracle_error:?}"
+    ));
     assert_the_factor_is_resolved(label, h, rates, errors, oracle, oracle_error);
     for q in 0..4 {
         assert!(
@@ -5747,9 +6222,23 @@ fn a_history_conditioned_static_factor_forecast_is_covered_by_its_reported_error
         subject.exit - subject.entry
     ));
     for (i, &offset) in offsets.iter().enumerate() {
-        let (oracle, oracle_error) =
-            static_factor_reference(&rates, &loadings, &marks, subject.exit - subject.entry, offset, 0.005);
-        assert_covered("history static", &f, i, offset, &rates, oracle, oracle_error);
+        let (oracle, oracle_error) = static_factor_reference(
+            &rates,
+            &loadings,
+            &marks,
+            subject.exit - subject.entry,
+            offset,
+            0.005,
+        );
+        assert_covered(
+            "history static",
+            &f,
+            i,
+            offset,
+            &rates,
+            oracle,
+            oracle_error,
+        );
     }
 }
 
@@ -5768,7 +6257,11 @@ fn a_history_conditioned_static_factor_forecast_is_covered_by_its_reported_error
 /// forecast was 5.0e-10 from the oracle on the pre-fix code too (probe
 /// 1230171). It prints before it asserts. For a dynamic factor it is the arm
 /// the pre-fix code's stalled mesh fires.
-fn assert_the_finer_rule_is_within_the_coarser_ones_error(label: &str, dynamic: bool, resolves: bool) {
+fn assert_the_finer_rule_is_within_the_coarser_ones_error(
+    label: &str,
+    dynamic: bool,
+    resolves: bool,
+) {
     let loadings = [0.8, -0.5, 0.6];
     let mut at_order = Vec::new();
     for order in [9, 17] {
@@ -5804,7 +6297,14 @@ fn assert_the_finer_rule_is_within_the_coarser_ones_error(label: &str, dynamic: 
                 oracle_error[q]
             ));
         }
-        assert_the_factor_is_resolved(&format!("orders {label}"), h, rates, e9, oracle, oracle_error);
+        assert_the_factor_is_resolved(
+            &format!("orders {label}"),
+            h,
+            rates,
+            e9,
+            oracle,
+            oracle_error,
+        );
         for q in 0..4 {
             assert!(
                 (v17[q] - oracle[q]).abs() <= e9[q] + oracle_error[q],
@@ -5855,16 +6355,25 @@ fn a_finer_rule_keeps_a_dynamic_factor_forecast_within_the_coarser_ones_error() 
 /// whose normaliser `log M(t)` is `log_normaliser` at `times`, the same for
 /// every mark, and linear between them. At rank zero the model's intensities
 /// are then `r_d e^{−log M(t)}`, with a kink at every interior grid time.
-fn kinked_constant_hazard_fit(times: &[f64], log_normaliser: &[f64]) -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
+fn kinked_constant_hazard_fit(
+    times: &[f64],
+    log_normaliser: &[f64],
+) -> (EventHistoryCohort, EventHistoryFit, Vec<f64>) {
     let (cohort, mut fit, rates) = constant_hazard_fit();
     let marks = fit.marks();
     let gaps = times.windows(2).map(|w| w[1] - w[0]).collect();
     fit.centring = Some(super::family::RiskSetCentring {
-        grid: ReferenceGrid { times: times.to_vec(), gaps },
+        grid: ReferenceGrid {
+            times: times.to_vec(),
+            gaps,
+        },
         profiles: Array2::zeros((1, cohort.covariates.ncols())),
         coefficients: Vec::new(),
         node_stratum: vec![0; times.len()],
-        log_normaliser: log_normaliser.iter().flat_map(|&m| std::iter::repeat_n(m, marks)).collect(),
+        log_normaliser: log_normaliser
+            .iter()
+            .flat_map(|&m| std::iter::repeat_n(m, marks))
+            .collect(),
         log_risk_mass: vec![0.0; times.len() * marks],
         masks: 0,
         mask_of_mark: vec![0; marks],
@@ -5883,7 +6392,10 @@ fn every_reference_grid_time_inside_a_window_is_a_level_zero_breakpoint() {
         entry: 1.0,
         exit: 3.5,
         events: Vec::new(),
-        segments: vec![CovariateSegment { start: 1.0, row: 0 }, CovariateSegment { start: 2.5, row: 0 }],
+        segments: vec![
+            CovariateSegment { start: 1.0, row: 0 },
+            CovariateSegment { start: 2.5, row: 0 },
+        ],
     };
     let breakpoints = super::forecast::window_breakpoints(&fit, &window);
     emit(&format!("[2963 breakpoints] {breakpoints:?}"));
@@ -5955,7 +6467,8 @@ fn a_centred_forecast_across_its_reference_grid_matches_its_closed_form() {
             let share = rates[d] / total;
             let share_mu = share * (total_mu / total + 1.0);
             closed[d + 1] = share * decrement;
-            closed_bound[d + 1] = f64::EPSILON * (share * decrement_mu + decrement * share_mu + closed[d + 1]);
+            closed_bound[d + 1] =
+                f64::EPSILON * (share * decrement_mu + decrement * share_mu + closed[d + 1]);
         }
         let (forecast, errors) = forecast_quantities(&f, i);
         emit(&format!(

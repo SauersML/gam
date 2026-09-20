@@ -76,7 +76,6 @@
 //! not the fit's `φ̂` because `φ̂` is computed from a residual the penalty shrank,
 //! whose law under `H₀` depends on the smoothing parameters REML chose.
 
-
 use std::ops::Range;
 
 use faer::Side;
@@ -266,7 +265,10 @@ impl<'a> RandomEffectTestBasis<'a> {
         }
         let rows_finite = input.beta.iter().all(|v| v.is_finite())
             && input.hessian_weights.iter().all(|v| v.is_finite())
-            && input.score_weights.iter().all(|v| v.is_finite() && *v >= 0.0)
+            && input
+                .score_weights
+                .iter()
+                .all(|v| v.is_finite() && *v >= 0.0)
             && input.score.iter().all(|v| v.is_finite());
         if !rows_finite {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
@@ -439,7 +441,10 @@ impl<'a> RandomEffectTestBasis<'a> {
         Ok(())
     }
 
-    fn finish_term(&self, term: PreparedTerm) -> Result<RandomEffectTest, RandomEffectTestUnavailable> {
+    fn finish_term(
+        &self,
+        term: PreparedTerm,
+    ) -> Result<RandomEffectTest, RandomEffectTestUnavailable> {
         let p = self.input.design.ncols();
         if term.fisher_projected.iter().any(|v| !v.is_finite())
             || term.score.iter().any(|v| !v.is_finite())
@@ -447,8 +452,12 @@ impl<'a> RandomEffectTestBasis<'a> {
             return Err(RandomEffectTestUnavailable::DesignUnavailable);
         }
         let symmetric = 0.5 * (&term.fisher_projected + &term.fisher_projected.t());
-        let (eigenvalues, _) = strict_symmetric_eigh(&symmetric, Side::Lower)
-            .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
+        let (eigenvalues, _) = strict_symmetric_eigh(
+            &symmetric,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+            Side::Lower,
+        )
+        .map_err(|_| RandomEffectTestUnavailable::DesignUnavailable)?;
         // `X̃_R` is a difference of two quantities of the size of `X_R`, so an
         // eigenvalue of `V` is resolved only above the rounding of that
         // difference: `p·ε` relative to `‖X_RᵀW_F X_R‖`, whose trace bounds it.
@@ -504,7 +513,8 @@ impl<'a> RandomEffectTestBasis<'a> {
                 )
             }
         };
-        let (p_value, p_value_relative_error) = resolved_tail(tail.probability, tail.relative_error)?;
+        let (p_value, p_value_relative_error) =
+            resolved_tail(tail.probability, tail.relative_error)?;
         Ok(RandomEffectTest {
             statistic: statistic / dispersion * effective_df / weight_sum,
             reference_df: effective_df,
@@ -535,7 +545,10 @@ struct PreparedTerm {
 /// probability of exactly zero, which the evaluator reports that way when the
 /// tail lies below the subnormal range — a resolved "smaller than any
 /// representable p-value".
-fn resolved_tail(probability: f64, relative_error: f64) -> Result<(f64, f64), RandomEffectTestUnavailable> {
+fn resolved_tail(
+    probability: f64,
+    relative_error: f64,
+) -> Result<(f64, f64), RandomEffectTestUnavailable> {
     if probability.is_nan() || relative_error.is_nan() {
         return Err(RandomEffectTestUnavailable::TailUnresolved);
     }
@@ -588,7 +601,12 @@ fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
         }
     }
     let symmetric = 0.5 * (&equilibrated + &equilibrated.t());
-    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(&symmetric, Side::Lower).ok()?;
+    let (eigenvalues, eigenvectors) = strict_symmetric_eigh(
+        &symmetric,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        Side::Lower,
+    )
+    .ok()?;
     let largest = eigenvalues.iter().cloned().fold(0.0_f64, f64::max);
     if !(largest > 0.0) {
         return Some(PseudoInverse {
@@ -606,7 +624,10 @@ fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
         } else {
             0.0
         };
-        scaled.column_mut(index).iter_mut().for_each(|v| *v *= factor);
+        scaled
+            .column_mut(index)
+            .iter_mut()
+            .for_each(|v| *v *= factor);
     }
     let mut inverse = scaled.dot(&eigenvectors.t());
     for i in 0..dim {
@@ -743,7 +764,10 @@ mod tests {
         assert_eq!(test.rank, levels - 1);
         assert!((test.reference_df - df1).abs() < 1e-9, "{test:?}");
         assert_eq!(test.residual_df, Some(df2));
-        assert!((test.statistic - f * df1).abs() < 1e-8 * f * df1, "{test:?} vs F={f}");
+        assert!(
+            (test.statistic - f * df1).abs() < 1e-8 * f * df1,
+            "{test:?} vs F={f}"
+        );
         assert!(
             (test.p_value - expected).abs() <= 1e-8 * expected + 1e-14,
             "{} vs {expected}",
@@ -757,7 +781,9 @@ mod tests {
         let mut rng = Lcg(3);
         let n = 120;
         let x: Vec<f64> = (0..n).map(|_| rng.next_uniform()).collect();
-        let groups: Vec<usize> = (0..n).map(|_| (rng.next_uniform() * levels as f64) as usize).collect();
+        let groups: Vec<usize> = (0..n)
+            .map(|_| (rng.next_uniform() * levels as f64) as usize)
+            .collect();
         let design = one_way_design(&groups, levels, &x);
         let y: Array1<f64> = (0..n).map(|i| 2.0 * x[i] + rng.next_normal()).collect();
         let reference = gaussian_test(
@@ -806,8 +832,8 @@ mod tests {
             let mut sum = 0.0;
             for _ in 0..reps {
                 let y: Array1<f64> = (0..n).map(|i| 1.0 + x[i] + rng.next_normal()).collect();
-                let test = gaussian_test(&design, &y, &beta, 2..2 + levels, scale)
-                    .expect("test runs");
+                let test =
+                    gaussian_test(&design, &y, &beta, 2..2 + levels, scale).expect("test runs");
                 sum += test.p_value;
                 rejections_05 += usize::from(test.p_value < 0.05);
                 rejections_10 += usize::from(test.p_value < 0.10);
@@ -822,7 +848,10 @@ mod tests {
                 );
             }
             let mean = sum / m;
-            assert!((mean - 0.5).abs() <= 3.0 * (1.0 / 12.0 / m).sqrt(), "{scale:?}: mean {mean}");
+            assert!(
+                (mean - 0.5).abs() <= 3.0 * (1.0 / 12.0 / m).sqrt(),
+                "{scale:?}: mean {mean}"
+            );
         }
     }
 
@@ -835,7 +864,9 @@ mod tests {
         let x: Vec<f64> = (0..n).map(|_| rng.next_uniform()).collect();
         let groups: Vec<usize> = (0..n).map(|i| i % levels).collect();
         let design = one_way_design(&groups, levels, &x);
-        let y: Array1<f64> = (0..n).map(|i| x[i] + effects[groups[i]] + rng.next_normal()).collect();
+        let y: Array1<f64> = (0..n)
+            .map(|i| x[i] + effects[groups[i]] + rng.next_normal())
+            .collect();
         let test = gaussian_test(
             &design,
             &y,
@@ -879,7 +910,10 @@ mod tests {
             RandomEffectTestScale::Estimated,
         )
         .expect_err("no residual d.f.");
-        assert_eq!(reason, RandomEffectTestUnavailable::NoResidualDegreesOfFreedom);
+        assert_eq!(
+            reason,
+            RandomEffectTestUnavailable::NoResidualDegreesOfFreedom
+        );
     }
 
     #[test]
@@ -893,7 +927,10 @@ mod tests {
         };
         let json = serde_json::to_string(&record).unwrap();
         assert!(json.contains("\"status\":\"unavailable\""), "{json}");
-        assert!(json.contains("\"reason\":\"no_estimable_direction\""), "{json}");
+        assert!(
+            json.contains("\"reason\":\"no_estimable_direction\""),
+            "{json}"
+        );
         let back: RandomEffectTestRecord = serde_json::from_str(&json).unwrap();
         assert_eq!(back, record);
     }

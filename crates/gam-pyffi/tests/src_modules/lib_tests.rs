@@ -226,6 +226,7 @@ fn symmetric_curvature_solve_preserves_exact_negative_modes() {
     let rhs = array![8.0, -8.0, 1.0];
     let solved = gam::linalg::utils::certified_symmetric_solve(
         &matrix,
+        gam::linalg::roundoff::SymmetricAssembly::Mirrored,
         &rhs,
         "indefinite symmetric curvature solve",
     )
@@ -495,7 +496,10 @@ fn response_geometry_parametric_only_rhs_fits_frechet_mean() {
     // shared-tangent fit.
     let (tangent, base, resolved) =
         dispatch_log_map(values.view(), spd, None, None).expect("SPD log map");
-    assert!(resolved.starts_with("spd"), "resolved response geometry {resolved}");
+    assert!(
+        resolved.starts_with("spd"),
+        "resolved response geometry {resolved}"
+    );
 
     // Intercept-only RHS. `r` is a non-constant placeholder LHS the materializer
     // needs to parse the formula; the impl discards it and uses the `tangent`
@@ -577,8 +581,12 @@ fn load_model_rejects_payload_version_mismatch() {
         Err(e) => e,
     };
     assert!(
-        matches!(err, gam::inference::model::FittedModelError::SchemaMismatch { .. })
-            && err.to_string().contains("saved model payload schema mismatch"),
+        matches!(
+            err,
+            gam::inference::model::FittedModelError::SchemaMismatch { .. }
+        ) && err
+            .to_string()
+            .contains("saved model payload schema mismatch"),
         "unexpected error: {err:?}"
     );
 }

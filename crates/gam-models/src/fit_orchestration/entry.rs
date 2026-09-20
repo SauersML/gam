@@ -1,8 +1,8 @@
 use super::*;
+use crate::inference::model_payload_builders::standard_fit_comparable_reml_score;
 use gam_linalg::matrix::LinearOperator;
 use gam_problem::FailureCategory;
 use gam_solve::estimate::reml::reml_outer_engine::penalty_matrix_root;
-use crate::inference::model_payload_builders::standard_fit_comparable_reml_score;
 use gam_terms::smooth::AdaptiveResolution;
 
 /// Request-specific inputs to the canonical standard-fit `FitOptions`.
@@ -114,7 +114,9 @@ fn spline_scan_failure(error: gam_solve::spline_scan::SplineScoreProofError) -> 
 }
 
 /// A residual-cascade proof or convergence refusal, under its category.
-fn residual_cascade_failure(error: gam_solve::residual_cascade::ResidualCascadeError) -> WorkflowError {
+fn residual_cascade_failure(
+    error: gam_solve::residual_cascade::ResidualCascadeError,
+) -> WorkflowError {
     use gam_solve::residual_cascade::ResidualCascadeError as E;
     let category = match &error {
         // "Invalid input or a numerical failure": prose from two kinds.
@@ -155,14 +157,12 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
     let wrap_solver_err =
         |failure: FitFailure| -> WorkflowError { WorkflowError::from(failure.ending_the_fit()) };
     match request {
-        FitRequest::Standard(request) => {
-            match try_deterministic_gaussian_standard_fit(&request)? {
-                GaussianStandardRoute::Exact(fitted) => Ok(FitResult::Standard(fitted)),
-                GaussianStandardRoute::Iterative(design) => {
-                    fit_standard_past_exact_gaussian_boundary(request, design)
-                }
+        FitRequest::Standard(request) => match try_deterministic_gaussian_standard_fit(&request)? {
+            GaussianStandardRoute::Exact(fitted) => Ok(FitResult::Standard(fitted)),
+            GaussianStandardRoute::Iterative(design) => {
+                fit_standard_past_exact_gaussian_boundary(request, design)
             }
-        }
+        },
         FitRequest::GaussianLocationScale(request) => fit_gaussian_location_scale_model(request)
             .map(FitResult::GaussianLocationScale)
             .map_err(wrap_solver_err),
@@ -224,9 +224,7 @@ pub(crate) fn resolved_resource_policy(
 /// the one rule [`FitConfig::resolve`] also enforces: `Some(levels)` for the
 /// expectile family, `None` for every other family, and `Err` for a malformed
 /// expectile request or an `expectile_tau` given with a non-expectile family.
-pub fn expectile_levels_for_config(
-    config: &FitConfig,
-) -> Result<Option<Vec<f64>>, WorkflowError> {
+pub fn expectile_levels_for_config(config: &FitConfig) -> Result<Option<Vec<f64>>, WorkflowError> {
     config
         .resolved_expectile_levels()
         .map_err(|reason| WorkflowError::InvalidConfig { reason })
@@ -537,7 +535,8 @@ mod expectile_convergence_tests {
     fn weighted_expectile_ignores_zero_weight_rows_and_rejects_bad_input() {
         let with_dead = weighted_empirical_expectile(&[1.0, 100.0, 3.0], &[1.0, 0.0, 1.0], 0.8)
             .expect("expectile");
-        let without = weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
+        let without =
+            weighted_empirical_expectile(&[1.0, 3.0], &[1.0, 1.0], 0.8).expect("expectile");
         assert!((with_dead - without).abs() <= 1.0e-15);
         assert!(weighted_empirical_expectile(&[], &[], 0.5).is_err());
         assert!(weighted_empirical_expectile(&[1.0], &[1.0, 1.0], 0.5).is_err());
@@ -639,7 +638,9 @@ fn deterministic_gaussian_standard_fit(
         }) => (design, Some((beta, penalty_faces))),
         None => (
             realize_standard_design(request).map_err(|err| WorkflowError::InvalidConfig {
-                reason: format!("deterministic Gaussian shortcut could not build its design: {err}"),
+                reason: format!(
+                    "deterministic Gaussian shortcut could not build its design: {err}"
+                ),
             })?,
             None,
         ),
@@ -760,23 +761,19 @@ fn deterministic_gaussian_standard_fit(
     let has_infinite_face = penalty_faces
         .iter()
         .any(|face| *face == DeterministicPenaltyFace::Infinite);
-    let (
-        lambda_infinite,
-        infinite_range_basis,
-        infinite_null_basis,
-        range_eigenvalues,
-    ) = if !has_infinite_face {
-        (
-            0.0,
-            Array2::<f64>::zeros((p, 0)),
-            Array2::<f64>::eye(p),
-            Vec::new(),
-        )
-    } else {
-        use gam_linalg::faer_ndarray::FaerEigh;
-        let symmetric_penalty =
-            (&infinite_face_penalty + &infinite_face_penalty.t().to_owned()) * 0.5;
-        let (penalty_eigenvalues, penalty_eigenvectors) =
+    let (lambda_infinite, infinite_range_basis, infinite_null_basis, range_eigenvalues) =
+        if !has_infinite_face {
+            (
+                0.0,
+                Array2::<f64>::zeros((p, 0)),
+                Array2::<f64>::eye(p),
+                Vec::new(),
+            )
+        } else {
+            use gam_linalg::faer_ndarray::FaerEigh;
+            let symmetric_penalty =
+                (&infinite_face_penalty + &infinite_face_penalty.t().to_owned()) * 0.5;
+            let (penalty_eigenvalues, penalty_eigenvectors) =
             symmetric_penalty.eigh(faer::Side::Lower).map_err(|error| {
                 raised_fit_failure(
                     FailureCategory::Numerical,
@@ -785,85 +782,85 @@ fn deterministic_gaussian_standard_fit(
                     ),
                 )
             })?;
-        let largest_penalty = penalty_eigenvalues
-            .iter()
-            .fold(0.0_f64, |largest, &value| largest.max(value.abs()));
-        if !(largest_penalty.is_finite() && largest_penalty > 0.0) {
-            return Err(raised_fit_failure(
-                FailureCategory::Numerical,
-                "deterministic Gaussian shortcut received penalties with zero numerical rank",
-            ));
-        }
-        let rank_floor = f64::EPSILON * (p.max(1) as f64) * largest_penalty;
-        if let Some(&negative) = penalty_eigenvalues
-            .iter()
-            .filter(|&&value| value < -rank_floor)
-            .min_by(|left, right| left.total_cmp(right))
-        {
-            return Err(raised_fit_failure(
-                FailureCategory::Numerical,
-                format!(
-                    "deterministic Gaussian shortcut received a non-PSD penalty \
-                     (minimum eigenvalue {negative:.6e}, numerical floor {rank_floor:.6e})"
-                ),
-            ));
-        }
-        let weakest_penalty = penalty_eigenvalues
-            .iter()
-            .copied()
-            .filter(|&value| value > rank_floor)
-            .min_by(|left, right| left.total_cmp(right))
-            .ok_or_else(|| {
-                raised_fit_failure(
+            let largest_penalty = penalty_eigenvalues
+                .iter()
+                .fold(0.0_f64, |largest, &value| largest.max(value.abs()));
+            if !(largest_penalty.is_finite() && largest_penalty > 0.0) {
+                return Err(raised_fit_failure(
                     FailureCategory::Numerical,
-                    "deterministic Gaussian shortcut could not identify a penalized direction",
-                )
-            })?;
-        // The induced infinity norm bounds the spectral norm of symmetric
-        // X'WX. A diagonal-only scale can underestimate a highly correlated
-        // design by O(p), leaving some data-informed direction insufficiently
-        // constrained at the purported λ→∞ boundary.
-        let information_scale = xtwx
-            .rows()
-            .into_iter()
-            .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
-            .fold(0.0_f64, f64::max);
-        if !(information_scale.is_finite() && information_scale > 0.0) {
-            return Err(raised_fit_failure(
-                FailureCategory::Input,
-                format!(
-                    "deterministic Gaussian shortcut: the weighted design carries no information \
+                    "deterministic Gaussian shortcut received penalties with zero numerical rank",
+                ));
+            }
+            let rank_floor = f64::EPSILON * (p.max(1) as f64) * largest_penalty;
+            if let Some(&negative) = penalty_eigenvalues
+                .iter()
+                .filter(|&&value| value < -rank_floor)
+                .min_by(|left, right| left.total_cmp(right))
+            {
+                return Err(raised_fit_failure(
+                    FailureCategory::Numerical,
+                    format!(
+                        "deterministic Gaussian shortcut received a non-PSD penalty \
+                     (minimum eigenvalue {negative:.6e}, numerical floor {rank_floor:.6e})"
+                    ),
+                ));
+            }
+            let weakest_penalty = penalty_eigenvalues
+                .iter()
+                .copied()
+                .filter(|&value| value > rank_floor)
+                .min_by(|left, right| left.total_cmp(right))
+                .ok_or_else(|| {
+                    raised_fit_failure(
+                        FailureCategory::Numerical,
+                        "deterministic Gaussian shortcut could not identify a penalized direction",
+                    )
+                })?;
+            // The induced infinity norm bounds the spectral norm of symmetric
+            // X'WX. A diagonal-only scale can underestimate a highly correlated
+            // design by O(p), leaving some data-informed direction insufficiently
+            // constrained at the purported λ→∞ boundary.
+            let information_scale = xtwx
+                .rows()
+                .into_iter()
+                .map(|row| row.iter().map(|value| value.abs()).sum::<f64>())
+                .fold(0.0_f64, f64::max);
+            if !(information_scale.is_finite() && information_scale > 0.0) {
+                return Err(raised_fit_failure(
+                    FailureCategory::Input,
+                    format!(
+                        "deterministic Gaussian shortcut: the weighted design carries no information \
                      (‖X'WX‖∞ = {information_scale:e}), so the λ→∞ boundary has no scale"
-                ),
-            ));
-        }
-        let lambda = information_scale / (f64::EPSILON.sqrt() * weakest_penalty);
-        if !(lambda.is_finite() && lambda > 0.0) {
-            return Err(raised_fit_failure(
-                FailureCategory::Numerical,
-                format!(
-                    "deterministic Gaussian shortcut produced invalid boundary precision {lambda}"
-                ),
-            ));
-        }
-        let range_indices: Vec<usize> = penalty_eigenvalues
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &value)| (value > rank_floor).then_some(index))
-            .collect();
-        let null_indices: Vec<usize> = penalty_eigenvalues
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &value)| (value <= rank_floor).then_some(index))
-            .collect();
-        let range_basis = penalty_eigenvectors.select(ndarray::Axis(1), &range_indices);
-        let null_basis = penalty_eigenvectors.select(ndarray::Axis(1), &null_indices);
-        let range_eigenvalues = range_indices
-            .iter()
-            .map(|&index| penalty_eigenvalues[index])
-            .collect();
-        (lambda, range_basis, null_basis, range_eigenvalues)
-    };
+                    ),
+                ));
+            }
+            let lambda = information_scale / (f64::EPSILON.sqrt() * weakest_penalty);
+            if !(lambda.is_finite() && lambda > 0.0) {
+                return Err(raised_fit_failure(
+                    FailureCategory::Numerical,
+                    format!(
+                        "deterministic Gaussian shortcut produced invalid boundary precision {lambda}"
+                    ),
+                ));
+            }
+            let range_indices: Vec<usize> = penalty_eigenvalues
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| (value > rank_floor).then_some(index))
+                .collect();
+            let null_indices: Vec<usize> = penalty_eigenvalues
+                .iter()
+                .enumerate()
+                .filter_map(|(index, &value)| (value <= rank_floor).then_some(index))
+                .collect();
+            let range_basis = penalty_eigenvectors.select(ndarray::Axis(1), &range_indices);
+            let null_basis = penalty_eigenvectors.select(ndarray::Axis(1), &null_indices);
+            let range_eigenvalues = range_indices
+                .iter()
+                .map(|&index| penalty_eigenvalues[index])
+                .collect();
+            (lambda, range_basis, null_basis, range_eigenvalues)
+        };
     // Canonicalize λ through its log-strength coordinate BEFORE anything reads
     // it. `UnifiedFitResult` requires `lambdas[i]` to be BITWISE equal to
     // `checked_exp_log_strength(log_lambdas[i])`, and ρ is the canonical
@@ -947,13 +944,11 @@ fn deterministic_gaussian_standard_fit(
         let u = &infinite_range_basis;
         let free_dim = z.ncols();
         let raw_free_information = z.t().dot(&xtwx.dot(z));
-        let free_information =
-            (&raw_free_information + &raw_free_information.t().to_owned()) * 0.5;
+        let free_information = (&raw_free_information + &raw_free_information.t().to_owned()) * 0.5;
         let influence = if free_dim == 0 {
             Array2::<f64>::zeros((p, p))
         } else {
-            let (equilibrated, scale) =
-                gam_linalg::decision::equilibrate_gram(&free_information);
+            let (equilibrated, scale) = gam_linalg::decision::equilibrate_gram(&free_information);
             // `A = Z. X.WX Z` is PSD by construction and positive DEFINITE only
             // when the data identify every free direction, i.e.
             // `rank(X Z) = dim(Z)`. That factorization IS the shortcut's
@@ -1007,8 +1002,7 @@ fn deterministic_gaussian_standard_fit(
             }
             let joint_penalty_pseudoinverse = scaled_range.dot(&u.t());
             let apply_pseudoinverse = |values: &mut [f64]| -> Result<(), WorkflowError> {
-                let applied =
-                    joint_penalty_pseudoinverse.dot(&ndarray::ArrayView1::from(&*values));
+                let applied = joint_penalty_pseudoinverse.dot(&ndarray::ArrayView1::from(&*values));
                 for (slot, value) in values.iter_mut().zip(applied.iter()) {
                     *slot = *value;
                 }
@@ -1043,9 +1037,7 @@ fn deterministic_gaussian_standard_fit(
                     // joint range, so that projection is the right-hand side its
                     // residual is priced against.
                     let mut root_columns = Array2::<f64>::zeros((p, root.nrows()));
-                    root_columns
-                        .slice_mut(ndarray::s![r, ..])
-                        .assign(&root.t());
+                    root_columns.slice_mut(ndarray::s![r, ..]).assign(&root.t());
                     let projected = u.dot(&u.t().dot(&root_columns));
                     let solution = joint_penalty_pseudoinverse.dot(&root_columns);
                     let (trace, band) = gam_linalg::roundoff::solved_penalty_trace(
@@ -1328,8 +1320,10 @@ fn exact_gaussian_coefficients(
             &adjusted_response.view().insert_axis(ndarray::Axis(1)),
         );
         let rhs = rhs_matrix.column(0).to_owned();
+        // `fast_xt_diag_x` mirrors on every backend.
         let reduced_beta = gam_linalg::utils::certified_symmetric_solve(
             &gram,
+            gam_linalg::roundoff::SymmetricAssembly::Mirrored,
             &rhs,
             "deterministic Gaussian normal equations",
         )
@@ -1522,7 +1516,10 @@ mod exact_gaussian_boundary_design_reuse_tests {
         let fresh = fit_standard_model(standard_request(&data)).expect("fresh fit");
         assert_eq!(on_design.fit.log_lambdas, fresh.fit.log_lambdas);
         assert_eq!(on_design.fit.beta, fresh.fit.beta);
-        assert_eq!(on_design.design.design.to_dense(), fresh.design.design.to_dense());
+        assert_eq!(
+            on_design.design.design.to_dense(),
+            fresh.design.design.to_dense()
+        );
     }
 }
 
@@ -1821,7 +1818,9 @@ pub fn drop_zero_weight_rows<'a>(
         return Ok(Cow::Borrowed(data));
     };
     let weights = data.values.column(column);
-    let keep: Vec<usize> = (0..weights.len()).filter(|&row| weights[row] != 0.0).collect();
+    let keep: Vec<usize> = (0..weights.len())
+        .filter(|&row| weights[row] != 0.0)
+        .collect();
     if keep.len() == weights.len() {
         return Ok(Cow::Borrowed(data));
     }
@@ -1883,13 +1882,18 @@ fn fit_expanded_formula_with_notes(
 ) -> Result<FormulaFitResult, WorkflowError> {
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
         let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
-            formula.to_string(), data, config)?;
-        return Ok(FormulaFitResult { inference_notes: FitNotes {
-                                        advisories: payload.inference_notes.clone(),
-                                        informational: payload.informational_notes.clone(),
-                                    },
-                                    unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
-                                    result: FitResult::Ctn(Box::new(payload)) });
+            formula.to_string(),
+            data,
+            config,
+        )?;
+        return Ok(FormulaFitResult {
+            inference_notes: FitNotes {
+                advisories: payload.inference_notes.clone(),
+                informational: payload.informational_notes.clone(),
+            },
+            unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
+            result: FitResult::Ctn(Box::new(payload)),
+        });
     }
     let mut config = config
         .clone()
@@ -2136,15 +2140,14 @@ fn refinement_spanning(
     support: &AdaptiveResolution,
     directions: usize,
 ) -> AdaptiveResolution {
-    let width =
-        |resolution: &AdaptiveResolution| {
-            gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
-        };
+    let width = |resolution: &AdaptiveResolution| {
+        gam_terms::smooth::adaptive_resolution_width(basis, values, resolution)
+    };
     let base = width(current);
     let mut target = gam_terms::smooth::refined_adaptive_resolution(current);
     while width(&target).saturating_sub(base) < directions {
-        let next = gam_terms::smooth::refined_adaptive_resolution(&target)
-            .clamped(support, current);
+        let next =
+            gam_terms::smooth::refined_adaptive_resolution(&target).clamped(support, current);
         if !next.exceeds(&target) {
             break;
         }
@@ -2241,8 +2244,7 @@ fn adaptive_refinements(
     resolution_tol: f64,
 ) -> Result<Vec<AdaptiveRefinement>, WorkflowError> {
     let term_count = result.resolvedspec.smooth_terms.len();
-    if result.adaptive_bases.len() != term_count || result.design.smooth.terms.len() != term_count
-    {
+    if result.adaptive_bases.len() != term_count || result.design.smooth.terms.len() != term_count {
         return Err(raised_fit_failure(
             FailureCategory::Invariant,
             format!(
@@ -2281,8 +2283,8 @@ fn adaptive_refinements(
             .smooth_term_penalty_range(term_index)
             .map_err(|reason| raised_fit_failure(FailureCategory::Invariant, reason))?
             .ok_or_else(|| invariant("emitted no penalty block"))?;
-        let global_range =
-            (smooth_offset + realized.coeff_range.start)..(smooth_offset + realized.coeff_range.end);
+        let global_range = (smooth_offset + realized.coeff_range.start)
+            ..(smooth_offset + realized.coeff_range.end);
         let edf = result
             .fit
             .per_term_edf(global_range, penalty_range.start, penalty_range.len());
@@ -2714,9 +2716,11 @@ fn attach_basis_adequacy(
                 canonical_family: inputs.canonical_family,
             },
         );
-        inference_notes.advisories.extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
-            &standard.basis_adequacy,
-        ));
+        inference_notes
+            .advisories
+            .extend(crate::fit_orchestration::drivers::basis_adequacy_notes(
+                &standard.basis_adequacy,
+            ));
     }
     FormulaFitResult {
         result: FitResult::Standard(standard),
@@ -3326,8 +3330,8 @@ fn publish_expectile_sandwich_covariance(
     let Some(vb) = fit.covariance_conditional.clone() else {
         // The declination is also what stops every Hessian reconstruction
         // (summary, predict, sampling) from rebuilding the working-model `Vb`.
-        let declined = gam_solve::estimate::CovarianceDeclined::
-            ExpectileSandwichRequiresDenseCovariance {
+        let declined =
+            gam_solve::estimate::CovarianceDeclined::ExpectileSandwichRequiresDenseCovariance {
                 coefficients: fit.beta.len(),
             };
         log::debug!("[expectile] {}", declined.explain());
@@ -3359,7 +3363,10 @@ fn publish_expectile_sandwich_covariance(
         return Ok(());
     }
     let edf = fit.edf_total().ok_or_else(|| {
-        invariant("a fit that publishes a covariance must carry its effective degrees of freedom".to_string())
+        invariant(
+            "a fit that publishes a covariance must carry its effective degrees of freedom"
+                .to_string(),
+        )
     })?;
     let n_positive = weights.iter().filter(|&&w| w > 0.0).count() as f64;
     let residual_df = n_positive - edf;
@@ -3469,9 +3476,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !term.shape.is_none()
-        || term.joint_null_rotation.is_some()
-    {
+    if !term.shape.is_none() || term.joint_null_rotation.is_some() {
         return None;
     }
     let gam_terms::smooth::SmoothBasisSpec::BSpline1D {
@@ -3642,9 +3647,7 @@ pub fn residual_cascade_structural_signature(
         return None;
     }
     let term = &spec.smooth_terms[0];
-    if !term.shape.is_none()
-        || term.joint_null_rotation.is_some()
-    {
+    if !term.shape.is_none() || term.joint_null_rotation.is_some() {
         return None;
     }
     // Only scattered radial spatial smooths (Duchon / Matérn) over 2–3 axes.
@@ -3784,8 +3787,9 @@ pub fn materialize<'a>(
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
     if config.ctn_stage1.is_some() || config.frozen_ctn.is_some() {
-        return Err(WorkflowError::InvalidConfig { reason:
-            "CTN composition requires fit_from_formula or fit_formula_to_payload".into() });
+        return Err(WorkflowError::InvalidConfig {
+            reason: "CTN composition requires fit_from_formula or fit_formula_to_payload".into(),
+        });
     }
     materialize_impl(formula, data, config, false)
 }
@@ -4400,7 +4404,10 @@ mod unread_firth_and_family_refusal_tests {
         ];
         for (formula, config, expected) in cases {
             let message = refusal(formula, config);
-            assert!(message.contains(expected), "`{formula}`: expected `{expected}`, got: {message}");
+            assert!(
+                message.contains(expected),
+                "`{formula}`: expected `{expected}`, got: {message}"
+            );
         }
     }
 

@@ -2,18 +2,18 @@
 //! the Stage-1 score-influence Jacobian and the absorbed influence block.
 //!
 //! Stage 1 (a conditional transformation-normal, "CTN", model) fits a monotone
-//! `h(y | x; θ₁)` and emits a latent score `z_i = Φ⁻¹(u_i)` from the
-//! finite-support PIT
+//! `h(y | x; θ₁)` and emits a latent score `z_i = Φ⁻¹(u_i)` from the model's
+//! own PIT `u_i = Φ(h_i)` clipped to `[c, 1 − c]`
+//! (`c = TRANSFORMATION_SCORE_PIT_CLIP_EPS`), i.e.
 //!
 //! ```text
-//! u_i = [Φ(h_i) − Φ(L_i)] / [Φ(U_i) − Φ(L_i)],
+//! z_i = clamp(h_i, Φ⁻¹(c), Φ⁻¹(1 − c))          (gam#2600)
 //! ```
 //!
 //! with (SCOP form, see `transformation_normal.rs`)
 //!
 //! ```text
 //! h_i = b(x_i) + ε·(y_i − median) + Σ_{k≥1} I_k(y_i)·α_k(x_i)
-//! L_i = h(y_min | x_i),  U_i = h(y_max | x_i)
 //! b(x_i)   = Xᶜᵒᵛ_i · θ_b           (location column, response basis col 0)
 //! α_k(x_i) = Xᶜᵒᵛ_i · θ_{αk}         (direct-α shape coordinates, cols k≥1,
 //!                                    non-negative by the Khatri-Rao cone).
@@ -24,8 +24,9 @@
 //! not orthogonal to θ₁. This module exposes the score-influence Jacobian
 //! `J = ∂z/∂θ₁` (design §2) and the absorbed influence block
 //! `Z_infl = diag(s_f·β̂₀)·J` (design §3); Stage 2 appends `Z_infl` as a
-//! null-penalized absorbed block, making the β estimating equation orthogonal
-//! to `span(Z_infl)` — the discrete realization of `ψ − Π_η[ψ]`.
+//! ridge-penalized absorbed block (REML-learned λ), making the β estimating
+//! equation orthogonal to `span(Z_infl)` — the discrete realization of
+//! `ψ − Π_η[ψ]`.
 //!
 //! ## Column ordering of `J`
 //!
@@ -82,7 +83,7 @@ pub(crate) fn influence_absorber_log_lambda(n_rows: usize) -> f64 {
 ///
 /// `columns` is `n × p₁` with `p₁ = p_resp · p_cov`; see the module-level
 /// "Column ordering of `J`" note for the layout of the second axis. Computing
-/// `J` already evaluates `h/L/U` and the finite-support PIT, so `z = Φ⁻¹(PIT)`
+/// `J` already evaluates `h/L/U` and the clipped model PIT, so `z = Φ⁻¹(PIT)`
 /// comes for free — exposing it here is the single source of truth for the
 /// cross-fit fold loop, which needs the out-of-fold `z` alongside `J` and must
 /// not re-run the PIT path to get it.
@@ -104,32 +105,32 @@ pub struct ScoreInfluenceJacobian {
 /// `offset` (length `n`) is the per-row additive transformation linear-predictor
 /// offset on these rows. The CTN row build adds this offset identically to
 /// `h`, `L`, and `U` (`row_quantities`: `h_acc = … + offset_i`, and likewise for
-/// the lower/upper endpoints), so the finite-support PIT — and hence the latent
-/// score `z` reported here — depends on it. The Jacobian itself (`∂z/∂θ₁`) does
-/// NOT depend on the offset (it is θ₁-independent), but the *operating point*
-/// at which the φ/Φ ratios are evaluated does; omitting a non-zero offset would
-/// place `h/L/U` (and the emitted `z`) at the wrong point. For an offset-free
+/// the lower/upper endpoints), so the PIT — and hence the latent score `z`
+/// reported here — depends on it. The interior Jacobian (`∂z/∂θ₁ = ∂h/∂θ₁`)
+/// does NOT depend on the offset (it is θ₁-independent), but whether a row sits
+/// inside the clip window, and so carries a non-zero Jacobian row, does;
+/// omitting a non-zero offset would place `h/L/U` (and the emitted `z`) at the
+/// wrong point. For an offset-free
 /// Stage-1 (`offset ≡ 0`) this is a no-op. Pass the held-out fold's offset rows.
 ///
-/// Implements design §2:
+/// Implements design §2 for the clipped model PIT `z_i = clamp(h_i, z_lo, z_hi)`
+/// (`z_lo/hi = Φ⁻¹(c)`, `Φ⁻¹(1 − c)`; gam#2600):
 ///
 /// ```text
-/// ∂z_i/∂θ₁ = (1/φ(z_i)) · ∂u_i/∂θ₁
-/// ∂u_i/∂θ₁ = [ φ(h_i)·∂h_i/∂θ₁
-///              − u_i·(φ(U_i)·∂U_i/∂θ₁ − φ(L_i)·∂L_i/∂θ₁)
-///              − φ(L_i)·∂L_i/∂θ₁ ] / (Φ(U_i) − Φ(L_i))
+/// ∂z_i/∂θ₁ = ∂h_i/∂θ₁   (z_lo < z_i < z_hi),     0   otherwise
 /// ∂h_i/∂A[0,j]   = Xᶜᵒᵛ_{i,j}
 /// ∂h_i/∂A[k,j]   = I_k(y_i)·Xᶜᵒᵛ_{i,j}              (k ≥ 1)
 /// ```
 ///
-/// with `∂L_i`, `∂U_i` analogous (the response basis `I_k` evaluated at the
-/// lower/upper support endpoints). The shape rows carry NO chart factor: the
-/// direct-α transform is affine in `A`, so the sensitivity of every component is
-/// the basis entry itself, uniformly in `k`. (Before gam#2680 this line read
-/// `2·I_k(y_i)·γ_k(x_i)`, the derivative of the pre-`#2306` squared chart,
-/// against a value path the fit had already moved off.) Non-finite rows,
-/// support-order violations, and an under-resolvable endpoint mass return `Err`
-/// with row context.
+/// The support endpoints `L_i`, `U_i` do not enter the score, so they do not
+/// enter the chain; they are still evaluated so the support-order check stays
+/// a structural assertion about the fitted model. The shape rows carry NO chart
+/// factor: the direct-α transform is affine in `A`, so the sensitivity of every
+/// component is the basis entry itself, uniformly in `k`. (Before gam#2680 this
+/// line read `2·I_k(y_i)·γ_k(x_i)`, the derivative of the pre-`#2306` squared
+/// chart, against a value path the fit had already moved off.) Non-finite
+/// geometry, support-order violations, and a failed PIT score return `Err` with
+/// row context.
 pub fn score_influence_jacobian(
     fit: &TransformationNormalFitResult,
     response: &Array1<f64>,
@@ -340,25 +341,36 @@ pub fn score_influence_jacobian(
 ///
 /// The returned `n × p₁` matrix spans the realized η-space leakage directions
 /// at the rigid pilot. Stage 2 appends it as a **plain additive** absorbed
-/// parameter block `+Z_infl·γ` carrying a fixed small ridge `½·ρ·‖γ‖²` (γ is a
-/// training-time leakage absorber, not a smooth/REML-learned block). This is
-/// NOT routed through the multiplicative `score_warp` / `DeviationRuntime`
-/// path — that path evaluates a scalar 1-D cubic in η and cannot carry the
-/// arbitrary x-dependent `n × p₁` matrix. The absorber is orthogonalized
-/// against the marginal block but deliberately overlaps slope, with gauge
-/// priority above slope, and is dropped at predict time.
+/// parameter block `+Z_infl·γ` carrying a single identity penalty `½·λ·‖γ‖²`
+/// whose `λ` is REML-learned on its own ρ slot, seeded at
+/// `influence_absorber_log_lambda`. This is NOT routed through the
+/// multiplicative `score_warp` / `DeviationRuntime` path — that path evaluates
+/// a scalar 1-D cubic in η and cannot carry the arbitrary x-dependent `n × p₁`
+/// matrix. The caller chooses the protected span the absorber is residualized
+/// against (see `residualized_influence_block`), and the absorber is dropped
+/// at predict time.
 pub fn influence_block_design(
     jac: &ScoreInfluenceJacobian,
     pilot_beta0: &Array1<f64>,
     s_f: f64,
 ) -> Array2<f64> {
-    let n = jac.columns.nrows();
+    row_scale_by_pilot_slope(&jac.columns, pilot_beta0, s_f)
+}
+
+/// `diag(s_f·β̂₀)·J` — the one row-scaling kernel behind
+/// [`influence_block_design`] and [`residualized_influence_block`].
+fn row_scale_by_pilot_slope(
+    columns: &Array2<f64>,
+    pilot_beta0: &Array1<f64>,
+    s_f: f64,
+) -> Array2<f64> {
+    let n = columns.nrows();
     assert_eq!(
         pilot_beta0.len(),
         n,
         "influence_block_design: pilot_beta0 length must equal Jacobian rows"
     );
-    let mut out = jac.columns.clone();
+    let mut out = columns.clone();
     for (i, mut row) in out.axis_iter_mut(ndarray::Axis(0)).enumerate() {
         let scale = s_f * pilot_beta0[i];
         row.mapv_inplace(|v| v * scale);
@@ -366,16 +378,16 @@ pub fn influence_block_design(
     out
 }
 
-/// Residualize the influence columns `Z_infl` against the **marginal** design
-/// span in the rigid-pilot row metric `W`, retaining the slope overlap
-/// (#461, design §3 — single source of truth for the BMS and survival absorbed
-/// blocks):
+/// Residualize the influence columns `Z_infl` against the caller's protected
+/// design span `M` in the rigid-pilot row metric `W` (#461, design §3 — single
+/// source of truth for the BMS and survival absorbed blocks):
 ///
 ///   Z̃ = Z − M·(MᵀWM)⁺·MᵀW·Z.
 ///
-/// Residualizing against **marginal only** deliberately keeps the
-/// slope-aligned component, so the absorber soaks the leakage direction that
-/// would otherwise manufacture spurious `β(x)` heterogeneity. `W` is the PIRLS
+/// Survival passes the marginal design only, deliberately keeping the
+/// slope-aligned component so the absorber soaks the leakage direction that
+/// would otherwise manufacture spurious `β(x)` heterogeneity; BMS passes the
+/// stacked marginal + slope design `[M | G]`. `W` is the PIRLS
 /// row inner product at the rigid pilot, so the resulting orthogonality
 /// `MᵀW Z̃ ≈ 0` holds in the same metric the penalized joint solve sees, not
 /// merely in the Euclidean sense.
@@ -443,11 +455,16 @@ pub(crate) fn residualize_influence_columns(
     // dividing the formation band by it never under-states the band.
     let relative_cutoff =
         accumulation_growth(n + 1) * diagonal.sum() / max_diagonal + p_m as f64 * f64::EPSILON;
-    let pseudoinverse = rank_certified_psd_pseudoinverse(&gram, relative_cutoff)
-        .map_err(|error| {
-            format!("residualize_influence_columns: weighted marginal Gram pseudo-inverse: {error}")
-        })?
-        .into_pseudoinverse();
+    // `fast_xt_diag_x` mirrors on every backend.
+    let pseudoinverse = rank_certified_psd_pseudoinverse(
+        &gram,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        relative_cutoff,
+    )
+    .map_err(|error| {
+        format!("residualize_influence_columns: weighted marginal Gram pseudo-inverse: {error}")
+    })?
+    .into_pseudoinverse();
     // coeffs = (MᵀWM)⁺ MᵀW Z   (p_m × p₁)
     let cross = fast_xt_diag_y(&marginal_design, w_metric, z_infl);
     let coeffs = fast_ab(&pseudoinverse, &cross);
@@ -473,28 +490,23 @@ pub(crate) fn residualize_influence_columns(
 /// Returns `Err` if the weighted marginal Gram cannot be pseudo-inverted or the
 /// residualized columns are not all finite (e.g. a non-finite pilot slope or row
 /// metric propagated through) — the guards are baked in so neither call site
-/// repeats them. The two families differ
-/// ONLY in how they install the returned `Z̃` (BMS widens `[M | Z̃]`; survival
-/// adds a dedicated additive η₁ channel), never in this math.
+/// repeats them. The math is shared; the families differ in the protected span
+/// they pass as `marginal_design` (BMS passes `[M | G]`, survival passes `M`)
+/// and in how they install the returned `Z̃` (BMS widens `[M | Z̃]`; survival
+/// adds a dedicated additive η₁ channel).
 ///
 /// `raw_jac` is the bare `n × p₁` score-influence Jacobian (`∂z/∂θ₁`) — i.e.
-/// the value carried by the spec's `score_influence_jacobian` field — and
-/// `oof_z` is the matching out-of-fold latent score; callers hold these two
-/// arrays directly, so this entry point pairs them into a `ScoreInfluenceJacobian`
-/// internally rather than asking every site to construct one.
+/// the value carried by the spec's `score_influence_jacobian` field — which
+/// callers hold directly, so this entry point row-scales it without asking
+/// every site to construct a `ScoreInfluenceJacobian`.
 pub(crate) fn residualized_influence_block(
     raw_jac: &Array2<f64>,
-    oof_z: &Array1<f64>,
     pilot_beta0: &Array1<f64>,
     s_f: f64,
     marginal_design: ArrayView2<f64>,
     w_metric: &Array1<f64>,
 ) -> Result<Array2<f64>, String> {
-    let jac = ScoreInfluenceJacobian {
-        columns: raw_jac.clone(),
-        z: oof_z.clone(),
-    };
-    let z_infl = influence_block_design(&jac, pilot_beta0, s_f);
+    let z_infl = row_scale_by_pilot_slope(raw_jac, pilot_beta0, s_f);
     let residualized = residualize_influence_columns(&z_infl, marginal_design, w_metric)?;
     if residualized.iter().any(|v| !v.is_finite()) {
         return Err(
@@ -686,23 +698,17 @@ mod tests {
         // The block builds Z_infl = diag(s_f·β̂₀)·J then residualizes against M in
         // the W-metric. Reconstruct that path manually.
         let raw_jac = array![[1.0, 0.5], [2.0, -1.0], [0.0, 3.0], [1.5, 1.0]];
-        let oof_z = array![0.1, 0.2, 0.3, 0.4];
         let pilot = array![1.0, 2.0, -0.5, 0.5];
         let s_f = 1.5;
         let m = array![[1.0, 0.0], [1.0, 1.0], [1.0, 2.0], [1.0, 3.0]];
         let w = array![1.0, 1.0, 2.0, 0.5];
 
-        let out =
-            residualized_influence_block(&raw_jac, &oof_z, &pilot, s_f, m.view(), &w).unwrap();
+        let out = residualized_influence_block(&raw_jac, &pilot, s_f, m.view(), &w).unwrap();
 
         // Manual: scale rows, then residualize.
-        let jac = ScoreInfluenceJacobian {
-            columns: raw_jac.clone(),
-            z: oof_z.clone(),
-        };
+        let jac = jac_from(raw_jac.clone());
         let z_infl = influence_block_design(&jac, &pilot, s_f);
-        let expected =
-            residualize_influence_columns(&z_infl, m.view(), &w).expect("projection");
+        let expected = residualize_influence_columns(&z_infl, m.view(), &w).expect("projection");
 
         assert_eq!(out, expected);
         // And the result is W-orthogonal to the marginal span.

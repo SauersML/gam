@@ -1,11 +1,16 @@
 //! The latent Gaussian REML outer problem: its objective and gradient in `t`, the manifold its trust region walks,
 //! and the spectral seeds, moved from gam-pyffi (#2899 F6).
 
-use gam_solve::gaussian_reml::{gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache};
+use gam_solve::gaussian_reml::{
+    gaussian_reml_multi_closed_form_backward_from_fit, gaussian_reml_multi_closed_form_with_cache,
+};
 use gam_terms::AnalyticPenaltyRegistry;
 use gam_terms::basis::input_loc_derivatives::contract_input_loc_gradient;
 use gam_terms::basis::latent_design::build_latent_forward_design;
-use gam_terms::latent::{aux_prior_targets, AuxPriorFamily, latent_analytic_penalty_value, latent_aux_prior_stats, latent_prior_score_and_aux_state_for_t, LatentAuxStrengthState, ValidatedDimSelectionPrecisions};
+use gam_terms::latent::{
+    AuxPriorFamily, LatentAuxStrengthState, ValidatedDimSelectionPrecisions, aux_prior_targets,
+    latent_analytic_penalty_value, latent_aux_prior_stats, latent_prior_score_and_aux_state_for_t,
+};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayView3};
 
 /// Owned inputs for the latent outer-optimization objective.
@@ -620,11 +625,13 @@ mod latent_reml_tests {
     use gam_terms::basis::latent_design::build_latent_duchon_design;
     use gam_terms::basis::latent_design::build_latent_forward_design;
 
-
-    fn fixture(n: usize, dim: usize, k: usize, outputs: usize) -> (Array1<f64>, LatentOuterProblem) {
-        let t = Array1::from_shape_fn(n * dim, |i| {
-            0.5 + 0.38 * ((i + 1) as f64 * 1.731).sin()
-        });
+    fn fixture(
+        n: usize,
+        dim: usize,
+        k: usize,
+        outputs: usize,
+    ) -> (Array1<f64>, LatentOuterProblem) {
+        let t = Array1::from_shape_fn(n * dim, |i| 0.5 + 0.38 * ((i + 1) as f64 * 1.731).sin());
         let centers = Array2::from_shape_fn((k, dim), |(i, a)| {
             0.5 + 0.44 * ((i * dim + a + 1) as f64 * 2.317).sin()
         });
@@ -678,9 +685,18 @@ mod latent_reml_tests {
             let (t, problem) = fixture(16, dim, 9, 1);
             let evaluate = |point: ArrayView1<'_, f64>| {
                 build_latent_forward_design(
-                    "duchon", point, 16, dim, problem.centers.view(), 2,
-                    None, None, None, None,
-                ).unwrap()
+                    "duchon",
+                    point,
+                    16,
+                    dim,
+                    problem.centers.view(),
+                    2,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap()
             };
             let (design, _, jet) = evaluate(t.view());
             let h = 1e-6;
@@ -733,7 +749,8 @@ mod latent_reml_tests {
             assert!(
                 squared_error.sqrt() <= 1e-4 * (1.0 + squared_fd.sqrt()),
                 "n={n}, dim={dim}, outputs={outputs}: error={}, fd norm={}",
-                squared_error.sqrt(), squared_fd.sqrt()
+                squared_error.sqrt(),
+                squared_fd.sqrt()
             );
             let norm = gradient.dot(&gradient).sqrt();
             assert!(norm > 0.0);
@@ -751,8 +768,12 @@ mod latent_reml_tests {
     fn latent_decoder_ols_r2(design: &Array2<f64>, y: &Array1<f64>) -> f64 {
         let gram = design.t().dot(design);
         let rhs = design.t().dot(y);
+        // A full GEMM over the design's rows: depth `n` per triangle.
         let beta = gam_linalg::utils::certified_spd_factorize(
             &gram,
+            gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                depth: design.nrows(),
+            },
             "OLS normal equations for latent decoder recovery",
         )
         .expect("OLS normal-equations SPD factor")
@@ -875,7 +896,8 @@ mod latent_reml_tests {
 
         // (b) Recovery on a clean circular signal across the whole circle, including
         // the seam. The truth is a genuine function on the circle.
-        let y: Array1<f64> = Array1::from_iter(theta.iter().map(|&a| a.cos() + 0.5 * (2.0 * a).sin()));
+        let y: Array1<f64> =
+            Array1::from_iter(theta.iter().map(|&a| a.cos() + 0.5 * (2.0 * a).sin()));
 
         let r2_periodic = latent_decoder_ols_r2(&design_per, &y);
         let r2_open = latent_decoder_ols_r2(&design_open, &y);
@@ -892,11 +914,17 @@ mod latent_reml_tests {
         let solve_fitted = |design: &Array2<f64>| -> Array1<f64> {
             let gram = design.t().dot(design);
             let rhs = design.t().dot(&y);
-            let beta = gam_linalg::utils::certified_spd_factorize(&gram, "seam OLS normal equations")
-                .expect("seam OLS SPD factor")
-                .solve(&rhs)
-                .expect("seam OLS solve")
-                .into_solution();
+            let beta = gam_linalg::utils::certified_spd_factorize(
+                &gram,
+                gam_linalg::roundoff::SymmetricAssembly::PsdAccumulation {
+                    depth: design.nrows(),
+                },
+                "seam OLS normal equations",
+            )
+            .expect("seam OLS SPD factor")
+            .solve(&rhs)
+            .expect("seam OLS solve")
+            .into_solution();
             design.dot(&beta)
         };
         let fitted_per = solve_fitted(&design_per);

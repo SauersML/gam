@@ -8,10 +8,7 @@ impl<'a> RemlState<'a> {
     /// The measured trust radius of `source` (see [`WarmStartTrustState`]);
     /// `None` until that predictor has had an error measured, in which case
     /// nothing yet says it loses to the flat seed.
-    pub(crate) fn warm_start_trust_radius(
-        &self,
-        source: WarmStartPredictionSource,
-    ) -> Option<f64> {
+    pub(crate) fn warm_start_trust_radius(&self, source: WarmStartPredictionSource) -> Option<f64> {
         let state = self
             .warm_start_trust
             .lock()
@@ -301,8 +298,10 @@ impl<'a> RemlState<'a> {
                 self.canonical_penalties
                     .iter()
                     .map(|penalty| {
-                        null_split
-                            .project_canonical(penalty, gam_terms::construction::PenaltyFrame::Original)
+                        null_split.project_canonical(
+                            penalty,
+                            gam_terms::construction::PenaltyFrame::Original,
+                        )
                     })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|error| {
@@ -316,8 +315,8 @@ impl<'a> RemlState<'a> {
                 .iter()
                 .map(|penalty| penalty.full_width_root().dot(z))
                 .collect();
-            let (value, penalty_rank, det1, det2_full) = self
-                .structural_penalty_logdet_value_and_derivatives(&projected_roots, &lambdas)?;
+            let (value, penalty_rank, det1, det2_full) =
+                self.structural_penalty_logdet_value_and_derivatives(&projected_roots, &lambdas)?;
             log::debug!(
                 "[STAGE] logdet S (Z-projected) rho_dim={} penalty_rank={} elapsed={:.3}s",
                 rho.len(),
@@ -393,7 +392,8 @@ impl<'a> RemlState<'a> {
             // This branch is the only consumer of the `EᵀE` eigensystem, so it
             // is formed here rather than by the callers on every evaluation.
             let subspace = self.compute_penalty_subspace(e_for_logdet)?;
-            let (rank, value) = self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&subspace);
+            let (rank, value) =
+                self.fixed_subspace_penalty_rank_and_logdet_from_subspace(&subspace);
             if !rho.is_empty() {
                 crate::bail_invalid_estim!(
                     "penalty log|Σλ S|₊ ρ-derivatives unavailable: rho_dim={} but no canonical \
@@ -538,17 +538,17 @@ impl<'a> RemlState<'a> {
         let n = x_dense.nrows();
         let p = x_dense.ncols();
         let governor = gam_runtime::resource::MemoryGovernor::global();
-        let working = match governor.try_reserve_dense_f64_copies(p.saturating_mul(p), p, 2, context)
-        {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                log::debug!(
-                    "{context}: Tierney-Kadane tensor working set refused by the memory ledger \
+        let working =
+            match governor.try_reserve_dense_f64_copies(p.saturating_mul(p), p, 2, context) {
+                Ok(reservation) => reservation,
+                Err(error) => {
+                    log::debug!(
+                        "{context}: Tierney-Kadane tensor working set refused by the memory ledger \
                      ({error}); evaluating row pairs"
-                );
-                return Ok(None);
-            }
-        };
+                    );
+                    return Ok(None);
+                }
+            };
         let results = match governor.try_reserve_dense_f64(n, p.saturating_add(1), context) {
             Ok(reservation) => reservation,
             Err(error) => {
@@ -751,7 +751,9 @@ impl<'a> RemlState<'a> {
         {
             Ok(reservation) => reservation,
             Err(error) => {
-                log::debug!("{context} refused by the memory ledger ({error}); evaluating row pairs");
+                log::debug!(
+                    "{context} refused by the memory ledger ({error}); evaluating row pairs"
+                );
                 return Ok(None);
             }
         };
@@ -1610,7 +1612,9 @@ impl<'a> RemlState<'a> {
                             let mut block = block_scratch.slice_mut(s![..rows, ..cols]);
                             let x_theta_i = x_theta.slice(s![i0..i1, ..]);
                             let z_j = z.slice(s![.., j0..j1]);
-                            ndarray::linalg::general_mat_mul(1.0, &x_theta_i, &z_j, 0.0, &mut block);
+                            ndarray::linalg::general_mat_mul(
+                                1.0, &x_theta_i, &z_j, 0.0, &mut block,
+                            );
                             let mut reverse = reverse_scratch.slice_mut(s![..cols, ..rows]);
                             let x_theta_j = x_theta.slice(s![j0..j1, ..]);
                             let z_i = z.slice(s![.., i0..i1]);
@@ -2064,16 +2068,14 @@ impl<'a> RemlState<'a> {
         // (every one symmetric), so the diagonal jet `x_iᵀ(K, K_a, K_ab)x_i` is
         // a row-wise dot of each product with `X`, and the row-pair sums below
         // read `XK` and `XK_a` as GEMM operands.
-        let row_dots = |product: &Array2<f64>| -> Array1<f64> {
-            (product * x_dense).sum_axis(Axis(1))
-        };
+        let row_dots =
+            |product: &Array2<f64>| -> Array1<f64> { (product * x_dense).sum_axis(Axis(1)) };
         let xk0 = fast_ab(x_dense, &k_mat);
         let xka: Vec<Array2<f64>> = k_i.iter().map(|ki| fast_ab(x_dense, ki)).collect();
         let hdiag_v = row_dots(&xk0);
         let hdiag_g: Vec<Array1<f64>> = xka.iter().map(|xk| row_dots(xk)).collect();
-        let compute_hdiag_pair = |&(i, j): &(usize, usize)| -> Array1<f64> {
-            row_dots(&fast_ab(x_dense, &k_ij[i][j]))
-        };
+        let compute_hdiag_pair =
+            |&(i, j): &(usize, usize)| -> Array1<f64> { row_dots(&fast_ab(x_dense, &k_ij[i][j])) };
         let hdiag_pairs: Vec<Array1<f64>> = if fan_pairs {
             use rayon::prelude::*;
             h_pairs
@@ -2729,7 +2731,6 @@ impl<'a> RemlState<'a> {
         }
     }
 
-
     pub(super) fn should_compute_hot_diagnostics(&self, eval_idx: u64) -> bool {
         // Keep expensive diagnostics out of the hot path unless they can
         // be surfaced. This has zero effect on optimization math.
@@ -3383,14 +3384,16 @@ impl<'a> RemlState<'a> {
                     let h1 = dmu_deta[i];
                     let h2 = d2mu_deta2[i];
                     let h3 = d3mu_deta3[i];
-                    let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                        inverse_link_ref,
-                        eta_raw,
-                    )?;
-                    let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                        inverse_link_ref,
-                        eta_raw,
-                    )?;
+                    let h4 =
+                        crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                            inverse_link_ref,
+                            eta_raw,
+                        )?;
+                    let h5 =
+                        crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                            inverse_link_ref,
+                            eta_raw,
+                        )?;
                     if !h1.is_finite()
                         || !h2.is_finite()
                         || !h3.is_finite()
@@ -3409,12 +3412,14 @@ impl<'a> RemlState<'a> {
                     // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
                     // and `V = mu*(1-mu)` would be a hard zero the whole
                     // observed-information jet then divides by.
-                    let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                        inverse_link_ref,
-                        eta_raw,
-                        mu_i,
-                    );
-                    let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
+                    let one_minus_mu =
+                        crate::mixture_link::inverse_link_complement_for_inverse_link(
+                            inverse_link_ref,
+                            eta_raw,
+                            mu_i,
+                        );
+                    let vj =
+                        pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
                     if !(vj.v.is_finite() && vj.v > 0.0) {
                         return Err(EstimationError::PirlsRowGeometryUnrepresentable {
                             row: i,
@@ -3425,7 +3430,8 @@ impl<'a> RemlState<'a> {
                     }
                     let pw = weights[i];
                     let y_i = y_view[i];
-                    let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
+                    let resid_i =
+                        pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
                     pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw)
                 };
                 if e_i.is_finite() {
@@ -3661,10 +3667,11 @@ impl<'a> RemlState<'a> {
             RHO_DISTRIBUTION_PC_TAIL_PROB,
         );
         let anchored = rho.mapv(|r| r - anchor);
-        crate::rho_prior_eval::distribution_correction(&self.rho_prior, &anchored, theta)
-            .map_err(|error| EstimationError::TrialPointRefused {
+        crate::rho_prior_eval::distribution_correction(&self.rho_prior, &anchored, theta).map_err(
+            |error| EstimationError::TrialPointRefused {
                 reason: format!("invalid smoothing posterior prior: {error:?}"),
-            })
+            },
+        )
     }
 
     /// Emit the configured ρ-prior as a criterion atom after every REML/LAML
@@ -4883,29 +4890,29 @@ impl<'a> RemlState<'a> {
                 rank: 0,
             });
         }
-        let cached =
-            self.cache_manager
-                .cached_penalty_subspace(e_transformed, || {
-                    let s_lambda = e_transformed.t().dot(e_transformed);
-                    let (evals, _) = s_lambda
-                        .eigh(Side::Lower)
-                        .map_err(EstimationError::EigendecompositionFailed)?;
-                    let rank = if self.canonical_penalties.is_empty() {
-                        positive_penalty_rank_and_logdet(
-                            evals
-                                .as_slice()
-                                .expect("eigh returns an owned contiguous eigenvalue Array1"),
-                        )
-                        .0
-                    } else {
-                        self.canonical_penalties
-                            .iter()
-                            .map(gam_terms::construction::CanonicalPenalty::rank)
-                            .sum::<usize>()
-                            .min(p)
-                    };
-                    Ok(PenaltySubspace { evals, rank })
-                })?;
+        let cached = self
+            .cache_manager
+            .cached_penalty_subspace(e_transformed, || {
+                let s_lambda = e_transformed.t().dot(e_transformed);
+                let (evals, _) = s_lambda
+                    .eigh(Side::Lower)
+                    .map_err(EstimationError::EigendecompositionFailed)?;
+                let rank = if self.canonical_penalties.is_empty() {
+                    positive_penalty_rank_and_logdet(
+                        evals
+                            .as_slice()
+                            .expect("eigh returns an owned contiguous eigenvalue Array1"),
+                    )
+                    .0
+                } else {
+                    self.canonical_penalties
+                        .iter()
+                        .map(gam_terms::construction::CanonicalPenalty::rank)
+                        .sum::<usize>()
+                        .min(p)
+                };
+                Ok(PenaltySubspace { evals, rank })
+            })?;
         Ok(PenaltySubspace {
             evals: cached.evals.clone(),
             rank: cached.rank,
@@ -5056,10 +5063,8 @@ impl<'a> RemlState<'a> {
         // rounding band, and never fewer than the penalty's own rank, because
         // `null(H_pen) ⊆ null(S_λ)` (#2748). The rank rule has one definition,
         // shared with the criterion's operator.
-        let rank = super::reml_outer_engine::DenseSpectralOperator::identified_rank(
-            h_evals,
-            penalty_rank,
-        );
+        let rank =
+            super::reml_outer_engine::DenseSpectralOperator::identified_rank(h_evals, penalty_rank);
         let mut order: Vec<usize> = (0..p).collect();
         order.sort_by(|&a, &b| h_evals[b].total_cmp(&h_evals[a]));
         let mut kept: Vec<usize> = order.into_iter().take(rank).collect();
@@ -6766,22 +6771,23 @@ impl<'a> RemlState<'a> {
             penalty_logdet.rho_derivatives_from_penalties(&applied_penalties, lambdas_slice);
         // Built at every problem scale, for the same reason as the dense bundle:
         // the inner solve carries Φ whenever Firth is requested (#825, #2900).
-        let firth_dense_operator_original = if let Some(jeffreys_link) =
-            reml_robust_jeffreys_link(&self.config)
-        {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
-                .map_err(EstimationError::InvalidInput)?;
-            Some(Arc::new(Self::build_firth_dense_operator_for_link(
-                &jeffreys_link,
-                x_dense.as_ref(),
-                &pirls_result.final_eta.to_owned(),
-                self.weights,
-            )?))
-        } else {
-            None
-        };
+        let firth_dense_operator_original =
+            if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
+                let x_dense = self
+                    .x()
+                    .try_to_dense_arc(
+                        "sparse exact REML runtime requires dense design for Firth operator",
+                    )
+                    .map_err(EstimationError::InvalidInput)?;
+                Some(Arc::new(Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?))
+            } else {
+                None
+            };
 
         Ok(EvalShared {
             key,
@@ -7523,8 +7529,7 @@ impl<'a> RemlState<'a> {
                                 // `ift` is the radius this prediction was
                                 // admitted under, `cap_predicted` the radius
                                 // it measured for the next one.
-                                let admitted_under = trust_radius_before
-                                    .unwrap_or(f64::INFINITY);
+                                let admitted_under = trust_radius_before.unwrap_or(f64::INFINITY);
                                 log::debug!(
                                     "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
                                     quality,
@@ -8552,13 +8557,16 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth test Hessian")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
+            Ok(gam_linalg::utils::certified_spd_factorize(
+                &h_solver,
+                // `fast_xt_diag_x` mirrors; the ridge is diagonal.
+                gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+                "Firth test Hessian",
             )
+            .expect("well-conditioned SPD factor")
+            .solve(rhs)
+            .expect("certified SPD solve")
+            .into_solution())
         };
 
         let hess = RemlState::tk_hessian_rho_canonical_logit(
@@ -8661,13 +8669,16 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth k4 test Hessian")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
+            Ok(gam_linalg::utils::certified_spd_factorize(
+                &h_solver,
+                // `fast_xt_diag_x` mirrors; the ridge is diagonal.
+                gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+                "Firth k4 test Hessian",
             )
+            .expect("well-conditioned SPD factor")
+            .solve(rhs)
+            .expect("certified SPD solve")
+            .into_solution())
         };
         RemlState::tk_hessian_rho_canonical_logit(
             x,
@@ -8718,7 +8729,9 @@ mod firth_hessian_direction_reuse_tests {
         let xk0 = x.dot(&k_mat);
         let xka: Vec<Array2<f64>> = k_i.iter().map(|ki| x.dot(ki)).collect();
         let c_v = Array1::from_shape_fn(n, |i| 0.2 + 0.1 * ((i as f64) * 0.61).sin());
-        let c_g = Array2::from_shape_fn((n, k), |(i, a)| 0.05 * ((i as f64) * (a as f64 + 0.9)).cos());
+        let c_g = Array2::from_shape_fn((n, k), |(i, a)| {
+            0.05 * ((i as f64) * (a as f64 + 0.9)).cos()
+        });
         let c_h = ndarray::Array3::from_shape_fn((n, k, k), |(i, a, b)| {
             0.03 * ((i as f64) * ((a + b) as f64 + 0.4)).sin()
         });
@@ -8729,7 +8742,9 @@ mod firth_hessian_direction_reuse_tests {
                 let kv = x.row(i).dot(&xk0.row(j));
                 let ka: Vec<f64> = (0..k).map(|a| x.row(i).dot(&xka[a].row(j))).collect();
                 let cc_v = c_v[i] * c_v[j];
-                let cc_g: Vec<f64> = (0..k).map(|a| c_g[[i, a]] * c_v[j] + c_v[i] * c_g[[j, a]]).collect();
+                let cc_g: Vec<f64> = (0..k)
+                    .map(|a| c_g[[i, a]] * c_v[j] + c_v[i] * c_g[[j, a]])
+                    .collect();
                 for a in 0..k {
                     for b in 0..k {
                         let kab = x.row(i).dot(&k_ij[a][b].dot(&x.row(j)));
@@ -8740,11 +8755,9 @@ mod firth_hessian_direction_reuse_tests {
                         let q_h = 3.0 * kv * kv * kab + 6.0 * kv * ka[a] * ka[b];
                         let q_g_a = 3.0 * kv * kv * ka[a];
                         let q_g_b = 3.0 * kv * kv * ka[b];
-                        reference[[a, b]] += (cc_h * kv * kv * kv
-                            + q_h * cc_v
-                            + cc_g[a] * q_g_b
-                            + q_g_a * cc_g[b])
-                            / 12.0;
+                        reference[[a, b]] +=
+                            (cc_h * kv * kv * kv + q_h * cc_v + cc_g[a] * q_g_b + q_g_a * cc_g[b])
+                                / 12.0;
                     }
                 }
             }
@@ -8760,7 +8773,10 @@ mod firth_hessian_direction_reuse_tests {
                 for b in 0..k {
                     let left = reference[[a, b]];
                     let right = block[[a, b]];
-                    assert!(left.abs() > 1e-6, "reference[{a},{b}] = {left:e} is too small to compare");
+                    assert!(
+                        left.abs() > 1e-6,
+                        "reference[{a},{b}] = {left:e} is too small to compare"
+                    );
                     let rel = (left - right).abs() / left.abs();
                     assert!(
                         rel < 1e-10,
@@ -8789,13 +8805,16 @@ mod firth_hessian_direction_reuse_tests {
         }
         let h_solver = h.clone();
         let h_inv_solve = move |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(
-                gam_linalg::utils::certified_spd_factorize(&h_solver, "Firth k4 tensor route test")
-                    .expect("well-conditioned SPD factor")
-                    .solve(rhs)
-                    .expect("certified SPD solve")
-                    .into_solution(),
+            Ok(gam_linalg::utils::certified_spd_factorize(
+                &h_solver,
+                // `fast_xt_diag_x` mirrors; the ridge is diagonal.
+                gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+                "Firth k4 tensor route test",
             )
+            .expect("well-conditioned SPD factor")
+            .solve(rhs)
+            .expect("certified SPD solve")
+            .into_solution())
         };
         let hessian = |route: TkRowPairRoute| {
             RemlState::tk_hessian_rho_canonical_logit_with_route(
@@ -8827,7 +8846,10 @@ mod firth_hessian_direction_reuse_tests {
             for b in 0..k {
                 let left = pairs[[a, b]];
                 let right = tensor[[a, b]];
-                assert!(left.abs() > 1e-12, "H[{a},{b}] = {left:e} is too small to compare");
+                assert!(
+                    left.abs() > 1e-12,
+                    "H[{a},{b}] = {left:e} is too small to compare"
+                );
                 let rel = (left - right).abs() / left.abs();
                 assert!(
                     rel < 1e-9,
@@ -9039,9 +9061,8 @@ mod firth_hessian_direction_reuse_tests {
         let chol = h.cholesky(Side::Lower).expect("chol(H)");
         let mut z = x_dense.t().to_owned();
         chol.solve_mat_in_place(&mut z);
-        let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> {
-            Ok(chol.solvevec(rhs))
-        };
+        let solve =
+            |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(chol.solvevec(rhs)) };
         let c_array = Array1::from_shape_fn(n, |i| 0.2 + 0.15 * ((i as f64) * 0.61).sin());
         let d_array = Array1::from_shape_fn(n, |i| 0.1 * ((i as f64) * 0.43).cos() - 0.04);
         let e_array = Array1::from_shape_fn(n, |i| 0.07 * ((i as f64) * 0.29).sin() + 0.02);
@@ -9056,8 +9077,9 @@ mod firth_hessian_direction_reuse_tests {
             0.05 * (((a + b) as f64) * 0.9).cos() + if a == b { 0.1 } else { 0.0 }
         });
         let eta_fixed = Array1::from_shape_fn(n, |i| 0.04 * ((i as f64) * 1.7).cos());
-        let x_fixed =
-            Array2::from_shape_fn((n, p), |(i, j)| 0.03 * ((i as f64) * (j as f64 + 1.1)).sin());
+        let x_fixed = Array2::from_shape_fn((n, p), |(i, j)| {
+            0.03 * ((i as f64) * (j as f64 + 1.1)).sin()
+        });
 
         let pairs = RemlState::tk_shared_intermediates_with_route(
             &x_dense,
@@ -9084,12 +9106,16 @@ mod firth_hessian_direction_reuse_tests {
         );
 
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
-        let value_pairs = RemlState::tk_scalar_from_shared(&x_dense, &z, &d_array, &pairs, &mut gram)
-            .expect("row-pair TK value");
+        let value_pairs =
+            RemlState::tk_scalar_from_shared(&x_dense, &z, &d_array, &pairs, &mut gram)
+                .expect("row-pair TK value");
         let value_tensor =
             RemlState::tk_scalar_from_shared(&x_dense, &z, &d_array, &tensor, &mut gram)
                 .expect("tensor TK value");
-        assert!(value_pairs.abs() > 1e-8, "TK value {value_pairs:e} is too small to compare");
+        assert!(
+            value_pairs.abs() > 1e-8,
+            "TK value {value_pairs:e} is too small to compare"
+        );
         let value_rel = (value_pairs - value_tensor).abs() / value_pairs.abs();
         assert!(
             value_rel < 1e-10,
@@ -9122,7 +9148,10 @@ mod firth_hessian_direction_reuse_tests {
         for idx in 0..grad_pairs.len() {
             let left = grad_pairs[idx];
             let right = grad_tensor[idx];
-            assert!(left.abs() > 1e-10, "gradient[{idx}] = {left:e} is too small to compare");
+            assert!(
+                left.abs() > 1e-10,
+                "gradient[{idx}] = {left:e} is too small to compare"
+            );
             let rel = (left - right).abs() / left.abs();
             assert!(
                 rel < 1e-10,
@@ -9167,16 +9196,15 @@ mod firth_hessian_direction_reuse_tests {
             .collect();
 
         let solve = |rhs: &Array1<f64>| -> Result<Array1<f64>, EstimationError> { Ok(rhs.clone()) };
-        let shared =
-            RemlState::tk_shared_intermediates_with_route(
-                &x_dense,
-                &z,
-                &c_array,
-                "perf test",
-                &solve,
-                TkRowPairRoute::RowPairs,
-            )
-                .expect("shared TK intermediates");
+        let shared = RemlState::tk_shared_intermediates_with_route(
+            &x_dense,
+            &z,
+            &c_array,
+            "perf test",
+            &solve,
+            TkRowPairRoute::RowPairs,
+        )
+        .expect("shared TK intermediates");
 
         let reps = 20usize;
         let mut gram = Array2::<f64>::zeros((TK_BLOCK_SIZE, TK_BLOCK_SIZE));
@@ -9242,9 +9270,9 @@ mod firth_hessian_direction_reuse_tests {
 
 #[cfg(test)]
 mod capped_request_cache_tests {
-    use super::BundleRows;
     use super::super::super::RemlConfig;
     use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
+    use super::BundleRows;
     use ndarray::{Array1, array};
 
     #[test]
@@ -9293,7 +9321,10 @@ mod capped_request_cache_tests {
             untouched,
             "the capped request re-ran P-IRLS instead of reusing the uncapped mode"
         );
-        assert_eq!(capped.beta_transformed.as_ref(), uncapped.beta_transformed.as_ref());
+        assert_eq!(
+            capped.beta_transformed.as_ref(),
+            uncapped.beta_transformed.as_ref()
+        );
 
         // The converse stays closed (#2309): a mode cached under a cap never
         // answers an uncapped request.

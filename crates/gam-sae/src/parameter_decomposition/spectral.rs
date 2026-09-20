@@ -91,7 +91,7 @@ use faer::Side;
 use gam_linalg::decision::projector_error_bar;
 use gam_linalg::faer_ndarray::{FaerLinalgError, FaerSvd, strict_symmetric_eigh};
 use gam_linalg::roundoff::{
-    accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
+    SymmetricAssembly, accumulation_growth, factor_singular_band, symmetric_spectrum_rounding_band,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use std::f64::consts::SQRT_2;
@@ -143,7 +143,10 @@ impl std::fmt::Display for PlaneRotationError {
                  orthogonal group, beyond the declared error {declared_error:.3e}"
             ),
             Self::Linalg(error) => {
-                write!(formatter, "plane-rotation recovery decomposition failed: {error}")
+                write!(
+                    formatter,
+                    "plane-rotation recovery decomposition failed: {error}"
+                )
             }
             Self::OddInteriorCluster { cluster, dimension } => write!(
                 formatter,
@@ -342,7 +345,8 @@ pub fn recover_plane_rotations(
     // whose Frobenius norm is at most `u ||W||_F`. The same bound holds for `K`.
     let formation_band = accumulation_growth(1) * frobenius_norm(matrix);
     let (values, vectors) =
-        strict_symmetric_eigh(&symmetric, Side::Lower).map_err(PlaneRotationError::Linalg)?;
+        strict_symmetric_eigh(&symmetric, SymmetricAssembly::Mirrored, Side::Lower)
+            .map_err(PlaneRotationError::Linalg)?;
     let mut order: Vec<usize> = (0..dimension).collect();
     order.sort_by(|&left, &right| values[left].total_cmp(&values[right]));
     let cosines: Vec<f64> = order.iter().map(|&index| values[index]).collect();
@@ -358,10 +362,7 @@ pub fn recover_plane_rotations(
     }
     let mut clusters = Vec::with_capacity(starts.len());
     for (cluster_index, &start) in starts.iter().enumerate() {
-        let end = starts
-            .get(cluster_index + 1)
-            .copied()
-            .unwrap_or(dimension);
+        let end = starts.get(cluster_index + 1).copied().unwrap_or(dimension);
         let width = end - start;
         let lowest = cosines[start];
         let highest = cosines[end - 1];
@@ -548,7 +549,10 @@ impl std::fmt::Display for ResponseBlockError {
                  declared error {declared_error:.3e}"
             ),
             Self::Linalg(error) => {
-                write!(formatter, "response block recovery decomposition failed: {error}")
+                write!(
+                    formatter,
+                    "response block recovery decomposition failed: {error}"
+                )
             }
             Self::NotIsolating {
                 response,
@@ -713,14 +717,7 @@ fn split_by_visibility(
     let unseen_ceiling = unseen
         .iter()
         .map(|&index| singular_values[index])
-        .fold(
-            if omitted_zero {
-                0.0
-            } else {
-                f64::NEG_INFINITY
-            },
-            f64::max,
-        );
+        .fold(if omitted_zero { 0.0 } else { f64::NEG_INFINITY }, f64::max);
     // Nothing seen, or everything seen: the split projector is 0 or I.
     let bar = if seen.is_empty() || unseen_ceiling == f64::NEG_INFINITY {
         0.0
@@ -797,9 +794,9 @@ pub fn recover_response_projector_blocks(
             .iter()
             .fold(0.0_f64, |acc, &value| acc.max(value));
         // The nearest partial isometry rounds every singular value to 0 or 1.
-        let distance = singular_values
-            .iter()
-            .fold(0.0_f64, |acc, &value| acc.max(value.min((1.0 - value).abs())));
+        let distance = singular_values.iter().fold(0.0_f64, |acc, &value| {
+            acc.max(value.min((1.0 - value).abs()))
+        });
         if distance > declared_error + factor_singular_band(rows, parameters, sigma_max) {
             return Err(ResponseBlockError::NotProjector {
                 response,
@@ -828,8 +825,7 @@ pub fn recover_response_projector_blocks(
                 + SQRT_2 * block.bar
                 + accumulation_growth(parameters)
                     * frobenius_norm(absolute_matrix.dot(&absolute_basis).view());
-            let split =
-                split_by_visibility(&compressed, perturbation, response, &block.responses)?;
+            let split = split_by_visibility(&compressed, perturbation, response, &block.responses)?;
             if split.seen.is_empty() || split.unseen.is_empty() {
                 let mut seeing = block.responses;
                 if split.unseen.is_empty() {
@@ -867,7 +863,9 @@ pub fn recover_response_projector_blocks(
         } else {
             let absolute_union = union.mapv(f64::abs);
             // Two nested products and one subtraction per entry.
-            let magnitude = absolute_matrix.dot(&absolute_union).dot(&absolute_union.t())
+            let magnitude = absolute_matrix
+                .dot(&absolute_union)
+                .dot(&absolute_union.t())
                 + &absolute_matrix;
             (
                 matrix.to_owned() - matrix.dot(&union).dot(&union.t()),
@@ -926,8 +924,7 @@ pub fn recover_response_projector_blocks(
         let absolute_basis = block.basis.mapv(f64::abs);
         let magnitude = absolute_basis.dot(&absolute_basis.t().dot(&absolute_parameter));
         let component_bar = basis_shift * parameter_norm
-            + accumulation_growth(parameters + block.basis.ncols())
-                * vector_norm(magnitude.view());
+            + accumulation_growth(parameters + block.basis.ncols()) * vector_norm(magnitude.view());
         invisible -= &component;
         invisible_bar += component_bar;
         component_magnitude += vector_norm(component.view());
@@ -1008,8 +1005,7 @@ fn response_defect(
         .fold(0.0_f64, |acc, &value| acc.max((value * value - 1.0).abs()))
         + accumulation_growth(2) * sigma_max * sigma_max
         + shift * (2.0 * sigma_max + shift);
-    let magnitude =
-        absolute_matrix.dot(&absolute_seen).dot(&absolute_seen.t()) + &absolute_matrix;
+    let magnitude = absolute_matrix.dot(&absolute_seen).dot(&absolute_seen.t()) + &absolute_matrix;
     let residual = matrix.to_owned() - projected.dot(&seen.t());
     let residual_norm = frobenius_norm(residual.view())
         + accumulation_growth(parameters + width + 1) * frobenius_norm(magnitude.view())
@@ -1102,10 +1098,11 @@ mod tests {
         let recovery = recover_planted(&planted);
         assert_eq!(recovery.clusters.len(), 4, "{recovery:?}");
         // Increasing cosine: 2.6, 1.2, 0.35, then the fixed space.
-        for (cluster, (angle, first)) in recovery
-            .clusters
-            .iter()
-            .zip([(2.6, 4_usize), (1.2, 2), (0.35, 0)])
+        for (cluster, (angle, first)) in
+            recovery
+                .clusters
+                .iter()
+                .zip([(2.6, 4_usize), (1.2, 2), (0.35, 0)])
         {
             assert_eq!(rotation_planes(cluster), 1, "{cluster:?}");
             assert_cosine_admitted(cluster, &planted, angle);
@@ -1147,10 +1144,11 @@ mod tests {
         let distinct = plant(DIMENSION, &[0.9, 1.0, 2.0], 0, 0x2951_0002);
         let recovery = recover_planted(&distinct);
         assert_eq!(recovery.clusters.len(), 4, "{recovery:?}");
-        for (cluster, (angle, first)) in recovery
-            .clusters
-            .iter()
-            .zip([(2.0, 4_usize), (1.0, 2), (0.9, 0)])
+        for (cluster, (angle, first)) in
+            recovery
+                .clusters
+                .iter()
+                .zip([(2.0, 4_usize), (1.0, 2), (0.9, 0)])
         {
             assert_eq!(rotation_planes(cluster), 1, "{cluster:?}");
             assert_spans_planted(cluster, &distinct, first..first + 2);
@@ -1367,7 +1365,13 @@ mod tests {
         let mut order: Vec<usize> = (0..16).collect();
         order.shuffle(&mut rng);
         let signs: Vec<f64> = (0..16)
-            .map(|_| if rng.random_range(0..2) == 0 { 1.0 } else { -1.0 })
+            .map(|_| {
+                if rng.random_range(0..2) == 0 {
+                    1.0
+                } else {
+                    -1.0
+                }
+            })
             .collect();
         Array2::<f64>::from_shape_fn((16, 16), |(row, col)| {
             let source = order[row];
@@ -1418,16 +1422,14 @@ mod tests {
         let magnitude = absolute.dot(&absolute.t().dot(&parameter.mapv(f64::abs)));
         (
             component,
-            accumulation_growth(planted.nrows() + planted.ncols())
-                * vector_norm(magnitude.view()),
+            accumulation_growth(planted.nrows() + planted.ncols()) * vector_norm(magnitude.view()),
         )
     }
 
     /// `||left - right||_2 <= bar`, counting the rounding of the subtraction.
     fn assert_within(label: &str, left: &Array1<f64>, right: &Array1<f64>, bar: f64) {
         let error = vector_norm((left - right).view());
-        let band =
-            accumulation_growth(1) * (vector_norm(left.view()) + vector_norm(right.view()));
+        let band = accumulation_growth(1) * (vector_norm(left.view()) + vector_norm(right.view()));
         assert!(
             error <= bar + band,
             "{label}: error {error:.3e} exceeds bar {bar:.3e} + band {band:.3e}"
@@ -1451,8 +1453,10 @@ mod tests {
             .iter()
             .map(|(_, columns, seed)| response_fixture(basis.slice(s![.., columns.clone()]), *seed))
             .collect();
-        let views: Vec<ArrayView2<'_, f64>> =
-            fixtures.iter().map(|fixture| fixture.matrix.view()).collect();
+        let views: Vec<ArrayView2<'_, f64>> = fixtures
+            .iter()
+            .map(|fixture| fixture.matrix.view())
+            .collect();
         let declared_error = fixtures
             .iter()
             .fold(0.0_f64, |acc, fixture| acc.max(fixture.declared_error));

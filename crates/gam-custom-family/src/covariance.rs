@@ -567,11 +567,13 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm<F: CustomFamily + ?Sized>
     if let Some(sets) = block_active_sets
         && sets.len() != states.len()
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity check: active-set count mismatch, got {}, expected {}",
+                sets.len(),
+                states.len()
+            ),
+        });
     }
 
     let block_constraints = collect_block_linear_constraints(family, states, specs)?;
@@ -627,18 +629,22 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
     states: &[ParameterBlockState],
 ) -> Result<Option<Array1<f64>>, CustomFamilyError> {
     if eval.blockworking_sets.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint gradient extraction: family returned {} block working sets, expected {}",
-            eval.blockworking_sets.len(),
-            specs.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint gradient extraction: family returned {} block working sets, expected {}",
+                eval.blockworking_sets.len(),
+                specs.len()
+            ),
+        });
     }
     if states.len() != specs.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint gradient extraction: state count {} does not match spec count {}",
-            states.len(),
-            specs.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint gradient extraction: state count {} does not match spec count {}",
+                states.len(),
+                specs.len()
+            ),
+        });
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     let mut gradient = Array1::<f64>::zeros(total_p);
@@ -655,11 +661,13 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
                 ..
             } => {
                 if block_gradient.len() != width {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "exact-newton joint gradient extraction: block gradient length mismatch, got {}, expected {}",
-                        block_gradient.len(),
-                        width
-                    ) });
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "exact-newton joint gradient extraction: block gradient length mismatch, got {}, expected {}",
+                            block_gradient.len(),
+                            width
+                        ),
+                    });
                 }
                 gradient
                     .slice_mut(ndarray::s![offset..offset + width])
@@ -687,13 +695,15 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
                 // branch and reports a zero outer gradient.
                 let n = working_response.len();
                 if working_weights.len() != n || state.eta.len() != n || spec.design.nrows() != n {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "exact-newton joint gradient extraction: diagonal working-set length mismatch (z={}, w={}, η={}, X_rows={})",
-                        working_response.len(),
-                        working_weights.len(),
-                        state.eta.len(),
-                        spec.design.nrows()
-                    ) });
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "exact-newton joint gradient extraction: diagonal working-set length mismatch (z={}, w={}, η={}, X_rows={})",
+                            working_response.len(),
+                            working_weights.len(),
+                            state.eta.len(),
+                            spec.design.nrows()
+                        ),
+                    });
                 }
                 let mut weighted = Array1::<f64>::zeros(n);
                 for i in 0..n {
@@ -702,11 +712,13 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
                 let block_gradient =
                     <DesignMatrix as LinearOperator>::apply_transpose(&spec.design, &weighted);
                 if block_gradient.len() != width {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "exact-newton joint gradient extraction: diagonal block transpose length mismatch, got {}, expected {}",
-                        block_gradient.len(),
-                        width
-                    ) });
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "exact-newton joint gradient extraction: diagonal block transpose length mismatch, got {}, expected {}",
+                            block_gradient.len(),
+                            width
+                        ),
+                    });
                 }
                 gradient
                     .slice_mut(ndarray::s![offset..offset + width])
@@ -715,12 +727,14 @@ pub(crate) fn exact_newton_joint_gradient_from_eval(
             BlockWorkingSet::NaturalDiagonal { score, .. } => {
                 let n = score.len();
                 if state.eta.len() != n || spec.solver_design().nrows() != n {
-                    return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-                        "exact-newton joint gradient extraction: natural-diagonal length mismatch (score={}, η={}, X_rows={})",
-                        score.len(),
-                        state.eta.len(),
-                        spec.solver_design().nrows(),
-                    ) });
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "exact-newton joint gradient extraction: natural-diagonal length mismatch (score={}, η={}, X_rows={})",
+                            score.len(),
+                            state.eta.len(),
+                            spec.solver_design().nrows(),
+                        ),
+                    });
                 }
                 let block_gradient = spec.solver_design().transpose_vector_multiply(score);
                 gradient
@@ -774,37 +788,45 @@ pub(crate) fn exact_newton_joint_stationarity_inf_norm_from_gradient(
         });
     }
     if block_constraints.len() != states.len() {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check from gradient: constraint count mismatch, got {}, expected {}",
-            block_constraints.len(),
-            states.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity check from gradient: constraint count mismatch, got {}, expected {}",
+                block_constraints.len(),
+                states.len()
+            ),
+        });
     }
     if let Some(sets) = block_active_sets
         && sets.len() != states.len()
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check from gradient: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity check from gradient: active-set count mismatch, got {}, expected {}",
+                sets.len(),
+                states.len()
+            ),
+        });
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check from gradient: joint gradient length mismatch, got {}, expected {}",
-            gradient.len(),
-            total_p
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity check from gradient: joint gradient length mismatch, got {}, expected {}",
+                gradient.len(),
+                total_p
+            ),
+        });
     }
     if let Some(js) = joint_penalty_score
         && js.len() != total_p
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity check from gradient: joint penalty score length mismatch, got {}, expected {}",
-            js.len(),
-            total_p
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity check from gradient: joint penalty score length mismatch, got {}, expected {}",
+                js.len(),
+                total_p
+            ),
+        });
     }
 
     // Same KKT projection as `exact_newton_joint_stationarity_inf_norm`:
@@ -882,17 +904,20 @@ pub(crate) fn exact_newton_joint_stationarity_vector_from_gradient(
 ) -> Result<Array1<f64>, CustomFamilyError> {
     if states.len() != specs.len() || states.len() != s_lambdas.len() {
         return Err(CustomFamilyError::DimensionMismatch {
-            reason: "exact-newton joint stationarity vector from gradient: block dimension mismatch"
-                .to_string(),
+            reason:
+                "exact-newton joint stationarity vector from gradient: block dimension mismatch"
+                    .to_string(),
         });
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton joint stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
-            gradient.len(),
-            total_p
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton joint stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
+                gradient.len(),
+                total_p
+            ),
+        });
     }
 
     let mut residual = Array1::<f64>::zeros(total_p);
@@ -967,35 +992,42 @@ pub(crate) fn exact_newton_joint_projected_stationarity_vector_from_gradient(
         || states.len() != block_constraints.len()
     {
         return Err(CustomFamilyError::DimensionMismatch {
-            reason: "exact-newton projected stationarity vector from gradient: block dimension mismatch"
-                .to_string(),
+            reason:
+                "exact-newton projected stationarity vector from gradient: block dimension mismatch"
+                    .to_string(),
         });
     }
     if let Some(sets) = block_active_sets
         && sets.len() != states.len()
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton projected stationarity vector from gradient: active-set count mismatch, got {}, expected {}",
-            sets.len(),
-            states.len()
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton projected stationarity vector from gradient: active-set count mismatch, got {}, expected {}",
+                sets.len(),
+                states.len()
+            ),
+        });
     }
     let total_p = specs.iter().map(|spec| spec.design.ncols()).sum::<usize>();
     if gradient.len() != total_p {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton projected stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
-            gradient.len(),
-            total_p
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton projected stationarity vector from gradient: joint gradient length mismatch, got {}, expected {}",
+                gradient.len(),
+                total_p
+            ),
+        });
     }
     if let Some(js) = joint_penalty_score
         && js.len() != total_p
     {
-        return Err(CustomFamilyError::DimensionMismatch { reason: format!(
-            "exact-newton projected stationarity vector from gradient: joint penalty score length mismatch, got {}, expected {}",
-            js.len(),
-            total_p
-        ) });
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-newton projected stationarity vector from gradient: joint penalty score length mismatch, got {}, expected {}",
+                js.len(),
+                total_p
+            ),
+        });
     }
 
     let mut residual = Array1::<f64>::zeros(total_p);
@@ -1437,7 +1469,16 @@ fn spd_covariance_from_precision(
     // Small positive curvature is not a structural null: its units depend on
     // the coefficient chart. Use the existing strict, unjittered Cholesky
     // and inverse backward-error certificate, not a spectral rank cutoff.
-    gam_linalg::utils::certified_spd_inverse(precision, face)
+    //
+    // Every precision reaching this gate leaves `penalized_hessian_from_owned_mode`
+    // (or the Jeffreys completion added onto it) through
+    // `symmetrize_dense_in_place`, so it is exactly mirrored and no rounding
+    // band is owed to its triangles.
+    gam_linalg::utils::certified_spd_inverse(
+        precision,
+        gam_linalg::roundoff::SymmetricAssembly::Mirrored,
+        face,
+    )
         .map(|certified| certified.into_inverse())
         .map_err(|error| CustomFamilyError::trial_point(format!(
             "joint posterior precision is non-PD at the converged optimum or its inverse could not be certified on the {face}: {error}"
@@ -1484,12 +1525,11 @@ fn improper_penalty_null_posterior(
     penalty: &Array2<f64>,
     precision: &Array2<f64>,
 ) -> Result<Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>, CustomFamilyError> {
-    let unreached =
-        gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
-            penalty.view(),
-        )
-        .map_err(CustomFamilyError::trial_point)?
-        .columns;
+    let unreached = gam_solve::estimate::reml::jeffreys_subspace::jeffreys_subspace_from_penalty(
+        penalty.view(),
+    )
+    .map_err(CustomFamilyError::trial_point)?
+    .columns;
     if unreached.ncols() == 0 {
         return Ok(None);
     }
@@ -2052,13 +2092,15 @@ pub(crate) fn install_reported_posterior_mean<F: CustomFamily + Clone + Send + S
     let Some(reported_beta) = reported_beta else {
         return Ok(());
     };
-    let constrained = geometry.constrained_posterior.as_mut().ok_or_else(|| {
-        CustomFamilyError::Optimization {
-            context: "reported posterior mean",
-            reason: "a published posterior mean carries no constrained-posterior geometry"
-                .to_string(),
-        }
-    })?;
+    let constrained =
+        geometry
+            .constrained_posterior
+            .as_mut()
+            .ok_or_else(|| CustomFamilyError::Optimization {
+                context: "reported posterior mean",
+                reason: "a published posterior mean carries no constrained-posterior geometry"
+                    .to_string(),
+            })?;
     constrained.mode_log_likelihood = Some(inner.log_likelihood);
     set_states_from_flat_beta(&mut inner.block_states, specs, reported_beta)?;
     refresh_all_block_etas(family, specs, &mut inner.block_states)?;
@@ -2244,11 +2286,15 @@ pub(crate) fn joint_penalty_subspace_trace_parts(
     }
     // The eigenpairs the kernel drops, from the same decomposition: its derivative couples them to
     // the kept ones (`PenaltySubspaceTrace::pseudo_inverse_rotation`).
-    let dropped: Vec<usize> = (0..m_evals.len()).filter(|index| !kept.contains(index)).collect();
+    let dropped: Vec<usize> = (0..m_evals.len())
+        .filter(|index| !kept.contains(index))
+        .collect();
     let mut dropped_basis = Array2::<f64>::zeros((precision_dim, dropped.len()));
     let mut dropped_eigenvalues = Array1::<f64>::zeros(dropped.len());
     for (out_col, &src_col) in dropped.iter().enumerate() {
-        dropped_basis.column_mut(out_col).assign(&m_evecs.column(src_col));
+        dropped_basis
+            .column_mut(out_col)
+            .assign(&m_evecs.column(src_col));
         dropped_eigenvalues[out_col] = m_evals[src_col];
     }
     let (u_m, dropped_basis) = match face_tangent {
@@ -2388,8 +2434,14 @@ pub(crate) fn joint_smoothing_correction(
         }
     }
 
-    first_order_smoothing_correction(v_cond, &u_mat, outer_hessian, outer_gradient, excluded_outer)
-        .map_err(CustomFamilyError::trial_point)
+    first_order_smoothing_correction(
+        v_cond,
+        &u_mat,
+        outer_hessian,
+        outer_gradient,
+        excluded_outer,
+    )
+    .map_err(CustomFamilyError::trial_point)
 }
 
 /// First-order ρ-uncertainty inflation `C = A·V_ρ·Aᵀ` of a conditional
@@ -2469,22 +2521,38 @@ pub fn first_order_smoothing_correction(
             .map(|&o| outer_gradient[o])
             .collect::<Array1<f64>>()
     };
-    let inverted =
-        match gam_solve::estimate::invert_identified_rho_hessian(&h_sub, 0, &g_sub, None, &[]) {
-            Ok(inverted) => inverted,
-            Err(refusal) => {
-                log::debug!(
-                    "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
+    // The ρ-Hessian's triangles are separate accumulations of the same mixed
+    // partial (Clairaut), so their skew part is assembly error, not rounding:
+    // symmetrize it and forward that measured defect as a `‖δH‖₂` component,
+    // exactly as the standard lane does (#2748), since the inverter takes an
+    // exactly mirrored ρ-Hessian.
+    let symmetrization_defect = gam_linalg::matrix::symmetrization_defect_2norm(&h_sub);
+    gam_linalg::matrix::symmetrize_in_place(&mut h_sub);
+    let measured_hessian_error = [gam_linalg::curvature_resolution::MeasuredHessianError::new(
+        "outer rho-Hessian symmetrization defect |(H - H')/2|_2",
+        symmetrization_defect,
+    )];
+    let inverted = match gam_solve::estimate::invert_identified_rho_hessian(
+        &h_sub,
+        0,
+        &g_sub,
+        None,
+        &measured_hessian_error,
+    ) {
+        Ok(inverted) => inverted,
+        Err(refusal) => {
+            log::debug!(
+                "[smoothing-correction] branch=unavailable reason=interior-rho-hessian-refused \
                      rho_dimension={k_outer} railed={}: {refusal}",
-                    k_outer - ki,
-                );
-                return Ok(Err(
-                    gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
-                        refusal,
-                    },
-                ));
-            }
-        };
+                k_outer - ki,
+            );
+            return Ok(Err(
+                gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused {
+                    refusal,
+                },
+            ));
+        }
+    };
 
     // C = (V·U_inc) · V_ρ · (V·U_inc)ᵀ — symmetric PSD by construction.
     let mut u_inc = Array2::<f64>::zeros((p_total, ki));
@@ -2533,7 +2601,9 @@ mod required_covariance_tests {
         assert!(
             matches!(
                 absence,
-                Err(gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused { .. })
+                Err(
+                    gam_solve::model_types::SmoothingCorrectionAbsence::InteriorRhoHessianRefused { .. }
+                )
             ),
             "a curvature below the certificate's bar is the typed interior refusal: {absence:?}"
         );
@@ -3058,7 +3128,9 @@ mod required_covariance_tests {
             None,
             Some(&retained),
         )
-        .expect("a multiplier of 100 against a normal curvature of -1 certifies the boundary-mode law");
+        .expect(
+            "a multiplier of 100 against a normal curvature of -1 certifies the boundary-mode law",
+        );
         let constrained = assembly
             .geometry
             .constrained_posterior
@@ -3488,7 +3560,9 @@ mod required_covariance_tests {
         let error = lower_bounded_posterior(spec, &states, None, Some(&stale))
             .expect_err("a score from another beta cannot certify this mode");
         assert!(
-            error.to_string().contains("evaluated at a different coefficient vector"),
+            error
+                .to_string()
+                .contains("evaluated at a different coefficient vector"),
             "the refusal must name the operating-point mismatch, got: {error}",
         );
     }

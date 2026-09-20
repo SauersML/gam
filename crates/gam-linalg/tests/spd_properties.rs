@@ -1,8 +1,8 @@
 use faer::Side;
 use faer::sparse::{SparseColMat, SymbolicSparseColMat};
-use gam_linalg::faer_ndarray::{fast_ata, strict_symmetric_eigh, FaerCholesky};
+use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, strict_symmetric_eigh};
 use gam_linalg::matrix::{FactorizedSystem, SymmetricMatrix};
-use gam_linalg::roundoff::accumulation_growth;
+use gam_linalg::roundoff::{SymmetricAssembly, accumulation_growth};
 use gam_linalg::sparse_exact::{factorize_sparse_spd_strict, logdet_from_factor, solve_sparse_spd};
 use ndarray::{Array1, Array2};
 use proptest::prelude::*;
@@ -58,8 +58,16 @@ fn spd_case() -> impl Strategy<Value = (Array2<f64>, Array1<f64>)> {
         })
 }
 
+/// Provenance of an `spd_case` matrix: each triangle of `L·Lᵀ` is an
+/// `n`-term sum of the PSD pieces `L_ik·L_jk`, rounded once more by the
+/// uniform scale, so the two triangles are depth-`(n + 1)` accumulations.
+fn spd_case_assembly(n: usize) -> SymmetricAssembly {
+    SymmetricAssembly::PsdAccumulation { depth: n + 1 }
+}
+
 fn condition_number(matrix: &Array2<f64>) -> f64 {
-    let (eigenvalues, _) = strict_symmetric_eigh(matrix, Side::Lower).unwrap();
+    let (eigenvalues, _) =
+        strict_symmetric_eigh(matrix, spd_case_assembly(matrix.nrows()), Side::Lower).unwrap();
     let smallest = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
     let largest = eigenvalues.iter().copied().fold(0.0, f64::max);
     largest / smallest
@@ -74,7 +82,9 @@ proptest! {
     fn strict_spd_solve_recovers_x_with_condition_derived_error((matrix, expected) in spd_case()) {
         let n = matrix.nrows();
         let rhs = matrix.dot(&expected);
-        let factor = SymmetricMatrix::Dense(matrix.clone()).factorize_spd().unwrap();
+        let factor = SymmetricMatrix::Dense(matrix.clone())
+            .factorize_spd(spd_case_assembly(n))
+            .unwrap();
         let actual = factor.solve(&rhs).unwrap();
         let error = infinity_norm(&(&actual - &expected));
 
@@ -149,7 +159,11 @@ proptest! {
             matrix[[n - 1, index]] = matrix[[0, index]];
             matrix[[index, n - 1]] = matrix[[index, 0]];
         }
-        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize_spd().is_err());
+        // `MᵀM` sums `n` PSD pieces per entry; the copied row and column
+        // carry the first row's entries, whose band is the same.
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone())
+            .factorize_spd(SymmetricAssembly::PsdAccumulation { depth: n })
+            .is_err());
         let sparse = dense_to_upper_csc(&matrix);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_err());
     }
@@ -183,8 +197,13 @@ proptest! {
         let scaled = Array2::from_shape_fn((n, n), |(row, column)| {
             matrix[[row, column]] * 10.0f64.powi(exponents[row] + exponents[column])
         });
-        prop_assert!(SymmetricMatrix::Dense(matrix.clone()).factorize_spd().is_ok());
-        prop_assert!(SymmetricMatrix::Dense(scaled.clone()).factorize_spd().is_ok());
+        prop_assert!(SymmetricMatrix::Dense(matrix.clone())
+            .factorize_spd(spd_case_assembly(n))
+            .is_ok());
+        // The symmetric factor `10^(e_i + e_j)` adds one rounding per entry.
+        prop_assert!(SymmetricMatrix::Dense(scaled.clone())
+            .factorize_spd(SymmetricAssembly::PsdAccumulation { depth: n + 2 })
+            .is_ok());
         let sparse = dense_to_upper_csc(&scaled);
         prop_assert!(factorize_sparse_spd_strict(&sparse).is_ok());
     }

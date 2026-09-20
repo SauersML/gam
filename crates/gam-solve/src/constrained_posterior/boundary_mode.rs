@@ -48,6 +48,7 @@
 //! Nothing here bounds the likelihood's third-order terms. The proper-cone Laplace law
 //! ignores those too, so the approximation is no weaker in that respect.
 
+use gam_linalg::roundoff::SymmetricAssembly;
 use gam_linalg::utils::certified_spd_factorize;
 use gam_math::probability::standard_normal_quantile;
 use gam_problem::LinearInequalityConstraints;
@@ -184,13 +185,21 @@ impl BoundaryModeApproximation {
         let rows = face.a_active.clone();
 
         let gram = rows.dot(&rows.t());
-        let gram_factor = certified_spd_factorize(&gram, "boundary-mode active-row Gram AAᵀ")
-            .map_err(|error| {
-                format!(
-                    "boundary-mode approximation: the {q} active row(s) are not independent: \
+        // A full GEMM: each triangle sums the `p` products `a_ik·a_jk` of the
+        // PSD pieces `a_k a_kᵀ`, depth `p` (#4350).
+        let gram_factor = certified_spd_factorize(
+            &gram,
+            SymmetricAssembly::PsdAccumulation {
+                depth: rows.ncols(),
+            },
+            "boundary-mode active-row Gram AAᵀ",
+        )
+        .map_err(|error| {
+            format!(
+                "boundary-mode approximation: the {q} active row(s) are not independent: \
                      {error}"
-                )
-            })?;
+            )
+        })?;
         let (gram_solved_rows, _) = gram_factor.solve_matrix(&rows).map_err(|error| {
             format!("boundary-mode approximation: the active-row Gram solve failed: {error}")
         })?;
@@ -218,15 +227,18 @@ impl BoundaryModeApproximation {
         } else {
             let mut face_precision = tangent.t().dot(&precision).dot(&tangent);
             gam_linalg::matrix::symmetrize_in_place(&mut face_precision);
-            let face_factor =
-                certified_spd_factorize(&face_precision, "boundary-mode face precision ZᵀMZ")
-                    .map_err(|error| {
-                        format!(
-                            "boundary-mode approximation: the precision is not positive \
+            let face_factor = certified_spd_factorize(
+                &face_precision,
+                SymmetricAssembly::Mirrored,
+                "boundary-mode face precision ZᵀMZ",
+            )
+            .map_err(|error| {
+                format!(
+                    "boundary-mode approximation: the precision is not positive \
                              definite on the {tangent_dimension}-dimensional face tangent: \
                              {error}"
-                        )
-                    })?;
+                )
+            })?;
             let coupling = tangent.t().dot(&precision_times_right_inverse);
             let (face_solved_coupling, _) =
                 face_factor.solve_matrix(&coupling).map_err(|error| {
@@ -297,10 +309,16 @@ impl BoundaryModeApproximation {
         } else {
             0.0
         };
-        let frobenius = scaled_schur.iter().map(|value| value * value).sum::<f64>().sqrt();
+        let frobenius = scaled_schur
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
         let face_width = q as f64;
-        let first_order_moment_bound =
-            0.5 * 5.0_f64.sqrt() * frobenius * (4.0 * face_width * face_width + 20.0 * face_width).sqrt();
+        let first_order_moment_bound = 0.5
+            * 5.0_f64.sqrt()
+            * frobenius
+            * (4.0 * face_width * face_width + 20.0 * face_width).sqrt();
 
         let certificate = BoundaryModeCertificate {
             rates,
@@ -420,7 +438,10 @@ impl BoundaryModeApproximation {
         let mut unique_rows = self.active_rows.clone();
         unique_rows.sort_unstable();
         unique_rows.dedup();
-        if q == 0 || unique_rows.len() != q || unique_rows.iter().any(|&row| row >= constraint_count) {
+        if q == 0
+            || unique_rows.len() != q
+            || unique_rows.iter().any(|&row| row >= constraint_count)
+        {
             return Err(format!(
                 "boundary-mode approximation names active rows {:?} that are not unique valid \
                  indices for {constraint_count} inequalities",
@@ -439,7 +460,9 @@ impl BoundaryModeApproximation {
             return Err("boundary-mode approximation contains a non-finite value".to_string());
         }
         if self.certificate.rates.iter().any(|&rate| !(rate > 0.0)) {
-            return Err("boundary-mode approximation has a non-positive exponential rate".to_string());
+            return Err(
+                "boundary-mode approximation has a non-positive exponential rate".to_string(),
+            );
         }
         if let Some((name, value)) = self
             .certificate
@@ -553,7 +576,8 @@ mod tests {
         )
         .expect_err("a multiplier of 1 against a normal curvature of -1 is not certified");
         assert!(
-            refusal.reason.contains("not certified") && refusal.reason.contains("overturn tail mass 1.353e-1"),
+            refusal.reason.contains("not certified")
+                && refusal.reason.contains("overturn tail mass 1.353e-1"),
             "the refusal must name the failing entry and its value, got: {refusal}"
         );
         let certificate = refusal
@@ -579,7 +603,10 @@ mod tests {
             &gradient,
         )
         .expect_err("a zero multiplier holds no coordinate");
-        assert!(refusal.reason.contains("strict complementarity"), "got: {refusal}");
+        assert!(
+            refusal.reason.contains("strict complementarity"),
+            "got: {refusal}"
+        );
     }
 
     /// The fixture `a_cone_improper_posterior_keeps_the_mode_under_a_named_decline` uses:
@@ -596,7 +623,12 @@ mod tests {
             &gradient,
         )
         .expect_err("an indefinite face has no Gaussian law");
-        assert!(refusal.reason.contains("not positive definite on the 1-dimensional face tangent"), "got: {refusal}");
+        assert!(
+            refusal
+                .reason
+                .contains("not positive definite on the 1-dimensional face tangent"),
+            "got: {refusal}"
+        );
     }
 
     /// An inactive wall at `β₁ ≤ 0.6` sits `0.1` from the mode against a face standard
@@ -614,7 +646,10 @@ mod tests {
         let refusal =
             BoundaryModeApproximation::at_converged_mode(precision.view(), &near, &mode, &gradient)
                 .expect_err("a wall 0.1 away inside a spread of 0.71 is within reach");
-        assert!(refusal.reason.contains("inactive constraint row 1"), "got: {refusal}");
+        assert!(
+            refusal.reason.contains("inactive constraint row 1"),
+            "got: {refusal}"
+        );
         let far = LinearInequalityConstraints {
             a: array![[1.0, 0.0], [0.0, -1.0]],
             b: array![0.0, -100.0],

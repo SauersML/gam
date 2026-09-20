@@ -30,7 +30,7 @@ use std::f64::consts::PI;
 
 use gam_linalg::faer_ndarray::{fast_ab, fast_ata};
 use gam_linalg::matrix::symmetrize_in_place;
-use gam_linalg::roundoff::factor_rank_partition;
+use gam_linalg::roundoff::{SymmetricAssembly, factor_rank_partition};
 use gam_linalg::utils::{
     CertifiedSymmetricSolveError, certified_spd_factorize, validate_finite_symmetric_matrix,
 };
@@ -62,6 +62,16 @@ impl GaussianEvidenceParts {
         -0.5 * (self.quadratic + self.log_det + self.observations as f64 * (2.0 * PI).ln())
     }
 }
+
+/// Provenance of a declared prior precision `Q` (#4350). `Q` is an input, not an accumulation of ours, so no rounding
+/// of this module can have split its triangles: a declared symmetric matrix must be exactly symmetric, and a caller who
+/// assembled it by a full GEMM mirrors or symmetrizes it before declaring it.
+const DECLARED_PRIOR_ASSEMBLY: SymmetricAssembly = SymmetricAssembly::Mirrored;
+
+/// Provenance of the posterior precision `Q + WᵀW`: `fast_ata` mirrors its triangular Gram, and the entrywise sum with
+/// the exactly symmetric declared prior adds the same two operands in both triangles.
+const POSTERIOR_PRECISION_ASSEMBLY: SymmetricAssembly =
+    SymmetricAssembly::Mirrored.psd_sum(DECLARED_PRIOR_ASSEMBLY);
 
 /// Why a declared-prior Gaussian evidence could not be computed.
 #[derive(Debug, PartialEq)]
@@ -118,7 +128,7 @@ pub struct GaussianMarginalModel {
 
 impl GaussianMarginalModel {
     /// Validate `y = Φβ + ε` with `ε ~ N(0, diag(noise_variance))` and `β ~ N(0, prior_precision⁻¹)`, refusing an
-    /// improper prior.
+    /// improper prior. The declared `prior_precision` must be exactly symmetric ([`DECLARED_PRIOR_ASSEMBLY`]).
     pub fn new(
         basis: ArrayView2<'_, f64>,
         response: ArrayView1<'_, f64>,
@@ -157,17 +167,22 @@ impl GaussianMarginalModel {
             )));
         }
         let prior = prior_precision.to_owned();
-        validate_finite_symmetric_matrix(&prior, "declared prior precision")
-            .map_err(|error| GaussianMarginalError::InvalidInput(error.to_string()))?;
+        validate_finite_symmetric_matrix(
+            &prior,
+            DECLARED_PRIOR_ASSEMBLY,
+            "declared prior precision",
+        )
+        .map_err(|error| GaussianMarginalError::InvalidInput(error.to_string()))?;
         if prior.nrows() != cols {
             return Err(GaussianMarginalError::InvalidInput(format!(
                 "the basis has {cols} columns but the prior precision is {0} x {0}",
                 prior.nrows()
             )));
         }
-        let prior_log_det = certified_spd_factorize(&prior, "declared prior precision")
-            .map_err(GaussianMarginalError::ImproperPrior)?
-            .log_det();
+        let prior_log_det =
+            certified_spd_factorize(&prior, DECLARED_PRIOR_ASSEMBLY, "declared prior precision")
+                .map_err(GaussianMarginalError::ImproperPrior)?
+                .log_det();
 
         let mut design = basis.to_owned();
         let mut whitened = response.to_owned();
@@ -210,11 +225,15 @@ impl GaussianMarginalModel {
     /// Dual (precision) form: factor `H = Q + WᵀW` at `p × p`.
     pub fn evidence_dual(&self) -> Result<GaussianEvidenceParts, GaussianMarginalError> {
         let precision = self.posterior_precision();
-        let factor = certified_spd_factorize(&precision, "posterior precision Q + ΦᵀR⁻¹Φ")
-            .map_err(|error| GaussianMarginalError::Solve {
-                stage: "posterior precision",
-                error,
-            })?;
+        let factor = certified_spd_factorize(
+            &precision,
+            POSTERIOR_PRECISION_ASSEMBLY,
+            "posterior precision Q + ΦᵀR⁻¹Φ",
+        )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "posterior precision",
+            error,
+        })?;
         let mean = factor
             .solve(&self.design.t().dot(&self.response))
             .map_err(|error| GaussianMarginalError::Solve {
@@ -235,9 +254,12 @@ impl GaussianMarginalModel {
     /// Primal (covariance) form: factor the whitened covariance `C̃ = I + WQ⁻¹Wᵀ` at `n × n`, with
     /// `log|C| = Σ log r + log|C̃|` and `yᵀC⁻¹y = ỹᵀC̃⁻¹ỹ`.
     pub fn evidence_primal(&self) -> Result<GaussianEvidenceParts, GaussianMarginalError> {
-        let prior_factor =
-            certified_spd_factorize(&self.prior_precision, "declared prior precision")
-                .map_err(GaussianMarginalError::ImproperPrior)?;
+        let prior_factor = certified_spd_factorize(
+            &self.prior_precision,
+            DECLARED_PRIOR_ASSEMBLY,
+            "declared prior precision",
+        )
+        .map_err(GaussianMarginalError::ImproperPrior)?;
         let readout = prior_factor
             .solve_matrix(&self.design.t().to_owned())
             .map_err(|error| GaussianMarginalError::Solve {
@@ -252,12 +274,15 @@ impl GaussianMarginalModel {
         for index in 0..covariance.nrows() {
             covariance[[index, index]] += 1.0;
         }
-        let factor =
-            certified_spd_factorize(&covariance, "whitened marginal covariance R + ΦQ⁻¹Φᵀ")
-                .map_err(|error| GaussianMarginalError::Solve {
-                    stage: "marginal covariance",
-                    error,
-                })?;
+        let factor = certified_spd_factorize(
+            &covariance,
+            SymmetricAssembly::Mirrored,
+            "whitened marginal covariance R + ΦQ⁻¹Φᵀ",
+        )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "marginal covariance",
+            error,
+        })?;
         let weights = factor
             .solve(&self.response)
             .map_err(|error| GaussianMarginalError::Solve {
@@ -275,17 +300,21 @@ impl GaussianMarginalModel {
     /// The coefficient posterior `β | y ~ N(H⁻¹b, H⁻¹)`.
     pub fn posterior(&self) -> Result<GaussianPosterior, GaussianMarginalError> {
         let precision = self.posterior_precision();
-        let mean = certified_spd_factorize(&precision, "posterior precision Q + ΦᵀR⁻¹Φ")
-            .map_err(|error| GaussianMarginalError::Solve {
-                stage: "posterior precision",
-                error,
-            })?
-            .solve(&self.design.t().dot(&self.response))
-            .map_err(|error| GaussianMarginalError::Solve {
-                stage: "posterior mean",
-                error,
-            })?
-            .into_solution();
+        let mean = certified_spd_factorize(
+            &precision,
+            POSTERIOR_PRECISION_ASSEMBLY,
+            "posterior precision Q + ΦᵀR⁻¹Φ",
+        )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "posterior precision",
+            error,
+        })?
+        .solve(&self.design.t().dot(&self.response))
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "posterior mean",
+            error,
+        })?
+        .into_solution();
         Ok(GaussianPosterior { mean, precision })
     }
 
@@ -320,19 +349,21 @@ impl GaussianPosterior {
         &self,
         rhs: &Array2<f64>,
     ) -> Result<Array2<f64>, GaussianMarginalError> {
-        Ok(
-            certified_spd_factorize(&self.precision, "posterior precision Q + ΦᵀR⁻¹Φ")
-                .map_err(|error| GaussianMarginalError::Solve {
-                    stage: "posterior precision",
-                    error,
-                })?
-                .solve_matrix(rhs)
-                .map_err(|error| GaussianMarginalError::Solve {
-                    stage: "posterior covariance solve",
-                    error,
-                })?
-                .0,
+        Ok(certified_spd_factorize(
+            &self.precision,
+            POSTERIOR_PRECISION_ASSEMBLY,
+            "posterior precision Q + ΦᵀR⁻¹Φ",
         )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "posterior precision",
+            error,
+        })?
+        .solve_matrix(rhs)
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "posterior covariance solve",
+            error,
+        })?
+        .0)
     }
 }
 
@@ -367,27 +398,34 @@ impl ExactConstraintPosterior {
         &self,
         rhs: &Array2<f64>,
     ) -> Result<Array2<f64>, GaussianMarginalError> {
-        let prior_part = certified_spd_factorize(&self.prior_precision, "declared prior precision")
-            .map_err(GaussianMarginalError::ImproperPrior)?
-            .solve_matrix(rhs)
-            .map_err(|error| GaussianMarginalError::Solve {
-                stage: "prior covariance solve",
-                error,
-            })?
-            .0;
+        let prior_part = certified_spd_factorize(
+            &self.prior_precision,
+            DECLARED_PRIOR_ASSEMBLY,
+            "declared prior precision",
+        )
+        .map_err(GaussianMarginalError::ImproperPrior)?
+        .solve_matrix(rhs)
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "prior covariance solve",
+            error,
+        })?
+        .0;
         let projected = self.readout.t().dot(rhs);
-        let correction =
-            certified_spd_factorize(&self.constraint_covariance, "constraint covariance AQ⁻¹Aᵀ")
-                .map_err(|error| GaussianMarginalError::Solve {
-                    stage: "constraint covariance",
-                    error,
-                })?
-                .solve_matrix(&projected)
-                .map_err(|error| GaussianMarginalError::Solve {
-                    stage: "constraint covariance solve",
-                    error,
-                })?
-                .0;
+        let correction = certified_spd_factorize(
+            &self.constraint_covariance,
+            SymmetricAssembly::Mirrored,
+            "constraint covariance AQ⁻¹Aᵀ",
+        )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "constraint covariance",
+            error,
+        })?
+        .solve_matrix(&projected)
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "constraint covariance solve",
+            error,
+        })?
+        .0;
         Ok(prior_part - &fast_ab(&self.readout, &correction))
     }
 }
@@ -426,7 +464,7 @@ pub fn condition_on_exact_constraint(
         ));
     }
     let prior = prior_precision.to_owned();
-    validate_finite_symmetric_matrix(&prior, "declared prior precision")
+    validate_finite_symmetric_matrix(&prior, DECLARED_PRIOR_ASSEMBLY, "declared prior precision")
         .map_err(|error| GaussianMarginalError::InvalidInput(error.to_string()))?;
     if prior.nrows() != cols {
         return Err(GaussianMarginalError::InvalidInput(format!(
@@ -444,25 +482,29 @@ pub fn condition_on_exact_constraint(
             resolved_rank,
         });
     }
-    let readout = certified_spd_factorize(&prior, "declared prior precision")
-        .map_err(GaussianMarginalError::ImproperPrior)?
-        .solve_matrix(&constraint.t().to_owned())
-        .map_err(|error| GaussianMarginalError::Solve {
-            stage: "prior readout Q⁻¹Aᵀ",
-            error,
-        })?
-        .0;
+    let readout =
+        certified_spd_factorize(&prior, DECLARED_PRIOR_ASSEMBLY, "declared prior precision")
+            .map_err(GaussianMarginalError::ImproperPrior)?
+            .solve_matrix(&constraint.t().to_owned())
+            .map_err(|error| GaussianMarginalError::Solve {
+                stage: "prior readout Q⁻¹Aᵀ",
+                error,
+            })?
+            .0;
     let mut covariance = fast_ab(&constraint, &readout);
     // `AQ⁻¹Aᵀ` is symmetric analytically; project the rounding of its two triangles back onto that symmetry.
     symmetrize_in_place(&mut covariance);
     let value = value.to_owned();
     let (weights, log_det) = {
-        let factor = certified_spd_factorize(&covariance, "constraint covariance AQ⁻¹Aᵀ").map_err(
-            |error| GaussianMarginalError::Solve {
-                stage: "constraint covariance",
-                error,
-            },
-        )?;
+        let factor = certified_spd_factorize(
+            &covariance,
+            SymmetricAssembly::Mirrored,
+            "constraint covariance AQ⁻¹Aᵀ",
+        )
+        .map_err(|error| GaussianMarginalError::Solve {
+            stage: "constraint covariance",
+            error,
+        })?;
         let weights = factor
             .solve(&value)
             .map_err(|error| GaussianMarginalError::Solve {
@@ -1034,10 +1076,9 @@ mod tests {
         let mut covariance = constraint.dot(&readout);
         symmetrize_in_place(&mut covariance);
         let covariance_spectrum = spectrum_extremes(&covariance);
-        let covariance_assembly = 2.0
-            * gamma(p + 1)
-            * frobenius(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
-            + frobenius(constraint) * readout_error;
+        let covariance_assembly =
+            2.0 * gamma(p + 1) * frobenius(&constraint.mapv(f64::abs).dot(&readout.mapv(f64::abs)))
+                + frobenius(constraint) * readout_error;
         let weights = covariance
             .cholesky(Side::Lower)
             .expect("fixture constraint covariance is SPD")
@@ -1078,7 +1119,9 @@ mod tests {
         let noisy_model =
             GaussianMarginalModel::new(constraint.view(), value.view(), noise.view(), prior.view())
                 .expect("noisy model");
-        let noisy = noisy_model.evidence_primal().expect("noisy primal evidence");
+        let noisy = noisy_model
+            .evidence_primal()
+            .expect("noisy primal evidence");
         let noisy_bands = bands(&noisy_model, &noise);
         let quadratic_band = exact_bands.quadratic + noisy_bands.primal_quadratic;
         let log_det_band = exact_bands.log_det + noisy_bands.primal_log_det;
@@ -1106,7 +1149,9 @@ mod tests {
             prior.view(),
         )
         .expect("coarse model");
-        let coarse = coarse_model.evidence_primal().expect("coarse primal evidence");
+        let coarse = coarse_model
+            .evidence_primal()
+            .expect("coarse primal evidence");
         let coarse_band = exact_bands.log_det + bands(&coarse_model, &coarse_noise).primal_log_det;
         assert!(
             coarse.log_det - exact.log_det > coarse_band,
@@ -1119,10 +1164,13 @@ mod tests {
     fn exact_constraint_covariance_annihilates_the_constraint() {
         let (constraint, value, prior) = constraint_fixture();
         let (n, p) = constraint.dim();
-        let posterior = condition_on_exact_constraint(constraint.view(), value.view(), prior.view())
-            .expect("exact constraint");
+        let posterior =
+            condition_on_exact_constraint(constraint.view(), value.view(), prior.view())
+                .expect("exact constraint");
         let unit = Array2::<f64>::eye(p);
-        let covariance = posterior.covariance_times(&unit).expect("covariance columns");
+        let covariance = posterior
+            .covariance_times(&unit)
+            .expect("covariance columns");
         let annihilated = constraint.dot(&covariance);
 
         // With ĉ = V̂⁻¹ẐᵀB and AQ⁻¹ = Zᵀ exactly:
@@ -1160,7 +1208,8 @@ mod tests {
             + cholesky_backward_band(n, exact_bands.covariance_spectrum.1) * correction_norm
             + exact_bands.covariance_assembly * correction_norm
             + frobenius(&constraint)
-                * (gamma(n + 1) * product_terms + gamma(1) * (frobenius(&prior_part) + product_terms))
+                * (gamma(n + 1) * product_terms
+                    + gamma(1) * (frobenius(&prior_part) + product_terms))
             + gamma(p + 1)
                 * frobenius(
                     &abs_constraint
