@@ -607,8 +607,8 @@ pub trait BlockExcessTarget {
     fn base_neg_score(&self) -> Result<Array1<f64>, String>;
 
     /// The most bytes one node holds live while
-    /// [`Self::excess_with_displaced_neg_score_batch`] or [`Self::excess_batch`]
-    /// evaluates it inside a batch: everything the implementor allocates per node
+    /// [`Self::excess_with_displaced_neg_score_batch`], [`Self::excess_batch`] or
+    /// [`Self::excess_band_and_displaced_neg_score_batch`] evaluates it inside a batch: everything the implementor allocates per node
     /// (displacements, the returned score and its entry, row transients). A batch of
     /// `B` nodes holds at most `B` times this, and the corrector reserves exactly that
     /// on the memory governor before it evaluates a chunk, so an implementor that
@@ -663,6 +663,49 @@ pub trait BlockExcessTarget {
         }
         out
     }
+
+    /// Batched [`Self::excess_with_displaced_neg_score`] with each node's
+    /// [`Self::excess_rounding_band`] beside it, one draw per column as in
+    /// [`Self::excess_with_displaced_neg_score_batch`]: what an adaptive rule
+    /// needs to decide a node's cell and to integrate its moments, from one
+    /// evaluation of the node. A node whose excess is non-finite carries no score
+    /// and a zero band (it is decided exactly). The default composes the two
+    /// calls; implementors override to form the band from the same row sweep.
+    fn excess_band_and_displaced_neg_score_batch(
+        &self,
+        draws: &Array2<f64>,
+    ) -> Vec<BlockNodeEvaluation> {
+        let mut t = Array1::<f64>::zeros(draws.nrows());
+        self.excess_with_displaced_neg_score_batch(draws)
+            .into_iter()
+            .zip(draws.columns())
+            .map(|((excess, displaced_neg_score), column)| {
+                let rounding_band = if excess.is_finite() && displaced_neg_score.is_some() {
+                    t.assign(&column);
+                    self.excess_rounding_band(&t)
+                } else {
+                    0.0
+                };
+                BlockNodeEvaluation {
+                    excess,
+                    rounding_band,
+                    displaced_neg_score,
+                }
+            })
+            .collect()
+    }
+}
+
+/// One node of [`BlockExcessTarget::excess_band_and_displaced_neg_score_batch`].
+#[derive(Clone, Debug)]
+pub struct BlockNodeEvaluation {
+    /// `ΔF(t)`; non-finite for an infeasible node.
+    pub excess: f64,
+    /// [`BlockExcessTarget::excess_rounding_band`] at `t`; zero for an infeasible node.
+    pub rounding_band: f64,
+    /// [`BlockExcessTarget::displaced_neg_score`] at `t`; `None` exactly when the node
+    /// is infeasible.
+    pub displaced_neg_score: Option<Array1<f64>>,
 }
 
 // ───────────────────────── injected sampler traits ───────────────────────────

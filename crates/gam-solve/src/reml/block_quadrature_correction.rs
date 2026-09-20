@@ -577,6 +577,7 @@ impl<'a> RemlState<'a> {
 
         let target = Gam784BlockTarget {
             x_transformed: x_dense.as_ref(),
+            block_design: Gam784BlockDesign::new(x_dense.as_ref(), &block_vecs),
             block_vecs,
             block_lambdas,
             eta_hat,
@@ -761,7 +762,7 @@ impl<'a> RemlState<'a> {
         // a_i = Λ^{-1/2} V_bᵀ x_i.
         let mixed = if axis_split {
             let (c_obs, d_obs, e_obs) = self.hessian_cde_arrays(pirls_result)?;
-            let mut whitened = x.dot(&target.block_vecs);
+            let mut whitened = target.block_design.product.clone();
             for r in 0..m {
                 let scale = target.block_lambdas[r].sqrt().recip();
                 whitened.column_mut(r).mapv_inplace(|v| v * scale);
@@ -1244,14 +1245,14 @@ fn block_target_channel_moments(
     let x = target.x_transformed;
     let n_rows = x.nrows();
     let width = target.block_vecs.ncols();
-    let xv = x.dot(&target.block_vecs); // n × width
+    let xv = &target.block_design.product; // n × width
     let ngs_base = target
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
 
     // σ²_i = E_p[s_i²] and the shared n × width intermediates.
     let xv_ett = xv.dot(&moments.e_tt); // n × width
-    let sigma2 = (&xv_ett * &xv).sum_axis(ndarray::Axis(1)); // n
+    let sigma2 = (&xv_ett * xv).sum_axis(ndarray::Axis(1)); // n
     let mut w_xv_ett = xv_ett.clone();
     for i in 0..n_rows {
         let w_i = target.weights_obs[i];
@@ -1305,6 +1306,7 @@ fn block_axis_target<'t>(target: &Gam784BlockTarget<'t>, r: usize) -> Gam784Bloc
             .column(r)
             .to_owned()
             .insert_axis(ndarray::Axis(1)),
+        block_design: target.block_design.column(r),
         block_lambdas: Array1::from_elem(1, target.block_lambdas[r]),
         eta_hat: target.eta_hat.clone(),
         weights_obs: target.weights_obs.clone(),
