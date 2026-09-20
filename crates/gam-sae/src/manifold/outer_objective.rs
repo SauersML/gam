@@ -1339,31 +1339,22 @@ impl SaeManifoldOuterObjective {
             OuterEvaluationArtifacts::ArrowOrbit(geometry) => {
                 // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
                 // log-determinant channel and the adjoint read the orbit lane's elimination.
-                let solver = DeflatedArrowSolver::plain(&evaluation.cache);
                 self.term
                     .analytic_outer_rho_gradient_components_arrow_orbit(
                     self.target.view(),
                     rho,
                     &evaluation.loss,
                     &evaluation.cache,
-                    &solver,
                     geometry,
                 )?
             }
             OuterEvaluationArtifacts::Dense(geometry) => {
-                let lambda_smooth = rho
-                    .lambda_smooth_vec()
-                    .map_err(OuterGradientError::internal)?;
-                let solver = self
-                    .term
-                    .outer_gradient_arrow_solver(&evaluation.cache, &lambda_smooth)?;
                 self.term
                     .analytic_outer_rho_gradient_components_with_bundle(
                         self.target.view(),
                         rho,
                         &evaluation.loss,
                         &evaluation.cache,
-                        &solver,
                         None,
                         None,
                         Some(geometry),
@@ -1384,14 +1375,12 @@ impl SaeManifoldOuterObjective {
         matrix_free: &MatrixFreeOuterArtifacts,
         vectors: &[Array1<f64>],
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        let solver = DeflatedArrowSolver::plain(&evaluation.cache);
         self.term
             .analytic_outer_rho_gradient_components_with_bundle(
                 self.target.view(),
                 rho,
                 &evaluation.loss,
                 &evaluation.cache,
-                &solver,
                 // #2515/#2668 — the ranked criterion on this lane is
                 // `½log|A| + rank_charge`, coordinate block included
                 // (`rank_adjusted_quasi_laplace_complexity` takes `½log_det`, and
@@ -3968,8 +3957,9 @@ impl OuterObjective for SaeManifoldOuterObjective {
         OuterCapability {
             // The planner always has an analytic outer update. Two regimes:
             //  * Dense-admitted: the exact analytic outer gradient is assembled
-            //    from the joint-Hessian IFT (`outer_gradient_arrow_solver`), for
-            //    every assignment mode, including ordered Beta--Bernoulli (#1006).
+            //    from the exact-A logdet channels (dense spectral / arrow-orbit
+            //    geometry), for every assignment mode, including ordered
+            //    Beta--Bernoulli (#1006).
             //  * Matrix-free (dense criterion factor exceeds the in-core budget,
             //    e.g. large-K / wide-border duchon): the rational value emits one
             //    frozen inverse-probe bundle, and the complete gradient consumes
@@ -4191,16 +4181,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // half of that gradient entry, and the scaled-block residual carries the
         // `½·R̃_ℓ` half through the data term.
         let cost = cost + self.block_jacobian(&rho_state);
-        // The gradient is the EXACT implicit derivative: `outer_gradient_arrow_
-        // solver` solves the implicit-function system through the rank-revealing
-        // gauge/decoder-null deflation (Rayleigh-band + Faddeev–Popov stiffness),
-        // and a genuinely singular system surfaced above as a typed
-        // `OuterGradientError` instead of a degraded direction. No secondary
-        // finite-difference safeguard is layered on top (SPEC: FD never leaves
-        // tests) — a near-flat inner direction that corrupts the `Γ·θ̂_ρ`
-        // envelope term is a deflation-candidate gap to fix in
-        // `outer_gradient_arrow_solver`, not something to paper over with a
-        // differenced value path.
+        // The gradient is the EXACT implicit derivative: the exact-A geometry
+        // (dense spectral quotient or arrow orbit) or the frozen probe bundle
+        // supplies the logdet traces and the stationarity adjoint through its
+        // own priced null policy, and a genuinely singular system surfaced
+        // above as a typed `OuterGradientError` instead of a degraded
+        // direction. No secondary finite-difference safeguard is layered on
+        // top (SPEC: FD never leaves tests) — a near-flat inner direction that
+        // corrupts the `Γ·θ̂_ρ` envelope term is a gap to fix in that geometry,
+        // not something to paper over with a differenced value path.
         self.current_rho = rho_state;
         self.last_loss = Some(evaluation.loss);
         self.record_search_criterion(cost, Some(gradient.dot(&gradient).sqrt()));

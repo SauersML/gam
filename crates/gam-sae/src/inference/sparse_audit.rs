@@ -438,7 +438,7 @@ pub fn run_sparse_sae_audit(
         &quantiles,
     )?;
 
-    let (dual, coordinate_reports) = if block_size == 1 {
+    let (dual, coordinate_reports, coordinate_block_ids) = if block_size == 1 {
         let report = crate::dual_certificate::sparse_route_dual_certificate(
             data_values.view(),
             decoder_values.view(),
@@ -446,7 +446,7 @@ pub fn run_sparse_sae_audit(
             route.values.index_axis(ndarray::Axis(2), 0),
             max_candidates,
         )?;
-        (report, Vec::new())
+        (report, Vec::new(), Vec::new())
     } else {
         let report = crate::dual_certificate::block_route_dual_certificate(
             data_values.view(),
@@ -457,6 +457,7 @@ pub fn run_sparse_sae_audit(
             max_candidates,
         )?;
         let mut coordinates = Vec::new();
+        let mut coordinate_block_ids = Vec::new();
         if block_size >= 2 && block_size % 2 == 0 {
             let total_blocks = decoder_values.nrows() / block_size;
             let blocks = coordinate_blocks
@@ -474,12 +475,14 @@ pub fn run_sparse_sae_audit(
                     n_units,
                     block,
                 )?);
+                coordinate_block_ids.push(block);
             }
         }
-        (report, coordinates)
+        (report, coordinates, coordinate_block_ids)
     };
 
-    let topology_records = topology_records_from_codes(&coordinate_reports, block_size);
+    let topology_records =
+        topology_records_from_codes(&coordinate_reports, &coordinate_block_ids, block_size);
     let atlas_data = data_values.mapv(f64::from);
     let atlas_nerve = atlas_nerve_from_sparse_route(
         &route,
@@ -898,8 +901,12 @@ fn standing_sparse_null_calibration(
     Ok(Some(nb::ClaimNullCalibration::from_calibrated_roc(report)?))
 }
 
+/// One topology record per coordinate report. `block_ids[i]` is the dictionary
+/// block `coordinate_reports[i]` was read from; a report carries no block of its
+/// own, and a block that never fires has no firing to read one from.
 fn topology_records_from_codes(
     coordinate_reports: &[crate::sparse_dict::BlockCoordinateReport],
+    block_ids: &[usize],
     block_size: usize,
 ) -> Vec<AuditTopologyRecord> {
     if block_size == 1 {
@@ -917,7 +924,7 @@ fn topology_records_from_codes(
         b2: None,
     };
     let mut records = Vec::with_capacity(coordinate_reports.len());
-    for report in coordinate_reports {
+    for (report, &block) in coordinate_reports.iter().zip(block_ids) {
         let live: Vec<_> = report
             .firings
             .iter()
@@ -930,7 +937,7 @@ fn topology_records_from_codes(
                 b2: None,
             };
             records.push(AuditTopologyRecord {
-                atom: report.firings.first().map_or(0, |firing| firing.block),
+                atom: block,
                 support_size: live.len(),
                 landmark_count: live.len(),
                 covering_side: "below_covering_number".to_string(),
@@ -957,7 +964,7 @@ fn topology_records_from_codes(
             &crate::manifold::SaeAtomBasisKind::Periodic,
         ) {
             records.push(AuditTopologyRecord {
-                atom: live[0].block,
+                atom: block,
                 support_size: verdict.support_size,
                 landmark_count: verdict.landmark_count,
                 covering_side: verdict.covering_side.as_str().to_string(),
@@ -992,4 +999,24 @@ fn sparse_atlas_nerve_richness_statistic(
         return Err("atlas nerve richness overflowed finite reporting range".to_string());
     }
     Ok(richness)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_block_that_never_fires_keeps_its_own_block_id() {
+        let silent = crate::sparse_dict::BlockCoordinateReport {
+            sigma_hat: 0.0,
+            mean_radius: 0.0,
+            n_firings: 0,
+            firings: Vec::new(),
+        };
+        let records = topology_records_from_codes(&[silent], &[5], 2);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].atom, 5);
+        assert_eq!(records[0].support_size, 0);
+        assert_eq!(records[0].measured_betti.b0, 0);
+    }
 }
