@@ -28,8 +28,10 @@
 //!
 //! `D′` needs no rows. The unpenalized fit is one Newton step from `β̂` in the
 //! same `W`: with `d = XᵀW(z − Xβ̂) = S(λ)β̂ = Hβ̂ − Gβ̂` it is
-//! `β̂ + G⁺d`, and `D′ = ‖z − Xβ̂‖²_W − dᵀG⁺d`. The fit supplies the penalized
-//! working residual `‖z − Xβ̂‖²_W` and its row count `n⁺`
+//! `β̂ + G⁺d`, and `D′ = ‖z − Xβ̂‖²_W − dᵀG⁺d`, for any generalized inverse
+//! `G⁺` since `d ∈ range(G)`. `rank(G)` is decided on the Jacobi-equilibrated
+//! Gram, so neither `D′` nor `ν` depends on the units of a column. The fit
+//! supplies the penalized working residual `‖z − Xβ̂‖²_W` and its row count `n⁺`
 //! ([`WorkingResidual`]); the ratio `Q` does not depend on the units of `W`, so
 //! the same construction serves a family whose `W` already carries `1/φ̂`.
 //!
@@ -119,6 +121,7 @@ use ndarray::{Array1, Array2, ArrayView1};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
+use crate::inference::random_effect_test::equilibrated_pseudo_inverse;
 use crate::inference::smooth_test::SmoothTestResult;
 
 /// Inputs to [`smooth_score_test`]. `beta`, `penalized_hessian` (`H = G + S(λ)`)
@@ -378,19 +381,14 @@ fn unpenalized_residual(
     residual: WorkingResidual,
 ) -> Result<(f64, f64), SmoothScoreTestRefusal> {
     let d = b - &g.dot(&beta);
-    let (evals, evecs) = symmetrized(g)
-        .eigh(faer::Side::Lower)
-        .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
-    let tolerance = crate::basis::spectral_tolerance(&evals);
-    let mut rank = 0usize;
-    let mut explained = 0.0;
-    for (i, &value) in evals.iter().enumerate() {
-        if value > tolerance {
-            let projection = evecs.column(i).dot(&d);
-            explained += projection * projection / value;
-            rank += 1;
-        }
-    }
+    // `rank(G)` is the column rank of `X`, which no column's units change, so
+    // it is decided on the Jacobi-equilibrated Gram: judged against the raw
+    // `λ_max(G)`, a calendar-year column beside a spline basis sent the basis's
+    // real small directions to the null space (gam#4415). `d` lies in
+    // `range(G)`, so `dᵀG⁻d` is the same for every generalized inverse.
+    let inverse = equilibrated_pseudo_inverse(g).ok_or(SmoothScoreTestRefusal::InconsistentFit)?;
+    let rank = inverse.rank;
+    let explained = d.dot(&inverse.inverse.dot(&d));
     let df = residual.rows as f64 - rank as f64;
     let deviance = residual.weighted_norm - explained;
     // `‖z − Xβ̂‖²_W` sums `n⁺` terms and `dᵀG⁺d` sums `rank` more; a difference
@@ -951,6 +949,39 @@ mod tests {
         let rss: f64 = residual.iter().zip(design.weights.iter()).map(|(r, w)| w * r * r).sum();
         assert_eq!(df, (design.x.nrows() - design.x.ncols()) as f64);
         assert!((deviance - rss).abs() <= 1e-9 * rss, "D′ {deviance} vs unpenalized RSS {rss}");
+    }
+
+    /// The units of a column are not a property of the model: the linear
+    /// column `x1` recorded `2¹²` times finer, `X → X·T` with `T = diag(t)`, is
+    /// the same fit with `G → TGT`, `β̂ → T⁻¹β̂`, `Hβ̂ → T·Hβ̂` and the same working
+    /// residual. The scale is a power of two, so each of those is exact in IEEE
+    /// arithmetic and the Jacobi-equilibrated Gram the rank is decided on is
+    /// bitwise the same matrix: `(D′, ν)` must be bitwise equal, with `ν = n − p`.
+    /// Judged against the raw `λ_max(G)`, this rescaling alone dropped one of the
+    /// fourteen ranks (gam#4415).
+    #[test]
+    fn the_scale_does_not_depend_on_the_units_of_a_column() {
+        let design = design(40);
+        let mut rng = StdRng::seed_from_u64(0x4415);
+        let fitted = fit(&design, &null_response(&design, &mut rng));
+        // Both charts are built the same way, so every product runs on arrays
+        // of one memory layout and the only difference is the exact scaling.
+        let in_units = |units: &Array1<f64>| {
+            let congruent = |matrix: &Array2<f64>| {
+                Array2::from_shape_fn(matrix.dim(), |(a, b)| units[a] * matrix[[a, b]] * units[b])
+            };
+            let beta = Array1::from_shape_fn(units.len(), |a| fitted.beta[a] / units[a]);
+            let hessian = congruent(&fitted.hessian);
+            let gram = congruent(&fitted.gram);
+            unpenalized_residual(&hessian.dot(&beta), &gram, beta.view(), fitted.residual)
+                .expect("the unpenalized residual is resolved")
+        };
+        let mut units = Array1::<f64>::ones(design.x.ncols());
+        let base = in_units(&units);
+        units[1] = 4096.0;
+        let rescaled = in_units(&units);
+        assert_eq!(base.1, (design.x.nrows() - design.x.ncols()) as f64);
+        assert_eq!(base, rescaled);
     }
 
     /// At small `n` with the other terms penalized, the penalized residual
