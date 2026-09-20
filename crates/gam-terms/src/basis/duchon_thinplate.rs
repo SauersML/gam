@@ -1466,7 +1466,7 @@ pub(crate) fn thin_plate_polynomial_basis_dimension(dimension: usize) -> usize {
 /// non-associativity lets a reordering perturb the Gram by an ulp. The reparam
 /// eigendecomposition fed by this Gram is near-degenerate (the thin-plate radial
 /// spectrum has a long low-curvature tail), so that ulp rotates its eigenvectors
-/// and makes the fitted `s(x, bs="tp")` basis — and hence the curve — depend on
+/// and makes the fitted `s(x, bs="tps")` basis — and hence the curve — depend on
 /// row order. That is the residual ~2e-7 row-permutation drift owed under
 /// gam#1378 that survives the value-anchored knot set and centroid seed (the
 /// local `bs="cr"/"ps"` bases never form this data-metric radial Gram, so they
@@ -1902,7 +1902,7 @@ fn select_thin_plate_knot_rows(
     // points that are symmetric about the mean (the common 1-D case), so the
     // `dist2_to_centroid` comparisons below stop reducing to the
     // value-lexicographic tie-break and the seed — and hence the whole knot set
-    // — flips with row order. That is the residual ~1e-7 `s(x, bs="tp")`
+    // — flips with row order. That is the residual ~1e-7 `s(x, bs="tps")`
     // row-permutation drift owed under gam#1378 (value-anchored `bs="cr"/"ps"`
     // stayed bit-stable because they never seed off this centroid). Sorting the
     // column values yields the identical addition sequence for every permutation
@@ -4065,7 +4065,7 @@ mod retained_radial_indices_tests {
     use ndarray::Array1;
 
     // The eigenvalue spectra below were captured from the live thin-plate
-    // builder (`s(x, bs="tp", k=20)`) on the #1271 regression data. They lock
+    // builder (`s(x, bs="tps", k=20)`) on the #1271 regression data. They lock
     // in the derived selection behaviour: keep EVERY numerically-real bending
     // mode (matching mgcv, which truncates only at the numerical-rank floor),
     // dropping only sub-floor roundoff dust — no tuned magnitude cutoff.

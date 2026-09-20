@@ -203,7 +203,6 @@ fn seeded_term_of_kind(
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: minimal.refine_routing,
-        seed_refine_random_state: 45,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,

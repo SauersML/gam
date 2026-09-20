@@ -13,7 +13,7 @@ c = CASES["tiny_n5"](); tryfit(c["data"], "y ~ s(x, k=20)")
 c = CASES["two_unique"]()
 for f in ["y ~ s(x)", "y ~ s(x, k=3)", "y ~ s(x, k=4)", "y ~ x"]: tryfit(c["data"], f)
 c = CASES["three_unique"]()
-for f in ["y ~ s(x)", "y ~ s(x, k=3)", "y ~ s(x, k=5)", "y ~ s(x, bs='tp')"]: tryfit(c["data"], f)
+for f in ["y ~ s(x)", "y ~ s(x, k=3)", "y ~ s(x, k=5)", "y ~ s(x, bs='tps')"]: tryfit(c["data"], f)
 r=np.random.default_rng(0)
 for nu in [4,5,6,8,10,16]:
     x = r.integers(0, nu, 400).astype(float); y = np.sin(x) + r.normal(0,.3,400)

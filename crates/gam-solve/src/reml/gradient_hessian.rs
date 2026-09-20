@@ -3490,13 +3490,13 @@ impl<'a> RemlState<'a> {
     /// priors also need the log-precision Jacobian. Every distribution consumer
     /// adds the same correction to the fitting criterion.
     ///
-    /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
-    /// log-density and its gradient, and no consumer of this correction needs
-    /// its curvature.
+    /// The samplers consume the cost and gradient; the curvature (diagonal,
+    /// since every term is per-coordinate) is what places them on the sampled
+    /// density's own Laplace geometry (#3293).
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
+    ) -> Result<crate::rho_prior_eval::DistributionCorrection, EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.
@@ -3699,27 +3699,163 @@ impl<'a> RemlState<'a> {
         })
     }
 
-    /// The row weights `W` of the data curvature `XᵀWX` that the penalized
-    /// Hessian `XᵀWX + S_λ` carries at `rho`. On the Gaussian identity link the
-    /// working weight is the prior weight, so no solve is needed; otherwise it
-    /// is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the cached P-IRLS
-    /// solve at `rho`, and a refused solve is returned as its error.
-    pub(crate) fn data_curvature_weights(
+    /// Pin every λ-search-frozen likelihood nuisance (NB θ, Tweedie φ, Gamma
+    /// shape, Beta precision, GLM dispersion) that the outer loop has already
+    /// captured into `likelihood`, so each inner solve of the λ search, and
+    /// every quantity read off the search's likelihood, sees the same
+    /// stationary criterion `F(ρ) = REML(ρ, ψ_frozen)`.
+    pub(crate) fn apply_lambda_search_freezes(
         &self,
-        rho: &Array1<f64>,
-    ) -> Result<Array1<f64>, EstimationError> {
-        if reml_is_gaussian_identity(&self.config.likelihood) {
-            return Ok(self.weights.to_owned());
-        }
-        let (pilot, _) = self.execute_pirls_if_needed(rho, BundleRows::Observed)?;
-        if pilot.solveweights.len() != self.weights.len() {
-            return Err(EstimationError::InvalidInput(format!(
-                "P-IRLS returned {} working weights for {} rows",
-                pilot.solveweights.len(),
-                self.weights.len()
-            )));
-        }
-        Ok(pilot.solveweights.to_owned())
+        likelihood: &mut GlmLikelihoodSpec,
+    ) -> Result<(), EstimationError> {
+        let resolved_likelihood_scale = likelihood
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
+        // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
+        // the inner solver re-derives θ from each outer iterate's warm-start
+        // η, so the NB working response / deviance / penalty-logdet — and
+        // thus the REML criterion — drift every outer evaluation, defeating
+        // the projected-gradient convergence test and grinding the loop to
+        // max_iter. Once the first non-screening solve has fixed a
+        // data-driven θ (captured into `frozen_negbin_theta` by
+        // `execute_pirls_if_needed`), pin every subsequent λ-search inner
+        // solve to that value so
+        // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
+        // still ML-refreshed at the single final reported fit (the
+        // `refine_dispersion_at_converged_eta = true` accept-fit in
+        // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
+        // requires. No effect on non-NB or user-fixed-θ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_negbin_theta.load(Ordering::Relaxed),
+            "frozen negative-binomial theta",
+            |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
+        )?;
+        // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
+        // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
+        // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
+        // re-estimated from each outer iterate's warm-start η does not merely
+        // make `F(ρ)` drift — it makes the criterion REWARD dispersion
+        // inflation, railing a double-penalty null-space `λ` to the box bound
+        // and shipping a boundary blow-up (#1477). Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Tweedie or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Tweedie {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_tweedie_phi.load(Ordering::Relaxed),
+            "frozen Tweedie dispersion",
+            |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
+        )?;
+        // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
+        // θ and Tweedie φ freezes above: with the shape `k` estimated, the
+        // inner solver re-derives it from each outer iterate's warm-start η,
+        // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
+        // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
+        // dropped, #359) — jumps with ρ. The realized REML cost then develops
+        // deterministic spikes (a flat warm-start η at a just-rejected
+        // over-smoothed trial gives a small `k`, the fitted-surface η at the
+        // neighbor a ~2× larger one), the analytic outer gradient (which
+        // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
+        // projected gradient floors well above tolerance, and the ARC descent
+        // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
+        // tensor under-recovery). Pin every λ-search inner solve to the first
+        // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
+        // stationary in ρ; `k` is still refreshed at the single final
+        // reported fit. No effect on non-Gamma or user-fixed-shape specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Gamma {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_gamma_shape.load(Ordering::Relaxed),
+            "frozen Gamma shape",
+            |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
+        )?;
+        // Beta λ-search precision freeze (#2369). Same drift mechanism as the
+        // NB θ / Tweedie φ / Gamma shape freezes above, and the same
+        // stalled-outer symptom: with φ estimated, the inner solver
+        // re-derives it by the Pearson moment estimator from each outer
+        // iterate's warm-start η. The Beta precision does not factor out of
+        // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
+        // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
+        // log-det terms with ρ; the analytic outer gradient holds φ fixed and
+        // can never match that motion, the projected gradient floors above
+        // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
+        // fit — the family-unusable #2369 signature. Pin every λ-search inner
+        // solve to the first converged solve's Pearson φ so
+        // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
+        // at the single final reported fit. No effect on non-Beta or
+        // user-fixed-φ specs.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::BetaPrecision {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_beta_phi.load(Ordering::Relaxed),
+            "frozen Beta precision",
+            |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
+        )?;
+        // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
+        // same λ-search freeze as the Tweedie φ.
+        apply_frozen_search_scale(
+            likelihood,
+            matches!(
+                resolved_likelihood_scale,
+                gam_problem::ResolvedLikelihoodScale::Dispersion {
+                    estimated: true,
+                    ..
+                }
+            ),
+            self.frozen_dispersion_phi.load(Ordering::Relaxed),
+            "frozen dispersion",
+            |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
+        )?;
+        Ok(())
+    }
+
+    /// The row weights `W` of the data curvature `XᵀWX` that the λ search's
+    /// penalized Hessian `XᵀWX + S_λ` starts from: the Fisher working weight
+    /// `w·(dμ/dη)²/V(μ)` at the cold P-IRLS start, under the search's likelihood
+    /// with every captured λ-search nuisance pinned
+    /// ([`pirls::start_working_weights`]). No inner solve runs, so the weights
+    /// exist at every ρ, including where the solve refuses; they refuse only when
+    /// the start itself is outside the family's domain (a non-positive mean
+    /// under a reciprocal link), where no fit exists either.
+    pub(crate) fn start_curvature_weights(&self) -> Result<Array1<f64>, EstimationError> {
+        let mut pirls_config = self.config.as_pirls_config();
+        pirls_config.link_kind = self.runtime_inverse_link();
+        self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
+        pirls::start_working_weights(
+            self.x(),
+            self.y,
+            self.weights,
+            self.offset.view(),
+            &pirls_config,
+        )
     }
 
     /// mgcv-style analytic initial smoothing-parameter seed (`initial.sp`).
@@ -3732,16 +3868,17 @@ impl<'a> RemlState<'a> {
     /// carries the working-weight magnitude, `exp(ρ_j)` is already the correctly
     /// scaled `λ_j` (no separate weight anchoring needed).
     ///
-    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` of the pilot fit at
-    /// `base`, not the prior weight: only the working weight makes the seed
-    /// equivariant under a change of units of `y`. Rescaling `y → c·y` scales
-    /// the working weight of a non-log link by a power of `c` (`μ³/4` for the
-    /// inverse-Gaussian `1/μ²` link, `μ²` for the Gamma inverse link) and the
-    /// optimal `λ` with it; a prior-weight seed stays put, so in small units it
-    /// sits on the over-smoothing plateau `λ → ∞`, where the REML gradient
-    /// vanishes and the outer solve certifies the intercept-only fit. For the
-    /// Gaussian identity link the working weight IS the prior weight, so no
-    /// pilot fit is needed there.
+    /// `W` is the Fisher working weight `w·(dμ/dη)²/V(μ)` at the cold P-IRLS
+    /// start ([`Self::start_curvature_weights`]), not the prior weight: only a
+    /// working weight makes the seed equivariant under a change of units of
+    /// `y`. Rescaling `y → c·y` scales the working weight of a non-log link by a
+    /// power of `c` (`μ³/4` for the inverse-Gaussian `1/μ²` link, `μ²` for the
+    /// Gamma inverse link) and the optimal `λ` with it; a prior-weight seed
+    /// stays put, so in small units it sits on the over-smoothing plateau
+    /// `λ → ∞`, where the REML gradient vanishes and the outer solve certifies
+    /// the intercept-only fit. The start weight needs no pilot solve, so the
+    /// seed exists even where the inner solve at `base` refuses, which is where
+    /// a second start matters most.
     ///
     /// This replaces the banned log-λ **grid** prepass (#2069 / #1575): a single
     /// data-derived estimate, no lattice search. A smooth whose penalized
@@ -3755,11 +3892,10 @@ impl<'a> RemlState<'a> {
     /// same 1:1 layout the λ-assembly uses); any trailing ext/ψ coordinates in
     /// `base` are not smoothing parameters and are passed through unchanged.
     /// Returns `Ok(None)` only when there is no smoothing coordinate to seed.
-    /// Every failure is an `Err` with its own type: the pilot P-IRLS solve at
-    /// `base` (the cached solve the caller's `compute_cost(&base)` also runs),
-    /// the design Gram diagonal, and a pilot or Gram whose length disagrees with
-    /// the problem's. The caller decides which of those a seed search can step
-    /// past; this function does not turn any of them into "no candidate".
+    /// Every failure is an `Err` with its own type: a start outside the
+    /// family's domain (no inner solve could start from that data either), the
+    /// design Gram diagonal, and a Gram whose length disagrees with the
+    /// problem's.
     pub(crate) fn analytic_initial_sp_rho(
         &self,
         base: &Array1<f64>,
@@ -3770,7 +3906,7 @@ impl<'a> RemlState<'a> {
         if n_rho == 0 {
             return Ok(None);
         }
-        let weights = self.data_curvature_weights(base)?;
+        let weights = self.start_curvature_weights()?;
         let gram_diag = self.x.diag_gram(&weights).map_err(|reason| {
             EstimationError::RemlOptimizationFailed(format!(
                 "analytic initial-sp seed: design Gram diagonal unavailable: {reason}"
@@ -6723,132 +6859,7 @@ impl<'a> RemlState<'a> {
                 );
             }
             pirls_config.link_kind = self.runtime_inverse_link();
-            let resolved_likelihood_scale = pirls_config
-                .likelihood
-                .resolved_scale()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            // Negative-Binomial λ-search θ freeze (#1082). With θ estimated,
-            // the inner solver re-derives θ from each outer iterate's warm-start
-            // η, so the NB working response / deviance / penalty-logdet — and
-            // thus the REML criterion — drift every outer evaluation, defeating
-            // the projected-gradient convergence test and grinding the loop to
-            // max_iter. Once the first converged solve has fixed a
-            // data-driven θ (captured below into `frozen_negbin_theta`), pin
-            // every subsequent λ-search inner solve to that value so
-            // `F(ρ) = REML(ρ, θ_frozen)` is a stationary function of ρ. θ is
-            // still ML-refreshed at the single final reported fit (the
-            // `refine_dispersion_at_converged_eta = true` accept-fit in
-            // `optimizer.rs`), exactly as the dispersion-at-converged-η contract
-            // requires. No effect on non-NB or user-fixed-θ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_negbin_theta.load(Ordering::Relaxed),
-                "frozen negative-binomial theta",
-                |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-            )?;
-            // Tweedie λ-search φ freeze (#1477). The same drift mechanism as the
-            // NB θ freeze above, with a sharper failure mode: the Tweedie LAML
-            // `−ℓ(β̂)` omits the φ-dependent saddlepoint normalizer, so a φ
-            // re-estimated from each outer iterate's warm-start η does not merely
-            // make `F(ρ)` drift — it makes the criterion REWARD dispersion
-            // inflation, railing a double-penalty null-space `λ` to the box bound
-            // and shipping a boundary blow-up (#1477). Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Tweedie or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Tweedie {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_tweedie_phi.load(Ordering::Relaxed),
-                "frozen Tweedie dispersion",
-                |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-            )?;
-            // Gamma λ-search shape freeze (#1074). Same drift mechanism as the NB
-            // θ and Tweedie φ freezes above: with the shape `k` estimated, the
-            // inner solver re-derives it from each outer iterate's warm-start η,
-            // so `k` — and through it BOTH the Gamma curvature `H = k·XᵀX + λS`
-            // and the data-fit `−ℓ = k·½D` (the `k`-saturated normalizer is
-            // dropped, #359) — jumps with ρ. The realized REML cost then develops
-            // deterministic spikes (a flat warm-start η at a just-rejected
-            // over-smoothed trial gives a small `k`, the fitted-surface η at the
-            // neighbor a ~2× larger one), the analytic outer gradient (which
-            // holds `k` fixed) can never match the cost's `k(ρ)` motion, the
-            // projected gradient floors well above tolerance, and the ARC descent
-            // stalls and rails λ to the over-smoothed corner (the #1074 te/Gamma
-            // tensor under-recovery). Pin every λ-search inner solve to the first
-            // converged solve's MLE `k` so `F(ρ) = REML(ρ, k_frozen)` is
-            // stationary in ρ; `k` is still refreshed at the single final
-            // reported fit. No effect on non-Gamma or user-fixed-shape specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Gamma {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_gamma_shape.load(Ordering::Relaxed),
-                "frozen Gamma shape",
-                |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-            )?;
-            // Beta λ-search precision freeze (#2369). Same drift mechanism as the
-            // NB θ / Tweedie φ / Gamma shape freezes above, and the same
-            // stalled-outer symptom: with φ estimated, the inner solver
-            // re-derives it by the Pearson moment estimator from each outer
-            // iterate's warm-start η. The Beta precision does not factor out of
-            // the digamma mean score (`∂ℓ/∂β = φ·Σ xᵢ(y*ᵢ − μ*ᵢ)`), so a φ that
-            // swings with η moves BOTH the mean fit β̂(ρ) and the REML data-fit /
-            // log-det terms with ρ; the analytic outer gradient holds φ fixed and
-            // can never match that motion, the projected gradient floors above
-            // tolerance, and the optimizer refuses ("NOT STATIONARY") for EVERY
-            // fit — the family-unusable #2369 signature. Pin every λ-search inner
-            // solve to the first converged solve's Pearson φ so
-            // `F(ρ) = REML(ρ, φ_frozen)` is stationary in ρ; φ is still refreshed
-            // at the single final reported fit. No effect on non-Beta or
-            // user-fixed-φ specs.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_beta_phi.load(Ordering::Relaxed),
-                "frozen Beta precision",
-                |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-            )?;
-            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-            // same λ-search freeze as the Tweedie φ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Dispersion {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_dispersion_phi.load(Ordering::Relaxed),
-                "frozen dispersion",
-                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-            )?;
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
             // Levenberg-Marquardt damping warm-start: the λ the previous
             // successful PIRLS solve at this surface ended on (0 = no hint).
             // It encodes the curvature regime that solve settled into; PIRLS
@@ -7555,86 +7566,7 @@ mod stateless_pirls_tests {
         ) -> Result<Arc<PirlsResult>, EstimationError> {
             let mut pirls_config = self.config.as_pirls_config();
             pirls_config.link_kind = self.runtime_inverse_link();
-            let resolved_likelihood_scale = pirls_config
-                .likelihood
-                .resolved_scale()
-                .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-            // Pin the same λ-search-frozen NB θ the outer loop converged under
-            // (#1082), so the fit is evaluated on the identical stationary surface
-            // F(ρ) = REML(ρ, θ_frozen) rather than re-estimating θ at this ρ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::NegativeBinomial {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_negbin_theta.load(Ordering::Relaxed),
-                "frozen negative-binomial theta",
-                |likelihood, value| likelihood.with_negbin_theta_frozen_for_search(value),
-            )?;
-            // Pin the same λ-search-frozen Tweedie φ the outer loop converged under
-            // (#1477).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Tweedie {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_tweedie_phi.load(Ordering::Relaxed),
-                "frozen Tweedie dispersion",
-                |likelihood, value| likelihood.with_tweedie_phi_frozen_for_search(value),
-            )?;
-            // Pin the same λ-search-frozen Gamma shape the outer loop converged under
-            // (#1074).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Gamma {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_gamma_shape.load(Ordering::Relaxed),
-                "frozen Gamma shape",
-                |likelihood, value| likelihood.with_gamma_shape_frozen_for_search(value),
-            )?;
-            // Beta precision is part of the same λ-search-frozen likelihood scale
-            // contract as NB, Tweedie, and Gamma (#2369, #2632).
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::BetaPrecision {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_beta_phi.load(Ordering::Relaxed),
-                "frozen Beta precision",
-                |likelihood, value| likelihood.with_beta_phi_frozen_for_search(value),
-            )?;
-            // Gaussian (non-identity link) / inverse Gaussian dispersion φ: the
-            // same λ-search freeze as the Tweedie φ.
-            apply_frozen_search_scale(
-                &mut pirls_config.likelihood,
-                matches!(
-                    resolved_likelihood_scale,
-                    gam_problem::ResolvedLikelihoodScale::Dispersion {
-                        estimated: true,
-                        ..
-                    }
-                ),
-                self.frozen_dispersion_phi.load(Ordering::Relaxed),
-                "frozen dispersion",
-                |likelihood, value| likelihood.with_dispersion_phi_frozen_for_search(value),
-            )?;
+            self.apply_lambda_search_freezes(&mut pirls_config.likelihood)?;
 
             // Gaussian + Identity outer REML reuses a precomputed XᵀWX and
             // XᵀW(y − offset) across every inner solve; for other families /
