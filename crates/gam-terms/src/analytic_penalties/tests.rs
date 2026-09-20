@@ -2657,8 +2657,10 @@ fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
 // ---------------------------------------------------------------------------
 // Central-difference consistency for analytic derivatives that had no FD pin:
 // smoothed total variation (path and graph operators), soft monotonicity, the
-// iVAE ridge conditional-mean gauge, and the normalized cross-Gram composition
-// behind the decoder-incoherence and subspace-overlap priors.
+// iVAE ridge conditional-mean gauge, group-lasso block sparsity, the coupled
+// row-precision prior, the Stiefel orthogonality gauge, and the normalized
+// cross-Gram composition behind the decoder-incoherence and subspace-overlap
+// priors.
 //
 // Tolerance derivation. A central difference with step h along a probe v has
 // truncation error h²/6 · |∂³_v f| and roundoff ≈ u·|f|/h (u = 2.2e-16). The
@@ -3031,4 +3033,111 @@ fn normalized_cross_gram_self_gram_norm_derivatives_match_fd() {
     assert_normalized_cross_gram_derivatives_match_fd(
         normalized_gram::GramNormalization::SelfGramNorm,
     );
+}
+
+#[test]
+fn block_sparsity_derivatives_match_fd() {
+    // Row-major (4, 3) block. Group {0, 2} sits in the L² regime (norm ≫ ε),
+    // where the rank-one −x xᵀ/s³ correction nearly cancels I/s along x;
+    // group {1} has entries ≪ ε, so its smoothed norm stays in the quadratic
+    // regime s ≈ ε.
+    let t = array![
+        0.8_f64, 0.02, -0.5, -0.3, -0.03, 1.1, 0.6, 0.01, 0.2, -0.9, 0.04, -0.4
+    ];
+    let probes = vec![
+        array![0.5_f64, -1.0, 0.3, 0.7, 0.4, -0.6, -0.2, 0.9, 1.1, 0.3, -0.5, 0.8],
+        array![-0.7_f64, 0.2, 1.0, -0.4, 0.6, 0.1, 0.9, -0.3, -0.8, 0.5, 0.7, -0.2],
+    ];
+    let rho = array![0.15_f64];
+    let pen = BlockSparsityPenalty::new(
+        PsiSlice::full(12, Some(3)),
+        vec![vec![0, 2], vec![1]],
+        0.9,
+        4,
+        0.3,
+        true,
+    )
+    .expect("valid block sparsity");
+    assert_penalty_derivatives_match_fd("block sparsity", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("block sparsity", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]].abs())
+        );
+    }
+}
+
+#[test]
+fn row_precision_prior_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.35_f64];
+    // One symmetric positive-definite precision per row, with off-diagonal
+    // coupling so the Hessian is not diagonal.
+    let lambda = array![
+        [[2.0_f64, 0.6], [0.6, 1.0]],
+        [[1.5, -0.4], [-0.4, 0.9]],
+        [[0.7, 0.2], [0.2, 2.2]],
+        [[3.0, 1.1], [1.1, 1.4]],
+        [[1.2, -0.5], [-0.5, 0.8]]
+    ];
+    let pen = RowPrecisionPriorPenalty::new(PsiSlice::full(10, Some(2)), lambda, 1.4, 5, true)
+        .expect("valid row-precision prior");
+    // grad_rho carries the normalizer derivative −½·len alongside ½μ·tᵀΛt.
+    assert_penalty_derivatives_match_fd("row precision", &pen, t.view(), rho.view(), &probes);
+    assert!(
+        pen.hessian_diag(t.view(), rho.view()).is_none(),
+        "a coupled per-row precision has no diagonal Hessian"
+    );
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("row precision", &dense, &pen, t.view(), rho.view(), &probes);
+}
+
+/// ½·(μ/n)·‖TᵀT − I‖²_F is quartic and nonconvex, so it is checked outside the
+/// convex helper: value→`grad_target`, `grad_target`→`hvp`, the materialized
+/// Hessian against `hvp`, and value→`grad_rho`.
+#[test]
+fn orthogonality_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.2_f64];
+    let pen = OrthogonalityPenalty::new(PsiSlice::full(10, Some(2)), 2, 1.1, 5, true)
+        .expect("valid orthogonality penalty");
+    let h = DERIV_FD_STEP;
+    let grad = pen.grad_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_fd_close(&format!("orthogonality grad[{i}]"), grad[i], fd);
+    }
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let step = v.mapv(|x| x * h);
+        let gp = pen.grad_target((&t + &step).view(), rho.view());
+        let gm = pen.grad_target((&t - &step).view(), rho.view());
+        for i in 0..t.len() {
+            assert_fd_close(
+                &format!("orthogonality hvp[{k}][{i}]"),
+                hv[i],
+                (gp[i] - gm[i]) / (2.0 * h),
+            );
+        }
+    }
+    let t_mat = pen.target_matrix(t.view()).expect("(5, 2) target");
+    let m = OrthogonalityPenalty::gram_minus_identity(t_mat);
+    let dense = pen.as_dense_with_precomputed_m(t_mat, m.view(), pen.scale(rho.view()));
+    assert_dense_matches_hvp("orthogonality", &dense, &pen, t.view(), rho.view(), &probes);
+    let grad_rho = pen.grad_rho(t.view(), rho.view());
+    let mut rp = rho.clone();
+    let mut rm = rho.clone();
+    rp[0] += h;
+    rm[0] -= h;
+    let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * h);
+    assert_fd_close("orthogonality grad_rho", grad_rho[0], fd);
 }
