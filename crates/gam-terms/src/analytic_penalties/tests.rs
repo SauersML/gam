@@ -3041,3 +3041,95 @@ fn ivae_ridge_mean_gauge_is_the_ridge_objective_and_its_derivatives_match_centra
         epsilon = 1e-10 * expected.abs().max(1.0)
     );
 }
+
+// ----- BlockSparsityPenalty tests -----
+
+/// The group-lasso penalty's only Rust test compared the frozen operator's
+/// diagonal and log-determinant with `as_dense`. Nothing checked `as_dense`,
+/// `grad_target`, `hvp` or `grad_rho` against the value itself. This pins
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional) and
+/// value -> `grad_rho` (learnable log-weight) against central differences.
+/// It also checks the `as_dense` columns against `hvp` of the unit vectors,
+/// `diag_target` against the dense diagonal, and that the Hessian
+/// `w √|g| (I/s - x xᵀ/s³)` of the smoothed norm `s = √(‖x‖² + ε²)` is
+/// positive definite: its smallest eigenvalue per group is `w √|g| ε²/s³ > 0`.
+///
+/// Tolerances. The smoothed norm's directional derivatives are bounded by
+/// `|s'''| ≤ 0.86/ε²` and `|s''''| ≤ 3/ε³`. With `ε = 0.3`,
+/// `w = 0.7 e^{0.2} ≈ 0.86` and `√|g| ≤ √2`, that gives
+/// `|f'''| ≲ 12` and `|f''''| ≲ 140`. With `h = 1e-5`:
+/// - value -> grad: `h²/6 · 12 + ε_mach · 3/h ≈ 3e-10`.
+/// - grad -> hvp: along `v` with `‖v‖ ≈ 1.5`, `h²/6 · 140 · 1.5³ ≈ 8e-9`.
+/// - value -> grad_rho: the value is `w₀ e^ρ A`, so its third ρ-derivative is
+///   the value (`≈ 2.8`), which gives `≈ 5e-11`.
+/// A `1e-7` tolerance leaves at least 10× margin. The dense, diagonal and
+/// `hvp` channels evaluate the same per-group factors, so they agree to
+/// rounding (`1e-12` relative).
+#[test]
+fn block_sparsity_derivatives_and_dense_hessian_match_central_differences() {
+    let (n_eff, d) = (4usize, 3usize);
+    let n = n_eff * d;
+    let h = 1e-5;
+    let tol = 1e-7;
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.37 * (1.3 * x).sin() + 0.11 * x - 0.4
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let pen = BlockSparsityPenalty::new(
+        PsiSlice::full(n, Some(d)),
+        vec![vec![0, 2], vec![1]],
+        0.7,
+        n_eff,
+        0.3,
+        true,
+    )
+    .expect("block sparsity penalty");
+    let rho = array![0.2_f64];
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1, "one learnable log-weight");
+    let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+        - pen.value(t.view(), array![0.2 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "group-lasso curvature must be nonzero");
+    let diag = pen.diag_target(t.view(), rho.view());
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+        }
+        assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+    }
+    let (evals, _) = dense.eigh(Side::Lower).expect("group-lasso Hessian eigh");
+    let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+    assert!(
+        min_eval > 0.0,
+        "smoothed group-lasso Hessian must be positive definite; min eigenvalue {min_eval:.3e}"
+    );
+}
