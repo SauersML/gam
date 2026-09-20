@@ -130,8 +130,14 @@ fn assert_finite_fit(fit: &LatentSurvivalTermFitResult, case: &str) {
 /// interval fit.
 #[test]
 fn an_all_interval_fit_seeds_from_the_lower_endpoint_surrogate_3711() {
-    let fit = fit_interval_fixture(|_| {})
-        .expect("#3711: an all-interval latent fit must converge from its surrogate seed");
+    let fit = fit_interval_fixture(|spec| {
+        assert!(!spec.weights.is_empty(), "the all-interval baseline must contain observed rows");
+        assert!(
+            spec.weights.iter().all(|&weight| weight.is_finite() && weight > 0.0),
+            "the all-interval baseline must observe every interval with positive finite weight"
+        );
+    })
+    .expect("#3711: an all-interval latent fit must converge from its surrogate seed");
     assert_finite_fit(&fit, "all-interval");
 }
 
