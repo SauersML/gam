@@ -59,9 +59,9 @@ pub fn random_effect_test_records(
     }
     // Same scale contract as the basis-adequacy score test: a profiled
     // dispersion is estimated, otherwise the score's variance is scaled by the
-    // multiplier the fit publishes on its coefficient covariance. A multiplier
-    // the fit cannot resolve is a typed absence, never a substituted `1`: that
-    // would publish a p-value on a scale the fit never had.
+    // multiplier the fit publishes on its coefficient covariance. A known scale
+    // the fit cannot publish is a typed reason, never a unit dispersion: a
+    // substituted 1 would calibrate every p-value against the wrong variance.
     let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
         RandomEffectTestScale::Estimated
     } else {
@@ -69,7 +69,7 @@ pub fn random_effect_test_records(
             Ok(dispersion) if dispersion.is_finite() && dispersion > 0.0 => {
                 RandomEffectTestScale::Known { dispersion }
             }
-            _ => return unavailable(RandomEffectTestUnavailable::DispersionUnavailable),
+            _ => return unavailable(RandomEffectTestUnavailable::KnownScaleUnavailable),
         }
     };
     let basis = match RandomEffectTestBasis::new(RandomEffectTestInput {

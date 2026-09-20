@@ -110,10 +110,6 @@ pub enum RandomEffectTestUnavailable {
     /// The design could not be read, or it or the row state held a non-finite
     /// value.
     DesignUnavailable,
-    /// The scale is known but the fit's dispersion could not be resolved to a
-    /// finite positive value, so the score's variance has no scale to be read
-    /// against.
-    DispersionUnavailable,
     /// Every direction of the term lies inside the span of the model's other
     /// columns, so the data carry no information about it.
     NoEstimableDirection,
@@ -122,6 +118,9 @@ pub enum RandomEffectTestUnavailable {
     NoResidualDegreesOfFreedom,
     /// The reference tail could not be resolved to any accuracy.
     TailUnresolved,
+    /// The scale is known, but the fit publishes no finite positive dispersion
+    /// to scale the score's variance by.
+    KnownScaleUnavailable,
 }
 
 impl RandomEffectTestUnavailable {
@@ -130,10 +129,10 @@ impl RandomEffectTestUnavailable {
         match self {
             Self::NoIrlsRowState => "random_effect_no_irls_row_state",
             Self::DesignUnavailable => "random_effect_design_unavailable",
-            Self::DispersionUnavailable => "random_effect_dispersion_unavailable",
             Self::NoEstimableDirection => "random_effect_no_estimable_direction",
             Self::NoResidualDegreesOfFreedom => "random_effect_no_residual_degrees_of_freedom",
             Self::TailUnresolved => "random_effect_tail_unresolved",
+            Self::KnownScaleUnavailable => "random_effect_known_scale_unavailable",
         }
     }
 
@@ -146,9 +145,6 @@ impl RandomEffectTestUnavailable {
             Self::DesignUnavailable => {
                 "the design or IRLS row state could not be read as finite values"
             }
-            Self::DispersionUnavailable => {
-                "the fit's known dispersion could not be resolved to a finite positive value"
-            }
             Self::NoEstimableDirection => {
                 "every direction of this term is spanned by the model's other terms"
             }
@@ -156,6 +152,9 @@ impl RandomEffectTestUnavailable {
                 "the scale is estimated but the unpenalized model leaves no residual degrees of freedom"
             }
             Self::TailUnresolved => "the reference tail probability could not be resolved",
+            Self::KnownScaleUnavailable => {
+                "the scale is known but the fit publishes no finite positive dispersion"
+            }
         }
     }
 }
@@ -276,7 +275,7 @@ impl<'a> RandomEffectTestBasis<'a> {
         if let RandomEffectTestScale::Known { dispersion } = input.scale
             && !(dispersion.is_finite() && dispersion > 0.0)
         {
-            return Err(RandomEffectTestUnavailable::DispersionUnavailable);
+            return Err(RandomEffectTestUnavailable::KnownScaleUnavailable);
         }
 
         let mut hessian_gram = Array2::<f64>::zeros((p, p));
@@ -884,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolvable_known_dispersion_is_a_typed_dispersion_absence() {
+    fn unresolvable_known_dispersion_is_a_typed_known_scale_absence() {
         let levels = 3;
         let groups: Vec<usize> = (0..30).map(|i| i % levels).collect();
         let design = intercept_and_groups(&groups, levels);
@@ -899,7 +898,7 @@ mod tests {
                 RandomEffectTestScale::Known { dispersion },
             )
             .expect_err("no usable dispersion");
-            assert_eq!(reason, RandomEffectTestUnavailable::DispersionUnavailable);
+            assert_eq!(reason, RandomEffectTestUnavailable::KnownScaleUnavailable);
         }
     }
 
