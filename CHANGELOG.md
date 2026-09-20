@@ -3,16 +3,18 @@
 - **A Gaussian latent declaration that misstates its anchor is refused** (gam#2968).
   `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain on a Bernoulli or
   survival marginal-slope fit whose score fails the standard-normal adequacy screen
-  used to be fitted with a warning whatever the departure cost. The certificate now
-  also carries the standard error of its excess anchoring loss `D̂` over the score
-  sample the estimated law was built from (the node-level linear, quadratic and
-  third-moment terms of resampling the scores; 0.92 and 1.02 of a 400-resample score
-  bootstrap's SD on a Gaussian and a skewed score), and
-  the declaration is refused when `D̂ > z₁₋α·SE(D̂)` at the conditional-law gate's
-  one-sided `α = 10⁻³`. The message gives `D̂`, `SE(D̂)`, the critical value and the
-  failed ledger. Exact-Gaussian scores are never refused at that level; a skewed
-  score at large `n` is. **Behavior change:** such declarations now raise instead of
-  returning a fitted model; drop the declaration to anchor on the estimated law.
+  used to be fitted with a warning whatever the departure cost. The declaration is now
+  refused when its residual energy `T = Σ w r²/(π(1−π))` against the estimated law's
+  anchor is beyond the upper `α = 10⁻³` tail of the least-favourable loss-free law
+  `λ₁·χ²₁(N/λ₁) + Σ_{k≥2} λ_k·χ²₁`, where `λ_k` are the eigenvalues of the estimated
+  law's anchoring noise and `N = Σ λ_k`: of every bias whose excess anchoring loss
+  `D̂ = T − 2N` has a non-positive mean, the one on the top eigenvector gives `T` its
+  heaviest upper tail. The p-value is that law's tail with certified bounds (a Poisson
+  mixture of central weighted chi-square tails, and Cantelli), so the refusal has size
+  exactly `α` at the least-favourable null and at most `α` at every other loss-free
+  one. The message gives `D̂`, the p-value bounds and the failed ledger.
+  **Behavior change:** such declarations now raise instead of returning a fitted
+  model; drop the declaration to anchor on the estimated law.
 
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry

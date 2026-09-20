@@ -314,21 +314,26 @@ pub(crate) fn build_empirical_law_on_own_axis(
     EmpiricalZGrid::new(nodes, build.grid.weights, context)
 }
 
-/// The Gaussian closed form's certificate anchor at one survival anchor under a
-/// finite law (gam#2926): the residual `r = Σ_k w_k Φ(−(α_cf + b·u_k)) − Φ(−q)` at
-/// `α_cf = q·√(1+b²)`, through [`survival_certificate_anchor`].
-pub(crate) fn closed_form_survival_certificate_anchor(
+/// The Gaussian closed form's anchoring residual at one survival anchor under a
+/// finite law (gam#2926): `r = Σ_k w_k Φ(−(α_cf + b·u_k)) − Φ(−q)` at
+/// `α_cf = q·√(1+b²)`, the standard deviation of `Φ(−(α_cf + b·U))` under the
+/// law, `π(1−π)` with `π = Φ(−q)`, and the smaller-tail probabilities at the law's
+/// nodes. The sums run on the smaller tail, so a survival probability near one keeps
+/// its precision.
+pub(crate) fn closed_form_survival_anchoring_residual(
     q: f64,
     observed_slope: f64,
     law: &EmpiricalZGrid,
-) -> Result<super::CertificateAnchor, String> {
+) -> (f64, f64, f64, Vec<f64>) {
     let alpha = q * (1.0 + observed_slope * observed_slope).sqrt();
     let probabilities: Vec<f64> = law
         .nodes
         .iter()
         .map(|&u| survival_tail_probability(q, alpha + observed_slope * u))
         .collect();
-    survival_certificate_anchor(q, &law.weights, &probabilities)
+    let (residual, law_sd, scale) =
+        anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities);
+    (residual, law_sd, scale, probabilities)
 }
 
 /// The moving-law certificate's `(ln S, ln(1 − S))` of one rigid survival anchor
@@ -349,31 +354,33 @@ pub(crate) fn survival_tail_probability(q: f64, eta: f64) -> f64 {
     if q < 0.0 { normal_cdf(eta) } else { normal_cdf(-eta) }
 }
 
-/// One survival anchor of the closed-form certificate from a finite law's node
-/// weights and per-node tail probabilities ([`survival_tail_probability`]):
-/// `r = Σ_k w_k Φ(−η_k) − Φ(−q)` and `π(1−π) = Φ(q)Φ(−q)`. The sums run on the
-/// smaller tail, so a survival probability near one keeps its precision: with
-/// `q < 0` the upper tail is summed, and because the weights sum to one,
-/// `Σ_k w_k Φ(−η_k) − Φ(−q) = −(Σ_k w_k Φ(η_k) − Φ(q))`, the upper tail read with
-/// the opposite sign.
-pub(crate) fn survival_certificate_anchor(
+/// `(r, sd, π(1−π))` of one survival anchor from a finite law's node weights and
+/// per-node tail probabilities ([`survival_tail_probability`]):
+/// `r = Σ_k w_k Φ(−η_k) − Φ(−q)`, the standard deviation of the node probabilities
+/// under the law, and `Φ(q)Φ(−q)`. With `q < 0` the upper tail is summed, and
+/// because the weights sum to one, `Σ_k w_k Φ(−η_k) − Φ(−q) = Φ(q) − Σ_k w_k Φ(η_k)`.
+pub(crate) fn anchoring_residual_from_tail_probabilities(
     q: f64,
     weights: &[f64],
     probabilities: &[f64],
-) -> Result<super::CertificateAnchor, String> {
-    let (target, sign) = if q < 0.0 {
-        (normal_cdf(q), -1.0)
+) -> (f64, f64, f64) {
+    let upper = q < 0.0;
+    let mean = weights
+        .iter()
+        .zip(probabilities.iter())
+        .map(|(&weight, &probability)| weight * probability)
+        .sum::<f64>();
+    let variance = weights
+        .iter()
+        .zip(probabilities.iter())
+        .map(|(&weight, &probability)| weight * (probability - mean) * (probability - mean))
+        .sum::<f64>();
+    let residual = if upper {
+        normal_cdf(q) - mean
     } else {
-        (normal_cdf(-q), 1.0)
+        mean - normal_cdf(-q)
     };
-    super::CertificateAnchor::on_law(
-        weights,
-        probabilities,
-        target,
-        sign,
-        normal_cdf(q) * normal_cdf(-q),
-    )
-    .map_err(|reason| format!("survival anchor at q={q}: {reason}"))
+    (residual, variance.sqrt(), normal_cdf(q) * normal_cdf(-q))
 }
 
 fn squared_distance(point: ArrayView1<'_, f64>, center: &[f64]) -> f64 {
@@ -1175,132 +1182,5 @@ mod tests {
             .expect("combined law");
         assert_eq!(law.nodes, vec![-1.0, 0.0, 1.0, 2.0]);
         assert_eq!(law.weights, vec![0.3125, 0.375, 0.0625, 0.25]);
-    }
-
-    /// gam#2968's certificate on a fit-free cell: one Bernoulli closed-form anchor
-    /// per row at marginal index `q_i` and slope `b_i` spread over the rows, read
-    /// under the law estimated from `z`.
-    fn closed_form_certificate_on(z: &[f64]) -> ClosedFormAnchorResidual {
-        let weights = vec![1.0; z.len()];
-        let law = build_empirical_law_on_own_axis(
-            ArrayView1::from(z),
-            ArrayView1::from(weights.as_slice()),
-            super::super::DEFAULT_EMPIRICAL_LATENT_GRID_SIZE,
-            "certificate cell",
-        )
-        .expect("estimated law");
-        let rows = 400;
-        let mut accumulator = ClosedFormAnchorAccumulator::new(&law.weights);
-        for row in 0..rows {
-            let t = row as f64 / (rows - 1) as f64;
-            let q = -1.5 + 3.0 * t;
-            let slope = 0.3 + 0.9 * ((7 * row) % rows) as f64 / rows as f64;
-            let intercept = q * (1.0 + slope * slope).sqrt();
-            let probabilities: Vec<f64> =
-                law.nodes.iter().map(|&u| normal_cdf(intercept + slope * u)).collect();
-            let mu = normal_cdf(q);
-            let anchor =
-                CertificateAnchor::on_law(&law.weights, &probabilities, mu, 1.0, mu * (1.0 - mu))
-                    .expect("anchor");
-            accumulator.add(&anchor, 1.0).expect("add");
-        }
-        let sampling =
-            ScoreSampling::from_weights(ArrayView1::from(weights.as_slice())).expect("sampling");
-        accumulator.finish(sampling).expect("certificate")
-    }
-
-    /// A standardised gamma score of skewness `skew` (standard normal at 0).
-    fn standardised_scores(rng: &mut rand::rngs::StdRng, n: usize, skew: f64) -> Vec<f64> {
-        use rand::RngExt as _;
-        if skew == 0.0 {
-            return (0..n).map(|_| rng.sample::<f64, _>(rand_distr::StandardNormal)).collect();
-        }
-        let shape = 4.0 / (skew * skew);
-        let gamma = rand_distr::Gamma::new(shape, 1.0).expect("gamma");
-        (0..n).map(|_| (rng.sample(gamma) - shape) / shape.sqrt()).collect()
-    }
-
-    /// gam#2968: `SE(D̂)` is the sampling error of `D̂` over the score sample the
-    /// law is estimated from, and matches the score bootstrap that rebuilds the
-    /// law per resample in both of its regimes: on a skewed score, where `D̂` is a
-    /// clear bias and the linear term carries the variance, and on a Gaussian
-    /// score, where `D̂` is noise and the quadratic term carries it.
-    #[test]
-    fn closed_form_certificate_standard_error_matches_the_score_bootstrap_2968() {
-        use rand::{RngExt as _, SeedableRng as _};
-        let mut rng = rand::rngs::StdRng::seed_from_u64(2968);
-        for (n, skew) in [(12_000, 1.0), (3000, 0.0)] {
-            let z = standardised_scores(&mut rng, n, skew);
-            let certificate = closed_form_certificate_on(&z);
-            let standard_error = certificate.standard_error.expect("standard error");
-            if skew > 0.0 {
-                assert!(
-                    certificate.excess_kl > 3.0 * standard_error,
-                    "fixture invariant: the skewed cell must carry a visible bias, {}",
-                    certificate.summary()
-                );
-            }
-            let resamples = 400;
-            let mut draws = Vec::with_capacity(resamples);
-            let mut resample = vec![0.0; n];
-            for _ in 0..resamples {
-                for value in resample.iter_mut() {
-                    *value = z[rng.random_range(0..n)];
-                }
-                draws.push(closed_form_certificate_on(&resample).excess_kl);
-            }
-            let mean = draws.iter().sum::<f64>() / resamples as f64;
-            let bootstrap_sd = (draws.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>()
-                / (resamples - 1) as f64)
-                .sqrt();
-            let ratio = standard_error / bootstrap_sd;
-            eprintln!(
-                "[2968 bootstrap] n={n} skew={skew}: SE(D̂)={standard_error:.4e} bootstrap \
-                 SD={bootstrap_sd:.4e} ratio={ratio:.3} | {}",
-                certificate.summary()
-            );
-            // The ratio's Monte-Carlo error is about 1/√(2·400) = 0.035.
-            assert!(
-                (0.85..=1.15).contains(&ratio),
-                "SE(D̂) = {standard_error:.4e} against the bootstrap SD {bootstrap_sd:.4e} at \
-                 n = {n}, skew {skew}: ratio {ratio:.3} ({})",
-                certificate.summary()
-            );
-        }
-    }
-
-    /// gam#2968: at the null the refusal holds its level. On exactly Gaussian
-    /// scores, a fresh sample per replicate and the law rebuilt from it, no
-    /// replicate's `D̂` passes `z_{1−α}·SE(D̂)`; on a materially skewed score at a
-    /// size where the declaration's bias dominates the law's noise, every one does.
-    #[test]
-    fn declared_gaussian_refusal_holds_its_level_and_refuses_material_skew_2968() {
-        use rand::SeedableRng as _;
-        let mut rng = rand::rngs::StdRng::seed_from_u64(29680);
-        let mut largest = f64::NEG_INFINITY;
-        for n in [1000, 30_000] {
-            for _ in 0..if n == 1000 { 400 } else { 40 } {
-                let z = standardised_scores(&mut rng, n, 0.0);
-                let certificate = closed_form_certificate_on(&z);
-                let standard_error = certificate.standard_error.expect("standard error");
-                largest = largest.max(certificate.excess_kl / standard_error);
-                assert_eq!(
-                    certificate.refuses_declaration().expect("decision"),
-                    None,
-                    "an exactly Gaussian score at n = {n} was refused: {}",
-                    certificate.summary()
-                );
-            }
-        }
-        for _ in 0..10 {
-            let z = standardised_scores(&mut rng, 30_000, 1.0);
-            let certificate = closed_form_certificate_on(&z);
-            assert!(
-                certificate.refuses_declaration().expect("decision").is_some(),
-                "a skew-1 score at n = 30000 was kept: {}",
-                certificate.summary()
-            );
-        }
-        eprintln!("largest D̂/SE on exact Gaussian scores: {largest:.3}");
     }
 }

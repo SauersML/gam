@@ -394,10 +394,6 @@ fn declared_on_planted_scores(
         "the declaration's certificate reads every row's exit and entry anchor on the joint law: \
          {certificate:?}"
     );
-    assert!(
-        certificate.standard_error.is_some(),
-        "a kept declaration's certificate must carry the SE(D̂) it was judged by: {certificate:?}"
-    );
     let null_sd = certificate
         .null_modes
         .map(|modes| (2.0 * certificate.noise_energy * certificate.noise_energy / modes).sqrt());

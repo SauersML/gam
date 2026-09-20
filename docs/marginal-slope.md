@@ -421,7 +421,7 @@ Every other law is a declaration, set with `config={"latent_measure": ...}`:
 | `latent_measure` | Law anchored on | When the score contradicts it |
 |---|---|---|
 | `"auto"` (default) | the closed form when the estimated law passes the adequacy check, else the estimated law, global or local by context | — |
-| `"gaussian"` | the closed form, `N(0, 1)` | refused when the conditional law moves, or when the score fails the screen and `D̂ > z₀.₉₉₉·SE(D̂)`; otherwise fitted, with a warning and its `D̂` when the screen failed |
+| `"gaussian"` | the closed form, `N(0, 1)` | refused when the conditional law moves, or when the score fails the screen and its residual energy is beyond the least-favourable loss-free law's upper 10⁻³ tail; otherwise fitted, with a warning and its `D̂` when the screen failed |
 | `"global-empirical"` | the pooled estimated law, whatever the span shows | — |
 | `"conditional-location-scale"` | `z = m(a) + √v(a)·ε` with `ε` on its estimated law; the slope lives on `ε`'s axis | — |
 
@@ -434,15 +434,23 @@ A Gaussian declaration is checked, never assumed. When `E[z|a]` or
 fit is refused with the p-values. When the pooled score fails the
 standard-normal adequacy screen (mean, SD, skewness, kurtosis, KS distance,
 tail mass, largest `|z|`), the declaration is judged by what the departure
-costs: the declaration's estimated excess anchoring loss `D̂` at the converged
-fit, and its standard error `SE(D̂)` over the score sample the estimated law
-was built from. When `D̂ > z₁₋α·SE(D̂)` at `α = 10⁻³`, one-sided, the declared
-anchor misstates the probabilities it anchors and the fit is refused, with
-`D̂`, `SE(D̂)` and the ledger in the message. Otherwise the declaration is
-fitted and the fit warns with the ledger and `D̂`, both recorded with the
-model. A failed screen alone is not grounds to refuse a declaration: at large
-`n` it detects departures that cost no anchoring accuracy, and `D̂` measures
-what the departure costs. To fit the closed form
+costs. At the converged fit the residual `r = b + e` of the declared anchor
+against the estimated law's splits into the declaration's bias `b` and the
+estimated law's own sampling noise `e`, and the residual energy
+`T = Σ w r²/(π(1−π))` has mean `‖b‖² + N`, where `N = Σ λ_k` sums the
+eigenvalues `λ_k` of the noise's covariance in that metric. The declaration
+costs no accuracy when `‖b‖² ≤ N`, that is when `D̂ = T − 2N` estimates a
+non-positive excess anchoring loss. Over every such bias the upper tail of
+`T` is largest when all of it lies on the top eigenvector, so the
+least-favourable loss-free law is `λ₁·χ²₁(N/λ₁) + Σ_{k≥2} λ_k·χ²₁`, a
+weighted non-central chi-square. Its tail at `T`, with certified bounds, is
+the declaration's p-value, and when it is below `α = 10⁻³` the declared
+anchor misstates the probabilities it anchors by more than its measurement
+can explain and the fit is refused, with `D̂`, the p-value and the ledger in
+the message. Otherwise the declaration is fitted and the fit warns with the
+ledger and `D̂`, both recorded with the model. A failed screen alone is not
+grounds to refuse a declaration: at large `n` it detects departures that cost
+no anchoring accuracy, and `D̂` measures what the departure costs. To fit the closed form
 on purpose on a score that is not normal without the warning, declare a
 Gauss–Hermite law: it is the Gaussian case to quadrature tolerance.
 

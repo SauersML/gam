@@ -17,7 +17,9 @@
 //!    score; the Gaussian form is reached through a declared Gauss–Hermite law,
 //!    which is its anchor to quadrature tolerance (claim 2). A Gaussian
 //!    declaration on this score is refused (gam#2968): its excess anchoring loss
-//!    is many standard errors beyond zero. The default and the Gaussian form are judged against the
+//!    is beyond its sampling noise, the residual energy far past the
+//!    least-favourable loss-free law's upper 1e-3 tail. The default and the
+//!    Gaussian form are judged against the
 //!    TRUE law, in closed form: `E[Φ(α + b·z)] = Σ_j p_j Φ((α + b·μ_j)/√(1 + b²σ_j²))`
 //!    for a normal mixture.
 //! 2. **On a Gaussian score the declared law and the closed form agree to
@@ -388,8 +390,9 @@ fn default_law_is_calibrated_on_a_skewed_score_and_the_gaussian_form_is_not_2926
 
     // A Gaussian declaration on this score is refused (gam#2968): the score fails
     // the standard-normal screen, and at the converged declared fit the closed
-    // form's excess anchoring loss is many standard errors beyond zero, so the
-    // declared anchor misstates the probabilities it anchors.
+    // form's excess anchoring loss is beyond its sampling noise at the
+    // least-favourable null, so the declared anchor misstates the probabilities
+    // it anchors.
     let refusal = match fit_from_formula("y ~ x", &data, &config(Some("gaussian"), None)) {
         Ok(_) => panic!("a Gaussian declaration on this skewed score must be refused"),
         Err(error) => error.to_string(),

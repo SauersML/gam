@@ -440,8 +440,9 @@ fn closed_form_is_miscalibrated_on_a_skewed_law_and_the_anchored_fit_is_not_2923
 
     // gam#2968: a Gaussian declaration on a score that fails the adequacy screen
     // is refused when, at the converged declared fit, the closed form's excess
-    // anchoring loss is beyond its sampling noise; on a law this skewed it is
-    // many standard errors beyond zero. The closed form below is reached through
+    // anchoring loss is beyond its sampling noise (its residual energy past the
+    // least-favourable loss-free law's upper 1e-3 tail); on a law this skewed it
+    // is far past it. The closed form below is reached through
     // the declared Gauss–Hermite law, which is its anchor to quadrature tolerance
     // (`anchored_fit_on_a_gaussian_law_reproduces_the_closed_form_2923`).
     let refusal = match fit_from_formula(

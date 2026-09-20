@@ -3948,9 +3948,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // `Σ_k w_k Φ(η_k) − π` under the estimated law, and its sampling error. When
     // their excess-KL estimate prefers that law, the fit is re-solved on it from
     // these coefficients. A declared Gaussian law whose score failed the screen
-    // is measured the same way: refused when its estimated excess loss is beyond
-    // that measurement's own sampling noise (gam#2968), and kept otherwise, with
-    // the measurement warned about.
+    // is measured the same way: refused when its excess anchoring loss is beyond
+    // that measurement's sampling noise at its least-favourable null law
+    // (gam#2968), and kept otherwise, with the measurement warned about.
     let certificate_pending = matches!(
         &latent_law_consumed,
         LatentLawConsumed::EstimatedGaussianAdequate { residual: None, .. }
@@ -3979,9 +3979,10 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .map_err(|reason| FitFailure::raised(FailureCategory::Invariant, reason))?;
         // The estimated law was compressed from these weighted scores, so its
         // sampling error scales with their Kish effective size.
-        let sampling = super::ScoreSampling::from_weights(weights.view())
-            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
-        let certificate = super::closed_form_certificate_pass(
+        let weight_sum = weights.iter().sum::<f64>();
+        let weight_sq_sum = weights.iter().map(|w| w * w).sum::<f64>();
+        let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
+        let (rows, noise) = super::closed_form_certificate_pass(
             y.len(),
             weights.as_slice().ok_or_else(|| {
                 FitFailure::raised(
@@ -3990,14 +3991,15 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 )
             })?,
             &law.weights,
+            sqrt_effective_n * sqrt_effective_n,
             || Ok(()),
-            |_, row| -> Result<[super::CertificateAnchor; 1], String> {
+            |_, row| -> Result<[(f64, f64, f64, Vec<f64>); 1], String> {
                 let marginal_eta = block_states[0].eta[row];
                 let slope = block_states[1].eta[row];
                 // gam#2985: with a residual block the row anchors on the joint
                 // (z, r) law; under the estimated law of the score it is the
                 // score-only anchor at the row's (ã, B).
-                let anchor = if let Some(runtime) = residual_runtime.as_ref() {
+                let (anchoring_residual, law_sd, mu, probabilities) = if let Some(runtime) = residual_runtime.as_ref() {
                     let joint = super::residual_repair::residual_certificate_row(
                         &certificate_family,
                         runtime,
@@ -4005,7 +4007,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         row,
                         certificate_family.z[row],
                     )?;
-                    joint.anchor.certificate_anchor(joint.alpha, joint.mu, law)?
+                    joint.anchor.anchoring_residual(joint.alpha, joint.mu, law)?
                 } else {
                     let (intercept, _, _) = certificate_family.solve_row_intercept_base(
                         row,
@@ -4015,7 +4017,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         beta_w,
                         None,
                     )?;
-                    certificate_family.empirical_grid_certificate_anchor(
+                    certificate_family.evaluate_empirical_grid_anchoring_residual(
                         intercept,
                         marginal_eta,
                         slope,
@@ -4024,10 +4026,16 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         law,
                     )?
                 };
-                Ok([anchor])
+                Ok([(anchoring_residual, law_sd, mu * (1.0 - mu), probabilities)])
             },
         )
-        .and_then(|accumulator| accumulator.finish(sampling))
+        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+        let certificate = ClosedFormAnchorResidual::from_rows(
+            &rows,
+            &noise,
+            law.nodes.len(),
+            sqrt_effective_n * sqrt_effective_n,
+        )
         .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         if let LatentLawConsumed::DeclaredGaussian {
             adequacy: Some(adequacy),
@@ -4035,29 +4043,30 @@ fn fit_bernoulli_marginal_slope_terms_under(
             ..
         } = &mut latent_law_consumed
         {
-            log::debug!(
-                "[{gate_context} latent-z] the declared Gaussian law is fitted although the score \
-                 fails the standard-normal adequacy screen (adequacy ledger, x = statistic / \
-                 bound, x<=1 passed: {}); the declaration's estimated excess anchoring loss at \
-                 the converged fit: {} (gam#2926)",
-                adequacy.ledger(),
-                certificate.summary()
-            );
-            if let Some(critical) = certificate
-                .refuses_declaration()
-                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?
-            {
+            let test = noise
+                .declared_gaussian_loss_test(certificate.residual_energy)
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            if test.refused {
                 return Err(FitFailure::raised(
                     FailureCategory::Input,
                     super::LatentLawRefusal::DeclaredGaussianAnchoringLoss {
                         context: gate_context.to_string(),
                         certificate,
-                        critical,
+                        test,
                         adequacy: adequacy.ledger(),
                     }
                     .to_string(),
                 ));
             }
+            log::debug!(
+                "[{gate_context} latent-z] the declared Gaussian law is fitted although the score \
+                 fails the standard-normal adequacy screen (adequacy ledger, x = statistic / \
+                 bound, x<=1 passed: {}); the declaration's estimated excess anchoring loss at \
+                 the converged fit: {}; {} (gam#2926, gam#2968)",
+                adequacy.ledger(),
+                certificate.summary(),
+                test.summary()
+            );
             *residual = Some(certificate);
         } else if let LatentLawConsumed::EstimatedGaussianAdequate {
             evidence,

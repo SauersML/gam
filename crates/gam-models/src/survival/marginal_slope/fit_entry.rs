@@ -2526,9 +2526,9 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // the residual is the closed form's under it.
     //
     // A declared Gaussian law whose score failed the screen is measured the same
-    // way: refused when its estimated excess loss is beyond that measurement's
-    // own sampling noise (gam#2968), and kept otherwise, with the measurement
-    // warned about.
+    // way: refused when its excess anchoring loss is beyond that measurement's
+    // sampling noise at its least-favourable null law (gam#2968), and kept
+    // otherwise.
     let mut latent_law_consumed = latent_calibration.consumed.clone();
     let certificate_pending = matches!(
         &latent_law_consumed,
@@ -2556,12 +2556,14 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let block_states = &solved.fit.block_states;
         // The estimated law was compressed from these weighted scores, so its
         // sampling error scales with their Kish effective size.
-        let sampling = crate::bms::ScoreSampling::from_weights(spec.weights.view())
-            .map_err(FitFailure::numerical)?;
+        let weight_sum = spec.weights.iter().sum::<f64>();
+        let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
+        let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
         let row_weights = spec.weights.as_slice().ok_or_else(|| {
             FitFailure::invariant("survival marginal-slope: the row weights are not contiguous")
         })?;
-        let certificate = if spec.z.ncols() == 1 {
+        let effective_n = sqrt_effective_n * sqrt_effective_n;
+        let (rows, noise, nodes) = if spec.z.ncols() == 1 {
             let law = laws
                 .as_ref()
                 .and_then(|laws| laws.first())
@@ -2571,15 +2573,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          estimated law to certify it against",
                     )
                 })?;
-            crate::bms::closed_form_certificate_pass(
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
                 n,
                 row_weights,
                 &law.weights,
+                effective_n,
                 || Ok(()),
                 |_, row| certificate_family.closed_form_certificate_anchors(row, block_states, law),
             )
-            .and_then(|accumulator| accumulator.finish(sampling))
-            .map_err(FitFailure::numerical)?
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, law.nodes.len())
         } else {
             let (_, joint_law) = build_joint_latent_law(
                 spec.z.view(),
@@ -2592,10 +2595,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
-            crate::bms::closed_form_certificate_pass(
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
                 n,
                 row_weights,
                 joint_law.weights(),
+                effective_n,
                 || {
                     super::calibration::JointCertificateWorkspace::new(
                         &certificate_family,
@@ -2611,9 +2615,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                     )
                 },
             )
-            .and_then(|accumulator| accumulator.finish(sampling))
-            .map_err(FitFailure::numerical)?
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, joint_law.node_count())
         };
+        let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
+            &rows,
+            &noise,
+            nodes,
+            effective_n,
+        )
+        .map_err(FitFailure::numerical)?;
         let mut uncertified = None;
         if let crate::bms::LatentLawConsumed::DeclaredGaussian {
             adequacy: Some(adequacy),
@@ -2621,28 +2632,29 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             ..
         } = &mut latent_law_consumed
         {
-            log::debug!(
-                "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
-                 the score fails the standard-normal adequacy screen (adequacy ledger, x = \
-                 statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
-                 anchoring loss at the converged fit: {} (gam#2926)",
-                adequacy.ledger(),
-                certificate.summary()
-            );
-            if let Some(critical) = certificate
-                .refuses_declaration()
-                .map_err(FitFailure::numerical)?
-            {
+            let test = noise
+                .declared_gaussian_loss_test(certificate.residual_energy)
+                .map_err(FitFailure::numerical)?;
+            if test.refused {
                 return Err(FitFailure::input(
                     crate::bms::LatentLawRefusal::DeclaredGaussianAnchoringLoss {
                         context: "survival marginal-slope".to_string(),
                         certificate,
-                        critical,
+                        test,
                         adequacy: adequacy.ledger(),
                     }
                     .to_string(),
                 ));
             }
+            log::debug!(
+                "[survival-marginal-slope latent-z] the declared Gaussian law is fitted although \
+                 the score fails the standard-normal adequacy screen (adequacy ledger, x = \
+                 statistic / bound, x<=1 passed: {}); the declaration's estimated excess \
+                 anchoring loss at the converged fit: {}; {} (gam#2926, gam#2968)",
+                adequacy.ledger(),
+                certificate.summary(),
+                test.summary()
+            );
             *residual = Some(certificate);
         } else if let crate::bms::LatentLawConsumed::EstimatedGaussianAdequate {
             evidence,
