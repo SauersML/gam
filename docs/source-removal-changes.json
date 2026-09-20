@@ -2564,7 +2564,7 @@
     "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
   },
   {
-    "base": "2c78a5aa48b8e797413ec1ffab95cb0cccbe557c",
+    "base": "03f9a1216aae0cc61e83bf828877243b2bf6a425",
     "items": [
       "crates/gam-inference/src/hmc_io.rs:fn:log1pexp_is_finite_for_extreme_eta",
       "crates/gam-inference/src/hmc_io.rs:fn:sigmoid_stable_behaves_at_extremes",
