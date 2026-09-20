@@ -61,8 +61,9 @@
 //! # The candidate support
 //!
 //! * Bernoulli: both levels `{0, 1}` are tested.
-//! * Poisson and NB: the counts `0, 1, …` are tested up to a tail point derived
-//!   from the data, beyond which no count can be in the set:
+//! * Poisson and NB: the counts are walked in the test-score coordinate, from
+//!   the score of the count `0` up to a tail score derived from the data,
+//!   beyond which no count can be in the set:
 //!   - NB: `u ∈ (−θ, y)`, so once the test score reaches `max(max y, θ)` no
 //!     training score can match it;
 //!   - Poisson and NB (with an unpenalised intercept): the intercept KKT row
@@ -71,9 +72,13 @@
 //!     `s ≥ max(max y, Σy/K)`. NB takes the smaller of its two tails, which
 //!     keeps the enumeration short when a near-Poisson fit estimates a large
 //!     `θ`.
-//!   The tail score is turned into a count by one certified solve of the
-//!   problem with the test score fixed at that value. Without a provable tail
-//!   the set is honestly `[0, ∞)`.
+//!   The score interval is bisected as for Gamma below, one certified solve
+//!   deciding a whole sub-interval, and a run of member pieces covers the
+//!   counts strictly inside the images of its end scores. The counts inside an
+//!   end image's slack, inside an undecided sliver, or tied with a training
+//!   row are each decided by their own solve, so the work follows the set's
+//!   boundaries rather than the width of the count range. Without a provable
+//!   tail the set is honestly `[0, ∞)`.
 //! * Gamma: the candidate line is walked in the test-score coordinate
 //!   `s = u_* ∈ (−1, ∞)`, where the augmented problem is the training fit tilted
 //!   by `−s·η_*` (same KKT system as the response problem at
@@ -110,8 +115,8 @@ use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
-    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL, GLM_NEWTON_MAX_BACKTRACKS,
-    GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
+    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL,
+    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
 };
 
 /// A non-Gaussian family the certified full-conformal set supports. Each has a
@@ -252,6 +257,27 @@ impl ConformalGlmFamily {
             }
             Self::GammaLog => eta.exp() * (1.0 + s),
         }
+    }
+
+    /// An enclosure of the responses at `η ∈ [eta_lo, eta_hi]` and `s ∈
+    /// [s_lo, s_hi]` that also holds in floating point: the computed ends are
+    /// widened by a rounding bound on `exp`, the products and the sums, so a
+    /// count sitting exactly on an end (the count `0` at the score of `0`)
+    /// is never rounded out of it.
+    fn response_enclosure(self, eta_lo: f64, eta_hi: f64, s_lo: f64, s_hi: f64) -> (f64, f64) {
+        let pad = |eta: f64, s: f64| {
+            let mu = eta.exp();
+            let scale = match self {
+                Self::NegativeBinomialLog { theta } => mu + s.abs() * (theta + mu) / theta,
+                Self::GammaLog => mu * (1.0 + s.abs()),
+                _ => mu + s.abs(),
+            };
+            16.0 * f64::EPSILON * scale * (1.0 + eta.abs())
+        };
+        (
+            self.response_of_score(eta_lo, s_lo) - pad(eta_lo, s_lo),
+            self.response_of_score(eta_hi, s_hi) + pad(eta_hi, s_hi),
+        )
     }
 
     /// The whole response support, returned when no candidate can be excluded.
@@ -410,7 +436,11 @@ impl GlmFullConformalSubstrate {
                 "negative-binomial full conformal: theta must be positive and finite, got {theta}"
             ));
         }
-        if x.iter().chain(offset.iter()).chain(s_lambda.iter()).any(|v| !v.is_finite()) {
+        if x.iter()
+            .chain(offset.iter())
+            .chain(s_lambda.iter())
+            .any(|v| !v.is_finite())
+        {
             return Err(format!(
                 "{} full conformal: labeled design, offsets and penalty must be finite",
                 family.name()
@@ -477,7 +507,9 @@ impl GlmFullConformalSubstrate {
         alpha: f64,
     ) -> Result<GlmFullConformalSet, String> {
         if !(alpha > 0.0 && alpha < 1.0) {
-            return Err(format!("full conformal: alpha must be in (0, 1), got {alpha}"));
+            return Err(format!(
+                "full conformal: alpha must be in (0, 1), got {alpha}"
+            ));
         }
         if x_star.len() != self.p() {
             return Err(format!(
@@ -538,10 +570,8 @@ impl GlmFullConformalSubstrate {
         let s_beta = self.s_lambda.dot(beta);
         let mut grad = &s_beta - &xtu;
         grad.scaled_add(-score_star, row.x);
-        let natural_scale = 1.0
-            + vec_norm(&xtu)
-            + vec_norm(&s_beta)
-            + vec_norm(row.x) * score_star.abs();
+        let natural_scale =
+            1.0 + vec_norm(&xtu) + vec_norm(&s_beta) + vec_norm(row.x) * score_star.abs();
         State {
             score,
             weight,
@@ -735,9 +765,9 @@ impl GlmFullConformalSubstrate {
         rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
     }
 
-    /// Enumeration over the discrete support with randomised ties.
+    /// The discrete set with randomised ties: both Bernoulli levels by their
+    /// own solves, the counts by [`Self::count_set`].
     fn discrete_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
-        let n = self.n();
         let u_tie = self.tie_break_uniform(row);
         // `K`: the most training rows with score at least the test score that
         // still leave a candidate outside the set, `k + U ≤ τ`.
@@ -745,57 +775,19 @@ impl GlmFullConformalSubstrate {
             return self.family.whole_support();
         }
         let k_max = (tau - u_tie).floor() as usize;
-        let z_max = match self.family {
-            ConformalGlmFamily::BernoulliLogit => 1.0,
-            _ => match self.count_tail(row, k_max) {
-                Some(z) => z,
-                None => return self.family.whole_support(),
-            },
-        };
-        let twin: Vec<bool> = (0..n)
+        let twin: Vec<bool> = (0..self.n())
             .map(|i| {
                 self.offset[i] == row.offset
                     && self.x.row(i).iter().zip(row.x.iter()).all(|(a, b)| a == b)
             })
             .collect();
-        let mut tied = vec![false; n];
-        let mut kept = Vec::<f64>::new();
-        let mut warm = self.warm_start.clone();
-        let mut z = 0.0_f64;
-        while z <= z_max {
-            let keep = match self.solve(row, Augmentation::Response(z), &warm) {
-                Ok(node) => {
-                    let keep = if node.certifies(node.error) {
-                        let t = node.score_star.abs();
-                        let err = 2.0 * node.weight_star * node.lever_star * node.error;
-                        let mut ties = 0usize;
-                        for i in 0..n {
-                            tied[i] = twin[i] && self.y[i] == z;
-                            ties += usize::from(tied[i]);
-                        }
-                        let self_weight = u_tie * (1 + ties) as f64;
-                        self.verdict(
-                            &node,
-                            node.error,
-                            (t - err).max(0.0),
-                            t + err,
-                            self_weight,
-                            tau,
-                            Some(&tied),
-                        ) != Verdict::NonMember
-                    } else {
-                        true
-                    };
-                    warm = node.beta;
-                    keep
-                }
-                Err(_) => true,
-            };
-            if keep {
-                kept.push(z);
-            }
-            z += 1.0;
+        if self.family != ConformalGlmFamily::BernoulliLogit {
+            return self.count_set(row, tau, u_tie, k_max, &twin);
         }
+        let kept: Vec<f64> = [0.0, 1.0]
+            .into_iter()
+            .filter(|&z| self.count_member(row, z, u_tie, &twin, tau))
+            .collect();
         let mut runs = Vec::<ConformalInterval>::new();
         for z in kept {
             match runs.last_mut() {
@@ -806,9 +798,36 @@ impl GlmFullConformalSubstrate {
         runs
     }
 
-    /// The largest count that can be in the set, from the provable score tail
-    /// of the module doc; `None` when no tail is provable.
-    fn count_tail(&self, row: &TestRow<'_>, k_max: usize) -> Option<f64> {
+    /// Exact membership of the response level `z` by its own certified solve,
+    /// with the training rows that share the test row's covariates, offset and
+    /// response counted as ties. A solve that fails or does not certify keeps
+    /// `z`.
+    fn count_member(&self, row: &TestRow<'_>, z: f64, u_tie: f64, twin: &[bool], tau: f64) -> bool {
+        let Ok(node) = self.solve(row, Augmentation::Response(z), &self.warm_start) else {
+            return true;
+        };
+        if !node.certifies(node.error) {
+            return true;
+        }
+        let t = node.score_star.abs();
+        let err = 2.0 * node.weight_star * node.lever_star * node.error;
+        let tied: Vec<bool> = (0..self.n()).map(|i| twin[i] && self.y[i] == z).collect();
+        let ties = tied.iter().filter(|&&is_tied| is_tied).count();
+        let self_weight = u_tie * (1 + ties) as f64;
+        self.verdict(
+            &node,
+            node.error,
+            (t - err).max(0.0),
+            t + err,
+            self_weight,
+            tau,
+            Some(&tied),
+        ) != Verdict::NonMember
+    }
+
+    /// The test score past which no count can be in the set, from the
+    /// provable tails of the module doc; `None` when no tail is provable.
+    fn count_score_tail(&self, row: &TestRow<'_>, k_max: usize) -> Option<f64> {
         let max_y = self.y.iter().fold(0.0_f64, |m, &v| m.max(v));
         // The intercept-KKT bound holds for both count families (`u_i < y_i`
         // for each); NB also has its score bound `θ`, and the smaller wins.
@@ -823,19 +842,239 @@ impl GlmFullConformalSubstrate {
             ConformalGlmFamily::PoissonLog => kkt_score?,
             _ => return None,
         };
-        if !(tail_score > 0.0 && tail_score.is_finite()) {
-            return None;
+        (tail_score > 0.0 && tail_score.is_finite()).then_some(tail_score)
+    }
+
+    /// Certified walk over the test-score coordinate for the count families.
+    ///
+    /// The candidate counts map increasingly onto test scores `s ∈ [s(0),
+    /// s_tail]`, and the response fit at `z` is the tilt fit at `s = u_*(z)`,
+    /// so the score interval is bisected as in [`Self::continuous_set`], one
+    /// solve deciding a whole sub-interval. A run of member pieces covers the
+    /// counts strictly inside the images of its end scores, each mapped by its
+    /// own certified solve; the counts inside those images' slack, inside an
+    /// undecided sliver, or tied with a training twin are decided by
+    /// [`Self::count_member`]. The work follows the set's boundaries, not the
+    /// width of the count range.
+    fn count_set(
+        &self,
+        row: &TestRow<'_>,
+        tau: f64,
+        u_tie: f64,
+        k_max: usize,
+        twin: &[bool],
+    ) -> Vec<ConformalInterval> {
+        let whole = self.family.whole_support();
+        let Some(s_top) = self.count_score_tail(row, k_max) else {
+            return whole;
+        };
+        let Ok(base) = self.solve(row, Augmentation::Response(0.0), &self.warm_start) else {
+            return whole;
+        };
+        if !base.certifies(base.error) {
+            return whole;
         }
-        let node = self
-            .solve(row, Augmentation::Tilt(tail_score), &self.warm_start)
-            .ok()?;
-        if !node.certifies(node.error) {
-            return None;
+        let mut s_bot = base.score_star - 2.0 * base.weight_star * base.lever_star * base.error;
+        // NB scores exceed `−θ`, where `z(s)` stops increasing in `η_*`.
+        if let ConformalGlmFamily::NegativeBinomialLog { theta } = self.family {
+            s_bot = s_bot.max(-theta);
         }
-        let z_tail = self
-            .family
-            .response_of_score(node.eta_star + node.lever_star * node.error, tail_score);
-        z_tail.is_finite().then(|| z_tail.floor())
+        if !(s_bot < s_top) {
+            // Even the smallest count scores past the tail: the set is empty.
+            return Vec::new();
+        }
+        #[derive(Clone, Copy, PartialEq)]
+        enum Kind {
+            Member,
+            NonMember,
+            Undecided,
+            Unknown,
+        }
+        struct Leaf {
+            kind: Kind,
+            s_lo: f64,
+            s_hi: f64,
+            z_lo: f64,
+            z_hi: f64,
+            warm: Array1<f64>,
+        }
+        let mut leaves = Vec::<Leaf>::new();
+        let mut stack = vec![(s_bot, s_top, base.beta)];
+        while let Some((a, b, warm)) = stack.pop() {
+            let m = 0.5 * (a + b);
+            let half = 0.5 * (b - a);
+            let splittable = m > a && m < b;
+            let unknown = |warm| Leaf {
+                kind: Kind::Unknown,
+                s_lo: a,
+                s_hi: b,
+                z_lo: 0.0,
+                z_hi: f64::INFINITY,
+                warm,
+            };
+            let node = match self.solve(row, Augmentation::Tilt(m), &warm) {
+                Ok(node) => node,
+                Err(_) => {
+                    leaves.push(unknown(warm));
+                    continue;
+                }
+            };
+            let e = node.error + 2.0 * half * node.lever_star;
+            if !node.certifies(e) {
+                // Narrower pieces shrink only the width term; a solve whose
+                // own error does not certify gains nothing from a split.
+                if splittable && node.certifies(node.error) {
+                    stack.push((m, b, node.beta.clone()));
+                    stack.push((a, m, node.beta));
+                } else {
+                    leaves.push(unknown(node.beta));
+                }
+                continue;
+            }
+            let (t_lo, t_hi) = if a <= 0.0 && 0.0 <= b {
+                (0.0, a.abs().max(b.abs()))
+            } else {
+                (a.abs().min(b.abs()), a.abs().max(b.abs()))
+            };
+            let kind = match self.verdict(&node, e, t_lo, t_hi, u_tie, tau, None) {
+                Verdict::Member => Kind::Member,
+                Verdict::NonMember => Kind::NonMember,
+                Verdict::Undecided => {
+                    if splittable && half > node.score_floor() {
+                        stack.push((m, b, node.beta.clone()));
+                        stack.push((a, m, node.beta));
+                        continue;
+                    }
+                    Kind::Undecided
+                }
+            };
+            let slack = node.lever_star * e;
+            let (z_lo, z_hi) =
+                self.family
+                    .response_enclosure(node.eta_star - slack, node.eta_star + slack, a, b);
+            leaves.push(Leaf {
+                kind,
+                s_lo: a,
+                s_hi: b,
+                z_lo,
+                z_hi,
+                warm: node.beta,
+            });
+        }
+        // The image `[z(s) lower, z(s) upper]` of one score by its own solve,
+        // whose slack is the solve error alone.
+        let image = |s: f64, warm: &Array1<f64>| -> Option<(f64, f64)> {
+            let node = self.solve(row, Augmentation::Tilt(s), warm).ok()?;
+            if !node.certifies(node.error) {
+                return None;
+            }
+            let slack = node.lever_star * node.error;
+            Some(
+                self.family
+                    .response_enclosure(node.eta_star - slack, node.eta_star + slack, s, s),
+            )
+        };
+        // Counts `lo..=hi` of a real range, clipped to the support.
+        let counts = |lo: f64, hi: f64| (lo.max(0.0).ceil(), hi.floor());
+        let mut ranges = Vec::<ConformalInterval>::new();
+        let mut exact = Vec::<f64>::new();
+        let push_exact = |lo: f64, hi: f64, exact: &mut Vec<f64>| {
+            let (lo, hi) = counts(lo, hi);
+            let mut z = lo;
+            while z <= hi {
+                exact.push(z);
+                z += 1.0;
+            }
+        };
+        // Leaves come off the stack left to right.
+        let mut i = 0;
+        while i < leaves.len() {
+            let kind = leaves[i].kind;
+            let mut j = i;
+            while j + 1 < leaves.len() && leaves[j + 1].kind == kind {
+                j += 1;
+            }
+            let (first, last) = (&leaves[i], &leaves[j]);
+            match kind {
+                Kind::NonMember => {}
+                Kind::Unknown => {
+                    let (lo, hi) = counts(first.z_lo, last.z_hi);
+                    ranges.push(ConformalInterval { lo, hi });
+                }
+                Kind::Undecided => push_exact(first.z_lo, last.z_hi, &mut exact),
+                Kind::Member => {
+                    // Counts strictly above the low end's image and strictly
+                    // below the high end's are members; the counts inside
+                    // each image are decided alone. An end whose solve does
+                    // not certify keeps its leaf's wider bound.
+                    let lo = match image(first.s_lo, &first.warm) {
+                        Some((z_min, z_max)) => {
+                            push_exact(z_min, z_max, &mut exact);
+                            z_max.floor() + 1.0
+                        }
+                        None => first.z_lo.max(0.0).ceil(),
+                    };
+                    let hi = match image(last.s_hi, &last.warm) {
+                        Some((z_min, z_max)) => {
+                            push_exact(z_min, z_max, &mut exact);
+                            z_min.ceil() - 1.0
+                        }
+                        None => last.z_hi.floor(),
+                    };
+                    ranges.push(ConformalInterval {
+                        lo: lo.max(0.0),
+                        hi,
+                    });
+                }
+            }
+            i = j + 1;
+        }
+        for (i, &is_twin) in twin.iter().enumerate() {
+            if is_twin {
+                exact.push(self.y[i]);
+            }
+        }
+        exact.sort_by(f64::total_cmp);
+        exact.dedup();
+        let (kept, dropped): (Vec<f64>, Vec<f64>) = exact
+            .into_iter()
+            .partition(|&z| self.count_member(row, z, u_tie, twin, tau));
+        ranges.extend(kept.into_iter().map(|z| ConformalInterval { lo: z, hi: z }));
+        ranges.retain(|r| r.lo <= r.hi);
+        ranges.sort_by(|p, q| p.lo.total_cmp(&q.lo));
+        let mut merged = Vec::<ConformalInterval>::new();
+        for piece in ranges {
+            match merged.last_mut() {
+                Some(last) if piece.lo <= last.hi + 1.0 => last.hi = last.hi.max(piece.hi),
+                _ => merged.push(piece),
+            }
+        }
+        // A count decided out by its own solve leaves every range it is in.
+        for z in dropped {
+            merged = merged
+                .into_iter()
+                .flat_map(|r| {
+                    if r.lo <= z && z <= r.hi {
+                        [
+                            ConformalInterval {
+                                lo: r.lo,
+                                hi: z - 1.0,
+                            },
+                            ConformalInterval {
+                                lo: z + 1.0,
+                                hi: r.hi,
+                            },
+                        ]
+                        .into_iter()
+                        .filter(|p| p.lo <= p.hi)
+                        .collect::<Vec<_>>()
+                    } else {
+                        vec![r]
+                    }
+                })
+                .collect();
+        }
+        merged
     }
 
     /// Certified walk over the test-score coordinate for the continuous
@@ -1179,7 +1418,11 @@ mod tests {
     #[test]
     fn score_and_weight_are_the_derivatives_of_the_nll() {
         for family in FAMILIES {
-            let y = if family == ConformalGlmFamily::GammaLog { 1.7 } else { 1.0 };
+            let y = if family == ConformalGlmFamily::GammaLog {
+                1.7
+            } else {
+                1.0
+            };
             for eta in [-2.0, -0.3, 0.0, 0.8, 2.5] {
                 let h = 1e-5;
                 let d1 = (family.nll(eta + h, y) - family.nll(eta - h, y)) / (2.0 * h);
@@ -1187,22 +1430,42 @@ mod tests {
                 assert!((u + d1).abs() < 1e-6, "{family:?} score at {eta}");
                 let (u_hi, _) = family.score_weight(eta + h, y);
                 let (u_lo, _) = family.score_weight(eta - h, y);
-                assert!((w + (u_hi - u_lo) / (2.0 * h)).abs() < 1e-6, "{family:?} weight");
+                assert!(
+                    (w + (u_hi - u_lo) / (2.0 * h)).abs() < 1e-6,
+                    "{family:?} weight"
+                );
                 let (_, w_hi) = family.score_weight(eta + h, y);
                 let (_, w_lo) = family.score_weight(eta - h, y);
                 let dlogw = (w_hi.ln() - w_lo.ln()) / (2.0 * h);
-                assert!(dlogw.abs() <= 1.0 + 1e-6, "{family:?} curvature log-derivative");
+                assert!(
+                    dlogw.abs() <= 1.0 + 1e-6,
+                    "{family:?} curvature log-derivative"
+                );
                 let z = family.response_of_score(eta, u);
-                assert!((z - y).abs() < 1e-9, "{family:?} response_of_score inverts the score");
+                assert!(
+                    (z - y).abs() < 1e-9,
+                    "{family:?} response_of_score inverts the score"
+                );
             }
         }
     }
 
     /// Exact membership of candidate `z` by a direct solve, independent of the
     /// set's pruning and certificates.
-    fn brute_force_member(sub: &GlmFullConformalSubstrate, x_star: &Array1<f64>, o: f64, z: f64, alpha: f64) -> bool {
-        let row = TestRow { x: x_star, offset: o };
-        let node = sub.solve(&row, Augmentation::Response(z), &sub.warm_start).unwrap();
+    fn brute_force_member(
+        sub: &GlmFullConformalSubstrate,
+        x_star: &Array1<f64>,
+        o: f64,
+        z: f64,
+        alpha: f64,
+    ) -> bool {
+        let row = TestRow {
+            x: x_star,
+            offset: o,
+        };
+        let node = sub
+            .solve(&row, Augmentation::Response(z), &sub.warm_start)
+            .unwrap();
         assert!(node.certifies(node.error));
         let n = sub.n();
         let tau = conformal_rank_threshold(alpha, n + 1);
@@ -1242,7 +1505,10 @@ mod tests {
                 }
                 if *family != ConformalGlmFamily::BernoulliLogit {
                     let last = set.intervals.last().unwrap();
-                    assert!(last.hi.is_finite(), "{family:?}: the count tail must bound the set");
+                    assert!(
+                        last.hi.is_finite(),
+                        "{family:?}: the count tail must bound the set"
+                    );
                 }
             }
         }
@@ -1257,15 +1523,78 @@ mod tests {
         let d = data(ConformalGlmFamily::PoissonLog, 60, &mut rng);
         let sub = substrate(family, &d);
         let x_star = row(0.3);
-        let test = TestRow { x: &x_star, offset: 0.0 };
+        let test = TestRow {
+            x: &x_star,
+            offset: 0.0,
+        };
         let tau = conformal_rank_threshold(ALPHA, sub.n() + 1);
         let k_max = (tau - sub.tie_break_uniform(&test)).floor() as usize;
-        let tail = sub.count_tail(&test, k_max).unwrap();
-        assert!(tail <= d.y.sum(), "tail {tail} is not on the data scale");
+        let tail = sub.count_score_tail(&test, k_max).unwrap();
+        assert!(
+            tail <= d.y.sum(),
+            "tail score {tail} is not on the data scale"
+        );
         let set = sub.prediction_set(&x_star, 0.0, ALPHA).unwrap();
-        for z in 0..=(tail as usize + 5) {
+        let hi = set.intervals.last().unwrap().hi;
+        assert!(hi <= d.y.sum(), "set edge {hi} is not on the data scale");
+        for z in 0..=(hi as usize + 5) {
             let z = z as f64;
-            assert_eq!(contains(&set, z), brute_force_member(&sub, &x_star, 0.0, z, ALPHA), "z={z}");
+            assert_eq!(
+                contains(&set, z),
+                brute_force_member(&sub, &x_star, 0.0, z, ALPHA),
+                "z={z}"
+            );
+        }
+    }
+
+    #[test]
+    fn large_mean_poisson_set_costs_its_boundaries_not_its_width() {
+        // Means near e^11 put the set tens of thousands of counts wide, and the
+        // tail thousands beyond it; one solve per count would take minutes.
+        let mut rng = StdRng::seed_from_u64(4411);
+        let family = ConformalGlmFamily::PoissonLog;
+        let n = 60;
+        let xs: Vec<f64> = (0..n).map(|_| rng.random::<f64>() * 2.0 - 1.0).collect();
+        let y: Array1<f64> = xs
+            .iter()
+            .map(|&x| {
+                PoissonDist::new((11.0 + 0.3 * x).exp())
+                    .unwrap()
+                    .sample(&mut rng)
+            })
+            .collect();
+        let d = Data {
+            x: design(&xs),
+            y,
+            offset: Array1::zeros(n),
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let sub = substrate(family, &d);
+            let set = sub.prediction_set(&row(0.2), 0.0, ALPHA).unwrap();
+            tx.send((sub, set)).unwrap();
+        });
+        let (sub, set) = rx
+            .recv_timeout(std::time::Duration::from_secs(60))
+            .expect("the large-mean Poisson set must not enumerate its counts");
+        let (lo, hi) = (set.intervals[0].lo, set.intervals.last().unwrap().hi);
+        assert!(lo > 0.0 && hi.is_finite(), "set {:?}", set.intervals);
+        // The edges are exact boundaries: brute force agrees on either side.
+        for z in [
+            lo - 3.0,
+            lo - 1.0,
+            lo,
+            lo + 1.0,
+            hi - 1.0,
+            hi,
+            hi + 1.0,
+            hi + 3.0,
+        ] {
+            assert_eq!(
+                contains(&set, z),
+                brute_force_member(&sub, &row(0.2), 0.0, z, ALPHA),
+                "z={z}"
+            );
         }
     }
 
@@ -1277,12 +1606,19 @@ mod tests {
             ConformalGlmFamily::PoissonLog,
             ConformalGlmFamily::GammaLog,
         ] {
-            assert_eq!(family.certificate(Some(0)), ConformalCertificate::ExactFrozen);
+            assert_eq!(
+                family.certificate(Some(0)),
+                ConformalCertificate::ExactFrozen
+            );
             assert_eq!(family.certificate(Some(1)), refused);
             assert_eq!(family.certificate(Some(3)), refused);
         }
         let nb = ConformalGlmFamily::NegativeBinomialLog { theta: 2.0 };
-        assert_eq!(nb.certificate(Some(0)), refused, "θ is selected on the responses");
+        assert_eq!(
+            nb.certificate(Some(0)),
+            refused,
+            "θ is selected on the responses"
+        );
         assert_eq!(
             ConformalGlmFamily::PoissonLog.certificate(None),
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
@@ -1313,17 +1649,26 @@ mod tests {
             let x = rng.random::<f64>() * 2.0 - 1.0;
             let set = sub.prediction_set(&row(x), 0.0, alpha).unwrap();
             let hi = set.intervals.last().unwrap().hi;
-            assert!(hi.is_finite(), "gamma set must be bounded: {:?}", set.intervals);
+            assert!(
+                hi.is_finite(),
+                "gamma set must be bounded: {:?}",
+                set.intervals
+            );
             for k in 1..400 {
                 let z = hi * 1.5 * k as f64 / 400.0;
                 let exact = brute_force_member(&sub, &row(x), 0.0, z, alpha);
                 if exact {
-                    assert!(contains(&set, z), "exact member {z} missing from {:?}", set.intervals);
+                    assert!(
+                        contains(&set, z),
+                        "exact member {z} missing from {:?}",
+                        set.intervals
+                    );
                 }
             }
             // Tightness: every endpoint is an exact boundary to solver accuracy.
             for iv in &set.intervals {
-                for (edge, inside) in [(iv.lo, iv.lo * (1.0 + 1e-6)), (iv.hi, iv.hi * (1.0 - 1e-6))] {
+                for (edge, inside) in [(iv.lo, iv.lo * (1.0 + 1e-6)), (iv.hi, iv.hi * (1.0 - 1e-6))]
+                {
                     if edge > 0.0 {
                         assert!(
                             brute_force_member(&sub, &row(x), 0.0, inside, alpha),
@@ -1343,14 +1688,23 @@ mod tests {
             let sub = substrate(family, &d);
             let beta = sub.refit_labeled_rows().unwrap();
             let zero = Array1::zeros(3);
-            let st = sub.state(&beta, &TestRow { x: &zero, offset: 0.0 }, Augmentation::Tilt(0.0));
+            let st = sub.state(
+                &beta,
+                &TestRow {
+                    x: &zero,
+                    offset: 0.0,
+                },
+                Augmentation::Tilt(0.0),
+            );
             assert!(vec_norm(&st.grad) < 1e-8 * st.natural_scale, "{family:?}");
         }
     }
 
     #[test]
     fn penalty_recovery_zeros_unpenalized_columns_and_is_psd() {
-        let gram = Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0]).unwrap();
+        let gram =
+            Array2::from_shape_vec((3, 3), vec![4.0, 1.0, 0.5, 1.0, 3.0, 0.2, 0.5, 0.2, 2.0])
+                .unwrap();
         let mut normal = gram.clone();
         normal[[1, 1]] += 2.0;
         normal[[2, 2]] += 1.0;
@@ -1382,7 +1736,9 @@ mod tests {
                 let x = rng.random::<f64>() * 2.0 - 1.0;
                 let o = rng.random::<f64>() * 0.4 - 0.2;
                 let y_star = draw(family, eta_true(x) + o, &mut rng);
-                let set = substrate(family, &d).prediction_set(&row(x), o, ALPHA).unwrap();
+                let set = substrate(family, &d)
+                    .prediction_set(&row(x), o, ALPHA)
+                    .unwrap();
                 covered += usize::from(contains(&set, y_star));
             }
             let cov = covered as f64 / reps as f64;
@@ -1392,6 +1748,39 @@ mod tests {
                 (cov - target).abs() <= 2.0 * mcse,
                 "{family:?}: coverage {cov} vs {target} ± {}",
                 2.0 * mcse
+            );
+        }
+    }
+    /// The count `0` sits exactly on the low end of the score walk, where
+    /// rounding in `z(s)` once pushed its image just above `0` and dropped it
+    /// from a member run. These replayed draws had `0` in by its own solve.
+    #[test]
+    fn count_zero_on_the_walk_edge_is_not_rounded_out() {
+        let reps = [169usize, 249, 630, 637, 645, 717, 722, 802];
+        let n = 99;
+        let family = FAMILIES[2];
+        let mut rng = StdRng::seed_from_u64(4242 + 2);
+        for rep in 0..=802 {
+            let d = data(family, n, &mut rng);
+            let x = rng.random::<f64>() * 2.0 - 1.0;
+            let o = rng.random::<f64>() * 0.4 - 0.2;
+            let _ = draw(family, eta_true(x) + o, &mut rng);
+            if !reps.contains(&rep) {
+                continue;
+            }
+            let sub = substrate(family, &d);
+            let xs = row(x);
+            let test = TestRow { x: &xs, offset: o };
+            let tau = conformal_rank_threshold(ALPHA, n + 1);
+            let u = sub.tie_break_uniform(&test);
+            let twin = vec![false; n];
+            assert!(sub.count_member(&test, 0.0, u, &twin, tau), "rep {rep}");
+            let set = sub.prediction_set(&xs, o, ALPHA).unwrap();
+            assert_eq!(
+                set.intervals.first().map(|r| r.lo),
+                Some(0.0),
+                "rep {rep}: {:?}",
+                set.intervals
             );
         }
     }
