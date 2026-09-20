@@ -145,6 +145,7 @@ nav:
     - Response geometry: response-geometry.md
   - Using a fitted model:
     - Predictions: predictions.md
+    - Inspecting terms: partial-effects.md
     - Posterior sampling: posterior-sampling.md
     - Diagnostics, summaries, reports: diagnostics.md
     - p-values and calibration: pvalues.md

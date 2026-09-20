@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use gam_solve::rho_optimizer::{OuterProblem, OuterResult};
+use gam_solve::rho_optimizer::OuterProblem;
 use gam_terms::analytic_penalties::AnalyticPenaltyRegistry;
 use ndarray::{Array1, Array2, s};
 use serde::Serialize;
@@ -534,7 +534,6 @@ pub fn run_auto_sae_crosscoder_fit(
         top_k: None,
         threshold: 0.0,
         seed_refine_routing: refine_routing,
-        seed_refine_random_state: request.config.random_state,
         fit_config: SaeFitConfig::default(),
         temperature_schedule: None,
         fisher_metric: None,
@@ -784,7 +783,7 @@ impl SaeCrosscoderFitReport {
 
 fn certify_crosscoder_outer(
     objective: SaeManifoldOuterObjective,
-    result: Result<OuterResult, gam_problem::EstimationError>,
+    result: Result<super::SaeOuterRun, gam_problem::EstimationError>,
 ) -> Result<SaeManifoldOuterObjective, SaeFitError> {
     super::fit_entry::certify_outer_stage(objective, SaeFitStage::Primary, result)
 }
@@ -886,7 +885,7 @@ pub fn run_sae_crosscoder_fit(
         let problem = OuterProblem::new(n_params)
             .with_problem_size(n_cells, p_beta)
             .with_initial_rho(initial_flat);
-        let result = problem.run(&mut objective, "SAE manifold crosscoder");
+        let result = objective.run_to_certificate(&problem, "SAE manifold crosscoder");
         certify_crosscoder_outer(objective, result)?
     } else {
         objective.fit_at_fixed_rho(initial_flat.view())?;
