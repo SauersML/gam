@@ -3550,16 +3550,6 @@ mod cpu_fallback {
     }
 }
 
-/// Solution-only mixed-precision solve (logdet discarded). Skips the redundant
-/// fp64 POTRF so the PIRLS Newton direction solve gets the full fp32-factor
-/// speedup; the solution is fp64-accurate via iterative refinement.
-pub fn cholesky_solve_only_gpu(
-    hessian: ArrayView2<'_, f64>,
-    rhs: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    gam_gpu::solver::cholesky_solve_only_gpu(hessian, rhs)
-}
-
 #[cfg(all(test, target_os = "linux"))]
 mod pirls_loop_likelihood_scale_tests {
     use super::PirlsLoopLikelihoodScale;

@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **The PIRLS dense Newton direction is solved the same way on every host** (#3551).
+  On a CUDA host the direction was sent to a device Cholesky on the raw Hessian, with
+  no size gate and no residual certificate, and a non-finite device result was silently
+  redone on the CPU. An indefinite Hessian (a delayed-entry survival fit away from its
+  mode) failed the device factorization and the fit errored, where a CPU-only host took
+  the #2814 Gill–Murray descent step. The device route and its solution-only
+  mixed-precision entry point are removed; the direction is always taken on
+  `descent_curvature(H)` under the one certificate.
+
 - **A learned Gaussian-shift frailty in survival marginal-slope is refused as not identified.**
   The likelihood reads σ only through the observed slope `s(σ)·g`, `s = 1/√(1+σ²)`, so with
   the default slope (an intercept in every slope surface and a constant or no offset) any σ
