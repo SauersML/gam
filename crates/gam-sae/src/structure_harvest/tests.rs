@@ -2033,6 +2033,178 @@ fn estimation_eval_split_is_disjoint() {
             );
         }
     }
+    let streamed: Vec<usize> = split.shards.iter().flat_map(|s| s.rows.iter().copied()).collect();
+    assert_eq!(split.eval_rows, streamed, "eval_rows is the shard stream in order");
+}
+
+/// #4327 fixture: one gate over a one-output Gaussian regression stream, scored
+/// with the PRODUCTION split, residual, dispersion and null-stream arithmetic of
+/// [`run_structure_search_rounds`]. Only the SAE fits are replaced, by exact
+/// least squares. The candidate is OLS `a + b·x` on the estimation rows. The
+/// null is intercept-only, refit on the evaluated stream prefix at every shard.
+/// Returns whether the gate certified, the candidate's summed held-out
+/// log-likelihood, and the null's final profiled supremum `R_T`.
+fn gaussian_regression_gate_4327(y: &Array2<f64>, alpha: f64) -> (bool, f64, f64) {
+    use gam_terms::inference::structure_evidence::{GateVerdict, run_atom_birth_gate};
+    let n = y.nrows();
+    let split = estimation_eval_split(y.view(), 8);
+    let x = |row: usize| row as f64 / (n - 1) as f64 - 0.5;
+    let est = &split.estimation_rows;
+    let m = est.len() as f64;
+    let x_bar = est.iter().map(|&r| x(r)).sum::<f64>() / m;
+    let y_bar = est.iter().map(|&r| y[[r, 0]]).sum::<f64>() / m;
+    let sxx: f64 = est.iter().map(|&r| (x(r) - x_bar).powi(2)).sum();
+    let sxy: f64 = est.iter().map(|&r| (x(r) - x_bar) * (y[[r, 0]] - y_bar)).sum();
+    let slope = sxy / sxx;
+    let alt_fitted = Array2::from_shape_fn((n, 1), |(r, _)| y_bar + slope * (x(r) - x_bar));
+    let (est_sse, est_count) = residual_sse(&alt_fitted, y, est).unwrap();
+    let sigma2 = est_sse / est_count as f64;
+
+    let mut null_stream = NullStreamSup::default();
+    let mut alt_total = 0.0_f64;
+    let mut null_sup = 0.0_f64;
+    let (gate, ()) = run_atom_birth_gate(
+        alpha,
+        (),
+        split.shards.iter(),
+        |_, shard| {
+            let (sse, count) = residual_sse(&alt_fitted, y, &shard.rows)?;
+            let log_lik = gaussian_log_lik(sse, count, sigma2)?;
+            alt_total += log_lik;
+            Ok(log_lik)
+        },
+        |shard| {
+            let (before, after) = stream_prefix_bounds(&split.eval_rows, &shard.rows)?;
+            let prefix = &split.eval_rows[..after];
+            let mean = prefix.iter().map(|&r| y[[r, 0]]).sum::<f64>() / prefix.len() as f64;
+            let null_fitted = Array2::from_elem((n, 1), mean);
+            let (sse, count) = residual_sse(&null_fitted, y, prefix)?;
+            let increment = null_stream.advance(before, after, sse, count)?;
+            null_sup += increment;
+            Ok(increment)
+        },
+        |alt, _| Ok(alt),
+    )
+    .unwrap();
+    let certified = matches!(gate.verdict(), GateVerdict::Certified { .. });
+    (certified, alt_total, null_sup)
+}
+
+/// `y_i = 7 + slope·x_i + σ·z_i` on `n = 100` rows, with standard normal `z`
+/// drawn under `seed`.
+fn gaussian_regression_target_4327(seed: u64, slope: f64, sigma: f64) -> Array2<f64> {
+    let n = 100usize;
+    let mut y = Array2::from_shape_fn((n, 1), |(r, _)| {
+        7.0 + slope * (r as f64 / (n - 1) as f64 - 0.5)
+    });
+    add_observation_noise(&mut y, seed, sigma);
+    y
+}
+
+/// #4327: the structure gate's split likelihood ratio is a valid e-value
+/// under the null at EVERY noise scale. The old unit-dispersion score
+/// `−½·ΔSSE` depended on σ², and its null evidence could exceed one. This
+/// fixture has an intercept-only null that is true, with a linear candidate.
+/// With σ unknown on both sides the gate must satisfy two bounds. The
+/// rejection rate of the running-sup certification must be at most α (Ville),
+/// and the final e-value must have mean at most 1. Each bound is checked up to
+/// three Monte-Carlo standard errors. A reference simulation of this fixture
+/// gives a final-e mean of about 0.21 and no certifications in 4000
+/// replications, at σ ∈ {0.1, 1, 30, 300}.
+#[test]
+fn structure_gate_gaussian_split_lr_is_null_valid_at_every_noise_scale_4327() {
+    let alpha = 0.05;
+    let reps = 2000usize;
+    for (scale_index, &sigma) in [1.0e-2, 1.0, 30.0].iter().enumerate() {
+        let mut rejections = 0usize;
+        let mut e_values = Vec::with_capacity(reps);
+        for rep in 0..reps {
+            let seed = 0x4327_0000_u64 + (scale_index * reps + rep) as u64;
+            let y = gaussian_regression_target_4327(seed, 0.0, sigma);
+            let (certified, alt_total, null_sup) = gaussian_regression_gate_4327(&y, alpha);
+            rejections += usize::from(certified);
+            e_values.push((alt_total - null_sup).exp());
+        }
+        let reps_f = reps as f64;
+        let rate = rejections as f64 / reps_f;
+        let rate_bound = alpha + 3.0 * (alpha * (1.0 - alpha) / reps_f).sqrt();
+        assert!(
+            rate <= rate_bound,
+            "σ = {sigma}: null certification rate {rate} exceeds α + 3·SE = {rate_bound}"
+        );
+        let mean = e_values.iter().sum::<f64>() / reps_f;
+        let var = e_values.iter().map(|e| (e - mean).powi(2)).sum::<f64>() / (reps_f - 1.0);
+        let mean_bound = 1.0 + 3.0 * (var / reps_f).sqrt();
+        assert!(
+            mean <= mean_bound,
+            "σ = {sigma}: null mean e-value {mean} exceeds 1 + 3·SE = {mean_bound}"
+        );
+    }
+}
+
+/// #4327: rescaling the target by `c` multiplies every residual by `c`. That
+/// shifts the candidate's Gaussian log-likelihood and the null's profiled
+/// supremum by the same `−M·ln c`, so the evidence is unchanged. The old
+/// `−½·ΔSSE` score scaled by `c²`. The same fixture also has a real slope
+/// (4σ across the x range), and the gate must still find it. A reference
+/// simulation certifies 32% of replications at every scale (0% under the old
+/// score at σ = 1), so a floor of 0.2 is more than ten Monte-Carlo standard
+/// errors below it.
+#[test]
+fn structure_gate_gaussian_split_lr_is_scale_invariant_and_keeps_power_4327() {
+    let alpha = 0.05;
+    let reps = 2000usize;
+    let mut certified_count = 0usize;
+    for rep in 0..reps {
+        let y = gaussian_regression_target_4327(0x4327_8000_u64 + rep as u64, 4.0, 1.0);
+        let (certified, alt_total, null_sup) = gaussian_regression_gate_4327(&y, alpha);
+        certified_count += usize::from(certified);
+        let log_e = alt_total - null_sup;
+        for c in [1.0e-3, 1.0e3] {
+            let scaled = y.mapv(|v| c * v);
+            let (certified_c, alt_c, null_c) = gaussian_regression_gate_4327(&scaled, alpha);
+            let log_e_c = alt_c - null_c;
+            // Each side shifts by `M·ln c` with the scale. Rounding is therefore
+            // relative to the size of the sides (a few ulps of sums of 40
+            // terms, about 1e-14 relative), not to their difference. A bound of
+            // 1e-9 of the sides' magnitude leaves five orders of margin.
+            let sides = 1.0 + alt_total.abs().max(alt_c.abs()) + null_sup.abs().max(null_c.abs());
+            assert!(
+                (log_e_c - log_e).abs() <= 1.0e-9 * sides,
+                "rep {rep}, c = {c}: log-e {log_e_c} differs from the unscaled {log_e}"
+            );
+            assert_eq!(certified_c, certified, "rep {rep}, c = {c}: verdict changed with scale");
+        }
+    }
+    let power = certified_count as f64 / reps as f64;
+    assert!(
+        power >= 0.2,
+        "a 4σ slope is certified in only {power} of replications"
+    );
+}
+
+/// #4327: the null stream is a supremum over the evaluated PREFIX. Its
+/// increments must telescope to the prefix supremum. A shard that does not
+/// continue the stream breaks the engine's order contract and is refused. A
+/// prefix the null reproduces exactly has an unbounded supremum over σ², and
+/// that is refused too.
+#[test]
+fn null_stream_sup_telescopes_and_refuses_broken_streams_4327() {
+    let mut stream = NullStreamSup::default();
+    let first = stream.advance(0, 5, 3.0, 5).unwrap();
+    let second = stream.advance(5, 10, 8.0, 10).unwrap();
+    let prefix_sup = gaussian_profiled_sup_log_lik(8.0, 10).unwrap();
+    assert!((first + second - prefix_sup).abs() < 1e-12);
+    assert!(stream.advance(15, 20, 12.0, 20).is_err(), "a skipped shard must be refused");
+    let restarted = stream.advance(0, 5, 3.0, 5).unwrap();
+    assert_eq!(restarted, first, "a new gate restarts the stream at the empty prefix");
+    let error = stream.advance(5, 10, 0.0, 10).unwrap_err();
+    assert!(error.contains("interpolates"), "{error}");
+
+    let eval_rows: Vec<usize> = (60..70).collect();
+    assert_eq!(stream_prefix_bounds(&eval_rows, &[63, 64, 65]).unwrap(), (3, 6));
+    assert!(stream_prefix_bounds(&eval_rows, &[63, 65]).is_err());
+    assert!(stream_prefix_bounds(&eval_rows, &[10]).is_err());
 }
 
 /// #977 per-atom topology RACE oracle: two birth targets — one tracing a
@@ -2257,9 +2429,10 @@ fn birth_topology_race_d2_is_undecided_on_an_interpolated_target() {
 /// normalizer is consumed by the live per-shard likelihood the K-vs-(K+1)
 /// birth gate forms its split-LR from — not just by the isolated unit test.
 ///
-/// `eval_log_lik` is the exact `alternative_log_lik` / `null_sup_log_lik`
-/// closure `run_atom_birth_gate` accumulates (see [`run_structure_search_rounds`]),
-/// so it is the production gate's evaluation statistic. We score the SAME
+/// `alternative_shard_log_lik` is the exact `alternative_log_lik` closure
+/// `run_atom_birth_gate` accumulates, and the null closure adds the same
+/// gate block for the null state (see [`run_structure_search_rounds`]). So it
+/// is the production gate's evaluation statistic. We score the SAME
 /// shard under a K-atom null and a (K+1)-atom candidate and isolate the
 /// gate-block contribution: growing the dictionary by one atom adds exactly
 /// one gate coordinate, so the `−½·d_g·log(2π)` normalizer (the term #1218
@@ -2287,7 +2460,8 @@ fn production_gate_consumes_corrected_pg_normalizer() {
     };
 
     // The gate-block contribution alone (private helper the live
-    // `eval_log_lik` adds in): the corrected normalizer is reachable here.
+    // `alternative_shard_log_lik` adds in): the corrected normalizer is
+    // reachable here.
     let null_gate = gate_block_log_evidence(&null_term, &shard).unwrap();
     let cand_gate = gate_block_log_evidence(&cand_term, &shard).unwrap();
     assert!(
@@ -2331,11 +2505,13 @@ fn production_gate_consumes_corrected_pg_normalizer() {
     );
 
     // And the full production statistic carries it: the gate-block evidence
-    // is a real, finite addend on top of the reconstruction likelihood.
-    let full = eval_log_lik(&cand_term, &shard).unwrap();
+    // is a real, finite addend on top of the reconstruction likelihood. Here
+    // every row is both an estimation row and a scored row, so the candidate's
+    // plug-in dispersion is σ̂² = SSE/m and its Gaussian reconstruction
+    // log-likelihood is −½·m·(ln(2π·SSE/m) + 1) (#4327).
+    let all_rows: Vec<usize> = (0..n).collect();
+    let full = alternative_shard_log_lik(&cand_term, &all_rows, &shard).unwrap();
     let recon_only = {
-        // Reconstruction-only baseline (what the path returned BEFORE the
-        // wiring): −½·SSE over the shard rows.
         let fitted = cand_term.try_fitted().unwrap();
         let mut sse = 0.0;
         for &row in &shard.rows {
@@ -2344,7 +2520,8 @@ fn production_gate_consumes_corrected_pg_normalizer() {
                 sse += d * d;
             }
         }
-        -0.5 * sse
+        let m = (shard.rows.len() * p) as f64;
+        -0.5 * m * ((2.0 * std::f64::consts::PI * sse / m).ln() + 1.0)
     };
     assert!(
         (full - (recon_only + cand_gate)).abs() < 1e-9,
