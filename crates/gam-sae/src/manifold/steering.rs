@@ -233,7 +233,9 @@ impl SaeManifoldTerm {
     /// `k` on the selected `rows`, shape `(rows.len(), p)`. The caller adds this
     /// to the ambient activation `x` to move token `i` along atom `k`'s chart by
     /// the intrinsic coordinate step `δ`, staying on the decoded feature image
-    /// by construction. For a one-dimensional periodic or interval chart, `δ`
+    /// by construction. The delta is in RAW activation units: on a Tier-0
+    /// standardized term it is `σ⊙` the fitted-frame chord, matching
+    /// [`Self::try_fitted`]'s lift (no mean — a chord has none). For a one-dimensional periodic or interval chart, `δ`
     /// is measured in the canonical arc-length coordinate (rescaled to the
     /// chart's span), not in the gauge-arbitrary fitted parameter. Higher
     /// dimensional charts retain their manifold-coordinate group action.
@@ -274,6 +276,7 @@ impl SaeManifoldTerm {
                 out[[out_row, c]] = a * (steered_decode[[out_row, c]] - base_decode[[out_row, c]]);
             }
         }
+        self.lift_tier0_scale_inplace(&mut out);
         Ok(out)
     }
 
@@ -296,7 +299,9 @@ impl SaeManifoldTerm {
     /// `k` on the selected `rows`, shape `(rows.len(), p)` — the ABSOLUTE moved
     /// contribution (not a delta), used by the E4 zoo ground-truth check where
     /// the steered reconstruction is compared against the planted manifold point
-    /// at `θ + δ`. Same moved coordinate and same amplitude/gate handling as
+    /// at `θ + δ`. RAW activation units: on a Tier-0 standardized term the
+    /// fitted-frame contribution is lifted by `σ⊙·` (the shared mean `μ` belongs
+    /// to the reconstruction, not to any one atom). Same moved coordinate and same amplitude/gate handling as
     /// [`Self::steer_rows`]: on a one-dimensional chart `δ` is the canonical
     /// arc-length displacement here too, so `steer_decode(δ) − steer_decode(0)`
     /// is `steer_rows(δ)` up to rounding.
@@ -320,7 +325,21 @@ impl SaeManifoldTerm {
                 out[[out_row, c]] = a * steered_decode[[out_row, c]];
             }
         }
+        self.lift_tier0_scale_inplace(&mut out);
         Ok(out)
+    }
+
+    /// Lift fitted-frame steering columns into raw activation units. A Tier-0
+    /// standardized term fits `(Z − μ)/σ`, so the raw image of a fitted-frame
+    /// decode `x̂_int` is `μ + σ⊙x̂_int`. A steering delta is a chord between two
+    /// such images and a per-atom contribution does not own the shared mean, so
+    /// both lift by `σ⊙·` alone; the mean `μ` is never added here.
+    fn lift_tier0_scale_inplace(&self, out: &mut Array2<f64>) {
+        if let Some(scale) = self.tier0_scale() {
+            for mut row in out.rows_mut() {
+                row *= scale;
+            }
+        }
     }
 
     /// Absolute steered contribution in one crosscoder layer's honest units.
