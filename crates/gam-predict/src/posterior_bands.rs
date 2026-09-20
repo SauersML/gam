@@ -1,4 +1,4 @@
-use ndarray::ArrayView2;
+use ndarray::{Array1, Array2, ArrayView2};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -140,64 +140,25 @@ pub fn draw_bands_from_matrices(
     Ok((eta_mean, eta_lower, eta_upper, mean, mean_lower, mean_upper))
 }
 
-/// semantics, but the response-scale push-through goes through a
-/// [`LinkSelector`] so the parameterized links (`Sas`, `Mixture`,
-/// `LatentCLogLog`, `BetaLogistic`) can be evaluated from their fitted state.
+/// Posterior means and credible bands from linear-predictor draws alone, for a
+/// model whose response mean is the inverse link of `eta`. Each draw is pushed
+/// through the [`LinkSelector`], so the parameterized links (`Sas`, `Mixture`,
+/// `LatentCLogLog`, `BetaLogistic`) are evaluated from their fitted state and
+/// the response-scale mean averages the inverse-link draws rather than
+/// inverting the `eta` mean. Both draw matrices are then reduced by
+/// [`draw_bands_from_matrices`], so this entry point validates and summarizes
+/// draws exactly like every other posterior band.
 pub fn eta_bands_from_matrix_link(
     eta: ArrayView2<'_, f64>,
     link: LinkSelector<'_>,
     level: f64,
 ) -> Result<PosteriorBands, String> {
-    if !(level > 0.0 && level < 1.0) {
-        return Err(format!("interval level must lie in (0, 1); got {level}"));
+    let mut mean = Array2::<f64>::zeros(eta.raw_dim());
+    for (row, eta_draws) in eta.columns().into_iter().enumerate() {
+        let response_draws = link.apply(&eta_draws.to_vec())?;
+        mean.column_mut(row).assign(&Array1::from(response_draws));
     }
-    let alpha = (1.0 - level) / 2.0;
-    let n_draws = eta.nrows();
-    let n_rows = eta.ncols();
-    if n_draws == 0 {
-        return Err("posterior bands unavailable: zero draws".to_string());
-    }
-    let mut eta_mean = vec![0.0_f64; n_rows];
-    let mut eta_lower = vec![0.0_f64; n_rows];
-    let mut eta_upper = vec![0.0_f64; n_rows];
-    let mut response_mean = vec![0.0_f64; n_rows];
-    let mut response_lower = vec![0.0_f64; n_rows];
-    let mut response_upper = vec![0.0_f64; n_rows];
-    let mut column = vec![0.0_f64; n_draws];
-    let inv_n = 1.0 / n_draws as f64;
-    for j in 0..n_rows {
-        for k in 0..n_draws {
-            column[k] = eta[[k, j]];
-        }
-        let mut sum = 0.0_f64;
-        for v in &column {
-            sum += *v;
-        }
-        eta_mean[j] = sum * inv_n;
-        // Response-scale posterior mean: average inv-link draws, not
-        // inv-link of the eta mean. See doc comment above.
-        let response_draws = link.apply(&column)?;
-        let mut rsum = 0.0_f64;
-        for v in &response_draws {
-            rsum += *v;
-        }
-        response_mean[j] = rsum * inv_n;
-        let mut response_column = response_draws;
-        response_column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        response_lower[j] = quantile_from_sorted(&response_column, alpha);
-        response_upper[j] = quantile_from_sorted(&response_column, 1.0 - alpha);
-        column.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
-        eta_lower[j] = quantile_from_sorted(&column, alpha);
-        eta_upper[j] = quantile_from_sorted(&column, 1.0 - alpha);
-    }
-    Ok((
-        eta_mean,
-        eta_lower,
-        eta_upper,
-        response_mean,
-        response_lower,
-        response_upper,
-    ))
+    draw_bands_from_matrices(eta, mean.view(), level)
 }
 
 #[cfg(test)]
@@ -254,6 +215,38 @@ mod tests {
             assert!(draw_bands_from_matrices(finite.view(), mean.view(), 0.95).is_err());
         }
     }
-    use ndarray::Array2;
 
+    #[test]
+    fn eta_link_bands_share_the_validated_draw_reducer() {
+        let eta = Array2::from_shape_vec((3, 2), vec![0.0, 1.0, 2.0, -1.0, -3.0, 0.5])
+            .expect("eta shape");
+        let mean = eta.mapv(|value| 1.0 / (1.0 + (-value).exp()));
+        let via_link = eta_bands_from_matrix_link(eta.view(), LinkSelector::Tag("logit"), 0.5)
+            .expect("logit link bands");
+        let via_matrices =
+            draw_bands_from_matrices(eta.view(), mean.view(), 0.5).expect("matrix bands");
+        let pairs = [
+            (&via_link.0, &via_matrices.0),
+            (&via_link.1, &via_matrices.1),
+            (&via_link.2, &via_matrices.2),
+            (&via_link.3, &via_matrices.3),
+            (&via_link.4, &via_matrices.4),
+            (&via_link.5, &via_matrices.5),
+        ];
+        for (link_band, matrix_band) in pairs {
+            for (a, b) in link_band.iter().zip(matrix_band.iter()) {
+                assert!((a - b).abs() <= 4.0 * f64::EPSILON * a.abs().max(1.0));
+            }
+        }
+        for invalid_eta in [f64::NAN, f64::NEG_INFINITY, f64::INFINITY] {
+            let eta =
+                Array2::from_shape_vec((3, 1), vec![0.0, invalid_eta, 1.0]).expect("eta shape");
+            assert!(
+                eta_bands_from_matrix_link(eta.view(), LinkSelector::Tag("logit"), 0.5).is_err(),
+                "an invalid eta draw ({invalid_eta}) must be refused, not sorted as a tie"
+            );
+        }
+        let eta = Array2::<f64>::zeros((2, 1));
+        assert!(eta_bands_from_matrix_link(eta.view(), LinkSelector::Tag("logit"), 1.0).is_err());
+    }
 }
