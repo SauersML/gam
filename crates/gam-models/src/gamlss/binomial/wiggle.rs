@@ -2986,13 +2986,16 @@ impl BinomialLocationScaleWiggleFamily {
     /// Build a matrix-free `RowCoeffOperator` for the BLS Wiggle joint
     /// directional derivative `D_β H_L[u]`. Channels (in order):
     /// X_t, X_ls, B (b0), B' (d0), B'' (dd0). The operator acts on the
-    /// joint coefficient vector `(β_t, β_ls, β_w)`.
+    /// joint coefficient vector `(β_t, β_ls, β_w)`. `row_factor` is the
+    /// outer-subsample Horvitz–Thompson row factor (`None` for all rows), so
+    /// the operator differentiates the value Hessian on its own row measure.
     pub(crate) fn bls_wiggle_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
         x_t_arc: Arc<Array2<f64>>,
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_flat: &Array1<f64>,
+        row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
@@ -3067,12 +3070,15 @@ impl BinomialLocationScaleWiggleFamily {
                 (2, 3, coeff_ww_bd),
             ],
             self.y.len(),
-        ))))
+        )
+        .with_row_factor(row_factor))))
     }
 
     /// Build the matrix-free `D²H[u,v]` operator from the K=8 typed-probe
     /// instantiation of the canonical row expression. Probe Hessian entries
-    /// lower directly onto the B/B'/B''/B''' channel plan.
+    /// lower directly onto the B/B'/B''/B''' channel plan. `row_factor` puts
+    /// it on the outer-subsample row measure, as for
+    /// [`Self::bls_wiggle_directional_operator`].
     pub(crate) fn bls_wiggle_second_directional_operator(
         &self,
         block_states: &[ParameterBlockState],
@@ -3080,6 +3086,7 @@ impl BinomialLocationScaleWiggleFamily {
         x_ls_arc: Arc<Array2<f64>>,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
+        row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let pt = x_t_arc.ncols();
         let pls = x_ls_arc.ncols();
@@ -3151,7 +3158,8 @@ impl BinomialLocationScaleWiggleFamily {
                 (3, 3, coeff_ww_dd),
             ],
             self.y.len(),
-        ))))
+        )
+        .with_row_factor(row_factor))))
     }
 }
 

@@ -109,6 +109,25 @@ pub(crate) trait LocationScaleJointPsiFamily: Clone + Send + Sync + 'static {
         subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
     ) -> Result<Array2<f64>, String>;
 
+    /// First-order fixed-β ψ terms `V_ψ`, `g_ψ`, `H_ψ` from the workspace's
+    /// cached direction, on the workspace's outer row measure.
+    ///
+    /// `Ok(None)` sends the caller to the family's own
+    /// `exact_newton_joint_psi_terms`, which sums every row. A family that
+    /// masks its second-order and drift ψ calculus under `subsample` must
+    /// implement this too, or its outer ψ gradient pairs a full-data first
+    /// derivative with a Horvitz–Thompson value.
+    fn ws_psi_first_order_terms_from_parts(
+        &self,
+        _block_states: &[ParameterBlockState],
+        _psi_dir: &LocationScaleJointPsiDirection,
+        _design_loc: &Array2<f64>,
+        _design_scale: &Array2<f64>,
+        _subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
+        Ok(None)
+    }
+
     /// Wire label for this family's primary (first) parameter block: `"mu"` for
     /// the Gaussian families, `"threshold"` for the Binomial ones. The shared
     /// direction/drift helpers name it in their diagnostics, so it is the one
@@ -360,6 +379,23 @@ impl LocationScaleJointPsiFamily for GaussianLocationScaleFamily {
             subsample,
         )
     }
+
+    fn ws_psi_first_order_terms_from_parts(
+        &self,
+        block_states: &[ParameterBlockState],
+        psi_dir: &LocationScaleJointPsiDirection,
+        design_loc: &Array2<f64>,
+        design_scale: &Array2<f64>,
+        subsample: Option<&[crate::outer_subsample::WeightedOuterRow]>,
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
+        Ok(Some(self.exact_newton_joint_psi_terms_from_parts(
+            block_states,
+            psi_dir,
+            design_loc,
+            design_scale,
+            subsample,
+        )?))
+    }
 }
 
 impl LocationScaleJointPsiFamily for GaussianLocationScaleWiggleFamily {
@@ -606,6 +642,22 @@ impl<F> ExactNewtonJointPsiWorkspace for LocationScaleJointPsiWorkspace<F>
 where
     F: LocationScaleJointPsiFamily,
 {
+    fn first_order_terms(
+        &self,
+        psi_index: usize,
+    ) -> Result<Option<gam_problem::ExactNewtonJointPsiTerms>, String> {
+        let Some(dir) = self.psi_direction(psi_index)? else {
+            return Ok(None);
+        };
+        self.family.ws_psi_first_order_terms_from_parts(
+            &self.block_states,
+            dir.as_ref(),
+            self.design_loc.as_ref(),
+            self.design_scale.as_ref(),
+            self.subsample_rows(),
+        )
+    }
+
     fn second_order_terms(
         &self,
         psi_i: usize,

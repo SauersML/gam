@@ -135,6 +135,20 @@ impl RowCoeffOperator {
         }
     }
 
+    /// Put the operator on an outer-subsample row measure: scale every pair
+    /// coefficient by the per-row Horvitz–Thompson factor from
+    /// [`outer_subsample_row_factor`]. The operator is row-linear in its pair
+    /// coefficients, so this is exactly the subsampled sum. `None` (no
+    /// subsample) returns the operator unchanged.
+    pub(crate) fn with_row_factor(mut self, row_factor: Option<&Array1<f64>>) -> Self {
+        if let Some(factor) = row_factor {
+            for pair in &mut self.pair_coeffs {
+                pair.coeff *= factor;
+            }
+        }
+        self
+    }
+
     pub(crate) fn acquire_scratch(&self) -> RowCoeffScratch {
         self.scratch_pool
             .lock()
@@ -709,6 +723,10 @@ pub(crate) struct GaussianLocationScaleHessianWorkspace {
     pub(crate) coeff_mm: Array1<f64>,
     pub(crate) coeff_ml: Array1<f64>,
     pub(crate) coeff_ll: Array1<f64>,
+    /// Horvitz–Thompson row factor of the outer subsample, when one is
+    /// applied; the β-directional derivative operators scale their row
+    /// coefficients by it so they differentiate the masked value Hessian.
+    pub(crate) outer_row_factor: Option<Array1<f64>>,
 }
 
 impl GaussianLocationScaleHessianWorkspace {
@@ -738,6 +756,7 @@ impl GaussianLocationScaleHessianWorkspace {
             coeff_mm,
             coeff_ml,
             coeff_ll,
+            outer_row_factor: None,
         })
     }
 
@@ -751,23 +770,20 @@ impl GaussianLocationScaleHessianWorkspace {
     /// `hessian_matvec`, `hessian_diagonal`) is row-linear in these arrays
     /// via `Xᵀ diag(W) X`, the resulting joint-Hessian is an unbiased
     /// estimator of the full-data joint Hessian.
+    ///
+    /// The same factor is kept for the β-directional derivatives: the outer
+    /// gradient differentiates this masked `log|H|`, so `D_βH[u]` and
+    /// `D²_βH[u,v]` must sum over the same rows, or the gradient is not the
+    /// derivative of the value it accompanies.
     pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
-        let n = self.coeff_mm.len();
-        let mut mask_mm = Array1::<f64>::zeros(n);
-        let mut mask_ml = Array1::<f64>::zeros(n);
-        let mut mask_ll = Array1::<f64>::zeros(n);
-        for r in rows {
-            let i = r.index;
-            mask_mm[i] = self.coeff_mm[i] * r.weight;
-            mask_ml[i] = self.coeff_ml[i] * r.weight;
-            mask_ll[i] = self.coeff_ll[i] * r.weight;
-        }
-        self.coeff_mm = mask_mm;
-        self.coeff_ml = mask_ml;
-        self.coeff_ll = mask_ll;
+        let factor = outer_subsample_row_factor(rows, self.coeff_mm.len());
+        self.coeff_mm *= &factor;
+        self.coeff_ml *= &factor;
+        self.coeff_ll *= &factor;
+        self.outer_row_factor = Some(factor);
     }
 }
 
@@ -950,6 +966,13 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            // The family's dense path sums every row; under a subsample the
+            // masked operator is the derivative of the masked value Hessian.
+            return Ok(self
+                .directional_derivative_operator(d_beta_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessian_directional_derivative_from_designs(
                 &self.block_states,
@@ -991,14 +1014,17 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         // channel too. Dropping it here made the operator-valued outer gradient
         // differentiate the old Fisher block (cross ≡ 0) while the LAML value
         // factorized the observed Hessian — an objective/gradient split (#1561).
-        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
-            self.xmu_design.clone(),
-            self.x_ls_design.clone(),
-            c_mm,
-            c_ml,
-            c_ll,
-            n,
-        ))))
+        Ok(Some(Arc::new(
+            make_two_block_row_coeff_operator(
+                self.xmu_design.clone(),
+                self.x_ls_design.clone(),
+                c_mm,
+                c_ml,
+                c_ll,
+                n,
+            )
+            .with_row_factor(self.outer_row_factor.as_ref()),
+        )))
     }
 
     fn second_directional_derivative(
@@ -1006,6 +1032,11 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            return Ok(self
+                .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
                 &self.block_states,
@@ -1051,15 +1082,35 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         // Same observed-curvature contract at fourth order: the operator must
         // carry d²(2κm)[u,v], exactly as the dense path does. Otherwise the
         // analytic outer Hessian is not the second derivative of its value.
-        Ok(Some(Arc::new(make_two_block_row_coeff_operator(
-            self.xmu_design.clone(),
-            self.x_ls_design.clone(),
-            c_mm,
-            c_ml,
-            c_ll,
-            n,
-        ))))
+        Ok(Some(Arc::new(
+            make_two_block_row_coeff_operator(
+                self.xmu_design.clone(),
+                self.x_ls_design.clone(),
+                c_mm,
+                c_ml,
+                c_ll,
+                n,
+            )
+            .with_row_factor(self.outer_row_factor.as_ref()),
+        )))
     }
+}
+
+/// Dense per-row Horvitz–Thompson factor of an outer-row subsample: the
+/// inverse-inclusion weight `1/π_i` on every sampled row and `0` on every other
+/// row. A joint-Hessian workspace keeps it so that the value Hessian and its
+/// β-directional derivatives `D_βH[u]` and `D²_βH[u,v]` all sum over one row
+/// measure. Every one of them is row-linear in its row coefficients, so
+/// scaling those coefficients by this factor is exactly the subsampled sum.
+pub(crate) fn outer_subsample_row_factor(
+    rows: &[crate::outer_subsample::WeightedOuterRow],
+    n: usize,
+) -> Array1<f64> {
+    let mut factor = Array1::<f64>::zeros(n);
+    for r in rows {
+        factor[r.index] = r.weight;
+    }
+    factor
 }
 
 /// Build a `RowCoeffOperator` for the standard two-block GAMLSS structure

@@ -14,6 +14,10 @@ pub(crate) struct BinomialLocationScaleHessianWorkspace {
     pub(crate) coeff_ll: Array1<f64>,
     pub(crate) direction_eta_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialDirectionEta>>>,
     pub(crate) first_coeff_cache: Mutex<HashMap<BinomialDirectionKey, Arc<BinomialRowCoeffTriple>>>,
+    /// Horvitz–Thompson row factor of the outer subsample, when one is
+    /// applied; the β-directional coefficient triples are scaled by it so the
+    /// derivative operators differentiate the masked value Hessian.
+    pub(crate) outer_row_factor: Option<Array1<f64>>,
     // No `second_coeff_cache` deliberately: see `second_coefficients` for why
     // the per-pair cache was a memory-only loss at large-scale shape.
 }
@@ -71,7 +75,28 @@ impl BinomialLocationScaleHessianWorkspace {
             coeff_ll,
             direction_eta_cache: Mutex::new(HashMap::new()),
             first_coeff_cache: Mutex::new(HashMap::new()),
+            outer_row_factor: None,
         })
+    }
+
+    /// Put a directional row-coefficient triple on the workspace's row
+    /// measure: unchanged on full data, scaled by the outer-subsample
+    /// Horvitz–Thompson factor otherwise.
+    fn row_measure_triple(
+        &self,
+        tt: Array1<f64>,
+        tl: Array1<f64>,
+        ll: Array1<f64>,
+    ) -> BinomialRowCoeffTriple {
+        let (tt, tl, ll) = match self.outer_row_factor.as_ref() {
+            Some(factor) => (tt * factor, tl * factor, ll * factor),
+            None => (tt, tl, ll),
+        };
+        BinomialRowCoeffTriple {
+            tt: Arc::new(tt),
+            tl: Arc::new(tl),
+            ll: Arc::new(ll),
+        }
     }
 
     pub(crate) fn direction_eta(
@@ -130,11 +155,7 @@ impl BinomialLocationScaleHessianWorkspace {
             &eta.ls,
             &self.family.link_kind,
         )?;
-        let value = Arc::new(BinomialRowCoeffTriple {
-            tt: Arc::new(tt),
-            tl: Arc::new(tl),
-            ll: Arc::new(ll),
-        });
+        let value = Arc::new(self.row_measure_triple(tt, tl, ll));
         let mut cache = self
             .first_coeff_cache
             .lock()
@@ -167,11 +188,7 @@ impl BinomialLocationScaleHessianWorkspace {
             &eta_v.ls,
             &self.family.link_kind,
         )?;
-        Ok(Arc::new(BinomialRowCoeffTriple {
-            tt: Arc::new(tt),
-            tl: Arc::new(tl),
-            ll: Arc::new(ll),
-        }))
+        Ok(Arc::new(self.row_measure_triple(tt, tl, ll)))
     }
 
     /// Apply a Horvitz–Thompson outer-row subsample mask to the precomputed
@@ -182,23 +199,24 @@ impl BinomialLocationScaleHessianWorkspace {
     /// `hessian_diagonal`) is row-linear in these arrays via `Xᵀ diag(W) X`,
     /// the resulting joint-Hessian is an unbiased estimator of the full-data
     /// joint Hessian.
+    ///
+    /// The same factor is kept for the β-directional derivatives: the outer
+    /// gradient differentiates this masked `log|H|`, so `D_βH[u]` and
+    /// `D²_βH[u,v]` must sum over the same rows. Cached first-order triples
+    /// were formed on the previous row measure and are dropped.
     pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
-        let n = self.coeff_tt.len();
-        let mut mask_tt = Array1::<f64>::zeros(n);
-        let mut mask_tl = Array1::<f64>::zeros(n);
-        let mut mask_ll = Array1::<f64>::zeros(n);
-        for r in rows {
-            let i = r.index;
-            mask_tt[i] = self.coeff_tt[i] * r.weight;
-            mask_tl[i] = self.coeff_tl[i] * r.weight;
-            mask_ll[i] = self.coeff_ll[i] * r.weight;
-        }
-        self.coeff_tt = mask_tt;
-        self.coeff_tl = mask_tl;
-        self.coeff_ll = mask_ll;
+        let factor = outer_subsample_row_factor(rows, self.coeff_tt.len());
+        self.coeff_tt *= &factor;
+        self.coeff_tl *= &factor;
+        self.coeff_ll *= &factor;
+        self.outer_row_factor = Some(factor);
+        self.first_coeff_cache
+            .get_mut()
+            .expect("binomial first coefficient cache lock poisoned")
+            .clear();
     }
 }
 

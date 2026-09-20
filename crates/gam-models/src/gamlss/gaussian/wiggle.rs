@@ -749,11 +749,13 @@ impl GaussianLocationScaleWiggleFamily {
     }
 
     /// The first directional Hessian operator along `d_beta_flat`, at the states
-    /// `operator_geometry` was built from.
+    /// `operator_geometry` was built from, on the row measure `row_factor`
+    /// (the outer-subsample Horvitz–Thompson factor, or `None` for all rows).
     pub(crate) fn gls_wiggle_directional_operator(
         &self,
         operator_geometry: &GlsWiggleOperatorGeometry,
         d_beta_flat: &Array1<f64>,
+        row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let GlsWiggleOperatorGeometry {
             geometry: geom,
@@ -844,7 +846,8 @@ impl GaussianLocationScaleWiggleFamily {
                 (2, 3, coeff_b_b1),
             ],
             n,
-        ))))
+        )
+        .with_row_factor(row_factor))))
     }
 
     /// Build a matrix-free `RowCoeffOperator` for the GLS Wiggle joint
@@ -853,11 +856,14 @@ impl GaussianLocationScaleWiggleFamily {
     /// assembly in `_from_designs`, with row-coefficient bundles that
     /// absorb the `ξ_u, ξ_v, ξ_u·ξ_v` row factors arising from
     /// `basis_u = diag(ξ_u)·B'`, `basis_uv = diag(ξ_u·ξ_v)·B''`, etc.
+    /// `row_factor` puts it on the outer-subsample row measure, as for
+    /// [`Self::gls_wiggle_directional_operator`].
     pub(crate) fn gls_wiggle_second_directional_operator(
         &self,
         operator_geometry: &GlsWiggleOperatorGeometry,
         d_beta_u: &Array1<f64>,
         d_beta_v: &Array1<f64>,
+        row_factor: Option<&Array1<f64>>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
         let GlsWiggleOperatorGeometry {
             geometry: geom,
@@ -1017,7 +1023,8 @@ impl GaussianLocationScaleWiggleFamily {
                 (3, 3, coeff_b1_b1),
             ],
             n,
-        ))))
+        )
+        .with_row_factor(row_factor))))
     }
 
     pub(crate) fn exact_newton_joint_hessiansecond_directional_derivative_from_designs(
@@ -2489,6 +2496,10 @@ pub(crate) struct GaussianLocationScaleWiggleHessianWorkspace {
     /// The geometry every directional operator of this workspace shares, built on the first
     /// request so value-only evaluations never build it (#2940).
     pub(crate) operator_geometry: std::sync::OnceLock<GlsWiggleOperatorGeometry>,
+    /// Horvitz–Thompson row factor of the outer subsample, when one is
+    /// applied; the β-directional derivative operators are put on the same
+    /// row measure as the masked value Hessian.
+    pub(crate) outer_row_factor: Option<Array1<f64>>,
 }
 
 impl GaussianLocationScaleWiggleHessianWorkspace {
@@ -2506,6 +2517,7 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
             x_ls: Arc::new(x_ls),
             pieces,
             operator_geometry: std::sync::OnceLock::new(),
+            outer_row_factor: None,
         })
     }
 
@@ -2538,36 +2550,23 @@ impl GaussianLocationScaleWiggleHessianWorkspace {
     /// The Gaussian wiggle has 7 coefficient arrays (no `coeff_lw_d`, unlike
     /// the binomial wiggle's 8) because the wiggle enters the Gaussian
     /// likelihood only through `q = η_μ + η_w` (no σ-chain).
+    ///
+    /// The same factor is kept for the β-directional derivatives: the outer
+    /// gradient differentiates this masked `log|H|`, so `D_βH[u]` and
+    /// `D²_βH[u,v]` must sum over the same rows.
     pub(crate) fn apply_outer_subsample(
         &mut self,
         rows: &[crate::outer_subsample::WeightedOuterRow],
     ) {
-        let n = self.pieces.coeff_mm.len();
-        let mut mask_mm = Array1::<f64>::zeros(n);
-        let mut mask_ml = Array1::<f64>::zeros(n);
-        let mut mask_ll = Array1::<f64>::zeros(n);
-        let mut mask_mw_b = Array1::<f64>::zeros(n);
-        let mut mask_mw_d = Array1::<f64>::zeros(n);
-        let mut mask_lw_b = Array1::<f64>::zeros(n);
-        let mut maskww = Array1::<f64>::zeros(n);
-        for r in rows {
-            let i = r.index;
-            let w = r.weight;
-            mask_mm[i] = self.pieces.coeff_mm[i] * w;
-            mask_ml[i] = self.pieces.coeff_ml[i] * w;
-            mask_ll[i] = self.pieces.coeff_ll[i] * w;
-            mask_mw_b[i] = self.pieces.coeff_mw_b[i] * w;
-            mask_mw_d[i] = self.pieces.coeff_mw_d[i] * w;
-            mask_lw_b[i] = self.pieces.coeff_lw_b[i] * w;
-            maskww[i] = self.pieces.coeff_ww[i] * w;
-        }
-        self.pieces.coeff_mm = mask_mm;
-        self.pieces.coeff_ml = mask_ml;
-        self.pieces.coeff_ll = mask_ll;
-        self.pieces.coeff_mw_b = mask_mw_b;
-        self.pieces.coeff_mw_d = mask_mw_d;
-        self.pieces.coeff_lw_b = mask_lw_b;
-        self.pieces.coeff_ww = maskww;
+        let factor = outer_subsample_row_factor(rows, self.pieces.coeff_mm.len());
+        self.pieces.coeff_mm *= &factor;
+        self.pieces.coeff_ml *= &factor;
+        self.pieces.coeff_ll *= &factor;
+        self.pieces.coeff_mw_b *= &factor;
+        self.pieces.coeff_mw_d *= &factor;
+        self.pieces.coeff_lw_b *= &factor;
+        self.pieces.coeff_ww *= &factor;
+        self.outer_row_factor = Some(factor);
     }
 }
 
@@ -2701,6 +2700,13 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            // The family's dense path sums every row; under a subsample the
+            // masked operator is the derivative of the masked value Hessian.
+            return Ok(self
+                .directional_derivative_operator(d_beta_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessian_directional_derivative_from_designs(
                 &self.block_states,
@@ -2714,8 +2720,11 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         &self,
         d_beta_flat: &Array1<f64>,
     ) -> Result<Option<Arc<dyn gam_problem::HyperOperator>>, String> {
-        self.family
-            .gls_wiggle_directional_operator(self.shared_operator_geometry()?, d_beta_flat)
+        self.family.gls_wiggle_directional_operator(
+            self.shared_operator_geometry()?,
+            d_beta_flat,
+            self.outer_row_factor.as_ref(),
+        )
     }
 
     fn second_directional_derivative(
@@ -2723,6 +2732,11 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
         d_beta_u_flat: &Array1<f64>,
         d_beta_v_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        if self.outer_row_factor.is_some() {
+            return Ok(self
+                .second_directional_derivative_operator(d_beta_u_flat, d_beta_v_flat)?
+                .map(|operator| operator.to_dense()));
+        }
         self.family
             .exact_newton_joint_hessiansecond_directional_derivative_from_designs(
                 &self.block_states,
@@ -2742,6 +2756,7 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleWiggleHessianWork
             self.shared_operator_geometry()?,
             d_beta_u,
             d_beta_v,
+            self.outer_row_factor.as_ref(),
         )
     }
 }
