@@ -3026,10 +3026,13 @@ fn traced_fixed_lambda_inner_solve_on_the_loaded_cohort_reports_its_cost() {
                 ));
             }
         }
-        Err(error) => emit(&format!(
-            "[cost] error after {:.1}s: {error}",
+        // The loaded cohort identifies the inner mode (the full fit recovers
+        // its positive loading), so a refused fixed-λ inner solve is an engine
+        // defect and must fail this test, not be logged past (#3886).
+        Err(error) => panic!(
+            "fixed-lambda inner solve on the loaded cohort refused after {:.1}s: {error}",
             clock.elapsed().as_secs_f64()
-        )),
+        ),
     }
 }
 
