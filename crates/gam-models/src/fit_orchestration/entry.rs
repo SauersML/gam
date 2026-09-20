@@ -2051,6 +2051,19 @@ fn fit_expanded_formula_with_notes(
             result: FitResult::Ctn(Box::new(payload)),
         });
     }
+    fit_formula_through_adaptive_resolution(formula, data, config)
+}
+
+/// Resolve `config`, fit `formula` at the adaptive structural start, and
+/// continue through the saturation-driven resolution loop. This is the one
+/// owner of that loop for a formula fit, so the library and the payload
+/// service reach the same fitted basis for the same request (the expectile
+/// payload route used to fit the fully provisioned basis with no loop, #4062).
+pub(crate) fn fit_formula_through_adaptive_resolution(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
         .resolve()
@@ -2684,11 +2697,11 @@ fn fit_from_formula_once_with_notes(
     // penalized expectile smooth with data-driven smoothing for free. This is a
     // genuine estimator route, not a silent swap: it fires only on the explicit
     // `family = "expectile"`. Every other family falls through unchanged.
-    if let Some(result) = fit_expectile_if_requested(formula, data, &config)? {
+    if let Some(outcome) = fit_expectile_if_requested(formula, data, &config)? {
         return Ok(FormulaFitResult {
-            result: result.into_fit_result(),
-            inference_notes: FitNotes::default(),
-            unidentified_scalar_terms: Vec::new(),
+            result: outcome.fit.into_fit_result(),
+            inference_notes: outcome.materialized.inference_notes,
+            unidentified_scalar_terms: outcome.materialized.unidentified_scalar_terms,
         });
     }
     let mat = materialize(formula, data, &config)?;
@@ -2907,18 +2920,44 @@ pub(crate) fn fit_expectile_if_requested(
     formula: &str,
     data: &Dataset,
     config: &FitConfig,
-) -> Result<Option<ExpectileFit>, WorkflowError> {
+) -> Result<Option<ExpectileOutcome>, WorkflowError> {
     let Some(levels) = expectile_levels_for_config(config)? else {
         return Ok(None);
     };
-    match levels.as_slice() {
-        [tau] => Ok(Some(ExpectileFit::Single(fit_expectile_laws(
-            formula, data, config, *tau,
-        )?))),
-        _ => Ok(Some(ExpectileFit::Joint(fit_expectile_location_scale(
-            formula, data, config, levels,
-        )?))),
-    }
+    let mut materialized = ExpectileMaterializeNotes::default();
+    let fit = match levels.as_slice() {
+        [tau] => ExpectileFit::Single(fit_expectile_laws(
+            formula,
+            data,
+            config,
+            *tau,
+            &mut materialized,
+        )?),
+        _ => ExpectileFit::Joint(fit_expectile_location_scale(
+            formula,
+            data,
+            config,
+            levels,
+            &mut materialized,
+        )?),
+    };
+    Ok(Some(ExpectileOutcome { fit, materialized }))
+}
+
+/// An expectile fit together with what its one inner materialization reported.
+pub(crate) struct ExpectileOutcome {
+    pub(crate) fit: ExpectileFit,
+    pub(crate) materialized: ExpectileMaterializeNotes,
+}
+
+/// The advisories and removed-term records of the inner Gaussian
+/// materialization an expectile driver runs. They describe the model that was
+/// fitted (a capped basis, a structural warning, a pruned scalar term), so every
+/// front end reports them exactly as it does for any other formula fit (#1543).
+#[derive(Default)]
+pub(crate) struct ExpectileMaterializeNotes {
+    pub(crate) inference_notes: FitNotes,
+    pub(crate) unidentified_scalar_terms: Vec<UnidentifiedScalarTerm>,
 }
 
 /// The two shapes an expectile request resolves to.
@@ -2988,6 +3027,7 @@ fn fit_expectile_location_scale(
     data: &Dataset,
     config: &FitConfig,
     levels: Vec<f64>,
+    materialized: &mut ExpectileMaterializeNotes,
 ) -> Result<ExpectileLocationScaleFitResult, WorkflowError> {
     if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
@@ -3005,6 +3045,8 @@ fn fit_expectile_location_scale(
         ..config.clone()
     };
     let mat = materialize(formula, data, &location_scale_config)?;
+    materialized.inference_notes = mat.inference_notes;
+    materialized.unidentified_scalar_terms = mat.unidentified_scalar_terms;
     let FitRequest::GaussianLocationScale(request) = mat.request else {
         return Err(WorkflowError::InvalidConfig {
             reason: "joint expectile regression is only defined for a Gaussian location-scale \
@@ -3194,6 +3236,7 @@ fn fit_expectile_laws(
     data: &Dataset,
     config: &FitConfig,
     tau: f64,
+    materialized: &mut ExpectileMaterializeNotes,
 ) -> Result<StandardFitResult, WorkflowError> {
     if config.frailty.is_active() {
         return Err(WorkflowError::InvalidConfig {
@@ -3218,6 +3261,8 @@ fn fit_expectile_laws(
     // transforms) does not depend on the prior weights, so it is reused across
     // every LAWS iteration; only the weight vector and the resulting β change.
     let base_mat = materialize(formula, data, &gaussian_config)?;
+    materialized.inference_notes = base_mat.inference_notes;
+    materialized.unidentified_scalar_terms = base_mat.unidentified_scalar_terms;
     let FitRequest::Standard(base_request) = base_mat.request else {
         return Err(WorkflowError::InvalidConfig {
             reason: "expectile regression is only defined for standard (non-survival, \
@@ -4457,8 +4502,14 @@ mod joint_expectile_scale_posterior_tests {
             expectile_tau: Some(LEVELS.to_vec()),
             ..FitConfig::default()
         };
-        let mut result = fit_expectile_location_scale("y ~ s(x)", &data, &config, LEVELS.to_vec())
-            .expect("joint expectile fit");
+        let mut result = fit_expectile_location_scale(
+            "y ~ s(x)",
+            &data,
+            &config,
+            LEVELS.to_vec(),
+            &mut ExpectileMaterializeNotes::default(),
+        )
+        .expect("joint expectile fit");
         let y_index = data
             .headers
             .iter()
@@ -4498,6 +4549,149 @@ mod joint_expectile_scale_posterior_tests {
                 "c_τ without the scale-block covariance must be refused, got the plug-in \
                  {plug_in:?} (integrated {integrated:?})"
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod expectile_front_end_tests {
+    use super::*;
+
+    const CR_CAP: &str = "cubic-regression ('cr'/'sz') basis reduced from k=8 to k=5";
+
+    /// `y = sin(3x) + (0.3 + 0.6x)·ε` on a covariate with 5 distinct values,
+    /// from a fixed LCG with Box–Muller, so `s(x, bs='cr', k=8)` is capped.
+    fn five_level_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x1543_2026_0920_0007;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|i| {
+                let x = (i % 5) as f64 / 4.0;
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let z = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let y = (3.0 * x).sin() + (0.3 + 0.6 * x) * z;
+                csv::StringRecord::from(vec![x.to_string(), y.to_string()])
+            })
+            .collect();
+        let headers = ["x", "y"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    fn expectile_config(levels: &[f64]) -> FitConfig {
+        FitConfig {
+            family: Some("expectile".to_string()),
+            expectile_tau: Some(levels.to_vec()),
+            ..FitConfig::default()
+        }
+    }
+
+    fn assert_cr_cap_reported(advisories: &[String], route: &str) {
+        assert!(
+            advisories.iter().any(|note| note.contains(CR_CAP)),
+            "{route}: the inner materialization's k cap must reach the caller, got {advisories:?}"
+        );
+    }
+
+    /// The expectile drivers materialize their own inner Gaussian design, and
+    /// what that materialization reports describes the fitted model. A capped
+    /// `k` must reach the library caller and the saved payload alike, as it
+    /// does for every other family (#1543).
+    #[test]
+    fn expectile_fits_report_the_inner_materialization_advisories() {
+        let data = five_level_dataset(200);
+        let formula = "y ~ s(x, bs='cr', k=8)";
+
+        let single = expectile_config(&[0.5]);
+        let library = fit_from_formula_with_notes(formula, &data, &single)
+            .expect("single-level expectile fit");
+        assert_cr_cap_reported(&library.inference_notes.advisories, "library, one level");
+        let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
+            formula.to_string(),
+            &data,
+            &single,
+        )
+        .expect("single-level expectile payload");
+        assert_cr_cap_reported(&payload.inference_notes, "payload, one level");
+
+        let joint = expectile_config(&[0.25, 0.75]);
+        let library = fit_from_formula_with_notes(formula, &data, &joint)
+            .expect("joint expectile fit");
+        assert_cr_cap_reported(&library.inference_notes.advisories, "library, two levels");
+        let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
+            formula.to_string(),
+            &data,
+            &joint,
+        )
+        .expect("joint expectile payload");
+        assert_cr_cap_reported(&payload.inference_notes, "payload, two levels");
+    }
+
+    /// `z = sin(3x₁)·cos(2x₂) + 0.3ε` on a scattered 2-D design, so the
+    /// default `s(x1, x2)` is a multivariate radial smooth whose adaptive start
+    /// is smaller than its fully provisioned basis.
+    fn scattered_surface_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x4062_2026_0920_0011;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|_| {
+                let x1 = unif();
+                let x2 = unif();
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let e = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let z = (3.0 * x1).sin() * (2.0 * x2).cos() + 0.3 * e;
+                csv::StringRecord::from(vec![x1.to_string(), x2.to_string(), z.to_string()])
+            })
+            .collect();
+        let headers = ["x1", "x2", "z"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    /// A one-level expectile fit is a standard fit, so the library and the
+    /// saved payload must reach it through the same adaptive-resolution loop
+    /// and land on the same basis and coefficients (#4062). The payload route
+    /// used to fit the fully provisioned radial basis instead.
+    #[test]
+    fn single_level_expectile_payload_matches_the_library_fit() {
+        let data = scattered_surface_dataset(200);
+        let formula = "z ~ s(x1, x2)";
+        let config = expectile_config(&[0.5]);
+        let library = fit_from_formula_with_notes(formula, &data, &config)
+            .expect("library expectile fit");
+        let FitResult::Standard(library) = library.result else {
+            panic!("a one-level expectile fit is a standard fit");
+        };
+        let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
+            formula.to_string(),
+            &data,
+            &config,
+        )
+        .expect("expectile payload");
+        let saved = payload
+            .fit_result
+            .as_ref()
+            .expect("standard expectile payload carries its fit result");
+        assert_eq!(
+            saved.beta.len(),
+            library.fit.beta.len(),
+            "Python / CLI --out and the library must fit the same expectile basis"
+        );
+        for (saved_coef, library_coef) in saved.beta.iter().zip(library.fit.beta.iter()) {
+            assert!(
+                (saved_coef - library_coef).abs() <= 1e-4 * (1.0 + library_coef.abs()),
+                "coefficients differ between front ends: {saved_coef} vs {library_coef}"
+            );
         }
     }
 }
