@@ -12,7 +12,13 @@
 //! success and the refusal text on failure, so every rung contributes a
 //! `(|Pg|, bound, rung, railed)` row whether or not it converged.
 //!
-//! Report-only by construction: the deliverable is the printed table.
+//! The table is printed for every rung first; then the test asserts gam#2760's
+//! acceptance criterion — "convergence at the larger rungs against the existing
+//! bounds, not a widened stationarity bound" — at every rung: each fit must
+//! return a Standard result carrying an analytic outer certificate (the fit has
+//! three active penalties plus κ, so an outer coordinate always exists and a
+//! missing certificate is itself a defect). A report-only ladder that merely
+//! printed `FAIL` could never catch that non-convergence coming back.
 
 use gam::{
     FitRequest, FitResult, StandardFitRequest,
@@ -202,7 +208,11 @@ fn rung(n: usize) -> Result<String, String> {
                 .convergence_evidence()
                 .outer_certificate()
                 .map(|c| c.summary())
-                .unwrap_or_else(|| "<no criterion certificate>".to_string());
+                .ok_or_else(|| {
+                    "fit returned without an outer criterion certificate although it has \
+                     outer coordinates (three penalties plus kappa)"
+                        .to_string()
+                })?;
             Ok(format!(
                 "V={:?} rho={:?} outer_iters={} | {cert}",
                 s.fit.reml_score(),
@@ -217,6 +227,7 @@ fn rung(n: usize) -> Result<String, String> {
 #[test]
 fn probe_2760_pg_and_bound_at_every_rung() {
     install_trace();
+    let mut failures = Vec::new();
     for &n in &[1_000usize, 2_000, 4_000, 8_000, 16_000] {
         eprintln!("[2760-ladder] ==== rung n={n} ====");
         log::debug!("[KAPPA-RUNG] ================ n={n} ================");
@@ -226,10 +237,19 @@ fn probe_2760_pg_and_bound_at_every_rung() {
                 "[2760-ladder] n={n:>6} OK   ({:.1}s) {line}",
                 t0.elapsed().as_secs_f64()
             ),
-            Err(reason) => eprintln!(
-                "[2760-ladder] n={n:>6} FAIL ({:.1}s) {reason}",
-                t0.elapsed().as_secs_f64()
-            ),
+            Err(reason) => {
+                eprintln!(
+                    "[2760-ladder] n={n:>6} FAIL ({:.1}s) {reason}",
+                    t0.elapsed().as_secs_f64()
+                );
+                failures.push(format!("n={n}: {reason}"));
+            }
         }
     }
+    assert!(
+        failures.is_empty(),
+        "gam#2760: the iso-kappa joint outer search must converge against its existing \
+         stationarity bound at every rung; failing rungs:\n  - {}",
+        failures.join("\n  - ")
+    );
 }
