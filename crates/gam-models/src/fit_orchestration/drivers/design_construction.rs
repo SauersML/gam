@@ -730,9 +730,6 @@ fn bounded_prior_shapes(prior: &BoundedCoefficientPriorSpec) -> Result<Option<(f
         // The shrinkage prior is Gaussian on the latent coordinate; the fit
         // carries it as a REML-weighted penalty block, not as a prior term.
         BoundedCoefficientPriorSpec::Shrinkage => return Ok(None),
-        // Uniform on the normalized user-scale coefficient z in (0, 1). In latent space this is
-        // exactly the Jacobian term for the logistic transform, up to an additive width constant.
-        BoundedCoefficientPriorSpec::Uniform => (1.0, 1.0),
         BoundedCoefficientPriorSpec::Beta { a, b } => (*a, *b),
     };
     if !(a.is_finite() && a > 0.0 && b.is_finite() && b > 0.0) {
@@ -3011,8 +3008,7 @@ fn fit_bounded_term_collection_with_design(
                 BoundedCoefficientPriorSpec::Shrinkage => {
                     bounded_shrinkage_latent_center(min_internal, max_internal)
                 }
-                BoundedCoefficientPriorSpec::Uniform
-                | BoundedCoefficientPriorSpec::Beta { .. } => 0.0,
+                BoundedCoefficientPriorSpec::Beta { .. } => 0.0,
             };
             bounded_terms.push(BoundedLinearTermMeta {
                 col_idx,

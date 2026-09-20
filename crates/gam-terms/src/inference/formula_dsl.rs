@@ -988,6 +988,7 @@ mod tests {
             ("bounded(x, min=0, max=1, pull=uniform)", "unknown option `pull` in bounded(); use `prior`"),
             ("bounded(x, min=0, max=1, prior=log-jacobian)", "unknown bounded() prior `log-jacobian`; use `uniform`"),
             ("bounded(x, min=0, max=1, prior=jacobian)", "unknown bounded() prior `jacobian`; use `uniform`"),
+            ("bounded(x, min=0, max=1, prior=none)", "unknown bounded() prior `none`; use `uniform`"),
         ];
         for (term, expected) in cases {
             let err = term_error(term);
@@ -2678,9 +2679,9 @@ fn parse_survival_formulaspec(
     })
 }
 
-/// The prior a `bounded()` term asks for, or `None` for `prior=none`: no prior
-/// beyond the box itself, which is the box-constrained linear term rather than
-/// a prior on the interval chart.
+/// The prior a `bounded()` term asks for on its interval chart, or `None` for
+/// `prior=uniform`: flat on the box of the coefficient, which is the
+/// box-constrained linear term rather than a prior on the interval chart.
 fn parse_bounded_priorspec(
     options: &BTreeMap<String, String>,
     min: f64,
@@ -2702,8 +2703,7 @@ fn parse_bounded_priorspec(
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
             "shrinkage" => Ok(Some(BoundedCoefficientPriorSpec::Shrinkage)),
-            "none" => Ok(None),
-            "uniform" => Ok(Some(BoundedCoefficientPriorSpec::Uniform)),
+            "uniform" => Ok(None),
             "center" => Ok(Some(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 })),
             other => Err(FormulaDslError::InvalidArgument {
                 reason: match removed_spellings::canonical_for(
@@ -2714,7 +2714,7 @@ fn parse_bounded_priorspec(
                         "unknown bounded() prior `{other}`; use `{canonical}`: {raw}"
                     ),
                     None => format!(
-                        "bounded() prior must be one of shrinkage|none|uniform|center, got '{other}': {raw}"
+                        "bounded() prior must be one of shrinkage|uniform|center, got '{other}': {raw}"
                     ),
                 },
             }
@@ -3460,13 +3460,17 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                 }
                 let double_penalty = option_bool(&options, "double_penalty")?;
                 let Some(prior) = parse_bounded_priorspec(&options, min, max, raw)? else {
-                    // `prior=none` is flat on the box of the coefficient. A
+                    // `prior=uniform` is flat on the box of the coefficient. A
                     // flat prior on the logit chart of the interval transform
                     // is improper: as the chart runs to either infinity the
                     // likelihood tends to its value at the rail, a positive
                     // constant, so that posterior has no mean, and at a binding
                     // box the fit stalled at the chart clamp and armed Jeffreys
-                    // (gam#3923). Flat on the box itself is proper, and it is
+                    // (gam#3923). Flat on the box pulled back to the chart
+                    // (the log-Jacobian correction) is proper, but the fit then
+                    // publishes the chart's mode, which is not the box
+                    // posterior's mean (gam#3479). Flat on the box itself, in
+                    // the coefficient's own coordinate, is proper, and it is
                     // the box-constrained linear term: the two constraint rows
                     // `beta >= min` and `beta <= max`, whose KKT solve puts the
                     // mode (the constrained MLE) on the rail when the box binds,
@@ -3475,7 +3479,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     if double_penalty == Some(true) {
                         return Err(FormulaDslError::IncompatibleTerm {
                             reason: format!(
-                                "bounded(prior=none) is the unpenalised constrained fit and cannot \
+                                "bounded(prior=uniform) is the unpenalised constrained fit and cannot \
                                  take double_penalty=true; write linear({}, min={min}, max={max}) \
                                  for a penalised box-constrained slope: {raw}",
                                 vars[0]

@@ -118,7 +118,7 @@ and for the bounds (`lower=`, `upper=`) are refused with an error that
 names `linear()`, `min=` or `max=`.
 
 `bounded(x, min, max)` applies an exact interval transform to `x`
-whenever it carries a prior. With `prior=none` it is the unpenalised
+whenever it carries a prior. With `prior=uniform` it is the unpenalised
 constrained linear term `linear(x, min=, max=, double_penalty=false)`.
 Required options: `min` and `max` (finite, `min < max`).
 
@@ -144,7 +144,7 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
   zero lies outside the box it is not an admissible value, and the
   prior centres at the box midpoint `(min + max) / 2`, the point of the
   interval map that favours neither bound.
-- `none` — no prior and no penalty beyond the box itself: flat on the
+- `uniform` — no prior and no penalty beyond the box itself: flat on the
   box of the coefficient. It is exactly
   `linear(x, min=, max=, double_penalty=false)`. The bounds are linear
   inequality constraints, so the posterior mode is the constrained
@@ -152,9 +152,9 @@ bounded(x, min=0, max=1, target=0.5, strength=3)
   published coefficient is the mean of that truncated posterior. It
   cannot take `double_penalty=true`. (A flat prior on the logit chart
   would be improper: the likelihood tends to a positive constant as the
-  chart runs to either rail.)
-- `uniform` — flat on the original scale, applied as a log-Jacobian
-  correction.
+  chart runs to either rail. Flat on the box pulled back to the chart is
+  proper, but its chart mode is not the box posterior's mean.) `none` is
+  refused with an error that names `uniform`.
 - `center` — `Beta(2, 2)` toward the midpoint.
 
 `target` plus `strength` is shorthand for a Beta prior:

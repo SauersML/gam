@@ -103,7 +103,6 @@ fn linear_term_label(name: &str, meta: Option<&LinearTermSpec>) -> String {
         LinearCoefficientGeometry::Bounded { min, max, prior } => {
             let prior = match prior {
                 BoundedCoefficientPriorSpec::Shrinkage => "shrinkage(REML)".to_string(),
-                BoundedCoefficientPriorSpec::Uniform => "Uniform(log-Jacobian)".to_string(),
                 BoundedCoefficientPriorSpec::Beta { a, b } => format!("Beta({a:.3},{b:.3})"),
             };
             let bounds = bounds.map(|b| format!(", {b}")).unwrap_or_default();

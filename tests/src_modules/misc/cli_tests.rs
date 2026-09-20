@@ -4000,37 +4000,11 @@ fn parse_bounded_linear_term_with_center_prior() {
 }
 
 #[test]
-fn parse_bounded_linear_termwith_uniform_prior() {
+fn parse_bounded_linear_uniform_prior_is_the_box_constrained_linear_term() {
+    // gam#3923 / gam#3479: `prior=uniform` is flat on the box of the
+    // coefficient, which is exactly the unpenalised box-constrained linear
+    // term. There is no flat-chart variant and no log-Jacobian chart variant.
     let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"uniform\") + z")
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
-    assert_eq!(parsed.terms.len(), 2);
-    match &parsed.terms[0] {
-        ParsedTerm::BoundedLinear {
-            name,
-            min,
-            max,
-            prior,
-            double_penalty,
-        } => {
-            assert_eq!(name, "mu_hat");
-            assert_eq!(*min, 0.0);
-            assert_eq!(*max, 1.0);
-            match prior {
-                BoundedCoefficientPriorSpec::Uniform => {}
-                other => panic!("unexpected prior: {other:?}"),
-            }
-            assert!(!*double_penalty);
-        }
-        other => panic!("unexpected term: {other:?}"),
-    }
-}
-
-#[test]
-fn parse_bounded_linear_without_prior_is_the_box_constrained_linear_term() {
-    // gam#3923: `prior=none` is flat on the box of the coefficient, which is
-    // exactly the unpenalised box-constrained linear term; there is no
-    // flat-chart variant.
-    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none) + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
@@ -4050,9 +4024,16 @@ fn parse_bounded_linear_without_prior_is_the_box_constrained_linear_term() {
         other => panic!("unexpected term: {other:?}"),
     }
     assert!(
-        parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none, double_penalty=true)")
+        parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=uniform, double_penalty=true)")
             .is_err(),
         "the unpenalised constrained fit cannot take a double penalty"
+    );
+    let removed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=none)")
+        .expect_err("`none` is a removed spelling of `uniform`")
+        .to_string();
+    assert!(
+        removed.contains("use `uniform`"),
+        "the refusal must name the canonical spelling: {removed}"
     );
 }
 

@@ -1072,9 +1072,12 @@ pub const BOUNDED_SHRINKAGE_PENALTY_SOURCE: &str = "BoundedShrinkage";
 ///
 /// There is no flat-chart variant: a flat prior on the logit chart is improper,
 /// because the likelihood tends to a positive constant as the chart runs to
-/// either rail (gam#3923). `bounded(x, min, max, prior=none)` is flat on the
-/// box of the coefficient instead, which the formula parser lowers to the
-/// box-constrained linear term `linear(x, min, max, double_penalty=false)`.
+/// either rail (gam#3923). Nor is there a log-Jacobian variant, flat on the box
+/// pulled back to the chart: its mode on the chart is not the box posterior's
+/// mean (gam#3479). `bounded(x, min, max, prior=uniform)` is flat on the box of
+/// the coefficient in its own coordinate instead, which the formula parser
+/// lowers to the box-constrained linear term
+/// `linear(x, min, max, double_penalty=false)`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
     /// The formula default: a Gaussian prior on the latent logit coordinate,
@@ -1083,7 +1086,6 @@ pub enum BoundedCoefficientPriorSpec {
     /// inside `(min, max)`; otherwise zero is not an admissible value and the
     /// prior centres at the box midpoint, the latent origin.
     Shrinkage,
-    Uniform,
     Beta {
         a: f64,
         b: f64,
@@ -1526,8 +1528,7 @@ impl TermCollectionSpec {
                     .into());
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::Shrinkage
-                    | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::Shrinkage => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(SmoothError::invalid_config(format!(

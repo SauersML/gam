@@ -90,8 +90,10 @@ pub(crate) const DESCRIPTOR_KINDS: &[RemovedSpelling] = &[
 pub(crate) const TERM_OPTION_KEYS: &[RemovedSpelling] =
     &[("lower", "min"), ("upper", "max"), ("pull", "prior")];
 
-/// `bounded(..., prior=)` values.
+/// `bounded(..., prior=)` values. `none` was a second spelling of the flat
+/// prior on the box of the coefficient, which is `uniform` (gam#3479).
 pub(crate) const BOUNDED_PRIORS: &[RemovedSpelling] = &[
+    ("none", "uniform"),
     ("log-jacobian", "uniform"),
     ("log_jacobian", "uniform"),
     ("jacobian", "uniform"),
