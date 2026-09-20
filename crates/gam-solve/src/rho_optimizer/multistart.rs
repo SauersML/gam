@@ -5,7 +5,7 @@
 //!
 //! A seed's start value is an upper bound on the minimum of the basin it drains
 //! into, never a lower bound, so no comparison of start values can prove a seed
-//! dominated. With no valid lower bound on a basin, every generated seed is
+//! dominated. With no valid lower bound on a basin, every declared start is
 //! searched. Each seed is its own complete, certified outer run on a lane: a task
 //! of the caller's Rayon pool when the caller runs inside one, else its own OS
 //! thread submitting to the global pool (the topology race's pattern for
@@ -15,16 +15,27 @@
 //! the lowest certified value wins, values within the criterion's rounding
 //! envelope of each other tie, and a tie goes to the lower seed index, so the
 //! winner depends neither on which run finished first nor on how many ran at once.
+//!
+//! A finished run's payload (for a custom family, its terminal inner mode and
+//! every O(n) buffer that carries) is kept only while it can still be the one
+//! published, and it keeps its search's grant on the ledger until it is dropped
+//! (#3238).
 
 use super::*;
 
-/// One parallel multistart: the seeds, each run's outcome with the caller's
-/// per-run payload, the keep-best winner among the certified runs, and how
-/// they ran.
+/// One parallel multistart: the seeds, each run's outcome, the keep-best winner
+/// among the certified runs, the one payload a caller publishes, and how they
+/// ran.
 pub struct MultistartOutcome<R> {
     pub seeds: Vec<Array1<f64>>,
-    pub runs: Vec<(Result<CertifiedOuterResult, EstimationError>, R)>,
+    /// Every seed's outcome, in seed order.
+    pub outcomes: Vec<Result<CertifiedOuterResult, EstimationError>>,
     pub winner: Option<usize>,
+    /// The caller's payload from the winner's run or, when no seed certified,
+    /// from the first seed's run. No other payload outlives the multistart: each
+    /// was dropped as soon as the finished outcomes showed it could not be this
+    /// one (#3238).
+    pub payload: R,
     /// Lanes the seeds ran on.
     pub lanes: usize,
     /// The most searches the memory governor had live at once.
@@ -40,9 +51,9 @@ impl<R> MultistartOutcome<R> {
         let outcomes: Vec<String> = self
             .seeds
             .iter()
-            .zip(&self.runs)
+            .zip(&self.outcomes)
             .enumerate()
-            .map(|(index, (seed, (outcome, _)))| match outcome {
+            .map(|(index, (seed, outcome))| match outcome {
                 Ok(certified) => format!(
                     "seed {index} rho={:?}: certified value={:.9e}",
                     seed.to_vec(),
@@ -72,6 +83,10 @@ const SEED_RUN_STACK_BYTES: usize = 64 << 20;
 /// governor has granted its predicted working set. A refused run waits for a live
 /// run to finish; with no run live it starts anyway, since it is then the serial
 /// run. It never fails and never takes a smaller working set.
+///
+/// A finished run whose payload can still be published keeps its grant: the
+/// payload is state its search built, inside the working set the grant charged,
+/// so the ledger carries it until [`FinishedSeeds`] drops it (#3238).
 struct LaneAdmission<'a> {
     governor: &'a gam_runtime::resource::MemoryGovernor,
     working_set_bytes: usize,
@@ -108,8 +123,15 @@ impl LaneAdmission<'_> {
         ))
     }
 
-    fn release(&self, lane: &gam_runtime::resource::SearchLaneBudget) {
-        lane.release_grant();
+    /// End an admitted run. `retired` holds the payloads the run's outcome just
+    /// ruled out, its own among them unless it can still be published, each with
+    /// the lane whose grant charged it: they are freed, then their grants return
+    /// to the ledger.
+    fn release<R>(&self, retired: Vec<RetiredSeed<R>>) {
+        for (payload, lane) in retired {
+            drop(payload);
+            lane.release_grant();
+        }
         let mut live = self
             .live
             .lock()
@@ -119,27 +141,184 @@ impl LaneAdmission<'_> {
     }
 }
 
+/// A payload a finished run no longer needs, with the lane whose grant charged
+/// it (`None` for a run that panicked and left none).
+type RetiredSeed<R> = (
+    Option<R>,
+    std::sync::Arc<gam_runtime::resource::SearchLaneBudget>,
+);
+
+/// What one seed's run ended with: its outcome and wall time, or its panic.
+type SeedRun = std::thread::Result<(Result<CertifiedOuterResult, EstimationError>, f64)>;
+
+/// A finished seed run: how it ended and, while its payload can still be the
+/// one published, that payload with the lane whose grant charges it.
+struct FinishedSeed<R> {
+    ran: SeedRun,
+    held: Option<(R, std::sync::Arc<gam_runtime::resource::SearchLaneBudget>)>,
+}
+
+/// The finished seed runs of one multistart, in seed order (#3238).
+///
+/// Filing a run drops, at once, every payload the outcomes finished so far rule
+/// out of publication ([`publishable_payloads`]). Holding every payload until the
+/// last seed finished kept S − c of them (S seeds, c lanes) outside the working
+/// set the admission charged: a custom family's `CustomOuterState`, whose terminal
+/// inner mode owns per-block linear predictors and working sets of n rows each.
+struct FinishedSeeds<R> {
+    seeds: std::sync::Mutex<Vec<Option<FinishedSeed<R>>>>,
+}
+
+impl<R> FinishedSeeds<R> {
+    fn new(count: usize) -> Self {
+        Self {
+            seeds: std::sync::Mutex::new((0..count).map(|_| None).collect()),
+        }
+    }
+
+    /// File seed `index`'s run, made on `lane`, and return every payload that can
+    /// no longer be published, for [`LaneAdmission::release`] to free.
+    fn file(
+        &self,
+        index: usize,
+        ran: std::thread::Result<(Result<CertifiedOuterResult, EstimationError>, R, f64)>,
+        lane: &std::sync::Arc<gam_runtime::resource::SearchLaneBudget>,
+    ) -> Vec<RetiredSeed<R>> {
+        let mut seeds = self
+            .seeds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut retired = Vec::new();
+        seeds[index] = Some(match ran {
+            Ok((outcome, payload, seconds)) => FinishedSeed {
+                ran: Ok((outcome, seconds)),
+                held: Some((payload, std::sync::Arc::clone(lane))),
+            },
+            Err(panic) => {
+                retired.push((None, std::sync::Arc::clone(lane)));
+                FinishedSeed {
+                    ran: Err(panic),
+                    held: None,
+                }
+            }
+        });
+        let values: Vec<Option<Option<f64>>> = seeds
+            .iter()
+            .map(|seed| seed.as_ref().map(|seed| certified_value(&seed.ran)))
+            .collect();
+        for (seed, publishable) in seeds.iter_mut().zip(publishable_payloads(&values)) {
+            if !publishable
+                && let Some((payload, lane)) = seed.as_mut().and_then(|seed| seed.held.take())
+            {
+                retired.push((Some(payload), lane));
+            }
+        }
+        retired
+    }
+
+    fn into_inner(self) -> Vec<Option<FinishedSeed<R>>> {
+        self.seeds
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The value keep-best compares for a finished run, or `None` when the run did not
+/// certify (a panic included).
+fn certified_value(ran: &SeedRun) -> Option<f64> {
+    match ran {
+        Ok((Ok(certified), _)) => Some(certified.final_value()),
+        _ => None,
+    }
+}
+
+/// Whether each seed's payload can still be the one a multistart publishes, from
+/// the runs finished so far: `values[i]` is `None` while seed `i` runs, and
+/// `Some(v)` once it has finished, with `v` its certified value or `None` when it
+/// did not certify (#3238).
+///
+/// The published payload is the winner's, or the first seed's when no seed
+/// certifies. Keep-best ([`multistart_winner`]) walks the seeds in order, and a run
+/// it displaces never becomes the incumbent again, so a certified run cannot win
+/// once
+/// - every seed before it has finished and the walk up to it leaves another
+///   incumbent, or
+/// - a certified run after it displaces it: the walk compares the two only if it
+///   is still the incumbent there, and it has already lost otherwise.
+///
+/// A run that did not certify never wins, and the first seed's payload is needed
+/// only until some seed certifies, since a winner then exists. The winner at the
+/// end is never ruled out: the full walk keeps it from its own step on.
+fn publishable_payloads(values: &[Option<Option<f64>>]) -> Vec<bool> {
+    let finished_prefix = values.iter().take_while(|value| value.is_some()).count();
+    let prefix_incumbent = keep_best(
+        values[..finished_prefix]
+            .iter()
+            .map(|&value| value.flatten()),
+    );
+    let any_certified = values.iter().any(|value| matches!(value, Some(Some(_))));
+    values
+        .iter()
+        .enumerate()
+        .map(|(index, value)| match value {
+            None => true,
+            Some(None) => index == 0 && !any_certified,
+            Some(Some(own)) => {
+                let lost_its_step = index < finished_prefix && prefix_incumbent != Some(index);
+                let displaced_after = values[index + 1..]
+                    .iter()
+                    .any(|later| matches!(later, Some(Some(later)) if displaces(*own, *later)));
+                !lost_its_step && !displaced_after
+            }
+        })
+        .collect()
+}
+
 impl OuterProblem {
-    /// Whether the seed policy is a full multistart: it generates more than one
-    /// seed and its budget covers every one of them. A policy that generates a
-    /// single seed is a single start whatever its budget.
-    pub fn searches_every_seed(&self) -> bool {
-        self.seed_config.max_seeds > 1 && self.seed_config.seed_budget >= self.seed_config.max_seeds
+    /// The starts a multistart searches, in seed order: `leading` (a joined warm
+    /// start) when given, then this problem's own derived start
+    /// ([`outer_start_point`](crate::rho_optimizer::run_plan::outer_start_point)),
+    /// then one start per level of `additional_levels`, every coordinate at that
+    /// level. Each is projected into the search box and exact duplicates are
+    /// dropped, so a level beyond a face lands on that face.
+    pub fn multistart_seeds(
+        &self,
+        leading: Option<Array1<f64>>,
+        additional_levels: &[f64],
+    ) -> Result<Vec<Array1<f64>>, EstimationError> {
+        let config = self.config();
+        let model_domain_bounds = outer_model_domain_bounds_template(&config, self.n_params);
+        let bounds = outer_search_bounds_template(&config, self.n_params);
+        let own = crate::rho_optimizer::run_plan::outer_start_point(
+            &config,
+            self.n_params,
+            &model_domain_bounds,
+        )?;
+        let mut seeds: Vec<Array1<f64>> = Vec::with_capacity(2 + additional_levels.len());
+        for start in leading.into_iter().chain(std::iter::once(own)).chain(
+            additional_levels
+                .iter()
+                .map(|&level| Array1::from_elem(self.n_params, level)),
+        ) {
+            let projected = project_to_bounds(&start, Some(&bounds));
+            if !seeds.contains(&projected) {
+                seeds.push(projected);
+            }
+        }
+        Ok(seeds)
     }
 
-    /// The seeds the cascade would search, in cascade order.
-    pub fn outer_seeds(&self, context: &str) -> Result<Vec<Array1<f64>>, EstimationError> {
-        outer_seed_cascade(&self.config(), self.n_params, context)
-    }
-
-    /// Search every seed the cascade would generate, each by `run_seed`, and
+    /// Search every start of [`Self::multistart_seeds`], each by `run_seed`, and
     /// pick the winner among the certified runs.
     ///
-    /// `run_seed(index, problem, lane)` receives this problem restricted to that
-    /// one seed (`with_sole_seed`) and without a cache session, which belongs to
+    /// `run_seed(index, problem, lane)` receives this problem started at that one
+    /// seed (`with_initial_rho`) and without a cache session, which belongs to
     /// one search, and the memory lane the search runs on. It builds its own
     /// objective, runs it (normally through [`OuterProblem::run_certified`]) and
     /// returns the outcome with whatever state the caller needs from the winner.
+    /// Only the winner's state is published, or the first seed's when no seed
+    /// certifies; every other run's is dropped as soon as the finished outcomes
+    /// rule it out, and until then it holds its search's grant.
     ///
     /// `serial_available_bytes` is the available memory the caller read once before
     /// launch, and `working_set_bytes` its prediction of one search's working set
@@ -155,6 +334,7 @@ impl OuterProblem {
     /// one more seed.
     pub fn run_certified_multistart<R, Run>(
         &self,
+        additional_levels: &[f64],
         context: &str,
         serial_available_bytes: u64,
         working_set_bytes: usize,
@@ -171,6 +351,7 @@ impl OuterProblem {
     {
         self.run_certified_multistart_on(
             gam_runtime::resource::MemoryGovernor::global(),
+            additional_levels,
             context,
             serial_available_bytes,
             working_set_bytes,
@@ -182,6 +363,7 @@ impl OuterProblem {
     pub(crate) fn run_certified_multistart_on<R, Run>(
         &self,
         governor: &gam_runtime::resource::MemoryGovernor,
+        additional_levels: &[f64],
         context: &str,
         serial_available_bytes: u64,
         working_set_bytes: usize,
@@ -206,7 +388,7 @@ impl OuterProblem {
             .as_ref()
             .filter(|warm_start| warm_start.same_inputs)
         {
-            let mut resume = self.clone().with_sole_seed(warm_start.theta.clone());
+            let mut resume = self.clone().with_initial_rho(warm_start.theta.clone());
             resume.cache_session = None;
             resume.cache_mirror_sessions.clear();
             resume.resume_only = true;
@@ -226,32 +408,27 @@ impl OuterProblem {
                 super::RESUME_DECLINED,
             ));
         }
-        // On other inputs the point joins this argmin as one more seed, so the
-        // winner is taken over a superset of the cold seeds and its V is at most
-        // the cold winner's, within the tie envelope. It enters as a caller
-        // candidate, so it is projected into this fit's search box and
-        // deduplicated like every other seed.
+        // On other inputs the point joins this argmin as one more start, so the
+        // winner is taken over a superset of the cold starts and its V is at most
+        // the cold winner's, within the tie envelope. It is projected into this
+        // fit's search box and deduplicated like every other start.
         let cold = self.without_warm_start();
         let joined = warm_start
             .as_ref()
             .filter(|warm_start| !warm_start.same_inputs);
-        let seeds = match joined {
-            Some(warm_start) => {
-                let mut with_warm = cold.clone();
-                with_warm
-                    .initial_rho_candidates
-                    .insert(0, warm_start.theta.clone());
-                warm_start.record(gam_model_api::WarmStartOutcome::JoinedMultistart);
-                with_warm.outer_seeds(context)?
-            }
-            None => cold.outer_seeds(context)?,
-        };
-        // One sole-seed problem per seed, without the cache session, which belongs
+        let seeds = cold.multistart_seeds(
+            joined.map(|warm_start| warm_start.theta.clone()),
+            additional_levels,
+        )?;
+        if let Some(warm_start) = joined {
+            warm_start.record(gam_model_api::WarmStartOutcome::JoinedMultistart);
+        }
+        // One problem per seed, started there, without the cache session, which belongs
         // to one search. The joined point's inner mode seeds only its own run.
         let problems = seeds
             .iter()
             .map(|seed| {
-                let mut problem = cold.clone().with_sole_seed(seed.clone());
+                let mut problem = cold.clone().with_initial_rho(seed.clone());
                 problem.cache_session = None;
                 problem.cache_mirror_sessions.clear();
                 problem.warm_start =
@@ -308,7 +485,7 @@ impl OuterProblem {
             most_live: AtomicUsize::new(0),
         };
         log::debug!(
-            "[OUTER] {context}: multistart searches all {} generated seeds on {concurrency} lanes \
+            "[OUTER] {context}: multistart searches all {} starts on {concurrency} lanes \
              ({working_set_bytes} bytes predicted per search, {} remaining in the memory budget, \
              {} bytes available before launch)",
             seeds.len(),
@@ -320,8 +497,7 @@ impl OuterProblem {
             .into_iter()
             .map(|problem| std::sync::Mutex::new(Some(problem)))
             .collect();
-        let slots: Vec<std::sync::Mutex<Option<std::thread::Result<_>>>> =
-            seeds.iter().map(|_| std::sync::Mutex::new(None)).collect();
+        let finished = FinishedSeeds::new(seeds.len());
         let next_seed = AtomicUsize::new(0);
         // A lane runs seeds one after another until none is left, each once the
         // governor has admitted it.
@@ -342,10 +518,7 @@ impl OuterProblem {
                 })
             }))
             .map(|(outcome, payload)| (outcome, payload, seed_started.elapsed().as_secs_f64()));
-            admission.release(&budget);
-            *slots[index]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(outcome);
+            admission.release(finished.file(index, outcome, &budget));
         };
         // From inside a pool (gnomon's calibrate pool, for one) the lanes are tasks
         // of that pool: its workers and their stacks run every seed. From outside
@@ -374,18 +547,17 @@ impl OuterProblem {
             })?;
         }
         let most_live = admission.most_live.load(Ordering::Relaxed);
-        let mut runs = Vec::with_capacity(seeds.len());
-        for (index, slot) in slots.into_iter().enumerate() {
-            let joined = slot
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .ok_or_else(|| {
-                    EstimationError::RemlOptimizationFailed(format!(
-                        "{context}: multistart seed {index} produced no outcome"
-                    ))
-                })?;
-            let (outcome, payload, seconds) =
-                joined.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let mut outcomes = Vec::with_capacity(seeds.len());
+        let mut held = Vec::with_capacity(seeds.len());
+        for (index, seed) in finished.into_inner().into_iter().enumerate() {
+            let seed = seed.ok_or_else(|| {
+                EstimationError::RemlOptimizationFailed(format!(
+                    "{context}: multistart seed {index} produced no outcome"
+                ))
+            })?;
+            let (outcome, seconds) = seed
+                .ran
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
             match &outcome {
                 Ok(certified) => log::debug!(
                     "[OUTER] {context}: multistart seed {index} rho={:?} certified value={:?} at \
@@ -401,16 +573,25 @@ impl OuterProblem {
                     seeds[index].to_vec(),
                 ),
             }
-            runs.push((outcome, payload));
+            outcomes.push(outcome);
+            held.push(seed.held);
         }
-        let winner = multistart_winner(&runs);
+        let winner = multistart_winner(&outcomes);
+        // Every other payload was dropped when the outcomes ruled it out.
+        let published = winner.unwrap_or(0);
+        let (payload, published_lane) = held.swap_remove(published).ok_or_else(|| {
+            EstimationError::RemlOptimizationFailed(format!(
+                "{context}: multistart seed {published}'s payload was dropped before publication"
+            ))
+        })?;
+        // From here the payload is the caller's, as a lone search's state is.
+        published_lane.release_grant();
         match winner {
             Some(index) => log::debug!(
                 "[OUTER] {context}: multistart winner is seed {index} of {} (value={:.9e}) \
                  after {:.3}s",
-                runs.len(),
-                runs[index]
-                    .0
+                outcomes.len(),
+                outcomes[index]
                     .as_ref()
                     .map(CertifiedOuterResult::final_value)
                     .unwrap_or(f64::NAN),
@@ -418,44 +599,54 @@ impl OuterProblem {
             ),
             None => log::debug!(
                 "[OUTER] {context}: no multistart seed certified ({} runs, {:.3}s)",
-                runs.len(),
+                outcomes.len(),
                 started.elapsed().as_secs_f64(),
             ),
         }
         Ok(MultistartOutcome {
             seeds,
-            runs,
+            outcomes,
             winner,
+            payload,
             lanes: concurrency,
             most_live,
         })
     }
 }
 
-/// Keep-best over the certified runs in seed order. A run displaces the
-/// incumbent only when it is lower by more than the rounding envelope of the two
-/// values (`outer_value_agreement_bound`), so a tie keeps the lower seed index.
-/// A run that did not certify never competes.
-pub(crate) fn multistart_winner<R>(
-    runs: &[(Result<CertifiedOuterResult, EstimationError>, R)],
+/// Keep-best over the certified runs in seed order. A run that did not certify
+/// never competes.
+pub(crate) fn multistart_winner(
+    outcomes: &[Result<CertifiedOuterResult, EstimationError>],
 ) -> Option<usize> {
+    keep_best(
+        outcomes
+            .iter()
+            .map(|outcome| outcome.as_ref().ok().map(CertifiedOuterResult::final_value)),
+    )
+}
+
+/// Keep-best over certified values in seed order (`None`: that run did not
+/// certify): the first certified value is the incumbent, and each later one
+/// replaces it when it [`displaces`] it.
+fn keep_best(values: impl IntoIterator<Item = Option<f64>>) -> Option<usize> {
     let mut winner: Option<(usize, f64)> = None;
-    for (index, (outcome, _)) in runs.iter().enumerate() {
-        let Ok(candidate) = outcome else {
+    for (index, value) in values.into_iter().enumerate() {
+        let Some(value) = value else {
             continue;
         };
-        let value = candidate.final_value();
-        let displaces = match winner {
-            None => true,
-            Some((_, incumbent)) => {
-                incumbent - value > outer_value_agreement_bound(incumbent, value)
-            }
-        };
-        if displaces {
+        if winner.is_none_or(|(_, incumbent)| displaces(incumbent, value)) {
             winner = Some((index, value));
         }
     }
     winner.map(|(index, _)| index)
+}
+
+/// Whether a run certified at `value` displaces the incumbent certified at
+/// `incumbent`: only when it is lower by more than the rounding envelope of the
+/// two values (`outer_value_agreement_bound`), so a tie keeps the lower seed index.
+fn displaces(incumbent: f64, value: f64) -> bool {
+    incumbent - value > outer_value_agreement_bound(incumbent, value)
 }
 
 #[cfg(test)]

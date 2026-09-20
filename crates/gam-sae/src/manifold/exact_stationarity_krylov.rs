@@ -116,9 +116,8 @@ where
              under the dimension {dim} they are applied in"
         ));
     }
-    let band = |terms: usize| terms as f64 * f64::EPSILON / (1.0 - terms as f64 * f64::EPSILON);
-    let gamma = band(dim);
-    let operator_gamma = band(operator_terms);
+    let gamma = gam_linalg::roundoff::accumulation_growth(dim);
+    let operator_gamma = gam_linalg::roundoff::accumulation_growth(operator_terms);
     let a_slice = |input: &[f64], output: &mut [f64]| -> Result<(), String> {
         let value = a_flat(&Array1::from_vec(input.to_vec()))?;
         for (slot, &value) in output.iter_mut().zip(value.iter()) {
@@ -222,7 +221,7 @@ where
         let mut basis = pairs
             .original_eigenvectors
             .ok_or("exact-stationarity Krylov solve: missing trial basis")?;
-        let (last_residual, last_scale) = loop {
+        let (last_residual, last_scale, last_gates) = loop {
             let width = basis.ncols();
             let mut applied_basis = Array2::zeros(basis.raw_dim());
             let mut metric_basis = Array2::zeros(basis.raw_dim());
@@ -349,7 +348,16 @@ where
                 + norm(&(&flat_rhs - &projected_rhs))
                 + norm(&projected_rhs);
             let dual_norm = norm(&vectors.t().dot(&residual));
-            let dual_scale = curvature_norm * solution_metric_norm + norm(&coefficients);
+            // The dual residual is `Vᵀ` applied to the physical residual, so it also carries the
+            // physical residual's rounding through `‖Vᵀ‖₂ ≤ ‖V‖_F`. The Ritz vectors are
+            // `Φ`-orthonormal, not orthonormal, so a small metric eigenvalue makes `‖V‖` large.
+            // At #2828 item 2's null-only state the physical residual was 2.8e-14 against its
+            // 9.7e-13 bar, while `Vᵀr` was 1.9e-13 against a 1.3e-13 bar that counted rounding
+            // in the whitened coordinates only (#2822).
+            let vectors_frobenius = vectors.iter().map(|value| value * value).sum::<f64>().sqrt();
+            let dual_scale = curvature_norm * solution_metric_norm
+                + norm(&coefficients)
+                + vectors_frobenius * physical_scale;
             // The Ritz vectors are `Φ`-orthonormal only to the Rayleigh--Ritz arithmetic,
             // `VᵀΦV = I + E` with `‖E‖` of order `κ(VᵀΦV)·ε`. On a basis that spans the space,
             // `ΦV(VᵀΦV)⁻¹Vᵀ = I`, so even the exact pseudoinverse on this basis leaves the dual
@@ -368,6 +376,15 @@ where
             // sqrt(eps) backward accuracy can miss an O(1) response to a
             // sqrt(eps)-sized excitation of a retained band mode. Require
             // machine-roundoff backward accuracy before accepting this inverse.
+            let gates = format!(
+                "classification resolved={classification_resolved}, gram defect {gram_defect:.3e} \
+                 (bar {:.3e}), residual {residual_norm:.3e} (bar {:.3e}), dual residual \
+                 {dual_norm:.3e} (bar {:.3e}), band mass {band_mass:.3e} (bar {:.3e}), width {width}",
+                tolerance * norm(&coefficients),
+                operator_gamma * physical_scale + physical_gram_defect,
+                operator_gamma * dual_scale + gram_defect,
+                tolerance * solution_metric_norm,
+            );
             if scale_resolved
                 && classification_resolved
                 && solution.iter().all(|x| x.is_finite())
@@ -379,10 +396,10 @@ where
                 return Ok(split(&solution));
             }
             if basis.ncols() >= steps {
-                break (residual_norm, physical_scale);
+                break (residual_norm, physical_scale, gates);
             }
             let Some(mut seed) = seed.or(Some(residual)) else {
-                break (residual_norm, physical_scale);
+                break (residual_norm, physical_scale, gates);
             };
             for _ in 0..2 {
                 let correction = basis.dot(&basis.t().dot(&seed));
@@ -390,7 +407,7 @@ where
             }
             let seed_norm = norm(&seed);
             if !seed_norm.is_finite() || seed_norm == 0.0 {
-                break (residual_norm, physical_scale);
+                break (residual_norm, physical_scale, gates);
             }
             seed /= seed_norm;
             let remaining = steps - basis.ncols();
@@ -437,7 +454,7 @@ where
                 }
             }
             if width == old_width {
-                break (residual_norm, physical_scale);
+                break (residual_norm, physical_scale, gates);
             }
             basis = joined.slice(s![.., ..width]).to_owned();
         };
@@ -445,7 +462,7 @@ where
             return Err(format!(
                 "exact-stationarity Krylov pseudoinverse did not certify in {steps} directions \
                  (dimension {dim}, budget {budget} bytes): residual {last_residual:.6e} / \
-                 backward scale {last_scale:.6e}, scale resolved={scale_resolved}"
+                 backward scale {last_scale:.6e}, scale resolved={scale_resolved}; {last_gates}"
             ));
         }
         steps = steps.saturating_mul(2).min(max_steps);

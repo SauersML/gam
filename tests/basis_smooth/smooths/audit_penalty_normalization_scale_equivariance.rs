@@ -41,7 +41,7 @@ fn open_spec(penalty_order: usize) -> BSplineBasisSpec {
         degree: 3,
         penalty_order,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(20),
+            num_internal_knots: 20,
             placement: BSplineKnotPlacement::Uniform,
             adaptive: false,
         },
@@ -62,7 +62,7 @@ fn cyclic_spec(penalty_order: usize) -> BSplineBasisSpec {
         degree: 3,
         penalty_order,
         knotspec: BSplineKnotSpec::Automatic {
-            num_internal_knots: Some(20),
+            num_internal_knots: 20,
             placement: BSplineKnotPlacement::Uniform,
             adaptive: false,
         },

@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed absence (unsupported platform, no driver, no device, or a CUDA runtime library such as cuBLAS with no candidate on the host, which is where a CPU-only install lands on a driver-only GPU machine) selects CPU; a present-but-broken driver or runtime library, or an initialization fault, remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
@@ -15,13 +15,23 @@ configure_global_policy(GpuPolicy::Auto);  // Auto (default) | Off | Required
 Python callers control this through a single `"gpu"` key in the `config` dict, whose value is one of `"auto"` (default), `"off"`, or `"required"`:
 
 ```python
-gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})
+import numpy as np
+import gamfit
+
+rng = np.random.default_rng(0)
+x = rng.uniform(0, 10, 300)
+df = {"x": x, "y": np.sin(x) + rng.normal(0, 0.3, 300)}
+
+gamfit.fit(df, "y ~ s(x)", config={"gpu": "auto"})   # CPU when no CUDA device is present
 ```
 
 Manifold-SAE fits own the policy per fit, including every nested arrow-Schur
 solve and evidence evaluation:
 
 ```python
+import numpy as np
+import gamfit
+
 rng = np.random.default_rng(0)
 angle = rng.uniform(0.0, 2.0 * np.pi, 200)
 X = np.column_stack([np.cos(angle), np.sin(angle)]) + 0.05 * rng.standard_normal((200, 2))
@@ -87,6 +97,28 @@ PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
 `row_primary_hessian_decision(model, n)`, which selects the device kernel
 only for a model the kernel declares. Once the device kernel is selected,
 a GPU error propagates under every policy and is never retried on the CPU.
+The survival marginal-slope rigid row jet takes the same decision,
+`decide_row_kernel`: it declares the four-primary Gaussian frame, so a
+follow-up-varying slope or a declared latent law runs the CPU row program
+under `gpu=auto` and is refused at fit entry under `gpu=required`. Both
+decisions probe the device only when the answer depends on it; a model
+outside the declaration or `gpu=off` never creates a CUDA context.
+
+Under `gpu=auto`, the survival row jet and the Pólya-Gamma batch weigh
+their own two executors, measured on the workload in front of them
+(`crates/gam-gpu/src/row_kernel_race.rs`, gam#3024). They no longer borrow
+twice the `X'WX` Gram's measured crossover. The first `auto` call for a
+shape the process has not timed runs the CPU executor once and the device
+executor twice, timing the warm second call. The faster executor is
+recorded, and that call returns the CPU result. Later calls read the record:
+an exact point at the same row count, or each executor's `a + b·n` fitted
+through two or more timed row counts. A device whose per-row cost exceeds
+the CPU's is never selected at any size. The choice is a timing, so near a
+crossover two runs can pick different executors, and results can then
+differ at roundoff. `gpu="off"` and `gpu="required"` never race and are the
+deterministic choices. On a GPU host, the first admission of any size
+creates the CUDA context once per process. A host without libcuda resolves
+to absence before any cudarc call (#2972).
 
 ## Transfer And Precision Policy
 

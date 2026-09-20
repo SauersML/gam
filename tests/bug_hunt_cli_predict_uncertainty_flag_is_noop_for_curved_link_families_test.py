@@ -44,6 +44,7 @@ def run_gam(*args):
 # posterior mean always, and the posterior mean's band only under --uncertainty.
 _POINT_COLUMNS = ["linear_predictor_plugin", "mean_plugin", "posterior_mean"]
 _BAND_COLUMNS = [
+    "linear_predictor_standard_error",
     "posterior_mean_standard_error",
     "posterior_mean_lower",
     "posterior_mean_upper",

@@ -1375,23 +1375,28 @@ pub(super) fn project_coefficients_to_lower_bounds(
     }
 }
 
+/// Whether the lower bound `lb` binds at `beta` with gradient `gradient`: the
+/// bound's row is active and the gradient presses into it.
+///
+/// A lower bound is the unit row `β_i ≥ lb_i` of the fit's inequality system
+/// (`polish_inequality_system` states it that way), whose scaled slack is
+/// `β_i − lb_i`. Whether a row is active has ONE definition,
+/// [`crate::active_set::row_is_active`], which the exact face decrement and the
+/// geometric KKT channels already apply to these same rows through
+/// `active_face`. The projected-gradient norm and the bound QP's working set
+/// read it here, so every half of the certificate agrees on the face (#3180).
+fn lower_bound_binds(gradient: f64, beta: f64, lb: f64) -> bool {
+    lb.is_finite() && gradient > 0.0 && crate::active_set::row_is_active(beta - lb)
+}
+
 /// Compute the projected gradient norm for bound-constrained optimization.
 ///
 /// At a constrained optimum, gradient components for variables at their lower
 /// bound that point into the infeasible direction (gradient > 0 for minimization)
 /// are KKT multipliers, not convergence defects.  Zeroing them gives the
-/// standard "projected gradient" used to test stationarity.
-/// Relative and absolute tolerances for deciding when a coefficient sits "at"
-/// its lower bound (an active box constraint). A coefficient is active when its
-/// slack is below `ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL`; the
-/// absolute term keeps genuinely-near-zero bounded coefficients (e.g. I-spline
-/// time coefficients pinned around 1e-6) from being treated as interior. Both
-/// the projected-gradient norm and the active-set classifier must use the same
-/// band so KKT diagnostics and the working set agree.
-pub(crate) const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
-
-pub(crate) const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
-
+/// standard "projected gradient" used to test stationarity. A coordinate is
+/// at its bound exactly when [`lower_bound_binds`] says so; any other
+/// coordinate's gradient is a stationarity defect.
 pub(super) fn projected_gradient_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -1403,17 +1408,8 @@ pub(super) fn projected_gradient_norm(
     let mut sum_sq = 0.0;
     for i in 0..gradient.len() {
         let g = gradient[i];
-        if lb[i].is_finite() && g > 0.0 {
-            // Use a relative+absolute tolerance so near-bound coefficients
-            // (e.g. I-spline time coefficients at 1e-6) are recognized as
-            // active.  At a KKT point the gradient into the infeasible region
-            // is a multiplier, not a convergence defect.
-            let slack = beta[i] - lb[i];
-            let scale = beta[i].abs().max(lb[i].abs()).max(1.0);
-            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
-            if slack < tol {
-                continue;
-            }
+        if lower_bound_binds(g, beta[i], lb[i]) {
+            continue;
         }
         sum_sq += g * g;
     }
@@ -1558,7 +1554,7 @@ pub(super) fn pirls_soft_acceptance(
 /// It used to be
 /// `max(primal_feasibility, dual_feasibility, complementarity, stationarity)`,
 /// and that scalar was handed to [`WorkingState::certifies_kkt`], whose two
-/// bounds — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — are both derived FOR A
+/// bounds at the time — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — were both derived FOR A
 /// GRADIENT: the first from "score components are `O(√n)`", the second from the
 /// penalized gradient's own natural magnitude. Only two of the four channels are
 /// gradient-space quantities:
@@ -1592,7 +1588,11 @@ pub(super) fn constrained_stationarity_norm(
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> f64 {
     if let Some(constraints) = linear_constraints {
-        let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
+        // Only the two residual norms are read here, and neither depends on the
+        // gradient scale. No scale is known at this call, so none is claimed:
+        // a NaN scale makes any gradient-unit verdict drawn from these
+        // diagnostics refuse rather than pass.
+        let kkt = compute_constraint_kkt_diagnostics(beta, gradient, f64::NAN, constraints);
         return kkt.dual_feasibility.max(kkt.stationarity);
     }
     projected_gradient_norm(gradient, beta, lower_bounds)
@@ -1610,7 +1610,8 @@ pub(super) fn constrained_stationarity_norm(
 ///   certifying against it can never hand the outer gate something it rejects.
 /// * Complementarity is `|λ_i·s_i|` — a gradient times a distance — and is held
 ///   to `KKT_TOL_COMP`, the OUTER startup gate's own bound, in the gate's own
-///   frame: absolutely AND relative to `max(1, ‖g‖∞)`
+///   frame: relative to `gradient_scale`, the natural scale of the operands
+///   that formed `gradient`
 ///   ([`crate::active_set::exceeds_at_gradient_scale`]). The multipliers carry
 ///   the gradient's scale, so a bare absolute bar made the same fit pass or
 ///   fail under a response rescale `y → c·y`. The requirement here is
@@ -1624,12 +1625,13 @@ pub(super) fn constrained_stationarity_norm(
 pub(super) fn constraint_geometry_is_certified(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     linear_constraints: Option<&LinearInequalityConstraints>,
 ) -> bool {
     let Some(constraints) = linear_constraints else {
         return true;
     };
-    let kkt = compute_constraint_kkt_diagnostics(beta, gradient, constraints);
+    let kkt = compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, constraints);
     kkt.primal_feasibility <= crate::active_set::ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
         && !crate::active_set::exceeds_at_gradient_scale(
             kkt.complementarity,
@@ -1683,7 +1685,7 @@ pub(crate) fn estimate_sparse_native_decision(
 ) -> SparsePirlsDecision {
     let p = x_original.ncols();
     let nnz_s_lambda = count_dense_upper_nnz(s_lambda);
-    let dense_reject = |reason: &'static str, nnz_x: usize| SparsePirlsDecision {
+    let dense_reject = |reason: &'static str, nnz_x: Option<usize>| SparsePirlsDecision {
         path: PirlsLinearSolvePath::DenseTransformed,
         reason,
         p,
@@ -1699,47 +1701,18 @@ pub(crate) fn estimate_sparse_native_decision(
         .map(|lb| lb.iter().any(|bound| bound.is_finite()))
         .unwrap_or(false);
     if has_finite_lower_bounds || linear_constraints_original.is_some() {
-        return dense_reject("constraints_present", 0);
+        return dense_reject("constraints_present", None);
     }
 
-    let x_sparse = if let Some(sparse) = x_original.as_sparse() {
-        sparse
-    } else {
-        // Count nonzeros via chunks so operator-backed dense designs
-        // (e.g. lazy ScaleDeviationOperator) participate in this diagnostic
-        // path without forcing a full materialization.
-        let row_chunk_start = std::time::Instant::now();
-        let n = x_original.nrows();
-        let chunk = row_chunk_for_byte_budget(n, x_original.ncols());
-        let mut nnz: usize = 0;
-        let mut chunks_processed = 0usize;
-        if chunk > 0 && n > 0 {
-            let mut start = 0;
-            while start < n {
-                let end = (start + chunk).min(n);
-                chunks_processed += 1;
-                match x_original.try_row_chunk(start..end) {
-                    Ok(rows) => {
-                        nnz = nnz.saturating_add(rows.iter().filter(|v| **v != 0.0).count());
-                    }
-                    Err(_) => {
-                        nnz = nnz.saturating_add((end - start).saturating_mul(x_original.ncols()));
-                    }
-                }
-                start = end;
-            }
-        }
-        log::debug!(
-            "[STAGE] PIRLS row-chunk generation chunks={} n={} p={} nnz={} elapsed={:.3}s",
-            chunks_processed,
-            n,
-            x_original.ncols(),
-            nnz,
-            row_chunk_start.elapsed().as_secs_f64(),
-        );
-        return dense_reject("design_not_sparse", nnz);
+    // A design with no sparse representation takes the dense path whatever its
+    // entries are, so its nonzeros are left uncounted (`nnz_x=na`, as the REML
+    // twin reports the same route). Counting them meant copying, or for a lazy
+    // operator evaluating, every row of the design on each P-IRLS call, only to
+    // fill a debug field.
+    let Some(x_sparse) = x_original.as_sparse() else {
+        return dense_reject("design_not_sparse", None);
     };
-    let nnz_x = x_sparse.val().len();
+    let nnz_x = Some(x_sparse.val().len());
     match workspace.sparse_penalized_system_stats(x_sparse, s_lambda) {
         Ok(stats) => SparsePirlsDecision {
             path: if stats.density_upper <= SPARSE_NATIVE_MAX_H_DENSITY {
@@ -1890,9 +1863,10 @@ pub(super) fn linear_constraints_from_lower_bounds(
 pub(super) fn compute_constraint_kkt_diagnostics(
     beta: &Array1<f64>,
     gradient: &Array1<f64>,
+    gradient_scale: f64,
     constraints: &LinearInequalityConstraints,
 ) -> ConstraintKktDiagnostics {
-    active_set::compute_constraint_kkt_diagnostics(beta, gradient, constraints)
+    active_set::compute_constraint_kkt_diagnostics(beta, gradient, gradient_scale, constraints)
 }
 
 /// Select which active bound-constraint to release in the primal active-set
@@ -2015,16 +1989,12 @@ pub fn solve_newton_directionwith_lower_bounds(
         }
     }
     for i in 0..p {
-        let lb = lower_bounds[i];
-        if lb.is_finite() && gradient[i] > 0.0 {
-            // Use a relative+absolute tolerance matching projected_gradient_norm
-            // so coefficients near the bound (e.g. I-spline at 1e-6) with positive
-            // gradient (KKT multiplier) are correctly identified as active.
-            let scale = beta[i].abs().max(lb.abs()).max(1.0);
-            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
-            if beta[i] <= lb + tol {
-                active[i] = true;
-            }
+        // The working set starts from the bounds that bind by the same rule the
+        // projected-gradient norm reads. It is a warm start only: the primal
+        // active-set loop below adds every bound a free step reaches and
+        // releases every negative multiplier.
+        if lower_bound_binds(gradient[i], beta[i], lower_bounds[i]) {
+            active[i] = true;
         }
     }
 

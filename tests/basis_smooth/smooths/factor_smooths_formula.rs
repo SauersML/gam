@@ -147,16 +147,9 @@ fn factor_by_smooth_defers_level_offsets_to_explicit_random_intercept() {
     assert_eq!(
         spec.random_effect_terms
             .iter()
-            .filter(|term| term.name == "fac" && term.penalized)
+            .filter(|term| term.name == "fac")
             .count(),
         1,
-        "the explicit group(fac) term should own the factor offsets"
-    );
-    assert!(
-        !spec
-            .random_effect_terms
-            .iter()
-            .any(|term| term.name == "fac" && !term.penalized),
-        "factor-by smooths must not add a no-pooling fixed factor effect when group(fac) is present"
+        "the explicit group(fac) term should own the factor offsets; factor-by smooths must not add a second factor block"
     );
 }

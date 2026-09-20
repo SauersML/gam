@@ -1,18 +1,33 @@
 //! The empirical-law intercept solve against an independent reference.
 //!
 //! The calibrated intercept `a` of a row under a declared finite law is the root
-//! of `Σ wᵢ Φ(a + β·zᵢ) = μ★` with `β = s·b`, solved by the shared monotone root
-//! finder from the closed-form seed. Every root is checked against a
-//! linear-space bisection of the same equation, never against the code under
-//! test.
+//! of `Σ wᵢ Φ(a + β·zᵢ) = Φ(q)` with `β = s·b`, solved from the marginal index
+//! `q` in log space on the smaller tail (gam#2978). Every root is checked
+//! against a linear-space bisection of the same equation on its smaller tail,
+//! never against the code under test, and held to the root displacement the
+//! bisection's own summation roundoff allows.
 
 #![cfg(test)]
 
-use super::gradient_paths::{
-    empirical_intercept_from_marginal_within, empirical_intercept_tail_tolerance,
-    empirical_rigid_calibration_eval,
-};
-use crate::probability::normal_cdf;
+use super::gradient_paths::empirical_intercept;
+use crate::probability::{normal_cdf, normal_pdf};
+
+/// How far the bisection reference can sit from the true root: its tail sum
+/// carries `nodes.len()` roundings of relative size `ε`, which move the root by
+/// that relative error over the tail's log-derivative `|∂ log T/∂a|`; the root
+/// itself is resolved to a few ulps.
+fn reference_resolution(reference: f64, target_q: f64, slope: f64, nodes: &[f64], weights: &[f64]) -> f64 {
+    let upper_tail = target_q > 0.0;
+    let (mut tail, mut density) = (0.0, 0.0);
+    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
+        let eta = reference + slope * node;
+        tail += weight * normal_cdf(if upper_tail { -eta } else { eta });
+        density += weight * normal_pdf(eta);
+    }
+    let log_derivative = density / tail;
+    4.0 * (nodes.len() as f64) * f64::EPSILON / log_derivative
+        + 64.0 * f64::EPSILON * (1.0 + reference.abs())
+}
 
 /// The node gam-cli's default posterior-mean predict refused (gam#2927
 /// regression, `cli_bernoulli_marginal_slope_fit_saves_covariance_so_default_predict_succeeds`),
@@ -44,30 +59,19 @@ fn empirical_intercept_solve_converges_on_the_captured_gam_cli_node() {
         9.33588375376590118e-1,
         8.24741868009762014e-1,
     );
-    let tol = empirical_intercept_tail_tolerance(target_mu);
-    let root = empirical_intercept_from_marginal_within(
-        target_mu, target_q, slope, 1.0, &nodes, &weights, None, tol,
-    )
-    .unwrap_or_else(|e| panic!("the captured node's intercept must solve: {e}"));
-    let (residual, derivative, _) =
-        empirical_rigid_calibration_eval(root, target_mu.ln(), slope, 1.0, &nodes, &weights)
-            .expect("the calibration evaluates at the root");
-    let reference = bisection_root(target_mu, slope, &nodes, &weights);
-    let bound = 1e3 * tol / derivative + 64.0 * f64::EPSILON * (1.0 + reference.abs());
+    let root = empirical_intercept(target_q, slope, 1.0, &nodes, &weights)
+        .unwrap_or_else(|e| panic!("the captured node's intercept must solve: {e}"));
+    let reference = bisection_root(target_q, slope, &nodes, &weights);
+    let bound = reference_resolution(reference, target_q, slope, &nodes, &weights);
     eprintln!(
         "[gam#2927 node] production root {root:+.12} vs bisection {reference:+.12} \
-         (|Δa| {:.2e}, bound {bound:.2e}); log-residual {residual:+.2e}",
+         (|Δa| {:.2e}, bound {bound:.2e}); μ★={target_mu}",
         (root - reference).abs()
     );
     assert!(
-        residual.abs() <= 1e3 * tol,
-        "log-residual {residual:e} above the acceptance {:e}",
-        1e3 * tol
-    );
-    assert!(
         (root - reference).abs() <= bound,
-        "root {root} is {:e} from the bisection root {reference}, beyond the {bound:e} its \
-         residual allows",
+        "root {root} is {:e} from the bisection root {reference}, beyond the {bound:e} the \
+         reference resolves",
         (root - reference).abs()
     );
 }
@@ -97,15 +101,11 @@ fn fixture_law() -> (Vec<f64>, Vec<f64>) {
     (nodes, vec![1.0 / n; raw.len()])
 }
 
-/// The root of `Σ wᵢ Φ(a + β·zᵢ) = μ★` by bisection in linear space, on the tail
-/// that is well conditioned: `Σ wᵢ Φ(−(a + β·zᵢ)) = 1 − μ★` above one half.
-fn bisection_root(target_mu: f64, observed_slope: f64, nodes: &[f64], weights: &[f64]) -> f64 {
-    let upper_tail = target_mu > 0.5;
-    let target = if upper_tail {
-        1.0 - target_mu
-    } else {
-        target_mu
-    };
+/// The root of `Σ wᵢ Φ(a + β·zᵢ) = Φ(q)` by bisection in linear space, on the
+/// smaller tail: `Σ wᵢ Φ(−(a + β·zᵢ)) = Φ(−q)` above the median.
+fn bisection_root(target_q: f64, observed_slope: f64, nodes: &[f64], weights: &[f64]) -> f64 {
+    let upper_tail = target_q > 0.0;
+    let target = normal_cdf(if upper_tail { -target_q } else { target_q });
     let calibrated = |a: f64| -> f64 {
         nodes
             .iter()
@@ -134,47 +134,28 @@ fn bisection_root(target_mu: f64, observed_slope: f64, nodes: &[f64], weights: &
 }
 
 /// The production solve reaches the calibration root for either sign of the
-/// slope, at `b = 0`, and at both link clamps. The accepted log-space residual
-/// bounds how far a root may sit from the true one, through the calibration's
-/// slope `F′` at the root; each root is held to that bound.
+/// slope and at `b = 0`, at interior marginal indices and far into both tails:
+/// `q = ±7.66, ±12.31, ±32.84` are the indices the refusing seeds of gam#2978
+/// stalled at, where `Φ(q)` rounds to one on the upper side and the retired
+/// probability clamp pinned the target.
 #[test]
-fn empirical_intercept_solve_matches_bisection_at_every_slope_sign_and_both_clamps() {
+fn empirical_intercept_solve_matches_bisection_at_every_slope_sign_and_both_tails() {
     let (nodes, weights) = fixture_law();
-    for &target_mu in &[1e-12, 0.3, 0.824771, 1.0 - 1e-12] {
-        let tol = empirical_intercept_tail_tolerance(target_mu);
-        let target_q = gam_math::probability::standard_normal_quantile(target_mu)
-            .expect("quantile of an interior level");
+    for &target_q in &[-32.84, -12.31, -7.66, -0.524, 0.0, 0.933, 7.66, 12.31, 32.84] {
         for &slope in &[-12.0, -3.7, -0.6, 0.0, 0.6, 3.7, 12.0] {
-            let root = empirical_intercept_from_marginal_within(
-                target_mu, target_q, slope, 1.0, &nodes, &weights, None, tol,
-            )
-            .unwrap_or_else(|e| panic!("mu*={target_mu:e}, b={slope}: {e}"));
-            let (residual, derivative, _) = empirical_rigid_calibration_eval(
-                root,
-                target_mu.ln(),
-                slope,
-                1.0,
-                &nodes,
-                &weights,
-            )
-            .expect("the calibration evaluates at the returned root");
-            let reference = bisection_root(target_mu, slope, &nodes, &weights);
-            let bound = 1e3 * tol / derivative + 64.0 * f64::EPSILON * (1.0 + reference.abs());
+            let root = empirical_intercept(target_q, slope, 1.0, &nodes, &weights)
+                .unwrap_or_else(|e| panic!("q={target_q}, b={slope}: {e}"));
+            let reference = bisection_root(target_q, slope, &nodes, &weights);
+            let bound = reference_resolution(reference, target_q, slope, &nodes, &weights);
             eprintln!(
-                "[intercept solve] mu*={target_mu:.3e} b={slope:+5.1}: a={root:+.12} vs bisection \
-                 {reference:+.12} (|Δa| {:.2e}, bound {bound:.2e}); log-residual {residual:+.2e}",
+                "[intercept solve] q={target_q:+.3} b={slope:+5.1}: a={root:+.12} vs bisection \
+                 {reference:+.12} (|Δa| {:.2e}, bound {bound:.2e})",
                 (root - reference).abs()
             );
             assert!(
-                residual.abs() <= 1e3 * tol,
-                "mu*={target_mu:e}, b={slope}: log-residual {residual:e} above the acceptance \
-                 {:e}",
-                1e3 * tol
-            );
-            assert!(
                 (root - reference).abs() <= bound,
-                "mu*={target_mu:e}, b={slope}: root {root} is {:e} from the bisection root \
-                 {reference}, beyond the {bound:e} its residual allows",
+                "q={target_q}, b={slope}: root {root} is {:e} from the bisection root \
+                 {reference}, beyond the {bound:e} the reference resolves",
                 (root - reference).abs()
             );
         }

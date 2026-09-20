@@ -67,8 +67,9 @@
 //!     coefficients back to raw response units, so mu = X_mean*beta_location is
 //!     already raw.
 //!   * gam's noise (sigma) link in raw units is
-//!     `sigma = response_scale*LOGB_SIGMA_FLOOR + exp(eta_scale)`
-//!     (`families::sigma_link::LOGB_SIGMA_FLOOR`). sigma is read through the
+//!     `sigma = response_scale*sigma_floor + exp(eta_scale)`, where
+//!     `sigma_floor` is the fit's recording-grid bound delta/sqrt(12) of the
+//!     standardized response. sigma is read through the
 //!     production `GaussianLocationScalePredictor`, so the floor is the one
 //!     prediction uses. The location block carries role `BlockRole::Location`,
 //!     the log-sigma block role `BlockRole::Scale`.
@@ -78,7 +79,6 @@
 //!     two-smooth additive blocks without it.
 
 use gam::estimate::BlockRole;
-use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::gamlss::GaussianLocationScaleFitResult;
 use gam::matrix::LinearOperator;
 use gam::predict::gaussian_location_scale::GaussianLocationScalePredictor;
@@ -191,6 +191,7 @@ fn gam_surfaces_on_grid(
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor,
         ..
     }) = result
     else {
@@ -228,7 +229,7 @@ fn gam_surfaces_on_grid(
 
     // Rebuild the SAME frozen mean / log-sigma designs at the grid points.
     // mu = X_mean*beta_location; sigma comes from the production Gaussian
-    // location-scale predictor, sigma = response_scale*LOGB_SIGMA_FLOOR +
+    // location-scale predictor, sigma = response_scale*sigma_floor +
     // exp(X_scale*beta_scale).
     let mean_design_grid = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
         .expect("rebuild mean design at grid");
@@ -239,7 +240,7 @@ fn gam_surfaces_on_grid(
     let gam_sigma: Vec<f64> = GaussianLocationScalePredictor {
         beta_mu: beta_location.clone(),
         beta_noise: beta_scale.clone(),
-        sigma_floor: LOGB_SIGMA_FLOOR,
+        sigma_floor,
         response_scale,
         covariance: None,
         link_wiggle: None,
@@ -491,8 +492,9 @@ fn gam_gaussian_multi_smooth_matches_gamlss() {
 
     // Log-sigma bar. The log-sd surface is a noisier second-moment quantity:
     // log(sigma_true) ranges over roughly [log 0.10, log 0.25] ~ [-2.30, -1.39]
-    // (a span of ~0.91), and gam's floored noise link sigma = 0.01 + exp(eta)
-    // adds a small pointwise bias near the floor. A faithful recovery still
+    // (a span of ~0.91), and gam's floored noise link
+    // sigma = response_scale*sigma_floor + exp(eta) adds a small pointwise bias
+    // near the floor. A faithful recovery still
     // tracks the truth to RMSE(log sigma) <= 0.30, about a third of the
     // log-sigma signal span.
     assert!(

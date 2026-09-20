@@ -1,3 +1,6 @@
+mod error_category;
+pub use error_category::ErrorCategory;
+
 use ndarray::{Array1, ArrayView1};
 use serde::{Deserialize, Serialize};
 
@@ -123,6 +126,9 @@ pub enum LinkFunction {
     BetaLogistic,
     Identity,
     Log,
+    /// Square-root link `g(mu) = sqrt(mu)`, `mu = eta^2` on `eta > 0`: the
+    /// variance-stabilising Poisson link.
+    Sqrt,
     /// Reciprocal link `g(mu) = 1/mu`, `mu = 1/eta`: the canonical Gamma link.
     Inverse,
     /// Inverse-square link `g(mu) = 1/mu^2`, `mu = eta^(-1/2)`: the canonical
@@ -134,9 +140,10 @@ impl LinkFunction {
     /// Every link, in the order error messages list them. The single source of
     /// the link vocabulary: parsers, legality listings and diagnostics derive
     /// their name sets from this table rather than spelling them out.
-    pub const ALL: [LinkFunction; 11] = [
+    pub const ALL: [LinkFunction; 12] = [
         Self::Identity,
         Self::Log,
+        Self::Sqrt,
         Self::Inverse,
         Self::InverseSquared,
         Self::Logit,
@@ -160,6 +167,7 @@ impl LinkFunction {
             Self::BetaLogistic => "beta-logistic",
             Self::Identity => "identity",
             Self::Log => "log",
+            Self::Sqrt => "sqrt",
             Self::Inverse => "inverse",
             Self::InverseSquared => "inverse-squared",
         }
@@ -190,6 +198,7 @@ impl LinkFunction {
             | Self::BetaLogistic
             | Self::Identity
             | Self::Log
+            | Self::Sqrt
             | Self::Inverse
             | Self::InverseSquared => None,
         }
@@ -275,6 +284,7 @@ pub enum StandardLink {
     Cauchit,
     Identity,
     Log,
+    Sqrt,
     Inverse,
     InverseSquared,
 }
@@ -295,6 +305,7 @@ impl StandardLink {
             Self::Cauchit => LinkFunction::Cauchit,
             Self::Identity => LinkFunction::Identity,
             Self::Log => LinkFunction::Log,
+            Self::Sqrt => LinkFunction::Sqrt,
             Self::Inverse => LinkFunction::Inverse,
             Self::InverseSquared => LinkFunction::InverseSquared,
         }
@@ -341,6 +352,7 @@ impl TryFrom<LinkFunction> for StandardLink {
             LinkFunction::Cauchit => Ok(Self::Cauchit),
             LinkFunction::Identity => Ok(Self::Identity),
             LinkFunction::Log => Ok(Self::Log),
+            LinkFunction::Sqrt => Ok(Self::Sqrt),
             LinkFunction::Inverse => Ok(Self::Inverse),
             LinkFunction::InverseSquared => Ok(Self::InverseSquared),
             LinkFunction::Sas | LinkFunction::BetaLogistic => {
@@ -545,6 +557,7 @@ fn legality_probe(link: LinkFunction) -> InverseLink {
         LinkFunction::Cauchit => InverseLink::Standard(StandardLink::Cauchit),
         LinkFunction::Identity => InverseLink::Standard(StandardLink::Identity),
         LinkFunction::Log => InverseLink::Standard(StandardLink::Log),
+        LinkFunction::Sqrt => InverseLink::Standard(StandardLink::Sqrt),
         LinkFunction::Inverse => InverseLink::Standard(StandardLink::Inverse),
         LinkFunction::InverseSquared => InverseLink::Standard(StandardLink::InverseSquared),
     }
@@ -852,45 +865,6 @@ impl ResponseFamily {
             | Self::NegativeBinomial { .. }
             | Self::Gamma
             | Self::InverseGaussian => None,
-        }
-    }
-
-    /// Closed numeric bounds of the **response support** — the closure of the
-    /// set of values a single observation `Y` can take — used to clamp the
-    /// *observation (prediction) interval* so a predictive band never reports
-    /// values the response can never attain.
-    ///
-    /// This is deliberately distinct from [`Self::mean_clamp_bounds`], which
-    /// governs the *mean* (confidence) interval. `mean_clamp_bounds` returns
-    /// `None` for the non-negative-real families (Poisson / Tweedie /
-    /// NegativeBinomial / Gamma) because their default mean interval is built
-    /// by transforming the η endpoints through a positive inverse link, which
-    /// cannot escape the support. The observation interval, by contrast, is the
-    /// symmetric response-scale band `μ ± z·σ_pred`; for a small fitted mean its
-    /// lower endpoint crosses below the support floor (e.g. a Poisson count band
-    /// going negative), so it must be floored at the response support here.
-    ///
-    /// The lower edge is the infimum of the support (`0` for every non-negative
-    /// family, including the open-at-zero Gamma, whose predictive lower bound is
-    /// reported at the boundary `0`). The upper edge is `+∞` where the response
-    /// is unbounded above, which leaves the upper band untouched, or `1` for the
-    /// `[0, 1]`-valued families. `None` means the response is supported on the
-    /// whole real line (Gaussian) or has its support enforced downstream
-    /// (Royston–Parmar), and the predictive band is passed through unclamped.
-    ///
-    /// The match arms mirror `Self::response_support_contains`: a new family
-    /// must update both together so the support a value is validated against and
-    /// the support a predictive band is clamped to stay consistent.
-    #[inline]
-    pub fn response_support_bounds(&self) -> Option<(f64, f64)> {
-        match self {
-            Self::Gamma
-            | Self::InverseGaussian
-            | Self::Poisson
-            | Self::NegativeBinomial { .. }
-            | Self::Tweedie { .. } => Some((0.0, f64::INFINITY)),
-            Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
-            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
         }
     }
 
@@ -1510,6 +1484,9 @@ pub struct IllegalLikelihoodCell {
     pub link: &'static str,
     /// The links legal for `response`, from [`LikelihoodSpec::legal_links_for`].
     pub legal_links: Vec<LinkFunction>,
+    /// The modelling reason a cell is rejected, from
+    /// [`LikelihoodSpec::illegal_cell_hint`].
+    pub hint: Option<&'static str>,
 }
 
 impl std::fmt::Display for IllegalLikelihoodCell {
@@ -1522,11 +1499,163 @@ impl std::fmt::Display for IllegalLikelihoodCell {
             self.link,
             self.response,
             LinkFunction::join_names(&self.legal_links)
-        )
+        )?;
+        if let Some(hint) = self.hint {
+            write!(f, "; {hint}")?;
+        }
+        Ok(())
     }
 }
 
 impl std::error::Error for IllegalLikelihoodCell {}
+
+/// The half-line of linear predictors a likelihood cell's mean map sends into
+/// the family's mean domain; see [`LikelihoodSpec::eta_feasibility`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtaFeasibility {
+    /// Every finite `η`.
+    Unrestricted,
+    /// `η > 0`.
+    Positive,
+    /// `η < 0`.
+    Negative,
+}
+
+impl EtaFeasibility {
+    /// Whether `η` lies in the open feasible set.
+    #[inline]
+    pub fn admits(self, eta: f64) -> bool {
+        eta.is_finite()
+            && match self {
+                Self::Unrestricted => true,
+                Self::Positive => eta > 0.0,
+                Self::Negative => eta < 0.0,
+            }
+    }
+
+    /// The open interval `(lower, upper)` of the feasible set.
+    #[inline]
+    pub const fn interval(self) -> (f64, f64) {
+        match self {
+            Self::Unrestricted => (f64::NEG_INFINITY, f64::INFINITY),
+            Self::Positive => (0.0, f64::INFINITY),
+            Self::Negative => (f64::NEG_INFINITY, 0.0),
+        }
+    }
+}
+
+/// The exponential-dispersion cells with no hand-written kernel: each is one
+/// variance function composed with one inverse link and is served by the
+/// generic variance × link row kernel (`gam_math::edm_row`). The canonical
+/// cells (Gaussian-identity, Poisson-log, Gamma-log, the Bernoulli probability
+/// links, …) keep their dedicated fast paths and are the oracles the generic
+/// kernel is pinned against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenericEdmCell {
+    GaussianLog,
+    GaussianSqrt,
+    GaussianInverseSquared,
+    PoissonIdentity,
+    PoissonSqrt,
+    PoissonInverse,
+    PoissonInverseSquared,
+    GammaIdentity,
+    GammaSqrt,
+    GammaInverseSquared,
+    InverseGaussianIdentity,
+    InverseGaussianSqrt,
+    InverseGaussianInverse,
+    BinomialLog,
+}
+
+impl GenericEdmCell {
+    /// The generic cell `(response, link)` names, or `None` for a cell served
+    /// by a dedicated kernel (or an illegal one).
+    #[inline]
+    pub const fn classify(response: &ResponseFamily, link: &InverseLink) -> Option<Self> {
+        let InverseLink::Standard(link) = link else {
+            return None;
+        };
+        Some(match (response, link) {
+            (ResponseFamily::Gaussian, StandardLink::Log) => Self::GaussianLog,
+            (ResponseFamily::Gaussian, StandardLink::Sqrt) => Self::GaussianSqrt,
+            (ResponseFamily::Gaussian, StandardLink::InverseSquared) => Self::GaussianInverseSquared,
+            (ResponseFamily::Poisson, StandardLink::Identity) => Self::PoissonIdentity,
+            (ResponseFamily::Poisson, StandardLink::Sqrt) => Self::PoissonSqrt,
+            (ResponseFamily::Poisson, StandardLink::Inverse) => Self::PoissonInverse,
+            (ResponseFamily::Poisson, StandardLink::InverseSquared) => Self::PoissonInverseSquared,
+            (ResponseFamily::Gamma, StandardLink::Identity) => Self::GammaIdentity,
+            (ResponseFamily::Gamma, StandardLink::Sqrt) => Self::GammaSqrt,
+            (ResponseFamily::Gamma, StandardLink::InverseSquared) => Self::GammaInverseSquared,
+            (ResponseFamily::InverseGaussian, StandardLink::Identity) => Self::InverseGaussianIdentity,
+            (ResponseFamily::InverseGaussian, StandardLink::Sqrt) => Self::InverseGaussianSqrt,
+            (ResponseFamily::InverseGaussian, StandardLink::Inverse) => Self::InverseGaussianInverse,
+            (ResponseFamily::Binomial, StandardLink::Log) => Self::BinomialLog,
+            _ => return None,
+        })
+    }
+
+    #[inline]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::GaussianLog => "gaussian-log",
+            Self::GaussianSqrt => "gaussian-sqrt",
+            Self::GaussianInverseSquared => "gaussian-inverse-squared",
+            Self::PoissonIdentity => "poisson-identity",
+            Self::PoissonSqrt => "poisson-sqrt",
+            Self::PoissonInverse => "poisson-inverse",
+            Self::PoissonInverseSquared => "poisson-inverse-squared",
+            Self::GammaIdentity => "gamma-identity",
+            Self::GammaSqrt => "gamma-sqrt",
+            Self::GammaInverseSquared => "gamma-inverse-squared",
+            Self::InverseGaussianIdentity => "inverse-gaussian-identity",
+            Self::InverseGaussianSqrt => "inverse-gaussian-sqrt",
+            Self::InverseGaussianInverse => "inverse-gaussian-inverse",
+            Self::BinomialLog => "binomial-log",
+        }
+    }
+
+    #[inline]
+    pub const fn pretty_name(self) -> &'static str {
+        match self {
+            Self::GaussianLog => "Gaussian Log",
+            Self::GaussianSqrt => "Gaussian Sqrt",
+            Self::GaussianInverseSquared => "Gaussian Inverse-Squared",
+            Self::PoissonIdentity => "Poisson Identity",
+            Self::PoissonSqrt => "Poisson Sqrt",
+            Self::PoissonInverse => "Poisson Inverse",
+            Self::PoissonInverseSquared => "Poisson Inverse-Squared",
+            Self::GammaIdentity => "Gamma Identity",
+            Self::GammaSqrt => "Gamma Sqrt",
+            Self::GammaInverseSquared => "Gamma Inverse-Squared",
+            Self::InverseGaussianIdentity => "Inverse-Gaussian Identity",
+            Self::InverseGaussianSqrt => "Inverse-Gaussian Sqrt",
+            Self::InverseGaussianInverse => "Inverse-Gaussian Inverse",
+            Self::BinomialLog => "Binomial Log",
+        }
+    }
+
+    /// The cell's inverse link.
+    #[inline]
+    pub const fn link(self) -> StandardLink {
+        match self {
+            Self::GaussianLog => StandardLink::Log,
+            Self::GaussianSqrt => StandardLink::Sqrt,
+            Self::GaussianInverseSquared => StandardLink::InverseSquared,
+            Self::PoissonIdentity => StandardLink::Identity,
+            Self::PoissonSqrt => StandardLink::Sqrt,
+            Self::PoissonInverse => StandardLink::Inverse,
+            Self::PoissonInverseSquared => StandardLink::InverseSquared,
+            Self::GammaIdentity => StandardLink::Identity,
+            Self::GammaSqrt => StandardLink::Sqrt,
+            Self::GammaInverseSquared => StandardLink::InverseSquared,
+            Self::InverseGaussianIdentity => StandardLink::Identity,
+            Self::InverseGaussianSqrt => StandardLink::Sqrt,
+            Self::InverseGaussianInverse => StandardLink::Inverse,
+            Self::BinomialLog => StandardLink::Log,
+        }
+    }
+}
 
 /// Legal-only enumeration of the `(ResponseFamily, InverseLink)` cells the
 /// engine recognises. `LikelihoodSpec` is the product type with ~40 nominal
@@ -1557,6 +1686,8 @@ pub enum FamilySpecKind {
     BinomialSas(SasLinkState),
     BinomialBetaLogistic(SasLinkState),
     BinomialMixture(MixtureLinkState),
+    /// A cell served by the generic variance × link kernel.
+    GenericEdm(GenericEdmCell),
 }
 
 impl FamilySpecKind {
@@ -1585,6 +1716,7 @@ impl FamilySpecKind {
             Self::BinomialSas(_) => "binomial-sas",
             Self::BinomialBetaLogistic(_) => "binomial-beta-logistic",
             Self::BinomialMixture(_) => "binomial-blended-inverse-link",
+            Self::GenericEdm(cell) => cell.name(),
         }
     }
 
@@ -1613,6 +1745,7 @@ impl FamilySpecKind {
             Self::BinomialSas(_) => "Binomial SAS",
             Self::BinomialBetaLogistic(_) => "Binomial Beta-Logistic",
             Self::BinomialMixture(_) => "Binomial Blended Inverse-Link",
+            Self::GenericEdm(cell) => cell.pretty_name(),
         }
     }
 
@@ -1629,6 +1762,7 @@ impl FamilySpecKind {
                 | Self::BinomialSas(_)
                 | Self::BinomialBetaLogistic(_)
                 | Self::BinomialMixture(_)
+                | Self::GenericEdm(GenericEdmCell::BinomialLog)
         )
     }
 
@@ -1683,10 +1817,19 @@ impl LikelihoodSpec {
     /// table: [`LikelihoodSpec::legal_links_for`] (and therefore every "legal
     /// links for this family" error message) is generated from it.
     ///
-    /// The reciprocal links are legal only where the family's mean is strictly
-    /// positive (Gaussian and Gamma take the inverse link `μ = 1/η`,
-    /// Inverse-Gaussian its canonical `μ = η^{-1/2}`); their `η > 0` domain is
-    /// kept by the inner solver's feasibility step-halving.
+    /// Legality is support-based. For the four exponential-dispersion
+    /// families with a free mean scale (Gaussian, Poisson, Gamma,
+    /// inverse Gaussian) every link of the power/log ladder — identity, log,
+    /// sqrt, `1/μ`, `1/μ²` — is legal, and a link whose range exceeds the
+    /// family's mean domain (identity for a positive mean, the reciprocal and
+    /// square-root links' `η > 0` branch) carries the feasibility set
+    /// [`LikelihoodSpec::eta_feasibility`], which the inner solver enforces by
+    /// recoverable step rejection. The Bernoulli mean admits every
+    /// probability link and the log link (relative-risk regression, feasible
+    /// on `η < 0`). A linear-probability model (`binomial + identity`) is
+    /// rejected: its mean map leaves `(0, 1)` on a half-space of every design,
+    /// and a constant-variance probability model is a Gaussian model and is
+    /// spelled as one.
     #[inline]
     pub fn is_legal_cell(response: &ResponseFamily, link: &InverseLink) -> bool {
         match response {
@@ -1694,41 +1837,43 @@ impl LikelihoodSpec {
             ResponseFamily::StudentT { .. } | ResponseFamily::RoystonParmar => {
                 matches!(link, InverseLink::Standard(StandardLink::Identity))
             }
-            ResponseFamily::Gaussian => matches!(
+            // The power/log link ladder over the free-scale EDM families.
+            ResponseFamily::Gaussian
+            | ResponseFamily::Poisson
+            | ResponseFamily::Gamma
+            | ResponseFamily::InverseGaussian => matches!(
                 link,
-                InverseLink::Standard(StandardLink::Identity | StandardLink::Inverse)
+                InverseLink::Standard(
+                    StandardLink::Identity
+                        | StandardLink::Log
+                        | StandardLink::Sqrt
+                        | StandardLink::Inverse
+                        | StandardLink::InverseSquared
+                )
             ),
-            ResponseFamily::Gamma => matches!(
-                link,
-                InverseLink::Standard(StandardLink::Log | StandardLink::Inverse)
-            ),
-            ResponseFamily::InverseGaussian => matches!(
-                link,
-                InverseLink::Standard(StandardLink::InverseSquared | StandardLink::Log)
-            ),
-            // Log-link families.
-            ResponseFamily::Poisson
-            | ResponseFamily::Tweedie { .. }
-            | ResponseFamily::NegativeBinomial { .. } => {
+            // Log-link families whose extra shape parameter has no
+            // non-log kernel.
+            ResponseFamily::Tweedie { .. } | ResponseFamily::NegativeBinomial { .. } => {
                 matches!(link, InverseLink::Standard(StandardLink::Log))
             }
             // Logit-link family.
             ResponseFamily::Beta { .. } => {
                 matches!(link, InverseLink::Standard(StandardLink::Logit))
             }
-            // Binomial admits every probability link except the inert
-            // identity/log standard links.
+            // Binomial admits every probability link and the relative-risk
+            // log link.
             ResponseFamily::Binomial => match link {
                 InverseLink::Standard(
                     StandardLink::Logit
                     | StandardLink::Probit
                     | StandardLink::CLogLog
                     | StandardLink::LogLog
-                    | StandardLink::Cauchit,
+                    | StandardLink::Cauchit
+                    | StandardLink::Log,
                 ) => true,
                 InverseLink::Standard(
                     StandardLink::Identity
-                    | StandardLink::Log
+                    | StandardLink::Sqrt
                     | StandardLink::Inverse
                     | StandardLink::InverseSquared,
                 ) => false,
@@ -1737,6 +1882,43 @@ impl LikelihoodSpec {
                 | InverseLink::BetaLogistic(_)
                 | InverseLink::Mixture(_) => true,
             },
+        }
+    }
+
+    /// The explanation an illegal cell's error carries beyond the legal-link
+    /// listing, for the cells whose rejection is a modelling statement rather
+    /// than a missing kernel.
+    pub fn illegal_cell_hint(response: &ResponseFamily, link: LinkFunction) -> Option<&'static str> {
+        match (response, link) {
+            (ResponseFamily::Binomial, LinkFunction::Identity) => Some(
+                "a linear probability GAM is a Gaussian model and should be spelled as one \
+                 (family=gaussian)",
+            ),
+            _ => None,
+        }
+    }
+
+    /// The set of linear predictors `η` whose mean `μ = h(η)` lies in the
+    /// family's mean domain (and in the link's own domain). A cell with a
+    /// restricted set is legal; the inner solver rejects any trial point
+    /// outside it (a recoverable step rejection), seeds inside it by
+    /// construction, and reports a converged optimum on its boundary as a
+    /// typed error. The set is always a half-line through the origin, because
+    /// every restricting mean map here (identity, `η²`, `1/η`, `η^{-1/2}`,
+    /// `exp(η) < 1`) changes admissibility only at `η = 0`.
+    pub fn eta_feasibility(&self) -> EtaFeasibility {
+        match (&self.response, &self.link) {
+            (_, InverseLink::Standard(StandardLink::Sqrt | StandardLink::Inverse | StandardLink::InverseSquared)) => {
+                EtaFeasibility::Positive
+            }
+            (
+                ResponseFamily::Poisson | ResponseFamily::Gamma | ResponseFamily::InverseGaussian,
+                InverseLink::Standard(StandardLink::Identity),
+            ) => EtaFeasibility::Positive,
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Log)) => {
+                EtaFeasibility::Negative
+            }
+            _ => EtaFeasibility::Unrestricted,
         }
     }
 
@@ -1790,6 +1972,7 @@ impl LikelihoodSpec {
                 response: response.name(),
                 link: link.link_function().name(),
                 legal_links: Self::legal_links_for(&response),
+                hint: Self::illegal_cell_hint(&response, link.link_function()),
             })
         }
     }
@@ -1875,6 +2058,12 @@ impl LikelihoodSpec {
     }
 
     fn legal_cell_kind(&self) -> Option<FamilySpecKind> {
+        if !Self::is_legal_cell(&self.response, &self.link) {
+            return None;
+        }
+        if let Some(cell) = self.generic_edm_cell() {
+            return Some(FamilySpecKind::GenericEdm(cell));
+        }
         Some(match (&self.response, &self.link) {
             (ResponseFamily::Gaussian, InverseLink::Standard(StandardLink::Identity)) => {
                 FamilySpecKind::GaussianIdentity
@@ -1960,6 +2149,13 @@ impl LikelihoodSpec {
     #[inline]
     pub fn is_binomial(&self) -> bool {
         self.kind().is_binomial()
+    }
+
+    /// The generic variance × link cell this likelihood is, or `None` for a
+    /// cell with a dedicated kernel.
+    #[inline]
+    pub const fn generic_edm_cell(&self) -> Option<GenericEdmCell> {
+        GenericEdmCell::classify(&self.response, &self.link)
     }
 
     #[inline]
@@ -2195,6 +2391,7 @@ pub fn inverse_link_to_binomial_spec(
         InverseLink::Standard(
             StandardLink::Log
             | StandardLink::Identity
+            | StandardLink::Sqrt
             | StandardLink::Inverse
             | StandardLink::InverseSquared,
         ) => Err(UnsupportedLinkError::new("binomial", link)),
@@ -3684,13 +3881,6 @@ mod tests {
     fn illegal_cells_rejected() {
         assert!(
             LikelihoodSpec::try_new(
-                ResponseFamily::Poisson,
-                InverseLink::Standard(StandardLink::Identity)
-            )
-            .is_err()
-        );
-        assert!(
-            LikelihoodSpec::try_new(
                 ResponseFamily::Gaussian,
                 InverseLink::Standard(StandardLink::Logit)
             )
@@ -3699,17 +3889,74 @@ mod tests {
         assert!(
             LikelihoodSpec::try_new(
                 ResponseFamily::Binomial,
-                InverseLink::Standard(StandardLink::Log)
-            )
-            .is_err()
-        );
-        assert!(
-            LikelihoodSpec::try_new(
-                ResponseFamily::Binomial,
                 InverseLink::Standard(StandardLink::Identity)
             )
             .is_err()
         );
+        for link in [StandardLink::Sqrt, StandardLink::Inverse, StandardLink::InverseSquared] {
+            assert!(
+                LikelihoodSpec::try_new(ResponseFamily::Binomial, InverseLink::Standard(link))
+                    .is_err()
+            );
+        }
+        assert!(
+            LikelihoodSpec::try_new(
+                ResponseFamily::Tweedie { p: 1.5 },
+                InverseLink::Standard(StandardLink::Identity)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn linear_probability_cell_is_rejected_with_the_gaussian_spelling() {
+        let message = LikelihoodSpec::try_new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Identity),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            message.contains(
+                "a linear probability GAM is a Gaussian model and should be spelled as one"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn noncanonical_cells_are_legal_and_carry_their_feasibility_set() {
+        use EtaFeasibility as F;
+        use ResponseFamily as R;
+        use StandardLink as L;
+        let cases = [
+            (R::Poisson, L::Identity, F::Positive, Some(GenericEdmCell::PoissonIdentity)),
+            (R::Poisson, L::Sqrt, F::Positive, Some(GenericEdmCell::PoissonSqrt)),
+            (R::Gaussian, L::Log, F::Unrestricted, Some(GenericEdmCell::GaussianLog)),
+            (R::Gaussian, L::Identity, F::Unrestricted, None),
+            (R::Gamma, L::Inverse, F::Positive, None),
+            (R::Gamma, L::Identity, F::Positive, Some(GenericEdmCell::GammaIdentity)),
+            (R::InverseGaussian, L::Inverse, F::Positive, Some(GenericEdmCell::InverseGaussianInverse)),
+            (R::Binomial, L::Log, F::Negative, Some(GenericEdmCell::BinomialLog)),
+            (R::Binomial, L::Logit, F::Unrestricted, None),
+        ];
+        for (response, link, feasibility, cell) in cases {
+            let spec = LikelihoodSpec::try_new(response, InverseLink::Standard(link))
+                .expect("support-based legality admits the cell");
+            assert_eq!(spec.eta_feasibility(), feasibility, "{}", spec.name());
+            assert_eq!(spec.generic_edm_cell(), cell, "{}", spec.name());
+        }
+        let binomial_log = LikelihoodSpec::try_new(
+            ResponseFamily::Binomial,
+            InverseLink::Standard(StandardLink::Log),
+        )
+        .unwrap();
+        assert_eq!(binomial_log.name(), "binomial-log");
+        assert!(binomial_log.is_binomial());
+        assert!(!binomial_log.supports_firth());
+        assert!(F::Negative.admits(-1e-300) && !F::Negative.admits(0.0));
+        assert!(F::Positive.admits(1e-300) && !F::Positive.admits(0.0));
+        assert!(!F::Unrestricted.admits(f64::NAN));
     }
 
     // -----------------------------------------------------------------------
@@ -4109,7 +4356,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ResponseFamily::mean_clamp_bounds / response_support_bounds
+    // ResponseFamily::mean_clamp_bounds
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4138,27 +4385,6 @@ mod tests {
     #[test]
     fn mean_clamp_bounds_poisson_none() {
         assert_eq!(ResponseFamily::Poisson.mean_clamp_bounds(), None);
-    }
-
-    #[test]
-    fn response_support_bounds_gamma_nonneg_to_inf() {
-        assert_eq!(
-            ResponseFamily::Gamma.response_support_bounds(),
-            Some((0.0, f64::INFINITY))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_binomial_unit_interval() {
-        assert_eq!(
-            ResponseFamily::Binomial.response_support_bounds(),
-            Some((0.0, 1.0))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_gaussian_none() {
-        assert_eq!(ResponseFamily::Gaussian.response_support_bounds(), None);
     }
 
     // -----------------------------------------------------------------------
@@ -4346,7 +4572,8 @@ mod tests {
         assert_eq!(LinkFunction::from_name("binomial-logit"), Some(LinkFunction::Logit));
         assert_eq!(LinkFunction::from_name("Binomial-CLogLog"), Some(LinkFunction::CLogLog));
         assert_eq!(LinkFunction::from_name("binomial_probit"), None);
-        assert_eq!(LinkFunction::from_name("sqrt"), None);
+        assert_eq!(LinkFunction::from_name("sqrt"), Some(LinkFunction::Sqrt));
+        assert_eq!(LinkFunction::from_name("cube-root"), None);
     }
 
     /// SPEC R25: each link has one spelling. The other spellings are refused,
@@ -4374,27 +4601,39 @@ mod tests {
 
     #[test]
     fn unknown_link_message_lists_the_whole_vocabulary() {
-        let message = UnknownLinkName("sqrt".to_string()).to_string();
-        assert!(message.contains("'sqrt'"), "{message}");
+        let message = UnknownLinkName("cube-root".to_string()).to_string();
+        assert!(message.contains("'cube-root'"), "{message}");
         for link in LinkFunction::ALL {
             assert!(message.contains(link.name()), "{message} is missing {}", link.name());
         }
     }
 
     #[test]
-    fn legality_table_admits_the_reciprocal_links_only_on_positive_mean_families() {
+    fn legality_table_is_support_based() {
         use ResponseFamily as R;
         let legal = |response: &ResponseFamily| LikelihoodSpec::legal_links_for(response);
-        assert_eq!(legal(&R::Gaussian), vec![LinkFunction::Identity, LinkFunction::Inverse]);
-        assert_eq!(legal(&R::Gamma), vec![LinkFunction::Log, LinkFunction::Inverse]);
+        let ladder = vec![
+            LinkFunction::Identity,
+            LinkFunction::Log,
+            LinkFunction::Sqrt,
+            LinkFunction::Inverse,
+            LinkFunction::InverseSquared,
+        ];
+        for response in [R::Gaussian, R::Poisson, R::Gamma, R::InverseGaussian] {
+            assert_eq!(legal(&response), ladder, "{}", response.name());
+        }
         assert_eq!(
-            legal(&R::InverseGaussian),
-            vec![LinkFunction::Log, LinkFunction::InverseSquared]
+            legal(&R::Binomial)[..2],
+            [LinkFunction::Log, LinkFunction::Logit],
+            "binomial admits log (relative risk) and the probability links"
         );
-        assert_eq!(legal(&R::Poisson), vec![LinkFunction::Log]);
-        for link in [LinkFunction::Inverse, LinkFunction::InverseSquared] {
+        for link in [
+            LinkFunction::Identity,
+            LinkFunction::Sqrt,
+            LinkFunction::Inverse,
+            LinkFunction::InverseSquared,
+        ] {
             assert!(!legal(&R::Binomial).contains(&link));
-            assert!(!legal(&R::Poisson).contains(&link));
         }
         // Every listed link is a legal cell, and every cell `try_new` accepts
         // is listed: the listing is the table, not a copy of it.
@@ -4416,22 +4655,25 @@ mod tests {
     fn illegal_cell_error_lists_the_family_legal_links() {
         let err = LikelihoodSpec::try_new(
             ResponseFamily::Gamma,
-            InverseLink::Standard(StandardLink::Identity),
-        )
-        .unwrap_err();
-        let message = err.to_string();
-        assert!(message.contains("legal links for `gamma`: log|inverse"), "{message}");
-
-        let err = LikelihoodSpec::try_new(
-            ResponseFamily::InverseGaussian,
-            InverseLink::Standard(StandardLink::Inverse),
+            InverseLink::Standard(StandardLink::Logit),
         )
         .unwrap_err();
         let message = err.to_string();
         assert!(
-            message.contains("legal links for `inverse-gaussian`: log|inverse-squared"),
+            message.contains("legal links for `gamma`: identity|log|sqrt|inverse|inverse-squared"),
             "{message}"
         );
+
+        let err = LikelihoodSpec::try_new(
+            ResponseFamily::NegativeBinomial {
+                theta: 1.0,
+                theta_fixed: false,
+            },
+            InverseLink::Standard(StandardLink::Inverse),
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("legal links for `negative-binomial`: log"), "{message}");
     }
 
     #[test]

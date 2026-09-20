@@ -42,15 +42,18 @@
 //!     `linkwiggle(...)` is a binomial-only link correction and is rejected for a
 //!     Gaussian response, so it is intentionally absent from the gam formula.
 //!   * LINK CONVENTION (the one subtlety that makes this comparison fair). gam's
-//!     scale block models sigma directly through a softplus-floored exp link
-//!       sigma = LOGB_SIGMA_FLOOR + exp(eta_gam),  LOGB_SIGMA_FLOOR = 0.01
-//!     (see `families::sigma_link::logb_sigma_from_eta_scalar`), so gam floors
-//!     SIGMA. mgcv's `gaulss(b=0.01)` uses the `logb` link on the PRECISION: its
-//!     second linear predictor returns 1/sigma = b + exp(eta_mgcv), so mgcv floors
-//!     1/SIGMA. The two link bases are therefore NOT identical: to first order on
-//!     the data scale (sigma in [0.1,0.35], b=0.01, so b*sigma <~ 3.5e-3),
-//!     eta_gam = log(sigma - b) ~= log sigma and eta_mgcv = log(1/sigma - b) ~=
-//!     -log sigma, i.e. the two engines smooth NEAR-NEGATIVES of each other in
+//!     scale block models sigma directly through a floored exp link
+//!       sigma = response_scale*sigma_floor + exp(eta_gam)
+//!     where `sigma_floor` is the fit's recording-grid bound delta/sqrt(12) of the
+//!     standardized response (see `families::sigma_link::logb_sigma_from_eta_scalar`),
+//!     so gam floors SIGMA. mgcv's `gaulss(b=0.01)` uses the `logb` link on the
+//!     PRECISION: its second linear predictor returns 1/sigma = b + exp(eta_mgcv),
+//!     so mgcv floors 1/SIGMA. The two link bases are therefore NOT identical: to
+//!     first order on the data scale (sigma in [0.1,0.35], mgcv b=0.01, so
+//!     b*sigma <~ 3.5e-3; gam's floor sits far below sigma for this continuous
+//!     response), eta_gam = log(sigma - floor) ~= log sigma and
+//!     eta_mgcv = log(1/sigma - b) ~= -log sigma, i.e. the two engines smooth
+//!     NEAR-NEGATIVES of each other in
 //!     their respective predictor spaces. We therefore must NOT compare the raw
 //!     eta surfaces. We compare the link-INVARIANT physical quantity log sigma:
 //!     the wiggliness penalty acts on second differences of eta and is invariant
@@ -69,13 +72,6 @@ use gam::{
 };
 use ndarray::Array2;
 use std::time::Instant;
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale), so gam
-/// floors SIGMA (mirrors `families::sigma_link::LOGB_SIGMA_FLOOR`). Note mgcv's
-/// `gaulss(b=0.01)` floors the PRECISION 1/sigma instead; see the module-level
-/// LINK CONVENTION note for why log sigma is still the fair, link-invariant
-/// quantity to compare.
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 #[test]
 fn gam_gaulss_tensor_product_matches_mgcv() {
@@ -150,7 +146,12 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     let result = fit_from_formula("y ~ te(x1, x2, bs=c('tps','tps'), k=c(5,5))", &ds, &cfg)
         .expect("gam gaulss tensor-product fit");
     let fit_elapsed = fit_started.elapsed();
-    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult { fit, .. }) = result
+    let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
+        fit,
+        response_scale,
+        sigma_floor,
+        ..
+    }) = result
     else {
         panic!("expected a Gaussian location-scale fit for a smooth noise_formula model");
     };
@@ -204,7 +205,10 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
 
     // Rebuild the SAME frozen mean / log-sigma tensor designs at the grid points
     // and apply each block's coefficients. mu = X_mean*beta_location;
-    // sigma = LOGB_SIGMA_FLOOR + exp(X_scale*beta_scale).
+    // sigma = response_scale*sigma_floor + exp(X_scale*beta_scale) (the
+    // coefficients are raw-unit, so the fit's floor is scaled to raw units too;
+    // gam floors SIGMA, unlike mgcv's precision floor -- see the LINK CONVENTION
+    // note).
     let mean_design_grid = build_term_collection_design(grid.view(), &fit.meanspec_resolved)
         .expect("rebuild mean tensor design at grid");
     let scale_design_grid = build_term_collection_design(grid.view(), &fit.noisespec_resolved)
@@ -214,7 +218,7 @@ fn gam_gaulss_tensor_product_matches_mgcv() {
     let gam_eta_sigma: Vec<f64> = scale_design_grid.design.apply(&beta_scale).to_vec();
     let gam_sigma: Vec<f64> = gam_eta_sigma
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| response_scale * sigma_floor + e.exp())
         .collect();
     let gam_log_sigma: Vec<f64> = gam_sigma.iter().map(|&s| s.ln()).collect();
 

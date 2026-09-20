@@ -49,6 +49,18 @@ pub enum BasisAdequacyProvenance {
     /// The test itself declined: no estimable enrichment direction survived the
     /// projection, or the assembled quadratic form was not finite.
     StatisticUnavailable,
+    /// Canonical binomial/Poisson fits only: the unpenalized null-model MLE the
+    /// conditional reference is built at did not certify on the test's rows
+    /// (a rank-deficient unpenalized design, or a line search that stalled in
+    /// roundoff before the Newton decrement reached the objective's rounding
+    /// band).
+    NullFitUnavailable,
+    /// Canonical binomial/Poisson fits only: the expansion of the score's
+    /// conditional law left its range of validity — its covariance was not
+    /// positive definite or its variance correction drove the reference scale
+    /// non-positive. That happens where high-leverage rows sit at an extreme
+    /// fitted mean; a number there would be an uncalibrated one.
+    ConditionalReferenceUnavailable,
 }
 
 impl BasisAdequacyProvenance {
@@ -63,6 +75,8 @@ impl BasisAdequacyProvenance {
             Self::NoIrlsRowState => "no_irls_row_state",
             Self::DesignGramUnavailable => "design_gram_unavailable",
             Self::StatisticUnavailable => "statistic_unavailable",
+            Self::NullFitUnavailable => "null_fit_unavailable",
+            Self::ConditionalReferenceUnavailable => "conditional_reference_unavailable",
         }
     }
 }
@@ -156,12 +170,39 @@ const ENRICHMENT_BYTE_BUDGET: f64 = 2.56e8;
 /// Rows per center: never ask for a kernel chart the data cannot condition.
 const ENRICHMENT_ROWS_PER_CENTER: usize = 8;
 
+/// The enrichment width a term asks for before any row-count budget applies —
+/// an upper bound on the width [`enrichment_width`] returns at any `n`.
+fn enrichment_target(realized_width: usize) -> usize {
+    realized_width
+        .saturating_mul(ENRICHMENT_WIDTH_MULTIPLE)
+        .clamp(ENRICHMENT_WIDTH_MIN, ENRICHMENT_WIDTH_MAX)
+}
+
+/// Flop budget, in multiply-adds per term, for the conditional reference of a
+/// canonical binomial/Poisson fit. Its third-order terms cost
+/// `O(m·(q·p²/2 + q²·p))` — the `H ∘ H` coupling of the enrichment's rows
+/// through the design's leverage, which no identity reduces below `p²` per
+/// row — against the `O(m·q²)` of the Gaussian reference. The budget is ten
+/// times [`ENRICHMENT_FLOP_BUDGET`] because this sweep is the whole of the
+/// canonical test's cost, where the Gaussian one pays the enrichment Gram
+/// several times over.
+const CONDITIONAL_REFERENCE_FLOP_BUDGET: f64 = 2.0e10;
+
+/// Row cap under which the conditional reference fits its flop budget for a
+/// `design_width`-column design and an enrichment no wider than
+/// `enrichment_width`. Exact on any fixed row subset, like the Gaussian test,
+/// so the cap costs power and nothing else.
+fn conditional_reference_row_cap(design_width: usize, enrichment_width: usize) -> usize {
+    let p = design_width.max(1) as f64;
+    let q = enrichment_width.max(1) as f64;
+    let per_row = q * p * p / 2.0 + q * q * p;
+    (CONDITIONAL_REFERENCE_FLOP_BUDGET / per_row).floor() as usize
+}
+
 /// The enrichment width for one term, or `None` when the budget cannot beat the
 /// realized width.
 fn enrichment_width(realized_width: usize, n_rows: usize) -> Option<usize> {
-    let target = realized_width
-        .saturating_mul(ENRICHMENT_WIDTH_MULTIPLE)
-        .clamp(ENRICHMENT_WIDTH_MIN, ENRICHMENT_WIDTH_MAX);
+    let target = enrichment_target(realized_width);
     let flop_cap = (ENRICHMENT_FLOP_BUDGET / (n_rows.max(1) as f64))
         .sqrt()
         .floor();
@@ -241,9 +282,12 @@ const ROW_SELECTION_STRIDE: u64 = 0x9E37_79B9_7F4A_7C15;
 /// sequence, so the same fit reports the same verdict on every machine and every
 /// rerun. A diagnostic whose answer moved between runs would be unusable as a
 /// gate.
-fn report_rows(n_rows: usize, design_width: usize) -> Vec<usize> {
+///
+/// `reference_cap` is the row count the chosen reference law's own cost admits
+/// (`usize::MAX` when it adds no bound of its own).
+fn report_rows(n_rows: usize, design_width: usize, reference_cap: usize) -> Vec<usize> {
     let byte_cap = (GATHERED_DESIGN_BYTE_BUDGET / (8.0 * design_width.max(1) as f64)) as usize;
-    let cap = REPORT_ROW_CAP.min(byte_cap).max(1);
+    let cap = REPORT_ROW_CAP.min(byte_cap).min(reference_cap).max(1);
     if n_rows <= cap {
         return (0..n_rows).collect();
     }
@@ -377,12 +421,73 @@ fn radial_enrichment(covariates: ArrayView2<'_, f64>, centers: usize) -> Option<
     (dense.ncols() > 0 && dense.iter().all(|value| value.is_finite())).then_some(dense)
 }
 
+/// The continuous covariates a term's alternative is drawn over, and the
+/// grouping column that gates it.
+///
+/// A factor smooth fits one curve per level of its grouping factor, so the
+/// alternative that asks "can any group's curve carry structure this basis
+/// cannot represent" is the radial enrichment in the continuous covariates,
+/// gated by each level's indicator. A pooled enrichment would only test the
+/// groups' shared curve and miss group curves that cancel on average.
+fn enrichment_frame(basis: &gam_terms::smooth::SmoothBasisSpec) -> (Vec<usize>, Option<usize>) {
+    match basis {
+        gam_terms::smooth::SmoothBasisSpec::FactorSmooth { spec } => {
+            (spec.continuous_cols.clone(), Some(spec.group_col))
+        }
+        other => (other.structural_feature_cols(), None),
+    }
+}
+
+/// The distinct levels of `group_col` on the selected rows, and each row's
+/// level index.
+fn group_levels(
+    data: ArrayView2<'_, f64>,
+    group_col: usize,
+    rows: &[usize],
+) -> Option<(usize, Vec<usize>)> {
+    if group_col >= data.ncols() {
+        return None;
+    }
+    let codes: Vec<u64> = rows
+        .iter()
+        .map(|&row| data[[row, group_col]].to_bits())
+        .collect();
+    let mut levels = codes.clone();
+    levels.sort_unstable();
+    levels.dedup();
+    let index = codes
+        .iter()
+        .map(|code| levels.binary_search(code).ok())
+        .collect::<Option<Vec<_>>>()?;
+    Some((levels.len(), index))
+}
+
+/// `enrichment` gated by each row's group: level `j`'s rows carry the shared
+/// radial columns in block `j` and zeros elsewhere.
+fn group_gated_enrichment(
+    enrichment: &Array2<f64>,
+    level_count: usize,
+    level_of_row: &[usize],
+) -> Array2<f64> {
+    let width = enrichment.ncols();
+    let mut out = Array2::<f64>::zeros((enrichment.nrows(), width * level_count));
+    for (row, &level) in level_of_row.iter().enumerate() {
+        out.row_mut(row)
+            .slice_mut(s![level * width..(level + 1) * width])
+            .assign(&enrichment.row(row));
+    }
+    out
+}
+
 /// The IRLS row state the score test needs, read off the fit's retained P-IRLS
 /// result.
 struct ScoreRowState {
     hessian_weights: Array1<f64>,
     score_weights: Array1<f64>,
     score: Array1<f64>,
+    /// `η̂`, offset included: the start of the canonical null-model Newton
+    /// iteration, which stays in the model's affine span from there.
+    linear_predictor: Array1<f64>,
 }
 
 fn score_row_state(fit: &UnifiedFitResult, n_rows: usize) -> Option<ScoreRowState> {
@@ -403,6 +508,7 @@ fn score_row_state(fit: &UnifiedFitResult, n_rows: usize) -> Option<ScoreRowStat
     if hessian_weights.iter().any(|w| !w.is_finite())
         || score_weights.iter().any(|w| !(w.is_finite() && *w >= 0.0))
         || score.iter().any(|value| !value.is_finite())
+        || pirls.final_eta.iter().any(|value| !value.is_finite())
     {
         return None;
     }
@@ -410,7 +516,46 @@ fn score_row_state(fit: &UnifiedFitResult, n_rows: usize) -> Option<ScoreRowStat
         hessian_weights,
         score_weights,
         score,
+        linear_predictor: pirls.final_eta.to_owned(),
     })
+}
+
+/// The response side of a standard fit: what the conditional reference for a
+/// canonical binomial/Poisson fit conditions on.
+pub struct BasisAdequacyResponse<'a> {
+    /// The response on the fit's rows (a proportion for binomial).
+    pub y: ArrayView1<'a, f64>,
+    /// Prior weights on the fit's rows (the trial count for binomial).
+    pub prior_weights: ArrayView1<'a, f64>,
+    /// The canonical family whose sufficient statistic the test conditions
+    /// on, from [`basis_adequacy_canonical_family`]; `None` keeps the
+    /// Gaussian reference.
+    pub canonical_family: Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily>,
+}
+
+/// The canonical exponential family a standard fit's likelihood is, when its
+/// row law is exactly that family's: binomial-logit and Poisson-log with no
+/// link wiggle and no latent coordinate (either makes the linear predictor a
+/// non-linear function of estimated parameters, and `Xᵀ(w∘y)` is then no longer
+/// sufficient).
+pub fn basis_adequacy_canonical_family(
+    likelihood: &LikelihoodSpec,
+    has_link_wiggle: bool,
+    has_latent_coordinate: bool,
+) -> Option<gam_terms::inference::basis_adequacy::CanonicalExponentialFamily> {
+    use gam_terms::inference::basis_adequacy::CanonicalExponentialFamily;
+    if has_link_wiggle || has_latent_coordinate {
+        return None;
+    }
+    match (&likelihood.response, &likelihood.link) {
+        (ResponseFamily::Binomial, InverseLink::Standard(gam_spec::StandardLink::Logit)) => {
+            Some(CanonicalExponentialFamily::BinomialLogit)
+        }
+        (ResponseFamily::Poisson, InverseLink::Standard(gam_spec::StandardLink::Log)) => {
+            Some(CanonicalExponentialFamily::PoissonLog)
+        }
+        _ => None,
+    }
 }
 
 /// The per-smooth basis-adequacy report for a fitted standard GAM.
@@ -429,6 +574,7 @@ pub fn basis_adequacy_report(
     design: &gam_terms::smooth::TermCollectionDesign,
     spec: &gam_terms::smooth::TermCollectionSpec,
     fit: &UnifiedFitResult,
+    response: &BasisAdequacyResponse<'_>,
 ) -> Vec<BasisAdequacyRow> {
     let term_count = design.smooth.terms.len();
     if term_count == 0 || term_count != spec.smooth_terms.len() {
@@ -436,6 +582,14 @@ pub fn basis_adequacy_report(
     }
     let n_rows = design.design.nrows();
     if n_rows == 0 || data.nrows() != n_rows {
+        return Vec::new();
+    }
+    // A canonical family is only ever referred to its conditional law; a
+    // response that does not cover the design's rows is a caller bug, not a
+    // reason to publish the first-order reference instead.
+    if response.canonical_family.is_some()
+        && (response.y.len() != n_rows || response.prior_weights.len() != n_rows)
+    {
         return Vec::new();
     }
 
@@ -473,10 +627,27 @@ pub fn basis_adequacy_report(
             .map(|idx| undetermined(idx, BasisAdequacyProvenance::NoIrlsRowState))
             .collect();
     };
+    let canonical_family = response.canonical_family;
+    // The conditional reference's cost grows with the design width squared, so
+    // for a canonical family the row sample is also sized to ITS budget, at the
+    // widest enrichment any term can ask for.
+    let reference_cap = match canonical_family {
+        Some(_) => {
+            let widest = design
+                .smooth
+                .terms
+                .iter()
+                .map(|term| enrichment_target(term.coeff_range.len()))
+                .max()
+                .unwrap_or(ENRICHMENT_WIDTH_MIN);
+            conditional_reference_row_cap(design.design.ncols(), widest)
+        }
+        None => usize::MAX,
+    };
     // Everything below is computed on ONE selected row sample, chosen once so
     // every term is tested against the same rows and the model-wide Gram matches
     // them.
-    let report_rows = report_rows(n_rows, design.design.ncols());
+    let report_rows = report_rows(n_rows, design.design.ncols(), reference_cap);
     // The design is gathered ONCE, for those rows, and reused by every pass and
     // every term. Two things force that shape. `as_dense_ref` is `Some` only for
     // `Dense(Materialized)`, and a reparameterized smooth ships
@@ -493,47 +664,77 @@ pub fn basis_adequacy_report(
             .map(|idx| undetermined(idx, BasisAdequacyProvenance::DesignGramUnavailable))
             .collect();
     };
-    let selected_hessian_weights = select_rows(rows_state.hessian_weights.view(), &report_rows);
-    let selected_score_weights = select_rows(rows_state.score_weights.view(), &report_rows);
-    let selected_score = select_rows(rows_state.score.view(), &report_rows);
-    // `G = X_SᵀW_H X_S` over exactly those rows, factored ONCE for the whole
-    // model. It has to be the SELECTED-row Gram: `Z̃ᵀW_H X_S = 0` is what
-    // annihilates the penalized fit's shrinkage bias, and that orthogonality is
-    // a property of the sub-design the test actually uses. Factoring is once
-    // rather than per term because `G` depends only on the design and the
-    // weights, and re-factoring it per term would charge `O(p³)` per smooth on a
-    // fit that runs only a few dozen IRLS iterations in total.
-    let Some(design_gram) = gam_terms::inference::basis_adequacy::weighted_gram(
-        gathered_design.view(),
-        selected_hessian_weights.view(),
-    )
-    .as_ref()
-    .and_then(|gram| gam_terms::inference::basis_adequacy::DesignGramFactor::new(gram.view()))
-    else {
-        return (0..term_count)
-            .map(|idx| undetermined(idx, BasisAdequacyProvenance::DesignGramUnavailable))
-            .collect();
+    let reference = match canonical_family {
+        // A canonical family is referred to the score's law GIVEN the null
+        // model's sufficient statistic, built at the unpenalized null MLE on
+        // these rows — one fit for the whole model, shared by every term.
+        Some(family) => {
+            let Some(null_fit) = gam_terms::inference::basis_adequacy::canonical_null_fit(
+                gathered_design.view(),
+                select_rows(response.y, &report_rows).view(),
+                select_rows(response.prior_weights, &report_rows).view(),
+                select_rows(rows_state.linear_predictor.view(), &report_rows).view(),
+                family,
+            ) else {
+                return (0..term_count)
+                    .map(|idx| undetermined(idx, BasisAdequacyProvenance::NullFitUnavailable))
+                    .collect();
+            };
+            ScoreReference::Conditional(null_fit)
+        }
+        None => {
+            let hessian_weights = select_rows(rows_state.hessian_weights.view(), &report_rows);
+            // `G = X_SᵀW_H X_S` over exactly those rows, factored ONCE for the
+            // whole model. It has to be the SELECTED-row Gram: `Z̃ᵀW_H X_S = 0`
+            // is what annihilates the penalized fit's shrinkage bias, and that
+            // orthogonality is a property of the sub-design the test actually
+            // uses. Factoring is once rather than per term because `G` depends
+            // only on the design and the weights, and re-factoring it per term
+            // would charge `O(p³)` per smooth on a fit that runs only a few
+            // dozen IRLS iterations in total.
+            let Some(design_gram) = gam_terms::inference::basis_adequacy::weighted_gram(
+                gathered_design.view(),
+                hessian_weights.view(),
+            )
+            .as_ref()
+            .and_then(|gram| {
+                gam_terms::inference::basis_adequacy::DesignGramFactor::new(gram.view())
+            }) else {
+                return (0..term_count)
+                    .map(|idx| undetermined(idx, BasisAdequacyProvenance::DesignGramUnavailable))
+                    .collect();
+            };
+            // The dispersion that scales the score's variance is the same
+            // multiplier the fit publishes on its coefficient covariance (`1`
+            // for every family carrying its dispersion inside the IRLS weight,
+            // `φ̂` for the profiled Gaussian).
+            let dispersion = fit
+                .coefficient_covariance_scale()
+                .ok()
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(1.0);
+            let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
+                gam_terms::inference::smooth_test::SmoothTestScale::Estimated
+            } else {
+                gam_terms::inference::smooth_test::SmoothTestScale::Known
+            };
+            ScoreReference::Product {
+                hessian_weights,
+                score_weights: select_rows(rows_state.score_weights.view(), &report_rows),
+                score: select_rows(rows_state.score.view(), &report_rows),
+                design_gram,
+                dispersion,
+                scale,
+                residual_df: fit.wald_residual_degrees_of_freedom(),
+            }
+        }
     };
-    // The dispersion that scales the score's variance is the same multiplier the
-    // fit publishes on its coefficient covariance (`1` for every family carrying
-    // its dispersion inside the IRLS weight, `φ̂` for the profiled Gaussian).
-    let dispersion = fit
-        .coefficient_covariance_scale()
-        .ok()
-        .filter(|value| value.is_finite() && *value > 0.0)
-        .unwrap_or(1.0);
-    let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
-        gam_terms::inference::smooth_test::SmoothTestScale::Estimated
-    } else {
-        gam_terms::inference::smooth_test::SmoothTestScale::Known
-    };
-    let residual_df = fit.wald_residual_degrees_of_freedom();
 
     (0..term_count)
         .map(|idx| {
             let realized = &design.smooth.terms[idx];
             let realized_width = realized.coeff_range.len();
-            let feature_cols = spec.smooth_terms[idx].basis.structural_feature_cols();
+            let (feature_cols, group_col) = enrichment_frame(&spec.smooth_terms[idx].basis);
             if feature_cols.is_empty() {
                 return undetermined(idx, BasisAdequacyProvenance::NoContinuousCovariates);
             }
@@ -541,30 +742,73 @@ pub fn basis_adequacy_report(
             else {
                 return undetermined(idx, BasisAdequacyProvenance::DegenerateCovariates);
             };
-            let Some(centers) = enrichment_width(realized_width, report_rows.len()) else {
+            let groups = match group_col {
+                Some(col) => match group_levels(data, col, &report_rows) {
+                    Some(groups) => Some(groups),
+                    None => return undetermined(idx, BasisAdequacyProvenance::DegenerateCovariates),
+                },
+                None => None,
+            };
+            let level_count = groups.as_ref().map_or(1, |(count, _)| *count);
+            // The budget bounds the whole alternative, so a gated enrichment
+            // shares it between the groups.
+            let Some(centers) = enrichment_width(realized_width, report_rows.len())
+                .map(|width| width / level_count)
+            else {
                 return undetermined(
                     idx,
                     BasisAdequacyProvenance::EnrichmentBudgetBelowRealizedWidth,
                 );
             };
-            let Some(enrichment) = radial_enrichment(covariates.view(), centers) else {
+            let Some(radial) = radial_enrichment(covariates.view(), centers) else {
                 return undetermined(idx, BasisAdequacyProvenance::EnrichmentBuildFailed);
             };
-            let outcome = gam_terms::inference::basis_adequacy::basis_adequacy_score_test(
-                gam_terms::inference::basis_adequacy::BasisAdequacyInput {
-                    enrichment: enrichment.view(),
-                    design: gathered_design.view(),
-                    hessian_weights: selected_hessian_weights.view(),
-                    score_weights: selected_score_weights.view(),
-                    score: selected_score.view(),
-                    design_gram: &design_gram,
+            let enrichment = match &groups {
+                Some((count, level_of_row)) => group_gated_enrichment(&radial, *count, level_of_row),
+                None => radial,
+            };
+            let outcome = match &reference {
+                ScoreReference::Conditional(null_fit) => {
+                    use gam_terms::inference::basis_adequacy::ConditionalTestRefusal;
+                    gam_terms::inference::basis_adequacy::conditional_basis_adequacy_test(
+                        enrichment.view(),
+                        gathered_design.view(),
+                        null_fit,
+                    )
+                    .map_err(|refusal| match refusal {
+                        ConditionalTestRefusal::NoTest => {
+                            BasisAdequacyProvenance::StatisticUnavailable
+                        }
+                        ConditionalTestRefusal::OutsideExpansion => {
+                            BasisAdequacyProvenance::ConditionalReferenceUnavailable
+                        }
+                    })
+                }
+                ScoreReference::Product {
+                    hessian_weights,
+                    score_weights,
+                    score,
+                    design_gram,
                     dispersion,
-                    residual_df,
                     scale,
-                },
-            );
+                    residual_df,
+                } => gam_terms::inference::basis_adequacy::basis_adequacy_score_test(
+                    gam_terms::inference::basis_adequacy::BasisAdequacyInput {
+                        enrichment: enrichment.view(),
+                        design: gathered_design.view(),
+                        hessian_weights: hessian_weights.view(),
+                        score_weights: score_weights.view(),
+                        score: score.view(),
+                        design_gram,
+                        dispersion: *dispersion,
+                        residual_df: *residual_df,
+                        scale: *scale,
+                    },
+                )
+                .ok_or(BasisAdequacyProvenance::StatisticUnavailable),
+            };
             match outcome {
-                Some(result) => BasisAdequacyRow {
+                Ok(result) => BasisAdequacyRow {
                     name: realized.name.clone(),
                     term_idx: idx,
                     basis_dim: realized_width,
@@ -576,10 +820,27 @@ pub fn basis_adequacy_report(
                     p_value: Some(result.p_value),
                     provenance: BasisAdequacyProvenance::RadialEnrichment,
                 },
-                None => undetermined(idx, BasisAdequacyProvenance::StatisticUnavailable),
+                Err(reason) => undetermined(idx, reason),
             }
         })
         .collect()
+}
+
+/// The reference law a report's rows are tested against, fixed once per model.
+enum ScoreReference {
+    /// The first-order score reference at the penalized fit: exact for a
+    /// Gaussian response, `χ²_r` or the added-variable `F`.
+    Product {
+        hessian_weights: Array1<f64>,
+        score_weights: Array1<f64>,
+        score: Array1<f64>,
+        design_gram: gam_terms::inference::basis_adequacy::DesignGramFactor,
+        dispersion: f64,
+        scale: gam_terms::inference::smooth_test::SmoothTestScale,
+        residual_df: Option<f64>,
+    },
+    /// The conditional reference for a canonical binomial/Poisson fit.
+    Conditional(gam_terms::inference::basis_adequacy::CanonicalNullFit),
 }
 
 /// Family-wise level at which a fit-time note is raised.
@@ -598,9 +859,9 @@ pub const BASIS_ADEQUACY_NOTE_LEVEL: f64 = 1.0e-3;
 /// The rows whose lack-of-fit test rejects basis adequacy at the family-wise
 /// [`BASIS_ADEQUACY_NOTE_LEVEL`], Bonferroni-corrected over the tested terms.
 ///
-/// Both consumers of the verdict read it here: the fit-time note, and the
-/// adaptive spatial-resolution loop that grows the basis the note tells a user
-/// to grow. One reading keeps the advisory and the action from disagreeing.
+/// This is the advisory reading only. The adaptive resolution loop does not
+/// act on a significance level: it screens with the statistic's own
+/// deviance-per-parameter reading and lets the refit's REML evidence decide.
 pub(crate) fn basis_adequacy_rows_lacking_fit(
     rows: &[BasisAdequacyRow],
 ) -> impl Iterator<Item = &BasisAdequacyRow> {
@@ -650,4 +911,37 @@ pub(crate) fn basis_adequacy_notes(rows: &[BasisAdequacyRow]) -> Vec<String> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod group_gated_enrichment_tests {
+    use super::{group_gated_enrichment, group_levels};
+    use ndarray::array;
+
+    #[test]
+    fn each_level_carries_the_shared_columns_in_its_own_block() {
+        // Column 1 is the grouping factor; rows 0 and 2 share a level.
+        let data = array![[0.1, 7.0], [0.2, 3.0], [0.3, 7.0], [0.4, 5.0]];
+        let (level_count, level_of_row) = group_levels(data.view(), 1, &[0, 1, 2, 3]).unwrap();
+        assert_eq!(level_count, 3);
+        assert_eq!(level_of_row, vec![2, 0, 2, 1]);
+
+        let radial = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let gated = group_gated_enrichment(&radial, level_count, &level_of_row);
+        assert_eq!(
+            gated,
+            array![
+                [0.0, 0.0, 0.0, 0.0, 1.0, 2.0],
+                [3.0, 4.0, 0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0, 5.0, 6.0],
+                [0.0, 0.0, 7.0, 8.0, 0.0, 0.0],
+            ]
+        );
+    }
+
+    #[test]
+    fn a_grouping_column_outside_the_data_has_no_levels() {
+        let data = array![[0.1], [0.2]];
+        assert!(group_levels(data.view(), 1, &[0, 1]).is_none());
+    }
 }

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use gam_problem::{CustomFamilyError, EstimationError, FailureCategory};
+use gam_problem::{CustomFamilyError, ErrorCategory, EstimationError, FailureCategory};
 
 use crate::survival::marginal_slope::SurvivalMarginalSlopeError;
 
@@ -105,8 +105,10 @@ pub enum WorkflowError {
     /// last under-resolved fit as if it were complete.
     SpatialUnderresolved {
         term: String,
-        current_centers: usize,
-        attempted_centers: usize,
+        /// The resolution the converged fit realized.
+        current_resolution: String,
+        /// The refinement that could not be certified.
+        attempted_resolution: String,
         reason: String,
         /// The certification refit's own failure, when a refit is what failed.
         /// It decides the failure's category; `reason` renders it (#2937).
@@ -131,14 +133,6 @@ pub enum WorkflowError {
         similar: Vec<String>,
         tsv_hint: bool,
     },
-    /// A formula term could not be built as written: a malformed or unknown
-    /// option (`s(x, k=ten)`, `penalty_order` above the degree), a `domain=`
-    /// that excludes the data, or data degenerate for the requested basis.
-    /// The source keeps the builder's category and the `in term ...:` label
-    /// so front ends raise it as a formula-authoring error.
-    TermBuilder {
-        source: gam_terms::term_builder::TermBuilderError,
-    },
     /// A marginal-slope fit named a link its probit-only kernel cannot fit.
     MarginalSlopeLink {
         context: &'static str,
@@ -148,6 +142,19 @@ pub enum WorkflowError {
     TransformationNormalConflict {
         conflict: TransformationNormalConflict,
     },
+    /// A formula term could not be built as written: a malformed or unknown
+    /// option (`s(x, k=ten)`, `penalty_order` above the degree), a `domain=`
+    /// that excludes the data, a categorical column used as a smooth
+    /// coordinate, or data degenerate for the requested basis. The typed
+    /// source keeps its category ([`TermBuilderError::error_category`]) and
+    /// the `in term ...:` label, so every front end classifies it the same.
+    ///
+    /// [`TermBuilderError::error_category`]: gam_terms::term_builder::TermBuilderError::error_category
+    TermBuilder {
+        source: gam_terms::term_builder::TermBuilderError,
+    },
+    /// The data layer refused a cell or table (unparseable, non-finite, empty).
+    Data(gam_data::DataError),
     /// A `warm_start_from` model this fit cannot resume (gam#3002).
     WarmStartRefused { refusal: WarmStartRefusal },
 }
@@ -164,15 +171,14 @@ impl std::fmt::Display for WorkflowError {
             }
             WorkflowError::SpatialUnderresolved {
                 term,
-                current_centers,
-                attempted_centers,
+                current_resolution,
+                attempted_resolution,
                 reason,
                 ..
             } => write!(
                 f,
-                "smooth term '{term}' remains under-resolution-uncertain at resolution \
-                 {current_centers} (centers, or internal knots for a B-spline): the \
-                 resolution-{attempted_centers} certification refit failed ({reason})"
+                "smooth term '{term}' remains under-resolved at {current_resolution}; its \
+                 refinement to {attempted_resolution} was not certified ({reason})"
             ),
             WorkflowError::FormulaDsl { context, source } => write!(f, "{context}: {source}"),
             WorkflowError::TermBuilder { source } => std::fmt::Display::fmt(source, f),
@@ -242,6 +248,7 @@ impl std::fmt::Display for WorkflowError {
                 };
                 write!(f, "transformation_normal cannot be combined with {control}")
             }
+            WorkflowError::Data(source) => std::fmt::Display::fmt(source, f),
             WorkflowError::WarmStartRefused { refusal } => match refusal {
                 WarmStartRefusal::RefitRequired { payload_version } => write!(
                     f,
@@ -270,7 +277,6 @@ impl std::error::Error for WorkflowError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             WorkflowError::FormulaDsl { source, .. } => Some(source),
-            WorkflowError::TermBuilder { source } => Some(source),
             // Renders exactly its failure, so it is transparent to the chain.
             WorkflowError::Fit(failure) => failure.source(),
             WorkflowError::InvalidConfig { .. }
@@ -282,6 +288,9 @@ impl std::error::Error for WorkflowError {
             | WorkflowError::MarginalSlopeLink { .. }
             | WorkflowError::TransformationNormalConflict { .. }
             | WorkflowError::WarmStartRefused { .. } => None,
+            // Render exactly their source, so they are transparent to the chain.
+            WorkflowError::TermBuilder { source } => source.source(),
+            WorkflowError::Data(source) => source.source(),
         }
     }
 }
@@ -305,7 +314,31 @@ impl WorkflowError {
                  and that the formula terms match."
                     .to_string(),
             ),
+            Self::Data(source) => source.advice(),
             _ => None,
+        }
+    }
+
+    /// Who has to act on this failure: the one category every front end
+    /// classifies it by (Python exception base, CLI exit code). Exhaustive with
+    /// no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::Fit(failure) => failure.error_category(),
+            Self::SpatialUnderresolved { refit_failure, .. } => refit_failure
+                .as_deref()
+                .map_or(ErrorCategory::Convergence, Self::error_category),
+            Self::TermBuilder { source } => source.error_category(),
+            Self::Data(source) => source.error_category(),
+            Self::SchemaMismatch { .. } | Self::InvalidData { .. } => ErrorCategory::Data,
+            Self::InvalidConfig { .. }
+            | Self::MissingDependency { .. }
+            | Self::FormulaDsl { .. }
+            | Self::ColumnNotFound { .. }
+            | Self::MarginalSlopeLink { .. }
+            | Self::TransformationNormalConflict { .. }
+            | Self::WarmStartRefused { .. } => ErrorCategory::Formula,
         }
     }
 
@@ -325,14 +358,15 @@ impl WorkflowError {
             | Self::MissingDependency { .. }
             | Self::InvalidData { .. }
             | Self::FormulaDsl { .. }
-            | Self::TermBuilder { .. }
             | Self::ColumnNotFound { .. }
             // A marginal-slope link the fit cannot declare: a configuration refusal.
             | Self::MarginalSlopeLink { .. }
             // Controls that select another response model: a configuration refusal.
             | Self::TransformationNormalConflict { .. }
             // A warm start the fit cannot resume: a configuration refusal.
-            | Self::WarmStartRefused { .. } => FailureCategory::Input,
+            | Self::WarmStartRefused { .. }
+            | Self::TermBuilder { .. }
+            | Self::Data(_) => FailureCategory::Input,
         }
     }
 
@@ -356,12 +390,13 @@ impl WorkflowError {
             Self::MissingDependency { .. } => "WorkflowError::MissingDependency",
             Self::InvalidData { .. } => "WorkflowError::InvalidData",
             Self::FormulaDsl { .. } => "WorkflowError::FormulaDsl",
-            Self::TermBuilder { .. } => "WorkflowError::TermBuilder",
             Self::ColumnNotFound { .. } => "WorkflowError::ColumnNotFound",
             Self::MarginalSlopeLink { .. } => "WorkflowError::MarginalSlopeLink",
             Self::TransformationNormalConflict { .. } => {
                 "WorkflowError::TransformationNormalConflict"
             }
+            Self::TermBuilder { source } => source.variant_name(),
+            Self::Data(source) => source.variant_name(),
             Self::WarmStartRefused { .. } => "WorkflowError::WarmStartRefused",
         }
     }
@@ -580,6 +615,22 @@ impl FitFailure {
         }
     }
 
+    /// Who has to act on the error this failure ends in; see
+    /// [`WorkflowError::error_category`].
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::Context { source, .. } | Self::Annotated { source, .. } => {
+                source.error_category()
+            }
+            Self::Estimation(err) => err.error_category(),
+            Self::CustomFamily(err) => err.error_category(),
+            Self::SurvivalMarginalSlope(err) => err.failure_category().error_category(),
+            Self::Workflow(err) => err.error_category(),
+            Self::Raised { category, .. } => category.error_category(),
+        }
+    }
+
     /// The `Enum::Variant` name of the error this failure ends in.
     #[must_use]
     pub fn variant_name(&self) -> &'static str {
@@ -639,6 +690,27 @@ impl FitFailure {
             },
             Self::Workflow(err) => match err.as_ref() {
                 WorkflowError::Fit(failure) => failure.terminal_inner_mode_evidence(),
+                _ => None,
+            },
+            Self::SurvivalMarginalSlope(_) | Self::Raised { .. } => None,
+        }
+    }
+
+    /// The Jeffreys arming evidence the custom-family refusal this failure ends
+    /// in carries ([`CustomFamilyError::jeffreys_arming_evidence`]), seen
+    /// through the wrappers that only carry it.
+    #[must_use]
+    pub fn jeffreys_arming_evidence(&self) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
+        match self {
+            Self::Context { source, .. } | Self::Annotated { source, .. } => {
+                source.jeffreys_arming_evidence()
+            }
+            Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
+            Self::Estimation(err) => {
+                Self::custom_family_leaf(err).and_then(CustomFamilyError::jeffreys_arming_evidence)
+            }
+            Self::Workflow(err) => match err.as_ref() {
+                WorkflowError::Fit(failure) => failure.jeffreys_arming_evidence(),
                 _ => None,
             },
             Self::SurvivalMarginalSlope(_) | Self::Raised { .. } => None,
@@ -942,8 +1014,8 @@ mod fit_failure_tests {
         let refit = WorkflowError::from(FitFailure::from(seeds_refused()));
         let refused = WorkflowError::SpatialUnderresolved {
             term: "s(x)".to_string(),
-            current_centers: 8,
-            attempted_centers: 16,
+            current_resolution: "8 centers".to_string(),
+            attempted_resolution: "16 centers".to_string(),
             reason: refit.to_string(),
             refit_failure: Some(Box::new(refit)),
         };
@@ -951,8 +1023,8 @@ mod fit_failure_tests {
         assert_eq!(refused.variant_name(), "EstimationError::StartupSeedsRefused");
         let exhausted = WorkflowError::SpatialUnderresolved {
             term: "s(x)".to_string(),
-            current_centers: 8,
-            attempted_centers: 8,
+            current_resolution: "8 centers".to_string(),
+            attempted_resolution: "8 centers".to_string(),
             reason: "term EDF remains at its realized basis ceiling".to_string(),
             refit_failure: None,
         };
@@ -1130,11 +1202,8 @@ impl From<gam_terms::inference::formula_dsl::FormulaDslError> for WorkflowError 
 /// preserves the structured fields (name, role, available, similar,
 /// tsv_hint) through to the FFI boundary so `gam-pyffi` can raise a
 /// `gamfit.errors.ColumnNotFoundError` with attributes set from the payload —
-/// not from re-parsed prose. Column-resolution failures keep the schema
-/// bucket (and its "same columns as training" advice); every term-authoring
-/// failure (bad option, incompatible configuration, unsupported feature,
-/// data degenerate for the basis) stays a typed `TermBuilder` error so the
-/// boundary raises it as a formula error.
+/// not from re-parsed prose. Every other variant is kept whole, so its
+/// [`ErrorCategory`] survives to the front ends.
 impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
     fn from(err: gam_terms::term_builder::TermBuilderError) -> Self {
         use gam_terms::term_builder::TermBuilderError;
@@ -1152,12 +1221,7 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
                 similar,
                 tsv_hint,
             },
-            TermBuilderError::MissingColumn { reason }
-            | TermBuilderError::MalformedFormula { reason } => Self::SchemaMismatch { reason },
-            source @ (TermBuilderError::IncompatibleConfig { .. }
-            | TermBuilderError::InvalidOption { .. }
-            | TermBuilderError::UnsupportedFeature { .. }
-            | TermBuilderError::DegenerateData { .. }) => Self::TermBuilder { source },
+            source => Self::TermBuilder { source },
         }
     }
 }
@@ -1165,10 +1229,8 @@ impl From<gam_terms::term_builder::TermBuilderError> for WorkflowError {
 /// Typed lift from leaf data-layer errors. `DataError::ColumnNotFound` is
 /// the variant of immediate interest — it preserves the structured fields
 /// so `gam-pyffi` can dispatch to `ColumnNotFoundError` without parsing
-/// human text. Other `DataError` variants degrade to the appropriate
-/// workflow bucket (`SchemaMismatch` for row/column shape problems,
-/// `InvalidConfig` for parse / encoding / empty / invalid-value sources)
-/// since they don't have a dedicated structured destination yet.
+/// human text. Schema and degenerate-column refusals take their workflow
+/// buckets; every other variant is kept whole under [`WorkflowError::Data`].
 impl From<gam_data::DataError> for WorkflowError {
     fn from(err: gam_data::DataError) -> Self {
         use gam_data::DataError;
@@ -1187,10 +1249,11 @@ impl From<gam_data::DataError> for WorkflowError {
                 tsv_hint,
             },
             DataError::SchemaMismatch { reason } => Self::SchemaMismatch { reason },
-            DataError::ParseError { reason }
-            | DataError::EncodingFailure { reason }
-            | DataError::EmptyInput { reason }
-            | DataError::InvalidValue { reason } => Self::InvalidConfig { reason },
+            other @ (DataError::ParseError { .. }
+            | DataError::EncodingFailure { .. }
+            | DataError::EmptyInput { .. }
+            | DataError::InvalidValue { .. }
+            | DataError::InvalidCell { .. }) => Self::Data(other),
             DataError::DegenerateColumn { column, problem } => {
                 Self::InvalidData { column, problem }
             }

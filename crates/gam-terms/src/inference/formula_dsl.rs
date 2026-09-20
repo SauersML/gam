@@ -1737,14 +1737,16 @@ mod tests {
     }
 
     #[test]
-    fn patsy_c_is_an_alias_for_factor() {
-        let c = parse_formula("y ~ C(g) + x").expect("C() parses");
-        let f = parse_formula("y ~ factor(g) + x").expect("factor() parses");
-        assert_eq!(format!("{:?}", c.terms), format!("{:?}", f.terms));
-        assert!(!random_effect_lenient_unseen("y ~ C(g)"));
-        // Lowercase `c()` is R's vector constructor, not patsy's C().
+    fn capital_c_is_refused_with_a_pointer_to_factor() {
+        // `factor(g)` is the only categorical level-effect spelling; `C(g)`
+        // names nothing else, so it is an error that says what to write.
+        let err = parse_formula("y ~ C(g) + x").expect_err("C() is not a term");
+        let err = err.to_string();
+        assert!(err.contains("`C()` is not a term function"), "{err}");
+        assert!(err.contains("factor(g)"), "{err}");
+        // Lowercase `c()` only appears inside option values (`k=c(5, 5)`).
         let err = parse_formula("y ~ c(g)").expect_err("c() is not a term");
-        assert!(err.to_string().contains("C()"), "{err}");
+        assert!(err.to_string().contains("unknown term function"), "{err}");
     }
 }
 
@@ -1855,9 +1857,9 @@ pub enum ParsedTerm {
         /// Unseen-level policy, fixed at parse time by the wrapper the user
         /// wrote. `group(g)`/`s(g, bs="re")` are genuine **random
         /// effects**: a held-out group is shrunk to the population mean, so an
-        /// unseen level at predict is tolerated (`true`). `factor(g)` (and
-        /// patsy's `C(g)` spelling) names a categorical level effect: like a
-        /// bare `+ g` categorical main effect, an unseen
+        /// unseen level at predict is tolerated (`true`). `factor(g)` names a
+        /// categorical level effect: like a bare `+ g` categorical main
+        /// effect, an unseen
         /// level is a schema mismatch that must raise rather than collapse onto
         /// the factor's centering point (`false`, #2137/#2102). Both wrappers
         /// share the penalized-categorical materialization; only this policy
@@ -2696,6 +2698,7 @@ fn parse_bounded_priorspec(
 
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
+            "shrinkage" => Ok(BoundedCoefficientPriorSpec::Shrinkage),
             "none" => Ok(BoundedCoefficientPriorSpec::None),
             "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
             "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
@@ -2708,7 +2711,7 @@ fn parse_bounded_priorspec(
                         "unknown bounded() prior `{other}`; use `{canonical}`: {raw}"
                     ),
                     None => format!(
-                        "bounded() prior must be one of none|uniform|center, got '{other}': {raw}"
+                        "bounded() prior must be one of shrinkage|none|uniform|center, got '{other}': {raw}"
                     ),
                 },
             }
@@ -2741,7 +2744,8 @@ fn parse_bounded_priorspec(
         return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
     }
 
-    Ok(BoundedCoefficientPriorSpec::None)
+    // No prior option: shrink toward the null with a REML-estimated strength.
+    Ok(BoundedCoefficientPriorSpec::Shrinkage)
 }
 
 // ---------------------------------------------------------------------------
@@ -3364,14 +3368,17 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
     // the plain-variable handling below is the answer, so there is no error here
     // to report.
     if let Ok(call) = parse_function_call(raw) {
-        // patsy's `C(g)` is the same fixed categorical factor as `factor(g)`.
-        // Only the capitalised spelling is the alias: a lower-case `c(...)` is
-        // R's vector constructor, which only ever appears inside option values.
-        let name = if call.name == "C" {
-            "factor".to_string()
-        } else {
-            call.name.to_ascii_lowercase()
-        };
+        // `factor(g)` is the one spelling of a categorical level effect. A
+        // second name for it would be an option with nothing to choose, so
+        // `C(g)` is refused with the spelling to use instead.
+        if call.name == "C" {
+            let target = split_call_args(&call).0.join(", ");
+            return Err(format!(
+                "`C()` is not a term function in '{raw}'; write factor({target}) for a \
+                 categorical level effect"
+            ));
+        }
+        let name = call.name.to_ascii_lowercase();
         let (vars, mut options) = split_call_args(&call);
         if let Some(canonical) = removed_spellings::canonical_for(removed_spellings::TERM_FUNCTIONS, &name)
         {
@@ -3867,7 +3874,7 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
             }
             _ => {
                 return Err(format!(
-                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), nonnegative(), nonpositive(), smooth()/s(), cyclic(), thinplate()/thin_plate()/tps(), te(), t2(), ti(), fs(), sz(), group(), factor()/C(), sphere()/sos()/spherical(), s2(), matern(), duchon(), mjs(), curv(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
+                    "unknown term function `{name}` in '{raw}'. Supported: bounded(), linear(), nonnegative(), nonpositive(), smooth()/s(), cyclic(), thinplate()/thin_plate()/tps(), te(), t2(), ti(), fs(), sz(), group(), factor(), sphere()/sos()/spherical(), s2(), matern(), duchon(), mjs(), curv(), pca(), slope(), linkwiggle(), timewiggle(), link(), survmodel()"
                 ));
             }
         }

@@ -1,11 +1,10 @@
 use crate::bms::{
     BernoulliMarginalSlopeSavedAloReplay, BernoulliMarginalSlopeSavedAloReplayInput,
     EmpiricalZGrid, LatentMeasureKind, LatentZConditionalCalibration, LatentZRankIntCalibration,
-    bernoulli_marginal_link_map, empirical_intercept_from_marginal,
-    empirical_intercept_from_marginal_within, empirical_intercept_tail_tolerance,
-    replay_saved_bernoulli_marginal_slope_alo,
+    bernoulli_marginal_link_map, empirical_intercept, replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
+use crate::latent_anchor::{CalibrationTail, smaller_tail_log_target, solve_log_tail_root};
 use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
@@ -16,7 +15,7 @@ use gam_math::probability::{normal_cdf, normal_pdf};
 use gam_problem::types::{InverseLink, LikelihoodSpec};
 use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::estimate::{EstimationError, UnifiedFitResult};
-use ndarray::{Array1, Array2, ArrayView1};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::sync::Arc;
 
@@ -74,10 +73,12 @@ pub enum LatentConditioningSpan {
 /// replays or the conditional location-scale calibration
 /// `ζ = (z − m(a))/√v(a)` (#905, gam#2926). A fit mints at most one of the two.
 ///
-/// This is the one owner of that composition. The saved marginal-slope predictor
-/// reads its kernel score through it, and so does
-/// `FittedModel::latent_conditional_residual`, which returns ζ for new rows
-/// (gam#3016).
+/// This is the one owner of that composition (gam#3016). The fit computes the
+/// score its kernel is fitted on through it ([`Self::apply_on_span`] on the
+/// training rows, [`Self::calibrate`] wherever the fit applies a calibration it
+/// just estimated), the saved marginal-slope predictor reads its kernel score
+/// through it, and so does `FittedModel::latent_conditional_residual`, which
+/// returns ζ for new rows.
 #[derive(Clone, Copy)]
 pub(crate) struct FittedLatentScoreMap<'a> {
     pub(crate) normalization: &'a SavedLatentZNormalization,
@@ -85,6 +86,23 @@ pub(crate) struct FittedLatentScoreMap<'a> {
     pub(crate) conditional: Option<&'a LatentZConditionalCalibration>,
     /// Where `primary_design` carries the conditioning span `a`.
     pub(crate) span: LatentConditioningSpan,
+}
+
+/// The normalisation of a score that is already on its fitted scale.
+static IDENTITY_NORMALIZATION: SavedLatentZNormalization =
+    SavedLatentZNormalization { mean: 0.0, sd: 1.0 };
+
+impl<'a> FittedLatentScoreMap<'a> {
+    /// The conditional location-scale step alone, for a fit applying the
+    /// calibration it just estimated to scores it has already normalised.
+    pub(crate) fn conditional_only(conditional: &'a LatentZConditionalCalibration) -> Self {
+        Self {
+            normalization: &IDENTITY_NORMALIZATION,
+            rank_int: None,
+            conditional: Some(conditional),
+            span: LatentConditioningSpan::PrimaryDesign,
+        }
+    }
 }
 
 impl FittedLatentScoreMap<'_> {
@@ -95,19 +113,76 @@ impl FittedLatentScoreMap<'_> {
         primary_design: &DesignMatrix,
         context: &str,
     ) -> Result<Array1<f64>, EstimationError> {
+        let design = self.conditional.map(|_| primary_design.to_dense());
+        let a_block = design
+            .as_ref()
+            .map(|design| self.conditioning_span(design.view()))
+            .transpose()?;
+        self.apply_on_span(z_raw, a_block, context)
+    }
+
+    /// The fitted latent score of each row with the conditioning span `a`
+    /// already in hand, as the fit has it on its training rows. `a_block` is
+    /// read only by a conditional calibration, which refuses its absence.
+    pub(crate) fn apply_on_span(
+        &self,
+        z_raw: &Array1<f64>,
+        a_block: Option<ArrayView2<'_, f64>>,
+        context: &str,
+    ) -> Result<Array1<f64>, EstimationError> {
         let normalized = self
             .normalization
             .apply(z_raw, context)
             .map_err(EstimationError::from)?;
-        self.conditional_step(&self.rank_int_step(&normalized), primary_design)
+        self.calibrate(normalized.view(), a_block)
+            .map_err(EstimationError::InvalidInput)
+    }
+
+    /// The calibration steps on normalised scores: the rank-INT or the
+    /// conditional location-scale map, whichever the fit minted.
+    pub(crate) fn calibrate(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_block: Option<ArrayView2<'_, f64>>,
+    ) -> Result<Array1<f64>, String> {
+        let z = self.rank_int_step(z);
+        let Some(cal) = self.conditional else {
+            return Ok(z);
+        };
+        let a_block = a_block.ok_or_else(|| {
+            "conditional latent calibration needs its conditioning span a, and none was supplied"
+                .to_string()
+        })?;
+        cal.apply(z.view(), a_block)
+    }
+
+    /// The columns of the dense primary design that carry `a`.
+    fn conditioning_span<'d>(
+        &self,
+        design: ArrayView2<'d, f64>,
+    ) -> Result<ArrayView2<'d, f64>, EstimationError> {
+        match self.span {
+            LatentConditioningSpan::PrimaryDesign => Ok(design),
+            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
+                let width = design.ncols();
+                if ncols > width {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "conditional latent calibration names the trailing {ncols} columns of the \
+                         primary design as its conditioning span, but that design has only \
+                         {width} columns"
+                    )));
+                }
+                Ok(design.slice_move(ndarray::s![.., width - ncols..]))
+            }
+        }
     }
 
     /// The rank-INT step on normalised scores, or the identity when the fit
     /// minted none.
-    fn rank_int_step(&self, z: &Array1<f64>) -> Array1<f64> {
+    fn rank_int_step(&self, z: ArrayView1<'_, f64>) -> Array1<f64> {
         match self.rank_int {
             Some(cal) => z.mapv(|zi| cal.apply_at_predict(zi)),
-            None => z.clone(),
+            None => z.to_owned(),
         }
     }
 
@@ -122,21 +197,7 @@ impl FittedLatentScoreMap<'_> {
             return Ok(z.clone());
         };
         let design = primary_design.to_dense();
-        let a_block = match self.span {
-            LatentConditioningSpan::PrimaryDesign => design.view(),
-            LatentConditioningSpan::PrimaryDesignTail { ncols } => {
-                let width = design.ncols();
-                if ncols > width {
-                    return Err(EstimationError::InvalidInput(format!(
-                        "conditional latent calibration names the trailing {ncols} columns of the \
-                         primary design as its conditioning span, but that design has only \
-                         {width} columns"
-                    )));
-                }
-                design.slice(ndarray::s![.., width - ncols..])
-            }
-        };
-        cal.apply(z.view(), a_block)
+        cal.apply(z.view(), self.conditioning_span(design.view())?)
             .map_err(EstimationError::InvalidInput)
     }
 }
@@ -174,10 +235,9 @@ impl AnchoredRowKernel {
     /// `η = a(q, b) + s·b·z` under an empirical law, `a` being the root of
     /// `Σ wᵢ Φ(a + s·b·zᵢ) = Φ(q)`. The same formulas
     /// [`BernoulliMarginalSlopePredictor::final_eta_from_theta`] evaluates at
-    /// `θ̂`; the only difference is that a posterior node can sit several
-    /// standard deviations into the tail of `q`, where the root is accepted at
-    /// the roundoff floor of its log-space residual
-    /// (`empirical_intercept_tail_tolerance`) rather than refused.
+    /// `θ̂`. A posterior node can sit several standard deviations into the tail
+    /// of `q`; the root is solved from `q` in log space on the smaller tail, so
+    /// it resolves there like anywhere else (gam#2978).
     pub fn eta(&self, q: f64, b: f64) -> Result<f64, EstimationError> {
         let sb = self.probit_scale * b;
         match &self.grid {
@@ -185,15 +245,12 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let intercept = empirical_intercept_from_marginal_within(
-                    marginal.mu,
+                let intercept = empirical_intercept(
                     marginal.q,
                     b,
                     self.probit_scale,
                     &grid.nodes,
                     &grid.weights,
-                    None,
-                    empirical_intercept_tail_tolerance(marginal.mu),
                 )
                 .map_err(EstimationError::InvalidInput)?;
                 Ok(intercept + sb * self.z)
@@ -223,20 +280,9 @@ impl AnchoredRowKernel {
             Some(grid) => {
                 let marginal = bernoulli_marginal_link_map(&self.base_link, q)
                     .map_err(EstimationError::InvalidInput)?;
-                let intercept = empirical_intercept_from_marginal_within(
-                    marginal.mu,
+                let (intercept, a_q, a_b) = empirical_intercept_and_partials(
                     marginal.q,
-                    b,
-                    scale,
-                    &grid.nodes,
-                    &grid.weights,
-                    None,
-                    empirical_intercept_tail_tolerance(marginal.mu),
-                )
-                .map_err(EstimationError::InvalidInput)?;
-                let (a_q, a_b) = empirical_intercept_partials(
-                    intercept,
-                    marginal.mu1,
+                    marginal.q1,
                     b,
                     scale,
                     &grid.nodes,
@@ -248,32 +294,33 @@ impl AnchoredRowKernel {
     }
 }
 
-/// The implicit-function partials `(∂a/∂q, ∂a/∂b) = (μ′(q)/F_a, −F_b/F_a)` of
-/// the empirical-law intercept `a`, the root of
-/// `F(a) = Σ wᵢ Φ(a + s·b·zᵢ) − μ(q)`, given that root and `μ′(q)`.
-fn empirical_intercept_partials(
-    intercept: f64,
-    marginal_mu1: f64,
+/// The empirical-law intercept `a`, the root of `Σ wᵢ Φ(a + s·b·zᵢ) = Φ(q)`,
+/// with its partials `(∂a/∂η, ∂a/∂b)` in the marginal index `η` (through
+/// `q′(η) = marginal_q1`) and the slope `b`. The root and its derivatives are
+/// the latent anchor's log-space solve and Taylor table at the observed slope
+/// `s·b`, normalized by the grid density, so a tail index keeps its exact
+/// partials (gam#2978).
+fn empirical_intercept_and_partials(
+    q: f64,
+    marginal_q1: f64,
     slope: f64,
     probit_scale: f64,
     nodes: &[f64],
     weights: &[f64],
-) -> Result<(f64, f64), EstimationError> {
+) -> Result<(f64, f64, f64), EstimationError> {
     let observed_slope = probit_scale * slope;
-    let mut f_a = 0.0;
-    let mut f_b = 0.0;
-    for (&node, &weight) in nodes.iter().zip(weights.iter()) {
-        let eta = intercept + observed_slope * node;
-        let pdf = normal_pdf(eta);
-        f_a += weight * pdf;
-        f_b += weight * pdf * probit_scale * node;
-    }
-    if !(f_a.is_finite() && f_a > 0.0 && f_b.is_finite()) {
-        return Err(EstimationError::InvalidInput(format!(
-            "empirical latent prediction calibration derivative is invalid: F_a={f_a}, F_b={f_b}"
-        )));
-    }
-    Ok((marginal_mu1 / f_a, -f_b / f_a))
+    let grid = crate::latent_anchor::AnchorGridOwned::new(nodes.to_vec(), weights.to_vec());
+    let derivatives = crate::latent_anchor::solve_anchor(q, observed_slope, grid.view())
+        .and_then(|alpha| {
+            crate::latent_anchor::AnchorTaylor::at(alpha, q, observed_slope, grid.view())
+        })
+        .map_err(EstimationError::InvalidInput)?
+        .derivatives();
+    Ok((
+        derivatives.alpha,
+        derivatives.a_q * marginal_q1,
+        derivatives.a_b * probit_scale,
+    ))
 }
 
 pub struct BernoulliMarginalSlopePredictor {
@@ -781,7 +828,7 @@ impl BernoulliMarginalSlopePredictor {
     /// having passed the strict normality check, so no transform was
     /// applied at fit time either.
     fn apply_latent_z_calibration(&self, z: &Array1<f64>) -> Array1<f64> {
-        self.latent_score_map().rank_int_step(z)
+        self.latent_score_map().rank_int_step(z.view())
     }
 
     /// Apply the (optional) conditional location-scale latent-z calibration
@@ -827,19 +874,7 @@ impl BernoulliMarginalSlopePredictor {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
         let scale = self.probit_frailty_scale();
-        let intercept = empirical_intercept_from_marginal(
-            marginal.mu,
-            marginal.q,
-            slope,
-            scale,
-            nodes,
-            weights,
-            None,
-        )
-        .map_err(EstimationError::InvalidInput)?;
-        let (a_marginal_eta, a_slope) =
-            empirical_intercept_partials(intercept, marginal.mu1, slope, scale, nodes, weights)?;
-        Ok((intercept, a_marginal_eta, a_slope))
+        empirical_intercept_and_partials(marginal.q, marginal.q1, slope, scale, nodes, weights)
     }
 
     fn local_empirical_mixture_for_point(
@@ -1219,18 +1254,22 @@ impl BernoulliMarginalSlopePredictor {
         Ok(cells)
     }
 
-    fn evaluate_denested_calibration(
+    /// The calibration `P(a) = Σ_cells ∫φ(z)Φ(η(z)) dz` under the standard
+    /// normal latent law, read on its smaller tail exactly as the fit reads it
+    /// (gam#3216, gam#3333): on the survival side each cell is evaluated with
+    /// its index negated, whose value is `∫φ(z)Φ(−η(z)) dz`, and whose moments
+    /// are the cell's own, so they contract with the cell's `∂c/∂a` into `P′`
+    /// and `P″`.
+    fn evaluate_denested_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
-        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
-            .map_err(EstimationError::InvalidInput)?;
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
         let cells = self.denested_partition_cells(
             a,
             slope,
@@ -1240,9 +1279,10 @@ impl BernoulliMarginalSlopePredictor {
             link_dev_correction_for_row,
         )?;
         let scale = self.probit_frailty_scale();
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        let summands = cells.len() * crate::cubic_cell_kernel::GL_NODES_FOR_GPU_KERNEL.len();
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let mut density_slope = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let (dc_da_raw, _) = crate::cubic_cell_kernel::denested_cell_coefficient_partials(
@@ -1267,15 +1307,22 @@ impl BernoulliMarginalSlopePredictor {
             let max_degree = crate::cubic_cell_kernel::cell_second_derivative_required_max_degree(
                 &dc_da, &dc_da, &d2c_da2,
             );
-            let state = crate::cubic_cell_kernel::evaluate_cell_moments(cell, max_degree)
-                .map_err(EstimationError::InvalidInput)?;
-            f += state.value;
-            f_a += crate::cubic_cell_kernel::cell_first_derivative_from_moments(
+            let state = crate::cubic_cell_kernel::evaluate_cell_moments(
+                if survival_side {
+                    cell.negated()
+                } else {
+                    cell
+                },
+                max_degree,
+            )
+            .map_err(EstimationError::InvalidInput)?;
+            tail += state.value;
+            density += crate::cubic_cell_kernel::cell_first_derivative_from_moments(
                 &dc_da,
                 &state.moments,
             )
             .map_err(EstimationError::InvalidInput)?;
-            f_aa += crate::cubic_cell_kernel::cell_second_derivative_from_moments(
+            density_slope += crate::cubic_cell_kernel::cell_second_derivative_from_moments(
                 cell,
                 &dc_da,
                 &dc_da,
@@ -1284,7 +1331,12 @@ impl BernoulliMarginalSlopePredictor {
             )
             .map_err(EstimationError::InvalidInput)?;
         }
-        Ok((f, f_a, f_aa))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: Some(density_slope),
+            summands,
+        })
     }
 
     fn observed_denested_cell_partials_at_z(
@@ -1358,22 +1410,23 @@ impl BernoulliMarginalSlopePredictor {
         })
     }
 
-    fn evaluate_empirical_denested_calibration(
+    /// The calibration `P(a) = Σ_k w_k Φ(η(a, z_k))` over an empirical latent
+    /// grid, read on its smaller tail `Σ_k w_k Φ(∓η_k)` (gam#3216, gam#3333).
+    fn evaluate_empirical_denested_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
-        let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
-            .map_err(EstimationError::InvalidInput)?;
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
+        let tail_sign = if survival_side { -1.0 } else { 1.0 };
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let mut density_slope = 0.0;
         for (node, weight) in grid.pairs() {
             let obs = self.observed_denested_cell_partials_at_z(
                 node,
@@ -1388,44 +1441,49 @@ impl BernoulliMarginalSlopePredictor {
             let eta_a = eval_coeff4_at(&obs.dc_da, node);
             let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
             let pdf = normal_pdf(eta);
-            f += weight * normal_cdf(eta);
-            f_a += weight * pdf * eta_a;
-            f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+            tail += weight * normal_cdf(tail_sign * eta);
+            density += weight * pdf * eta_a;
+            density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
         }
-        Ok((f, f_a, f_aa))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: Some(density_slope),
+            summands: grid.nodes.len(),
+        })
     }
 
-    fn evaluate_prediction_calibration(
+    fn evaluate_prediction_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_score_warp: Option<&Array1<f64>>,
         beta_link_dev: Option<&Array1<f64>>,
         empirical_grid: Option<&EmpiricalZGrid>,
         score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
-    ) -> Result<(f64, f64, f64), EstimationError> {
+        survival_side: bool,
+    ) -> Result<CalibrationTail, EstimationError> {
         if let Some(grid) = empirical_grid {
-            self.evaluate_empirical_denested_calibration(
+            self.evaluate_empirical_denested_calibration_tail(
                 a,
-                marginal_eta,
                 slope,
                 beta_score_warp,
                 beta_link_dev,
                 grid,
                 score_warp_correction_for_row,
                 link_dev_correction_for_row,
+                survival_side,
             )
         } else {
-            self.evaluate_denested_calibration(
+            self.evaluate_denested_calibration_tail(
                 a,
-                marginal_eta,
                 slope,
                 beta_score_warp,
                 beta_link_dev,
                 score_warp_correction_for_row,
                 link_dev_correction_for_row,
+                survival_side,
             )
         }
     }
@@ -1656,8 +1714,7 @@ impl BernoulliMarginalSlopePredictor {
         Ok((marginal, slope, score_warp, link_dev))
     }
 
-    /// Safeguarded monotone root solve for the marginal intercept under the
-    /// de-nested flexible model
+    /// The marginal intercept under the de-nested flexible model
     ///   η(z) = a + b z + b Δ_h(z) + Δ_w(a + b z).
     fn solve_intercept_scalar(
         &self,
@@ -1672,20 +1729,6 @@ impl BernoulliMarginalSlopePredictor {
     ) -> Result<f64, EstimationError> {
         let marginal = bernoulli_marginal_link_map(&self.base_link, marginal_eta)
             .map_err(EstimationError::InvalidInput)?;
-        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_prediction_calibration(
-                a,
-                marginal_eta,
-                slope,
-                score_warp_beta,
-                link_dev_beta,
-                empirical_grid,
-                score_warp_correction_for_row,
-                link_dev_correction_for_row,
-            )
-            .map_err(|err| err.to_string())
-        };
-
         let probit_scale = self.probit_frailty_scale();
         let a_rigid = self.rigid_intercept_from_marginal(marginal.q, slope);
         let mut intercept = a_rigid;
@@ -1711,28 +1754,33 @@ impl BernoulliMarginalSlopePredictor {
             }
         }
 
-        // The implicit-function gradients (`a_q`, `a_b`) read this root exactly as
-        // the fit's derivatives read the fitted one, so the saved model accepts it
-        // at the fit's residual contract. The root solver is driven to the same
-        // tolerance the acceptance check below uses.
-        let target = marginal.mu;
-        let abs_tol =
-            crate::bms::row_primary_hessian::bernoulli_intercept_residual_tolerance(target);
-
-        let (root, _, f_best) = crate::monotone_root::solve_monotone_root(
-            eval,
+        // The saved model solves the fit's equation, `log T(a) = log Φ(∓q)` on
+        // the smaller marginal tail, held to the same derived resolution, so
+        // the root it reads the implicit-function gradients (`a_q`, `a_b`) at
+        // is the fitted one to rounding, whatever the seed (gam#3333).
+        let survival_side = marginal.q >= 0.0;
+        let log_target = smaller_tail_log_target(marginal.q);
+        let (root, _) = solve_log_tail_root(
             intercept,
-            "saved bernoulli intercept",
-            abs_tol,
-            64,
-            48,
-        )?;
-
-        if f_best.abs() > abs_tol {
-            return Err(EstimationError::InvalidInput(format!(
-                "saved bernoulli marginal-slope intercept solve failed: residual={f_best:.3e} at a={root:.6}, target mu={target:.6}"
-            )));
-        }
+            survival_side,
+            |a| {
+                self.evaluate_prediction_calibration_tail(
+                    a,
+                    slope,
+                    score_warp_beta,
+                    link_dev_beta,
+                    empirical_grid,
+                    score_warp_correction_for_row,
+                    link_dev_correction_for_row,
+                    survival_side,
+                )
+                .map_err(|err| err.to_string())?
+                .log_residual(survival_side, log_target)
+            },
+            "saved bernoulli marginal-slope intercept",
+            || format!("q={}, b={slope}", marginal.q),
+        )
+        .map_err(EstimationError::InvalidInput)?;
         Ok(root)
     }
 
@@ -2109,16 +2157,18 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts_view[local_row];
-                    let (_, m_a, _) = self.evaluate_prediction_calibration(
+                    let m_a = self
+                        .evaluate_prediction_calibration_tail(
                         intercept,
-                        q,
                         slope,
                         score_warp_beta_owned.as_ref(),
                         link_dev_beta_owned.as_ref(),
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                    )?;
+                        false,
+                    )?
+                        .density;
                     // ∂a/∂θ = −F_θ/F_a by the implicit function theorem. The
                     // calibration F is increasing in a, so F_a is positive unless
                     // every quadrature density has underflowed; the intercept then
@@ -2734,16 +2784,18 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let (_, m_a, _) = self.evaluate_prediction_calibration(
+                    let m_a = self
+                        .evaluate_prediction_calibration_tail(
                         intercept,
-                        q,
                         slope,
                         self.beta_score_warp.as_ref(),
                         self.beta_link_dev.as_ref(),
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                    )?;
+                        false,
+                    )?
+                        .density;
                     // ∂a/∂θ = −F_θ/F_a: a non-positive F_a leaves the intercept
                     // with no finite gradient, so the row is refused.
                     if !(m_a > 0.0 && m_a.is_finite()) {

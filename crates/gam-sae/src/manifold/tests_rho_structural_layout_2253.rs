@@ -101,9 +101,8 @@ fn fixed_assignment_strength_is_absent_from_flat_rho_layout_2253() {
 }
 
 /// #2933 F45 — an ordered Beta--Bernoulli prior carries the sparse coordinate exactly while
-/// its concentration is learned. A fixed concentration, by the mode or by a per-fit override
-/// of a learnable mode, is the complete prior at weight one, and its placeholder is kept out
-/// of the flat vector and left unchanged by reconstitution.
+/// its concentration is learned. A fixed concentration is the complete prior at weight one,
+/// and its placeholder is kept out of the flat vector and left unchanged by reconstitution.
 #[test]
 fn ordered_beta_bernoulli_sparse_coordinate_follows_the_effective_concentration_2933() {
     let smooth_and_ard = vec![array![0.2], array![0.3]];
@@ -113,16 +112,12 @@ fn ordered_beta_bernoulli_sparse_coordinate_follows_the_effective_concentration_
     assert_eq!(learned.flat_coordinates(), array![-0.9, 0.1, 0.1, 0.2, 0.3]);
 
     let fixed = layout_assignment(AssignmentMode::ordered_beta_bernoulli(0.8, 1.7, false), 2);
-    let mut overridden = learnable.clone();
-    overridden.set_ordered_beta_bernoulli_alpha_override(Some(0.6));
-    for (label, assignment) in [("fixed mode", &fixed), ("override", &overridden)] {
-        let rho = SaeManifoldRho::new(-0.9, 0.1, smooth_and_ard.clone()).for_assignment(assignment);
-        assert_eq!(rho.sparse_flat_index(), None, "{label}");
-        assert_eq!(rho.flat_coordinates(), array![0.1, 0.1, 0.2, 0.3], "{label}");
-        let restored = rho
-            .from_flat(array![0.4, -0.2, 0.5, 0.6].view())
-            .expect("the four present coordinates rebuild");
-        assert_abs_diff_eq!(restored.log_lambda_sparse, -0.9, epsilon = 0.0);
-    }
+    let rho = SaeManifoldRho::new(-0.9, 0.1, smooth_and_ard.clone()).for_assignment(&fixed);
+    assert_eq!(rho.sparse_flat_index(), None);
+    assert_eq!(rho.flat_coordinates(), array![0.1, 0.1, 0.2, 0.3]);
+    let restored = rho
+        .from_flat(array![0.4, -0.2, 0.5, 0.6].view())
+        .expect("the four present coordinates rebuild");
+    assert_abs_diff_eq!(restored.log_lambda_sparse, -0.9, epsilon = 0.0);
 }
 

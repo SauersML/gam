@@ -14,8 +14,8 @@ last bits of ``H`` between two solves at the same rho. The correction now reads
 the criterion's own root-scale (#2644) eigensystem.
 
 F15. The chicago Poisson model ``y ~ s(time) + s(tmpd) + te(pm10, o3)`` at
-n = 1000-1500 raised "smoothing cubature has no positive-width proposal". It
-now fits and the smoothing correction is integrated by the cubature itself.
+n = 1000-1500 raised "smoothing cubature has no positive-width proposal". The
+cubature is gone; the fit publishes the first-order smoothing correction.
 
 Both fixtures are synthetic analogues with the covariate scales of the data.
 """

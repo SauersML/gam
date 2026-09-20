@@ -10,15 +10,14 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component (or, for an unpenalized factor block, fixed-effect)
-/// test of every random-effect block of a fitted standard GAM.
+/// The variance-component test of every random-effect block of a fitted
+/// standard GAM.
 ///
 /// Never fails: a fit without the row state the score needs yields one
 /// `NoIrlsRowState` record per block, so the summary always has an answer for
 /// each random-effect row.
 pub fn random_effect_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
-    spec: &gam_terms::smooth::TermCollectionSpec,
     fit: &UnifiedFitResult,
 ) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
     use gam_terms::inference::random_effect_test::{
@@ -85,13 +84,8 @@ pub fn random_effect_test_records(
     };
     let requests: Vec<RandomEffectTermRequest> = ranges
         .iter()
-        .map(|(name, range)| RandomEffectTermRequest {
+        .map(|(_, range)| RandomEffectTermRequest {
             range: range.clone(),
-            penalized: spec
-                .random_effect_terms
-                .iter()
-                .find(|term| term.name == *name)
-                .is_none_or(|term| term.penalized),
         })
         .collect();
     records(

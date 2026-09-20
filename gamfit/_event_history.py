@@ -129,8 +129,8 @@ class EventHistoryModel:
 
     @property
     def reference_certificate(self) -> float | None:
-        """The reference grid's certificate: the geometric-tail estimate of the
-        moves finer grids make the fitted coefficients take, in posterior
+        """The reference grid's certificate: the moves finer grids make the
+        fitted coefficients take, closed by a geometric-tail estimate, in posterior
         standard deviations, within the certificate's tolerance. ``None`` when the
         baselines are centred on the stationary prior."""
         return self._native.reference_certificate()

@@ -113,6 +113,49 @@ pub(crate) fn reciprocal_power_link_jet6(
 /// Canonical names of the reciprocal links, from the one link vocabulary.
 pub(crate) const INVERSE_LINK_NAME: &str = StandardLink::Inverse.name();
 pub(crate) const INVERSE_SQUARED_LINK_NAME: &str = StandardLink::InverseSquared.name();
+pub(crate) const SQRT_LINK_NAME: &str = StandardLink::Sqrt.name();
+
+/// The inverse-link stack `[h, h′, …, h⁽⁵⁾]` of the square-root link
+/// `g(μ) = √μ`, whose inverse `μ = η²` is a bijection only on the branch
+/// `η > 0`; every other `η` is refused through the typed domain error (the
+/// recoverable step-rejection channel), never folded back onto the branch.
+pub(crate) fn sqrt_link_jet6(eta: f64) -> Result<[f64; 6], EstimationError> {
+    if !(eta > 0.0 && eta.is_finite()) {
+        return Err(EstimationError::InverseLinkDomainViolation {
+            link: SQRT_LINK_NAME,
+            eta,
+            lower: 0.0,
+            upper: f64::MAX,
+        });
+    }
+    Ok([eta * eta, 2.0 * eta, 2.0, 0.0, 0.0, 0.0])
+}
+
+/// The inverse-link stack `[h, h′, …, h⁽⁵⁾]` at `η` for the links of the
+/// power/log ladder (identity, log, sqrt, `1/μ`, `1/μ²`), `None` for the
+/// probability links. Each link's own domain is enforced through
+/// [`EstimationError::InverseLinkDomainViolation`].
+pub(crate) fn standard_ladder_link_jet6(
+    link: StandardLink,
+    eta: f64,
+) -> Option<Result<[f64; 6], EstimationError>> {
+    match link {
+        StandardLink::Identity => Some(
+            finite_inverse_link_eta(StandardLink::Identity.name(), eta)
+                .map(|eta| [eta, 1.0, 0.0, 0.0, 0.0, 0.0]),
+        ),
+        StandardLink::Log => Some(log_link_solver_exp(eta).map(|e| [e; 6])),
+        StandardLink::Sqrt => Some(sqrt_link_jet6(eta)),
+        StandardLink::Inverse | StandardLink::InverseSquared => {
+            standard_reciprocal_power_jet6(link, eta)
+        }
+        StandardLink::Logit
+        | StandardLink::Probit
+        | StandardLink::CLogLog
+        | StandardLink::LogLog
+        | StandardLink::Cauchit => None,
+    }
+}
 
 /// [`reciprocal_power_link_jet6`] for the standard link, `None` for every link
 /// that is not a reciprocal power.
@@ -521,6 +564,7 @@ pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64
         StandardLink::Cauchit => component_fisher_weight_jet5(LinkComponent::Cauchit, eta),
         StandardLink::Identity
         | StandardLink::Log
+        | StandardLink::Sqrt
         | StandardLink::Inverse
         | StandardLink::InverseSquared => (0.0, 0.0, 0.0, 0.0, 0.0),
     }
@@ -850,6 +894,244 @@ fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
         density_over_p,
         density_over_q,
     )
+}
+
+/// η-derivatives of the two Bernoulli log-probabilities (#3317):
+/// `log_mu[k] = ∂^{k+1} log μ(η)/∂η^{k+1}` and `log_complement[k]` the same for
+/// `log(1 − μ(η))`, for `k = 0..4`.
+///
+/// A Bernoulli row's log-likelihood is `y·log μ + (1−y)·log(1−μ)`, so its
+/// observed information and every η-derivative of it are linear in these two
+/// jets. Nothing here divides by the variance `μ(1−μ)`, which the ratio tower
+/// `μ'/(φμ(1−μ))` must: each side is normalized by its OWN probability. The
+/// series `μ(η+t)/μ(η)` has coefficients `(μ'/μ)·(μ^(m)/μ')/m!` and
+/// `(1−μ)(η+t)/(1−μ)(η)` has `−(μ'/(1−μ))·(μ^(m)/μ')/m!`, the reverse hazard
+/// and the hazard times the density ratios; the jet is the Taylor logarithm of
+/// each. Both stay representable where `μ'` and `1−μ` underflow together and
+/// the tower is `0/0` — cloglog at `η = 6.65`, whose `y = 1` row has the exact,
+/// representable observed information `≈ 0` that the tower reported as NaN.
+///
+/// Accuracy is relative wherever a side's probability is not small, and on
+/// the closed forms (logit, and the cloglog/loglog side `−e^{±η}`). Where a
+/// side's own probability is small and it has no closed form, its higher
+/// derivatives are small differences of terms of size `ρ^m`, `ρ` the side's
+/// first derivative (`|η|` for probit, `1` for the cloglog probability at
+/// `η ≪ 0`), so the error there is absolute, `~ε·ρ^m`: `5e-8` on the fifth
+/// derivative of `log Φ(−30)`, whose second is `−0.9989`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BernoulliLogJet {
+    pub(crate) log_mu: [f64; 5],
+    pub(crate) log_complement: [f64; 5],
+}
+
+pub(crate) fn bernoulli_log_jet5_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<BernoulliLogJet, EstimationError> {
+    if eta.is_nan() {
+        return Ok(BernoulliLogJet {
+            log_mu: [f64::NAN; 5],
+            log_complement: [f64::NAN; 5],
+        });
+    }
+    match link {
+        InverseLink::Standard(StandardLink::Logit) => {
+            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Logistic, eta))
+        }
+        InverseLink::Standard(StandardLink::Probit) => {
+            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Normal, eta))
+        }
+        InverseLink::Standard(StandardLink::Cauchit) => {
+            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Cauchy, eta))
+        }
+        InverseLink::Standard(StandardLink::CLogLog) => Ok(BernoulliLogJet {
+            log_mu: cloglog_log_mean_jet5(eta),
+            // log(1 − μ) = −e^η: every derivative is −e^η.
+            log_complement: [-eta.exp(); 5],
+        }),
+        // loglog μ(η) = 1 − cloglog μ(−η): the two sides trade places.
+        InverseLink::Standard(StandardLink::LogLog) => Ok(BernoulliLogJet {
+            log_mu: reflect_log_jet5([-(-eta).exp(); 5]),
+            log_complement: reflect_log_jet5(cloglog_log_mean_jet5(-eta)),
+        }),
+        _ => bernoulli_log_jet5_from_inverse_link_jet(link, eta),
+    }
+}
+
+/// The link-generic construction behind [`bernoulli_log_jet5_for_inverse_link`],
+/// from the inverse-link jet and its fourth and fifth derivatives, normalizing
+/// each side by its own probability.
+pub(crate) fn bernoulli_log_jet5_from_inverse_link_jet(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<BernoulliLogJet, EstimationError> {
+    let jet = link.jet(eta)?;
+    let derivatives = [
+        jet.d1,
+        jet.d2,
+        jet.d3,
+        inverse_link_pdfthird_derivative_for_inverse_link(link, eta)?,
+        inverse_link_pdffourth_derivative_for_inverse_link(link, eta)?,
+    ];
+    let complement = inverse_link_complement_for_inverse_link(link, eta, jet.mu);
+    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
+    let mut mean_series = [0.0; 5];
+    let mut complement_series = [0.0; 5];
+    for m in 0..5 {
+        mean_series[m] = derivatives[m] / (factorial[m] * jet.mu);
+        complement_series[m] = -derivatives[m] / (factorial[m] * complement);
+    }
+    Ok(BernoulliLogJet {
+        log_mu: log_of_normalized_series5(mean_series),
+        log_complement: log_of_normalized_series5(complement_series),
+    })
+}
+
+/// `f(−η)`'s derivative jet from `f`'s jet evaluated at `−η`:
+/// order `m` picks up `(−1)^m`.
+#[inline]
+fn reflect_log_jet5(jet: [f64; 5]) -> [f64; 5] {
+    [-jet[0], jet[1], -jet[2], jet[3], -jet[4]]
+}
+
+/// Derivatives of `log P(t)` at `t = 0` for `P(t) = 1 + Σ_{m=1}^{5} p_m t^m`,
+/// given `p_m` as `series[m-1]`. From `P' = (log P)'·P`, the Taylor coefficients
+/// `l_m` of `log P` obey `l_m = p_m − (1/m) Σ_{j=1}^{m-1} j l_j p_{m-j}`.
+#[inline]
+fn log_of_normalized_series5(series: [f64; 5]) -> [f64; 5] {
+    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
+    let mut log_coefficients = [0.0_f64; 5];
+    for m in 1..=5 {
+        let mut convolution = 0.0;
+        for j in 1..m {
+            let p = series[m - j - 1];
+            if p != 0.0 {
+                convolution += j as f64 * log_coefficients[j - 1] * p;
+            }
+        }
+        log_coefficients[m - 1] = series[m - 1] - convolution / m as f64;
+    }
+    let mut derivatives = [0.0; 5];
+    for m in 0..5 {
+        derivatives[m] = canonicalzero(log_coefficients[m] * factorial[m]);
+    }
+    derivatives
+}
+
+/// `p_m = ratio·density_ratios[m-1]/m!`; a zero ratio is an exactly zero series
+/// whatever the polynomials' size.
+#[inline]
+fn density_ratio_series5(ratio: f64, density_ratios: [f64; 5]) -> [f64; 5] {
+    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
+    let mut series = [0.0; 5];
+    if ratio != 0.0 {
+        for m in 0..5 {
+            series[m] = ratio * density_ratios[m] / factorial[m];
+        }
+    }
+    series
+}
+
+/// The inverse-link CDFs symmetric about zero, `1 − F(x) = F(−x)`.
+#[derive(Clone, Copy)]
+enum SymmetricBernoulliCdf {
+    Logistic,
+    Normal,
+    Cauchy,
+}
+
+/// Both sides of a symmetric link: `1 − F(η) = F(−η)`, so the complement's
+/// jet is the mean's evaluated at `−η` and reflected.
+fn symmetric_bernoulli_log_jet5(cdf: SymmetricBernoulliCdf, eta: f64) -> BernoulliLogJet {
+    BernoulliLogJet {
+        log_mu: symmetric_log_cdf_jet5(cdf, eta),
+        log_complement: reflect_log_jet5(symmetric_log_cdf_jet5(cdf, -eta)),
+    }
+}
+
+/// Derivatives of `log F(x)` for a symmetric Bernoulli CDF `F`.
+fn symmetric_log_cdf_jet5(cdf: SymmetricBernoulliCdf, x: f64) -> [f64; 5] {
+    match cdf {
+        SymmetricBernoulliCdf::Logistic => {
+            // (log F)' = 1 − F and (1 − F)' = −F', so order m ≥ 2 is −F^(m−1).
+            let jet = logit_inverse_link_jet5(x);
+            [logit_inverse_link_jet5(-x).mu, -jet.d1, -jet.d2, -jet.d3, -jet.d4]
+        }
+        SymmetricBernoulliCdf::Normal => {
+            let x2 = x * x;
+            let density_ratios = [1.0, -x, x2 - 1.0, -x * (x2 - 3.0), x2 * x2 - 6.0 * x2 + 3.0];
+            let (log_p, ratio) = gam_math::probability::signed_probit_logcdf_and_mills_ratio(x);
+            if ratio >= f64::MIN_POSITIVE {
+                return log_of_normalized_series5(density_ratio_series5(ratio, density_ratios));
+            }
+            // φ(x) is subnormal or zero, which happens only at x ≫ 0 where
+            // log Φ(x) is an exact −Φ(−x): form each coefficient φ·dr/(Φ·m!)
+            // in log scale so it survives the underflow of φ alone. A Hermite
+            // polynomial overflows only where e^{−x²/2} times it is zero.
+            let log_ratio = -0.5 * x2 - 0.5 * (2.0 * std::f64::consts::PI).ln() - log_p;
+            if log_ratio == f64::NEG_INFINITY || density_ratios.iter().any(|v| !v.is_finite()) {
+                return [0.0; 5];
+            }
+            let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
+            let mut series = [0.0; 5];
+            for m in 0..5 {
+                let ratio_poly = density_ratios[m];
+                if ratio_poly != 0.0 {
+                    series[m] =
+                        ratio_poly.signum() * (log_ratio + ratio_poly.abs().ln()).exp() / factorial[m];
+                }
+            }
+            log_of_normalized_series5(series)
+        }
+        SymmetricBernoulliCdf::Cauchy => {
+            let (a, b) = cauchit_rational_factors(x);
+            let a2 = a * a;
+            let b2 = b * b;
+            let density_ratios = [
+                1.0,
+                -2.0 * b,
+                6.0 * b2 - 2.0 * a2,
+                24.0 * b * (a2 - b2),
+                24.0 * a2 * a2 - 240.0 * a2 * b2 + 120.0 * b2 * b2,
+            ];
+            let log_density = -std::f64::consts::PI.ln() - 2.0 * x.hypot(1.0).ln();
+            let ratio = (log_density - cauchit_mean(x).ln()).exp();
+            log_of_normalized_series5(density_ratio_series5(ratio, density_ratios))
+        }
+    }
+}
+
+/// Derivatives of `log μ(η)` for `μ = 1 − exp(−e^η)`.
+fn cloglog_log_mean_jet5(eta: f64) -> [f64; 5] {
+    let u = eta.exp();
+    let survival = (-u).exp();
+    let series = if 1.0 - survival == 1.0 {
+        // μ rounds to 1, so dividing by it is exact to rounding and each
+        // coefficient is μ^(m)/m! = u·dr_{m−1}(u)·e^{−u}/m!, evaluated without
+        // underflowing e^{−u} or overflowing the polynomial.
+        let eval = |coefficients: &[f64]| stable_nonnegative_poly_times_exp_neg(u, coefficients);
+        [
+            eval(&[0.0, 1.0]),
+            eval(&[0.0, 1.0, -1.0]) / 2.0,
+            eval(&[0.0, 1.0, -3.0, 1.0]) / 6.0,
+            eval(&[0.0, 1.0, -7.0, 6.0, -1.0]) / 24.0,
+            eval(&[0.0, 1.0, -15.0, 25.0, -10.0, 1.0]) / 120.0,
+        ]
+    } else {
+        let u2 = u * u;
+        // μ'/μ = 1/exprel(u), with the exact u → 0 limit.
+        density_ratio_series5(
+            (-gam_math::special::log_exprel(u)).exp(),
+            [
+                1.0,
+                1.0 - u,
+                1.0 - 3.0 * u + u2,
+                1.0 - 7.0 * u + 6.0 * u2 - u2 * u,
+                1.0 - 15.0 * u + 25.0 * u2 - 10.0 * u2 * u + u2 * u2,
+            ],
+        )
+    };
+    log_of_normalized_series5(series)
 }
 
 #[inline]
@@ -1415,6 +1697,10 @@ impl InverseLinkKernel for LinkFunction {
                     d3: e,
                 })
             }
+            LinkFunction::Sqrt => {
+                let [mu, d1, d2, d3, _, _] = sqrt_link_jet6(eta)?;
+                Ok(InverseLinkJet { mu, d1, d2, d3 })
+            }
             LinkFunction::Inverse => {
                 let [mu, d1, d2, d3, _, _] =
                     reciprocal_power_link_jet6(INVERSE_LINK_NAME, 1.0, eta)?;
@@ -1498,6 +1784,7 @@ impl InverseLinkKernel for InverseLink {
             InverseLink::Standard(StandardLink::Cauchit) => CauchitLinkKernel.jet(eta),
             InverseLink::Standard(StandardLink::Identity) => LinkFunction::Identity.jet(eta),
             InverseLink::Standard(StandardLink::Log) => LinkFunction::Log.jet(eta),
+            InverseLink::Standard(StandardLink::Sqrt) => LinkFunction::Sqrt.jet(eta),
             InverseLink::Standard(StandardLink::Inverse) => LinkFunction::Inverse.jet(eta),
             InverseLink::Standard(StandardLink::InverseSquared) => {
                 LinkFunction::InverseSquared.jet(eta)
@@ -1585,7 +1872,7 @@ pub fn inverse_link_mu_d1_for_inverse_link(
 /// Each link with a cancellation-free closed form for `1 - mu` uses it; links
 /// without one fall back to `1.0 - mu` (unchanged behaviour). The complement is
 /// clamped into `[0, 1]` only against round-off just past the boundary.
-pub(crate) fn inverse_link_complement_for_inverse_link(
+pub fn inverse_link_complement_for_inverse_link(
     link: &InverseLink,
     eta: f64,
     mu: f64,
@@ -1649,12 +1936,15 @@ fn standard_link_complement(link: StandardLink, eta: f64, mu: f64) -> f64 {
             }
         }
         StandardLink::Cauchit => cauchit_mean(-eta),
-        // Logit carries its own tail complement on the canonical path; identity
-        // and log are not Bernoulli-variance links. The naive complement is
-        // exact enough for these here.
+        // Relative-risk Bernoulli link: mu = exp(eta)  =>  1 - mu = -expm1(eta),
+        // which keeps the complement's leading digits as eta -> 0⁻.
+        StandardLink::Log => -eta.exp_m1(),
+        // Logit carries its own tail complement on the canonical path; the
+        // remaining links are not Bernoulli-variance links. The naive
+        // complement is exact enough for these here.
         StandardLink::Logit
         | StandardLink::Identity
-        | StandardLink::Log
+        | StandardLink::Sqrt
         | StandardLink::Inverse
         | StandardLink::InverseSquared => 1.0 - mu,
     }
@@ -1814,6 +2104,10 @@ fn link_function_mu_d1(link: LinkFunction, eta: f64) -> Result<(f64, f64), Estim
         LinkFunction::CLogLog => Ok(component_inverse_link_mu_d1(LinkComponent::CLogLog, eta)),
         LinkFunction::LogLog => Ok(component_inverse_link_mu_d1(LinkComponent::LogLog, eta)),
         LinkFunction::Cauchit => Ok(component_inverse_link_mu_d1(LinkComponent::Cauchit, eta)),
+        LinkFunction::Sqrt => {
+            let jet = sqrt_link_jet6(eta)?;
+            Ok((jet[0], jet[1]))
+        }
         LinkFunction::Inverse => {
             let jet = reciprocal_power_link_jet6(INVERSE_LINK_NAME, 1.0, eta)?;
             Ok((jet[0], jet[1]))
@@ -1996,6 +2290,7 @@ fn inverse_link_pdf_derivative_for_inverse_link(
 ) -> Result<f64, EstimationError> {
     match link {
         InverseLink::Standard(StandardLink::Identity) => Ok(0.0),
+        InverseLink::Standard(StandardLink::Sqrt) => sqrt_link_jet6(eta).map(|_| 0.0),
         InverseLink::Standard(StandardLink::Log) => log_link_solver_exp(eta),
         InverseLink::Standard(link @ (StandardLink::Inverse | StandardLink::InverseSquared)) => {
             let jet = standard_reciprocal_power_jet6(*link, eta)

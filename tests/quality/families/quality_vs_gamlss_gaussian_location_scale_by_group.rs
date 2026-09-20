@@ -43,7 +43,6 @@
 //! finding.
 
 use csv::StringRecord;
-use gam::families::sigma_link::LOGB_SIGMA_FLOOR;
 use gam::matrix::LinearOperator;
 use gam::predict::gaussian_location_scale::GaussianLocationScalePredictor;
 use gam::predict::{PredictInput, PredictableModel};
@@ -204,12 +203,13 @@ fn gam_location_scale_by_group_matches_gamlss() {
     // activates only that group's block, and read off X·β through the frozen
     // resolved specs (mean uses meanspec_resolved, σ uses noisespec_resolved).
     // σ goes through the production Gaussian location-scale predictor, whose
-    // raw-unit noise link is σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_noise·β);
-    // exp(X_noise·β) alone drops that floor and biases log σ̂ low.
+    // raw-unit noise link is σ = response_scale·sigma_floor + exp(X_noise·β), with
+    // the fit's own floor (recording-grid bound δ/√12 of the standardized
+    // response); exp(X_noise·β) alone drops that floor and biases log σ̂ low.
     let sigma_predictor = GaussianLocationScalePredictor {
         beta_mu: beta_mean.clone(),
         beta_noise: beta_scale.clone(),
-        sigma_floor: LOGB_SIGMA_FLOOR,
+        sigma_floor: fit.sigma_floor,
         response_scale: fit.response_scale,
         covariance: None,
         link_wiggle: None,

@@ -84,6 +84,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
                 knotspec: BSplineKnotSpec::PeriodicUniform {
                     data_range: (0.0, 1.0),
                     num_basis: 10,
+                    adaptive: false,
                 },
                 double_penalty: true,
                 identifiability: BSplineIdentifiability::None,
@@ -193,6 +194,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             knotspec: BSplineKnotSpec::PeriodicUniform {
                 data_range: (0.0, 1.0),
                 num_basis: 10,
+                adaptive: false,
             },
             double_penalty: false,
             identifiability: BSplineIdentifiability::None,
@@ -270,6 +272,7 @@ fn periodic_bspline_terms_build_with_cyclic_penalty_and_formula_alias() {
             BSplineKnotSpec::PeriodicUniform {
                 data_range,
                 num_basis,
+                ..
             } => {
                 assert_eq!(num_basis, 9);
                 assert_eq!(data_range, (0.0, 1.0));

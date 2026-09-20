@@ -66,6 +66,58 @@ pub(crate) fn rewrite_thin_plate_knots_error(
     }
 }
 
+/// Put the unresolvable-bulk thin-plate refusal in the term's own units: name
+/// the smooth and, for each covariate, the full range the centres had to span
+/// next to the interquartile range where the bulk of the rows sit, so the
+/// outlying span is visible and the remedy is actionable.
+pub(crate) fn name_thin_plate_outlier_span(
+    err: BasisError,
+    termname: &str,
+    data: ArrayView2<'_, f64>,
+    feature_cols: &[usize],
+) -> BasisError {
+    let BasisError::ThinPlateBulkUnresolvable {
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        ..
+    } = err
+    else {
+        return err;
+    };
+    let spans = feature_cols
+        .iter()
+        .filter(|&&col| col < data.ncols() && data.nrows() > 0)
+        .map(|&col| {
+            let mut values: Vec<f64> = data.column(col).iter().copied().collect();
+            values.sort_by(f64::total_cmp);
+            let quantile = |p: f64| {
+                let pos = p * (values.len() - 1) as f64;
+                let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+                values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
+            };
+            crate::basis::CovariateSpan {
+                column: col,
+                min: values[0],
+                lower_quartile: quantile(0.25),
+                upper_quartile: quantile(0.75),
+                max: values[values.len() - 1],
+            }
+        })
+        .collect();
+    BasisError::ThinPlateBulkUnresolvable {
+        term: Some(termname.to_string()),
+        axis,
+        bulk_fraction,
+        resolvable_fraction,
+        retained,
+        available,
+        spans,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShapeConstraint {
     None,
@@ -539,6 +591,12 @@ pub struct FactorSmoothSpec {
     /// persisted; replayed verbatim by `apply_global_smooth_identifiability`.
     #[serde(default)]
     pub frozen_global_orthogonality: Option<Array2<f64>>,
+    /// `true` when nobody chose the shared marginal's size: it is the formula
+    /// default's starting resolution, which the standard formula workflow
+    /// refines from the converged fit's own evidence. An explicit `k=` is
+    /// `false` and honoured verbatim.
+    #[serde(default)]
+    pub adaptive: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1011,10 +1069,21 @@ pub(crate) struct RawSmoothDesign {
     pub linear_constraints: Option<LinearInequalityConstraints>,
 }
 
+/// Penalty-source tag of the latent-scale ridge a `bounded()` coefficient
+/// carries under [`BoundedCoefficientPriorSpec::Shrinkage`].
+pub const BOUNDED_SHRINKAGE_PENALTY_SOURCE: &str = "BoundedShrinkage";
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub enum BoundedCoefficientPriorSpec {
+    /// Constrained MLE: no prior term on the bounded coefficient (`prior=none`).
     #[default]
     None,
+    /// The formula default: a Gaussian prior on the latent logit coordinate,
+    /// centred at the null, whose precision REML estimates like any other
+    /// smoothing parameter. The null is `beta = 0` when zero lies strictly
+    /// inside `(min, max)`; otherwise zero is not an admissible value and the
+    /// prior centres at the box midpoint, the latent origin.
+    Shrinkage,
     Uniform,
     Beta {
         a: f64,
@@ -1182,20 +1251,13 @@ pub(crate) const fn default_pca_chunk_size() -> usize {
 /// Random-effects term specification.
 ///
 /// The selected feature column is interpreted as a categorical grouping variable.
-/// The term contributes a one-hot dummy block with an identity penalty on group
-/// coefficients, equivalent to i.i.d. Gaussian random effects.
+/// The term contributes a full one-hot dummy block, one column per level, with
+/// a REML-estimated identity ridge on the group coefficients (i.i.d. Gaussian
+/// random effects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RandomEffectTermSpec {
     pub name: String,
     pub feature_col: usize,
-    /// If true, drop the lexicographically first group level to use treatment coding.
-    /// If false, keep all levels (full one-hot block, still identifiable under ridge).
-    pub drop_first_level: bool,
-    /// If true, add a ridge penalty and estimate this block as a random effect.
-    /// If false, leave the one-hot/treatment-coded block unpenalized so it is a
-    /// fixed categorical main effect.  The default preserves older saved models.
-    #[serde(default = "default_random_effect_penalized")]
-    pub penalized: bool,
     /// Optional fixed kept-level set (sorted by f64 bit pattern) captured at fit time.
     /// When present, prediction uses exactly these columns to avoid design drift.
     #[serde(default)]
@@ -1209,23 +1271,11 @@ pub struct RandomEffectTermSpec {
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
     /// out-of-vocabulary level at predict rather than being silently mapped to
-    /// the factor's centering point (#2102/#2137). `factor(g)` originally shared
-    /// the `group()` parse arm and so wrongly inherited the lenient policy
-    /// (#2137). For a string factor the typed schema encode rejects the unseen
-    /// level upstream; for a numeric-coded `factor(year)` the reject is enforced
-    /// by `build_random_effect_block`, which owns the frozen vocabulary. The
-    /// `true` default preserves the pre-#2102 (uniformly lenient) behavior for
-    /// models serialized before this field existed.
-    #[serde(default = "default_random_effect_lenient_unseen")]
+    /// the factor's centering point (#2102/#2137). For a string factor the typed
+    /// schema encode rejects the unseen level upstream; for a numeric-coded
+    /// `factor(year)` the reject is enforced by `build_random_effect_block`,
+    /// which owns the frozen vocabulary.
     pub lenient_unseen: bool,
-}
-
-pub(crate) fn default_random_effect_penalized() -> bool {
-    true
-}
-
-pub(crate) fn default_random_effect_lenient_unseen() -> bool {
-    true
 }
 
 pub(crate) fn validate_measure_jet_positive_vec_len(
@@ -1272,7 +1322,7 @@ pub struct TermCollectionSpec {
 /// is the unpenalized all-ones column, and every other term is centred against
 /// it. A formula that removes the intercept (`0 + …`, `… - 1`) still keeps it
 /// when some term spans the constant: a fixed factor block (`+ g`,
-/// `factor(g)`, `C(g)`, or the main effect of a factor `by=`), a
+/// `factor(g)`, or the main effect of a factor `by=`), a
 /// pure-indicator interaction over the full level cross (`g:h`), or a
 /// B-spline / tensor smooth whose gauge would keep the constant (the default
 /// sum-to-zero centring, or `identifiability=none`). Such a model has the
@@ -1478,7 +1528,9 @@ impl TermCollectionSpec {
                     .into());
                 }
                 match prior {
-                    BoundedCoefficientPriorSpec::None | BoundedCoefficientPriorSpec::Uniform => {}
+                    BoundedCoefficientPriorSpec::None
+                    | BoundedCoefficientPriorSpec::Shrinkage
+                    | BoundedCoefficientPriorSpec::Uniform => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(SmoothError::invalid_config(format!(
@@ -2269,6 +2321,70 @@ pub fn weighted_blockwise_penalty_sum(
     out
 }
 
+fn compose_affine_offset(
+    design_rows: usize,
+    affine_offset: &Array1<f64>,
+    base: ArrayView1<'_, f64>,
+    context: &str,
+) -> Result<Array1<f64>, BasisError> {
+    let n = design_rows;
+    if affine_offset.len() != n || base.len() != n {
+        crate::bail_dim_basis!(
+            "{context}: design rows={n}, affine offset rows={}, base offset rows={}",
+            affine_offset.len(),
+            base.len()
+        );
+    }
+    if affine_offset.iter().any(|value| !value.is_finite())
+        || base.iter().any(|value| !value.is_finite())
+    {
+        crate::bail_invalid_basis!("{context}: offsets must be finite");
+    }
+    Ok(base.to_owned() + affine_offset)
+}
+
+/// Which parts of a smooth build the caller consumes.
+///
+/// A fitted model's frozen spec already carries every coefficient chart the
+/// design needs (identifiability transforms, persisted joint-null rotations,
+/// residualization corrections), so evaluating it on new rows needs only the
+/// design and its affine offset. Realizing the penalties there repeats the
+/// fit-time penalty normalization, PSD projection and collection-chart
+/// filtering on every prediction call, all of it discarded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SmoothPenaltyDemand {
+    /// Build the design and the full penalty set (fitting, rebuilds, summaries).
+    Realize,
+    /// Build the design and affine offset only. A term whose design still
+    /// depends on its penalties (an unfrozen spec, whose joint-null rotation is
+    /// computed from them) realizes them regardless.
+    DesignOnly,
+}
+
+/// The row-evaluation half of a [`TermCollectionDesign`]: the design matrix and
+/// fixed affine channel of a frozen spec on new rows, with no penalties. The
+/// predictor is `affine_offset + design * beta`.
+#[derive(Clone, Debug)]
+pub struct TermCollectionPredictionDesign {
+    pub design: DesignMatrix,
+    pub affine_offset: Array1<f64>,
+    /// Each linear term's name and global coefficient range, in spec order.
+    pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Each smooth term's name and global coefficient range, in spec order.
+    pub smooth_ranges: Vec<(String, Range<usize>)>,
+}
+
+impl TermCollectionPredictionDesign {
+    /// See [`TermCollectionDesign::compose_offset`].
+    pub fn compose_offset(
+        &self,
+        base: ArrayView1<'_, f64>,
+        context: &str,
+    ) -> Result<Array1<f64>, BasisError> {
+        compose_affine_offset(self.design.nrows(), &self.affine_offset, base, context)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TermCollectionDesign {
     /// The full design matrix.
@@ -2322,20 +2438,7 @@ impl TermCollectionDesign {
         base: ArrayView1<'_, f64>,
         context: &str,
     ) -> Result<Array1<f64>, BasisError> {
-        let n = self.design.nrows();
-        if self.affine_offset.len() != n || base.len() != n {
-            crate::bail_dim_basis!(
-                "{context}: design rows={n}, affine offset rows={}, base offset rows={}",
-                self.affine_offset.len(),
-                base.len()
-            );
-        }
-        if self.affine_offset.iter().any(|value| !value.is_finite())
-            || base.iter().any(|value| !value.is_finite())
-        {
-            crate::bail_invalid_basis!("{context}: offsets must be finite");
-        }
-        Ok(base.to_owned() + &self.affine_offset)
+        compose_affine_offset(self.design.nrows(), &self.affine_offset, base, context)
     }
 
     /// Evaluate `affine_offset + design * beta` with a checked coefficient
@@ -2380,6 +2483,7 @@ impl TermCollectionDesign {
                     &info.penalty.source,
                     crate::basis::PenaltySource::Other(source)
                         if source == "LinearTermRidge"
+                            || source == BOUNDED_SHRINKAGE_PENALTY_SOURCE
                             || source.starts_with("RandomEffectRidge(")
                 )
             })
@@ -5484,11 +5588,63 @@ fn numerical_rank(matrix: &Array2<f64>) -> Result<usize, BasisError> {
 /// first, while their coordinates stay independent on the chart's null space.
 /// That reproduces both cases and needs no record of which chart produced a
 /// frozen transform.
+/// Orthonormal basis of `{γ : Zγ ∈ span(F)}` for an injective chart `Z` and an
+/// orthonormal frame `F`.
+///
+/// `Z = UΣVᵀ` moves the question onto the orthonormal `U`, where the singular
+/// values of `(I − FFᵀ)U` are sines of principal angles between two subspaces.
+/// A direction the chart keeps inside `span(F)` has angle zero up to roundoff,
+/// so a machine-precision rank cutoff decides it however the chart scales its
+/// coordinates. `γ = VΣ⁻¹u` maps each such `u` back to the chart.
+fn chart_preimage_of_span(
+    chart: &Array2<f64>,
+    frame: &Array2<f64>,
+) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::{FaerSvd, rrqr_nullspace_basis};
+    if chart.nrows() != frame.nrows() {
+        crate::bail_dim_basis!(
+            "tensor chart has {} rows but the null frame has {}",
+            chart.nrows(),
+            frame.nrows()
+        );
+    }
+    let width = chart.ncols();
+    if frame.ncols() == 0 || width == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let (left, singular, right_t) = chart.svd(true, true).map_err(BasisError::LinalgError)?;
+    let (Some(left), Some(right_t)) = (left, right_t) else {
+        crate::bail_invalid_basis!("tensor chart SVD returned no singular vectors");
+    };
+    if singular.len() < width || singular.iter().take(width).any(|&s| !(s > 0.0)) {
+        crate::bail_invalid_basis!(
+            "tensor identifiability chart is not injective ({} columns)",
+            width
+        );
+    }
+    let left = left.slice(s![.., ..width]).to_owned();
+    let projected = &left - &frame.dot(&frame.t().dot(&left));
+    // `rrqr_nullspace_basis(a)` spans `null(aᵀ)`.
+    let (angle_null, _) =
+        rrqr_nullspace_basis(&projected.t().to_owned(), 1.0).map_err(BasisError::LinalgError)?;
+    if angle_null.ncols() == 0 {
+        return Ok(Array2::zeros((width, 0)));
+    }
+    let scaled = Array2::from_shape_fn(angle_null.dim(), |(row, col)| {
+        angle_null[[row, col]] / singular[row]
+    });
+    let preimage = right_t.slice(s![..width, ..]).t().dot(&scaled);
+    let (basis, _, _) = preimage.svd(true, false).map_err(BasisError::LinalgError)?;
+    let Some(basis) = basis else {
+        crate::bail_invalid_basis!("tensor chart null SVD returned no singular vectors");
+    };
+    Ok(basis.slice(s![.., ..preimage.ncols()]).to_owned())
+}
+
 fn tensor_null_function_block_ridges(
     normalized_marginal_penalties: &[(Array2<f64>, f64)],
     marginal_function_grams: &[Array2<f64>],
     chart: Option<&Array2<f64>>,
-    chart_primary: &ConstructiveQuadratic,
 ) -> Result<Vec<ConstructiveQuadratic>, BasisError> {
     use gam_linalg::faer_ndarray::FaerEigh;
     let margins = normalized_marginal_penalties.len();
@@ -5498,12 +5654,9 @@ fn tensor_null_function_block_ridges(
             marginal_function_grams.len()
         );
     }
-    let Some(chart_null) = crate::basis::constructive_nullspace_basis(chart_primary)? else {
-        return Ok(Vec::new());
-    };
-
     // Per margin: the constant frame and the trend frame, each orthonormal.
     let mut margin_frames = Vec::<[Array2<f64>; 2]>::with_capacity(margins);
+    let mut joint_null = Array2::<f64>::eye(1);
     for ((penalty, _), gram) in normalized_marginal_penalties
         .iter()
         .zip(marginal_function_grams)
@@ -5517,6 +5670,7 @@ fn tensor_null_function_block_ridges(
             .map(|(idx, _)| idx)
             .collect();
         let null = analysis.eigenvectors.select(Axis(1), &null_idx);
+        joint_null = kronecker_product(&joint_null, &null);
         let width = penalty.nrows();
         let ones = Array1::<f64>::from_elem(width, 1.0);
         let constant_energy = ones.dot(&penalty.dot(&ones)) / width as f64;
@@ -5545,6 +5699,20 @@ fn tensor_null_function_block_ridges(
             null.dot(&constant_coords).insert_axis(Axis(1)),
             null.dot(&trend_coords),
         ]);
+    }
+    // Both decompositions penalize every tensor direction with a penalized
+    // factor, so the joint null is `⊗_j null(S_j)` by construction, and in the
+    // chart it is the preimage of that span. Reading it off the chart
+    // primary's spectrum instead fails once the chart is not orthonormal: the
+    // collection gauge whitens against the design Gram, which spreads the
+    // primary's eigenvalues until a spectral cutoff counts penalized
+    // directions as null.
+    let chart_null = match chart {
+        Some(z) => chart_preimage_of_span(z, &joint_null)?,
+        None => joint_null,
+    };
+    if chart_null.ncols() == 0 {
+        return Ok(Vec::new());
     }
 
     // Blocks `⊗_j frames[j][bit j]`, with their Gram images `⊗_j G_j frames[j][bit j]`.
@@ -5653,10 +5821,16 @@ fn tensor_null_function_block_ridges(
         .collect()
 }
 
+/// Build a tensor B-spline term, assembling its penalties only when
+/// `realize_penalties` is set. The design and metadata never read them, and
+/// the tensor penalties (Kronecker sums, their chart restriction and
+/// renormalization, the null-function ridges, candidate filtering) are the
+/// dominant cost of evaluating a frozen tensor on new rows.
 pub(crate) fn build_tensor_bspline_basis(
     data: ArrayView2<'_, f64>,
     feature_cols: &[usize],
     spec: &TensorBSplineSpec,
+    realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
     if feature_cols.is_empty() {
         crate::bail_invalid_basis!("TensorBSpline requires at least one feature column");
@@ -5809,7 +5983,7 @@ pub(crate) fn build_tensor_bspline_basis(
             (
                 BSplineKnotSpec::PeriodicUniform {
                     data_range,
-                    num_basis,
+                    num_basis, ..
                 },
                 _,
             ) => Array1::linspace(data_range.0, data_range.1, *num_basis),
@@ -5939,109 +6113,115 @@ pub(crate) fn build_tensor_bspline_basis(
         );
     }
 
-    match spec.penalty_decomposition {
-        TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
-            // Margin `dim`'s roughness is integrated over the other margins'
-            // functions. For `f = Σ β (B_0 ⊗ … ⊗ B_{d-1})`,
-            // `∫ (∂ᵐ_dim f)² = βᵀ (G_0 ⊗ … ⊗ S_dim ⊗ … ⊗ G_{d-1}) β`, where `G_j`
-            // is margin `j`'s function Gram. `S_dim ⊗ I` would measure the other
-            // margins by their coefficients, and agrees with the integral only
-            // where those bases are Gram-orthonormal (#1561, SPEC rule 5). Every
-            // `G_j` is positive definite, so the joint null space of the sum is
-            // still the tensor of the marginal polynomial null spaces: the one
-            // the tensor double penalty (built after the identifiability chart)
-            // shrinks, never the already-penalized interaction range.
-            //
-            // Each other margin's Gram is divided by its own domain measure
-            // `1ᵀ G_j 1 = ∫ (Σ_i b_i)²`, the margin's length for a partition-of-unity
-            // basis, so the other margins enter as an average over their domains.
-            // A raw Gram would carry margin `j`'s length unit into margin `dim`'s λ
-            // (#2315 scale law), and a Frobenius normalizer would carry its basis
-            // size instead. The physical integral's scale moves into
-            // `normalization_scale`.
-            let mut gram_measures = Vec::<f64>::with_capacity(marginal_function_grams.len());
-            for (j, gram) in marginal_function_grams.iter().enumerate() {
-                let measure = gram.sum();
-                if !(measure.is_finite() && measure > 0.0) {
-                    crate::bail_invalid_basis!(
-                        "internal TensorBSpline error at dim {j}: function Gram measure {measure} is not positive and finite"
-                    );
-                }
-                gram_measures.push(measure);
-            }
-            for dim in 0..normalized_marginal_penalties.len() {
-                let mut s_dim = Array2::<f64>::eye(1);
-                let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
-                let mut other_measures = 1.0_f64;
+    // A design-only build reads no penalty; the chart below is placed from
+    // the marginal designs alone.
+    if realize_penalties {
+        match spec.penalty_decomposition {
+            TensorBSplinePenaltyDecomposition::MarginalKroneckerSum => {
+                // Margin `dim`'s roughness is integrated over the other margins'
+                // functions. For `f = Σ β (B_0 ⊗ … ⊗ B_{d-1})`,
+                // `∫ (∂ᵐ_dim f)² = βᵀ (G_0 ⊗ … ⊗ S_dim ⊗ … ⊗ G_{d-1}) β`, where `G_j`
+                // is margin `j`'s function Gram. `S_dim ⊗ I` would measure the other
+                // margins by their coefficients, and agrees with the integral only
+                // where those bases are Gram-orthonormal (#1561, SPEC rule 5). Every
+                // `G_j` is positive definite, so the joint null space of the sum is
+                // still the tensor of the marginal polynomial null spaces: the one
+                // the tensor double penalty (built after the identifiability chart)
+                // shrinks, never the already-penalized interaction range.
+                //
+                // Each other margin's Gram is divided by its own domain measure
+                // `1ᵀ G_j 1 = ∫ (Σ_i b_i)²`, the margin's length for a partition-of-unity
+                // basis, so the other margins enter as an average over their domains.
+                // A raw Gram would carry margin `j`'s length unit into margin `dim`'s λ
+                // (#2315 scale law), and a Frobenius normalizer would carry its basis
+                // size instead. The physical integral's scale moves into
+                // `normalization_scale`.
+                let mut gram_measures = Vec::<f64>::with_capacity(marginal_function_grams.len());
                 for (j, gram) in marginal_function_grams.iter().enumerate() {
-                    let factor = if j == dim {
-                        normalized_marginal_penalties[j].0.clone()
-                    } else {
-                        other_measures *= gram_measures[j];
-                        gram.mapv(|value| value / gram_measures[j])
-                    };
-                    factors.push(factor.clone());
-                    s_dim = kronecker_product(&s_dim, &factor);
+                    let measure = gram.sum();
+                    if !(measure.is_finite() && measure > 0.0) {
+                        crate::bail_invalid_basis!(
+                            "internal TensorBSpline error at dim {j}: function Gram measure {measure} is not positive and finite"
+                        );
+                    }
+                    gram_measures.push(measure);
                 }
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        s_dim,
-                        "tensor marginal penalty",
-                    )?,
-                    source: PenaltySource::TensorMarginal { dim },
-                    normalization_scale: normalized_marginal_penalties[dim].1 * other_measures,
-                    kronecker_factors: Some(factors),
-                    op: None,
-                });
+                for dim in 0..normalized_marginal_penalties.len() {
+                    let mut s_dim = Array2::<f64>::eye(1);
+                    let mut factors = Vec::<Array2<f64>>::with_capacity(marginalnum_basis.len());
+                    let mut other_measures = 1.0_f64;
+                    for (j, gram) in marginal_function_grams.iter().enumerate() {
+                        let factor = if j == dim {
+                            normalized_marginal_penalties[j].0.clone()
+                        } else {
+                            other_measures *= gram_measures[j];
+                            gram.mapv(|value| value / gram_measures[j])
+                        };
+                        factors.push(factor.clone());
+                        s_dim = kronecker_product(&s_dim, &factor);
+                    }
+                    candidates.push(PenaltyCandidate {
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            s_dim,
+                            "tensor marginal penalty",
+                        )?,
+                        source: PenaltySource::TensorMarginal { dim },
+                        normalization_scale: normalized_marginal_penalties[dim].1 * other_measures,
+                        kronecker_factors: Some(factors),
+                        op: None,
+                    });
+                }
             }
-        }
-        TensorBSplinePenaltyDecomposition::Separable => {
-            // t2: one penalty per functional-ANOVA block. Each margin enters a block
-            // through its roughness `S̃_j` (the block penalizes that margin's
-            // wiggliness) or through the mass of its null-space component (the block
-            // holds that margin to its unpenalized functions). Both are functionals
-            // of the margin's functions, so every block penalizes the function, never
-            // the coefficients (#2901, SPEC rule 5). The block is the Kronecker
-            // product of its factors as they stand, so those factors describe it
-            // exactly, and the physical scale moves into `normalization_scale` as in
-            // the te decomposition above.
-            let margins =
-                tensor_margin_separable_factors(&normalized_marginal_penalties, &marginal_function_grams)?;
-            let n_masks = 1usize.checked_shl(margins.len() as u32).ok_or_else(|| {
-                BasisError::InvalidInput(format!(
-                    "t2 separable tensor penalty supports at most {} margins, got {}",
-                    usize::BITS - 1,
-                    margins.len()
-                ))
-            })?;
-            for mask in 1..n_masks {
-                let mut matrix = Array2::<f64>::eye(1);
-                let mut factors = Vec::<Array2<f64>>::with_capacity(margins.len());
-                let mut penalized_margins = Vec::<usize>::new();
-                let mut normalization_scale = 1.0_f64;
-                for (dim, margin) in margins.iter().enumerate() {
-                    let use_range = ((mask >> dim) & 1) == 1;
-                    let factor = if use_range {
-                        penalized_margins.push(dim);
-                        normalization_scale *= margin.range_scale;
-                        margin.range.clone()
-                    } else {
-                        normalization_scale *= margin.null_scale;
-                        margin.null.clone()
-                    };
-                    matrix = kronecker_product(&matrix, &factor);
-                    factors.push(factor);
+            TensorBSplinePenaltyDecomposition::Separable => {
+                // t2: one penalty per functional-ANOVA block. Each margin enters a block
+                // through its roughness `S̃_j` (the block penalizes that margin's
+                // wiggliness) or through the mass of its null-space component (the block
+                // holds that margin to its unpenalized functions). Both are functionals
+                // of the margin's functions, so every block penalizes the function, never
+                // the coefficients (#2901, SPEC rule 5). The block is the Kronecker
+                // product of its factors as they stand, so those factors describe it
+                // exactly, and the physical scale moves into `normalization_scale` as in
+                // the te decomposition above.
+                let margins = tensor_margin_separable_factors(
+                    &normalized_marginal_penalties,
+                    &marginal_function_grams,
+                )?;
+                let n_masks = 1usize.checked_shl(margins.len() as u32).ok_or_else(|| {
+                    BasisError::InvalidInput(format!(
+                        "t2 separable tensor penalty supports at most {} margins, got {}",
+                        usize::BITS - 1,
+                        margins.len()
+                    ))
+                })?;
+                for mask in 1..n_masks {
+                    let mut matrix = Array2::<f64>::eye(1);
+                    let mut factors = Vec::<Array2<f64>>::with_capacity(margins.len());
+                    let mut penalized_margins = Vec::<usize>::new();
+                    let mut normalization_scale = 1.0_f64;
+                    for (dim, margin) in margins.iter().enumerate() {
+                        let use_range = ((mask >> dim) & 1) == 1;
+                        let factor = if use_range {
+                            penalized_margins.push(dim);
+                            normalization_scale *= margin.range_scale;
+                            margin.range.clone()
+                        } else {
+                            normalization_scale *= margin.null_scale;
+                            margin.null.clone()
+                        };
+                        matrix = kronecker_product(&matrix, &factor);
+                        factors.push(factor);
+                    }
+                    candidates.push(PenaltyCandidate {
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            matrix,
+                            "tensor separable penalty",
+                        )?,
+                        source: PenaltySource::TensorSeparable { penalized_margins },
+                        normalization_scale,
+                        kronecker_factors: Some(factors),
+                        op: None,
+                    });
                 }
-                candidates.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        matrix,
-                        "tensor separable penalty",
-                    )?,
-                    source: PenaltySource::TensorSeparable { penalized_margins },
-                    normalization_scale,
-                    kronecker_factors: Some(factors),
-                    op: None,
-                });
             }
         }
     }
@@ -6149,25 +6329,14 @@ pub(crate) fn build_tensor_bspline_basis(
             .collect::<Result<Vec<_>, _>>()?;
     }
 
-    if spec.double_penalty {
+    if realize_penalties && spec.double_penalty {
         // The null-function ridges are built in the coefficient chart the fit
         // uses, after identifiability, because the chart decides which null
         // blocks remain free (see `tensor_null_function_block_ridges`).
-        let physical_primary_terms = candidates
-            .iter()
-            .map(|candidate| {
-                candidate
-                    .matrix
-                    .scaled(candidate.normalization_scale, "physical tensor primary penalty")
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let chart_primary =
-            ConstructiveQuadratic::sum(&physical_primary_terms, "joint tensor primary penalty")?;
         for ridge in tensor_null_function_block_ridges(
             &normalized_marginal_penalties,
             &marginal_function_grams,
             z_opt.as_ref(),
-            &chart_primary,
         )? {
             let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
             candidates.push(PenaltyCandidate {
@@ -6373,20 +6542,8 @@ pub fn build_random_effect_block(
         if levels.is_empty() {
             crate::bail_invalid_basis!("random-effect term '{}' has no observed levels", spec.name);
         }
-        let start_idx = if spec.drop_first_level && levels.len() > 1 {
-            1usize
-        } else {
-            0usize
-        };
-        levels[start_idx..].to_vec()
+        levels
     };
-
-    if kept_levels.is_empty() {
-        crate::bail_invalid_basis!(
-            "random-effect term '{}' drops all levels; keep at least one level",
-            spec.name
-        );
-    }
 
     let q = kept_levels.len();
     let mut level_to_col = BTreeMap::<u64, usize>::new();
@@ -6405,14 +6562,11 @@ pub fn build_random_effect_block(
     // encode rejects the unseen level before we get here; a *numeric-coded*
     // `factor(year)` column, however, reaches Rust as a plain numeric column
     // with no categorical schema, so the operator that owns the frozen level
-    // vocabulary is the enforcement point that closes the same gap. Only when
-    // the full one-hot block is kept (`!drop_first_level`) does an absent level
-    // unambiguously mean "unseen" — with treatment coding the dropped baseline
-    // is a legitimate absent column, so we do not gate that path. `frozen_levels`
-    // presence marks the predict/frozen context; at fit the vocabulary is
-    // derived from this very data, so no row is unseen.
-    let strict_unseen =
-        !spec.lenient_unseen && !spec.drop_first_level && spec.frozen_levels.is_some();
+    // vocabulary is the enforcement point that closes the same gap. The block
+    // keeps every level, so a level absent from the frozen set is unseen.
+    // `frozen_levels` presence marks the predict/frozen context; at fit the
+    // vocabulary is derived from this very data, so no row is unseen.
+    let strict_unseen = !spec.lenient_unseen && spec.frozen_levels.is_some();
     let mut group_ids = Vec::with_capacity(n);
     for (row, &v) in col.iter().enumerate() {
         let bits = gam_data::canonical_level_bits(v);
@@ -7871,11 +8025,12 @@ fn build_shape_cone_bspline_basis_1d(
     spec: &BSplineBasisSpec,
     term: &SmoothTermSpec,
     atom: ShapeConstraint,
+    realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
     let centring_weights = match &spec.identifiability {
         // A frozen spec already carries the realized cone chart.
         BSplineIdentifiability::FrozenTransform { .. } => {
-            return build_bspline_basis_1d(x, spec);
+            return build_bspline_basis_1d_realizing(x, spec, realize_penalties);
         }
         BSplineIdentifiability::None => None,
         BSplineIdentifiability::WeightedSumToZero { weights } => Some(weights.clone()),
@@ -7965,6 +8120,21 @@ pub fn build_single_local_smooth_term(
     term: &SmoothTermSpec,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    build_single_local_smooth_term_for(data, term, workspace, SmoothPenaltyDemand::Realize)
+}
+
+/// [`build_single_local_smooth_term`] for a caller that states which parts it
+/// consumes. Under [`SmoothPenaltyDemand::DesignOnly`] a term whose coefficient
+/// chart is already frozen returns no penalties; a numeric or level `by=`
+/// passes the demand to its inner term. `BySmooth` and factor smooths build
+/// their inner term with the full penalty set, because their outer design is
+/// placed from the inner penalties.
+pub(crate) fn build_single_local_smooth_term_for(
+    data: ArrayView2<'_, f64>,
+    term: &SmoothTermSpec,
+    workspace: &mut crate::basis::BasisWorkspace,
+    demand: SmoothPenaltyDemand,
+) -> Result<LocalSmoothTermBuild, BasisError> {
     term.basis.validate_scale_configuration()?;
     validate_shape_request(term)?;
     if let SmoothBasisSpec::ByVariable {
@@ -7992,7 +8162,9 @@ pub fn build_single_local_smooth_term(
             shape: term.shape.clone(),
             joint_null_rotation: None,
         };
-        let built = build_single_local_smooth_term(data, &inner_term, workspace)?;
+        // Row gating only rescales the inner design, so the inner term needs
+        // exactly the penalties the caller needs.
+        let built = build_single_local_smooth_term_for(data, &inner_term, workspace, demand)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
     }
 
@@ -8002,6 +8174,11 @@ pub fn build_single_local_smooth_term(
         return build_by_smooth_local(data, term, smooth, by_kind, workspace);
     }
 
+    // A frozen chart needs no penalty to place its design: the joint-null
+    // rotation is the only penalty-derived design input, and a frozen spec
+    // persists it or has none.
+    let realize_penalties = demand == SmoothPenaltyDemand::Realize
+        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
@@ -8243,14 +8420,24 @@ pub fn build_single_local_smooth_term(
                 );
             }
             if let Some(atom) = term.shape.single_atom() {
-                build_shape_cone_bspline_basis_1d(data.column(*feature_col), spec, term, atom)?
+                build_shape_cone_bspline_basis_1d(
+                    data.column(*feature_col),
+                    spec,
+                    term,
+                    atom,
+                    realize_penalties,
+                )?
             } else {
                 // A conjunction keeps the spec's own identifiability chart; its
                 // cone rows are mapped through that chart after the build.
                 // Endpoint boundary conditions are structural for B-splines: the
                 // basis builder bakes their homogeneous nullspace transform into
                 // the design, penalties, and stored raw-basis transform.
-                build_bspline_basis_1d(data.column(*feature_col), spec)?
+                build_bspline_basis_1d_realizing(
+                    data.column(*feature_col),
+                    spec,
+                    realize_penalties,
+                )?
             }
         }
         SmoothBasisSpec::ThinPlate {
@@ -8278,7 +8465,8 @@ pub fn build_single_local_smooth_term(
                 spec_local.identifiability = SpatialIdentifiability::None;
             }
             let mut result = build_thin_plate_basis(x.view(), &spec_local).map_err(|err| {
-                rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec)
+                let err = rewrite_thin_plate_knots_error(err, &term.name, feature_cols.len(), spec);
+                name_thin_plate_outlier_span(err, &term.name, data, feature_cols)
             })?;
             // Inject the input scale into metadata; also restore the user's
             // original length_scale (not the σ_geom-compensated one) so a
@@ -8600,7 +8788,7 @@ pub fn build_single_local_smooth_term(
             )?
         }
         SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-            build_tensor_bspline_basis(data, feature_cols, spec)?
+            build_tensor_bspline_basis(data, feature_cols, spec, realize_penalties)?
         }
         SmoothBasisSpec::ByVariable { .. } => {
             crate::bail_invalid_basis!(
@@ -8638,7 +8826,13 @@ pub fn build_single_local_smooth_term(
     // dials do not. The operator triplet is therefore retained as the Matérn
     // penalty, and the κ-optimizer re-key / ψ-derivative paths route through the
     // same triplet builder so the block count stays ψ-stable (#1270).
-    if let SmoothBasisSpec::Matern { .. } = &term.basis {
+    //
+    // A design-only build of a frozen chart skips the override and the
+    // renormalization below.
+    if !realize_penalties {
+        built.active_penalties.clear();
+        built.dropped_penalties.clear();
+    } else if let SmoothBasisSpec::Matern { .. } = &term.basis {
         let filtered = matern_operator_penalty_triplet_from_metadata(&built.metadata)?;
         built.active_penalties = filtered.active;
         built.dropped_penalties = filtered.dropped;
@@ -8782,7 +8976,12 @@ pub(crate) fn build_smooth_design_withworkspace_unvalidated(
             "joint spatial center planner returned no smooth blocks".to_string(),
         )
     })?;
-    build_smooth_design_from_planned_terms(data, &planned_terms, workspace)
+    build_smooth_design_from_planned_terms(
+        data,
+        &planned_terms,
+        workspace,
+        SmoothPenaltyDemand::Realize,
+    )
 }
 
 /// Build smooth terms after the sweep-level spatial planner has already run.
@@ -8796,6 +8995,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
     data: ArrayView2<'_, f64>,
     planned_terms: &[SmoothTermSpec],
     workspace: &mut crate::basis::BasisWorkspace,
+    demand: SmoothPenaltyDemand,
 ) -> Result<RawSmoothDesign, BasisError> {
     let policy = workspace.policy().clone();
     let local_builds: Vec<LocalSmoothTermBuild> = {
@@ -8804,7 +9004,7 @@ pub(crate) fn build_smooth_design_from_planned_terms(
             .par_iter()
             .map(|term| {
                 let mut term_workspace = crate::basis::BasisWorkspace::with_policy(policy.clone());
-                build_single_local_smooth_term(data, &term, &mut term_workspace)
+                build_single_local_smooth_term_for(data, &term, &mut term_workspace, demand)
             })
             .collect::<Result<Vec<_>, _>>()?
     };

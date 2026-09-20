@@ -256,7 +256,19 @@ fn a_survival_law_whose_shape_moves_is_certified_local_2926() {
         mean(&location_scale.errors),
     );
     assert_eq!(default.label, "estimated-local");
-    assert_eq!(certificate.fitted, MovingLawArm::LocationScaleGaussian);
+    // gam#2926: a shape that moves leaves the pooled residual ζ a mixture, which fails
+    // the adequacy screen, so the location-scale Gaussian arm is not a candidate and
+    // the fit starts on the location-scale empirical arm.
+    let location_scale_gaussian = certificate
+        .arms
+        .iter()
+        .find(|score| score.arm == MovingLawArm::LocationScaleGaussian)
+        .expect("the location-scale Gaussian arm is scored");
+    assert!(
+        location_scale_gaussian.adequacy.is_some() && !location_scale_gaussian.admissible(),
+        "a moving shape's ζ must fail the screen: {location_scale_gaussian:?}"
+    );
+    assert_eq!(certificate.fitted, MovingLawArm::LocationScaleEmpirical);
     assert_eq!(certificate.argmin, MovingLawArm::Local);
     assert_eq!(certificate.chosen, MovingLawArm::Local);
     for score in certificate.arms.iter().filter(|s| s.arm != MovingLawArm::Local) {
@@ -287,5 +299,17 @@ fn a_survival_location_scale_law_is_certified_on_its_gaussian_residual_2926() {
         certificate.chosen,
         MovingLawArm::LocationScaleGaussian,
         "the true law is location-scale with a Gaussian residual: {certificate:?}"
+    );
+    // gam#2926: the arm is a candidate because its residual passes the adequacy
+    // screen, so the admissibility rule admits a Gaussian arm the data support and
+    // is not a ban on Gaussian arms.
+    let arm = certificate
+        .arms
+        .iter()
+        .find(|score| score.arm == MovingLawArm::LocationScaleGaussian)
+        .expect("the location-scale Gaussian arm is scored");
+    assert!(
+        arm.adequacy.is_some() && arm.admissible(),
+        "a Gaussian residual must be screened and admitted: {arm:?}"
     );
 }

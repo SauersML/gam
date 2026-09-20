@@ -15,9 +15,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 from .plans import HOST_WORKERS, PLANS, Cell
 from .report import paired_verdict, ratio_verdict, render
 from .run import THREAD_ENV, run_batch, run_rep, thread_env
+from .worker import COUNT_FAMILIES, COUNT_SLOPE, EXPOSURE_RATE, make_data, supports
 
 BENCH_DIR = Path(__file__).resolve().parent.parent
 
@@ -125,6 +128,28 @@ def test_paired_accuracy_verdicts() -> None:
     assert paired_verdict(g, c, "logscore").text == "**LOSS(missing)**"
 
 
+def test_count_plans_run_pygam_only_where_it_has_the_family() -> None:
+    for name in ("count_small", "count_1e4", "count_1e5"):
+        families = {cell.family for cell in PLANS[name].cells}
+        assert families == set(COUNT_FAMILIES), name
+    assert supports("gamfit", "negbin") and supports("gamfit", "tweedie")
+    assert not supports("pygam", "negbin") and not supports("pygam_gs", "tweedie")
+    assert supports("pygam_gs", "poisson_exposure")
+
+
+def test_exposure_draw_carries_its_offset() -> None:
+    X, y, mu, weights, offset = make_data(500, "p1", "poisson_exposure", 0)
+    assert weights is None
+    assert offset is not None and offset.shape == y.shape
+    rate = mu / np.exp(offset)
+    # The rate is the level times the smooth; the exposure is all in the offset.
+    assert np.allclose(
+        rate, EXPOSURE_RATE * np.exp(COUNT_SLOPE * np.sin(2 * np.pi * X[:, 0]))
+    )
+    for family in ("poisson_lo", "negbin", "tweedie"):
+        assert make_data(50, "p1", family, 0)[3:] == (None, None)
+
+
 def test_timeout_is_a_listed_loss_not_a_skip() -> None:
     records = [
         _rec("gamfit", 0, status="timeout"),
@@ -135,6 +160,25 @@ def test_timeout_is_a_listed_loss_not_a_skip() -> None:
     assert "0/1 ok, 1 timeout" in text
     losses = text.split("## Losses")[1]
     assert "status vs pygam " in losses and "status vs pygam_gs" in losses
+
+
+def test_n_predict_cells_are_reported_apart() -> None:
+    # Two cells that differ only in n_predict are separate report rows, and a
+    # post-fit metric gets its own table only once some rep measured it.
+    records = [
+        dict(_rec(lib, 0, pred_cpu_s=t), n_predict=m)
+        for m, t in ((100, 0.01), (1_000_000, 1.0))
+        for lib in ("gamfit", "pygam_gs")
+    ]
+    text = render(records)
+    assert "gaussian n=100 p1 n_predict=100" in text
+    assert "gaussian n=100 p1 n_predict=1e+06" in text
+    assert "## partial dependence CPU" not in text
+    records[0]["pd_cpu_s"] = 0.5
+    records[1]["pd_cpu_s"] = 0.25
+    assert "## partial dependence CPU" in render(records)
+    assert PLANS["postfit"].postfit
+    assert all(cell.n_predict is not None for cell in PLANS["postfit"].cells)
 
 
 def test_thread_settings_reach_every_pool_variable() -> None:

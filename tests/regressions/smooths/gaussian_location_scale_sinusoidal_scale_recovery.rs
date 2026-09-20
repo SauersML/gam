@@ -11,8 +11,6 @@ use gam::{
 };
 use ndarray::Array2;
 
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
 fn next_unit(state: &mut u64) -> f64 {
     *state = state
         .wrapping_mul(6364136223846793005)
@@ -105,7 +103,7 @@ fn fitted_channels(fit: &GaussianLocationScaleFitResult, x: &[f64]) -> (Vec<f64>
         .design
         .apply(&beta_scale)
         .iter()
-        .map(|&eta| (fit.response_scale * LOGB_SIGMA_FLOOR + eta.exp()).ln())
+        .map(|&eta| (fit.response_scale * fit.sigma_floor + eta.exp()).ln())
         .collect();
     (fitted_mu, fitted_log_sigma)
 }

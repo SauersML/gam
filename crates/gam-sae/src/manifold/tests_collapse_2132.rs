@@ -183,7 +183,7 @@ pub(crate) fn oos_heldout_ev(
     }
     term.assignment.logits.assign(&logits);
     let mut rho_oos = rho.clone();
-    term.run_fixed_decoder_arrow_schur(x, &mut rho_oos, None, 24, 1.0, 1.0e-6)
+    term.run_fixed_decoder_arrow_schur(x, &mut rho_oos, None, 1.0e-6)
         .expect("fixed-decoder OOS solve");
     let fitted = term.try_fitted().expect("OOS fitted");
     global_ev(x, fitted.view())
@@ -202,11 +202,6 @@ fn fit_circle_dictionary(
     let result = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_initial_rho(seed)
         .with_max_iter(12)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .run(&mut objective, "SAE manifold")
         .expect("circle dictionary fit must not abort");
     objective

@@ -332,6 +332,7 @@ pub(crate) fn weight_link_for_inverse_link(inverse_link: &InverseLink) -> Weight
         InverseLink::Standard(StandardLink::Identity)
         | InverseLink::Standard(StandardLink::Inverse)
         | InverseLink::Standard(StandardLink::InverseSquared)
+        | InverseLink::Standard(StandardLink::Sqrt)
         | InverseLink::Standard(StandardLink::Logit)
         | InverseLink::Standard(StandardLink::Probit)
         | InverseLink::Standard(StandardLink::CLogLog)
@@ -350,6 +351,12 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     inverse_link: &InverseLink,
 ) -> bool {
     let spec = &likelihood.spec;
+    // A generic variance × link cell is non-canonical (its observed
+    // information carries the residual term) and its score program yields
+    // the observed tower exactly.
+    if GenericEdmCell::classify(&spec.response, inverse_link).is_some() {
+        return true;
+    }
     if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
@@ -434,6 +441,18 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         );
     }
 
+    if let Some(cell) = GenericEdmCell::classify(&likelihood.spec.response, inverse_link) {
+        let phi = fixed_glm_dispersion(likelihood)?;
+        let certified: Vec<(f64, f64, f64)> = super::par_certified_rows(n, |i| {
+            generic_edm_observed_weight_jet(cell, phi, i, y[i], eta[i], priorweights[i])
+        })?;
+        for (i, &(w, c, d)) in certified.iter().enumerate() {
+            hessian_weights[i] = w;
+            hessian_c[i] = c;
+            hessian_d[i] = d;
+        }
+        return Ok(());
+    }
     if matches!(likelihood.spec.response, ResponseFamily::StudentT { .. }) {
         let scale = StudentTScale::from_likelihood(likelihood)?;
         let certified: Vec<(f64, f64, f64)> = (0..n)
@@ -486,28 +505,39 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         // Every jet and every variance carrier is evaluated at this exact
         // eta.  A non-representable tail is refused below rather than
         // projected onto a different Hessian surface.
-        let jet =
-            crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
-        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-            inverse_link,
-            eta_used,
-        )?;
-        let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-            inverse_link,
-            eta_used,
-            jet.mu,
-        );
-        let (w_obs, c_obs, d_obs) = observed_weight_dispatch(
-            weight_family,
-            weight_link,
-            y[i],
-            jet.mu,
-            one_minus_mu,
-            phi,
-            priorweights[i],
-            jet,
-            h4,
-        );
+        let (w_obs, c_obs, d_obs) = if matches!(weight_family, WeightFamily::Binomial) {
+            let [w, c, d, _] = bernoulli_observed_information_jet(
+                inverse_link,
+                eta_used,
+                y[i],
+                phi,
+                priorweights[i],
+            )?;
+            (w, c, d)
+        } else {
+            let jet =
+                crate::mixture_link::inverse_link_jet_for_inverse_link(inverse_link, eta_used)?;
+            let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                inverse_link,
+                eta_used,
+            )?;
+            let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                inverse_link,
+                eta_used,
+                jet.mu,
+            );
+            observed_weight_dispatch(
+                weight_family,
+                weight_link,
+                y[i],
+                jet.mu,
+                one_minus_mu,
+                phi,
+                priorweights[i],
+                jet,
+                h4,
+            )
+        };
         // A *finite* but non-positive observed weight is NOT a failure: the
         // observed information `W_obs = W_Fisher - (y-μ)·B` legitimately goes
         // indefinite on individual rows for a non-canonical link (probit,
@@ -896,6 +926,37 @@ pub(crate) fn bernoulli_pair_residual(family: WeightFamily, y: f64, mu: f64, one
         }
     }
     y - mu
+}
+
+/// Observed information of one Bernoulli row and its first three η-derivatives,
+/// `[W_obs, dW/dη, d²W/dη², d³W/dη³]`, for the row log-likelihood
+/// `(pw/φ)·[y·log μ + (1−y)·log(1−μ)]` (#3317).
+///
+/// Each term is the response coefficient times a derivative of that side's own
+/// log-probability, so no division by the variance `μ(1−μ)` occurs and a side
+/// whose coefficient is exactly zero contributes nothing, even where its
+/// log-probability is `−∞`. This is the same information the ratio tower
+/// `observed_weight_noncanonical`/`e_obs_from_jets` computes, but it stays
+/// representable where `μ'` and `1−μ` underflow together.
+pub(crate) fn bernoulli_observed_information_jet(
+    inverse_link: &InverseLink,
+    eta: f64,
+    y: f64,
+    phi: f64,
+    prior_weight: f64,
+) -> Result<[f64; 4], EstimationError> {
+    let jet = crate::mixture_link::bernoulli_log_jet5_for_inverse_link(inverse_link, eta)?;
+    let mut information = [0.0_f64; 4];
+    for (coefficient, side) in [(y, jet.log_mu), (1.0 - y, jet.log_complement)] {
+        if coefficient == 0.0 {
+            continue;
+        }
+        for k in 0..4 {
+            information[k] -= coefficient * side[k + 1];
+        }
+    }
+    let scale = prior_weight / phi;
+    Ok(information.map(|value| scale * value))
 }
 
 pub(crate) fn observed_weight_dispatch(

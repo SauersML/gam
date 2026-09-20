@@ -14,6 +14,7 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
+use crate::latent_anchor::{anchor_residual_resolution, smaller_tail_log_target, solve_log_tail_root};
 use gam_math::probability::normal_logcdf_derivatives;
 
 #[inline]
@@ -227,21 +228,6 @@ mod empirical_cubic_moment_tests {
     }
 }
 
-/// Residual tolerance at which a Bernoulli marginal-slope intercept is accepted as
-/// the root of its calibration `F(a) = Σ∫Φ(η) − μ(q) = 0`.
-///
-/// The analytic implicit-function gradient and Hessian (`a_u = −F_u/F_a`,
-/// `a_uv = …`) are valid only at `F = 0`, so an acceptance band leaves `a` off the
-/// root by `O(residual)`, and that offset propagates linearly into every one of
-/// them: a `~1e-4·μ` band showed up as a `~5e-5` gap in the q-axis second
-/// derivative against the finite difference of the gradient (#1607). The fit's
-/// row solve and a saved model's prediction read the same root through the same
-/// derivatives, so both accept at this one tolerance. The relative component keeps
-/// genuinely flat (extreme-slope) rows solvable.
-pub(crate) fn bernoulli_intercept_residual_tolerance(target_mu: f64) -> f64 {
-    1e-12_f64.max(1e-10 * target_mu.abs())
-}
-
 impl BernoulliMarginalSlopeFamily {
     pub(super) fn intercept_primary_point(
         q: f64,
@@ -306,34 +292,17 @@ impl BernoulliMarginalSlopeFamily {
             .unwrap_or(0.0)
     }
 
-    pub(super) fn near_zero_deviation_residual_bound(
-        &self,
-        slope: f64,
-        beta_h_linf: f64,
-        beta_w_linf: f64,
-    ) -> f64 {
-        let score_basis_sup = self
-            .score_warp
-            .as_ref()
-            .map(|runtime| runtime.value_basis_l1_sup_norm())
-            .unwrap_or(0.0);
-        let link_basis_sup = self
-            .link_dev
-            .as_ref()
-            .map(|runtime| runtime.value_basis_l1_sup_norm())
-            .unwrap_or(0.0);
-        // At the rigid intercept, deviations perturb the probit argument by at
-        // most `s * (|b|·||h||∞ + ||w||∞)`.  Since `Φ` is globally
-        // `φ(0)`-Lipschitz, the calibration residual changes by no more than
-        // `φ(0)` times this argument bound after integrating against the unit
-        // normal density.  The L1 basis sup-norms give
-        // `||h||∞ <= K_h ||β_h||∞` and `||w||∞ <= K_w ||β_w||∞`; if this is
-        // below the solver's `abs_tol`, the rigid root is already acceptable.
-        normal_pdf(0.0)
-            * self.probit_frailty_scale()
-            * (slope.abs() * score_basis_sup * beta_h_linf + link_basis_sup * beta_w_linf)
-    }
-
+    /// The row's calibrated intercept `a(β)`, the root of `P(a) = Φ(q)` with
+    /// `P(a) = E[Φ(η(a, Z))]` over the row's latent law, and `P′(a)` there.
+    ///
+    /// The root is solved on the smaller marginal tail in log units,
+    /// `log E[Φ(∓η)] = log Φ(∓q)` (gam#3216), by the safeguarded solve the
+    /// survival anchor uses ([`solve_log_tail_root`]): accepted at the
+    /// residual the arithmetic resolves and finished by a Newton step. So the
+    /// root is a function of `β` to rounding whatever the seed, and every
+    /// evaluator of the row — the line search's cached and cold paths, the
+    /// saved model's prediction — reads one root (gam#3333). The
+    /// implicit-function derivatives `a_u = −P_u/P′` hold only there.
     pub(super) fn solve_row_intercept_base(
         &self,
         row: usize,
@@ -345,217 +314,100 @@ impl BernoulliMarginalSlopeFamily {
     ) -> Result<(f64, f64, bool), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let probit_scale = self.probit_frailty_scale();
-        let target = marginal.mu;
-        // The calibrated intercept is consumed as the root of `F(a) = 0` by the
-        // implicit-function derivatives; see `bernoulli_intercept_residual_tolerance`.
-        let abs_tol = bernoulli_intercept_residual_tolerance(target);
-        let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
-        let rigid_abs_deriv =
-            rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
-
-        let beta_h_linf = Self::beta_linf(beta_h);
-        let beta_w_linf = Self::beta_linf(beta_w);
-        let exact_zero_deviation = beta_h_linf == 0.0 && beta_w_linf == 0.0;
-        let standard_normal_law = matches!(self.latent_measure, LatentMeasureKind::StandardNormal);
-        if exact_zero_deviation && standard_normal_law {
+        let exact_zero_deviation = Self::beta_linf(beta_h) == 0.0 && Self::beta_linf(beta_w) == 0.0;
+        if exact_zero_deviation && matches!(self.latent_measure, LatentMeasureKind::StandardNormal) {
+            let rigid_a = rigid_prescale_intercept_from_marginal(marginal.q, slope, probit_scale);
+            let rigid_abs_deriv =
+                rigid_prescale_intercept_derivative_abs(marginal.q, slope, probit_scale);
             self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
             return Ok((rigid_a, rigid_abs_deriv, true));
         }
 
-        let beta_linf_max = beta_h_linf.max(beta_w_linf);
-        // The perturbation bound walks every span of every deviation basis column and
-        // only the StandardNormal law reads it, so an empirical-law row never pays for it.
-        if standard_normal_law
-            && beta_linf_max <= f64::EPSILON.sqrt()
-            && self.near_zero_deviation_residual_bound(slope, beta_h_linf, beta_w_linf) <= abs_tol
-        {
-            // Numerical guardrail for the conservative perturbation bound: the
-            // exact-zero path above avoids all cell machinery, while this
-            // near-zero path spends one evaluator call to guarantee that every
-            // accepted row satisfies the same residual contract as the solver.
-            // The extra `sqrt(eps)` coefficient cap keeps numerical
-            // derivative probes out of this value-only acceptance path;
-            // mathematically nonzero deviations still fall through unless they
-            // are too small to carry stable derivative information.
-            let (f_rigid, _, _) = self.evaluate_calibration_newton(
-                row,
-                rigid_a,
-                marginal_eta,
-                slope,
-                beta_h,
-                beta_w,
-            )?;
-            if f_rigid.abs() <= abs_tol {
-                self.cache_row_intercept(row, rigid_a, marginal_eta, slope, beta_h, beta_w);
-                return Ok((rigid_a, rigid_abs_deriv, true));
-            }
-        }
-
-        // Use the Newton-only calibration evaluator: `solve_monotone_root`
-        // safely degrades its Halley step to Newton when `F''(a) = 0`, and
-        // dropping the second derivative lets us skip order-9 value-bearing
-        // cell moments in favour of degree-4 moments.
-        let eval = |a: f64| -> Result<(f64, f64, f64), String> {
-            self.evaluate_calibration_newton(row, a, marginal_eta, slope, beta_h, beta_w)
-        };
-
-        // Closed-form fallback initial guess: rigid probit in pre-scale
-        // denested coordinates:
-        //   a₀ = q·√(1 + (s_f b)²) / s_f,  s_f = 1/√(1+σ²).
-        // When link deviation is active, upgrade to affine-link warm start:
-        //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)
-        //   ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁
+        // Closed-form initial guess: rigid probit in pre-scale denested
+        // coordinates, `a₀ = q·√(1 + (s_f b)²) / s_f` with `s_f = 1/√(1+σ²)`,
+        // upgraded under a link deviation to the affine-link inversion
+        //   s_f·L(u) ≈ s_f·(ℓ₀ + ℓ₁·u)  ⟹  a = (q·√(1 + (s_f ℓ₁ b)²) / s_f − ℓ₀) / ℓ₁.
         let a_closed_form = self.row_intercept_closed_form_seed(row, marginal, slope, beta_w)?;
-
-        // Prefer the previous PIRLS iter's converged intercept as the
-        // initial guess; β changes only a little between consecutive PIRLS
-        // iterations, so the previous answer is typically within a few
-        // root-solver steps of the new one. If the cache slot is NaN
-        // (uninitialised) or non-finite (stale), fall back to the closed-
-        // form seed.
+        // Prefer the predictor or the previous iterate's root: β moves little
+        // between consecutive inner iterations, so either sits a step or two
+        // from the new root. The cache slot is tagged with β_h and β_w, since
+        // under link deviation and score warp the root depends on the joint
+        // coefficient vector, not just `(marginal_eta, slope)`. The seed only
+        // decides where the solve starts; the root it returns does not depend
+        // on it.
         let current_primary_point =
             Self::intercept_primary_point(marginal_eta, slope, beta_h, beta_w);
         let predictor_a = self
             .intercept_warm_starts
             .as_ref()
             .and_then(|cache| cache.predictor_seed(row, &current_primary_point));
-        // FLEX cache slot must include β_h and β_w: under link-deviation and
-        // score-warp the root depends on the joint coefficient vector, not
-        // just `(marginal_eta, slope)`. Without the tag a TR trial at one β
-        // can read back a converged value from a different trial at the same
-        // row and poison the solve.
         let flex_beta_tag = hash_intercept_warm_start_key_flex(marginal_eta, slope, beta_h, beta_w);
         let cached_a = self
             .intercept_warm_starts
             .as_ref()
             .and_then(|cache| cache.load_tagged(row, flex_beta_tag));
+        let warm = predictor_a.is_some() || cached_a.is_some();
         let a_init = predictor_a.or(cached_a).unwrap_or(a_closed_form);
 
-        // Note: an explicit `eval(a_closed_form)` short-circuit at this point
-        // would be redundant. On cold cycle-0 `cached_a` is None, so `a_init`
-        // already equals `a_closed_form` and the two-step Newton probe below
-        // evaluates there with the residual contract from
-        // `row_intercept_newton_is_converged`, matching the exact-root path
-        // in `monotone_root::solve_monotone_root` (see monotone_root.rs:50-66).
-        // On warm cycles, evaluating at `a_closed_form` would add an extra
-        // cell-moment call even when the cached seed is already the root.
-
-        // Adaptive acceptance tolerance: for extreme slopes the intercept
-        // equation becomes numerically flat and tight absolute precision is
-        // not achievable. We accept any bracketed solution at this level, so
-        // pass the same tolerance to the root solver — driving it tighter
-        // than `abs_tol` is wasted cell-moment work, since at large scale
-        // (n=320k, FLEX active with linkwiggle + score-warp) the solver is
-        // called once per row per Hessian build and the per-row cell-moment
-        // kernel dominates wall time. With this tolerance the closed-form /
-        // affine warm start short-circuits at `monotone_root.rs:26` for the
-        // common case, instead of forcing 30+ refinement iters down to 1e-10.
-
-        // Local Newton probe before paying for the safeguarded bracket.
-        // Cycle-0 is cold at large scale, so forcing every row through the
-        // bracket spends most of the wall time rebuilding identical cell
-        // value integrals. The rigid/affine seed is exact when deviations vanish
-        // and first-order accurate when they are small; probe that local
-        // Newton basin first. The convergence test uses the same residual
-        // contract as the safeguarded solver plus a tight relative-correction
-        // gate, so any accept here satisfies the existing final check. Hard
-        // cases still fall through unchanged.
-        let probe_result = (|| -> Result<(Option<(f64, f64, f64)>, f64), String> {
-            let mut a = a_init;
-            let mut seed_residual = None;
-            for _ in 0..6 {
-                let (f, f_a, _) = eval(a)?;
-                if seed_residual.is_none() {
-                    seed_residual = Some(f);
-                }
-                if Self::row_intercept_newton_is_converged(a, f, f_a, abs_tol) {
-                    return Ok((Some((a, f_a.abs(), f)), seed_residual.unwrap_or(f)));
-                }
-                if !(f_a.is_finite() && f_a != 0.0) {
-                    break;
-                }
-                let next_a = a - f / f_a;
-                if !next_a.is_finite() {
-                    break;
-                }
-                a = next_a;
-            }
-            Ok((None, seed_residual.unwrap_or(f64::INFINITY)))
-        })();
-
-        if let Ok((accepted, seed_residual)) = &probe_result {
-            if let Some(stats) = stats {
-                stats.record_seed_residual(*seed_residual, abs_tol);
-            }
-            if let Some((a, abs_deriv, _)) = accepted {
-                if let Some(stats) = stats {
-                    if predictor_a.is_some() || cached_a.is_some() {
-                        stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
-                    } else {
-                        stats
-                            .closed_form_short_circuit
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-                self.cache_row_intercept(row, *a, marginal_eta, slope, beta_h, beta_w);
-                return Ok((*a, *abs_deriv, false));
-            }
-        }
-
-        let mut solve_result = crate::monotone_root::solve_monotone_root_detailed(
-            eval,
+        let survival_side = marginal.q >= 0.0;
+        let log_target = smaller_tail_log_target(marginal.q);
+        let grid = self.training_row_grid(row)?;
+        let mut seed_residual = None;
+        let mut density = f64::NAN;
+        let (a, evaluations) = solve_log_tail_root(
             a_init,
-            "bernoulli intercept",
-            abs_tol,
-            64,
-            48,
-        );
-
-        // If the warm-started solve failed, retry once from the closed-form
-        // seed. Cached `a` from a prior PIRLS iter can be far enough from
-        // the current root (e.g., after a large β step) that the bracketing
-        // search exhausts; the closed-form seed always sits in the correct
-        // basin.
-        if (predictor_a.is_some() || cached_a.is_some()) && solve_result.is_err() {
-            solve_result = crate::monotone_root::solve_monotone_root_detailed(
-                eval,
-                a_closed_form,
-                "bernoulli intercept",
-                abs_tol,
-                64,
-                48,
-            );
-        }
-        // Routine emits its own format!()-based String errors below
-        // (residual rejection); enclosing return type stays Result<_, String>.
-        let solve_solution = solve_result.map_err(|e| e.to_string())?;
+            survival_side,
+            |a| {
+                let tail = match grid.as_deref() {
+                    None => self.evaluate_denested_calibration_tail(
+                        a,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        survival_side,
+                    )?,
+                    Some(grid) => self.evaluate_empirical_grid_calibration_tail(
+                        a,
+                        slope,
+                        beta_h,
+                        beta_w,
+                        grid,
+                        survival_side,
+                    )?,
+                };
+                let residual = tail.log_residual(survival_side, log_target)?;
+                seed_residual.get_or_insert((
+                    residual.value,
+                    anchor_residual_resolution(a, residual.first, residual.rounding),
+                ));
+                density = tail.density;
+                Ok(residual)
+            },
+            "bernoulli marginal-slope intercept",
+            || format!("row {row}, q={}, b={slope}", marginal.q),
+        )?;
         if let Some(stats) = stats {
-            stats.record_full_solver(solve_solution.refine_iters);
+            if let Some((residual, resolution)) = seed_residual {
+                stats.record_seed_residual(residual, resolution);
+            }
+            if evaluations == 1 && warm {
+                stats.cached_short_circuit.fetch_add(1, Ordering::Relaxed);
+            } else if evaluations == 1 {
+                stats
+                    .closed_form_short_circuit
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats.record_full_solver(evaluations);
+            }
         }
-        let (a, abs_deriv, f_best) = (
-            solve_solution.root,
-            solve_solution.abs_deriv,
-            solve_solution.residual,
-        );
-
-        if f_best.abs() > abs_tol {
-            return Err(format!(
-                "bernoulli marginal-slope intercept solve failed: \
-                     residual={f_best:.3e} at a={a:.6}, target mu={target:.6}"
-            ));
-        }
-
-        // Cache the converged intercept for the next PIRLS iter.
         self.cache_row_intercept(row, a, marginal_eta, slope, beta_h, beta_w);
-
-        Ok((a, abs_deriv, false))
+        Ok((a, density, false))
     }
-    pub(super) fn build_row_exact_context_with_stats_and_cell_cache(
+    pub(super) fn build_row_exact_context(
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
         stats: Option<&BernoulliInterceptSolveStats>,
-        cache_degree9_cells: bool,
     ) -> Result<BernoulliMarginalSlopeRowExactContext, String> {
         let marginal_eta = block_states[0].eta[row];
         let marginal = self.marginal_link_map(marginal_eta)?;
@@ -580,56 +432,10 @@ impl BernoulliMarginalSlopeFamily {
             };
             (intercept, f64::NAN, false)
         };
-        // Cache degree-9 cell moments at the converged intercept so the
-        // many gradient/diagonal/matvec passes that run *after* this point
-        // for the same (row, β) don't re-evaluate `evaluate_cell_moments` /
-        // `bivariate_normal_cdf` on identical inputs. This matters for the
-        // FLEX path (linkwiggle + score-warp), where each per-row Hessian
-        // build runs the cell-moment kernel once per cell per closure call.
-        let degree9_cells = if cache_degree9_cells
-            && self.effective_flex_active(block_states)?
-            && matches!(self.latent_measure, LatentMeasureKind::StandardNormal)
-        {
-            let cells = self.denested_partition_cells(intercept, slope, beta_h, beta_w)?;
-            // Per-row dedup: within ONE row's denested-partition output, the
-            // score-warp and link-wiggle bases occasionally produce cells
-            // whose `(left, right, c0, c1, c2, c3)` are bit-equal. Evaluating
-            // moments once and cloning the result into the other slots is
-            // numerically identical to evaluating each cell independently
-            // (`evaluate_cell_moments_lru` is a pure function of the cell), and
-            // skips redundant work. The dedup is purely intra-row, so it is
-            // orthogonal to the per-family LRU (which is keyed across rows)
-            // and the affine tail-cell memo (a separate mechanism).
-            let mut dedup: HashMap<
-                exact_kernel::CellFingerprint,
-                exact_kernel::CellDerivativeMomentState,
-            > = HashMap::new();
-            let mut out: Vec<CachedDenestedCellMoments> = Vec::with_capacity(cells.len());
-            for partition_cell in cells.into_iter() {
-                let key = exact_kernel::CellFingerprint::new(partition_cell.cell);
-                let state: exact_kernel::CellDerivativeMomentState =
-                    if let Some(existing) = dedup.get(&key) {
-                        existing.clone()
-                    } else {
-                        let computed =
-                            self.evaluate_cell_derivative_moments_lru(partition_cell.cell, 9)?;
-                        dedup.insert(key, computed.clone());
-                        computed
-                    };
-                out.push(CachedDenestedCellMoments {
-                    partition_cell,
-                    state,
-                });
-            }
-            Some(out)
-        } else {
-            None
-        };
         Ok(BernoulliMarginalSlopeRowExactContext {
             intercept,
             m_a,
             intercept_fast_path,
-            degree9_cells,
         })
     }
 
@@ -725,17 +531,6 @@ impl BernoulliMarginalSlopeFamily {
         }
         let stats = BernoulliInterceptSolveStats::default();
         let cell_cache_before = self.cell_moment_cache_stats.snapshot();
-        // Suppress per-row `degree9_cells` caching during the parallel context
-        // build: when flex is active *and* the latent measure is StandardNormal
-        // (i.e. exactly when `degree9_cells` would be populated), the top-of-
-        // cycle `build_row_cell_moments_bundle` invocation below also calls
-        // `denested_partition_cells` for every row. Suppressing the per-row
-        // cache here avoids the duplicate partition computation and the
-        // unused degree-9 moment evaluations whenever the bundle succeeds.
-        // When the bundle returns `None` (budget exceeded), the per-row
-        // `degree9_cells` cache is reconstructed below so the row-evaluation
-        // fast path that consults `row_ctx.degree9_cells` still has its
-        // cache. Numerical results are unchanged either way.
         let context_started = std::time::Instant::now();
         let progress_step = (context_row_count / 10).max(1);
         let completed_rows = AtomicUsize::new(0);
@@ -744,12 +539,7 @@ impl BernoulliMarginalSlopeFamily {
                 .par_iter()
                 .copied()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
@@ -769,7 +559,6 @@ impl BernoulliMarginalSlopeFamily {
                     intercept: f64::NAN,
                     m_a: f64::NAN,
                     intercept_fast_path: false,
-                    degree9_cells: None,
                 };
                 n
             ];
@@ -781,12 +570,7 @@ impl BernoulliMarginalSlopeFamily {
             (0..n)
                 .into_par_iter()
                 .map(|row| {
-                    let ctx = self.build_row_exact_context_with_stats_and_cell_cache(
-                        row,
-                        block_states,
-                        Some(&stats),
-                        false,
-                    )?;
+                    let ctx = self.build_row_exact_context(row, block_states, Some(&stats))?;
                     if log_exact_work(n) {
                         let done = completed_rows.fetch_add(1, Ordering::Relaxed) + 1;
                         if done == context_row_count || done % progress_step == 0 {
@@ -822,7 +606,7 @@ impl BernoulliMarginalSlopeFamily {
         }
         if flex_active {
             log::debug!(
-                "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=abs_tol:{}, >abs_tol:{}}}",
+                "bernoulli marginal-slope intercept seed short-circuit: cached={}, closed_form={}, full_solver={}, max_full_solver_iters={}, seed_residual_bins={{<=1e-12:{}, <=1e-10:{}, <=1e-8:{}, <=resolution:{}, >resolution:{}}}",
                 stats.cached_short_circuit.load(Ordering::Relaxed),
                 stats.closed_form_short_circuit.load(Ordering::Relaxed),
                 stats.full_solver.load(Ordering::Relaxed),
@@ -830,8 +614,8 @@ impl BernoulliMarginalSlopeFamily {
                 stats.seed_residual_le_1e12.load(Ordering::Relaxed),
                 stats.seed_residual_le_1e10.load(Ordering::Relaxed),
                 stats.seed_residual_le_1e8.load(Ordering::Relaxed),
-                stats.seed_residual_le_abs_tol.load(Ordering::Relaxed),
-                stats.seed_residual_gt_abs_tol.load(Ordering::Relaxed),
+                stats.seed_residual_le_resolution.load(Ordering::Relaxed),
+                stats.seed_residual_gt_resolution.load(Ordering::Relaxed),
             );
         }
         if flex_active {
@@ -1022,9 +806,9 @@ impl BernoulliMarginalSlopeFamily {
     /// `max_degree`. Returns `None` when the FLEX path is inactive, when an
     /// empirical latent grid is in effect (the row kernel takes a non-cell
     /// path), or when the estimated resident bytes exceed the active
-    /// resource-policy budget. Numerical equivalence with the legacy per-row
-    /// path is unconditional: callers always fall back to
-    /// `degree9_cells`/on-demand cell evaluation when the bundle is absent.
+    /// resource-policy budget. Numerical equivalence with the per-row path is
+    /// unconditional: callers fall back to on-demand cell evaluation when the
+    /// bundle is absent.
     pub(super) fn build_row_cell_moments_bundle(
         &self,
         block_states: &[ParameterBlockState],
@@ -3188,16 +2972,6 @@ impl BernoulliMarginalSlopeFamily {
                     !cached.is_empty(),
                     "row cell moments bundle was selected but row {row} has no cells"
                 );
-                cached
-                    .iter()
-                    .map(|entry| {
-                        (
-                            entry.partition_cell,
-                            std::borrow::Cow::Borrowed(&entry.state),
-                        )
-                    })
-                    .collect()
-            } else if let Some(cached) = row_ctx.degree9_cells.as_ref() {
                 cached
                     .iter()
                     .map(|entry| {
@@ -7435,6 +7209,7 @@ impl BernoulliMarginalSlopeFamily {
                         &ordered_pairs,
                         primary,
                         lanes,
+                        &self.jet_scratch.batch,
                     )
                 }
             }?;

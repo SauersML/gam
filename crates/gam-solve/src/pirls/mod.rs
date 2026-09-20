@@ -17,6 +17,7 @@ mod dispersion;
 mod edf;
 mod family_state;
 mod gam_working_model;
+mod generic_edm;
 mod glm_update;
 mod log_link_working_state;
 pub(crate) mod loop_driver;
@@ -37,6 +38,10 @@ mod workspace;
 mod beta_logistic_saturated_row_2902_tests;
 #[cfg(test)]
 mod firth_noncanonical_curvature_2273_tests;
+#[cfg(test)]
+mod bernoulli_log_jet_3317_tests;
+#[cfg(test)]
+mod gaussian_row_log_free_tests;
 #[cfg(test)]
 mod residuals_tests;
 #[cfg(test)]
@@ -66,6 +71,7 @@ pub use family_state::{
     valid_count_response,
 };
 pub(crate) use gam_working_model::*;
+pub(crate) use generic_edm::*;
 pub(crate) use row_pass::*;
 pub use glm_update::*;
 pub use low_rank::*;
@@ -104,7 +110,7 @@ pub use reweight::{
     ExactNewtonDecrementEvidence, exact_newton_decrement_evidence, runworking_model_pirls,
 };
 
-pub use state::array1_l2_norm;
+pub use state::{array1_l2_norm, relative_gradient_residual};
 
 // Surface the `WorkingModel` trait (defined in the private `working_model_trait`
 // module) at the `pirls` root so out-of-crate engine implementors (gam-models

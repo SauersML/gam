@@ -6,14 +6,22 @@ use std::sync::{Arc, Mutex};
 
 /// Report the trial just evaluated as accepted, as `OuterAcceptObserver` does
 /// when `opt`'s ratio test accepts it (#3017). The gate reads only whether a
-/// report arrived; the scalars are `StepInfo`'s, which these fixtures do not
-/// model.
+/// report arrived, and the guard reads the step's predicted decrease (#3018):
+/// these fixtures model a step whose model predicted none.
 fn report_accepted_trial_3017(ledger: &AcceptedStepLedger, iter: usize) {
     ledger.push(AcceptedOuterStep {
         iter,
         step_norm: 0.0,
         actual_decrease: 0.0,
+        predicted_decrease: 0.0,
     });
+}
+
+/// Report that the objective refused the trial just evaluated, as
+/// `OuterAcceptObserver` does when `opt` calls `on_trial_refused`, with the
+/// decrease the refused step's model predicted (#3018).
+fn report_refused_trial_3018(ledger: &AcceptedStepLedger, predicted_decrease: f64) {
+    ledger.push_refused(predicted_decrease);
 }
 
 /// Evaluate `x` through the dense ARC bridge and settle it as an accepted
@@ -43,12 +51,7 @@ fn certificate_attests_consistent_quadratic() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![2.0, 2.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![2.0, 2.0]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| {
@@ -192,7 +195,7 @@ fn analytic_hessian_candidate_screening_requires_only_first_order_evidence_2414(
 
     assert!(
         certified
-            .result()
+            .0
             .criterion_certificate
             .as_ref()
             .is_some_and(OuterCriterionCertificate::certifies),
@@ -226,12 +229,7 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
-        .with_initial_rho(array![0.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![0.0]);
     let mut obj = problem
         .build_objective(
             PilotState::default(),
@@ -293,16 +291,10 @@ fn sampled_outer_pilot_is_followed_by_exact_polish_before_certification_979() {
 #[test]
 fn terminal_certification_does_not_change_outer_solution() {
     let center = array![0.25];
-    let seed_config = gam_problem::SeedConfig {
-        max_seeds: 1,
-        seed_budget: 1,
-        ..Default::default()
-    };
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
         .with_initial_rho(array![1.5])
-        .with_seed_config(seed_config)
         .with_problem_size(8, 3);
     let config = problem.config();
 
@@ -355,18 +347,18 @@ fn terminal_certification_does_not_change_outer_solution() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
 
-    let baseline = run_outer_uncertified(&mut uncertified, &config, "terminal-baseline")
+    let baseline = run_outer_uncertified(&mut uncertified, &config, "certification-baseline")
         .expect("baseline outer run");
-    let diagnosed =
-        run_outer(&mut certified, &config, "terminal-certified").expect("certified outer run");
+    let certified_result =
+        run_outer(&mut certified, &config, "certification-run").expect("certified outer run");
 
-    assert_eq!(baseline.rho, diagnosed.rho);
+    assert_eq!(baseline.rho, certified_result.rho);
     assert_eq!(
         baseline.final_value.to_bits(),
-        diagnosed.final_value.to_bits()
+        certified_result.final_value.to_bits()
     );
-    assert_eq!(baseline.iterations, diagnosed.iterations);
-    assert_eq!(baseline.final_grad_norm, diagnosed.final_grad_norm);
+    assert_eq!(baseline.iterations, certified_result.iterations);
+    assert_eq!(baseline.final_grad_norm, certified_result.final_grad_norm);
 }
 
 /// The desync bug genus (#748/#752/#901): the gradient path optimizes a
@@ -382,12 +374,7 @@ fn certificate_flags_value_gradient_desync() {
     let problem = OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![1.0, 1.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(array![1.0, 1.0]);
     // eval(): a self-consistent but WRONG world (shifted center) so the
     // line search accepts steps and BFGS converges to wrong_center.
     // eval_cost(): the TRUE criterion value — the path the audit probes.
@@ -817,13 +804,7 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
             Array1::from_elem(1, -WRONG_RAIL_FACE),
             Array1::from_elem(1, WRONG_RAIL_FACE),
         )
-        .with_initial_rho(reseed)
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_initial_rho(reseed);
     let mut recovery_obj = recovery_problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(cost(rho)),
@@ -851,15 +832,18 @@ fn wrong_rail_pullback_recovers_gradient_only_objective_2392() {
 /// Build an interior 1-coordinate objective `½·ρ₀²` (analytic gradient `[ρ₀]`,
 /// analytic Dense Hessian `[[1]]`) and certify at `theta_hat` with NO
 /// `operator_stop_reason` set — i.e. the non-flat-valley exit path a fit takes
-/// when it is already stationary at iteration 0. `objective_scale = 80` makes
-/// the arithmetic gradient floor `80·√ε`, mirroring the Gaussian-linear
-/// standard-REML fit's matrix-factorization resolution.
+/// when it is already stationary at iteration 0. The route publishes no gradient
+/// parts, so the raw band is the `1e-12` tolerance. It declares `n = 5000`
+/// observations, so the criterion resolution is `τ_stat = 1/(2n) = 1e-4`.
 fn audit_interior_with_dense_curvature(
     theta_hat: Array1<f64>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let config = OuterConfig {
         tolerance: 1.0e-12,
-        objective_scale: Some(80.0),
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(5_000),
+            p_coefficients: Some(1),
+        },
         ..OuterConfig::default()
     };
     let mut obj = OuterProblem::new(1)
@@ -898,13 +882,13 @@ fn audit_interior_with_dense_curvature(
 /// The curvature-scaled widening is NOT gated to a `CostStallFlatValley` exit:
 /// a fit already stationary at iteration 0 (a 2-parameter Gaussian-linear REML
 /// with λ→0) reaches certification with `operator_stop_reason = None`, a
-/// projected gradient above the arithmetic score·√ε floor, and a
+/// projected gradient above the raw band, and a
 /// NEGLIGIBLE Newton decrement. The Newton decrement — not the exit reason — is
 /// the stationarity certificate, so the point must certify.
 #[test]
 fn curvature_widening_certifies_stationary_point_on_any_exit_reason() {
-    let arithmetic_floor = 80.0 * f64::EPSILON.sqrt();
-    // |Pg| = 2e-6 > 80·√ε, but ½·gᵀH⁻¹g = ½·(2e-6)² = 2e-12,
+    let raw_band = 1.0e-12;
+    // |Pg| = 2e-6 > 1e-12, but ½·gᵀH⁻¹g = ½·(2e-6)² = 2e-12,
     // orders of magnitude below any outer objective tolerance: stationary to
     // second order, must certify DESPITE operator_stop_reason = None.
     let cert = audit_interior_with_dense_curvature(array![2.0e-6])
@@ -915,7 +899,7 @@ fn curvature_widening_certifies_stationary_point_on_any_exit_reason() {
         cert.summary(),
     );
     assert!(
-        cert.stationarity.projected_norm() > arithmetic_floor,
+        cert.stationarity.projected_norm() > raw_band,
         "the test must exercise the ABOVE-solver-bound regime (else it proves \
          nothing about the widening): {}",
         cert.summary(),
@@ -1125,15 +1109,62 @@ fn mixture_reml_certificate_recomputes_augmented_theta_at_full_fidelity_2309() {
     assert_eq!(result.final_gradient(), Some(&array![0.0, 37.0]));
 }
 
+/// The #2269 fixture's REML criterion: exactly flat in `ρ`, with an analytic
+/// score formed from two channels of magnitude 80 that cancel, `½λ tr(H⁻¹S) =
+/// ½rank = 80` against `logdet_s = −½rank`. `residual` is the forward-error
+/// remainder of that sum, all of which lands in the KKT channel.
+const SCORE_CHANNEL_2269: f64 = 80.0;
+
+fn problem_size_2269() -> crate::rho_optimizer::OuterProblemSize {
+    crate::rho_optimizer::OuterProblemSize {
+        n_obs: Some(1_000),
+        p_coefficients: Some(10),
+    }
+}
+
+fn score_parts_2269(residual: f64) -> crate::estimate::outer_eval_capture::RhoGradientParts {
+    crate::estimate::outer_eval_capture::RhoGradientParts {
+        index: 0,
+        lambda: 1.0,
+        block_quadratic: 0.0,
+        rank: 160,
+        dim: 160,
+        fixed_beta: 0.0,
+        logdet_h: SCORE_CHANNEL_2269,
+        frozen_logdet_h: SCORE_CHANNEL_2269,
+        mode_response_logdet_h: 0.0,
+        logdet_s: -SCORE_CHANNEL_2269,
+        total: residual,
+    }
+}
+
+/// The caller's tolerance is far below what the score's own arithmetic can
+/// resolve: `τ = 1e-14·(1 + 80)` against a rounding band of `γ_m·160`.
+fn config_2269() -> OuterConfig {
+    OuterConfig {
+        tolerance: 1.0e-14,
+        problem_size: problem_size_2269(),
+        ..OuterConfig::default()
+    }
+}
+
+/// The score's rounding band `ε` (Theorem 9) at a sub-resolution residual.
+fn score_rounding_band_2269() -> f64 {
+    let evidence = crate::estimate::outer_eval_capture::CertificateEvidence {
+        parts: vec![score_parts_2269(0.0)],
+        ..Default::default()
+    };
+    let band = outer_coordinate_bands(&config_2269(), 1, &evidence)
+        .expect("the fixture declares its problem size")[0]
+        .expect("the fixture publishes the score's parts");
+    assert!(band.is_arithmetic_limited(), "the fixture must sit below the score's resolution");
+    band.epsilon
+}
+
 fn audit_gradient_only_roundoff_residual_2269(
     residual: f64,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
-    let objective_scale = 80.0;
-    let config = OuterConfig {
-        tolerance: 1.0e-12,
-        objective_scale: Some(objective_scale),
-        ..OuterConfig::default()
-    };
+    let config = config_2269();
     // The value oracle is exactly flat. `residual` represents the forward-error
     // remainder of its analytic matrix-factorization score: this is the
     // gradient-only case, so no Hessian/decrement or trajectory-noise rescue is
@@ -1143,10 +1174,13 @@ fn audit_gradient_only_roundoff_residual_2269(
         .with_hessian(DeclaredHessianForm::Unavailable)
         .build_objective(
             (),
-            move |_: &mut (), _: &Array1<f64>| Ok(objective_scale),
+            move |_: &mut (), _: &Array1<f64>| Ok(SCORE_CHANNEL_2269),
             move |_: &mut (), _: &Array1<f64>| {
+                crate::estimate::outer_eval_capture::record_certificate_parts(&[
+                    score_parts_2269(residual),
+                ]);
                 Ok(OuterEval {
-                    cost: objective_scale,
+                    cost: SCORE_CHANNEL_2269,
                     gradient: array![residual],
                     hessian: HessianValue::Unavailable,
                     inner_beta_hint: None,
@@ -1157,7 +1191,7 @@ fn audit_gradient_only_roundoff_residual_2269(
         );
     let mut result = OuterResult::new(
         array![0.0],
-        objective_scale,
+        SCORE_CHANNEL_2269,
         1,
         true,
         OuterPlan {
@@ -1173,23 +1207,31 @@ fn audit_gradient_only_roundoff_residual_2269(
     )
 }
 
+/// #2269 / #2954 — a gradient-only certificate judges a score at the rounding
+/// resolution of the channels that score was summed from, not at a floor
+/// anchored to the criterion's value (the deleted `|V|·√ε`). The verdict is
+/// labelled arithmetic-limited because the caller asked for less than that
+/// resolution can prove.
 #[test]
-fn gradient_only_certificate_uses_objective_roundoff_resolution_2269() {
-    let scale = 80.0;
-    let arithmetic_floor = scale * f64::EPSILON.sqrt();
-    let residual = 0.5 * arithmetic_floor;
+fn gradient_only_certificate_uses_the_scores_own_rounding_resolution_2269() {
+    let epsilon = score_rounding_band_2269();
+    let residual = 0.5 * epsilon;
 
     let certificate = audit_gradient_only_roundoff_residual_2269(residual)
-        .expect("a flat score's sub-roundoff residual must certify without curvature or probes");
+        .expect("a flat score's sub-rounding residual must certify without curvature or probes");
     assert!(certificate.certifies());
-    assert!(certificate.stationarity.bound() >= arithmetic_floor);
+    // The residual itself enters the KKT channel, so the judged band exceeds
+    // the residual-free `ε` by `γ_m·residual`, below `ε·1e-12`.
+    let bound = certificate.stationarity.bound();
+    assert!(bound >= epsilon && bound - epsilon <= 1.0e-12 * epsilon);
+    assert_eq!(certificate.stationarity.rung().label, "arithmetic-limited");
+    assert!(!certificate.stationarity.rung().derived_standard);
     assert!(certificate.stationarity.projected_norm() <= certificate.stationarity.bound());
 }
 
 #[test]
-fn gradient_only_certificate_rejects_residual_above_roundoff_2269() {
-    let arithmetic_floor = 80.0 * f64::EPSILON.sqrt();
-    assert!(audit_gradient_only_roundoff_residual_2269(2.0 * arithmetic_floor).is_err());
+fn gradient_only_certificate_rejects_residual_above_the_scores_rounding_2269() {
+    assert!(audit_gradient_only_roundoff_residual_2269(3.0 * score_rounding_band_2269()).is_err());
 }
 
 /// Slope reported on the saturated coordinate's gradient (#2299). In the bias
@@ -1876,7 +1918,6 @@ fn closure_objective_delegates() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut i32, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -1977,7 +2018,6 @@ fn closure_objective_seed_inner_state_delegates_when_hook_present() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut Vec<f64>, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     }
@@ -2005,12 +2045,7 @@ fn writable_inner_seed_hook_does_not_authorize_off_target_evaluations() {
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(literal_seed.clone())
         .with_bounds(array![-8.0], array![8.0])
-        .with_max_iter(1)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_max_iter(1);
     let literal_for_cost = literal_seed.clone();
     let literal_for_eval = literal_seed.clone();
     let mut obj = problem
@@ -2079,13 +2114,7 @@ fn auxiliary_psi_is_never_synthetically_oversmoothed() {
         .with_psi_dim(1)
         .with_initial_rho(literal_seed.clone())
         .with_bounds(array![-8.0, -8.0], array![8.0, 8.0])
-        .with_max_iter(1)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            num_auxiliary_trailing: 1,
-            ..Default::default()
-        });
+        .with_max_iter(1);
     let literal_for_cost = literal_seed.clone();
     let literal_for_eval = literal_seed.clone();
     let mut obj = problem
@@ -2187,7 +2216,6 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2201,7 +2229,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2268,7 +2296,6 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut (), &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut (), &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2282,7 +2309,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2360,7 +2387,6 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2374,7 +2400,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2439,7 +2465,6 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         rail_face_limit_fn: None,
         criterion_invariance_fn: None,
         criterion_rank_fn: None,
-        screening_proxy_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<f64, EstimationError>>,
         seed_fn: None::<fn(&mut usize, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
         terminal_eval_order: None,
     };
@@ -2453,7 +2478,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(COST_STALL_REL_TOL_FLOOR, COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2761,7 +2786,6 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
         value_probe_cache: Vec::new(),
         cost_stall: None,
         cost_stall_bounds: None,
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
@@ -2830,7 +2854,7 @@ fn outer_second_order_bridge_separates_first_and_second_order_requests() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -2895,7 +2919,7 @@ fn outer_second_order_bridge_rejects_a_candidate_whose_row_geometry_refuses_2627
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -2969,7 +2993,7 @@ fn outer_second_order_bridge_keeps_structural_refusals_fatal_2627() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3027,7 +3051,7 @@ fn analytic_route_unavailable_hessian_is_fatal() {
         last_value_grad_rho: None,
         cost_stall: None,
         cost_stall_bounds: None,
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::default()),
         decrement_verdict_config: None,
     };
@@ -3060,38 +3084,75 @@ fn analytic_route_unavailable_hessian_is_fatal() {
 /// negative curvature, and once a PSD improving iterate replaces the saddle as
 /// best, the next filled window certifies THAT point.
 /// A configuration whose certificate band is exactly `band` at every criterion
-/// value: the absolute tolerance with no point-anchored relative widening and no
-/// declared scale. The guard judges a stall's claim by the certificate's band
+/// value: the absolute tolerance. The guard judges a stall's claim by the certificate's band
 /// (#2817), so a guard fixture that means "stationary below `band`" builds this.
 fn claim_band_config(band: f64) -> OuterConfig {
     OuterConfig {
         tolerance: band,
-        rel_cost_tolerance: Some(0.0),
-        objective_scale: None,
         ..OuterConfig::default()
     }
 }
 
+/// The relative resolution these guard fixtures give each value: a computed
+/// `V` is within `GUARD_REL_RESOLUTION·(1 + |V|)` of the exact one, so a step
+/// buys resolved progress only when it lowers the incumbent by more than twice
+/// that (#3018). It is the improvement floor the fixtures used to hand the guard.
+const GUARD_REL_RESOLUTION: f64 = 1.0e-6;
+
+/// The criterion resolution `τ` these fixtures hand the guard, the resolution a
+/// value carries when its evaluation publishes no band: absolute, as every route
+/// derives it (`outer_criterion_resolution`).
+const GUARD_TAU: f64 = 1.0e-6;
+
+/// A step whose model predicted no decrease: with no resolvable measured
+/// decrease either, it is a stalled step (#3018). A refused trial proposed by
+/// such a step stalls too, since it could not have shown resolved progress.
+const NO_MODEL_DECREASE: f64 = 0.0;
+
+/// A step whose model still promised a decrease far past every resolution these
+/// fixtures use: the solver adapting its step. A refused trial proposed by it
+/// reaches no verdict (#3018).
+const ADAPTING_DECREASE: f64 = 1.0;
+
+/// A trusted sample for a guard fixture at [`GUARD_REL_RESOLUTION`].
+fn guard_sample(
+    rho: &Array1<f64>,
+    value: f64,
+    grad_norm: f64,
+    curvature_psd: Option<bool>,
+) -> StallSample<'_> {
+    StallSample {
+        point: rho,
+        value,
+        resolution: GUARD_REL_RESOLUTION * (1.0 + value.abs()),
+        grad_norm,
+        trusted: true,
+        curvature_psd,
+    }
+}
+
+
 #[test]
 fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
 
     // Best-so-far: low cost, gradient inside the certification band, but a
     // certified strict saddle (the #2357 eval#5 analogue at ρ₂≈5.4).
     let saddle_rho = array![5.4];
-    let verdict = guard.observe_second_order(&saddle_rho, 100.0, 5.0e-4, true, Some(false));
+    let verdict = guard.observe(guard_sample(&saddle_rho, 100.0, 5.0e-4, Some(false)), NO_MODEL_DECREASE);
     assert!(matches!(verdict, CostStallVerdict::Continue));
 
-    // Three no-improvement evals (the ρ₂≈10.7 oscillation) fill the window.
-    // Pre-fix this certified the SADDLE as Converged; the strict-saddle refusal
-    // must instead grant an escape and keep descending.
-    let osc_rho = array![10.7];
-    for k in 0..3 {
-        let verdict = guard.observe_second_order(&osc_rho, 100.5, 5.0e-4, true, Some(true));
+    // Three no-improvement evals (the ρ₂≈10.7 oscillation), each a stalled step
+    // on a point the search had not visited. Pre-fix this certified the SADDLE as
+    // Converged; the strict-saddle refusal must instead grant an escape at every
+    // stall and keep descending.
+    for (k, osc) in [10.7, 10.8, 10.9].into_iter().enumerate() {
+        let osc_rho = array![osc];
+        let verdict = guard.observe(guard_sample(&osc_rho, 100.5, 5.0e-4, Some(true)), NO_MODEL_DECREASE);
         assert!(
             matches!(verdict, CostStallVerdict::Continue),
-            "window fill #{k} at a strict-saddle incumbent must refuse the stall, \
+            "stall #{k} at a strict-saddle incumbent must refuse to stop there, \
              not certify the saddle"
         );
     }
@@ -3107,17 +3168,15 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
     }
 
     // The continued descent finds a better, PSD iterate (the warm-resume
-    // outcome): it becomes best, and the next filled window certifies it.
+    // outcome): it becomes best, and its projected gradient 4e-4 is inside the
+    // certification band 1e-3 at its value, so the step is stalled whatever its
+    // decrease (#3018: drift inside the band is not feasible descent) and the PSD
+    // incumbent certifies at once, where a window used to wait for two more.
     let settled_rho = array![6.1];
-    let verdict = guard.observe_second_order(&settled_rho, 99.0, 4.0e-4, true, Some(true));
-    assert!(matches!(verdict, CostStallVerdict::Continue));
-    let mut last = CostStallVerdict::Continue;
-    for _ in 0..3 {
-        last = guard.observe_second_order(&osc_rho, 100.5, 5.0e-4, true, Some(true));
-    }
+    let last = guard.observe(guard_sample(&settled_rho, 99.0, 4.0e-4, Some(true)), 1.0);
     assert!(
         matches!(last, CostStallVerdict::Converged),
-        "a PSD best inside the certification band must certify once the window refills"
+        "a PSD best inside the certification band must certify at its own stall"
     );
     let published = exit
         .lock()
@@ -3145,61 +3204,52 @@ fn finite_cost_stall_refuses_to_certify_strict_saddle_incumbent_2357() {
 #[test]
 fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let incumbent = array![-2.6, 4.8];
-    guard.observe_second_order_seed(&incumbent, 935.29, 0.297, Some(false));
+    guard.observe_second_order_seed(
+        &incumbent,
+        935.29,
+        GUARD_REL_RESOLUTION * (1.0 + 935.29),
+        0.297,
+        Some(false),
+    );
 
-    // Shrinking trials toward the incumbent, each one above it (rejected).
+    // Shrinking trials toward the incumbent, each one above it, and each a
+    // stalled step on a point the search had not visited.
     let mut step = 3.77;
-    let mut shrinking_window = |guard: &mut CostStallGuard| {
-        let mut verdicts = Vec::new();
-        for _ in 0..3 {
-            let trial = array![-2.6 - step, 4.8];
-            verdicts.push(guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)));
-            step *= 0.7;
-        }
-        verdicts
-    };
-    for window in 0..4 {
-        let verdicts = shrinking_window(&mut guard);
+    for trial in 0..12 {
+        let point = array![-2.6 - step, 4.8];
+        let verdict = guard.observe(guard_sample(&point, 937.3, 8.0, Some(false)), NO_MODEL_DECREASE);
         assert!(
-            verdicts
-                .iter()
-                .all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
-            "window {window}: rejected trials that move are not a replay, so the strict-saddle \
+            matches!(verdict, CostStallVerdict::Continue),
+            "trial {trial}: a stall on a trial that moved is not a replay, so the strict-saddle \
              escape must be granted again"
         );
         assert!(
-            guard.license_continuation(),
-            "window {window}: an unreplayed window at a strict saddle is licensed"
+            guard.unprogressing_stop().is_none(),
+            "trial {trial}: an unreplayed stall at a strict saddle is licensed"
         );
+        step *= 0.7;
     }
-    assert_eq!(guard.stuck_escapes, 4, "each moving window earns its escape");
+    assert_eq!(guard.stuck_escapes(), 12, "each stall on a moving trial earns its escape");
 
-    // A window that revisits the previous window's trials from the same
-    // incumbent is a proven replay and is cut.
-    let revisited = [0.3, 0.2, 0.1];
-    for trial_step in revisited {
-        let trial = array![-2.6 - trial_step, 4.8];
-        assert!(
-            matches!(
-                guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false)),
-                CostStallVerdict::Continue
-            ),
-            "the first pass over a fresh window is not yet a replay"
-        );
-    }
-    let mut last = CostStallVerdict::Continue;
-    for trial_step in revisited {
-        let trial = array![-2.6 - trial_step, 4.8];
-        last = guard.observe_second_order(&trial, 937.3, 8.0, true, Some(false));
-    }
+    // A stall that revisits the previous stall's trial from the same incumbent is
+    // a proven replay and is cut.
+    let revisited = array![-2.6 - 0.1, 4.8];
+    assert!(
+        matches!(
+            guard.observe(guard_sample(&revisited, 937.3, 8.0, Some(false)), NO_MODEL_DECREASE),
+            CostStallVerdict::Continue
+        ),
+        "the first stall on a fresh trial is not yet a replay"
+    );
+    let last = guard.observe(guard_sample(&revisited, 937.3, 8.0, Some(false)), NO_MODEL_DECREASE);
     assert!(
         matches!(last, CostStallVerdict::FlatValleyStall { .. }),
-        "a window that revisits the same trials from the same incumbent replays it and must halt"
+        "a stall on the same trial from the same incumbent replays the last one and must halt"
     );
     assert!(
-        !guard.license_continuation(),
+        guard.unprogressing_stop().is_some(),
         "no licence reopens a proven replay"
     );
     let published = exit.lock().unwrap().take().expect("halt publishes the incumbent");
@@ -3212,8 +3262,8 @@ fn rejected_trials_that_move_do_not_prove_a_replay_at_a_strict_saddle() {
 /// lower box bound and the ARC outer loop cycles to `max_iter` without ever
 /// certifying a stationary point (the #1082 multinomial timeout). The
 /// `OuterSecondOrderBridge` now carries the same cost-stall guard the BFGS
-/// bridge does: once the REML score has stopped improving over
-/// `COST_STALL_WINDOW` evals, the bridge returns the `Fatal` cost-stall
+/// bridge does: once an accepted step buys no resolvable decrease and its model
+/// predicted none (#3018), the bridge returns the `Fatal` cost-stall
 /// sentinel so the runner halts ARC at the published best iterate. The guard
 /// fires from `eval_hessian` — `opt::Arc`'s per-iterate oracle evaluates the
 /// (value, grad, Hessian) triple there and NEVER calls `eval_grad` on the ARC
@@ -3267,7 +3317,7 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     // Threshold the projected residual (0 here) must clear; any positive value
     // certifies the at-bound stall as converged.
-    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3280,15 +3330,16 @@ fn arc_bridge_finite_cost_stall_defers_at_bound_separation() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
     // Hammer eval_hessian at the lower bound — the ARC per-iterate oracle path.
-    // Every finite sample, including the one that fills the stall window, must
-    // retain its Hessian so ARC owns the convergence verdict. The schedule spans
-    // one window, so the #2817 progress licence is spent only once here.
-    for iter in 0..(COST_STALL_WINDOW + 2) {
+    // Every finite sample, including the one the stall is judged at, must retain
+    // its Hessian so ARC owns the convergence verdict. The schedule spans one
+    // stall (the incumbent, then the stalled step), so the #2817 progress licence
+    // is spent only once here.
+    for iter in 0..2 {
         let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &lo, iter)
             .expect("finite ARC stall sample must reach the second-order solver");
         assert_eq!(sample.hessian, Some(array![[1.0]]));
@@ -3336,7 +3387,7 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3349,14 +3400,15 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-10.0], array![10.0])),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
 
-    for iter in 0..5 {
+    // The incumbent, then the stalled step at it.
+    for iter in 0..2 {
         let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &point, iter)
-            .expect("strict-saddle Hessian must reach ARC after the stall window fills");
+            .expect("strict-saddle Hessian must reach ARC through the stall");
         assert_eq!(sample.hessian, Some(array![[-1.0]]));
     }
     let published = exit.lock().unwrap().take().expect("best checkpoint published");
@@ -3371,9 +3423,9 @@ fn arc_bridge_finite_stall_delivers_interior_negative_curvature() {
 /// resets the no-improvement streak on every step (the cost really is dropping)
 /// and the loop never certifies; `opt::Arc`'s own gradient-tolerance check never
 /// trips either, because it tests the RAW gradient, which points out of the box
-/// forever. The guard now counts a KKT-stationary-at-bound trial as
-/// no-improvement, so the window fills and ARC halts at the best feasible
-/// iterate. This drives the ARC bridge directly and asserts the halt.
+/// forever. The guard now calls a KKT-stationary-at-bound step stalled whatever
+/// its decrease (drift pinned at a bound is not feasible descent, #3018), so ARC
+/// halts at the best feasible iterate. This drives the ARC bridge directly and asserts the halt.
 #[test]
 fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
     let lo = array![-10.0];
@@ -3400,7 +3452,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
             step.set(k + 1);
             Ok(OuterEval {
                 // Monotonically decreasing by far more than the rel-tol floor:
-                // a pure cost-stall test could never fill its window here.
+                // a pure cost-stall test would never call these steps stalled.
                 cost: 1.0 - (k as f64),
                 // Gradient whose descent step exits the lower bound: raw norm = 1
                 // forever, bound-projected residual = 0 (KKT-stationary).
@@ -3416,7 +3468,7 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3429,11 +3481,14 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
-    for iter in 0..(COST_STALL_WINDOW + 2) {
+    // Every step is inside the band, so every accepted step is a stall however
+    // much raw cost it buys; each is deferred to ARC, and each is licensed by the
+    // unit of resolved descent it bought since the last.
+    for iter in 0..8 {
         let sample = eval_accepted_hessian_3017(&mut bridge, &ledger, &lo, iter)
             .expect("finite bound sample must reach ARC with curvature");
         assert_eq!(sample.hessian, Some(array![[1.0]]));
@@ -3452,10 +3507,12 @@ fn arc_bridge_finite_stall_defers_kkt_stationary_bound_descent() {
 /// back INFEASIBLE (cost = +∞). Those infeasible trials are rejected by the
 /// finite-eval validator BEFORE the finite cost-stall guard sees them, so the
 /// no-improvement window can never fill — and the outer loop used to grind to
-/// `max_iter` (the timeout). The bridge now feeds infeasible trials to the
-/// guard's dedicated infeasible-streak path: a run of `COST_STALL_WINDOW`
-/// consecutive infeasible trials after a feasible best halts ARC at that best
-/// feasible iterate. This drives the ARC bridge directly and asserts the halt.
+/// `max_iter` (the timeout). The bridge now holds each infeasible trial until
+/// `opt` reports the decrease its step's cubic model predicted, and the guard
+/// judges it by that alone (#3018): a refusal whose model still promised a
+/// resolvable decrease is ARC raising σ and reaches no verdict however many come,
+/// and one whose model promised no more than the feasible best's resolution halts
+/// ARC at that best feasible iterate. This drives the ARC bridge directly.
 #[test]
 fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
     let lo = array![-10.0];
@@ -3499,7 +3556,7 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3512,40 +3569,43 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
-    // One feasible eval records the best; the next `COST_STALL_WINDOW` infeasible
-    // evals fill the infeasible-streak window and trip the sentinel.
-    let mut sentinel_fired = false;
     // First: the feasible iterate.
     // ARC accepts it; the next evaluation folds it as the incumbent (#3017).
     SecondOrderObjective::eval_hessian(&mut bridge, &feasible_rho)
         .expect("feasible iterate must evaluate cleanly");
     report_accepted_trial_3017(&ledger, 0);
     let separating = array![-10.0];
-    for _ in 0..(COST_STALL_WINDOW + 2) {
+    // Refused trials whose cubic model still promised a resolvable decrease: more
+    // of them than any count the guard used to stop on, and none reaches a verdict.
+    for trial in 0..8 {
         match SecondOrderObjective::eval_hessian(&mut bridge, &separating) {
             Ok(_) => panic!("an infeasible (cost=∞) trial must not return a finite sample"),
-            // Before the window fills, infeasible trials surface as the normal
-            // recoverable non-finite-cost error (the optimizer shrinks + retries).
-            Err(err) if err.is_recoverable() => {}
-            Err(err) => {
-                let message = err.into_message();
-                assert_eq!(
-                    message, ARC_INFEASIBLE_STALL_SENTINEL,
-                    "infeasible-run halt must use the non-converged ARC checkpoint sentinel"
-                );
-                sentinel_fired = true;
-                break;
-            }
+            // An adapting refusal surfaces as the normal recoverable non-finite-cost
+            // error (the optimizer shrinks + retries).
+            Err(err) => assert!(
+                err.is_recoverable(),
+                "refusal {trial} promised a resolvable decrease and must not stop ARC: {}",
+                err.message()
+            ),
         }
+        report_refused_trial_3018(&ledger, ADAPTING_DECREASE);
     }
-    assert!(
-        sentinel_fired,
-        "ARC bridge must halt after {} consecutive infeasible separating trials",
-        COST_STALL_WINDOW
+    // One refusal whose model promised nothing: the next evaluation settles it and
+    // halts at the feasible best before evaluating anything.
+    let err = SecondOrderObjective::eval_hessian(&mut bridge, &separating)
+        .expect_err("an infeasible (cost=∞) trial must not return a finite sample");
+    assert!(err.is_recoverable(), "the adapting run's last refusal: {}", err.message());
+    report_refused_trial_3018(&ledger, NO_MODEL_DECREASE);
+    let halt = SecondOrderObjective::eval_hessian(&mut bridge, &separating)
+        .expect_err("a refusal whose model promised no resolvable decrease must halt ARC");
+    assert_eq!(
+        halt.into_message(),
+        ARC_INFEASIBLE_STALL_SENTINEL,
+        "infeasible-run halt must use the non-converged ARC checkpoint sentinel"
     );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert!(
@@ -3562,9 +3622,10 @@ fn arc_bridge_cost_stall_halts_on_infeasible_separation_run() {
 
 /// #2735: the same infeasible run, with each trial REFUSED as a typed error rather
 /// than priced at +∞. A refusal is an infeasible trial exactly like a non-finite
-/// cost, so it must feed the ARC bridge's infeasible-streak path and halt at the
-/// feasible best. Before the typed channel the bridge returned a recoverable
-/// error ahead of the streak bookkeeping, so the window never filled.
+/// cost, so it must reach the ARC bridge's refused-trial test and halt at the
+/// feasible best once a refusal's model promised no resolvable decrease (#3018).
+/// Before the typed channel the bridge returned a recoverable error ahead of the
+/// refusal bookkeeping, so no refusal was ever judged.
 #[test]
 fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
     let lo = array![-10.0];
@@ -3606,7 +3667,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
+    let guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
@@ -3619,7 +3680,7 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         last_value_grad_rho: None,
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo.clone(), hi.clone())),
-        curvature_stationary_floor: None,
+        curvature_stationary_resolution: None,
         accepted_trials: AcceptedTrialGate::new(Arc::clone(&ledger)),
         decrement_verdict_config: None,
     };
@@ -3628,34 +3689,24 @@ fn arc_bridge_cost_stall_halts_on_a_run_of_typed_refusals_2735() {
         .expect("feasible iterate must evaluate cleanly");
     report_accepted_trial_3017(&ledger, 0);
     let separating = array![-10.0];
-    let mut sentinel_fired = false;
-    for _ in 0..(COST_STALL_WINDOW + 2) {
-        match SecondOrderObjective::eval_hessian(&mut bridge, &separating) {
-            Ok(_) => panic!("a refused trial must not return a finite sample"),
-            // Before the window fills, each refusal surfaces as a recoverable error
-            // that still names its reason.
-            Err(err) if err.is_recoverable() => {
-                assert!(
-                    err.message().contains("planted refusal at a separating trial"),
-                    "the refusal's reason must reach the optimizer: {}",
-                    err.message()
-                );
-            }
-            Err(err) => {
-                assert_eq!(
-                    err.into_message(),
-                    ARC_INFEASIBLE_STALL_SENTINEL,
-                    "a run of refusals must halt through the infeasible-streak checkpoint"
-                );
-                sentinel_fired = true;
-                break;
-            }
-        }
+    // Each refusal surfaces as a recoverable error that still names its reason.
+    // The last is proposed by a step whose model promised nothing.
+    for predicted_decrease in [ADAPTING_DECREASE, ADAPTING_DECREASE, NO_MODEL_DECREASE] {
+        let err = SecondOrderObjective::eval_hessian(&mut bridge, &separating)
+            .expect_err("a refused trial must not return a finite sample");
+        assert!(
+            err.is_recoverable() && err.message().contains("planted refusal at a separating trial"),
+            "the refusal's reason must reach the optimizer: {}",
+            err.message()
+        );
+        report_refused_trial_3018(&ledger, predicted_decrease);
     }
-    assert!(
-        sentinel_fired,
-        "ARC bridge must halt after {} consecutive refused trials",
-        COST_STALL_WINDOW
+    assert_eq!(
+        SecondOrderObjective::eval_hessian(&mut bridge, &separating)
+            .expect_err("the stalled refusal must halt ARC")
+            .into_message(),
+        ARC_INFEASIBLE_STALL_SENTINEL,
+        "a stalled refusal must halt through the infeasible checkpoint"
     );
     let published = exit.lock().unwrap().take().expect("best iterate published");
     assert_eq!(published.rho, feasible_rho);
@@ -3704,7 +3755,6 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
             value_probe_cache: Vec::new(),
             cost_stall: None,
             cost_stall_bounds: None,
-            consecutive_probe_refusals: 0,
             accepted_steps: Arc::default(),
             pending_first_order: Vec::new(),
             incumbent: None,
@@ -3750,31 +3800,31 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
 #[test]
 fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
-    guard.observe_seed(&seed, 10.0, 5.0e-4);
+    guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), 5.0e-4);
 
     let separating_probe = array![-10.0, -10.0];
     assert!(
         matches!(
-            guard.observe_infeasible(&separating_probe),
+            guard.observe_infeasible(&separating_probe, ADAPTING_DECREASE),
             CostStallVerdict::Continue
         ),
-        "first infeasible probe should only start the streak"
+        "a refusal whose model promised a resolvable decrease reaches no verdict"
     );
     assert!(
         matches!(
-            guard.observe_infeasible(&separating_probe),
+            guard.observe_infeasible(&separating_probe, ADAPTING_DECREASE),
             CostStallVerdict::Continue
         ),
-        "second infeasible probe should still be below the window"
+        "nor does a second one"
     );
     assert!(
         matches!(
-            guard.observe_infeasible(&separating_probe),
+            guard.observe_infeasible(&separating_probe, NO_MODEL_DECREASE),
             CostStallVerdict::Converged
         ),
-        "third infeasible probe should halt back to the cached seed"
+        "a refusal whose model promised nothing halts back to the cached seed"
     );
 
     let published = exit.lock().unwrap().take().expect("seed best published");
@@ -3791,15 +3841,15 @@ fn arc_cost_stall_guard_uses_cached_initial_sample_as_feasible_best() {
 #[test]
 fn arc_infeasible_stall_refuses_cached_strict_saddle_2316() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit);
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit);
     let seed = array![0.0, 0.0];
-    guard.observe_second_order_seed(&seed, 10.0, 5.0e-2, Some(false));
+    guard.observe_second_order_seed(&seed, 10.0, GUARD_REL_RESOLUTION * 11.0, 5.0e-2, Some(false));
 
     let infeasible = array![-8.0, -8.0];
     for probe in 0..9 {
         assert!(
             matches!(
-                guard.observe_infeasible(&infeasible),
+                guard.observe_infeasible(&infeasible, NO_MODEL_DECREASE),
                 CostStallVerdict::Continue
             ),
             "strict-saddle infeasible probe {probe} must return control to ARC"
@@ -3826,9 +3876,16 @@ fn reduced_hessian_psd_keeps_weak_bound_direction_in_critical_cone_2316() {
     );
 }
 
+/// A BFGS line search probing into an infeasible region halts back at the cached
+/// seed once a probe's linear model promises no more than the seed's resolution
+/// (#3018). The seed's gradient descends toward `+ρ`, so a probe at `ρ` promises
+/// `5e-4·ρ`: the long probes promise far more than the resolution `1.1e-5` and
+/// reach no verdict, and the probe the search shrinks to `ρ = 1e-3` promises
+/// `5e-7` and stalls.
 #[test]
 fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     let seed = array![0.0];
+    let seed_gradient = array![-5.0e-4];
     let problem = OuterProblem::new(1).with_gradient(Derivative::Analytic);
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -3843,8 +3900,8 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &claim_band_config(1.0e-3), exit.clone());
-    guard.observe_seed(&seed, 10.0, 5.0e-4);
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
+    guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), 5.0e-4);
     let lo = array![-10.0];
     let hi = array![10.0];
     let mut bridge = OuterFirstOrderBridge {
@@ -3858,10 +3915,13 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo, hi)),
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
-        incumbent: None,
+        incumbent: Some(OuterIncumbent {
+            rho: seed.clone(),
+            cost: 10.0,
+            gradient: seed_gradient,
+        }),
         stratum_rank: None,
         stratum_probe: None,
     };
@@ -3869,31 +3929,25 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
     // A real BFGS line search probes a *sequence of distinct* trial ρ along its
     // search direction, not one point repeated. The bridge caches each probed ρ
     // bit-exactly (`value_probe_cache`/`same_outer_point`) and short-circuits an
-    // exact repeat WITHOUT re-entering the cost-stall guard — so re-probing a
-    // single fixed ρ would only ever register ONE infeasible observation and the
-    // streak could never fill the window. Walk distinct points (1.0, 2.0, …) so
-    // each probe is a fresh guard observation, exactly as the line search does.
-    let mut sentinel_fired = false;
-    for i in 0..(COST_STALL_WINDOW + 2) {
+    // exact repeat WITHOUT re-entering the cost-stall guard, so walk distinct
+    // points, exactly as the line search does.
+    for i in 0..8 {
         let trial = array![1.0 + i as f64];
-        match ZerothOrderObjective::eval_cost(&mut bridge, &trial) {
-            Ok(cost) => panic!("infeasible probe unexpectedly returned finite cost {cost}"),
-            Err(err) if err.is_recoverable() => {}
-            Err(err) => {
-                let message = err.into_message();
-                assert_eq!(
-                    message, COST_STALL_CONVERGED_SENTINEL,
-                    "BFGS infeasible-probe halt must use the shared cost-stall sentinel"
-                );
-                sentinel_fired = true;
-                break;
-            }
-        }
+        let err = ZerothOrderObjective::eval_cost(&mut bridge, &trial)
+            .expect_err("an infeasible probe must not return a finite cost");
+        assert!(
+            err.is_recoverable(),
+            "probe at ρ = {} promised a resolvable decrease and must not stop BFGS: {}",
+            trial[0],
+            err.message()
+        );
     }
-    assert!(
-        sentinel_fired,
-        "BFGS bridge must halt after {} consecutive infeasible probes when a finite seed is cached",
-        COST_STALL_WINDOW
+    let halt = ZerothOrderObjective::eval_cost(&mut bridge, &array![1.0e-3])
+        .expect_err("an infeasible probe must not return a finite cost");
+    assert_eq!(
+        halt.into_message(),
+        COST_STALL_CONVERGED_SENTINEL,
+        "BFGS infeasible-probe halt must use the shared cost-stall sentinel"
     );
     let published = exit.lock().unwrap().take().expect("seed best published");
     assert_eq!(published.rho, seed);
@@ -3905,9 +3959,9 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
 #[test]
 fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let stale_seed = array![0.0, 0.0];
-    guard.observe_seed(&stale_seed, 1.0, 2.0);
+    guard.observe_seed(&stale_seed, 1.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(1.0)), 2.0);
 
     // Genuine near-separable case: the REML criterion decreases monotonically
     // toward the λ→0 lower bound, so the bound probe carries a cost AT OR BELOW
@@ -3915,7 +3969,7 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
     // a converged verdict — superseding the (non-stationary, higher raw-cost)
     // seed.
     let boundary_probe = array![-10.0, -10.0];
-    let verdict = guard.observe_constrained_stationary(&boundary_probe, 0.5, 0.0, true, None);
+    let verdict = guard.observe_constrained_stationary(guard_sample(&boundary_probe, 0.5, 0.0, None), NO_MODEL_DECREASE);
     assert!(
         matches!(verdict, CostStallVerdict::Converged),
         "a finite constrained-stationary separation probe should halt immediately"
@@ -3948,32 +4002,32 @@ fn constrained_stationary_probe_replaces_stale_nonstationary_best() {
 #[test]
 fn constrained_stationary_probe_keeps_better_incumbent() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     // A good interior fit (the prepass seed): low cost on a flat valley floor,
     // with a residual outer gradient above the claim band, so it is not certified
     // stationary but it is the incumbent every later publish must keep.
     let good_seed = array![3.0, 30.0, 3.0, 3.0];
     let good_seed_grad = 2.5;
-    guard.observe_seed(&good_seed, -231.86, good_seed_grad);
+    guard.observe_seed(&good_seed, -231.86, GUARD_REL_RESOLUTION * (1.0 + f64::abs(-231.86)), good_seed_grad);
 
     // The collapse corner: two axes pinned at the λ→0 lower bound (looks like a
     // separation probe) while two more rail at λ→∞; its cost is hundreds of
     // units WORSE than the incumbent.
     let collapse_corner = array![30.0, 29.95, -30.0, -30.0];
     let verdict =
-        guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
+        guard.observe_constrained_stationary(guard_sample(&collapse_corner, 587.84, 0.0, None), NO_MODEL_DECREASE);
 
     // The probe regresses, so the guard must NOT halt-and-publish it as the
-    // optimum on this single observation; it folds in as an ordinary
-    // non-improving step (the window has not yet filled).
+    // optimum; it folds in as an ordinary stalled step, judged at the GOOD
+    // incumbent. That incumbent's residual is above the band, so the verdict is
+    // an escape (#3018: one stalled step reaches a verdict).
     assert!(
-        matches!(verdict, CostStallVerdict::Continue),
+        matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
         "a constrained-stationary probe that regresses the incumbent must not be \
-         adopted as the optimum"
+         adopted as the optimum; the stall it makes is judged at the incumbent"
     );
     // `observe_seed` seeds the shared exit cell with the feasible best (#1371),
-    // so the cell tracks the GOOD incumbent — never the regressing corner —
-    // while the no-improvement window is still filling.
+    // so the cell tracks the GOOD incumbent — never the regressing corner.
     {
         let cell = exit.lock().unwrap();
         let best = cell.as_ref().expect("seed best tracked in exit cell");
@@ -3983,15 +4037,13 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
         );
     }
 
-    // Driving the no-improvement window to its limit ends the window on the GOOD
-    // incumbent, never on the collapse corner. Its residual is above the band, so
-    // the verdict is an escape and the exit cell keeps tracking that incumbent.
-    guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
+    // The same corner again is a replay of that escape, which halts, on the GOOD
+    // incumbent, never on the collapse corner.
     let final_verdict =
-        guard.observe_constrained_stationary(&collapse_corner, 587.84, 0.0, true, None);
+        guard.observe_constrained_stationary(guard_sample(&collapse_corner, 587.84, 0.0, None), NO_MODEL_DECREASE);
     assert!(
-        !matches!(final_verdict, CostStallVerdict::Continue),
-        "the stall window should eventually fill and reach a verdict"
+        matches!(final_verdict, CostStallVerdict::FlatValleyStall { .. }),
+        "a replayed stall at a non-stationary incumbent halts"
     );
     let published = exit
         .lock()
@@ -4019,30 +4071,31 @@ fn constrained_stationary_probe_keeps_better_incumbent() {
 #[test]
 fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     // Best iterate has a HUGE residual gradient (the #1426 |g|≈11 signature),
     // orders of magnitude above the claim band — the inner solve did not converge.
     let stuck_grad = 10.9;
     assert!(
-        stuck_grad > guard.stationarity_band(10.0),
+        stuck_grad > guard.stationarity_band(),
         "test premise: the stuck residual must exceed the certificate band the guard judges by"
     );
-    guard.observe_seed(&seed, 10.0, stuck_grad);
+    guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), stuck_grad);
 
-    // Drive the no-improvement window to the stall via infeasible λ→0 probes,
-    // exactly as the outer loop does when ARC/BFGS keep probing the unpenalized
-    // ridge. The third probe fills the window and reaches the stall verdict.
+    // Drive the guard to the stall via infeasible λ→0 probes, exactly as the
+    // outer loop does when ARC/BFGS keep probing the unpenalized ridge: two
+    // refusals whose model still promised descent reach no verdict, and one whose
+    // model promised nothing stalls (#3018).
     let probe = array![-10.0, -10.0];
     assert!(matches!(
-        guard.observe_infeasible(&probe),
+        guard.observe_infeasible(&probe, ADAPTING_DECREASE),
         CostStallVerdict::Continue
     ));
     assert!(matches!(
-        guard.observe_infeasible(&probe),
+        guard.observe_infeasible(&probe, ADAPTING_DECREASE),
         CostStallVerdict::Continue
     ));
-    let verdict = guard.observe_infeasible(&probe);
+    let verdict = guard.observe_infeasible(&probe, NO_MODEL_DECREASE);
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
         "a cost stall with |g|≈11 ≫ band must NOT be classified as a \
@@ -4050,7 +4103,7 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
         std::mem::discriminant(&verdict)
     );
     // Crucially: no halt was shipped — the optimizer is allowed to continue.
-    // (The exit cell still tracks the running best via `publish_best_so_far`,
+    // (The exit cell still tracks the running best the stall monitor publishes,
     // but the verdict did not request a halt.)
 
     // The escapes are finite: an infeasible probe leaves the incumbent
@@ -4060,10 +4113,10 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
     // that a halt arrives, not when.
     let mut last = verdict;
     for _ in 0..8 {
-        // Re-fill the window each round (each escape reset it).
-        guard.observe_infeasible(&probe);
-        guard.observe_infeasible(&probe);
-        last = guard.observe_infeasible(&probe);
+        // The same three refusals each round, at the same incumbent.
+        guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+        guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+        last = guard.observe_infeasible(&probe, NO_MODEL_DECREASE);
         if matches!(last, CostStallVerdict::FlatValleyStall { .. }) {
             break;
         }
@@ -4074,7 +4127,7 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
          halt (reported non-converged) so the loop terminates"
     );
     assert_eq!(
-        guard.stuck_escapes, 1,
+        guard.stuck_escapes(), 1,
         "infeasible probes leave the incumbent bit-identical, so exactly ONE \
          escape is informative and the rest are provable replays"
     );
@@ -4100,26 +4153,25 @@ fn cost_stall_far_above_tolerance_keeps_descending_not_flat_valley() {
 #[test]
 fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     let stuck_grad = 10.9;
-    guard.observe_seed(&seed, 10.0, stuck_grad);
+    guard.observe_seed(&seed, 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), stuck_grad);
 
     // Walk a MULTI-SHELF descent past the fitted budget of 8 that used to cap
-    // it: each window improves the incumbent, but by less than the relative
-    // no-improvement floor, so the window still fills and each shelf is granted
-    // exactly one escape. That is the trajectory #2253 is about — the Qwen K=1
-    // circle replay whose 7th escape bought a 36-point drop.
+    // it: each trial improves the incumbent, but by less than the two values'
+    // resolutions, so each is a stalled step and is granted an escape (#3018).
+    // That is the trajectory #2253 is about — the Qwen K=1 circle replay whose
+    // 7th escape bought a 36-point drop.
     //
-    // The improvement per trial must sit strictly between two thresholds the
-    // guard already owns, and the whole budget mechanism lives in that gap:
-    //   * above `f64::EPSILON·(1+|best|)` -- the roundoff resolution the guard
-    //     uses to refuse REPEATING an escape that moved nothing at all (the
-    //     geo_latlon pathology: eight escapes fired back to back at a
-    //     bit-identical incumbent, each reopening a full window for nothing);
-    //   * at or below `rel_tol·(1+|best|)` -- the floor above which an
-    //     improvement counts as genuine descent and REPLENISHES the budget,
-    //     which is the second half of this test.
+    // The improvement per trial must sit strictly between two thresholds, and
+    // the whole budget mechanism lives in that gap:
+    //   * above `f64::EPSILON·(1+|best|)`, so the incumbent really moves and no
+    //     escape replays a bit-identical one (the geo_latlon pathology: eight
+    //     escapes fired back to back at a bit-identical incumbent);
+    //   * at or below the resolution, above which an improvement counts as
+    //     genuine descent and REPLENISHES the budget, which is the second half
+    //     of this test.
     // Driving the shelves with infeasible probes instead leaves the incumbent
     // bit-identical, which is precisely the case the guard must cut at escape
     // one; it would measure the pathology, not the subject.
@@ -4139,7 +4191,7 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
         for trial in 0..3 {
             shelf_value -= SUBFLOOR_STEP;
             let rho = array![escape_idx as f64, trial as f64];
-            verdict = guard.observe(&rho, shelf_value, stuck_grad, true);
+            verdict = guard.observe(guard_sample(&rho, shelf_value, stuck_grad, None), NO_MODEL_DECREASE);
         }
         assert!(
             matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
@@ -4152,7 +4204,7 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
     // A trusted, super-floor accepted improvement proves the escapes were
     // productive. This must replenish the consecutive-fruitless budget.
     let descended = array![1.0, -1.0];
-    let descent = guard.observe(&descended, -20.0, stuck_grad, true);
+    let descent = guard.observe(guard_sample(&descended, -20.0, stuck_grad, None), NO_MODEL_DECREASE);
     assert!(
         matches!(descent, CostStallVerdict::Continue),
         "genuine descent must resume the trajectory rather than halt"
@@ -4161,14 +4213,14 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
     // At the next shelf the guard must grant a fresh escape. Without c28e6f9f7
     // the lifetime counter remains exhausted and this is FlatValleyStall.
     assert!(matches!(
-        guard.observe_infeasible(&infeasible_probe),
+        guard.observe_infeasible(&infeasible_probe, ADAPTING_DECREASE),
         CostStallVerdict::Continue
     ));
     assert!(matches!(
-        guard.observe_infeasible(&infeasible_probe),
+        guard.observe_infeasible(&infeasible_probe, ADAPTING_DECREASE),
         CostStallVerdict::Continue
     ));
-    let verdict = guard.observe_infeasible(&infeasible_probe);
+    let verdict = guard.observe_infeasible(&infeasible_probe, NO_MODEL_DECREASE);
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
         "a productive descent must replenish the stuck-stall escape budget (#2253)"
@@ -4185,45 +4237,45 @@ fn cost_stall_productive_descent_replenishes_escape_budget_2253() {
 /// halt. The guard used to halt it directly as a `FlatValleyStall` when its
 /// residual sat within 1.5× of the score-relative term, capped at 5.0; neither
 /// number had a derivation, and the halt ended non-stationary searches. Now the
-/// first filled window grants an escape, exactly as for any residual above the
-/// band, and termination comes from the bit-identity replay cut: the incumbent
-/// did not move, so reopening the window again provably replays it, the guard
-/// halts non-converged, and no continuation licence reopens a proven replay.
+/// first stall grants an escape, exactly as for any residual above the band, and
+/// termination comes from the bit-identity replay cut: the incumbent did not
+/// move and the same trials follow it, so the next stall provably replays the
+/// first, the guard halts non-converged, and no continuation licence reopens a proven replay.
 #[test]
 fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let seed = array![0.0, 0.0];
     let score = -1.0e3;
     // Just above the band the certificate applies (1e-3 here, at every value).
     let valley_grad = 1.2e-3;
     assert!(
-        valley_grad > guard.stationarity_band(score),
+        valley_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
-    guard.observe_seed(&seed, score, valley_grad);
+    guard.observe_seed(&seed, score, GUARD_REL_RESOLUTION * (1.0 + f64::abs(score)), valley_grad);
 
     let probe = array![-10.0, -10.0];
-    guard.observe_infeasible(&probe);
-    guard.observe_infeasible(&probe);
-    let first = guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    let first = guard.observe_infeasible(&probe, NO_MODEL_DECREASE);
     assert!(
         matches!(first, CostStallVerdict::StuckKeepDescending { .. }),
         "a residual above the band is non-stationary and must be granted an escape, \
          not halted on a margin. Got {:?}",
         std::mem::discriminant(&first)
     );
-    guard.observe_infeasible(&probe);
-    guard.observe_infeasible(&probe);
-    let second = guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    let second = guard.observe_infeasible(&probe, NO_MODEL_DECREASE);
     assert!(
         matches!(second, CostStallVerdict::FlatValleyStall { .. }),
-        "the bit-identical incumbent makes the next window a proven replay, which must \
+        "the bit-identical incumbent makes the next stall a proven replay, which must \
          halt. Got {:?}",
         std::mem::discriminant(&second)
     );
     assert!(
-        !guard.license_continuation(),
+        guard.unprogressing_stop().is_some(),
         "no continuation licence may reopen a proven replay"
     );
     let published = exit.lock().unwrap().take().expect("best published");
@@ -4243,22 +4295,22 @@ fn a_stall_modestly_above_the_band_escapes_then_halts_on_the_replay_cut_2817() {
 #[test]
 fn cost_stall_above_score_relative_band_keeps_descending() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-3), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-3), exit.clone());
     let seed = array![3.0, -3.0];
     let score = -6.0e2;
     // Far above the band the certificate applies, and below the fixed 5.0 ceiling
     // that used to halt exactly this stall.
     let descending_grad = 2.0;
     assert!(
-        descending_grad > guard.stationarity_band(score),
+        descending_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
-    guard.observe_seed(&seed, score, descending_grad);
+    guard.observe_seed(&seed, score, GUARD_REL_RESOLUTION * (1.0 + f64::abs(score)), descending_grad);
 
     let probe = array![-10.0, -10.0];
-    guard.observe_infeasible(&probe);
-    guard.observe_infeasible(&probe);
-    let verdict = guard.observe_infeasible(&probe);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    guard.observe_infeasible(&probe, ADAPTING_DECREASE);
+    let verdict = guard.observe_infeasible(&probe, NO_MODEL_DECREASE);
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
         "an interior stall well clear of the certificate's band has feasible \
@@ -4268,8 +4320,8 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
 }
 
 /// #2241, restated by #2817: a stalled walk whose residual projected gradient is
-/// below σ̂/Δ (the window's evaluation-noise scale over the radius its accepted
-/// steps probed) is NOT claimed at the guard. The guard used to certify it
+/// below σ̂/Δ (the evaluation-noise scale of the samples since the last resolved
+/// progress, over the radius its accepted steps probed) is NOT claimed at the guard. The guard used to certify it
 /// through a probe-noise-floor rung. The terminal certificate never applied that
 /// rung, so each such claim was either refused or certified by a band the stall
 /// had not met. σ̂/Δ says how finely the criterion resolves a gradient at this
@@ -4279,25 +4331,25 @@ fn cost_stall_above_score_relative_band_keeps_descending() {
 #[test]
 fn a_stall_inside_its_probe_noise_floor_is_not_claimed_2241() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-9), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
     let residual_grad = 0.5;
     let score = 10.0;
     assert!(
-        residual_grad > guard.stationarity_band(score),
+        residual_grad > guard.stationarity_band(),
         "test premise: the residual sits above the certificate's band"
     );
-    guard.observe_seed(&array![0.0, 0.0], score, residual_grad);
+    guard.observe_seed(&array![0.0, 0.0], score, GUARD_REL_RESOLUTION * (1.0 + f64::abs(score)), residual_grad);
     // Three accepted, trusted iterates with O(1e-3) probe steps whose values
     // scatter by O(1e-3) around the incumbent: no improvement beyond the
-    // relative floor, so the window fills, and σ̂ = median{8e-4, 4e-4, 6e-4} =
+    // resolution, so each is a stalled step, and σ̂ = median{8e-4, 4e-4, 6e-4} =
     // 6e-4 over Δ = 1e-3 gives σ̂/Δ = 0.6 > 0.5 = |g|, the regime the deleted
     // rung certified.
-    guard.observe(&array![1.0e-3, 0.0], score + 8.0e-4, residual_grad, true);
-    guard.observe(&array![2.0e-3, 0.0], score + 4.0e-4, residual_grad, true);
-    let verdict = guard.observe(&array![3.0e-3, 0.0], score + 1.0e-3, residual_grad, true);
+    guard.observe(guard_sample(&array![1.0e-3, 0.0], score + 8.0e-4, residual_grad, None), NO_MODEL_DECREASE);
+    guard.observe(guard_sample(&array![2.0e-3, 0.0], score + 4.0e-4, residual_grad, None), NO_MODEL_DECREASE);
+    let verdict = guard.observe(guard_sample(&array![3.0e-3, 0.0], score + 1.0e-3, residual_grad, None), NO_MODEL_DECREASE);
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
-        "a residual inside the window's noise scale but above the certificate's band \
+        "a residual inside its samples' noise scale but above the certificate's band \
          must be granted an escape, not claimed (#2817). Got {:?}",
         std::mem::discriminant(&verdict)
     );
@@ -4313,7 +4365,7 @@ fn a_stall_inside_its_probe_noise_floor_is_not_claimed_2241() {
 /// `(σ̂/Δ).min(CAP)` the band the guard claimed by ROSE as the search stopped
 /// making progress, from `0.6` to the `1.0` ceiling, and then covered
 /// `|g| = 0.5`. With the claim read off the certificate's band at the incumbent's
-/// value, nothing the window measured about its steps can move that band, so the
+/// value, nothing the stall measured about its steps can move that band, so the
 /// verdict at both radii is the same escape.
 #[test]
 fn collapsed_probe_radius_leaves_the_claim_band_unchanged_2456() {
@@ -4322,13 +4374,13 @@ fn collapsed_probe_radius_leaves_the_claim_band_unchanged_2456() {
     let verdict_at_radius = |radius: f64| {
         let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
         let mut guard =
-            CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-9), exit.clone());
-        guard.observe_seed(&array![0.0, 0.0], score, residual_grad);
+            CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
+        guard.observe_seed(&array![0.0, 0.0], score, GUARD_REL_RESOLUTION * (1.0 + f64::abs(score)), residual_grad);
         // σ̂ = median{8e-4, 4e-4, 6e-4} = 6e-4 over a probed radius Δ = radius.
-        guard.observe(&array![radius, 0.0], score + 8.0e-4, residual_grad, true);
-        guard.observe(&array![2.0 * radius, 0.0], score + 4.0e-4, residual_grad, true);
-        let verdict = guard.observe(&array![3.0 * radius, 0.0], score + 1.0e-3, residual_grad, true);
-        let band = guard.stationarity_band(score);
+        guard.observe(guard_sample(&array![radius, 0.0], score + 8.0e-4, residual_grad, None), NO_MODEL_DECREASE);
+        guard.observe(guard_sample(&array![2.0 * radius, 0.0], score + 4.0e-4, residual_grad, None), NO_MODEL_DECREASE);
+        let verdict = guard.observe(guard_sample(&array![3.0 * radius, 0.0], score + 1.0e-3, residual_grad, None), NO_MODEL_DECREASE);
+        let band = guard.stationarity_band();
         let claimed = exit.lock().unwrap().as_ref().is_some_and(|published| published.converged);
         (std::mem::discriminant(&verdict), band, claimed)
     };
@@ -4390,7 +4442,7 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
         .with_tolerance(1.0e-10)
-        .with_objective_scale(Some(1_200.0));
+        .with_problem_size(1_000, 1);
     let config = problem.config();
     let mut obj = problem.build_objective_with_eval_order(
         (),
@@ -4427,10 +4479,10 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
     );
     result.operator_stop_reason = Some(OperatorTrustRegionStopReason::CostStallFlatValley);
 
-    // The band the certificate will apply, and the rung that produced it. Read
-    // from the helper rather than from the refusal string so this asserts a
-    // value and not a message format.
-    let band = outer_stationarity_band_and_rung_at(&config, score);
+    // The first-order band the ladder starts from, and the rung that produced
+    // it. Read from the helper rather than from the refusal string so this
+    // asserts a value and not a message format.
+    let band = outer_stationarity_band_and_rung(&config);
     assert!(
         matches!(band.source, StationarityBoundSource::SolverBand),
         "the ladder, not the flat-valley constant, must decide this point; got rung {}",
@@ -4455,9 +4507,13 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
         "a constant-gradient objective carrying CostStallFlatValley must be refused, \
          not certified through a score-relative constant",
     );
+    // The declared exact curvature (`H = 0`) lets the ladder widen the solver
+    // band to its curvature-resolvability rung; the residual clears neither, and
+    // the refusal names the derived rung that decided it.
     let message = refusal.to_string();
     assert!(
-        message.contains("rung=solver-band"),
+        message.contains("rung=curvature-resolvability derived_standard=true")
+            && message.contains("NOT STATIONARY"),
         "the refusal must name the rung that decided it (#2688); got: {message}"
     );
 }
@@ -4474,14 +4530,14 @@ fn criterion_flat_halt_is_refused_by_the_ladder_not_rescued_by_a_constant_2458()
 #[test]
 fn probe_noise_floor_capped_never_certifies_steep_point_2241() {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(1.0e-6, 3, &claim_band_config(1.0e-9), exit.clone());
+    let mut guard = CostStallGuard::new(GUARD_TAU, &claim_band_config(1.0e-9), exit.clone());
     let steep_grad = 2.0;
-    guard.observe_seed(&array![0.0, 0.0], 10.0, steep_grad);
+    guard.observe_seed(&array![0.0, 0.0], 10.0, GUARD_REL_RESOLUTION * (1.0 + f64::abs(10.0)), steep_grad);
     // Degenerate 1e-9 probe steps with O(1e-3) value scatter: raw σ̂/Δ ≈ 1e6,
     // which without the cap would "certify" a steep stuck point.
-    guard.observe(&array![1.0e-9, 0.0], 10.0 + 8.0e-4, steep_grad, true);
-    guard.observe(&array![2.0e-9, 0.0], 10.0 + 4.0e-4, steep_grad, true);
-    let verdict = guard.observe(&array![3.0e-9, 0.0], 10.0 + 1.0e-3, steep_grad, true);
+    guard.observe(guard_sample(&array![1.0e-9, 0.0], 10.0 + 8.0e-4, steep_grad, None), NO_MODEL_DECREASE);
+    guard.observe(guard_sample(&array![2.0e-9, 0.0], 10.0 + 4.0e-4, steep_grad, None), NO_MODEL_DECREASE);
+    let verdict = guard.observe(guard_sample(&array![3.0e-9, 0.0], 10.0 + 1.0e-3, steep_grad, None), NO_MODEL_DECREASE);
     assert!(
         !matches!(verdict, CostStallVerdict::Converged),
         "collapsed probe steps must never manufacture a convergence claim at a \
@@ -5259,62 +5315,6 @@ fn finite_outer_eval_reports_gradient_length_mismatch() {
     );
 }
 
-#[test]
-fn run_with_initial_seed_still_considers_generated_candidates() {
-    let generated =
-        crate::seeding::generate_rho_candidates(
-            1,
-            None,
-            &gam_problem::SeedConfig::default(),
-            gam_problem::OrderedRhoBounds::new(-12.0, 12.0).expect("fixture seed domain"),
-        );
-    let valid_seed = generated
-        .first()
-        .expect("seed generator should yield at least one candidate")
-        .clone();
-    let expected_seed = valid_seed.clone();
-    let initial_seed = array![9.0];
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    let problem = OuterProblem::new(1)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_seed_config(seed_config)
-        .with_initial_rho(initial_seed)
-        .with_max_iter(1);
-    let mut obj = problem.build_objective(
-        (),
-        {
-            let valid_seed = valid_seed.clone();
-            move |_: &mut (), theta: &Array1<f64>| {
-                if theta == valid_seed {
-                    Ok(0.0)
-                } else {
-                    Ok(f64::INFINITY)
-                }
-            }
-        },
-        move |_: &mut (), theta: &Array1<f64>| {
-            if theta == valid_seed {
-                Ok(OuterEval {
-                    cost: 0.0,
-                    gradient: Array1::zeros(1),
-                    hessian: HessianValue::Unavailable,
-                    inner_beta_hint: None,
-                })
-            } else {
-                Ok(OuterEval::infeasible(theta.len()))
-            }
-        },
-        None::<fn(&mut ())>,
-        None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
-    );
-    let result = problem
-        .run(&mut obj, "generated seed should remain reachable")
-        .expect("generated seed should still be eligible when an initial seed is provided");
-    assert_eq!(result.rho, expected_seed);
-}
-
 #[derive(Clone, Copy)]
 enum ReactiveDomainMode {
     FiniteAtColdSeed,
@@ -5512,11 +5512,6 @@ fn run_reactive_domain_fixture(
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(array![SEED])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .with_max_iter(4);
     let mut objective = ReactiveDomainObjective::new(SEED, mode);
     let result = problem.run(&mut objective, "reactive-domain-entry fixture");
@@ -5669,14 +5664,6 @@ fn model_upper_mask_audit_eager_eval(
     )
 }
 
-fn one_seed_config() -> gam_problem::SeedConfig {
-    gam_problem::SeedConfig {
-        max_seeds: 1,
-        seed_budget: 1,
-        ..Default::default()
-    }
-}
-
 fn record_other_model_upper_bound(upper: f64) {
     let other_model = OuterConfig {
         model_domain_bounds: Some((array![-10.0], array![upper])),
@@ -5694,9 +5681,7 @@ fn lower_model_rail_singleton_search_preserves_derivative_in_screening_and_mint_
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(array![-5.0], array![5.0])
-        .with_initial_rho(array![-5.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(one_seed_config());
+        .with_initial_rho(array![-5.0]);
     let mut objective = problem.build_objective_with_eval_order(
         ModelUpperMaskAudit::default(),
         model_upper_mask_audit_cost,
@@ -5807,9 +5792,7 @@ fn model_upper_rail_masks_derivative_in_screening_and_mint_2514() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Dense)
         .with_bounds(array![-5.0], array![5.0])
-        .with_initial_rho(array![5.0])
-        .with_screen_initial_rho(false)
-        .with_seed_config(one_seed_config());
+        .with_initial_rho(array![5.0]);
     let mut objective = problem.build_objective_with_eval_order(
         ModelUpperMaskAudit::default(),
         model_upper_mask_audit_cost,
@@ -5910,11 +5893,6 @@ fn custom_box_and_seed_are_intersected_with_both_objective_faces() {
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-1_000.0], array![1_000.0])
         .with_initial_rho(array![-900.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        })
         .with_max_iter(1);
     let mut objective = ReactiveDomainObjective::new(0.125, ReactiveDomainMode::FiniteAtColdSeed);
     drop(problem.run(&mut objective, "two-sided objective-domain intersection"));
@@ -6057,95 +6035,6 @@ fn reactive_domain_entry_keeps_unrepairable_seed_as_typed_refusal() {
     );
 }
 
-/// #2080 — the continuation's COLD ENTRY leg is a constant of the problem, so
-/// the seed cascade must evaluate it ONCE, not once per seed.
-///
-/// `ContinuationPath::step` pins the entering leg at `s = 1`, and `s = 1` is
-/// bitwise the legal upper box for rho and the contract's literal entry state
-/// for the scalars (`literal_endpoint_bits_survive_without_affine_rounding`
-/// pins the rho half); the walk is opened with an empty warm start. None of the
-/// three depends on the seed, so if that leg refuses for one seed it refuses
-/// identically for every other one. Measured on the real fixture before this
-/// gate existed (#2599's K=2 determinism test): four attempts, 247 of 248 log
-/// lines byte-identical across the seed blocks, the sole difference being the
-/// seed index in the refusal message — 1577 s of wall spent replaying one
-/// evaluation.
-///
-/// `NeverOpens` never establishes finite evidence, so every walk dies on the
-/// entering leg and each walk installs exactly one scalar state: the entry one.
-/// Counting those installs therefore counts WALKS, which is the quantity this
-/// change is about. The test also pins what must NOT change — every seed is
-/// still attempted, still rejected, still individually reported — so a future
-/// edit cannot satisfy the count by shortening the cascade instead.
-#[test]
-fn cold_entry_leg_is_evaluated_once_across_the_whole_seed_cascade_2080() {
-    const SEED: f64 = 0.125;
-    let problem = OuterProblem::new(1)
-        .with_gradient(Derivative::Analytic)
-        .with_hessian(DeclaredHessianForm::Unavailable)
-        .with_initial_rho(array![SEED])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 4,
-            seed_budget: 4,
-            ..Default::default()
-        })
-        .with_max_iter(4);
-    let mut objective = ReactiveDomainObjective::new(SEED, ReactiveDomainMode::NeverOpens);
-    let error = problem
-        .run(&mut objective, "cold-entry replay fixture")
-        .expect_err("a path that never establishes finite evidence must still refuse");
-    let message = error.to_string();
-
-    // Read the seed count off the refusal rather than assuming the generator
-    // honoured `max_seeds`. If only one seed was ever attempted there is no
-    // cross-seed replay to observe and this test would be asserting nothing.
-    let generated = message
-        .split_once("generated=")
-        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
-        .and_then(|digits| digits.parse::<usize>().ok())
-        .unwrap_or_else(|| panic!("refusal must report a seed count; got: {message}"));
-    assert!(
-        generated >= 2,
-        "this fixture needs at least two generated seeds to test cross-seed replay, \
-         but the cascade generated {generated}; refusal: {message}"
-    );
-
-    let contract = ReactiveDomainObjective::scalar_contract();
-    let entry_installs = objective
-        .installed_scalar_states
-        .iter()
-        .filter(|state| state.bitwise_eq(contract.entry()))
-        .count();
-    assert_eq!(
-        entry_installs, 1,
-        "the cold entry waypoint is seed-independent, so {generated} seeds must share ONE \
-         evaluation of it; the cascade installed the entry scalar state {entry_installs} times"
-    );
-
-    // Coverage that must survive the deduplication: every seed is still
-    // attempted and still refused on its own line, and no seed reaches the
-    // solver on the strength of a replayed verdict.
-    assert_eq!(
-        objective.derivative_evals, 0,
-        "the outer solver must not start without finite exact-seed evidence"
-    );
-    let replays = message.matches("(replayed:").count();
-    assert_eq!(
-        replays,
-        generated - 1,
-        "every seed after the first must be answered by the recorded entry verdict; \
-         got {replays} replays for {generated} seeds. Refusal: {message}"
-    );
-    assert!(
-        message.contains("reactive domain entry refused"),
-        "the replayed verdict must still be the typed entry refusal: {message}"
-    );
-    assert!(
-        objective.checkpoint_domain_open.is_none(),
-        "typed refusal must not leak an active waypoint transaction"
-    );
-}
-
 /// #979: the generic gradient-residue floor and a caller's strict local-minimum
 /// requirement answer different questions. A floor-cleared raw negative Hessian
 /// may mint for a generic objective, but must not satisfy a mode selector that
@@ -6242,12 +6131,9 @@ fn strict_curvature_requirement_does_not_reinterpret_floor_clearance_as_psd() {
 
 #[test]
 fn run_indefinite_analytic_seed_stays_on_arc_and_its_declared_curvature_is_measured() {
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![0.0])
         .with_max_iter(1);
     let mut obj = problem.build_objective(
@@ -6338,12 +6224,9 @@ fn run_seed_materialization_failure_surfaces_arc_error_verbatim() {
     // verbatim — there is no lateral demote to BFGS+BfgsApprox that would
     // silently discard the analytic outer Hessian, and no budget retry
     // (#2817). Hence the runner returns the original Err.
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![0.0])
         .with_max_iter(1);
     let mut obj = problem.build_objective(
@@ -6386,29 +6269,19 @@ fn run_nonconverged_arc_returns_typed_checkpoint_without_a_budget_retry() {
     // We use a quartic `cost = SCALE·(x − OFFSET)^4` from `initial_rho = [5.0]`
     // with `max_iter = 1`, which no seed can finish.
     //
-    // OFFSET is what makes the subject reachable, and it is not cosmetic. The
-    // seed budget bounds how many seeds are STARTED SPECULATIVELY, not how many
-    // may be tried: `should_start_next_seed` keeps going while no candidate has
-    // certified, because a fit whose budgeted seeds all fail should try the rest
-    // rather than refuse. So with a plain `x^4` the cascade walks past the
-    // exhausted `[5.0]` ladder to the always-injected neutral baseline `[0.0]`,
-    // which is the EXACT global minimum of `x^4` — it certifies at iteration 0,
-    // the run returns `Ok`, and the refusal this test exists to observe never
-    // happens. Putting the optimum at ½ leaves it stationary at NO
-    // generated candidate (they are integers), so every seed exhausts its budget
-    // and the runner must produce the typed checkpoint. SCALE keeps the residual
-    // gradient far above the stationarity band after the cascade, so the verdict
-    // cannot turn on how close a seed happened to land.
+    // The search runs from its one start `[5.0]`; there is no further seed to
+    // fall back on. OFFSET puts the optimum at ½ so no integer start (including
+    // the neutral baseline `[0.0]` a derived start would pick) is the exact
+    // minimum and certifies at iteration 0; the single budgeted iteration must
+    // exhaust and the runner must produce the typed checkpoint. SCALE keeps the
+    // residual gradient far above the stationarity band after that iteration,
+    // so the verdict cannot turn on how close the step happened to land.
     const OFFSET: f64 = 0.5;
     const SCALE: f64 = 1.0e6;
-    let mut seed_config = gam_problem::SeedConfig::default();
-    seed_config.seed_budget = 1;
-    seed_config.risk_profile = gam_problem::SeedRiskProfile::Gaussian;
     let (_d, session) = tmp_cache_session("nonconverged-arc-cache");
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Either)
-        .with_seed_config(seed_config)
         .with_initial_rho(array![5.0])
         .with_max_iter(1)
         .with_cache_session(Arc::clone(&session));
@@ -6445,11 +6318,10 @@ fn run_nonconverged_arc_returns_typed_checkpoint_without_a_budget_retry() {
     );
 }
 
-// The seed cascade: keep-best / parsimony ranking, Gaussian multistart,
-// expensive-seed screening and its cap ladder, the seed budget, and seed
-// projection before validation. Split out for the source-file length budget.
-#[path = "run_plan_seed_cascade_tests.rs"]
-mod run_plan_seed_cascade_tests;
+// The one derived outer start: a single trajectory, the start's provenance, and
+// seed projection before validation. Split out for the source-file length budget.
+#[path = "run_plan_single_start_tests.rs"]
+mod run_plan_single_start_tests;
 
 // #2953: the typed refusal that reports a declined certified optimum, and the continuation
 // that publishes in its place.
@@ -6501,7 +6373,7 @@ mod run_plan_stopped_run_2953_tests;
 /// custom-family effective-df ceiling once emitted an upper bound below
 /// `rho_lower_bound`, inverting the box, and `f64::clamp(min, max)` with
 /// `min > max` then panicked inside `project_to_bounds` and escaped as an opaque
-/// "panicked inside Rust boundary" `GamError` across the FFI. The projection no
+/// "panicked inside Rust boundary" `GamfitError` across the FFI. The projection no
 /// longer panics, so an inverted box would instead place seeds outside it; the
 /// runner rejects any such box up front, before a seed is projected against it.
 #[test]
@@ -6512,12 +6384,7 @@ fn inverted_rho_box_is_a_typed_error_not_a_clamp_panic_2370() {
         .with_initial_rho(array![0.0])
         // lower (-10) strictly ABOVE upper (-11.855…): the exact inversion the
         // effective-df ceiling produced for a binomial flexible_link fit.
-        .with_bounds(array![-10.0], array![-11.855421824787882])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_bounds(array![-10.0], array![-11.855421824787882]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
@@ -6555,12 +6422,7 @@ fn pinned_equal_rho_bounds_are_accepted_2370() {
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_initial_rho(array![2.0])
-        .with_bounds(array![2.0], array![2.0])
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            ..Default::default()
-        });
+        .with_bounds(array![2.0], array![2.0]);
     let mut obj = problem.build_objective(
         (),
         move |_: &mut (), rho: &Array1<f64>| Ok(0.5 * rho[0] * rho[0]),
@@ -6628,3 +6490,8 @@ mod arc_rejected_trials_3017_tests;
 // two evaluations it compares, not a relative floor (#3018).
 #[path = "cost_stall_objective_band_3018_tests.rs"]
 mod cost_stall_objective_band_3018_tests;
+
+// A run whose probes are refused ends on the refused step's own linear model,
+// not on a count of refusals (#3219).
+#[path = "probe_refusal_derived_bound_3219_tests.rs"]
+mod probe_refusal_derived_bound_3219_tests;

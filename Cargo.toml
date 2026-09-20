@@ -64,16 +64,18 @@ members = [
     "crates/gam-pyffi",
     "crates/gam-runtime",
     "crates/gam-test-support",
+    "crates/gam-build-identity",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 # This exact optimizer revision includes the projected-Wolfe bound-kink
 # repair, exact PSD trust-region subproblem, and true Armijo recovery used by
-# GAM, and exports the box projection and KKT-projected gradient the outer
-# bridges call. Pinning the source commit makes the line-search semantics
+# GAM, exports the box projection and KKT-projected gradient the outer
+# bridges call, and reports each refused trial's model decrease the outer
+# cost-stall rule judges (#3018). Pinning the source commit makes the line-search semantics
 # reproducible.
-opt = { version = "=0.9.0", git = "https://github.com/SauersML/opt.git", rev = "3b58e325c0c1f9e48cde80d223a9cc12ab5ad7db" }
+opt = { version = "=0.9.0", git = "https://github.com/SauersML/opt.git", rev = "4053fcb6b7567b05fd1dee199fe8e2e43e6f1315" }
 # This general-mcmc revision adds GenericNUTS::run_adaptive, the open-ended
 # warmup gam-inference samples with. It is the one pin for every crate here.
 general-mcmc = { version = "=0.10.1", git = "https://github.com/SauersML/general-mcmc.git", rev = "adc78bb049a81da80089330f9db43d8a45d8ed2d", default-features = false }

@@ -9,8 +9,8 @@ point (the *unweighted* across-level average), and ``Model.check`` reported
 ``ok=True`` — the exact defect #2102 documented, on a sibling construction its fix
 never reached.
 
-Root cause: ``factor(g)`` is a FIXED categorical factor (R ``factor()`` / patsy
-``C()`` convention), not a random-effect alias. On seen levels it fits identically
+Root cause: ``factor(g)`` names the categorical level effect of a column seen in
+training, not a held-out-group random effect. On seen levels it fits identically
 to the bare ``+ g`` factor (both are penalized categorical blocks); only the
 unseen-level policy differed. The fix carries that policy on
 ``ParsedTerm::RandomEffect`` — ``factor()`` => strict, ``group()``/
