@@ -445,21 +445,28 @@ fn streaming_gradient_is_affine_in_the_derivative_bundle_second_moment_2933() {
         "premise: the bundle carries several vectors to average; it carries {}",
         rows.len()
     );
+    // The two sides sum the same terms in different orders: each gradient reduces
+    // over the `n` data rows, and the mean adds `r` per-vector gradients. The
+    // first-order bound on reordering a sum of `n + r` terms is `(n + r)·ε` times
+    // the largest magnitude summed.
     let count = rows.len() as f64;
+    let n_rows = 256.0;
     for coordinate in 0..full.len() {
         let mean = rows.iter().map(|row| row[coordinate]).sum::<f64>() / count;
         let magnitude = rows
             .iter()
             .map(|row| row[coordinate].abs())
             .fold(full[coordinate].abs(), f64::max);
-        eprintln!(
-            "F29 affinity coord {coordinate}: full={:.17e} mean={mean:.17e} diff={:.3e} scale={magnitude:.3e} r={}",
+        let tolerance = (n_rows + count) * f64::EPSILON * magnitude;
+        let gap = (full[coordinate] - mean).abs();
+        assert!(
+            gap <= tolerance,
+            "coordinate {coordinate}: gradient on the bundle {:.17e} differs from the mean \
+             of its {} per-vector gradients {mean:.17e} by {gap:.3e} > {tolerance:.3e}",
             full[coordinate],
-            (full[coordinate] - mean).abs(),
             rows.len()
         );
     }
-    panic!("measure");
 }
 
 /// #2515 blocker 3 — WHICH assembly the stale-pair guard is comparing.
