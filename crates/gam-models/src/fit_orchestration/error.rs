@@ -315,6 +315,15 @@ impl WorkflowError {
                     .to_string(),
             ),
             Self::Data(source) => source.advice(),
+            // A fit failure's advice is its decisive engine error's, read the
+            // way the Python boundary reads it (`fit_failure_to_pyerr`), so the
+            // CLI `help:` line and the Python message cannot disagree (#2470).
+            Self::Fit(failure) => failure.estimation_error().and_then(EstimationError::advice),
+            // The certification refit's failure decides the category; it
+            // decides the remediation too.
+            Self::SpatialUnderresolved { refit_failure, .. } => {
+                refit_failure.as_deref().and_then(Self::advice)
+            }
             _ => None,
         }
     }
@@ -938,6 +947,58 @@ mod fit_failure_tests {
             failure.estimation_error(),
             Some(EstimationError::StartupSeedsRefused(_))
         ));
+    }
+
+    /// The CLI prints `WorkflowError::advice` as its `help:` line; the Python
+    /// boundary appends the fit failure's estimation-error advice. A fit failure
+    /// must carry the same remediation through both.
+    #[test]
+    fn a_fit_failure_carries_its_engine_advice_through_the_workflow_boundary() {
+        let separation = EstimationError::PerfectSeparationDetected {
+            iteration: 3,
+            max_abs_eta: 1.0e3,
+        };
+        let expected = separation.advice().expect("separation advice");
+        let boundary = WorkflowError::from(FitFailure::from(separation));
+        assert!(matches!(boundary, WorkflowError::Fit(_)), "{boundary}");
+        assert_eq!(boundary.advice().as_deref(), Some(expected.as_str()));
+
+        let wrapped =
+            WorkflowError::from(FitFailure::from(CustomFamilyError::OuterSmoothingFailed {
+                reason: "outer smoothing optimization failed".to_string(),
+                last_refusal: None,
+                search_inner_refusal: None,
+                outer_error: Arc::new(EstimationError::ModelIsIllConditioned {
+                    condition_number: 1e18,
+                }),
+            }));
+        let advice = wrapped.advice().expect("custom-family fit failure advice");
+        assert!(advice.contains("collinear"), "{advice}");
+
+        let refit = WorkflowError::SpatialUnderresolved {
+            term: "s(x)".to_string(),
+            current_resolution: "k=10".to_string(),
+            attempted_resolution: "k=20".to_string(),
+            reason: "refit failed".to_string(),
+            refit_failure: Some(Box::new(WorkflowError::from(FitFailure::from(
+                EstimationError::ModelIsIllConditioned {
+                    condition_number: 1e18,
+                },
+            )))),
+        };
+        assert!(
+            refit
+                .advice()
+                .is_some_and(|advice| advice.contains("collinear"))
+        );
+
+        assert!(
+            WorkflowError::from(FitFailure::from(EstimationError::InvalidInput(
+                "bad weights".to_string()
+            )))
+            .advice()
+            .is_none()
+        );
     }
 
     /// A CTN prefit whose outer search declined a certified optimum and certified nothing
