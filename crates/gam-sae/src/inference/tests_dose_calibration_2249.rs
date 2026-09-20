@@ -217,7 +217,6 @@ mod tests {
             top_k: None,
             threshold: 0.0,
             seed_refine_routing: refine_routing,
-            seed_refine_random_state: 0,
             fit_config: SaeFitConfig::default(),
             temperature_schedule: None,
             fisher_metric: Some(dummy_metric),

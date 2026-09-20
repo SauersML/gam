@@ -7,9 +7,15 @@
 //! that the second one traverses the image twice. That is precisely the
 //! multi-preimage hazard the encode path's uniqueness claim cannot see.
 
+use std::sync::Arc;
+
 use ndarray::Array2;
 
-use super::embeddedness::{certify_periodic_decoder_embeddedness, AtomEmbeddednessCertificate};
+use super::atom::{SaeAtomBasisKind, SaeManifoldAtom};
+use super::embeddedness::{
+    certify_periodic_decoder_embeddedness, periodic_atom_embeddedness, AtomEmbeddednessCertificate,
+};
+use crate::basis::{PeriodicHarmonicEvaluator, SaeBasisEvaluator};
 
 /// Build a periodic decoder in the `PeriodicHarmonicEvaluator` column layout:
 /// row `0` is the constant, rows `2h−1` / `2h` are the `sin`/`cos` coefficients
@@ -162,4 +168,88 @@ fn even_row_count_is_rejected_as_a_layout_error() {
     let err = certify_periodic_decoder_embeddedness(b.view())
         .expect_err("even row counts are not the periodic harmonic layout");
     assert!(err.contains("odd row count"), "unexpected message: {err}");
+}
+
+#[test]
+fn rank_reduced_atom_is_certified_on_its_full_width_decoder() {
+    // #3514 — a #1117 rank-reduced periodic atom stores `B̃ = QᵀB` (`r × p`) in
+    // an eigenvector frame whose rows MIX harmonics. The atom below decodes the
+    // unit circle `m(t) = (cos 2πt, sin 2πt)` on a two-harmonic inner basis
+    // (`M = 5`), reduced to `r = 3` by a map `Q` whose third column mixes the
+    // constant with `sin 4πt`. The reduced block has an odd row count, so read
+    // as a harmonic decoder it would be certified as the degenerate segment
+    // `(sin 2πt, 0)` — the unit circle would be refused. The certificate must
+    // read the full-width `Q·B̃`, the curve the atom actually draws.
+    let eval = PeriodicHarmonicEvaluator::new(5).expect("two-harmonic evaluator");
+    let train_t = Array2::from_shape_vec((7, 1), vec![0.03, 0.17, 0.29, 0.44, 0.58, 0.71, 0.89])
+        .expect("train phases");
+    let (phi, jac) = eval.evaluate(train_t.view()).expect("evaluate inner basis");
+    let circle = decoder(2, 2, &[(1, vec![0.0, 1.0], vec![1.0, 0.0])]);
+    let mut penalty = Array2::<f64>::zeros((5, 5));
+    for i in 1..5 {
+        penalty[[i, i]] = 1.0;
+    }
+    let mut atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "circle",
+        SaeAtomBasisKind::Periodic,
+        1,
+        phi,
+        jac,
+        circle.clone(),
+        penalty,
+    )
+    .expect("periodic atom")
+    .with_basis_second_jet(Arc::new(eval));
+
+    // Orthonormal columns `e₁`, `e₂`, `(e₀ + e₃)/√2`; the circle's decoder lies
+    // in their span, so `Q·QᵀB = B` exactly.
+    let mut q = Array2::<f64>::zeros((5, 3));
+    q[[1, 0]] = 1.0;
+    q[[2, 1]] = 1.0;
+    q[[0, 2]] = std::f64::consts::FRAC_1_SQRT_2;
+    q[[3, 2]] = std::f64::consts::FRAC_1_SQRT_2;
+    atom.reduce_basis_to_subspace(&q).expect("rank reduction");
+    assert_eq!(
+        atom.decoder_coefficients().nrows(),
+        3,
+        "the reduced block has an odd row count — the case that used to be misread"
+    );
+
+    let full = atom.full_width_decoder();
+    for i in 0..5 {
+        for j in 0..2 {
+            assert!(
+                (full[[i, j]] - circle[[i, j]]).abs() < 1.0e-14,
+                "Q·B̃ must reproduce the in-span decoder at ({i}, {j})"
+            );
+        }
+    }
+
+    let cert = periodic_atom_embeddedness(&atom)
+        .expect("certificate")
+        .expect("a d = 1 periodic atom always gets a certificate");
+    assert_eq!(
+        cert.harmonics, 2,
+        "harmonics count the INNER basis, not the reduced rank"
+    );
+    assert!(
+        cert.embedded,
+        "the unit circle must certify after rank reduction: certified_min={} grid_min={}",
+        cert.certified_min, cert.grid_min
+    );
+    let direct = certify(&circle);
+    assert!(
+        (cert.certified_min - direct.certified_min).abs() < 1.0e-12,
+        "reduced-atom certificate {} must equal the full-width decoder's {}",
+        cert.certified_min,
+        direct.certified_min
+    );
+
+    // The misread the fix removes: the raw reduced block, taken as a harmonic
+    // decoder, is a segment and does not certify.
+    let misread = certify(atom.decoder_coefficients());
+    assert!(
+        !misread.embedded,
+        "the reduced block read in harmonic layout is the segment (sin 2πt, 0)"
+    );
 }
