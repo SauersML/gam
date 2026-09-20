@@ -1128,9 +1128,9 @@ pub(crate) fn polygamma_half_shift_gap_stack(
 /// sum of like-signed terms. The recurrence terms and the two leading asymptotic
 /// terms of one order share the gap's sign, and the alternating Bernoulli tail
 /// is below `x⁻² ≤ 1/400` of them, so the result is correct to a few ulps
-/// relative at every `x` and every shift. At `s = ½` the arithmetic is the
-/// half-shift kernel's bit for bit: `½/(x+½)` and `1/(2x+1)` differ by an exact
-/// power of two.
+/// relative at every `x` and every shift. The two fractions use a bounded
+/// smaller-to-larger ratio, so `x+s` need not be representable. The half-shift
+/// kernel reads this same implementation at `s = ½`.
 pub(crate) fn polygamma_shift_gap_stack(
     mut x: f64,
     shift: f64,
@@ -1143,11 +1143,13 @@ pub(crate) fn polygamma_shift_gap_stack(
         out[..orders].fill(f64::NAN);
         return out;
     }
+    if shift == 0.0 {
+        return out;
+    }
     // `δ[m] = (1 + s/x)^{−m} − 1` for `m = 0, …, DELTA_ORDERS`.
     let deltas = |x: f64, top: usize| {
         let mut delta = [0.0; DELTA_ORDERS + 1];
-        let first = -shift / (x + shift);
-        let ratio = x / (x + shift);
+        let (ratio, first) = positive_shift_fractions(x, shift);
         for m in 1..=top {
             delta[m] = ratio * delta[m - 1] + first;
         }
@@ -1209,6 +1211,9 @@ pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
     if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
         return f64::NAN;
     }
+    if shift == 0.0 {
+        return 0.0;
+    }
     let mut recurrence = 0.0;
     let mut small_product_minus_one: f64 = 0.0;
     while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
@@ -1224,8 +1229,7 @@ pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
     }
     recurrence += small_product_minus_one.ln_1p();
     let mut delta = [0.0; 2 * BERNOULLI_EVEN.len()];
-    let first = -shift / (x + shift);
-    let ratio = x / (x + shift);
+    let (ratio, first) = positive_shift_fractions(x, shift);
     for m in 1..delta.len() {
         delta[m] = ratio * delta[m - 1] + first;
     }
@@ -1238,6 +1242,21 @@ pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
     }
     shift * x.ln() + (x + shift - 0.5) * (shift * inverse).ln_1p() - shift + inverse * tail
         - recurrence
+}
+
+// `(x/(x+s), -s/(x+s))` without forming a possibly overflowing sum.
+// The smaller-to-larger ratio is at most one, so both fractions stay resolved.
+#[inline]
+fn positive_shift_fractions(x: f64, shift: f64) -> (f64, f64) {
+    if shift <= x {
+        let ratio = shift / x;
+        let denominator = 1.0 + ratio;
+        (1.0 / denominator, -ratio / denominator)
+    } else {
+        let ratio = x / shift;
+        let denominator = 1.0 + ratio;
+        (ratio / denominator, -1.0 / denominator)
+    }
 }
 
 const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
@@ -2823,5 +2842,27 @@ mod contraction_symmetry_tests {
             "full_nest",
         );
         gate.finish();
+    }
+}
+
+#[cfg(test)]
+mod shift_gap_extreme_tests {
+    use super::*;
+
+    #[test]
+    fn finite_arguments_keep_the_gap_when_their_sum_overflows() {
+        let gap = polygamma_shift_gap_stack(1.0e308, 1.0e308, 2);
+        assert!((gap[0] - 2.0_f64.ln()).abs() < 1.0e-14);
+        // At this scale the asymptotic remainder is unrepresentably small:
+        // psi_1(2x)-psi_1(x) = -1/(2x) to f64 rounding.
+        assert!((gap[1] / -5.0e-309 - 1.0).abs() < 1.0e-14, "{gap:?}");
+    }
+
+    #[test]
+    fn zero_shift_is_exact_even_at_subnormal_arguments() {
+        for x in [f64::from_bits(1), f64::MIN_POSITIVE, 1.0, 1.0e308] {
+            assert_eq!(polygamma_shift_gap_stack(x, 0.0, 5), [0.0; 5]);
+            assert_eq!(ln_gamma_shift_gap(x, 0.0), 0.0);
+        }
     }
 }
