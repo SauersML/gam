@@ -32,7 +32,7 @@ use gam_solve::inference::alo::{
     compute_multiblock_alo,
 };
 use gam_solve::model_types::UnifiedFitResult;
-use gam_spec::{GlmLikelihoodSpec, LinkFunction};
+use gam_spec::GlmLikelihoodSpec;
 use gam_terms::basis::BasisOptions;
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array1, Array2, s};
@@ -890,25 +890,29 @@ fn pullback_saved_coordinate_designs(
     Ok((active_designs, active_ranges))
 }
 
-fn standard_alo_dispersion(
+/// Coefficient-covariance scale for the saved single-block ALO replay.
+///
+/// The saved penalized Hessian is `H = XᵀWX + S_λ` with the replayed IRLS
+/// working weights `W`, so the only dispersion that `H⁻¹` does not already
+/// carry is the one `GlmLikelihoodSpec::coefficient_covariance_scale` restores:
+/// `σ̂²` for the scale-free profiled Gaussian and `1.0` for every family whose
+/// working weight already folds in `1/φ` (Gamma, inverse-Gaussian, fixed-φ
+/// Gaussian, Tweedie, …; see #679). `fit.standard_deviation` is `√φ` for every
+/// scalar-scale family, and the covariance-scale rule consults it only for the
+/// profiled Gaussian.
+fn standard_alo_covariance_scale(
+    likelihood: &GlmLikelihoodSpec,
     standard_deviation: f64,
-    link: LinkFunction,
 ) -> Result<f64, EstimationError> {
-    if link != LinkFunction::Identity {
-        return Ok(1.0);
-    }
-    if !standard_deviation.is_finite() || standard_deviation <= 0.0 {
+    let scale = likelihood
+        .coefficient_covariance_scale(standard_deviation * standard_deviation)
+        .map_err(|error| invalid(format!("saved standard ALO covariance scale: {error}")))?;
+    if !scale.is_finite() || scale <= 0.0 {
         return Err(invalid(format!(
-            "saved standard identity-link ALO requires a positive finite fitted residual standard deviation, got {standard_deviation}"
+            "saved standard ALO requires a positive finite coefficient-covariance scale, got {scale} (fitted sigma={standard_deviation})"
         )));
     }
-    let phi = standard_deviation * standard_deviation;
-    if !phi.is_finite() {
-        return Err(invalid(format!(
-            "saved standard identity-link ALO residual variance is outside f64 range: sigma={standard_deviation}"
-        )));
-    }
-    Ok(phi)
+    Ok(scale)
 }
 
 fn compute_saved_standard_alo(
@@ -1007,7 +1011,7 @@ fn compute_saved_standard_alo(
         &mut working_weights,
         &mut working_response,
     )?;
-    let phi = standard_alo_dispersion(fit.standard_deviation, likelihood.spec.link_function())?;
+    let cov_scale = standard_alo_covariance_scale(&likelihood, fit.standard_deviation)?;
     let (mut active_designs, active_ranges) = pullback_saved_coordinate_designs(
         class,
         geometry.gauge,
@@ -1028,7 +1032,7 @@ fn compute_saved_standard_alo(
         &dense_design,
         &eta,
         &input.offset,
-        phi,
+        cov_scale,
         &working_weights,
         &working_response,
     ))?;
@@ -1046,7 +1050,7 @@ fn compute_saved_standard_alo(
         .map(|standard_error| Array1::from_vec(vec![standard_error * standard_error]))
         .collect::<Vec<_>>();
     // Model-based posterior predictive variance: the scalar path's Bayesian
-    // SE squared (φ·x_iᵀH⁻¹x_i), the same quantity the multi-block core
+    // SE squared (cov_scale·x_iᵀH⁻¹x_i), the same quantity the multi-block core
     // surfaces as diag(A_i) (#2301).
     let predictive_variance = scalar
         .se_bayes
@@ -1057,7 +1061,12 @@ fn compute_saved_standard_alo(
     let mut cook_distance = Array1::<f64>::zeros(n);
     for row in 0..n {
         let deletion = scalar.eta_tilde[row] - eta[row];
-        let cook = phi * working_weights[row] * deletion * deletion;
+        // Cook-type influence Δηᵀ C_i Δη with C_i the row score covariance
+        // (Fisher information), matching the multi-block convention. The
+        // replayed working weight is that Fisher information up to the same
+        // covariance scale the Hessian omits: w_i/σ̂² for the scale-free
+        // profiled Gaussian, w_i itself when W already carries 1/φ.
+        let cook = working_weights[row] / cov_scale * deletion * deletion;
         if !cook.is_finite() || cook < 0.0 {
             return Err(invalid(format!(
                 "saved standard ALO Cook distance is invalid at row {row}: {cook}"
