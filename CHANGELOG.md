@@ -1,5 +1,14 @@
 ## Unreleased
 
+- **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
+  (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
+  point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
+  deleted, and so is `cholesky_logdet_from_col_major`. `GpuMixedPrecisionPolicy` is deleted,
+  since only its `Refinement` variant was ever reachable. `GpuDispatchPolicy` loses seven
+  fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
+  `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
+  `prefer_gpu_factorization_min_p` and `mixed_precision`.
+
 - **Process-monitor CPU average names its real window** (#4083). The `[process-monitor]`
   heartbeat printed every busy-core average as `(avg over 1m00s)` even when a failed
   `/proc/self/stat` read or an early wakeup meant it covered a different span. It now prints
