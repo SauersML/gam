@@ -2665,5 +2665,21 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_ranges",
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_ranges_follow_the_design_intercept_gauge",
+      "crates/gam-inference/src/difference_smooth.rs:fn:random_effect_spec",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:categorical_level_name_for_bits",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:coefficient_provenance_for_state",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:smooth_basis_kind_label",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:smooth_term_column_ranges",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:struct:CoefficientProvenancePayload",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:struct:TermBlock"
+    ],
+    "reason": "#3522: the pyffi-side coefficient provenance and term-block reconstruction and difference_smooth's own random-effect range arithmetic are replaced by the engine-owned TermCollectionLayout, exposed once through gam_inference::coefficient_layout.",
+    "evidence": "crates/gam-inference/src/coefficient_layout.rs builds CoefficientProvenance/TermBlock from frozen_term_collection_layout; difference_smooth reads its random-effect ranges from the same layout; tests coefficient_layout and difference_smooth::tests::random_effect_columns_follow_the_engine_layout* pin the no-intercept layout."
   }
 ]
