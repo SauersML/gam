@@ -178,6 +178,7 @@ __all__ = [
     "equivariant_rho_so2_jvp",
     "equivariant_rho_so3",
     "equivariant_rho_so3_jvp",
+    "evidence_ratio",
     "expected_resolution_budget",
     "extend_model_with_group",
     "extract_reml_score_raw",
@@ -245,7 +246,6 @@ __all__ = [
     "linear_dictionary_transform_ffi",
     "load_joint_event_model",
     "log_e_from_p_value",
-    "log_evidence_ratio",
     "log_loss_from_predictions",
     "loop_holonomy",
     "manifold_ambient_dimension",
@@ -1747,6 +1747,8 @@ def equivariant_rho_so3(omega: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def equivariant_rho_so3_jvp(omega: NDArray[np.float64], domega: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
+def evidence_ratio(model_a: _FittedModel, model_b: _FittedModel) -> float: ...
+
 def expected_resolution_budget(alpha: float, growth_nats_per_obs: float) -> float | None: ...
 
 def extend_model_with_group(model: _FittedModel, request_json: str) -> bytes: ...
@@ -1880,8 +1882,6 @@ def linear_dictionary_transform_ffi(x: NDArray[np.float64], atoms: NDArray[np.fl
 def load_joint_event_model(path: str) -> _JointEventModel: ...
 
 def log_e_from_p_value(p_value: float) -> float: ...
-
-def log_evidence_ratio(model_a: _FittedModel, model_b: _FittedModel) -> float: ...
 
 def log_loss_from_predictions(observed: Sequence[float], predicted_mean: Sequence[float]) -> float: ...
 

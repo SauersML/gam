@@ -2848,5 +2848,14 @@
     ],
     "reason": "#3521: gumbel_temperature_schedule_from_pydict no longer hand-parses the Python dict with its nested `get` helper (which defaulted a geometric rate to 0.9 and silently accepted wrong-typed optional fields); it routes through the single strict Rust schedule descriptor parser shared with the penalty registry's temperature_schedule.",
     "evidence": "The removed item is a function-local helper nested in gumbel_temperature_schedule_from_pydict with no other callers (the 2318 production occurrences are the unrelated common name `get`); covered by gam-pyffi gumbel_temperature_schedule and gam-models descriptors::tests."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "items": [
+      "crates/gam-models/src/inference/saved_summary.rs:fn:saved_models_log_evidence_ratio",
+      "crates/gam-pyffi/src/model/model_ffi.rs:fn:log_evidence_ratio"
+    ],
+    "reason": "#3878: the evidence ratio is exponentiated in Rust; the log-ratio entry points are replaced by saved_models_evidence_ratio and the pyffi evidence_ratio.",
+    "evidence": "PR #3895; Model.evidence_ratio_vs no longer overflows in Python."
   }
 ]

@@ -1065,12 +1065,19 @@ pub fn compare_saved_models(
     gam_solve::evidence::compare_models(candidates)
 }
 
-/// Log Akaike evidence ratio of model `a` over model `b` on the corrected AIC,
-/// `½·(AIC_c(b) − AIC_c(a))`: the pairwise form of [`compare_saved_models`].
-pub fn saved_models_log_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
+/// Akaike evidence ratio of model `a` over model `b` on the corrected AIC,
+/// `exp(½·(AIC_c(b) − AIC_c(a)))`: the pairwise form of
+/// [`compare_saved_models`].
+///
+/// The exponential is rounded by IEEE arithmetic: a ratio above `f64::MAX`
+/// (log gap past ~709.78) is `+inf` and one below the smallest subnormal is
+/// `0`, which are the correctly rounded values of the true ratio. The
+/// `compare_models` table instead reports such a ratio as absent because its
+/// JSON transport cannot carry `inf`.
+pub fn saved_models_evidence_ratio(a: &FittedModel, b: &FittedModel) -> Result<f64, String> {
     let a = comparison_candidate("a".to_string(), saved_model_summary(a)?)?;
     let b = comparison_candidate("b".to_string(), saved_model_summary(b)?)?;
-    gam_solve::evidence::log_evidence_ratio(&a, &b)
+    Ok(gam_solve::evidence::log_evidence_ratio(&a, &b)?.exp())
 }
 
 #[derive(Serialize)]

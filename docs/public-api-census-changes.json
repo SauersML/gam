@@ -4921,5 +4921,13 @@
     },
     "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
     "evidence": "public_api_census.py with this base and the landing commit as head refuses exactly this identity; git grep -w retained_normals finds 0 occurrences under crates, src, tests or python in the head tree."
+  },
+  {
+    "base": "c78ebbfb47498180e00fa0b6721359b1ff02948c",
+    "removed": {
+      "crates/gam-models/src/inference/saved_summary.rs::saved_models_log_evidence_ratio": 1
+    },
+    "reason": "#3878: saved_models_log_evidence_ratio is replaced by saved_models_evidence_ratio, which returns the ratio formed in Rust.",
+    "evidence": "PR #3895."
   }
 ]
