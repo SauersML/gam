@@ -3433,23 +3433,15 @@ pub(crate) fn build_matern_basis_log_kappa_derivativeswithworkspace(
             )?,
         )
     } else {
-        // The builder returns the canonical `[mass, tension, stiffness]` blocks
-        // (plus third-order when the kernel carries it), while the forward build
-        // keeps only the operators `matern_for_smoothness` admits (ν = 1/2 keeps
-        // mass alone, #707). Select each surviving penalty's block by source so
-        // the derivative list is index-aligned with `base.active_penalties`.
-        let (first_blocks, second_blocks) = build_matern_operator_penalty_psi_derivatives(
+        // The helper already gates and selects the forward active operators.
+        build_matern_operator_penalty_psi_derivatives(
             centers.view(),
             length_scale,
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
             aniso,
-        )?;
-        (
-            active_operator_penalty_derivatives(&base.active_penalties, &first_blocks, "Matérn")?,
-            active_operator_penalty_derivatives(&base.active_penalties, &second_blocks, "Matérn")?,
-        )
+        )?
     };
 
     Ok(BasisPsiDerivativeBundle {
