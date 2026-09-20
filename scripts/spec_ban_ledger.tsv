@@ -27,8 +27,6 @@ box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	htt
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	const EFS_MAX_STEP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/outer_entry_helpers.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_GROW_FACTOR	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/state_caches.rs	const IFT_STEP_CAP_SHRINK_FACTOR	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-terms/src/smooth/term_specs.rs	clamp(+-MAX_NUDGE)	https://github.com/SauersML/gam/issues/2902
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
 magic	crates/gam-custom-family/src/covariance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
