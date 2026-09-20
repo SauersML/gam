@@ -683,7 +683,6 @@ impl PirlsResult {
                 inverse_link,
                 &final_eta_owned,
                 y,
-                &self.solveweights.to_owned(),
                 priorweights,
             )?;
             (fw.into(), sc.into(), sd.into())

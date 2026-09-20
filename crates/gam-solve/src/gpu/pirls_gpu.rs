@@ -2834,7 +2834,6 @@ extern "C" __global__ void status_first_ladder(
                             ext.inverse_link,
                             &final_eta,
                             ext.y,
-                            &final_w_solver,
                             ext.priorweights,
                         )
                         .map_err(PirlsGpuLoopError::Geometry)?

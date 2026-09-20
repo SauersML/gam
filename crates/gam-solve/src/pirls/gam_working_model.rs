@@ -999,7 +999,6 @@ impl<'a> GamWorkingModel<'a> {
             &self.link_kind,
             &self.workspace.eta_buf,
             self.y,
-            &self.lastweights,
             self.priorweights,
             &mut self.lasthessian_weights,
             &mut self.lasthessian_c,

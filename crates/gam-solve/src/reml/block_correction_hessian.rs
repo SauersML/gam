@@ -243,7 +243,6 @@ fn displaced_row_curvature(
                 &target.inverse_link,
                 eta,
                 target.y.view(),
-                &Array1::zeros(n),
                 target.prior_weights.view(),
             )?
             .0
@@ -1253,7 +1252,6 @@ mod block_correction_hessian_tests {
                         &inverse_link,
                         &Array1::from_elem(1, eta),
                         Array1::from_elem(1, y).view(),
-                        &Array1::zeros(1),
                         prior.view(),
                     )
                     .expect("observed curvature")

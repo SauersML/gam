@@ -453,7 +453,6 @@ mod linux_impl {
                     input.inverse_link,
                     &final_eta,
                     input.y,
-                    &final_w_solver,
                     input.priorweights,
                 )?
             } else {

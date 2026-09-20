@@ -2383,7 +2383,6 @@ mod tests {
         let mu = eta.mapv(f64::exp);
         let y = array![1.8, 0.7];
         let w = array![2.0, 0.5];
-        let fisher = w.clone();
 
         let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
             &GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
@@ -2393,7 +2392,6 @@ mod tests {
             &InverseLink::Standard(StandardLink::Log),
             &eta,
             y.view(),
-            &fisher,
             w.view(),
         )
         .expect("gamma-log observed curvature should evaluate");
@@ -2600,30 +2598,14 @@ mod tests {
         let y = array![1.0, 0.0, 0.0, 1.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(eta.len());
 
-        // Exact Fisher weights at these represented eta values.
-        let mut fisher = Array1::<f64>::zeros(eta.len());
-        for i in 0..eta.len() {
-            let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta[i])
-                .expect("mixture jet");
-            let mu = jet.mu;
-            let v = mu * (1.0 - mu);
-            fisher[i] = jet.d1 * jet.d1 / v;
-        }
-
         // Post-fix contract: the build SUCCEEDS (no bail) and returns finite
         // arrays even though some rows carry a non-positive observed weight.
-        let (w_obs, c_obs, d_obs) = compute_observed_hessian_curvature_arrays(
-            &likelihood,
-            &link,
-            &eta,
-            y.view(),
-            &fisher,
-            w.view(),
-        )
-        .expect(
-            "binomial mixture observed curvature must tolerate finite indefinite \
-             rows instead of bailing (#1598)",
-        );
+        let (w_obs, c_obs, d_obs) =
+            compute_observed_hessian_curvature_arrays(&likelihood, &link, &eta, y.view(), w.view())
+                .expect(
+                    "binomial mixture observed curvature must tolerate finite indefinite \
+                     rows instead of bailing (#1598)",
+                );
 
         assert!(
             w_obs.iter().all(|w| w.is_finite()),
