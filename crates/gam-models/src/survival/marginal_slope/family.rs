@@ -191,6 +191,11 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
     /// the cache to length-`n`. When `None`, the solver behaves exactly as it
     /// did before the warm-start machinery was added (closed-form rigid seed).
     pub(crate) intercept_warm_starts: Option<Arc<SurvivalInterceptWarmStartCache>>,
+    /// The fit's pool of runtime-sized FLEX jet arenas, drawn on by the
+    /// third-order directional contractions and the order-≤2 timepoint builder.
+    /// An idle arena stays only while the MemoryGovernor admits the bytes it
+    /// retains, and the pool ends with the fit's families (gam#3266).
+    pub(crate) flex_jet_arenas: Arc<FlexJetArenaPool>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
     /// on the unarmed fit's own evidence, through
     /// `fit_custom_family_arming_on_evidence` (#979).
@@ -470,6 +475,22 @@ pub(crate) fn new_intercept_warm_start_cache(n: usize) -> Arc<SurvivalInterceptW
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect(),
     })
+}
+
+/// Reusable FLEX jet arenas whose retained tapes are on the governor's ledger
+/// (gam#3266).
+pub(crate) type FlexJetArenaPool =
+    gam_runtime::resource::GovernedScratchPool<gam_math::jet_scalar::DynamicJetArena>;
+
+/// A fit's FLEX jet arena pool on the process governor. Each arena is charged
+/// at the one chunk its reset keeps, the high-water mark of its tape.
+pub(crate) fn new_flex_jet_arena_pool() -> Arc<FlexJetArenaPool> {
+    Arc::new(gam_runtime::resource::GovernedScratchPool::new(
+        gam_runtime::resource::MemoryGovernor::global().clone(),
+        "survival marginal-slope flex jet arena",
+        gam_math::jet_scalar::DynamicJetArena::new,
+        gam_math::jet_scalar::DynamicJetArena::allocated_bytes,
+    ))
 }
 
 /// FNV-1a 64-bit hash of the joint coefficient slices `(beta_h, beta_w)`.

@@ -698,9 +698,9 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
@@ -2478,10 +2478,19 @@ impl SavedLinkWiggleRuntime {
                 ),
             });
         }
+        Ok(base + &self.contribution(warp_index)?)
+    }
+
+    /// The wiggle's share `B(warp_index)·β` of the link, certified monotone at
+    /// `warp_index`. This is the one evaluation of that share:
+    /// [`Self::apply_with_index`] adds it to the base predictor, and a Gaussian
+    /// location-scale fit publishes it as its wiggle block's state, so the saved
+    /// model reproduces the fit's own mean bit for bit (#3001).
+    pub fn contribution(&self, warp_index: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(warp_index)?;
         let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(base + &xwiggle.dot(&beta_link_wiggle))
+        Ok(xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {

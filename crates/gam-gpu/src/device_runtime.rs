@@ -344,25 +344,6 @@ impl GpuRuntime {
         })
     }
 
-    /// Size-gated [`Self::resolve`] for independent fused row kernels.
-    ///
-    /// Batches below
-    /// [`GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N`] cannot be
-    /// admitted by either the default or any device-calibrated policy. Refuse
-    /// them before availability resolution so a CPU-sized first call does not
-    /// create CUDA contexts and run calibration merely to learn that it should
-    /// stay on the CPU. At and above the universal floor, the concrete
-    /// runtime's calibrated policy remains authoritative.
-    pub fn resolve_if_fused_batch_exceeds_floor(
-        policy: super::GpuPolicy,
-        rows: usize,
-    ) -> Result<Option<&'static Self>, GpuError> {
-        if rows < GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N {
-            return Ok(None);
-        }
-        Self::resolve(policy)
-    }
-
     #[must_use]
     pub fn policy(&self) -> &GpuDispatchPolicy {
         &self.policy
