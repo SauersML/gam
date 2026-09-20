@@ -16,6 +16,7 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+mod gaussian_sufficient_statistics_tests;
 mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
@@ -4801,6 +4802,23 @@ impl CriterionRankDecision {
     }
 }
 
+/// What the observation-row fields of a bundle's `pirls_result` describe.
+///
+/// Every coefficient-space quantity (β̂, `H`, deviance, score, the REML value
+/// and its ρ-derivatives) is exact under both variants. The variants differ
+/// only in whether `final_eta`, `finalmu` and the working response are this
+/// mode's fitted rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BundleRows {
+    /// The rows were realised from the design at this bundle's mode.
+    Observed,
+    /// Fixed-design Gaussian identity: the fit was solved from the
+    /// `XᵀWX`, `XᵀW(y−offset)`, `(y−offset)ᵀW(y−offset)` sufficient
+    /// statistics, and the row fields are the ρ-invariant carrier shared by
+    /// every such solve. Only pure-ρ criterion evaluations may consume it.
+    SufficientStatistics,
+}
+
 /// Holds the state for the outer REML optimization and supplies cost and
 /// gradient evaluations to the `opt` optimizer.
 ///
@@ -4815,6 +4833,10 @@ impl CriterionRankDecision {
 pub(crate) struct EvalShared {
     pub(crate) key: Option<Vec<u64>>,
     pub(crate) pirls_result: Arc<PirlsResult>,
+    /// Whether `pirls_result`'s rows are fitted rows or the sufficient-statistic
+    /// carrier. `obtain_eval_bundle` serves only `Observed` bundles; the pure-ρ
+    /// outer criterion accepts either.
+    pub(crate) rows: BundleRows,
     /// The routing verdict this bundle was built under, carried WITH the
     /// quantities it was decided from (#2465 instance 4). The bundle used to
     /// hold the bare `RemlGeometry` label, so every consumer that reported
@@ -5475,6 +5497,8 @@ impl EvalCacheManager {
         Ok(value)
     }
 
+    /// The cached bundle at `key`, whichever rows it carries; callers that
+    /// read rows check [`EvalShared::rows`].
     pub(crate) fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
         let guard = self
             .current_eval_bundle
