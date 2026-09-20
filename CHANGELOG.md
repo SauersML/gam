@@ -6,7 +6,8 @@
   used to be fitted with a warning whatever the departure cost. The certificate now
   also carries the standard error of its excess anchoring loss `D̂` over the score
   sample the estimated law was built from (the node-level linear, quadratic and
-  third-moment terms of resampling the scores; within 2% of a score bootstrap), and
+  third-moment terms of resampling the scores; 0.92 and 1.02 of a 400-resample score
+  bootstrap's SD on a Gaussian and a skewed score), and
   the declaration is refused when `D̂ > z₁₋α·SE(D̂)` at the conditional-law gate's
   one-sided `α = 10⁻³`. The message gives `D̂`, `SE(D̂)`, the critical value and the
   failed ledger. Exact-Gaussian scores are never refused at that level; a skewed

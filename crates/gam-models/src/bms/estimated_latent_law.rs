@@ -1048,46 +1048,56 @@ mod tests {
     }
 
     /// gam#2968: `SE(D̂)` is the sampling error of `D̂` over the score sample the
-    /// law is estimated from. On a skewed score, where `D̂` is a clear bias and not
-    /// noise, it matches the score bootstrap that rebuilds the law per resample.
+    /// law is estimated from, and matches the score bootstrap that rebuilds the
+    /// law per resample in both of its regimes: on a skewed score, where `D̂` is a
+    /// clear bias and the linear term carries the variance, and on a Gaussian
+    /// score, where `D̂` is noise and the quadratic term carries it.
     #[test]
     fn closed_form_certificate_standard_error_matches_the_score_bootstrap_2968() {
         use rand::{RngExt as _, SeedableRng as _};
         let mut rng = rand::rngs::StdRng::seed_from_u64(2968);
-        let n = 3000;
-        let z = standardised_scores(&mut rng, n, 1.0);
-        let certificate = closed_form_certificate_on(&z, true);
-        let standard_error = certificate.standard_error.expect("second-order certificate");
-        assert!(
-            certificate.excess_kl > 3.0 * standard_error,
-            "fixture invariant: the skewed cell must carry a visible bias, {}",
-            certificate.summary()
-        );
-        assert!(
-            closed_form_certificate_on(&z, false).standard_error.is_none(),
-            "a first-order fold measures no standard error"
-        );
-        let resamples = 400;
-        let mut draws = Vec::with_capacity(resamples);
-        let mut resample = vec![0.0; n];
-        for _ in 0..resamples {
-            for value in resample.iter_mut() {
-                *value = z[rng.random_range(0..n)];
+        for (n, skew) in [(12_000, 1.0), (3000, 0.0)] {
+            let z = standardised_scores(&mut rng, n, skew);
+            let certificate = closed_form_certificate_on(&z, true);
+            let standard_error = certificate.standard_error.expect("second-order certificate");
+            if skew > 0.0 {
+                assert!(
+                    certificate.excess_kl > 3.0 * standard_error,
+                    "fixture invariant: the skewed cell must carry a visible bias, {}",
+                    certificate.summary()
+                );
             }
-            draws.push(closed_form_certificate_on(&resample, false).excess_kl);
+            assert!(
+                closed_form_certificate_on(&z, false).standard_error.is_none(),
+                "a first-order fold measures no standard error"
+            );
+            let resamples = 400;
+            let mut draws = Vec::with_capacity(resamples);
+            let mut resample = vec![0.0; n];
+            for _ in 0..resamples {
+                for value in resample.iter_mut() {
+                    *value = z[rng.random_range(0..n)];
+                }
+                draws.push(closed_form_certificate_on(&resample, false).excess_kl);
+            }
+            let mean = draws.iter().sum::<f64>() / resamples as f64;
+            let bootstrap_sd = (draws.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>()
+                / (resamples - 1) as f64)
+                .sqrt();
+            let ratio = standard_error / bootstrap_sd;
+            eprintln!(
+                "[2968 bootstrap] n={n} skew={skew}: SE(D̂)={standard_error:.4e} bootstrap \
+                 SD={bootstrap_sd:.4e} ratio={ratio:.3} | {}",
+                certificate.summary()
+            );
+            // The ratio's Monte-Carlo error is about 1/√(2·400) = 0.035.
+            assert!(
+                (0.85..=1.15).contains(&ratio),
+                "SE(D̂) = {standard_error:.4e} against the bootstrap SD {bootstrap_sd:.4e} at \
+                 n = {n}, skew {skew}: ratio {ratio:.3} ({})",
+                certificate.summary()
+            );
         }
-        let mean = draws.iter().sum::<f64>() / resamples as f64;
-        let bootstrap_sd = (draws.iter().map(|d| (d - mean) * (d - mean)).sum::<f64>()
-            / (resamples - 1) as f64)
-            .sqrt();
-        let ratio = standard_error / bootstrap_sd;
-        // The ratio's Monte-Carlo error is about 1/√(2·400) = 0.035.
-        assert!(
-            (0.85..=1.15).contains(&ratio),
-            "SE(D̂) = {standard_error:.4e} against the bootstrap SD {bootstrap_sd:.4e}: ratio \
-             {ratio:.3} ({})",
-            certificate.summary()
-        );
     }
 
     /// gam#2968: at the null the refusal holds its level. On exactly Gaussian
