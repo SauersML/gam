@@ -721,7 +721,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
             &z_row,
             reference,
             fit,
-            None,
+            options.observation_prior_weights.as_ref(),
         )?;
         override_band = match (lower, upper) {
             (Some(lower), Some(upper)) => Some((lower, upper)),
@@ -945,11 +945,8 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     &z_row,
                     reference,
                     fit,
-                    // Generic transform posterior-mean band: analytic prior
-                    // weights (#2077) are threaded through the dedicated
-                    // full-uncertainty Gaussian path, not this driver (None ⇒
-                    // unchanged for the families reaching here).
-                    None,
+                    // A weighted Gaussian band carries `σ̂²/w_i` (#2077, #3957).
+                    options.observation_prior_weights.as_ref(),
                 )?;
                 result.observation_lower = obs_lower;
                 result.observation_upper = obs_upper;
@@ -1081,6 +1078,9 @@ pub fn resolve_prediction_request(
                 covariance_mode: request.covariance_mode,
                 include_observation_interval: request.observation_interval,
                 extrapolation_variance: request.extrapolation_variance.clone(),
+                // A curved-link weighted Gaussian band is heteroscedastic in the
+                // prior weight exactly as the identity-link arm below (#3957).
+                observation_prior_weights: request.observation_prior_weights.clone(),
             };
             let prediction = predictor.predict_posterior_mean(input, fit, &options)?;
             let mean_standard_error = prediction.mean_standard_error.ok_or_else(|| {

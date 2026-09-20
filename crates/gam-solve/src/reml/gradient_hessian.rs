@@ -2426,18 +2426,14 @@ impl<'a> RemlState<'a> {
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
                 let jeffreys_link = self.runtime_inverse_link();
-                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                    Some(cached.clone())
-                } else {
-                    Some(std::sync::Arc::new(
-                        Self::build_firth_dense_operator_for_link(
-                            &jeffreys_link,
-                            x_dense.as_ref(),
-                            &pirls_result.final_eta.to_owned(),
-                            self.weights,
-                        )?,
-                    ))
-                }
+                Some(std::sync::Arc::new(
+                    Self::build_firth_dense_operator_for_link(
+                        &jeffreys_link,
+                        x_dense.as_ref(),
+                        &pirls_result.final_eta.to_owned(),
+                        self.weights,
+                    )?,
+                ))
             } else {
                 None
             };
@@ -4545,7 +4541,7 @@ impl<'a> RemlState<'a> {
         // routed dense logged nothing, so `penalized_hessian_too_dense` (a
         // density genuinely measured above the threshold) could not be told from
         // `design_not_sparse`, `constraints_present`,
-        // `firth_bias_reduction_active` or `sparse_stats_failed` — none of
+        // `firth_bias_reduction_active` — none of
         // which measures a density at all.
         // "Which side of SPARSE_HESSIAN_MAX_DENSITY does this design land on"
         // was therefore unanswerable from a log for exactly the shapes where it
@@ -4566,28 +4562,29 @@ impl<'a> RemlState<'a> {
                     key.clone(),
                     rows,
                     decision.clone(),
-                ) {
-                    Ok(bundle) => Ok(bundle),
-                    Err(err) => {
-                        log::debug!(
-                            "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
-                            err
-                        );
+                )? {
+                    Some(bundle) => Ok(bundle),
+                    None => {
+                        // P-IRLS routes its own linear solve and returned its
+                        // mode outside the sparse-native frame, so the sparse
+                        // exact system has no coordinates to be assembled in.
+                        // This is the only way the sparse builder declines. Every
+                        // error it raises (an inner-solve retreat, a non-SPD
+                        // factorization) propagates, so the outer loop sees it
+                        // instead of a second solve on another surface (#3636).
+                        //
                         // The bundle records the geometry it was BUILT with,
                         // and here that is not the routing verdict: the
                         // structural quantities still say sparse was the right
                         // route, so the label must carry the reason it was not
-                        // taken (#2465). A bundle stamped `sparse_exact_spd`
-                        // while holding a dense factorization, or stamped
-                        // `penalized_hessian_too_dense` when the density is
-                        // below the threshold, would both be labels that
-                        // contradict their own basis.
-                        let fallback = SparseRemlDecision {
+                        // taken (#2465).
+                        let rerouted = SparseRemlDecision {
                             geometry: RemlGeometry::DenseSpectral,
-                            reason: "sparse_exact_spd_assembly_failed",
+                            reason: "pirls_frame_not_sparse_native",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
+                        log::debug!("[reml-geometry] dense_spectral {}", rerouted.basis());
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, rerouted)
                     }
                 }
             }
@@ -6662,7 +6659,6 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(h_total),
             sparse_exact: None,
             firth_dense_operator,
-            firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
@@ -6672,21 +6668,29 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// The sparse exact-SPD bundle at `rho`, or `None` when the inner solve
+    /// returned its mode outside the sparse-native frame. P-IRLS routes its own
+    /// linear solve, so such a mode has no sparse exact system to assemble.
+    /// Every other failure is an error of this evaluation and is returned as one
+    /// (#3636).
     pub(super) fn prepare_sparse_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
         rows: BundleRows,
         decision: SparseRemlDecision,
-    ) -> Result<EvalShared, EstimationError> {
+    ) -> Result<Option<EvalShared>, EstimationError> {
+        // Routing excludes constraints before choosing this backend. Refuse
+        // misuse here too: its Hessian contains no constraint curvature.
+        if self.linear_constraints.is_some() || self.coefficient_lower_bounds.is_some() {
+            crate::bail_invalid_estim!("sparse exact geometry does not support coefficient constraints");
+        }
         let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
         ) {
-            crate::bail_invalid_estim!(
-                "sparse exact geometry requires sparse-native PIRLS coordinates"
-            );
+            return Ok(None);
         }
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -6712,17 +6716,6 @@ impl<'a> RemlState<'a> {
                 cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
             }
         }
-        // Add log-barrier Hessian diagonal for monotonicity-constrained
-        // coefficients (sparse path uses original coordinates).
-        if let Some(ref lin) = self.linear_constraints
-            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
-        {
-            let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
-            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig) {
-                log::debug!("Sparse barrier Hessian diagonal skipped: {e}");
-            }
-        }
-
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p);
         // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
         // built once from constant weights. The outer REML loop never
@@ -6764,26 +6757,7 @@ impl<'a> RemlState<'a> {
         let logdet_s_pos = penalty_logdet.value();
         let (det1_values, _) =
             penalty_logdet.rho_derivatives_from_penalties(&applied_penalties, lambdas_slice);
-        // Built at every problem scale, for the same reason as the dense bundle:
-        // the inner solve carries Φ whenever Firth is requested (#825, #2900).
-        let firth_dense_operator_original = if let Some(jeffreys_link) =
-            reml_robust_jeffreys_link(&self.config)
-        {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
-                .map_err(EstimationError::InvalidInput)?;
-            Some(Arc::new(Self::build_firth_dense_operator_for_link(
-                &jeffreys_link,
-                x_dense.as_ref(),
-                &pirls_result.final_eta.to_owned(),
-                self.weights,
-            )?))
-        } else {
-            None
-        };
-
-        Ok(EvalShared {
+        Ok(Some(EvalShared {
             key,
             pirls_result,
             rows,
@@ -6808,7 +6782,6 @@ impl<'a> RemlState<'a> {
                 }
             })),
             firth_dense_operator: None,
-            firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
@@ -6827,7 +6800,7 @@ impl<'a> RemlState<'a> {
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: Default::default(),
-        })
+        }))
     }
 
     /// The inner P-IRLS iteration budget in force for one solve: the configured
@@ -9309,3 +9282,7 @@ mod capped_request_cache_tests {
         assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
 }
+
+#[cfg(test)]
+#[path = "sparse_refusal_tests.rs"]
+mod sparse_refusal_tests;

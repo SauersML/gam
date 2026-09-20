@@ -550,9 +550,9 @@ pub fn generative_spec_for_saved_model(
         let predictor =
             model
                 .predictor()
-                .ok_or_else(|| SavedGenerativeError::MissingSavedState {
+                .map_err(|reason| SavedGenerativeError::MissingSavedState {
                     model_class,
-                    reason: "canonical predictor could not be reconstructed".to_string(),
+                    reason: format!("canonical predictor could not be reconstructed: {reason}"),
                 })?;
         let prediction = predictor.predict_plugin_response(&input).map_err(|error| {
             SavedGenerativeError::Evaluation {

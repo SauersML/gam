@@ -1,5 +1,6 @@
-// The per-term random-effect test — the driver that turns a fitted standard GAM
-// into "does each `group()` block carry a between-group effect?".
+// The per-term variance-component test — the driver that turns a fitted
+// standard GAM into "does each `group()` block carry a between-group effect?"
+// and "does each ridged slope carry an effect?".
 //
 // `include!`d into `drivers/mod.rs` like the other self-contained inference
 // subsystems, so it shares the driver's flat namespace and import surface.
@@ -10,12 +11,22 @@
 // over; every term gets a record, and a term the test cannot score carries the
 // typed reason instead of a p-value.
 
-/// The variance-component test of every random-effect block of a fitted
-/// standard GAM.
+/// The variance-component test of every random-effect block and every
+/// `LinearTermRidge`-penalized linear term of a fitted standard GAM.
+///
+/// A ridged slope `β_j` with penalty `λ_j m_j β_j²` is the variance component
+/// `β_j ~ N(0, φ/(λ_j m_j))`, and "no effect" is `λ_j = ∞`, on the boundary:
+/// the same question a `group()` block asks, with a one-column design. The
+/// fit's `β̂_j` was shrunk by a `λ_j` REML chose from the same data, so
+/// `β̂_j/se` has no valid Wald reference (it piles its null p-values up at one);
+/// the score statistic reads no `β̂_j`. For a single column it is the Rao
+/// score statistic of `β_j = 0` with every other column projected out, and for
+/// a Gaussian model with an estimated scale it is exactly the partial `t²` of
+/// the unpenalized slope. The summary's parametric rows read these records.
 ///
 /// Never fails: a fit without the row state the score needs yields one
-/// `NoIrlsRowState` record per block, so the summary always has an answer for
-/// each random-effect row.
+/// `NoIrlsRowState` record per term, so the summary always has an answer for
+/// each tested row.
 pub fn random_effect_test_records(
     design: &gam_terms::smooth::TermCollectionDesign,
     fit: &UnifiedFitResult,
@@ -26,7 +37,11 @@ pub fn random_effect_test_records(
         RandomEffectTestUnavailable,
     };
 
-    let ranges = &design.random_effect_ranges;
+    let ranges: Vec<(String, std::ops::Range<usize>)> = design
+        .ridged_linear_ranges()
+        .into_iter()
+        .chain(design.random_effect_ranges.iter().cloned())
+        .collect();
     if ranges.is_empty() {
         return Vec::new();
     }

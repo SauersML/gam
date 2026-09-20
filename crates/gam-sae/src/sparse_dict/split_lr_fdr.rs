@@ -90,6 +90,7 @@
 //! e-values, so a single strong candidate can clear the `ln(m/(α·k))` bar on its
 //! own.
 
+use gam_math::probability::positive_log_sum_exp;
 use gam_terms::inference::structure_evidence::e_benjamini_hochberg_in_family;
 use ndarray::Array2;
 
@@ -195,7 +196,7 @@ pub fn crossfit_ui_log_evalue<A>(
         return Ok(f64::NEG_INFINITY);
     }
     // ln Ē = ln( (1/K)·Σ_f exp(log_e_f) ) = logsumexp(log_e_f) − ln K.
-    Ok(logsumexp(&fold_log_e) - (fold_log_e.len() as f64).ln())
+    Ok(positive_log_sum_exp(&fold_log_e) - (fold_log_e.len() as f64).ln())
 }
 
 /// Concrete universal-inference split-LR log-e-value for one screened candidate:
@@ -470,15 +471,6 @@ fn ring_loglik(coords: &Array2<f64>, rows: &[usize], m: &Ring) -> f64 {
         }
     }
     total
-}
-
-fn logsumexp(xs: &[f64]) -> f64 {
-    let m = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    if !m.is_finite() {
-        return m;
-    }
-    let s: f64 = xs.iter().map(|&x| (x - m).exp()).sum();
-    m + s.ln()
 }
 
 /// Overflow-safe `ln I0(x)`, still never materialising `e^x`.

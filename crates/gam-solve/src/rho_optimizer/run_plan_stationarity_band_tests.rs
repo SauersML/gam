@@ -30,18 +30,8 @@ fn zz_measure_2613_gradient_only_stiff_ridge_trajectory() {
     // where 29.9 is interior.
     const WRONG_RAIL_FACE: f64 = 30.0;
 
-    // A second `try_init` in one process is an `Err`, and that is the expected
-    // state whenever another test installed the logger first. Either way trace
-    // output is reachable, which is all this diagnostic needs; the result is
-    // reported rather than discarded.
-    if env_logger::builder()
-        .filter_level(log::LevelFilter::Trace)
-        .is_test(false)
-        .try_init()
-        .is_err()
-    {
-        log::trace!("zz_measure #2613: a logger was already installed by another test");
-    }
+    gam_runtime::test_support::install_diagnostic_logger();
+    log::set_max_level(log::LevelFilter::Trace);
 
     let calls = Arc::new(Mutex::new(Vec::<(char, f64, f64, f64)>::new()));
     let cost_log = Arc::clone(&calls);
@@ -140,8 +130,8 @@ const STATIONARY_GRAD_2613: f64 = 5.0e-4;
 
 /// The plateau every #2613 window test sits on: a Strong-Wolfe zoom's trials
 /// converging geometrically to one point, so consecutive costs differ by ~1e-9
-/// against each value's resolution `1e-7 · (1 + 4996.7) ≈ 5e-4` while the ITERATE
-/// has not moved once.
+/// while the ITERATE has not moved once, every one of them above the seed's
+/// `−4996.7`, so no accepted step among them buys a decrease.
 fn zoom_plateau_schedule_2613(len: usize) -> Vec<(f64, f64, f64)> {
     (0..len)
         .map(|i| {
@@ -197,15 +187,10 @@ fn drive_first_order_bridge_2613(
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let config = claim_band_config(1.0e-3);
-    let mut guard = CostStallGuard::new(outer_criterion_resolution(&config), &config, exit.clone());
-    // The scripted objective publishes no evidence, so the seed value carries the
-    // resolution the certificate asserts, as every later sample does (#3018).
-    guard.observe_seed(
-        &seed_rho,
-        seed_cost,
-        outer_criterion_resolution(&config),
-        seed_grad,
-    );
+    let mut guard = CostStallGuard::new(&config, exit.clone());
+    // The scripted objective publishes no evidence, so the seed value carries
+    // only its own rounding, as every later sample does (#3287).
+    guard.observe_seed(&seed_rho, seed_cost, value_representation_band(seed_cost), seed_grad);
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -348,9 +333,9 @@ fn accepted_steps_still_trip_the_cost_stall_window_2613() {
         "the halt must use the shared cost-stall sentinel",
     );
     // The accept for evaluation `i` is published after it and drained at the
-    // top of evaluation `i+1`, so the first accepted step, a stall (its
-    // decrease is ~1e-9 against resolutions of ~5e-4, and it sits inside the
-    // band), is judged on evaluation 1. One evaluation of latency is inherent:
+    // top of evaluation `i+1`, so the first accepted step, a stall (its value
+    // sits ~1e-9 above the seed incumbent, which no resolution reads as a
+    // decrease, and it sits inside the band), is judged on evaluation 1. One evaluation of latency is inherent:
     // `on_step_accepted` fires after the line search that produced the step.
     assert_eq!(
         halted, 1,

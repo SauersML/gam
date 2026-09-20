@@ -281,7 +281,7 @@ fn a_saturating_gate_has_a_finite_mode_at_the_derived_curvature_2080() {
     for (mu, weight, temperature) in [(100.0_f64, 1.0_f64, 1.0_f64), (4.0e3, 0.5, 0.25), (12.0, 3.0, 2.0)]
     {
         let inv_tau = temperature.recip();
-        let gate = |logit: f64| gam_linalg::utils::stable_logistic(logit * inv_tau);
+        let gate = |logit: f64| gam_math::special::logistic(logit * inv_tau);
         let slope = |logit: f64| {
             let z = gate(logit);
             -mu * z * (1.0 - z) * inv_tau

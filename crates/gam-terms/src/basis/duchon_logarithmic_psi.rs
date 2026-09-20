@@ -61,15 +61,15 @@ impl DuchonLogarithmicPsiCorrection {
     }
 
     fn evaluate(coefficients: &[(usize, f64)], r2: f64) -> (f64, f64) {
-        let mut value = KahanSum::default();
-        let mut radial = KahanSum::default();
+        let mut value = CompensatedSum::default();
+        let mut radial = CompensatedSum::default();
         for &(degree, coefficient) in coefficients {
             value.add(coefficient * r2.powi(degree as i32));
             if degree > 0 {
                 radial.add(2.0 * degree as f64 * coefficient * r2.powi(degree as i32 - 1));
             }
         }
-        (value.sum(), radial.sum())
+        (value.value(), radial.value())
     }
 }
 

@@ -320,7 +320,7 @@ fn refused_wall_2939(guard: &CostStallGuard, refused: &Array1<f64>) -> (f64, f64
 fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<f64>) {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let config = stratum_problem().config();
-    let mut guard = CostStallGuard::new(1.0e-6, &config, exit.clone());
+    let mut guard = CostStallGuard::new(&config, exit.clone());
     let incumbent = array![1.99965, 0.4549];
     let fixture = StratumFixture {
         cutoff: 0.05,
@@ -491,4 +491,78 @@ fn a_rank_refusal_below_the_incumbent_stops_the_run_for_the_crossing_2939() {
         .expect("the stop publishes its rank-boundary evidence");
     assert_eq!(evidence.kept_rank, KEPT_RANK_INSIDE);
     assert_eq!(evidence.refused_trials, 1);
+}
+
+
+#[test]
+fn feasible_unaccepted_probe_ends_refusal_streak_without_granting_progress() {
+    let (mut guard, exit, _) = pinned_guard();
+    let refused = array![2.011981138, 0.457077141];
+    let value = guard.best_value() + 1.0;
+    let resolution = guard.value_resolution(value, &Default::default());
+    let best = guard.best_value();
+    let accepted = guard.accepted_iters();
+    assert!(matches!(guard.observe_off_stratum(
+        &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
+    ), CostStallVerdict::Continue));
+    assert_eq!(guard.off_stratum_streak(), 1);
+    guard.observe_feasible_probe();
+    assert_eq!(guard.off_stratum_streak(), 0);
+    assert_eq!(guard.infeasible_streak(), 0);
+    assert_eq!(guard.best_value(), best);
+    assert_eq!(guard.accepted_iters(), accepted);
+    let publication = exit.lock().expect("exit cell").clone().expect("seed publication");
+    assert_eq!(publication.value, best);
+    assert_eq!(publication.iterations, accepted);
+    assert!(publication.rank_boundary.is_none());
+    assert!(matches!(guard.observe_off_stratum(
+        &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
+    ), CostStallVerdict::Continue));
+    assert_eq!(guard.off_stratum_streak(), 1);
+    assert_eq!(guard.infeasible_streak(), 1);
+}
+
+
+#[test]
+fn terminal_boundary_evidence_requires_pure_refusals_at_the_actual_checkpoint() {
+    let (guard, _, incumbent) = pinned_guard();
+    let fixture = StratumFixture { cutoff: 0.05, center0: 4.0, across_shift: 12.0 };
+    let eval = fixture.eval(&incumbent);
+    let mut objective = RecordingStratum { fixture, requests: Vec::new(), last_rank: Some(KEPT_RANK_INSIDE) };
+    let mut bridge = OuterFirstOrderBridge {
+        obj: &mut objective,
+        layout: OuterThetaLayout::new(2, 0),
+        outer_inner_cap: None,
+        first_order_evals: 0,
+        g_norm_initial: None,
+        last_g_norm: None,
+        last_value_grad_rho: None,
+        value_probe_cache: Vec::new(),
+        cost_stall: Some(guard),
+        cost_stall_bounds: None,
+        accepted_steps: Arc::default(),
+        pending_first_order: Vec::new(),
+        incumbent: Some(OuterIncumbent { rho: incumbent.clone(), cost: eval.cost, gradient: eval.gradient }),
+        stratum_rank: Some(KEPT_RANK_INSIDE),
+        stratum_probe: Some(Arc::default()),
+    };
+    // A generic solver failure without any rank refusal carries no such diagnosis.
+    assert!(bridge.terminal_rank_boundary(&incumbent).is_none());
+    let refused = array![2.011981138, 0.457077141];
+    assert!(bridge.eval_cost(&refused).expect_err("off-rank trial").is_recoverable());
+    assert_eq!(bridge.terminal_rank_boundary(&incumbent).expect("rank evidence").refused_trials, 1);
+    assert!(bridge.terminal_rank_boundary(&array![0.0, 0.0]).is_none());
+    bridge.cost_stall.as_mut().unwrap().observe_infeasible(&refused, ADAPTING_DECREASE);
+    assert!(bridge.terminal_rank_boundary(&incumbent).is_none());
+    let other_refused = array![2.012, 0.458];
+    assert!(bridge.eval_cost(&other_refused).is_err());
+    assert!(bridge.terminal_rank_boundary(&incumbent).is_none(), "a mixed refusal window is not a pure rank boundary");
+    let feasible = array![1.998, 0.455];
+    assert!(bridge.eval_cost(&feasible).is_ok());
+    assert!(bridge.terminal_rank_boundary(&incumbent).is_none());
+    let new_refused = array![2.013, 0.459];
+    assert!(bridge.eval_cost(&new_refused).is_err());
+    assert_eq!(bridge.terminal_rank_boundary(&incumbent).unwrap().refused_trials, 1);
+    assert!(bridge.eval_cost(&feasible).is_ok(), "cached feasible probes have the same reset semantics");
+    assert!(bridge.terminal_rank_boundary(&incumbent).is_none());
 }

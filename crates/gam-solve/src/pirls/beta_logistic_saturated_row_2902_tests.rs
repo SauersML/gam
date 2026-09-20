@@ -131,7 +131,7 @@ fn assert_reference(label: &str, got: (f64, f64, f64), reference: &Reference) {
 #[test]
 fn the_mean_route_collapses_at_the_reference_points_2902() {
     assert_eq!(
-        gam_linalg::utils::stable_logistic(CERTIFIED.eta),
+        gam_math::special::logistic(CERTIFIED.eta),
         1.0,
         "logistic(42.77) must round to 1.0, or this fixture no longer reaches the tail"
     );

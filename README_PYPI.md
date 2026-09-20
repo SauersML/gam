@@ -162,7 +162,7 @@ model.report("report.html")
 | `gamfit.results.SurvivalPrediction` | Per-row hazard / survival surface. |
 | `gamfit.results.CompetingRisksPrediction`, `competing_risks_cif` | Competing-risks CIF evaluation. |
 | `gamfit.MultinomialModel` | Multinomial-logit / softmax model. |
-| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive`, `PairedPosteriorSamples` | Posterior interface. |
+| `gamfit.results.SamplingConfig`, `PosteriorSamples`, `PosteriorPredictive` | Posterior interface. |
 | `gamfit.ResponseGeometryModel`, `sphere_frechet_mean`, `simplex_frechet_mean`, `alr`, `clr`, `closure` | Response-geometry utilities. |
 | `gamfit.smooth.Duchon`, `Matern`, `BSpline`, `TensorBSpline`, `MeasureJet`, `Sphere` | Smooth descriptors for `smooths=` and torch. |
 | `gamfit.sklearn.GAMRegressor` / `GAMClassifier` | scikit-learn estimators. |
