@@ -199,15 +199,16 @@ pub fn run_measured_row_kernel<T, E>(
     }
 }
 
-/// The race of a row kernel whose CPU executor builds state once and then
-/// applies against it many times, while the device executor re-reads its
-/// inputs on every apply and keeps nothing: the SAE residual-curvature HVP,
-/// whose CPU executor keeps per-state contractions that each CG apply reads.
-/// Timing one apply would leave out the build the CPU choice pays and the
-/// reuse it buys, so the race times the whole state: the CPU build, then both
-/// executors on every apply against it. The device executor's first apply
-/// also runs once untimed, which pays compilation, allocation and first touch
-/// as [`race_row_kernel`]'s cold call does. Every apply returns the CPU
+/// The race of a row kernel whose executors each build state once and then
+/// apply against it many times: the SAE residual-curvature HVP, whose CPU
+/// executor keeps per-state contractions that each CG apply reads, and the BMS
+/// FLEX row-primary Hessian, whose device executor keeps the row Hessians and
+/// designs resident for every inner CG HVP. Timing one apply would leave out
+/// the builds each choice pays and the reuse it buys, so the race times the
+/// whole state: both builds, then both executors on every apply against them.
+/// The device executor's build and its first apply each also run once
+/// untimed, which pays compilation, allocation and first touch as
+/// [`race_row_kernel`]'s cold call does. Every apply returns the CPU
 /// executor's value, and the totals are recorded when the state is dropped,
 /// so the next state of this shape reads them. A state with no apply, or one
 /// an executor faulted in, records nothing.
@@ -224,23 +225,29 @@ struct ReusedStateLedger {
 }
 
 impl ReusedStateRace {
-    /// Build the CPU executor's state for `shape`, timed.
-    pub fn build<C, E>(
+    /// Build both executors' states for `shape`, timed. An executor that keeps
+    /// nothing builds `()`.
+    pub fn build<C, D, E>(
         shape: RowKernelShape,
         cpu_state: impl FnOnce() -> Result<C, E>,
-    ) -> Result<(Self, C), E> {
+        mut device_state: impl FnMut() -> Result<D, E>,
+    ) -> Result<(Self, C, D), E> {
         let started = Instant::now();
-        let state = cpu_state()?;
+        let cpu = cpu_state()?;
+        let cpu_seconds = started.elapsed().as_secs_f64();
+        drop(device_state()?);
+        let started = Instant::now();
+        let device = device_state()?;
         let race = Self {
             shape,
             ledger: Mutex::new(ReusedStateLedger {
-                cpu_seconds: started.elapsed().as_secs_f64(),
-                device_seconds: 0.0,
+                cpu_seconds,
+                device_seconds: started.elapsed().as_secs_f64(),
                 applies: 0,
                 faulted: false,
             }),
         };
-        Ok((race, state))
+        Ok((race, cpu, device))
     }
 
     /// One apply against the state: both executors, timed; the CPU value.
@@ -295,7 +302,7 @@ impl Drop for ReusedStateRace {
         record(&self.shape, ledger.cpu_seconds, ledger.device_seconds);
         log::debug!(
             "[GPU row-kernel race] kernel={} rows={} widths={:?} threads={} applies={} \
-             cpu_build_and_applies={:.6}s device_applies={:.6}s selects={}",
+             cpu_build_and_applies={:.6}s device_build_and_applies={:.6}s selects={}",
             self.shape.kernel.as_str(),
             self.shape.rows,
             self.shape.widths,
@@ -459,10 +466,10 @@ mod tests {
         assert!(measured_executor(&shape).is_some());
     }
 
-    /// A reused-state race times the CPU build plus every apply against the
-    /// device's applies, records only when its state drops, returns the CPU
-    /// value, and records nothing for a state an executor faulted in or that
-    /// was never applied.
+    /// A reused-state race times both builds plus every apply on each
+    /// executor, runs the device's build and first apply once cold, records
+    /// only when its state drops, returns the CPU value, and records nothing
+    /// for a state an executor faulted in or that was never applied.
     #[test]
     fn a_reused_state_race_records_its_whole_state_on_drop_3024() {
         let shape = RowKernelShape {
@@ -471,8 +478,21 @@ mod tests {
             widths: [33, 48, 0, 0],
             threads: 1,
         };
-        let (race, kept) =
-            ReusedStateRace::build(shape, || Ok::<_, String>(4.0)).expect("the build succeeds");
+        let mut device_builds = 0;
+        let (race, kept, resident) = ReusedStateRace::build(
+            shape,
+            || Ok::<_, String>(4.0),
+            || {
+                device_builds += 1;
+                Ok(device_builds)
+            },
+        )
+        .expect("both builds succeed");
+        assert_eq!(
+            (device_builds, resident),
+            (2, 2),
+            "the device builds once cold, then keeps its timed build"
+        );
         let mut device_runs = 0;
         for _ in 0..3 {
             let value = race
@@ -499,13 +519,14 @@ mod tests {
             rows: 3_349,
             ..shape
         };
-        drop(ReusedStateRace::build(unapplied, || Ok::<_, String>(())).expect("built"));
+        drop(ReusedStateRace::build(unapplied, || Ok::<_, String>(()), || Ok(())).expect("built"));
         assert_eq!(measured_executor(&unapplied), None);
         let faulted = RowKernelShape {
             widths: [33, 49, 0, 0],
             ..shape
         };
-        let (race, ()) = ReusedStateRace::build(faulted, || Ok::<_, String>(())).expect("built");
+        let (race, (), ()) =
+            ReusedStateRace::build(faulted, || Ok::<_, String>(()), || Ok(())).expect("built");
         assert_eq!(
             race.apply(|| Ok(1.0), || Err("device fault".to_string())),
             Err("device fault".to_string())

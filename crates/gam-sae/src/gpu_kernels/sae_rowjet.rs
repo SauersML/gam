@@ -1100,8 +1100,7 @@ fn plan_dispatch(
     p: usize,
     n_beta: usize,
     mode: gam_gpu::GpuPolicy,
-    // Only the CUDA planner weighs the kernel's executors.
-    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))] kernel: gam_gpu::GpuKernel,
+    kernel: gam_gpu::GpuKernel,
     ledger: SaeRowJetMemoryLedger,
     host_budget: usize,
 ) -> Result<SaeRowJetExecutionPlan, String> {
@@ -1135,10 +1134,10 @@ fn plan_dispatch(
     #[cfg(not(target_os = "linux"))]
     {
         if mode == gam_gpu::GpuPolicy::Required {
-            return Err(
-                "complete SAE row jet requires CUDA, which is unavailable on this platform"
-                    .to_string(),
-            );
+            return Err(format!(
+                "complete SAE row jet kernel '{}' requires CUDA, which is unavailable on this platform",
+                kernel.as_str()
+            ));
         }
         Ok(SaeRowJetExecutionPlan {
             path: SaeRowJetPath::Cpu,
@@ -1186,16 +1185,15 @@ fn plan_dispatch(
         let decision = gam_gpu::decide_row_kernel(
             mode,
             gam_gpu::RowKernelAdmission {
-                kernel,
                 missing_capability: None,
                 compiled: true,
-                size: gam_gpu::RowKernelSize::Measured(gam_gpu::RowKernelShape {
+                shape: gam_gpu::RowKernelShape {
                     kernel,
                     rows: tile_rows,
                     widths: [k, q, p, n_beta],
                     // The CPU tile evaluates its rows sequentially.
                     threads: 1,
-                }),
+                },
             },
             &mut gam_gpu::RuntimeDeviceProbe,
         )

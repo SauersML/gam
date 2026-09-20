@@ -973,12 +973,14 @@ impl SaeManifoldTerm {
                     PreparedSoftmaxRowJetExecutor::Device
                 }
                 crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Race(shape) => {
-                    let (race, kept) = gam_gpu::ReusedStateRace::build(
+                    // The device executor keeps nothing between applies.
+                    let (race, kept, ()) = gam_gpu::ReusedStateRace::build(
                         gam_gpu::RowKernelShape {
                             rows: inputs.len(),
                             ..shape
                         },
                         keep,
+                        || Ok(()),
                     )?;
                     PreparedSoftmaxRowJetExecutor::Racing { kept, race }
                 }
