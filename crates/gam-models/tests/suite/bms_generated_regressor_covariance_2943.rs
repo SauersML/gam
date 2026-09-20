@@ -13,6 +13,9 @@
 //! gamma(2) skew and t(3) tails. The benchmark's linear PC adjustment of the
 //! score is left out; the cluster structure it cannot remove is what fires the
 //! calibration, and the tails send the second-stage measure to global-empirical.
+//! A small one-dimensional smooth retains smoothing coordinates and the full
+//! generated-regressor covariance path without a six-dimensional benchmark fit.
+//! Calibration, empirical measure and both covariance pairs are asserted below.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -23,7 +26,7 @@ use gam_models::inference::model_payload_builders::fit_formula_to_payload;
 use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 use rand_distr::{Beta, Distribution, Gamma, Normal, StudentT};
 
-const ROWS: usize = 3000;
+const ROWS: usize = 256;
 /// EUR, AFR, AMR, EAS, SAS, MID.
 const SHARE: [f64; 6] = [0.50, 0.22, 0.19, 0.05, 0.025, 0.015];
 /// Continental poles in six PCs: EUR, AFR, NAT, EAS, SAS, MID.
@@ -37,7 +40,6 @@ const POLES: [[f64; 6]; 6] = [
 ];
 const NOISE: [f64; 6] = [0.020, 0.015, 0.012, 0.010, 0.008, 0.006];
 const PREVALENCE: f64 = 0.45;
-const SURFACE: &str = "duchon(PC1, PC2, PC3, PC4, PC5, PC6, centers=8)";
 
 fn nonlinear_score_dataset(seed: u64) -> EncodedDataset {
     let mut rng = StdRng::seed_from_u64(seed);
@@ -91,7 +93,8 @@ fn nonlinear_score_dataset(seed: u64) -> EncodedDataset {
         let (afr, nat, eas, sas, mid) = (mix[1], mix[2], mix[3], mix[4], mix[5]);
         let spread = 1.0 + 0.8 * afr - 0.4 * eas;
         let skew = (gamma2.sample(&mut rng) - 2.0) / 2.0_f64.sqrt();
-        let score = -2.5 * afr - 0.8 * nat + 3.0 * eas - 1.5 * sas + 2.0 * mid
+        let score = -2.5 * afr - 0.8 * nat + 3.0 * eas - 1.5 * sas
+            + 2.0 * mid
             + 2.0 * afr * (1.0 - afr)
             + spread * (0.7 * skew + 0.5 * t3.sample(&mut rng));
         groups.push(group);
@@ -135,17 +138,27 @@ fn nonlinear_score_dataset(seed: u64) -> EncodedDataset {
 
     let mean = scores.iter().sum::<f64>() / ROWS as f64;
     let sd = (scores.iter().map(|s| (s - mean).powi(2)).sum::<f64>() / ROWS as f64).sqrt();
-    let headers = ["event", "z", "age0", "sex", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6"]
-        .iter()
-        .map(|name| name.to_string())
-        .collect();
+    let headers = [
+        "event", "z", "age0", "sex", "PC1", "PC2", "PC3", "PC4", "PC5", "PC6",
+    ]
+    .iter()
+    .map(|name| name.to_string())
+    .collect();
     let records = (0..ROWS)
         .map(|row| {
             let mut fields = vec![
-                if noisy[row] > threshold { "1".to_string() } else { "0".to_string() },
+                if noisy[row] > threshold {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
                 format!("{:.17e}", (scores[row] - mean) / sd),
                 format!("{:.17e}", ages[row]),
-                if sexes[row] > 0.5 { "1".to_string() } else { "0".to_string() },
+                if sexes[row] > 0.5 {
+                    "1".to_string()
+                } else {
+                    "0".to_string()
+                },
             ];
             fields.extend(pcs[row].iter().map(|v| format!("{v:.17e}")));
             StringRecord::from(fields)
@@ -187,23 +200,39 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
         "{label}: the fixture must fire the latent-z conditional calibration \
          (#2943's precondition); the payload carries none"
     );
-    let fit = payload.fit_result.as_ref().expect("the payload carries its fit result");
+    let fit = payload
+        .fit_result
+        .as_ref()
+        .expect("the payload carries its fit result");
+    assert!(
+        !fit.log_lambdas.is_empty(),
+        "{label}: the fixture must fit smoothing coordinates"
+    );
     assert!(
         fit.artifacts.covariance_declined.is_none(),
         "{label}: the generated-regressor correction must be computed on this path, not withheld: {:?}",
         fit.artifacts.covariance_declined
     );
     for (pair, standard_errors, covariance) in [
-        ("conditional", fit.beta_standard_errors(), fit.beta_covariance()),
-        ("corrected", fit.beta_standard_errors_corrected(), fit.beta_covariance_corrected()),
+        (
+            "conditional",
+            fit.beta_standard_errors(),
+            fit.beta_covariance(),
+        ),
+        (
+            "corrected",
+            fit.beta_standard_errors_corrected(),
+            fit.beta_covariance_corrected(),
+        ),
     ] {
         // Both pairs are required: this fit has smoothing coordinates and did
         // not decline its covariance, so a missing pair is a regression, not a
         // case to skip.
         let standard_errors = standard_errors
             .unwrap_or_else(|| panic!("{label}: the {pair} standard errors must be published"));
-        let covariance = covariance
-            .unwrap_or_else(|| panic!("{label}: {pair} standard errors are published without their covariance"));
+        let covariance = covariance.unwrap_or_else(|| {
+            panic!("{label}: {pair} standard errors are published without their covariance")
+        });
         // `zip` stops at the shorter side, so a length mismatch would silently
         // compare only a prefix.
         assert_eq!(
@@ -214,7 +243,29 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
             covariance.nrows(),
             covariance.ncols()
         );
-        for (i, (se, diagonal)) in standard_errors.iter().zip(covariance.diag().iter()).enumerate() {
+        assert_eq!(
+            covariance.nrows(),
+            covariance.ncols(),
+            "{label}: {pair} covariance must be square"
+        );
+        assert_eq!(
+            standard_errors.len(),
+            fit.beta.len(),
+            "{label}: {pair} must cover every coefficient"
+        );
+        assert!(
+            covariance.iter().all(|value| value.is_finite()),
+            "{label}: {pair} covariance must be finite"
+        );
+        for (i, (se, diagonal)) in standard_errors
+            .iter()
+            .zip(covariance.diag().iter())
+            .enumerate()
+        {
+            assert!(
+                se.is_finite() && *se >= 0.0 && *diagonal >= 0.0,
+                "{label}: {pair} invalid variance at {i}"
+            );
             assert!(
                 (se * se - diagonal).abs() <= 1.0e-12 * diagonal.abs().max(1.0),
                 "{label}: {pair} standard error {i} squares to {:.17e} against the published \
@@ -225,7 +276,8 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
     }
     // What `gamfit.fit` hands `compile_model`: the saved model's bytes, parsed
     // and validated exactly as a load does.
-    let bytes = serde_json::to_vec(&FittedModel::from_payload(payload)).expect("serialize the model");
+    let bytes =
+        serde_json::to_vec(&FittedModel::from_payload(payload)).expect("serialize the model");
     let loaded: FittedModel = serde_json::from_slice(&bytes).expect("parse the saved model");
     loaded
         .validate_for_persistence()
@@ -238,10 +290,6 @@ fn assert_corrected_fit_is_consistent_and_loads(payload: FittedModelPayload, lab
 #[test]
 fn a_fit_whose_calibration_fired_saves_a_model_that_loads_2943() {
     let data = nonlinear_score_dataset(2335);
-    let payload = fit_payload(
-        &data,
-        &format!("event ~ s(age0, k=6) + sex + {SURFACE}"),
-        &format!("1 + {SURFACE}"),
-    );
+    let payload = fit_payload(&data, "event ~ s(PC1, k=4) + PC2 + sex", "1");
     assert_corrected_fit_is_consistent_and_loads(payload, "gnomon#2335 nonlinear score");
 }

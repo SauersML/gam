@@ -460,12 +460,11 @@ fn run() -> Result<(), String> {
 
     println!(
         "[k2000] COMPOSED in_sample_ev={:.6} tier2_outer_iters={} births={} refusals={} \
-         pc_reseed_events={} wall={:.1}s",
+         wall={:.1}s",
         ev_composed_in,
         tier2_outer_iters,
         tiered_report.ledger.n_births,
         tiered_report.ledger.n_refusals,
-        tiered_report.ledger.pc_reseed_events,
         tiered_wall,
     );
     println!(

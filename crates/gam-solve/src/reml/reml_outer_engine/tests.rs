@@ -1438,18 +1438,19 @@ pub(crate) fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form(
         [0.0, 0.0],
     ];
 
-    let projected = coord.project_into_subspace(&z);
+    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
+    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
+    // projected coordinate. The face runs through the origin (`β_full` has
+    // no off-face component), so the restriction carries no offset.
+    let beta_f = array![0.7, -1.3];
+    let beta_full = z.dot(&beta_f);
+
+    let projected = coord.project_into_subspace(&z, beta_full.view());
     assert_eq!(
         projected.dim(),
         z.ncols(),
         "projected penalty coordinate dim must equal the reduced beta length"
     );
-
-    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
-    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
-    // projected coordinate.
-    let beta_f = array![0.7, -1.3];
-    let beta_full = z.dot(&beta_f);
 
     let s_beta_full = coord.apply_penalty(&beta_full, 1.0);
     let full_quadratic = beta_full.dot(&s_beta_full);

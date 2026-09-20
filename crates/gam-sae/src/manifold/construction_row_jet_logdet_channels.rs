@@ -118,14 +118,6 @@ impl crate::row_jet_program::SaeOrder2RowProgramSource for ProductionRowProgram<
 }
 
 #[cfg(test)]
-mod tests_reconstruction_program_builder {
-    use super::*;
-
-    impl SaeManifoldTerm {
-    }
-}
-
-#[cfg(test)]
 mod tests_hand_reference {
     use super::*;
 
@@ -844,9 +836,9 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
     ) -> Result<PreparedSoftmaxRowJets, String> {
-        if !matches!(self.assignment.mode, AssignmentMode::Softmax { .. }) {
+        let AssignmentMode::Softmax { temperature, .. } = self.assignment.mode else {
             return Err("softmax row-jet plan requested for a non-softmax gate".to_string());
-        }
+        };
         let n = self.n_obs();
         let p = self.output_dim();
         let k_atoms = self.k_atoms();
@@ -859,10 +851,6 @@ impl SaeManifoldTerm {
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
         let mut assignments = Array1::<f64>::zeros(k_atoms);
-        let mut probe_assignments = Array1::<f64>::zeros(k_atoms);
-        let mut decoded = vec![0.0_f64; p];
-        let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = Array1::<f64>::zeros(p);
         // #2560 — the cgroup-aware budget is a property of the host, not of the
         // row chunk, so read it once here rather than once per loop turn.
         let host_budget = crate::manifold::sae_host_in_core_budget_bytes().0;
@@ -909,44 +897,19 @@ impl SaeManifoldTerm {
                     second_jets: &second_jets,
                     border: &border,
                 };
-                let sqrt_row_weight = row_loss_w.map_or(1.0, |weights| weights[row].sqrt());
+                let w_row = row_loss_w.map_or(1.0, |weights| weights[row]);
                 let input = crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput::from_source(
                     &source,
-                    sqrt_row_weight,
+                    w_row.sqrt(),
                     shared_beta_layout.clone(),
                 )?;
                 shared_beta_layout = Some((input.beta_atoms.clone(), input.beta_outputs.clone()));
                 inputs.push(input);
-                self.assignment.try_assignments_row_into(
-                    row,
-                    probe_assignments.as_slice_mut().ok_or_else(|| {
-                        "apply_exact_hessian_minus_b: assignment scratch is not contiguous"
-                            .to_string()
-                    })?,
-                )?;
-                fitted.fill(0.0);
-                let active_atoms = self
-                    .last_row_layout
-                    .as_ref()
-                    .map(|layout| layout.active_atoms[row].as_slice());
-                for k in 0..k_atoms {
-                    if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                        continue;
-                    }
-                    self.atoms[k].fill_decoded_row(row, &mut decoded);
-                    let a_k = probe_assignments[k];
-                    for out_col in 0..p {
-                        fitted[out_col] += a_k * decoded[out_col];
-                    }
-                }
-                let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
-                for out_col in 0..p {
-                    error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-                }
-                let probe_row = match self.row_metric.as_ref() {
-                    Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                    _ => error.to_vec(),
-                };
+                // The √w-scaled metric-applied residual probe, from the one
+                // residual producer every exact-A leg shares, at the gate values
+                // the row program above already read.
+                let probe_row =
+                    self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
                 if probe_row.len() != p {
                     return Err(format!(
                         "contracted SAE row-jet probe for row {row} has length {}; expected {p}",
@@ -955,15 +918,12 @@ impl SaeManifoldTerm {
                 }
                 probe.extend_from_slice(&probe_row);
             }
-            let keep = || match self.assignment.mode {
-                AssignmentMode::Softmax { temperature, .. } => {
-                    crate::gpu_kernels::sae_rowjet::bilinear::prepare_bilinear_contractions(
-                        &inputs,
-                        1.0 / temperature,
-                        &probe,
-                    )
-                }
-                _ => Ok(None),
+            let keep = || {
+                crate::gpu_kernels::sae_rowjet::bilinear::prepare_bilinear_contractions(
+                    &inputs,
+                    1.0 / temperature,
+                    &probe,
+                )
             };
             let executor = match plan.path {
                 crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Cpu => {

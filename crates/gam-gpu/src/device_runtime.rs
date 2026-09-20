@@ -561,29 +561,40 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
         .map_err(|err| GpuError::DriverCallFailed {
             reason: err.to_string(),
         })?;
-    let attr = |attribute| -> Result<i32, GpuError> {
-        // SAFETY: device comes from cudarc's validated device::get.
-        unsafe { result::device::get_attribute(device, attribute) }.map_err(|err| {
-            GpuError::DriverCallFailed {
-                reason: err.to_string(),
-            }
+    query_cuda_device_info(
+        ordinal,
+        |attribute| {
+            // SAFETY: device comes from cudarc's validated device::get.
+            unsafe { result::device::get_attribute(device, attribute) }
+        },
+        || result::device::get_name(device),
+        || ctx.mem_get_info(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn query_cuda_device_info<E: std::fmt::Display>(
+    ordinal: usize,
+    mut attribute: impl FnMut(sys::CUdevice_attribute_enum) -> Result<i32, E>,
+    name: impl FnOnce() -> Result<String, E>,
+    memory: impl FnOnce() -> Result<(usize, usize), E>,
+) -> Result<GpuDeviceInfo, GpuError> {
+    let mut attr = |kind| {
+        attribute(kind).map_err(|err| GpuError::DriverCallFailed {
+            reason: format!("CUDA device {ordinal}: attribute {kind:?} failed: {err}"),
         })
     };
-    let (free_mem_bytes, total_mem_bytes) =
-        ctx.mem_get_info()
-            .map_err(|err| GpuError::DriverCallFailed {
-                reason: err.to_string(),
-            })?;
+    let name = name().map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("CUDA device {ordinal}: name query failed: {err}"),
+    })?;
+    let (free_mem_bytes, total_mem_bytes) = memory().map_err(|err| GpuError::DriverCallFailed {
+        reason: format!("CUDA device {ordinal}: memory query failed: {err}"),
+    })?;
     let major = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR)?;
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {
         ordinal,
-        name: result::device::get_name(device).unwrap_or_else(|err| {
-            log::trace!(
-                "CUDA device {ordinal}: name query failed ({err}); using a positional label"
-            );
-            format!("CUDA device {ordinal}")
-        }),
+        name,
         capability: super::device::GpuCapability::from_compute_capability(major, minor),
         sm_count: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         max_threads_per_sm: attr(
@@ -591,21 +602,15 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
         )?,
         max_shared_mem_per_block: attr(
             sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-        )
-        .unwrap_or(0) as usize,
-        l2_cache_bytes: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
-            .unwrap_or(0) as usize,
+        )? as usize,
+        l2_cache_bytes: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?
+            as usize,
         total_mem_bytes,
         free_mem_bytes,
-        ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)
-            .unwrap_or(0)
-            != 0,
-        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED).unwrap_or(0)
-            != 0,
-        mig_mode: false,
+        ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)? != 0,
+        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
     })
 }
-
 #[cfg(test)]
 mod policy_resolution_contract_tests {
     use super::*;
@@ -754,7 +759,6 @@ mod policy_resolution_contract_tests {
             free_mem_bytes: 0,
             ecc_enabled: false,
             integrated: false,
-            mig_mode: false,
         };
         let runtime = GpuRuntime {
             memory_budget_bytes: device.memory_budget_bytes(),
@@ -882,5 +886,120 @@ mod policy_resolution_contract_tests {
                     if reason == "synthetic missing cuBLAS"
             ));
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod device_query_failure_tests {
+    use super::*;
+    use sys::CUdevice_attribute_enum as Attribute;
+
+    const ATTRIBUTES: [(Attribute, i32); 8] = [
+        (Attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR, 8),
+        (Attribute::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR, 0),
+        (Attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, 108),
+        (
+            Attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+            2048,
+        ),
+        (
+            Attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
+            49152,
+        ),
+        (Attribute::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE, 41943040),
+        (Attribute::CU_DEVICE_ATTRIBUTE_ECC_ENABLED, 1),
+        (Attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED, 0),
+    ];
+
+    fn value(kind: Attribute) -> i32 {
+        ATTRIBUTES
+            .iter()
+            .find(|(candidate, _)| *candidate == kind)
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn every_required_attribute_failure_preserves_device_query_and_cause() {
+        for (failed, _) in ATTRIBUTES {
+            let error = query_cuda_device_info(
+                7,
+                |kind| {
+                    if kind == failed {
+                        Err("injected driver cause")
+                    } else {
+                        Ok(value(kind))
+                    }
+                },
+                || Ok("measured device".to_owned()),
+                || Ok((100, 200)),
+            )
+            .unwrap_err();
+            assert!(matches!(error, GpuError::DriverCallFailed { .. }));
+            let reason = error.to_string();
+            assert!(reason.contains("CUDA device 7"), "{reason}");
+            assert!(reason.contains(&format!("{failed:?}")), "{reason}");
+            assert!(reason.contains("injected driver cause"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn name_and_memory_query_failures_are_not_substituted() {
+        let name = query_cuda_device_info(
+            3,
+            |kind| Ok(value(kind)),
+            || Err("name driver cause"),
+            || Ok((100, 200)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            name.contains("CUDA device 3: name query failed: name driver cause"),
+            "{name}"
+        );
+        let memory = query_cuda_device_info(
+            4,
+            |kind| Ok(value(kind)),
+            || Ok("name".to_owned()),
+            || Err("memory driver cause"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            memory.contains("CUDA device 4: memory query failed: memory driver cause"),
+            "{memory}"
+        );
+    }
+
+    #[test]
+    fn successful_queries_keep_measured_values_including_zero_flags() {
+        let mut visited = Vec::new();
+        let device = query_cuda_device_info::<&str>(
+            5,
+            |kind| {
+                visited.push(kind);
+                Ok(value(kind))
+            },
+            || Ok("actual measured name".to_owned()),
+            || Ok((123, 456)),
+        )
+        .unwrap();
+        assert_eq!(visited, ATTRIBUTES.map(|(kind, _)| kind));
+        assert_eq!(device.ordinal, 5);
+        assert_eq!(device.name, "actual measured name");
+        assert_eq!(
+            (
+                device.capability.compute_major,
+                device.capability.compute_minor
+            ),
+            (8, 0)
+        );
+        assert_eq!(device.sm_count, 108);
+        assert_eq!(device.max_threads_per_sm, 2048);
+        assert_eq!(device.max_shared_mem_per_block, 49152);
+        assert_eq!(device.l2_cache_bytes, 41943040);
+        assert_eq!((device.free_mem_bytes, device.total_mem_bytes), (123, 456));
+        assert!(device.ecc_enabled);
+        assert!(!device.integrated);
     }
 }

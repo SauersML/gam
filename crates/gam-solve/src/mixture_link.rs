@@ -601,7 +601,7 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// terms and a separately evaluated log weight. Direct complementary tails
 /// retain variance information after the reported mean rounds to an endpoint;
 /// each derivative is rescaled separately, including when W itself underflows.
-pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+pub fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
             let jet = logit_inverse_link_jet5(eta);
@@ -2777,8 +2777,8 @@ struct LogisticU {
 
 #[inline]
 fn logistic_uwith_derivatives(eta: f64) -> LogisticU {
-    let ln_u = -gam_linalg::utils::stable_softplus(-eta);
-    let ln_one_minus_u = -gam_linalg::utils::stable_softplus(eta);
+    let ln_u = -gam_math::special::softplus(-eta);
+    let ln_one_minus_u = -gam_math::special::softplus(eta);
     let u = ln_u.exp();
     let one_minus_u = ln_one_minus_u.exp();
     let du = (ln_u + ln_one_minus_u).exp();
@@ -5003,9 +5003,9 @@ mod tests {
         let etas = [-40.0, -30.0, -5.0, 0.42, 5.0, 30.0, 40.0];
         for eta in etas {
             let j_bl = beta_logistic_inverse_link_jet(eta, 0.0, 0.0);
-            let expected_mu = gam_linalg::utils::stable_logistic(eta);
-            let expected_d1 = (-gam_linalg::utils::stable_softplus(-eta)
-                - gam_linalg::utils::stable_softplus(eta))
+            let expected_mu = gam_math::special::logistic(eta);
+            let expected_d1 = (-gam_math::special::softplus(-eta)
+                - gam_math::special::softplus(eta))
             .exp();
             assert!(
                 (j_bl.mu - expected_mu).abs() <= 1e-15 * expected_mu.abs().max(1.0),

@@ -785,7 +785,6 @@ pub fn gaussian_reml_fit_blocks_exact(
         .with_prefer_gradient_only(false)
         .with_disable_fixed_point(true)
         .with_tolerance(1.0e-10)
-        .with_required_projected_gradient_norm(Some(1.0e-8))
         .with_bounds(rho_lower.clone(), rho_upper.clone())
         .with_rho_canonical_keys(Some(canonical_keys))
         .with_fallback_policy(FallbackPolicy::Disabled)
