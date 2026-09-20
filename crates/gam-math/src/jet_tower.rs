@@ -1207,12 +1207,28 @@ pub(crate) fn polygamma_shift_gap_stack(
 /// and taken through one `ln_1p`, the rest are summed as `ln_1p(t_k)` (or
 /// `ln s − ln x_k` once `s/x_k` overflows). That subtraction can cancel against
 /// the Stirling part, so there the error is about `10⁻¹⁴ · max(|gap|, 1)`.
-pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
+pub(crate) fn ln_gamma_shift_gap(x: f64, shift: f64) -> f64 {
+    ln_gamma_shift_gap_with_error(x, shift).0
+}
+
+/// The same live evaluator with a first-omitted Stirling remainder and an
+/// arithmetic allowance based on the uncancelled terms. This is used when a
+/// root residual must account for its normalization rather than treating a
+/// log-gamma difference as one correctly rounded logarithm. The analytic
+/// remainder is the sum of the first omitted alternating Stirling terms,
+/// bounded at the smaller argument x. The arithmetic allowance uses the
+/// uncancelled magnitude and 256 roundings: at most 20 recurrence steps
+/// (five operations each), 20 two-operation delta updates, 10 three-operation
+/// tail updates, logarithms, products and compensated final assembly. libm 0.2.16
+/// log.rs and log1p.rs document errors below one ulp; two unit roundoffs per
+/// logarithm are included. This is a floating-point allowance, not interval
+/// arithmetic with directed rounding of the allowance itself.
+pub(crate) fn ln_gamma_shift_gap_with_error(mut x: f64, shift: f64) -> (f64, f64) {
     if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
-        return f64::NAN;
+        return (f64::NAN, f64::NAN);
     }
     if shift == 0.0 {
-        return 0.0;
+        return (0.0, 0.0);
     }
     let mut recurrence = 0.0;
     let mut small_product_minus_one: f64 = 0.0;
@@ -1221,13 +1237,13 @@ pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
         if t < 1.0 {
             small_product_minus_one += (1.0 + small_product_minus_one) * t;
         } else if t.is_finite() {
-            recurrence += t.ln_1p();
+            recurrence += libm::log1p(t);
         } else {
-            recurrence += shift.ln() - x.ln();
+            recurrence += libm::log(shift) - libm::log(x);
         }
         x += 1.0;
     }
-    recurrence += small_product_minus_one.ln_1p();
+    recurrence += libm::log1p(small_product_minus_one);
     let mut delta = [0.0; 2 * BERNOULLI_EVEN.len()];
     let (ratio, first) = positive_shift_fractions(x, shift);
     for m in 1..delta.len() {
@@ -1240,8 +1256,27 @@ pub(crate) fn ln_gamma_shift_gap(mut x: f64, shift: f64) -> f64 {
         let coefficient = bernoulli / (power * (power - 1)) as f64;
         tail = tail * inverse_squared + coefficient * delta[power - 1];
     }
-    shift * x.ln() + (x + shift - 0.5) * (shift * inverse).ln_1p() - shift + inverse * tail
-        - recurrence
+    let terms = [
+        shift * libm::log(x),
+        // x+shift can overflow although the gap is finite (MAX, 1e292).
+        (x - 0.5) * libm::log1p(shift * inverse),
+        shift * libm::log1p(shift * inverse),
+        -shift,
+        inverse * tail,
+        -recurrence,
+    ];
+    let mut sum = crate::sparse_grid::CompensatedSum::default();
+    for term in terms {
+        sum.add(term);
+    }
+    let magnitude = terms.iter().map(|x| x.abs()).sum::<f64>();
+    let remainder = 2.0 * (854513.0 / 63756.0) * inverse.powi(21);
+    (
+        sum.value(),
+        remainder
+            + crate::roundoff::accumulation_growth(256) * magnitude
+            + 256.0 * crate::double_double::SMALLEST_SUBNORMAL,
+    )
 }
 
 // `(x/(x+s), -s/(x+s))` without forming a possibly overflowing sum.
@@ -2570,6 +2605,23 @@ mod derivative_stack_tests {
     /// `ln Γ(x + s) − ln Γ(x)` against 50-digit references (mpmath `loggamma`),
     /// to a few ulps of `max(|gap|, 1)`, including the NB Poisson limit where two
     /// separate `ln Γ` values of size `x ln x` would leave a `10⁻⁸`–`10⁻³` error.
+    #[test]
+    fn ln_gamma_shift_gap_preserves_finite_results_when_argument_sum_overflows() {
+        // mpmath at 400 digits and exact binary64 input arguments.
+        for (x, shift, expected) in [
+            (f64::MAX, 1.0e292, 7.09782712893384e294),
+            (f64::MAX, 0.5, 354.891356446692),
+            (f64::MAX, 1.0, 709.782712893384),
+            (1.0e300, 1.0e285, 6.907755278982137e287),
+        ] {
+            let (value, error) = ln_gamma_shift_gap_with_error(x, shift);
+            assert!((value-expected).abs() <= 8.0 * f64::EPSILON * expected.abs(),
+                "x={x}, shift={shift}: {value} vs {expected}");
+            assert!((value-expected).abs() <= error);
+            assert_eq!(ln_gamma_shift_gap(x, shift), value);
+        }
+    }
+
     #[test]
     fn ln_gamma_shift_gap_matches_high_precision_references() {
         const REFERENCES: [(f64, f64, f64); 10] = [
