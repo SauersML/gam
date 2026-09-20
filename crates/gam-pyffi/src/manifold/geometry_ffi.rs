@@ -1502,7 +1502,6 @@ fn sinkhorn_barycenter_forward<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let atoms_owned = atoms.as_array().to_owned();
     let weights_owned = weights.as_array().to_owned();
@@ -1513,7 +1512,6 @@ fn sinkhorn_barycenter_forward<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
         )
     })?;
     Ok(out.into_pyarray(py).unbind())
@@ -1526,7 +1524,6 @@ fn sinkhorn_barycenter_vjp<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
     cotangent: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>)> {
     let atoms_owned = atoms.as_array().to_owned();
@@ -1539,7 +1536,6 @@ fn sinkhorn_barycenter_vjp<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
             cot_owned.view(),
         )
     })?;
