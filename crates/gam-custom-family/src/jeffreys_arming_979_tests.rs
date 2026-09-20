@@ -355,10 +355,14 @@ impl CustomFamily for CoupledQuarticPairFamily {
 
     fn exact_newton_joint_hessiansecond_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         d_beta_u_flat: &Array1<f64>,
         d_betav_flat: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        assert!(
+            Self::beta(block_states).iter().all(|value| value.is_finite()),
+            "the coupled quartic second directional derivative owes a finite mode"
+        );
         let c = 2.0 * self.curvature;
         Ok(Some(array![
             [c * d_beta_u_flat[0] * d_betav_flat[0], 0.0],
@@ -378,11 +382,16 @@ impl CustomFamily for CoupledQuarticPairFamily {
 
     fn exact_newton_hessian_second_directional_derivative(
         &self,
-        _block_states: &[ParameterBlockState],
-        _block_idx: usize,
+        block_states: &[ParameterBlockState],
+        block_idx: usize,
         u: &Array1<f64>,
         v: &Array1<f64>,
     ) -> Result<Option<Array2<f64>>, String> {
+        assert!(block_idx < 2, "the coupled quartic family has two blocks");
+        assert!(
+            block_states[block_idx].beta.iter().all(|value| value.is_finite()),
+            "the coupled quartic second directional derivative owes a finite mode"
+        );
         Ok(Some(array![[2.0 * self.curvature * u[0] * v[0]]]))
     }
 }
