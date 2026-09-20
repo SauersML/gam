@@ -213,28 +213,36 @@ impl SurvivalMarginalSlopeFamily {
             .transpose()
     }
 
-    /// The flex calibration `F(a) = Σ_k w_k Φ(−η_k) − Φ(−q)` on a declared finite
-    /// law and its first two `a`-derivatives: the node sum that replaces the
+    /// The smaller tail `T(a)` of the flex calibration on a declared finite law
+    /// and its first two `a`-derivatives: the node sum that replaces the
     /// Gaussian integral of [`Self::evaluate_denested_survival_calibration`]
     /// (gam#2948). At node `u_k`, with `U = a + b·u_k`,
-    /// `η_k = s·(U + b·h(u_k) + w(U))` and `χ_k = ∂η_k/∂a = s·(1 + w′(U))`, so
-    /// `F_a = −Σ_k w_k φ(η_k) χ_k` and `F_aa = −Σ_k w_k φ(η_k)(s·w″(U) − η_k χ_k²)`.
-    /// `F` is summed on the smaller tail: the weights sum to one, so
-    /// `Σ_k w_k Φ(−η_k) − Φ(−q) = Φ(q) − Σ_k w_k Φ(η_k)`, the form read where `q < 0`.
-    pub(crate) fn evaluate_law_survival_calibration(
+    /// `η_k = s·(U + b·h(u_k) + w(U))` and `χ_k = ∂η_k/∂a = s·(1 + w′(U))`.
+    ///
+    /// On the survival side (`q ≥ 0`) the tail is the marginal survival
+    /// `T = Σ_k w_k Φ(−η_k)`,
+    /// with `T_a = −Σ_k w_k φ(η_k) χ_k` and
+    /// `T_aa = −Σ_k w_k φ(η_k)(s·w″(U) − η_k χ_k²)`; otherwise it is the
+    /// marginal failure `T = Σ_k w_k Φ(η_k)`, whose derivatives are the same
+    /// sums with the opposite sign. The calibration identity is `T(a) = Φ(∓q)`
+    /// (gam#2971). `T` is returned as summed, never as a difference against
+    /// `Φ(∓q)`: a difference cannot resolve a tail below one ulp of `Φ(∓q)`,
+    /// which the log-tail root solve must be able to read at every probe.
+    pub(crate) fn evaluate_law_survival_tail(
         &self,
         grid: AnchorGrid<'_>,
         a: f64,
-        q: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
+        survival_side: bool,
     ) -> Result<(f64, f64, f64), String> {
         let scale = self.probit_frailty_scale();
-        let upper = q < 0.0;
+        // `T` integrates `Φ(∓η)`, so its `a`-derivatives carry `∓φ(η)`.
+        let sign = if survival_side { -1.0 } else { 1.0 };
         let mut tail = 0.0;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        let mut tail_a = 0.0;
+        let mut tail_aa = 0.0;
         for (&node, &weight) in grid.nodes.iter().zip(grid.weights) {
             let score = match (self.score_warp.as_ref(), beta_h) {
                 (Some(runtime), Some(beta)) => {
@@ -257,16 +265,11 @@ impl SurvivalMarginalSlopeFamily {
             let eta = scale * (u + slope * score + deviation);
             let chi = scale * (1.0 + deviation_d1);
             let density = crate::probability::normal_pdf(eta);
-            tail += weight * crate::probability::normal_cdf(if upper { eta } else { -eta });
-            f_a -= weight * density * chi;
-            f_aa -= weight * density * (scale * deviation_d2 - eta * chi * chi);
+            tail += weight * crate::probability::normal_cdf(sign * eta);
+            tail_a += sign * weight * density * chi;
+            tail_aa += sign * weight * density * (scale * deviation_d2 - eta * chi * chi);
         }
-        let f = if upper {
-            crate::probability::normal_cdf(q) - tail
-        } else {
-            tail - crate::probability::normal_cdf(-q)
-        };
-        Ok((f, f_a, f_aa))
+        Ok((tail, tail_a, tail_aa))
     }
 
     pub(crate) fn evaluate_survival_denom_d(
@@ -281,10 +284,10 @@ impl SurvivalMarginalSlopeFamily {
         // solved by `solve_row_survival_intercept`, on the row's own law.
         // Reusing that exact derivative convention avoids sign drift between the
         // solver path and the direct-check path.
+        // At `q = 0` the calibration is solved on the survival side,
+        // `F = T − Φ(0)`, so `F′ = T′`.
         let (_, f_a, _) = match self.flex_law_grid(Some(row))? {
-            Some(grid) => {
-                self.evaluate_law_survival_calibration(grid, a, 0.0, b, beta_h, beta_w)?
-            }
+            Some(grid) => self.evaluate_law_survival_tail(grid, a, b, beta_h, beta_w, true)?,
             None => self.evaluate_denested_survival_calibration(a, 0.0, b, beta_h, beta_w)?,
         };
         let d = f_a.abs();

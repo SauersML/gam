@@ -275,7 +275,7 @@ impl<'a> RandomEffectTestBasis<'a> {
         if let RandomEffectTestScale::Known { dispersion } = input.scale
             && !(dispersion.is_finite() && dispersion > 0.0)
         {
-            return Err(RandomEffectTestUnavailable::DesignUnavailable);
+            return Err(RandomEffectTestUnavailable::KnownScaleUnavailable);
         }
 
         let mut hessian_gram = Array2::<f64>::zeros((p, p));
@@ -554,9 +554,9 @@ fn weighted_cross(block: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f
     block.t().dot(&weighted)
 }
 
-struct PseudoInverse {
-    inverse: Array2<f64>,
-    rank: usize,
+pub(crate) struct PseudoInverse {
+    pub(crate) inverse: Array2<f64>,
+    pub(crate) rank: usize,
 }
 
 /// Moore-Penrose inverse of a symmetric positive semi-definite Gram, taken on
@@ -570,8 +570,9 @@ struct PseudoInverse {
 ///
 /// `D^{-1/2} C⁺ D^{-1/2}` is a generalized inverse of `G` (not its Moore-Penrose
 /// inverse when `G` is singular), which is all a projection and a residual sum
-/// of squares require: `G G⁻ G = G` makes both invariant to the choice.
-fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
+/// of squares require: `G G⁻ G = G` makes both invariant to the choice. The
+/// smooth score test's unpenalized residual reads the same inverse.
+pub(crate) fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
     let dim = gram.nrows();
     if dim == 0 || gram.ncols() != dim || gram.iter().any(|v| !v.is_finite()) {
         return None;
@@ -880,6 +881,26 @@ mod tests {
         )
         .expect_err("no residual d.f.");
         assert_eq!(reason, RandomEffectTestUnavailable::NoResidualDegreesOfFreedom);
+    }
+
+    #[test]
+    fn unresolvable_known_dispersion_is_a_typed_known_scale_absence() {
+        let levels = 3;
+        let groups: Vec<usize> = (0..30).map(|i| i % levels).collect();
+        let design = intercept_and_groups(&groups, levels);
+        let y: Array1<f64> = groups.iter().map(|&g| g as f64).collect();
+        let beta = Array1::<f64>::zeros(design.ncols());
+        for dispersion in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let reason = gaussian_test(
+                &design,
+                &y,
+                &beta,
+                1..1 + levels,
+                RandomEffectTestScale::Known { dispersion },
+            )
+            .expect_err("no usable dispersion");
+            assert_eq!(reason, RandomEffectTestUnavailable::KnownScaleUnavailable);
+        }
     }
 
     #[test]

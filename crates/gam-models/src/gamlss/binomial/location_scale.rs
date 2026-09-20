@@ -234,18 +234,20 @@ impl BinomialLocationScaleFamily {
         )?;
         let rows: Vec<(f64, f64, f64)> = (0..n)
             .into_par_iter()
-            .map(|i| {
+            .map(|i| -> Result<_, String> {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, _, _) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
-                );
-                (f * q.q_t * q.q_t, f * q.q_t * q.q_ls, f * q.q_ls * q.q_ls)
+                )?;
+                Ok((f * q.q_t * q.q_t, f * q.q_t * q.q_ls, f * q.q_ls * q.q_ls))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);
         let mut coeff_ll = Array1::<f64>::zeros(n);
@@ -315,23 +317,25 @@ impl BinomialLocationScaleFamily {
         )?;
         let rows: Vec<(f64, f64, f64)> = (0..n)
             .into_par_iter()
-            .map(|i| {
+            .map(|i| -> Result<_, String> {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let u = nonwiggle_q_directional(q, d_eta_t[i], d_eta_ls[i]);
                 let (f, f1, _) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
-                );
+                )?;
                 let tt = f1 * u.delta_q * q.q_t * q.q_t + 2.0 * f * q.q_t * u.delta_q_t;
                 let tl = f1 * u.delta_q * q.q_t * q.q_ls
                     + f * (u.delta_q_t * q.q_ls + q.q_t * u.delta_q_ls);
                 let ll = f1 * u.delta_q * q.q_ls * q.q_ls + 2.0 * f * q.q_ls * u.delta_q_ls;
-                (tt, tl, ll)
+                Ok((tt, tl, ll))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);
         let mut coeff_ll = Array1::<f64>::zeros(n);
@@ -405,16 +409,18 @@ impl BinomialLocationScaleFamily {
         )?;
         let rows: Vec<(f64, f64, f64)> = (0..n)
             .into_par_iter()
-            .map(|i| {
+            .map(|i| -> Result<_, String> {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, f1, f2) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
-                );
-                binomial_expected_location_scale_second_coefficients(
+                )?;
+                Ok(binomial_expected_location_scale_second_coefficients(
                     q,
                     f,
                     f1,
@@ -423,9 +429,9 @@ impl BinomialLocationScaleFamily {
                     d_eta_ls_u[i],
                     d_eta_t_v[i],
                     d_eta_ls_v[i],
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);
         let mut coeff_ll = Array1::<f64>::zeros(n);
@@ -490,7 +496,7 @@ impl BinomialLocationScaleFamily {
         )?;
         let rows: Vec<(f64, f64, f64)> = (0..n)
             .into_par_iter()
-            .map(|i| {
+            .map(|i| -> Result<_, String> {
                 let mut trace_tt = 0.0;
                 for a in 0..pt {
                     for b in 0..pt {
@@ -514,11 +520,13 @@ impl BinomialLocationScaleFamily {
                 let q = nonwiggle_q_derivs(eta_t[i], core.sigma[i]);
                 let (f, f1, f2) = binomial_expected_q_information_derivatives(
                     self.weights[i],
+                    core.q0[i],
+                    &self.link_kind,
                     core.mu[i],
                     core.dmu_dq[i],
                     core.d2mu_dq2[i],
                     core.d3mu_dq3[i],
-                );
+                )?;
                 let (tt_tt, tt_tl, tt_ll) = binomial_expected_location_scale_second_coefficients(
                     q, f, f1, f2, 1.0, 0.0, 1.0, 0.0,
                 );
@@ -528,13 +536,13 @@ impl BinomialLocationScaleFamily {
                 let (ll_tt, ll_tl, ll_ll) = binomial_expected_location_scale_second_coefficients(
                     q, f, f1, f2, 0.0, 1.0, 0.0, 1.0,
                 );
-                (
+                Ok((
                     trace_tt * tt_tt + trace_tl * tt_tl + trace_ll * tt_ll,
                     trace_tt * tl_tt + trace_tl * tl_tl + trace_ll * tl_ll,
                     trace_tt * ll_tt + trace_tl * ll_tl + trace_ll * ll_ll,
-                )
+                ))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         let mut coeff_tt = Array1::<f64>::zeros(n);
         let mut coeff_tl = Array1::<f64>::zeros(n);
         let mut coeff_ll = Array1::<f64>::zeros(n);

@@ -3129,6 +3129,30 @@ pub(crate) fn build_smooth_basis(
                     )
                     .to_string());
                 }
+                // `parse_ps_internal_knots` reads a `knots=[...]` list as "no
+                // count", leaving the list for `resolve_nonperiodic_bspline_knotspec`.
+                // This branch never reaches that resolver: a periodic basis is a
+                // uniform cyclic grid (`cyclic_uniform_knot_vector`) and cannot
+                // take arbitrary interior positions. Without this refusal the
+                // list was dropped and the default adaptive basis was fitted.
+                // `knot_placement=` is refused for the same reason: the grid
+                // is uniform by construction, so the option was accepted and
+                // never read.
+                if knots_option_is_list(options) {
+                    return Err(TermBuilderError::incompatible_config(
+                        "periodic B-spline smooth: explicit knots=[...] positions are not \
+                         supported on a periodic axis, whose knots are a uniform cyclic grid; \
+                         size the basis with k=<basis_dim> instead",
+                    )
+                    .to_string());
+                }
+                if explicit_knot_placement(options)?.is_some() {
+                    return Err(TermBuilderError::incompatible_config(
+                        "periodic B-spline smooth: knot_placement= does not apply on a \
+                         periodic axis, whose knots are a uniform cyclic grid",
+                    )
+                    .to_string());
+                }
                 {
                     let (domain_start, p_value) = if let Some(period) = periods[0] {
                         (origins[0].unwrap_or(minv), period)
@@ -3165,26 +3189,98 @@ pub(crate) fn build_smooth_basis(
                 // and gam's tensor path. Below the cr minimum (a binary covariate)
                 // degrade to the B-spline marginal the default `s(x, k=..)` basis
                 // already fits on the same data — never a hard error.
-                let k_cr = (n_knots + effective_degree + 1).max(CR_MIN_KNOTS);
-                let knotspec = match capped_cr_marginal_knotspec(
-                    ds.values.column(c),
-                    k_cr,
-                    &vars.join(","),
-                    inference_notes,
-                )? {
-                    Some(mut cr_knotspec) => {
-                        widen_cr_knots_to_domain(&mut cr_knotspec, domain);
-                        cr_knotspec
+                //
+                // An explicit `knots=[...]` list gives the interior value knots
+                // (mgcv's `knots=` for `cr`). The basis is indexed by exactly
+                // these knots plus the two boundary knots, so the list fixes the
+                // dimension and conflicts with `k=`. It used to be dropped here,
+                // because `parse_ps_internal_knots` reads a list as "no count",
+                // and the default quantile-knot basis was fitted instead.
+                //
+                // `knot_placement=` is refused: `select_cr_knots` always puts the
+                // value knots at the covariate's quantiles, so the option was
+                // accepted and never read. Explicit knots=[...] choose them.
+                //
+                // `degree=` and `penalty_order=` are definitional on a cr
+                // basis (`build_cubic_regression_basis_1d` builds an
+                // interpolating cubic penalized by ∫f''² and reads neither),
+                // so only the cr's own values are accepted, as on a tensor
+                // cr margin (`CR_MARGIN_DEGREE`, `CR_MARGIN_PENALTY_ORDER`).
+                if let Some(d) =
+                    option_usize(options, "degree")?.filter(|&d| d != CR_MARGIN_DEGREE)
+                {
+                    return Err(TermBuilderError::incompatible_config(format!(
+                        "cr smooth: degree={d} does not apply to bs=cr, a natural cubic \
+                         regression spline (degree {CR_MARGIN_DEGREE}); use bs=ps for a \
+                         B-spline of another degree"
+                    ))
+                    .to_string());
+                }
+                if let Some(m) =
+                    parse_penalty_order(options)?.filter(|&m| m != CR_MARGIN_PENALTY_ORDER)
+                {
+                    return Err(TermBuilderError::incompatible_config(format!(
+                        "cr smooth: penalty_order={m} does not apply to bs=cr, whose penalty \
+                         is the integrated squared derivative of order {CR_MARGIN_PENALTY_ORDER}; \
+                         use bs=ps for another penalty order"
+                    ))
+                    .to_string());
+                }
+                if explicit_knot_placement(options)?.is_some() {
+                    return Err(TermBuilderError::incompatible_config(
+                        "cr smooth: knot_placement= does not apply to bs=cr, whose value \
+                         knots sit at the covariate's quantiles; give explicit knots=[...] \
+                         positions to place them",
+                    )
+                    .to_string());
+                }
+                let explicit_value_knots = match parse_explicit_internal_knots(options)? {
+                    Some(positions) => {
+                        if option_usize_any(options, &["k"])?.is_some() {
+                            return Err(TermBuilderError::incompatible_config(
+                                "cr smooth: specify either explicit knots=[...] positions or \
+                                 k=<basis_dim> (not both); the basis size is fixed by the knots",
+                            )
+                            .to_string());
+                        }
+                        // A one-fold boundary stencil (`degree = 0`) gives
+                        // `[lo, sorted interior..., hi]`. The validation matches
+                        // the open B-spline path: finite, strictly inside the
+                        // range, no duplicates.
+                        let knots = crate::basis::clamped_knot_vector_from_internal_positions(
+                            domain.unwrap_or((minv, maxv)),
+                            &positions,
+                            0,
+                        )
+                        .map_err(|e| e.to_string())?;
+                        Some(BSplineKnotSpec::NaturalCubicRegression { knots })
                     }
-                    None => resolve_nonperiodic_bspline_knotspec(
-                        options,
+                    None => None,
+                };
+                let knotspec = if let Some(explicit) = explicit_value_knots {
+                    explicit
+                } else {
+                    let k_cr = (n_knots + effective_degree + 1).max(CR_MIN_KNOTS);
+                    match capped_cr_marginal_knotspec(
                         ds.values.column(c),
-                        (minv, maxv),
-                        domain,
-                        effective_degree,
-                        n_knots,
-                        false,
-                    )?,
+                        k_cr,
+                        &vars.join(","),
+                        inference_notes,
+                    )? {
+                        Some(mut cr_knotspec) => {
+                            widen_cr_knots_to_domain(&mut cr_knotspec, domain);
+                            cr_knotspec
+                        }
+                        None => resolve_nonperiodic_bspline_knotspec(
+                            options,
+                            ds.values.column(c),
+                            (minv, maxv),
+                            domain,
+                            effective_degree,
+                            n_knots,
+                            false,
+                        )?,
+                    }
                 };
                 (knotspec, parse_cyclic_boundary(options, minv, maxv)?)
             } else {
@@ -5184,7 +5280,11 @@ fn parse_ps_internal_knots(
     // count; it is consumed by `parse_explicit_internal_knots`. Treat it as
     // "count not specified" here so the strict integer parse does not reject
     // the bracketed value (the Provided path ignores the returned count).
-    let knots_internal = if knots_option_is_list(options) {
+    // The list is still the user's choice of basis, so it is never reported
+    // as inferred: an inferred count is resized to the covariate's support
+    // and grown by the formula pilot, and neither may rewrite explicit knots.
+    let explicit_knot_list = knots_option_is_list(options);
+    let knots_internal = if explicit_knot_list {
         None
     } else {
         option_usize(options, "knots")?
@@ -5221,7 +5321,7 @@ fn parse_ps_internal_knots(
     } else {
         Ok((
             knots_internal.unwrap_or(default_internal_knots),
-            knots_internal.is_none(),
+            knots_internal.is_none() && !explicit_knot_list,
             degree,
         ))
     }
@@ -5334,13 +5434,13 @@ fn parse_tensor_per_axis_usize(
 /// The polynomial degree of the natural cubic regression margin. It is not a
 /// parameter of that basis — a "cubic regression spline" IS cubic — so a margin
 /// that asks for any other degree cannot be realized as one.
-const CR_MARGIN_DEGREE: usize = 3;
+pub(crate) const CR_MARGIN_DEGREE: usize = 3;
 
 /// The derivative order the natural cubic regression penalty integrates. Like
 /// [`CR_MARGIN_DEGREE`], this is definitional rather than adjustable: the cr
 /// penalty is the exact integrated squared SECOND derivative of the
 /// interpolating cubic.
-const CR_MARGIN_PENALTY_ORDER: usize = 2;
+pub(crate) const CR_MARGIN_PENALTY_ORDER: usize = 2;
 
 /// The declared `knot_placement=`, distinguishing "unset" from an explicit
 /// `knot_placement=uniform`.
@@ -5414,6 +5514,15 @@ fn resolve_nonperiodic_bspline_knotspec(
             return Err(TermBuilderError::incompatible_config(
                 "ps/bspline smooth: specify either explicit knots=[...] positions or \
                  k=<basis_dim> (not both); the basis size is fixed by the knot vector",
+            )
+            .to_string());
+        }
+        // Placement is a rule for GENERATING knots; the list already gives
+        // them, so a `knot_placement=` beside it was accepted and never read.
+        if explicit_knot_placement(options)?.is_some() {
+            return Err(TermBuilderError::incompatible_config(
+                "ps/bspline smooth: knot_placement= generates knots and cannot be combined \
+                 with explicit knots=[...] positions",
             )
             .to_string());
         }

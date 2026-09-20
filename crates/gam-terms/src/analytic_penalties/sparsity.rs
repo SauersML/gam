@@ -55,7 +55,9 @@ pub fn soft_abs_squared_scale(x: f64, eps_sq: f64) -> f64 {
 ///   may be REML-selected, in which case the
 ///   shrink rate `ε → 0` is governed by the marginal likelihood (Occam keeps
 ///   `ε` large when the data don't demand sharpness).
-/// * `Hoyer` — `(√n · ‖x‖_1 − ‖x‖_2) / (√n − 1)`. Scale-invariant; encourages
+/// * `Hoyer` — `(‖x‖_1 / ‖x‖_2 − 1) / (√n − 1)`, which maps the ratio
+///   `‖x‖_1 / ‖x‖_2 ∈ [1, √n]` onto `[0, 1]`: `0` for a 1-sparse vector and
+///   `1` for an equal-magnitude dense one. Scale-invariant; encourages
 ///   absolute sparsity even when the global scale of `x` drifts.
 /// * `Log { delta }` — `Σ_i log(1 + x_i² / δ²)`. Strongly concave; aggressive
 ///   sparsifier suitable for active-set / iterative-reweighted paths.

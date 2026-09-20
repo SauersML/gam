@@ -284,7 +284,10 @@ pub struct InterventionCalibrationPlan {
     pub eval_log_nu: Vec<f64>,
     pub eval_log_nu_hat: Vec<f64>,
     pub eval_atom: Vec<i64>,
+    /// Atoms whose fit-eligible train interventions (non-control, positive
+    /// prediction) all measure at or below their floors.
     pub below_measurement_floor_atoms: Vec<i64>,
+    /// Atoms with no fit-eligible train intervention.
     pub no_training_intervention_atoms: Vec<i64>,
     /// The `floor_quantile` of the train-control measurements. It is exactly 0 on
     /// a deterministic model.
@@ -485,9 +488,16 @@ pub fn prepare_intervention_calibration(
         .map(|i| floors[i].measurement_band_nats)
         .fold(0.0_f64, f64::max);
 
+    // A record can enter the fit only as an intervention with a positive
+    // prediction, the domain of `log ν̂`. Measurability is screened over exactly
+    // these records, so every atom the reference and held-out frames name has
+    // rows in the fit frame.
+    let fit_eligible = |i: usize| !shard.is_control[i] && nu_hat[i] > 0.0;
+
     // Sorted map makes both the Rust API and every binding deterministic.
-    // Every atom with at least one train intervention is classified exactly
-    // once; controls and eval-forever rows cannot influence measurability.
+    // Every atom with at least one fit-eligible train intervention is classified
+    // exactly once; controls, zero predictions and eval-forever rows cannot
+    // influence measurability.
     let mut atom_is_measurable: BTreeMap<i64, Option<bool>> = shard
         .atom
         .iter()
@@ -495,7 +505,7 @@ pub fn prepare_intervention_calibration(
         .map(|atom| (atom, None))
         .collect();
     for i in 0..n {
-        if !eval[i] && !shard.is_control[i] {
+        if !eval[i] && fit_eligible(i) {
             let measurable = shard.nu_measured[i] > floor[i];
             atom_is_measurable
                 .entry(shard.atom[i])
@@ -523,8 +533,7 @@ pub fn prepare_intervention_calibration(
     let mut eval_log_nu_hat = Vec::new();
     let mut eval_atom = Vec::new();
     for i in 0..n {
-        if shard.is_control[i]
-            || nu_hat[i] <= 0.0
+        if !fit_eligible(i)
             || !matches!(atom_is_measurable.get(&shard.atom[i]), Some(Some(true)))
         {
             continue;
@@ -2430,6 +2439,25 @@ mod tests {
         assert!((result.respeed[0].1 - (-0.5_f64).exp()).abs() < 1.0e-12);
         assert!((result.respeed[1].1 - 0.5_f64.exp()).abs() < 1.0e-12);
         assert_eq!(result.heldout_rmse_lognats, Some(0.25));
+    }
+
+    #[test]
+    fn an_atom_resolved_only_by_zero_predictions_is_never_named_without_fit_rows() {
+        // Atom 20's one train intervention clears the floor but predicts 0 nats, so
+        // it cannot enter the log-log fit. Screening it as measurable put atom 20 in
+        // the reference frame with no row of the fit frame, an atom level the fitted
+        // `group(atom)` term never saw.
+        let (mut shard, spec) = calibration_shard_and_spec();
+        shard.nu_hat_1[3] = 0.0;
+        shard.nu_measured[3] = 5.0;
+        let plan = prepare_intervention_calibration(&shard, spec).unwrap();
+        assert_eq!(plan.measurable_atoms, vec![10]);
+        assert_eq!(plan.below_measurement_floor_atoms, Vec::<i64>::new());
+        assert_eq!(plan.no_training_intervention_atoms, vec![20]);
+        assert_eq!(plan.train_atom, vec![10, 10]);
+        for atom in plan.measurable_atoms.iter().chain(&plan.eval_atom) {
+            assert!(plan.train_atom.contains(atom), "atom {atom} has no fit rows");
+        }
     }
 
     #[test]

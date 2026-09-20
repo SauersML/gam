@@ -480,7 +480,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "survival_should_chunk",
             "survival_chunk_iter_collect",
             "write_survival_csv",
-            "default_survival_time_grid",
             "competing_risks_cif",
             "competing_risks_cif_from_predictions",
             "survival_prediction_payload_from_json",
@@ -615,29 +614,14 @@ impl PyEncodedTable {
             .map(|(column, schema)| {
                 let value = self.dataset.values[[row, column]];
                 match schema.kind {
-                    ColumnKindTag::Categorical => {
-                        let code = value as usize;
-                        if value < 0.0 || value.fract() != 0.0 || code >= schema.levels.len() {
-                            return Err(format!(
-                                "categorical column '{}' has invalid encoded value {value} at row {}",
-                                schema.name,
-                                row + 1
-                            ));
-                        }
-                        // Legacy table entry points still infer from strings. Mark
-                        // this one lazily-rendered row so numeric-looking labels
-                        // retain their categorical source intent.
-                        Ok(format!(
-                            "{}{}",
-                            gam::data::CATEGORICAL_CELL_SENTINEL,
-                            schema.levels[code]
-                        ))
-                    }
-                    ColumnKindTag::Binary => Ok(if value == 0.0 {
-                        "0".to_string()
-                    } else {
-                        "1".to_string()
-                    }),
+                    // Legacy table entry points still infer from strings. Mark
+                    // this one lazily-rendered row so numeric-looking labels
+                    // retain their categorical source intent.
+                    ColumnKindTag::Categorical => schema.present_cell_label(value, row).map(
+                        |label| format!("{}{label}", gam::data::CATEGORICAL_CELL_SENTINEL),
+                    ),
+                    // A missing binary cell is refused, not rendered as "1".
+                    ColumnKindTag::Binary => schema.present_cell_label(value, row),
                     ColumnKindTag::Continuous => Ok(format!("{value:?}")),
                 }
             })
@@ -1411,62 +1395,16 @@ fn extract_row_ids(
         rows.dataset.schema.columns.get(index).ok_or_else(|| {
             py_value_error(format!("id_column '{id_column}' has no encoded schema"))
         })?;
-    let mut row_ids = Vec::with_capacity(rows.dataset.values.nrows());
-    for row in 0..rows.dataset.values.nrows() {
-        let value = rows.dataset.values[[row, index]];
-        row_ids.push(match schema.kind {
-            ColumnKindTag::Categorical => {
-                let code = value as usize;
-                schema.levels.get(code).cloned().ok_or_else(|| {
-                    py_value_error(format!(
-                        "id_column '{id_column}' has invalid category code {value} at row {}",
-                        row + 1
-                    ))
-                })?
-            }
-            ColumnKindTag::Binary => if value == 0.0 { "0" } else { "1" }.to_string(),
-            ColumnKindTag::Continuous => format!("{value:?}"),
-        });
-    }
+    // Every prediction row needs its own id: a missing id cell is refused, not
+    // relabelled as the first level (`NaN as usize == 0`) or as binary "1".
+    let row_ids = (0..rows.dataset.values.nrows())
+        .map(|row| {
+            schema
+                .present_cell_label(rows.dataset.values[[row, index]], row)
+                .map_err(|err| py_value_error(format!("id_column '{id_column}': {err}")))
+        })
+        .collect::<PyResult<Vec<String>>>()?;
     Ok(Some(row_ids))
-}
-
-#[pyfunction(signature = (model_class, formula, headers, rows, model_bytes = None))]
-fn default_survival_time_grid(
-    model_class: &str,
-    formula: &str,
-    headers: Vec<String>,
-    rows: PyRef<'_, PyEncodedTable>,
-    model_bytes: Option<Vec<u8>>,
-) -> PyResult<Option<Vec<f64>>> {
-    rows.require_headers(&headers).map_err(py_value_error)?;
-    default_survival_time_grid_impl(model_class, formula, &rows.dataset, model_bytes.as_deref())
-}
-
-fn default_survival_time_grid_impl(
-    model_class: &str,
-    formula: &str,
-    dataset: &EncodedDataset,
-    model_bytes: Option<&[u8]>,
-) -> PyResult<Option<Vec<f64>>> {
-    match model_class {
-        "survival"
-        | "competing risks survival"
-        | "survival marginal-slope"
-        | "survival location-scale" => {}
-        _ => return Ok(None),
-    }
-    // Training-time anchor from the saved payload, read through the TYPED
-    // model rather than ad-hoc JSON field sniffing (#2470). A byte payload
-    // that fails to parse contributes no anchor, preserving the historical
-    // prediction-frame-only fallback for legacy models.
-    let training_hi = model_bytes
-        .and_then(|bytes| serde_json::from_slice::<FittedModel>(bytes).ok())
-        .and_then(|model| {
-            gam::families::survival::predict::survival_training_time_upper_bound(model.payload())
-        });
-    gam::families::survival::predict::default_survival_time_grid(formula, dataset, training_hi)
-        .map_err(py_value_error)
 }
 
 fn default_survival_time_grid_from_model(
@@ -3593,6 +3531,33 @@ fn sphere_kernel_kind_from_str(
             "{site} kernel must be one of 'sobolev', 'pseudo', 'harmonic'; got '{other}'"
         ))),
     }
+}
+
+/// Column count of the S² basis `sphere_basis` / `sphere_basis_with_centers`
+/// build for `n_centers` centers (the harmonic truncation degree under
+/// `kernel = "harmonic"`), read without evaluating it through
+/// `gam::terms::basis::spherical_spline_basis_width`, the builder's own width
+/// rule. A descriptor the builder refuses (a harmonic degree past the cap, a
+/// pseudo width past it, fewer than two Wahba centers) is refused here with
+/// the same error.
+#[pyfunction(signature = (n_centers, kernel = "sobolev"))]
+fn sphere_basis_size(n_centers: usize, kernel: &str) -> PyResult<usize> {
+    let (method, wahba_kernel) = sphere_kernel_kind_from_str(kernel, "sphere_basis_size")?;
+    let max_degree = matches!(method, SphereMethod::Harmonic).then_some(n_centers);
+    let spec = SphericalSplineBasisSpec {
+        center_strategy: CenterStrategy::FarthestPoint {
+            num_centers: n_centers,
+        },
+        penalty_order: 2,
+        double_penalty: false,
+        radians: false,
+        method,
+        max_degree,
+        wahba_kernel,
+        identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
+    };
+    gam::terms::basis::spherical_spline_basis_width(&spec, 0).map_err(basis_error_to_pyerr)
 }
 
 /// Analytic DESIGN jet `∂Φ/∂(lat, lon)` of the spherical-spline basis built by

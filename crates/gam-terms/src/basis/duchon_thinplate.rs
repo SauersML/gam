@@ -2276,7 +2276,11 @@ pub(crate) fn thin_plate_canonical_infeasible_at_centers(centers: ArrayView2<'_,
     // Enough centers by count (`M(d) ≤ k`), so the block is small enough to
     // form: check the ACTUAL rank so a degenerate center geometry promotes to
     // Duchon rather than hard-erroring in canonical TPS.
-    let poly_block = thin_plate_polynomial_block(centers);
+    // Probe the same mean-centered frame the builder factors
+    // (`thin_plate_kernel_constraint_nullspace`), so a large coordinate offset
+    // cannot make the gate and the builder disagree about the rank.
+    let centered = mean_centered_centers(centers);
+    let poly_block = thin_plate_polynomial_block(centered.view());
     let poly_cols = poly_block.ncols();
     match rrqr_nullspace_basis(&poly_block, default_rrqr_rank_alpha()) {
         Ok((_, rank)) => rank < poly_cols,
@@ -2489,6 +2493,11 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
         data_centered.column_mut(c).mapv_inplace(|v| v - mu);
         knots_centered.column_mut(c).mapv_inplace(|v| v - mu);
     }
+    // `thin_plate_kernel_constraint_nullspace` mean-centers internally with
+    // this same knot mean; hand it the RAW knots so this builder and every
+    // metadata consumer (which only ever see the raw frozen centers) factor
+    // bit-identical inputs and share one cache entry.
+    let knots_raw = knots;
     let data = data_centered.view();
     let knots = knots_centered.view();
 
@@ -2528,7 +2537,7 @@ pub(crate) fn create_thin_plate_spline_basis_scaledwithworkspace(
 
     // Enforce TPS side-constraint P(knots)^T α = 0 by projecting onto
     // the nullspace of P(knots)^T.
-    let z = thin_plate_kernel_constraint_nullspace(knots, &mut workspace.cache)?;
+    let z = thin_plate_kernel_constraint_nullspace(knots_raw, &mut workspace.cache)?;
     let kernel_constrained = fast_ab(&kernel_block, &z);
     let omega_constrained = {
         let zt_o = fast_atb(&z, &omega);

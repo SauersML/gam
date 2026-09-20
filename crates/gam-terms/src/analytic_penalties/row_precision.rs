@@ -301,9 +301,6 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -366,8 +363,15 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
 /// Khemakhem et al. (2020) identify nonlinear ICA/iVAE latent factors from
 /// auxiliary-variable variation up to an affine transform under sufficient
 /// variation in `u`. This penalty implements the conditional-mean side of that
-/// signal as `0.5 * μ * ||t - U(UᵀU + εI)⁻¹Uᵀt||²`, penalizing only the
-/// component of each latent axis not explained by a ridge linear fit to `u`.
+/// signal. Per latent axis `t` it is `0.5 * μ * tᵀ(I - P)t` with ridge hat
+/// matrix `P = U(UᵀU + εI)⁻¹Uᵀ`. This equals the minimized ridge objective
+/// `0.5 * μ * min_B (||t - UB||² + ε||B||²)`, so it penalizes the component of
+/// each axis not explained by a ridge linear fit to `u`. It is not the squared
+/// residual `||t - Pt||² = tᵀ(I - P)²t`: `P` is not idempotent when `ε > 0`.
+/// By Woodbury, `I - P = (I + UUᵀ/ε)⁻¹`. So `μ(I - P)` is the precision of the
+/// Gaussian marginal of `t = UB + e` with `B ~ N(0, I/(με))` and
+/// `e ~ N(0, I/μ)`. That is why the learnable-weight normalizer is
+/// `-0.5 * len * ln μ`.
 #[derive(Debug, Clone)]
 pub struct IvaeRidgeMeanGauge {
     pub aux: Array2<f64>,
@@ -676,9 +680,6 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
