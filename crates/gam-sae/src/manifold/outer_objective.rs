@@ -1,6 +1,7 @@
 use super::*;
 use gam_solve::rho_optimizer::{
-    CriterionRank, FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
+    CriterionRank, FixedPointCertificateEval, FixedPointCoordinateCertificate,
+    OuterCriterionCertificate, OuterResult,
 };
 
 pub(crate) fn reconstruction_explained_variance(
@@ -892,6 +893,10 @@ pub struct SaeManifoldOuterObjective {
 /// resulting capacity is deliberately conservative and comes from the same
 /// cgroup-aware host budget as the SAE streaming plan. Reaching it is an
 /// explicit feasibility error from `BasinBundle::admit`, not an inexact envelope.
+///
+/// The shape is read from `term` as it is NOW, the same shape
+/// [`SaeManifoldTerm::streaming_plan`] routes the probe on, so the envelope is
+/// never admitted by one shape and sized by another.
 fn basin_bundle_member_capacity(term: &SaeManifoldTerm) -> usize {
     // #2560 — derive from the reading the term captured once at construction,
     // not from a fresh probe. Available memory moves with every other process
@@ -963,6 +968,39 @@ pub(crate) fn assignment_strength_gradient_coordinate(rho: &SaeManifoldRho) -> O
 const SAE_SURROGATE_LANE_QUADRATURE_REL_TOL: f64 = 1.0e-8;
 const SAE_SURROGATE_LANE_CG_REL_TOL: f64 = 1.0e-8;
 const SAE_SURROGATE_LANE_DEFLATION_SUBSPACE_ITERS: usize = 4;
+
+/// Why [`SaeManifoldOuterObjective::certify_outer_result`] did not stamp a result.
+#[derive(Debug)]
+pub enum SaeOuterCertificationError {
+    /// The result cannot certify the installed state.
+    Refused(String),
+    /// #2933 F29 — the streaming surrogate's certificate is contradicted by probes the
+    /// search never saw. The doubled validation plan is installed; the search resumes
+    /// from `rho` ([`SaeManifoldOuterObjective::run_to_certificate`]).
+    SurrogateDisagrees { rho: Array1<f64>, detail: String },
+}
+
+impl std::fmt::Display for SaeOuterCertificationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(reason) => f.write_str(reason),
+            Self::SurrogateDisagrees { detail, .. } => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for SaeOuterCertificationError {}
+
+/// The outcome of [`SaeManifoldOuterObjective::run_to_certificate`].
+#[derive(Debug)]
+pub enum SaeOuterRun {
+    /// Converged and stamped: the objective holds the certified state.
+    Certified(OuterResult),
+    /// The search stopped without converging.
+    Unconverged(OuterResult),
+    /// Converged, but the result could not be certified.
+    Refused { result: OuterResult, reason: String },
+}
 
 pub(crate) fn sae_surrogate_lane_config() -> SurrogateLaneConfig {
     SurrogateLaneConfig {
@@ -1159,7 +1197,6 @@ impl SaeManifoldOuterObjective {
             .as_ref()
             .map(AnalyticPenaltyRegistry::isometry_scalar_weights)
             .unwrap_or_default();
-        let basin_member_capacity = basin_bundle_member_capacity(&term);
         Self {
             term,
             baseline_term,
@@ -1180,7 +1217,9 @@ impl SaeManifoldOuterObjective {
             cancel_flag: None,
             probe_converged_handoff: None,
             surrogate_lane: Some(SurrogateLaneState::new(sae_surrogate_lane_config())),
-            basin_bundle: BasinBundle::new(basin_member_capacity),
+            // Sized from the live shape at every envelope probe
+            // (`authoritative_envelope_value_probe`), never from this one.
+            basin_bundle: BasinBundle::new(0),
             // #2235 — outer-search accounting + the non-convergence forcing
             // function (stationarity defect raises a typed error; a fit object
             // only ever exists from a converged optimization).
@@ -1313,37 +1352,13 @@ impl SaeManifoldOuterObjective {
         evaluation: &OuterCriterionEvaluation,
     ) -> Result<Array1<f64>, OuterGradientError> {
         let components = match &evaluation.artifacts {
-            OuterEvaluationArtifacts::MatrixFree(matrix_free) => {
-                let derivative_vectors = &matrix_free.logdet_derivative_bundle.vectors;
-                let solver = DeflatedArrowSolver::plain(&evaluation.cache);
-                self.term
-                    .analytic_outer_rho_gradient_components_with_bundle(
-                        self.target.view(),
-                        rho,
-                        &evaluation.loss,
-                        &evaluation.cache,
-                        &solver,
-                        // #2515/#2668 — the ranked criterion on this lane is
-                        // `½log|A| + rank_charge`, coordinate block included
-                        // (`rank_adjusted_quasi_laplace_complexity` takes `½log_det`, and
-                        // `log_det = log|A_tt| + log|S_A|` comes off
-                        // `exact_a_evidence_system`). Its derivative is
-                        // `½tr(A⁻¹ ∂A/∂ρ)`, which the from-probes channels
-                        // reconstruct only if the row geometry and the `S⁻¹` come from
-                        // the same operator. `cache` stays `B`: it is the Newton/IFT
-                        // scale that `solve_exact_stationarity_matrix_free` rebuilds
-                        // `A = B + ΔC` on top of, and promoting it would double-count
-                        // `ΔC`.
-                        Some(BundleEvidenceGeometry {
-                            operator: EvidenceOperator::ExactObservedInformation,
-                            cache: &matrix_free.exact_a_cache,
-                            probes: derivative_vectors,
-                            sinv: derivative_vectors,
-                        }),
-                        Some(&matrix_free.system),
-                        None,
-                    )?
-            }
+            OuterEvaluationArtifacts::MatrixFree(matrix_free) => self
+                .matrix_free_gradient_components(
+                    rho,
+                    evaluation,
+                    matrix_free,
+                    &matrix_free.logdet_derivative_bundle.vectors,
+                )?,
             OuterEvaluationArtifacts::ArrowOrbit(geometry) => {
                 // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
                 // log-determinant channel and the adjoint read the orbit lane's elimination.
@@ -1378,7 +1393,56 @@ impl SaeManifoldOuterObjective {
                     )?
             }
         };
-        let mut gradient = components.gradient();
+        self.with_block_log_lambda_gradient(rho, components.gradient())
+    }
+
+    /// The streaming lane's gradient components with `vectors` standing in for the
+    /// evaluation's derivative bundle. `vectors` is the whole bundle for the gradient,
+    /// or one probe's reweighted share of it for that probe's sample
+    /// ([`Self::logdet_gradient_probe_samples`]).
+    fn matrix_free_gradient_components(
+        &self,
+        rho: &SaeManifoldRho,
+        evaluation: &OuterCriterionEvaluation,
+        matrix_free: &MatrixFreeOuterArtifacts,
+        vectors: &[Array1<f64>],
+    ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
+        let solver = DeflatedArrowSolver::plain(&evaluation.cache);
+        self.term
+            .analytic_outer_rho_gradient_components_with_bundle(
+                self.target.view(),
+                rho,
+                &evaluation.loss,
+                &evaluation.cache,
+                &solver,
+                // #2515/#2668 — the ranked criterion on this lane is
+                // `½log|A| + rank_charge`, coordinate block included
+                // (`rank_adjusted_quasi_laplace_complexity` takes `½log_det`, and
+                // `log_det = log|A_tt| + log|S_A|` comes off
+                // `exact_a_evidence_system`). Its derivative is
+                // `½tr(A⁻¹ ∂A/∂ρ)`, which the from-probes channels
+                // reconstruct only if the row geometry and the `S⁻¹` come from
+                // the same operator. `cache` stays `B`: it is the Newton/IFT
+                // scale that `solve_exact_stationarity_matrix_free` rebuilds
+                // `A = B + ΔC` on top of, and promoting it would double-count
+                // `ΔC`.
+                Some(BundleEvidenceGeometry {
+                    operator: EvidenceOperator::ExactObservedInformation,
+                    cache: &matrix_free.exact_a_cache,
+                    probes: vectors,
+                    sinv: vectors,
+                }),
+                Some(&matrix_free.system),
+                None,
+            )
+    }
+
+    /// Add the crosscoder block-weight gradient to `gradient` (a no-op for a plain SAE).
+    fn with_block_log_lambda_gradient(
+        &self,
+        rho: &SaeManifoldRho,
+        mut gradient: Array1<f64>,
+    ) -> Result<Array1<f64>, OuterGradientError> {
         if let Some(block_grad) = self
             .block_log_lambda_gradient()
             .map_err(OuterGradientError::internal)?
@@ -1398,6 +1462,60 @@ impl SaeManifoldOuterObjective {
             }
         }
         Ok(gradient)
+    }
+
+    /// #2933 F29 — the streaming gradient re-taken on each Hutchinson probe's share of
+    /// the evaluation's derivative bundle alone, one row per probe; `None` when the
+    /// evaluation's value is exact (dense, arrow-orbit, or the exact dense reduced Schur
+    /// the lane prices below its probe budget), where there is no probe to split.
+    ///
+    /// The gradient is affine in the bundle's second moment `(1/r)Σ_z z zᵀ`: every
+    /// log-determinant channel is a trace against it, and the implicit channel solves
+    /// with a right-hand side linear in it. The bundle is `D + (1/m)Σ_j X_j`, with `D`
+    /// its deterministic deflation share and `X_j = Σ_ℓ w_ℓ u_{jℓ} u_{jℓ}ᵀ` probe `j`'s
+    /// quadrature ladder. Probe `j`'s `nodes` vectors, each scaled by
+    /// `√(nodes·w)` with `w = m/r` ([`RationalLogdetDerivativeBundle::probe_sample_weight`]),
+    /// have second moment `X_j`, so row `j` is the gradient with the probe mean replaced
+    /// by probe `j` and the deflation share dropped. The mean over rows differs from the
+    /// gradient by that deterministic share, and a mean over any subset of rows,
+    /// shifted by the same difference, is the gradient that subset's probes alone
+    /// estimate.
+    pub(crate) fn logdet_gradient_probe_samples(
+        &self,
+        rho: &SaeManifoldRho,
+        evaluation: &OuterCriterionEvaluation,
+    ) -> Result<Option<Array2<f64>>, OuterGradientError> {
+        let OuterEvaluationArtifacts::MatrixFree(matrix_free) = &evaluation.artifacts else {
+            return Ok(None);
+        };
+        let bundle = &matrix_free.logdet_derivative_bundle;
+        let probes = bundle.hutchinson_probe_count();
+        if probes == 0 {
+            return Ok(None);
+        }
+        let nodes = bundle.evaluation_metrics().node_count;
+        let scale = (nodes as f64 * bundle.probe_sample_weight()).sqrt();
+        let mut samples: Option<Array2<f64>> = None;
+        for probe in 0..probes {
+            let share: Vec<Array1<f64>> = bundle
+                .probe_vectors(probe)
+                .ok_or_else(|| {
+                    OuterGradientError::internal(format!(
+                        "streaming derivative bundle of {} vectors holds no probe {probe} of {probes} \
+                         on {nodes} quadrature nodes",
+                        bundle.vectors.len()
+                    ))
+                })?
+                .iter()
+                .map(|vector| vector * scale)
+                .collect();
+            let components =
+                self.matrix_free_gradient_components(rho, evaluation, matrix_free, &share)?;
+            let row = self.with_block_log_lambda_gradient(rho, components.gradient())?;
+            let samples = samples.get_or_insert_with(|| Array2::zeros((probes, row.len())));
+            samples.row_mut(probe).assign(&row);
+        }
+        Ok(samples)
     }
 
     /// #2231 Inc-B (stage 1) — enable crosscoder block-relevance PRICING.
@@ -1797,26 +1915,41 @@ impl SaeManifoldOuterObjective {
     /// closes the #2230 hole where any successful evaluation populated
     /// `last_loss` and `into_fitted` silently interpreted an absent search
     /// verdict as `FixedRho`.
-    pub fn certify_outer_result(&mut self, result: &OuterResult) -> Result<(), String> {
+    ///
+    /// On the streaming lane the searched criterion is the frozen rational surrogate
+    /// of `½log|A|`, and the certificate judges that surrogate's gradient. Before
+    /// stamping, the certified point is re-scored on a plan of twice the search's
+    /// probes ([`Self::validate_surrogate_certificate`]); a disagreement is returned as
+    /// [`SaeOuterCertificationError::SurrogateDisagrees`] with the doubled plan
+    /// installed, for [`Self::run_to_certificate`] to resume from.
+    pub fn certify_outer_result(
+        &mut self,
+        result: &OuterResult,
+    ) -> Result<(), SaeOuterCertificationError> {
+        use SaeOuterCertificationError::Refused;
         self.fit_verdict = None;
         self.terminal_penalized_quasi_laplace_criterion = None;
         if !result.converged() {
-            return Err("outer result is not converged".to_string());
+            return Err(Refused("outer result is not converged".to_string()));
         }
-        let via = result
-            .converged_via()
-            .ok_or_else(|| "converged outer result is missing converged_via".to_string())?;
+        let via = result.converged_via().ok_or_else(|| {
+            Refused("converged outer result is missing converged_via".to_string())
+        })?;
         let certificate = result.criterion_certificate.as_ref().ok_or_else(|| {
-            "converged outer result is missing its analytic criterion certificate".to_string()
+            Refused(
+                "converged outer result is missing its analytic criterion certificate".to_string(),
+            )
         })?;
         if !certificate.certifies() {
-            return Err(format!(
+            return Err(Refused(format!(
                 "outer criterion certificate does not certify the installed state: {}",
                 certificate.summary()
-            ));
+            )));
         }
         if self.last_loss.is_none() {
-            return Err("outer result has no installed converged inner loss".to_string());
+            return Err(Refused(
+                "outer result has no installed converged inner loss".to_string(),
+            ));
         }
         let installed_rho = self.current_rho.flat_coordinates();
         let rho_matches = installed_rho.len() == result.rho.len()
@@ -1825,17 +1958,218 @@ impl SaeManifoldOuterObjective {
                 .zip(result.rho.iter())
                 .all(|(installed, certified)| installed.to_bits() == certified.to_bits());
         if !rho_matches {
-            return Err(format!(
+            return Err(Refused(format!(
                 "outer result rho does not match the installed state (certified={:?}, installed={:?})",
                 result.rho, installed_rho
-            ));
+            )));
         }
         if !result.final_value.is_finite() {
-            return Err("converged outer result has a non-finite final criterion value".into());
+            return Err(Refused(
+                "converged outer result has a non-finite final criterion value".into(),
+            ));
         }
-        self.terminal_penalized_quasi_laplace_criterion = Some(result.final_value);
+        let terminal = match self.validate_surrogate_certificate(certificate)? {
+            Some(validated) => validated,
+            None => result.final_value,
+        };
+        self.terminal_penalized_quasi_laplace_criterion = Some(terminal);
         self.fit_verdict = Some(SaeOuterVerdict::Search(via));
         Ok(())
+    }
+
+    /// #2933 F29 — check a certificate the streaming lane's surrogate issued against
+    /// probes the search never saw. `Ok(None)` when the certified value was exact (the
+    /// dense route, or a streaming lane that built no rational plan); `Ok(Some(value))`
+    /// with the criterion re-scored on the validation plan when the certificate stands.
+    ///
+    /// The search minimized the surrogate on its `m` frozen probes, so its certificate
+    /// `‖Pg_m‖ ≤ b` is a claim about those probes. The validation plan draws `2m` off
+    /// the same sequential stream: its first `m` repeat the search's, and the last `m`
+    /// are independent of everything the search did. Their per-probe gradient samples
+    /// ([`Self::logdet_gradient_probe_samples`]) give an unselected estimate `g'` with
+    /// standard error `σ'` from their own spread, and the first half's spread gives the
+    /// search probes' resolution `σ_seen`. The point minimizes the surrogate, so the
+    /// criterion's gradient there is the search probes' own gradient error, of size
+    /// `‖Pσ_seen‖`; the unseen block contradicts the certificate only past its own noise:
+    /// it stands iff `‖Pg'‖ ≤ b + ‖Pσ_seen‖ + ‖Pσ'‖`. A railed coordinate's outward
+    /// component is no descent direction, so it is projected out as the certificate
+    /// projects it. When the doubled plan prices the exact reduced Schur instead
+    /// (`num_probes·k` now covers its build), there is no probe noise left and the
+    /// certificate stands iff the exact `‖Pg‖ ≤ b`. The support LAML's search judges
+    /// its certified points the same way (`run_support_outer_search`).
+    /// The judged point is the installed `current_rho`, which
+    /// [`Self::certify_outer_result`] has verified bit-identical to the result's.
+    pub(crate) fn validate_surrogate_certificate(
+        &mut self,
+        certificate: &OuterCriterionCertificate,
+    ) -> Result<Option<f64>, SaeOuterCertificationError> {
+        use SaeOuterCertificationError::Refused;
+        let direct_logdet_admitted = self
+            .term
+            .streaming_plan()
+            .map_err(Refused)?
+            .direct_logdet_admitted();
+        if direct_logdet_admitted {
+            return Ok(None);
+        }
+        let Some((seen, nodes, border)) = self
+            .surrogate_lane
+            .as_ref()
+            .and_then(SurrogateLaneState::plan)
+            .map(|plan| (plan.probes.len(), plan.nodes.len(), plan.dim))
+        else {
+            return Ok(None);
+        };
+        let doubled = seen
+            .checked_mul(2)
+            .ok_or_else(|| Refused("surrogate probe count overflow".to_string()))?;
+        super::support_outer::admit_logdet_probe_plan(doubled, nodes, border)
+            .map_err(|err| Refused(err.to_string()))?;
+        self.surrogate_lane = Some(SurrogateLaneState::new(SurrogateLaneConfig {
+            num_probes: doubled,
+            ..sae_surrogate_lane_config()
+        }));
+        let rho = self.current_rho.clone();
+        self.apply_block_scaling(&rho).map_err(Refused)?;
+        let evaluation = self
+            .evaluate_outer_criterion_route(&rho, false, false)
+            .map_err(|err| {
+                Refused(format!(
+                    "the streaming criterion could not re-score its certified point on {doubled} \
+                     probes: {err}"
+                ))
+            })?;
+        let refused_gradient = |err: OuterGradientError| {
+            Refused(format!(
+                "the streaming gradient could not be re-taken at its certified point on \
+                 {doubled} probes: {err}"
+            ))
+        };
+        let gradient = self
+            .analytic_gradient_for_outer_evaluation(&rho, &evaluation)
+            .map_err(refused_gradient)?;
+        let samples = self
+            .logdet_gradient_probe_samples(&rho, &evaluation)
+            .map_err(refused_gradient)?;
+        let (mut judged, mut unseen_std_err, mut seen_std_err) = match &samples {
+            None => (
+                gradient.clone(),
+                Array1::zeros(gradient.len()),
+                Array1::zeros(gradient.len()),
+            ),
+            Some(samples) if samples.nrows() == doubled => {
+                let blocks = super::support_outer::probe_block_gradients(&gradient, samples, seen)
+                    .map_err(|err| Refused(err.to_string()))?;
+                (
+                    blocks.unseen_gradient,
+                    blocks.unseen_std_err,
+                    blocks.seen_std_err,
+                )
+            }
+            Some(samples) => {
+                return Err(Refused(format!(
+                    "the streaming criterion re-scored its certified point on {} probes, not \
+                     the {doubled} its validation plan draws",
+                    samples.nrows()
+                )));
+            }
+        };
+        for fact in &certificate.railed_facts {
+            let coordinate = fact.index;
+            if coordinate >= judged.len() {
+                continue;
+            }
+            let at_lower = fact.theta - fact.lower <= fact.upper - fact.theta;
+            let outward = if at_lower {
+                judged[coordinate] > 0.0
+            } else {
+                judged[coordinate] < 0.0
+            };
+            if outward {
+                judged[coordinate] = 0.0;
+                unseen_std_err[coordinate] = 0.0;
+                seen_std_err[coordinate] = 0.0;
+            }
+        }
+        let gradient_norm = judged.dot(&judged).sqrt();
+        let std_err_norm = unseen_std_err.dot(&unseen_std_err).sqrt();
+        let seen_std_err_norm = seen_std_err.dot(&seen_std_err).sqrt();
+        let band = certificate.stationarity.bound();
+        let threshold = band + seen_std_err_norm + std_err_norm;
+        let lane = if samples.is_some() {
+            format!("{seen} unseen probes")
+        } else {
+            "the exact reduced Schur".to_string()
+        };
+        log::debug!(
+            "SAE streaming certified point re-scored on {lane}: |Pg| = {gradient_norm:.6e}, \
+             standard error {std_err_norm:.6e}; certificate band {band:.6e}, search-probe \
+             resolution {seen_std_err_norm:.6e}"
+        );
+        if gradient_norm > threshold {
+            return Err(SaeOuterCertificationError::SurrogateDisagrees {
+                rho: rho.flat_coordinates(),
+                detail: format!(
+                    "the surrogate's certified point has |Pg| = {gradient_norm:.6e} on {lane} \
+                     against band {band:.6e} plus search-probe resolution \
+                     {seen_std_err_norm:.6e} plus standard error {std_err_norm:.6e}"
+                ),
+            });
+        }
+        let cost = evaluation.cost + self.block_jacobian(&rho);
+        if !cost.is_finite() {
+            return Err(Refused(format!(
+                "the streaming criterion re-scored its certified point on {lane} to a \
+                 non-finite value"
+            )));
+        }
+        self.last_loss = Some(evaluation.loss);
+        Ok(Some(cost))
+    }
+
+    /// Run `problem` to a certified fit: each converged result goes through
+    /// [`Self::certify_outer_result`], and a surrogate certificate the unseen probes
+    /// contradict resumes the search from its point on the doubled plan it installed,
+    /// whose probe noise is `1/√2` of its predecessor's. The doubling ends where the
+    /// host cannot store a larger plan, where the doubled plan prices the exact reduced
+    /// Schur, or where `problem`'s iteration budget is spent; every ending is a typed
+    /// outcome, never an unchecked fit.
+    pub fn run_to_certificate(
+        &mut self,
+        problem: &gam_solve::rho_optimizer::OuterProblem,
+        context: &str,
+    ) -> Result<SaeOuterRun, EstimationError> {
+        let budget = problem.max_iter();
+        let mut attempt = problem.clone();
+        let mut spent = 0usize;
+        loop {
+            let result = attempt.run(self, context)?;
+            spent = spent.saturating_add(result.iterations);
+            if !result.converged() {
+                return Ok(SaeOuterRun::Unconverged(result));
+            }
+            match self.certify_outer_result(&result) {
+                Ok(()) => return Ok(SaeOuterRun::Certified(result)),
+                Err(SaeOuterCertificationError::Refused(reason)) => {
+                    return Ok(SaeOuterRun::Refused { result, reason });
+                }
+                Err(SaeOuterCertificationError::SurrogateDisagrees { rho, detail }) => {
+                    if spent >= budget {
+                        return Ok(SaeOuterRun::Refused {
+                            reason: format!(
+                                "{detail}, and the outer budget of {budget} iterations is spent"
+                            ),
+                            result,
+                        });
+                    }
+                    log::debug!("{context}: {detail}; resuming on the doubled probe plan");
+                    attempt = problem
+                        .clone()
+                        .with_initial_rho(rho)
+                        .with_max_iter(budget - spent);
+                }
+            }
+        }
     }
 
     /// Freeze every basin-entry accelerator so the next analytic evaluation
@@ -2462,9 +2796,15 @@ impl SaeManifoldOuterObjective {
             return self.evaluate_authoritative_value_probe(rho_flat);
         }
 
-        // (2) Seed the bundle with the accepted entry basin on first use. The
+        // (2) Size the bundle from the shape this probe routes on, then seed it
+        // with the accepted entry basin on first use. The route above is read
+        // from the live shape, which moves during a fit (an atom rank-reduces, a
+        // frame activates); a capacity frozen at another shape can refuse the
+        // seed on the very route that just admitted the envelope. The
         // placeholder +∞ value is overwritten the first time this member is
         // re-converged below.
+        self.basin_bundle
+            .set_member_capacity(basin_bundle_member_capacity(&self.term));
         if self.basin_bundle.is_empty() {
             self.basin_bundle
                 .admit_distinct(self.term.clone(), f64::INFINITY)
@@ -5512,6 +5852,52 @@ mod crosscoder_reset_baseline_2627_tests {
                 .with_global_dispersion(0)
                 .expect("the global dispersion installs on the stacked fixture");
             (obj, vec![p], 0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl SaeManifoldOuterObjective {
+        /// Test access to the probe count of the installed rational log|S| plan; `None`
+        /// before the streaming lane has built one.
+        pub(crate) fn surrogate_probe_count(&self) -> Option<usize> {
+            self.surrogate_lane
+                .as_ref()
+                .and_then(SurrogateLaneState::plan)
+                .map(|plan| plan.probes.len())
+        }
+
+        /// Test access to the streaming gradient's dependence on its derivative bundle:
+        /// the gradient on the whole bundle, and the gradient on each single bundle vector
+        /// taken as a one-vector bundle. `None` off the streaming lane.
+        pub(crate) fn streaming_gradient_per_bundle_vector(
+            &self,
+            rho: &SaeManifoldRho,
+            evaluation: &OuterCriterionEvaluation,
+        ) -> Result<Option<(Array1<f64>, Vec<Array1<f64>>)>, OuterGradientError> {
+            let OuterEvaluationArtifacts::MatrixFree(matrix_free) = &evaluation.artifacts else {
+                return Ok(None);
+            };
+            let vectors = &matrix_free.logdet_derivative_bundle.vectors;
+            let full = self
+                .matrix_free_gradient_components(rho, evaluation, matrix_free, vectors)?
+                .gradient();
+            let rows = vectors
+                .iter()
+                .map(|vector| {
+                    self.matrix_free_gradient_components(
+                        rho,
+                        evaluation,
+                        matrix_free,
+                        std::slice::from_ref(vector),
+                    )
+                    .map(|components| components.gradient())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((full, rows)))
         }
     }
 }

@@ -4909,10 +4909,13 @@ impl SaeManifoldTerm {
 
         // Reject the seed on any row that got worse, reverting ALL of that row's atom
         // coords to the snapshot. Reconstruction couples atoms within a row, so the
-        // accept/reject decision is per row, not per (row, atom).
+        // accept/reject decision is per row, not per (row, atom). The comparison is
+        // exact: the reconstruction and the basis refresh are row-local, so a seed
+        // that leaves a row's coords bitwise unchanged reproduces its SSE bitwise and
+        // is kept, while any worsening is reverted to the snapshot (always safe).
         let post_fitted = self.try_fitted_for_rho(rho)?;
         let accepted: Vec<bool> = (0..n)
-            .map(|row| candidate_rows[row] && row_sse(&post_fitted, row) <= pre_sse[row] + 1.0e-12)
+            .map(|row| candidate_rows[row] && row_sse(&post_fitted, row) <= pre_sse[row])
             .collect();
         let mut reverted_any = false;
         for atom_idx in 0..k_atoms {
