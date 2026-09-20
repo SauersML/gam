@@ -289,7 +289,7 @@ mod tests_zoo_micro_local;
 mod tests_termination_2235;
 
 #[cfg(test)]
-mod tests_alpha_override_persistence_2933;
+mod tests_alpha_persistence_2933;
 
 #[cfg(test)]
 mod tests_steering_e4;

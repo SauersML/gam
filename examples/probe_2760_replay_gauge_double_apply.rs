@@ -150,6 +150,7 @@ fn main() {
                     duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
                         &trial,
                     ),
+                    bspline_null_ridge: gam_terms::smooth::bspline_null_ridge_request(&trial),
                     termname: "duchon_1d",
                 },
             )
