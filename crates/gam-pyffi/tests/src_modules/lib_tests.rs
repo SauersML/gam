@@ -1488,6 +1488,10 @@ fn batched_state_round_trip_matches_refit() {
                     .cache_coefficient_basis
                     .slice(s![b, .., ..])
                     .to_owned(),
+                data_null_basis: forward
+                    .cache_data_null_basis
+                    .slice(s![b, .., 0..0])
+                    .to_owned(),
                 xtwx_fingerprint: forward.cache_xtwx_fingerprints[b],
                 penalty_fingerprint: forward.cache_penalty_fingerprints[b],
                 logdet_xtwx: forward.cache_logdet_xtwx[b],
