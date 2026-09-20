@@ -62,6 +62,7 @@ def main() -> None:
             tau_start=1.0,
             tau_min=0.2,
             decay="geometric",
+            steps=20,
         ),
         a_init=_logit(0.1 + 0.8 * planted_gates),
         n_iter=20,

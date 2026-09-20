@@ -2840,5 +2840,13 @@
     ],
     "reason": "Single source of truth for log-sum-exp: five private copies (categorical positive_log_sum_exp, latent_law_compression log_sum_exp, split_lr_fdr logsumexp, evidence log_sum_exp, block_correction_hessian log_sum_exp) plus three inline copies duplicated gam_math::probability::signed_log_sum_exp with all signs +1. They are replaced by one pub gam_math::probability::positive_log_sum_exp that shares signed_log_sum_exp's body. The evidence.rs copy returned -inf for a +inf term; the canonical routine silently dropped NaN terms, which consolidation would have turned into a NaN-swallowing regression, so it now propagates an undefined term as NaN.",
     "evidence": "gam-math probability tests slse_undefined_term_makes_the_sum_undefined and positive_log_sum_exp_edge_cases pin NaN propagation, +inf, -inf, empty input and the 1000+ln2 overflow case; at the head git grep -w finds no definition of the five removed names in the edited files, and every former caller now calls positive_log_sum_exp."
+  },
+  {
+    "base": "b9758d35a07556d8233277172814d07401129bb5",
+    "items": [
+      "crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs:fn:get"
+    ],
+    "reason": "#3521: gumbel_temperature_schedule_from_pydict no longer hand-parses the Python dict with its nested `get` helper (which defaulted a geometric rate to 0.9 and silently accepted wrong-typed optional fields); it routes through the single strict Rust schedule descriptor parser shared with the penalty registry's temperature_schedule.",
+    "evidence": "The removed item is a function-local helper nested in gumbel_temperature_schedule_from_pydict with no other callers (the 2318 production occurrences are the unrelated common name `get`); covered by gam-pyffi gumbel_temperature_schedule and gam-models descriptors::tests."
   }
 ]
