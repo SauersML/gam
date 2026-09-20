@@ -3178,12 +3178,6 @@ impl FittedFamily {
     }
 }
 
-/// The grouping column of a random-slope factor smooth (`s(x, g, bs="re")`),
-/// unwrapped through `by=`/sum-to-zero wrappers (#2365). `None` for every
-/// other basis: only the `Re` flavour is a genuine random effect under the
-/// held-out-group contract — `fs`/`sz` estimate a per-level deviation
-/// function, so an unseen level has no zero-deviation population fallback and
-/// stays strict, exactly like a fixed categorical factor (#2102/#2137).
 /// Whether `basis` is a Duchon smooth, directly or as the inner basis of a
 /// `by`-variable, sum-to-zero factor or by-smooth wrapper.
 fn basis_uses_duchon_kernel_chart(basis: &gam_terms::smooth::SmoothBasisSpec) -> bool {
@@ -3205,6 +3199,12 @@ fn basis_uses_duchon_kernel_chart(basis: &gam_terms::smooth::SmoothBasisSpec) ->
     }
 }
 
+/// The grouping column of a random-slope factor smooth (`s(x, g, bs="re")`),
+/// unwrapped through `by=`/sum-to-zero wrappers (#2365). `None` for every
+/// other basis: only the `Re` flavour is a genuine random effect under the
+/// held-out-group contract — `fs`/`sz` estimate a per-level deviation
+/// function, so an unseen level has no zero-deviation population fallback and
+/// stays strict, exactly like a fixed categorical factor (#2102/#2137).
 fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
     use gam_terms::smooth::{FactorSmoothFlavour, SmoothBasisSpec};
     match basis {
