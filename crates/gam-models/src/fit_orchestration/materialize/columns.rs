@@ -31,8 +31,9 @@ pub fn formula_columns(parsed: &ParsedFormula) -> Result<BTreeSet<String>, Workf
 
 /// Every column a formula fit reads: [`formula_columns`] of the main, noise and
 /// slope formulas and of a CTN stage-1 recipe, the z, weight, offset and
-/// noise-offset columns, the recipe's weight and offset columns, and the
-/// variables and `by=` columns of smooth overrides.
+/// noise-offset columns, the recipe's weight, offset, fold and group columns,
+/// a frozen CTN's inputs and response, and the variables and `by=` columns of
+/// smooth overrides.
 ///
 /// This is the fit's input contract. `gam fit` loads exactly these columns and
 /// the fit boundary validates exactly these, so a column the model never reads
@@ -66,6 +67,20 @@ pub fn fit_required_columns(
         required.extend(formula_columns(&parsed_stage1)?);
         required.extend(stage1.weight_column.iter().cloned());
         required.extend(stage1.offset_column.iter().cloned());
+        // The cross-fitting folds are read from these labels.
+        required.extend(stage1.fold_column.iter().cloned());
+        required.extend(stage1.group_column.iter().cloned());
+    }
+    // A frozen CTN's score is evaluated from its own inputs: its covariates,
+    // offset and the stage-1 response it transforms.
+    if let Some(frozen) = config.frozen_ctn.as_ref() {
+        let transform = crate::inference::model::FittedModel::from_payload((*frozen.0).clone());
+        required.extend(
+            transform
+                .prediction_required_columns()
+                .map_err(|reason| WorkflowError::InvalidConfig { reason })?,
+        );
+        required.insert(parse_formula(&transform.formula)?.response);
     }
     if let Some(descriptors) = config
         .smooth_overrides
@@ -240,6 +255,80 @@ mod weight_row_index_tests {
         let weights = resolve_fit_weight_column(&one_positive, &one_positive.column_map(), Some("w"))
             .expect("a single positive weight is a valid weight column");
         assert_eq!(weights.to_vec(), vec![0.0, 0.0, 2.5, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod ctn_reserved_columns_tests {
+    use super::*;
+    use crate::fit_orchestration::CtnStage1Recipe;
+    use crate::transformation_normal::TransformationNormalConfig;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    fn ctn_config() -> FitConfig {
+        let mut recipe =
+            CtnStage1Recipe::new("pgs", "x", TransformationNormalConfig::default(), None, None)
+                .expect("valid stage-1 recipe");
+        recipe.fold_column = Some("fold".to_string());
+        recipe.group_column = Some("site".to_string());
+        FitConfig {
+            family: Some("bernoulli-marginal-slope".to_string()),
+            ctn_stage1: Some(recipe),
+            ..FitConfig::default()
+        }
+    }
+
+    /// The cross-fitting fold and group labels are inputs of a CTN chain: the
+    /// fit reads them to assign its folds.
+    #[test]
+    fn ctn_fold_and_group_columns_are_fit_inputs() {
+        let parsed = gam_terms::inference::formula_dsl::parse_formula("event ~ age")
+            .expect("formula parses");
+        let required = fit_required_columns(&parsed, &ctn_config()).expect("required columns");
+        for name in ["event", "age", "pgs", "x", "fold", "site"] {
+            assert!(required.contains(name), "'{name}' missing from {required:?}");
+        }
+    }
+
+    /// `.` stands for the columns no other part of the fit reads, so it must
+    /// not turn the CTN's fold or group labels into outcome covariates.
+    #[test]
+    fn automatic_term_leaves_ctn_fold_and_group_columns_out() {
+        let headers: Vec<String> = ["event", "age", "pgs", "x", "fold", "site"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let n = 40;
+        let values = Array2::from_shape_fn((n, headers.len()), |(row, column)| match column {
+            0 => (row % 2) as f64,
+            1 => 20.0 + row as f64 * 1.37,
+            2 => (row as f64 * 0.61).sin(),
+            3 => row as f64 / n as f64,
+            4 => (row % 5) as f64,
+            _ => (row % 8) as f64 * 1.5,
+        });
+        let data = Dataset {
+            headers: headers.clone(),
+            values,
+            schema: DataSchema {
+                columns: headers
+                    .iter()
+                    .map(|name| SchemaColumn {
+                        name: name.clone(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: vec![ColumnKindTag::Continuous; headers.len()],
+        };
+        let expanded = expand_automatic_fit_formula("event ~ .", &data, &ctn_config())
+            .expect("automatic formula expands")
+            .formula;
+        assert!(expanded.contains("age"), "{expanded}");
+        assert!(!expanded.contains("fold"), "fold labels became a covariate: {expanded}");
+        assert!(!expanded.contains("site"), "group labels became a covariate: {expanded}");
     }
 }
 
