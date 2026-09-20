@@ -51,24 +51,46 @@ use super::*;
 /// a-posteriori contraction test, not a rigorous certificate.
 pub(crate) const NEWTON_REGION_CONTRACTION_BOUND: f64 = 0.25;
 
-/// The Newton correction and the simplified correction at a predictor.
+/// The Newton correction and the simplified correction at a predictor, each beside its arithmetic
+/// resolution.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct NewtonRegionContraction {
     /// `‖Δ⁰‖`, the Newton correction at the predictor.
     pub(crate) first_correction: f64,
     /// `‖Δ̄¹‖`, the simplified correction, with the curvature frozen at the predictor.
     pub(crate) second_correction: f64,
+    /// The largest `‖Δ⁰‖` the rounding of its right-hand side and of the iterate it lands on can
+    /// produce ([`ExactNewtonBlockUpdater::update_step_with_resolution`]).
+    pub(crate) first_resolution: f64,
+    /// The same for `‖Δ̄¹‖`.
+    pub(crate) second_resolution: f64,
 }
 
 impl NewtonRegionContraction {
-    /// The measured contraction `Θ = ‖Δ̄¹‖ / ‖Δ⁰‖`. A predictor that is already stationary
-    /// (`Δ⁰ = Δ̄¹ = 0`) has `Θ = 0`; a non-finite correction measures nothing.
+    /// The measured contraction `Θ = ‖Δ̄¹‖ / ‖Δ⁰‖`, read only where both corrections are resolved.
+    ///
+    /// A correction at or below its resolution is zero on this arithmetic: the iterate it starts
+    /// from is at its root, so Newton has converged there and `Θ = 0`. Above it, `Θ` compares two
+    /// resolved corrections. Below it, `Θ` is a ratio of rounding errors: on the event-history
+    /// slope surface at `λ = 1.09e9` (gam#2973 comment 5744888545), corrections of `9.2e-11` and
+    /// `8.2e-11` against a resolution of `7.1e-9` read `Θ = 0.90`, and the certified mode's own
+    /// continuation was refused as a fold. A non-finite correction or resolution measures nothing.
     pub(crate) fn contraction_factor(&self) -> Option<f64> {
-        if !(self.first_correction.is_finite() && self.second_correction.is_finite()) {
+        if ![
+            self.first_correction,
+            self.second_correction,
+            self.first_resolution,
+            self.second_resolution,
+        ]
+        .iter()
+        .all(|value| value.is_finite())
+        {
             return None;
         }
-        if self.first_correction == 0.0 {
-            return (self.second_correction == 0.0).then_some(0.0);
+        if self.first_correction <= self.first_resolution
+            || self.second_correction <= self.second_resolution
+        {
+            return Some(0.0);
         }
         Some(self.second_correction / self.first_correction)
     }
@@ -79,20 +101,23 @@ impl NewtonRegionContraction {
             .is_some_and(|theta| theta <= NEWTON_REGION_CONTRACTION_BOUND)
     }
 
-    /// The Kantorovich radius around the predictor inside which the root the test names lies:
-    /// `‖Δ⁰‖ (1 − √(1 − 2[h₀])) / [h₀]` with `[h₀] = 2Θ`, which is `‖Δ⁰‖` at `Θ = 0` and `2‖Δ⁰‖`
-    /// at `Θ = ¼`. `None` outside the Newton region.
+    /// The radius around the predictor inside which the root the test names lies: the
+    /// Kantorovich radius `‖Δ⁰‖ (1 − √(1 − 2[h₀])) / [h₀]` with `[h₀] = 2Θ`, which is `‖Δ⁰‖` at
+    /// `Θ = 0` and `2‖Δ⁰‖` at `Θ = ¼`, widened by the two corrections' resolutions, since the
+    /// corrections it is measured from are known only to within them. `None` outside the Newton
+    /// region.
     pub(crate) fn root_radius(&self) -> Option<f64> {
         if !self.in_newton_region() {
             return None;
         }
         let theta = self.contraction_factor()?;
         let h = 2.0 * theta;
-        if h == 0.0 {
-            Some(self.first_correction)
+        let kantorovich = if h == 0.0 {
+            self.first_correction
         } else {
-            Some(self.first_correction * (1.0 - (1.0 - 2.0 * h).sqrt()) / h)
-        }
+            self.first_correction * (1.0 - (1.0 - 2.0 * h).sqrt()) / h
+        };
+        Some(kantorovich + self.first_resolution + self.second_resolution)
     }
 }
 
@@ -130,6 +155,8 @@ pub(crate) fn newton_region_contraction<F: CustomFamily + Clone + Send + Sync + 
         contraction: NewtonRegionContraction {
             first_correction: corrections.first_correction,
             second_correction: corrections.second_correction,
+            first_resolution: corrections.first_resolution,
+            second_resolution: corrections.second_resolution,
         },
         state: ConstrainedWarmStart {
             rho: rho.clone(),
@@ -337,11 +364,13 @@ fn correct_sub_step<F: CustomFamily + Clone + Send + Sync + 'static>(
         test.contraction.root_radius(),
     ) else {
         return SubStep::Failed(format!(
-            "outside the Newton region at rho=[{}]: Newton correction {:.3e}, simplified correction \
-             {:.3e}, contraction {}",
+            "outside the Newton region at rho=[{}]: Newton correction {:.3e} (resolution {:.3e}), \
+             simplified correction {:.3e} (resolution {:.3e}), contraction {}",
             join_rho(rho_trial),
             test.contraction.first_correction,
+            test.contraction.first_resolution,
             test.contraction.second_correction,
+            test.contraction.second_resolution,
             test.contraction
                 .contraction_factor()
                 .map_or_else(|| "unmeasured".to_string(), |theta| format!("{theta:.3e}")),

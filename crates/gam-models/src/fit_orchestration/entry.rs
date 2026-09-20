@@ -133,10 +133,14 @@ fn residual_cascade_failure(error: gam_solve::residual_cascade::ResidualCascadeE
 /// certificate builds its own dense design and normal equations, so a caller
 /// that already ran it hands the request here rather than back through
 /// [`fit_model`], which would build and refuse it a second time.
+///
+/// `realized_design` is the design that certificate realized, when it built one;
+/// the REML fit starts from it instead of realizing the same design again.
 fn fit_standard_past_exact_gaussian_boundary(
     request: StandardFitRequest<'_>,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<FitResult, WorkflowError> {
-    fit_standard_model(request)
+    fit_standard_model_on_design(request, realized_design)
         .map(FitResult::Standard)
         .map_err(|failure| WorkflowError::from(failure.ending_the_fit()))
 }
@@ -152,10 +156,11 @@ pub fn fit_model(request: FitRequest<'_>) -> Result<FitResult, WorkflowError> {
         |failure: FitFailure| -> WorkflowError { WorkflowError::from(failure.ending_the_fit()) };
     match request {
         FitRequest::Standard(request) => {
-            if let Some(fitted) = try_deterministic_gaussian_standard_fit(&request)? {
-                Ok(FitResult::Standard(fitted))
-            } else {
-                fit_standard_past_exact_gaussian_boundary(request)
+            match try_deterministic_gaussian_standard_fit(&request)? {
+                GaussianStandardRoute::Exact(fitted) => Ok(FitResult::Standard(fitted)),
+                GaussianStandardRoute::Iterative(design) => {
+                    fit_standard_past_exact_gaussian_boundary(request, design)
+                }
             }
         }
         FitRequest::GaussianLocationScale(request) => fit_gaussian_location_scale_model(request)
@@ -553,18 +558,51 @@ enum DeterministicPenaltyFace {
 }
 
 struct ExactGaussianBoundary {
+    /// The design the certificate was proved on.
+    design: TermCollectionDesign,
     beta: Array1<f64>,
     penalty_faces: Vec<DeterministicPenaltyFace>,
 }
 
-/// `Ok(None)` means the shortcut does not apply and the iterative REML solver
+/// What the exact Gaussian boundary certificate found.
+enum ExactGaussianVerdict {
+    /// The request is not a candidate; no design was realized.
+    Ineligible,
+    /// The realized design does not reproduce the response exactly.
+    Interior(TermCollectionDesign),
+    Boundary(ExactGaussianBoundary),
+}
+
+/// Who fits a Gaussian identity standard request.
+enum GaussianStandardRoute {
+    /// The deterministic zero-residual boundary fit.
+    Exact(StandardFitResult),
+    /// The iterative REML solver, handed the design the boundary check
+    /// realized from this request's `spec`, `data` and `resource_policy`, when
+    /// it realized one.
+    Iterative(Option<TermCollectionDesign>),
+}
+
+/// The design every standard fit of `request` realizes, built with the fit's
+/// own resource policy so that the REML fit can start from it.
+fn realize_standard_design(
+    request: &StandardFitRequest<'_>,
+) -> Result<TermCollectionDesign, gam_terms::basis::BasisError> {
+    gam_terms::smooth::build_term_collection_design_with_policy(
+        request.data.view(),
+        &request.spec,
+        &request.options.resource_policy,
+    )
+}
+
+/// `Iterative` means the shortcut does not apply and the iterative REML solver
 /// owns the fit; it is returned when the exact boundary face's free directions
 /// are not identified by the data (see the tangent-precision factorization
 /// below). Every `Err` is a malformed request, not a declined shortcut.
 fn deterministic_gaussian_standard_fit(
     request: &StandardFitRequest<'_>,
     exact_boundary: Option<ExactGaussianBoundary>,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
+) -> Result<GaussianStandardRoute, WorkflowError> {
     if !request.family.is_gaussian_identity() || request.y.is_empty() {
         return Err(WorkflowError::InvalidConfig {
             reason:
@@ -590,28 +628,35 @@ fn deterministic_gaussian_standard_fit(
             reason: "deterministic Gaussian shortcut requires positive total weight".to_string(),
         });
     }
-    let design =
-        build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
-            WorkflowError::InvalidConfig {
-                reason: format!("deterministic Gaussian shortcut could not rebuild design: {err}"),
-            }
-        })?;
+    let (design, exact_boundary) = match exact_boundary {
+        Some(ExactGaussianBoundary {
+            design,
+            beta,
+            penalty_faces,
+        }) => (design, Some((beta, penalty_faces))),
+        None => (
+            realize_standard_design(request).map_err(|err| WorkflowError::InvalidConfig {
+                reason: format!("deterministic Gaussian shortcut could not build its design: {err}"),
+            })?,
+            None,
+        ),
+    };
     let p = design.design.ncols();
     let n_penalties = design.penalties.len();
     let (beta, penalty_faces) = match exact_boundary {
-        Some(boundary) => {
-            if boundary.beta.len() != p || boundary.penalty_faces.len() != n_penalties {
+        Some((beta, penalty_faces)) => {
+            if beta.len() != p || penalty_faces.len() != n_penalties {
                 return Err(raised_fit_failure(
                     FailureCategory::Invariant,
                     format!(
-                        "deterministic Gaussian boundary shape changed while rebuilding: \
+                        "deterministic Gaussian boundary does not match its design: \
                          coefficients {} vs {p}, penalty faces {} vs {n_penalties}",
-                        boundary.beta.len(),
-                        boundary.penalty_faces.len(),
+                        beta.len(),
+                        penalty_faces.len(),
                     ),
                 ));
             }
-            (boundary.beta, boundary.penalty_faces)
+            (beta, penalty_faces)
         }
         None => {
             // Dispatch proved every represented `y - offset` value is
@@ -919,7 +964,7 @@ fn deterministic_gaussian_standard_fit(
             // n-vs-rank decision, fit the model (the n=30 wine-shaped fold of
             // #1089 is exactly this shape).
             let Ok(chol) = equilibrated.cholesky(faer::Side::Lower) else {
-                return Ok(None);
+                return Ok(GaussianStandardRoute::Iterative(Some(design)));
             };
             let solve_free = |rhs: &Array2<f64>| {
                 let mut scaled_rhs = rhs.clone();
@@ -1099,6 +1144,7 @@ fn deterministic_gaussian_standard_fit(
         // Exact fit ⇒ residual variance is exactly zero.
         dispersion: gam_solve::estimate::Dispersion::ZERO_ESTIMATE,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
         weighted_gram: Some(xtwx),
@@ -1177,7 +1223,7 @@ fn deterministic_gaussian_standard_fit(
                 reason: format!("deterministic Gaussian shortcut could not freeze design: {err}"),
             }
         })?;
-    Ok(Some(StandardFitResult {
+    Ok(GaussianStandardRoute::Exact(StandardFitResult {
         fit,
         design,
         resolvedspec,
@@ -1392,6 +1438,72 @@ mod exact_gaussian_boundary_tests {
     }
 }
 
+#[cfg(test)]
+mod exact_gaussian_boundary_design_reuse_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+
+    fn noisy_surface() -> Dataset {
+        let mut rng = StdRng::seed_from_u64(3261);
+        let headers: Vec<String> = ["x0", "x1", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..240)
+            .map(|_| {
+                let x0: f64 = rng.random();
+                let x1: f64 = rng.random();
+                let noise: f64 = rng.random::<f64>() - 0.5;
+                let y = (3.0 * x0).sin() * (2.0 * x1).cos() + 0.2 * noise;
+                StringRecord::from(vec![x0.to_string(), x1.to_string(), y.to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize("y ~ te(x0, x1)", data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian te() formula materializes a standard request"),
+        }
+    }
+
+    /// The boundary certificate refuses a noisy response after realizing the
+    /// full design; the REML fit must start from that design, and doing so
+    /// must be the same fit as realizing it again.
+    #[test]
+    fn refused_boundary_hands_the_fit_its_realized_design() {
+        let data = noisy_surface();
+        let request = standard_request(&data);
+        let GaussianStandardRoute::Iterative(Some(design)) =
+            try_deterministic_gaussian_standard_fit(&request).expect("boundary check")
+        else {
+            panic!("a noisy te() response is refused with its realized design");
+        };
+        let rebuilt = realize_standard_design(&request).expect("rebuild");
+        assert_eq!(design.design.to_dense(), rebuilt.design.to_dense());
+        assert_eq!(design.affine_offset, rebuilt.affine_offset);
+        assert_eq!(design.penalties.len(), rebuilt.penalties.len());
+        for (handed, fresh) in design.penalties.iter().zip(&rebuilt.penalties) {
+            assert_eq!(handed.col_range, fresh.col_range);
+            assert_eq!(handed.local, fresh.local);
+        }
+
+        let on_design = fit_standard_model_on_design(request, Some(design)).expect("reused fit");
+        let fresh = fit_standard_model(standard_request(&data)).expect("fresh fit");
+        assert_eq!(on_design.fit.log_lambdas, fresh.fit.log_lambdas);
+        assert_eq!(on_design.fit.beta, fresh.fit.beta);
+        assert_eq!(on_design.design.design.to_dense(), fresh.design.design.to_dense());
+    }
+}
+
 /// Certify that a Gaussian design represents its adjusted response exactly and
 /// identify the asymptotic face of every smoothing precision.
 ///
@@ -1409,7 +1521,7 @@ mod exact_gaussian_boundary_tests {
 /// Thus a merely small residual cannot enter this route.
 fn exact_gaussian_boundary(
     request: &StandardFitRequest<'_>,
-) -> Result<Option<ExactGaussianBoundary>, WorkflowError> {
+) -> Result<ExactGaussianVerdict, WorkflowError> {
     if !request.family.is_gaussian_identity()
         || request.y.is_empty()
         || !request.spec.random_effect_terms.is_empty()
@@ -1427,16 +1539,11 @@ fn exact_gaussian_boundary(
         || request.y.len() != request.offset.len()
         || request.y.len() != request.weights.len()
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Ineligible);
     }
-    let design =
-        build_term_collection_design(request.data.view(), &request.spec).map_err(|err| {
-            WorkflowError::InvalidConfig {
-                reason: format!(
-                    "deterministic Gaussian candidate could not build its design: {err}"
-                ),
-            }
-        })?;
+    let design = realize_standard_design(request).map_err(|err| WorkflowError::InvalidConfig {
+        reason: format!("deterministic Gaussian candidate could not build its design: {err}"),
+    })?;
     if design.design.ncols() == 0
         || design.coefficient_lower_bounds.is_some()
         || design.linear_constraints.is_some()
@@ -1445,7 +1552,7 @@ fn exact_gaussian_boundary(
             .iter()
             .any(|block| !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero))
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     }
     let adjusted_response = request.y.as_ref() - request.offset.as_ref() - &design.affine_offset;
     if adjusted_response.iter().any(|value| !value.is_finite())
@@ -1454,13 +1561,13 @@ fn exact_gaussian_boundary(
             .iter()
             .any(|weight| !weight.is_finite() || *weight < 0.0)
     {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     }
     let x = design.design.to_dense();
     let Some(beta) =
         exact_gaussian_coefficients(&x, &adjusted_response, request.weights.as_ref(), None)
     else {
-        return Ok(None);
+        return Ok(ExactGaussianVerdict::Interior(design));
     };
 
     let p = x.ncols();
@@ -1569,14 +1676,15 @@ fn exact_gaussian_boundary(
             request.weights.as_ref(),
             Some((&joint_null_basis, joint_rotation_radius)),
         ) else {
-            return Ok(None);
+            return Ok(ExactGaussianVerdict::Interior(design));
         };
         tangent_beta
     } else {
         beta
     };
 
-    Ok(Some(ExactGaussianBoundary {
+    Ok(ExactGaussianVerdict::Boundary(ExactGaussianBoundary {
+        design,
         beta,
         penalty_faces,
     }))
@@ -1644,14 +1752,17 @@ fn embedded_penalty_null_basis(
 
 fn try_deterministic_gaussian_standard_fit(
     request: &StandardFitRequest<'_>,
-) -> Result<Option<StandardFitResult>, WorkflowError> {
+) -> Result<GaussianStandardRoute, WorkflowError> {
     if gaussian_response_is_constant(request) {
         return deterministic_gaussian_standard_fit(request, None);
     }
-    let Some(boundary) = exact_gaussian_boundary(request)? else {
-        return Ok(None);
-    };
-    deterministic_gaussian_standard_fit(request, Some(boundary))
+    match exact_gaussian_boundary(request)? {
+        ExactGaussianVerdict::Ineligible => Ok(GaussianStandardRoute::Iterative(None)),
+        ExactGaussianVerdict::Interior(design) => Ok(GaussianStandardRoute::Iterative(Some(design))),
+        ExactGaussianVerdict::Boundary(boundary) => {
+            deterministic_gaussian_standard_fit(request, Some(boundary))
+        }
+    }
 }
 
 /// The training table with every zero-weight row removed.
@@ -2433,14 +2544,18 @@ fn fit_materialized_once_with_notes(
     // through to the dense `fit_model` path unchanged. Mirrors the CLI
     // (main.rs run_fit) and FFI consumers, which build the persistence payload
     // from this same `SplineScanFit`.
+    let mut realized_design = None;
     if let FitRequest::Standard(request) = &mat.request {
-        if let Some(result) = try_deterministic_gaussian_standard_fit(request)? {
-            return Ok(attach_basis_adequacy(
-                FitResult::Standard(result),
-                standard_covariate_frame,
-                inference_notes,
-                unidentified_scalar_terms,
-            ));
+        match try_deterministic_gaussian_standard_fit(request)? {
+            GaussianStandardRoute::Exact(result) => {
+                return Ok(attach_basis_adequacy(
+                    FitResult::Standard(result),
+                    standard_covariate_frame,
+                    inference_notes,
+                    unidentified_scalar_terms,
+                ));
+            }
+            GaussianStandardRoute::Iterative(design) => realized_design = design,
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = gam_solve::spline_scan::fit_spline_scan(
@@ -2487,9 +2602,12 @@ fn fit_materialized_once_with_notes(
     // `fit_model` already returns `WorkflowError` end-to-end; propagate it
     // directly instead of stringifying then re-wrapping. A standard request
     // was refused by the exact Gaussian boundary above, so it skips that
-    // certificate's second design build inside `fit_model`.
+    // certificate's second design build inside `fit_model` and fits on the
+    // design the certificate realized.
     let result = match mat.request {
-        FitRequest::Standard(request) => fit_standard_past_exact_gaussian_boundary(request)?,
+        FitRequest::Standard(request) => {
+            fit_standard_past_exact_gaussian_boundary(request, realized_design)?
+        }
         request => fit_model(request)?,
     };
     Ok(attach_basis_adequacy(
@@ -3174,6 +3292,7 @@ fn publish_expectile_sandwich_covariance(
         fit.covariance_corrected = None;
         if let Some(inference) = fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
+            inference.smoothing_correction_factorized = None;
         }
         fit.artifacts.covariance_declined = Some(declined);
         return Ok(());

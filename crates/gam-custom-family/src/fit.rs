@@ -3417,14 +3417,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
         match multistart {
             Ok(mut outcome) => match outcome.winner {
-                Some(winner) => outcome.runs.swap_remove(winner),
+                Some(winner) => (outcome.outcomes.swap_remove(winner), outcome.payload),
                 // No seed certified: refuse with every seed's outcome. The
                 // first seed (the fit's own initial rho) lends its state for
                 // the refusal's last-evaluation evidence.
-                None => {
-                    let refusal = outcome.refusal("custom family");
-                    (Err(refusal), outcome.runs.swap_remove(0).1)
-                }
+                None => (Err(outcome.refusal("custom family")), outcome.payload),
             },
             Err(error) => (
                 Err(error),

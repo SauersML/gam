@@ -9,7 +9,7 @@ They pin the behaviour a *user* sees from a fitted surface:
     BOTH axes (no seam at u=0/2pi or v=0/2pi);
   * a ``sphere(lat, lon)`` smooth must wrap in longitude (no seam at lon=0/2pi) and
     must collapse the pole to a single point (all longitudes at lat=pi/2 agree);
-  * a cylinder smooth ``te(theta, z, periodic=[0], period=[2*pi, 0])`` must wrap on the
+  * a cylinder smooth ``te(theta, z, periodic=[0], period=[2*pi, None])`` must wrap on the
     angular axis WITHOUT imposing spurious periodicity on the linear height axis.
 
 A regression in the periodic-margin wiring or the spherical chart would surface here as
@@ -97,7 +97,7 @@ def test_sphere_fit_wraps_in_longitude_and_collapses_pole() -> None:
 def test_cylinder_fit_wraps_in_angle_but_not_in_height() -> None:
     """A cylinder smooth wraps on the angular axis WITHOUT wrapping the linear axis.
 
-    ``te(theta, z, periodic=[0], period=[2*pi, 0])`` makes only the first margin
+    ``te(theta, z, periodic=[0], period=[2*pi, None])`` makes only the first margin
     periodic. The fitted surface must therefore close the seam at theta=0/2pi while
     leaving the height axis ``z`` a genuine non-periodic trend. This guards the
     mixed-periodicity bug class where a periodic margin leaks into the linear margin
@@ -109,9 +109,11 @@ def test_cylinder_fit_wraps_in_angle_but_not_in_height() -> None:
     z = rng.uniform(-2.0, 2.0, n)  # linear (non-periodic) height axis
     y = np.sin(theta) + 0.7 * z + 0.3 * np.cos(theta) * z + rng.normal(0.0, 0.2, n)
 
+    # A period entry declares its axis periodic (#2781; docs/formulas.md, "Declaring a
+    # period"), so the open height axis carries ``None``, not a placeholder period.
     model = gamfit.fit(
         pd.DataFrame({"theta": theta, "z": z, "y": y}),
-        "y ~ te(theta, z, periodic=[0], period=[2*pi, 0])",
+        "y ~ te(theta, z, periodic=[0], period=[2*pi, None])",
     )
 
     # (a) angular seam closes: f(0, z) == f(2*pi, z)

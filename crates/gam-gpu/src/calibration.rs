@@ -29,9 +29,6 @@ const _: () = assert!(
 );
 const _: () = assert!(POTRF_DIMS[0] == GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P);
 const _: () = assert!(XTWX_DIMS[0].0 == GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N);
-const _: () = assert!(
-    XTWX_DIMS[0].0 * 2 == GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N
-);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CachedCalibration {
@@ -114,7 +111,6 @@ fn calibrate_device(
     if let Some(rows) = crossover_rows(&measurements, "xtwx", policy.xtwx_n_min) {
         policy.xtwx_n_min = rows;
         policy.row_kernel_min_n = rows;
-        policy.fused_kernel_min_n = rows.saturating_mul(2);
     }
     if let Some(p) = crossover_rows(&measurements, "potrf", policy.potrf_min_p) {
         policy.potrf_min_p = p;

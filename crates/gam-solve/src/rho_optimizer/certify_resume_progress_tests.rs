@@ -156,15 +156,15 @@ fn a_refused_checkpoint_without_a_strategy_change_returns_the_refusal_2817() {
 #[test]
 fn a_published_reseed_is_taken_in_precedence_order_and_the_rest_dropped_2817() {
     let mut result = OuterResult::new(array![1.0, 2.0], 3.0, 4, false, arc_plan_2817());
-    result.tail_snap_reseed = Some(array![1.0, 3.0]);
+    result.saddle_escape_reseed = Some(array![1.0, 3.0]);
     result.wrong_rail_reseed = Some(array![1.5, 2.0]);
     result.active_set_reseed = Some(ActiveSetReseed {
         rho: array![1.0, 2.0],
         bounds: (array![-4.0, 2.0], array![4.0, 2.0]),
     });
     let reseed = take_certify_reseed(&mut result)
-        .expect("a confirmed-tail snap was published");
-    assert_eq!(reseed.kind, CertifyReseedKind::TailSnap);
+        .expect("a saddle escape was published");
+    assert_eq!(reseed.kind, CertifyReseedKind::SaddleEscape);
     assert_eq!(reseed.rho, array![1.0, 3.0]);
     assert!(reseed.search_bounds_override.is_none());
     assert!(

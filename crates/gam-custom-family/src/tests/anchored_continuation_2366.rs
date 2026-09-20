@@ -674,6 +674,31 @@ fn a_double_well_fit_publishes_its_uncertified_trace_2901() {
     );
 }
 
+/// A custom-family fit publishes its likelihood curvature `H − S(λ)` beside the
+/// penalized Hessian, so the smooth-term score test has the `G` it needs. It is
+/// the observed information, not a Gram: at the double well's certified mode
+/// it is negative, and that sign is published rather than projected away.
+#[test]
+fn a_custom_family_fit_publishes_its_likelihood_curvature() {
+    let family = TiltedDoubleWellFamily::new(TILT);
+    let result = fit_custom_family(&family, &[double_well_spec(2.0)], &double_well_options())
+        .expect("a certified double-well mode fits");
+    let inference = result.inference.as_ref().expect("the fit computed inference");
+    let hessian = inference.penalized_hessian.as_array()[[0, 0]];
+    let curvature = inference
+        .weighted_gram
+        .as_ref()
+        .expect("an identity-gauge custom-family fit publishes its likelihood curvature");
+    assert_eq!(curvature.dim(), (1, 1));
+    let expected = hessian - result.lambdas[0];
+    assert!(
+        (curvature[[0, 0]] - expected).abs() <= 4.0 * f64::EPSILON * hessian.abs().max(result.lambdas[0]),
+        "published curvature {} is H − λS = {expected}",
+        curvature[[0, 0]]
+    );
+    assert!(curvature[[0, 0]] < 0.0, "the double well's data curvature is negative at its mode");
+}
+
 /// The end-to-end property: a whole production fit is a function of the model
 /// and the data, not of the coefficients the caller happened to pass in.
 ///
@@ -925,27 +950,263 @@ fn the_newton_region_test_is_kantorovich_h_at_most_one_half_2973() {
     let at_bound = NewtonRegionContraction {
         first_correction: 1.0,
         second_correction: 0.25,
+        first_resolution: 0.0,
+        second_resolution: 0.0,
     };
     assert!(at_bound.in_newton_region(), "Θ = ¼ is h = ½, inside the Newton region");
     assert_eq!(at_bound.root_radius(), Some(2.0), "at h = ½ the root radius is 2‖Δ⁰‖");
     let past = NewtonRegionContraction {
         first_correction: 1.0,
         second_correction: 0.25 + f64::EPSILON,
+        first_resolution: 0.0,
+        second_resolution: 0.0,
     };
     assert!(!past.in_newton_region(), "Θ above ¼ is outside the Newton region");
     assert_eq!(past.root_radius(), None);
     let stationary = NewtonRegionContraction {
         first_correction: 0.0,
         second_correction: 0.0,
+        first_resolution: 0.0,
+        second_resolution: 0.0,
     };
     assert_eq!(stationary.contraction_factor(), Some(0.0));
     assert_eq!(stationary.root_radius(), Some(0.0));
     let unmeasured = NewtonRegionContraction {
         first_correction: 1.0,
         second_correction: f64::NAN,
+        first_resolution: 0.0,
+        second_resolution: 0.0,
     };
     assert_eq!(unmeasured.contraction_factor(), None, "a non-finite correction measures nothing");
     assert!(!unmeasured.in_newton_region());
+}
+
+/// #2973: `Θ` is read only where both corrections are resolved.
+///
+/// A correction at or below its resolution is zero on the arithmetic, so the iterate it starts
+/// from is at its root: `Θ = 0`, whatever the ratio of the two rounding errors. The root radius is
+/// widened by both resolutions. A resolved pair is judged by its ratio as before, and a
+/// non-finite resolution measures nothing.
+#[test]
+fn a_correction_within_its_resolution_is_converged_2973() {
+    // The slope-surface refusal: both corrections under a resolution of 7.1e-9.
+    let rounding = NewtonRegionContraction {
+        first_correction: 9.2e-11,
+        second_correction: 8.2e-11,
+        first_resolution: 7.1e-9,
+        second_resolution: 7.1e-9,
+    };
+    assert_eq!(rounding.contraction_factor(), Some(0.0));
+    assert!(rounding.in_newton_region());
+    assert_eq!(rounding.root_radius(), Some(9.2e-11 + 7.1e-9 + 7.1e-9));
+    // A resolved Newton correction whose simplified correction is rounding: Newton converged in
+    // one step.
+    let converged_in_one = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: 0.5,
+        first_resolution: 1.0e-9,
+        second_resolution: 0.6,
+    };
+    assert_eq!(converged_in_one.contraction_factor(), Some(0.0));
+    // The same pair with both corrections resolved does not contract.
+    let resolved = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: 0.5,
+        first_resolution: 1.0e-9,
+        second_resolution: 0.1,
+    };
+    assert_eq!(resolved.contraction_factor(), Some(0.5));
+    assert!(!resolved.in_newton_region());
+    let unresolvable = NewtonRegionContraction {
+        first_correction: 1.0,
+        second_correction: 0.5,
+        first_resolution: f64::INFINITY,
+        second_resolution: 0.1,
+    };
+    assert_eq!(unresolvable.contraction_factor(), None);
+}
+
+/// A two-coefficient quadratic `ℓ(β) = −½w‖β − c‖²` under the rank-one penalty `λ·vvᵀ`,
+/// `v = (1, −3)`, whose mode is closed-form: `β̂ = c − λ(vᵀc) / (w + λ‖v‖²)·v`.
+///
+/// At `λ = 1e9` the penalty product `S_λβ̂` sums terms of order `λ‖β̂‖` to an order-one result, so
+/// the Newton correction at `β̂` is the rounding of that sum, carried along the penalty's null
+/// direction `(3, 1)`, where the curvature is `w`.
+#[derive(Clone)]
+struct RoundedQuadraticFamily {
+    center: Array1<f64>,
+    curvature: f64,
+}
+
+impl CustomFamily for RoundedQuadraticFamily {
+    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
+        let beta = &block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta;
+        let residual = &self.center - beta;
+        Ok(FamilyEvaluation {
+            log_likelihood: -0.5 * self.curvature * residual.dot(&residual),
+            blockworking_sets: vec![BlockWorkingSet::ExactNewton {
+                gradient: &residual * self.curvature,
+                hessian: SymmetricMatrix::Dense(Array2::eye(2) * self.curvature),
+            }],
+        })
+    }
+
+    // The joint Hessian is declared, so the inner certificate measures the stationarity residual.
+    fn exact_newton_joint_hessian(
+        &self,
+        block_states: &[ParameterBlockState],
+    ) -> Result<Option<Array2<f64>>, String> {
+        let width = block_states
+            .first()
+            .ok_or_else(|| "missing block 0".to_string())?
+            .beta
+            .len();
+        Ok(Some(Array2::eye(width) * self.curvature))
+    }
+}
+
+/// The rounded quadratic's one block: an identity design and the penalty `vvᵀ`, whose null
+/// direction is declared.
+fn rounded_quadratic_spec() -> ParameterBlockSpec {
+    ParameterBlockSpec {
+        name: "rounded".to_string(),
+        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(Array2::eye(2))),
+        offset: Array1::zeros(2),
+        penalties: vec![PenaltyMatrix::Dense(array![[1.0, -3.0], [-3.0, 9.0]])],
+        nullspace_dims: vec![1],
+        initial_log_lambdas: array![0.0],
+        initial_beta: None,
+        gauge_priority: 100,
+        jacobian_callback: None,
+        stacked_design: None,
+        stacked_offset: None,
+    }
+}
+
+/// #2973: a predictor at its root to rounding is in the Newton region.
+///
+/// The predictor is the closed-form mode at `λ = 1e9`. Its Newton correction and the simplified
+/// correction after it are both rounding of the penalty product, so their ratio is a ratio of
+/// rounding errors, which the test used to read as a contraction and refuse as a fold. Each lies
+/// within its resolution, so the predictor is converged: `Θ = 0`, and the root radius covers both
+/// corrections.
+#[test]
+fn a_predictor_at_its_root_to_rounding_is_in_the_newton_region_2973() {
+    let specs = [rounded_quadratic_spec()];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let rho = 1.0e9_f64.ln();
+    let lambda = rho.exp();
+    let v = array![1.0, -3.0];
+    for k in 0..8 {
+        let center = array![1.0 + 0.37 * k as f64, -0.5 + 0.21 * k as f64];
+        let mode = &center - &(&v * (lambda * v.dot(&center) / (1.0 + lambda * v.dot(&v))));
+        let predictor = crate::assembly::ConstrainedWarmStart {
+            rho: array![rho],
+            block_beta: vec![mode],
+            active_sets: vec![None],
+            cached_inner: None,
+        };
+        let family = RoundedQuadraticFamily {
+            center,
+            curvature: 1.0,
+        };
+        let test =
+            newton_region_contraction(&family, &specs, &options, &layout, &array![rho], &predictor)
+                .expect("the Newton-region test runs at the closed-form mode");
+        let contraction = test.contraction;
+        eprintln!("[2973 rounded mode] center {k}: {contraction:?}");
+        assert!(
+            contraction.first_correction <= contraction.first_resolution,
+            "the closed-form mode's Newton correction is rounding: {contraction:?}"
+        );
+        assert!(
+            contraction.in_newton_region(),
+            "a predictor at its root to rounding is in the Newton region: {contraction:?}"
+        );
+        assert!(
+            contraction.root_radius().is_some_and(
+                |radius| radius >= contraction.first_correction + contraction.first_resolution
+            ),
+            "the root radius covers the rounding it was measured through: {contraction:?}"
+        );
+    }
+}
+
+/// #2973: a mode at its root to rounding certifies, and its branch continues.
+///
+/// At `λ = 1e9` the rounded quadratic's stationarity residual at its mode is the rounding of the
+/// penalty product, far above the `inner_tol`-scaled target, and the line search takes steps of
+/// the same rounding. The certificate's target is never below the residual's own rounding band,
+/// as on the joint path (#2812), and a residual inside that band makes the cycle's step rounding
+/// too, so the inner solve certifies the mode, and the continuation from it to `λ = 2e9`
+/// publishes a mode that is again at its root to rounding. Without the band the solve reported
+/// the mode unconverged and every corrector of the continuation refused, which is how the
+/// event-history slope surface's continuations ended as folds.
+#[test]
+fn a_mode_at_its_root_to_rounding_certifies_and_continues_2973() {
+    let family = RoundedQuadraticFamily {
+        center: array![1.3, -0.4],
+        curvature: 1.0,
+    };
+    let specs = [rounded_quadratic_spec()];
+    let options = double_well_options();
+    let penalty_counts: Vec<usize> = specs.iter().map(|spec| spec.penalties.len()).collect();
+    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
+        .expect("single-penalty label layout");
+    let from = 1.0e9_f64.ln();
+    let start = outerobjectivegradienthessian_labeled(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![from],
+        None,
+        &gam_problem::RhoPrior::Flat,
+        EvalMode::ValueAndGradient,
+    )
+    .expect("the evaluation at λ = 1e9");
+    assert!(
+        start.inner_converged,
+        "the mode at its root to rounding certifies"
+    );
+    let to = 2.0e9_f64.ln();
+    let continuation = match continue_branch(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &gam_problem::RhoPrior::Flat,
+        &start.warm_start,
+        &array![to],
+        EvalMode::ValueAndGradient,
+    ) {
+        Ok(continuation) => continuation,
+        Err(refusal) => panic!("the quadratic's single branch continues to λ = 2e9: {refusal}"),
+    };
+    assert!(
+        continuation.eval.inner_converged,
+        "the continued mode certifies"
+    );
+    let at_target = newton_region_contraction(
+        &family,
+        &specs,
+        &options,
+        &layout,
+        &array![to],
+        &continuation.eval.warm_start,
+    )
+    .expect("the Newton-region test runs at the continued mode");
+    assert!(
+        at_target.contraction.first_correction <= at_target.contraction.first_resolution,
+        "the continued mode is at its root to rounding: {:?}",
+        at_target.contraction
+    );
 }
 
 /// #2973 pin 1: the shallow branch is followed to its fold, and the continuation declines past
@@ -1104,15 +1365,17 @@ fn the_shallow_branch_is_followed_to_its_fold_and_declines_past_it_2973() {
             else {
                 panic!("the continuation must decline at the fold, not with: {refusal}");
             };
+            // The branch is followed to its fold, to the arithmetic's resolution: the last certified
+            // point is the closed-form fold in f64 (measured 0.9766625503626531 for both; the next
+            // sub-step past it reads λ_min = −5.8e-9 and is refused as indefinite), and never past
+            // it.
             assert!(
-                last_certified_rho[0] > 0.5 && last_certified_rho[0] < rho_fold,
+                last_certified_rho[0] > 0.5 && last_certified_rho[0] <= rho_fold,
                 "the last certified point lies on the shallow branch between the start and the \
                  fold at {rho_fold}; got {}",
                 last_certified_rho[0]
             );
-            // The branch is followed to its fold, not abandoned short of it: the last certified
-            // point is within 1e-3 of the closed-form fold (measured 9.766626e-1 against
-            // 9.76663e-1).
+            // Not abandoned short of the fold either.
             assert!(
                 rho_fold - last_certified_rho[0] < 1e-3,
                 "the continuation stops {} short of the fold at {rho_fold}",

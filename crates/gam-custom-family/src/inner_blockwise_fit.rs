@@ -3375,8 +3375,33 @@ pub(crate) struct SimplifiedNewtonCorrections {
     /// `‖Δ̄¹‖`, the simplified correction at `x¹ = x⁰ + Δ⁰`: the gradient at `x¹`, the
     /// curvature frozen at `x⁰`.
     pub(crate) second_correction: f64,
+    /// The arithmetic resolution of `‖Δ⁰‖` and of `‖Δ̄¹‖`
+    /// ([`ExactNewtonBlockUpdater::update_step_with_resolution`]).
+    pub(crate) first_resolution: f64,
+    pub(crate) second_resolution: f64,
     /// The block coefficients at `x¹`.
     pub(crate) after_first: Vec<Array1<f64>>,
+}
+
+/// The rounding band of a single block's Newton right-hand side `g − S_λβ`, per coefficient
+/// (gam#2973): the data gradient's `γ_n·|g_j|` over the `n` rows it sums, plus the penalty
+/// product's band ([`exact_joint_fit::penalty_rounding_bands`]).
+///
+/// `|g_j|` is a lower bound on the absolute sum of the row terms coordinate `j` accumulates, so
+/// the band can only be too narrow.
+fn block_newton_rhs_rounding_band(
+    spec: &ParameterBlockSpec,
+    gradient: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    beta: &Array1<f64>,
+) -> Array1<f64> {
+    let data_growth =
+        gam_linalg::roundoff::accumulation_growth(spec.solver_design().nrows().max(1));
+    let (penalty_bands, _) =
+        exact_joint_fit::penalty_rounding_bands(std::slice::from_ref(s_lambda), &[beta], None);
+    Array1::from_shape_fn(gradient.len(), |j| {
+        data_growth * gradient[j].abs() + penalty_bands[j]
+    })
 }
 
 /// Whether [`single_block_simplified_newton_corrections`] covers a solve: one block, no joint
@@ -3470,20 +3495,23 @@ pub(crate) fn single_block_simplified_newton_corrections<
         });
     };
     let predictor_constraints = family.block_linear_constraints(&states, 0, spec)?;
-    let first = ExactNewtonBlockUpdater {
+    let (first, first_resolution) = ExactNewtonBlockUpdater {
         gradient: predictor_gradient,
         hessian: frozen_hessian,
     }
-    .compute_update_step(&BlockUpdateContext {
-        family,
-        states: &states,
-        spec,
-        block_idx: 0,
-        s_lambda: &s_lambda,
-        options,
-        linear_constraints: predictor_constraints.as_ref(),
-        cached_active_set: None,
-    })?;
+    .update_step_with_resolution(
+        &BlockUpdateContext {
+            family,
+            states: &states,
+            spec,
+            block_idx: 0,
+            s_lambda: &s_lambda,
+            options,
+            linear_constraints: predictor_constraints.as_ref(),
+            cached_active_set: None,
+        },
+        &block_newton_rhs_rounding_band(spec, predictor_gradient, &s_lambda, &states[0].beta),
+    )?;
     let x0 = states[0].beta.clone();
     let x1 = family.post_update_block_beta(&states, 0, spec, first.beta_new_raw)?;
     let first_correction = (&x1 - &x0).mapv(|value| value * value).sum().sqrt();
@@ -3502,25 +3530,30 @@ pub(crate) fn single_block_simplified_newton_corrections<
         });
     };
     let first_constraints = family.block_linear_constraints(&states, 0, spec)?;
-    let second = ExactNewtonBlockUpdater {
+    let (second, second_resolution) = ExactNewtonBlockUpdater {
         gradient: first_gradient,
         hessian: frozen_hessian,
     }
-    .compute_update_step(&BlockUpdateContext {
-        family,
-        states: &states,
-        spec,
-        block_idx: 0,
-        s_lambda: &s_lambda,
-        options,
-        linear_constraints: first_constraints.as_ref(),
-        cached_active_set: first.active_set.as_deref(),
-    })?;
+    .update_step_with_resolution(
+        &BlockUpdateContext {
+            family,
+            states: &states,
+            spec,
+            block_idx: 0,
+            s_lambda: &s_lambda,
+            options,
+            linear_constraints: first_constraints.as_ref(),
+            cached_active_set: first.active_set.as_deref(),
+        },
+        &block_newton_rhs_rounding_band(spec, first_gradient, &s_lambda, &x1),
+    )?;
     let x2 = family.post_update_block_beta(&states, 0, spec, second.beta_new_raw)?;
     let second_correction = (&x2 - &x1).mapv(|value| value * value).sum().sqrt();
     Ok(SimplifiedNewtonCorrections {
         first_correction,
         second_correction,
+        first_resolution,
+        second_resolution,
         after_first: vec![x1],
     })
 }
@@ -4721,7 +4754,37 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             .fold(0.0_f64, f64::max);
         let step_tol = inner_tol * (1.0 + beta_inf);
         let objective_tol = inner_tol * (1.0 + objective.abs());
-        let residual_tol = objective_tol;
+        // The caller's tolerance is a convergence choice; the residual's own rounding band is a
+        // resolution, and the target is never below it, as on the joint path (#2812). Without
+        // it a residual inside the band cannot certify, so a mode at its root to rounding is
+        // reported unconverged: on the event-history slope surface at λ = 1.09e9 residuals of
+        // 2e-8..1.6e-7 stood against a target of 1.4e-8 and a penalty band of 1e-6, and every
+        // branch-continuation corrector there refused (gam#2973).
+        let stationarity_band = if has_joint_exacthessian {
+            let data_gradient_inf = cached_eval
+                .blockworking_sets
+                .iter()
+                .filter_map(|set| match set {
+                    BlockWorkingSet::ExactNewton { gradient, .. } => Some(
+                        gradient
+                            .iter()
+                            .fold(0.0_f64, |largest, value| largest.max(value.abs())),
+                    ),
+                    _ => None,
+                })
+                .fold(0.0_f64, f64::max);
+            let block_betas: Vec<&Array1<f64>> = states.iter().map(|state| &state.beta).collect();
+            Some(exact_joint_fit::joint_stationarity_rounding_band(
+                &s_lambdas,
+                &block_betas,
+                None,
+                data_gradient_inf,
+                total_joint_n,
+            ))
+        } else {
+            None
+        };
+        let residual_tol = stationarity_band.map_or(objective_tol, |band| objective_tol.max(band));
         // The premise this used to skip the measurement on is true and the
         // conclusion drawn from it was not (gam#2612).
         //
@@ -4747,7 +4810,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         // So measure it for one block too. The premise says the answer must
         // agree with the block-conditional verdict when that verdict is real,
         // which is exactly why measuring costs nothing here.
-        let exact_joint_stationarity_ok = if has_joint_exacthessian {
+        let stationarity_residual = if has_joint_exacthessian {
             exact_newton_joint_stationarity_inf_norm(
                 family,
                 specs,
@@ -4756,11 +4819,18 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 &s_lambdas,
                 None,
             )?
-            .map(|residual| residual <= residual_tol)
-            .unwrap_or(true)
         } else {
-            true
+            None
         };
+        let exact_joint_stationarity_ok =
+            stationarity_residual.is_none_or(|residual| residual <= residual_tol);
+        // A residual inside its own rounding band drives a step that is rounding too: the
+        // iterate is at its root to the arithmetic, so a step this cycle took from it is not a
+        // step it needed (the Newton-region test's rule, gam#2973).
+        let step_is_rounding = matches!(
+            (stationarity_residual, stationarity_band),
+            (Some(residual), Some(band)) if residual <= band
+        );
         log::debug!(
             "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
             cycle,
@@ -4836,7 +4906,9 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         // outside the real KKT/objective tolerance, biasing the REML/LAML
         // criterion the inner residual feeds. Convergence is certified ONLY by
         // the exact stationarity gate below.
-        if max_accepted_beta_step <= step_tol && objective_change <= objective_tol {
+        if (max_accepted_beta_step <= step_tol || step_is_rounding)
+            && objective_change <= objective_tol
+        {
             if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
                 converged = true;
             }

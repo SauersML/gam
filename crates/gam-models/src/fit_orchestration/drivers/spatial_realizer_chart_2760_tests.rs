@@ -325,6 +325,9 @@ mod spatial_realizer_chart_2760_tests {
                     duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
                         &spec.smooth_terms[0],
                     ),
+                    bspline_null_ridge: gam_terms::smooth::bspline_null_ridge_request(
+                        &spec.smooth_terms[0],
+                    ),
                     termname: "duchon_1d",
                 },
             )

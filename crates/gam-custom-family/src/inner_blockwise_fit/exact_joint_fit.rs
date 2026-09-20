@@ -21,7 +21,7 @@ use super::*;
 /// the safe direction: this band can only fail to certify a stationary point,
 /// never certify a non-stationary one. It is not built from the penalty's
 /// entries — a band from `‖S‖` alone certified a residual of `0.15`.
-fn joint_stationarity_rounding_band(
+pub(super) fn joint_stationarity_rounding_band(
     s_lambdas: &[Array2<f64>],
     block_betas: &[&Array1<f64>],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,
@@ -43,7 +43,7 @@ fn joint_stationarity_rounding_band(
 /// Each local penalty product accumulates `p_k` terms; each full-width joint
 /// penalty accumulates `p` terms followed by strength scaling and summation
 /// across penalties. Both are charged on their absolute summand magnitudes.
-fn penalty_rounding_bands(
+pub(super) fn penalty_rounding_bands(
     s_lambdas: &[Array2<f64>],
     block_betas: &[&Array1<f64>],
     joint_bundle: Option<&gam_problem::JointPenaltyBundle>,

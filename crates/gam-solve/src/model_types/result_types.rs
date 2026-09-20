@@ -164,6 +164,7 @@ mod per_term_edf_tests {
                 dispersion: Dispersion::estimated(1.0)
                     .expect("1.0 is a valid estimated dispersion"),
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -275,6 +276,7 @@ mod per_term_edf_tests {
                 dispersion: Dispersion::estimated(1.0)
                     .expect("1.0 is a valid estimated dispersion"),
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
@@ -348,6 +350,7 @@ mod per_term_edf_tests {
                 dispersion: Dispersion::estimated(1.0)
                     .expect("1.0 is a valid estimated dispersion"),
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 // No influence matrix: forces the `|coeff_range| − Σ tr_kk`
                 // per-block-trace channel, where the `penalty_cursor` walk matters.
@@ -551,6 +554,7 @@ mod per_term_edf_tests {
                 dispersion: Dispersion::estimated(1.0)
                     .expect("1.0 is a valid estimated dispersion"),
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 // No influence matrix: forces the per-block-trace fallback where
                 // `penalty_cursor` keys into `penalty_block_trace`.
@@ -1972,11 +1976,11 @@ impl Default for FitOptions {
 /// `Normal { mean: 0, sd: 3 }`, so the shipped criterion was `REML + Σρ²/18` —
 /// MAP in ρ, with an underived `sd = 3.0` — for as long as nobody re-read the
 /// `Default` impl. The damage was not only statistical: a prior whose gradient
-/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and all three
-/// rail-reasoning paths (`try_certify_asymptote_rail`, `try_tail_snap_to_rail`,
+/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and the
+/// measured rail-reasoning paths (`try_certify_asymptote_rail`,
 /// `detect_wrong_rail_pullback`) decide by testing that `ĉ` is CONSTANT. One
-/// `Default` disabled the face certificate, the tail snap, and the repair path
-/// for a coordinate stuck on the wrong bound.
+/// `Default` disabled the face certificate and the repair path for a
+/// coordinate stuck on the wrong bound.
 #[cfg(test)]
 mod tests_certification_refusal_2550 {
     use super::{
@@ -3009,6 +3013,9 @@ pub enum SmoothingCorrectionAbsence {
     RailCertified { detail: String },
     /// The corrected covariance could not be truncated to the constrained feasible set.
     ConstrainedTruncationRefused { detail: String },
+    /// A fit whose inference stayed factorized (the dense covariance bundle was not reserved)
+    /// could not reserve the workspace the first-order correction is assembled in (#3283).
+    CorrectionWorkspaceRefused { detail: String },
 }
 
 /// Why a custom-family outer search declares no analytic ρ-Hessian.
@@ -3062,8 +3069,29 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
                 f,
                 "the corrected covariance could not be truncated to the feasible set: {detail}"
             ),
+            Self::CorrectionWorkspaceRefused { detail } => write!(
+                f,
+                "the factorized fit could not reserve the smoothing correction's workspace: {detail}"
+            ),
         }
     }
+}
+
+/// The smoothing-parameter correction of a fit whose inference stayed factorized (#3283).
+///
+/// When the resource governor refuses the dense covariance bundle, the standard optimizer
+/// publishes standard errors without a covariance (#2960). The correction `C = J·V_ρ·Jᵀ` is then
+/// kept as the square-root factor it is assembled from, `C = B·Bᵀ` with `B` of shape `p × r`
+/// (`r` the identified rank of `V_ρ`), so no `p × p` matrix is formed. A consumer applies
+/// `Vp·x = Vb·x + B·(Bᵀ·x)` through the Hessian factor; a constrained fit's corrected law is the
+/// truncation at `Vp`'s own lift, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, as the dense branch builds it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FactorizedSmoothingCorrection {
+    /// `B` in the frame of the published coefficients, `C = B·Bᵀ`.
+    pub factor: Array2<f64>,
+    /// `sqrt(diag(Vp))` of the published coefficients, truncated to the feasible set on a
+    /// constrained fit, solved beside [`FitInference::factorized_standard_errors`].
+    pub standard_errors: Array1<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -3095,8 +3123,9 @@ pub struct FitInference {
     pub edf_rank_bound: Vec<crate::estimate::EdfRankBound>,
     pub edf_total: f64,
     pub smoothing_correction: Option<Array2<f64>>,
-    /// Method that produced `smoothing_correction`. Required whenever a matrix
-    /// is present; `None` means no correction was retained.
+    /// Method that produced `smoothing_correction`, or the factor in
+    /// `smoothing_correction_factorized`. Required whenever either is present;
+    /// `None` means no correction was retained.
     pub smoothing_correction_method: Option<SmoothingCorrectionMethod>,
     /// The exact first-order IFT smoothing-parameter-uncertainty correction
     /// read by the #946 WPS-corrected-EDF/AIC channel (see
@@ -3114,8 +3143,9 @@ pub struct FitInference {
     #[serde(default)]
     pub smoothing_correction_method_first_order: Option<SmoothingCorrectionMethod>,
     /// The typed reason a fit that selected smoothing parameters publishes no
-    /// `beta_covariance_corrected`. `None` whenever the corrected covariance is published or the
-    /// fit has no smoothing coordinate.
+    /// `beta_covariance_corrected`. `None` whenever the corrected covariance is published, in
+    /// full or as the factorized branch's `smoothing_correction_factorized` (#3283), or the fit
+    /// has no smoothing coordinate.
     #[serde(default)]
     pub smoothing_correction_absence: Option<SmoothingCorrectionAbsence>,
     /// Penalised Hessian `H = X'W_HX + S(λ)` with NO dispersion scaling.
@@ -3148,6 +3178,13 @@ pub struct FitInference {
     /// stale.
     #[serde(default)]
     pub factorized_standard_errors: Option<Array1<f64>>,
+    /// The factorized branch's smoothing correction and corrected standard
+    /// errors (#3283). `Some` only beside [`Self::factorized_standard_errors`]:
+    /// a fit that publishes a covariance carries its correction in
+    /// [`Self::smoothing_correction`] and its corrected covariance in
+    /// [`UnifiedFitResult::covariance_corrected`].
+    #[serde(default)]
+    pub smoothing_correction_factorized: Option<FactorizedSmoothingCorrection>,
     /// Frequentist covariance Ve = H⁻¹ X'WX H⁻¹ * φ̂.
     #[serde(default)]
     pub beta_covariance_frequentist: Option<Array2<f64>>,
@@ -3155,11 +3192,18 @@ pub struct FitInference {
     #[serde(default)]
     pub coefficient_influence: Option<Array2<f64>>,
     /// Weighted Gram `X'WX = H − S(λ)` in the original coefficient basis —
-    /// symmetric PSD by construction. Stored directly (issue #1027) so the
+    /// symmetric PSD by construction on the GLM lanes. Stored directly (issue #1027) so the
     /// Wood–Pya–Säfken corrected-EDF correction `tr(X'WX·Σ_ρ)` pairs the true
     /// PSD Gram with `Σ_ρ`, rather than reconstructing it as `H·F` from a
     /// Hessian surface that need not satisfy `H·F = X'WX` (which made the
     /// correction indefinite and the corrected EDF drop below the conditional).
+    ///
+    /// A blockwise custom-family fit publishes its likelihood curvature
+    /// `H − S(λ)` here, the observed information of an arbitrary likelihood,
+    /// which is PSD only at a likelihood maximum. Such a fit has no scalar
+    /// covariance scale, so the corrected-EDF correction never reads it; the
+    /// smooth score test refuses a term whose score covariance it leaves
+    /// indefinite.
     #[serde(default)]
     pub weighted_gram: Option<Array2<f64>>,
     /// The penalized Hessian's identified coefficient subspace at the fitted
@@ -3204,6 +3248,8 @@ struct FitInferenceWire {
     #[serde(default)]
     factorized_standard_errors: Option<Array1<f64>>,
     #[serde(default)]
+    smoothing_correction_factorized: Option<FactorizedSmoothingCorrection>,
+    #[serde(default)]
     beta_covariance: Option<serde::de::IgnoredAny>,
     #[serde(default)]
     beta_standard_errors: Option<Array1<f64>>,
@@ -3239,6 +3285,7 @@ impl From<FitInferenceWire> for FitInference {
             reparam_qs: wire.reparam_qs,
             dispersion: wire.dispersion,
             factorized_standard_errors,
+            smoothing_correction_factorized: wire.smoothing_correction_factorized,
             beta_covariance_frequentist: wire.beta_covariance_frequentist,
             coefficient_influence: wire.coefficient_influence,
             weighted_gram: wire.weighted_gram,
@@ -3806,6 +3853,7 @@ mod assembly_inner_status_gate_tests {
                 dispersion: Dispersion::estimated(1.0)
                     .expect("1.0 is a valid estimated dispersion"),
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -4273,6 +4321,56 @@ mod assembly_inner_status_gate_tests {
             .expect_err("a second diagonal beside the store must be refused")
             .to_string();
         assert!(message.contains("beside a conditional covariance"), "{message}");
+    }
+
+    /// #3283: the factorized branch's smoothing correction (the fixture has one
+    /// smoothing coordinate) mints only beside the standard errors it was solved with, is what the corrected standard errors
+    /// and the published covariance definition read on a fit with no covariance,
+    /// and never rides beside a published corrected covariance.
+    #[test]
+    fn a_factorized_smoothing_correction_mints_only_beside_factorized_standard_errors_3283() {
+        let standard_errors = Array1::from_vec(vec![1.0, 2.0]);
+        let corrected = Array1::from_vec(vec![3.0, 4.0]);
+        let factorized = FactorizedSmoothingCorrection {
+            factor: Array2::from_shape_vec((2, 1), vec![0.5, -1.5]).expect("2x1"),
+            standard_errors: corrected.clone(),
+        };
+        let mut alone = parts_with_inner_status(PirlsStatus::Converged);
+        if let Some(inference) = alone.inference.as_mut() {
+            inference.factorized_standard_errors = Some(standard_errors.clone());
+            inference.smoothing_correction_factorized = Some(factorized.clone());
+        }
+        let fit = UnifiedFitResult::try_from_parts(alone)
+            .expect("a factorized correction beside factorized standard errors mints");
+        assert_eq!(fit.beta_standard_errors(), Some(standard_errors.clone()));
+        assert_eq!(fit.beta_standard_errors_corrected(), Some(corrected.clone()));
+        assert_eq!(
+            fit.published_covariance_mode(),
+            InferenceCovarianceMode::SmoothingCorrected,
+            "a fit carrying its factorized correction publishes the corrected definition"
+        );
+
+        let mut without_errors = parts_with_inner_status(PirlsStatus::Converged);
+        if let Some(inference) = without_errors.inference.as_mut() {
+            inference.smoothing_correction_factorized = Some(factorized.clone());
+        }
+        let message = UnifiedFitResult::try_from_parts(without_errors)
+            .expect_err("a factorized correction without its standard errors must be refused")
+            .to_string();
+        assert!(message.contains("factorized smoothing correction beside"), "{message}");
+
+        let mut short = parts_with_inner_status(PirlsStatus::Converged);
+        if let Some(inference) = short.inference.as_mut() {
+            inference.factorized_standard_errors = Some(standard_errors);
+            inference.smoothing_correction_factorized = Some(FactorizedSmoothingCorrection {
+                factor: Array2::from_shape_vec((1, 1), vec![0.5]).expect("1x1"),
+                standard_errors: corrected,
+            });
+        }
+        let message = UnifiedFitResult::try_from_parts(short)
+            .expect_err("a factor with the wrong row count must be refused")
+            .to_string();
+        assert!(message.contains("factorized smoothing correction shape mismatch"), "{message}");
     }
 
     /// #2955: an inference block written before the one-store schema carries the
@@ -4837,6 +4935,16 @@ impl FitInference {
             validate_all_finite_estimation(
                 "fit_result.factorized_standard_errors",
                 v.iter().copied(),
+            )?;
+        }
+        if let Some(factorized) = self.smoothing_correction_factorized.as_ref() {
+            validate_all_finite_estimation(
+                "fit_result.smoothing_correction_factorized.factor",
+                factorized.factor.iter().copied(),
+            )?;
+            validate_all_finite_estimation(
+                "fit_result.smoothing_correction_factorized.standard_errors",
+                factorized.standard_errors.iter().copied(),
             )?;
         }
         // These three are INFERENCE-ONLY objects derived from `H⁻¹` at the
@@ -5546,6 +5654,39 @@ impl UnifiedFitResult {
                     );
                 }
             }
+            if let Some(factorized) = inf.smoothing_correction_factorized.as_ref() {
+                // #3283: the factorized branch's correction is solved with the
+                // standard errors beside it; a fit that publishes a covariance
+                // carries its correction and corrected covariance instead.
+                if inf.factorized_standard_errors.is_none() || covariance_corrected.is_some() {
+                    bail_fit_result_invariant!(
+                        "UnifiedFitResult carries a factorized smoothing correction beside a \
+                         published covariance; it exists only beside factorized standard errors"
+                    );
+                }
+                if factorized.factor.nrows() != p || factorized.standard_errors.len() != p {
+                    bail_fit_result_invariant!(
+                        "UnifiedFitResult factorized smoothing correction shape mismatch: factor \
+                         {}x{}, standard errors {}, expected {} coefficients",
+                        factorized.factor.nrows(),
+                        factorized.factor.ncols(),
+                        factorized.standard_errors.len(),
+                        p
+                    );
+                }
+                if let Some((index, value)) = factorized
+                    .standard_errors
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|&(_, v)| v < 0.0)
+                {
+                    bail_fit_result_invariant!(
+                        "UnifiedFitResult factorized corrected standard error {index} is negative: \
+                         {value:?}"
+                    );
+                }
+            }
             if let Some(cov) = inf.beta_covariance_frequentist.as_ref()
                 && (cov.nrows() != p || cov.ncols() != p)
             {
@@ -5913,10 +6054,25 @@ impl UnifiedFitResult {
     pub fn beta_standard_errors_corrected(&self) -> Option<Array1<f64>> {
         match self.covariance_corrected.as_ref() {
             Some(covariance) => Some(standard_errors_of_published_covariance(covariance)),
-            None => has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts)
-                .then(|| self.beta_standard_errors())
-                .flatten(),
+            None => match self.smoothing_correction_factorized() {
+                // The factorized branch's corrected standard errors (#3283).
+                Some(factorized) => Some(factorized.standard_errors.clone()),
+                None => has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts)
+                    .then(|| self.beta_standard_errors())
+                    .flatten(),
+            },
         }
+    }
+
+    /// The smoothing correction of a fit whose inference stayed factorized:
+    /// its square-root factor `B` (`C = B·Bᵀ`) in the frame of the published
+    /// coefficients, and the corrected standard errors (#3283). A fit that
+    /// publishes a covariance returns `None` here and carries
+    /// [`Self::beta_covariance_corrected`] instead.
+    pub fn smoothing_correction_factorized(&self) -> Option<&FactorizedSmoothingCorrection> {
+        self.inference
+            .as_ref()
+            .and_then(|inference| inference.smoothing_correction_factorized.as_ref())
     }
 
     /// Add one correction matrix to the published conditional and corrected
@@ -6147,8 +6303,9 @@ impl UnifiedFitResult {
     /// a display policy or request is never evidence of what was used.
     /// The covariance definition this fit PUBLISHES, and therefore the one
     /// every default uncertainty surface uses when the caller names none
-    /// (gam#2779): smoothing-corrected whenever the fit carries that matrix —
-    /// or its exact identity form for a fit with no smoothing coordinates,
+    /// (gam#2779): smoothing-corrected whenever the fit carries that matrix,
+    /// or its factorized form on a fit whose inference stayed factorized
+    /// (#3283) — or its exact identity form for a fit with no smoothing coordinates,
     /// where the correction is the zero matrix — and conditional otherwise.
     /// A fit certified at an infinite-smoothing rail has a typed-unavailable
     /// correction and publishes conditional, which is what `summary()` prices
@@ -6159,6 +6316,7 @@ impl UnifiedFitResult {
     /// refuses when the matrix is absent.
     pub fn published_covariance_mode(&self) -> InferenceCovarianceMode {
         if self.beta_covariance_corrected().is_some()
+            || self.smoothing_correction_factorized().is_some()
             || has_no_smoothing_coordinate(&self.log_lambdas, &self.artifacts)
         {
             InferenceCovarianceMode::SmoothingCorrected

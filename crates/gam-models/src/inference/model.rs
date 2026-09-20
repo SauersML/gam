@@ -427,6 +427,36 @@ impl_reason_error_boilerplate! {
     }
 }
 
+impl FittedModelError {
+    /// Who has to act on a saved model this binary refuses: the one category
+    /// every front end classifies it by. Each variant refuses the saved
+    /// payload's own contents (its schema, bytes, fields, options or values),
+    /// so each is a data refusal, remedied by refitting or re-saving the model
+    /// (gam#3008). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::SchemaMismatch { .. }
+            | Self::PayloadCorrupt { .. }
+            | Self::MissingField { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidInput { .. } => gam_problem::ErrorCategory::Data,
+        }
+    }
+
+    /// The `Enum::Variant` name a front end reports beside the category.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "FittedModelError::SchemaMismatch",
+            Self::PayloadCorrupt { .. } => "FittedModelError::PayloadCorrupt",
+            Self::MissingField { .. } => "FittedModelError::MissingField",
+            Self::IncompatibleConfig { .. } => "FittedModelError::IncompatibleConfig",
+            Self::InvalidInput { .. } => "FittedModelError::InvalidInput",
+        }
+    }
+}
+
 // Boundary conversions so external `Result<_, EstimationError>` /
 // `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
 // Survival prediction keeps the model-layer source so the chain identifies
@@ -668,9 +698,9 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
@@ -2451,10 +2481,19 @@ impl SavedLinkWiggleRuntime {
                 ),
             });
         }
+        Ok(base + &self.contribution(warp_index)?)
+    }
+
+    /// The wiggle's share `B(warp_index)·β` of the link, certified monotone at
+    /// `warp_index`. This is the one evaluation of that share:
+    /// [`Self::apply_with_index`] adds it to the base predictor, and a Gaussian
+    /// location-scale fit publishes it as its wiggle block's state, so the saved
+    /// model reproduces the fit's own mean bit for bit (#3001).
+    pub fn contribution(&self, warp_index: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(warp_index)?;
         let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(base + &xwiggle.dot(&beta_link_wiggle))
+        Ok(xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {

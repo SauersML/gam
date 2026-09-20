@@ -251,6 +251,7 @@ fn main() {
                 duchon_operator_penalties: gam_terms::smooth::duchon_operator_penalty_request(
                     &term_spec(ell),
                 ),
+                bspline_null_ridge: gam_terms::smooth::bspline_null_ridge_request(&term_spec(ell)),
                 termname: "duchon_1d",
             },
         );

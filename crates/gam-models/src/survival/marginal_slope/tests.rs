@@ -347,6 +347,7 @@ fn make_closed_form_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -946,6 +947,7 @@ fn test_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -1416,6 +1418,7 @@ fn exact_flex_row_matches_rigid_closed_form_without_deviations() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -1770,6 +1773,7 @@ fn oracle_rigid_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -2105,6 +2109,7 @@ fn exact_flex_row_value_matches_rigid_with_zero_score_and_link_coefficients() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -2254,6 +2259,7 @@ fn flex_contracted_tower_matches_independent_rigid_tower_and_catches_sign_flip()
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         // ZERO deviation coefficients: the flex calculus runs in full, but the
         // primary NLL reduces to the rigid closed form so the rigid Tower4 is the
@@ -2453,6 +2459,7 @@ fn flex_contracted_tower_matches_independent_fd_witness_nonzero_deviation() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let primary = flex_primary_slices(&family);
     let p = primary.total;
@@ -2897,6 +2904,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let specs = vec![
         dummy_blockspec(1),
@@ -2947,6 +2955,7 @@ fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3022,6 +3031,7 @@ fn censored_rows_still_reject_invalid_time_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3095,6 +3105,7 @@ fn exact_newton_evaluation_propagates_invalid_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -3169,6 +3180,7 @@ fn time_constraints_use_exact_derivative_guard_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3257,6 +3269,7 @@ fn time_block_constraints_synthesize_qd1_rows_when_stored_constraints_missing() 
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3332,6 +3345,7 @@ fn time_block_max_feasible_step_uses_synthesized_qd1_rows() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.4, 7.0],
@@ -3398,6 +3412,7 @@ fn coupled_qd1_guard_limits_time_step_before_post_update_projection() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.6, 0.6],
@@ -3477,6 +3492,7 @@ fn timewiggle_tail_step_is_clipped_before_it_can_flip_derivative() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![ParameterBlockState {
         beta: array![0.0, 0.5],
@@ -3545,6 +3561,7 @@ fn time_block_post_update_rejects_infeasible_beta_instead_of_projecting() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 1,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3626,6 +3643,7 @@ fn time_block_post_update_rejects_qd1_when_no_linear_constraints() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3711,6 +3729,7 @@ fn time_block_post_update_errors_when_current_violates_qd1() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let spec = ParameterBlockSpec {
         name: "time_surface".to_string(),
@@ -3791,6 +3810,7 @@ fn time_block_feasible_step_stays_inside_derivative_guard() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let states = vec![
         ParameterBlockState {
@@ -3874,6 +3894,7 @@ fn mixed_blockwise_exact_newton_preserves_sparse_block_hessians() {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let block_states = vec![
         ParameterBlockState {
@@ -4213,6 +4234,7 @@ fn make_block_psi_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -4355,6 +4377,7 @@ fn make_flex_baseline_psi_test_fixture() -> (
         time_wiggle_degree: Some(degree),
         time_wiggle_ncols: wiggle_width,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
 
     let mut beta_time = Array1::zeros(time_width);
@@ -4625,11 +4648,14 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline first callback")
         .expect("FLEX baseline first terms are present");
     assert_eq!(first.score_psi.len(), dimension);
-    let first_hessian = first
-        .hessian_psi_operator
-        .as_ref()
-        .expect("FLEX baseline first Hessian operator")
-        .to_dense();
+    // gam#3061: the ζ composition serves this frame's chart terms with a dense θ Hessian.
+    assert!(family.timewiggle_zeta_available());
+    assert!(
+        first.hessian_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline θ Hessian"
+    );
+    let first_hessian = first.hessian_psi.clone();
+    assert!(first_hessian.iter().any(|value| *value != 0.0));
     assert_eq!(first_hessian.dim(), (dimension, dimension));
     assert!(first.score_psi.iter().all(|value| value.is_finite()));
     assert!(first_hessian.iter().all(|value| value.is_finite()));
@@ -5318,6 +5344,7 @@ fn make_flex_no_wiggle_test_family(n: usize) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6039,6 +6066,7 @@ fn flex_contraction_fixture_family(
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let h_dim = score_runtime.basis_dim();
     let w_dim = link_runtime.basis_dim();
@@ -6264,6 +6292,7 @@ fn make_time_guard_family(deriv_coeff: f64, deriv_offset: f64) -> SurvivalMargin
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -6488,6 +6517,7 @@ fn zz_diag_failure1_flex_vs_rigid_vs_fdhess() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         };
         let sd = score_runtime.basis_dim();
         let ld = link_runtime.basis_dim();
@@ -8181,6 +8211,7 @@ fn make_timewiggle_test_family(
         time_wiggle_degree: Some(TIMEWIGGLE_TEST_DEGREE),
         time_wiggle_ncols: TIMEWIGGLE_TEST_NCOLS,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 
@@ -8513,6 +8544,106 @@ fn rigid_row_primary_mixed_in_z_matches_finite_difference() {
     );
 }
 
+/// A time block's exit design with `p_base` base columns and a zero placeholder
+/// wiggle tail, the baseline predictor it carries, and the wiggle it declares.
+fn placeholder_time_exit_with_wiggle(
+    p_base: usize,
+) -> (DesignMatrix, Array1<f64>, TimeWiggleBlockInput, Array2<f64>) {
+    let n = 40;
+    let offset_exit = Array1::from_shape_fn(n, |i| -1.5 + 3.0 * i as f64 / (n - 1) as f64);
+    let degree = 3;
+    let knots = gam_terms::basis::initializewiggle_knots_from_seed(offset_exit.view(), degree, 2)
+        .expect("wiggle knots from the baseline predictor");
+    let jacobian = crate::wiggle::monotone_wiggle_basis_from_knots(offset_exit.view(), &knots, degree)
+        .expect("warp Jacobian at the baseline predictor");
+    let ncols = jacobian.ncols();
+    let mut placeholder = Array2::<f64>::zeros((n, p_base + ncols));
+    for i in 0..n {
+        for j in 0..p_base {
+            placeholder[[i, j]] = offset_exit[i].powi(j as i32);
+        }
+    }
+    (
+        DesignMatrix::from(placeholder),
+        offset_exit,
+        TimeWiggleBlockInput { knots, degree, ncols },
+        jacobian,
+    )
+}
+
+fn embedded_penalty(p: usize, range: std::ops::Range<usize>, local: &Array2<f64>) -> Array2<f64> {
+    let mut embedded = Array2::<f64>::zeros((p, p));
+    embedded.slice_mut(s![range.clone(), range]).assign(local);
+    embedded
+}
+
+/// gam#3061: a timewiggle-only time block (no base columns) is exactly the
+/// production refusal when seeded against its placeholder design; seeded against
+/// the acting design, its wiggle penalty reads the warp Jacobian's scale.
+#[test]
+fn timewiggle_penalties_are_seeded_against_the_warp_jacobian_3061() {
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(0);
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![embedded_penalty(wiggle.ncols, 0..wiggle.ncols, &wiggle_local)];
+
+    let refused = block_log_lambda_seeds(&placeholder, penalties.iter())
+        .expect_err("the control must refuse: the placeholder tail has an all-zero Gram");
+    assert!(refused.contains("mean Gram diagonal is 0e0"), "{refused}");
+
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    assert_eq!(acting.to_dense(), jacobian, "the wiggle tail must be the warp Jacobian");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("a wiggle penalty seeds against the Jacobian");
+    let expected = block_log_lambda_seeds(&DesignMatrix::from(jacobian.clone()), [&wiggle_local])
+        .expect("seed against the Jacobian itself");
+    assert_eq!(seeds, expected);
+
+    // The ρ domain is read against the same design, and the placeholder's all-zero
+    // Gram carried no resolvability information for it.
+    let (lo, hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&acting, penalties.iter());
+    let (placeholder_lo, placeholder_hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&placeholder, penalties.iter());
+    assert!(lo[0].is_finite() && hi[0].is_finite() && lo[0] < hi[0], "[{}, {}]", lo[0], hi[0]);
+    assert_ne!(
+        (lo[0], hi[0]),
+        (placeholder_lo[0], placeholder_hi[0]),
+        "the acting design must resolve the wiggle penalty's own domain"
+    );
+}
+
+/// gam#3061: with base columns beside the wiggle, each time penalty is seeded
+/// against the part it acts on, and a penalty coupling the two parts is refused.
+#[test]
+fn time_penalties_are_seeded_against_the_part_they_act_on_3061() {
+    let p_base = 2;
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(p_base);
+    let p = p_base + wiggle.ncols;
+    let base_local = array![[0.0, 0.0], [0.0, 1.0]];
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![
+        embedded_penalty(p, 0..p_base, &base_local),
+        embedded_penalty(p, p_base..p, &wiggle_local),
+    ];
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("time seeds on the acting design");
+
+    let base_design = DesignMatrix::from(placeholder.to_dense().slice(s![.., ..p_base]).to_owned());
+    let base_seed = block_log_lambda_seeds(&base_design, [&base_local]).expect("base seed");
+    let wiggle_seed = block_log_lambda_seeds(&DesignMatrix::from(jacobian), [&wiggle_local])
+        .expect("wiggle seed");
+    assert_relative_eq!(seeds[0], base_seed[0], max_relative = 1e-12);
+    assert_relative_eq!(seeds[1], wiggle_seed[0], max_relative = 1e-12);
+
+    let coupled = &penalties[0] + &penalties[1];
+    let refused = time_block_log_lambda_seeds(&acting, &[coupled], wiggle.ncols)
+        .expect_err("a penalty on both parts has no single scale");
+    assert!(refused.contains("couples the base columns"), "{refused}");
+}
+
 /// #932 single-source pin, restored (#2818): the SPECIALIZED rigid-row
 /// contractions must equal the INDEPENDENT dense `Tower4<4>`'s own contractions
 /// on the exact inputs the release measurement is taken at, and — in release —
@@ -8815,6 +8946,7 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: cache,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         }
     };
     let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
@@ -8868,33 +9000,26 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
     );
 }
 
-/// #2900 row 6.11: the rigid survival row jet reaches the device through the
-/// dispatch policy's fused-kernel crossover, and the device returns the per-row
-/// CPU program. On a CUDA host the fixture is sized at the probed runtime's
-/// `fused_kernel_min_n`, so the production cache build selects the device, and
-/// every channel of every row is compared with `row_kernel(row)` at the
-/// `RowKernel::batched_value_grad_hess_all` contract (≤ 1e-9). Two rows in
-/// seven are shifted 5 units into either probability tail. On a host without a
-/// device, nothing is admitted: the check reduces to admission, and the report
-/// says `device_selected=false`.
+/// #2900 row 6.11 and gam#3024: the rigid survival row jet is weighed by its
+/// own two executors, and the device returns the per-row CPU program. On a
+/// host without a device nothing is admitted or raced, and the cache is the
+/// per-row loop. On a CUDA host the first `auto` build of an untimed shape
+/// races the per-row loop against the device pass and returns the per-row
+/// result bit for bit; the shape is then decided from its timing without
+/// another race, and the device pass is compared with `row_kernel(row)` on
+/// every channel of every row at the `RowKernel::batched_value_grad_hess_all`
+/// contract (≤ 1e-9). Two rows in seven are shifted 5 units into either
+/// probability tail.
 #[test]
 fn rigid_row_jet_device_admission_and_parity_2900() {
     use crate::row_kernel::{RowKernel, RowSet, build_row_kernel_cache};
-    use gam_gpu::policy::GpuDispatchPolicy;
-    let admitted = |n: usize| {
+    let n = 2_048;
+    let decide = || {
         rigid_row_jet_decision::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(n)
             .expect("survival row-jet admission must not fault")
-            .use_gpu
     };
-
-    let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N;
-    assert!(
-        !admitted(floor - 1),
-        "no reachable policy admits a fused batch below {floor} rows"
-    );
     let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
         .expect("CUDA runtime resolution must not fault");
-    let n = runtime.map_or(64, |runtime| runtime.policy().fused_kernel_min_n.max(floor));
 
     let mut family = make_closed_form_test_family(n);
     let into_tails = |values: &Array1<f64>| {
@@ -8911,45 +9036,87 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
         family,
         block_states,
     );
-
-    let selected = admitted(n);
-    assert_eq!(
-        selected,
-        runtime.is_some(),
-        "a {n}-row batch at the probed runtime's fused-kernel crossover must reach the device \
-         exactly when a device resolves"
-    );
-    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
-    let mut worst_gap = 0.0_f64;
-    let mut worst_row = 0;
-    for row in 0..n {
-        let (value, grad, hess) = RowKernel::row_kernel(&kernel, row).expect("per-row CPU program");
-        let channels = std::iter::once((cache.nll[row], value))
-            .chain(cache.gradients[row].iter().copied().zip(grad))
-            .chain(
-                cache.hessians[row]
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .zip(hess.iter().flatten().copied()),
-            );
-        for (batched, per_row) in channels {
-            let gap = (batched - per_row).abs() / 1.0_f64.max(batched.abs()).max(per_row.abs());
-            if !(gap <= worst_gap) {
-                worst_gap = gap;
-                worst_row = row;
+    let per_row: Vec<_> = (0..n)
+        .map(|row| RowKernel::row_kernel(&kernel, row).expect("per-row CPU program"))
+        .collect();
+    let worst_gap =
+        |nll: &[f64],
+         gradients: &[[f64; STATIC_SLOPE_PRIMARIES]],
+         hessians: &[[[f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]]| {
+            let mut worst = (0.0_f64, 0);
+            for (row, (value, grad, hess)) in per_row.iter().enumerate() {
+                let channels = std::iter::once((nll[row], *value))
+                    .chain(gradients[row].iter().copied().zip(grad.iter().copied()))
+                    .chain(
+                        hessians[row]
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .zip(hess.iter().flatten().copied()),
+                    );
+                for (batched, cpu) in channels {
+                    let gap = (batched - cpu).abs() / 1.0_f64.max(batched.abs()).max(cpu.abs());
+                    if !(gap <= worst.0) {
+                        worst = (gap, row);
+                    }
+                }
             }
+            worst
+        };
+
+    let first = decide();
+    if runtime.is_none() {
+        assert_eq!(
+            (first.use_gpu, first.race),
+            (false, None),
+            "a host without a device admits and races nothing: {}",
+            first.reason
+        );
+    } else {
+        assert!(
+            first.race.is_some() || first.reason == "cpu-device-measured-slower" || first.use_gpu,
+            "an untimed shape on a CUDA host is raced: {}",
+            first.reason
+        );
+    }
+    let raced = first.race.is_some();
+    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
+    let (cache_gap, cache_row) = worst_gap(&cache.nll, &cache.gradients, &cache.hessians);
+    if raced || !first.use_gpu {
+        assert_eq!(
+            cache_gap, 0.0,
+            "a raced or CPU-decided build returns the per-row loop bit for bit; row {cache_row}"
+        );
+        if raced {
+            assert!(decide().race.is_none(), "a raced shape is decided from its timing");
         }
     }
+    #[cfg(target_os = "linux")]
+    let device_gap = runtime.map(|_| {
+        let (nll, gradients, hessians) = kernel
+            .rigid_row_jet_on_device()
+            .expect("the device row jet runs on a CUDA host");
+        worst_gap(&nll, &gradients, &hessians)
+    });
+    #[cfg(not(target_os = "linux"))]
+    let device_gap: Option<(f64, usize)> = None;
     eprintln!(
-        "#2900 survival row jet: n={n} device_selected={selected} \
-         worst_relative_gap={worst_gap:.3e} at row {worst_row}"
+        "#2900/#3024 survival row jet: n={n} raced={raced} decision={} cache_gap={cache_gap:.3e} \
+         device_gap={device_gap:?}",
+        first.reason
     );
     assert!(
-        worst_gap <= 1e-9,
-        "survival row jet: batched channel differs from the per-row program by {worst_gap:e} \
-         (relative) at row {worst_row}, device_selected={selected}"
+        cache_gap <= 1e-9,
+        "survival row jet: the cache differs from the per-row program by {cache_gap:e} \
+         (relative) at row {cache_row}"
     );
+    if let Some((gap, row)) = device_gap {
+        assert!(
+            gap <= 1e-9,
+            "survival row jet: the device pass differs from the per-row program by {gap:e} \
+             (relative) at row {row}"
+        );
+    }
 }
 
 /// gam#3000 slice 2: the device row jet declares the four-primary Gaussian
@@ -9082,4 +9249,177 @@ fn closed_form_certificate_anchors_exclude_the_influence_offset_2926() {
             "row {row}: the certificate must score the offset-free anchor, whatever o_infl = {offset}"
         );
     }
+}
+
+/// gam#2971: a survival event row's likelihood keeps its value and its slope as
+/// the row's link-deviation argument `u = a₁ + g·z` crosses the support's right
+/// end. The event density carries `ln χ₁`, `χ₁ = 1 + w′(u)`, and outside the
+/// support the deviation is flat, so a link basis whose `w′` survives at the end
+/// made the row likelihood jump by `ln(1 + w′(end))` there. The inner Newton
+/// crept toward that cliff and never certified. The likelihood's gradient reads
+/// `w″` through `∂χ₁/∂a`, so its slope jumps as well unless `w″` also vanishes.
+///
+/// The exit index `q₁*` putting `u` on the end is bisected, and the row
+/// likelihood is read at `q₁* ± h, ± 2h, ± 3h`. Each side's three points give a
+/// quadratic extrapolation of the value and the slope at `q₁*`. Its gap to the
+/// linear extrapolation from the two nearer points is that side's truncation
+/// estimate. The two sides must agree within the sum of their estimates.
+#[test]
+fn link_deviation_row_likelihood_is_c1_across_its_support_end_2971() {
+    let score_runtime = test_deviation_runtime();
+    let link_seed = array![-2.0, -1.0, 0.0, 1.0, 2.0];
+    let link_runtime = build_link_deviation_block_from_knots_design_seed_and_weights(
+        &link_seed,
+        &link_seed,
+        &DeviationBlockConfig {
+            degree: 3,
+            num_internal_knots: 3,
+            penalty_order: 2,
+            penalty_orders: vec![1, 2, 3],
+            double_penalty: false,
+            monotonicity_eps: 1e-4,
+        },
+    )
+    .expect("build the production survival link deviation")
+    .runtime;
+    let h_dim = score_runtime.basis_dim();
+    let w_dim = link_runtime.basis_dim();
+    let q0v = -0.25_f64;
+    let qd1v = 0.9_f64;
+    let gv = 0.4_f64;
+    let family = SurvivalMarginalSlopeFamily {
+        jeffreys_armed: true,
+        latent_law: None,
+        n: 1,
+        entry_at_origin: Arc::new(Array1::from_elem(1, false)),
+        event: Arc::new(array![1.0]),
+        weights: Arc::new(array![1.0]),
+        z: Arc::new(array![0.3].insert_axis(Axis(1))),
+        score_covariance: unit_score_covariance(),
+        gaussian_frailty_sd: None,
+        family_hyper: SurvivalMarginalSlopeFamilyHyperState::default(),
+        derivative_guard: 1e-6,
+        design_entry: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        design_derivative_exit: DesignMatrix::from(Array2::zeros((1, 1))),
+        offset_entry: Arc::new(array![q0v]),
+        offset_exit: Arc::new(array![0.0]),
+        derivative_offset_exit: Arc::new(array![qd1v]),
+        marginal_design: DesignMatrix::from(Array2::zeros((1, 0))),
+        slope_layout: (DesignMatrix::from(Array2::zeros((1, 0)))).into(),
+        score_warp: Some(score_runtime.clone()),
+        link_dev: Some(link_runtime.clone()),
+        influence_absorber: None,
+        time_linear_constraints: None,
+        time_wiggle_knots: None,
+        time_wiggle_degree: None,
+        time_wiggle_ncols: 0,
+        intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
+    };
+    let beta_h = Array1::from_iter((0..h_dim).map(|k| 0.04 * (k as f64 + 1.3).sin()));
+    let beta_w = Array1::from_iter((0..w_dim).map(|k| 0.035 * (k as f64 + 0.7).cos()));
+    let z_obs = family.observed_score_projection(0);
+    let breakpoints = link_runtime.breakpoints();
+    let right_end = breakpoints[breakpoints.len() - 1];
+    let last_interior = breakpoints[breakpoints.len() - 2];
+    let argument = |q1: f64| -> f64 {
+        let (a1, _) = family
+            .solve_row_survival_intercept_with_slot(q1, gv, Some(&beta_h), Some(&beta_w), None)
+            .expect("exit intercept solve");
+        a1 + gv * z_obs
+    };
+    let neglog = |q1: f64| -> f64 {
+        family
+            .row_neglog_flex_value_from_parts(
+                0,
+                q0v,
+                q1,
+                qd1v,
+                gv,
+                Some(&beta_h),
+                Some(&beta_w),
+                0.0,
+            )
+            .expect("row neglog")
+    };
+
+    // The argument rises with q₁; bisect until the bracket stops shrinking.
+    let (mut lo, mut hi) = (-4.0_f64, 4.0_f64);
+    assert!(
+        argument(lo) < right_end && argument(hi) > right_end,
+        "the bracket must straddle the support end {right_end}: u(lo)={:.6} u(hi)={:.6}",
+        argument(lo),
+        argument(hi)
+    );
+    loop {
+        let mid = 0.5 * (lo + hi);
+        if !(mid > lo && mid < hi) {
+            break;
+        }
+        if argument(mid) <= right_end {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let q_star = 0.5 * (lo + hi);
+    let h = 1e-3;
+    let values: Vec<(f64, f64, f64)> = [-3.0, -2.0, -1.0, 1.0, 2.0, 3.0]
+        .iter()
+        .map(|&k: &f64| {
+            let q = q_star + k * h;
+            (q, argument(q), neglog(q))
+        })
+        .collect();
+    for (q, u, value) in &values {
+        eprintln!(
+            "support end 2971: q1={q:.12e} u={u:.12e} (end {right_end:.6}) neglog={value:.15e}"
+        );
+    }
+    // Every left point lies in the last span and every right point in the flat
+    // tail, so each side's stencil reads one polynomial piece.
+    assert!(
+        values[..3]
+            .iter()
+            .all(|&(_, u, _)| u > last_interior && u <= right_end)
+            && values[3..].iter().all(|&(_, u, _)| u > right_end),
+        "the stencil must sit in the last span on the left and in the tail on the right"
+    );
+    let side = |near: f64, mid: f64, far: f64, sign: f64| -> (f64, f64, f64, f64) {
+        let value = 3.0 * near - 3.0 * mid + far;
+        let value_linear = 2.0 * near - mid;
+        let slope = sign * (2.5 * near - 4.0 * mid + 1.5 * far) / h;
+        let slope_linear = sign * (near - mid) / h;
+        (
+            value,
+            (value - value_linear).abs(),
+            slope,
+            (slope - slope_linear).abs(),
+        )
+    };
+    let (left_value, left_value_est, left_slope, left_slope_est) =
+        side(values[2].2, values[1].2, values[0].2, 1.0);
+    let (right_value, right_value_est, right_slope, right_slope_est) =
+        side(values[3].2, values[4].2, values[5].2, -1.0);
+    let value_gap = (left_value - right_value).abs();
+    let slope_gap = (left_slope - right_slope).abs();
+    eprintln!(
+        "support end 2971: q1*={q_star:.12e} value left={left_value:.15e} right={right_value:.15e} \
+         gap={value_gap:.3e} bound={:.3e} | slope left={left_slope:.12e} right={right_slope:.12e} \
+         gap={slope_gap:.3e} bound={:.3e}",
+        left_value_est + right_value_est,
+        left_slope_est + right_slope_est
+    );
+    assert!(
+        value_gap <= left_value_est + right_value_est,
+        "the row likelihood jumps at the link support end: gap={value_gap:.3e} > bound={:.3e}",
+        left_value_est + right_value_est
+    );
+    assert!(
+        slope_gap <= left_slope_est + right_slope_est,
+        "the row likelihood's slope jumps at the link support end: gap={slope_gap:.3e} > \
+         bound={:.3e}",
+        left_slope_est + right_slope_est
+    );
 }

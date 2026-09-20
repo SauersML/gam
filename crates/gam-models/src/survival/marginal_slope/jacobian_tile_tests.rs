@@ -148,6 +148,7 @@ fn fixture(time_storage: Storage, covariate_storage: Storage) -> Fixture {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     };
     let beta_marginal = Array1::from_shape_fn(MARGINAL_COLS, |j| 0.03 * (j as f64) - 0.08);
     let beta_slope = Array1::from_shape_fn(SLOPE_COLS, |j| 0.05 - 0.04 * (j as f64));

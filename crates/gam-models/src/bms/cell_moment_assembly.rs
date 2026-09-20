@@ -4949,18 +4949,21 @@ mod empirical_flex_jet_oracle_tests {
     // single-source contract this gate is meant to enforce.
 
     fn runtime_for_primary_dimension(total_dimension: usize) -> DeviationRuntime {
+        // A clamped cubic vector with `k` internal knots keeps `k + 1` directions
+        // after the smoothness drop, so every width from one up is reachable. A
+        // simple-ended vector needs eight knots, and so three ramps, before it has
+        // any direction at all (gam#3011).
         let wanted = total_dimension - 2;
-        for n_knots in 5..=40 {
-            let knots = Array1::from_iter(
-                (0..n_knots).map(|i| -2.45_f64 + 5.0_f64 * (i as f64) / ((n_knots - 1) as f64)),
-            );
-            if let Ok(runtime) = DeviationRuntime::try_new(knots, 0.0, 3)
-                && runtime.basis_dim() == wanted
-            {
-                return runtime;
-            }
-        }
-        panic!("no deviation runtime realizes total primary dimension {total_dimension}");
+        let seed = Array1::from_vec(vec![-2.45_f64, 2.55]);
+        let knots = gam_terms::basis::initializewiggle_knots_from_seed(seed.view(), 3, wanted - 1)
+            .expect("clamped deviation knots");
+        let runtime = DeviationRuntime::try_new(knots, 0.0, 3).expect("deviation runtime");
+        assert_eq!(
+            runtime.basis_dim(),
+            wanted,
+            "a clamped runtime realizes total primary dimension {total_dimension}"
+        );
+        runtime
     }
 
     fn make_dimension_fixture(is_score_warp: bool, total_dimension: usize) -> FlexFixture {
