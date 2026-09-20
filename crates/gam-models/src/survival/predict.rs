@@ -1642,10 +1642,10 @@ fn predict_survival_replayed_truncated_law_posterior_mean(
     covariance_mode: SurvivalPredictionCovarianceMode,
     draws: &TruncatedCoefficientDraws,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    fn plugin_request<'a>(
+    fn plugin_request<'a: 'b, 'b>(
         req: &SurvivalPredictRequest<'a>,
-        model: &'a SavedModel,
-    ) -> SurvivalPredictRequest<'a> {
+        model: &'b SavedModel,
+    ) -> SurvivalPredictRequest<'b> {
         SurvivalPredictRequest {
             model,
             data: req.data,
