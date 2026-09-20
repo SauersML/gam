@@ -995,6 +995,34 @@ mod tests {
         }
     }
 
+    /// `bounded(prior=uniform)` is flat on the coefficient over the box: the
+    /// same posterior as the unpenalised boxed `linear()` term, so it must be
+    /// that term and publish its truncated posterior mean (#3479), not a
+    /// separate latent-logit route whose mode differs from it.
+    #[test]
+    fn bounded_uniform_prior_is_the_unpenalised_boxed_linear_term() {
+        let uniform = parse_formula("y ~ bounded(x, min=1, max=3, prior=uniform)")
+            .expect("bounded(prior=uniform) parses");
+        match uniform.terms.as_slice() {
+            [ParsedTerm::Linear {
+                name,
+                explicit: true,
+                double_penalty: false,
+                coefficient_min: Some(min),
+                coefficient_max: Some(max),
+            }] => {
+                assert_eq!(name, "x");
+                assert_eq!((*min, *max), (1.0, 3.0));
+            }
+            other => panic!("bounded(prior=uniform) must lower to the boxed linear term: {other:?}"),
+        }
+        let err = term_error("bounded(x, min=1, max=3, prior=uniform, double_penalty=true)");
+        assert!(
+            err.contains("cannot also carry the double_penalty ridge"),
+            "a flat box with a ridge must be refused, got `{err}`"
+        );
+    }
+
     #[test]
     fn canonical_formula_spellings_parse() {
         for term in [
@@ -2678,12 +2706,23 @@ fn parse_survival_formulaspec(
     })
 }
 
+/// What a `bounded()` prior option asks for.
+enum BoundedPriorChoice {
+    /// A prior carried on the latent logit coordinate of the interval map.
+    Latent(BoundedCoefficientPriorSpec),
+    /// `prior=uniform`: flat on the coefficient over `[min, max]`. That is the
+    /// box-constrained, unpenalised linear coefficient, so the term lowers to
+    /// `linear(x, min, max, double_penalty=false)` and publishes that route's
+    /// truncated posterior mean (#2705) instead of a logit-chart mode (#3479).
+    FlatOnBox,
+}
+
 fn parse_bounded_priorspec(
     options: &BTreeMap<String, String>,
     min: f64,
     max: f64,
     raw: &str,
-) -> Result<BoundedCoefficientPriorSpec, String> {
+) -> Result<BoundedPriorChoice, String> {
     let prior_mode = options.get("prior").map(|s| s.to_ascii_lowercase());
     let target = parse_optional_f64_option(options, "target", raw)?;
     let strength = parse_optional_f64_option(options, "strength", raw)?;
@@ -2698,10 +2737,13 @@ fn parse_bounded_priorspec(
 
     if let Some(priorname) = prior_mode {
         return match priorname.as_str() {
-            "shrinkage" => Ok(BoundedCoefficientPriorSpec::Shrinkage),
-            "none" => Ok(BoundedCoefficientPriorSpec::None),
-            "uniform" => Ok(BoundedCoefficientPriorSpec::Uniform),
-            "center" => Ok(BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 2.0 }),
+            "shrinkage" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Shrinkage)),
+            "none" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::None)),
+            "uniform" => Ok(BoundedPriorChoice::FlatOnBox),
+            "center" => Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Beta {
+                a: 2.0,
+                b: 2.0,
+            })),
             other => Err(FormulaDslError::InvalidArgument {
                 reason: match removed_spellings::canonical_for(
                     removed_spellings::BOUNDED_PRIORS,
@@ -2741,11 +2783,11 @@ fn parse_bounded_priorspec(
         let z = (targetvalue - min) / (max - min);
         let a = 1.0 + strengthvalue * z;
         let b = 1.0 + strengthvalue * (1.0 - z);
-        return Ok(BoundedCoefficientPriorSpec::Beta { a, b });
+        return Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Beta { a, b }));
     }
 
     // No prior option: shrink toward the null with a REML-estimated strength.
-    Ok(BoundedCoefficientPriorSpec::Shrinkage)
+    Ok(BoundedPriorChoice::Latent(BoundedCoefficientPriorSpec::Shrinkage))
 }
 
 // ---------------------------------------------------------------------------
@@ -3455,22 +3497,42 @@ fn parse_term_quoted(raw: &str) -> Result<ParsedTerm, String> {
                     }
                     .into());
                 }
-                let prior = parse_bounded_priorspec(&options, min, max, raw)?;
-                return Ok(ParsedTerm::BoundedLinear {
-                    name: vars[0].clone(),
-                    min,
-                    max,
-                    prior,
-                    // Unlike a plain `linear()` term, `bounded()` already commits
-                    // the coefficient to an exact interval transform (plus an
-                    // optional prior); layering the null-space ridge on top is
-                    // structurally rejected downstream (`design_construction.rs`:
-                    // "bounded linear term ... cannot also use double_penalty"),
-                    // so the default must be `false`, not the `linear()`/`s()`
-                    // convention of `true`.
-                    double_penalty: option_bool(&options, "double_penalty")?
-                        .unwrap_or(false),
-                });
+                // Unlike a plain `linear()` term, `bounded()` already commits
+                // the coefficient to a prior on the box; layering the
+                // null-space ridge on top is structurally rejected downstream
+                // (`design_construction.rs`: "bounded linear term ... cannot
+                // also use double_penalty"), so the default must be `false`,
+                // not the `linear()`/`s()` convention of `true`.
+                let double_penalty =
+                    option_bool(&options, "double_penalty")?.unwrap_or(false);
+                return match parse_bounded_priorspec(&options, min, max, raw)? {
+                    BoundedPriorChoice::Latent(prior) => Ok(ParsedTerm::BoundedLinear {
+                        name: vars[0].clone(),
+                        min,
+                        max,
+                        prior,
+                        double_penalty,
+                    }),
+                    BoundedPriorChoice::FlatOnBox => {
+                        if double_penalty {
+                            return Err(FormulaDslError::IncompatibleTerm {
+                                reason: format!(
+                                    "bounded(prior=uniform) is flat on the box and cannot also \
+                                     carry the double_penalty ridge; use \
+                                     linear(x, min=..., max=...) for a shrunk boxed coefficient: {raw}"
+                                ),
+                            }
+                            .into());
+                        }
+                        Ok(ParsedTerm::Linear {
+                            name: vars[0].clone(),
+                            explicit: true,
+                            double_penalty: false,
+                            coefficient_min: Some(min),
+                            coefficient_max: Some(max),
+                        })
+                    }
+                };
             }
             "group" | "factor" => {
                 if vars.len() != 1 {

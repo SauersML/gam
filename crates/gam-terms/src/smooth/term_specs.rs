@@ -1079,7 +1079,9 @@ pub enum BoundedCoefficientPriorSpec {
     /// inside `(min, max)`; otherwise zero is not an admissible value and the
     /// prior centres at the box midpoint, the latent origin.
     Shrinkage,
-    Uniform,
+    /// A `Beta(a, b)` prior on the normalized coefficient `z = (beta - min) /
+    /// (max - min)`. A prior flat on the box is not carried here: it is the
+    /// unpenalised boxed `linear()` coefficient (#3479).
     Beta {
         a: f64,
         b: f64,
@@ -1524,8 +1526,7 @@ impl TermCollectionSpec {
                 }
                 match prior {
                     BoundedCoefficientPriorSpec::None
-                    | BoundedCoefficientPriorSpec::Shrinkage
-                    | BoundedCoefficientPriorSpec::Uniform => {}
+                    | BoundedCoefficientPriorSpec::Shrinkage => {}
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         if !a.is_finite() || !b.is_finite() || *a < 1.0 || *b < 1.0 {
                             return Err(SmoothError::invalid_config(format!(

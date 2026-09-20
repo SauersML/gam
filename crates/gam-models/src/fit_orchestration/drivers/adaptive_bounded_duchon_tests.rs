@@ -922,33 +922,20 @@ mod adaptive_bounded_duchon_tests {
     }
 
     #[test]
-    fn bounded_uniform_prior_matches_beta_one_one_terms() {
-        let theta = 0.7;
-        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform)
-            .expect("uniform prior geometry");
-        let beta11 =
-            bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 })
-                .expect("Beta(1,1) prior geometry");
-        assert!((uniform.0 - beta11.0).abs() < 1e-12);
-        assert!((uniform.1 - beta11.1).abs() < 1e-12);
-        assert!((uniform.2 - beta11.2).abs() < 1e-12);
-        assert!((uniform.3 - beta11.3).abs() < 1e-12);
-    }
-
-    #[test]
     fn boundednone_prior_has_no_extra_latentobjective_terms() {
         let theta = 0.7;
         let none = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::None)
             .expect("flat prior geometry");
         assert_eq!(none, (0.0, 0.0, 0.0, 0.0, 0.0));
 
-        let uniform = bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Uniform)
-            .expect("uniform prior geometry");
-        assert!(uniform.0.is_finite());
-        assert!(uniform.0 < 0.0);
-        assert!(uniform.1.abs() > 1e-6);
-        assert!(uniform.2 > 0.0);
-        assert!(uniform.3.is_finite());
+        let beta =
+            bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 })
+                .expect("Beta(1,1) prior geometry");
+        assert!(beta.0.is_finite());
+        assert!(beta.0 < 0.0);
+        assert!(beta.1.abs() > 1e-6);
+        assert!(beta.2 > 0.0);
+        assert!(beta.3.is_finite());
     }
 
     #[test]
@@ -1005,7 +992,7 @@ mod adaptive_bounded_duchon_tests {
                 col_idx: 0,
                 min: 0.0,
                 max: 1.0,
-                prior: BoundedCoefficientPriorSpec::Uniform,
+                prior: BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 },
                 latent_center: 0.0,
             }],
         };
@@ -1070,7 +1057,7 @@ mod adaptive_bounded_duchon_tests {
             (
                 LikelihoodSpec::gaussian_identity(),
                 array![0.4, 1.0, 1.7, 2.2],
-                BoundedCoefficientPriorSpec::Uniform,
+                BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 },
             ),
             (
                 LikelihoodSpec::poisson_log(),
@@ -1181,7 +1168,7 @@ mod adaptive_bounded_duchon_tests {
             (
                 LikelihoodSpec::gaussian_identity(),
                 array![0.4, 1.0, 1.7, 2.2],
-                BoundedCoefficientPriorSpec::Uniform,
+                BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 },
             ),
             (
                 LikelihoodSpec::poisson_log(),
@@ -1200,7 +1187,7 @@ mod adaptive_bounded_duchon_tests {
             (
                 LikelihoodSpec::binomial_probit(),
                 array![0.0, 1.0, 1.0, 0.0],
-                BoundedCoefficientPriorSpec::Uniform,
+                BoundedCoefficientPriorSpec::Beta { a: 1.0, b: 1.0 },
             ),
         ];
         let u = array![0.3, -0.4];

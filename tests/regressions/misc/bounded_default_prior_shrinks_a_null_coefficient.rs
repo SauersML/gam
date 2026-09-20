@@ -209,7 +209,49 @@ fn bounded_unpenalised_fit_certifies_an_optimum_on_the_rail() {
     // improper, arms the Jeffreys term (#979), and the armed refit publishes
     // 1.0076 rather than the constrained maximum-likelihood rail `min = 1` that
     // docs/formulas.md promises for `prior=none`. That contract question is
-    // gam#3923, next to gam#3479 for `prior=uniform`.
+    // gam#3923.
+}
+
+/// `bounded(x, min, max, prior=uniform)` is flat on the coefficient over the
+/// box, which is the posterior of the unpenalised box-constrained `linear()`
+/// coefficient, so both formulas must publish the same number: that route's
+/// truncated posterior mean (#2705). The bounded term used to fit this prior
+/// on its logit chart and publish the chart's mode pushed back to the
+/// coefficient, which is neither the mode nor the mean in the coefficient
+/// (gam#3479): on this fixture it sat 2.0e-4 below the truncated mean inside
+/// `[-1, 1]` and 1.15e-4 above it on the rail box `[1, 3]`.
+#[test]
+fn bounded_uniform_prior_publishes_the_boxed_linear_truncated_mean() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let ols = ols_slope(&x, &y);
+    for (min, max) in [(-1.0_f64, 1.0_f64), (1.0, 3.0)] {
+        let uniform = bounded_slope(
+            &format!("y ~ bounded(x, min={min}, max={max}, prior=uniform)"),
+            &data,
+        );
+        let boxed = bounded_slope(
+            &format!("y ~ linear(x, min={min}, max={max}, double_penalty=false)"),
+            &data,
+        );
+        // Both formulas lower to the same term and solve the same problem, so
+        // they differ at most by the reduction-order rounding of about 1e-15
+        // derived in the interior test below. The 1e-12 band sits eight orders
+        // under the 1e-4 gap of the chart mode it replaces.
+        assert!(
+            (uniform - boxed).abs() <= 1e-12,
+            "bounded(prior=uniform) on [{min}, {max}] must publish the boxed linear \
+             truncated mean {boxed}, got {uniform}"
+        );
+        // Non-vacuity: the box is interior on [-1, 1] and binds on [1, 3],
+        // where the truncated mean lies strictly inside the box, off the rail.
+        assert!(
+            min < boxed && boxed < max,
+            "the truncated mean {boxed} must lie strictly inside ({min}, {max})"
+        );
+    }
+    assert!(ols < 1.0, "non-vacuity: the least-squares slope {ols} must lie below the rail box");
 }
 
 /// A box that does not bind leaves the fit unconstrained, so on an unpenalised
