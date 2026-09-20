@@ -600,6 +600,8 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 ///   Each runs to its own stopping test — no term cap, whose silent truncation
 ///   used to hand back a partial sum as a converged value — and returns NaN if
 ///   that test can never be met, which the band code already reads as "no band".
+///   Below the split with `a < 1`, `Q` is summed directly
+///   ([`small_shape_upper_gamma_below_split`]) rather than formed as `1 − P`.
 ///
 /// All three share the prefactor `x^a e^{−x} / Γ(a)` in the form
 /// `e^{−a·h} √(a/2π) / Γ*(a)`, `h = λ − 1 − ln λ`, `λ = x / a`
@@ -621,6 +623,18 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
     }
     let prefactor = incomplete_gamma_prefactor(a, x);
     if x < a + 1.0 {
+        // The series below gives `P`, and `1 − P` keeps absolute accuracy ε, so
+        // its relative error is ε·P/Q. For `a ≥ 1` this branch has
+        // `Q ≥ Q(1, 2) = e^{-2}`, so the loss is below a factor `e² − 1`. For
+        // `a < 1`, however, `Q(a, x) ≈ a·E₁(x)` goes to 0 with `a`, so there `Q`
+        // is summed directly and, where it is the smaller tail, `P` is its
+        // complement (#4242).
+        if a < 1.0 {
+            let q = small_shape_upper_gamma_below_split(a, x);
+            if q <= 0.5 {
+                return (1.0 - q, q);
+            }
+        }
         // Power series: P(a,x) = x^a e^{−x}/Γ(a) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
         // The running term `del` is the ratio form, so no factorial overflows.
         // The terms after `del` are bounded by the geometric series of ratio
@@ -645,64 +659,121 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
             del *= x / ap;
             sum += del;
         }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
+        // Here `Q ≥ e^{-2}` (`a ≥ 1`) or `Q > ½`, so `1 − P` loses at most a
+        // factor `e² − 1` of relative accuracy.
         let p = prefactor * sum;
         (p, 1.0 - p)
     } else {
-        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
         // Evaluating the *upper* tail here keeps the directly-computed quantity
         // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        // Lentz's modified continued-fraction algorithm substitutes a tiny value
-        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
-        // component of the algorithm, not a floor on a result: any value below
-        // the smallest normal quotient works and the converged fraction does not
-        // depend on it, so it is the arithmetic's own smallest normal, not a
-        // chosen magnitude (#2469).
-        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
-        // Each factor `del = d·c` is a product of two quotients, each a
-        // correctly rounded division of a correctly rounded sum: four roundings,
-        // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
-        // certified. The fraction has converged once a factor reaches `ε` (the
-        // Numerical Recipes test) or, inside that rounding band, stops getting
-        // closer to 1 — further factors are rounding noise, not convergence.
-        const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / LENTZ_TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        let mut previous_distance = f64::INFINITY;
-        let mut i = 1.0_f64;
-        loop {
-            let an = -i * (i - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < LENTZ_TINY {
-                d = LENTZ_TINY;
-            }
-            c = b + an / c;
-            if c.abs() < LENTZ_TINY {
-                c = LENTZ_TINY;
-            }
-            d = 1.0 / d;
-            let del = d * c;
-            h *= del;
-            let distance = (del - 1.0).abs();
-            if !distance.is_finite() || !h.is_finite() {
-                return (f64::NAN, f64::NAN);
-            }
-            if distance <= f64::EPSILON
-                || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
-            {
-                break;
-            }
-            previous_distance = distance;
-            i += 1.0;
-        }
-        let q = prefactor * h;
+        let q = prefactor * upper_gamma_continued_fraction(a, x);
         (1.0 - q, q)
     }
+}
+
+/// The modified-Lentz continued fraction `h(a, x)` with
+/// `Q(a, x) = x^a·e^{−x}/Γ(a) · h(a, x)`, for `x ≥ a + 1`, where it converges
+/// rapidly (Numerical Recipes §6.2). NaN where the recurrence leaves the
+/// floating range.
+fn upper_gamma_continued_fraction(a: f64, x: f64) -> f64 {
+    // Lentz's modified continued-fraction algorithm substitutes a tiny value
+    // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+    // component of the algorithm, not a floor on a result: any value below
+    // the smallest normal quotient works and the converged fraction does not
+    // depend on it, so it is the arithmetic's own smallest normal, not a
+    // chosen magnitude (#2469).
+    const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+    // Each factor `del = d·c` is a product of two quotients, each a
+    // correctly rounded division of a correctly rounded sum: four roundings,
+    // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
+    // certified. The fraction has converged once a factor reaches `ε` (the
+    // Numerical Recipes test) or, inside that rounding band, stops getting
+    // closer to 1 — further factors are rounding noise, not convergence.
+    const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / LENTZ_TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    let mut previous_distance = f64::INFINITY;
+    let mut i = 1.0_f64;
+    loop {
+        let an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = b + an / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        let distance = (del - 1.0).abs();
+        if !distance.is_finite() || !h.is_finite() {
+            return f64::NAN;
+        }
+        if distance <= f64::EPSILON
+            || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
+        {
+            break;
+        }
+        previous_distance = distance;
+        i += 1.0;
+    }
+    h
+}
+
+/// `Q(a, x)` for `0 < a < 1`, `0 < x < s = a + 1`, summed without the
+/// complement `1 − P`.
+///
+/// `Γ(a, x) = Γ(a, s) + ∫_x^s t^{a−1}e^{−t} dt`, and both parts are positive,
+/// so `Q(a, x) = Q(a, s) + (1/Γ(a))·∫_x^s t^{a−1}e^{−t} dt`. `Q(a, s)` comes
+/// from the continued fraction at its own convergence boundary. Expanding
+/// `e^{−t}` gives
+///
+/// `∫_x^s t^{a−1}e^{−t} dt = Σ_{n≥0} (−1)^n c_n`, where
+/// `c_n = s^{a+n}(1 − r^{a+n}) / ((a+n)·n!)` and `r = x/s < 1`.
+///
+/// Each `1 − r^{a+n} = −expm1((a+n)·ln r)` lies in `(0, 1)`, so no term
+/// overflows or cancels. For `m > 0`, `(1 − r^{m+1})/(1 − r^m) ≤ 1 + 1/m`
+/// (`1 − r^m − m·r^m(1−r)` falls to 0 at `r = 1`). So `c_{n+1}/c_n ≤ s/(n+1) < 1`
+/// for every `n ≥ 1`, because `s < 2`. The alternating tail past term `n − 1` is
+/// then bounded by `c_n`, and the sum stops once `c_n` is below one rounding of
+/// the positive total. `1/Γ(a) = a/Γ(1 + a)` uses `ln Γ(1 + a)`, whose argument
+/// lies in `[1, 2)`, so the scale costs only the absolute error of that
+/// logarithm and not the `ln(1/a)` magnitude of `ln Γ(a)`.
+fn small_shape_upper_gamma_below_split(a: f64, x: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    let s = a + 1.0;
+    let ln_r = (x / s).ln();
+    // `s^a / Γ(1 + a)`: the `n = 0` term is `c_0 / Γ(a)` = this times `1 − r^a`.
+    let leading = (a * s.ln() - ln_gamma(s)).exp();
+    // `Q(a, s)` through the same `a/Γ(1 + a)` scaling ([`incomplete_gamma_prefactor`]).
+    let mut total = incomplete_gamma_prefactor(a, s) * upper_gamma_continued_fraction(a, s)
+        + leading * (-(a * ln_r).exp_m1());
+    // `s^{a+n} / (n!·Γ(a))`, carried as a ratio so neither factor overflows.
+    let mut scaled_power = leading * a;
+    let mut n = 1.0_f64;
+    loop {
+        scaled_power *= s / n;
+        let m = a + n;
+        let term = scaled_power * (-(m * ln_r).exp_m1()) / m;
+        // Negated so that a NaN (from an unvalidated `a ≤ 0`) ends the sum and
+        // propagates, rather than never satisfying the comparison.
+        if !(term > total * f64::EPSILON) {
+            break;
+        }
+        // `(−1)^n`: odd `n` subtracts.
+        if n % 2.0 == 1.0 {
+            total -= term;
+        } else {
+            total += term;
+        }
+        n += 1.0;
+    }
+    total
 }
 
 /// Taylor degree, in `ζ`, of the function `f(ζ) = ζ / (μ(ζ) − 1)` the Temme
@@ -876,19 +947,26 @@ fn gamma_exponent(a: f64, x: f64) -> f64 {
 /// `ln Γ*(a)`, `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`. Stirling's series from
 /// [`temme_table`] where its terms reach `ε` before the table ends (the series
 /// is asymptotic: its terms fall until `k ≈ 2πa`, and the first omitted term
-/// bounds the error); otherwise `a` is small enough that `ln Γ(a)` and
-/// `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the difference
-/// loses nothing.
+/// bounds the error); it is declined as soon as a term stops falling, since
+/// from there it only diverges (for `a ≲ 1e-13` the terms overflow, and an
+/// infinite term would pass the `ε` test). Otherwise `a` is small enough that
+/// `ln Γ(a)` and `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the
+/// difference loses nothing.
 fn ln_gamma_star(a: f64) -> f64 {
     let stirling = &temme_table().stirling;
     let mut sum = 0.0;
     let mut scale = 1.0;
+    let mut previous_term = f64::INFINITY;
     for &gamma_k in stirling {
         let term = gamma_k * scale;
+        if term.abs() >= previous_term {
+            break;
+        }
         sum += term;
         if term.abs() <= f64::EPSILON * sum.abs() {
             return sum.ln();
         }
+        previous_term = term.abs();
         scale /= a;
     }
     statrs::function::gamma::ln_gamma(a) - (a - 0.5) * a.ln() + a
@@ -899,7 +977,17 @@ fn ln_gamma_star(a: f64) -> f64 {
 /// `h = λ − 1 − ln λ`. The exponent `a·h` ([`gamma_exponent`]) is never formed
 /// as `a·ln x − x − ln Γ(a)`, which cancels to it from terms of size `a·ln a`;
 /// its rounding is `h`'s own, which is the conditioning of `e^{−a·h}` itself.
+///
+/// For `a < 1` there is no `a·ln a` to cancel, but `ln Γ(a) ≈ ln(1/a)` is: both
+/// the textbook exponent and the `Γ*` form carry it, and an exponent of that
+/// size costs `ln(1/a)` ulp of the prefactor (≈ 690 at `a = 1e-300`), although
+/// the prefactor's condition number in `a` is about 1. There
+/// `1/Γ(a) = a/Γ(1 + a)` moves the `ln(1/a)` out of the exponent into an exact
+/// scaling: `a·exp(a·ln x − x − ln Γ(1 + a))`, with `ln Γ(1 + a) ∈ (−0.13, 0]`.
 fn incomplete_gamma_prefactor(a: f64, x: f64) -> f64 {
+    if a < 1.0 {
+        return a * (a * x.ln() - x - statrs::function::gamma::ln_gamma(1.0 + a)).exp();
+    }
     let exponent = -gamma_exponent(a, x) + 0.5 * (a / (2.0 * std::f64::consts::PI)).ln()
         - ln_gamma_star(a);
     exponent.exp()
@@ -2228,6 +2316,57 @@ mod tests {
             }
         }
         assert!(chi_square_quantile(0.5, 0.0).is_nan());
+    }
+
+    /// #4242: below the split `x < a + 1` with shape `a < 1`, `Q(a, x)` keeps
+    /// relative accuracy as `a → 0`, where the complement `1 − P` it replaces
+    /// has relative error ≈ ε·P/Q (1.9e5ε at `a = 1e-4`). The references are
+    /// 50-digit `mpmath.gammainc(a, x, inf, regularized=True)` values at the
+    /// exact binary `a` and `x`. The bar, 64ε, covers the continued fraction's
+    /// own error at the split, ≈52ε worst for `a < 1` against mpmath, which the
+    /// sum inherits through `Q(a, a + 1)` and does not add to. The two smallest shapes
+    /// are where `ln Γ*(a)`'s Stirling series overflowed and the pair came back
+    /// NaN or `P = 0`.
+    #[test]
+    fn small_shape_upper_gamma_keeps_relative_accuracy_4242() {
+        let bar = 64.0 * f64::EPSILON;
+        let cases: [(f64, f64, f64); 10] = [
+            (1e-2, 0.909, 2.585_880_246_514_324_190_4e-3),
+            (1e-3, 0.99099, 2.229_549_549_437_722_252_1e-4),
+            (1e-4, 0.9901, 2.230_849_540_126_837_447_8e-5),
+            (1e-8, 0.5, 5.597_735_977_099_587_104_9e-9),
+            (1e-12, 0.7, 3.737_688_432_337_938_572_5e-13),
+            (
+                1.220_517_092_297_636_4e-14,
+                0.535_882_004_306_695_7,
+                6.328_065_217_785_509_233_1e-15,
+            ),
+            (
+                4.469_568_170_114_96e-293,
+                0.874_332_377_373_819_6,
+                1.216_172_647_707_404_266_1e-293,
+            ),
+            (0.5, 1.2, 0.121_335_250_358_482_153_42),
+            (0.9, 1e-3, 0.997_926_400_133_915_959_51),
+            (0.3, 1e-20, 0.999_998_885_757_491_452_7),
+        ];
+        for (a, x, expected) in cases {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let rel = (q - expected).abs() / expected;
+            assert!(
+                rel <= bar,
+                "Q({a}, {x}) = {q:e}, expected {expected:e}: rel {rel:e}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "P({a}, {x}) = {p:e} is not a probability"
+            );
+            assert!(
+                (p + q - 1.0).abs() <= f64::EPSILON,
+                "P + Q = {} at a = {a}",
+                p + q
+            );
+        }
     }
 
     const TOL: f64 = 1e-12;
