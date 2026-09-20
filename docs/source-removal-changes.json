@@ -2408,9 +2408,32 @@
     ],
     "reason": "#3187 / #3263: the rho-posterior tiers and NUTS tuning carried hand-set caps and knobs. TIER1_MAX_DIM / TIER2_MAX_DIM capped the escalation route by K; the route is now derived (quadrature iff nodes^K <= RHO_NUTS_MIN_EVALUATIONS = 2 * NUTS_CONVERGENCE.min_ess, else NUTS, no K cap). ESCALATION_NUTS_SAMPLES fixed the Tier-2 draw count; it is now the warmup transitions run_adaptive used. DEFAULT_M = 64 was the Tier-0 proposal draw count (callers could override it); it is now reliable_sample_size(ESCALATE_K_HAT) = 2155, the draws at which PSIS is reliable for a shape at the escalation cutoff (at M=100 a Cauchy-over-N(0,0.25) target, true k=1, read k<0.5 in 43.5% of 200 seeds, 13.5% at 2155). robust_target_accept and its floors/MAX_TARGET_ACCEPT clamped a user-tunable target_accept that no longer exists: NutsConfig.target_accept is deleted and NUTS uses NUTS_TARGET_ACCEPT = 0.9, so validate_nuts_target_accept and its rejects-invalid test have nothing to validate.",
     "evidence": "At the head git grep -w finds none of these names under crates, src or tests. cargo check --workspace --tests passes on the merge of main into the branch; cargo test -p gam-inference --lib hmc_io 59/59 and rho_posterior (including the new escalation-routing test K=4 -> 81-node quadrature, K=5 and K=17 -> NUTS) pass; cargo test -p gam-solve --lib psis passes (reliable_sample_size S(0.5)=100, S(0.7)=2155). The Python sampling wrapper and its tests no longer pass target_accept."
-    },
-    {
-    "base": "e0f6e0b3f4dd2684c47289dfd02249d43bff6e0e",
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "items": [
+      "crates/gam-sae/src/manifold/rho.rs:fn:seed_scaled_by_dispersion_with_sparse_policy"
+    ],
+    "reason": "A multi-atom separable-gate seed took only max(ln φ, 0) of the dispersion shift, a clamp nothing derives, so on clean data a K > 1 seed started 1/φ times stiffer than the construction value. The clamp and its scale_sparse policy flag go: seed_scaled_by_dispersion_with_sparse_policy is removed, and every scale-coupled log-strength takes the full ln φ at every K.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3357 (fix-3233-seed-dispersion-clamp, Fixes #3233) merged as 53dfd6479c37a261096d31a5bf0763668ca8a229 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 53dfd6479c37a261096d31a5bf0763668ca8a229's own tree with --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head 53dfd6479c37a261096d31a5bf0763668ca8a229 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> 53dfd6479c37a261096d31a5bf0763668ca8a229 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "53dfd6479c37a261096d31a5bf0763668ca8a229",
+    "items": [
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:inverse_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:linearized_fixed_point",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:log_det_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:normal_solves",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:posterior",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:quadratic_part",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:retained_normals",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:struct:SiteMotionSystem"
+    ],
+    "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 8 items. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
+  },
+  {
+    "base": "2d4b9ce53a61db906be4977b1a4aab76c45d8d57",
     "items": [
       "crates/gam-terms/src/basis/center_selection.rs:const:LOWER_MASK",
       "crates/gam-terms/src/basis/center_selection.rs:const:M",
