@@ -182,7 +182,7 @@ pub enum MetricProvenance {
     /// pullback reduces to the bare `J_nᵀ J_n`. This is the default and is
     /// bit-for-bit the historical isotropic-`φ̂` path.
     Euclidean,
-    /// `M_n = U_n U_nᵀ (+ solver-only δI)` from supplied per-row output-Fisher
+    /// `M_n = U_n U_nᵀ` from supplied per-row output-Fisher
     /// factors `U_n ∈ ℝ^{p × rank}`. The canonical "one unit of latent motion ↦
     /// one unit of behavioral change" metric: residuals are whitened in the
     /// output-Fisher inner product and the gauge pulls back through the same
@@ -230,10 +230,10 @@ pub enum MetricProvenance {
     BehavioralFisher { probes: usize },
     /// Structured-residual whitening: `M_n = Σ_n^{-1}` from the **estimated**
     /// factor-analytic residual covariance `Σ_n = Λ c(z_n) Λᵀ + D` (#974), with
-    /// `factor_rank` the selected factor count. Produced by
-    /// Structured-residual producers materialize this provenance when they fit
-    /// a residual-covariance whitening model;
-    /// the only provenance for which
+    /// `factor_rank` the selected factor count. Structured-residual producers
+    /// materialize this provenance when they fit a residual-covariance
+    /// whitening model. It is one of the two provenances (with
+    /// [`MetricProvenance::BehavioralFisher`]) for which
     /// [`whitens_likelihood`](RowMetric::whitens_likelihood) is `true`. It
     /// carries the same low-rank factor layout as
     /// [`MetricProvenance::OutputFisher`].
@@ -297,15 +297,6 @@ pub struct RowMetric {
     /// `(n_rows, p * rank)` row-major: `U_n[i, k] = u[n, i * rank + k]`. `None`
     /// for [`MetricProvenance::Euclidean`] (the identity factor is implicit).
     factors: Option<Arc<Array2<f64>>>,
-    /// **Solver-only** Tikhonov floor `δ` added as `δ I_p` to make a
-    /// rank-deficient `U_n U_nᵀ` invertible for an *internal solve only*.
-    ///
-    /// Invariant (#747): `δ` **never** enters
-    /// any quantity that feeds the evidence criterion. The criterion-facing
-    /// quad-form / whitening / fisher-mass methods all use the *un-floored*
-    /// `U_n U_nᵀ`; only [`Self::solve_floor`]-tagged solver helpers see `δ`. A
-    /// nonzero floor therefore cannot bias the objective the optimizer reports.
-    solver_delta: f64,
     /// Per-row traces `tr(M_n)` of the criterion-facing (un-floored) metric.
     ///
     /// This is the only dense-block reduction any consumer reads (the #980
@@ -313,9 +304,7 @@ pub struct RowMetric {
     /// validated **streamingly** at construction through
     /// [`normalize_fisher_rao_blocks`] one row at a time and then dropped.
     /// Retaining it was `n·p²·8` bytes — 13 GiB at `(n=2000, p=896)` and an
-    /// OOM at LLM-scale `p` — for a record nothing ever re-read. The solver
-    /// `δ` is deliberately *not* baked in here, so this is the
-    /// criterion-facing trace.
+    /// OOM at LLM-scale `p` — for a record nothing ever re-read.
     traces: ndarray::Array1<f64>,
     /// Explicit output-Fisher factor status. `None` for Euclidean and structured
     /// residual metrics, which do not claim to approximate an output Fisher.
@@ -342,7 +331,6 @@ impl RowMetric {
             p,
             rank: p,
             factors: None,
-            solver_delta: 0.0,
             traces: ndarray::Array1::<f64>::from_elem(n_rows, p as f64),
             fisher_factor_kind: None,
             truncation_mass_residual: None,
@@ -353,9 +341,9 @@ impl RowMetric {
     /// supplied as a `(n_rows, p * rank)` row-major matrix (`U_n[i, k] =
     /// u[n, i * rank + k]`). The induced `M_n = U_n U_nᵀ` is PSD by
     /// construction; it is validated through [`normalize_fisher_rao_blocks`] so
-    /// the validation path is shared. No solver floor (`δ = 0`).
+    /// the validation path is shared.
     pub fn output_fisher(u: Arc<Array2<f64>>, p: usize, rank: usize) -> Result<Self, String> {
-        Self::from_factors(MetricProvenance::OutputFisher { rank }, u, p, rank, 0.0)
+        Self::from_factors(MetricProvenance::OutputFisher { rank }, u, p, rank)
     }
 
     /// Downstream-influence output-Fisher metric: per-row factors `U_n ∈
@@ -376,7 +364,6 @@ impl RowMetric {
             u,
             p,
             rank,
-            0.0,
         )
     }
 
@@ -388,18 +375,12 @@ impl RowMetric {
     /// [`Self::output_fisher`], the resulting metric returns
     /// `whitens_likelihood() == true`: the data-fit prices reconstruction error
     /// as `½ eᵀ G_n e`. Validated through [`normalize_fisher_rao_blocks`] like
-    /// every factored metric; no solver floor (`δ = 0`).
+    /// every factored metric.
     ///
     /// A natural `(n, p, s)` probe stack emitted at harvest time packs into this
     /// layout as `u[n, i * probes + k] = probes[n, i, k]`.
     pub fn behavioral_fisher(u: Arc<Array2<f64>>, p: usize, probes: usize) -> Result<Self, String> {
-        Self::from_factors(
-            MetricProvenance::BehavioralFisher { probes },
-            u,
-            p,
-            probes,
-            0.0,
-        )
+        Self::from_factors(MetricProvenance::BehavioralFisher { probes }, u, p, probes)
     }
 
     /// Structured-residual whitening from supplied per-row precision factors.
@@ -411,14 +392,13 @@ impl RowMetric {
     /// activity-scale) assemble these factors and call through here. Because the
     /// provenance is
     /// [`MetricProvenance::WhitenedStructured`], [`Self::whitens_likelihood`] is
-    /// `true`: a metric built this way is the first that whitens the likelihood.
+    /// `true`: a metric built this way whitens the likelihood.
     pub fn whitened_structured(u: Arc<Array2<f64>>, p: usize, rank: usize) -> Result<Self, String> {
         Self::from_factors(
             MetricProvenance::WhitenedStructured { factor_rank: rank },
             u,
             p,
             rank,
-            0.0,
         )
     }
 
@@ -427,7 +407,6 @@ impl RowMetric {
         u: Arc<Array2<f64>>,
         p: usize,
         rank: usize,
-        solver_delta: f64,
     ) -> Result<Self, String> {
         let n_rows = u.nrows();
         if u.ncols() != p * rank {
@@ -473,7 +452,6 @@ impl RowMetric {
             p,
             rank,
             factors: Some(u),
-            solver_delta,
             traces,
             fisher_factor_kind: match provenance {
                 MetricProvenance::OutputFisher { .. }
@@ -552,7 +530,7 @@ impl RowMetric {
     }
 
     /// Restrict the metric to the rows `rows` (an index subset or permutation),
-    /// preserving provenance, `p`, `rank`, and the solver floor. The
+    /// preserving provenance, `p`, and `rank`. The
     /// outer-criterion row subsample uses this to whiten the subsampled fit
     /// through the SAME per-row metric the full-`N` fit uses, so the ρ search
     /// ranks the delivered criterion (e.g. a #974 structured-whitening fit is not
@@ -580,15 +558,9 @@ impl RowMetric {
                     sub.row_mut(pos).assign(&factors.row(r));
                 }
                 // Re-runs the shared PSD normalizer on the subset (a subset of
-                // valid rows stays valid) and preserves the exact provenance and
-                // solver floor.
-                let mut metric = Self::from_factors(
-                    self.provenance,
-                    Arc::new(sub),
-                    self.p,
-                    self.rank,
-                    self.solver_delta,
-                )?;
+                // valid rows stays valid) and preserves the exact provenance.
+                let mut metric =
+                    Self::from_factors(self.provenance, Arc::new(sub), self.p, self.rank)?;
                 metric.fisher_factor_kind = self.fisher_factor_kind;
                 match self.truncation_mass_residual.as_ref() {
                     None => Ok(metric),
