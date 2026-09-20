@@ -2676,7 +2676,7 @@
     "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
   },
   {
-    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "base": "a9ab22c1139986a36b3594264e54cf1ae386413d",
     "items": [
       "crates/gam-sae/src/manifold/construction_exact_hessian.rs:fn:project_sphere_tangent_slots"
     ],
