@@ -183,7 +183,8 @@ pub enum RhoPosteriorRefusal {
     TailFitUnavailable,
     /// The Pareto tail fit returned a non-finite shape, which grades nothing.
     TailShapeNotFinite,
-    /// The smoothed importance weights do not sum to a positive finite total.
+    /// The smoothed importance weights have no positive finite largest weight
+    /// to normalize by.
     SmoothedWeightsNotNormalizable,
 }
 
@@ -211,7 +212,7 @@ impl fmt::Display for RhoPosteriorRefusal {
             }
             Self::TailShapeNotFinite => f.write_str("the Pareto tail shape is not finite"),
             Self::SmoothedWeightsNotNormalizable => {
-                f.write_str("smoothed importance weights do not sum to a positive finite total")
+                f.write_str("smoothed importance weights have no positive finite largest weight")
             }
         }
     }

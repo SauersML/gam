@@ -607,26 +607,26 @@ where
         return Err(RhoPosteriorRefusal::TailShapeNotFinite);
     }
 
-    // Self-normalize the smoothed weights. Normalized weights sum to 1, so
-    // Cauchy–Schwarz gives Σw² ≥ 1/M > 0 and the Kish ESS lies in [1, M].
-    let total: f64 = psis.smoothed.iter().sum();
-    if !(total.is_finite() && total > 0.0) {
+    // Kish's ESS `(Σw)²/Σw²` of the smoothed weights. It is scale-free, so the
+    // weights are scaled by their largest, not their total: each scaled weight
+    // is in `(0, 1]`, so `Σs ≤ M` and `1 ≤ Σs² ≤ M` neither overflow nor
+    // underflow, and an exact proposal's unit weights stay exactly 1, where
+    // dividing by the total rounds `1/M` at every `M` that is not a power of
+    // two. Cauchy–Schwarz gives `(Σs)² ≤ M Σs²`, so the ESS lies in `[1, M]`.
+    let largest = psis.smoothed.iter().copied().fold(0.0, f64::max);
+    if !(largest.is_finite() && largest > 0.0) {
         return Err(RhoPosteriorRefusal::SmoothedWeightsNotNormalizable);
     }
-    let sum_sq: f64 = psis
-        .smoothed
-        .iter()
-        .map(|&w| {
-            let normalized = w / total;
-            normalized * normalized
-        })
-        .sum();
+    let (total, sum_sq) = psis.smoothed.iter().fold((0.0, 0.0), |(sum, sum_sq), &w| {
+        let scaled = w / largest;
+        (sum + scaled, sum_sq + scaled * scaled)
+    });
 
     Ok(Some(RhoPosteriorAdequacy {
         tail_shape: psis.shape,
         adequacy: RhoProposalAdequacy::from_tail_shape(psis.shape),
         n_samples: m,
-        effective_sample_size: 1.0 / sum_sq,
+        effective_sample_size: total * total / sum_sq,
     }))
 }
 
