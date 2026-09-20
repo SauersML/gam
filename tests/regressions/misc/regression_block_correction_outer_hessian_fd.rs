@@ -54,6 +54,9 @@ struct Criterion {
 struct EngagedBlock {
     block_cols: Vec<usize>,
     axis_orders: Vec<usize>,
+    /// Per piece, whether it was integrated on a feasible interval with a
+    /// finite end.
+    truncated_pieces: Vec<bool>,
 }
 
 fn engaged_block(label: &str, rho: &Array1<f64>) -> EngagedBlock {
@@ -68,6 +71,7 @@ fn engaged_block(label: &str, rho: &Array1<f64>) -> EngagedBlock {
     EngagedBlock {
         block_cols: record.block_cols,
         axis_orders: record.axis_orders,
+        truncated_pieces: record.truncated_pieces,
     }
 }
 
@@ -445,6 +449,13 @@ fn inverse_gaussian_truncated_block_hessian_matches_differences_at_its_optimum()
         criterion.opts.family.link,
         InverseLink::Standard(StandardLink::InverseSquared),
         "the fixture must fit the canonical link, whose block is truncated"
+    );
+    let (_, block) = criterion.hessian("inverse gaussian", &optimum);
+    assert!(
+        block.truncated_pieces.iter().any(|&truncated| truncated),
+        "the fixture must integrate its block on a feasible interval with a finite end, or \
+         the moving ends, transported nodes and ln Z are not what this test exercised: \
+         {block:?}"
     );
     criterion.assert_gradient_matches_cost_differences("inverse gaussian", &optimum);
     criterion.assert_hessian_matches_gradient_differences("inverse gaussian", &optimum);

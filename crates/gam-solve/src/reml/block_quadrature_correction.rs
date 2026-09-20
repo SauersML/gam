@@ -724,6 +724,7 @@ impl<'a> RemlState<'a> {
         let piece_count = if axis_split { m } else { 1 };
         let mut pieces: Vec<BlockPieceQuadrature> = Vec::with_capacity(piece_count);
         let mut axis_orders: Vec<usize> = Vec::with_capacity(m);
+        let mut truncated_pieces: Vec<bool> = Vec::new();
         for k in 0..piece_count {
             let (first_axis, width) = if axis_split { (k, 1) } else { (0, m) };
             let axis_target;
@@ -760,6 +761,11 @@ impl<'a> RemlState<'a> {
                 },
             };
             axis_orders.extend_from_slice(&quadrature.axis_orders);
+            if crate::estimate::outer_eval_capture::rho_outer_audit_enabled() {
+                truncated_pieces.push(piece_target.axis_truncation().is_some_and(|truncation| {
+                    truncation.lower().is_some() || truncation.upper().is_some()
+                }));
+            }
             let Some(moments) = quadrature.moments.take() else {
                 // The corrector's contract reserves absent moments for the empty
                 // block, and every piece has at least one axis.
@@ -1205,6 +1211,7 @@ impl<'a> RemlState<'a> {
                     max_abs_skewness: verdict.max_abs_skewness,
                     skewness_threshold: verdict.threshold,
                     block_cols: block_cols.clone(),
+                    truncated_pieces,
                     explicit_a: audit_a,
                     trace_bc: audit_trace,
                     mode_d: audit_mode,
