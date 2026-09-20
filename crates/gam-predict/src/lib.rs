@@ -999,7 +999,11 @@ impl FittedModelPredictExt for FittedModel {
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
                 let beta_noise = location_scale_noise_beta(fit)
                     .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
-                let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
+                let response_scale =
+                    gam_models::inference::model::gaussian_location_scale_saved_response_scale(
+                        self.payload(),
+                    )
+                    .ok()?;
                 let sigma_floor =
                     gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
                         self.payload(),

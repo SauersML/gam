@@ -792,6 +792,9 @@ fn gaussian_location_scale_draws(
     let sigma_floor =
         gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(model.payload())
             .map_err(|error| inconsistent_state_error(model_class, error.to_string()))?;
+    let response_scale =
+        gam_models::inference::model::gaussian_location_scale_saved_response_scale(model.payload())
+            .map_err(|error| inconsistent_state_error(model_class, error.to_string()))?;
     let mut predictor = GaussianLocationScalePredictor {
         beta_mu: fit
             .beta
@@ -802,7 +805,7 @@ fn gaussian_location_scale_draws(
             .slice(s![scale_range.start..scale_range.end])
             .to_owned(),
         sigma_floor,
-        response_scale: model.gaussian_response_scale.unwrap_or(1.0),
+        response_scale,
         covariance: None,
         link_wiggle: link_wiggle.take(),
     };

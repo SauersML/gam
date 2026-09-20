@@ -1165,9 +1165,9 @@ fn compute_gaussian_location_scale_alo(
         basis_d1.map_err(|error| invalid(format!("saved Gaussian ALO warp d1: {error}")))?;
     let basis_d2 =
         basis_d2.map_err(|error| invalid(format!("saved Gaussian ALO warp d2: {error}")))?;
-    let response_scale = model.payload().gaussian_response_scale.ok_or_else(|| {
-        invalid("saved Gaussian location-scale ALO is missing its response standardization scale")
-    })?;
+    let response_scale =
+        gam_models::inference::model::gaussian_location_scale_saved_response_scale(model.payload())
+            .map_err(|error| invalid(format!("saved Gaussian location-scale ALO: {error}")))?;
     let sigma_floor =
         gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(model.payload())
             .map_err(|error| invalid(format!("saved Gaussian location-scale ALO: {error}")))?;
