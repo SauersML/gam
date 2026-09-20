@@ -38,10 +38,11 @@ class ChartCalibration:
         (``t ← s_k · t``), from the fitted per-atom random intercept
         ``s_k = exp(b_k / 2)``. Only atoms above the G3 floor appear.
     below_measurement_floor
-        Atom ids with train interventions but no measured response above its
-        record's floor.
+        Atom ids with fit-usable train interventions but no measured response
+        above its record's floor.
     no_training_intervention
-        Atom ids present in the shard but absent from train interventions.
+        Atom ids present in the shard but with no train intervention the fit
+        can use: a non-control record with positive predicted nats.
     control_quantile_nats
         The ``floor_quantile`` of the Δt = 0 control measurements (train
         split), nats. It is exactly 0 on a deterministic model, whose controls

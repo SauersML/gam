@@ -225,19 +225,7 @@ Everything else lives in a public submodule, imported on first access
       heading_level: 3
       members_order: source
 
-::: gamfit.results.PairedPosteriorSamples
-    options:
-      show_root_heading: true
-      heading_level: 3
-      members_order: source
-
 ::: gamfit.results.PosteriorPredictive
-    options:
-      show_root_heading: true
-      heading_level: 3
-      members_order: source
-
-::: gamfit.results.CumulativeIncidenceDraws
     options:
       show_root_heading: true
       heading_level: 3

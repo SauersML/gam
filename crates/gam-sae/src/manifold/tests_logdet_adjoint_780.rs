@@ -10,6 +10,7 @@
 use super::*;
 use super::tests::gamma_fd_tiny_fixture;
 use super::tests_behavioral_fisher_rung1::pack_probe_factors;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::tests_recovery_split_780::{
     FdAnchorRegime, FdBranchRegime, FiniteDifferenceStratumCertificate, FixedStateLogdetSample,
     certified_branch_stable_central_difference, certified_fd_anchor, fixed_state_logdet_sample,

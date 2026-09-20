@@ -1,5 +1,79 @@
 use super::*;
+use gam_linalg::roundoff::{symmetric_spectrum_rounding_band, weighted_gram_assembly_band};
 use ndarray::s;
+
+// ---------------------------------------------------------------------------
+// Certified spectral pieces shared by the Gram-penalty PSD majorizers
+// ---------------------------------------------------------------------------
+
+/// Computed eigenpairs of a symmetric Gram-type matrix `S` together with the
+/// band that separates them from the spectrum of the exact matrix they stand
+/// for.
+///
+/// `assembly_band` is the caller's spectral-norm bound on the error the
+/// formation of `S` left in it (see
+/// [`gam_linalg::roundoff::weighted_gram_assembly_band`]); the eigensolver
+/// adds its own backward error, `p·ε·‖S‖₂`. By Weyl, every eigenvalue of the
+/// exact matrix lies within `assembly_band + p·ε·‖S‖₂` of a computed one.
+fn gram_spectrum_with_band(
+    s: &Array2<f64>,
+    assembly_band: f64,
+    what: &str,
+) -> Result<(Array1<f64>, Array2<f64>, f64), String> {
+    let (evals, q) = s
+        .eigh(Side::Lower)
+        .map_err(|err| format!("{what} eigendecomposition failed: {err}"))?;
+    if let Some(bad) = evals.iter().find(|value| !value.is_finite()) {
+        return Err(format!("{what} has a non-finite eigenvalue {bad}"));
+    }
+    let band = symmetric_spectrum_rounding_band(&evals.to_vec()) + assembly_band;
+    Ok((evals, q, band))
+}
+
+/// Certified upper bound on `λ_max` of the exact symmetric matrix that `s`
+/// was assembled to represent: the largest computed eigenvalue plus the
+/// spectrum band of [`gram_spectrum_with_band`].
+fn certified_lambda_max(s: &Array2<f64>, assembly_band: f64, what: &str) -> Result<f64, String> {
+    let (evals, _, band) = gram_spectrum_with_band(s, assembly_band, what)?;
+    let top = evals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    Ok(top.max(0.0) + band)
+}
+
+/// Certified PSD upper envelope `S₊ + β·I ⪰ S_exact` of a symmetric matrix.
+///
+/// `S₊ = Q·max(Λ, 0)·Qᵀ` is the PSD part of the computed spectrum. The lift
+/// `β` is the spectrum band of [`gram_spectrum_with_band`] plus the rounding
+/// of rebuilding `Q·Λ₊·Qᵀ` itself: each entry is a `p`-term inner product of
+/// two-rounding summands `(q_ik·λ_k)·q_jk`, whose entrywise majorant
+/// `|Q|Λ₊|Q|ᵀ` has trace `Σ_k λ₊_k` (the columns of `Q` are unit vectors).
+/// Then `S_exact ⪯ QΛQᵀ + band·I ⪯ QΛ₊Qᵀ + band·I`, and the rebuilt matrix is
+/// within the reconstruction band of `QΛ₊Qᵀ` in spectral norm.
+fn certified_psd_envelope(
+    s: &Array2<f64>,
+    assembly_band: f64,
+    what: &str,
+) -> Result<Array2<f64>, String> {
+    let (evals, q, band) = gram_spectrum_with_band(s, assembly_band, what)?;
+    let p = evals.len();
+    let positive_sum: f64 = evals.iter().map(|value| value.max(0.0)).sum();
+    let lift = band + weighted_gram_assembly_band(p, 2, positive_sum);
+    let mut out = Array2::<f64>::zeros((p, p));
+    for i in 0..p {
+        for j in i..p {
+            let mut acc = 0.0;
+            for k in 0..p {
+                let lambda = evals[k];
+                if lambda > 0.0 {
+                    acc += (q[[i, k]] * lambda) * q[[j, k]];
+                }
+            }
+            out[[i, j]] = acc;
+            out[[j, i]] = acc;
+        }
+        out[[i, i]] += lift;
+    }
+    Ok(out)
+}
 
 // ---------------------------------------------------------------------------
 // Block-orthogonality penalty
@@ -31,9 +105,11 @@ use ndarray::s;
 ///
 /// * `groups` must be a true partition of all latent axes: every axis appears
 ///   exactly once, and at least two groups are required.
-/// * The Hessian is dense across rows and axes even though an exact diagonal is
-///   available for diagnostics/preconditioning. Use the HVP for the full
-///   Newton curvature.
+/// * The exact Hessian is dense across rows and axes and indefinite (its
+///   `I_n ⊗ K` part below is traceless), so `hessian_diag` stays at the trait
+///   default `None` and the exact curvature is only available through `hvp`.
+///   The PSD Newton / PIRLS curvature is the row-block majorizer
+///   `I_n ⊗ M` of `Self::psd_majorizer_row_block`, which is `⪰ ∂²P`.
 #[derive(Debug, Clone)]
 pub struct BlockOrthogonalityPenalty {
     pub target: PsiSlice,
@@ -314,6 +390,102 @@ impl BlockOrthogonalityPenalty {
         }
         dense
     }
+
+    /// Per-row block `M ∈ ℝ^{d×d}` of the PSD majorizer `B = I_n ⊗ M ⪰ ∂²P`.
+    ///
+    /// With `C_gh = T_gᵀT_h`, the exact curvature along a direction `V` is
+    ///
+    /// ```text
+    ///   vᵀHv = w · [ Σ_{g<h} ‖T_gᵀV_h + V_gᵀT_h‖²_F  +  Σ_n v_nᵀ K v_n ],
+    /// ```
+    ///
+    /// where `v_n` is row `n` of `V` and `K` is the symmetric `d×d` matrix with
+    /// off-diagonal blocks `K_gh = C_gh` and zero diagonal blocks. The first
+    /// (Gauss-Newton) sum couples every row; the second is row-block diagonal
+    /// but traceless, hence indefinite whenever some `C_gh ≠ 0`. Both are
+    /// majorized row-block-diagonally:
+    ///
+    /// * `‖T_gᵀV_h + V_gᵀT_h‖² ≤ 2‖T_g‖₂²‖V_h‖² + 2‖T_h‖₂²‖V_g‖²`, so summing
+    ///   over `g < h` bounds the Gauss-Newton part by `Σ_n v_nᵀ diag(D) v_n`
+    ///   with `D_a = 2·Σ_{h ≠ g(a)} σ_h`, `σ_h = λ_max(T_hᵀT_h) = ‖T_h‖₂²`;
+    /// * `v_nᵀ K v_n ≤ v_nᵀ K₊ v_n`, `K₊` the PSD part of `K`.
+    ///
+    /// Hence `M = w·(diag(D) + K₊)` gives `vᵀ(I_n ⊗ M)v ≥ vᵀHv` and `M ⪰ 0`.
+    /// Each spectral quantity is lifted by its certified rounding band
+    /// (Gram assembly over `n` rows plus eigensolver backward error), so the
+    /// computed `M` majorizes the exact curvature rather than a rounded one.
+    ///
+    /// The majorizer is necessarily `O(n)` along the coherent direction
+    /// `V = T`: every row-block-diagonal `B ⪰ H` must pay the Gauss-Newton
+    /// curvature `‖T_h‖₂²` of that direction in each row, because `H` there
+    /// grows with `n` while a row block sees one row at a time.
+    pub(crate) fn psd_majorizer_row_block(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let t = self.target_matrix(target).ok_or_else(|| {
+            format!(
+                "BlockOrthogonalityPenalty target length {} is not a multiple of n_eff {}",
+                target.len(),
+                self.n_eff
+            )
+        })?;
+        let n_obs = t.nrows();
+        let d = t.ncols();
+        let weight = self.resolved_weight(rho);
+        let mut group_of = vec![usize::MAX; d];
+        for (gi, group) in self.groups.iter().enumerate() {
+            for &axis in group {
+                group_of[axis] = gi;
+            }
+        }
+        let mut group_spectral_sq = Vec::with_capacity(self.groups.len());
+        for group in &self.groups {
+            let gram = Self::cross_gram(t.view(), group, group);
+            let frobenius_sq: f64 = group
+                .iter()
+                .map(|&axis| t.column(axis).iter().map(|value| value * value).sum::<f64>())
+                .sum();
+            group_spectral_sq.push(certified_lambda_max(
+                &gram,
+                weighted_gram_assembly_band(n_obs, 1, frobenius_sq),
+                "BlockOrthogonalityPenalty within-group Gram",
+            )?);
+        }
+        let mut between = Array2::<f64>::zeros((d, d));
+        for a in 0..d {
+            for b in 0..d {
+                if group_of[a] != group_of[b] {
+                    let mut s = 0.0;
+                    for n in 0..n_obs {
+                        s += t[[n, a]] * t[[n, b]];
+                    }
+                    between[[a, b]] = s;
+                }
+            }
+        }
+        // The masked Gram's entrywise rounding majorant is dominated by the
+        // full `|T|ᵀ|T|`, whose trace is `‖T‖²_F`.
+        let total_frobenius_sq: f64 = t.iter().map(|value| value * value).sum();
+        let mut m = certified_psd_envelope(
+            &between,
+            weighted_gram_assembly_band(n_obs, 1, total_frobenius_sq),
+            "BlockOrthogonalityPenalty between-group Gram",
+        )?;
+        for a in 0..d {
+            let g = group_of[a];
+            let mut other_spectral_sq = 0.0;
+            for (h, &sigma) in group_spectral_sq.iter().enumerate() {
+                if h != g {
+                    other_spectral_sq += sigma;
+                }
+            }
+            m[[a, a]] += 2.0 * other_spectral_sq;
+        }
+        m.mapv_inplace(|value| weight * value);
+        Ok(m)
+    }
 }
 
 impl AnalyticPenalty for BlockOrthogonalityPenalty {
@@ -379,9 +551,6 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -398,38 +567,34 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         Self::flatten_matrix(&hv)
     }
 
-    fn hessian_diag(
+    /// PSD majorizer-vector product `(I_n ⊗ M) v`, row `n` of the result being
+    /// `M v_n` with `M` from `BlockOrthogonalityPenalty::psd_majorizer_row_block`.
+    fn psd_majorizer_hvp(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
-    ) -> Option<Array1<f64>> {
-        let t = self.target_matrix(target)?;
-        let n_obs = t.nrows();
-        let d = t.ncols();
-        let weight = self.resolved_weight(rho);
-        let mut group_of = vec![usize::MAX; d];
-        for (gi, group) in self.groups.iter().enumerate() {
-            for &axis in group {
-                group_of[axis] = gi;
-            }
-        }
-        let mut out = Array1::<f64>::zeros(n_obs * d);
-        for n in 0..n_obs {
-            let mut row_sq = 0.0_f64;
-            let mut group_sq = vec![0.0_f64; self.groups.len()];
-            for b in 0..d {
-                let v = t[[n, b]];
-                let v2 = v * v;
-                row_sq += v2;
-                group_sq[group_of[b]] += v2;
-            }
-            for a in 0..d {
-                let g = group_of[a];
-                out[n * d + a] = weight * (row_sq - group_sq[g]);
-            }
-        }
-        Some(out)
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(
+            target.len(),
+            v.len(),
+            "psd_majorizer_hvp dimension mismatch"
+        );
+        let m = self
+            .psd_majorizer_row_block(target, rho)
+            .expect("BlockOrthogonality PSD row-block majorizer");
+        let v_mat = self
+            .target_matrix(v)
+            .expect("direction has the target's shape");
+        // `M` is symmetric, so row `n` of `V·M` is `(M v_n)ᵀ`.
+        Self::flatten_matrix(&v_mat.dot(&m))
     }
+
+    // `hessian_diag` is intentionally left at the trait default (`None`): the
+    // exact Hessian is dense across rows and axes, so its diagonal is neither
+    // the Hessian nor a majorizer of it, and consumers that read a `Some`
+    // diagonal as the curvature (the default `psd_majorizer_hvp`, the SAE
+    // `htt` assembly, the spatial hyper-direction Hessian) would be wrong.
 
     impl_learnable_weight_grad_rho!();
 
@@ -1366,6 +1531,11 @@ impl AnalyticPenalty for DecoderIncoherencePenalty {
 /// ARD alone is rotation-invariant — pair with Orthogonality to identify
 /// intrinsic dim. This penalty locks a canonical orthonormal basis first;
 /// ARD can then shrink axes after the rotation gauge has been identified.
+///
+/// The energy is `P(T) = ½·s·‖TᵀT − I‖²_F` with `s = w / n_eff`. Its exact
+/// Hessian is indefinite wherever `TᵀT` has an eigenvalue below one;
+/// `psd_majorizer_hvp` returns the PSD majorizer obtained by replacing
+/// `TᵀT − I` with its PSD part (see `Self::psd_majorizer_gram`).
 #[derive(Debug, Clone)]
 pub struct OrthogonalityPenalty {
     pub target: PsiSlice,
@@ -1478,6 +1648,26 @@ impl OrthogonalityPenalty {
             gram[[a, a]] -= 1.0;
         }
         gram
+    }
+
+    /// Certified PSD envelope `G₊ + β·I ⪰ G` of `G = TᵀT − I`, the matrix that
+    /// replaces `G` in the PSD majorizer.
+    ///
+    /// The exact curvature along `V` is
+    /// `vᵀHv = s·‖VᵀT + TᵀV‖²_F + 2s·tr(V G Vᵀ)`; the first term is PSD and
+    /// `tr(V G Vᵀ) ≤ tr(V G₊ Vᵀ)`, so substituting the envelope for `G` in
+    /// [`Self::hvp_with_precomputed_m`] gives `B ⪰ H` and `B ⪰ 0`. Each entry
+    /// of `G` is an `n`-term inner product plus (on the diagonal) the exact
+    /// `−1`; its entrywise rounding majorant `|T|ᵀ|T| + I` has trace
+    /// `‖T‖²_F + d`, which bands the assembly.
+    pub(crate) fn psd_majorizer_gram(t: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
+        let gram = Self::gram_minus_identity(t);
+        let frobenius_sq: f64 = t.iter().map(|value| value * value).sum();
+        certified_psd_envelope(
+            &gram,
+            weighted_gram_assembly_band(t.nrows() + 1, 1, frobenius_sq + t.ncols() as f64),
+            "OrthogonalityPenalty Gram TᵀT − I",
+        )
     }
 
     fn flatten_matrix(m: &Array2<f64>) -> Array1<f64> {
@@ -1622,9 +1812,6 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -1635,6 +1822,36 @@ impl AnalyticPenalty for OrthogonalityPenalty {
         let hv = self.hvp_with_precomputed_m(t.view(), m.view(), v_mat.view(), self.scale(rho));
         Self::flatten_matrix(&hv)
     }
+
+    /// PSD majorizer-vector product `2s·(V (G₊ + β·I) + T(VᵀT + TᵀV))`: the
+    /// exact HVP with `G = TᵀT − I` replaced by its certified PSD envelope
+    /// (`OrthogonalityPenalty::psd_majorizer_gram`). The exact Hessian is
+    /// indefinite whenever `TᵀT` has an eigenvalue below one.
+    fn psd_majorizer_hvp(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+        v: ArrayView1<'_, f64>,
+    ) -> Array1<f64> {
+        assert_eq!(
+            target.len(),
+            v.len(),
+            "psd_majorizer_hvp dimension mismatch"
+        );
+        let t = self
+            .target_matrix(target)
+            .expect("target length is a multiple of latent_dim");
+        let v_mat = self
+            .target_matrix(v)
+            .expect("direction has the target's shape");
+        let envelope =
+            Self::psd_majorizer_gram(t.view()).expect("Orthogonality PSD Gram envelope");
+        let bv =
+            self.hvp_with_precomputed_m(t.view(), envelope.view(), v_mat.view(), self.scale(rho));
+        Self::flatten_matrix(&bv)
+    }
+
+    // `hessian_diag` stays at the trait default (`None`): the Hessian is dense.
 
     impl_learnable_weight_grad_rho!();
 

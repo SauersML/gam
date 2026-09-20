@@ -256,7 +256,7 @@ fn per_atom_max_mass(term: &SaeManifoldTerm) -> Array1<f64> {
 /// number of significant directions (the #2233 span estimate `ŝ` when the spectrum
 /// is the residual factor-energy set). `1.0` for a single direction (or an
 /// all-but-one-zero spectrum); `0.0` for an empty / all-zero spectrum.
-fn participation_ratio(spectrum: &[f64]) -> f64 {
+pub(crate) fn participation_ratio(spectrum: &[f64]) -> f64 {
     let sum: f64 = spectrum.iter().map(|&e| e.max(0.0)).sum();
     let sum_sq: f64 = spectrum.iter().map(|&e| e.max(0.0) * e.max(0.0)).sum();
     if sum_sq > 0.0 {
@@ -285,7 +285,11 @@ fn participation_ratio(spectrum: &[f64]) -> f64 {
 /// plan is what makes that unrepeatable — `SaeAtomGeometryPlan::new` refuses the
 /// chart form `(Sphere, latent_dim = 2, ..)` outright, so a price on an
 /// unbuildable atom is now a hard error here instead of a silent literal.
-fn curved_topology_for_span(span: f64) -> Result<(usize, usize), String> {
+///
+/// This and [`participation_ratio`] are the ONE span estimate and span→topology
+/// map of the #2233 pre-screen; the compression-promotion producer
+/// ([`crate::manifold::curve_promotion`]) reads both from here.
+pub(crate) fn curved_topology_for_span(span: f64) -> Result<(usize, usize), String> {
     let plan = SaeAtomGeometryPlan::curved_prescreen_atom_for_span(span)?;
     Ok((plan.intrinsic_dim(), plan.basis_size()?))
 }
@@ -2452,18 +2456,9 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
         let la = term.assignment.logits[[row, a]];
         let lb = term.assignment.logits[[row, b]];
         term.assignment.logits[[row, a]] = if softmax_routing {
-            // Numerically stable logsumexp. When BOTH logits are -∞ (two rows of
-            // zero softmax mass — a hard-masked/dead pair), `m = -∞` makes
-            // `la - m = -∞ - (-∞) = NaN`, and the NaN poisons the whole logits
-            // row (every subsequent softmax over it is NaN). The combined mass of
-            // two zero-mass atoms is exactly zero, i.e. logit -∞ — return that
-            // directly instead of computing NaN.
-            let m = la.max(lb);
-            if m == f64::NEG_INFINITY {
-                f64::NEG_INFINITY
-            } else {
-                m + ((la - m).exp() + (lb - m).exp()).ln()
-            }
+            // Two zero-mass atoms (both logits -∞, a hard-masked/dead pair) fuse
+            // to zero mass, logit -∞, not the NaN of `-∞ - (-∞)`.
+            gam_math::special::logaddexp(la, lb)
         } else {
             la.max(lb)
         };
