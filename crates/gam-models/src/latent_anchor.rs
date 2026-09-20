@@ -624,13 +624,127 @@ fn solve_anchor_with(
         ));
     }
     let survival_side = q >= 0.0;
-    let log_target = if survival_side {
+    let log_target = smaller_tail_log_target(q);
+    let rounding = anchor_residual_rounding(log_target, grid.len());
+    solve_log_tail_root(
+        seed,
+        survival_side,
+        |alpha| {
+            let (value, first, second) =
+                residual(alpha, observed_slope, grid, survival_side, log_target)?;
+            Ok(LogTailResidual {
+                value,
+                first,
+                second,
+                rounding,
+            })
+        },
+        "survival marginal-slope anchor",
+        || format!("q={q}, b={observed_slope}"),
+    )
+}
+
+/// One evaluation of a log-tail calibration residual: `(F, F′, F″)` at `α` and
+/// the rounding `F` carries there ([`anchor_residual_rounding`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LogTailResidual {
+    pub(crate) value: f64,
+    pub(crate) first: f64,
+    pub(crate) second: f64,
+    pub(crate) rounding: f64,
+}
+
+/// A calibration `P(a) = E[Φ(η(a, Z))]` at one intercept, read on its smaller
+/// tail (gam#3216, gam#3333).
+///
+/// `tail` is `T = E[Φ(∓η)]` summed from positive terms: `1 − P` on the
+/// survival side (`q ≥ 0`), `P` on the complement side. It is never formed as
+/// `1 − P`, so it keeps its relative accuracy where `P` rounds to one. The
+/// slopes stay in probability space, `P′ = E[φ(η)·η_a]` and, where evaluated,
+/// `P″`; the implicit derivatives `a_u = −P_u/P′` read `density` directly.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CalibrationTail {
+    pub(crate) tail: f64,
+    pub(crate) density: f64,
+    pub(crate) density_slope: Option<f64>,
+    /// The terms summed into `tail`, for its rounding.
+    pub(crate) summands: usize,
+}
+
+impl CalibrationTail {
+    /// The residual `log T − log Φ(∓q)` with its slopes: `T′ = ∓P′`,
+    /// `F′ = T′/T`, and `F″ = T″/T − F′²` where `P″` was evaluated, else zero
+    /// so the solve takes Newton's step. A tail that has underflowed, or a
+    /// calibration that no longer moves with `a`, has no root to resolve and
+    /// is refused.
+    pub(crate) fn log_residual(
+        &self,
+        survival_side: bool,
+        log_target: f64,
+    ) -> Result<LogTailResidual, String> {
+        if !(self.tail.is_finite() && self.tail > 0.0 && self.density.is_finite() && self.density > 0.0)
+        {
+            return Err(format!(
+                "calibration tail has no resolvable log residual: tail={:e}, density={:e}",
+                self.tail, self.density
+            ));
+        }
+        let sign = if survival_side { -1.0 } else { 1.0 };
+        let first = sign * self.density / self.tail;
+        let second = match self.density_slope {
+            Some(slope) if slope.is_finite() => sign * slope / self.tail - first * first,
+            Some(slope) => {
+                return Err(format!("calibration tail has a non-finite P''={slope:e}"));
+            }
+            None => 0.0,
+        };
+        Ok(LogTailResidual {
+            value: self.tail.ln() - log_target,
+            first,
+            second,
+            rounding: anchor_residual_rounding(log_target, self.summands),
+        })
+    }
+}
+
+/// `log Φ(∓q)`, the log of the smaller marginal tail: the survival tail
+/// `Φ(−q)` when `q ≥ 0`, the complement `Φ(q)` otherwise.
+#[inline]
+pub(crate) fn smaller_tail_log_target(q: f64) -> f64 {
+    if q >= 0.0 {
         normal_logcdf(-q)
     } else {
         normal_logcdf(q)
-    };
-    // `F` is strictly decreasing in `α` on the survival side and strictly
-    // increasing on the complement side.
+    }
+}
+
+/// The root of a calibration residual written on the smaller marginal tail,
+/// `F(α) = log T(α) − log Φ(∓q)`, from `seed` (gam#2928, gam#3333).
+///
+/// `residual` returns `(F, F′, F″)` at `α` with the rounding `F` carries there
+/// ([`anchor_residual_rounding`]); `F″ = 0` reduces every Halley step to
+/// Newton's. `survival_side` is `q ≥ 0`: there `T` is the survival tail and
+/// `F` strictly decreases in `α`, on the complement side it strictly
+/// increases.
+///
+/// The solve is a safeguarded Halley iteration on a sign bracket: Halley's
+/// step where it agrees with Newton's, a doubling search until both sides of
+/// the root are seen, bisection whenever a step leaves the bracket or fails to
+/// halve. It returns only an `α` whose residual meets
+/// [`anchor_residual_resolution`], finished by one Newton step from there, and
+/// refuses otherwise; it never stops on a bracket width. So the returned root
+/// is a function of the equation alone, to rounding, whatever the seed.
+/// Returns the root and the residual evaluations spent.
+pub(crate) fn solve_log_tail_root(
+    seed: f64,
+    survival_side: bool,
+    mut residual: impl FnMut(f64) -> Result<LogTailResidual, String>,
+    label: &str,
+    context: impl Fn() -> String,
+) -> Result<(f64, usize), String> {
+    if !seed.is_finite() {
+        return Err(format!("{label} requires a finite seed, got {seed} ({})", context()));
+    }
     let increasing = !survival_side;
     // The sign bracket: `below < root < above` once each side has been seen.
     let mut below = f64::NEG_INFINITY;
@@ -638,9 +752,13 @@ fn solve_anchor_with(
     let mut alpha = seed;
     let mut step_cap = (0.25 * (1.0 + seed.abs())).max(1.0);
     let mut last_step = f64::INFINITY;
-    let rounding = anchor_residual_rounding(log_target, grid.len());
     for evaluation in 0..ANCHOR_SOLVE_MAX_EVALUATIONS {
-        let (value, first, second) = residual(alpha, observed_slope, grid, survival_side, log_target)?;
+        let LogTailResidual {
+            value,
+            first,
+            second,
+            rounding,
+        } = residual(alpha)?;
         if value.abs() <= anchor_residual_resolution(alpha, first, rounding) {
             // The accepted `α` still carries a residual up to the tolerance,
             // and where it stops depends on the seed, so it moves irregularly
@@ -702,8 +820,9 @@ fn solve_anchor_with(
             last_step = (next - alpha).abs();
             if !(next > below && next < above) {
                 return Err(format!(
-                    "survival marginal-slope anchor bracketed its root between adjacent floats \
-                     [{below:e}, {above:e}] without resolving the residual (q={q}, b={observed_slope})"
+                    "{label} bracketed its root between adjacent floats \
+                     [{below:e}, {above:e}] without resolving the residual ({})",
+                    context()
                 ));
             }
             next
@@ -718,8 +837,9 @@ fn solve_anchor_with(
         alpha = next;
     }
     Err(format!(
-        "survival marginal-slope anchor did not resolve its residual in {ANCHOR_SOLVE_MAX_EVALUATIONS} \
-         evaluations (q={q}, b={observed_slope}, seed={seed}, bracket [{below:e}, {above:e}])"
+        "{label} did not resolve its residual in {ANCHOR_SOLVE_MAX_EVALUATIONS} \
+         evaluations ({}, seed={seed}, bracket [{below:e}, {above:e}])",
+        context()
     ))
 }
 

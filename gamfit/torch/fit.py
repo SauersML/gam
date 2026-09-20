@@ -543,13 +543,12 @@ def _build_design_penalty(
         return design.to(torch.float64), penalty
 
     if entry == "categorical" and isinstance(smooth, Categorical):
-        # Sum-to-zero coded categorical contrast = i.i.d. Gaussian random
-        # effect with an identity ridge penalty on the level contrasts. This
-        # mirrors the Rust `RandomEffectTermSpec` (one-hot dummy block with an
-        # identity penalty on group coefficients) and the `Pca` torch branch
-        # (linear projection design + identity ridge penalty). The level codes
-        # are structural (integer category labels), so the design carries no
-        # autograd path back to `points`.
+        # Sum-to-zero coded categorical contrast: an i.i.d. Gaussian random
+        # effect on the level effects, restricted to effects that sum to zero.
+        # The ridge prices the level effects, as the Rust `RandomEffectTermSpec`
+        # prices its one-hot group coefficients. The level codes are structural
+        # (integer category labels), so the design carries no autograd path
+        # back to `points`.
         if smooth.levels is None:
             raise ValueError("Categorical requires `levels` on the torch path")
         n_levels = int(smooth.n_levels)
@@ -579,9 +578,12 @@ def _build_design_penalty(
         )
         onehot[torch.arange(N, device=points.device), levels] = 1.0
         design = onehot[:, :contrast] - onehot[:, contrast:contrast + 1]
-        penalty = torch.eye(
-            contrast, dtype=torch.float64, device=points.device
-        )
+        # The design's level effects are e = C·c with C = [I; -1ᵀ], so the
+        # ridge on them is ‖e‖² = cᵀ(I + 11ᵀ)c. It treats every level alike: an
+        # identity ridge on c would give the last-coded level K - 1 times the
+        # prior variance of the others, and the fit would move with the coding.
+        identity = torch.eye(contrast, dtype=torch.float64, device=points.device)
+        penalty = identity + torch.ones_like(identity)
         return design, penalty
 
     raise NotImplementedError(

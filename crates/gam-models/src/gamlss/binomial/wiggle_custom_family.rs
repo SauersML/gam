@@ -167,15 +167,6 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
         let wiggle_design = self.wiggle_design(core.q0.view())?;
         let dq_dq0 =
             self.wiggle_dq_dq0(core.q0.view(), block_states[Self::BLOCK_WIGGLE].beta.view())?;
-        let threshold_design = self.threshold_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact-newton path is missing threshold design"
-                .to_string()
-        })?;
-        let log_sigma_design = self.log_sigma_design.as_ref().ok_or_else(|| {
-            "BinomialLocationScaleWiggleFamily exact-newton path is missing log-sigma design"
-                .to_string()
-        })?;
-
         // Per-block gradients from the eta-space score.
         //
         //   q = q0 + w(q0), a = dq/dq0
@@ -204,28 +195,25 @@ impl CustomFamily for BinomialLocationScaleWiggleFamily {
             grad_eta_ls[i] = score_q * dq_dq0[i] * q0d.q_ls;
             grad_q[i] = score_q;
         }
-        let grad_t = threshold_design.transpose_vector_multiply(&grad_eta_t);
-        let grad_ls = log_sigma_design.transpose_vector_multiply(&grad_eta_ls);
         let grad_w = fast_atv(&wiggle_design, &grad_q);
 
-        // Per-block diagonal Hessians without ever materializing the full p×p
-        // joint matrix. The shared row-pieces struct exposes block diagonals
-        // directly, so the cross blocks (h_tl, h_tw, h_lw) are not formed.
-        let (x_t, x_ls) = self
-            .exact_joint_dense_block_designs(None)?
-            .ok_or("BinomialLocationScaleWiggleFamily: joint block designs unavailable")?;
+        // The threshold and log-σ blocks carry their row score and within-block
+        // curvature `c_bb`, which the caller contracts with the designs it solves on,
+        // so they read no design copy of the family's own (#3015). The wiggle block's
+        // design is the basis at this state's q0, built here, so it stays in
+        // coefficient space. The cross blocks (h_tl, h_tw, h_lw) are not formed.
         let pieces = self.wiggle_order2_rows(block_states)?;
-        let (h_tt, h_ll, h_ww) = pieces.assemble_block_diagonals(&x_t, &x_ls)?;
+        let h_ww = xt_diag_x_dense(&pieces.b0, &pieces.coeff_ww)?;
         Ok(FamilyEvaluation {
             log_likelihood: core.log_likelihood,
             blockworking_sets: vec![
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_t,
-                    hessian: SymmetricMatrix::Dense(h_tt),
+                BlockWorkingSet::NaturalDiagonal {
+                    score: grad_eta_t,
+                    observed_curvature: pieces.coeff_tt,
                 },
-                BlockWorkingSet::ExactNewton {
-                    gradient: grad_ls,
-                    hessian: SymmetricMatrix::Dense(h_ll),
+                BlockWorkingSet::NaturalDiagonal {
+                    score: grad_eta_ls,
+                    observed_curvature: pieces.coeff_ll,
                 },
                 BlockWorkingSet::ExactNewton {
                     gradient: grad_w,

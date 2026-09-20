@@ -24,7 +24,14 @@ from dataclasses import dataclass, field
 from .fuzz_families import FAMILY_LABELS, REGIMES
 from .fuzz_families import fuzz_design as family_fuzz_design
 from .fuzz_terms import fuzz_design as term_fuzz_design
-from .worker import BINOMIAL_FAMILIES, EXTRA_DESIGNS, FAMILIES, LIBS, POSITIVE_FAMILIES
+from .worker import (
+    BINOMIAL_FAMILIES,
+    COUNT_FAMILIES,
+    EXTRA_DESIGNS,
+    FAMILIES,
+    LIBS,
+    POSITIVE_FAMILIES,
+)
 from .worker import DESIGNS as ALL_DESIGNS
 
 CORE_DESIGNS: tuple[str, ...] = ("p1", "p5", "te")
@@ -313,6 +320,32 @@ PLANS: dict[str, Plan] = {
                 " x every design, 1 rep"
             ),
             cells=_grid((100_000,), ALL_DESIGNS, BINOMIAL_SWEEP),
+            reps=1,
+            timeout_s=3_600.0,
+        ),
+        # The count-family speed/convergence sweep (audit lane sweep-count):
+        # Poisson at mean 0.3 / 5 / 500 and with a log-exposure offset, the
+        # negative binomial with theta estimated, and Tweedie with phi
+        # estimated. pyGAM runs the Poisson cells only (it has no NB or
+        # Tweedie), so those two report gamfit's absolute times and status.
+        Plan(
+            name="count_small",
+            description="n in {1e2, 1e3}, every count family x every design, 3 reps",
+            cells=_grid((100, 1_000), ALL_DESIGNS, COUNT_FAMILIES),
+            reps=3,
+            timeout_s=600.0,
+        ),
+        Plan(
+            name="count_1e4",
+            description="n=1e4, every count family x every design, 2 reps",
+            cells=_grid((10_000,), ALL_DESIGNS, COUNT_FAMILIES),
+            reps=2,
+            timeout_s=1_800.0,
+        ),
+        Plan(
+            name="count_1e5",
+            description="n=1e5, every count family x {p1, p5, te}, 1 rep",
+            cells=_grid((100_000,), CORE_DESIGNS, COUNT_FAMILIES),
             reps=1,
             timeout_s=3_600.0,
         ),

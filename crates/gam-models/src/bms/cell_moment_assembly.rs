@@ -16,7 +16,8 @@ use super::*;
 
 use crate::fnv1a::Fnv1a;
 use crate::latent_anchor::{
-    AnchorGridOwned, AnchorTaylor, anchor_derivatives_in_slot, anchor_taylor_in_slot, solve_anchor,
+    AnchorGridOwned, AnchorTaylor, CalibrationTail, anchor_derivatives_in_slot,
+    anchor_taylor_in_slot, smaller_tail_log_target, solve_anchor, solve_log_tail_root,
 };
 use gam_math::jet_scalar::{
     DynamicOneSeedBatch, DynamicTwoSeedBatch, FixedRuntimeJet, OneSeed, TwoSeed,
@@ -829,59 +830,46 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
 
-        // The derivative lift requires a genuine scalar root. Polish the seed
-        // with Newton in the model's scalar calibration kernel for as long as a
-        // step still shrinks the residual: the evaluator's rounding floor ends
-        // it, because a strictly decreasing sequence of doubles is finite. The
-        // polished root is then held to the #1607 contract the row solve and a
-        // saved prediction accept at. The residual is a probability, so that
-        // contract is the one owner's μ band, not a multiple of the probit-scale
-        // `1 + |a|`. Freeze the primal Jacobian there; derivative channels below
-        // come only from the canonical jet expression.
+        // The derivative lift requires a genuine scalar root: the one the row
+        // solve returns, a function of β to rounding whatever the seed
+        // (gam#3333), solved on the smaller tail in log units. From the row
+        // solve's own root it resolves in one evaluation. The primal Jacobian
+        // is frozen there; derivative channels below come only from the
+        // canonical jet expression.
         let marginal = self.marginal_link_map(q)?;
-        let root_tol = super::row_primary_hessian::bernoulli_intercept_residual_tolerance(marginal.mu);
-        // Every evaluation also keeps its nodes' observed index `η`, so the node programs
-        // below read the accepted root's `η` instead of re-evaluating both spans of every
-        // node at that same root.
-        let mut intercept_root = intercept_seed;
-        let mut root_etas = Vec::with_capacity(grid.nodes.len());
-        let mut candidate_etas = Vec::with_capacity(grid.nodes.len());
-        let (mut root_residual, mut f_a, _) = self.evaluate_empirical_grid_calibration_newton_recording(
-            intercept_root,
-            q,
-            slope,
-            beta_h,
-            beta_w,
-            grid,
-            Some(&mut root_etas),
-        )?;
-        while root_residual != 0.0 {
-            let candidate = intercept_root - root_residual / f_a;
-            candidate_etas.clear();
-            let (candidate_residual, candidate_f_a, _) = self
-                .evaluate_empirical_grid_calibration_newton_recording(
-                    candidate,
-                    q,
+        let survival_side = marginal.q >= 0.0;
+        let log_target = smaller_tail_log_target(marginal.q);
+        let (intercept_root, _) = solve_log_tail_root(
+            intercept_seed,
+            survival_side,
+            |a| {
+                self.evaluate_empirical_grid_calibration_tail(
+                    a,
                     slope,
                     beta_h,
                     beta_w,
                     grid,
-                    Some(&mut candidate_etas),
-                )?;
-            if !(candidate_residual.abs() < root_residual.abs()) {
-                break;
-            }
-            intercept_root = candidate;
-            root_residual = candidate_residual;
-            f_a = candidate_f_a;
-            std::mem::swap(&mut root_etas, &mut candidate_etas);
-        }
-        if root_residual.abs() > root_tol {
-            return Err(format!(
-                "empirical BMS intercept is not a calibration root at row {row}: \
-                 residual={root_residual:.3e} > {root_tol:.3e}"
-            ));
-        }
+                    survival_side,
+                )?
+                .log_residual(survival_side, log_target)
+            },
+            "empirical BMS intercept",
+            || format!("row {row}, q={}, b={slope}", marginal.q),
+        )?;
+        // The node programs below read the root's `η` from this evaluation
+        // instead of re-evaluating both spans of every node there.
+        let mut root_etas = Vec::with_capacity(grid.nodes.len());
+        let f_a = self
+            .evaluate_empirical_grid_calibration_tail_recording(
+                intercept_root,
+                slope,
+                beta_h,
+                beta_w,
+                grid,
+                survival_side,
+                Some(&mut root_etas),
+            )?
+            .density;
         if !(f_a.is_finite() && f_a > 0.0) {
             return Err(format!(
                 "empirical BMS calibration has invalid F_a={f_a} at row {row}"
@@ -2900,31 +2888,41 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    /// Newton-step evaluator for the inner-PIRLS row-intercept root solver.
+    /// The row calibration `P(a) = Σ_cells ∫φ(z)Φ(η(z)) dz` under the standard
+    /// normal latent law, read on its smaller tail (gam#3216, gam#3333).
     ///
-    /// Returns `(f, f', 0.0)`: the third slot — `F''(a)` — is reported as
-    /// zero, which makes [`monotone_root::solve_monotone_root`]'s safeguarded
-    /// Halley step reduce to a Newton step. A measured degree-9 `F''(a)` path
-    /// did not reduce calibration evaluations on the large-scale FLEX repro, and
-    /// it made each value-bearing cell evaluation slower; degree 4 is the
-    /// correct cost/accuracy point for this solver.
-    pub(super) fn evaluate_denested_calibration_newton(
+    /// On the survival side each cell is evaluated with its index negated,
+    /// whose value is `∫φ(z)Φ(−η(z)) dz` directly. Its moments
+    /// `∫zᵏ·e^{−(z² + η²)/2}` are those of the cell itself, so they contract
+    /// with the cell's own `∂c/∂a` into `P′`. `P″` is not evaluated: a
+    /// degree-9 `P″` did not reduce calibration evaluations on the large-scale
+    /// FLEX repro and made each value-bearing cell slower, so the solve takes
+    /// Newton's step at degree-4 moments. Each cell's value is a sum of at most
+    /// the terminal Gauss–Legendre rule's terms.
+    pub(super) fn evaluate_denested_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-    ) -> Result<(f64, f64, f64), String> {
-        let marginal = self.marginal_link_map(marginal_eta)?;
+        survival_side: bool,
+    ) -> Result<CalibrationTail, String> {
         let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
         let scale = self.probit_frailty_scale();
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let summands = cells.len() * exact_kernel::TERMINAL_GL_ORDER;
         for partition_cell in cells {
             let cell = partition_cell.cell;
-            let state = self.evaluate_cell_moments_lru(cell, 4)?;
-            f += state.value;
+            let state = self.evaluate_cell_moments_lru(
+                if survival_side {
+                    cell.negated()
+                } else {
+                    cell
+                },
+                4,
+            )?;
+            tail += state.value;
             let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
@@ -2932,48 +2930,55 @@ impl BernoulliMarginalSlopeFamily {
                 slope,
             );
             let dc_da = scale_coeff4(dc_da_raw, scale);
-            f_a += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
+            density += exact_kernel::cell_first_derivative_from_moments(&dc_da, &state.moments)?;
         }
-        Ok((f, f_a, 0.0))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: None,
+            summands,
+        })
     }
 
-    pub(super) fn evaluate_empirical_grid_calibration_newton(
+    /// The row calibration `P(a) = Σ_k w_k Φ(η(a, u_k))` under the finite law
+    /// `grid`, read on its smaller tail: `T = Σ_k w_k Φ(∓η_k)` with
+    /// `P′ = Σ w φ(η)·η_a` and `P″ = Σ w φ(η)·(η_aa − η·η_a²)`.
+    pub(super) fn evaluate_empirical_grid_calibration_tail(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
-        self.evaluate_empirical_grid_calibration_newton_recording(
+        survival_side: bool,
+    ) -> Result<CalibrationTail, String> {
+        self.evaluate_empirical_grid_calibration_tail_recording(
             a,
-            marginal_eta,
             slope,
             beta_h,
             beta_w,
             grid,
+            survival_side,
             None,
         )
     }
 
-    /// [`Self::evaluate_empirical_grid_calibration_newton`], also appending every grid
+    /// [`Self::evaluate_empirical_grid_calibration_tail`], also appending every grid
     /// node's observed index `η` to `node_etas` in node order when one is given.
-    fn evaluate_empirical_grid_calibration_newton_recording(
+    fn evaluate_empirical_grid_calibration_tail_recording(
         &self,
         a: f64,
-        marginal_eta: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
+        survival_side: bool,
         mut node_etas: Option<&mut Vec<f64>>,
-    ) -> Result<(f64, f64, f64), String> {
-        let marginal = self.marginal_link_map(marginal_eta)?;
+    ) -> Result<CalibrationTail, String> {
         let scale = self.probit_frailty_scale();
-        let mut f = -marginal.mu;
-        let mut f_a = 0.0;
-        let mut f_aa = 0.0;
+        let mut tail = 0.0;
+        let mut density = 0.0;
+        let mut density_slope = 0.0;
         for (node, weight) in grid.pairs() {
             // A Newton step reads only `coeff`, `dc_da` and `dc_daa`; the helper builds
             // those bit-identically to the full observed partials and skips the rest.
@@ -2994,16 +2999,16 @@ impl BernoulliMarginalSlopeFamily {
                 etas.push(eta);
             }
             let pdf = normal_pdf(eta);
-            f += weight * normal_cdf(eta);
-            f_a += weight * pdf * eta_a;
-            f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+            tail += weight * normal_cdf(if survival_side { -eta } else { eta });
+            density += weight * pdf * eta_a;
+            density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
         }
-        if !(f.is_finite() && f_a.is_finite() && f_a > 0.0 && f_aa.is_finite()) {
-            return Err(format!(
-                "empirical latent denested calibration produced invalid root state: f={f}, f_a={f_a}, f_aa={f_aa}"
-            ));
-        }
-        Ok((f, f_a, f_aa))
+        Ok(CalibrationTail {
+            tail,
+            density,
+            density_slope: Some(density_slope),
+            summands: grid.nodes.len(),
+        })
     }
 
     /// The moving-law certificate's `(ln P, ln(1 − P))` of the row's anchor at
@@ -3061,30 +3066,6 @@ impl BernoulliMarginalSlopeFamily {
             ));
         }
         Ok((mean - marginal.mu, variance.sqrt(), marginal.mu))
-    }
-
-    pub(super) fn evaluate_calibration_newton(
-        &self,
-        row: usize,
-        a: f64,
-        marginal_eta: f64,
-        slope: f64,
-        beta_h: Option<&Array1<f64>>,
-        beta_w: Option<&Array1<f64>>,
-    ) -> Result<(f64, f64, f64), String> {
-        match self.training_row_grid(row)? {
-            None => {
-                self.evaluate_denested_calibration_newton(a, marginal_eta, slope, beta_h, beta_w)
-            }
-            Some(grid) => self.evaluate_empirical_grid_calibration_newton(
-                a,
-                marginal_eta,
-                slope,
-                beta_h,
-                beta_w,
-                &grid,
-            ),
-        }
     }
 
     pub(super) fn flex_active(&self) -> bool {
@@ -3439,21 +3420,6 @@ impl BernoulliMarginalSlopeFamily {
         );
         Ok(())
     }
-
-    #[inline]
-    pub(super) fn row_intercept_newton_is_converged(
-        a: f64,
-        f: f64,
-        f_a: f64,
-        abs_tol: f64,
-    ) -> bool {
-        // A probe accepts exactly what the safeguarded solve's final check accepts,
-        // the residual contract, with a derivative the implicit-function gradient
-        // can divide by. A small relative Newton correction is not that contract:
-        // the residual behind it is |F_a| times the correction, which exceeds the
-        // contract wherever the calibration is steep against μ.
-        a.is_finite() && f.is_finite() && f_a.is_finite() && f_a != 0.0 && f.abs() <= abs_tol
-    }
 }
 
 #[derive(Default)]
@@ -3464,13 +3430,13 @@ pub(super) struct BernoulliInterceptSolveStats {
     pub(super) seed_residual_le_1e12: AtomicUsize,
     pub(super) seed_residual_le_1e10: AtomicUsize,
     pub(super) seed_residual_le_1e8: AtomicUsize,
-    pub(super) seed_residual_le_abs_tol: AtomicUsize,
-    pub(super) seed_residual_gt_abs_tol: AtomicUsize,
+    pub(super) seed_residual_le_resolution: AtomicUsize,
+    pub(super) seed_residual_gt_resolution: AtomicUsize,
     pub(super) max_full_solver_iters: AtomicUsize,
 }
 
 impl BernoulliInterceptSolveStats {
-    pub(super) fn record_seed_residual(&self, residual: f64, abs_tol: f64) {
+    pub(super) fn record_seed_residual(&self, residual: f64, resolution: f64) {
         let abs = residual.abs();
         // Work bound (#2469): these bin edges only choose which diagnostic counter
         // to bump; the counters reach nothing but the intercept-seed log line.
@@ -3481,11 +3447,11 @@ impl BernoulliInterceptSolveStats {
             self.seed_residual_le_1e10.fetch_add(1, Ordering::Relaxed);
         } else if abs <= SEED_RESIDUAL_BIN_EDGES[2] {
             self.seed_residual_le_1e8.fetch_add(1, Ordering::Relaxed);
-        } else if abs <= abs_tol {
-            self.seed_residual_le_abs_tol
+        } else if abs <= resolution {
+            self.seed_residual_le_resolution
                 .fetch_add(1, Ordering::Relaxed);
         } else {
-            self.seed_residual_gt_abs_tol
+            self.seed_residual_gt_resolution
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -5185,12 +5151,13 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
-    /// gnomon#2337: the empirical calibration Newton evaluator builds only the three
-    /// observed channels it sums, and the row plan reads the accepted root's node index `η`
+    /// gnomon#2337: the empirical calibration tail evaluator builds only the three
+    /// observed channels it sums, and the row plan reads the root's node index `η`
     /// recorded by that evaluator instead of re-evaluating both spans of every node there.
     /// Both must match the full observed-partials route bit for bit: the evaluator at three
-    /// intercepts, and the plan's root, `1/F_a` and order-two row jet against a plan
-    /// assembled from full partials at the same polished root.
+    /// intercepts on both tails, and the plan's root, `1/F_a` and order-two row jet against
+    /// a plan assembled from full partials at the root the same log-tail solve returns
+    /// from the same seed (gam#3333).
     #[test]
     fn empirical_calibration_newton_reuse_matches_full_partials_bitwise_2337() {
         for is_score_warp in [true, false] {
@@ -5215,11 +5182,11 @@ mod empirical_flex_jet_oracle_tests {
                 (None, Some(&beta))
             };
             let marginal = fx.family.marginal_link_map(q).expect("marginal link map");
-            // The evaluator as it stood before gnomon#2337, through the full observed partials.
-            let full_newton = |a: f64| -> (f64, f64, f64) {
-                let mut f = -marginal.mu;
-                let mut f_a = 0.0;
-                let mut f_aa = 0.0;
+            // The tail evaluator through the full observed partials.
+            let full_tail = |a: f64, survival_side: bool| -> CalibrationTail {
+                let mut tail = 0.0;
+                let mut density = 0.0;
+                let mut density_slope = 0.0;
                 for (node, weight) in fx.grid.pairs() {
                     let obs = fx
                         .family
@@ -5229,14 +5196,25 @@ mod empirical_flex_jet_oracle_tests {
                     let eta_a = eval_coeff4_at(&obs.dc_da, node);
                     let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
                     let pdf = normal_pdf(eta);
-                    f += weight * normal_cdf(eta);
-                    f_a += weight * pdf * eta_a;
-                    f_aa += weight * pdf * (eta_aa - eta * eta_a * eta_a);
+                    tail += weight * normal_cdf(if survival_side { -eta } else { eta });
+                    density += weight * pdf * eta_a;
+                    density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
                 }
-                (f, f_a, f_aa)
+                CalibrationTail {
+                    tail,
+                    density,
+                    density_slope: Some(density_slope),
+                    summands: fx.grid.nodes.len(),
+                }
             };
-            let bits =
-                |(f, f_a, f_aa): (f64, f64, f64)| [f.to_bits(), f_a.to_bits(), f_aa.to_bits()];
+            let bits = |t: CalibrationTail| {
+                [
+                    t.tail.to_bits(),
+                    t.density.to_bits(),
+                    t.density_slope.map(f64::to_bits).unwrap_or(u64::MAX),
+                    t.summands as u64,
+                ]
+            };
 
             let plan = compiled_flex_fixture_program(&fx, &p0);
             for a in [
@@ -5244,41 +5222,49 @@ mod empirical_flex_jet_oracle_tests {
                 plan.intercept_root,
                 plan.intercept_root + 0.3,
             ] {
-                let trimmed = fx
-                    .family
-                    .evaluate_empirical_grid_calibration_newton(a, q, b, beta_h, beta_w, &fx.grid)
-                    .expect("trimmed calibration Newton evaluation");
-                assert_eq!(
-                    bits(trimmed),
-                    bits(full_newton(a)),
-                    "kind={is_score_warp} a={a}: calibration Newton terms"
-                );
+                for survival_side in [true, false] {
+                    let trimmed = fx
+                        .family
+                        .evaluate_empirical_grid_calibration_tail(
+                            a,
+                            b,
+                            beta_h,
+                            beta_w,
+                            &fx.grid,
+                            survival_side,
+                        )
+                        .expect("trimmed calibration tail evaluation");
+                    assert_eq!(
+                        bits(trimmed),
+                        bits(full_tail(a, survival_side)),
+                        "kind={is_score_warp} a={a} survival={survival_side}: calibration tail terms"
+                    );
+                }
             }
 
-            // The root polish and node programs as they stood before gnomon#2337, from the
-            // same seed `compiled_flex_fixture_program` passes.
+            // The root solve and node programs on full partials, from the same seed
+            // `compiled_flex_fixture_program` passes.
             let scale = fx.family.probit_frailty_scale();
             let seed_marginal = bernoulli_marginal_link_map(
                 &InverseLink::Standard(gam_problem::StandardLink::Probit),
                 q,
             )
             .expect("link map");
-            let mut root = witness_intercept(&fx, seed_marginal.mu, b, &beta, scale);
-            let (mut residual, mut f_a, _) = full_newton(root);
-            while residual != 0.0 {
-                let candidate = root - residual / f_a;
-                let (candidate_residual, candidate_f_a, _) = full_newton(candidate);
-                if !(candidate_residual.abs() < residual.abs()) {
-                    break;
-                }
-                root = candidate;
-                residual = candidate_residual;
-                f_a = candidate_f_a;
-            }
+            let survival_side = marginal.q >= 0.0;
+            let log_target = smaller_tail_log_target(marginal.q);
+            let (root, _) = solve_log_tail_root(
+                witness_intercept(&fx, seed_marginal.mu, b, &beta, scale),
+                survival_side,
+                |a| full_tail(a, survival_side).log_residual(survival_side, log_target),
+                "reference empirical BMS intercept",
+                String::new,
+            )
+            .expect("reference log-tail root");
+            let f_a = full_tail(root, survival_side).density;
             assert_eq!(
                 plan.intercept_root.to_bits(),
                 root.to_bits(),
-                "kind={is_score_warp}: polished calibration root"
+                "kind={is_score_warp}: calibration root"
             );
             assert_eq!(
                 plan.inv_f_a.to_bits(),
@@ -5360,6 +5346,120 @@ mod empirical_flex_jet_oracle_tests {
                 order_two_bits(&plan),
                 order_two_bits(&reference),
                 "kind={is_score_warp}: order-two row jet"
+            );
+        }
+    }
+
+    /// gam#3333, gam#3216: the row intercept deep in the marginal tail is a
+    /// function of the coefficients, not of the seed. At `q = 7.66` the
+    /// survival tail is `Φ(−7.66) ≈ 9e-15`, below any probability-space band,
+    /// so a band accepted intercepts whose tail was off by orders of magnitude
+    /// and which one it returned depended on where the solve started; `∂a/∂q`
+    /// read at it disagreed with the solved root's own motion. The log-tail
+    /// solve lands on the same root from every seed, to its rounding, and the
+    /// implicit derivative `μ′/P′` there matches a central difference of the
+    /// solved root.
+    #[test]
+    fn deep_tail_intercept_root_is_seed_independent_3333() {
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            let beta: Array1<f64> = Array1::from_iter(dev_range.enumerate().map(|(k, _)| fx.beta_dev[k]));
+            let (beta_h, beta_w) = if is_score_warp {
+                (Some(&beta), None)
+            } else {
+                (None, Some(&beta))
+            };
+            let b = 0.35;
+            let scale = fx.family.probit_frailty_scale();
+
+            // Both tails of both evaluators come from positive sums that add
+            // to one.
+            for a in [-1.3, 0.0, 0.8] {
+                let grid_tail = |side| {
+                    fx.family
+                        .evaluate_empirical_grid_calibration_tail(a, b, beta_h, beta_w, &fx.grid, side)
+                        .expect("grid calibration tail")
+                };
+                let cell_tail = |side| {
+                    fx.family
+                        .evaluate_denested_calibration_tail(a, b, beta_h, beta_w, side)
+                        .expect("denested calibration tail")
+                };
+                for (label, survival, complement) in [
+                    ("grid", grid_tail(true), grid_tail(false)),
+                    ("cells", cell_tail(true), cell_tail(false)),
+                ] {
+                    assert!(
+                        (survival.tail + complement.tail - 1.0).abs() <= 1e-12,
+                        "kind={is_score_warp} {label} a={a}: tails {:e} + {:e} != 1",
+                        survival.tail,
+                        complement.tail
+                    );
+                    assert_eq!(
+                        survival.density.to_bits(),
+                        complement.density.to_bits(),
+                        "kind={is_score_warp} {label} a={a}: P' is side-independent"
+                    );
+                }
+            }
+
+            let solve = |q: f64, seed: f64| -> (f64, CalibrationTail) {
+                let marginal = fx.family.marginal_link_map(q).expect("marginal link map");
+                let survival_side = marginal.q >= 0.0;
+                let log_target = smaller_tail_log_target(marginal.q);
+                let tail = |a: f64| {
+                    fx.family.evaluate_empirical_grid_calibration_tail(
+                        a,
+                        b,
+                        beta_h,
+                        beta_w,
+                        &fx.grid,
+                        survival_side,
+                    )
+                };
+                let (root, _) = solve_log_tail_root(
+                    seed,
+                    survival_side,
+                    |a| tail(a)?.log_residual(survival_side, log_target),
+                    "deep-tail BMS intercept",
+                    || format!("q={q}"),
+                )
+                .expect("deep-tail root");
+                (root, tail(root).expect("tail at the root"))
+            };
+
+            let q = 7.66;
+            let marginal = fx.family.marginal_link_map(q).expect("marginal link map");
+            let rigid = marginal.q * (1.0 + (scale * b) * (scale * b)).sqrt() / scale;
+            let (root, at_root) = solve(q, rigid);
+            let residual = at_root
+                .log_residual(true, smaller_tail_log_target(marginal.q))
+                .expect("log residual at the root");
+            let root_resolution = 4.0 * residual.rounding / residual.first.abs();
+            // A cached seed from a neighbouring marginal, and seeds on either
+            // side of the root.
+            let (cached, _) = solve(7.5, rigid);
+            for seed in [cached, rigid - 0.75, rigid + 0.75, root + 3.0] {
+                let (other, _) = solve(q, seed);
+                assert!(
+                    (other - root).abs() <= root_resolution,
+                    "kind={is_score_warp} seed={seed}: root {other} vs {root} \
+                     (resolution {root_resolution:e})"
+                );
+            }
+
+            // ∂a/∂q = μ′(q)/P′(a) against the solved root's own motion.
+            let h = 1e-4;
+            let central = (solve(q + h, root).0 - solve(q - h, root).0) / (2.0 * h);
+            let implicit = marginal.mu1 / at_root.density;
+            assert!(
+                (implicit - central).abs() <= 1e-6 * implicit.abs(),
+                "kind={is_score_warp}: implicit da/dq {implicit} vs central {central}"
             );
         }
     }

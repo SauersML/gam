@@ -89,7 +89,7 @@ impl SurvivalMarginalSlopeFamily {
             super::flex_jet::FLEX_ORDER_FOUR_MOMENT_DEGREE,
         )?;
         let (entry_base, entry_ext, exit_base, exit_ext) =
-            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+            self.with_flex_jet_arena(|jet_arena| -> Result<_, String> {
                 let (entry_base, entry_ext) = self
                     .compute_survival_timepoint_directional_jet_from_cached(
                         geometry.row,
@@ -327,7 +327,7 @@ impl SurvivalMarginalSlopeFamily {
         // The directional pack is the Jet3 instance of the canonical timepoint
         // expression.
         let (entry_ext, exit_ext) =
-            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+            self.with_flex_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry_ext) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,
@@ -448,7 +448,7 @@ impl SurvivalMarginalSlopeFamily {
         // Both directional and mixed-directional timepoint extensions instantiate
         // the same expression at Jet3 and Jet4.
         let (entry_ext_u, entry_ext_v, exit_ext_u, exit_ext_v) =
-            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+            self.with_flex_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry_ext_u) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,
@@ -587,7 +587,7 @@ impl SurvivalMarginalSlopeFamily {
         let beta_h = base.beta_h.as_ref();
         let beta_w = base.beta_w.as_ref();
         let directional = |dir: &Array1<f64>| -> Result<_, String> {
-            super::flex_jet::with_flex_third_jet_arena(|jet_arena| -> Result<_, String> {
+            self.with_flex_jet_arena(|jet_arena| -> Result<_, String> {
                 let (_, entry) = self.compute_survival_timepoint_directional_jet_from_cached(
                     base.row,
                     &primary,

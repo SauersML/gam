@@ -3,11 +3,11 @@ use super::*;
 /// The criterion value and iteration count a first-order run ended at, when it ended by
 /// converging or stalling: the ends at which the search may cross into the stratum of a
 /// trial it refused for keeping a different rank (#2765). A budget verdict or a failure
-/// crosses nothing. A run whose every probe was refused stalled where it started.
+/// crosses nothing. A run whose every probe was refused stalled where it started, and
+/// the guard published that start (#3219).
 fn stratum_run_end(
     outcome: &Result<Solution, BfgsError>,
     cost_stall_exit: &Mutex<Option<CostStallExit>>,
-    start_cost: f64,
 ) -> Option<(f64, usize)> {
     match outcome {
         Ok(solution) => Some((solution.final_value, solution.iterations)),
@@ -19,11 +19,6 @@ fn stratum_run_end(
                 .lock()
                 .ok()
                 .and_then(|slot| slot.as_ref().map(|exit| (exit.value, exit.iterations)))
-        }
-        Err(BfgsError::ObjectiveFailed { message })
-            if message.starts_with(PROBE_REFUSAL_FATAL_SENTINEL) =>
-        {
-            Some((start_cost, 0))
         }
         Err(_) => None,
     }
@@ -500,16 +495,16 @@ impl crate::estimate::outer_eval_capture::OuterSeedProbe for RunnerSeedProbe<'_>
 
 /// Execute a single plan attempt (derived start → solver loop → best result).
 ///
-/// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
-/// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
-/// the retry pass itself runs with it `false` so a reseed can never recurse.
+/// `allow_certify_reseed` gates the one-shot retries from a refused
+/// certificate's saddle-escape reseed and from a dominating incumbent; the
+/// retry pass itself runs with it `false` so a reseed can never recurse.
 pub(crate) fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
     cap: &OuterCapability,
     the_plan: &OuterPlan,
-    allow_tail_snap_reseed: bool,
+    allow_certify_reseed: bool,
 ) -> Result<PlanRunOutcome, EstimationError> {
     // Derivative/IFT masking belongs to the model domain, never to a temporary
     // active-set search face. In particular, freezing a model-lower-rail
@@ -535,10 +530,6 @@ pub(crate) fn run_outer_with_plan(
     // it publishes (#2596, #2627). An earlier plan attempt's lowest state starts
     // it (#2953).
     let mut best_checkpoint: Option<OuterResult> = config.carried_checkpoint.clone();
-    // Confirmed-tail snapped reseed published by a refused certification
-    // (#2348 Inc 2b). Consumed once, after the search, for a single polishing
-    // retry pinned at the snapped rail point.
-    let mut tail_snap_reseed_point: Option<Array1<f64>> = None;
     // Negative-curvature escape reseed published by a refused certification
     // whose interior reduced Hessian is a certified strict saddle (#2357).
     // Consumed once, after the search, for a single retry seeded off the saddle
@@ -659,25 +650,23 @@ pub(crate) fn run_outer_with_plan(
         install_matching_initial_inner_seed(obj, config, seed, context)?;
         // Zero-iteration acceptance, decided HERE rather than in the objective.
         //
-        // Whether a start is already stationary is a question about the
-        // stationarity BAND, and the band lives with `OuterConfig`
-        // (`outer_gradient_tolerance`), not with the objective.
+        // Whether a start is already stationary is the outer certificate's
+        // question, judged on the same ladder that minted the prior fit, not
+        // the objective's.
         //
-        // Measured (#2363): a fit resumed from a prior fit's terminal
-        // certificate is stationary where it starts. |Pg| at the resumed rho is
-        // 4.225362e-9 / 6.680405e-8 / 1.369603e-7 on the three estimated-nuisance
-        // fixtures, against a band of 1.61e-5 -- inside by three to four orders
-        // of magnitude. It then takes one outer iteration to go nowhere, which
-        // this skips along with its inner solves.
+        // #2363/#3312: a fit resumed from a prior fit's terminal certificate is
+        // at a point that certificate already accepted for this criterion.
+        // Searching on from it re-derives a point it was handed and lands
+        // somewhere else, so a warm cache would change WHERE the fit landed.
         //
-        // The branch RE-CERTIFIES what it accepts through
+        // The branch CERTIFIES what it claims through
         // `CertifiedOuterCandidate::from_solver_claim` and, when that fails,
         // runs the ordinary search from the same start, so an over-eager
-        // acceptance costs nothing; and it fires only for a rho a previous
-        // outer run already certified as terminal.
+        // claim costs nothing; and it fires only for a rho a previous outer
+        // run already certified as terminal.
         let zero_iteration_cost = match obj.accept_seed_without_outer_iterations(seed)? {
             Some(cost) => Some(cost),
-            None => certified_resume_is_already_stationary(
+            None => claim_prior_terminal_certificate(
                 obj,
                 config,
                 seed,
@@ -1943,7 +1932,6 @@ pub(crate) fn run_outer_with_plan(
                                 value_probe_cache: Vec::new(),
                                 cost_stall: Some(cost_stall_guard),
                                 cost_stall_bounds: Some((lo.clone(), hi.clone())),
-                                consecutive_probe_refusals: 0,
                                 accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
                                 incumbent: Some(OuterIncumbent {
@@ -2106,7 +2094,7 @@ pub(crate) fn run_outer_with_plan(
                         let outcome = optimizer.run();
                         drop(optimizer);
                         let probe = stratum_probe.lock().ok().and_then(|mut slot| slot.take());
-                        let run_end = stratum_run_end(&outcome, &cost_stall_exit, stratum_eval.cost);
+                        let run_end = stratum_run_end(&outcome, &cost_stall_exit);
                         let (Some(from_rank), Some(probe), Some((final_value, run_iterations))) =
                             (stratum_rank, probe, run_end)
                         else {
@@ -2320,21 +2308,6 @@ pub(crate) fn run_outer_with_plan(
                                 ))),
                             }
                         }
-                        Err(BfgsError::ObjectiveFailed { message })
-                            if message.starts_with(PROBE_REFUSAL_FATAL_SENTINEL) =>
-                        {
-                            // The bridge's probe-refusal non-termination guard
-                            // (#NaN-outer-loop): every line-search cost probe at
-                            // this seed was infeasible, so BFGS would have spent
-                            // its entire max_iterations budget on inner solves
-                            // that all fail. Route as a seed rejection so the
-                            // cascade tries the next seed instead of propagating
-                            // a fatal error.
-                            Err(EstimationError::RemlOptimizationFailed(format!(
-                                "BFGS aborted: globally infeasible neighbourhood \
-                                 at seed (probe-refusal guard): {message}"
-                            )))
-                        }
                         Err(BfgsError::ObjectiveFailed { message }) => {
                             Err(objective_failure_from_publication(
                                 "outer BFGS evaluation",
@@ -2488,7 +2461,6 @@ pub(crate) fn run_outer_with_plan(
                             "[OUTER] {context}: solver convergence claim failed analytic \
                              certification: {error}; retaining only a resume checkpoint"
                         );
-                        tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
                         saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
                         retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                         seed_rejections.push(SeedRejection::from_estimation_error(
@@ -2534,7 +2506,7 @@ pub(crate) fn run_outer_with_plan(
     // envelope, [`outer_value_agreement_bound`], because two values of one
     // criterion closer than that cannot be ranked. Beyond it the winner loses.
     // The search continues once from the incumbent, with the same one-shot reseed
-    // the tail-snap and saddle-escape retries use. If that does not certify, the
+    // the saddle-escape retry uses. If that does not certify, the
     // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
     // incumbent is the resume checkpoint. When the objective refuses to
     // re-evaluate the incumbent, its stored value, the criterion's own evaluation
@@ -2616,7 +2588,7 @@ pub(crate) fn run_outer_with_plan(
                 DominanceContinuationStop::NotRun
             }
         };
-        if allow_tail_snap_reseed && reevaluated {
+        if allow_certify_reseed && reevaluated {
             let mut retry_config = config.clone();
             // The continuation judges what it certifies against the state it starts from, so it
             // cannot publish the optimum that state just beat (#2953).
@@ -2766,46 +2738,16 @@ pub(crate) fn run_outer_with_plan(
         return Ok(PlanRunOutcome::Converged(result));
     }
 
-    // #2348 Inc 2b: a refused certification CONFIRMED an exponential tail
-    // (probing passed) but the interior was still unpolished — the budget died
-    // mid-crawl while the interior tracked the crawling tail coordinate.
-    // Retry ONCE seeded at the snapped rail point: the box projection pins the
-    // tail coordinate at its bound while the interior converges in its few
-    // remaining Newton steps, and the Inc 1 railed mint then certifies through
-    // the natural path. The retry pass runs with the reseed gate closed, so
-    // this can never recurse; a failed retry falls back to the original
-    // exhaustion accounting.
-    if allow_tail_snap_reseed && let Some(reseed) = tail_snap_reseed_point {
-        log::debug!(
-            "[OUTER] {context}: retrying once from the confirmed-tail snapped \
-             reseed {reseed} (#2348 Inc 2b)"
-        );
-        let mut retry_config = config.clone();
-        retry_config.initial_rho = Some(reseed);
-        obj.reset();
-        match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
-            Ok(outcome) => {
-                return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
-            }
-            Err(retry_error) => {
-                log::debug!(
-                    "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
-                     falling through to the original exhaustion accounting"
-                );
-            }
-        }
-    }
-
     // #2357 — saddle escape. A refused certification identified an interior
     // strict saddle (first-order stationary, indefinite curvature, no rail) and
     // published a negative-curvature escape point strictly below it. Retry ONCE
     // seeded there: the outer search resumes off the saddle ridge and descends
     // to the true PSD minimum — the deterministic form of the identical
     // warm-started resume that converges where the cold run refuses. The retry
-    // pass runs with the reseed gate closed (`allow_tail_snap_reseed = false`),
+    // pass runs with the reseed gate closed (`allow_certify_reseed = false`),
     // so it can never recurse; a failed retry falls back to the original
     // exhaustion accounting.
-    if allow_tail_snap_reseed && let Some(reseed) = saddle_escape_reseed_point {
+    if allow_certify_reseed && let Some(reseed) = saddle_escape_reseed_point {
         log::debug!(
             "[OUTER] {context}: retrying once from the negative-curvature saddle-escape \
              reseed {reseed} (#2357)"
@@ -2936,15 +2878,16 @@ mod run_fixed_point_continuation_tests;
 #[path = "run_trial_inner_nonconvergence_retreat_2943_tests.rs"]
 mod run_trial_inner_nonconvergence_retreat_2943_tests;
 
-/// Is `seed` a prior fit's terminal certificate that is STILL stationary here?
+/// Is `seed` a prior fit's terminal certificate for THIS search's criterion?
 ///
 /// `Some(cost)` only when all of: the seed is the resumed rho itself; a first
-/// order evaluation succeeds and is finite; on a resume attempt
-/// (`OuterConfig::resume_value`) its value agrees with the recorded one; and the
-/// rail-projected gradient sits inside the band the outer certificate demands. Anything else is `None` and
-/// the ordinary seed cascade runs. This refuses by default and never turns an
-/// evaluation failure into an acceptance.
-fn certified_resume_is_already_stationary(
+/// order evaluation succeeds and is finite; and on a resume attempt
+/// (`OuterConfig::resume_value`) its value agrees with the recorded one.
+/// Anything else is `None` and the ordinary seed cascade runs. `Some` is a claim,
+/// not an acceptance: every caller passes it to the outer certificate, which
+/// judges stationarity on the same ladder that minted the prior fit. This
+/// refuses by default and never turns an evaluation failure into a claim.
+fn claim_prior_terminal_certificate(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     seed: &Array1<f64>,
@@ -2984,18 +2927,20 @@ fn certified_resume_is_already_stationary(
         );
         return None;
     }
+    // Whether the point is still stationary is the certificate's question, and
+    // every caller hands the claim straight to it
+    // (`CertifiedOuterCandidate::from_solver_claim`). A first-order band judged
+    // here would be a second, stricter standard: the prior fit was minted on the
+    // certificate's whole ladder (the Newton-decrement verdict, the
+    // curvature-resolvability rung), and #3312 measured the gamma, Tweedie and
+    // Beta estimated-nuisance fits certified at |Pg| = 1.65e-3 / 3.08e-2 /
+    // 3.55e-2 and then declined here against the absolute band 1.61e-5, so the
+    // warm arm searched on from its own certified optimum and landed elsewhere.
     let projected = rail_projected_gradient_norm(seed, &eval.gradient, Some(bounds_template));
-    let band = outer_gradient_tolerance(config).threshold(eval.cost, projected);
-    if projected > band {
-        log::trace!(
-            "[OUTER] {context}: resumed terminal certificate seed {seed_idx} is not stationary \
-             here (|Pg|={projected:.6e} > band {band:.6e}); running the ordinary cascade"
-        );
-        return None;
-    }
     log::debug!(
-        "[OUTER] {context}: seed {seed_idx} is a prior fit's terminal certificate and is still \
-         stationary (|Pg|={projected:.6e} <= band {band:.6e}); accepting with zero outer iterations"
+        "[OUTER] {context}: seed {seed_idx} is a prior fit's terminal certificate for this \
+         criterion (|Pg|={projected:.6e}); claiming it with zero outer iterations for the \
+         certificate to re-judge"
     );
     Some(eval.cost)
 }
@@ -3005,7 +2950,7 @@ fn certified_resume_is_already_stationary(
 ///
 /// The point is accepted exactly as the seed loop accepts a still-stationary
 /// terminal certificate, with no outer iteration: certified for this search's
-/// criterion (`certified_resume_is_already_stationary`), then screened by the
+/// criterion (`claim_prior_terminal_certificate`), then screened by the
 /// analytic certificate and installed as the terminal state, and `run_outer`
 /// mints it as it mints every plan's winner. Anything else declines with an
 /// error. No plan runs, so no reseed, fallback or retry can search from the
@@ -3031,7 +2976,7 @@ pub(crate) fn resume_prior_certificate(
     obj.reset();
     install_matching_initial_inner_seed(obj, config, &seed, context)?;
     let cost =
-        certified_resume_is_already_stationary(obj, config, &seed, &bounds_template, 0, context)
+        claim_prior_terminal_certificate(obj, config, &seed, &bounds_template, 0, context)
             .ok_or_else(|| {
                 declined("the point is not certified for this search's criterion".to_string())
             })?;

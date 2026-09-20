@@ -304,7 +304,10 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// transfer, or validation failure; the dispatcher must not substitute the
     /// per-row CPU algorithm after that selection. The batched result MUST be
     /// bit-close (≤1e-9) to the per-row path because it runs the same unified
-    /// row program on device.
+    /// row program on device. An override whose `auto` decision races an
+    /// untimed shape (gam#3024) runs [`evaluate_every_row`] against its
+    /// accelerator pass through `gam_gpu::race_row_kernel` and returns the
+    /// per-row result as `Some(Ok(_))`.
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String>> {
@@ -698,6 +701,80 @@ pub struct RowKernelCache<const K: usize> {
     pub hessians: Vec<[[f64; K]; K]>,
 }
 
+/// Write every row's `(nll, gradient, Hessian)` into its `n`-length slots
+/// through the per-row `row_kernel(row)` loop. This is the CPU executor of the
+/// full-data cache build, and the one a batched accelerator pass races against
+/// (gam#3024).
+pub(crate) fn evaluate_every_row_into<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    nll: &mut [f64],
+    gradients: &mut [[f64; K]],
+    hessians: &mut [[[f64; K]; K]],
+) -> Result<(), String> {
+    let n = kern.n_rows();
+    let progress_ticker =
+        (n >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
+    // Pool-aware block size (issue #1045): a few-per-worker partition of
+    // the row range instead of one task per 256-row arrow tile, so the
+    // light per-row jet build does not pay `n/256` task entries of
+    // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
+    // is bit-identical — every slot is written by its absolute row index.
+    let block_rows = cache_build_chunk_rows(n);
+    let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
+        (0..cache_build_block_count(n, block_rows))
+            .into_par_iter()
+            .map(|block_idx| {
+                let start = block_idx * block_rows;
+                let end = (start + block_rows).min(n);
+                let mut chunk = Vec::with_capacity(end - start);
+                let mut block_progress = progress_ticker.as_ref().map(|ticker| {
+                    ticker.chunk(|progress, elapsed| {
+                        log::debug!(
+                            "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                            progress.min(n),
+                            n,
+                            100.0 * progress.min(n) as f64 / n.max(1) as f64,
+                            elapsed,
+                            rayon::current_num_threads(),
+                        );
+                    })
+                });
+                for row in start..end {
+                    let out = kern.row_kernel(row)?;
+                    if let Some(block_progress) = block_progress.as_mut() {
+                        block_progress.advance(1);
+                    }
+                    chunk.push(out);
+                }
+                Ok(chunk)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
+        let start = block_idx * block_rows;
+        for (local, (l, g, h)) in chunk.into_iter().enumerate() {
+            let i = start + local;
+            nll[i] = l;
+            gradients[i] = g;
+            hessians[i] = h;
+        }
+    }
+    Ok(())
+}
+
+/// Every row's `(nll, gradient, Hessian)` through the per-row loop
+/// ([`evaluate_every_row_into`]), as the three `n`-length channels a batched
+/// pass returns.
+pub(crate) fn evaluate_every_row<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+) -> Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String> {
+    let n = kern.n_rows();
+    let mut nll = vec![0.0_f64; n];
+    let mut gradients = vec![[0.0_f64; K]; n];
+    let mut hessians = vec![[[0.0_f64; K]; K]; n];
+    evaluate_every_row_into(kern, &mut nll, &mut gradients, &mut hessians)?;
+    Ok((nll, gradients, hessians))
+}
+
 /// Build the cache by evaluating all row kernels in parallel over the
 /// supplied [`RowSet`].
 ///
@@ -756,50 +833,7 @@ pub fn build_row_kernel_cache<const K: usize>(
                     hessians: bh,
                 });
             }
-            // Pool-aware block size (issue #1045): a few-per-worker partition of
-            // the row range instead of one task per 256-row arrow tile, so the
-            // light per-row jet build does not pay `n/256` task entries of
-            // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
-            // is bit-identical — every slot is written by its absolute row index.
-            let block_rows = cache_build_chunk_rows(n);
-            let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
-                (0..cache_build_block_count(n, block_rows))
-                    .into_par_iter()
-                    .map(|block_idx| {
-                        let start = block_idx * block_rows;
-                        let end = (start + block_rows).min(n);
-                        let mut chunk = Vec::with_capacity(end - start);
-                        let mut block_progress = progress_ticker.as_ref().map(|ticker| {
-                            ticker.chunk(|progress, elapsed| {
-                                log::debug!(
-                                    "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                    progress.min(n),
-                                    n,
-                                    100.0 * progress.min(n) as f64 / n.max(1) as f64,
-                                    elapsed,
-                                    rayon::current_num_threads(),
-                                );
-                            })
-                        });
-                        for row in start..end {
-                            let out = kern.row_kernel(row)?;
-                            if let Some(block_progress) = block_progress.as_mut() {
-                                block_progress.advance(1);
-                            }
-                            chunk.push(out);
-                        }
-                        Ok(chunk)
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-            for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
-                let start = block_idx * block_rows;
-                for (local, (l, g, h)) in chunk.into_iter().enumerate() {
-                    let i = start + local;
-                    nll[i] = l;
-                    gradients[i] = g;
-                    hessians[i] = h;
-                }
-            }
+            evaluate_every_row_into(kern, &mut nll, &mut gradients, &mut hessians)?;
         }
         RowSet::Subsample { rows: list, .. } => {
             // Evaluate only the sampled rows in parallel; scatter into

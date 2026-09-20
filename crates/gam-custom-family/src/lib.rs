@@ -150,6 +150,7 @@ mod jeffreys;
 mod jeffreys_arming;
 mod joint_derivatives;
 mod joint_newton;
+mod mode_selection;
 mod outer_objective;
 mod penalty_labels;
 mod psi_design;
@@ -184,6 +185,7 @@ pub use jeffreys_arming::{
 pub(crate) use jeffreys::*;
 pub(crate) use joint_derivatives::*;
 pub use joint_newton::*;
+pub(crate) use mode_selection::*;
 pub(crate) use outer_objective::*;
 pub(crate) use penalty_labels::*;
 // ψ design-derivative operators / actions / joint-ψ operator / resolvers

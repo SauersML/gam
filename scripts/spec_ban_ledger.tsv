@@ -15,11 +15,6 @@
 box	crates/gam-model-api/src/families/custom_family/options.rs	const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-models/src/fit_orchestration/drivers/design_construction.rs	clamp(+-limit)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs	const SPATIAL_PSI_BFGS_STEP_CAP	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/assignment.rs	const SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/estimate/optimizer.rs	smooth_bound_support(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902
@@ -31,10 +26,6 @@ box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://g
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_U_CLAMP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/quadrature.rs	clamp(+-QUADRATURE_EXP_LOG_MAX)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/quadrature.rs	clamp(+-QUADRATURE_EXP_LOG_MAX)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/per_atom_efs.rs	clamp(+-PER_ATOM_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-solve/src/reml/per_atom_efs.rs	const PER_ATOM_MAX_STEP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	clamp(+-EFS_MAX_STEP)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/reml/reml_outer_engine/efs.rs	const EFS_MAX_STEP	https://github.com/SauersML/gam/issues/2902
@@ -46,7 +37,6 @@ jitter	crates/gam-sae/src/manifold/minimal_seed.rs	const RANDOM_STATE_LOGIT_JITT
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	const SAE_RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
 magic	crates/gam-custom-family/src/covariance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-custom-family/src/inner_blockwise_fit.rs	< 1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-custom-family/src/joint_newton.rs	<= 1e-3	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-event-history/src/static_state.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
@@ -76,7 +66,6 @@ magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://
 magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/joint_latent_law.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/predict.rs	.max(1.0e-9)	https://github.com/SauersML/gam/issues/2469

@@ -1,11 +1,14 @@
-//! `Φ₂` with a relative a-priori error bound at plain-evaluation cost, through one route per quantity (#3158).
+//! `Φ₂` with a relative a-priori error bound at plain-evaluation cost, through one route per quantity (#3158, #3226,
+//! #3253).
 //!
 //! # Tree
 //!
-//! With `n₁ = h − ρk` and `n₂ = k − ρh`, every orthant is a positive term or a difference led by `Φ` of a both-active
-//! orthant, one whose constraints both have `nᵢ ≤ 0`:
+//! With `n₁ = h − ρk` and `n₂ = k − ρh`, every orthant is a positive term, or at `ρ > 0` a difference led by `Φ`, of
+//! both-active orthants, ones whose constraints both have `nᵢ ≤ 0`:
 //! - both `nᵢ ≤ 0`: `Φ₂(h, k; ρ)` itself;
-//! - only `n₁ ≤ 0`: `Φ(h) − Φ₂(h, −k; −ρ)`, and symmetrically for `n₂`;
+//! - only `n₁ ≤ 0`, `ρ < 0`: the both-active orthant at the foot `(h, ρh)` of the active edge, plus the mass between the
+//!   foot and `k`, the foot's leaf integral continued past its apex (`edge`), and symmetrically for `n₂`;
+//! - only `n₁ ≤ 0`, `ρ > 0`: `Φ(h) − Φ₂(h, −k; −ρ)`, and symmetrically for `n₂`;
 //! - neither: `P(−k ≤ Z ≤ h) + Φ₂(−h, −k; ρ)`, where `n₁ + n₂ = (1 − ρ)(h + k) > 0` makes the interval positive.
 //!
 //! A both-active orthant with `ρ > 0` splits as `Φ₂(u*, k; −ĉ) + Φ₂(−u*, h; −ĉ)`, with `ĉ = √((1 − ρ)/2)` and
@@ -33,19 +36,18 @@
 //!
 //! # Rounding
 //!
-//! The bound is first order in `u`, the core's model: the cited `libm::exp` contract (libm 0.2.16,
+//! The bound is first order in `u`, the parent module's model: the cited `libm::exp` contract (libm 0.2.16,
 //! `src/math/exp.rs:58-60`, pinned by `the_cited_libm_is_the_locked_one`), [`NORMAL_SCALED_TAIL_RELATIVE_ERROR`] and
 //! [`NORMAL_CDF_RELATIVE_ERROR`] for `R` and `Φ`, and the certified rule's node and weight errors. A count of `k`
 //! rounded operations is carried as Wilkinson's `γ_k`. Only a straddling interval `P(lo ≤ Z ≤ hi)` with `lo < 0 < hi`
-//! calls `erf`, charged the one ulp the core charges its `erfc`, a measurement of the platform library.
+//! calls `erf`, charged one ulp, a measurement of the platform library.
 //!
-//! A leaf's bound, and a sum's, scales with its value. A difference's bound scales with its minuend `Φ(h)`. Its
-//! subtrahend is `P(X ≤ h, Y > k)` with `n₂ = k − ρh > 0`.
-//! - For `ρ > 0` every `x ≤ h` has its conditional mean `ρx ≤ ρh < k`, so the subtrahend is below `Φ(h)/2` and the
-//!   minuend is below twice the result.
-//! - For `ρ < 0` the conditional mean `ρx` grows as `x` falls. With `h = −H`, the branch is `|ρ|H < k ≤ H/|ρ|`, and as
-//!   `ρ → −1` with `k` near `H` the result `≈ P(−k ≤ X ≤ −H)` is a small part of `Φ(h)`. The bound then carries the
-//!   ratio `Φ(h)/Φ₂`: it stays a valid bound, not a relative one.
+//! A leaf's bound, an edge's and a sum's scale with the value. A difference's bound scales with its minuend `Φ(h)`, and
+//! the tree takes one only at `ρ > 0`: its subtrahend is `P(X ≤ h, Y > k)` with `n₂ = k − ρh > 0`, and every `x ≤ h` has
+//! its conditional mean `ρx ≤ ρh < k`, so the subtrahend is below `Φ(h)/2` and the minuend is below twice the result.
+//! At `ρ < 0` the conditional mean `ρx` grows as `x` falls. With `h = −H`, the branch is `|ρ|H < k ≤ H/|ρ|`, and as
+//! `ρ → −1` with `k` near `H` the result `≈ P(−k ≤ X ≤ −H)` is a vanishing part of `Φ(h)`, so the difference there
+//! would carry the ratio `Φ(h)/Φ₂`. The edge form carries the value itself.
 
 use super::{BoundedProbability, Correlation, density};
 use crate::double_double::SMALLEST_SUBNORMAL;
@@ -55,7 +57,7 @@ use crate::probability::{
 };
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth as growth, inflated};
 use crate::special::{CertifiedGaussLegendreRule, gauss_legendre_certified};
-use std::f64::consts::{FRAC_1_SQRT_2, LN_2};
+use std::f64::consts::{FRAC_1_SQRT_2, LN_2, PI};
 use std::sync::{Arc, RwLock};
 
 /// The ellipse log-radius `S₀`, the root of `s·tanh(s/2) = 1`, where `(1 + cosh s)/s` is least. The truncation's
@@ -164,8 +166,50 @@ fn ellipse_log_bound(length: f64, slopes: (f64, f64), curvatures: (f64, f64)) ->
     left.max(right) + growth(16) * magnitude
 }
 
+/// An upper bound on `ln(|g|/R(a))` over the Bernstein ellipse of `[0, L]` at log-radius [`LOG_RADIUS`], for an
+/// extension's `g(s) = e^{bs − s²/2} R(a − τs)` ([`extension`]).
+///
+/// With `|R(z)| ≤ R(Re z)` and `|e^{−s²/2}| = e^{((Im s)² − (Re s)²)/2}`, a point `s = C + Au + iB√(1 − u²)` has
+/// `ln|g| − ln R(a) ≤ q(C + Au) + B²(1 − u²)/2`, a quadratic in `u` between the knots of `q` at `Re s = 0` and `V`:
+/// - `Re s ≤ 0`: `R`'s argument is at least `a` and `R` decreases, so `q = b_lo·x − x²/2`;
+/// - `0 ≤ Re s ≤ V`: `μ ≤ μ(a − τV)` along the argument, so `q = κx − x²/2` with `κ = b_hi + τμ(a − τV)`;
+/// - `Re s ≥ V`: past the ray's end `(ln R)'' ≤ 1` adds `τ²(x − V)²/2`.
+///
+/// The terms are at most `mag` in size, so their rounding is within `γ₁₆·mag`.
+fn extension_ellipse_log_bound(length: f64, slope_lo: f64, rise: f64, tau: f64, reach: f64) -> f64 {
+    let centre = 0.5 * length;
+    let major = centre * LOG_RADIUS.cosh();
+    let minor = centre * LOG_RADIUS.sinh();
+    // `q(x) = p₂x² + p₁x + p₀` at `x = C + Au`, plus `B²(1 − u²)/2`.
+    let quadratic = |p2: f64, p1: f64, p0: f64| {
+        [
+            p2 * major * major - 0.5 * minor * minor,
+            (2.0 * p2 * centre + p1) * major,
+            (p2 * centre + p1) * centre + p0 + 0.5 * minor * minor,
+        ]
+    };
+    let origin = -centre / major;
+    let end = (reach - centre) / major;
+    let mut bound = quadratic_max(quadratic(-0.5, slope_lo, 0.0), -1.0, origin).max(quadratic_max(
+        quadratic(-0.5, rise, 0.0),
+        origin,
+        end.min(1.0),
+    ));
+    let span = major + centre;
+    let mut magnitude = minor * minor + major * major + span * (slope_lo.abs() + rise.abs());
+    // The ray's end lies inside the ellipse's real extent only when `V < C + A`, so `V` enters no term otherwise.
+    if end < 1.0 {
+        let squared = tau * tau;
+        let past = quadratic(-0.5 * (1.0 - squared), rise - squared * reach, 0.5 * squared * reach * reach);
+        bound = bound.max(quadratic_max(past, end, 1.0));
+        magnitude += squared * (span * reach + (span + reach) * (span + reach));
+    }
+    bound + growth(16) * magnitude
+}
+
 /// Absolute errors of a leaf's inputs against the orthant it stands for: `h` and `τ` absolute, the complement relative
-/// to `1 − τ²` of the computed `τ`. A caller's leaf has none. A split leaf's `u*`, `ĉ` and `(1 + ĉ)(1 − ĉ)` round.
+/// to `1 − τ²` of the computed `τ`. A caller's leaf carries only its correlation's complement error: `γ₃` for
+/// `(1 − ρ)(1 + ρ)` formed from `ρ`, none for a caller's complement. A split leaf's `u*`, `ĉ` and `(1 + ĉ)(1 − ĉ)` round.
 #[derive(Clone, Copy, Default)]
 struct Perturbation {
     h: f64,
@@ -290,21 +334,160 @@ fn leaf(h: f64, k: f64, correlation: Correlation, perturbation: Perturbation) ->
 }
 
 /// A both-active orthant: a leaf when `ρ ≤ 0`, the two split leaves otherwise.
-/// - `ĉ = √½·√(1 − ρ)` errs by at most `γ₃` of itself: the factor, both products and `√`.
-/// - `u* = (h − k)/(2ĉ)` then errs by `γ₅|u*|`, and the piece's `(1 + ĉ)(1 − ĉ)` by `γ₃` of `1 − ĉ²`.
+/// - The correlation carries `1 − ρ` within `γ₂`: formed from `ρ` (exact for `ρ ≥ ½` by Sterbenz, `u` otherwise), or as
+///   the caller's complement over the rounded `1 + |ρ|`. So `ĉ = √½·√(1 − ρ)` errs by at most `γ₄` of itself: that
+///   factor's error halved by the root, the constant, `√` and the product.
+/// - `u* = (h − k)/(2ĉ)` then errs by `γ₆|u*|`, and the piece's `(1 + ĉ)(1 − ĉ)` by `γ₃` of `1 − ĉ²`.
 fn both_active(h: f64, k: f64, correlation: Correlation) -> BoundedProbability {
     if correlation.rho <= 0.0 {
-        return leaf(h, k, correlation, Perturbation::default());
+        let perturbation = Perturbation {
+            complement: correlation.complement_error,
+            ..Perturbation::default()
+        };
+        return leaf(h, k, correlation, perturbation);
     }
     let half_gap = FRAC_1_SQRT_2 * correlation.one_minus.sqrt();
     let split = (h - k) / (2.0 * half_gap);
     let piece = Correlation::from_rho(-half_gap);
     let perturbation = Perturbation {
-        h: growth(5) * split.abs(),
-        tau: growth(3) * half_gap,
-        complement: growth(3),
+        h: growth(6) * split.abs(),
+        tau: growth(4) * half_gap,
+        complement: piece.complement_error,
     };
     sum(leaf(split, k, piece, perturbation), leaf(-split, h, piece, perturbation))
+}
+
+/// An orthant with `ρ < 0` whose constraint `Y ≤ k` is inactive, `n₁ = h − ρk ≤ 0 < n₂ = k − ρh` (#3226). Then `h < 0`,
+/// and the active edge `X = h` is nearest the origin at its foot `(h, ρh)`. The orthant is the both-active orthant at the
+/// apex `(h, y)`, `y = min(ρh, k)` as computed, plus the mass `P(X ≤ h, y < Y ≤ k)` between the apex and `k`
+/// ([`extension`]). The split is exact at any `y`. Both parts are positive, so the bound scales with the value, where the
+/// difference `Φ(h) − Φ₂(h, −k; −ρ)` carries the ratio `Φ(h)/Φ₂`, which grows without bound as `ρ → −1` with `k ≈ −h`.
+fn edge(h: f64, k: f64, correlation: Correlation) -> BoundedProbability {
+    let apex = (correlation.rho * h).min(k);
+    let foot = both_active(h, apex, correlation);
+    if apex == k {
+        return foot;
+    }
+    sum(foot, extension(h, apex, k, correlation))
+}
+
+/// `P(X ≤ h, apex < Y ≤ k)` above a both-active apex `(h, apex)` with `ρ = −τ < 0`, where the orthant's own constraint
+/// `n₁ = h + τk` is active: the apex's leaf integral (module docs) continued back past the apex along `w ∈ [−V, 0]`,
+/// `V = (k − apex)/√c`, to the edge `Y = k`.
+///
+/// With `s = −w` and the apex's `a = −(h + τ·apex)/√c`, `b = −(apex + τh)/√c`, the mass is `c·φ₂(h, apex)·J` with
+/// `J = ∫₀^V g`, `g(s) = e^{bs − s²/2} R(a − τs)`. The ray ends at `a − τV = −n₁/√c ≥ 0`, so `R`'s argument never goes
+/// below it: `R` decreases along the ray, and nothing cancels.
+/// - **Floor.** `R(a − τs) ≥ R(a)`, so `J ≥ R(a)·G` with `G = ∫₀^V e^{bs − s²/2} ds`. The integrand is least at an end,
+///   so `G ≥ V·min(1, e^{bV − V²/2})`, and `G = √(2π) e^{b²/2} P(−b ≤ Z ≤ V − b)`; the floor is the larger of the two.
+/// - **Tail.** `μ` decreases, so on `[0, V]`, `ln R(a − τs) − ln R(a) ≤ τμ(a − τV)·s`, and the mass past `T` is at most
+///   `R(a) e^{−(T²/2 − κT)}/(T − κ)`, with `κ = b + τμ(a − τV)`. `T` solves `T²/2 − κT = L`, `L = ln(2/u) − ln G`, so
+///   the tail is `u/2` of the floor, raised as at [`tail_length`]. The rule runs on `[0, min(V, T)]`.
+/// - **Rule.** As at [`leaf`], with the ellipse bound of [`extension_ellipse_log_bound`], relative to the floor.
+/// - **Rounding.** `a`, `b` and `V` err by `γ₃` of themselves, and move `ln J` by at most `μ(a − τV)`, `V` and
+///   `g(V)/J ≤ e^{κV − V²/2}/G` per unit. A caller's complement error moves `c` by itself, the density's exponent `E`, and
+///   `a`, `b`, `V` by half of it. Each node's position, exponent, `exp`, ratio argument and value, and the products round.
+fn extension(h: f64, apex: f64, k: f64, correlation: Correlation) -> BoundedProbability {
+    let (density_value, density_error) = density(h, apex, correlation);
+    if density_value == 0.0 {
+        // The mass lies in `{X ≤ h}`, so it is at most `Φ(h)` within the table route's bound. The apex density
+        // `e^{−(h² + b²)/2}/(2π√c)` underflows only past `(h² + b²)/2 ≈ 745`, where `b` is the apex's rounding over `√c`.
+        let marginal = normal_cdf_bounded(h);
+        return BoundedProbability {
+            value: 0.0,
+            rounding: marginal.value + marginal.rounding,
+        };
+    }
+    let tau = -correlation.rho;
+    let complement = correlation.complement;
+    let root = complement.sqrt();
+    let (first, second) = (tau.mul_add(apex, h), tau.mul_add(h, apex));
+    let exponent = 0.5 * (first * first / complement + apex * apex);
+    let (a, b) = (-first / root, -second / root);
+    let reach = (k - apex) / root;
+    let (a_error, b_error, reach_error) = (growth(3) * a.abs(), growth(3) * b.abs(), growth(3) * reach);
+    // The ray's last Mills-ratio argument, less its rounding, bounds `μ` along the ray.
+    let end = (-tau).mul_add(reach, a);
+    let end_error = growth(1) * end.abs() + a_error + tau * reach_error;
+    let mu_end = mean_excess_bound(end - end_error);
+    let (slope_lo, slope_hi) = (b - b_error, b + b_error);
+    // `κ`, rounded up: the sum and the product.
+    let rise = slope_hi + tau * mu_end + growth(2) * (slope_hi.abs() + tau * mu_end);
+
+    if 0.5 * reach == 0.0 {
+        // A ray below twice the smallest subnormal: `J ≤ V·R(a − τV)·e^{κV}`, with `R` at most `π/2` at an argument within
+        // rounding of zero and `κV` within rounding of zero, so `J ≤ πV`.
+        return BoundedProbability {
+            value: 0.0,
+            rounding: inflated(complement * (density_value + density_error) * PI * reach, 8),
+        };
+    }
+    let pointwise = reach * libm::exp((slope_lo * reach - 0.5 * reach * reach).min(0.0));
+    let mass = signed_interval(-b, reach - b);
+    let closed = SQRT_2PI * libm::exp(0.5 * b * b) * (mass.value - mass.rounding);
+    let floor = pointwise.max(closed) * (1.0 - growth(8));
+    let level = 54.0 * LN_2 - floor.ln();
+    let cutoff = tail_length(-rise, 1.0, level);
+    let (length, tail_relative) = if cutoff < reach {
+        let tail_exponent = 0.5 * cutoff * cutoff - rise * cutoff;
+        let tail_scale = rise.abs() * cutoff + 0.5 * cutoff * cutoff;
+        let tail_rate = cutoff - rise;
+        let relative = libm::exp(-tail_exponent + growth(4) * tail_scale) / (tail_rate * (1.0 - growth(2))) / floor;
+        (cutoff, inflated(relative, 6))
+    } else {
+        (reach, 0.0)
+    };
+
+    let log_max = extension_ellipse_log_bound(length, slope_lo, rise, tau, reach);
+    let decay = libm::expm1(2.0 * LOG_RADIUS);
+    let span = 32.0 * length / 15.0;
+    let order = ((log_max + span.ln() - decay.ln() + level) / (2.0 * LOG_RADIUS))
+        .ceil()
+        .max(1.0) as usize;
+    let quadrature_relative = inflated(
+        libm::exp(log_max - 2.0 * order as f64 * LOG_RADIUS) * span / (decay * (1.0 - growth(3))) / floor,
+        8,
+    );
+
+    let rule = rule_of_order(order);
+    let centre = 0.5 * length;
+    let (mut sum, mut sum_error) = (0.0, 0.0);
+    for (&node, &weight) in rule.nodes.iter().zip(&rule.weights) {
+        let s = centre * (1.0 + node);
+        let damping = libm::exp(s * (b - 0.5 * s));
+        let (ratio, ratio_error) = mills_ratio((-tau).mul_add(s, a));
+        let term = weight * (damping * ratio);
+        // The node's position, the exponent, `exp`, the ratio's argument and value, and the product.
+        let relative = (b.abs() + s + tau * mu_end) * (centre * rule.node_error + growth(2) * s)
+            + 2.0 * UNIT_ROUNDOFF
+            + growth(2) * s * (b.abs() + 0.5 * s)
+            + mu_end * growth(1) * (a.abs() + tau * s)
+            + ratio_error
+            + 2.0 * UNIT_ROUNDOFF;
+        sum += term;
+        sum_error += term * relative;
+    }
+    let integral = centre * sum;
+
+    let end_gain = inflated(libm::exp(rise * reach - 0.5 * reach * reach) / floor, 4);
+    let complement_gain = 1.0 + exponent + 0.5 * (mu_end * a.abs() + reach * b.abs() + end_gain * reach);
+    let relative = tail_relative
+        + quadrature_relative
+        + rule.weight_relative_error
+        + growth(order + 1)
+        + sum_error / sum
+        + growth(1)
+        + mu_end * a_error
+        + reach * b_error
+        + end_gain * reach_error
+        + complement_gain * correlation.complement_error
+        + growth(2);
+    let value = complement * density_value * integral;
+    let rounding = value * relative + complement * integral * density_error + SMALLEST_SUBNORMAL * (1.0 + integral);
+    BoundedProbability {
+        value,
+        rounding: inflated(rounding, 8),
+    }
 }
 
 /// `Φ(x)` within [`NORMAL_CDF_RELATIVE_ERROR`] of itself, plus [`NORMAL_CDF_UNDERFLOW_FLOOR`].
@@ -393,6 +576,8 @@ pub(super) fn orthant(h: f64, k: f64, correlation: Correlation) -> BoundedProbab
         let (first, second) = (h - rho * k, k - rho * h);
         match (first <= 0.0, second <= 0.0) {
             (true, true) => both_active(h, k, correlation),
+            (true, false) if rho < 0.0 => edge(h, k, correlation),
+            (false, true) if rho < 0.0 => edge(k, h, correlation),
             (true, false) => difference(normal_cdf_bounded(h), both_active(h, -k, correlation.negated())),
             (false, true) => difference(normal_cdf_bounded(k), both_active(-h, k, correlation.negated())),
             (false, false) => sum(signed_interval(-k, h), both_active(-h, -k, correlation)),
@@ -407,12 +592,10 @@ pub(super) fn orthant(h: f64, k: f64, correlation: Correlation) -> BoundedProbab
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bivariate_normal::{
-        BIVARIATE_NORMAL_CDF_ERROR_BOUND, bivariate_normal_cdf_with_complement, bivariate_normal_interval_probability,
-    };
+    use crate::bivariate_normal::{bivariate_normal_cdf, bivariate_normal_interval_probability};
 
-    /// `(h, k, ρ, Φ₂)` from #3158's table: rare-event binomial cells whose `Φ₂` the core's absolute bound leaves with no
-    /// digit. Truths by 60-digit piecewise Gauss-Legendre of `∫_{−∞}^h φ(x)Φ((k − ρx)/√(1 − ρ²)) dx` over 400 panels.
+    /// `(h, k, ρ, Φ₂)` from #3158's table: rare-event binomial cells whose `Φ₂` the former core's absolute bound left with
+    /// no digit. Truths by 60-digit piecewise Gauss-Legendre of `∫_{−∞}^h φ(x)Φ((k − ρx)/√(1 − ρ²)) dx` over 400 panels.
     const ISSUE_TABLE: &[(f64, f64, f64, f64)] = &[
         (-11.464024688443615, 0.5, -0.2873478855663454, 1.6302187740911292421e-33),
         (-11.464024688443615, 0.5, 0.2873478855663454, 9.9996637035816518385e-31),
@@ -443,6 +626,7 @@ mod tests {
         for &(h, k, rho, truth) in ISSUE_TABLE {
             let complement = (1.0 - rho) * (1.0 + rho);
             covers(&format!("orthant ({h}, {k}, {rho})"), orthant(h, k, Correlation::from_complement(rho, complement)), truth);
+            covers(&format!("plain entry ({h}, {k}, {rho})"), bivariate_normal_cdf(h, k, rho).unwrap(), truth);
             // `Φ₂(h, k; ρ) = P(X ≤ h, −k ≤ Y')` with `Y' = −Y` at correlation `−ρ`.
             covers(
                 &format!("lower interval ({h}, {k}, {rho})"),
@@ -467,40 +651,80 @@ mod tests {
         assert!(growth(LOG_RADIUS) < growth(LOG_RADIUS * (1.0 - 1.0e-6)));
     }
 
-    /// Every branch of the tree against the core: both constraints active, either one, neither, `ρ` of either sign,
-    /// `ρ → ±1` and the exact special cases.
+    /// Every branch of the tree, both constraints active, either one, neither, `ρ` of either sign and `ρ → ±1`: the bound
+    /// is within `10⁻¹²` of the value (#3226). The value itself is checked against an independent reference in the parent
+    /// module's tests. A vanished value keeps a subnormal bound.
     #[test]
-    fn every_branch_meets_the_core_within_both_bounds() {
+    fn every_branch_bound_scales_with_the_value() {
         let arguments = [-9.0, -4.0, -1.5, -0.3, 0.0, 0.3, 1.5, 4.0, 9.0];
         let correlations = [-0.999_999, -0.95, -0.6, -0.2, 0.0, 0.2, 0.6, 0.95, 0.999_999, -1.0, 1.0];
+        let mut edges = 0_usize;
         for &h in &arguments {
             for &k in &arguments {
                 for &rho in &correlations {
                     let complement = (1.0 - rho) * (1.0 + rho);
-                    let apex = orthant(h, k, Correlation::from_complement(rho, complement));
-                    let core = bivariate_normal_cdf_with_complement(h, k, rho, complement).unwrap();
+                    let correlation = Correlation::from_complement(rho, complement);
+                    let apex = orthant(h, k, correlation);
                     assert!(
-                        (apex.value - core).abs() <= apex.rounding + BIVARIATE_NORMAL_CDF_ERROR_BOUND,
-                        "({h}, {k}, {rho}): apex {:e} ± {:e}, core {core:e}",
-                        apex.value,
-                        apex.rounding
-                    );
-                    // The bound scales with the value, except in a difference at `ρ < 0`, where it scales with the
-                    // minuend `Φ(min(h, k))` (module docs). A vanished value keeps a subnormal bound.
-                    let scale = if rho < 0.0 {
-                        apex.value.max(normal_cdf_and_pdf(h.min(k)).0)
-                    } else {
-                        apex.value
-                    };
-                    assert!(
-                        apex.rounding <= 1.0e-12 * scale + f64::MIN_POSITIVE,
+                        apex.rounding <= 1.0e-12 * apex.value + f64::MIN_POSITIVE,
                         "({h}, {k}, {rho}): {:e} ± {:e}",
                         apex.value,
                         apex.rounding
                     );
+                    // An edge orthant against the difference it replaces: the two agree within both bounds.
+                    let (first, second) = (h - rho * k, k - rho * h);
+                    if rho < 0.0 && rho > -1.0 && (first <= 0.0) != (second <= 0.0) {
+                        edges += 1;
+                        let replaced = if first <= 0.0 {
+                            difference(normal_cdf_bounded(h), both_active(h, -k, correlation.negated()))
+                        } else {
+                            difference(normal_cdf_bounded(k), both_active(-h, k, correlation.negated()))
+                        };
+                        assert!(
+                            (apex.value - replaced.value).abs() <= apex.rounding + replaced.rounding,
+                            "({h}, {k}, {rho}): edge {:e} ± {:e} against difference {:e} ± {:e}",
+                            apex.value,
+                            apex.rounding,
+                            replaced.value,
+                            replaced.rounding
+                        );
+                    }
                 }
             }
         }
+        assert!(edges > 0, "the grid must reach the edge branch");
+    }
+
+    /// #3226's law, `(h, k, ρ) = (−0.3, 0.3, −0.999999)`: the difference `Φ(h) − Φ₂(h, −k; −ρ)` reported a bound of about
+    /// `1.4·10⁻¹¹` of the value, from its minuend. The edge form reports one below `10⁻¹²` of it, and its value lies within
+    /// the difference's bound: the positive control of the test above.
+    #[test]
+    fn the_issue_law_keeps_its_relative_bound_where_the_difference_did_not() {
+        let (h, k, rho) = (-0.3_f64, 0.3_f64, -0.999_999_f64);
+        let correlation = Correlation::from_complement(rho, (1.0 - rho) * (1.0 + rho));
+        assert!(h - rho * k <= 0.0 && k - rho * h > 0.0, "the law is on the edge branch");
+        let edge_form = orthant(h, k, correlation);
+        let replaced = difference(normal_cdf_bounded(h), both_active(h, -k, correlation.negated()));
+        assert!(
+            replaced.rounding > 1.0e-12 * replaced.value,
+            "the difference must fail the relative bound here: {:e} ± {:e}",
+            replaced.value,
+            replaced.rounding
+        );
+        assert!(
+            edge_form.rounding <= 1.0e-12 * edge_form.value,
+            "edge {:e} ± {:e}",
+            edge_form.value,
+            edge_form.rounding
+        );
+        assert!(
+            (edge_form.value - replaced.value).abs() <= edge_form.rounding + replaced.rounding,
+            "edge {:e} ± {:e} against difference {:e} ± {:e}",
+            edge_form.value,
+            edge_form.rounding,
+            replaced.value,
+            replaced.rounding
+        );
     }
 
     #[test]

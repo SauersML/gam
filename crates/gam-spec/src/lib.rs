@@ -833,45 +833,6 @@ impl ResponseFamily {
         }
     }
 
-    /// Closed numeric bounds of the **response support** — the closure of the
-    /// set of values a single observation `Y` can take — used to clamp the
-    /// *observation (prediction) interval* so a predictive band never reports
-    /// values the response can never attain.
-    ///
-    /// This is deliberately distinct from [`Self::mean_clamp_bounds`], which
-    /// governs the *mean* (confidence) interval. `mean_clamp_bounds` returns
-    /// `None` for the non-negative-real families (Poisson / Tweedie /
-    /// NegativeBinomial / Gamma) because their default mean interval is built
-    /// by transforming the η endpoints through a positive inverse link, which
-    /// cannot escape the support. The observation interval, by contrast, is the
-    /// symmetric response-scale band `μ ± z·σ_pred`; for a small fitted mean its
-    /// lower endpoint crosses below the support floor (e.g. a Poisson count band
-    /// going negative), so it must be floored at the response support here.
-    ///
-    /// The lower edge is the infimum of the support (`0` for every non-negative
-    /// family, including the open-at-zero Gamma, whose predictive lower bound is
-    /// reported at the boundary `0`). The upper edge is `+∞` where the response
-    /// is unbounded above, which leaves the upper band untouched, or `1` for the
-    /// `[0, 1]`-valued families. `None` means the response is supported on the
-    /// whole real line (Gaussian) or has its support enforced downstream
-    /// (Royston–Parmar), and the predictive band is passed through unclamped.
-    ///
-    /// The match arms mirror `Self::response_support_contains`: a new family
-    /// must update both together so the support a value is validated against and
-    /// the support a predictive band is clamped to stay consistent.
-    #[inline]
-    pub fn response_support_bounds(&self) -> Option<(f64, f64)> {
-        match self {
-            Self::Gamma
-            | Self::InverseGaussian
-            | Self::Poisson
-            | Self::NegativeBinomial { .. }
-            | Self::Tweedie { .. } => Some((0.0, f64::INFINITY)),
-            Self::Beta { .. } | Self::Binomial => Some((0.0, 1.0)),
-            Self::Gaussian | Self::StudentT { .. } | Self::RoystonParmar => None,
-        }
-    }
-
     /// Per-family textual description of the response-support requirement.
     /// `None` means the family is supported on the entire real line at the
     /// validation layer (Gaussian) or has its support enforced by a downstream
@@ -4360,7 +4321,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // ResponseFamily::mean_clamp_bounds / response_support_bounds
+    // ResponseFamily::mean_clamp_bounds
     // -----------------------------------------------------------------------
 
     #[test]
@@ -4389,27 +4350,6 @@ mod tests {
     #[test]
     fn mean_clamp_bounds_poisson_none() {
         assert_eq!(ResponseFamily::Poisson.mean_clamp_bounds(), None);
-    }
-
-    #[test]
-    fn response_support_bounds_gamma_nonneg_to_inf() {
-        assert_eq!(
-            ResponseFamily::Gamma.response_support_bounds(),
-            Some((0.0, f64::INFINITY))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_binomial_unit_interval() {
-        assert_eq!(
-            ResponseFamily::Binomial.response_support_bounds(),
-            Some((0.0, 1.0))
-        );
-    }
-
-    #[test]
-    fn response_support_bounds_gaussian_none() {
-        assert_eq!(ResponseFamily::Gaussian.response_support_bounds(), None);
     }
 
     // -----------------------------------------------------------------------
