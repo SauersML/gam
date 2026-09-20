@@ -29,7 +29,9 @@
 use ndarray::{Array1, Array2, ArrayBase, Data, Ix2};
 use serde::{Deserialize, Serialize};
 
-use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+use gam_linalg::faer_ndarray::{
+    FaerArrayView, col_piv_qr_solve_lstsq, fast_ab, fast_abt, fast_atb,
+};
 
 /// The lift `T : reduced → raw` plus the per-block partitions of both
 /// coordinate systems. See the module docs for the lift conventions.
@@ -555,6 +557,68 @@ impl Gauge {
         fast_ab(&t_s, &self.t_full)
     }
 
+    /// Push a reduced-coordinate quadratic form (a Hessian, a weighted Gram)
+    /// forward to raw coordinates: the inverse of [`Gauge::restrict_penalty`].
+    ///
+    /// A quadratic form is covariant, `A_θ = Tᵀ · A_raw · T`, so the raw form
+    /// it came from is `A_raw = T⁻ᵀ · A_θ · T⁻¹`, which exists and is unique
+    /// exactly when `T` is square and invertible. The affine shift does not
+    /// enter: it moves the expansion point, not the curvature. Under a
+    /// rectangular section the reduced form only determines `A_raw` on the
+    /// range of `T`, so there is no unique raw form and this refuses.
+    ///
+    /// `T⁻ᵀ` is applied by two column-pivoted QR solves against `Tᵀ` rather
+    /// than by forming the inverse, and the result is symmetrised for the
+    /// same reason as [`Gauge::lift_covariance`]. A singular `T` (not a
+    /// section) surfaces as a non-finite solve and is refused.
+    pub fn push_forward_quadratic_form(
+        &self,
+        reduced_form: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let reduced_total = self.reduced_total();
+        assert_eq!(
+            reduced_form.dim(),
+            (reduced_total, reduced_total),
+            "Gauge::push_forward_quadratic_form: matrix has shape {:?}, expected \
+             ({reduced_total}, {reduced_total})",
+            reduced_form.dim(),
+        );
+        if self.t_full_is_identity() {
+            return Ok(reduced_form.clone());
+        }
+        let raw_total = self.raw_total();
+        if raw_total != reduced_total {
+            return Err(format!(
+                "a {raw_total}×{reduced_total} section has no unique raw-frame form of a \
+                 reduced quadratic form: only its restriction to the range of the lift is known"
+            ));
+        }
+        let t_transposed = self.t_full.t().to_owned();
+        let t_transposed_view = FaerArrayView::new(&t_transposed);
+        // `Tᵀ · X = A`, then `Tᵀ · Yᵀ = Xᵀ`: `Yᵀ = T⁻ᵀ Aᵀ T⁻¹`.
+        let solve = |rhs: &Array2<f64>| -> Array2<f64> {
+            let rhs_view = FaerArrayView::new(rhs);
+            let solved = col_piv_qr_solve_lstsq(t_transposed_view.as_ref(), rhs_view.as_ref());
+            Array2::from_shape_fn((solved.nrows(), solved.ncols()), |(i, j)| solved[(i, j)])
+        };
+        let half = solve(reduced_form);
+        let mut raw = solve(&half.t().to_owned());
+        if raw.iter().any(|value| !value.is_finite()) {
+            return Err(
+                "the lift is singular, so the reduced quadratic form has no raw-frame form"
+                    .to_string(),
+            );
+        }
+        for i in 0..raw_total {
+            for j in (i + 1)..raw_total {
+                let avg = 0.5 * (raw[[i, j]] + raw[[j, i]]);
+                raw[[i, j]] = avg;
+                raw[[j, i]] = avg;
+            }
+        }
+        Ok(raw)
+    }
+
     /// Pull a constructive quadratic factor into reduced coordinates.
     ///
     /// A positive-semidefinite quadratic represented as
@@ -868,6 +932,63 @@ mod tests {
         let raw = Array2::<f64>::from_shape_fn((5, 3), |(i, j)| i as f64 + j as f64 * 0.25);
         let restricted = gauge.restrict_design(&raw);
         assert_eq!(restricted, fast_ab(&raw, &t));
+    }
+
+    #[test]
+    fn push_forward_quadratic_form_inverts_restrict_penalty_3346() {
+        // The de-alias shape `[[I, −A], [0, I]]` of a mean-wiggle saved frame,
+        // with a non-unit diagonal so `T` is neither orthogonal nor unimodular.
+        let t = Array2::from_shape_vec(
+            (3, 3),
+            vec![2.0, 0.0, -0.75, 0.0, 1.0, 0.5, 0.0, 0.0, 1.5],
+        )
+        .unwrap();
+        let gauge = Gauge::from_t(t, &[3], &[3]);
+        let raw = Array2::from_shape_vec(
+            (3, 3),
+            vec![4.0, 1.0, -0.5, 1.0, 3.0, 0.25, -0.5, 0.25, 2.0],
+        )
+        .unwrap();
+        let reduced = gauge.restrict_penalty(&raw);
+        let pushed = gauge
+            .push_forward_quadratic_form(&reduced)
+            .expect("a square invertible section has a unique raw form");
+        // κ(T) ≈ 3 here, so a backward-stable solve is exact to a few ulps of
+        // the entries' magnitude.
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (pushed[[i, j]] - raw[[i, j]]).abs() <= 1e-13 * raw[[i, i]].max(1.0),
+                    "push-forward must invert the pullback at ({i},{j}): {} vs {}",
+                    pushed[[i, j]],
+                    raw[[i, j]],
+                );
+                assert_eq!(pushed[[i, j]], pushed[[j, i]], "result must be symmetric");
+            }
+        }
+    }
+
+    #[test]
+    fn push_forward_quadratic_form_is_bit_exact_on_the_identity_3346() {
+        let gauge = Gauge::identity(&[2, 1]);
+        let form = Array2::from_shape_fn((3, 3), |(i, j)| 1.0 / (1.0 + i as f64 + j as f64));
+        assert_eq!(gauge.push_forward_quadratic_form(&form).unwrap(), form);
+    }
+
+    #[test]
+    fn push_forward_quadratic_form_refuses_a_rectangular_or_singular_section_3346() {
+        let rectangular = Gauge::sum_to_zero(
+            Array2::from_shape_vec((3, 2), vec![1.0, 0.0, 0.0, 1.0, -1.0, -1.0]).unwrap(),
+        );
+        assert!(
+            rectangular
+                .push_forward_quadratic_form(&Array2::eye(2))
+                .is_err()
+        );
+        let mut singular = Array2::<f64>::eye(2);
+        singular[[1, 1]] = 0.0;
+        let singular = Gauge::from_t(singular, &[2], &[2]);
+        assert!(singular.push_forward_quadratic_form(&Array2::eye(2)).is_err());
     }
 
     #[test]
