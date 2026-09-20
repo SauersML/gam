@@ -698,9 +698,9 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
