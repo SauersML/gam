@@ -1175,6 +1175,7 @@ mod tests {
         let make_fit = |geometry: Option<FitGeometry>| -> UnifiedFitResult {
             let mut fit = survival_fit_from_parts(SurvivalLocationScaleFitResultParts {
                 training_sample_size: 32,
+                log_lambdas: Array1::zeros(0),
                 beta_time: beta_pi.slice(s![0..2]).to_owned(),
                 beta_threshold: beta_pi.slice(s![2..4]).to_owned(),
                 beta_log_sigma: beta_pi.slice(s![4..6]).to_owned(),

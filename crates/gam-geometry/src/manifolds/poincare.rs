@@ -288,10 +288,12 @@ pub fn log_origin(y: ArrayView1<'_, f64>, curvature: f64) -> GeometryResult<Arra
         // positive `√k|y|` takes `artanh(t)/t`, which is 1 to rounding at small t.
         return Ok(out);
     }
-    // y is validated in-ball, so sqrt(k)·|y| < 1; the clamp only guards the
-    // last-ulp approach to the boundary, never an out-of-domain artanh.
-    let arg = (sqrt_negc * norm).min(1.0 - BOUNDARY_EPS);
-    let coeff = arg.atanh() / (sqrt_negc * norm);
+    // `require_in_ball` refused `√k·|y| ≥ 1` computed from the same sum in the
+    // same order, so `arg < 1` and `artanh(arg)` is finite on the whole open
+    // ball. No clamp: shortening `arg` would return a tangent whose length is
+    // not the distance `poincare_distance` reports for the same point.
+    let arg = sqrt_negc * norm;
+    let coeff = arg.atanh() / arg;
     for v in out.iter_mut() {
         *v *= coeff;
     }
@@ -1091,6 +1093,35 @@ mod tests {
             (got - expected).abs() < 1.0e-12,
             "got {got}, expected {expected}"
         );
+    }
+
+    /// A point inside the ball but within `BOUNDARY_EPS` of its rim is a
+    /// valid point: its logarithm's length must be half its distance from the
+    /// origin, as it is everywhere else, not `artanh(1 − BOUNDARY_EPS)`.
+    #[test]
+    fn log_origin_is_exact_between_the_projection_radius_and_the_rim() {
+        for &(curvature, gap) in &[(-1.0, 1.0e-8), (-1.0, 1.0e-12), (-2.5, 1.0e-9)] {
+            let sqrt_k = f64::sqrt(-curvature);
+            let radius = (1.0 - gap) / sqrt_k;
+            let y = array![0.6 * radius, -0.8 * radius];
+            let v = log_origin(y.view(), curvature).expect("an in-ball point has a logarithm");
+            let tangent_norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+            let origin = Array1::<f64>::zeros(2);
+            let distance = poincare_distance(origin.view(), y.view(), curvature).expect("distance");
+            // `d(0, y) = 2|log_0(y)|`. Both sides read `√k|y|` to a few ulps,
+            // and `2·artanh` turns a move `δs` into `2δs/(1 − s²) ≈ δs/gap`,
+            // so each carries an absolute error of a few `ε/(gap·√k)`.
+            let band = 32.0 * f64::EPSILON / (gap * sqrt_k);
+            assert!(
+                (distance - 2.0 * tangent_norm).abs() <= band,
+                "c={curvature}, gap={gap}: d={distance}, 2|log|={}",
+                2.0 * tangent_norm
+            );
+            assert!(
+                sqrt_k * tangent_norm > (1.0 - BOUNDARY_EPS).atanh() + 1.0,
+                "the logarithm was shortened to the projection radius: {tangent_norm}"
+            );
+        }
     }
 
     #[test]

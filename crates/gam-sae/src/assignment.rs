@@ -853,7 +853,7 @@ pub fn default_ordered_beta_bernoulli_concentration_for_k_atoms(k_atoms: usize) 
 pub fn ordered_beta_bernoulli_row(logits: ArrayView1<'_, f64>, temperature: f64) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
+        out[i] = gam_math::special::logistic(logits[i] / temperature);
     }
     out
 }
@@ -865,7 +865,7 @@ pub fn threshold_gate_row(
 ) -> Array1<f64> {
     let mut out = Array1::<f64>::zeros(logits.len());
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
+        out[i] = gam_math::special::logistic((logits[i] - threshold) / temperature);
     }
     out
 }
@@ -909,7 +909,7 @@ pub(crate) fn topk_row_into(logits: ArrayView1<'_, f64>, k: usize, out: &mut [f6
 }
 
 /// Exact numerical inverse of the softplus link `softplus(x) = log(1 + eˣ)`
-/// (the forward direction is [`gam_linalg::utils::stable_softplus`], used by
+/// (the forward direction is [`gam_math::special::softplus`], used by
 /// the penalty implementations). This is the single source of truth for the
 /// softplus⁻¹ reparameterization the SAE penalty FFI uses to map
 /// a positive scale hyperparameter `β > 0` back to its raw pre-softplus
@@ -1035,7 +1035,7 @@ pub(crate) fn ordered_beta_bernoulli_row_into(
     out: &mut [f64],
 ) {
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic(logits[i] / temperature);
+        out[i] = gam_math::special::logistic(logits[i] / temperature);
     }
 }
 
@@ -1046,7 +1046,7 @@ pub(crate) fn threshold_gate_row_into(
     out: &mut [f64],
 ) {
     for i in 0..logits.len() {
-        out[i] = gam_linalg::utils::stable_logistic((logits[i] - threshold) / temperature);
+        out[i] = gam_math::special::logistic((logits[i] - threshold) / temperature);
     }
 }
 
@@ -1097,7 +1097,7 @@ pub(crate) fn fill_assignment_logit_jvp_rows(
             let inv_tau = 1.0 / temperature;
             for logit_col in 0..assignments.len() {
                 let activation =
-                    gam_linalg::utils::stable_logistic((logits[logit_col] - threshold) * inv_tau);
+                    gam_math::special::logistic((logits[logit_col] - threshold) * inv_tau);
                 let da = activation * (1.0 - activation) * inv_tau;
                 for out_col in 0..fitted.len() {
                     local_jac[[logit_col, out_col]] = da * decoded[[logit_col, out_col]];
@@ -1575,7 +1575,7 @@ fn threshold_gate_free_gates(
         // #991 — this row stands in for `w_i` population rows.
         let w_row = row_weights.map_or(1.0, |w| w[idx / k]);
         gates.weighted_activation +=
-            w_row * gam_linalg::utils::stable_logistic((logit - threshold) / temperature);
+            w_row * gam_math::special::logistic((logit - threshold) / temperature);
         gates.weight += w_row;
     }
     gates
@@ -1698,7 +1698,7 @@ impl ThresholdGateLogitCurvature {
     /// caller keeps that convention so value, gradient and curvature share one
     /// weighting (#991).
     pub(crate) fn eval(strength: f64, logit: f64, threshold: f64, inv_tau: f64) -> Self {
-        let activation = gam_linalg::utils::stable_logistic((logit - threshold) * inv_tau);
+        let activation = gam_math::special::logistic((logit - threshold) * inv_tau);
         let slope = activation * (1.0 - activation);
         // Non-negative magnitude, and the dimensionless signed factor it
         // multiplies. The clamp acts on the second and scales with the first.
@@ -1898,21 +1898,15 @@ fn simplex_gate_frame(assignment: &SaeAssignment) -> Option<(Vec<usize>, f64)> {
     (!free.is_empty()).then_some((free, temperature))
 }
 
-/// `ln Σ_{atom ∈ atoms} e^{ℓ_atom/τ}`, shifted by its largest term so no exponent overflows or
-/// underflows to an infinite logarithm.
+/// `ln Σ_{atom ∈ atoms} e^{ℓ_atom/τ}`, through gam-math's max-shifted compensated log-sum-exp so no
+/// exponent overflows or underflows to an infinite logarithm.
 fn log_sum_exp_scaled(
     logits: ArrayView1<'_, f64>,
-    atoms: impl Iterator<Item = usize> + Clone,
+    atoms: impl Iterator<Item = usize>,
     inv_tau: f64,
 ) -> f64 {
-    let top = atoms
-        .clone()
-        .map(|atom| logits[atom] * inv_tau)
-        .fold(f64::NEG_INFINITY, f64::max);
-    top + atoms
-        .map(|atom| (logits[atom] * inv_tau - top).exp())
-        .sum::<f64>()
-        .ln()
+    let scaled: Vec<f64> = atoms.map(|atom| logits[atom] * inv_tau).collect();
+    gam_math::probability::positive_log_sum_exp(&scaled)
 }
 
 /// One softmax row's `J = −Σ_{i∈F} ln z_i − ln R + |F|·ln τ` (see [`simplex_gate_frame`]), from

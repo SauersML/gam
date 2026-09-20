@@ -20,6 +20,7 @@
 //! No quantity here is differenced; the tests difference it.
 
 use super::block_quadrature_correction::{block_axis_target, mixed_axis_laplace_term};
+use gam_math::probability::positive_log_sum_exp;
 use super::*;
 
 /// How a row's likelihood curvature `ψ''(η)` is evaluated off the mode, where
@@ -619,7 +620,8 @@ fn piece_second_order(
         .base_neg_score()
         .map_err(EstimationError::InvalidInput)?;
     let w_mode = &piece_target.weights_obs;
-    let log_norm = log_sum_exp(nodes.iter().map(|&(_, _, w)| w.ln()));
+    let log_node_weights: Vec<f64> = nodes.iter().map(|&(_, _, w)| w.ln()).collect();
+    let log_norm = positive_log_sum_exp(&log_node_weights);
     let feasible: Vec<(f64, [f64; 2], f64, Array1<f64>)> = batched
         .into_iter()
         .zip(nodes.iter())
@@ -631,7 +633,8 @@ fn piece_second_order(
     if feasible.is_empty() {
         crate::bail_invalid_estim!("#784 ρ-Hessian: every Gauss–Hermite node was infeasible");
     }
-    let log_mass = log_sum_exp(feasible.iter().map(|(_, _, lw, _)| *lw));
+    let log_feasible_weights: Vec<f64> = feasible.iter().map(|(_, _, lw, _)| *lw).collect();
+    let log_mass = positive_log_sum_exp(&log_feasible_weights);
     let value = log_mass - log_norm + log_mass_of_interval;
 
     let mut expected_second = Array1::<f64>::zeros(pairs.len());
@@ -717,14 +720,6 @@ fn piece_second_order(
         gradient,
         hessian,
     })
-}
-
-fn log_sum_exp(values: impl Iterator<Item = f64> + Clone) -> f64 {
-    let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
-    if !max.is_finite() {
-        return max;
-    }
-    max + values.map(|v| (v - max).exp()).sum::<f64>().ln()
 }
 
 /// The cost-side ρ-gradient and ρ-Hessian of `−Δ_b` at this evaluation.
