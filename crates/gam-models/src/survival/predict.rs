@@ -4854,13 +4854,10 @@ fn evaluate_rp_row_with_beta(
         + eta_time_offset_row.abs()
         + primary_offset_row.abs();
     let eta_band = gam_linalg::roundoff::accumulation_growth(p + 2) * eta_magnitude;
-    // `Λ̂ = fl(exp(η̂))` is one libm rounding of `exp(η̂)`, so `exp(η̂) ≤ Λ̂·(1 + γ₂)`, and
-    // `|exp(η) − exp(η̂)| ≤ exp(η̂)·expm1(eta_band)`. Together
-    // `|Λ − Λ̂| ≤ Λ̂·(expm1(eta_band) + γ₂)·(1 + γ₂)`; the `exp_m1` itself and the sum
-    // and two products forming the band add five more roundings, for `(1 + γ₇)` overall.
-    let cum_band = cum
-        * (eta_band.exp_m1() + gam_linalg::roundoff::accumulation_growth(2))
-        * (1.0 + gam_linalg::roundoff::accumulation_growth(7));
+    // `cum = exp(eta)` is accurate to one ulp, `2u`, so the exact cumulative
+    // hazard lies within `(1 + γ₂)·exp(±eta_band)` of it.
+    let exp_growth = gam_linalg::roundoff::accumulation_growth(2);
+    let cum_band = cum * (eta_band.exp_m1() * (1.0 + exp_growth) + exp_growth);
     Ok((eta, cum, haz, cum_band))
 }
 
