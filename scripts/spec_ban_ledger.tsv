@@ -37,7 +37,6 @@ jitter	crates/gam-sae/src/manifold/minimal_seed.rs	const RANDOM_STATE_LOGIT_JITT
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	const SAE_RANDOM_STATE_LOGIT_JITTER	https://github.com/SauersML/gam/issues/3090
 jitter	crates/gam-sae/src/manifold/seed_routing.rs	diag += jitter	https://github.com/SauersML/gam/issues/3090
 magic	crates/gam-custom-family/src/covariance.rs	> 1.0e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-custom-family/src/inner_blockwise_fit.rs	< 1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-custom-family/src/joint_newton.rs	<= 1e-3	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-event-history/src/static_state.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
@@ -67,7 +66,6 @@ magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://
 magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/fit_setup.rs	< 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/joint_latent_law.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-10	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/marginal_slope/spec.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/predict.rs	.max(1.0e-9)	https://github.com/SauersML/gam/issues/2469
