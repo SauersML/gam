@@ -107,12 +107,8 @@ fn calibrate_device(
     if let Some(flops) = crossover_flops(&measurements, "xtwx", policy.xtwx_flops_min) {
         policy.xtwx_flops_min = flops;
     }
-    if let Some(rows) = crossover_rows(&measurements, "xtwx", policy.xtwx_n_min) {
-        policy.xtwx_n_min = rows;
-    }
     if let Some(p) = crossover_rows(&measurements, "potrf", policy.potrf_min_p) {
         policy.potrf_min_p = p;
-        policy.prefer_gpu_factorization_min_p = p;
     }
 
     log::debug!(
