@@ -110,6 +110,7 @@ pub(crate) fn build_model_summary(
             }) => {
                 let prior_txt = match prior {
                     BoundedCoefficientPriorSpec::None => ", no-prior".to_string(),
+                    BoundedCoefficientPriorSpec::Shrinkage => ", shrinkage(REML)".to_string(),
                     BoundedCoefficientPriorSpec::Uniform => ", Uniform(log-Jacobian)".to_string(),
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         format!(", Beta({a:.3},{b:.3})")

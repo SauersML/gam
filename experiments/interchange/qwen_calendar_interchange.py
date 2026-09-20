@@ -300,15 +300,6 @@ def restricted_top_label(logits: Any, candidate_ids: list[int], task: CalendarTa
     return top, values
 
 
-def full_vocab_kl(clean_logits: Any, patched_logits: Any) -> float:
-    import torch
-
-    logp = torch.log_softmax(clean_logits.to(torch.float64), dim=-1)
-    logq = torch.log_softmax(patched_logits.to(torch.float64), dim=-1)
-    p = logp.exp()
-    return float((p * (logp - logq)).sum().item())
-
-
 def restricted_logprob(logits: Any, candidate_ids: list[int], label_index: int) -> float:
     import torch
 
@@ -400,6 +391,7 @@ def run_interchanges(
     margin_tolerance: float,
 ) -> list[InterventionRecord]:
     import torch
+    from gamfit.torch.interventions import kl_and_logit_extent
 
     period = len(task.labels)
     records: list[InterventionRecord] = []
@@ -426,7 +418,7 @@ def run_interchanges(
             match=margin >= -margin_tolerance,
             clean_base_label=task.labels[clean_top],
             clean_base_correct=clean_top == base_expected,
-            realized_kl=max(full_vocab_kl(base.logits, patched_logits), 0.0),
+            realized_kl=kl_and_logit_extent(base.logits, patched_logits)[0],
             predicted_logit_margin=margin,
             predicted_logprob_lift=patched_lp - clean_lp,
         )

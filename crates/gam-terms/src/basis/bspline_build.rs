@@ -100,12 +100,27 @@ pub fn build_bspline_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
 ) -> Result<BasisBuildResult, BasisError> {
+    build_bspline_basis_1d_realizing(data, spec, true)
+}
+
+/// [`build_bspline_basis_1d`] with the penalty set optional.
+///
+/// The design, affine offset and metadata never read the penalties, so a
+/// caller that only evaluates the design (a prediction rebuild) passes
+/// `realize_penalties = false` and gets empty active and dropped penalty lists
+/// without paying for the roughness factor, the null-space ridge or the
+/// penalty rank analysis.
+pub(crate) fn build_bspline_basis_1d_realizing(
+    data: ArrayView1<'_, f64>,
+    spec: &BSplineBasisSpec,
+    realize_penalties: bool,
+) -> Result<BasisBuildResult, BasisError> {
     // Natural cubic regression spline (bs="cr"/"cs", #1074): a dense
     // value-at-knot basis with its own roughness penalty, not a B-spline
     // derivative penalty. Route to the dedicated builder BEFORE the B-spline-only
     // auto-shrink and periodic logic so neither touches a cr spec.
     if let BSplineKnotSpec::NaturalCubicRegression { knots } = &spec.knotspec {
-        return build_cubic_regression_basis_1d(data, spec, knots);
+        return build_cubic_regression_basis_1d(data, spec, knots, realize_penalties);
     }
 
     if let OneDimensionalBoundary::Cyclic { start, end } = spec.boundary
@@ -125,7 +140,7 @@ pub fn build_bspline_basis_1d(
     let periodic_build = match &spec.knotspec {
         BSplineKnotSpec::PeriodicUniform {
             data_range,
-            num_basis,
+            num_basis, ..
         } => {
             if let Some((boundary_start, boundary_end, _)) = spec.boundary.period() {
                 let scale = (boundary_end - boundary_start).abs().max(1.0);
@@ -197,98 +212,103 @@ pub fn build_bspline_basis_1d(
         // alias energy at frequencies `1 ± K, 1 ± 2K, …`, small but above any
         // rank cutoff, and the double-penalty rebuild must not read that alias
         // energy as curvature (#2445).
-        let harmonic_null_frame = (spec.penalty_order >= 2)
-            .then(|| cyclic_harmonic_null_frame(num_basis))
-            .transpose()?;
-        let s_bend_raw = match &harmonic_null_frame {
-            Some(frame) => ConstructiveQuadratic::from_energy_factor(
-                cyclic_bspline_harmonic_penalty_factor(
-                    spec.degree,
-                    num_basis,
-                    end - start,
-                    spec.penalty_order,
-                )?,
-                "cyclic B-spline harmonic roughness",
-            )?
-            .with_structural_null_frame(
-                frame.clone(),
-                "cyclic harmonic roughness structural null declaration",
-            )?,
-            None => ConstructiveQuadratic::from_energy_factor(
-                cyclic_bspline_derivative_penalty_factor(
-                    spec.degree,
-                    num_basis,
-                    end - start,
-                    spec.penalty_order,
-                )?,
-                "cyclic B-spline roughness",
-            )?,
-        };
-        // The null-space-shrinkage ("double") ridge charges the null component
-        // its own smoothing parameter, so REML can still recover the null. The
-        // candidate set is assembled exactly like every other 1-D basis, and
-        // `rebuild_double_penalty_nullspace_in_constrained_chart` rebuilds the
-        // ridge on the null directions that survive the identifiability chart.
-        // Under the periodic sum-to-zero constraint (the default) the centering
-        // removes one direction: the fundamental survives for the harmonic
-        // roughness, so the ridge keeps rank 2 and an identified λ; for `m = 1`
-        // nothing survives, the ridge collapses to `ConstructiveQuadratic::zero`,
-        // and `filter_penalty_candidates` drops it as
-        // `PenaltyDropReason::ZeroMatrix`. A zero block contributes nothing to
-        // the REML cost or penalty log-determinant, so its log-λ coordinate would
-        // be completely unidentified and the outer loop could not certify a step
-        // (#874).
-        //
-        // Under `identifiability='none'` the constant direction SURVIVES into the
-        // design, is exactly aliased with the global intercept, and — with no
-        // ridge to penalize it — the pre-fit rank audit refused the model
-        // ("rank 1 < 2 unpenalized columns"). With the ridge the constant is a
-        // penalized direction, the unpenalized block is the intercept alone, and
-        // an uncentered cyclic smooth fits the same way an uncentered open one
-        // does (#2783).
-        //
-        // Frobenius-normalize the cyclic wiggliness penalty (recording the norm
-        // in `normalization_scale`) so its smoothing parameter `λ` is on the same
-        // unit-Frobenius scale as every other basis (cr / duchon / tensor / the
-        // open-knot ps path, #1365). The shipped design penalty is `β'(S/c)β`; a
-        // raw `S` (scale 1.0) put `λ` on a basis-dependent scale and the outer
-        // λ-search heuristics under-smoothed exactly as for the open ps single
-        // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
-        let (_, s_bend_scale) = normalize_penalty(s_bend_raw.dense());
-        let mut penalties_raw = vec![PenaltyCandidate {
-            matrix: s_bend_raw
-                .scaled(1.0 / s_bend_scale, "normalized cyclic B-spline roughness")?,
-            source: PenaltySource::Primary,
-            normalization_scale: s_bend_scale,
-            kronecker_factors: None,
-            op: None,
-        }];
-        if spec.double_penalty {
-            // Same function-space ridge the open path builds (SPEC rule 5): the
-            // metric is the exact L² Gram of the *periodic* cardinal basis over
-            // one period, so the penalized quantity is `∫(null component of f)²`
-            // and is invariant to how the cyclic basis happens to be scaled.
-            let gram = periodic_bspline_function_gram(start, end, spec.degree, num_basis)?;
-            let shrinkage = match &harmonic_null_frame {
-                // The declared frame IS the null space; a rank test on the
-                // harmonic roughness would keep only the constant.
-                Some(frame) => Some(function_space_subspace_trend_ridge(frame, &gram)?),
-                None => function_space_nullspace_shrinkage(s_bend_raw.dense(), &gram)?,
-            };
-            if let Some(shrinkage) = shrinkage {
-                let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
-                penalties_raw.push(PenaltyCandidate {
-                    matrix: ConstructiveQuadratic::try_from_dense_psd(
-                        ridge_norm,
-                        "cyclic B-spline null-function ridge",
+        let penalties_raw = if realize_penalties {
+            let harmonic_null_frame = (spec.penalty_order >= 2)
+                .then(|| cyclic_harmonic_null_frame(num_basis))
+                .transpose()?;
+            let s_bend_raw = match &harmonic_null_frame {
+                Some(frame) => ConstructiveQuadratic::from_energy_factor(
+                    cyclic_bspline_harmonic_penalty_factor(
+                        spec.degree,
+                        num_basis,
+                        end - start,
+                        spec.penalty_order,
                     )?,
-                    source: PenaltySource::DoublePenaltyNullspace,
-                    normalization_scale: ridge_scale,
-                    kronecker_factors: None,
-                    op: None,
-                });
+                    "cyclic B-spline harmonic roughness",
+                )?
+                .with_structural_null_frame(
+                    frame.clone(),
+                    "cyclic harmonic roughness structural null declaration",
+                )?,
+                None => ConstructiveQuadratic::from_energy_factor(
+                    cyclic_bspline_derivative_penalty_factor(
+                        spec.degree,
+                        num_basis,
+                        end - start,
+                        spec.penalty_order,
+                    )?,
+                    "cyclic B-spline roughness",
+                )?,
+            };
+            // The null-space-shrinkage ("double") ridge charges the null component
+            // its own smoothing parameter, so REML can still recover the null. The
+            // candidate set is assembled exactly like every other 1-D basis, and
+            // `rebuild_double_penalty_nullspace_in_constrained_chart` rebuilds the
+            // ridge on the null directions that survive the identifiability chart.
+            // Under the periodic sum-to-zero constraint (the default) the centering
+            // removes one direction: the fundamental survives for the harmonic
+            // roughness, so the ridge keeps rank 2 and an identified λ; for `m = 1`
+            // nothing survives, the ridge collapses to `ConstructiveQuadratic::zero`,
+            // and `filter_penalty_candidates` drops it as
+            // `PenaltyDropReason::ZeroMatrix`. A zero block contributes nothing to
+            // the REML cost or penalty log-determinant, so its log-λ coordinate would
+            // be completely unidentified and the outer loop could not certify a step
+            // (#874).
+            //
+            // Under `identifiability='none'` the constant direction SURVIVES into the
+            // design, is exactly aliased with the global intercept, and — with no
+            // ridge to penalize it — the pre-fit rank audit refused the model
+            // ("rank 1 < 2 unpenalized columns"). With the ridge the constant is a
+            // penalized direction, the unpenalized block is the intercept alone, and
+            // an uncentered cyclic smooth fits the same way an uncentered open one
+            // does (#2783).
+            //
+            // Frobenius-normalize the cyclic wiggliness penalty (recording the norm
+            // in `normalization_scale`) so its smoothing parameter `λ` is on the same
+            // unit-Frobenius scale as every other basis (cr / duchon / tensor / the
+            // open-knot ps path, #1365). The shipped design penalty is `β'(S/c)β`; a
+            // raw `S` (scale 1.0) put `λ` on a basis-dependent scale and the outer
+            // λ-search heuristics under-smoothed exactly as for the open ps single
+            // penalty. Fit-invariant at the REML optimum (only `λ̂` rescales by `c`).
+            let (_, s_bend_scale) = normalize_penalty(s_bend_raw.dense());
+            let mut penalties_raw = vec![PenaltyCandidate {
+                matrix: s_bend_raw
+                    .scaled(1.0 / s_bend_scale, "normalized cyclic B-spline roughness")?,
+                source: PenaltySource::Primary,
+                normalization_scale: s_bend_scale,
+                kronecker_factors: None,
+                op: None,
+            }];
+            if spec.double_penalty {
+                // Same function-space ridge the open path builds (SPEC rule 5): the
+                // metric is the exact L² Gram of the *periodic* cardinal basis over
+                // one period, so the penalized quantity is `∫(null component of f)²`
+                // and is invariant to how the cyclic basis happens to be scaled.
+                let gram = periodic_bspline_function_gram(start, end, spec.degree, num_basis)?;
+                let shrinkage = match &harmonic_null_frame {
+                    // The declared frame IS the null space; a rank test on the
+                    // harmonic roughness would keep only the constant.
+                    Some(frame) => Some(function_space_subspace_trend_ridge(frame, &gram)?),
+                    None => function_space_nullspace_shrinkage(s_bend_raw.dense(), &gram)?,
+                };
+                if let Some(shrinkage) = shrinkage {
+                    let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
+                    penalties_raw.push(PenaltyCandidate {
+                        matrix: ConstructiveQuadratic::try_from_dense_psd(
+                            ridge_norm,
+                            "cyclic B-spline null-function ridge",
+                        )?,
+                        source: PenaltySource::DoublePenaltyNullspace,
+                        normalization_scale: ridge_scale,
+                        kronecker_factors: None,
+                        op: None,
+                    });
+                }
             }
-        }
+            penalties_raw
+        } else {
+            Vec::new()
+        };
         let auto_chunk = auto_streaming_chunk_size_for_dense(data.len(), num_basis);
         let (design, transformed_candidates, identifiability_transform) =
             if let Some(chunk) = auto_chunk {
@@ -409,18 +429,22 @@ pub fn build_bspline_basis_1d(
         None
     };
     if let Some((knots, p_raw, chunk)) = auto_chunk_streaming {
-        let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
-            bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
-            "streaming B-spline roughness",
-        )?;
-        let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
+        let penalties_raw = if realize_penalties {
+            let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
+                bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
+                "streaming B-spline roughness",
+            )?;
+            bspline_penalty_candidates(&s_bend_raw, spec, &knots)?
+        } else {
+            Vec::new()
+        };
         log::debug!(
             "B-spline basis auto-streaming evaluator: n={} p={} chunk_size={}",
             data.len(),
             p_raw,
             chunk,
         );
-        let mean_slope = if uses_mean_slope_ridge(spec) {
+        let mean_slope = if realize_penalties && uses_mean_slope_ridge(spec) {
             Some(bspline_mean_slope_row(&knots, spec.degree)?)
         } else {
             None
@@ -491,7 +515,7 @@ pub fn build_bspline_basis_1d(
             BSplineKnotSpec::NaturalCubicRegression { knots } => {
                 // Unreachable in practice (the early dispatch returns the cr
                 // basis), but keeps this match exhaustive and self-consistent.
-                return build_cubic_regression_basis_1d(data, spec, knots);
+                return build_cubic_regression_basis_1d(data, spec, knots, realize_penalties);
             }
             BSplineKnotSpec::Provided(knots) => {
                 let (basis, knots) = create_basis::<Sparse>(
@@ -548,12 +572,12 @@ pub fn build_bspline_basis_1d(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
             BSplineKnotSpec::NaturalCubicRegression { knots } => {
                 // Unreachable in practice (the early dispatch returns the cr
                 // basis), but keeps this match exhaustive and self-consistent.
-                return build_cubic_regression_basis_1d(data, spec, knots);
+                return build_cubic_regression_basis_1d(data, spec, knots, realize_penalties);
             }
             BSplineKnotSpec::Provided(knots) => {
                 let (basis, knots) = create_basis::<Dense>(
@@ -562,7 +586,7 @@ pub fn build_bspline_basis_1d(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
             BSplineKnotSpec::PeriodicUniform { .. } => {
                 crate::bail_invalid_basis!(
@@ -592,7 +616,7 @@ pub fn build_bspline_basis_1d(
                     spec.degree,
                     BasisOptions::value(),
                 )?;
-                (None, Some((*basis).clone()), knots)
+                (None, Some(std::sync::Arc::unwrap_or_clone(basis)), knots)
             }
         }
     };
@@ -622,12 +646,16 @@ pub fn build_bspline_basis_1d(
         }
         None => None,
     };
-    let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
-        bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
-        "B-spline roughness",
-    )?;
-    let penalties_raw = bspline_penalty_candidates(&s_bend_raw, spec, &knots)?;
-    let mean_slope = if uses_mean_slope_ridge(spec) {
+    let penalties_raw = if realize_penalties {
+        let s_bend_raw = ConstructiveQuadratic::from_energy_factor(
+            bspline_derivative_penalty_factor(knots.view(), spec.degree, spec.penalty_order)?,
+            "B-spline roughness",
+        )?;
+        bspline_penalty_candidates(&s_bend_raw, spec, &knots)?
+    } else {
+        Vec::new()
+    };
+    let mean_slope = if realize_penalties && uses_mean_slope_ridge(spec) {
         Some(bspline_mean_slope_row(&knots, spec.degree)?)
     } else {
         None
@@ -781,6 +809,7 @@ pub(crate) fn build_cubic_regression_basis_1d(
     data: ArrayView1<'_, f64>,
     spec: &BSplineBasisSpec,
     knots: &Array1<f64>,
+    realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
     // cr has no B-spline knot/degree geometry: a `RemoveLinearTrend`
     // identifiability would mis-apply Greville-based linear removal to the
@@ -804,41 +833,49 @@ pub(crate) fn build_cubic_regression_basis_1d(
 
     let cr = CubicRegressionBasis::new(knots.clone())?;
     let raw_design = cr.design(data);
-    let s_bend_raw = cr.penalty();
+    let penalties_raw = if realize_penalties {
+        let s_bend_raw = cr.penalty();
 
-    // Raw (pre-identifiability) candidates: Frobenius-normalized bending penalty
-    // plus, for `cs`/double-penalty, the null-space shrinkage ridge — exactly as
-    // `bspline_penalty_candidates` assembles them.
-    let want_nullspace = spec.double_penalty;
-    let (bend_norm, bend_scale) = normalize_penalty(&s_bend_raw);
-    let mut penalties_raw = vec![PenaltyCandidate {
-        matrix: ConstructiveQuadratic::try_from_dense_psd(bend_norm, "cubic-regression roughness")?,
-        source: PenaltySource::Primary,
-        normalization_scale: bend_scale,
-        kronecker_factors: None,
-        op: None,
-    }];
-    // The cr basis is piecewise cubic between its knots, so its exact L² Gram
-    // supplies the function metric for the null-component shrinkage (SPEC 5).
-    let cr_shrinkage = if want_nullspace {
-        let gram = cubic_regression_function_gram(knots)?;
-        function_space_nullspace_shrinkage(&s_bend_raw, &gram)?
-    } else {
-        None
-    };
-    if let Some(shrinkage) = cr_shrinkage {
-        let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
-        penalties_raw.push(PenaltyCandidate {
+        // Raw (pre-identifiability) candidates: Frobenius-normalized bending penalty
+        // plus, for `cs`/double-penalty, the null-space shrinkage ridge — exactly as
+        // `bspline_penalty_candidates` assembles them.
+        let want_nullspace = spec.double_penalty;
+        let (bend_norm, bend_scale) = normalize_penalty(&s_bend_raw);
+        let mut penalties_raw = vec![PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
-                ridge_norm,
-                "cubic-regression null-function ridge",
+                bend_norm,
+                "cubic-regression roughness",
             )?,
-            source: PenaltySource::DoublePenaltyNullspace,
-            normalization_scale: ridge_scale,
+            source: PenaltySource::Primary,
+            normalization_scale: bend_scale,
             kronecker_factors: None,
             op: None,
-        });
-    }
+        }];
+        // The cr basis is piecewise cubic between its knots, so its exact L² Gram
+        // supplies the function metric for the null-component shrinkage (SPEC 5).
+        let cr_shrinkage = if want_nullspace {
+            let gram = cubic_regression_function_gram(knots)?;
+            function_space_nullspace_shrinkage(&s_bend_raw, &gram)?
+        } else {
+            None
+        };
+        if let Some(shrinkage) = cr_shrinkage {
+            let (ridge_norm, ridge_scale) = normalize_penalty(&shrinkage);
+            penalties_raw.push(PenaltyCandidate {
+                matrix: ConstructiveQuadratic::try_from_dense_psd(
+                    ridge_norm,
+                    "cubic-regression null-function ridge",
+                )?,
+                source: PenaltySource::DoublePenaltyNullspace,
+                normalization_scale: ridge_scale,
+                kronecker_factors: None,
+                op: None,
+            });
+        }
+        penalties_raw
+    } else {
+        Vec::new()
+    };
 
     // Apply the identifiability constraint to the dense design.
     // `apply_bspline_identifiability_policy` is design-generic for every variant
@@ -2536,12 +2573,15 @@ fn rebuild_double_penalty_nullspace_in_constrained_chart(
         primary_candidate.normalization_scale,
         "physical constrained B-spline roughness",
     )?;
-    if primary_constrained.nrows() == 0 {
-        crate::bail_invalid_basis!(
-            "double-penalty B-spline primary roughness has an empty coefficient chart"
-        );
-    }
     let p = primary_constrained.nrows();
+    if p == 0 {
+        // A frozen chart with no columns: the collection's gauge found every
+        // coefficient direction of this design carried by other terms (a
+        // factor-by level with a single row). The coefficient space is empty,
+        // so every candidate is already the empty quadratic and there is no
+        // null space left to rebuild a ridge on.
+        return Ok(candidates);
+    }
     for candidate in &mut candidates {
         if matches!(candidate.source, PenaltySource::DoublePenaltyNullspace) {
             // Undo the raw-chart Frobenius normalizations before rebuilding.

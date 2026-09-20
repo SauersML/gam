@@ -280,6 +280,11 @@
   `declared_latent_law` now serves the Bernoulli family too.
 - Saved models record which law the fit consumed in `latent_law_consumed`.
   Models saved earlier replay their old calibration unchanged.
+- Where the score's law moves, an arm that anchors on a Gaussian residual is a
+  candidate of the moving-law rule only if that residual passes the adequacy
+  screen, and the fit is solved on the simplest candidate first; each arm's
+  screen is recorded in the certificate (`MovingLawArmScore::adequacy`,
+  payload 32).
 - Fits that anchor on an estimated law are slower than the closed form until
   the anchor kernel follow-up lands: a 100 000-row Bernoulli fit on a skewed
   score took 199 s where the closed form took 4.6 s, and on a moving law

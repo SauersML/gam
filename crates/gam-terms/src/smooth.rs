@@ -59,6 +59,7 @@ pub use term_design::{
     TermCollectionDerivativeDesign,
     apply_smooth_transform_to_design,
     build_term_collection_derivative_design, build_term_collection_design,
+    build_term_collection_prediction_design, build_term_prediction_columns,
     build_planned_term_collection_design_inner_with_policy,
     bspline_null_ridge_request, build_term_collection_design_with_policy,
     duchon_operator_penalty_request,
@@ -73,6 +74,12 @@ pub use term_design::{
 // single canonical model-save freezer; its helper `freeze_smooth_basis_from_metadata`
 // stays private. A legal gam-terms resident (pure gam-terms/gam-problem types) and
 // a shared home the future family sub-crates can call without depending on gam-models.
+mod adaptive_resolution;
+pub use adaptive_resolution::{
+    AdaptiveResolution, adaptive_resolution_of, adaptive_resolution_support,
+    adaptive_resolution_width, apply_adaptive_resolution, refined_adaptive_resolution,
+};
+
 mod design_freezing;
 pub use design_freezing::freeze_term_collection_from_design;
 
