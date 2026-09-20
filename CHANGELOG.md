@@ -1,16 +1,12 @@
 ## Unreleased
 
-- **Survival I-spline time basis: structural column selection and derived rounding bands** (#3288).
-  The retained `keep_cols` of an inferred I-spline time basis are now read off the knot
-  vector. A column is kept exactly when the support of its M-spline `I_c'` meets the span
-  of the evaluated log-times, including the `LinearTails` exterior. The former rule was an
-  absolute `max − min > 1e-12` cut on I-spline values. It dropped a genuinely varying
-  column whose only interior point sits just past a knot. The `(-1e-12..0)` clamp, the
-  `v < -1e-12` refusal and the `1e-15` sparsity cut on the derivative block are replaced
-  by the suffix sum's own rounding band, `γ_{7p+2}·2p/Δ_min`. The time-block penalty PSD
-  guard now reads the congruence's assembly band plus the eigensolver band, in place of
-  `100·p·ε·max(|λ|, 1)`, and an eigendecomposition failure is reported instead of skipping
-  the check.
+- **Survival I-spline time-block penalty: derived PSD band** (#3288).
+  The PSD guard on the assembled time-block penalty `Lᵀ S_B[1:,1:] L` used
+  `100·p·ε·max(|λ|, 1)`. It now reads its band from the assembly: the double
+  suffix sum's error bound, `γ_{2p+1}·‖Σ|S_B|‖_F` on the kept block, plus the
+  eigensolver's backward error. The old cut-off had an absolute floor of 1, so it
+  did not scale with the penalty. An eigendecomposition failure is now reported
+  instead of silently skipping the check.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from

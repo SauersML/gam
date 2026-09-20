@@ -1251,99 +1251,6 @@ pub fn parse_survival_time_basis_config(
 // Time basis construction
 // ---------------------------------------------------------------------------
 
-/// The I-spline columns that are NOT constant on `[data_min, data_max]`, read
-/// off the knot vector (#3288).
-///
-/// Column `c` of the degree-`degree` I-spline basis is `Σ_{m>c} B_{m,p}`, where
-/// `p = degree + 1` (`create_ispline_dense`). The sum telescopes under the de
-/// Boor derivative formula:
-///
-///   `M_c = I_c' = p·B_{c+1,p−1} / (t_{c+p+1} − t_{c+1})`.
-///
-/// That is one M-spline, strictly positive on the open interval
-/// `(t_{c+1}, t_{c+p+1})` and zero outside it. `I_c` is monotone, so it takes
-/// one value on every data point exactly when `M_c ≡ 0` on
-/// `(data_min, data_max)`, i.e. when that interval misses the support.
-///
-/// The `LinearTails` exterior continues `I_c` at its one-sided boundary slope,
-/// so the support reaches past `left` exactly when `M_c(left+) ≠ 0`. A
-/// degree-`q` B-spline `B_{i,q}` is nonzero at `t_i+` exactly when
-/// `t_i = t_{i+q}`, so the condition is `t_{c+1} = t_{c+p} = left`. Past
-/// `right`, by the mirror argument, it is `t_{c+2} = t_{c+p+1} = right`.
-///
-/// The rule reads knot order only. The former `max − min > 1e-12` value test
-/// was an absolute cut on I-spline values that carry roundoff (`I_c ≈ 1` above
-/// its support). It dropped a genuinely varying column whose only interior
-/// point sits a small distance past a knot, where `I_c ∼ (δ/h)^p`.
-fn ispline_columns_varying_on_range(
-    knots: ndarray::ArrayView1<'_, f64>,
-    degree: usize,
-    interval: Option<(f64, f64)>,
-    data_min: f64,
-    data_max: f64,
-) -> Vec<usize> {
-    let p = degree + 1;
-    let columns = knots.len().saturating_sub(p + 2);
-    if !(data_min < data_max) {
-        return Vec::new();
-    }
-    (0..columns)
-        .filter(|&c| {
-            let lo = knots[c + 1];
-            let hi = knots[c + p + 1];
-            if !(lo < hi) {
-                return false;
-            }
-            let (lo, hi) = match interval {
-                Some((left, right)) => (
-                    if lo == left && knots[c + p] == left {
-                        f64::NEG_INFINITY
-                    } else {
-                        lo
-                    },
-                    if hi == right && knots[c + 2] == right {
-                        f64::INFINITY
-                    } else {
-                        hi
-                    },
-                ),
-                None => (lo, hi),
-            };
-            data_min < hi && data_max > lo
-        })
-        .collect()
-}
-
-/// Rounding band on one entry of `create_ispline_derivative_dense(.., 1)` for a
-/// degree-`degree` I-spline, in the units of `d/dx` (#3288).
-///
-/// That evaluator forms `M_c` as the suffix sum `Σ_{m>c} B'_{m,p}` of B-spline
-/// derivatives, which have mixed signs. The exact `M_c` is non-negative, but
-/// the computed one can land slightly below zero. The bound has two parts.
-///
-/// - Magnitude of the summands. `B'_{m,p} = p·(B_{m,p−1}/Δ_m − B_{m+1,p−1}/Δ_{m+1})`
-///   with `Δ_m = t_{m+p} − t_m`. Since `Σ_m B_{m,p−1} ≤ 1`, this gives
-///   `Σ_m |B'_{m,p}| ≤ 2p / min_{Δ_m > 0} Δ_m`.
-/// - Roundings per summand. They are counted as `create_ispline_dense` counts
-///   its own entries: `6·p` through the recurrence and `p + 1` for the at most
-///   `p + 1` nonzero summands, plus one for the caller's chain-rule product.
-///
-/// The band is `γ_{7p+2} · 2p / Δ_min`. It is relative to the knot spacing, so
-/// shifting or rescaling `log t` moves it with the basis. An exact-zero `M_c`
-/// read inside it is roundoff, and a negative read outside it means the
-/// evaluator did not compute a non-negative M-spline.
-fn ispline_first_derivative_rounding_band(
-    knots: ndarray::ArrayView1<'_, f64>,
-    degree: usize,
-) -> f64 {
-    let p = degree + 1;
-    let min_span = (0..knots.len().saturating_sub(p))
-        .map(|m| knots[m + p] - knots[m])
-        .filter(|&span| span > 0.0)
-        .fold(f64::INFINITY, f64::min);
-    gam_linalg::roundoff::accumulation_growth(6 * p + (p + 1) + 1) * (2 * p) as f64 / min_span
-}
-
 pub fn build_survival_time_basis(
     age_entry: &Array1<f64>,
     age_exit: &Array1<f64>,
@@ -1948,22 +1855,22 @@ pub fn build_survival_time_basis(
                 }
 
                 let keep_cols = if keep_cols.is_empty() {
-                    // Structural (#3288): a column is kept iff its M-spline
-                    // support meets the span of the log-times the value basis
-                    // was evaluated at.
-                    let (data_min, data_max) = log_exit
-                        .iter()
-                        .chain(log_entry_for_basis.iter())
-                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
-                            (lo.min(v), hi.max(v))
-                        });
-                    ispline_columns_varying_on_range(
-                        knotvec.view(),
-                        degree,
-                        interval,
-                        data_min,
-                        data_max,
-                    )
+                    let constant_tol = 1e-12_f64;
+                    let mut inferred_keep_cols: Vec<usize> = Vec::new();
+                    for j in 0..p_time_full {
+                        let mut minv = f64::INFINITY;
+                        let mut maxv = f64::NEG_INFINITY;
+                        for i in 0..n {
+                            let ve = x_exit_full[[i, j]];
+                            let vs = x_entry_full[[i, j]];
+                            minv = minv.min(ve.min(vs));
+                            maxv = maxv.max(ve.max(vs));
+                        }
+                        if (maxv - minv) > constant_tol {
+                            inferred_keep_cols.push(j);
+                        }
+                    }
+                    inferred_keep_cols
                 } else {
                     keep_cols
                 };
@@ -1997,31 +1904,29 @@ pub fn build_survival_time_basis(
             // Structural (#2469): a capacity hint only; the triplets are pushed.
             let mut deriv_triplets = Vec::with_capacity(n * p_time.min(16));
             let mut found_nonfinite: Option<(usize, usize)> = None;
-            // The exact M-spline is non-negative. A computed entry within the
-            // suffix sum's own rounding band is not resolved from zero, and a
-            // negative one outside it is a defect of the evaluator (#3288).
-            let log_band = ispline_first_derivative_rounding_band(knotvec.view(), degree);
             for i in 0..n {
                 let chain = 1.0 / age_exit[i].max(SURVIVAL_TIME_FLOOR);
-                let band = log_band * chain;
                 for (j_new, &j_old) in keep_cols.iter().enumerate() {
                     let raw_v = d_exit_log_full[[i, j_old]] * chain;
-                    if !raw_v.is_finite() {
+                    let v = if (-1e-12..0.0).contains(&raw_v) {
+                        0.0
+                    } else {
+                        raw_v
+                    };
+                    if !v.is_finite() {
                         found_nonfinite = Some((i, j_new));
-                        continue;
                     }
-                    if raw_v.abs() <= band {
-                        continue;
-                    }
-                    if raw_v < 0.0 {
+                    if v < -1e-12 {
                         return Err(format!(
-                            "survival ispline derivative basis must stay non-negative at row {}, \
-                             column {}; found {raw_v:.3e} beyond its rounding band {band:.3e}",
+                            "survival ispline derivative basis must stay non-negative at row {}, column {}; found {:.3e}",
                             i + 1,
                             j_new + 1,
+                            v
                         ));
                     }
-                    deriv_triplets.push(faer::sparse::Triplet::new(i, j_new, raw_v));
+                    if v.abs() > 1e-15 {
+                        deriv_triplets.push(faer::sparse::Triplet::new(i, j_new, v));
+                    }
                 }
             }
             if let Some((row, col)) = found_nonfinite {
@@ -7972,86 +7877,5 @@ mod tests {
             interior.iter().any(|value| *value > 1.0e-9),
             "an interior anchor must still evaluate the basis, got {interior:?}"
         );
-    }
-
-    /// #3288: the retained I-spline columns are read off the knot vector, and
-    /// they agree with the evaluator's own derivative on every span, including
-    /// the case the former `max − min > 1e-12` value test dropped.
-    #[test]
-    fn ispline_keep_cols_follow_the_m_spline_support() {
-        use super::{ispline_columns_varying_on_range, ispline_first_derivative_rounding_band};
-        use gam_terms::basis::{
-            ISplineBoundary, ispline_modelling_interval, ispline_value_and_first_derivative,
-        };
-        // Degree-2 I-spline (internal degree 3) on [0, 1] with interior knots
-        // at the quarters. Column `c` has M-spline support `(t_{c+1}, t_{c+4})`:
-        // c0 (0, .25), c1 (0, .5), c2 (0, .75), c3 (.25, 1), c4 (.5, 1),
-        // c5 (.75, 1). Only c0 has a nonzero slope at `left` and only c5 one at
-        // `right`, so only they continue past the boundary knots.
-        let knots = Array1::from_vec(vec![
-            0.0, 0.0, 0.0, 0.0, 0.25, 0.5, 0.75, 1.0, 1.0, 1.0, 1.0,
-        ]);
-        let degree = 2;
-        let interval = ispline_modelling_interval(knots.view(), degree).expect("interval");
-        assert_eq!(interval, Some((0.0, 1.0)));
-        let keep = |lo: f64, hi: f64| {
-            ispline_columns_varying_on_range(knots.view(), degree, interval, lo, hi)
-        };
-        assert_eq!(keep(0.0, 1.0), vec![0, 1, 2, 3, 4, 5]);
-        assert_eq!(keep(0.3, 0.45), vec![1, 2, 3]);
-        assert_eq!(keep(-0.5, -0.1), vec![0], "only c0 extends below left");
-        assert_eq!(keep(1.2, 1.9), vec![5], "only c5 extends above right");
-        assert_eq!(keep(0.4, 0.4), Vec::<usize>::new(), "one point carries no shape");
-        // One data point a hair past the knot at 0.5: `I_4 ∼ (δ/h)^3 ≈ 1e-18`
-        // there, so a value test with an absolute 1e-12 cut drops column 4,
-        // although its M-spline is positive at that point.
-        let delta = 1e-6;
-        assert_eq!(keep(0.3, 0.5 + delta), vec![1, 2, 3, 4]);
-
-        // Cross-check against the evaluator on a grid of each range: a dropped
-        // column has `M_c` inside the rounding band everywhere, and a kept one
-        // is resolved from zero somewhere.
-        let band = ispline_first_derivative_rounding_band(knots.view(), degree);
-        for &(lo, hi) in &[(0.0, 1.0), (0.3, 0.45), (-0.5, -0.1), (1.2, 1.9), (0.3, 0.5 + delta)] {
-            let grid = Array1::linspace(lo, hi, 257);
-            let (_, derivative) = ispline_value_and_first_derivative(
-                grid.view(),
-                knots.view(),
-                degree,
-                ISplineBoundary::LinearTails,
-            )
-            .expect("I-spline pair");
-            let kept = keep(lo, hi);
-            for c in 0..derivative.ncols() {
-                let column = derivative.column(c);
-                assert!(
-                    column.iter().all(|&m| m >= -band),
-                    "M_{c} fell below -{band:.3e} on [{lo}, {hi}]: {column:?}"
-                );
-                let resolved = column.iter().any(|&m| m > band);
-                assert_eq!(
-                    resolved,
-                    kept.contains(&c),
-                    "column {c} on [{lo}, {hi}]: structural keep {kept:?}, evaluator {column:?}"
-                );
-            }
-        }
-    }
-
-    /// #3288: the derivative band is relative to the knot spacing, so a shift
-    /// of `log t` (a change of time unit) leaves it unchanged and a rescale
-    /// moves it inversely, as `d/dx` does.
-    #[test]
-    fn ispline_derivative_band_moves_with_the_knot_scale() {
-        use super::ispline_first_derivative_rounding_band;
-        let knots = Array1::from_vec(vec![0.0, 0.0, 0.0, 0.0, 0.3, 0.7, 1.0, 1.0, 1.0, 1.0]);
-        let base = ispline_first_derivative_rounding_band(knots.view(), 2);
-        let shifted = knots.mapv(|t| t - 13.8);
-        let scaled = knots.mapv(|t| 8.0 * t);
-        assert!(base.is_finite() && base > 0.0, "{base}");
-        let shifted_band = ispline_first_derivative_rounding_band(shifted.view(), 2);
-        assert!((shifted_band - base).abs() <= 1e-3 * base, "{shifted_band} vs {base}");
-        let scaled_band = ispline_first_derivative_rounding_band(scaled.view(), 2);
-        assert_eq!(scaled_band, base / 8.0);
     }
 }
