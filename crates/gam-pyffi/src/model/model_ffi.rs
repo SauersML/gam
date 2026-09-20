@@ -14,7 +14,7 @@ use sklearn_metadata::sklearn_fit_metadata;
 
 use gam::families::inference::saved_summary::{
     compare_saved_models, prediction_model_class_label, saved_model_report_input,
-    saved_model_summary, saved_models_log_evidence_ratio, scan_introspection, scan_smooth_label,
+    saved_model_summary, saved_models_evidence_ratio, scan_introspection, scan_smooth_label,
 };
 use gam::families::inference::summary_text::render_summary_text;
 
@@ -1614,23 +1614,23 @@ fn compile_model(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<PyFittedModel
     PyFittedModel::compile(py, model_bytes)
 }
 
-/// Log Akaike evidence ratio of model A over model B on the smoothing-corrected
-/// AIC, `−(AIC_c(A) − AIC_c(B))/2`, formed by the same Rust comparison as
-/// `compare_models`.
+/// Akaike evidence ratio of model A over model B on the smoothing-corrected
+/// AIC, `exp(−(AIC_c(A) − AIC_c(B))/2)`, formed by the same Rust comparison as
+/// `compare_models`; `+inf` / `0` once the ratio leaves the `f64` range.
 ///
-/// This is the relative likelihood of Burnham & Anderson, NOT a log Bayes
-/// factor (no prior is integrated over), and the Python surface names it
+/// This is the relative likelihood of Burnham & Anderson, NOT a Bayes factor
+/// (no prior is integrated over), and the Python surface names it
 /// `Model.evidence_ratio_vs` accordingly.
 #[pyfunction]
-fn log_evidence_ratio(
+fn evidence_ratio(
     py: Python<'_>,
     model_a: PyRef<'_, PyFittedModel>,
     model_b: PyRef<'_, PyFittedModel>,
 ) -> PyResult<f64> {
     let model_a = Arc::clone(&model_a.model);
     let model_b = Arc::clone(&model_b.model);
-    detach_py_result(py, "log_evidence_ratio", move || {
-        saved_models_log_evidence_ratio(&model_a, &model_b)
+    detach_py_result(py, "evidence_ratio", move || {
+        saved_models_evidence_ratio(&model_a, &model_b)
     })
 }
 
