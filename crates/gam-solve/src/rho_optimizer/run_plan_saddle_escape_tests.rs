@@ -1411,6 +1411,8 @@ impl OuterObjective for RecordingValley {
 struct ValleyRounds {
     saddle_rounds: usize,
     iteration_zero_restarts: usize,
+    /// Hessian-order requests over the whole run, the mint's included.
+    hessian_requests: usize,
 }
 
 fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
@@ -1418,7 +1420,11 @@ fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
     let mut derivative_points: Vec<Array1<f64>> = Vec::new();
     let mut previous_finalize: Option<Array1<f64>> = None;
     let mut iteration_zero_restarts = 0usize;
+    let mut hessian_requests = 0usize;
     for request in requests {
+        if matches!(request, ValleyRequest::Ordered(OuterEvalOrder::ValueGradientHessian, _)) {
+            hessian_requests += 1;
+        }
         match request {
             ValleyRequest::Cost | ValleyRequest::Ordered(OuterEvalOrder::Value, _) => {}
             ValleyRequest::Legacy(rho)
@@ -1448,6 +1454,7 @@ fn valley_rounds(requests: &[ValleyRequest]) -> ValleyRounds {
     ValleyRounds {
         saddle_rounds: saddle_points.len(),
         iteration_zero_restarts,
+        hessian_requests,
     }
 }
 
@@ -1603,6 +1610,21 @@ fn a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939() {
         result.plan_used.solver,
         Solver::Bfgs,
         "with no certified saddle the search must keep the gradient-only plan"
+    );
+    // #2898: the gradient-only lifecycle assembles the declared Hessian once, for the
+    // mint's certificate, and never while it searches.
+    assert_eq!(
+        rounds.hessian_requests, 1,
+        "the gradient-only search must request the declared Hessian exactly once, at the mint: \
+         {rounds:?}"
+    );
+    assert!(
+        result
+            .criterion_certificate
+            .as_ref()
+            .is_some_and(|c| c.hessian_psd() == Some(true)),
+        "the mint's one Hessian must price the certificate: rho={:?}",
+        result.rho
     );
 }
 

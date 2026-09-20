@@ -2215,5 +2215,50 @@
     ],
     "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
     "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "items": [
+      "crates/gam-models/src/gamlss/dispersion_family.rs:fn:outer_hyper_hessian_dense_available"
+    ],
+    "reason": "DispersionGlmLocationScaleFamily's override of CustomFamily::outer_hyper_hessian_dense_available returned `specs.len() < 2`. It declined the dense outer Hessian on every two-block fit because the family had no joint second directional derivative D2_beta H_L[u, v], and the trait default for that hook is block-diagonal, which drops the mean/precision cross curvature. The family now implements exact_newton_joint_hessian_second_directional_derivative_with_specs from its contracted fourth row surfaces, so the override is deleted and the trait default (dense outer Hessian available) applies. The trait method and every other family's implementation are unchanged.",
+    "evidence": "Direct gate dy7 run w2tha-g1-predict (direct-dy7-w2tha-g1-predict.log) at 96a81f3bca on this change gave RC_CHECK 0, SCANNER_ERRORS 0 and RC_PYFFI 0. The gam-predict gamma, negbin and tweedie dispersion_location_scale_assembles_covariance_and_is_predictable tests passed 3 of 3; gamma had been red at 64f2129d00 (dy3 w2o-3140-basectl) and at 96a81f3bca (dy6 w2tha-pr1b). The guard's only hit is this override. The name's other occurrences are the trait declaration, its callers and other families' own overrides, none of which change."
+  },
+  {
+    "base": "45d1a4328ec82034e602ca762a1232a27a3934bc",
+    "items": [
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:const:POLISH_MAX_ITER",
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs:fn:polish_joint_newton_step"
+    ],
+    "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
+    "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
+    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
+    "items": [
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:enum:MixedPrecisionAttempt",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_factor_slab_to_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:arrow_rhs",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:cholesky_solve_lower_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:mixed_precision_kappa_gate_failure",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:solve_arrow_system_f32",
+      "crates/gam-solve/src/arrow_schur/newton_step.rs:fn:try_mixed_precision_arrow_solve",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_KAPPA_MARGIN",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:F32_UNIT_ROUNDOFF",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER",
+      "crates/gam-solve/src/arrow_schur/prelude.rs:const:MIXED_PRECISION_KAPPA_MARGIN_CEILING",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:matrix_inf_norm",
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs:fn:mixed_precision_reduced_beta",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:ArrowSolvePrecisionPolicy",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:enum:MixedPrecisionStatus",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:certified_mixed",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:default",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:is_enabled",
+      "crates/gam-solve/src/arrow_schur/solve_options.rs:fn:with_streaming_solve_precision_default"
+    ],
+    "reason": "#2946 census T10: the arrow-Schur CertifiedMixed solve factored in f64 (factor_dense_reduced_schur and the per-row H_tt factors), copied those factors to f32, and ran f32 triangular solves with f64-residual refinement until a normwise backward-error certificate closed. Because the f64 factor that answers the system in one triangular solve already existed, the f32 path was strictly more work, gated by chosen constants (6 refinements, 1e-11 certificate, kappa*u_f32 margin 0.5 / ceiling 1.0, 64*eps floor). SPEC: 'Unnecessary choices and options should be deleted, not included.' and 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' Deleted: the policy enum and its Default impl, the status enum, both mixed solves, the kappa gate, the f32 helpers (slab copy, f32 arrow solve, f32 Cholesky solve), arrow_rhs and matrix_inf_norm (used only by the mixed path), the streaming default upgrade and the six constants.",
+    "evidence": "At base 5834fb219d source_removal_guard.py reports exactly these 21 identities. The removed `default` is the one `impl Default for ArrowSolvePrecisionPolicy`; the other Default impls in solve_options.rs are untouched. At head git grep finds no occurrence of ArrowSolvePrecisionPolicy, MixedPrecisionStatus, solve_precision, mixed_precision_status, try_mixed_precision_arrow_solve, mixed_precision_reduced_beta or F32_UNIT_ROUNDOFF outside CHANGELOG.md and the ledgers. Every former caller already fell back to the f64 cholesky_solve_vector / solve_dense_reduced_system on the same factor, which is now the only route. No test constructed CertifiedMixed or read mixed_precision_status. cargo check --workspace --tests rc 0."
   }
 ]
