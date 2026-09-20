@@ -87,8 +87,9 @@ pub enum SmoothPValueUnavailable {
     /// positive semidefinite at a penalized mode; the score then has no
     /// covariance to refer it to.
     IndefiniteCurvature,
-    /// The scale is estimated, but the fit has no positive residual degrees of
-    /// freedom for the denominator of the reference law.
+    /// The scale is estimated, but the fit records no working residual, or the
+    /// full model fit unpenalized leaves no residual (`n⁺ ≤ rank(X'WX)`) for
+    /// the denominator `D′/ν` of the reference law (gam#3832).
     ResidualDfUnavailable,
     /// A random-effect term whose variance-component score test
     /// (`gam_terms::inference::random_effect_test`) could not be computed, with
@@ -145,8 +146,9 @@ impl SmoothPValueUnavailable {
                  indefinite covariance, so the score has no variance law; no p-value is reported"
             }
             Self::ResidualDfUnavailable => {
-                "residual df unavailable: the scale is estimated but the fit has no positive \
-                 residual degrees of freedom; no p-value is reported"
+                "residual df unavailable: the scale is estimated but the full model fit \
+                 unpenalized leaves no residual to estimate it from (or the fit recorded no \
+                 working residual); no p-value is reported"
             }
             Self::RandomEffect(reason) => reason.explanation(),
             Self::RandomEffectTestNotRecorded => {

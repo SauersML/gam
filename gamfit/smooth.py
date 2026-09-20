@@ -786,8 +786,10 @@ class Sphere(Smooth):
     kernel : one of ``"sobolev"`` (default), ``"pseudo"``, ``"harmonic"``.
     radians : default ``False`` (degrees, Earth/data-frame convention).
     centers : optional explicit ``(K, 2)`` center array (lat, lon) in the
-        same angular convention as ``radians``. When provided, ``n_centers``
-        is ignored and ``K = centers.shape[0]`` drives the basis size.
+        same angular convention as ``radians``, for the Wahba kernels. When
+        provided, ``n_centers`` is ignored and ``K = centers.shape[0]`` drives
+        the basis size. Refused with ``kernel="harmonic"``, which has no
+        centers.
 
     Notes
     -----
@@ -816,50 +818,52 @@ class Sphere(Smooth):
 
     @property
     def basis_size(self) -> int:
-        """Analytic basis dimension, the column count of :meth:`evaluate` — no
-        Rust call required.
+        """Column count of :meth:`evaluate`, read from the Rust builder's width
+        rule without evaluating the basis.
 
-        - ``kernel='sobolev'``: ``K = n_centers``. The Rust builder's
-          ``CenterSumToZero`` identifiability is the identity on the decomposed
-          Wahba design, whose width is the center count.
-        - ``kernel='harmonic'``: ``K = L * (L + 2)`` where ``L = n_centers``
-          is the truncation degree.
-        - ``kernel='pseudo'``: the Rust builder routes through harmonics of the
-          smallest degree ``L`` with ``L * (L + 2) >= n_centers``, and at least
-          8, so ``K = L * (L + 2)``.
+        ``kernel='sobolev'`` keeps one column per center, ``'harmonic'`` spans
+        the ``L * (L + 2)`` harmonics of degrees ``1..=L`` with ``L =
+        n_centers``, and ``'pseudo'`` routes through harmonics of a degree
+        chosen to reach ``n_centers`` columns. A descriptor the builder refuses
+        (a degree past the harmonic cap, fewer than two centers) raises here.
         """
-        if self.centers is not None:
+        from . import _api
+
+        if self._is_harmonic() or self.centers is None:
+            width = int(self.n_centers)
+        else:
             import numpy as np
 
-            k = int(np.asarray(self.centers, dtype=np.float64).shape[0])
-        else:
-            k = int(self.n_centers)
-        kernel = str(self.kernel).lower()
-        if kernel == "harmonic":
-            return k * (k + 2)
-        if kernel == "pseudo":
-            degree = next((l for l in range(1, 33) if l * (l + 2) >= k), None)
-            if degree is None:
-                raise ValueError(
-                    f"Sphere.basis_size: a pseudo kernel with {k} centers exceeds the "
-                    "degree-32 harmonic cap (1088 columns), which the Rust builder refuses"
-                )
-            degree = max(degree, 8)
-            return degree * (degree + 2)
-        return k
+            width = int(np.asarray(self.centers, dtype=np.float64).shape[0])
+        return int(_api.rust_module().sphere_basis_size(width, str(self.kernel)))
+
+    def _is_harmonic(self) -> bool:
+        """Whether this is the center-free truncated spherical-harmonic basis.
+        Explicit ``centers`` with ``kernel='harmonic'`` are refused rather than
+        silently ignored."""
+        harmonic = str(self.kernel).lower() == "harmonic"
+        if harmonic and self.centers is not None:
+            raise ValueError(
+                "Sphere(kernel='harmonic') is a truncated spherical-harmonic basis of "
+                "degree n_centers and has no centers; drop `centers` or use "
+                "kernel='sobolev' / 'pseudo'"
+            )
+        return harmonic
 
     def _resolve_centers(self, coords: Any) -> Any:
         """Resolve and cache the basis center matrix.
 
         For ``kernel='harmonic'`` no centers are needed and this returns
-        ``None``. For Wahba kernels the resolution order is:
+        ``None`` (explicit ``centers`` are refused, see
+        :meth:`_is_harmonic`). For Wahba kernels the resolution order
+        is:
 
         1. User-supplied ``centers``.
         2. Farthest-point sampling (Rust) from ``coords``, completed from the
            Fibonacci lattice when ``coords`` holds fewer than ``n_centers``
            distinct directions.
         """
-        if str(self.kernel).lower() == "harmonic":
+        if self._is_harmonic():
             return None
 
         cached = getattr(self, "_cached_centers", None)

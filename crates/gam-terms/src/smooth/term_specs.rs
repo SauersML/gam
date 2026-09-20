@@ -8267,22 +8267,42 @@ pub(crate) fn build_single_local_smooth_term_for(
                     term.name
                 );
             }
-            // Split the marginal penalty's null space into its function
-            // components BEFORE the penalty vector is rebuilt below; the
-            // sum-to-zero null-space ridges replicate these into the contrast
-            // space.
+            // The marginal's `double_penalty=` decides whether the deviation
+            // null space is penalized, and that null penalty has exactly ONE
+            // representation here: the pooled `(I + 11ᵀ) ⊗ R_k` ridges below
+            // (#3969). The marginal's own null-space ridge `R` is therefore
+            // never replicated per level. Its function components satisfy
+            // `Σ_k R_k = R` and the per-level structures `E_k` satisfy
+            // `Σ_k E_k = I + 11ᵀ`, so carrying both `E_k ⊗ R` and
+            // `(I + 11ᵀ) ⊗ R_k` would make the total null penalty
+            // `Σ_{k,j} (μ_k + ν_j) E_k ⊗ R_j`, whose smoothing parameters
+            // cannot be identified (`μ_k += c`, `ν_j -= c` leaves it unchanged).
+            let null_space_penalized = inner_built
+                .active_penalties
+                .iter()
+                .any(|penalty| {
+                    matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            // Split the marginal curvature penalty's null space into its
+            // function components BEFORE the penalty vector is rebuilt below;
+            // the sum-to-zero null-space ridges replicate these into the
+            // contrast space.
             let inner_degree = match inner.as_ref() {
                 SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec.degree),
                 _ => None,
             };
-            let inner_null_components = match inner_built.active_penalties.first() {
-                Some(penalty) => factor_smooth_null_component_penalties(
+            let inner_primary = inner_built
+                .active_penalties
+                .iter()
+                .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary));
+            let inner_null_components = match (null_space_penalized, inner_primary) {
+                (true, Some(penalty)) => factor_smooth_null_component_penalties(
                     &penalty.matrix,
                     &inner_built.metadata,
                     inner_degree,
                     &term.name,
                 )?,
-                None => Vec::new(),
+                _ => Vec::new(),
             };
             let base = inner_built
                 .design
@@ -8381,8 +8401,15 @@ pub(crate) fn build_single_local_smooth_term_for(
                     }
                     s_big
                 };
-            for base_penalty in &inner_built.active_penalties {
-                // Emit `L` independent per-level blocks for this marginal penalty.
+            let curvature_penalties = inner_built
+                .active_penalties
+                .iter()
+                .filter(|penalty| {
+                    !matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            for base_penalty in curvature_penalties {
+                // Emit `L` independent per-level blocks for this marginal
+                // curvature penalty (the null-space ridge is pooled below).
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
                     let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw)?;
@@ -8413,7 +8440,10 @@ pub(crate) fn build_single_local_smooth_term_for(
             // contrast space, so the constraint (and the identifiability of `sz`
             // vs `fs`) is preserved. The split is made with the marginal's
             // function metric, so which deviations each `λ` shrinks does not
-            // depend on the coefficient chart (SPEC rule 5).
+            // depend on the coefficient chart (SPEC rule 5). The components are
+            // empty unless the marginal requests its null-space penalty
+            // (`double_penalty=`, on by default), so `double_penalty=false`
+            // really leaves the deviation null space unpenalized.
             for p_k in &inner_null_components {
                 // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ R_k` form): each is
                 // one shared variance for that null component of every level's
