@@ -4990,12 +4990,14 @@ mod fisher_override_tests {
             })
             .expect("override fit must converge")
         };
+        // Dyadic entries, so (W + Wᵀ)/2 of the skewed block rounds to the
+        // symmetric block exactly and the two fits must agree bit for bit.
         let symmetric = Array3::from_shape_fn((n, 2, 2), |(_, a, b)| {
-            if a == b { 2.0 / 9.0 } else { -1.0 / 9.0 }
+            if a == b { 0.25 } else { -0.125 }
         });
         let skew = Array3::from_shape_fn((n, 2, 2), |(row, a, b)| match (a, b) {
-            (0, 1) => 0.05 * (row as f64 + 1.0),
-            (1, 0) => -0.05 * (row as f64 + 1.0),
+            (0, 1) => 0.0625 * (row as f64 + 1.0),
+            (1, 0) => -0.0625 * (row as f64 + 1.0),
             _ => 0.0,
         });
         let asymmetric = &symmetric + &skew;
