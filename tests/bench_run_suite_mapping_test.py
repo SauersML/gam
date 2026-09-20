@@ -161,7 +161,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                 for _ in range(5)
             ],
             plot_payload=None,
-            model_spec="s_temp ~ s(year, type=ps, knots=7) via release binary [5-fold CV]",
+            model_spec="s_temp ~ s(year, bs=ps, knots=7) via release binary [5-fold CV]",
         )
         self.assertEqual(result["evaluation"], "5-fold CV")
         # Required-metadata contract: every successful result row must carry
@@ -196,7 +196,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     }
                 ],
                 plot_payload=None,
-                model_spec="s_temp ~ s(year, type=ps, knots=7) via release binary [holdout]",
+                model_spec="s_temp ~ s(year, bs=ps, knots=7) via release binary [holdout]",
                 extra_metrics={"evaluation": "broken"},
             )
 
@@ -208,7 +208,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "contender": "rust_gam",
                     "scenario_name": "lidar_semipar",
                     "evaluation": "5-fold CV",
-                    "model_spec": "logratio ~ s(range, type=ps, knots=24) via release binary [5-fold CV]",
+                    "model_spec": "logratio ~ s(range, bs=ps, knots=24) via release binary [5-fold CV]",
                 }
             ]
         )
@@ -222,7 +222,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                         "contender": "rust_gam",
                         "scenario_name": "lidar_semipar",
                         "evaluation": None,
-                        "model_spec": "logratio ~ s(range, type=ps, knots=24) via release binary [5-fold CV]",
+                        "model_spec": "logratio ~ s(range, bs=ps, knots=24) via release binary [5-fold CV]",
                     }
                 ]
             )
@@ -446,7 +446,7 @@ class RunSuiteMappingTests(unittest.TestCase):
             "papuan_oce4_duchon_k6", {"target": "y"}, cfg_override=cfg
         )
         self.assertIn("duchon(pc1, pc2, pc3, pc4", rust_formula)
-        self.assertNotIn("type=ps", rust_formula)
+        self.assertNotIn("bs=ps", rust_formula)
 
     def test_geo_subpop16_dataset_builds_without_external_pc_file(self) -> None:
         ds = _RUN_SUITE.dataset_for_scenario({"name": "geo_subpop16_tp_k6"})
@@ -558,7 +558,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "_rust_formula_for_scenario",
                     lambda *_args, **_kwargs: (
                         "gaussian",
-                        "logratio ~ s(range, type=ps, knots=24)",
+                        "logratio ~ s(range, bs=ps, knots=24)",
                     ),
                 ),
                 (_RUN_SUITE, "zscore_train_test", lambda train, test, _features: (train, test)),
@@ -618,7 +618,7 @@ class RunSuiteMappingTests(unittest.TestCase):
                     "_rust_formula_for_scenario",
                     lambda *_args, **_kwargs: (
                         "gaussian",
-                        "logratio ~ s(range, type=ps, knots=24)",
+                        "logratio ~ s(range, bs=ps, knots=24)",
                     ),
                 ),
                 (_RUN_SUITE, "_sigma_feature_terms", lambda *_args, **_kwargs: ["s(range)"]),

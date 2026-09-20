@@ -48,7 +48,7 @@ Status labels used throughout:
 - **What the current failures are.** The box is [ln(√ε γ_min), ln(γ_max/√ε)] (`rho_domain.rs:142`–`159`).
   - Its edges sit exactly at the ρ where the naive ρ-gradient's rounding noise equals its signal c·e^{−ρ}. Measured crossover: ρ ≈ 22 [num].
   - An optimum on a face therefore rails at the box edge, with |Pg| of noise size just above the bound. This matches prostate-logit (2.28e-5 against 7.3e-6 at ρ = 22.73), the Matérn and statsmodels lower rails near −21 to −18, and the statsmodels upper rail at 21.63.
-  - The Weibull-AFT and `x1+cc(x2)` failures are interior or indefinite, not face problems. They gain only from the exact-Hessian negative-curvature trust region and from deleting the tail snap.
+  - The Weibull-AFT and `x1+cyclic(x2)` failures are interior or indefinite, not face problems. They gain only from the exact-Hessian negative-curvature trust region and from deleting the tail snap.
 - **Deletions.**
   - Delete entirely: `rho_optimizer/rail.rs` (230 lines), `rho_optimizer/asymptote_certificate.rs` (725 lines, including the magic 1e-8, 1e-6 and 1e-3 constants), the resolvability-box constructors, and the inverted-box validation in `run.rs`.
   - Keep and repurpose `rail_face.rs` and `reml/rail_face_limit.rs` as the τ-regular face evaluator. Ideally it merges into the main evaluator: the master-lemma form is valid at τ = 0 and at τ > 0 alike.
@@ -425,7 +425,7 @@ At the top edge, τγ_max = √ε. The naive g_ρ noise there is about ε κ₀ 
 | iso-kappa Matérn (14600), mgcv Matérn (15831), sklearn GP (33534) | lower rails near −20.8 to −21 with abs(Pg) up to 3.6 (not noise-sized) | a λ = 0 end plus a possible (ρ, ψ) microergodic ridge. The large abs(Pg) says the box cuts a descent direction, which is exactly what a hand bound does | u chart removes the cut; the ridge is for the Matérn identifiability report |
 | multinomial (13475) | many ρ near −15 | the family floor `rho_lower_bound` (`crates/gam-model-api/src/families/custom_family/options.rs:447`) acts as a hand bound; the λ → 0 end is covered or uncovered per Theorem 3 | replace the floor with u = 1 (the domain) plus a typed non-identifiability check; defer to the multinomial report for the floor's derivation |
 | Weibull AFT by-factor (33697) | unrailed, abs(Pg) = 6.99e-2 vs 1.86e-3; tail snap declined ("ρ = 5.16 more than 18 e-folds inside the box"); curved variant λ_min(H) = −6.4e-4 | interior non-convergence or indefinite curvature, not a face | exact-Hessian trust region with negative-curvature steps (opt); deleting the tail snap removes a misleading decline path |
-| `x1+cc(x2)` (1009) | ARC decrement stall | interior | not a compactification issue |
+| `x1+cyclic(x2)` (1009) | ARC decrement stall | interior | not a compactification issue |
 
 ### 6.2 Deletions
 
