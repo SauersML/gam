@@ -2932,5 +2932,13 @@
     ],
     "reason": "Unbanded objective values now carry their own arithmetic rounding via value_representation_band. CostStallGuard no longer takes the statistical decrement tolerance, leaving this fixture constant without a reader.",
     "evidence": "All CostStallGuard constructors use the configuration and publication slot. Complete gam_solve unit source passes warnings-denied metadata checking; optimizer regressions cover unbanded descent, sub-rounding stalls and typed rank-boundary failures."
+  },
+  {
+    "base": "9200d1d37f6b27ba1ea2834acc521aabcca8b0c0",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/residual_dist.rs:fn:inverse_link_pdffourth_derivative"
+    ],
+    "reason": "#3745: residual derivatives now use the shared inverse-link jets, including Gaussian tail-safe products. The redundant fourth-derivative dispatcher is removed and its sole row-kernel caller directly uses the shared dispatcher. Residual-to-standard-link mapping derives from the same component owner.",
+    "evidence": "Complete production gam-models source compiled and ran three focused regressions on MSI with coherent current-main dependencies: independent Hermite references, infinite/NaN limits across all residual laws, and nonzero Gaussian subnormal derivatives after density underflow. Complete unit metadata passes with warnings denied. Reference audit finds no remaining use of the removed dispatcher; row_kernel calls inverse_link_pdffourth_derivative_for_inverse_link directly."
   }
 ]
