@@ -5954,4 +5954,28 @@ mod beta_logit_fisher_row_tail_tests {
         assert!(relative_error(upper.c, 8.4967085105831768e-18) <= 1e-12, "c = {:e}", upper.c);
         assert!(relative_error(upper.d, -8.4967085105831755e-18) <= 1e-12, "d = {:e}", upper.d);
     }
+
+    /// The Beta precision refresh reads the same exact logit pair as the row.
+    /// Main formed the moment statistic from the rounded mean and refused
+    /// every row past η ≈ 36.7, where `μ` rounds to 1 although `1 − μ` is a
+    /// normal number. The mirrored sample (η → −η, y → 1 − y) must give the
+    /// same precision. The reference is the moment estimator in 60-digit
+    /// arithmetic on these f64 inputs.
+    #[test]
+    fn beta_precision_moment_estimate_accepts_rows_past_the_rounded_mean() {
+        use super::super::estimate_beta_phi_from_eta;
+        use ndarray::array;
+        let weights = array![1.0, 1.0, 1.0, 1.0];
+        let eta = array![-2.0, 0.5, 38.0, 45.0];
+        let y = array![0.25, 0.625, 1.0 - 2f64.powi(-53), 1.0 - 2f64.powi(-50)];
+        let mirrored_eta = eta.mapv(|e: f64| -e);
+        let mirrored_y = y.mapv(|v: f64| 1.0 - v);
+        let phi = estimate_beta_phi_from_eta(y.view(), &eta, weights.view())
+            .expect("the upper-tail sample has a finite moment precision");
+        let mirrored = estimate_beta_phi_from_eta(mirrored_y.view(), &mirrored_eta, weights.view())
+            .expect("the lower-tail sample has a finite moment precision");
+        let reference = 23.544459333498157;
+        assert!(relative_error(phi, reference) <= 1e-13, "phi = {phi:e}");
+        assert!(relative_error(mirrored, reference) <= 1e-13, "mirrored phi = {mirrored:e}");
+    }
 }
