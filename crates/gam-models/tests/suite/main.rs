@@ -9,6 +9,7 @@ mod bms_latent_conditional_residual_3016;
 mod bms_learned_sigma_finite_law_3059;
 mod bms_per_smooth_summary_2997;
 mod bms_route_arming_3164;
+mod bms_pooled_pilot_separation_3217;
 mod bspline_nonzero_anchor_affine_2297;
 mod duchon_grid_fit_and_rotation_2319;
 mod exact_gaussian_boundary_2663;

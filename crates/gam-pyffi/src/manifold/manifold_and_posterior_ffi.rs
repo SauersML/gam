@@ -723,7 +723,7 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design(&model, dataset)
+            gam_predict::partial_effect::standard_mean_design(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)
@@ -5123,8 +5123,11 @@ impl ManifoldSaeCore {
 
     #[staticmethod]
     fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Py<ManifoldSaeCore>> {
-        let payload_json = std::fs::read_to_string(path)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
+        // The one saved-model reader every surface shares (gam#3054): a
+        // filesystem refusal raises the `OSError` subclass its kind names, with
+        // the path in its message.
+        let payload_json = gam_model_api::saved_model::read_saved_model_file(&path)
+            .map_err(crate::saved_document_error_to_pyerr)?;
         Self::from_json(py, &payload_json)
     }
 
@@ -5143,8 +5146,12 @@ impl ManifoldSaeCore {
 
     fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         let payload = self.inner.to_json().map_err(py_value_error)?;
-        std::fs::write(path, payload)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
+        // The one saved-model writer every surface shares (gam#3054): atomic,
+        // so a failed save leaves the previous file whole, and durable on Unix
+        // before it returns. A filesystem refusal raises the `OSError` subclass
+        // its kind names, with the path in its message.
+        gam_model_api::saved_model::write_saved_model(&path, payload.as_bytes())
+            .map_err(crate::saved_document_error_to_pyerr)
     }
 
     fn __repr__(&self) -> PyResult<String> {
