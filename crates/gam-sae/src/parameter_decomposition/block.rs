@@ -122,7 +122,7 @@ use super::rewrite::{
 };
 use gam_linalg::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
 use gam_runtime::resource::Governed;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, Zip};
 use std::fmt;
 
 /// A source model's input normalization on its own tensors.
@@ -163,43 +163,41 @@ impl NativeNorm {
     /// band against the exact normalization of the same rows: `|fl(N(h)) − N(h)|`
     /// entrywise, for a receipt that compares this stage at its own input.
     ///
-    /// - **RMSNorm.** `fl(N(h))` passes the squares, `d − 1` additions, the mean,
-    ///   `+ ε`, the square root, the reciprocal and the products with the row and the
-    ///   gain, `γ_(d+6)` relative, so the band is `γ_(d+6) |fl(N(h))| / (1 − γ_(d+6))`.
+    /// - **RMSNorm.** [`rms_norm_band`].
     /// - **LayerNorm.** The centred row `ĉ = fl(h − fl(mean h))` carries an absolute
-    ///   error `e_j ≤ γ_d mean|h| + u |ĉ_j| / (1 − u)`, which no relative bound covers
-    ///   near a constant row. It passes through the normalization, whose Jacobian has
-    ///   spectral norm `ρ(x) = (‖x‖²/d + ε)^(-1/2)`, so it adds `|w_i| sup ρ ‖e‖₂` by the
-    ///   mean value inequality. On the segment `sup ρ ≤ ((‖ĉ‖/2)²/d + ε)^(-1/2)` once
-    ///   `4 ‖e‖₂ ≤ ‖ĉ‖`, and `sup ρ ≤ ε^(-1/2)` always. The row's own rounding at `ĉ`
-    ///   is `γ_(d+7) (|w_i ĉ_i ν̂| + |b_i|)`, the bias addition included.
+    ///   error `e_j ≤ γ_d mean|h| + 2^-1074 + u |ĉ_j| / (1 − u)` (the `2^-1074` covers the
+    ///   mean's division rounding into the subnormal range, [`SUBNORMAL_SPACING`]), which no
+    ///   relative bound covers near a constant row. It passes through the normalization, whose
+    ///   Jacobian has spectral norm `ρ(x) = (‖x‖²/d + ε)^(-1/2)`, so it adds `|w_i| sup ρ ‖e‖₂`
+    ///   by the mean value inequality. On the segment `sup ρ ≤ ((‖ĉ‖/2)²/d + ε)^(-1/2)` once
+    ///   `4 ‖e‖₂ ≤ ‖ĉ‖`, and `sup ρ ≤ ε^(-1/2)` always. `‖e‖₂` is scaled by its largest entry,
+    ///   so no square of an error underflows. The row's own rounding at `ĉ` is
+    ///   [`rms_norm_band`]'s at `x = ĉ` with `γ_(d+7)` for the bias addition:
+    ///   `λ (|w_i ĉ_i ν̂| + |b_i| + a_i) / (1 − λ) + a_i`.
     ///
-    /// Every band is divided by `1 − γ_k` for its own arithmetic: `k = d + 12` for an RMSNorm
-    /// band, and `k = 2d + 20` for a LayerNorm band, whose slope and error norm each take a
-    /// sum of `d` squares and a square root before their product. A LayerNorm row
-    /// with `ε = 0` whose error is not below a quarter of its norm has no bound and is
-    /// refused.
+    /// A LayerNorm band is divided by `1 − γ_(2d+23)` for its own arithmetic: its slope and
+    /// error norm each take a sum of `d` squares and a square root before their product, and
+    /// the scaled error norm adds a division and a product on its path and scaled squares
+    /// whose underflow stays below one more rounding. A row with `ε = 0` whose error is not
+    /// below a quarter of its norm, or whose mean square is not resolved above binary64's
+    /// underflow ([`rms_norm_band`]), has no bound and is refused.
     pub fn apply_with_band(&self, rows: ArrayView2<'_, f64>) -> Result<(Array2<f64>, Array2<f64>), BlockError> {
         let normalized = self.as_masked_norm().apply(rows)?;
         let width = rows.ncols();
         let band = match self {
-            Self::Rms { .. } => rms_norm_band(normalized.view()),
+            Self::Rms { epsilon, gain } => rms_norm_band(*epsilon, gain.view(), rows, normalized.view())?,
             Self::Layer { epsilon, gain, bias } => {
-                let (mean_growth, own_growth) = (accumulation_growth(width), accumulation_growth(width + 7));
-                let dominance = 1.0 - accumulation_growth(2 * width + 20);
+                let mean_growth = accumulation_growth(width);
+                let dominance = 1.0 - accumulation_growth(2 * width + 23);
                 let mut band = Array2::<f64>::zeros(rows.raw_dim());
                 for (row, (values, mut band_row)) in rows.rows().into_iter().zip(band.rows_mut()).enumerate() {
                     let mean = values.sum() / width as f64;
                     let centred = values.mapv(|value| value - mean);
                     let mean_abs = values.iter().map(|value| value.abs()).sum::<f64>() / width as f64;
-                    let error_norm = centred
-                        .iter()
-                        .map(|&value| {
-                            let error = mean_growth * mean_abs + UNIT_ROUNDOFF * value.abs() / (1.0 - UNIT_ROUNDOFF);
-                            error * error
-                        })
-                        .sum::<f64>()
-                        .sqrt();
+                    let errors = centred.mapv(|value| {
+                        mean_growth * mean_abs + SUBNORMAL_SPACING + UNIT_ROUNDOFF * value.abs() / (1.0 - UNIT_ROUNDOFF)
+                    });
+                    let error_norm = scaled_norm(errors.view());
                     let centred_norm = centred.iter().map(|value| value * value).sum::<f64>().sqrt();
                     let slope = if 4.0 * error_norm <= centred_norm {
                         let half = centred_norm / 2.0;
@@ -209,6 +207,8 @@ impl NativeNorm {
                     } else {
                         return Err(BlockError::NormBandUnbounded { row });
                     };
+                    let growth = normalization_growth(centred.view(), *epsilon, width + 7)
+                        .ok_or(BlockError::NormBandUnbounded { row })?;
                     let inverse_root = (centred.iter().map(|value| value * value).sum::<f64>() / width as f64
                         + epsilon)
                         .sqrt()
@@ -216,8 +216,9 @@ impl NativeNorm {
                     for (((slot, &weight), &offset), &value) in
                         band_row.iter_mut().zip(gain.iter()).zip(bias.iter()).zip(centred.iter())
                     {
-                        let own = own_growth * ((weight * value * inverse_root).abs() + offset.abs())
-                            / (1.0 - own_growth);
+                        let absolute = underflow_reach(weight);
+                        let magnitude = up(up((weight * (value * inverse_root)).abs() + offset.abs()) + absolute);
+                        let own = up(up(up(growth * magnitude) / down(1.0 - growth)) + absolute);
                         *slot = (own + weight.abs() * slope * error_norm) / dominance;
                     }
                 }
@@ -228,16 +229,145 @@ impl NativeNorm {
     }
 }
 
-/// The rounding band of one binary64 evaluation of an RMSNorm, `MaskedNorm::Rms`'s program, against
-/// the exact RMSNorm of the same input rows, from its computed rows `normalized`: the squares, `d − 1`
-/// additions, the mean, `+ ε`, the square root, the reciprocal and the products with the row and the
-/// gain are `γ_(d+6)` relative, so the band is `γ_(d+6) |fl(N(h))| / (1 − γ_(d+6))`, divided by
-/// `1 − γ_(d+12)` for its own arithmetic ([`NativeNorm::apply_with_band`]).
-pub fn rms_norm_band(normalized: ArrayView2<'_, f64>) -> Array2<f64> {
-    let width = normalized.ncols();
-    let dominance = 1.0 - accumulation_growth(width + 12);
-    let growth = accumulation_growth(width + 6);
-    normalized.mapv(|value| growth * value.abs() / (1.0 - growth) / dominance)
+/// binary64's subnormal spacing `2^-1074`. A product or quotient whose result rounds into
+/// the subnormal range moves by an absolute amount of at most half of it, not relatively;
+/// additions and subtractions are exact there. Half the spacing, `2^-1075`, is not a
+/// binary64 number (`f64::MIN_POSITIVE * UNIT_ROUNDOFF` rounds to zero), so a band carries
+/// the whole spacing.
+pub const SUBNORMAL_SPACING: f64 = f64::MIN_POSITIVE * f64::EPSILON;
+
+/// `value` stepped one float up: an upper bound on the exact result of an operation that
+/// rounded to nearest to `value`.
+pub(super) fn up(value: f64) -> f64 {
+    value.next_up()
+}
+
+/// `value` stepped one float down, clamped at zero: a lower bound on a nonnegative exact
+/// result that rounded to nearest to `value`.
+pub(super) fn down(value: f64) -> f64 {
+    value.next_down().max(0.0)
+}
+
+/// An upper bound on the absolute underflow of one normalized entry `fl(w fl(x ν̂))` beyond
+/// its relative rounding: `|w| 2^-1075 (1 + u)` from `x ν̂` and `2^-1075` from the gain's
+/// product, carried as `|w| 2^-1074 + 2^-1074`, which also covers a following bias
+/// addition's `1 + u`.
+fn underflow_reach(weight: f64) -> f64 {
+    up(up(weight.abs() * SUBNORMAL_SPACING) + SUBNORMAL_SPACING)
+}
+
+/// The relative growth `λ` of one normalized entry `fl(w fl(x ν̂))` of the row `values`
+/// (`x`, `d` wide) against its exact value `w x ν` beyond [`underflow_reach`], with
+/// `operations = k` relative roundings on the entry's path, or `None` when no finite `λ < 1`
+/// bounds it.
+///
+/// The computed argument of the square root is `X (1 + θ) + A`, with `X = mean(x²) + ε`,
+/// `|θ| ≤ γ_(d+2)` and `|A| ≤ 2^-1074 (1 + γ_(d+1))`: each square and the mean's division
+/// round by at most `2^-1075` absolute into the subnormal range, while the sum and `+ ε`
+/// stay relative. With `X ≥ X₀ = max(ε, max_j x_j² / d)`, the absolute part is a relative
+/// `α`, `|α| ≤ ω = 2 · 2^-1074 / (X₀ (1 − γ_k))`, which moves `ν̂` by `(1 + α)^(-1/2)`, within
+/// `ρ = ω / (2 (1 − ω))` of one for `ω < 1`: `(1 − ω)^(-1/2) − 1 = ω / (√(1 − ω) (1 + √(1 − ω)))`
+/// and `1 − ω ≤ √(1 − ω)`. So `λ = (1 + γ_k)(1 + ρ) − 1 = γ_k + ρ + γ_k ρ`. A row with `ε = 0`
+/// whose mean square is not resolved above the underflow (`ω ≥ 1`) has no bound. Every
+/// operation rounds to nearest and then steps one float up (down where it divides), so `λ`
+/// is an upper bound computed in binary64.
+fn normalization_growth(values: ArrayView1<'_, f64>, epsilon: f64, operations: usize) -> Option<f64> {
+    let largest = values.iter().fold(0.0_f64, |largest, value| largest.max(value.abs()));
+    let floor = epsilon.max(down(down(largest * largest) / values.len() as f64));
+    let growth = up(accumulation_growth(operations));
+    let omega = up(2.0 * SUBNORMAL_SPACING / down(floor * down(1.0 - growth)));
+    if !(omega < 1.0) {
+        return None;
+    }
+    let rho = up(omega / down(2.0 * down(1.0 - omega)));
+    let lambda = up(up(growth + rho) + up(growth * rho));
+    (lambda < 1.0).then_some(lambda)
+}
+
+/// `‖e‖₂` of the nonnegative `errors`, scaled by the largest entry so that no square
+/// underflows.
+fn scaled_norm(errors: ArrayView1<'_, f64>) -> f64 {
+    let largest = errors.iter().fold(0.0_f64, |largest, &error| largest.max(error));
+    if largest == 0.0 {
+        return 0.0;
+    }
+    largest
+        * errors
+            .iter()
+            .map(|&error| {
+                let scaled = error / largest;
+                scaled * scaled
+            })
+            .sum::<f64>()
+            .sqrt()
+}
+
+/// The rounding band of one binary64 evaluation of an RMSNorm, `MaskedNorm::Rms`'s program
+/// `fl(w_j fl(x_j ν̂))`, against the exact RMSNorm `y = w x (mean(x²) + ε)^(-1/2)` of the input
+/// rows `inputs` (`d` wide, with the gain `gain`), from its computed rows `normalized`.
+///
+/// The squares, `d − 1` additions, the mean, `+ ε`, the square root, the reciprocal and the
+/// products with the row and the gain are `γ_(d+6)` relative while their results stay
+/// normal. A square, the mean or a product whose result is subnormal rounds by an absolute
+/// `2^-1075` instead: through `ν̂` that is the relative `ρ` of [`normalization_growth`], and on
+/// the entry it is the absolute `a_j = |w_j| 2^-1074 + 2^-1074` of [`underflow_reach`]. So
+/// `|ŷ − y| ≤ λ |y| + a` with `λ = (1 + γ_(d+6))(1 + ρ) − 1`, and `|y| ≤ (|ŷ| + a)/(1 − λ)`,
+/// so the band is `λ (|ŷ| + a)/(1 − λ) + a`. Every operation rounds to nearest and then steps
+/// one float up (down where it divides), so the band is an upper bound computed in binary64.
+///
+/// `inputs` and `normalized` share a shape and `gain` is as wide; a row with `ε = 0` whose
+/// mean square is not resolved above binary64's underflow has no band and is refused.
+pub fn rms_norm_band(
+    epsilon: f64,
+    gain: ArrayView1<'_, f64>,
+    inputs: ArrayView2<'_, f64>,
+    normalized: ArrayView2<'_, f64>,
+) -> Result<Array2<f64>, NormBandUnbounded> {
+    let width = inputs.ncols();
+    let mut band = Array2::<f64>::zeros(normalized.raw_dim());
+    for (row, (values, (computed, mut band_row))) in inputs
+        .rows()
+        .into_iter()
+        .zip(normalized.rows().into_iter().zip(band.rows_mut()))
+        .enumerate()
+    {
+        let growth = normalization_growth(values, epsilon, width + 6).ok_or(NormBandUnbounded { row })?;
+        let complement = down(1.0 - growth);
+        Zip::from(&mut band_row)
+            .and(gain)
+            .and(computed)
+            .for_each(|slot, &weight, &value| {
+                let absolute = underflow_reach(weight);
+                *slot = up(up(up(growth * up(value.abs() + absolute)) / complement) + absolute);
+            });
+    }
+    Ok(band)
+}
+
+/// A normalization row whose rounding band has no finite bound: a row with `ε = 0` whose mean
+/// square is not resolved above binary64's underflow ([`rms_norm_band`]), or a LayerNorm row
+/// with `ε = 0` whose centring error is not below a quarter of its norm
+/// ([`NativeNorm::apply_with_band`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NormBandUnbounded {
+    pub row: usize,
+}
+
+impl From<NormBandUnbounded> for BlockError {
+    fn from(NormBandUnbounded { row }: NormBandUnbounded) -> Self {
+        Self::NormBandUnbounded { row }
+    }
+}
+
+impl fmt::Display for NormBandUnbounded {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "normalization row {} with zero epsilon has no finite rounding band: its mean square is not \
+             resolved above binary64's underflow, or its centring error is too large for a slope bound",
+            self.row
+        )
+    }
 }
 
 /// One of a decoder block's two sublayers.
@@ -308,8 +438,8 @@ pub enum BlockError {
         projection: AttentionProjection,
         position: usize,
     },
-    /// A LayerNorm row with `ε = 0` whose centring error is not below a quarter of its
-    /// norm: its normalization has no finite slope bound.
+    /// A normalization row with `ε = 0` whose rounding band has no finite bound
+    /// ([`NormBandUnbounded`]).
     NormBandUnbounded { row: usize },
 }
 
@@ -387,10 +517,7 @@ impl fmt::Display for BlockError {
                 formatter,
                 "the {projection} edit declares position {position}, which no row of the layer holds"
             ),
-            Self::NormBandUnbounded { row } => write!(
-                formatter,
-                "LayerNorm row {row} with zero epsilon has a centring error too large for a slope bound"
-            ),
+            Self::NormBandUnbounded { row } => write!(formatter, "{}", NormBandUnbounded { row: *row }),
         }
     }
 }
@@ -2438,6 +2565,59 @@ mod tests {
         assert!(
             zero_epsilon.apply_with_band(rows.slice(ndarray::s![0..1, ..])).is_ok(),
             "control: a zero-epsilon row far from a constant has a band"
+        );
+    }
+
+    /// An RMSNorm row whose product `x ν̂` falls in the subnormal range rounds it by an
+    /// absolute `2^-1075`, not relatively: `[1000, 1e-310]` with gain `[1, 1e10]` has
+    /// `x ν̂ ≈ 1.4e-313`, whose rounding the gain lifts to about `9e-315` on a normal output
+    /// of `1.4e-303`. The band covers the double-double normalization there. Positive
+    /// control: the relative band alone, `γ_(d+6) |ŷ| / (1 − γ_(d+6))`, about `1e-318`, is
+    /// exceeded. A zero-epsilon row whose mean square is the smallest subnormal has no
+    /// band and is refused, typed, though the owner normalizes it.
+    #[test]
+    fn a_normalization_band_covers_a_row_whose_products_underflow() {
+        use qd::Quad;
+        let quad = Quad::from_f64;
+        let rows = ndarray::array![[1000.0, 1.0e-310]];
+        let gain = ndarray::array![1.0, 1.0e10];
+        let norm = NativeNorm::Rms {
+            epsilon: RMS_EPSILON,
+            gain: gain.clone(),
+        };
+        let (normalized, band) = norm.apply_with_band(rows.view()).expect("finite rows");
+        let square = quad(rows[[0, 0]]) * quad(rows[[0, 0]]) + quad(rows[[0, 1]]) * quad(rows[[0, 1]]);
+        let inverse_root = quad(1.0) / (square / quad(2.0) + quad(RMS_EPSILON)).sqrt();
+        // `w x` is normal, so the reference's products keep their accuracy.
+        let exact = quad(gain[1]) * quad(rows[[0, 1]]) * inverse_root;
+        let error = (quad(normalized[[0, 1]]) - exact).0.abs();
+        assert!(
+            error <= band[[0, 1]],
+            "the band {:e} must cover the underflowed product's error {error:e}",
+            band[[0, 1]]
+        );
+        let growth = accumulation_growth(2 + 6);
+        let relative_only = growth * normalized[[0, 1]].abs() / (1.0 - growth);
+        assert!(
+            error > relative_only,
+            "positive control: the relative band {relative_only:e} must not cover the error {error:e}"
+        );
+
+        let unresolved = ndarray::array![[2.0e-162, 2.0e-162]];
+        let zero_epsilon = NativeNorm::Rms {
+            epsilon: 0.0,
+            gain: ndarray::array![1.0, 1.0],
+        };
+        assert!(
+            zero_epsilon.as_masked_norm().apply(unresolved.view()).is_ok(),
+            "control: the owner normalizes a row whose mean square is the smallest subnormal"
+        );
+        assert!(
+            matches!(
+                zero_epsilon.apply_with_band(unresolved.view()),
+                Err(BlockError::NormBandUnbounded { row: 0 })
+            ),
+            "a zero-epsilon row whose mean square is not resolved above the underflow must be refused"
         );
     }
 

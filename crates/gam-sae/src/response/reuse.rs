@@ -39,7 +39,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, HouseholderQr, fast_ab};
 use gam_linalg::roundoff::{accumulation_growth, symmetric_spectrum_rounding_band};
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 use gam_math::special::{logaddexp, logistic};
 use gam_solve::gaussian_marginal::{
     GaussianEvidenceParts, GaussianMarginalError, GaussianMarginalModel,
@@ -353,11 +353,11 @@ struct PenaltySplit {
 }
 
 fn frobenius_norm(matrix: &Array2<f64>) -> f64 {
-    let mut sum = KahanSum::default();
+    let mut sum = CompensatedSum::default();
     for value in matrix {
         sum.add(value * value);
     }
-    sum.sum().sqrt()
+    sum.value().sqrt()
 }
 
 /// How far a declared null space escapes one penalty: `‖S N̂‖_F` for the orthonormal basis `N̂` of the declaration,
@@ -451,9 +451,9 @@ fn annihilation(
             band: 0.0,
         });
     }
-    let (eigenvalues, _) = penalty.eigh(Side::Lower).map_err(|error| {
-        ReuseError::InvalidInput(format!("penalty {index} spectrum: {error}"))
-    })?;
+    let (eigenvalues, _) = penalty
+        .eigh(Side::Lower)
+        .map_err(|error| ReuseError::InvalidInput(format!("penalty {index} spectrum: {error}")))?;
     Ok(NullSpaceAnnihilation {
         residual: frobenius_norm(&fast_ab(penalty, null_basis)),
         band: (nullity as f64).sqrt()
@@ -613,7 +613,7 @@ fn reml_fit(
     .map_err(|error| ReuseError::Reml(format!("{hypothesis} hypothesis REML refused: {error}")))?;
     // `log p(y) = log p(R^{-1/2}y) − ½Σ ln r_i`. Both hypotheses stack the same rows in the same order, so this sum is
     // bitwise the same on both sides and cancels from the Bayes factor.
-    let mut log_noise = KahanSum::default();
+    let mut log_noise = CompensatedSum::default();
     for variance in noise_variance {
         log_noise.add(variance.ln());
     }
@@ -624,7 +624,7 @@ fn reml_fit(
     let (rows, columns) = design.dim();
     let whitening = 1.0 + accumulation_growth(3) / accumulation_growth(rows * columns);
     Ok(RemlFit {
-        log_evidence: -evaluation.reml_score - 0.5 * log_noise.sum(),
+        log_evidence: -evaluation.reml_score - 0.5 * log_noise.value(),
         lambdas: evaluation.lambdas.clone(),
         placement: fit.rho_placement.clone(),
         resolution: optimality_gap(&fit)
@@ -1445,7 +1445,8 @@ mod tests {
             null_space_annihilation(&penalties, intercept.view()).expect("intercept measure");
         assert!(intercept_measured.iter().all(NullSpaceAnnihilation::holds));
         let slope = array![[0.0], [1.0], [0.0]];
-        let slope_measured = null_space_annihilation(&penalties, slope.view()).expect("slope measure");
+        let slope_measured =
+            null_space_annihilation(&penalties, slope.view()).expect("slope measure");
         assert!(
             !slope_measured[0].holds() && slope_measured[1].holds(),
             "the slope escapes diag(0, 1, 0) only: {slope_measured:?}"

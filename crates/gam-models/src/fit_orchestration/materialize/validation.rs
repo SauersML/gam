@@ -103,6 +103,58 @@ pub(crate) fn reject_survival_only_config_for_nonsurvival(
             ),
         });
     }
+    // The baseline, follow-up time basis and time-varying block settings are
+    // read only by `materialize_survival`. On a non-survival response they would
+    // be dropped and an ordinary GAM fitted. The CLI refused them, but a
+    // `gamfit.fit` call or a Rust caller did not, so the refusal lives here,
+    // where every front end arrives.
+    let defaults = FitConfig::default();
+    let survival_only_settings: Vec<&str> = [
+        ("baseline_scale", config.baseline_scale.is_some()),
+        ("baseline_shape", config.baseline_shape.is_some()),
+        ("baseline_rate", config.baseline_rate.is_some()),
+        ("baseline_makeham", config.baseline_makeham.is_some()),
+        (
+            "baseline_target",
+            !config
+                .baseline_target
+                .trim()
+                .eq_ignore_ascii_case(&defaults.baseline_target),
+        ),
+        (
+            "time_basis",
+            !config.time_basis.trim().eq_ignore_ascii_case(&defaults.time_basis),
+        ),
+        ("time_degree", config.time_degree != defaults.time_degree),
+        (
+            "time_num_internal_knots",
+            config.time_num_internal_knots != defaults.time_num_internal_knots,
+        ),
+        (
+            "survival_distribution",
+            !config
+                .survival_distribution
+                .trim()
+                .eq_ignore_ascii_case(&defaults.survival_distribution),
+        ),
+        ("threshold_time_k", config.threshold_time_k.is_some()),
+        ("sigma_time_k", config.sigma_time_k.is_some()),
+        ("slope_time_k", config.slope_time_k.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    if !survival_only_settings.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "{} {} read only by the survival fit path and require a Surv(...) response; for a \
+                 non-survival response they would otherwise be silently ignored. Wrap the \
+                 response in Surv(...) or drop them.",
+                survival_only_settings.join(", "),
+                if survival_only_settings.len() == 1 { "is" } else { "are" },
+            ),
+        });
+    }
     // `survival_likelihood` is `None` by default across every entrance (#2301):
     // the sole canonical default is resolved to `"transformation"` at the
     // `Surv(...)` seam, not stored here. So `None` is genuinely "unset" and must
@@ -310,6 +362,41 @@ pub(super) fn reject_too_few_rows_for_formula(
     })
 }
 
+/// Refuse precision hyperpriors and coefficient groups on a model class whose
+/// fit request has no place for them.
+///
+/// `FitConfig::penalty_block_gamma_priors` (the frontends' `precision_hyperpriors`)
+/// is realized only by the standard fit and by the survival
+/// transformation/Weibull fit. `FitConfig::coefficient_groups` is realized only
+/// by the standard fit. Every other materializer builds a request without these
+/// fields, so without this check the fit would run with the default flat
+/// smoothing-parameter prior while the caller believes the requested prior was
+/// used.
+pub(super) fn reject_unrealized_precision_priors(
+    config: &FitConfig,
+    model: &str,
+    realizes_penalty_block_priors: bool,
+) -> Result<(), WorkflowError> {
+    if !realizes_penalty_block_priors && !config.penalty_block_gamma_priors.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "precision_hyperpriors is not supported for {model}: only standard and \
+                 survival transformation/weibull fits realize penalty-block Gamma priors, \
+                 so this fit would ignore them"
+            ),
+        });
+    }
+    if !config.coefficient_groups.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "coefficient_groups is not supported for {model}: only standard fits \
+                 realize coefficient groups, so this fit would ignore them"
+            ),
+        });
+    }
+    Ok(())
+}
+
 /// Detect whether a response column is binary (0/1 only).
 pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     if y.is_empty() {
@@ -317,6 +404,36 @@ pub fn is_binary_response(y: ArrayView1<'_, f64>) -> bool {
     }
     // Exact membership: a value near 0 or 1 is not an outcome.
     y.iter().all(|&v| v == 0.0 || v == 1.0)
+}
+
+/// Judge the response column against the family's support and degeneracy
+/// rules over the rows that enter the likelihood (positive prior weight).
+///
+/// Both rules are owned by [`ResponseFamily`] so the formula materializers
+/// and the external-design path share one definition; this adapter only
+/// attaches the column name and routes the violation to
+/// [`WorkflowError::InvalidData`], the data-error class, because the fault is
+/// in the supplied values rather than in the model configuration.
+pub(super) fn validate_response_against_family(
+    family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    response: &str,
+) -> Result<(), WorkflowError> {
+    family
+        .response
+        .validate_response_support(y, weights)
+        .map_err(|violation| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: violation.problem(),
+        })?;
+    family
+        .response
+        .validate_response_degeneracy(y, weights)
+        .map_err(|degeneracy| WorkflowError::InvalidData {
+            column: response.to_string(),
+            problem: degeneracy.problem(),
+        })
 }
 
 #[cfg(test)]

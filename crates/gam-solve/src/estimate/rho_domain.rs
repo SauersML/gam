@@ -539,6 +539,43 @@ pub(crate) struct CriterionContinuation {
 }
 
 impl CriterionContinuation {
+    /// The region on which the criterion has a value, as a `(lower, upper)`
+    /// box: the domain with each saturated face opened to `∓∞`, since the
+    /// criterion continues past it, and each literal face kept. Past the
+    /// representable log-strength cut `ρ` is not a model. Past the precision
+    /// box of a term without penalty geometry it is one, but the criterion
+    /// carries no value there, so a posterior drawn on this region is
+    /// `π(ρ|y)` restricted to it. A draw confined to it is one [`Self::value`]
+    /// can value (#3010).
+    pub(crate) fn posterior_support(&self) -> (Array1<f64>, Array1<f64>) {
+        let open = |faces: &Array1<f64>, saturated: &[bool], infinity: f64| {
+            Array1::from_iter(faces.iter().enumerate().map(|(k, &face)| {
+                if saturated.get(k).copied().unwrap_or(false) {
+                    infinity
+                } else {
+                    face
+                }
+            }))
+        };
+        (
+            open(&self.lower, &self.lower_saturated, f64::NEG_INFINITY),
+            open(&self.upper, &self.upper_saturated, f64::INFINITY),
+        )
+    }
+
+    /// The coordinates a proposal around `rho_hat` holds at `rho_hat`: the
+    /// `railed` ones, and every one with `rho_hat` on a face of the domain,
+    /// saturated or literal. Each is the face-reduced model's (#3010).
+    pub(crate) fn held_at(&self, rho_hat: &Array1<f64>, railed: &[usize]) -> Vec<usize> {
+        (0..rho_hat.len())
+            .filter(|&k| {
+                railed.contains(&k)
+                    || self.lower.get(k).is_some_and(|&face| rho_hat[k] <= face)
+                    || self.upper.get(k).is_some_and(|&face| rho_hat[k] >= face)
+            })
+            .collect()
+    }
+
     /// `None` inside the domain; otherwise the clamp `ρ_c` of `ρ` onto it, or
     /// the refusal naming the first coordinate past a literal face.
     fn clamp_past_saturated_faces(&self, rho: &Array1<f64>) -> Result<Option<Array1<f64>>, String> {
@@ -1099,5 +1136,27 @@ mod tests {
             .expect_err("past a literal face");
         assert!(refusal.contains("rho[1]") && refusal.contains("upper"), "{refusal}");
         assert!(domain.value_and_gradient(&array![0.0, f64::NAN], affine).is_err());
+    }
+
+    /// #3010: the posterior's support opens every saturated face and keeps
+    /// every literal one, so every point of it is one the continuation values;
+    /// the held coordinates are the railed ones and those with `ρ̂` on a face.
+    #[test]
+    fn the_posterior_support_is_bounded_only_at_literal_faces_3010() {
+        let domain = CriterionContinuation {
+            lower: array![-1.0, -2.0, -3.0],
+            upper: array![1.0, 2.0, 3.0],
+            lower_saturated: vec![true, false, true],
+            upper_saturated: vec![false, true, true],
+        };
+        let (lower, upper) = domain.posterior_support();
+        assert_eq!(lower, array![f64::NEG_INFINITY, -2.0, f64::NEG_INFINITY]);
+        assert_eq!(upper, array![1.0, f64::INFINITY, f64::INFINITY]);
+        let affine = |r: &Array1<f64>| Ok((r.sum(), Array1::ones(r.len())));
+        for corner in [array![-40.0, -2.0, 40.0], array![1.0, 40.0, -40.0]] {
+            assert!(domain.value(&corner, |r| Ok(r.sum()), affine).is_ok(), "{corner}");
+        }
+        assert_eq!(domain.held_at(&array![0.0, 2.0, -3.0], &[0]), vec![0, 1, 2]);
+        assert_eq!(domain.held_at(&array![0.0, 1.0, 0.0], &[]), Vec::<usize>::new());
     }
 }

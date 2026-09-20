@@ -570,9 +570,9 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 }
 
 /// Both regularized incomplete gamma tails at once, `(P(a, x), Q(a, x))`, each
-/// accurate to a relative ulp across the whole domain. `P(a, x) = γ(a, x) / Γ(a)`
-/// is the CDF of a unit-scale `Gamma(shape = a)` variate and `Q = 1 − P` is its
-/// survival function.
+/// accurate to a relative ulp times the problem's own conditioning. `P(a, x) =
+/// γ(a, x) / Γ(a)` is the CDF of a unit-scale `Gamma(shape = a)` variate and
+/// `Q = 1 − P` is its survival function.
 ///
 /// The pair is returned rather than `P` alone because the two are not
 /// interchangeable in `f64`: whichever of them is small carries information the
@@ -586,76 +586,480 @@ pub fn chi_square_quantile(p: f64, degrees_of_freedom: f64) -> f64 {
 /// own it rather than borrowing `statrs::gamma_lr`. That routine hard-clamps to
 /// `0.0` for every `x ≤ 1.11e-15` (its `almost_eq(x, 0)` guard, with accuracy
 /// `DEFAULT_F64_ACC`), which silently zeroes the residual `P(a, x) − p` in the
-/// small-shape lower tail: the Halley iterate is then driven *up* — away from a
-/// good sub-`1e-15` seed — until `x` crosses that clamp around `~1.6e-15`, where
-/// the returned point carries far more mass than `p` (#1018). The Numerical
-/// Recipes split — a power series for `x < a + 1`, the modified-Lentz continued
-/// fraction for the complement `Q = 1 − P` otherwise — keeps the leading
-/// `exp(a·ln x − x − ln Γ(a))` factor in logs, so the value stays finite and
-/// nonzero for arguments far below that clamp, and always evaluates the *smaller*
-/// tail directly (no catastrophic cancellation near either edge).
+/// small-shape lower tail (#1018).
+///
+/// Three evaluations, each used exactly where it is certified (#4068):
+///
+/// * Temme's uniform asymptotic expansion ([`temme_incomplete_gamma_pair`]),
+///   whenever its `1/a` correction series certifies convergence to `ε`. Its
+///   cost does not grow with `a`, and its accuracy is uniform in `x / a`, so it
+///   carries the transition region `x ≈ a` where the other two need `O(√a)`
+///   terms (and, once `a + 1 == a`, stall outright).
+/// * Otherwise the Numerical Recipes split: a power series for `x < a + 1`, the
+///   modified-Lentz continued fraction for the complement `Q = 1 − P` otherwise.
+///   Each runs to its own stopping test — no term cap, whose silent truncation
+///   used to hand back a partial sum as a converged value — and returns NaN if
+///   that test can never be met, which the band code already reads as "no band".
+///   Below the split with `a < 1`, `Q` is summed directly
+///   ([`small_shape_upper_gamma_below_split`]) rather than formed as `1 − P`.
+///
+/// All three share the prefactor `x^a e^{−x} / Γ(a)` in the form
+/// `e^{−a·h} √(a/2π) / Γ*(a)`, `h = λ − 1 − ln λ`, `λ = x / a`
+/// ([`incomplete_gamma_prefactor`]): the textbook `exp(a·ln x − x − ln Γ(a))`
+/// is a difference of terms of size `a·ln a` and loses that many ulp of it.
 pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
-    use statrs::function::gamma::ln_gamma;
-    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream; a
-    // non-positive `a` would only mis-feed `ln_gamma`, never UB.
+    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream.
+    if x.is_nan() || a.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
     if x <= 0.0 {
         return (0.0, 1.0);
     }
-    let gln = ln_gamma(a);
+    if x == f64::INFINITY {
+        return (1.0, 0.0);
+    }
+    if let Some(pair) = temme_incomplete_gamma_pair(a, x) {
+        return pair;
+    }
+    let prefactor = incomplete_gamma_prefactor(a, x);
     if x < a + 1.0 {
-        // Power series: P(a,x) = exp(a·ln x − x − ln Γ(a)) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
+        // The series below gives `P`, and `1 − P` keeps absolute accuracy ε, so
+        // its relative error is ε·P/Q. For `a ≥ 1` this branch has
+        // `Q ≥ Q(1, 2) = e^{-2}`, so the loss is below a factor `e² − 1`. For
+        // `a < 1`, however, `Q(a, x) ≈ a·E₁(x)` goes to 0 with `a`, so there `Q`
+        // is summed directly and, where it is the smaller tail, `P` is its
+        // complement (#4242).
+        if a < 1.0 {
+            let q = small_shape_upper_gamma_below_split(a, x);
+            if q <= 0.5 {
+                return (1.0 - q, q);
+            }
+        }
+        // Power series: P(a,x) = x^a e^{−x}/Γ(a) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
         // The running term `del` is the ratio form, so no factorial overflows.
+        // The terms after `del` are bounded by the geometric series of ratio
+        // `x / (ap + 1)`, so once that bound is below `ε·sum` every digit the
+        // sum can hold is in it. The ratio falls below 1 after at most `x − a`
+        // terms and the bound then only shrinks, so the loop ends unless the
+        // denominator itself stops advancing (`ap + 1 == ap`, i.e. `a ≥ 2^53`
+        // with `x` so close to `a` that Temme would have taken it): then the
+        // test can never be met, and the answer is NaN, not a partial sum.
         let mut ap = a;
         let mut del = 1.0 / a;
         let mut sum = del;
-        for _ in 0..1000 {
-            ap += 1.0;
+        loop {
+            let next = ap + 1.0;
+            if next > x && del * x <= f64::EPSILON * sum * (next - x) {
+                break;
+            }
+            if next == ap || !sum.is_finite() {
+                return (f64::NAN, f64::NAN);
+            }
+            ap = next;
             del *= x / ap;
             sum += del;
-            if del.abs() <= sum.abs() * f64::EPSILON {
-                break;
-            }
         }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
-        let p = (sum.ln() + a * x.ln() - x - gln).exp();
+        // Here `Q ≥ e^{-2}` (`a ≥ 1`) or `Q > ½`, so `1 − P` loses at most a
+        // factor `e² − 1` of relative accuracy.
+        let p = prefactor * sum;
         (p, 1.0 - p)
     } else {
-        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
         // Evaluating the *upper* tail here keeps the directly-computed quantity
         // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        // Lentz's modified continued-fraction algorithm substitutes a tiny value
-        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
-        // component of the algorithm, not a floor on a result: any value below
-        // the smallest normal quotient works and the converged fraction does not
-        // depend on it, so it is the arithmetic's own smallest normal, not a
-        // chosen magnitude (#2469).
-        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / LENTZ_TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < LENTZ_TINY {
-                d = LENTZ_TINY;
-            }
-            c = b + an / c;
-            if c.abs() < LENTZ_TINY {
-                c = LENTZ_TINY;
-            }
-            d = 1.0 / d;
-            let del = d * c;
-            h *= del;
-            if (del - 1.0).abs() <= f64::EPSILON {
-                break;
-            }
-        }
-        let q = (a * x.ln() - x - gln + h.ln()).exp();
+        let q = prefactor * upper_gamma_continued_fraction(a, x);
         (1.0 - q, q)
+    }
+}
+
+/// The modified-Lentz continued fraction `h(a, x)` with
+/// `Q(a, x) = x^a·e^{−x}/Γ(a) · h(a, x)`, for `x ≥ a + 1`, where it converges
+/// rapidly (Numerical Recipes §6.2). NaN where the recurrence leaves the
+/// floating range.
+fn upper_gamma_continued_fraction(a: f64, x: f64) -> f64 {
+    // Lentz's modified continued-fraction algorithm substitutes a tiny value
+    // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+    // component of the algorithm, not a floor on a result: any value below
+    // the smallest normal quotient works and the converged fraction does not
+    // depend on it, so it is the arithmetic's own smallest normal, not a
+    // chosen magnitude (#2469).
+    const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+    // Each factor `del = d·c` is a product of two quotients, each a
+    // correctly rounded division of a correctly rounded sum: four roundings,
+    // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
+    // certified. The fraction has converged once a factor reaches `ε` (the
+    // Numerical Recipes test) or, inside that rounding band, stops getting
+    // closer to 1 — further factors are rounding noise, not convergence.
+    const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / LENTZ_TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    let mut previous_distance = f64::INFINITY;
+    let mut i = 1.0_f64;
+    loop {
+        let an = -i * (i - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = b + an / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        let distance = (del - 1.0).abs();
+        if !distance.is_finite() || !h.is_finite() {
+            return f64::NAN;
+        }
+        if distance <= f64::EPSILON
+            || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
+        {
+            break;
+        }
+        previous_distance = distance;
+        i += 1.0;
+    }
+    h
+}
+
+/// `Q(a, x)` for `0 < a < 1`, `0 < x < s = a + 1`, summed without the
+/// complement `1 − P`.
+///
+/// `Γ(a, x) = Γ(a, s) + ∫_x^s t^{a−1}e^{−t} dt`, and both parts are positive,
+/// so `Q(a, x) = Q(a, s) + (1/Γ(a))·∫_x^s t^{a−1}e^{−t} dt`. `Q(a, s)` comes
+/// from the continued fraction at its own convergence boundary. Expanding
+/// `e^{−t}` gives
+///
+/// `∫_x^s t^{a−1}e^{−t} dt = Σ_{n≥0} (−1)^n c_n`, where
+/// `c_n = s^{a+n}(1 − r^{a+n}) / ((a+n)·n!)` and `r = x/s < 1`.
+///
+/// Each `1 − r^{a+n} = −expm1((a+n)·ln r)` lies in `(0, 1)`, so no term
+/// overflows or cancels. For `m > 0`, `(1 − r^{m+1})/(1 − r^m) ≤ 1 + 1/m`
+/// (`1 − r^m − m·r^m(1−r)` falls to 0 at `r = 1`). So `c_{n+1}/c_n ≤ s/(n+1) < 1`
+/// for every `n ≥ 1`, because `s < 2`. The alternating tail past term `n − 1` is
+/// then bounded by `c_n`, and the sum stops once `c_n` is below one rounding of
+/// the positive total. `1/Γ(a) = a/Γ(1 + a)` uses `ln Γ(1 + a)`, whose argument
+/// lies in `[1, 2)`, so the scale costs only the absolute error of that
+/// logarithm and not the `ln(1/a)` magnitude of `ln Γ(a)`.
+fn small_shape_upper_gamma_below_split(a: f64, x: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    let s = a + 1.0;
+    let ln_r = (x / s).ln();
+    // `s^a / Γ(1 + a)`: the `n = 0` term is `c_0 / Γ(a)` = this times `1 − r^a`.
+    let leading = (a * s.ln() - ln_gamma(s)).exp();
+    // `Q(a, s)` through the same `a/Γ(1 + a)` scaling ([`incomplete_gamma_prefactor`]).
+    let mut total = incomplete_gamma_prefactor(a, s) * upper_gamma_continued_fraction(a, s)
+        + leading * (-(a * ln_r).exp_m1());
+    // `s^{a+n} / (n!·Γ(a))`, carried as a ratio so neither factor overflows.
+    let mut scaled_power = leading * a;
+    let mut n = 1.0_f64;
+    loop {
+        scaled_power *= s / n;
+        let m = a + n;
+        let term = scaled_power * (-(m * ln_r).exp_m1()) / m;
+        // Negated so that a NaN (from an unvalidated `a ≤ 0`) ends the sum and
+        // propagates, rather than never satisfying the comparison.
+        if !(term > total * f64::EPSILON) {
+            break;
+        }
+        // `(−1)^n`: odd `n` subtracts.
+        if n % 2.0 == 1.0 {
+            total -= term;
+        } else {
+            total += term;
+        }
+        n += 1.0;
+    }
+    total
+}
+
+/// Taylor degree, in `ζ`, of the function `f(ζ) = ζ / (μ(ζ) − 1)` the Temme
+/// coefficient table is derived from. The table's size decides only where the
+/// expansion is *used*: [`temme_correction`] certifies each evaluation against
+/// the truncation of the table and declines where it does not suffice, and the
+/// series or continued fraction then take the point.
+const TEMME_TAYLOR_DEGREE: usize = 64;
+
+/// Number of `1/a` orders in the Temme table. Each order differentiates the
+/// previous one, costing two Taylor degrees, so this spends most of
+/// [`TEMME_TAYLOR_DEGREE`].
+const TEMME_ORDERS: usize = 25;
+
+/// Radius of convergence, in `η`, of the Temme coefficients `C_k(η)`. With
+/// `½η² = λ − 1 − ln λ`, the map `η ↦ λ` branches where `dη/dλ` is infinite,
+/// i.e. at `λ = 1` on the other sheets of the logarithm, `ln λ = 2πik`:
+/// `η² = ∓4πi`, four square-root branch points on the circle `|η| = 2√π`.
+const TEMME_ETA_RADIUS: f64 = 3.544_907_701_811_032;
+
+/// The Temme expansion's coefficients, derived once from their defining
+/// recurrences rather than transcribed.
+struct TemmeTable {
+    /// `γ_k` in Stirling's series `Γ*(a) = Σ_k γ_k a^{−k}`, where
+    /// `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`.
+    stirling: Vec<f64>,
+    /// Taylor coefficients in `η` of `C_k(η)`, `k = 0, 1, …`, the coefficients
+    /// of Temme's correction series `S(a, η) = Σ_k C_k(η) a^{−k}`.
+    orders: Vec<Vec<f64>>,
+    /// Per order, the Darboux envelope `max |c_j| ρ^j` over the last full
+    /// period of the kept coefficients, `ρ = TEMME_ETA_RADIUS`. The four branch
+    /// points share the modulus `ρ` at angles `±π/4, ±3π/4`, so `|c_j| ρ^j`
+    /// oscillates with period 8 in `j` (dipping near zero on some `j`) about an
+    /// envelope that grows at most like `j^k`; one full period recovers it where
+    /// the last coefficient alone can sit on a dip.
+    envelopes: Vec<f64>,
+}
+
+/// Derive [`TemmeTable`] (Temme 1979; DiDonato & Morris 1986, §4).
+///
+/// Substituting `t = aμ` with `μ − 1 − ln μ = ½ζ²` in `Γ(a, x)` gives
+/// `Q(a, x) = √(a/2π)/Γ*(a) ∫_η^∞ e^{−aζ²/2} f(ζ) dζ` with `f(ζ) = ζ/(μ − 1)`
+/// (the `1/ζ` and `1/(μ − 1)` poles cancel). Integrating by parts repeatedly,
+/// `f_0 = f`, `f_k = γ'_k + ζ g_k`, `f_{k+1} = g_k'`, peels off
+/// `γ'_k = f_k(0)` against the Gaussian integral and leaves
+/// `Q = ½ erfc(η√(a/2)) + e^{−aη²/2}/√(2πa) · S` with
+/// `S = (Σ g_k(η) a^{−k}) / (Σ γ'_k a^{−k})`. The `γ'_k` are Stirling's `γ_k`
+/// (the `η = x`-free case of the same integral is `Γ(a)` itself), so the
+/// denominator is `Γ*(a)` and `C_k` follows by dividing the two series.
+///
+/// `μ − 1 = u(ζ) = Σ m_j ζ^j` is the reversion of `u − ln(1 + u) = ½ζ²`. Its
+/// power-series reversion is catastrophically ill-conditioned in `f64`;
+/// differentiating instead gives `u·u′ = ζ(1 + u)`, whose `ζⁿ` coefficient is
+/// `(n+1) m_n + Σ_{i=2}^{n−1} m_i (n+1−i) m_{n+1−i} = m_{n−1}` — a forward
+/// recurrence with `m_1 = 1` (the branch on which `μ` increases with `ζ`) and
+/// coefficients accurate to a few ulp of their row.
+fn temme_table() -> &'static TemmeTable {
+    static TABLE: std::sync::OnceLock<TemmeTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let degree = TEMME_TAYLOR_DEGREE;
+        let mut m = vec![0.0_f64; degree + 2];
+        m[1] = 1.0;
+        for n in 2..degree + 2 {
+            let mut s = m[n - 1];
+            for i in 2..n {
+                s -= m[i] * (n + 1 - i) as f64 * m[n + 1 - i];
+            }
+            m[n] = s / (n + 1) as f64;
+        }
+        // f = ζ/u = 1 / (Σ_j m_{j+1} ζ^j), by series division.
+        let mut f = vec![0.0_f64; degree + 1];
+        f[0] = 1.0;
+        for n in 1..=degree {
+            let mut s = 0.0;
+            for j in 1..=n {
+                s += m[j + 1] * f[n - j];
+            }
+            f[n] = -s;
+        }
+        let mut stirling = Vec::with_capacity(TEMME_ORDERS);
+        let mut numerators: Vec<Vec<f64>> = Vec::with_capacity(TEMME_ORDERS);
+        let mut fk = f;
+        for _ in 0..TEMME_ORDERS {
+            stirling.push(fk[0]);
+            let gk: Vec<f64> = fk[1..].to_vec();
+            fk = (1..gk.len()).map(|n| gk[n] * n as f64).collect();
+            numerators.push(gk);
+        }
+        // C_k = g_k − Σ_{j=1}^{k} γ_j C_{k−j}, on the Taylor degrees all of
+        // them carry.
+        let mut orders: Vec<Vec<f64>> = Vec::with_capacity(TEMME_ORDERS);
+        for k in 0..TEMME_ORDERS {
+            let len = if k == 0 {
+                numerators[0].len()
+            } else {
+                numerators[k].len().min(orders[k - 1].len())
+            };
+            let mut row = numerators[k][..len].to_vec();
+            for j in 1..=k {
+                for (n, entry) in row.iter_mut().enumerate() {
+                    *entry -= stirling[j] * orders[k - j][n];
+                }
+            }
+            orders.push(row);
+        }
+        const DARBOUX_PERIOD: usize = 8;
+        let envelopes = orders
+            .iter()
+            .map(|row| {
+                let start = row.len().saturating_sub(DARBOUX_PERIOD);
+                (start..row.len())
+                    .map(|j| row[j].abs() * TEMME_ETA_RADIUS.powi(j as i32))
+                    .fold(0.0, f64::max)
+            })
+            .collect();
+        TemmeTable {
+            stirling,
+            orders,
+            envelopes,
+        }
+    })
+}
+
+/// `ln(1 + μ) − μ` for `μ > −1`, without the cancellation of forming it
+/// directly near `μ = 0`. With `t = μ / (2 + μ)`,
+/// `ln(1 + μ) = 2 artanh t = 2 Σ_{n odd} tⁿ/n` and `μ = 2t / (1 − t) =
+/// 2 Σ_{n≥1} tⁿ`, so `ln(1 + μ) − μ = −Σ_{n≥2} c_n tⁿ` with `c_n = 2` for even
+/// `n` and `2 − 2/n` for odd `n`. The terms share a sign and `c_n ≤ 2`, so the
+/// tail after `tⁿ` is at most `2|t|^{n+1}/(1 − |t|)`: the sum stops on that
+/// bound. For `|t| > ½` (`μ` outside `(−⅔, 2)`) the direct form subtracts
+/// unequal magnitudes and is used as is.
+fn ln_1p_minus(mu: f64) -> f64 {
+    let t = mu / (2.0 + mu);
+    if t.abs() > 0.5 {
+        return mu.ln_1p() - mu;
+    }
+    let mut power = t;
+    let mut sum = 0.0;
+    let mut n = 1_u32;
+    loop {
+        n += 1;
+        power *= t;
+        let c = if n % 2 == 0 { 2.0 } else { 2.0 - 2.0 / f64::from(n) };
+        sum += c * power;
+        if 2.0 * (power * t).abs() <= f64::EPSILON * sum.abs() * (1.0 - t.abs()) {
+            return -sum;
+        }
+    }
+}
+
+/// `a·h ≥ 0`, `h = λ − 1 − ln λ` at `λ = x / a`: the exponent of the gamma
+/// prefactor. Near `λ = 1` it is formed as `−a·(ln(1 + μ) − μ)` from
+/// `μ = (x − a)/a` — exact subtraction there by Sterbenz — through
+/// [`ln_1p_minus`]. Away from it, as `(x − a) − a·ln λ`, whose logarithm keeps
+/// its relative accuracy however small `λ` is (`1 + μ` would not); where `λ`
+/// itself leaves the floating range (a subnormal `a`), `ln λ = ln x − ln a`.
+fn gamma_exponent(a: f64, x: f64) -> f64 {
+    let lambda = x / a;
+    if (1.0 / 3.0..=3.0).contains(&lambda) {
+        -a * ln_1p_minus((x - a) / a)
+    } else {
+        let ln_lambda = if lambda.is_normal() {
+            lambda.ln()
+        } else {
+            x.ln() - a.ln()
+        };
+        (x - a) - a * ln_lambda
+    }
+}
+
+/// `ln Γ*(a)`, `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`. Stirling's series from
+/// [`temme_table`] where its terms reach `ε` before the table ends (the series
+/// is asymptotic: its terms fall until `k ≈ 2πa`, and the first omitted term
+/// bounds the error); it is declined as soon as a term stops falling, since
+/// from there it only diverges (for `a ≲ 1e-13` the terms overflow, and an
+/// infinite term would pass the `ε` test). Otherwise `a` is small enough that
+/// `ln Γ(a)` and `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the
+/// difference loses nothing.
+fn ln_gamma_star(a: f64) -> f64 {
+    let stirling = &temme_table().stirling;
+    let mut sum = 0.0;
+    let mut scale = 1.0;
+    let mut previous_term = f64::INFINITY;
+    for &gamma_k in stirling {
+        let term = gamma_k * scale;
+        if term.abs() >= previous_term {
+            break;
+        }
+        sum += term;
+        if term.abs() <= f64::EPSILON * sum.abs() {
+            return sum.ln();
+        }
+        previous_term = term.abs();
+        scale /= a;
+    }
+    statrs::function::gamma::ln_gamma(a) - (a - 0.5) * a.ln() + a
+        - 0.5 * (2.0 * std::f64::consts::PI).ln()
+}
+
+/// The gamma prefactor `x^a e^{−x} / Γ(a) = e^{−a·h} √(a/2π) / Γ*(a)`,
+/// `h = λ − 1 − ln λ`. The exponent `a·h` ([`gamma_exponent`]) is never formed
+/// as `a·ln x − x − ln Γ(a)`, which cancels to it from terms of size `a·ln a`;
+/// its rounding is `h`'s own, which is the conditioning of `e^{−a·h}` itself.
+///
+/// For `a < 1` there is no `a·ln a` to cancel, but `ln Γ(a) ≈ ln(1/a)` is: both
+/// the textbook exponent and the `Γ*` form carry it, and an exponent of that
+/// size costs `ln(1/a)` ulp of the prefactor (≈ 690 at `a = 1e-300`), although
+/// the prefactor's condition number in `a` is about 1. There
+/// `1/Γ(a) = a/Γ(1 + a)` moves the `ln(1/a)` out of the exponent into an exact
+/// scaling: `a·exp(a·ln x − x − ln Γ(1 + a))`, with `ln Γ(1 + a) ∈ (−0.13, 0]`.
+fn incomplete_gamma_prefactor(a: f64, x: f64) -> f64 {
+    if a < 1.0 {
+        return a * (a * x.ln() - x - statrs::function::gamma::ln_gamma(1.0 + a)).exp();
+    }
+    let exponent = -gamma_exponent(a, x) + 0.5 * (a / (2.0 * std::f64::consts::PI)).ln()
+        - ln_gamma_star(a);
+    exponent.exp()
+}
+
+/// Temme's correction series `S(a, η) = Σ_k C_k(η) a^{−k}`, or `None` where it
+/// is not certified to `ε`.
+///
+/// Each `C_k` is a truncated Taylor series of degree `d`. Its coefficients
+/// follow the Darboux envelope `|c_j| ≤ M_k (j/d)^k ρ^{−j}` beyond the table
+/// (`M_k` from [`TemmeTable::envelopes`]; each order is one more derivative of
+/// a square-root singularity, so the growth exponent is below `k`). With
+/// `r = |η|/ρ` and `(1 + i/d)^k ≤ e^{ik/d}`, the omitted tail is at most
+/// `M_k r^d · q/(1 − q)`, `q = r e^{k/d}`, and the order is declined where
+/// `q ≥ 1`. The series
+/// in `1/a` is asymptotic, so it is accepted at the first order whose term is
+/// below `ε·|S|` — provided the accumulated Taylor truncation is too — and
+/// declined as soon as a term grows (the series has begun to diverge) or the
+/// table runs out.
+fn temme_correction(a: f64, eta: f64) -> Option<f64> {
+    let table = temme_table();
+    let r = eta.abs() / TEMME_ETA_RADIUS;
+    let mut sum = 0.0_f64;
+    let mut truncation = 0.0_f64;
+    let mut scale = 1.0_f64;
+    let mut previous_term = f64::INFINITY;
+    for (k, (row, &envelope)) in table.orders.iter().zip(&table.envelopes).enumerate() {
+        let degree = row.len().checked_sub(1)?;
+        let q = r * (k as f64 / degree as f64).exp();
+        if q >= 1.0 {
+            return None;
+        }
+        let value = row.iter().rev().fold(0.0, |acc, &c| acc * eta + c);
+        let term = value * scale;
+        sum += term;
+        truncation += envelope * r.powi(degree as i32) * q / (1.0 - q) * scale;
+        if k > 0 && term.abs() <= f64::EPSILON * sum.abs() {
+            return (truncation <= f64::EPSILON * sum.abs()).then_some(sum);
+        }
+        if k > 0 && term.abs() >= previous_term {
+            return None;
+        }
+        previous_term = term.abs();
+        scale /= a;
+    }
+    None
+}
+
+/// `(P(a, x), Q(a, x))` from Temme's uniform asymptotic expansion, or `None`
+/// where [`temme_correction`] does not certify it.
+///
+/// `Q = ½ erfc(η√(a/2)) + e^{−aη²/2}/√(2πa) · S(a, η)` with
+/// `½η² = h = λ − 1 − ln λ`, `sign η = sign(λ − 1)`, and `P = 1 − Q` is the
+/// same expansion reflected: `P = ½ erfc(−η√(a/2)) − e^{−aη²/2}/√(2πa) · S`.
+/// Each tail is evaluated where it is the small one — `Q` for `x ≥ a`, `P`
+/// below — through `erfc(y) = e^{−y²} erfcx(y)` with `y = √(a·h) ≥ 0`, so the
+/// common factor `e^{−a·h}` is taken out once and nothing underflows before
+/// the result does.
+fn temme_incomplete_gamma_pair(a: f64, x: f64) -> Option<(f64, f64)> {
+    let exponent = gamma_exponent(a, x);
+    let eta = (2.0 * exponent / a).sqrt().copysign(x - a);
+    let correction = temme_correction(a, eta)?;
+    let y = exponent.sqrt();
+    let envelope = (-exponent).exp();
+    let erfc_half = 0.5 * erfcx_nonnegative(y);
+    let gaussian = correction / (2.0 * std::f64::consts::PI * a).sqrt();
+    if x >= a {
+        let q = envelope * (erfc_half + gaussian);
+        Some((1.0 - q, q))
+    } else {
+        let p = envelope * (erfc_half - gaussian);
+        Some((p, 1.0 - p))
     }
 }
 
@@ -674,9 +1078,9 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
 /// iteration itself. Both tails come from the crate's own
 /// [`regularized_incomplete_gamma_pair`] (NOT `statrs::gamma_lr`, which clamps the
 /// residual to `−p` for tiny `x`; see that fn's note); the density
-/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
-/// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
-/// finite across a wide range of `a`. A positivity step-halving guard keeps the
+/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is the same pair's prefactor
+/// ([`incomplete_gamma_prefactor`]) over `x`, finite and free of the `a·ln a`
+/// cancellation for every `a`. A positivity step-halving guard keeps the
 /// iterate inside the support.
 pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     use statrs::function::gamma::ln_gamma;
@@ -691,7 +1095,6 @@ pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         return f64::INFINITY;
     }
 
-    let gln = ln_gamma(a);
     let a1 = a - 1.0;
 
     // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
@@ -742,14 +1145,6 @@ pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         }
     };
 
-    // Density factorization constants for `a > 1` (kept overflow-safe in logs).
-    let (lna1, afac) = if a > 1.0 {
-        let lna1 = a1.ln();
-        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
-    } else {
-        (0.0, 0.0)
-    };
-
     // Halley refinement of the seeded quantile. Halley's cubic convergence
     // shrinks the step geometrically from the standard Wilson-Hilferty /
     // asymptotic seed; once a step is no smaller than the one before it, or no
@@ -775,11 +1170,7 @@ pub fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         } else {
             p_at_x - p
         };
-        let dens = if a > 1.0 {
-            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
-        } else {
-            (-x + a1 * x.ln() - gln).exp()
-        };
+        let dens = incomplete_gamma_prefactor(a, x) / x;
         if !(dens.is_finite() && dens > 0.0) {
             break;
         }
@@ -1046,18 +1437,39 @@ pub fn exact_binary64_sum_sign(
 /// is `(+∞, +1)`; only with negative sign, `(+∞, −1)` (a log-magnitude of
 /// `+∞` with sign `−1` encodes the value `−∞`); with both signs the sum is
 /// the indeterminate `+∞ − ∞`, returned as `(NaN, 0.0)`.  A `−∞`
-/// log-magnitude is `exp(−∞) = 0` and is correctly dropped.
+/// log-magnitude is `exp(−∞) = 0` and is correctly dropped. A `NaN` sign, or a
+/// `NaN` log-magnitude carried by a nonzero sign, is an undefined term and makes
+/// the whole sum undefined: `(NaN, 0.0)`.
 pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
+    signed_log_sum_exp_by(log_mags, |idx| signs[idx])
+}
+
+/// `log Σ_i e^{x_i}`: [`signed_log_sum_exp`] with every sign `+1`. A `−∞` term
+/// contributes `e^{−∞} = 0`, so an empty or all-`−∞` sum is `−∞`; a `+∞` term
+/// makes the sum `+∞`; a `NaN` term makes it `NaN`. Callers that must refuse
+/// those inputs use [`crate::categorical::log_sum_exp`], which validates first.
+pub fn positive_log_sum_exp(log_terms: &[f64]) -> f64 {
+    signed_log_sum_exp_by(log_terms, |_| 1.0).0
+}
+
+/// The reduction behind [`signed_log_sum_exp`] and [`positive_log_sum_exp`],
+/// with the sign of term `idx` read from `sign(idx)`.
+fn signed_log_sum_exp_by(log_mags: &[f64], sign: impl Fn(usize) -> f64) -> (f64, f64) {
     // Infinite-magnitude terms dominate any finite contribution, so resolve
     // them before the finite log-sum-exp reduction below. `−∞` log-magnitudes
-    // are `exp(−∞) = 0` and need no special handling.
+    // are `exp(−∞) = 0` and need no special handling. An undefined term makes
+    // the sum undefined; `f64::max` below would otherwise skip it silently.
     let mut has_pos_inf = false;
     let mut has_neg_inf = false;
     for (idx, &lm) in log_mags.iter().enumerate() {
+        let term_sign = sign(idx);
+        if term_sign.is_nan() || (lm.is_nan() && term_sign != 0.0) {
+            return (f64::NAN, 0.0);
+        }
         if lm == f64::INFINITY {
-            if signs[idx] > 0.0 {
+            if term_sign > 0.0 {
                 has_pos_inf = true;
-            } else if signs[idx] < 0.0 {
+            } else if term_sign < 0.0 {
                 has_neg_inf = true;
             }
         }
@@ -1075,9 +1487,9 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut pos_max = f64::NEG_INFINITY;
     let mut neg_max = f64::NEG_INFINITY;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             pos_max = pos_max.max(lm);
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             neg_max = neg_max.max(lm);
         }
     }
@@ -1098,11 +1510,11 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
     let mut absolute_scaled_sum = 0.0_f64;
     let mut finite_term_count = 0usize;
     for (idx, &lm) in log_mags.iter().enumerate() {
-        if !lm.is_finite() || !(signs[idx] > 0.0 || signs[idx] < 0.0) {
+        if !lm.is_finite() || !(sign(idx) > 0.0 || sign(idx) < 0.0) {
             continue;
         }
         let magnitude = (lm - common_max).exp();
-        let term = if signs[idx] > 0.0 {
+        let term = if sign(idx) > 0.0 {
             magnitude
         } else {
             -magnitude
@@ -1141,13 +1553,13 @@ pub fn signed_log_sum_exp(log_mags: &[f64], signs: &[f64]) -> (f64, f64) {
         if !lm.is_finite() {
             continue;
         }
-        if signs[idx] > 0.0 {
+        if sign(idx) > 0.0 {
             let term = (lm - pos_max).exp();
             let combined = pos_sum + term;
             let shifted = combined - pos_sum;
             pos_tail += (pos_sum - (combined - shifted)) + (term - shifted);
             pos_sum = combined;
-        } else if signs[idx] < 0.0 {
+        } else if sign(idx) < 0.0 {
             let term = (lm - neg_max).exp();
             let combined = neg_sum + term;
             let shifted = combined - neg_sum;
@@ -1925,6 +2337,57 @@ mod tests {
             }
         }
         assert!(chi_square_quantile(0.5, 0.0).is_nan());
+    }
+
+    /// #4242: below the split `x < a + 1` with shape `a < 1`, `Q(a, x)` keeps
+    /// relative accuracy as `a → 0`, where the complement `1 − P` it replaces
+    /// has relative error ≈ ε·P/Q (1.9e5ε at `a = 1e-4`). The references are
+    /// 50-digit `mpmath.gammainc(a, x, inf, regularized=True)` values at the
+    /// exact binary `a` and `x`. The bar, 64ε, covers the continued fraction's
+    /// own error at the split, ≈52ε worst for `a < 1` against mpmath, which the
+    /// sum inherits through `Q(a, a + 1)` and does not add to. The two smallest shapes
+    /// are where `ln Γ*(a)`'s Stirling series overflowed and the pair came back
+    /// NaN or `P = 0`.
+    #[test]
+    fn small_shape_upper_gamma_keeps_relative_accuracy_4242() {
+        let bar = 64.0 * f64::EPSILON;
+        let cases: [(f64, f64, f64); 10] = [
+            (1e-2, 0.909, 2.585_880_246_514_324_190_4e-3),
+            (1e-3, 0.99099, 2.229_549_549_437_722_252_1e-4),
+            (1e-4, 0.9901, 2.230_849_540_126_837_447_8e-5),
+            (1e-8, 0.5, 5.597_735_977_099_587_104_9e-9),
+            (1e-12, 0.7, 3.737_688_432_337_938_572_5e-13),
+            (
+                1.220_517_092_297_636_4e-14,
+                0.535_882_004_306_695_7,
+                6.328_065_217_785_509_233_1e-15,
+            ),
+            (
+                4.469_568_170_114_96e-293,
+                0.874_332_377_373_819_6,
+                1.216_172_647_707_404_266_1e-293,
+            ),
+            (0.5, 1.2, 0.121_335_250_358_482_153_42),
+            (0.9, 1e-3, 0.997_926_400_133_915_959_51),
+            (0.3, 1e-20, 0.999_998_885_757_491_452_7),
+        ];
+        for (a, x, expected) in cases {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let rel = (q - expected).abs() / expected;
+            assert!(
+                rel <= bar,
+                "Q({a}, {x}) = {q:e}, expected {expected:e}: rel {rel:e}"
+            );
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "P({a}, {x}) = {p:e} is not a probability"
+            );
+            assert!(
+                (p + q - 1.0).abs() <= f64::EPSILON,
+                "P + Q = {} at a = {a}",
+                p + q
+            );
+        }
     }
 
     const TOL: f64 = 1e-12;
@@ -2923,6 +3386,41 @@ mod tests {
         let (lm, sg) = signed_log_sum_exp(&[f64::INFINITY, f64::INFINITY], &[1.0, -1.0]);
         assert!(lm.is_nan());
         assert_eq!(sg, 0.0);
+    }
+
+    #[test]
+    fn slse_undefined_term_makes_the_sum_undefined() {
+        // `f64::max` skips a NaN, so a NaN log-magnitude used to vanish from the
+        // sum and leave a finite, wrong answer.
+        for (log_mags, signs) in [
+            ([f64::NAN, 1.0], [1.0, 1.0]),
+            ([1.0, f64::NAN], [1.0, -1.0]),
+            ([f64::NAN, f64::INFINITY], [1.0, 1.0]),
+            ([1.0, 2.0], [f64::NAN, 1.0]),
+        ] {
+            let (lm, sg) = signed_log_sum_exp(&log_mags, &signs);
+            assert!(lm.is_nan(), "{log_mags:?} {signs:?} gave {lm}");
+            assert_eq!(sg, 0.0);
+        }
+        // A zero sign removes the term whatever its magnitude.
+        let (lm, sg) = signed_log_sum_exp(&[f64::NAN, 2.0], &[0.0, 1.0]);
+        assert_eq!((lm, sg), (2.0, 1.0));
+    }
+
+    #[test]
+    fn positive_log_sum_exp_edge_cases() {
+        assert_eq!(positive_log_sum_exp(&[]), f64::NEG_INFINITY);
+        assert_eq!(
+            positive_log_sum_exp(&[f64::NEG_INFINITY, f64::NEG_INFINITY]),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(positive_log_sum_exp(&[0.0, f64::INFINITY]), f64::INFINITY);
+        assert!(positive_log_sum_exp(&[0.0, f64::NAN]).is_nan());
+        let ln2 = std::f64::consts::LN_2;
+        assert!((positive_log_sum_exp(&[0.0, 0.0]) - ln2).abs() <= 2.0 * f64::EPSILON);
+        // Max-shifted: terms far beyond `exp`'s range stay finite.
+        let big = positive_log_sum_exp(&[1000.0, 1000.0, f64::NEG_INFINITY]);
+        assert!((big - (1000.0 + ln2)).abs() <= 1000.0 * f64::EPSILON);
     }
 
     // ── normal_logcdf ─────────────────────────────────────────────────────────

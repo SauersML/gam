@@ -1011,75 +1011,23 @@ fn canonicalize_assignment_kind(kind: &str) -> Result<String, String> {
 // `term.seed_oos_softmax_logits_from_projection_residuals(..)` /
 // `term.seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(..)` directly.
 
+/// Parse the Python `gumbel_schedule` dict through the single Rust schedule
+/// descriptor parser shared with the analytic penalty registry's
+/// `temperature_schedule`, so the SAE surface, `gumbel_schedule_tau` and the
+/// penalty descriptors accept and refuse exactly the same schedules.
 fn gumbel_temperature_schedule_from_pydict(
     schedule: Option<&Bound<'_, PyDict>>,
 ) -> Result<Option<GumbelTemperatureSchedule>, String> {
-    fn get<'py>(state: &'py Bound<'py, PyDict>, key: &str) -> Result<Bound<'py, PyAny>, String> {
-        state
-            .get_item(key)
-            .map_err(|err| err.to_string())?
-            .ok_or_else(|| format!("gumbel_schedule is missing key {key:?}"))
-    }
-
     let Some(schedule) = schedule else {
         return Ok(None);
     };
-    let decay_name = get(schedule, "decay")?
-        .extract::<String>()
-        .map_err(|err| err.to_string())?
-        .to_ascii_lowercase()
-        .replace('-', "_");
-    let tau_start = get(schedule, "tau_start")?
-        .extract::<f64>()
-        .map_err(|err| err.to_string())?;
-    let tau_min = match schedule
-        .get_item("tau_min")
-        .map_err(|err| err.to_string())?
-    {
-        Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
-        None => return Err("gumbel_schedule is missing key \"tau_min\"".to_string()),
-    };
-    let decay = match decay_name.as_str() {
-        "geometric" => {
-            // Prefer the (tau_start, tau_min, steps) endpoints spec and derive
-            // the rate here; fall back to an explicit `rate` (default 0.9).
-            let steps = match schedule.get_item("steps").map_err(|err| err.to_string())? {
-                Some(value) => Some(value.extract::<usize>().map_err(|err| err.to_string())?),
-                None => None,
-            };
-            let rate = match steps {
-                Some(steps) => ScheduleKind::geometric_rate_from_steps(tau_start, tau_min, steps),
-                None => match schedule.get_item("rate").map_err(|err| err.to_string())? {
-                    Some(value) => value.extract::<f64>().map_err(|err| err.to_string())?,
-                    None => 0.9,
-                },
-            };
-            ScheduleKind::Geometric { rate }
-        }
-        "linear" => {
-            let steps = get(schedule, "steps")?
-                .extract::<usize>()
-                .map_err(|err| err.to_string())?;
-            ScheduleKind::Linear { steps }
-        }
-        "reciprocal_iter" => ScheduleKind::ReciprocalIter,
-        other => {
-            return Err(format!(
-                "gumbel_schedule decay must be 'geometric', 'linear', or 'reciprocal_iter'; got {other:?}"
-            ));
-        }
-    };
-    let mut schedule_out = GumbelTemperatureSchedule::new(tau_start, tau_min, decay)?;
-    if let Some(iter_count) = schedule
-        .get_item("iter_count")
-        .map_err(|err| err.to_string())?
-    {
-        schedule_out.iter_count = iter_count
-            .extract::<usize>()
-            .map_err(|err| err.to_string())?;
-        schedule_out.validate()?;
-    }
-    Ok(Some(schedule_out))
+    let raw = crate::manifold::manifold_sae_coercion::py_any_to_json_value(schedule.as_any())
+        .map_err(|err| format!("gumbel_schedule: {err}"))?;
+    gam::families::fit_orchestration::descriptors::gumbel_temperature_schedule_from_json(
+        &raw,
+        "gumbel_schedule",
+    )
+    .map(Some)
 }
 
 fn structured_residual_pass_diagnostics_dict<'py>(
@@ -2554,6 +2502,7 @@ fn layer_transport_report_to_pydict<'py>(
     out.set_item("layer_to", report.layer_to)?;
     out.set_item("topology_from", report.topology_from.name())?;
     out.set_item("topology_to", report.topology_to.name())?;
+    out.set_item("pairs", pair_law_name(report.pair_law))?;
     out.set_item("topology_preserved", report.topology_preserved)?;
     out.set_item("degree", report.degree)?;
     out.set_item("degree_concentration", report.degree_concentration)?;
@@ -2582,13 +2531,37 @@ fn layer_transport_report_to_pydict<'py>(
     Ok(out)
 }
 
-/// Fit one inter-layer concept transport map `t_to = h(t_from)` with the
-/// engine's REML machinery (issue #1013) and return the evidence payload:
+/// Parse the declared law of transport pairs: `"stochastic"` pairs scatter
+/// about the map (estimated chart coordinates), `"deterministic"` pairs are one
+/// function of the source coordinate (a held executed transport, a noise-free
+/// synthetic map).
+fn parse_pair_law(pairs: &str) -> PyResult<gam::inference::layer_transport::PairLaw> {
+    use gam::inference::layer_transport::PairLaw;
+    match pairs {
+        "stochastic" => Ok(PairLaw::Stochastic),
+        "deterministic" => Ok(PairLaw::Deterministic),
+        other => Err(PyValueError::new_err(format!(
+            "pairs must be \"stochastic\" or \"deterministic\", got {other:?}"
+        ))),
+    }
+}
+
+fn pair_law_name(pair_law: gam::inference::layer_transport::PairLaw) -> &'static str {
+    use gam::inference::layer_transport::PairLaw;
+    match pair_law {
+        PairLaw::Stochastic => "stochastic",
+        PairLaw::Deterministic => "deterministic",
+    }
+}
+
+/// Fit one inter-layer concept transport map `t_to = h(t_from)` (issue #1013)
+/// under the declared pair law — the REML smooth of stochastic pairs, the
+/// minimum-curvature interpolant of deterministic ones — and return the evidence payload:
 /// winding degree (circle→circle), topology-preservation verdict, the
 /// data-density-weighted isometry defect with its delta-method SE, EDF, and
 /// the selected smoothing level. See
 /// `gam::inference::layer_transport` for the estimator and gauge discipline.
-#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1))]
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", layer_from = 0, layer_to = 1, pairs = "stochastic"))]
 fn layer_transport_fit(
     py: Python<'_>,
     coords_from: PyReadonlyArray1<'_, f64>,
@@ -2597,13 +2570,15 @@ fn layer_transport_fit(
     topology_to: &str,
     layer_from: usize,
     layer_to: usize,
+    pairs: &str,
 ) -> PyResult<Py<PyDict>> {
+    let pair_law = parse_pair_law(pairs)?;
     let from = coords_from.as_array();
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
     let report = gam::inference::layer_transport::fit_layer_transport(
-        layer_from, layer_to, from, to, topo_from, topo_to,
+        layer_from, layer_to, from, to, topo_from, topo_to, pair_law,
     )
     .map_err(PyValueError::new_err)?;
     Ok(layer_transport_report_to_pydict(py, &report)?.unbind())
@@ -2713,20 +2688,25 @@ impl PyFittedTransport {
 /// invertible [`PyFittedTransport`] (rather than the summary dict that
 /// [`layer_transport_fit`] returns). `coords_from[i]` and `coords_to[i]`
 /// coordinatize the same observation in the source and target charts;
-/// topologies are `"circle"` or `"interval"`.
-#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle"))]
+/// topologies are `"circle"` or `"interval"`; `pairs` is `"stochastic"` or
+/// `"deterministic"`.
+#[pyfunction(signature = (coords_from, coords_to, topology_from = "circle", topology_to = "circle", pairs = "stochastic"))]
 fn fit_transport(
     coords_from: PyReadonlyArray1<'_, f64>,
     coords_to: PyReadonlyArray1<'_, f64>,
     topology_from: &str,
     topology_to: &str,
+    pairs: &str,
 ) -> PyResult<PyFittedTransport> {
+    let pair_law = parse_pair_law(pairs)?;
     let from = coords_from.as_array();
     let to = coords_to.as_array();
     let topo_from = parse_chart_topology(topology_from, from)?;
     let topo_to = parse_chart_topology(topology_to, to)?;
-    let inner = gam::inference::layer_transport::fit_transport_map(from, to, topo_from, topo_to)
-        .map_err(PyValueError::new_err)?;
+    let inner = gam::inference::layer_transport::fit_transport_map(
+        from, to, topo_from, topo_to, pair_law,
+    )
+    .map_err(PyValueError::new_err)?;
     Ok(PyFittedTransport { inner })
 }
 
@@ -2735,14 +2715,17 @@ fn fit_transport(
 /// `h_{l→l+2} ≟ h_{l+1→l+2} ∘ h_{l→l+1}` attached (issue #1013). `coords` is
 /// a list of equal-length 1-D coordinate arrays (one per layer, same rows);
 /// `topology` applies to every chart; `layers` are optional labels
-/// (defaulting to `0..len`). Returns `{"adjacent": [...], "two_hop": [...]}`.
-#[pyfunction(signature = (coords, topology = "circle", layers = None))]
+/// (defaulting to `0..len`); `pairs` declares every pair's law. Returns
+/// `{"adjacent": [...], "two_hop": [...]}`.
+#[pyfunction(signature = (coords, topology = "circle", layers = None, pairs = "stochastic"))]
 fn layer_transport_ladder(
     py: Python<'_>,
     coords: &Bound<'_, PyList>,
     topology: &str,
     layers: Option<Vec<usize>>,
+    pairs: &str,
 ) -> PyResult<Py<PyDict>> {
+    let pair_law = parse_pair_law(pairs)?;
     use gam::inference::layer_transport::transport_ladder;
     let mut coord_vecs: Vec<ndarray::Array1<f64>> = Vec::with_capacity(coords.len());
     for item in coords.iter() {
@@ -2767,7 +2750,8 @@ fn layer_transport_ladder(
         topologies.push(parse_chart_topology(topology, coord.view())?);
     }
     let ladder =
-        transport_ladder(&layer_labels, &coord_vecs, &topologies).map_err(PyValueError::new_err)?;
+        transport_ladder(&layer_labels, &coord_vecs, &topologies, pair_law)
+        .map_err(PyValueError::new_err)?;
     let out = PyDict::new(py);
     let adjacent = PyList::empty(py);
     for report in &ladder.adjacent {

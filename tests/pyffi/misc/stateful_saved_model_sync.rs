@@ -72,7 +72,19 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 2;
 // fit consumed and its certificate (gam#2926, `#[serde(default)]` only, so it always
 // serializes); it is a fit record, not a fitted link state, so no stateful-link slot
 // changes.
-const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 100;
+// Two keys landed after that count without re-counting it:
+// `gaussian_sigma_floor` (the Gaussian location-scale sigma floor, a scalar) and
+// `informational_notes` (the fit's record of engine-chosen defaults). Neither is
+// a fitted link state. gam#4466 then removes six write-only keys:
+// `sas_param_covariance` and `mixture_link_param_covariance` (second copies of
+// the covariance that `fit_result.fitted_link` already serializes, which
+// prediction reads), `beta_noise` (a copy of the fit's `Scale` block, which
+// prediction reads), `slope_formulas` and `baseline_slopes` (singleton mirrors
+// of `slope_formula` and `baseline_slope` that nothing read) and the
+// never-written `latent_score_contract`. `FittedModelPayload` now declares 100
+// `pub` fields, so the JSON payload carries 100 - 4 = 96 keys. The stateful sync
+// keeps mirroring each link's point state; the link covariance stays on the fit.
+const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 96;
 const EXPECTED_STANDARD_FAMILY_FIELD_COUNT: usize = 6;
 
 fn read_saved_model_json(path: &Path) -> Value {
@@ -159,6 +171,19 @@ fn standard_family_state(saved: &Value) -> &serde_json::Map<String, Value> {
         Some("standard")
     );
     family_state
+}
+
+/// The SAS link-parameter covariance round-trips through its canonical home,
+/// `fit_result.fitted_link`, which is what link-uncertainty prediction reads.
+fn assert_loaded_sas_covariance(payload: &FittedModelPayload, expected: &Array2<f64>) {
+    let fit = payload
+        .fit_result
+        .as_ref()
+        .expect("loaded standard model carries its canonical fit_result");
+    let FittedLinkState::Sas { covariance, .. } = &fit.fitted_link else {
+        panic!("expected a SAS fitted link, got {:?}", fit.fitted_link);
+    };
+    assert_eq!(covariance.as_ref(), Some(expected));
 }
 
 fn minimal_fit_result(fitted_link: FittedLinkState) -> UnifiedFitResult {
@@ -400,10 +425,6 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     assert_eq!(family_state.get("latent_cloglog_state"), Some(&Value::Null));
     assert_eq!(family_state.get("mixture_state"), Some(&Value::Null));
     assert_eq!(
-        saved_model_payload(&saved).get("sas_param_covariance"),
-        Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
-    );
-    assert_eq!(
         saved_model_payload(&saved).get("training_headers"),
         Some(&serde_json::json!(["x"]))
     );
@@ -423,10 +444,7 @@ fn save_and_load_syncs_standard_sas_state_from_fit_result() {
     let FittedModel::Standard { payload } = loaded else {
         panic!("expected standard model");
     };
-    assert_eq!(
-        payload.sas_param_covariance,
-        Some(vec![vec![0.1, 0.02], vec![0.02, 0.2]])
-    );
+    assert_loaded_sas_covariance(&payload, &covariance);
     assert_eq!(payload.training_headers, Some(vec!["x".to_string()]));
     assert_eq!(payload.training_feature_ranges, Some(vec![(-1.5, 2.25)]));
 }
@@ -481,10 +499,6 @@ fn save_and_load_syncs_standard_sas_state_from_unified_fit_result() {
         Some(&serde_json::to_value(sas_state).expect("sas state json")),
         "serialized model should include synchronized family_state.sas_state from unified fit"
     );
-    assert_eq!(
-        saved_model_payload(&saved).get("sas_param_covariance"),
-        Some(&serde_json::json!([[0.1, 0.02], [0.02, 0.2]]))
-    );
 
     let loaded = FittedModel::load_from_path(&path).expect("load model");
     let loaded_state = loaded
@@ -492,6 +506,10 @@ fn save_and_load_syncs_standard_sas_state_from_unified_fit_result() {
         .expect("loaded sas state")
         .expect("expected loaded sas state");
     assert_eq!(loaded_state, sas_state);
+    let FittedModel::Standard { payload } = loaded else {
+        panic!("expected standard model");
+    };
+    assert_loaded_sas_covariance(&payload, &covariance);
 }
 
 #[test]

@@ -164,7 +164,6 @@ fn main() {
             ResponseFamily::Binomial,
             InverseLink::Standard(StandardLink::Logit),
         ),
-        estimate_tweedie_p: false,
         options: fit_options(),
         kappa_options: SpatialLengthScaleOptimizationOptions::default(),
         wiggle: match lane {
