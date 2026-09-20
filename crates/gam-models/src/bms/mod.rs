@@ -2440,6 +2440,11 @@ pub(crate) fn robust_conditional_score_pvalue(
 /// first-order effect makes `Ω̂` the variance of the score as it is actually
 /// computed, not as if the nuisance were known. `row_roundings` bounds the
 /// roundings that formed each `ψ_ij`, for the rank cutoff.
+///
+/// `None` means the test is degenerate — no contributions, or an `Ω̂` with no
+/// usable direction — so there is no evidence either way. A score, meat,
+/// statistic or tail probability that is not finite is a numerical failure,
+/// not an absence of evidence, and is an error.
 pub(crate) fn robust_score_contributions_pvalue(
     contributions: &Array2<f64>,
     row_roundings: usize,
@@ -2452,7 +2457,10 @@ pub(crate) fn robust_score_contributions_pvalue(
     let s = contributions.sum_axis(ndarray::Axis(0));
     let omega = gam_linalg::faer_ndarray::fast_ata(contributions);
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
-        return Ok(None);
+        return Err(format!(
+            "robust score test over {n} rows and {r} directions: the score or its meat is not \
+             finite"
+        ));
     }
     // Rank cutoff: `Ω̂`'s formation band against `λ_max(Ω̂)`. Each entry sums `n`
     // products `ψ_ij·ψ_ik`, each factor formed with `row_roundings` roundings,
@@ -2475,14 +2483,30 @@ pub(crate) fn robust_score_contributions_pvalue(
     if rank == 0 {
         return Ok(None);
     }
-    let d_stat = s.dot(&omega_pinv.dot(&s));
-    if !(d_stat.is_finite() && d_stat >= 0.0) {
-        return Ok(None);
+    // `D = sᵀΩ̂⁺s` is formed as `‖Ψ Ω̂⁺ s‖²`, `Ψ` the contribution rows: the
+    // rank-truncated pseudo-inverse satisfies `Ω̂⁺ Ω̂ Ω̂⁺ = Ω̂⁺` with `Ω̂ = ΨᵀΨ`, so
+    // the two agree, and a sum of squares cannot round below zero the way the
+    // quadratic form can when `s` lies in `Ω̂`'s discarded null space.
+    let direction = omega_pinv.dot(&s);
+    let d_stat = contributions
+        .dot(&direction)
+        .iter()
+        .map(|value| value * value)
+        .sum::<f64>();
+    if !d_stat.is_finite() {
+        return Err(format!(
+            "robust score test over {n} rows at rank {rank}: the statistic sᵀΩ⁺s is not finite"
+        ));
     }
     // The shared survival primitive owns both the direct upper-gamma identity
     // and its exact `Q(a, 0) = 1` boundary.
     let p_value = chi_square_sf(d_stat, rank as f64);
-    Ok(p_value.is_finite().then_some(p_value))
+    if !p_value.is_finite() {
+        return Err(format!(
+            "robust score test: the chi-square({rank}) tail at D = {d_stat:e} is not finite"
+        ));
+    }
+    Ok(Some(p_value))
 }
 
 /// Fit the conditional location-scale calibration (#905) if the conditional
@@ -3706,6 +3730,36 @@ mod tests {
         let err = EmpiricalZGrid::new(vec![0.0, -1.0], vec![0.5, 0.5], "sorted-grid invariant")
             .expect_err("constructed grids must already be canonical");
         assert!(err.contains("nodes must be sorted ascending"), "{err}");
+    }
+
+    #[test]
+    fn robust_score_test_statistic_is_the_score_quadratic_form() {
+        // s = 1.5, Ω̂ = 1 + 1 + 0.25 = 2.25, so D = s²/Ω̂ = 1 on one direction.
+        let contributions = ndarray::array![[1.0], [1.0], [-0.5]];
+        let p = super::robust_score_contributions_pvalue(&contributions, 1)
+            .expect("finite contributions")
+            .expect("one usable direction");
+        let expected = super::chi_square_sf(1.0, 1.0);
+        assert!((p - expected).abs() <= 1e-12 * expected, "{p} vs {expected}");
+    }
+
+    #[test]
+    fn robust_score_test_with_a_null_space_score_reports_p_one() {
+        // The score is zero and Ω̂ = diag(2, 0) has rank 1: D = 0 is evidence of
+        // no departure, p = 1, not a degenerate test.
+        let contributions = ndarray::array![[1.0, 0.0], [-1.0, 0.0]];
+        let p = super::robust_score_contributions_pvalue(&contributions, 1)
+            .expect("finite contributions")
+            .expect("one usable direction");
+        assert_eq!(p, 1.0);
+    }
+
+    #[test]
+    fn robust_score_test_refuses_a_non_finite_score() {
+        let contributions = ndarray::array![[1.0e300, 1.0], [1.0e300, -1.0]];
+        let err = super::robust_score_contributions_pvalue(&contributions, 1)
+            .expect_err("an overflowed meat is a numerical failure, not a degenerate test");
+        assert!(err.contains("not finite"), "{err}");
     }
 }
 

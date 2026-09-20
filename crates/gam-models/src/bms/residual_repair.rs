@@ -367,12 +367,17 @@ impl ResidualBlockRuntime {
         let mut centring_pvalues = Vec::with_capacity(k);
         for (col, name) in spec.columns.iter().enumerate() {
             let u: Vec<f64> = spec.features.column(col).to_vec();
+            // A test with no usable direction has not tested the column, so it
+            // refuses rather than passing the column as centred.
             let p_value = robust_conditional_score_pvalue(basis.view(), &u, weights)
                 .map_err(|reason| ResidualRepairRefusal::CentringTestUnavailable {
                     column: name.clone(),
                     reason,
                 })?
-                .unwrap_or(1.0);
+                .ok_or_else(|| ResidualRepairRefusal::CentringTestUnavailable {
+                    column: name.clone(),
+                    reason: "the robust score test has no usable direction".to_string(),
+                })?;
             if p_value < AUTO_Z_CONDITIONAL_RAO_ALPHA {
                 return Err(ResidualRepairRefusal::ColumnNotCentred {
                     column: name.clone(),
