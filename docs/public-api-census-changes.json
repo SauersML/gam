@@ -4894,5 +4894,13 @@
     },
     "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
     "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "0ad99f35c574d1698a07f2c4a891a14a95a5090d",
+    "removed": {
+      "crates/gam-terms/src/basis/types.rs::power_as_usize": 1
+    },
+    "reason": "#3541: a hybrid Duchon power is read through the fallible duchon_hybrid_s_order, which refuses a fractional s; the truncating power_as_usize view is gone. The d=4-only gh#750 test becomes a d=1,2,4 refusal table (hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541).",
+    "evidence": "git grep finds no remaining caller of power_as_usize; every former caller now calls DuchonBasisSpec::hybrid_s_order or duchon_hybrid_s_order."
   }
 ]

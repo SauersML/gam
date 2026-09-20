@@ -2732,5 +2732,14 @@
     ],
     "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "0ad99f35c574d1698a07f2c4a891a14a95a5090d",
+    "items": [
+      "crates/gam-terms/src/basis/types.rs:fn:power_as_usize",
+      "tests/src_modules/smooths/basis_radial_periodic_thinplate_tests.rs:fn:hybrid_duchon_fractional_default_d4_rejects_realized_nonfinite_kernel"
+    ],
+    "reason": "#3541: a hybrid Duchon power is read through the fallible duchon_hybrid_s_order, which refuses a fractional s; the truncating power_as_usize view is gone. The d=4-only gh#750 test becomes a d=1,2,4 refusal table (hybrid_duchon_fractional_power_is_refused_in_every_dimension_3541).",
+    "evidence": "git grep finds no remaining caller of power_as_usize; every former caller now calls DuchonBasisSpec::hybrid_s_order or duchon_hybrid_s_order."
   }
 ]
