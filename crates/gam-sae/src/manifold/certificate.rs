@@ -18,206 +18,20 @@ use super::*;
 // are the optimizer's equilibrium response to superposition pressure: bend
 // just enough to buy back identifiability.
 //
-// This module is the quantitative, certificate-producing face of that claim.
-// It is the curvature/measure-side complement to the support-side empirical
-// Terracini rank test in `identifiability.rs` / `isa_seed.rs`: that side
-// certifies from the SUPPORT geometry (transversality of active-row
-// tangents); this side certifies from CURVATURE + cross-atom INCOHERENCE
-// (the two are both needed — support transversality can fail to see a
-// flat-vs-curved distinction that this side exists to certify).
+// This module measures the quantities that claim is stated in: the empirical
+// cross-atom frame incoherence `μ̂` and the per-atom second-fundamental-form
+// curvature `κ̂`, with the activity floors and reconstruction SNR beside them.
+// It publishes them as measurements. No sufficient condition turning them into
+// a global-optimality verdict has been derived for curved atoms, so none is
+// computed here. The support-side Terracini rank test (`identifiability.rs` /
+// `isa_seed.rs`) and the measured dual certificate (`dual_certificate.rs`) are
+// separate owners and are not changed by this.
 
-/// The global-optimality verdict of the curved-dictionary incoherence
-/// certificate (#1008): whether the fit's basin stationary point is certified
-/// unique up to the residual gauge group, and by what margin.
-///
-/// The certificate is **conservative by construction**: it certifies only when
-/// the conservative sufficient condition holds with positive margin, so a
-/// `CertifiedGlobal` verdict can never be wrong (the phase-diagram validation
-/// asserts exactly this — no certified-but-wrong cell, ever). An
-/// `Uncertified` verdict is *not* a claim of non-uniqueness — it is the honest
-/// "this certificate cannot decide", which is the only safe failure mode.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum GlobalOptimalityVerdict {
-    /// The conservative sufficient condition holds: the basin stationary point
-    /// is unique up to the certified residual gauge group. `margin` is the
-    /// (positive) slack `budget − μ̂` by which the condition is met.
-    CertifiedGlobal { margin: f64 },
-    /// The condition is not met (or a precondition — graph-validity / SNR > 1 —
-    /// fails). `margin` is the non-positive slack when the inequality is
-    /// defined, and `None` when a precondition rules the inequality itself out.
-    /// Multistart / homotopy is genuinely needed here.
-    Uncertified { margin: Option<f64> },
-}
-
-impl GlobalOptimalityVerdict {
-    /// The signed margin `budget − μ̂` (positive ⇒ certified), or `None` when a
-    /// failed precondition leaves that inequality undefined.
-    pub fn margin(&self) -> Option<f64> {
-        match self {
-            Self::CertifiedGlobal { margin } => Some(*margin),
-            Self::Uncertified { margin } => *margin,
-        }
-    }
-
-    /// Whether the fit is certified globally optimal up to the gauge group.
-    pub fn is_certified(&self) -> bool {
-        matches!(self, Self::CertifiedGlobal { .. })
-    }
-}
-
-/// Conservative tangent-graph curvature budget: the atom image is a graph over
-/// its tangent frame only while `C_KAPPA · κ̂` stays below 1 — i.e. the relative
-/// second-fundamental-form curvature `κ̂` (perp curvature per unit tangent
-/// scale) is below `1`. Above it the atom turns faster than its own tangent
-/// extent and the linear-case perturbation argument is void, so the certificate
-/// refuses to certify. A circle of radius `r` has `κ̂ = 1/r`, so this admits
-/// `r > 1` (benign, well-resolved atoms) and rejects tightly-curved ones whose
-/// graph approximation is uncontrolled. Raising this constant only ever shrinks
-/// the certified region (withholds certification), never grants a wrong one.
-///
-/// This constant is the load-bearing pivot of "curvature is the
-/// identifiability resource, bounded above for tangent-graph validity": the
-/// factor `(1 − C_κ κ̂)` it feeds (see [`curved_dictionary_global_optimality_verdict`])
-/// is double-duty. Some curvature is *good* — it is precisely what breaks the
-/// flat GL gauge and lets the within-atom restricted-strong-convexity term pin
-/// each atom's identity — but too much curvature (`C_κ κ̂ ≥ 1`) voids the very
-/// tangent-graph perturbation the certificate is built on, so the same
-/// quantity that grants rigidity also bounds how far the atom is allowed to
-/// bend before the analysis stops applying.
-pub const SAE_CERT_CURVATURE_CONSTANT: f64 = 1.0;
-
-/// Conservative incoherence-budget constant `c0` in the sufficient condition
-/// `μ̂ ≤ c0 · a_floor² · (1 − 1/SNR) · (1 − C_κ κ̂) / K`. Small (conservative):
-/// shrinking the budget can only withhold certification, never grant a wrong
-/// one.
-///
-/// `μ̂` is the empirical cross-atom frame incoherence — the coupling channel
-/// through which the superposition/flatness disease acts (large `μ̂` means two
-/// atoms' output frames overlap enough, when co-active, for a cross-atom
-/// recombination to masquerade as the fit). The certificate's claim is exactly
-/// that incoherence (small `μ̂`) *plus* controlled curvature (`κ̂` bounded by
-/// [`SAE_CERT_CURVATURE_CONSTANT`]) together certify rigidity: superposition
-/// coupling that is weak enough, on a dictionary that is curved enough, cannot
-/// hide an alternative flat recombination.
-pub const SAE_CERT_INCOHERENCE_BUDGET: f64 = 0.125;
-
-/// The conservative curved-dictionary global-optimality threshold (#1008).
-///
-/// # Theory: curvature as the identifiability resource
-///
-/// Superposition ambiguity is a flatness disease: a purely linear (flat)
-/// dictionary has a gauge groupoid as large as GL acting on any co-active flat
-/// span, since any invertible recombination of co-firing linear directions
-/// reconstructs identically. Curved atoms are generically rigid instead — jet
-/// transversality makes second-order osculation between two generic
-/// embeddings an infinite-codimension coincidence, so a curved atom's residual
-/// gauge collapses to Diff × Sym. This function is the quantitative decision
-/// procedure for that claim: it takes the empirical curvature `κ̂`, cross-atom
-/// incoherence `μ̂` (the superposition coupling), activity floor, and SNR, and
-/// answers whether the fitted dictionary is curved-and-incoherent *enough* to
-/// certify the flat gauge does not apply here.
-///
-/// # The condition
-///
-/// Following the linear exact-recovery lineage (Spielman–Wang–Wright complete
-/// case; Sun–Qu–Wright geometric analysis — in benign regimes every local min
-/// is global) perturbed to curved atoms: the atom image is a graph over its
-/// tangent frame with second-fundamental-form curvature `κ`, so the linear-case
-/// arguments perturb when `κ·diam(chart)` is small. The competing-basin coupling
-/// is the cross-atom frame incoherence `μ` amplified by co-activation; the
-/// within-atom restricted strong convexity that pins each atom scales with the
-/// activity floor (how reliably the atom fires) and the SNR (how far the signal
-/// is above noise), and is **degraded by curvature** (the graph approximation
-/// error). The certificate certifies global optimality up to the residual gauge
-/// when
-///
-/// ```text
-///   μ̂  ≤  c0 · a_floor² · (1 − 1/SNR) · (1 − C_κ · κ̂_max) / K
-/// ```
-///
-/// subject to the preconditions `C_κ · κ̂_max < 1` (tangent-graph validity) and
-/// `SNR > 1` (signal above noise). `a_floor` is the support activity floor
-/// (`min_k max_i a_ik`, the same statistic the collapse guard reads), `K` the
-/// atom count, `κ̂_max` the largest per-atom second-fundamental-form bound.
-///
-/// This is the memo's honesty-ledger doctrine applied to identifiability
-/// itself: identifiability stops being an assumption silently baked into "we
-/// fit a dictionary" and becomes a certificate the fit *carries* — either
-/// `CertifiedGlobal` with an auditable margin, or the structurally
-/// un-overclaimable `Uncertified`. There is no third option where the code
-/// asserts uniqueness without having checked it.
-///
-/// # Conservatism
-///
-/// Every constant is chosen to *shrink* the certified region relative to the
-/// true (unknown) sharp threshold: `c0` is small, `C_κ` is large. A
-/// `CertifiedGlobal` verdict therefore implies the sharp condition with room to
-/// spare — it can never be wrong. An `Uncertified` verdict is the honest "cannot
-/// decide", never a claim of non-uniqueness. The cross-validation with the
-/// certified-homotopy bifurcation events (#1007) is exactly this: a bifurcation
-/// (a competing basin appearing) should only ever occur where this margin is
-/// non-positive.
-pub fn curved_dictionary_global_optimality_verdict(
-    mu_hat: f64,
-    kappa_max: f64,
-    activity_floor: f64,
-    snr_proxy: f64,
-    k_atoms: usize,
-) -> GlobalOptimalityVerdict {
-    // Preconditions: any non-finite input, no atoms, a curvature that voids the
-    // tangent-graph perturbation, or SNR at/below the noise floor ⇒ refuse.
-    if !mu_hat.is_finite()
-        || !kappa_max.is_finite()
-        || !activity_floor.is_finite()
-        || !snr_proxy.is_finite()
-        || snr_proxy <= 0.0
-        || k_atoms == 0
-    {
-        // `snr_proxy <= 0.0` is an explicit precondition: the sufficient
-        // condition needs SNR > 1, enforced below via `snr_factor > 0`. But that
-        // check alone is `1 − 1/snr_proxy > 0`, which a NEGATIVE `snr_proxy` also
-        // satisfies (`1 − (negative) > 1`) and would then INFLATE the budget
-        // (`snr_factor > 1`) and falsely certify. A negative signal-to-noise
-        // proxy is physically degenerate, so refuse up front — keeping the
-        // "an Uncertified verdict never claims a wrong certification" contract
-        // robust even for direct callers (the in-tree report path already floors
-        // dispersion > 0, so this only hardens the public entry point).
-        return GlobalOptimalityVerdict::Uncertified {
-            margin: None,
-        };
-    }
-    let curvature_factor = 1.0 - SAE_CERT_CURVATURE_CONSTANT * kappa_max.max(0.0);
-    let snr_factor = 1.0 - 1.0 / snr_proxy;
-    if curvature_factor <= 0.0 || snr_factor <= 0.0 {
-        // Tangent-graph perturbation void, or signal not above noise: the
-        // linear-case argument does not apply, so certification is impossible.
-        return GlobalOptimalityVerdict::Uncertified {
-            margin: None,
-        };
-    }
-    let a = activity_floor.max(0.0);
-    let budget =
-        SAE_CERT_INCOHERENCE_BUDGET * a * a * snr_factor * curvature_factor / k_atoms as f64;
-    let margin = budget - mu_hat;
-    if !margin.is_finite() {
-        // Finite inputs can still overflow while squaring an adversarially
-        // large activity floor. An infinite slack is not evidence: the
-        // sufficient inequality is numerically undefined at that scale.
-        return GlobalOptimalityVerdict::Uncertified { margin: None };
-    }
-    if margin > 0.0 {
-        GlobalOptimalityVerdict::CertifiedGlobal { margin }
-    } else {
-        GlobalOptimalityVerdict::Uncertified {
-            margin: Some(margin),
-        }
-    }
-}
-
-/// Empirical quantities that feed the curved-dictionary incoherence theorem,
-/// plus the conservative global-optimality verdict (#1008).
+/// Empirical cross-atom incoherence, curvature, activity and SNR of a fitted
+/// curved dictionary (#1008). These are measurements; no verdict is derived
+/// from them.
 #[derive(Clone, Debug)]
-pub struct CertificateInputs {
+pub struct DictionaryIncoherenceReport {
     /// `max_{j != k} sigma_max(U_j^T U_k)` over decoder output subspaces.
     pub mu_hat: f64,
     /// Per-atom maximum empirical second-fundamental-form norm on the fitted
@@ -236,20 +50,13 @@ pub struct CertificateInputs {
     pub snr_proxy: f64,
     /// Dispersion used in [`Self::snr_proxy`].
     pub dispersion: f64,
-    /// The conservative global-optimality verdict (#1008):
-    /// `CertifiedGlobal { margin }` when the sufficient condition
-    /// ([`curved_dictionary_global_optimality_verdict`]) holds with positive
-    /// slack — the basin stationary point is unique up to the residual gauge
-    /// group — else `Uncertified { margin }`. Conservative: a certified verdict
-    /// is never wrong; an uncertified one is "cannot decide", not "non-unique".
-    pub global_optimality: GlobalOptimalityVerdict,
-    /// Human-readable summary of the quantities and verdict.
+    /// Human-readable summary of the quantities.
     pub note: String,
 }
 
 /// The additive post-fit diagnostics for a fitted [`SaeManifoldTerm`]: the
 /// two-score per-atom lens, residual-gauge certificate, and empirical
-/// incoherence/curvature certificate inputs.
+/// incoherence/curvature measurements.
 ///
 /// Built by [`SaeManifoldTerm::fit_diagnostics_report`]. Both reports are pure
 /// reads of the fitted term + its single per-row metric; nothing here feeds back
@@ -265,10 +72,11 @@ pub struct SaeManifoldFitDiagnostics {
     /// to (`crate::identifiability::residual_gauge_exact_from_curvature` and
     /// `residual_gauge_exact_from_streamed`).
     pub residual_gauge: crate::identifiability::ResidualGaugeReport,
-    /// Empirical curved-dictionary certificate inputs (#1008). Present when the
-    /// caller supplies the fitted reconstruction dispersion needed for the SNR
-    /// proxy; absent for legacy callers that only need the existing diagnostics.
-    pub incoherence_report: Option<CertificateInputs>,
+    /// Empirical curved-dictionary incoherence/curvature measurements (#1008).
+    /// Present when the caller supplies the fitted reconstruction dispersion
+    /// needed for the SNR proxy; absent for legacy callers that only need the
+    /// existing diagnostics.
+    pub incoherence_report: Option<DictionaryIncoherenceReport>,
     /// Per-atom Riesz-debiased smooth-functional inference and the any-n-valid
     /// split-LRT smooth-structure e-value (#1097 / #1103), one entry per fitted
     /// atom in atom order.
@@ -338,23 +146,18 @@ pub struct SaeAtomTrustDiagnostics {
     pub active_token_count: usize,
 }
 
-/// Build the empirical curved-dictionary certificate quantities from a fitted
-/// term and an explicit Gaussian reconstruction dispersion.
+/// Measure the curved-dictionary incoherence/curvature quantities of a fitted
+/// term under an explicit Gaussian reconstruction dispersion.
 ///
-/// This is where the theory's abstract quantities get measured off the
-/// fitted term: `mu_hat` (via `dictionary_frame_incoherence`) is the
-/// empirical cross-atom incoherence — the superposition coupling — and each
-/// `per_atom_kappa_hat` entry (via `atom_curvature_bound`) is the empirical
-/// second-fundamental-form curvature — the per-atom rigidity measure. Feeding
-/// the worst (largest) curvature and the weakest (support-floor) activity
-/// into [`curved_dictionary_global_optimality_verdict`] below is deliberately
-/// pessimistic per-atom: the certificate is only as strong as its most
-/// fragile, most tightly-curved constituent.
+/// `mu_hat` (via `dictionary_frame_incoherence`) is the empirical cross-atom
+/// incoherence — the superposition coupling — and each `per_atom_kappa_hat`
+/// entry (via `atom_curvature_bound`) is the empirical second-fundamental-form
+/// curvature of that atom's image.
 pub(crate) fn dictionary_incoherence_report_with_dispersion(
     term: &SaeManifoldTerm,
     dispersion: f64,
     fitted: ArrayView2<'_, f64>,
-) -> Result<CertificateInputs, String> {
+) -> Result<DictionaryIncoherenceReport, String> {
     if !dispersion.is_finite() || dispersion <= 0.0 {
         return Err(format!(
             "dictionary_incoherence_report_with_dispersion: dispersion must be finite and positive, got {dispersion}"
@@ -414,53 +217,19 @@ pub(crate) fn dictionary_incoherence_report_with_dispersion(
         0.0
     };
     let snr_proxy = signal_power / dispersion;
-    // The curvature bound entering the threshold is the largest per-atom
-    // second-fundamental-form norm (the worst graph-approximation error across
-    // the dictionary). The support activity floor `min_k max_i a_ik` is the
-    // honest "how reliably does the weakest atom fire" statistic.
-    let kappa_max = per_atom_kappa_hat
+    let kappa_summary = per_atom_kappa_hat
         .iter()
         .copied()
         .try_fold(0.0_f64, |largest, value| {
             value.map(|value| largest.max(value))
-        });
-    let global_optimality = kappa_max.map_or(
-        GlobalOptimalityVerdict::Uncertified { margin: None },
-        |kappa_max| {
-            curved_dictionary_global_optimality_verdict(
-                mu_hat,
-                kappa_max,
-                peak_activity_floor,
-                snr_proxy,
-                k_atoms,
-            )
-        },
-    );
-    let kappa_summary = kappa_max
+        })
         .map(|value| format!("{value:.3e}"))
         .unwrap_or_else(|| "unbounded (unresolved tangent frame)".to_string());
-    let note = match global_optimality {
-        GlobalOptimalityVerdict::CertifiedGlobal { margin } => format!(
-            "global optimality CERTIFIED up to the residual gauge group \
-             (margin {margin:.3e}); μ̂={mu_hat:.3e}, κ̂_max={kappa_summary}, \
-             a_floor={peak_activity_floor:.3e}, SNR={snr_proxy:.3e}"
-        ),
-        GlobalOptimalityVerdict::Uncertified {
-            margin: Some(margin),
-        } => format!(
-            "global optimality UNCERTIFIED (margin {margin:.3e}; cannot decide — \
-             multistart/homotopy genuinely needed); μ̂={mu_hat:.3e}, \
-             κ̂_max={kappa_summary}, a_floor={peak_activity_floor:.3e}, \
-             SNR={snr_proxy:.3e}"
-        ),
-        GlobalOptimalityVerdict::Uncertified { margin: None } => format!(
-            "global optimality UNCERTIFIED (margin unavailable because a certificate \
-             precondition failed; cannot decide — multistart/homotopy genuinely needed); \
-             μ̂={mu_hat:.3e}, κ̂_max={kappa_summary}, \
-             a_floor={peak_activity_floor:.3e}, SNR={snr_proxy:.3e}"
-        ),
-    };
-    Ok(CertificateInputs {
+    let note = format!(
+        "μ̂={mu_hat:.3e}, κ̂_max={kappa_summary}, a_floor={peak_activity_floor:.3e}, \
+         SNR={snr_proxy:.3e}"
+    );
+    Ok(DictionaryIncoherenceReport {
         mu_hat,
         per_atom_kappa_hat,
         per_atom_mean_activity,
@@ -469,7 +238,6 @@ pub(crate) fn dictionary_incoherence_report_with_dispersion(
         peak_activity_floor,
         snr_proxy,
         dispersion,
-        global_optimality,
         note,
     })
 }
@@ -567,9 +335,7 @@ pub(crate) fn atom_curvature_bound(
 /// atom's image manifold — the differential-geometric object whose size *is*
 /// the rigidity measure the theory trades on: zero second fundamental form
 /// means the atom is locally flat (gauge-vulnerable, per the module's
-/// flatness-disease framing); a bounded-away-from-zero one is the curvature
-/// budget that lets [`curved_dictionary_global_optimality_verdict`] certify.
-/// The `max` over rows and axis pairs makes `κ̂` a sup-norm (worst-case, hence
+/// flatness-disease framing). The `max` over rows and axis pairs makes `κ̂` a sup-norm (worst-case, hence
 /// conservative) bound. An unresolved tangent frame with a nonzero perpendicular
 /// second derivative returns `None`: the bound is unbounded, but absence is kept
 /// typed rather than smuggled through report serialization as infinity.
@@ -719,7 +485,7 @@ pub(crate) fn projected_perp_norm(vector: &[f64], tangent_frame: ArrayView2<'_, 
 }
 
 #[cfg(test)]
-mod certificate_verdict_tests {
+mod certificate_curvature_tests {
     use super::*;
 
     /// Closed-form check of the extrinsic-curvature bound `κ̂`
@@ -729,8 +495,7 @@ mod certificate_verdict_tests {
     /// `κ̂ = ‖P_⊥ m''‖ / ‖m'‖²` must reproduce it to machine precision (and
     /// scale as `1/r`, since a bigger circle bends less). This pins the
     /// normalization — dividing the perp second-derivative by the SQUARED
-    /// tangent singular value, not the singular value — which the certified
-    /// tangent-graph budget `1 − C_κ·κ̂` depends on.
+    /// tangent singular value, not the singular value.
     #[test]
     fn atom_curvature_bound_recovers_circle_reciprocal_radius() {
         use ndarray::{Array2, Array4};
@@ -801,55 +566,6 @@ mod certificate_verdict_tests {
             atom_curvature_bound_with_decoder(&atom, 0, second.view(), decoder.view()).unwrap(),
             None,
             "nonzero normal curvature with no resolved tangent has an unbounded, not infinite-sentinel, bound"
-        );
-    }
-
-    /// A negative `snr_proxy` must NEVER certify. The bare `snr_factor =
-    /// 1 − 1/snr_proxy > 0` check passes a negative proxy (`1 − (−) > 1`) and
-    /// inflates the budget; the explicit precondition refuses it.
-    #[test]
-    fn negative_snr_proxy_never_certifies() {
-        // Inputs that WOULD certify at a healthy SNR (tiny μ̂, zero curvature,
-        // strong activity), so only the SNR guard can decide the verdict.
-        let v = curved_dictionary_global_optimality_verdict(1e-6, 0.0, 0.9, -5.0, 4);
-        assert!(!v.is_certified(), "negative snr_proxy must not certify");
-        assert_eq!(
-            v.margin(),
-            None,
-            "precondition failure leaves the margin undefined"
-        );
-    }
-
-    #[test]
-    fn overflowing_certificate_budget_has_no_margin() {
-        let v = curved_dictionary_global_optimality_verdict(0.0, 0.0, f64::MAX, 100.0, 1);
-        assert_eq!(
-            v,
-            GlobalOptimalityVerdict::Uncertified { margin: None },
-            "overflow cannot manufacture an infinite global-optimality certificate"
-        );
-    }
-
-    /// SNR at/below 1 (reachable (0, 1]) is uncertifiable — the sufficient
-    /// condition needs strictly SNR > 1; unchanged by the negative-guard hardening.
-    #[test]
-    fn snr_at_or_below_one_does_not_certify() {
-        for snr in [0.25_f64, 1.0] {
-            let v = curved_dictionary_global_optimality_verdict(1e-9, 0.0, 0.9, snr, 4);
-            assert!(!v.is_certified(), "snr_proxy={snr} (<= 1) must not certify");
-        }
-    }
-
-    /// A healthy regime (SNR >> 1, tiny incoherence, zero curvature, strong
-    /// activity floor) certifies with a positive margin — the guard does not
-    /// over-reject the reachable, genuinely-certifiable case.
-    #[test]
-    fn healthy_regime_certifies_with_positive_margin() {
-        let v = curved_dictionary_global_optimality_verdict(1e-9, 0.0, 0.9, 100.0, 4);
-        assert!(v.is_certified(), "healthy regime must certify");
-        assert!(
-            v.margin().is_some_and(|margin| margin > 0.0),
-            "certified margin must be positive"
         );
     }
 }

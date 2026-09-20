@@ -1478,6 +1478,51 @@ impl CustomOuterState {
         }
     }
 
+    /// The starts of one outer evaluation at `theta` once the cold-reeval latch holds
+    /// (#2349): the canonical seed and the fit's fixed starts, unless the latest filed mode
+    /// ([`Self::record_cold_mode`]) was solved at bitwise `theta` from a canonical seed of
+    /// this identity (#3322).
+    ///
+    /// A cold evaluation is one deterministic computation of θ and the canonical seed, so
+    /// solving it again at that θ reproduces the filed selection, and the filed mode is served
+    /// alone. Without this every cold value probe's gradient, and every re-evaluation of the
+    /// terminal point, solved all three starts again: 12 s of a 19 s outer iteration on the
+    /// event-history risk-set centred fit. Like a value probe's mode it is a start, not a
+    /// value: the inner solve reuses it only when its own same-ρ check accepts it.
+    pub(crate) fn cold_mode_starts_for<'a>(
+        &'a self,
+        theta: &Array1<f64>,
+        canonical: Option<&'a ConstrainedWarmStart>,
+    ) -> ModeStarts<'a> {
+        match &self.value_probe {
+            Some(probe)
+                if probe.theta == theta_bits(theta)
+                    && probe.seed == SeedIdentity::of(canonical) =>
+            {
+                ModeStarts {
+                    incumbent: Some(&probe.mode),
+                    fixed: &[],
+                }
+            }
+            _ => ModeStarts {
+                incumbent: canonical,
+                fixed: &self.fixed_starts,
+            },
+        }
+    }
+
+    /// File the selected mode of a converged cold evaluation at `theta`, value probe or
+    /// first-order, solved from the canonical seed `canonical` (#3322). It replaces the
+    /// previous filed mode, and [`Self::cold_mode_starts_for`] serves it at bitwise `theta`.
+    pub(crate) fn record_cold_mode(
+        &mut self,
+        theta: &Array1<f64>,
+        canonical: Option<&ConstrainedWarmStart>,
+        mode: ConstrainedWarmStart,
+    ) {
+        self.record_value_probe(theta, SeedIdentity::of(canonical), mode);
+    }
+
     /// The seed of one outer evaluation at `theta`: the certified mode a walk
     /// accepted at `theta` when there is one, otherwise the incumbent's (#2627,
     /// #2668).

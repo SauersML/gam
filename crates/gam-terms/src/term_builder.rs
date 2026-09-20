@@ -18,7 +18,7 @@ use crate::basis::{
     OneDimensionalBoundary, SpatialIdentifiability, SphereMethod, SphereWahbaKernel,
     SphericalSplineBasisSpec, SphericalSplineIdentifiability, ThinPlateBasisSpec,
     auto_spatial_center_strategy, count_unique_coordinate_rows, default_num_centers,
-    default_spatial_center_strategy, default_spherical_harmonic_degree,
+    default_spatial_center_strategy, provisioned_spherical_harmonic_degree,
     SPHERICAL_HARMONIC_MAX_DEGREE, penalized_resolution_rank,
     select_r_uniform_subsample_centers,
     starting_num_centers, thin_plate_penalty_order,
@@ -2750,20 +2750,19 @@ pub(crate) fn build_smooth_basis(
             option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE)
         };
         // For a factor smooth every group's curve is fit from THAT group's rows
-        // alone, so the default marginal is the univariate `s()` default applied
-        // to the least-informed group: its pilot is the penalized resolution
-        // rank of the smallest group's row count (`pilot_internal_knots`, the
-        // same rate rule as a univariate `s()`), and it is held to the least
-        // per-group distinct-value support by the same rank bound a univariate
-        // `s()` obeys (`support_capped_bspline_dimension`). A group with `u`
-        // distinct covariate values gives its block of the marginal design rank
-        // at most `u`, so a marginal with more functions has directions in that
-        // group identified by the penalty alone. Inside that bound the penalty
-        // and REML, not the basis size, decide the effective degrees of freedom,
-        // and the adaptive formula workflow grows the shared marginal only while
-        // the fit's REML evidence prefers it. The explicit `re` random-effect
-        // form takes neither rule: it is a raw linear `[1, x]` random effect
-        // (0 internal knots), handled in the branch below.
+        // alone, so the marginal is held to the least per-group distinct-value
+        // support by the same rank bound a univariate `s()` obeys
+        // (`support_capped_bspline_dimension`): a group with `u` distinct
+        // covariate values gives its block of the marginal design rank at most
+        // `u`, so a marginal with more functions has directions in that group
+        // identified by the penalty alone. Inside that bound the default is the
+        // provisioned pooled count held at the provisioned factor-smooth
+        // marginal; the standard formula workflow instead starts it at the
+        // univariate `s()` pilot of the least-informed group
+        // (`factor_smooth_pilot_internal_knots`) and grows it only while the
+        // fit's REML evidence prefers it (#3149, #3264). The explicit `re`
+        // random-effect form takes neither rule: it is a raw linear `[1, x]`
+        // random effect (0 internal knots), handled in the branch below.
         let group_column = ds.values.column(cols[group_idx]);
         let min_group_resolution = min_per_group_unique_count(ds.values.column(c), group_column);
         let default_internal = if type_opt == "re" {
@@ -2781,14 +2780,10 @@ pub(crate) fn build_smooth_basis(
             // raw linear basis is both the correct `re` semantics and fast.
             0
         } else {
-            let marginal_penalty_order = parse_penalty_order(options)?
-                .unwrap_or(DEFAULT_PENALTY_ORDER)
-                .min(degree)
-                .max(1);
-            pilot_internal_knots(
-                min_per_group_row_count(group_column),
-                degree,
-                marginal_penalty_order,
+            provisioned_internal_knots_for_column(ds.values.column(c)).min(
+                FACTOR_SMOOTH_PROVISIONED_BASIS_DIM
+                    .saturating_sub(degree + 1)
+                    .max(1),
             )
         };
         let (mut n_knots, knots_inferred, mut effective_degree) =
@@ -2919,18 +2914,11 @@ pub(crate) fn build_smooth_basis(
             validate_spline_degree("degree", degree)?;
             let penalty_order =
                 resolve_spline_penalty_order(parse_penalty_order(options)?, degree, None)?;
-            // A periodic spline has no free endpoints: the wrap constraint
-            // leaves only the constant unpenalized, so its pilot is that
-            // one-dimensional null space plus the penalized resolution rank of
-            // the rows (never below one full polynomial piece, `degree + 1`).
-            // The penalty, not the basis size, controls smoothness; the adaptive
-            // formula workflow grows the periodic basis while the fit's REML
-            // evidence prefers the richer one. More functions than distinct
-            // covariate values cannot be resolved, so the pilot is held to that
-            // support.
-            let unique = unique_count_column(ds.values.column(c));
-            let default_basis = pilot_cyclic_basis_dim(sizing_rows, degree, penalty_order)
-                .min(unique.max(degree + 1));
+            // The provisioned periodic default. The standard formula workflow
+            // instead starts it at its pilot (`pilot_cyclic_basis_dim`) and
+            // grows it while the fit's REML evidence prefers the richer basis
+            // (#3149).
+            let default_basis = provisioned_cyclic_basis_dim(ds.values.column(c), degree);
             let requested_basis =
                 option_usize(options, "k")?;
             let adaptive = requested_basis.is_none();
@@ -3041,14 +3029,9 @@ pub(crate) fn build_smooth_basis(
             let c = cols[0];
             let (minv, maxv) = col_minmax(ds.values.column(c))?;
             let degree = option_usize(options, "degree")?.unwrap_or(DEFAULT_BSPLINE_DEGREE);
-            let default_internal = pilot_internal_knots(
-                sizing_rows,
-                degree,
-                parse_penalty_order(options)?
-                    .unwrap_or(DEFAULT_PENALTY_ORDER)
-                    .min(degree)
-                    .max(1),
-            );
+            // The provisioned default; the standard formula workflow starts a
+            // default it grows at its pilot instead (#3149).
+            let default_internal = provisioned_internal_knots_for_column(ds.values.column(c));
             let (mut n_knots, inferred, mut effective_degree) =
                 parse_ps_internal_knots(options, degree, default_internal)?;
             let periodic_axes = parse_periodic_axes(options, 1).map_err(|e| e.to_string())?;
@@ -3405,7 +3388,7 @@ pub(crate) fn build_smooth_basis(
                             .unwrap_or(k),
                         None => {
                             adaptive_degree = true;
-                            default_spherical_harmonic_degree(sizing_rows, penalty_order)
+                            provisioned_spherical_harmonic_degree(sizing_rows)
                         }
                     },
                 };
@@ -3423,16 +3406,16 @@ pub(crate) fn build_smooth_basis(
                 None
             };
             let center_strategy = if matches!(method, SphereMethod::Wahba) {
-                // Pilot Wahba center count: the kernel's constant null space
-                // (removed by the center sum-to-zero constraint) plus the
-                // directions an order-`m` penalty resolves on the 2-D sphere.
-                // Nobody chose it, so it is `Auto`: the formula workflow refines
-                // it on the fit's own REML evidence.
-                let pilot_centers = 1usize
-                    .saturating_add(penalized_resolution_rank(sizing_rows, 2, penalty_order.max(1)))
-                    .min(sizing_rows)
-                    .max(1);
-                let centers = parse_countwith_basis_alias(options, "centers", pilot_centers)?;
+                // Provisioned Wahba center count, the generic spatial count
+                // (an order-4 penalty's kernel needs at least its provisioned
+                // floor). Nobody chose it, so it is `Auto`: the formula workflow
+                // starts it at its pilot and refines it on the fit's own REML
+                // evidence (#3149).
+                let mut default_centers = default_num_centers(sizing_rows, cols.len());
+                if penalty_order >= 4 {
+                    default_centers = default_centers.max(WAHBA_ORDER4_PROVISIONED_CENTERS);
+                }
+                let centers = parse_countwith_basis_alias(options, "centers", default_centers)?;
                 let strategy = CenterStrategy::FarthestPoint {
                     num_centers: centers,
                 };
@@ -3620,7 +3603,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -3814,7 +3797,7 @@ pub(crate) fn build_smooth_basis(
             // #1867: spline-equivalent floor so a 1-D radial basis is not
             // dimensioned coarser than the competing `s(x)` on identical data.
             let univariate_floor = if cols.len() == 1 {
-                univariate_spline_basis_dim(ds.values.column(cols[0]), sizing_rows)
+                univariate_spline_basis_dim(ds.values.column(cols[0]))
             } else {
                 0
             };
@@ -4740,6 +4723,84 @@ fn min_per_group_row_count(group_col: ArrayView1<'_, f64>) -> usize {
     per_group.values().copied().min().unwrap_or(1).max(1)
 }
 
+/// Internal-knot cap of the provisioned default univariate B-spline
+/// ([`provisioned_internal_knots_for_column`]).
+const PROVISIONED_INTERNAL_KNOTS_CAP: usize = 8;
+
+/// Internal-knot floor of the provisioned default univariate B-spline, so a
+/// non-trivial smooth is representable at all.
+const PROVISIONED_INTERNAL_KNOTS_FLOOR: usize = 4;
+
+/// Provisioned default basis dimension of a one-dimensional cyclic cubic
+/// P-spline. Periodic smooths spend no coefficients on free endpoints, so they
+/// do not inherit the larger open B-spline count.
+const CYCLIC_PROVISIONED_BASIS_DIM: usize = 12;
+
+/// Provisioned default shared-marginal basis dimension of a `bs="fs"`/`"sz"`
+/// factor smooth: a factor smooth shares one marginal across all levels, and a
+/// modest marginal recovers the shared signal without fitting each group's
+/// within-group noise (gam#903).
+const FACTOR_SMOOTH_PROVISIONED_BASIS_DIM: usize = 10;
+
+/// Provisioned default center floor of an order-4 Wahba sphere penalty.
+const WAHBA_ORDER4_PROVISIONED_CENTERS: usize = 30;
+
+/// Internal-knot count of the provisioned default univariate B-spline on
+/// `col`: `unique/4`, held between [`PROVISIONED_INTERNAL_KNOTS_FLOOR`] and
+/// [`PROVISIONED_INTERNAL_KNOTS_CAP`].
+///
+/// A formula default is built at this provisioned size. Only a basis the
+/// standard formula workflow grows starts at its penalized-resolution pilot
+/// instead (`smooth::starting_resolution`), because only there does the
+/// converged fit's own evidence refine it; every other route (a raw
+/// `materialize`, a location-scale, marginal-slope, survival, transformation or
+/// multinomial fit, a position basis) keeps the basis it is given, so its
+/// default is sized to be adequate without growth. These constants are the
+/// pre-#3191 defaults those routes had, restored because #3191's pilot
+/// replaced them there with nothing to grow it (a location-scale `s(x)` at
+/// n = 1000 got 6 functions instead of 12; #3149). Each route retires its
+/// provisioned default when its fit joins the loop.
+pub(crate) fn provisioned_internal_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
+    let unique = unique_count_column(col);
+    (unique / 4).clamp(PROVISIONED_INTERNAL_KNOTS_FLOOR, PROVISIONED_INTERNAL_KNOTS_CAP)
+}
+
+/// The provisioned default basis dimension of a degree-`degree` cyclic
+/// B-spline on `col`: its open counterpart's
+/// [`provisioned_internal_knots_for_column`] basis, capped at
+/// [`CYCLIC_PROVISIONED_BASIS_DIM`] (never below `degree + 1`).
+pub(crate) fn provisioned_cyclic_basis_dim(col: ArrayView1<'_, f64>, degree: usize) -> usize {
+    (provisioned_internal_knots_for_column(col) + degree + 1)
+        .min(CYCLIC_PROVISIONED_BASIS_DIM.max(degree + 1))
+}
+
+/// Provisioned default center cap of a Duchon smooth of dimension `d`,
+/// `10 · 3^(d - 1)` (30 in 2-D): Duchon fits rotate their constrained radial
+/// block through its center Gram and several operator penalties, so a default
+/// that no loop grows is held to this low-rank size (#1757).
+fn provisioned_duchon_center_cap(d: usize) -> usize {
+    let exponent = u32::try_from(d.saturating_sub(1)).unwrap_or(u32::MAX);
+    10usize.saturating_mul(3usize.saturating_pow(exponent))
+}
+
+/// Pilot internal-knot count of a factor smooth's shared degree-`degree`
+/// marginal on `feature_col` grouped by `group_col`: the univariate `s()`
+/// pilot of the least-populated group's row count (every group's curve is fit
+/// from its own rows alone), held to the least per-group distinct-value
+/// support by the rank bound (#3264).
+pub(crate) fn factor_smooth_pilot_internal_knots(
+    feature_col: ArrayView1<'_, f64>,
+    group_col: ArrayView1<'_, f64>,
+    degree: usize,
+    penalty_order: usize,
+) -> usize {
+    let pilot = pilot_internal_knots(min_per_group_row_count(group_col), degree, penalty_order.max(1));
+    match min_per_group_unique_count(feature_col, group_col) {
+        support if support >= 2 => pilot.min(support.saturating_sub(degree + 1)),
+        _ => pilot,
+    }
+}
+
 /// Pilot basis dimension of a default univariate penalized spline with an
 /// `nullspace_dim`-dimensional unpenalized space and an order-`penalty_order`
 /// roughness penalty, fitted on `n` rows:
@@ -4768,17 +4829,6 @@ pub(crate) fn pilot_internal_knots(n: usize, degree: usize, penalty_order: usize
     pilot_spline_basis_dim(n, penalty_order, penalty_order).saturating_sub(degree + 1)
 }
 
-/// Pilot internal-knot count of the formula-default open cubic `s(x)` on the
-/// column `col` ([`pilot_internal_knots`] with the default degree and penalty
-/// order at the column's row count).
-pub(crate) fn pilot_internal_knots_for_column(col: ArrayView1<'_, f64>) -> usize {
-    pilot_internal_knots(
-        col.len(),
-        DEFAULT_BSPLINE_DEGREE,
-        DEFAULT_PENALTY_ORDER.min(DEFAULT_BSPLINE_DEGREE),
-    )
-}
-
 /// Cap a default open B-spline `(internal_knots, degree)` so its basis
 /// dimension `internal_knots + degree + 1` does not exceed the covariate's
 /// `unique` distinct values (`unique >= 2`).
@@ -4804,15 +4854,22 @@ pub(crate) fn support_capped_bspline_dimension(
     (unique.saturating_sub(degree + 1), degree)
 }
 
-/// #1867: the basis dimension the default open cubic `s(x)` gets on `col`
-/// (after its distinct-value support cap), the floor under a 1-D radial
-/// smooth's default so it is not dimensioned coarser than the spline it
-/// competes with on the same data.
-///
-/// #3179: `sizing_rows` is the row count the competing `s(x)` is sized from
-/// — the smallest level of a categorical `by=`, otherwise every row — so the
-/// floor tracks the spline's pilot exactly instead of the full column length.
-pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>, sizing_rows: usize) -> usize {
+/// #1867: the basis dimension the provisioned default open cubic `s(x)` gets
+/// on `col`, the floor under a 1-D radial smooth's default so it is not
+/// dimensioned coarser than the spline it competes with on the same data.
+pub(crate) fn univariate_spline_basis_dim(col: ArrayView1<'_, f64>) -> usize {
+    provisioned_internal_knots_for_column(col).saturating_add(DEFAULT_BSPLINE_DEGREE + 1)
+}
+
+/// #1867 on a route whose loop grows the basis: the pilot open cubic `s(x)`
+/// dimension on `col` (after its distinct-value support cap), the floor under
+/// a 1-D radial smooth's pilot. `sizing_rows` is the row count the competing
+/// `s(x)` pilot is sized from — a by-level's own rows, otherwise every row
+/// (#3179) — so the floor tracks that spline's pilot exactly.
+pub(crate) fn pilot_univariate_spline_basis_dim(
+    col: ArrayView1<'_, f64>,
+    sizing_rows: usize,
+) -> usize {
     let dim = pilot_internal_knots(
         sizing_rows,
         DEFAULT_BSPLINE_DEGREE,
@@ -4914,15 +4971,6 @@ pub(crate) fn tensor_margin_sizes(caps: &[usize], budget: usize) -> Vec<usize> {
 /// the `degree + 1` functions a periodic degree-`degree` basis needs to wrap.
 pub(crate) fn pilot_cyclic_basis_dim(n: usize, degree: usize, penalty_order: usize) -> usize {
     pilot_spline_basis_dim(n, 1, penalty_order).max(degree + 1)
-}
-
-/// Default periodic basis dimension of a degree-`degree` cyclic spline on
-/// `col` with the default penalty order: the rate pilot
-/// [`pilot_cyclic_basis_dim`] held to the column's distinct values (the same
-/// rule the formula `s(x, bs="cyclic")` arm applies).
-pub(crate) fn cyclic_basis_dim_for_column(col: ArrayView1<'_, f64>, degree: usize) -> usize {
-    pilot_cyclic_basis_dim(col.len(), degree, DEFAULT_PENALTY_ORDER.min(degree).max(1))
-        .min(unique_count_column(col).max(degree + 1))
 }
 
 // ---------------------------------------------------------------------------
@@ -5803,15 +5851,13 @@ pub(crate) fn default_duchon_center_count(
 ) -> usize {
     // #1757: Duchon fits pay a larger setup cost than Matérn/TPS because the
     // constrained radial block is rotated through its center Gram and several
-    // operator-collocation penalties, so the default must not hand a cold fit
-    // far more centers than the data can resolve. The implicit count is the
-    // rate-derived pilot `starting_num_centers(n, d, polynomial_cols)`: the
-    // polynomial null space plus the penalized resolution rank of the minimal
-    // embedding order at `n` rows. The penalty sets smoothness; the adaptive
-    // formula workflow refines the centers while the fit's REML evidence
-    // prefers the richer basis. An explicit `centers=`/`k=` request still takes
-    // full effect upstream, and the polynomial null space must still fit, so
-    // tiny high-order bases are raised to the smallest admissible count.
+    // operator-collocation penalties, so a default no loop grows is the generic
+    // spatial count held to the low-rank `provisioned_duchon_center_cap`. The
+    // standard formula workflow instead starts it at its pilot
+    // ([`pilot_duchon_center_count`]) and grows it on the fit's REML evidence
+    // (#3149). An explicit `centers=`/`k=` request still takes full effect
+    // upstream, and the polynomial null space must still fit, so tiny
+    // high-order bases are raised to the smallest admissible count.
     let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     // #1867: a 1-D radial basis must not be dimensioned coarser than the
     // univariate spline the competing `s(x)` gets on the SAME data, or
@@ -5819,6 +5865,25 @@ pub(crate) fn default_duchon_center_count(
     // d>1) carries that spline-equivalent basis dimension and floors the 1-D
     // default, bounded by n; smoothness is set by the REML penalty, not the raw
     // count. Explicit `k`/`centers` still override upstream.
+    default_num_centers(n, d)
+        .min(provisioned_duchon_center_cap(d))
+        .max(low_n_floor)
+        .max(univariate_floor.min(n))
+}
+
+/// The pilot center count of a default Duchon smooth the standard workflow
+/// grows: the rate-derived `starting_num_centers(n, d, polynomial_cols)`, the
+/// polynomial null space plus the penalized resolution rank of the minimal
+/// embedding order at `n` rows, under the same identifiability and #1867
+/// floors as [`default_duchon_center_count`] (`univariate_floor` is the pilot
+/// `s(x)`'s, [`pilot_univariate_spline_basis_dim`]).
+pub(crate) fn pilot_duchon_center_count(
+    n: usize,
+    d: usize,
+    polynomial_cols: usize,
+    univariate_floor: usize,
+) -> usize {
+    let low_n_floor = (polynomial_cols + 1).min(n).max(1);
     starting_num_centers(n, d, polynomial_cols)
         .max(low_n_floor)
         .max(univariate_floor.min(n))
