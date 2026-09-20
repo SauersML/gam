@@ -557,35 +557,56 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     Ok(Some(hyper_dirs))
 }
 
+/// What one direct latent hyper slot parameterizes (#4266). The slot order is
+/// the order [`latent_coord_initial_direct_hypers`] seeds them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatentDirectHyperSlot {
+    /// A log-precision: the REML-selected `ln μ` of an `AuxPrior` /
+    /// `IsometryToReference` anchor, or one per-axis ARD `ln α_j`.
+    LogPrecision,
+    /// A behavioral-head regression coefficient (an intercept or a loading on
+    /// one latent axis). It is a coefficient, not a log-strength.
+    HeadCoefficient,
+}
+
+fn latent_coord_direct_hyper_slots(
+    id_mode: &gam_terms::latent::LatentIdMode,
+    latent_dim: usize,
+) -> Vec<LatentDirectHyperSlot> {
+    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
+    let anchor_log_mu = |strength: &AuxPriorStrength| match strength {
+        AuxPriorStrength::Auto => 1,
+        AuxPriorStrength::Fixed(_) => 0,
+    };
+    let (log_mu, head_coeffs, ard) = match id_mode {
+        LatentIdMode::AuxPrior { strength, .. } => (anchor_log_mu(strength), 0, 0),
+        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
+            (anchor_log_mu(strength), 0, latent_dim)
+        }
+        LatentIdMode::DimSelection { .. } => (0, 0, latent_dim),
+        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
+        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
+        LatentIdMode::IsometryToReference { strength, .. } => (anchor_log_mu(strength), 0, 0),
+        // The behavioral head appends one (1 + d) coefficient block per
+        // η-channel, plus the composed per-axis ARD log-precisions.
+        LatentIdMode::AuxOutcome { head, .. } => (0, head.n_coeffs(latent_dim), latent_dim),
+        LatentIdMode::None => (0, 0, 0),
+    };
+    let mut slots = Vec::with_capacity(log_mu + head_coeffs + ard);
+    slots.extend(std::iter::repeat_n(LatentDirectHyperSlot::LogPrecision, log_mu));
+    slots.extend(std::iter::repeat_n(
+        LatentDirectHyperSlot::HeadCoefficient,
+        head_coeffs,
+    ));
+    slots.extend(std::iter::repeat_n(LatentDirectHyperSlot::LogPrecision, ard));
+    slots
+}
+
 fn latent_coord_direct_hyper_count(
     id_mode: &gam_terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> usize {
-    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
-    match id_mode {
-        LatentIdMode::AuxPrior { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
-            latent_dim
-                + match strength {
-                    AuxPriorStrength::Auto => 1,
-                    AuxPriorStrength::Fixed(_) => 0,
-                }
-        }
-        LatentIdMode::DimSelection { .. } => latent_dim,
-        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
-        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
-        LatentIdMode::IsometryToReference { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        // The behavioral head appends one (1 + d) coefficient block per
-        // η-channel, plus the composed per-axis ARD log-precisions.
-        LatentIdMode::AuxOutcome { head, .. } => head.n_coeffs(latent_dim) + latent_dim,
-        LatentIdMode::None => 0,
-    }
+    latent_coord_direct_hyper_slots(id_mode, latent_dim).len()
 }
 
 fn latent_coord_initial_direct_hypers(
