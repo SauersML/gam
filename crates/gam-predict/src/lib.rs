@@ -3545,7 +3545,7 @@ mod tests {
             .expect("a fit carrying its SAS state predicts");
     }
 
-    fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
+    pub(super) fn test_fit_with_covariance(beta: Array1<f64>, covariance: Array2<f64>) -> UnifiedFitResult {
         UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
             blocks: vec![FittedBlock {
                 beta: beta.clone(),
