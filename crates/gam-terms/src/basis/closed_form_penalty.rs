@@ -463,6 +463,93 @@ pub(crate) fn log_riesz_finite_part_shift(d: usize, n: usize) -> f64 {
     shift
 }
 
+/// Normalizing constant `c_n` of the log-Riesz block
+/// `R_{d/2+n}^d(r) = c_n r^{2n}(log r + A_n)`, the resolved pole of
+/// `Γ(d/2−j)/(4^j π^{d/2} Γ(j)) r^{2j−d}` at `j = d/2 + n`:
+///
+/// ```text
+/// c_n = (−1)^{n+1} / (2^{d+2n−1} π^{d/2} Γ(d/2+n) n!).
+/// ```
+///
+/// `d` may be odd: the block order `j` is then a half-integer, which the
+/// fractional-`s` Riesz path reaches.
+pub(crate) fn log_riesz_coefficient(d: usize, n: usize) -> f64 {
+    let half_d = 0.5 * d as f64;
+    let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
+    sign / (2.0_f64.powi((d + 2 * n) as i32 - 1)
+        * std::f64::consts::PI.powf(half_d)
+        * gamma_fn(half_d + n as f64)
+        * factorial_f64(n))
+}
+
+/// ψ-triplet `(e_i, ∂_ψ e_i, ∂²_ψ e_i)`, `ψ = ln κ`, of the `R^{2i}`
+/// coefficient of the analytic part `E` of the hybrid Duchon kernel at EVEN
+/// `d` (see [`duchon_small_chi_riesz_series_radial_derivatives`]).
+///
+/// The partial-fraction form
+/// `f = Σ_{j≤a} α_j R_j^d + Σ_{ℓ≤b} β_ℓ M_ℓ^d(κ, ·)` with
+/// `α_j = (−1)^{a−j} C(a+b−j−1, a−j) κ^{−2(a+b−j)}` and
+/// `β_ℓ = (−1)^a C(a+b−ℓ−1, b−ℓ) κ^{−2(a+b−ℓ)}` is exact, so the `R^{2i}`
+/// coefficient of `f` that is not multiplied by `log R` is the sum of
+///
+/// * `α_j c_i A_i` for the log-Riesz block `j = d/2 + i ≤ a`
+///   (`R_j^d = c_i R^{2i}(log R + A_i)`), and
+/// * `β_ℓ` times the pure `R^{2i}` Taylor coefficient of each Matérn block,
+///   which carries its `log(κ/2)` and digamma constants.
+///
+/// The Riesz tail `S` already carries the finite-part constant of its own
+/// log-Riesz block `R_{a+b+n}^d` with `n = i + d/2 − (a+b) ≥ 0`, so that
+/// constant, `γ_n c_i A_i` with `γ_n = (−1)^n C(b+n−1, n) κ^{2n}`, is
+/// subtracted: `E` is exactly what `S` lacks. Every piece is `κ^x` times a
+/// ψ-polynomial, so its ψ-derivatives are exact.
+fn duchon_small_chi_even_d_analytic_coefficient(
+    d: usize,
+    a: usize,
+    b: usize,
+    kappa: f64,
+    i: usize,
+) -> [f64; 3] {
+    debug_assert!(d.is_multiple_of(2));
+    let half_d = d / 2;
+    let base = a + b;
+    let mut out = [0.0_f64; 3];
+    let mut add_power = |value: f64, exponent: f64| {
+        out[0] += value;
+        out[1] += exponent * value;
+        out[2] += exponent * exponent * value;
+    };
+    let log_riesz_constant = log_riesz_coefficient(d, i) * log_riesz_finite_part_shift(d, i);
+
+    let j = half_d + i;
+    if j <= a {
+        let exponent = -2.0 * (base - j) as f64;
+        let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
+        let alpha = sign * binomial_f64(base - j - 1, a - j) * kappa.powf(exponent);
+        add_power(alpha * log_riesz_constant, exponent);
+    }
+
+    if i + half_d >= base {
+        let n = i + half_d - base;
+        let exponent = 2.0 * n as f64;
+        let sign = if n.is_multiple_of(2) { 1.0 } else { -1.0 };
+        let gamma = sign * binomial_f64(b + n - 1, n) * kappa.powf(exponent);
+        add_power(-gamma * log_riesz_constant, exponent);
+    }
+
+    let sign_a = if a.is_multiple_of(2) { 1.0 } else { -1.0 };
+    for ell in 1..=b {
+        let exponent = -2.0 * (base - ell) as f64;
+        let beta = sign_a * binomial_f64(base - ell - 1, b - ell) * kappa.powf(exponent);
+        let (pure, _) =
+            super::duchon_psi_derivatives::duchon_matern_block_taylor_r2j_triplet(kappa, ell, d, i);
+        // ∂_ψ^k [κ^x p(ψ)] = κ^x (x + ∂_ψ)^k p.
+        out[0] += beta * pure.0;
+        out[1] += beta * (exponent * pure.0 + pure.1);
+        out[2] += beta * (exponent * exponent * pure.0 + 2.0 * exponent * pure.1 + pure.2);
+    }
+    out
+}
+
 pub(crate) const DUCHON_SMALL_CHI_SERIES_MAX: f64 = 0.125;
 const DUCHON_SMALL_CHI_SERIES_MAX_TERMS: usize = 96;
 
@@ -475,26 +562,50 @@ pub(crate) fn use_duchon_small_chi_riesz_series(kappa: f64, r: f64) -> bool {
         && (kappa * r).abs() <= DUCHON_SMALL_CHI_SERIES_MAX
 }
 
-/// Small-χ Riesz-series chart for
-/// `F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}`.
+/// Small-χ chart for the hybrid Duchon kernel
+/// `f = F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}`.
 ///
-/// Expanding at high frequency gives
+/// For small `κR` the kernel splits as `f = S + E`:
 ///
 /// ```text
-/// Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d(R).
+/// S(R) = Σ_n (-1)^n C(b+n-1,n) κ^{2n} R_{a+b+n}^d(R)      (Riesz tail)
+/// E(R) = Σ_i e_i(κ) R^{2i}                                (analytic part)
 /// ```
 ///
-/// When `d > 2(a+b)`, the low-frequency mass is uniformly integrable and
-/// this is the true pointwise positive-κ kernel for small χ. In singular
-/// regimes this same chart is the constrained Duchon finite-part
-/// representative after quotienting the polynomial nullspace. Either way,
-/// this avoids the catastrophic Riesz/Matérn partial-fraction cancellation
-/// that appears as κR→0.
+/// `S` is the high-frequency expansion of the symbol and carries every
+/// non-analytic piece of `f` (the `R^{2j-d}` powers and, at even `d`, the
+/// `R^{2i} log R` terms). `E` is an entire function of `R²` fixed by the
+/// low-frequency part of the symbol, which the high-frequency expansion does
+/// not see. Both are part of the kernel. The partial-fraction and Schwinger
+/// charts evaluate all of `f`, so a chart that returned `S` alone made the
+/// kernel jump across `κR = DUCHON_SMALL_CHI_SERIES_MAX`: at `d=4, a=1, b=4,
+/// κ=0.08, R=1.1` the tail alone is `≈ -4e-10` of the kernel, and a pair
+/// block assembled from pairs on both sides of the switch is indefinite
+/// (#4135).
 ///
-/// This helper returns radial R-derivatives of that same series and,
-/// with `kappa_derivative_order` set to 1 or 2, the corresponding
-/// analytic κ partials. It is the shared value/η/κ source for the
-/// cancellation basin; production never differentiates it numerically.
+/// The low-order `e_i` carry the infrared divergence (`e_0 ∝ κ^{d-2a-2b}`
+/// at odd `d`). After `Δ^q` the divergent ones are low-degree polynomials
+/// `|x−y|^{2i}` in the pair difference, which the polynomial-nullspace side
+/// constraints annihilate, so the constrained penalty keeps its finite
+/// `κ → 0` limit. They are still returned here, because every pair of a
+/// Gram must be evaluated on the same kernel.
+///
+/// Odd `d` (Mellin–Barnes residues at `z = d/2 + i`, no pole collision):
+///
+/// ```text
+/// e_0     = Γ(a+b-d/2) Γ(d/2-a) / (Γ(b) 4^{d/2} π^{d/2} Γ(d/2)) · κ^{d-2a-2b}
+/// e_{i+1} = e_i · (-κ²/4) · (i+d/2-a) / ((i+1)(i+d/2)(a+b-1-d/2-i))
+/// ```
+///
+/// Even `d`: [`duchon_small_chi_even_d_analytic_coefficient`].
+/// Each `e_i` is `κ^x` times a polynomial in `ψ = ln κ`, so the κ partials
+/// come from its exact ψ-derivatives: `∂_κ e = ∂_ψ e / κ`,
+/// `∂²_κ e = (∂²_ψ e − ∂_ψ e) / κ²`.
+///
+/// This helper returns radial R-derivatives of `S + E` and, with
+/// `kappa_derivative_order` set to 1 or 2, the corresponding analytic κ
+/// partials. It is the shared value/η/κ source for the cancellation basin;
+/// production never differentiates it numerically.
 pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
     d: usize,
     a: usize,
@@ -627,13 +738,86 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
 
         coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
     }
+
+    // Analytic part `E = Σ_i e_i R^{2i}`, accumulated into the same
+    // compensated sums. The `R^{2i}` term contributes to radial order `o`
+    // only for `o ≤ 2i`, so the truncation test starts once `2i ≥ max_order`,
+    // where each term reaches every order. A term that is exactly zero is a
+    // structural zero of the κ partial (`x(x−1) = 0` at odd `d`), not a
+    // converged tail, and cannot end the series. The band is the one charged
+    // above: below it a further term cannot move any accumulated sum.
+    let half_d = 0.5 * d as f64;
+    let odd_d = !d.is_multiple_of(2);
+    let odd_base_exponent = d as f64 - 2.0 * base as f64;
+    let mut odd_coefficient = if odd_d {
+        gamma_fn(base as f64 - half_d) * gamma_fn(half_d - a as f64)
+            / (gamma_fn(b as f64)
+                * 4.0_f64.powf(half_d)
+                * std::f64::consts::PI.powf(half_d)
+                * gamma_fn(half_d))
+            * kappa.powf(odd_base_exponent)
+    } else {
+        0.0
+    };
+    let mut analytic_reached_band = false;
+    for i in 0..DUCHON_SMALL_CHI_SERIES_MAX_TERMS {
+        let psi_triplet = if odd_d {
+            let exponent = odd_base_exponent + 2.0 * i as f64;
+            [
+                odd_coefficient,
+                exponent * odd_coefficient,
+                exponent * exponent * odd_coefficient,
+            ]
+        } else {
+            duchon_small_chi_even_d_analytic_coefficient(d, a, b, kappa, i)
+        };
+        let coefficient = match kappa_derivative_order {
+            0 => psi_triplet[0],
+            1 => psi_triplet[1] / kappa,
+            _ => (psi_triplet[2] - psi_triplet[1]) / kappa_sq,
+        };
+        let two_i = 2 * i;
+        let mut term_norm = 0.0_f64;
+        if coefficient != 0.0 {
+            let mut falling = 1.0_f64;
+            for (order, (accumulator, absolute_sum)) in total
+                .iter_mut()
+                .zip(absolute.iter_mut())
+                .enumerate()
+                .take(max_order.min(two_i) + 1)
+            {
+                let summand = coefficient * falling * r.powi((two_i - order) as i32);
+                accumulator.add(summand);
+                *absolute_sum += summand.abs();
+                term_norm = term_norm.max(summand.abs());
+                falling *= (two_i - order) as f64;
+            }
+        }
+        if two_i >= max_order && term_norm > 0.0 {
+            let accumulated_band = absolute
+                .iter()
+                .copied()
+                .map(|absolute_sum| gam_linalg::roundoff::compensated_band(1, absolute_sum))
+                .fold(0.0_f64, f64::max);
+            if term_norm <= accumulated_band {
+                analytic_reached_band = true;
+                break;
+            }
+        }
+        if odd_d {
+            let t = i as f64;
+            odd_coefficient *= -0.25 * kappa_sq * (t + half_d - a as f64)
+                / ((t + 1.0) * (t + half_d) * (base as f64 - 1.0 - half_d - t));
+        }
+    }
+
     // The series is admitted only in the small-χ regime where its terms fall
     // under the accumulated rounding band within a few dozen terms. If the
     // term budget runs out before that, the partial sum is not the value of
     // the series and is not returned as one: the derivatives come back
     // non-finite, which every Gram and penalty assembly downstream refuses
     // (#2469 — this used to return the partial sum silently).
-    if !reached_band {
+    if !reached_band || !analytic_reached_band {
         return vec![f64::NAN; total.len()];
     }
 
@@ -1229,13 +1413,7 @@ pub(crate) fn riesz_block_radial_derivatives(
         // R_j^d(r) = c · r^{2n} · (ln r + A_n).
         let n_f = (offset / 2.0).round();
         let n = n_f as usize;
-        let two_j_i = two_j.round() as i32;
-        let sign = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
-        let denom = 2.0_f64.powi(two_j_i - 1)
-            * std::f64::consts::PI.powf(d as f64 / 2.0)
-            * gamma_fn(j)
-            * factorial_f64(n);
-        let c = sign / denom;
+        let c = log_riesz_coefficient(d, n);
         let two_n = 2 * n;
         let shift = log_riesz_finite_part_shift(d, n);
         for k in 0..=max_order {
@@ -1338,18 +1516,15 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon(
 
     // Hybrid case (s ≥ 1, κ > 0). Three charts in priority order:
     //
-    // 1. Small-χ Riesz series (`κr ≤ DUCHON_SMALL_CHI_SERIES_MAX`).
-    //    Exact analytic finite-part representative at small κ. Converges
-    //    spectrally in `κ²r²` so the tails decay geometrically; carries
-    //    full f64 precision when applicable. Several test fixtures
-    //    (`test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials`)
-    //    pin the production code to this chart at the boundary
-    //    κ=0.01, r=1.3 because the value, radial-derivative, and
-    //    κ-partial code paths must all use the *same* finite-part
-    //    representative there. Dispatching to Schwinger first at high
-    //    d would re-evaluate the integrand at a near-singular Matérn
-    //    limit (κ_t = √(1-t)κ → 0) and produce wildly different
-    //    numerics. So check small-χ first.
+    // 1. Small-χ series (`κr ≤ DUCHON_SMALL_CHI_SERIES_MAX`): the Riesz
+    //    tail plus the analytic part, i.e. the same kernel the other two
+    //    charts evaluate, expanded in `κ²r²` so the tails decay
+    //    geometrically and carry full f64 precision.
+    //    `test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partials`
+    //    pins the value, radial-derivative and κ-partial paths to this
+    //    one chart at κ=0.01, r=1.3. Dispatching to Schwinger first at
+    //    high d would evaluate the integrand near its singular Matérn
+    //    limit (κ_t = √(1-t)κ → 0), so check small-χ first.
     //
     // 2. Schwinger Beta-form (`d > 4m`, fallback when small-χ does not
     //    apply). For high-d cases the alternating Riesz/Matérn
@@ -1511,9 +1686,9 @@ pub(crate) fn anisotropic_duchon_penalty_radial_with_powers(
 
     // Request the same radial-derivative depth used by the derivative
     // bundle for q > 0. The radial ladder itself chooses the stable chart:
-    // partial fractions away from cancellation and the constrained
-    // finite-part Riesz series when κR is small. That keeps q>0 values and
-    // η/κ derivatives on one analytic representative.
+    // partial fractions away from cancellation and the small-χ series
+    // (Riesz tail plus analytic part) when κR is small. That keeps q>0
+    // values and η/κ derivatives on one kernel.
     let max_order = if q == 0 { 0 } else { (2 * q + 2).min(6) };
     let fr = radial_derivatives_of_isotropic_duchon(d, m, s, kappa, big_r, max_order);
 

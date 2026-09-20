@@ -1223,8 +1223,9 @@ fn overlap_vs_no_overlap_diag_differs_by_2q_sum() {
 
 use super::closed_form_penalty::bessel_k;
 
-// Hybrid isotropic Duchon evaluation, test-local: the partial-fraction and
-// finite-part Riesz oracle these kernel tests compare production against.
+// Production's small-χ chart (Riesz tail plus analytic part), value only.
+// The test-local `isotropic_duchon_penalty` routes through it inside the
+// basin where the partial fractions below cancel catastrophically.
 fn duchon_small_chi_riesz_series_value(
     d: usize,
     a: usize,
@@ -1238,19 +1239,18 @@ fn duchon_small_chi_riesz_series_value(
 /// Hybrid isotropic Duchon penalty
 /// g_q^iso(R; m, s, κ) = F^{-1}{1/(ρ^{2(2m-q)} (κ² + ρ²)^{2s})}(R).
 ///
-/// This returns the canonical constrained Duchon representative: polynomial
-/// nullspace components are quotiented out, and the small-κR chart evaluates
-/// the matching finite-part Riesz series directly. The ordinary
-/// partial-fraction Green's function and this representative differ by
-/// nullspace terms in low-dimensional singular regimes, but the constrained
-/// fit only sees this representative. Value, radial derivatives, and κ
+/// One kernel, two charts: outside the small-κR basin the partial-fraction
+/// Green's function ([`hybrid_partial_fraction_value`]); inside it,
+/// production's small-χ series, the Riesz tail plus the analytic part
+/// `Σ_i e_i R^{2i}`, which is the same kernel expanded where the partial
+/// fractions cancel catastrophically. Value, radial derivatives, and κ
 /// partials all use the same chart switch, so production never mixes a
 /// stable value formula with cancelled derivative formulas.
 ///
 /// Edge cases:
 /// - s = 0: g_q^iso(R) = R_{2m-q}^d(R) (no Matérn factor).
 /// - κ = 0, s ≥ 1: g_q^iso(R) = R_{2m+2s-q}^d(R) (Riesz pure).
-/// - General: small-κR finite-part Riesz series or, outside that chart,
+/// - General: small-κR series or, outside that chart, the
 ///   partial-fraction decomposition with a = 2m - q, b = 2s.
 ///
 /// Requires a := 2m - q ≥ 1.
@@ -1288,7 +1288,13 @@ fn isotropic_duchon_penalty(q: usize, d: usize, m: usize, s: f64, kappa: f64, r:
     if super::closed_form_penalty::use_duchon_small_chi_riesz_series(kappa, r) {
         return duchon_small_chi_riesz_series_value(d, a, b, kappa, r);
     }
+    hybrid_partial_fraction_value(d, a, b, kappa, r)
+}
 
+/// Partial-fraction form of the hybrid kernel
+/// `F^{-1}{ρ^{-2a}(κ²+ρ²)^{-b}}(R) = Σ_j A_j R_j^d(R) + Σ_ℓ B_ℓ M_ℓ^d(κ, R)`,
+/// exact at every `κ, R > 0`; its alternating terms cancel as `κR → 0`.
+fn hybrid_partial_fraction_value(d: usize, a: usize, b: usize, kappa: f64, r: f64) -> f64 {
     let kappa_sq = kappa * kappa;
 
     // A_j = (-1)^{a-j} · C(a+b-j-1, a-j) · κ^{-2(a+b-j)}, j = 1..a
@@ -2103,40 +2109,48 @@ fn test_isotropic_duchon_kappa_to_zero_limit() {
 }
 
 #[test]
-fn test_isotropic_duchon_kappa_to_zero_ir_divergence_is_quotiented_by_finite_part() {
-
-    // Same (m,s,q) as the convergent test but d=5. Now a=1,b=4 and
-    // d-2a-2b = -5, so the ordinary low-frequency positive-κ Green's
-    // function carries a divergent polynomial/nullspace component. The
-    // constrained Duchon kernel is its finite-part representative; after
-    // quotienting that nullspace, the off-diagonal value converges to the
-    // κ=0 Riesz representative. The small-χ Riesz-series chart is what
-    // resolves the severe Riesz/Matérn cancellation needed to see this.
+fn test_isotropic_duchon_kappa_to_zero_carries_the_ir_divergent_constant() {
+    // Same (m,s,q) as the convergent test but d=5: a=1, b=4 and
+    // d-2a-2b = -5, so the symbol ρ^{-2}(κ²+ρ²)^{-4} loses integrability at
+    // ρ→0 as κ→0. The positive-κ kernel carries that divergence in its
+    // analytic part E = Σ_i e_i R^{2i}. The Mellin–Barnes residues at
+    // z = d/2 + i give
+    //   e_0 = Γ(a+b-d/2) Γ(d/2-a) / (Γ(b) 4^{d/2} π^{d/2} Γ(d/2)) · κ^{-5},
+    //   e_{i+1}/e_i = -(κ²/4)(i+d/2-a)/((i+1)(i+d/2)(a+b-1-d/2-i)),
+    // i.e. e_1/e_0 = -κ²/10 and e_2/e_0 = κ⁴/56, so with C_0 = κ⁵ e_0
+    //   κ⁵ g / C_0 = 1 - κ²R²/10 + κ⁴R⁴/56 - … + κ⁵ S / C_0,
+    // where S = O(1) is the Riesz tail (→ R_{a+b}^d(R) as κ→0). After the
+    // Laplacians of a pair block these R^{2i} are polynomials in the pair
+    // difference that the nullspace side constraints annihilate; that is
+    // where the finite κ→0 limit lives, not in the kernel value itself.
+    //
+    // At κ=1e-3, R=1.3 the first omitted term is κ⁴R⁴/56 = 5.1e-14 and the
+    // Riesz-tail share is κ⁵|S|/C_0 ≈ 3e-17, so the two-term expansion holds
+    // to 1e-12 with a 20x margin. A chart that dropped E misses by O(1).
+    let gamma = statrs::function::gamma::gamma;
     let d = 5usize;
     let m = 1usize;
     let s = 2usize;
     let q = 1usize;
+    let a = 2 * m - q;
+    let b = 2 * s;
     let r = 1.3_f64;
-    let finite_part = riesz_kernel_value(d, (2 * m + 2 * s - q) as f64, r);
-    let kappa_hi = 0.1_f64;
-    let kappa_lo = 0.01_f64;
-    let hi = isotropic_duchon_penalty(q, d, m, s as f64, kappa_hi, r);
-    let lo = isotropic_duchon_penalty(q, d, m, s as f64, kappa_lo, r);
-
+    let kappa = 1.0e-3_f64;
+    let half_d = 0.5 * d as f64;
+    let leading_constant = gamma((a + b) as f64 - half_d) * gamma(half_d - a as f64)
+        / (gamma(b as f64)
+            * 4.0_f64.powf(half_d)
+            * std::f64::consts::PI.powf(half_d)
+            * gamma(half_d));
+    let value = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
+    assert!(value.is_finite(), "small-κ kernel must be finite: {value}");
+    let scaled = kappa.powi(5) * value / leading_constant;
+    let expected = 1.0 - 0.1 * kappa * kappa * r * r;
+    let err = (scaled - expected).abs();
     assert!(
-        hi.is_finite() && lo.is_finite() && finite_part.is_finite(),
-        "test setup should stay finite away from κ=0 and r=0"
-    );
-    assert!(
-        hi.abs() > 1.0e5 * finite_part.abs(),
-        "moderate positive-κ finite-part representative should still be far from κ=0 Riesz at κ={kappa_hi}: \
-             hi={hi:.6e}, finite_part={finite_part:.6e}"
-    );
-    let lo_err = (lo - finite_part).abs();
-    assert!(
-        lo_err < 1.0e-3 * finite_part.abs(),
-        "small positive-κ finite-part representative should converge to κ=0 Riesz: \
-             κ={kappa_lo}, value={lo:.6e}, finite_part={finite_part:.6e}, err={lo_err:.6e}"
+        err < 1.0e-12,
+        "κ⁵·g/C_0 must follow the IR expansion 1 - κ²R²/10: κ={kappa}, r={r}, \
+             κ⁵g/C_0={scaled:.15e}, expected={expected:.15e}, err={err:.3e}"
     );
 }
 
@@ -2148,7 +2162,7 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
         radial_derivatives_of_isotropic_duchon_kappa_partial2,
     };
 
-    fn finite_part_series(
+    fn small_chi_kernel_series(
         d: usize,
         a: usize,
         b: usize,
@@ -2207,13 +2221,44 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
             }
             coeff *= -((b + n) as f64) * kappa_sq / ((n + 1) as f64);
         }
+
+        // Analytic part `E = Σ_i e_i R^{2i}`, which the Riesz tail above does
+        // not carry. Odd d: the Mellin–Barnes residues at z = d/2 + i give, in
+        // direct Gamma form (production uses the term ratio instead),
+        //   e_i = (−1)^i Γ(a+b−d/2−i) Γ(d/2−a+i)
+        //         / (Γ(b) 4^{d/2+i} π^{d/2} Γ(d/2+i) i!) · κ^{d−2a−2b+2i}.
+        // Consecutive terms shrink by O((κR)²/4) ≈ 4e-5 here, so 24 terms are
+        // far below f64 resolution.
+        let gamma = statrs::function::gamma::gamma;
+        let half_d = 0.5 * d as f64;
+        for i in 0..24usize {
+            let fi = i as f64;
+            let sign = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
+            let unit = sign * gamma((a + b) as f64 - half_d - fi) * gamma(half_d - a as f64 + fi)
+                / (gamma(b as f64)
+                    * 4.0_f64.powf(half_d + fi)
+                    * std::f64::consts::PI.powf(half_d)
+                    * gamma(half_d + fi)
+                    * gamma(fi + 1.0));
+            let p = d as f64 - 2.0 * (a + b) as f64 + 2.0 * fi;
+            let kappa_part = match kappa_derivative_order {
+                0 => kappa.powf(p),
+                1 => p * kappa.powf(p - 1.0),
+                _ => p * (p - 1.0) * kappa.powf(p - 2.0),
+            };
+            let mut falling = 1.0_f64;
+            for (order, slot) in out.iter_mut().enumerate().take(max_order.min(2 * i) + 1) {
+                *slot += unit * kappa_part * falling * r.powi((2 * i - order) as i32);
+                falling *= (2 * i - order) as f64;
+            }
+        }
         out
     }
 
     // Same singular cell that exposed the κ→0 failure, but q=0 because
     // `radial_derivatives_of_isotropic_duchon` is the base f(R) before
     // anisotropic Laplacians apply q. The root invariant is that every
-    // production path uses this same constrained finite-part representative:
+    // production path uses this same kernel, Riesz tail plus analytic part:
     // value, radial R-derivatives, and κ-partials.
     let d = 5usize;
     let m = 1usize;
@@ -2224,9 +2269,9 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
     let r = 1.3_f64;
     let max_order = 4usize;
 
-    let expected = finite_part_series(d, a, b, kappa, r, max_order, 0);
-    let expected_dk = finite_part_series(d, a, b, kappa, r, max_order, 1);
-    let expected_dkk = finite_part_series(d, a, b, kappa, r, max_order, 2);
+    let expected = small_chi_kernel_series(d, a, b, kappa, r, max_order, 0);
+    let expected_dk = small_chi_kernel_series(d, a, b, kappa, r, max_order, 1);
+    let expected_dkk = small_chi_kernel_series(d, a, b, kappa, r, max_order, 2);
 
     let value = isotropic_duchon_penalty(0, d, m, s as f64, kappa, r);
     let radial = radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, r, max_order);
@@ -2236,7 +2281,7 @@ fn test_small_kappa_finite_part_chart_is_shared_by_value_radial_and_kappa_partia
     let rel0 = (value - expected[0]).abs() / expected[0].abs().max(1e-300);
     assert!(
         rel0 < 1e-12,
-        "small-κ value path is not the finite-part chart: got={value:.12e} expected={:.12e} rel={rel0:.3e}",
+        "small-κ value path is not the small-χ kernel series: got={value:.12e} expected={:.12e} rel={rel0:.3e}",
         expected[0]
     );
 
@@ -2360,11 +2405,16 @@ fn test_small_chi_chart_is_the_kernel_not_its_riesz_tail() {
 
 #[test]
 fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
-
-    // Even-dimensional log-Riesz case: d/2 <= N = 2m - q + 2s.
-    // This used to return only the leading R_N term under cancellation.
-    // The expected value below is the finite-part Taylor series itself,
-    // including log-Riesz constants in every R_{N+n} term.
+    // Even-dimensional log-Riesz case: d/2 <= N = 2m - q + 2s, inside the
+    // small-χ basin (κR = 0.088). This used to return only the leading R_N
+    // term, and then only the Riesz tail Σ_n (−1)^n C(b+n−1,n) κ^{2n} R_{N+n},
+    // which is ≈ −4e-10 of the kernel here (#4135). The oracle is the
+    // partial-fraction Green's function, exact at every κR > 0. Its
+    // alternating terms cancel by Σ|terms|/|Σ| = 3.1e3 at this point, so a
+    // few ulps of error in each term and in their compensated sum reach the
+    // value as about 3.1e3 · 4u ≈ 2.8e-12; the `1e-11` bound leaves a 3x
+    // margin above that and sits ten decades below the O(1) defect of the
+    // tail alone.
     let d = 4usize;
     let m = 1usize;
     let s = 2usize;
@@ -2375,22 +2425,23 @@ fn test_even_log_riesz_small_kappa_uses_full_taylor_series() {
     let kappa = 0.08_f64;
     let r = 1.1_f64;
 
+    let expected = hybrid_partial_fraction_value(d, a, b, kappa, r);
     let mut coeff = 1.0_f64;
-    let mut expected = 0.0_f64;
+    let mut riesz_tail = 0.0_f64;
     for n in 0..80 {
-        expected += coeff * riesz_kernel_value(d, (n0 + n) as f64, r);
+        riesz_tail += coeff * riesz_kernel_value(d, (n0 + n) as f64, r);
         coeff *= -((b + n) as f64) * kappa * kappa / ((n + 1) as f64);
     }
-    let leading = riesz_kernel_value(d, (n0) as f64, r);
     let got = isotropic_duchon_penalty(q, d, m, s as f64, kappa, r);
     let rel = (got - expected).abs() / expected.abs().max(1e-300);
     assert!(
         rel < 1e-11,
-        "even log-Riesz Taylor mismatch: got={got:.12e} expected={expected:.12e} rel={rel:.3e}"
+        "even log-Riesz small-χ kernel mismatch: got={got:.12e} expected={expected:.12e} rel={rel:.3e}"
     );
     assert!(
-        (expected - leading).abs() > 1e-5 * expected.abs().max(1e-300),
-        "test must exercise more than the leading κ→0 term"
+        (expected - riesz_tail).abs() > 0.5 * expected.abs(),
+        "test must exercise the analytic part the Riesz tail lacks: \
+             kernel={expected:.12e} tail={riesz_tail:.12e}"
     );
 }
 
