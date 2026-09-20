@@ -89,8 +89,8 @@ pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJ
 /// `Arc::new`). Together with the joint-Hessian build this O(n·cells) rebuild is
 /// the bulk of biobank-fit wall-clock.
 ///
-/// This mirrors `custom_family::outer_objective::AssembledOperatorCache` one
-/// layer down: a module-level `OnceLock<Mutex<..>>`, FIFO capacity 2, keyed by a
+/// Like the custom-family `AssembledOperatorCache` one layer up, it is a
+/// module-level `OnceLock<Mutex<..>>` with FIFO capacity 2, here keyed by a
 /// content fingerprint over EXACTLY the build inputs. Reuse is gated on exact
 /// byte-equality of that fingerprint, so a hit returns an `Arc` to a cache that
 /// is bit-identical to a fresh rebuild — identical row contexts, cell moments,
