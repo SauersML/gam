@@ -140,6 +140,44 @@ def test_harvest_matches_closed_form_linear_head() -> None:
     "harvest",
     [harvest_output_fisher_factors, harvest_downstream_output_fisher_factors],
 )
+def test_hutchinson_mass_residual_is_the_deflated_tail(harvest) -> None:
+    # With C = rank + 1 classes the softmax Fisher F_n has rank C − 1 = rank, so
+    # G_n = Wᵀ F_n W has rank exactly `rank`: the truncation tail is 0. With
+    # fewer trace probes than p the tail is a Hutchinson estimate. Probing G_n
+    # itself and subtracting the Ritz sum leaves estimator noise on the scale
+    # of λ_1 (and a clamp hid the negative draws); probing the deflated
+    # P G_n P, P = I − V_r V_rᵀ, which annihilates range(G_n), leaves only
+    # float64 round-off, many orders below trace(G_n).
+    rng = np.random.default_rng(44)
+    rank, p, n = 2, 8, 6
+    C = rank + 1
+    W_np = rng.standard_normal((C, p))
+    X_np = rng.standard_normal((n, p))
+    W = torch.from_numpy(W_np).to(torch.float64)
+    X = torch.from_numpy(X_np).to(torch.float64)
+    model = _LinearHead(W).to(torch.float64)
+
+    shard = harvest(model, model.feature, X, rank=rank, trace_probes=3, seed=0)
+
+    assert shard.mass_residual is not None
+    for i in range(n):
+        trace_g = float(np.trace(_closed_form_pullback(W_np, X_np[i])))
+        residual = float(shard.mass_residual[i])
+        assert 0.0 <= residual <= 1e-10 * trace_g, (i, residual, trace_g)
+
+
+def test_trace_probes_must_be_positive() -> None:
+    W = torch.eye(3, dtype=torch.float64)
+    model = _LinearHead(W).to(torch.float64)
+    X = torch.zeros((2, 3), dtype=torch.float64)
+    with pytest.raises(ValueError, match="trace_probes must be >= 1"):
+        harvest_output_fisher_factors(model, model.feature, X, rank=1, trace_probes=0)
+
+
+@pytest.mark.parametrize(
+    "harvest",
+    [harvest_output_fisher_factors, harvest_downstream_output_fisher_factors],
+)
 def test_attention_forward_ad_failure_names_eager_reload_2265(
     monkeypatch: pytest.MonkeyPatch,
     harvest,

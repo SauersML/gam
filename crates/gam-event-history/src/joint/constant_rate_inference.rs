@@ -135,7 +135,9 @@ fn strength(counts: &[u64], exposure: &[f64]) -> Result<f64, EventHistoryError> 
     };
     let (smallest, largest) = exposed
         .iter()
-        .fold((f64::INFINITY, 0.0_f64), |(lo, hi), mark| (lo.min(mark.1), hi.max(mark.1)));
+        .fold((f64::INFINITY, 0.0_f64), |(lo, hi), mark| {
+            (lo.min(mark.1), hi.max(mark.1))
+        });
     let bracket = (
         (smallest / (2.0 * total_count)).ln() - x0,
         (2.0 * exposed.len() as f64 * largest / total_count).ln() - x0,
@@ -422,8 +424,10 @@ mod tests {
         marks: &[(&str, MarkKind)],
         subjects: &[(f64, f64, &[(f64, usize)])],
     ) -> Result<(Vec<MarkKind>, Vec<JointHistory>), EventHistoryError> {
-        let declared: Vec<(String, MarkKind)> =
-            marks.iter().map(|&(name, kind)| (name.to_string(), kind)).collect();
+        let declared: Vec<(String, MarkKind)> = marks
+            .iter()
+            .map(|&(name, kind)| (name.to_string(), kind))
+            .collect();
         let mut tables = JointTables::default();
         for (i, &(entry, exit, events)) in subjects.iter().enumerate() {
             let id = format!("s{i}");
@@ -438,7 +442,10 @@ mod tests {
         }
         let (schema, encoded) =
             FrozenJointSchema::fit(&rank_zero_declarations(Some(declared)), &tables)?;
-        Ok((schema.mark_kinds, encoded.into_iter().map(|subject| subject.history).collect()))
+        Ok((
+            schema.mark_kinds,
+            encoded.into_iter().map(|subject| subject.history).collect(),
+        ))
     }
 
     const COMPETING: [(&str, MarkKind); 4] = [
@@ -471,7 +478,10 @@ mod tests {
         let marks = [(1.0_f64, 1.0_f64), (0.0, 3.0)];
         let x0 = 4.0_f64.ln();
         let evidence = Evidence {
-            marks: marks.iter().map(|&(count, e)| (count, x0 - e.ln())).collect(),
+            marks: marks
+                .iter()
+                .map(|&(count, e)| (count, x0 - e.ln()))
+                .collect(),
         };
         // -log p(data | c) without constants: sum_d (y_d+1) log(E_d+c) - log c.
         let terms = |z: f64| -> Vec<f64> {
@@ -487,11 +497,20 @@ mod tests {
         for z in [-4.0, -1.0, 0.0, 0.7, 3.0] {
             let [gradient, curvature, third] = evidence.derivatives(z);
             let (fd, bar) = central_difference(&value, z, roundoff(&terms(z)));
-            assert!(gradient.abs() > bar && (gradient - fd).abs() <= bar, "z {z}: {gradient} vs {fd}, bar {bar}");
+            assert!(
+                gradient.abs() > bar && (gradient - fd).abs() <= bar,
+                "z {z}: {gradient} vs {fd}, bar {bar}"
+            );
             let (fd, bar) = central_difference(&derivative(0), z, roundoff(&[bound, bound]));
-            assert!(curvature.abs() > bar && (curvature - fd).abs() <= bar, "z {z}: {curvature} vs {fd}, bar {bar}");
+            assert!(
+                curvature.abs() > bar && (curvature - fd).abs() <= bar,
+                "z {z}: {curvature} vs {fd}, bar {bar}"
+            );
             let (fd, bar) = central_difference(&derivative(1), z, roundoff(&[bound, bound]));
-            assert!(third.abs() > bar && (third - fd).abs() <= bar, "z {z}: {third} vs {fd}, bar {bar}");
+            assert!(
+                third.abs() > bar && (third - fd).abs() <= bar,
+                "z {z}: {third} vs {fd}, bar {bar}"
+            );
         }
     }
 
@@ -509,10 +528,13 @@ mod tests {
             let [.., curvature, third] = evidence.derivatives(z);
             // The certificate places log c within the gradient resolution over
             // the curvature, plus one representable step of each log.
-            let location = evidence.resolution(x0, z) / curvature
-                + roundoff(&[log_c, x0, root, scale.ln()]);
+            let location =
+                evidence.resolution(x0, z) / curvature + roundoff(&[log_c, x0, root, scale.ln()]);
             assert!(z.abs() > location && third.is_finite());
-            assert!((log_c - root).abs() <= location, "scale {scale}: {log_c} vs {root}, bar {location}");
+            assert!(
+                (log_c - root).abs() <= location,
+                "scale {scale}: {log_c} vs {root}, bar {location}"
+            );
         }
     }
 
@@ -521,8 +543,14 @@ mod tests {
         // Once-only target Gamma(1, 5) against a terminal cause Gamma(3, 11).
         let (b_d, b_t, delta) = (5.0_f64, 11.0_f64, 6.0_f64);
         let rates = [
-            GammaRate { shape: 1.0, log_rate: b_d.ln() },
-            GammaRate { shape: 3.0, log_rate: b_t.ln() },
+            GammaRate {
+                shape: 1.0,
+                log_rate: b_d.ln(),
+            },
+            GammaRate {
+                shape: 3.0,
+                log_rate: b_t.ln(),
+            },
         ];
         // Antiderivative pieces of 1/(x^2 (x+delta)^3), by partial fractions.
         let pieces = |x: f64| {
@@ -543,23 +571,40 @@ mod tests {
             let oracle: f64 = parts.iter().sum();
             let oracle_error = roundoff(&parts);
             let (value, error) = incidence(&rates, &[0, 1], u, &mut rules);
-            assert!(error > 0.0 && oracle > error + oracle_error, "u {u}: error {error}");
-            assert!((value - oracle).abs() <= error + oracle_error, "u {u}: {value} vs {oracle}");
+            assert!(
+                error > 0.0 && oracle > error + oracle_error,
+                "u {u}: error {error}"
+            );
+            assert!(
+                (value - oracle).abs() <= error + oracle_error,
+                "u {u}: {value} vs {oracle}"
+            );
             let survival = (b_d / (b_d + u)) * (b_t / (b_t + u)).powi(3);
             let (other, other_error) = incidence(&rates, &[1, 0], u, &mut rules);
             let complement_error = roundoff(&[other, oracle, 1.0, survival]);
-            assert!((other - (1.0 - survival - oracle)).abs() <= other_error + oracle_error + complement_error);
+            assert!(
+                (other - (1.0 - survival - oracle)).abs()
+                    <= other_error + oracle_error + complement_error
+            );
         }
         // Equal rates have the closed form a_d / sum_j a_j (1 - G(u)).
         let equal = [
-            GammaRate { shape: 2.0, log_rate: 7.0_f64.ln() },
-            GammaRate { shape: 3.0, log_rate: 7.0_f64.ln() },
+            GammaRate {
+                shape: 2.0,
+                log_rate: 7.0_f64.ln(),
+            },
+            GammaRate {
+                shape: 3.0,
+                log_rate: 7.0_f64.ln(),
+            },
         ];
         let (value, error) = incidence(&equal, &[0, 1], 2.0, &mut rules);
         let log_g = 5.0 * (7.0_f64 / 9.0).ln();
         let expected = 0.4 * (1.0 - log_g.exp());
         assert_eq!(error, 0.0);
-        assert!((value - expected).abs() <= roundoff(&[value, expected, 0.4 * log_g, 0.4 * log_g, 0.4]));
+        assert!(
+            (value - expected).abs() <= roundoff(&[value, expected, 0.4 * log_g, 0.4 * log_g, 0.4])
+        );
     }
 
     #[test]
@@ -568,7 +613,10 @@ mod tests {
         // diagnosis with two visits, censored at 6.
         let (marks, cohort) = histories(
             &COMPETING,
-            &[(0.0, 4.0, &[(4.0, 1)]), (0.0, 6.0, &[(0.0, 0), (1.0, 3), (5.0, 3)])],
+            &[
+                (0.0, 4.0, &[(4.0, 1)]),
+                (0.0, 6.0, &[(0.0, 0), (1.0, 3), (5.0, 3)]),
+            ],
         )
         .unwrap();
         // The encoded cohort's sufficient statistics, re-derived from the
@@ -589,7 +637,10 @@ mod tests {
             }
         }
         assert_eq!(counts_total, [0, 1, 0, 2]);
-        assert_eq!(exposure_total.map(f64::to_bits), [4.0_f64, 10.0, 10.0, 10.0].map(f64::to_bits));
+        assert_eq!(
+            exposure_total.map(f64::to_bits),
+            [4.0_f64, 10.0, 10.0, 10.0].map(f64::to_bits)
+        );
         let posterior = ConstantRatePosterior::infer(&marks, cohort.into_iter().map(Ok)).unwrap();
         // Exposures (4, 10, 10, 10) and counts (0, 1, 0, 2): the score
         // sum_d (E_d - y_d c)/(E_d + c) vanishes where 3c^2 - 22c - 160 = 0.
@@ -598,7 +649,11 @@ mod tests {
         let c: f64 = (22.0 + 2404.0_f64.sqrt()) / 6.0;
         let x0 = 34.0_f64.ln() - 3.0_f64.ln();
         let evidence = Evidence {
-            marks: counts.iter().zip(exposure).map(|(&count, e)| (count, x0 - e.ln())).collect(),
+            marks: counts
+                .iter()
+                .zip(exposure)
+                .map(|(&count, e)| (count, x0 - e.ln()))
+                .collect(),
         };
         let z = c.ln() - x0;
         let curvature = evidence.derivatives(z)[1];
@@ -608,8 +663,8 @@ mod tests {
         for d in 0..4 {
             assert_eq!(rates[d].shape, counts[d] + 1.0);
             let expected = (exposure[d] + c).ln();
-            let bar = location * c / (exposure[d] + c)
-                + roundoff(&[expected, exposure[d].ln(), c.ln()]);
+            let bar =
+                location * c / (exposure[d] + c) + roundoff(&[expected, exposure[d].ln(), c.ln()]);
             assert!((rates[d].log_rate - expected).abs() <= bar, "mark {d}");
         }
 
@@ -627,7 +682,10 @@ mod tests {
         for (h, &u) in horizons.iter().enumerate().skip(1) {
             let lomax = |shape: f64| {
                 let log_g = shape * (b_t / (b_t + u)).ln();
-                (log_g.exp(), log_g.exp() * roundoff(&[log_g, log_g, 1.0, 1.0]))
+                (
+                    log_g.exp(),
+                    log_g.exp() * roundoff(&[log_g, log_g, 1.0, 1.0]),
+                )
             };
             // Survival: the Lomax law of the three terminal shapes. Inserting
             // the posterior mean rates instead misses it by more than its bar.
@@ -643,7 +701,10 @@ mod tests {
             ] {
                 let expected = share * (1.0 - g);
                 let bar = share * g_bar + roundoff(&[forecast.incidence[[h, d]], share, share * g]);
-                assert!((forecast.incidence[[h, d]] - expected).abs() <= bar, "u {u}, mark {d}");
+                assert!(
+                    (forecast.incidence[[h, d]] - expected).abs() <= bar,
+                    "u {u}, mark {d}"
+                );
                 assert_eq!(forecast.incidence_error[[h, d]], 0.0);
             }
             // The diagnosis against both terminal causes:
@@ -664,7 +725,10 @@ mod tests {
             let oracle: f64 = parts.iter().sum();
             let (value, error) = (forecast.incidence[[h, 0]], forecast.incidence_error[[h, 0]]);
             assert!(error > 0.0 && oracle > error + roundoff(&parts));
-            assert!((value - oracle).abs() <= error + roundoff(&parts), "u {u}: {value} vs {oracle}");
+            assert!(
+                (value - oracle).abs() <= error + roundoff(&parts),
+                "u {u}: {value} vs {oracle}"
+            );
         }
     }
 
@@ -674,21 +738,28 @@ mod tests {
         let (kinds, cohort) = histories(&marks, &[(0.0, 3.0, &[]), (0.0, 5.0, &[])]).unwrap();
         let posterior = ConstantRatePosterior::infer(&kinds, cohort.into_iter().map(Ok)).unwrap();
         assert_eq!(posterior.rates, None);
-        let forecast = posterior.forecast(&kinds, &[true, true], &[1.0, 1e300]).unwrap();
+        let forecast = posterior
+            .forecast(&kinds, &[true, true], &[1.0, 1e300])
+            .unwrap();
         assert_eq!(forecast.survival, [1.0, 1.0]);
         assert!(forecast.incidence.iter().all(|&p| p == 0.0));
         let (_, quiet) = histories(&marks, &[(0.0, 2.0, &[])]).unwrap();
         assert_eq!(posterior.condition(&kinds, &quiet[0]).unwrap(), posterior);
         let (_, diagnosed) = histories(&marks, &[(0.0, 2.0, &[(1.0, 0)])]).unwrap();
-        let error = posterior.condition(&kinds, &diagnosed[0]).err().unwrap().to_string();
+        let error = posterior
+            .condition(&kinds, &diagnosed[0])
+            .err()
+            .unwrap()
+            .to_string();
         assert!(error.contains("probability zero"), "{error}");
         // Everyone prevalent for the only mark: no exposure identifies the strength.
         let (prevalent, histories_prevalent) =
             histories(&[("only", MarkKind::Once)], &[(0.0, 2.0, &[(0.0, 0)])]).unwrap();
-        let error = ConstantRatePosterior::infer(&prevalent, histories_prevalent.into_iter().map(Ok))
-            .err()
-            .unwrap()
-            .to_string();
+        let error =
+            ConstantRatePosterior::infer(&prevalent, histories_prevalent.into_iter().map(Ok))
+                .err()
+                .unwrap()
+                .to_string();
         assert!(error.contains("unidentified"), "{error}");
     }
 }

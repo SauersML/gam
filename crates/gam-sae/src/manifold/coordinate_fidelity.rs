@@ -1312,7 +1312,15 @@ impl SaeManifoldTerm {
     /// at accepted-iterate incumbent-comparison boundaries (never inside a line
     /// search), where one band-limited grid evaluation per atom is negligible
     /// against the joint Newton assembly.
-    pub(crate) fn coordinate_uniformity_aggregate(&self) -> Option<f64> {
+    ///
+    /// A degenerate chart is an honest `Ok(None)` skip inside
+    /// [`crate::chart_canonicalization::chart_unit_speed_defect`]; an `Err`
+    /// (basis evaluation failure, basis/decoder width mismatch, malformed jet) is
+    /// a structural fault and propagates, exactly as it does in the per-atom
+    /// report ([`atom_coordinate_fidelity`]). Swallowing it would silently drop
+    /// the atom from the mean, so the candidate and incumbent of one tie-break
+    /// could be averaged over DIFFERENT atom sets.
+    pub(crate) fn coordinate_uniformity_aggregate(&self) -> Result<Option<f64>, String> {
         let mut sum = 0.0_f64;
         let mut count = 0usize;
         for atom_idx in 0..self.atoms.len() {
@@ -1324,16 +1332,18 @@ impl SaeManifoldTerm {
                 continue;
             }
             let atom = &self.atoms[atom_idx];
-            let defect = atom.basis_evaluator.as_ref().and_then(|evaluator| {
-                crate::chart_canonicalization::chart_unit_speed_defect(
+            let defect = match atom.basis_evaluator.as_ref() {
+                Some(evaluator) => crate::chart_canonicalization::chart_unit_speed_defect(
                     evaluator.as_ref(),
                     atom.decoder_coefficients().view(),
                     coords.column(0),
                     &topology,
                 )
-                .ok()
-                .flatten()
-            });
+                .map_err(|err| {
+                    format!("coordinate_uniformity_aggregate: atom {atom_idx}: {err}")
+                })?,
+                None => None,
+            };
             if let Some(d) = defect {
                 if d.is_finite() {
                     sum += d;
@@ -1342,9 +1352,9 @@ impl SaeManifoldTerm {
             }
         }
         if count == 0 {
-            None
+            Ok(None)
         } else {
-            Some(sum / count as f64)
+            Ok(Some(sum / count as f64))
         }
     }
 }

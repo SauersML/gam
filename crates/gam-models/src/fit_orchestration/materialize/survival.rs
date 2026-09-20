@@ -102,17 +102,23 @@ pub(crate) fn materialize_survival<'a>(
     // adds `linkwiggle(...)` to a `Surv(...)` formula without overriding the
     // (default) `survival_likelihood='transformation'`, the formula itself
     // selects the location-scale AFT model whose link the wiggle flexes — so
-    // promote rather than reject. An EXPLICIT incompatible likelihood
-    // (weibull/latent/latent-binary) is still a hard error below.
-    if parsed.linkwiggle.is_some() && survival_mode == SurvivalLikelihoodMode::Transformation {
+    // promote rather than reject. Only an UNSET likelihood is promoted: an
+    // explicit incompatible likelihood, `transformation` included, is still a
+    // hard error below rather than a silently swapped model.
+    let likelihood_is_default = config.survival_likelihood.is_none();
+    if likelihood_is_default
+        && parsed.linkwiggle.is_some()
+        && survival_mode == SurvivalLikelihoodMode::Transformation
+    {
         survival_mode = SurvivalLikelihoodMode::LocationScale;
     }
     // A noise formula is the log-sigma predictor, which only the location-scale
     // likelihood has. Under the default `transformation` likelihood it selects
     // that model, as `linkwiggle(...)` does. An explicit likelihood with no sigma
-    // block is refused rather than fitted with the noise formula dropped.
+    // block, `transformation` included, is refused rather than fitted with the
+    // noise formula dropped or with the likelihood swapped.
     if config.noise_formula.is_some() {
-        if survival_mode == SurvivalLikelihoodMode::Transformation {
+        if likelihood_is_default && survival_mode == SurvivalLikelihoodMode::Transformation {
             survival_mode = SurvivalLikelihoodMode::LocationScale;
         }
         if survival_mode != SurvivalLikelihoodMode::LocationScale {
@@ -123,6 +129,22 @@ pub(crate) fn materialize_survival<'a>(
                 ),
             });
         }
+    }
+    // A noise offset enters the log-sigma predictor of the location-scale fit or
+    // the slope predictor of the marginal-slope fit. No other likelihood reads
+    // it, so it is refused instead of being dropped.
+    if config.noise_offset_column.is_some()
+        && !matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
+        )
+    {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "noise_offset_column is supported only for survival location-scale or marginal-slope; survival_likelihood='{}' has no log-sigma or slope predictor",
+                config.resolved_survival_likelihood()
+            ),
+        });
     }
     // `survmodel(spec=...)` names the risk the fit estimates. Every survival
     // likelihood here fits one hazard per cause, which is the net risk. A crude
@@ -154,6 +176,19 @@ pub(crate) fn materialize_survival<'a>(
             ),
         });
     }
+    // Only the transformation/Weibull request carries penalty-block priors;
+    // no survival request carries coefficient groups.
+    reject_unrealized_precision_priors(
+        config,
+        &format!(
+            "survival_likelihood='{}'",
+            crate::survival::construction::survival_likelihood_modename(survival_mode)
+        ),
+        matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+        ),
+    )?;
     // Fail fast on zero effective event mass (all-censored, OR every event-coded
     // row carries zero weight) for every survival likelihood (#789B /
     // construction-time fittability split; #2276). With no row contributing a
@@ -265,6 +300,23 @@ pub(crate) fn materialize_survival<'a>(
             ),
         }
         .into());
+    }
+    // The threshold and log-sigma time margins exist only in the location-scale
+    // likelihood. Every other mode would build the template and drop it.
+    if survival_mode != SurvivalLikelihoodMode::LocationScale {
+        for (name, set, block) in [
+            ("threshold_time_k", config.threshold_time_k.is_some(), "threshold"),
+            ("sigma_time_k", config.sigma_time_k.is_some(), "log-sigma"),
+        ] {
+            if set {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "{name} applies to the survival location-scale likelihood; survival_likelihood='{}' has no {block} block to vary along follow-up",
+                        config.resolved_survival_likelihood()
+                    ),
+                });
+            }
+        }
     }
     // Hoist the survival marginal-slope z-column exclusion check above the
     // time-basis / termspec construction below.  Those downstream steps fail
@@ -1299,14 +1351,6 @@ pub(crate) fn materialize_survival<'a>(
 
     let request = match survival_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
-            if config.noise_offset_column.is_some() {
-                return Err(WorkflowError::InvalidConfig {
-                    reason:
-                        "noise_offset_column is supported only for survival location-scale or marginal-slope"
-                            .to_string(),
-                }
-                .into());
-            }
             let weibull_seed = if survival_mode == SurvivalLikelihoodMode::Weibull
                 && effective_timewiggle.is_none()
             {
@@ -1371,4 +1415,148 @@ pub(crate) fn materialize_survival<'a>(
             ),
         ),
     })
+}
+
+#[cfg(test)]
+mod survival_only_setting_routing_tests {
+    //! A survival setting the selected fit does not read is refused by the
+    //! library, the one place every front end reaches, rather than dropped.
+    use super::*;
+    use gam_data::load_dataset_projected;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// `t` a positive exit time, `e` a {0,1} event, `y` a continuous response,
+    /// `x` a covariate.
+    fn dataset() -> Dataset {
+        let td = tempdir().expect("tempdir");
+        let path = td.path().join("survival_only_settings.csv");
+        fs::write(
+            &path,
+            "t,e,y,x\n\
+             0.4,1,0.3,-0.9\n\
+             0.7,0,-0.2,-0.6\n\
+             0.9,1,1.1,-0.3\n\
+             1.2,1,0.7,-0.1\n\
+             1.5,0,-0.5,0.2\n\
+             1.8,1,0.2,0.4\n\
+             2.2,0,1.4,0.6\n\
+             2.6,1,-0.9,0.8\n\
+             3.1,1,0.5,0.9\n\
+             3.7,0,0.0,-0.4\n\
+             4.2,1,0.8,0.1\n\
+             4.8,0,-0.3,-0.7\n",
+        )
+        .expect("write survival-only settings csv");
+        let columns = ["t", "e", "y", "x"].map(str::to_string);
+        load_dataset_projected(&path, &columns).expect("load survival-only settings dataset")
+    }
+
+    fn refusal(formula: &str, config: FitConfig) -> String {
+        match materialize(formula, &dataset(), &config) {
+            Ok(_) => panic!("`{formula}` with {config:?} must be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn survival_only_settings_on_a_non_survival_response_are_refused() {
+        let cases = [
+            (
+                "baseline_scale, baseline_target are read only",
+                FitConfig {
+                    baseline_target: "weibull".to_string(),
+                    baseline_scale: Some(2.0),
+                    ..FitConfig::default()
+                },
+            ),
+            (
+                "time_basis is read only",
+                FitConfig {
+                    time_basis: "bspline".to_string(),
+                    ..FitConfig::default()
+                },
+            ),
+            (
+                "time_num_internal_knots is read only",
+                FitConfig {
+                    time_num_internal_knots: 5,
+                    ..FitConfig::default()
+                },
+            ),
+            (
+                "threshold_time_k, sigma_time_k are read only",
+                FitConfig {
+                    threshold_time_k: Some(4),
+                    sigma_time_k: Some(4),
+                    ..FitConfig::default()
+                },
+            ),
+            (
+                "slope_time_k is read only",
+                FitConfig {
+                    slope_time_k: Some(3),
+                    ..FitConfig::default()
+                },
+            ),
+        ];
+        for (expected, config) in cases {
+            let message = refusal("y ~ x", config);
+            assert!(
+                message.contains(expected) && message.contains("require a Surv(...) response"),
+                "expected `{expected}`, got: {message}"
+            );
+        }
+        materialize("y ~ x", &dataset(), &FitConfig::default())
+            .unwrap_or_else(|error| panic!("an ordinary GAM must still materialize: {error}"));
+    }
+
+    #[test]
+    fn a_time_margin_outside_the_location_scale_likelihood_is_refused() {
+        let message = refusal(
+            "Surv(t, e) ~ x",
+            FitConfig {
+                threshold_time_k: Some(4),
+                ..FitConfig::default()
+            },
+        );
+        assert!(
+            message.contains("threshold_time_k applies to the survival location-scale likelihood")
+                && message.contains("'transformation'"),
+            "{message}"
+        );
+        let message = refusal(
+            "Surv(t, e) ~ x",
+            FitConfig {
+                survival_likelihood: Some("weibull".to_string()),
+                sigma_time_k: Some(4),
+                ..FitConfig::default()
+            },
+        );
+        assert!(
+            message.contains("sigma_time_k applies to the survival location-scale likelihood")
+                && message.contains("'weibull'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_noise_offset_outside_location_scale_and_marginal_slope_is_refused() {
+        for likelihood in [None, Some("weibull"), Some("latent"), Some("latent-binary")] {
+            let message = refusal(
+                "Surv(t, e) ~ x",
+                FitConfig {
+                    survival_likelihood: likelihood.map(str::to_string),
+                    noise_offset_column: Some("x".to_string()),
+                    ..FitConfig::default()
+                },
+            );
+            assert!(
+                message.contains(
+                    "noise_offset_column is supported only for survival location-scale or marginal-slope"
+                ),
+                "{likelihood:?}: {message}"
+            );
+        }
+    }
 }

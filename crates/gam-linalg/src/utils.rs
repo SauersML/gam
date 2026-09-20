@@ -59,7 +59,8 @@ pub const SPECTRAL_DEFLATION_REL_FLOOR: f64 = 1.0e-8;
 /// (largest-admissible, hence smoothest) value gives `τ₀ = floor/ln2 ≈ 1.443e-8`,
 /// so the absolute perturbation is `P·floor` — exactly the deflation floor
 /// relative to the operator's own curvature scale.
-pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 = SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
+pub(crate) const SMOOTH_PSD_CLAMP_TEMPERATURE: f64 =
+    SPECTRAL_DEFLATION_REL_FLOOR / std::f64::consts::LN_2;
 
 /// Homogeneity-preserving smooth replacement for `prefactor · max(x, 0)` on a
 /// dimensionless `x` (`prefactor ≥ 0`), at the temperature
@@ -177,41 +178,6 @@ pub fn trace_of_product(a: ArrayView2<'_, f64>, b: ArrayView2<'_, f64>) -> f64 {
         }
     }
     value
-}
-
-/// Numerically stable softplus `log(1 + exp(x))`.
-///
-/// Uses the identity `softplus(x) = max(x, 0) + log1p(exp(-|x|))`, which
-/// avoids both `exp` overflow for large positive `x` and `log(1)` cancellation
-/// for large negative `x`. Previously duplicated as `stable_softplus` in
-/// `terms/smooth.rs` and `families/gamlss.rs`.
-#[inline]
-pub fn stable_softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
-}
-
-/// Numerically stable logistic `σ(x) = 1 / (1 + exp(-x))`.
-///
-/// Splits on the sign of `x` to keep both `exp` arguments non-positive and
-/// avoid overflow:
-///   σ(x) = 1 / (1 + exp(-x))   for x ≥ 0,
-///   σ(x) = exp(x) / (1 + exp(x))   for x < 0.
-///
-/// Canonical home for the routine previously duplicated as `logistic` in
-/// `terms/analytic_penalties.rs`, `sigmoid_stable` in `inference/hmc.rs`, and
-/// `sigmoid_scalar` in `terms/sae/manifold/mod.rs` — all three were bit-identical.
-#[inline]
-pub fn stable_logistic(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let ex = x.exp();
-        ex / (1.0 + ex)
-    }
 }
 
 /// Generic finiteness check for any `f64` ndarray view (1-D, 2-D, etc.).
@@ -809,24 +775,6 @@ pub fn certified_spd_inverse(
     certified_spd_factorize(matrix, label)?.inverse()
 }
 
-/// Compensated scalar summation for the linear-algebra callers. It is the workspace owner
-/// [`gam_math::sparse_grid::CompensatedSum`] (Kahan–Babuška / Neumaier), so an addend larger than
-/// the running sum keeps the running sum's low-order bits and `sum()` folds the compensation back in.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct KahanSum(gam_math::sparse_grid::CompensatedSum);
-
-impl KahanSum {
-    #[inline]
-    pub fn add(&mut self, value: f64) {
-        self.0.add(value);
-    }
-
-    #[inline]
-    pub fn sum(self) -> f64 {
-        self.0.value()
-    }
-}
-
 pub struct StableSolver;
 
 impl StableSolver {
@@ -1412,7 +1360,6 @@ impl RankCertifiedPsdPseudoinverse {
     pub fn into_pseudoinverse(self) -> Array2<f64> {
         self.pseudoinverse
     }
-
 }
 
 /// Compute a declared rank-truncated PSD pseudoinverse from one strict,
@@ -1420,9 +1367,13 @@ impl RankCertifiedPsdPseudoinverse {
 ///
 /// Eigenvalues `lambda > relative_cutoff * lambda_max` define the certified
 /// range. Values at or below that explicit cutoff define the discarded null
-/// space. A negative eigenvalue is admitted only within the dimension-scaled
-/// eigensolver roundoff bound; material indefiniteness is an error. No absolute
-/// floor, repaired eigendecomposition, or fallback rank is hidden here.
+/// space. A negative eigenvalue is admitted only when it is unresolved from
+/// zero: within the decomposition's own rounding band
+/// ([`crate::roundoff::symmetric_spectrum_rounding_band`]) or within the
+/// caller's declared null-space cutoff, whose sign carries no information by the
+/// same resolution that discards it. Material indefiniteness beyond both is an
+/// error. No absolute floor, repaired eigendecomposition, or fallback rank is
+/// hidden here.
 pub fn rank_certified_psd_pseudoinverse(
     penalty: &Array2<f64>,
     relative_cutoff: f64,
@@ -1434,23 +1385,21 @@ pub fn rank_certified_psd_pseudoinverse(
     }
     let (eigs, vecs) = strict_symmetric_eigh(penalty, Side::Lower)
         .map_err(|error| LinalgError::InvalidInput(error.to_string()))?;
-    let max_abs = eigs
-        .iter()
-        .fold(0.0_f64, |maximum, &value| maximum.max(value.abs()));
     let max_eigenvalue = eigs
         .iter()
         .fold(0.0_f64, |maximum, &value| maximum.max(value));
-    let psd_roundoff = 128.0 * penalty.nrows() as f64 * f64::EPSILON * max_abs;
+    let absolute_cutoff = relative_cutoff * max_eigenvalue;
+    let unresolved_band =
+        crate::roundoff::symmetric_spectrum_rounding_band(&eigs.to_vec()).max(absolute_cutoff);
     if let Some((index, &value)) = eigs
         .iter()
         .enumerate()
-        .find(|(_, value)| **value < -psd_roundoff)
+        .find(|(_, value)| **value < -unresolved_band)
     {
         return Err(LinalgError::InvalidInput(format!(
-            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{psd_roundoff:.3e}"
+            "PSD pseudoinverse input is indefinite at eigenvalue {index}: {value:.3e} < -{unresolved_band:.3e}"
         )));
     }
-    let absolute_cutoff = relative_cutoff * max_eigenvalue;
     let mut rank = 0_usize;
     let mut scaled = Array2::<f64>::zeros(vecs.dim());
     for col in 0..eigs.len() {
@@ -1702,6 +1651,28 @@ mod certified_inverse_tests {
         let error = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap_err();
         assert!(error.to_string().contains("indefinite"));
     }
+
+    #[test]
+    fn psd_pseudoinverse_admits_a_negative_eigenvalue_inside_its_declared_null_cutoff() {
+        // `-1e-12` is below the decomposition's rounding band `2·ε ≈ 4.4e-16`,
+        // but inside the declared null cutoff `1e-10·λ_max`: the resolution that
+        // discards a `+1e-12` eigenvalue as null cannot read the sign of a
+        // `-1e-12` one, so both are the same discarded direction.
+        let matrix = array![[1.0, 0.0], [0.0, -1.0e-12]];
+        let geometry = rank_certified_psd_pseudoinverse(&matrix, 1.0e-10).unwrap();
+        assert_eq!(geometry.rank(), 1);
+        let pseudoinverse = geometry.into_pseudoinverse();
+        let expected = array![[1.0, 0.0], [0.0, 0.0]];
+        for (got, want) in pseudoinverse.iter().zip(expected.iter()) {
+            assert!(
+                (got - want).abs() <= 4.0 * f64::EPSILON,
+                "{pseudoinverse:?}"
+            );
+        }
+        // With no declared cutoff only the rounding band is unresolved.
+        let error = rank_certified_psd_pseudoinverse(&matrix, 0.0).unwrap_err();
+        assert!(error.to_string().contains("indefinite"));
+    }
 }
 
 #[cfg(test)]
@@ -1921,82 +1892,7 @@ mod tests {
 
 #[cfg(test)]
 mod pure_fn_tests {
-    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message, stable_logistic, stable_softplus};
-
-    // -----------------------------------------------------------------------
-    // stable_softplus: log(1 + exp(x))
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn softplus_at_zero() {
-        let got = stable_softplus(0.0);
-        let expected = (1.0_f64 + 1.0_f64).ln();
-        assert!((got - expected).abs() < 1e-14, "got={got}");
-    }
-
-    #[test]
-    fn softplus_positive_large_approximates_x() {
-        let x = 100.0_f64;
-        let got = stable_softplus(x);
-        assert!(
-            (got - x).abs() < 1e-10,
-            "softplus({x}) = {got}, expected ~{x}"
-        );
-    }
-
-    #[test]
-    fn softplus_negative_large_approximates_zero() {
-        let x = -50.0_f64;
-        let got = stable_softplus(x);
-        assert!(got >= 0.0, "softplus must be non-negative, got {got}");
-        assert!(got < 1e-10, "softplus({x}) = {got}, expected ~0");
-    }
-
-    #[test]
-    fn softplus_matches_naive_formula_at_moderate_x() {
-        for x in [-5.0_f64, -1.0, 0.5, 1.0, 5.0] {
-            let got = stable_softplus(x);
-            let expected = (1.0 + x.exp()).ln();
-            assert!(
-                (got - expected).abs() < 1e-12,
-                "x={x}: got={got} expected={expected}"
-            );
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // stable_logistic: 1 / (1 + exp(-x))
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn logistic_at_zero_is_half() {
-        let got = stable_logistic(0.0);
-        assert!((got - 0.5).abs() < 1e-15, "got={got}");
-    }
-
-    #[test]
-    fn logistic_large_positive_approaches_one() {
-        let got = stable_logistic(100.0);
-        assert!((got - 1.0).abs() < 1e-10, "got={got}");
-    }
-
-    #[test]
-    fn logistic_large_negative_approaches_zero() {
-        let got = stable_logistic(-100.0);
-        assert!(got >= 0.0 && got < 1e-10, "got={got}");
-    }
-
-    #[test]
-    fn logistic_symmetry_around_zero() {
-        for x in [0.5_f64, 1.0, 2.0, 5.0] {
-            let pos = stable_logistic(x);
-            let neg = stable_logistic(-x);
-            assert!(
-                (pos + neg - 1.0).abs() < 1e-15,
-                "x={x}: pos={pos} neg={neg}"
-            );
-        }
-    }
+    use super::{inf_norm, predict_gam_dimension_mismatch_message, row_mismatch_message};
 
     // -----------------------------------------------------------------------
     // inf_norm
@@ -2086,7 +1982,9 @@ mod certified_log_det_tests {
         let largest = values.iter().copied().fold(0.0_f64, f64::max);
         let dim = matrix.nrows();
         (dim * dim) as f64 * accumulation_growth(3 * dim + 1) * largest / smallest
-            + accumulation_growth(2 * dim) * dim as f64 * smallest.ln().abs().max(largest.ln().abs())
+            + accumulation_growth(2 * dim)
+                * dim as f64
+                * smallest.ln().abs().max(largest.ln().abs())
     }
 
     #[test]
@@ -2122,32 +2020,5 @@ mod certified_log_det_tests {
             (raised_log_det - raised_reference).abs() <= raised_band,
             "raised log|A| {raised_log_det:e} against ln 67.015625 = {raised_reference:e}, band {raised_band:e}"
         );
-    }
-}
-
-#[cfg(test)]
-mod kahan_sum_tests {
-    use super::KahanSum;
-
-    #[test]
-    fn kahan_sum_keeps_the_running_sum_under_a_larger_addend() {
-        // Plain Kahan compensation returns 0 for this sequence; the exact sum is 2.
-        let mut sum = KahanSum::default();
-        for value in [1.0, 1e100, 1.0, -1e100] {
-            sum.add(value);
-        }
-        assert_eq!(sum.sum(), 2.0);
-    }
-
-    #[test]
-    fn kahan_sum_folds_the_final_compensation_into_its_total() {
-        // The last addition cancels the running sum, so the exact total 2^-60 lives only in the
-        // compensation; a total read off the running sum alone returns 0.
-        let tiny = 2.0_f64.powi(-60);
-        let mut sum = KahanSum::default();
-        for value in [1.0, tiny, -1.0] {
-            sum.add(value);
-        }
-        assert_eq!(sum.sum(), tiny);
     }
 }

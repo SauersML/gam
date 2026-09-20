@@ -73,7 +73,9 @@ pub enum JointNewtonTerminalReason {
     /// The joint Hessian source carried a non-finite entry at `cycle`, after
     /// the solve had moved β (gam#1088), so the penalized Hessian and its
     /// spectrum are degenerate and no certificate exists at this iterate.
-    NonFiniteCurvature { cycle: usize },
+    NonFiniteCurvature {
+        cycle: usize,
+    },
     /// The inner state went non-finite (the gam#554 divergence guard). The
     /// three values are carried as they stood, so the message names which of
     /// them diverged.
@@ -125,7 +127,10 @@ pub enum ConstrainedFixedPointCondition {
         objective_floor: f64,
     },
     /// The scalar Newton model's relative error exceeds its bound.
-    ModelInexact { scalar_model_relerr: f64, bound: f64 },
+    ModelInexact {
+        scalar_model_relerr: f64,
+        bound: f64,
+    },
     /// The accepted step is not finite or exceeds the stationarity tolerance.
     StepAboveTolerance {
         accepted_step_inf: f64,
@@ -374,21 +379,6 @@ impl std::fmt::Display for ConstrainedFixedPointCondition {
     }
 }
 
-/// The blockwise inner loop's terminal decision variables — the quantities its
-/// convergence verdict is actually taken on.
-///
-/// The loop certifies with
-/// `max_accepted_step <= step_tol && objective_change <= objective_tol`, and then
-/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Reporting only the
-/// cycle count cannot say which of those four conjuncts failed, and they have
-/// different causes: steps still large means the solve needs more cycles, steps
-/// tiny with `joint_stationarity_ok == false` means the exact joint gate is the
-/// blocker rather than the budget, and an `objective_change` above tolerance
-/// means the iterate is still moving. This is deliberately NOT a KKT residual:
-/// `BlockwiseInnerResult::kkt_residual` is `None` off a converged iterate on
-/// purpose, because no caller may trust an IFT correction there, so the honest
-/// diagnostic is the decision variables themselves rather than a residual
-/// recomputed at a non-KKT point.
 /// The stationarity residual denominated the way its own gate denominates it.
 ///
 /// The inner joint-Newton gate is `R ≤ inner_tol · (1 + scale)` with
@@ -425,6 +415,28 @@ pub fn relative_stationarity(stationarity_residual: f64, stationarity_scale: f64
     stationarity_residual / (1.0 + stationarity_scale)
 }
 
+/// An inner loop's terminal decision variables — the quantities its
+/// convergence verdict is actually taken on.
+///
+/// The loop certifies with
+/// `max_accepted_step <= step_tol && objective_change <= objective_tol`, and then
+/// `joint_stationarity_ok || max_proposed_step <= step_tol`. Here
+/// `joint_stationarity_ok` is `true` only for a joint residual that was
+/// MEASURED and passed (a family without exact joint curvature measures none,
+/// so it is `false` there), and `max_proposed_step` is the block updates'
+/// step BEFORE trust-region truncation, which vanishes exactly at a fixed
+/// point of the block map. The truncated step is not reported: a collapsed
+/// trust radius drives it to zero at a non-stationary iterate. Reporting only
+/// the cycle count cannot say which of those four conjuncts failed, and they
+/// have different causes: steps still large means the solve needs more cycles,
+/// accepted steps tiny while the proposed step is large means the line search
+/// or trust region stalled short of a stationary point, and an
+/// `objective_change` above tolerance means the iterate is still moving.
+/// This is deliberately NOT a KKT residual:
+/// `BlockwiseInnerResult::kkt_residual` is `None` off a converged iterate on
+/// purpose, because no caller may trust an IFT correction there, so the honest
+/// diagnostic is the decision variables themselves rather than a residual
+/// recomputed at a non-KKT point.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InnerConvergenceTerminalState {
     /// The blockwise Gauss-Seidel route's terminal cycle.
@@ -552,9 +564,9 @@ impl std::fmt::Display for InnerConvergenceTerminalState {
 /// residual is 4e5x its tolerance" call for different next steps.
 fn render_projected_kkt_comparison(residual: Option<f64>, tol: Option<f64>) -> String {
     match (residual, tol) {
-        (Some(residual), Some(tol)) => format!(
-            "projected KKT residual |r|_inf={residual:.6e} against tol={tol:.6e}"
-        ),
+        (Some(residual), Some(tol)) => {
+            format!("projected KKT residual |r|_inf={residual:.6e} against tol={tol:.6e}")
+        }
         (Some(residual), None) => format!(
             "projected KKT residual |r|_inf={residual:.6e}; \
              no stationarity tolerance was recorded to compare it against"
@@ -1692,9 +1704,11 @@ impl CustomFamilyError {
     #[must_use]
     pub fn fit_ended_without_certified_inner_mode(refusal: CustomFamilyError) -> CustomFamilyError {
         match refusal {
-            refusal @ Self::InnerSolveNotConverged { .. } => Self::FitEndedWithoutCertifiedInnerMode {
-                refusal: Box::new(refusal),
-            },
+            refusal @ Self::InnerSolveNotConverged { .. } => {
+                Self::FitEndedWithoutCertifiedInnerMode {
+                    refusal: Box::new(refusal),
+                }
+            }
             other => other,
         }
     }

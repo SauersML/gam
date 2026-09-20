@@ -848,7 +848,11 @@ pub fn ring_permutation_evidence(
     };
     let mut exceed = 0usize;
     let mut drawn = 0usize;
-    let (mut sum_r, mut sum_r2) = (0.0_f64, 0.0_f64);
+    // Null moments accumulated CENTRED (Welford): each increment
+    // `(r − m_old)(r − m_new)` is a product of two same-signed factors because
+    // the rounded running mean stays between `m_old` and `r`, so the spread is
+    // `≥ 0` by construction and needs no clamp (#4086 sibling).
+    let (mut mk, mut centred_r2) = (0.0_f64, 0.0_f64);
     for _draw in 0..replicates {
         for i in (1..n).rev() {
             let j = (next() % (i as u64 + 1)) as usize;
@@ -860,17 +864,17 @@ pub fn ring_permutation_evidence(
             .map(|(x, y)| x * y)
             .sum();
         let r = rho_of(cross);
-        sum_r += r;
-        sum_r2 += r * r;
         drawn += 1;
+        let before = r - mk;
+        mk += before / drawn as f64;
+        centred_r2 += before * (r - mk);
         if cross <= cross_obs {
             exceed = 1;
             break;
         }
     }
     let df = drawn as f64;
-    let mk = sum_r / df;
-    let sk = (sum_r2 / df - mk * mk).max(0.0).sqrt();
+    let sk = (centred_r2 / df).sqrt();
     let e_value = if exceed == 0 {
         replicates as f64 + 1.0
     } else {

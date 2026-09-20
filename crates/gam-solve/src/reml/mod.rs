@@ -4753,6 +4753,17 @@ pub(crate) struct FirthDirection {
     pub(crate) b_uvec: Array1<f64>,
 }
 
+/// Shared contractions of `D H_φ[u]` against one symmetric `Π`, built by
+/// `FirthDenseOperator::hphi_direction_trace_kernel`.
+pub(crate) struct FirthHphiTraceKernel {
+    /// `ℓ = diag(X Π Xᵀ)`.
+    pub(crate) leverage: Array1<f64>,
+    /// `v = ((M⊙M)⊙(X Π Xᵀ)) w'`.
+    pub(crate) hadamard_w1: Array1<f64>,
+    /// `R = Zᵀ diag(w') (M⊙X Π Xᵀ) diag(w') Z` in reduced coordinates.
+    pub(crate) reduced: Array2<f64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthTauPartialKernel {
     pub(super) deta_partial: Array1<f64>,
@@ -4950,9 +4961,6 @@ pub(crate) struct EvalShared {
     pub(crate) h_total: Arc<Array2<f64>>,
     pub(crate) sparse_exact: Option<Arc<SparseExactEvalData>>,
     pub(crate) firth_dense_operator: Option<Arc<FirthDenseOperator>>,
-    /// Cached FirthDenseOperator built from the original (non-reparameterized)
-    /// design matrix, for use by the sparse evaluation path.
-    pub(crate) firth_dense_operator_original: Option<Arc<FirthDenseOperator>>,
     /// The ONE original-frame penalty pseudo-logdet factorization for this
     /// evaluation point (#931 atom discipline). `log|Σ λ_k S_k|₊`'s VALUE,
     /// ρ-derivatives, τ/ψ components, and ρ×τ cross blocks are all
@@ -5751,6 +5759,33 @@ impl RemlArena {
             inner_pirls_solve_count: AtomicU64::new(0),
             lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
+    }
+
+    /// Run post-convergence work without charging it to the search.
+    ///
+    /// `outer_cost_evals` and `inner_pirls_solves` report the work the
+    /// smoothing-parameter search did (#1575), and work guards read them as
+    /// such. Inference run at the converged `ρ̂` afterwards (the #938 Tier-0
+    /// diagnostic and the tiers it selects) evaluates the same criterion, so
+    /// both counters are put back to their values at entry once it returns: a
+    /// fit that requests that inference reports the same search as one that
+    /// does not.
+    pub(crate) fn without_charging_the_search<T>(&self, work: impl FnOnce() -> T) -> T {
+        let cost_evals = *self
+            .cost_eval_count
+            .read()
+            .expect("cost-eval counter lock is never held across a panic");
+        let inner_solves = self
+            .inner_pirls_solve_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = work();
+        *self
+            .cost_eval_count
+            .write()
+            .expect("cost-eval counter lock is never held across a panic") = cost_evals;
+        self.inner_pirls_solve_count
+            .store(inner_solves, std::sync::atomic::Ordering::Relaxed);
+        result
     }
 }
 

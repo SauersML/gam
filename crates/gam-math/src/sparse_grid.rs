@@ -48,7 +48,10 @@ pub struct SmolyakBounds {
 pub struct SmolyakIndexOverflow;
 
 /// The composition totals of isotropic Smolyak `level` in `rank` directions.
-pub fn isotropic_smolyak_bounds(rank: usize, level: usize) -> Result<SmolyakBounds, SmolyakIndexOverflow> {
+pub fn isotropic_smolyak_bounds(
+    rank: usize,
+    level: usize,
+) -> Result<SmolyakBounds, SmolyakIndexOverflow> {
     let q = rank.checked_add(level).ok_or(SmolyakIndexOverflow)?;
     let lower_total = q.saturating_sub(rank.saturating_sub(1)).max(rank);
     Ok(SmolyakBounds { q, lower_total })
@@ -79,8 +82,8 @@ where
     let mut indices = vec![1usize; rank];
     for total in bounds.lower_total..=bounds.q {
         let alternating_power = bounds.q - total;
-        let mut coefficient =
-            binomial_as_f64(rank - 1, alternating_power).map_err(SmolyakLevelError::BinomialOverflow)?;
+        let mut coefficient = binomial_as_f64(rank - 1, alternating_power)
+            .map_err(SmolyakLevelError::BinomialOverflow)?;
         if alternating_power % 2 == 1 {
             coefficient = -coefficient;
         }
@@ -115,7 +118,15 @@ where
     let maximum_here = remaining.saturating_sub(dimensions_left - 1);
     for index in 1..=maximum_here {
         indices[position] = index;
-        stream_compositions(rules, position + 1, remaining - index, indices, coefficient, z, visit)?;
+        stream_compositions(
+            rules,
+            position + 1,
+            remaining - index,
+            indices,
+            coefficient,
+            z,
+            visit,
+        )?;
     }
     Ok(())
 }
@@ -278,5 +289,29 @@ mod tests {
         assert_eq!(moments[0], 0.0);
         assert_eq!(moments[1].to_bits(), owner.value().to_bits());
         assert_eq!(mass.to_bits(), owner.value().to_bits());
+    }
+
+    #[test]
+    fn compensated_total_retains_final_cancellation_error() {
+        let tiny = 2.0_f64.powi(-60);
+        let mut total = CompensatedSum::default();
+        for value in [1.0, tiny, -1.0] {
+            total.add(value);
+        }
+        assert_eq!(total.value(), tiny);
+    }
+
+    #[test]
+    fn copied_accumulator_keeps_compensation_and_reset_clears_it() {
+        let mut total = CompensatedSum::default();
+        total.add(2.0_f64.powi(60));
+        total.add(1.0);
+        let mut copied = total;
+        copied.add(-2.0_f64.powi(60));
+        assert_eq!(copied.value(), 1.0);
+        total = CompensatedSum::default();
+        total.add(3.0);
+        assert_eq!(total.value(), 3.0);
+        assert_eq!(copied.value(), 1.0);
     }
 }
