@@ -651,12 +651,12 @@ impl ResponseManifold {
                 }
                 let y_norm = y_sq.sqrt();
                 let s = k.sqrt() * y_norm;
-                // `log_0` clamps `s` at `1 − BOUNDARY_EPS`: past it the returned
-                // logarithm is shortened, not rounded, and no band covers it.
-                if s >= 1.0 - crate::manifolds::poincare::BOUNDARY_EPS {
+                // `log_0` is exact on the whole open ball, and the radial slope
+                // `1/(1 − s²)` below carries its conditioning toward the rim. A
+                // shifted point on the rim to precision has no logarithm to band.
+                if !(s < 1.0) {
                     return Err(GeometryError::Singular(
-                        "Poincaré logarithm clamped at the ball boundary: the target lies beyond \
-                         the distance the base can resolve",
+                        "Poincaré logarithm target lies on the ball boundary to precision",
                     ));
                 }
                 let magnitudes = (1.0 + 2.0 * k * uv.abs() + k * vv) * uu.sqrt()
@@ -2445,27 +2445,49 @@ mod tests {
         );
     }
 
-    /// Past `√k·|(−p) ⊕ x| = 1 − BOUNDARY_EPS` the Poincaré logarithm is
-    /// clamped: it returns a shortened tangent, not a rounded one, so a Karcher
-    /// field built from it has zeros that are not the mean. A cloud with rows
-    /// beyond that horizon of the seed must be refused, never certified. A
-    /// dispersion-only descent stalled on this cloud at `‖ξ‖ = 3.7e-2` until its
-    /// iteration budget ran out.
+    /// The Poincaré logarithm is exact on the whole open ball, so two points
+    /// farther apart than `2·artanh(1 − BOUNDARY_EPS)` (the former log clamp's
+    /// horizon, where the mean used to be refused) have their geodesic
+    /// midpoint as the certified Fréchet mean: equidistant from both, to the
+    /// Karcher residual and the rim's conditioning.
     #[test]
-    fn poincare_cloud_beyond_the_log_clamp_is_refused_not_certified() {
+    fn poincare_mean_of_points_beyond_the_former_log_clamp_is_their_midpoint() {
         let manifold = ResponseManifold::Poincare {
             dim: 2,
             curvature: -1.0,
         };
-        let mut base = Array1::<f64>::zeros(2);
-        base[0] = 0.3;
-        let values = exp_cloud(manifold, base.view(), 2000, 3.0, 1008);
-        match response_frechet_mean(manifold, values.view(), None) {
-            Err(GeometryError::Singular(message)) => {
-                assert!(message.contains("clamped at the ball boundary"), "{message}");
-            }
-            other => panic!("expected the clamped cloud to be refused, got {other:?}"),
-        }
+        let gap = 1.0e-7;
+        let values = array![[1.0 - gap, 0.0], [-0.5, 0.0]];
+        let mean = response_frechet_mean(manifold, values.view(), None)
+            .expect("a pair beyond the former clamp horizon has a certified mean");
+        let residual = frechet_residual(manifold, values.view(), mean.view());
+        let band = certified_band(manifold, values.view(), mean.view());
+        assert!(
+            residual <= 3.0 * band,
+            "mean residual {residual:.3e} exceeds 3 x its rounding band {band:.3e}"
+        );
+        let d_far = crate::manifolds::poincare::poincare_distance(mean.view(), values.row(0), -1.0)
+            .expect("distance");
+        let d_near = crate::manifolds::poincare::poincare_distance(mean.view(), values.row(1), -1.0)
+            .expect("distance");
+        let separation = crate::manifolds::poincare::poincare_distance(
+            values.row(0),
+            values.row(1),
+            -1.0,
+        )
+        .expect("distance");
+        assert!(
+            separation > 2.0 * (1.0 - crate::manifolds::poincare::BOUNDARY_EPS).atanh() + 1.0,
+            "the fixture must lie beyond the former clamp horizon: {separation}"
+        );
+        // On the geodesic the two logarithms are `d_far·u` and `−d_near·u`,
+        // so `|d_far − d_near| = 2‖ξ‖`; each distance also reads the far
+        // point's `1 − |x|` to a few `ε/gap`.
+        assert!(
+            (d_far - d_near).abs() <= 2.0 * 3.0 * band + 32.0 * f64::EPSILON / gap,
+            "the mean is not the midpoint: d_far={d_far}, d_near={d_near}"
+        );
+        assert!(mean[1].abs() <= 3.0 * band, "the mean left the geodesic: {mean:?}");
     }
 
     /// The phase-2 stall refusal, forced. The same SPD cloud and seed are
