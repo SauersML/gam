@@ -3164,14 +3164,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
