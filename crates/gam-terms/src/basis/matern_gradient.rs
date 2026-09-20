@@ -165,7 +165,7 @@ impl StreamingMaternBasisGradientEvaluator {
                     let d_log_kappa = matern_log_kappa_derivative(distance, self.nu);
                     row[center_idx] = match target {
                         MaternBasisGradientTarget::LogKappa => d_log_kappa,
-                        MaternBasisGradientTarget::AnisoLogScale(axis) => {
+                        MaternBasisGradientTarget::AnisoLogScale(_) => {
                             if d_log_kappa == 0.0 {
                                 0.0
                             } else {
