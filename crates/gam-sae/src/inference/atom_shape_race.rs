@@ -590,7 +590,7 @@ pub fn run_atom_shape_race(
         },
         PredictiveRaceCandidate {
             kind: candidate_kinds[2],
-            bic_half: mixture_winner.bic,
+            bic_half: -mixture_winner.log_evidence,
             certification: EvidenceCertification::Exact,
             // The displayed/reported k is the full-data final fit. Its outer-CV
             // predictive column independently selects k on each training fold,

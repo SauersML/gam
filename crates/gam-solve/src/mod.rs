@@ -68,8 +68,8 @@ pub mod warm_start_artifact;
 pub mod warm_start_transfer;
 
 pub use evidence::{
-    CircularGaussianFit2d, GaussianMixtureCertificate, GaussianMixtureCheckpoint,
-    GaussianMixtureConfig, GaussianMixtureFit, RingGaussianMixtureFit,
+    CircularGaussianFit2d, GaussianMixtureCertificate, GaussianMixtureConfig, GaussianMixtureFit,
+    RingGaussianMixtureFit,
     StackingCertificate, StackingCheckpoint, StackingConfig, StackingError, StackingWeights,
     TopologyScoreScale, UnionStructure, solve_stacking_weights,
 };
