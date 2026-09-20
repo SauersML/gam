@@ -233,6 +233,7 @@ impl SurvivalPredictionCovarianceMode {
 }
 
 /// Inputs to the unified survival predict pipeline.
+#[derive(Clone, Copy)]
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
     pub data: ArrayView2<'a, f64>,
