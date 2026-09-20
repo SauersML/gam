@@ -948,6 +948,33 @@ pub(crate) enum MarginalSlopeCovarianceRef<'a> {
 }
 
 impl MarginalSlopeCovariance {
+    /// Absorb the covariance into a persistent warm-start key (#3697). The
+    /// full storage's square-root factor and `1ᵀΣ1` are functions of the
+    /// covariance, so the covariance itself is the identity.
+    pub(crate) fn fingerprint_into(&self, hasher: &mut gam_runtime::warm_start::Fingerprinter) {
+        let Self {
+            storage,
+            ones_quadratic_form: _,
+        } = self;
+        match storage {
+            MarginalSlopeCovarianceStorage::Diagonal { covariance } => {
+                hasher.write_str("diagonal");
+                hasher.write_f64_array1(covariance);
+            }
+            MarginalSlopeCovarianceStorage::Full {
+                covariance,
+                square_root_factor: _,
+            } => {
+                hasher.write_str("full");
+                hasher.write_f64_array2(covariance);
+            }
+            MarginalSlopeCovarianceStorage::LowRank { factor } => {
+                hasher.write_str("low-rank");
+                hasher.write_f64_array2(factor);
+            }
+        }
+    }
+
     pub fn diagonal(covariance: Array1<f64>) -> Result<Self, String> {
         if covariance.is_empty() {
             return Err("marginal-slope diagonal covariance is empty".to_string());

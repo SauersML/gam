@@ -65,6 +65,66 @@ impl SurvivalMarginalSlopeFamilyHyperState {
         })
     }
 
+    /// Absorb the family-owned hyper coordinates into a persistent warm-start
+    /// key (#3697): the role map, the realized coordinate values and the whole
+    /// baseline offset geometry. The geometry's `baseline_config` is the recipe
+    /// its arrays were evaluated from at `theta`; it reaches the family only
+    /// through those arrays, which are hashed value by value.
+    pub(crate) fn fingerprint_into(&self, hasher: &mut gam_runtime::warm_start::Fingerprinter) {
+        let Self {
+            baseline_axis_count,
+            log_sigma_axis,
+            family_values,
+            baseline_geometry,
+        } = self;
+        hasher.write_usize(*baseline_axis_count);
+        match log_sigma_axis {
+            None => hasher.write_bool(false),
+            Some(axis) => {
+                hasher.write_bool(true);
+                hasher.write_usize(*axis);
+            }
+        }
+        hasher.write_f64_array1(family_values);
+        let Some(geometry) = baseline_geometry else {
+            hasher.write_bool(false);
+            return;
+        };
+        hasher.write_bool(true);
+        let crate::survival::construction::SurvivalMarginalSlopeOffsetGeometry {
+            baseline_config: _,
+            theta,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+            offset_entry_theta_first,
+            offset_exit_theta_first,
+            derivative_offset_exit_theta_first,
+            offset_entry_theta_second,
+            offset_exit_theta_second,
+            derivative_offset_exit_theta_second,
+        } = geometry.as_ref();
+        hasher.write_f64_array1(theta);
+        hasher.write_f64_array1(offset_entry);
+        hasher.write_f64_array1(offset_exit);
+        hasher.write_f64_array1(derivative_offset_exit);
+        hasher.write_f64_array2(offset_entry_theta_first);
+        hasher.write_f64_array2(offset_exit_theta_first);
+        hasher.write_f64_array2(derivative_offset_exit_theta_first);
+        for second in [
+            offset_entry_theta_second,
+            offset_exit_theta_second,
+            derivative_offset_exit_theta_second,
+        ] {
+            for &extent in second.shape() {
+                hasher.write_usize(extent);
+            }
+            for &value in second.iter() {
+                hasher.write_f64(value);
+            }
+        }
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.baseline_axis_count + usize::from(self.log_sigma_axis.is_some())
     }
@@ -208,6 +268,127 @@ pub(crate) struct SurvivalMarginalSlopeFamily {
 }
 
 impl SurvivalMarginalSlopeFamily {
+    /// Fingerprint of everything that defines this family's penalized inner
+    /// objective, for the persistent warm-start key (#3697). A key hit returns
+    /// the cached mode, log-likelihood and log-determinants without
+    /// re-evaluating them, so any field that changes the likelihood and is
+    /// missing here serves one model's evidence to another.
+    ///
+    /// The family is destructured exhaustively: a field added later is a
+    /// compile error here until it is either hashed or named as not part of
+    /// the likelihood. The two fields ignored are solver scratch, not model:
+    /// the intercept warm starts only seed the calibration root, which is
+    /// solved to convergence regardless, and the jet arenas are memory pools.
+    pub(crate) fn likelihood_fingerprint(&self) -> Result<String, String> {
+        use gam_custom_family::hash_cf_design_matrix;
+        let Self {
+            n,
+            event,
+            weights,
+            z,
+            score_covariance,
+            gaussian_frailty_sd,
+            family_hyper,
+            derivative_guard,
+            design_entry,
+            design_exit,
+            design_derivative_exit,
+            offset_entry,
+            offset_exit,
+            derivative_offset_exit,
+            entry_at_origin,
+            marginal_design,
+            slope_layout,
+            score_warp,
+            link_dev,
+            influence_absorber,
+            time_linear_constraints,
+            time_wiggle_knots,
+            time_wiggle_degree,
+            time_wiggle_ncols,
+            intercept_warm_starts: _,
+            flex_jet_arenas: _,
+            jeffreys_armed,
+            latent_law,
+        } = self;
+        let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
+        hasher.write_str("survival-marginal-slope-family");
+        hasher.write_usize(*n);
+        hasher.write_f64_array1(event);
+        hasher.write_f64_array1(weights);
+        hasher.write_f64_array2(z);
+        score_covariance.fingerprint_into(&mut hasher)?;
+        match gaussian_frailty_sd {
+            Some(value) => {
+                hasher.write_bool(true);
+                hasher.write_f64(*value);
+            }
+            None => hasher.write_bool(false),
+        }
+        family_hyper.fingerprint_into(&mut hasher);
+        hasher.write_f64(*derivative_guard);
+        hash_cf_design_matrix(&mut hasher, design_entry)?;
+        hash_cf_design_matrix(&mut hasher, design_exit)?;
+        hash_cf_design_matrix(&mut hasher, design_derivative_exit)?;
+        hasher.write_f64_array1(offset_entry);
+        hasher.write_f64_array1(offset_exit);
+        hasher.write_f64_array1(derivative_offset_exit);
+        hasher.write_usize(entry_at_origin.len());
+        for &at_origin in entry_at_origin.iter() {
+            hasher.write_bool(at_origin);
+        }
+        hash_cf_design_matrix(&mut hasher, marginal_design)?;
+        slope_layout.fingerprint_into(&mut hasher)?;
+        for deviation in [score_warp, link_dev] {
+            match deviation {
+                Some(runtime) => {
+                    hasher.write_bool(true);
+                    runtime.fingerprint_into(&mut hasher);
+                }
+                None => hasher.write_bool(false),
+            }
+        }
+        match influence_absorber {
+            Some(columns) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array2(columns);
+            }
+            None => hasher.write_bool(false),
+        }
+        match time_linear_constraints {
+            Some(LinearInequalityConstraints { a, b }) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array2(a);
+                hasher.write_f64_array1(b);
+            }
+            None => hasher.write_bool(false),
+        }
+        match time_wiggle_knots {
+            Some(knots) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array1(knots);
+            }
+            None => hasher.write_bool(false),
+        }
+        match time_wiggle_degree {
+            Some(degree) => {
+                hasher.write_bool(true);
+                hasher.write_usize(*degree);
+            }
+            None => hasher.write_bool(false),
+        }
+        hasher.write_usize(*time_wiggle_ncols);
+        hasher.write_bool(*jeffreys_armed);
+        match latent_law {
+            Some(law) => {
+                hasher.write_bool(true);
+                law.fingerprint_into(&mut hasher)?;
+            }
+            None => hasher.write_bool(false),
+        }
+        Ok(hasher.finish_hex())
+    }
+
     /// The weight of the row's entry survival factor `log Φ(−η₀)`: the row's
     /// prior weight for a delayed entry, `0` for an entry at the time origin.
     #[inline]

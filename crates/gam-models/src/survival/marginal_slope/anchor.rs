@@ -97,6 +97,38 @@ impl SurvivalLatentLaw {
         }
     }
 
+    /// Absorb the declared law into a persistent warm-start key (#3697). A
+    /// scalar law's grids are materialised from `kind` alone by
+    /// [`Self::from_kind`], so `kind` pins them; a joint law carries its own
+    /// runtime, which is hashed. The root cache is solver state, not law.
+    pub(crate) fn fingerprint_into(
+        &self,
+        hasher: &mut gam_runtime::warm_start::Fingerprinter,
+    ) -> Result<(), String> {
+        let Self {
+            kind,
+            grids,
+            roots: _,
+        } = self;
+        let bytes = serde_json::to_vec(kind).map_err(|error| {
+            format!("survival latent law fingerprint serialization failed: {error}")
+        })?;
+        hasher.write_usize(bytes.len());
+        hasher.write_bytes(&bytes);
+        match grids {
+            LawGrids::Global(_) => hasher.write_str("global"),
+            LawGrids::PerRow(grids) => {
+                hasher.write_str("per-row");
+                hasher.write_usize(grids.len());
+            }
+            LawGrids::Joint(runtime) => {
+                hasher.write_str("joint");
+                runtime.fingerprint_into(hasher);
+            }
+        }
+        Ok(())
+    }
+
     /// The joint law, when this is one.
     #[inline]
     pub(crate) fn joint(&self) -> Option<&super::JointLatentLawRuntime> {

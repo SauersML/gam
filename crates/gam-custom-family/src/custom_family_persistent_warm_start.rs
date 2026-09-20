@@ -323,7 +323,11 @@ pub(crate) fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-pub(crate) fn hash_cf_design_matrix(
+/// Absorb a design into a persistent warm-start key: its shape and every
+/// value, read in bounded row chunks so an operator-backed design is never
+/// densified whole. Public so a family's `persistent_warm_start_fingerprint`
+/// hashes its own designs under the same rule the block specs use (#3697).
+pub fn hash_cf_design_matrix(
     hasher: &mut Fingerprinter,
     design: &DesignMatrix,
 ) -> Result<(), String> {

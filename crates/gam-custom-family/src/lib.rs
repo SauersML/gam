@@ -196,6 +196,7 @@ pub(crate) use penalty_labels::*;
 pub use self::psi_design::*;
 pub use psi_hyper::*;
 pub use warm_start::*;
+pub use custom_family_persistent_warm_start::hash_cf_design_matrix;
 
 #[cfg(test)]
 mod jeffreys_arming_979_tests;

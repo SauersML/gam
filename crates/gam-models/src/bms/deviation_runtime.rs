@@ -375,6 +375,72 @@ pub(crate) fn build_quadratic_derivative_bernstein_constraints(
 }
 
 impl DeviationRuntime {
+    /// Absorb the deviation basis into a persistent warm-start key (#3697):
+    /// every span table, the monotonicity rows and floor, the boundary row and
+    /// the installed cross-block anchor. Destructured exhaustively, so a field
+    /// added later cannot silently escape the key.
+    pub(crate) fn fingerprint_into(&self, hasher: &mut gam_runtime::warm_start::Fingerprinter) {
+        let Self {
+            degree,
+            value_span_degree,
+            basis_dim,
+            monotonicity_eps,
+            endpoint_points,
+            span_c0,
+            span_c1,
+            span_c2,
+            span_c3,
+            monotonicity_constraint_rows,
+            right_boundary_value_row,
+            installed_flex_block,
+            anchor_rows_at_training,
+        } = self;
+        hasher.write_usize(*degree);
+        hasher.write_usize(*value_span_degree);
+        hasher.write_usize(*basis_dim);
+        hasher.write_f64(*monotonicity_eps);
+        hasher.write_f64_array1(endpoint_points);
+        hasher.write_f64_array2(span_c0);
+        hasher.write_f64_array2(span_c1);
+        hasher.write_f64_array2(span_c2);
+        hasher.write_f64_array2(span_c3);
+        hasher.write_f64_array2(monotonicity_constraint_rows);
+        hasher.write_f64_array1(right_boundary_value_row);
+        match installed_flex_block {
+            None => hasher.write_bool(false),
+            Some(InstalledFlexBlock {
+                anchor_correction,
+                anchor_components,
+            }) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array2(anchor_correction);
+                hasher.write_usize(anchor_components.len());
+                for component in anchor_components {
+                    match component {
+                        AnchorComponentTag::Parametric { block, ncols } => {
+                            hasher.write_str(match block {
+                                ParametricAnchorBlock::Marginal => "parametric-marginal",
+                                ParametricAnchorBlock::Slope => "parametric-slope",
+                            });
+                            hasher.write_usize(*ncols);
+                        }
+                        AnchorComponentTag::FlexEvaluation { ncols } => {
+                            hasher.write_str("flex-evaluation");
+                            hasher.write_usize(*ncols);
+                        }
+                    }
+                }
+            }
+        }
+        match anchor_rows_at_training {
+            None => hasher.write_bool(false),
+            Some(rows) => {
+                hasher.write_bool(true);
+                hasher.write_f64_array2(rows);
+            }
+        }
+    }
+
     /// Rehydrate the exact post-compilation cubic tables carried by a saved
     /// model for likelihood replay.
     ///
