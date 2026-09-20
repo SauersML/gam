@@ -1312,7 +1312,12 @@ pub(crate) fn realize_smooth_collection_gauge(
         termname,
     )?;
     let projector = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?;
-    let (design, row_space_correction) = projector.project_design(design, termname)?;
+    let row_space_correction = projector.row_space_correction(&design, termname)?;
+    // `X·T0 − C·R` through the one operator the predict-time replay also uses
+    // (`apply_global_smooth_identifiability`'s frozen-chart arm), so a saved
+    // model evaluates the fit's own product rather than a reassociated one.
+    let design =
+        subtract_row_space_correction(design, block, row_space_correction.view(), termname)?;
     let residualization = crate::basis::ParametricResidualization {
         coefficient_transform: coefficient_transform.clone(),
         row_space_correction,
@@ -1423,6 +1428,9 @@ pub fn place_term_in_collection_gauge(
         owner_terms: gauge.owner_terms.clone(),
         has_parametric_block: gauge.has_parametric_block,
         correction: realized.residualization.row_space_correction.clone(),
+        coefficient_transform: realized.coefficient_transform.clone(),
+        local_identifiability_transform: gauge.local_identifiability_transform.clone(),
+        joint_null_rotation: joint_null_rotation.cloned(),
     });
     Ok(CollectionGaugedTerm {
         design: realized.design,
@@ -2075,6 +2083,22 @@ fn apply_global_smooth_identifiability(
                     );
                 }
                 Some(z.clone())
+            } else if let Some(chart) = replay_correction
+                .filter(|_| chart_replays_in_local_chart(&termspec.basis, &term.metadata))
+            {
+                // The frozen spec rebuilt the basis in its term-local chart and
+                // the aggregation loop applied the persisted `Q`, so `T0` is
+                // applied here, on its own, exactly as the fit applied it
+                // (#3001).
+                if design_local.ncols() != chart.coefficient_transform.nrows() {
+                    gam_problem::bail_dim_basis!(
+                        "frozen collection chart mismatch for term '{}': rebuilt design has {} columns but the persisted fit-time coefficient chart has {} rows",
+                        term.name,
+                        design_local.ncols(),
+                        chart.coefficient_transform.nrows()
+                    );
+                }
+                Some(chart.coefficient_transform.clone())
             } else if skip_global_transform {
                 None
             } else {
@@ -2131,10 +2155,7 @@ fn apply_global_smooth_identifiability(
         // Factor-smooth kinds cannot absorb the realized transform into their
         // metadata (see the export below). Every other kind's placed metadata is
         // the chart its penalties live in.
-        let absorbs_realized_transform = !matches!(
-            &termspec.basis,
-            SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. }
-        );
+        let absorbs_realized_transform = basis_absorbs_collection_chart(&termspec.basis);
         let placed_metadata = if absorbs_realized_transform {
             with_identifiability_transform(&term.metadata, realized_transform.as_ref())?
         } else {
@@ -2176,6 +2197,11 @@ fn apply_global_smooth_identifiability(
                 owner_terms: owner_indices.clone(),
                 has_parametric_block: parametric_block.is_some(),
                 correction: plan.row_space_correction.clone(),
+                coefficient_transform: plan.coefficient_transform.clone(),
+                local_identifiability_transform: collection_gauge
+                    .as_ref()
+                    .and_then(|gauge| gauge.local_identifiability_transform.clone()),
+                joint_null_rotation: term.joint_null_rotation.clone(),
             })
             .or_else(|| replay_correction.cloned());
         local_collection_gauge[idx] = collection_gauge;

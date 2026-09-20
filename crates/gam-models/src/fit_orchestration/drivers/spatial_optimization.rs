@@ -2911,64 +2911,6 @@ fn freeze_geometry_from_metadata(
     }
 }
 
-/// Put a replay spec's identifiability back to the TERM-LOCAL chart the
-/// collection gauge was derived on (gam#2760).
-///
-/// Used for exactly one thing: a term whose collection applied a
-/// [`gam_terms::smooth::SmoothCollectionGauge`], whose `(T, R)` pair is re-derived
-/// at every ψ rebuild and must therefore not ALSO arrive frozen inside the spec.
-/// `Some(z)` replays the term's own chart verbatim (a center sum-to-zero frame,
-/// a linear-orthogonality frame, a caller's frozen chart — all ψ-independent);
-/// `None` states that the local build applied none, which is the radial families'
-/// ordinary case, where `OrthogonalToParametric` defers to the gauge entirely.
-///
-/// Only the families the spatial outer search rebuilds are listed. A gauged term
-/// of any other family is never re-realized by this realizer, so its replay spec
-/// is left exactly as the freeze wrote it.
-fn restore_local_identifiability_chart(
-    replay: &mut SmoothBasisSpec,
-    local_chart: Option<&Array2<f64>>,
-) {
-    let spatial = |chart: Option<&Array2<f64>>| match chart {
-        Some(transform) => SpatialIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        },
-        None => SpatialIdentifiability::None,
-    };
-    if let SmoothBasisSpec::Duchon { spec, .. } = &mut *replay {
-        spec.identifiability = spatial(local_chart);
-    }
-    if let SmoothBasisSpec::ThinPlate { spec, .. } = &mut *replay {
-        spec.identifiability = spatial(local_chart);
-    }
-    if let SmoothBasisSpec::Matern { spec, .. } = &mut *replay {
-        spec.identifiability = match local_chart {
-            Some(transform) => MaternIdentifiability::FrozenTransform {
-                transform: transform.clone(),
-            },
-            None => MaternIdentifiability::None,
-        };
-    }
-    // These two families have no "no chart" policy — their local build always
-    // applies a center sum-to-zero section — so a `None` here would be a claim
-    // the enum cannot express. It is left alone instead of invented, and a
-    // gauged term of theirs whose metadata carried no transform keeps whatever
-    // the freeze wrote (which is that same `CenterSumToZero` default).
-    if let (SmoothBasisSpec::ConstantCurvature { spec, .. }, Some(transform)) =
-        (&mut *replay, local_chart)
-    {
-        spec.identifiability = gam_terms::basis::ConstantCurvatureIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        };
-    }
-    if let (SmoothBasisSpec::MeasureJet { spec, .. }, Some(transform)) = (&mut *replay, local_chart)
-    {
-        spec.identifiability = gam_terms::basis::MeasureJetIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        };
-    }
-}
-
 /// Shape of the frozen radial chart a rebuild spec carries, for diagnostics.
 fn spatial_frozen_radial_chart_shape(termspec: &SmoothTermSpec) -> Option<(usize, usize)> {
     match &termspec.basis {
@@ -3349,17 +3291,16 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // derivatives, and the geometry cache all start from the same centers,
         // scaling, identifiability transform, and penalty topology.
         //
-        // EXCEPT the half a collection GAUGE owns (gam#2760). The gauge carries
-        // the fixed row space `C` AND the fixed reference coefficient chart
-        // `T0`; a moving-psi value is represented canonically as
-        // `P_C X_local(psi) T0`. The freeze above writes the metadata's composed
-        // `z_local*T0` into the replay spec. Leaving that composition in place
-        // would apply `T0` once in the local rebuild and once again when the
-        // gauge performs its fixed-chart placement.
+        // A term the collection GAUGED (gam#2760) is frozen in its TERM-LOCAL
+        // chart `z_local` with the fit's `Q`, and its collection chart carries
+        // the fixed `T0` and `C` (#3001), so a moving-psi rebuild represents the
+        // value canonically as `P_C X_local(psi) Q T0`. Freezing the composition
+        // `z_local*Q*T0` instead would apply `T0` once in the local rebuild and
+        // again in the gauge's fixed-chart placement.
         //
         // MEASURED on the `kappa_loop_n_scaling` fixture's own spec
         // (`examples/probe_2760_replay_gauge_double_apply`, 12 centers, n = 600,
-        // one Duchon term, `arm=Delete`, `C = [1]`, replay chart
+        // one Duchon term, `arm=Delete`, `C = [1]`, composed replay chart
         // `FrozenTransform(12, 11)`) — the orthogonality residual of the
         // singly-charted rebuild against the gauge's own block:
         //
@@ -3367,48 +3308,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         //   ℓ = 0.5                   9.0e-1    and stale everywhere else
         //   ℓ = 2.0                   9.5e-1
         //
-        // so the gauge resolves a direction and DELETES one, at every ψ
-        // including the seed. The term then reaches the splice one column short
-        // (11 → 10 against a cached 11) and every κ fixture on a Duchon term
-        // refuses in 0.2 s with `incremental realizer width mismatch`. On the
-        // `Residualize` arm the second application is idempotent (`P² = P`),
-        // which is why the Matérn fixture the gauge work was verified on stayed
-        // green while every Duchon one went red.
-        //
-        // So a gauged term's replay spec is put back into the TERM-LOCAL chart
-        // the fixed `T0` was derived on. The gauge carries both pieces because
-        // the composition in metadata cannot be decomposed after the fact.
-        // Everything else the freeze decides (centers, input scale, radial
-        // chart, penalty topology) is psi-invariant and is kept.
+        // so the gauge resolved a direction and DELETED one, at every ψ
+        // including the seed, and the term reached the splice one column short.
         //
         // The caller's own spec is NOT the source: by the time it reaches this
-        // realizer it has already been frozen at least once upstream, so its
-        // policy is itself a composed transform.
-        let mut spec = freeze_term_collection_from_design(&spec, &design)
+        // realizer it has already been frozen at least once upstream.
+        let spec = freeze_term_collection_from_design(&spec, &design)
             .map_err(|e| format!("failed to freeze incremental replay specification: {e}"))?;
-        for (term_idx, term) in design.smooth.terms.iter().enumerate() {
-            let Some(gauge) = term.collection_gauge.as_ref() else {
-                continue;
-            };
-            let Some(replay) = spec.smooth_terms.get_mut(term_idx) else {
-                continue;
-            };
-            restore_local_identifiability_chart(
-                &mut replay.basis,
-                gauge.local_identifiability_transform.as_ref(),
-            );
-            // The rotation `Q` the collection applied BEFORE it derived `T0`
-            // (gam#2760). The freeze copied the term's own `joint_null_rotation`,
-            // which the collection cleared once it composed `Q·T0` into the
-            // metadata, and the chart restored above is the pre-`Q` one — so
-            // without this the replay put an unrotated block through a chart
-            // derived on the rotated one. The local build honours a persisted
-            // rotation instead of re-deriving one, and
-            // `wrap_local_build_as_realization` applies it before the gauge
-            // applies `T0`: the collection's own order.
-            replay.joint_null_rotation = gauge.joint_null_rotation.clone();
-        }
-        let spec = spec;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
             .map_err(|e| format!("failed to cache fixed term-collection blocks: {e}"))?;
 

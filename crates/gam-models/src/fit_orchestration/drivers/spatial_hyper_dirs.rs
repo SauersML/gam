@@ -107,13 +107,12 @@ fn try_build_spatial_term_log_kappa_derivative(
             // stalled the κ-optimizer at its iteration cap with a large residual
             // gradient (#1122). `double_penalty: false` reproduces the operator
             // triplet exactly (verified: the 2-D iso-κ FD matches to ~1e-9).
-            // The jet is built in the FITTED coefficient chart. The incremental
-            // realizer hands this builder a spec whose identifiability has been
-            // put back into the TERM-LOCAL chart `z_local`
-            // (`restore_local_identifiability_chart`, gam#2760) so that a design
-            // REBUILD can apply the collection gauge's fixed `T0` itself; the
-            // design the criterion is built on lives in the composition
-            // `z_local · T0` the realized term's metadata records. Built on
+            // The jet is built in the FITTED coefficient chart. A frozen gauged
+            // term's spec carries its TERM-LOCAL chart `z_local` (gam#2760,
+            // #3001) so that a design REBUILD applies `Q` and the collection's
+            // fixed `T0` itself; the design the criterion is built on lives in
+            // the composition `z_local · Q · T0` the realized term's metadata
+            // records. Built on
             // `z_local`, the jet has the fitted WIDTH whenever `T0` is square
             // (the Residualize arm), so nothing declines and the ψ-gradient is
             // silently wrong: measured on the #1379 seed-3 fixture, the same θ

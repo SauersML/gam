@@ -4222,13 +4222,12 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
             // double-penalty blocks, or the analytic `tr(S⁺ Ṡ)` desyncs from the
             // FD of the criterion's operator-triplet `log|Sλ|₊` (the iso-axis
             // analogue is handled in `try_build_spatial_term_log_kappa_derivative`).
-            // The jet is built in the FITTED coefficient chart. The incremental
-            // realizer hands this builder a spec whose identifiability has been
-            // put back into the TERM-LOCAL chart `z_local`
-            // (`restore_local_identifiability_chart`, gam#2760) so that a design
-            // REBUILD can apply the collection gauge's fixed `T0` itself; the
-            // design the criterion is built on lives in the composition
-            // `z_local · T0` the realized term's metadata records. Built on
+            // The jet is built in the FITTED coefficient chart. A frozen gauged
+            // term's spec carries its TERM-LOCAL chart `z_local` (gam#2760,
+            // #3001) so that a design REBUILD applies `Q` and the collection's
+            // fixed `T0` itself; the design the criterion is built on lives in
+            // the composition `z_local · Q · T0` the realized term's metadata
+            // records. Built on
             // `z_local`, the jet has the fitted WIDTH whenever `T0` is square
             // (the Residualize arm), so nothing declines and the ψ-gradient is
             // silently wrong: measured on the #1379 seed-3 fixture, the same θ
@@ -4256,13 +4255,11 @@ fn try_build_spatial_term_log_kappa_aniso_derivativeinfos(
         // coordinate layout, zero design drift, and shared candidate
         // normalization are owned by `build_measure_jet_basis_psi_derivatives`.
         //
-        // The chart the jets are built in is the FITTED one. The incremental
-        // realizer hands this builder a spec whose identifiability has been put
-        // back into the TERM-LOCAL chart `z_local` (see
-        // `restore_local_identifiability_chart`, gam#2760) so that a design
-        // REBUILD can apply the collection gauge's fixed `T0` itself. A ψ-jet
-        // must differentiate the design the criterion is built on, and that
-        // design lives in the composition `z_local · T0` the realized term's
+        // The chart the jets are built in is the FITTED one. A frozen gauged
+        // term's spec carries its TERM-LOCAL chart `z_local` (gam#2760, #3001)
+        // so that a design REBUILD applies `Q` and the collection's fixed `T0`
+        // itself. A ψ-jet must differentiate the design the criterion is built
+        // on, and that design lives in the composition `z_local · Q · T0` the realized term's
         // metadata records — the same frozen chart the Duchon arm below replays
         // from its metadata. Built on `z_local` alone, every jet came out
         // `local_columns` wide against a `coeff_range` one gauge rank narrower,

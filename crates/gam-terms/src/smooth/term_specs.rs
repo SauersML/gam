@@ -700,12 +700,19 @@ pub struct SmoothTermSpec {
 }
 
 /// The predict-time replay record of a span-preserving parametric
-/// orthogonalization (#2747): this term's realized block is `X·T − C·R`.
+/// orthogonalization (#2747): this term's realized block is
+/// `((B·z_local)·Q)·T0 − C·R`.
 ///
-/// `T` is not here — it is the ordinary coefficient transform, already absorbed
-/// into the basis metadata, so a rebuilt `design_local` arrives with it applied.
-/// What cannot be absorbed is `R`, because it multiplies the CONSTRAINT block
-/// rather than the basis.
+/// The chart carries every factor of that product, not their composition
+/// (#3001). The fit applies them one at a time — the term-local chart `z_local`
+/// inside the basis build, the joint-null rotation `Q` in the aggregation loop,
+/// then `T0`, then the row-space correction — and floating-point products do not
+/// reassociate. A replay that froze `z_local·Q·T0` into the basis metadata
+/// formed `B·(z_local·Q·T0)` instead, and a saved model's μ and σ drifted from
+/// the fitted ones by an ulp or two on a quarter of the rows. So the frozen spec
+/// keeps the basis in its local chart `z_local`, persists `Q` as the term's
+/// `joint_null_rotation`, and applies `T0` and `−C·R` here, in the fit's order
+/// and through the same operators.
 ///
 /// `R` is TRAINING-ROW data and is never re-derived, for the same reason
 /// `frozen_global_orthogonality` is not (#978): the fit already decided this
@@ -728,6 +735,110 @@ pub struct ParametricResidualizationChart {
     pub has_parametric_block: bool,
     /// `R`, `q × k`, stated against the RAW constraint columns.
     pub correction: Array2<f64>,
+    /// `T0`, the collection coefficient chart, from the term's rotated local
+    /// coordinates (`X_local·Q`) to its realized ones.
+    pub coefficient_transform: Array2<f64>,
+    /// `z_local`, the term-local identifiability chart the basis build applied
+    /// before `Q` and `T0` (see
+    /// [`SmoothCollectionGauge::local_identifiability_transform`]).
+    pub local_identifiability_transform: Option<Array2<f64>>,
+    /// `Q`, the joint-null rotation the aggregation loop applied to the local
+    /// build before `T0` was derived.
+    pub joint_null_rotation: Option<crate::basis::JointNullRotation>,
+}
+
+impl ParametricResidualizationChart {
+    /// The fitted metadata put back into the term-local chart `z_local`, for a
+    /// term whose replay applies `Q`, `T0` and `−C·R` itself (#3001); `None`
+    /// for a term whose replay does not (see [`chart_replays_in_local_chart`]).
+    pub(crate) fn local_chart_metadata(
+        &self,
+        basis: &SmoothBasisSpec,
+        metadata: &BasisMetadata,
+    ) -> Option<BasisMetadata> {
+        if !chart_replays_in_local_chart(basis, metadata) {
+            return None;
+        }
+        let mut local = metadata.clone();
+        *local_identifiability_slot(&mut local)? = self.local_identifiability_transform.clone();
+        Some(local)
+    }
+}
+
+/// Whether a term with a [`ParametricResidualizationChart`] is replayed from
+/// its term-local chart, the fit's own order (#3001): the basis build applies
+/// `z_local`, the aggregation loop the persisted `Q`, and the collection `T0`
+/// then `−C·R`. The freeze and the replay both read this one predicate, so a
+/// spec is never frozen in one chart and replayed in the other.
+///
+/// Factor-smooth kinds are excluded because they already replay that way (see
+/// [`basis_absorbs_collection_chart`]). Metadata without a single
+/// identifiability slot (PCA, spherical harmonics, `BySmooth`, factor smooths)
+/// keeps the composed transform the freeze writes into it.
+pub(crate) fn chart_replays_in_local_chart(
+    basis: &SmoothBasisSpec,
+    metadata: &BasisMetadata,
+) -> bool {
+    basis_absorbs_collection_chart(basis)
+        && local_identifiability_slot(&mut metadata.clone()).is_some()
+}
+
+/// Whether a basis kind's placed metadata absorbs the collection chart
+/// (`Q`, `T0`). Factor-smooth kinds do not: their metadata stays in the
+/// per-level chart and the collection transform is persisted as
+/// `frozen_global_orthogonality` instead.
+pub(crate) fn basis_absorbs_collection_chart(basis: &SmoothBasisSpec) -> bool {
+    !matches!(
+        basis,
+        SmoothBasisSpec::FactorSumToZero { .. } | SmoothBasisSpec::FactorSmooth { .. }
+    )
+}
+
+/// The metadata field holding the term-local identifiability chart, for the
+/// kinds that have exactly one.
+fn local_identifiability_slot(metadata: &mut BasisMetadata) -> Option<&mut Option<Array2<f64>>> {
+    match metadata {
+        BasisMetadata::BSpline1D {
+            identifiability_transform,
+            ..
+        }
+        | BasisMetadata::CubicRegression1D {
+            identifiability_transform,
+            ..
+        }
+        | BasisMetadata::ThinPlate {
+            identifiability_transform,
+            ..
+        }
+        | BasisMetadata::Matern {
+            identifiability_transform,
+            ..
+        }
+        | BasisMetadata::Duchon {
+            identifiability_transform,
+            ..
+        }
+        | BasisMetadata::TensorBSpline {
+            identifiability_transform,
+            ..
+        } => Some(identifiability_transform),
+        BasisMetadata::Sphere {
+            constraint_transform,
+            ..
+        }
+        | BasisMetadata::ConstantCurvature {
+            constraint_transform,
+            ..
+        }
+        | BasisMetadata::MeasureJet {
+            constraint_transform,
+            ..
+        } => Some(constraint_transform),
+        BasisMetadata::Pca { .. }
+        | BasisMetadata::SphereHarmonics { .. }
+        | BasisMetadata::BySmooth { .. }
+        | BasisMetadata::FactorSmooth { .. } => None,
+    }
 }
 
 /// Which construction `apply_global_smooth_identifiability` chose to make one
@@ -786,11 +897,13 @@ pub struct SmoothCollectionGauge {
     /// The TERM-LOCAL identifiability chart the gauged block was derived ON —
     /// `z_local`, before this gauge composed its own `T` on top of it (gam#2760).
     ///
-    /// The term's `BasisMetadata` records the COMPOSITION `z_local · T0`, which
-    /// is what a predict-time replay wants. A caller that moves `ψ` must rebuild
-    /// in `z_local`, then apply the separately stored fixed
-    /// [`Self::coefficient_transform`] and fixed row-space projection. Starting
-    /// from the composition would apply `T0` twice.
+    /// The term's placed `BasisMetadata` records the COMPOSITION
+    /// `z_local · Q · T0`, the chart its penalties live in. Neither a caller
+    /// that moves `ψ` nor a predict-time replay starts from it: both rebuild in
+    /// `z_local`, apply `Q`, then the fixed [`Self::coefficient_transform`] and
+    /// row-space correction, one at a time as the fit did. Starting from the
+    /// composition applies `T0` twice when `ψ` moves, and at fixed `ψ` forms a
+    /// different floating-point product than the fit (#3001).
     ///
     /// Measured before this existed, on a one-Duchon-term collection with
     /// `C = [1]` and the `Delete` arm: the replay spec carried
@@ -8173,12 +8286,15 @@ pub(crate) fn build_single_local_smooth_term_for(
         if matches!(by, ByVariableSpec::Level { .. }) {
             defer_inner_model_centering_to_factor_level_wrapper(&mut inner_basis);
         }
+        // The inner build is where the joint-null rotation is derived, so a
+        // frozen term's persisted `Q` and collection chart go with it: the
+        // inner leaf then returns that `Q` instead of re-deriving one (#3001).
         let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+            frozen_parametric_residualization: term.frozen_parametric_residualization.clone(),
             name: term.name.clone(),
             basis: inner_basis,
             shape: term.shape.clone(),
-            joint_null_rotation: None,
+            joint_null_rotation: term.joint_null_rotation.clone(),
         };
         // Row gating only rescales the inner design, so the inner term needs
         // exactly the penalties the caller needs.

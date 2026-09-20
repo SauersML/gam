@@ -6,6 +6,7 @@ use crate::basis::{
 
 use super::{
     ByVarKind, FactorSmoothFlavour, SmoothBasisSpec, SmoothTermSpec, TensorBSplineIdentifiability,
+    basis_absorbs_collection_chart,
 };
 
 use std::collections::BTreeSet;
@@ -76,7 +77,22 @@ fn smooth_basis_family_rank(term: &SmoothTermSpec) -> u8 {
     }
 }
 
+/// Whether this spec's coefficient chart is already decided, so a rebuild
+/// neither re-derives its joint-null rotation nor re-runs the collection's
+/// owner analysis for it.
+///
+/// A spec carrying a frozen collection chart is decided by construction: it
+/// persists its `Q` (or had none) and the chart names its owners and `T0`
+/// (#3001). Its basis identifiability may still read as unfrozen, because the
+/// freeze writes the term-local chart `z_local` — which is `None` for a basis
+/// without its own constraint. Factor-smooth kinds fall through to their own
+/// arms: their collection transform is persisted apart from the chart.
 pub(crate) fn smooth_has_frozen_identifiability(term: &SmoothTermSpec) -> bool {
+    if term.frozen_parametric_residualization.is_some()
+        && basis_absorbs_collection_chart(&term.basis)
+    {
+        return true;
+    }
     match &term.basis {
         SmoothBasisSpec::ByVariable { inner, .. }
         | SmoothBasisSpec::FactorSumToZero { inner, .. } => {

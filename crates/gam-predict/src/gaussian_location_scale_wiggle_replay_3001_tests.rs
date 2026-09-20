@@ -13,10 +13,11 @@
 //! agreement is printed before anything is asserted: the location η, the wiggle's
 //! share, μ and σ.
 //!
-//! The same model predicting from the design its frozen spec REBUILDS on these rows is
-//! printed too. That rebuild still differs from the fit's design by rounding (the
-//! joint-null rotation and the collection chart are applied as one product on replay and
-//! as two at fit time), which is the other half of #3001.
+//! The same model must also predict that μ and σ from the design its frozen spec
+//! REBUILDS on these rows. The replay applies each gauged smooth's term-local chart, its
+//! joint-null rotation `Q`, the collection chart `T0` and the row-space correction `−C·R`
+//! one at a time, as the fit did, so it forms the fit's own product. The composed
+//! `B·(Q·T0)` it used to form left μ 2 ulp off in 11 of the 48 rows (#3001).
 
 use crate::FittedModelPredictExt;
 use crate::test_support::init_parallelism;
@@ -182,7 +183,7 @@ fn a_saved_gaussian_location_scale_wiggle_model_predicts_its_own_fitted_mean_and
     let mean_differing = agreement("μ (fit design)", &mean, &fitted_mean);
     let sigma_differing = agreement("σ (fit design)", &sigma, &fitted_sigma);
 
-    // The other half of #3001, printed only: the design the frozen spec rebuilds.
+    // The design the frozen spec rebuilds on the same rows.
     let col_map: HashMap<String, usize> = data
         .headers
         .iter()
@@ -207,8 +208,9 @@ fn a_saved_gaussian_location_scale_wiggle_model_predicts_its_own_fitted_mean_and
         .predict_noise_scale(&rebuilt_input)
         .expect("predict σ on the rebuilt design")
         .expect("a location-scale model has a scale");
-    agreement("μ (rebuilt design)", &rebuilt_mean, &fitted_mean);
-    agreement("σ (rebuilt design)", &rebuilt_sigma, &fitted_sigma);
+    let rebuilt_mean_differing = agreement("μ (rebuilt design)", &rebuilt_mean, &fitted_mean);
+    let rebuilt_sigma_differing =
+        agreement("σ (rebuilt design)", &rebuilt_sigma, &fitted_sigma);
 
     assert_eq!(
         mean_differing, 0,
@@ -217,5 +219,13 @@ fn a_saved_gaussian_location_scale_wiggle_model_predicts_its_own_fitted_mean_and
     assert_eq!(
         sigma_differing, 0,
         "on its fit's own design the saved model's σ must be the fit's own σ, bit for bit"
+    );
+    assert_eq!(
+        rebuilt_mean_differing, 0,
+        "on the design its frozen spec rebuilds the saved model's μ must be the fit's own μ, bit for bit"
+    );
+    assert_eq!(
+        rebuilt_sigma_differing, 0,
+        "on the design its frozen spec rebuilds the saved model's σ must be the fit's own σ, bit for bit"
     );
 }

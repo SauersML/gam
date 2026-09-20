@@ -4720,8 +4720,7 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
         use gam_terms::basis::{
-            CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
-            PenaltySource,
+            BasisMetadata, CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource,
         };
         use gam_terms::smooth::SmoothBasisSpec;
         use gam_terms::smooth::build_term_collection_design;
@@ -4999,12 +4998,19 @@ impl FittedModel {
             // `mj.length_scale`, and σ_coord are all standardized consistently.
             if let Some(sigma_coord) = frozen.sigma_coord {
                 'input_var: {
-                    let MeasureJetIdentifiability::FrozenTransform { transform } =
-                        &mj.identifiability
+                    // The replayed term's metadata records the whole chart from
+                    // the raw representer+head coefficients to the realized
+                    // ones. The frozen spec does not: a collection-charted term
+                    // is frozen in its term-local chart and its replay applies
+                    // `Q` and `T0` separately (#3001).
+                    let Some(BasisMetadata::MeasureJet {
+                        constraint_transform: Some(transform),
+                        ..
+                    }) = design.smooth.terms.get(smooth_idx).map(|t| &t.metadata)
                     else {
                         log::debug!(
-                            "measure-jet term '{}': identifiability is not a frozen transform; \
-                             skipping its input-measurement-error variance",
+                            "measure-jet term '{}': the replayed design records no coefficient \
+                             chart; skipping its input-measurement-error variance",
                             term.name
                         );
                         break 'input_var;
