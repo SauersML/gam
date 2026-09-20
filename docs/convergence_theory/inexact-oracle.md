@@ -483,7 +483,7 @@ The following remain and are *not* tolerances: c₁ ∈ (0, ½), any contraction
 - **Binomial logit, railed** (all-tests.log:324, 871, 886): |Pg| = 2.28e-5, railed at ρ = 22.73.
   - O1 and the floor stop fix the line-search half, for the same reason as the prostate case.
   - The rail and box half belongs to the boundary-asymptotics and compactified-coordinates lanes.
-- **x1 + cc(x2)** (all-tests.log:1009): "Newton decrement stopped contracting", ½λ̂² = 4.7e-5 against band_f = 3.95e-11.
+- **x1 + cyclic(x2)** (all-tests.log:1009): "Newton decrement stopped contracting", ½λ̂² = 4.7e-5 against band_f = 3.95e-11.
   - This is not an oracle-noise failure: each step decreased V by 4e-5 to 6e-5, six orders above band_f.
   - My only contributions are the honest bands (O2, §6.3), so that its verdict is right. The flat direction is a rail/asymptote problem, and "2 of 2 Newton steps" is a cap.
 - **Multinomial (ARC)**, **survival dim = 6**, **transformation/Box-Cox/Yeo-Johnson timeouts**:
