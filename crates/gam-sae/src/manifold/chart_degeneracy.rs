@@ -27,7 +27,7 @@
 //!    periodic axis is therefore measured by its circular variance
 //!    `1 − |mean exp(i κ t)|`, a Euclidean axis by its standard deviation.
 
-use ndarray::{Array1, ArrayView2};
+use ndarray::{ArrayView1, ArrayView2};
 
 use super::SaeManifoldTerm;
 
@@ -219,55 +219,8 @@ impl SaeManifoldTerm {
                 .map(|atom| atom.name.clone())
                 .unwrap_or_default();
             for axis in 0..coord.latent_dim() {
-                let column: Array1<f64> = matrix.column(axis).to_owned();
-                let magnitude = column.iter().fold(0.0_f64, |m, &t| m.max(t.abs()));
-                // The resolution at which two coordinate values on this axis are
-                // the SAME f64 point, at the axis's own magnitude. This is a
-                // representation limit, not a tuned tolerance.
-                let resolution = f64::EPSILON * magnitude;
-                let (dispersion, floor, resolved_points) = match periods[axis] {
-                    Some(period) if period > 0.0 => {
-                        let kappa = std::f64::consts::TAU / period;
-                        let (mut re, mut im) = (0.0_f64, 0.0_f64);
-                        for &t in column.iter() {
-                            let phase = kappa * t;
-                            re += phase.cos();
-                            im += phase.sin();
-                        }
-                        re /= n as f64;
-                        im /= n as f64;
-                        let resultant = (re * re + im * im).sqrt().min(1.0);
-                        // Rows separated by `resolution` in `t` are separated by
-                        // `kappa * resolution` in phase; the circular variance of
-                        // a spread that small is `½ (κ·resolution)²` to leading
-                        // order. That is the dispersion an axis shows when every
-                        // row is the same chart point.
-                        let phase_resolution = kappa * resolution;
-                        let floor = 0.5 * phase_resolution * phase_resolution;
-                        let mut wrapped: Vec<i64> = column
-                            .iter()
-                            .map(|&t| {
-                                let unit = t.rem_euclid(period) / period;
-                                (unit / f64::EPSILON).round() as i64
-                            })
-                            .collect();
-                        wrapped.sort_unstable();
-                        wrapped.dedup();
-                        (1.0 - resultant, floor, wrapped.len())
-                    }
-                    _ => {
-                        let mean = column.iter().sum::<f64>() / n as f64;
-                        let variance = column
-                            .iter()
-                            .map(|&t| (t - mean) * (t - mean))
-                            .sum::<f64>()
-                            / n as f64;
-                        let mut distinct: Vec<u64> = column.iter().map(|t| t.to_bits()).collect();
-                        distinct.sort_unstable();
-                        distinct.dedup();
-                        (variance.sqrt(), resolution, distinct.len())
-                    }
-                };
+                let (dispersion, floor, resolved_points) =
+                    axis_dispersion(matrix.column(axis), periods[axis]);
                 axes.push(ChartAxisDispersion {
                     atom: atom_idx,
                     atom_name: atom_name.clone(),
@@ -282,6 +235,107 @@ impl SaeManifoldTerm {
         ChartDegeneracyReport {
             axes,
             atom_count: self.k_atoms(),
+        }
+    }
+}
+
+/// `(dispersion, floor, resolved_points)` of one chart axis, measured in its
+/// own manifold (see [`ChartAxisDispersion`]).
+///
+/// The floor sits at the representation limit (`ε · max|t|` in `t`, i.e.
+/// `½ (κ ε max|t|)²` in circular variance), so the dispersion must be computed
+/// with an error that scales with the SPREAD of the rows, not with their
+/// magnitude. Neither textbook formula does that. `1 − |mean exp(iκt)|`
+/// subtracts a resultant `≈ 1` from `1`, which has absolute error `O(ε)`
+/// against a floor of `O(ε²)`: `{0.3, 100.3}` on a period-1 circle (one point
+/// of it, up to the representation of `100.3`) reads `1.1e-16`, fourteen
+/// orders above its floor, and is certified as a chart, while the two genuine
+/// points `{0.25, 0.25 + 1e-9}` (circular variance `4.9e-18`) read exactly `0`
+/// and are refused. Likewise a Euclidean `mean(t)` carries summation error of
+/// order `n ε |t|` that centering on it then reports as spread: 10⁵ rows split
+/// over the two adjacent floats `0.1` and `0.1 + ulp` read a standard
+/// deviation of `1.9e-13`, four orders above both their true `6.9e-18` and
+/// their floor.
+///
+/// Both are removed by measuring every row relative to the first. That offset
+/// rounds by at most half an ulp of `max|t|`, below the floor's own
+/// resolution, and is exact (Sterbenz) whenever the rows are close as floats.
+/// On a periodic axis the offset is reduced into
+/// `[−P/2, P/2]` exactly (`%` is exact, and the `± P` correction is again a
+/// Sterbenz subtraction), and the circular variance is evaluated as
+/// `mean 2 sin²((φᵢ − μ)/2) = 1 − mean cos(φᵢ − μ)` about the mean direction
+/// `μ`. At the true `μ` that is exactly `1 − R`, and an error in `μ` enters
+/// only at second order because `∂/∂μ mean cos(φᵢ − μ) = 0` there; when
+/// `R = 0` it is `1` for every `μ`.
+fn axis_dispersion(column: ArrayView1<'_, f64>, period: Option<f64>) -> (f64, f64, usize) {
+    let n = column.len();
+    let magnitude = column.iter().fold(0.0_f64, |m, &t| m.max(t.abs()));
+    // The resolution at which two coordinate values on this axis are the SAME
+    // f64 point, at the axis's own magnitude. This is a representation limit,
+    // not a tuned tolerance.
+    let resolution = f64::EPSILON * magnitude;
+    let anchor = column[0];
+    match period {
+        Some(period) if period > 0.0 => {
+            let kappa = std::f64::consts::TAU / period;
+            let half = 0.5 * period;
+            let phases: Vec<f64> = column
+                .iter()
+                .map(|&t| {
+                    let offset = (t - anchor) % period;
+                    let offset = if offset > half {
+                        offset - period
+                    } else if offset < -half {
+                        offset + period
+                    } else {
+                        offset
+                    };
+                    kappa * offset
+                })
+                .collect();
+            let (sin_sum, cos_sum) = phases
+                .iter()
+                .fold((0.0_f64, 0.0_f64), |(s, c), &phi| (s + phi.sin(), c + phi.cos()));
+            let mean_direction = sin_sum.atan2(cos_sum);
+            let dispersion = phases
+                .iter()
+                .map(|&phi| {
+                    let half_gap = (0.5 * (phi - mean_direction)).sin();
+                    2.0 * half_gap * half_gap
+                })
+                .sum::<f64>()
+                / n as f64;
+            // Rows separated by `resolution` in `t` are separated by
+            // `kappa * resolution` in phase; the circular variance of a spread
+            // that small is `½ (κ·resolution)²` to leading order. That is the
+            // dispersion an axis shows when every row is the same chart point.
+            let phase_resolution = kappa * resolution;
+            let floor = 0.5 * phase_resolution * phase_resolution;
+            let mut wrapped: Vec<i64> = column
+                .iter()
+                .map(|&t| {
+                    let unit = t.rem_euclid(period) / period;
+                    (unit / f64::EPSILON).round() as i64
+                })
+                .collect();
+            wrapped.sort_unstable();
+            wrapped.dedup();
+            (dispersion, floor, wrapped.len())
+        }
+        _ => {
+            let mean_offset = column.iter().map(|&t| t - anchor).sum::<f64>() / n as f64;
+            let variance = column
+                .iter()
+                .map(|&t| {
+                    let centred = (t - anchor) - mean_offset;
+                    centred * centred
+                })
+                .sum::<f64>()
+                / n as f64;
+            let mut distinct: Vec<u64> = column.iter().map(|t| t.to_bits()).collect();
+            distinct.sort_unstable();
+            distinct.dedup();
+            (variance.sqrt(), resolution, distinct.len())
         }
     }
 }
@@ -374,5 +428,107 @@ impl gam_problem::topology_certificates::Certificate for ChartNondegeneracyCerti
         } else {
             Verdict::Insufficient
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::axis_dispersion;
+    use ndarray::Array1;
+
+    fn measure(values: &[f64], period: Option<f64>) -> (f64, f64, usize) {
+        axis_dispersion(Array1::from(values.to_vec()).view(), period)
+    }
+
+    fn is_degenerate((dispersion, floor, resolved_points): (f64, f64, usize)) -> bool {
+        resolved_points <= 1 || !(dispersion > floor)
+    }
+
+    /// `100.3 − 100` is `0.3` only up to the representation of `100.3`, so the
+    /// two rows are ONE point of the period-1 circle that wraps into two
+    /// buckets. `1 − |mean exp(iκt)|` read `1.1e-16` here — fourteen orders
+    /// above the `9.8e-27` floor — and certified the axis as a chart.
+    #[test]
+    fn one_circle_point_modulo_the_period_is_degenerate() {
+        let measured = measure(&[0.3, 100.3], Some(1.0));
+        assert_eq!(measured.2, 2, "the rows must wrap into two buckets, so the dispersion decides");
+        assert!(
+            is_degenerate(measured),
+            "one circle point must be degenerate: dispersion {:.3e}, floor {:.3e}",
+            measured.0,
+            measured.1
+        );
+    }
+
+    /// Two genuine points `1e-9` apart on the period-1 circle have circular
+    /// variance `2 sin²(κδ/4) ≈ 4.9e-18`, fourteen orders above the floor.
+    /// `1 − R` rounded that to exactly `0` and refused the chart.
+    #[test]
+    fn two_circle_points_a_nanoperiod_apart_are_a_chart() {
+        let (a, b) = (0.25, 0.25 + 1e-9);
+        let measured = measure(&[a, b], Some(1.0));
+        assert!(!is_degenerate(measured), "dispersion {:.3e}, floor {:.3e}", measured.0, measured.1);
+        let quarter = std::f64::consts::TAU * (b - a) / 4.0;
+        let exact = 2.0 * quarter.sin() * quarter.sin();
+        // Every step (the Sterbenz-exact offset, one sin, one product, a mean
+        // of two) is correctly rounded or exact, so a few ulps bound it.
+        assert!(
+            (measured.0 - exact).abs() <= 4.0 * f64::EPSILON * exact,
+            "circular variance {:.17e} vs exact {:.17e}",
+            measured.0,
+            exact
+        );
+    }
+
+    /// A cluster straddling the seam `t ≡ t + 1` must be measured across it.
+    #[test]
+    fn a_cluster_straddling_the_period_seam_is_a_chart() {
+        let measured = measure(&[0.0, 0.999_999_999, 1e-9], Some(1.0));
+        assert!(!is_degenerate(measured), "dispersion {:.3e}, floor {:.3e}", measured.0, measured.1);
+        // Small-angle circular variance `½ var(φ)`; its truncation error is
+        // `O(φ²) ≈ 4e-17` relative, far inside the ulp-level bound below.
+        let phases = [0.0, 0.999_999_999 - 1.0, 1e-9].map(|o| std::f64::consts::TAU * o);
+        let mean = phases.iter().sum::<f64>() / 3.0;
+        let small_angle = 0.5 * phases.iter().map(|p| (p - mean) * (p - mean)).sum::<f64>() / 3.0;
+        assert!(
+            (measured.0 - small_angle).abs() <= 16.0 * f64::EPSILON * small_angle,
+            "circular variance {:.17e} vs small-angle {:.17e}",
+            measured.0,
+            small_angle
+        );
+    }
+
+    /// 10⁵ rows on the two adjacent floats `0.1` and `0.1 + ulp` have standard
+    /// deviation `ulp/2 = 6.9e-18`, below the `ε·0.1 = 2.2e-17` floor. Centering
+    /// on `mean(t)` read `1.9e-13` of summation error as spread and certified it.
+    #[test]
+    fn rows_on_two_adjacent_floats_are_one_euclidean_point() {
+        let next = f64::from_bits(0.1_f64.to_bits() + 1);
+        let values: Vec<f64> = (0..100_000).map(|i| if i % 2 == 0 { 0.1 } else { next }).collect();
+        let measured = measure(&values, None);
+        assert_eq!(measured.2, 2);
+        assert!(
+            is_degenerate(measured),
+            "two adjacent floats must be degenerate: std {:.3e}, floor {:.3e}",
+            measured.0,
+            measured.1
+        );
+        let half_ulp = 0.5 * (next - 0.1);
+        assert!(
+            (measured.0 - half_ulp).abs() <= 4.0 * f64::EPSILON * half_ulp,
+            "std {:.17e} vs half an ulp {:.17e}",
+            measured.0,
+            half_ulp
+        );
+    }
+
+    /// Spread charts are unchanged: seven equally spaced circle points have
+    /// resultant `0`, i.e. circular variance `1`.
+    #[test]
+    fn an_evenly_spread_circle_has_unit_circular_variance() {
+        let values: Vec<f64> = (0..7).map(|i| i as f64 / 7.0).collect();
+        let measured = measure(&values, Some(1.0));
+        assert_eq!(measured.2, 7);
+        assert!((measured.0 - 1.0).abs() <= 16.0 * f64::EPSILON, "circular variance {:.17e}", measured.0);
     }
 }
