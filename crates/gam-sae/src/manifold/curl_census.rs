@@ -52,7 +52,9 @@ use super::curl::{
     CurlVerdict, coalesce_antipodal, cooccurrence_pairs_sparse, curl_verdict,
     ring_permutation_evidence, orthonormal_pair_coords,
 };
-use gam_terms::inference::structure_evidence::e_benjamini_hochberg_in_family;
+use gam_terms::inference::structure_evidence::{
+    e_benjamini_hochberg_in_family, e_bh_log_threshold,
+};
 
 /// One atom's per-row ambient image, supplied lazily.
 ///
@@ -340,14 +342,13 @@ pub fn census_shattered_circles(
             "curl census: null_replicates must be 0 (derived) or at least 2, got 1".to_string(),
         );
     }
-    // The derived budget: B + 1 = m/α, the smallest at which every e-BH rank is
-    // reachable and the largest that buys anything. See `null_replicates`.
+    // The derived budget: B + 1 is the smallest integer clearing the ledger's
+    // rank-1 threshold m/α, at which every e-BH rank is reachable and the largest
+    // that buys anything. See `null_replicates` and `derived_replicate_budget`.
     let replicates = if cfg.null_replicates > 0 {
         cfg.null_replicates
     } else {
-        ((candidate_pairs.len() as f64 / cfg.fdr_alpha).ceil() as usize)
-            .saturating_sub(1)
-            .max(2)
+        derived_replicate_budget(candidate_pairs.len(), cfg.fdr_alpha)
     };
 
     let out: Vec<CensusPair> = candidate_pairs
@@ -505,6 +506,31 @@ struct CensusLedger {
     n_max_e: usize,
     /// `m/(α·n_max_e) − 1`; `∞` when no pair attained the maximum.
     replicates_required: f64,
+}
+
+/// The derived permutation budget `B` for a family of `family` screened planes
+/// at FDR level `alpha` (see [`CurlCensusConfig::null_replicates`]).
+///
+/// A plane that beats every surrogate scores `e = B + 1`, and rank 1 of the
+/// ledger needs `e ≥ m/α`. So `B + 1` is the smallest integer that clears the
+/// rank-1 threshold, at least 3 so a null of `B ≥ 2` draws exists. The
+/// threshold is the one the ledger applies,
+/// [`e_bh_log_threshold`]`(m, α, 1) = ln m − ln α`. The linear quotient `m/α`
+/// is not used as the bar, because it and the log threshold round
+/// independently: at `m = 10, α = 0.05`, `⌈m/α⌉ = 200` while
+/// `ln 200 < ln 10 − ln 0.05` by one ulp, so a budget of `B = 199` can never
+/// reject, not even a lone perfect plane. The quotient is only the starting
+/// point. It is within rounding of `exp(ln m − ln α)`, and consecutive
+/// integers differ by `≈ 1/(B + 1)` in log, far above that rounding, so the
+/// step below runs at most once in practice. It is written as a loop so that
+/// no bound on the rounding is assumed.
+fn derived_replicate_budget(family: usize, alpha: f64) -> usize {
+    let rank_one = e_bh_log_threshold(family, alpha, 1);
+    let mut max_e = (family as f64 / alpha).ceil().max(3.0);
+    while max_e.ln() < rank_one {
+        max_e += 1.0;
+    }
+    max_e as usize - 1
 }
 
 /// Run e-BH at level `alpha` over a family of `family` hypotheses of which the
@@ -706,6 +732,41 @@ mod tests {
         assert_eq!(with_refused.ebh_threshold, f64::INFINITY);
         assert_eq!(with_refused.n_max_e, 1);
         assert_eq!(with_refused.replicates_required, 2.0 / 0.05 - 1.0);
+    }
+
+    /// The derived budget's perfect plane must clear rank 1 of the ledger it
+    /// feeds, for every family size. The linear `⌈m/α⌉ − 1` fell one ulp short
+    /// of the log-space threshold at, among others, `m = 10, α = 0.05`
+    /// (`e = 200` against `ln 10 − ln 0.05 > ln 200`), so a lone planted circle
+    /// with a perfect permutation record could never be a discovery. The budget
+    /// is also minimal: one draw fewer cannot reach rank 1.
+    #[test]
+    fn derived_budget_lets_a_lone_perfect_plane_clear_rank_one() {
+        for alpha in [0.05, 0.1, 0.01, 0.2, 0.025] {
+            for family in 1..=3000 {
+                let replicates = derived_replicate_budget(family, alpha);
+                assert!(replicates >= 2);
+                let max_e = replicates as f64 + 1.0;
+                let mut e_values = vec![0.0; family];
+                e_values[family - 1] = max_e;
+                assert_eq!(
+                    ebh_ledger(&e_values, family, alpha).unwrap().rejected,
+                    vec![family - 1],
+                    "m = {family}, alpha = {alpha}: B = {replicates}"
+                );
+                if replicates > 2 {
+                    e_values[family - 1] = max_e - 1.0;
+                    assert!(
+                        ebh_ledger(&e_values, family, alpha)
+                            .unwrap()
+                            .rejected
+                            .is_empty(),
+                        "m = {family}, alpha = {alpha}: B = {replicates} is not minimal"
+                    );
+                }
+            }
+        }
+        assert_eq!(derived_replicate_budget(10, 0.05), 200);
     }
 
     /// One dominant e-value in a family of nulls is the only discovery; a flat
