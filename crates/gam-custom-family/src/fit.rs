@@ -262,6 +262,16 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
                 verdict.drift.recovered.join(", "),
             );
         }
+        if verdict.recovered_under_identity_gauge() {
+            log::debug!(
+                "[AUDIT-DRIFT] converged identifiability accepted a recovery on the identity \
+                 gauge: the fit ran every raw column, and convergence identifies rank {} where \
+                 the pilot identified {}; recovered=[{}]",
+                verdict.drift.current_rank,
+                verdict.drift.pilot_rank,
+                verdict.drift.recovered.join(", "),
+            );
+        }
         (verdict.drift, refuses, Some(pilot_gauge_rank))
     } else {
         let drift = gam_identifiability::audit::maybe_log_audit_drift(
@@ -2995,10 +3005,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         if matches!(order, OuterEvalOrder::Value) {
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3015,8 +3022,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
@@ -3091,10 +3100,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
         let starts = if force_cold {
-            ModeStarts {
-                incumbent: canonical_seed.as_ref(),
-                fixed: &fixed_starts,
-            }
+            outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
         } else {
             outer.mode_starts_for(rho)
         };
@@ -3135,6 +3141,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
+                // A cold evaluation's mode is served again at bitwise this θ (#3322).
+                if force_cold {
+                    outer.record_cold_mode(rho, canonical_seed.as_ref(), warm_start.clone());
+                }
                 outer.record_first_order_mode(warm_start.clone());
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_cache.as_ref(),
@@ -3254,10 +3264,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.last_criterion_rank = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3274,8 +3281,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
