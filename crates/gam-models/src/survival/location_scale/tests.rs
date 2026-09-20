@@ -1889,6 +1889,7 @@ fn survival_location_scale_planner_keeps_analytic_hessian_at_large_scale_dimensi
 }
 
 mod derivative_identities;
+mod packed_hessian_directional;
 mod time_block_identification;
 
 fn survival_exact_newton_test_familywith_inverse_link(

@@ -58,6 +58,7 @@ These are the plans (see `plans.py`):
 | `n1e5_core` | n=1e5, all families × {`p1`, `p5`, `te`} | 2 |
 | `n1e6_memory` | n=1e6, {gaussian, poisson} × {`p1`, `p5`}: peak RSS and user/sys CPU | 1 |
 | `full`      | n ∈ {1e3, 1e4, 1e5}, all families × all designs | 3 |
+| `postfit`   | n ∈ {1e3, 1e5} × n_predict ∈ {1e2, 1e4, 1e6}, all families × {`p5`, `p20`, `te`}, `gamfit` and `pygam_gs` only, with the post-fit phases | 1 |
 | `gaussian_small` | n ∈ {1e2, 1e3, 1e4}, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} (the nightly Gaussian regression cells) | 3 |
 | `gaussian_1e5` | n=1e5, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`} | 3 |
 | `gaussian_1e6` | n=1e6, gaussian × {`p1`, `p5`, `p20`, `te`, `te+s`, `by`}: wall, CPU and peak RSS at the largest scale | 3 |
@@ -171,10 +172,13 @@ host load hits all of them alike.
 **Time.** Each phase is timed as both wall time (`perf_counter`) and process
 CPU time (`process_time`). The phases are import, one cold fit, a warm refit
 of the same data in the same process (the per-fit cost once imports and lazy
-initialisation are paid), point predict on n fresh rows, and a 95% interval
-predict. CPU time is the primary metric, because wall time on a shared box also
-measures the neighbours. The 1-minute load average is recorded at the start and
-end of each rep.
+initialisation are paid), point predict on n fresh rows (or `n_predict` rows
+when the cell sets it), and a 95% interval predict. Plans with `postfit` also
+time a term's partial dependence on a 200-point grid, the summary, a save/load
+round trip (`save_bytes` records the file size), 100 posterior coefficient
+draws and gamfit's smooth significance. CPU time is the primary metric, because
+wall time on a shared box also measures the neighbours. The 1-minute load
+average is recorded at the start and end of each rep.
 
 **Memory.** The worker's own peak RSS comes from `ru_maxrss`. The driver also
 polls the process-tree RSS and thread count with psutil every 50 ms.

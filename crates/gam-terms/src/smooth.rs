@@ -60,6 +60,7 @@ pub use term_design::{
     TermCollectionDerivativeDesign,
     apply_smooth_transform_to_design,
     build_term_collection_derivative_design, build_term_collection_design,
+    build_term_collection_prediction_design, build_term_prediction_columns,
     build_planned_term_collection_design_inner_with_policy,
     build_term_collection_design_with_policy, duchon_operator_penalty_request,
     orthogonality_relative_residual_for_design, place_term_in_collection_gauge,
