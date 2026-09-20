@@ -2691,5 +2691,18 @@
     ],
     "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
     "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "b4b0ef17614582d86b30c8ad89e094bc3bca6a7c",
+    "items": [
+      "crates/gam-models/src/vector_response.rs:fn:grad_eta",
+      "crates/gam-models/src/vector_response.rs:fn:hess_block",
+      "crates/gam-models/src/vector_response.rs:fn:hess_diag",
+      "crates/gam-models/src/vector_response.rs:fn:log_lik",
+      "crates/gam-models/src/vector_response.rs:fn:row_weight",
+      "crates/gam-models/src/vector_response.rs:struct:GaussianVectorLikelihood"
+    ],
+    "reason": "#4070: GaussianVectorLikelihood (identity-link Gaussian vector likelihood with diagonal plus low-rank precision) was re-exported from gam-models but never constructed outside one validation test. Its struct, its private row_weight helper and its VectorLikelihood impl (log_lik, grad_eta, hess_diag, hess_block) are deleted with the re-export. The trait's other implementation, MultinomialLogitLikelihood, keeps its own log_lik/grad_eta/hess_diag/hess_block, and the #932 non-finite-state contract stays under test on it.",
+    "evidence": "At the base, git grep -w GaussianVectorLikelihood finds only its declaration and impls in crates/gam-models/src/vector_response.rs, the pub use in crates/gam-models/src/mod.rs, and the vector_response test that constructed it; no crate, binding or Python module names it. The guard's remaining declarations of log_lik, grad_eta, hess_diag and hess_block are the VectorLikelihood trait's and MultinomialLogitLikelihood's; the other row_weight is unrelated."
   }
 ]
