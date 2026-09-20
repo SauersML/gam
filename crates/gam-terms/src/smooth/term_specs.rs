@@ -7275,12 +7275,23 @@ pub(crate) fn build_by_smooth_local(
     by_kind: &ByVarKind,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    // A numeric by-variable only rescales the inner rows, so its inner build
+    // decides this term's joint-null rotation and carries the term's frozen
+    // rotation decision (#3001). A factor by-variable derives its rotation on
+    // the level-gated block below, whose chart the inner build does not share.
+    let (inner_rotation, inner_residualization) = match by_kind {
+        ByVarKind::Numeric { .. } => (
+            term.joint_null_rotation.clone(),
+            term.frozen_parametric_residualization.clone(),
+        ),
+        ByVarKind::Factor { .. } => (None, None),
+    };
     let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+        frozen_parametric_residualization: inner_residualization,
         name: term.name.clone(),
         basis: (*smooth).clone(),
         shape: term.shape.clone(),
-        joint_null_rotation: None,
+        joint_null_rotation: inner_rotation,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
 
@@ -7402,7 +7413,13 @@ pub(crate) fn build_by_smooth_local(
             // joint-null rotation absent. The canonical filter authors matrix,
             // rank, nullity, null basis, and metadata together.
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
-            let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
+            // A frozen parametric residualization is the fit's whole
+            // collection-chart decision, `Q` included (#3001).
+            let joint_null_rotation = match term.joint_null_rotation.clone() {
+                Some(persisted) => Some(persisted),
+                None if term.frozen_parametric_residualization.is_some() => None,
+                None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
+            };
             let mut dropped_penalties = inner.dropped_penalties;
             dropped_penalties.extend(filtered.dropped);
 
@@ -8162,15 +8179,18 @@ pub(crate) fn build_single_local_smooth_term_for(
         if matches!(by, ByVariableSpec::Level { .. }) {
             defer_inner_model_centering_to_factor_level_wrapper(&mut inner_basis);
         }
+        // The inner build is the one that decides this term's joint-null
+        // rotation, so it carries the term's frozen rotation decision: the
+        // persisted `Q` and the frozen residualization that states the fit
+        // applied none (#3001). Row gating only rescales the inner design, so
+        // the inner term needs exactly the penalties the caller needs.
         let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+            frozen_parametric_residualization: term.frozen_parametric_residualization.clone(),
             name: term.name.clone(),
             basis: inner_basis,
             shape: term.shape.clone(),
-            joint_null_rotation: None,
+            joint_null_rotation: term.joint_null_rotation.clone(),
         };
-        // Row gating only rescales the inner design, so the inner term needs
-        // exactly the penalties the caller needs.
         let built = build_single_local_smooth_term_for(data, &inner_term, workspace, demand)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
     }
@@ -8183,9 +8203,12 @@ pub(crate) fn build_single_local_smooth_term_for(
 
     // A frozen chart needs no penalty to place its design: the joint-null
     // rotation is the only penalty-derived design input, and a frozen spec
-    // persists it or has none.
+    // persists it or has none. The condition is the one under which the
+    // rotation below is derived rather than taken from the spec.
     let realize_penalties = demand == SmoothPenaltyDemand::Realize
-        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
+        || (term.joint_null_rotation.is_none()
+            && !smooth_has_frozen_identifiability(term)
+            && term.frozen_parametric_residualization.is_none());
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
