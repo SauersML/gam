@@ -4649,13 +4649,12 @@ fn survival_concordance(
         )));
     }
     // Delegate to the single source of truth for Harrell's C-index in
-    // gam-models (`survival::predict::harrell_concordance`). The core counts
-    // tied event times as a comparable half-credit pair and returns None when
-    // there are no comparable pairs at all (e.g. every row censored); the old
-    // hand-rolled pair loop here dropped tied-time pairs entirely and returned
-    // a silent 0.5 sentinel. Where the two disagreed the core wins — a None
-    // degenerate result is surfaced as Python None, matching how the
-    // neighboring metric pyfunctions report an undefined score.
+    // gam-models (`survival::predict::harrell_concordance`), which applies the
+    // standard pair rules (tied events are not comparable; an event tied with a
+    // censoring is, the censored subject being the survivor) and returns None
+    // when the score is undefined (no comparable pair, or a non-finite input).
+    // None is surfaced as Python None, matching how the neighboring metric
+    // pyfunctions report an undefined score.
     Ok(gam::families::survival::predict::harrell_concordance(
         &event_times,
         &events,
@@ -5278,8 +5277,8 @@ mod latent_glm_family_validation_tests {
             "gaussian-identity",
             "poisson",
             "poisson-log",
-            "negbin",
-            "negbin-log",
+            "negative-binomial",
+            "negative-binomial-log",
             "binomial",
             "logistic",
             "probit",
@@ -5293,12 +5292,12 @@ mod latent_glm_family_validation_tests {
 
     /// #983: an explicitly supplied θ *pins* the negative-binomial shape. The
     /// FFI's private table hardcoded `theta_fixed: false`, so the identical
-    /// `family="negbin", negbin_theta=2.5` request estimated θ from Python and
+    /// `family="negative-binomial", negbin_theta=2.5` request estimated θ from Python and
     /// held it fixed from the CLI — one request, two models.
     #[test]
     fn an_explicit_negative_binomial_theta_pins_it() {
         let (spec, _) = scalar_family_from_name(
-            "negbin-log",
+            "negative-binomial-log",
             FamilyNuisanceOverrides {
                 negative_binomial_theta: Some(2.5),
                 ..FamilyNuisanceOverrides::default()
@@ -5321,7 +5320,7 @@ mod latent_glm_family_validation_tests {
     /// supplied means estimate it.
     #[test]
     fn an_absent_negative_binomial_theta_is_estimated() {
-        let (spec, _) = scalar_family_from_name("negbin", FamilyNuisanceOverrides::default())
+        let (spec, _) = scalar_family_from_name("negative-binomial", FamilyNuisanceOverrides::default())
             .expect("an absent theta seeds the estimate");
         match spec.response {
             ResponseFamily::NegativeBinomial { theta_fixed, .. } => {

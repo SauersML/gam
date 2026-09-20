@@ -724,10 +724,12 @@ fn a_stationary_seed_is_certified_without_walking() {
 ///
 /// On #2080's wide-p fixture (job 507123) seed 0's HybridEFS walk evaluated a
 /// criterion of 2.649e1 and then published its last iterate at 3.873e2. Here the
-/// EFS map always proposes the same step and every backtracking probe accepts it
-/// (the value route reads 0), while the fixed-point sample's own criterion reads
-/// 1.0 at the seed, 0.5 at the first iterate and 4.0 from then on. The walk runs
-/// to `max_iter`, and the published result must carry the 0.5.
+/// EFS map proposes a step that halves in norm at every evaluation, and every
+/// backtracking probe accepts it (the value route reads 0), while the
+/// fixed-point sample's own criterion reads 1.0 at the seed, 0.5 at the first
+/// iterate and 4.0 from then on. The contracting step is progress to the
+/// fixed-point progress rule (#3176) even where the criterion worsens, so the
+/// walk runs to `max_iter`, and the published result must carry the 0.5.
 #[test]
 fn a_budget_exhausted_efs_walk_publishes_its_best_iterate_2817() {
     const MAX_ITER: usize = 3;
@@ -755,7 +757,7 @@ fn a_budget_exhausted_efs_walk_publishes_its_best_iterate_2817() {
                 let call = efs_calls.fetch_add(1, Ordering::Relaxed);
                 Ok(EfsEval {
                     cost: SAMPLE_COSTS[call.min(SAMPLE_COSTS.len() - 1)],
-                    steps: vec![-0.25; theta.len()],
+                    steps: vec![-0.25 * 0.5_f64.powi(call as i32); theta.len()],
                     beta: None,
                     psi_gradient: None,
                     psi_indices: None,
@@ -822,7 +824,7 @@ fn a_budget_exhausted_efs_walk_publishes_its_best_iterate_2817() {
 
 /// An EFS walk whose sample criterion reads 1.0 at the seed, 0.5 at the first
 /// iterate and 1.0 from then on, while the map keeps proposing the same step:
-/// after the first iterate no window buys a resolved improvement or a smaller
+/// after the first iterate no evaluation buys a resolved improvement or a smaller
 /// step, so the bridge stops the walk as unprogressing (#2817). `gradient`
 /// supplies the analytic gradient the screening certificate reads.
 const UNPROGRESSING_SAMPLE_COSTS_2153: [f64; 3] = [1.0, 0.5, 1.0];
@@ -919,8 +921,9 @@ fn an_unprogressing_walk_at_a_non_stationary_point_continues_its_best_iterate_21
         }
     };
     assert!(
-        efs_calls > UNPROGRESSING_SAMPLE_COSTS_2153.len(),
-        "fixture precondition: the walk evaluated past its best iterate"
+        efs_calls >= UNPROGRESSING_SAMPLE_COSTS_2153.len(),
+        "fixture precondition: the walk evaluated past its best iterate \
+         (the seed, the best iterate and a worse one; {efs_calls} evaluation(s))"
     );
     assert!(request.refusal.is_recoverable());
     assert_eq!(

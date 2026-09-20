@@ -494,6 +494,9 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         EstimationError::PrefitLinearSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
+        EstimationError::PrefitLatentScoreSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
         EstimationError::MultinomialSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
@@ -642,6 +645,22 @@ pub(crate) fn saved_model_error_to_pyerr(
         attach_err.write_unraisable(py, Some(&bound));
     }
     exc
+}
+
+/// A saved document that could not be written or read through
+/// `gam_model_api::saved_model`. A filesystem refusal raises the `OSError`
+/// subclass its kind names (`FileNotFoundError`, `PermissionError`, ...), with
+/// the path in its message; a document the engine refuses is a `DataError`, the
+/// category of a payload (gam#3008, gam#3054).
+pub(crate) fn saved_document_error_to_pyerr(
+    error: gam_model_api::saved_model::SavedModelError,
+) -> PyErr {
+    match error {
+        gam_model_api::saved_model::SavedModelError::Io { path, source } => {
+            PyErr::from(std::io::Error::new(source.kind(), format!("{path}: {source}")))
+        }
+        refused => DataError::new_err(refused.to_string()),
+    }
 }
 
 /// A Rust panic caught at the boundary is an engine defect whatever the input,
