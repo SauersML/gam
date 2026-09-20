@@ -2595,6 +2595,10 @@ pub fn closed_form_anisotropic_pair_block_pure(
     let self_pair = j_prefactor
         * closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, &eta_centered)
             .unwrap_or_else(|| {
+                // SAFETY: outside the UV clause `4(m+s) > d + 2q` the self-pair diverges
+                // and no closed-form block exists; callers gate on
+                // `duchon_closed_form_operator_penalty_converges`, so reaching this is a
+                // broken contract, and no finite value may stand in for the limit.
                 panic!(
                     "closed_form_anisotropic_pair_block_pure: q={q} d={d} m={m} s={s} violates \
                      the UV clause 4(m+s) > d + 2q, so the self-pair diverges; callers must gate \
