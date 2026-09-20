@@ -2167,3 +2167,6 @@ fn a_symmetry_the_certificate_is_not_given_is_refused_2576() {
         }
     }
 }
+
+#[path = "support_term_phase_3258_tests.rs"]
+mod phase_3258;
