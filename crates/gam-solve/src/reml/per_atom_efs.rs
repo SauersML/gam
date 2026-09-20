@@ -1,7 +1,5 @@
 //! Frontier ρ-scaling: per-atom decoupled Extended Fellner–Schall (EFS) as the
-//! primary outer iteration, with a coupled correction restricted to
-//! shared-border axes and a matrix-free θ-HVP for axes that need true
-//! second-order coupling (issue #986, building on the #740 θ-HVP design).
+//! primary outer iteration (issue #986).
 //!
 //! # Why this module exists
 //!
@@ -13,66 +11,32 @@
 //! *per-coordinate decoupled* in its arithmetic — each ρ_i step is
 //! `log(1 − 2·g_full[i]/q_eff_i)`, a function of that atom's own gradient entry
 //! and penalty-quadratic curvature scale only — so EFS is the natural frontier
-//! primary. This module drives that decoupled fixed point directly, parallel
-//! across atoms, and never assembles any K×K object.
+//! primary. This module drives that decoupled fixed point directly and never
+//! assembles any K×K object.
 //!
-//! Three layers, in increasing cost and decreasing breadth:
-//!
-//! 1. **Per-atom decoupled EFS** (every atom, every iteration). The outer
-//!    objective's `eval_efs` hook runs one inner P-IRLS solve and returns the
-//!    full per-coordinate step vector. We apply each atom's own multiplicative
-//!    log-λ step, with a whole-vector cost line search (Wood–Fasiolo give
-//!    ascent in the EFS direction but not full-step monotonicity). The step is
-//!    taken as `eval_efs` produced it, with no per-coordinate box: the line
-//!    search alone sets its length. The per-atom arithmetic *after* the shared
-//!    inner solve is O(K); the only rayon fan-out is the border-block probe,
-//!    which honors the OnceLock+nested-rayon rule (any `get_or_init` is warmed
-//!    at the top level before the `into_par_iter`, never inside it).
-//!
-//! 2. **Shared-border coupled correction** (only the few border axes). Most
-//!    atoms are penalty-block-disjoint: their ρ updates do not interact, so the
-//!    decoupled step is exact for them. A small set of axes *do* interact —
-//!    those whose penalty blocks overlap through the arrow border (shared
-//!    columns / a shared global block). For just those `m ≪ K` axes we solve
-//!    one tiny `m × m` coupled Newton correction using the matrix-free θ-HVP to
-//!    fill the restricted outer-Hessian sub-block, then factorize that `m × m`
-//!    system (never the full K × K).
-//!
-//! 3. **Matrix-free θ-HVP** (#740). For a direction `v` over the border axes,
-//!    `H_outer · v` is computed *without* assembling the O(K²) coordinate-pair
-//!    Hessian. The family's exact outer-Hessian operator
-//!    (`HessianValue::Operator`) `matvec` realizes the IFT-corrected action
-//!    `β̇ = −H⁻¹ (∂g/∂θ)·v` plus the logdet directional trace — exactly the #740
-//!    product — through one inner solve per matvec. When no exact operator is
-//!    available the shared-border correction is deferred to the decoupled
-//!    per-atom step rather than approximated numerically (#1440 removed the
-//!    former central-difference fallback): the θ-HVP is always exact.
+//! Each iteration, the outer objective's `eval_efs` hook runs one inner P-IRLS
+//! solve and returns the full per-coordinate step vector. We apply each atom's
+//! own multiplicative log-λ step, with a whole-vector cost line search
+//! (Wood–Fasiolo give ascent in the EFS direction but not full-step
+//! monotonicity). The step is taken as `eval_efs` produced it, with no
+//! per-coordinate box: the line search alone sets its length.
 //!
 //! # Consistency / reduction to the coupled objective at small K
 //!
 //! At small K the per-atom step reduces to exactly the coupled EFS step:
 //! `compute_efs_update` already produces the same per-coordinate
-//! `log(1 − 2·g_full[i]/q_eff_i)` regardless of K, and the shared-border
-//! correction is a Newton step on the *same* outer gradient `g` that the
-//! coupled path uses (it nulls out when `g` is zero). Concretely, when the
-//! border set is the whole ρ-vector (small K), the layer-2 correction is the
-//! exact dense Newton step on `g`, and when `g = 0` (a stationary point of the
-//! coupled objective) every layer's step is zero. This stationarity property is
-//! a design invariant of routing every layer through the same `eval`/`eval_efs`
-//! hooks that the dense path consumes, not a separately maintained surrogate.
+//! `log(1 − 2·g_full[i]/q_eff_i)` regardless of K, and when `g = 0` (a
+//! stationary point of the coupled objective) the step is zero. This
+//! stationarity property is a design invariant of routing the step through the
+//! same `eval_efs` hook that the dense path consumes, not a separately
+//! maintained surrogate.
 
 use crate::estimate::EstimationError;
 use crate::rho_optimizer::{
     OuterCapability, OuterObjective, OuterPlan, OuterResult, OuterResultOrigin,
 };
-use faer::Side;
-use gam_linalg::faer_ndarray::{FaerArrayView, factorize_symmetricwith_fallback};
-use gam_linalg::matrix::FactorizedSystem;
-use gam_problem::{HessianOperator, HessianValue};
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use opt::{BacktrackConfig, backtracking_line_search};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
-use std::sync::Arc;
 
 /// Smallest ρ-dimension at which the per-atom decoupled EFS primary outranks
 /// the dense quasi-Newton path.
@@ -136,8 +100,8 @@ impl PerAtomEfsResult {
     // Keep this method `pub(crate)` so the now-`pub` `per_atom_efs` module does
     // not expose a private-in-public type (`private_interfaces` under
     // `warnings = "deny"`). Called only in-crate (`rho_optimizer::run`); the root
-    // facade re-exports `run_per_atom_efs` / `PerAtomEfsConfig` /
-    // `SharedBorderTopology`, never this convenience method.
+    // facade re-exports `run_per_atom_efs` / `PerAtomEfsConfig`, never this
+    // convenience method.
     pub(crate) fn into_outer_result(self, plan_used: OuterPlan) -> OuterResult {
         let mut result = OuterResult::new(
             self.rho,
@@ -149,49 +113,6 @@ impl PerAtomEfsResult {
         result.origin = OuterResultOrigin::PerAtomFellnerSchall;
         result.final_grad_norm = Some(self.final_step_inf_norm);
         result
-    }
-}
-
-/// Shared-border topology over the ρ-axes.
-///
-/// `border_axes` are the (few) coordinates whose penalty blocks overlap through
-/// the arrow border — a shared global block or shared design columns — so their
-/// EFS updates are *not* mutually decoupled and benefit from a coupled
-/// correction. Every other axis is block-disjoint and exact under the per-atom
-/// step alone.
-#[derive(Clone, Debug)]
-pub struct SharedBorderTopology {
-    pub(crate) border_axes: Vec<usize>,
-    pub(crate) rho_dim: usize,
-}
-
-impl SharedBorderTopology {
-    /// No shared border: every atom is block-disjoint and the decoupled
-    /// per-atom step is exact. This is the common ARD-per-atom case where each
-    /// atom owns a private penalty block.
-    pub(crate) fn disjoint(rho_dim: usize) -> Self {
-        Self {
-            border_axes: Vec::new(),
-            rho_dim,
-        }
-    }
-
-    /// Indices of the shared-border axes (sorted, deduplicated, in range).
-    #[inline]
-    pub(crate) fn border_axes(&self) -> &[usize] {
-        &self.border_axes
-    }
-
-    /// Number of shared-border axes `m`. The coupled correction solves an
-    /// `m × m` system; when `m == 0` it is skipped entirely.
-    #[inline]
-    pub(crate) fn border_count(&self) -> usize {
-        self.border_axes.len()
-    }
-
-    #[inline]
-    pub(crate) fn rho_dim(&self) -> usize {
-        self.rho_dim
     }
 }
 
@@ -247,149 +168,13 @@ pub(crate) fn finite_step(raw: &[f64], source: &str) -> Result<Array1<f64>, Esti
     Ok(Array1::from_vec(raw.to_vec()))
 }
 
-/// Assemble the restricted `m × m` outer-Hessian sub-block over the
-/// shared-border axes by probing the exact matrix-free θ-HVP with the `m` border
-/// basis directions, then symmetrizing.
-///
-/// This is the only place a dense matrix is formed, and it is `m × m` with
-/// `m ≪ K` (the border count), never `K × K`. Each probe is one operator
-/// matvec; the `m` probes are independent, so they fan across rayon. An exact
-/// outer-Hessian operator is required (#1440 removed the finite-difference
-/// fallback) — when none is available the caller defers the border correction.
-pub(crate) fn border_hessian_block(
-    topology: &SharedBorderTopology,
-    operator: &Arc<dyn HessianOperator>,
-    rho: &Array1<f64>,
-) -> Result<Array2<f64>, EstimationError> {
-    let m = topology.border_count();
-    let border = topology.border_axes();
-    let mut block = Array2::<f64>::zeros((m, m));
-
-    if operator.dim() != rho.len() {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "per-atom border θ-HVP operator dim {} != rho_dim {}",
-            operator.dim(),
-            rho.len()
-        )));
-    }
-    // Exact operator path: probes are independent operator applications; fan across
-    // rayon. No OnceLock get_or_init is triggered inside the probe closure
-    // (the HVP is a pure linear action on a captured factorization), so the
-    // nested-rayon deadlock rule is satisfied.
-    let cols: Result<Vec<(usize, Array1<f64>)>, EstimationError> = (0..m)
-        .into_par_iter()
-        .map(|j| {
-            let mut e_j = Array1::<f64>::zeros(rho.len());
-            e_j[border[j]] = 1.0;
-            let hv = operator.apply(&e_j).map_err(|reason| {
-                EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom border θ-HVP operator application failed: {reason}"
-                ))
-            })?;
-            Ok((j, hv))
-        })
-        .collect();
-    for (j, hv) in cols? {
-        for (row, &axis) in border.iter().enumerate() {
-            block[[row, j]] = hv[axis];
-        }
-    }
-
-    // Symmetrize against round-off asymmetry.
-    for r in 0..m {
-        for c in (r + 1)..m {
-            let s = 0.5 * (block[[r, c]] + block[[c, r]]);
-            block[[r, c]] = s;
-            block[[c, r]] = s;
-        }
-    }
-    Ok(block)
-}
-
-fn solve_shared_border_block(
-    topology: &SharedBorderTopology,
-    block: Array2<f64>,
-    gradient: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    let m = topology.border_count();
-    let mut step = Array1::<f64>::zeros(topology.rho_dim());
-    if m == 0 {
-        return Ok(step);
-    }
-    let border = topology.border_axes();
-    let g_border_inf = border
-        .iter()
-        .map(|&i| gradient[i].abs())
-        .fold(0.0_f64, f64::max);
-    // Only an exactly zero border gradient has an exactly zero correction; any
-    // other gradient is solved, and a small one yields a proportionally small step.
-    if g_border_inf == 0.0 {
-        return Ok(step);
-    }
-    if block.dim() != (m, m) {
-        return Err(EstimationError::RemlOptimizationFailed(format!(
-            "per-atom shared-border block shape {:?} != expected {m}x{m}",
-            block.dim()
-        )));
-    }
-
-    let mut g_border = Array1::<f64>::zeros(m);
-    for (row, &axis) in border.iter().enumerate() {
-        g_border[row] = gradient[axis];
-    }
-
-    let factor = {
-        let view = FaerArrayView::new(&block);
-        factorize_symmetricwith_fallback(view.as_ref(), Side::Lower).map_err(|err| {
-            EstimationError::RemlOptimizationFailed(format!(
-                "per-atom shared-border {m}×{m} factorization failed: {err:?}"
-            ))
-        })?
-    };
-    let delta = FactorizedSystem::solve(&factor, &g_border).map_err(|reason| {
-        EstimationError::RemlOptimizationFailed(format!(
-            "per-atom shared-border {m}×{m} solve failed: {reason}"
-        ))
-    })?;
-
-    let delta = finite_step(&delta.to_vec(), "shared-border correction")?;
-    for (row, &axis) in border.iter().enumerate() {
-        step[axis] = -delta[row];
-    }
-    Ok(step)
-}
-
-/// Solve the restricted coupled Newton correction on the shared-border axes:
-/// `Δρ_border = − H_bb⁻¹ · g_border`, where `H_bb` is the `m × m` border
-/// outer-Hessian block from [`border_hessian_block`] and `g_border` is the outer
-/// gradient restricted to the border axes.
-///
-/// Returns a full-length ρ step that is zero off the border. An indefinite or
-/// singular border block is factored by the pivoted symmetric fallback, a
-/// non-finite component is refused by [`finite_step`], and the whole-vector cost
-/// line search decides whether the correction is taken.
-pub(crate) fn shared_border_correction(
-    topology: &SharedBorderTopology,
-    operator: &Arc<dyn HessianOperator>,
-    rho: &Array1<f64>,
-    gradient: &Array1<f64>,
-) -> Result<Array1<f64>, EstimationError> {
-    let m = topology.border_count();
-    if m == 0 {
-        return Ok(Array1::<f64>::zeros(topology.rho_dim()));
-    }
-    let block = border_hessian_block(topology, operator, rho)?;
-    solve_shared_border_block(topology, block, gradient)
-}
-
 /// Whole-vector cost line search for the per-atom EFS step.
 ///
 /// Wood–Fasiolo give ascent in the EFS direction but not full-step
-/// monotonicity, so halve α from 1 on the *whole* applied step (per-atom
-/// decoupled step plus the shared-border correction), accepting the first α
-/// whose projected cost does not resolvably exceed the current cost. Halving
-/// ends where the step stops being resolvable: once `α·‖step‖∞` falls below the
-/// step-norm tolerance, the move is one the convergence test would already call
+/// monotonicity, so halve α from 1 on the *whole* applied per-atom step,
+/// accepting the first α whose projected cost does not resolvably exceed the
+/// current cost. Halving ends where the step stops being resolvable: once
+/// `α·‖step‖∞` falls below the step-norm tolerance, the move is one the convergence test would already call
 /// zero, so the schedule is `{α = 2^-k : α·‖step‖∞ ≥ tolerance}` and carries no
 /// count of its own. Two costs differ resolvably when they are further apart than
 /// the sum of their rounding bands, `γ₁·(|f_cur| + |f_trial|)`. Returns the
@@ -448,20 +233,14 @@ pub(crate) fn backtrack_cost(
 /// Loop, each iteration:
 /// 1. `eval_efs` at the current ρ — one inner P-IRLS solve — yields the full
 ///    per-coordinate decoupled step vector.
-/// 2. If the topology has shared-border axes, add the coupled Newton correction
-///    on just those axes via the matrix-free θ-HVP (`m × m` solve).
-/// 3. Whole-vector cost line search; apply the accepted step.
-/// 4. Converged when the applied step's ∞-norm falls below tolerance.
+/// 2. Converged when the step's ∞-norm falls below tolerance.
+/// 3. Otherwise whole-vector cost line search; apply the accepted step.
 ///
-/// `seed` is the starting ρ (already within bounds). `cap` declares the outer
-/// capability (used only for the layout/border defaults). The topology selects
-/// which axes get the coupled correction; pass `SharedBorderTopology::disjoint`
-/// when every atom owns a private penalty block (the common ARD-per-atom case).
+/// `seed` is the starting ρ; it is projected into the bounds.
 pub fn run_per_atom_efs(
     obj: &mut dyn OuterObjective,
     seed: &Array1<f64>,
     cfg: &PerAtomEfsConfig,
-    topology: &SharedBorderTopology,
 ) -> Result<PerAtomEfsResult, EstimationError> {
     let rho_dim = seed.len();
     if cfg.lower.len() != rho_dim || cfg.upper.len() != rho_dim {
@@ -472,21 +251,7 @@ pub fn run_per_atom_efs(
             rho_dim
         )));
     }
-    if topology.rho_dim() != rho_dim {
-        return Err(EstimationError::InvalidInput(format!(
-            "per-atom EFS topology rho_dim {} != seed dim {}",
-            topology.rho_dim(),
-            rho_dim
-        )));
-    }
 
-    // Warm any process-global lazy state (rayon pool init, OnceLock-backed
-    // policy probes) at the top level by issuing the first inner solve here,
-    // BEFORE any `into_par_iter` in the per-atom assembly. This satisfies the
-    // OnceLock + nested-rayon deadlock rule: a `get_or_init` whose closure
-    // itself does `into_par_iter` must never first fire from inside an outer
-    // par_iter. The border-block probe below is the only par_iter, and by the
-    // time it runs the inner solve has already forced all such warm-ups.
     let mut rho = project_to_bounds(seed, cfg);
 
     let mut iterations = 0usize;
@@ -501,7 +266,7 @@ pub fn run_per_atom_efs(
     for _ in 0..cfg.max_iter.max(1) {
         iterations += 1;
 
-        // ── Layer 1: per-atom decoupled EFS step (one inner solve) ──
+        // Per-atom decoupled EFS step (one inner solve).
         let efs = obj.eval_efs(&rho)?;
         if !efs.cost.is_finite() {
             return Err(EstimationError::RemlOptimizationFailed(
@@ -519,58 +284,7 @@ pub fn run_per_atom_efs(
 
         // Each atom's own multiplicative step, unboxed: its length is set by the
         // whole-vector line search below, and a non-finite component is refused.
-        let mut full_step = finite_step(&efs.steps, "decoupled EFS")?;
-
-        // ── Layer 2: shared-border coupled correction (m × m) ──
-        //
-        // Only the border axes interact through the arrow border; correct just
-        // those with a Newton step on the same outer gradient the coupled path
-        // uses, filling the m × m restricted block via the matrix-free θ-HVP.
-        if topology.border_count() > 0 {
-            // Capture the outer gradient + operator at the current ρ via the
-            // full `eval` hook (the EFS eval surfaces steps, not the raw
-            // gradient/operator). One inner solve.
-            let outer_eval = obj.eval(&rho)?;
-            let gradient = outer_eval.gradient.clone();
-            if gradient.len() == rho_dim {
-                let border_step_result = match &outer_eval.hessian {
-                    HessianValue::Dense(hessian)
-                        if hessian.nrows() == rho_dim && hessian.ncols() == rho_dim =>
-                    {
-                        let m = topology.border_count();
-                        let border = topology.border_axes();
-                        let mut block = Array2::<f64>::zeros((m, m));
-                        for (r, &axis_r) in border.iter().enumerate() {
-                            for (c, &axis_c) in border.iter().enumerate() {
-                                block[[r, c]] = hessian[[axis_r, axis_c]];
-                            }
-                        }
-                        solve_shared_border_block(topology, block, &gradient)
-                    }
-                    HessianValue::Operator(op) => {
-                        let operator = Arc::clone(op);
-                        shared_border_correction(topology, &operator, &rho, &gradient)
-                    }
-                    _ => {
-                        log::trace!(
-                            "[PER-ATOM-EFS] no usable outer Hessian; shared-border \
-                             correction deferred to decoupled step for this iter"
-                        );
-                        Ok(Array1::<f64>::zeros(rho_dim))
-                    }
-                };
-                match border_step_result {
-                    Ok(border_step) => {
-                        for &axis in topology.border_axes() {
-                            full_step[axis] = border_step[axis];
-                        }
-                    }
-                    Err(err) => {
-                        log::trace!("[PER-ATOM-EFS] shared-border correction skipped: {err}");
-                    }
-                }
-            }
-        }
+        let full_step = finite_step(&efs.steps, "decoupled EFS")?;
 
         // Convergence on the applied (pre-line-search) step ∞-norm.
         let step_inf = full_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
@@ -589,7 +303,7 @@ pub fn run_per_atom_efs(
             break;
         }
 
-        // ── Layer 3: whole-vector cost line search, then apply ──
+        // Whole-vector cost line search, then apply.
         match backtrack_cost(obj, &rho, &full_step, efs.cost, cfg)? {
             Some((rho_new, cost_new, _alpha)) => {
                 rho = rho_new;
@@ -604,12 +318,11 @@ pub fn run_per_atom_efs(
                 log::debug!(
                     "[PER-ATOM-EFS] step rejected at every resolvable halving \
                      (step_inf={:.3e}, tolerance={:.3e}) at cost={:.6e} \
-                     (rho_dim={}, border={}); reporting stall",
+                     (rho_dim={}); reporting stall",
                     step_inf,
                     cfg.tolerance,
                     efs.cost,
                     rho_dim,
-                    topology.border_count(),
                 );
                 break;
             }
@@ -629,32 +342,8 @@ pub fn run_per_atom_efs(
 mod tests {
     use super::*;
     use crate::rho_optimizer::SeedOutcome;
-    use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, OuterEval};
-    use ndarray::array;
-
-    /// Exact outer-Hessian operator for the quadratic mock: `v ↦ A·v`.
-    pub(crate) struct QuadraticOperator {
-        pub(crate) a: Array2<f64>,
-    }
-
-    impl HessianOperator for QuadraticOperator {
-        fn dim(&self) -> usize {
-            self.a.nrows()
-        }
-        fn apply_into(
-            &self,
-            v: &Array1<f64>,
-            out: &mut Array1<f64>,
-        ) -> Result<(), opt::ObjectiveEvalError> {
-            if v.len() != self.a.ncols() || out.len() != self.a.nrows() {
-                return Err(opt::ObjectiveEvalError::fatal(
-                    "quadratic Hessian operator shape mismatch",
-                ));
-            }
-            out.assign(&self.a.dot(v));
-            Ok(())
-        }
-    }
+    use gam_problem::{DeclaredHessianForm, Derivative, EfsEval, HessianValue, OuterEval};
+    use ndarray::{Array2, array};
 
     /// Quadratic mock objective `f(ρ) = ½ (ρ − t)ᵀ A (ρ − t)`.
     ///
@@ -663,8 +352,8 @@ mod tests {
     /// `−g_i / A_ii` (each coordinate's own Newton step from its own gradient
     /// entry and curvature scale — the shape of `compute_efs_update`), `eval`
     /// returns the *same* analytic gradient `A(ρ − t)` plus the exact
-    /// operator, and `eval_cost` the same cost. Every layer of the per-atom
-    /// runner is thereby probed against one shared ground truth.
+    /// Hessian, and `eval_cost` the same cost. The per-atom runner is
+    /// thereby probed against one shared ground truth.
     pub(crate) struct QuadraticObjective {
         pub(crate) a: Array2<f64>,
         pub(crate) target: Array1<f64>,
@@ -700,7 +389,7 @@ mod tests {
             Ok(OuterEval {
                 cost: self.cost(rho),
                 gradient: self.grad(rho),
-                hessian: HessianValue::Operator(Arc::new(QuadraticOperator { a: self.a.clone() })),
+                hessian: HessianValue::Dense(self.a.clone()),
                 inner_beta_hint: None,
             })
         }
@@ -805,7 +494,7 @@ mod tests {
     pub(crate) fn decoupled_primary_converges_on_separable_objective() {
         // Diagonal A: the per-atom decoupled step IS the exact Newton step for
         // every coordinate, so the frontier primary must converge to the
-        // target with no border correction at all.
+        // target.
         let dim = 96; // above PER_ATOM_EFS_MIN_RHO_DIM: a frontier-shaped K
         let a = Array2::from_shape_fn(
             (dim, dim),
@@ -819,9 +508,8 @@ mod tests {
             target: target.clone(),
         };
         let cfg = wide_bounds(dim);
-        let topology = SharedBorderTopology::disjoint(dim);
         let seed = Array1::zeros(dim);
-        let result = run_per_atom_efs(&mut obj, &seed, &cfg, &topology).expect("run");
+        let result = run_per_atom_efs(&mut obj, &seed, &cfg).expect("run");
         assert!(result.converged, "separable quadratic must converge");
         for i in 0..dim {
             assert!(
@@ -854,13 +542,7 @@ mod tests {
             target: target.clone(),
         };
         let cfg = wide_bounds(dim);
-        let result = run_per_atom_efs(
-            &mut obj,
-            &Array1::zeros(dim),
-            &cfg,
-            &SharedBorderTopology::disjoint(dim),
-        )
-        .expect("run");
+        let result = run_per_atom_efs(&mut obj, &Array1::zeros(dim), &cfg).expect("run");
         assert!(result.converged, "separable quadratic must converge");
         assert_eq!(
             result.iterations, 2,
@@ -988,51 +670,9 @@ mod tests {
             a: Array2::eye(dim),
             target: array![3.0, 0.0],
         });
-        let error = run_per_atom_efs(
-            &mut obj,
-            &Array1::zeros(dim),
-            &wide_bounds(dim),
-            &SharedBorderTopology::disjoint(dim),
-        )
-        .err()
-        .expect("a non-finite EFS step must fail the run");
+        let error = run_per_atom_efs(&mut obj, &Array1::zeros(dim), &wide_bounds(dim))
+            .err()
+            .expect("a non-finite EFS step must fail the run");
         assert!(error.to_string().contains("non-finite"), "{error}");
-    }
-
-    #[test]
-    pub(crate) fn theta_hvp_forwards_exactly_to_the_operator_action() {
-        // The matrix-free θ-HVP forwards `v` to the exact outer-Hessian operator
-        // matvec, reproducing H·v of the analytic quadratic bit-for-bit (#1440:
-        // there is no finite-difference branch to approximate it).
-        fn theta_hvp_matrix_free(
-            operator: &Arc<dyn HessianOperator>,
-            v: &Array1<f64>,
-        ) -> Result<Array1<f64>, EstimationError> {
-            if operator.dim() != v.len() {
-                return Err(EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom θ-HVP operator dim {} != vector len {}",
-                    operator.dim(),
-                    v.len()
-                )));
-            }
-            operator.apply(v).map_err(|reason| {
-                EstimationError::RemlOptimizationFailed(format!(
-                    "per-atom θ-HVP operator application failed (dim={}): {reason}",
-                    v.len()
-                ))
-            })
-        }
-
-        let a = array![[2.0, 0.3, 0.0], [0.3, 1.5, -0.2], [0.0, -0.2, 4.0]];
-        let v = array![0.3, -1.1, 0.9];
-        let exact = a.dot(&v);
-        let op: Arc<dyn HessianOperator> = Arc::new(QuadraticOperator { a: a.clone() });
-        let hv_op = theta_hvp_matrix_free(&op, &v).expect("op hvp");
-        for i in 0..3 {
-            assert_eq!(hv_op[i].to_bits(), exact[i].to_bits());
-        }
-        // A dimension mismatch is a hard error, not a silent zero.
-        let wrong = array![1.0, 2.0];
-        assert!(theta_hvp_matrix_free(&op, &wrong).is_err());
     }
 }

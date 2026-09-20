@@ -474,6 +474,11 @@ pub fn lawley_lr_bartlett_factor(
         ));
     }
     let shift = lawley_lr_mean_shift(x, kappas, penalty, tested)?;
+    bartlett_factor_from_conditional_shift(shift, ref_df)
+}
+
+/// `1 + Δε/d` for a fixed-λ shift `Δε` taken at the same λ as `d`.
+fn bartlett_factor_from_conditional_shift(shift: f64, ref_df: f64) -> Result<f64, String> {
     let mean_w = ref_df + shift;
     let factor = crate::inference::higher_order::bartlett_factor_from_mean(mean_w, ref_df)
         .ok_or_else(|| {
@@ -722,10 +727,10 @@ fn lawley_lr_mean_shift_rho_hessian(
 ///   solver already maintains), passed as `rho_cov` (`m × m` for `m`
 ///   smoothing parameters). This is the sampling covariance of ρ̂.
 ///
-/// Returns the **total** mean shift `Δε(ρ̂)`. The
-/// caller forms the Bartlett factor `c = 1 + Δε(ρ̂)/d` exactly as for the
-/// conditional shift; the difference from the conditional factor is the size
-/// correction attributable specifically to ρ̂-variation.
+/// Returns the **total** mean shift `Δε(ρ̂) + δ_ρ`. The ρ̂-variation increment
+/// `δ_ρ` does not scale with the fitted reference's mean, so it is NOT folded
+/// into a Bartlett ratio `1 + total/d`; [`lawley_lr_correction_estimated_lambda`]
+/// applies it as the additive location it is.
 ///
 /// `components` must have one entry per row/column of `rho_cov`; `penalty` is the
 /// total fitted `S_λ` (the conditional anchor). Errors on shape mismatch or a
@@ -817,6 +822,77 @@ pub fn lawley_lr_mean_shift_with_rho_variation(
         ));
     }
     Ok(total)
+}
+
+/// Lawley's LR correction in the form it is applied to a reference law `L`
+/// whose mean is `d`: the corrected reference is `scale·L + location`, and a
+/// statistic `W` is scored as `W* = (W − location)/scale` against `L`.
+///
+/// The two parts of the second-order mean `E[W] = d + Δε(ρ̂) + δ_ρ` enter
+/// differently because they scale differently with the tested block:
+///
+/// * `Δε(ρ̂)` is the fixed-λ shift at the SAME λ the reference is built at. It
+///   is a sum over the tested block's directions and vanishes with them — as
+///   the penalty absorbs the block, `Δε(ρ̂)` falls at least as fast as `d` does
+///   (pinned by `fixed_lambda_factor_stays_bounded_as_the_block_is_absorbed`)
+///   — so `1 + Δε(ρ̂)/d` is a bounded per-component rescale of `L`'s spectral
+///   weights, `w_j → w_j + Δε(ρ̂)·w_j/d`.
+/// * `δ_ρ = ½ tr(H_Δε Cov(ρ̂))` is the ρ̂-variation term. It averages `Δε` over
+///   the λ̂ the fit could have chosen, not the one it did, so it does NOT
+///   vanish with the fitted `d`: a railed fit has `d → 0` while its `Cov(ρ̂)` is
+///   largest. Dividing it by `d` is what made the old ratio `E[W]/d` run to
+///   `10³–10⁴` on railed null terms. It is an additive mean shift of the
+///   reference, and is reported as one.
+///
+/// The smooth-term LR driver applies only the scale. Its reference already
+/// integrates the law over the λ̂ the fit could have chosen (the selection
+/// replay), and `c` rescales that integrated law, so the part of `δ_ρ` carried
+/// by the reference's own λ̂-dependence is counted there. `δ_ρ` itself is the
+/// quadratic expansion of `E[Δε(ρ̂)] − Δε(ρ̂₀)`: `Δε` is a bounded, saturating
+/// function of `e^ρ`, so the true increment is bounded by `Δε`'s range over ρ,
+/// while the expansion grows with `Cov(ρ̂)` without bound — exactly on the
+/// railed terms, where it is largest.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LawleyLrCorrection {
+    /// The fixed-λ Bartlett factor `1 + Δε(ρ̂)/d`.
+    pub scale: f64,
+    /// The ρ̂-variation mean shift `δ_ρ`; `0` when λ is treated as given.
+    pub location: f64,
+}
+
+impl LawleyLrCorrection {
+    /// `W* = (W − location)/scale`, floored at zero: a statistic below the
+    /// reference's location is at the bottom of the corrected law.
+    pub fn corrected_statistic(&self, statistic: f64) -> f64 {
+        ((statistic - self.location) / self.scale).max(0.0)
+    }
+
+    /// The corrected reference's mean shift over `d`: `(scale − 1)·d + location`.
+    pub fn mean_shift(&self, ref_df: f64) -> f64 {
+        (self.scale - 1.0) * ref_df + self.location
+    }
+}
+
+/// The estimated-λ [`LawleyLrCorrection`]: the fixed-λ factor of
+/// [`lawley_lr_bartlett_factor`] as the scale and the ρ̂-variation increment of
+/// [`lawley_lr_mean_shift_with_rho_variation`] as the location.
+pub fn lawley_lr_correction_estimated_lambda(
+    x: ArrayView2<'_, f64>,
+    kappas: &[RowKappas],
+    penalty: ArrayView2<'_, f64>,
+    tested: std::ops::Range<usize>,
+    components: &[RhoPenaltyComponent],
+    rho_cov: ArrayView2<'_, f64>,
+    ref_df: f64,
+) -> Result<LawleyLrCorrection, String> {
+    let conditional = lawley_lr_mean_shift(x, kappas, Some(penalty), tested.clone())?;
+    let scale = bartlett_factor_from_conditional_shift(conditional, ref_df)?;
+    let total =
+        lawley_lr_mean_shift_with_rho_variation(x, kappas, penalty, tested, components, rho_cov)?;
+    Ok(LawleyLrCorrection {
+        scale,
+        location: total - conditional,
+    })
 }
 
 /// Expected jets for a GLM family/link pair at linear predictor `eta` with an
@@ -1721,6 +1797,111 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// A Poisson slope tested beside an intercept, with the slope's ridge
+    /// strength as the one smoothing parameter, and the LR reference mean
+    /// `d = 1 − (1 − p)²` of that block at share `p = I/(I + s)`, where `I` is the
+    /// slope's Schur-complemented Fisher information.
+    fn absorbed_slope_fixture(strength: f64) -> (Array2<f64>, Vec<RowKappas>, Array2<f64>, f64) {
+        let n = 50usize;
+        let mut x = Array2::<f64>::ones((n, 2));
+        let mut kappas = Vec::with_capacity(n);
+        let (mut weight, mut first, mut second) = (0.0, 0.0, 0.0);
+        for i in 0..n {
+            let z = -0.5 + i as f64 / (n - 1) as f64;
+            x[[i, 1]] = z;
+            let eta = 0.3 + 0.6 * z;
+            kappas.push(RowExpectedJets::poisson_log(eta).kappas().expect("kappas"));
+            let mu = eta.exp();
+            weight += mu;
+            first += mu * z;
+            second += mu * z * z;
+        }
+        let information = second - first * first / weight;
+        let share = information / (information + strength);
+        let mut penalty = Array2::<f64>::zeros((2, 2));
+        penalty[[1, 1]] = strength;
+        (x, kappas, penalty, 1.0 - (1.0 - share) * (1.0 - share))
+    }
+
+    /// L1: the fixed-λ factor `1 + Δε/d` is a ratio of two quantities taken at
+    /// the same λ, and `Δε` falls at least as fast as `d` as the penalty absorbs
+    /// the tested block — so the factor goes to one, it does not explode.
+    #[test]
+    fn fixed_lambda_factor_stays_bounded_as_the_block_is_absorbed() {
+        let mut previous = f64::INFINITY;
+        for strength in [1.0, 1e2, 1e4, 1e6, 1e8] {
+            let (x, kappas, penalty, ref_df) = absorbed_slope_fixture(strength);
+            let factor =
+                lawley_lr_bartlett_factor(x.view(), &kappas, Some(penalty.view()), 1..2, ref_df)
+                    .expect("fixed-lambda factor");
+            let excess = (factor - 1.0).abs();
+            assert!(
+                excess <= previous,
+                "strength {strength}: |c − 1| = {excess} grew from {previous} (d = {ref_df})"
+            );
+            previous = excess;
+        }
+        assert!(previous < 1e-6, "absorbed block keeps |c − 1| = {previous}");
+    }
+
+    /// L1: the ρ̂-variation term averages `Δε` over the λ̂ the fit could have
+    /// chosen, so near a rail — `d → 0` while `Cov(ρ̂)` is the inverse of a
+    /// vanishing curvature — it does not shrink with `d`. As a ratio `E[W]/d`
+    /// it is unbounded; as the location it is, the corrected reference has
+    /// exactly Lawley's mean and a bounded scale.
+    #[test]
+    fn rho_variation_is_a_location_not_a_ratio() {
+        let (x, kappas, penalty, ref_df) = absorbed_slope_fixture(1e4);
+        let components = vec![RhoPenaltyComponent {
+            s_component: penalty.clone(),
+        }];
+        let rho_cov = Array2::from_shape_vec((1, 1), vec![1e8]).unwrap();
+        let total = lawley_lr_mean_shift_with_rho_variation(
+            x.view(),
+            &kappas,
+            penalty.view(),
+            1..2,
+            &components,
+            rho_cov.view(),
+        )
+        .expect("total shift");
+        let conditional =
+            lawley_lr_mean_shift(x.view(), &kappas, Some(penalty.view()), 1..2).expect("shift");
+        let ratio = crate::inference::higher_order::bartlett_factor_from_mean(
+            ref_df + total,
+            ref_df,
+        )
+        .expect("ratio");
+        assert!(ratio > 10.0, "fixture no longer rails the ratio: E[W]/d = {ratio}");
+
+        let correction = lawley_lr_correction_estimated_lambda(
+            x.view(),
+            &kappas,
+            penalty.view(),
+            1..2,
+            &components,
+            rho_cov.view(),
+            ref_df,
+        )
+        .expect("correction");
+        // The scale is exactly the fixed-λ factor, and on this absorbed block it
+        // sits within `1e-4` of one while the ratio construction is past ten.
+        assert_eq!(correction.scale, (ref_df + conditional) / ref_df);
+        assert!(
+            (correction.scale - 1.0).abs() < 1e-4,
+            "scale {} is not the absorbed block's fixed-lambda factor",
+            correction.scale
+        );
+        assert_eq!(correction.location, total - conditional);
+        assert!((correction.mean_shift(ref_df) - total).abs() <= 1e-15 * (1.0 + total.abs()));
+        let statistic = 3.0;
+        assert_eq!(
+            correction.corrected_statistic(statistic),
+            (statistic - correction.location) / correction.scale
+        );
+        assert_eq!(correction.corrected_statistic(0.5 * correction.location), 0.0);
     }
 
     #[test]

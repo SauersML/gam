@@ -1481,11 +1481,23 @@ fn build_predict_input_for_model_inner(
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
                 })?;
+            // The slope offset is a slope on the score as given; the model reads the
+            // score `(z − mean)/sd`, on which the same slope is `sd` times it, the
+            // factor the fit applied (gam#3231).
+            let score_sd = model
+                .latent_z_normalization
+                .as_ref()
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: "marginal-slope prediction requires the saved latent-z normalization"
+                        .to_string(),
+                })?
+                .sd;
             let slope_offset = design_slope
                 .compose_offset(offset_noise.view(), "marginal-slope slope prediction")
                 .map_err(|error| PredictInputError::InvalidInput {
                     reason: error.to_string(),
-                })?;
+                })?
+                * score_sd;
             let local = build_marginal_slope_local_auxiliary_matrix(model, design_input, col_map)?;
             let auxiliary_matrix = match model.residual_repair.as_ref() {
                 None => local,
@@ -1619,9 +1631,9 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, PredictInputError> {
         let runtime = self.saved_prediction_runtime()?;
-        let Some(conditional) = runtime.latent_z_conditional_calibration.as_ref() else {
+        if runtime.latent_z_conditional_calibration.is_none() {
             return Ok(None);
-        };
+        }
         if self.survival_marginal_slope_joint_latent_law.is_some() {
             return Err(PredictInputError::InvalidInput {
                 reason: "latent conditional residual: the model is anchored on the joint latent \
@@ -1629,13 +1641,6 @@ impl FittedModel {
                     .to_string(),
             });
         }
-        let normalization =
-            self.latent_z_normalization
-                .as_ref()
-                .ok_or_else(|| PredictInputError::MissingMetadata {
-                    reason: "latent conditional residual requires the saved latent-z normalization"
-                        .to_string(),
-                })?;
         let z_raw = crate::inference::ctn::latent_scores(self, data, col_map)
             .map_err(|reason| PredictInputError::InvalidInput { reason })?;
         let spec = resolve_termspec_for_prediction(
@@ -1651,14 +1656,35 @@ impl FittedModel {
                 reason: format!("failed to build the conditioning design: {e}"),
             }
         })?;
+        self.fitted_latent_score(&z_raw, &design.design, "latent conditional residual")
+            .map(Some)
+    }
+
+    /// Each row's fitted latent score (gam#3016): `z_raw` through the map this saved
+    /// marginal-slope model applied to its latent score before any kernel read it, the
+    /// saved normalisation and then the rank-INT or the conditional location-scale
+    /// calibration the fit minted, the conditional one reading `a` as the whole of
+    /// `conditioning`. A host that replays the fitted model on rows of its own, as the
+    /// saved-model ALO does, reads the score here instead of composing the maps itself.
+    pub fn fitted_latent_score(
+        &self,
+        z_raw: &Array1<f64>,
+        conditioning: &DesignMatrix,
+        context: &str,
+    ) -> Result<Array1<f64>, PredictInputError> {
+        let normalization =
+            self.latent_z_normalization
+                .as_ref()
+                .ok_or_else(|| PredictInputError::MissingMetadata {
+                    reason: format!("{context} requires the saved latent-z normalization"),
+                })?;
         FittedLatentScoreMap {
             normalization,
-            rank_int: runtime.latent_z_rank_int_calibration.as_ref(),
-            conditional: Some(conditional),
+            rank_int: self.latent_z_rank_int_calibration.as_ref(),
+            conditional: self.latent_z_conditional_calibration.as_ref(),
             span: LatentConditioningSpan::PrimaryDesign,
         }
-        .apply(&z_raw, &design.design, "latent conditional residual")
-        .map(Some)
+        .apply(z_raw, conditioning, context)
         .map_err(|error| PredictInputError::InvalidInput {
             reason: error.to_string(),
         })

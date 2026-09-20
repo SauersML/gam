@@ -2307,7 +2307,6 @@ pub(crate) fn aniso_distance_and_components(
     let mut scaled_components = Vec::with_capacity(d);
     for a in 0..d {
         let h_a = data_row[a] - center[a];
-        // Clamp exp(2ψ) to avoid overflow/underflow: ψ in [-50, 50].
         let scale_a = aniso_axis_scale(eta[a], eta_mean);
         let scaled_h_a = scale_a * h_a;
         let s_a = scaled_h_a * scaled_h_a;

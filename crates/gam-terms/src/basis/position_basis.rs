@@ -10,14 +10,16 @@
 //! wrap period the basis and penalty share. The bindings forward the request
 //! here unchanged, so no front door resolves a basis of its own.
 //!
-//! An omitted basis size takes the formula front door's univariate default for
-//! the same kind on the same data: the open B-spline internal-knot pilot,
-//! the cyclic basis dimension, and the 1-D Duchon center count.
+//! An omitted basis size takes the formula front door's provisioned univariate
+//! default for the same kind on the same data (a position basis is never grown
+//! by the resolution loop): the open B-spline internal-knot count, the cyclic
+//! basis dimension, and the 1-D Duchon center count.
 
 use super::*;
 use crate::term_builder::{
-    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, cyclic_basis_dim_for_column,
-    default_duchon_center_count, pilot_internal_knots_for_column, univariate_spline_basis_dim,
+    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, default_duchon_center_count,
+    provisioned_cyclic_basis_dim, provisioned_internal_knots_for_column,
+    univariate_spline_basis_dim,
 };
 
 /// Where a position basis's knots or centers come from.
@@ -188,7 +190,7 @@ pub fn resolve_position_basis(
             (centers, order, period)
         }
     };
-    let penalty = position_penalty(kind, penalty, locations.view(), order, period)?;
+    let penalty = position_penalty(t, kind, penalty, locations.view(), order, period)?;
     Ok(ResolvedPositionBasis {
         display_kind,
         kind,
@@ -218,9 +220,9 @@ fn finite_nonempty(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String
 /// - An explicit knot vector or cyclic grid is used as given.
 /// - An integer `K` is the internal-knot count, open or cyclic: `K + degree + 1`
 ///   basis functions, the dimension `s(x)` gives the same `K`.
-/// - The default is the formula's: [`pilot_internal_knots_for_column`] internal
-///   knots for an open basis, [`cyclic_basis_dim_for_column`] functions for a
-///   cyclic one.
+/// - The default is the formula's provisioned one:
+///   [`provisioned_internal_knots_for_column`] internal knots for an open
+///   basis, [`provisioned_cyclic_basis_dim`] functions for a cyclic one.
 /// - Open knots are placed at quantiles by [`auto_knot_vector_1d_quantile`],
 ///   which may lower the degree for a short `t` (#340).
 /// - A cyclic grid is uniform from `min t` over one `period`, or over
@@ -242,7 +244,7 @@ fn bspline_locations(
                 });
             }
             PositionBasisLocations::Count(count) => count,
-            PositionBasisLocations::Default => pilot_internal_knots_for_column(t),
+            PositionBasisLocations::Default => provisioned_internal_knots_for_column(t),
         };
         let auto = auto_knot_vector_1d_quantile(t, internal_knots, degree)
             .map_err(|err| err.to_string())?;
@@ -261,7 +263,7 @@ fn bspline_locations(
             });
         }
         PositionBasisLocations::Count(count) => count + degree + 1,
-        PositionBasisLocations::Default => cyclic_basis_dim_for_column(t, degree),
+        PositionBasisLocations::Default => provisioned_cyclic_basis_dim(t, degree),
     };
     let low = t.iter().copied().fold(f64::INFINITY, f64::min);
     let high = match period {
@@ -317,13 +319,14 @@ pub struct ResolvedBasisLocations {
 /// `duchon_basis(x)` the centers of `duchon(x)`:
 ///
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the
-///   internal-knot count (the request's, or [`pilot_internal_knots_for_column`])
-///   is placed at quantiles by [`auto_knot_vector_1d_quantile`].
+///   internal-knot count (the request's, or
+///   [`provisioned_internal_knots_for_column`]) is placed at quantiles by
+///   [`auto_knot_vector_1d_quantile`].
 /// - Cyclic B-spline: an explicit grid is used as given; otherwise the uniform
 ///   grid over `[min t, max t]` with one cyclic control per interval. An
 ///   integer `K` names the same dimension it does for an open basis,
 ///   `K + degree + 1` controls; the default is the formula's cyclic basis
-///   dimension [`cyclic_basis_dim_for_column`].
+///   dimension [`provisioned_cyclic_basis_dim`].
 /// - Duchon: an explicit center vector is used as given; otherwise the center
 ///   count (the request's, at least 2, or the formula's 1-D Duchon default) is
 ///   placed by equal mass.
@@ -385,7 +388,7 @@ fn default_univariate_duchon_center_count(t: ArrayView1<'_, f64>) -> usize {
         n,
         1,
         polynomial_cols,
-        univariate_spline_basis_dim(t, t.len()),
+        univariate_spline_basis_dim(t),
     )
 }
 
@@ -456,6 +459,7 @@ pub fn validate_position_period(
 
 /// The single-λ penalty of a resolved position basis.
 fn position_penalty(
+    t: ArrayView1<'_, f64>,
     kind: PositionBasisKind,
     request: PositionPenaltyRequest,
     locations: ArrayView1<'_, f64>,
@@ -503,18 +507,7 @@ fn position_penalty(
                     ));
                 }
             }
-            let periodic = period.is_some();
-            let (nullspace_order, power) = duchon_cubic_default_with_periodicity(1, periodic);
-            let centers = locations.insert_axis(Axis(1));
-            duchon_function_norm_penalty(
-                centers,
-                None,
-                nullspace_order,
-                power,
-                &[periodic],
-                period,
-            )
-            .map_err(|err| err.to_string())
+            duchon_position_penalty(t, locations, order, period)
         }
         PositionBasisKind::BSpline => {
             match normalized.as_deref() {
@@ -557,6 +550,61 @@ fn position_penalty(
     }
 }
 
+/// The function-norm Gram of the Duchon position design, in that design's
+/// coefficient frame.
+///
+/// The position design (`position_basis_design` in the bindings) is the Duchon
+/// basis of order `m = order` built over the sample positions `t`, and an open
+/// basis carries the data-metric radial chart `V` solved over `t` (#1355). Its
+/// `PenaltySource::Primary` block is the native Gram in that chart,
+/// `(ZV)ᵀ K_CC (ZV)`. The penalty must be that block from the same build:
+/// a Gram built over the centers instead is expressed in the centers' chart
+/// (a different `V`, and a different width once `n < K` truncates the chart),
+/// and a fixed cubic null space ignores the requested order `m`.
+fn duchon_position_penalty(
+    t: ArrayView1<'_, f64>,
+    centers: ArrayView1<'_, f64>,
+    order: usize,
+    period: Option<f64>,
+) -> Result<Array2<f64>, String> {
+    let spec = DuchonBasisSpec {
+        radial_reparam: None,
+        center_strategy: CenterStrategy::UserProvided(centers.insert_axis(Axis(1)).to_owned()),
+        periodic: None,
+        length_scale: None,
+        power: 0.0,
+        nullspace_order: duchon_nullspace_order_from_m(order),
+        identifiability: SpatialIdentifiability::None,
+        aniso_log_scales: None,
+        operator_penalties: Default::default(),
+        boundary: OneDimensionalBoundary::Open,
+    };
+    let data = t.insert_axis(Axis(1));
+    let built = match period {
+        Some(period) => build_duchon_basis_mixed_periodicity_auto(
+            data,
+            &spec,
+            &[true],
+            Some(std::slice::from_ref(&period)),
+        ),
+        None => {
+            // The same strict operator policy the batched design uses to
+            // freeze its chart, so the n x p design is never materialized.
+            let mut workspace = BasisWorkspace::with_policy(
+                gam_runtime::resource::ResourcePolicy::analytic_operator_required(),
+            );
+            build_duchon_basiswithworkspace(data, &spec, &mut workspace)
+        }
+    }
+    .map_err(|err| format!("failed to build the Duchon position penalty: {err}"))?;
+    built
+        .active_penalties
+        .into_iter()
+        .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary))
+        .map(|penalty| penalty.matrix)
+        .ok_or_else(|| "the Duchon builder emitted no Primary function-norm Gram".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -580,7 +628,7 @@ mod tests {
             None,
         )
         .expect("default open B-spline");
-        let internal = pilot_internal_knots_for_column(t.view());
+        let internal = provisioned_internal_knots_for_column(t.view());
         assert_eq!(open.kind, PositionBasisKind::BSpline);
         assert_eq!(open.display_kind, "bspline");
         assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
@@ -597,7 +645,7 @@ mod tests {
             Some(1.0),
         )
         .expect("default cyclic B-spline");
-        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
+        let num_basis = provisioned_cyclic_basis_dim(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         assert_eq!(cyclic.penalty.nrows(), num_basis);
         let origin = t.iter().copied().fold(f64::INFINITY, f64::min);
@@ -619,7 +667,7 @@ mod tests {
         assert_eq!(duchon.order, 2);
         assert_eq!(duchon.locations.len(), default_univariate_duchon_center_count(t.view()));
         assert!(
-            duchon.locations.len() >= univariate_spline_basis_dim(t.view(), t.len()),
+            duchon.locations.len() >= univariate_spline_basis_dim(t.view()),
             "the 1-D Duchon default is floored at the open s(x) dimension (#1867)"
         );
     }
@@ -641,7 +689,7 @@ mod tests {
         assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
         assert_eq!(
             open.locations.len() - open.order - 1,
-            univariate_spline_basis_dim(t.view(), t.len())
+            univariate_spline_basis_dim(t.view())
         );
 
         let cyclic = resolve_basis_locations_1d(
@@ -652,7 +700,7 @@ mod tests {
             true,
         )
         .expect("default cyclic grid");
-        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
+        let num_basis = provisioned_cyclic_basis_dim(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         let low = t.iter().copied().fold(f64::INFINITY, f64::min);
         let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -836,5 +884,66 @@ mod tests {
             )
             .contains("only valid when periodic=true")
         );
+    }
+
+    /// The Duchon position penalty is the Primary block of the position
+    /// design's own build: order `m`, data-metric chart over `t`. It used to be
+    /// the cubic Gram built over the centers, which is in a different chart,
+    /// ignores `m`, and has the wrong width once `n < K`.
+    #[test]
+    fn duchon_position_penalty_is_the_design_frame_gram() {
+        let dense = positions();
+        let sparse = Array1::from(vec![0.1, 0.35, 0.5, 0.72, 0.9]);
+        let given = Array1::linspace(0.05, 0.95, 8);
+        let cases = [
+            (dense.clone(), PositionBasisLocations::Count(8)),
+            (sparse.clone(), PositionBasisLocations::Given(given.clone())),
+        ];
+        for (t, request) in cases {
+            for m in [2usize, 3] {
+                let resolved = resolve_position_basis(
+                    t.view(),
+                    Some("duchon"),
+                    request.clone(),
+                    PositionPenaltyRequest::Canonical,
+                    Some(m),
+                    false,
+                    None,
+                )
+                .expect("open Duchon position basis");
+                let spec = DuchonBasisSpec {
+                    radial_reparam: None,
+                    center_strategy: CenterStrategy::UserProvided(
+                        resolved.locations.clone().insert_axis(Axis(1)),
+                    ),
+                    periodic: None,
+                    length_scale: None,
+                    power: 0.0,
+                    nullspace_order: duchon_nullspace_order_from_m(m),
+                    identifiability: SpatialIdentifiability::None,
+                    aniso_log_scales: None,
+                    operator_penalties: Default::default(),
+                    boundary: OneDimensionalBoundary::Open,
+                };
+                let built = build_duchon_basis(t.view().insert_axis(Axis(1)), &spec)
+                    .expect("position design build");
+                let expected = built
+                    .active_penalties
+                    .iter()
+                    .find(|p| matches!(p.info.source, PenaltySource::Primary))
+                    .map(|p| p.matrix.clone())
+                    .expect("Primary Gram");
+                let label = format!("n={} m={m}", t.len());
+                assert_eq!(resolved.penalty.dim(), expected.dim(), "{label}");
+                assert_eq!(resolved.penalty.ncols(), built.design.ncols(), "{label}");
+                let scale = expected.iter().fold(0.0_f64, |a, v| a.max(v.abs())).max(1.0);
+                for (got, want) in resolved.penalty.iter().zip(expected.iter()) {
+                    assert!(
+                        (got - want).abs() <= 1.0e-8 * scale,
+                        "{label}: penalty {got} vs design-frame Gram {want}"
+                    );
+                }
+            }
+        }
     }
 }

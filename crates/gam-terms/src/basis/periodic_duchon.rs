@@ -1856,7 +1856,7 @@ fn reject_nonpsd_then_clamp_noise(matrix: &Array2<f64>) -> Result<Array2<f64>, B
         });
     }
     // λ_min is at the noise floor: clamp the harmless negative residue to zero.
-    Ok(project_penalty_to_psd_cone(&sym))
+    project_penalty_to_psd_cone(&sym, "Duchon constrained bending penalty")
 }
 
 /// The STRUCTURAL null frame of the Duchon curvature seminorm, in the chart
