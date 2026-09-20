@@ -315,20 +315,25 @@ fn build_term_collection_design_inner_with_policy_and_plan(
     // a unit ridge on its latent logit coordinate, centred at the null. The
     // latent coordinate is dimensionless, so the unit scale carries no
     // covariate units; the bounded fit applies this block in latent space.
+    //
+    // `LinearTermSpec::owns_penalty_block` is the one statement of which
+    // terms own a block here; `TermCollectionSpec::random_effect_penalty_index`
+    // reads the same predicate to locate a random-effect ridge in a saved fit.
     for (j, linear) in spec.linear_terms.iter().enumerate() {
+        if !linear.owns_penalty_block() {
+            continue;
+        }
+        // A `double_penalty` term always has its function mass here; the
+        // remaining owners are bounded-shrinkage coefficients.
         let (mass, source) = match linear_function_masses.get(j).copied().flatten() {
             Some(function_mass) => (function_mass, "LinearTermRidge"),
-            None if matches!(
-                linear.coefficient_geometry,
-                LinearCoefficientGeometry::Bounded {
-                    prior: BoundedCoefficientPriorSpec::Shrinkage,
-                    ..
-                }
-            ) =>
-            {
-                (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE)
+            None if !linear.double_penalty => (1.0, BOUNDED_SHRINKAGE_PENALTY_SOURCE),
+            None => {
+                return Err(BasisError::InvalidInput(format!(
+                    "linear term '{}' owns a function-mass ridge but its mass was not realized",
+                    linear.name,
+                )));
             }
-            None => continue,
         };
         let col = p_intercept + j;
         let global_index = penalties.len();
@@ -1154,7 +1159,7 @@ impl GlobalIdentifiabilityPlan {
 ///
 /// This is `z_local` — the term-local half. After
 /// `realize_smooth_collection_gauge` runs, the metadata carries the
-/// COMPOSITION `z_local · T`, so this must be read BEFORE the gauge composes,
+/// COMPOSITION `z_local · Q · T`, so this must be read BEFORE the gauge composes,
 /// which is exactly where [`SmoothCollectionGauge::local_identifiability_transform`]
 /// is filled from (gam#2760).
 ///
@@ -1199,9 +1204,11 @@ fn basis_local_identifiability_transform(metadata: &BasisMetadata) -> Option<Arr
             constraint_transform,
             ..
         } => constraint_transform.clone(),
+        // A `by=` wrapper keeps its inner basis's chart, in the slot
+        // `with_identifiability_transform` composes into.
+        BasisMetadata::BySmooth { inner, .. } => basis_local_identifiability_transform(inner),
         BasisMetadata::Pca { .. }
         | BasisMetadata::SphereHarmonics { .. }
-        | BasisMetadata::BySmooth { .. }
         | BasisMetadata::FactorSmooth { .. } => None,
     }
 }
@@ -1312,7 +1319,11 @@ pub(crate) fn realize_smooth_collection_gauge(
         termname,
     )?;
     let projector = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?;
-    let (design, row_space_correction) = projector.project_design(design, termname)?;
+    let row_space_correction = projector.row_space_correction(&design, termname)?;
+    // `X_local T0 − C R` through the function the saved model's replay forms it
+    // with, so the fit's design and its rebuild are one computation (#3001).
+    let design =
+        subtract_row_space_correction(design, block, row_space_correction.view(), termname)?;
     let residualization = crate::basis::ParametricResidualization {
         coefficient_transform: coefficient_transform.clone(),
         row_space_correction,
@@ -1422,6 +1433,7 @@ pub fn place_term_in_collection_gauge(
     let parametric_residualization = Some(ParametricResidualizationChart {
         owner_terms: gauge.owner_terms.clone(),
         has_parametric_block: gauge.has_parametric_block,
+        coefficient_transform: realized.coefficient_transform.clone(),
         correction: realized.residualization.row_space_correction.clone(),
     });
     Ok(CollectionGaugedTerm {
@@ -1901,8 +1913,8 @@ fn apply_global_smooth_identifiability(
             .collect::<Vec<_>>();
         // A frozen span-preserving residualization (#2747) says this term's
         // realized block is `X·T − C·R`, so `C` must be rebuilt at these rows
-        // whatever the transform gates say — the metadata already carried `T`
-        // through, and the correction is the half it could not absorb.
+        // whatever the transform gates say. The chart carries `T` and `R`
+        // both, and the replay applies them in the fit's order (#3001).
         let replay_correction = frozen_parametric_residualization(termspec);
         let needs_parametric_block = match replay_correction {
             Some(chart) => chart.has_parametric_block,
@@ -2063,7 +2075,7 @@ fn apply_global_smooth_identifiability(
             (realized.design, Some(realized.coefficient_transform))
         } else {
             // No gauge: either there is nothing to be orthogonal to, or this is
-            // a REPLAY, where the fit already decided both halves and only `C`
+            // a REPLAY, where the fit already decided `T` and `R` and only `C`
             // is rebuilt at the new rows.
             let z_opt = if let Some(z) = replay_z {
                 if design_local.ncols() != z.nrows() {
@@ -2075,6 +2087,19 @@ fn apply_global_smooth_identifiability(
                     );
                 }
                 Some(z.clone())
+            } else if let Some(chart) = replay_correction {
+                // The collection chart `T0` the fit applied to `X_local · Q`,
+                // applied here to the same product, so the replay forms
+                // `(X_local · Q) · T0` exactly as the fit did (#3001).
+                if design_local.ncols() != chart.coefficient_transform.nrows() {
+                    gam_problem::bail_dim_basis!(
+                        "frozen collection chart mismatch for term '{}': rebuilt design has {} columns but the persisted fit-time chart has {} rows",
+                        term.name,
+                        design_local.ncols(),
+                        chart.coefficient_transform.nrows()
+                    );
+                }
+                Some(chart.coefficient_transform.clone())
             } else if skip_global_transform {
                 None
             } else {
@@ -2175,6 +2200,7 @@ fn apply_global_smooth_identifiability(
             .map(|plan| ParametricResidualizationChart {
                 owner_terms: owner_indices.clone(),
                 has_parametric_block: parametric_block.is_some(),
+                coefficient_transform: plan.coefficient_transform.clone(),
                 correction: plan.row_space_correction.clone(),
             })
             .or_else(|| replay_correction.cloned());
@@ -2583,7 +2609,7 @@ fn penalty_candidates_under_collection_gauge(
             } else {
                 raw
             };
-            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+            let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense())?;
             let matrix = restricted.scaled(1.0 / c_new, "normalized global smooth penalty")?;
             Ok(PenaltyCandidate {
                 matrix,
@@ -2716,7 +2742,7 @@ fn penalty_candidates_under_collection_gauge(
                         full_factor,
                         "embedded global smooth null ridge",
                     )?;
-                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense());
+                    let (_, scale) = normalize_penalty_in_constrained_space(full.dense())?;
                     candidate.matrix = full
                         .scaled(1.0 / scale, "normalized embedded global smooth null ridge")?;
                     candidate.normalization_scale = scale;
@@ -2946,9 +2972,35 @@ fn compose_identifiability_transforms(
     }
 }
 
+/// `metadata` with `transform` composed onto the identifiability chart it
+/// already carries.
 fn with_identifiability_transform(
     metadata: &BasisMetadata,
     transform: Option<&Array2<f64>>,
+) -> Result<BasisMetadata, BasisError> {
+    map_identifiability_transform(metadata, &|existing| {
+        compose_identifiability_transforms(existing, transform)
+    })
+}
+
+/// `metadata` with its identifiability chart REPLACED by `transform`.
+///
+/// The freeze of a collection-gauged term writes the TERM-LOCAL chart the
+/// gauge was derived on, not the composition its metadata records, because a
+/// replay applies the local chart, the joint-null rotation and the collection
+/// chart as three products, as the fit does (#3001).
+pub(crate) fn with_replaced_identifiability_transform(
+    metadata: &BasisMetadata,
+    transform: Option<&Array2<f64>>,
+) -> Result<BasisMetadata, BasisError> {
+    map_identifiability_transform(metadata, &|_| Ok(transform.cloned()))
+}
+
+/// `metadata` with `chart` applied to its identifiability-transform slot: the
+/// one place that knows which slot each basis kind keeps its chart in.
+fn map_identifiability_transform(
+    metadata: &BasisMetadata,
+    chart: &dyn Fn(Option<&Array2<f64>>) -> Result<Option<Array2<f64>>, BasisError>,
 ) -> Result<BasisMetadata, BasisError> {
     match metadata {
         BasisMetadata::BSpline1D {
@@ -2961,10 +3013,7 @@ fn with_identifiability_transform(
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
             degree: *degree,
             auto_shrink_note: auto_shrink_note.clone(),
             // The offset coefficients live in the raw-basis chart and are
@@ -2977,10 +3026,7 @@ fn with_identifiability_transform(
             identifiability_transform,
         } => Ok(BasisMetadata::CubicRegression1D {
             knots: knots.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::ThinPlate {
             centers,
@@ -2993,10 +3039,7 @@ fn with_identifiability_transform(
             centers: centers.clone(),
             length_scale: *length_scale,
             periodic: periodic.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
             input_scale: *input_scale,
             radial_reparam: radial_reparam.clone(),
         }),
@@ -3013,10 +3056,7 @@ fn with_identifiability_transform(
             method: *method,
             max_degree: *max_degree,
             wahba_kernel: *wahba_kernel,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
         }),
         BasisMetadata::ConstantCurvature {
             centers,
@@ -3027,10 +3067,7 @@ fn with_identifiability_transform(
             centers: centers.clone(),
             kappa: *kappa,
             length_scale: *length_scale,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
         }),
         BasisMetadata::MeasureJet {
             centers,
@@ -3058,10 +3095,7 @@ fn with_identifiability_transform(
             penalty_normalization_scales: penalty_normalization_scales.clone(),
             raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
             fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
             sigma_coord: *sigma_coord,
         }),
         BasisMetadata::Matern {
@@ -3073,19 +3107,46 @@ fn with_identifiability_transform(
             identifiability_transform,
             input_scale,
             aniso_log_scales,
-        } => Ok(BasisMetadata::Matern {
-            centers: centers.clone(),
-            length_scale: *length_scale,
-            periodic: periodic.clone(),
-            nu: *nu,
-            include_intercept: *include_intercept,
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
-            input_scale: *input_scale,
-            aniso_log_scales: aniso_log_scales.clone(),
-        }),
+        } => {
+            // Every consumer of the Matérn chart applies it to the KERNEL
+            // columns only: the design rebuild, the operator-penalty triplet
+            // and predict each form `K·Z` and append the `include_intercept`
+            // constant after it, as `[K·Z | 1]`. A collection transform is
+            // expressed on the realized `[K·Z | 1]` columns, so it composes
+            // with `Z` only when no column is appended. With one appended, no
+            // kernel-only chart reproduces it. The composition then either
+            // fails on shape, or it matches `Z`'s shape when the transform
+            // removes exactly one column, and is silently taken for `Z`. The
+            // penalty is then built one column wider than the design (#3632).
+            //
+            // A centered term always gets such a transform: it centers the
+            // appended constant away against the model's constant. An
+            // uncentered one (`identifiability=none`) gets one only when its
+            // joint penalty has a null space, and the joint-null rotation then
+            // acts on all realized columns. When the penalties jointly have
+            // full rank (the double penalty shrinks the constant), no
+            // transform arrives and `[K·Z | 1]` is realized as is.
+            if *include_intercept && chart(None)?.is_some() {
+                crate::bail_invalid_basis!(
+                    "matern include_intercept=true appends a constant column after the kernel \
+                     chart, but this term collection transforms the term's realized columns: it \
+                     centers the term against the model's constant, or it rotates the term's \
+                     joint penalty null space into the parametric block. The Matérn chart acts \
+                     on the kernel columns alone, so it cannot carry that transform. The \
+                     model's intercept already spans the constant; drop include_intercept=true"
+                );
+            }
+            Ok(BasisMetadata::Matern {
+                centers: centers.clone(),
+                length_scale: *length_scale,
+                periodic: periodic.clone(),
+                nu: *nu,
+                include_intercept: *include_intercept,
+                identifiability_transform: chart(identifiability_transform.as_ref())?,
+                input_scale: *input_scale,
+                aniso_log_scales: aniso_log_scales.clone(),
+            })
+        }
         BasisMetadata::Duchon {
             centers,
             length_scale,
@@ -3109,10 +3170,7 @@ fn with_identifiability_transform(
             operator_collocation_points: operator_collocation_points.clone(),
             radial_reparam: radial_reparam.clone(),
             spectral_basis: spectral_basis.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::SphereHarmonics {
             max_degree,
@@ -3134,10 +3192,7 @@ fn with_identifiability_transform(
             degrees: degrees.clone(),
             periods: periods.clone(),
             is_cr: is_cr.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::BySmooth {
             inner,
@@ -3145,7 +3200,7 @@ fn with_identifiability_transform(
             levels,
             ordered,
         } => Ok(BasisMetadata::BySmooth {
-            inner: Box::new(with_identifiability_transform(inner, transform)?),
+            inner: Box::new(map_identifiability_transform(inner, chart)?),
             by_col: *by_col,
             levels: levels.clone(),
             ordered: *ordered,
@@ -3166,7 +3221,7 @@ fn with_identifiability_transform(
             // `s(x) + fs(x, g)` unpredictable — reject loudly so any future
             // caller that reaches this arm with a transform fails at fit time
             // rather than corrupting the saved coefficient chart.
-            if transform.is_some() {
+            if chart(None)?.is_some() {
                 gam_problem::bail_invalid_basis!(
                     "FactorSmooth metadata cannot absorb an identifiability transform; \
                      route it through the term-level frozen_global_orthogonality carrier"
@@ -3196,7 +3251,7 @@ fn with_identifiability_transform(
             // (the constraint, if any, lives inside the PCA loadings
             // themselves), so the caller cannot meaningfully attach a
             // post-hoc Z transform here.
-            if transform.is_some() {
+            if chart(None)?.is_some() {
                 gam_problem::bail_invalid_basis!(
                     "PCA bases do not expose a composable identifiability transform"
                 );
@@ -3533,5 +3588,91 @@ mod frozen_linear_term_mass_rebuild_tests {
             "the rebuilt design must carry the REUSED training-time mass, not a value \
              recomputed from the (all-zero) evaluation rows"
         );
+    }
+}
+
+#[cfg(test)]
+mod random_effect_penalty_index_tests {
+    use super::*;
+
+    fn linear(
+        name: &str,
+        col: usize,
+        double_penalty: bool,
+        geometry: LinearCoefficientGeometry,
+    ) -> LinearTermSpec {
+        LinearTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            feature_cols: vec![col],
+            categorical_levels: Vec::new(),
+            double_penalty,
+            coefficient_geometry: geometry,
+            coefficient_min: None,
+            coefficient_max: None,
+            frozen_function_mass: None,
+        }
+    }
+
+    fn group(name: &str, col: usize) -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: name.to_string(),
+            feature_col: col,
+            frozen_levels: None,
+            lenient_unseen: true,
+        }
+    }
+
+    /// `random_effect_penalty_index` must name the block the design builder
+    /// actually emitted for each random-effect term. Two ridged slopes, one
+    /// unpenalized slope and one bounded-shrinkage slope put three linear
+    /// blocks ahead of the random-effect ridges; the index formerly counted
+    /// at most one, so a saved fit's unseen-level prior read a slope's `λ`.
+    #[test]
+    fn random_effect_penalty_index_names_the_emitted_random_effect_ridge() {
+        let n = 24;
+        let data = Array2::from_shape_fn((n, 6), |(i, j)| match j {
+            0 => 1.0 + i as f64,
+            1 => ((i * 7) % 11) as f64 - 5.0,
+            2 => (i % 5) as f64,
+            3 => ((i * 3) % 13) as f64 / 13.0,
+            4 => (i % 3) as f64,
+            _ => (i % 4) as f64,
+        });
+        let shrink = LinearCoefficientGeometry::Bounded {
+            min: -1.0,
+            max: 1.0,
+            prior: BoundedCoefficientPriorSpec::Shrinkage,
+        };
+        let spec = TermCollectionSpec {
+            linear_terms: vec![
+                linear("x0", 0, true, LinearCoefficientGeometry::Unconstrained),
+                linear("x1", 1, true, LinearCoefficientGeometry::Unconstrained),
+                linear("x2", 2, false, LinearCoefficientGeometry::Unconstrained),
+                linear("x3", 3, false, shrink),
+            ],
+            random_effect_terms: vec![group("g0", 4), group("g1", 5)],
+            smooth_terms: Vec::new(),
+            level: Default::default(),
+        };
+        let design = build_term_collection_design(data.view(), &spec).expect("design builds");
+        for (term_idx, term) in spec.random_effect_terms.iter().enumerate() {
+            let index = spec.random_effect_penalty_index(term_idx);
+            assert_eq!(index, 3 + term_idx);
+            let info = design
+                .penaltyinfo
+                .get(index)
+                .unwrap_or_else(|| panic!("no penalty block at index {index}"));
+            assert!(
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source)
+                        if *source == format!("RandomEffectRidge({})", term.name)
+                ),
+                "penalty block {index} is {:?}, not the ridge of '{}'",
+                info.penalty.source,
+                term.name
+            );
+        }
     }
 }

@@ -1103,38 +1103,53 @@ pub(crate) fn polygamma_positive_stack(mut x: f64, orders: usize) -> [f64; POLYG
     out
 }
 
-/// `[ψ(x + ½) − ψ(x), ψ₁(x + ½) − ψ₁(x), …]` through the first `orders` entries
-/// (at most five), for `x > 0`; those entries are `NaN` otherwise, and the
-/// entries past `orders` are zero.
-///
-/// The gap is `O(x^{−(k+1)})` while `ψ(x)` is `O(ln x)` and `ψ_k(x)` is
-/// `O(x^{−k})`, so subtracting two [`polygamma_positive_stack`] values loses
-/// about `log₂(2x·ln x)` bits for `ψ` and `log₂(2x)` bits for `ψ_k`: at
-/// `x = 2.5·10⁷` the digamma difference keeps about seven significant digits.
-/// Here every term of the recurrence and of the asymptotic series is
-/// differenced in closed form instead, `c·[(x+½)^{−m} − x^{−m}] = c·x^{−m}·δ_m`
-/// with `δ_m = (1 + 1/(2x))^{−m} − 1`, and the logarithm as `ln(1 + 1/(2x))`.
-/// Every `δ_m` has the sign of `δ₁ = −1/(2x + 1)` and follows from
-/// `δ_m = ρ·δ_{m−1} + δ₁`, `ρ = x/(x + ½)`, a sum of like-signed terms. The
-/// recurrence terms and the two leading asymptotic terms of one order share the
-/// gap's sign, and the alternating Bernoulli tail is below `x⁻² ≤ 1/400` of
-/// them, so the result is correct to a few ulps relative at every `x`.
+/// `[ψ(x + ½) − ψ(x), ψ₁(x + ½) − ψ₁(x), …]`: [`polygamma_shift_gap_stack`] at
+/// the half shift the Student-t ν-score reads.
 pub(crate) fn polygamma_half_shift_gap_stack(
+    x: f64,
+    orders: usize,
+) -> [f64; POLYGAMMA_STACK_ORDERS] {
+    polygamma_shift_gap_stack(x, 0.5, orders)
+}
+
+/// `[ψ(x + s) − ψ(x), ψ₁(x + s) − ψ₁(x), …]` through the first `orders` entries
+/// (at most five), for `x > 0` and finite `s ≥ 0`; those entries are `NaN`
+/// otherwise, and the entries past `orders` are zero.
+///
+/// For `s ≪ x` the gap is `O(s·x^{−(k+1)})` while `ψ(x)` is `O(ln x)` and
+/// `ψ_k(x)` is `O(x^{−k})`, so subtracting two [`polygamma_positive_stack`]
+/// values loses about `log₂(x·ln x / s)` bits for `ψ` and `log₂(x/s)` bits for
+/// `ψ_k`: at `x = 2.5·10⁷, s = ½` the digamma difference keeps about seven
+/// significant digits. Here every term of the recurrence and of the asymptotic
+/// series is differenced in closed form instead,
+/// `c·[(x+s)^{−m} − x^{−m}] = c·x^{−m}·δ_m` with `δ_m = (1 + s/x)^{−m} − 1`, and
+/// the logarithm as `ln(1 + s/x)`. Every `δ_m` has the sign of
+/// `δ₁ = −s/(x + s)` and follows from `δ_m = ρ·δ_{m−1} + δ₁`, `ρ = x/(x + s)`, a
+/// sum of like-signed terms. The recurrence terms and the two leading asymptotic
+/// terms of one order share the gap's sign, and the alternating Bernoulli tail
+/// is below `x⁻² ≤ 1/400` of them, so the result is correct to a few ulps
+/// relative at every `x` and every shift. The two fractions use a bounded
+/// smaller-to-larger ratio, so `x+s` need not be representable. The half-shift
+/// kernel reads this same implementation at `s = ½`.
+pub(crate) fn polygamma_shift_gap_stack(
     mut x: f64,
+    shift: f64,
     orders: usize,
 ) -> [f64; POLYGAMMA_STACK_ORDERS] {
     const DELTA_ORDERS: usize = POLYGAMMA_STACK_ORDERS + 2 * BERNOULLI_EVEN.len();
     let orders = orders.min(POLYGAMMA_STACK_ORDERS);
     let mut out = [0.0; POLYGAMMA_STACK_ORDERS];
-    if !(x.is_finite() && x > 0.0) {
+    if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
         out[..orders].fill(f64::NAN);
         return out;
     }
-    // `δ[m] = (1 + 1/(2x))^{−m} − 1` for `m = 0, …, DELTA_ORDERS`.
+    if shift == 0.0 {
+        return out;
+    }
+    // `δ[m] = (1 + s/x)^{−m} − 1` for `m = 0, …, DELTA_ORDERS`.
     let deltas = |x: f64, top: usize| {
         let mut delta = [0.0; DELTA_ORDERS + 1];
-        let first = -1.0 / (2.0 * x + 1.0);
-        let ratio = x / (x + 0.5);
+        let (ratio, first) = positive_shift_fractions(x, shift);
         for m in 1..=top {
             delta[m] = ratio * delta[m - 1] + first;
         }
@@ -1165,7 +1180,7 @@ pub(crate) fn polygamma_half_shift_gap_stack(
             tail = tail * inverse_squared + coefficient * delta[order + 2 * (index + 1)];
         }
         let series = if order == 0 {
-            (0.5 * inverse).ln_1p() - 0.5 * inverse * delta[1] + inverse_squared * tail
+            (shift * inverse).ln_1p() - 0.5 * inverse * delta[1] + inverse_squared * tail
         } else {
             let [leading, half_term] = POLYGAMMA_ASYMPTOTIC_LEADING[order];
             power *= inverse;
@@ -1177,6 +1192,106 @@ pub(crate) fn polygamma_half_shift_gap_stack(
         *entry += series;
     }
     out
+}
+
+/// `ln Γ(x + s) − ln Γ(x)` for `x > 0` and finite `s ≥ 0`, `NaN` otherwise: the
+/// value slot above [`polygamma_shift_gap_stack`]'s digamma gap.
+///
+/// Two separate `ln Γ` values of size `x ln x` leave an absolute error of about
+/// `x ln x · ε` on an `s ln x` difference (`2·10⁻⁸` at `x = 10⁸, s = 3`). Here
+/// at `x ≥ 20` Stirling's series is differenced in closed form,
+/// `s ln x + (x + s − ½) ln(1 + s/x) − s + Σ_j B_{2j}/(2j(2j−1)) x^{1−2j} δ_{2j−1}`
+/// with the same `δ_m = (1 + s/x)^{−m} − 1`, which is within a few ulps of
+/// `max(|gap|, 1)`. Below 20 the recurrence removes `ln(1 + s/x_k)` per unit
+/// step: steps with `s/x_k < 1` are multiplied together as `Π(1 + t_k) − 1`
+/// and taken through one `ln_1p`, the rest are summed as `ln_1p(t_k)` (or
+/// `ln s − ln x_k` once `s/x_k` overflows). That subtraction can cancel against
+/// the Stirling part, so there the error is about `10⁻¹⁴ · max(|gap|, 1)`.
+pub(crate) fn ln_gamma_shift_gap(x: f64, shift: f64) -> f64 {
+    ln_gamma_shift_gap_with_error(x, shift).0
+}
+
+/// The same live evaluator with a first-omitted Stirling remainder and an
+/// arithmetic allowance based on the uncancelled terms. This is used when a
+/// root residual must account for its normalization rather than treating a
+/// log-gamma difference as one correctly rounded logarithm. The analytic
+/// remainder is the sum of the first omitted alternating Stirling terms,
+/// bounded at the smaller argument x. The arithmetic allowance uses the
+/// uncancelled magnitude and 256 roundings: at most 20 recurrence steps
+/// (five operations each), 20 two-operation delta updates, 10 three-operation
+/// tail updates, logarithms, products and compensated final assembly. libm 0.2.16
+/// log.rs and log1p.rs document errors below one ulp; two unit roundoffs per
+/// logarithm are included. This is a floating-point allowance, not interval
+/// arithmetic with directed rounding of the allowance itself.
+pub(crate) fn ln_gamma_shift_gap_with_error(mut x: f64, shift: f64) -> (f64, f64) {
+    if !(x.is_finite() && x > 0.0 && shift.is_finite() && shift >= 0.0) {
+        return (f64::NAN, f64::NAN);
+    }
+    if shift == 0.0 {
+        return (0.0, 0.0);
+    }
+    let mut recurrence = 0.0;
+    let mut small_product_minus_one: f64 = 0.0;
+    while x < POLYGAMMA_ASYMPTOTIC_MIN_X {
+        let t = shift / x;
+        if t < 1.0 {
+            small_product_minus_one += (1.0 + small_product_minus_one) * t;
+        } else if t.is_finite() {
+            recurrence += libm::log1p(t);
+        } else {
+            recurrence += libm::log(shift) - libm::log(x);
+        }
+        x += 1.0;
+    }
+    recurrence += libm::log1p(small_product_minus_one);
+    let mut delta = [0.0; 2 * BERNOULLI_EVEN.len()];
+    let (ratio, first) = positive_shift_fractions(x, shift);
+    for m in 1..delta.len() {
+        delta[m] = ratio * delta[m - 1] + first;
+    }
+    let inverse = 1.0 / x;
+    let inverse_squared = inverse * inverse;
+    let mut tail = 0.0;
+    for &(power, bernoulli) in BERNOULLI_EVEN.iter().rev() {
+        let coefficient = bernoulli / (power * (power - 1)) as f64;
+        tail = tail * inverse_squared + coefficient * delta[power - 1];
+    }
+    let terms = [
+        shift * libm::log(x),
+        // x+shift can overflow although the gap is finite (MAX, 1e292).
+        (x - 0.5) * libm::log1p(shift * inverse),
+        shift * libm::log1p(shift * inverse),
+        -shift,
+        inverse * tail,
+        -recurrence,
+    ];
+    let mut sum = crate::sparse_grid::CompensatedSum::default();
+    for term in terms {
+        sum.add(term);
+    }
+    let magnitude = terms.iter().map(|x| x.abs()).sum::<f64>();
+    let remainder = 2.0 * (854513.0 / 63756.0) * inverse.powi(21);
+    (
+        sum.value(),
+        remainder
+            + crate::roundoff::accumulation_growth(256) * magnitude
+            + 256.0 * crate::double_double::SMALLEST_SUBNORMAL,
+    )
+}
+
+// `(x/(x+s), -s/(x+s))` without forming a possibly overflowing sum.
+// The smaller-to-larger ratio is at most one, so both fractions stay resolved.
+#[inline]
+fn positive_shift_fractions(x: f64, shift: f64) -> (f64, f64) {
+    if shift <= x {
+        let ratio = shift / x;
+        let denominator = 1.0 + ratio;
+        (1.0 / denominator, -ratio / denominator)
+    } else {
+        let ratio = x / shift;
+        let denominator = 1.0 + ratio;
+        (ratio / denominator, -1.0 / denominator)
+    }
 }
 
 const POLYGAMMA_ASYMPTOTIC_MIN_X: f64 = 20.0;
@@ -2433,6 +2548,108 @@ mod derivative_stack_tests {
         assert!(polygamma_half_shift_gap_stack(0.0, 2)[..2].iter().all(|g| g.is_nan()));
         assert!(polygamma_half_shift_gap_stack(f64::INFINITY, 2)[..2].iter().all(|g| g.is_nan()));
     }
+
+    /// `ψ_k(x+s) − ψ_k(x)` against 60-digit `mpmath` values across the
+    /// recurrence/asymptotic switch, for shifts below, near and far above `x`,
+    /// and deep in the negative-binomial Poisson limit (`x = θ = 10⁸` with a
+    /// count `s = y = 3`), where the difference of two digammas keeps about
+    /// eight digits.
+    #[test]
+    fn polygamma_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, [f64; 5]); 8] = [
+            (0.03, 1.0, [3.3333333333333334567e1, -1.1111111111111111933e3, 7.4074074074074082298e4, -7.4074074074074085039e6, 9.8765432098765450374e8]),
+            (1.0, 3.0, [1.8333333333333333333, -1.3611111111111111111, 2.3240740740740740741, -6.4490740740740740741, 2.4848765432098765432e1]),
+            (3.7, 17.0, [1.8386311354792204527, -2.6054300883356516719e-1, 9.2946067996035776598e-2, -5.803686711730261023e-2, 5.3002647722389986814e-2]),
+            (19.75, 2.0, [9.8825682476742412689e-2, -4.8862349008584845848e-3, 4.8347393507043446939e-4, -7.1800332361523576081e-5, 1.4225936548352248144e-5]),
+            (137.25, 40.0, [2.5658096912712086343e-1, -1.6548881373862945753e-3, 2.1464201686552508135e-5, -4.1985640675823273367e-7, 1.1008708911580509542e-8]),
+            (5.0, 1.0e6, [1.2309397389522390328e1, -2.2132195574161530519e-1, 4.8789732244114505725e-2, -2.1427828192755073022e-2, 1.4063191342112799854e-2]),
+            (1.0e8, 3.0, [2.9999999700000005e-8, -2.9999999400000015e-16, 5.999999820000006e-24, -1.799999928000003e-31, 7.199999640000018e-39]),
+            (1.0e12, 250.0, [2.4999999996887500001e-10, -2.4999999993775000002e-22, 4.9999999981325000006e-34, -1.4999999992530000003e-45, 5.9999999962650000019e-57]),
+        ];
+        let mut worst = 0.0_f64;
+        for (x, shift, reference) in REFERENCES {
+            let gaps = polygamma_shift_gap_stack(x, shift, POLYGAMMA_STACK_ORDERS);
+            for order in 0..POLYGAMMA_STACK_ORDERS {
+                let relative = (gaps[order] - reference[order]).abs() / reference[order].abs();
+                worst = worst.max(relative);
+                assert!(
+                    relative <= 8.0 * f64::EPSILON,
+                    "x={x:e} s={shift:e} order={order}: gap={:+.17e} reference={:+.17e} relative error {relative:e}",
+                    gaps[order],
+                    reference[order]
+                );
+            }
+            assert_eq!(polygamma_shift_gap_stack(x, shift, 1)[0], gaps[0]);
+        }
+        eprintln!("shift polygamma gap: worst relative error {worst:e}");
+        // A zero count is an exact zero gap at every order.
+        assert!(polygamma_shift_gap_stack(7.0, 0.0, POLYGAMMA_STACK_ORDERS).iter().all(|&g| g == 0.0));
+        // The half-shift kernel is this kernel at `s = ½`, bit for bit.
+        for x in [0.03, 1.0, 19.75, 20.0, 2.4411730862068e7] {
+            assert_eq!(
+                polygamma_shift_gap_stack(x, 0.5, POLYGAMMA_STACK_ORDERS),
+                polygamma_half_shift_gap_stack(x, POLYGAMMA_STACK_ORDERS)
+            );
+        }
+        // The cancelling difference this kernel replaces, at the NB Poisson limit.
+        let naive = polygamma_positive_stack(1.0e8 + 3.0, 1)[0] - polygamma_positive_stack(1.0e8, 1)[0];
+        assert!(
+            ((naive - 2.9999999700000005e-8) / 2.9999999700000005e-8).abs() > 1.0e-10,
+            "the direct digamma difference was expected to cancel: {naive:e}"
+        );
+        assert!(polygamma_shift_gap_stack(1.0, -1.0, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_shift_gap_stack(1.0, f64::NAN, 2)[..2].iter().all(|g| g.is_nan()));
+        assert!(polygamma_shift_gap_stack(0.0, 1.0, 2)[..2].iter().all(|g| g.is_nan()));
+    }
+
+    /// `ln Γ(x + s) − ln Γ(x)` against 50-digit references (mpmath `loggamma`),
+    /// to a few ulps of `max(|gap|, 1)`, including the NB Poisson limit where two
+    /// separate `ln Γ` values of size `x ln x` would leave a `10⁻⁸`–`10⁻³` error.
+    #[test]
+    fn ln_gamma_shift_gap_preserves_finite_results_when_argument_sum_overflows() {
+        // mpmath at 400 digits and exact binary64 input arguments.
+        for (x, shift, expected) in [
+            (f64::MAX, 1.0e292, 7.09782712893384e294),
+            (f64::MAX, 0.5, 354.891356446692),
+            (f64::MAX, 1.0, 709.782712893384),
+            (1.0e300, 1.0e285, 6.907755278982137e287),
+        ] {
+            let (value, error) = ln_gamma_shift_gap_with_error(x, shift);
+            assert!((value-expected).abs() <= 8.0 * f64::EPSILON * expected.abs(),
+                "x={x}, shift={shift}: {value} vs {expected}");
+            assert!((value-expected).abs() <= error);
+            assert_eq!(ln_gamma_shift_gap(x, shift), value);
+        }
+    }
+
+    #[test]
+    fn ln_gamma_shift_gap_matches_high_precision_references() {
+        const REFERENCES: [(f64, f64, f64); 10] = [
+            (0.03, 1.0, -3.5065578973199817136),
+            (1.0, 3.0, 1.7917594692280550008),
+            (3.7, 17.0, 40.00359240394925555),
+            (19.75, 2.0, 6.01569973802383818),
+            (137.25, 40.0, 202.07709097510874743),
+            (5.0, 1.0e6, 12815570.468656571118),
+            (1.0e8, 3.0, 55.262042261857096166),
+            (1.0e12, 250.0, 6907.7552790132620521),
+            (1.0, 1.0, 0.0),
+            // `s/x` overflows on the first recurrence step.
+            (1.0e-300, 1.0e10, 220258508598.03505357),
+        ];
+        for (x, shift, reference) in REFERENCES {
+            let gap = ln_gamma_shift_gap(x, shift);
+            let error = (gap - reference).abs() / reference.abs().max(1.0);
+            assert!(
+                error <= 8.0 * f64::EPSILON,
+                "x={x:e} s={shift:e}: gap={gap:+.17e} reference={reference:+.17e} error {error:e}"
+            );
+        }
+        assert_eq!(ln_gamma_shift_gap(7.0, 0.0), 0.0);
+        assert!(ln_gamma_shift_gap(1.0, -1.0).is_nan());
+        assert!(ln_gamma_shift_gap(0.0, 1.0).is_nan());
+        assert!(ln_gamma_shift_gap(1.0, f64::INFINITY).is_nan());
+    }
 }
 
 // ── Contraction-symmetry optimization gate ────────────────────────────────────
@@ -2677,5 +2894,27 @@ mod contraction_symmetry_tests {
             "full_nest",
         );
         gate.finish();
+    }
+}
+
+#[cfg(test)]
+mod shift_gap_extreme_tests {
+    use super::*;
+
+    #[test]
+    fn finite_arguments_keep_the_gap_when_their_sum_overflows() {
+        let gap = polygamma_shift_gap_stack(1.0e308, 1.0e308, 2);
+        assert!((gap[0] - 2.0_f64.ln()).abs() < 1.0e-14);
+        // At this scale the asymptotic remainder is unrepresentably small:
+        // psi_1(2x)-psi_1(x) = -1/(2x) to f64 rounding.
+        assert!((gap[1] / -5.0e-309 - 1.0).abs() < 1.0e-14, "{gap:?}");
+    }
+
+    #[test]
+    fn zero_shift_is_exact_even_at_subnormal_arguments() {
+        for x in [f64::from_bits(1), f64::MIN_POSITIVE, 1.0, 1.0e308] {
+            assert_eq!(polygamma_shift_gap_stack(x, 0.0, 5), [0.0; 5]);
+            assert_eq!(ln_gamma_shift_gap(x, 0.0), 0.0);
+        }
     }
 }

@@ -92,32 +92,53 @@
 //!
 //! # Ties in the discrete families
 //!
-//! The discrete families use the smoothed (randomised) conformal p-value
-//! `π = (#{s_i > s_*} + U·(1 + T))/(n + 1)`, with `T` the training rows tied
-//! with the test point (same covariates, offset and response), so coverage is
-//! exactly `1 − α` rather than conservative. `U` is a uniform seeded from a
-//! hash of the labeled responses and the test row: the same inputs give the
-//! same set in every front end. Gamma scores are continuous and use the plain
-//! p-value `(1 + #{s_i ≥ s_*})/(n + 1)`.
+//! The discrete families use an independent `U ~ Uniform[0, 1)` drawn once per
+//! inversion and shared by all candidate labels. Exact smoothed ranks have
+//! marginal coverage `1 − α` for exchangeable supplied rows and a fitting map
+//! symmetric in all augmented rows. This is not a conditional-on-features
+//! guarantee; a training-only learned basis or penalty need not be symmetric.
+//! Numerical uncertainty is retained as a conservative enclosure, so this
+//! implementation does not claim exact coverage. Gamma currently uses the
+//! conservative unsmoothed rank. Fixed-U entry points support reproducible
+//! tests without deriving randomization from the observations.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use faer::Side;
 use ndarray::{Array1, Array2, Axis};
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_av, fast_xt_diag_x};
-use gam_linalg::utils::{stable_logistic as sigmoid, stable_softplus as softplus};
+use gam_math::special::{logistic as sigmoid, softplus};
 use gam_problem::types::LikelihoodSpec;
 use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
-    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL,
-    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
+    ConformalCertificate, ConformalInterval, ConformalRefusal, conformal_rank_threshold,
 };
+
+/// Maximum damped-Newton iterations for a cold augmented GLM fit.
+const GLM_NEWTON_MAX_ITERS: usize = 200;
+
+/// Maximum Armijo backtracking halvings per cold Newton iteration.
+const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+
+/// Strict scale-invariant KKT tolerance declaring convergence, applied to the
+/// RAW penalized gradient (dimension-scaled OR natural-scale relative — the
+/// same certificate the main P-IRLS solver uses). NOT a tolerance on the
+/// preconditioned Newton step.
+const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+
+/// Armijo sufficient-decrease constant for the cold-fit line search —
+/// sourced from the shared optimizer constants so the workspace has exactly
+/// one `c₁`.
+const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
+
+#[inline]
+fn vec_norm(v: &Array1<f64>) -> f64 {
+    v.dot(v).sqrt()
+}
 
 /// A non-Gaussian family the certified full-conformal set supports. Each has a
 /// negative log-likelihood convex in `η` whose curvature satisfies
@@ -151,8 +172,8 @@ impl ConformalGlmFamily {
     ///
     /// With no smoothing parameter the frozen-penalty fitting map selects
     /// nothing from the responses (the Gamma dispersion does not enter an
-    /// unpenalized fit, and the score is dispersion-free), so the set is
-    /// exact. A selected λ, or the negative-binomial θ estimated from the
+    /// unpenalized fit, and the score is dispersion-free), so the numerical set is
+    /// a conservative enclosure. A selected λ, or the negative-binomial θ estimated from the
     /// responses, makes the frozen map asymmetric in the augmented row; those
     /// rows are refused with [`ConformalRefusal::GlmFrozenPenalty`].
     pub fn certificate(self, penalty_count: Option<usize>) -> ConformalCertificate {
@@ -161,7 +182,7 @@ impl ConformalGlmFamily {
             (Self::NegativeBinomialLog { .. }, _) | (_, Some(1..)) => {
                 ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty)
             }
-            (_, Some(0)) => ConformalCertificate::ExactFrozen,
+            (_, Some(0)) => ConformalCertificate::ConservativeFrozen,
         }
     }
 
@@ -234,6 +255,19 @@ impl ConformalGlmFamily {
                 let r = y * (-eta).exp();
                 (r - 1.0, r)
             }
+        }
+    }
+
+    /// Sum of the nonnegative operands of the score, before cancellation.
+    fn score_operand_scale(self, eta: f64, y: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => y + sigmoid(eta),
+            Self::PoissonLog => y + eta.exp(),
+            Self::NegativeBinomialLog { theta } => {
+                let t = eta - theta.ln();
+                y * sigmoid(-t) + theta * sigmoid(t)
+            }
+            Self::GammaLog => y * (-eta).exp() + 1.0,
         }
     }
 
@@ -506,6 +540,23 @@ impl GlmFullConformalSubstrate {
         offset_star: f64,
         alpha: f64,
     ) -> Result<GlmFullConformalSet, String> {
+        self.prediction_set_with_uniform(x_star, offset_star, alpha, rand::rng().random())
+    }
+
+    /// Invert with one externally supplied independent uniform variate.
+    /// Reusing this value across candidates defines a coherent randomized set.
+    pub fn prediction_set_with_uniform(
+        &self,
+        x_star: &Array1<f64>,
+        offset_star: f64,
+        alpha: f64,
+        tie_uniform: f64,
+    ) -> Result<GlmFullConformalSet, String> {
+        if !(tie_uniform.is_finite() && (0.0..1.0).contains(&tie_uniform)) {
+            return Err(format!(
+                "full conformal: tie uniform must be in [0, 1), got {tie_uniform}"
+            ));
+        }
         if !(alpha > 0.0 && alpha < 1.0) {
             return Err(format!(
                 "full conformal: alpha must be in (0, 1), got {alpha}"
@@ -527,7 +578,7 @@ impl GlmFullConformalSubstrate {
         };
         let tau = conformal_rank_threshold(alpha, self.n() + 1);
         let intervals = if self.family.is_discrete() {
-            self.discrete_set(&row, tau)
+            self.discrete_set(&row, tau, tie_uniform)
         } else {
             self.continuous_set(&row, tau)
         };
@@ -570,8 +621,22 @@ impl GlmFullConformalSubstrate {
         let s_beta = self.s_lambda.dot(beta);
         let mut grad = &s_beta - &xtu;
         grad.scaled_add(-score_star, row.x);
-        let natural_scale =
-            1.0 + vec_norm(&xtu) + vec_norm(&s_beta) + vec_norm(row.x) * score_star.abs();
+        let training_scale: f64 = (0..n)
+            .map(|i| {
+                self.x
+                    .row(i)
+                    .iter()
+                    .fold(0.0_f64, |norm, value| norm.hypot(*value))
+                    * self
+                        .family
+                        .score_operand_scale(eta[i] + self.offset[i], self.y[i])
+            })
+            .sum();
+        let test_scale = match aug {
+            Augmentation::Response(z) => self.family.score_operand_scale(eta_star, z),
+            Augmentation::Tilt(s) => s.abs(),
+        };
+        let natural_scale = 1.0 + training_scale + vec_norm(&s_beta) + vec_norm(row.x) * test_scale;
         State {
             score,
             weight,
@@ -600,8 +665,10 @@ impl GlmFullConformalSubstrate {
     fn kkt_converged(&self, state: &State) -> bool {
         let g_norm = vec_norm(&state.grad);
         let dimension_scale = ((self.n() + 1) as f64).sqrt() * (self.p() as f64).sqrt();
-        g_norm < GLM_CONVERGENCE_RTOL * dimension_scale
-            || g_norm / state.natural_scale < GLM_CONVERGENCE_RTOL
+        g_norm.is_finite()
+            && state.natural_scale.is_finite()
+            && (g_norm < GLM_CONVERGENCE_RTOL * dimension_scale
+                || g_norm / state.natural_scale < GLM_CONVERGENCE_RTOL)
     }
 
     /// Damped Newton on the augmented problem from `init`, then the solve
@@ -755,20 +822,9 @@ impl GlmFullConformalSubstrate {
         }
     }
 
-    /// The seeded tie-break uniform of one test row.
-    fn tie_break_uniform(&self, row: &TestRow<'_>) -> f64 {
-        let mut hasher = DefaultHasher::new();
-        for v in self.y.iter().chain(row.x.iter()) {
-            v.to_bits().hash(&mut hasher);
-        }
-        row.offset.to_bits().hash(&mut hasher);
-        rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
-    }
-
     /// The discrete set with randomised ties: both Bernoulli levels by their
     /// own solves, the counts by [`Self::count_set`].
-    fn discrete_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
-        let u_tie = self.tie_break_uniform(row);
+    fn discrete_set(&self, row: &TestRow<'_>, tau: f64, u_tie: f64) -> Vec<ConformalInterval> {
         // `K`: the most training rows with score at least the test score that
         // still leave a candidate outside the set, `k + U ≤ τ`.
         if tau < u_tie {
@@ -1324,7 +1380,7 @@ pub fn penalty_from_normal_and_gram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
+    use rand::{SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, Gamma as GammaDist, Poisson as PoissonDist};
 
     const ALPHA: f64 = 0.1;
@@ -1471,7 +1527,7 @@ mod tests {
         let tau = conformal_rank_threshold(alpha, n + 1);
         let s_star = node.score_star.abs();
         if sub.family.is_discrete() {
-            let u = sub.tie_break_uniform(&row);
+            let u = 0.5;
             let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
             greater as f64 + u > tau
         } else {
@@ -1489,7 +1545,9 @@ mod tests {
                 let sub = substrate(*family, &d);
                 let x = rng.random::<f64>() * 2.0 - 1.0;
                 let o = 0.1;
-                let set = sub.prediction_set(&row(x), o, ALPHA).unwrap();
+                let set = sub
+                    .prediction_set_with_uniform(&row(x), o, ALPHA, 0.5)
+                    .unwrap();
                 let top = match family {
                     ConformalGlmFamily::BernoulliLogit => 1,
                     _ => 80,
@@ -1528,13 +1586,15 @@ mod tests {
             offset: 0.0,
         };
         let tau = conformal_rank_threshold(ALPHA, sub.n() + 1);
-        let k_max = (tau - sub.tie_break_uniform(&test)).floor() as usize;
+        let k_max = (tau - 0.5).floor() as usize;
         let tail = sub.count_score_tail(&test, k_max).unwrap();
         assert!(
             tail <= d.y.sum(),
             "tail score {tail} is not on the data scale"
         );
-        let set = sub.prediction_set(&x_star, 0.0, ALPHA).unwrap();
+        let set = sub
+            .prediction_set_with_uniform(&x_star, 0.0, ALPHA, 0.5)
+            .unwrap();
         let hi = set.intervals.last().unwrap().hi;
         assert!(hi <= d.y.sum(), "set edge {hi} is not on the data scale");
         for z in 0..=(hi as usize + 5) {
@@ -1571,7 +1631,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let sub = substrate(family, &d);
-            let set = sub.prediction_set(&row(0.2), 0.0, ALPHA).unwrap();
+            let set = sub
+                .prediction_set_with_uniform(&row(0.2), 0.0, ALPHA, 0.5)
+                .unwrap();
             tx.send((sub, set)).unwrap();
         });
         let (sub, set) = rx
@@ -1599,7 +1661,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_is_exact_only_when_nothing_was_selected() {
+    fn certificate_distinguishes_conservative_frozen_from_refused() {
         let refused = ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty);
         for family in [
             ConformalGlmFamily::BernoulliLogit,
@@ -1608,7 +1670,7 @@ mod tests {
         ] {
             assert_eq!(
                 family.certificate(Some(0)),
-                ConformalCertificate::ExactFrozen
+                ConformalCertificate::ConservativeFrozen
             );
             assert_eq!(family.certificate(Some(1)), refused);
             assert_eq!(family.certificate(Some(3)), refused);
@@ -1647,7 +1709,9 @@ mod tests {
             let d = data(family, n, &mut rng);
             let sub = substrate(family, &d);
             let x = rng.random::<f64>() * 2.0 - 1.0;
-            let set = sub.prediction_set(&row(x), 0.0, alpha).unwrap();
+            let set = sub
+                .prediction_set_with_uniform(&row(x), 0.0, alpha, 0.5)
+                .unwrap();
             let hi = set.intervals.last().unwrap().hi;
             assert!(
                 hi.is_finite(),
@@ -1721,36 +1785,6 @@ mod tests {
         assert!(evals.iter().all(|&v| v >= -1e-15));
     }
 
-    /// Seeded Monte Carlo: marginal coverage of the certified set at n = 99,
-    /// α = 0.1 (so α(n+1) is an integer and the target is exactly 0.9) is
-    /// within two Monte Carlo standard errors of 1 − α, two-sided.
-    #[test]
-    fn monte_carlo_coverage_is_nominal_for_every_family() {
-        let reps = 1000;
-        let n = 99;
-        for (k, family) in FAMILIES.into_iter().enumerate() {
-            let mut rng = StdRng::seed_from_u64(4242 + k as u64);
-            let mut covered = 0usize;
-            for _ in 0..reps {
-                let d = data(family, n, &mut rng);
-                let x = rng.random::<f64>() * 2.0 - 1.0;
-                let o = rng.random::<f64>() * 0.4 - 0.2;
-                let y_star = draw(family, eta_true(x) + o, &mut rng);
-                let set = substrate(family, &d)
-                    .prediction_set(&row(x), o, ALPHA)
-                    .unwrap();
-                covered += usize::from(contains(&set, y_star));
-            }
-            let cov = covered as f64 / reps as f64;
-            let target = 1.0 - ALPHA;
-            let mcse = (target * ALPHA / reps as f64).sqrt();
-            assert!(
-                (cov - target).abs() <= 2.0 * mcse,
-                "{family:?}: coverage {cov} vs {target} ± {}",
-                2.0 * mcse
-            );
-        }
-    }
     /// The count `0` sits exactly on the low end of the score walk, where
     /// rounding in `z(s)` once pushed its image just above `0` and dropped it
     /// from a member run. These replayed draws had `0` in by its own solve.
@@ -1772,10 +1806,10 @@ mod tests {
             let xs = row(x);
             let test = TestRow { x: &xs, offset: o };
             let tau = conformal_rank_threshold(ALPHA, n + 1);
-            let u = sub.tie_break_uniform(&test);
+            let u = 0.5;
             let twin = vec![false; n];
             assert!(sub.count_member(&test, 0.0, u, &twin, tau), "rep {rep}");
-            let set = sub.prediction_set(&xs, o, ALPHA).unwrap();
+            let set = sub.prediction_set_with_uniform(&xs, o, ALPHA, 0.5).unwrap();
             assert_eq!(
                 set.intervals.first().map(|r| r.lo),
                 Some(0.0),
@@ -1792,5 +1826,173 @@ mod tests {
                 "rep {rep}: y* {y_star}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn uncancelled_poisson_stationarity_preserves_3451() {
+        let n = 16;
+        let x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                (std::f64::consts::PI * i as f64 / 15.0).cos()
+            }
+        });
+        let y = Array1::from_shape_fn(n, |i| {
+            (1.0 + (2.0 * std::f64::consts::PI * i as f64 / 15.0).sin())
+                .exp()
+                .round()
+        });
+        let total = y.sum();
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::PoissonLog,
+            x,
+            y,
+            Array1::zeros(n),
+            Array2::zeros((2, 2)),
+            Array1::zeros(2),
+        )
+        .unwrap();
+        let beta = sub.refit_labeled_rows().unwrap();
+        let x_star = array![1.0, (std::f64::consts::PI * 0.37).cos()];
+        let row = TestRow {
+            x: &x_star,
+            offset: 0.0,
+        };
+        let z = x_star.dot(&beta).exp();
+        let state = sub.state(&beta, &row, Augmentation::Response(z));
+        assert!(state.natural_scale >= total);
+        assert!(sub.kkt_converged(&state));
+        let cold = sub
+            .solve(&row, Augmentation::Response(z), &Array1::zeros(2))
+            .unwrap();
+        assert!(cold.certifies(cold.error));
+        assert!(vec_norm(&(&cold.beta - &beta)) <= 1e-9 * (1.0 + vec_norm(&beta)));
+        let nonstationary = State {
+            natural_scale: f64::INFINITY,
+            grad: array![1.0, 1.0],
+            ..state
+        };
+        assert!(!sub.kkt_converged(&nonstationary));
+    }
+
+    #[test]
+    fn fixed_uniform_validates_endpoints_and_is_shared_by_labels() {
+        // Identical zero rows produce exactly tied scores for each Bernoulli
+        // candidate. For candidate 0 every score is 1/2, hence its p-value is U.
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            Array2::zeros((4, 1)),
+            Array1::zeros(4),
+            Array1::zeros(4),
+            array![[1.0]],
+            array![0.0],
+        )
+        .unwrap();
+        let row = array![0.0];
+        for u in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0] {
+            assert!(sub.prediction_set_with_uniform(&row, 0.0, 0.2, u).is_err());
+        }
+        for u in [0.0, 0.1, 0.2, 0.3, 1.0 - f64::EPSILON] {
+            let set = sub.prediction_set_with_uniform(&row, 0.0, 0.2, u).unwrap();
+            let member = set
+                .intervals
+                .iter()
+                .any(|piece| piece.lo <= 0.0 && piece.hi >= 0.0);
+            assert_eq!(member, u > 0.2, "tied candidate, U={u}");
+        }
+    }
+
+    #[test]
+    fn supplied_uniform_preserves_row_permutation() {
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.4],
+            [1.0, 0.2],
+            [1.0, 0.8],
+            [1.0, 1.2],
+            [1.0, -0.8]
+        ];
+        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let offset = array![0.1, -0.2, 0.3, 0.0, -0.1, 0.2];
+        let order = [3, 0, 5, 1, 4, 2];
+        let make = |x, y, offset| {
+            GlmFullConformalSubstrate::new(
+                ConformalGlmFamily::BernoulliLogit,
+                x,
+                y,
+                offset,
+                array![[0.5, 0.0], [0.0, 0.7]],
+                Array1::zeros(2),
+            )
+            .unwrap()
+        };
+        let ordinary = make(x.clone(), y.clone(), offset.clone());
+        let permuted = make(
+            x.select(Axis(0), &order),
+            y.select(Axis(0), &order),
+            offset.select(Axis(0), &order),
+        );
+        let row = array![1.0, 0.35];
+        for u in [0.0, 0.17, 0.5, 0.93] {
+            for alpha in [0.1, 0.3, 0.7] {
+                let first = ordinary
+                    .prediction_set_with_uniform(&row, 0.15, alpha, u)
+                    .unwrap();
+                let second = permuted
+                    .prediction_set_with_uniform(&row, 0.15, alpha, u)
+                    .unwrap();
+                assert_eq!(first.intervals, second.intervals, "U={u}, alpha={alpha}");
+            }
+        }
+    }
+    #[test]
+    fn finite_exchangeability_and_uniform_grid_give_nominal_coverage() {
+        // Uniformly hold out one of five exchangeable rows, independently of
+        // U. The augmented fit is always the same, and its fitted p exceeds
+        // 1/2: two zero-label scores dominate the three one-label scores.
+        // The exact ranks are 2U/5 for zeros, (2+3U)/5 for ones.
+        let labels = array![0.0, 0.0, 1.0, 1.0, 1.0];
+        let mut covered = 0;
+        for held_out in 0..5 {
+            let train = Array1::from_iter((0..5).filter(|&i| i != held_out).map(|i| labels[i]));
+            let sub = GlmFullConformalSubstrate::new(
+                ConformalGlmFamily::BernoulliLogit,
+                Array2::ones((4, 1)),
+                train,
+                Array1::zeros(4),
+                array![[0.5]],
+                array![0.0],
+            )
+            .unwrap();
+            for k in 0..20 {
+                let u = (k as f64 + 0.5) / 20.0;
+                let z = labels[held_out];
+                let expected = if z == 0.0 {
+                    2.0 * u > 1.5
+                } else {
+                    2.0 + 3.0 * u > 1.5
+                };
+                let set = sub
+                    .prediction_set_with_uniform(&array![1.0], 0.0, 0.3, u)
+                    .unwrap();
+                let member = set
+                    .intervals
+                    .iter()
+                    .any(|piece| piece.lo <= z && z <= piece.hi);
+                assert_eq!(member, expected, "held out {held_out}, U={u}");
+                covered += usize::from(member);
+            }
+        }
+        assert_eq!(covered, 70);
+        let certificate = ConformalGlmFamily::BernoulliLogit.certificate(Some(0));
+        assert_eq!(certificate.label(), "conservative_frozen");
+        assert_eq!(certificate.code(), 2);
     }
 }

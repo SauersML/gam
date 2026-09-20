@@ -267,7 +267,6 @@ mod tests {
             free_mem_bytes: (free_gib * 1_073_741_824.0) as usize,
             ecc_enabled: false,
             integrated: false,
-            mig_mode: false,
         }
     }
 

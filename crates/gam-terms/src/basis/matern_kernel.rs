@@ -280,7 +280,19 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
                 bending_order,
             )?;
         }
-        let poly_block = thin_plate_polynomial_block(data);
+        // Same knot-mean-centered polynomial chart `{1, x − x̄_C, …}` the dense
+        // builder emits (#1269), so a fit and its replay agree column for
+        // column whichever side of the materialization cap each lands on. The
+        // kernel block reads only `data − centers` and needs no shift.
+        let poly_block = {
+            let k_centers = centers.nrows().max(1) as f64;
+            let mut data_centered = data.to_owned();
+            for axis in 0..data.ncols() {
+                let mu = centers.column(axis).sum() / k_centers;
+                data_centered.column_mut(axis).mapv_inplace(|v| v - mu);
+            }
+            thin_plate_polynomial_block(data_centered.view())
+        };
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
         let shared_data = shared_owned_data_matrix(data, &workspace.cache);
@@ -2566,9 +2578,12 @@ pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
 /// must be used in place of [`closed_form_anisotropic_pair_block`] for
 /// `length_scale = None` (pure-Duchon) penalty assembly.
 ///
-/// Self-pairs (R=0) are ε-regularized using a small fraction of the median
-/// off-diagonal lag, since the radial form is singular at R=0 and the pure
-/// Riesz Schoenberg fallback also doesn't converge for κ=0.
+/// Self-pairs (R=0) take the exact `R → 0⁺` limit
+/// [`closed_form_penalty::pure_duchon_self_pair_value`] (integer or fractional
+/// `s`): `0` whenever the UV clause `4(m+s) > d + 2q` of
+/// [`duchon_closed_form_operator_penalty_converges`] holds. Outside that regime
+/// the self-pair diverges and no closed-form block exists, so calling this
+/// without the convergence gate is a contract violation and panics.
 pub fn closed_form_anisotropic_pair_block_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -2588,25 +2603,20 @@ pub fn closed_form_anisotropic_pair_block_pure(
     };
     let j_prefactor = eta_centered.iter().sum::<f64>().exp();
 
-    // Median off-diagonal anisotropic distance is needed only when the
-    // exact pure-Duchon finite self-pair is unavailable. The integer-only
-    // self-pair helper is consulted only when `s` is whole-valued;
-    // fractional `s` always falls through to the analytic radial chain
-    // below, which now accepts `f64` via the threaded
-    // `radial_derivatives_of_isotropic_duchon` cascade.
-    let s_int = if s.fract() == 0.0 && s >= 0.0 {
-        Some(s as usize)
-    } else {
-        None
-    };
-    let pure_diag_exact = s_int
-        .and_then(|si| closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, &eta_centered))
-        .is_some();
-    let r_eps = if pure_diag_exact {
-        0.0
-    } else {
-        pure_duchon_diagonal_epsilon(centers, &eta_centered)
-    };
+    // The exact self-pair limit `g_q(0)`, shared by every diagonal entry.
+    let self_pair = j_prefactor
+        * closed_form_penalty::pure_duchon_self_pair_value(q, d, m, s, &eta_centered)
+            .unwrap_or_else(|| {
+                // SAFETY: outside the UV clause `4(m+s) > d + 2q` the self-pair diverges
+                // and no closed-form block exists; callers gate on
+                // `duchon_closed_form_operator_penalty_converges`, so reaching this is a
+                // broken contract, and no finite value may stand in for the limit.
+                panic!(
+                    "closed_form_anisotropic_pair_block_pure: q={q} d={d} m={m} s={s} violates \
+                     the UV clause 4(m+s) > d + 2q, so the self-pair diverges; callers must gate \
+                     on duchon_closed_form_operator_penalty_converges"
+                )
+            });
     let powers = closed_form_penalty::AnisoMetricPowers::new(&eta_centered);
 
     // Parallelize by independent lower-triangular rows and evaluate each
@@ -2624,26 +2634,7 @@ pub fn closed_form_anisotropic_pair_block_pure(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = if i == j {
-                // Self-pair (R = 0). Prefer the exact finite-part limit
-                // when available (integer s only); otherwise use the same
-                // ε-regularized convention via the analytic radial chain
-                // (which now accepts fractional s end-to-end).
-                let closed_self = s_int.and_then(|si| {
-                    closed_form_penalty::pure_duchon_self_pair_value(q, d, m, si, eta_slice)
-                });
-                if let Some(closed) = closed_self {
-                    j_prefactor * closed
-                } else {
-                    let mut r_eps_buf: SmallVec<[f64; 16]> = SmallVec::with_capacity(d);
-                    r_eps_buf.resize(d, 0.0);
-                    if d > 0 {
-                        r_eps_buf[0] = r_eps * eta_slice[0].exp();
-                    }
-                    j_prefactor
-                        * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                            q, m, s, 0.0, eta_slice, &powers, &r_eps_buf,
-                        )
-                }
+                self_pair
             } else {
                 j_prefactor
                     * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
@@ -3105,8 +3096,8 @@ pub(crate) const CLOSED_FORM_OPERATOR_THRESHOLD: usize = 1500;
 /// [`closed_form_anisotropic_pair_block_pure`] to evaluate the closed-form
 /// penalty via analytic radial derivatives of the pure-Riesz kernel, which
 /// is finite for R > 0 in any (m, s, d, q) regime where
-/// `radial_derivatives_of_isotropic_duchon` is defined. Self-pair (R=0)
-/// regularization is handled inside the pair-block routine.
+/// `radial_derivatives_of_isotropic_duchon` is defined. The self-pair (R=0)
+/// takes its exact limit inside the pair-block routine.
 pub(crate) fn closed_form_operator_penalty_in_total_basis_pure(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -3118,12 +3109,8 @@ pub(crate) fn closed_form_operator_penalty_in_total_basis_pure(
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
     // The whole scale-free Duchon chain — pair block, anisotropic radial,
-    // uniform-metric branch, isotropic radial derivatives, Riesz kernel —
-    // is now `f64`-threaded for `kappa = 0`. The integer-only self-pair /
-    // partial-fraction helpers are still consulted opportunistically
-    // (`s_int` gating inside the pair block) when `s` happens to be
-    // whole-valued, but fractional `s` falls through cleanly to the
-    // ε-regularized analytic radial chain.
+    // uniform-metric branch, isotropic radial derivatives, Riesz kernel, and
+    // the exact self-pair limit — is `f64`-threaded for `kappa = 0`.
     assert!(
         s_order.is_finite() && s_order >= 0.0,
         "closed_form_operator_penalty_in_total_basis_pure: s_order must be finite and ≥ 0, got {s_order}"
@@ -4594,21 +4581,27 @@ mod third_order_operator_tests {
         }
     }
 
-    /// The η-derivative builder's third-order blocks (per-axis first and
-    /// second, and the cross pair) match central differences of the normalized
-    /// third-order penalty in the metric's log weights. The reference penalty
-    /// takes the weights `e^{2η}` as given, which is the builder's derivative
-    /// convention (`s_a = w_a h_a²`); at the centred base point they are the
-    /// forward builder's weights.
+    /// The η-derivative builder's blocks (per-axis first and second, and the
+    /// cross pair) match central differences of the normalized forward
+    /// penalties in the metric's log weights, for every operator the builder
+    /// carries: mass `D₀ = φ`, tension `D₁ = ∂φ/∂x_b = q w_b h_b`, stiffness
+    /// `D₂ = ∂²φ/∂x_b∂x_c` and the third-order block. The reference penalties
+    /// take the weights `e^{2η}` as given, which is the builder's derivative
+    /// convention (`s_a = w_a h_a²`, the raw optimizer coordinate of gam#1376);
+    /// at the centred base point they are the forward builder's weights.
     #[test]
     fn the_third_order_eta_derivatives_match_central_differences_2953() {
         let centers = centers_2d();
         let (p, d) = centers.dim();
         let length_scale = 0.8;
         let eta0 = [0.25, -0.25];
+        let block_names = ["S₀ (mass)", "S₁ (tension)", "S₂ (stiffness)", "S₃ (third order)"];
         for nu in [MaternNu::FiveHalves, MaternNu::SevenHalves] {
-            let penalty = |eta: [f64; 2]| -> Array2<f64> {
+            let penalty = |eta: [f64; 2]| -> Vec<Array2<f64>> {
                 let weights: Vec<f64> = eta.iter().map(|value| (2.0 * value).exp()).collect();
+                let mut mass = Array2::<f64>::zeros((p, p));
+                let mut tension = Array2::<f64>::zeros((p * d, p));
+                let mut stiffness = Array2::<f64>::zeros((p * d * d, p));
                 let mut gram = Array2::<f64>::zeros((p, p));
                 let mut displacement = Array2::<f64>::zeros((p, d));
                 let mut distance = vec![0.0_f64; p];
@@ -4621,9 +4614,26 @@ mod third_order_operator_tests {
                         let r = stable_euclidean_norm(
                             (0..d).map(|c| weights[c].sqrt() * displacement[[j, c]]),
                         );
-                        let (_, _, t, t_r, _) =
+                        let (phi, q, t, t_r, _) =
                             matern_aniso_extended_radial_scalars(r, length_scale, nu)
                                 .expect("Matérn radial scalars");
+                        mass[[k, j]] = phi;
+                        for b in 0..d {
+                            let h_b = displacement[[j, b]];
+                            tension[[k * d + b, j]] = q * weights[b] * h_b;
+                            for c in 0..d {
+                                stiffness[[(k * d + b) * d + c, j]] = hessian_operator_entry(
+                                    q,
+                                    t,
+                                    h_b,
+                                    displacement[[j, c]],
+                                    weights[b],
+                                    weights[c],
+                                    b,
+                                    c,
+                                );
+                            }
+                        }
                         distance[j] = r;
                         radial[j] = ThirdOrderRadial { t, t_r };
                     }
@@ -4643,7 +4653,15 @@ mod third_order_operator_tests {
                         }
                     }
                 }
-                normalize_penalty(&symmetrize(&gram)).0
+                let operator_penalty = |operator: &Array2<f64>| {
+                    normalize_penalty(&symmetrize(&operator.t().dot(operator))).0
+                };
+                vec![
+                    operator_penalty(&mass),
+                    operator_penalty(&tension),
+                    operator_penalty(&stiffness),
+                    normalize_penalty(&symmetrize(&gram)).0,
+                ]
             };
             let (per_axis, _, cross) = build_matern_operator_penalty_aniso_derivatives(
                 centers.view(),
@@ -4671,32 +4689,42 @@ mod third_order_operator_tests {
             for axis in 0..d {
                 let plus = shifted(&[(axis, step)]);
                 let minus = shifted(&[(axis, -step)]);
-                let fd_first = (&plus - &minus) / (2.0 * step);
-                let fd_second = (&plus - &(&center * 2.0) + &minus) / (step * step);
                 let (first, second) = &per_axis[axis];
                 assert_eq!(first.len(), 4, "nu={nu:?}: mass, tension, stiffness and third order");
-                let first_gap = relative(&first[3], &fd_first);
-                let second_gap = relative(&second[3], &fd_second);
-                assert!(
-                    first_gap < 1e-5,
-                    "nu={nu:?} ∂S₃/∂η_{axis} mismatch: relative gap {first_gap:.3e}"
-                );
-                assert!(
-                    second_gap < 1e-3,
-                    "nu={nu:?} ∂²S₃/∂η_{axis}² mismatch: relative gap {second_gap:.3e}"
-                );
+                for (block, name) in block_names.iter().enumerate() {
+                    let fd_first = (&plus[block] - &minus[block]) / (2.0 * step);
+                    let fd_second = (&plus[block] - &(&center[block] * 2.0) + &minus[block])
+                        / (step * step);
+                    let first_gap = relative(&first[block], &fd_first);
+                    let second_gap = relative(&second[block], &fd_second);
+                    assert!(
+                        first_gap < 1e-5,
+                        "nu={nu:?} ∂{name}/∂η_{axis} mismatch: relative gap {first_gap:.3e}"
+                    );
+                    assert!(
+                        second_gap < 1e-3,
+                        "nu={nu:?} ∂²{name}/∂η_{axis}² mismatch: relative gap {second_gap:.3e}"
+                    );
+                }
             }
-            let fd_cross = (&shifted(&[(0, step), (1, step)]) - &shifted(&[(0, step), (1, -step)])
-                - &shifted(&[(0, -step), (1, step)])
-                + &shifted(&[(0, -step), (1, -step)]))
-                / (4.0 * step * step);
+            let corners = [
+                shifted(&[(0, step), (1, step)]),
+                shifted(&[(0, step), (1, -step)]),
+                shifted(&[(0, -step), (1, step)]),
+                shifted(&[(0, -step), (1, -step)]),
+            ];
             let analytic_cross = cross.evaluate(0, 1).expect("Matérn cross η-derivatives");
             assert_eq!(analytic_cross.len(), 4, "nu={nu:?}: four cross blocks");
-            let cross_gap = relative(&analytic_cross[3], &fd_cross);
-            assert!(
-                cross_gap < 1e-3,
-                "nu={nu:?} ∂²S₃/∂η₀∂η₁ mismatch: relative gap {cross_gap:.3e}"
-            );
+            for (block, name) in block_names.iter().enumerate() {
+                let fd_cross = (&corners[0][block] - &corners[1][block] - &corners[2][block]
+                    + &corners[3][block])
+                    / (4.0 * step * step);
+                let cross_gap = relative(&analytic_cross[block], &fd_cross);
+                assert!(
+                    cross_gap < 1e-3,
+                    "nu={nu:?} ∂²{name}/∂η₀∂η₁ mismatch: relative gap {cross_gap:.3e}"
+                );
+            }
         }
     }
 }
@@ -4916,6 +4944,8 @@ mod matern_basis_size_tests {
     }
 }
 
+#[cfg(test)]
+mod thin_plate_constraint_frame_tests;
 #[cfg(test)]
 mod thin_plate_workspace_equivalence_regression_tests;
 #[cfg(test)]

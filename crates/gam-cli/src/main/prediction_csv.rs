@@ -40,6 +40,12 @@ pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 7] = [
 pub(crate) const PREDICTION_INTERVAL_COLUMNS: [&str; 2] = ["mean_lower", "mean_upper"];
 pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
 
+/// Read the `--id-column` values to echo into prediction output.
+///
+/// The ID column is carried through, not modelled, so it is read as text
+/// ([`gam::data::load_column_text`]) and never passed through the numeric
+/// encoder, whose re-rendering would turn `00123` into `123` and round int64
+/// keys above 2^53 onto their neighbours.
 pub(crate) fn load_prediction_id_values(
     path: &Path,
     id_column: &str,
@@ -48,53 +54,14 @@ pub(crate) fn load_prediction_id_values(
     if id_column.trim().is_empty() {
         return Err("--id-column must be a non-empty column name".to_string());
     }
-    let projected = load_dataset_projected(path, &[id_column.to_string()])?;
-    if projected.values.nrows() != expected_rows {
+    let ids = gam::data::load_column_text(path, id_column).map_err(|e| e.to_string())?;
+    if ids.len() != expected_rows {
         return Err(format!(
             "id column '{id_column}' row count {} does not match prediction row count {expected_rows}",
-            projected.values.nrows()
+            ids.len()
         ));
     }
-    let col_idx = resolve_role_col(&projected.column_map(), id_column, "id")?;
-    let schema_col = projected
-        .schema
-        .columns
-        .iter()
-        .find(|column| column.name == id_column)
-        .ok_or_else(|| format!("id column '{id_column}' missing from inferred schema"))?;
-    let mut out = Vec::<String>::with_capacity(projected.values.nrows());
-    for row_idx in 0..projected.values.nrows() {
-        let value = projected.values[[row_idx, col_idx]];
-        if !value.is_finite() {
-            return Err(format!(
-                "id column '{id_column}' contains non-finite value at row {row_idx}"
-            ));
-        }
-        let rendered = match schema_col.kind {
-            ColumnKindTag::Categorical => {
-                let level_idx = value.round() as usize;
-                schema_col.levels.get(level_idx).cloned().ok_or_else(|| {
-                    format!(
-                        "id column '{id_column}' categorical code {level_idx} at row {row_idx} is out of bounds"
-                    )
-                })?
-            }
-            ColumnKindTag::Continuous | ColumnKindTag::Binary => format_id_number(value),
-        };
-        out.push(rendered);
-    }
-    Ok(out)
-}
-
-pub(crate) fn format_id_number(value: f64) -> String {
-    if value.fract() == 0.0 {
-        format!("{value:.0}")
-    } else {
-        format!("{value:.12}")
-            .trim_end_matches('0')
-            .trim_end_matches('.')
-            .to_string()
-    }
+    Ok(ids)
 }
 
 pub(crate) fn prepend_id_column_to_prediction_csv(

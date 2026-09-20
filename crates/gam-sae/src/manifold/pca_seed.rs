@@ -5,7 +5,7 @@
 use super::SaeAtomBasisKind;
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
-use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, Axis, s};
 use rayon::prelude::*;
 
 /// Residual-norm floor below which the surplus atom's second phase axis is
@@ -161,10 +161,12 @@ fn squared_distance_rows(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
 /// The issue asks for persistent-cohomology harmonic coordinates.  In the core
 /// build we avoid a heavyweight dependency and compute the same object needed by
 /// the optimizer seed: low-energy harmonic coordinates on a symmetric kNN graph
-/// built from a bounded deterministic subsample.  The first non-constant graph
-/// Laplacian eigenfunctions are the discrete harmonic representatives; reading
-/// their phases gives circle/torus coordinates, while normalizing the first
-/// three gives a sphere chart.  If the graph is too small/degenerate this returns
+/// built from a bounded deterministic subsample.  The low non-constant graph
+/// Laplacian eigenfunctions are the discrete harmonic representatives; each atom
+/// reads a window of them chosen by the target energy it carries
+/// ([`topology_seed_harmonic_windows`]).  Reading their phases gives
+/// circle/torus coordinates, while normalizing a window of three gives a sphere
+/// chart.  If the graph is too small/degenerate this returns
 /// `Ok(None)`: the cold-start seed then reads principal components, and the
 /// co-collapse reseed reads data rows ([`sae_data_row_anchored_coords`]).
 pub(crate) fn topology_curved_seed_initial_coords(
@@ -335,7 +337,23 @@ pub(crate) fn topology_curved_seed_initial_coords(
     // constant Fiedler-0 column. Each is a function over the `m` subsample rows.
     let harmonic: Vec<ArrayView1<'_, f64>> = (1..evecs.ncols()).map(|c| evecs.column(c)).collect();
     let n_harm = harmonic.len();
-    let starts = topology_seed_harmonic_starts(basis_kinds, atom_dim);
+    // #3459 — the target energy each harmonic carries, `‖(Z_sub − 1μᵀ)ᵀ v‖²`. An
+    // atom's seed decoder is the least-squares projection of the target onto its
+    // chart's basis, whose first harmonics are these functions, so this is the
+    // reconstruction a harmonic contributes to the seed.
+    let mut z_sub = Array2::<f64>::zeros((m, z.ncols()));
+    for (pos, &r) in rows.iter().enumerate() {
+        z_sub.row_mut(pos).assign(&z.row(r));
+    }
+    let sub_mean = z_sub.sum_axis(Axis(0)) / m as f64;
+    z_sub -= &sub_mean;
+    let target_on_harmonic = z_sub.t().dot(&evecs.slice(s![.., 1..]));
+    let energy: Vec<f64> = target_on_harmonic
+        .columns()
+        .into_iter()
+        .map(|col| col.dot(&col))
+        .collect();
+    let windows = topology_seed_harmonic_windows(basis_kinds, atom_dim, &energy);
     for atom_idx in 0..basis_kinds.len() {
         let d = atom_dim[atom_idx];
         let kind = &basis_kinds[atom_idx];
@@ -346,18 +364,16 @@ pub(crate) fn topology_curved_seed_initial_coords(
         // #1893 UNIVERSAL overcomplete seeding on the topology-seed path (which
         // previously returned early with a wrap that gave every sphere / flat atom
         // an IDENTICAL chart, and every surplus circle / torus atom a duplicate
-        // pair). An atom takes a DISJOINT harmonic window `[start, start+need)`
-        // only when that window fits the available harmonics and no reseed rotation
-        // is requested; otherwise it gets a DISTINCT atom-keyed generic combination
-        // of ALL harmonics, so K ≫ p atoms never share a chart and a co-collapse
-        // reseed (retry > 0) lands every atom on a different basin. Atom 0 at
-        // retry 0 keeps its original leading-harmonic window bit-for-bit.
-        let start = starts[atom_idx];
-        let canonical = pc_pair_offset == 0 && start + need <= n_harm;
-        let fns: Vec<Array1<f64>> = if canonical {
-            (0..need).map(|i| harmonic[start + i].to_owned()).collect()
-        } else {
-            generic_ortho_combos(&harmonic, atom_idx, pc_pair_offset, basis_kinds.len(), need)
+        // pair). An atom takes a DISJOINT harmonic window
+        // ([`topology_seed_harmonic_windows`]) when one is free and no reseed
+        // rotation is requested; otherwise it gets a DISTINCT atom-keyed generic
+        // combination of ALL harmonics, so K ≫ p atoms never share a chart and a
+        // co-collapse reseed (retry > 0) lands every atom on a different basin.
+        let fns: Vec<Array1<f64>> = match windows[atom_idx].filter(|_| pc_pair_offset == 0) {
+            Some(start) => (0..need).map(|i| harmonic[start + i].to_owned()).collect(),
+            None => {
+                generic_ortho_combos(&harmonic, atom_idx, pc_pair_offset, basis_kinds.len(), need)
+            }
         };
         if fns.is_empty() {
             continue;
@@ -455,17 +471,53 @@ fn topology_seed_chart_need(kind: &SaeAtomBasisKind, d: usize) -> usize {
     }
 }
 
-fn topology_seed_harmonic_starts(
+/// The disjoint harmonic window `[start, start + need)` each atom reads, in atom
+/// order, over the eigenvalue-ordered harmonics carrying target energy `energy`.
+///
+/// A window is a run of consecutive eigenvalue ranks, because the chart functions an
+/// atom reads together belong to one eigenspace: on a closed curve the harmonics
+/// `cos jθ, sin jθ` of its phase share an eigenvalue and sit in adjacent ranks, and
+/// the phase `atan2` needs both of one pair. The windows tile each free run of ranks
+/// from its first rank, so they never straddle two eigenspaces of a pair ladder.
+///
+/// #3459 — among the free windows an atom takes the one carrying the most target
+/// energy, not the lowest-eigenvalue one. The eigenvalue ranks a harmonic by its
+/// smoothness on the graph, and one closed curve carries a whole ladder of smooth
+/// harmonics: a window on its `j = 2` pair reads the chart `2θ`, which no planted
+/// structure varies along linearly, and the fit then relaxes that atom onto the
+/// strong structure and splits it across two atoms. Ties keep eigenvalue order, so
+/// at equal energies the windows are the cumulative eigenvalue-order windows. `None`
+/// means no free window fits (or the atom reads no harmonic).
+fn topology_seed_harmonic_windows(
     basis_kinds: &[SaeAtomBasisKind],
     atom_dim: &[usize],
-) -> Vec<usize> {
-    let mut next = 0usize;
-    let mut starts = Vec::with_capacity(basis_kinds.len());
+    energy: &[f64],
+) -> Vec<Option<usize>> {
+    let n_harm = energy.len();
+    let mut taken = vec![false; n_harm];
+    let mut windows = Vec::with_capacity(basis_kinds.len());
     for (kind, &d) in basis_kinds.iter().zip(atom_dim.iter()) {
-        starts.push(next);
-        next = next.saturating_add(topology_seed_chart_need(kind, d));
+        let need = topology_seed_chart_need(kind, d);
+        let mut best: Option<(usize, f64)> = None;
+        let mut s = 0usize;
+        while need > 0 && s + need <= n_harm {
+            if let Some(blocked) = taken[s..s + need].iter().position(|&t| t) {
+                // The free run ends inside this window: resume at the next free rank.
+                s += blocked + 1;
+                continue;
+            }
+            let e: f64 = energy[s..s + need].iter().sum();
+            if best.is_none_or(|(_, best_e)| e > best_e) {
+                best = Some((s, e));
+            }
+            s += need;
+        }
+        if let Some((start, _)) = best {
+            taken[start..start + need].fill(true);
+        }
+        windows.push(best.map(|(start, _)| start));
     }
-    starts
+    windows
 }
 
 /// splitmix64 → pseudo-random weight in `[-1, 1]`, keyed deterministically. No
@@ -1313,10 +1365,40 @@ mod tests {
         ];
         let dims = vec![2usize, 1, 2, 3];
         assert_eq!(
-            topology_seed_harmonic_starts(&kinds, &dims),
-            vec![0, 4, 6, 9],
+            topology_seed_harmonic_windows(&kinds, &dims, &[1.0; 16]),
+            vec![Some(0), Some(4), Some(6), Some(9)],
             "mixed atom kinds must allocate canonical harmonic windows cumulatively; \
              atom_idx * per-atom-need overlaps when need varies"
+        );
+    }
+
+    /// #3459 — one closed curve whose phase `θ` carries the strong circle at `cos θ,
+    /// sin θ` and a weak one at `cos 3θ, sin 3θ`: the harmonic ladder puts the
+    /// data-empty `2θ` pair between them. The second atom must read the `3θ` pair
+    /// that carries target energy, and a window never straddles two pairs.
+    #[test]
+    fn topology_harmonic_windows_follow_target_energy_3459() {
+        let kinds = vec![SaeAtomBasisKind::Periodic; 3];
+        let dims = vec![1usize; 3];
+        // Eigenvalue ranks: j = 1, 1, 2, 2, 3, 3, 4, 4.
+        let energy = [64.0, 64.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0];
+        assert_eq!(
+            topology_seed_harmonic_windows(&kinds, &dims, &energy),
+            vec![Some(0), Some(4), Some(2)],
+            "atoms take the free eigenvalue-rank pairs in order of the target energy they carry"
+        );
+        // The straddling window `[1, 3)` carries the most energy, but it mixes two
+        // eigenspaces and is never a candidate.
+        let energy = [0.0, 64.0, 64.0, 0.0, 1.0, 1.0];
+        assert_eq!(
+            topology_seed_harmonic_windows(&kinds[..1], &dims[..1], &energy),
+            vec![Some(0)],
+            "windows tile the eigenvalue ranks and never straddle two pairs"
+        );
+        assert_eq!(
+            topology_seed_harmonic_windows(&kinds, &dims, &[1.0; 5]),
+            vec![Some(0), Some(2), None],
+            "an atom with no free window reads the generic combination"
         );
     }
 

@@ -14,7 +14,6 @@ mod sphere_high_freq_truth_robust;
 mod sphere_integration;
 mod sphere_invalid_lat_handling;
 mod sphere_low_snr_robust;
-mod sphere_m4_lambda_diagnostic;
 mod sphere_options_batch_g;
 mod sphere_overresourced_small_n;
 mod sphere_polar_latitude_band_profile;

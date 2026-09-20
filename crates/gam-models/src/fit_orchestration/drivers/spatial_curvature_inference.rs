@@ -281,7 +281,7 @@ pub fn curvature_inference_forspec(
             offset.len(),
         );
     }
-    validate_constant_curvature_profile_inputs(weights, offset, &family)?;
+    validate_constant_curvature_profile_inputs(resolvedspec, term_idx, weights, offset, &family)?;
     let (kappa_min, kappa_max) = constant_curvature_kappa_bounds(data, resolvedspec, term_idx);
     let (feature_cols, base_spec) = match resolvedspec
         .smooth_terms

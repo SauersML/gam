@@ -616,11 +616,26 @@ pub(crate) fn efs_q_eff_with_gamma_rate(
 /// fixed-point bridge handles the only thing this formula can't —
 /// non-PSD penalty derivatives that flip the descent direction.
 ///
+/// The update solves the multiplicative model of the gradient along `ρ_i`
+/// that holds every trace fixed and moves only the penalty quadratic, which is
+/// linear in `λ_i`:
+///
+/// ```text
+///   g(ρ + Δ) ≈ g_full + q_eff·(e^Δ − 1)/2.
+/// ```
+///
 /// Three regimes:
-/// - **Stable (`q_eff > 0`, `2·g_full < q_eff`)**: clamp to `±EFS_MAX_STEP`.
-/// - **Over-correction (`q_eff > 0`, `2·g_full ≥ q_eff`)**: emit
-///   `−EFS_MAX_STEP`; line search trims and the canonical form resumes
-///   on the next iteration.
+/// - **Stable (`q_eff > 0`, `2·g_full < q_eff`)**: the model's root,
+///   `Δ = log(1 − 2·g_full/q_eff)`, taken whole. Its length is the outer
+///   fixed-point bridge's to decide: it clips the step to the outer domain and
+///   contracts it by the cost line search. A per-coordinate box on it (#2902)
+///   slowed every walk whose root lay farther away than the box, with no
+///   property of the problem behind the box's width.
+/// - **Over-correction (`q_eff > 0`, `2·g_full ≥ q_eff`)**: the model has no
+///   root (its infimum `g_full − q_eff/2` is still non-negative), so the step
+///   is the model's Newton step from `Δ = 0`, `−2·g_full/q_eff`, along the
+///   model's own curvature `q_eff/2 > 0`: a downhill step whose length the
+///   same line search decides, after which the next evaluation re-linearizes.
 /// - **Pathological (`q_eff ≤ 0` or non-finite)**: returns `None` so the
 ///   caller leaves the step at zero for that coordinate.
 #[inline]
@@ -628,11 +643,11 @@ pub(crate) fn efs_log_step_from_grad(q_eff: f64, g_full: f64) -> Option<f64> {
     if !q_eff.is_finite() || q_eff <= 0.0 || !g_full.is_finite() {
         return None;
     }
-    let ratio = 1.0 - 2.0 * g_full / q_eff;
-    if ratio > 0.0 {
-        Some(ratio.ln().clamp(-EFS_MAX_STEP, EFS_MAX_STEP))
+    let relative = -2.0 * g_full / q_eff;
+    if relative > -1.0 {
+        Some(relative.ln_1p())
     } else {
-        Some(-EFS_MAX_STEP)
+        Some(relative)
     }
 }
 

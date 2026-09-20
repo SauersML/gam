@@ -6,8 +6,8 @@
 //!
 //! # Log-sum-exp and log-softmax
 //!
-//! `lse(z) = log Σ_i e^{z_i}` is [`signed_log_sum_exp`] with every sign positive: one common max-shift and a compensated
-//! sum, so gam-math keeps one owner of the reduction. `log softmax(z)_i = z_i − lse(z)`.
+//! `lse(z) = log Σ_i e^{z_i}` is [`positive_log_sum_exp`], the signed log-sum-exp with every sign positive: one
+//! common max-shift and a compensated sum, so gam-math keeps one owner of the reduction. `log softmax(z)_i = z_i − lse(z)`.
 //!
 //! # KL from logits
 //!
@@ -75,8 +75,9 @@
 
 use std::fmt;
 
-use crate::probability::signed_log_sum_exp;
+use crate::probability::positive_log_sum_exp;
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
+use crate::special::softplus;
 
 /// A logit vector that names no categorical distribution, or two logit vectors that cannot be compared.
 #[derive(Clone, Debug, PartialEq)]
@@ -141,11 +142,6 @@ fn validate(name: &'static str, logits: &[f64]) -> Result<(), CategoricalError> 
     Ok(())
 }
 
-/// `log Σ_i e^{x_i}` over terms that may be `−∞`; an empty or all-`−∞` sum is `−∞`.
-fn positive_log_sum_exp(log_terms: &[f64]) -> f64 {
-    signed_log_sum_exp(log_terms, &vec![1.0; log_terms.len()]).0
-}
-
 /// A first-order bound on `|lse(x) − normalizer|` read off the normalization defect (see the module documentation), and
 /// the weights `e^{x_i − normalizer}`. `normalizer` is the computed log-sum-exp of `log_terms`, so some weight is near 1.
 fn normalizer_error(log_terms: &[f64], normalizer: f64) -> (f64, Vec<f64>) {
@@ -173,16 +169,7 @@ fn normalizer_error(log_terms: &[f64], normalizer: f64) -> (f64, Vec<f64>) {
     (defect + rounding / total, weights)
 }
 
-/// `log(1 + e^x)` without overflow.
-fn log1p_exp(value: f64) -> f64 {
-    if value > 0.0 {
-        value + (-value).exp().ln_1p()
-    } else {
-        value.exp().ln_1p()
-    }
-}
-
-/// First-order rounding of `log1p_exp(value) = result`: the exponential's unit carried through `log1p` with derivative
+/// First-order rounding of `softplus(value) = result`: the exponential's unit carried through `log1p` with derivative
 /// `v/(1 + v)`, the `log1p`'s own unit, and for a positive argument the final addition.
 fn log1p_exp_error(value: f64, result: f64) -> f64 {
     if value > 0.0 {
@@ -239,7 +226,7 @@ fn log_excess_exponential(d: f64) -> (f64, f64) {
     }
 }
 
-/// `lse(z) = log Σ_i e^{z_i}`, through [`signed_log_sum_exp`]'s max-shifted compensated sum.
+/// `lse(z) = log Σ_i e^{z_i}`, through [`positive_log_sum_exp`]'s max-shifted compensated sum.
 pub fn log_sum_exp(logits: &[f64]) -> Result<f64, CategoricalError> {
     validate("logits", logits)?;
     Ok(positive_log_sum_exp(logits))
@@ -392,7 +379,7 @@ pub fn categorical_kl_from_logits_with_error(
             .sum();
         let relative = weighted + mean_gap_error + log_sum_bound;
         linearized &= relative <= 0.5;
-        let divergence = log1p_exp(log_sum);
+        let divergence = softplus(log_sum);
         let sensitivity = (log_sum - divergence).exp();
         let error = sensitivity * relative
             + absolute_error * (-divergence).exp()
@@ -410,8 +397,8 @@ pub fn categorical_kl_from_logits_with_error(
         let log_ratio = log_mass_off - log_mass_on;
         // Both normalizers' errors, and the subtraction's u·(|off| + |on|).
         let ratio_error = on_bound + off_bound + u * (log_mass_off.abs() + log_mass_on.abs());
-        let mass = log1p_exp(log_ratio);
-        // log1p_exp is 1-Lipschitz, so a ratio error past the linearized range still costs at most itself.
+        let mass = softplus(log_ratio);
+        // softplus is 1-Lipschitz, so a ratio error past the linearized range still costs at most itself.
         let sensitivity = if ratio_error <= 0.5 {
             (log_ratio - mass).exp()
         } else {

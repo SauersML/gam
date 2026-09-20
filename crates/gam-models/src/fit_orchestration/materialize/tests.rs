@@ -1157,6 +1157,48 @@ fn family_transformation_normal_uses_ctn_conflict_validation() {
 }
 
 #[test]
+fn location_scale_refuses_an_active_frailty_it_cannot_realize() {
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+    let data = workflow_test_dataset();
+    let frailties = [
+        FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Fixed { sigma: 0.5 },
+        },
+        FrailtySpec::HazardMultiplier {
+            scale: FrailtyScale::Fixed { sigma: 0.5 },
+            loading: HazardLoading::Full,
+        },
+    ];
+    for (formula, family) in [("bmi ~ age_entry", None), ("event ~ bmi", Some("binomial"))] {
+        for frailty in frailties.clone() {
+            let config = FitConfig {
+                family: family.map(str::to_string),
+                noise_formula: Some("1".to_string()),
+                frailty,
+                ..FitConfig::default()
+            };
+            let err = materialize(formula, &data, &config).err();
+            assert!(
+                matches!(&err, Some(WorkflowError::InvalidConfig { reason })
+                    if reason.contains("frailty is not supported for location-scale")),
+                "{formula}: a location-scale fit must refuse a frailty it would drop, got {:?}",
+                err.map(|error| error.to_string())
+            );
+        }
+    }
+    // Without a frailty the same requests still materialize.
+    for (formula, family) in [("bmi ~ age_entry", None), ("event ~ bmi", Some("binomial"))] {
+        let config = FitConfig {
+            family: family.map(str::to_string),
+            noise_formula: Some("1".to_string()),
+            ..FitConfig::default()
+        };
+        materialize(formula, &data, &config)
+            .unwrap_or_else(|error| panic!("{formula}: location-scale without frailty: {error}"));
+    }
+}
+
+#[test]
 fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
     let mut data = workflow_test_dataset();
     data.values.column_mut(2).fill(0.0);
@@ -1256,6 +1298,67 @@ fn competing_risks_all_causes_weighted_passes_per_cause_gate_issue_2276() {
         assert!(
             !err.to_string().contains("unidentifiable"),
             "all causes carrying a positive-weight event must not trip the per-cause gate: {err}"
+        );
+    }
+}
+
+/// An explicit `survival_likelihood='transformation'` is the user's choice, not
+/// the unset default: `linkwiggle(...)` must not silently swap it for the
+/// location-scale model. The existing linkwiggle refusal fires instead.
+#[test]
+fn explicit_transformation_likelihood_with_linkwiggle_is_refused_not_swapped() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: Some("transformation".to_string()),
+        ..FitConfig::default()
+    };
+    let err = materialize(
+        "Surv(age_entry, age_exit, event) ~ bmi + linkwiggle(degree=2, internal_knots=1)",
+        &data,
+        &config,
+    )
+    .err()
+    .expect("an explicit transformation likelihood must not be promoted by linkwiggle");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("linkwiggle(...) is not defined for survival_likelihood='transformation'"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Same contract for `noise_formula`: an explicit transformation likelihood has
+/// no log-sigma predictor, so the noise formula is refused.
+#[test]
+fn explicit_transformation_likelihood_with_noise_formula_is_refused_not_swapped() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: Some("transformation".to_string()),
+        noise_formula: Some("bmi".to_string()),
+        ..FitConfig::default()
+    };
+    let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config)
+        .err()
+        .expect("an explicit transformation likelihood must not be promoted by noise_formula");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("noise_formula requires the survival location-scale likelihood"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Control: with the likelihood unset, a noise formula still selects the
+/// location-scale model, so the transformation refusal never fires.
+#[test]
+fn unset_likelihood_with_noise_formula_still_selects_location_scale() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        noise_formula: Some("bmi".to_string()),
+        ..FitConfig::default()
+    };
+    if let Err(err) = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config) {
+        assert!(
+            !err.to_string().contains("noise_formula requires"),
+            "an unset likelihood must be promoted to location-scale: {err}"
         );
     }
 }
@@ -1512,9 +1615,17 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
     };
     let (initial_centers, initial_is_auto) =
         planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
+    // #3149: the orchestrated request starts at the pilot (here the rate count
+    // `starting_num_centers`, above the pilot `s(x)` floor), and the raw
+    // request, which nothing grows, at the provisioned default above it.
     assert_eq!(
-        initial_centers, raw_centers,
-        "an absent adaptive proposal must preserve the canonical 1-D {label} formula resolution"
+        initial_centers,
+        starting_num_centers(data.values.nrows(), 1, 2),
+        "an absent adaptive proposal must start the 1-D {label} at its pilot"
+    );
+    assert!(
+        raw_centers > initial_centers,
+        "the provisioned 1-D {label} default ({raw_centers}) sits above the pilot ({initial_centers})"
     );
     assert!(
         initial_is_auto,
@@ -1627,19 +1738,19 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
         adaptive_centers,
         starting_num_centers(data.values.nrows(), 2, 3)
     );
-    // #1757 made the IMPLICIT 2-D Duchon default low-rank; that rank is the
-    // rate-derived pilot `starting_num_centers(n, d, nullspace)` — the affine
-    // null space plus the penalized resolution rank at `n` rows — which is
-    // also where the adaptive pilot starts. The raw default and the pilot
-    // start therefore COINCIDE at every n.
-    // What separates them is the grow CEILING, not the start: only the
-    // orchestrated request has an owner that may escalate toward
-    // `default_num_centers`, and the raw request stays pinned at the low-rank
-    // default forever. Asserted below as two equalities and a headroom fact,
-    // which is strictly more than the single inequality it replaces.
+    // #3149: only the orchestrated request, whose loop grows the basis,
+    // starts at the rate-derived pilot `starting_num_centers(n, d, nullspace)`.
+    // The raw request has no loop, so it keeps the provisioned low-rank
+    // default (#1757): the generic spatial count held to `10 · 3^(d - 1)` =
+    // 30 centers in 2-D.
     assert_eq!(
-        raw_centers, adaptive_centers,
-        "the raw 2-D Duchon default and the adaptive pilot start are the same low-rank rule"
+        raw_centers,
+        default_num_centers(data.values.nrows(), 2).min(30),
+        "the raw 2-D Duchon default is the provisioned low-rank default"
+    );
+    assert!(
+        raw_centers > adaptive_centers,
+        "the pilot start ({adaptive_centers}) sits below the provisioned default ({raw_centers})"
     );
     assert!(
         adaptive_centers <= default_num_centers(data.values.nrows(), 2),
@@ -1663,9 +1774,9 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 
     // Second arm, at an n where the `n / COND_N_DIVISOR` conditioning cap in
-    // `default_num_centers` no longer binds: the rate pilot is then STRICTLY
-    // below the production ceiling, so the orchestrator's grow loop has
-    // something to escalate.
+    // `default_num_centers` no longer binds: the raw request is at the 30-center
+    // provisioned cap, and the rate pilot is STRICTLY below the production
+    // ceiling, so the orchestrator's grow loop has something to escalate.
     let wide = duchon_workflow_dataset_with_rows(200);
     let wide_rows = wide.values.nrows();
     let low_rank_representer_rank = starting_num_centers(wide_rows, 2, 3);
@@ -1683,14 +1794,100 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     };
     assert_eq!(
         wide_raw_spec.center_strategy.planned_num_centers(2),
-        low_rank_representer_rank,
-        "the implicit 2-D Duchon default is the rate-derived low-rank pilot (#1757)"
+        30,
+        "the raw 2-D Duchon default is the provisioned low-rank cap (#1757)"
     );
     assert!(
         default_num_centers(wide_rows, 2) > low_rank_representer_rank,
         "the grow-loop ceiling must strictly exceed the low-rank start at {wide_rows} rows,          or an orchestrated 2-D Duchon has nothing to escalate: ceiling={}, start={}",
         default_num_centers(wide_rows, 2),
         low_rank_representer_rank
+    );
+}
+
+/// Two continuous coordinates and an unbalanced two-level factor: `a` on
+/// `n_a` rows, `b` on `n_b`.
+fn by_level_radial_workflow_dataset(n_a: usize, n_b: usize) -> Dataset {
+    let n = n_a + n_b;
+    let mut values = Array2::<f64>::zeros((n, 4));
+    for i in 0..n {
+        let x = i as f64 / (n - 1) as f64;
+        let z = ((i * 37) % n) as f64 / (n - 1) as f64;
+        values[[i, 0]] = (3.0 * x).sin() + z;
+        values[[i, 1]] = x;
+        values[[i, 2]] = z;
+        values[[i, 3]] = if i < n_a { 0.0 } else { 1.0 };
+    }
+    let continuous = |name: &str| SchemaColumn {
+        name: name.to_string(),
+        kind: ColumnKindTag::Continuous,
+        levels: vec![],
+    };
+    Dataset {
+        headers: vec!["y".to_string(), "x".to_string(), "z".to_string(), "g".to_string()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                continuous("y"),
+                continuous("x"),
+                continuous("z"),
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+/// #3149/#2993: a factor-by level's block is identified on its own level's
+/// rows, so the orchestrated start of an auto-sized radial smooth in each
+/// level is the rate pilot at that level's row count, not at the pooled rows
+/// the other levels contribute.
+#[test]
+fn adaptive_spatial_start_of_a_by_level_smooth_counts_its_own_level_rows() {
+    let (n_a, n_b) = (120, 60);
+    let data = by_level_radial_workflow_dataset(n_a, n_b);
+    let config = FitConfig {
+        adaptive_resolution: Some(Vec::new()),
+        ..FitConfig::default()
+    };
+    let mat = materialize("y ~ s(x, z, by=g)", &data, &config)
+        .expect("adaptive by-level thin-plate materialization");
+    let FitRequest::Standard(request) = mat.request else {
+        panic!("expected standard request");
+    };
+    let mut starts = Vec::new();
+    for term in &request.spec.smooth_terms {
+        let SmoothBasisSpec::ByVariable { inner, .. } = &term.basis else {
+            continue;
+        };
+        let SmoothBasisSpec::ThinPlate { spec, .. } = inner.as_ref() else {
+            panic!("expected a thin-plate level block, got {inner:?}");
+        };
+        assert!(center_strategy_is_auto(&spec.center_strategy));
+        starts.push(spec.center_strategy.planned_num_centers(2));
+    }
+    assert_eq!(
+        starts,
+        vec![
+            starting_num_centers(n_a, 2, 3),
+            starting_num_centers(n_b, 2, 3)
+        ],
+        "each level starts from its own {n_a} / {n_b} rows, not the pooled {}",
+        n_a + n_b
+    );
+    assert_ne!(
+        starting_num_centers(n_b, 2, 3),
+        starting_num_centers(n_a + n_b, 2, 3),
+        "the fixture must separate a level's rows from the pooled rows"
     );
 }
 
@@ -4555,4 +4752,124 @@ fn every_link_spelling_is_read_and_a_disagreeing_link_argument_is_refused_3014()
     // A flexible request of a link the joint wiggle cannot flex is still refused,
     // now also when the link is named in the formula.
     assert!(resolve("y ~ x + link(type=sas)", None, true).is_err());
+}
+
+fn with_precision_hyperprior(config: FitConfig) -> FitConfig {
+    FitConfig {
+        penalty_block_gamma_priors: vec![("bmi".to_string(), 2.0, 1.0)],
+        ..config
+    }
+}
+
+fn assert_precision_prior_refused<T>(result: Result<T, WorkflowError>, model: &str) {
+    let err = result
+        .err()
+        .unwrap_or_else(|| panic!("{model}: a precision hyperprior the fit cannot use must be refused"));
+    let message = err.to_string();
+    assert!(
+        matches!(err, WorkflowError::InvalidConfig { .. })
+            && message.contains("precision_hyperpriors is not supported for")
+            && message.contains(model),
+        "{model}: {message}"
+    );
+}
+
+#[test]
+fn precision_hyperpriors_are_refused_where_no_fit_realizes_them() {
+    let data = workflow_test_dataset();
+    assert_precision_prior_refused(
+        materialize(
+            "bmi ~ age_entry",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                noise_formula: Some("age_entry".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "location-scale",
+    );
+    assert_precision_prior_refused(
+        materialize(
+            "bmi ~ s(age_entry, k=4)",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                family: Some("transformation-normal".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "transformation-normal",
+    );
+    assert_precision_prior_refused(
+        materialize(
+            "event ~ bmi",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                family: Some("bernoulli-marginal-slope".to_string()),
+                slope_formula: Some("1".to_string()),
+                z_column: Some("z".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "Bernoulli marginal-slope",
+    );
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    for likelihood in ["location-scale", "latent", "latent-binary"] {
+        assert_precision_prior_refused(
+            materialize(
+                "Surv(age_entry, age_exit, event) ~ bmi",
+                &survival,
+                &with_precision_hyperprior(FitConfig {
+                    survival_likelihood: Some(likelihood.to_string()),
+                    ..FitConfig::default()
+                }),
+            ),
+            &format!("survival_likelihood='{likelihood}'"),
+        );
+    }
+}
+
+#[test]
+fn precision_hyperpriors_still_reach_the_survival_transformation_fit() {
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    for likelihood in ["transformation", "weibull"] {
+        if let Err(err) = materialize(
+            "Surv(age_entry, age_exit, event) ~ bmi",
+            &survival,
+            &with_precision_hyperprior(FitConfig {
+                survival_likelihood: Some(likelihood.to_string()),
+                ..FitConfig::default()
+            }),
+        ) {
+            assert!(
+                !err.to_string().contains("precision_hyperpriors is not supported"),
+                "{likelihood} realizes penalty-block priors and must not refuse them: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coefficient_groups_are_refused_on_survival_fits() {
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    let config = FitConfig {
+        coefficient_groups: vec![gam_terms::smooth::CoefficientGroupSpec {
+            name: "g".to_string(),
+            selectors: vec![gam_terms::smooth::CoefficientSelector::LinearTerm(
+                "bmi".to_string(),
+            )],
+            parent: None,
+            prior: None,
+            prior_mean: Default::default(),
+        }],
+        ..FitConfig::default()
+    };
+    let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &survival, &config)
+        .err()
+        .expect("coefficient groups the survival fit cannot use must be refused");
+    let message = err.to_string();
+    assert!(
+        matches!(err, WorkflowError::InvalidConfig { .. })
+            && message.contains("coefficient_groups is not supported for"),
+        "{message}"
+    );
 }

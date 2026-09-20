@@ -112,17 +112,19 @@ impl CrosscoderDriftReport {
             .collect()
     }
 
-    /// Atom `k`'s total drift: the sum of its finite per-step drifts (a `NaN` step,
-    /// a dead atom at some layer, contributes `0`). The dictionary-level ranking key
-    /// for "how much does this feature move through the stack".
+    /// Atom `k`'s total drift: the sum of its per-step drifts. The dictionary-level
+    /// ranking key for "how much does this feature move through the stack".
+    ///
+    /// `NaN` when any step is `NaN`, that is, when the atom is numerically dead at
+    /// some layer. A feature that vanishes from a layer has no drift magnitude
+    /// there. Summing only its live steps would score the vanishing as zero
+    /// movement, and an atom dead at every layer would total `0`, so
+    /// [`Self::most_stable_atom`] would name the dead atom.
     ///
     /// # Panics
     /// If `k >= num_atoms`.
     pub(crate) fn atom_total_drift(&self, k: usize) -> f64 {
-        self.atom_drift_profile(k)
-            .into_iter()
-            .filter(|d| d.is_finite())
-            .sum()
+        self.atom_drift_profile(k).into_iter().sum()
     }
 
     /// Mean per-step drift over every atom and step whose drift is finite. `NaN`
@@ -142,13 +144,14 @@ impl CrosscoderDriftReport {
     }
 
     /// The atom with the largest total drift (the feature that rotates the most
-    /// through the stack). `None` when there are no atoms or no finite drift.
+    /// through the stack), over the atoms live at every layer. `None` when no atom
+    /// is.
     pub(crate) fn most_drifting_atom(&self) -> Option<usize> {
         self.extremal_atom(true)
     }
 
-    /// The atom with the smallest total drift (the most layer-stable feature).
-    /// `None` when there are no atoms or no finite drift.
+    /// The atom with the smallest total drift (the most layer-stable feature), over
+    /// the atoms live at every layer. `None` when no atom is.
     pub(crate) fn most_stable_atom(&self) -> Option<usize> {
         self.extremal_atom(false)
     }

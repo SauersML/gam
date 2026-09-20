@@ -184,10 +184,11 @@ class GumbelTemperatureSchedule:
         self.tau_start = float(tau_start)
         self.tau_min = float(tau_min)
         self.decay = str(decay).lower().replace("-", "_")  # type: ignore[assignment]
-        # A geometric schedule takes an explicit `rate` or the (tau_start,
-        # tau_min, steps) endpoints. The Rust descriptor derives or defaults the
-        # rate and validates every field; parsing it once here refuses a bad
-        # schedule at construction.
+        # A geometric schedule takes exactly one of an explicit `rate` or the
+        # (tau_start, tau_min, steps) endpoints; there is no default rate. The
+        # Rust descriptor parser derives the rate from `steps` and validates
+        # every field; parsing it once here refuses a bad schedule at
+        # construction.
         self.rate = rate
         self.steps = steps
         self.iter_count = int(iter_count)

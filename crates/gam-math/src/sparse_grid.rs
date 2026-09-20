@@ -48,7 +48,10 @@ pub struct SmolyakBounds {
 pub struct SmolyakIndexOverflow;
 
 /// The composition totals of isotropic Smolyak `level` in `rank` directions.
-pub fn isotropic_smolyak_bounds(rank: usize, level: usize) -> Result<SmolyakBounds, SmolyakIndexOverflow> {
+pub fn isotropic_smolyak_bounds(
+    rank: usize,
+    level: usize,
+) -> Result<SmolyakBounds, SmolyakIndexOverflow> {
     let q = rank.checked_add(level).ok_or(SmolyakIndexOverflow)?;
     let lower_total = q.saturating_sub(rank.saturating_sub(1)).max(rank);
     Ok(SmolyakBounds { q, lower_total })
@@ -79,8 +82,8 @@ where
     let mut indices = vec![1usize; rank];
     for total in bounds.lower_total..=bounds.q {
         let alternating_power = bounds.q - total;
-        let mut coefficient =
-            binomial_as_f64(rank - 1, alternating_power).map_err(SmolyakLevelError::BinomialOverflow)?;
+        let mut coefficient = binomial_as_f64(rank - 1, alternating_power)
+            .map_err(SmolyakLevelError::BinomialOverflow)?;
         if alternating_power % 2 == 1 {
             coefficient = -coefficient;
         }
@@ -115,7 +118,15 @@ where
     let maximum_here = remaining.saturating_sub(dimensions_left - 1);
     for index in 1..=maximum_here {
         indices[position] = index;
-        stream_compositions(rules, position + 1, remaining - index, indices, coefficient, z, visit)?;
+        stream_compositions(
+            rules,
+            position + 1,
+            remaining - index,
+            indices,
+            coefficient,
+            z,
+            visit,
+        )?;
     }
     Ok(())
 }
@@ -174,7 +185,22 @@ where
     Ok(())
 }
 
-/// Kahan–Babuška (Neumaier) compensated sum.
+/// One Kahan–Babuška (Neumaier) step: add `value` to `sum` and move the exact rounding error of that addition
+/// into `correction`. Unlike plain Kahan, the error is taken from whichever operand is smaller in magnitude, so an
+/// addend larger than the running sum does not lose the running sum's low-order bits.
+#[inline]
+fn neumaier_step(sum: &mut f64, correction: &mut f64, value: f64) {
+    let combined = *sum + value;
+    if sum.abs() >= value.abs() {
+        *correction += (*sum - combined) + value;
+    } else {
+        *correction += (value - combined) + *sum;
+    }
+    *sum = combined;
+}
+
+/// Kahan–Babuška (Neumaier) compensated sum: the workspace's single owner of compensated scalar summation.
+#[derive(Debug, Default, Clone, Copy)]
 pub struct CompensatedSum {
     sum: f64,
     correction: f64,
@@ -182,30 +208,18 @@ pub struct CompensatedSum {
 
 impl CompensatedSum {
     pub fn new() -> Self {
-        Self {
-            sum: 0.0,
-            correction: 0.0,
-        }
+        Self::default()
     }
 
+    #[inline]
     pub fn add(&mut self, value: f64) {
-        let combined = self.sum + value;
-        if self.sum.abs() >= value.abs() {
-            self.correction += (self.sum - combined) + value;
-        } else {
-            self.correction += (value - combined) + self.sum;
-        }
-        self.sum = combined;
+        neumaier_step(&mut self.sum, &mut self.correction, value);
     }
 
-    pub fn value(&self) -> f64 {
+    /// The compensated total: the running sum with its accumulated rounding error folded back in.
+    #[inline]
+    pub fn value(self) -> f64 {
         self.sum + self.correction
-    }
-}
-
-impl Default for CompensatedSum {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -230,13 +244,7 @@ impl QuadratureAccumulator {
     }
 
     pub fn add_moment(&mut self, index: usize, value: f64) {
-        let combined = self.sums[index] + value;
-        if self.sums[index].abs() >= value.abs() {
-            self.corrections[index] += (self.sums[index] - combined) + value;
-        } else {
-            self.corrections[index] += (value - combined) + self.sums[index];
-        }
-        self.sums[index] = combined;
+        neumaier_step(&mut self.sums[index], &mut self.corrections[index], value);
     }
 
     pub fn add_weight(&mut self, weight: f64) {
@@ -250,5 +258,60 @@ impl QuadratureAccumulator {
             *sum += *correction;
         }
         (self.sums, self.mass.value(), self.absolute_weight_sum)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CompensatedSum, QuadratureAccumulator};
+
+    #[test]
+    fn compensated_sum_keeps_the_running_sum_under_a_larger_addend() {
+        // Plain Kahan returns 0 here: adding 1e100 to 1 rounds the running sum's 1 away and its compensation
+        // term never sees it. Neumaier takes the error from the smaller operand and recovers the exact 2.
+        let mut sum = CompensatedSum::new();
+        for value in [1.0, 1e100, 1.0, -1e100] {
+            sum.add(value);
+        }
+        assert_eq!(sum.value(), 2.0);
+    }
+
+    #[test]
+    fn quadrature_moments_use_the_same_compensation() {
+        let mut accumulator = QuadratureAccumulator::from_zeroed(vec![0.0; 2], vec![0.0; 2]);
+        let mut owner = CompensatedSum::new();
+        for value in [1.0, 1e100, 1.0, -1e100, 0.1, 0.2] {
+            accumulator.add_moment(1, value);
+            owner.add(value);
+            accumulator.add_weight(value);
+        }
+        let (moments, mass, _) = accumulator.finish();
+        assert_eq!(moments[0], 0.0);
+        assert_eq!(moments[1].to_bits(), owner.value().to_bits());
+        assert_eq!(mass.to_bits(), owner.value().to_bits());
+    }
+
+    #[test]
+    fn compensated_total_retains_final_cancellation_error() {
+        let tiny = 2.0_f64.powi(-60);
+        let mut total = CompensatedSum::default();
+        for value in [1.0, tiny, -1.0] {
+            total.add(value);
+        }
+        assert_eq!(total.value(), tiny);
+    }
+
+    #[test]
+    fn copied_accumulator_keeps_compensation_and_reset_clears_it() {
+        let mut total = CompensatedSum::default();
+        total.add(2.0_f64.powi(60));
+        total.add(1.0);
+        let mut copied = total;
+        copied.add(-2.0_f64.powi(60));
+        assert_eq!(copied.value(), 1.0);
+        total = CompensatedSum::default();
+        total.add(3.0);
+        assert_eq!(total.value(), 3.0);
+        assert_eq!(copied.value(), 1.0);
     }
 }

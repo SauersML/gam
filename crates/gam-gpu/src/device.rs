@@ -2,12 +2,8 @@
 pub struct GpuCapability {
     pub compute_major: i32,
     pub compute_minor: i32,
-    pub has_tensor_cores: bool,
     pub has_fp64_tensor_cores: bool,
     pub has_async_copy: bool,
-    pub has_cluster_launch: bool,
-    pub has_tma: bool,
-    pub min_warp_size: i32,
 }
 
 impl GpuCapability {
@@ -15,12 +11,8 @@ impl GpuCapability {
         Self {
             compute_major: major,
             compute_minor: minor,
-            has_tensor_cores: major >= 7,
             has_fp64_tensor_cores: major >= 8,
             has_async_copy: major >= 8,
-            has_cluster_launch: major >= 9,
-            has_tma: major >= 9,
-            min_warp_size: 32,
         }
     }
 
@@ -72,7 +64,6 @@ pub struct GpuDeviceInfo {
     pub free_mem_bytes: usize,
     pub ecc_enabled: bool,
     pub integrated: bool,
-    pub mig_mode: bool,
 }
 
 impl GpuDeviceInfo {

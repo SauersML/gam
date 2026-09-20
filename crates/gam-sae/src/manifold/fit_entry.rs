@@ -260,7 +260,7 @@ pub struct SaeFitReport {
     /// absent when no genuine structure search ran.
     pub structure_certificate_json: Option<String>,
     /// #2023 criterion 3: the dictionary moves this fit adjudicated, in one account,
-    /// with the `pc_reseed_events` invariant. It holds the residual-factor nursery's
+    /// including the residual-factor nursery's
     /// promotions (one curved birth each, round = the structured-residual pass that
     /// made it) and, when the structure search ran, its births, deaths and refusals.
     /// The joint fit's collapse-guard events are reported beside it
@@ -502,6 +502,12 @@ pub enum SaeFitError {
     OuterDidNotConverge {
         stage: SaeFitStage,
         result: Box<OuterResult>,
+        /// Why [`SaeManifoldOuterObjective::certify_outer_result`] refused a
+        /// result the solver reported as converged (a missing or failing
+        /// criterion certificate, a rho that is not the installed state, a
+        /// non-finite criterion). `None` when the solver itself stopped
+        /// without converging.
+        certification_refusal: Option<String>,
     },
     /// #2691 — a LOAD-BEARING atom's chart collapsed to a single point of its
     /// own manifold. That atom decodes to a constant, and any consumer reading a
@@ -538,7 +544,11 @@ impl std::fmt::Display for SaeFitError {
             Self::OuterRun { stage, source } => {
                 write!(f, "SAE manifold {stage} outer search failed: {source}")
             }
-            Self::OuterDidNotConverge { stage, result } => {
+            Self::OuterDidNotConverge {
+                stage,
+                result,
+                certification_refusal,
+            } => {
                 let grad = result
                     .final_grad_norm
                     .map(|value| format!("{value:.6e}"))
@@ -547,14 +557,22 @@ impl std::fmt::Display for SaeFitError {
                     f,
                     "SAE manifold {stage} outer search stopped without a stationarity \
                      certificate (iterations={}, final_value={:.6e}, final_grad_norm={}, \
-                     plan={}, stop_reason={:?}, rho_checkpoint={:?}); refusing to mint a fit",
+                     plan={}, stop_reason={:?}, rho_checkpoint={:?}",
                     result.iterations,
                     result.final_value,
                     grad,
                     result.plan_used,
                     result.operator_stop_reason,
                     result.rho,
-                )
+                )?;
+                if let Some(refusal) = certification_refusal {
+                    write!(
+                        f,
+                        "; the solver reported convergence but certification refused it: \
+                         {refusal}"
+                    )?;
+                }
+                f.write_str("); refusing to mint a fit")
             }
         }
     }
@@ -578,23 +596,22 @@ impl std::error::Error for SaeFitError {
 pub(crate) fn certify_outer_stage(
     objective: SaeManifoldOuterObjective,
     stage: SaeFitStage,
-    run_result: Result<OuterResult, EstimationError>,
+    run_result: Result<super::SaeOuterRun, EstimationError>,
 ) -> Result<SaeManifoldOuterObjective, SaeFitError> {
     match run_result {
-        Ok(result) if result.converged() => {
-            let mut objective = objective;
-            match objective.certify_outer_result(&result) {
-                Ok(()) => Ok(objective),
-                Err(_) => Err(SaeFitError::OuterDidNotConverge {
-                    stage,
-                    result: Box::new(result),
-                }),
-            }
-        }
-        Ok(result) => Err(SaeFitError::OuterDidNotConverge {
+        Ok(super::SaeOuterRun::Certified(_)) => Ok(objective),
+        Ok(super::SaeOuterRun::Unconverged(result)) => Err(SaeFitError::OuterDidNotConverge {
             stage,
             result: Box::new(result),
+            certification_refusal: None,
         }),
+        Ok(super::SaeOuterRun::Refused { result, reason }) => {
+            Err(SaeFitError::OuterDidNotConverge {
+                stage,
+                result: Box::new(result),
+                certification_refusal: Some(reason),
+            })
+        }
         Err(source) => Err(SaeFitError::OuterRun { stage, source }),
     }
 }
@@ -717,12 +734,14 @@ fn fit_outer_stage_to_boundary(
             let problem = OuterProblem::new(rho_flat.len())
                 .with_problem_size(target.len(), p_beta)
                 .with_initial_rho(rho_flat);
-            match problem.run(&mut objective, "SAE manifold") {
-                Ok(result) if result.converged() => {
-                    return certify_outer_stage(objective, stage, Ok(result))
+            match objective.run_to_certificate(&problem, "SAE manifold") {
+                Ok(
+                    run @ (super::SaeOuterRun::Certified(_) | super::SaeOuterRun::Refused { .. }),
+                ) => {
+                    return certify_outer_stage(objective, stage, Ok(run))
                         .map(SaeStageFit::Certified);
                 }
-                Ok(result) => {
+                Ok(super::SaeOuterRun::Unconverged(result)) => {
                     let terminal_rho = Array1::from(result.rho.clone());
                     match objective.vanished_stage_state_at(terminal_rho.view()) {
                         Ok(Some(state)) => Some(state),
@@ -730,6 +749,7 @@ fn fit_outer_stage_to_boundary(
                             return Err(SaeFitError::OuterDidNotConverge {
                                 stage,
                                 result: Box::new(result),
+                                certification_refusal: None,
                             });
                         }
                         // `vanished_stage_state_at` CLASSIFIES a run that has
@@ -752,6 +772,7 @@ fn fit_outer_stage_to_boundary(
                             return Err(SaeFitError::OuterDidNotConverge {
                                 stage,
                                 result: Box::new(result),
+                                certification_refusal: None,
                             });
                         }
                     }

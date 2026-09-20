@@ -124,10 +124,13 @@ pub fn family_noise_parameter(
         | (ResponseFamily::Gamma, LikelihoodScaleMetadata::EstimatedGammaShape { shape }) => {
             positive("Gamma shape", shape)
         }
-        // Gaussian / Poisson / Binomial: the residual scale is the generative
-        // sigma (Poisson/Binomial ignore it downstream).
+        // Poisson / Binomial have no free dispersion (`phi = 1`). The Student-t
+        // scale and degrees of freedom are the fitted values stored on the
+        // response spec itself (the likelihood carries the unit
+        // exponential-dispersion multiplier), which `from_likelihood` reads
+        // directly, so none of the three takes a scalar noise parameter.
         (
-            ResponseFamily::Binomial | ResponseFamily::Poisson,
+            ResponseFamily::Binomial | ResponseFamily::Poisson | ResponseFamily::StudentT { .. },
             LikelihoodScaleMetadata::FixedDispersion { phi },
         ) if phi.to_bits() == 1.0_f64.to_bits() => Ok(None),
         (ResponseFamily::RoystonParmar, _) => Err(invalid(
@@ -236,16 +239,14 @@ pub fn generativespec_from_predict(
 ) -> Result<GenerativeSpec, EstimationError> {
     let mut noise =
         NoiseModel::from_likelihood(&likelihood, prediction.mean.len(), gaussian_scale)?;
-    // Analytic prior weights define `Var(y_i) = sigma^2 / w_i` for a weighted
-    // Gaussian fit, so replicate observation noise is heteroskedastic:
-    // `sigma_i = sigma_hat / sqrt(w_i)`. `from_likelihood` broadcasts the pooled
-    // scalar `sigma_hat` to every row (the correct value for an unweighted fit),
-    // so rescale it per row here whenever the fit carried prior weights (#2025).
-    // Only the Gaussian arm exposes a location-scale `sigma`; the other families
-    // encode dispersion through their own precision parameter and analytic prior
-    // weights do not enter their observation draw, so they are left untouched.
-    if let (NoiseModel::Gaussian { sigma }, Some(weights)) = (&mut noise, prior_weights) {
-        scale_gaussian_sigma_by_prior_weights(sigma, weights)?;
+    // Analytic prior weights are precisions for every continuous
+    // exponential-dispersion family: the fit's likelihood (and its Pearson
+    // dispersion estimate) is built on `Var(y_i) = phi V(mu_i) / w_i`.
+    // `from_likelihood` broadcasts the pooled scalar dispersion to every row
+    // (the correct value for an unweighted fit), so rescale it per row here
+    // whenever the fit carried prior weights (#2025).
+    if let Some(weights) = prior_weights {
+        apply_precision_prior_weights(&mut noise, weights)?;
     }
     Ok(GenerativeSpec {
         mean: prediction.mean,
@@ -253,29 +254,75 @@ pub fn generativespec_from_predict(
     })
 }
 
-/// Rescale a broadcast Gaussian `sigma_hat` vector into the per-row analytic-weight
-/// observation scale `sigma_i = sigma_hat / sqrt(w_i)` (#2025). The prior weights
-/// `w_i` are the same non-negative weights the fit consumed; a zero or non-finite
-/// weight has no finite observation variance under the analytic-weight model, so it
-/// is rejected rather than silently producing an infinite draw scale.
-fn scale_gaussian_sigma_by_prior_weights(
-    sigma: &mut Array1<f64>,
+/// Thread analytic (precision) prior weights `w_i` into a broadcast observation
+/// law, so each row is drawn from `Var(y_i) = phi V(mu_i) / w_i` exactly as the
+/// fit's likelihood defines it:
+///
+/// * Gaussian: `sigma_i = sigma_hat / sqrt(w_i)`;
+/// * Gamma: `Var = mu^2 / (k w_i)`, i.e. shape `k_i = k w_i` (the scale
+///   `mu_i / k_i` keeps the mean at `mu_i`);
+/// * inverse Gaussian: `Var = phi mu^3 / w_i`, i.e. `phi_i = phi / w_i`;
+/// * Tweedie: `Var = phi mu^p / w_i`, i.e. `phi_i = phi / w_i`.
+///
+/// Poisson, negative binomial and Beta fits read prior weights as frequency
+/// counts (replicated rows, not a per-row precision). The Bernoulli noise model
+/// describes one binary outcome; its prior weights do not rescale that law.
+/// Student-t, categorical and transformation-normal laws carry no analytic-weight
+/// observation scale here. The weights are the same non-negative weights the fit
+/// consumed; a zero or non-finite weight has no finite observation variance under
+/// the precision model, so it is rejected rather than silently producing a
+/// degenerate draw scale.
+fn apply_precision_prior_weights(
+    noise: &mut NoiseModel,
     weights: &Array1<f64>,
 ) -> Result<(), EstimationError> {
-    if weights.len() != sigma.len() {
+    match noise {
+        NoiseModel::Gaussian { sigma } => {
+            scale_rows_by_prior_weights(sigma, weights, true, |sigma, w| sigma / w.sqrt())
+        }
+        NoiseModel::Gamma { shape } => {
+            scale_rows_by_prior_weights(shape, weights, false, |shape, w| shape * w)
+        }
+        NoiseModel::InverseGaussian { phi } | NoiseModel::Tweedie { phi, .. } => {
+            scale_rows_by_prior_weights(phi, weights, false, |phi, w| phi / w)
+        }
+        NoiseModel::Poisson
+        | NoiseModel::NegativeBinomial { .. }
+        | NoiseModel::Beta { .. }
+        | NoiseModel::Bernoulli
+        | NoiseModel::StudentT { .. }
+        | NoiseModel::Categorical { .. }
+        | NoiseModel::TransformationNormalQuantile { .. } => Ok(()),
+    }
+}
+
+fn scale_rows_by_prior_weights(
+    values: &mut Array1<f64>,
+    weights: &Array1<f64>,
+    allow_zero: bool,
+    scale: impl Fn(f64, f64) -> f64,
+) -> Result<(), EstimationError> {
+    if weights.len() != values.len() {
         crate::bail_invalid_estim!(
             "prior weights length {} does not match observation count {}",
             weights.len(),
-            sigma.len()
+            values.len()
         );
     }
-    for (s, &w) in sigma.iter_mut().zip(weights.iter()) {
+    for (row, (value, &w)) in values.iter_mut().zip(weights.iter()).enumerate() {
         if !(w.is_finite() && w > 0.0) {
             crate::bail_invalid_estim!(
-                "Gaussian replicate prior weights must be finite and > 0; got {w}"
+                "replicate precision prior weights must be finite and > 0; got {w}"
             );
         }
-        *s /= w.sqrt();
+        let scaled = scale(*value, w);
+        if !scaled.is_finite() || !(scaled > 0.0 || (allow_zero && *value == 0.0 && scaled == 0.0))
+        {
+            crate::bail_invalid_estim!(
+                "replicate precision-scaled parameter at row {row} is not representable: {scaled}"
+            );
+        }
+        *value = scaled;
     }
     Ok(())
 }
@@ -1128,6 +1175,127 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispersion_family_generativespec_scales_noise_by_precision_prior_weights() {
+        use gam_problem::{InverseLink, StandardLink};
+        // Precision prior weights define Var(y_i) = phi V(mu_i) / w_i for every
+        // continuous exponential-dispersion family, so the per-row observation law
+        // must carry the weight: Gamma shape k w_i, inverse-Gaussian and Tweedie
+        // dispersion phi / w_i. Unit weights reproduce the pooled scalar.
+        let weights = Array1::from(vec![1.0, 4.0, 0.25]);
+        let unit = Array1::from_elem(3, 1.0_f64);
+        let mean = Array1::from(vec![0.5, 1.0, 2.0]);
+        let log_link = InverseLink::Standard(StandardLink::Log);
+        let prediction = || PredictResult {
+            eta: mean.mapv(f64::ln),
+            mean: mean.clone(),
+        };
+        let per_row = |likelihood: LikelihoodSpec, parameter: f64, w: &Array1<f64>| {
+            match generativespec_from_predict(prediction(), likelihood, Some(parameter), Some(w))
+                .expect("weighted generative spec builds")
+                .noise
+            {
+                NoiseModel::Gamma { shape } => shape,
+                NoiseModel::InverseGaussian { phi } | NoiseModel::Tweedie { phi, .. } => phi,
+                other => panic!("unexpected observation noise {other:?}"),
+            }
+        };
+        let cases = [
+            (LikelihoodSpec::gamma_log(), 3.0, [3.0, 12.0, 0.75]),
+            (
+                LikelihoodSpec::new(ResponseFamily::InverseGaussian, log_link.clone()),
+                0.5,
+                [0.5, 0.125, 2.0],
+            ),
+            (
+                LikelihoodSpec::new(ResponseFamily::Tweedie { p: 1.5 }, log_link),
+                2.0,
+                [2.0, 0.5, 8.0],
+            ),
+        ];
+        for (likelihood, parameter, expected) in cases {
+            let name = likelihood.pretty_name();
+            let weighted = per_row(likelihood.clone(), parameter, &weights);
+            for (i, (&got, &want)) in weighted.iter().zip(expected.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-12 * want,
+                    "{name} row {i}: weighted noise parameter must be {want}, got {got} \
+                     (the pooled {parameter} drops the precision prior weight)"
+                );
+            }
+            let flat = per_row(likelihood, parameter, &unit);
+            assert!(
+                flat.iter().all(|&v| v == parameter),
+                "{name}: unit prior weights must leave the pooled parameter {parameter}"
+            );
+        }
+
+        // Frequency-weighted families are unchanged by prior weights.
+        let poisson = generativespec_from_predict(
+            prediction(),
+            LikelihoodSpec::poisson_log(),
+            None,
+            Some(&weights),
+        )
+        .expect("weighted Poisson generative spec builds");
+        assert!(matches!(poisson.noise, NoiseModel::Poisson));
+
+        // A non-positive precision weight has no finite observation variance.
+        let zero = Array1::from(vec![1.0, 0.0, 1.0]);
+        assert!(
+            generativespec_from_predict(
+                prediction(),
+                LikelihoodSpec::gamma_log(),
+                Some(3.0),
+                Some(&zero),
+            )
+            .is_err(),
+            "a zero precision weight must be rejected, not drawn with infinite variance"
+        );
+    }
+
+    #[test]
+    fn student_t_fit_resolves_its_generative_law_from_the_fitted_spec() {
+        use gam_problem::{InverseLink, StandardLink};
+        // A Student-t fit records the unit exponential-dispersion multiplier
+        // (`FixedDispersion { phi: 1 }`); sigma and nu live on the response
+        // spec. The scalar noise-parameter picker must accept that metadata
+        // (it used to fall through to "inconsistent metadata", so every
+        // Student-t `sample_replicates` / `generate` call failed), and the
+        // observation law must carry the fitted sigma and nu.
+        let likelihood = LikelihoodSpec::new(
+            ResponseFamily::StudentT {
+                sigma: 1.5,
+                nu: 4.0,
+            },
+            InverseLink::Standard(StandardLink::Identity),
+        );
+        let parameter = family_noise_parameter(
+            LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+            0.0,
+            &likelihood,
+        )
+        .expect("Student-t fitted scale metadata resolves");
+        assert_eq!(parameter, None);
+        let mean = Array1::from(vec![0.0, 1.0, -2.0]);
+        let spec = generativespec_from_predict(
+            PredictResult {
+                eta: mean.clone(),
+                mean,
+            },
+            likelihood,
+            parameter,
+            Some(&Array1::from(vec![1.0, 2.0, 0.5])),
+        )
+        .expect("Student-t generative spec builds");
+        match spec.noise {
+            NoiseModel::StudentT { sigma, nu } => {
+                assert_eq!((sigma, nu), (1.5, 4.0));
+            }
+            other => panic!("unexpected Student-t observation noise {other:?}"),
+        }
+    }
+
     /// RoystonParmar is not exposed through the generic generative path, and
     /// both the canonical mapping and the simulation adapter must reject it
     /// identically so the two paths stay in lockstep.
@@ -1143,4 +1311,139 @@ mod tests {
         );
     }
 
+    #[test]
+    fn precision_weighted_replicates_match_independent_response_moments() {
+        use gam_problem::{InverseLink, StandardLink};
+        let weights = ndarray::array![0.5, 2.0];
+        let mu = 2.0_f64;
+        let phi = 0.125_f64;
+        for (response, parameter, power) in [
+            (ResponseFamily::Gaussian, phi.sqrt(), 0.0),
+            (ResponseFamily::Gamma, phi.recip(), 2.0),
+            (ResponseFamily::InverseGaussian, phi, 3.0),
+            (ResponseFamily::Tweedie { p: 1.5 }, phi, 1.5),
+        ] {
+            let spec = generativespec_from_predict(
+                PredictResult {
+                    eta: Array1::from_elem(2, mu.ln()),
+                    mean: Array1::from_elem(2, mu),
+                },
+                LikelihoodSpec::new(response, InverseLink::Standard(StandardLink::Log)),
+                Some(parameter),
+                Some(&weights),
+            )
+            .unwrap();
+            let draws = sampleobservation_seeded_replicates(&spec, 0, 20_000, 4163).unwrap();
+            for row in 0..2 {
+                let mut mean = 0.0;
+                let mut m2 = 0.0;
+                for (index, &value) in draws.column(row).iter().enumerate() {
+                    let delta = value - mean;
+                    mean += delta / (index + 1) as f64;
+                    m2 += delta * (value - mean);
+                }
+                // These are the fitted EDM moments, independently of the
+                // sampler's shape/scale parameterization.
+                let expected = phi * mu.powf(power) / weights[row];
+                assert!(
+                    (mean - mu).abs() < 6.0 * (expected / 20_000.0).sqrt(),
+                    "{power} {row}: {mean}"
+                );
+                let observed = m2 / 19_999.0;
+                assert!(
+                    (observed / expected - 1.0).abs() < 0.09,
+                    "{power} {row}: variance {observed}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn precision_scaled_parameters_refuse_unrepresentable_values() {
+        let min = f64::from_bits(1);
+        for (mut noise, weight) in [
+            (
+                NoiseModel::Gamma {
+                    shape: ndarray::array![f64::MAX],
+                },
+                2.0,
+            ),
+            (
+                NoiseModel::Gamma {
+                    shape: ndarray::array![min],
+                },
+                0.25,
+            ),
+            (
+                NoiseModel::InverseGaussian {
+                    phi: ndarray::array![f64::MAX],
+                },
+                0.25,
+            ),
+            (
+                NoiseModel::Tweedie {
+                    p: 1.5,
+                    phi: ndarray::array![min],
+                },
+                4.0,
+            ),
+            (
+                NoiseModel::Gaussian {
+                    sigma: ndarray::array![min],
+                },
+                16.0,
+            ),
+        ] {
+            let error =
+                apply_precision_prior_weights(&mut noise, &ndarray::array![weight]).unwrap_err();
+            assert!(error.to_string().contains("row 0"));
+        }
+        let mut zero = NoiseModel::Gaussian {
+            sigma: ndarray::array![0.0],
+        };
+        apply_precision_prior_weights(&mut zero, &ndarray::array![4.0]).unwrap();
+        assert!(matches!(zero, NoiseModel::Gaussian { sigma } if sigma[0] == 0.0));
+        for weight in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut noise = NoiseModel::Gamma {
+                shape: ndarray::array![2.0],
+            };
+            assert!(apply_precision_prior_weights(&mut noise, &ndarray::array![weight]).is_err());
+        }
+        let mut noise = NoiseModel::Gamma {
+            shape: ndarray::array![2.0],
+        };
+        assert!(apply_precision_prior_weights(&mut noise, &Array1::zeros(0)).is_err());
+    }
+
+    #[test]
+    fn student_t_scale_is_not_a_variance_and_survives_infinite_variance() {
+        use gam_problem::{InverseLink, StandardLink};
+        for nu in [1.0, 2.0, 4.0] {
+            let likelihood = LikelihoodSpec::new(
+                ResponseFamily::StudentT { sigma: 1.5, nu },
+                InverseLink::Standard(StandardLink::Identity),
+            );
+            let parameter = family_noise_parameter(
+                LikelihoodScaleMetadata::FixedDispersion { phi: 1.0 },
+                0.0,
+                &likelihood,
+            )
+            .unwrap();
+            let spec = generativespec_from_predict(
+                PredictResult {
+                    eta: ndarray::array![0.0, 0.0],
+                    mean: ndarray::array![0.0, 0.0],
+                },
+                likelihood,
+                parameter,
+                Some(&ndarray::array![1.0, 4.0]),
+            )
+            .unwrap();
+            assert!(
+                matches!(spec.noise, NoiseModel::StudentT { sigma, nu: fitted_nu } if sigma == 1.5 && fitted_nu == nu)
+            );
+            let draws = sampleobservation_seeded_replicates(&spec, 0, 64, 4166).unwrap();
+            assert!(draws.iter().all(|x| x.is_finite()));
+        }
+    }
 }

@@ -475,54 +475,55 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
 
             if model.predict_model_class() == PredictModelClass::BernoulliMarginalSlope {
                 let y = ds.values.column(y_col).to_owned();
-                if let Some(predictor) = model.predictor() {
-                    let (report_offset, report_noise_offset) = resolve_predict_offsets(
-                        &model,
-                        &ds,
-                        &col_map,
-                        saved_offset_column,
-                        saved_noise_offset_column,
-                    )?;
-                    let pred_input = build_predict_input_for_model(
-                        &model,
-                        ds.values.view(),
-                        &col_map,
-                        training_headers,
-                        &report_offset,
-                        &report_noise_offset,
-                        saved_noise_offset_column.is_some(),
-                    )?;
-                    let pred = predictor
-                        .predict_plugin_response(&pred_input)
-                        .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
+                let predictor = model.predictor().map_err(|reason| {
+                    format!("prediction for report diagnostics failed: {reason}")
+                })?;
+                let (report_offset, report_noise_offset) = resolve_predict_offsets(
+                    &model,
+                    &ds,
+                    &col_map,
+                    saved_offset_column,
+                    saved_noise_offset_column,
+                )?;
+                let pred_input = build_predict_input_for_model(
+                    &model,
+                    ds.values.view(),
+                    &col_map,
+                    training_headers,
+                    &report_offset,
+                    &report_noise_offset,
+                    saved_noise_offset_column.is_some(),
+                )?;
+                let pred = predictor
+                    .predict_plugin_response(&pred_input)
+                    .map_err(|e| format!("prediction for report diagnostics failed: {e}"))?;
 
-                    // Bernoulli response: randomized-quantile residuals (the
-                    // raw y − p residual is two-valued and can never track a
-                    // normal Q-Q reference), plus equal-count calibration
-                    // deciles.
-                    let leverage = alo_data
-                        .as_ref()
-                        .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
-                    let rows = observed_rows(
-                        &y.to_vec(),
-                        &pred.mean.to_vec(),
-                        &prior_weights.to_vec(),
-                        leverage.as_deref(),
-                    )?;
-                    let residuals = report_residual_diagnostics(
-                        &ResponseFamily::Binomial,
-                        &rows,
-                        edf_total,
-                        &mut notes,
-                    )?;
-                    let calibration = binary_calibration_deciles(&rows.y, &rows.mu);
-                    diagnostics = Some(report::DiagnosticsInput {
-                        residuals,
-                        y_observed: rows.y,
-                        y_predicted: rows.mu,
-                        calibration,
-                    });
-                }
+                // Bernoulli response: randomized-quantile residuals (the
+                // raw y − p residual is two-valued and can never track a
+                // normal Q-Q reference), plus equal-count calibration
+                // deciles.
+                let leverage = alo_data
+                    .as_ref()
+                    .map(|alo| alo.rows.iter().map(|row| row.leverage).collect::<Vec<_>>());
+                let rows = observed_rows(
+                    &y.to_vec(),
+                    &pred.mean.to_vec(),
+                    &prior_weights.to_vec(),
+                    leverage.as_deref(),
+                )?;
+                let residuals = report_residual_diagnostics(
+                    &ResponseFamily::Binomial,
+                    &rows,
+                    edf_total,
+                    &mut notes,
+                )?;
+                let calibration = binary_calibration_deciles(&rows.y, &rows.mu);
+                diagnostics = Some(report::DiagnosticsInput {
+                    residuals,
+                    y_observed: rows.y,
+                    y_predicted: rows.mu,
+                    calibration,
+                });
             } else if matches!(
                 model.predict_model_class(),
                 PredictModelClass::Standard | PredictModelClass::BinomialLocationScale
@@ -562,48 +563,12 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // R-squared for Gaussian, on the weighted least-squares
                 // criterion the fit minimised: 1 − Σw(y−μ)² / Σw(y−ȳ_w)².
                 if family.is_gaussian_identity() {
-                    let weight_sum: f64 = rows.weights.iter().sum();
-                    let y_mean = rows
-                        .weights
-                        .iter()
-                        .zip(&rows.y)
-                        .map(|(&wi, &yi)| wi * yi)
-                        .sum::<f64>()
-                        / weight_sum;
-                    let ss_tot: f64 = rows
-                        .weights
-                        .iter()
-                        .zip(&rows.y)
-                        .map(|(&wi, &yi)| wi * (yi - y_mean).powi(2))
-                        .sum();
-                    let ss_res: f64 = rows
-                        .weights
-                        .iter()
-                        .zip(rows.y.iter().zip(&rows.mu))
-                        .map(|(&wi, (&yi, &pi))| wi * (yi - pi).powi(2))
-                        .sum();
-                    // A mean over `n` rows is resolved to `γ_{n+1}·max|y|`, so a total sum of
-                    // squares inside `γ_{n+1}²·Σw·y²` is the rounding residue of a constant
-                    // response, which has no variance to explain.
-                    let energy: f64 = rows
-                        .weights
-                        .iter()
-                        .zip(&rows.y)
-                        .map(|(&wi, &yi)| wi * yi * yi)
-                        .sum();
-                    let band =
-                        gam::linalg::roundoff::accumulation_growth(rows.y.len() + 1).powi(2) * energy;
-                    if ss_tot > band {
-                        r_squared = Some(1.0 - ss_res / ss_tot);
-                    }
+                    r_squared = weighted_report_r_squared(&rows)?;
                 }
 
                 // Continuous smoothness order
-                let smooth_rows = smooth_term_summary_rows(
-                    &design,
-                    &fit,
-                    SummaryBlockOffset::default(),
-                );
+                let smooth_rows =
+                    smooth_term_summary_rows(&design, &fit, SummaryBlockOffset::default());
                 for st in &smooth_rows {
                     if let Some(ord) = st.continuous_order.as_ref() {
                         let status = match ord.status {
@@ -731,7 +696,7 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
                 // Poisson residual variance grows with μ).
                 let residuals =
                     report_residual_diagnostics(&family.response, &rows, edf_total, &mut notes)?;
-                let calibration = if is_binary_response(y.view()) {
+                let calibration = if is_binary_response(ArrayView1::from(rows.y.as_slice())) {
                     binary_calibration_deciles(&rows.y, &rows.mu)
                 } else {
                     None
@@ -812,9 +777,9 @@ pub(crate) fn run_report(args: ReportArgs) -> Result<(), String> {
 /// quantile residuals: reports must be identical run to run.
 const REPORT_RESIDUAL_SEED: u64 = 0x0D5E_ED11;
 
-/// Observation-aligned residuals whose null distribution is standard normal
-/// under a correct model — exactly so for the randomized-quantile families,
-/// asymptotically for Tweedie deviance residuals.
+/// Observation-aligned residuals on a normal-reference scale. Estimated
+/// parameters and smoothing make this a diagnostic approximation, not an
+/// exact finite-sample normality guarantee.
 struct FamilyResiduals {
     values: Vec<f64>,
     label: &'static str,
@@ -852,6 +817,18 @@ fn observed_rows(
             leverage.map(<[f64]>::len)
         ));
     }
+    for (i, &weight) in weights.iter().enumerate() {
+        if !(weight.is_finite() && weight >= 0.0) {
+            return Err(format!(
+                "report diagnostics: observation {i} has invalid prior weight {weight}"
+            ));
+        }
+        if weight > 0.0 && !(y[i].is_finite() && mu[i].is_finite()) {
+            return Err(format!(
+                "report diagnostics: observed row {i} has a nonfinite response or mean"
+            ));
+        }
+    }
     let index: Vec<usize> = (0..n).filter(|&i| weights[i] > 0.0).collect();
     if index.is_empty() {
         return Err(format!(
@@ -874,7 +851,7 @@ fn observed_rows(
 fn report_residual_diagnostics(
     response: &ResponseFamily,
     rows: &ObservedRows,
-    edf_total: f64,
+    edf_total: Option<f64>,
     notes: &mut Vec<String>,
 ) -> Result<Option<report::ResidualDiagnostics>, String> {
     match report_family_residuals(response, rows, edf_total) {
@@ -904,7 +881,7 @@ fn report_residual_diagnostics(
 /// Continuous families map the response through its own fitted CDF and then
 /// Φ⁻¹; discrete families draw u ~ U(F(y−1), F(y)) so u is exactly U(0,1)
 /// under a correct model. Gaussian uses the internally-studentized residual
-/// (equivalent to its quantile residual) with the √(1 − h_ii) leverage factor
+/// with the usual √(1 − h_ii) leverage approximation
 /// when hat values are available. Dispersions that the saved model does not
 /// carry (Gaussian σ², Gamma φ, inverse-Gaussian φ, Tweedie φ) use the
 /// weighted Pearson estimate `Σ w (y−μ)²/V(μ) / (n − edf)`, and row `i` of
@@ -914,7 +891,7 @@ fn report_residual_diagnostics(
 fn report_family_residuals(
     response: &ResponseFamily,
     rows: &ObservedRows,
-    edf_total: f64,
+    edf_total: Option<f64>,
 ) -> Result<FamilyResiduals, String> {
     use rand::RngExt;
     use statrs::distribution::{
@@ -926,43 +903,61 @@ fn report_family_residuals(
     if n == 0 {
         return Err("no observations".to_string());
     }
-    // Residual degrees of freedom for the Pearson dispersion estimates. With none
-    // left there is no residual scale to estimate, and the diagnostics are omitted
-    // rather than divided by a dof of one that the fit does not have.
-    let residual_dof = n as f64 - edf_total;
-    if !(residual_dof > 0.0) {
-        return Err(format!(
-            "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf_total})"
-        ));
-    }
+    // Residual degrees of freedom for the Pearson dispersion estimates, needed
+    // only by the families whose scale the saved model does not carry. A fit
+    // that retained no total EDF has no known n − edf, and a fit with none left
+    // has no residual scale to estimate: either way those diagnostics are
+    // omitted rather than divided by a dof the fit does not have (#3978).
+    let residual_dof = || -> Result<f64, String> {
+        let edf = edf_total.ok_or_else(|| {
+            "the fit retained no total EDF, so the residual degrees of freedom n − edf \
+             are unknown"
+                .to_string()
+        })?;
+        if !(edf.is_finite() && edf >= 0.0) {
+            return Err(format!(
+                "invalid total EDF {edf}: expected a finite nonnegative value"
+            ));
+        }
+        let dof = n as f64 - edf;
+        if !(dof > 0.0) {
+            return Err(format!(
+                "no residual degrees of freedom to estimate a scale (n = {n}, edf = {edf})"
+            ));
+        }
+        Ok(dof)
+    };
     let mut rng = StdRng::seed_from_u64(REPORT_RESIDUAL_SEED);
     // Predictive CDF value → normal scale. Only the exact endpoints have no
     // finite quantile, so u is held inside the representable open interval:
     // the smallest positive double and the largest double below one.
     let to_normal = |u: f64| {
+        if !(u.is_finite() && (0.0..=1.0).contains(&u)) {
+            return Err(format!("residual CDF is not a finite probability: {u}"));
+        }
         standard_normal_quantile(u.clamp(f64::MIN_POSITIVE, 1.0_f64.next_down()))
     };
 
     match response {
         ResponseFamily::Gaussian => {
             let ssr: f64 = (0..n).map(|i| w[i] * (y[i] - mu[i]).powi(2)).sum();
-            let sigma = (ssr / residual_dof).sqrt();
+            let sigma = (ssr / residual_dof()?).sqrt();
             if !(sigma.is_finite() && sigma > 0.0) {
                 return Err("Gaussian residual scale is zero or non-finite".to_string());
             }
             let values = (0..n)
                 .map(|i| {
-                    // Var(y_i − μ̂_i) = σ²(1 − h_ii)/w_i, with the weighted hat
+                    // The usual leverage approximation is σ²(1 − h_ii)/w_i, with the weighted hat
                     // value h_ii = w_i x_iᵀH⁻¹x_i that ALO reports: without the
                     // √w_i factor a correct weighted fit's residuals are a scale
                     // mixture, and without the leverage factor they
                     // under-disperse at high-leverage rows.
                     let row = rows.index[i];
                     let h = rows.leverage.as_ref().map_or(0.0, |l| l[i]);
-                    if h < 0.0 {
+                    if !h.is_finite() || h < 0.0 {
                         return Err(format!(
                             "observation {row} has leverage {h}: a Gaussian hat value \
-                             w_i x_iᵀH⁻¹x_i cannot be negative"
+                             w_i x_iᵀH⁻¹x_i must be finite and nonnegative"
                         ));
                     }
                     // A row with leverage one is fitted exactly, so its residual
@@ -973,7 +968,11 @@ fn report_family_residuals(
                              residual has no variance to standardize"
                         ));
                     }
-                    Ok(w[i].sqrt() * (y[i] - mu[i]) / (sigma * (1.0 - h).sqrt()))
+                    let value = w[i].sqrt() * (y[i] - mu[i]) / (sigma * (1.0 - h).sqrt());
+                    if !value.is_finite() {
+                        return Err(format!("Gaussian residual at row {row} is not finite"));
+                    }
+                    Ok(value)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(FamilyResiduals {
@@ -982,10 +981,16 @@ fn report_family_residuals(
             })
         }
         ResponseFamily::Binomial => {
+            if y.iter().any(|&value| value != 0.0 && value != 1.0) {
+                return Err("Bernoulli residual diagnostics require individual 0/1 responses; a trial-proportion residual law is not implemented".to_string());
+            }
+            if mu.iter().any(|&value| !(0.0..=1.0).contains(&value)) {
+                return Err("Bernoulli residual probabilities must lie in [0,1]".to_string());
+            }
             // Bernoulli: u ~ U(F(y−), F(y)) with F(0) = 1 − p, F(1) = 1.
             let values = (0..n)
                 .map(|i| {
-                    let p = mu[i].clamp(0.0, 1.0);
+                    let p = mu[i];
                     let v: f64 = rng.random();
                     let u = if y[i] < 0.5 {
                         v * (1.0 - p)
@@ -1065,7 +1070,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * ((y[i] - mu[i]) / mu[i]).powi(2))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Gamma dispersion estimate is not positive".to_string());
             }
@@ -1092,7 +1097,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * (y[i] - mu[i]).powi(2) / mu[i].powi(3))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("inverse-Gaussian dispersion estimate is not positive".to_string());
             }
@@ -1105,7 +1110,13 @@ fn report_family_residuals(
                         ));
                     }
                     // IG(μ, λ = w_i/φ): Var = φμ³/w_i.
-                    to_normal(inverse_gaussian_cdf(y[i], mu[i], w[i] / phi))
+                    let lambda = w[i] / phi;
+                    if !(lambda.is_finite() && lambda > 0.0) {
+                        return Err(format!(
+                            "inverse-Gaussian row precision is not finite and positive: {lambda}"
+                        ));
+                    }
+                    to_normal(inverse_gaussian_cdf(y[i], mu[i], lambda))
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(FamilyResiduals {
@@ -1162,7 +1173,7 @@ fn report_family_residuals(
             let phi = (0..n)
                 .map(|i| w[i] * (y[i] - mu[i]).powi(2) / mu[i].powf(p))
                 .sum::<f64>()
-                / residual_dof;
+                / residual_dof()?;
             if !(phi.is_finite() && phi > 0.0) {
                 return Err("Tweedie dispersion estimate is not positive".to_string());
             }
@@ -1175,7 +1186,20 @@ fn report_family_residuals(
                         ));
                     }
                     let dev = tweedie_unit_deviance(y[i], mu[i], p);
-                    Ok((y[i] - mu[i]).signum() * (w[i] * dev.max(0.0) / phi).sqrt())
+                    if !(mu[i] > 0.0 && dev.is_finite()) {
+                        return Err(format!(
+                            "Tweedie residual at mean {} has invalid deviance {dev}",
+                            mu[i]
+                        ));
+                    }
+                    let value = (y[i] - mu[i]).signum() * (w[i] * dev.max(0.0) / phi).sqrt();
+                    if !value.is_finite() {
+                        return Err(format!(
+                            "Tweedie residual at row {} is not finite",
+                            rows.index[i]
+                        ));
+                    }
+                    Ok(value)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(FamilyResiduals {
@@ -1243,4 +1267,225 @@ fn binary_calibration_deciles(y: &[f64], p: &[f64]) -> Option<report::Calibratio
         mean_predicted,
         observed_rate,
     })
+}
+
+#[cfg(test)]
+mod weighted_residual_tests {
+    use super::*;
+    use gam::probability::normal_cdf;
+
+    fn rows(y: &[f64], mu: &[f64], weights: &[f64]) -> ObservedRows {
+        observed_rows(y, mu, weights, None).expect("valid observed rows")
+    }
+
+    #[test]
+    fn precision_residuals_match_independent_closed_forms() {
+        let gaussian = observed_rows(
+            &[1.0, 3.0, 5.0, f64::NAN],
+            &[0.0, 2.0, 4.0, f64::NAN],
+            &[1.0, 4.0, 9.0, 0.0],
+            Some(&[0.1, 0.2, 0.3, f64::NAN]),
+        )
+        .expect("zero row is absent");
+        let residual = report_family_residuals(&ResponseFamily::Gaussian, &gaussian, Some(1.0))
+            .expect("Gaussian");
+        for (i, expected) in [
+            1.0 / (7.0_f64 * 0.9).sqrt(),
+            2.0 / (7.0_f64 * 0.8).sqrt(),
+            3.0 / (7.0_f64 * 0.7).sqrt(),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!((residual.values[i] - expected).abs() < 2e-15);
+        }
+        assert_eq!(gaussian.index, vec![0, 1, 2]);
+        let positive = rows(&[2.0, 0.5], &[1.0, 1.0], &[1.0, 4.0]);
+        let gamma =
+            report_family_residuals(&ResponseFamily::Gamma, &positive, Some(0.0)).expect("Gamma");
+        // Here Pearson phi=1. Gamma shapes are1 and4; their integer-shape
+        // CDFs at rate*y=2 have elementary, independent expressions.
+        let gamma_cdf = [
+            1.0 - (-2.0_f64).exp(),
+            1.0 - (-2.0_f64).exp() * (1.0 + 2.0 + 2.0 + 8.0 / 6.0),
+        ];
+        for (actual, expected) in gamma.values.iter().zip(gamma_cdf) {
+            assert!((normal_cdf(*actual) - expected).abs() < 2e-12);
+        }
+        let ig = report_family_residuals(&ResponseFamily::InverseGaussian, &positive, Some(0.0))
+            .expect("IG");
+        for (i, (&y, &lambda)) in positive.y.iter().zip(&positive.weights).enumerate() {
+            let root = (lambda / y).sqrt();
+            let cdf =
+                normal_cdf(root * (y - 1.0)) + (2.0 * lambda).exp() * normal_cdf(-root * (y + 1.0));
+            assert!((normal_cdf(ig.values[i]) - cdf).abs() < 2e-12);
+        }
+        let tweedie =
+            report_family_residuals(&ResponseFamily::Tweedie { p: 1.5 }, &positive, Some(0.0))
+                .expect("Tweedie");
+        for (i, (&y, &weight)) in positive.y.iter().zip(&positive.weights).enumerate() {
+            // At mu=1,p=3/2, unit deviance is4(sqrt(y)-1)^2.
+            let expected = 2.0 * weight.sqrt() * (y.sqrt() - 1.0);
+            assert!((tweedie.values[i] - expected).abs() < 2e-14);
+        }
+    }
+
+    #[test]
+    fn precision_residuals_are_invariant_to_common_weight_scale() {
+        for family in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Tweedie { p: 1.5 },
+        ] {
+            let first = report_family_residuals(
+                &family,
+                &rows(&[2.0, 0.5], &[1.0, 1.0], &[1.0, 4.0]),
+                Some(0.0),
+            )
+            .expect("original weights");
+            let scaled = report_family_residuals(
+                &family,
+                &rows(&[2.0, 0.5], &[1.0, 1.0], &[9.0, 36.0]),
+                Some(0.0),
+            )
+            .expect("scaled weights");
+            for (a, b) in first.values.iter().zip(&scaled.values) {
+                assert!((a - b).abs() < 3e-12);
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_edf_omits_only_residuals_that_need_estimated_dispersion() {
+        for family in [
+            ResponseFamily::Gaussian,
+            ResponseFamily::Gamma,
+            ResponseFamily::InverseGaussian,
+            ResponseFamily::Tweedie { p: 1.5 },
+        ] {
+            let data = rows(&[2.0, 0.5], &[1.0, 1.0], &[1.0, 4.0]);
+            for edf in [
+                None,
+                Some(-1.0),
+                Some(f64::NAN),
+                Some(f64::INFINITY),
+                Some(f64::NEG_INFINITY),
+                Some(2.0),
+            ] {
+                assert!(report_family_residuals(&family, &data, edf).is_err());
+            }
+        }
+        for (family, y, mu, weights) in [
+            (ResponseFamily::Binomial, [0.0, 1.0], [0.2, 0.8], [0.5, 4.0]),
+            (ResponseFamily::Poisson, [1.0, 3.0], [1.2, 2.8], [2.0, 4.0]),
+        ] {
+            let absent = report_family_residuals(&family, &rows(&y, &mu, &weights), None)
+                .expect("known per-row law needs no EDF");
+            let weighted = report_family_residuals(&family, &rows(&y, &mu, &[2.0, 1.0]), Some(0.0))
+                .expect("frequency weights preserve per-row law");
+            assert_eq!(absent.values, weighted.values);
+        }
+    }
+
+    #[test]
+    fn weighted_r_squared_matches_the_weighted_objective() {
+        let data = rows(&[1.0, 3.0, 5.0], &[2.0, 2.0, 4.0], &[1.0, 2.0, 1.0]);
+        assert_eq!(
+            weighted_report_r_squared(&data).expect("finite moments"),
+            Some(0.5)
+        );
+        assert_eq!(
+            weighted_report_r_squared(&rows(&[3.0, 3.0], &[2.0, 4.0], &[1.0, 2.0]))
+                .expect("constant response"),
+            None
+        );
+        assert!(
+            weighted_report_r_squared(&rows(&[f64::MAX, 1.0], &[0.0, 0.0], &[2.0, 1.0])).is_err()
+        );
+    }
+
+    #[test]
+    fn invalid_rows_and_unsupported_binomial_laws_refuse() {
+        assert!(weighted_report_r_squared(&rows(&[1e-150,2e-150], &[1e150,1e150], &[1.0,1.0])).is_err());
+        for weight in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(observed_rows(&[1.0], &[1.0], &[weight], None).is_err());
+        }
+        assert!(observed_rows(&[1.0], &[], &[1.0], None).is_err());
+        assert!(observed_rows(&[1.0], &[1.0], &[0.0], None).is_err());
+        assert!(observed_rows(&[f64::NAN], &[1.0], &[1.0], None).is_err());
+        for leverage in [-0.1, f64::NAN, 1.0] {
+            let data = observed_rows(
+                &[2.0, 0.5],
+                &[1.0, 1.0],
+                &[1.0, 4.0],
+                Some(&[leverage, 0.0]),
+            )
+            .expect("aligned rows");
+            assert!(report_family_residuals(&ResponseFamily::Gaussian, &data, Some(0.0)).is_err());
+        }
+        assert!(
+            report_family_residuals(
+                &ResponseFamily::Binomial,
+                &rows(&[0.25, 1.0], &[0.2, 0.8], &[4.0, 4.0]),
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            report_family_residuals(
+                &ResponseFamily::Binomial,
+                &rows(&[0.0, 1.0], &[-0.1, 0.8], &[1.0, 1.0]),
+                None
+            )
+            .is_err()
+        );
+    }
+}
+
+fn weighted_report_r_squared(rows: &ObservedRows) -> Result<Option<f64>, String> {
+    let weight_sum: f64 = rows.weights.iter().sum();
+    let y_mean = rows
+        .weights
+        .iter()
+        .zip(&rows.y)
+        .map(|(&wi, &yi)| wi * yi)
+        .sum::<f64>()
+        / weight_sum;
+    let ss_tot: f64 = rows
+        .weights
+        .iter()
+        .zip(&rows.y)
+        .map(|(&wi, &yi)| wi * (yi - y_mean).powi(2))
+        .sum();
+    let ss_res: f64 = rows
+        .weights
+        .iter()
+        .zip(rows.y.iter().zip(&rows.mu))
+        .map(|(&wi, (&yi, &pi))| wi * (yi - pi).powi(2))
+        .sum();
+    // A mean over `n` rows is resolved to `γ_{n+1}·max|y|`, so a total sum of
+    // squares inside `γ_{n+1}²·Σw·y²` is the rounding residue of a constant
+    // response, which has no variance to explain.
+    let energy: f64 = rows
+        .weights
+        .iter()
+        .zip(&rows.y)
+        .map(|(&wi, &yi)| wi * yi * yi)
+        .sum();
+    let band = gam::linalg::roundoff::accumulation_growth(rows.y.len() + 1).powi(2) * energy;
+    if ![weight_sum, y_mean, ss_tot, ss_res, energy, band]
+        .iter()
+        .all(|value| value.is_finite())
+    {
+        return Err("weighted R-squared arithmetic is not finite".to_string());
+    }
+    if ss_tot > band {
+        let value = 1.0 - ss_res / ss_tot;
+        if !value.is_finite() {
+            return Err("weighted R-squared is not finite".to_string());
+        }
+        return Ok(Some(value));
+    }
+    Ok(None)
 }
