@@ -51,7 +51,9 @@
 //! more-uniform-coordinate basin wins, because EV alone provably cannot break
 //! that tie.
 
-use ndarray::{Array1, ArrayView1};
+use gam_solve::exact_jet_objective::certified_newton_minimum;
+use ndarray::{Array1, Array2, ArrayView1};
+use opt::{Bounds, DecrementBands, ObjectiveEvalError, SecondOrderSample, accumulation_growth};
 
 use crate::chart_canonicalization::{
     CanonicalChartTopology, ChartArcLengthReading, SAE_FLOW_DIFFEO_MIN_DET,
@@ -441,6 +443,15 @@ pub(crate) fn watson_u2_uniform_weighted(
 // consulted (SPEC rule 18, #2902). The winning class is the occupancy law; when a
 // `k ≥ 2` anchor model wins, the atom carries a discrete measure of `k` anchors
 // (`d_eff = k − 1`).
+//
+// #4237 — BIC is `−2 ℓ̂ + p ln n` with `ℓ̂` the MAXIMISED log-likelihood, so each
+// rung's `ℓ̂` is the certified maximum of the shared-width mixture likelihood
+// over all `2k` parameters (means, weights, width), found by `opt`'s Newton
+// trust region on the exact jet and read only where the Newton decrement lies
+// inside the likelihood's own rounding band (SPEC: "A fit object must only ever
+// come from a converged optimization."). A rung whose maximum does not certify
+// has no evidence to compare, so the law is `Indeterminate` rather than a
+// verdict read off an unconverged plug-in.
 // ===========================================================================
 
 /// The occupancy law of a fitted `d = 1` coordinate ON its honest chart: which
@@ -530,7 +541,8 @@ pub(crate) fn classify_occupancy_interval_weighted(
 }
 
 /// Shared occupancy adjudicator. `circular` selects the geometry: `true` folds
-/// onto the unit circle (wrapped distances, ±1 Gaussian images), `false` treats
+/// onto the unit circle (wrapped distances, the periodic images
+/// [`wrapped_image_count`] retains), `false` treats
 /// `[0, 1]` as a line (linear distances, no wrap). The model race and BIC are
 /// identical; only the metric differs.
 /// #2691 — the extent of the smallest arc (circle) or interval (line) containing
@@ -607,27 +619,28 @@ fn classify_occupancy_weighted_impl(
         return OccupancyLaw::Collapsed;
     }
 
-    let single =
-        wrapped_gaussian_mixture_bic_weighted(&pts, &w, 1, sigma_floor, ln_n, circular, mass);
+    let mixture_bic = |anchors: usize| {
+        certified_mixture_log_likelihood(&pts, &w, anchors, sigma_floor, circular, mass)
+            .map(|log_likelihood| -2.0 * log_likelihood + (2 * anchors) as f64 * ln_n)
+    };
 
+    let Some(single) = mixture_bic(1) else {
+        return OccupancyLaw::Indeterminate;
+    };
     let mut best_law = OccupancyLaw::Uniform;
     let mut best_bic = bic_uniform;
-    if let Some(bic) = single {
-        if bic < best_bic {
-            best_bic = bic;
-            best_law = OccupancyLaw::Continuous;
-        }
+    if single < best_bic {
+        best_bic = single;
+        best_law = OccupancyLaw::Continuous;
     }
     // Walk the anchor count up from two and stop at the first order that does not
-    // improve on the order below it (or whose evidence is not computable). The
-    // walk is bounded by the rows themselves: a mixture needs fewer anchors than
-    // points.
+    // improve on the order below it. The walk is bounded by the rows themselves: a
+    // mixture needs fewer anchors than points. An order whose maximum does not
+    // certify leaves the walk without the evidence it compares, so no law is read.
     let mut previous_order_bic = f64::INFINITY;
     for k in 2..pairs.len() {
-        let Some(bic) =
-            wrapped_gaussian_mixture_bic_weighted(&pts, &w, k, sigma_floor, ln_n, circular, mass)
-        else {
-            break;
+        let Some(bic) = mixture_bic(k) else {
+            return OccupancyLaw::Indeterminate;
         };
         if !(bic < previous_order_bic) {
             break;
@@ -641,127 +654,280 @@ fn classify_occupancy_weighted_impl(
     best_law
 }
 
-fn wrapped_gaussian_mixture_bic_weighted(
+/// #4237 — the widest shared width the circular mixture carries: at
+/// `σ ≥ σ_max` a wrapped normal is the uniform density to working precision.
+///
+/// Its Fourier series is `f(d) = 1 + 2 Σ_{q≥1} e^{−2π²q²σ²} cos 2πqd`, so
+/// `|f − 1| ≤ 2e^{−2π²σ²} (1 + Σ_{q≥2} e^{−2π²(q²−1)σ²})`. At
+/// `σ_max = √(ln(2/u) / (2π²))`, with `u` the unit roundoff, the leading term is
+/// `u` and every later term is below `u²`: a wider width changes no density by
+/// more than a rounding of `1`. The likelihood is flat in the width beyond it,
+/// so it bounds the width from above and the uniform limit is a point the
+/// search can reach and certify.
+fn wrapped_width_ceiling() -> f64 {
+    let unit_roundoff = f64::EPSILON / 2.0;
+    ((2.0 / unit_roundoff).ln() / (2.0 * std::f64::consts::PI.powi(2))).sqrt()
+}
+
+/// #4237 — how many periodic images `m ∈ [−M, M]` the wrapped normal of width
+/// `sigma` needs: the smallest `M` whose omitted images carry, even weighted by
+/// the `1 + z⁴` the Hessian's fourth moment puts on them, at most a unit
+/// roundoff of the retained central term.
+///
+/// With the offset `d ∈ [−½, ½)`, the central term has `|z| ≤ b = 1/(2σ)` and an
+/// omitted image `|q| ≥ M + 1` has `|z| ≥ a = (M + ½)/σ`. On each side the
+/// omitted `(1 + z⁴) e^{−z²/2}` fall at least geometrically, by
+/// `ρ = ((M + 3/2)/(M + ½))⁴ e^{−(M+1)/σ²}` per image, so once `ρ < 1` their sum
+/// relative to the central `e^{−b²/2}` is at most
+/// `2 (1 + a⁴) e^{−(a² − b²)/2} / (1 − ρ)`.
+fn wrapped_image_count(sigma: f64) -> usize {
+    let unit_roundoff = f64::EPSILON / 2.0;
+    let central = 0.5 / sigma;
+    let mut images = 0usize;
+    loop {
+        let nearest = images as f64 + 0.5;
+        let reach = nearest / sigma;
+        let ratio =
+            ((nearest + 1.0) / nearest).powi(4) * (-(nearest + 0.5) / (sigma * sigma)).exp();
+        if ratio < 1.0 {
+            let tail = 2.0 * (1.0 + reach.powi(4))
+                * (-0.5 * (reach * reach - central * central)).exp()
+                / (1.0 - ratio);
+            if tail <= unit_roundoff {
+                return images;
+            }
+        }
+        images += 1;
+    }
+}
+
+/// The signed offset of `x` from `mean`: on the circle the representative in
+/// `[−½, ½)`, on the line the plain difference.
+fn signed_offset(x: f64, mean: f64, circular: bool) -> f64 {
+    let raw = x - mean;
+    if circular {
+        (raw + 0.5).rem_euclid(1.0) - 0.5
+    } else {
+        raw
+    }
+}
+
+/// #4237 — the exact second-order jet of the negative mixture log-likelihood
+/// `−Σ_i w_i ln f(x_i; θ)` of a `k`-anchor, shared-width Gaussian mixture
+/// (wrapped on the circle), at `θ = [μ_1..μ_k, a_1..a_{k−1}, ln σ]` with the
+/// weights `π = softmax(a_1, .., a_{k−1}, 0)`.
+///
+/// Every term is `h_{jm} = π_j φ(z_{jm}) / σ` with `z_{jm} = (d_j + m)/σ` over
+/// the images [`wrapped_image_count`] retains (`m = 0` alone on the line), and
+/// `ln f = ln Σ h` is taken by log-sum-exp. With responsibilities `r = h / f`,
+/// `∇ ln f = Σ r ∇ ln h` and `∇² ln f = Σ r (∇² ln h + ∇ln h ∇ln hᵀ) − ∇ln f ∇ln fᵀ`,
+/// where `∇ ln h` is `z/σ` in `μ_j`, `z² − 1` in `ln σ` and `δ_{jl} − π_l` in
+/// `a_l`, and `∇² ln h` is `−1/σ²`, `−2z/σ`, `−2z²` and `−(diag π − ππᵀ)`.
+///
+/// The sample carries its rounding bands, so `opt`'s verdict on it is the
+/// Newton decrement against them: each band charges the accumulation growth of
+/// the longest sum (the rows, then every image of every anchor, then the `2k`
+/// parameter terms) on the absolute values the sums accumulate.
+fn mixture_negative_log_likelihood(
     pts: &[f64],
-    weights_in: &[f64],
-    k: usize,
+    weights: &[f64],
+    anchors: usize,
+    circular: bool,
+    theta: &Array1<f64>,
+) -> SecondOrderSample {
+    let k = anchors;
+    let p = 2 * k;
+    let s_idx = p - 1;
+    let log_sigma = theta[s_idx];
+    let sigma = log_sigma.exp();
+    let logits: Vec<f64> = (0..k)
+        .map(|j| if j + 1 < k { theta[k + j] } else { 0.0 })
+        .collect();
+    let top = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let log_normaliser = top + logits.iter().map(|a| (a - top).exp()).sum::<f64>().ln();
+    let log_pi: Vec<f64> = logits.iter().map(|a| a - log_normaliser).collect();
+    let pi: Vec<f64> = log_pi.iter().map(|l| l.exp()).collect();
+    let images = if circular { wrapped_image_count(sigma) } else { 0 };
+    let span = 2 * images + 1;
+    let log_density_offset = 0.5 * std::f64::consts::TAU.ln() + log_sigma;
+
+    let mut value = 0.0_f64;
+    let mut gradient = Array1::<f64>::zeros(p);
+    let mut hessian = Array2::<f64>::zeros((p, p));
+    let mut value_channel = 0.0_f64;
+    let mut gradient_channel = Array1::<f64>::zeros(p);
+    let mut hessian_channel = Array2::<f64>::zeros((p, p));
+
+    let mut z = vec![0.0_f64; k * span];
+    let mut log_terms = vec![0.0_f64; k * span];
+    let mut g = Array1::<f64>::zeros(p);
+    let mut g_abs = Array1::<f64>::zeros(p);
+    let mut h = Array2::<f64>::zeros((p, p));
+    let mut h_abs = Array2::<f64>::zeros((p, p));
+    let mut dl = vec![0.0_f64; k.saturating_sub(1)];
+    for (&x, &wi) in pts.iter().zip(weights) {
+        for j in 0..k {
+            let d = signed_offset(x, theta[j], circular);
+            for m in 0..span {
+                let zz = (d + m as f64 - images as f64) / sigma;
+                z[j * span + m] = zz;
+                log_terms[j * span + m] = log_pi[j] - 0.5 * zz * zz - log_density_offset;
+            }
+        }
+        let peak = log_terms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let total: f64 = log_terms.iter().map(|l| (l - peak).exp()).sum();
+        let ln_f = peak + total.ln();
+
+        g.fill(0.0);
+        g_abs.fill(0.0);
+        h.fill(0.0);
+        h_abs.fill(0.0);
+        let mut second_moment_total = 0.0_f64;
+        for j in 0..k {
+            let (mut r0, mut z1, mut z2, mut z3, mut z4) = (0.0, 0.0, 0.0, 0.0, 0.0);
+            let (mut a1, mut b1, mut ab, mut b2) = (0.0, 0.0, 0.0, 0.0);
+            for m in 0..span {
+                let r = (log_terms[j * span + m] - peak).exp() / total;
+                let zz = z[j * span + m];
+                let zsq = zz * zz;
+                let excess = zsq - 1.0;
+                r0 += r;
+                z1 += r * zz;
+                z2 += r * zsq;
+                z3 += r * zsq * zz;
+                z4 += r * zsq * zsq;
+                a1 += r * zz.abs();
+                b1 += r * excess.abs();
+                ab += r * zz.abs() * excess.abs();
+                b2 += r * excess * excess;
+            }
+            second_moment_total += z2;
+            for (l, slot) in dl.iter_mut().enumerate() {
+                *slot = if l == j { 1.0 } else { 0.0 } - pi[l];
+            }
+            g[j] += z1 / sigma;
+            g[s_idx] += z2 - r0;
+            g_abs[j] += a1 / sigma;
+            g_abs[s_idx] += b1;
+            h[[j, j]] += (z2 - r0) / (sigma * sigma);
+            h_abs[[j, j]] += (r0 + z2) / (sigma * sigma);
+            let mixed = (z3 - 3.0 * z1) / sigma;
+            let mixed_abs = (2.0 * a1 + ab) / sigma;
+            h[[j, s_idx]] += mixed;
+            h[[s_idx, j]] += mixed;
+            h_abs[[j, s_idx]] += mixed_abs;
+            h_abs[[s_idx, j]] += mixed_abs;
+            h[[s_idx, s_idx]] += z4 - 4.0 * z2 + r0;
+            h_abs[[s_idx, s_idx]] += 2.0 * z2 + b2;
+            for l in 0..dl.len() {
+                let al = k + l;
+                g[al] += r0 * dl[l];
+                g_abs[al] += r0 * dl[l].abs();
+                h[[j, al]] += z1 / sigma * dl[l];
+                h[[al, j]] += z1 / sigma * dl[l];
+                h_abs[[j, al]] += a1 / sigma * dl[l].abs();
+                h_abs[[al, j]] += a1 / sigma * dl[l].abs();
+                h[[s_idx, al]] += (z2 - r0) * dl[l];
+                h[[al, s_idx]] += (z2 - r0) * dl[l];
+                h_abs[[s_idx, al]] += b1 * dl[l].abs();
+                h_abs[[al, s_idx]] += b1 * dl[l].abs();
+                for q in 0..dl.len() {
+                    let aq = k + q;
+                    let covariance = if l == q { pi[l] } else { 0.0 } - pi[l] * pi[q];
+                    h[[al, aq]] += r0 * (dl[l] * dl[q] - covariance);
+                    h_abs[[al, aq]] += r0 * (dl[l].abs() * dl[q].abs() + covariance.abs());
+                }
+            }
+        }
+        for row in 0..p {
+            for col in 0..p {
+                h[[row, col]] -= g[row] * g[col];
+                h_abs[[row, col]] += g_abs[row] * g_abs[col];
+            }
+        }
+        value -= wi * ln_f;
+        gradient.scaled_add(-wi, &g);
+        hessian.scaled_add(-wi, &h);
+        value_channel += wi * (ln_f.abs() + 1.0 + second_moment_total);
+        gradient_channel.scaled_add(wi, &g_abs);
+        hessian_channel.scaled_add(wi, &h_abs);
+    }
+    let growth = accumulation_growth(pts.len() + k * span + p);
+    let hessian_band = growth * hessian_channel.iter().map(|v| v * v).sum::<f64>().sqrt();
+    SecondOrderSample {
+        value,
+        gradient,
+        hessian: Some(hessian),
+        decrement_bands: Some(DecrementBands {
+            objective: growth * value_channel,
+            tolerance: growth * value_channel,
+            gradient: gradient_channel * growth,
+            hessian: hessian_band,
+        }),
+    }
+}
+
+/// #4237 — the certified maximum log-likelihood of the `anchors`-component,
+/// shared-width Gaussian mixture (wrapped on the circle) of the weighted
+/// points, or `None` when the maximisation does not certify.
+///
+/// `opt`'s Newton trust region runs on the exact jet
+/// ([`mixture_negative_log_likelihood`]) over the width box
+/// `σ ∈ [σ_floor, σ_max]` — the resolution floor below, and on the circle the
+/// uniform limit [`wrapped_width_ceiling`] above — and starts from the weighted
+/// quantile means with equal weights and the width of the rows' spread about
+/// their nearest mean. The start only chooses the basin; the value read is the
+/// certified stationary point's.
+fn certified_mixture_log_likelihood(
+    pts: &[f64],
+    weights: &[f64],
+    anchors: usize,
     sigma_floor: f64,
-    ln_n: f64,
     circular: bool,
     total_mass: f64,
 ) -> Option<f64> {
-    let n = pts.len();
-    if k == 0 || k > n || weights_in.len() != n || !(total_mass > 0.0) {
-        return None;
-    }
-    let circ_dist = |a: f64, b: f64| -> f64 {
-        if circular {
-            let d = (a - b).rem_euclid(1.0);
-            d.min(1.0 - d)
-        } else {
-            (a - b).abs()
-        }
+    let k = anchors;
+    let p = 2 * k;
+    let means = weighted_quantile_initial_means(pts, weights, k, total_mass);
+    let spread: f64 = pts
+        .iter()
+        .zip(weights)
+        .map(|(&x, &wi)| {
+            let nearest = means
+                .iter()
+                .map(|&m| signed_offset(x, m, circular).abs())
+                .fold(f64::INFINITY, f64::min);
+            wi * nearest * nearest
+        })
+        .sum();
+    let lower_log_width = sigma_floor.ln();
+    let upper_log_width = if circular {
+        wrapped_width_ceiling().ln()
+    } else {
+        f64::INFINITY
     };
-    let mut means = weighted_quantile_initial_means(pts, weights_in, k, total_mass);
-    let mut assign = vec![0usize; n];
-    for _ in 0..100 {
-        let mut changed = false;
-        for (i, &p) in pts.iter().enumerate() {
-            let mut best_j = 0usize;
-            let mut best_d = f64::INFINITY;
-            for (j, &m) in means.iter().enumerate() {
-                let d = circ_dist(p, m);
-                if d < best_d {
-                    best_d = d;
-                    best_j = j;
-                }
-            }
-            if assign[i] != best_j {
-                assign[i] = best_j;
-                changed = true;
-            }
-        }
-        for (j, m) in means.iter_mut().enumerate() {
-            if circular {
-                let (mut sx, mut sy, mut mass_j) = (0.0_f64, 0.0_f64, 0.0_f64);
-                for (i, &p) in pts.iter().enumerate() {
-                    if assign[i] == j {
-                        let wi = weights_in[i];
-                        let ang = std::f64::consts::TAU * p;
-                        sx += wi * ang.cos();
-                        sy += wi * ang.sin();
-                        mass_j += wi;
-                    }
-                }
-                if mass_j > 0.0 && (sx * sx + sy * sy) > 0.0 {
-                    *m = (sy.atan2(sx) / std::f64::consts::TAU).rem_euclid(1.0);
-                }
-            } else {
-                let (mut sum, mut mass_j) = (0.0_f64, 0.0_f64);
-                for (i, &p) in pts.iter().enumerate() {
-                    if assign[i] == j {
-                        let wi = weights_in[i];
-                        sum += wi * p;
-                        mass_j += wi;
-                    }
-                }
-                if mass_j > 0.0 {
-                    *m = sum / mass_j;
-                }
-            }
-        }
-        if !changed {
-            break;
-        }
+    let start_log_width = (spread / total_mass)
+        .sqrt()
+        .max(sigma_floor)
+        .ln()
+        .clamp(lower_log_width, upper_log_width);
+    let mut start = Array1::<f64>::zeros(p);
+    for (j, &m) in means.iter().enumerate() {
+        start[j] = m;
     }
-
-    let mut mixture_weights = vec![0.0_f64; k];
-    let mut total_ss = 0.0_f64;
-    for (i, &p) in pts.iter().enumerate() {
-        let j = assign[i];
-        let wi = weights_in[i];
-        mixture_weights[j] += wi;
-        let d = if circular {
-            let raw = (p - means[j]).rem_euclid(1.0);
-            if raw > 0.5 { raw - 1.0 } else { raw }
-        } else {
-            p - means[j]
-        };
-        total_ss += wi * d * d;
-    }
-    for weight in &mut mixture_weights {
-        *weight /= total_mass;
-    }
-    let shared_sigma = (total_ss / total_mass).sqrt().max(sigma_floor);
-    let sigmas = vec![shared_sigma; k];
-
-    let inv_sqrt_2pi = 1.0 / (std::f64::consts::TAU).sqrt();
-    let mut loglik = 0.0_f64;
-    for (i, &p) in pts.iter().enumerate() {
-        let mut dens = 0.0_f64;
-        for j in 0..k {
-            if mixture_weights[j] <= 0.0 {
-                continue;
-            }
-            let s = sigmas[j];
-            let mut g = 0.0_f64;
-            let (lo_img, hi_img) = if circular { (-1_i32, 1_i32) } else { (0, 0) };
-            for m in lo_img..=hi_img {
-                let d = p - means[j] + m as f64;
-                g += (-0.5 * (d / s) * (d / s)).exp();
-            }
-            dens += mixture_weights[j] * inv_sqrt_2pi / s * g;
-        }
-        if !(dens > 0.0) {
-            return None;
-        }
-        loglik += weights_in[i] * dens.ln();
-    }
-    if !loglik.is_finite() {
-        return None;
-    }
-    let p_free = (2 * k) as f64;
-    Some(-2.0 * loglik + p_free * ln_n)
+    start[p - 1] = start_log_width;
+    let mut lower = Array1::from_elem(p, f64::NEG_INFINITY);
+    let mut upper = Array1::from_elem(p, f64::INFINITY);
+    lower[p - 1] = lower_log_width;
+    upper[p - 1] = upper_log_width;
+    let bounds = Bounds::new(lower, upper, 0.0).ok()?;
+    let solution = certified_newton_minimum(start, Some(bounds), None, |theta: &Array1<f64>| {
+        Ok::<_, ObjectiveEvalError>(mixture_negative_log_likelihood(
+            pts, weights, k, circular, theta,
+        ))
+    })
+    .ok()?;
+    Some(-solution.final_value)
 }
 
 fn weighted_quantile_initial_means(
@@ -2095,6 +2261,110 @@ mod coordinate_fidelity_tests {
             coordinate_uniformity_weighted(flat.view(), &support, &CanonicalChartTopology::Interval)
                 .is_none(),
             "equal coordinates have no span to normalize"
+        );
+    }
+
+    // ---- #4237: the occupancy BIC reads a CERTIFIED mixture maximum ----------
+
+    /// Normal scores `Φ⁻¹((i + ½)/m)`: a deterministic sample whose moments
+    /// are those of a standard normal to `O(1/m)`.
+    fn normal_scores(m: usize) -> Vec<f64> {
+        (0..m)
+            .map(|i| {
+                gam_math::probability::standard_normal_quantile((i as f64 + 0.5) / m as f64)
+                    .expect("an interior probability has a quantile")
+            })
+            .collect()
+    }
+
+    /// #4237 — the flip fixture: 48 rows at `0.40 + 0.03·z` and 12 at
+    /// `0.48 + 0.05·z` on the line. The old hard-assignment plug-in scored the
+    /// two-anchor rung at its Lloyd partition (a split near the midpoint of two
+    /// overlapping clusters), not at its maximum, and read `Continuous`. At the
+    /// certified maxima the BICs are `k = 1: −189.39`, `k = 2: −192.52`,
+    /// `k = 3: −184.33`, so the evidence picks two anchors.
+    #[test]
+    fn occupancy_reads_the_certified_two_anchor_maximum_on_overlapping_clusters_4237() {
+        let mut u: Vec<f64> = normal_scores(48).iter().map(|z| 0.40 + 0.03 * z).collect();
+        u.extend(normal_scores(12).iter().map(|z| 0.48 + 0.05 * z));
+        let weights = Array1::from_elem(u.len(), 1.0);
+        assert_eq!(
+            classify_occupancy_interval_weighted(&u, weights.view()),
+            OccupancyLaw::Discrete { anchors: 2 },
+            "the certified two-anchor maximum beats the single Gaussian"
+        );
+    }
+
+    /// #4237 — on the line a single Gaussian's maximum is closed-form: the
+    /// weighted mean and the (biased) weighted standard deviation, with
+    /// `ℓ* = −(W/2)(ln 2πσ̂² + 1)`. The certified search must land on it: within
+    /// one rounding band of the decrement it certified and one of the value.
+    #[test]
+    fn single_anchor_line_maximum_matches_the_closed_form_4237() {
+        let mut pts: Vec<f64> = normal_scores(48).iter().map(|z| 0.40 + 0.03 * z).collect();
+        pts.extend(normal_scores(12).iter().map(|z| 0.48 + 0.05 * z));
+        pts.sort_by(f64::total_cmp);
+        let w: Vec<f64> = (0..pts.len()).map(|i| 1.0 + (i % 3) as f64).collect();
+        let mass: f64 = w.iter().sum();
+        let mean = pts.iter().zip(&w).map(|(x, wi)| wi * x).sum::<f64>() / mass;
+        let variance =
+            pts.iter().zip(&w).map(|(x, wi)| wi * (x - mean).powi(2)).sum::<f64>() / mass;
+        let closed_form = -0.5 * mass * ((std::f64::consts::TAU * variance).ln() + 1.0);
+        let floor = 1.0 / (2.0 * pts.len() as f64);
+        let certified = certified_mixture_log_likelihood(&pts, &w, 1, floor, false, mass)
+            .expect("a single Gaussian on spread rows certifies");
+        let at_closed_form = mixture_negative_log_likelihood(
+            &pts,
+            &w,
+            1,
+            false,
+            &Array1::from_vec(vec![mean, 0.5 * variance.ln()]),
+        );
+        let band = at_closed_form
+            .decrement_bands
+            .as_ref()
+            .expect("the mixture jet carries its bands")
+            .objective;
+        assert!(
+            (-at_closed_form.value - closed_form).abs() <= band,
+            "the jet's value at the closed-form maximum must be ℓ* within its band"
+        );
+        assert!(
+            (certified - closed_form).abs() <= 2.0 * band,
+            "certified ℓ̂ = {certified} vs closed-form ℓ* = {closed_form} (band {band:e})"
+        );
+    }
+
+    /// #4237 — 84 evenly spaced points on the circle ARE the uniform law. A
+    /// single wrapped Gaussian's likelihood rises with its width all the way to
+    /// the uniform limit, so its certified maximum sits on the width ceiling at
+    /// `ℓ̂ = 0` to within the band; the old plug-in scored it at the rows'
+    /// Lloyd spread, `ℓ = −3.31`. The law is `Uniform`.
+    #[test]
+    fn uniform_circle_single_anchor_maximum_is_the_uniform_limit_4237() {
+        let pts: Vec<f64> = (0..84).map(|r| r as f64 / 84.0).collect();
+        let w = vec![1.0; pts.len()];
+        let certified = certified_mixture_log_likelihood(&pts, &w, 1, 1.0 / 168.0, true, 84.0)
+            .expect("the single wrapped Gaussian certifies at the width ceiling");
+        let at_ceiling = mixture_negative_log_likelihood(
+            &pts,
+            &w,
+            1,
+            true,
+            &Array1::from_vec(vec![0.5, wrapped_width_ceiling().ln()]),
+        );
+        let band = at_ceiling
+            .decrement_bands
+            .expect("the mixture jet carries its bands")
+            .objective;
+        assert!(
+            certified.abs() <= 2.0 * band,
+            "ℓ̂ = {certified} must be the uniform limit 0 (band {band:e})"
+        );
+        let weights = Array1::from_vec(w);
+        assert_eq!(
+            classify_occupancy_weighted(&pts, weights.view()),
+            OccupancyLaw::Uniform
         );
     }
 }
