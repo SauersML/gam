@@ -2665,5 +2665,13 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-sae/src/manifold/construction_exact_hessian.rs:fn:project_sphere_tangent_slots"
+    ],
+    "reason": "#3438: renamed and generalized to project_coordinate_tangent_slots. The coordinate tangent projector B is assembled in now has two block kinds, CoordinateTangentBlock::{Sphere, PinnedBound}: an embedded-sphere block keeps P = I - t t^T, and an interval coordinate held at an active bound is the zero map. The sphere-only function would miss the pinned slots, so every caller moves to the generalized projector over coordinate_tangent_blocks and the old name is deleted rather than kept as a shim.",
+    "evidence": "At the base, git grep finds project_sphere_tangent_slots at its declaration (construction_exact_hessian.rs:1389), two uses in the same file (the delta-C applier's input and output legs) and four in construction_fitted_response.rs (the rhs, the solution, and the G column and row). In the landing tree the name occurs 0 times; each of those seven sites calls project_coordinate_tangent_slots with the coordinate tangent blocks. cargo check --workspace --tests passes and the gam-sae manifold suite, including tests_interval_active_bound_3438, passes."
   }
 ]
