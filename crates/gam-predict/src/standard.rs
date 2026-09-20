@@ -255,15 +255,13 @@ impl PredictionTransform for StandardPredictor {
         strategy.inverse_link_array(eta.view())
     }
 
-    fn response_jacobian_rows(&self, pass: PredictPass) -> ResponseInterval {
-        match pass {
-            // Wiggle full uncertainty reports a genuine η interval and a
-            // delta-method response interval.
-            PredictPass::FullUncertainty => ResponseInterval::SymmetricDelta,
-            // Wiggle posterior-mean bounds transform the η endpoints through the
-            // inverse link (the `enrich_posterior_mean_bounds` policy).
-            PredictPass::PosteriorMean => ResponseInterval::TransformEta,
-        }
+    fn response_jacobian_rows(&self, _: PredictPass) -> ResponseInterval {
+        // Both passes report the image of the wiggled-η interval
+        // `η ± z·SE(η)` under the monotone inverse link. The wiggle is already
+        // inside η and its SE carries the warp chain rule exactly, so the band
+        // lies inside the link's range by construction; a delta band
+        // `μ ± z·|dμ/dη|·SE(η)` leaves `[0, 1]` wherever the link saturates.
+        ResponseInterval::TransformEta
     }
 
     fn bounds(&self) -> ResponseBounds {
