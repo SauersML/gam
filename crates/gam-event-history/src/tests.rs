@@ -23,6 +23,7 @@ use super::marginal::{SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
 use gam_model_api::families::custom_family::BlockwiseFitOptions;
 use gam_problem::ParameterBlockState;
+use gam_terms::FitNotes;
 use gam_math::jet_scalar::{OneSeed, TwoSeed};
 use gam_math::nested_dual::JetField;
 use gam_terms::smooth::{
@@ -1291,15 +1292,58 @@ fn formula_right_hand_side_resolves_against_the_node_columns() {
     let mut cohort = simulate_cohort(4, 3.0, -0.5, 0.4, 0.0, 0.5, 5);
     cohort.validate().expect("valid");
     let rows = design_rows(&cohort, 3).expect("rows");
-    let spec = super::formula::covariate_spec_from_formula("x + s(time)", rows.view(), &cohort)
-        .expect("spec");
+    let mut notes = FitNotes::default();
+    let spec = super::formula::covariate_spec_from_formula(
+        "x + s(time)",
+        rows.view(),
+        &cohort,
+        &mut notes,
+    )
+    .expect("spec");
     assert_eq!(spec.linear_terms.len(), 1);
     assert_eq!(spec.linear_terms[0].feature_col, 0);
     assert_eq!(spec.smooth_terms.len(), 1);
-    let error = super::formula::covariate_spec_from_formula("nope", rows.view(), &cohort)
-        .err()
-        .expect("unknown column must fail");
+    assert!(
+        notes.advisories.iter().all(|note| !note.contains("appear both")),
+        "{:?}",
+        notes.advisories
+    );
+    let error = super::formula::covariate_spec_from_formula(
+        "nope",
+        rows.view(),
+        &cohort,
+        &mut FitNotes::default(),
+    )
+    .err()
+    .expect("unknown column must fail");
     assert!(error.to_string().contains("nope"), "{error}");
+}
+
+/// A formula whose lowering changes a term's meaning must say so: `time` owned
+/// by both a smooth and a linear term makes the fit residualize the smooth
+/// against the line, and the term builder's advisory for that reaches the
+/// caller instead of a discarded local list.
+#[test]
+fn formula_lowering_advisories_reach_the_caller() {
+    let mut cohort = simulate_cohort(4, 3.0, -0.5, 0.4, 0.0, 0.5, 5);
+    cohort.validate().expect("valid");
+    let rows = design_rows(&cohort, 3).expect("rows");
+    let mut notes = FitNotes::default();
+    super::formula::covariate_spec_from_formula(
+        "time + s(time)",
+        rows.view(),
+        &cohort,
+        &mut notes,
+    )
+    .expect("spec");
+    assert!(
+        notes
+            .advisories
+            .iter()
+            .any(|note| note.contains("[time]") && note.contains("appear both")),
+        "{:?}",
+        notes.advisories
+    );
 }
 
 #[test]
@@ -4770,8 +4814,13 @@ fn a_risk_set_centred_fit_reads_its_baseline_as_the_marginal_incidence() {
     let mut spec = EventHistorySpec::new(Vec::new());
     let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
     spec.covariates = vec![
-        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
-            .expect("baseline formula"),
+        super::formula::covariate_spec_from_formula(
+            "s(time)",
+            rows.view(),
+            &cohort,
+            &mut FitNotes::default(),
+        )
+        .expect("baseline formula"),
     ];
     let prior_centred = fit_event_history(&mut cohort, &spec).expect("prior-centred fit");
     spec.reference = Some(ReferenceStrata::single(0, cohort.subjects.len()));
@@ -5088,8 +5137,13 @@ fn a_certified_rank_is_the_admitted_candidate_2627() {
     let mut spec = EventHistorySpec::new(Vec::new());
     let rows = design_rows(&cohort, spec.quadrature_order).expect("design rows");
     spec.covariates = vec![
-        super::formula::covariate_spec_from_formula("s(time)", rows.view(), &cohort)
-            .expect("baseline formula"),
+        super::formula::covariate_spec_from_formula(
+            "s(time)",
+            rows.view(),
+            &cohort,
+            &mut FitNotes::default(),
+        )
+        .expect("baseline formula"),
     ];
     let marks = cohort.marks();
     let setting = (spec.gauss_hermite_order, 0);

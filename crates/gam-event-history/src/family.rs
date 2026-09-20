@@ -30,6 +30,7 @@ use gam_math::jet_scalar::{JetScalar, OneSeed, Order2, TwoSeed};
 use gam_math::nested_dual::JetField;
 use gam_problem::CoefficientCoordinate;
 use gam_solve::model_types::UnifiedFitResult;
+use gam_terms::FitNotes;
 use gam_terms::smooth::{
     TermCollectionDesign, TermCollectionSpec, build_term_collection_design,
     freeze_term_collection_from_design,
@@ -1322,6 +1323,12 @@ pub struct EventHistoryFit {
     /// ([`select_reference_grid`]), within `quadrature_tolerance`; absent for
     /// prior centring.
     pub reference_certificate: Option<f64>,
+    /// What the term builder recorded while lowering the formulas
+    /// ([`fit_event_history_formulas`]): advisories where the fitted terms
+    /// differ from the literal formula, informational notes for defaults chosen
+    /// on the caller's behalf. With one formula per mark each note names its
+    /// mark. Empty for a fit built from a ready term collection.
+    pub inference_notes: FitNotes,
 }
 
 impl EventHistoryFit {
@@ -1556,23 +1563,44 @@ pub fn fit_event_history_formulas<F: AsRef<str>>(
     spec.options = options;
     let rows = design_rows(cohort, spec.quadrature_order)?;
     let mut covariates = Vec::with_capacity(formulas.len());
+    let mut inference_notes = FitNotes::default();
     for (d, formula) in formulas.iter().enumerate() {
-        let terms =
-            super::formula::covariate_spec_from_formula(formula.as_ref(), rows.view(), cohort)
-                .map_err(|error| {
-                    if formulas.len() == 1 {
-                        error
-                    } else {
-                        EventHistoryError::InvalidInput {
-                            reason: format!("mark {:?}: {error}", cohort.mark_names[d]),
-                        }
-                    }
-                })?;
+        let mut notes = FitNotes::default();
+        let terms = super::formula::covariate_spec_from_formula(
+            formula.as_ref(),
+            rows.view(),
+            cohort,
+            &mut notes,
+        )
+        .map_err(|error| {
+            if formulas.len() == 1 {
+                error
+            } else {
+                EventHistoryError::InvalidInput {
+                    reason: format!("mark {:?}: {error}", cohort.mark_names[d]),
+                }
+            }
+        })?;
+        if formulas.len() == 1 {
+            inference_notes.advisories.extend(notes.advisories);
+            inference_notes.informational.extend(notes.informational);
+        } else {
+            let mark = &cohort.mark_names[d];
+            let named = |note: String| format!("mark {mark:?}: {note}");
+            inference_notes
+                .advisories
+                .extend(notes.advisories.into_iter().map(named));
+            inference_notes
+                .informational
+                .extend(notes.informational.into_iter().map(named));
+        }
         covariates.push(terms);
     }
     spec.covariates = covariates;
     spec.reference = reference;
-    fit_event_history(cohort, &spec)
+    let mut fit = fit_event_history(cohort, &spec)?;
+    fit.inference_notes = inference_notes;
+    Ok(fit)
 }
 
 /// The family and its block specs at one (order, mesh refinement) setting.
@@ -2752,6 +2780,7 @@ fn assemble(
         reference_refinements: Vec::new(),
         centring,
         reference_certificate: None,
+        inference_notes: FitNotes::default(),
     })
 }
 

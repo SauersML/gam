@@ -258,6 +258,10 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         reference,
     )
     .map_err(|e| e.to_string())?;
+    crate::print_inference_summary(
+        &fit.inference_notes.advisories,
+        &fit.inference_notes.informational,
+    );
 
     let mut summary = Map::new();
     summary.insert("marks".to_string(), json!(mark_names));
@@ -274,6 +278,14 @@ pub(crate) fn run_fit_events(args: FitEventsArgs) -> Result<(), String> {
         } else {
             json!(formulas)
         },
+    );
+    summary.insert(
+        "inference_notes".to_string(),
+        json!(fit.inference_notes.advisories),
+    );
+    summary.insert(
+        "informational_notes".to_string(),
+        json!(fit.inference_notes.informational),
     );
     summary.insert("rank".to_string(), json!(fit.rank()));
     // Whether the rank is the one the evidence selected, or the certified

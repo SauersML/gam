@@ -118,6 +118,17 @@ impl PyEventHistoryModel {
         self.fit.rank()
     }
 
+    /// Advisories the term builder recorded while lowering the formulas: where
+    /// the fitted terms differ from the literal formula.
+    fn inference_notes(&self) -> Vec<String> {
+        self.fit.inference_notes.advisories.clone()
+    }
+
+    /// Defaults the term builder chose on the caller's behalf.
+    fn informational_notes(&self) -> Vec<String> {
+        self.fit.inference_notes.informational.clone()
+    }
+
     /// Per reference grid the fit ran on, the move the next grid makes at the
     /// fitted coefficients, in posterior standard deviations; empty for
     /// stationary-prior centring.

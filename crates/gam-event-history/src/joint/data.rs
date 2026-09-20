@@ -74,6 +74,7 @@ use crate::cohort::{
     mark_index_of, resolve_mark_vocabulary,
 };
 use crate::formula::covariate_spec_from_formula;
+use gam_terms::FitNotes;
 use gam_terms::smooth::{
     TermCollectionSpec, build_term_collection_design, freeze_term_collection_from_design,
 };
@@ -602,7 +603,16 @@ fn frozen_basis(
     cohort: &EventHistoryCohort,
     basis: &'static str,
 ) -> Result<FrozenBasis, JointDataError> {
-    let spec = covariate_spec_from_formula(formula, rows, cohort)?;
+    // The joint schema has no notes channel to a front end, so a basis whose
+    // lowering the term builder flags as differing from the declared formula
+    // (a capped or degraded basis, a feature owned twice) is refused rather
+    // than frozen and saved as if it were what was declared. The informational
+    // notes name defaults whose resolved values the frozen spec below records.
+    let mut notes = FitNotes::default();
+    let spec = covariate_spec_from_formula(formula, rows, cohort, &mut notes)?;
+    if let Some(advisory) = notes.advisories.first() {
+        return Err(invalid(format!("{basis} formula {formula:?}: {advisory}")));
+    }
     let design = build_term_collection_design(rows, &spec)
         .map_err(|error| invalid(format!("{basis} design: {error}")))?;
     let frozen = freeze_term_collection_from_design(&spec, &design)

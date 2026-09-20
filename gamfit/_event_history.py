@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 import numpy as np
 
 from ._binding import rust_module
+from ._warnings import emit_inference_warnings
 
 if TYPE_CHECKING:
     from . import _rust
@@ -105,6 +106,21 @@ class EventHistoryModel:
     @property
     def subject_ids(self) -> list[str]:
         return list(self._native.subject_ids())
+
+    @property
+    def notes(self) -> list[str]:
+        """Notes the term builder recorded while lowering the formula(s),
+        advisories first.
+
+        An *advisory* says the fitted terms differ from the literal formula —
+        a ``k`` capped to a covariate's distinct values, a basis degraded to a
+        line, a feature owned by both a smooth and a linear term;
+        :func:`fit_event_history` also emits each one as a
+        :class:`gamfit.errors.GamInferenceWarning`. An *informational* note
+        records a default chosen on the caller's behalf. With one formula per
+        mark, each note names its mark.
+        """
+        return [*self._native.inference_notes(), *self._native.informational_notes()]
 
     @property
     def rank(self) -> int:
@@ -570,4 +586,5 @@ def fit_event_history(
         reference_rows,
         subject_stratum,
     )
+    emit_inference_warnings(native.inference_notes())
     return EventHistoryModel(native)
