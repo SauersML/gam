@@ -1,4 +1,4 @@
-//! End-to-end quality: gam's isotropic 2-D thin-plate smooth (`s(x, z, bs="tp")`)
+//! End-to-end quality: gam's isotropic 2-D thin-plate smooth (`s(x, z, bs="tps")`)
 //! must RECOVER a known smooth surface, and do so at least as accurately as
 //! mgcv — the mature, standard GAM implementation and the *origin* of Wood's
 //! (2003) low-rank thin-plate regression spline.
@@ -82,13 +82,13 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
     let z_idx = col["z"];
 
     // ---- fit with gam: isotropic 2-D thin-plate smooth, REML ---------------
-    // `s(x, z, bs="tp")` routes the two-variable smooth through the thin-plate
+    // `s(x, z, bs="tps")` routes the two-variable smooth through the thin-plate
     // (`tps`) radial kernel — the exact analogue of mgcv's `s(x, z, bs="tp")`.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, z, bs=\"tp\", k=10)", &ds, &cfg).expect("gam fit");
+    let result = fit_from_formula("y ~ s(x, z, bs=\"tps\", k=10)", &ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
     };
@@ -152,7 +152,7 @@ fn gam_thin_plate_2d_matches_mgcv_gaussian() {
     let rel_to_mgcv = relative_l2(&gam_fitted, mgcv_fitted);
 
     eprintln!(
-        "tp-2d s(x,z,bs=tp): n={n} sigma={noise_sigma:.3} signal_range={signal_range:.3} \
+        "tp-2d s(x,z,bs=tps): n={n} sigma={noise_sigma:.3} signal_range={signal_range:.3} \
          gam_rmse_vs_truth={gam_rmse:.5} mgcv_rmse_vs_truth={mgcv_rmse:.5} \
          rel_l2_gam_vs_mgcv={rel_to_mgcv:.5}"
     );

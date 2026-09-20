@@ -1,6 +1,6 @@
 """Translation invariance of a univariate thin-plate smooth (issue #1269).
 
-A univariate thin-plate regression spline ``s(x, bs="tp")`` is a functional of
+A univariate thin-plate regression spline ``s(x, bs="tps")`` is a functional of
 the radial kernel ``phi(x_i - x_j)`` (coordinate *differences*) plus a polynomial
 nullspace ``{1, x}`` penalised by ``integral (f'')**2``.  Both pieces depend on
 the covariate only through differences and a smoothness functional that is itself
@@ -86,10 +86,10 @@ def _max_drift(bs: str) -> tuple[float, float]:
 
 def test_thinplate_fit_is_invariant_to_covariate_translation() -> None:
     """The tp fit must not move when the covariate is purely translated."""
-    drift, signal_range = _max_drift("tp")
+    drift, signal_range = _max_drift("tps")
     rel = drift / signal_range
     assert rel < 1e-3, (
-        f"thin-plate s(x, bs='tp') is NOT translation invariant: "
+        f"thin-plate s(x, bs='tps') is NOT translation invariant: "
         f"max drift {drift:.3e} = {rel:.3%} of signal range {signal_range:.3f} "
         f"(ceiling 1e-3)"
     )
@@ -108,7 +108,7 @@ def test_local_bases_are_translation_invariant_control() -> None:
 
 
 if __name__ == "__main__":  # pragma: no cover - manual smoke run
-    for bs in ("tp", "ps", "cr"):
+    for bs in ("tps", "ps", "cr"):
         d, sr = _max_drift(bs)
         print(f"bs={bs:>3}: max drift {d:.3e}  ({d / sr:.3%} of range {sr:.3f})")
     raise SystemExit(pytest.main([__file__, "-v"]))

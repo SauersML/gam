@@ -2229,7 +2229,7 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2309,7 +2309,7 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2400,7 +2400,7 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2478,7 +2478,7 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2786,7 +2786,6 @@ fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
         value_probe_cache: Vec::new(),
         cost_stall: None,
         cost_stall_bounds: None,
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: None,
@@ -3756,7 +3755,6 @@ fn bfgs_bridge_value_probe_carries_the_refusal_reason_where_plus_inf_names_nothi
             value_probe_cache: Vec::new(),
             cost_stall: None,
             cost_stall_bounds: None,
-            consecutive_probe_refusals: 0,
             accepted_steps: Arc::default(),
             pending_first_order: Vec::new(),
             incumbent: None,
@@ -3917,7 +3915,6 @@ fn bfgs_bridge_halts_infeasible_probe_run_back_to_cached_seed() {
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),
         cost_stall_bounds: Some((lo, hi)),
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::default(),
         pending_first_order: Vec::new(),
         incumbent: Some(OuterIncumbent {
@@ -6493,3 +6490,13 @@ mod arc_rejected_trials_3017_tests;
 // two evaluations it compares, not a relative floor (#3018).
 #[path = "cost_stall_objective_band_3018_tests.rs"]
 mod cost_stall_objective_band_3018_tests;
+
+// An ARC claim on a trial above the iterate it left is declined as a
+// dominated plateau (#3279).
+#[path = "arc_uphill_trial_claim_3279_tests.rs"]
+mod arc_uphill_trial_claim_3279_tests;
+
+// A run whose probes are refused ends on the refused step's own linear model,
+// not on a count of refusals (#3219).
+#[path = "probe_refusal_derived_bound_3219_tests.rs"]
+mod probe_refusal_derived_bound_3219_tests;

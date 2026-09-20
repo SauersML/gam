@@ -1277,11 +1277,18 @@ impl SaeManifoldTerm {
         }
     }
 
-    /// `½λ²/(|f| + 1)` at the installed state, priced exactly as the budget-limit
-    /// and final-gate acceptances price it: assemble at `(term, rho)`, take the
-    /// deflated evidence factor with [`Self::evidence_factor_options`], and read
-    /// the Newton decrement off that factor's discarded step. The state is not
-    /// moved.
+    /// `½λ²/(|f| + 1)` at the installed state, priced exactly as the decrement
+    /// acceptances price it: assemble at `(term, rho)`, take the deflated evidence
+    /// factor with [`Self::evidence_factor_options`], and read the majorizer Newton
+    /// decrement off that factor's discarded step. Where that decrement admits, the
+    /// exact verdict decides, as it does for every native decrement acceptance
+    /// (#2933 F08, [`Self::certified_decrement_acceptance`]):
+    ///
+    /// - A classified state reports its exact `½λ²/scale`.
+    /// - A clamp basin, or a state above the dense admission, reports the majorizer's.
+    /// - A saddle, or dense geometry that cannot be formed, is `Err`.
+    ///
+    /// The state is not moved.
     pub(crate) fn installed_newton_decrement_relative(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -1311,7 +1318,24 @@ impl SaeManifoldTerm {
                 "installed-state Newton decrement is not a certificate: λ²={decrement_sq:e}"
             ));
         }
-        Ok(0.5 * decrement_sq / scale)
+        let majorizer_relative = 0.5 * decrement_sq / scale;
+        if !Self::inner_decrement_certifies(majorizer_relative) {
+            return Ok(majorizer_relative);
+        }
+        match self.refined_root_verdict(target, rho, registry, &mut sys, &factor.cache)? {
+            RefinedRootVerdict::Certified { relative, .. }
+            | RefinedRootVerdict::Refused(RefinedRootRefusal::DecrementAboveTolerance {
+                relative,
+                ..
+            }) => Ok(relative),
+            RefinedRootVerdict::ClampBasin { .. } | RefinedRootVerdict::Unclassified => {
+                Ok(majorizer_relative)
+            }
+            refused @ RefinedRootVerdict::Refused(_) => Err(format!(
+                "the exact information refuses the installed state [{}]: {refused}",
+                refused.tag()
+            )),
+        }
     }
 
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its

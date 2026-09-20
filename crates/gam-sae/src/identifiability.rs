@@ -1068,7 +1068,7 @@ pub struct AtomSmoothSignificance {
 /// delta-method SE conditioned on the generated latent coordinates as if known.
 /// The plug-in curvature point estimate itself survives — as the per-atom
 /// `kappa_hat` entries of
-/// [`crate::manifold::CertificateInputs::per_atom_kappa_hat`] (the
+/// [`crate::manifold::DictionaryIncoherenceReport::per_atom_kappa_hat`] (the
 /// #1008 empirical curved-dictionary report, surfaced to Python as
 /// `ManifoldSAE.curvature_report`), the single source of truth for the bound.
 /// It is deliberately *not* duplicated onto this report: a descriptive geometry
@@ -3588,7 +3588,7 @@ fn atom_smooth_significance(fit: &AtomInnerFit) -> Option<AtomSmoothSignificance
 ///   a sup-norm curvature BOUND is not an estimand with a profiled criterion,
 ///   and its delta-method SE conditioned on generated latent coordinates as if
 ///   known. The plug-in curvature point estimate survives on
-///   [`crate::manifold::CertificateInputs::per_atom_kappa_hat`] (the
+///   [`crate::manifold::DictionaryIncoherenceReport::per_atom_kappa_hat`] (the
 ///   #1008 empirical curved-dictionary report), not on this report.
 pub(crate) fn atom_inference_reports(model: &FittedSaeManifold) -> Vec<AtomInferenceReport> {
     model
