@@ -433,17 +433,41 @@ fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_cer
     );
 }
 
-/// gam#2926/gam#2968: the first of K = 2 scores stretched above +1σ, a skew that
-/// moves each anchor at first order, fails the adequacy screen at n = 3 000, and
-/// the declaration's excess anchoring loss on the joint law is beyond its sampling
-/// noise: the declaration is refused.
+/// gam#2926/gam#2968: the first of K = 2 scores stretched by half above +1σ fails
+/// the adequacy screen on its own skewness at n = 3 000 and costs the declaration's
+/// anchor a positive excess loss on the joint law, but not one beyond that loss's
+/// own sampling noise at n = 3 000: the declaration is kept, its certificate
+/// recording both.
+#[test]
+fn a_gaussian_declaration_on_a_mildly_skewed_k2_score_keeps_a_loss_within_noise_2968() {
+    install();
+    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 1.5 * (e - 1.0) } else { e };
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0006, upper_stretch)
+        .unwrap_or_else(|refusal| {
+            panic!("a loss within its sampling noise must not refuse the declaration: {refusal}")
+        });
+    eprintln!("[2968 declared K=2 mild skew] {adequacy:?} | {certificate:?}");
+    assert!(
+        adequacy.skew.abs() > adequacy.skew_tol,
+        "the stretched upper tail must fail the screen on the score's own skewness: {adequacy:?}"
+    );
+    assert!(
+        certificate.excess_kl > 0.0 && !certificate.closed_form_chosen,
+        "the skew must cost the declaration's anchor a positive excess loss: {certificate:?}"
+    );
+}
+
+/// gam#2968: the first of K = 2 scores stretched threefold above +1σ, a skew that
+/// moves each anchor at first order, costs the declaration an excess anchoring loss
+/// on the joint law beyond its sampling noise at n = 3 000: the declaration is
+/// refused, naming the failed ledger.
 #[test]
 fn a_gaussian_declaration_on_a_skewed_k2_score_is_refused_beyond_noise_2968() {
     install();
-    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 1.5 * (e - 1.0) } else { e };
+    let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 3.0 * (e - 1.0) } else { e };
     match declared_on_planted_scores(0x2929_0000_0006, upper_stretch) {
         Ok((adequacy, certificate)) => panic!(
-            "a skewed K=2 score must refuse the Gaussian declaration; it was kept with \
+            "a strongly skewed K=2 score must refuse the Gaussian declaration; it was kept with \
              {adequacy:?} | {certificate:?}"
         ),
         Err(refusal) => {
