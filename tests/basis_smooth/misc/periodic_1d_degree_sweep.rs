@@ -120,10 +120,13 @@ fn periodic_1d_degree_0_rejected_cleanly() {
         Ok(_) => panic!("periodic B-spline degree=0 must be rejected"),
         Err(e) => e,
     };
-    let lower = err.to_string().to_lowercase();
+    // The refusal must name the offending option and value ("degree=0 requests
+    // a piecewise-constant spline ..."). A bare `k` disjunct matched almost
+    // any error text, so an unrelated failure passed.
+    let msg = err.to_string();
     assert!(
-        lower.contains("degree") || lower.contains("k") || lower.contains("at least"),
-        "degree=0 rejection must mention degree/k: {err}",
+        msg.contains("degree=0"),
+        "degree=0 rejection must name degree=0: {err}",
     );
     eprintln!("[per-deg0] rejected: {err}");
 }
