@@ -1615,7 +1615,7 @@ pub(crate) fn compute_smoothing_correction(
         Ok(penalties) => penalties,
         Err(error) => {
             return SmoothingCorrectionComputation {
-                correction: None,
+                factor: None,
                 rho_covariance: None,
                 active_rank: None,
                 status: SmoothingCorrectionStatus::Unavailable(
@@ -1628,7 +1628,7 @@ pub(crate) fn compute_smoothing_correction(
     };
     if original_applied.len() != n_rho {
         return SmoothingCorrectionComputation {
-            correction: None,
+            factor: None,
             rho_covariance: None,
             active_rank: None,
             status: SmoothingCorrectionStatus::Unavailable(
