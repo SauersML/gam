@@ -367,11 +367,99 @@ impl<'a> RemlState<'a> {
         //   A_left = K_r, A_right = K_r        for Hw⊙Hw actions,
         //   A_left = K_r, A_right = A_u        for Hw⊙Nbar_u actions,
         // and symmetric variants in mixed second-direction terms.
+        //
+        // Two exact routes, taken by predicted work:
+        //   columns: one `apply_hadamard_gram` per column, c·(4nr² + 4r³);
+        //   rows:    form `M_I = (Z A_left)_I Zᵀ`, `N_I = (Z A_right)_I Zᵀ` one
+        //            row block `I` at a time and apply `(M_I⊙N_I) mat`,
+        //            4n²r (2n²r when A_left is A_right) + 2n²c + 4nr².
+        // The column route never forms an n×n block and wins once n ≳ r²; the
+        // row route wins for the wide, moderate-n designs where a p-column
+        // materialization would otherwise pay c reduced Grams.
+        let n = z.nrows();
+        let r = z.ncols();
+        let c = mat.ncols();
+        if n == 0 || c == 0 {
+            return Array2::<f64>::zeros(mat.raw_dim());
+        }
+        let same_factor = std::ptr::eq(a_left, a_right);
+        let columns_work = c.saturating_mul(
+            n.saturating_mul(r)
+                .saturating_mul(r)
+                .saturating_add(r.saturating_mul(r).saturating_mul(r))
+                .saturating_mul(4),
+        );
+        let n_squared = n.saturating_mul(n);
+        let factor_blocks = if same_factor { 2 } else { 4 };
+        let rows_work = n_squared
+            .saturating_mul(r)
+            .saturating_mul(factor_blocks)
+            .saturating_add(n_squared.saturating_mul(c).saturating_mul(2))
+            .saturating_add(n.saturating_mul(r).saturating_mul(r).saturating_mul(4));
+        if rows_work < columns_work {
+            return Self::apply_hadamard_gram_to_matrix_by_row_blocks(
+                z,
+                a_left,
+                a_right,
+                same_factor,
+                mat,
+            );
+        }
         let mut out = Array2::<f64>::zeros(mat.raw_dim());
         for col in 0..mat.ncols() {
             let v = mat.column(col).to_owned();
             let y = Self::apply_hadamard_gram(z, a_left, a_right, &v);
             out.column_mut(col).assign(&y);
+        }
+        out
+    }
+
+    /// Row-block route of [`Self::apply_hadamard_gram_to_matrix`]: row `i` of
+    /// the result is `Σ_j M_ij N_ij mat_j` with `M = Z A_left Zᵀ` and
+    /// `N = Z A_right Zᵀ`, formed one row block at a time. Each block's rows
+    /// are independent of every other block, so the deterministic fold only
+    /// concatenates them in row order.
+    fn apply_hadamard_gram_to_matrix_by_row_blocks(
+        z: &Array2<f64>,
+        a_left: &Array2<f64>,
+        a_right: &Array2<f64>,
+        same_factor: bool,
+        mat: &Array2<f64>,
+    ) -> Array2<f64> {
+        let n = z.nrows();
+        let c = mat.ncols();
+        let z_left = fast_ab(z, a_left);
+        let z_right = if same_factor {
+            None
+        } else {
+            Some(fast_ab(z, a_right))
+        };
+        let z_t = z.t().to_owned();
+        let blocks = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range: core::ops::Range<usize>| {
+                gam_problem::with_nested_parallel(|| {
+                    let rows = s![range.start..range.end, ..];
+                    let mut hadamard = fast_ab(&z_left.slice(rows).to_owned(), &z_t);
+                    match z_right.as_ref() {
+                        Some(z_right) => {
+                            let right = fast_ab(&z_right.slice(rows).to_owned(), &z_t);
+                            hadamard *= &right;
+                        }
+                        None => hadamard.mapv_inplace(|m| m * m),
+                    }
+                    vec![(range.start, fast_ab(&hadamard, mat))]
+                })
+            },
+            |mut left, right| {
+                left.extend(right);
+                left
+            },
+        );
+        let mut out = Array2::<f64>::zeros((n, c));
+        for (start, block) in blocks.into_iter().flatten() {
+            out.slice_mut(s![start..start + block.nrows(), ..])
+                .assign(&block);
         }
         out
     }
@@ -941,6 +1029,97 @@ impl FirthDenseOperator {
         // where P = M⊙M and P_u = -2(M⊙N_u), but M/N_u are never formed explicitly.
         symmetrize_in_place(&mut out);
         out
+    }
+
+    /// Direction-independent contractions for `tr(D H_φ[u] Π)` against one
+    /// fixed symmetric `Π` (p×p).
+    ///
+    /// With `L = X Π Xᵀ`, `M = Z K_r Zᵀ`, `P = M⊙M` and the terms of
+    /// [`Self::hphi_direction_apply`] at `V = I`:
+    ///   tr(Xᵀ diag(c_u) X Π)            = c_uᵀ ℓ,             ℓ = diag(L),
+    ///   tr(B_uᵀ P B Π) = tr(Bᵀ P B_u Π) = b_uᵀ v,             v = (P⊙L) w',
+    ///   tr(Bᵀ P_u B Π)                  = -2 ⟨A_u, R⟩,         R = Zᵀ diag(w')(M⊙L) diag(w') Z,
+    /// using `N_u = Z A_u Zᵀ`, `P_u = -2 (M⊙N_u)` and `Σ_ij G_ij N_ij = ⟨A_u, ZᵀGZ⟩`.
+    /// `ℓ`, `v` and `R` are shared by every direction, so each trace costs one
+    /// `direction_from_deta` instead of materializing `D H_φ[u]` through `p`
+    /// Hadamard-Gram columns. The shared pass forms `M` and `L` one row block at
+    /// a time: `O(n²·(r + p))` time and `O(n)` memory per block.
+    pub(crate) fn hphi_direction_trace_kernel(
+        &self,
+        pi: &Array2<f64>,
+    ) -> Result<FirthHphiTraceKernel, EstimationError> {
+        let n = self.x_dense.nrows();
+        let p = self.x_dense.ncols();
+        let r = self.x_reduced.ncols();
+        if pi.nrows() != p || pi.ncols() != p {
+            crate::bail_invalid_estim!(
+                "Firth Hessian-derivative trace kernel shape mismatch: expected {p}x{p}, got {}x{}",
+                pi.nrows(),
+                pi.ncols()
+            );
+        }
+        let x_pi = fast_ab(&self.x_dense, pi);
+        let leverage = (&x_pi * &self.x_dense).sum_axis(Axis(1));
+        let z_k = fast_ab(&self.x_reduced, &self.k_reduced);
+        let z_t = self.x_reduced.t().to_owned();
+        let w1 = &self.w1;
+        // Row block `I`: M_I = (Z K_r)_I Zᵀ and L_I = (X Π)_I Xᵀ. The block
+        // returns v_I and its contribution Z_Iᵀ G_I Z to R; the deterministic
+        // tree concatenates the v segments in row order and sums R.
+        let folded = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range: core::ops::Range<usize>| {
+                gam_problem::with_nested_parallel(|| {
+                    let rows = s![range.start..range.end, ..];
+                    let m_block = fast_ab(&z_k.slice(rows).to_owned(), &z_t);
+                    let l_block = fast_ab(&x_pi.slice(rows).to_owned(), &self.x_dense_t);
+                    let mut v_block = Vec::with_capacity(range.len());
+                    let mut g_block = Array2::<f64>::zeros(m_block.raw_dim());
+                    for (local, i) in range.clone().enumerate() {
+                        let m_row = m_block.row(local);
+                        let l_row = l_block.row(local);
+                        let mut v_i = 0.0;
+                        for j in 0..n {
+                            let ml = m_row[j] * l_row[j];
+                            v_i += m_row[j] * ml * w1[j];
+                            g_block[[local, j]] = w1[i] * ml * w1[j];
+                        }
+                        v_block.push(v_i);
+                    }
+                    let g_z = fast_ab(&g_block, &self.x_reduced);
+                    let r_block = fast_atb(&self.x_reduced.slice(rows).to_owned(), &g_z);
+                    (v_block, r_block)
+                })
+            },
+            |(mut v_left, r_left), (v_right, r_right)| {
+                v_left.extend(v_right);
+                (v_left, r_left + r_right)
+            },
+        );
+        let (hadamard_w1, reduced) = match folded {
+            Some((v, reduced)) => (Array1::from_vec(v), reduced),
+            None => (Array1::<f64>::zeros(0), Array2::<f64>::zeros((r, r))),
+        };
+        Ok(FirthHphiTraceKernel {
+            leverage,
+            hadamard_w1,
+            reduced,
+        })
+    }
+
+    /// `tr(D H_φ[u] Π)` for the `Π` of `kernel`; equal to contracting
+    /// [`Self::hphi_direction`] against `Π` (see
+    /// [`Self::hphi_direction_trace_kernel`] for the identities).
+    pub(crate) fn hphi_direction_trace(
+        &self,
+        kernel: &FirthHphiTraceKernel,
+        dir: &FirthDirection,
+    ) -> f64 {
+        let c_u = &(&self.w3 * &dir.deta) * &self.h_diag + &(&self.w2 * &dir.dh);
+        let diag_term = c_u.dot(&kernel.leverage);
+        let hadamard_terms = 2.0 * dir.b_uvec.dot(&kernel.hadamard_w1);
+        let p_u_term = -2.0 * (&dir.a_u_reduced * &kernel.reduced).sum();
+        0.5 * (diag_term - (hadamard_terms + p_u_term))
     }
 
     pub(crate) fn hphisecond_direction_apply(
@@ -3776,6 +3955,98 @@ mod tests {
         let diff = &direct - &via_apply;
         let err = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
         assert!(err < 1e-10, "direction/apply mismatch: {err:e}");
+    }
+
+    #[test]
+    pub(crate) fn firth_direction_trace_kernel_matches_materialized_contraction() {
+        // More rows than one deterministic-fold leaf, a duplicated column so
+        // the reduced rank r is below p, and non-unit observation weights.
+        let n = 300;
+        let x = Array2::from_shape_fn((n, 5), |(i, j)| {
+            let t = i as f64 / n as f64;
+            match j {
+                0 => 1.0,
+                1 => 2.0 * t - 1.0,
+                2 => (7.0 * t).sin(),
+                3 => (3.0 * t + 0.4).cos() * (1.0 + t),
+                _ => 2.0 * t - 1.0,
+            }
+        });
+        let beta = array![0.1, -0.7, 0.4, 0.3, -0.2];
+        let eta = x.dot(&beta);
+        let weights = Array1::from_shape_fn(n, |i| 0.5 + ((i * 7) % 11) as f64 / 10.0);
+        let op = build_weighted_logit_firth_dense_operator(&x, &eta, weights.view())
+            .expect("firth operator");
+        assert!(op.x_reduced.ncols() < x.ncols());
+        let p = x.ncols();
+        let mut pi = Array2::from_shape_fn((p, p), |(a, b)| {
+            ((a * 5 + b * 3) as f64 * 0.37).sin() + if a == b { 1.5 } else { 0.0 }
+        });
+        symmetrize_in_place(&mut pi);
+        let kernel = op.hphi_direction_trace_kernel(&pi).expect("trace kernel");
+        for u in [
+            array![0.25, -0.4, 0.35, 0.1, -0.05],
+            array![-1.0, 0.2, 0.0, 0.6, 0.3],
+        ] {
+            let dir = op.direction_from_deta(x.dot(&u));
+            let hphi = op.hphi_direction(&dir);
+            let materialized = (&hphi * &pi.t()).sum();
+            let kernel_trace = op.hphi_direction_trace(&kernel, &dir);
+            let scale = hphi.iter().map(|v| v.abs()).sum::<f64>()
+                * pi.iter().map(|v| v.abs()).fold(0.0, f64::max);
+            assert!(
+                (kernel_trace - materialized).abs() <= 1e-12 * scale,
+                "trace kernel {kernel_trace:.15e} vs materialized {materialized:.15e}"
+            );
+        }
+    }
+
+    #[test]
+    pub(crate) fn hadamard_gram_matrix_routes_match_dense_hadamard_product() {
+        // n spans two deterministic-fold leaves; r and c are wide enough that
+        // the dispatcher takes the row-block route.
+        let (n, r, c) = (150, 40, 30);
+        let z = Array2::from_shape_fn((n, r), |(i, j)| {
+            ((i * 13 + j * 7) as f64 * 0.11).sin() + 0.1 * (j as f64 + 1.0).ln()
+        });
+        let spd = |shift: f64| {
+            let g = Array2::from_shape_fn((r, r), |(a, b)| ((a * 3 + b * 5) as f64 * shift).cos());
+            let mut a = g.t().dot(&g) / r as f64 + Array2::<f64>::eye(r);
+            symmetrize_in_place(&mut a);
+            a
+        };
+        let a_left = spd(0.21);
+        let a_right = spd(0.47);
+        let mat = Array2::from_shape_fn((n, c), |(i, j)| ((i + 2 * j) as f64 * 0.05).cos());
+        for (left, right) in [(&a_left, &a_right), (&a_left, &a_left)] {
+            let m = z.dot(left).dot(&z.t());
+            let nn = z.dot(right).dot(&z.t());
+            let hadamard = &m * &nn;
+            let dense = hadamard.dot(&mat);
+            let scale = hadamard.mapv(f64::abs).dot(&mat.mapv(f64::abs));
+            let rows = RemlState::apply_hadamard_gram_to_matrix_by_row_blocks(
+                &z,
+                left,
+                right,
+                std::ptr::eq(left, right),
+                &mat,
+            );
+            let mut columns = Array2::<f64>::zeros((n, c));
+            for col in 0..c {
+                let y = RemlState::apply_hadamard_gram(&z, left, right, &mat.column(col).to_owned());
+                columns.column_mut(col).assign(&y);
+            }
+            let dispatched = RemlState::apply_hadamard_gram_to_matrix(&z, left, right, &mat);
+            for (name, got) in [("rows", &rows), ("columns", &columns), ("dispatched", &dispatched)] {
+                for ((idx, g), d) in got.indexed_iter().zip(dense.iter()) {
+                    assert!(
+                        (g - d).abs() <= 1e-12 * scale[idx],
+                        "{name} route at {idx:?}: {g:.15e} vs dense {d:.15e}"
+                    );
+                }
+            }
+            assert_eq!(dispatched, rows, "dispatcher takes the row-block route here");
+        }
     }
 
     #[test]
