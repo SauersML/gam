@@ -2597,6 +2597,84 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
 }
 
+/// `FrozenAnalyticPenaltyOp` is one PSD curvature operator: `matvec` applies the
+/// penalty's PSD majorizer, so `diag`, `as_dense` and `log det(S + λI)` must read
+/// that same operator. Isometry is nonconvex and its majorizer is the Gauss-Newton
+/// block `B_GN`, while its cached HVP state builds the exact Hessian, which also
+/// carries the residual and third-jet terms and is indefinite. The fixture installs
+/// the third jet so the exact Hessian is available and differs from `B_GN`; every
+/// frozen query must still return `B_GN`, the matrix whose columns are `matvec`
+/// of the unit vectors.
+///
+/// Tolerances: `diag` and `as_dense` probe the same `psd_majorizer_hvp` as
+/// `matvec` on the same inputs, so they agree to rounding (a relative
+/// `1e-12` of the largest entry). The log-determinant is an eigensolve of a
+/// 6 × 6 symmetric matrix with `λ = 0.3` added. Its eigenvalues are therefore at
+/// least 0.3, each `log` term carries a relative error of about `n·ε / 0.3`, and
+/// `1e-10` of `max(|log det|, 1)` leaves several orders of margin.
+#[test]
+fn frozen_isometry_operator_reads_the_gauss_newton_majorizer_everywhere() {
+    let (n_obs, p, d, j, h) = isometry_gn_fixture();
+    let n = n_obs * d;
+    let pen = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(d)), p);
+    pen.refresh_caches(Some(j), Some(h));
+    let k = ndarray::Array3::<f64>::from_shape_fn((n_obs, p, d * d * d), |(row, output, axes)| {
+        let (a, c, e) = (axes / (d * d), (axes / d) % d, axes % d);
+        0.11 * (row as f64 + 1.0) - 0.07 * (output as f64) + 0.05 * ((a + c + e) as f64)
+    });
+    pen.set_third_decoder_derivative(Some(Arc::new(k)));
+    let kind = AnalyticPenaltyKind::Isometry(Arc::new(pen));
+    let rho = array![0.0_f64];
+    let t = Array1::<f64>::zeros(n);
+
+    let mut majorizer = Array2::<f64>::zeros((n, n));
+    let mut exact = Array2::<f64>::zeros((n, n));
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let b = kind.psd_majorizer_hvp(t.view(), rho.view(), e.view());
+        let hv = kind.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            majorizer[[row, col]] = b[row];
+            exact[[row, col]] = hv[row];
+        }
+    }
+    let scale = majorizer.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let gap = (&exact - &majorizer).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(scale > 0.0, "the Gauss-Newton majorizer must be nonzero on this fixture");
+    assert!(
+        gap > 1e-6 * scale,
+        "the fixture must separate the exact Hessian from B_GN; max gap {gap:.3e}"
+    );
+
+    let op = FrozenAnalyticPenaltyOp::new(kind, t, rho).expect("frozen isometry operator");
+    let mut applied = Array2::<f64>::zeros((n, n));
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let mut out = Array1::<f64>::zeros(n);
+        op.matvec(e.view(), out.view_mut());
+        for row in 0..n {
+            applied[[row, col]] = out[row];
+        }
+    }
+    let dense = op.as_dense();
+    let diag = op.diag();
+    for row in 0..n {
+        assert_abs_diff_eq!(diag[row], majorizer[[row, row]], epsilon = 1e-12 * scale);
+        for col in 0..n {
+            assert_abs_diff_eq!(applied[[row, col]], majorizer[[row, col]], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(dense[[row, col]], majorizer[[row, col]], epsilon = 1e-12 * scale);
+        }
+    }
+
+    let lambda = 0.3;
+    let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&majorizer, lambda)
+        .expect("log det of the Gauss-Newton majorizer");
+    let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen isometry log det");
+    assert_abs_diff_eq!(log_det, expected, epsilon = 1e-10 * expected.abs().max(1.0));
+}
+
 /// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
 /// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
 /// value, gradient, curvature and the log-determinant agree exactly. An input

@@ -562,28 +562,14 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     p.scale(self.rho.view()),
                 );
             }
-            AnalyticPenaltyKind::Isometry(p) => {
-                let n = self.target.len();
-                let Some(state) = p.hvp_state(self.target.view()) else {
-                    return Array2::<f64>::zeros((n, n));
-                };
-                let mut dense = Array2::<f64>::zeros((n, n));
-                let mut e = Array1::<f64>::zeros(n);
-                for j in 0..n {
-                    e[j] = 1.0;
-                    let col = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
-                    for i in 0..n {
-                        dense[[i, j]] = col[i];
-                    }
-                    e[j] = 0.0;
-                }
-                return dense;
-            }
             // No closed-form dense materialization: fall through to the
             // column-by-column PSD-majorizer probe below. Enumerated rather
             // than wildcarded so a newly registered penalty has to state
-            // which side of this split it is on.
-            AnalyticPenaltyKind::Sparsity(_)
+            // which side of this split it is on. Isometry is here because its
+            // cached HVP state builds the exact, indefinite Hessian, while this
+            // operator is its Gauss-Newton majorizer.
+            AnalyticPenaltyKind::Isometry(_)
+            | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::OrderedBetaBernoulli(_)
             | AnalyticPenaltyKind::Ard(_)
@@ -645,25 +631,13 @@ impl FrozenAnalyticPenaltyOp {
                 }
                 return diag;
             }
-            AnalyticPenaltyKind::Isometry(p) => {
-                let n = self.target.len();
-                let Some(state) = p.hvp_state(self.target.view()) else {
-                    return Array1::<f64>::zeros(n);
-                };
-                let mut d = Array1::<f64>::zeros(n);
-                let mut e = Array1::<f64>::zeros(n);
-                for i in 0..n {
-                    e[i] = 1.0;
-                    let h = p.hvp_with_precomputed_state(&state, self.rho.view(), e.view());
-                    d[i] = h[i];
-                    e[i] = 0.0;
-                }
-                return d;
-            }
-            // No cached HVP state to exploit: fall through to the generic
+            // No closed-form majorizer diagonal: fall through to the generic
             // unit-probe loop below. Enumerated rather than wildcarded so a
             // newly registered penalty has to state which side it is on.
-            AnalyticPenaltyKind::Sparsity(_)
+            // Isometry's cached HVP state is the exact, indefinite Hessian, not
+            // the Gauss-Newton majorizer that `matvec` applies.
+            AnalyticPenaltyKind::Isometry(_)
+            | AnalyticPenaltyKind::Sparsity(_)
             | AnalyticPenaltyKind::SoftmaxAssignmentSparsity(_)
             | AnalyticPenaltyKind::OrderedBetaBernoulli(_)
             | AnalyticPenaltyKind::Ard(_)
