@@ -727,6 +727,7 @@ pub(crate) fn ridge_profile(
         hessian: Some(Array2::from_elem((1, 1), d2_rho)),
         decrement_bands: Some(DecrementBands {
             objective: growth * value_channel,
+            tolerance: growth * value_channel,
             gradient: Array1::from_elem(1, growth * slope_channel),
             hessian: growth * curvature_channel,
         }),
