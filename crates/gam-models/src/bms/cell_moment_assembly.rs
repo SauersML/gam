@@ -2911,7 +2911,7 @@ impl BernoulliMarginalSlopeFamily {
         let scale = self.probit_frailty_scale();
         let mut tail = 0.0;
         let mut density = 0.0;
-        let summands = cells.len() * exact_kernel::GL_NODES_FOR_GPU_KERNEL.len();
+        let summands = cells.len() * exact_kernel::TERMINAL_GL_ORDER;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let state = self.evaluate_cell_moments_lru(
