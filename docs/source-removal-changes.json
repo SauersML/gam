@@ -2053,5 +2053,14 @@
     ],
     "reason": "#3280: block_correction_admission_does_not_depend_on_the_start_1082 no longer asserts bitwise-equal published rho from the two starts, a property nothing guarantees (each start publishes the point where its search met the outer certificate). It asserts the decision, the latched rule and block, and published criterion values within 3*tau_stat instead. bits, the helper that mapped rho to its bit patterns for that assertion, had no other caller and is deleted with it.",
     "evidence": "At the head tree git grep -w bits finds no occurrence in tests/regressions/misc/regression_1082_block_correction_decided_at_optimum.rs, and the helper was private to that file. Gate direct-dy7-w2thb-g5.log, TIPCHECK at tip 990d8e0b93 (tree aecdde9112): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi RC 0, and block_correction_admission_does_not_depend_on_the_start_1082 PASS. Before this entry, the guard's only finding on this change was this removal (direct-dy7-w2thb-g2.log)."
+  },
+  {
+    "base": "38bfcabf183e3eaae913674a739c42ea2351021e",
+    "items": [
+      "crates/gam-solve/src/quadrature.rs:fn:sigmoid",
+      "crates/gam-solve/src/quadrature.rs:fn:test_logit_exact_clamped_degenerate_branch_is_locally_flat"
+    ],
+    "reason": "#2902: the private sigmoid helper clamped its argument to +-QUADRATURE_EXP_LOG_MAX (700); its only caller, stable_sigmoidwith_derivative, now computes the logistic and its slope from z = e^{-|x|}, which never overflows. The deleted test pinned the clamp's defect (a zero slope at mu = -710, where the slope is e^-710).",
+    "evidence": "test_logit_exact_point_mass_keeps_its_tails_past_the_exp_log_limit fails on main (mu=-710: (9.86e-305, 0.0) vs (4.48e-309, 4.48e-309)) and passes here; cargo test -p gam-solve --lib -- quadrature: 84 passed."
   }
 ]
