@@ -17,11 +17,14 @@
 //! both of the Gauss–Newton system.
 //!
 //! The data term, both prior normalizers and the integrated coordinate block are the
-//! dense SAE criterion's (#2933 F24–F26, F27 S1–S2). The ARD log precisions are outer
-//! coordinates on the dense lane's layout, one per atom axis below
+//! dense SAE criterion's (#2933 F24–F26, F27 S1–S2). The Euclidean ARD log precisions
+//! are outer coordinates on the dense lane's layout, one per atom axis below
 //! `SAE_SHARED_ARD_K_THRESHOLD` atoms and one per axis index above it, and the criterion
 //! is minimized over them as the dense one is (#3433, F27 S5). The value still departs
-//! from the dense criterion in three ways:
+//! from the dense criterion in four ways:
+//! - a periodic axis's precision is held at the caller's value, because its Laplace
+//!   criterion has no minimizer where the axis carries no profiled data curvature
+//!   ([`SaeSupportArdLayout`]);
 //! - the curvature is the majorizer, not the exact observed information `log|A|`;
 //! - no realised-rank charge and no collapse-prevention energy enter;
 //! - smoothing is shared per family.
@@ -165,11 +168,32 @@ impl SaeSupportSmoothingLayout {
 /// The layout is the dense lane's (`fit_seed`): one coordinate per atom axis below
 /// `SAE_SHARED_ARD_K_THRESHOLD` atoms, and above it one per axis index, shared by
 /// every atom that has that axis. A support route and a dense route of one request
-/// therefore search the same precision coordinates.
+/// therefore search the same Euclidean precision coordinates.
+///
+/// A periodic (von-Mises) axis is held at the caller's precision and is not an
+/// outer coordinate. On a circle of period `P` with `κ = 2π/P`, the prior's exact
+/// partition is `log Z = log(2π/κ) − α/κ² + log I₀(α/κ²)` per slot, while the
+/// criterion integrates the coordinate block by Laplace, `½·log(α + d)` with `d` the
+/// profiled data curvature of the slot axis. Where `d = 0`, which happens exactly
+/// (for example a single selecting row whose decoder carries an unpenalized
+/// constant column absorbs the row's cell for every `λ`), the slot's
+/// log-precision derivative is `−α/κ² + (α/κ²)·I₁/I₀(α/κ²) + ½ → ½` as `α → 0`: the
+/// criterion decreases without bound toward the prior's flat limit, where the
+/// Laplace step integrates a density that is no longer concentrated, and its
+/// minimizer is the domain face, at which the row block is singular to working
+/// precision. A Gaussian axis has no such limit: its partition's `−½·log α`
+/// cancels the Laplace `½·log α`, so a data-free Euclidean axis is exactly flat.
+/// Selecting a periodic precision needs the circle's own integrated block, not
+/// its Laplace image (#2933 F27 S3.1). Until then the lane holds it, and its
+/// entries still curve the row blocks at that precision.
 #[derive(Clone, Debug)]
 pub struct SaeSupportArdLayout {
-    /// `atom_coordinate[atom][axis]`: the coordinate pricing that axis.
-    pub atom_coordinate: Vec<Vec<usize>>,
+    /// `atom_coordinate[atom][axis]`: the coordinate pricing that axis, `None` for
+    /// a held periodic axis.
+    pub atom_coordinate: Vec<Vec<Option<usize>>>,
+    /// The caller's precisions per atom axis: the search's seed, and the value a
+    /// held axis keeps.
+    pub entry_precisions: Vec<Vec<f64>>,
     /// Number of ARD log-precision coordinates.
     pub coordinates: usize,
     /// Whether the coordinates are shared by axis index.
@@ -177,36 +201,91 @@ pub struct SaeSupportArdLayout {
 }
 
 impl SaeSupportArdLayout {
-    pub(crate) fn from_term(term: &SaeSupportSparseTerm) -> Self {
-        let widths = (0..term.k_atoms())
-            .map(|atom| term.assignment.atom_coord_dim(atom))
-            .collect::<Vec<_>>();
-        let shared = term.k_atoms() >= super::fit_seed::SAE_SHARED_ARD_K_THRESHOLD;
-        if shared {
-            Self {
-                atom_coordinate: widths.iter().map(|&width| (0..width).collect()).collect(),
-                coordinates: widths.iter().copied().max().unwrap_or(0),
-                shared,
+    /// The layout for `term` at the caller's precisions. A non-positive precision
+    /// has no log coordinate and is refused.
+    pub(crate) fn from_term(
+        term: &SaeSupportSparseTerm,
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<Self, String> {
+        if ard_precisions.len() != term.k_atoms() {
+            return Err(format!(
+                "support ARD layout: {} precision blocks for {} atoms",
+                ard_precisions.len(),
+                term.k_atoms()
+            ));
+        }
+        let mut euclidean = Vec::with_capacity(term.k_atoms());
+        for (atom, precisions) in ard_precisions.iter().enumerate() {
+            let periods = term.atom_ard_axis_periods(atom);
+            if precisions.len() != term.assignment.atom_coord_dim(atom)
+                || periods.len() != precisions.len()
+            {
+                return Err(format!(
+                    "support ARD layout: atom {atom} has {} precisions for {} axes",
+                    precisions.len(),
+                    term.assignment.atom_coord_dim(atom)
+                ));
             }
-        } else {
-            let mut next = 0usize;
-            let atom_coordinate = widths
+            if let Some(precision) = precisions
                 .iter()
-                .map(|&width| {
-                    let coordinates = (next..next + width).collect::<Vec<_>>();
-                    next += width;
-                    coordinates
+                .find(|precision| !(precision.is_finite() && **precision > 0.0))
+            {
+                return Err(format!(
+                    "support ARD layout: atom {atom} precision {precision} has no log \
+                     coordinate; the support lane searches log precisions"
+                ));
+            }
+            euclidean.push(periods.iter().map(Option::is_none).collect::<Vec<_>>());
+        }
+        let shared = term.k_atoms() >= super::fit_seed::SAE_SHARED_ARD_K_THRESHOLD;
+        let (atom_coordinate, coordinates) = if shared {
+            // One coordinate per axis index some atom prices as Euclidean.
+            let width = euclidean.iter().map(Vec::len).max().unwrap_or(0);
+            let mut index_of_axis = vec![None; width];
+            let mut next = 0usize;
+            for (axis, slot) in index_of_axis.iter_mut().enumerate() {
+                if euclidean.iter().any(|axes| axes.get(axis).copied().unwrap_or(false)) {
+                    *slot = Some(next);
+                    next += 1;
+                }
+            }
+            let map = euclidean
+                .iter()
+                .map(|axes| {
+                    axes.iter()
+                        .enumerate()
+                        .map(|(axis, &free)| if free { index_of_axis[axis] } else { None })
+                        .collect()
                 })
                 .collect();
-            Self {
-                atom_coordinate,
-                coordinates: next,
-                shared,
-            }
-        }
+            (map, next)
+        } else {
+            let mut next = 0usize;
+            let map = euclidean
+                .iter()
+                .map(|axes| {
+                    axes.iter()
+                        .map(|&free| {
+                            free.then(|| {
+                                next += 1;
+                                next - 1
+                            })
+                        })
+                        .collect()
+                })
+                .collect();
+            (map, next)
+        };
+        Ok(Self {
+            atom_coordinate,
+            entry_precisions: ard_precisions.to_vec(),
+            coordinates,
+            shared,
+        })
     }
 
-    /// The per-atom ARD precisions `exp(u)` at the log precisions `log_ard`.
+    /// The per-atom ARD precisions at the log precisions `log_ard`: `exp(u)` on
+    /// every priced axis, the entry precision on every held one.
     pub fn expand(&self, log_ard: ArrayView1<'_, f64>) -> Result<Vec<Vec<f64>>, String> {
         if log_ard.len() != self.coordinates {
             return Err(format!(
@@ -222,49 +301,31 @@ impl SaeSupportArdLayout {
         Ok(self
             .atom_coordinate
             .iter()
-            .map(|axes| axes.iter().map(|&index| precisions[index]).collect())
+            .zip(&self.entry_precisions)
+            .map(|(axes, held)| {
+                axes.iter()
+                    .zip(held)
+                    .map(|(index, &held)| index.map_or(held, |index| precisions[index]))
+                    .collect()
+            })
             .collect())
     }
 
-    /// The caller's per-atom precisions on this layout: each coordinate at the
-    /// geometric mean of the precisions it prices. A non-positive precision has no
-    /// log coordinate and is refused.
-    fn seed(&self, ard_precisions: &[Vec<f64>]) -> Result<Array1<f64>, String> {
-        if ard_precisions.len() != self.atom_coordinate.len() {
-            return Err(format!(
-                "support ARD seed: {} precision blocks for {} atoms",
-                ard_precisions.len(),
-                self.atom_coordinate.len()
-            ));
-        }
+    /// The caller's precisions on this layout: each coordinate at the geometric
+    /// mean of the entry precisions it prices.
+    fn seed(&self) -> Array1<f64> {
         let mut sum = Array1::<f64>::zeros(self.coordinates);
         let mut count = vec![0usize; self.coordinates];
-        for (atom, (precisions, axes)) in
-            ard_precisions.iter().zip(&self.atom_coordinate).enumerate()
-        {
-            if precisions.len() != axes.len() {
-                return Err(format!(
-                    "support ARD seed: atom {atom} has {} precisions for {} axes",
-                    precisions.len(),
-                    axes.len()
-                ));
-            }
-            for (&precision, &index) in precisions.iter().zip(axes) {
-                if !(precision.is_finite() && precision > 0.0) {
-                    return Err(format!(
-                        "support ARD seed: atom {atom} precision {precision} has no log \
-                         coordinate; the support lane searches log precisions"
-                    ));
+        for (axes, precisions) in self.atom_coordinate.iter().zip(&self.entry_precisions) {
+            for (index, &precision) in axes.iter().zip(precisions) {
+                if let Some(index) = *index {
+                    sum[index] += precision.ln();
+                    count[index] += 1;
                 }
-                sum[index] += precision.ln();
-                count[index] += 1;
             }
         }
-        // Every coordinate prices at least one axis: per atom by construction, and
-        // shared because the widest atom has every axis index.
-        Ok(Array1::from_shape_fn(self.coordinates, |index| {
-            sum[index] / count[index] as f64
-        }))
+        // Every coordinate prices at least one axis by construction.
+        Array1::from_shape_fn(self.coordinates, |index| sum[index] / count[index] as f64)
     }
 }
 
@@ -273,7 +334,8 @@ pub struct SaeSupportOuterRequest {
     pub target: Array2<f64>,
     pub initial_smoothness: f64,
     /// The ARD precisions the search starts from, per atom axis. Each outer
-    /// log-precision coordinate starts at the geometric mean of those it prices.
+    /// log-precision coordinate starts at the geometric mean of those it prices,
+    /// and a periodic axis keeps its value ([`SaeSupportArdLayout`]).
     pub ard_precisions: Vec<Vec<f64>>,
     pub max_outer_iter: usize,
     pub trust_radius: f64,
@@ -610,10 +672,27 @@ impl SaeSupportOuterObjective {
         let groups = self.layout.group_keys.len();
         if index < groups {
             format!("smoothing group {index} ({})", self.layout.group_keys[index])
-        } else if self.ard_layout.shared {
-            format!("shared ARD log precision of axis {}", index - groups)
         } else {
-            format!("ARD log precision {}", index - groups)
+            let coordinate = Some(index - groups);
+            let priced = self
+                .ard_layout
+                .atom_coordinate
+                .iter()
+                .enumerate()
+                .flat_map(|(atom, axes)| {
+                    axes.iter()
+                        .enumerate()
+                        .filter(|(_, priced)| **priced == coordinate)
+                        .map(move |(axis, _)| (atom, axis))
+                })
+                .next();
+            match (self.ard_layout.shared, priced) {
+                (true, Some((_, axis))) => format!("shared ARD log precision of axis {axis}"),
+                (false, Some((atom, axis))) => {
+                    format!("ARD log precision of atom {atom} axis {axis}")
+                }
+                (_, None) => format!("ARD log precision {}", index - groups),
+            }
         }
     }
 
@@ -1423,8 +1502,10 @@ fn support_ard_domain(
     let ranges = term.support_ard_axis_curvature_ranges()?;
     let mut gammas_by_coordinate = vec![Vec::<f64>::new(); layout.coordinates];
     for (atom_ranges, axes) in ranges.iter().zip(&layout.atom_coordinate) {
-        for (&(smallest, largest), &index) in atom_ranges.iter().zip(axes) {
-            if largest > 0.0 {
+        for (&(smallest, largest), index) in atom_ranges.iter().zip(axes) {
+            if let Some(index) = *index
+                && largest > 0.0
+            {
                 gammas_by_coordinate[index].extend([smallest, largest]);
             }
         }
@@ -1476,10 +1557,11 @@ pub fn run_sae_support_outer(
         ));
     }
     let spectrum = penalty_spectrum(&request.term, &layout).map_err(outer_error)?;
-    let ard_layout = SaeSupportArdLayout::from_term(&request.term);
+    let ard_layout = SaeSupportArdLayout::from_term(&request.term, &request.ard_precisions)
+        .map_err(outer_error)?;
     let (rho_lower, rho_upper) =
         support_outer_domain(&request.term, &layout, &ard_layout).map_err(outer_error)?;
-    let ard_seed = ard_layout.seed(&request.ard_precisions).map_err(outer_error)?;
+    let ard_seed = ard_layout.seed();
     // #2954: the criterion's rows and the reduced Schur's border are the
     // formation counts the certificate charges each gradient component's
     // rounding at. Its resolution is each group's own O(rank) scale, which the
@@ -2103,6 +2185,12 @@ mod tests {
     /// later iterate moves further from `p/4`, so the coordinate block stays
     /// strictly positive definite all the way to the recurring fixed point.
     fn build_objective() -> SaeSupportOuterObjective {
+        build_objective_at(&unit_ard_precisions())
+    }
+
+    /// [`build_objective`] entering at the ARD precisions `entry_ard`, which the
+    /// circle's held axis keeps.
+    fn build_objective_at(entry_ard: &[Vec<f64>]) -> SaeSupportOuterObjective {
         let periodic_eval: Arc<dyn SaeBasisSecondJet> =
             Arc::new(PeriodicHarmonicEvaluator::new(3).expect("periodic"));
         let patch_eval: Arc<dyn SaeBasisSecondJet> =
@@ -2147,10 +2235,12 @@ mod tests {
         let layout = SaeSupportSmoothingLayout::from_term(&term);
         assert_eq!(layout.group_keys.len(), 2, "fixture must expose two groups");
         let spectrum = penalty_spectrum(&term, &layout).expect("spectrum");
-        let ard_layout = SaeSupportArdLayout::from_term(&term);
+        let ard_layout =
+            SaeSupportArdLayout::from_term(&term, entry_ard).expect("ARD layout");
         assert_eq!(
-            ard_layout.coordinates, 3,
-            "fixture must expose one ARD log precision per atom axis"
+            ard_layout.coordinates, 2,
+            "fixture must expose one ARD log precision per Euclidean atom axis and hold the \
+             periodic one"
         );
         let initial_term = term.clone();
         SaeSupportOuterObjective {
@@ -2172,8 +2262,14 @@ mod tests {
         }
     }
 
-    /// The fixtures' ARD log precisions at `α = 1` on every atom axis.
-    const UNIT_LOG_ARD: [f64; 3] = [0.0; 3];
+    /// The fixtures' ARD precisions, `α = 1` on every atom axis: the circle's is
+    /// held there, the plane's two are the outer coordinates' entry.
+    fn unit_ard_precisions() -> Vec<Vec<f64>> {
+        vec![vec![1.0], vec![1.0, 1.0]]
+    }
+
+    /// The fixtures' ARD log precisions at `α = 1` on every Euclidean atom axis.
+    const UNIT_LOG_ARD: [f64; 2] = [0.0; 2];
 
     /// The outer point `[smoothing log strengths…, ARD log precisions…]`.
     fn outer_point(smoothing: &[f64], log_ard: &[f64]) -> Array1<f64> {
@@ -2226,17 +2322,16 @@ mod tests {
     /// direction as descent on the filed Tier-2 route. The row determinant now
     /// enters with its implicit response (#2933 F27 S2), and this oracle checks both.
     ///
-    /// The ARD log precisions are outer coordinates too (#3433, F27 S5), so the same
-    /// refitted central difference covers them, at precisions away from one: their
+    /// The Euclidean ARD log precisions are outer coordinates too (#3433, F27 S5), so
+    /// the same refitted central difference covers them, at precisions away from one,
+    /// with the circle's held away from one as well: their
     /// gradient is the prior energy, the normalizer's derivative and both determinants'
     /// explicit and implicit responses.
     #[test]
     fn profiled_support_outer_gradient_matches_refitted_value_fd_2634() {
-        let mut objective = build_objective();
-        let base = outer_point(
-            &[0.4_f64.ln(), 2.2_f64.ln()],
-            &[1.3_f64.ln(), 0.8_f64.ln(), 1.6_f64.ln()],
-        );
+        // The circle's precision is held at 1.3; the plane's two are outer coordinates.
+        let mut objective = build_objective_at(&[vec![1.3], vec![0.8, 1.6]]);
+        let base = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &[0.8_f64.ln(), 1.6_f64.ln()]);
         assert_eq!(base.len(), objective.n_params());
         let analytic = objective
             .evaluate(&base)
@@ -2605,6 +2700,14 @@ mod tests {
     /// exact gradient at the same point. Over independent probe sets the rational
     /// route's realized gradient error must be the size its samples report, and the
     /// samples carry the implicit profile response through their own adjoints.
+    ///
+    /// A coordinate whose reduced-Schur share is identically zero has no probe error
+    /// to report: an ARD axis whose profiled data curvature vanishes (the plane's
+    /// second axis here, whose gradient is `0` to rounding) contributes no
+    /// `D_aa·v_a²` to any probe. Its samples must then report no bar above the
+    /// deterministic floor and its realized error must stay under that floor as
+    /// well, and at least one coordinate must be stochastic so the calibration is
+    /// exercised.
     #[test]
     fn rational_route_gradient_error_is_the_size_its_probe_samples_report_2933() {
         let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &UNIT_LOG_ARD);
@@ -2635,6 +2738,7 @@ mod tests {
                 ));
             }
         }
+        let mut stochastic = 0usize;
         for (group, pairs) in pairs.iter().enumerate() {
             let count = pairs.len() as f64;
             let rms_error = (pairs.iter().map(|(error, _)| error * error).sum::<f64>() / count).sqrt();
@@ -2650,6 +2754,16 @@ mod tests {
                 exact.gradient[group],
                 pairs.len()
             );
+            if rms_bar <= floor {
+                assert!(
+                    rms_error <= floor,
+                    "group {group}: its samples report no probe error (RMS bar \
+                     {rms_bar:.3e} under the deterministic floor {floor:.3e}), yet the \
+                     realized RMS gradient error is {rms_error:.3e}"
+                );
+                continue;
+            }
+            stochastic += 1;
             assert!(
                 rms_error > floor,
                 "group {group}: RMS gradient error {rms_error:.3e} is not above the \
@@ -2667,6 +2781,7 @@ mod tests {
                 pairs.len()
             );
         }
+        assert!(stochastic > 0, "no outer coordinate carries a probe error to calibrate");
     }
 
     /// #2933 F29 — the rational-route search publishes a certified point only after
@@ -2950,7 +3065,8 @@ mod tests {
         let layout = SaeSupportSmoothingLayout::from_term(&term);
         assert_eq!(layout.group_keys.len(), 2, "one smoothing group per atom");
         let spectrum = penalty_spectrum(&term, &layout).expect("spectrum");
-        let ard_layout = SaeSupportArdLayout::from_term(&term);
+        let ard_layout =
+            SaeSupportArdLayout::from_term(&term, &unit_ard_precisions()).expect("ARD layout");
         let initial_term = term.clone();
         let mut objective = SaeSupportOuterObjective {
             term,
@@ -3247,11 +3363,9 @@ mod tests {
     /// and the two log-determinants, with no profiled dispersion.
     #[test]
     fn support_value_prices_the_ard_partition_on_active_slots_2933_f27() {
-        let mut objective = build_objective();
-        let rho = outer_point(
-            &[0.4_f64.ln(), 2.2_f64.ln()],
-            &[1.7_f64.ln(), 3.0_f64.ln(), 1.5_f64.ln()],
-        );
+        // The circle's precision is held at 1.7; the plane's two are outer coordinates.
+        let mut objective = build_objective_at(&[vec![1.7], vec![1.0, 1.0]]);
+        let rho = outer_point(&[0.4_f64.ln(), 2.2_f64.ln()], &[3.0_f64.ln(), 1.5_f64.ln()]);
         let evaluation = objective.evaluate(&rho).expect("support value evaluates");
         let components = evaluation.components;
         for (got, want) in evaluation
@@ -3262,7 +3376,8 @@ mod tests {
         {
             assert!(
                 (got - want).abs() <= 1.0e-14 * want,
-                "the outer point's ARD precisions {:?} are not exp of its log coordinates",
+                "the outer point's ARD precisions {:?} are not the held circle precision and exp \
+                 of the plane's log coordinates",
                 evaluation.ard_precisions
             );
         }

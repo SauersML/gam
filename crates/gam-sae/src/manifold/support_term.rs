@@ -930,11 +930,11 @@ struct SupportOuterDifferentialRow {
 }
 
 /// One active ARD prior entry `(row, slot, axis)` and the outer log-precision
-/// coordinate that prices it (#3433). Every field is already its own
-/// `∂/∂log α` by degree-1 homogeneity.
+/// coordinate that prices it (#3433), `None` on a held axis. Every field is
+/// already its own `∂/∂log α` by degree-1 homogeneity.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SupportArdPriorEntry {
-    pub(crate) coordinate: usize,
+    pub(crate) coordinate: Option<usize>,
     /// `∂V/∂t` at the entry's coordinate.
     pub(crate) grad: f64,
     /// The Gauss–Newton majorizer curvature the row block carries on its diagonal.
@@ -972,7 +972,9 @@ impl SupportArdPriorEntries {
         }
         let mut out = Array1::<f64>::zeros(self.coordinates);
         for (value, entry) in t.iter().zip(self.rows.iter().flatten()) {
-            out[entry.coordinate] += value * entry.grad;
+            if let Some(index) = entry.coordinate {
+                out[index] += value * entry.grad;
+            }
         }
         Ok(out)
     }
@@ -1643,7 +1645,7 @@ impl SaeSupportSparseTerm {
 
     /// Period of one atom's ARD coordinate prior per axis; see the
     /// `atom_ard_axis_periods` field.
-    fn atom_ard_axis_periods(&self, atom: usize) -> &[Option<f64>] {
+    pub(crate) fn atom_ard_axis_periods(&self, atom: usize) -> &[Option<f64>] {
         &self.atom_ard_axis_periods[atom]
     }
 
@@ -1697,7 +1699,9 @@ impl SaeSupportSparseTerm {
     /// it prices, with the criterion's explicit log-precision derivatives (#3433).
     ///
     /// `coordinate[atom][axis]` names the outer coordinate `u_c = log α_c` that
-    /// atom `atom`'s axis `axis` reads. Several atom-axes may share one. The prior's
+    /// atom `atom`'s axis `axis` reads, `None` for an axis held at its precision.
+    /// Several atom-axes may share one. A held axis's entries stay in the row
+    /// blocks, which they curve, and price no coordinate. The prior's
     /// value, gradient and majorizer curvature are each degree-1 homogeneous in `α`
     /// ([`ArdAxisPrior::eval`], [`ArdAxisPrior::psd_majorizer_hess`]), so their
     /// `∂/∂u` is the entry itself, and the entry list carries everything the
@@ -1715,7 +1719,7 @@ impl SaeSupportSparseTerm {
     pub(crate) fn support_ard_prior_entries(
         &self,
         ard_precisions: &[Vec<f64>],
-        coordinate: &[Vec<usize>],
+        coordinate: &[Vec<Option<usize>>],
         coordinates: usize,
     ) -> Result<SupportArdPriorEntries, String> {
         if ard_precisions.len() != self.k_atoms() || coordinate.len() != self.k_atoms() {
@@ -1734,7 +1738,7 @@ impl SaeSupportSparseTerm {
                 || ard_precisions[atom]
                     .iter()
                     .any(|value| !(value.is_finite() && *value > 0.0))
-                || coordinate[atom].iter().any(|&index| index >= coordinates)
+                || coordinate[atom].iter().flatten().any(|&index| index >= coordinates)
             {
                 return Err(format!(
                     "SaeSupportSparseTerm::support_ard_prior_entries: atom {atom} needs {width} \
@@ -1759,8 +1763,10 @@ impl SaeSupportSparseTerm {
                         periods[axis],
                     );
                     let index = coordinate[atom][axis];
-                    energy[index] += prior.value;
-                    priced[index] += 1;
+                    if let Some(index) = index {
+                        energy[index] += prior.value;
+                        priced[index] += 1;
+                    }
                     entries.push(SupportArdPriorEntry {
                         coordinate: index,
                         grad: prior.grad,
@@ -1784,9 +1790,11 @@ impl SaeSupportSparseTerm {
                 log_alpha.view(),
                 alpha.view(),
             )?;
-            for (axis, &index) in coordinate[atom].iter().enumerate() {
-                log_partition_gradient[index] +=
-                    slots as f64 * partition.log_precision_gradient[axis];
+            for (axis, index) in coordinate[atom].iter().enumerate() {
+                if let Some(index) = *index {
+                    log_partition_gradient[index] +=
+                        slots as f64 * partition.log_precision_gradient[axis];
+                }
             }
         }
         if energy
@@ -1874,7 +1882,9 @@ impl SaeSupportSparseTerm {
             let inverse = CpuBatchedBlockSolver
                 .solve_block_matrix(factors.factor(row), Array2::<f64>::eye(q).view());
             for (local, entry) in row_entries.iter().enumerate() {
-                row_log_det[entry.coordinate] += inverse[[local, local]] * entry.majorizer;
+                if let Some(index) = entry.coordinate {
+                    row_log_det[index] += inverse[[local, local]] * entry.majorizer;
+                }
             }
         }
         // `Σ_{z ∈ vectors[range]} zᵀ ∂S_c z` for every `c`, folded over the
@@ -1890,8 +1900,10 @@ impl SaeSupportSparseTerm {
                             let solved = CpuBatchedBlockSolver
                                 .solve_block_vector(factors.factor(row), cross.view());
                             for (local, entry) in row_entries.iter().enumerate() {
-                                out[entry.coordinate] +=
-                                    entry.majorizer * solved[local] * solved[local];
+                                if let Some(index) = entry.coordinate {
+                                    out[index] +=
+                                        entry.majorizer * solved[local] * solved[local];
+                                }
                             }
                         }
                     }
