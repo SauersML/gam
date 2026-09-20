@@ -724,8 +724,6 @@ mod tests {
         RandomEffectTermSpec {
             name: name.to_string(),
             feature_col,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: Some(levels.iter().map(|level| level.to_bits()).collect()),
             lenient_unseen: false,
         }
@@ -737,6 +735,7 @@ mod tests {
             linear_terms: Vec::new(),
             random_effect_terms: vec![factor_term("g", 1, &[0.0, 1.0])],
             smooth_terms: Vec::new(),
+            level: Default::default(),
         };
         let pd = table(&spec, "g", PartialDependenceGrid::TrainingRange { n_points: 50 })
             .expect("a bare factor term");
@@ -767,6 +766,7 @@ mod tests {
             linear_terms: Vec::new(),
             random_effect_terms: vec![factor_term("factor(z)", 2, &[1.0, 2.0, 3.0])],
             smooth_terms: Vec::new(),
+            level: Default::default(),
         };
         let pd = table(&spec, "factor(z)", PartialDependenceGrid::TrainingRange { n_points: 4 })
             .expect("a numeric-coded factor term");
