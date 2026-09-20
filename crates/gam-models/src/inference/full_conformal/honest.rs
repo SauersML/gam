@@ -121,6 +121,11 @@ pub enum ConformalRefusal {
     RefitOutsideTube,
     /// The outer engine could not complete a local refit.
     RefitFailed,
+    /// A non-Gaussian likelihood whose fit selected a smoothing strength (or a
+    /// negative-binomial θ) on the training rows: the set is that of the
+    /// frozen-penalty certified refit, and no REML re-selecting map is built
+    /// for these families.
+    GlmFrozenPenalty,
 }
 
 impl ConformalRefusal {
@@ -132,6 +137,7 @@ impl ConformalRefusal {
             ConformalRefusal::RemlUndefined => "refused:reml_undefined",
             ConformalRefusal::RefitOutsideTube => "refused:refit_outside_tube",
             ConformalRefusal::RefitFailed => "refused:refit_failed",
+            ConformalRefusal::GlmFrozenPenalty => "refused:glm_frozen_penalty",
         }
     }
 
@@ -143,6 +149,7 @@ impl ConformalRefusal {
             ConformalRefusal::RemlUndefined => -4,
             ConformalRefusal::RefitOutsideTube => -5,
             ConformalRefusal::RefitFailed => -6,
+            ConformalRefusal::GlmFrozenPenalty => -7,
         }
     }
 }
@@ -171,7 +178,8 @@ impl ConformalCertificate {
 
     /// Numeric code for column output: `0` exact_frozen, `1` honest_refit,
     /// negative for a refusal (`-1` multi_penalty, `-2` unknown_penalty_structure,
-    /// `-3` augmented_gram_singular, `-4` reml_undefined, `-5` refit_outside_tube, `-6` refit_failed).
+    /// `-3` augmented_gram_singular, `-4` reml_undefined, `-5` refit_outside_tube, `-6` refit_failed,
+    /// `-7` glm_frozen_penalty).
     pub fn code(self) -> i32 {
         match self {
             ConformalCertificate::ExactFrozen => 0,
