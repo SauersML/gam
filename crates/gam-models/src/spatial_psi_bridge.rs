@@ -17,7 +17,7 @@ use crate::custom_family::{
 use crate::fit_orchestration::drivers::{
     spatial_length_scale_term_indices, try_build_spatial_log_kappa_derivativeinfo_list,
 };
-use gam_linalg::matrix::{EmbeddedColumnBlock, EmbeddedSquareBlock};
+use gam_linalg::matrix::EmbeddedSquareBlock;
 use gam_terms::smooth::{TermCollectionDesign, TermCollectionSpec};
 use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1};
 use std::any::Any;
@@ -57,11 +57,6 @@ pub(crate) trait SpatialPsiBlockTransform {
         op: Arc<dyn CustomFamilyPsiDerivativeOperator>,
     ) -> Result<Arc<dyn CustomFamilyPsiDerivativeOperator>, String> {
         Ok(op)
-    }
-
-    /// Transform a materialized (already embedded) design block. Default: identity.
-    fn transform_design(&self, design: Array2<f64>) -> Array2<f64> {
-        design
     }
 
     /// Transform a materialized (already embedded) penalty block. Default: identity.
@@ -118,8 +113,8 @@ impl SpatialPsiBlockTransform for IdentitySpatialPsiBlockTransform {}
 ///
 /// `raw_from_current` is the fixed section `T` in `beta_raw = T beta_current`.
 /// Every derivative artifact is moved through the same chart:
-/// `X_psi -> X_psi T` and `S_psi -> T' S_psi T`, including matrix-free first
-/// and second design-derivative actions.
+/// `X_psi -> X_psi T` (through the matrix-free first and second
+/// design-derivative actions) and `S_psi -> T' S_psi T`.
 pub(crate) struct CoefficientSpatialPsiBlockTransform {
     raw_from_current: Arc<Array2<f64>>,
 }
@@ -348,10 +343,6 @@ impl SpatialPsiBlockTransform for CoefficientSpatialPsiBlockTransform {
         }))
     }
 
-    fn transform_design(&self, design: Array2<f64>) -> Array2<f64> {
-        design.dot(self.raw_from_current.as_ref())
-    }
-
     fn transform_penalty(&self, penalty: Array2<f64>) -> Array2<f64> {
         self.raw_from_current
             .t()
@@ -375,10 +366,14 @@ pub(crate) fn build_block_spatial_psi_derivatives(
 /// Shared exact-derivative / spatial-ψ engine.
 ///
 /// Builds the per-axis [`CustomFamilyBlockPsiDerivative`] blocks for every
-/// spatial length-scale term, threading every materialized design/penalty matrix
-/// and every assembled implicit operator through `transform`. Family modules
-/// consume this engine and supply a [`SpatialPsiBlockTransform`] rather than
-/// duplicating the block-assembly, cross-axis, and operator-embedding logic.
+/// spatial length-scale term, threading every materialized penalty matrix and
+/// every assembled design-derivative operator through `transform`. Every axis
+/// that moves a design column carries an operator (implicit, or the embedded
+/// dense one over `x_psi_local`/`x_psi_psi_local` and the anisotropic cross
+/// designs), so the design derivative is never also shipped materialized.
+/// Family modules consume this engine and supply a [`SpatialPsiBlockTransform`]
+/// rather than duplicating the block-assembly, cross-axis, and
+/// operator-embedding logic.
 pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
     data: ndarray::ArrayView2<'_, f64>,
     resolvedspec: &TermCollectionSpec,
@@ -451,22 +446,6 @@ pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
                 .clone()
                 .map(|op| transform.transform_operator(op))
                 .transpose()?;
-            let materialize_dense_design =
-                !info.x_psi_local.is_empty() && design_operator.is_none();
-            let embed_design = |local: &Array2<f64>| -> Array2<f64> {
-                let embedded = if local.ncols() == 0 || local.nrows() == 0 {
-                    Array2::<f64>::zeros((local.nrows(), info.total_p))
-                } else {
-                    EmbeddedColumnBlock::new(local, info.global_range.clone(), info.total_p)
-                        .materialize()
-                };
-                transform.transform_design(embedded)
-            };
-            let x_full = if materialize_dense_design {
-                embed_design(&info.x_psi_local)
-            } else {
-                Array2::<f64>::zeros((0, 0))
-            };
             let penalty_indices = info.penalty_indices.clone();
             let embed_penalty = |local: &Array2<f64>| -> Array2<f64> {
                 let embedded = if local.nrows() == 0 || local.ncols() == 0 {
@@ -487,24 +466,6 @@ pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
                 )
                 .collect();
             s_components.extend(std::mem::take(&mut owned.first[psi_idx]));
-            // Build x_psi_psi rows with cross-derivative designs
-            let x_psi_psi_rows = if materialize_dense_design {
-                let mut rows =
-                    vec![Array2::<f64>::zeros((x_full.nrows(), x_full.ncols())); psi_dim];
-                rows[psi_idx] = embed_design(&info.x_psi_psi_local);
-                if let (Some(gid), Some(cross_designs)) =
-                    (info.aniso_group_id, info.aniso_cross_designs.as_ref())
-                {
-                    for (axis_j, local) in cross_designs {
-                        if let Some(&global_j) = axis_lookup.get(&(gid, *axis_j)) {
-                            rows[global_j] = embed_design(local);
-                        }
-                    }
-                }
-                Some(rows)
-            } else {
-                None
-            };
             // Build s_psi_psi_components with cross-penalty terms
             let mut s_psi_psi_comp_rows = vec![Vec::<(usize, Array2<f64>)>::new(); psi_dim];
             s_psi_psi_comp_rows[psi_idx] = penalty_indices
@@ -540,11 +501,11 @@ pub(crate) fn build_block_spatial_psi_derivatives_with_transform(
             }
             Ok(CustomFamilyBlockPsiDerivative {
                 penalty_index: Some(info.penalty_index),
-                x_psi: x_full,
+                x_psi: Array2::<f64>::zeros((0, 0)),
                 s_psi: Array2::<f64>::zeros((0, 0)),
                 s_psi_components: Some(s_components),
                 s_psi_penalty_components: None,
-                x_psi_psi: x_psi_psi_rows,
+                x_psi_psi: None,
                 s_psi_psi: None,
                 s_psi_psi_components: Some(s_psi_psi_comp_rows),
                 s_psi_psi_penalty_components: None,
