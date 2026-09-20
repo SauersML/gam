@@ -1,5 +1,10 @@
 ## Unreleased
 
+- **A CUDA userspace library that fails to preload now reports the loader's own diagnostic** (#4390).
+  The refusal used to end in libloading's generic `dlopen failed`. The compute-library probe keeps its
+  verdict and the opened handle in one cache entry and recovers a poisoned cache instead of bypassing
+  it, so the handle can no longer be dropped (and the library closed) after a panic elsewhere.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

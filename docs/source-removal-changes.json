@@ -2665,5 +2665,14 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
+    "items": [
+      "crates/gam-gpu/src/driver.rs:fn:append_versioned_linux_libcuda_candidates",
+      "crates/gam-gpu/src/driver.rs:static:KEEP_ALIVE"
+    ],
+    "reason": "#4390: append_versioned_linux_libcuda_candidates duplicated append_versioned_linux_so_candidates with base \"libcuda\"; its only extra rule (skip libcuda.so.1) is already covered by the shared helper's skip of names already listed, since every directory it walks has its libcuda.so.1 path in the fixed candidate list. cuda_library_candidate_names now calls the shared helper. The KEEP_ALIVE static in require_cuda_compute_library held the opened compute-library handles in a second mutex beside the verdict map, and both were bypassed on poison (dropping the handle); the verdict map now stores Result<Library, GpuError> itself.",
+    "evidence": "scripts/source_removal_guard.py with --base f5930beca8e6b774e426c13bf165f822a5e8e920 and head the change's commit lists exactly these removals. Read-proof at the head: git grep finds no append_versioned_linux_libcuda_candidates or KEEP_ALIVE in crates/ tests/ examples/ python/; the new test versioned_so_candidates_are_sorted_and_deduplicated pins the shared helper's order and dedup."
   }
 ]
