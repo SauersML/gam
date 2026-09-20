@@ -5868,3 +5868,114 @@ fn beta_half_unit_deviance_from_shape_differences_is_exact_and_resolved() {
         "positive control: the direct form should be noise-dominated at this φ, got {direct_curv:.9e} vs {analytic:.9e}"
     );
 }
+
+/// Beta-logit Fisher working rows in both logit tails (#4527).
+#[cfg(test)]
+mod beta_logit_fisher_row_tail_tests {
+    use super::super::exact_beta_logit_row;
+
+    fn relative_error(value: f64, reference: f64) -> f64 {
+        ((value - reference) / reference).abs()
+    }
+
+    /// Fisher `W`, `z`, `c = dW/dη` and `d = d²W/dη²` of one row
+    /// (`ω = 1`, `φ = 4`, `y = 1/3` as an f64). The references are the
+    /// closed forms evaluated in 60-digit arithmetic and rounded to 17
+    /// significant digits.
+    ///
+    /// The shifted-polygamma forms are well conditioned at every point here.
+    /// Their float64 evaluation stays within 1.6e-15 of the reference, so
+    /// 1e-12 leaves room for the polygamma implementation's own error and
+    /// still refuses main's unshifted forms. Those forms cancel O(1) poles:
+    /// they miss by 9.5e-10 at η = 8, by 7.3e-4 at η = 15 and by a factor
+    /// 1e10 at η = 30, where the rounded `1 − μ` compounds the cancellation.
+    #[test]
+    fn beta_logit_fisher_curvature_matches_reference_in_both_tails() {
+        let phi = 4.0;
+        let y = 1.0 / 3.0;
+        // (η, W, z, c, d)
+        let references = [
+            (-30.0, 9.9999999999981285e-1, -28.99999999999948, -1.871524593762105e-13, -1.8715245937561751e-13),
+            (-15.0, 9.9999938819852749e-1, -13.999998298961095, -6.1179830402406552e-7, -6.1179196706819654e-7),
+            (-8.0, 9.9933287479558206e-1, -6.9981415182408401, -6.6333553141763312e-4, -6.5577689451943296e-4),
+            (0.3, 1.2765364075355014, -0.52855793718461334, -0.087181825644534897, -0.26828185644214066),
+            (8.0, 9.9933287479558206e-1, 6.996281324888551, 6.6333553141763312e-4, -6.5577689451943296e-4),
+            (15.0, 9.9999938819852749e-1, 13.999996602678447, 6.1179830402406552e-7, -6.1179196706819654e-7),
+            (30.0, 9.9999999999981285e-1, 28.999999999998961, 1.871524593762105e-13, -1.8715245937561751e-13),
+        ];
+        for (eta, weight, z, c, d) in references {
+            let row = exact_beta_logit_row(0, eta, Some(y), 1.0, phi)
+                .unwrap_or_else(|error| panic!("beta-logit row at eta={eta} refused: {error:?}"));
+            for (label, value, reference) in
+                [("W", row.weight, weight), ("z", row.z, z), ("c", row.c, c), ("d", row.d, d)]
+            {
+                let error = relative_error(value, reference);
+                assert!(
+                    error <= 1e-12,
+                    "eta={eta}: {label} = {value:e} vs reference {reference:e} (relative error {error:e})"
+                );
+            }
+        }
+    }
+
+    /// The Beta model is symmetric under `y ↔ 1 − y`, `η ↔ −η`: `W` and `d` are
+    /// even and `z` and `c` are odd. The responses are dyadic, so `1 − y` is exact.
+    /// Past η ≈ 36.7 the rounded mean is exactly 1.0, so the upper row can
+    /// only exist by forming its second shape from the exact logit complement.
+    /// The mirrored rows run the same float operations except the order of the
+    /// jet's `q″` polynomial, so they agree to a few ulps. 1e-13 is a bound on
+    /// that, not a tolerance on an approximation.
+    #[test]
+    fn beta_logit_fisher_row_is_mirror_symmetric_past_the_rounded_mean() {
+        let phi = 4.0;
+        let tail_response = 2.0_f64.powi(-40);
+        for eta in [20.0, 30.0, 40.0, 60.0] {
+            let upper = exact_beta_logit_row(0, eta, Some(1.0 - tail_response), 1.0, phi)
+                .unwrap_or_else(|error| panic!("upper-tail row at eta={eta} refused: {error:?}"));
+            let lower = exact_beta_logit_row(0, -eta, Some(tail_response), 1.0, phi)
+                .unwrap_or_else(|error| panic!("lower-tail row at eta={} refused: {error:?}", -eta));
+            for (label, up, mirrored) in [
+                ("W", upper.weight, lower.weight),
+                ("z", upper.z, -lower.z),
+                ("c", upper.c, -lower.c),
+                ("d", upper.d, lower.d),
+            ] {
+                let error = relative_error(up, mirrored);
+                assert!(
+                    error <= 1e-13,
+                    "eta=±{eta}: {label} upper {up:e} vs mirrored lower {mirrored:e} (relative error {error:e})"
+                );
+            }
+        }
+        // At η = 40 the 60-digit reference is W = 1 − 8.5e-18, z = 39 + 4.4e-16,
+        // c = 8.4967085105831768e-18 and d = −8.4967085105831755e-18.
+        let upper = exact_beta_logit_row(0, 40.0, Some(1.0 - tail_response), 1.0, phi)
+            .expect("upper-tail row at eta=40");
+        assert!(relative_error(upper.c, 8.4967085105831768e-18) <= 1e-12, "c = {:e}", upper.c);
+        assert!(relative_error(upper.d, -8.4967085105831755e-18) <= 1e-12, "d = {:e}", upper.d);
+    }
+
+    /// The Beta precision refresh reads the same exact logit pair as the row.
+    /// Main formed the moment statistic from the rounded mean and refused
+    /// every row past η ≈ 36.7, where `μ` rounds to 1 although `1 − μ` is a
+    /// normal number. The mirrored sample (η → −η, y → 1 − y) must give the
+    /// same precision. The reference is the moment estimator in 60-digit
+    /// arithmetic on these f64 inputs.
+    #[test]
+    fn beta_precision_moment_estimate_accepts_rows_past_the_rounded_mean() {
+        use super::super::estimate_beta_phi_from_eta;
+        use ndarray::array;
+        let weights = array![1.0, 1.0, 1.0, 1.0];
+        let eta = array![-2.0, 0.5, 38.0, 45.0];
+        let y = array![0.25, 0.625, 1.0 - 2f64.powi(-53), 1.0 - 2f64.powi(-50)];
+        let mirrored_eta = eta.mapv(|e: f64| -e);
+        let mirrored_y = y.mapv(|v: f64| 1.0 - v);
+        let phi = estimate_beta_phi_from_eta(y.view(), &eta, weights.view())
+            .expect("the upper-tail sample has a finite moment precision");
+        let mirrored = estimate_beta_phi_from_eta(mirrored_y.view(), &mirrored_eta, weights.view())
+            .expect("the lower-tail sample has a finite moment precision");
+        let reference = 23.544459333498157;
+        assert!(relative_error(phi, reference) <= 1e-13, "phi = {phi:e}");
+        assert!(relative_error(mirrored, reference) <= 1e-13, "mirrored phi = {mirrored:e}");
+    }
+}
