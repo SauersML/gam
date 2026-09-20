@@ -279,6 +279,62 @@ pub fn reconstruct_sparse_rows(
     Ok(out)
 }
 
+/// Rounding band on `|‖d‖² − 1|` for a length-`dim` f32 atom normalized to the unit
+/// sphere and measured with f64 accumulation.
+///
+/// This is the derivation of [`gam_math::roundoff::unit_normalization_band`] at the f32
+/// unit roundoff `u₃₂ = ε₃₂/2`. The normalizing norm sums `dim` rounded squares, and its
+/// square root and the per-coordinate quotient add a bounded number of roundings, so the
+/// exact squared norm of an atom normalized in f32 lies within `γ₃₂(dim + 6)` of one. An
+/// atom normalized in f64 and then rounded to f32 takes one rounding per coordinate, which
+/// is `2u₃₂` on the squared norm and is covered. Measuring in f64 squares each f32
+/// coordinate exactly (a 24-bit significand squared fits in 53 bits) and sums `dim` terms,
+/// which adds `γ₆₄(dim)`.
+pub(crate) fn f32_unit_atom_band(dim: usize) -> f64 {
+    let single = dim.saturating_add(6) as f64 * (f64::from(f32::EPSILON) / 2.0);
+    let normalization = if single < 1.0 {
+        single / (1.0 - single)
+    } else {
+        f64::INFINITY
+    };
+    normalization + gam_math::roundoff::accumulation_growth(dim)
+}
+
+/// Refuse a linear-lane decoder whose live atoms are not unit norm.
+///
+/// Every linear-lane diagnostic reads its gates and masses in unit-atom units:
+/// - the routability audit scores `|⟨r, d_k⟩| / ‖r‖` against a dimensionless floor;
+/// - the dual certificate compares the off-support gate `|⟨r, d_k⟩|`, which is the optimal
+///   new code only when `‖d_k‖ = 1`, with the weakest active code `|c_k|`.
+///
+/// For a row of norm `ν ≠ 1` the gate scales with `ν` and the code with `1/ν`. The
+/// verdicts would then depend on how a checkpoint split scale between its decoder and its
+/// codes. An exactly zero row is a dead atom and carries no scale. Every other row must be
+/// unit norm within the f32 normalization band [`f32_unit_atom_band`].
+pub(crate) fn require_unit_norm_atoms(
+    decoder: ArrayView2<'_, f32>,
+    context: &str,
+) -> Result<(), String> {
+    let band = f32_unit_atom_band(decoder.ncols());
+    for (atom, row) in decoder.outer_iter().enumerate() {
+        let squared_norm: f64 = row.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        if squared_norm == 0.0 {
+            continue;
+        }
+        let defect = (squared_norm - 1.0).abs();
+        if !(defect <= band) {
+            return Err(format!(
+                "{context}: decoder atom {atom} has norm {norm}, not 1 (squared-norm defect \
+                 {defect:e} exceeds the f32 normalization band {band:e}). Linear-lane gates \
+                 and masses are in unit-atom units: rescale the row to unit norm and multiply \
+                 its codes by the same norm, which leaves the reconstruction unchanged",
+                norm = squared_norm.sqrt(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Out-of-sample sparse-dictionary encode plus route-dispatch diagnostics.
 #[derive(Clone, Debug)]
 pub struct SparseDictTransform {
