@@ -1,5 +1,5 @@
 //! Solver configuration and the batched block-solve abstraction: BA solver
-//! modes, PCG/trust-region/mixed-precision/proximal options, diagnostics, and
+//! modes, PCG/trust-region/proximal options, diagnostics, and
 //! the [`BatchedBlockSolver`] trait with its CPU implementation.
 
 use super::*;
@@ -309,8 +309,6 @@ pub struct ArrowPcgDiagnostics {
     pub final_relative_residual: f64,
     /// Why the loop stopped.
     pub stopping_reason: PcgStopReason,
-    /// Mixed-precision certificate outcome for this solve.
-    pub mixed_precision_status: MixedPrecisionStatus,
     /// True exactly when the matrix-free reduced-Schur PCG algorithm was
     /// selected. This records the numerical owner independently of execution
     /// placement: CPU and device InexactPCG both set it, while dense Direct
@@ -335,19 +333,6 @@ pub struct ArrowPcgDiagnostics {
     /// (#1209). Distinct field so perf accounting never mistakes a host
     /// procedural matvec for true device execution.
     pub injected_host_procedural_matvec: bool,
-}
-
-/// Outcome of an opt-in mixed-precision arrow solve.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub enum MixedPrecisionStatus {
-    /// The caller did not request mixed precision or this solve mode cannot use it.
-    #[default]
-    Off,
-    /// The f32 factor solve was refined until the f64 backward-error certificate held.
-    Certified { refinement_steps: usize },
-    /// The kappa gate or solve shape rejected mixed precision and the f64 path ran.
-    /// The declining reason is logged at `info` level when the fallback fires.
-    F64Fallback,
 }
 
 /// PCG controls for BA's inexact reduced-camera-system solve.
@@ -468,49 +453,6 @@ impl ArrowPcgBudget {
     }
 }
 
-/// Opt-in Carson--Higham mixed-precision refinement for dense arrow solves.
-///
-/// Default is [`ArrowSolvePrecisionPolicy::F64Only`]: exact f64 solves remain the default.
-/// [`ArrowSolvePrecisionPolicy::CertifiedMixed`] stores f32 copies of the per-row Cholesky
-/// factors and dense Schur factor, solves corrections in f32, and recomputes the
-/// residual in f64 against the original arrow blocks. The standard refinement
-/// certificate is the normwise backward error
-///
-/// `||r||_inf / (||H||_inf ||x||_inf + ||b||_inf) <= residual_relative_tolerance`.
-///
-/// The kappa gate enforces `kappa_estimate * u_f32 < kappa_unit_roundoff_margin`;
-/// when it fails, the solve reports [`MixedPrecisionStatus::F64Fallback`] and
-/// logs the reason before using the f64 path.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum ArrowSolvePrecisionPolicy {
-    F64Only,
-    CertifiedMixed {
-        max_refinement_steps: usize,
-        residual_relative_tolerance: f64,
-        kappa_unit_roundoff_margin: f64,
-    },
-}
-
-impl Default for ArrowSolvePrecisionPolicy {
-    fn default() -> Self {
-        Self::F64Only
-    }
-}
-
-impl ArrowSolvePrecisionPolicy {
-    pub(crate) fn certified_mixed() -> Self {
-        Self::CertifiedMixed {
-            max_refinement_steps: DEFAULT_MIXED_PRECISION_MAX_REFINEMENTS,
-            residual_relative_tolerance: DEFAULT_MIXED_PRECISION_CERTIFICATE_TOLERANCE,
-            kappa_unit_roundoff_margin: DEFAULT_MIXED_PRECISION_KAPPA_MARGIN,
-        }
-    }
-
-    pub(crate) fn is_enabled(self) -> bool {
-        matches!(self, ArrowSolvePrecisionPolicy::CertifiedMixed { .. })
-    }
-}
-
 /// Conditioning contract for the undamped evidence cache.
 ///
 /// This is intentionally independent of Newton-step damping. Evidence may
@@ -610,8 +552,6 @@ pub struct ArrowSolveOptions {
     pub gpu_matvec: Option<GpuSchurMatvec>,
     /// Conditioning contract for the separately-built undamped evidence cache.
     pub evidence_policy: ArrowEvidencePolicy,
-    /// Arrow solve precision policy. Default is f64-only.
-    pub solve_precision: ArrowSolvePrecisionPolicy,
     /// Optional spectral positive-definiteness floor on the *reduced Schur
     /// complement* `S = H_ββ + ridge_β·I − Σ_i H_tβ^(i)ᵀ (H_tt^(i))⁻¹ H_tβ^(i)`,
     /// as a relative fraction of `S`'s largest eigenvalue.
@@ -671,7 +611,6 @@ impl std::fmt::Debug for ArrowSolveOptions {
             .field("riemannian_trust_region", &self.riemannian_trust_region)
             .field("gpu_matvec", &self.gpu_matvec.is_some())
             .field("evidence_policy", &self.evidence_policy)
-            .field("solve_precision", &self.solve_precision)
             .field(
                 "newton_schur_tikhonov_rel_floor",
                 &self.newton_schur_tikhonov_rel_floor,
@@ -751,7 +690,6 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             evidence_policy: ArrowEvidencePolicy::Strict,
-            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
@@ -770,7 +708,6 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             evidence_policy: ArrowEvidencePolicy::Strict,
-            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
@@ -788,7 +725,6 @@ impl ArrowSolveOptions {
             riemannian_trust_region: false,
             gpu_matvec: None,
             evidence_policy: ArrowEvidencePolicy::Strict,
-            solve_precision: ArrowSolvePrecisionPolicy::F64Only,
             newton_schur_tikhonov_rel_floor: None,
             sae_resident_frame: None,
         }
@@ -834,22 +770,6 @@ impl ArrowSolveOptions {
     pub fn with_newton_schur_tikhonov(mut self, relative_floor: f64) -> Self {
         self.newton_schur_tikhonov_rel_floor = Some(relative_floor);
         self
-    }
-
-    /// Turn certified mixed precision ON for the streaming/residency reduced
-    /// solve unless the caller already pinned an explicit policy (#1014).
-    ///
-    /// Only `F64Only` (the inherited default) is upgraded to `CertifiedMixed`;
-    /// a caller that deliberately set a policy keeps it. The reduced-Schur f64
-    /// factor and every evidence log-determinant are unaffected — see
-    /// `mixed_precision_reduced_beta`.
-    #[must_use]
-    pub(crate) fn with_streaming_solve_precision_default(&self) -> Self {
-        let mut out = self.clone();
-        if matches!(out.solve_precision, ArrowSolvePrecisionPolicy::F64Only) {
-            out.solve_precision = ArrowSolvePrecisionPolicy::certified_mixed();
-        }
-        out
     }
 }
 

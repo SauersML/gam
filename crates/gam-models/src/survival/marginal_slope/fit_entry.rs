@@ -1230,34 +1230,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()
         .map_err(FitFailure::input)?;
-    // Coordinate-cone time bases already encode monotonicity as β >= 0:
-    // validation proved D >= 0 and offsets absorb the derivative guard. Emitting
-    // row-wise `D β + o >= guard` constraints here duplicates the same condition
-    // as hundreds of dense rows and forces the generic active-set QP path. Use
-    // a single identity cone instead so the custom-family solver recognizes the
-    // simple lower-bound problem.
-    let time_linear_constraints = match spec.time_block.time_monotonicity {
-        monotonicity if monotonicity.is_coordinate_cone() => {
-            let p_total = design_exit.ncols();
-            LinearInequalityConstraints::from_per_coordinate_lower_bounds(&Array1::<f64>::zeros(
-                p_total,
-            ))
-        }
-        _ => {
-            let derivative_guard_constraints = time_derivative_guard_constraints(
-                &design_derivative_exit,
-                derivative_offset_exit.as_ref(),
-                derivative_guard,
-            )
-            .map_err(FitFailure::unclassified)?;
-            append_timewiggle_tail_nonnegative_constraints(
-                derivative_guard_constraints,
-                design_exit.ncols(),
-                derived_time_wiggle_ncols.unwrap_or(0),
-            )
-            .map_err(FitFailure::invariant)?
-        }
-    };
+    // The time block is a coordinate cone: validation proved D >= 0 and
+    // offsets >= guard, so β >= 0 implies `D β + o >= guard` at every row.
+    // A single identity cone lets the custom-family solver recognize the
+    // simple lower-bound problem instead of hundreds of dense row constraints.
+    let time_linear_constraints = LinearInequalityConstraints::from_per_coordinate_lower_bounds(
+        &Array1::<f64>::zeros(design_exit.ncols()),
+    );
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
     let flex_jet_arenas = new_flex_jet_arena_pool();
