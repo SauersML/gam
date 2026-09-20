@@ -1941,6 +1941,14 @@ impl SurvivalMarginalSlopeFamily {
             && !(self.flex_active() && self.slope_is_follow_up_varying())
     }
 
+    /// Whether the ζ composition serves the order-five sweeps: the Jeffreys third information
+    /// derivative and the ψ-mixed third information derivatives. The FLEX base carries a declared
+    /// latent law through its anchored timepoints (gam#2948); the rigid row reads the Gaussian
+    /// lowering's closed-form fifth tensor, which a declared law does not have (gam#3304).
+    pub(crate) fn timewiggle_zeta_fifth_available(&self) -> bool {
+        self.timewiggle_zeta_available() && (self.flex_active() || !self.anchored_law_active())
+    }
+
     /// Row `row`'s ζ value calculus for the design-ψ terms, from the FLEX row program when `flex`
     /// holds and from the rigid one otherwise.
     fn timewiggle_zeta_psi_row(
