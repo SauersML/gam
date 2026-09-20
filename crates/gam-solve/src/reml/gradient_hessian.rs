@@ -5848,19 +5848,32 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn reset_outer_seed_state(&self) {
-        self.cache_manager.invalidate_eval_bundle();
-        // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
-        self.cache_manager
-            .pirls_cache
-            .write()
-            .expect("PIRLS result cache lock poisoned")
-            .clear();
-        // The outer is restarting from a fresh seed — the previous
-        // trajectory's warm-start signals are calibrated to a different
-        // ρ-path and would mislead both predictors and the adaptive cap
-        // policies. Wipe in lockstep so the first solve at the new
-        // seed starts fully cold.
-        self.clear_warm_start_predictor_state();
+        if self.inner_mode_is_seed_independent() {
+            // Every inner solve, and every outer evaluation built on one, is a
+            // function of its key alone, so what the state already holds is what
+            // a cold restart would rebuild, bit for bit: the bundle, the PIRLS
+            // LRU, the outer-eval LRU and the warm start that publishes each
+            // evaluation's `inner_beta_hint` all survive. Their keys carry the
+            // inner cap, which still separates a capped screening solve from a
+            // terminal one. Only the previous-evaluation mirror is trajectory
+            // state, and it goes.
+            self.cache_manager.forget_previous_outer_eval();
+        } else {
+            self.cache_manager.invalidate_eval_bundle();
+            // Drop cross-call PIRLS LRU entries: cached β may have been computed under a coarsened inner cap, so reusing them on retry skips real work and bit-replays the prior attempt.
+            self.cache_manager
+                .pirls_cache
+                .write()
+                .expect("PIRLS result cache lock poisoned")
+                .clear();
+            // The outer is restarting from a fresh seed — the previous
+            // trajectory's warm-start signals are calibrated to a different
+            // ρ-path and would mislead the predictors. Wipe them so the first
+            // solve at the new seed starts fully cold.
+            self.clear_warm_start_predictor_state();
+        }
+        // The previous trajectory's adaptive signals would mislead the adaptive
+        // cap policies of the next one.
         self.clear_warm_start_adaptive_signals();
         // Inner-PIRLS iteration caps are cross-trajectory state: the
         // previous outer's first-order bridge writes `outer_inner_cap`
@@ -5870,6 +5883,14 @@ impl<'a> RemlState<'a> {
         // next outer is responsible for re-establishing any cap it wants
         // via its own bridge; zeroing here is the safe baseline.
         self.outer_inner_cap.store(0, Ordering::Relaxed);
+    }
+
+    /// Whether the inner mode at a key is a function of that key and the frozen
+    /// state alone. An eligible Gaussian-identity fit has no inner iteration: its
+    /// mode is one direct penalized least-squares solve, which no warm start,
+    /// adaptive signal or cap reaches.
+    fn inner_mode_is_seed_independent(&self) -> bool {
+        self.gaussian_fixed_cache_eligible()
     }
 
     // Accessor methods for private fields
@@ -6573,14 +6594,24 @@ impl<'a> RemlState<'a> {
             .load(Ordering::Relaxed);
         // Use sanitized key to handle NaN and -0.0 vs 0.0 issues
         let key_opt = self.rhokey_sanitized(rho);
+        // A request under an outer iteration cap is also answered by the mode
+        // certified uncapped at the same rho. The outer search probes a trial
+        // rho by value with no cap and then asks for the gradient there under
+        // its schedule's cap; without the stand-in that gradient re-ran P-IRLS
+        // to the mode already in the cache.
         if use_cache
             && let Some(key) = &key_opt
-            && let Some(cached) = self
-                .cache_manager
-                .pirls_cache
-                .write()
-                .expect("PIRLS result cache lock poisoned")
-                .get(key)
+            && let Some(cached) = {
+                let mut cache = self
+                    .cache_manager
+                    .pirls_cache
+                    .write()
+                    .expect("PIRLS result cache lock poisoned");
+                cache.get(key).or_else(|| {
+                    super::rho_key::uncapped_stand_in_key(key)
+                        .and_then(|uncapped| cache.get(&uncapped))
+                })
+            }
         {
             // Do not overwrite the current warm start from cache hits.
             // Line search / multi-eval outer loops revisit older rho keys and
@@ -9219,5 +9250,72 @@ mod firth_hessian_direction_reuse_tests {
                 "batched direct[{idx}] not bit-identical to per-direction at n={n}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod capped_request_cache_tests {
+    use super::super::super::RemlConfig;
+    use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
+    use ndarray::{Array1, array};
+
+    #[test]
+    fn capped_gradient_request_reuses_uncapped_mode_at_same_rho() {
+        // The outer search probes a trial rho by value with no inner cap, then
+        // asks for the gradient at that rho under its schedule's cap. The
+        // uncapped mode is already certified and cached, so the capped request
+        // must be answered from it rather than re-running P-IRLS: at n=1e4 the
+        // repeat solve was a third of every value+gradient pair.
+        use std::sync::atomic::Ordering;
+        let y = array![0.0, 1.0, 1.0, 0.0, 0.0, 1.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        let rho = array![0.0];
+        let cfg = RemlConfig::external(binomial_logit_glm_spec(), 1e-10, false);
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state
+            .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
+            .expect("uncapped value probe should succeed");
+        let uncapped = state
+            .execute_pirls_if_needed(&rho)
+            .expect("uncapped mode is cached");
+
+        // A fresh solve records its iteration count; a cache answer does not.
+        let untouched = usize::MAX;
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state.outer_inner_cap.store(5, Ordering::Relaxed);
+        let capped = state
+            .execute_pirls_if_needed(&rho)
+            .expect("capped request should succeed");
+
+        assert_eq!(
+            state.last_inner_iters.load(Ordering::Relaxed),
+            untouched,
+            "the capped request re-ran P-IRLS instead of reusing the uncapped mode"
+        );
+        assert_eq!(capped.beta_transformed.as_ref(), uncapped.beta_transformed.as_ref());
+
+        // The converse stays closed (#2309): a mode cached under a cap never
+        // answers an uncapped request.
+        let rho_capped_only = array![0.5];
+        state
+            .execute_pirls_if_needed(&rho_capped_only)
+            .expect("capped solve should succeed");
+        state.outer_inner_cap.store(0, Ordering::Relaxed);
+        state.last_inner_iters.store(untouched, Ordering::Relaxed);
+        state
+            .execute_pirls_if_needed(&rho_capped_only)
+            .expect("uncapped solve should succeed");
+        assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
 }

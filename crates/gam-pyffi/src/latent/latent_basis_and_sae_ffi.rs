@@ -1118,8 +1118,8 @@ fn structured_residual_pass_diagnostics_dict<'py>(
         item.set_item("gamma", d.gamma)?;
         item.set_item("factor_rank", d.factor_rank)?;
         item.set_item(
-            "bic_penalized_log_likelihood",
-            d.bic_penalized_log_likelihood,
+            "log_evidence",
+            d.log_evidence,
         )?;
         item.set_item("factor_energy", d.factor_energy)?;
         item.set_item("diagonal_mean", d.diagonal_mean)?;

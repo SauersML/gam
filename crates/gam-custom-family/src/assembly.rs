@@ -1892,38 +1892,6 @@ fn criterion_face_tangent(
     })
 }
 
-/// Evaluate the rho-only custom-family outer objective through the unified
-/// joint hyperpath with no external ψ coordinates attached.
-pub(crate) fn outerobjectivegradienthessian_internal<
-    F: CustomFamily + Clone + Send + Sync + 'static,
->(
-    family: &F,
-    specs: &[ParameterBlockSpec],
-    options: &BlockwiseFitOptions,
-    penalty_counts: &[usize],
-    rho: &Array1<f64>,
-    warm_start: Option<&ConstrainedWarmStart>,
-    rho_prior: gam_problem::RhoPrior,
-    eval_mode: EvalMode,
-) -> Result<OuterObjectiveEvalResult, CustomFamilyError> {
-    let hyper_layout = CustomFamilyHyperLayout::new(
-        vec![Vec::<CustomFamilyBlockPsiDerivative>::new(); specs.len()],
-        Vec::new(),
-        Array1::zeros(0),
-    )?;
-    evaluate_custom_family_hyper_internal(
-        family,
-        specs,
-        options,
-        penalty_counts,
-        rho,
-        &hyper_layout,
-        warm_start,
-        rho_prior,
-        eval_mode,
-    )
-}
-
 pub(crate) fn outerobjectiveefs<F: CustomFamily + Clone + Send + Sync + 'static>(
     family: &F,
     specs: &[ParameterBlockSpec],

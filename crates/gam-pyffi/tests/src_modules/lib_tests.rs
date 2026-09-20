@@ -577,8 +577,9 @@ fn load_model_rejects_payload_version_mismatch() {
         Err(e) => e,
     };
     assert!(
-        err.contains("saved model payload schema mismatch"),
-        "unexpected error: {err}"
+        matches!(err, gam::inference::model::FittedModelError::SchemaMismatch { .. })
+            && err.to_string().contains("saved model payload schema mismatch"),
+        "unexpected error: {err:?}"
     );
 }
 

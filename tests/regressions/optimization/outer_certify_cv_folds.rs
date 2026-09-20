@@ -11,6 +11,7 @@
 //! | `nearsep_n200` fold 0, 2   | `|Pg| 8.5e-3 > 2.2e-4`, `StepSizeTooSmall` |
 //! | `haberman` fold 2          | `|Pg| 7.5e-6 > 3.65e-6`, `hessian_psd=NO` |
 //! | `haberman` fold 4          | `|Pg| 6.99e-3 > 3.65e-6`                  |
+//! | `haberman` fold 0, `k = 20` | `|Pg| 5.709e-8 > 1.968e-10`, BFGS cost stall |
 //!
 //! The `nearsep` folds are the ones the repair in
 //! `Gam784BlockTarget::excess` addresses. The #784 block-local Gauss–Hermite
@@ -25,6 +26,11 @@
 //! The `binom_add4_n300` and `haberman` folds already certify on the code this
 //! regression was written against; they are kept so the certificate on the
 //! whole set the audit reported is pinned.
+//!
+//! `haberman` fold 0 at `k = 20` is the fold PR #3127's smoothing-correction
+//! tests fit (#3239). At a6731fd3 its search stalled on BFGS curvature at
+//! `|Pg| = 5.709e-8` against the per-coordinate gradient band's (#3190)
+//! `1.968e-10`, and the fit was refused.
 
 use csv::StringRecord;
 use gam::{FitConfig, encode_recordswith_inferred_schema, init_parallelism};
@@ -97,4 +103,12 @@ fn haberman_fold2_outer_certifies() {
 #[test]
 fn haberman_fold4_outer_certifies() {
     assert_fold_certifies("haberman_fold4", "y ~ s(age) + s(year) + s(nodes)");
+}
+
+#[test]
+fn haberman_k20_fold0_outer_certifies_3239() {
+    assert_fold_certifies(
+        "haberman_fold0",
+        "y ~ s(age, k=20) + s(year, k=20) + s(nodes, k=20)",
+    );
 }

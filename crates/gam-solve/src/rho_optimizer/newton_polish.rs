@@ -17,7 +17,7 @@ use ndarray::{Array1, Array2};
 /// What the mint's Newton polish reads from the certificate that decided to
 /// take it (#2954).
 pub(super) struct MintPolish<'a> {
-    pub(super) allow_tail_snap: bool,
+    pub(super) allow_certify_reseed: bool,
     pub(super) fidelity: CertificationFidelity,
     /// The polish this walk has taken so far, `None` on the first verdict.
     pub(super) polish: Option<PolishWalk>,
@@ -73,7 +73,7 @@ pub(super) fn polish_the_mint(
     inputs: MintPolish<'_>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let MintPolish {
-        allow_tail_snap,
+        allow_certify_reseed,
         fidelity,
         polish,
         decision,
@@ -150,7 +150,7 @@ pub(super) fn polish_the_mint(
                     config,
                     context,
                     result,
-                    allow_tail_snap,
+                    allow_certify_reseed,
                     fidelity,
                     record,
                     taken,
@@ -218,7 +218,7 @@ pub(super) fn polish_the_mint(
                             config,
                             context,
                             result,
-                            allow_tail_snap,
+                            allow_certify_reseed,
                             fidelity,
                             Some(PolishWalk { record, judged }),
                         );
@@ -282,7 +282,7 @@ pub(super) fn polish_the_mint(
                     config,
                     context,
                     result,
-                    allow_tail_snap,
+                    allow_certify_reseed,
                     fidelity,
                     record,
                     taken,
@@ -480,7 +480,7 @@ fn take_polish_step(
     config: &OuterConfig,
     context: &str,
     result: &mut OuterResult,
-    allow_tail_snap: bool,
+    allow_certify_reseed: bool,
     fidelity: CertificationFidelity,
     mut record: NewtonPolishRecord,
     taken: DampedNewtonStep,
@@ -513,7 +513,7 @@ fn take_polish_step(
         config,
         context,
         result,
-        allow_tail_snap,
+        allow_certify_reseed,
         fidelity,
         Some(PolishWalk { record, judged }),
     )
