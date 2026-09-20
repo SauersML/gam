@@ -3847,7 +3847,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 3,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4011,7 +4010,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 5,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4077,7 +4075,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 5,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4117,7 +4114,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             firth_bias_reduction: true,
             coefficient_lower_bounds: None,
@@ -4177,7 +4173,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 5,
             firth_bias_reduction: true,
             coefficient_lower_bounds: None,
@@ -4227,7 +4222,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4264,7 +4258,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4293,7 +4286,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 1,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4321,7 +4313,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 25,
             convergence_tolerance: 1e-6,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4358,7 +4349,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 1,
             convergence_tolerance: 1e-6,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 1,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4908,7 +4898,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,
@@ -4966,7 +4955,6 @@ mod root_cause_tests {
         let options = WorkingModelPirlsOptions {
             max_iterations: 2,
             convergence_tolerance: 1e-8,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 3,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,

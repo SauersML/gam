@@ -62,7 +62,6 @@ pub struct PersistentWarmStartRecord {
     pub last_inner_converged: bool,
     pub last_pirls_lm_lambda: Option<f64>,
     pub last_ift_prediction_residual: Option<f64>,
-    pub last_pirls_accept_rho: Option<f64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -195,7 +194,6 @@ impl PersistentWarmStartRecord {
             last_inner_converged: false,
             last_pirls_lm_lambda: None,
             last_ift_prediction_residual: None,
-            last_pirls_accept_rho: None,
         }
     }
 

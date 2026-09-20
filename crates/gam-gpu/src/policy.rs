@@ -347,7 +347,7 @@ impl GpuDispatchPolicy {
     pub const DEVICE_LOOP_MIN_P: usize = 32;
 
     /// Conservative admission predicate for routing
-    /// `fit_model_for_fixed_rho_with_adaptive_kkt` through the Stage 3.3
+    /// `fit_model_for_fixed_rho_configured` through the Stage 3.3
     /// device-resident PIRLS loop instead of the CPU LM loop.
     ///
     /// The threshold is the dense `XᵀWX` work estimate, not row count alone:

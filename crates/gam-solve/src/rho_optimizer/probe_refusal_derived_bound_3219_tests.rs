@@ -85,10 +85,8 @@ fn drive_refused_probes_3219(
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
-        outer_inner_cap: None,
+        inner_progress: None,
         first_order_evals: 0,
-        g_norm_initial: None,
-        last_g_norm: None,
         last_value_grad_rho: None,
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),

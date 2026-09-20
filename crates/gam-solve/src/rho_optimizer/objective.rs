@@ -261,17 +261,17 @@ pub trait OuterObjective {
     /// the certified value disagree by a whole basin (measured: `9.1931e2` vs
     /// `9.1671e2` on the cause-specific survival gate).
     ///
-    /// That terminal reset is otherwise gated on `config.outer_inner_cap`,
-    /// which the REML/mixture objectives wire but the custom-family (and any
-    /// other terminal-mode-owning closure) objective does not — it holds its
-    /// inner cap in a different field and leaves `outer_inner_cap` `None`, so
-    /// the reset never fires and the bitwise bind can spuriously fail on a
-    /// bimodal inner solve. Returning `true` here forces the terminal reset
-    /// *independently of the cap*, so `finalize` and `certify` provably come
-    /// from one fresh evaluation at `rho_star`. It deliberately does NOT touch
-    /// the `inner_solve_converged(config.outer_inner_cap)` gate: an objective
-    /// that owns a terminal mode but does not populate the cap's convergence
-    /// atomic keeps its own stateful convergence semantics.
+    /// That terminal reset (`terminal_state_is_reset`) is otherwise gated on
+    /// `config.inner_progress`, which the REML/mixture objectives wire but a
+    /// terminal-mode-owning closure objective need not, so without this hook
+    /// the reset would not fire and the bitwise bind could spuriously fail on
+    /// a bimodal inner solve. Returning `true` here forces the terminal reset
+    /// independently of the progress channel, so `finalize` and `certify`
+    /// provably come from one fresh evaluation at `rho_star`. It deliberately
+    /// does NOT touch the `inner_solve_converged(config.inner_progress)` gate:
+    /// an objective that owns a terminal mode but does not populate the
+    /// channel's convergence atomic keeps its own stateful convergence
+    /// semantics.
     ///
     /// The default is `false`: an objective that owns no terminal coefficient
     /// mode (the reactive-domain fixture among them) retains the very state its

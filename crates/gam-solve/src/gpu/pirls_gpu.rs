@@ -2003,7 +2003,7 @@ extern "C" __global__ void status_first_ladder(
 
     /// Optional host-side inputs that turn the bare GPU loop result
     /// into a full-surface `PirlsLoopOutcome` matching the CPU oracle
-    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    /// `fit_model_for_fixed_rho_configured`.
     ///
     /// When supplied, the postpass at loop exit runs the same host-side
     /// helpers the CPU oracle uses
@@ -2766,7 +2766,7 @@ extern "C" __global__ void status_first_ladder(
     /// weights; `compute_constraint_kkt_diagnostics` runs over the
     /// converged β and reconstructed penalised gradient. All of this
     /// is bit-identical to the corresponding CPU oracle code paths in
-    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    /// `fit_model_for_fixed_rho_configured`.
     fn build_loop_outcome(
         ws: &mut SigmaPirlsGpuWorkspace,
         loop_ws: &mut PirlsLoopWorkspace,

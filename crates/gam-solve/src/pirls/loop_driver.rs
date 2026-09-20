@@ -1,7 +1,7 @@
 //! Outer driver for a single fixed-ρ PIRLS fit.
 //!
 //! Owns:
-//! - `fit_model_for_fixed_rho` and `fit_model_for_fixed_rho_with_adaptive_kkt`
+//! - `fit_model_for_fixed_rho` and `fit_model_for_fixed_rho_configured`
 //!   — build the working model, run the inner LM loop, assemble the final result.
 //! - `PirlsProblem`, `PenaltyConfig`, `PirlsConfig` — the configuration types.
 //! - Helper functions exclusive to the fixed-ρ fitting path: constraint
@@ -12,7 +12,6 @@
 
 use super::{
     // state re-exports
-    AdaptiveKktTolerance,
     ExportedLaplaceCurvature,
     FirthDiagnostics,
     GamWorkingModel,
@@ -694,13 +693,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
 ) -> Result<(PirlsResult, WorkingModelPirlsResult), EstimationError> {
-    fit_model_for_fixed_rho_with_adaptive_kkt(
+    fit_model_for_fixed_rho_configured(
         rho,
         problem,
         penalty,
         config,
         warm_start_beta,
-        None,
         false,
         None,
     )
@@ -727,13 +725,12 @@ pub fn fit_model_for_fixed_rho<'a, X: Into<DesignMatrix> + Clone>(
 /// (μ ≈ 0.5) attenuates every slope toward zero; here the fixed point is
 /// load-bearing — it is what recovers the correct mean coefficients (the betareg
 /// alternating mean-fit ↔ φ-estimate scheme).
-pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix> + Clone>(
+pub(crate) fn fit_model_for_fixed_rho_configured<'a, X: Into<DesignMatrix> + Clone>(
     rho: LogSmoothingParamsView<'_>,
     problem: PirlsProblem<'a, X>,
     penalty: PenaltyConfig<'_>,
     config: &PirlsConfig,
     warm_start_beta: Option<&Coefficients>,
-    adaptive_kkt_tolerance: Option<AdaptiveKktTolerance>,
     refine_dispersion_at_converged_eta: bool,
     // Shared invariant row carrier for a Gaussian value-only evaluation.
     //
@@ -1562,7 +1559,6 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         // the caller's `max_iterations` and trips as a hard error if exceeded.
         max_iterations: config.max_iterations,
         convergence_tolerance: config.convergence_tolerance,
-        adaptive_kkt_tolerance,
         // LM step-halving is a per-iteration damping retry budget; it is
         // independent of the total outer-iteration cap. Tying the two
         // together collapsed step halving to 3 under a low outer-imposed

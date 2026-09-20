@@ -59,7 +59,6 @@ fn pirls_leaves_an_exact_symmetric_saddle_3318() {
     let options = WorkingModelPirlsOptions {
         max_iterations: 200,
         convergence_tolerance: 1e-8,
-        adaptive_kkt_tolerance: None,
         max_step_halving: 30,
         firth_bias_reduction: false,
         coefficient_lower_bounds: None,
@@ -101,7 +100,6 @@ fn pirls_certifies_a_positive_definite_minimum_unchanged_3318() {
     let options = WorkingModelPirlsOptions {
         max_iterations: 200,
         convergence_tolerance: 1e-8,
-        adaptive_kkt_tolerance: None,
         max_step_halving: 30,
         firth_bias_reduction: false,
         coefficient_lower_bounds: None,

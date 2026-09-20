@@ -5482,24 +5482,18 @@ pub(crate) struct EvalCacheManager {
     pub(crate) pirls_cache: RwLock<PirlsLruCache>,
     pub(crate) penalty_subspace_cache: RwLock<PenaltySubspaceCache>,
     pub(crate) current_eval_bundle: RwLock<Option<EvalShared>>,
-    /// Most-recently-*stored* outer eval (single slot). Retained verbatim so
-    /// `previous_outer_gradient_norm` keeps its exact "immediately previous
-    /// distinct eval" semantics, independent of the multi-slot reuse cache.
-    pub(crate) current_outer_eval: RwLock<Option<(Vec<u64>, OuterEval)>>,
     /// Bounded multi-slot LRU of converged outer evaluations keyed by the
-    /// sanitized rho-bits and the active inner-solve caps (#1575/#2309).
+    /// sanitized rho-bits (#1575).
     ///
     /// For a frozen `RemlState` (fixed design, prior weights, offset, penalty
     /// structure, link state, Firth/Jeffreys configuration, and rho-prior — all
     /// of which are immutable for the lifetime of the state that owns this
     /// manager and therefore the lifetime of the cache), the remaining
-    /// result-determining state is `(rho, outer_cap)`. The cap suffix is
-    /// essential because a search-time partial inner mode and the terminal
-    /// uncapped mode can share bit-identical rho.
-    /// Line searches and certification probes revisit earlier rho-points;
-    /// with only the single `current_outer_eval` slot, any revisit re-ran a
-    /// full n-sized P-IRLS. This LRU returns the stored cost/gradient for
-    /// those revisited rho-points.
+    /// result-determining input is `rho`: every inner solve runs at one
+    /// fidelity (#3536), so a value and a gradient request at one rho share an
+    /// inner mode. Line searches and certification probes revisit earlier
+    /// rho-points; this LRU returns the stored cost/gradient for them instead
+    /// of re-running a full n-sized P-IRLS.
     pub(crate) outer_eval_lru: RwLock<OuterEvalLru>,
     pub(crate) pirls_cache_enabled: AtomicBool,
 }
@@ -5512,7 +5506,6 @@ impl EvalCacheManager {
             pirls_cache: RwLock::new(PirlsLruCache::new(pirls_cache_byte_budget)),
             penalty_subspace_cache: RwLock::new(PenaltySubspaceCache::new()),
             current_eval_bundle: RwLock::new(None),
-            current_outer_eval: RwLock::new(None),
             outer_eval_lru: RwLock::new(OuterEvalLru::new(OUTER_EVAL_LRU_CAPACITY)),
             pirls_cache_enabled: AtomicBool::new(true),
         }
@@ -5584,12 +5577,6 @@ impl EvalCacheManager {
 
     pub(crate) fn store_outer_eval(&self, key: &Option<Vec<u64>>, eval: &OuterEval) {
         if let Some(key) = key.clone() {
-            // Keep the single-slot mirror for `previous_outer_gradient_norm`,
-            // whose "immediately previous distinct eval" contract reads it
-            // directly and must stay byte-for-byte unchanged.
-            *self.current_outer_eval.write().expect(
-                "current outer eval lock is poisoned: a writer panicked while holding it",
-            ) = Some((key.clone(), eval.clone()));
             self.outer_eval_lru
                 .write()
                 .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
@@ -5602,20 +5589,10 @@ impl EvalCacheManager {
             .write()
             .expect("current eval bundle lock is poisoned: a writer panicked while holding it")
             .take();
-        self.forget_previous_outer_eval();
         self.outer_eval_lru
             .write()
             .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
             .clear();
-    }
-
-    /// Drop the single-slot mirror of the previous outer evaluation, which a
-    /// new trajectory must not inherit, and keep every keyed cache.
-    pub(crate) fn forget_previous_outer_eval(&self) {
-        self.current_outer_eval
-            .write()
-            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
-            .take();
     }
 
     pub(crate) fn clear_eval_and_factor_caches(&self) {
@@ -5807,30 +5784,14 @@ pub(crate) struct RemlState<'a> {
     pub(crate) ift_joint_mode_response_slot:
         std::sync::Mutex<Option<outer_eval::IftJointModeResponseRuntimeCache>>,
     pub(crate) warm_start_enabled: AtomicBool,
-    /// Outer-aware inner-PIRLS iteration cap for the main descent loop.
-    ///
-    /// This atomic is purely a cap — when nonzero, the inner Newton loop is capped at
-    /// `min(this, full_max_iterations)`, but cache writes and warm-start
-    /// updates remain enabled. Driven by the outer optimizer to coarsen
-    /// inner solves at early outer iterations when ρ is far from converged,
-    /// and lifted back to full at the final accepted iter (otherwise the
-    /// returned β would be biased by the loose cap).
-    ///
-    /// Default 0 (no cap).
-    pub(crate) outer_inner_cap: Arc<AtomicUsize>,
-
     /// Inner-PIRLS feedback signal driven by `execute_pirls_if_needed` after
-    /// each inner solve. Stores the iteration count at which the
-    /// inner Newton stopped, plus a flag indicating whether it converged
-    /// (vs. hit the iteration cap). The outer first-/second-order bridges
-    /// read these atomics to drive an adaptive `inner_cap_schedule`: the
-    /// next outer iter's inner cap becomes `last_iters + small_margin`
-    /// when the previous solve converged, or a geometric backoff when it
-    /// hit the cap. This replaces the older hardcoded iter-tier schedule
-    /// (3/5/10/20) with a cap that follows the inner solver's actual
-    /// convergence behavior — Eisenstat-Walker style for the inner
-    /// quadratic loop. Default 0 / false (no signal yet — first outer
-    /// iter falls back to a coarse iter-count tier).
+    /// each inner solve: the iteration count at which the inner Newton
+    /// stopped, and whether it converged. The outer bridges read
+    /// `last_inner_converged` (through `InnerProgressFeedback`) so a
+    /// stationarity certificate is never issued at a non-converged inner
+    /// mode; `last_inner_iters == 0` means no solve has reported yet. The
+    /// outer never uses them to limit the inner iteration budget (#3536).
+    /// Default 0 / false.
     pub(crate) last_inner_iters: Arc<AtomicUsize>,
     pub(crate) last_inner_converged: Arc<AtomicBool>,
 
@@ -5958,22 +5919,6 @@ pub(crate) struct RemlState<'a> {
     /// faithfulness of the linearization at this surface's scale.
     /// Reset on `reset_surface` and on failed solves.
     pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
-
-    /// Last observed gain ratio of the accepted LM step
-    /// (`actual_reduction / predicted_reduction`) from the most recent
-    /// PIRLS solve. Bit-packed `f64` with the same NaN
-    /// sentinel discipline as `last_ift_prediction_residual`: NaN bits
-    /// (`IFT_RESIDUAL_NO_SIGNAL_BITS`) encode "no signal yet" so a
-    /// recorded ratio of exactly 0 (degenerate but possible) doesn't
-    /// collide with the no-signal token.
-    ///
-    /// Used by `first_order_inner_cap_schedule` as a third quality
-    /// signal alongside `last_iters` and `last_converged`. A small
-    /// `accept_rho` (model overstating predicted reduction) is a hint
-    /// the next iter's inner Newton may need extra margin even when
-    /// the previous solve converged in few iters. Reset on
-    /// `reset_surface` and on failed solves.
-    pub(crate) last_pirls_accept_rho: Arc<AtomicU64>,
 
     /// Cached Cholesky factorization of `IftWarmStartCache::penalized_hessian_transformed`.
     /// Lazily computed on the first IFT predict call after a fresh

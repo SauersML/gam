@@ -66,7 +66,6 @@ fn terminal_face_decrement_certifies_a_representable_quadratic_minimum() {
             // branch has not evaluated that final point.
             max_iterations: 1,
             convergence_tolerance: 1e-11,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 4,
             firth_bias_reduction: false,
             coefficient_lower_bounds: lower_bounds,

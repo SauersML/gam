@@ -3,9 +3,13 @@ use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
 pub(crate) const TK_BLOCK_SIZE: usize = 128;
 
-pub(crate) const ADAPTIVE_KKT_ETA: f64 = 0.1;
-
-pub(crate) const ADAPTIVE_KKT_FLOOR_REML_DIVISOR: f64 = 100.0;
+/// Ratio between the outer REML tolerance and the inner P-IRLS KKT tolerance
+/// every inner solve is certified at (#3536). The outer gradient is the
+/// envelope derivative at the inner mode, so an inner residual of size `r`
+/// perturbs it at first order in `r`; resolving the inner mode two orders
+/// below the outer tolerance keeps that perturbation out of the outer
+/// stationarity decision.
+pub(crate) const INNER_KKT_REML_DIVISOR: f64 = 100.0;
 
 pub(crate) const IFT_QUALITY_HISTORY_CAP: usize = 5;
 

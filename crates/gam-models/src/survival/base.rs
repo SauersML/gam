@@ -4873,7 +4873,6 @@ mod tests {
         let options = gam_solve::pirls::WorkingModelPirlsOptions {
             max_iterations: 400,
             convergence_tolerance: crate::survival::SURVIVAL_LAML_STATIONARITY_RELATIVE_TOL,
-            adaptive_kkt_tolerance: None,
             max_step_halving: 40,
             firth_bias_reduction: false,
             coefficient_lower_bounds: None,

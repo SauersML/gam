@@ -268,7 +268,7 @@ pub fn fit_nested_at_fitted_log_lambdas(
             .as_pirls_config();
     config.link_kind = link_kind;
 
-    let solved = pirls::fit_model_for_fixed_rho_with_adaptive_kkt(
+    let solved = pirls::fit_model_for_fixed_rho_configured(
         LogSmoothingParamsView::new(rho.view())?,
         pirls::PirlsProblem {
             x: &x_fit,
@@ -287,7 +287,6 @@ pub fn fit_nested_at_fitted_log_lambdas(
             linear_constraints_original: fit_constraints.as_ref(),
         },
         &config,
-        None,
         None,
         // As in the full fit's final solve: refine the dispersion the inner
         // solve owns at the converged η.

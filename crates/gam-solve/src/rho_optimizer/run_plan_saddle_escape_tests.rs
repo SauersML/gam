@@ -15,11 +15,11 @@ use ndarray::array;
 // a nonconvex / bimodal inner solve those two evaluations can land in
 // DIFFERENT coefficient basins unless each re-installs from the same clean
 // baseline through `reset()`. That reset was gated solely on
-// `config.outer_inner_cap.is_some()`, which the custom-family fit never sets
-// (it holds its inner cap in a different field), so the reset never fired and
-// the downstream bitwise bind `terminal_mode.objective == final_value` could
-// spuriously fail. `owns_terminal_coefficient_mode()` now forces that reset
-// independently of the cap.
+// `config.inner_progress.is_some()`, which a mode-owning closure objective
+// need not wire, so the reset never fired and the downstream bitwise bind
+// `terminal_mode.objective == final_value` could spuriously fail.
+// `owns_terminal_coefficient_mode()` now forces that reset independently of
+// the progress channel.
 
 /// A deterministic stand-in for a warm-start-sensitive bimodal inner solve.
 ///
@@ -223,10 +223,10 @@ fn terminal_reset_binds_bimodal_mode_owner_bitwise() {
 
 #[test]
 fn without_ownership_flag_bimodal_terminal_bind_fails() {
-    // WITHOUT the flag (and no outer_inner_cap wired, exactly the custom-family
-    // situation): no terminal reset, so finalize and the certifying re-eval are
-    // one warm-parity flip apart and settle in different basins — a whole-basin
-    // bitwise mismatch, i.e. the spurious bind failure this fix removes.
+    // WITHOUT the flag (and no inner_progress wired): no terminal reset, so
+    // finalize and the certifying re-eval are one warm-parity flip apart and
+    // settle in different basins — a whole-basin bitwise mismatch, i.e. the
+    // spurious bind failure this fix removes.
     let (installed, final_value) = run_bimodal_terminal(false);
     assert_ne!(
         installed.to_bits(),

@@ -85,7 +85,6 @@ pub(crate) use working_model_trait::*;
 pub use workspace::*;
 
 // ── Pre-existing real-submodule re-exports (visibility preserved) ─────────────
-use convergence::effective_kkt_tolerance;
 
 use damping::{
     add_scaled_diagonal_to_upper_sparse, compute_lm_d2, update_scaled_diagonal_in_place,
@@ -120,7 +119,7 @@ pub use state::{array1_l2_norm, penalized_gradient_natural_scale, relative_gradi
 pub use working_model_trait::WorkingModel;
 
 pub use state::{
-    AdaptiveKktTolerance, ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
+    ExportedLaplaceCurvature, FirthDiagnostics, HessianCurvatureKind,
     PirlsCoordinateFrame, PirlsLinearSolvePath, PirlsResult, PirlsStatus,
     WorkingModelIterationInfo, WorkingModelPirlsResult, WorkingState,
 };
@@ -128,12 +127,12 @@ pub use state::{
 // loop_driver owns: default_beta_guess_external, solve_intercept_for_prevalence,
 // assemble_pirls_result, canonical_prior_shift,
 // PirlsProblem, PenaltyConfig, fit_model_for_fixed_rho,
-// fit_model_for_fixed_rho_with_adaptive_kkt, PirlsConfig, make_reparam_operator,
+// fit_model_for_fixed_rho_configured, PirlsConfig, make_reparam_operator,
 // build_transformed_lower_bound_constraints*, build_transformed_linear_constraints*,
 // merge_linear_constraints, sparse_from_denseview.
 use loop_driver::assert_symmetric_tol;
 
-pub(crate) use loop_driver::{fit_model_for_fixed_rho_with_adaptive_kkt, start_working_weights};
+pub(crate) use loop_driver::{fit_model_for_fixed_rho_configured, start_working_weights};
 
 pub use loop_driver::{
     PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,

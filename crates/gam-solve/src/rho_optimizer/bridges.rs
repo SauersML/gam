@@ -4,27 +4,12 @@ use opt::{BacktrackConfig, backtracking_line_search};
 pub(crate) struct OuterFirstOrderBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
     pub(crate) layout: OuterThetaLayout,
-    /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
-    /// a coarsen-then-tighten cap into it on every accepted gradient eval
-    /// (see `first_order_inner_cap_schedule`).
-    ///
-    /// The cap is a perf optimization for the GRADIENT inner solve only: at
-    /// the accepted ρ the warm-start is excellent, so a small cap converges
-    /// the inner Newton and a still-non-converged result is honestly rejected
-    /// as infeasible. But the line-search COST probe (`eval_cost`) evaluates a
-    /// DIFFERENT trial ρ whose warm-start is worse; the same small cap can stop
-    /// the inner solve short of its fixed point, returning a non-converged
-    /// `f64::INFINITY` cost for a point that is actually feasible. With every
-    /// trial step then reporting `∞`, no Wolfe/ARC step satisfies descent, the
-    /// optimizer never leaves the accepted ρ, and the gradient re-evaluated
-    /// there is identical iter after iter — the frozen-|g| outer stall in
-    /// gam#787 (bernoulli matern marginal-slope) and gam#808 (survival
-    /// marginal-slope). The line-search cost MUST be the same converged-inner
-    /// objective the analytic envelope gradient differentiates; a capped
-    /// surrogate is a different objective. So `eval_cost` UNCAPS the inner solve
-    /// (stores `0` = full `pirls_config.max_iterations`) before delegating, and
-    /// `eval_grad`/`eval_hessian` restore the scheduled cap on the next call.
-    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
+    /// Inner-PIRLS progress channel (see `InnerProgressFeedback`). The bridge
+    /// reads the last inner solve's convergence report for the stationarity
+    /// certificate and raises the STUCK-stall cold re-evaluation pulse; it
+    /// never truncates the inner solve (#3536), so the line-search cost and
+    /// the gradient are evaluated at the same converged-inner objective.
+    pub(crate) inner_progress: Option<InnerProgressFeedback>,
     /// Counts gradient EVALUATIONS, which is not the same thing as outer
     /// iterations and is why this is no longer called `iter_count` (#2613): the
     /// Strong-Wolfe search evaluates the gradient at every trial that clears
@@ -37,17 +22,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// "no gradient evaluation has ever succeeded on this seed" probe-refusal
     /// gate, both of which want evaluations.
     pub(crate) first_order_evals: usize,
-    /// First observed `‖g‖` from `eval_grad`. Used by the schedule to
-    /// compute the gradient-ratio (`last / initial`) — when the ratio
-    /// drops, the optimizer is approaching convergence and the inner
-    /// cap should lift to full so the cached β is at full tolerance.
-    pub(crate) g_norm_initial: Option<f64>,
-    /// `‖g‖` from the most recent eval. Stale by one outer iter relative
-    /// to the cap that consumes it (the cap is set BEFORE the new eval),
-    /// but for monotone-decreasing g_norm this is safe — it makes the
-    /// cap conservatively LARGER than the truly-needed value, never
-    /// smaller.
-    pub(crate) last_g_norm: Option<f64>,
     /// Most recent derivative-evaluation point. Value-only line-search probes
     /// log their distance from this reference so hidden backtracking work is
     /// visible in STAGE traces.
@@ -960,9 +934,7 @@ impl CostStallGuard {
             // ridge would anchor the best to the overfit forever) and do NOT
             // judge it a stall, so the optimizer keeps stepping until a
             // fully-converged inner solve lands a trustworthy (cost, gradient)
-            // pair. The bridge separately uncaps the inner solve when it detects
-            // a stuck stall, so subsequent solves do converge and the best-so-far
-            // tracks an honest iterate.
+            // pair.
             self.infeasible_streak = 0;
             self.record_window_trial(rho);
             return CostStallVerdict::Continue;
@@ -1732,17 +1704,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         // call that lands here is a real line-search probe, not a too-far
         // attempt the bridge needs to swat away.
         //
-        // Uncap the inner solve for the line-search cost probe (see the field
-        // doc on `outer_inner_cap`): the deciding cost MUST be the true
-        // converged-inner objective the analytic gradient differentiates, not
-        // the scheduled gradient-path cap which can stop a trial-ρ inner solve
-        // short of its fixed point and report a spurious `∞`. `eval_grad`
-        // restores the scheduled cap on the next call.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            feedback
-                .cap
-                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
-        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
@@ -1956,53 +1917,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
-        // Drive the outer-aware inner-PIRLS cap from accepted outer
-        // iterations, BEFORE invoking the inner solve. Cap stays fixed
-        // within line-search cost probes (`eval_cost` never touches the
-        // atomic). A cap of 0 means "no cap from this source"; the inner
-        // solver still honors `pirls_max_iterations`.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
-                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
-                _ => None,
-            };
-            let snapshot = feedback.snapshot();
-            let accepted_iter = feedback.accepted_iter.load(Ordering::Relaxed);
-            let cap = first_order_inner_cap_schedule(accepted_iter, g_ratio, snapshot);
-            let prev = feedback.cap.swap(cap, Ordering::Relaxed);
-            if prev != cap {
-                let ratio_str = match g_ratio {
-                    Some(r) => format!("{:.3e}", r),
-                    None => "n/a".to_string(),
-                };
-                let snap_str = match snapshot {
-                    Some(s) => format!(
-                        "last_iters={} converged={} ift_residual={} accept_rho={}",
-                        s.last_iters,
-                        s.last_converged,
-                        match s.last_ift_residual {
-                            Some(r) => format!("{:.3e}", r),
-                            None => "n/a".to_string(),
-                        },
-                        match s.last_accept_rho {
-                            Some(r) => format!("{:.3}", r),
-                            None => "n/a".to_string(),
-                        },
-                    ),
-                    None => "no-history".to_string(),
-                };
-                log::debug!(
-                    "[OUTER schedule] inner-PIRLS cap transition accepted_iter={} eval_count={} g_ratio={} {} prev={} new={} ({})",
-                    accepted_iter,
-                    self.first_order_evals,
-                    ratio_str,
-                    snap_str,
-                    prev,
-                    cap,
-                    if cap == 0 { "uncapped" } else { "capped" }
-                );
-            }
-        }
         let stage_start = std::time::Instant::now();
         log::debug!(
             "[STAGE] outer eval start order=ValueAndGradient dim={} (first-order bridge, eval={})",
@@ -2049,12 +1963,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         };
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         let gradient = eval.gradient;
-        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
-            self.g_norm_initial = Some(g_norm);
-        }
-        if g_norm.is_finite() {
-            self.last_g_norm = Some(g_norm);
-        }
         self.last_value_grad_rho = Some(x.clone());
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
@@ -2085,10 +1993,10 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // A non-finite / non-converged inner solve makes the reported
         // cost/gradient untrustworthy; the guard must not record it as
         // best-so-far nor count it toward a stall. `None` (no feedback wired)
-        // defaults to `true` so routes without inner-cap feedback are unchanged.
+        // defaults to `true` so routes without inner-progress feedback are unchanged.
         // It is captured HERE rather than at fold time because the snapshot is
         // only valid immediately after this ρ's solve.
-        let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
+        let inner_converged = inner_solve_converged(self.inner_progress.as_ref());
         if let Some(guard) = self.cost_stall.as_ref() {
             let resolution = guard.value_resolution(eval.cost, &evidence);
             // The stall guard's stationarity test must use the bound-PROJECTED
@@ -2096,7 +2004,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             // separation fit pins log-λ directions at the bound with a
             // persistent out-of-bounds ∂V/∂ρ that inflates the raw norm forever
             // and otherwise blocks the converged verdict (#1082). The raw
-            // `g_norm` is kept for the inner-cap schedule / logging.
+            // `g_norm` is kept for logging.
             // Measured against the rail-relaxed box, the same one the terminal
             // certificate uses (#2412): a coordinate creeping onto the ceiling
             // must not keep an outward pull here that certification discards,
@@ -2295,18 +2203,15 @@ impl OuterFirstOrderBridge<'_> {
                     // above tolerance — a stuck stall from an inconsistent
                     // (non-converged inner solve) objective/gradient, NOT a flat
                     // valley. Do NOT halt: keep descending so the optimizer can
-                    // climb out toward the well-penalized optimum. UNCAP the
-                    // inner PIRLS so the next solves run to full tolerance — the
-                    // stuck state is caused by the inner cap stopping PIRLS short
-                    // of its fixed point, leaving the cost and the analytic
-                    // gradient inconsistent; an uncapped solve restores a
-                    // trustworthy gradient the outer step can actually use.
-                    // #2349: raise the cold-reeval pulse alongside the uncap. It
-                    // reaches objectives that subscribe to it (today the custom
-                    // family, through `OuterProblem::with_stuck_stall_cold_reeval_signal`)
-                    // and is inert on every other route (`InnerProgressFeedback::force_cold`).
-                    if let Some(feedback) = self.outer_inner_cap.as_ref() {
-                        feedback.cap.store(0, Ordering::Relaxed);
+                    // climb out toward the well-penalized optimum. Every inner
+                    // solve already runs to its residual tolerance (#3536), so
+                    // the remaining inconsistency is warm-start hysteresis on a
+                    // near-flat inner ridge (#2349): raise the cold-reeval pulse.
+                    // It reaches objectives that subscribe to it (today the
+                    // custom family, through
+                    // `OuterProblem::with_stuck_stall_cold_reeval_signal`) and is
+                    // inert on every other route (`InnerProgressFeedback::force_cold`).
+                    if let Some(feedback) = self.inner_progress.as_ref() {
                         feedback.force_cold.store(true, Ordering::Relaxed);
                     }
                     log::debug!(
@@ -2371,214 +2276,31 @@ impl OuterFirstOrderBridge<'_> {
     }
 }
 
-/// Outer gradient-decay ratio `‖g_now‖/‖g_initial‖` below which the outer is
-/// treated as essentially converged: the inner cap is lifted entirely so the
-/// cached β reaches full inner tolerance before the convergence guard runs.
-pub(crate) const INNER_CAP_CONVERGENCE_OVERRIDE_RATIO: f64 = 0.01;
-
-/// Floor on the adaptive inner-PIRLS cap. Any cap below this is below the
-/// inner-Newton noise level and would reject usable warm-started steps.
-pub(crate) const INNER_CAP_FLOOR: usize = 3;
-
-/// Ceiling on the adaptive inner-PIRLS cap, set at the inner-Newton noise
-/// floor at large scale; further iterations are pure waste once the warm
-/// start is close.
-pub(crate) const INNER_CAP_CEILING: usize = 64;
-
-/// Adaptive inner-PIRLS cap schedule. Replaces the older hardcoded
-/// iter-tier (3/5/10/20) and ratio-tier (0.50/0.20/0.05/0.01) schedule
-/// with a cap driven by the inner solver's actual convergence behavior
-/// — Eisenstat-Walker style for the inner Newton.
-///
-/// Inputs:
-/// - `accepted_iters`: outer iter index, used only as a fallback when no
-///   inner-progress feedback has arrived yet (first 1-2 outer iters).
-/// - `g_ratio`: outer gradient-norm decay `‖g_now‖ / ‖g_initial‖`. When
-///   this drops below 1% the outer is essentially converged; we lift
-///   the cap fully so the cached β is at full inner tolerance and the
-///   convergence guard does not have to re-pay a full inner solve.
-/// - `last`: snapshot from `InnerProgressFeedback`. When present and
-///   the previous solve converged, we set the cap to `last_iters + 2`
-///   (a small margin in case ρ moved enough to need a couple more
-///   iters); when the previous solve hit the cap, we double — a
-///   geometric backoff that recovers from too-tight a cap without
-///   thrashing.
-///
-/// A cap of 0 means "no cap from this source"; the inner solver still
-/// honors `pirls_max_iterations`. The cap is
-/// floored at 3 (anything less is below noise) and ceilinged at 64
-/// (the inner noise floor at large scale; further iters would be
-/// pure waste).
 /// Did the inner PIRLS for the most recent outer eval converge?
 ///
-/// Reads the inner-progress feedback snapshot the cap schedule already consumes.
-/// Returns the snapshot's `last_converged` flag, defaulting to `true` when there
+/// Returns the feedback's `last_converged` flag, defaulting to `true` when there
 /// is no feedback wired (`feedback == None`) or no inner solve has reported yet
-/// (`snapshot() == None`, e.g. the very first outer eval). Defaulting to `true`
-/// keeps routes without inner-cap feedback — and the cold-start iterate — on
-/// their existing behavior; the #1426 guard only *withholds trust* from an
+/// (`last_iters == 0`, e.g. the very first outer eval). Defaulting to `true`
+/// keeps routes without inner-progress feedback — and the cold-start iterate —
+/// on their existing behavior; the #1426 guard only *withholds trust* from an
 /// iterate KNOWN to have a non-converged inner solve, it never invents distrust.
 ///
-/// IMPORTANT: this must be read AFTER the outer eval has run (so the feedback
+/// IMPORTANT: this must be read AFTER the outer eval has run, so the feedback
 /// atomics, set by `execute_pirls_if_needed` post-solve, describe the solve at
-/// the current ρ), and BEFORE the next eval's cap is computed.
+/// the current ρ.
 pub(crate) fn inner_solve_converged(feedback: Option<&InnerProgressFeedback>) -> bool {
-    match feedback.and_then(InnerProgressFeedback::snapshot) {
-        Some(snap) => snap.last_converged,
-        None => true,
+    match feedback {
+        Some(feedback) if feedback.last_iters.load(Ordering::Relaxed) != 0 => {
+            feedback.last_converged.load(Ordering::Relaxed)
+        }
+        _ => true,
     }
 }
-
-pub(crate) fn first_order_inner_cap_schedule(
-    accepted_iters: usize,
-    g_ratio: Option<f64>,
-    last: Option<InnerProgressSnapshot>,
-) -> usize {
-    // Convergence override: when the outer is essentially converged the
-    // cached β must be at full inner tolerance. This belt-and-suspenders
-    // path is independent of inner-progress history because the outer
-    // re-evaluation guard pays a full inner solve anyway — uncapping
-    // here just avoids one wasted iter at low cap before the guard.
-    if matches!(g_ratio, Some(r) if r < INNER_CAP_CONVERGENCE_OVERRIDE_RATIO) {
-        return 0;
-    }
-
-    // Adaptive path: drive the cap from the inner solver's prior iter
-    // count rather than a hardcoded tier.
-    if let Some(snap) = last {
-        let next = if snap.last_converged {
-            // Converged in `last_iters` last time; pick a small margin
-            // for ρ-step variability. The IFT predictor's residual
-            // tells us how close the warm-start was to the KKT point:
-            //   residual < 0.01  → next solve starts essentially AT the
-            //                      KKT β, so +1 iter of margin suffices.
-            //   residual < 0.10  → +2 (default, current behavior).
-            //   residual ≥ 0.10  → predictor was poor (or fell back to
-            //                      flat); the inner Newton has more
-            //                      recovery work, so +4 to be safe.
-            //   None             → no signal yet → +2 (default).
-            // This wires the [IFT-QUALITY] feedback directly into the
-            // adaptive cap, replacing the previous fixed +2.
-            let mut margin = match snap.last_ift_residual {
-                Some(r) if r < 0.01 => 1usize,
-                Some(r) if r >= 0.10 => 4usize,
-                _ => 2usize,
-            };
-            // LM model fidelity (commit 6445c079): if the previous
-            // solve's accepted gain ratio was poor (model overstating
-            // predicted reduction), the inner Newton's quadratic model
-            // is unreliable. Bump margin by +2 — even a fast-converged
-            // previous iter (small `last_iters`) provides weaker
-            // evidence about the next solve's required effort when the
-            // model is mis-calibrated. Threshold 0.5 is the textbook
-            // "good agreement" cutoff for trust-region gain ratios.
-            if matches!(snap.last_accept_rho, Some(r) if r < 0.5) {
-                margin = margin.saturating_add(2);
-            }
-            snap.last_iters.saturating_add(margin)
-        } else {
-            // Hit the cap. Geometric backoff so we don't thrash on a
-            // marginally-too-tight cap, but enforce floor of
-            // last_iters+4 to actually grow.
-            //
-            // LM-fidelity escalation: if the previous solve's accepted
-            // gain ratio was VERY poor (`accept_rho < 0.3`), the LM
-            // model is severely mis-calibrated — doubling the cap may
-            // not give the inner Newton enough headroom to find a
-            // usable trust radius. Triple instead of doubling so we
-            // don't waste another cycle hitting the cap. The 0.3
-            // threshold is tighter than the +2-margin trigger (0.5)
-            // because here we ALREADY know the iter budget was
-            // insufficient AND the model was poor — both signals
-            // pointing the same way.
-            let multiplier = if matches!(snap.last_accept_rho, Some(r) if r < 0.3) {
-                3
-            } else {
-                2
-            };
-            snap.last_iters
-                .saturating_mul(multiplier)
-                .max(snap.last_iters.saturating_add(4))
-        };
-        return next.clamp(INNER_CAP_FLOOR, INNER_CAP_CEILING);
-    }
-
-    // No feedback yet (first outer iter, or right after a bundle
-    // reset). Coarse iter-count fallback for the first 1-2
-    // outer iters so the cold-start cap is shallow even before the
-    // adaptive signal kicks in.
-    match accepted_iters {
-        0 => 3,
-        1 => 5,
-        _ => 10,
-    }
-}
-
-#[cfg(test)]
-#[path = "inner_cap_schedule_tests.rs"]
-mod inner_cap_schedule_tests;
 
 #[cfg(test)]
 #[path = "value_gradient_refusal_2982_tests.rs"]
 mod value_gradient_refusal_2982_tests;
 
-
-/// Apply the accepted-iter inner-PIRLS cap schedule shared by the two ARC
-/// bridges. `OuterFirstOrderBridge::eval_grad` and
-/// `OuterSecondOrderBridge::eval_hessian` drive it from the same three fields,
-/// so one body keeps the logged transition identical across both. The BFGS and
-/// operator bridges use different schedule inputs and keep their own.
-fn apply_arc_inner_cap_schedule(
-    outer_inner_cap: Option<&InnerProgressFeedback>,
-    last_g_norm: Option<f64>,
-    g_norm_initial: Option<f64>,
-) {
-if let Some(feedback) = outer_inner_cap {
-    // Use the observer-fed accepted-iter counter (opt 0.5.0
-    // OptimizerObserver) instead of `eval_count / 2`; the
-    // observer increments only on rho-accepted steps, so the
-    // schedule no longer relaxes the cap on rejected trials.
-    let arc_iter = feedback.accepted_iter.load(Ordering::Relaxed);
-    let g_ratio = match (last_g_norm, g_norm_initial) {
-        (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
-        _ => None,
-    };
-    let snapshot = feedback.snapshot();
-    let cap = first_order_inner_cap_schedule(arc_iter, g_ratio, snapshot);
-    let prev = feedback.cap.swap(cap, Ordering::Relaxed);
-    if prev != cap {
-        let ratio_str = match g_ratio {
-            Some(r) => format!("{:.3e}", r),
-            None => "n/a".to_string(),
-        };
-        let snap_str = match snapshot {
-            Some(s) => format!(
-                "last_iters={} converged={} ift_residual={} accept_rho={}",
-                s.last_iters,
-                s.last_converged,
-                match s.last_ift_residual {
-                    Some(r) => format!("{:.3e}", r),
-                    None => "n/a".to_string(),
-                },
-                match s.last_accept_rho {
-                    Some(r) => format!("{:.3}", r),
-                    None => "n/a".to_string(),
-                },
-            ),
-            None => "no-history".to_string(),
-        };
-        log::debug!(
-            "[OUTER schedule] inner-PIRLS cap transition (ARC bridge) arc_iter={} g_ratio={} {} prev={} new={} ({})",
-            arc_iter,
-            ratio_str,
-            snap_str,
-            prev,
-            cap,
-            if cap == 0 { "uncapped" } else { "capped" }
-        );
-    }
-}
-}
 pub(crate) struct OuterSecondOrderBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
     pub(crate) layout: OuterThetaLayout,
@@ -2587,25 +2309,10 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// when the upstream `opt` solver does not emit per-iteration logs of its
     /// own. Emitted at INFO from `eval_grad` and `eval_hessian` (the calls
     /// that gate one optimizer step); skipped on `eval_cost` so linesearch
-    /// trial points do not flood the log. Also drives the outer-aware
-    /// inner-PIRLS cap schedule (see `first_order_inner_cap_schedule`).
+    /// trial points do not flood the log.
     pub(crate) eval_count: usize,
-    /// Outer-aware inner-PIRLS cap atomic. When `Some`, the bridge stores
-    /// a coarsen-then-tighten cap into it on every accepted eval_grad /
-    /// eval_hessian call. Mirrors the BFGS-side wiring in
-    /// `OuterFirstOrderBridge`. Cap is NEVER touched in `eval_cost` so
-    /// line-search probes within an outer iter see a stable inner
-    /// tolerance (Wolfe / trust-region acceptance both assume constant
-    /// cost noise within a bracket).
-    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
-    /// First observed `‖g‖` from `eval_grad`/`eval_hessian`. Used by the
-    /// schedule's gradient-ratio gate so the cap lifts when the optimizer
-    /// is approaching convergence, not just when iter count says so.
-    pub(crate) g_norm_initial: Option<f64>,
-    /// `‖g‖` from the most recent eval. See `OuterFirstOrderBridge` for
-    /// the staleness rationale: monotone-decreasing g_norm means the cap
-    /// is conservatively LARGER than truly needed, never smaller.
-    pub(crate) last_g_norm: Option<f64>,
+    /// Inner-PIRLS progress channel, mirroring `OuterFirstOrderBridge`.
+    pub(crate) inner_progress: Option<InnerProgressFeedback>,
     /// Most recent derivative-evaluation point, used to log value-probe
     /// displacement in line-search / trial-acceptance STAGE traces.
     pub(crate) last_value_grad_rho: Option<Array1<f64>>,
@@ -2649,19 +2356,6 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
 
 impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        // Uncap the inner solve for the ARC line-search / trial-acceptance cost
-        // probe. Identical rationale to `OuterFirstOrderBridge::eval_cost`: the
-        // deciding cost must be the true converged-inner objective the analytic
-        // gradient/Hessian differentiate, never the scheduled gradient-path cap
-        // (which at a trial ρ can stop the inner solve short and report a
-        // spurious `∞`, freezing the ARC at constant cost / |g| — gam#808
-        // survival marginal-slope, gam#787 bernoulli matern marginal-slope).
-        // `eval_grad`/`eval_hessian` restore the scheduled cap on the next call.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            feedback
-                .cap
-                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
-        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
@@ -2689,11 +2383,6 @@ impl ZerothOrderObjective for OuterSecondOrderBridge<'_> {
 impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
-        apply_arc_inner_cap_schedule(
-            self.outer_inner_cap.as_ref(),
-            self.last_g_norm,
-            self.g_norm_initial,
-        );
         let stage_start = std::time::Instant::now();
         log::debug!(
             "[STAGE] outer eval start order=ValueAndGradient dim={}",
@@ -2706,12 +2395,6 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
-            self.g_norm_initial = Some(g_norm);
-        }
-        if g_norm.is_finite() {
-            self.last_g_norm = Some(g_norm);
-        }
         self.last_value_grad_rho = Some(x.clone());
         log::debug!(
             "[STAGE] outer eval end order=ValueAndGradient elapsed={:.3}s cost={:.6e} |g|={:.3e}",
@@ -2868,16 +2551,13 @@ impl OuterSecondOrderBridge<'_> {
             } => {
                 // #1426: cost flatlined but the projected gradient is far above
                 // tolerance — a stuck stall, not a flat valley. Do not halt ARC.
-                // Uncap the inner PIRLS so the next solves run to full tolerance
-                // and the outer gradient becomes trustworthy (see the BFGS-side
-                // arm for the full rationale). #2349: also raise the cold-reeval
-                // pulse. It reaches objectives that subscribe to it (today the
+                // #2349: raise the cold-reeval pulse (see the BFGS-side arm for
+                // the full rationale). It reaches objectives that subscribe to it (today the
                 // custom family, through `OuterProblem::with_stuck_stall_cold_reeval_signal`),
                 // where a warm-biased ridge point is re-solved from the canonical
                 // anchored mode; every other route leaves it inert
                 // (`InnerProgressFeedback::force_cold`).
-                if let Some(feedback) = self.outer_inner_cap.as_ref() {
-                    feedback.cap.store(0, Ordering::Relaxed);
+                if let Some(feedback) = self.inner_progress.as_ref() {
                     feedback.force_cold.store(true, Ordering::Relaxed);
                 }
                 log::debug!(
@@ -3404,11 +3084,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         if let Some(stop) = self.settle_pending_trial() {
             return Err(stop);
         }
-        apply_arc_inner_cap_schedule(
-            self.outer_inner_cap.as_ref(),
-            self.last_g_norm,
-            self.g_norm_initial,
-        );
         let stage_start = std::time::Instant::now();
         log::debug!(
             "[STAGE] outer eval start order=ValueGradientHessian dim={}",
@@ -3450,12 +3125,6 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
-            self.g_norm_initial = Some(g_norm);
-        }
-        if g_norm.is_finite() {
-            self.last_g_norm = Some(g_norm);
-        }
         self.last_value_grad_rho = Some(x.clone());
         log::debug!(
             "[STAGE] outer eval end order=ValueGradientHessian elapsed={:.3}s cost={:.6e} |g|={:.3e}",
@@ -3536,7 +3205,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 hessian: hessian.clone(),
                 hessian_psd,
                 curvature,
-                inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
+                inner_converged: inner_solve_converged(self.inner_progress.as_ref()),
                 evidence: self.decrement_verdict_config.is_some().then_some(evidence),
             });
         }
@@ -3559,12 +3228,11 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
 /// `InnerProgressFeedback.accepted_iter` on every accepted outer
 /// step. Replaces the bridge-side `eval_count / 2` heuristic on
 /// routes that see trial-and-rejection probing (ARC dense,
-/// matrix-free TR). The bridge's inner-cap schedule reads
-/// `accepted_iter` from the feedback channel instead of inferring
-/// it from raw eval counts.
+/// matrix-free TR). Consumers read `accepted_iter` from the feedback
+/// channel instead of inferring it from raw eval counts.
 pub(crate) struct OuterAcceptObserver {
-    /// Inner-PIRLS cap channel. `None` on routes that do not schedule the
-    /// inner solve from the outer trajectory; the observer is still installed
+    /// Inner-PIRLS progress channel. `None` on routes that carry no inner
+    /// progress feedback; the observer is still installed
     /// for [`Self::accepted_steps`] and [`Self::census`].
     pub(crate) feedback: Option<InnerProgressFeedback>,
     /// Trajectory census (#2735), read by the runner after the solver returns.
@@ -4018,16 +3686,10 @@ pub(crate) const ACCEPTED_STEP_COST_MATCH_ULPS: f64 = 8.0;
 pub(crate) struct OuterOperatorBridge<'a> {
     pub(crate) obj: &'a mut dyn OuterObjective,
     pub(crate) layout: OuterThetaLayout,
-    /// Inner-PIRLS cap atomic, mirroring the BFGS / ARC bridges.
-    pub(crate) outer_inner_cap: Option<InnerProgressFeedback>,
-    /// Counts gradient/Hessian evaluations for the inner-cap schedule
-    /// and progress logs.
+    /// Inner-PIRLS progress channel, mirroring the BFGS / ARC bridges.
+    pub(crate) inner_progress: Option<InnerProgressFeedback>,
+    /// Counts gradient/Hessian evaluations for progress logs.
     pub(crate) eval_count: usize,
-    /// First observed `‖g‖`. Used by the inner-cap schedule's
-    /// gradient-ratio gate.
-    pub(crate) g_norm_initial: Option<f64>,
-    /// `‖g‖` from the most recent eval.
-    pub(crate) last_g_norm: Option<f64>,
     /// Most recent derivative-evaluation point, used to log value-probe
     /// displacement in line-search STAGE traces.
     pub(crate) last_value_grad_rho: Option<Array1<f64>>,
@@ -4080,7 +3742,7 @@ impl OuterOperatorBridge<'_> {
     /// the run when a stall has bought nothing since the previous one (#2817).
     ///
     /// A stall is handled as the dense route handles a deferred one: a stuck
-    /// stall uncaps the inner solve, and continuing needs
+    /// stall asks for a cold inner re-evaluation, and continuing needs
     /// [`CostStallGuard::license_continuation`]. This route holds only a
     /// Hessian operator at the bridge, so there is no second-order adjudication
     /// to run first; the terminal certificate judges whatever point this stops
@@ -4111,8 +3773,7 @@ impl OuterOperatorBridge<'_> {
         match verdict {
             CostStallVerdict::Continue => return None,
             CostStallVerdict::StuckKeepDescending { .. } => {
-                if let Some(feedback) = self.outer_inner_cap.as_ref() {
-                    feedback.cap.store(0, Ordering::Relaxed);
+                if let Some(feedback) = self.inner_progress.as_ref() {
                     feedback.force_cold.store(true, Ordering::Relaxed);
                 }
             }
@@ -4132,19 +3793,6 @@ impl OuterOperatorBridge<'_> {
 
 impl ZerothOrderObjective for OuterOperatorBridge<'_> {
     fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
-        // Uncap the inner solve for the matrix-free TR line-search cost probe.
-        // Identical rationale to the BFGS / ARC bridges: the deciding cost must
-        // be the true converged-inner objective the analytic gradient/operator
-        // Hessian differentiate, never the scheduled gradient-path cap (which at
-        // a trial ρ can stop the inner solve short and report a spurious `∞`,
-        // freezing the TR at constant cost / |g|). This is the route the
-        // ψ-bearing matern bernoulli marginal-slope fit takes (gam#787);
-        // `eval_value_grad_op` restores the scheduled cap on the next call.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            feedback
-                .cap
-                .store(INNER_ITERATIONS_UNCAPPED, Ordering::Relaxed);
-        }
         self.layout
             .validate_point_len(x, "outer eval_cost failed")?;
         let trial_rho_distance = trial_rho_distance(self.last_value_grad_rho.as_ref(), x);
@@ -4178,12 +3826,6 @@ impl FirstOrderObjective for OuterOperatorBridge<'_> {
             .map_err(|err| into_objective_error("outer eval failed", err))?;
         let eval = finite_outer_first_order_eval_or_error("outer eval failed", self.layout, eval)?;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
-            self.g_norm_initial = Some(g_norm);
-        }
-        if g_norm.is_finite() {
-            self.last_g_norm = Some(g_norm);
-        }
         self.last_value_grad_rho = Some(x.clone());
         Ok(FirstOrderSample {
             value: eval.cost,
@@ -4200,24 +3842,6 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         self.layout.validate_point_len(x, "outer eval failed")?;
         if let Some(stop) = self.settle_pending_trial() {
             return Err(stop);
-        }
-        // Drive the outer-aware inner-PIRLS cap, mirroring
-        // OuterSecondOrderBridge::eval_grad / eval_hessian. Each outer
-        // iteration calls eval_value_grad_op exactly once, at its trial
-        // (the matrix-free TR's inner CG uses HVPs, not full
-        // evaluations), so we increment per call without the /2 the
-        // ARC bridge needs.
-        if let Some(feedback) = self.outer_inner_cap.as_ref() {
-            let g_ratio = match (self.last_g_norm, self.g_norm_initial) {
-                (Some(g), Some(g0)) if g0 > 0.0 => Some(g / g0),
-                _ => None,
-            };
-            let snapshot = feedback.snapshot();
-            let cap = first_order_inner_cap_schedule(self.eval_count, g_ratio, snapshot);
-            let previous_cap = feedback.cap.swap(cap, Ordering::Relaxed);
-            if previous_cap != cap {
-                log::trace!("outer operator bridge updated inner cap from {previous_cap} to {cap}");
-            }
         }
         let stage_start = std::time::Instant::now();
         log::debug!(
@@ -4245,12 +3869,6 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         };
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
-        if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
-            self.g_norm_initial = Some(g_norm);
-        }
-        if g_norm.is_finite() {
-            self.last_g_norm = Some(g_norm);
-        }
         self.last_value_grad_rho = Some(x.clone());
         // Hold this trial until the ratio test decides it (#3017).
         if let Some(guard) = self.cost_stall.as_ref() {
@@ -4265,7 +3883,7 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
                     &eval.gradient,
                     self.cost_stall_bounds.as_ref(),
                 ),
-                inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
+                inner_converged: inner_solve_converged(self.inner_progress.as_ref()),
             });
         }
         log::debug!(

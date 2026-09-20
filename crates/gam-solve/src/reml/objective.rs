@@ -324,8 +324,8 @@ impl<'a> RemlState<'a> {
 
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
-            // converged inner modes — partial fits under an outer-imposed
-            // inner cap routinely yield indefinite Hessians, and
+            // converged inner modes — partial fits that ran out of inner
+            // iterations routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
             let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
@@ -911,8 +911,8 @@ impl<'a> RemlState<'a> {
     /// The correction is engaged UNCONDITIONALLY whenever the residual is
     /// well-defined — it is the exact second-order value/gradient at the
     /// Newton-refined mode `β* = β̂ − H⁻¹r`, and it vanishes as `r → 0`, so a
-    /// fully-converged inner solve is unchanged while a β̂ accepted at a
-    /// first-order inner cap gets the stationary-mode gradient the raw capped β̂
+    /// fully-converged inner solve is unchanged while a β̂ certified at a finite
+    /// inner KKT tolerance gets the stationary-mode gradient the raw β̂
     /// silently misreports. There is deliberately NO relative-residual gate: a
     /// threshold that suppressed the correction above some tolerance would
     /// silently present a non-stationary iterate as exact-KKT to the outer
@@ -3101,14 +3101,14 @@ impl<'a> RemlState<'a> {
         // with the gradient path's smooth-floored `log|H|`; force the spectral
         // logdet so the LLT exact-determinant fast path cannot desync the cost.
         let force_spectral_logdet = ext_coords.iter().any(|c| !c.is_penalty_like);
-        // #1876: the SAS/mixture flexible-link optimizer accepts the inner β̂ at
-        // a first-order cap (`outer_inner_cap`); the link-parameter gradient is
-        // hypersensitive to that capped β̂ (`coord.g ~ 1e4`+), so a ~1e-4 β̂ error
+        // #1876: the SAS/mixture flexible-link inner β̂ is certified at a finite
+        // KKT tolerance; the link-parameter gradient is hypersensitive to the
+        // remaining residual (`coord.g ~ 1e4`+), so a ~1e-4 β̂ error
         // silently collapses the ε gradient to near-zero and the optimizer
         // stalls at the wrong skewness. Engage the inner-KKT envelope correction
         // `Ṽ = V − ½·rᵀH⁻¹r` (populate_inner_kkt = true) so the outer value AND
         // gradient are the true stationary-mode quantities rather than the raw
-        // capped-β̂ values. The optimizer's cost closure routes through this same
+        // β̂ values. The optimizer's cost closure routes through this same
         // evaluator (value-only), so cost and gradient stay in sync. The
         // correction vanishes as `r → 0`, so a converged inner solve is
         // unchanged.

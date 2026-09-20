@@ -16,7 +16,7 @@ use super::{
     add_scaled_diagonal_to_upper_sparse,
     compute_constraint_kkt_diagnostics, compute_lm_d2, constraint_geometry_is_certified,
     constrained_stationarity_norm,
-    effective_kkt_tolerance, linear_constraints_from_lower_bounds, pirls_soft_acceptance,
+    linear_constraints_from_lower_bounds, pirls_soft_acceptance,
     project_coefficients_to_lower_bounds,
     objective_curvature_for_direction, solve_direction_with_dense_factor,
     solve_newton_directionwith_linear_constraints, solve_newton_directionwith_lower_bounds,
@@ -868,7 +868,7 @@ where
     let mut last_step_halving = 0usize;
     // Tracks the gain ratio of the most-recently-accepted step across
     // PIRLS iters. Populates the result's `final_accept_rho` field so
-    // outer consumers (cap schedule, convergence guard) can query the
+    // outer consumers (diagnostics, convergence guard) can query the
     // inner Newton's last model-fidelity measurement programmatically.
     let mut last_iter_accept_rho: Option<f64> = None;
     let mut max_abs_eta = 0.0;
@@ -919,7 +919,7 @@ where
     // the old beta allocation back into this buffer, so the hot path keeps
     // one O(p) candidate allocation for the whole solve.
     let mut candidate_buf: Array1<f64> = Array1::zeros(beta.len());
-    let kkt_tolerance = effective_kkt_tolerance(options);
+    let kkt_tolerance = options.convergence_tolerance;
     // Only this geometry admits a plain coefficient-space Newton certificate:
     // Arrow-Schur has latent directions outside beta, so the coefficient-space
     // Newton system is not the objective's system at all. That is structural and
@@ -941,15 +941,6 @@ where
     //
     // The active set is a property of the ITERATE, so it is asked per use rather
     // than once up front.
-    if let Some(adaptive) = options.adaptive_kkt_tolerance {
-        log::debug!(
-            "[ADAPTIVE-KKT] outer_g_norm={:.3e} effective_tol={:.3e} floor={:.3e} ceiling={:.3e}",
-            adaptive.outer_grad_norm,
-            kkt_tolerance,
-            adaptive.floor,
-            adaptive.ceiling,
-        );
-    }
     // Pre-allocated buffer for the regularized hessian to avoid O(p²) clone
     // per PIRLS iteration. Reused across iterations when dimensions match.
     let mut regularized_buf: Option<gam_linalg::matrix::SymmetricMatrix> = None;

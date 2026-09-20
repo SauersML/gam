@@ -192,7 +192,7 @@ fn eval_seed_restoring_rays(
         // resolution (#3018), each attempt's on its own so a refused attempt's
         // evidence never reaches the seed that evaluated.
         let (attempt, evidence) = super::bridges::evaluate_with_certificate_evidence(true, || {
-            eval_seed_at_full_inner_fidelity(obj, config, seed, order)
+            obj.eval_with_order(seed, order)
         });
         let err = match attempt {
             Ok(eval) => return Ok((eval, evidence)),
@@ -288,28 +288,6 @@ fn eval_seed_restoring_rays(
         *seed = restored;
         restorations += 1;
     }
-}
-
-/// Evaluate the literal outer seed against the true profiled objective.
-///
-/// Adaptive inner caps are search accelerators. A capped, nonconverged inner
-/// iterate is not a value or derivative of the profiled objective and therefore
-/// cannot reject a seed or initialize an optimizer. Lift the shared cap only for
-/// this sample, preserving any continuation/pilot warm state, then restore the
-/// scheduler before search begins.
-fn eval_seed_at_full_inner_fidelity(
-    obj: &mut dyn OuterObjective,
-    config: &OuterConfig,
-    seed: &Array1<f64>,
-    order: OuterEvalOrder,
-) -> Result<OuterEval, EstimationError> {
-    let full_fidelity_guard = config
-        .outer_inner_cap
-        .as_ref()
-        .map(FullFidelityInnerCapGuard::lift);
-    let result = obj.eval_with_order(seed, order);
-    drop(full_fidelity_guard);
-    result
 }
 
 /// Require a continuation arrival to certify the literal outer seed itself.
@@ -588,10 +566,6 @@ pub(crate) fn run_outer_with_plan(
             // below (including any curvature homotopy) is bit-identical to a
             // run with no observer, on the refusal path as well as the success
             // path.
-            let full_fidelity_guard = config
-                .outer_inner_cap
-                .as_ref()
-                .map(FullFidelityInnerCapGuard::lift);
             let mut runner_probe = RunnerSeedProbe {
                 obj: &mut *obj,
                 config,
@@ -612,7 +586,6 @@ pub(crate) fn run_outer_with_plan(
                      search proceeds unchanged"
                 );
             }
-            drop(full_fidelity_guard);
             obj.reset();
         }
         // Certified curvature-homotopy entry leg (#1007). When the objective
@@ -1068,10 +1041,8 @@ pub(crate) fn run_outer_with_plan(
                     let bridge_obj = OuterOperatorBridge {
                         obj,
                         layout,
-                        outer_inner_cap: config.outer_inner_cap.clone(),
+                        inner_progress: config.inner_progress.clone(),
                         eval_count: 0,
-                        g_norm_initial: None,
-                        last_g_norm: None,
                         last_value_grad_rho: None,
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -1122,7 +1093,7 @@ pub(crate) fn run_outer_with_plan(
                     // to that question.
                     let census = Arc::new(OuterStepCensus::default());
                     solver = solver.with_observer(OuterAcceptObserver {
-                        feedback: config.outer_inner_cap.clone(),
+                        feedback: config.inner_progress.clone(),
                         accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&census)),
                     });
@@ -1356,9 +1327,7 @@ pub(crate) fn run_outer_with_plan(
                         layout,
                         hessian_source,
                         eval_count: 0,
-                        outer_inner_cap: config.outer_inner_cap.clone(),
-                        g_norm_initial: None,
-                        last_g_norm: None,
+                        inner_progress: config.inner_progress.clone(),
                         last_value_grad_rho: None,
                         cost_stall: Some(cost_stall_guard),
                         cost_stall_bounds: Some((lo.clone(), hi.clone())),
@@ -1408,7 +1377,7 @@ pub(crate) fn run_outer_with_plan(
                     // is what a budget-exhausted ARC run needs to report (#2735).
                     let arc_census = Arc::new(OuterStepCensus::default());
                     optimizer = optimizer.with_observer(OuterAcceptObserver {
-                        feedback: config.outer_inner_cap.clone(),
+                        feedback: config.inner_progress.clone(),
                         accepted_steps: Arc::clone(&accepted_steps),
                         census: Some(Arc::clone(&arc_census)),
                     });
@@ -1959,10 +1928,8 @@ pub(crate) fn run_outer_with_plan(
                             OuterFirstOrderBridge {
                                 obj,
                                 layout,
-                                outer_inner_cap: config.outer_inner_cap.clone(),
+                                inner_progress: config.inner_progress.clone(),
                                 first_order_evals: 0,
-                                g_norm_initial: None,
-                                last_g_norm: None,
                                 last_value_grad_rho: None,
                                 value_probe_cache: Vec::new(),
                                 cost_stall: Some(cost_stall_guard),
@@ -2113,13 +2080,13 @@ pub(crate) fn run_outer_with_plan(
                             optimizer = optimizer.with_axis_step_caps(caps);
                         }
                         // The observer is installed UNCONDITIONALLY on this route
-                        // (#2613). It used to be gated on `outer_inner_cap`, the
+                        // (#2613). It used to be gated on `inner_progress`, the
                         // only consumer at the time; the cost-stall guard now
                         // depends on the same accepted-step signal to tell an
                         // accepted outer iterate from a line-search trial, and that
                         // guard is present on every BFGS seed.
                         optimizer = optimizer.with_observer(OuterAcceptObserver {
-                            feedback: config.outer_inner_cap.clone(),
+                            feedback: config.inner_progress.clone(),
                             accepted_steps: Arc::clone(&accepted_steps),
                             // BFGS reports no trust radius, so a region census would
                             // be a column of `None`s; its own non-convergence
@@ -2143,9 +2110,7 @@ pub(crate) fn run_outer_with_plan(
                         }
                         let (crossing_eval, crossing_evidence) =
                             super::bridges::evaluate_with_certificate_evidence(true, || {
-                                eval_seed_at_full_inner_fidelity(
-                                    obj,
-                                    config,
+                                obj.eval_with_order(
                                     &probe.rho,
                                     OuterEvalOrder::ValueAndGradient,
                                 )
@@ -2735,41 +2700,15 @@ pub(crate) fn run_outer_with_plan(
         // provenance: nothing downstream of here treats a plan result as minted
         // until `run_outer` replaces the certificate with its own.
         // The finalize evaluation re-installs the selected outer result by
-        // re-running the inner P-IRLS at θ̂. During the outer search the ARC /
-        // BFGS bridge schedule throttles `RemlState::outer_inner_cap` down to a
-        // small adaptive cap (e.g. 3 iters) so early, far-from-converged outer
-        // steps spend a coarse inner solve. That cap MUST NOT leak into the
-        // finalize solve at the optimum: the inner Newton there can need many
-        // iterations (SAS link drives η to extreme magnitudes mid-search,
-        // #1572), and a capped `MaxIterationsReached` is escalated to a fatal
-        // `PirlsDidNotConverge` ("did not converge within 3 iterations"),
-        // aborting the whole fit. Lift the cap to 0 (no cap) for the finalize,
-        // mirroring the post-run `run_outer_inner_cap_guard`
-        // (optimizer.rs:135) and the accept-fit's "full inner budget" intent
-        // (gradient_hessian.rs:6469), then restore the prior cap so any later
-        // schedule-driven evaluation sees the value it expects.
-        // Held in a named binding and dropped explicitly after the finalize
-        // (which restores the prior cap), rather than `let _guard`: the
-        // workspace ban-scanner (build.rs) forbids every underscore-leading
-        // `let` pattern, and a plain `let guard` would trip `unused_variables`
-        // under `warnings = "deny"`. The explicit `drop(...)` is the idiomatic
-        // "use" (see e.g. `hessian_scope_guard` in custom_family). The guard's
-        // Drop runs before `?` propagates a finalize error, so the cap is
-        // restored on both the success and the abort path.
-        let finalize_cap_guard = config
-            .outer_inner_cap
-            .as_ref()
-            .map(FullFidelityInnerCapGuard::lift);
-        if finalize_cap_guard.is_some() {
+        // re-running the inner P-IRLS at θ̂.
+        if config.inner_progress.is_some() {
             // Certification evaluated trial points after the search ended.
             // Clear every search-state cache before installing the selected
             // point so a rho-only hit cannot leave the objective owning the
             // last trial's inner mode.
             obj.reset();
         }
-        let finalize_outcome = obj.finalize_outer_result(&result.rho, the_plan);
-        drop(finalize_cap_guard);
-        finalize_outcome?;
+        obj.finalize_outer_result(&result.rho, the_plan)?;
         return Ok(PlanRunOutcome::Converged(result));
     }
 
@@ -2936,12 +2875,8 @@ fn claim_prior_terminal_certificate(
     if config.initial_rho.as_ref() != Some(seed) {
         return None;
     }
-    let eval = eval_seed_at_full_inner_fidelity(
-                            obj,
-                            config,
-                            seed,
-                            OuterEvalOrder::ValueAndGradient,
-                        )
+    let eval = obj
+        .eval_with_order(seed, OuterEvalOrder::ValueAndGradient)
         .ok()?;
     if !eval.cost.is_finite() || eval.gradient.iter().any(|value| !value.is_finite()) {
         return None;
@@ -3020,17 +2955,10 @@ pub(crate) fn resume_prior_certificate(
     let result = CertifiedOuterCandidate::from_solver_claim(obj, config, context, candidate)
         .map_err(|(_, error)| declined(format!("the analytic certificate refused it: {error}")))?
         .into_result();
-    // Install the accepted point at full inner fidelity, as the seed loop's
-    // winner is installed.
-    let finalize_cap_guard = config
-        .outer_inner_cap
-        .as_ref()
-        .map(FullFidelityInnerCapGuard::lift);
-    if finalize_cap_guard.is_some() {
+    // Install the accepted point as the seed loop's winner is installed.
+    if config.inner_progress.is_some() {
         obj.reset();
     }
-    let finalize_outcome = obj.finalize_outer_result(&result.rho, &the_plan);
-    drop(finalize_cap_guard);
-    finalize_outcome?;
+    obj.finalize_outer_result(&result.rho, &the_plan)?;
     Ok(result)
 }

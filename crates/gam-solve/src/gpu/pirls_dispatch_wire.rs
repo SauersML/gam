@@ -1,7 +1,7 @@
 //! Stage 3.3 GPU PIRLS-loop dispatch wire-in.
 //!
 //! `try_gpu_pirls_loop_dispatch` is the single entry the CPU PIRLS driver
-//! ([`crate::pirls::fit_model_for_fixed_rho_with_adaptive_kkt`])
+//! ([`crate::pirls::fit_model_for_fixed_rho_configured`])
 //! calls before falling through to the host LM loop. Returns
 //! `Some((PirlsResult, WorkingModelPirlsResult))` when the device-resident
 //! loop fully completed and assembled the CPU-oracle-equivalent surface;
@@ -219,7 +219,7 @@ mod linux_impl {
         // Gaussian-identity fits have an exact GPU PLS path (issue #272) and
         // must NOT be routed through the row-kernel PIRLS loop on device.
         // The exact path (try_gpu_gaussian_pls_dispatch) fires before this
-        // dispatch site in fit_model_for_fixed_rho_with_adaptive_kkt.
+        // dispatch site in fit_model_for_fixed_rho_configured.
         // This gate ensures no future code path accidentally re-routes them
         // here.  Tests that explicitly exercise the row kernel may bypass
         // this gate by calling pirls_loop_on_stream directly.
