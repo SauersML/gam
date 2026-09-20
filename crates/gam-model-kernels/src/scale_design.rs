@@ -1,4 +1,4 @@
-use gam_linalg::faer_ndarray::{FaerSvd, fast_ab};
+use gam_linalg::faer_ndarray::fast_ab;
 use gam_linalg::matrix::{
     DenseDesignMatrix, DenseDesignOperator, DesignMatrix, FiniteSignedWeightsView, LinearOperator,
 };
@@ -26,9 +26,6 @@ pub enum ScaleDesignError {
     DegenerateDesign { reason: String },
     /// Row materialization from an underlying `DesignMatrix` failed.
     RowMaterializationFailed { reason: String },
-    /// Thin SVD of the weighted primary design failed or produced no
-    /// singular vectors.
-    SvdFailed { reason: String },
 }
 
 impl_reason_error_boilerplate! {
@@ -38,22 +35,13 @@ impl_reason_error_boilerplate! {
         NonFiniteInput,
         DegenerateDesign,
         RowMaterializationFailed,
-        SvdFailed,
     }
 }
 
 // Imported, not transcribed (#2704): the same streamed working-set budget,
-// used for a row chunk in `scale_design_row_chunk_size` and a column chunk in
-// the replay solve.
+// used for a row chunk in `scale_design_row_chunk_size`.
 const SCALE_DESIGN_TARGET_CHUNK_BYTES: usize =
     gam_runtime::resource::LIBRARY_ROW_CHUNK_TARGET_BYTES;
-// Numerical conditioning floor for the SVD truncation tolerance: we drop any
-// singular direction below `RCOND_FLOOR * sigma_max`, which is the standard
-// machine-precision boundary for considering a direction resolvable. Above
-// this floor, the replay solve is unbiased least squares (no Tikhonov
-// damping), so noise in the primary span is recovered exactly. This is the
-// primary safety net.
-const SCALE_PROJECTION_REPLAY_RCOND_FLOOR: f64 = 1e-8;
 
 #[derive(Clone, Debug)]
 pub struct ScaleDeviationTransform {
@@ -61,9 +49,9 @@ pub struct ScaleDeviationTransform {
     pub weighted_column_mean: Array1<f64>,
     pub rescale: Array1<f64>,
     pub non_intercept_start: usize,
-    /// Squared SVD truncation cutoff used when fitting `projection_coef`.
-    /// Stored so prediction-time replay is reproducible without re-deriving
-    /// the cutoff from heuristics.
+    /// Squared SVD truncation cutoff a saved model's `projection_coef` was fitted
+    /// with. Carried so that model's prediction-time replay reads exactly what it
+    /// saved; no current fit derives a projection (#3015).
     pub projection_ridge_alpha: f64,
 }
 
@@ -79,10 +67,11 @@ impl ScaleDeviationTransform {
     /// log-scale), so residualizing the scale design against the location design
     /// — replacing `X_σ` with `(I − P_{X_μ}) X_σ` — imposes a spurious
     /// constraint and erases real heteroscedastic signal whenever the two blocks
-    /// overlap. The Gaussian location-scale path already keeps its log-σ design
-    /// un-residualized (`identified_gaussian_log_sigma_design`); this constructor
-    /// lets the survival location-scale path do the same while preserving the
-    /// transform plumbing (payload serialization, prediction-time replay).
+    /// overlap. The Gaussian and binomial location-scale paths keep their log-σ
+    /// designs un-residualized (`location_scale_log_sigma_design`, #3015); this
+    /// constructor lets the survival location-scale path do the same while
+    /// preserving the transform plumbing (payload serialization, prediction-time
+    /// replay).
     pub fn identity(p_primary: usize, p_noise: usize, non_intercept_start: usize) -> Self {
         ScaleDeviationTransform {
             projection_coef: Array2::<f64>::zeros((p_primary, p_noise)),
@@ -179,7 +168,6 @@ fn scale_transform_from_payload_typed(
 
 #[derive(Clone, Copy)]
 enum ScaleDesignMatrixRef<'a> {
-    Dense(&'a Array2<f64>),
     Design(&'a DesignMatrix),
 }
 
@@ -187,7 +175,6 @@ impl ScaleDesignMatrixRef<'_> {
     #[inline]
     fn nrows(self) -> usize {
         match self {
-            Self::Dense(matrix) => matrix.nrows(),
             Self::Design(matrix) => matrix.nrows(),
         }
     }
@@ -195,14 +182,12 @@ impl ScaleDesignMatrixRef<'_> {
     #[inline]
     fn ncols(self) -> usize {
         match self {
-            Self::Dense(matrix) => matrix.ncols(),
             Self::Design(matrix) => matrix.ncols(),
         }
     }
 
     fn row_chunk(self, rows: Range<usize>) -> Result<Array2<f64>, ScaleDesignError> {
         match self {
-            Self::Dense(matrix) => Ok(matrix.slice(s![rows, ..]).to_owned()),
             Self::Design(matrix) => {
                 matrix
                     .try_row_chunk(rows)
@@ -220,23 +205,6 @@ fn dim_err(reason: impl Into<String>) -> ScaleDesignError {
     }
 }
 
-pub fn build_scale_deviation_transform(
-    primary_design: &Array2<f64>,
-    noise_design: &Array2<f64>,
-    weights: &Array1<f64>,
-    non_intercept_start: usize,
-) -> Result<ScaleDeviationTransform, String> {
-    build_scale_deviation_transform_impl(
-        ScaleDesignMatrixRef::Dense(primary_design),
-        ScaleDesignMatrixRef::Dense(noise_design),
-        weights,
-        non_intercept_start,
-        "scale deviation transform row mismatch",
-    )
-    .map_err(|e| e.to_string())
-}
-
-#[derive(Clone)]
 struct ScaleDeviationOperator {
     primary_design: DesignMatrix,
     rawnoise_design: DesignMatrix,
@@ -496,139 +464,6 @@ fn infer_non_intercept_start_impl(
     Ok(end)
 }
 
-fn build_weighted_primary_design(
-    primary_design: ScaleDesignMatrixRef<'_>,
-    sqrtw: &Array1<f64>,
-    chunk_rows: usize,
-) -> Result<Array2<f64>, ScaleDesignError> {
-    let n = primary_design.nrows();
-    let p_primary = primary_design.ncols();
-    let mut wx = Array2::<f64>::zeros((n, p_primary));
-    for start in (0..n).step_by(chunk_rows) {
-        let end = (start + chunk_rows).min(n);
-        let x_chunk = primary_design.row_chunk(start..end)?;
-        for local in 0..(end - start) {
-            let sw = sqrtw[start + local];
-            for col in 0..p_primary {
-                wx[[start + local, col]] = sw * x_chunk[[local, col]];
-            }
-        }
-    }
-    Ok(wx)
-}
-
-/// Pick the squared singular-value cutoff for the replay solve.
-///
-/// Retained directions use the exact inverse `1 / sigma_k`; directions at or
-/// below `sqrt(alpha) = RCOND_FLOOR · sigma_max` are dropped, so no retained
-/// direction amplifies a unit-norm prediction row by more than `1 / RCOND_FLOOR`
-/// times what a sigma_max-scale direction sees in the un-regularized solve.
-fn choose_scale_projection_ridge_alpha(singular: &[f64]) -> f64 {
-    if singular.is_empty() {
-        return 0.0;
-    }
-    let sigma_max = singular.iter().copied().fold(0.0_f64, f64::max);
-    if !sigma_max.is_finite() || sigma_max <= 0.0 {
-        return 0.0;
-    }
-    let truncation_tol = SCALE_PROJECTION_REPLAY_RCOND_FLOOR * sigma_max;
-    truncation_tol * truncation_tol
-}
-
-fn solve_scale_projection(
-    primary_design: ScaleDesignMatrixRef<'_>,
-    noise_design: ScaleDesignMatrixRef<'_>,
-    weights: &Array1<f64>,
-    first_active: usize,
-    chunk_rows: usize,
-) -> Result<(Array2<f64>, f64), ScaleDesignError> {
-    let n = primary_design.nrows();
-    let p_primary = primary_design.ncols();
-    let p_noise = noise_design.ncols();
-    let mut projection_coef = Array2::<f64>::zeros((p_primary, p_noise));
-    let active_cols = p_noise.saturating_sub(first_active);
-
-    if active_cols == 0 || p_primary == 0 {
-        return Ok((projection_coef, 0.0));
-    }
-
-    let sqrtw = weights.mapv(f64::sqrt);
-    let wx = build_weighted_primary_design(primary_design, &sqrtw, chunk_rows)?;
-    // Thin SVD of W^{1/2} X_primary: replay reduces to V * diag(filter) * U^T
-    // applied to the weighted noise RHS. Retained singular directions use the
-    // exact inverse; unresolved directions are dropped by the cutoff below.
-    let (u_opt, singular, vt_opt) =
-        wx.svd(true, true)
-            .map_err(|e| ScaleDesignError::SvdFailed {
-                reason: format!("scale projection SVD failed: {e:?}"),
-            })?;
-    let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        return Err(ScaleDesignError::SvdFailed {
-            reason: "scale projection SVD did not return singular vectors".to_string(),
-        });
-    };
-    let alpha = choose_scale_projection_ridge_alpha(singular.as_slice().unwrap_or(&[]));
-    let rank = singular.len();
-    if rank == 0 {
-        return Ok((projection_coef, alpha));
-    }
-    // Truncated SVD with leverage-bound cutoff: directions resolved well
-    // enough to keep coefficient amplification under
-    // `1 / SCALE_PROJECTION_REPLAY_RCOND_FLOOR` are inverted exactly (no
-    // damping on the dominant components), and weaker directions are
-    // dropped. The primary design is fixed across any single replay, so no
-    // threshold-crossings occur within a call: the projection is a linear
-    // function of the noise RHS, which is the continuity property the audit
-    // asked for. The discarded singular value floor sqrt(alpha) doubles as
-    // the recovered-coefficient leverage cap.
-    let cutoff = alpha.sqrt();
-    let mut filter = Array1::<f64>::zeros(rank);
-    for k in 0..rank {
-        let s = singular[k];
-        filter[k] = if s > cutoff && s > 0.0 { 1.0 / s } else { 0.0 };
-    }
-
-    let chunk_cols = (SCALE_DESIGN_TARGET_CHUNK_BYTES / (n.max(1) * std::mem::size_of::<f64>()))
-        .max(1)
-        .min(active_cols);
-
-    for chunk_start in (0..active_cols).step_by(chunk_cols) {
-        let width = (active_cols - chunk_start).min(chunk_cols);
-        let mut rhs = Array2::<f64>::zeros((n, width));
-        for start in (0..n).step_by(chunk_rows) {
-            let end = (start + chunk_rows).min(n);
-            let noise_chunk = noise_design.row_chunk(start..end)?;
-            for local in 0..(end - start) {
-                let sw = sqrtw[start + local];
-                for col in 0..width {
-                    rhs[[start + local, col]] =
-                        sw * noise_chunk[[local, first_active + chunk_start + col]];
-                }
-            }
-        }
-
-        // U^T (rank x n) * rhs (n x width) -> (rank x width)
-        let mut t = u.t().dot(&rhs);
-        // Apply filter rowwise: t_k *= 1 / sigma_k for retained directions.
-        for k in 0..rank {
-            let f = filter[k];
-            for col in 0..width {
-                t[[k, col]] *= f;
-            }
-        }
-        // V (p_primary x rank) * t (rank x width) -> (p_primary x width).
-        // vt has shape (rank, p_primary), so V = vt^T.
-        let block = vt.t().dot(&t);
-        for col in 0..width {
-            for row in 0..p_primary {
-                projection_coef[[row, first_active + chunk_start + col]] = block[[row, col]];
-            }
-        }
-    }
-
-    Ok((projection_coef, alpha))
-}
-
 fn apply_projection_chunk(
     primary_chunk: &Array2<f64>,
     projection_coef: &Array2<f64>,
@@ -644,159 +479,6 @@ fn apply_projection_chunk(
     }
 }
 
-fn build_scale_deviation_transform_impl(
-    primary_design: ScaleDesignMatrixRef<'_>,
-    noise_design: ScaleDesignMatrixRef<'_>,
-    weights: &Array1<f64>,
-    non_intercept_start: usize,
-    row_mismatch_error: &str,
-) -> Result<ScaleDeviationTransform, ScaleDesignError> {
-    if primary_design.nrows() != noise_design.nrows() || weights.len() != noise_design.nrows() {
-        return Err(dim_err(row_mismatch_error.to_string()));
-    }
-    validate_scale_weights(weights)?;
-
-    let n = primary_design.nrows();
-    let p_primary = primary_design.ncols();
-    let p_noise = noise_design.ncols();
-    let first_active = non_intercept_start.min(p_noise);
-    let chunk_rows = scale_design_row_chunk_size(n, p_primary.max(p_noise));
-    let (projection_coef, projection_ridge_alpha) = solve_scale_projection(
-        primary_design,
-        noise_design,
-        weights,
-        first_active,
-        chunk_rows,
-    )?;
-    let mut weighted_column_mean = Array1::<f64>::zeros(p_noise);
-    let mut rescale = Array1::<f64>::ones(p_noise);
-    let active_cols = p_noise - first_active;
-
-    if active_cols > 0 {
-        let projection_only_transform = ScaleDeviationTransform {
-            projection_coef: projection_coef.clone(),
-            weighted_column_mean: Array1::<f64>::zeros(p_noise),
-            rescale: Array1::<f64>::ones(p_noise),
-            non_intercept_start,
-            projection_ridge_alpha,
-        };
-        let mut w_sum = 0.0;
-        let mut w_resid_sum = Array1::<f64>::zeros(active_cols);
-        let mut w_noise_sum = Array1::<f64>::zeros(active_cols);
-
-        for start in (0..n).step_by(chunk_rows) {
-            let end = (start + chunk_rows).min(n);
-            let x_chunk = primary_design.row_chunk(start..end)?;
-            let noise_chunk = noise_design.row_chunk(start..end)?;
-            let resid_chunk = apply_scale_deviation_reparam_chunk(
-                &x_chunk,
-                &noise_chunk,
-                &projection_only_transform,
-            );
-            for local in 0..(end - start) {
-                let w = weights[start + local];
-                if w == 0.0 {
-                    continue;
-                }
-                w_sum += w;
-                for jj in 0..active_cols {
-                    let nij = noise_chunk[[local, first_active + jj]];
-                    w_noise_sum[jj] += w * nij;
-                    w_resid_sum[jj] += w * resid_chunk[[local, first_active + jj]];
-                }
-            }
-        }
-
-        if !w_sum.is_finite() || w_sum <= 0.0 {
-            return Err(ScaleDesignError::InvalidWeights {
-                reason: "scale deviation requires positive finite total weight".to_string(),
-            });
-        }
-
-        let resid_center = w_resid_sum.mapv(|sum| sum / w_sum);
-        let noise_mean = w_noise_sum.mapv(|sum| sum / w_sum);
-        let mut orig_css = Array1::<f64>::zeros(active_cols);
-        let mut resid_css = Array1::<f64>::zeros(active_cols);
-        // The rescale `sqrt(orig_css / resid_css)` is formed only for a column
-        // whose two centred sums of squares are both distinguishable from the
-        // zero column. A column in the primary span has a residual that is
-        // computed as rounding noise, not as zero; rescaling that noise up to
-        // the column's original spread would publish rounding as signal.
-        //
-        // Each weighted row's residual `noise − X·coef` comes from a
-        // `p_primary`-term inner product and one subtraction. Centring it adds
-        // a second subtraction. Its rounding is therefore at most
-        // `γ_{p_primary+2}·(|noise| + Σ_k |x_k|·|coef_k|)` (Higham, ASNA
-        // Lemma 3.1). The deviation `noise − mean` rounds within
-        // `γ_{n+2}·(|noise| + |mean|)`, where the `n` accounts for the weighted
-        // mean's accumulation. Centring rounding noise `b` at its own weighted
-        // mean at most doubles each row's deviation, because
-        // `w_sum·mean(b)² ≤ Σ w·b²` for non-negative weights. A computed sum at
-        // or below `4·Σ w·b²` is thus indistinguishable from zero. Both bands
-        // scale with the data, so the rescale does not depend on the columns'
-        // units.
-        let abs_coef = projection_coef
-            .slice(s![.., first_active..])
-            .mapv(f64::abs);
-        let residual_growth = gam_linalg::roundoff::accumulation_growth(p_primary + 2);
-        let deviation_growth = gam_linalg::roundoff::accumulation_growth(n + 2);
-        let mut orig_band = Array1::<f64>::zeros(active_cols);
-        let mut resid_band = Array1::<f64>::zeros(active_cols);
-
-        for start in (0..n).step_by(chunk_rows) {
-            let end = (start + chunk_rows).min(n);
-            let x_chunk = primary_design.row_chunk(start..end)?;
-            let noise_chunk = noise_design.row_chunk(start..end)?;
-            let resid_chunk = apply_scale_deviation_reparam_chunk(
-                &x_chunk,
-                &noise_chunk,
-                &projection_only_transform,
-            );
-            let abs_fitted = fast_ab(&x_chunk.mapv(f64::abs), &abs_coef);
-            for local in 0..(end - start) {
-                let w = weights[start + local];
-                if w == 0.0 {
-                    continue;
-                }
-                for jj in 0..active_cols {
-                    let nij = noise_chunk[[local, first_active + jj]];
-                    let d_orig = nij - noise_mean[jj];
-                    orig_css[jj] += w * d_orig * d_orig;
-                    let orig_rounding = deviation_growth * (nij.abs() + noise_mean[jj].abs());
-                    orig_band[jj] += w * orig_rounding * orig_rounding;
-                    let d_resid = resid_chunk[[local, first_active + jj]] - resid_center[jj];
-                    resid_css[jj] += w * d_resid * d_resid;
-                    let resid_rounding = residual_growth * (nij.abs() + abs_fitted[[local, jj]]);
-                    resid_band[jj] += w * resid_rounding * resid_rounding;
-                }
-            }
-        }
-
-        for jj in 0..active_cols {
-            let j = first_active + jj;
-            let scale = if resid_css[jj].is_finite()
-                && resid_css[jj] > 4.0 * resid_band[jj]
-                && orig_css[jj].is_finite()
-                && orig_css[jj] > 4.0 * orig_band[jj]
-            {
-                (orig_css[jj] / resid_css[jj]).sqrt()
-            } else {
-                1.0
-            };
-            weighted_column_mean[j] = resid_center[jj];
-            rescale[j] = scale;
-        }
-    }
-
-    Ok(ScaleDeviationTransform {
-        projection_coef,
-        weighted_column_mean,
-        rescale,
-        non_intercept_start,
-        projection_ridge_alpha,
-    })
-}
-
 pub fn infer_non_intercept_start_design(
     design: &DesignMatrix,
     weights: &Array1<f64>,
@@ -809,22 +491,6 @@ pub fn infer_non_intercept_start_design(
             design.nrows(),
             weights.len()
         ),
-    )
-    .map_err(|e| e.to_string())
-}
-
-pub fn build_scale_deviation_transform_design(
-    primary_design: &DesignMatrix,
-    noise_design: &DesignMatrix,
-    weights: &Array1<f64>,
-    non_intercept_start: usize,
-) -> Result<ScaleDeviationTransform, String> {
-    build_scale_deviation_transform_impl(
-        ScaleDesignMatrixRef::Design(primary_design),
-        ScaleDesignMatrixRef::Design(noise_design),
-        weights,
-        non_intercept_start,
-        "scale deviation transform design row mismatch",
     )
     .map_err(|e| e.to_string())
 }
@@ -964,157 +630,94 @@ mod tests {
         assert!(err.contains("row 1"), "unexpected diagnostic: {err}");
     }
 
+    /// A saved model's residualized noise design replays bit for bit after the
+    /// transform-fitting route is gone (#3015): read from its payload fields, the
+    /// transform maps each active column to `(noise − primary·P − center)·rescale` and
+    /// passes the intercept through. Every input is a short dyadic rational, so each
+    /// product and sum is exact in f64 and the expected design has one bit pattern,
+    /// whatever order the operator accumulates in.
     #[test]
-    fn choose_scale_projection_ridge_alpha_scales_with_sigma_max() {
-        // Truncation tolerance is `RCOND_FLOOR * sigma_max`, so
-        // alpha = (RCOND_FLOOR * sigma_max)^2.
-        let alpha_unit = choose_scale_projection_ridge_alpha(&[1.0, 0.5, 1e-6]);
-        let expected_unit = SCALE_PROJECTION_REPLAY_RCOND_FLOOR.powi(2);
-        assert!(alpha_unit > 0.0);
-        assert!(
-            (alpha_unit - expected_unit).abs() < 1e-24,
-            "alpha should be {expected_unit:e} for sigma_max=1, got {alpha_unit}"
-        );
-
-        let alpha_scaled = choose_scale_projection_ridge_alpha(&[100.0, 1.0]);
-        let expected_scaled = (SCALE_PROJECTION_REPLAY_RCOND_FLOOR * 100.0).powi(2);
-        assert!(
-            (alpha_scaled - expected_scaled).abs() < 1e-18,
-            "alpha should be {expected_scaled:e} for sigma_max=100, got {alpha_scaled}"
-        );
-        // Scales as sigma_max^2.
-        assert!(
-            (alpha_scaled / alpha_unit - 1.0e4).abs() < 1e-6,
-            "alpha should scale as sigma_max^2; got ratio {}",
-            alpha_scaled / alpha_unit
-        );
-
-        let alpha_floor = choose_scale_projection_ridge_alpha(&[]);
-        assert_eq!(alpha_floor, 0.0);
+    fn a_saved_scale_transform_replays_its_noise_design_bit_for_bit() {
+        let primary = array![[1.0, 0.5], [1.0, -0.25], [1.0, 1.5], [1.0, -2.0]];
+        let noise = array![
+            [1.0, 0.75, 1.0],
+            [1.0, -1.25, 0.5],
+            [1.0, 2.5, -0.75],
+            [1.0, 0.125, 3.0]
+        ];
+        let projection = vec![vec![0.0, 0.25, -0.5], vec![0.0, 0.125, 1.0]];
+        let center = vec![0.0, 0.0625, -0.375];
+        let rescale = vec![1.0, 2.0, 0.5];
+        let transform = scale_transform_from_payload(
+            &Some(projection.clone()),
+            &Some(center.clone()),
+            &Some(rescale.clone()),
+            Some(1),
+            Some(0.0),
+        )
+        .expect("saved transform")
+        .expect("a populated payload carries a transform");
+        let replayed = build_scale_deviation_operator(
+            DesignMatrix::Dense(DenseDesignMatrix::from(primary.clone())),
+            DesignMatrix::Dense(DenseDesignMatrix::from(noise.clone())),
+            &transform,
+        )
+        .expect("replay operator")
+        .to_dense();
+        let expected = Array2::from_shape_fn(noise.dim(), |(i, j)| {
+            if j == 0 {
+                noise[[i, 0]]
+            } else {
+                let fitted =
+                    primary[[i, 0]] * projection[0][j] + primary[[i, 1]] * projection[1][j];
+                (noise[[i, j]] - fitted - center[j]) * rescale[j]
+            }
+        });
+        for ((i, j), value) in replayed.indexed_iter() {
+            assert_eq!(
+                value.to_bits(),
+                expected[[i, j]].to_bits(),
+                "replayed noise design entry ({i}, {j}): {value} against {}",
+                expected[[i, j]]
+            );
+        }
     }
 
+    /// A saved model's transform — the only way a residualized noise design still
+    /// reaches prediction since no fit residualizes one (#3015) — replays exactly as
+    /// it was written.
     #[test]
-    fn ridge_replay_continuous_under_input_sweep() {
-        // A near-collinear primary design plus a sweepable perturbation column
-        // would, under the old hard coefficient cap, jump discontinuously when
-        // the cap kicks in. With a fixed SVD cutoff, the replayed coefficient
-        // is a linear function of the input perturbation.
-        let n = 64;
-        let mut primary = Array2::<f64>::zeros((n, 3));
-        let mut noise = Array2::<f64>::zeros((n, 2));
-        let weights = Array1::<f64>::ones(n);
-        for i in 0..n {
-            let t = i as f64 / n as f64;
-            primary[[i, 0]] = 1.0;
-            primary[[i, 1]] = t;
-            // Near-collinear with col 1 — this is the high-gain direction.
-            primary[[i, 2]] = t + 1e-9 * (5.0 * t).sin();
-            noise[[i, 0]] = 1.0;
-            noise[[i, 1]] = (0.4 * t).cos();
-        }
-
-        // Sweep: gradually scale one noise entry; record the corresponding
-        // projected coefficient cell. Numerical first differences should be
-        // bounded because the fixed projection operator is linear in the input.
-        let mut last: Option<f64> = None;
-        let mut max_step: f64 = 0.0;
-        for k in 0..50 {
-            let s = k as f64 / 49.0;
-            let mut perturbed = noise.clone();
-            for i in 0..n {
-                perturbed[[i, 1]] += s;
-            }
-            let transform = build_scale_deviation_transform(&primary, &perturbed, &weights, 1)
-                .expect("ridge transform should succeed under input sweep");
-            let val = transform.projection_coef[[2, 1]];
-            if let Some(prev) = last {
-                let step = (val - prev).abs();
-                max_step = max_step.max(step);
-            }
-            last = Some(val);
-        }
-        // Step bound: with 50 samples over a unit sweep, a smooth dependence
-        // produces uniform tiny jumps.  The old coefficient cap would emit a
-        // single huge step at the cap boundary, easily blowing 1.0 here.
-        assert!(
-            max_step < 0.5,
-            "replay coefficient sweep should be continuous, got max step {max_step}"
-        );
-    }
-
-    #[test]
-    fn scale_transform_payload_round_trips_alpha() {
-        let n = 64;
-        let mut primary = Array2::<f64>::zeros((n, 3));
-        let mut noise = Array2::<f64>::zeros((n, 2));
-        let weights = Array1::<f64>::ones(n);
-        for i in 0..n {
-            let t = i as f64 / n as f64;
-            primary[[i, 0]] = 1.0;
-            primary[[i, 1]] = t;
-            primary[[i, 2]] = (4.0 * t).cos();
-            noise[[i, 0]] = 1.0;
-            noise[[i, 1]] = (2.0 * t).sin();
-        }
-        let transform = build_scale_deviation_transform(&primary, &noise, &weights, 1)
-            .expect("transform should succeed");
-
+    fn scale_transform_payload_round_trips_every_field() {
+        let transform = ScaleDeviationTransform {
+            projection_coef: array![[0.0, 0.25], [0.0, -1.5], [0.0, 0.125]],
+            weighted_column_mean: array![0.0, 0.375],
+            rescale: array![1.0, 2.5],
+            non_intercept_start: 1,
+            projection_ridge_alpha: 1.0e-16,
+        };
         let projection: Vec<Vec<f64>> = transform
             .projection_coef
             .rows()
             .into_iter()
             .map(|row| row.to_vec())
             .collect();
-        let center = transform.weighted_column_mean.to_vec();
-        let scale = transform.rescale.to_vec();
         let restored = scale_transform_from_payload(
             &Some(projection),
-            &Some(center),
-            &Some(scale),
+            &Some(transform.weighted_column_mean.to_vec()),
+            &Some(transform.rescale.to_vec()),
             Some(transform.non_intercept_start),
             Some(transform.projection_ridge_alpha),
         )
         .expect("payload round-trip should succeed")
         .expect("payload should produce a transform");
+        assert_eq!(restored.projection_coef, transform.projection_coef);
+        assert_eq!(restored.weighted_column_mean, transform.weighted_column_mean);
+        assert_eq!(restored.rescale, transform.rescale);
+        assert_eq!(restored.non_intercept_start, transform.non_intercept_start);
         assert_eq!(
-            restored.projection_ridge_alpha, transform.projection_ridge_alpha,
+            restored.projection_ridge_alpha.to_bits(),
+            transform.projection_ridge_alpha.to_bits(),
             "alpha must round-trip exactly through payload serialization"
-        );
-    }
-
-    /// The rescale restores a noise column's spread after its primary-span
-    /// part is projected out. It is a ratio of two sums of squares in that
-    /// column's own units, so changing the units must not move it. An absolute
-    /// 1e-12 floor on both sums had left a column recorded in small units
-    /// unscaled.
-    #[test]
-    fn rescale_is_invariant_to_the_noise_columns_units() {
-        let n = 64;
-        let mut primary = Array2::<f64>::zeros((n, 2));
-        let mut noise = Array2::<f64>::zeros((n, 2));
-        let weights = Array1::<f64>::ones(n);
-        for i in 0..n {
-            let t = i as f64 / n as f64;
-            primary[[i, 0]] = 1.0;
-            primary[[i, 1]] = t;
-            noise[[i, 0]] = 1.0;
-            noise[[i, 1]] = (2.0 * t).sin();
-        }
-        let unit = build_scale_deviation_transform(&primary, &noise, &weights, 1)
-            .expect("unit-scale transform");
-        let mut small = noise.clone();
-        small.column_mut(1).mapv_inplace(|v| v * 1.0e-7);
-        let scaled = build_scale_deviation_transform(&primary, &small, &weights, 1)
-            .expect("small-unit transform");
-        assert!(
-            unit.rescale[1] > 1.0,
-            "projecting out [1, t] must shrink the column's spread"
-        );
-        assert!(
-            (scaled.rescale[1] / unit.rescale[1] - 1.0).abs() < 1.0e-9,
-            "rescale moved with the column's units: {} vs {}",
-            scaled.rescale[1],
-            unit.rescale[1]
         );
     }
 }

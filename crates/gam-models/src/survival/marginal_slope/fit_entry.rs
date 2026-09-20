@@ -1226,6 +1226,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
+    let flex_jet_arenas = new_flex_jet_arena_pool();
     let initial_hyper_theta = setup.theta0();
     let family_coordinate_start = setup.rho_dim() + setup.log_kappa_dim();
     let baseline_axis_count = baseline_initial_theta.len();
@@ -1354,6 +1355,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
             time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
+            flex_jet_arenas: Arc::clone(&flex_jet_arenas),
         };
         family.memoize_operator_backed_designs();
         Ok(family)

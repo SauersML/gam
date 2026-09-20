@@ -402,53 +402,42 @@ pub(crate) fn build_location_scale_wiggle_block(
     Ok(spec)
 }
 
-pub(crate) fn prepared_gaussian_log_sigma_design(
-    mu_design: &DesignMatrix,
+/// The log-σ design of a location-scale family: the noise formula's design, raw,
+/// for every likelihood.
+///
+/// Residualizing it against the location design, `X_σ → (I − P_{X_μ}) X_σ`, imposes a
+/// constraint the likelihood does not carry, for Gaussian and binomial alike:
+///
+/// * Gaussian, `L(μ, η) = ½ Σ_i [(y_i − μ_i)² e^{−2η_i} + 2η_i]`: β_μ and β_σ enter
+///   through different sufficient statistics (residual and residual²), so a shared
+///   basis is identified.
+/// * Binomial, `q = −η_t·e^{−η_σ}`: the likelihood sees the blocks only through `q`,
+///   whose tangent null space is `{(δη_t, δη_σ) : δη_t = η_t·δη_σ}`. A log-σ direction
+///   `f` is unidentified only where `η_t·f` lies in the threshold span. For the
+///   intercept that holds at every β (the exact gauge `pseudo_logdet_mode` names).
+///   For any other `f` it holds only at a constant threshold, so a log-σ column the
+///   threshold also spans is identified whenever the threshold varies.
+///
+/// The residualization zeroed every scale column in the location span, so the scale
+/// effect it carried could not be fitted. The identifiability audit then dropped the
+/// zero column beside a family that kept the full width, and every seed was refused
+/// (#3015: noise `x3` beside `duchon(x2, x3)`, truth `σ = e^{0.3·x3}`). Survival
+/// location-scale keeps its scale design raw for the same reason.
+pub(crate) fn location_scale_log_sigma_design(
+    location_design: &DesignMatrix,
     log_sigma_design: &DesignMatrix,
 ) -> Result<DesignMatrix, String> {
-    if mu_design.nrows() != log_sigma_design.nrows() {
+    if location_design.nrows() != log_sigma_design.nrows() {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(
-                "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
-                mu_design.nrows(),
+                "location-scale log-sigma design row mismatch: location rows={}, log_sigma rows={}",
+                location_design.nrows(),
                 log_sigma_design.nrows()
             ),
         }
         .into());
     }
-    // Gaussian location-scale remains identifiable even when μ and log σ use
-    // the same covariate basis:
-    //
-    //   L(μ, η) = 0.5 * Σ_i [ (y_i - μ_i)^2 exp(-2η_i) + 2η_i ],
-    //   μ = X_μ β_μ,  η = X_σ β_σ.
-    //
-    // Shared columns are not a frame mismatch. β_μ and β_σ enter through
-    // different sufficient statistics (residual and residual²), so replacing
-    // X_σ with (I - P_{X_μ}) X_σ would impose an extra constraint and can
-    // erase real heteroscedastic signal when the two blocks share a basis.
     Ok(log_sigma_design.clone())
-}
-
-pub(crate) fn identified_binomial_log_sigma_design(
-    threshold_design: &TermCollectionDesign,
-    log_sigma_design: &TermCollectionDesign,
-    weights: &Array1<f64>,
-) -> Result<DesignMatrix, String> {
-    let non_intercept_start = log_sigma_design
-        .intercept_range
-        .end
-        .min(log_sigma_design.design.ncols());
-    let transform = build_scale_deviation_transform_design(
-        &threshold_design.design,
-        &log_sigma_design.design,
-        weights,
-        non_intercept_start,
-    )?;
-    build_scale_deviation_operator(
-        threshold_design.design.clone(),
-        log_sigma_design.design.clone(),
-        &transform,
-    )
 }
 
 pub(crate) fn identity_penalty(dim: usize) -> Array2<f64> {
@@ -520,7 +509,7 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
         &format!("{context}: mu"),
     )?;
     let prepared_noise_design =
-        prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
+        location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
     // The formula-native penalty topology is authoritative. Smooth terms carry
     // their own REML-selected null-space penalty when `double_penalty=true`
     // (the default), while an explicit `double_penalty=false` remains a real
@@ -562,9 +551,9 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
 
 /// Build the (threshold, log-σ) parameter-block pair for a Binomial
 /// location-scale family. Shared by the non-wiggle and wiggle Binomial builders;
-/// mirrors [`build_gaussian_mean_and_scale_blocks`] but with the binomial-
-/// identified log-σ design, the link-aware joint warm start, and the same
-/// REML-selected full-span scale shrinkage penalty.
+/// mirrors [`build_gaussian_mean_and_scale_blocks`], with the same raw log-σ
+/// design ([`location_scale_log_sigma_design`]), the link-aware joint warm
+/// start, and the same REML-selected full-span scale shrinkage penalty.
 pub(crate) fn build_binomial_threshold_and_scale_blocks(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -585,9 +574,9 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let noise_offset = noise_design
         .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
         .map_err(|error| error.to_string())?;
-    let identifiednoise_design =
-        identified_binomial_log_sigma_design(mean_design, noise_design, weights)?;
-    let p_noise = identifiednoise_design.ncols();
+    let raw_log_sigma_design =
+        location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
+    let p_noise = raw_log_sigma_design.ncols();
     let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
         noise_design.penalties_as_penalty_matrix();
     log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
@@ -605,7 +594,7 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     )?;
     let mut log_sigmaspec = build_location_scale_block(
         "log_sigma",
-        identifiednoise_design,
+        raw_log_sigma_design,
         noise_offset,
         log_sigma_penalty_matrices,
         vec![],
@@ -3409,8 +3398,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
         let preparednoise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)
-                .expect("prepared Gaussian log-sigma design should match block construction");
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
@@ -3560,8 +3549,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
         let preparednoise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design).expect(
-                "prepared Gaussian log-sigma design should match wiggle block construction",
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design).expect(
+                "the location-scale log-sigma design should match wiggle block construction",
             );
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
@@ -3694,15 +3683,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
-                .expect("identified binomial log-sigma design");
+        let raw_log_sigma_design =
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         BinomialLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(identifiednoise_design),
+            log_sigma_design: Some(raw_log_sigma_design),
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             jeffreys_armed: false,
         }
@@ -3855,15 +3844,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
-                .expect("identified binomial log-sigma design should match block construction");
+        let raw_log_sigma_design =
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         BinomialLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(identifiednoise_design),
+            log_sigma_design: Some(raw_log_sigma_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),

@@ -1634,7 +1634,7 @@ pub fn inverse_link_mu_d1_for_inverse_link(
 /// Each link with a cancellation-free closed form for `1 - mu` uses it; links
 /// without one fall back to `1.0 - mu` (unchanged behaviour). The complement is
 /// clamped into `[0, 1]` only against round-off just past the boundary.
-pub(crate) fn inverse_link_complement_for_inverse_link(
+pub fn inverse_link_complement_for_inverse_link(
     link: &InverseLink,
     eta: f64,
     mu: f64,
