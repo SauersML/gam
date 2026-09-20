@@ -146,8 +146,6 @@ fn base_time_block() -> TimeBlockInput {
             1,
             DEFAULT_SURVIVAL_MARGINAL_SLOPE_DERIVATIVE_GUARD,
         ),
-        time_monotonicity:
-            crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByRowConstraint,
         penalties: Vec::new(),
         nullspace_dims: Vec::new(),
         initial_log_lambdas: None,
@@ -981,8 +979,6 @@ fn validate_spec_rejects_coordinate_cone_without_guard_offset() {
             offset_entry: Array1::zeros(2),
             offset_exit: Array1::zeros(2),
             derivative_offset_exit: Array1::zeros(2),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             ..base_time_block()
         },
         timewiggle_block: None,

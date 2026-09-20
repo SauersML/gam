@@ -2321,7 +2321,7 @@ where
     // Report the outer iteration count that was MEASURED, including a genuine
     // zero. A seed that is a prior fit's terminal certificate and is still
     // stationary here is accepted without iterating
-    // (`certified_resume_is_already_stationary`), so zero is a reachable,
+    // (`claim_prior_terminal_certificate`), so zero is a reachable,
     // meaningful outcome; flooring it to one made the reported count a claim no
     // measurement supports, and every consumer asking "did a fit happen" then
     // read a fabricated pass (#2622).

@@ -456,10 +456,19 @@ fn saved_standard_payload_carries_no_per_row_training_data() {
         .get("full_conformal")
         .and_then(serde_json::Value::as_object)
         .expect("an eligible gaussian fit persists its exact full-conformal penalty");
+    // The field holds the p × p frozen penalty and the fit's smoothing-parameter
+    // count (a scalar, gam#3296), and nothing else: no labeled rows.
     assert_eq!(
         conformal.keys().collect::<Vec<_>>(),
-        vec!["s_lambda"],
-        "the exact full-conformal field must persist only the frozen penalty"
+        vec!["penalty_count", "s_lambda"],
+        "the exact full-conformal field must persist only the frozen penalty and its count"
+    );
+    assert_eq!(
+        conformal.get("penalty_count").and_then(serde_json::Value::as_u64),
+        Some(4),
+        "the conformal penalty count is the fit's four smoothing parameters \
+         (two smooths, each carrying a wiggliness and a null-space penalty under \
+         the default double penalty)"
     );
     assert!(
         longest_array(&large) < small_rows as usize,
