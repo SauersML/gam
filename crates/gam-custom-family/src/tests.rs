@@ -4518,7 +4518,11 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
         .expect("Jeffreys term")
         .expect("active Jeffreys term");
     assert!(completion.is_some());
-    assert_eq!(information_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        information_calls.load(Ordering::Relaxed),
+        1,
+        "H_Phi and its second-order completion share one materialized information",
+    );
     assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
 
@@ -4530,7 +4534,7 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
     );
     assert_eq!(
         information_calls.load(Ordering::Relaxed),
-        3,
+        2,
         "lazy drift construction must materialize the information matrix exactly once",
     );
     assert_eq!(
@@ -8093,15 +8097,10 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
 
     let hphi_at = |t: f64| -> Array2<f64> {
         let states = vec![jeffreys_seam_state(&beta + &(&direction * t))];
-        let (_, hphi, completion) =
-            custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
-                .expect("Jeffreys term")
-                .expect("the small information keeps the conditioning gate active");
-        assert!(
-            completion.is_none(),
-            "this fixture declares no contracted-trace completion, so the drift it \
-             differences is the bare divided-difference H_Phi"
-        );
+        // The drift is `D_β H_Φ`; the mode-response completion does not enter it.
+        let (_, hphi, _) = custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
+            .expect("Jeffreys term")
+            .expect("the small information keeps the conditioning gate active");
         hphi
     };
 
