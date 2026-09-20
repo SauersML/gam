@@ -145,6 +145,24 @@ impl From<CanonicalChartTopology> for ChartTopology {
     }
 }
 
+/// How the paired coordinates handed to [`fit_transport_map`] were produced.
+///
+/// The caller declares it, because the pairs cannot: a smooth deterministic map
+/// sampled at `n` points and the same map observed with small noise differ only
+/// in what an estimator is allowed to assume about the residual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairLaw {
+    /// Each target coordinate is one deterministic function of its source
+    /// coordinate (a held executed transport, a synthetic noise-free map). The
+    /// estimator is the minimum-curvature interpolant `argmin ∫h″²` through the
+    /// pairs; there is no observation noise, so no sampling covariance.
+    Deterministic,
+    /// The target coordinates scatter about a smooth map (estimated chart
+    /// coordinates, resampled other state). The estimator is the Gaussian-REML
+    /// penalized spline on a data-resolved knot spacing.
+    Stochastic,
+}
+
 /// Wrap an angle into `[0, 2π)`.
 fn wrap_tau(x: f64) -> f64 {
     x.rem_euclid(TAU)
