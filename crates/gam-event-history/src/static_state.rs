@@ -17,6 +17,7 @@ use crate::chain::{Grid, log_sum_exp, normal_density};
 use crate::cohort::EventHistoryError;
 use crate::marginal::{ForwardPass, Spell, SubjectInputs, centred_baseline, condition, node_likelihood};
 use crate::scalar::{add_real, div, exp, ln, sqrt};
+use gam_linalg::roundoff::accumulation_growth;
 use gam_math::nested_dual::{JET_ORDER_CAP, JetField};
 
 /// Newton steps that carry every derivative order a jet holds from a converged
@@ -241,29 +242,123 @@ impl<S: JetField> Statistics<S> {
         (value, gradient, precision)
     }
 
-    /// `steps` Newton ascent steps on `ln φ L` from `start`, each halved until
-    /// the objective does not fall below where it was.
-    fn ascend(&self, loadings: &[S], start: Vec<S>, steps: usize) -> Result<Vec<S>, EventHistoryError> {
+    /// The rounding floor of every score component at `z`, given the negative
+    /// Hessian `precision` there.
+    ///
+    /// Component `k` of the score is `linear_k − z_k − Σ_d rate_d a_dk`, a
+    /// product and `marks + 2` terms accumulated in turn, so one reading rounds
+    /// it by `γ_(marks+3)` of its terms' magnitudes. Each `rate_d` is `exp` of
+    /// `log_hazard_d + a_d · z`, `2·atoms` operations whose absolute rounding
+    /// `exp` turns into a relative one, plus the `exp` itself. And the point is
+    /// held to one representable step in each coordinate, which moves the score
+    /// by the precision row times that step. A Newton step from a score read to
+    /// this floor lands within it of the mode (the landing point's own rounding
+    /// is one more such step), and the score there is read with the same floor
+    /// again, so a converged mode is held to twice one reading's floor.
+    fn score_floor(&self, loadings: &[S], z: &[S], precision: &[S]) -> Vec<f64> {
+        let atoms = z.len();
+        let summation = accumulation_growth(self.log_hazards.len() + 3);
+        let exponent = accumulation_growth(2 * atoms + 1);
+        (0..atoms)
+            .map(|k| {
+                let mut magnitude = self.linear[k].value().abs() + z[k].value().abs();
+                let mut rate_rounding = 0.0;
+                for (d, log_hazard) in self.log_hazards.iter().enumerate() {
+                    if let Some(log_hazard) = log_hazard {
+                        let a = &loadings[d * atoms..(d + 1) * atoms];
+                        let (log_rate, spread) = a.iter().zip(z).fold(
+                            (log_hazard.value(), log_hazard.value().abs()),
+                            |(sum, spread), (a, z)| {
+                                let term = a.value() * z.value();
+                                (sum + term, spread + term.abs())
+                            },
+                        );
+                        let term = log_rate.exp() * a[k].value().abs();
+                        magnitude += term;
+                        rate_rounding += term * (exponent * spread + f64::EPSILON);
+                    }
+                }
+                let representable = f64::EPSILON
+                    * (0..atoms)
+                        .map(|j| precision[k * atoms + j].value().abs() * z[j].value().abs())
+                        .sum::<f64>();
+                2.0 * (summation * magnitude + rate_rounding + 2.0 * representable)
+            })
+            .collect()
+    }
+
+    /// The largest ratio of a score component to its rounding floor
+    /// ([`Statistics::score_floor`]): at most one exactly at a resolved mode,
+    /// and infinite for a score or floor that is not finite.
+    fn score_excess(&self, loadings: &[S], z: &[S], gradient: &[S], precision: &[S]) -> f64 {
+        let floor = self.score_floor(loadings, z, precision);
+        gradient.iter().zip(&floor).fold(0.0, |excess, (g, floor)| {
+            let g = g.value().abs();
+            if !g.is_finite() || !floor.is_finite() {
+                f64::INFINITY
+            } else if g == 0.0 {
+                excess
+            } else {
+                excess.max(g / floor)
+            }
+        })
+    }
+
+    /// The mode of `ln φ L`, from `start`, to the score's rounding floor.
+    ///
+    /// `ln φ L` is strictly concave (its negative Hessian is the identity plus
+    /// a positive semidefinite sum), so the Newton direction ascends. Each step
+    /// is halved until it strictly raises the objective; the objective takes
+    /// finitely many values, so this damped ascent ends, at the latest where
+    /// no halving raises it before the halved step stops moving the point:
+    /// there the gain left is below the objective's own rounding. Full Newton
+    /// steps then carry the score to its rounding floor, each required to
+    /// shrink it; one that does not before the floor is reached is a placement
+    /// that did not converge, reported as such.
+    fn ascend(&self, loadings: &[S], start: Vec<S>) -> Result<Vec<S>, EventHistoryError> {
         let mut means = start;
-        for _ in 0..steps {
+        'damped: loop {
             let (value, gradient, precision) = self.objective(loadings, &means);
+            if !value.value().is_finite() {
+                return Err(failure("static posterior grid placement met a non-finite objective"));
+            }
+            if self.score_excess(loadings, &means, &gradient, &precision) <= 1.0 {
+                return Ok(means);
+            }
             let step = solve(&precision, &gradient)?;
+            if step.iter().any(|d| !d.value().is_finite()) {
+                return Err(failure("static posterior grid placement met a non-finite Newton step"));
+            }
             let mut scale = 1.0;
-            let mut next: Vec<S> = means.iter().zip(&step).map(|(z, d)| z.add(d)).collect();
-            let mut accepted = false;
-            for _ in 0..40 {
+            loop {
+                let next: Vec<S> = means.iter().zip(&step).map(|(z, d)| z.add(&d.scale(scale))).collect();
+                if next.iter().zip(&means).all(|(next, z)| next.value() == z.value()) {
+                    break 'damped;
+                }
                 let proposed = self.objective(loadings, &next).0.value();
-                if proposed.is_finite() && proposed >= value.value() - 16.0 * f64::EPSILON * (1.0 + value.value().abs()) {
-                    accepted = true;
-                    break;
+                if proposed.is_finite() && proposed > value.value() {
+                    means = next;
+                    continue 'damped;
                 }
                 scale *= 0.5;
-                next = means.iter().zip(&step).map(|(z, d)| z.add(&d.scale(scale))).collect();
             }
-            if !accepted { return Err(failure("static posterior grid placement did not converge")); }
-            means = next;
         }
-        Ok(means)
+        let mut previous = f64::INFINITY;
+        loop {
+            let (_, gradient, precision) = self.objective(loadings, &means);
+            let excess = self.score_excess(loadings, &means, &gradient, &precision);
+            if excess <= 1.0 {
+                return Ok(means);
+            }
+            if excess >= previous {
+                return Err(failure(
+                    "static posterior grid placement did not converge: Newton steps stopped shrinking the score above its rounding floor",
+                ));
+            }
+            previous = excess;
+            let step = solve(&precision, &gradient)?;
+            means = means.iter().zip(&step).map(|(z, d)| z.add(d)).collect();
+        }
     }
 
     /// The product grid at the mode of `φ L`, scaled by its curvature.
@@ -281,7 +376,7 @@ impl<S: JetField> Statistics<S> {
             log_hazards: self.log_hazards.iter().map(|h| h.as_ref().map(JetField::value)).collect(),
         };
         let loadings: Vec<f64> = inputs.loadings.iter().map(JetField::value).collect();
-        let mode = values.ascend(&loadings, vec![0.0; inputs.rates.len()], 24)?;
+        let mode = values.ascend(&loadings, vec![0.0; inputs.rates.len()])?;
         let start = mode.iter().map(|z| like.constant_like(*z)).collect();
         self.grid_at(inputs, self.implicit_steps(inputs.loadings, start, IMPLICIT_STEPS)?)
     }
@@ -300,12 +395,13 @@ impl<S: JetField> Statistics<S> {
     }
 
     /// The grid centred at `means`, which must be the mode, with the scales
-    /// its curvature gives.
+    /// its curvature gives. The mode is held to the score's rounding floor
+    /// ([`Statistics::score_floor`]), the resolution the placement reaches.
     fn grid_at(&self, inputs: &SubjectInputs<'_, S>, means: Vec<S>) -> Result<Grid<S>, EventHistoryError> {
         let atoms = inputs.rates.len();
         let like = &inputs.eta0[0];
         let (value, gradient, precision) = self.objective(inputs.loadings, &means);
-        if !value.value().is_finite() || gradient.iter().any(|g| !g.value().is_finite() || g.value().abs() > 1e-8) {
+        if !value.value().is_finite() || self.score_excess(inputs.loadings, &means, &gradient, &precision) > 1.0 {
             return Err(failure("static posterior grid placement has an unresolved score"));
         }
         let zero = like.constant_like(0.0);
@@ -733,7 +829,7 @@ mod tests {
             }
         }
         let zero = eta0[0].constant_like(0.0);
-        let today = statistics.ascend(inputs.loadings, vec![zero; 2], 24).unwrap();
+        let today = statistics.ascend(inputs.loadings, vec![zero; 2]).unwrap();
         let values = Statistics {
             linear: statistics.linear.iter().map(JetField::value).collect(),
             log_hazards: statistics.log_hazards.iter().map(|h| h.as_ref().map(JetField::value)).collect(),
