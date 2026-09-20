@@ -5086,6 +5086,29 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             eval.psi_gradient.as_ref(),
             eval.cost,
         )?;
+        // The EFS step arrives whole, with no box on its length (#2902). The
+        // only bound on it is the outer domain, the same box opt's fixed-point
+        // loop projects every applied step onto, so the step is clipped to that
+        // domain here and the progress test, the resolution test and the cost
+        // line search all read the step that can actually be taken.
+        let raw_step = {
+            let (lower, upper) =
+                super::run::outer_search_bounds_template(self.config, self.layout.n_params);
+            if lower.len() != x.len() || upper.len() != x.len() {
+                return Err(ObjectiveEvalError::fatal(format!(
+                    "outer EFS eval failed: outer domain dimension mismatch \
+                     (parameters={}, lower={}, upper={})",
+                    x.len(),
+                    lower.len(),
+                    upper.len(),
+                )));
+            }
+            let mut clipped = raw_step;
+            for (i, delta) in clipped.iter_mut().enumerate() {
+                *delta = (x[i] + *delta).max(lower[i]).min(upper[i]) - x[i];
+            }
+            clipped
+        };
         let current_cost = eval.cost;
         // #2241 — an objective may certify that consecutive inner solves
         // returned to the same banked incumbent after non-monotone boundary
