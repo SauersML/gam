@@ -25,6 +25,15 @@
 //! `−2 Σ (δc_ij r_i + c_ij δr_i)` per atom. The Riemannian Hessian on the sphere
 //! is that product projected to the tangent space minus `⟨d_a, ∂F/∂d_a⟩ v_a`.
 //!
+//! **Attainable decrease.** A row whose support holds `s` unit atoms has
+//! `‖A_iᵀc‖ ≤ ‖A_i‖_F ‖c‖ = √s ‖c‖`, so with `t = ‖A_iᵀc‖` its loss is at least
+//! `min_t (‖x_i‖ − t)² + (ρ/s) t² = ρ‖x_i‖²/(s + ρ)` for EVERY unit decoder. The
+//! decrease any decoder can buy at these supports is therefore at most
+//! `Σ_i F_i(D) − ρ‖x_i‖²/(s_i + ρ)`, whatever the Hessian does. At a zero-residual
+//! fit the loss is the ridge alone and this gap is of order `ρ‖X‖²`, where the
+//! gauge directions of the profiled Hessian are flat and its computed curvature is
+//! rounding of either sign.
+//!
 //! Every per-atom sum runs over the atom's firings in row order and every inner
 //! product over atoms in atom order, so the step does not depend on the thread
 //! count.
@@ -40,6 +49,9 @@ struct ProfiledRow {
     codes: Array1<f64>,
     residual: Array1<f64>,
     gram: ResolvedActiveGram,
+    /// `‖r‖² + ρ‖c‖² − ρ‖x‖²/(s + ρ)`: this row's loss above the floor no unit
+    /// decoder at its support can go below.
+    excess: f64,
 }
 
 /// What one decoder Newton solve measured and proposes.
@@ -47,13 +59,18 @@ pub(super) struct DecoderNewtonStep {
     /// `½ gᵀH⁻¹g` in loss units, the decrease the quadratic model promises.
     pub(super) decrement: f64,
     /// The solve resolved the decrement: the Hessian was positive definite on every
-    /// Krylov direction and conjugate gradients converged.
+    /// Krylov direction, and conjugate gradients converged or spanned the tangent
+    /// space.
     pub(super) resolved: bool,
     /// The decoder the Newton step reaches, retracted to unit rows. `None` when the
     /// first Krylov direction already had nonpositive curvature.
     pub(super) candidate: Option<Array2<f32>>,
-    /// Hessian-vector products spent.
+    /// Hessian-vector products spent, at most the tangent dimension.
     pub(super) hessian_products: usize,
+    /// An upper bound on the decrease ANY unit decoder can buy at these supports,
+    /// `Σ_i F_i(D) − ρ‖x_i‖²/(s_i + ρ)` (see the module docs). It holds whether or
+    /// not the solve resolved.
+    pub(super) attainable_gap: f64,
 }
 
 /// The profiled objective `F(D)` at one decoder, with its Riemannian gradient and
@@ -68,6 +85,8 @@ struct ProfiledDecoder {
     radial: Vec<f64>,
     /// The tangent gradient.
     gradient: Array2<f64>,
+    /// `Σ_i excess_i` in row order, the attainable decrease at these supports.
+    attainable_gap: f64,
 }
 
 impl ProfiledDecoder {
@@ -110,6 +129,12 @@ impl ProfiledDecoder {
             .collect();
         let mut gradient = euclidean_gradient;
         project_tangent(&mut gradient, decoder.view(), &moves);
+        let attainable_gap = rows
+            .iter()
+            .flatten()
+            .map(|profiled| profiled.excess)
+            .sum::<f64>()
+            .max(0.0);
         Self {
             decoder,
             moves,
@@ -117,6 +142,7 @@ impl ProfiledDecoder {
             firings,
             radial,
             gradient,
+            attainable_gap,
         }
     }
 
@@ -179,10 +205,19 @@ impl ProfiledDecoder {
 /// move.
 ///
 /// Conjugate gradients stops when the residual falls to `relative_tolerance` of the
-/// gradient, or when an iteration no longer moves the decrement at f64 resolution.
+/// gradient, when an iteration no longer moves the decrement at f64 resolution, or
+/// when it has spent the tangent dimension `d = (moving atoms)·(P − 1)`. On a
+/// positive definite operator CG spans the whole tangent space in `d` iterations
+/// and its iterate is then the Newton step in exact arithmetic. In floating point,
+/// on the ill-conditioned Hessians of a ridge-selected rotation (condition near
+/// `1/ρ`), the recursive residual stalls at its attainable accuracy above the
+/// relative stop, and every further iteration re-explores directions already
+/// spanned with gains the decrement test does not reject; without the bound the
+/// solve never ended (#3402 review). An exhausted solve is resolved.
 /// A direction of nonpositive curvature ends the solve unresolved: the point is not
 /// a local minimum of the profiled objective, and the step keeps the iterate built
-/// before that direction.
+/// before that direction. [`DecoderNewtonStep::attainable_gap`] still bounds what
+/// such a point gives up.
 pub(super) fn decoder_newton_step(
     x: ArrayView2<'_, f32>,
     decoder: ArrayView2<'_, f32>,
@@ -201,23 +236,28 @@ pub(super) fn decoder_newton_step(
     );
     let gradient = &profiled.gradient;
     let gradient_norm2 = inner(gradient, gradient);
+    let attainable_gap = profiled.attainable_gap;
     if gradient_norm2 == 0.0 {
         return DecoderNewtonStep {
             decrement: 0.0,
             resolved: true,
             candidate: None,
             hessian_products: 0,
+            attainable_gap,
         };
     }
+    let tangent_dimension = profiled.moves.iter().filter(|&&moves| moves).count() * (p - 1);
     let stop = relative_tolerance * gradient_norm2.sqrt();
     let mut step = Array2::<f64>::zeros((k, p));
     let mut residual = gradient.mapv(|value| -value);
     let mut search = residual.clone();
     let mut residual_norm2 = gradient_norm2;
     let mut decrement = 0.0f64;
-    let mut resolved = false;
+    // Exhausting the tangent dimension resolves the solve; only nonpositive
+    // curvature leaves it unresolved.
+    let mut resolved = true;
     let mut hessian_products = 0usize;
-    loop {
+    while hessian_products < tangent_dimension {
         let curved = profiled.hessian_product(&search);
         hessian_products += 1;
         let curvature = inner(&search, &curved);
@@ -228,6 +268,7 @@ pub(super) fn decoder_newton_step(
                 gradient_norm2.sqrt(),
                 residual_norm2.sqrt(),
             );
+            resolved = false;
             break;
         }
         let length = residual_norm2 / curvature;
@@ -239,7 +280,6 @@ pub(super) fn decoder_newton_step(
         decrement += gain;
         let next_norm2 = inner(&residual, &residual);
         if next_norm2.sqrt() <= stop || gain <= f64::EPSILON * decrement {
-            resolved = true;
             break;
         }
         let beta = next_norm2 / residual_norm2;
@@ -268,6 +308,7 @@ pub(super) fn decoder_newton_step(
         resolved,
         candidate,
         hessian_products,
+        attainable_gap,
     }
 }
 
@@ -295,11 +336,15 @@ fn profile_row(
     let gram = ResolvedActiveGram::new(&gram_matrix, code_ridge, p);
     let codes = gram.solve(active.dot(&target).view());
     let residual = &target - &active.t().dot(&codes);
+    let support = atoms.len() as f64;
+    let excess = residual.dot(&residual) + code_ridge * codes.dot(&codes)
+        - code_ridge * target.dot(&target) / (support + code_ridge);
     Some(ProfiledRow {
         atoms,
         codes,
         residual,
         gram,
+        excess,
     })
 }
 
@@ -546,6 +591,68 @@ mod tests {
             first.decrement,
             second.decrement,
             third.decrement
+        );
+    }
+
+    #[test]
+    fn conjugate_gradients_ends_within_the_tangent_dimension_3402() {
+        // A zero relative stop is never met, so only the decrement test or the
+        // tangent-dimension bound can end the solve: three moving atoms in R⁴ span a
+        // nine-dimensional tangent space.
+        let (x, decoder, codes) = fixture();
+        let start = decoder.mapv(|value| value as f32);
+        for movable in [[true; 3], [true, false, true]] {
+            let moving = movable.iter().filter(|&&moves| moves).count();
+            let step = decoder_newton_step(x.view(), start.view(), &codes, 0.05, &movable, 0.0);
+            assert!(step.resolved, "movable {movable:?}: unresolved");
+            assert!(
+                step.hessian_products <= moving * (x.ncols() - 1),
+                "movable {movable:?}: {} Hessian products past the tangent dimension",
+                step.hessian_products
+            );
+            assert!(step.decrement.is_finite() && step.decrement > 0.0);
+        }
+    }
+
+    #[test]
+    fn attainable_gap_bounds_every_unit_decoder_and_vanishes_at_the_ridge_floor_3402() {
+        // Upper bound: no unit decoder at the fixture's supports sits lower than the
+        // profiled loss minus the gap, near the start or far from it.
+        let (x, decoder, codes) = fixture();
+        let ridge = 0.05;
+        let profiled = ProfiledDecoder::new(x.view(), decoder.clone(), &codes, ridge, &[true; 3]);
+        let floor =
+            profiled_loss(x.view(), decoder.view(), &codes, ridge) - profiled.attainable_gap;
+        assert!(profiled.attainable_gap > 0.0);
+        for seed in [5, 17, 43, 71] {
+            let direction = tangent_direction(&decoder, seed);
+            for t in [0.01, 0.3, 3.0] {
+                let other = retract(&decoder, &direction, t);
+                let loss = profiled_loss(x.view(), other.view(), &codes, ridge);
+                assert!(
+                    loss >= floor * (1.0 - 1e-12),
+                    "seed {seed}, t {t}: loss {loss:e} below the attainable floor {floor:e}"
+                );
+            }
+        }
+
+        // Tightness: rows that each sit on their own unit atom, one atom per support,
+        // are at `ρ‖x‖²/(1 + ρ)`, the floor itself, so nothing is left to gain.
+        let rows = ndarray::array![[3.0f32, 0.0, 4.0], [0.0, -2.0, 0.0], [1.0, 2.0, 2.0]];
+        let atoms = unit_rows(rows.mapv(f64::from));
+        let single: Vec<SparseCode> = (0..rows.nrows() as u32)
+            .map(|atom| SparseCode {
+                indices: vec![atom],
+                codes: vec![1.0],
+            })
+            .collect();
+        let ridge = 1e-3;
+        let at_floor = ProfiledDecoder::new(rows.view(), atoms, &single, ridge, &[true; 3]);
+        let energy: f64 = rows.iter().map(|&value| f64::from(value).powi(2)).sum();
+        assert!(
+            at_floor.attainable_gap <= 1e-12 * ridge * energy,
+            "gap {:e} at the ridge floor",
+            at_floor.attainable_gap
         );
     }
 }

@@ -17,10 +17,14 @@
 //! older method-of-moments form `k = ½(1 − μ²/Var)` is structurally capped
 //! below `0.5` and so cannot fire a heavy-tail gate.
 
+pub use gam_problem::rho_posterior::WeightTailShape;
+
 #[derive(Debug, Clone)]
 pub struct PsisResult {
     pub smoothed: Vec<f64>,
-    pub k_hat: f64,
+    /// The fitted GPD shape of the upper tail, or [`WeightTailShape::Flat`]
+    /// when every tail weight equals the threshold weight.
+    pub shape: WeightTailShape,
     pub tail_start: usize,
     pub tail_count: usize,
 }
@@ -71,10 +75,32 @@ pub fn shape_standard_error(tail_n: usize, k: f64) -> f64 {
     n.sqrt() * (1.0 + k) / (n + SHAPE_PRIOR_PSEUDO_OBSERVATIONS)
 }
 
+/// Fewest draws `S` at which a PSIS estimate whose weights have tail shape `k`
+/// is reliable: `⌈10^{1/(1−k)}⌉`, the inverse of the sample-size-dependent
+/// threshold `k < 1 − 1/log₁₀ S` of Vehtari, Simpson, Gelman, Yao & Gabry
+/// (2024, "Pareto smoothed importance sampling", JMLR 25). It is `10` at
+/// `k ≤ 0`, `100` at `k = 0.5` and `2155` at `k = 0.7`, the shape beyond which
+/// that paper holds no draw count makes the estimate reliable; for `k ≥ 1` (or
+/// a non-finite `k`) it is `None`.
+pub fn reliable_sample_size(k: f64) -> Option<usize> {
+    if !(k < 1.0) {
+        return None;
+    }
+    let exponent = 1.0 / (1.0 - k.max(0.0));
+    Some(10f64.powf(exponent).ceil() as usize)
+}
+
 /// Pareto-smooth a non-negative weight vector and report the fitted GPD tail
 /// shape.  Non-tail observations are left bit-identical; only the largest tail
 /// observations are replaced by sorted GPD expected quantiles and then clipped
 /// to be non-decreasing in the original sorted order.
+///
+/// When the largest weight equals the threshold (the largest non-tail weight),
+/// every tail excess is exactly zero: the weights have no upper tail, there is
+/// no shape to fit, and smoothing would return the same weights. That case is
+/// reported as [`WeightTailShape::Flat`] with the weights unchanged (#3202). The
+/// comparison is exact, because the tail is sorted and each of its weights lies
+/// between the threshold and the largest weight.
 pub fn pareto_smooth_weights(weights: &[f64]) -> Option<PsisResult> {
     if weights.len() < MIN_TAIL_COUNT * 2 || weights.iter().any(|w| !w.is_finite() || *w < 0.0) {
         return None;
@@ -88,6 +114,14 @@ pub fn pareto_smooth_weights(weights: &[f64]) -> Option<PsisResult> {
     }
     let tail_start = n - tail_count;
     let threshold = indexed[tail_start - 1].1;
+    if indexed[n - 1].1 == threshold {
+        return Some(PsisResult {
+            smoothed: weights.to_vec(),
+            shape: WeightTailShape::Flat,
+            tail_start,
+            tail_count,
+        });
+    }
     let excesses: Vec<f64> = indexed[tail_start..]
         .iter()
         .map(|(_, w)| (w - threshold).max(0.0))
@@ -104,7 +138,7 @@ pub fn pareto_smooth_weights(weights: &[f64]) -> Option<PsisResult> {
     }
     Some(PsisResult {
         smoothed,
-        k_hat,
+        shape: WeightTailShape::Pareto(k_hat),
         tail_start,
         tail_count,
     })
@@ -312,11 +346,37 @@ mod tests {
         }
         let out = pareto_smooth_weights(&w).expect("PSIS should fit a positive tail");
         assert_eq!(out.smoothed[0], 1.0);
+        let WeightTailShape::Pareto(k_hat) = out.shape else {
+            panic!("a genuine GPD tail must be fitted, got {:?}", out.shape);
+        };
         assert!(
-            out.k_hat > 0.5,
-            "genuine GPD(k=0.7) tail should be flagged as heavy (infinite variance); got k_hat={}",
-            out.k_hat
+            k_hat > 0.5,
+            "genuine GPD(k=0.7) tail should be flagged as heavy (infinite variance); got k_hat={k_hat}"
         );
+    }
+
+    /// #3202: an exact proposal makes every weight the same number. Its tail
+    /// excesses are all zero, which is no tail rather than too few to fit, so
+    /// the weights come back unchanged with the typed flat shape. A plateau at
+    /// the top over weights that vary below it is flat in the same sense: the
+    /// tail is what the shape describes.
+    #[test]
+    fn flat_tail_is_reported_as_flat_with_the_weights_unchanged_3202() {
+        for n in [10usize, 64, 1000] {
+            let w = vec![0.75; n];
+            let out = pareto_smooth_weights(&w).expect("constant weights have a flat tail");
+            assert_eq!(out.shape, WeightTailShape::Flat, "n = {n}");
+            assert_eq!(out.smoothed, w, "n = {n}");
+            assert_eq!(out.tail_count, tail_count(n));
+        }
+        let mut plateau: Vec<f64> = (0..64).map(|i| 0.01 * (i + 1) as f64).collect();
+        let tail = tail_count(64);
+        for v in &mut plateau[64 - tail - 1..] {
+            *v = 1.0;
+        }
+        let out = pareto_smooth_weights(&plateau).expect("a flat top is a flat tail");
+        assert_eq!(out.shape, WeightTailShape::Flat);
+        assert_eq!(out.smoothed, plateau);
     }
 
     /// Regression for #585 from the *shape-recovery* angle: the moment estimator
@@ -428,5 +488,22 @@ mod tests {
             assert!((se - unshrunk * shrink).abs() <= 4.5 * f64::EPSILON * se, "n = {n}: {se}");
         }
         assert!(shape_standard_error(1_000_000, 0.7) < 0.002);
+    }
+
+    /// The reliable draw count inverts `k < 1 − 1/log₁₀ S`: at the returned `S`
+    /// the paper's threshold reaches `k`, and one draw fewer leaves it below.
+    #[test]
+    fn reliable_sample_size_inverts_the_sample_size_threshold() {
+        assert_eq!(reliable_sample_size(-0.3), Some(10));
+        assert_eq!(reliable_sample_size(0.0), Some(10));
+        assert_eq!(reliable_sample_size(0.5), Some(100));
+        assert_eq!(reliable_sample_size(0.7), Some(2155));
+        assert_eq!(reliable_sample_size(1.0), None);
+        assert_eq!(reliable_sample_size(f64::NAN), None);
+        let threshold = |s: usize| 1.0 - 1.0 / (s as f64).log10();
+        for k in [0.1, 0.3, 0.55, 0.62, 0.69] {
+            let s = reliable_sample_size(k).expect("k < 1");
+            assert!(threshold(s) >= k && threshold(s - 1) < k, "k = {k}: S = {s}");
+        }
     }
 }

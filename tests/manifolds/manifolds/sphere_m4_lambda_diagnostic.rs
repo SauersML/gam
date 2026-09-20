@@ -1,5 +1,5 @@
 //! Diagnostic: dump REML-chosen lambdas / log_lambdas / beta-norm / pred-variance
-//! for sphere(lat, lon, k=30, m=1..4). Hypothesis under investigation: at m=4
+//! for sphere(lat, lon, k=30, penalty_order=1..4). Hypothesis under investigation: at m=4
 //! REML picks λ→∞ and the smooth contribution collapses to a near-constant
 //! (the response mean), while m=1, 2, 3 fit the truth fine.
 //!
@@ -58,7 +58,7 @@ fn sphere_m_sweep_lambda_diagnostic() {
     eprintln!("=========================================================\n");
 
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, k=30, m={m})");
+        let formula = format!("y ~ sphere(lat, lon, k=30, penalty_order={m})");
         eprintln!("---- m={m} : `{formula}` ----");
         let result = match fit_from_formula(&formula, &data, &cfg) {
             Ok(r) => r,

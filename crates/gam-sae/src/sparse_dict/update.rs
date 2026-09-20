@@ -990,11 +990,12 @@ fn run_from_decoder(
             &next_codes,
         );
 
-        // Per-epoch heartbeat on the log::warn channel (log::info is dropped by
-        // the RUST_LOG=warn harnesses, which is why a multi-hour host fit went
-        // silent). A hang in the refresh or route is visible at round cadence,
-        // and the CG certificate (giant component size, the a-priori κ bound,
-        // any typed non-convergence) is on the same line.
+        // Per-epoch heartbeat at debug level: silent by default, and streamed
+        // while the fit runs once the caller lowers the `gamfit` logger (or
+        // the CLI's log level) to debug. A hang in the refresh or route is then
+        // visible at round cadence, and the CG certificate (giant component
+        // size, the a-priori κ bound, any typed non-convergence) is on the
+        // same line.
         log::debug!(
             "[SAE epoch {}/{}] ev={:.6} improve={:.3e} ev_resid={:.3e} decoder_resid={:.3e} \
              routing_resid={:.3e} births={} revived={} live={}/{} \
@@ -1070,7 +1071,12 @@ fn run_from_decoder(
         // The residuals bound one epoch's step. The decrement bounds what the profiled
         // objective still gives up at these supports: inside the tolerance in loss units,
         // or inside the loss's own rounding, where no arithmetic resolves it (#3193).
-        let stationary = newton.resolved && newton.decrement <= loss_tolerance.max(certified_band);
+        // The attainable gap bounds the same loss for every unit decoder at once, so it
+        // certifies where the Hessian cannot: at a zero-residual fit its gauge directions
+        // are flat and the computed curvature is rounding of either sign. An unresolved
+        // solve reports an infinite decrement, so only the gap can certify such a state.
+        let stationary =
+            newton.decrement.min(newton.attainable_gap) <= loss_tolerance.max(certified_band);
         let certified_fixed_point = structure_settled
             && numerically_sound
             && stationary
@@ -1140,9 +1146,11 @@ fn run_from_decoder(
                 penalized_objective(x, candidate.view(), &candidate_codes, config.code_ridge);
             log::debug!(
                 "[SAE epoch {epochs_run}] decoder Newton: decrement={:.3e} resolved={} \
-                 hessian_products={} plain_loss={plain_loss:.9e} newton_loss={candidate_loss:.9e}",
+                 attainable_gap={:.3e} hessian_products={} plain_loss={plain_loss:.9e} \
+                 newton_loss={candidate_loss:.9e}",
                 newton.decrement,
                 newton.resolved,
+                newton.attainable_gap,
                 newton.hessian_products,
             );
             if candidate_loss + candidate_band < plain_loss - plain_band {

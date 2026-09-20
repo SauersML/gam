@@ -1,4 +1,4 @@
-//! #1379 — univariate `matern(x)` / `s(x, bs="gp")` deterministically aborted at
+//! #1379 — univariate `matern(x)` / `s(x, bs="matern")` deterministically aborted at
 //! n=200 on >50% of ordinary 1-D datasets with
 //! "range penalty block contains non-finite entries (max finite magnitude
 //! 0.000e0)".
