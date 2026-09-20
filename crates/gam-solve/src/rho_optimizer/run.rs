@@ -7188,6 +7188,16 @@ pub(crate) fn run_outer_uncertified(
     // there instead of replaying the same refuted fixed-point walk or throwing
     // away useful work.
     let mut refuted_fixed_point_continuation: Option<OuterResult> = None;
+    // The lowest finite state an earlier attempt of THIS ladder ended at without a
+    // claim (#3306). A degraded plan changes how the search moves, not the
+    // objective, so it resumes that state instead of re-searching from the seed:
+    // restarting discarded every accepted step of the refused attempt. On a binary
+    // Bernoulli marginal-slope fit the gradient-only BFGS attempt ended at the
+    // certified value to seven digits, and exact-curvature ARC re-searched from
+    // the seed. A state carried in from an earlier search is only this ladder's
+    // comparator (`carried_checkpoint`), never its start: the caller chose this
+    // ladder's seed, and a multistart member keeps its own basin.
+    let mut ladder_incumbent: Option<OuterResult> = None;
     // Iterations spent by attempts whose results this function discards: a plan
     // the degraded ladder replaces, a fixed-point walk handed to BFGS.
     // `OuterResult.iterations` is the total across solver restarts and these are
@@ -7209,6 +7219,26 @@ pub(crate) fn run_outer_uncertified(
         // would be. Otherwise this attempt could publish the optimum an earlier attempt declined
         // (#2953).
         attempt_config.carried_checkpoint = best_checkpoint.as_ref().map(carried_checkpoint_of);
+        if let Some(incumbent) = ladder_incumbent.as_ref() {
+            attempt_config.initial_rho = Some(incumbent.rho.clone());
+            // The configured inner seed belongs to the configured start, not to
+            // this incumbent; the inner solve warm-starts from its own cache.
+            attempt_config.initial_inner_seed = None;
+            // A mid-run incumbent is not a terminal certificate imported from a
+            // prior fit, and a transferred Hessian is bound to that prior fit's
+            // rho, not to this state.
+            attempt_config.initial_rho_is_prior_terminal_certificate = false;
+            attempt_config.warm_start_outer_hessian = None;
+            log::debug!(
+                "[OUTER] {context}: resuming {the_plan} from the lowest finite state an \
+                 earlier attempt of this ladder ended at ({:?}, {} iteration(s)): \
+                 cost={:.6e}, |g|={:?}",
+                incumbent.plan_used.solver,
+                incumbent.iterations,
+                incumbent.final_value,
+                incumbent.final_grad_norm,
+            );
+        }
         if let Some(checkpoint) = fixed_point_continuation.take() {
             if !matches!(the_plan.solver, Solver::Bfgs) {
                 return Err(EstimationError::RemlOptimizationFailed(format!(
@@ -7400,6 +7430,13 @@ pub(crate) fn run_outer_uncertified(
                         !checkpoint.final_value.is_finite()
                             || result.final_value < checkpoint.final_value
                     });
+                let improves_incumbent = result.final_value.is_finite()
+                    && ladder_incumbent
+                        .as_ref()
+                        .is_none_or(|incumbent| result.final_value < incumbent.final_value);
+                if improves_incumbent {
+                    ladder_incumbent = Some(result.clone());
+                }
                 if improves_checkpoint {
                     best_checkpoint = Some(result);
                 }

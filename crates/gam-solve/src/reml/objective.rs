@@ -236,7 +236,7 @@ impl<'a> RemlState<'a> {
             return Ok(f64::INFINITY);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_value_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2659,7 +2659,7 @@ impl<'a> RemlState<'a> {
             return Ok(eval.gradient);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2777,7 +2777,7 @@ impl<'a> RemlState<'a> {
         }
 
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2794,7 +2794,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Genuinely value-only fulfilment (#979). A `Value` request never needs
-        // the outer gradient. The inner solve above (`obtain_eval_bundle`) has
+        // the outer gradient. The inner solve above (`obtain_outer_eval_bundle`) has
         // already established its owned mode, so assemble only the scalar cost,
         // return a zero-length gradient, and surface the coefficient hint for a
         // typed reactive waypoint when one is active. Line-search, screening,
