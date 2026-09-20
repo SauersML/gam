@@ -2613,5 +2613,21 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
+    "items": [
+      "crates/gam-runtime/src/process_monitor.rs:fn:clock_ticks_per_second",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_io_bytes_wrong_key_returns_none",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_count_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_valid_line",
+      "crates/gam-runtime/src/process_monitor.rs:fn:parse_status_kb_wrong_key_returns_none"
+    ],
+    "reason": "#4083: process_monitor.rs kept three copies of the /proc line parser (parse_status_kb and parse_status_count byte-identical, parse_io_bytes the same minus a no-op first-token split), a clock_ticks_per_second with an unreachable non-Linux 0.0 arm, and a CpuSampler last_cores fallback reachable only for a zero wall-clock delta; the heartbeat also labelled every average with the nominal interval instead of the measured window. parse_proc_value replaces the three parsers, CLOCK_TICKS_PER_SECOND replaces clock_ticks_per_second, and the five parser unit tests become parse_proc_value_reads_status_and_io_lines and parse_proc_value_wrong_key_returns_none, which keep every assertion; busy_cores_averages_over_the_measured_window is new.",
+    "evidence": "scripts/source_removal_guard.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit lists exactly these removals, all private to crates/gam-runtime/src/process_monitor.rs. Read-proof at the head: git grep -w finds 0 occurrences of parse_status_count, parse_io_bytes and clock_ticks_per_second in crates/ tests/ examples/; parse_status_kb survives only as an unrelated local helper in crates/gam-sae/examples/scale_k.rs."
   }
 ]

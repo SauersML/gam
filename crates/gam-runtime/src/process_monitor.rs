@@ -283,64 +283,61 @@ fn format_duration(duration: Duration) -> String {
 /// Process-wide CPU utilization sampler.
 ///
 /// On Linux it reads cumulative user+system CPU jiffies from `/proc/self/stat`
-/// and, between consecutive heartbeats, computes the average number of cores
-/// kept busy over the interval: `Δ(utime+stime)/clock_hz / Δwall`. The first
-/// heartbeat has no prior sample and reports the busy figure as unknown.
+/// and, between consecutive successful reads, computes the average number of
+/// cores kept busy over the measured wall-clock window:
+/// `Δ(utime+stime)/CLOCK_TICKS_PER_SECOND / Δwall`. The first heartbeat has no
+/// prior sample and reports the busy figure as unknown.
 struct CpuSampler {
-    prev_total_ticks: Option<u64>,
-    prev_wall: Option<Instant>,
-    last_cores: Option<f64>,
+    previous: Option<(u64, Instant)>,
 }
 
 impl CpuSampler {
     fn new() -> Self {
-        Self {
-            prev_total_ticks: None,
-            prev_wall: None,
-            last_cores: None,
-        }
+        Self { previous: None }
     }
 
     fn sample(&mut self) -> CpuSnapshot {
         let now = Instant::now();
         let ticks = read_self_cpu_ticks();
-        let cores = match (ticks, self.prev_total_ticks, self.prev_wall) {
-            (Some(ticks), Some(prev_ticks), Some(prev_wall)) => {
-                let delta_ticks = ticks.saturating_sub(prev_ticks) as f64;
-                let delta_wall = now.duration_since(prev_wall).as_secs_f64();
-                let hz = clock_ticks_per_second();
-                if delta_wall > 0.0 && hz > 0.0 {
-                    let cores = delta_ticks / hz / delta_wall;
-                    self.last_cores = Some(cores);
-                    Some(cores)
-                } else {
-                    self.last_cores
-                }
-            }
+        let busy = match (ticks, self.previous) {
+            (Some(ticks), Some((prev_ticks, prev_wall))) => busy_cores(
+                ticks.saturating_sub(prev_ticks),
+                now.duration_since(prev_wall),
+            ),
             _ => None,
         };
         if let Some(ticks) = ticks {
-            self.prev_total_ticks = Some(ticks);
-            self.prev_wall = Some(now);
+            self.previous = Some((ticks, now));
         }
         CpuSnapshot {
-            cores,
+            busy,
             ncpu: available_parallelism(),
-            window: PROCESS_MONITOR_INTERVAL,
         }
     }
 }
 
+/// Average cores kept busy by `delta_ticks` CPU jiffies over `window`; `None`
+/// for an empty window, which has no average.
+fn busy_cores(delta_ticks: u64, window: Duration) -> Option<(f64, Duration)> {
+    let seconds = window.as_secs_f64();
+    (seconds > 0.0).then(|| {
+        (
+            delta_ticks as f64 / CLOCK_TICKS_PER_SECOND / seconds,
+            window,
+        )
+    })
+}
+
 struct CpuSnapshot {
-    cores: Option<f64>,
+    /// Average busy cores and the measured window they were averaged over.
+    busy: Option<(f64, Duration)>,
     ncpu: Option<usize>,
-    window: Duration,
 }
 
 impl CpuSnapshot {
     fn format(&self) -> String {
-        match self.cores {
-            Some(cores) => {
+        match self.busy {
+            Some((cores, window)) => {
                 let of = match self.ncpu {
                     Some(n) => format!("/{n}"),
                     None => String::new(),
@@ -349,7 +346,7 @@ impl CpuSnapshot {
                     "cpu={:.1}{} cores (avg over {})",
                     cores,
                     of,
-                    format_duration(self.window),
+                    format_duration(window),
                 )
             }
             None => "cpu=<warming-up>".to_string(),
@@ -380,19 +377,12 @@ fn read_self_cpu_ticks() -> Option<u64> {
     None
 }
 
-/// Clock ticks per second (`sysconf(_SC_CLK_TCK)`); on Linux this is almost
-/// universally 100. We hard-pin 100 rather than linking libc just for the
-/// sysconf call — the value is fixed at kernel build time and the standard
-/// Linux ABI value is 100, which is what `/proc` times are reported in.
-#[cfg(target_os = "linux")]
-fn clock_ticks_per_second() -> f64 {
-    100.0
-}
-
-#[cfg(not(target_os = "linux"))]
-fn clock_ticks_per_second() -> f64 {
-    0.0
-}
+/// Clock ticks per second (`sysconf(_SC_CLK_TCK)`) that `/proc/self/stat`
+/// reports `utime`/`stime` in. We hard-pin 100 rather than linking libc just
+/// for the sysconf call: the value is fixed at kernel build time and the
+/// standard Linux ABI value is 100. Off Linux no ticks are read, so it is
+/// never used there.
+const CLOCK_TICKS_PER_SECOND: f64 = 100.0;
 
 fn available_parallelism() -> Option<usize> {
     thread::available_parallelism().ok().map(|n| n.get())
@@ -435,20 +425,20 @@ impl ProcessResourceSnapshot {
         let mut snapshot = Self::default();
         if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
             for line in status.lines() {
-                if let Some(value) = parse_status_kb(line, "VmRSS:") {
+                if let Some(value) = parse_proc_value(line, "VmRSS:") {
                     snapshot.rss_kb = Some(value);
-                } else if let Some(value) = parse_status_kb(line, "VmHWM:") {
+                } else if let Some(value) = parse_proc_value(line, "VmHWM:") {
                     snapshot.peak_rss_kb = Some(value);
-                } else if let Some(value) = parse_status_count(line, "Threads:") {
+                } else if let Some(value) = parse_proc_value(line, "Threads:") {
                     snapshot.threads = Some(value);
                 }
             }
         }
         if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
             for line in io.lines() {
-                if let Some(value) = parse_io_bytes(line, "read_bytes:") {
+                if let Some(value) = parse_proc_value(line, "read_bytes:") {
                     snapshot.read_bytes = Some(value);
-                } else if let Some(value) = parse_io_bytes(line, "write_bytes:") {
+                } else if let Some(value) = parse_proc_value(line, "write_bytes:") {
                     snapshot.write_bytes = Some(value);
                 }
             }
@@ -457,22 +447,15 @@ impl ProcessResourceSnapshot {
     }
 }
 
+/// The integer after `key` on one `/proc/self/{status,io}` line, ignoring a
+/// trailing unit such as `kB`.
 #[cfg(target_os = "linux")]
-fn parse_status_kb(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_status_count(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.split_whitespace().next()?.parse().ok()
-}
-
-#[cfg(target_os = "linux")]
-fn parse_io_bytes(line: &str, key: &str) -> Option<u64> {
-    let rest = line.strip_prefix(key)?.trim();
-    rest.parse().ok()
+fn parse_proc_value(line: &str, key: &str) -> Option<u64> {
+    line.strip_prefix(key)?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
 }
 
 fn format_count(value: Option<u64>) -> String {
@@ -616,41 +599,38 @@ mod format_tests {
         assert_eq!(format_kb(Some(1)), "1.0KiB");
     }
 
-    // ── parse_status_kb / parse_status_count / parse_io_bytes (Linux) ─────────
+    // ── parse_proc_value (Linux) ─────────────────────────────────────────────
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_status_kb_valid_line() {
-        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmRSS:"), Some(1234));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_status_kb_wrong_key_returns_none() {
-        assert_eq!(parse_status_kb("VmRSS:\t1234 kB", "VmPeak:"), None);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_status_count_valid_line() {
+    fn parse_proc_value_reads_status_and_io_lines() {
+        assert_eq!(parse_proc_value("VmRSS:\t1234 kB", "VmRSS:"), Some(1234));
+        assert_eq!(parse_proc_value("Threads:\t42", "Threads:"), Some(42));
         assert_eq!(
-            parse_status_count("voluntary_ctxt_switches:\t42", "voluntary_ctxt_switches:"),
-            Some(42)
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn parse_io_bytes_valid_line() {
-        assert_eq!(
-            parse_io_bytes("read_bytes: 65536", "read_bytes:"),
+            parse_proc_value("read_bytes: 65536", "read_bytes:"),
             Some(65536)
         );
     }
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn parse_io_bytes_wrong_key_returns_none() {
-        assert_eq!(parse_io_bytes("read_bytes: 65536", "write_bytes:"), None);
+    fn parse_proc_value_wrong_key_returns_none() {
+        assert_eq!(parse_proc_value("VmRSS:\t1234 kB", "VmPeak:"), None);
+        assert_eq!(parse_proc_value("read_bytes: 65536", "write_bytes:"), None);
+    }
+
+    // ── CPU busy window ──────────────────────────────────────────────────────
+
+    #[test]
+    fn busy_cores_averages_over_the_measured_window() {
+        // 1_200 jiffies at 100 Hz is 12 CPU-seconds; over 3 s that is 4 cores.
+        let window = Duration::from_secs(3);
+        assert_eq!(busy_cores(1_200, window), Some((4.0, window)));
+        assert_eq!(busy_cores(1_200, Duration::ZERO), None);
+        let snapshot = CpuSnapshot {
+            busy: busy_cores(1_200, window),
+            ncpu: Some(8),
+        };
+        assert_eq!(snapshot.format(), "cpu=4.0/8 cores (avg over 3s)");
     }
 }
