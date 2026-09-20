@@ -954,8 +954,15 @@ impl SmoothTerm {
 
 /// Numeric core of [`SmoothTerm::wald_unpenalized_dim`]: the dimension of the
 /// joint null space `∩_k null(S_k) = null(Σ_k S_k)` of a term's local penalty
-/// blocks, with a conservative fallback when a penalty is not materialized as a
-/// full `p_local × p_local` matrix (e.g. a Kronecker tensor factor).
+/// blocks.
+///
+/// Every active penalty is stored as its full `p_local × p_local` block: the
+/// filter keeps the symmetrized dense matrix of the certified
+/// `ConstructiveQuadratic` (a tensor penalty is the materialized Kronecker
+/// product, its factors ride along only as a spectral hint), and the design
+/// builder places each one with `BlockwisePenalty::new`, which asserts that
+/// shape. A block of any other shape is a construction defect, not a case with
+/// a sensible default, so it is asserted here too rather than guessed.
 pub(crate) fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePenalty]) -> usize {
     use gam_linalg::faer_ndarray::FaerEigh;
     if p_local == 0 {
@@ -965,52 +972,40 @@ pub(crate) fn joint_unpenalized_dim(p_local: usize, active_penalties: &[ActivePe
         // No penalty ⇒ a wholly unpenalized (fixed-effect) block.
         return p_local;
     }
-    // Sum the penalties that are materialized as full `p_local × p_local`
-    // blocks (the common smooth case). The covariance block the Wald test
-    // slices lives in this same coefficient basis (post joint-null rotation),
-    // so the rank is computed in the right metric.
+    // The covariance block the Wald test slices lives in this same coefficient
+    // basis (post joint-null rotation), so the rank is computed in the right
+    // metric.
     let mut s_total = Array2::<f64>::zeros((p_local, p_local));
-    let mut materialized = 0usize;
     for penalty in active_penalties {
         let s = &penalty.matrix;
-        if s.nrows() == p_local && s.ncols() == p_local {
-            s_total += s;
-            materialized += 1;
-        }
+        assert_eq!(
+            s.dim(),
+            (p_local, p_local),
+            "active penalty {:?} is {}×{} on a {p_local}-coefficient term",
+            penalty.info.source,
+            s.nrows(),
+            s.ncols(),
+        );
+        s_total += s;
     }
-    if materialized == active_penalties.len() {
-        let symmetric = {
-            let transpose = s_total.t().to_owned();
-            (&s_total + &transpose) * 0.5
-        };
-        if let Ok((evals, _)) = symmetric.eigh(faer::Side::Lower) {
-            let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-            if max_abs == 0.0 {
-                // All penalties identically zero ⇒ unpenalized block.
-                return p_local;
-            }
-            // The joint null space is read at the crate's one penalty-spectrum rank
-            // cutoff, so this dimension agrees with the ranks the term's penalties
-            // carry everywhere else.
-            let tol = crate::basis::spectral_tolerance(&evals);
-            let rank = evals.iter().filter(|&&v| v > tol).count();
-            return p_local.saturating_sub(rank);
-        }
+    let symmetric = {
+        let transpose = s_total.t().to_owned();
+        (&s_total + &transpose) * 0.5
+    };
+    let (evals, _) = symmetric
+        .eigh(faer::Side::Lower)
+        .expect("symmetric eigendecomposition of a sum of certified PSD penalties");
+    let max_abs = evals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    if max_abs == 0.0 {
+        // All penalties identically zero ⇒ unpenalized block.
+        return p_local;
     }
-    // Conservative fallback when a penalty is not a materialized full block
-    // (e.g. a Kronecker tensor factor): with ≥2 active penalties the joint
-    // null space is almost always empty (the only over-rejecting direction);
-    // with a single penalty it is exactly that penalty's own null space.
-    if active_penalties.len() >= 2 {
-        0
-    } else {
-        active_penalties
-            .iter()
-            .map(|penalty| penalty.nullity)
-            .min()
-            .unwrap_or(0)
-            .min(p_local)
-    }
+    // The joint null space is read at the crate's one penalty-spectrum rank
+    // cutoff, so this dimension agrees with the ranks the term's penalties
+    // carry everywhere else.
+    let tol = crate::basis::spectral_tolerance(&evals);
+    let rank = evals.iter().filter(|&&v| v > tol).count();
+    p_local.saturating_sub(rank)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2404,12 +2399,25 @@ impl TermCollectionLayout {
             .fold(self.intercept_range.end, usize::max)
     }
 
-    /// The global columns of the random-effect term named `name`.
-    pub fn random_effect_range(&self, name: &str) -> Option<Range<usize>> {
-        self.random_effect_ranges
+    /// The global coefficient range of the linear, random-effect or smooth term
+    /// named `term`.
+    pub fn term_range(&self, term: &str) -> Option<Range<usize>> {
+        self.linear_ranges
             .iter()
-            .find(|(term, _)| term == name)
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .find(|(name, _)| name == term)
             .map(|(_, range)| range.clone())
+    }
+
+    /// Every non-intercept term's name, in design order.
+    pub fn term_names(&self) -> Vec<&str> {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .map(|(name, _)| name.as_str())
+            .collect()
     }
 }
 
@@ -5348,7 +5356,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
             continue;
         }
         let sym = (&raw + &raw.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(matrix, "Matérn operator penalty")?,
             source,
@@ -5359,7 +5367,7 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     }
     if let Some(gram) = ops.third_order_gram.as_ref() {
         let sym = (gram + &gram.t()) * 0.5;
-        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym);
+        let (matrix, normalization_scale) = normalize_penalty_in_constrained_space(&sym)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 matrix,
@@ -5374,19 +5382,26 @@ pub fn matern_operator_penalty_triplet_at_length_scale(
     filter_penalty_candidates(candidates)
 }
 
-pub(crate) fn normalize_penalty_in_constrained_space(matrix: &Array2<f64>) -> (Array2<f64>, f64) {
+pub(crate) fn normalize_penalty_in_constrained_space(
+    matrix: &Array2<f64>,
+) -> Result<(Array2<f64>, f64), BasisError> {
     // Constrained-space normalization:
     //   c = ||S_con||_F,  S_tilde = S_con / c.
     // This is the only normalization coherent with a REML objective that is
     // evaluated entirely in constrained coordinates.
     let matrix = (matrix + &matrix.t().to_owned()) * 0.5;
-    // Clamp noise-floor negative eigenvalues so β'Sβ is non-negative as a contract, not just in exact arithmetic.
-    let matrix = crate::basis::project_penalty_to_psd_cone(&matrix);
+    // Clamp noise-floor negative eigenvalues so β'Sβ is non-negative as a
+    // contract, not just in exact arithmetic. Material negative curvature is
+    // refused there, not clamped into a different penalty (#3673).
+    let matrix = crate::basis::project_penalty_to_psd_cone(
+        &matrix,
+        "constrained-space penalty normalization",
+    )?;
     let c = matrix.iter().map(|v| v * v).sum::<f64>().sqrt();
     if c.is_finite() && c > 0.0 {
-        (matrix.mapv(|v| v / c), c)
+        Ok((matrix.mapv(|v| v / c), c))
     } else {
-        (matrix, 1.0)
+        Ok((matrix, 1.0))
     }
 }
 
@@ -6168,7 +6183,7 @@ pub(crate) fn build_tensor_bspline_basis(
     let normalized_marginal_penalties: Vec<(Array2<f64>, f64)> = marginal_penalties
         .iter()
         .map(normalize_penalty_in_constrained_space)
-        .collect();
+        .collect::<Result<_, _>>()?;
     if marginal_function_grams.len() != marginalnum_basis.len() {
         crate::bail_dim_basis!(
             "TensorBSpline requires one function Gram per margin; got {} for {} margins",
@@ -6372,7 +6387,7 @@ pub(crate) fn build_tensor_bspline_basis(
                 // relative amount of smoothing seen by the LAML/REML optimizer.
                 // Keep the physical scale in metadata and give the optimizer
                 // unit-scale constrained penalties for every tensor margin.
-                let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense());
+                let (_, c_new) = normalize_penalty_in_constrained_space(restricted.dense())?;
                 let matrix = restricted.scaled(
                     1.0 / c_new,
                     "normalized tensor penalty after identifiability",
@@ -6402,7 +6417,7 @@ pub(crate) fn build_tensor_bspline_basis(
             &marginal_function_grams,
             z_opt.as_ref(),
         )? {
-            let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense());
+            let (_, scale) = normalize_penalty_in_constrained_space(ridge.dense())?;
             candidates.push(PenaltyCandidate {
                 matrix: ridge.scaled(1.0 / scale, "normalized tensor null-function block ridge")?,
                 source: PenaltySource::TensorGlobalRidge,
@@ -7439,7 +7454,7 @@ pub(crate) fn build_by_smooth_local(
                     s_big
                         .slice_mut(s![off..off + p, off..off + p])
                         .assign(&base_penalty.matrix);
-                    let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big);
+                    let (s_big, scale) = normalize_penalty_in_constrained_space(&s_big)?;
                     candidates.push(PenaltyCandidate {
                         matrix: ConstructiveQuadratic::try_from_dense_psd(
                             s_big,
@@ -7904,7 +7919,7 @@ pub(crate) fn build_factor_smooth(
                 .slice_mut(s![start..start + p, start..start + p])
                 .assign(&s_inner);
         }
-        let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big);
+        let (s_big, factor_smooth_scale) = normalize_penalty_in_constrained_space(&s_big)?;
         candidates.push(PenaltyCandidate {
             matrix: ConstructiveQuadratic::try_from_dense_psd(
                 s_big,
@@ -7966,7 +7981,7 @@ pub(crate) fn build_factor_smooth(
                     .slice_mut(s![start..start + p, start..start + p])
                     .assign(&p_k);
             }
-            let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null);
+            let (s_null, null_scale) = normalize_penalty_in_constrained_space(&s_null)?;
             candidates.push(PenaltyCandidate {
                 matrix: ConstructiveQuadratic::try_from_dense_psd(
                     s_null,
@@ -8403,7 +8418,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                 // Emit `L` independent per-level blocks for this marginal penalty.
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
-                    let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw);
+                    let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw)?;
                     candidates.push(PenaltyCandidate {
                         matrix: ConstructiveQuadratic::try_from_dense_psd(
                             s_big,
@@ -8450,7 +8465,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                     s_big
                 };
                 let (s_null, null_scale) =
-                    normalize_penalty_in_constrained_space(&stz_pooled_null);
+                    normalize_penalty_in_constrained_space(&stz_pooled_null)?;
                 candidates.push(PenaltyCandidate {
                     matrix: ConstructiveQuadratic::try_from_dense_psd(
                         s_null,
@@ -8937,7 +8952,7 @@ pub(crate) fn build_single_local_smooth_term_for(
                 info,
                 ..
             } = penalty;
-            let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix);
+            let (matrix, c_new) = normalize_penalty_in_constrained_space(&matrix)?;
             let normalization_scale = info.normalization_scale * c_new;
             let op_scale = 1.0 / c_new;
             let kronecker_scale = 1.0 / c_new;

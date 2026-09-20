@@ -187,7 +187,7 @@ pub struct RoutabilityAudit {
 
 /// Audit a fitted dictionary's routing floor against real residual rows.
 ///
-/// `decoder` is `K×P` (linear lane: `K` unit-norm atom rows; block lane: `K =
+/// `decoder` is `K×P` (linear lane: `K` unit-norm atom rows, refused otherwise; block lane: `K =
 /// G·b` frame rows, block `g` occupying rows `[g·b, g·b+b)`). `block_size` is `1`
 /// for the linear atom lane, `b` for the block lane; it must divide `K`. For each
 /// residual row `r` the per-block gate is the group ℓ₂ `‖r D_gᵀ‖₂` (which reduces
@@ -227,6 +227,9 @@ pub fn routability_audit(
     }
     if !quantile_levels.iter().all(|&q| (0.0..=1.0).contains(&q)) {
         return Err("routability_audit: quantile levels must lie in [0, 1]".to_string());
+    }
+    if block_size == 1 {
+        crate::sparse_dict::require_unit_norm_atoms(decoder, "routability_audit")?;
     }
     let n_blocks = k_rows / block_size;
     let floor = routability_floor(p, n_blocks, block_size, delta);

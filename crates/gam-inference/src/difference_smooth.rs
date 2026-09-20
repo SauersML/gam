@@ -182,7 +182,11 @@ pub fn difference_smooth_report(
     let band_options = if request.simultaneous {
         BandOptions::Simultaneous(SimultaneousBandOptions {
             level,
-            simulations: request.n_sim.unwrap_or(effects::DEFAULT_SIMULATIONS),
+            simulations: match request.n_sim {
+                Some(simulations) => simulations,
+                None => effects::simultaneous_band_simulations(level)
+                    .map_err(|error| error.to_string())?,
+            },
             seed: request.seed.unwrap_or(effects::DEFAULT_SIMULATION_SEED),
         })
     } else {
