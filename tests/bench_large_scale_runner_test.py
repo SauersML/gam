@@ -617,16 +617,6 @@ _MARKER_SAMPLES: dict[str, tuple[str, str]] = {
         "source=rebuilt",
         "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed=",
     ),
-    "_PIRLS_MID_ITER_FISHER_PATTERN": (
-        "[PIRLS] mid-iter Fisher fallback iter=12 reason=candidate_err",
-        "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
-    ),
-    "_PIRLS_FORCE_FISHER_PATTERN": (
-        "[PIRLS] force_fisher_for_rest engaged at iter=5 "
-        "(consecutive_fisher_fallbacks=3) reason=iter_start",
-        "[PIRLS] force_fisher_for_rest engaged at iter={} "
-        "(consecutive_fisher_fallbacks={}) reason=iter_start",
-    ),
     "_PIRLS_LM_TRAJECTORY_PATTERN": (
         "[PIRLS lm-trajectory] iter=  3 start_lambda=1.000e-6 final_lambda=3.333e-7 "
         "log10_ratio=-0.477 accept_rho=0.985 attempts=1",
@@ -1039,27 +1029,6 @@ class MarkerPatternTests(unittest.TestCase):
                 [kind],
                 f"curvature kind {kind!r} did not parse",
             )
-
-    def test_pirls_mid_iter_fisher_pattern_captures_both_reasons(self) -> None:
-        for iter_str, reason in (("3", "gain_rejection"), ("200", "candidate_err")):
-            line = f"[PIRLS] mid-iter Fisher fallback iter={iter_str} reason={reason}"
-            matches = _RUNNER._PIRLS_MID_ITER_FISHER_PATTERN.findall(line)
-            self.assertEqual(len(matches), 1, f"reason {reason!r} did not parse")
-            self.assertEqual(matches[0], (iter_str, reason))
-
-    def test_pirls_force_fisher_pattern_captures_all_three_reasons(self) -> None:
-        for iter_str, count, reason in (
-            ("5", "3", "iter_start"),
-            ("12", "4", "gain_rejection"),
-            ("2", "3", "candidate_err"),
-        ):
-            line = (
-                f"[PIRLS] force_fisher_for_rest engaged at iter={iter_str} "
-                f"(consecutive_fisher_fallbacks={count}) reason={reason}"
-            )
-            matches = _RUNNER._PIRLS_FORCE_FISHER_PATTERN.findall(line)
-            self.assertEqual(len(matches), 1, f"reason {reason!r} did not parse")
-            self.assertEqual(matches[0], (iter_str, count, reason))
 
     def test_pirls_iter_breakdown_pattern_extracts_all_seven_subphases(self) -> None:
         line = (
@@ -1496,7 +1465,7 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertEqual(len(fit_lines), 1)
         self.assertIn("verdict=DEGRADED", fit_lines[0])
         self.assertIn("pirls=DEGRADED", fit_lines[0])
-        self.assertIn("curvature=ABSENT", fit_lines[0])
+        self.assertNotIn("curvature=", fit_lines[0])
 
     def test_phase_summary_emits_pirls_health_verdict_alongside_warm_start(self) -> None:
         stderr = "\n".join([
@@ -1512,74 +1481,26 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
         self.assertIn("[PIRLS health]", out)
         self.assertIn("verdict=HEALTHY", out.splitlines()[-1])
 
-    def test_phase_summary_curvature_healthy_when_fisher_frac_low(self) -> None:
+    def test_phase_summary_counts_curvature_kinds_without_a_health_axis(self) -> None:
+        """The curvature kind is a property of the model (#3962): there is
+        no Observed->Fisher fallback ladder whose firing rate could grade
+        a fit, so the kinds are counted and no curvature verdict exists."""
         lines = [
             self._ift_quality("1.000e-04", 3),
             self._solve_end("2.000e-01", iters=4),
             self._solve_end("2.300e-01", iters=4),
         ]
-        lines.extend(self._curvature(idx, "Observed") for idx in range(1, 26))
-        lines.append(self._curvature(26, "Fisher"))
+        lines.extend(self._curvature(idx, "Observed") for idx in range(1, 9))
         lines.append("[PHASE] my-fit fit end elapsed=10.0s")
         out = self._run_summary("\n".join(lines))
-        curv_lines = [
-            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
-        ]
-        self.assertEqual(len(curv_lines), 1)
-        self.assertIn("verdict=HEALTHY", curv_lines[0])
+        self.assertIn("pirls_curv_n=8 pirls_curv_Observed=8", out)
+        self.assertNotIn("fisher_frac", out)
+        self.assertNotIn("[CURVATURE health]", out)
         fit_lines = [line for line in out.splitlines() if line.startswith("[FIT health]")]
         self.assertEqual(len(fit_lines), 1)
         self.assertIn("verdict=HEALTHY", fit_lines[0])
         self.assertIn("dominant_axis=pirls", fit_lines[0])
-
-    def test_phase_summary_curvature_marginal_when_fisher_frac_in_band(self) -> None:
-        lines = [
-            self._ift_quality("1.000e-04", 3),
-            self._solve_end("2.000e-01", iters=4),
-            self._solve_end("2.300e-01", iters=4),
-        ]
-        lines.extend(self._curvature(idx, "Observed") for idx in range(1, 10))
-        lines.append(self._curvature(10, "Fisher"))
-        lines.append("[PHASE] my-fit fit end elapsed=10.0s")
-        out = self._run_summary("\n".join(lines))
-        curv_lines = [
-            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
-        ]
-        self.assertEqual(len(curv_lines), 1)
-        self.assertIn("verdict=MARGINAL", curv_lines[0])
-        self.assertIn("fisher_frac=0.10", curv_lines[0])
-        self.assertIn("force_fisher_n=0", curv_lines[0])
-        fit_lines = [line for line in out.splitlines() if line.startswith("[FIT health]")]
-        self.assertEqual(len(fit_lines), 1)
-        self.assertIn("verdict=MARGINAL", fit_lines[0])
-        self.assertIn("dominant_axis=curvature", fit_lines[0])
-        self.assertIn("curvature=MARGINAL", fit_lines[0])
-
-    def test_phase_summary_curvature_degraded_drives_fit_health(self) -> None:
-        lines = [
-            self._ift_quality("1.000e-04", 3),
-            self._ift_quality("2.000e-04", 3),
-            self._solve_end("2.000e-01", iters=4),
-            self._solve_end("2.500e-01", iters=5),
-            self._solve_end("2.300e-01", iters=4),
-        ]
-        lines.extend(self._curvature(idx, "Observed") for idx in range(1, 6))
-        lines.extend(self._curvature(idx, "Fisher") for idx in range(6, 11))
-        lines.append("[PHASE] my-fit fit end elapsed=10.0s")
-        out = self._run_summary("\n".join(lines))
-        curv_lines = [
-            line for line in out.splitlines() if line.startswith("[CURVATURE health]")
-        ]
-        self.assertEqual(len(curv_lines), 1)
-        self.assertIn("verdict=DEGRADED", curv_lines[0])
-        self.assertIn("fisher_frac=0.50", curv_lines[0])
-        fit_lines = [line for line in out.splitlines() if line.startswith("[FIT health]")]
-        self.assertEqual(len(fit_lines), 1)
-        self.assertIn("verdict=DEGRADED", fit_lines[0])
-        self.assertIn("warm_start=HEALTHY", fit_lines[0])
-        self.assertIn("pirls=HEALTHY", fit_lines[0])
-        self.assertIn("curvature=DEGRADED", fit_lines[0])
-        self.assertIn("dominant_axis=curvature", fit_lines[0])
+        self.assertNotIn("curvature=", fit_lines[0])
 
     def test_phase_summary_reports_when_the_marker_buffer_rolled_over(self) -> None:
         """A truncated buffer makes every percentile a suffix statistic.
@@ -1604,65 +1525,25 @@ class PhaseSummaryAggregationTests(unittest.TestCase):
 class HealthVerdictTests(unittest.TestCase):
     def test_combine_fit_verdicts_worst_wins(self) -> None:
         combine = _RUNNER._combine_fit_verdicts
-        self.assertEqual(combine("HEALTHY", "HEALTHY", "HEALTHY"), "HEALTHY")
-        self.assertEqual(combine("HEALTHY", "HEALTHY", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine("HEALTHY", "HEALTHY", "MARGINAL"), "MARGINAL")
-        self.assertEqual(combine("DEGRADED", "HEALTHY", "MARGINAL"), "DEGRADED")
-        self.assertEqual(combine("HEALTHY", "MARGINAL", "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine("HEALTHY", None, "MARGINAL"), "MARGINAL")
-        self.assertEqual(combine(None, None, "DEGRADED"), "DEGRADED")
-        self.assertEqual(combine(None, None, None), "NO-DATA")
+        self.assertEqual(combine("HEALTHY", "HEALTHY"), "HEALTHY")
+        self.assertEqual(combine("HEALTHY", "DEGRADED"), "DEGRADED")
+        self.assertEqual(combine("MARGINAL", "HEALTHY"), "MARGINAL")
+        self.assertEqual(combine("DEGRADED", "MARGINAL"), "DEGRADED")
+        self.assertEqual(combine(None, "MARGINAL"), "MARGINAL")
+        self.assertEqual(combine("DEGRADED", None), "DEGRADED")
+        self.assertEqual(combine(None, None), "NO-DATA")
 
     def test_dominant_axis_for_verdict_resolves_correctly(self) -> None:
         dom = _RUNNER._dominant_axis_for_verdict
         self.assertEqual(
-            dom("DEGRADED", warm_start="HEALTHY", pirls="HEALTHY", curvature="DEGRADED"),
-            "curvature",
+            dom("DEGRADED", warm_start="DEGRADED", pirls="HEALTHY"), "warm_start"
         )
-        self.assertEqual(
-            dom("DEGRADED", warm_start="DEGRADED", pirls="HEALTHY", curvature="HEALTHY"),
-            "warm_start",
-        )
-        self.assertEqual(
-            dom("DEGRADED", warm_start="HEALTHY", pirls="DEGRADED", curvature="HEALTHY"),
-            "pirls",
-        )
-        self.assertEqual(
-            dom("DEGRADED", warm_start="DEGRADED", pirls="DEGRADED", curvature="DEGRADED"),
-            "pirls",
-        )
-        self.assertEqual(
-            dom("DEGRADED", warm_start="DEGRADED", pirls="HEALTHY", curvature="DEGRADED"),
-            "warm_start",
-        )
-        self.assertEqual(
-            dom("MARGINAL", warm_start="HEALTHY", pirls="HEALTHY", curvature="MARGINAL"),
-            "curvature",
-        )
-        self.assertEqual(
-            dom("HEALTHY", warm_start="HEALTHY", pirls="HEALTHY", curvature="HEALTHY"),
-            "pirls",
-        )
-        self.assertEqual(dom("NO-DATA", warm_start=None, pirls=None, curvature=None), "none")
-        self.assertEqual(
-            dom("MARGINAL", warm_start=None, pirls="MARGINAL", curvature=None), "pirls"
-        )
-
-    def test_curvature_health_verdict_classifies_tiers(self) -> None:
-        verdict = _RUNNER._curvature_health_verdict
-        self.assertEqual(verdict(fisher_frac=0.0, force_fisher_n=0)[0], "HEALTHY")
-        self.assertEqual(verdict(fisher_frac=0.04, force_fisher_n=0)[0], "HEALTHY")
-        self.assertEqual(verdict(fisher_frac=0.05, force_fisher_n=0)[0], "MARGINAL")
-        self.assertEqual(verdict(fisher_frac=0.19, force_fisher_n=0)[0], "MARGINAL")
-        self.assertEqual(verdict(fisher_frac=0.20, force_fisher_n=0)[0], "DEGRADED")
-        self.assertEqual(verdict(fisher_frac=0.50, force_fisher_n=0)[0], "DEGRADED")
-        self.assertEqual(verdict(fisher_frac=0.0, force_fisher_n=1)[0], "DEGRADED")
-        self.assertEqual(verdict(fisher_frac=0.04, force_fisher_n=1)[0], "DEGRADED")
-        self.assertEqual(verdict(fisher_frac=None, force_fisher_n=0)[0], "NO-DATA")
-        tier, detail = verdict(fisher_frac=0.123, force_fisher_n=2)
-        self.assertEqual(tier, "DEGRADED")
-        self.assertIn("fisher_frac=0.12", detail)
-        self.assertIn("force_fisher_n=2", detail)
+        self.assertEqual(dom("DEGRADED", warm_start="HEALTHY", pirls="DEGRADED"), "pirls")
+        self.assertEqual(dom("DEGRADED", warm_start="DEGRADED", pirls="DEGRADED"), "pirls")
+        self.assertEqual(dom("MARGINAL", warm_start="MARGINAL", pirls=None), "warm_start")
+        self.assertEqual(dom("HEALTHY", warm_start="HEALTHY", pirls="HEALTHY"), "pirls")
+        self.assertEqual(dom("NO-DATA", warm_start=None, pirls=None), "none")
+        self.assertEqual(dom("MARGINAL", warm_start=None, pirls="MARGINAL"), "pirls")
 
     def test_pirls_health_verdict_classifies_tiers(self) -> None:
         verdict = _RUNNER._pirls_health_verdict

@@ -1543,12 +1543,30 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
             WorkingCoordinateDesign::OriginalSparseNative
         ) && !self.firth_bias_reduction
         {
-            // The SPD-check factor is discarded here: the downstream consumer
-            // is the LM Newton step, which always factorizes
-            // (H + loop_lambda · I) with a non-zero loop_lambda (initial value
-            // 1e-6), so it sees a different matrix.
-            let (h_sparse, _factor) =
-                certify_sparse_penalized_hessian(self.sparse_penalized_hessian(&solver_weights)?)?;
+            let h_sparse = self.sparse_penalized_hessian(&solver_weights)?;
+            let h_sparse = match hessian_curvature {
+                // `XᵀWX + S_λ` with `W ≥ 0` is SPD by construction, so a
+                // failed factorization is a defect of the assembly and is
+                // refused. The SPD-check factor is discarded: the LM Newton
+                // step factorizes `H + λD²`, a different matrix.
+                HessianCurvatureKind::Fisher => certify_sparse_penalized_hessian(h_sparse)?.0,
+                // The observed information of a non-canonical link is a signed
+                // matrix away from the mode; it is the Newton system of the
+                // iterate, not a failure (#3962). The LM step factorizes
+                // `H + λD²` and answers an indefinite `H` by raising `λ`, and
+                // the post-convergence export certifies the inertia of `H` at
+                // β̂. Only a non-finite assembly is a defect here.
+                HessianCurvatureKind::Observed => {
+                    let (_, values) = h_sparse.parts();
+                    if !values.iter().all(|value| value.is_finite()) {
+                        crate::bail_invalid_estim!(
+                            "PIRLS penalized Hessian: sparse observed-information assembly \
+                             contains non-finite entries; refusing to factor"
+                        );
+                    }
+                    h_sparse
+                }
+            };
             (Array2::zeros((0, 0)), Some(h_sparse))
         } else {
             let penalized_hessian = self.penalized_hessian(&solver_weights)?;
@@ -1562,7 +1580,26 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 .iter()
                 .fold(0.0_f64, |largest, value| largest.max(value.abs()));
             assert_symmetric_tol(&penalized_hessian, "PIRLS penalized Hessian", symmetry_band);
-            certify_positive_semidefinite_hessian(&penalized_hessian, "PIRLS penalized Hessian")?;
+            match hessian_curvature {
+                // PSD by construction; a material negative eigenvalue is an
+                // assembly defect and is refused.
+                HessianCurvatureKind::Fisher => certify_positive_semidefinite_hessian(
+                    &penalized_hessian,
+                    "PIRLS penalized Hessian",
+                )?,
+                // A signed observed information is the iterate's own Newton
+                // system (#3962): the direction is taken on its Gill–Murray
+                // modification (`descent_curvature`), and the export certifies
+                // its inertia at β̂. Only a non-finite assembly is refused.
+                HessianCurvatureKind::Observed => {
+                    if !penalized_hessian.iter().all(|value| value.is_finite()) {
+                        crate::bail_invalid_estim!(
+                            "PIRLS penalized Hessian: observed-information assembly contains \
+                             non-finite entries; refusing to factor"
+                        );
+                    }
+                }
+            }
             (penalized_hessian, None)
         };
         self.workspace.matvec_buf = solver_weights;
@@ -1680,8 +1717,7 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         // same LM system and preserves that cancellation directly.  Observed
         // noncanonical curvature is not the curvature of the Firth working
         // residual (even when every realized row weight happens to be
-        // positive), so it retains the assembled dense solve; Fisher fallback
-        // supplies the exact PSD-root state.
+        // positive), so it retains the assembled dense solve.
         if augmented_root_represents_working_system(
             state.hessian_curvature,
             self.firth_bias_reduction,

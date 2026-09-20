@@ -33,7 +33,7 @@ use gam_linalg::sparse_exact::{
 };
 use gam_linalg::utils::{StableSolver, array_is_finite, inf_norm};
 use gam_problem::Coefficients;
-use ndarray::{Array1, Array2, Zip};
+use ndarray::{Array1, Array2};
 
 /// Madsen-Nielsen-Tingleff smooth Marquardt trust-region update (eq 3.17 in
 /// "Methods for non-linear least squares problems", IMM Tech Univ Denmark,
@@ -613,148 +613,6 @@ pub fn runworking_model_pirls<M>(
 where
     M: WorkingModel + ?Sized,
 {
-    // ── Anderson acceleration of depth 1 (AA(1)) for the Fisher fixed-point ──
-    // PIRLS normally uses observed-information Newton (already super-linear, no
-    // help available from AA). When `force_fisher_for_rest` engages, the inner
-    // iteration becomes the linearly-convergent Fisher contraction — exactly
-    // the regime where AA(1) provably improves the rate. State is local to
-    // this PIRLS call; costs nothing while `force_fisher_for_rest` stays
-    // false because the mixing branch is never entered.
-    const AA1_DISABLE_REJECT_THRESHOLD: usize = 3;
-
-    struct AndersonOneState {
-        pub(crate) prev_beta: Option<Array1<f64>>,
-        pub(crate) prev_residual: Option<Array1<f64>>,
-        pub(crate) r_k: Array1<f64>,
-        pub(crate) dr: Array1<f64>,
-        pub(crate) dx: Array1<f64>,
-        pub(crate) beta_accel: Array1<f64>,
-        pub(crate) consecutive_accepts: usize,
-        pub(crate) consecutive_rejects: usize,
-        pub(crate) disabled: bool,
-        pub(crate) engaged_logged: bool,
-    }
-
-    impl AndersonOneState {
-        pub(crate) fn new() -> Self {
-            Self {
-                prev_beta: None,
-                prev_residual: None,
-                r_k: Array1::zeros(0),
-                dr: Array1::zeros(0),
-                dx: Array1::zeros(0),
-                beta_accel: Array1::zeros(0),
-                consecutive_accepts: 0,
-                consecutive_rejects: 0,
-                disabled: false,
-                engaged_logged: false,
-            }
-        }
-
-        pub(crate) fn ensure_len(buf: &mut Array1<f64>, len: usize) {
-            if buf.len() != len {
-                *buf = Array1::zeros(len);
-            }
-        }
-
-        /// Try to produce an accelerated candidate from the plain Fisher
-        /// fixed-point step `beta_new = beta_old + direction`. The fixed-point
-        /// residual at this iteration is `r_k = beta_new - beta_old`.
-        ///
-        /// Returns `Some(beta_accel)` when a finite acceleration is available,
-        /// `None` when AA should be skipped (no history yet, disabled, or
-        /// numerical floor hit).
-        pub(crate) fn aa1_mix(
-            &mut self,
-            beta_old: &Array1<f64>,
-            beta_new: &Array1<f64>,
-        ) -> Option<&Array1<f64>> {
-            if self.disabled {
-                return None;
-            }
-            let prev_beta = self.prev_beta.as_ref()?;
-            let prev_residual = self.prev_residual.as_ref()?;
-            if prev_beta.len() != beta_old.len() || prev_residual.len() != beta_old.len() {
-                return None;
-            }
-            let len = beta_old.len();
-            Self::ensure_len(&mut self.r_k, len);
-            Self::ensure_len(&mut self.dr, len);
-            Self::ensure_len(&mut self.dx, len);
-            Self::ensure_len(&mut self.beta_accel, len);
-            // r_k = beta_new - beta_old
-            Zip::from(&mut self.r_k)
-                .and(beta_new)
-                .and(beta_old)
-                .for_each(|r, &new, &old| *r = new - old);
-            // dr = r_k - prev_residual
-            Zip::from(&mut self.dr)
-                .and(&self.r_k)
-                .and(prev_residual)
-                .for_each(|dr, &r, &prev| *dr = r - prev);
-            // dx = beta_old - prev_beta
-            Zip::from(&mut self.dx)
-                .and(beta_old)
-                .and(prev_beta)
-                .for_each(|dx, &old, &prev| *dx = old - prev);
-            let den = self.dr.dot(&self.dr);
-            // `dr` subtracts two residuals entry by entry; a difference inside that
-            // subtraction's rounding band `γ·(‖r_k‖ + ‖r_prev‖)` carries no secant.
-            let secant_band = gam_linalg::roundoff::accumulation_growth(len + 1)
-                * (self.r_k.dot(&self.r_k).sqrt() + prev_residual.dot(prev_residual).sqrt());
-            if !den.is_finite() || den.sqrt() <= secant_band {
-                return None;
-            }
-            let alpha = (self.dr.dot(&self.r_k) / den).clamp(-1.0, 1.0);
-            // beta_accel = beta_new - alpha * (dx + dr)
-            for i in 0..len {
-                self.beta_accel[i] = beta_new[i] - alpha * (self.dx[i] + self.dr[i]);
-            }
-            if !array_is_finite(&self.beta_accel) {
-                return None;
-            }
-            // The caller copies this borrow into its candidate buffer before the next AA mutation.
-            Some(&self.beta_accel)
-        }
-
-        pub(crate) fn note_accept(&mut self, iter: usize) {
-            self.consecutive_accepts = self.consecutive_accepts.saturating_add(1);
-            self.consecutive_rejects = 0;
-            if !self.engaged_logged {
-                log::debug!("[PIRLS-AA1] engaged at iter={}", iter);
-                self.engaged_logged = true;
-            }
-        }
-
-        pub(crate) fn note_reject(&mut self, iter: usize) {
-            self.consecutive_rejects = self.consecutive_rejects.saturating_add(1);
-            self.consecutive_accepts = 0;
-            if !self.disabled
-                && self.consecutive_rejects >= AA1_DISABLE_REJECT_THRESHOLD
-                && self.consecutive_accepts < 1
-            {
-                self.disabled = true;
-                log::debug!(
-                    "[PIRLS-AA1] disabled at iter={} reason=consecutive_rejects",
-                    iter
-                );
-            }
-        }
-
-        pub(crate) fn update_history(&mut self, beta_old: &Array1<f64>, residual: &Array1<f64>) {
-            // AA history must outlive this LM attempt; assign into retained
-            // buffers so accepted Fisher steps do not allocate two O(p) clones.
-            match self.prev_beta.as_mut() {
-                Some(prev) if prev.len() == beta_old.len() => prev.assign(beta_old),
-                _ => self.prev_beta = Some(beta_old.to_owned()),
-            }
-            match self.prev_residual.as_mut() {
-                Some(prev) if prev.len() == residual.len() => prev.assign(residual),
-                _ => self.prev_residual = Some(residual.to_owned()),
-            }
-        }
-    }
-
     fn reuse_regularized_hessian_buffer(
         existing: Option<gam_linalg::matrix::SymmetricMatrix>,
         source: &gam_linalg::matrix::SymmetricMatrix,
@@ -905,16 +763,9 @@ where
         .coefficient_lower_bounds
         .as_ref()
         .map(|_| Vec::new());
-    let mut consecutive_fisher_fallbacks = 0usize;
     // Exact bare-Hessian decrement factorization is paid at most once per
     // contiguous numerical plateau. Meaningful objective progress rearms it.
     let mut exact_decrement_checked_at_plateau = false;
-    // AA(1) state — engages only while `force_fisher_for_rest == true`. The
-    // initial allocations stay None until the first Fisher-regime iteration,
-    // so this is free when PIRLS stays on the observed-information Newton
-    // path the whole way through.
-    let mut aa_state = AndersonOneState::new();
-    let mut force_fisher_for_rest = false;
     // Reused across LM attempts and PIRLS iterations. On acceptance we swap
     // the old beta allocation back into this buffer, so the hot path keeps
     // one O(p) candidate allocation for the whole solve.
@@ -984,17 +835,22 @@ where
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
-    // The mixed strategy is used here:
-    // - The inner PIRLS iteration uses observed-information curvature when
-    //   available (preferred_curvature = Observed for non-canonical links).
-    //   This gives faster convergence than Fisher scoring for non-canonical
-    //   links, but either choice finds the same mode.
-    // - Fisher scoring internally is FINE --- any convergent algorithm works.
-    //   If observed curvature fails (non-SPD), we fall back to Fisher scoring.
+    // - The inner PIRLS iteration assembles the model's own curvature kind at
+    //   every iterate: observed information whenever the model supports it,
+    //   Fisher otherwise. The Newton system is therefore a function of β
+    //   alone, never of which earlier solve failed (#3962).
+    // - Observed information away from the mode may be indefinite. That is a
+    //   property of the objective, not a solver failure, so it is neither
+    //   refused nor swapped for Fisher: the dense direction solve takes its
+    //   step from `descent_curvature` (the eigen-floored modified Newton
+    //   matrix, `‖H‖·√ε` floor; exact H whenever H is PD), the sparse solve
+    //   raises the Levenberg-Marquardt damping until `H + λD²` factors, and
+    //   the gain ratio is measured against the exact quadratic model built
+    //   from the bare H. A rejected step raises λ; it never changes H.
     // - The requirement is that the output Hessian (which flows
-    //   into the outer REML log|H| and trace terms) uses observed information.
-    //   This is ensured by `into_final_state()` which stores the
-    //   `lasthessian_weights` (observed when available) as `finalweights`.
+    //   into the outer REML log|H| and trace terms) uses observed information,
+    //   and that it is positive definite at β̂ (a local minimum). The export
+    //   below certifies that inertia and refuses a saddle.
     //
     // The Laplace approximation int exp(-F(beta)) dbeta uses the actual
     // Hessian nabla^2 F at the actual mode. Replacing with expected Fisher
@@ -1020,13 +876,14 @@ where
             last_step_halving,
             last_deviance_change
         );
-        let preferred_curvature =
-            if model.supports_observed_information_curvature() && !force_fisher_for_rest {
-                HessianCurvatureKind::Observed
-            } else {
-                HessianCurvatureKind::Fisher
-            };
-        let mut used_fisher_fallback_this_iter = false;
+        // The Newton system is a function of the iterate alone: the model's
+        // own curvature kind, never one chosen by the history of failed
+        // solves (#3962).
+        let preferred_curvature = if model.supports_observed_information_curvature() {
+            HessianCurvatureKind::Observed
+        } else {
+            HessianCurvatureKind::Fisher
+        };
         // The latest trial point of THIS iteration that left the link's
         // feasibility set. A rejection in an earlier iteration says nothing
         // about where the final iterate sits.
@@ -1047,8 +904,7 @@ where
         // snapshot bits match what this iter requests; the Hessian depends on
         // the working weights/linearization point, so curvature kind alone is
         // not a sufficient freshness predicate.
-        // Otherwise (e.g. force_fisher_for_rest just engaged, flipping
-        // preferred from Observed → Fisher) fall through to the rebuild path.
+        // Otherwise fall through to the rebuild path.
         // Smoothing ρ/λ and penalty structure are fixed for this PIRLS call;
         // outer REML constructs a new working model when they change.
         // Iter 1 always rebuilds because no prior accept has populated
@@ -1063,37 +919,9 @@ where
                 .take()
                 .expect("cached_state_matches implies final_state.is_some()")
         } else {
-            match model.update_with_curvature(&beta, preferred_curvature) {
-                Ok(state) => state,
-                Err(
-                    err @ (EstimationError::InverseLinkDomainViolation { .. }
-                    | EstimationError::PirlsRowGeometryUnrepresentable { .. }),
-                ) => return Err(err),
-                Err(_) if preferred_curvature == HessianCurvatureKind::Observed => {
-                    used_fisher_fallback_this_iter = true;
-                    consecutive_fisher_fallbacks += 1;
-                    if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                        log::debug!(
-                            "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=iter_start",
-                            iter,
-                            consecutive_fisher_fallbacks,
-                        );
-                        force_fisher_for_rest = true;
-                    }
-                    model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?
-                }
-                Err(err) => return Err(err),
-            }
+            model.update_with_curvature(&beta, preferred_curvature)?
         };
         let mut curvature_total = curvature_start.elapsed();
-        // Log the ACTUAL curvature used, not the preferred one. When
-        // Fisher-fallback fires (Observed assembly failed → retried with
-        // Fisher), `state.hessian_curvature` correctly reports `Fisher`
-        // while `preferred_curvature` is still `Observed`. Logging
-        // preferred_curvature here would systematically under-count
-        // Fisher fallbacks for the bench runner's `pirls_fisher_frac`
-        // diagnostic (commit 971e67ad), masking observed-Hessian PD
-        // failures at large scale.
         log::debug!(
             "[STAGE] PIRLS update_with_curvature iter={} curvature={:?} elapsed={:.3}s source={}",
             iter,
@@ -1170,16 +998,11 @@ where
         let mut loop_lambda = lambda;
         // Per-iteration hard bound (#968): ticks at the top of EVERY LM
         // pass — including `continue` paths that reach no reject ritual
-        // (Fisher fallback, special cases) — so the unbounded `loop {}`
-        // below is structurally bounded no matter which branch a pass
-        // takes. Distinct from the reject escalator by design; see the
-        // loop_guard module docs.
+        // (a failed direction solve, a non-finite direction) — so the
+        // unbounded `loop {}` below is structurally bounded no matter which
+        // branch a pass takes. Distinct from the reject escalator by design;
+        // see the loop_guard module docs.
         let mut lm_bound = IterationBound::new(lm_max_attempts);
-        // An AA(1) candidate is an extrapolation of the LM step, not the step
-        // whose predicted reduction the gain ratio is measured against, so its
-        // rejection says nothing about the damping. Once one is rejected this
-        // iteration, the retry evaluates the plain LM step at the same λ.
-        let mut aa_declined_this_iter = false;
         // Snapshot the LM trajectory's starting λ for the
         // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
         // the runtime-layer adaptive clamp (commit 43be42be) selected for
@@ -1208,9 +1031,7 @@ where
         // `lm_can_retry` declares MADSEN_DAMPING_CAP exhausted; the older ×10
         // hit the ceiling in just 12 rejections (10^12 = MADSEN_DAMPING_CAP),
         // while ×2 doubling needs 40 rejections to exceed the same
-        // ceiling — well past `lm_max_attempts`. Restarts on
-        // Fisher-fallback (different problem, restart the LM trajectory).
-        // The doubling discipline itself is owned by the shared escalator
+        // ceiling — well past `lm_max_attempts`. The doubling discipline itself is owned by the shared escalator
         // (#968) so no reject branch can apply the damping bump without
         // advancing the schedule.
         let mut madsen_escalator = RejectEscalator::new();
@@ -1228,11 +1049,12 @@ where
         let mut sparse_applied_lambda = 0.0_f64;
         // Per-coordinate LM damping scale: D²[i] = H_diag[i], raised to the
         // diagonal's rounding band (`compute_lm_d2`). Held constant within an LM rejection cluster (only λ
-        // varies); recomputed whenever state.hessian changes (Fisher fallback).
+        // varies); `state.hessian` is fixed for the whole LM loop of one
+        // iteration, so D² is too.
         // Using the full penalized-Hessian diagonal avoids the artificial
         // anisotropy that scalar λI introduces across basis/penalty/latent blocks
         // with very different column scales.
-        let mut lm_d2 = compute_lm_d2(&state.hessian);
+        let lm_d2 = compute_lm_d2(&state.hessian);
         loop {
             lm_bound.tick();
             lm_attempts_done += 1;
@@ -1503,36 +1325,6 @@ where
             {
                 project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
             }
-            // ── AA(1) Anderson acceleration ──────────────────────────────────
-            // Active only in the Fisher fixed-point regime (linearly
-            // convergent contraction). Treats the LM attempt as a fixed-point
-            // step F(beta_old) = beta_old + direction; mixes against the
-            // previous iteration's residual to produce an accelerated
-            // candidate. If the existing bound-projection / finiteness checks
-            // reject the accelerated candidate, fall back to the plain Fisher
-            // candidate transparently — no change to the rest of the loop.
-            let mut aa_attempt = false;
-            if force_fisher_for_rest && !aa_state.disabled && !aa_declined_this_iter {
-                let beta_old_ref: &Array1<f64> = beta.as_ref();
-                if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
-                    candidate_buf.assign(beta_accel);
-                    // Apply the same bound projection the loop already runs on
-                    // the plain candidate. Treat this as the "existing
-                    // validity check": if projection moves the accelerated
-                    // candidate (i.e. it would have left the feasible region)
-                    // we keep the projected version; finiteness was already
-                    // validated inside aa1_mix. No new gates are introduced
-                    // here.
-                    if options.linear_constraints.is_none()
-                        && let Some(lb) = options.coefficient_lower_bounds.as_ref()
-                    {
-                        project_coefficients_to_lower_bounds(&mut candidate_buf, lb);
-                    }
-                    if array_is_finite(&candidate_buf) {
-                        aa_attempt = true;
-                    }
-                }
-            }
             let candidate_beta = Coefficients::new(std::mem::take(&mut candidate_buf));
             let candidate_eval_start = std::time::Instant::now();
             let candidate_eval_result = model.screen_candidate(
@@ -1671,11 +1463,6 @@ where
                         }
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
                             candidate_buf = candidate_beta.into();
-                            if aa_attempt {
-                                aa_state.note_reject(iter);
-                                aa_declined_this_iter = true;
-                                continue;
-                            }
                             // Exhaustion guard, identical to the screening-reject
                             // branch below. The screening test admitted this trial
                             // (cheap forward eval looked like a descent) but the full
@@ -1742,21 +1529,6 @@ where
                                 step_rayleigh_curvature,
                             );
                             continue;
-                        }
-                        if preferred_curvature == HessianCurvatureKind::Observed
-                            && state.hessian_curvature == HessianCurvatureKind::Observed
-                            && !used_fisher_fallback_this_iter
-                        {
-                            consecutive_fisher_fallbacks = 0;
-                        }
-                        if aa_attempt {
-                            aa_state.note_accept(iter);
-                        }
-                        // Refresh AA(1) history with the plain Fisher residual
-                        // before `beta` is replaced; borrowing here avoids the
-                        // speculative O(p) beta/direction clones on rejected LM attempts.
-                        if force_fisher_for_rest {
-                            aa_state.update_history(beta.as_ref(), direction);
                         }
                         // Accept Step.
                         // Stash the accepted gain ratio for the
@@ -2112,54 +1884,6 @@ where
                         break; // Break inner lambda loop, continue outer pirls loop
                     } else {
                         candidate_buf = candidate_beta.into();
-                        if aa_attempt {
-                            aa_state.note_reject(iter);
-                            aa_declined_this_iter = true;
-                            continue;
-                        }
-                        if state.hessian_curvature == HessianCurvatureKind::Observed
-                            && !used_fisher_fallback_this_iter
-                        {
-                            used_fisher_fallback_this_iter = true;
-                            consecutive_fisher_fallbacks += 1;
-                            if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                                log::debug!(
-                                    "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=gain_rejection",
-                                    iter,
-                                    consecutive_fisher_fallbacks,
-                                );
-                                force_fisher_for_rest = true;
-                            }
-                            // Mid-LM-loop Fisher fallback: the Observed
-                            // curvature succeeded at iter-start but the
-                            // candidate evaluation produced a bad gain
-                            // ratio (or non-finite gradient / extreme
-                            // eta), suggesting the Observed Hessian is
-                            // unreliable for this β region. Distinct
-                            // signal from iter-start Fisher fallback
-                            // (Observed assembly itself failed). Tagged
-                            // with `gain_rejection` so the runner
-                            // aggregator can count both reasons.
-                            log::debug!(
-                                "[PIRLS] mid-iter Fisher fallback iter={} reason=gain_rejection",
-                                iter,
-                            );
-                            let fisher_fallback_start = std::time::Instant::now();
-                            state =
-                                model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
-                            curvature_total += fisher_fallback_start.elapsed();
-                            regularized =
-                                reuse_regularized_hessian_buffer(Some(regularized), &state.hessian);
-                            applied_lambda = 0.0;
-                            cached_sparse_regularized = None;
-                            sparse_applied_lambda = 0.0;
-                            loop_lambda = lambda;
-                            lm_d2 = compute_lm_d2(&state.hessian);
-                            // Different problem (Hessian curvature changed):
-                            // restart the Madsen rejection-factor trajectory.
-                            madsen_escalator.restart();
-                            continue;
-                        }
                         // Reject Step
                         let stategrad_norm = constrained_stationarity_norm(
                             &state.gradient,
@@ -2262,54 +1986,9 @@ where
                 }
                 Err(err) => {
                     candidate_buf = candidate_beta.into();
-                    if aa_attempt && is_lm_retriable_candidate_error(&err) {
-                        aa_state.note_reject(iter);
-                        aa_declined_this_iter = true;
-                        continue;
-                    }
                     let witness = feasibility_witness(&err);
                     if witness.is_some() {
                         feasibility_witness_this_iter = witness;
-                    }
-                    if state.hessian_curvature == HessianCurvatureKind::Observed
-                        && !used_fisher_fallback_this_iter
-                    {
-                        used_fisher_fallback_this_iter = true;
-                        consecutive_fisher_fallbacks += 1;
-                        if consecutive_fisher_fallbacks > 2 && !force_fisher_for_rest {
-                            log::debug!(
-                                "[PIRLS] force_fisher_for_rest engaged at iter={} (consecutive_fisher_fallbacks={}) reason=candidate_err",
-                                iter,
-                                consecutive_fisher_fallbacks,
-                            );
-                            force_fisher_for_rest = true;
-                        }
-                        // Mid-LM-loop Fisher fallback: the candidate
-                        // evaluation itself returned Err (e.g., model
-                        // overflowed at the proposed β + δ). Tagged with
-                        // `candidate_err` to distinguish from the
-                        // gain-rejection variant above; both indicate
-                        // mid-iter Observed-curvature unreliability,
-                        // but candidate_err is a stronger signal
-                        // (numerical breakdown, not just bad gain).
-                        log::debug!(
-                            "[PIRLS] mid-iter Fisher fallback iter={} reason=candidate_err",
-                            iter,
-                        );
-                        let fisher_err_start = std::time::Instant::now();
-                        state = model.update_with_curvature(&beta, HessianCurvatureKind::Fisher)?;
-                        curvature_total += fisher_err_start.elapsed();
-                        regularized =
-                            reuse_regularized_hessian_buffer(Some(regularized), &state.hessian);
-                        applied_lambda = 0.0;
-                        cached_sparse_regularized = None;
-                        sparse_applied_lambda = 0.0;
-                        loop_lambda = lambda;
-                        lm_d2 = compute_lm_d2(&state.hessian);
-                        // Different problem (Hessian curvature changed):
-                        // restart the Madsen rejection-factor trajectory.
-                        madsen_escalator.restart();
-                        continue;
                     }
                     if !is_lm_retriable_candidate_error(&err) {
                         return Err(err);
@@ -2940,93 +2619,107 @@ where
     // Post-convergence Laplace curvature finalization (Issue 4).
     //
     // The Laplace approximation ∫ exp(-F(β)) dβ requires the *actual*
-    // Hessian H_F = ∇²F at the mode. The inner LM step search may have
-    // accepted steps under Fisher curvature (when observed went non-SPD or
-    // produced a bad gain ratio mid-iteration), but that decision must NOT
-    // leak into the exported H — Fisher → Observed substitution turns the
-    // exact Laplace criterion into a silent PQL surrogate.
+    // Hessian H_F = ∇²F at the mode, and a mode is a local minimum only when
+    // H_F is positive definite there. The inner loop iterates on observed
+    // curvature and accepts indefinite H_F away from the mode (#3962), so the
+    // inertia at β̂ is exactly the fact this block must certify rather than
+    // assume.
     //
-    // Always re-evaluate observed curvature at β̂. If the model supports it
-    // and the resulting Hessian is SPD within tolerance, export
-    // `ObservedExact`. If it's indefinite, surface the witness via
-    // `InvalidObservedCurvature` with diagnostics so the outer caller can
-    // decide loudly. If the model does not support observed curvature
-    // (canonical-link case where Observed = Fisher, or by-design surrogate
-    // family), export `ExpectedInformationSurrogate` — never silently
-    // mislabel a Fisher fallback as exact.
+    // Re-evaluate observed curvature at β̂. If the Hessian is PD within its
+    // own rounding, export `ObservedExact`. If it is indefinite (a saddle),
+    // or its inertia cannot be certified, surface `InvalidObservedCurvature`
+    // with the witness so the outer caller decides loudly. If the model does
+    // not support observed curvature (canonical-link case where
+    // Observed = Fisher, or by-design surrogate family), export
+    // `ExpectedInformationSurrogate`.
     let exported_laplace_curvature: ExportedLaplaceCurvature =
         if model.supports_observed_information_curvature() {
             match model.update_with_curvature(&beta, HessianCurvatureKind::Observed) {
                 Ok(observed_state) => {
-                    // Inertia check via the dense Hessian. Use the symmetric
-                    // eigensolver (matches the indefinite-safe stabilization
-                    // path elsewhere in PIRLS). If the Hessian is sparse-only
-                    // and we cannot densify, conservatively label SPD when
-                    // assembly succeeded; the symbolic pattern of the sparse
-                    // path enforces SPD assembly upstream.
-                    let inertia = observed_state
-                        .hessian
-                        .as_dense()
-                        .and_then(gam_linalg::utils::symmetric_extremes);
-                    let (label, accept_observed) = match inertia {
-                        Some((min_eig, max_eig)) => {
-                            // A computed eigenvalue is only known to the rounding
-                            // of the Hessian it came from: `n` per-row terms and
-                            // `p²` penalty products, the objective band's own
-                            // accounting (`convergence::objective_rounding_band`),
-                            // at the matrix's spectral scale. Below that the
-                            // curvature is resolvably indefinite (#2469).
-                            let pd_tolerance = gam_linalg::roundoff::accumulation_growth(
-                                observed_state.eta.len()
-                                    + observed_state.gradient.len() * observed_state.gradient.len(),
-                            ) * min_eig.abs().max(max_eig.abs());
-                            if min_eig > -pd_tolerance {
-                                (ExportedLaplaceCurvature::ObservedExact, true)
+                    let g_norm = || {
+                        constrained_stationarity_norm(
+                            &observed_state.gradient,
+                            beta.as_ref(),
+                            options.coefficient_lower_bounds.as_ref(),
+                            options.linear_constraints.as_ref(),
+                        )
+                    };
+                    let label = match observed_state.hessian.as_sparse() {
+                        // Sparse-native Hessian: the sparse Cholesky IS the
+                        // inertia certificate (it succeeds iff H is numerically
+                        // PD). On refusal the Gershgorin disc bound is the
+                        // rigorous witness of how far below zero the spectrum
+                        // can reach. Nothing upstream certified this matrix:
+                        // the loop accepts indefinite observed curvature.
+                        Some(h_sparse) => {
+                            if factorize_sparse_spd(h_sparse).is_ok() {
+                                ExportedLaplaceCurvature::ObservedExact
                             } else {
-                                let g_norm = constrained_stationarity_norm(
-                                    &observed_state.gradient,
-                                    beta.as_ref(),
-                                    options.coefficient_lower_bounds.as_ref(),
-                                    options.linear_constraints.as_ref(),
-                                );
+                                let min_eigenvalue =
+                                    super::newton_solve::gershgorin_min_eigenvalue_lower_bound(
+                                        h_sparse,
+                                    );
+                                let gradient_norm = g_norm();
                                 log::debug!(
-                                    "[PIRLS] post-convergence observed Hessian indefinite: \
-                                 λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, ‖g‖={g_norm:.3e}"
+                                    "[PIRLS] post-convergence sparse observed Hessian refused \
+                                     sparse Cholesky: gershgorin λ_min ≥ {min_eigenvalue:.3e}, \
+                                     ‖g‖={gradient_norm:.3e}"
                                 );
-                                (
+                                ExportedLaplaceCurvature::InvalidObservedCurvature {
+                                    min_eigenvalue,
+                                    pd_tolerance: 0.0,
+                                    gradient_norm,
+                                }
+                            }
+                        }
+                        None => match observed_state
+                            .hessian
+                            .as_dense()
+                            .and_then(gam_linalg::utils::symmetric_extremes)
+                        {
+                            Some((min_eig, max_eig)) => {
+                                // A computed eigenvalue is only known to the
+                                // rounding of the Hessian it came from: `n`
+                                // per-row terms and `p²` penalty products, the
+                                // objective band's own accounting
+                                // (`convergence::objective_rounding_band`), at the
+                                // matrix's spectral scale. Below that the
+                                // curvature is resolvably indefinite (#2469).
+                                let pd_tolerance = gam_linalg::roundoff::accumulation_growth(
+                                    observed_state.eta.len()
+                                        + observed_state.gradient.len()
+                                            * observed_state.gradient.len(),
+                                ) * min_eig.abs().max(max_eig.abs());
+                                if min_eig > -pd_tolerance {
+                                    ExportedLaplaceCurvature::ObservedExact
+                                } else {
+                                    let gradient_norm = g_norm();
+                                    log::debug!(
+                                        "[PIRLS] post-convergence observed Hessian indefinite: \
+                                         λ_min={min_eig:.3e}, pd_tol={pd_tolerance:.3e}, \
+                                         ‖g‖={gradient_norm:.3e}"
+                                    );
                                     ExportedLaplaceCurvature::InvalidObservedCurvature {
                                         min_eigenvalue: min_eig,
                                         pd_tolerance,
-                                        gradient_norm: g_norm,
-                                    },
-                                    // Indefinite observed Hessian: we still
-                                    // promote it into `state` so the exported
-                                    // Hessian matches the diagnostic label —
-                                    // the caller is told loudly via
-                                    // InvalidObservedCurvature that downstream
-                                    // log|H| is not trustworthy.
-                                    true,
-                                )
+                                        gradient_norm,
+                                    }
+                                }
                             }
-                        }
-                        None => {
-                            // Sparse-native path or eigensolver failure: rely on
-                            // the upstream SPD-assembly invariant. Treat as
-                            // observed-exact since the model accepted the assembly.
-                            (ExportedLaplaceCurvature::ObservedExact, true)
-                        }
+                            // The symmetric eigensolver did not return: the
+                            // inertia is unknown, which is not a certificate.
+                            None => ExportedLaplaceCurvature::InvalidObservedCurvature {
+                                min_eigenvalue: f64::NAN,
+                                pd_tolerance: f64::NAN,
+                                gradient_norm: g_norm(),
+                            },
+                        },
                     };
-                    // WHY: promote the observed_state into the exported `state`
-                    // when the post-convergence Observed assembly succeeded.
-                    // Without this swap, when the inner LM loop ended on
-                    // Fisher (force_fisher_for_rest engaged or mid-iter
-                    // gain-rejection fallback fired), the exported
-                    // `penalized_hessian_transformed` would still carry Fisher
-                    // weights even though `exported_laplace_curvature` claims
-                    // ObservedExact. The label and the matrix must agree.
-                    if accept_observed {
-                        state = observed_state;
-                    }
+                    // The exported `state` carries the matrix the label
+                    // describes, including an indefinite one: the caller is
+                    // told loudly via InvalidObservedCurvature that downstream
+                    // log|H| is not trustworthy.
+                    state = observed_state;
                     label
                 }
                 Err(err) => {

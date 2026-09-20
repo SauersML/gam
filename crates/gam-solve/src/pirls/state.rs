@@ -54,13 +54,16 @@ impl FirthDiagnostics {
 /// the two choices coincide. Non-canonical links (probit, cloglog, mixture,
 /// flexible, Gamma-log, ...) need observed information W_obs = W_Fisher -
 /// (y - mu) * B for the outer REML/Laplace log|H| and trace terms to be
-/// exact; Fisher weights alone yield a PQL-type surrogate. We fall back to
-/// `Fisher` only when the observed-information Hessian fails the
-/// positive-definiteness check, since the inner Newton step must be SPD.
+/// exact; Fisher weights alone yield a PQL-type surrogate. The kind is a
+/// property of the model, never of the solve history (#3962): a model that
+/// supports observed information iterates on it at every iterate, and an
+/// indefinite observed Hessian away from the mode is answered by the Newton
+/// direction's Gill–Murray modification and the LM damping, not by switching
+/// to a different likelihood surface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HessianCurvatureKind {
     /// Expected (Fisher) information: W_Fisher = h'^2 / (phi * V(mu)).
-    /// Used as the inner iteration matrix when observed curvature fails (non-SPD).
+    /// The iteration matrix of a model without observed-information support.
     Fisher,
     /// Observed information: W_obs = W_Fisher - (y - mu) * B.
     /// Required for the outer REML log|H| and trace terms (exact Laplace).
@@ -430,10 +433,9 @@ pub struct PirlsResult {
     // PIRLS always recomputes observed weights at the accepted β̂ in a
     // post-convergence finalization step (see "Post-convergence Laplace curvature
     // finalization"), so `finalweights` carries the *observed-information* diagonal
-    // whenever the model supports it — even if the inner LM loop ended on Fisher
-    // due to a fallback. Exact label of what these represent is in
-    // `exported_laplace_curvature`; do not infer the kind from `hessian_curvature`
-    // (which records what the inner loop's last accepted step happened to use).
+    // whenever the model supports it. Exact label of what these represent is in
+    // `exported_laplace_curvature`, which also carries the inertia certificate of
+    // the observed Hessian at β̂.
     // #1868: the length-`n` row fields are `ArcArray1` (reference-counted
     // ndarray, O(1) clone) so the n-free κ-trial skip path can SHARE the
     // once-built frozen row bundle across every trial instead of

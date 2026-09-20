@@ -1459,26 +1459,14 @@ _PIRLS_ITER_BREAKDOWN_PATTERN = re.compile(
 )
 
 # Per-iter curvature kind: the Debug rendering of `HessianCurvatureKind`
-# (`Observed` or `Fisher`). The Observed path converges faster but is
-# not guaranteed PD; a high Fisher fraction is a direct signal of
-# observed-Hessian PD failures at scale. The trailing `source=` field
-# distinguishes a rebuilt assembly from a reused one and is deliberately
-# not captured — the fraction is over kinds, not over rebuilds.
+# (`Observed` or `Fisher`). The kind is a property of the model (#3962):
+# a model with observed-information support iterates on the observed
+# Hessian every iteration, so the counts record which iteration matrix
+# the fit used, not a solve-history fallback rate. The trailing
+# `source=` field distinguishes a rebuilt assembly from a reused one and
+# is deliberately not captured.
 _PIRLS_CURVATURE_KIND_PATTERN = re.compile(
     r"\[STAGE\] PIRLS update_with_curvature iter=\d+\s+curvature=(\w+)"
-)
-
-# Fisher fallbacks that fire mid-LM-loop (the iter-start assembly
-# succeeded but the candidate evaluation forced a retry), and the
-# `force_fisher_for_rest` lock-in that fires at most once per solve
-# when consecutive fallbacks cross the threshold. Together they
-# separate transient fallbacks from a sustained Fisher-only state.
-_PIRLS_MID_ITER_FISHER_PATTERN = re.compile(
-    r"\[PIRLS\] mid-iter Fisher fallback iter=(\d+)\s+reason=(\w+)"
-)
-_PIRLS_FORCE_FISHER_PATTERN = re.compile(
-    r"\[PIRLS\] force_fisher_for_rest engaged at iter=(\d+)\s+"
-    r"\(consecutive_fisher_fallbacks=(\d+)\)\s+reason=(\w+)"
 )
 
 # Per-iter LM trajectory. `log10_ratio` is log10(final λ / start λ):
@@ -1626,8 +1614,6 @@ _INSTRUMENTATION_MARKERS: tuple[str, ...] = (
     "[PIRLS iter-breakdown]",
     "[PIRLS lm-trajectory]",
     "[PIRLS solve-end]",
-    "[PIRLS] mid-iter Fisher fallback",
-    "[PIRLS] force_fisher_for_rest",
     "[KAPPA-PHASE",
     "[IFT-QUALITY]",
     "[IFT-REJECTED]",
@@ -1689,14 +1675,13 @@ def _finite(values: Iterable[str]) -> list[float]:
 def _combine_fit_verdicts(
     warm_start: str | None,
     pirls: str | None,
-    curvature: str | None = None,
 ) -> str:
     """Combine the per-axis health verdicts into one fit verdict on the
     worst-wins total ordering DEGRADED > MARGINAL > HEALTHY > NO-DATA.
 
     A `None` axis (its markers never fired) ranks as NO-DATA. Worst-wins
-    rather than averaging: a fit that is HEALTHY on two axes and
-    DEGRADED on the third is DEGRADED, and the per-axis fields on the
+    rather than averaging: a fit that is HEALTHY on one axis and
+    DEGRADED on the other is DEGRADED, and the per-axis fields on the
     `[FIT health]` line say which one tripped it.
     """
     rank = {"DEGRADED": 3, "MARGINAL": 2, "HEALTHY": 1, "NO-DATA": 0}
@@ -1704,7 +1689,6 @@ def _combine_fit_verdicts(
     worst = max(
         rank.get(warm_start or "NO-DATA", 0),
         rank.get(pirls or "NO-DATA", 0),
-        rank.get(curvature or "NO-DATA", 0),
     )
     return inv_rank[worst]
 
@@ -1714,14 +1698,13 @@ def _dominant_axis_for_verdict(
     *,
     warm_start: str | None,
     pirls: str | None,
-    curvature: str | None,
 ) -> str:
     """Name the axis that drove `combined`, so a CI scraper can alert on
-    the failing axis without re-deriving worst-of-three.
+    the failing axis without re-deriving worst-of-two.
 
     Ties are broken toward `pirls` first (the central inner-Newton
-    diagnostic), then `warm_start`, then `curvature`. An all-missing
-    combination reports `none`.
+    diagnostic), then `warm_start`. An all-missing combination reports
+    `none`.
     """
     if combined == "NO-DATA":
         return "none"
@@ -1730,36 +1713,10 @@ def _dominant_axis_for_verdict(
     for name, verdict in (
         ("pirls", pirls),
         ("warm_start", warm_start),
-        ("curvature", curvature),
     ):
         if rank.get(verdict or "NO-DATA", 0) == target:
             return name
     return "none"
-
-
-def _curvature_health_verdict(
-    *,
-    fisher_frac: float | None,
-    force_fisher_n: int,
-) -> tuple[str, str]:
-    """Classify observed-Hessian reliability from the Fisher-fallback
-    counters. Returns (verdict, detail).
-
-    HEALTHY   fisher_frac < 0.05 and no lock-in
-    MARGINAL  fisher_frac < 0.20 and no lock-in — occasional transient
-              fallbacks, Observed still mostly usable
-    DEGRADED  fisher_frac >= 0.20, or any `force_fisher_for_rest`
-              lock-in: at least one solve abandoned Observed entirely
-    NO-DATA   the curvature-kind markers never fired
-    """
-    if fisher_frac is None:
-        return ("NO-DATA", "fisher_frac=n/a force_fisher_n=0")
-    detail = f"fisher_frac={fisher_frac:.2f} force_fisher_n={force_fisher_n}"
-    if force_fisher_n > 0 or fisher_frac >= 0.20:
-        return ("DEGRADED", detail)
-    if fisher_frac >= 0.05:
-        return ("MARGINAL", detail)
-    return ("HEALTHY", detail)
 
 
 def _pirls_health_verdict(*, rates: list[float]) -> tuple[str, str]:
@@ -1985,40 +1942,14 @@ def _emit_phase_summary(
         )
 
     curvature_kinds = _PIRLS_CURVATURE_KIND_PATTERN.findall(captured_stderr)
-    fisher_frac: float | None = None
     if curvature_kinds:
         kind_counts: dict[str, int] = {}
         for kind in curvature_kinds:
             kind_counts[kind] = kind_counts.get(kind, 0) + 1
-        fisher_frac = kind_counts.get("Fisher", 0) / len(curvature_kinds)
         kind_pieces = " ".join(
             f"pirls_curv_{kind}={count}" for kind, count in sorted(kind_counts.items())
         )
-        parts.append(
-            f"pirls_curv_n={len(curvature_kinds)} {kind_pieces} "
-            f"pirls_fisher_frac={fisher_frac:.2f}"
-        )
-
-    mid_iter_fisher = _PIRLS_MID_ITER_FISHER_PATTERN.findall(captured_stderr)
-    if mid_iter_fisher:
-        parts.append(
-            f"pirls_mid_iter_fisher_n={len(mid_iter_fisher)} "
-            f"pirls_mid_iter_gain_rejection="
-            f"{sum(1 for row in mid_iter_fisher if row[1] == 'gain_rejection')} "
-            f"pirls_mid_iter_candidate_err="
-            f"{sum(1 for row in mid_iter_fisher if row[1] == 'candidate_err')}"
-        )
-
-    force_fisher = _PIRLS_FORCE_FISHER_PATTERN.findall(captured_stderr)
-    if force_fisher:
-        force_reasons: dict[str, int] = {}
-        for _iter, _count, reason in force_fisher:
-            force_reasons[reason] = force_reasons.get(reason, 0) + 1
-        reason_pieces = " ".join(
-            f"pirls_force_fisher_{reason}={count}"
-            for reason, count in sorted(force_reasons.items())
-        )
-        parts.append(f"pirls_force_fisher_n={len(force_fisher)} {reason_pieces}")
+        parts.append(f"pirls_curv_n={len(curvature_kinds)} {kind_pieces}")
 
     breakdown = _PIRLS_ITER_BREAKDOWN_PATTERN.findall(captured_stderr)
     if breakdown:
@@ -2323,39 +2254,18 @@ def _emit_phase_summary(
             flush=True,
         )
 
-    curvature_verdict: str | None = None
-    if fisher_frac is not None:
-        curvature_verdict, detail = _curvature_health_verdict(
-            fisher_frac=fisher_frac,
-            force_fisher_n=len(force_fisher),
-        )
-        print(
-            f"[CURVATURE health] cmd='{cmd_preview}' "
-            f"verdict={curvature_verdict} {detail}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    if (
-        warm_start_verdict is not None
-        or pirls_verdict is not None
-        or curvature_verdict is not None
-    ):
-        combined = _combine_fit_verdicts(
-            warm_start_verdict, pirls_verdict, curvature_verdict
-        )
+    if warm_start_verdict is not None or pirls_verdict is not None:
+        combined = _combine_fit_verdicts(warm_start_verdict, pirls_verdict)
         dominant_axis = _dominant_axis_for_verdict(
             combined,
             warm_start=warm_start_verdict,
             pirls=pirls_verdict,
-            curvature=curvature_verdict,
         )
         print(
             f"[FIT health] cmd='{cmd_preview}' verdict={combined} "
             f"dominant_axis={dominant_axis} "
             f"warm_start={warm_start_verdict or 'ABSENT'} "
-            f"pirls={pirls_verdict or 'ABSENT'} "
-            f"curvature={curvature_verdict or 'ABSENT'}",
+            f"pirls={pirls_verdict or 'ABSENT'}",
             file=sys.stderr,
             flush=True,
         )
