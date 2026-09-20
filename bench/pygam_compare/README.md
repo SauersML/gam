@@ -241,7 +241,7 @@ heteroscedastic, heavy tails, binomial, Poisson) at n ∈ {30, 100, 1000}.
 python -m bench.pygam_compare.conformal_coverage --reps 1000
 ```
 
-It writes `bench/pygam_audit/conformal_coverage.md`, the committed table.
+It writes the table to `bench/pygam_audit/conformal_coverage.md`.
 The module docstring defines the DGPs, the width measure and the **nominal**
 band, `0.9 - 2 MCSE <= coverage <= 0.9 + 1/(n_cal + 1) + 2 MCSE`. The report
 ends with the cells where pyGAM misses that band and gamfit full conformal's
