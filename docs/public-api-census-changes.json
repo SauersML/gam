@@ -4799,13 +4799,13 @@
     "evidence": "public_api_census.py with base 9af3c66f1b and head the merge commit refused exactly this identity (13440 -> 13441 public function declarations). After this change git grep -w finds build_model_summary only in a historical doc sentence in saved_summary.rs."
   },
   {
-    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
+    "base": "f50774f77ccd28ee24f0cb8efe07c2871a2ae822",
     "removed": {
       "crates/gam-sae/src/manifold/certificate.rs::curved_dictionary_global_optimality_verdict": 1,
       "crates/gam-sae/src/manifold/certificate.rs::is_certified": 1,
       "crates/gam-sae/src/manifold/certificate.rs::margin": 1
     },
     "reason": "#2946 census T1/C1: curved_dictionary_global_optimality_verdict was the decision rule of GlobalOptimalityVerdict::CertifiedGlobal, which published 'unique global optimum' from the underived sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K with the chosen constants c0 = 1.0 and C_kappa = 0.125; margin and is_certified were that verdict's accessors. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' The verdict is deleted; its measured inputs survive as DictionaryIncoherenceReport (mu_hat, per_atom_kappa_hat, peak_activity_floor, snr_proxy).",
-    "evidence": "At base 5834fb219d public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
+    "evidence": "At base f50774f77c public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
   }
 ]
