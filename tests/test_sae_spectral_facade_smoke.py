@@ -215,8 +215,18 @@ def test_atlas_nerve_diagram_smoke():
     circle = np.stack((np.cos(theta), np.sin(theta)), axis=1).astype(np.float32)
     indices = np.tile(np.array([[0, 1]], dtype=np.uint32), (n, 1))
     values = np.stack((circle, circle), axis=1)
-    report = atlas_nerve_diagram((indices, values), n_units=2, block_size=2)
+    uncertified = atlas_nerve_diagram((indices, values), n_units=2, block_size=2)
+    assert uncertified.computed
+    assert uncertified.transfer_gate_level is None
+    assert uncertified.n_edges == 0
+    report = atlas_nerve_diagram(
+        (indices, values), n_units=2, block_size=2, familywise_alpha=0.05
+    )
     assert report.computed
+    assert report.transfer_gate_level == pytest.approx(0.05)
+    assert len(report.transfer_gates) == 1
+    assert report.transfer_gates[0]["valid"] is True
+    assert report.transfer_gates[0]["orientation"] == "preserving"
     assert report.chart_blocks == [0, 1]
     assert set(report.betti) == {"b0", "b1", "b2"}
     assert report.betti["b0"] >= 1

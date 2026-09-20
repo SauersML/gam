@@ -645,6 +645,26 @@ fn atlas_nerve_dict<'py>(
     out.set_item("n_triangles", diagram.n_triangles)?;
     out.set_item("n_tetrahedra", diagram.n_tetrahedra)?;
     out.set_item("simplex_counts", diagram.simplex_counts.clone())?;
+    // Per-edge level of the calibrated transfer gates; `None` means no
+    // familywise level was supplied, so no nerve edge is certified.
+    out.set_item("transfer_gate_level", report.transfer_gate_level)?;
+    let transfer_gates = PyList::empty(py);
+    for gate in &report.transfer_gates {
+        let row = PyDict::new(py);
+        let test = &gate.test;
+        row.set_item("a", gate.edge().a())?;
+        row.set_item("b", gate.edge().b())?;
+        row.set_item("n_rows", test.n_rows)?;
+        row.set_item("orientation", test.orientation.as_str())?;
+        row.set_item("scale", test.scale)?;
+        row.set_item("conformal_defect", test.conformal_defect)?;
+        row.set_item("conformal_defect_se", test.conformal_defect_se)?;
+        row.set_item("conformal_p_value", test.conformal_p_value)?;
+        row.set_item("existence_p_value", test.existence_p_value)?;
+        row.set_item("valid", gate.valid)?;
+        transfer_gates.append(row)?;
+    }
+    out.set_item("transfer_gates", transfer_gates)?;
     // The alternating simplex sum is an exact statistic of the admitted
     // finite nerve. It is not, by itself, a finite-sample Gauss--Bonnet claim
     // about the sampled manifold, so keep the two values separately named.
@@ -726,21 +746,25 @@ fn atlas_nerve_dict<'py>(
 /// E1 FFI completeness). This exposes the same Čech-nerve reduction `audit_sae`
 /// computes internally as its own front-door accessor: build one `AtlasChart` per
 /// requested `b`-wide block from sparse per-row block-energy support, certify only
-/// genuinely co-active chart transfers, and reduce the nerve to its Betti signature
-/// and simplex counts. Every number is computed in the `gam::terms::sae::inference::
+/// co-active chart transfers, and reduce the nerve to its Betti signature and
+/// simplex counts. Every number is computed in the `gam::terms::sae::inference::
 /// atlas_nerve` core; this only marshals the sparse route in and the diagram dict
 /// out. Returns `{computed: false, reason}` for shapes the nerve does not apply to
 /// (scalar `block_size == 1` or fewer than two selected charts), matching
 /// `atlas_nerve_dict`'s skipped-report contract.
 ///
+/// An overlap becomes a nerve edge only through a calibrated transfer test: the
+/// co-firing codes must carry a linear transfer that is a scaled rotation or
+/// reflection. `familywise_alpha` is the probability of misclassifying any tested
+/// pair (each of the `m` tests runs at `α/m`); without it every gate reports its
+/// p-values under `transfer_gates` but no edge is admitted.
+///
 /// Supplying `observations` (the ambient activation rows these charts were read
-/// from, one row per route row) together with `familywise_alpha` promotes the
-/// front door from a combinatorial-only nerve to a certified fit: it runs the
-/// cross-fitted Gaussian-PCA holonomy producer and threads the resulting
-/// finite-sample certificate — projected-PCA patches, disjoint-inference-row
-/// error model, and every typed refusal — through the diagram. The two arguments
-/// travel together because a certified holonomy claim must state the error
-/// probability it spends; omitting both keeps the pure combinatorial reduction.
+/// from, one row per route row) as well runs the cross-fitted Gaussian-PCA
+/// holonomy producer and threads its finite-sample certificate — projected-PCA
+/// patches, disjoint-inference-row error model, and every typed refusal —
+/// through the diagram. It requires `familywise_alpha`, because a certified
+/// holonomy claim must state the error probability it spends.
 #[pyfunction(signature = (
     indices,
     values,
@@ -768,12 +792,6 @@ fn atlas_nerve_diagram<'py>(
         "atlas route",
     )
     .map_err(PyValueError::new_err)?;
-    // When the caller supplies the ambient activations these charts were read
-    // from together with a familywise level, run the cross-fitted Gaussian-PCA
-    // holonomy producer and thread a real finite-sample certificate through the
-    // nerve. Without both, the front door stays a combinatorial-only nerve; the
-    // two travel together because a certified holonomy claim must always state the
-    // error probability it is willing to spend.
     let observations = observations.map(|array| array.as_array().to_owned());
     let report = detach_py_result(py, "atlas_nerve_diagram", move || {
         atlas_nerve_from_sparse_route(
@@ -1414,24 +1432,41 @@ mod sae_spectral_ffi_tests {
 
     #[test]
     fn atlas_nerve_uses_canonical_overlap_zero_without_fabricating_holonomy() {
-        let route = AuditSparseRoute::new(
-            ndarray::array![[0_u32, 1_u32], [0_u32, 1_u32]],
-            ndarray::array![
-                [[1.0_f32, 0.0_f32], [1.0_f32, 0.0_f32]],
-                [[0.0_f32, 1.0_f32], [0.0_f32, 1.0_f32]],
-            ],
-            2,
-            2,
-            "atlas test route",
-        )
-        .unwrap();
-        let report = atlas_nerve_from_sparse_route(&route, None, None, None)
+        const ROWS: usize = 8;
+        let mut indices = ndarray::Array2::<u32>::zeros((ROWS, 2));
+        let mut values = ndarray::Array3::<f32>::zeros((ROWS, 2, 2));
+        for row in 0..ROWS {
+            indices[[row, 1]] = 1;
+            let (sine, cosine) = (std::f64::consts::TAU * row as f64 / ROWS as f64).sin_cos();
+            for chart in 0..2 {
+                values[[row, chart, 0]] = cosine as f32;
+                values[[row, chart, 1]] = sine as f32;
+            }
+        }
+        let route = AuditSparseRoute::new(indices, values, 2, 2, "atlas test route").unwrap();
+        // Without a familywise level the gate reports its test but certifies
+        // no edge.
+        let uncertified = atlas_nerve_from_sparse_route(&route, None, None, None)
             .unwrap()
             .unwrap();
+        assert_eq!(uncertified.transfer_gate_level, None);
+        assert_eq!(uncertified.transfer_gates.len(), 1);
+        assert!(!uncertified.diagram.edges[0].transfer_valid);
+        assert!(!uncertified.diagram.edges[0].admitted);
+
+        let report = atlas_nerve_from_sparse_route(&route, None, None, Some(0.05))
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.transfer_gate_level, Some(0.05));
+        assert!(report.transfer_gates[0].test.conformal_p_value > 0.05);
         assert_eq!(report.diagram.edges.len(), 1);
         assert_eq!(report.diagram.edges[0].overlap, 0);
         assert!(report.diagram.edges[0].transfer_valid);
         assert!(report.diagram.edges[0].admitted);
+        assert_eq!(
+            report.holonomy_unavailable_reason.as_deref(),
+            Some("ambient observations were not supplied for cross-fitted holonomy")
+        );
         assert!(report.diagram.holonomy_certificate.is_none());
         assert_eq!(report.diagram.certified_orientability(), None);
 
@@ -1449,6 +1484,18 @@ mod sae_spectral_ffi_tests {
                 .extract()
                 .unwrap();
             assert_eq!(nerve_euler, report.diagram.euler_characteristic);
+            let level: Option<f64> = dict
+                .get_item("transfer_gate_level")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(level, Some(0.05));
+            let gates = dict.get_item("transfer_gates").unwrap().unwrap();
+            let gate = gates.get_item(0).unwrap();
+            assert!(gate.get_item("valid").unwrap().extract::<bool>().unwrap());
+            let orientation: String = gate.get_item("orientation").unwrap().extract().unwrap();
+            assert_eq!(orientation, "preserving");
             let status: String = dict
                 .get_item("holonomy_status")
                 .unwrap()
@@ -1752,6 +1799,7 @@ mod sae_spectral_ffi_tests {
         let report = atlas_nerve_from_sparse_route(&route, None, None, None)
             .unwrap()
             .unwrap();
+        assert!(report.transfer_gates.is_empty());
         assert_eq!(report.diagram.edges.len(), 1);
         assert_eq!(report.diagram.edges[0].overlap, 0);
         assert!(!report.diagram.edges[0].transfer_valid);

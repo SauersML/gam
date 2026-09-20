@@ -10,7 +10,6 @@
 //! characteristic; stopping at triangles or tetrahedra changes topology when
 //! five or more charts share an overlap.
 
-use crate::chart_transfer::TransferCertificate;
 use crate::inference::atlas_holonomy::{
     AtlasEulerCharacteristic, AtlasHolonomyCertificate, AtlasHolonomyEdgeId,
 };
@@ -123,35 +122,346 @@ impl AtlasChart {
     pub fn support_rows(&self) -> &[usize] {
         &self.support_rows
     }
-
 }
 
-/// Existing transfer evidence for one connected chart-overlap component,
-/// compressed to the validity verdict the nerve gate needs.
+/// Orientation class of a planar conformal transfer `x_b = c·Q·x_a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanarTransferOrientation {
+    /// `Q` is a rotation: the transfer lies in `span{I, G}` and commutes with
+    /// the SO(2) generator `G = [[0, −1], [1, 0]]`.
+    Preserving,
+    /// `Q` is a reflection: the transfer lies in `span{F, H}`
+    /// (`F = diag(1, −1)`, `H = [[0, 1], [1, 0]]`) and anti-commutes with `G`.
+    Reversing,
+}
+
+impl PlanarTransferOrientation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Preserving => "preserving",
+            Self::Reversing => "reversing",
+        }
+    }
+}
+
+/// Calibrated test that the empirical transfer between two planar charts is a
+/// scaled rotation or reflection.
+///
+/// The co-firing rows give paired codes `x_i` (chart a) and `y_i` (chart b).
+/// The least-squares operator `A = (XᵀX)⁻¹XᵀY` (so `y_i ≈ Aᵀx_i`) decomposes
+/// uniquely and Frobenius-orthogonally as
+/// `A = a·I + b·G + p·F + q·H`, with
+/// `(a, b) = ((A₀₀ + A₁₁)/2, (A₁₀ − A₀₁)/2)` the conformal-rotation part and
+/// `(p, q) = ((A₀₀ − A₁₁)/2, (A₀₁ + A₁₀)/2)` the conformal-reflection part.
+/// `A` is a scaled rotation exactly when `(p, q) = 0`, and a scaled reflection
+/// exactly when `(a, b) = 0`. Both constraints leave the scale free, because
+/// two independently learned chart blocks have unidentified relative radii.
+///
+/// The sampling covariance of `vec(A)` is the HC2 sandwich
+/// `(I ⊗ S⁻¹) [Σᵢ Ωᵢ ⊗ xᵢxᵢᵀ] (I ⊗ S⁻¹)` with `S = XᵀX` and
+/// `Ωᵢ = eᵢeᵢᵀ/(1 − hᵢ) + Q_{y,i} + AᵀQ_{x,i}A`. Here `eᵢ` is the residual and
+/// `hᵢ = xᵢᵀS⁻¹xᵢ` the leverage; HC2 makes the meat unbiased under
+/// homoskedastic errors. `Q_{·,i}` is the uniform-quantization variance
+/// `ulp²/12` of the f32 codes the routes store. A code is known only to half an
+/// f32 spacing, so this is the input's own resolution. It is negligible beside
+/// any sampling noise, and it keeps the covariance of an exactly consistent pair
+/// equal to the input resolution instead of `0/0`.
+///
+/// Each Wald statistic is referred to its χ² distribution:
+/// `(p, q)` and `(a, b)` against χ²₂, and `vec(A) = 0` against χ²₄. The
+/// conformality p-value is that of the union null (rotation or reflection),
+/// `max(p_rot, p_ref)`. It is exact when the scale is resolved, because the
+/// other class's p-value then vanishes.
+#[derive(Clone, Debug)]
+pub struct PlanarTransferTest {
+    pub n_rows: usize,
+    /// Least-squares operator with `X_a·A ≈ X_b`.
+    pub operator: [[f64; 2]; 2],
+    /// The conformal class with the larger p-value.
+    pub orientation: PlanarTransferOrientation,
+    /// Relative radius `c`: the norm of the in-class coordinates.
+    pub scale: f64,
+    /// Frobenius norm of the off-class component of `A`.
+    pub conformal_defect: f64,
+    /// Null root-mean-square of [`Self::conformal_defect`],
+    /// `√(E‖defect‖²) = √(2·tr Cov(off-class coordinates))`.
+    pub conformal_defect_se: f64,
+    pub conformal_statistic: f64,
+    pub conformal_p_value: f64,
+    /// Wald statistic of `A = 0`: no linear transfer between the charts.
+    pub existence_statistic: f64,
+    pub existence_p_value: f64,
+}
+
+/// Uniform-quantization variance `ulp(v)²/12` of one stored f32 code.
+fn f32_quantization_variance(value: f32) -> f64 {
+    let magnitude = value.abs();
+    let next = f32::from_bits(magnitude.to_bits() + 1);
+    let spacing = f64::from(next) - f64::from(magnitude);
+    spacing * spacing / 12.0
+}
+
+/// `vᵀ C⁻¹ v` for a symmetric positive-definite `C` through its Cholesky
+/// factor; `None` when `C` is not numerically positive definite.
+fn spd_quadratic_form<const N: usize>(cov: &[[f64; N]; N], v: &[f64; N]) -> Option<f64> {
+    let mut l = [[0.0_f64; N]; N];
+    for i in 0..N {
+        for j in 0..=i {
+            let mut sum = cov[i][j];
+            for k in 0..j {
+                sum -= l[i][k] * l[j][k];
+            }
+            if i == j {
+                if !(sum > 0.0 && sum.is_finite()) {
+                    return None;
+                }
+                l[i][i] = sum.sqrt();
+            } else {
+                l[i][j] = sum / l[j][j];
+            }
+        }
+    }
+    let mut z = [0.0_f64; N];
+    for i in 0..N {
+        let mut sum = v[i];
+        for k in 0..i {
+            sum -= l[i][k] * z[k];
+        }
+        z[i] = sum / l[i][i];
+    }
+    let form = z.iter().map(|value| value * value).sum::<f64>();
+    form.is_finite().then_some(form)
+}
+
+impl PlanarTransferTest {
+    /// Test the transfer carried by paired f32 codes, one row per co-firing
+    /// observation. Needs at least three rows: `2n` responses fit four
+    /// coefficients, so `n ≥ 3` leaves residual degrees of freedom.
+    pub fn from_codes(x_a: &[[f32; 2]], x_b: &[[f32; 2]]) -> Result<Self, String> {
+        let n = x_a.len();
+        if x_b.len() != n {
+            return Err(format!(
+                "planar transfer test needs paired rows, got {n} and {}",
+                x_b.len()
+            ));
+        }
+        if n < 3 {
+            return Err(format!(
+                "planar transfer test needs at least three co-firing rows to leave residual degrees of freedom, got {n}"
+            ));
+        }
+        if x_a
+            .iter()
+            .chain(x_b)
+            .any(|row| !(row[0].is_finite() && row[1].is_finite()))
+        {
+            return Err("planar transfer test received a non-finite code".to_string());
+        }
+        let x = |i: usize| [f64::from(x_a[i][0]), f64::from(x_a[i][1])];
+        let y = |i: usize| [f64::from(x_b[i][0]), f64::from(x_b[i][1])];
+        let mut gram = [[0.0_f64; 2]; 2];
+        let mut cross = [[0.0_f64; 2]; 2];
+        for i in 0..n {
+            let (xi, yi) = (x(i), y(i));
+            for k in 0..2 {
+                for m in 0..2 {
+                    gram[k][m] += xi[k] * xi[m];
+                    cross[k][m] += xi[k] * yi[m];
+                }
+            }
+        }
+        let det = gram[0][0] * gram[1][1] - gram[0][1] * gram[1][0];
+        if !(det > 0.0 && det.is_finite()) {
+            return Err(format!(
+                "chart-a overlap codes span less than the plane (Gram determinant {det})"
+            ));
+        }
+        let gram_inv = [
+            [gram[1][1] / det, -gram[0][1] / det],
+            [-gram[1][0] / det, gram[0][0] / det],
+        ];
+        // operator[k][j]: regressor coordinate k, response coordinate j.
+        let mut operator = [[0.0_f64; 2]; 2];
+        for k in 0..2 {
+            for j in 0..2 {
+                operator[k][j] = gram_inv[k][0] * cross[0][j] + gram_inv[k][1] * cross[1][j];
+            }
+        }
+        // Meat indexed by θ = vec(A) with θ[2j + k] = A[k][j].
+        let mut meat = [[0.0_f64; 4]; 4];
+        for i in 0..n {
+            let (xi, yi) = (x(i), y(i));
+            let leverage = (0..2)
+                .map(|k| (0..2).map(|m| xi[k] * gram_inv[k][m] * xi[m]).sum::<f64>())
+                .sum::<f64>();
+            let free = 1.0 - leverage;
+            if !(free > 0.0) {
+                return Err(format!(
+                    "overlap row {i} has unit leverage, so its residual carries no noise information"
+                ));
+            }
+            let residual: [f64; 2] =
+                std::array::from_fn(|j| yi[j] - operator[0][j] * xi[0] - operator[1][j] * xi[1]);
+            let qx = [
+                f32_quantization_variance(x_a[i][0]),
+                f32_quantization_variance(x_a[i][1]),
+            ];
+            let qy = [
+                f32_quantization_variance(x_b[i][0]),
+                f32_quantization_variance(x_b[i][1]),
+            ];
+            let mut omega = [[0.0_f64; 2]; 2];
+            for j in 0..2 {
+                for l in 0..2 {
+                    omega[j][l] = residual[j] * residual[l] / free
+                        + (0..2)
+                            .map(|k| operator[k][j] * qx[k] * operator[k][l])
+                            .sum::<f64>();
+                }
+                omega[j][j] += qy[j];
+            }
+            for j in 0..2 {
+                for k in 0..2 {
+                    for l in 0..2 {
+                        for m in 0..2 {
+                            meat[2 * j + k][2 * l + m] += omega[j][l] * xi[k] * xi[m];
+                        }
+                    }
+                }
+            }
+        }
+        let mut cov = [[0.0_f64; 4]; 4];
+        for j in 0..2 {
+            for k in 0..2 {
+                for l in 0..2 {
+                    for m in 0..2 {
+                        cov[2 * j + k][2 * l + m] = (0..2)
+                            .map(|kk| {
+                                (0..2)
+                                    .map(|mm| {
+                                        gram_inv[k][kk]
+                                            * meat[2 * j + kk][2 * l + mm]
+                                            * gram_inv[mm][m]
+                                    })
+                                    .sum::<f64>()
+                            })
+                            .sum();
+                    }
+                }
+            }
+        }
+        // φ = (a, b, p, q) = Lθ with θ = (A₀₀, A₁₀, A₀₁, A₁₁).
+        let lmap = [
+            [0.5, 0.0, 0.0, 0.5],
+            [0.0, 0.5, -0.5, 0.0],
+            [0.5, 0.0, 0.0, -0.5],
+            [0.0, 0.5, 0.5, 0.0],
+        ];
+        let theta = [
+            operator[0][0],
+            operator[1][0],
+            operator[0][1],
+            operator[1][1],
+        ];
+        let phi: [f64; 4] = std::array::from_fn(|r| (0..4).map(|c| lmap[r][c] * theta[c]).sum());
+        let mut phi_cov = [[0.0_f64; 4]; 4];
+        for r in 0..4 {
+            for s in 0..4 {
+                phi_cov[r][s] = (0..4)
+                    .map(|c| {
+                        (0..4)
+                            .map(|d| lmap[r][c] * cov[c][d] * lmap[s][d])
+                            .sum::<f64>()
+                    })
+                    .sum();
+            }
+        }
+        let block = |offset: usize| -> ([f64; 2], [[f64; 2]; 2]) {
+            (
+                [phi[offset], phi[offset + 1]],
+                [
+                    [phi_cov[offset][offset], phi_cov[offset][offset + 1]],
+                    [phi_cov[offset + 1][offset], phi_cov[offset + 1][offset + 1]],
+                ],
+            )
+        };
+        let singular = || "planar transfer covariance is not positive definite".to_string();
+        let (rotation, rotation_cov) = block(0);
+        let (reflection, reflection_cov) = block(2);
+        // Rotation null: the reflection coordinates vanish, and vice versa.
+        let rotation_statistic =
+            spd_quadratic_form(&reflection_cov, &reflection).ok_or_else(singular)?;
+        let reflection_statistic =
+            spd_quadratic_form(&rotation_cov, &rotation).ok_or_else(singular)?;
+        let existence_statistic = spd_quadratic_form(&phi_cov, &phi).ok_or_else(singular)?;
+        let rotation_p = gam_math::probability::chi_square_sf(rotation_statistic, 2.0);
+        let reflection_p = gam_math::probability::chi_square_sf(reflection_statistic, 2.0);
+        let norm = |v: [f64; 2]| v[0].hypot(v[1]);
+        let (orientation, in_class, off_class, off_cov, statistic, p_value) =
+            if rotation_p >= reflection_p {
+                (
+                    PlanarTransferOrientation::Preserving,
+                    rotation,
+                    reflection,
+                    reflection_cov,
+                    rotation_statistic,
+                    rotation_p,
+                )
+            } else {
+                (
+                    PlanarTransferOrientation::Reversing,
+                    reflection,
+                    rotation,
+                    rotation_cov,
+                    reflection_statistic,
+                    reflection_p,
+                )
+            };
+        Ok(Self {
+            n_rows: n,
+            operator,
+            orientation,
+            scale: norm(in_class),
+            conformal_defect: std::f64::consts::SQRT_2 * norm(off_class),
+            conformal_defect_se: (2.0 * (off_cov[0][0] + off_cov[1][1])).sqrt(),
+            conformal_statistic: statistic,
+            conformal_p_value: p_value,
+            existence_statistic,
+            existence_p_value: gam_math::probability::chi_square_sf(existence_statistic, 4.0),
+        })
+    }
+}
+
+/// Transfer evidence for one connected chart-overlap component.
+///
+/// The gate is valid at a per-edge level `α_e` when the transfer exists
+/// (`vec(A) = 0` is rejected, `p_exist ≤ α_e`) and is conformal (the union
+/// rotation-or-reflection null is not rejected, `p_conf > α_e`). An edge can
+/// then be wrongly admitted only when an absent transfer passes the existence
+/// test, and wrongly refused only when a conformal transfer fails the
+/// conformality test. Each happens with probability at most `α_e`. With no
+/// level the gate carries its test but certifies nothing.
 #[derive(Clone, Debug)]
 pub struct AtlasTransferGate {
     edge: AtlasHolonomyEdgeId,
+    pub test: PlanarTransferTest,
+    pub level: Option<f64>,
     pub valid: bool,
-    pub transport_defect: f64,
-    pub equivariance_defect: f64,
 }
 
 impl AtlasTransferGate {
-    pub fn from_square_transfer(
+    pub fn from_test(
         edge: AtlasHolonomyEdgeId,
-        certificate: TransferCertificate,
-        chart_dim: usize,
+        test: PlanarTransferTest,
+        level: Option<f64>,
     ) -> Self {
-        let scale = (chart_dim.max(1) as f64).sqrt() * f64::EPSILON;
-        let valid = certificate.transport_defect.is_finite()
-            && certificate.equivariance_defect.is_finite()
-            && certificate.transport_defect <= scale
-            && certificate.equivariance_defect <= scale;
+        let valid = level
+            .is_some_and(|alpha| test.existence_p_value <= alpha && test.conformal_p_value > alpha);
         Self {
             edge,
+            test,
+            level,
             valid,
-            transport_defect: certificate.transport_defect,
-            equivariance_defect: certificate.equivariance_defect,
         }
     }
 
@@ -881,11 +1191,99 @@ pub fn build_atlas_nerve(
 
 #[cfg(test)]
 mod tests {
-    use super::{AtlasChart, AtlasTransferGate, build_atlas_nerve};
-    use crate::chart_transfer::certify_square_transfer;
+    use super::{
+        AtlasChart, AtlasTransferGate, PlanarTransferOrientation, PlanarTransferTest,
+        build_atlas_nerve,
+    };
     use crate::inference::atlas_holonomy::AtlasHolonomyEdgeId;
     use crate::manifold::{AtlasOrientability, GraphCompressionKind};
-    use ndarray::{Array2, arr2};
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
+    use std::f64::consts::PI;
+
+    /// Evenly spaced unit-circle codes.
+    fn circle_codes(n: usize) -> Vec<[f32; 2]> {
+        (0..n)
+            .map(|i| {
+                let angle = 2.0 * PI * i as f64 / n as f64;
+                [angle.cos() as f32, angle.sin() as f32]
+            })
+            .collect()
+    }
+
+    /// `y_i = Aᵀx_i` evaluated exactly in f64 and stored as f32.
+    fn mapped_codes(codes: &[[f32; 2]], operator: [[f64; 2]; 2]) -> Vec<[f32; 2]> {
+        codes
+            .iter()
+            .map(|x| {
+                let (x0, x1) = (f64::from(x[0]), f64::from(x[1]));
+                [
+                    (operator[0][0] * x0 + operator[1][0] * x1) as f32,
+                    (operator[0][1] * x0 + operator[1][1] * x1) as f32,
+                ]
+            })
+            .collect()
+    }
+
+    fn gate_from_operator(
+        edge: AtlasHolonomyEdgeId,
+        operator: [[f64; 2]; 2],
+        level: Option<f64>,
+    ) -> AtlasTransferGate {
+        let x = circle_codes(16);
+        let y = mapped_codes(&x, operator);
+        AtlasTransferGate::from_test(edge, PlanarTransferTest::from_codes(&x, &y).unwrap(), level)
+    }
+
+    fn standard_normal(rng: &mut StdRng) -> f64 {
+        let u: f64 = rng.random_range(f64::MIN_POSITIVE..1.0);
+        let v: f64 = rng.random_range(0.0..1.0);
+        (-2.0 * u.ln()).sqrt() * (2.0 * PI * v).cos()
+    }
+
+    /// `n` isotropic codes `x_i` and responses `y_i = Aᵀx_i + σε_i`.
+    fn noisy_pair(
+        rng: &mut StdRng,
+        n: usize,
+        operator: [[f64; 2]; 2],
+        sigma: f64,
+    ) -> (Vec<[f32; 2]>, Vec<[f32; 2]>) {
+        let mut x = Vec::with_capacity(n);
+        let mut y = Vec::with_capacity(n);
+        for _ in 0..n {
+            let x0 = standard_normal(rng);
+            let x1 = standard_normal(rng);
+            let y0 = operator[0][0] * x0 + operator[1][0] * x1 + sigma * standard_normal(rng);
+            let y1 = operator[0][1] * x0 + operator[1][1] * x1 + sigma * standard_normal(rng);
+            x.push([x0 as f32, x1 as f32]);
+            y.push([y0 as f32, y1 as f32]);
+        }
+        (x, y)
+    }
+
+    /// Rejection rates of `p_value` at each level, and the Monte Carlo
+    /// standard error `√(α(1 − α)/R)` a calibrated test would show.
+    fn assert_calibrated(p_values: &[f64], label: &str) {
+        let reps = p_values.len() as f64;
+        for alpha in [0.01, 0.05, 0.2] {
+            let rate = p_values.iter().filter(|&&p| p <= alpha).count() as f64 / reps;
+            let mcse = (alpha * (1.0 - alpha) / reps).sqrt();
+            assert!(
+                (rate - alpha).abs() <= 4.0 * mcse,
+                "{label}: rejection rate {rate} at level {alpha} is outside 4 MCSE ({mcse})"
+            );
+        }
+    }
+
+    fn rotation(scale: f64, angle: f64) -> [[f64; 2]; 2] {
+        let (s, c) = angle.sin_cos();
+        [[scale * c, -scale * s], [scale * s, scale * c]]
+    }
+
+    fn reflection(scale: f64, angle: f64) -> [[f64; 2]; 2] {
+        let (s, c) = angle.sin_cos();
+        [[scale * c, scale * s], [scale * s, -scale * c]]
+    }
 
     fn charts_from_faces(n_charts: usize, faces: &[Vec<usize>]) -> Vec<AtlasChart> {
         let mut support_rows = vec![Vec::new(); n_charts];
@@ -905,18 +1303,14 @@ mod tests {
     }
 
     fn all_valid_pair_gates(n_charts: usize) -> Vec<AtlasTransferGate> {
-        let generator = Array2::<f64>::zeros((2, 2));
-        let identity = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
+        let identity = [[1.0, 0.0], [0.0, 1.0]];
         let mut gates = Vec::new();
         for a in 0..n_charts {
             for b in (a + 1)..n_charts {
-                let cert =
-                    certify_square_transfer(identity.view(), generator.view(), generator.view())
-                        .unwrap();
-                gates.push(AtlasTransferGate::from_square_transfer(
+                gates.push(gate_from_operator(
                     AtlasHolonomyEdgeId::new(a, b, 0).unwrap(),
-                    cert,
-                    2,
+                    identity,
+                    Some(0.05),
                 ));
             }
         }
@@ -1031,28 +1425,24 @@ mod tests {
     fn inconsistent_transfer_rejects_cross_cluster_edge() {
         let faces = vec![vec![0, 1], vec![1, 2], vec![2, 3]];
         let charts = charts_from_faces(4, &faces);
-        let generator = Array2::<f64>::zeros((2, 2));
-        let identity = arr2(&[[1.0, 0.0], [0.0, 1.0]]);
-        let scaled = arr2(&[[2.0, 0.0], [0.0, 2.0]]);
-        let valid_cert =
-            certify_square_transfer(identity.view(), generator.view(), generator.view()).unwrap();
-        let invalid_cert =
-            certify_square_transfer(scaled.view(), generator.view(), generator.view()).unwrap();
+        let identity = [[1.0, 0.0], [0.0, 1.0]];
+        // An anisotropic stretch is linear but not conformal.
+        let stretch = [[1.0, 0.0], [0.0, 2.0]];
         let gates = vec![
-            AtlasTransferGate::from_square_transfer(
+            gate_from_operator(
                 AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
-                valid_cert,
-                2,
+                identity,
+                Some(0.05),
             ),
-            AtlasTransferGate::from_square_transfer(
+            gate_from_operator(
                 AtlasHolonomyEdgeId::new(1, 2, 0).unwrap(),
-                invalid_cert,
-                2,
+                stretch,
+                Some(0.05),
             ),
-            AtlasTransferGate::from_square_transfer(
+            gate_from_operator(
                 AtlasHolonomyEdgeId::new(2, 3, 0).unwrap(),
-                valid_cert,
-                2,
+                identity,
+                Some(0.05),
             ),
         ];
         let diagram = build_atlas_nerve(&charts, &gates, None).unwrap();
@@ -1068,4 +1458,110 @@ mod tests {
         assert!(!rejected.admitted);
     }
 
+    /// #3921: two independently learned blocks have unidentified relative
+    /// radii, so a scaled rotation is a valid transfer. The old gate compared
+    /// ‖QᵀQ − I‖ to √d·ε and refused it.
+    #[test]
+    fn scaled_rotation_and_reflection_transfers_are_admitted() {
+        let edge = AtlasHolonomyEdgeId::new(0, 1, 0).unwrap();
+        let scaled = gate_from_operator(edge, [[2.0, 0.0], [0.0, 2.0]], Some(0.05));
+        assert!(scaled.valid, "{:?}", scaled.test);
+        assert_eq!(
+            scaled.test.orientation,
+            PlanarTransferOrientation::Preserving
+        );
+        assert!((scaled.test.scale - 2.0).abs() < 1e-6);
+        let turned = gate_from_operator(edge, rotation(0.3, 1.1), Some(0.05));
+        assert!(turned.valid, "{:?}", turned.test);
+        assert_eq!(
+            turned.test.orientation,
+            PlanarTransferOrientation::Preserving
+        );
+        let flipped = gate_from_operator(edge, reflection(0.7, 0.4), Some(0.05));
+        assert!(flipped.valid, "{:?}", flipped.test);
+        assert_eq!(
+            flipped.test.orientation,
+            PlanarTransferOrientation::Reversing
+        );
+        assert!((flipped.test.scale - 0.7).abs() < 1e-6);
+    }
+
+    /// Identical f32 codes carry only their own quantization noise: the
+    /// covariance is the input resolution, not 0/0, and the gate is valid.
+    #[test]
+    fn identical_codes_are_a_valid_identity_transfer() {
+        let x = circle_codes(8);
+        let test = PlanarTransferTest::from_codes(&x, &x).unwrap();
+        assert!(test.conformal_p_value > 0.5, "{test:?}");
+        assert!(test.existence_p_value < 1e-12, "{test:?}");
+        assert!(test.conformal_defect <= 4.0 * test.conformal_defect_se);
+        let gate = AtlasTransferGate::from_test(
+            AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
+            test,
+            Some(0.05),
+        );
+        assert!(gate.valid);
+        let uncertified = gate_from_operator(
+            AtlasHolonomyEdgeId::new(0, 1, 0).unwrap(),
+            [[1.0, 0.0], [0.0, 1.0]],
+            None,
+        );
+        assert!(
+            !uncertified.valid,
+            "without a level a gate certifies nothing"
+        );
+        assert!(PlanarTransferTest::from_codes(&x[..2], &x[..2]).is_err());
+    }
+
+    #[test]
+    fn conformality_test_is_calibrated_under_rotation_and_reflection_nulls() {
+        let mut rng = StdRng::seed_from_u64(3921);
+        for (label, operator, orientation) in [
+            (
+                "rotation",
+                rotation(0.7, 1.1),
+                PlanarTransferOrientation::Preserving,
+            ),
+            (
+                "reflection",
+                reflection(0.7, 1.1),
+                PlanarTransferOrientation::Reversing,
+            ),
+        ] {
+            let mut p_values = Vec::new();
+            for _ in 0..1500 {
+                let (x, y) = noisy_pair(&mut rng, 200, operator, 0.1);
+                let test = PlanarTransferTest::from_codes(&x, &y).unwrap();
+                assert_eq!(test.orientation, orientation);
+                p_values.push(test.conformal_p_value);
+            }
+            assert_calibrated(&p_values, label);
+        }
+    }
+
+    #[test]
+    fn existence_test_is_calibrated_when_no_transfer_exists() {
+        let mut rng = StdRng::seed_from_u64(39210);
+        let p_values: Vec<f64> = (0..1500)
+            .map(|_| {
+                let (x, y) = noisy_pair(&mut rng, 200, [[0.0, 0.0], [0.0, 0.0]], 0.1);
+                PlanarTransferTest::from_codes(&x, &y)
+                    .unwrap()
+                    .existence_p_value
+            })
+            .collect();
+        assert_calibrated(&p_values, "existence");
+    }
+
+    #[test]
+    fn a_shear_transfer_is_refused() {
+        let mut rng = StdRng::seed_from_u64(39211);
+        let edge = AtlasHolonomyEdgeId::new(0, 1, 0).unwrap();
+        for _ in 0..50 {
+            let (x, y) = noisy_pair(&mut rng, 200, [[1.0, 0.3], [0.0, 1.0]], 0.1);
+            let test = PlanarTransferTest::from_codes(&x, &y).unwrap();
+            assert!(test.conformal_p_value < 1e-6, "{test:?}");
+            assert!(!AtlasTransferGate::from_test(edge, test, Some(0.01)).valid);
+        }
+    }
 }

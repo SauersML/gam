@@ -78,6 +78,12 @@ pub struct AuditTopologyRecord {
 pub struct AuditAtlasReport {
     pub chart_blocks: Vec<usize>,
     pub diagram: crate::inference::atlas_nerve::AtlasNerveDiagram,
+    /// One calibrated transfer test per co-firing chart pair that exposes a
+    /// planar transfer.
+    pub transfer_gates: Vec<crate::inference::atlas_nerve::AtlasTransferGate>,
+    /// Per-edge level `α/m` of the gates (Bonferroni over the `m` tested pairs),
+    /// or `None` when no familywise level was supplied and no edge is certified.
+    pub transfer_gate_level: Option<f64>,
     pub holonomy_unavailable_reason: Option<String>,
 }
 
@@ -200,6 +206,13 @@ pub struct SparseSaeAuditReport {
 
 /// A chart fires on the rows whose routed block gate is nonzero: the route's own
 /// support, with no firing cutoff to choose.
+///
+/// `familywise_alpha` bounds the probability that any tested chart pair is
+/// misclassified: each of the `m` transfer tests runs at `α/m`, so by the union
+/// bound at most `α` of the admitted-or-refused edge decisions are wrong. Without
+/// it the gates carry their p-values but admit no edge. Cross-fitted holonomy
+/// additionally needs the ambient observations and is a separate claim at the
+/// same familywise level.
 pub fn atlas_nerve_from_sparse_route(
     route: &AuditSparseRoute,
     requested_blocks: Option<&[usize]>,
@@ -264,9 +277,9 @@ pub fn atlas_nerve_from_sparse_route(
             )?,
         );
     }
-    let mut gates = Vec::with_capacity(coactive_pairs.len());
+    let mut tests = Vec::with_capacity(coactive_pairs.len());
     for (a, b) in coactive_pairs {
-        if let Some(gate) = chart_transfer_gate_sparse(
+        if let Some(test) = chart_transfer_test_sparse(
             route,
             &charts[a],
             &charts[b],
@@ -275,9 +288,26 @@ pub fn atlas_nerve_from_sparse_route(
             a,
             b,
         )? {
-            gates.push(gate);
+            tests.push(test);
         }
     }
+    let transfer_gate_level = match familywise_alpha {
+        Some(alpha) => {
+            let alpha = crate::inference::atlas_holonomy::AtlasFamilywiseLevel::new(alpha)?.alpha();
+            Some(alpha / tests.len().max(1) as f64)
+        }
+        None => None,
+    };
+    let gates: Vec<_> = tests
+        .into_iter()
+        .map(|(edge, test)| {
+            crate::inference::atlas_nerve::AtlasTransferGate::from_test(
+                edge,
+                test,
+                transfer_gate_level,
+            )
+        })
+        .collect();
     let preliminary = crate::inference::atlas_nerve::build_atlas_nerve(&charts, &gates, None)?;
     let admitted_edges: Vec<_> = preliminary
         .edges
@@ -301,6 +331,10 @@ pub fn atlas_nerve_from_sparse_route(
                 Err(reason) => (None, Some(reason)),
             }
         }
+        (None, Some(_)) => (
+            None,
+            Some("ambient observations were not supplied for cross-fitted holonomy".to_string()),
+        ),
         (None, None) => (
             None,
             Some(
@@ -308,9 +342,9 @@ pub fn atlas_nerve_from_sparse_route(
                     .to_string(),
             ),
         ),
-        _ => {
+        (Some(_), None) => {
             return Err(
-                "cross-fitted atlas holonomy requires ambient observations and familywise alpha together"
+                "cross-fitted atlas holonomy requires a familywise alpha with the ambient observations"
                     .to_string(),
             );
         }
@@ -326,6 +360,8 @@ pub fn atlas_nerve_from_sparse_route(
     Ok(Some(AuditAtlasReport {
         chart_blocks,
         diagram,
+        transfer_gates: gates,
+        transfer_gate_level,
         holonomy_unavailable_reason,
     }))
 }
@@ -520,6 +556,7 @@ pub fn run_sparse_sae_audit(
                 &donor,
                 residuals_f64.view(),
                 &atlas.chart_blocks,
+                delta,
                 &calibration_cfg,
             )?
         }
@@ -634,25 +671,21 @@ fn absorption_audit(route: &AuditSparseRoute, max_pairs: usize) -> AbsorptionAud
     }
 }
 
-/// Genuine chart-transfer certificate for one atlas-nerve gate between two
-/// charts, read from the frozen code matrix.
+/// Calibrated chart-transfer test for one atlas-nerve edge, read from the frozen
+/// code matrix.
 ///
-/// A gate stamped `valid = true` with zero transport/equivariance defect is a
-/// FABRICATED certificate: it admits every co-active chart pair as a nerve edge
-/// without running any transport test, so the reported topology is manufactured,
-/// not measured. The real certificate needs a square (≤2-D) chart-to-chart
-/// operator; only the harmonic circle lane (`block_size == 2`) exposes a 2-D
-/// per-row coordinate from which the empirical transfer operator `A` (least
-/// squares `X_a A ≈ X_b` over the rows that fire in BOTH charts) can be formed.
-/// `A` is certified against isometry (`‖AᵀA − I‖_F`) and SO(2) equivariance
-/// (`‖A·G − G·A‖_F`) by [`certify_square_transfer`], and validity is the
-/// library's own gate ([`AtlasTransferGate::from_square_transfer`]). Any other
-/// block width, fewer than two co-firing rows, a singular coordinate Gram, or a
-/// non-finite operator exposes no transfer gate at this boundary; the nerve
-/// records the observed overlap as rejected because no certificate exists.
-/// `block_a`/`block_b` index the dictionary blocks the two charts read;
-/// `chart_a`/`chart_b` are the nerve-vertex labels.
-fn chart_transfer_gate_sparse(
+/// Only the harmonic circle lane (`block_size == 2`) exposes a planar per-row
+/// coordinate. Over the rows that fire in BOTH charts, the paired codes give the
+/// least-squares transfer `X_a·A ≈ X_b`, and
+/// [`crate::inference::atlas_nerve::PlanarTransferTest`] tests it for existence
+/// and for being a scaled rotation or reflection. The relative scale stays free:
+/// two independently learned blocks have no shared radius. Any other block
+/// width, fewer than three co-firing rows (no residual degrees of freedom), or a
+/// co-firing set that does not span the plane exposes no test; the nerve then
+/// records the observed overlap as rejected. `block_a`/`block_b` index the
+/// dictionary blocks the two charts read; `chart_a`/`chart_b` are the
+/// nerve-vertex labels.
+fn chart_transfer_test_sparse(
     route: &AuditSparseRoute,
     support_a: &crate::inference::atlas_nerve::AtlasChart,
     support_b: &crate::inference::atlas_nerve::AtlasChart,
@@ -660,15 +693,20 @@ fn chart_transfer_gate_sparse(
     block_b: usize,
     chart_a: usize,
     chart_b: usize,
-) -> Result<Option<crate::inference::atlas_nerve::AtlasTransferGate>, String> {
+) -> Result<
+    Option<(
+        crate::inference::atlas_holonomy::AtlasHolonomyEdgeId,
+        crate::inference::atlas_nerve::PlanarTransferTest,
+    )>,
+    String,
+> {
     use crate::inference::atlas_holonomy::AtlasHolonomyEdgeId;
-    use crate::inference::atlas_nerve::AtlasTransferGate;
     let edge = AtlasHolonomyEdgeId::new(chart_a, chart_b, 0)?;
     if route.block_size != 2 {
         return Ok(None);
     }
-    let mut xa: Vec<f64> = Vec::new();
-    let mut xb: Vec<f64> = Vec::new();
+    let mut xa: Vec<[f32; 2]> = Vec::new();
+    let mut xb: Vec<[f32; 2]> = Vec::new();
     let mut position_a = 0usize;
     let mut position_b = 0usize;
     while position_a < support_a.support_rows().len() && position_b < support_b.support_rows().len()
@@ -688,11 +726,8 @@ fn chart_transfer_gate_sparse(
         let mut b = None;
         for slot in 0..route.width() {
             let unit = route.indices[[row, slot]] as usize;
-            let value = [
-                route.values[[row, slot, 0]] as f64,
-                route.values[[row, slot, 1]] as f64,
-            ];
-            if value[0] * value[0] + value[1] * value[1] == 0.0 {
+            let value = [route.values[[row, slot, 0]], route.values[[row, slot, 1]]];
+            if value[0] == 0.0 && value[1] == 0.0 {
                 continue;
             }
             if unit == block_a {
@@ -701,37 +736,18 @@ fn chart_transfer_gate_sparse(
                 b = Some(value);
             }
         }
-        if let (Some([a0, a1]), Some([b0, b1])) = (a, b) {
-            xa.extend([a0, a1]);
-            xb.extend([b0, b1]);
+        if let (Some(a), Some(b)) = (a, b) {
+            xa.push(a);
+            xb.push(b);
         }
         position_a += 1;
         position_b += 1;
     }
-    let n_co = xa.len() / 2;
-    if n_co < 2 {
+    if xa.len() < 3 {
         return Ok(None);
     }
-    let x_a = ndarray::Array2::from_shape_vec((n_co, 2), xa)
-        .map_err(|error| format!("chart {chart_a} overlap coordinates are malformed: {error}"))?;
-    let x_b = ndarray::Array2::from_shape_vec((n_co, 2), xb)
-        .map_err(|error| format!("chart {chart_b} overlap coordinates are malformed: {error}"))?;
-    // Empirical chart-to-chart transfer operator `A = (X_aᵀX_a)⁻¹ X_aᵀX_b`
-    // solving `X_a A ≈ X_b` over the co-firing rows.
-    let Ok(operator) =
-        crate::chart_transfer::pulled_back_operator(x_a.view(), x_b.view())
-    else {
-        return Ok(None);
-    };
-    // Both charts are circles, so the shared infinitesimal-rotation generator is
-    // the SO(2) generator `[[0,−1],[1,0]]`.
-    let generator = ndarray::array![[0.0_f64, -1.0], [1.0, 0.0]];
-    match crate::chart_transfer::certify_square_transfer(
-        operator.view(),
-        generator.view(),
-        generator.view(),
-    ) {
-        Ok(cert) => Ok(Some(AtlasTransferGate::from_square_transfer(edge, cert, 2))),
+    match crate::inference::atlas_nerve::PlanarTransferTest::from_codes(&xa, &xb) {
+        Ok(test) => Ok(Some((edge, test))),
         Err(_) => Ok(None),
     }
 }
@@ -845,6 +861,7 @@ fn standing_sparse_null_calibration(
     donor: &AuditSparseRoute,
     residuals_f64: ndarray::ArrayView2<'_, f64>,
     chart_blocks: &[usize],
+    familywise_alpha: f64,
     cfg: &StandingCalibrationConfig,
 ) -> Result<Option<crate::null_battery::ClaimNullCalibration>, String> {
     use crate::null_battery as nb;
@@ -859,12 +876,16 @@ fn standing_sparse_null_calibration(
         return Ok(None);
     }
     use rand::SeedableRng;
-    let observed = sparse_atlas_nerve_richness_statistic(route, chart_blocks)?;
+    let observed = sparse_atlas_nerve_richness_statistic(route, chart_blocks, familywise_alpha)?;
     let mut rng = rand::rngs::StdRng::seed_from_u64(cfg.null_seed);
     let mut samples = Vec::with_capacity(cfg.null_replicates);
     for _ in 0..cfg.null_replicates {
         let surrogate = resample_sparse_architecture_null(route, donor, &mut rng)?;
-        samples.push(sparse_atlas_nerve_richness_statistic(&surrogate, chart_blocks)?);
+        samples.push(sparse_atlas_nerve_richness_statistic(
+            &surrogate,
+            chart_blocks,
+            familywise_alpha,
+        )?);
     }
     let null_summary = nb::summarize_null_distribution(
         nb::NullKind::ArchitectureMatchedRandomWeight,
@@ -974,13 +995,17 @@ fn topology_records_from_codes(
 }
 
 /// Atlas-nerve topological-richness statistic over a fixed-width sparse route.
-/// The statistic never materializes the logical `N×K` code matrix.
+/// The statistic never materializes the logical `N×K` code matrix. Edges are
+/// admitted by the same familywise transfer gates as the observed nerve, so the
+/// null and the observation count the same certified simplices.
 fn sparse_atlas_nerve_richness_statistic(
     route: &AuditSparseRoute,
     chart_blocks: &[usize],
+    familywise_alpha: f64,
 ) -> Result<f64, String> {
-    let report = atlas_nerve_from_sparse_route(route, Some(chart_blocks), None, None)?
-        .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
+    let report =
+        atlas_nerve_from_sparse_route(route, Some(chart_blocks), None, Some(familywise_alpha))?
+            .ok_or_else(|| "atlas null statistic requires at least two block charts".to_string())?;
     let richness = report
         .diagram
         .simplex_counts
