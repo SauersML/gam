@@ -1039,13 +1039,13 @@ pub(crate) fn fit_survival_location_scale_terms(
                 exact_warm_start.borrow().as_ref(),
                 effective_mode,
             )
-            .map_err(|e| e.to_string())?;
+            ?;
             // An unconverged inner state (a SlowGeometricRate or stall exit) is
             // neither a fit nor a seed (#2902): the next trial warm-starts from
             // the last converged mode.
             if !owned.result.inner_converged {
                 return Err(
-                    "survival location-scale exact joint inner solve did not converge".to_string(),
+                    "survival location-scale exact joint inner solve did not converge".to_string().into(),
                 );
             }
             exact_warm_start.replace(Some(owned.result.warm_start.clone()));
@@ -1124,11 +1124,11 @@ pub(crate) fn fit_survival_location_scale_terms(
                 &hyper_layout,
                 exact_warm_start.borrow().as_ref(),
             )
-            .map_err(|e| e.to_string())?;
+            ?;
             if !owned.result.inner_converged {
                 return Err(
                     "survival location-scale exact joint EFS inner solve did not converge"
-                        .to_string(),
+                        .to_string().into(),
                 );
             }
             exact_warm_start.replace(Some(owned.result.warm_start.clone()));

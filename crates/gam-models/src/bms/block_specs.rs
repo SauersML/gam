@@ -3522,10 +3522,10 @@ fn fit_bernoulli_marginal_slope_terms_under(
             search_refusal.replace(None);
             let record_refusal = |error: crate::custom_family::CustomFamilyError| {
                 search_refusal.replace(error.jeffreys_arming_evidence());
-                error.to_string()
+                crate::fit_orchestration::drivers::ExactJointRefusal::from(error)
             };
             if let Some(err) = runaway_error.borrow().as_ref().cloned() {
-                return Err(err);
+                return Err(err.into());
             }
             use gam_problem::EvalMode;
             // One-shot row-measure waypoint. This closure runs on EVERY outer
@@ -3626,7 +3626,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 "exact outer evaluation",
             ) {
                 runaway_error.replace(Some(err.clone()));
-                return Err(err);
+                return Err(err.into());
             }
             exact_mode_branch.borrow_mut().record_value(
                 eval_mode,
@@ -3636,7 +3636,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
             );
             if !selection.result.inner_converged {
                 return Err(
-                    "exact bernoulli marginal-slope inner solve did not converge".to_string(),
+                    "exact bernoulli marginal-slope inner solve did not converge".to_string().into(),
                 );
             }
             if matches!(eval_mode, EvalMode::ValueGradientHessian)
@@ -3644,7 +3644,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 && !selection.result.outer_hessian.is_analytic()
             {
                 return Err("exact bernoulli marginal-slope joint [rho, psi] objective did not return an outer Hessian"
-                            .to_string());
+                            .to_string().into());
             }
             Ok(ExactJointEvaluation {
                 objective: selection.result.objective,
@@ -3654,8 +3654,8 @@ fn fit_bernoulli_marginal_slope_terms_under(
             })
         },
         |_, _, _| {
-            Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, String>(
-                "bernoulli marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string(),
+            Err::<ExactJointEfsEvaluation<CustomFamilyJointHyperModeSelection>, _>(
+                "bernoulli marginal-slope EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string().into(),
             )
         },
         crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),

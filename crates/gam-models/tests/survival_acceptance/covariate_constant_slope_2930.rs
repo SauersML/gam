@@ -152,6 +152,62 @@ fn covariate_constant_slope_survival_fit_passes_seed_validation_2930() {
     fit_and_report("smooth", "Surv(time, event) ~ s(x, k=5)", &data, &config);
 }
 
+/// gam#3467: every event time sits on the Weibull chart's own crossing,
+/// `T = λ·(−log Φ(z))^{1/k}`, so `q(T) = −z` and the probit survival index fits
+/// every row ever better as the slope grows. At the derived seed the inner solve
+/// stops on a descending ray that the time block's penalty closes at a named
+/// log-strength step. That certificate reached the outer startup as prose, so
+/// the #2695 restoration could not read it and the only seed was refused.
+fn separated_dataset(n: usize, seed: u64) -> gam_data::EncodedDataset {
+    let headers = ["time", "event", "z", "x"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    let mut state = seed;
+    let rows = (0..n)
+        .map(|_| {
+            let z = next_gaussian(&mut state);
+            let x = next_gaussian(&mut state);
+            let cumulative_hazard = -normal_cdf(z).ln();
+            let time = BASELINE_LOG_SCALE.exp()
+                * cumulative_hazard.powf((-BASELINE_LOG_SHAPE).exp());
+            StringRecord::from(vec![
+                format!("{:.17e}", time.clamp(1e-3, 1e3)),
+                "1".to_string(),
+                format!("{z:.17e}"),
+                format!("{x:.17e}"),
+            ])
+        })
+        .collect();
+    encode_recordswith_inferred_schema(headers, rows).expect("encode the #3467 fixture")
+}
+
+#[test]
+fn separated_survival_seed_takes_the_closing_rho_step_3467() {
+    super::initialize_cpu_fitting();
+    gam_runtime::test_support::install_diagnostic_logger();
+    #[cfg(target_os = "macos")]
+    gam_gpu::configure_global_policy(gam_gpu::GpuPolicy::Off);
+
+    let data = separated_dataset(400, 0x3467_0000_0001);
+    fit_and_report(
+        "separated frozen score",
+        "Surv(time, event) ~ x",
+        &data,
+        &constant_slope_config(),
+    );
+    fit_and_report(
+        "separated global-empirical",
+        "Surv(time, event) ~ x",
+        &data,
+        &FitConfig {
+            frozen_score: false,
+            latent_measure: Some("global-empirical".to_string()),
+            ..constant_slope_config()
+        },
+    );
+}
+
 /// gam#2945, gam#2938: a learned Gaussian frailty σ on this fixture is refused once, by name, before
 /// the smoothing search. Its slope carries an intercept and a constant offset, so the likelihood
 /// reads σ only as the observed slope `s(σ)·g` and does not identify it: the inner objective was

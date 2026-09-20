@@ -3155,7 +3155,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
-                                .to_string(),
+                                .to_string().into(),
                         );
                     }
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
@@ -3201,12 +3201,12 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &hyper_layout,
                         warm_start.as_ref(),
                         eval_mode,
-                    ).map_err(|error| error.to_string())?;
+                    )?;
                     // An unconverged inner state is neither a fit nor a seed
                     // (#2902): the next trial warm-starts from the last converged mode.
                     if !owned.result.inner_converged {
                         return Err(
-                            "exact two-block spatial inner solve did not converge".to_string(),
+                            "exact two-block spatial inner solve did not converge".to_string().into(),
                         );
                     }
                     *hyper_warm_start_cell.borrow_mut() = Some(owned.result.warm_start.clone());
@@ -3215,7 +3215,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     {
                         return Err(
                             "exact two-block spatial objective requires a full joint [rho, psi] hessian"
-                            .to_string(),
+                            .to_string().into(),
                         );
                     }
                     Ok(ExactJointEvaluation {
@@ -3231,7 +3231,7 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     if !analytic_joint_derivatives_available {
                         return Err(
                             "analytic spatial psi derivatives are unavailable for this exact two-block path"
-                                .to_string(),
+                                .to_string().into(),
                         );
                     }
                     let rho = theta.slice(s![..joint_setup.rho_dim()]).to_owned();
@@ -3274,10 +3274,10 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                         &rho,
                         &hyper_layout,
                         warm_start.as_ref(),
-                    ).map_err(|error| error.to_string())?;
+                    )?;
                     if !owned.result.inner_converged {
                         return Err(
-                            "exact two-block spatial EFS inner solve did not converge".to_string(),
+                            "exact two-block spatial EFS inner solve did not converge".to_string().into(),
                         );
                     }
                     *hyper_warm_start_cell.borrow_mut() = Some(owned.result.warm_start.clone());

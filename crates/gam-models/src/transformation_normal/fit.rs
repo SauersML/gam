@@ -709,8 +709,7 @@ pub(crate) fn fit_transformation_normal(
                     Arc::clone(&geometry.hyper_layout),
                     value_selection,
                     eval_mode,
-                )
-                .map_err(|e| format!("transformation exact joint mode upgrade: {e}"))?
+                )?
             } else {
                 let warm_starts = exact_mode_candidates(eval_mode, theta, &rho);
                 let carried = evaluate_custom_family_joint_hyper_best_mode_shared(
@@ -755,8 +754,7 @@ pub(crate) fn fit_transformation_normal(
                         )
                     }
                     other => other,
-                }
-                .map_err(|e| format!("transformation exact joint mode profile: {e}"))?;
+                }?;
                 for (candidate_idx, rejection) in selection.rejected_candidates.iter().enumerate() {
                     if let Some(rejection) = rejection {
                         log::debug!(
@@ -784,7 +782,11 @@ pub(crate) fn fit_transformation_normal(
             })
         },
         |_, _: &[TermCollectionSpec], _: &[TermCollectionDesign]| {
-            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyJointHyperModeSelection>, String>("transformation-normal EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature".to_string())
+            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyJointHyperModeSelection>, _>(
+                "transformation-normal EFS callback invoked even though fixed-point optimization is disabled for beta-dependent exact curvature"
+                    .to_string()
+                    .into(),
+            )
         },
         |_: &Array1<f64>| Ok(gam_solve::rho_optimizer::SeedOutcome::NoSlot),
     )?;

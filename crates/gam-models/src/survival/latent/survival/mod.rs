@@ -1185,7 +1185,7 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
                 warm_start.as_ref(),
                 eval_mode,
             )
-            .map_err(|error| error.to_string())?;
+            ?;
             exact_mode_branch.borrow_mut().record_value(
                 eval_mode,
                 theta,
@@ -1194,7 +1194,7 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
             );
             // An unconverged inner state is neither a fit nor a seed (#2902).
             if !owned.result.inner_converged {
-                return Err("latent exact joint inner solve did not converge".to_string());
+                return Err("latent exact joint inner solve did not converge".to_string().into());
             }
             Ok(ExactJointEvaluation {
                 objective: owned.result.objective,
@@ -1208,8 +1208,10 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         // violation. It is refused here rather than served from a second seed
         // policy.
         |_, _: &[TermCollectionSpec], _: &[TermCollectionDesign]| {
-            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyOwnedMode>, String>(
-                "latent survival EFS callback invoked even though fixed-point optimization is disabled for this exact joint route".to_string(),
+            Err::<ExactJointEfsEvaluation<crate::custom_family::CustomFamilyOwnedMode>, _>(
+                "latent survival EFS callback invoked even though fixed-point optimization is disabled for this exact joint route"
+                    .to_string()
+                    .into(),
             )
         },
         crate::marginal_slope_shared::make_beta_seed_validator(&pending_beta_seed),
