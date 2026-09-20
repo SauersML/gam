@@ -4837,6 +4837,15 @@
   {
     "base": "41fbd6c3376037036ca93f1c5274575fef526dc0",
     "removed": {
+      "crates/gam-terms/src/term_builder.rs::cyclic_basis_dim_for_column": 1,
+      "crates/gam-terms/src/term_builder.rs::pilot_internal_knots_for_column": 1
+    },
+    "reason": "#3149 R0: formula defaults are built at their provisioned size on every route, and only the bases the standard workflow's resolution loop grows start at their penalized-resolution pilot, through the one rule gam_terms::smooth::starting_resolution. materialize/terms.rs spatial_center_strategy_mut served only the d>1 radial start special case that starting_resolution now owns; term_builder cyclic_basis_dim_for_column was the position basis's pilot cyclic default, now provisioned_cyclic_basis_dim; the test multidimensional_duchon_default_uses_rate_derived_pilot_basis is restated as multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_pilot (same fixture, both sizes asserted); term_builder pilot_internal_knots_for_column lost its last production caller (the position basis now takes the provisioned default, and the pilot floor sizes from the rows it is identified on, #3179), so its tests call pilot_internal_knots directly.",
+    "evidence": "Gate direct-dy6-w2a-r0v5-gt.log, TIPCHECK at tip 988f269d7e (tip tree 9598a61a74): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, gam-terms 114 of 114; its source_removal_guard and public_api_census flagged exactly these items and nothing else. Read-proof: git grep -w for spatial_center_strategy_mut, cyclic_basis_dim_for_column and pilot_internal_knots_for_column at 988f269d7e finds only their definitions, the callers this landing rewrites, and a doc comment in basis/types.rs that this landing also rewrites."
+  },
+  {
+    "base": "33e71f2363e2b5b2cc64043c2a865d2247b59452",
+    "removed": {
       "crates/gam-solve/src/rho_optimizer/run.rs::bfgs_axis_step_caps": 1,
       "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap": 1,
       "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap_psi": 1
