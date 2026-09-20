@@ -769,7 +769,7 @@ pub fn fit_penalized_vector_glm<L: VectorLikelihood>(
             0.5 * (fw[[row, a, b]] + fw[[row, b, a]])
         })
     });
-    let fisher_w_override = symmetric_override.as_ref().map(Array3::view);
+    let fisher_w_override = symmetric_override.as_ref().map(|fw| fw.view());
     for ((i, j), &v) in design.indexed_iter() {
         if !v.is_finite() {
             crate::bail_invalid_estim!("{context}: design[{i},{j}] must be finite (got {v})");
