@@ -9,7 +9,7 @@
 //! Confirmed empirically (agent investigation): on demo training data
 //! (800 pts, σ=0.10, `sphere(lat, lon, radians=true, k=100)`), the
 //! [+1.2, +1.4) rad latitude band had mean 3D-error ≈ 0.12 vs ≈ 0.061 at the
-//! equator — 2× worse — and this reproduced in BOTH `method=wahba` and
+//! equator — 2× worse — and this reproduced in BOTH `method=sobolev` and
 //! `method=harmonic`. This locks in the no finite-center coefficient gauge and
 //! spherical-distance center placement behavior.
 //!

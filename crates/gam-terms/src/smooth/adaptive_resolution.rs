@@ -1,6 +1,6 @@
 //! The resolution of a formula-default smooth basis that nobody chose.
 //!
-//! A formula default (`s(x)`, `s(x, bs="cc")`, `fs(x, g)`, an auto-sized
+//! A formula default (`s(x)`, `s(x, bs="cyclic")`, `fs(x, g)`, an auto-sized
 //! radial or sphere smooth) starts at the penalized-resolution
 //! pilot and is refined by the standard formula workflow from the converged
 //! fit's own evidence (#1689, #3078). This module is the one place that knows,

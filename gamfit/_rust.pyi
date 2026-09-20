@@ -264,7 +264,7 @@ __all__ = [
     "model_debiased_functional_json",
     "model_deployment_extensions",
     "model_group_metadata",
-    "model_partial_dependence",
+    "model_partial_effect",
     "model_variance_share",
     "multinomial_model_metadata_pyfunc",
     "multinomial_smooth_significance_pyfunc",
@@ -443,6 +443,7 @@ __all__ = [
     "validate_formula_json",
     "weighted_sum_to_zero_transform",
     "whole_set_containment",
+    "write_saved_model_file",
     "write_survival_csv",
 ]
 
@@ -1920,7 +1921,7 @@ def model_deployment_extensions(model: _FittedModel) -> Any: ...
 
 def model_group_metadata(model: _FittedModel) -> Any: ...
 
-def model_partial_dependence(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int) -> dict[Any, Any]: ...
+def model_partial_effect(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int, level: float) -> dict[Any, Any]: ...
 
 def model_variance_share(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, term: str | None = ...) -> list[tuple[str, float]]: ...
 
@@ -2277,5 +2278,7 @@ def validate_formula_json(headers: Sequence[str], rows: _EncodedTable, formula: 
 def weighted_sum_to_zero_transform(basis: NDArray[np.float64], weights: NDArray[np.float64] | None = ...) -> NDArray[np.float64]: ...
 
 def whole_set_containment(chain: Sequence[tuple[str, float, float, float]], initial_radius: float, nominal_offsets: Sequence[float]) -> dict[Any, Any]: ...
+
+def write_saved_model_file(path: str | os.PathLike[str], model_bytes: Sequence[int]) -> None: ...
 
 def write_survival_csv(path: str, surface: tuple[NDArray[np.float64], NDArray[np.float64]] | None, parameters: NDArray[np.float64] | None, times: NDArray[np.float64], id_column: str | None, row_ids: Sequence[str] | None, people_chunk: int, time_grid_chunk: int) -> str: ...

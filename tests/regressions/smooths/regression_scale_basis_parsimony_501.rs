@@ -21,7 +21,7 @@ fn fit_location_scale(noise_formula: &str) -> GaussianLocationScaleFitResult {
         noise_formula: Some(noise_formula.to_string()),
         ..FitConfig::default()
     };
-    match fit_from_formula("GAG ~ s(Age, bs='tp')", &ds, &cfg).expect("fit location-scale") {
+    match fit_from_formula("GAG ~ s(Age, bs='tps')", &ds, &cfg).expect("fit location-scale") {
         FitResult::GaussianLocationScale(r) => r,
         _ => panic!("expected GaussianLocationScale fit result"),
     }
@@ -43,7 +43,7 @@ fn block_ncoef(result: &GaussianLocationScaleFitResult, role: BlockRole) -> usiz
 /// secondary-predictor default — strictly smaller, and modest in absolute terms.
 #[test]
 fn scale_smooth_basis_is_parsimonious_relative_to_mean() {
-    let result = fit_location_scale("1 + s(Age, bs='tp')");
+    let result = fit_location_scale("1 + s(Age, bs='tps')");
     let mean_ncoef = block_ncoef(&result, BlockRole::Location);
     let scale_ncoef = block_ncoef(&result, BlockRole::Scale);
 
@@ -68,8 +68,8 @@ fn scale_smooth_basis_is_parsimonious_relative_to_mean() {
 /// parsimony pass only fills in a default when the user gave none.
 #[test]
 fn explicit_scale_k_is_respected() {
-    let parsimonious = fit_location_scale("1 + s(Age, bs='tp')");
-    let explicit = fit_location_scale("1 + s(Age, bs='tp', k=25)");
+    let parsimonious = fit_location_scale("1 + s(Age, bs='tps')");
+    let explicit = fit_location_scale("1 + s(Age, bs='tps', k=25)");
 
     let default_scale = block_ncoef(&parsimonious, BlockRole::Scale);
     let explicit_scale = block_ncoef(&explicit, BlockRole::Scale);

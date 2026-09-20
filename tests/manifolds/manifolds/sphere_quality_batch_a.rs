@@ -92,7 +92,7 @@ fn cycle_52_tiny_n_does_not_crash() {
     for kernel in ["sobolev", "pseudo"] {
         let data = make_dataset(10, 0.05, 7);
         let pred = fit_pred(
-            &format!("y ~ sphere(lat, lon, k=10, kernel={kernel})"),
+            &format!("y ~ sphere(lat, lon, k=10, method={kernel})"),
             data,
         );
         assert!(
@@ -117,7 +117,7 @@ fn cycle_53_extreme_noise_predicts_near_flat() {
     for kernel in ["sobolev", "pseudo"] {
         let data = make_dataset(400, 5.0, 7);
         let pred = fit_pred(
-            &format!("y ~ sphere(lat, lon, k=20, kernel={kernel})"),
+            &format!("y ~ sphere(lat, lon, k=20, method={kernel})"),
             data,
         );
         let mean: f64 = pred.iter().sum::<f64>() / pred.len() as f64;
@@ -139,7 +139,7 @@ fn cycle_54_full_sphere_predictions_bounded() {
     for kernel in ["sobolev", "pseudo"] {
         let data = make_dataset(400, 0.05, 7);
         let pred = fit_pred(
-            &format!("y ~ sphere(lat, lon, k=30, kernel={kernel})"),
+            &format!("y ~ sphere(lat, lon, k=30, method={kernel})"),
             data,
         );
         let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);

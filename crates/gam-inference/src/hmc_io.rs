@@ -4875,8 +4875,68 @@ const NUTS_CONVERGENCE: MixingTargets = MixingTargets {
 };
 
 #[inline]
-fn mixing_converged(rhat: f64, ess: f64) -> bool {
+pub(crate) fn mixing_converged(rhat: f64, ess: f64) -> bool {
     rhat < NUTS_CONVERGENCE.max_rhat && ess > NUTS_CONVERGENCE.min_ess
+}
+
+/// Runs `n_chains` Markov chains of dimension `p` until they mix, and returns the
+/// transitions each chain ran. `transition(chain, draw)` advances `chain` by one
+/// transition and writes its new state into `draw`.
+///
+/// Burn-in runs in windows that double from the fewest draws split R-hat needs,
+/// and ends at the first window whose chains meet [`NUTS_CONVERGENCE`]. When every
+/// chain meets the ESS target on its own but the chains disagree in two windows
+/// in a row, they sample different regions and more burn-in cannot join them.
+pub(crate) fn burn_in_until_mixed(
+    n_chains: usize,
+    p: usize,
+    sampler: &str,
+    transitions: &str,
+    mut transition: impl FnMut(usize, ndarray::ArrayViewMut1<'_, f64>) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut window_len = MIN_NUTS_SAMPLES;
+    let mut burn_in = 0usize;
+    let mut disagreeing_windows = 0usize;
+    loop {
+        let mut window = Array3::<f64>::zeros((n_chains, window_len, p));
+        for chain in 0..n_chains {
+            for t in 0..window_len {
+                transition(chain, window.slice_mut(s![chain, t, ..]))?;
+            }
+        }
+        burn_in += window_len;
+        let (rhat, ess) = compute_split_rhat_and_ess(&window);
+        if mixing_converged(rhat, ess) {
+            return Ok(burn_in);
+        }
+        let mut within_ess = Array1::<f64>::zeros(p);
+        for chain in 0..n_chains {
+            let (_, chain_ess) = split_rhat_mean_ess(window.slice(s![chain..chain + 1, .., ..]));
+            within_ess += &chain_ess;
+        }
+        if within_ess
+            .iter()
+            .all(|value| *value > NUTS_CONVERGENCE.min_ess)
+        {
+            disagreeing_windows += 1;
+            if disagreeing_windows == 2 {
+                return Err(HmcError::SamplingFailed {
+                    reason: format!(
+                        "{sampler} chains disagree after {burn_in} burn-in {transitions} per chain: split R-hat {rhat} stayed at or above {} in two consecutive windows whose chains each met the ESS target",
+                        NUTS_CONVERGENCE.max_rhat
+                    ),
+                }
+                .into());
+            }
+        } else {
+            disagreeing_windows = 0;
+        }
+        window_len = window_len.checked_mul(2).ok_or_else(|| {
+            format!(
+                "{sampler} burn-in window cannot double again after {burn_in} {transitions} per chain"
+            )
+        })?;
+    }
 }
 
 /// Fewer criterion value+gradient evaluations than any converged
@@ -5228,55 +5288,18 @@ pub(crate) fn run_logit_polya_gamma_gibbs(
         Ok(())
     };
 
-    // Burn-in runs in windows that double from the fewest draws split R-hat needs,
-    // and ends at the first window whose chains meet NUTS_CONVERGENCE. When every
-    // chain meets the ESS target on its own but the chains disagree in two windows
-    // in a row, they sample different regions and more burn-in cannot join them.
-    let mut window_len = MIN_NUTS_SAMPLES;
-    let mut burn_in = 0usize;
-    let mut disagreeing_windows = 0usize;
-    loop {
-        let mut window = Array3::<f64>::zeros((NUTS_CHAINS, window_len, p));
-        for (chain, state) in chains.iter_mut().enumerate() {
-            for t in 0..window_len {
-                sweep(chain, state)?;
-                window.slice_mut(ndarray::s![chain, t, ..]).assign(&state.beta);
-            }
-        }
-        burn_in += window_len;
-        let (rhat, ess) = compute_split_rhat_and_ess(&window);
-        if mixing_converged(rhat, ess) {
-            break;
-        }
-        let mut within_ess = Array1::<f64>::zeros(p);
-        for chain in 0..NUTS_CHAINS {
-            let (_, chain_ess) =
-                split_rhat_mean_ess(window.slice(ndarray::s![chain..chain + 1, .., ..]));
-            within_ess += &chain_ess;
-        }
-        if within_ess
-            .iter()
-            .all(|value| *value > NUTS_CONVERGENCE.min_ess)
-        {
-            disagreeing_windows += 1;
-            if disagreeing_windows == 2 {
-                return Err(HmcError::SamplingFailed {
-                    reason: format!(
-                        "Pólya-Gamma Gibbs chains disagree after {burn_in} burn-in sweeps per chain: split R-hat {rhat} stayed at or above {} in two consecutive windows whose chains each met the ESS target",
-                        NUTS_CONVERGENCE.max_rhat
-                    ),
-                }
-                .into());
-            }
-        } else {
-            disagreeing_windows = 0;
-        }
-        window_len = window_len.checked_mul(2).ok_or_else(|| {
-            format!(
-                "Pólya-Gamma Gibbs burn-in window cannot double again after {burn_in} sweeps per chain"
-            )
-        })?;
-    }
+    let burn_in = burn_in_until_mixed(
+        NUTS_CHAINS,
+        p,
+        "Pólya-Gamma Gibbs",
+        "sweeps",
+        |chain, mut draw| {
+            let state = &mut chains[chain];
+            sweep(chain, state)?;
+            draw.assign(&state.beta);
+            Ok(())
+        },
+    )?;
 
     let mut samples_array = Array3::<f64>::zeros((NUTS_CHAINS, config.n_samples, p));
     for (chain, state) in chains.iter_mut().enumerate() {
@@ -5567,9 +5590,9 @@ struct WhitenedRhoCriterionTarget<F> {
     criterion_and_grad: Mutex<F>,
     /// The first position the criterion could not value, and why.
     evaluation_failure: Arc<Mutex<Option<String>>>,
-    /// `ρ̂`, the converged smoothing parameters (the whitening center).
+    /// The whitening center: the sampled density's mode.
     mode: Array1<f64>,
-    /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
+    /// `L` with `L Lᵀ = H⁻¹`: maps whitened `z` to `ρ = mode + L z`.
     chol: Array2<f64>,
     /// `Lᵀ`, for the gradient chain rule.
     chol_t: Array2<f64>,
@@ -5620,9 +5643,11 @@ where
 /// Run NUTS over the smoothing parameters `ρ` with the exact profiled criterion
 /// and gradient (#938 Tier 2).
 ///
-/// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
-/// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
-///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
+/// * `rho_hat` — the whitening center and chain seed: the sampled density's
+///   mode (#3293).
+/// * `outer_hessian` — finite symmetric positive-definite Hessian of the
+///   sampled density at that center, factored without perturbation for
+///   whitening.
 /// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
 ///   reason it cannot value `ρ`; any such position fails the run with that
 ///   reason. Each call is one warm inner profile solve.
