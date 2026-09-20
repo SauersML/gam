@@ -1628,37 +1628,23 @@ fn plan_no_gradient_with_declared_hessian_stays_bfgs() {
 }
 
 #[test]
-fn plan_boundary_8_params_uses_bfgs() {
+fn plan_efs_selected_single_param_when_penalty_like() {
+    // No coordinate count gates the fixed-point lane: even a one-coordinate,
+    // analytic-gradient, penalty-like objective with a fixed-point hook plans
+    // EFS rather than BFGS.
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
-        n_params: SMALL_OUTER_BFGS_MAX_PARAMS,
+        n_params: 1,
         psi_dim: 0,
-        fixed_point_available: false,
+        fixed_point_available: true,
         barrier_config: None,
         prefer_gradient_only: false,
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
-}
-
-#[test]
-fn plan_boundary_9_params_uses_bfgs() {
-    let cap = OuterCapability {
-        gradient: Derivative::Analytic,
-        hessian: DeclaredHessianForm::Unavailable,
-        n_params: SMALL_OUTER_BFGS_MAX_PARAMS + 1,
-        psi_dim: 0,
-        fixed_point_available: false,
-        barrier_config: None,
-        prefer_gradient_only: false,
-        disable_fixed_point: false,
-    };
-    let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
 }
 
 #[test]
@@ -1701,7 +1687,7 @@ fn plan_efs_selected_few_params_when_penalty_like() {
     // small fits (2–7 ρ coords) into the fragile Wolfe/probe lane while large
     // fits got the robust trace-based fixed point. A fixed-point-capable,
     // all-penalty-like objective now routes to EFS at every dimension (see
-    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
+    // `OuterCapability::efs_plan_eligible`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -4818,7 +4804,7 @@ fn plan_hybrid_efs_selected_few_params() {
     // ψ-carrying fixed-point objectives route to HybridEfs at every
     // dimension: the former ≤8-coordinate BFGS crossover sent exactly the
     // failing small fits into the fragile Wolfe/probe lane (see
-    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
+    // `OuterCapability::hybrid_efs_plan_eligible`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
