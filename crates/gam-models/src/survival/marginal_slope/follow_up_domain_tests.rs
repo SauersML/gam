@@ -136,6 +136,7 @@ fn family(frame_is_follow_up_varying: bool) -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 

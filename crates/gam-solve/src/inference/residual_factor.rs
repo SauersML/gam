@@ -18,21 +18,18 @@
 //!   interference subspace or a topology-race confound),
 //! * `D = diag(d) ≻ 0` is the **idiosyncratic diagonal** (per-channel
 //!   independent noise), and
-//! * `c(z) > 0` is the **smooth activity-scale law**: a strictly-positive scalar
-//!   that modulates the factor energy with the activity coordinate, recovered as
-//!   a binned-then-smoothed function of `z`.
+//! * `c(z) > 0` is the **activity-scale law**: a strictly-positive scalar that
+//!   modulates the factor energy with the activity coordinate, piecewise
+//!   constant over equal-width bins of `z` and normalized to row-mean one.
 //!
-//! The fit is a deterministic, fixed-iteration **alternation** (no clock, no
-//! RNG; any tie is broken by index): it alternates
-//!
-//! 1. *(scale | Λ, D)* — re-estimate the per-row factor activity `c(z_n)` and
-//!    smooth it across `z`, holding the factor model fixed; and
-//! 2. *(Λ, D | scale)* — re-estimate the factor and diagonal from the
-//!    scale-deflated second-moment, holding the activity law fixed,
-//!
-//! a fixed small number of times. The **factor count `r`** is chosen by a
-//! BIC ladder: each candidate `r` is scored by its Gaussian log-likelihood less
-//! `½·k·log n` (`−BIC/2`, not a marginal likelihood) and the best is kept.
+//! Each rank `r` is fitted to its certified posterior mode by a Newton
+//! trust-region solve with exact analytic derivatives, under priors centred on
+//! "no factor" and on the null activity law `c ≡ 1`, and scored by its Laplace
+//! log marginal likelihood (see [`evidence`]). The **factor count `r`** is the
+//! evidence maximizer over every rank the model identifies,
+//! `0 ≤ r ≤ L(p)` with `L(p)` the Ledermann bound; a higher rank is taken only
+//! on strictly larger evidence. The candidate set is fixed by identifiability
+//! alone, so no caller-supplied cap can truncate the model comparison.
 //!
 //! # What it produces
 //!
@@ -51,6 +48,8 @@
 //! first metric whose `whitens_likelihood()` is `true`: see
 //! [`RowMetric::whitens_likelihood`](gam_problem::RowMetric::whitens_likelihood).
 
+mod evidence;
+
 use std::sync::Arc;
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
@@ -59,32 +58,12 @@ use faer::Side;
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_problem::RowMetric;
 
-/// Alternation sweeps the structured-Gaussian fit may take before it is
-/// refused. The alternation is a block-coordinate ascent on the BIC-penalized
-/// log-likelihood (with smoothed, floored scale updates, so not an exact
-/// ascent), and it stops on its own at the first sweep that fails to improve
-/// the score by more than the score's rounding band, keeping the best
-/// state it saw. This budget bounds an ascent that keeps improving, and its
-/// exhaustion is a refusal, not a result (#2469 — it used to run exactly 8
-/// sweeps and return whatever state that left).
-const ALTERNATION_MAX_SWEEPS: usize = 256;
-
-/// Number of bins the activity coordinate `z` is partitioned into for the smooth
-/// activity-scale `c(z)`. The per-bin factor activity is estimated then linearly
-/// interpolated across bin centers, giving a continuous piecewise-linear scale
-/// law. Chosen as a fixed structural constant (magic-by-default): enough bins to
-/// resolve a smooth monotone or unimodal scale trend without over-fitting the
-/// per-row noise.
+/// Number of equal-width bins the activity coordinate `z` is partitioned into
+/// for the activity-scale law `c(z)`, which is constant within a bin. A fixed
+/// structural resolution of the law: every occupied bin's scale is a free
+/// parameter of the evidence, centred on the null law `c ≡ 1` by the Dirichlet
+/// activity prior and integrated out with the rest of the model.
 const ACTIVITY_SCALE_BINS: usize = 8;
-
-/// Relative floor on the idiosyncratic diagonal `D`, as a fraction of the mean
-/// residual variance. Keeps `Σ_n ≻ 0` and the Woodbury `r × r` capacitance
-/// invertible even when a channel is (near-)perfectly explained by the factor.
-const DIAGONAL_REL_FLOOR: f64 = 1e-6;
-
-/// Relative floor on the activity scale `c(z)`, as a fraction of its mean. Keeps
-/// `c(z) > 0` (a covariance scale) across the whole `z` range.
-const SCALE_REL_FLOOR: f64 = 1e-4;
 
 /// The fitted structured residual-covariance model: low-rank factor `Λ`,
 /// idiosyncratic diagonal `D`, and the smooth activity-scale `c(z)` evaluated at
@@ -99,14 +78,13 @@ pub struct StructuredResidualModel {
     factor_rank: usize,
     /// Interference factor `Λ ∈ ℝ^{p×r}` (the shared off-diagonal subspace).
     lambda: Array2<f64>,
-    /// Idiosyncratic diagonal `d ∈ ℝ^p` (`D = diag(d)`), floored `≻ 0`.
+    /// Idiosyncratic diagonal `d ∈ ℝ^p` (`D = diag(d)`, every `d_j > 0`).
     diagonal: Array1<f64>,
     /// Per-row activity scale `c(z_n) > 0`, length `n`.
     row_scale: Array1<f64>,
-    /// BIC-penalized Gaussian log-likelihood of the selected model (higher is
-    /// better), the value the rank ladder maximized over the candidate ranks. It is
-    /// `−BIC/2`, not a marginal likelihood; see [`gaussian_bic_log_likelihood`].
-    bic_penalized_log_likelihood: f64,
+    /// Laplace log marginal likelihood of the selected rank, in raw residual
+    /// units: the value the rank search maximized.
+    log_evidence: f64,
 }
 
 /// Estimator inputs: the residual matrix and the smooth activity coordinate.
@@ -120,10 +98,6 @@ pub struct ResidualFactorInput<'a> {
     pub residuals: ArrayView2<'a, f64>,
     /// Activity coordinate `z ∈ ℝ^n` the scale law is smooth in.
     pub activity: ArrayView1<'a, f64>,
-    /// Maximum factor rank the BIC ladder is allowed to consider. The
-    /// ladder scores `r = 0, 1, …, min(max_factor_rank, p−1)` and keeps the
-    /// `−BIC/2` maximizer. `0` forces the pure-diagonal model.
-    pub max_factor_rank: usize,
 }
 
 /// A persistent, evidence-earning residual factor direction — a promotion
@@ -154,10 +128,13 @@ pub struct FactorPromotion {
 }
 
 impl StructuredResidualModel {
-    /// Fit the structured residual-covariance model by the deterministic
-    /// fixed-iteration alternation, selecting the factor rank by the BIC
-    /// ladder. Returns an error only on shape / non-finite-input violations; the
-    /// numerical path is total (every floor and solve is guarded).
+    /// Fit the structured residual-covariance model: every identifiable rank
+    /// `r = 0, 1, …, L(p)` (`L(p)` the Ledermann bound, the largest rank a
+    /// `p`-channel factor model identifies) is fitted to its certified posterior mode and
+    /// scored by its Laplace evidence, and the maximizer is kept (the lower rank
+    /// on a tie). Errors on shape / non-finite input, on a residual channel that
+    /// is identically zero, and on any rank whose mode the solver cannot certify:
+    /// a rank with no certified evidence cannot be compared.
     pub fn fit(input: ResidualFactorInput<'_>) -> Result<Self, String> {
         let r = input.residuals;
         let z = input.activity;
@@ -184,7 +161,7 @@ impl StructuredResidualModel {
         // Bin assignment for the activity-scale law: deterministic equal-width
         // bins over the observed z-range. A degenerate (zero-width) range maps
         // every row to bin 0, recovering a single homoscedastic scale.
-        let bins = ACTIVITY_SCALE_BINS.max(1);
+        let bins = ACTIVITY_SCALE_BINS;
         let z_min = z.iter().copied().fold(f64::INFINITY, f64::min);
         let z_max = z.iter().copied().fold(f64::NEG_INFINITY, f64::max);
         let z_span = z_max - z_min;
@@ -200,232 +177,29 @@ impl StructuredResidualModel {
             })
             .collect();
 
-        let max_rank = input.max_factor_rank.min(p.saturating_sub(1));
-
-        // Rank ladder over candidate factor ranks. Each candidate is fit by the
-        // full alternation and scored by its BIC-penalized Gaussian log-likelihood;
-        // the maximizer is kept. Index order breaks any tie (lowest rank wins on
-        // an exact tie — Occam).
-        let mut best: Option<StructuredResidualModel> = None;
+        let moments = evidence::binned_moments(r, &row_bin, bins)?;
+        let max_rank = evidence::ledermann_bound(p);
+        let mut best: Option<(usize, evidence::RankFit)> = None;
         for rank in 0..=max_rank {
-            let model = Self::fit_fixed_rank(r, &row_bin, bins, rank)?;
-            let take = match &best {
-                None => true,
-                Some(b) => model.bic_penalized_log_likelihood > b.bic_penalized_log_likelihood,
-            };
+            let candidate = evidence::fit_rank(&moments, rank)?;
+            let take = best
+                .as_ref()
+                .map_or(true, |(_, b)| candidate.log_evidence > b.log_evidence);
             if take {
-                best = Some(model);
+                best = Some((rank, candidate));
             }
         }
-        best.ok_or_else(|| "StructuredResidualModel::fit: BIC ladder empty".to_string())
-    }
-
-    /// Fit the model at a fixed factor rank by the deterministic alternation.
-    fn fit_fixed_rank(
-        r: ArrayView2<'_, f64>,
-        row_bin: &[usize],
-        bins: usize,
-        rank: usize,
-    ) -> Result<Self, String> {
-        let n = r.nrows();
-        let p = r.ncols();
-
-        // Mean residual variance — the scale reference for the diagonal floor.
-        let mut total_var = 0.0_f64;
-        for i in 0..n {
-            for j in 0..p {
-                total_var += r[[i, j]] * r[[i, j]];
-            }
-        }
-        let mean_var = (total_var / (n as f64 * p as f64)).max(f64::MIN_POSITIVE);
-        let diag_floor = DIAGONAL_REL_FLOOR * mean_var;
-
-        // Initialize the per-row scale to 1 (homoscedastic start), the diagonal
-        // to the per-channel sample variance, and Λ to the leading eigenvectors
-        // of the (scale-1) second moment. The alternation refines all three.
-        let mut row_scale = Array1::<f64>::ones(n);
-        let mut bin_scale = Array1::<f64>::ones(bins);
-        // Raw (undeflated) per-channel second moment — the D estimator's data
-        // term. Constant across sweeps.
-        let raw_diag = column_variances(r);
-        let mut diagonal = raw_diag.mapv(|v| v.max(diag_floor));
-        let mut lambda = Array2::<f64>::zeros((p, rank));
-
-        // Best state seen, restored when a sweep stops improving the score.
-        let mut best: Option<(f64, Array2<f64>, Array1<f64>, Array1<f64>)> = None;
-        let mut converged = false;
-        for _sweep in 0..ALTERNATION_MAX_SWEEPS {
-            // (Λ, D | scale): scale-deflated second moment
-            //   S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n).
-            // Under the model E[r_n r_nᵀ] = c_n ΛΛᵀ + D, so S ≈ ΛΛᵀ + D̄ with
-            // D̄ the scale-averaged diagonal; the leading eigenpairs of S − D
-            // give Λ, the residual diagonal gives D.
-            let s = scaled_second_moment(r, &row_scale);
-            let (evals, evecs) = symmetric_eig_ascending(&s)?;
-            // Leading `rank` eigenpairs (eigenvalues ascending ⇒ take the tail).
-            if rank > 0 {
-                for k in 0..rank {
-                    let col = p - 1 - k;
-                    // Factor energy above the idiosyncratic floor: the part of
-                    // the eigenvalue not explained by the mean diagonal.
-                    let mean_diag = diagonal.iter().copied().sum::<f64>() / p as f64;
-                    let energy = (evals[col] - mean_diag).max(0.0);
-                    let amp = energy.sqrt();
-                    for row in 0..p {
-                        lambda[[row, k]] = amp * evecs[[row, col]];
-                    }
-                }
-            }
-            // D update from the RAW (undeflated) moment, floored ≻ 0. The model
-            // is Σ_n = c_n·ΛΛᵀ + D with D NOT scale-multiplied, and c is mean-1
-            // normalized, so E[(1/n)Σ r_n r_nᵀ] = ΛΛᵀ + D exactly. The deflated
-            // moment `s` is the right object for the FACTOR block (its factor
-            // part is scale-free) but its diagonal carries D·mean(1/c) — a
-            // Jensen-inflated D (mean(1/c) > 1 for any non-constant law), which
-            // biased D upward by exactly mean(1/c̃) and let a spurious
-            // higher-rank candidate win the BIC ladder on a better D
-            // alone (the probe's rank-2 winner had a zero second column).
-            for j in 0..p {
-                let mut factor_var = 0.0_f64;
-                for k in 0..rank {
-                    factor_var += lambda[[j, k]] * lambda[[j, k]];
-                }
-                diagonal[j] = (raw_diag[j] - factor_var).max(diag_floor);
-            }
-
-            // (scale | Λ, D): per-row factor activity. With residual r_n, the
-            // factor-subspace energy is r_nᵀ P r_n where P projects onto
-            // range(Λ) in the D-whitened metric; the maximum-likelihood scalar
-            // multiplier on ΛΛᵀ that matches the row's factor-subspace energy is
-            //   c_n = (r̃_nᵀ B (BᵀB)^{-1} Bᵀ r̃_n) / tr(...)-normalizer.
-            // We use a stable closed-form proxy: the row's factor-coordinate
-            // energy ‖Λ⁺ r_n‖² normalized by the unit-scale expectation, then
-            // bin-smoothed across z. With rank 0 there is no factor ⇒ c ≡ 1.
-            if rank > 0 {
-                let mut bin_num = Array1::<f64>::zeros(bins);
-                let mut bin_den = Array1::<f64>::zeros(bins);
-                let coords = factor_coordinates(&lambda, &diagonal, r)?;
-                for i in 0..n {
-                    let mut energy = 0.0_f64;
-                    for k in 0..rank {
-                        energy += coords[[i, k]] * coords[[i, k]];
-                    }
-                    let b = row_bin[i];
-                    bin_num[b] += energy;
-                    bin_den[b] += rank as f64;
-                }
-                // Per-bin mean factor energy = activity scale. Empty bins inherit
-                // the global mean so the scale law stays defined everywhere.
-                let global = {
-                    let num: f64 = bin_num.iter().sum();
-                    let den: f64 = bin_den.iter().sum();
-                    if den > 0.0 { num / den } else { 1.0 }
-                };
-                for b in 0..bins {
-                    bin_scale[b] = if bin_den[b] > 0.0 {
-                        bin_num[b] / bin_den[b]
-                    } else {
-                        global
-                    };
-                }
-                // Smooth (3-point moving average over bins) for a continuous law,
-                // then floor ≻ 0.
-                let scale_floor = SCALE_REL_FLOOR * global.max(f64::MIN_POSITIVE);
-                let smoothed = moving_average_3(&bin_scale);
-                for b in 0..bins {
-                    bin_scale[b] = smoothed[b].max(scale_floor);
-                }
-                // Re-normalize so the mean scale is 1 (the factor amplitude lives
-                // in Λ; c(z) carries only the relative activity law). This keeps
-                // the (Λ, D) ↔ (scale) split identified.
-                //
-                // The mean MUST be taken over ROWS, not over bins. The identity
-                // that makes `raw_diag` an unbiased ΛΛᵀ + D estimator is
-                //   E[(1/n) Σ_n r_n r_nᵀ] = (1/n) Σ_i c(z_i) · ΛΛᵀ + D,
-                // which reduces to ΛΛᵀ + D iff the ROW mean of c is 1:
-                //   (1/n) Σ_i c(z_i) = Σ_b (n_b / n) · bin_scale[b] = 1,
-                // where n_b is the occupancy (row count) of bin b. Under uneven
-                // occupancy (the common case — z is data-driven) the bin-UNIFORM
-                // mean (1/bins) Σ_b bin_scale[b] ≠ this occupancy-weighted mean, so
-                // normalizing by it would leave raw_diag = ΛΛᵀ + D biased by
-                // exactly (occupancy mean / bin mean). Divide by the occupancy-
-                // weighted mean instead, so (1/n) Σ_i row_scale[i] is exactly 1.
-                // ORDERING: the positivity floor was applied above FIRST, so the
-                // floored per-bin values are the ones this normalization sees; the
-                // per-row assignment below therefore needs no second clamp (a
-                // re-clamp would use pre-normalization floor units and break the
-                // exact row-mean-1 invariant just established).
-                let mut bin_count = vec![0.0_f64; bins];
-                for &b in row_bin.iter() {
-                    bin_count[b] += 1.0;
-                }
-                let mean_scale =
-                    (0..bins).map(|b| bin_count[b] * bin_scale[b]).sum::<f64>() / n as f64;
-                if mean_scale > 0.0 {
-                    bin_scale.mapv_inplace(|v| v / mean_scale);
-                }
-                // Each bin_scale[b] is already ≥ scale_floor / mean_scale > 0.
-                for i in 0..n {
-                    row_scale[i] = bin_scale[row_bin[i]];
-                }
-            }
-            // Stop at the first sweep that does not improve the BIC-penalized
-            // log-likelihood by more than the score's own rounding band: the
-            // band is the accumulation of every term the score sums, so an
-            // improvement inside it is not one the arithmetic can attest to,
-            // and a decrease is the smoothed, floored scale update overshooting.
-            // The best state is kept either way.
-            let (score, band) =
-                gaussian_bic_log_likelihood_with_band(r, &lambda, &diagonal, &row_scale, rank);
-            match &best {
-                Some((best_score, _, _, _)) if score <= best_score + band => {
-                    converged = true;
-                    break;
-                }
-                _ => {
-                    best = Some((score, lambda.clone(), diagonal.clone(), row_scale.clone()));
-                }
-            }
-        }
-        let Some((_, best_lambda, best_diagonal, best_row_scale)) = best else {
-            return Err(format!(
-                "structured residual factor fit: no alternation sweep produced a state \
-                 (rank {rank}, p {p}, n {n})"
-            ));
-        };
-        if !converged {
-            return Err(format!(
-                "structured residual factor fit: the alternation was still improving the \
-                 BIC-penalized log-likelihood beyond its rounding band after \
-                 {ALTERNATION_MAX_SWEEPS} sweeps (rank {rank}, p {p}, n {n})"
-            ));
-        }
-        let (lambda, diagonal, row_scale) = (best_lambda, best_diagonal, best_row_scale);
-
-        let bic_penalized_log_likelihood =
-            gaussian_bic_log_likelihood(r, &lambda, &diagonal, &row_scale, rank);
-        let mut model = Self {
+        let (factor_rank, fit) =
+            best.ok_or_else(|| "StructuredResidualModel::fit: empty rank search".to_string())?;
+        let row_scale = Array1::from_iter(moments.row_slot.iter().map(|&s| fit.slot_scale[s]));
+        Ok(Self {
             p,
-            factor_rank: rank,
-            lambda,
-            diagonal,
+            factor_rank,
+            lambda: fit.lambda,
+            diagonal: fit.diagonal,
             row_scale,
-            bic_penalized_log_likelihood,
-        };
-        // Guard against any non-finite leak from a degenerate fit: fall back to a
-        // pure-diagonal model with the same score accounting.
-        if !model.is_finite() {
-            model.lambda = Array2::<f64>::zeros((p, rank));
-            model.row_scale = Array1::<f64>::ones(n);
-        }
-        Ok(model)
-    }
-
-    fn is_finite(&self) -> bool {
-        self.lambda.iter().all(|v| v.is_finite())
-            && self.diagonal.iter().all(|v| v.is_finite() && *v > 0.0)
-            && self.row_scale.iter().all(|v| v.is_finite() && *v > 0.0)
-            && self.bic_penalized_log_likelihood.is_finite()
+            log_evidence: fit.log_evidence,
+        })
     }
 
     /// Selected factor rank `r`.
@@ -445,12 +219,12 @@ impl StructuredResidualModel {
         self.diagonal.view()
     }
 
-    /// The rank ladder's score: the Gaussian log-likelihood at the fitted
-    /// parameters minus the Schwarz penalty `½·k·log n`, i.e. `−BIC/2`. It drops
-    /// every `O(1)` prior and Fisher-determinant term, so it is not a marginal
-    /// likelihood.
-    pub fn bic_penalized_log_likelihood(&self) -> f64 {
-        self.bic_penalized_log_likelihood
+    /// The Laplace log marginal likelihood of the selected rank (raw residual
+    /// units): the likelihood integrated against the factor, diagonal and
+    /// activity-law priors, evaluated at the certified posterior mode with the
+    /// exact Hessian.
+    pub fn log_evidence(&self) -> f64 {
+        self.log_evidence
     }
 
     /// #2021 Λ nursery→promotion: detect *persistent, evidence-earning* factor
@@ -460,8 +234,8 @@ impl StructuredResidualModel {
     /// both gates hold:
     /// 1. **Earns its complexity** (evidence gate): its explained energy
     ///    `‖Λ_:,j‖² ≥ energy_floor_mult · mean(diag(D))`. Every column is already
-    ///    inside the evidence-ladder-selected rank (so it cleared the BIC
-    ///    penalty globally); this per-direction floor additionally requires the
+    ///    inside the evidence-selected rank (so its rank earned its evidence
+    ///    globally); this per-direction floor additionally requires the
     ///    factor to explain more than an average channel's idiosyncratic noise,
     ///    so we never promote a direction that only barely survived rank
     ///    selection.
@@ -579,8 +353,7 @@ impl StructuredResidualModel {
         // inverse diagonal D^{-1}, B = D^{-1}Λ, its transpose Bᵀ, and the Gram
         // M0 = ΛᵀD^{-1}Λ. Only the c_n^{-1} I_r shift on the capacitance is
         // per-row, so the per-row capacitance is M_n = M0 + c_n^{-1} I_r — a
-        // scalar-diagonal reweight of the SAME M0 (mirroring the Fix-B hoist in
-        // `gaussian_bic_log_likelihood`). Building the n-row U_n stack now costs
+        // scalar-diagonal reweight of the SAME M0. Building the n-row U_n stack now costs
         // O(p·r² + n·(p·r + r³ + p³)) instead of rebuilding B and the Gram every
         // row. The summation order per row is unchanged, so the assembled U_n is
         // bit-for-bit identical to the per-row-rebuild it replaces.
@@ -615,8 +388,7 @@ impl StructuredResidualModel {
         // BIT-IDENTICAL output — every row runs the exact serial arithmetic and
         // writes only its own p² chunk. This was the dominant serial wall of the
         // #974 metric install (n_rows × O(p³) on one core while the inner fit
-        // parallelizes cleanly). Same engagement discipline as
-        // `scaled_second_moment`: only above a row threshold (serial avoids
+        // parallelizes cleanly). It engages only above a row threshold (serial avoids
         // rayon overhead on small stacks) and only when not already inside a
         // rayon worker (nested calls keep the outer region's cores). Error
         // selection stays deterministic: the indexed collect preserves row
@@ -766,8 +538,7 @@ impl StructuredResidualModel {
         let iid_anchor = self.isotropic_dispersion();
         // Row-INDEPENDENT outer products ΛΛᵀ (this model and, if present, prev):
         // only the per-row activity scale c(z) multiplies them, so hoist the Gram
-        // out of the per-row loop (mirroring the row_metric / gaussian_bic_log_likelihood
-        // hoist).
+        // out of the per-row loop (mirroring the row_metric hoist).
         let self_gram = outer_product(&self.lambda);
         let prev_gram = prev.map(|pv| outer_product(&pv.lambda));
 
@@ -992,186 +763,6 @@ fn invert_spd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
     Ok(inv)
 }
 
-/// Per-channel (column) sample second moment of the residual matrix.
-fn column_variances(r: ArrayView2<'_, f64>) -> Array1<f64> {
-    let n = r.nrows();
-    let p = r.ncols();
-    let mut v = Array1::<f64>::zeros(p);
-    for j in 0..p {
-        let mut acc = 0.0_f64;
-        for i in 0..n {
-            acc += r[[i, j]] * r[[i, j]];
-        }
-        v[j] = acc / n as f64;
-    }
-    v
-}
-
-/// Scale-deflated second moment `S = (1/n) Σ_n (r_n r_nᵀ) / c_n`.
-/// Per-row-chunk contribution to the scaled second moment — the inner
-/// `p×p` accumulation of one contiguous row block, summed in row order.
-fn scaled_second_moment_chunk(
-    r: ArrayView2<'_, f64>,
-    row_scale: &Array1<f64>,
-    lo: usize,
-    hi: usize,
-) -> Array2<f64> {
-    let p = r.ncols();
-    let mut s = Array2::<f64>::zeros((p, p));
-    for i in lo..hi {
-        let w = 1.0 / row_scale[i].max(f64::MIN_POSITIVE);
-        for a in 0..p {
-            let ra = r[[i, a]];
-            for b in 0..p {
-                s[[a, b]] += w * ra * r[[i, b]];
-            }
-        }
-    }
-    s
-}
-
-/// `S = (1/n) Σ_n (r_n r_nᵀ) / c(z_n)` — the O(N·p²) scale-deflated second moment
-/// that dominates each alternation sweep of the residual-factor fit.
-///
-/// Reduced over the deterministic length-only pairwise tree
-/// [`par_deterministic_block_fold`]: the `p×p` partial of each `BASE_CHUNK`-row
-/// base block is combined by the same `left_split` association regardless of
-/// thread count OR nesting, so the result is a pure function of the ordered rows
-/// (#2228 reduction doctrine — parallel and nested-serial evaluation are
-/// bit-identical, not merely run-to-run reproducible). The tree self-serializes
-/// below `BASE_CHUNK` rows (a base block is folded directly with no `rayon::join`),
-/// so small inputs and nested calls stay on a single thread without a separate
-/// branch that could associate the round-off differently.
-fn scaled_second_moment(r: ArrayView2<'_, f64>, row_scale: &Array1<f64>) -> Array2<f64> {
-    use gam_linalg::pairwise_reduce::par_deterministic_block_fold;
-    let n = r.nrows();
-    let p = r.ncols();
-
-    let mut s = par_deterministic_block_fold(
-        n,
-        |range: core::ops::Range<usize>| {
-            scaled_second_moment_chunk(r, row_scale, range.start, range.end)
-        },
-        |mut acc: Array2<f64>, part: Array2<f64>| {
-            acc += &part;
-            acc
-        },
-    )
-    .unwrap_or_else(|| Array2::<f64>::zeros((p, p)));
-
-    s.mapv_inplace(|v| v / n as f64);
-    // Symmetrize against accumulation round-off.
-    for a in 0..p {
-        for b in (a + 1)..p {
-            let avg = 0.5 * (s[[a, b]] + s[[b, a]]);
-            s[[a, b]] = avg;
-            s[[b, a]] = avg;
-        }
-    }
-    s
-}
-
-/// Factor coordinates `Λ⁺_D r_n` per row: the generalized-least-squares
-/// projection of each residual onto `range(Λ)` in the `D^{-1}` metric, returned
-/// as an `n × r` matrix. Solves the `r × r` normal equations
-/// `(Λᵀ D^{-1} Λ) γ = Λᵀ D^{-1} r_n` per row (shared factorization).
-fn factor_coordinates(
-    lambda: &Array2<f64>,
-    diagonal: &Array1<f64>,
-    r: ArrayView2<'_, f64>,
-) -> Result<Array2<f64>, String> {
-    let p = lambda.nrows();
-    let rank = lambda.ncols();
-    let n = r.nrows();
-    // GLS weights 1/D_ii, with zero-variance channels DROPPED (weight 0): a
-    // channel whose residual is identically zero carries no factor information,
-    // and its 1/0 = ∞ weight poisons the whole normal matrix into NaN — the
-    // fully-explained-target abort (Cholesky NonPositivePivot) that killed
-    // stagewise runs on targets the dictionary explains exactly. Dropping the
-    // channel is the pseudo-inverse limit; with every channel degenerate the
-    // normal matrix is zero and every coordinate is the least-norm 0.
-    let d_inv: Vec<f64> = (0..p)
-        .map(|i| {
-            let d = diagonal[i];
-            if !(d > 0.0 && d.is_finite()) {
-                return 0.0;
-            }
-            // A subnormal-floored variance (the zero-residual case floors the
-            // scale reference at f64::MIN_POSITIVE) passes `d > 0` but its
-            // reciprocal OVERFLOWS to ∞ — the same NaN poisoning through the
-            // second door. A non-finite weight is the same degenerate-channel
-            // verdict: drop it.
-            let w = d.recip();
-            if w.is_finite() { w } else { 0.0 }
-        })
-        .collect();
-    // Normal matrix ΛᵀD^{-1}Λ.
-    let mut normal = Array2::<f64>::zeros((rank, rank));
-    for a in 0..rank {
-        for b in 0..rank {
-            let mut acc = 0.0_f64;
-            for i in 0..p {
-                acc += lambda[[i, a]] * d_inv[i] * lambda[[i, b]];
-            }
-            normal[[a, b]] = acc;
-        }
-    }
-    // A factor column with no weight in the D^{-1} metric has a zero diagonal,
-    // and hence a zero row and column, in the normal matrix (a zero-energy
-    // column, or every channel dropped). It adds nothing to Λγ, so its
-    // least-norm coordinate is exactly 0. The remaining columns are scaled
-    // distinct eigenvectors of the second moment, weighted by strictly positive
-    // channel weights, so their block is factored strictly with no ridge (#2469).
-    let kept: Vec<usize> = (0..rank).filter(|&a| normal[[a, a]] > 0.0).collect();
-    let mut coords = Array2::<f64>::zeros((n, rank));
-    if kept.is_empty() {
-        return Ok(coords);
-    }
-    let mut block = Array2::<f64>::zeros((kept.len(), kept.len()));
-    for (x, &a) in kept.iter().enumerate() {
-        for (y, &b) in kept.iter().enumerate() {
-            block[[x, y]] = normal[[a, b]];
-        }
-    }
-    let chol = block
-        .cholesky(Side::Lower)
-        .map_err(|e| format!("factor_coordinates normal solve: {e:?}"))?;
-    let mut rhs = Array1::<f64>::zeros(kept.len());
-    for i in 0..n {
-        for (x, &a) in kept.iter().enumerate() {
-            let mut acc = 0.0_f64;
-            for j in 0..p {
-                acc += lambda[[j, a]] * d_inv[j] * r[[i, j]];
-            }
-            rhs[x] = acc;
-        }
-        let gamma = chol.solvevec(&rhs);
-        for (x, &a) in kept.iter().enumerate() {
-            coords[[i, a]] = gamma[x];
-        }
-    }
-    Ok(coords)
-}
-
-/// 3-point moving average over a bin vector (edge-clamped), giving the smooth
-/// activity-scale law a continuous, low-curvature shape.
-fn moving_average_3(v: &Array1<f64>) -> Array1<f64> {
-    let m = v.len();
-    let mut out = Array1::<f64>::zeros(m);
-    for i in 0..m {
-        let lo = i.saturating_sub(1);
-        let hi = (i + 1).min(m - 1);
-        let mut acc = 0.0_f64;
-        let mut cnt = 0.0_f64;
-        for j in lo..=hi {
-            acc += v[j];
-            cnt += 1.0;
-        }
-        out[i] = acc / cnt;
-    }
-    out
-}
-
 /// Ascending-eigenvalue symmetric eigendecomposition (faer convention).
 fn symmetric_eig_ascending(m: &Array2<f64>) -> Result<(Array1<f64>, Array2<f64>), String> {
     m.eigh(Side::Lower)
@@ -1213,132 +804,6 @@ fn lower_cholesky_psd(a: &Array2<f64>) -> Result<Array2<f64>, String> {
         .map_err(|e| format!("lower_cholesky_psd eigen-repair: {e:?}"))
 }
 
-/// BIC-penalized Gaussian log-likelihood of the structured model at the fitted
-/// parameters — the rank ladder's score.
-///
-/// The per-row log-density of `r_n ~ N(0, Σ_n)` is
-/// `−½ ( log|Σ_n| + r_nᵀ Σ_n^{-1} r_n + p log 2π )`. We sum it across rows and
-/// subtract the Schwarz parameter-count penalty `½ k_params · log n` (over the
-/// `p·r` factor entries + `p` diagonal entries + the bin scales), so adding a
-/// spurious factor that does not improve the fit is rejected. The result is
-/// `−BIC/2`: the leading terms of a large-sample expansion of the log marginal
-/// likelihood with every `O(1)` prior and Fisher-determinant term dropped, not the
-/// marginal likelihood itself (#2946). Both `log|Σ_n|` and the quadratic use the
-/// Woodbury / matrix-determinant lemma so no dense `p × p` inverse or determinant
-/// is formed.
-fn gaussian_bic_log_likelihood(
-    r: ArrayView2<'_, f64>,
-    lambda: &Array2<f64>,
-    diagonal: &Array1<f64>,
-    row_scale: &Array1<f64>,
-    rank: usize,
-) -> f64 {
-    gaussian_bic_log_likelihood_with_band(r, lambda, diagonal, row_scale, rank).0
-}
-
-/// The BIC-penalized log-likelihood and its rounding band: Wilkinson's growth
-/// factor for the number of floating-point operations the score accumulates,
-/// times the sum of the magnitudes of every term it adds, so a difference between
-/// two scores inside the band is not attested by the arithmetic (#2469).
-fn gaussian_bic_log_likelihood_with_band(
-    r: ArrayView2<'_, f64>,
-    lambda: &Array2<f64>,
-    diagonal: &Array1<f64>,
-    row_scale: &Array1<f64>,
-    rank: usize,
-) -> (f64, f64) {
-    let n = r.nrows();
-    let p = r.ncols();
-    let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
-    let log_det_d: f64 = diagonal.iter().map(|&d| d.ln()).sum();
-    let two_pi_ln = (2.0 * std::f64::consts::PI).ln();
-
-    // Row-INDEPENDENT Gram M0 = ΛᵀD^{-1}Λ (r × r). This does not depend on the
-    // row, so build it ONCE here rather than rebuilding it inside the per-row loop
-    // (which was O(n·p·r²)). The per-row capacitance is only a scalar-diagonal
-    // reweight of this SAME M0 — M_n = M0 + (1/c_n) I_r — so each row copies M0 and
-    // adds 1/c_n to its diagonal (cheap, O(r)) before its own Cholesky. The
-    // summation order over j (0..p) is preserved exactly and the diagonal add is
-    // the identical `+= 1.0 / c` op, so the hoist is bit-for-bit identical to the
-    // pre-hoist per-row rebuild (same log|Σ_n|, same quadratic, same evidence).
-    let mut m0 = Array2::<f64>::zeros((rank, rank));
-    if rank > 0 {
-        for a in 0..rank {
-            for b in 0..rank {
-                let mut acc = 0.0_f64;
-                for j in 0..p {
-                    acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
-                }
-                m0[[a, b]] = acc;
-            }
-        }
-    }
-
-    let mut log_lik = 0.0_f64;
-    let mut magnitude = 0.0_f64;
-    for i in 0..n {
-        let c = row_scale[i].max(f64::MIN_POSITIVE);
-        // Quadratic r_nᵀ Σ_n^{-1} r_n via Woodbury:
-        //   r_nᵀ D^{-1} r_n − (Bᵀ r_n)ᵀ M^{-1} (Bᵀ r_n),
-        // with B = D^{-1}Λ and M = c^{-1}I + ΛᵀD^{-1}Λ.
-        let mut quad = 0.0_f64;
-        for j in 0..p {
-            quad += r[[i, j]] * d_inv[j] * r[[i, j]];
-        }
-        let mut log_det = log_det_d;
-        if rank > 0 {
-            // Per-row capacitance M_n = M0 + (1/c) I_r (copy the hoisted M0, then
-            // add 1/c to the diagonal), and w = Bᵀ r_n = ΛᵀD^{-1} r_n.
-            let mut m = m0.clone();
-            for a in 0..rank {
-                m[[a, a]] += 1.0 / c;
-            }
-            let mut w = Array1::<f64>::zeros(rank);
-            for a in 0..rank {
-                let mut wa = 0.0_f64;
-                for j in 0..p {
-                    wa += lambda[[j, a]] * d_inv[j] * r[[i, j]];
-                }
-                w[a] = wa;
-            }
-            // Cholesky M = R Rᵀ → log|M|, and solve M y = w.
-            match m.cholesky(Side::Lower) {
-                Ok(chol) => {
-                    let y = chol.solvevec(&w);
-                    let mut wy = 0.0_f64;
-                    for a in 0..rank {
-                        wy += w[a] * y[a];
-                    }
-                    quad -= wy;
-                    // log|Σ_n| = log|D| + log|M| + r·log c   (matrix-determinant
-                    // lemma; the c^{-1}I shift carries the +r·log c).
-                    let diag = chol.diag();
-                    let log_det_m: f64 = diag.iter().map(|&l| (l * l).ln()).sum();
-                    log_det = log_det_d + log_det_m + rank as f64 * c.ln();
-                }
-                Err(_) => {
-                    // Degenerate capacitance — fall back to the diagonal model's
-                    // accounting for this row (no factor correction).
-                    log_det = log_det_d;
-                }
-            }
-        }
-        log_lik += -0.5 * (log_det + quad + p as f64 * two_pi_ln);
-        magnitude += 0.5 * (log_det.abs() + quad.abs() + p as f64 * two_pi_ln);
-    }
-
-    let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
-    let penalty = 0.5 * k_params * (n.max(2) as f64).ln();
-    magnitude += penalty.abs();
-    // Operations accumulated per row: the quadratic form (`p`), the factor
-    // projections (`rank·p`), the capacitance solve (`rank²`) and the
-    // `rank`-term contraction; plus the `p` log-determinant terms and the
-    // `rank²·p` capacitance assembly once.
-    let operations = n * (p * (1 + rank) + rank * (rank + 1)) + p * (1 + rank * rank);
-    let band = gam_linalg::roundoff::accumulation_growth(operations) * magnitude;
-    (log_lik - penalty, band)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1358,16 +823,12 @@ mod tests {
         (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
     }
 
-    /// Per-rank evidence breakdown on the planted single-factor activity-law
-    /// DGP (the `fitted_scale_recovers_planted_activity_law` plant). Pins the
-    /// rank-selection decision itself: the ladder must prefer rank 1, and this
-    /// test names the margin so an over-selection regression is diagnosable
-    /// from the failure message alone.
-    #[test]
-    fn evidence_ladder_prefers_planted_rank_one() {
+    /// The planted single-factor activity-law DGP: `r_n = √c(z_n)·λ₀·f_n + ε_n`
+    /// with `c(z) = e^{1.3 z}` and `z` uniform on `[0, 1]`.
+    fn planted_rank_one_activity() -> (Array2<f64>, Array1<f64>) {
         let n = 5000usize;
         let p = 4usize;
-        let lambda0 = ndarray::array![[1.5], [1.2], [-0.4], [0.3]];
+        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
         let sigma_eps = 0.2_f64;
         let slope = 1.3_f64;
         let mut seed = 0xD1B54A32D192ED03_u64;
@@ -1379,51 +840,146 @@ mod tests {
             let amp = (slope * z).exp().sqrt();
             let f = lcg_normal(&mut seed);
             for i in 0..p {
-                residuals[[row, i]] = amp * lambda0[[i, 0]] * f + sigma_eps * lcg_normal(&mut seed);
+                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
             }
         }
-        // Reproduce fit()'s bin assignment, then score each rank directly.
-        let bins = ACTIVITY_SCALE_BINS.max(1);
-        let row_bin: Vec<usize> = (0..n)
-            .map(|i| {
-                let frac = activity[i];
-                (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
+        (residuals, activity)
+    }
+
+    /// Reproduce `fit`'s equal-width bin assignment for a test activity vector.
+    fn assign_bins(activity: &Array1<f64>) -> Vec<usize> {
+        let bins = ACTIVITY_SCALE_BINS;
+        let z_min = activity.iter().copied().fold(f64::INFINITY, f64::min);
+        let z_max = activity.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let span = z_max - z_min;
+        activity
+            .iter()
+            .map(|&z| {
+                if span <= 0.0 {
+                    0
+                } else {
+                    let frac = (z - z_min) / span;
+                    (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
+                }
             })
+            .collect()
+    }
+
+    /// Per-rank evidence on the planted single-factor activity-law DGP: the
+    /// planted rank 1 must carry strictly larger evidence than the null rank 0,
+    /// and `fit` must select it. For `p = 4` the Ledermann bound is 1, so these
+    /// are the only identifiable ranks.
+    #[test]
+    fn evidence_prefers_planted_rank_one() {
+        let (residuals, activity) = planted_rank_one_activity();
+        let row_bin = assign_bins(&activity);
+        let moments = evidence::binned_moments(residuals.view(), &row_bin, ACTIVITY_SCALE_BINS)
+            .expect("moments");
+        assert_eq!(evidence::ledermann_bound(4), 1);
+        let ev: Vec<f64> = (0..=1usize)
+            .map(|rank| evidence::fit_rank(&moments, rank).expect("rank fit").log_evidence)
             .collect();
-        let mut report = String::new();
-        let mut ev = Vec::new();
-        for rank in 0..=2usize {
-            let m = StructuredResidualModel::fit_fixed_rank(residuals.view(), &row_bin, bins, rank)
-                .expect("fixed-rank fit");
-            let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
-            let log_lik = m.bic_penalized_log_likelihood() + 0.5 * k_params * (n as f64).ln();
-            let col_norms: Vec<f64> = (0..rank)
-                .map(|k| {
-                    m.factor()
-                        .column(k)
-                        .iter()
-                        .map(|v| v * v)
-                        .sum::<f64>()
-                        .sqrt()
-                })
-                .collect();
-            report.push_str(&format!(
-                "rank {rank}: score={:.3} loglik={:.3} penalty={:.3} col_norms={:?} diag={:?}\n",
-                m.bic_penalized_log_likelihood(),
-                log_lik,
-                0.5 * k_params * (n as f64).ln(),
-                col_norms,
-                m.diagonal()
-                    .iter()
-                    .map(|v| (v * 1e4).round() / 1e4)
-                    .collect::<Vec<_>>()
-            ));
-            ev.push(m.bic_penalized_log_likelihood());
-        }
         assert!(
-            ev[1] > ev[0] && ev[1] > ev[2],
-            "evidence ladder must prefer the planted rank 1; breakdown:\n{report}"
+            ev[1] > ev[0],
+            "evidence must prefer the planted rank 1: log Z_0 = {:.3}, log Z_1 = {:.3}",
+            ev[0],
+            ev[1]
         );
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+        })
+        .expect("fit");
+        assert_eq!(model.factor_rank(), 1);
+        assert_eq!(model.log_evidence(), ev[1]);
+    }
+
+    /// The fitted model is the posterior mode, so its likelihood score in each
+    /// log-diagonal `η_j = ln d_j` is exactly balanced by the prior's: with
+    /// `W_n = Σ_n⁻¹`, the likelihood score is
+    /// `½ d_j Σ_n [(W_n r_n)_j² − (W_n)_jj]`, and the matrix-Cauchy prior's
+    /// η-score lies in `[−r/2, p/2)`, so at the mode the likelihood score is
+    /// bounded by `(p + 2r)/2` whatever `n` is. The retired alternation stopped
+    /// at a state whose η-scores reached −641 on this DGP (it was not a
+    /// stationary point of anything); this computes the score from scratch, per
+    /// row, independently of the fitting code.
+    #[test]
+    fn fitted_diagonal_is_stationary_for_the_likelihood() {
+        let (residuals, activity) = planted_rank_one_activity();
+        let model = StructuredResidualModel::fit(ResidualFactorInput {
+            residuals: residuals.view(),
+            activity: activity.view(),
+        })
+        .expect("fit");
+        let (n, p) = residuals.dim();
+        let rank = model.factor_rank();
+        assert_eq!(rank, 1);
+        let lambda = model.factor().to_owned();
+        let d = model.diagonal().to_owned();
+        let mut score = Array1::<f64>::zeros(p);
+        for row in 0..n {
+            let mut sigma = lambda.dot(&lambda.t()) * model.row_scale[row];
+            for j in 0..p {
+                sigma[[j, j]] += d[j];
+            }
+            let w = sigma
+                .cholesky(Side::Lower)
+                .expect("Σ_n SPD")
+                .solve_mat(&Array2::<f64>::eye(p));
+            let wr = w.dot(&residuals.row(row));
+            for j in 0..p {
+                score[j] += 0.5 * d[j] * (wr[j] * wr[j] - w[[j, j]]);
+            }
+        }
+        let bound = (p + 2 * rank) as f64 / 2.0;
+        for j in 0..p {
+            assert!(
+                score[j].abs() <= bound,
+                "likelihood η-score {j} = {} exceeds the prior's reach {bound} at the fitted \
+                 mode; scores = {score:?}",
+                score[j]
+            );
+        }
+        let row_mean_scale = model.row_scale.sum() / n as f64;
+        assert!(
+            (row_mean_scale - 1.0).abs() <= 1e-12,
+            "the activity law must have row mean one; got {row_mean_scale}"
+        );
+    }
+
+    /// Null recoverability: independent heteroscedastic channels with a varying
+    /// activity coordinate carry no factor, and the evidence must return the
+    /// pure-diagonal model on every seed, with the whole identifiable ladder
+    /// (`p = 6`: ranks 0‥3) open to it.
+    #[test]
+    fn evidence_selects_rank_zero_under_the_null() {
+        let n = 2000usize;
+        let p = 6usize;
+        for seed0 in [0x3C6EF372FE94F82B_u64, 0xA54FF53A5F1D36F1, 0x510E527FADE682D1] {
+            let mut seed = seed0;
+            let mut residuals = Array2::<f64>::zeros((n, p));
+            let mut activity = Array1::<f64>::zeros(n);
+            for row in 0..n {
+                activity[row] = lcg_uniform(&mut seed);
+                for j in 0..p {
+                    residuals[[row, j]] = (0.5 + 0.3 * j as f64) * lcg_normal(&mut seed);
+                }
+            }
+            let model = StructuredResidualModel::fit(ResidualFactorInput {
+                residuals: residuals.view(),
+                activity: activity.view(),
+            })
+            .expect("fit");
+            assert_eq!(
+                model.factor_rank(),
+                0,
+                "seed {seed0:#x}: the null carries no factor, but rank {} was selected \
+                 (log Z = {:.3})",
+                model.factor_rank(),
+                model.log_evidence()
+            );
+            assert!(model.row_scale.iter().all(|&c| c == 1.0));
+        }
     }
 
     /// Orthonormalize the columns of `m` (modified Gram–Schmidt), dropping
@@ -1453,7 +1009,7 @@ mod tests {
     /// #974 verification arm (a): the fitted factor must recover the PLANTED
     /// interference subspace. Two orthogonal planted directions with distinct
     /// strengths; the principal angles between each planted direction and
-    /// range(Λ̂) must be small, and the evidence ladder must select rank 2.
+    /// range(Λ̂) must be small, and the evidence must select rank 2.
     #[test]
     fn factor_recovers_planted_interference_subspace() {
         let n = 6000usize;
@@ -1480,16 +1036,15 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 4,
         })
         .expect("fit");
 
         assert_eq!(
             model.factor_rank(),
             2,
-            "ladder must select the planted rank 2 (got {}, score {:.3})",
+            "evidence must select the planted rank 2 (got {}, log Z {:.3})",
             model.factor_rank(),
-            model.bic_penalized_log_likelihood()
+            model.log_evidence()
         );
         let basis = orthonormal_columns(model.factor());
         assert_eq!(basis.len(), 2, "fitted factor must span 2 directions");
@@ -1502,314 +1057,6 @@ mod tests {
         );
     }
 
-    /// Reproduce `fit`'s equal-width bin assignment for a test activity vector.
-    fn assign_bins(activity: &Array1<f64>, bins: usize) -> Vec<usize> {
-        let n = activity.len();
-        let z_min = activity.iter().copied().fold(f64::INFINITY, f64::min);
-        let z_max = activity.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let span = z_max - z_min;
-        (0..n)
-            .map(|i| {
-                if span <= 0.0 {
-                    0
-                } else {
-                    let frac = (activity[i] - z_min) / span;
-                    (frac * bins as f64).floor().clamp(0.0, bins as f64 - 1.0) as usize
-                }
-            })
-            .collect()
-    }
-
-    /// Naive, pre-hoist reference for `gaussian_bic_log_likelihood`: rebuilds the
-    /// row-independent Gram M0 = ΛᵀD⁻¹Λ INSIDE the per-row loop (the original
-    /// formula). The production function hoists M0 out; the two must agree.
-    fn naive_gaussian_bic_log_likelihood(
-        r: ArrayView2<'_, f64>,
-        lambda: &Array2<f64>,
-        diagonal: &Array1<f64>,
-        row_scale: &Array1<f64>,
-        rank: usize,
-    ) -> f64 {
-        let n = r.nrows();
-        let p = r.ncols();
-        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
-        let log_det_d: f64 = diagonal.iter().map(|&d| d.ln()).sum();
-        let two_pi_ln = (2.0 * std::f64::consts::PI).ln();
-        let mut log_lik = 0.0_f64;
-        for i in 0..n {
-            let c = row_scale[i].max(f64::MIN_POSITIVE);
-            let mut quad = 0.0_f64;
-            for j in 0..p {
-                quad += r[[i, j]] * d_inv[j] * r[[i, j]];
-            }
-            let mut log_det = log_det_d;
-            if rank > 0 {
-                let mut m = Array2::<f64>::zeros((rank, rank));
-                let mut w = Array1::<f64>::zeros(rank);
-                for a in 0..rank {
-                    let mut wa = 0.0_f64;
-                    for j in 0..p {
-                        wa += lambda[[j, a]] * d_inv[j] * r[[i, j]];
-                    }
-                    w[a] = wa;
-                    for b in 0..rank {
-                        let mut acc = 0.0_f64;
-                        for j in 0..p {
-                            acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
-                        }
-                        m[[a, b]] = acc;
-                    }
-                    m[[a, a]] += 1.0 / c;
-                }
-                match m.cholesky(Side::Lower) {
-                    Ok(chol) => {
-                        let y = chol.solvevec(&w);
-                        let mut wy = 0.0_f64;
-                        for a in 0..rank {
-                            wy += w[a] * y[a];
-                        }
-                        quad -= wy;
-                        let diag = chol.diag();
-                        let log_det_m: f64 = diag.iter().map(|&l| (l * l).ln()).sum();
-                        log_det = log_det_d + log_det_m + rank as f64 * c.ln();
-                    }
-                    Err(_) => {
-                        log_det = log_det_d;
-                    }
-                }
-            }
-            log_lik += -0.5 * (log_det + quad + p as f64 * two_pi_ln);
-        }
-        let k_params = (p * rank + p + ACTIVITY_SCALE_BINS) as f64;
-        log_lik - 0.5 * k_params * (n.max(2) as f64).ln()
-    }
-
-    /// Naive, per-row-rebuild reference for `factor_coordinates`: rebuilds and
-    /// re-factors the (row-independent) normal matrix ΛᵀD⁻¹Λ for EVERY row.
-    /// Mathematically identical to the shared-factorization production path.
-    fn naive_factor_coordinates(
-        lambda: &Array2<f64>,
-        diagonal: &Array1<f64>,
-        r: ArrayView2<'_, f64>,
-    ) -> Array2<f64> {
-        let p = lambda.nrows();
-        let rank = lambda.ncols();
-        let n = r.nrows();
-        let d_inv: Vec<f64> = (0..p).map(|i| 1.0 / diagonal[i]).collect();
-        let mut coords = Array2::<f64>::zeros((n, rank));
-        for i in 0..n {
-            let mut normal = Array2::<f64>::zeros((rank, rank));
-            for a in 0..rank {
-                for b in 0..rank {
-                    let mut acc = 0.0_f64;
-                    for j in 0..p {
-                        acc += lambda[[j, a]] * d_inv[j] * lambda[[j, b]];
-                    }
-                    normal[[a, b]] = acc;
-                }
-            }
-            let kept: Vec<usize> = (0..rank).filter(|&a| normal[[a, a]] > 0.0).collect();
-            if kept.is_empty() {
-                continue;
-            }
-            let mut block = Array2::<f64>::zeros((kept.len(), kept.len()));
-            for (x, &a) in kept.iter().enumerate() {
-                for (y, &b) in kept.iter().enumerate() {
-                    block[[x, y]] = normal[[a, b]];
-                }
-            }
-            let chol = block.cholesky(Side::Lower).expect("naive normal solve");
-            let mut rhs = Array1::<f64>::zeros(kept.len());
-            for (x, &a) in kept.iter().enumerate() {
-                let mut acc = 0.0_f64;
-                for j in 0..p {
-                    acc += lambda[[j, a]] * d_inv[j] * r[[i, j]];
-                }
-                rhs[x] = acc;
-            }
-            let gamma = chol.solvevec(&rhs);
-            for (x, &a) in kept.iter().enumerate() {
-                coords[[i, a]] = gamma[x];
-            }
-        }
-        coords
-    }
-
-    /// FIX B equivalence: the hoisted `gaussian_bic_log_likelihood` and the shared-
-    /// factorization `factor_coordinates` must equal their naive per-row-rebuild
-    /// references to ~1e-10 (in fact bit-for-bit — the hoist preserves op order).
-    #[test]
-    fn hoisted_gram_matches_naive_per_row_rebuild() {
-        let n = 200usize;
-        let p = 5usize;
-        let rank = 2usize;
-        let mut seed = 0x243F6A8885A308D3_u64;
-        let mut lambda = Array2::<f64>::zeros((p, rank));
-        for i in 0..p {
-            for k in 0..rank {
-                lambda[[i, k]] = lcg_normal(&mut seed);
-            }
-        }
-        let mut diagonal = Array1::<f64>::zeros(p);
-        for j in 0..p {
-            diagonal[j] = 0.3 + lcg_uniform(&mut seed); // strictly positive
-        }
-        let mut row_scale = Array1::<f64>::zeros(n);
-        for i in 0..n {
-            row_scale[i] = 0.5 + 1.5 * lcg_uniform(&mut seed); // strictly positive
-        }
-        let mut residuals = Array2::<f64>::zeros((n, p));
-        for i in 0..n {
-            for j in 0..p {
-                residuals[[i, j]] = lcg_normal(&mut seed);
-            }
-        }
-
-        let ev_hoisted =
-            gaussian_bic_log_likelihood(residuals.view(), &lambda, &diagonal, &row_scale, rank);
-        let ev_naive = naive_gaussian_bic_log_likelihood(
-            residuals.view(),
-            &lambda,
-            &diagonal,
-            &row_scale,
-            rank,
-        );
-        assert!(
-            (ev_hoisted - ev_naive).abs() <= 1e-10 * (1.0 + ev_naive.abs()),
-            "hoisted score must equal naive rebuild: {ev_hoisted} vs {ev_naive}"
-        );
-
-        let coords_hoisted =
-            factor_coordinates(&lambda, &diagonal, residuals.view()).expect("coords");
-        let coords_naive = naive_factor_coordinates(&lambda, &diagonal, residuals.view());
-        let mut max_abs = 0.0_f64;
-        for i in 0..n {
-            for a in 0..rank {
-                max_abs = max_abs.max((coords_hoisted[[i, a]] - coords_naive[[i, a]]).abs());
-            }
-        }
-        assert!(
-            max_abs <= 1e-10,
-            "hoisted factor coordinates must equal naive rebuild; max |Δ| = {max_abs:e}"
-        );
-    }
-
-    /// FIX A regression: on an uneven-bin synthetic with a KNOWN planted single
-    /// factor, the low-rank reconstruction ΛΛᵀ + D built from the OCCUPANCY-
-    /// weighted scale law reconstructs the empirical second moment
-    /// (1/n) Σ_n r_n r_nᵀ strictly better (Frobenius) than the one built from
-    /// the bin-UNIFORM scale law. Uses the module's own `scaled_second_moment` /
-    /// eigen path so it exercises the real (Λ, D | scale) step.
-    #[test]
-    fn occupancy_scale_improves_second_moment_reconstruction() {
-        let n = 4000usize;
-        let p = 4usize;
-        let lambda0 = ndarray::array![1.5, 1.2, -0.4, 0.3];
-        let sigma_eps = 0.2_f64;
-        let slope = 2.0_f64;
-        let bins = ACTIVITY_SCALE_BINS.max(1);
-        let mut seed = 0xCA62C1D6_u64 ^ 0x9B05688C_u64;
-        let mut residuals = Array2::<f64>::zeros((n, p));
-        let mut activity = Array1::<f64>::zeros(n);
-        let mut c_true = Array1::<f64>::zeros(n);
-        for row in 0..n {
-            let u = (row as f64) / (n as f64 - 1.0);
-            let z = u * u * u; // cubic warp ⇒ uneven bin occupancy
-            activity[row] = z;
-            let c = (slope * z).exp();
-            c_true[row] = c;
-            let amp = c.sqrt();
-            let f = lcg_normal(&mut seed);
-            for i in 0..p {
-                residuals[[row, i]] = amp * lambda0[i] * f + sigma_eps * lcg_normal(&mut seed);
-            }
-        }
-
-        // Empirical (undeflated) second moment T = (1/n) Σ_n r_n r_nᵀ — the
-        // object the model's ΛΛᵀ + D must reconstruct.
-        let mut t = Array2::<f64>::zeros((p, p));
-        for i in 0..n {
-            for a in 0..p {
-                for b in 0..p {
-                    t[[a, b]] += residuals[[i, a]] * residuals[[i, b]];
-                }
-            }
-        }
-        t.mapv_inplace(|v| v / n as f64);
-
-        let raw_diag = column_variances(residuals.view());
-        let mean_var = raw_diag.iter().sum::<f64>() / p as f64;
-        let diag_floor = DIAGONAL_REL_FLOOR * mean_var.max(f64::MIN_POSITIVE);
-
-        // Per-bin raw scale law: mean of the true c(z) within each bin.
-        let row_bin = assign_bins(&activity, bins);
-        let mut bin_sum = vec![0.0_f64; bins];
-        let mut bin_cnt = vec![0.0_f64; bins];
-        for i in 0..n {
-            bin_sum[row_bin[i]] += c_true[i];
-            bin_cnt[row_bin[i]] += 1.0;
-        }
-        let bin_raw: Vec<f64> = (0..bins)
-            .map(|b| {
-                if bin_cnt[b] > 0.0 {
-                    bin_sum[b] / bin_cnt[b]
-                } else {
-                    1.0
-                }
-            })
-            .collect();
-
-        // Occupancy-weighted mean-1 (Fix A) vs bin-uniform mean-1 (old).
-        let mean_occ = (0..bins).map(|b| bin_cnt[b] * bin_raw[b]).sum::<f64>() / n as f64;
-        let occupied: Vec<usize> = (0..bins).filter(|&b| bin_cnt[b] > 0.0).collect();
-        let mean_uni = occupied.iter().map(|&b| bin_raw[b]).sum::<f64>() / occupied.len() as f64;
-        let row_scale_occ: Array1<f64> = (0..n).map(|i| bin_raw[row_bin[i]] / mean_occ).collect();
-        let row_scale_uni: Array1<f64> = (0..n).map(|i| bin_raw[row_bin[i]] / mean_uni).collect();
-
-        // One (Λ, D | scale) extraction from the deflated moment, mirroring the
-        // production first sweep, returning the reconstruction ΛΛᵀ + D.
-        let extract_recon = |row_scale: &Array1<f64>| -> Array2<f64> {
-            let s = scaled_second_moment(residuals.view(), row_scale);
-            let (evals, evecs) = symmetric_eig_ascending(&s).expect("eig");
-            let mean_diag = raw_diag.iter().map(|&v| v.max(diag_floor)).sum::<f64>() / p as f64;
-            let col = p - 1;
-            let amp = (evals[col] - mean_diag).max(0.0).sqrt();
-            let mut lam = Array1::<f64>::zeros(p);
-            for j in 0..p {
-                lam[j] = amp * evecs[[j, col]];
-            }
-            let mut recon = Array2::<f64>::zeros((p, p));
-            for a in 0..p {
-                for b in 0..p {
-                    recon[[a, b]] = lam[a] * lam[b];
-                }
-            }
-            for j in 0..p {
-                let d = (raw_diag[j] - lam[j] * lam[j]).max(diag_floor);
-                recon[[j, j]] += d;
-            }
-            recon
-        };
-
-        let frob = |m: &Array2<f64>| -> f64 {
-            let mut acc = 0.0_f64;
-            for a in 0..p {
-                for b in 0..p {
-                    let d = m[[a, b]] - t[[a, b]];
-                    acc += d * d;
-                }
-            }
-            acc.sqrt()
-        };
-
-        let dist_occ = frob(&extract_recon(&row_scale_occ));
-        let dist_uni = frob(&extract_recon(&row_scale_uni));
-        assert!(
-            dist_occ < dist_uni,
-            "occupancy-weighted reconstruction must beat bin-uniform: \
-             ‖·‖_F occ = {dist_occ:.6} vs uni = {dist_uni:.6}"
-        );
-    }
 
     /// Fit a small structured model on a planted single-factor DGP — shared
     /// fixture builder for the producer / damped-metric integration tests.
@@ -1834,7 +1081,6 @@ mod tests {
         let model = StructuredResidualModel::fit(ResidualFactorInput {
             residuals: residuals.view(),
             activity: activity.view(),
-            max_factor_rank: 2,
         })
         .expect("fit");
         (n, model)

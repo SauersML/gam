@@ -1148,6 +1148,7 @@ pub fn blockwise_fit_from_parts(
         reparam_qs: None,
         dispersion: gam_solve::model_types::Dispersion::UNIT,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram,
@@ -1369,6 +1370,9 @@ pub(crate) struct CustomOuterState {
     /// Kept rank of the criterion the most recent successful evaluation priced (#2765),
     /// published to the outer search through `OuterObjective::criterion_rank`.
     pub(crate) last_criterion_rank: Option<usize>,
+    /// The fit's fixed starts (gam#3173): every evaluation also solves a mode from each, and
+    /// publishes the certified mode with the lowest penalized objective ([`evaluate_on_branch`]).
+    pub(crate) fixed_starts: Vec<Option<ConstrainedWarmStart>>,
 }
 
 fn theta_bits(theta: &Array1<f64>) -> Vec<u64> {
@@ -1431,6 +1435,46 @@ impl CustomOuterState {
             walk_endpoints: Vec::new(),
             value_probe: None,
             last_criterion_rank: None,
+            fixed_starts: Vec::new(),
+        }
+    }
+
+    /// Install the fit's fixed starts (gam#3173).
+    pub(crate) fn with_fixed_starts(
+        mut self,
+        fixed_starts: Vec<Option<ConstrainedWarmStart>>,
+    ) -> Self {
+        self.fixed_starts = fixed_starts;
+        self
+    }
+
+    /// The starts of one outer evaluation at `theta` (gam#3173): the incumbent's
+    /// ([`Self::warm_start_for`]) and the fit's fixed starts.
+    ///
+    /// A start that is already this rule's published mode at bitwise `theta` (a value probe's, a
+    /// walk's, or the evaluated incumbent's own) was selected there against the same fixed
+    /// starts, and solving them again at `theta` reproduces that selection, so they are left out.
+    pub(crate) fn mode_starts_for(&self, theta: &Array1<f64>) -> ModeStarts<'_> {
+        let key = theta_bits(theta);
+        let seed = self.seed_for(theta);
+        let published_here = self.walk_endpoints.iter().any(|(bits, _)| *bits == key)
+            || self
+                .value_probe
+                .as_ref()
+                .is_some_and(|probe| probe.theta == key && probe.seed == SeedIdentity::of(seed))
+            || (self.incumbent_established
+                && self
+                    .warm_cache
+                    .as_ref()
+                    .is_some_and(|mode| theta_bits(&mode.rho) == key));
+        let fixed: &[Option<ConstrainedWarmStart>] = if published_here {
+            &[]
+        } else {
+            &self.fixed_starts
+        };
+        ModeStarts {
+            incumbent: self.warm_start_for(theta),
+            fixed,
         }
     }
 

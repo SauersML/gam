@@ -338,26 +338,27 @@ impl PredictionTransform for DispersionLocationScalePredictor {
     fn observation_band(
         &self,
         input: &PredictInput,
-        mean: &Array1<f64>,
-        mean_se: &Array1<f64>,
+        eta: &Array1<f64>,
+        eta_se: &Array1<f64>,
         z_lower: &Array1<f64>,
         z_upper: &Array1<f64>,
     ) -> Result<Option<(Array1<f64>, Array1<f64>)>, EstimationError> {
         let precision = self.precision(input)?;
         let response = &self.likelihood.response;
-        if mean.len() != precision.len() {
-            return Ok(None);
+        let n = eta.len();
+        if precision.len() != n || eta_se.len() != n {
+            return Err(EstimationError::InvalidInput(format!(
+                "dispersion location-scale observation band: {n} linear predictors against \
+                 {} precisions and {} standard errors",
+                precision.len(),
+                eta_se.len()
+            )));
         }
-        // Per-row observation-noise variance `E[Var(Y | μ, φ)]` integrated over
-        // the joint (η_μ, η_d) posterior (see `integrated_response_variance` —
-        // the plug-in law understates the band wherever the scale predictor is
-        // uncertain, audit finding 6), and the per-row dispersion in the
-        // family's natural units (NB θ, Tweedie φ; Gamma/Beta ignore it). The
-        // moment-matched predictive then carries each row's conditional law,
-        // widened by that row's estimation SE. The plug-in dispersion still
-        // selects the predictive *shape*; the integrated variance sets its
-        // width.
-        let n = mean.len();
+        // The per-row dispersion in the family's natural units (NB θ, Tweedie φ;
+        // Gamma/Beta ignore it). The moment-matched predictive carries each row's
+        // conditional law, widened by that row's posterior spread. The plug-in
+        // dispersion selects the predictive *shape*; the integrated variance sets
+        // its width.
         let mut dispersion = Array1::<f64>::zeros(n);
         for i in 0..n {
             let prec = precision[i];
@@ -374,20 +375,40 @@ impl PredictionTransform for DispersionLocationScalePredictor {
             };
             dispersion[i] = disp;
         }
-        let response_var = self.integrated_response_variance(input)?;
-        let (lower, upper) = family_observation_band_per_row(
+        // The predictive law's moments over the mean block's η posterior (#3140):
+        // `E[μ]` and `Var(μ)` from one integral, and for Beta the complement's own
+        // mean, which keeps its digits where μ rounds to one.
+        let strategy = self.strategy();
+        let quadctx = gam_solve::quadrature::QuadratureContext::new();
+        let mut mean = Array1::<f64>::zeros(n);
+        let mut mean_variance = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let (m, v) = strategy.posterior_meanvariance(&quadctx, eta[i], eta_se[i])?;
+            mean[i] = m;
+            mean_variance[i] = v;
+        }
+        let complement = match response {
+            ResponseFamily::Beta { .. } => Some(
+                (0..n)
+                    .map(|i| strategy.posterior_complement_mean(&quadctx, eta[i], eta_se[i]))
+                    .collect::<Result<Array1<f64>, _>>()?,
+            ),
+            _ => None,
+        };
+        // `E[Var(Y | μ, φ)]` integrated over the joint (η_μ, η_d) posterior (see
+        // `integrated_response_variance`; the plug-in law understates the band
+        // wherever the scale predictor is uncertain, audit finding 6).
+        let expected_response_var = self.integrated_response_variance(input)?;
+        family_observation_band_per_row(
             response,
-            mean,
-            mean_se,
-            &response_var,
+            &mean,
+            complement.as_ref(),
+            &mean_variance,
+            &expected_response_var,
             &dispersion,
             z_lower,
             z_upper,
-        );
-        Ok(match (lower, upper) {
-            (Some(lo), Some(hi)) => Some((lo, hi)),
-            _ => None,
-        })
+        )
     }
 }
 

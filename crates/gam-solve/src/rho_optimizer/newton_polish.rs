@@ -17,7 +17,7 @@ use ndarray::{Array1, Array2};
 /// What the mint's Newton polish reads from the certificate that decided to
 /// take it (#2954).
 pub(super) struct MintPolish<'a> {
-    pub(super) allow_tail_snap: bool,
+    pub(super) allow_certify_reseed: bool,
     pub(super) fidelity: CertificationFidelity,
     /// The polish this walk has taken so far, `None` on the first verdict.
     pub(super) polish: Option<PolishWalk>,
@@ -73,7 +73,7 @@ pub(super) fn polish_the_mint(
     inputs: MintPolish<'_>,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
     let MintPolish {
-        allow_tail_snap,
+        allow_certify_reseed,
         fidelity,
         polish,
         decision,
@@ -150,7 +150,7 @@ pub(super) fn polish_the_mint(
                     config,
                     context,
                     result,
-                    allow_tail_snap,
+                    allow_certify_reseed,
                     fidelity,
                     record,
                     taken,
@@ -218,7 +218,7 @@ pub(super) fn polish_the_mint(
                             config,
                             context,
                             result,
-                            allow_tail_snap,
+                            allow_certify_reseed,
                             fidelity,
                             Some(PolishWalk { record, judged }),
                         );
@@ -282,7 +282,7 @@ pub(super) fn polish_the_mint(
                     config,
                     context,
                     result,
-                    allow_tail_snap,
+                    allow_certify_reseed,
                     fidelity,
                     record,
                     taken,
@@ -319,10 +319,11 @@ pub(super) fn polish_the_mint(
     Err(outer_nonconvergence_error(
         context,
         &format!(
-            "Newton-decrement above tolerance after polish: λ̂²={:.3e} > band_f={:.3e} \
-             after {} Newton step(s) on the current face (ΔV per step {:?}; {} \
-             rail(s) {:?}; λ̂² {:.3e} before, {:.3e} now): {stopped}",
+            "Newton-decrement above tolerance after polish: λ̂²={:.3e} > tolerance={:.3e} \
+             (rounding band_f={:.3e}) after {} Newton step(s) on the current face (ΔV per \
+             step {:?}; {} rail(s) {:?}; λ̂² {:.3e} before, {:.3e} now): {stopped}",
             evidence.lambda_sq,
+            evidence.tolerance,
             evidence.band_f,
             record.decreases.len() - face_start,
             record.decreases,
@@ -344,8 +345,9 @@ pub(super) fn polish_the_mint(
 /// The evidence of a verdict whose Newton decrement the arithmetic resolves as
 /// a decrease still to buy (#2954): `DecrementAboveTolerance`, and a
 /// `DecrementUnresolved` whose `λ̂²` exceeds its own rounding `band_λ²` by more
-/// than `band_f`. The latter's certificate is undecidable, but its decrease is
-/// not: the decrease left to the minimum is more than either band. So both are polished, or
+/// than the verdict's tolerance. The latter's certificate is undecidable, but its
+/// decrease is not: the decrease left to the minimum is more than the tolerance,
+/// which is never below the rounding band `band_f`. So both are polished, or
 /// refused by name, and neither certifies.
 pub(super) fn resolvable_decrease_evidence(
     verdict: &opt::DecrementVerdict,
@@ -353,7 +355,7 @@ pub(super) fn resolvable_decrease_evidence(
     match verdict {
         opt::DecrementVerdict::DecrementAboveTolerance(evidence) => Some(evidence),
         opt::DecrementVerdict::DecrementUnresolved(evidence)
-            if evidence.lambda_sq - evidence.band_lambda_sq > evidence.band_f =>
+            if evidence.lambda_sq - evidence.band_lambda_sq > evidence.tolerance =>
         {
             Some(evidence)
         }
@@ -375,10 +377,12 @@ struct DampedNewtonStep {
 /// The first step along the Newton step `p`, halving `t` from one, that lowers
 /// the criterion by more than `band_f` (#3012).
 ///
-/// A verdict refuses on the decrease left to the minimum, `λ̂²`, while the full
-/// step's quadratic model promises `½λ̂²`. Where `band_f < λ̂² ≤ 2·band_f` the
-/// decrease left is resolvable but no step's decrease is, so no step can show
-/// the decrease `band_f` a kept step must. There the full step is a settling
+/// A verdict refuses on the decrease left to the minimum, `λ̂²`, against its
+/// tolerance, while the full step's quadratic model promises `½λ̂²`. Where
+/// `½λ̂² ≤ band_f` although `λ̂²` is above the tolerance, which can happen only
+/// where the tolerance is below `2·band_f`, no step's decrease is resolvable
+/// against the rounding band `band_f`, so no step can show the decrease a kept
+/// step must. There the full step is a settling
 /// step: it is taken where it does not raise the criterion by more than
 /// `band_f`, and the point it reaches must certify (`polish_the_mint` refuses a
 /// settled point that does not).
@@ -455,9 +459,9 @@ fn damped_newton_step(
         };
         if settling {
             return Err(format!(
-                "the settling step, where λ̂²={:.3e} is resolvable against band_f={:.3e} but \
-                 the full step's own ½λ̂² is not, {outcome}",
-                evidence.lambda_sq, evidence.band_f,
+                "the settling step, where λ̂²={:.3e} is above the tolerance {:.3e} but the \
+                 full step's own ½λ̂² is not resolvable against band_f={:.3e}, {outcome}",
+                evidence.lambda_sq, evidence.tolerance, evidence.band_f,
             ));
         }
         let full = full_step.get_or_insert(outcome);
@@ -480,7 +484,7 @@ fn take_polish_step(
     config: &OuterConfig,
     context: &str,
     result: &mut OuterResult,
-    allow_tail_snap: bool,
+    allow_certify_reseed: bool,
     fidelity: CertificationFidelity,
     mut record: NewtonPolishRecord,
     taken: DampedNewtonStep,
@@ -495,14 +499,14 @@ fn take_polish_step(
         settling,
     } = taken;
     log::debug!(
-        "[CERTIFICATE] {context}: Newton-decrement polish {} {}: λ̂²={:.3e} is \
-         resolvable against band_f={:.3e}; the Newton step at t={t:.3e} moves the \
+        "[CERTIFICATE] {context}: Newton-decrement polish {} {}: λ̂²={:.3e} is above \
+         the tolerance {:.3e}; the Newton step at t={t:.3e} moves the \
          criterion from {cost:.9e} to {trial_cost:.9e}, and the point it reaches is judged \
          instead (#2954)",
         if settling { "settling step" } else { "step" },
         record.decreases.len() + 1,
         evidence.lambda_sq,
-        evidence.band_f,
+        evidence.tolerance,
     );
     record.decreases.push(cost - trial_cost);
     record.settled = settling;
@@ -513,7 +517,7 @@ fn take_polish_step(
         config,
         context,
         result,
-        allow_tail_snap,
+        allow_certify_reseed,
         fidelity,
         Some(PolishWalk { record, judged }),
     )

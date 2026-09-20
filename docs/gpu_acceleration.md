@@ -102,8 +102,23 @@ The survival marginal-slope rigid row jet takes the same decision,
 follow-up-varying slope or a declared latent law runs the CPU row program
 under `gpu=auto` and is refused at fit entry under `gpu=required`. Both
 decisions probe the device only when the answer depends on it; a model
-outside the declaration, `gpu=off`, or an `auto` workload below the floor
-every dispatch policy shares never creates a CUDA context.
+outside the declaration or `gpu=off` never creates a CUDA context.
+
+Under `gpu=auto`, the survival row jet and the Pólya-Gamma batch weigh
+their own two executors, measured on the workload in front of them
+(`crates/gam-gpu/src/row_kernel_race.rs`, gam#3024). They no longer borrow
+twice the `X'WX` Gram's measured crossover. The first `auto` call for a
+shape the process has not timed runs the CPU executor once and the device
+executor twice, timing the warm second call. The faster executor is
+recorded, and that call returns the CPU result. Later calls read the record:
+an exact point at the same row count, or each executor's `a + b·n` fitted
+through two or more timed row counts. A device whose per-row cost exceeds
+the CPU's is never selected at any size. The choice is a timing, so near a
+crossover two runs can pick different executors, and results can then
+differ at roundoff. `gpu="off"` and `gpu="required"` never race and are the
+deterministic choices. On a GPU host, the first admission of any size
+creates the CUDA context once per process. A host without libcuda resolves
+to absence before any cudarc call (#2972).
 
 ## Transfer And Precision Policy
 

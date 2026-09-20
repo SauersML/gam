@@ -40,31 +40,44 @@ const DAWSON_ASYMPTOTIC_MIN: f64 = 7.0;
 /// Dawson's integral `F(x) = e^{-x²} ∫₀ˣ e^{t²} dt` and its derivatives
 /// `[F, F', F'', F''']`.
 pub fn dawson_jet(x: f64) -> [f64; 4] {
+    dawson_jet_n::<4>(x)
+}
+
+/// Dawson's integral and its first `N − 1` derivatives, `N ≤ 5`. Below
+/// [`DAWSON_ASYMPTOTIC_MIN`] the derivatives follow from `F' = 1 − 2xF` and
+/// `F^{(j+1)} = −2j·F^{(j−1)} − 2x·F^{(j)}`.
+fn dawson_jet_n<const N: usize>(x: f64) -> [f64; N] {
     if x.is_nan() {
-        return [f64::NAN; 4];
+        return [f64::NAN; N];
     }
     let a = x.abs();
-    let mut jet = if a.is_infinite() {
-        [0.0; 4]
-    } else if a >= DAWSON_ASYMPTOTIC_MIN {
-        // `F(x) = ½·M(x)` for the principal-value mean `M` at `s² = ½`.
-        let series = reciprocal_moment_series(a, 0.5);
-        [0.5 * series[0], 0.5 * series[1], 0.5 * series[2], 0.5 * series[3]]
-    } else {
+    // At an infinite argument `F` and every derivative vanish, so the jet stays zero.
+    let mut jet = [0.0_f64; N];
+    if a < DAWSON_ASYMPTOTIC_MIN {
         let value = if a < DAWSON_SERIES_MAX {
             dawson_maclaurin(a)
         } else {
             dawson_rybicki(a)
         };
-        let d1 = 1.0 - 2.0 * a * value;
-        let d2 = -2.0 * value - 2.0 * a * d1;
-        let d3 = -4.0 * d1 - 2.0 * a * d2;
-        [value, d1, d2, d3]
-    };
+        jet[0] = value;
+        if N > 1 {
+            jet[1] = 1.0 - 2.0 * a * value;
+        }
+        for j in 1..N.saturating_sub(1) {
+            jet[j + 1] = -2.0 * (j as f64) * jet[j - 1] - 2.0 * a * jet[j];
+        }
+    } else if a.is_finite() {
+        // `F(x) = ½·M(x)` for the principal-value mean `M` at `s² = ½`.
+        let series = reciprocal_moment_series::<N>(a, 0.5 / (a * a));
+        for (value, term) in jet.iter_mut().zip(series) {
+            *value = 0.5 * term;
+        }
+    }
     if x < 0.0 {
         // `F` is odd, so its even derivatives are odd too.
-        jet[0] = -jet[0];
-        jet[2] = -jet[2];
+        for value in jet.iter_mut().step_by(2) {
+            *value = -*value;
+        }
     }
     jet
 }
@@ -109,16 +122,18 @@ fn dawson_rybicki(x: f64) -> f64 {
     FRAC_1_SQRT_PI * sum
 }
 
-/// The moment expansion `M(m) = Σ_k (2k−1)!! s^{2k} m^{-(2k+1)}` of
-/// `E[1/η]`, `η ~ N(m, s²)`, with its first three `m`-derivatives, for
-/// `s²/m² ≤ 1/(2·DAWSON_ASYMPTOTIC_MIN²)`.
+/// The inverse-moment series `Σ_k (2k−1)!!·r^k·m^{-(2k+1)}` and its first
+/// `N − 1` `m`-derivatives (`N ≤ 5`), for a signed ratio `r` with
+/// `|r| ≤ 1/(2·DAWSON_ASYMPTOTIC_MIN²)`.
 ///
-/// The series is asymptotic: its terms fall until `k ≈ m²/(2s²)` and then
+/// `r = s²/m²` is the moment expansion of `E[1/η]`, `η ~ N(m, s²)`. `r = −σ/m²`
+/// is the expansion of the half-line integral `∫₀^∞ e^{−mt − σt²/2} dt`
+/// ([`half_line_gaussian_log_jet`]), the same function continued to `σ = −s²`.
+/// The series is asymptotic: its terms fall until `k ≈ 1/(2|r|)` and then
 /// grow. It is summed until the terms stop changing the sums, or truncated at
-/// the smallest term, whose size is of order `e^{-m²/(2s²)}`.
-fn reciprocal_moment_series(m: f64, s2: f64) -> [f64; 4] {
-    let r = s2 / (m * m);
-    let mut sums = [0.0_f64; 4];
+/// the smallest term, whose size is of order `e^{-1/(2|r|)}`.
+fn reciprocal_moment_series<const N: usize>(m: f64, r: f64) -> [f64; N] {
+    let mut sums = [0.0_f64; N];
     // `t_k = (2k−1)!!·r^k`; the `j`-th derivative carries the rising
     // factorial `(2k+1)(2k+2)…(2k+j)`.
     let mut t = 1.0_f64;
@@ -126,8 +141,13 @@ fn reciprocal_moment_series(m: f64, s2: f64) -> [f64; 4] {
     let mut previous_top = f64::INFINITY;
     loop {
         let p = 2.0 * k + 1.0;
-        let terms = [t, t * p, t * p * (p + 1.0), t * p * (p + 1.0) * (p + 2.0)];
-        if terms[3] > previous_top {
+        let mut terms = [0.0_f64; N];
+        let mut factor = t;
+        for (j, term) in terms.iter_mut().enumerate() {
+            *term = factor;
+            factor *= p + j as f64;
+        }
+        if terms[N - 1].abs() > previous_top {
             break;
         }
         for (sum, term) in sums.iter_mut().zip(terms) {
@@ -136,44 +156,127 @@ fn reciprocal_moment_series(m: f64, s2: f64) -> [f64; 4] {
         let converged = sums
             .iter()
             .zip(terms)
-            .all(|(sum, term)| term <= f64::EPSILON * sum.abs());
+            .all(|(sum, term)| term.abs() <= f64::EPSILON * sum.abs());
         if converged {
             break;
         }
-        previous_top = terms[3];
+        previous_top = terms[N - 1].abs();
         t *= p * r;
         k += 1.0;
     }
     let inv = 1.0 / m;
     let inv2 = inv * inv;
-    [
-        sums[0] * inv,
-        -sums[1] * inv2,
-        sums[2] * inv2 * inv,
-        -sums[3] * inv2 * inv2,
-    ]
+    std::array::from_fn(|j| match j {
+        0 => sums[j] * inv,
+        1 => -sums[j] * inv2,
+        2 => sums[j] * inv2 * inv,
+        3 => -sums[j] * inv2 * inv2,
+        _ => sums[j] * inv2 * inv2 * inv,
+    })
 }
 
 /// The principal-value mean `PV E[1/η]`, `η ~ N(m, s²)`, and its first three
 /// `m`-derivatives. At `s = 0` this is the plug-in `1/m` and its derivatives.
 pub fn principal_value_inverse_normal_jet(m: f64, s: f64) -> [f64; 4] {
+    principal_value_inverse_normal_jet_n::<4>(m, s)
+}
+
+/// [`principal_value_inverse_normal_jet`] with its first `N − 1`
+/// `m`-derivatives, `N ≤ 5`.
+fn principal_value_inverse_normal_jet_n<const N: usize>(m: f64, s: f64) -> [f64; N] {
     if s == 0.0 {
         let inv = 1.0 / m;
-        return [inv, -inv * inv, 2.0 * inv * inv * inv, -6.0 * inv * inv * inv * inv];
+        return std::array::from_fn(|j| match j {
+            0 => inv,
+            1 => -inv * inv,
+            2 => 2.0 * inv * inv * inv,
+            3 => -6.0 * inv * inv * inv * inv,
+            _ => 24.0 * inv * inv * inv * inv * inv,
+        });
     }
     if m.abs() >= DAWSON_ASYMPTOTIC_MIN * SQRT_2 * s {
-        return reciprocal_moment_series(m, s * s);
+        return reciprocal_moment_series::<N>(m, s * s / (m * m));
     }
     // `M(m) = 2c·F(cm)` with `c = 1/(√2 s)`, so `M^{(j)} = 2c^{j+1} F^{(j)}(cm)`.
     let c = 1.0 / (SQRT_2 * s);
-    let f = dawson_jet(c * m);
-    let scale = 2.0 * c;
-    [
-        scale * f[0],
-        scale * c * f[1],
-        scale * c * c * f[2],
-        scale * c * c * c * f[3],
-    ]
+    let f = dawson_jet_n::<N>(c * m);
+    let mut scale = 2.0 * c;
+    let mut jet = [0.0_f64; N];
+    for (value, derivative) in jet.iter_mut().zip(f) {
+        *value = scale * derivative;
+        scale *= c;
+    }
+    jet
+}
+
+/// `J(μ, σ) = ∫₀^∞ e^{−μt − σt²/2} dt`, the mass a half-line leaves an
+/// exponential-quadratic weight, as `[ln J, κ₁, κ₂, κ₃, κ₄]`.
+///
+/// `κ_k` are the cumulants of `t` under the normalized weight,
+/// `κ_k = (−1)^k ∂^k_μ ln J`, so `∂_μκ_k = −κ_{k+1}`. Since `∂_σ J = −½∂²_μ J`,
+/// the `σ`-rates follow from the same jet: `∂_σ ln J = −½(κ₂ + κ₁²)`.
+///
+/// For `σ < 0` the integral diverges, and `J` is continued by the principal
+/// value `J(μ, σ) = PV E[1/η]` with `η ~ N(μ, −σ)`. Every branch below
+/// satisfies `σ·∂_μJ = μJ − 1`, and the continuation is the solution of it that
+/// keeps the expansion `J ~ μ⁻¹ Σ_k (2k−1)!!·(−σ/μ²)^k` on both sides of
+/// `σ = 0`. So at `μ > 0`, `J` is smooth through `σ = 0`, where it is the
+/// exponential mass `1/μ`: the Laplace factor of a boundary with multiplier
+/// `μ`, whose normal curvature `σ` of either sign is a correction of relative
+/// order `σ/μ²`.
+///
+/// The branches all evaluate this one function:
+/// - `σ ≤ 0`: the principal value, through the series and Dawson branches of
+///   [`principal_value_inverse_normal_jet`] at `s = √−σ`;
+/// - `σ > 0` with `μ ≥ DAWSON_ASYMPTOTIC_MIN·√(2σ)`: the same series with the
+///   alternating ratio `−σ/μ²`, where the log-normal-CDF form would cancel;
+/// - `σ > 0` otherwise: `J = √(2π/σ)·e^{z²/2}·Φ(z)` with `z = −μ/√σ`.
+///
+/// Returns `None` where neither the integral nor its continuation is a
+/// positive mass (`μ ≤ 0` with `σ ≤ 0`), or for a non-finite argument.
+pub fn half_line_gaussian_log_jet(mu: f64, sigma: f64) -> Option<[f64; 5]> {
+    if !(mu.is_finite() && sigma.is_finite()) {
+        return None;
+    }
+    if sigma > 0.0 && !(mu > 0.0 && mu >= DAWSON_ASYMPTOTIC_MIN * SQRT_2 * sigma.sqrt()) {
+        let root = sigma.sqrt();
+        let z = -mu / root;
+        let f = crate::probability::normal_logcdf_derivatives(z);
+        let log_mass = 0.5 * (2.0 * std::f64::consts::PI / sigma).ln() + 0.5 * z * z + f[0];
+        let jet = [
+            log_mass,
+            (z + f[1]) / root,
+            (1.0 + f[2]) / sigma,
+            f[3] / (sigma * root),
+            f[4] / (sigma * sigma),
+        ];
+        return jet.iter().all(|value| value.is_finite()).then_some(jet);
+    }
+    if !(mu > 0.0) {
+        return None;
+    }
+    let derivatives = if sigma > 0.0 {
+        reciprocal_moment_series::<5>(mu, -sigma / (mu * mu))
+    } else {
+        principal_value_inverse_normal_jet_n::<5>(mu, (-sigma).sqrt())
+    };
+    let mass = derivatives[0];
+    if !(mass > 0.0 && mass.is_finite()) {
+        return None;
+    }
+    // Raw moments `E[tʲ] = (−1)ʲ J^{(j)}/J`, then cumulants.
+    let m1 = -derivatives[1] / mass;
+    let m2 = derivatives[2] / mass;
+    let m3 = -derivatives[3] / mass;
+    let m4 = derivatives[4] / mass;
+    let jet = [
+        mass.ln(),
+        m1,
+        m2 - m1 * m1,
+        m3 - 3.0 * m2 * m1 + 2.0 * m1 * m1 * m1,
+        m4 - 4.0 * m3 * m1 - 3.0 * m2 * m2 + 12.0 * m2 * m1 * m1 - 6.0 * m1 * m1 * m1 * m1,
+    ];
+    jet.iter().all(|value| value.is_finite()).then_some(jet)
 }
 
 /// Half-width, in standard deviations, of the window outside which the
@@ -399,5 +502,144 @@ mod tests {
         }
         assert_close("1/m", pv[0], 1.0 / m, 1e-15);
         assert_close("m^-1/2", root[0], 1.0 / m.sqrt(), 1e-15);
+    }
+
+    /// `[ln J, E[t], …, E[t⁴]]` of `∫₀^∞ e^{−μt − σt²/2} dt`, `σ > 0`, by 20-point
+    /// Gauss–Legendre on 400 panels of `[0, T]`. Past `T = t* + √(2L/σ)`, with
+    /// `t* = max(0, −μ/σ)` the weight's peak and `L = −ln ε²`, the exponent has
+    /// fallen by more than `L` below its peak.
+    fn half_line_moments_by_quadrature(mu: f64, sigma: f64) -> [f64; 5] {
+        let (nodes, weights) = crate::special::gauss_legendre(20);
+        let peak = (-mu / sigma).max(0.0);
+        let exponent = |t: f64| -mu * t - 0.5 * sigma * t * t;
+        let top = exponent(peak);
+        let end = peak + (-4.0 * f64::EPSILON.ln() / sigma).sqrt();
+        let panels = 400;
+        let width = end / panels as f64;
+        let mut sums = [0.0_f64; 5];
+        for panel in 0..panels {
+            let centre = (panel as f64 + 0.5) * width;
+            for (node, weight) in nodes.iter().zip(&weights) {
+                let t = centre + 0.5 * width * node;
+                let mass = 0.5 * width * weight * (exponent(t) - top).exp();
+                let mut power = 1.0;
+                for sum in &mut sums {
+                    *sum += mass * power;
+                    power *= t;
+                }
+            }
+        }
+        [sums[0].ln() + top, sums[1] / sums[0], sums[2] / sums[0], sums[3] / sums[0], sums[4] / sums[0]]
+    }
+
+    fn raw_moments_from_cumulants(jet: &[f64; 5]) -> [f64; 4] {
+        let [_, k1, k2, k3, k4] = *jet;
+        [
+            k1,
+            k2 + k1 * k1,
+            k3 + 3.0 * k2 * k1 + k1 * k1 * k1,
+            k4 + 4.0 * k3 * k1 + 3.0 * k2 * k2 + 6.0 * k2 * k1 * k1 + k1 * k1 * k1 * k1,
+        ]
+    }
+
+    /// Against quadrature on every `σ > 0` branch: the alternating series
+    /// (`μ ≥ 7√(2σ)`), the log-normal-CDF form on both sides of its seam with
+    /// the series, and an interior peak (`μ < 0`). The bar: the log-CDF form's
+    /// brackets `z + f′` and `1 + f″` cancel by at most `1 + z²` with `z² = μ²/σ ≤ 98`
+    /// on that branch, and the moment-to-cumulant map amplifies relative error
+    /// by at most `Σ|terms|/κ₄ = 15` on the exponential law, the worst of these
+    /// weights. So `3·15·(1 + 98)·ε` bounds every entry, with a factor 3 for the
+    /// quadrature's own rounding.
+    #[test]
+    fn half_line_log_jet_matches_quadrature_2765() {
+        let seam = 3.0 * 3.0 / (2.0 * DAWSON_ASYMPTOTIC_MIN * DAWSON_ASYMPTOTIC_MIN);
+        let bar = 3.0 * 15.0 * 99.0 * f64::EPSILON;
+        for (mu, sigma) in [
+            (3.0, 0.05),
+            (3.0, seam),
+            (3.0, seam * (1.0 + 4.0 * f64::EPSILON)),
+            (3.0, 0.5),
+            (0.5, 2.0),
+            (0.0, 1.0),
+            (-2.0, 1.0),
+        ] {
+            let jet = half_line_gaussian_log_jet(mu, sigma).expect("a positive-σ half-line mass");
+            let reference = half_line_moments_by_quadrature(mu, sigma);
+            assert_close(&format!("ln J({mu}, {sigma})"), jet[0], reference[0], bar);
+            let moments = raw_moments_from_cumulants(&jet);
+            for j in 0..4 {
+                assert_close(&format!("E[t^{}]({mu}, {sigma})", j + 1), moments[j], reference[j + 1], bar);
+            }
+        }
+    }
+
+    /// `σ·∂_μJ = μJ − 1` and its `μ`-derivatives hold on every branch, the
+    /// principal-value continuation at `σ < 0` included. In raw moments:
+    /// `σm₁ + μ = 1/J`, `σm₂ + μm₁ = 1`, `σm₃ + μm₂ = 2m₁`, `σm₄ + μm₃ = 3m₂`.
+    /// Each identity is judged relative to the magnitudes it sums, at the same
+    /// bar as the quadrature comparison.
+    #[test]
+    fn half_line_log_jet_satisfies_its_differential_equation_2765() {
+        let bar = 3.0 * 15.0 * 99.0 * f64::EPSILON;
+        for (mu, sigma) in [
+            (3.0, 0.5),
+            (3.0, 0.05),
+            (3.0, 1e-4),
+            (3.0, -1e-4),
+            (3.0, -0.05),
+            (3.0, -0.5),
+            (3.0, -4.0),
+            (0.7, -0.2),
+            (0.5, 2.0),
+            (-2.0, 1.0),
+        ] {
+            let jet = half_line_gaussian_log_jet(mu, sigma).expect("a half-line mass or its continuation");
+            let [m1, m2, m3, m4] = raw_moments_from_cumulants(&jet);
+            let inverse_mass = (-jet[0]).exp();
+            let checks = [
+                (sigma * m1 + mu, inverse_mass, (sigma * m1).abs() + mu.abs()),
+                (sigma * m2 + mu * m1, 1.0, (sigma * m2).abs() + (mu * m1).abs()),
+                (sigma * m3 + mu * m2, 2.0 * m1, (sigma * m3).abs() + (mu * m2).abs()),
+                (sigma * m4 + mu * m3, 3.0 * m2, (sigma * m4).abs() + (mu * m3).abs()),
+            ];
+            for (order, (lhs, rhs, magnitude)) in checks.into_iter().enumerate() {
+                assert!(
+                    (lhs - rhs).abs() <= bar * magnitude.max(rhs.abs()),
+                    "order {order} at (μ={mu}, σ={sigma}): {lhs:e} against {rhs:e}"
+                );
+            }
+        }
+    }
+
+    /// At `σ = 0` the mass is the exponential law's, and on either side it
+    /// follows the one expansion `ln J = −ln μ − s + (5/2)s² − (37/3)s³ + …`,
+    /// `μκ₁ = 1 − 2s + 10s² − 74s³ + …`, `s = σ/μ²`: the continuation is smooth
+    /// through `σ = 0`. Each bar is the first omitted coefficient rounded up
+    /// (`37/3 → 13`, `10 → 11`); at `|s| ≤ 3·10⁻³` the next terms (`353/4·s⁴`,
+    /// `74|s|³`) stay inside that rounding.
+    #[test]
+    fn half_line_log_jet_is_smooth_through_zero_curvature_2765() {
+        let mu = 2.5;
+        let at_zero = half_line_gaussian_log_jet(mu, 0.0).expect("the exponential mass");
+        let exponential = [-mu.ln(), 1.0 / mu, 1.0 / (mu * mu), 2.0 / mu.powi(3), 6.0 / mu.powi(4)];
+        for j in 0..5 {
+            assert_close(&format!("exponential jet {j}"), at_zero[j], exponential[j], 64.0 * f64::EPSILON);
+        }
+        for s in [3e-3, 1e-3, 1e-5, -1e-5, -1e-3, -3e-3] {
+            let jet = half_line_gaussian_log_jet(mu, s * mu * mu).expect("a mass near zero curvature");
+            let log_deviation = jet[0] + mu.ln() - (-s + 2.5 * s * s);
+            assert!(log_deviation.abs() <= 13.0 * s.abs().powi(3), "ln J at s={s}: {log_deviation:e}");
+            let mean_deviation = mu * jet[1] - (1.0 - 2.0 * s);
+            assert!(mean_deviation.abs() <= 11.0 * s * s, "μκ₁ at s={s}: {mean_deviation:e}");
+        }
+    }
+
+    /// Neither the integral nor its continuation is a positive mass where the
+    /// weight has no decay along the half-line.
+    #[test]
+    fn half_line_log_jet_refuses_a_weight_without_decay_2765() {
+        for (mu, sigma) in [(-1.0, -1.0), (0.0, 0.0), (0.0, -1.0), (-1.0, 0.0), (1.0, f64::NAN)] {
+            assert!(half_line_gaussian_log_jet(mu, sigma).is_none(), "(μ={mu}, σ={sigma})");
+        }
     }
 }

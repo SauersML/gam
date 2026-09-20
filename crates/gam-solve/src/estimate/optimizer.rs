@@ -346,6 +346,12 @@ struct NegbinJointCheckpoint {
     theta_bound: f64,
 }
 
+/// The square matrices the first-order smoothing correction's assembly holds
+/// live: the dense bundle charges them inside its atomic peak, and a fit whose
+/// inference stayed factorized charges the same owner on its own
+/// ([`reserve_smoothing_correction_workspace`], #3283).
+const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
+
 /// Reserve the complete peak live set of the optional dense inference path.
 ///
 /// The count is assembled from named algorithmic owners rather than a
@@ -356,7 +362,6 @@ struct NegbinJointCheckpoint {
 fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
     const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
-    const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
     /// A constrained fit assembles its truncated covariance as a sum of Grams
     /// (`ConstrainedPosteriorCorrection::truncated_covariance_psd`, #2705 group
     /// A), which holds three `p × p` blocks live at once: the Cholesky factor of
@@ -463,6 +468,77 @@ pub(crate) fn apply_marginal_constraint_truncation(
         }
     }
     Ok(Ok(()))
+}
+
+/// Reserve the first-order smoothing correction's workspace on a fit whose
+/// inference stayed factorized (#3283).
+///
+/// The correction is assembled exactly as on the dense branch, whose bundle
+/// charges this owner inside its atomic peak; only its result differs, the
+/// `p × r` factor instead of the `p × p` Gram. A refusal is the typed absence
+/// [`crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused`].
+fn reserve_smoothing_correction_workspace(
+    p: usize,
+) -> Result<gam_runtime::resource::MemoryReservation, String> {
+    gam_runtime::resource::MemoryGovernor::global()
+        .try_reserve_dense_f64_copies(
+            p,
+            p,
+            FIRST_ORDER_SMOOTHING_WORKSPACES,
+            "factorized-branch first-order smoothing correction workspace",
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// The truncation of the ρ-marginal `Vp = Vb + B·Bᵀ` to the fit's feasible set
+/// on the factorized branch (#3283), where neither covariance is formed.
+///
+/// It is [`apply_marginal_constraint_truncation`]'s construction: `Vp`'s own
+/// lift and orthant moments at `W_p = A·Vp·Aᵀ`, built from the only block the
+/// decomposition reads, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, with
+/// `conditional_times_constraints = Vb·Aᵀ` solved through the Hessian factor.
+/// `Ok(Ok(None))` means no retained face moves the answer; a MOMENT failure is
+/// `Ok(Err(reason))`, which the caller publishes as the typed absence, and a
+/// STRUCTURAL mismatch is fatal, both exactly as on the dense branch. A declined
+/// geometry never truncated the conditional law, and the caller does not call
+/// this for one.
+fn factorized_marginal_constraint_truncation(
+    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
+    conditional_times_constraints: &Array2<f64>,
+    factor: &Array2<f64>,
+) -> Result<Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>, EstimationError>
+{
+    let constraints = &geometry.constraints;
+    let p = factor.nrows();
+    if constraints.a.ncols() != p
+        || conditional_times_constraints.dim() != (p, constraints.a.nrows())
+    {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "constrained posterior geometry has {}x{} constraints against a {p}-row smoothing \
+             correction factor and a {:?} conditional normal block",
+            constraints.a.nrows(),
+            constraints.a.ncols(),
+            conditional_times_constraints.dim(),
+        )));
+    }
+    let center = match geometry.unconstrained_center() {
+        Ok(center) if center.len() == p => center,
+        Ok(center) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "constrained posterior geometry carries a length-{} centre against a {p}-row \
+                 smoothing correction factor",
+                center.len(),
+            )));
+        }
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let marginal_times_constraints =
+        conditional_times_constraints + &factor.dot(&factor.t().dot(&constraints.a.t()));
+    Ok(crate::constrained_posterior::constrained_posterior_correction(
+        marginal_times_constraints.view(),
+        center,
+        constraints,
+    ))
 }
 
 /// Reserve the square matrices that remain live even when inference stays
@@ -2244,7 +2320,7 @@ where
     // Report the outer iteration count that was MEASURED, including a genuine
     // zero. A seed that is a prior fit's terminal certificate and is still
     // stationary here is accepted without iterating
-    // (`certified_resume_is_already_stationary`), so zero is a reachable,
+    // (`claim_prior_terminal_certificate`), so zero is a reachable,
     // meaningful outcome; flooring it to one made the reported count a claim no
     // measurement supports, and every consumer asking "did a fit happen" then
     // read a fabricated pass (#2622).
@@ -2363,6 +2439,10 @@ where
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
     let mut factorized_standard_errors = None;
+    // #3283: the factorized branch's smoothing correction, as its square-root
+    // factor, and the corrected standard errors solved beside the conditional
+    // ones.
+    let mut smoothing_correction_factorized = None;
     let mut beta_covariance_corrected = None;
     // #2705 group A: carried from where the constrained-posterior correction is
     // APPLIED to where the corrected covariance is READ, so the refusal below
@@ -3358,11 +3438,33 @@ where
         }
 
         // Smoothing-parameter correction `J·V_ρ·Jᵀ` (Wood, Pya & Säfken 2016,
-        // mgcv's Vc1), analytic for any number of smoothing parameters. The
-        // dense branch forms the complete p×p matrix. On governor refusal the
-        // factorized branch computes only diag(J V_rho J') from cached p×k mode
-        // responses instead, because the full product is p×p.
-        if beta_covariance_unscaled.is_some() {
+        // mgcv's Vc1), analytic for any number of smoothing parameters, on BOTH
+        // inference branches. It is assembled as its square-root factor `B`
+        // (`p × r`, `C = B·Bᵀ`). The dense branch forms `C` for `Vp = Vb + C`.
+        // The factorized branch keeps `B` and solves the corrected standard
+        // errors beside the conditional ones below, because a `p × p` matrix is
+        // what its governor refused (#3283); it charges the correction's
+        // workspace here, where the dense bundle already holds it.
+        let smoothing_workspace = if beta_covariance_unscaled.is_some() {
+            Ok(None)
+        } else {
+            reserve_smoothing_correction_workspace(qs.nrows()).map(Some)
+        };
+        let mut smoothing_correction_factor: Option<Array2<f64>> = None;
+        if let Err(detail) = smoothing_workspace.as_ref() {
+            if !final_rho.is_empty() {
+                log::debug!(
+                    "[SMOOTHING-CORRECTION] factorized branch could not reserve the correction's \
+                     workspace ({detail}); publishing the typed absence"
+                );
+                smoothing_correction_absence = Some(
+                    crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused {
+                        detail: detail.clone(),
+                    },
+                );
+            }
+        }
+        if let Ok(smoothing_workspace_reservation) = smoothing_workspace {
             let no_outer_gradient = Array1::<f64>::zeros(0);
             // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
             //
@@ -3530,12 +3632,22 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    (smoothing_correction, smoothing_correction_method) =
-                        outcome.into_correction_with_method();
-                    smoothing_correction_first_order = smoothing_correction.clone();
-                    smoothing_correction_method_first_order = smoothing_correction_method;
+                    let (factor, method) = outcome.into_correction_with_method();
+                    smoothing_correction_method = method;
+                    if beta_covariance_unscaled.is_some() {
+                        smoothing_correction = factor
+                            .as_ref()
+                            .map(crate::estimate::smoothing_correction::smoothing_correction_gram);
+                        smoothing_correction_first_order = smoothing_correction.clone();
+                        smoothing_correction_method_first_order = smoothing_correction_method;
+                    } else {
+                        smoothing_correction_factor = factor;
+                    }
                 }
             }
+            // The correction's assembly transients are gone; its `p × r` factor
+            // is all that stays live on the factorized branch.
+            drop(smoothing_workspace_reservation);
         }
 
         // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML
@@ -3640,12 +3752,9 @@ where
                     ))
                 })?
                 .flatten();
-            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+            let inverse_diagonal = crate::estimate::penalty::factorized_published_inverse_diagonal(
                 &conditioning,
                 qs,
-                cov_scale,
-                correction,
-                zero_covariance_boundary,
                 se_chunk_cols,
                 |rhs, rows| {
                     factor_t.certified_solve(
@@ -3657,7 +3766,71 @@ where
                         ),
                     )
                 },
+            )?;
+            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+                &conditioning,
+                &inverse_diagonal,
+                cov_scale,
+                None,
+                correction,
+                zero_covariance_boundary,
             )?);
+            // #3283: the corrected standard errors of `Vp = Vb + B·Bᵀ` from the
+            // same solved diagonal. A constrained fit truncates `Vp` at its own
+            // lift, as the dense branch does, from `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`:
+            // `m` solves against the factor instead of a `p × p` product.
+            if let Some(factor) = smoothing_correction_factor.take() {
+                let truncation = match constrained_posterior
+                    .as_ref()
+                    .filter(|geometry| geometry.decline().is_none())
+                {
+                    Some(geometry) => {
+                        let constraints_transpose = geometry.constraints.a.t().to_owned();
+                        let solved = factor_t.certified_solve(
+                            &pirls_res.stabilizedhessian_transformed,
+                            &qs.t().dot(&constraints_transpose),
+                            "smoothing-corrected constrained posterior normal geometry",
+                        )?;
+                        let conditional_times_constraints = qs.dot(&solved) * cov_scale;
+                        factorized_marginal_constraint_truncation(
+                            geometry,
+                            &conditional_times_constraints,
+                            &factor,
+                        )?
+                    }
+                    None => Ok(None),
+                };
+                match truncation {
+                    Ok(marginal_correction) => {
+                        let standard_errors = crate::estimate::penalty::factorized_standard_errors(
+                            &conditioning,
+                            &inverse_diagonal,
+                            cov_scale,
+                            Some(&factor),
+                            marginal_correction.as_ref(),
+                            false,
+                        )?;
+                        smoothing_correction_factorized = Some(
+                            crate::model_types::FactorizedSmoothingCorrection {
+                                factor,
+                                standard_errors,
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        log::debug!(
+                            "[CONSTRAINED-Vp] the factorized smoothing-corrected law could not be \
+                             truncated to the feasible set ({reason}); publishing the typed absence"
+                        );
+                        smoothing_correction_absence = Some(
+                            crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
+                                detail: reason,
+                            },
+                        );
+                        smoothing_correction_method = None;
+                    }
+                }
+            }
         } else {
             // `edf_factor` is set on every `compute_inference` fit, so one of
             // the two branches above runs. Reaching here would publish an
@@ -3833,6 +4006,7 @@ where
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
         factorized_standard_errors,
+        smoothing_correction_factorized,
         beta_covariance_frequentist,
         coefficient_influence,
         weighted_gram,

@@ -6730,7 +6730,7 @@ fn fit_dataset_impl(
     // `warm_start_from` (gam#3002): the saved model's certified outer point,
     // resolved against exactly the data and request this fit runs on.
     if let Some(model_bytes) = warm_start_model {
-        let prior = load_model_impl(model_bytes)?;
+        let prior = load_model_impl(model_bytes).map_err(String::from)?;
         fit_config.warm_start = Some(gam::families::fit_orchestration::resolve_warm_start(
             prior.payload(),
             &formula,
@@ -6756,9 +6756,17 @@ fn fit_dataset_impl(
     })
 }
 
-fn load_model_impl(model_bytes: &[u8]) -> Result<FittedModel, String> {
-    let model: FittedModel = serde_json::from_slice(model_bytes)
-        .map_err(|err| format!("failed to parse model json: {err}"))?;
+/// A saved model's bytes, parsed and validated, or the typed refusal that says
+/// why they are not a model this binary can read (gam#3008). Callers raise it
+/// through `saved_model_error_to_pyerr`, as the class of its category.
+fn load_model_impl(
+    model_bytes: &[u8],
+) -> Result<FittedModel, gam::inference::model::FittedModelError> {
+    let model: FittedModel = serde_json::from_slice(model_bytes).map_err(|err| {
+        gam::inference::model::FittedModelError::PayloadCorrupt {
+            reason: format!("failed to parse model json: {err}"),
+        }
+    })?;
     model.validate_for_persistence()?;
     model.validate_numeric_finiteness()?;
     Ok(model)

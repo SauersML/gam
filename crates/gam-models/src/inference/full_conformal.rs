@@ -1383,8 +1383,10 @@ impl<'a> GlmHomotopyFullConformal<'a> {
 ///
 /// Older payloads persisted the training `x` and `y` beside `s_lambda` under
 /// the same field; deserialization reads `s_lambda` and ignores them. Payloads
-/// written before `penalty_count` existed read it as `None`, and their rows are
-/// refused with [`ConformalRefusal::UnknownPenaltyStructure`].
+/// written before `penalty_count` existed (v32 and older) read it as `None`, and
+/// their rows are refused with [`ConformalRefusal::UnknownPenaltyStructure`]. A
+/// v32 binary refuses a payload carrying the count by version (v33), so no binary
+/// publishes a frozen-λ set for a fit whose smoothing selection it cannot see.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExactFullConformalPenalty {
     /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).

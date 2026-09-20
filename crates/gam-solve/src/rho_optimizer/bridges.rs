@@ -69,8 +69,8 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// pathology: a trivial n≈30..120 Gaussian fit emitting ~850k cost-only
     /// evaluations until a wall-clock budget kills it. This guard adds the
     /// missing mgcv-style score-change stop: it watches the accepted-iterate
-    /// REML objective and, once it stops improving by more than a relative
-    /// tolerance over a window of consecutive accepted outer steps, publishes
+    /// REML objective and, once an accepted step buys no decrease past the two
+    /// values' evaluation resolutions while its model predicted none (#3018), publishes
     /// the best-so-far iterate and signals BFGS to stop. The runner then
     /// classifies the run as *converged at the flat-valley floor* rather than
     /// non-converged — the remaining gradient lies along weakly-identified ρ
@@ -90,23 +90,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// cycling). `None` ⇒ unconstrained, no projection (raw norm). Cheap to hold
     /// (the outer dimension is the smoothing-param count).
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// Count of consecutive `eval_cost` calls that returned `Recoverable`
-    /// without a single success in between. When every trial step in every
-    /// search direction is infeasible (the inner solve refuses to converge at
-    /// any neighboring ρ), BFGS would otherwise spend its full
-    /// `max_iterations × line_search_budget` budget doing inner solves that
-    /// all fail — the non-termination reported in issue #NaN-outer-loop.
-    ///
-    /// Once this counter exceeds [`PROBE_REFUSAL_FATAL_THRESHOLD`] and no
-    /// gradient evaluation has ever been accepted on this seed (`first_order_evals ==
-    /// 0`), the bridge escalates to `Fatal` so BFGS exits immediately via
-    /// `ObjectiveFailed`. The seed loop treats that outcome as a rejected seed
-    /// and moves on, keeping the cascade bounded.
-    ///
-    /// Reset to 0 on any successful cost evaluation so normal line-search
-    /// noise (a few recoverable probes followed by an accepted step) never
-    /// trips this guard.
-    pub(crate) consecutive_probe_refusals: usize,
     /// Accepted-outer-step signal published by [`OuterAcceptObserver`] (#2613).
     ///
     /// The cost-stall guard above counts *accepted outer steps*. Before #2613
@@ -118,8 +101,8 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// curvature condition `|g(α)ᵀd| ≤ c₂|g(0)ᵀd|` needs it. A zoom that
     /// bisects toward a point therefore feeds the guard a run of iterates whose
     /// costs differ negligibly — of course they do, they are converging — and
-    /// the guard reads its own window of "6 consecutive accepted steps with no
-    /// improvement" as a flat valley and halts the solver *inside* one
+    /// the guard read its window of "6 consecutive accepted steps with no
+    /// improvement" as a flat valley and halted the solver *inside* one
     /// iteration, before `opt`'s own rescue ladder (global-best salvage, then
     /// trust-region dogleg) gets a turn.
     ///
@@ -136,10 +119,13 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
     /// First-order evaluations made since the last accepted step, oldest first.
     /// Drained by [`Self::drain_accepted_steps`].
     pub(crate) pending_first_order: Vec<PendingOuterEval>,
-    /// `(ρ, cost)` of the last iterate known to be accepted — the seed, then
-    /// each accepted step. The reference point for reconciling
-    /// [`AcceptedOuterStep`] against [`Self::pending_first_order`].
-    pub(crate) incumbent: Option<(Array1<f64>, f64)>,
+    /// The last iterate known to be accepted — the seed, then each accepted
+    /// step. The reference point for reconciling [`AcceptedOuterStep`] against
+    /// [`Self::pending_first_order`], and the point a refused trial's linear
+    /// model is taken at (#3018). The seed is installed here from the runner's
+    /// initial sample, so a run whose every probe is refused is judged against
+    /// the seed's own gradient and resolution from its first probe (#3219).
+    pub(crate) incumbent: Option<OuterIncumbent>,
     /// Kept rank of the criterion at this run's start (#2765), read from
     /// [`OuterObjective::criterion_rank`]. A trial whose criterion keeps a different
     /// rank prices a different function, so it is refused as a trial point and the line
@@ -153,40 +139,6 @@ pub(crate) struct OuterFirstOrderBridge<'a> {
 pub(crate) const VALUE_PROBE_CACHE_CAPACITY: usize = 256;
 
 pub(crate) const VALUE_PROBE_REJECT_COST_FLOOR: f64 = 1.0e11;
-
-/// Number of consecutive recoverable `eval_cost` failures (every line-search
-/// probe infeasible) before the bridge escalates to `Fatal` and forces an
-/// immediate BFGS exit. This guard fires only before the first accepted
-/// gradient step (`first_order_evals == 0`): once BFGS has accepted at least one
-/// outer iteration the current ρ is feasible and isolated probe refusals are
-/// normal line-search noise, not a stuck loop.
-///
-/// The threshold covers one full StrongWolfe attempt (up to 20 probes)
-/// plus one backtracking fallback (up to 50 probes) with a small margin,
-/// so a SINGLE failed direction does not fire the guard. Two consecutive
-/// direction failures (120 probes) always does — once both Wolfe and
-/// backtracking exhausted two complete directions with no success, the
-/// neighborhood is globally infeasible and further BFGS iterations are
-/// pure waste.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD: usize = 150;
-
-/// Tighter probe-refusal threshold used when the bridge has never seen a
-/// `eval_grad` call of its own — i.e. the seed (cost, gradient) was supplied
-/// via `with_initial_sample` so `last_value_grad_rho` is `None` and every
-/// `trial_rho_distance` prints as NaN.  In this case the seed gradient is
-/// already confirmed feasible externally; if even the first line-search
-/// direction exhausts its Wolfe probes without success (≈ 20 probes), the
-/// neighborhood IS globally infeasible and further iterations just repeat
-/// the same expensive inner solve 150 more times.  One generous Wolfe
-/// budget (25 probes) is enough to confirm the failure; 13 seeds ×
-/// 150 probes × ~3 s each would otherwise cause an observed ~97 min hang.
-pub(crate) const PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED: usize = 25;
-
-/// Sentinel prefix embedded in the fatal [`ObjectiveEvalError`] message the
-/// bridge returns when [`PROBE_REFUSAL_FATAL_THRESHOLD`] fires. The seed-loop
-/// runner matches this prefix and routes the failed seed to
-/// typed [`SeedRejection`] accounting rather than propagating a fatal error.
-pub(crate) const PROBE_REFUSAL_FATAL_SENTINEL: &str = "OUTER_PROBE_REFUSAL_FATAL";
 
 /// Sentinel embedded in the fatal [`ObjectiveEvalError`] message the bridge
 /// returns when [`CostStallGuard`] halts BFGS on a cost stall. `opt::Bfgs`
@@ -238,10 +190,10 @@ pub(crate) const ARC_INFEASIBLE_STALL_SENTINEL: &str = "OUTER_ARC_INFEASIBLE_STA
 /// curvature (#1082, #2612).
 pub(crate) const ARC_CURVATURE_STATIONARY_SENTINEL: &str = "OUTER_ARC_CURVATURE_STATIONARY";
 
-/// Sentinel returned when a filled cost-stall window on the dense-ARC route
-/// carries no progress since the previous one, so the search stops at its
-/// incumbent instead of spending another window it has no evidence can buy
-/// anything (#2817). See [`CostStallGuard::license_continuation`].
+/// Sentinel returned when a cost stall on the dense-ARC route carries no
+/// progress since the previous one, so the search stops at its incumbent
+/// instead of spending another stall it has no evidence can buy anything
+/// (#2817). See [`CostStallGuard::license_continuation`].
 ///
 /// The runner maps this sentinel to a NON-converged checkpoint: the point is
 /// the trajectory's best feasible iterate, and whether it is stationary is the
@@ -256,21 +208,21 @@ pub(crate) const ARC_UNPROGRESSING_STALL_SENTINEL: &str = "OUTER_ARC_UNPROGRESSI
 /// [`CostStallGuard::observe`].
 #[derive(Debug)]
 pub(crate) enum CostStallVerdict {
-    /// The objective is still improving (or the no-improvement window has not
-    /// yet filled). Keep descending.
+    /// The last accepted step resolvably decreased the objective, or its model
+    /// still promised a resolvable decrease (#3018). Keep descending.
     Continue,
-    /// The objective has stopped improving over the window AND the projected
+    /// The last accepted step stalled (#3018) AND the projected
     /// gradient norm at the best iterate clears the outer gradient tolerance:
     /// a genuine stationary optimum on a (legitimately) flat REML surface.
     Converged,
-    /// The objective has stopped improving over the window but the projected
+    /// The last accepted step stalled (#3018) but the projected
     /// gradient norm at the best iterate is still above the outer gradient
     /// tolerance: a weakly-identified flat-valley FLOOR with residual
     /// non-stationarity. Halting here is correct (no further cost progress is
     /// available), but the iterate is NOT a stationary optimum and must be
     /// reported `converged = false`.
     FlatValleyStall { residual_grad_norm: f64 },
-    /// The objective has stopped improving over the window but the projected
+    /// The last accepted step stalled (#3018) but the projected
     /// gradient at the best iterate is above the certificate's band at the
     /// incumbent's value (`> escape_threshold`, the value actually compared;
     /// #2817). A genuine flat-valley floor is, by
@@ -281,7 +233,7 @@ pub(crate) enum CostStallVerdict {
     /// this ρ, so the cached cost and the analytic gradient disagree and no
     /// line-search direction can make cost progress even though the surface is
     /// steep). Halting here would ship a near-unpenalized overfit (#1426). The
-    /// guard instead resets the no-improvement window so the optimizer keeps
+    /// guard instead grants an escape so the optimizer keeps
     /// descending (the inner solve runs to tighter tolerance at the next
     /// iterate, restoring a trustworthy gradient), for a bounded number of
     /// escapes before falling back to a `FlatValleyStall` halt so a genuinely
@@ -294,13 +246,67 @@ pub(crate) enum CostStallVerdict {
     },
 }
 
-/// Number of consecutive accepted outer iterates with no resolvable
-/// objective improvement required before the cost-stall guard declares
-/// convergence. Matches the spirit of `opt`'s own `StallPolicy { window: 3 }`
-/// but, crucially, is gated on the cost alone (not on gradient smallness),
-/// which is the condition `opt` never checks in isolation.
+/// The window of the per-atom fixed-point walk's progress certificate
+/// ([`FixedPointProgress`]) and of `opt`'s own BFGS cost stall on the GPU walk.
+/// A fixed-point map has no model decrease, so the accepted-step stall rule
+/// (#3018) does not apply to it as it stands (#3176).
 pub(crate) const COST_STALL_WINDOW: usize = 6;
-pub(crate) const ARC_COST_STALL_WINDOW: usize = 3;
+
+/// One sample the cost-stall guard judges (#3018).
+///
+/// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`:
+/// the objective band the evaluation's own evidence forms, or the criterion's
+/// resolution `τ` where it publishes none ([`sample_resolution`]).
+/// `grad_norm` is the bound-projected gradient norm. `trusted` is the inner
+/// solve's convergence flag for this sample (#1426). `curvature_psd` is its
+/// reduced-Hessian verdict, `Some(false)` for a certified strict saddle.
+/// Whether `value`, computed to within `resolution`, is resolvably below
+/// `reference`, computed to within `reference_resolution` (#3018).
+///
+/// Two computed values imply the exact ones are ordered exactly when they are
+/// further apart than the sum of their resolutions: that is sufficient, since
+/// `V_r − V_x ≥ V̂_r − V̂_x − R_r − R_x`, and necessary, since otherwise
+/// `V_r = V̂_r − R_r` and `V_x = V̂_x + R_x` fit the data with `V_r ≤ V_x`. This is
+/// the one test of resolved descent: it decides whether a step bought progress,
+/// whether the #2817 licence saw descent, and whether a trial refused for its rank
+/// holds descent the seed loop can cross to (#2939). A value that is not a number
+/// is never below anything.
+pub(crate) fn resolvably_below(
+    reference: f64,
+    reference_resolution: f64,
+    value: f64,
+    resolution: f64,
+) -> bool {
+    reference - value > reference_resolution + resolution
+}
+
+/// The resolution of a criterion value an evaluation computed (#3018): a bound
+/// `R` on its evaluation error, `|V̂ − V| ≤ R`. It is the objective band the
+/// evaluation's own evidence forms
+/// ([`outer_objective_band`](super::decrement_bands::outer_objective_band)), and
+/// the criterion's resolution `tau` where it forms none
+/// ([`super::run::outer_criterion_resolution`]).
+pub(crate) fn sample_resolution(
+    config: &OuterConfig,
+    tau: f64,
+    cost: f64,
+    evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
+) -> f64 {
+    super::decrement_bands::outer_objective_band(config, cost, evidence)
+        .ok()
+        .map(|band| band.total())
+        .filter(|band| band.is_finite())
+        .unwrap_or(tau)
+}
+
+pub(crate) struct StallSample<'a> {
+    pub(crate) point: &'a Array1<f64>,
+    pub(crate) value: f64,
+    pub(crate) resolution: f64,
+    pub(crate) grad_norm: f64,
+    pub(crate) trusted: bool,
+    pub(crate) curvature_psd: Option<bool>,
+}
 
 /// The search state a stall escape was granted from, compared by raw bits: the
 /// incumbent, and the trial points the window that filled had evaluated.
@@ -384,16 +390,6 @@ pub(crate) struct CostStallExit {
 /// objective has effectively stopped decreasing. See the `cost_stall` field
 /// doc on [`OuterFirstOrderBridge`] for the full rationale (#1089).
 pub(crate) struct CostStallGuard {
-    /// The criterion's absolute resolution `τ`
-    /// ([`super::run::outer_criterion_resolution`]), used only where the
-    /// evaluations carry no objective band: an accepted step counts as "no
-    /// improvement" when `(best - cost) <= τ`. Where both the incumbent and the
-    /// trial carry a band, the resolution is their sum instead
-    /// ([`Self::resolution_against_incumbent`], #3018).
-    resolution: f64,
-    /// Consecutive accepted-step window with no improvement before declaring
-    /// convergence.
-    window: usize,
     /// The run's own configuration, so every stationarity judgement the guard
     /// makes is the certificate's band at the value it judges
     /// ([`Self::stationarity_band`]), and every coordinate it names is rendered
@@ -402,12 +398,18 @@ pub(crate) struct CostStallGuard {
     /// `1e-3·(1 + |V|)` term and a probe-noise widening, none derived; a stall
     /// claimed points the certificate then refused.
     claim_config: OuterConfig,
+    /// The criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]):
+    /// the resolution of a value whose evaluation forms no objective band
+    /// ([`Self::value_resolution`], #3018).
+    resolution: f64,
     /// Set when a replay cut proved that reopening the window replays a
     /// deterministic procedure from a bit-identical incumbent. From then on the
     /// run stops at its incumbent: no continuation licence overrides a proven
     /// replay (#2817, parity1561's curved-acceleration spin).
     replay_proven: bool,
     best_value: f64,
+    /// The evaluation resolution of `best_value` ([`StallSample::resolution`]).
+    best_resolution: f64,
     best_rho: Option<Array1<f64>>,
     best_grad_norm: f64,
     /// Reduced-Hessian verdict synchronized with `best_rho`. `Some(false)`
@@ -420,34 +422,21 @@ pub(crate) struct CostStallGuard {
     /// Facts staged by the bridge for the sample it is about to observe; adopted
     /// only if that sample becomes the incumbent.
     staged_curvature: Option<IncumbentCurvature>,
-    /// `band_f(V)` at the incumbent's value: the bound on how far the computed
-    /// criterion can sit from the exact one there, from the evaluation's own
-    /// certificate evidence ([`super::decrement_bands::outer_objective_band`]).
-    /// `None` when that evaluation carried no evidence the band is formed from.
-    best_band: Option<f64>,
-    /// `band_f` of the sample the bridge is about to observe
-    /// ([`Self::stage_objective_band`]); adopted only if that sample becomes
-    /// the incumbent.
-    staged_band: Option<f64>,
-    /// Set when a filled window at a strict-saddle incumbent grants an escape.
-    /// The second-order bridge takes it and adjudicates the incumbent's negative
+    /// Set when a stall at a strict-saddle incumbent grants an escape. The
+    /// second-order bridge takes it and adjudicates the incumbent's negative
     /// curvature against the criterion before the escape is spent (#1082).
     strict_saddle_refusal: bool,
-    no_improve_streak: usize,
-    /// Consecutive infeasible (non-finite cost) outer trials since the last
-    /// finite observation. On a near-separable multinomial fit ARC repeatedly
-    /// probes the unbounded λ→0 separating region where the inner softmax solve
-    /// does not converge and returns `OuterEval::infeasible` (cost=∞). Those
-    /// trials never produce a finite descent, so the normal `no_improve_streak`
-    /// (which only counts finite trials) can never fill its window — the loop
-    /// would otherwise grind to `max_iter`. A run of `window` consecutive
-    /// infeasible trials, once a finite best is in hand, is the same "no further
-    /// real progress" signal and trips the same halt at the best feasible
-    /// iterate (#1082/#1237).
+    /// Consecutive refused outer trials (non-finite cost, a typed refusal, or
+    /// off the run's kept rank) since the last finite observation. On a
+    /// near-separable multinomial fit ARC repeatedly probes the unbounded λ→0
+    /// separating region where the inner softmax solve does not converge, and
+    /// those trials never reach [`Self::observe`]. Each is judged by its step's
+    /// model decrease ([`Self::observe_infeasible`], #3018); the count is
+    /// evidence a stop reports, not a rule (#1082/#1237).
     infeasible_streak: usize,
     /// How many of the trials in the current [`Self::infeasible_streak`] were refused for
     /// keeping a different kept rank than the run's start (#2765), rather than failing to
-    /// evaluate. When it equals the streak, the whole window left the run's rank (#2939).
+    /// evaluate. When it equals the streak, the whole run left the run's rank (#2939).
     off_stratum_streak: usize,
     accepted_iters: usize,
     /// Number of consecutive fruitless [`CostStallVerdict::StuckKeepDescending`]
@@ -459,9 +448,8 @@ pub(crate) struct CostStallGuard {
     /// which was raised to whichever fixture was widest at the time. What
     /// actually bounds the escapes is [`Self::incumbent_at_last_escape`] (an
     /// escape from a bit-identical incumbent provably replays the previous one)
-    /// together with the CONFIGURED outer iteration budget: each escape costs a
-    /// full `window` of accepted or infeasible trials, so a run admits at most
-    /// `max_iter / window` of them however this counter moves.
+    /// together with the #2817 progress licence, which stops a stall that bought
+    /// nothing since the previous one.
     ///
     /// `pub(crate)` so the escape tests can assert HOW MANY escapes a
     /// trajectory was granted. Both of them previously asserted only that a
@@ -497,15 +485,14 @@ pub(crate) struct CostStallGuard {
     /// half of the replay identity the incumbent cannot carry (see
     /// [`EscapeIncumbent`]).
     window_trials: Vec<Vec<u64>>,
-    /// `(best value, best projected-gradient norm)` when the previous filled
-    /// window was licensed to continue a non-stationary stall on the ARC route;
-    /// `None` before the first. What the next licence is judged against (see
-    /// [`Self::license_continuation`]).
-    continuation_incumbent: Option<(f64, f64, Option<f64>)>,
-    /// #2241 — the most recent trusted accepted iterates `(ρ_i, f_i)` (finite
-    /// cost, inner solve converged), newest last, capped at `window + 1`
-    /// entries. This is the raw evidence for the published probe scale: during
-    /// a stall the consecutive value differences measure the criterion's own
+    /// `(best value, best projected-gradient norm, best resolution)` when the
+    /// previous stall was licensed to continue; `None` before the first. What the
+    /// next licence is judged against (see [`Self::license_continuation`]).
+    continuation_incumbent: Option<(f64, f64, f64)>,
+    /// #2241 — the trusted accepted iterates `(ρ_i, f_i)` (finite cost, inner
+    /// solve converged) since the last resolved progress, newest last. This is
+    /// the raw evidence for the published probe scale: during a stall the
+    /// consecutive value differences measure the criterion's own
     /// evaluation-noise scale, and the consecutive ρ distances measure the
     /// radius the search actually probed. It reports; it certifies nothing.
     recent: std::collections::VecDeque<(Array1<f64>, f64)>,
@@ -517,25 +504,21 @@ pub(crate) struct CostStallGuard {
 impl CostStallGuard {
     pub(crate) fn new(
         resolution: f64,
-        window: usize,
         claim_config: &OuterConfig,
         exit: Arc<Mutex<Option<CostStallExit>>>,
     ) -> Self {
         Self {
-            resolution,
-            window,
             claim_config: claim_config.clone(),
+            resolution,
             replay_proven: false,
             best_value: f64::INFINITY,
+            best_resolution: 0.0,
             best_rho: None,
             best_grad_norm: f64::INFINITY,
             best_hessian_psd: None,
             best_curvature: None,
             staged_curvature: None,
-            best_band: None,
-            staged_band: None,
             strict_saddle_refusal: false,
-            no_improve_streak: 0,
             infeasible_streak: 0,
             off_stratum_streak: 0,
             accepted_iters: 0,
@@ -593,7 +576,6 @@ impl CostStallGuard {
         self.stuck_escapes = self.stuck_escapes.saturating_add(1);
         self.incumbent_at_last_escape = Some(incumbent);
         self.window_trials.clear();
-        self.no_improve_streak = 0;
         true
     }
 
@@ -608,17 +590,16 @@ impl CostStallGuard {
         self.window_trials.push(point_bits(rho));
     }
 
-    /// Whether a filled window at a non-stationary stall may be followed by
+    /// Whether a stall at a non-stationary incumbent may be followed by
     /// another one on the ARC route (#2817).
     ///
     /// This is the progress certificate that ends a stalled search instead of
-    /// an iteration count. A window is licensed when, since the previous
-    /// licensed window, the search bought either
+    /// an iteration count. A stall is licensed when, since the previous
+    /// licensed stall, the search bought either
     ///
-    /// * resolved descent: the incumbent improved by more than the criterion's
-    ///   resolution between the two incumbents
-    ///   ([`Self::resolution_between`]), the same test that decides whether one
-    ///   step counts as an improvement; or
+    /// * resolved descent: the incumbent improved by more than the sum of the two
+    ///   incumbents' resolutions, the same test that decides whether one step buys
+    ///   resolved progress ([`Self::observe`]); or
     /// * stationarity: the incumbent's projected gradient contracted;
     ///
     /// or when descent is still available at the incumbent itself: its reduced
@@ -661,21 +642,25 @@ impl CostStallGuard {
         }
         let licensed = match self.continuation_incumbent {
             None => true,
-            Some((previous_value, previous_grad_norm, previous_band)) => {
-                let resolution = self.resolution_between(previous_band, self.best_band);
-                previous_value - self.best_value > resolution
+            Some((previous_value, previous_grad_norm, previous_resolution)) => {
+                resolvably_below(
+                    previous_value,
+                    previous_resolution,
+                    self.best_value,
+                    self.best_resolution,
+                )
                     || self.best_grad_norm < previous_grad_norm
                     || self.best_hessian_psd == Some(false)
             }
         };
         if licensed {
             self.continuation_incumbent =
-                Some((self.best_value, self.best_grad_norm, self.best_band));
+                Some((self.best_value, self.best_grad_norm, self.best_resolution));
         }
         licensed
     }
 
-    /// The incumbent to stop at when a filled window is not licensed to
+    /// The incumbent to stop at when a stall is not licensed to
     /// continue (see [`Self::license_continuation`]); `None` while continuing
     /// is licensed. Every route that installs the guard stops through here, so
     /// what "bought nothing" means is decided in one place (#2817).
@@ -685,7 +670,7 @@ impl CostStallGuard {
         }
         let rho = self.best_rho.clone()?;
         log::debug!(
-            "[OUTER] stopping at an unprogressing stall: the window filled again at \
+            "[OUTER] stopping at an unprogressing stall: the search stalled again at \
              value={:.6e} |Pg|={:.3e} after {} accepted outer iteration(s), with no resolved \
              descent and no contraction of the projected gradient since the last one; the \
              terminal certificate judges the incumbent (#2817).",
@@ -704,14 +689,11 @@ impl CostStallGuard {
         })
     }
 
-    /// Record one trusted accepted iterate into the #2241 noise-evidence
-    /// buffer, keeping only the latest `window + 1` (⇒ `window` consecutive
-    /// differences).
-    fn record_recent(&mut self, rho: &Array1<f64>, value: f64) {
+    /// Restart the #2241 noise-evidence buffer at `rho`: the samples since the
+    /// last resolved progress begin here.
+    fn restart_recent(&mut self, rho: &Array1<f64>, value: f64) {
+        self.recent.clear();
         self.recent.push_back((rho.clone(), value));
-        while self.recent.len() > self.window + 1 {
-            self.recent.pop_front();
-        }
     }
 
     /// The stall window's evidence about the criterion's scatter, reported with a
@@ -795,49 +777,64 @@ impl CostStallGuard {
         self.staged_curvature = curvature;
     }
 
-    /// `band_f(cost)` formed from the certificate evidence the evaluation of
-    /// `cost` published (#3018); `None` when that evidence does not form it.
-    pub(crate) fn objective_band(
+    /// The configuration the guard judges by: the band it claims against, and
+    /// the resolution a bridge charges a value that publishes no evidence.
+    pub(crate) fn claim_config(&self) -> &OuterConfig {
+        &self.claim_config
+    }
+
+    /// The resolution of `cost` as its evaluation computed it (#3018): the
+    /// objective band its `evidence` forms, or the guard's `τ` where it forms none
+    /// ([`sample_resolution`]).
+    pub(crate) fn value_resolution(
         &self,
         cost: f64,
         evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
-    ) -> Option<f64> {
-        super::decrement_bands::outer_objective_band(&self.claim_config, cost, evidence)
-            .ok()
-            .map(|band| band.total())
-            .filter(|band| band.is_finite())
+    ) -> f64 {
+        sample_resolution(&self.claim_config, self.resolution, cost, evidence)
     }
 
-    /// Stage `band_f` of the sample about to be observed ([`Self::objective_band`]).
-    /// A sample staged with `None` is judged by [`Self::resolution`].
-    pub(crate) fn stage_objective_band(&mut self, band: Option<f64>) {
-        self.staged_band = band;
+    pub(crate) fn best_value(&self) -> f64 {
+        self.best_value
     }
 
-    /// The smallest decrease between two criterion values the evaluations can
-    /// resolve (#3018).
-    ///
-    /// Each computed value sits within its own `band_f` of the exact criterion,
-    /// so the exact values are ordered as the computed ones are exactly when the
-    /// computed values are further apart than `band_f(V_a) + band_f(V_b)`. A
-    /// decrease inside that sum is one the criterion does not represent: it may
-    /// be rounding in either evaluation. When either value carries no band, the
-    /// criterion's resolution `τ` stands in for it. Infinite while there is no
-    /// finite incumbent.
-    fn resolution_between(&self, band_a: Option<f64>, band_b: Option<f64>) -> f64 {
-        if !self.best_value.is_finite() {
-            return f64::INFINITY;
-        }
-        match (band_a, band_b) {
-            (Some(a), Some(b)) => a + b,
-            _ => self.resolution,
-        }
+    /// The evaluation resolution of [`Self::best_value`] (#3018).
+    pub(crate) fn best_resolution(&self) -> f64 {
+        self.best_resolution
     }
 
-    /// The resolution of a trial carrying `band` against the incumbent
-    /// ([`Self::resolution_between`]). Infinite before the first incumbent.
-    fn resolution_against_incumbent(&self, band: Option<f64>) -> f64 {
-        self.resolution_between(self.best_band, band)
+    pub(crate) fn best_grad_norm(&self) -> f64 {
+        self.best_grad_norm
+    }
+
+    pub(crate) fn stuck_escapes(&self) -> usize {
+        self.stuck_escapes
+    }
+
+    pub(crate) fn infeasible_streak(&self) -> usize {
+        self.infeasible_streak
+    }
+
+    pub(crate) fn off_stratum_streak(&self) -> usize {
+        self.off_stratum_streak
+    }
+
+    pub(crate) fn accepted_iters(&self) -> usize {
+        self.accepted_iters
+    }
+
+    pub(crate) fn best_rho(&self) -> Option<&Array1<f64>> {
+        self.best_rho.as_ref()
+    }
+
+    pub(crate) fn best_curvature(&self) -> Option<&IncumbentCurvature> {
+        self.best_curvature.as_ref()
+    }
+
+    /// Take the flag a strict-saddle stall set when it granted its escape, so
+    /// the second-order bridge adjudicates the curvature once (#1082).
+    pub(crate) fn take_strict_saddle_refusal(&mut self) -> bool {
+        std::mem::take(&mut self.strict_saddle_refusal)
     }
 
     fn best_curvature_note(&self) -> String {
@@ -847,59 +844,80 @@ impl CostStallGuard {
         )
     }
 
-    pub(crate) fn observe_seed(&mut self, rho: &Array1<f64>, value: f64, grad_norm: f64) {
-        self.observe_seed_with_curvature(rho, value, grad_norm, None);
+    /// Fold the seed: `value` at `rho`, computed to within `resolution`.
+    pub(crate) fn observe_seed(
+        &mut self,
+        rho: &Array1<f64>,
+        value: f64,
+        resolution: f64,
+        grad_norm: f64,
+    ) {
+        self.observe_seed_with_curvature(rho, value, resolution, grad_norm, None);
     }
 
     pub(crate) fn observe_second_order_seed(
         &mut self,
         rho: &Array1<f64>,
         value: f64,
+        resolution: f64,
         grad_norm: f64,
         hessian_psd: Option<bool>,
     ) {
-        self.observe_seed_with_curvature(rho, value, grad_norm, hessian_psd);
+        self.observe_seed_with_curvature(rho, value, resolution, grad_norm, hessian_psd);
     }
 
     fn observe_seed_with_curvature(
         &mut self,
         rho: &Array1<f64>,
         value: f64,
+        resolution: f64,
         grad_norm: f64,
         hessian_psd: Option<bool>,
     ) {
         let staged_curvature = self.staged_curvature.take();
-        let staged_band = self.staged_band.take();
         if !value.is_finite() {
             return;
         }
         self.best_value = value;
+        self.best_resolution = resolution;
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
         self.best_hessian_psd = hessian_psd;
         self.best_curvature = staged_curvature;
-        self.best_band = staged_band;
-        self.no_improve_streak = 0;
         self.infeasible_streak = 0;
         self.window_trials.clear();
         self.accepted_iters = self.accepted_iters.saturating_add(1);
-        self.record_recent(rho, value);
+        self.restart_recent(rho, value);
         // Seed the shared exit cell so the budget-exhaustion path always has a
         // feasible best to fall back to, even if no later step improves (#1371).
         self.publish_best_so_far();
     }
 
-    /// Fold one accepted-iterate `(ρ, cost, ‖g‖)` into the guard. Returns a
-    /// [`CostStallVerdict`]: `Continue` while the score is still improving,
-    /// `Converged` when the score has stalled AND the projected gradient norm
-    /// at the best iterate clears the outer gradient tolerance (a genuine
-    /// stationary optimum on a flat REML surface), or `FlatValleyStall` when
-    /// the score has stalled but the residual gradient remains above tolerance
-    /// (a weakly-identified flat valley that is NOT stationary). Either stalled
-    /// verdict publishes the best iterate to the shared cell, tagged with its
-    /// `converged` status.
+    /// Fold one accepted iterate into the guard, reached by a step whose own model
+    /// predicted `predicted_decrease` (#3018): the cubic or quadratic model's for
+    /// ARC and the trust region, the linear model's `−g_bᵀs` for a line search.
     ///
-    /// `inner_converged` is the inner-PIRLS convergence flag for THIS iterate's
+    /// Two computed values imply `V_b > V_j` exactly when `V̂_b − V̂_j` exceeds the
+    /// sum of their resolutions: that is sufficient, since `V_b − V_j ≥ V̂_b − V̂_j −
+    /// R_b − R_j`, and necessary, since otherwise `V_b = V̂_b − R_b` and
+    /// `V_j = V̂_j + R_j` fit the data with `V_b ≤ V_j`. So a step buys resolved
+    /// progress iff its decrease exceeds `R_b + R_j`. A step that buys none is
+    /// **stalled** when its model's predicted decrease is not resolvable either;
+    /// otherwise the model promised a decrease the function did not deliver, which
+    /// the solver acts on (its ratio test or its curvature update), and the step is
+    /// **adapting** and reaches no verdict. One stalled step reaches the verdict:
+    /// its model decrease bounds the solver's Cauchy decrease, so either the
+    /// gradient is at resolution relative to the curvature, or rejected trials
+    /// drove the step length down at this point, and the next step comes from the
+    /// same model at the same scale. The windows of 6 and 3 such steps are gone.
+    ///
+    /// Returns `Continue` while the search makes resolved progress or adapts,
+    /// `Converged` when a stall's incumbent meets the certificate's band,
+    /// `StuckKeepDescending` when a stall above the band is granted an escape, or
+    /// `FlatValleyStall` when it is not. Every stalled verdict publishes the best
+    /// iterate to the shared cell, tagged with its `converged` status.
+    ///
+    /// `sample.trusted` is the inner-PIRLS convergence flag for THIS iterate's
     /// solve (read from the inner-progress feedback AFTER the outer eval ran). It
     /// is the load-bearing #1426 input: at the under-penalized (λ→0) ridge the
     /// inner PIRLS hits its iteration cap, so the cost it reports is a half-fit
@@ -910,150 +928,126 @@ impl CostStallGuard {
     /// uncapped, honest re-evaluation at a well-penalized ρ then carries a
     /// *higher* (correct) cost and can never displace it, so the loop ships the
     /// near-full-basis overfit. A non-converged inner solve is therefore NEVER
-    /// recorded as best and NEVER counted toward a stall: its cost/gradient are
-    /// untrustworthy, so the guard treats it as forced descent (streak reset) and
-    /// keeps the optimizer moving until an honest, converged iterate lands.
+    /// recorded as best and NEVER judged a stall: its cost/gradient are
+    /// untrustworthy, so the guard keeps the optimizer moving until an honest,
+    /// converged iterate lands.
     pub(crate) fn observe(
         &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        inner_converged: bool,
+        sample: StallSample<'_>,
+        predicted_decrease: f64,
     ) -> CostStallVerdict {
-        self.observe_with_curvature(rho, value, grad_norm, inner_converged, None)
-    }
-
-    pub(crate) fn observe_second_order(
-        &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        inner_converged: bool,
-        hessian_psd: Option<bool>,
-    ) -> CostStallVerdict {
-        self.observe_with_curvature(rho, value, grad_norm, inner_converged, hessian_psd)
-    }
-
-    fn observe_with_curvature(
-        &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        inner_converged: bool,
-        hessian_psd: Option<bool>,
-    ) -> CostStallVerdict {
+        let StallSample {
+            point: rho,
+            value,
+            resolution,
+            grad_norm,
+            trusted,
+            curvature_psd: hessian_psd,
+        } = sample;
         let staged_curvature = self.staged_curvature.take();
-        let staged_band = self.staged_band.take();
         if !value.is_finite() {
             // A non-finite accepted objective is the inner-solver's problem,
-            // not a stall; reset so a later real descent is not falsely
-            // credited as a no-improvement step. The dedicated infeasible-trial
-            // bookkeeping lives in `observe_infeasible`; this finite-path entry
-            // is left untouched for non-finite values.
-            self.no_improve_streak = 0;
+            // not a stall. The dedicated refused-trial bookkeeping lives in
+            // `observe_infeasible`.
             self.record_window_trial(rho);
             return CostStallVerdict::Continue;
         }
-        if !inner_converged {
+        if !trusted {
             // #1426: the inner PIRLS hit its iteration cap at this ρ, so `value`
             // is a half-converged artifact and `grad_norm` is inconsistent with
             // it. Do NOT update best-so-far (a corrupted low cost at the λ→0
             // ridge would anchor the best to the overfit forever) and do NOT
-            // count this toward a stall — reset the no-improvement streak so the
-            // optimizer keeps stepping until a fully-converged inner solve lands
-            // a trustworthy (cost, gradient) pair. The bridge separately uncaps
-            // the inner solve when it detects a stuck stall, so subsequent solves
-            // do converge and the best-so-far tracks an honest iterate.
+            // judge it a stall, so the optimizer keeps stepping until a
+            // fully-converged inner solve lands a trustworthy (cost, gradient)
+            // pair. The bridge separately uncaps the inner solve when it detects
+            // a stuck stall, so subsequent solves do converge and the best-so-far
+            // tracks an honest iterate.
             self.infeasible_streak = 0;
-            self.no_improve_streak = 0;
             self.record_window_trial(rho);
             return CostStallVerdict::Continue;
         }
         // A finite trial means the inner solve produced a real cost: the
-        // separating-region infeasible run is broken, so clear its streak.
+        // separating-region refused run is broken, so clear its streak.
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
-        self.record_recent(rho, value);
-        let improvement = self.best_value - value;
-        let floor = self.resolution_against_incumbent(staged_band);
+        let first = !self.best_value.is_finite();
+        let resolution_pair = self.best_resolution + resolution;
+        let resolved = resolvably_below(self.best_value, self.best_resolution, value, resolution);
         if value < self.best_value {
             self.best_value = value;
+            self.best_resolution = resolution;
             self.best_rho = Some(rho.clone());
             self.best_grad_norm = grad_norm;
             self.best_hessian_psd = hessian_psd;
             self.best_curvature = staged_curvature;
-            self.best_band = staged_band;
             // Keep the shared exit cell tracking the best feasible iterate so the
             // ARC budget-exhaustion path can recover it instead of the optimizer's
             // last (possibly degenerate-corner) iterate (#1371).
             self.publish_best_so_far();
         }
+        // The first observation IS progress: it is the first incumbent, whatever
+        // its gradient, so it never reaches a verdict.
+        if first {
+            self.restart_recent(rho, value);
+            return CostStallVerdict::Continue;
+        }
         // KKT-stationary-at-bound (#1082/#1237). On a near-separable multinomial
         // the outer REML criterion keeps decreasing as λ→0, so several log-λ
         // directions slam to the lower box bound: the BOUND-PROJECTED gradient
-        // is already below the outer tolerance (the iterate is KKT-stationary),
-        // yet the raw cost keeps dropping by more than `floor` along those
-        // bound-pinned directions — so a pure cost-improvement test resets the
-        // no-improvement streak forever and the loop never certifies. Once the
-        // projected gradient clears the stationarity threshold there is no
-        // FEASIBLE descent left; further raw progress is bound-pinned drift, not
-        // optimization. Treat such a trial as no-improvement so the window can
-        // fill and the guard halts at the (stationary) best feasible iterate.
-        // `opt::Arc`'s own gradient-tolerance check never trips here because it
-        // tests the RAW gradient, which points out of the box forever.
+        // is already inside the band (the iterate is KKT-stationary), yet the raw
+        // cost keeps dropping by more than the resolution along those
+        // bound-pinned directions — so a pure cost-improvement test would read
+        // progress forever and the loop would never certify. Once the projected
+        // gradient clears the stationarity threshold there is no FEASIBLE descent
+        // left; further raw progress is bound-pinned drift, not optimization, so
+        // the step is stalled whatever its decrease and the guard halts at the
+        // (stationary) best feasible iterate. `opt::Arc`'s own gradient-tolerance
+        // check never trips here because it tests the RAW gradient, which points
+        // out of the box forever.
         let kkt_stationary_at_bound =
             grad_norm.is_finite() && grad_norm <= self.stationarity_band();
-        // With no incumbent yet the floor is `∞`. The first
-        // observation IS an improvement: it is the first incumbent, whatever its
-        // gradient, so it never counts toward a window. Counting it (through
-        // `∞ ≤ ∞`, or through the at-bound test when its gradient is already
-        // inside the band) filled every window one evaluation early. Once windows
-        // carry a progress licence (#2817), that off-by-one decides when a run
-        // stops.
-        if floor.is_finite() && (improvement <= floor || kkt_stationary_at_bound) {
-            self.no_improve_streak = self.no_improve_streak.saturating_add(1);
-            self.record_window_trial(rho);
-        } else {
-            self.no_improve_streak = 0;
+        if !kkt_stationary_at_bound && resolved {
+            // Resolved progress means the last stuck-stall escape (if any)
+            // restored real descent, so the escape streak is over: clear both the
+            // diagnostic count and the recorded incumbent so the next stall is
+            // judged as a fresh streak rather than as a replay of one that
+            // predates real descent. Clearing the incumbent is redundant with the
+            // bit-identity test (an improved best cannot compare equal) and is
+            // kept because it makes the state machine say what the streak means.
             self.window_trials.clear();
-            // A genuine super-floor improvement means the last stuck-stall
-            // escape (if any) restored real descent, so the escape streak is
-            // over: clear both the diagnostic count and the recorded incumbent
-            // so the next stall is judged as a fresh streak rather than as a
-            // replay of a window that predates real descent. Clearing the
-            // incumbent is redundant with the bit-identity test (an improved
-            // best cannot compare equal) and is kept because it makes the
-            // state machine say what the streak means.
             self.stuck_escapes = 0;
             self.incumbent_at_last_escape = None;
-        }
-        if self.no_improve_streak < self.window {
+            self.restart_recent(rho, value);
             return CostStallVerdict::Continue;
         }
-        // #2357: the finite window can fill while the recorded BEST is a
-        // certified strict saddle — the guard tracks `best_hessian_psd` but the
-        // finite-stall path never consulted it, so the stall halted at a
-        // low-cost pass-through iterate whose curvature had not settled
-        // (cold periodic-te() repro: window fills on three oscillating evals
-        // near ρ₂≈10.7, halts to an earlier ρ₂≈5.4 point with hessian_psd=NO,
-        // and the analytic certificate then refuses with INDEFINITE CURVATURE
-        // AT INTERIOR OPTIMUM — while re-running warm from that very
-        // checkpoint converges in a few more iterations). A strict saddle has
-        // a certified local escape direction, so refuse the stall and return
-        // control to cubic regularization exactly as the infeasible-run path
-        // already does; the escape budget bounds consecutive fruitless
-        // refusals so a surface that genuinely floors at a saddle still halts
-        // (converged=false) after the budget instead of looping.
+        self.recent.push_back((rho.clone(), value));
+        self.record_window_trial(rho);
+        if !kkt_stationary_at_bound && predicted_decrease > resolution_pair {
+            // Adapting: the model promised a resolvable decrease the function did
+            // not deliver, and the solver acts on that mismatch.
+            return CostStallVerdict::Continue;
+        }
+        // #2357: a stall can arrive while the recorded BEST is a certified strict
+        // saddle — the guard tracks `best_hessian_psd` but the finite-stall path
+        // never consulted it, so the stall halted at a low-cost pass-through
+        // iterate whose curvature had not settled (cold periodic-te() repro:
+        // three oscillating evals near ρ₂≈10.7 halted to an earlier ρ₂≈5.4 point
+        // with hessian_psd=NO, and the analytic certificate then refused with
+        // INDEFINITE CURVATURE AT INTERIOR OPTIMUM — while re-running warm from
+        // that very checkpoint converges in a few more iterations). A strict
+        // saddle has a certified local escape direction, so refuse the stall and
+        // return control to cubic regularization; the replay cut ends a surface
+        // that genuinely floors at a saddle (converged=false) instead of looping.
         if self.best_hessian_psd == Some(false) {
             let (best_rho, best_value, best_grad_norm) =
                 self.best_iterate_or(rho, value, grad_norm);
             let incumbent = self.escape_state(&best_rho, best_value, best_grad_norm);
             if self.grant_escape_unless_replay(incumbent) {
                 log::debug!(
-                    "[OUTER] ARC cost-stall window filled at a strict-saddle incumbent \
-                     (hessian_psd=NO at best-so-far, value={:.6e}; {}): refusing to certify \
-                     the saddle and returning control to cubic regularization to exploit the \
-                     negative curvature (escape {}).",
+                    "[OUTER] ARC cost stall at a strict-saddle incumbent (hessian_psd=NO at \
+                     best-so-far, value={:.6e}; {}): refusing to certify the saddle and \
+                     returning control to cubic regularization to exploit the negative \
+                     curvature (escape {}).",
                     self.best_value,
                     self.best_curvature_note(),
                     self.stuck_escapes,
@@ -1066,11 +1060,10 @@ impl CostStallGuard {
             self.replay_proven = true;
             log::debug!(
                 "[OUTER] ARC strict-saddle stall refusal cut at escape {}: the previous \
-                 refusal reopened a full {}-step window that evaluated the same trials \
-                 from a bit-identical incumbent (best={:.9e}, |g|={:.3e}), so refusing \
-                 again replays the same window from the same state; halting.",
+                 refusal was followed by the same trials from a bit-identical incumbent \
+                 (best={:.9e}, |g|={:.3e}), so refusing again replays the same search from \
+                 the same state; halting.",
                 self.stuck_escapes,
-                self.window,
                 best_value,
                 best_grad_norm,
             );
@@ -1078,42 +1071,54 @@ impl CostStallGuard {
         self.publish_stall(rho, value, grad_norm)
     }
 
-    /// Fold one INFEASIBLE outer trial (non-finite cost — typically a near-λ=0
-    /// separating point whose inner softmax solve did not converge) into the
-    /// guard. ARC keeps proposing these on a near-separable multinomial fit and
-    /// they never reach `observe` with a finite value, so without this the
-    /// no-improvement window can never fill and the outer loop grinds to
-    /// `max_iter` (#1082/#1237). A run of `window` consecutive infeasible trials
-    /// — provided a finite best is already in hand to halt back to — is the same
-    /// "no further real progress" signal and trips the same halt.
-    ///
-    /// Returns `Continue` until the infeasible streak fills the window; never
-    /// fires before any finite iterate has been recorded (there would be nothing
-    /// to halt back to).
-    pub(crate) fn observe_infeasible(&mut self, rho: &Array1<f64>) -> CostStallVerdict {
-        self.staged_band = None;
+    /// Whether a refused trial whose step's model predicted `predicted_decrease`
+    /// stalls (#3018). A refused trial has no value, so the measured half of the
+    /// stall test cannot be taken; the predicted half can, because the model
+    /// decrease is known before the trial is evaluated. A trial whose model
+    /// promised at most the incumbent's resolution could not have shown resolved
+    /// progress even had it evaluated exactly, since that needs
+    /// `V̂_b − V̂_j > R_b + R_j ≥ R_b`. One whose model promised more is the solver
+    /// still adapting its step (σ or the radius growing, the line search
+    /// shrinking), and its run ends on the solver's own terms. A decrease that is
+    /// not a number decides nothing.
+    fn refusal_stalls(&self, predicted_decrease: f64) -> bool {
+        predicted_decrease <= self.best_resolution
+    }
+
+    /// Fold one REFUSED outer trial — a non-finite cost or a typed refusal,
+    /// typically a near-λ=0 separating point whose inner softmax solve did not
+    /// converge — proposed by a step whose model predicted `predicted_decrease`.
+    /// ARC keeps proposing these on a near-separable multinomial fit and they
+    /// never reach `observe` with a finite value (#1082/#1237). A refusal that
+    /// stalls ([`Self::refusal_stalls`]) halts back to the best feasible iterate,
+    /// which is judged converged or not exactly as a stall is; one that does not
+    /// reaches no verdict, however many come. Never fires before a finite
+    /// iterate has been recorded (there would be nothing to halt back to).
+    pub(crate) fn observe_infeasible(
+        &mut self,
+        rho: &Array1<f64>,
+        predicted_decrease: f64,
+    ) -> CostStallVerdict {
         if self.best_rho.is_none() || !self.best_value.is_finite() {
-            // No feasible iterate recorded yet: an infeasible run this early is
-            // the inner solver's startup problem, not a converged stall. Keep
+            // No feasible iterate recorded yet: a refusal this early is the
+            // inner solver's startup problem, not a converged stall. Keep
             // descending so the optimizer can find its first feasible point.
             return CostStallVerdict::Continue;
         }
         self.infeasible_streak = self.infeasible_streak.saturating_add(1);
         self.off_stratum_streak = 0;
         self.record_window_trial(rho);
-        if self.infeasible_streak < self.window {
+        if !self.refusal_stalls(predicted_decrease) {
             return CostStallVerdict::Continue;
         }
         if self.best_hessian_psd == Some(false) {
-            // A strict saddle has a certified local escape direction. An
-            // infeasible run only says ARC's current cubic step crossed the
-            // profiled objective's domain wall; it cannot turn that saddle
-            // into a terminal checkpoint. Clear the local run so ARC can raise
-            // sigma, shrink the step, and exploit the known negative curvature.
-            self.infeasible_streak = 0;
-            self.no_improve_streak = 0;
+            // A strict saddle has a certified local escape direction. A refused
+            // trial only says ARC's current cubic step crossed the profiled
+            // objective's domain wall; it cannot turn that saddle into a
+            // terminal checkpoint, so ARC keeps control to raise σ, shrink the
+            // step, and exploit the known negative curvature.
             log::debug!(
-                "[OUTER] ARC infeasible-probe run reached a strict-saddle incumbent ({}); \
+                "[OUTER] ARC refused trial stalled at a strict-saddle incumbent ({}); \
                  refusing the stall and returning control to cubic regularization",
                 self.best_curvature_note(),
             );
@@ -1126,46 +1131,52 @@ impl CostStallGuard {
 
     /// Fold one finite trial the solver's ratio test REJECTED (#3017).
     ///
-    /// The iterate did not move, so this is not an outer step: the incumbent,
-    /// the accepted-iterate count and the no-improvement streak are untouched.
-    /// A window counts steps that bought nothing; a rejection bought nothing
-    /// only in the sense that the solver has not yet found the step, and while
-    /// it raises σ toward the Hessian's Lipschitz scale the next accepted step
-    /// is still owed. Counting rejections stopped the #3017 fixture thirteen
+    /// The iterate did not move, so this is not an outer step: the incumbent and
+    /// the accepted-iterate count are untouched, and it reaches no verdict. While
+    /// the solver raises σ toward the Hessian's Lipschitz scale the next accepted
+    /// step is still owed. Counting rejections stopped the #3017 fixture thirteen
     /// rejections short of a Newton step that lands on the optimum.
     ///
-    /// What the trial does change: its finite value ends any run of infeasible
-    /// trials, since that run means consecutive trials that did not evaluate,
-    /// and it is a point the open window evaluated, so it belongs to the window's
-    /// replay identity. The curvature staged for it is dropped, since it never
-    /// becomes the incumbent.
+    /// What the trial does change: its finite value ends any run of refused
+    /// trials, since that run means consecutive trials that did not evaluate, and
+    /// it is a point the search evaluated, so it belongs to the replay identity.
+    /// The curvature staged for it is dropped, since it never becomes the
+    /// incumbent.
     pub(crate) fn observe_rejected_trial(&mut self, rho: &Array1<f64>) {
         self.staged_curvature = None;
-        self.staged_band = None;
         self.infeasible_streak = 0;
         self.record_window_trial(rho);
     }
 
-    /// Fold one trial refused for keeping a different kept rank than the run's start
-    /// (#2765) into the guard (#2939).
+    /// Fold one trial refused for keeping a different kept rank than the run's
+    /// start (#2765) into the guard (#2939). `value` and `resolution` are the
+    /// trial's own criterion value and its evaluation resolution; the criterion
+    /// belongs to the other rank. `predicted_decrease` is the refused step's model
+    /// decrease.
     ///
-    /// The trial shares [`Self::observe_infeasible`]'s streak and window. A window that
-    /// also holds a trial that failed to evaluate is decided exactly as that one is. A
-    /// window whose every trial was refused for its rank publishes the incumbent and
-    /// grants no escape. #1426's escape reopens a window because a non-stationary
-    /// incumbent may still have feasible descent that the rescue ladder can reach past
-    /// probes that did not evaluate. These probes did evaluate. Their criterion belongs
-    /// to another rank, and the seed loop crosses to the lowest of them when it is
-    /// lower. From an incumbent pinned where its rank ends, continuing only proposes
-    /// more trials off the rank. On the stratum-wall fixture, five escapes bought descent
-    /// into the rank boundary while |Pg| grew from 4.2 to 11.3, and the run never
-    /// certified.
+    /// The trial shares [`Self::observe_infeasible`]'s streak. It stops the run at
+    /// once, with no escape, when its value is resolvably below the incumbent's
+    /// (`V̂_b − V̂_x > R_b + R_x`): that is descent this search cannot take on its
+    /// own rank and the seed loop can, since it crosses to the lowest refused
+    /// trial when it is lower. Otherwise the other rank is only a wall, and the
+    /// trial is judged by its model decrease as any refusal is. A stalled run that
+    /// also holds a trial that failed to evaluate is decided exactly as that one is.
+    /// A stalled run whose every trial was refused for its rank publishes the
+    /// incumbent and grants no escape. #1426's escape continues because a
+    /// non-stationary incumbent may still have feasible descent that the rescue
+    /// ladder can reach past probes that did not evaluate. These probes did
+    /// evaluate. From an incumbent pinned where its rank ends, continuing only
+    /// proposes more trials off the rank. On the stratum-wall fixture, five
+    /// escapes bought descent into the rank boundary while |Pg| grew from 4.2 to
+    /// 11.3, and the run never certified.
     pub(crate) fn observe_off_stratum(
         &mut self,
         rho: &Array1<f64>,
         kept_rank: usize,
+        value: f64,
+        resolution: f64,
+        predicted_decrease: f64,
     ) -> CostStallVerdict {
-        self.staged_band = None;
         if self.best_rho.is_none() || !self.best_value.is_finite() {
             return CostStallVerdict::Continue;
         }
@@ -1175,11 +1186,15 @@ impl CostStallGuard {
             1 => 1,
             _ => self.off_stratum_streak.saturating_add(1),
         };
-        if self.infeasible_streak < self.window {
-            return CostStallVerdict::Continue;
-        }
-        if self.off_stratum_streak < self.infeasible_streak {
-            return self.publish_stall(rho, self.best_value, self.best_grad_norm);
+        let other_rank_lower =
+            resolvably_below(self.best_value, self.best_resolution, value, resolution);
+        if !other_rank_lower {
+            if !self.refusal_stalls(predicted_decrease) {
+                return CostStallVerdict::Continue;
+            }
+            if self.off_stratum_streak < self.infeasible_streak {
+                return self.publish_stall(rho, self.best_value, self.best_grad_norm);
+            }
         }
         let (best_rho, best_value, best_grad_norm) =
             self.best_iterate_or(rho, self.best_value, self.best_grad_norm);
@@ -1218,79 +1233,59 @@ impl CostStallGuard {
     /// report `converged=false`. In that separation case the current feasible
     /// probe is the certificate-bearing point and should be returned directly.
     ///
-    /// `grad_norm` MUST be the bound-PROJECTED gradient norm at the probe, not a
-    /// presumed zero: the constrained-KKT certificate holds only when the pull on
-    /// the railed axes is the *whole* residual. The projected norm retains any
-    /// INTERIOR (feasible-descent) component, so `publish_stall` certifies
+    /// `sample.grad_norm` MUST be the bound-PROJECTED gradient norm at the probe,
+    /// not a presumed zero: the constrained-KKT certificate holds only when the
+    /// pull on the railed axes is the *whole* residual. The projected norm retains
+    /// any INTERIOR (feasible-descent) component, so `publish_stall` certifies
     /// `converged` iff the probe is genuinely stationary in the feasible subspace
     /// (#1426 — a flat-valley overfit that merely rails a couple of axes is
     /// reported NON-converged rather than certified behind a fake zero).
     pub(crate) fn observe_constrained_stationary(
         &mut self,
-        rho: &Array1<f64>,
-        value: f64,
-        grad_norm: f64,
-        inner_converged: bool,
-        hessian_psd: Option<bool>,
+        sample: StallSample<'_>,
+        predicted_decrease: f64,
     ) -> CostStallVerdict {
-        if !value.is_finite() {
-            self.staged_band = None;
+        if !sample.value.is_finite() {
             return CostStallVerdict::Continue;
         }
-        if !inner_converged {
-            // #1426: a separation-stationary probe whose inner PIRLS did not
-            // converge carries an untrustworthy (cost, gradient) pair. Adopting
-            // it as the certificate-bearing optimum would ship a half-fit. Route
-            // it through the ordinary finite-path observer, which (with
-            // `inner_converged = false`) refuses to record it as best and keeps
-            // the optimizer descending toward an honest, converged iterate.
-            return self.observe_with_curvature(
-                rho,
-                value,
-                grad_norm,
-                inner_converged,
-                hessian_psd,
-            );
-        }
-        // A lower-bound separation probe is the certificate-bearing optimum ONLY
-        // when it does not REGRESS the best feasible iterate already seen. In the
-        // genuine near-separable case (#1082/#1237) the criterion decreases
-        // monotonically toward the λ→0 bound, so the probe carries the lowest
-        // cost and this guard is a no-op. But the SAME local test
-        // (`lower_bound_outward_active_count`) also fires at an over-smoothing
-        // collapse corner of a multi-penalty RKHS smooth (duchon/matern, #1355):
-        // there a couple of operator penalties rail at the λ→0 LOWER bound (so
-        // they look "separation-stationary") while OTHER penalties rail at the
-        // λ→∞ UPPER bound and shrink the fit to a bare constant. Such a corner is
-        // a spurious local KKT point whose REML cost is far WORSE than the
-        // interior optimum the optimizer already passed through (commonly the
-        // grid-prepass seed). Unconditionally adopting it discards that better
-        // iterate and publishes a degenerate EDF≈1 constant fit. Only adopt the
-        // probe when it does not regress the incumbent best.
+        // #1426: a separation-stationary probe whose inner PIRLS did not converge
+        // carries an untrustworthy (cost, gradient) pair, and adopting it would
+        // ship a half-fit; the ordinary observer refuses it as best. A lower-bound
+        // separation probe is the certificate-bearing optimum ONLY when it does not
+        // REGRESS the best feasible iterate already seen. In the genuine
+        // near-separable case (#1082/#1237) the criterion decreases monotonically
+        // toward the λ→0 bound, so the probe carries the lowest cost and this guard
+        // is a no-op. But the SAME local test (`lower_bound_outward_active_count`)
+        // also fires at an over-smoothing collapse corner of a multi-penalty RKHS
+        // smooth (duchon/matern, #1355): there a couple of operator penalties rail
+        // at the λ→0 LOWER bound (so they look "separation-stationary") while OTHER
+        // penalties rail at the λ→∞ UPPER bound and shrink the fit to a bare
+        // constant. Such a corner is a spurious local KKT point whose REML cost is
+        // far WORSE than the interior optimum the optimizer already passed through
+        // (commonly the grid-prepass seed). Unconditionally adopting it discards
+        // that better iterate and publishes a degenerate EDF≈1 constant fit. Only
+        // adopt the probe when it does not resolvably regress the incumbent best.
         let regresses = self.best_value.is_finite()
-            && value > self.best_value + self.resolution_against_incumbent(self.staged_band);
-        if regresses {
-            // Spurious corner: keep the better incumbent. Fold the probe in as an
-            // ordinary (non-improving) observation so `best_rho`/`best_grad_norm`
-            // are preserved and the stall logic halts back to that incumbent
-            // rather than to this corner.
-            return self.observe_with_curvature(
-                rho,
-                value,
-                grad_norm,
-                inner_converged,
-                hessian_psd,
-            );
+            && resolvably_below(sample.value, sample.resolution, self.best_value, self.best_resolution);
+        if !sample.trusted || regresses {
+            return self.observe(sample, predicted_decrease);
         }
+        let StallSample {
+            point: rho,
+            value,
+            resolution,
+            grad_norm,
+            curvature_psd,
+            ..
+        } = sample;
         self.infeasible_streak = 0;
         self.accepted_iters = self.accepted_iters.saturating_add(1);
         self.best_value = value;
+        self.best_resolution = resolution;
         self.best_rho = Some(rho.clone());
         self.best_grad_norm = grad_norm;
-        self.best_hessian_psd = hessian_psd;
+        self.best_hessian_psd = curvature_psd;
         self.best_curvature = self.staged_curvature.take();
-        self.best_band = self.staged_band.take();
-        self.no_improve_streak = self.window;
         self.publish_stall(rho, value, grad_norm)
     }
 
@@ -1373,13 +1368,11 @@ impl CostStallGuard {
             // The replay is proven, so nothing continues past this stall (#2817).
             self.replay_proven = true;
             log::debug!(
-                "[OUTER] cost-stall escape streak cut at {}: escape {} reopened a full \
-                 {}-step window that evaluated the same trials from a bit-identical \
-                 incumbent (best={:.9e}, |g|={:.3e}), so reopening it again replays the \
-                 same window from the same state; halting.",
+                "[OUTER] cost-stall escape streak cut at {}: escape {} was followed by the \
+                 same trials from a bit-identical incumbent (best={:.9e}, |g|={:.3e}), so \
+                 escaping again replays the same search from the same state; halting.",
                 self.stuck_escapes,
                 self.stuck_escapes,
-                self.window,
                 best_value,
                 best_grad_norm,
             );
@@ -1455,11 +1448,10 @@ impl CostStallGuard {
     /// A finite analytic second-order sample must reach ARC's synchronized
     /// projected-gradient + reduced-Hessian convergence gate. The generic
     /// cost-stall guard may still track the best feasible iterate, but it cannot
-    /// halt the finite path from a first-order verdict. Reset only the finite
-    /// stall window and revoke the provisional published convergence label;
-    /// retain the best/recent evidence for budget-exhaustion recovery.
+    /// halt the finite path from a first-order verdict. Revoke the provisional
+    /// published convergence label; retain the best/recent evidence for
+    /// budget-exhaustion recovery.
     fn defer_finite_second_order_stall(&mut self) {
-        self.no_improve_streak = 0;
         if let Ok(mut slot) = self.exit.lock()
             && let Some(exit) = slot.as_mut()
         {
@@ -1792,7 +1784,8 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
             trial_rho_distance,
             self.first_order_evals
         );
-        let mut left_stratum = false;
+        // The refused trial's own criterion value when it left the run's stratum.
+        let mut left_stratum: Option<f64> = None;
         let result = self
             .obj
             .eval_with_order(x, OuterEvalOrder::Value)
@@ -1802,7 +1795,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
             .and_then(|eval| finite_cost_or_error("outer eval_cost failed", eval.cost))
             .and_then(|cost| match self.refuse_off_stratum_trial(x, cost) {
                 Some(refusal) => {
-                    left_stratum = true;
+                    left_stratum = Some(cost);
                     Err(into_objective_error("outer eval_cost failed", refusal))
                 }
                 None => Ok(cost),
@@ -1811,11 +1804,6 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
             Ok(cost) => {
-                // A successful probe resets the consecutive-refusal counter: the
-                // current ρ neighbourhood has at least one feasible point, so
-                // isolated refusals on other directions are normal line-search
-                // noise, not a globally-infeasible neighbourhood.
-                self.consecutive_probe_refusals = 0;
                 log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
@@ -1841,9 +1829,40 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     err,
                 );
                 if let Some(guard) = self.cost_stall.as_mut() {
+                    // A refused probe has no value, so the linear model at the
+                    // incumbent, the one the line search takes its sufficient
+                    // decrease against, decides whether it stalls (#3018).
+                    //
+                    // This is also what ends a run whose every probe is refused
+                    // (#3219). A line search shrinks `α` by a factor `β < 1` along
+                    // `d`, so the model decrease is `p(α) = α·|g_bᵀd|`, and the
+                    // first probe with `p ≤ R_b` stalls: the direction reaches a
+                    // verdict within `⌈log_{1/β}(α₀·|g_bᵀd| / R_b)⌉ + 1` refused
+                    // probes, a number the incumbent's own gradient and resolution
+                    // fix. A stall at a stationary incumbent converges. One at a
+                    // non-stationary incumbent is granted its first escape, and
+                    // the next stall stops the run through the progress licence,
+                    // since refused probes buy no descent (#2817). A route
+                    // without the guard ends on the line search's own failure.
+                    let predicted_decrease = self
+                        .incumbent
+                        .as_ref()
+                        .map_or(f64::NAN, |incumbent| incumbent.linear_model_decrease(x));
                     let verdict = match (left_stratum, self.stratum_rank) {
-                        (true, Some(kept_rank)) => guard.observe_off_stratum(x, kept_rank),
-                        _ => guard.observe_infeasible(x),
+                        (Some(refused_cost), Some(kept_rank)) => {
+                            // The value lane publishes no evidence, so the trial's
+                            // value carries the criterion's resolution.
+                            let refused_resolution =
+                                guard.value_resolution(refused_cost, &Default::default());
+                            guard.observe_off_stratum(
+                                x,
+                                kept_rank,
+                                refused_cost,
+                                refused_resolution,
+                                predicted_decrease,
+                            )
+                        }
+                        _ => guard.observe_infeasible(x, predicted_decrease),
                     };
                     match verdict {
                         CostStallVerdict::Continue => {}
@@ -1860,8 +1879,8 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                                  to halt-and-ship and continuing (escape {}, value={:.6e}).",
                                 residual_grad_norm,
                                 escape_threshold,
-                                guard.stuck_escapes,
-                                guard.best_value,
+                                guard.stuck_escapes(),
+                                guard.best_value(),
                             );
                             // An escape is a continuation, and continuing needs
                             // evidence it buys something (#2817).
@@ -1876,16 +1895,17 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                         }
                         CostStallVerdict::Converged => {
                             log::debug!(
-                                "[OUTER] cost-stall convergence (infeasible BFGS probes): {} \
-                                 consecutive infeasible probes after a finite seed/iterate; \
-                                 accepting best-so-far as a stationary optimum (value={:.6e}).",
-                                guard.infeasible_streak,
-                                guard.best_value,
+                                "[OUTER] cost-stall convergence (refused BFGS probe): a refused probe whose \
+                                 linear model promised no more than the incumbent's resolution, \
+                                 after {} consecutive refusals; accepting best-so-far as a \
+                                 stationary optimum (value={:.6e}).",
+                                guard.infeasible_streak(),
+                                guard.best_value(),
                             );
                             return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                         }
                         CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
-                            if left_stratum && guard.off_stratum_streak == guard.infeasible_streak {
+                            if left_stratum.is_some() && guard.off_stratum_streak() == guard.infeasible_streak() {
                                 log::debug!(
                                     "[OUTER] stratum boundary (#2939): the last {} trials all keep \
                                      a rank other than the {} this search started on, so the search \
@@ -1893,67 +1913,26 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                                      residual |g|={:.3e} (value={:.6e}). The seed loop crosses to the \
                                      lowest refused trial if it is lower, and the certificate judges \
                                      the incumbent otherwise.",
-                                    guard.infeasible_streak,
+                                    guard.infeasible_streak(),
                                     self.stratum_rank
                                         .map_or_else(|| "none".to_string(), |rank| rank.to_string()),
                                     residual_grad_norm,
-                                    guard.best_value,
+                                    guard.best_value(),
                                 );
                             } else {
                                 log::debug!(
-                                    "[OUTER] cost-stall halt (infeasible BFGS probes): {} \
-                                     consecutive infeasible probes after a finite seed/iterate; \
-                                     halting at best-so-far with residual |g|={:.3e} \
-                                     (value={:.6e}).",
-                                    guard.infeasible_streak,
+                                    "[OUTER] cost-stall halt (refused BFGS probe): a refused probe whose \
+                                     linear model promised no more than the incumbent's resolution, \
+                                     after {} consecutive refusals; halting at best-so-far with \
+                                     residual |g|={:.3e} (value={:.6e}).",
+                                    guard.infeasible_streak(),
                                     residual_grad_norm,
-                                    guard.best_value,
+                                    guard.best_value(),
                                 );
                             }
                             return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                         }
                     }
-                }
-                // Non-termination guard (#NaN-outer-loop): when every
-                // line-search probe is infeasible and BFGS has never
-                // accepted a gradient step (`first_order_evals == 0`), the
-                // neighbourhood around the seed is globally degenerate.
-                // BFGS would otherwise spend its entire max_iterations ×
-                // line_search_budget doing inner solves that all fail.
-                // Escalate to Fatal so BFGS exits immediately; the seed
-                // loop routes it as a rejected seed.
-                self.consecutive_probe_refusals = self.consecutive_probe_refusals.saturating_add(1);
-                // When the bridge seed (cost, gradient) was supplied via
-                // `with_initial_sample` the bridge's own `eval_grad` is
-                // never called, so `last_value_grad_rho` stays `None` and
-                // every `trial_rho_distance` prints as NaN.  The seed IS
-                // feasible (it was evaluated externally), but if every
-                // line-search probe is Recoverable from the very first
-                // direction, the neighbourhood is globally infeasible.
-                // Use the tighter NaN-seed threshold so the guard fires
-                // after one generous Wolfe budget instead of 150 probes
-                // (which, at ~3 s each × 13 seeds, would produce an
-                // observed ~97 min hang on real D=5120 LLM activations).
-                let threshold = if self.last_value_grad_rho.is_none() {
-                    PROBE_REFUSAL_FATAL_THRESHOLD_NAN_SEED
-                } else {
-                    PROBE_REFUSAL_FATAL_THRESHOLD
-                };
-                if self.first_order_evals == 0 && self.consecutive_probe_refusals >= threshold {
-                    log::debug!(
-                        "[OUTER] probe-refusal non-termination guard fired after {} consecutive \
-                         infeasible cost probes with no accepted gradient step \
-                         (nan_seed={}); escalating to Fatal to abort this seed \
-                         (first-order bridge, eval={})",
-                        self.consecutive_probe_refusals,
-                        self.last_value_grad_rho.is_none(),
-                        self.first_order_evals,
-                    );
-                    return Err(ObjectiveEvalError::fatal(format!(
-                            "{PROBE_REFUSAL_FATAL_SENTINEL}: {consecutive} consecutive \
-                             infeasible probes with no accepted outer step",
-                            consecutive = self.consecutive_probe_refusals,
-                        )));
                 }
             }
             Err(_err) => {
@@ -2029,16 +2008,12 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             x.len(),
             self.first_order_evals
         );
-        // #3018: the cost-stall guard judges each decrease against the objective
-        // band this evaluation's own evidence forms. The capture is taken before
-        // any error is surfaced, so a failed evaluation leaves it disarmed.
-        let capture_evidence = self.cost_stall.is_some();
-        if capture_evidence {
-            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
-        }
-        let evaluated = self.obj.eval_with_order(x, OuterEvalOrder::ValueAndGradient);
-        let evidence = capture_evidence
-            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
+        // The evaluation publishes what its value's resolution is charged from
+        // (#3018): the stall guard's resolved-progress test needs it per sample.
+        let (evaluated, evidence) = evaluate_with_certificate_evidence(
+            self.cost_stall.is_some(),
+            || self.obj.eval_with_order(x, OuterEvalOrder::ValueAndGradient),
+        );
         let evaluated = evaluated
             .map_err(|err| into_objective_error("outer eval failed", err))
             .and_then(|eval| {
@@ -2080,10 +2055,6 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             self.last_g_norm = Some(g_norm);
         }
         self.last_value_grad_rho = Some(x.clone());
-        // A successful gradient evaluation means the current ρ is feasible;
-        // reset the consecutive-probe-refusal counter so the guard only fires
-        // when ALL probes in EVERY subsequent direction fail.
-        self.consecutive_probe_refusals = 0;
         self.value_probe_cache
             .retain(|entry| value_probe_reject_outcome(&entry.outcome));
         log::debug!(
@@ -2118,6 +2089,7 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // only valid immediately after this ρ's solve.
         let inner_converged = inner_solve_converged(self.outer_inner_cap.as_ref());
         if let Some(guard) = self.cost_stall.as_ref() {
+            let resolution = guard.value_resolution(eval.cost, &evidence);
             // The stall guard's stationarity test must use the bound-PROJECTED
             // gradient norm (KKT residual), not the raw `g_norm` above — a
             // separation fit pins log-λ directions at the bound with a
@@ -2133,11 +2105,10 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
             let sample = PendingOuterEval {
                 rho: x.clone(),
                 cost: eval.cost,
+                resolution,
+                gradient: gradient.clone(),
                 projected_grad_norm,
                 inner_converged,
-                objective_band: evidence
-                    .as_ref()
-                    .and_then(|evidence| guard.objective_band(eval.cost, evidence)),
             };
             if self.pending_first_order.len() >= PENDING_FIRST_ORDER_CAPACITY {
                 self.pending_first_order.remove(0);
@@ -2203,8 +2174,8 @@ impl OuterFirstOrderBridge<'_> {
         for step in &steps {
             match self.resolve_accepted_iterate(step) {
                 Some(sample) => {
-                    self.incumbent = Some((sample.rho.clone(), sample.cost));
-                    outcome = self.fold_accepted_iterate(&sample);
+                    self.incumbent = Some(OuterIncumbent::at(&sample));
+                    outcome = self.fold_accepted_iterate(&sample, step.predicted_decrease);
                     if outcome.is_err() {
                         break;
                     }
@@ -2243,7 +2214,7 @@ impl OuterFirstOrderBridge<'_> {
         let target = self
             .incumbent
             .as_ref()
-            .map(|(_, cost)| cost - step.actual_decrease)
+            .map(|incumbent| incumbent.cost - step.actual_decrease)
             .filter(|target| target.is_finite());
         if let Some(target) = target {
             let slack = ACCEPTED_STEP_COST_MATCH_ULPS * f64::EPSILON * (1.0 + target.abs());
@@ -2260,7 +2231,7 @@ impl OuterFirstOrderBridge<'_> {
         // to measure a length against, so take the most recent evaluation —
         // the line search returns the trial it evaluated last on every path
         // that does not go through a rescue.
-        let Some((incumbent_rho, _)) = self.incumbent.as_ref() else {
+        let Some(incumbent_rho) = self.incumbent.as_ref().map(|incumbent| &incumbent.rho) else {
             return self.pending_first_order.last().cloned();
         };
         if !step.step_norm.is_finite() {
@@ -2286,8 +2257,8 @@ impl OuterFirstOrderBridge<'_> {
     /// Fold one ACCEPTED outer iterate into the cost-stall guard and act on the
     /// verdict.
     ///
-    /// When the REML score has stopped improving over `COST_STALL_WINDOW`
-    /// consecutive accepted steps, halt BFGS by returning a sentinel `Fatal`.
+    /// When an accepted step buys no resolvable decrease and its linear model
+    /// predicted none (#3018), halt BFGS by returning a sentinel `Fatal`.
     /// The runner rebuilds the outer result from the published best iterate —
     /// but whether that result is reported CONVERGED is decided by the guard's
     /// STATIONARITY test, not by cost-flatness alone: a stall whose projected
@@ -2298,16 +2269,21 @@ impl OuterFirstOrderBridge<'_> {
     fn fold_accepted_iterate(
         &mut self,
         sample: &PendingOuterEval,
+        predicted_decrease: f64,
     ) -> Result<(), ObjectiveEvalError> {
         let Some(guard) = self.cost_stall.as_mut() else {
             return Ok(());
         };
-            guard.stage_objective_band(sample.objective_band);
             match guard.observe(
-                &sample.rho,
-                sample.cost,
-                sample.projected_grad_norm,
-                sample.inner_converged,
+                StallSample {
+                    point: &sample.rho,
+                    value: sample.cost,
+                    resolution: sample.resolution,
+                    grad_norm: sample.projected_grad_norm,
+                    trusted: sample.inner_converged,
+                    curvature_psd: None,
+                },
+                predicted_decrease,
             ) {
                 CostStallVerdict::Continue => {}
                 CostStallVerdict::StuckKeepDescending {
@@ -2333,21 +2309,21 @@ impl OuterFirstOrderBridge<'_> {
                         feedback.force_cold.store(true, Ordering::Relaxed);
                     }
                     log::debug!(
-                        "[OUTER] cost-stall STUCK (NOT a flat valley): REML objective improved \
-                         no more than its resolution (τ={:.3e} unbanded) over {} accepted outer steps but the projected \
-                         gradient is FAR above the certified-stationary band \
-                         (|g|={:.3e} > escape threshold {:.3e}); refusing \
-                         to halt-and-ship and continuing the descent (escape {}, value={:.6e}).",
-                        guard.resolution,
-                        guard.window,
+                        "[OUTER] cost-stall STUCK (NOT a flat valley): an accepted outer step \
+                         bought no decrease past the resolution {:.3e} and its linear model \
+                         predicted none, but the projected gradient is FAR above the \
+                         certified-stationary band (|g|={:.3e} > escape threshold {:.3e}); \
+                         refusing to halt-and-ship and continuing the descent (escape {}, \
+                         value={:.6e}).",
+                        guard.best_resolution(),
                         residual_grad_norm,
                         escape_threshold,
-                        guard.stuck_escapes,
-                        guard.best_value,
+                        guard.stuck_escapes(),
+                        guard.best_value(),
                     );
                     // An escape is a continuation, and continuing needs evidence
                     // it buys something: without resolved descent or a smaller
-                    // residual since the last licensed window, the walk stops at
+                    // residual since the last licensed stall, the walk stops at
                     // its incumbent, reported non-converged (#2817).
                     if let Some(stop) = guard.unprogressing_stop() {
                         if let Ok(mut slot) = guard.exit.lock() {
@@ -2364,30 +2340,28 @@ impl OuterFirstOrderBridge<'_> {
                     // tolerance made a band acceptance read as an arithmetic
                     // impossibility in the log.
                     log::debug!(
-                        "[OUTER] cost-stall convergence: REML objective improved no more than its \
-                         resolution (τ={:.3e} unbanded) over {} consecutive accepted outer steps AND the projected \
-                         gradient cleared a stationarity band (|g|={:.3e}; bound {}); accepting \
-                         best-so-far as a stationary optimum (value={:.6e}).",
-                        guard.resolution,
-                        guard.window,
-                        guard.best_grad_norm,
+                        "[OUTER] cost-stall convergence: an accepted outer step bought no \
+                         decrease past the resolution {:.3e} and its linear model predicted none, \
+                         AND the projected gradient cleared a stationarity band (|g|={:.3e}; \
+                         bound {}); accepting best-so-far as a stationary optimum (value={:.6e}).",
+                        guard.best_resolution(),
+                        guard.best_grad_norm(),
                         guard.stationarity_band(),
-                        guard.best_value,
+                        guard.best_value(),
                     );
                     return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                 }
                 CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                     log::debug!(
-                        "[OUTER] cost-stall FLAT-VALLEY STALL: REML objective improved no more than its \
-                         resolution (τ={:.3e} unbanded) over {} consecutive accepted outer steps but the projected \
-                         gradient is still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); \
-                         halting on a weakly-identified ρ valley floor and reporting NON-CONVERGED \
-                         (residual outer non-stationarity, value={:.6e}).",
-                        guard.resolution,
-                        guard.window,
+                        "[OUTER] cost-stall FLAT-VALLEY STALL: an accepted outer step bought no \
+                         decrease past the resolution {:.3e} and its linear model predicted none, \
+                         but the projected gradient is still ABOVE the outer tolerance \
+                         (|g|={:.3e} > {:.3e}); halting on a weakly-identified ρ valley floor and \
+                         reporting NON-CONVERGED (residual outer non-stationarity, value={:.6e}).",
+                        guard.best_resolution(),
                         residual_grad_norm,
                         guard.stationarity_band(),
-                        guard.best_value,
+                        guard.best_value(),
                     );
                     return Err(ObjectiveEvalError::fatal(COST_STALL_CONVERGED_SENTINEL.to_string()));
                 }
@@ -2771,9 +2745,12 @@ impl FirstOrderObjective for OuterSecondOrderBridge<'_> {
 impl OuterSecondOrderBridge<'_> {
     /// Act on `opt::Arc`'s decision about the pending trial (#3017). An
     /// accepted trial is folded into the cost-stall guard as the new iterate,
-    /// and a stop that fold reaches is returned; a rejected one is recorded as
-    /// a trial that did not move the iterate
-    /// ([`CostStallGuard::observe_rejected_trial`]).
+    /// with the decrease its step's cubic model predicted (#3018), and a stop
+    /// that fold reaches is returned; a rejected one is recorded as a trial
+    /// that did not move the iterate
+    /// ([`CostStallGuard::observe_rejected_trial`]); and a refused one is judged
+    /// by the decrease its step's model predicted
+    /// ([`Self::observe_cost_stall_infeasible`]).
     ///
     /// `eval_hessian` calls this before it evaluates anything, since the
     /// observer reports on the previous trial only after that trial's
@@ -2781,12 +2758,17 @@ impl OuterSecondOrderBridge<'_> {
     /// iterate before the new trial is spent.
     pub(crate) fn settle_pending_trial(&mut self) -> Option<ObjectiveEvalError> {
         match self.accepted_trials.decide()? {
-            TrialDecision::Accepted(trial) => self.observe_cost_stall(&trial),
+            TrialDecision::Accepted(trial, predicted_decrease) => {
+                self.observe_cost_stall(&trial, predicted_decrease)
+            }
             TrialDecision::Rejected(trial) => {
                 self.cost_stall
                     .as_mut()?
                     .observe_rejected_trial(&trial.rho);
                 None
+            }
+            TrialDecision::Refused(point, predicted_decrease) => {
+                self.observe_cost_stall_infeasible(&point, predicted_decrease)
             }
         }
     }
@@ -2803,16 +2785,23 @@ impl OuterSecondOrderBridge<'_> {
     /// the outer REML criterion keeps decreasing as λ→0, several log-λ
     /// directions slam to the lower box bound and bounce, and ARC otherwise
     /// cycles to its `max_iter` cap without certifying a stationary point. The
-    /// guard halts the moment the REML score plateaus over `COST_STALL_WINDOW`
-    /// evals; the converged verdict rides on the bound-PROJECTED gradient norm
+    /// guard stalls the moment an accepted step buys no decrease past the two
+    /// values' resolutions and its cubic model predicted none (#3018); the
+    /// converged verdict rides on the bound-PROJECTED gradient norm
     /// (KKT residual), NOT the raw `g_norm` — a bound-pinned separating
     /// direction with a persistent out-of-bounds ∂V/∂ρ is KKT-stationary even
-    /// though its raw gradient never vanishes. A trial that beats the best cost
-    /// resets the streak, so genuine descent never trips the halt.
-    fn observe_cost_stall(&mut self, trial: &PendingSecondOrderTrial) -> Option<ObjectiveEvalError> {
+    /// though its raw gradient never vanishes. A step that resolvably decreases
+    /// the cost, or whose model still promises a resolvable decrease, never
+    /// stalls, so genuine descent never trips the halt.
+    fn observe_cost_stall(
+        &mut self,
+        trial: &PendingSecondOrderTrial,
+        predicted_decrease: f64,
+    ) -> Option<ObjectiveEvalError> {
         let PendingSecondOrderTrial {
             rho: x,
             cost,
+            resolution,
             gradient,
             hessian,
             hessian_psd,
@@ -2821,6 +2810,14 @@ impl OuterSecondOrderBridge<'_> {
             evidence,
         } = trial;
         let (cost, hessian_psd, inner_converged) = (*cost, *hessian_psd, *inner_converged);
+        let stall_sample = |grad_norm| StallSample {
+            point: x,
+            value: cost,
+            resolution: *resolution,
+            grad_norm,
+            trusted: inner_converged,
+            curvature_psd: hessian_psd,
+        };
         let bounds = self.cost_stall_bounds.clone();
         let separation_bound_stationary = {
             let Some(guard) = self.cost_stall.as_ref() else {
@@ -2838,10 +2835,6 @@ impl OuterSecondOrderBridge<'_> {
             return None;
         };
         guard.stage_sample_curvature(curvature.clone());
-        let band = evidence
-            .as_ref()
-            .and_then(|evidence| guard.objective_band(cost, evidence));
-        guard.stage_objective_band(band);
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
         // box: it counts coordinates pinned at the LOWER bound for the
@@ -2858,20 +2851,14 @@ impl OuterSecondOrderBridge<'_> {
             // *looks* separated on a couple of railed axes while retaining a large
             // INTERIOR (feasible-descent) gradient component — the Gamma/log λ→0
             // ridge of #1426 — keeps that interior mass in ‖g_proj‖, so
-            // `publish_stall` honestly returns FlatValleyStall / converged=false
+            // the stall monitor honestly returns FlatValleyStall / converged=false
             // instead of shipping the overfit silently behind a fake zero.
-            guard.observe_constrained_stationary(
-                x,
-                cost,
-                projected_g_norm,
-                inner_converged,
-                hessian_psd,
-            )
+            guard.observe_constrained_stationary(stall_sample(projected_g_norm), predicted_decrease)
         } else {
-            guard.observe_second_order(x, cost, projected_g_norm, inner_converged, hessian_psd)
+            guard.observe(stall_sample(projected_g_norm), predicted_decrease)
         };
         let mut adjudicate_second_order = false;
-        let window_filled = !matches!(verdict, CostStallVerdict::Continue);
+        let stalled = !matches!(verdict, CostStallVerdict::Continue);
         match verdict {
             CostStallVerdict::Continue => {}
             CostStallVerdict::StuckKeepDescending {
@@ -2893,19 +2880,18 @@ impl OuterSecondOrderBridge<'_> {
                     feedback.force_cold.store(true, Ordering::Relaxed);
                 }
                 log::debug!(
-                    "[OUTER] ARC cost-stall STUCK (NOT a flat valley): REML objective improved \
-                     no more than its resolution (τ={:.3e} unbanded) over {} outer steps but the projected gradient is FAR \
-                     above the certified-stationary band (|g|={:.3e} > escape threshold \
-                     {:.3e}); refusing to halt-and-ship \
-                     and continuing the descent (escape {}, value={:.6e}).",
-                    guard.resolution,
-                    guard.window,
+                    "[OUTER] ARC cost-stall STUCK (NOT a flat valley): an accepted step bought \
+                     no decrease past the resolution {:.3e} and its cubic model predicted none, \
+                     but the projected gradient is FAR above the certified-stationary band \
+                     (|g|={:.3e} > escape threshold {:.3e}); refusing to halt-and-ship and \
+                     continuing the descent (escape {}, value={:.6e}).",
+                    guard.best_resolution(),
                     residual_grad_norm,
                     escape_threshold,
-                    guard.stuck_escapes,
-                    guard.best_value,
+                    guard.stuck_escapes(),
+                    guard.best_value(),
                 );
-                // The window filled, so the criterion has stopped moving, and that
+                // The search stalled, so the criterion has stopped moving, and that
                 // is the condition the certificate's curvature-resolvability rung
                 // decides whatever the first-order band says (#2817). A stall used
                 // to reach the adjudication only by halting inside 1.5x the old
@@ -2917,31 +2903,29 @@ impl OuterSecondOrderBridge<'_> {
             CostStallVerdict::Converged => {
                 log::debug!(
                     "[OUTER] ARC finite cost stall deferred to exact second-order convergence: \
-                     REML objective improved no more than its resolution (τ={:.3e} unbanded) over {} consecutive outer \
-                     steps and the stored best projected gradient is small (|g|={:.3e}; bound \
-                     {}), but only ARC owns the synchronized reduced-Hessian certificate \
-                     (value={:.6e}).",
-                    guard.resolution,
-                    guard.window,
-                    guard.best_grad_norm,
+                     an accepted step bought no decrease past the resolution {:.3e} and its \
+                     cubic model predicted none, and the stored best projected gradient is \
+                     small (|g|={:.3e}; bound {}), but only ARC owns the synchronized \
+                     reduced-Hessian certificate (value={:.6e}).",
+                    guard.best_resolution(),
+                    guard.best_grad_norm(),
                     guard.stationarity_band(),
-                    guard.best_value,
+                    guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
                 adjudicate_second_order = true;
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::debug!(
-                    "[OUTER] ARC finite cost stall deferred: REML objective improved no more than its \
-                     resolution (τ={:.3e} unbanded) over {} consecutive outer steps but the stored best projected \
-                     gradient remains above tolerance (|g|={:.3e} > {:.3e}). Returning the \
-                     current finite gradient + Hessian to ARC instead of halting at a stale \
-                     best point (value={:.6e}).",
-                    guard.resolution,
-                    guard.window,
+                    "[OUTER] ARC finite cost stall deferred: an accepted step bought no \
+                     decrease past the resolution {:.3e} and its cubic model predicted none, \
+                     but the stored best projected gradient remains above tolerance \
+                     (|g|={:.3e} > {:.3e}). Returning the current finite gradient + Hessian to \
+                     ARC instead of halting at a stale best point (value={:.6e}).",
+                    guard.best_resolution(),
                     residual_grad_norm,
                     guard.stationarity_band(),
-                    guard.best_value,
+                    guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
                 adjudicate_second_order = true;
@@ -2964,7 +2948,7 @@ impl OuterSecondOrderBridge<'_> {
         // The Newton-decrement verdict (#2954) needs no such wait: it is the
         // certificate's own stationarity decision, so it is taken at every
         // evaluated point and stops the run the first time it certifies. Only
-        // the curvature-resolvability rung is held for a filled window.
+        // the curvature-resolvability rung is held for a stall.
         let verdict = self.curvature_stationary_exit(
             x,
             cost,
@@ -2979,15 +2963,15 @@ impl OuterSecondOrderBridge<'_> {
         }
         // Neither test accepted the point, so continuing needs evidence that
         // continuing buys something. Without it the run stops at its incumbent
-        // rather than spending windows until an iteration count runs out (#2817).
-        if window_filled {
+        // rather than spending stalls until an iteration count runs out (#2817).
+        if stalled {
             return self.unprogressing_stall_exit();
         }
         None
     }
 
-    /// Stop the run at its incumbent when a filled stall window has bought
-    /// nothing since the previous one (#2817). See
+    /// Stop the run at its incumbent when a stall has bought nothing since the
+    /// previous one (#2817). See
     /// [`CostStallGuard::license_continuation`].
     fn unprogressing_stall_exit(&mut self) -> Option<ObjectiveEvalError> {
         let guard = self.cost_stall.as_mut()?;
@@ -3059,7 +3043,7 @@ impl OuterSecondOrderBridge<'_> {
     /// at n = 10⁴: certified at ρ ≈ 19.6, stopped at ρ ≈ 22.7). The
     /// curvature-resolvability rung is not the certificate's decision where a
     /// verdict is taken, only its fallback, and it decides only once the
-    /// criterion has stopped moving (`criterion_stalled`, a filled window).
+    /// criterion has stopped moving (`criterion_stalled`, a stall).
     fn curvature_stationary_exit(
         &mut self,
         x: &Array1<f64>,
@@ -3082,6 +3066,22 @@ impl OuterSecondOrderBridge<'_> {
         let rail_bounds = self.cost_stall_bounds.as_ref().map(rail_relaxed_bounds);
         let projected = project_gradient_vector(x, gradient, rail_bounds.as_ref());
         let projected_norm = projected.iter().map(|v| v * v).sum::<f64>().sqrt();
+        // #2568: the certificate caps every rung at the caller's |Pg|
+        // requirement, so the loop keeps going past a point that requirement
+        // refuses. Stopping here would hand the certificate a point it must
+        // refuse, or, before the cap reached the ladder's top, one it minted
+        // short of what the caller asked for (#3311).
+        if let Some(required) = self
+            .decrement_verdict_config
+            .and_then(|config| config.required_projected_gradient_norm)
+            && !(projected_norm <= required)
+        {
+            log::debug!(
+                "[OUTER] ARC online stop declined: |Pg|={projected_norm:.3e} exceeds the \
+                 caller's requirement {required:.3e} (#2568)"
+            );
+            return None;
+        }
         // #2954: the certificate's verdict, where it is taken, is the rung.
         let verdict_decided = self
             .decrement_verdict_config
@@ -3155,7 +3155,7 @@ impl OuterSecondOrderBridge<'_> {
         // incumbent" and nothing weaker. A trial the guard declined to adopt
         // (a non-converged inner solve, say) leaves the best where it was and
         // cannot end the run.
-        if !(cost <= guard.best_value) {
+        if !(cost <= guard.best_value()) {
             return None;
         }
         log::debug!(
@@ -3163,16 +3163,16 @@ impl OuterSecondOrderBridge<'_> {
              Hessian PSD; |Pg|={projected_norm:.3e} after {iters} accepted outer iteration(s). The \
              absolute gradient band the solver was driven to is a different and unrelated \
              standard (#2817).",
-            iters = guard.accepted_iters,
+            iters = guard.accepted_iters(),
         );
         if let Ok(mut slot) = guard.exit.lock() {
             *slot = Some(CostStallExit {
                 rho: x.clone(),
                 value: cost,
                 grad_norm: projected_norm,
-                iterations: guard.accepted_iters,
+                iterations: guard.accepted_iters(),
                 converged: true,
-                // No stall window fired, so no window evidence is reported: the
+                // No stall fired, so no stall evidence is reported: the
                 // rung that stopped this run is the decrement.
                 probe_scale: None,
                 rank_boundary: None,
@@ -3187,7 +3187,7 @@ impl OuterSecondOrderBridge<'_> {
     /// when the guard refuses the stall rather than after the budget is spent
     /// (#1082).
     ///
-    /// A filled window at a strict-saddle incumbent grants an escape so cubic
+    /// A stall at a strict-saddle incumbent grants an escape so cubic
     /// regularization can exploit the negative curvature. The terminal
     /// certificate asks the criterion first: `run::adjudicate_negative_curvature`
     /// steps along the most negative eigenvector of the judged sub-block, both
@@ -3220,20 +3220,20 @@ impl OuterSecondOrderBridge<'_> {
         let objective_resolution = self.curvature_stationary_resolution?;
         let bounds = self.cost_stall_bounds.clone()?;
         let guard = self.cost_stall.as_mut()?;
-        if !std::mem::take(&mut guard.strict_saddle_refusal)
-            || !(guard.best_grad_norm <= guard.stationarity_band())
-            || !guard.best_value.is_finite()
+        if !guard.take_strict_saddle_refusal()
+            || !(guard.best_grad_norm() <= guard.stationarity_band())
+            || !guard.best_value().is_finite()
         {
             return None;
         }
-        let rho = guard.best_rho.clone()?;
-        let curvature = guard.best_curvature.clone()?;
-        let value = guard.best_value;
-        let grad_norm = guard.best_grad_norm;
+        let rho = guard.best_rho().cloned()?;
+        let curvature = guard.best_curvature().cloned()?;
+        let value = guard.best_value();
+        let grad_norm = guard.best_grad_norm();
         let grad_threshold = guard.stationarity_band();
-        let iterations = guard.accepted_iters;
+        let iterations = guard.accepted_iters();
         let railed: Vec<usize> = curvature.railed.iter().map(|railed| railed.index).collect();
-        let curvature_note = curvature.render(guard.claim_config.native_coordinate_order.as_deref());
+        let curvature_note = curvature.render(guard.claim_config().native_coordinate_order.as_deref());
         let invariance = self.obj.criterion_invariant_directions(&rho);
         let context = "ARC strict-saddle stall refusal";
         match super::run::adjudicate_negative_curvature(
@@ -3314,7 +3314,7 @@ impl OuterSecondOrderBridge<'_> {
                 grad_norm,
                 iterations,
                 converged: true,
-                // No stall window's evidence is reported: the rung that
+                // No stall's evidence is reported: the rung that
                 // stopped this run is the certificate's band.
                 probe_scale: None,
                 rank_boundary: None,
@@ -3325,15 +3325,22 @@ impl OuterSecondOrderBridge<'_> {
         ))
     }
 
-    /// Fold one INFEASIBLE ARC trial (non-finite cost) into the cost-stall
-    /// guard. Mirrors `observe_cost_stall` but routes through the guard's
-    /// infeasible-streak path: a run of `COST_STALL_WINDOW` consecutive
-    /// infeasible trials after a feasible best halts the outer loop at that
-    /// best feasible iterate rather than letting ARC grind to `max_iter`
-    /// probing the unbounded λ→0 separating region (#1082/#1237).
-    fn observe_cost_stall_infeasible(&mut self, x: &Array1<f64>) -> Option<ObjectiveEvalError> {
+    /// Fold one INFEASIBLE ARC trial (the objective refused it, or its cost is
+    /// not finite) into the cost-stall guard, with the decrease its step's cubic
+    /// model predicted as `opt::Arc` reported it. Mirrors `observe_cost_stall`
+    /// but routes through the guard's refused-trial test (#3018). A refused
+    /// trial whose model promised no more than the best feasible iterate's
+    /// resolution could not have shown progress, so the outer loop halts at that
+    /// iterate rather than letting ARC grind to `max_iter` probing the unbounded
+    /// λ→0 separating region (#1082/#1237). One whose model promised more is ARC
+    /// still raising σ, and ARC's own σ ceiling ends that run.
+    fn observe_cost_stall_infeasible(
+        &mut self,
+        x: &Array1<f64>,
+        predicted_decrease: f64,
+    ) -> Option<ObjectiveEvalError> {
         let guard = self.cost_stall.as_mut()?;
-        match guard.observe_infeasible(x) {
+        match guard.observe_infeasible(x, predicted_decrease) {
             CostStallVerdict::Continue => None,
             CostStallVerdict::StuckKeepDescending {
                 residual_grad_norm,
@@ -3348,36 +3355,40 @@ impl OuterSecondOrderBridge<'_> {
                      halt-and-ship and continuing (escape {}, value={:.6e}).",
                     residual_grad_norm,
                     escape_threshold,
-                    guard.stuck_escapes,
-                    guard.best_value,
+                    guard.stuck_escapes(),
+                    guard.best_value(),
                 );
                 None
             }
             CostStallVerdict::Converged => {
                 log::debug!(
-                    "[OUTER] ARC infeasible-probe stall: {} consecutive infeasible λ→0 trials \
-                     after the best feasible iterate. Its stored projected gradient is small \
+                    "[OUTER] ARC infeasible-probe stall: a refused λ→0 trial whose cubic model \
+                     promised no more than the resolution {:.3e} of the best feasible iterate \
+                     ({} consecutive refusals). Its stored projected gradient is small \
                      (|g|={:.3e}; bound {}) and its synchronized reduced Hessian does not \
                      certify negative curvature; halting only as a NON-CONVERGED checkpoint \
                      (value={:.6e}).",
-                    guard.window,
-                    guard.best_grad_norm,
+                    guard.best_resolution(),
+                    guard.infeasible_streak(),
+                    guard.best_grad_norm(),
                     guard.stationarity_band(),
-                    guard.best_value,
+                    guard.best_value(),
                 );
                 guard.revoke_published_convergence();
                 Some(ObjectiveEvalError::fatal(ARC_INFEASIBLE_STALL_SENTINEL.to_string()))
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::debug!(
-                    "[OUTER] ARC cost-stall halt (infeasible run): {} consecutive infeasible \
-                     λ→0 trials after the best feasible iterate, whose projected gradient is \
-                     still ABOVE the outer tolerance (|g|={:.3e} > {:.3e}); halting at the best \
-                     feasible iterate and reporting NON-CONVERGED (value={:.6e}).",
-                    guard.window,
+                    "[OUTER] ARC cost-stall halt (refused trial): a refused λ→0 trial whose cubic \
+                     model promised no more than the resolution {:.3e} of the best feasible \
+                     iterate ({} consecutive refusals), whose projected gradient is still ABOVE \
+                     the outer tolerance (|g|={:.3e} > {:.3e}); halting at the best feasible \
+                     iterate and reporting NON-CONVERGED (value={:.6e}).",
+                    guard.best_resolution(),
+                    guard.infeasible_streak(),
                     residual_grad_norm,
                     guard.stationarity_band(),
-                    guard.best_value,
+                    guard.best_value(),
                 );
                 guard.revoke_published_convergence();
                 Some(ObjectiveEvalError::fatal(ARC_INFEASIBLE_STALL_SENTINEL.to_string()))
@@ -3405,45 +3416,35 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // Infeasible trials are the near-separable multinomial failure mode:
         // ARC probes the unbounded λ→0 separating region where the inner softmax
         // solve does not converge. These never reach `observe_cost_stall` below
-        // (validation rejects them), so feed them to the guard's dedicated
-        // infeasible-streak path FIRST — a run of consecutive infeasible trials
-        // after a feasible best halts the outer loop at that best iterate instead
-        // of grinding to `max_iter` (#1082/#1237). A typed refusal is an
-        // infeasible trial exactly like a non-finite cost, so it feeds the same
-        // streak (#2735).
+        // (validation rejects them), so they are held as refused trials: `opt`
+        // reports the decrease the step's cubic model predicted, and the next
+        // evaluation's settle judges the refusal by it before anything else. A
+        // refusal whose model promised no more than the incumbent's resolution
+        // halts the outer loop at that best iterate instead of grinding to
+        // `max_iter` (#1082/#1237, #3018). A typed refusal is an infeasible trial
+        // exactly like a non-finite cost, and is held the same way (#2735).
         //
         // #2954: the online decrement stop decides on the certificate's verdict,
-        // which reads this evaluation's own parts. The capture is taken before
-        // the error is surfaced, so a failed evaluation leaves it disarmed.
-        //
-        // #3018: the cost-stall guard judges each decrease against the objective
-        // bands this evidence forms, so the guard arms the capture too.
-        let capture_evidence =
-            self.decrement_verdict_config.is_some() || self.cost_stall.is_some();
-        if capture_evidence {
-            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
-        }
-        let evaluated = self
-            .obj
-            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian);
-        let evidence = capture_evidence
-            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
+        // which reads this evaluation's own parts, and the stall guard charges
+        // the value's resolution from the same parts (#3018). The capture is
+        // taken before the error is surfaced, so a failed evaluation leaves it
+        // disarmed.
+        let (evaluated, evidence) = evaluate_with_certificate_evidence(
+            self.decrement_verdict_config.is_some() || self.cost_stall.is_some(),
+            || self.obj.eval_with_order(x, OuterEvalOrder::ValueGradientHessian),
+        );
         let eval = match evaluated {
             Ok(eval) => eval,
             Err(err) => {
                 let err = into_line_search_value_probe_error("outer eval failed", err);
-                if err.is_recoverable()
-                    && let Some(halt) = self.observe_cost_stall_infeasible(x)
-                {
-                    return Err(halt);
+                if err.is_recoverable() && self.cost_stall.is_some() {
+                    self.accepted_trials.stage_refusal(x.clone());
                 }
                 return Err(err);
             }
         };
-        if !eval.cost.is_finite() {
-            if let Some(err) = self.observe_cost_stall_infeasible(x) {
-                return Err(err);
-            }
+        if !eval.cost.is_finite() && self.cost_stall.is_some() {
+            self.accepted_trials.stage_refusal(x.clone());
         }
         let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
         self.eval_count += 1;
@@ -3514,7 +3515,7 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // gate can either certify a mode or exploit negative curvature (#979);
         // the guard sees it on the next evaluation, as an iterate only if it
         // was accepted.
-        if self.cost_stall.is_some() {
+        if let Some(guard) = self.cost_stall.as_ref() {
             let curvature = match (hessian_psd, hessian.as_ref()) {
                 (Some(false), Some(dense)) => incumbent_curvature(
                     x,
@@ -3525,15 +3526,17 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
                 ),
                 _ => None,
             };
+            let resolution = guard.value_resolution(eval.cost, &evidence);
             self.accepted_trials.stage(PendingSecondOrderTrial {
                 rho: x.clone(),
                 cost: eval.cost,
+                resolution,
                 gradient: eval.gradient.clone(),
                 hessian: hessian.clone(),
                 hessian_psd,
                 curvature,
                 inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
-                evidence,
+                evidence: self.decrement_verdict_config.is_some().then_some(evidence),
             });
         }
         Ok(SecondOrderSample {
@@ -3694,6 +3697,7 @@ impl OptimizerObserver for OuterAcceptObserver {
             iter: info.iter,
             step_norm: info.step_norm,
             actual_decrease: info.actual_decrease,
+            predicted_decrease: info.predicted_decrease,
         });
         if let Some(census) = self.census.as_ref() {
             census.observe(info, true);
@@ -3712,6 +3716,16 @@ impl OptimizerObserver for OuterAcceptObserver {
             census.observe(info, false);
         }
     }
+
+    fn on_trial_refused(&mut self, info: &StepInfo) {
+        log::trace!(
+            "outer trial refused iter={} step_norm={:.3e} predicted_decrease={:.3e}",
+            info.iter,
+            info.step_norm,
+            info.predicted_decrease,
+        );
+        self.accepted_steps.push_refused(info.predicted_decrease);
+    }
 }
 
 /// One accepted outer step as `opt` reports it through
@@ -3728,6 +3742,11 @@ pub(crate) struct AcceptedOuterStep {
     pub(crate) step_norm: f64,
     /// `f_k − f_next`.
     pub(crate) actual_decrease: f64,
+    /// The decrease the step's own model predicted (`opt::StepInfo::predicted_decrease`):
+    /// the cubic or quadratic model's for ARC and the trust region, the linear
+    /// model's `−g_kᵀs_k` for BFGS. The stall rule asks whether it was
+    /// resolvable (#3018).
+    pub(crate) predicted_decrease: f64,
 }
 
 /// Accepted-outer-step channel from [`OuterAcceptObserver`] to
@@ -3742,6 +3761,9 @@ pub(crate) struct AcceptedOuterStep {
 #[derive(Debug, Default)]
 pub(crate) struct AcceptedStepLedger {
     steps: Mutex<Vec<AcceptedOuterStep>>,
+    /// The model decrease of each trial the objective refused, as `opt` reported
+    /// it through [`opt::OptimizerObserver::on_trial_refused`] (#3018).
+    refused: Mutex<Vec<f64>>,
 }
 
 impl AcceptedStepLedger {
@@ -3758,6 +3780,20 @@ impl AcceptedStepLedger {
             Err(_) => Vec::new(),
         }
     }
+
+    pub(crate) fn push_refused(&self, predicted_decrease: f64) {
+        if let Ok(mut refused) = self.refused.lock() {
+            refused.push(predicted_decrease);
+        }
+    }
+
+    /// Take every refused trial's model decrease queued so far, oldest first.
+    pub(crate) fn drain_refused(&self) -> Vec<f64> {
+        match self.refused.lock() {
+            Ok(mut refused) => std::mem::take(&mut *refused),
+            Err(_) => Vec::new(),
+        }
+    }
 }
 
 /// One first-order outer evaluation the bridge has made and that `opt` has not
@@ -3765,17 +3801,79 @@ impl AcceptedStepLedger {
 ///
 /// Everything the cost-stall guard needs is captured HERE, at evaluation time,
 /// rather than re-derived when the accept arrives: `projected_grad_norm` needs
-/// the rail-relaxed box, and `inner_converged` is a snapshot of the
-/// inner-progress feedback that is only valid immediately after this ρ's solve.
+/// the rail-relaxed box, `inner_converged` is a snapshot of the inner-progress
+/// feedback that is only valid immediately after this ρ's solve, and
+/// `resolution` is charged from what this evaluation published (#3018).
 #[derive(Debug, Clone)]
 pub(crate) struct PendingOuterEval {
     pub(crate) rho: Array1<f64>,
     pub(crate) cost: f64,
+    /// A bound on `cost`'s evaluation error ([`sample_resolution`]).
+    pub(crate) resolution: f64,
+    /// The criterion's gradient at `rho`, kept so the linear model at this point
+    /// can price a refused trial's step should it become the incumbent (#3018).
+    pub(crate) gradient: Array1<f64>,
     pub(crate) projected_grad_norm: f64,
     pub(crate) inner_converged: bool,
-    /// `band_f(cost)` from this evaluation's own certificate evidence
-    /// ([`CostStallGuard::objective_band`], #3018).
-    pub(crate) objective_band: Option<f64>,
+}
+
+/// The last iterate the first-order bridge knows was accepted, with the gradient
+/// evaluated there (#3018).
+///
+/// A trial the objective refuses has no value, so whether it stalls is decided by
+/// its step's model decrease alone ([`CostStallGuard::observe_infeasible`]). For a
+/// line search that model is the linear one at the incumbent, the same model an
+/// accepted step's `−g_kᵀs_k` is taken against.
+#[derive(Debug, Clone)]
+pub(crate) struct OuterIncumbent {
+    pub(crate) rho: Array1<f64>,
+    pub(crate) cost: f64,
+    pub(crate) gradient: Array1<f64>,
+}
+
+impl OuterIncumbent {
+    pub(crate) fn at(sample: &PendingOuterEval) -> Self {
+        Self {
+            rho: sample.rho.clone(),
+            cost: sample.cost,
+            gradient: sample.gradient.clone(),
+        }
+    }
+
+    /// The linear model's decrease from the incumbent to `x`, `−gᵀ(x − ρ)`.
+    /// `NaN` when `x` or the gradient does not share the incumbent's dimension,
+    /// so a mismatched point decides nothing.
+    pub(crate) fn linear_model_decrease(&self, x: &Array1<f64>) -> f64 {
+        if x.len() != self.rho.len() || self.gradient.len() != self.rho.len() {
+            return f64::NAN;
+        }
+        -self
+            .gradient
+            .iter()
+            .zip(x.iter().zip(self.rho.iter()))
+            .map(|(g, (trial, incumbent))| g * (trial - incumbent))
+            .sum::<f64>()
+    }
+}
+
+/// Run one objective evaluation with the certificate capture armed when
+/// `armed`, and take what it published (#3018): the resolution of the value the
+/// evaluation computed is charged from it. The capture is taken on every path,
+/// so no evaluation leaves it armed for the next; unarmed, nothing is recorded
+/// and the evidence is empty.
+pub(crate) fn evaluate_with_certificate_evidence<T>(
+    armed: bool,
+    evaluate: impl FnOnce() -> T,
+) -> (T, crate::estimate::outer_eval_capture::CertificateEvidence) {
+    if !armed {
+        return (evaluate(), Default::default());
+    }
+    crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
+    let result = evaluate();
+    (
+        result,
+        crate::estimate::outer_eval_capture::take_certificate_evidence(),
+    )
 }
 
 /// The one evaluated trial a trust-region-type solver has not yet accepted or
@@ -3800,15 +3898,28 @@ pub(crate) struct PendingOuterEval {
 /// step was due.
 pub(crate) struct AcceptedTrialGate<S> {
     ledger: Arc<AcceptedStepLedger>,
-    pending: Option<S>,
+    pending: Option<PendingTrial<S>>,
+}
+
+/// The trial a gate holds: one the objective evaluated, or the point of one it
+/// refused (#3018).
+enum PendingTrial<S> {
+    Evaluated(S),
+    Refused(Array1<f64>),
 }
 
 /// What `opt` decided about the gate's pending trial.
 pub(crate) enum TrialDecision<S> {
-    /// The trial became the next iterate.
-    Accepted(S),
+    /// The trial became the next iterate, by a step whose model predicted the
+    /// decrease carried beside it (#3018).
+    Accepted(S, f64),
     /// The ratio test rejected it; the iterate did not move.
     Rejected(S),
+    /// The objective refused the trial at this point, proposed by a step whose
+    /// model predicted the decrease carried beside it, as `opt` reported it
+    /// ([`opt::OptimizerObserver::on_trial_refused`]); `NaN` when `opt` reported
+    /// none (#3018).
+    Refused(Array1<f64>, f64),
 }
 
 impl<S> AcceptedTrialGate<S> {
@@ -3822,20 +3933,31 @@ impl<S> AcceptedTrialGate<S> {
     /// Hold `sample`, the trial just evaluated, until `opt` decides on it.
     /// The previous pending trial must already have been [`Self::decide`]d.
     pub(crate) fn stage(&mut self, sample: S) {
-        self.pending = Some(sample);
+        self.pending = Some(PendingTrial::Evaluated(sample));
+    }
+
+    /// Hold the point of a trial the objective just refused, until `opt` reports
+    /// the decrease its step's model predicted (#3018).
+    pub(crate) fn stage_refusal(&mut self, point: Array1<f64>) {
+        self.pending = Some(PendingTrial::Refused(point));
     }
 
     /// Consume `opt`'s decision on the pending trial. Called at the top of the
     /// next evaluation, the first point the bridge can act after the observer
-    /// has run. `None` when nothing is pending (no finite trial was evaluated
-    /// since the last decision).
+    /// has run. `None` when nothing is pending (no trial was evaluated since the
+    /// last decision). An accepted or refused trial carries the decrease its
+    /// step's model predicted, which the stall rule needs (#3018).
     pub(crate) fn decide(&mut self) -> Option<TrialDecision<S>> {
-        let accepted = !self.ledger.drain().is_empty();
-        let pending = self.pending.take()?;
-        Some(if accepted {
-            TrialDecision::Accepted(pending)
-        } else {
-            TrialDecision::Rejected(pending)
+        let accepted = self.ledger.drain().pop();
+        let refused = self.ledger.drain_refused().pop();
+        Some(match self.pending.take()? {
+            PendingTrial::Evaluated(trial) => match accepted {
+                Some(step) => TrialDecision::Accepted(trial, step.predicted_decrease),
+                None => TrialDecision::Rejected(trial),
+            },
+            PendingTrial::Refused(point) => {
+                TrialDecision::Refused(point, refused.unwrap_or(f64::NAN))
+            }
         })
     }
 }
@@ -3848,6 +3970,9 @@ impl<S> AcceptedTrialGate<S> {
 pub(crate) struct PendingSecondOrderTrial {
     pub(crate) rho: Array1<f64>,
     pub(crate) cost: f64,
+    /// A bound on `cost`'s evaluation error, charged from what the evaluation
+    /// published (#3018).
+    pub(crate) resolution: f64,
     pub(crate) gradient: Array1<f64>,
     pub(crate) hessian: Option<Array2<f64>>,
     pub(crate) hessian_psd: Option<bool>,
@@ -3926,39 +4051,63 @@ pub(crate) struct OuterOperatorBridge<'a> {
 impl OuterOperatorBridge<'_> {
     /// Act on the trust region's decision about the pending trial (#3017):
     /// fold an accepted one as the new iterate, record a rejected one as a
-    /// trial that did not move it. See
-    /// [`OuterSecondOrderBridge::settle_pending_trial`].
+    /// trial that did not move it, and judge a refused one by its step's model
+    /// decrease (#3018). See [`OuterSecondOrderBridge::settle_pending_trial`].
     pub(crate) fn settle_pending_trial(&mut self) -> Option<ObjectiveEvalError> {
         match self.accepted_trials.decide()? {
-            TrialDecision::Accepted(trial) => self.observe_unprogressing_stall(&trial),
+            TrialDecision::Accepted(trial, predicted_decrease) => {
+                self.observe_unprogressing_stall(&trial, predicted_decrease)
+            }
             TrialDecision::Rejected(trial) => {
                 self.cost_stall
                     .as_mut()?
                     .observe_rejected_trial(&trial.rho);
                 None
             }
+            TrialDecision::Refused(point, predicted_decrease) => {
+                let verdict = self
+                    .cost_stall
+                    .as_mut()?
+                    .observe_infeasible(&point, predicted_decrease);
+                self.act_on_stall(verdict)
+            }
         }
     }
 
-    /// Fold one accepted iterate into the stall guard, and stop the run when a
-    /// filled window has bought nothing since the previous one (#2817).
+    /// Fold one accepted iterate, reached by a step whose quadratic model
+    /// predicted `predicted_decrease` (#3018), into the stall guard, and stop
+    /// the run when a stall has bought nothing since the previous one (#2817).
     ///
-    /// A filled window is handled as the dense route handles a deferred one:
-    /// the window reopens, a stuck stall uncaps the inner solve, and continuing
-    /// needs [`CostStallGuard::license_continuation`]. This route holds only a
+    /// A stall is handled as the dense route handles a deferred one: a stuck
+    /// stall uncaps the inner solve, and continuing needs
+    /// [`CostStallGuard::license_continuation`]. This route holds only a
     /// Hessian operator at the bridge, so there is no second-order adjudication
     /// to run first; the terminal certificate judges whatever point this stops
     /// at.
-    fn observe_unprogressing_stall(&mut self, trial: &PendingOuterEval) -> Option<ObjectiveEvalError> {
+    fn observe_unprogressing_stall(
+        &mut self,
+        trial: &PendingOuterEval,
+        predicted_decrease: f64,
+    ) -> Option<ObjectiveEvalError> {
         let guard = self.cost_stall.as_mut()?;
-        guard.stage_objective_band(trial.objective_band);
-        match guard.observe_second_order(
-            &trial.rho,
-            trial.cost,
-            trial.projected_grad_norm,
-            trial.inner_converged,
-            None,
-        ) {
+        let sample = StallSample {
+            point: &trial.rho,
+            value: trial.cost,
+            resolution: trial.resolution,
+            grad_norm: trial.projected_grad_norm,
+            trusted: trial.inner_converged,
+            curvature_psd: None,
+        };
+        let verdict = guard.observe(sample, predicted_decrease);
+        self.act_on_stall(verdict)
+    }
+
+    /// Act on the guard's verdict on an accepted iterate or a refused trial:
+    /// continue, or stop at the incumbent when the stall has bought nothing
+    /// since the previous one (#2817).
+    fn act_on_stall(&mut self, verdict: CostStallVerdict) -> Option<ObjectiveEvalError> {
+        let guard = self.cost_stall.as_mut()?;
+        match verdict {
             CostStallVerdict::Continue => return None,
             CostStallVerdict::StuckKeepDescending { .. } => {
                 if let Some(feedback) = self.outer_inner_cap.as_ref() {
@@ -4074,18 +4223,25 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
             "[STAGE] outer eval start order=ValueGradientHessian dim={} (operator bridge)",
             x.len(),
         );
-        // #3018: see the first-order bridge's matching capture.
-        let capture_evidence = self.cost_stall.is_some();
-        if capture_evidence {
-            crate::estimate::outer_eval_capture::begin_certificate_parts_capture();
-        }
-        let evaluated = self
-            .obj
-            .eval_with_order(x, OuterEvalOrder::ValueGradientHessian);
-        let evidence = capture_evidence
-            .then(crate::estimate::outer_eval_capture::take_certificate_evidence);
-        let eval = evaluated.map_err(|err| into_objective_error("outer eval failed", err))?;
-        let eval = finite_outer_eval_or_error("outer eval failed", self.layout, eval)?;
+        let (evaluated, evidence) = evaluate_with_certificate_evidence(
+            self.cost_stall.is_some(),
+            || self.obj.eval_with_order(x, OuterEvalOrder::ValueGradientHessian),
+        );
+        let eval = match evaluated
+            .map_err(|err| into_objective_error("outer eval failed", err))
+            .and_then(|eval| finite_outer_eval_or_error("outer eval failed", self.layout, eval))
+        {
+            Ok(eval) => eval,
+            Err(err) => {
+                // A refused trial is judged by its step's model decrease once
+                // the trust region reports it, before the next evaluation
+                // (#3018).
+                if err.is_recoverable() && self.cost_stall.is_some() {
+                    self.accepted_trials.stage_refusal(x.clone());
+                }
+                return Err(err);
+            }
+        };
         self.eval_count += 1;
         let g_norm = eval.gradient.iter().map(|v| v * v).sum::<f64>().sqrt();
         if self.g_norm_initial.is_none() && g_norm.is_finite() && g_norm > 0.0 {
@@ -4097,19 +4253,18 @@ impl OperatorObjective for OuterOperatorBridge<'_> {
         self.last_value_grad_rho = Some(x.clone());
         // Hold this trial until the ratio test decides it (#3017).
         if let Some(guard) = self.cost_stall.as_ref() {
-            let objective_band = evidence
-                .as_ref()
-                .and_then(|evidence| guard.objective_band(eval.cost, evidence));
+            let resolution = guard.value_resolution(eval.cost, &evidence);
             self.accepted_trials.stage(PendingOuterEval {
                 rho: x.clone(),
                 cost: eval.cost,
+                resolution,
+                gradient: eval.gradient.clone(),
                 projected_grad_norm: rail_projected_gradient_norm(
                     x,
                     &eval.gradient,
                     self.cost_stall_bounds.as_ref(),
                 ),
                 inner_converged: inner_solve_converged(self.outer_inner_cap.as_ref()),
-                objective_band,
             });
         }
         log::debug!(
