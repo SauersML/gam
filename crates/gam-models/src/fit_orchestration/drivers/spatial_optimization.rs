@@ -6146,6 +6146,107 @@ where
     })
 }
 
+/// Whether the latent-coordinate joint criterion carries objective terms the
+/// driver adds on top of the base REML/LAML evaluation: the identifiability
+/// objective of every gauge mode except `None` (the auxiliary or isometry
+/// prior with its log-precision normalizer, ARD, the behavioral head) and the
+/// analytic latent penalties.
+///
+/// The HybridEFS fixed point cannot optimize such a criterion. Its ρ and ψ
+/// steps are built inside the REML evaluator from the base gradient alone
+/// (`compute_hybrid_efs_update`), so the driver terms never reach a step: the
+/// latent coordinates move without their prior, and the direct hyperparameters
+/// and analytic-penalty ρ, whose design drift is zero, never move at all. Its
+/// cost line search also compares a full-criterion trial (`eval_cost`) against
+/// a current cost that lacks them. Such a criterion runs on the gradient lane,
+/// whose `eval_full` carries every term.
+fn latent_joint_criterion_has_driver_terms(
+    id_mode: &gam_terms::latent::LatentIdMode,
+    has_analytic_penalties: bool,
+) -> bool {
+    has_analytic_penalties || !matches!(id_mode, gam_terms::latent::LatentIdMode::None)
+}
+
+#[cfg(test)]
+mod latent_joint_efs_criterion_tests {
+    use super::*;
+    use gam_terms::latent::{AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold};
+
+    fn latent_block(id_mode: LatentIdMode) -> LatentCoordValues {
+        let t = ndarray::array![[0.4, -1.1], [1.3, 0.2], [-0.7, 0.9]];
+        LatentCoordValues::from_matrix_with_manifold(t.view(), id_mode, LatentManifold::Euclidean)
+    }
+
+    /// Only the bare `None` gauge without analytic penalties leaves the base
+    /// REML criterion whole, so only it may take the fixed point.
+    #[test]
+    fn only_a_bare_criterion_admits_the_fixed_point() {
+        let reference = Array2::<f64>::zeros((3, 2));
+        assert!(!latent_joint_criterion_has_driver_terms(&LatentIdMode::None, false));
+        assert!(latent_joint_criterion_has_driver_terms(&LatentIdMode::None, true));
+        for strength in [AuxPriorStrength::Auto, AuxPriorStrength::Fixed(2.0)] {
+            let mode = LatentIdMode::IsometryToReference {
+                reference: reference.clone(),
+                strength,
+            };
+            assert!(latent_joint_criterion_has_driver_terms(&mode, false));
+        }
+        assert!(latent_joint_criterion_has_driver_terms(
+            &LatentIdMode::DimSelection {
+                init_log_precision: None
+            },
+            false
+        ));
+    }
+
+    /// The terms the fixed point cannot see are live: an isometry anchor with a
+    /// REML-selected log-μ adds `½ μ ‖t − ref‖² − ½ K log μ` to the cost and a
+    /// nonzero gradient on the latent block and on its log-μ slot, a slot whose
+    /// zero design drift gives the base-REML EFS step nothing to move. The
+    /// `None` gauge adds exactly nothing.
+    #[test]
+    fn the_isometry_anchor_moves_cost_and_its_direct_slot() {
+        let reference = Array2::<f64>::zeros((3, 2));
+        let latent = latent_block(LatentIdMode::IsometryToReference {
+            reference,
+            strength: AuxPriorStrength::Auto,
+        });
+        let rho_dim = 1;
+        let log_mu = 0.5_f64;
+        let mut theta = Array1::<f64>::zeros(rho_dim + latent.len() + 1);
+        theta
+            .slice_mut(s![rho_dim..rho_dim + latent.len()])
+            .assign(latent.as_flat());
+        theta[rho_dim + latent.len()] = log_mu;
+        let contribution = latent_id_objective_contribution(&theta, rho_dim, 0, &latent)
+            .expect("isometry contribution");
+        let q: f64 = latent.as_flat().iter().map(|v| v * v).sum();
+        let mu = log_mu.exp();
+        let k = latent.len() as f64;
+        let expected_cost = 0.5 * mu * q - 0.5 * k * log_mu;
+        assert!((contribution.cost - expected_cost).abs() <= 1e-12 * (1.0 + expected_cost.abs()));
+        let expected_slot = 0.5 * mu * q - 0.5 * k;
+        let slot = contribution.gradient[rho_dim + latent.len()];
+        assert!((slot - expected_slot).abs() <= 1e-12 * (1.0 + expected_slot.abs()));
+        assert!(slot.abs() > 0.1, "the log-mu slot carries a live gradient: {slot}");
+        for (idx, &value) in latent.as_flat().iter().enumerate() {
+            let grad = contribution.gradient[rho_dim + idx];
+            assert!((grad - mu * value).abs() <= 1e-12 * (1.0 + (mu * value).abs()));
+        }
+        assert_eq!(contribution.gradient[0], 0.0);
+
+        let bare = latent_block(LatentIdMode::None);
+        let mut bare_theta = Array1::<f64>::zeros(rho_dim + bare.len());
+        bare_theta
+            .slice_mut(s![rho_dim..rho_dim + bare.len()])
+            .assign(bare.as_flat());
+        let none = latent_id_objective_contribution(&bare_theta, rho_dim, 0, &bare)
+            .expect("bare contribution");
+        assert_eq!(none.cost, 0.0);
+        assert!(none.gradient.iter().all(|&g| g == 0.0));
+    }
+}
+
 fn try_exact_joint_latent_coord_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -6283,14 +6384,28 @@ fn try_exact_joint_latent_coord_optimization(
             self.cache
                 .ensure_theta(theta)
                 .map_err(EstimationError::InvalidInput)?;
+            let registry_for_key = self.cache.analytic_penalties();
+            let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
+            if latent_joint_criterion_has_driver_terms(
+                latent.id_mode(),
+                registry_for_key.is_some(),
+            ) {
+                // The outer problem disables the fixed point for this
+                // criterion (see `latent_joint_criterion_has_driver_terms`),
+                // so reaching here is a construction defect, not a trial point.
+                crate::bail_invalid_estim!(
+                    "latent-coordinate joint EFS was asked to step a criterion carrying \
+                     driver-side identifiability or analytic-penalty terms, which its \
+                     base-REML steps cannot see"
+                );
+            }
             let hyper_dirs = self
                 .cache
                 .hyper_dirs()
                 .map_err(EstimationError::InvalidInput)?;
-            let registry_for_key = self.cache.analytic_penalties();
             self.evaluator
                 .set_analytic_penalty_registry(registry_for_key.as_deref());
-            let mut efs = evaluate_joint_reml_efs_at_theta(
+            evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
                 theta,
@@ -6298,32 +6413,7 @@ fn try_exact_joint_latent_coord_optimization(
                 hyper_dirs,
                 None,
                 Some(self.cache.design_revision()),
-            )?;
-            if let Some(registry) = registry_for_key {
-                let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
-                let contribution = analytic_penalty_objective_contribution(
-                    theta,
-                    self.rho_dim,
-                    latent.as_ref(),
-                    registry.as_ref(),
-                )?;
-                efs.cost += contribution.cost;
-                if let (Some(psi_gradient), Some(psi_indices)) =
-                    (efs.psi_gradient.as_mut(), efs.psi_indices.as_ref())
-                {
-                    if psi_gradient.len() != psi_indices.len() {
-                        crate::bail_invalid_estim!(
-                            "latent-coordinate analytic penalty EFS psi gradient length mismatch: gradient={}, indices={}",
-                            psi_gradient.len(),
-                            psi_indices.len()
-                        );
-                    }
-                    for (local_idx, &theta_idx) in psi_indices.iter().enumerate() {
-                        psi_gradient[local_idx] += contribution.gradient[theta_idx];
-                    }
-                }
-            }
-            Ok(efs)
+            )
         }
 
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
@@ -6440,7 +6530,13 @@ fn try_exact_joint_latent_coord_optimization(
         theta0.len(),
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
-        false,
+        // The HybridEFS fixed point steps only the base REML criterion; a
+        // criterion with driver-side terms runs on the gradient lane, whose
+        // `eval_full` carries them.
+        latent_joint_criterion_has_driver_terms(
+            latent.values.id_mode(),
+            latent.analytic_penalties.is_some(),
+        ),
         options.tol,
         options.max_iter.max(1),
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
