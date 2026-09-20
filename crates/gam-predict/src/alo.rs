@@ -3134,4 +3134,30 @@ mod tests {
         assert_eq!(active_ranges, vec![0..2]);
         assert_eq!(active_designs[0].to_dense(), expected);
     }
+
+    #[test]
+    fn standard_alo_covariance_scale_restores_only_the_profiled_gaussian_scale() {
+        // The saved covariance is the unscaled inverse penalized Hessian; only
+        // a profiled Gaussian carries sigma^2 outside it. A fixed-shape Gamma
+        // folds its dispersion into the working weights, so its scale is 1.
+        let gaussian = GlmLikelihoodSpec::try_new(
+            gam_spec::LikelihoodSpec::gaussian_identity(),
+            gam_spec::LikelihoodScaleMetadata::ProfiledGaussian,
+        )
+        .expect("profiled Gaussian");
+        assert_eq!(
+            standard_alo_covariance_scale(&gaussian, 1.5).expect("scale"),
+            2.25
+        );
+        let gamma = GlmLikelihoodSpec::try_new(
+            gam_spec::LikelihoodSpec::gamma_log(),
+            gam_spec::LikelihoodScaleMetadata::FixedGammaShape { shape: 4.0 },
+        )
+        .expect("fixed-shape Gamma");
+        assert_eq!(
+            standard_alo_covariance_scale(&gamma, 1.5).expect("scale"),
+            1.0
+        );
+        assert!(standard_alo_covariance_scale(&gaussian, 0.0).is_err());
+    }
 }
