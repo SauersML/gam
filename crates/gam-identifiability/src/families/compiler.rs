@@ -779,6 +779,11 @@ pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) -> Res
     let k = m.nrows();
     assert_eq!(m.ncols(), k);
     assert_eq!(out.shape(), &[k, k]);
+    if m.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "symmetric square root of a {k}x{k} row metric: non-finite entry"
+        ));
+    }
     if k == 1 {
         out[[0, 0]] = m[[0, 0]].max(0.0).sqrt();
         return Ok(());
@@ -786,14 +791,25 @@ pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) -> Res
     let (evals, evecs) = m.eigh(Side::Lower).map_err(|e| {
         format!("symmetric square root of a {k}x{k} row metric: eigendecomposition failed ({e:?})")
     })?;
-    // out = U · diag(sqrt(max(0, λ))) · Uᵀ, formed explicitly for K ≤ 4.
+    if evals
+        .iter()
+        .chain(evecs.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "symmetric square root of a {k}x{k} row metric: non-finite eigendecomposition"
+        ));
+    }
+    // Form one triangle of U diag(sqrt(max(0, λ))) Uᵀ and mirror it.
+    // Independent triangle sums can round differently despite exact symmetry.
     for i in 0..k {
-        for j in 0..k {
+        for j in 0..=i {
             let mut acc = 0.0;
             for l in 0..k {
                 acc += evecs[[i, l]] * evals[l].max(0.0).sqrt() * evecs[[j, l]];
             }
             out[[i, j]] = acc;
+            out[[j, i]] = acc;
         }
     }
     Ok(())
@@ -1720,11 +1736,7 @@ mod tests {
         let compiled = compile(
             &ops,
             &hess,
-            &[
-                BlockOrder::Marginal,
-                BlockOrder::Slope,
-                BlockOrder::LinkDev,
-            ],
+            &[BlockOrder::Marginal, BlockOrder::Slope, BlockOrder::LinkDev],
         )
         .expect("compile should succeed");
         let total: usize = compiled.blocks.iter().map(|b| b.t_lw.ncols()).sum();
@@ -2227,16 +2239,36 @@ mod tests {
         }
     }
 
-    /// A metric the eigendecomposition cannot represent never comes back as a finite
-    /// square root: it is either refused or carries its non-finite entry through.
+    /// A metric outside the finite domain is refused before the eigensolver or
+    /// scalar PSD projection can erase the invalid entry.
     #[test]
     fn symmetric_sqrt_of_a_non_finite_metric_is_not_a_finite_substitute() {
         let h = ndarray::array![[1.0, f64::NAN], [f64::NAN, 1.0]];
         let mut root = Array2::<f64>::zeros((2, 2));
         let result = symmetric_sqrt_into(&h, &mut root);
         assert!(
-            result.is_err() || root.iter().any(|v| !v.is_finite()),
+            result.is_err(),
             "a non-finite metric must not produce a finite square root: {root:?}"
         );
+    }
+
+    #[test]
+    fn nonfinite_scalar_metric_is_refused_through_both_compiler_operators() {
+        use crate::families::bernoulli::BernoulliDenseDesignOperator;
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let hessian = DiagonalScalarRowHessian::new(ndarray::array![1.0, invalid]);
+            let design = ndarray::array![[1.0], [2.0]];
+            let operators: [Arc<dyn RowJacobianOperator>; 2] = [
+                op(design.clone()),
+                Arc::new(BernoulliDenseDesignOperator::new(design)),
+            ];
+            for operator in operators {
+                let error = compile(&[operator], &hessian, &[BlockOrder::Marginal])
+                    .err()
+                    .expect("a non-finite row metric must fail the public compiler");
+                assert!(matches!(error, CompilerError::LinalgFailure(_)), "{error}");
+                assert!(error.to_string().contains("row 1"), "{error}");
+            }
+        }
     }
 }
