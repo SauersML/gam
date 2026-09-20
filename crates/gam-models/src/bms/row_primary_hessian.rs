@@ -1618,13 +1618,48 @@ impl BernoulliMarginalSlopeFamily {
         }
     }
 
+    /// The contiguous row-major dense views of both designs, which the
+    /// device-resident executor keeps on the device; `None` when either design
+    /// has none.
+    fn flex_dense_designs(&self) -> Option<(&[f64], &[f64])> {
+        Some((
+            self.marginal_design.as_dense_ref()?.as_slice()?,
+            self.slope_design.as_dense_ref()?.as_slice()?,
+        ))
+    }
+
+    /// The shape this family's row-primary Hessian is raced and recorded on
+    /// (gam#3024): the device executor the designs admit (resident with dense
+    /// designs, a host pin otherwise), the rows, the primary, marginal, slope
+    /// and total coefficient widths, and the CPU executor's threads.
+    fn flex_row_kernel_shape(&self) -> gam_gpu::RowKernelShape {
+        let slices = block_slices(self);
+        let primary = primary_slices(&slices);
+        let resident = cfg!(target_os = "linux") && self.flex_dense_designs().is_some();
+        gam_gpu::RowKernelShape {
+            kernel: if resident {
+                gam_gpu::GpuKernel::MarginalSlopeRows
+            } else {
+                gam_gpu::GpuKernel::MarginalSlopeRowsHostPin
+            },
+            rows: self.y.len(),
+            widths: [
+                primary.total,
+                slices.marginal.len(),
+                slices.slope.len(),
+                slices.total,
+            ],
+            threads: rayon::current_num_threads(),
+        }
+    }
+
     /// Which kernel builds this family's row-primary Hessian: the one decision,
     /// read at fit entry (where `gpu=required` for a model the device kernel
     /// does not compute is refused before any seed) and by every cache build.
     pub(super) fn flex_row_kernel_decision(&self) -> Result<gam_gpu::GpuDecision, String> {
         crate::bms::gpu::flex::require_row_primary_hessian_supported(
             &self.flex_row_model(),
-            self.y.len(),
+            self.flex_row_kernel_shape(),
         )
     }
 
@@ -1637,8 +1672,7 @@ impl BernoulliMarginalSlopeFamily {
             return Ok(RowPrimaryEvalCache::Empty);
         }
         let n = self.y.len();
-        let primary = &cache.primary;
-        let r = primary.total;
+        let r = cache.primary.total;
         // On its own, the live reading folded into the monotone capacity floor
         // keeps the per-shape single-cache budget stable across workspace
         // rebuilds while the live reading drives the global-pin OOM guard. In a
@@ -1655,11 +1689,35 @@ impl BernoulliMarginalSlopeFamily {
             workspace_pinned,
         );
         let gpu_decision = self.flex_row_kernel_decision()?;
-        // When policy selects GPU, backend readiness is part of the execution
-        // contract. A failed probe is surfaced immediately; silently changing
-        // algorithms after selection would make both performance and failure
-        // semantics data-dependent.
-        if gpu_decision.use_gpu {
+        let resident = gpu_decision.kernel == gam_gpu::GpuKernel::MarginalSlopeRows;
+        // The host-pin device executor builds the pin the memory plan sizes, so
+        // under `auto` it is raced or run only where the plan materializes one,
+        // and raced only where the discarded device pin fits beside the kept
+        // CPU pin. `required` runs it wherever it is selected.
+        let host_pin_admitted =
+            plan.materialize || matches!(gpu_decision.policy, gam_gpu::GpuPolicy::Required);
+        let host_pin_race_fits = plan.materialize
+            && plan
+                .workspace_pinned_bytes
+                .saturating_add(plan.bytes.saturating_mul(2))
+                <= plan.global_pin_budget_bytes;
+        let race = gpu_decision.race.filter(|_| resident || host_pin_race_fits);
+        let use_gpu = gpu_decision.use_gpu && (resident || host_pin_admitted);
+        let gpu_decision = if (use_gpu, race) == (gpu_decision.use_gpu, gpu_decision.race) {
+            gpu_decision
+        } else {
+            gam_gpu::GpuDecision {
+                use_gpu,
+                race,
+                reason: "cpu-device-host-pin-outside-memory-plan",
+                ..gpu_decision
+            }
+        };
+        // When policy selects GPU, or races it, backend readiness is part of the
+        // execution contract. A failed probe is surfaced immediately; silently
+        // changing algorithms after selection would make both performance and
+        // failure semantics data-dependent.
+        if use_gpu || race.is_some() {
             let backend = crate::bms::gpu::flex::BmsFlexGpuBackend::probe()
                 .map_err(|err| format!("BMS FLEX GPU backend probe failed: {err}"))?;
             if log_exact_work(n) {
@@ -1669,7 +1727,164 @@ impl BernoulliMarginalSlopeFamily {
                 );
             }
         }
-        if !plan.materialize && !gpu_decision.use_gpu {
+        // GPU selection is fail-closed: every backend error is returned to the
+        // caller. The device kernel is selected only for a model it declares,
+        // and the packer is total over those models, so no input it is handed
+        // can send the build back to the CPU. CPU execution remains a separate
+        // policy decision, never an implicit retry of a selected GPU algorithm.
+        if let Some(shape) = race {
+            // A race times the whole inner step each executor would run: the
+            // resident device state serves every inner CG HVP, so both builds
+            // and every HVP against them are timed; the host pin serves the
+            // same HVPs either way, so its build is the race.
+            #[cfg(target_os = "linux")]
+            if resident {
+                let (race, cpu, device) = gam_gpu::ReusedStateRace::build(
+                    shape,
+                    || {
+                        self.build_row_primary_hessian_cpu_cache(
+                            block_states,
+                            cache,
+                            &plan,
+                            &gpu_decision,
+                        )
+                    },
+                    || self.build_row_primary_hessian_device_resident(block_states, cache),
+                )?;
+                return Ok(RowPrimaryEvalCache::Racing(Box::new(RowPrimaryEvalRace {
+                    cpu,
+                    device,
+                    race,
+                })));
+            }
+            return gam_gpu::race_row_kernel(
+                shape,
+                || {
+                    self.build_row_primary_hessian_cpu_cache(
+                        block_states,
+                        cache,
+                        &plan,
+                        &gpu_decision,
+                    )
+                },
+                || {
+                    self.build_row_primary_hessian_device_outputs(block_states, cache)
+                        .map(drop)
+                },
+            );
+        }
+        if !use_gpu {
+            return self.build_row_primary_hessian_cpu_cache(
+                block_states,
+                cache,
+                &plan,
+                &gpu_decision,
+            );
+        }
+        let started = std::time::Instant::now();
+        let process_monitor_guard = gam_runtime::process_monitor::track_scope(format!(
+            "BMS row-primary-hessian-device n={n} r={r} kernel={}",
+            gpu_decision.kernel.as_str()
+        ));
+        #[cfg(target_os = "linux")]
+        if resident {
+            let device_state =
+                self.build_row_primary_hessian_device_resident(block_states, cache)?;
+            if log_exact_work(n) {
+                log::debug!(
+                    "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
+                    n,
+                    r,
+                    started.elapsed().as_secs_f64()
+                );
+            }
+            drop(process_monitor_guard);
+            return Ok(RowPrimaryEvalCache::Device(device_state));
+        }
+        let outputs = self.build_row_primary_hessian_device_outputs(block_states, cache)?;
+        if log_exact_work(n) {
+            log::debug!(
+                "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
+                n,
+                r,
+                started.elapsed().as_secs_f64()
+            );
+        }
+        let packed_neglog = Array1::<f64>::from_vec(outputs.neglog);
+        let packed_grad = Array2::<f64>::from_shape_vec((n, r), outputs.grad)
+            .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
+        let packed_hess = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
+            .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
+        drop(process_monitor_guard);
+        Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
+            packed_neglog,
+            packed_grad,
+            packed_hess,
+            plan.bytes,
+            self.search.as_ref().map(|member| Arc::clone(&member.lane)),
+        )))
+    }
+
+    /// The device-resident executor's state: the n×r² row Hessian and both
+    /// dense designs, kept on the device for every subsequent HVP, diagonal
+    /// and gradient launch.
+    #[cfg(target_os = "linux")]
+    fn build_row_primary_hessian_device_resident(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<crate::bms::gpu::row::DeviceResidentRowHess, String> {
+        let (md_slice, gd_slice) = self
+            .flex_dense_designs()
+            .ok_or("BMS FLEX device-resident row kernel needs contiguous dense designs")?;
+        let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
+        let block_layout = crate::bms::gpu::row::BmsFlexBlockLayout {
+            p_m: cache.slices.marginal.len(),
+            p_g: cache.slices.slope.len(),
+            h: cache.slices.h.clone(),
+            w: cache.slices.w.clone(),
+            p_total: cache.slices.total,
+        };
+        let primary_layout = crate::bms::gpu::row::BmsFlexPrimaryLayout {
+            h: cache.primary.h.clone(),
+            w: cache.primary.w.clone(),
+            r: cache.primary.total,
+        };
+        crate::bms::gpu::row::launch_bms_flex_row_kernel_device_resident(
+            owned.as_borrowed(),
+            md_slice,
+            gd_slice,
+            block_layout,
+            primary_layout,
+        )
+        .map_err(|err| format!("BMS FLEX device-resident row launch failed: {err}"))
+    }
+
+    /// The host-pin device executor's rows: the device kernel's neglog,
+    /// gradient and row Hessian, copied back to the host.
+    fn build_row_primary_hessian_device_outputs(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+    ) -> Result<crate::bms::gpu::row::BmsFlexRowKernelOutputs, String> {
+        let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
+        crate::bms::gpu::row::launch_bms_flex_row_kernel(owned.as_borrowed())
+            .map_err(|err| format!("BMS FLEX row launch failed: {err}"))
+    }
+
+    /// The CPU executor's cache under the memory plan: a pin when the plan
+    /// materializes one, tiles when reuse pays for them and they fit, otherwise
+    /// nothing, and the rows are streamed.
+    fn build_row_primary_hessian_cpu_cache(
+        &self,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        plan: &RowPrimaryHessianCachePlan,
+        gpu_decision: &gam_gpu::GpuDecision,
+    ) -> Result<RowPrimaryEvalCache, String> {
+        let n = self.y.len();
+        let r = cache.primary.total;
+        if !plan.materialize {
             let tiled_budget_bytes = plan
                 .global_pin_budget_bytes
                 .saturating_sub(plan.workspace_pinned_bytes);
@@ -1781,88 +1996,6 @@ impl BernoulliMarginalSlopeFamily {
                 gpu_decision.use_gpu,
                 gpu_decision.reason,
             );
-        }
-        // GPU selection is fail-closed: every backend error is returned to the
-        // caller. The device kernel is selected only for a model it declares,
-        // and the packer is total over those models, so no input it is handed
-        // can send the build back to the CPU. CPU execution remains a separate
-        // policy decision, never an implicit retry of a selected GPU algorithm.
-        if gpu_decision.use_gpu {
-            let owned = self.pack_bms_flex_row_kernel_inputs(block_states, cache)?;
-            // When both marginal/slope designs expose a contiguous dense
-            // view, keep the n×r² row Hessian + designs resident for all
-            // subsequent HVP / diagonal launches.
-            #[cfg(target_os = "linux")]
-            {
-                let marginal_dense = self.marginal_design.as_dense_ref();
-                let slope_dense = self.slope_design.as_dense_ref();
-                if let (Some(md), Some(gd)) = (marginal_dense, slope_dense) {
-                    if md.is_standard_layout() && gd.is_standard_layout() {
-                        let block_layout = crate::bms::gpu::row::BmsFlexBlockLayout {
-                            p_m: cache.slices.marginal.len(),
-                            p_g: cache.slices.slope.len(),
-                            h: cache.slices.h.clone(),
-                            w: cache.slices.w.clone(),
-                            p_total: cache.slices.total,
-                        };
-                        let primary_layout = crate::bms::gpu::row::BmsFlexPrimaryLayout {
-                            h: primary.h.clone(),
-                            w: primary.w.clone(),
-                            r: primary.total,
-                        };
-                        let md_slice = md
-                            .as_slice()
-                            .expect("dense marginal_design is row-major contiguous");
-                        let gd_slice = gd
-                            .as_slice()
-                            .expect("dense slope_design is row-major contiguous");
-                        let device_state =
-                            crate::bms::gpu::row::launch_bms_flex_row_kernel_device_resident(
-                                owned.as_borrowed(),
-                                md_slice,
-                                gd_slice,
-                                block_layout,
-                                primary_layout,
-                            )
-                            .map_err(|err| {
-                                format!("BMS FLEX device-resident row launch failed: {err}")
-                            })?;
-                        if log_exact_work(n) {
-                            log::debug!(
-                                "[BMS row-primary-hessian-cache] gpu_device_resident_ok rows={} r={} elapsed={:.3}s",
-                                n,
-                                r,
-                                started.elapsed().as_secs_f64()
-                            );
-                        }
-                        drop(process_monitor_guard);
-                        return Ok(RowPrimaryEvalCache::Device(device_state));
-                    }
-                }
-            }
-            let outputs = crate::bms::gpu::row::launch_bms_flex_row_kernel(owned.as_borrowed())
-                .map_err(|err| format!("BMS FLEX row launch failed: {err}"))?;
-            if log_exact_work(n) {
-                log::debug!(
-                    "[BMS row-primary-hessian-cache] gpu_launch_ok rows={} r={} elapsed={:.3}s",
-                    n,
-                    r,
-                    started.elapsed().as_secs_f64()
-                );
-            }
-            let packed_neglog = Array1::<f64>::from_vec(outputs.neglog);
-            let packed_grad = Array2::<f64>::from_shape_vec((n, r), outputs.grad)
-                .map_err(|err| format!("bms_flex_row grad shape: {err}"))?;
-            let packed_hess = Array2::<f64>::from_shape_vec((n, r * r), outputs.hess)
-                .map_err(|err| format!("bms_flex_row hess shape: {err}"))?;
-            drop(process_monitor_guard);
-            return Ok(RowPrimaryEvalCache::Host(RowPrimaryEvalPin::new(
-                packed_neglog,
-                packed_grad,
-                packed_hess,
-                plan.bytes,
-                self.search.as_ref().map(|member| Arc::clone(&member.lane)),
-            )));
         }
         let completed_rows = AtomicUsize::new(0);
         let progress_step = (n / 10).max(1);
