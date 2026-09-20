@@ -10,7 +10,7 @@ def test_difference_smooth_binding_is_marshalling_only() -> None:
         / "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs"
     ).read_text(encoding="utf-8")
     start = source.index("fn difference_smooth_json_impl(")
-    end = source.index("\nfn json_f64_vec", start)
+    end = source.index("\nstruct CurvatureInferenceRow", start)
     binding = source[start:end]
 
     assert "difference_smooth_report(" in binding

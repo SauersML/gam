@@ -47,24 +47,14 @@ pub(crate) fn materialize_standard<'a>(
     );
 
     // Per-family response-support validation (#335 Gamma requires y > 0;
-    // #337 Poisson/NegativeBinomial require y ≥ 0; mirrors the Beta
-    // (0,1)-support check in the external-design GLM path). The family
-    // itself owns the check — see `ResponseFamily::validate_response_support`
-    // — so adding a new family that constrains its support is a single edit
-    // on the type, not a coordinated update across every materializer.
-    family
-        .response
-        .validate_response_support(y.view())
-        .map_err(|violation| violation.message_for(&parsed.response))?;
-
-    // Per-family response-distribution degeneracy (#331 all-0/all-1 Bernoulli).
-    // Symmetric to validate_response_support —
-    // each `ResponseFamily` variant owns its own degeneracy classifier, the
-    // workflow only forwards the column name.
-    family
-        .response
-        .validate_response_degeneracy(y.view())
-        .map_err(|deg| deg.message_for(&parsed.response))?;
+    // #337 Poisson/NegativeBinomial require non-negative integer counts;
+    // mirrors the Beta (0,1)-support check in the external-design GLM path).
+    // The family itself owns the check — see
+    // `ResponseFamily::validate_response_support` — so adding a new family
+    // that constrains its support is a single edit on the type, not a
+    // coordinated update across every materializer. Only positive-weight rows
+    // are judged: a zero weight excludes its row from the likelihood.
+    validate_response_against_family(&family, y.view(), weights.view(), &parsed.response)?;
 
     // An explicit `linkwiggle(...)` term is only wired into the fit below for a
     // binomial family; reject it for a non-binomial response rather than drop
@@ -334,7 +324,6 @@ pub(crate) fn materialize_standard<'a>(
             offset: Arc::new(offset),
             spec,
             family,
-            estimate_tweedie_p: false,
             options,
             kappa_options,
             wiggle,

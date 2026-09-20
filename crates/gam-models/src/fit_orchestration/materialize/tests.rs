@@ -1157,6 +1157,48 @@ fn family_transformation_normal_uses_ctn_conflict_validation() {
 }
 
 #[test]
+fn location_scale_refuses_an_active_frailty_it_cannot_realize() {
+    use crate::survival::lognormal_kernel::{FrailtyScale, FrailtySpec, HazardLoading};
+    let data = workflow_test_dataset();
+    let frailties = [
+        FrailtySpec::GaussianShift {
+            scale: FrailtyScale::Fixed { sigma: 0.5 },
+        },
+        FrailtySpec::HazardMultiplier {
+            scale: FrailtyScale::Fixed { sigma: 0.5 },
+            loading: HazardLoading::Full,
+        },
+    ];
+    for (formula, family) in [("bmi ~ age_entry", None), ("event ~ bmi", Some("binomial"))] {
+        for frailty in frailties.clone() {
+            let config = FitConfig {
+                family: family.map(str::to_string),
+                noise_formula: Some("1".to_string()),
+                frailty,
+                ..FitConfig::default()
+            };
+            let err = materialize(formula, &data, &config).err();
+            assert!(
+                matches!(&err, Some(WorkflowError::InvalidConfig { reason })
+                    if reason.contains("frailty is not supported for location-scale")),
+                "{formula}: a location-scale fit must refuse a frailty it would drop, got {:?}",
+                err.map(|error| error.to_string())
+            );
+        }
+    }
+    // Without a frailty the same requests still materialize.
+    for (formula, family) in [("bmi ~ age_entry", None), ("event ~ bmi", Some("binomial"))] {
+        let config = FitConfig {
+            family: family.map(str::to_string),
+            noise_formula: Some("1".to_string()),
+            ..FitConfig::default()
+        };
+        materialize(formula, &data, &config)
+            .unwrap_or_else(|error| panic!("{formula}: location-scale without frailty: {error}"));
+    }
+}
+
+#[test]
 fn survival_marginal_slope_rejects_zero_event_data_before_fit() {
     let mut data = workflow_test_dataset();
     data.values.column_mut(2).fill(0.0);
