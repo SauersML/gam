@@ -191,7 +191,7 @@ pub(crate) const SMOOTH_HEAD_KEYWORDS: [&str; 11] = [
 /// `shape=<kind>` option understood by the formula DSL.
 ///
 /// `constraints` pairs the smooth-term text as it appears in the formula
-/// (e.g. `"s(x)"` or `"s(x, type=duchon, centers=8)"`) with a `shape=` value
+/// (e.g. `"s(x)"` or `"s(x, bs=duchon, centers=8)"`) with a `shape=` value
 /// in the grammar of [`parse_shape_expr`] (an atom, a conjunction
 /// `[monotone_increasing, concave]`, or a per-margin `te()` list); comparison
 /// is exact after whitespace removal. A `"none"` constraint is a no-op.
@@ -1266,7 +1266,7 @@ pub struct RandomEffectTermSpec {
     /// time (encoded as an out-of-vocabulary code and shrunk toward the
     /// population mean) instead of raising a schema mismatch.
     ///
-    /// Only a genuine random effect — `group(g)`/`re(g)`/`s(g, bs="re")` — is
+    /// Only a genuine random effect — `group(g)`/`s(g, bs="re")` — is
     /// lenient: the held-out-group policy is a deliberate contract. A FIXED
     /// categorical factor — a bare `+ g` OR an explicit `factor(g)` — although
     /// materialized as a penalized one-hot block, must raise on an
@@ -1332,7 +1332,7 @@ pub struct TermCollectionSpec {
 ///
 /// Only when no term spans the constant is it removed (`NoIntercept`): every
 /// effect then passes through the origin, as a parametric no-intercept fit
-/// does. A genuine random effect (`group(g)`, `re(g)`) never spans it: its
+/// does. A genuine random effect (`group(g)`) never spans it: its
 /// levels are mean-zero deviations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum ModelLevel {

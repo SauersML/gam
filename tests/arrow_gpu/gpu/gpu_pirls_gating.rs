@@ -178,15 +178,15 @@ fn gpu_pirls_gating_1_newton_sign_gaussian_direction() {
 }
 
 // ---------------------------------------------------------------------------
-// Test 2 — Penalty gradient sign and shift
+// Test 2 — Penalty gradient sign
 //
-// Contract: with non-zero S and linear_shift, the gradient inside the loop
-// must be g = Sβ − linear_shift − Xᵀscore (not +Xᵀscore or −Sβ).
+// Contract: with non-zero S, the gradient inside the loop
+// must be g = Sβ − Xᵀscore (not +Xᵀscore or −Sβ).
 // We verify indirectly: the converged β must satisfy the KKT stationarity
 // condition ‖Sβ + Xᵀresid‖ / (1 + ‖β‖) ≈ 0.
 // ---------------------------------------------------------------------------
 #[test]
-fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
+fn gpu_pirls_gating_2_penalty_gradient_sign() {
     let n = 80_usize;
     let p = 6_usize;
     let mut rng = StdRng::seed_from_u64(0xDEAD_BEEF_0002);
@@ -241,7 +241,7 @@ fn gpu_pirls_gating_2_penalty_gradient_sign_and_shift() {
         relative_grad < 1e-6,
         "PIRLS must reach a gradient-stationary solution under ridge \
          penalty.  Relative gradient norm = {relative_grad:.3e} (tol 1e-6). \
-         If large, the penalty gradient sign or linear_shift is wrong."
+         If large, the penalty gradient sign is wrong."
     );
 }
 

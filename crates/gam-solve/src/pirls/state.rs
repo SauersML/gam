@@ -100,11 +100,12 @@ pub struct WorkingState {
     pub firth: FirthDiagnostics,
     pub hessian_curvature: HessianCurvatureKind,
     // Natural scale of the penalized gradient, used to form a scale-invariant
-    // KKT certificate.  Equal to ||X'(weighted_residual)||_2 + ||S*beta||_2.
-    // Under
-    // stochastic noise the score component scales as O(sqrt(n)), so an
-    // absolute ||g||_2 < tol test rejects fits whose normalized stationarity
-    // residual is already negligible. Convergence uses ||g||_2 / this.
+    // KKT certificate: [`penalized_gradient_natural_scale`] of the terms whose
+    // combination is the gradient, ||X'W eta||_2 + ||X'W z||_2 + ||S*beta||_2.
+    // Under stochastic noise the score operands scale as O(sqrt(n)) or faster,
+    // so an absolute ||g||_2 < tol test rejects fits whose normalized
+    // stationarity residual is already negligible. Convergence uses
+    // ||g||_2 / this.
     pub gradient_natural_scale: f64,
 }
 
@@ -121,7 +122,7 @@ impl WorkingState {
     }
 
     /// Scale-invariant relative gradient residual
-    /// `‖g‖ / (‖score‖ + ‖S·β‖)`.
+    /// `‖g‖ / (‖XᵀWη‖ + ‖XᵀWz‖ + ‖S·β‖)`.
     ///
     /// `g_norm` is the projected/constrained stationarity residual in the
     /// current PIRLS basis; the denominator is the natural magnitude of the
@@ -182,6 +183,34 @@ pub fn relative_gradient_residual(g_norm: f64, natural_scale: f64) -> f64 {
     } else {
         g_norm / natural_scale
     }
+}
+
+/// Natural scale of the penalized gradient `g = XᵀW(η − z) + S_λβ`: the norms
+/// of the terms whose combination forms it, `‖XᵀWη‖ + ‖XᵀWz‖ + ‖S_λβ‖`.
+///
+/// The scale is read at the optimum, where `g` cancels, so it has to be built
+/// from the operands of that cancellation rather than from any part of the
+/// result. The score `XᵀW(η − z)` is itself cancelled: at an interior optimum
+/// of an unpenalised coefficient `S_λβ = 0` and the score is rounding-level,
+/// so a scale `‖score‖ + ‖S_λβ‖` collapsed to the gradient's own magnitude and
+/// the stationarity ratio read about 1 on a fully converged fit (#3339).
+/// `XᵀWη` and `XᵀWz` are the P-IRLS analogue of the metric projection's `Hβ`
+/// and `rhs`: they are what the score subtracts, they stay at the data's
+/// magnitude however well the fit has converged, and they scale with the
+/// objective (`W → cW`) and with the coefficients (`X → XD`) exactly as the
+/// gradient does, so the ratio stays unit-free. By the triangle inequality the
+/// scale is never smaller than `‖score‖ + ‖S_λβ‖`.
+///
+/// `xt_w_eta` and `xt_w_z` must be in the basis the gradient is reported in,
+/// and `s_beta` is the penalty's shifted gradient `S_λβ − shift` the producer
+/// added to the score.
+#[inline]
+pub fn penalized_gradient_natural_scale(
+    xt_w_eta: &Array1<f64>,
+    xt_w_z: &Array1<f64>,
+    s_beta: &Array1<f64>,
+) -> f64 {
+    array1_l2_norm(xt_w_eta) + array1_l2_norm(xt_w_z) + array1_l2_norm(s_beta)
 }
 
 /// Numerically stable Euclidean norm of an `Array1<f64>`.

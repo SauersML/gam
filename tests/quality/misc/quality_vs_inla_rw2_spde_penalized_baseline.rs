@@ -112,9 +112,9 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
 
-    // ---- fit gam on the TRAINING rows: logratio ~ s(range, bs='ps', m=2) --
-    // bs='ps' with a SECOND-order difference penalty (penalty_order=2 is gam's
-    // spelling of mgcv's `m=2`) -> the discrete analog of INLA's rw2 latent
+    // ---- fit gam on the TRAINING rows: logratio ~ s(range, bs='ps', penalty_order=2) --
+    // bs='ps' with a SECOND-order difference penalty (penalty_order=2) -> the
+    // discrete analog of INLA's rw2 latent
     // prior; REML selects lambda by marginal likelihood.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -289,7 +289,7 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla() {
 /// honest quality claim is predictive: does gam's 2-D smooth of magnitude over
 /// geographic location generalize to quakes it never saw? We make a fully
 /// deterministic train/test split (every 5th row, by original file order, is
-/// held out), fit `mag ~ s(long, lat, bs='tp')` on the training rows only,
+/// held out), fit `mag ~ s(long, lat, bs='tps')` on the training rows only,
 /// predict the held-out rows from the frozen smooth, and assert
 ///
 ///   1. an **absolute held-out informativeness bar**: out-of-sample
@@ -366,7 +366,7 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
     let mut train_ds = ds.clone();
     train_ds.values = train_values;
 
-    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs='tp'), REML --------------
+    // ---- fit gam on TRAIN: mag ~ s(long, lat, bs='tps'), REML --------------
     // A 2-D thin-plate regression spline over geographic location: the planar,
     // isotropic analog of the 1-D RW2 smoothness penalty, with REML selecting
     // the smoothing parameter by marginal likelihood.
@@ -374,7 +374,7 @@ fn gam_rw2_pspline_predicts_held_out_at_least_as_well_as_inla_on_real_data() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("mag ~ s(long, lat, bs='tp')", &train_ds, &cfg)
+    let result = fit_from_formula("mag ~ s(long, lat, bs='tps')", &train_ds, &cfg)
         .expect("gam 2-D thin-plate spatial fit on training rows");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");

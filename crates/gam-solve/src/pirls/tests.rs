@@ -2830,6 +2830,66 @@ mod tests {
         assert!(err.is_trial_point_infeasible());
     }
 
+    /// The cold-start working weight is the Fisher weight at the weighted mean:
+    /// for the inverse-Gaussian inverse-squared link `W = w·ȳ³/(4φ)` on every
+    /// row, whatever the other design columns hold. Rescaling `y → c·y` with the
+    /// dispersion `φ → φ/c` scales it by `c⁴`, exactly as the fitted working
+    /// weight does, which is the unit covariance the analytic `initial.sp` seed
+    /// and the ρ-domain Gram rely on. The weight needs no solve, so it exists at
+    /// responses where the inner solve at the seed point refuses (the fuzzer's
+    /// inverse-Gaussian n = 50 cells lost their seed to such a refusal).
+    #[test]
+    pub(crate) fn start_working_weights_follow_response_units() {
+        let t = array![-1.0, -0.4, 0.1, 0.5, 0.9, 1.3];
+        let mut x = Array2::<f64>::ones((t.len(), 2));
+        x.column_mut(1).assign(&t);
+        let design = DesignMatrix::from(x);
+        let y = array![0.6, 1.4, 0.9, 2.2, 1.1, 3.0];
+        let w = array![1.0, 2.0, 0.5, 1.5, 1.0, 3.0];
+        let offset = Array1::zeros(y.len());
+        let config_at = |phi: f64| {
+            let link = InverseLink::Standard(StandardLink::InverseSquared);
+            PirlsConfig {
+                likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::InverseGaussian,
+                    link.clone(),
+                ))
+                .with_dispersion_phi_frozen_for_search(phi),
+                link_kind: link,
+                max_iterations: 100,
+                convergence_tolerance: 1e-8,
+                firth_bias_reduction: false,
+                initial_lm_lambda: None,
+            }
+        };
+        let phi = 0.7;
+        let weights = super::start_working_weights(
+            &design,
+            y.view(),
+            w.view(),
+            offset.view(),
+            &config_at(phi),
+        )
+        .expect("start weights at a positive response");
+        let ybar = y.dot(&w) / w.sum();
+        for (&wi, &wt) in w.iter().zip(weights.iter()) {
+            assert_relative_eq!(wt, wi * ybar.powi(3) / (4.0 * phi), max_relative = 1e-12);
+        }
+
+        let c = 3.0;
+        let scaled = super::start_working_weights(
+            &design,
+            (&y * c).view(),
+            w.view(),
+            offset.view(),
+            &config_at(phi / c),
+        )
+        .expect("start weights at a rescaled response");
+        for (&wt, &ws) in weights.iter().zip(scaled.iter()) {
+            assert_relative_eq!(ws, c.powi(4) * wt, max_relative = 1e-12);
+        }
+    }
+
     #[test]
     pub(crate) fn poisson_cache_rehydration_preserves_log_derivatives() {
         let x = array![[1.0], [1.0], [1.0], [1.0]];

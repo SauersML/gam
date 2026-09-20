@@ -108,7 +108,7 @@ pub use reweight::{
     ExactNewtonDecrementEvidence, exact_newton_decrement_evidence, runworking_model_pirls,
 };
 
-pub use state::{array1_l2_norm, relative_gradient_residual};
+pub use state::{array1_l2_norm, penalized_gradient_natural_scale, relative_gradient_residual};
 
 // Surface the `WorkingModel` trait (defined in the private `working_model_trait`
 // module) at the `pirls` root so out-of-crate engine implementors (gam-models
@@ -129,7 +129,7 @@ pub use state::{
 // merge_linear_constraints, sparse_from_denseview.
 use loop_driver::assert_symmetric_tol;
 
-pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
+pub(crate) use loop_driver::{fit_model_for_fixed_rho_with_adaptive_kkt, start_working_weights};
 
 pub use loop_driver::{
     PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,

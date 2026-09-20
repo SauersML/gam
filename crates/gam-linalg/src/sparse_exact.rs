@@ -42,6 +42,19 @@ impl SparseExactFactor {
         self.simplicial.l_values.len()
     }
 
+    /// The most stored entries in any one row of `L`. The recurrence for
+    /// `L_ij` (`j ≤ i`) sums `L_ik·L_jk` over `k < j`, and a product is nonzero
+    /// only where row `j` of `L` stores `k`, so no inner product the numeric
+    /// factorization forms has more terms than this. It is the length the
+    /// factor's componentwise backward error is charged at.
+    pub fn factor_max_row_nnz(&self) -> usize {
+        let mut counts = vec![0usize; self.n];
+        for &row in &self.simplicial.l_row_idx {
+            counts[row] += 1;
+        }
+        counts.into_iter().max().unwrap_or(0)
+    }
+
     /// Multiply-adds of the Takahashi recurrence on this factor: every pair of
     /// off-diagonal rows in a column of `L` costs one, so this is
     /// `Σ_j c_j²` over the off-diagonal counts `c_j`, the same order as the

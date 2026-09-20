@@ -58,7 +58,8 @@ use crate::probability::{
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth as growth, inflated};
 use crate::special::{CertifiedGaussLegendreRule, gauss_legendre_certified};
 use std::f64::consts::{FRAC_1_SQRT_2, LN_2, PI};
-use std::sync::{Arc, RwLock};
+use std::cell::RefCell;
+use std::sync::{Arc, LazyLock, RwLock};
 
 /// The ellipse log-radius `S₀`, the root of `s·tanh(s/2) = 1`, where `(1 + cosh s)/s` is least. The truncation's
 /// exponent grows as `T²(1 + cosh s)²/16` against the decay `2ns`, so `S₀` needs the fewest nodes at large `T`.
@@ -90,6 +91,48 @@ pub(super) fn rule_of_order(order: usize) -> Arc<CertifiedGaussLegendreRule> {
     }
     rule
 }
+
+thread_local! {
+    /// This thread's copy of [`CERTIFIED_RULES`], so a leaf reads its rule without the shared lock or a reference count.
+    static THREAD_RULES: RefCell<Vec<Option<Arc<CertifiedGaussLegendreRule>>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Runs `body` on the certified rule of `order`, read from this thread's cache and filled from [`rule_of_order`] on first
+/// use. `body` must not evaluate a leaf itself.
+fn with_rule_of_order<R>(order: usize, body: impl FnOnce(&CertifiedGaussLegendreRule) -> R) -> R {
+    THREAD_RULES.with(|rules| {
+        if let Some(Some(rule)) = rules.borrow().get(order) {
+            return body(rule);
+        }
+        let rule = rule_of_order(order);
+        let result = body(&rule);
+        let mut rules = rules.borrow_mut();
+        if rules.len() <= order {
+            rules.resize(order + 1, None);
+        }
+        rules[order] = Some(rule);
+        result
+    })
+}
+
+/// `cosh S₀`, `sinh S₀`, `e^{2S₀} − 1` and its logarithm, which every leaf reads: computed once, by the calls a leaf made
+/// for itself, so each leaf's arithmetic is unchanged.
+struct EllipseConstants {
+    cosh: f64,
+    sinh: f64,
+    decay: f64,
+    log_decay: f64,
+}
+
+static ELLIPSE: LazyLock<EllipseConstants> = LazyLock::new(|| {
+    let decay = libm::expm1(2.0 * LOG_RADIUS);
+    EllipseConstants {
+        cosh: LOG_RADIUS.cosh(),
+        sinh: LOG_RADIUS.sinh(),
+        decay,
+        log_decay: decay.ln(),
+    }
+});
 
 /// Mills' ratio `R(t) = Φ(−t)/φ(t)` and a bound on its relative error.
 /// - `t ≥ 0`: `√(2π)·Q(t)` from the table, within [`NORMAL_SCALED_TAIL_RELATIVE_ERROR`], plus the constant and the product.
@@ -149,8 +192,8 @@ fn ellipse_log_bound(length: f64, slopes: (f64, f64), curvatures: (f64, f64)) ->
     let (slope_lo, slope_hi) = slopes;
     let (curvature_left, curvature_right) = curvatures;
     let centre = 0.5 * length;
-    let major = centre * LOG_RADIUS.cosh();
-    let minor = centre * LOG_RADIUS.sinh();
+    let major = centre * ELLIPSE.cosh;
+    let minor = centre * ELLIPSE.sinh;
     let quadratic = |slope: f64, curvature: f64| {
         [
             -0.5 * (curvature * major * major + minor * minor),
@@ -178,8 +221,8 @@ fn ellipse_log_bound(length: f64, slopes: (f64, f64), curvatures: (f64, f64)) ->
 /// The terms are at most `mag` in size, so their rounding is within `γ₁₆·mag`.
 fn extension_ellipse_log_bound(length: f64, slope_lo: f64, rise: f64, tau: f64, reach: f64) -> f64 {
     let centre = 0.5 * length;
-    let major = centre * LOG_RADIUS.cosh();
-    let minor = centre * LOG_RADIUS.sinh();
+    let major = centre * ELLIPSE.cosh;
+    let minor = centre * ELLIPSE.sinh;
     // `q(x) = p₂x² + p₁x + p₀` at `x = C + Au`, plus `B²(1 − u²)/2`.
     let quadratic = |p2: f64, p1: f64, p0: f64| {
         [
@@ -277,9 +320,9 @@ fn leaf(h: f64, k: f64, correlation: Correlation, perturbation: Perturbation) ->
     );
 
     let log_max = ellipse_log_bound(length, (slope_lo, slope_hi), (curvature_left, curvature_right));
-    let decay = libm::expm1(2.0 * LOG_RADIUS);
+    let decay = ELLIPSE.decay;
     let span = 32.0 * length / 15.0;
-    let order = ((log_max + span.ln() - decay.ln() + level) / (2.0 * LOG_RADIUS))
+    let order = ((log_max + span.ln() - ELLIPSE.log_decay + level) / (2.0 * LOG_RADIUS))
         .ceil()
         .max(1.0) as usize;
     let quadrature_relative = inflated(
@@ -287,25 +330,27 @@ fn leaf(h: f64, k: f64, correlation: Correlation, perturbation: Perturbation) ->
         8,
     );
 
-    let rule = rule_of_order(order);
     let centre = 0.5 * length;
     let (mu_a, mu_b) = (mean_excess_bound(a), mean_excess_bound(b));
-    let (mut sum, mut sum_error) = (0.0, 0.0);
-    for (&node, &weight) in rule.nodes.iter().zip(&rule.weights) {
-        let w = centre * (1.0 + node);
-        let damping = libm::exp(-(w * (b + 0.5 * w)));
-        let (ratio, ratio_error) = mills_ratio(a + tau * w);
-        let term = weight * (damping * ratio);
-        // The node's position, the exponent, `exp`, the ratio's argument and value, and the product.
-        let relative = (b.abs() + tau * mu_a + w) * (centre * rule.node_error + growth(2) * w)
-            + 2.0 * UNIT_ROUNDOFF
-            + growth(2) * w * (b.abs() + 0.5 * w)
-            + mu_a * growth(2) * (a.abs() + tau * w)
-            + ratio_error
-            + UNIT_ROUNDOFF;
-        sum += term;
-        sum_error += term * relative;
-    }
+    let (sum, sum_error, weight_relative_error) = with_rule_of_order(order, |rule| {
+        let (mut sum, mut sum_error) = (0.0, 0.0);
+        for (&node, &weight) in rule.nodes.iter().zip(&rule.weights) {
+            let w = centre * (1.0 + node);
+            let damping = libm::exp(-(w * (b + 0.5 * w)));
+            let (ratio, ratio_error) = mills_ratio(a + tau * w);
+            let term = weight * (damping * ratio);
+            // The node's position, the exponent, `exp`, the ratio's argument and value, and the product.
+            let relative = (b.abs() + tau * mu_a + w) * (centre * rule.node_error + growth(2) * w)
+                + 2.0 * UNIT_ROUNDOFF
+                + growth(2) * w * (b.abs() + 0.5 * w)
+                + mu_a * growth(2) * (a.abs() + tau * w)
+                + ratio_error
+                + UNIT_ROUNDOFF;
+            sum += term;
+            sum_error += term * relative;
+        }
+        (sum, sum_error, rule.weight_relative_error)
+    });
     let integral = centre * sum;
 
     let (mu_first, mu_second) = if swapped { (mu_b, mu_a) } else { (mu_a, mu_b) };
@@ -313,7 +358,7 @@ fn leaf(h: f64, k: f64, correlation: Correlation, perturbation: Perturbation) ->
     let complement_gain = 1.0 + exponent + 0.5 * (mu_a * a.abs() + mu_b * b.abs());
     let relative = tail_relative
         + quadrature_relative
-        + rule.weight_relative_error
+        + weight_relative_error
         + growth(order + 1)
         + sum_error / sum
         + growth(1)
@@ -439,9 +484,9 @@ fn extension(h: f64, apex: f64, k: f64, correlation: Correlation) -> BoundedProb
     };
 
     let log_max = extension_ellipse_log_bound(length, slope_lo, rise, tau, reach);
-    let decay = libm::expm1(2.0 * LOG_RADIUS);
+    let decay = ELLIPSE.decay;
     let span = 32.0 * length / 15.0;
-    let order = ((log_max + span.ln() - decay.ln() + level) / (2.0 * LOG_RADIUS))
+    let order = ((log_max + span.ln() - ELLIPSE.log_decay + level) / (2.0 * LOG_RADIUS))
         .ceil()
         .max(1.0) as usize;
     let quadrature_relative = inflated(
@@ -449,31 +494,33 @@ fn extension(h: f64, apex: f64, k: f64, correlation: Correlation) -> BoundedProb
         8,
     );
 
-    let rule = rule_of_order(order);
     let centre = 0.5 * length;
-    let (mut sum, mut sum_error) = (0.0, 0.0);
-    for (&node, &weight) in rule.nodes.iter().zip(&rule.weights) {
-        let s = centre * (1.0 + node);
-        let damping = libm::exp(s * (b - 0.5 * s));
-        let (ratio, ratio_error) = mills_ratio((-tau).mul_add(s, a));
-        let term = weight * (damping * ratio);
-        // The node's position, the exponent, `exp`, the ratio's argument and value, and the product.
-        let relative = (b.abs() + s + tau * mu_end) * (centre * rule.node_error + growth(2) * s)
-            + 2.0 * UNIT_ROUNDOFF
-            + growth(2) * s * (b.abs() + 0.5 * s)
-            + mu_end * growth(1) * (a.abs() + tau * s)
-            + ratio_error
-            + 2.0 * UNIT_ROUNDOFF;
-        sum += term;
-        sum_error += term * relative;
-    }
+    let (sum, sum_error, weight_relative_error) = with_rule_of_order(order, |rule| {
+        let (mut sum, mut sum_error) = (0.0, 0.0);
+        for (&node, &weight) in rule.nodes.iter().zip(&rule.weights) {
+            let s = centre * (1.0 + node);
+            let damping = libm::exp(s * (b - 0.5 * s));
+            let (ratio, ratio_error) = mills_ratio((-tau).mul_add(s, a));
+            let term = weight * (damping * ratio);
+            // The node's position, the exponent, `exp`, the ratio's argument and value, and the product.
+            let relative = (b.abs() + s + tau * mu_end) * (centre * rule.node_error + growth(2) * s)
+                + 2.0 * UNIT_ROUNDOFF
+                + growth(2) * s * (b.abs() + 0.5 * s)
+                + mu_end * growth(1) * (a.abs() + tau * s)
+                + ratio_error
+                + 2.0 * UNIT_ROUNDOFF;
+            sum += term;
+            sum_error += term * relative;
+        }
+        (sum, sum_error, rule.weight_relative_error)
+    });
     let integral = centre * sum;
 
     let end_gain = inflated(libm::exp(rise * reach - 0.5 * reach * reach) / floor, 4);
     let complement_gain = 1.0 + exponent + 0.5 * (mu_end * a.abs() + reach * b.abs() + end_gain * reach);
     let relative = tail_relative
         + quadrature_relative
-        + rule.weight_relative_error
+        + weight_relative_error
         + growth(order + 1)
         + sum_error / sum
         + growth(1)
@@ -759,5 +806,25 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A leaf reads its rule from the thread's cache (#3253): the first read fills it from the shared cache, a second
+    /// read on the same thread and a read on a fresh thread see the same nodes and weights, bit for bit.
+    #[test]
+    fn a_leaf_reads_the_shared_certified_rule_from_its_thread() {
+        let bits = |rule: &CertifiedGaussLegendreRule| {
+            rule.nodes
+                .iter()
+                .chain(&rule.weights)
+                .map(|value| value.to_bits())
+                .chain([rule.node_error.to_bits(), rule.weight_relative_error.to_bits()])
+                .collect::<Vec<u64>>()
+        };
+        let order = 17;
+        let shared = bits(&rule_of_order(order));
+        assert_eq!(with_rule_of_order(order, bits), shared);
+        assert_eq!(with_rule_of_order(order, bits), shared, "a second read reuses this thread's copy");
+        let fresh = std::thread::spawn(move || with_rule_of_order(order, bits)).join().unwrap();
+        assert_eq!(fresh, shared, "another thread fills its own copy from the same rule");
     }
 }

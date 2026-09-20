@@ -131,7 +131,6 @@ fn sae_manifold_fit_minimal<'py>(
         top_k,
         threshold_gate_threshold,
         refine_routing,
-        random_state,
         // WP-D → fit wiring (#980): the factor shard selects the native
         // OutputFisher row metric; absence selects the Euclidean metric.
         fisher_u,
