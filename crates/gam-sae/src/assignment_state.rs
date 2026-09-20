@@ -419,6 +419,77 @@ impl SaeAssignmentState {
         Ok(())
     }
 
+    /// The row's linearized feasible update space for the descent direction
+    /// `descent`, as a symmetric block-diagonal projector matrix `P` over the
+    /// compact coordinate block.
+    ///
+    /// Each atom block is the linear map `v ↦ project_to_tangent(t, v)` of the
+    /// velocity space its retraction travels: `I − ttᵀ` on a sphere, the identity
+    /// on flat and periodic charts. An interval endpoint is the one non-linear
+    /// case: its velocity projection holds the coordinate exactly when the update
+    /// leaves the interval, so it is linearized at `descent`, the direction the
+    /// step is built to follow. The coordinate is held (`P_ii = 0`) when `descent`
+    /// points outward and free (`P_ii = 1`) otherwise. Applying the velocity
+    /// projection to `sign(descent_j)·e_j` and undoing the sign reads exactly
+    /// that, and leaves every linear block unchanged.
+    ///
+    /// A trust-region model restricted to `range(P)`, `(PHP, P·descent)`, has its
+    /// solution in `range(P)`, so the step certified against it is the step
+    /// [`Self::retract_row_coords`] travels.
+    pub fn row_tangent_projector(
+        &self,
+        row: usize,
+        coords: &[f64],
+        descent: &[f64],
+    ) -> Result<ndarray::Array2<f64>, String> {
+        if row >= self.n_obs {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} out of range N={}",
+                self.n_obs
+            ));
+        }
+        if descent.len() != coords.len() {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} descent width {} != compact coordinate width {}",
+                descent.len(),
+                coords.len()
+            ));
+        }
+        let width = coords.len();
+        let mut projector = ndarray::Array2::<f64>::zeros((width, width));
+        let mut cursor = 0usize;
+        for &atom in &self.indices[row] {
+            let meta = &self.atom_coord_meta[atom as usize];
+            let end = cursor + meta.latent_dim;
+            if end > width {
+                return Err(format!(
+                    "SaeAssignmentState::row_tangent_projector: row {row} atom {atom} block {cursor}..{end} exceeds compact coordinate width {width}"
+                ));
+            }
+            let point = Array1::from_vec(coords[cursor..end].to_vec());
+            for column in 0..meta.latent_dim {
+                let sign = if descent[cursor + column] < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let mut basis = Array1::<f64>::zeros(meta.latent_dim);
+                basis[column] = sign;
+                let projected = meta.manifold.project_to_tangent(point.view(), basis.view());
+                for (offset, value) in projected.iter().enumerate() {
+                    projector[[cursor + offset, cursor + column]] = sign * value;
+                }
+            }
+            cursor = end;
+        }
+        if cursor != width {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} atom blocks cover {cursor} of {width} compact coordinates"
+            ));
+        }
+        Ok(projector)
+    }
+
     pub fn retract_row_coords(
         &self,
         row: usize,
