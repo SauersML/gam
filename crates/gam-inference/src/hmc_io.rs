@@ -5567,9 +5567,9 @@ struct WhitenedRhoCriterionTarget<F> {
     criterion_and_grad: Mutex<F>,
     /// The first position the criterion could not value, and why.
     evaluation_failure: Arc<Mutex<Option<String>>>,
-    /// `ρ̂`, the converged smoothing parameters (the whitening center).
+    /// The whitening center: the sampled density's mode.
     mode: Array1<f64>,
-    /// `L` with `L Lᵀ = H_ρ⁻¹`: maps whitened `z` to `ρ = ρ̂ + L z`.
+    /// `L` with `L Lᵀ = H⁻¹`: maps whitened `z` to `ρ = mode + L z`.
     chol: Array2<f64>,
     /// `Lᵀ`, for the gradient chain rule.
     chol_t: Array2<f64>,
@@ -5620,9 +5620,11 @@ where
 /// Run NUTS over the smoothing parameters `ρ` with the exact profiled criterion
 /// and gradient (#938 Tier 2).
 ///
-/// * `rho_hat` — converged `ρ̂` (the whitening center and chain seed).
-/// * `outer_hessian` — exact finite symmetric positive-definite outer Hessian
-///   `H_ρ` at `ρ̂`, factored without perturbation for whitening.
+/// * `rho_hat` — the whitening center and chain seed: the sampled density's
+///   mode (#3293).
+/// * `outer_hessian` — finite symmetric positive-definite Hessian of the
+///   sampled density at that center, factored without perturbation for
+///   whitening.
 /// * `criterion_and_grad` — `ρ ↦ (LAML(ρ), ∇_ρ LAML(ρ))`, both exact, or the
 ///   reason it cannot value `ρ`; any such position fails the run with that
 ///   reason. Each call is one warm inner profile solve.

@@ -88,7 +88,7 @@ fn fit_smooth_three_class(seed: u64) -> MultinomialSavedModel {
         init_lambda: 1.0,
         max_iter: 120,
         tol: 1e-8,
-        ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tp', k=8)", &config)
+        ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
     })
     .expect("three-class smooth multinomial fit")
 }
