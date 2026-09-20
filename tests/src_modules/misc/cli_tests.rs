@@ -1340,12 +1340,12 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
 
 #[test]
 fn required_columns_for_fit_includes_auxiliary_formula_columns() {
-    let parsed = parse_formula("y ~ x + s(pc1, pc2, type=tensor)")
+    let parsed = parse_formula("y ~ x + te(pc1, pc2)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "parse main formula", e));
     let mut args = location_scale_fit_args(
         PathBuf::from("train.csv"),
         PathBuf::from("model.json"),
-        "y ~ x + s(pc1, pc2, type=tensor)",
+        "y ~ x + te(pc1, pc2)",
         "z + smooth(w)",
     );
     args.slope_formula = Some("slope_x + slope_z".to_string());
@@ -2611,7 +2611,7 @@ fn cli_bernoulli_marginal_slope_rejects_z_column_in_slope_formula() {
         request: None,
         formula_positional: Some("y ~ x".to_string()),
         predict_noise: None,
-        slope_formula: Some("1 + s(z, type=duchon, centers=6)".to_string()),
+        slope_formula: Some("1 + s(z, bs=duchon, centers=6)".to_string()),
         z_column: Some("z".to_string()),
         residual_columns: Vec::new(),
         weights_column: None,
@@ -3973,8 +3973,8 @@ fn parse_bounded_linear_term_defaults_to_shrinkage_prior() {
 }
 
 #[test]
-fn parse_bounded_linear_termwith_center_pull() {
-    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, pull=\"center\") + z")
+fn parse_bounded_linear_term_with_center_prior() {
+    let parsed = parse_formula("y ~ bounded(mu_hat, min=0, max=1, prior=\"center\") + z")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     assert_eq!(parsed.terms.len(), 2);
     match &parsed.terms[0] {
@@ -4125,7 +4125,7 @@ fn warns_for_repeated_univariate_duchon_spatial_terms() {
     assert!(warnings[0].contains("[pc1, pc2, pc3]"));
     assert!(warnings[0].contains("TIP:"));
     assert!(
-        warnings[0].contains("s(pc1, type=duchon) + s(pc2, type=duchon) + s(pc3, type=duchon)")
+        warnings[0].contains("s(pc1, bs=duchon) + s(pc2, bs=duchon) + s(pc3, bs=duchon)")
     );
     assert!(warnings[0].contains("duchon(pc1, pc2, pc3)"));
 }
@@ -4215,7 +4215,7 @@ fn warns_for_repeated_univariate_thinplate_spatial_terms() {
 
     assert_eq!(warnings.len(), 1);
     assert!(warnings[0].contains("2 separate 1D thinplate/tps spatial smooths"));
-    assert!(warnings[0].contains("s(pc1, type=tps) + s(pc2, type=tps)"));
+    assert!(warnings[0].contains("s(pc1, bs=tps) + s(pc2, bs=tps)"));
     assert!(warnings[0].contains("thinplate(pc1, pc2)"));
 }
 
@@ -5211,7 +5211,7 @@ fn parse_survmodel_formula_config_extractsspec_and_distribution() {
 
 #[test]
 fn parse_formula_retains_explicit_duchon_power_and_order_options() {
-    let parsed = parse_formula("y ~ s(pc1, type=duchon, centers=12, power=0, order=1)")
+    let parsed = parse_formula("y ~ s(pc1, bs=duchon, centers=12, power=0, order=1)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     match &parsed.terms[0] {
         ParsedTerm::Smooth { options, .. } => {
@@ -5224,7 +5224,7 @@ fn parse_formula_retains_explicit_duchon_power_and_order_options() {
 
 #[test]
 fn build_termspec_rejects_duchon_double_penalty_option() {
-    let parsed = parse_formula("y ~ s(pc1, pc2, type=duchon, centers=8, double_penalty=true)")
+    let parsed = parse_formula("y ~ s(pc1, pc2, bs=duchon, centers=8, double_penalty=true)")
         .unwrap_or_else(|e| {
             panic!(
                 "{} failed: {:?}",
@@ -5288,7 +5288,7 @@ fn build_termspec_honors_explicit_duchon_power_and_builds_well_posed() {
     // honored (not silently bumped to 2) and the design builds well-posed rather
     // than emitting the old opaque "Duchon D2 collocation requires …" reject
     // that once broke every PgsCalibration fit.
-    let formula = "y ~ s(pc1, pc2, pc3, pc4, type=duchon, centers=8, order=1, \
+    let formula = "y ~ s(pc1, pc2, pc3, pc4, bs=duchon, centers=8, order=1, \
                        power=1, length_scale=1)";
     let parsed = parse_formula(formula)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula should parse", e));
@@ -8107,7 +8107,7 @@ fn saved_linkwiggle_derivative_matches_exact_constrained_basis_chain_rule() {
 
 #[test]
 fn parse_formula_allows_nested_expression_arguments_in_smooth_calls() {
-    let parsed = parse_formula("y ~ s(log(x + 1), type=duchon, centers=12, power=0, order=1)")
+    let parsed = parse_formula("y ~ s(log(x + 1), bs=duchon, centers=12, power=0, order=1)")
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "formula", e));
     let ParsedTerm::Smooth { vars, options, .. } = &parsed.terms[0] else {
         panic!("expected smooth term");

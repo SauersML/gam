@@ -859,11 +859,12 @@ fn many_atom_declared_law_is_compressed_persisted_and_replayed_bitwise_2928() {
 
 /// gam#2926 follow-up: a survival fit whose slope varies along follow-up, on a
 /// standard-normal score, certifies its closed form with each anchor's own slope:
-/// the entry slope at entry and the exit slope at exit. The record follows the sign
-/// of `D̂`: `D̂ ≤ 0` keeps a certified closed form, and `D̂ > 0` keeps the same fit
-/// recorded `gaussian-uncertified` with its certificate, because the anchored frame
-/// does not carry a follow-up-varying slope. A certified fit is calibrated under the
-/// TRUE law on the marginal index.
+/// the entry slope at entry and the exit slope at exit. The record follows the
+/// certificate: a residual energy whose null tail is at or above the design rate
+/// keeps a certified closed form, and one below it keeps the same fit recorded
+/// `gaussian-uncertified` with its certificate, because the anchored frame does not
+/// carry a follow-up-varying slope. A certified fit is calibrated under the TRUE law
+/// on the marginal index.
 #[test]
 fn follow_up_varying_slope_default_records_its_certificate_decision_2926() {
     super::initialize_cpu_fitting();
@@ -920,8 +921,12 @@ fn records_certificate_decision<E: std::fmt::Display>(
             ..
         } => {
             assert!(
-                certificate.closed_form_chosen && certificate.excess_kl <= 0.0,
-                "a kept closed form's recorded decision must be the sign of its D̂: {certificate:?}"
+                certificate.closed_form_chosen
+                    && certificate
+                        .null_p_value
+                        .is_some_and(|p| p >= gam_models::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+                "a kept closed form's recorded decision must be its null tail at or above the design \
+                 rate: {certificate:?}"
             );
             eprintln!(
                 "[2926 {label}] n={N} planted b={SLOPE} | kept the closed form: {certificate:?} | \
@@ -943,9 +948,12 @@ fn records_certificate_decision<E: std::fmt::Display>(
                  mean |Φ(−q̂)−Φ(−q)|={marginal_error:.4}"
             );
             assert!(
-                !certificate.closed_form_chosen && certificate.excess_kl > 0.0,
-                "an uncertified closed form must carry the D̂ that preferred the estimated law: \
-                 {certificate:?}"
+                !certificate.closed_form_chosen
+                    && certificate
+                        .null_p_value
+                        .is_some_and(|p| p < gam_models::bms::CLOSED_FORM_CERTIFICATE_ALPHA),
+                "an uncertified closed form must carry the certificate that preferred the \
+                 estimated law, its null tail below the design rate: {certificate:?}"
             );
             assert!(
                 missing.contains("expected to be the more accurate anchor")

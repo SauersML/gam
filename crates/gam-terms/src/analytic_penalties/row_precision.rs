@@ -78,26 +78,25 @@ impl RowPrecisionPriorPenalty {
                 "RowPrecisionPriorPenalty::new lambda_per_row shape must be ({n_eff}, {latent_dim}, {latent_dim}), got ({lambda_n}, {lambda_rows}, {lambda_cols})"
             ));
         }
+        if let Some(((n, i, j), _)) = lambda_per_row
+            .indexed_iter()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "RowPrecisionPriorPenalty::new lambda_per_row[{n},{i},{j}] must be finite"
+            ));
+        }
+        // The energy ½ tᵀΛt, its gradient Λt and its Hessian Λ are those of the
+        // quadratic form, which reads only (Λ + Λᵀ)/2. Storing that part keeps
+        // every consumer, and the eigendecomposition that reads one triangle,
+        // on the same matrix. A symmetric Λ is stored unchanged, since
+        // (a + a)·½ = a.
+        let lambda_per_row = Array3::from_shape_fn(lambda_per_row.dim(), |(n, i, j)| {
+            0.5 * (lambda_per_row[[n, i, j]] + lambda_per_row[[n, j, i]])
+        });
         for n in 0..n_eff {
-            let mut matrix = Array2::<f64>::zeros((latent_dim, latent_dim));
-            for i in 0..latent_dim {
-                for j in 0..latent_dim {
-                    let value = lambda_per_row[[n, i, j]];
-                    if !value.is_finite() {
-                        return Err(format!(
-                            "RowPrecisionPriorPenalty::new lambda_per_row[{n},{i},{j}] must be finite"
-                        ));
-                    }
-                    let transpose = lambda_per_row[[n, j, i]];
-                    if (value - transpose).abs() >= 1.0e-10 {
-                        return Err(format!(
-                            "RowPrecisionPriorPenalty::new lambda_per_row[{n}] must be symmetric; |Λ[{i},{j}] - Λ[{j},{i}]| = {:.3e}",
-                            (value - transpose).abs()
-                        ));
-                    }
-                    matrix[[i, j]] = value;
-                }
-            }
+            let matrix =
+                Array2::from_shape_fn((latent_dim, latent_dim), |(i, j)| lambda_per_row[[n, i, j]]);
             let (evals, _) = matrix.eigh(Side::Lower).map_err(|err| {
                 format!("RowPrecisionPriorPenalty::new lambda_per_row[{n}] eigendecomposition failed: {err}")
             })?;

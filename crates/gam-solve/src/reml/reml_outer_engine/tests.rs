@@ -5830,6 +5830,57 @@ pub(crate) fn sparse_takahashi_block_root_traces_match_dense_reference() {
     }
 }
 
+/// #3294: the sparse Cholesky operator publishes the componentwise bound on its
+/// `log|H|` forward error, `p·γ_(r+1)·Σ_i H_ii·(H⁻¹)_ii` with `r` the most
+/// entries in a row of `L`, so the Newton-decrement verdict is taken on the
+/// sparse exact path as it is on the dense one. It never exceeds the dense
+/// Cholesky bound, which charges every inner product at the full `p`.
+#[test]
+pub(crate) fn sparse_cholesky_publishes_its_logdet_forward_error_3294() {
+    let h = random_effect_shaped_hessian();
+    let p = h.nrows();
+    let h_sparse = gam_linalg_test_support::dense_to_upper_csc(&h);
+    let factor =
+        std::sync::Arc::new(gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap());
+    let inverse = gam_linalg::sparse_exact::solve_sparse_spdmulti(&factor, &Array2::eye(p)).unwrap();
+    let row_length = factor.factor_max_row_nnz();
+    assert!((1..=p).contains(&row_length));
+    let reference = p as f64
+        * gam_linalg::roundoff::accumulation_growth(row_length + 1)
+        * (0..p).map(|i| h[[i, i]] * inverse[[i, i]]).sum::<f64>();
+
+    let bare = SparseCholeskyOperator::new(factor.clone(), 0.0, p);
+    assert_eq!(
+        bare.logdet_forward_error(),
+        None,
+        "without the factored H there is no diagonal to equilibrate by"
+    );
+    let with_hessian = bare.with_hessian(std::sync::Arc::new(h_sparse.clone()));
+    let solved = with_hessian
+        .logdet_forward_error()
+        .expect("the factored H and its selected inverse give the bound");
+    assert_relative_eq!(solved, reference, max_relative = 1e-12);
+
+    let sfactor = gam_linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
+    let taka =
+        std::sync::Arc::new(gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor).unwrap());
+    let cached = SparseCholeskyOperator::new(factor, 0.0, p)
+        .with_hessian(std::sync::Arc::new(h_sparse))
+        .with_takahashi(taka)
+        .logdet_forward_error()
+        .expect("the cached selected inverse gives the same bound");
+    assert_relative_eq!(cached, reference, max_relative = 1e-12);
+
+    let dense = DenseCholeskyOperator::from_positive_definite(&h)
+        .unwrap()
+        .logdet_forward_error()
+        .expect("the dense Cholesky factor publishes its bound");
+    assert!(
+        solved <= dense * (1.0 + 1e-12),
+        "sparse bound {solved:.6e} exceeds the dense bound {dense:.6e}"
+    );
+}
+
 #[test]
 pub(crate) fn sparse_block_root_logdet_cross_matches_dense_reference() {
     let embedded = |p: usize, root: &Array2<f64>, start: usize| {

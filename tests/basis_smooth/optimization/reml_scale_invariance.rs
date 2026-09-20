@@ -111,8 +111,8 @@ fn reml_pseudo_and_sobolev_m4_both_recover_smooth_truth() {
     // same predictions (different λ in the original kernel units, same
     // effective smoother).
     init_parallelism();
-    let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let pred_pse = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=pseudo)");
+    let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
+    let pred_pse = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=pseudo)");
     let rmse_sob = rmse(&pred_sob);
     let rmse_pse = rmse(&pred_pse);
     eprintln!("[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_pse={rmse_pse:.4}");

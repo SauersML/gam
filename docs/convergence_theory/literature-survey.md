@@ -104,7 +104,7 @@ This is the restricted likelihood of y ~ N(X₀β₀, φ(I + τZZᵀ)). The rand
 | Id | Test family | Signature |
 |---|---|---|
 | F1 | binomial logit (prostate), BFGS | \|Pg\|=2.280e-5 against bound 7.302e-6 (rung=solver-band, derived_standard=false); curvature_source=unavailable; #2 railed at the upper box 22.73 (margin 0.5); line_search_failed with StepSizeTooSmall after 50 attempts, 7 iterations, f=306.27 |
-| F2 | x1+cc(x2), ARC | "Newton decrement stopped contracting": ½λ̂²=4.7e-5 against band_f=3.95e-11 |
+| F2 | x1+cyclic(x2), ARC | "Newton decrement stopped contracting": ½λ̂²=4.7e-5 against band_f=3.95e-11 |
 | F3 | iso-kappa Matérn joint REML, including the statsmodels parity test | ρ railed at the lower edge ≈ −21; \|Pg\| 0.331 vs 0.0181 (129 iterations), 3.62 vs 0.065, 2.79e-2 vs 1.51e-2, 3.72e-2 vs 2.51e-2; "tail-snap declined: … psi coordinate, no exponential tail law" |
 | F4 | survival Weibull AFT, dim 6 | BFGS MaxAttempts \|Pg\|=6.99e-2 vs 1.86e-3; ARC trust_region_reject_floor (radius 1e-12 after 44 rejections), \|Pg\|=0.272; probes show a clean tail g ∝ e^{-ρ} |
 | F5 | multinomial penguins, 15 coordinates | rails at −15 (λ_min = −23), \|Pg\|=24.7; "inner mode's softest curvature 3.096e-8 at/below rounding band" (separation) |
@@ -497,7 +497,7 @@ File:line references are against the current tree. `run.rs` means `crates/gam-so
    - if ½λ̂² ≤ 2·band_f, certify at rung NewtonDecrement, because Prop. 5 makes no further certified progress possible;
    - otherwise report a genuine failure.
    - Align `decrement_stationarity_bound` (`decrement_bands.rs:288`) to the same 2·band_f threshold, or justify band_f as the per-evaluation error and 2·band_f as the difference error, so no gap window exists.
-5. **F2 (x1+cc(x2)).** ½λ̂² = 4.7e-5 is far above band_f, so F2 is not noise-limited. The mechanism predicted by Section 3.1 is a coordinate on an exponential tail: steps of about 1 e-fold, decrement × e^{-1} per step, and about ln(4.7e-5/3.95e-11) ≈ 14 more steps to reach band_f. [C] until the log's per-coordinate steps are checked. The fix is the τ chart of Section 6.2. Deuflhard's Θ_k ≈ 1 with ‖Δρ_k‖ ≈ 1 is the diagnostic that identifies it, and it is scale-free.
+5. **F2 (x1+cyclic(x2)).** ½λ̂² = 4.7e-5 is far above band_f, so F2 is not noise-limited. The mechanism predicted by Section 3.1 is a coordinate on an exponential tail: steps of about 1 e-fold, decrement × e^{-1} per step, and about ln(4.7e-5/3.95e-11) ≈ 14 more steps to reach band_f. [C] until the log's per-coordinate steps are checked. The fix is the τ chart of Section 6.2. Deuflhard's Θ_k ≈ 1 with ‖Δρ_k‖ ≈ 1 is the diagnostic that identifies it, and it is scale-free.
 
 ### 6.5 Derived tolerances (no magic constants)
 

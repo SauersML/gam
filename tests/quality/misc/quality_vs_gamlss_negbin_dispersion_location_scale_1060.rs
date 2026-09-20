@@ -120,7 +120,7 @@ fn gam_negbin_dispersion_location_scale_recovers_theta_surface_vs_gamlss() {
     let ncols = ds.headers.len();
 
     let cfg = FitConfig {
-        family: Some("nb".to_string()),
+        family: Some("negative-binomial".to_string()),
         noise_formula: Some("s(x, k=6)".to_string()),
         ..FitConfig::default()
     };

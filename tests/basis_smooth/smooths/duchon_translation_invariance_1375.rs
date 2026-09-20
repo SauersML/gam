@@ -10,7 +10,7 @@
 //! translation `b`, the `{1, x}` columns become near-collinear, the design
 //! ill-conditions, and REML λ-selection drifts into a different basin — moving
 //! the fit even though `{1, x − x̄}` spans the SAME model space. This is the
-//! exact defect #1269 fixed for the `bs="tp"` thin-plate path; the fix here
+//! exact defect #1269 fixed for the `bs="tps"` thin-plate path; the fix here
 //! mirrors it by centering the polynomial / side-condition assembly on the
 //! center-cloud per-axis mean (a fixed, frozen property replayed at predict).
 //!

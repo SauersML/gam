@@ -231,7 +231,7 @@ fn clean_fit_invariance_gaussian() {
         tg[[i, x_idx]] = (i as f64 + 0.5) / n as f64;
     }
 
-    let formula = "y ~ s(x, bs='tp', k=12)";
+    let formula = "y ~ s(x, bs='tps', k=12)";
     let fit = run_standard(formula, "gaussian", &data, &tg);
     assert_zero_downside("gaussian", &fit);
 }
@@ -271,7 +271,7 @@ fn clean_fit_invariance_binomial_logit() {
         tg[[i, x_idx]] = (i as f64 + 0.5) / n as f64;
     }
 
-    let formula = "y ~ s(x, bs='tp', k=10)";
+    let formula = "y ~ s(x, bs='tps', k=10)";
     let fit = run_standard(formula, "binomial", &data, &tg);
     assert_zero_downside("binomial-logit", &fit);
 }
@@ -309,10 +309,10 @@ fn clean_fit_invariance_gamlss_location_scale() {
     let run = || -> CleanFit {
         let cfg = FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some("1 + s(x, bs='tp', k=8)".to_string()),
+            noise_formula: Some("1 + s(x, bs='tps', k=8)".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("y ~ s(x, bs='tp', k=10)", &data, &cfg)
+        let result = fit_from_formula("y ~ s(x, bs='tps', k=10)", &data, &cfg)
             .unwrap_or_else(|e| panic!("clean gamlss fit returned Err: {e}"));
         let FitResult::GaussianLocationScale(ls) = result else {
             panic!("expected GaussianLocationScale");
@@ -407,7 +407,7 @@ fn clean_fit_invariance_survival_lognormal() {
         // relying on a wrong assumption that the default is location-scale.
         let mut cfg = FitConfig::default();
         cfg.survival_likelihood = Some("location-scale".to_string());
-        let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
+        let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tps", k=6)"#, &data, &cfg)
             .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
         let variant_dbg = match &result {
             FitResult::Standard(_) => "Standard",

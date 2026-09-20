@@ -432,13 +432,13 @@ def test_sklearn_regressor_accepts_rhs_only_formula_with_separate_target() -> No
 
 def test_sklearn_classifier_roundtrip() -> None:
     # `y ~ x` is an unpenalized parametric term, so its logistic MLE diverges
-    # under perfect separation and the engine's pre-fit separation guard
-    # (PrefitPerfectSeparationDetected) rejects such a design by design. The two
-    # observations at x=2.0 with opposite labels break separation (the MLE is
-    # finite) while preserving the monotone-increasing P(y=1 | x) trend this
-    # roundtrip asserts; the test targets the sklearn wrapper mechanics
-    # (predict_proba shape, class ordering, argmax hard labels, weighted score),
-    # not the degenerate infinite-slope fit.
+    # under perfect separation, and the engine's pre-fit separation certificate
+    # then fits the Jeffreys-prior estimator instead. The two observations at
+    # x=2.0 with opposite labels break separation (the MLE is finite) while
+    # preserving the monotone-increasing P(y=1 | x) trend this roundtrip
+    # asserts; the test targets the sklearn wrapper mechanics (predict_proba
+    # shape, class ordering, argmax hard labels, weighted score), not the
+    # separated-design estimator.
     train = pd.DataFrame(
         [
             {"y": 0.0, "x": 0.0},

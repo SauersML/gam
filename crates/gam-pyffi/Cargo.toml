@@ -20,6 +20,7 @@ crate-type = ["cdylib", "rlib"]
 gam = { path = "../.." }
 gam-build-identity = { path = "../gam-build-identity" }
 gam-math = { path = "../gam-math" }
+gam-model-api = { path = "../gam-model-api" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
 log = "0.4.33"

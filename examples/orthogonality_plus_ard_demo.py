@@ -19,7 +19,7 @@ def main() -> None:
 
     gamfit.fit(
         data=data,
-        formula="y ~ s(t, type='duchon', centers=32)",
+        formula="y ~ s(t, bs='duchon', centers=32)",
         latents={"t": gamfit.smooth.LatentCoord(n=n, d=d, init=t0)},
         penalties=[
             gamfit.penalties.OrthogonalityPenalty(weight=1.0, n_eff=n, target="t"),
