@@ -486,8 +486,10 @@ pub(crate) fn assemble_custom_family_fit_result(
         exact_lambdas_from_log_strengths(&log_lambdas, "custom-family fitted log strength")?;
     let (block_states, covariance_conditional, geometry, precomputed_edf, smoothing_corrected) =
         if let Some(canonical) = canonical {
-            let precomputed_edf = precomputed_edf
-                .or_else(|| reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas));
+            let precomputed_edf = match precomputed_edf {
+                Some(edf) => Some(edf),
+                None => reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas)?,
+            };
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
@@ -2407,7 +2409,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     let (persistent_warm_start_cache, mut persistent_warm_start) = if options.warm_start.is_some() {
         (None, None)
     } else {
-        load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len())
+        load_persistent_custom_family_warm_start::<F>(family, specs, options, rho0.len())?
     };
     // The cross-fit `FitArtifact` transfer (consume/capture below) reuses
     // per-block β/ρ from a structurally-matching prior fit under a descriptor
@@ -2415,8 +2417,9 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // `persistent_warm_start_fingerprint` contract, reusing β across fits is
     // only admissible for families that opt into persistent warm-starts by
     // providing a likelihood-data fingerprint (which is exactly what makes
-    // `persistent_warm_start_cache` `Some`). Families that opt out (fingerprint
-    // `None` ⇒ key `None`) must cold-start so repeat fits of the same model are
+    // `persistent_warm_start_cache` `Some`). A family that opts out refuses a
+    // configured store above (gam#3002), so with no store it cold-starts and
+    // repeat fits of the same model are
     // bit-reproducible: without this gate a second structurally-identical fit
     // warm-starts off the first and settles on a different point within the
     // inner solve's flat-basin tolerance (gam#1607 cluster 4 — the location-
@@ -2665,7 +2668,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let bfgs_step_cap = Some(FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β.
@@ -2915,7 +2917,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
         .with_problem_size(n_obs, p_total.max(1))
         // Per-coordinate ρ domain (#2812): the interval on which each term's

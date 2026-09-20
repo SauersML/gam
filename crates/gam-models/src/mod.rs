@@ -117,4 +117,4 @@ pub use gam_identifiability::families::compiler::{
     BlockOrder, CompiledBlock, CompiledBlocks, CompilerError, RowHessian, RowJacobianOperator,
     compile,
 };
-pub use vector_response::{GaussianVectorLikelihood, MultinomialLogitLikelihood, VectorLikelihood};
+pub use vector_response::{MultinomialLogitLikelihood, VectorLikelihood};

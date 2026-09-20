@@ -1172,7 +1172,7 @@ mod persistence_tests {
             homoskedastic_var: 0.75,
             post_mean: 0.0,
             post_sd: 1.0,
-            theta1_cov: Array2::<f64>::zeros((2, 2)),
+            theta1_cov: Array2::<f64>::zeros((3, 3)),
         })
     }
 

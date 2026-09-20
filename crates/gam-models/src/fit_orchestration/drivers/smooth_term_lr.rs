@@ -11,15 +11,12 @@
 /// statistic the reported p-value is built from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SmoothLrCorrection {
-    /// A per-term LR statistic corrected by the full estimated-λ Lawley factor,
-    /// including the ρ̂-sampling-variation contribution from the regularized
-    /// inverse REML/LAML outer Hessian.
-    LawleyLrEstimatedLambda,
     /// A per-term likelihood-ratio statistic `W = 2(ℓ_full − ℓ_null)` that has
     /// been Bartlett-corrected with the fixed-λ Lawley factor `c = E[W|λ]/d`
-    /// (`W* = W/c`, referenced against `χ²_d`). This is used when a λ̂-selection
-    /// replay already carries the estimation of `λ` in the reference law, and
-    /// when the estimated-λ handoff is unavailable.
+    /// (`W* = W/c`, scored against the reference law). The λ̂-sampling
+    /// variation is not a second Lawley term: the reference's selection replay
+    /// integrates the law over the λ̂ the fit could have chosen, and `c`
+    /// rescales that integrated law.
     LawleyLrFixedLambda,
     /// No second-order correction was applied — either the family has no
     /// closed-form Lawley cumulant jets or the null refit did not converge — so
@@ -31,7 +28,6 @@ impl SmoothLrCorrection {
     /// The serialized provenance label surfaced in the summary table.
     pub fn label(self) -> &'static str {
         match self {
-            SmoothLrCorrection::LawleyLrEstimatedLambda => "lawley_lr_estimated_lambda",
             SmoothLrCorrection::LawleyLrFixedLambda => "lawley_lr_fixed_lambda",
             SmoothLrCorrection::None => "none",
         }
@@ -186,6 +182,15 @@ pub struct SmoothLrSelectionReplay {
     /// difference whose variance is what makes this a control variate rather
     /// than two independent estimates.
     conditional_sample: Vec<f64>,
+    /// On a PROFILED-scale replay, each draw's weight-one residual `χ²_h`, in
+    /// draw order: the same variate drove that draw's selection (through the
+    /// profiled deviance) and is the weight-one block of its `V`, so the tail
+    /// shift reads it back rather than integrating over a fresh one.
+    /// `None` when the selection did not profile a scale.
+    residual_unit_sample: Option<Vec<f64>>,
+    /// Stratified coordinates the replay consumed, so draws that are to be
+    /// independent of it start after them.
+    consumed_coordinates: usize,
     /// The OBSERVED data scored the way every draw is: its whitened block
     /// score run through the same selection, read at the selected `t` and at
     /// `t = 1`. `None` when the caller supplied no score.
@@ -211,6 +216,10 @@ pub struct SmoothLrSelectionReplay {
     /// replay's selection is `W · W_q(t*; z)/W_q(1; z)`: the fit's own exact
     /// `W`, carried to the replay's selected point by the quadratic model's own
     /// ratio. At `t* = 1` the ratio is one and nothing moves.
+    ///
+    /// On a profiled replay the observation is selected by the profiled
+    /// criterion too, over its OWN residual deviance ([`ObservedDraw`]), so
+    /// that it is chosen by exactly the rule each draw is.
     observed: Option<ObservedSelection>,
 }
 
@@ -222,6 +231,21 @@ struct ObservedSelection {
     selected: f64,
 }
 
+/// The observation as the replay scores it: its whitened block score, and on a
+/// profiled replay the full fit's penalized deviance `D_p(λ̂)` in the same
+/// units as the score's squares.
+///
+/// A profiled draw selects over `m·ln(R + D(t))`, with `R` the part of the
+/// penalized deviance the tested scale does not reach. The observation's `R`
+/// is not drawn — it is the fit's own: along the tested scale the penalized
+/// deviance is `R + Σ_j c_j² s_j(t)` in the fitted eigenbasis, so
+/// `R = D_p(λ̂) − Σ_j c_j² s_j(1)`, read off the fit at `t = 1`.
+#[derive(Clone, Copy, Debug)]
+struct ObservedDraw<'a> {
+    whitened: &'a [f64],
+    penalized_deviance: Option<f64>,
+}
+
 impl std::fmt::Debug for SmoothLrSelectionReplay {
     /// The two samples are thousands of draws each and are never what a reader
     /// of a failure message wants; the spectrum that generated them is.
@@ -229,6 +253,7 @@ impl std::fmt::Debug for SmoothLrSelectionReplay {
         f.debug_struct("SmoothLrSelectionReplay")
             .field("generalized", &self.generalized)
             .field("draws", &self.selection_sample.len())
+            .field("profiled", &self.residual_unit_sample.is_some())
             .field("observed", &self.observed)
             .finish()
     }
@@ -239,6 +264,8 @@ impl PartialEq for SmoothLrSelectionReplay {
         self.generalized == other.generalized
             && self.selection_sample == other.selection_sample
             && self.conditional_sample == other.conditional_sample
+            && self.residual_unit_sample == other.residual_unit_sample
+            && self.consumed_coordinates == other.consumed_coordinates
             && self.observed == other.observed
     }
 }
@@ -441,6 +468,28 @@ struct SelectionPoint {
     weights: Vec<f64>,
     /// Columns are the eigenvectors of `T(t)`, in the same order.
     basis: Array2<f64>,
+}
+
+impl SelectionPoint {
+    /// The observation's profiled floor at this point: its penalized deviance
+    /// less the tested block's part of it, `R = D_p − Σ_j c_j²·e_j/(1 + e_j)`,
+    /// with `c` the whitened score in this point's eigenbasis (see
+    /// [`ObservedDraw`]). `None` unless that leaves a positive deviance — `R`
+    /// holds the residual sum of squares, so anything else is a score and a
+    /// deviance that do not describe one fit.
+    fn observed_floor(&self, whitened: &[f64], penalized_deviance: f64) -> Option<f64> {
+        let mut reached = 0.0_f64;
+        for (column, &eigenvalue) in self.eigenvalues.iter().enumerate() {
+            let projection: f64 = whitened
+                .iter()
+                .enumerate()
+                .map(|(row, value)| value * self.basis[[row, column]])
+                .sum();
+            reached += projection * projection * eigenvalue / (1.0 + eigenvalue);
+        }
+        let floor = penalized_deviance - reached;
+        (floor.is_finite() && floor > 0.0).then_some(floor)
+    }
 }
 
 impl SelectionGeometry {
@@ -952,6 +1001,10 @@ pub enum SmoothLrSelectionDecline {
     /// by the replay's selection rule — and a replay whose observation is
     /// selected by a different rule than its draws is not a reference for it.
     ObservedScoreUnusable,
+    /// The family profiles its scale, but the model's penalized rank is smaller
+    /// than the tested term's own, so the residual deviance the profiled
+    /// selection is driven by has no consistent law to draw from.
+    ProfileInconsistent,
 }
 
 impl SmoothLrSelectionDecline {
@@ -965,6 +1018,7 @@ impl SmoothLrSelectionDecline {
             SmoothLrSelectionDecline::GridRefused => "grid_refused",
             SmoothLrSelectionDecline::SelectionUnresolved => "selection_unresolved",
             SmoothLrSelectionDecline::ObservedScoreUnusable => "observed_score_unusable",
+            SmoothLrSelectionDecline::ProfileInconsistent => "profile_inconsistent",
         }
     }
 }
@@ -998,12 +1052,43 @@ impl SmoothLrSelectionDecline {
 /// `s = (3 ∓ √3)/6`). That is what lets the replay take each selection as the
 /// certified global minimum of its criterion over the window, through
 /// [`gam_math::score_opt::maximize_score_1d`].
+///
+/// # The profiled-scale form
+///
+/// A family whose scale is PROFILED does not select with `C`. Its REML cost is
+/// `½[m·ln D_p(u) + log|I + T(u)| − log|T(u)|₊]`, with `D_p` the penalized
+/// residual deviance and `m = n − M_p` the positive-weight rows less the
+/// balanced penalty's structural null space (the solver's own profiled
+/// residual degrees of freedom). Along the replay `D_p(u) = F + D(u)`,
+/// `D = Σ_j c_j² s_j`, where the floor `F` is every part of the deviance the
+/// moving scale does not reach. So with [`ProfiledFloor`] set the data term is
+/// `m·ln(F + D)` in place of `D`, and with `a = F + D`
+///
+/// ```text
+/// (m ln a)′ = m·D′/a,
+/// (m ln a)″ = m·(D″/a − (D′/a)²),
+/// (m ln a)‴ = m·(D‴/a − 3·D′D″/a² + 2·(D′/a)³),
+/// ```
+///
+/// where `D′, D″, D‴` are the data sums above. `D` increases with `u`, so over a
+/// cell `a` is enclosed by its endpoint values and every ratio by interval
+/// division by that positive range.
 struct DiagonalCriterion<'a> {
     squares: &'a [f64],
     generalized: &'a [f64],
     rank: usize,
     occam: &'a [f64],
     constant: f64,
+    profile: Option<ProfiledFloor>,
+}
+
+/// The profiled-scale data term `m·ln(floor + Σ_j c_j² s_j)` of a
+/// [`DiagonalCriterion`]: `multiplier` is `m`, `floor` the deviance the moving
+/// scale does not reach, in the same units as the squares.
+#[derive(Clone, Copy, Debug)]
+struct ProfiledFloor {
+    multiplier: f64,
+    floor: f64,
 }
 
 /// Range of `f` over the share interval `[lo, hi]`, from its endpoints and the
@@ -1032,6 +1117,11 @@ impl DiagonalCriterion<'_> {
         let mut value = -rank * log_t - self.constant;
         let mut magnitude = (rank * log_t).abs() + self.constant.abs();
         let (mut first, mut second, mut third) = (-rank, 0.0_f64, 0.0_f64);
+        // The data sums `D, D′, D″, D‴`, kept apart from the log-determinant
+        // terms so the profiled form can take their logarithm.
+        let (mut data, mut data_first, mut data_second, mut data_third) =
+            (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+        let mut data_magnitude = 0.0_f64;
         for (&square, &nu) in self.squares.iter().zip(self.generalized.iter()) {
             let scaled = t * nu;
             if !scaled.is_finite() {
@@ -1040,12 +1130,16 @@ impl DiagonalCriterion<'_> {
             let share = scaled / (1.0 + scaled);
             let spread = share * (1.0 - share);
             let log_term = scaled.ln_1p();
-            value += square * share + log_term;
-            magnitude += (square * share).abs() + log_term.abs();
-            first += square * spread + share;
-            second += square * spread * (1.0 - 2.0 * share) + spread;
-            third += square * spread * (1.0 - 6.0 * share + 6.0 * share * share)
-                + spread * (1.0 - 2.0 * share);
+            value += log_term;
+            magnitude += log_term.abs();
+            first += share;
+            second += spread;
+            third += spread * (1.0 - 2.0 * share);
+            data += square * share;
+            data_magnitude += (square * share).abs();
+            data_first += square * spread;
+            data_second += square * spread * (1.0 - 2.0 * share);
+            data_third += square * spread * (1.0 - 6.0 * share + 6.0 * share * share);
         }
         for &mu in self.occam {
             let scaled = t * mu;
@@ -1061,10 +1155,37 @@ impl DiagonalCriterion<'_> {
             second -= spread;
             third -= spread * (1.0 - 2.0 * share);
         }
-        let band = gam_linalg::roundoff::accumulation_band(
-            4 * self.squares.len() + 3 * self.occam.len() + 2,
-            magnitude,
+        let terms = 4 * self.squares.len() + 3 * self.occam.len() + 2;
+        let Some(profile) = self.profile else {
+            value += data;
+            magnitude += data_magnitude;
+            first += data_first;
+            second += data_second;
+            third += data_third;
+            let band = gam_linalg::roundoff::accumulation_band(terms, magnitude);
+            return Some(([value, first, second, third], band));
+        };
+        let level = profile.floor + data;
+        if !(level > 0.0 && level.is_finite()) {
+            return None;
+        }
+        let multiplier = profile.multiplier;
+        let (slope, bend, twist) = (data_first / level, data_second / level, data_third / level);
+        let log_level = level.ln();
+        value += multiplier * log_level;
+        first += multiplier * slope;
+        second += multiplier * (bend - slope * slope);
+        third += multiplier * (twist - 3.0 * slope * bend + 2.0 * slope * slope * slope);
+        // `level` carries the accumulation error of its `len + 1` summands, which
+        // the logarithm turns into an absolute error of that over `level`; the
+        // product with `m` and the final addition carry one rounding each.
+        let level_band = gam_linalg::roundoff::accumulation_band(
+            self.squares.len() + 1,
+            profile.floor.abs() + data_magnitude,
         );
+        let band = gam_linalg::roundoff::accumulation_band(terms, magnitude)
+            + multiplier * level_band / level
+            + gam_linalg::roundoff::accumulation_band(2, (multiplier * log_level).abs());
         Some(([value, first, second, third], band))
     }
 
@@ -1198,6 +1319,14 @@ impl DiagonalCriterion<'_> {
         let spread = |s: f64| s * (1.0 - s);
         let skew = |s: f64| s * (1.0 - s) * (1.0 - 2.0 * s);
         let torsion = |s: f64| s * (1.0 - s) * (1.0 - 6.0 * s + 6.0 * s * s);
+        // The data sums `D` and `D′, D″, D‴`, enclosed apart from the
+        // log-determinant terms so the profiled form can divide them by `F + D`.
+        let (mut data_lo, mut data_hi) = (0.0_f64, 0.0_f64);
+        let (mut data_first_lo, mut data_first_hi) = (0.0_f64, 0.0_f64);
+        let (mut data_second_lo, mut data_second_hi) = (0.0_f64, 0.0_f64);
+        let (mut data_third_lo, mut data_third_hi) = (0.0_f64, 0.0_f64);
+        let (mut data_first_magnitude, mut data_second_magnitude, mut data_third_magnitude) =
+            (0.0_f64, 0.0_f64, 0.0_f64);
         let mut nu_order: Vec<usize> = (0..self.generalized.len())
             .filter(|&index| self.generalized[index] > 0.0)
             .collect();
@@ -1228,12 +1357,14 @@ impl DiagonalCriterion<'_> {
                 share_polynomial_range(share_lo, share_hi, skew, &skew_stationary);
             let (torsion_lo, torsion_hi) =
                 share_polynomial_range(share_lo, share_hi, torsion, &torsion_stationary);
-            first_lo += square * spread_lo;
-            first_hi += square * spread_hi;
-            second_lo += square * skew_lo;
-            second_hi += square * skew_hi;
-            third_lo += square * torsion_lo;
-            third_hi += square * torsion_hi;
+            data_lo += square * share_lo;
+            data_hi += square * share_hi;
+            data_first_lo += square * spread_lo;
+            data_first_hi += square * spread_hi;
+            data_second_lo += square * skew_lo;
+            data_second_hi += square * skew_hi;
+            data_third_lo += square * torsion_lo;
+            data_third_hi += square * torsion_hi;
             if !nu_paired[index] {
                 first_lo += share_lo;
                 first_hi += share_hi;
@@ -1242,10 +1373,12 @@ impl DiagonalCriterion<'_> {
                 third_lo += skew_lo;
                 third_hi += skew_hi;
             }
-            first_magnitude += square * spread_hi.abs().max(spread_lo.abs()) + share_hi.abs();
-            second_magnitude += square * skew_hi.abs().max(skew_lo.abs()) + spread_hi.abs();
-            third_magnitude +=
-                square * torsion_hi.abs().max(torsion_lo.abs()) + skew_hi.abs().max(skew_lo.abs());
+            data_first_magnitude += square * spread_hi.abs().max(spread_lo.abs());
+            data_second_magnitude += square * skew_hi.abs().max(skew_lo.abs());
+            data_third_magnitude += square * torsion_hi.abs().max(torsion_lo.abs());
+            first_magnitude += share_hi.abs();
+            second_magnitude += spread_hi.abs();
+            third_magnitude += skew_hi.abs().max(skew_lo.abs());
         }
         // The Occam spectrum enters with a MINUS sign, so an unpaired share range
         // subtracts crosswise: its largest share lowers the derivative's floor.
@@ -1320,7 +1453,63 @@ impl DiagonalCriterion<'_> {
             third_lo += twist_lo.min(twist_hi);
             third_hi += twist_lo.max(twist_hi);
         }
-        let terms = 5 * self.squares.len() + 4 * self.occam.len() + 6 * pairs + 1;
+        let mut terms = 5 * self.squares.len() + 4 * self.occam.len() + 6 * pairs + 1;
+        match self.profile {
+            None => {
+                first_lo += data_first_lo;
+                first_hi += data_first_hi;
+                second_lo += data_second_lo;
+                second_hi += data_second_hi;
+                third_lo += data_third_lo;
+                third_hi += data_third_hi;
+                first_magnitude += data_first_magnitude;
+                second_magnitude += data_second_magnitude;
+                third_magnitude += data_third_magnitude;
+            }
+            Some(profile) => {
+                // `a = F + D` over the cell, and the ratios `x = D′/a ≥ 0`,
+                // `y = D″/a`, `z = D‴/a` by division by that positive range.
+                let (level_lo, level_hi) = (profile.floor + data_lo, profile.floor + data_hi);
+                if !(level_lo > 0.0 && level_hi.is_finite()) {
+                    return None;
+                }
+                let divide = |lo: f64, hi: f64| {
+                    (
+                        (lo / level_lo).min(lo / level_hi),
+                        (hi / level_lo).max(hi / level_hi),
+                    )
+                };
+                let (slope_lo, slope_hi) = (
+                    data_first_lo.max(0.0) / level_hi,
+                    data_first_hi.max(0.0) / level_lo,
+                );
+                let (bend_lo, bend_hi) = divide(data_second_lo, data_second_hi);
+                let (twist_lo, twist_hi) = divide(data_third_lo, data_third_hi);
+                // `x·y` with `x ≥ 0` is extremal at the ends of `x`.
+                let cross_lo = (slope_lo * bend_lo).min(slope_hi * bend_lo);
+                let cross_hi = (slope_lo * bend_hi).max(slope_hi * bend_hi);
+                let multiplier = profile.multiplier;
+                first_lo += multiplier * slope_lo;
+                first_hi += multiplier * slope_hi;
+                second_lo += multiplier * (bend_lo - slope_hi * slope_hi);
+                second_hi += multiplier * (bend_hi - slope_lo * slope_lo);
+                third_lo += multiplier
+                    * (twist_lo - 3.0 * cross_hi + 2.0 * slope_lo * slope_lo * slope_lo);
+                third_hi += multiplier
+                    * (twist_hi - 3.0 * cross_lo + 2.0 * slope_hi * slope_hi * slope_hi);
+                // Relative to the magnitudes they are built from, the ratios
+                // carry the errors of both the sums and `a`, `len + 1` terms each,
+                // and the products and combination a handful more.
+                let bend_magnitude = bend_lo.abs().max(bend_hi.abs());
+                let twist_magnitude = twist_lo.abs().max(twist_hi.abs());
+                let cross_magnitude = cross_lo.abs().max(cross_hi.abs());
+                first_magnitude += multiplier * slope_hi;
+                second_magnitude += multiplier * (bend_magnitude + slope_hi * slope_hi);
+                third_magnitude += multiplier
+                    * (twist_magnitude + 3.0 * cross_magnitude + 2.0 * slope_hi * slope_hi * slope_hi);
+                terms += 2 * self.squares.len() + 8;
+            }
+        }
         let first_band = gam_linalg::roundoff::accumulation_band(terms, first_magnitude);
         let second_band = gam_linalg::roundoff::accumulation_band(terms, second_magnitude);
         let third_band = gam_linalg::roundoff::accumulation_band(terms, third_magnitude);
@@ -1451,6 +1640,10 @@ struct AxisSlice {
     rank: usize,
     /// `μ_k`, the directions `A` shares with `B`.
     occam: Vec<f64>,
+    /// `‖v‖² − ‖L⁻¹v‖²`, the part of the draw's data term `vᵀDv` this scale
+    /// does not move: `vᵀDv = ‖v‖² − vᵀ(I + C)⁻¹v = ‖v‖² − ‖L⁻¹v‖² + Σ_j h_j² s_j`.
+    /// Only the profiled criterion reads it, as part of its floor.
+    unreached: f64,
 }
 
 impl AxisSlice {
@@ -1495,11 +1688,15 @@ impl AxisSlice {
         let own_rows = own.nrows();
         let mut squares = Vec::with_capacity(own_rows);
         let mut generalized = Vec::with_capacity(own_rows);
+        let mapped = gam_linalg::triangular::forward_substitution_lower_vector(&lower, coordinates);
+        // `(I + B)⁻¹ ≼ I`, so the exact difference is nonnegative; only its
+        // rounding can take it below zero.
+        let unreached = (coordinates.iter().map(|value| value * value).sum::<f64>()
+            - mapped.iter().map(|value| value * value).sum::<f64>())
+        .max(0.0);
         if own_rows > 0 {
             let whitened =
                 gam_linalg::triangular::forward_substitution_lower_matrix(&lower, own.t());
-            let mapped =
-                gam_linalg::triangular::forward_substitution_lower_vector(&lower, coordinates);
             let (left, singular, _) =
                 gam_linalg::faer_ndarray::FaerSvd::svd(&whitened, true, false).ok()?;
             let left = left?;
@@ -1598,16 +1795,24 @@ impl AxisSlice {
             generalized,
             rank: linear,
             occam,
+            unreached,
         })
     }
 
-    fn criterion(&self) -> DiagonalCriterion<'_> {
+    /// The slice's criterion; `residual` is the draw's profiled residual
+    /// `(m, R)` when the family profiles its scale, and the slice's floor is then
+    /// `R` plus the part of the data term this scale does not reach.
+    fn criterion(&self, residual: Option<(f64, f64)>) -> DiagonalCriterion<'_> {
         DiagonalCriterion {
             squares: &self.squares,
             generalized: &self.generalized,
             rank: self.rank,
             occam: &self.occam,
             constant: 0.0,
+            profile: residual.map(|(multiplier, residual)| ProfiledFloor {
+                multiplier,
+                floor: residual + self.unreached,
+            }),
         }
     }
 }
@@ -1643,6 +1848,71 @@ impl SmoothLrSelection {
     }
 }
 
+/// What a PROFILED-scale family's selection is driven by beyond the tested
+/// block: the dimensions of the residual deviance its REML criterion takes the
+/// logarithm of.
+///
+/// A family whose scale is profiled selects `λ` by minimizing
+/// `½[m·ln D_p + log|I + T| − log|T|₊]` ([`DiagonalCriterion`]), so a draw's
+/// selection depends on the WHOLE penalized deviance `D_p`, not only on the
+/// tested block's part of it. Under the null the rest of `D_p` is, in units of
+/// the scale,
+///
+/// ```text
+///   R = χ²_h + χ²_{r − r_j},     m = h + r,
+/// ```
+///
+/// with `h` the residual directions no column reaches, `r` the model's
+/// penalized rank and `r_j` the tested term's. The `χ²_h` is the residual sum
+/// of squares' weight-one block — the SAME variate that is the weight-one block
+/// of the statistic's `V` ([`SmoothLrProfiledScale`]) — and `χ²_{r − r_j}` is
+/// the other penalized directions' share: a penalized direction's
+/// `y²·s = χ²_1` exactly under the Gaussian law REML's own fixed point
+/// `E[D_p] = m·φ` is the mean of. With a known scale the selection sees none of
+/// this and the replay needs no profile.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SmoothLrSelectionProfile {
+    /// `h`, the residual directions no column reaches.
+    pub(crate) residual_unit_dimension: usize,
+    /// `r`, the structural rank of the model's balanced penalty.
+    pub(crate) penalized_rank: usize,
+}
+
+/// A profiled replay's per-draw residual deviance, in draw order.
+struct ProfiledResidualDraws {
+    /// `m = h + r`.
+    multiplier: f64,
+    /// The weight-one `χ²_h`, shared with the statistic's `V`.
+    unit: Vec<f64>,
+    /// `R = χ²_h + χ²_{r − r_j}`, the floor of the draw's profiled deviance.
+    residual: Vec<f64>,
+}
+
+impl SmoothLrSelectionProfile {
+    /// Stratified draws of `R`, on the two coordinates after the replay's
+    /// `dimension`: `χ²_h` on coordinate `dimension`, `χ²_{r − r_j}` on
+    /// `dimension + 1`. Declines when the tested term's rank exceeds the
+    /// model's, which leaves `χ²_{r − r_j}` undefined.
+    fn residual_draws(
+        self,
+        geometry: &SelectionGeometry,
+        draws: usize,
+    ) -> Result<ProfiledResidualDraws, SmoothLrSelectionDecline> {
+        let other = self
+            .penalized_rank
+            .checked_sub(geometry.rank)
+            .ok_or(SmoothLrSelectionDecline::ProfileInconsistent)?;
+        let unit = stratified_chi_square(self.residual_unit_dimension, geometry.dimension, draws);
+        let other = stratified_chi_square(other, geometry.dimension + 1, draws);
+        let residual = unit.iter().zip(other.iter()).map(|(unit, other)| unit + other).collect();
+        Ok(ProfiledResidualDraws {
+            multiplier: (self.residual_unit_dimension + self.penalized_rank) as f64,
+            unit,
+            residual,
+        })
+    }
+}
+
 impl SmoothLrSelectionReplay {
     /// Generate the replay for one term from its whitened penalty geometry and
     /// the window of `ln t` the fit's own `ρ` box leaves open around the fitted
@@ -1659,12 +1929,18 @@ impl SmoothLrSelectionReplay {
     /// the units of the unscaled information the whitener was built from (see
     /// [`ObservedSelection`]); its whitened image `Wᵀg` is the observation's
     /// own draw.
+    ///
+    /// `profile` is `Some` exactly when the family profiles its scale: each
+    /// draw then selects with the profiled criterion over its own residual
+    /// deviance ([`SmoothLrSelectionProfile`]) rather than the known-scale one.
     fn generate(
         whitener: &Array2<f64>,
         unit_penalties: &[Array2<f64>],
         log_lambda: &[f64],
         log_scale_windows: &[(f64, f64)],
+        profile: Option<SmoothLrSelectionProfile>,
         observed_score: Option<&Array1<f64>>,
+        observed_penalized_deviance: Option<f64>,
     ) -> SmoothLrSelection {
         if unit_penalties.is_empty() || unit_penalties.len() != log_lambda.len() {
             return SmoothLrSelection::Declined(
@@ -1698,9 +1974,13 @@ impl SmoothLrSelectionReplay {
         Self::from_geometry(
             &geometry,
             log_scale_windows,
+            profile,
             SMOOTH_LR_SELECTION_DRAWS,
             SMOOTH_LR_MULTISCALE_DRAWS,
-            observed.as_deref(),
+            observed.as_deref().map(|whitened| ObservedDraw {
+                whitened,
+                penalized_deviance: observed_penalized_deviance,
+            }),
         )
     }
 
@@ -1712,22 +1992,30 @@ impl SmoothLrSelectionReplay {
     fn from_geometry(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
+        profile: Option<SmoothLrSelectionProfile>,
         diagonal_draws: usize,
         multiscale_draws: usize,
-        observed: Option<&[f64]>,
+        observed: Option<ObservedDraw<'_>>,
     ) -> SmoothLrSelection {
         if log_scale_windows.len() != geometry.roots.len() {
             return SmoothLrSelection::Declined(
                 SmoothLrSelectionDecline::NoPenaltyComponents,
             );
         }
-        if observed.is_some_and(|draw| draw.len() != geometry.dimension) {
+        // A profiled selection needs the observation's own deviance to select
+        // it by the profiled rule; without it the observation cannot be scored
+        // the way its reference is.
+        if observed.is_some_and(|draw| {
+            draw.whitened.len() != geometry.dimension
+                || (profile.is_some() && draw.penalized_deviance.is_none())
+        }) {
             return SmoothLrSelection::Declined(SmoothLrSelectionDecline::ObservedScoreUnusable);
         }
         if geometry.roots.len() >= 2 {
             return match Self::generate_multiscale(
                 geometry,
                 log_scale_windows,
+                profile,
                 multiscale_draws,
                 observed,
             ) {
@@ -1740,13 +2028,14 @@ impl SmoothLrSelectionReplay {
                 Err(SmoothLrSelectionDecline::WindowClosed) => Self::generate_common_scale(
                     geometry,
                     log_scale_windows,
+                    profile,
                     diagonal_draws,
                     observed,
                 ),
                 Err(reason) => SmoothLrSelection::Declined(reason),
             };
         }
-        Self::generate_common_scale(geometry, log_scale_windows, diagonal_draws, observed)
+        Self::generate_common_scale(geometry, log_scale_windows, profile, diagonal_draws, observed)
     }
 
     /// The COMMON-SCALE replay: every scale moved together, `t_i ≡ t`.
@@ -1770,8 +2059,9 @@ impl SmoothLrSelectionReplay {
     fn generate_common_scale(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
+        profile: Option<SmoothLrSelectionProfile>,
         draws: usize,
-        observed: Option<&[f64]>,
+        observed: Option<ObservedDraw<'_>>,
     ) -> SmoothLrSelection {
         // Moving every scale together, the reachable set is the INTERSECTION of
         // the per-scale windows: a common shift has to keep every `ρ̂_i + ln t`
@@ -1805,19 +2095,31 @@ impl SmoothLrSelectionReplay {
             .sum();
 
         // `(W(t*), W(1))` for one draw's squared coordinates in the fitted
-        // eigenbasis. The observation goes through this same function.
-        let score = |squares: &[f64]| {
+        // eigenbasis, and on a profiled replay its floor. Under a common scale
+        // the eigenbasis reaches every direction of the block, so the floor is
+        // the draw's residual deviance alone. The observation goes through
+        // this same function.
+        let score = |squares: &[f64], profile: Option<ProfiledFloor>| {
             let criterion = DiagonalCriterion {
                 squares,
                 generalized: &generalized,
                 rank: geometry.rank,
                 occam: &[],
                 constant,
+                profile,
             };
             let selected = criterion.select(low, high).ok()?;
             // The control variate's conditional arm is read AT the fitted scale,
             // `ln t = 0`, on the same draw.
             Some((criterion.statistic(selected), criterion.statistic(0.0)))
+        };
+
+        let profiled = match profile
+            .map(|profile| profile.residual_draws(geometry, draws))
+            .transpose()
+        {
+            Ok(profiled) => profiled,
+            Err(reason) => return SmoothLrSelection::Declined(reason),
         };
 
         let dimension = geometry.dimension;
@@ -1827,7 +2129,11 @@ impl SmoothLrSelectionReplay {
         let mut conditional_sample = vec![0.0_f64; draws];
         for draw in 0..draws {
             stream.fill_chi_square_ones(&mut squares);
-            let Some((selected, held)) = score(&squares) else {
+            let floor = profiled.as_ref().map(|profiled| ProfiledFloor {
+                multiplier: profiled.multiplier,
+                floor: profiled.residual[draw],
+            });
+            let Some((selected, held)) = score(&squares, floor) else {
                 return SmoothLrSelection::Declined(SmoothLrSelectionDecline::SelectionUnresolved);
             };
             selection_sample[draw] = selected;
@@ -1840,11 +2146,30 @@ impl SmoothLrSelectionReplay {
                 // the observation is put in the same coordinates.
                 for (column, square) in squares.iter_mut().enumerate() {
                     let projection: f64 = (0..dimension)
-                        .map(|row| draw[row] * fitted.basis[[row, column]])
+                        .map(|row| draw.whitened[row] * fitted.basis[[row, column]])
                         .sum();
                     *square = projection * projection;
                 }
-                let Some((selected, conditional)) = score(&squares) else {
+                let floor = match (profiled.as_ref(), draw.penalized_deviance) {
+                    (None, _) => None,
+                    (Some(profiled), Some(deviance)) => {
+                        let Some(floor) = fitted.observed_floor(draw.whitened, deviance) else {
+                            return SmoothLrSelection::Declined(
+                                SmoothLrSelectionDecline::ObservedScoreUnusable,
+                            );
+                        };
+                        Some(ProfiledFloor {
+                            multiplier: profiled.multiplier,
+                            floor,
+                        })
+                    }
+                    (Some(_), None) => {
+                        return SmoothLrSelection::Declined(
+                            SmoothLrSelectionDecline::ObservedScoreUnusable,
+                        );
+                    }
+                };
+                let Some((selected, conditional)) = score(&squares, floor) else {
                     return SmoothLrSelection::Declined(
                         SmoothLrSelectionDecline::SelectionUnresolved,
                     );
@@ -1859,6 +2184,8 @@ impl SmoothLrSelectionReplay {
             generalized: ascending(generalized),
             selection_sample,
             conditional_sample,
+            consumed_coordinates: consumed_coordinates(dimension, profiled.is_some()),
+            residual_unit_sample: profiled.map(|profiled| profiled.unit),
             observed,
         })
     }
@@ -1913,8 +2240,9 @@ impl SmoothLrSelectionReplay {
     fn generate_multiscale(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
+        profile: Option<SmoothLrSelectionProfile>,
         draws: usize,
-        observed: Option<&[f64]>,
+        observed: Option<ObservedDraw<'_>>,
     ) -> Result<Self, SmoothLrSelectionDecline> {
         let scales = geometry.roots.len();
         if scales < 2 {
@@ -1943,15 +2271,34 @@ impl SmoothLrSelectionReplay {
         let fitted = geometry
             .at(&zero)
             .ok_or(SmoothLrSelectionDecline::GridRefused)?;
+        let profiled = profile
+            .map(|profile| profile.residual_draws(geometry, draws))
+            .transpose()?;
         let dimension = geometry.dimension;
         let mut factor = SelectionFactor::new(geometry);
         let mut stream = SelectionDrawStream::new(dimension, draws);
         let mut draw = vec![0.0_f64; dimension];
         let mut coordinates = vec![0.0_f64; geometry.rank];
         let mut selected = vec![0.0_f64; scales];
-        // `(W(t*), W(1))` for one whitened draw. The observation goes through
-        // this same function.
-        let mut score = |draw: &[f64]| -> Result<(f64, f64), SmoothLrSelectionDecline> {
+        // The observation's profiled `(m, R)`, read off the fit in the fitted
+        // eigensystem before that is handed to the replay.
+        let observed_residual = match (observed, profiled.as_ref()) {
+            (Some(draw), Some(profiled)) => {
+                let deviance = draw
+                    .penalized_deviance
+                    .ok_or(SmoothLrSelectionDecline::ObservedScoreUnusable)?;
+                let floor = fitted
+                    .observed_floor(draw.whitened, deviance)
+                    .ok_or(SmoothLrSelectionDecline::ObservedScoreUnusable)?;
+                Some((profiled.multiplier, floor))
+            }
+            _ => None,
+        };
+        // `(W(t*), W(1))` for one whitened draw and, on a profiled replay, its
+        // `(m, R)`. The observation goes through this same function.
+        let mut score = |draw: &[f64],
+                         residual: Option<(f64, f64)>|
+         -> Result<(f64, f64), SmoothLrSelectionDecline> {
             let mut norm_squared = 0.0_f64;
             let mut conditional = 0.0_f64;
             for column in 0..dimension {
@@ -1969,7 +2316,7 @@ impl SmoothLrSelectionReplay {
                 }
                 coordinates[column] = projection;
             }
-            Self::select_draw(geometry, log_scale_windows, &coordinates, &mut selected)?;
+            Self::select_draw(geometry, log_scale_windows, &coordinates, residual, &mut selected)?;
             if !factor.refactor(geometry, &selected) {
                 return Err(SmoothLrSelectionDecline::SelectionUnresolved);
             }
@@ -1979,12 +2326,15 @@ impl SmoothLrSelectionReplay {
         let mut conditional_sample = vec![0.0_f64; draws];
         for index in 0..draws {
             stream.fill_normals(&mut draw);
-            (selection_sample[index], conditional_sample[index]) = score(&draw)?;
+            let residual = profiled
+                .as_ref()
+                .map(|profiled| (profiled.multiplier, profiled.residual[index]));
+            (selection_sample[index], conditional_sample[index]) = score(&draw, residual)?;
         }
         let observed = match observed {
             None => None,
             Some(draw) => {
-                let (selected, conditional) = score(draw)?;
+                let (selected, conditional) = score(draw.whitened, observed_residual)?;
                 Some(ObservedSelection {
                     conditional,
                     selected,
@@ -1995,6 +2345,8 @@ impl SmoothLrSelectionReplay {
             generalized: ascending(fitted.eigenvalues),
             selection_sample,
             conditional_sample,
+            consumed_coordinates: consumed_coordinates(dimension, profiled.is_some()),
+            residual_unit_sample: profiled.map(|profiled| profiled.unit),
             observed,
         })
     }
@@ -2010,10 +2362,14 @@ impl SmoothLrSelectionReplay {
     /// stationary point of the box-constrained criterion. Every accepted move
     /// lowers a criterion that is bounded below on the box by more than its own
     /// rounding, so the sweep terminates without an iteration budget.
+    ///
+    /// `residual` is the draw's profiled `(m, R)` when the family profiles its
+    /// scale ([`AxisSlice::criterion`]).
     fn select_draw(
         geometry: &SelectionGeometry,
         log_scale_windows: &[(f64, f64)],
         coordinates: &[f64],
+        residual: Option<(f64, f64)>,
         selected: &mut [f64],
     ) -> Result<(), SmoothLrSelectionDecline> {
         if selected.len() != log_scale_windows.len() {
@@ -2030,7 +2386,7 @@ impl SmoothLrSelectionReplay {
                 }
                 let slice = AxisSlice::new(geometry, selected, axis, coordinates)
                     .ok_or(SmoothLrSelectionDecline::SelectionUnresolved)?;
-                let criterion = slice.criterion();
+                let criterion = slice.criterion(residual);
                 let candidate = criterion
                     .select(low, high)
                     .map_err(|_| SmoothLrSelectionDecline::SelectionUnresolved)?;
@@ -2051,23 +2407,22 @@ impl SmoothLrSelectionReplay {
             }
         }
     }
-    /// The observation's statistic under the replay's own selection, given
-    /// its statistic `conditional` at the fitted `λ̂`: `conditional` carried by
-    /// the quadratic model's ratio `W_q(t*; z)/W_q(1; z)` of the observed
-    /// whitened score (see [`Self::observed`]). Unchanged when no observation
-    /// was scored, or when its `W_q(1; z)` is not a positive number to divide
-    /// by — a score of exactly zero, where every `t` gives the same `W_q = 0`
-    /// and the selection moves nothing.
-    fn observed_selection_threshold(&self, conditional: f64) -> f64 {
+    /// The factor that carries the observation from the fitted `λ̂` to the
+    /// replay's own selection: the quadratic model's ratio `W_q(t*; z)/W_q(1; z)`
+    /// of the observed whitened score (see [`Self::observed`]). One when no
+    /// observation was scored, or when its `W_q(1; z)` is not a positive number
+    /// to divide by — a score of exactly zero, where every `t` gives the same
+    /// `W_q = 0` and the selection moves nothing.
+    fn observed_ratio(&self) -> f64 {
         match self.observed {
             Some(observed)
                 if observed.conditional.is_finite()
                     && observed.conditional > 0.0
                     && observed.selected.is_finite() =>
             {
-                conditional * (observed.selected / observed.conditional)
+                observed.selected / observed.conditional
             }
-            _ => conditional,
+            _ => 1.0,
         }
     }
 
@@ -2086,31 +2441,138 @@ impl SmoothLrSelectionReplay {
     /// thresholds — the control variate, and why the standard error is a
     /// fraction of the naive `√(p(1−p)/N)`.
     fn tail_shift_at(&self, conditional_threshold: f64, selection_threshold: f64) -> (f64, f64) {
+        paired_mean_with_error(
+            self.selection_sample
+                .iter()
+                .zip(self.conditional_sample.iter())
+                .map(|(&selected, &held)| {
+                    f64::from(selected >= selection_threshold)
+                        - f64::from(held >= conditional_threshold)
+                }),
+        )
+    }
+
+    /// The same shift for a statistic whose scale was PROFILED, integrated over
+    /// the residual law rather than read at one point of it.
+    ///
+    /// With an estimated scale the event `W ≥ w` is `Q ≥ c·V`
+    /// ([`SmoothLrProfiledScale`]), and under the replay's selection the
+    /// observation's `Q` is carried by [`Self::observed_ratio`] `ρ` with its `V`
+    /// unchanged, so its event is `Q_sel ≥ ρc·V`. The shift the replay has to
+    /// supply is therefore
+    ///
+    /// ```text
+    ///   E[ 1{Q_sel ≥ ρc·V} − 1{Q_cond ≥ c·V} ],
+    ///   V = Σ_r v_r·χ²_1 + χ²_h,
+    /// ```
+    ///
+    /// over the joint law of the draw and `V`. Conditional plus shift is then
+    /// `P(Q_sel ≥ ρc·V)` up to the Monte-Carlo error of the paired difference,
+    /// because the analytic conditional tail `P(Q_cond − c·V ≥ 0)` integrates
+    /// over the same `V`. What this replaced read the shift at the single
+    /// threshold `c·E[V]`: the shift is a difference of two tails, which is not
+    /// linear in the threshold, so its value at the mean threshold is not its
+    /// mean over the threshold's law.
+    ///
+    /// The non-unit part `V' = Σ_r v_r·χ²_1` is drawn from the same stratified
+    /// stream as the replay, on coordinates numbered after every one the replay
+    /// consumed, so it is independent of the draws it pairs with and the whole
+    /// construction is still a pure function of its inputs. The weight-one block
+    /// `χ²_h` — the dominant term, `h = n − p` — depends on how the replay
+    /// selected:
+    ///
+    /// - A PROFILED selection drove each draw with its own `χ²_h`
+    ///   ([`SmoothLrSelectionProfile`]): a large residual flattens the profiled
+    ///   criterion's data term and so moves `λ̂`, and the same residual is the
+    ///   weight-one block of that draw's `V`. The two are one variate, so the
+    ///   event is read on the draw's own. Integrating a fresh `χ²_h` instead
+    ///   would pair a selection with a residual it was not made under.
+    /// - A known-scale selection never saw the residual, so `χ²_h` is
+    ///   independent of the draw and is integrated in CLOSED FORM:
+    ///   `P(Q ≥ r(V' + χ²_h)) = 1 − P(χ²_h > Q/r − V')`, one regularized
+    ///   incomplete gamma per draw and arm.
+    fn profiled_tail_shift(
+        &self,
+        conditional_ratio: f64,
+        selection_ratio: f64,
+        scale: &SmoothLrProfiledScale,
+    ) -> (f64, f64) {
         let draws = self.selection_sample.len();
-        if draws == 0 {
-            return (0.0, 0.0);
-        }
-        let mut sum = 0.0_f64;
-        let mut sum_squares = 0.0_f64;
-        for (&selected, &held) in self
+        let non_unit = stratified_weighted_chi_square_sum(
+            &scale.residual_weights,
+            self.consumed_coordinates,
+            draws,
+        );
+        let arms = self
             .selection_sample
             .iter()
             .zip(self.conditional_sample.iter())
-        {
-            let difference = f64::from(selected >= selection_threshold)
-                - f64::from(held >= conditional_threshold);
-            sum += difference;
-            sum_squares += difference * difference;
+            .zip(non_unit.iter());
+        if let Some(unit_sample) = self.residual_unit_sample.as_ref() {
+            return paired_mean_with_error(arms.zip(unit_sample.iter()).map(
+                |(((&selected, &held), &non_unit), &unit)| {
+                    let residual = non_unit + unit;
+                    f64::from(selected >= selection_ratio * residual)
+                        - f64::from(held >= conditional_ratio * residual)
+                },
+            ));
         }
-        let count = draws as f64;
-        let shift = sum / count;
-        // `d_i ∈ {−1, 0, +1}` and is zero on every draw whose selected `t` left
-        // it on the same side of `statistic` — which is most of them. That is
-        // the control variate, and this is its own sample variance rather than
-        // the `√(p(1−p)/N)` of either term alone.
-        let variance = (sum_squares / count - shift * shift).max(0.0);
-        (shift, (variance / count).sqrt())
+        let unit = scale.residual_unit_dimension;
+        // `P(Q ≥ r·V)` for one draw of `Q` and of `V'`.
+        let exceedance = |quadratic: f64, ratio: f64, non_unit: f64| {
+            let room = quadratic / ratio - non_unit;
+            if unit > 0.0 {
+                if room > 0.0 {
+                    1.0 - gam_math::probability::chi_square_sf(room, unit)
+                } else {
+                    0.0
+                }
+            } else {
+                f64::from(room >= 0.0)
+            }
+        };
+        paired_mean_with_error(arms.map(|((&selected, &held), &non_unit)| {
+            exceedance(selected, selection_ratio, non_unit)
+                - exceedance(held, conditional_ratio, non_unit)
+        }))
     }
+}
+
+/// Stratified coordinates a replay of `dimension` consumes: its own block, and
+/// on a profiled replay the two residual coordinates after it
+/// ([`SmoothLrSelectionProfile::residual_draws`]).
+fn consumed_coordinates(dimension: usize, profiled: bool) -> usize {
+    if profiled { dimension + 2 } else { dimension }
+}
+
+/// `(mean, standard error)` of a paired-difference sample. `d_i ∈ {−1, 0, +1}`
+/// (or its closed-form average over `χ²_h`) is zero on every draw whose
+/// selection left it on the same side of both thresholds — which is most of
+/// them. That is the control variate, and this is its own sample variance
+/// rather than the `√(p(1−p)/N)` of either term alone. Empty is `(0, 0)`: no
+/// replay, no shift.
+///
+/// The spread is accumulated in two passes about the sample's own mean:
+/// `M₂ = Σ (dᵢ − d̄)²` is a sum of squares, so it is `≥ 0` in floating point
+/// with no clamp. The mean is read pivoted on the first draw,
+/// `d̄ = d₁ + Σ (dᵢ − d₁)/N`, so a constant sample has every pivoted
+/// difference exactly zero and reports `d̄ = d₁` and `M₂ = 0` exactly. Any
+/// rounding left in `d̄` enters `M₂` only at second order, since
+/// `Σ (dᵢ − m)² = Σ (dᵢ − d̄)² + N (d̄ − m)²`. The one-pass `Σd²/N − d̄²`
+/// it replaces differences two quantities of size `d̄²`, so it resolves the
+/// variance only in steps of `ulp(d̄²)` and reports a positive error on a
+/// draw set that is constant (#4086). A running (Welford) mean does not
+/// fix this either: on an ordered sample it drifts by `ulp(d̄)` per step,
+/// which is not small beside a spread far below `|d̄|`.
+fn paired_mean_with_error(differences: impl Iterator<Item = f64>) -> (f64, f64) {
+    let sample: Vec<f64> = differences.collect();
+    let Some(&pivot) = sample.first() else {
+        return (0.0, 0.0);
+    };
+    let count = sample.len() as f64;
+    let shift = pivot + sample.iter().map(|d| d - pivot).sum::<f64>() / count;
+    let centred_squares: f64 = sample.iter().map(|d| (d - shift) * (d - shift)).sum();
+    (shift, (centred_squares / count / count).sqrt())
 }
 
 /// Deterministic `χ²_1` draws for the selection replay.
@@ -2140,28 +2602,11 @@ struct SelectionDrawStream {
 
 impl SelectionDrawStream {
     fn new(dimension: usize, draws: usize) -> Self {
-        let signed: Vec<f64> = (0..draws)
-            .map(|bin| {
-                // Bin midpoint: never `0` or `1`, so the quantile is finite.
-                let uniform = (bin as f64 + 0.5) / draws as f64;
-                gam_math::probability::standard_normal_quantile(uniform)
-                    .expect("a bin midpoint is strictly inside (0, 1)")
-            })
-            .collect();
+        let signed = stratum_normals(draws);
         let values: Vec<f64> = signed.iter().map(|normal| normal * normal).collect();
-        let mut permutations = Vec::with_capacity(dimension);
-        for coordinate in 0..dimension {
-            let mut order: Vec<u32> = (0..draws as u32).collect();
-            // Fisher–Yates with a counter-based stream keyed by the coordinate.
-            let mut state = 0x9E37_79B9_7F4A_7C15_u64
-                ^ (coordinate as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
-            for position in (1..order.len()).rev() {
-                state = split_mix64(state);
-                let pick = (state % (position as u64 + 1)) as usize;
-                order.swap(position, pick);
-            }
-            permutations.push(order);
-        }
+        let permutations = (0..dimension)
+            .map(|coordinate| stratum_permutation(coordinate, draws))
+            .collect();
         Self {
             values,
             signed,
@@ -2191,6 +2636,78 @@ impl SelectionDrawStream {
         }
         self.index += 1;
     }
+}
+
+/// The `N` stratum midpoints of the standard normal, in stratum order.
+fn stratum_normals(draws: usize) -> Vec<f64> {
+    (0..draws)
+        .map(|bin| {
+            // Bin midpoint: never `0` or `1`, so the quantile is finite.
+            let uniform = (bin as f64 + 0.5) / draws as f64;
+            gam_math::probability::standard_normal_quantile(uniform)
+                .expect("a bin midpoint is strictly inside (0, 1)")
+        })
+        .collect()
+}
+
+/// The order in which coordinate `coordinate` visits the `N` strata: a
+/// Fisher–Yates shuffle driven by a counter-based stream keyed by the
+/// coordinate, so the same coordinate index always gets the same order.
+fn stratum_permutation(coordinate: usize, draws: usize) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..draws as u32).collect();
+    let mut state =
+        0x9E37_79B9_7F4A_7C15_u64 ^ (coordinate as u64).wrapping_mul(0x94D0_49BB_1331_11EB);
+    for position in (1..order.len()).rev() {
+        state = split_mix64(state);
+        let pick = (state % (position as u64 + 1)) as usize;
+        order.swap(position, pick);
+    }
+    order
+}
+
+/// `Σ_r a_r·χ²_{1,r}` over `draws` stratified draws, one coordinate per weight,
+/// the coordinates numbered from `first_coordinate`.
+///
+/// The offset is what keeps these draws INDEPENDENT of a replay's: a replay of
+/// dimension `q` consumes coordinates `0..q`, so a sum that is to be independent
+/// of it starts at `q`. Built one coordinate at a time, so the memory is one
+/// permutation rather than one per weight.
+fn stratified_weighted_chi_square_sum(
+    weights: &[f64],
+    first_coordinate: usize,
+    draws: usize,
+) -> Vec<f64> {
+    let squares: Vec<f64> = stratum_normals(draws)
+        .iter()
+        .map(|normal| normal * normal)
+        .collect();
+    let mut sum = vec![0.0_f64; draws];
+    for (offset, &weight) in weights.iter().enumerate() {
+        let order = stratum_permutation(first_coordinate + offset, draws);
+        for (slot, &stratum) in sum.iter_mut().zip(order.iter()) {
+            *slot += weight * squares[stratum as usize];
+        }
+    }
+    sum
+}
+
+/// `χ²_k` over `draws` stratified draws on ONE coordinate: draw `i` is the
+/// `χ²_k` quantile at the midpoint of the stratum [`stratum_permutation`] gives
+/// it, so the sample is the same Latin-hypercube construction as the replay's
+/// own `χ²_1` coordinates at the cost of one quantile per draw rather than `k`
+/// normals. `k = 0` is the point mass at zero.
+fn stratified_chi_square(degrees_of_freedom: usize, coordinate: usize, draws: usize) -> Vec<f64> {
+    if degrees_of_freedom == 0 {
+        return vec![0.0; draws];
+    }
+    let degrees_of_freedom = degrees_of_freedom as f64;
+    stratum_permutation(coordinate, draws)
+        .into_iter()
+        .map(|stratum| {
+            let uniform = (f64::from(stratum) + 0.5) / draws as f64;
+            gam_math::probability::chi_square_quantile(uniform, degrees_of_freedom)
+        })
+        .collect()
 }
 
 /// SplitMix64, used only to permute the strata. Any full-period mixer would do;
@@ -2290,9 +2807,9 @@ fn split_mix64(state: u64) -> u64 {
 ///   LEAST effective d.f. Measured on the #2672 fixture: a replicate with
 ///   `edf = 0.070` was handed `rho_uncertainty = 1.79`, twenty-five times the
 ///   term's own effective d.f. It was holding the size up by an unrelated
-///   mechanism. λ̂'s sampling variation enters `E[W]` through the estimated-λ
-///   Lawley shift already applied as the Bartlett factor, at the `O(n⁻¹)` order
-///   it belongs to.
+///   mechanism. λ̂'s sampling variation enters the reference through its
+///   selection replay, which integrates the law over the λ̂ the fit could have
+///   chosen.
 /// * `.max(edf)` and `.max(null_dim)`. Both are automatic: `w_j = 1` exactly on
 ///   an unpenalized direction, so `Σ w_j ≥ null_dim` by construction, and `Σ w_j`
 ///   dominates `tr(F_jj) = edf` because `w_j = 2f_j − f_j² ≥ f_j` for `f_j ∈ [0,1]`.
@@ -2508,37 +3025,24 @@ impl SmoothLrReferenceDf {
         if !conditional.is_finite() {
             return (conditional, bound);
         }
-        let threshold = self.selection_threshold(statistic);
-        let (shift, standard_error) =
-            replay.tail_shift_at(threshold, replay.observed_selection_threshold(threshold));
+        let observed_ratio = replay.observed_ratio();
+        let (shift, standard_error) = match self.profiled_scale.as_ref() {
+            None => replay.tail_shift_at(statistic, observed_ratio * statistic),
+            Some(scale) => {
+                let ratio = ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
+                if !(ratio > 0.0) {
+                    // `conditional` is the certain `1` here (see
+                    // `conditional_tail_with_bound`), and every draw of either
+                    // arm clears a non-positive threshold, so nothing moves.
+                    return (conditional, bound);
+                }
+                replay.profiled_tail_shift(ratio, observed_ratio * ratio, scale)
+            }
+        };
         (
             (conditional + shift).clamp(0.0, 1.0),
             bound + 2.0 * standard_error,
         )
-    }
-
-    /// The threshold the λ̂-selection replay has to be asked about, which is not
-    /// the statistic itself once the scale is profiled.
-    ///
-    /// The replay samples the statistic's KNOWN-SCALE law `Q` under two ways of
-    /// choosing `λ`, and its shift is the difference of the two tails at a
-    /// `Q`-threshold. With an estimated scale the event `W > w` is
-    /// `Q > c(w)·V`, so the `Q`-threshold is random; the selection correction is
-    /// `E_V[Δ(c(w)·V)]`, and evaluating `Δ` at `E[V]` is the first-order term of
-    /// that expectation. `E[V] = Σ_i v_i + (n − p)` is the residual law's own
-    /// mean, already carried.
-    ///
-    /// As `ν → ∞` this returns the statistic: `B → 0`, `E[V]/n → 1`, and
-    /// `expm1(w/n)·n → w`. So the correction composes with the known-scale
-    /// behaviour rather than replacing it.
-    fn selection_threshold(&self, statistic: f64) -> f64 {
-        let Some(scale) = self.profiled_scale.as_ref() else {
-            return statistic;
-        };
-        let residual_mean: f64 = scale.residual_weights.iter().sum::<f64>()
-            + scale.residual_unit_dimension;
-        let ratio = ((statistic - scale.deterministic_offset) / scale.observations).exp_m1();
-        ratio.max(0.0) * residual_mean
     }
 
     /// The statistic's OWN null law, as a list of `λ_j·χ²_{h_j}` terms: the
@@ -2825,25 +3329,21 @@ pub struct SmoothTermLrInference {
     /// The reference distribution itself: both spectral moments of the null law,
     /// the `(ν, g)` pair resolved from them, and which lane supplied it (#2672).
     pub ref_df_provenance: SmoothLrReferenceDf,
-    /// Lawley LR Bartlett factor `c = E[W]/d = 1 + Δε/d` when computable, else
-    /// `1.0` (no correction).
+    /// The fixed-λ Lawley LR Bartlett factor `c = 1 + Δε(ρ̂)/d` — the scale the
+    /// corrected reference applies to every spectral weight,
+    /// `w_j → w_j + Δε(ρ̂)·w_j/d` — when computable, else `1.0` (no correction).
+    /// `Δε(ρ̂)` is taken at the λ the reference is built at and vanishes with
+    /// the tested block, so `c` stays bounded as `d → 0`.
     pub bartlett_factor: f64,
-    /// Fixed-λ conditional factor `c_cond = 1 + Δε(ρ̂)/d` when the estimated-λ
-    /// correction was applied. `None` means the applied factor was either the
-    /// fixed-λ factor itself or no Lawley correction was available.
-    pub bartlett_factor_conditional: Option<f64>,
-    /// Increment in Lawley's LR mean shift due solely to ρ̂ sampling variation,
-    /// `0.5 * tr(H_Δε Cov(ρ̂))`, when estimated-λ correction was applied.
-    pub rho_variation_shift: Option<f64>,
-    /// Bartlett-corrected statistic `W* = W / c`.
+    /// Corrected statistic `W* = W/c`.
     pub statistic_corrected: f64,
     /// Uncorrected tail probability `P(χ²_ν > W/g)` under the null law's own
     /// two-moment reference.
     pub p_value_uncorrected: f64,
     /// Corrected tail probability `P(χ²_ν > W*/g)`; equals the uncorrected value
-    /// when no correction was applied. Dividing the statistic by `c` and scaling
-    /// every spectral weight by `c` are the same operation on this reference, so
-    /// the Bartlett correction composes without a second convention.
+    /// when no correction was applied. Scoring `W*` against the reference `L` is
+    /// scoring `W` against `c·L`, so the correction composes without a second
+    /// convention.
     pub p_value_corrected: f64,
     /// Whether the second-order correction is **material** (#939 deliverable 4):
     /// the per-test diagnostic "is `n` too small for first-order inference
@@ -2885,46 +3385,6 @@ pub struct SmoothTermLrInference {
 /// deliverable 4): a correction is flagged material when it changes the result
 /// by more than 10%.
 pub const SMOOTH_LR_MATERIAL_THRESHOLD: f64 = 0.10;
-
-/// Build `S_b = lambda_b * S_b^unit` as global `p_total x p_total` matrices in
-/// exactly the fitted rho/lambda ordering. This is the narrow handoff the
-/// estimated-lambda Lawley correction needs: the same `design.penalties` order
-/// already paired with `fit.lambdas`, without changing #740's outer-Hessian
-/// algebra or the production penalty assembly.
-fn fitted_rho_penalty_components(
-    penalties: &[BlockwisePenalty],
-    lambdas: &[f64],
-    p_total: usize,
-) -> Result<Vec<gam_terms::inference::lawley::RhoPenaltyComponent>, EstimationError> {
-    if penalties.len() != lambdas.len() {
-        return Err(EstimationError::InvalidInput(format!(
-            "smooth_term_lr_inference: penalty/lambda count mismatch ({} penalties, {} lambdas)",
-            penalties.len(),
-            lambdas.len()
-        )));
-    }
-    let mut components = Vec::with_capacity(penalties.len());
-    for (idx, (penalty, &lambda)) in penalties.iter().zip(lambdas.iter()).enumerate() {
-        if !(lambda.is_finite() && lambda >= 0.0) {
-            return Err(EstimationError::InvalidInput(format!(
-                "smooth_term_lr_inference: lambda[{idx}] is invalid: {lambda}"
-            )));
-        }
-        let r = &penalty.col_range;
-        if r.end > p_total {
-            return Err(EstimationError::InvalidInput(format!(
-                "smooth_term_lr_inference: penalty[{idx}] range {:?} exceeds coefficient dimension {p_total}",
-                r
-            )));
-        }
-        let mut s_component = Array2::<f64>::zeros((p_total, p_total));
-        s_component
-            .slice_mut(s![r.start..r.end, r.start..r.end])
-            .scaled_add(lambda, &penalty.local);
-        components.push(gam_terms::inference::lawley::RhoPenaltyComponent { s_component });
-    }
-    Ok(components)
-}
 
 /// The end-to-end per-term likelihood-ratio significance report for every
 /// penalized (shape-unconstrained) smooth term in a fitted model, magically
@@ -2997,7 +3457,7 @@ pub fn smooth_term_lr_inference_forspec(
 ) -> Result<Vec<SmoothTermLrReport>, EstimationError> {
     use gam_terms::inference::lawley::{
         LAWLEY_PAIR_MATRIX_MAX_ROWS, known_scale_expected_jets_with_dispersion,
-        lawley_lr_bartlett_factor, lawley_lr_mean_shift_with_rho_variation,
+        lawley_lr_bartlett_factor,
     };
 
     let n = data.nrows();
@@ -3038,11 +3498,6 @@ pub fn smooth_term_lr_inference_forspec(
         )
     })?;
     let s_lambda = weighted_blockwise_penalty_sum(&full.design.penalties, lambdas, p_total);
-    let rho_penalty_components =
-        fitted_rho_penalty_components(&full.design.penalties, lambdas, p_total)?;
-    let rho_covariance = full.fit.artifacts.rho_covariance.as_ref().filter(|cov| {
-        cov.nrows() == rho_penalty_components.len() && cov.ncols() == rho_penalty_components.len()
-    });
     // Full design as a dense n×p array for the Lawley pair-matrix reduction.
     let full_design_dense = full.design.design.to_dense();
     let influence = full.fit.coefficient_influence();
@@ -3118,6 +3573,33 @@ pub fn smooth_term_lr_inference_forspec(
     // the weight-one block. On the exact rung that block is the `n − p`
     // directions no column reaches; on the summary rung the whole residual law
     // is folded into it at the fit's own `ν`.
+    // A profiled family's REML criterion selects every term's `λ` through
+    // `m·ln D_p` with `m = n − M_p`, `M_p = p − r` the balanced penalty's
+    // structural null space, so the replay has to select through the same
+    // residual (#2672). Only the exact rung carries a replay: the summary rung
+    // has no Hessian inverse to whiten a term by.
+    let selection_profile = match profiled_residual_shares.as_ref() {
+        Some(Some(_)) => {
+            let penalized_rank = gam_terms::construction::balanced_penalty_structural_rank(
+                full.design
+                    .penalties
+                    .iter()
+                    .map(|block| (block.local.view(), block.col_range.clone())),
+                p_total,
+            )?;
+            Some(SmoothLrSelectionProfile {
+                residual_unit_dimension: profiled_observations.saturating_sub(p_total),
+                penalized_rank,
+            })
+        }
+        _ => None,
+    };
+    // `D_p(λ̂) = D + β̂ᵀS_λβ̂`, the deviance the profiled REML criterion takes
+    // the logarithm of.
+    let full_penalized_deviance = selection_profile.and_then(|_| {
+        let beta = full.fit.beta_flat();
+        (beta.len() == s_lambda.nrows()).then(|| full.fit.deviance + beta.dot(&s_lambda.dot(&beta)))
+    });
     let profiled_residual = profiled_residual_shares.zip(full_residual_df).map(
         |(shares, residual_df)| match shares {
             Some(spectrum) => (spectrum, profiled_observations.saturating_sub(p_total) as f64),
@@ -3259,8 +3741,8 @@ pub fn smooth_term_lr_inference_forspec(
         // either edge. A term whose geometry cannot be projected keeps the
         // precision box around unit strength.
         let block_gram = {
-            let dense = full.design.design.to_dense();
-            let block = dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
+            let block =
+                full_design_dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
             block.t().dot(&block)
         };
         let log_scale_windows: Vec<(f64, f64)> = term_penalties
@@ -3296,8 +3778,11 @@ pub fn smooth_term_lr_inference_forspec(
         // whose working weight already carries the dispersion reads it off the
         // reporting likelihood directly; the profiled Gaussian's score is
         // `X_jᵀ W (y − μ̂₀)` (unit `φ`), and dividing by `√(D_f / E[V])` puts
-        // it on the scale the selection threshold `expm1((W − B)/n)·E[V]` is
-        // expressed in — the same `D_f/E[V]` that threshold divides out.
+        // it on the unit scale the replay's draws are on. The profiled
+        // criterion's argmin is invariant to that common scale, so all it has
+        // to do is put the score and the observed penalized deviance in the
+        // same units.
+        let mut observed_penalized_deviance = None;
         let observed_score = match null_outcome.as_ref() {
             Some(gam_solve::estimate::NestedFixedLambdaOutcome::Converged(null)) => {
                 let block_score = full_design_dense
@@ -3312,6 +3797,12 @@ pub fn smooth_term_lr_inference_forspec(
                     }
                     None => 1.0,
                 };
+                // A profiled selection is driven by the whole penalized
+                // deviance, so the observation carries its own, in the same
+                // units as its score's squares.
+                if selection_profile.is_some() && unit_scale.is_finite() && unit_scale > 0.0 {
+                    observed_penalized_deviance = full_penalized_deviance.map(|deviance| deviance / unit_scale);
+                }
                 (unit_scale.is_finite() && unit_scale > 0.0)
                     .then(|| block_score.mapv(|value| value / unit_scale.sqrt()))
             }
@@ -3327,7 +3818,9 @@ pub fn smooth_term_lr_inference_forspec(
             &log_scale_windows,
             &term_penalties,
             &term_log_lambda,
+            selection_profile,
             observed_score.as_ref(),
+            observed_penalized_deviance,
         );
         let mut reference = reference;
         let ref_df = reference.mean;
@@ -3413,8 +3906,6 @@ pub fn smooth_term_lr_inference_forspec(
         // family has closed-form jets, n is in the resolvable regime, and the
         // factor is computable. Otherwise the uncorrected χ² stands.
         let mut bartlett_factor = 1.0;
-        let mut bartlett_factor_conditional = None;
-        let mut rho_variation_shift = None;
         let mut statistic_corrected = statistic_lr;
         let mut p_corrected = p_uncorrected;
         let mut correction = SmoothLrCorrection::None;
@@ -3445,50 +3936,17 @@ pub fn smooth_term_lr_inference_forspec(
                     && c_cond.is_finite()
                     && c_cond > 0.0
                 {
-                    let mut c_applied = c_cond;
                     correction = SmoothLrCorrection::LawleyLrFixedLambda;
-                    // The ρ-variation mean shift is a first-order account of what
-                    // estimating `λ` does to `W`. A selection replay already puts
-                    // the whole of that into the law — it re-selects `λ` on every
-                    // draw — so adding the shift as well counts it twice. On a
-                    // term REML shrinks to its null the double count is not
-                    // small: an `O(1/n)` shift over `ref_df ~ 1e-5` is a factor
-                    // near 70, and it moved every such term's p-value to ~1.
-                    // With a replay, only the fixed-`λ` factor — the
-                    // non-Gaussian part of the conditional law, which the
-                    // replay's Gaussian quadratic form does not carry — applies.
-                    if reference.selection.replay().is_none()
-                        && let Some(cov) = rho_covariance
-                        && let Ok(total_shift) = lawley_lr_mean_shift_with_rho_variation(
-                            full_design_dense.view(),
-                            &kappas,
-                            s_lambda.view(),
-                            coeff_range.clone(),
-                            &rho_penalty_components,
-                            cov.view(),
-                        )
-                    {
-                        let mean_w = ref_df + total_shift;
-                        if let Some(c_est) =
-                            gam_terms::inference::higher_order::bartlett_factor_from_mean(
-                                mean_w, ref_df,
-                            )
-                            && c_est.is_finite()
-                            && c_est > 0.0
-                        {
-                            let conditional_shift = (c_cond - 1.0) * ref_df;
-                            c_applied = c_est;
-                            bartlett_factor_conditional = Some(c_cond);
-                            rho_variation_shift = Some(total_shift - conditional_shift);
-                            correction = SmoothLrCorrection::LawleyLrEstimatedLambda;
-                        }
-                    }
-                    bartlett_factor = c_applied;
-                    statistic_corrected = statistic_lr / c_applied;
-                    // `W* = W/c` and "rescale every spectral weight by `c`" are
-                    // the same operation on this reference — the law is exactly
-                    // scale-equivariant — so the correction composes with the
-                    // scaled reference without a second convention.
+                    bartlett_factor = c_cond;
+                    statistic_corrected = statistic_lr / c_cond;
+                    // Scoring `W/c` against the reference is scoring `W`
+                    // against `c·L`: the factor rescales every spectral weight
+                    // (the law is exactly scale-equivariant), and the
+                    // selection replay inside `L` already carries the λ̂ the
+                    // fit could have chosen, so the correction composes with
+                    // it without a second convention. `c = 1 + Δε/d` is a ratio
+                    // of two quantities taken at the same λ, so it stays
+                    // bounded as a shrunk term's `d → 0`.
                     let (corrected, corrected_bound) =
                         reference.tail_probability_with_bound(statistic_corrected);
                     p_corrected = corrected;
@@ -3504,8 +3962,7 @@ pub fn smooth_term_lr_inference_forspec(
         // p-value shift, whichever is larger (a factor near one can still flip a
         // p-value sitting on the α boundary, and vice versa).
         let material = match correction {
-            SmoothLrCorrection::LawleyLrEstimatedLambda
-            | SmoothLrCorrection::LawleyLrFixedLambda => {
+            SmoothLrCorrection::LawleyLrFixedLambda => {
                 let factor_move = (bartlett_factor - 1.0).abs();
                 let p_denom = p_uncorrected.max(p_corrected);
                 // Two zero p-values have not moved.
@@ -3532,8 +3989,6 @@ pub fn smooth_term_lr_inference_forspec(
             ref_df,
             ref_df_provenance,
             bartlett_factor,
-            bartlett_factor_conditional,
-            rho_variation_shift,
             statistic_corrected,
             p_value_uncorrected: p_uncorrected,
             p_value_corrected: p_corrected,
@@ -3688,6 +4143,11 @@ fn lawley_dispersion_for_family(
 /// it whenever the `λ_i` separate (#2644 — see [`SelectionGeometry`]).
 /// `log_scale_windows` carries ONE window per component, because the outer
 /// search moved each `ρ_i` independently inside its own box.
+/// `selection_profile` is the residual the replay's selection is driven by when
+/// the family profiles its scale ([`SmoothLrSelectionProfile`]), `None` when it
+/// does not; `observed_penalized_deviance` is then the full fit's `D_p(λ̂)` in
+/// the observed score's units, which selects the observation by the same
+/// profiled rule ([`ObservedDraw`]).
 fn lr_null_reference(
     influence: Option<&Array2<f64>>,
     hessian_inverse: Option<&Array2<f64>>,
@@ -3698,7 +4158,9 @@ fn lr_null_reference(
     log_scale_windows: &[(f64, f64)],
     term_penalties: &[Array2<f64>],
     term_log_lambda: &[f64],
+    selection_profile: Option<SmoothLrSelectionProfile>,
     observed_score: Option<&Array1<f64>>,
+    observed_penalized_deviance: Option<f64>,
 ) -> SmoothLrReferenceDf {
     let from_moments = |mean: f64, second_moment: f64, source| SmoothLrReferenceDf {
         weights: Vec::new(),
@@ -3763,7 +4225,9 @@ fn lr_null_reference(
                     term_penalties,
                     term_log_lambda,
                     log_scale_windows,
+                    selection_profile,
                     observed_score,
+                    observed_penalized_deviance,
                 ),
                 profiled_scale: None,
             };
@@ -4127,6 +4591,8 @@ mod lr_null_reference_tests {
             &[],
             &[],
             None,
+            None,
+            None,
         );
         assert_eq!(exact.source, SmoothLrReferenceSource::NullSpectrum);
         assert_eq!(exact.weights.len(), q);
@@ -4134,7 +4600,7 @@ mod lr_null_reference_tests {
         // No `H⁻¹` (or no penalty): the moments off `F`, and NO weights — which
         // is exactly the condition `tail_probability_with_bound` switches on.
         for degraded in [
-            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[], None),
+            lr_null_reference(Some(&influence), None, Some(&penalty), &(0..q), 2.0, 1, WINDOW, &[], &[], None, None, None),
             lr_null_reference(
                 Some(&influence),
                 Some(&hessian_inverse),
@@ -4146,6 +4612,8 @@ mod lr_null_reference_tests {
                 &[],
                 &[],
                 None,
+                None,
+                None,
             ),
         ] {
             assert_eq!(degraded.source, SmoothLrReferenceSource::SpectralMomentMatch);
@@ -4154,18 +4622,18 @@ mod lr_null_reference_tests {
         }
 
         // Nothing at all: the unit-weight shape with its `max(edf, null_dim, 1)`.
-        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[], None);
+        let fallback = lr_null_reference(None, None, None, &(0..q), 2.5, 1, WINDOW, &[], &[], None, None, None);
         assert_eq!(fallback.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert!(fallback.weights.is_empty());
         assert_eq!(fallback.chi_square_df, 2.5);
         assert_eq!(fallback.scale, 1.0);
         // The `max(edf, null_dim, 1)` shape is retained only on this lane.
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[], None).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 3, WINDOW, &[], &[], None, None, None).chi_square_df,
             3.0
         );
         assert_eq!(
-            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[], None).chi_square_df,
+            lr_null_reference(None, None, None, &(0..4), 0.01, 0, WINDOW, &[], &[], None, None, None).chi_square_df,
             1.0
         );
     }
@@ -4388,11 +4856,72 @@ mod profiled_scale_reference_tests {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        AxisSlice, DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream,
-        SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
-        SmoothLrReferenceDf, SmoothLrReferenceSource, SmoothLrSelectionReplay, split_mix64,
+        AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
+        SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
+        SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, paired_mean_with_error, split_mix64,
+        stratified_chi_square,
     };
     use ndarray::Array2;
+
+    /// #4086 sibling: the paired-difference spread is two-pass centred, so it
+    /// cannot cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
+    /// power of two) have mean exactly `c` and population variance exactly
+    /// `s²`, so the reference is exact with no second implementation. The
+    /// retired one-pass `Σd²/N − d̄²` is evaluated alongside to show this is
+    /// the regime where it loses the variance (it resolves only `ulp(c²)`),
+    /// and a constant sample must report an error of exactly zero.
+    ///
+    /// The fixture is chosen so that every floating-point step of the two-pass
+    /// reading is exact, which is why the assertions are equalities rather than
+    /// an ε band:
+    /// - `c ± s` with `c = 3·2⁻²` and `s = 2⁻ᵏ`, `k ≤ 31`, spans bits `2⁻¹…2⁻³¹`,
+    ///   well inside a 53-bit significand, so both values are exact.
+    /// - The pivoted differences are `0` or `−2s`, exact by Sterbenz because
+    ///   `c − s` and `c + s` are within a factor of two of each other.
+    /// - Every partial sum is a multiple of `2s` no larger than `2⁹·s`, so it is
+    ///   exact. Dividing by `N = 2⁸` is exact, and so is `(c + s) − s = c`.
+    /// - The centred values `±s` and their squares `2⁻²ᵏ` (normal for `k ≤ 31`)
+    ///   are exact, and so is the sum `N·s²`.
+    /// - `M₂/N/N = 2⁻²ᵏ⁻⁸` and its square root `2⁻ᵏ⁻⁴` are exact, and that root
+    ///   is exactly the reference `√(s²/N)`.
+    ///
+    /// A constant sample has every pivoted difference exactly `0`, so its mean is
+    /// the pivot and its `M₂` is `0`, both exactly.
+    #[test]
+    fn paired_standard_error_is_centred_and_exact_under_a_large_mean_4086() {
+        let c = 0.75_f64;
+        let mut one_pass_lost = 0usize;
+        for k in 20..32_i32 {
+            let s = 2.0_f64.powi(-k);
+            let mut sample = vec![c + s; 128];
+            sample.extend(std::iter::repeat_n(c - s, 128));
+            let n = sample.len() as f64;
+            let exact_error = (s * s / n).sqrt();
+            let (shift, error) = paired_mean_with_error(sample.iter().copied());
+            assert_eq!(shift, c, "the construction gives the mean exactly");
+            assert_eq!(
+                error, exact_error,
+                "s = 2^-{k}: every step of the centred reading is exact on this fixture"
+            );
+            let sum: f64 = sample.iter().sum();
+            let sum_squares: f64 = sample.iter().map(|d| d * d).sum();
+            let one_pass = sum_squares / n - (sum / n) * (sum / n);
+            if (one_pass - s * s).abs() > 0.5 * s * s {
+                one_pass_lost += 1;
+            }
+        }
+        assert!(
+            one_pass_lost > 0,
+            "the retired one-pass form must be seen to lose the variance, or this \
+             test is not exercising the cancelling regime"
+        );
+        for value in [0.1_f64, 1.0 / 3.0, -0.7, 1.0] {
+            let (shift, error) = paired_mean_with_error(std::iter::repeat_n(value, 10));
+            assert_eq!(error, 0.0, "a constant sample of {value} has no spread");
+            assert_eq!(shift, value, "a constant sample of {value} is its own mean");
+        }
+    }
 
     /// A shrunk-smooth generalized spectrum: one direction the data can still
     /// see and a geometric tail the penalty has taken.
@@ -4417,6 +4946,7 @@ mod selection_replay_tests {
             rank: generalized.len() - occam.len(),
             occam: &occam,
             constant,
+            profile: None,
         };
         let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
         let step = 1.0e-5;
@@ -4499,6 +5029,7 @@ mod selection_replay_tests {
             rank: 1,
             occam: &occam,
             constant: 0.0,
+            profile: None,
         };
         let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
         for (cell_lo, cell_hi) in [(30.91_f64, 30.9111_f64), (30.0, 33.0), (-18.0, 42.0)] {
@@ -4556,6 +5087,7 @@ mod selection_replay_tests {
             rank: 0,
             occam: &occam,
             constant: 0.0,
+            profile: None,
         };
         let jet = |u: f64| criterion.jet(u).expect("evaluable jet").0;
         for (cell_lo, cell_hi) in [
@@ -4608,7 +5140,7 @@ mod selection_replay_tests {
     }
 
     fn replay_from(spectrum: &[f64], window: (f64, f64), draws: usize) -> SmoothLrSelectionReplay {
-        match SmoothLrSelectionReplay::from_geometry(&diagonal(spectrum), &[window], draws, draws, None) {
+        match SmoothLrSelectionReplay::from_geometry(&diagonal(spectrum), &[window], None, draws, draws, None) {
             SmoothLrSelection::Replayed(replay) => replay,
             SmoothLrSelection::Declined(reason) => {
                 panic!("expected a replay, declined: {}", reason.label())
@@ -4678,9 +5210,13 @@ mod selection_replay_tests {
             let replay = match SmoothLrSelectionReplay::from_geometry(
                 &diagonal(&generalized),
                 &[window],
+                None,
                 draws,
                 draws,
-                Some(&z),
+                Some(ObservedDraw {
+                    whitened: &z,
+                    penalized_deviance: None,
+                }),
             ) {
                 SmoothLrSelection::Replayed(replay) => replay,
                 SmoothLrSelection::Declined(reason) => {
@@ -4745,6 +5281,92 @@ mod selection_replay_tests {
         assert!(
             blind_d > ks_limit,
             "the unrescored tail must fail this test (D = {blind_d:.4})"
+        );
+    }
+
+    /// Stratified χ² draws are the exact quantiles of the stratum midpoints, so
+    /// their mean is `k` up to the midpoint rule's error, and a zero-dimensional
+    /// variate is identically zero rather than a failed quantile.
+    #[test]
+    fn stratified_chi_square_draws_have_the_chi_square_mean() {
+        for &k in &[1usize, 7, 40, 900] {
+            let draws = stratified_chi_square(k, 3, 4096);
+            let mean = draws.iter().sum::<f64>() / draws.len() as f64;
+            assert!((mean - k as f64).abs() < 1.0e-2 * k as f64, "k={k}: mean {mean}");
+            assert!(draws.iter().all(|value| value.is_finite() && *value > 0.0));
+        }
+        assert!(stratified_chi_square(0, 3, 64).iter().all(|value| *value == 0.0));
+    }
+
+    /// An estimated-scale family selects on the profiled criterion, so its
+    /// replay draws the residual deviance too: the weight-one `χ²_h` is kept
+    /// for the tail shift to share with `V`, and the two coordinates it and the
+    /// other penalized directions occupy are consumed. A tested term whose
+    /// rank exceeds the model's leaves `χ²_{r − r_j}` undefined and declines.
+    /// As `h → ∞` the profiled criterion's `m·ln(R + D)` tends to `m·ln R +
+    /// D·m/R` with `m/R → 1`, i.e. the known-scale criterion, so the selected
+    /// statistics converge to the unprofiled replay's.
+    #[test]
+    fn a_profiled_replay_draws_the_residual_law_and_tends_to_the_known_scale_one() {
+        let geometry = diagonal(&spectrum());
+        let draws = 512;
+        let replay = |profile| match SmoothLrSelectionReplay::from_geometry(
+            &geometry,
+            &[(-8.0, 8.0)],
+            profile,
+            draws,
+            draws,
+            None,
+        ) {
+            SmoothLrSelection::Replayed(replay) => replay,
+            SmoothLrSelection::Declined(reason) => panic!("declined: {}", reason.label()),
+        };
+        let known = replay(None);
+        assert!(known.residual_unit_sample.is_none());
+        assert_eq!(known.consumed_coordinates, geometry.dimension);
+
+        let profiled = replay(Some(SmoothLrSelectionProfile {
+            residual_unit_dimension: 20,
+            penalized_rank: geometry.rank + 3,
+        }));
+        let unit = profiled.residual_unit_sample.as_ref().expect("profiled draws");
+        assert_eq!(unit.len(), profiled.selection_sample.len());
+        let mean = unit.iter().sum::<f64>() / unit.len() as f64;
+        assert!((mean - 20.0).abs() < 0.5, "χ²_20 draws average {mean}");
+        assert_eq!(profiled.consumed_coordinates, geometry.dimension + 2);
+        assert_eq!(profiled.conditional_sample, known.conditional_sample);
+        assert_ne!(profiled.selection_sample, known.selection_sample);
+
+        let asymptotic = replay(Some(SmoothLrSelectionProfile {
+            residual_unit_dimension: 100_000_000,
+            penalized_rank: geometry.rank,
+        }));
+        for (index, (profiled, known)) in asymptotic
+            .selection_sample
+            .iter()
+            .zip(known.selection_sample.iter())
+            .enumerate()
+        {
+            assert!(
+                (profiled - known).abs() <= 1.0e-2 * (1.0 + known.abs()),
+                "draw {index}: profiled {profiled} vs known-scale {known}"
+            );
+        }
+
+        assert_eq!(
+            SmoothLrSelectionReplay::from_geometry(
+                &geometry,
+                &[(-8.0, 8.0)],
+                Some(SmoothLrSelectionProfile {
+                    residual_unit_dimension: 20,
+                    penalized_rank: geometry.rank - 1,
+                }),
+                draws,
+                draws,
+                None,
+            )
+            .decline(),
+            Some(SmoothLrSelectionDecline::ProfileInconsistent)
         );
     }
 
@@ -4903,6 +5525,7 @@ mod selection_replay_tests {
         let split = SmoothLrSelectionReplay::generate_multiscale(
             &split_geometry,
             &[(-6.0, 6.0), (-6.0, 6.0)],
+            None,
             2048,
             None,
         )
@@ -4967,6 +5590,7 @@ mod selection_replay_tests {
             SmoothLrSelectionReplay::generate_multiscale(
                 &single,
                 &[(-6.0, 6.0)],
+                None,
                 256,
                 None,
             )
@@ -4979,11 +5603,11 @@ mod selection_replay_tests {
         let crowded = SelectionGeometry::whiten(&information, &many, &[0.0; 5])
             .expect("crowded geometry");
         assert!(
-            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, 256, None).is_ok(),
+            SmoothLrSelectionReplay::generate_multiscale(&crowded, &windows, None, 256, None).is_ok(),
             "a term with five scales is replayed over all five"
         );
         assert!(
-            SmoothLrSelectionReplay::from_geometry(&crowded, &windows, 256, 256, None)
+            SmoothLrSelectionReplay::from_geometry(&crowded, &windows, None, 256, 256, None)
                 .replay()
                 .is_some(),
             "a term with five scales still gets a replay"
@@ -4999,6 +5623,7 @@ mod selection_replay_tests {
             SmoothLrSelectionReplay::generate_multiscale(
                 &pair,
                 &[(1.0, 1.0), (2.0, 2.0)],
+                None,
                 256,
                 None,
             ) == Err(SmoothLrSelectionDecline::WindowClosed)
@@ -5009,6 +5634,7 @@ mod selection_replay_tests {
             SmoothLrSelectionReplay::generate_multiscale(
                 &pair,
                 &[(1.0, 1.0), (-6.0, 6.0)],
+                None,
                 256,
                 None,
             )
@@ -5040,7 +5666,7 @@ mod selection_replay_tests {
         let geometry = diagonal(&spectrum());
         for window in [(4.0_f64, -4.0_f64), (f64::NAN, 1.0)] {
             assert_eq!(
-                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], 256, 256, None).decline(),
+                SmoothLrSelectionReplay::from_geometry(&geometry, &[window], None, 256, 256, None).decline(),
                 Some(SmoothLrSelectionDecline::WindowClosed),
                 "a closed window must decline with a NAMED reason"
             );
@@ -5077,6 +5703,7 @@ mod selection_replay_tests {
             SmoothLrSelectionReplay::generate_multiscale(
                 &geometry,
                 &[(-36.0, 24.0), (-21.0, 39.0)],
+                None,
                 512,
                 None,
             )
@@ -5243,7 +5870,7 @@ mod selection_replay_tests {
                 for axis in 0..2 {
                     let slice = AxisSlice::new(&geometry, &point[..], axis, &coordinates)
                         .expect("an axis slice at a priced point");
-                    let criterion = slice.criterion();
+                    let criterion = slice.criterion(None);
                     let slice_anchor = criterion.jet(point[axis]).expect("slice jet").0[0];
                     assert!(factor.refactor(&geometry, &point[..]));
                     let anchor = factor.score(&coordinates, norm_squared).0;
@@ -5322,6 +5949,7 @@ mod selection_replay_tests {
                     geometry,
                     &windows,
                     &coordinates,
+                    None,
                     &mut selected,
                 )
                 .expect("a certified multi-scale selection");
@@ -5473,6 +6101,7 @@ mod selection_replay_tests {
             let replay = SmoothLrSelectionReplay::from_geometry(
                 &geometry,
                 &[(-6.0, 6.0), (-6.0, 6.0)],
+                None,
                 512,
                 512,
                 None,
@@ -5483,6 +6112,7 @@ mod selection_replay_tests {
                     SmoothLrSelectionReplay::from_geometry(
                         &geometry,
                         &[(-6.0, 6.0), (-6.0, 6.0)],
+                        None,
                         512,
                         512,
                         None,
@@ -5554,6 +6184,93 @@ mod selection_replay_tests {
             .sum();
         log_det_hessian - log_det_penalty
     }
+
+    /// Independent standard normals for the brute-force checks: Box–Muller on
+    /// SplitMix64, a stream disjoint from the replay's stratified one.
+    fn brute_force_normals(seed: u64, count: usize) -> Vec<f64> {
+        let mut state = seed;
+        let mut uniform = || {
+            state = split_mix64(state);
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        (0..count)
+            .map(|_| {
+                let (a, b) = (uniform(), uniform());
+                (-2.0 * a.ln()).sqrt() * (std::f64::consts::TAU * b).cos()
+            })
+            .collect()
+    }
+
+    /// An estimated-scale selection shift is `E_V[P(Q_sel ≥ cV) − P(Q_cond ≥ cV)]`
+    /// over the residual law of `V`, not the same difference at `c·E[V]`. The
+    /// replay's closed-form-in-`χ²_h` integral must agree with a brute-force
+    /// Monte-Carlo over `V` drawn independently of it, on the replay's own
+    /// paired samples, and the single-threshold reading it replaced must not.
+    ///
+    /// The residual law is the `n = 60` Gaussian cell's shape: a handful of
+    /// partially-shrunk directions and `h = 44` unit ones.
+    #[test]
+    fn the_profiled_selection_shift_integrates_over_the_residual_law() {
+        use super::SmoothLrProfiledScale;
+        let replay = replay_from(&spectrum(), (-8.0, 8.0), SMOOTH_LR_SELECTION_DRAWS);
+        let scale = SmoothLrProfiledScale {
+            observations: 60.0,
+            deterministic_offset: 0.0,
+            residual_weights: vec![0.81, 0.36, 0.09, 0.01],
+            residual_unit_dimension: 44.0,
+        };
+        let mean_v: f64 =
+            scale.residual_weights.iter().sum::<f64>() + scale.residual_unit_dimension;
+        let unit = scale.residual_unit_dimension as usize;
+        let per_draw = scale.residual_weights.len() + unit;
+        let outer = 4000usize;
+        let normals = brute_force_normals(0xB4_2672, outer * per_draw);
+        let residual_draws: Vec<f64> = normals
+            .chunks(per_draw)
+            .map(|z| {
+                let (weighted, unit_part) = z.split_at(scale.residual_weights.len());
+                weighted
+                    .iter()
+                    .zip(scale.residual_weights.iter())
+                    .map(|(zi, w)| w * zi * zi)
+                    .sum::<f64>()
+                    + unit_part.iter().map(|zi| zi * zi).sum::<f64>()
+            })
+            .collect();
+        let paired_shift_at = |threshold: f64| {
+            replay
+                .selection_sample
+                .iter()
+                .zip(replay.conditional_sample.iter())
+                .map(|(&selected, &held)| {
+                    f64::from(selected >= threshold) - f64::from(held >= threshold)
+                })
+                .sum::<f64>()
+                / replay.selection_sample.len() as f64
+        };
+        for ratio in [0.01_f64, 0.03, 0.06, 0.1] {
+            let per_v: Vec<f64> = residual_draws
+                .iter()
+                .map(|&v| paired_shift_at(ratio * v))
+                .collect();
+            let brute = per_v.iter().sum::<f64>() / outer as f64;
+            let spread = (per_v.iter().map(|s| (s - brute).powi(2)).sum::<f64>()
+                / (outer - 1) as f64)
+                .sqrt();
+            let brute_error = spread / (outer as f64).sqrt();
+            let (integrated, _) = replay.profiled_tail_shift(ratio, ratio, &scale);
+            let at_mean = paired_shift_at(ratio * mean_v);
+            eprintln!(
+                "c={ratio}: integrated {integrated:.5} brute {brute:.5} ± {brute_error:.5} \
+                 at E[V] {at_mean:.5}"
+            );
+            assert!(
+                (integrated - brute).abs() <= 4.0 * brute_error + 5.0e-4,
+                "c={ratio}: integrated shift {integrated} vs brute-force E_V {brute} \
+                 (± {brute_error})"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5598,7 +6315,7 @@ mod lr_null_spectrum_moment_tests {
         let f = ndarray::array![[0.5_f64, 40.0], [40.0, 0.5]];
         let [mean, _] = lr_null_spectral_moments(Some(&f), &(0..2)).unwrap();
         assert!(mean < 0.0, "the corrupted block's first moment is {mean}");
-        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[], None);
+        let reference = lr_null_reference(Some(&f), None, None, &(0..2), 1.0, 1, WINDOW, &[], &[], None, None, None);
         assert_eq!(reference.source, SmoothLrReferenceSource::UnitWeightFallback);
         assert_eq!(reference.chi_square_df, 1.0);
         assert_eq!(reference.scale, 1.0);
@@ -5621,7 +6338,7 @@ mod lr_null_spectrum_moment_tests {
             [0.0, 0.0]
         );
         assert_eq!(
-            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[], None).source,
+            lr_null_reference(Some(&zero), None, None, &(0..2), 0.0, 0, WINDOW, &[], &[], None, None, None).source,
             SmoothLrReferenceSource::UnitWeightFallback
         );
     }

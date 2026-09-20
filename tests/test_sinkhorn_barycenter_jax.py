@@ -19,7 +19,6 @@ def test_jax_gradcheck_vs_finite_differences() -> None:
     rng = np.random.default_rng(11)
     m = 16
     k = 2
-    n_iter = 200
     eps = 0.1
     atoms_np = rng.uniform(0.01, 1.0, size=(k, m))
     atoms_np = atoms_np / atoms_np.sum(axis=1, keepdims=True)
@@ -33,7 +32,6 @@ def test_jax_gradcheck_vs_finite_differences() -> None:
             jnp.asarray(weights_np),
             jnp.asarray(cost_np),
             eps,
-            n_iter,
         )
         return (bary * jnp.asarray(target_np)).sum()
 
@@ -47,9 +45,10 @@ def test_jax_gradcheck_vs_finite_differences() -> None:
         minus = atoms_np.copy()
         plus[ki, j] += h
         minus[ki, j] -= h
-        bp = kernels.sinkhorn_barycenter(plus, weights_np, cost_np, eps=eps, n_iter=n_iter)
-        bm = kernels.sinkhorn_barycenter(minus, weights_np, cost_np, eps=eps, n_iter=n_iter)
+        bp = kernels.sinkhorn_barycenter(plus, weights_np, cost_np, eps=eps)
+        bm = kernels.sinkhorn_barycenter(minus, weights_np, cost_np, eps=eps)
         fd = float(((bp - bm) * target_np).sum() / (2 * h))
-        denom = max(abs(analytic[ki, j]), abs(fd), 1e-6)
-        rel = abs(analytic[ki, j] - fd) / denom
-        assert rel < 0.05, f"mismatch at ({ki},{j}): analytic={analytic[ki,j]} fd={fd} rel={rel}"
+        # The adjoint of the certified fixed point matches to the finite
+        # differences' own accuracy, measured at the gradient's scale.
+        rel = abs(analytic[ki, j] - fd) / np.max(np.abs(analytic))
+        assert rel < 1e-6, f"mismatch at ({ki},{j}): analytic={analytic[ki,j]} fd={fd} rel={rel}"

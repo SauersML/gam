@@ -281,13 +281,19 @@ class Summary:
         columnar sequence so indexing and iteration do not require an eager
         list of per-coefficient dictionaries.
     parametric_statistic : str or None
-        The Wald reference of :attr:`parametric_terms`: ``"t"`` (Student-t on
-        the residual degrees of freedom) when the scale is estimated, ``"z"``
-        when it is known.
+        The reference of :attr:`parametric_terms`: ``"t"`` (Student-t on the
+        residual degrees of freedom) when the scale is estimated, ``"z"`` when
+        it is known.
     parametric_terms : list of dict
         The intercept and linear-term coefficients, one record per coefficient
         with ``name``, ``estimate``, ``std_error``, ``statistic`` and
-        ``p_value``.
+        ``p_value``. An unpenalized coefficient is tested by its Wald ratio. A
+        ridged linear term (the default) is tested by the variance-component
+        score test of its ridge, never by the ridge-shrunk estimate's Wald
+        ratio, whose null p-values pile up near one (gam#3573): ``statistic``
+        is the score statistic's signed square root, oriented by
+        ``estimate``. A ridged row on a fit that records no such test has
+        ``statistic`` and ``p_value`` of ``None``.
     parametric_terms_unavailable : str or None
         Why :attr:`parametric_terms` could not be built; the same causes as
         :attr:`smooth_terms_unavailable`.
@@ -301,9 +307,11 @@ class Summary:
         its fixed structural penalties, one variance component per penalty on
         its own null scale, so it never reads the term's own fitted
         smoothing parameter, and its reference law (a weighted
-        :math:`\\chi^2_1` sum, over :math:`\\chi^2_\\rho/\\rho` when the scale is
-        estimated) is the null law at the fitted smoothing parameters of the
-        other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
+        :math:`\\chi^2_1` sum, over :math:`\\chi^2_\\nu/\\nu` when the scale is
+        estimated, with the scale taken from the residual of the full model fit
+        unpenalized on :math:`\\nu = n^+ - \\mathrm{rank}(X^\\top W X)`) is
+        the null law at the fitted smoothing parameters of the other terms;
+        ``chi_sq`` is scaled so its null mean is ``ref_df``.
         Random-effect blocks carry the score test of their variance component
         against its exact boundary null law, or a ``"random_effect_*"``
         reason when it could not be scored. A smooth with no valid

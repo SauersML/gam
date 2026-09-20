@@ -73,21 +73,21 @@ fn logit_natural_jet(eta: f64) -> BernoulliNaturalJet {
     BernoulliNaturalJet {
         mu,
         log_mu: [
-            -gam_linalg::utils::stable_softplus(-eta),
+            -gam_math::special::softplus(-eta),
             one_minus_mu,
             -curvature,
             third,
             fourth,
         ],
         log_one_minus_mu: [
-            -gam_linalg::utils::stable_softplus(eta),
+            -gam_math::special::softplus(eta),
             -mu,
             -curvature,
             third,
             fourth,
         ],
-        log_fisher: -gam_linalg::utils::stable_softplus(eta)
-            - gam_linalg::utils::stable_softplus(-eta),
+        log_fisher: -gam_math::special::softplus(eta)
+            - gam_math::special::softplus(-eta),
     }
 }
 

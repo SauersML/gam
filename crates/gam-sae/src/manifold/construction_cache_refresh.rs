@@ -20,9 +20,8 @@ use super::*;
 /// * `K`, an `Array3` of shape `(n_obs, p, d·d·d)` with last axis packed
 ///   `((a·d + c)·d + e)` — `K[n, i, a, c, e] = ∂³Z_{n,i} / ∂t_a ∂t_c ∂t_e =
 ///   Σ_m d³Phi[n, m, a, c, e] · B[m, i]`. Installed via the new third-jet slot
-///   whenever the base evaluator's `third_jet_dyn` yields a jet AND the penalty
-///   carries no `duchon_radial_source`. This is the residual-curvature source
-///   for the exact isometry `hvp`.
+///   whenever the base evaluator's `third_jet_dyn` yields a jet. This is the
+///   residual-curvature source for the exact isometry `hvp`.
 ///
 /// Returns `Ok(true)` when both caches were installed (i.e. the atom was
 /// built via [`SaeManifoldAtom::with_basis_second_jet`], so its
@@ -30,8 +29,7 @@ use super::*;
 /// that supplies the analytic Hessian). Returns `Ok(false)` when only the
 /// base [`SaeBasisEvaluator`] is installed (no second jet available) — in
 /// that case only the first-jet `jacobian_cache` is installed, and the
-/// penalty's gradient precondition can still be met by a pre-supplied
-/// `duchon_radial_source`. Returns `Err` on
+/// penalty refuses gradient-order evaluation by name. Returns `Err` on
 /// shape mismatches (which would indicate a buggy evaluator) or when the
 /// second-jet implementation itself fails (e.g. wrong latent dimension).
 ///
@@ -126,51 +124,44 @@ pub fn refresh_isometry_caches_from_atom(
     // (no finite-difference fallback). An analytic jet is contracted with the
     // decoder, a certified-zero jet installs `K = 0`, and an unavailable jet
     // installs no `K`, so the penalty reports a missing third source rather than
-    // holding a fabricated zero one (#2933 F02). Installed only when the penalty
-    // has no `duchon_radial_source` — a Duchon penalty already carries its own
-    // analytic third source and `jacobian_third` would shadow it with this
-    // cache. Always written (Some or None) so a stale K from a prior outer step
-    // never survives a refresh.
-    let jac3_opt = if penalty.duchon_radial_source.is_none() {
-        match evaluator.third_jet_dyn(coords)? {
-            SaeBasisThirdJetCapability::Analytic(t3) => {
-                if t3.dim() != (n_obs, m, d, d, d) {
-                    return Err(format!(
-                        "refresh_isometry_caches_from_atom: evaluator third jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d}, {d})",
-                        t3.dim()
-                    ));
-                }
-                // K[n, i, ((a·d + c)·d + e)]: one (n×m)·(m×p) GEMM per
-                // (a, c, e) triple into the row-major (n, p, d, d, d) layout,
-                // then flattened — the last axis packing ((a·d + c)·d + e) IS
-                // the row-major order of (a, c, e).
-                let mut jac3_5d = ndarray::Array5::<f64>::zeros((n_obs, p, d, d, d));
-                for a in 0..d {
-                    for c in 0..d {
-                        for e in 0..d {
-                            let basis_axes: ndarray::ArrayView2<'_, f64> =
-                                t3.slice(ndarray::s![.., .., a, c, e]);
-                            let slab = basis_axes.dot(b);
-                            jac3_5d
-                                .slice_mut(ndarray::s![.., .., a, c, e])
-                                .assign(&slab);
-                        }
+    // holding a fabricated zero one (#2933 F02). Always written (Some or None)
+    // so a stale K from a prior outer step never survives a refresh.
+    let jac3_opt = match evaluator.third_jet_dyn(coords)? {
+        SaeBasisThirdJetCapability::Analytic(t3) => {
+            if t3.dim() != (n_obs, m, d, d, d) {
+                return Err(format!(
+                    "refresh_isometry_caches_from_atom: evaluator third jet has shape {:?}, expected ({n_obs}, {m}, {d}, {d}, {d})",
+                    t3.dim()
+                ));
+            }
+            // K[n, i, ((a·d + c)·d + e)]: one (n×m)·(m×p) GEMM per
+            // (a, c, e) triple into the row-major (n, p, d, d, d) layout,
+            // then flattened — the last axis packing ((a·d + c)·d + e) IS
+            // the row-major order of (a, c, e).
+            let mut jac3_5d = ndarray::Array5::<f64>::zeros((n_obs, p, d, d, d));
+            for a in 0..d {
+                for c in 0..d {
+                    for e in 0..d {
+                        let basis_axes: ndarray::ArrayView2<'_, f64> =
+                            t3.slice(ndarray::s![.., .., a, c, e]);
+                        let slab = basis_axes.dot(b);
+                        jac3_5d
+                            .slice_mut(ndarray::s![.., .., a, c, e])
+                            .assign(&slab);
                     }
                 }
-                let jac3 = jac3_5d
-                    .into_shape_with_order((n_obs, p, d * d * d))
-                    .map_err(|err| {
-                        format!("refresh_isometry_caches_from_atom: K reshape failed: {err}")
-                    })?;
-                Some(Arc::new(jac3))
             }
-            SaeBasisThirdJetCapability::CertifiedZero => {
-                Some(Arc::new(ndarray::Array3::<f64>::zeros((n_obs, p, d * d * d))))
-            }
-            SaeBasisThirdJetCapability::Unavailable => None,
+            let jac3 = jac3_5d
+                .into_shape_with_order((n_obs, p, d * d * d))
+                .map_err(|err| {
+                    format!("refresh_isometry_caches_from_atom: K reshape failed: {err}")
+                })?;
+            Some(Arc::new(jac3))
         }
-    } else {
-        None
+        SaeBasisThirdJetCapability::CertifiedZero => {
+            Some(Arc::new(ndarray::Array3::<f64>::zeros((n_obs, p, d * d * d))))
+        }
+        SaeBasisThirdJetCapability::Unavailable => None,
     };
 
     let installed = jac2_opt.is_some();
