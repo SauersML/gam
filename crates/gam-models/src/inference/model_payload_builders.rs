@@ -2481,7 +2481,11 @@ fn payload_for_survival_transformation(
     Ok(payload)
 }
 
-fn payload_for_gaussian_location_scale(
+/// The saved model of a Gaussian location-scale fit: the builder
+/// `fit_formula_to_payload` uses. It is public so a caller that keeps the fit
+/// result, and with it the fitted block states the payload does not persist,
+/// saves that fit through the same route (#3001).
+pub fn payload_for_gaussian_location_scale(
     formula: String,
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
