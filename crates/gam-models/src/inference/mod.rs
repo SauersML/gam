@@ -1,6 +1,7 @@
 pub use gam_math::probability;
 pub use gam_solve::quadrature;
 pub mod full_conformal;
+pub mod full_conformal_glm;
 pub mod generative;
 pub mod model;
 pub mod model_extension;

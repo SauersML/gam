@@ -72,9 +72,19 @@ noncentrality near 107, and a level curve of amplitude 2 under a binomial
 response was found in 7% of fits.
 
 When the subspaces do not form a basis (overlapping tensor marginals in
-`te`/`ti`), no exact split exists and `K_l = S_l⁺` is the additive working
-model. Any fixed `K` gives an exact null law, so this choice affects power
-only, never size.
+`te`/`ti`), no exact split exists. `K_l` is then penalty `l`'s share of the
+prior covariance at a data-scaled base precision `P = Σ_l a_l S_l`, with
+`a_l = 1/tr(G_jj⁺ S_l)`:
+
+```text
+K_l = P⁻¹ (a_l S_l) P⁻¹ = −∂(Σ_k λ_k S_k)⁻¹/∂ log λ_l  at λ = a.
+```
+
+This moves with the coefficient chart and does not depend on any penalty's
+scale. On complementary ranges it is the exact formula above divided by
+`a_l`, which the null-mean normalization cancels, so the one rule covers both
+cases. `S_l⁺` moved with the chart. Any fixed `K` gives an exact null law, so
+this choice affects power only, never size.
 
 ### When no p-value is reported
 
