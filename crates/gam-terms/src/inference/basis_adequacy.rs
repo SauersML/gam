@@ -58,19 +58,28 @@
 //!     Var(U) = φ · Z̃ᵀ W_F Z̃ =: φ · V,     T = Uᵀ V⁻ U / φ.
 //! ```
 //!
-//! `T` is referred to `χ²_r` when the dispersion is known, the same
-//! `Known`/`Estimated` split as [`crate::inference::smooth_test`]. When the
-//! dispersion is estimated from the fit's `ν` residual d.f., the residual sum
-//! `ν·φ̂` already contains the tested directions' share `T·φ̂`. So the
-//! reference is the added-variable `F`:
+//! `T` is referred to `χ²_r` when the dispersion is known. When it is
+//! estimated, the scale comes from the UNPENALIZED residual on the test's own
+//! rows, never from the fit's `φ̂`. Write `e = W_F^{-1/2} s` (so
+//! `Var(e) = φ·I`), `A = W_F^{-1/2} W_H X` and `B = W_F^{1/2} Z̃`. Then
+//! `U = Bᵀe`, `Q = Uᵀ V⁻ U = eᵀ P_B e`, and `AᵀB = XᵀW_H Z̃ = 0`. The fit's
+//! error `X(β̂ − β)` enters `e` only inside `span(A)`, so
 //!
 //! ```text
-//!     F = (T / r) / ((ν − T) / (ν − r))   on (r, ν − r) d.f.,
+//!     D′ = eᵀ(I − P_A)e = Σ s²/W_F − cᵀ M⁻ c,   c = XᵀW_H W_F⁻¹ s,  M = AᵀA,
+//!     ν′ = m⁺ − rank(M),
+//!     F  = (Q / r) / ((D′ − Q) / (ν′ − r))   on (r, ν′ − r) d.f.,
 //! ```
 //!
-//! whose denominator is the part of the residual sum the numerator does not
-//! use. It is exact for an unpenalized Gaussian fit; `T/r` against `F(r, ν)`
-//! would divide by a scale containing its own numerator and read conservative.
+//! with `m⁺` the rows carrying score variance. For a Gaussian response,
+//! `D′ − Q = eᵀ(I − P_A − P_B)e` is `φ·χ²_{ν′−r}` independent of `Q`, so this
+//! is the exact added-variable `F` whatever the penalty did to `β̂`. The fit's
+//! own `φ̂ = RSS_λ/(n − edf)` is not a valid denominator. Its residual is the
+//! PENALIZED one: shrinkage bias inflates it, the partly-shrunk directions
+//! make its law something other than `χ²_{n−edf}`, and it is not orthogonal
+//! to the score. The resulting size is off in either direction, depending on
+//! `λ` and the truth. It also belongs to all `n` rows while the score may use
+//! a subset. [`unpenalized_residual`] computes `(D′, ν′)` once per report.
 //!
 //! # Why the UNPENALIZED Gram, and not `H⁻¹`
 //!
@@ -246,7 +255,92 @@ use gam_linalg::faer_ndarray::strict_symmetric_eigh;
 use gam_math::probability::{chi_square_sf, fisher_snedecor_sf};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
-pub use crate::inference::smooth_test::SmoothTestScale;
+/// How the score quadratic form `Q = Uᵀ V⁻ U` is scaled and referred.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum BasisAdequacyScale {
+    /// Known dispersion `φ`, `1.0` for families that carry it inside the
+    /// IRLS weight: `T = Q/φ` against `χ²_r`.
+    Known { dispersion: f64 },
+    /// Estimated dispersion: the added-variable `F` against the unpenalized
+    /// residual on the test's own rows (module header).
+    Estimated(UnpenalizedResidual),
+}
+
+/// The unpenalized residual `D′ = eᵀ(I − P_A)e` on `ν′ = m⁺ − rank(M)` d.f.,
+/// in the score's own units (`Var(s) = φ·W_F`). See [`unpenalized_residual`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UnpenalizedResidual {
+    pub sum: f64,
+    pub df: f64,
+}
+
+/// The residual of the score's standardized form `e = W_F^{-1/2} s` after
+/// projecting out `span(A)`, `A = W_F^{-1/2} W_H X`, on the rows the test is
+/// computed on. It is the unpenalized weighted residual sum of the fitted
+/// design, the estimated-scale denominator of [`basis_adequacy_score_test`].
+///
+/// For a canonical link (`W_H = W_F`), `M = AᵀA` is the Gram `G` the caller
+/// already factored. So this is `Σ s²/W − (Xᵀs)ᵀ G⁻ (Xᵀs)` on
+/// `m⁺ − rank(G)` d.f. and no second factorization is paid. Otherwise
+/// `M = XᵀW_H² W_F⁻¹ X` is factored here.
+///
+/// `None` when the shapes disagree, an entry is non-finite, a row with
+/// `W_F = 0` carries a score or a curvature (it has no standardized residual),
+/// or nothing is left: `D′ ≤ 0` or `ν′ ≤ 0`.
+pub fn unpenalized_residual(
+    design: ArrayView2<'_, f64>,
+    hessian_weights: ArrayView1<'_, f64>,
+    score_weights: ArrayView1<'_, f64>,
+    score: ArrayView1<'_, f64>,
+    design_gram: &DesignGramFactor,
+) -> Option<UnpenalizedResidual> {
+    let m = design.nrows();
+    let p = design.ncols();
+    if m == 0
+        || p == 0
+        || hessian_weights.len() != m
+        || score_weights.len() != m
+        || score.len() != m
+        || design_gram.dimension() != p
+    {
+        return None;
+    }
+    let mut total = 0.0_f64;
+    let mut informative = 0usize;
+    let mut canonical = true;
+    // `W_H/W_F` per row: `c = Xᵀ(W_H/W_F)s` and `M = Xᵀ W_H (W_H/W_F) X`.
+    let mut ratio = Array1::<f64>::zeros(m);
+    for row in 0..m {
+        let curvature = hessian_weights[row];
+        let fisher = score_weights[row];
+        let value = score[row];
+        if !(curvature.is_finite() && fisher.is_finite() && fisher >= 0.0 && value.is_finite())
+        {
+            return None;
+        }
+        if fisher > 0.0 {
+            total += value * value / fisher;
+            informative += 1;
+            ratio[row] = curvature / fisher;
+            canonical &= curvature == fisher;
+        } else if curvature != 0.0 || value != 0.0 {
+            return None;
+        }
+    }
+    let cross = design.t().dot(&(&ratio * &score)).insert_axis(ndarray::Axis(1));
+    let (explained, rank) = if canonical {
+        let solved = design_gram.solve(&cross)?;
+        (cross.column(0).dot(&solved.column(0)), design_gram.rank())
+    } else {
+        let metric = weighted_gram(design, (&hessian_weights * &ratio).view())?;
+        let factor = DesignGramFactor::new(metric.view())?;
+        let solved = factor.solve(&cross)?;
+        (cross.column(0).dot(&solved.column(0)), factor.rank())
+    };
+    let sum = total - explained;
+    let df = informative as f64 - rank as f64;
+    (sum.is_finite() && sum > 0.0 && df > 0.0).then_some(UnpenalizedResidual { sum, df })
+}
 
 /// Inputs to [`basis_adequacy_score_test`].
 ///
@@ -284,20 +378,15 @@ pub struct BasisAdequacyInput<'a> {
     /// The module header explains why this is the unpenalized Gram and not the
     /// penalized Hessian.
     pub design_gram: &'a DesignGramFactor,
-    /// `φ̂` — the fitted dispersion. `1.0` for families that carry their
-    /// dispersion inside the IRLS weight.
-    pub dispersion: f64,
-    /// `ν` — the residual d.f. `φ̂` was estimated on. The `Estimated`-scale
-    /// reference is `F(r, ν − r)`, since `r` of those d.f. carry the tested
-    /// directions. Ignored on the `Known` branch.
-    pub residual_df: Option<f64>,
-    pub scale: SmoothTestScale,
+    pub scale: BasisAdequacyScale,
 }
 
 /// Outcome of the penalized score lack-of-fit test.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BasisAdequacyResult {
-    /// `T = Uᵀ V⁻ U / φ̂`.
+    /// `T = Uᵀ V⁻ U / φ`, with `φ` the known dispersion or, when it is
+    /// estimated, the independent unpenalized scale `(D′ − Q)/(ν′ − r)`, so
+    /// that `T/r` is the added-variable `F`.
     pub statistic: f64,
     /// Number of estimable enrichment directions actually summed — the
     /// reference d.f. This is the enrichment width MINUS whatever part of it the
@@ -305,7 +394,7 @@ pub struct BasisAdequacyResult {
     /// resolution the alternative carried.
     pub rank: usize,
     /// `P(χ²_rank > T)`, or, when the scale is estimated, the added-variable
-    /// `F(rank, ν − rank)` tail at `(T/rank)·(ν − rank)/(ν − T)`.
+    /// `F(rank, ν′ − rank)` tail at `T/rank`.
     pub p_value: f64,
 }
 
@@ -313,9 +402,9 @@ pub struct BasisAdequacyResult {
 ///
 /// Returns `None` — never a stand-in value — when the inputs cannot support the
 /// test: mismatched shapes, a non-finite entry anywhere in the assembled
-/// quadratic form, a non-positive dispersion, no estimable enrichment direction
-/// left after projection, or an `Estimated` scale with no usable residual d.f.
-/// (none, `ν ≤ rank`, or `T ≥ ν`).
+/// quadratic form, a non-positive known dispersion, no estimable enrichment
+/// direction left after projection, or an `Estimated` scale whose unpenalized
+/// residual cannot hold the tested directions (`ν′ ≤ rank` or `D′ ≤ Q`).
 /// An absent verdict is a caller-visible "not measured", which is the only
 /// honest report when the geometry is missing.
 pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisAdequacyResult> {
@@ -330,7 +419,6 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
         || input.score_weights.len() != m
         || input.score.len() != m
         || input.design_gram.dimension() != p
-        || !(input.dispersion.is_finite() && input.dispersion > 0.0)
     {
         return None;
     }
@@ -344,37 +432,40 @@ pub fn basis_adequacy_score_test(input: BasisAdequacyInput<'_>) -> Option<BasisA
         input.design_gram,
     )?;
     let rank = geometry.basis.ncols();
-    let statistic = geometry.projected.iter().map(|value| value * value).sum::<f64>();
-    let statistic = statistic / input.dispersion;
-    if !statistic.is_finite() || statistic < 0.0 {
+    let quadratic = geometry.projected.iter().map(|value| value * value).sum::<f64>();
+    if !quadratic.is_finite() || quadratic < 0.0 {
         return None;
     }
 
     let reference_df = rank as f64;
-    let p_value = match input.scale {
-        SmoothTestScale::Known => chi_square_sf(statistic, reference_df),
-        SmoothTestScale::Estimated => {
-            let residual_df = input
-                .residual_df
-                .filter(|value| value.is_finite() && *value > 0.0)?;
-            // `φ̂` was estimated from the fit's residual sum `ν·φ̂`, and the
-            // residual's projection onto the tested directions, `T·φ̂` on `r`
-            // d.f., is part of that sum. `T/r` against `F(r, ν)` therefore divides
-            // by a scale that contains its own numerator: the ratio is
-            // `(ν/r)·Beta(r/2, (ν − r)/2)`, bounded and conservative at every
-            // level. The scale that is independent of the numerator is the rest
-            // of the sum, `(ν − T)·φ̂` on `ν − r` d.f., which gives the classical
-            // added-variable `F` (exact for an unpenalized Gaussian fit). With
-            // `ν ≤ r` or `T ≥ ν`, nothing is left to estimate that scale from.
-            let independent_df = residual_df - reference_df;
-            let independent_sum = residual_df - statistic;
+    let (statistic, p_value) = match input.scale {
+        BasisAdequacyScale::Known { dispersion } => {
+            if !(dispersion.is_finite() && dispersion > 0.0) {
+                return None;
+            }
+            let statistic = quadratic / dispersion;
+            (statistic, chi_square_sf(statistic, reference_df))
+        }
+        BasisAdequacyScale::Estimated(residual) => {
+            // `D′ − Q` on `ν′ − r` d.f. is the part of the unpenalized residual
+            // orthogonal to both the design and the tested directions, which
+            // for a Gaussian response is `φ·χ²` independent of `Q` (module
+            // header). With nothing left there, no scale can be estimated.
+            let independent_df = residual.df - reference_df;
+            let independent_sum = residual.sum - quadratic;
             if !(independent_df > 0.0 && independent_sum > 0.0) {
                 return None;
             }
-            let f_statistic = (statistic / reference_df) / (independent_sum / independent_df);
-            fisher_snedecor_sf(f_statistic, reference_df, independent_df)
+            let statistic = quadratic / (independent_sum / independent_df);
+            (
+                statistic,
+                fisher_snedecor_sf(statistic / reference_df, reference_df, independent_df),
+            )
         }
     };
+    if !statistic.is_finite() {
+        return None;
+    }
     if !p_value.is_finite() {
         return None;
     }
@@ -1153,6 +1244,15 @@ impl DesignGramFactor {
         self.dimension
     }
 
+    /// `rank(G)`: the full dimension on the Cholesky route, the directions
+    /// kept above the rank floor on the pseudo-inverse route.
+    pub fn rank(&self) -> usize {
+        match &self.kind {
+            DesignGramFactorKind::Cholesky(_) => self.dimension,
+            DesignGramFactorKind::SpectralPseudoInverse(root) => root.ncols(),
+        }
+    }
+
     fn solve(&self, rhs: &Array2<f64>) -> Option<Array2<f64>> {
         let solved = match &self.kind {
             DesignGramFactorKind::Cholesky(factor) => factor.solve_mat(rhs),
@@ -1271,9 +1371,7 @@ mod tests {
                 score_weights: self.weights.view(),
                 score: self.score.view(),
                 design_gram: &self.design_gram,
-                dispersion: 1.0,
-                residual_df: None,
-                scale: SmoothTestScale::Known,
+                scale: BasisAdequacyScale::Known { dispersion: 1.0 },
             }
         }
     }
@@ -1551,9 +1649,7 @@ mod tests {
             score_weights: sub_weights.view(),
             score: sub_score.view(),
             design_gram: &sub_gram,
-            dispersion: 1.0,
-            residual_df: None,
-            scale: SmoothTestScale::Known,
+            scale: BasisAdequacyScale::Known { dispersion: 1.0 },
         })
         .expect("the subset carries estimable directions");
         // Gathering the same rows out of a `DesignMatrix` must reproduce it bit
@@ -1572,9 +1668,7 @@ mod tests {
             score_weights: sub_weights.view(),
             score: sub_score.view(),
             design_gram: &gathered_gram,
-            dispersion: 1.0,
-            residual_df: None,
-            scale: SmoothTestScale::Known,
+            scale: BasisAdequacyScale::Known { dispersion: 1.0 },
         })
         .expect("the gathered subset carries estimable directions");
         assert_eq!(subset, via_gather);
@@ -1782,18 +1876,37 @@ mod tests {
         out
     }
 
+    /// The residual sum of squares of the unpenalized least-squares fit of `y`
+    /// on `columns`.
+    fn least_squares_residual_sum(columns: &Array2<f64>, y: &Array1<f64>) -> f64 {
+        let beta = invert_symmetric(&columns.t().dot(columns)).dot(&columns.t().dot(y));
+        let residual = y - &columns.dot(&beta);
+        residual.dot(&residual)
+    }
+
+    /// The Gaussian harness's unpenalized residual, on its own rows and Gram.
+    fn harness_residual(harness: &GaussianHarness) -> Option<UnpenalizedResidual> {
+        unpenalized_residual(
+            harness.design.view(),
+            harness.weights.view(),
+            harness.weights.view(),
+            harness.score.view(),
+            &harness.design_gram,
+        )
+    }
+
     /// With the scale estimated, the p-value is the classical added-variable
-    /// `F` test. Take an unpenalized least-squares fit, `φ̂ = RSS₀/ν` with
-    /// `ν = n − p`, and an enrichment of width `r` outside `span(X)`. The exact
-    /// reference is `F = ((RSS₀ − RSS₁)/r) / (RSS₁/(ν − r))` on `(r, ν − r)`
-    /// d.f., where `RSS₁` is the residual sum of squares after also fitting
-    /// `Z`.
+    /// `F` test, whatever the penalty did to `β̂`. With `RSS₀` and `RSS₁` the
+    /// unpenalized residual sums without and with the enrichment of width `r`,
+    /// the exact reference is `F = ((RSS₀ − RSS₁)/r) / (RSS₁/(n − p − r))` on
+    /// `(r, n − p − r)` d.f.
     ///
-    /// Referring `T/r` to `F(r, ν)` instead divides by a `φ̂` whose residual
-    /// sum contains the numerator. The ratio is then `(ν/r)·Beta`, bounded and
-    /// under-dispersed, and it reads conservative at every level.
+    /// The fit is ridge-shrunk hard, so its own `φ̂ = RSS_λ/(n − edf)` carries
+    /// the shrinkage bias. The reference must be the unpenalized residual,
+    /// which the score at the penalized `β̂` reproduces exactly:
+    /// `(I − P_X)s = (I − P_X)y`.
     #[test]
-    fn estimated_scale_p_value_is_the_exact_added_variable_f_test() {
+    fn estimated_scale_p_value_is_the_exact_added_variable_f_test_at_a_penalized_fit() {
         let n = 60;
         let mut rng = Lcg(20_260_919);
         let mut design = Array2::<f64>::zeros((n, 2));
@@ -1808,47 +1921,164 @@ mod tests {
             enrichment[(row, 2)] = (6.0 * x).sin();
             y[row] = 0.5 + 2.0 * x + 0.4 * x * x + 0.3 * rng.next_normal();
         }
-        let residual_sum = |columns: &Array2<f64>| {
-            let beta = invert_symmetric(&columns.t().dot(columns)).dot(&columns.t().dot(&y));
-            let residual = &y - &columns.dot(&beta);
-            residual.dot(&residual)
-        };
-        let rss_null = residual_sum(&design);
-        let rss_alternative =
-            residual_sum(&ndarray::concatenate![ndarray::Axis(1), design, enrichment]);
+        let rss_null = least_squares_residual_sum(&design, &y);
+        let rss_alternative = least_squares_residual_sum(
+            &ndarray::concatenate![ndarray::Axis(1), design, enrichment],
+            &y,
+        );
         let (p, r) = (design.ncols() as f64, enrichment.ncols() as f64);
-        let residual_df = n as f64 - p;
-        let exact_f = ((rss_null - rss_alternative) / r) / (rss_alternative / (residual_df - r));
-        let exact = fisher_snedecor_sf(exact_f, r, residual_df - r);
+        let independent_df = n as f64 - p - r;
+        let exact_f = ((rss_null - rss_alternative) / r) / (rss_alternative / independent_df);
+        let exact = fisher_snedecor_sf(exact_f, r, independent_df);
 
-        let harness = GaussianHarness::new(design, enrichment, y, 0.0);
+        let harness = GaussianHarness::new(design, enrichment, y, 25.0);
+        let residual = harness_residual(&harness).expect("the unpenalized residual exists");
+        assert!(
+            (residual.sum - rss_null).abs() <= 1e-9 * rss_null,
+            "unpenalized residual {} against RSS₀ {rss_null}",
+            residual.sum
+        );
+        assert_eq!(residual.df, n as f64 - p);
         let mut input = harness.input();
-        input.dispersion = rss_null / residual_df;
-        input.residual_df = Some(residual_df);
-        input.scale = SmoothTestScale::Estimated;
+        input.scale = BasisAdequacyScale::Estimated(residual);
         let out = basis_adequacy_score_test(input).expect("three estimable directions");
         assert_eq!(out.rank, 3);
-        // The score statistic itself is `(RSS₀ − RSS₁)/φ̂`: in the Gaussian
+        // `T = (RSS₀ − RSS₁)/φ̃` with `φ̃ = RSS₁/(n − p − r)`: in the Gaussian
         // identity case the residual's projection onto `span(Z̃)` IS the drop in
         // residual sum from fitting `Z`.
-        let expected_statistic = (rss_null - rss_alternative) / (rss_null / residual_df);
+        let expected_statistic = r * exact_f;
         assert!(
-            (out.statistic - expected_statistic).abs() <= 1e-9 * expected_statistic,
+            (out.statistic - expected_statistic).abs() <= 1e-8 * expected_statistic,
             "statistic {} against {expected_statistic}",
             out.statistic
         );
         assert!(
-            (out.p_value - exact).abs() <= 1e-9 * exact.max(1e-12),
+            (out.p_value - exact).abs() <= 1e-8 * exact.max(1e-12),
             "p-value {} against the exact added-variable F tail {exact}",
             out.p_value
         );
     }
 
-    /// The estimated-scale branch refuses when the fit's residual d.f. cannot
-    /// hold the tested directions: `ν ≤ r` leaves no degrees of freedom for a
-    /// scale estimate independent of the numerator.
+    /// Under `H₀` at a heavily shrunk Gaussian fit, the estimated-scale
+    /// p-values are `U(0, 1)`. The truth is a cubic inside `span(X)`, and the
+    /// ridge shrinks every coefficient, so the penalized residual carries a
+    /// large bias. Referring the score to the fit's `φ̂ = RSS_λ/(n − edf)`
+    /// reads strongly conservative on this fixture: size about 0.011 at the 5%
+    /// level. The unpenalized residual does not see the bias at all.
     #[test]
-    fn estimated_scale_refuses_when_the_residual_df_cannot_hold_the_rank() {
+    fn estimated_scale_is_uniform_under_the_null_at_a_heavily_penalized_fit() {
+        let n = 40;
+        let mut design = Array2::<f64>::zeros((n, 4));
+        let mut enrichment = Array2::<f64>::zeros((n, 3));
+        let mut mean = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let x = (row as f64 + 0.5) / n as f64;
+            design[(row, 0)] = 1.0;
+            design[(row, 1)] = x;
+            design[(row, 2)] = x * x;
+            design[(row, 3)] = x * x * x;
+            let angle = std::f64::consts::PI * x;
+            enrichment[(row, 0)] = (6.0 * angle).sin();
+            enrichment[(row, 1)] = (6.0 * angle).cos();
+            enrichment[(row, 2)] = (9.0 * angle).sin();
+            mean[row] = 1.0 + 3.0 * x - 4.0 * x * x + 2.0 * x * x * x;
+        }
+        let mut rng = Lcg(20_260_920);
+        let mut p_values = Vec::new();
+        for _ in 0..2000 {
+            let y = mean.mapv(|value| value + 0.3 * rng.next_normal());
+            let harness = GaussianHarness::new(design.clone(), enrichment.clone(), y, 5.0);
+            let residual = harness_residual(&harness).expect("the unpenalized residual exists");
+            let mut input = harness.input();
+            input.scale = BasisAdequacyScale::Estimated(residual);
+            let out = basis_adequacy_score_test(input).expect("three estimable directions");
+            assert_eq!(out.rank, 3);
+            p_values.push(out.p_value);
+        }
+        assert_uniform(&p_values, "estimated scale, ridge-shrunk Gaussian null");
+    }
+
+    /// With `W_H ≠ W_F` the residual is that of the standardized score
+    /// `e = W_F^{-1/2}s` on `A = W_F^{-1/2}W_H X`. Here it is checked against a
+    /// direct least-squares fit of `e` on `A`.
+    #[test]
+    fn unpenalized_residual_projects_the_standardized_score_in_the_curvature_metric() {
+        let n = 30;
+        let mut rng = Lcg(11);
+        let mut design = Array2::<f64>::zeros((n, 3));
+        let mut hessian_weights = Array1::<f64>::zeros(n);
+        let mut score_weights = Array1::<f64>::zeros(n);
+        let mut score = Array1::<f64>::zeros(n);
+        for row in 0..n {
+            let x = (row as f64 + 0.5) / n as f64;
+            design[(row, 0)] = 1.0;
+            design[(row, 1)] = x;
+            design[(row, 2)] = x * x;
+            hessian_weights[row] = 0.8 + x * x;
+            score_weights[row] = 0.5 + x;
+            score[row] = rng.next_normal() * score_weights[row].sqrt();
+        }
+        let gram = weighted_gram(design.view(), hessian_weights.view())
+            .and_then(|gram| DesignGramFactor::new(gram.view()))
+            .expect("the Gram factors");
+        let residual = unpenalized_residual(
+            design.view(),
+            hessian_weights.view(),
+            score_weights.view(),
+            score.view(),
+            &gram,
+        )
+        .expect("the unpenalized residual exists");
+
+        let mut standardized = Array1::<f64>::zeros(n);
+        let mut metric_design = design.clone();
+        for row in 0..n {
+            let root = score_weights[row].sqrt();
+            standardized[row] = score[row] / root;
+            let scale = hessian_weights[row] / root;
+            metric_design.row_mut(row).iter_mut().for_each(|v| *v *= scale);
+        }
+        let direct = least_squares_residual_sum(&metric_design, &standardized);
+        assert!(
+            (residual.sum - direct).abs() <= 1e-10 * direct,
+            "residual {} against the direct projection {direct}",
+            residual.sum
+        );
+        assert_eq!(residual.df, (n - 3) as f64);
+
+        // A row with no score variance but a nonzero score has no standardized
+        // residual, and the reference refuses rather than dropping the row.
+        let mut silent = score_weights.clone();
+        silent[4] = 0.0;
+        assert_eq!(
+            unpenalized_residual(
+                design.view(),
+                hessian_weights.view(),
+                silent.view(),
+                score.view(),
+                &gram,
+            ),
+            None
+        );
+        let short = score.slice(ndarray::s![..n - 1]);
+        assert_eq!(
+            unpenalized_residual(
+                design.view(),
+                hessian_weights.view(),
+                score_weights.view(),
+                short,
+                &gram,
+            ),
+            None
+        );
+    }
+
+    /// The estimated-scale branch refuses when the unpenalized residual cannot
+    /// hold the tested directions: `ν′ ≤ r` leaves no degrees of freedom for a
+    /// scale estimate independent of the numerator, and `D′ ≤ Q` leaves no
+    /// residual sum.
+    #[test]
+    fn estimated_scale_refuses_when_the_residual_cannot_hold_the_rank() {
         let n = 40;
         let mut rng = Lcg(7);
         let mut design = Array2::<f64>::zeros((n, 2));
@@ -1864,10 +2094,22 @@ mod tests {
             y[row] = 0.5 + 2.0 * x + rng.next_normal();
         }
         let harness = GaussianHarness::new(design, enrichment, y, 0.0);
-        let mut input = harness.input();
-        input.scale = SmoothTestScale::Estimated;
-        input.residual_df = Some(3.0);
-        assert_eq!(basis_adequacy_score_test(input), None);
+        let residual = harness_residual(&harness).expect("the unpenalized residual exists");
+
+        let mut too_few_df = harness.input();
+        too_few_df.scale = BasisAdequacyScale::Estimated(UnpenalizedResidual {
+            sum: residual.sum,
+            df: 3.0,
+        });
+        assert_eq!(basis_adequacy_score_test(too_few_df), None);
+
+        let known = basis_adequacy_score_test(harness.input()).expect("known-scale statistic");
+        let mut exhausted = harness.input();
+        exhausted.scale = BasisAdequacyScale::Estimated(UnpenalizedResidual {
+            sum: known.statistic,
+            df: residual.df,
+        });
+        assert_eq!(basis_adequacy_score_test(exhausted), None);
     }
 
     /// Shape and finiteness guards refuse rather than returning a stand-in.
@@ -1879,18 +2121,13 @@ mod tests {
         let harness = GaussianHarness::new(design, enrichment, y, 1.0);
 
         let mut bad_dispersion = harness.input();
-        bad_dispersion.dispersion = 0.0;
+        bad_dispersion.scale = BasisAdequacyScale::Known { dispersion: 0.0 };
         assert_eq!(basis_adequacy_score_test(bad_dispersion), None);
 
         let mismatched = Array2::<f64>::zeros((2, 1));
         let mut bad_rows = harness.input();
         bad_rows.enrichment = mismatched.view();
         assert_eq!(basis_adequacy_score_test(bad_rows), None);
-
-        let mut estimated_without_df = harness.input();
-        estimated_without_df.scale = SmoothTestScale::Estimated;
-        estimated_without_df.residual_df = None;
-        assert_eq!(basis_adequacy_score_test(estimated_without_df), None);
     }
 
     /// Kolmogorov–Smirnov `p` of `p_values` against `U(0, 1)`: the asymptotic
