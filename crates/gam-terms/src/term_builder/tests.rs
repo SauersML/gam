@@ -5555,7 +5555,7 @@ fn frozen_bspline_1d_design_is_built_without_its_penalties() {
         "y ~ s(x, double_penalty=true)",
         "y ~ s(x, bs=\"cr\")",
         "y ~ s(x, bs=\"cr\", double_penalty=true)",
-        "y ~ s(x, bs=\"cc\")",
+        "y ~ s(x, bs=\"cyclic\")",
         "y ~ s(x, shape=monotone_increasing)",
     ] {
         let spec = build_formula(formula, &train);
