@@ -6,6 +6,7 @@ pub(crate) fn materialize_location_scale<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    reject_unrealized_precision_priors(config, "location-scale (noise_formula) models", false)?;
     let y_col = resolve_role_col(col_map, &parsed.response, "response")?;
     let mut y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
     let y_kind = response_column_kind(data, y_col);

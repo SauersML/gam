@@ -4650,3 +4650,123 @@ fn every_link_spelling_is_read_and_a_disagreeing_link_argument_is_refused_3014()
     // now also when the link is named in the formula.
     assert!(resolve("y ~ x + link(type=sas)", None, true).is_err());
 }
+
+fn with_precision_hyperprior(config: FitConfig) -> FitConfig {
+    FitConfig {
+        penalty_block_gamma_priors: vec![("bmi".to_string(), 2.0, 1.0)],
+        ..config
+    }
+}
+
+fn assert_precision_prior_refused<T>(result: Result<T, WorkflowError>, model: &str) {
+    let err = result
+        .err()
+        .unwrap_or_else(|| panic!("{model}: a precision hyperprior the fit cannot use must be refused"));
+    let message = err.to_string();
+    assert!(
+        matches!(err, WorkflowError::InvalidConfig { .. })
+            && message.contains("precision_hyperpriors is not supported for")
+            && message.contains(model),
+        "{model}: {message}"
+    );
+}
+
+#[test]
+fn precision_hyperpriors_are_refused_where_no_fit_realizes_them() {
+    let data = workflow_test_dataset();
+    assert_precision_prior_refused(
+        materialize(
+            "bmi ~ age_entry",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                noise_formula: Some("age_entry".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "location-scale",
+    );
+    assert_precision_prior_refused(
+        materialize(
+            "bmi ~ s(age_entry, k=4)",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                family: Some("transformation-normal".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "transformation-normal",
+    );
+    assert_precision_prior_refused(
+        materialize(
+            "event ~ bmi",
+            &data,
+            &with_precision_hyperprior(FitConfig {
+                family: Some("bernoulli-marginal-slope".to_string()),
+                slope_formula: Some("1".to_string()),
+                z_column: Some("z".to_string()),
+                ..FitConfig::default()
+            }),
+        ),
+        "Bernoulli marginal-slope",
+    );
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    for likelihood in ["location-scale", "latent", "latent-binary"] {
+        assert_precision_prior_refused(
+            materialize(
+                "Surv(age_entry, age_exit, event) ~ bmi",
+                &survival,
+                &with_precision_hyperprior(FitConfig {
+                    survival_likelihood: Some(likelihood.to_string()),
+                    ..FitConfig::default()
+                }),
+            ),
+            &format!("survival_likelihood='{likelihood}'"),
+        );
+    }
+}
+
+#[test]
+fn precision_hyperpriors_still_reach_the_survival_transformation_fit() {
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    for likelihood in ["transformation", "weibull"] {
+        if let Err(err) = materialize(
+            "Surv(age_entry, age_exit, event) ~ bmi",
+            &survival,
+            &with_precision_hyperprior(FitConfig {
+                survival_likelihood: Some(likelihood.to_string()),
+                ..FitConfig::default()
+            }),
+        ) {
+            assert!(
+                !err.to_string().contains("precision_hyperpriors is not supported"),
+                "{likelihood} realizes penalty-block priors and must not refuse them: {err}"
+            );
+        }
+    }
+}
+
+#[test]
+fn coefficient_groups_are_refused_on_survival_fits() {
+    let survival = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0; 4]);
+    let config = FitConfig {
+        coefficient_groups: vec![gam_terms::smooth::CoefficientGroupSpec {
+            name: "g".to_string(),
+            selectors: vec![gam_terms::smooth::CoefficientSelector::LinearTerm(
+                "bmi".to_string(),
+            )],
+            parent: None,
+            prior: None,
+            prior_mean: Default::default(),
+        }],
+        ..FitConfig::default()
+    };
+    let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &survival, &config)
+        .err()
+        .expect("coefficient groups the survival fit cannot use must be refused");
+    let message = err.to_string();
+    assert!(
+        matches!(err, WorkflowError::InvalidConfig { .. })
+            && message.contains("coefficient_groups is not supported for"),
+        "{message}"
+    );
+}
