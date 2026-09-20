@@ -75,8 +75,11 @@ fn vruntime() -> DeviationRuntime {
 }
 
 fn vfixture(is_score_warp: bool, amplitude: f64) -> VFixture {
+    vfixture_on(vruntime(), is_score_warp, amplitude)
+}
+
+fn vfixture_on(runtime: DeviationRuntime, is_score_warp: bool, amplitude: f64) -> VFixture {
     let grid = vgrid();
-    let runtime = vruntime();
     let basis_dim = runtime.basis_dim();
     let policy = gam_runtime::resource::ResourcePolicy::default_library();
     let dummy = || {
@@ -578,6 +581,166 @@ fn production_flex_grad_hess_matches_independent_fd_link_dev_wide_deviation_932(
 #[test]
 fn production_flex_grad_hess_matches_independent_fd_link_dev_constant_tail_2341() {
     run_production_gate_at(false, 0.2, 2.2, 0.06);
+}
+
+// ==================================================================
+// gam#3011: the link deviation at its support ends.
+//
+// The link deviation is read at `a + b·z` for every observed row and every
+// calibration node, and that index moves with β. If the deviation is only C0 at
+// a support end, the row objective's gradient steps wherever an index crosses
+// the end: under an empirical latent measure a node crossing puts a corner in
+// the calibration `Σ_k ω_k Φ(η_k)`, and the intercept root and every gradient
+// channel inherit it. A mode on such a crossing has no stationary point, so the
+// inner Newton 2-cycles across it with the step as its residual (#3011: the
+// same |δ| = 1.793e-6 and residual 4.635e-6 for 37 cycles).
+// ==================================================================
+
+fn production_link_deviation(seed: &Array1<f64>) -> DeviationPrepared {
+    let config = DeviationBlockConfig {
+        num_internal_knots: 2,
+        ..DeviationBlockConfig::default()
+    };
+    build_link_deviation_block_from_knots_design_seed_and_weights(seed, seed, &config)
+        .expect("production link deviation")
+}
+
+/// Each basis column's one-sided `[w'(L), w''(L), w'(R), w''(R)]` at the two
+/// support ends, divided by the column's largest span coefficient.
+fn support_end_derivatives(runtime: &DeviationRuntime) -> Vec<[f64; 4]> {
+    let last = runtime.span_count() - 1;
+    (0..runtime.basis_dim())
+        .map(|basis| {
+            let first = runtime.basis_span_cubic(0, basis).expect("first span");
+            let end = runtime.basis_span_cubic(last, basis).expect("last span");
+            let h = end.right - end.left;
+            let scale = (0..=last)
+                .map(|span| {
+                    let cubic = runtime.basis_span_cubic(span, basis).expect("span");
+                    cubic.c1.abs().max(cubic.c2.abs()).max(cubic.c3.abs())
+                })
+                .fold(0.0_f64, f64::max);
+            [
+                first.c1 / scale,
+                2.0 * first.c2 / scale,
+                (end.c1 + 2.0 * end.c2 * h + 3.0 * end.c3 * h * h) / scale,
+                (2.0 * end.c2 + 6.0 * end.c3 * h) / scale,
+            ]
+        })
+        .collect()
+}
+
+#[test]
+fn production_link_deviation_is_flat_to_second_order_at_its_support_ends_3011() {
+    let seed = Array1::linspace(-1.2, 1.2, 16);
+    let link = production_link_deviation(&seed);
+    // A flat-ended ramp basis represents no polynomial, so every ramp is a
+    // penalized direction and none is dropped: internal knots plus degree.
+    assert_eq!(link.runtime.basis_dim(), 2 + 3);
+    for (basis, ends) in support_end_derivatives(&link.runtime).iter().enumerate() {
+        assert!(
+            ends.iter().all(|derivative| derivative.abs() <= 1e-12),
+            "link deviation column {basis} steps at a support end: \
+             [w'(L), w''(L), w'(R), w''(R)] / scale = {ends:?}"
+        );
+    }
+    // Negative control: the score warp is read at the data's fixed z and keeps
+    // clamped ends, where the same check sees the step.
+    let config = DeviationBlockConfig {
+        num_internal_knots: 2,
+        ..DeviationBlockConfig::default()
+    };
+    let score = build_score_warp_deviation_block_from_seed(&seed, &config).expect("score warp");
+    let largest = support_end_derivatives(&score.runtime)
+        .iter()
+        .flatten()
+        .fold(0.0_f64, |largest, derivative| largest.max(derivative.abs()));
+    assert!(
+        largest > 1e-2,
+        "a clamped end steps, but the score warp's largest one-sided end derivative is \
+         {largest:.3e}"
+    );
+}
+
+/// The largest component of `g(q*+ε) − g(q*−ε)` for ε = 1e-5 and ε = 1e-8, where
+/// `g` is the row objective's gradient and `q*` is the marginal index at which
+/// the top calibration node's index `a + b·z_K` sits on the link deviation's
+/// right support end.
+fn gradient_gap_across_the_right_end(runtime: DeviationRuntime) -> (f64, f64) {
+    let fx = vfixture_on(runtime, false, 0.05);
+    let r = fx.primary.total;
+    let b0 = 1.0;
+    let top_node = fx.grid.nodes.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let (_, right_end) = fx.runtime.support_interval().expect("support interval");
+    let link = fx.primary.w.clone().expect("the link fixture declares its block");
+    let beta = fx.beta_dev.clone();
+    let index_gap = |q: f64| -> f64 {
+        let (a, _, _) = fx
+            .family
+            .solve_row_intercept_base(0, q, b0, None, Some(&beta), None)
+            .expect("intercept solve");
+        a + b0 * top_node - right_end
+    };
+    // The calibrated intercept rises with the marginal index; bisect it onto the end.
+    let (mut lo, mut hi) = (-3.0_f64, 3.0_f64);
+    assert!(
+        index_gap(lo) < 0.0 && index_gap(hi) > 0.0,
+        "the top node's index does not bracket the support end {right_end}"
+    );
+    for _ in 0..200 {
+        let mid = 0.5 * (lo + hi);
+        if index_gap(mid) < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let q_star = 0.5 * (lo + hi);
+    let gradient_at = |q: f64| -> Vec<f64> {
+        let mut p = vec![0.0; r];
+        p[fx.primary.q] = q;
+        p[fx.primary.slope] = b0;
+        for (k, i) in link.clone().enumerate() {
+            p[i] = beta[k];
+        }
+        production_grad_hess(&fx, &p).1
+    };
+    let gap = |eps: f64| -> f64 {
+        let above = gradient_at(q_star + eps);
+        let below = gradient_at(q_star - eps);
+        above
+            .iter()
+            .zip(&below)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0_f64, f64::max)
+    };
+    (gap(1e-5), gap(1e-8))
+}
+
+#[test]
+fn row_gradient_is_continuous_where_a_calibration_node_crosses_the_link_support_end_3011() {
+    let seed = Array1::linspace(-1.2, 1.2, 16);
+    let (wide, narrow) =
+        gradient_gap_across_the_right_end(production_link_deviation(&seed).runtime);
+    eprintln!("[3011] simple-ended link: gradient gap {wide:.3e} at eps=1e-5, {narrow:.3e} at eps=1e-8");
+    // A continuous gradient's gap falls in proportion to ε, to 1e-3 of the wide gap.
+    assert!(
+        narrow <= 1e-2 * wide,
+        "production link deviation: the row gradient steps across the support end, gap \
+         {narrow:.3e} at eps=1e-8 against {wide:.3e} at eps=1e-5 (gam#3011)"
+    );
+    // Negative control: the same fixture on clamped ends steps by a gap that does
+    // not fall with ε.
+    let clamped_knots =
+        gam_terms::basis::initializewiggle_knots_from_seed(seed.view(), 3, 2).expect("knots");
+    let clamped = DeviationRuntime::try_new(clamped_knots, 0.0, 3).expect("clamped runtime");
+    let (wide, narrow) = gradient_gap_across_the_right_end(clamped);
+    eprintln!("[3011] clamped link: gradient gap {wide:.3e} at eps=1e-5, {narrow:.3e} at eps=1e-8");
+    assert!(
+        narrow >= 0.5 * wide,
+        "a clamped end steps, but its gap {narrow:.3e} at eps=1e-8 fell against {wide:.3e} \
+         at eps=1e-5"
+    );
 }
 
 // ==================================================================
@@ -1174,7 +1337,16 @@ fn zz_measure_2347_t4_richardson() {
 #[test]
 fn zz_measure_2347_bb_moment_fd() {
     let row = 0usize;
-    let (family, states) = standard_normal_flex_fixture();
+    let (family, mut states) = standard_normal_flex_fixture();
+    // The fixture's link coefficients are linear in the column index, and on
+    // uniform simple-ended ramps that is a quadratic `w`: no `w'''` jump at any
+    // knot, so no moving-knot flux to measure. An irregular sequence gives every
+    // interior knot its jump, and at this size the flux clears the bar below
+    // (gam#3011).
+    let link_width = states[3].beta.len();
+    states[3].beta = Array1::from_shape_fn(link_width, |index| {
+        -0.008 * (1.5 + (1.7 * index as f64).sin())
+    });
     let cache = family.build_exact_eval_cache(&states).expect("cache");
     let a0 = BernoulliMarginalSlopeFamily::row_ctx(&cache, row).intercept;
     let b = states[1].eta[row];
