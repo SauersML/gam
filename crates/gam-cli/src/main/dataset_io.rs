@@ -14,7 +14,7 @@ pub(crate) fn load_dataset_projected(
 ///
 /// Only roles that are factors *regardless of the data's values* are included:
 ///
-/// * `group(g)` / `factor(g)` / `re(g)` random-effect terms
+/// * `group(g)` / `factor(g)` random-effect terms
 ///   ([`ParsedTerm::RandomEffect`]) — a grouping factor by construction.
 /// * a categorical / multinomial **response** column, when `response_is_categorical`.
 ///

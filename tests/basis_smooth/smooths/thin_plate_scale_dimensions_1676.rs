@@ -1,10 +1,10 @@
 //! `scale_dimensions=True` must genuinely engage per-axis anisotropy for a
-//! thin-plate (`bs="tp"`) smooth, not be a silent no-op (gam#1676).
+//! thin-plate (`bs="tps"`) smooth, not be a silent no-op (gam#1676).
 //!
 //! A canonical thin-plate regression spline carries a *single* curvature
 //! penalty (the exact `∫|Dᵐf|²` RKHS Gram) with no per-axis structure, so the
 //! `scale_dimensions` flag had nothing to engage and was silently dropped for
-//! `bs="tp"` while it worked for `duchon()`/`matern()`. The fix rewrites a
+//! `bs="tps"` while it worked for `duchon()`/`matern()`. The fix rewrites a
 //! multi-axis thin-plate term to its mathematically-equivalent anisotropic s=0
 //! Duchon spline (the thin-plate kernel `r^{2m−d}` IS the s=0 Duchon kernel), so
 //! the per-axis tension-ARD machinery (`Σ‖∇f‖²` → `d` directional

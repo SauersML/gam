@@ -114,6 +114,118 @@ pub(crate) fn build_truncated_coefficient_law(
     covariance: &Array2<f64>,
     tangent_dimension: usize,
 ) -> Result<Option<TruncatedCoefficientLaw>, String> {
+    let Some(pieces) = truncated_law_pieces(fit, covariance)? else {
+        return Ok(None);
+    };
+    pieces.into_law(tangent_dimension).map(Some)
+}
+
+/// The truncated law as a rule over WHOLE coefficient vectors: every node of
+/// the joint rule maps to one raw coefficient vector
+/// `β = β_unc + TG(u − E_untrunc[u]) + L_res z`, with `L_res` a factor of
+/// `Σ_res` and `z` the node's tangent coordinates, so the tangent block has the
+/// rank of `Σ_res` coordinates.
+///
+/// This is the form a consumer needs when its functional of `β` does not
+/// factor through a few linear predictors per evaluation point, as the plug-in
+/// survival surfaces do not (a time grid, a hazard read from the time channel's
+/// rate, a link wiggle evaluated at the realized location). Every node is
+/// feasible: `u` lies inside the cone by construction and `AL_res = 0`
+/// because `AΣ_resAᵀ = 0`.
+pub(crate) struct TruncatedCoefficientDraws {
+    law: TruncatedCoefficientLaw,
+    /// `L_res` with `L_res L_resᵀ = Σ_res`, raw × rank.
+    residual_factor: Array2<f64>,
+}
+
+impl TruncatedCoefficientDraws {
+    /// The joint rule the draws are served on.
+    pub(crate) fn rule(&self) -> &ConstrainedPosteriorJointRule {
+        &self.law.rule
+    }
+
+    /// The raw coefficient vector at one node of [`Self::rule`].
+    pub(crate) fn coefficients(
+        &self,
+        normal_coordinates: &Array1<f64>,
+        tangent: &[f64],
+    ) -> Result<Array1<f64>, String> {
+        if normal_coordinates.len() != self.law.normal_center.len()
+            || tangent.len() != self.residual_factor.ncols()
+        {
+            return Err(format!(
+                "truncated coefficient draw: node has {} constraint-normal and {} tangent \
+                 coordinates, the law has {} and {}",
+                normal_coordinates.len(),
+                tangent.len(),
+                self.law.normal_center.len(),
+                self.residual_factor.ncols()
+            ));
+        }
+        let displacement = normal_coordinates - &self.law.normal_center;
+        Ok(&self.law.center
+            + &self.law.lift.dot(&displacement)
+            + &self
+                .residual_factor
+                .dot(&ArrayView1::from(tangent)))
+    }
+}
+
+/// [`TruncatedCoefficientDraws`] for a fit, or `None` under the same conditions
+/// as [`build_truncated_coefficient_law`].
+pub(crate) fn build_truncated_coefficient_draws(
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+) -> Result<Option<TruncatedCoefficientDraws>, String> {
+    let Some(pieces) = truncated_law_pieces(fit, covariance)? else {
+        return Ok(None);
+    };
+    let residual_factor = factorize_psd_covariance(
+        &pieces.residual_covariance,
+        "survival location-scale truncated residual covariance",
+    )?
+    .factor;
+    let law = pieces.into_law(residual_factor.ncols())?;
+    Ok(Some(TruncatedCoefficientDraws {
+        law,
+        residual_factor,
+    }))
+}
+
+/// Everything of the truncated law but its rule, whose tangent dimension is the
+/// consumer's.
+struct TruncatedLawPieces {
+    center: Array1<f64>,
+    lift: Array2<f64>,
+    normal_center: Array1<f64>,
+    normal_covariance: Array2<f64>,
+    residual_covariance: Array2<f64>,
+    upper_limits: Vec<f64>,
+}
+
+impl TruncatedLawPieces {
+    fn into_law(self, tangent_dimension: usize) -> Result<TruncatedCoefficientLaw, String> {
+        let rule = ConstrainedPosteriorJointRule::new(
+            &self.normal_center,
+            &self.normal_covariance,
+            &self.upper_limits,
+            tangent_dimension,
+        )?;
+        Ok(TruncatedCoefficientLaw {
+            center: self.center,
+            lift: self.lift,
+            normal_center: self.normal_center,
+            residual_covariance: self.residual_covariance,
+            rule,
+            tangent_dimension,
+        })
+    }
+}
+
+fn truncated_law_pieces(
+    fit: &UnifiedFitResult,
+    covariance: &Array2<f64>,
+) -> Result<Option<TruncatedLawPieces>, String> {
     let Some(geometry) = fit.geometry.as_ref() else {
         return Ok(None);
     };
@@ -292,21 +404,13 @@ pub(crate) fn build_truncated_coefficient_law(
         }
     }
 
-    let upper_limits = correction.upper_limits();
-    let rule = ConstrainedPosteriorJointRule::new(
-        &normal_center,
-        &normal_covariance,
-        &upper_limits,
-        tangent_dimension,
-    )?;
-
-    Ok(Some(TruncatedCoefficientLaw {
+    Ok(Some(TruncatedLawPieces {
         center,
         lift: lift_matrix,
         normal_center,
+        normal_covariance,
         residual_covariance,
-        rule,
-        tangent_dimension,
+        upper_limits: correction.upper_limits(),
     }))
 }
 
@@ -888,7 +992,7 @@ fn certify_response_moments(
 }
 
 /// Standard error of the mean of independent replicate estimates of one quantity.
-fn replicate_standard_error(estimates: &[f64]) -> f64 {
+pub(crate) fn replicate_standard_error(estimates: &[f64]) -> f64 {
     let replicates = estimates.len() as f64;
     let mean = estimates.iter().sum::<f64>() / replicates;
     let spread = estimates

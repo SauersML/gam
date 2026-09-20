@@ -36,7 +36,7 @@ const ROWS: usize = 48;
 
 /// Both channels' terms, as gnomon's `score_smooth` and `context_formula` write them.
 const TERMS: &str =
-    "s(score, type=duchon, centers=4) + sex + s(PC1, PC2, type=duchon, centers=4)";
+    "s(score, bs=duchon, centers=4) + sex + s(PC1, PC2, bs=duchon, centers=4)";
 
 fn gnomon_gaussian_table() -> gam_data::EncodedDataset {
     let headers = ["y", "score", "sex", "PC1", "PC2"].map(String::from).to_vec();

@@ -318,7 +318,6 @@ fn build_sample_payload(
             n_samples: cfg.n_samples,
             n_warmup: nuts.warmup_transitions,
             n_chains: gam::sample::NUTS_CHAINS,
-            target_accept: cfg.target_accept,
             seed: cfg.seed,
         },
         model_class: prediction_model_class_label(model),
@@ -384,8 +383,11 @@ fn categorical_level_name_for_bits(
     if !value.is_finite() {
         return None;
     }
+    // A level code is a stored integer, so it round-trips `usize` exactly; a
+    // fractional, negative or out-of-range value does not (the cast truncates
+    // or saturates) and names no level.
     let idx = value as usize;
-    if (idx as f64 - value).abs() > 1e-12 {
+    if idx as f64 != value {
         return None;
     }
     schema

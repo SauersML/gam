@@ -206,7 +206,7 @@ pub(crate) fn run_fit(args: FitArgs) -> CliResult<()> {
     let requested_columns = fit_required_columns(&parsed, &fit_config)?
         .into_iter()
         .collect::<Vec<_>>();
-    // Force `group(g)` / `factor(g)` / `re(g)` grouping columns to a factor
+    // Force `group(g)` / `factor(g)` grouping columns to a factor
     // encoding even when their labels are numeric. An untyped CSV cannot carry
     // the typed-frame categorical sentinel the Python path uses, so without this
     // a numeric-coded grouping column would be demoted to a single continuous

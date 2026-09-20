@@ -5,7 +5,7 @@ textbook heteroscedastic count data that every sibling path fits.
 modelling of the mean and a per-row dispersion for the dispersion families
 (gamma / nb / beta / tweedie). For the negative binomial this is
 
-    gamfit.fit(df, "y ~ s(x)", family="nb", noise_formula="s(x)")
+    gamfit.fit(df, "y ~ s(x)", family="negative-binomial", noise_formula="s(x)")
 
 On well-posed data — a smooth log-mean ``mu(x) = exp(1 + 0.5 x)`` and a smoothly
 varying NB size/dispersion ``size(x) = exp(1.5 - 0.7 x)`` at ``n = 10000`` — this
@@ -27,7 +27,7 @@ NB two-block dispersion path).
 
 The data is well-posed and the failure is specific to the NB location-scale path:
 
-  * a plain ``family="nb"`` fit (no ``noise_formula``) on the SAME data fits,
+  * a plain ``family="negative-binomial"`` fit (no ``noise_formula``) on the SAME data fits,
   * a Gaussian location-scale fit (same design, same ``n``) fits,
   * a Gamma location-scale fit on analogous positive data fits.
 
@@ -74,7 +74,7 @@ def test_nb_location_scale_fit_succeeds_on_heteroscedastic_counts() -> None:
 
     # Control 1: plain NB (no dispersion block) must fit this data — proves the
     # mean structure / data scale are fine.
-    plain = gamfit.fit(df, "y ~ s(x)", family="nb")
+    plain = gamfit.fit(df, "y ~ s(x)", family="negative-binomial")
     assert np.all(np.isfinite(np.asarray(plain.predict(df), dtype=float)))
 
     # Control 2: a Gaussian location-scale fit on the same design and n fits,
@@ -84,7 +84,7 @@ def test_nb_location_scale_fit_succeeds_on_heteroscedastic_counts() -> None:
 
     # The documented NB location-scale fit. This is the line that currently
     # raises IntegrationError ("custom-family inner solve did not converge").
-    model = gamfit.fit(df, "y ~ s(x)", family="nb", noise_formula="s(x)")
+    model = gamfit.fit(df, "y ~ s(x)", family="negative-binomial", noise_formula="s(x)")
 
     mean = np.asarray(model.predict(df), dtype=float)
     assert mean.shape[0] == len(df)

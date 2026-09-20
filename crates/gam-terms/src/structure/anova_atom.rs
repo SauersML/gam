@@ -70,31 +70,42 @@
 //! This module is a PURE READ of a fitted tensor-product decoder: the
 //! caller supplies the factor bases evaluated on the code sample and the
 //! per-output-dim coefficient matrices (plus, optionally, their posterior
-//! covariance for the Wald test). It deliberately does NOT add an
+//! covariance for the resolution bound, and the sample-space binding test
+//! of [`InteractionTest`]). It deliberately does NOT add an
 //! in-fit ANOVA basis kind: two independent circles are just two atoms
 //! summing — ordinary superposition, the default multi-atom model — so
 //! the product machinery is only ever needed at the moment a fitted pair
 //! shows dependent codes and the structure search must adjudicate
 //! merge-vs-keep. That adjudication consumes this carve.
 //!
-//! # The gauge inside the test (load-bearing)
+//! # The binding test lives in sample space (gauge-free by construction)
 //!
 //! On a partition-of-unity factor basis (B-splines: `Σ_j φ_j ≡ 1`) the
-//! empirically centered basis functions `φ̃_j = φ_j − mean_n φ_j(θ_n)`
-//! carry one exact linear dependence per factor: `Σ_j φ̃_j ≡ 0`. The
-//! coefficient directions `u vᵀ + w uᵀ` (u the dependence vector) change
-//! NOTHING about `f₁₂` — they are pure gauge, their posterior values are
-//! penalty-set noise, and a Wald statistic that includes them is wrong.
-//! The binding test therefore projects the interaction block onto the
-//! gauge quotient (`C ↦ P₁ C P₂`, `P_i = I − û_i û_iᵀ`) before testing;
-//! the quotient dimension `(M₁−1)(M₂−1)` is the test's honest rank.
+//! empirically centered basis functions carry one exact linear dependence
+//! per factor, so the interaction coefficients `C` carry gauge directions
+//! that change nothing about `f₁₂`. A coefficient-space test must quotient
+//! them out and then guess the rank of what is left. [`InteractionTest`]
+//! never enters coefficient space: it is the exact Gaussian nested-model
+//! test of the additive column space `W = [1, Φ¹, Φ²]` against the full
+//! space `F = [W, φ¹ ⊗ φ²]` on the code sample. The interaction directions
+//! are the numerical range of the tensor columns projected off `span W`,
+//! so any reparameterization of either factor basis leaves the test
+//! unchanged, and its rank `k = rank F − rank W` is read off the sample —
+//! `(M₁−1)(M₂−1)` for constant-leading or partition-of-unity factors, with
+//! no EDF substitute and no floor. When the factor bases do not span the
+//! constant, `span F ⊋ span(φ¹ ⊗ φ²)` and the alternative is the full
+//! space. Per output dimension the statistic is exactly `F(k, ν)`,
+//! `ν = n − rank F`; the edge-level statistic is Wilks' `Λ` over all output
+//! dimensions jointly, whose exact null law is evaluated in closed form, or
+//! as a certified one-dimensional convolution when the output count and the
+//! interaction rank are both odd.
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, s};
-
-use crate::inference::smooth_test::{
-    SmoothTestInput, SmoothTestResult, SmoothTestScale, wood_smooth_test,
-};
-use gam_linalg::faer_ndarray::FaerEigh;
+use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
+use gam_linalg::roundoff::factor_singular_band;
+use gam_math::probability::{fisher_snedecor_sf, ln_regularized_beta_lower_from_log_x};
+use gam_math::special::gauss_legendre;
+use statrs::function::beta::ln_beta;
 
 /// Which binding notion a carve report speaks about (see module docs).
 ///
@@ -127,8 +138,8 @@ pub enum BindingNotion {
 /// ```
 ///
 /// so `mean = m₁ᵀ C m₂`, `main_a = C m₂`, `main_b = Cᵀ m₁`, and the
-/// interaction block on the centered tensor basis is `C` itself (tested
-/// in its gauge quotient, see module docs).
+/// interaction block on the centered tensor basis is `C` itself (its
+/// binding test runs in sample space, see module docs).
 #[derive(Clone, Debug)]
 pub(crate) struct AnovaBlocks {
     pub mean: f64,
@@ -185,8 +196,7 @@ pub struct ChildDecoder {
     pub centered_coeffs: Array1<f64>,
 }
 
-impl ChildDecoder {
-}
+impl ChildDecoder {}
 
 /// The lossless-on-the-additive-part split: child atoms inheriting the
 /// main-effect blocks. Gauge choice (documented, fixed): the grand mean
@@ -208,17 +218,15 @@ pub struct FissionPlan {
 #[derive(Clone, Debug)]
 pub struct CarveReport {
     pub notion: BindingNotion,
-    /// Wood-style Wald test of the gauge-projected interaction block, one
-    /// per output dimension (`None` where covariance was unavailable or
-    /// the test degenerated).
-    pub binding_tests: Vec<Option<SmoothTestResult>>,
-    /// Edge-level binding p-value: Bonferroni min-p across output
-    /// dimensions (conservative under arbitrary cross-dimension
-    /// dependence — the dimensions share every code). `None` when no
-    /// per-dimension test ran. This is the number that feeds
-    /// `structure_evidence::ClaimKind::BindingEdge` through
-    /// `log_e_from_p_calibrator`.
-    pub edge_p_value: Option<f64>,
+    /// Exact nested-model F test of the interaction, one per output
+    /// dimension ([`InteractionTest::per_dimension`]); the error names why a
+    /// dimension has no test.
+    pub binding_tests: Vec<Result<BindingFTest, BindingTestUnavailable>>,
+    /// Edge-level binding test over all output dimensions jointly
+    /// ([`InteractionTest::edge`]). Its p-value ([`Self::edge_p_value`]) is
+    /// the number that feeds `structure_evidence::ClaimKind::BindingEdge`
+    /// through `log_e_from_p_calibrator`.
+    pub edge_test: Result<EdgeBindingTest, BindingTestUnavailable>,
     /// Fraction of centered surface energy carried by the interaction,
     /// aggregated over output dimensions — the continuous "how bound"
     /// dial (0 = perfectly additive, 1 = pure interaction).
@@ -226,6 +234,13 @@ pub struct CarveReport {
     /// The lossless split, present iff this notion's carve allows it:
     /// interaction unresolved at the carve's resolution AND not proven present.
     pub fission: Option<FissionPlan>,
+}
+
+impl CarveReport {
+    /// The edge-level binding p-value, or why the edge has no test.
+    pub fn edge_p_value(&self) -> Result<f64, BindingTestUnavailable> {
+        self.edge_test.map(|test| test.p_value())
+    }
 }
 
 /// The joint adjudication over both notions — three-valued on purpose:
@@ -246,17 +261,247 @@ pub enum FissionDecision {
     Keep,
 }
 
+/// Why a binding test has no p-value. Each is a property of the sample,
+/// reported instead of a number that would claim a calibration it lacks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingTestUnavailable {
+    /// The carve was handed no sample-space test ([`CarveInput::interaction_test`]).
+    NoStatistics,
+    /// The tensor columns add no direction to the additive space on this
+    /// sample (`rank F = rank W`): there is no interaction to test.
+    NoInteractionDirections,
+    /// The full space spans every sample (`rank F = n`): no residual is
+    /// left to weigh the interaction against.
+    NoResidualDegreesOfFreedom,
+    /// Output dimension `dim` lies in the full space to rounding: its
+    /// residual carries no variation to calibrate a test against (an exact
+    /// reconstruction, for instance).
+    NoResidualVariation { dim: usize },
+    /// The residual cross-product of the output dimensions is singular
+    /// (fewer residual degrees of freedom than outputs, or an output that
+    /// is a linear combination of the others in the residual), so Wilks'
+    /// `Λ` is undefined.
+    ResidualCovarianceRankDeficient { residual_df: usize, dims: usize },
+}
+
+/// One output dimension's exact nested-model F test of the interaction:
+/// `statistic ~ F(numerator_df, denominator_df)` under no interaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BindingFTest {
+    pub statistic: f64,
+    pub numerator_df: usize,
+    pub denominator_df: usize,
+    pub p_value: f64,
+}
+
+/// Wilks' likelihood-ratio test of no interaction across all output
+/// dimensions jointly: `Λ = |E| / |E + H|` with `E` the residual and `H` the
+/// interaction cross-product, `Λ ~ Λ(dims, residual_df, interaction_rank)`
+/// under no interaction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WilksTest {
+    /// `−ln Λ`.
+    pub neg_log_lambda: f64,
+    pub dims: usize,
+    pub interaction_rank: usize,
+    pub residual_df: usize,
+    pub p_value: f64,
+}
+
+/// The edge-level binding test: the F test itself for a single output
+/// dimension, Wilks' `Λ` for several.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum EdgeBindingTest {
+    SingleOutput(BindingFTest),
+    Wilks(WilksTest),
+}
+
+impl EdgeBindingTest {
+    pub fn p_value(&self) -> f64 {
+        match self {
+            Self::SingleOutput(test) => test.p_value,
+            Self::Wilks(test) => test.p_value,
+        }
+    }
+}
+
+/// The exact Gaussian test of "no interaction" on the code sample.
+///
+/// With `W = [1, Φ¹, Φ²]` (the additive surfaces) and `F = [W, φ¹ ⊗ φ²]`,
+/// the responses `Y` (`n × D`) are tested for `E[Y] ∈ span W` against
+/// `E[Y] ∈ span F`, rows independent Gaussian with a common covariance.
+/// With `Q` an orthonormal basis of `span F ⊖ span W` (`k` columns), the
+/// interaction scores `S = Qᵀ Y` (`k × D`) and the full-space residual
+/// `E` (`ν = n − rank F` degrees of freedom) are independent, so per output
+/// dimension `(‖s_d‖²/k) / (‖e_d‖²/ν) ~ F(k, ν)` exactly, and across outputs
+/// `Λ = |EᵀE| / |EᵀE + SᵀS|` is Wilks-distributed exactly.
+///
+/// Everything is read off `span W` and `span F` alone: reparameterizing
+/// either factor basis by any invertible map, or carrying gauge directions
+/// in it, leaves the test unchanged. Numerical ranks are the singular
+/// directions above each matrix's backward-error band
+/// (`gam_linalg::roundoff::factor_singular_band`).
+#[derive(Clone, Debug)]
+pub struct InteractionTest {
+    n: usize,
+    m1: usize,
+    m2: usize,
+    /// `k = rank F − rank W`, the numerator degrees of freedom.
+    pub interaction_rank: usize,
+    /// `ν = n − rank F`, the residual degrees of freedom.
+    pub residual_df: usize,
+    pub per_dimension: Vec<Result<BindingFTest, BindingTestUnavailable>>,
+    pub edge: Result<EdgeBindingTest, BindingTestUnavailable>,
+}
+
+impl InteractionTest {
+    /// Run the test for responses `responses` (`n × D`) on factor bases
+    /// `phi_a` (`n × M₁`) and `phi_b` (`n × M₂`).
+    pub fn from_sample(
+        phi_a: ArrayView2<'_, f64>,
+        phi_b: ArrayView2<'_, f64>,
+        responses: ArrayView2<'_, f64>,
+    ) -> Result<Self, String> {
+        let n = phi_a.nrows();
+        let m1 = phi_a.ncols();
+        let m2 = phi_b.ncols();
+        let dims = responses.ncols();
+        if phi_b.nrows() != n || responses.nrows() != n {
+            return Err(format!(
+                "InteractionTest: sample sizes disagree (phi_a {n}, phi_b {}, responses {})",
+                phi_b.nrows(),
+                responses.nrows()
+            ));
+        }
+        if n == 0 || m1 == 0 || m2 == 0 || dims == 0 {
+            return Err(format!(
+                "InteractionTest: degenerate problem (n={n}, M₁={m1}, M₂={m2}, D={dims})"
+            ));
+        }
+        if phi_a
+            .iter()
+            .chain(phi_b.iter())
+            .chain(responses.iter())
+            .any(|v| !v.is_finite())
+        {
+            return Err("InteractionTest: non-finite basis or response entry".to_string());
+        }
+
+        let additive_width = 1 + m1 + m2;
+        let full_width = additive_width + m1 * m2;
+        let mut full = Array2::<f64>::zeros((n, full_width));
+        for row in 0..n {
+            full[[row, 0]] = 1.0;
+            for j in 0..m1 {
+                full[[row, 1 + j]] = phi_a[[row, j]];
+            }
+            for k in 0..m2 {
+                full[[row, 1 + m1 + k]] = phi_b[[row, k]];
+            }
+            for j in 0..m1 {
+                for k in 0..m2 {
+                    full[[row, additive_width + j * m2 + k]] = phi_a[[row, j]] * phi_b[[row, k]];
+                }
+            }
+        }
+        let additive = full.slice(s![.., ..additive_width]);
+        let additive_band = factor_singular_band(
+            n,
+            additive_width,
+            largest_singular_value(additive, "additive space")?,
+        );
+        let additive_range = numerical_range(additive, additive_band, "additive space")?;
+        // The interaction directions: the tensor columns off span W, kept above the
+        // FULL matrix's band, so rank W + k is rank F at F's own resolution.
+        let full_band = factor_singular_band(
+            n,
+            full_width,
+            largest_singular_value(full.view(), "full space")?,
+        );
+        let interaction_columns = project_out(
+            &additive_range,
+            full.slice(s![.., additive_width..]).to_owned(),
+        );
+        let interaction =
+            numerical_range(interaction_columns.view(), full_band, "interaction space")?;
+        let interaction_rank = interaction.ncols();
+        let full_rank = additive_range.ncols() + interaction_rank;
+        let residual_df = n.checked_sub(full_rank).ok_or_else(|| {
+            format!("InteractionTest: numerical rank {full_rank} exceeds the sample size {n}")
+        })?;
+
+        let additive_residual = project_out(&additive_range, responses.to_owned());
+        let scores = interaction.t().dot(&additive_residual); // k × D
+        let residual = project_out(&interaction, additive_residual); // n × D
+
+        let unavailable = if interaction_rank == 0 {
+            Some(BindingTestUnavailable::NoInteractionDirections)
+        } else if residual_df == 0 {
+            Some(BindingTestUnavailable::NoResidualDegreesOfFreedom)
+        } else {
+            None
+        };
+        let per_dimension: Vec<Result<BindingFTest, BindingTestUnavailable>> = (0..dims)
+            .map(|dim| {
+                if let Some(reason) = unavailable {
+                    return Err(reason);
+                }
+                let residual_energy = column_energy(residual.column(dim));
+                // A residual inside the projections' rounding band of the response
+                // is a response in span F: nothing is left to calibrate against.
+                let response_norm = column_energy(responses.column(dim)).sqrt();
+                if residual_energy.sqrt() <= factor_singular_band(n, full_width, response_norm) {
+                    return Err(BindingTestUnavailable::NoResidualVariation { dim });
+                }
+                let score_energy = column_energy(scores.column(dim));
+                let statistic = (score_energy / interaction_rank as f64)
+                    / (residual_energy / residual_df as f64);
+                Ok(BindingFTest {
+                    statistic,
+                    numerator_df: interaction_rank,
+                    denominator_df: residual_df,
+                    p_value: fisher_snedecor_sf(
+                        statistic,
+                        interaction_rank as f64,
+                        residual_df as f64,
+                    ),
+                })
+            })
+            .collect();
+
+        let edge = if dims == 1 {
+            per_dimension[0].map(EdgeBindingTest::SingleOutput)
+        } else if let Some(Err(reason)) = per_dimension.iter().find(|test| test.is_err()) {
+            Err(*reason)
+        } else if residual_df < dims {
+            Err(BindingTestUnavailable::ResidualCovarianceRankDeficient { residual_df, dims })
+        } else {
+            wilks_test(&residual, &scores, residual_df)?
+        };
+
+        Ok(Self {
+            n,
+            m1,
+            m2,
+            interaction_rank,
+            residual_df,
+            per_dimension,
+            edge,
+        })
+    }
+}
+
 /// A penalized tensor-surface fit over the code sample: the producer of
 /// [`CarveInput`]s for BOTH binding notions (#993 items 1–2).
 ///
 /// `coeffs[d]` is the fitted `M₁ × M₂` coefficient matrix for response
 /// dimension `d`; `coeff_covariance[d]` is the matching SCALE-INCLUDED
-/// posterior covariance of its row-major vec (the mgcv-`Vb` object
-/// [`wood_smooth_test`] contracts for); `joint_covariance()` assembles
-/// the cross-dimension covariance for the joint binding test. The fit is
-/// evaluated against the SAME empirical code measure the carve centers
-/// against — the test and its covariance live on one measure by
-/// construction, which is the coherence the production fit's own Hessian
+/// posterior covariance of its row-major vec; `joint_covariance()`
+/// assembles the cross-dimension covariance. The carve reads these for its
+/// posterior resolution bound, and reads `interaction_test` — the exact
+/// sample-space test of the same responses on the same bases — for binding.
+/// The fit is evaluated against the SAME empirical code measure the carve
+/// centers against, which is the coherence the production fit's own Hessian
 /// (a different parameterization: tangent frames, not tensor
 /// coefficients) cannot offer the carve.
 #[derive(Clone, Debug)]
@@ -280,8 +525,8 @@ pub struct TensorSurfaceFit {
     /// Effective degrees of freedom `rank(X)/(1 + λ)` (per dimension; the
     /// design and λ are shared).
     pub edf: f64,
-    /// Residual degrees of freedom `n − edf` (the denominator d.f. for
-    /// the `Estimated`-scale F branch).
+    /// Residual degrees of freedom `n − edf` of the shrunk fit, the divisor
+    /// of `residual_cross_cov`.
     pub residual_df: f64,
     /// Per response dimension, a bound on the absolute rounding error of every
     /// entry of `coeffs[d]`, carried from the solve that produced them (see
@@ -289,6 +534,10 @@ pub struct TensorSurfaceFit {
     /// interaction block is distinguishable from what an exactly additive
     /// surface leaves after this solve.
     pub coeff_band: Vec<f64>,
+    /// The exact sample-space binding test of `responses` on these factor
+    /// bases ([`InteractionTest::from_sample`]); feed to
+    /// [`CarveInput::interaction_test`].
+    pub interaction_test: InteractionTest,
 }
 
 impl TensorSurfaceFit {
@@ -642,6 +891,8 @@ pub fn fit_tensor_surface(
         coeff_covariance.push(&unit_covariance * residual_cross_cov[[d, d]]);
     }
 
+    let interaction_test = InteractionTest::from_sample(phi_a, phi_b, responses)?;
+
     Ok(TensorSurfaceFit {
         coeffs,
         coeff_covariance,
@@ -651,6 +902,7 @@ pub fn fit_tensor_surface(
         edf,
         residual_df,
         coeff_band,
+        interaction_test,
     })
 }
 
@@ -685,10 +937,8 @@ pub struct FittedAtomCarveInput {
 
 impl FittedAtomCarveInput {
     /// Borrow this bundle as a representational [`CarveInput`] ready for
-    /// [`carve`]. The coefficient covariance and the joint covariance come
-    /// from the REML re-fit; the gauge kernels default to the
-    /// partition-of-unity convention (`u = 1`), which is the correct centered-
-    /// basis null direction for the constant-leading harmonic factor bases.
+    /// [`carve`]. The coefficient covariance, the joint covariance and the
+    /// sample-space binding test all come from the REML re-fit.
     pub fn representational_carve_input(&self) -> CarveInput<'_> {
         CarveInput {
             phi_a: self.phi_a.view(),
@@ -697,11 +947,7 @@ impl FittedAtomCarveInput {
             coeff_band: self.surface.coeff_band.as_slice(),
             coeff_covariance: Some(self.surface.coeff_covariance.as_slice()),
             joint_coeff_covariance: Some(&self.joint_covariance),
-            kernel_a: None,
-            kernel_b: None,
-            edf: Some(self.surface.edf),
-            residual_df: self.surface.residual_df,
-            scale: SmoothTestScale::Estimated,
+            interaction_test: Some(&self.surface.interaction_test),
             notion: BindingNotion::Representational,
         }
     }
@@ -728,11 +974,13 @@ impl FittedAtomCarveInput {
 ///
 /// The carve responses are the atom's own ambient reconstruction
 /// `m_k(t) = Φ_k(t)·B_k` (`n × p`); fitting the tensor surface to it on the
-/// same code measure yields the scale-included coefficient covariance the
-/// binding Wald test needs. The reconstruction is an exact linear image of the
-/// decoder, so the re-fit recovers the decoder's own ANOVA structure (the
-/// representational binding question) with a covariance that is honest about
-/// the finite code sample.
+/// same code measure yields the coefficients, their covariance and the
+/// sample-space binding test. The reconstruction is an exact linear image of
+/// the decoder, so the re-fit recovers the decoder's own ANOVA structure (the
+/// representational binding question). It also leaves no residual variation
+/// for a sampling test to weigh the interaction against, so the binding test
+/// reports [`BindingTestUnavailable::NoResidualVariation`] there and the
+/// carve's resolution dial decides.
 pub fn carve_input_from_fitted_atom(
     basis_values: ArrayView2<'_, f64>,
     decoder_coefficients: ArrayView2<'_, f64>,
@@ -811,7 +1059,7 @@ pub fn carve_input_from_fitted_atom(
     let reconstruction = basis_values.dot(&decoder_coefficients);
 
     // REML re-fit of the reconstruction onto the SAME tensor basis: supplies the
-    // scale-included decoder-coefficient covariance the binding Wald test reads.
+    // coefficients, their covariance and the sample-space binding test.
     let surface = fit_tensor_surface(phi_a.view(), phi_b.view(), reconstruction.view())?;
     let joint_covariance = surface.joint_covariance();
 
@@ -831,13 +1079,11 @@ pub fn carve_input_from_fitted_atom(
 /// notion they come from fitting the same tensor basis to the pulled-back
 /// readout. `coeff_covariance`: matching scale-included posterior
 /// covariance of the ROW-MAJOR vec of each `C` (`M₁M₂ × M₁M₂` per output
-/// dim) — optional; without it the carve still reports the energy
-/// fraction but runs no Wald test. `kernel_a`/`kernel_b`: the per-factor
-/// coefficient direction along which the centered basis is degenerate
-/// (`Σ_j u_j φ̃_j ≡ 0`); `None` selects the partition-of-unity convention
-/// `u = 1` (B-splines). `edf`: fitted EDF of the interaction block when
-/// the fit tracked one; `None` uses the full quotient rank
-/// `(M₁−1)(M₂−1)`.
+/// dim) — optional; it sets the posterior part of the carve's resolution
+/// bound. `interaction_test`: the sample-space binding test of the
+/// responses the coefficients were fitted to, on the same factor bases —
+/// optional; without it no binding test runs and the carve reports
+/// [`BindingTestUnavailable::NoStatistics`].
 pub struct CarveInput<'a> {
     pub phi_a: ArrayView2<'a, f64>,
     pub phi_b: ArrayView2<'a, f64>,
@@ -849,22 +1095,16 @@ pub struct CarveInput<'a> {
     pub coeff_covariance: Option<&'a [Array2<f64>]>,
     /// Covariance of the dimension-major STACKED coefficient vector
     /// `[vec(C₀); vec(C₁); …]` (`D·M₁M₂` square, scale-included), e.g.
-    /// [`TensorSurfaceFit::joint_covariance`]. When present, the
-    /// edge-level binding p-value comes from ONE joint Wald over the
-    /// stacked gauge-projected blocks at rank `D·(M₁−1)(M₂−1)` instead of
-    /// the conservative Bonferroni min-p across dimensions (the per-dim
-    /// tests share every code row, so Bonferroni over-corrects).
+    /// [`TensorSurfaceFit::joint_covariance`]. Its diagonal blocks stand in
+    /// for `coeff_covariance` when that is absent.
     pub joint_coeff_covariance: Option<&'a Array2<f64>>,
-    pub kernel_a: Option<Array1<f64>>,
-    pub kernel_b: Option<Array1<f64>>,
-    pub edf: Option<f64>,
-    pub residual_df: f64,
-    pub scale: SmoothTestScale,
+    /// The sample-space binding test, e.g. [`TensorSurfaceFit::interaction_test`].
+    pub interaction_test: Option<&'a InteractionTest>,
     pub notion: BindingNotion,
 }
 
-/// The carve: exact ANOVA split, interaction energy, gauge-projected
-/// binding test, and the fission plan when this notion permits one.
+/// The carve: exact ANOVA split, interaction energy, sample-space binding
+/// test, and the fission plan when this notion permits one.
 ///
 /// Fission rule (asymmetric on purpose): the test REJECTING proves
 /// binding and always blocks the split; the test NOT rejecting is only
@@ -891,8 +1131,8 @@ pub struct CarveInput<'a> {
 /// least `1 − 2α` at every sample size; a fixed interaction share grows `Ê` with `n`
 /// while `P` stays `O(σ²·rank)`, so it is kept. Without a covariance `P` is zero and
 /// only the rounding floor certifies, so a bare noisy estimate stays whole and
-/// contested — route its `edge_p_value` into the evidence ledger and let the probe
-/// loop earn the verdict.
+/// contested — route its [`CarveReport::edge_p_value`] into the evidence ledger and
+/// let the probe loop earn the verdict.
 pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> {
     let n = input.phi_a.nrows();
     if input.phi_b.nrows() != n {
@@ -934,6 +1174,26 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     if !(alpha > 0.0 && alpha < 1.0) {
         return Err(format!("carve: alpha must be in (0,1), got {alpha}"));
     }
+    let dims = input.coeffs.len();
+    let (binding_tests, edge_test) = match input.interaction_test {
+        None => (
+            vec![Err(BindingTestUnavailable::NoStatistics); dims],
+            Err(BindingTestUnavailable::NoStatistics),
+        ),
+        Some(test) => {
+            if (test.n, test.m1, test.m2) != (n, m1, m2) || test.per_dimension.len() != dims {
+                return Err(format!(
+                    "carve: the interaction test was run on n={}, M₁={}, M₂={} with {} outputs, \
+                     but the carve has n={n}, M₁={m1}, M₂={m2} with {dims}",
+                    test.n,
+                    test.m1,
+                    test.m2,
+                    test.per_dimension.len()
+                ));
+            }
+            (test.per_dimension.clone(), test.edge)
+        }
+    };
 
     let mean_a = basis_means(input.phi_a);
     let mean_b = basis_means(input.phi_b);
@@ -957,16 +1217,8 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
         p
     };
 
-    // Gauge projectors P_i = I − û ûᵀ for the centered-basis dependence,
-    // and their Kronecker product (the row-major-vec transform shared by
-    // the per-dimension and joint Wald tests).
-    let proj_a = gauge_projector(m1, input.kernel_a.as_ref())?;
-    let proj_b = gauge_projector(m2, input.kernel_b.as_ref())?;
-    let gauge_kron = gauge_kron_rowmajor(&proj_a, &proj_b);
-
     let mut child_a: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
     let mut child_b: Vec<ChildDecoder> = Vec::with_capacity(input.coeffs.len());
-    let mut binding_tests: Vec<Option<SmoothTestResult>> = Vec::with_capacity(input.coeffs.len());
     let mut interaction_energy = 0.0f64;
     // `Σ_n band_n²`: the energy an exactly additive surface can leave in the
     // computed interaction block (see the numerical-additivity decision below).
@@ -1019,22 +1271,6 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
             centered_energy += centered * centered;
         }
 
-        // Gauge-projected Wald test of the interaction block.
-        let test = match input.coeff_covariance {
-            None => None,
-            Some(covs) => binding_wald_test(
-                c,
-                &covs[dim],
-                &proj_a,
-                &proj_b,
-                &gauge_kron,
-                input.edf,
-                input.residual_df,
-                input.scale,
-            ),
-        };
-        binding_tests.push(test);
-
         child_a.push(ChildDecoder {
             constant: blocks.mean,
             centered_coeffs: blocks.main_a,
@@ -1050,50 +1286,19 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     } else {
         0.0
     };
-    // Edge-level p: the joint Wald over the stacked gauge-projected
-    // blocks when the cross-dimension covariance is available (exact
-    // rank, no Bonferroni slack), else Bonferroni min-p across the
-    // per-dimension tests (valid under their arbitrary dependence,
-    // conservative).
-    let edge_p_value = match input.joint_coeff_covariance {
-        Some(joint_cov) => joint_binding_wald_test(
-            input.coeffs,
-            joint_cov,
-            &proj_a,
-            &proj_b,
-            &gauge_kron,
-            input.edf,
-            input.residual_df,
-            input.scale,
-        )
-        .map(|t| t.p_value),
-        None => {
-            let ran: Vec<f64> = binding_tests.iter().flatten().map(|t| t.p_value).collect();
-            ran.iter()
-                .cloned()
-                .fold(None, |acc: Option<f64>, p| {
-                    Some(acc.map_or(p, |a| a.min(p)))
-                })
-                .map(|min_p| (min_p * ran.len() as f64).min(1.0))
-        }
-    };
-
-    // A Wald test cannot prove the PRESENCE of an interaction whose energy is
-    // numerically indistinguishable from zero. When the interaction block is at
-    // the f64 roundoff floor (an exactly-additive surface fit to machine
-    // precision), the scale-included posterior collapses with it and the Wald
-    // statistic becomes a 0/0 artifact that can read as overwhelmingly
-    // significant (p ≈ 0). Below the floor the surface is additive by
-    // construction, so no statistic counts as binding and the atom is free to
-    // fission. The floor is `Σ_n band_n²`, where `band_n` bounds how far the
-    // computed `f₁₂(θ_n)` of an exactly additive surface can sit from zero: the
-    // rounding of the products and the centering, `γ_ops·Σ_jk |φ̃¹_j||C_jk||φ̃²_k|`,
+    // No test can prove the PRESENCE of an interaction in these coefficients
+    // when their interaction energy is numerically indistinguishable from zero:
+    // below the floor the surface is additive by construction, so no statistic
+    // counts as binding and the atom is free to fission. The floor is
+    // `Σ_n band_n²`, where `band_n` bounds how far the computed `f₁₂(θ_n)` of an
+    // exactly additive surface can sit from zero: the rounding of the products and the centering, `γ_ops·Σ_jk |φ̃¹_j||C_jk||φ̃²_k|`,
     // plus what each coefficient carries from its own solve (`coeff_band`). A
     // fitted surface's interaction coefficients cancel O(‖C‖) magnitudes, so the
     // products' band alone, denominated in those roundoff-sized coefficients,
     // sat a whole solve backward error below the floor (#2822).
     let numerically_additive = interaction_energy <= interaction_band_energy;
-    let binding_proven = !numerically_additive && edge_p_value.is_some_and(|p| p <= alpha);
+    let binding_proven =
+        !numerically_additive && edge_test.is_ok_and(|test| test.p_value() <= alpha);
     // The posterior error energy of the interaction values (fission rule above):
     // `G = Σ_n x_n x_nᵀ` with `x_n = vec(φ̃¹_n φ̃²_nᵀ)` row-major and
     // `P = Σ_d Σ_ab G_ab Σ_d[a,b]`. Its band is γ over the accumulation depth (the
@@ -1101,7 +1306,6 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     // contractions) times the absolute shadow `Σ_d Σ_ab |G|_ab·|Σ_d[a,b]|`, to first
     // order in `u`.
     let interaction_width = m1 * m2;
-    let dims = input.coeffs.len();
     let posterior_blocks: Option<Vec<ArrayView2<'_, f64>>> =
         match (input.coeff_covariance, input.joint_coeff_covariance) {
             (Some(covs), _) => {
@@ -1184,8 +1388,8 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
              semidefinite"
         ));
     }
-    let resolution_band = interaction_band_energy.sqrt()
-        + ((posterior_energy + posterior_band) / alpha).sqrt();
+    let resolution_band =
+        interaction_band_energy.sqrt() + ((posterior_energy + posterior_band) / alpha).sqrt();
     let negligible = interaction_energy.sqrt() <= resolution_band;
     let fission = if negligible && !binding_proven {
         Some(FissionPlan {
@@ -1200,7 +1404,7 @@ pub fn carve(input: &CarveInput<'_>, alpha: f64) -> Result<CarveReport, String> 
     Ok(CarveReport {
         notion: input.notion,
         binding_tests,
-        edge_p_value,
+        edge_test,
         interaction_fraction,
         fission,
     })
@@ -1230,174 +1434,410 @@ pub fn fission_decision(
     }
 }
 
-/// `P = I − û ûᵀ` for the factor's centered-basis kernel direction
-/// (default: the partition-of-unity vector of ones). Projecting the
-/// interaction block with these on both sides picks the unique gauge
-/// representative with no component along the directions that do not
-/// change `f₁₂`.
-fn gauge_projector(m: usize, kernel: Option<&Array1<f64>>) -> Result<Array2<f64>, String> {
-    let u = match kernel {
-        Some(k) => {
-            if k.len() != m {
-                return Err(format!(
-                    "gauge_projector: kernel length {} != basis size {m}",
-                    k.len()
-                ));
-            }
-            k.clone()
+/// `σ_max` of `matrix`.
+fn largest_singular_value(matrix: ArrayView2<'_, f64>, context: &str) -> Result<f64, String> {
+    let (_, singular, _) = matrix
+        .svd(false, false)
+        .map_err(|e| format!("InteractionTest: {context} SVD failed: {e:?}"))?;
+    Ok(singular.iter().fold(0.0_f64, |acc, &value| acc.max(value)))
+}
+
+/// Orthonormal basis of `matrix`'s numerical range: its left singular vectors
+/// whose singular values exceed `band`.
+fn numerical_range(
+    matrix: ArrayView2<'_, f64>,
+    band: f64,
+    context: &str,
+) -> Result<Array2<f64>, String> {
+    let (left, singular, _) = matrix
+        .svd(true, false)
+        .map_err(|e| format!("InteractionTest: {context} SVD failed: {e:?}"))?;
+    let left = left.ok_or_else(|| format!("InteractionTest: {context} SVD returned no U"))?;
+    let kept: Vec<usize> = (0..singular.len())
+        .filter(|&i| singular[i] > band)
+        .collect();
+    Ok(left.select(Axis(1), &kept))
+}
+
+/// `(I − U Uᵀ) target` for orthonormal `U`, applied twice: the second pass
+/// removes what the first leaves along `U` from rounding, so the result is
+/// orthogonal to `U` to working precision.
+fn project_out(basis: &Array2<f64>, target: Array2<f64>) -> Array2<f64> {
+    if basis.ncols() == 0 {
+        return target;
+    }
+    let once = &target - &basis.dot(&basis.t().dot(&target));
+    &once - &basis.dot(&basis.t().dot(&once))
+}
+
+fn column_energy(column: ArrayView1<'_, f64>) -> f64 {
+    column.dot(&column)
+}
+
+/// Wilks' test from the full-space residual `E` (`n × D`) and interaction
+/// scores `S` (`k × D`). `Λ = |EᵀE| / |EᵀE + SᵀS|`; with `E = U Σ Vᵀ`,
+/// `−ln Λ = Σ_i ln(1 + σ_i(A)²)` for `A = Σ⁻¹ Vᵀ Sᵀ`, which never forms a
+/// determinant or a cross-product.
+fn wilks_test(
+    residual: &Array2<f64>,
+    scores: &Array2<f64>,
+    residual_df: usize,
+) -> Result<Result<EdgeBindingTest, BindingTestUnavailable>, String> {
+    let (n, dims) = residual.dim();
+    let interaction_rank = scores.nrows();
+    let (_, residual_singular, right) = residual
+        .svd(false, true)
+        .map_err(|e| format!("InteractionTest: residual SVD failed: {e:?}"))?;
+    let right = right.ok_or_else(|| "InteractionTest: residual SVD returned no Vᵀ".to_string())?;
+    let sigma_max = residual_singular
+        .iter()
+        .fold(0.0_f64, |acc, &value| acc.max(value));
+    let band = factor_singular_band(n, dims, sigma_max);
+    if residual_singular.len() < dims || residual_singular.iter().any(|&value| value <= band) {
+        return Ok(Err(
+            BindingTestUnavailable::ResidualCovarianceRankDeficient { residual_df, dims },
+        ));
+    }
+    let mut whitened = right.dot(&scores.t()); // D × k
+    for (mut row, &sigma) in whitened
+        .rows_mut()
+        .into_iter()
+        .zip(residual_singular.iter())
+    {
+        row.mapv_inplace(|value| value / sigma);
+    }
+    let (_, canonical, _) = whitened
+        .svd(false, false)
+        .map_err(|e| format!("InteractionTest: canonical SVD failed: {e:?}"))?;
+    let neg_log_lambda: f64 = canonical.iter().map(|&value| (value * value).ln_1p()).sum();
+    let p_value = wilks_survival(neg_log_lambda, dims, interaction_rank, residual_df)?;
+    Ok(Ok(EdgeBindingTest::Wilks(WilksTest {
+        neg_log_lambda,
+        dims,
+        interaction_rank,
+        residual_df,
+        p_value,
+    })))
+}
+
+/// `P(−ln Λ > t)` for `Λ ~ Λ(D, ν, k) = Π_{i=1}^{D} Beta((ν−i+1)/2, k/2)`
+/// (independent factors), `ν ≥ D`.
+///
+/// Four parameter lines reduce to an F law exactly (Rao): `k = 1` and `D = 1`
+/// through `1/Λ − 1`, `k = 2` and `D = 2` through `1/√Λ − 1` (the `k` lines by
+/// the symmetry `Λ(D, ν, k) = Λ(k, ν + k − D, D)`). Otherwise `−ln Λ` is a sum
+/// of independent exponentials whenever `k` or `D` is even, evaluated by
+/// [`hypoexponential_survival`], and that sum plus one `−ln Beta(c, ½)` when
+/// both are odd ([`WilksLaw`]), evaluated by
+/// [`hypoexponential_log_beta_half_survival`].
+fn wilks_survival(t: f64, dims: usize, k: usize, nu: usize) -> Result<f64, String> {
+    let (d, kf, nuf) = (dims as f64, k as f64, nu as f64);
+    if k == 1 {
+        return Ok(fisher_snedecor_sf(
+            t.exp_m1() * (nuf - d + 1.0) / d,
+            d,
+            nuf - d + 1.0,
+        ));
+    }
+    if dims == 1 {
+        return Ok(fisher_snedecor_sf(t.exp_m1() * nuf / kf, kf, nuf));
+    }
+    if k == 2 {
+        return Ok(fisher_snedecor_sf(
+            (0.5 * t).exp_m1() * (nuf - d + 1.0) / d,
+            2.0 * d,
+            2.0 * (nuf - d + 1.0),
+        ));
+    }
+    if dims == 2 {
+        return Ok(fisher_snedecor_sf(
+            (0.5 * t).exp_m1() * (nuf - 1.0) / kf,
+            2.0 * kf,
+            2.0 * (nuf - 1.0),
+        ));
+    }
+    let law = WilksLaw::new(dims, k, nu);
+    match law.half_beta_shape {
+        None => Ok(hypoexponential_survival(&law.rates, t)),
+        Some(shape) => hypoexponential_log_beta_half_survival(&law.rates, shape, t),
+    }
+}
+
+/// The null law of `−ln Λ(D, ν, k)` as an independent sum `H + L`: `H` a sum
+/// of exponentials with `rates`, and `L = −ln Beta(c, ½)` when
+/// `half_beta_shape = Some(c)`, which is exactly when `D` and `k` are both
+/// odd. With `a_i = (ν − i + 1)/2`:
+///
+/// - `k` even: `−ln Beta(a, m) = Σ_{j<m} Exp(a + j)` for integer `m` (the
+///   Mellin transforms agree: `E[Bˢ] = Π_{j<m} (a + j)/(a + j + s)`), so the
+///   rates are `a_i + j`, `i = 1..D`, `j < k/2`.
+/// - `k` odd: consecutive factors pair by Legendre duplication,
+///   `Beta(α + ½, β)·Beta(α, β) = Beta(2α, 2β)²` in law, so with `α = a_{2l}`,
+///   `β = k/2` each pair is `2·(−ln Beta(2a_{2l}, k)) = Σ_{j<k} Exp(a_{2l} + j/2)`.
+///   An odd `D` leaves `Beta(a_D, m + ½)`, `m = (k − 1)/2`, unpaired; the
+///   product rule `Beta(α, β)·Beta(α + β, γ) = Beta(α, β + γ)` in law splits
+///   it into `Beta(a_D, m)`, rates `a_D + j` for `j < m`, and `Beta(a_D + m, ½)`.
+struct WilksLaw {
+    rates: Vec<f64>,
+    half_beta_shape: Option<f64>,
+}
+
+impl WilksLaw {
+    fn new(dims: usize, k: usize, nu: usize) -> Self {
+        let a = |i: usize| (nu as f64 - i as f64 + 1.0) / 2.0;
+        if k % 2 == 0 {
+            return Self {
+                rates: (1..=dims)
+                    .flat_map(|i| (0..k / 2).map(move |j| a(i) + j as f64))
+                    .collect(),
+                half_beta_shape: None,
+            };
         }
-        None => Array1::<f64>::ones(m),
+        let mut rates: Vec<f64> = (1..=dims / 2)
+            .flat_map(|l| (0..k).map(move |j| a(2 * l) + 0.5 * j as f64))
+            .collect();
+        if dims % 2 == 0 {
+            return Self {
+                rates,
+                half_beta_shape: None,
+            };
+        }
+        let half_rank = (k - 1) / 2;
+        rates.extend((0..half_rank).map(|j| a(dims) + j as f64));
+        Self {
+            rates,
+            half_beta_shape: Some(a(dims) + half_rank as f64),
+        }
+    }
+}
+
+/// Gauss–Legendre order of each panel rule in
+/// [`hypoexponential_log_beta_half_survival`].
+const CONVOLUTION_PANEL_ORDER: usize = 16;
+
+/// Panel count at which [`hypoexponential_log_beta_half_survival`] refuses
+/// instead of returning an unconverged value.
+const CONVOLUTION_MAX_PANELS: usize = 1 << 12;
+
+/// One panel `[left, right]` of the convolution integral, priced by the panel
+/// rule on the panel and on its two halves. The halves' sum is kept; the
+/// difference is its indicator.
+struct ConvolutionPanel {
+    left: f64,
+    right: f64,
+    mass: f64,
+    gap: f64,
+}
+
+/// `P(H + L > t)` for independent `H = Σ_i Exp(rates[i])` (`rates` not empty)
+/// and `L = −ln B`, `B ~ Beta(c, ½)`.
+///
+/// Conditioning on `L`: `P(H + L > t) = P(L > t) + E[S_H(t − L); L ≤ t]`,
+/// with `P(L > t) = I_{e^{−t}}(c, ½)` and `S_H` the survival
+/// [`hypoexponential_survival`] evaluates. `L` has density
+/// `e^{−cs}(1 − e^{−s})^{−½}/B(c, ½)`, whose `s^{−½}` endpoint the substitution
+/// `s = r²` removes:
+///
+/// ```text
+/// E[S_H(t − L); L ≤ t] = (2/B(c, ½)) ∫_0^{√t} e^{−c r²} (r²/(1 − e^{−r²}))^{½} S_H(t − r²) dr.
+/// ```
+///
+/// `S_H` is entire (exponentials times polynomials) and `r²/(1 − e^{−r²})` is
+/// analytic on the real line, so the integrand is analytic on the closed
+/// interval, and it is positive, so the quadrature sums without cancellation.
+/// Every factor is a combination of `e^{±λ r²}` with `λ` at most `q`, the
+/// largest of `c` and the rates, so the first panels are at most `1/√q` wide and
+/// already resolve each factor at `r = 0`. Each panel carries the 16-point
+/// rule on its two halves, with the difference from the whole-panel rule as
+/// its indicator. For an integrand analytic around a panel, halving the panel
+/// scales the rule's error by roughly `2^{−32}`, so indicators summing below
+/// `√ε` of the survival leave an error far below `ε` of it. The panel with the
+/// largest indicator is bisected until then; exhausting
+/// [`CONVOLUTION_MAX_PANELS`] is a refusal, not a value. When the Chernoff
+/// bound `e^{−θt}·Π r_i/(r_i − θ)·B(c − θ, ½)/B(c, ½)`, at
+/// `θ = max(0, ρ − (R + 1)/t)` with `ρ` the smallest of `c` and the rates and
+/// `R` the rate count, underflows, the survival is below every positive double
+/// and is 0.
+fn hypoexponential_log_beta_half_survival(
+    rates: &[f64],
+    shape: f64,
+    t: f64,
+) -> Result<f64, String> {
+    if !(t > 0.0) {
+        return Ok(1.0);
+    }
+    if t == f64::INFINITY {
+        return Ok(0.0);
+    }
+    let log_beta = ln_beta(shape, 0.5);
+    let floor = rates.iter().fold(shape, |acc, &r| acc.min(r));
+    let theta = (floor - (rates.len() as f64 + 1.0) / t).max(0.0);
+    let log_bound = -theta * t - rates.iter().map(|&r| (-theta / r).ln_1p()).sum::<f64>()
+        + ln_beta(shape - theta, 0.5)
+        - log_beta;
+    if log_bound.exp() == 0.0 {
+        return Ok(0.0);
+    }
+    let tail = ln_regularized_beta_lower_from_log_x(-t, shape, 0.5).exp();
+    let log_scale = std::f64::consts::LN_2 - log_beta;
+    let integrand = |r: f64| {
+        let s = r * r;
+        let jacobian = if s == 0.0 {
+            1.0
+        } else {
+            (-s / (-s).exp_m1()).sqrt()
+        };
+        (log_scale - shape * s).exp() * jacobian * hypoexponential_survival(rates, t - s)
     };
-    let norm_sq: f64 = u.dot(&u);
-    let mut p = Array2::<f64>::eye(m);
-    if norm_sq > 0.0 {
-        for i in 0..m {
-            for j in 0..m {
-                p[[i, j]] -= u[i] * u[j] / norm_sq;
+    let (nodes, weights) = gauss_legendre(CONVOLUTION_PANEL_ORDER);
+    let rule = |left: f64, right: f64| {
+        let centre = 0.5 * (left + right);
+        let half = 0.5 * (right - left);
+        half * nodes
+            .iter()
+            .zip(&weights)
+            .map(|(node, weight)| weight * integrand(centre + half * node))
+            .sum::<f64>()
+    };
+    let priced = |left: f64, right: f64| -> Result<ConvolutionPanel, String> {
+        let middle = 0.5 * (left + right);
+        if !(middle > left && middle < right) {
+            return Err(format!(
+                "Wilks survival: convolution panel [{left}, {right}] cannot be halved at \
+                 t={t}, c={shape}"
+            ));
+        }
+        let mass = rule(left, middle) + rule(middle, right);
+        Ok(ConvolutionPanel {
+            left,
+            right,
+            mass,
+            gap: (rule(left, right) - mass).abs(),
+        })
+    };
+    let upper = t.sqrt();
+    let fastest = rates.iter().fold(shape, |acc, &r| acc.max(r));
+    // Equal panels no wider than `1/√q`, the last ending exactly at `√t`.
+    let count = (upper * fastest.sqrt()).ceil().max(1.0) as usize;
+    let cut = |i: usize| upper * i as f64 / count as f64;
+    let mut panels = (0..count)
+        .map(|i| priced(cut(i), cut(i + 1)))
+        .collect::<Result<Vec<_>, _>>()?;
+    loop {
+        let survival = tail + panels.iter().map(|panel| panel.mass).sum::<f64>();
+        let gap: f64 = panels.iter().map(|panel| panel.gap).sum();
+        if !survival.is_finite() {
+            return Err(format!(
+                "Wilks survival: non-finite convolution {survival} at t={t}, c={shape}"
+            ));
+        }
+        if gap <= f64::EPSILON.sqrt() * survival {
+            return Ok(survival);
+        }
+        if panels.len() >= CONVOLUTION_MAX_PANELS {
+            return Err(format!(
+                "Wilks survival did not converge within {CONVOLUTION_MAX_PANELS} panels at \
+                 t={t}, c={shape}: relative indicator {:.3e}",
+                gap / survival
+            ));
+        }
+        let mut worst = 0;
+        for (index, panel) in panels.iter().enumerate() {
+            if panel.gap > panels[worst].gap {
+                worst = index;
             }
         }
+        let panel = panels.swap_remove(worst);
+        let middle = 0.5 * (panel.left + panel.right);
+        panels.push(priced(panel.left, middle)?);
+        panels.push(priced(middle, panel.right)?);
     }
-    Ok(p)
 }
 
-/// `K = P₁ ⊗ P₂` under the row-major vec convention
-/// (`vec(A X B)[a·M₂+c] = Σ A[a,j]·B[k,c]·vec(X)[j·M₂+k]`; `P₂`
-/// symmetric) — the coefficient-space transform realizing the gauge
-/// projection `C ↦ P₁ C P₂` on row-major vecs. Built once per carve and
-/// shared by the per-dimension and joint Wald tests.
-fn gauge_kron_rowmajor(proj_a: &Array2<f64>, proj_b: &Array2<f64>) -> Array2<f64> {
-    let m1 = proj_a.nrows();
-    let m2 = proj_b.nrows();
-    let mm = m1 * m2;
-    let mut kron = Array2::<f64>::zeros((mm, mm));
-    for a in 0..m1 {
-        for j in 0..m1 {
-            let pa = proj_a[[a, j]];
-            if pa == 0.0 {
-                continue;
-            }
-            for cc in 0..m2 {
-                for k in 0..m2 {
-                    kron[[a * m2 + cc, j * m2 + k]] = pa * proj_b[[k, cc]];
-                }
+/// `P(Σ_i X_i > t)` for independent `X_i ~ Exp(rates[i])`, by uniformization:
+/// the sum is the absorption time of the chain that leaves phase `i` at rate
+/// `rates[i]`, so with `q = max rate` the survival is
+/// `Σ_s Poisson(s; qt)·m_s`, `m_s` the chance that `s` jumps of the discrete
+/// chain (stay in `i` w.p. `1 − r_i/q`, advance w.p. `r_i/q`) leave it
+/// unabsorbed. Every term is positive, so the sum has no cancellation, and
+/// it is carried in logarithms so no term underflows before it matters. `m_s`
+/// is non-increasing, so once `s + 2 > qt` the unsummed tail is at most
+/// `m_s·w_{s+1}/(1 − qt/(s + 2))` (a geometric bound on the Poisson weights
+/// `w`); the sum stops when that is below one rounding unit of the total.
+/// When the Chernoff bound `e^{−θt}·Π r_i/(r_i − θ)`, at `θ = max(0, r_min −
+/// R/t)`, underflows, the survival is below every positive double and is 0.
+fn hypoexponential_survival(rates: &[f64], t: f64) -> f64 {
+    if !(t > 0.0) {
+        return 1.0;
+    }
+    if t == f64::INFINITY {
+        return 0.0;
+    }
+    let count = rates.len() as f64;
+    let r_min = rates.iter().fold(f64::INFINITY, |acc, &r| acc.min(r));
+    let q = rates.iter().fold(0.0_f64, |acc, &r| acc.max(r));
+    let theta = (r_min - count / t).max(0.0);
+    let log_bound = -theta * t - rates.iter().map(|&r| (-theta / r).ln_1p()).sum::<f64>();
+    if log_bound.exp() == 0.0 {
+        return 0.0;
+    }
+    let qt = q * t;
+    let ln_qt = qt.ln();
+    let stay: Vec<f64> = rates.iter().map(|&r| 1.0 - r / q).collect();
+    let advance: Vec<f64> = rates.iter().map(|&r| r / q).collect();
+    let mut phase = vec![0.0_f64; rates.len()];
+    phase[0] = 1.0;
+    let mut next = vec![0.0_f64; rates.len()];
+    let mut log_mass = 0.0_f64;
+    let mut log_weight = -qt;
+    let mut log_sum = -qt;
+    let mut step = 0usize;
+    loop {
+        let s = step as f64;
+        if s + 2.0 > qt {
+            let log_tail =
+                log_mass + log_weight + ln_qt - (s + 1.0).ln() - (-qt / (s + 2.0)).ln_1p();
+            if log_tail <= f64::EPSILON.ln() + log_sum {
+                break;
             }
         }
+        next[0] = phase[0] * stay[0];
+        for i in 1..rates.len() {
+            next[i] = phase[i] * stay[i] + phase[i - 1] * advance[i - 1];
+        }
+        let total: f64 = next.iter().sum();
+        if total == 0.0 {
+            break;
+        }
+        log_mass += total.ln();
+        for (slot, &value) in phase.iter_mut().zip(next.iter()) {
+            *slot = value / total;
+        }
+        step += 1;
+        log_weight += ln_qt - (step as f64).ln();
+        log_sum = log_add(log_sum, log_weight + log_mass);
     }
-    kron
+    log_sum.exp()
 }
 
-/// Wald test of `f₁₂ ≡ 0` for one output dimension: transform the raw
-/// interaction coefficients to the gauge quotient (`z = vec(P₁ C P₂)`,
-/// row-major; `Σ_z = K Σ Kᵀ` with `K = P₁ ⊗ P₂`) and hand the projected
-/// block to [`wood_smooth_test`] at the quotient rank. Returns `None`
-/// when the test degenerates (the caller records "not tested", which is
-/// not "additive").
-fn binding_wald_test(
-    c: &Array2<f64>,
-    cov: &Array2<f64>,
-    proj_a: &Array2<f64>,
-    proj_b: &Array2<f64>,
-    gauge_kron: &Array2<f64>,
-    edf: Option<f64>,
-    residual_df: f64,
-    scale: SmoothTestScale,
-) -> Option<SmoothTestResult> {
-    let (m1, m2) = c.dim();
-    let mm = m1 * m2;
-    if cov.dim() != (mm, mm) {
-        return None;
+/// `ln(eᵃ + eᵇ)`.
+fn log_add(a: f64, b: f64) -> f64 {
+    if a == f64::NEG_INFINITY {
+        return b;
     }
-    // z = vec(P₁ C P₂), row-major.
-    let projected = proj_a.dot(c).dot(proj_b);
-    let mut z = Array1::<f64>::zeros(mm);
-    for j in 0..m1 {
-        for k in 0..m2 {
-            z[j * m2 + k] = projected[[j, k]];
-        }
+    if b == f64::NEG_INFINITY {
+        return a;
     }
-    let cov_z = gauge_kron.dot(cov).dot(&gauge_kron.t());
-    let quotient_rank = ((m1.saturating_sub(1)) * (m2.saturating_sub(1))).max(1) as f64;
-    let edf = edf.unwrap_or(quotient_rank).min(quotient_rank);
-    wood_smooth_test(SmoothTestInput {
-        beta: z.view(),
-        covariance: &cov_z,
-        influence_matrix: None,
-        whitening_gram: None,
-        coeff_range: 0..mm,
-        edf,
-        nullspace_dim: 0,
-        residual_df: Some(residual_df),
-        scale,
-    })
-}
-
-/// ONE Wald test of `f₁₂ ≡ 0 across all output dimensions jointly` (#993
-/// item 4): stack the gauge-projected interaction vecs dimension-major,
-/// transform the supplied joint covariance by the block-diagonal
-/// `I_D ⊗ K`, and test at the joint quotient rank `D·(M₁−1)(M₂−1)`. This
-/// replaces the Bonferroni combination exactly where Bonferroni is
-/// loosest — strongly cross-correlated output dimensions (they share
-/// every code row).
-fn joint_binding_wald_test(
-    coeffs: &[Array2<f64>],
-    joint_cov: &Array2<f64>,
-    proj_a: &Array2<f64>,
-    proj_b: &Array2<f64>,
-    gauge_kron: &Array2<f64>,
-    edf: Option<f64>,
-    residual_df: f64,
-    scale: SmoothTestScale,
-) -> Option<SmoothTestResult> {
-    let d_dims = coeffs.len();
-    if d_dims == 0 {
-        return None;
-    }
-    let (m1, m2) = coeffs[0].dim();
-    let mm = m1 * m2;
-    let total = d_dims * mm;
-    if joint_cov.dim() != (total, total) {
-        return None;
-    }
-    // Stacked z: dimension-major [vec(P₁C₀P₂); vec(P₁C₁P₂); …].
-    let mut z = Array1::<f64>::zeros(total);
-    for (d, c) in coeffs.iter().enumerate() {
-        let projected = proj_a.dot(c).dot(proj_b);
-        for j in 0..m1 {
-            for k in 0..m2 {
-                z[d * mm + j * m2 + k] = projected[[j, k]];
-            }
-        }
-    }
-    // Σ_z = (I_D ⊗ K) · J · (I_D ⊗ K)ᵀ, computed blockwise.
-    let mut cov_z = Array2::<f64>::zeros((total, total));
-    for d in 0..d_dims {
-        for e in 0..d_dims {
-            let block = joint_cov.slice(s![d * mm..(d + 1) * mm, e * mm..(e + 1) * mm]);
-            let transformed = gauge_kron.dot(&block).dot(&gauge_kron.t());
-            cov_z
-                .slice_mut(s![d * mm..(d + 1) * mm, e * mm..(e + 1) * mm])
-                .assign(&transformed);
-        }
-    }
-    let quotient_rank = ((m1.saturating_sub(1)) * (m2.saturating_sub(1))).max(1) as f64;
-    let per_dim_edf = edf.unwrap_or(quotient_rank).min(quotient_rank);
-    wood_smooth_test(SmoothTestInput {
-        beta: z.view(),
-        covariance: &cov_z,
-        influence_matrix: None,
-        whitening_gram: None,
-        coeff_range: 0..total,
-        edf: per_dim_edf * d_dims as f64,
-        nullspace_dim: 0,
-        residual_df: Some(residual_df),
-        scale,
-    })
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    hi + (lo - hi).exp().ln_1p()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use ndarray::array;
+    use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
 
     /// A tiny partition-of-unity "hat" basis on a 3-point sample: rows sum
     /// to 1, columns are linearly independent over the sample.
@@ -1447,12 +1887,12 @@ mod tests {
         }
     }
 
-    /// A planted BOUND surface (rank-1 centered interaction) must refuse
-    /// to fission, and with a tight posterior the binding test must reject;
-    /// the planted additive surface under the same covariance must NOT
-    /// reject — the asymmetry that makes the test a test.
+    /// Coefficients alone carry no sampling evidence: a planted BOUND matrix
+    /// is kept whole with the edge test reported as not run, and the planted
+    /// additive matrix under the same covariance still splits, its interaction
+    /// being inside the resolution bound.
     #[test]
-    fn planted_bound_torus_refuses_and_test_rejects() {
+    fn planted_bound_coefficients_refuse_fission_without_a_test() {
         let phi_a = pou_basis();
         let phi_b = pou_basis_b();
         // Centered directions (orthogonal to the PoU kernel = ones).
@@ -1464,7 +1904,6 @@ mod tests {
                 c[[j, k]] = 2.0 * at[j] * bt[k];
             }
         }
-        // Tight scale-included posterior: σ² = 1e-4 per coefficient.
         let cov = Array2::<f64>::eye(9) * 1e-4;
         let input = CarveInput {
             phi_a: phi_a.view(),
@@ -1473,20 +1912,21 @@ mod tests {
             coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: 100.0,
-            scale: SmoothTestScale::Known,
+            interaction_test: None,
             notion: BindingNotion::Representational,
         };
         let report = carve(&input, 0.05).expect("carve");
         assert!(report.fission.is_none(), "bound surface must not fission");
         assert!(report.interaction_fraction > 0.1);
-        let p = report.edge_p_value.expect("test ran");
-        assert!(p < 1e-6, "strong planted binding must reject, p = {p}");
+        assert_eq!(
+            report.edge_p_value(),
+            Err(BindingTestUnavailable::NoStatistics)
+        );
+        assert_eq!(
+            report.binding_tests,
+            vec![Err(BindingTestUnavailable::NoStatistics)]
+        );
 
-        // The additive surface, same covariance: no rejection.
         let a = array![1.0, -0.5, 2.0];
         let b = array![0.3, 1.7, -1.0];
         let mut c_add = Array2::<f64>::zeros((3, 3));
@@ -1502,31 +1942,20 @@ mod tests {
             coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: 100.0,
-            scale: SmoothTestScale::Known,
+            interaction_test: None,
             notion: BindingNotion::Representational,
         };
         let report_add = carve(&input_add, 0.05).expect("carve");
-        let p_add = report_add.edge_p_value.expect("test ran");
-        assert!(
-            p_add > 0.99,
-            "additive surface carries zero projected interaction, p = {p_add}"
-        );
         assert!(report_add.fission.is_some());
     }
 
-    /// The gauge directions (`u vᵀ + w uᵀ`) contribute NOTHING to the test
-    /// statistic: adding them to a planted-additive coefficient matrix
-    /// leaves the projected interaction (and hence the p-value) unchanged.
+    /// The gauge directions (`u vᵀ + w uᵀ`) carry no interaction: on a PoU
+    /// basis they ARE `f₁ + f₂`, so the centered interaction values vanish.
     #[test]
-    fn gauge_directions_do_not_enter_the_binding_test() {
+    fn gauge_directions_carry_no_interaction() {
         let phi_a = pou_basis();
         let phi_b = pou_basis_b();
         let mut c = Array2::<f64>::zeros((3, 3));
-        // Pure gauge: u vᵀ + w uᵀ with u = ones.
         let v = array![0.4, -1.2, 0.7];
         let w = array![-0.9, 0.1, 0.5];
         for j in 0..3 {
@@ -1542,36 +1971,45 @@ mod tests {
             coeff_band: &[0.0],
             coeff_covariance: Some(std::slice::from_ref(&cov)),
             joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: 100.0,
-            scale: SmoothTestScale::Known,
+            interaction_test: None,
             notion: BindingNotion::Representational,
         };
         let report = carve(&input, 0.05).expect("carve");
-        // u vᵀ + w uᵀ IS additive (it is f₁ + f₂ on a PoU basis), so the
-        // projected interaction is exactly zero.
         assert!(report.interaction_fraction < 1e-24);
-        let p = report.edge_p_value.expect("test ran");
-        assert!(p > 0.99, "pure-gauge coefficients must not reject, p = {p}");
+        assert!(report.fission.is_some());
     }
 
     /// A deterministic Bernstein (degree-2, partition-of-unity) basis
     /// evaluated on `n` scattered points, with two decorrelated sample
     /// mappings so the tensor design is well-conditioned.
     fn bernstein_pair(n: usize) -> (Array2<f64>, Array2<f64>) {
-        let mut phi_a = Array2::<f64>::zeros((n, 3));
-        let mut phi_b = Array2::<f64>::zeros((n, 3));
+        bernstein_factors(n, 2, 2)
+    }
+
+    /// Bernstein bases of degrees `degree_a` and `degree_b` (partition of
+    /// unity, `degree + 1` columns) on the two decorrelated sample mappings of
+    /// [`bernstein_pair`].
+    fn bernstein_factors(n: usize, degree_a: usize, degree_b: usize) -> (Array2<f64>, Array2<f64>) {
+        let bernstein = |degree: usize, x: f64| -> Vec<f64> {
+            (0..=degree)
+                .map(|j| {
+                    let binomial =
+                        (0..j).fold(1.0, |acc, i| acc * (degree - i) as f64 / (i + 1) as f64);
+                    binomial * x.powi(j as i32) * (1.0 - x).powi((degree - j) as i32)
+                })
+                .collect()
+        };
+        let mut phi_a = Array2::<f64>::zeros((n, degree_a + 1));
+        let mut phi_b = Array2::<f64>::zeros((n, degree_b + 1));
         for t in 0..n {
             let x = t as f64 / (n - 1) as f64;
             let z = ((t * 17) % n) as f64 / (n - 1) as f64;
-            phi_a[[t, 0]] = (1.0 - x) * (1.0 - x);
-            phi_a[[t, 1]] = 2.0 * x * (1.0 - x);
-            phi_a[[t, 2]] = x * x;
-            phi_b[[t, 0]] = (1.0 - z) * (1.0 - z);
-            phi_b[[t, 1]] = 2.0 * z * (1.0 - z);
-            phi_b[[t, 2]] = z * z;
+            for (j, value) in bernstein(degree_a, x).into_iter().enumerate() {
+                phi_a[[t, j]] = value;
+            }
+            for (k, value) in bernstein(degree_b, z).into_iter().enumerate() {
+                phi_b[[t, k]] = value;
+            }
         }
         (phi_a, phi_b)
     }
@@ -1585,10 +2023,393 @@ mod tests {
         y
     }
 
+    fn standard_normal(rng: &mut StdRng) -> f64 {
+        let u1 = 1.0 - rng.random::<f64>();
+        let u2 = rng.random::<f64>();
+        (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos()
+    }
+
+    /// Kolmogorov–Smirnov `p` of `p_values` against `U(0, 1)`: the asymptotic
+    /// Kolmogorov tail at Stephens' finite-sample-corrected statistic.
+    fn kolmogorov_smirnov_uniform_p_value(p_values: &[f64]) -> f64 {
+        let mut sorted = p_values.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let count = sorted.len() as f64;
+        let distance = sorted
+            .iter()
+            .enumerate()
+            .map(|(index, &value)| {
+                let above = (index as f64 + 1.0) / count - value;
+                let below = value - index as f64 / count;
+                above.max(below)
+            })
+            .fold(0.0_f64, f64::max);
+        let root = count.sqrt();
+        let scaled = distance * (root + 0.12 + 0.11 / root);
+        // `Q(t) = 2 Σ_{k≥1} (−1)^{k−1} e^{−2k²t²}`, summed until a term no longer
+        // moves the partial sum.
+        let mut tail = 0.0_f64;
+        let mut k = 1.0_f64;
+        loop {
+            let term = 2.0 * (-2.0 * k * k * scaled * scaled).exp();
+            let signed = if (k as u64) % 2 == 1 { term } else { -term };
+            if tail + signed == tail {
+                break;
+            }
+            tail += signed;
+            k += 1.0;
+        }
+        tail.clamp(0.0, 1.0)
+    }
+
+    /// Hold null p-values to `U(0, 1)` in BOTH directions: a two-sided
+    /// Kolmogorov–Smirnov test over the whole range, and the empirical size at
+    /// each conventional level within 3.5 Monte Carlo standard errors of that
+    /// level. A conservative p-value — sizes below nominal, mass piled near
+    /// `p = 1` — fails here exactly as an anti-conservative one does.
+    fn assert_uniform(p_values: &[f64], label: &str) {
+        assert!(
+            p_values.iter().all(|value| (0.0..=1.0).contains(value)),
+            "{label}: p-values outside [0, 1]"
+        );
+        let count = p_values.len() as f64;
+        let ks = kolmogorov_smirnov_uniform_p_value(p_values);
+        assert!(
+            ks > 1e-3,
+            "{label}: KS p = {ks:.3e} against U(0,1) over {count} replicates"
+        );
+        for level in [0.01, 0.05, 0.10, 0.20] {
+            let size = p_values.iter().filter(|&&value| value <= level).count() as f64 / count;
+            let standard_error = (level * (1.0 - level) / count).sqrt();
+            assert!(
+                (size - level).abs() <= 3.5 * standard_error,
+                "{label}: size {size:.4} at level {level} is {:+.1} Monte Carlo SE from nominal",
+                (size - level) / standard_error
+            );
+        }
+    }
+
+    /// Seeded null calibration of the per-dimension F test and of the edge
+    /// test (#3182). Responses are an additive surface plus rows of
+    /// CORRELATED Gaussian noise (`N(0, LLᵀ)`), so the null is true and the
+    /// edge statistic has to handle the cross-dimension dependence exactly.
+    /// Each configuration exercises one branch of the edge's null law, and
+    /// each asserts the configuration's rank so the branch is the one named.
+    fn assert_null_calibration(
+        degree_a: usize,
+        degree_b: usize,
+        dims: usize,
+        expected_rank: usize,
+        seed: u64,
+        label: &str,
+    ) {
+        let n = 40usize;
+        let replicates = 2000usize;
+        let (phi_a, phi_b) = bernstein_factors(n, degree_a, degree_b);
+        let (m1, m2) = (degree_a + 1, degree_b + 1);
+        let mut rng = StdRng::seed_from_u64(seed);
+        // Additive mean: c[j,k] = a_d[j] + b_d[k].
+        let mut mean = Array2::<f64>::zeros((n, dims));
+        for d in 0..dims {
+            let mut c = Array2::<f64>::zeros((m1, m2));
+            for j in 0..m1 {
+                for k in 0..m2 {
+                    c[[j, k]] = (1.0 + d as f64) * (j as f64 - 0.7) + (0.5 - k as f64) * 0.3;
+                }
+            }
+            mean.column_mut(d)
+                .assign(&surface_values(&phi_a, &phi_b, &c));
+        }
+        // Lower-triangular noise factor with unit diagonal and 0.6 couplings.
+        let mut factor = Array2::<f64>::eye(dims);
+        for d in 0..dims {
+            for e in 0..d {
+                factor[[d, e]] = 0.6;
+            }
+        }
+        let mut edge_p = Vec::with_capacity(replicates);
+        let mut first_dim_p = Vec::with_capacity(replicates);
+        for _ in 0..replicates {
+            let mut noise = Array2::<f64>::zeros((n, dims));
+            noise.mapv_inplace(|_| standard_normal(&mut rng));
+            let responses = &mean + &noise.dot(&factor.t());
+            let test = InteractionTest::from_sample(phi_a.view(), phi_b.view(), responses.view())
+                .expect("interaction test");
+            assert_eq!(
+                test.interaction_rank, expected_rank,
+                "{label}: interaction rank"
+            );
+            assert_eq!(test.residual_df, n - m1 * m2, "{label}: residual d.f.");
+            first_dim_p.push(test.per_dimension[0].expect("per-dimension test").p_value);
+            edge_p.push(test.edge.expect("edge test").p_value());
+        }
+        assert_uniform(&first_dim_p, &format!("{label}, per-dimension F"));
+        assert_uniform(&edge_p, &format!("{label}, edge"));
+    }
+
+    /// `k = 4`, `D = 3`: the even-`k` exponential decomposition of Wilks' `Λ`.
+    #[test]
+    fn interaction_test_is_calibrated_even_rank() {
+        assert_null_calibration(2, 2, 3, 4, 0x3182_0001, "k=4, D=3");
+    }
+
+    /// `k = 3`, `D = 4`: the duplication pairing of an even number of outputs.
+    #[test]
+    fn interaction_test_is_calibrated_even_outputs_odd_rank() {
+        assert_null_calibration(1, 3, 4, 3, 0x3182_0002, "k=3, D=4");
+    }
+
+    /// `k = 4`, `D = 2`: Rao's exact F transform.
+    #[test]
+    fn interaction_test_is_calibrated_two_outputs() {
+        assert_null_calibration(2, 2, 2, 4, 0x3182_0003, "k=4, D=2");
+    }
+
+    /// `k = 1`, `D = 3`: Hotelling's exact F transform.
+    #[test]
+    fn interaction_test_is_calibrated_rank_one() {
+        assert_null_calibration(1, 1, 3, 1, 0x3182_0004, "k=1, D=3");
+    }
+
+    /// `k = 3`, `D = 3` (#3423): one pair plus the unpaired half-integer Beta
+    /// factor, through the certified convolution.
+    #[test]
+    fn interaction_test_is_calibrated_odd_outputs_odd_rank() {
+        assert_null_calibration(1, 3, 3, 3, 0x3423_0001, "k=3, D=3");
+    }
+
+    /// `k = 3`, `D = 5` (#3423): two pairs plus the unpaired factor.
+    #[test]
+    fn interaction_test_is_calibrated_five_outputs_odd_rank() {
+        assert_null_calibration(1, 3, 5, 3, 0x3423_0002, "k=3, D=5");
+    }
+
+    /// The test reads only `span W` and `span F`: mixing either factor basis by
+    /// an invertible map changes neither the rank nor any statistic.
+    #[test]
+    fn interaction_test_is_invariant_to_factor_reparameterization() {
+        let n = 40usize;
+        let (phi_a, phi_b) = bernstein_pair(n);
+        let mut c = Array2::<f64>::zeros((3, 3));
+        for j in 0..3 {
+            for k in 0..3 {
+                c[[j, k]] = (j as f64 - 1.0) * (k as f64 - 0.5) + 0.3 * j as f64;
+            }
+        }
+        let y = surface_values(&phi_a, &phi_b, &c);
+        let mut responses = Array2::<f64>::zeros((n, 2));
+        for t in 0..n {
+            responses[[t, 0]] = y[t] + 0.2 * (1.3 * t as f64).sin();
+            responses[[t, 1]] = -y[t] + 0.2 * (2.1 * t as f64).cos();
+        }
+        let mix_a = array![[1.0, 0.5, -0.2], [0.0, 2.0, 0.3], [0.4, 0.0, 1.5]];
+        let mix_b = array![[0.7, 0.0, 0.0], [1.1, 1.0, 0.0], [-0.3, 0.2, 3.0]];
+        let original = InteractionTest::from_sample(phi_a.view(), phi_b.view(), responses.view())
+            .expect("test");
+        let mixed = InteractionTest::from_sample(
+            phi_a.dot(&mix_a).view(),
+            phi_b.dot(&mix_b).view(),
+            responses.view(),
+        )
+        .expect("test");
+        assert_eq!(original.interaction_rank, 4);
+        assert_eq!(mixed.interaction_rank, 4);
+        assert_eq!(original.residual_df, mixed.residual_df);
+        let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(b.abs());
+        for (lhs, rhs) in original
+            .per_dimension
+            .iter()
+            .zip(mixed.per_dimension.iter())
+        {
+            let (lhs, rhs) = (lhs.expect("test"), rhs.expect("test"));
+            assert!(close(lhs.statistic, rhs.statistic), "{lhs:?} vs {rhs:?}");
+            assert!(close(lhs.p_value, rhs.p_value), "{lhs:?} vs {rhs:?}");
+        }
+        let (lhs, rhs) = (original.edge.expect("edge"), mixed.edge.expect("edge"));
+        assert!(close(lhs.p_value(), rhs.p_value()), "{lhs:?} vs {rhs:?}");
+    }
+
+    /// The rates of a Wilks law that is a pure sum of exponentials.
+    fn exponential_rates(dims: usize, k: usize, nu: usize) -> Vec<f64> {
+        let law = WilksLaw::new(dims, k, nu);
+        assert!(
+            law.half_beta_shape.is_none(),
+            "Λ({dims}, {nu}, {k}) is not a pure exponential sum"
+        );
+        law.rates
+    }
+
+    /// `hypoexponential_survival` against closed forms. Each exponential law
+    /// below equals a Beta or F law exactly, so the two evaluations may differ
+    /// only by rounding: the uniformization sums at most a few hundred positive
+    /// terms, each a product of as many correctly rounded factors, and the
+    /// regularized incomplete beta is accurate to a few ulps, so `1e-11` holds
+    /// with two orders of margin over `steps·ε`.
+    #[test]
+    fn hypoexponential_survival_matches_closed_forms() {
+        let close = |a: f64, b: f64, label: &str| {
+            assert!(
+                (a - b).abs() <= 1e-11 * a.abs().max(b.abs()),
+                "{label}: {a:e} vs {b:e}"
+            )
+        };
+        for &t in &[0.02, 0.3, 1.0, 2.5, 6.0] {
+            // One rate, and Erlang(2).
+            close(hypoexponential_survival(&[1.7], t), (-1.7 * t).exp(), "Exp");
+            close(
+                hypoexponential_survival(&[0.9, 0.9], t),
+                (-0.9 * t).exp() * (1.0 + 0.9 * t),
+                "Erlang",
+            );
+            let nu = 23usize;
+            let nuf = nu as f64;
+            let scale = t / 4.0;
+            // D = 1, k = 6: F(6, ν) through 1/Λ − 1.
+            let rates = exponential_rates(1, 6, nu);
+            close(
+                hypoexponential_survival(&rates, scale),
+                fisher_snedecor_sf(scale.exp_m1() * nuf / 6.0, 6.0, nuf),
+                "D=1",
+            );
+            // D = 2, k = 4: Rao through 1/√Λ − 1.
+            let rates = exponential_rates(2, 4, nu);
+            close(
+                hypoexponential_survival(&rates, scale),
+                fisher_snedecor_sf(
+                    (0.5 * scale).exp_m1() * (nuf - 1.0) / 4.0,
+                    8.0,
+                    2.0 * (nuf - 1.0),
+                ),
+                "D=2",
+            );
+            // k = 2, D = 5: the symmetric Rao line.
+            let rates = exponential_rates(5, 2, nu);
+            close(
+                hypoexponential_survival(&rates, scale),
+                fisher_snedecor_sf(
+                    (0.5 * scale).exp_m1() * (nuf - 4.0) / 5.0,
+                    10.0,
+                    2.0 * (nuf - 4.0),
+                ),
+                "k=2",
+            );
+            // k = 1, D = 4: the pairing against Hotelling's F(D, ν − D + 1).
+            let rates = exponential_rates(4, 1, nu);
+            close(
+                hypoexponential_survival(&rates, scale),
+                fisher_snedecor_sf(scale.exp_m1() * (nuf - 3.0) / 4.0, 4.0, nuf - 3.0),
+                "k=1",
+            );
+            // D = 4, k = 3 pairing against its symmetric Λ(3, ν − 1, 4), even k.
+            let paired = exponential_rates(4, 3, nu);
+            let symmetric = exponential_rates(3, 4, nu - 1);
+            close(
+                hypoexponential_survival(&paired, scale),
+                hypoexponential_survival(&symmetric, scale),
+                "symmetry",
+            );
+        }
+        assert_eq!(hypoexponential_survival(&[1.0, 2.0], 0.0), 1.0);
+        assert_eq!(hypoexponential_survival(&[1.0, 2.0], f64::INFINITY), 0.0);
+        assert_eq!(hypoexponential_survival(&[1.0, 2.0], 1e6), 0.0);
+    }
+
+    /// #3423: the convolution for odd `D` and odd `k` against laws known in
+    /// closed form. On `D = 1` (odd `k`) and on `k = 1` (odd `D`) the same
+    /// split — pairs, `Beta(a_D, m)` as exponentials, and `Beta(a_D + m, ½)`
+    /// — must reproduce Snedecor's F exactly, and `Λ(3, ν, 5)` must equal its
+    /// symmetric `Λ(5, ν + 2, 3)`, which the split decomposes differently
+    /// (one pair and `Beta(a_3, 5/2)` against two pairs and `Beta(a'_5, 3/2)`).
+    /// The quadrature's error is far below its `√ε` indicator and the
+    /// uniformization's is `steps·ε`, so `1e-10` leaves two orders of margin;
+    /// `t` reaches survivals near `1e−14`, so the upper tail is checked
+    /// relatively, not only near one.
+    #[test]
+    fn odd_wilks_convolution_matches_closed_forms_3423() {
+        let close = |a: f64, b: f64, label: &str| {
+            assert!(
+                (a - b).abs() <= 1e-10 * a.abs().max(b.abs()),
+                "{label}: {a:e} vs {b:e}"
+            )
+        };
+        let convolved = |dims: usize, k: usize, nu: usize, t: f64| {
+            let law = WilksLaw::new(dims, k, nu);
+            let shape = law.half_beta_shape.expect("odd D and odd k");
+            hypoexponential_log_beta_half_survival(&law.rates, shape, t).expect("converges")
+        };
+        let nu = 23usize;
+        let nuf = nu as f64;
+        for &t in &[0.01, 0.1, 0.5, 1.0, 2.0, 3.5] {
+            for &k in &[3usize, 5, 7] {
+                let kf = k as f64;
+                close(
+                    convolved(1, k, nu, t),
+                    fisher_snedecor_sf(t.exp_m1() * nuf / kf, kf, nuf),
+                    &format!("D=1, k={k}, t={t}"),
+                );
+            }
+            for &dims in &[3usize, 5] {
+                let d = dims as f64;
+                close(
+                    convolved(dims, 1, nu, t),
+                    fisher_snedecor_sf(t.exp_m1() * (nuf - d + 1.0) / d, d, nuf - d + 1.0),
+                    &format!("k=1, D={dims}, t={t}"),
+                );
+            }
+            close(
+                wilks_survival(t, 3, 5, nu).expect("survival"),
+                wilks_survival(t, 5, 3, nu + 2).expect("survival"),
+                &format!("symmetry, t={t}"),
+            );
+        }
+        assert!(fisher_snedecor_sf(3.5_f64.exp_m1() * nuf / 7.0, 7.0, nuf) < 1e-12);
+        assert_eq!(convolved(3, 3, nu, 0.0), 1.0);
+        assert_eq!(convolved(3, 3, nu, f64::INFINITY), 0.0);
+        assert_eq!(convolved(3, 3, nu, 1e6), 0.0);
+    }
+
+    /// #3423: the whole odd-`D`, odd-`k` law through its Mellin transform,
+    /// `E[Λˢ] = Π_i Π_{j<s} (a_i + j)/(a_i + k/2 + j)`, which is
+    /// `1 − s·∫₀^∞ e^{−st}·P(−ln Λ > t) dt` for the survival evaluated here.
+    /// The integral is taken with `t = x²` (the survival is `1 − O(x^{Dk})`
+    /// at the origin) by 16-point panels of width `1/4` up to `x = 6`, past
+    /// which `e^{−st}` is below `ε`.
+    #[test]
+    fn odd_wilks_survival_matches_its_mellin_transform_3423() {
+        let (nodes, weights) = gauss_legendre(16);
+        for &(dims, k, nu) in &[(3usize, 3usize, 20usize), (3, 5, 9), (5, 3, 12)] {
+            for s in 1..=2usize {
+                let sf = s as f64;
+                let mut integral = 0.0;
+                for panel in 0..24 {
+                    let (left, right) = (0.25 * panel as f64, 0.25 * (panel + 1) as f64);
+                    let (centre, half) = (0.5 * (left + right), 0.5 * (right - left));
+                    for (node, weight) in nodes.iter().zip(&weights) {
+                        let x = centre + half * node;
+                        let t = x * x;
+                        let survival = wilks_survival(t, dims, k, nu).expect("survival");
+                        integral += half * weight * 2.0 * x * (-sf * t).exp() * survival;
+                    }
+                }
+                let exact: f64 = (1..=dims)
+                    .flat_map(|i| {
+                        let a = (nu as f64 - i as f64 + 1.0) / 2.0;
+                        (0..s).map(move |j| (a + j as f64) / (a + 0.5 * k as f64 + j as f64))
+                    })
+                    .product();
+                let transform = 1.0 - sf * integral;
+                assert!(
+                    (transform - exact).abs() <= 1e-10 * exact,
+                    "Λ({dims}, {nu}, {k}), s={s}: {transform:e} vs {exact:e}"
+                );
+            }
+        }
+    }
+
     /// END-TO-END (#993 items 1+2+4): fit_tensor_surface recovers a
     /// planted BOUND two-dimensional surface from noisy samples, its
-    /// covariance feeds the carve, and the JOINT cross-dim Wald (via
-    /// `joint_covariance`) proves the binding while fission refuses.
+    /// covariance feeds the carve, and the joint two-output edge test (Rao's
+    /// exact F for Wilks' Λ) proves the binding while fission refuses.
     #[test]
     fn tensor_surface_fit_to_carve_proves_planted_binding_jointly() {
         let n = 40usize;
@@ -1645,15 +2466,11 @@ mod tests {
             coeff_band: &fit.coeff_band,
             coeff_covariance: Some(&fit.coeff_covariance),
             joint_coeff_covariance: Some(&joint),
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: fit.residual_df,
-            scale: SmoothTestScale::Estimated,
+            interaction_test: Some(&fit.interaction_test),
             notion: BindingNotion::Representational,
         };
         let report = carve(&input, 0.05).expect("carve");
-        let p = report.edge_p_value.expect("joint test ran");
+        let p = report.edge_p_value().expect("edge test ran");
         assert!(p < 1e-3, "planted joint binding must reject, p = {p}");
         assert!(report.fission.is_none(), "bound surface must not fission");
         assert!(report.interaction_fraction > 0.05);
@@ -1689,11 +2506,7 @@ mod tests {
             coeff_band: &fit.coeff_band,
             coeff_covariance: Some(&fit.coeff_covariance),
             joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: fit.residual_df,
-            scale: SmoothTestScale::Estimated,
+            interaction_test: Some(&fit.interaction_test),
             notion: BindingNotion::Representational,
         };
         let report = carve(&with_covariance, 0.05).expect("carve");
@@ -1701,7 +2514,7 @@ mod tests {
             report.fission.is_some(),
             "an additive surface with its covariance must split (fraction = {}, p = {:?})",
             report.interaction_fraction,
-            report.edge_p_value
+            report.edge_p_value()
         );
 
         let bare = CarveInput {
@@ -1711,11 +2524,7 @@ mod tests {
             coeff_band: &fit.coeff_band,
             coeff_covariance: None,
             joint_coeff_covariance: None,
-            kernel_a: None,
-            kernel_b: None,
-            edf: None,
-            residual_df: fit.residual_df,
-            scale: SmoothTestScale::Estimated,
+            interaction_test: Some(&fit.interaction_test),
             notion: BindingNotion::Representational,
         };
         let bare_report = carve(&bare, 0.05).expect("carve");
@@ -1736,7 +2545,7 @@ mod tests {
         let splittable = CarveReport {
             notion: BindingNotion::Representational,
             binding_tests: vec![],
-            edge_p_value: None,
+            edge_test: Err(BindingTestUnavailable::NoStatistics),
             interaction_fraction: 0.0,
             fission: Some(FissionPlan {
                 child_a: vec![],
@@ -1749,7 +2558,12 @@ mod tests {
         let comp_bound = CarveReport {
             notion: BindingNotion::Computational,
             binding_tests: vec![],
-            edge_p_value: Some(1e-9),
+            edge_test: Ok(EdgeBindingTest::SingleOutput(BindingFTest {
+                statistic: 50.0,
+                numerator_df: 4,
+                denominator_df: 31,
+                p_value: 1e-9,
+            })),
             interaction_fraction: 0.4,
             fission: None,
         };
@@ -1860,9 +2674,12 @@ mod tests {
         // The carve runs end-to-end on the producer's output.
         let report = carve(&input, 0.05).expect("carve on producer output");
         assert_eq!(report.notion, BindingNotion::Representational);
-        assert!(
-            report.edge_p_value.is_some(),
-            "binding p-value must be produced"
+        // The re-fit reproduces the decoder's surface exactly, so no residual
+        // variation is left to scale a test against: the test reports that,
+        // and the carve's resolution dial alone decides.
+        assert_eq!(
+            report.edge_test,
+            Err(BindingTestUnavailable::NoResidualVariation { dim: 0 })
         );
     }
 

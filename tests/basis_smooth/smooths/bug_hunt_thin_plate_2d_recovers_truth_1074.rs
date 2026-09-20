@@ -1,5 +1,5 @@
 //! #1074 regression (reference-free): gam's isotropic 2-D thin-plate smooth
-//! `s(x, z, bs="tp", k=10)` must RECOVER a known smooth surface after REML
+//! `s(x, z, bs="tps", k=10)` must RECOVER a known smooth surface after REML
 //! denoising — its truth-recovery RMSE must fall BELOW the observation-noise
 //! level, not sit several times above it.
 //!
@@ -108,7 +108,7 @@ fn thin_plate_2d_recovers_truth_under_noise_floor() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, z, bs=\"tp\", k=10)", &ds, &cfg).expect("gam fit");
+    let result = fit_from_formula("y ~ s(x, z, bs=\"tps\", k=10)", &ds, &cfg).expect("gam fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for a gaussian 2-D thin-plate smooth");
     };
