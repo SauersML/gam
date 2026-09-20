@@ -183,7 +183,7 @@ pub(crate) use gam::families::fit_orchestration::{
 };
 
 pub(crate) use ndarray::{
-    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, IxDyn, s,
+    Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3, ArrayView4, Axis, s,
 };
 
 pub(crate) use numpy::{
