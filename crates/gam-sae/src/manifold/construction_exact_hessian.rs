@@ -7359,6 +7359,10 @@ impl SaeManifoldTerm {
 }
 
 #[cfg(test)]
+#[path = "tests_soft_mode_quartic_3684.rs"]
+mod tests_soft_mode_quartic_3684;
+
+#[cfg(test)]
 mod test_support {
     use super::Side;
     use super::{
