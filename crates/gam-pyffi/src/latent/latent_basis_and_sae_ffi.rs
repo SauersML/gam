@@ -174,6 +174,10 @@ fn dense_fisher_gaussian_fit_to_pydict<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -456,6 +460,10 @@ fn latent_multi_output_fit_to_pydict<'py>(
     )?;
     out.set_item(
         "cache_coefficient_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
+    out.set_item(
+        "cache_data_null_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;

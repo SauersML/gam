@@ -1,5 +1,6 @@
+use gam::smooth::BoundedCoefficientPriorSpec;
 use super::{
-    BlockRole, BoundedCoefficientPriorSpec, CliError, CliFirthValidation,
+    BlockRole, CliError, CliFirthValidation,
     FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
     ResponseFamily, SavedModel, SurvivalBaselineTarget,
     SurvivalLikelihoodMode, build_survival_time_basis,

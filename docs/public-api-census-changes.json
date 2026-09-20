@@ -4807,5 +4807,30 @@
     },
     "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "8256e9b70f568d96c311c361f4724ab8589e0be2",
+    "removed": {
+      "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1
+    },
+    "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary has one owner. build_model_summary was the CLI's second summary builder (the gam_solve ModelSummary Display path); `gam summary` renders saved_model_summary's payload through gam_models::inference::summary_text::render_summary_text, the same function gamfit's Model.summary() prints. The conditional and corrected AIC the report prints come from main's gam_solve::inference::information_criteria through SummaryInformationCriteria, so nothing moved into this change.",
+    "evidence": "public_api_census.py with base 9af3c66f1b and head the merge commit refused exactly this identity (13440 -> 13441 public function declarations). After this change git grep -w finds build_model_summary only in a historical doc sentence in saved_summary.rs."
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "removed": {
+      "crates/gam-sae/src/manifold/rho.rs::seed_scaled_by_dispersion_with_sparse_policy": 1
+    },
+    "reason": "A multi-atom separable-gate seed took only max(ln φ, 0) of the dispersion shift, a clamp nothing derives, so on clean data a K > 1 seed started 1/φ times stiffer than the construction value. The clamp and its scale_sparse policy flag go: seed_scaled_by_dispersion_with_sparse_policy is removed, and every scale-coupled log-strength takes the full ln φ at every K.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3357 (fix-3233-seed-dispersion-clamp, Fixes #3233) merged as 53dfd6479c37a261096d31a5bf0763668ca8a229 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 53dfd6479c37a261096d31a5bf0763668ca8a229's own tree with --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head 53dfd6479c37a261096d31a5bf0763668ca8a229 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> 53dfd6479c37a261096d31a5bf0763668ca8a229 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "53dfd6479c37a261096d31a5bf0763668ca8a229",
+    "removed": {
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs::normal_solves": 1,
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs::retained_normals": 1
+    },
+    "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
   }
 ]
