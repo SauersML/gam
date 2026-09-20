@@ -3580,17 +3580,20 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
     requested.clamp(lo + eps, hi)
 }
 
-/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
-/// (issue #1032).
-///
-/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
-/// difference dictated by the issue: the cascade is **not** the same posterior
-/// as the Duchon/Matérn term it stands in for (a different finite basis — the
-/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
-/// the 1-D scan, which silently swaps an identical posterior, this path must
-/// only fire as an explicit alternative estimator on the structural signature
-/// the issue names, never as a transparent replacement. It returns `Some` only
-/// when ALL of the following hold:
+/// Structural signature of a residual-cascade-eligible request: the scattered
+/// radial smooth's coordinate columns and the Sobolev order it requests
+/// (before the Wendland native-window clamp). Produced by
+/// [`residual_cascade_structural_signature`]; carries no size information.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResidualCascadeSignature {
+    pub feature_cols: Vec<usize>,
+    pub requested_sobolev_order: f64,
+}
+
+/// Pure structural predicate for the O(n log n) multiresolution
+/// residual-cascade fast path (issue #1032): every eligibility guard of
+/// [`residual_cascade_fast_path`] EXCEPT the dense-kernel size gate. It returns
+/// `Some` only when ALL of the following hold:
 /// - family is Gaussian + identity link (the scattered low-d smooth the
 ///   cascade solves);
 /// - none of the exotic-link / constraint / Firth / coefficient-group /
@@ -3599,20 +3602,15 @@ fn cascade_sobolev_order(requested: f64, d: usize) -> f64 {
 ///   effects, no by-variables;
 /// - that smooth is a scattered radial spatial smooth (`Duchon` or `Matern`)
 ///   over `d ∈ {2, 3}` coordinates with no shape constraint;
-/// - the offset is identically zero and every weight is finite and positive;
-/// - `n` is past the derived dense-kernel cliff
-///   (`past_dense_kernel_cliff`) — below it the dense radial path is both
-///   exact-posterior and cheap, so there is no reason to change estimators.
+/// - the offset is identically zero, every weight is finite and positive, and
+///   every coordinate and response value is finite.
 ///
-/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
-/// spec's isotropic radial distance); the quasi-uniformity guard inside
-/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
-/// is the no-regression gate that refuses the selected route when a
-/// near-degenerate metric would break the BPX iteration bound. That refusal is
-/// propagated; it never silently changes the estimator.
-pub fn residual_cascade_fast_path(
+/// Kept separate from the size gate so each structural guard is observable on
+/// its own at small `n` (issue #3550): below the cliff the full fast path is
+/// `None` for every input, which would mask a mis-firing structural guard.
+pub fn residual_cascade_structural_signature(
     request: &StandardFitRequest<'_>,
-) -> Option<ResidualCascadeInputs> {
+) -> Option<ResidualCascadeSignature> {
     if !request.family.is_gaussian_identity() {
         return None;
     }
@@ -3667,8 +3665,8 @@ pub fn residual_cascade_fast_path(
             feature_cols, spec, ..
         } => {
             // Matérn smoothness ν sets native Sobolev order ν + d/2; the cascade
-            // frame represents up to (d+3)/2, so the clamp below applies the
-            // ceiling. (d is known just below from feature_cols.)
+            // frame represents up to (d+3)/2, so the fast path's clamp applies
+            // the ceiling. (d is known just below from feature_cols.)
             let nu = spec.nu.half_integer_value();
             (feature_cols, nu + feature_cols.len() as f64 / 2.0)
         }
@@ -3684,28 +3682,63 @@ pub fn residual_cascade_fast_path(
     if request.weights.iter().any(|&v| !(v.is_finite() && v > 0.0)) {
         return None;
     }
-    let n = request.y.len();
-    if n != request.data.nrows() || feature_cols.iter().any(|&c| c >= request.data.ncols()) {
+    if request.y.len() != request.data.nrows()
+        || feature_cols.iter().any(|&c| c >= request.data.ncols())
+    {
         return None;
     }
-    if !past_dense_kernel_cliff(n, d) {
+    if feature_cols
+        .iter()
+        .any(|&c| request.data.column(c).iter().any(|v| !v.is_finite()))
+        || request.y.iter().any(|v| !v.is_finite())
+    {
         return None;
     }
-    let coords: Vec<Vec<f64>> = feature_cols
+    Some(ResidualCascadeSignature {
+        feature_cols: feature_cols.to_vec(),
+        requested_sobolev_order: requested_s,
+    })
+}
+
+/// Detection seam for the O(n log n) multiresolution residual-cascade fast path
+/// (issue #1032).
+///
+/// This mirrors [`spline_scan_fast_path`] in shape but carries one CRITICAL
+/// difference dictated by the issue: the cascade is **not** the same posterior
+/// as the Duchon/Matérn term it stands in for (a different finite basis — the
+/// multilevel Wendland frame, not the reduced-rank radial kernel). So unlike
+/// the 1-D scan, which silently swaps an identical posterior, this path must
+/// only fire as an explicit alternative estimator on the structural signature
+/// the issue names, never as a transparent replacement. It returns `Some` only
+/// when the request carries the structural signature
+/// ([`residual_cascade_structural_signature`]) AND `n` is past the derived
+/// dense-kernel cliff (`past_dense_kernel_cliff`) — below it the dense radial
+/// path is both exact-posterior and cheap, so there is no reason to change
+/// estimators.
+///
+/// The returned [`ResidualCascadeInputs`] carry a unit per-axis metric (the
+/// spec's isotropic radial distance); the quasi-uniformity guard inside
+/// [`gam_solve::residual_cascade::fit_residual_cascade`] (issue caveat 2)
+/// is the no-regression gate that refuses the selected route when a
+/// near-degenerate metric would break the BPX iteration bound. That refusal is
+/// propagated; it never silently changes the estimator.
+pub fn residual_cascade_fast_path(
+    request: &StandardFitRequest<'_>,
+) -> Option<ResidualCascadeInputs> {
+    let signature = residual_cascade_structural_signature(request)?;
+    let d = signature.feature_cols.len();
+    if !past_dense_kernel_cliff(request.y.len(), d) {
+        return None;
+    }
+    let coords: Vec<Vec<f64>> = signature
+        .feature_cols
         .iter()
         .map(|&c| request.data.column(c).iter().copied().collect())
         .collect();
     let y: Vec<f64> = request.y.iter().copied().collect();
     let w: Vec<f64> = request.weights.iter().copied().collect();
-    if coords
-        .iter()
-        .any(|axis| axis.iter().any(|v| !v.is_finite()))
-        || y.iter().any(|v| !v.is_finite())
-    {
-        return None;
-    }
     let metric = vec![1.0_f64; d];
-    let sobolev_s = cascade_sobolev_order(requested_s, d);
+    let sobolev_s = cascade_sobolev_order(signature.requested_sobolev_order, d);
     Some(ResidualCascadeInputs {
         coords,
         y,
