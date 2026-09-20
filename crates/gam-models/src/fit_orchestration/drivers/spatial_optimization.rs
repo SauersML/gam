@@ -5338,10 +5338,11 @@ pub(crate) fn exact_joint_outer_problem(
         // Re-enable the automatic fallback ladder for exact joint spatial
         // problems. It was previously `Disabled` to suppress a geo-bench
         // fallback bug where HybridEFS ψ stagnation degraded silently to
-        // BfgsApprox on a Charbonnier surface. With the ψ-stagnation guard
-        // in OuterFixedPointBridge (`MAX_CONSECUTIVE_PSI_STAGNATION`) the
-        // bridge now surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` when ψ
-        // stationarity cannot be enforced, so the ladder routes correctly
+        // BfgsApprox on a Charbonnier surface. OuterFixedPointBridge now
+        // surfaces `EFS_FIRST_ORDER_FALLBACK_MARKER` when ψ stationarity cannot
+        // be enforced (a nonstationary ψ block at arithmetic resolution, or an
+        // EFS direction no resolvable contraction of which descends), so
+        // the ladder routes correctly
         // to a joint gradient-based solver instead of grinding HybridEFS
         // for thousands of iterations.
         .with_fallback_policy(gam_solve::rho_optimizer::FallbackPolicy::Automatic)
