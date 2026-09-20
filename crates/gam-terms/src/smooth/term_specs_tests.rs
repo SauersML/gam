@@ -78,32 +78,49 @@ mod joint_unpenalized_dim_tests {
     }
 
     #[test]
-    fn non_materialized_penalty_falls_back_conservatively() {
-        // A penalty whose stored block is not p_local × p_local (e.g. a
-        // Kronecker tensor factor). With ≥2 penalties the conservative joint
-        // dim is 0 (never over-rejecting).
-        let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
-        let factor: Array2<f64> = array![[1.0]]; // wrong shape for p_local=2
-        let mixed_penalties = [
-            active_penalty(full, 1, 1, 0, PenaltySource::Primary),
+    fn tensor_product_penalties_read_the_materialized_kronecker_blocks() {
+        // te(x, z) with 3×2 margins: S_x ⊗ I and I ⊗ S_z. Their joint null
+        // space is null(S_x) ⊗ null(S_z), 1 × 1 = 1-dimensional, which the
+        // retired fallback reported as 0 for any ≥2-penalty term it did not
+        // materialize.
+        let s_x = array![[1.0, -1.0, 0.0], [-1.0, 2.0, -1.0], [0.0, -1.0, 1.0]];
+        let s_z = array![[1.0, -1.0], [-1.0, 1.0]];
+        let kron = |a: &Array2<f64>, b: &Array2<f64>| {
+            let (ra, ca) = a.dim();
+            let (rb, cb) = b.dim();
+            Array2::from_shape_fn((ra * rb, ca * cb), |(i, j)| {
+                a[[i / rb, j / cb]] * b[[i % rb, j % cb]]
+            })
+        };
+        let penalties = [
             active_penalty(
-                factor.clone(),
+                kron(&s_x, &Array2::eye(2)),
+                4,
                 2,
                 0,
-                1,
                 PenaltySource::TensorMarginal { dim: 0 },
             ),
+            active_penalty(
+                kron(&Array2::eye(3), &s_z),
+                3,
+                3,
+                1,
+                PenaltySource::TensorMarginal { dim: 1 },
+            ),
         ];
-        assert_eq!(joint_unpenalized_dim(2, &mixed_penalties), 0);
-        // With a single non-materialized penalty, fall back to its own null dim.
-        let factor_penalties = [active_penalty(
-            factor,
-            2,
-            2,
-            0,
-            PenaltySource::TensorMarginal { dim: 0 },
-        )];
-        assert_eq!(joint_unpenalized_dim(4, &factor_penalties), 2);
+        assert_eq!(joint_unpenalized_dim(6, &penalties), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "on a 2-coefficient term")]
+    fn a_penalty_block_of_the_wrong_shape_is_a_construction_defect() {
+        let full: Array2<f64> = array![[0.0, 0.0], [0.0, 1.0]];
+        let wrong: Array2<f64> = array![[1.0]];
+        let penalties = [
+            active_penalty(full, 1, 1, 0, PenaltySource::Primary),
+            active_penalty(wrong, 1, 0, 1, PenaltySource::TensorMarginal { dim: 0 }),
+        ];
+        joint_unpenalized_dim(2, &penalties);
     }
 }
 
@@ -857,8 +874,44 @@ mod pca_function_mass_tests {
         );
         assert!(
             message.contains("rank 1 < 2"),
-            "missing RRQR evidence: {message}"
+            "missing rank evidence: {message}"
         );
+    }
+
+    /// A score column that is an exact copy, or an exact combination, of the
+    /// others has a Gram eigenvalue that is zero up to the Gram's formation
+    /// rounding. Its computed sign is arbitrary; on the positive side the
+    /// eigen-square-root resurrects it as a pivot of order `√ε·σ_max`, far above
+    /// a column-pivoted QR cutoff of order `n·ε·|R₀₀|`, so a pivot-magnitude
+    /// test passes such a design as full rank about half the time. The rank
+    /// read against the Gram's resolution band must refuse every case.
+    #[test]
+    fn dependent_pca_score_components_are_rejected_whatever_the_rounding_sign() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut uniform = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let duplicated = array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+        let summed = array![[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+        for dataset in 0..8 {
+            let rows = 64 + 17 * dataset;
+            let data = Array2::from_shape_fn((rows, 2), |_| uniform());
+            for (label, basis) in [("duplicated", &duplicated), ("summed", &summed)] {
+                let result =
+                    build_pca_smooth_basis(data.view(), &[0, 1], basis, false, None, None, 16);
+                let err = result.err().unwrap_or_else(|| {
+                    panic!("{label} component in dataset {dataset} must be rejected")
+                });
+                let message = err.to_string();
+                assert!(
+                    message.contains("rank 2 < 3"),
+                    "{label} dataset {dataset}: unexpected error: {message}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -921,15 +974,15 @@ mod factor_smooth_null_component_tests {
         Array1::from(vec![0.0, 0.0, 0.0, 0.0, 0.2, 0.45, 0.6, 1.0, 1.0, 1.0, 1.0])
     }
 
-    /// `double_penalty` as the DSL defaults it: on for `fs` (it gates the
-    /// per-component null penalties), off for `sz` (whose pooled null-function
-    /// penalties are emitted unconditionally).
-    fn marginal(double_penalty: bool) -> BSplineBasisSpec {
+    /// `double_penalty` as the DSL defaults it for every factor-smooth
+    /// flavour: on. It is the single switch for the null-space penalties of
+    /// both `fs` (per-component) and `sz` (pooled zero-sum ridges, #3969).
+    fn marginal() -> BSplineBasisSpec {
         BSplineBasisSpec {
             degree: DEGREE,
             penalty_order: 2,
             knotspec: BSplineKnotSpec::Provided(knots()),
-            double_penalty,
+            double_penalty: true,
             identifiability: BSplineIdentifiability::None,
             boundary: crate::basis::OneDimensionalBoundary::Open,
             boundary_conditions: crate::basis::BSplineBoundaryConditions::default(),
@@ -951,7 +1004,7 @@ mod factor_smooth_null_component_tests {
         let spec = FactorSmoothSpec {
             continuous_cols: vec![0],
             group_col: 1,
-            marginal: marginal(matches!(flavour, FactorSmoothFlavour::Fs { .. })),
+            marginal: marginal(),
             flavour,
             group_frozen_levels: None,
             frozen_global_orthogonality: None,

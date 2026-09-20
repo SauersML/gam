@@ -83,10 +83,7 @@ impl std::fmt::Display for StationarityRung {
 pub enum StationarityStandard {
     /// A stationarity residual measured at this point was weighed against
     /// `bound`, which `rung` derived from this point's own evidence.
-    Measured {
-        bound: f64,
-        rung: StationarityRung,
-    },
+    Measured { bound: f64, rung: StationarityRung },
     /// The refusal was decided without any stationarity comparison — the
     /// terminal evidence was rejected before a residual existed, or the
     /// predicate was an identity/existence check rather than a bound test. The
@@ -236,16 +233,14 @@ impl core::fmt::Display for FixedLambdaStallReason {
 /// Solver-native first-order residual carried by a fixed-lambda stall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FixedLambdaResidualKind {
-    /// Euclidean norm of the exact penalized likelihood gradient.
-    PenalizedGradientNorm,
-    /// Firth/Jeffreys Newton decrement `0.5 * |score' H^-1 score|`.
+    /// Half the squared Newton decrement `0.5 * score' H^+ score`, in
+    /// objective units (Firth/Jeffreys and penalized vector-GLM solves).
     NewtonDecrement,
 }
 
 impl core::fmt::Display for FixedLambdaResidualKind {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
-            Self::PenalizedGradientNorm => "penalized gradient norm",
             Self::NewtonDecrement => "Newton decrement",
         })
     }
@@ -413,7 +408,6 @@ impl OuterObjectiveErrorSource {
             Self::Objective(source) => source.downcast_ref::<EstimationError>(),
         }
     }
-
 }
 
 /// A comprehensive error type for the model estimation process.
@@ -499,37 +493,15 @@ pub enum EstimationError {
     },
 
     #[error(
-        "Block-orthogonal Gaussian REML did not converge within {iterations} outer passes: \
-         max relative rho-score residual {max_score_residual:.6e}/{score_tol:.3e}, \
-         minimum profiled curvature {min_profile_curvature:.6e} (negative allowance \
-         {profile_curvature_roundoff:.3e}; last scale fixed-point step \
-         {last_scale_step:.6e}{}). \
+        "Block-orthogonal Gaussian REML has no certified smoothing optimum: {reason}. \
          A fit is only minted from a converged optimization; resume from the \
-         checkpoint by passing `init_rhos` = {rho_checkpoint:?}.",
-        if *cycle_detected { ", deterministic limit cycle detected" } else { "" }
+         checkpoint by passing `init_rhos` = {rho_checkpoint:?}."
     )]
     BlockOrthogonalRemlDidNotConverge {
-        /// Outer alternation passes executed before exhaustion.
-        iterations: usize,
-        /// Largest per-block |dV/drho| at the final iterate, normalized by the
-        /// score's natural magnitude `d * max(1, rank)`.
-        max_score_residual: f64,
-        /// Tolerance the residual had to meet for the convergence certificate.
-        score_tol: f64,
-        /// Smallest eigenvalue of the analytic rho Hessian after profiling out
-        /// the exact conditional scale block.
-        min_profile_curvature: f64,
-        /// Dimension-scaled eigensolver roundoff allowed below zero when
-        /// certifying positive semidefiniteness.
-        profile_curvature_roundoff: f64,
-        /// Last max |Δ log scale-precision| fixed-point movement (evidence of
-        /// whether the alternation was still moving or had stalled).
-        last_scale_step: f64,
-        /// The alternation revisited an earlier `(rho, scale)` state exactly;
-        /// as a deterministic map it can never certify, so it stopped early.
-        cycle_detected: bool,
-        /// Per-block log-lambda iterates at exhaustion; feed back through the
-        /// entry point's `init_rhos` to resume rather than restart.
+        /// Why the certified Newton trust region on the scale-profiled
+        /// objective returned no stationary point.
+        reason: String,
+        /// Last iterate of the smoothing search, resumable through `init_rhos`.
         rho_checkpoint: Vec<f64>,
     },
 
@@ -616,6 +588,17 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Pre-fit separation detected in the Bernoulli marginal-slope latent score: the threshold \
+        {threshold:.6e} on z separates the binary outcomes (positive_above_threshold={positive_above_threshold}), \
+        so the pooled probit likelihood of y on z has no finite mode. Enable Firth/Jeffreys bias \
+        reduction or supply a latent score that does not separate the outcomes."
+    )]
+    PrefitLatentScoreSeparationDetected {
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
+
+    #[error(
         "Not enough observations to identify the model: {n_observations} positive-weight rows but \
         {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
         penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
@@ -639,23 +622,6 @@ pub enum EstimationError {
         rank: usize,
         num_unpenalized_columns: usize,
         min_eigenvalue: f64,
-        tolerance: f64,
-        column_indices: Vec<usize>,
-    },
-
-    #[error(
-        "Pre-fit near-degeneracy detected in the realized unpenalized design: the {num_unpenalized_columns} \
-        unpenalized columns span a numerically rank-degenerate direction (Gram condition number {condition_number:.3e} \
-        exceeds tolerance {tolerance:.3e}; min eigenvalue {min_eigenvalue:.3e}, max eigenvalue {max_eigenvalue:.3e}, \
-        columns {column_indices:?}). The unpenalized normal equations are effectively singular along this direction, \
-        so the fit would grind/diverge. Remove/reparameterize the near-aliased columns or add an explicit \
-        penalty/constraint before fitting."
-    )]
-    PrefitNearDegenerateDesignDetected {
-        num_unpenalized_columns: usize,
-        condition_number: f64,
-        min_eigenvalue: f64,
-        max_eigenvalue: f64,
         tolerance: f64,
         column_indices: Vec<usize>,
     },
@@ -820,7 +786,9 @@ pub enum EstimationError {
     /// it needed none. The sixth, a corrector that returns no gradient moments for a non-empty
     /// block, breaks the corrector's contract at every rho and stays fatal.
     #[error("#784 block-local quadrature correction refused: {stage}")]
-    BlockQuadratureCorrectionRefused { stage: BlockQuadratureCorrectionStage },
+    BlockQuadratureCorrectionRefused {
+        stage: BlockQuadratureCorrectionStage,
+    },
 
     #[error("Fatal outer-objective evaluation failure ({context}): {source}")]
     OuterObjectiveEvaluationFailed {
@@ -1158,8 +1126,7 @@ impl EstimationError {
             Self::OuterObjectiveEvaluationFailed { source, .. } => {
                 source.estimation_error().and_then(Self::advice)
             }
-            Self::PerfectSeparationDetected { .. }
-            | Self::MultinomialSeparationDetected { .. } => {
+            Self::PerfectSeparationDetected { .. } | Self::MultinomialSeparationDetected { .. } => {
                 Some(format!("Detected (quasi-)separation. {SEPARATION}"))
             }
             Self::PrefitPerfectSeparationDetected { column_index, .. } => Some(format!(
@@ -1168,22 +1135,24 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {PREFIT_SEPARATION}"
             )),
+            Self::PrefitLatentScoreSeparationDetected { .. } => Some(format!(
+                "Detected separation driven by the marginal-slope latent score. {SEPARATION}"
+            )),
             Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
                 "The {link} link's range exceeds the family's mean domain and the data put \
                  a fitted mean on the edge of that domain. Use a link whose range is the \
                  whole mean domain (the canonical link), or remove the predictor or rows \
                  that force the mean to the boundary."
             )),
-            Self::PrefitRankDeficientDesignDetected { column_indices, .. }
-            | Self::PrefitNearDegenerateDesignDetected { column_indices, .. } => Some(format!(
+            Self::PrefitRankDeficientDesignDetected { column_indices, .. } => Some(format!(
                 "Matrix conditioning issue in unpenalized columns {column_indices:?}. {CONDITIONING}"
             )),
             Self::ModelIsIllConditioned { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LinearSystemSolveFailed(_)
-            | Self::EigendecompositionFailed(_) => {
-                Some(format!("Matrix conditioning issue detected. {CONDITIONING}"))
-            }
+            | Self::EigendecompositionFailed(_) => Some(format!(
+                "Matrix conditioning issue detected. {CONDITIONING}"
+            )),
             _ => None,
         }
     }
@@ -1249,9 +1218,9 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::HessianNotPositiveDefinite { .. }
             | Self::LaplacePrecisionIndefinite { .. }
             | Self::IdentifiedRankNotLocallyConstant { .. }
@@ -1324,16 +1293,6 @@ impl EstimationError {
         matches!(self, EstimationError::OuterObjectiveEvaluationFailed { .. })
     }
 
-    /// Classifies inner-solve failures that the outer REML loop should
-    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
-    /// rather than propagate as a hard error.
-    ///
-    /// Why: when the penalised Hessian becomes effectively singular at the
-    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
-    /// it exhausts its iteration budget, the outer optimiser's correct
-    /// response is to back away from this rho — not to terminate the fit.
-    /// All three variants encode "the inner problem at this rho is too hard
-    /// to evaluate, try a different rho".
     /// Re-report this failure with more context WITHOUT changing whether it
     /// is a trial-point refusal.
     ///
@@ -1344,17 +1303,42 @@ impl EstimationError {
     /// `InnerSolveNotConverged` reached it as `RemlOptimizationFailed` and did
     /// the same (#2590). Any site that adds context to an error it did not
     /// produce should use this instead of choosing a variant for it.
+    ///
+    /// The fatal branch keeps the source typed. Re-rendering it into
+    /// `InvalidInput` preserved the fatal verdict but replaced the producer's
+    /// variant: a `LinearSystemSolveFailed` or `HessianNotPositiveDefinite`
+    /// raised inside the evaluator reached the caller as an `Input` failure,
+    /// under the wrong variant name, CLI exit code and advice. Wrapping it as
+    /// [`Self::OuterObjectiveEvaluationFailed`] carries the context while
+    /// `innermost_estimation_error`, `failure_category` and `advice` still
+    /// answer for the source.
     #[must_use]
     pub fn wrap_preserving_trial_point(self, context: &str) -> Self {
-        let infeasible = self.is_trial_point_infeasible();
-        let reason = format!("{context}: {self}");
-        if infeasible {
-            Self::TrialPointRefused { reason }
+        if self.is_trial_point_infeasible() {
+            Self::TrialPointRefused {
+                reason: format!("{context}: {self}"),
+            }
         } else {
-            Self::InvalidInput(reason)
+            // This operation adds context even if the source is already wrapped.
+            // The orchestration helper intentionally deduplicates fatal wrappers,
+            // so using it here would silently discard the new caller context.
+            Self::OuterObjectiveEvaluationFailed {
+                context: context.to_string(),
+                source: OuterObjectiveErrorSource::Estimation(Box::new(self)),
+            }
         }
     }
 
+    /// Classifies inner-solve failures that the outer REML loop should
+    /// treat as a soft retreat (return +inf cost / infeasible outer-eval)
+    /// rather than propagate as a hard error.
+    ///
+    /// Why: when the penalised Hessian becomes effectively singular at the
+    /// current rho, when P-IRLS hits a perfect-separation diagnostic, or when
+    /// it exhausts its iteration budget, the outer optimiser's correct
+    /// response is to back away from this rho — not to terminate the fit.
+    /// Each of them encodes "the inner problem at this rho is too hard
+    /// to evaluate, try a different rho".
     pub fn is_inner_solve_retreat(&self) -> bool {
         // ONE table. This method and `is_trial_point_infeasible` ask the same
         // question -- "is this a statement about this rho, or about the
@@ -1440,9 +1424,9 @@ impl EstimationError {
             | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
-            | Self::PrefitNearDegenerateDesignDetected { .. }
             | Self::MultinomialSeparationDetected { .. }
             | Self::PredictiveIntervalsDeclined { .. }
             | Self::ModelIsIllConditioned { .. }
@@ -1522,20 +1506,24 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
             }
+            Self::PrefitLatentScoreSeparationDetected { .. } => {
+                "EstimationError::PrefitLatentScoreSeparationDetected"
+            }
             Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
                 "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"
             }
             Self::PrefitRankDeficientDesignDetected { .. } => {
                 "EstimationError::PrefitRankDeficientDesignDetected"
             }
-            Self::PrefitNearDegenerateDesignDetected { .. } => {
-                "EstimationError::PrefitNearDegenerateDesignDetected"
-            }
             Self::MultinomialSeparationDetected { .. } => {
                 "EstimationError::MultinomialSeparationDetected"
             }
-            Self::HessianNotPositiveDefinite { .. } => "EstimationError::HessianNotPositiveDefinite",
-            Self::LaplacePrecisionIndefinite { .. } => "EstimationError::LaplacePrecisionIndefinite",
+            Self::HessianNotPositiveDefinite { .. } => {
+                "EstimationError::HessianNotPositiveDefinite"
+            }
+            Self::LaplacePrecisionIndefinite { .. } => {
+                "EstimationError::LaplacePrecisionIndefinite"
+            }
             Self::PredictiveIntervalsDeclined { .. } => {
                 "EstimationError::PredictiveIntervalsDeclined"
             }
@@ -1553,17 +1541,19 @@ impl EstimationError {
                 "EstimationError::OuterObjectiveEvaluationFailed"
             }
             Self::RemlDidNotConverge { .. } => "EstimationError::RemlDidNotConverge",
-            Self::DominatedCertifiedPlateau { .. } => {
-                "EstimationError::DominatedCertifiedPlateau"
-            }
+            Self::DominatedCertifiedPlateau { .. } => "EstimationError::DominatedCertifiedPlateau",
             Self::FitDidNotConverge { .. } => "EstimationError::FitDidNotConverge",
             Self::GradientUnavailable { .. } => "EstimationError::GradientUnavailable",
             Self::LayoutError(_) => "EstimationError::LayoutError",
             Self::ModelIsIllConditioned { .. } => "EstimationError::ModelIsIllConditioned",
             Self::InvalidInput(_) => "EstimationError::InvalidInput",
             Self::FitResultInvariantViolated(_) => "EstimationError::FitResultInvariantViolated",
-            Self::ProfiledResidualUnresolved { .. } => "EstimationError::ProfiledResidualUnresolved",
-            Self::InverseLinkDomainViolation { .. } => "EstimationError::InverseLinkDomainViolation",
+            Self::ProfiledResidualUnresolved { .. } => {
+                "EstimationError::ProfiledResidualUnresolved"
+            }
+            Self::InverseLinkDomainViolation { .. } => {
+                "EstimationError::InverseLinkDomainViolation"
+            }
             Self::LinkFeasibilityBoundaryOptimum { .. } => {
                 "EstimationError::LinkFeasibilityBoundaryOptimum"
             }
@@ -1576,7 +1566,9 @@ impl EstimationError {
             Self::DenseMaterializationRefused { .. } => {
                 "EstimationError::DenseMaterializationRefused"
             }
-            Self::LogStrengthDomainViolation { .. } => "EstimationError::LogStrengthDomainViolation",
+            Self::LogStrengthDomainViolation { .. } => {
+                "EstimationError::LogStrengthDomainViolation"
+            }
             Self::MonotoneRoot(_) => "EstimationError::MonotoneRoot",
             Self::CalibratorTrainingFailed(_) => "EstimationError::CalibratorTrainingFailed",
             Self::InvalidSpecification(_) => "EstimationError::InvalidSpecification",
@@ -1616,7 +1608,11 @@ mod advice_policy_tests {
         let advice = basis.advice().expect("basis advice");
         assert!(advice.contains("power"), "{advice}");
 
-        assert!(EstimationError::InvalidInput("dimension=16".into()).advice().is_none());
+        assert!(
+            EstimationError::InvalidInput("dimension=16".into())
+                .advice()
+                .is_none()
+        );
     }
 }
 
@@ -1661,7 +1657,7 @@ mod trial_point_classification_tests {
                 reason: FixedLambdaStallReason::IterationBudgetExhausted,
                 objective_value: 12.5,
                 stationarity: FixedLambdaStationarityEvidence {
-                    kind: FixedLambdaResidualKind::PenalizedGradientNorm,
+                    kind: FixedLambdaResidualKind::NewtonDecrement,
                     residual: 1.0e-3,
                     bound: 1.0e-8,
                 },
@@ -1819,10 +1815,7 @@ mod tests {
     fn the_bound_and_its_rung_are_one_field() {
         let standard = measured("solver-band", false);
         assert_eq!(standard.bound(), Some(1.0e-2));
-        assert_eq!(
-            standard.rung().map(|rung| rung.label),
-            Some("solver-band")
-        );
+        assert_eq!(standard.rung().map(|rung| rung.label), Some("solver-band"));
         assert_eq!(StationarityStandard::NoComparison.bound(), None);
         assert_eq!(StationarityStandard::NoComparison.rung(), None);
     }
@@ -1920,6 +1913,88 @@ mod tests {
             1,
             "fatal provenance must not be re-wrapped at every orchestration layer"
         );
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_fatal_source_typed() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -1.0,
+        }
+        .wrap_preserving_trial_point("survival smoothing LAML evaluation failed");
+        assert!(!wrapped.is_trial_point_infeasible());
+        assert!(wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped
+                .to_string()
+                .contains("survival smoothing LAML evaluation failed"),
+            "{wrapped}"
+        );
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        let advice = wrapped
+            .advice()
+            .expect("conditioning advice survives the wrap");
+        assert!(advice.contains("conditioning"), "{advice}");
+
+        let input = EstimationError::InvalidInput("frame mismatch".to_string())
+            .wrap_preserving_trial_point("inner state");
+        assert!(!input.is_trial_point_infeasible());
+        assert_eq!(input.failure_category(), FailureCategory::Input);
+    }
+
+    #[test]
+    fn wrap_preserving_trial_point_keeps_a_refusal_recoverable() {
+        let wrapped = EstimationError::TrialPointRefused {
+            reason: "lambda out of range".to_string(),
+        }
+        .wrap_preserving_trial_point("inner state");
+        assert!(wrapped.is_trial_point_infeasible());
+        assert!(!wrapped.is_fatal_outer_evaluation());
+        assert!(
+            wrapped.to_string().contains("lambda out of range"),
+            "{wrapped}"
+        );
+    }
+
+    #[test]
+    fn repeated_trial_context_preserves_typed_source_and_each_context() {
+        let wrapped = EstimationError::HessianNotPositiveDefinite {
+            min_eigenvalue: -0.5,
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        let message = wrapped.to_string();
+        assert!(message.contains("row likelihood"), "{message}");
+        assert!(message.contains("outer smoothing"), "{message}");
+        assert!(matches!(wrapped.innermost_estimation_error(),
+            EstimationError::HessianNotPositiveDefinite { min_eigenvalue } if *min_eigenvalue == -0.5));
+        assert_eq!(wrapped.failure_category(), FailureCategory::Numerical);
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::HessianNotPositiveDefinite"
+        );
+        assert!(
+            wrapped
+                .advice()
+                .expect("typed advice")
+                .contains("conditioning")
+        );
+        assert!(std::error::Error::source(&wrapped).is_some());
+        assert!(!wrapped.is_trial_point_infeasible());
+
+        let refused = EstimationError::TrialPointRefused {
+            reason: "outside domain".into(),
+        }
+        .wrap_preserving_trial_point("row likelihood")
+        .wrap_preserving_trial_point("outer smoothing");
+        assert!(refused.is_trial_point_infeasible());
+        assert!(!refused.is_fatal_outer_evaluation());
+        for context in ["outside domain", "row likelihood", "outer smoothing"] {
+            assert!(refused.to_string().contains(context));
+        }
     }
 
     // ── error message content ─────────────────────────────────────────────────
@@ -2064,7 +2139,9 @@ mod tests {
 
     #[test]
     fn block_quadrature_correction_refusals_back_off_only_at_rho_local_stages_784() {
-        use crate::laplace_sampler_contract::{BlockQuadratureOrderRefusal, BlockQuadratureRefusal};
+        use crate::laplace_sampler_contract::{
+            BlockQuadratureOrderRefusal, BlockQuadratureRefusal,
+        };
         // The six stages that are facts about the trial point back the outer search off it,
         // as a convergence-class refusal (#784 ruling A).
         let rho_local = [
@@ -2245,7 +2322,10 @@ impl std::fmt::Display for BlockQuadratureCorrectionStage {
                  {min_eigenvalue:.4e}, so the implicit mode response is undefined"
             ),
             Self::EigenpairResolutionUnavailable { reason } => {
-                write!(f, "the eigenpair residual bounds are unavailable at this rho: {reason}")
+                write!(
+                    f,
+                    "the eigenpair residual bounds are unavailable at this rho: {reason}"
+                )
             }
             Self::EigenframeNearDegeneracy {
                 block_eigenvalue,

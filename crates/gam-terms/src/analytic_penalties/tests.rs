@@ -304,6 +304,89 @@ fn ordered_beta_bernoulli_majorized_channels_match_fd_of_psd_majorized_operator(
     );
 }
 
+/// The trait-level PSD majorizer of the ordered Beta--Bernoulli prior used to be
+/// the trait default, i.e. the exact Hessian diagonal: it carries the negative
+/// mass-coupled rank-one diagonal `s'_k·u_ik²` and the negative part of the
+/// row-local term, so it was neither PSD nor a majorizer, and it disagreed with
+/// the `max(diagonal_term, 0)` majorizer the Laplace path assembles. It must be
+/// that majorizer: PSD, dominating the exact Hessian, and the frozen operator's
+/// diagonal and log-determinant must be built from it.
+#[test]
+fn ordered_beta_bernoulli_trait_psd_majorizer_is_the_declared_loewner_majorizer() {
+    let w = [1.6_f64, 0.4, 1.2, 0.8];
+    let cases = [
+        (
+            OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false),
+            array![
+                0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+            ],
+            Array1::<f64>::zeros(0),
+        ),
+        (
+            OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true).with_row_weights(Some(&w)),
+            array![
+                2.5_f64, -1.8, 0.6, 3.1, 0.1, -2.4, -0.1, 1.7, 0.2, 2.4, -0.3, 0.8
+            ],
+            array![0.15_f64],
+        ),
+    ];
+    for (case, (pen, target, rho)) in cases.iter().enumerate() {
+        let n = target.len();
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[j] = 1.0;
+            hessian
+                .column_mut(j)
+                .assign(&pen.hvp(target.view(), rho.view(), e.view()));
+        }
+        let declared = pen
+            .psd_majorizer_logit_third_channels(target.view(), rho.view())
+            .diagonal_term
+            .mapv(|value| value.max(0.0));
+        let diag = pen
+            .psd_majorizer_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli majorizer diagonal");
+        let exact_diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli Hessian diagonal");
+        let scale = hessian.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(scale > 0.0, "case {case}: nonzero curvature");
+        let tol = 1e-12 * scale;
+        assert!(
+            exact_diag.iter().any(|&v| v < -1e-3 * scale),
+            "case {case}: the exact Hessian diagonal has negative entries"
+        );
+        let mut majorizer = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], declared[i], epsilon = tol);
+            assert!(diag[i] >= 0.0, "case {case}: B must be PSD");
+            majorizer[[i, i]] = diag[i];
+        }
+        let min_eig = <Array2<f64> as PenaltyOp>::eigendecompose(&(&majorizer - &hessian))
+            .expect("symmetric eigensolve")
+            .0
+            .iter()
+            .fold(f64::INFINITY, |acc, &v| acc.min(v));
+        assert!(
+            min_eig >= -tol,
+            "case {case}: B must dominate the exact Hessian; min eig(B - H) = {min_eig:.3e}"
+        );
+
+        let kind = AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, target.clone(), rho.clone())
+            .expect("frozen operator");
+        let op_diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(op_diag[i], declared[i], epsilon = tol);
+        }
+        let lambda = 0.3;
+        let expected: f64 = declared.iter().map(|&d| (d + lambda).ln()).sum();
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
+}
+
 #[test]
 fn ordered_beta_bernoulli_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
@@ -723,6 +806,116 @@ fn parametric_row_precision_is_the_stated_precision_with_nothing_added() {
     );
 }
 
+/// The parametric row-precision prior learns its whole conditional precision map:
+/// `λ_k(u_n) = e^{log α_k} + softplus(raw β_k) ‖u_n − μ_k‖²`, plus a learnable
+/// weight, for `2d + d·du + 1` outer coordinates in all. Before this test the only
+/// check of `grad_rho` was the single log-α entry at `t = 0`, and nothing tied
+/// `grad_target` or `hessian_diag` to the value. This pins value -> `grad_target`,
+/// `grad_target` -> `hessian_diag` (the full FD Jacobian of the gradient, so the
+/// Hessian is also checked to be exactly diagonal) and value -> every `grad_rho`
+/// coordinate, all against central differences. It also checks the `as_dense`,
+/// `log det(S + λI)` and frozen-operator channels against that diagonal.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h` with `h = 1e-5`.
+/// - The value is quadratic in `t`, so value -> grad has no truncation error.
+///   Every summand is `O(1)`, which leaves a roundoff of about `1e-10`.
+/// - The gradient is linear in `t`, so grad -> Hessian is also pure roundoff,
+///   about `ε_mach · 3 / h ≈ 1e-10`.
+/// - Along each ρ coordinate, `|f'''| ≲ 2` on this fixture (softplus, `e^ρ` and
+///   the quadratic in μ are all `O(1)` here), so the truncation error is at most
+///   about `3e-11`. The roundoff is `ε_mach · Σ|terms| / h ≈ 2e-10`.
+/// A `1e-8` tolerance leaves at least 40× margin. The dense and log-det channels
+/// re-evaluate the same `w·λ_k(u_n)`, so they agree to rounding: `1e-12` relative
+/// on the entries, and one `ln` per entry for the eight-term log-det sum.
+#[test]
+fn parametric_row_precision_derivatives_match_central_differences() {
+    let (n_eff, d) = (4usize, 2usize);
+    let n = n_eff * d;
+    let penalty = ParametricRowPrecisionPriorPenalty::new(
+        PsiSlice::full(n, Some(d)),
+        array![[-0.6_f64], [0.1], [0.45], [1.2]],
+        array![-0.3_f64, 0.2],
+        array![0.4_f64, -0.7],
+        array![[0.2_f64], [-0.1]],
+        0.8,
+        n_eff,
+        true,
+    )
+    .expect("parametric row-precision penalty");
+    assert_eq!(penalty.rho_count(), 7);
+    let rho = array![0.1_f64, -0.2, 0.3, 0.15, -0.25, 0.05, 0.2];
+    penalty.validate_rho(rho.view()).expect("interior rho");
+    let t = Array1::from_shape_fn(n, |i| 0.5 * (1.1 * i as f64 + 0.3).sin() + 0.1);
+    let h = 1e-5;
+    let tol = 1e-8;
+
+    let g = penalty.grad_target(t.view(), rho.view());
+    let diag = penalty
+        .hessian_diag(t.view(), rho.view())
+        .expect("row-precision Hessian is diagonal");
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (penalty.value(tp.view(), rho.view()) - penalty.value(tm.view(), rho.view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        let gp = penalty.grad_target(tp.view(), rho.view());
+        let gm = penalty.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = tol);
+        }
+    }
+
+    let gr = penalty.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 7);
+    for c in 0..7 {
+        let mut rp = rho.clone();
+        let mut rm = rho.clone();
+        rp[c] += h;
+        rm[c] -= h;
+        let fd =
+            (penalty.value(t.view(), rp.view()) - penalty.value(t.view(), rm.view())) / (2.0 * h);
+        assert_abs_diff_eq!(gr[c], fd, epsilon = tol);
+    }
+
+    let scale = diag.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(
+        diag.iter().all(|&x| x > 0.0),
+        "the conditional precision is positive"
+    );
+    let dense = penalty.as_dense(t.view(), rho.view());
+    for i in 0..n {
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!(dense[[i, j]], expected, epsilon = 1e-12 * scale);
+        }
+    }
+    let lambda = 0.3;
+    let expected_log_det: f64 = diag.iter().map(|&x| (x + lambda).ln()).sum();
+    let log_det = penalty
+        .log_det_plus_lambda_i(rho.view(), lambda)
+        .expect("row-precision log det");
+    assert_abs_diff_eq!(log_det, expected_log_det, epsilon = 1e-12 * n as f64);
+
+    let op = FrozenAnalyticPenaltyOp::new(
+        AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(penalty)),
+        t.clone(),
+        rho.clone(),
+    )
+    .expect("frozen row-precision operator");
+    let frozen_diag = op.diag();
+    for i in 0..n {
+        assert_abs_diff_eq!(frozen_diag[i], diag[i], epsilon = 1e-12 * scale);
+    }
+    let frozen_log_det = op
+        .log_det_plus_lambda_i(lambda)
+        .expect("frozen row-precision log det");
+    assert_abs_diff_eq!(frozen_log_det, expected_log_det, epsilon = 1e-12 * n as f64);
+}
+
 #[test]
 fn sparsity_learnable_smoothing_has_one_structural_coordinate() {
     assert!(
@@ -1086,6 +1279,161 @@ fn smooth_threshold_psd_majorizer_diag_is_psd_over_logit_sweep() {
     }
 }
 
+/// Checks `grad_target` against central differences of `value`, the Hessian
+/// `diag` against central differences of `grad_target`, and `grad_rho`
+/// against central differences of `value` in each ρ coordinate. The full FD
+/// Jacobian of the gradient is compared with `diag`, so the Hessian is also
+/// checked to be exactly diagonal.
+fn assert_diagonal_penalty_matches_central_differences(
+    pen: &dyn AnalyticPenalty,
+    t: &Array1<f64>,
+    rho: &Array1<f64>,
+    diag: &Array1<f64>,
+    tol: f64,
+) {
+    let h = 1e-5;
+    let n = t.len();
+    let worst = value_grad_fd_max_abs_error(pen, t.view(), rho.view(), h);
+    assert!(
+        worst <= tol,
+        "{} value -> grad FD max abs error = {worst:.3e}",
+        pen.name()
+    );
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = tol);
+        }
+    }
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), rho.len());
+    for c in 0..rho.len() {
+        let mut rp = rho.clone();
+        let mut rm = rho.clone();
+        rp[c] += h;
+        rm[c] -= h;
+        let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * h);
+        assert_abs_diff_eq!(gr[c], fd, epsilon = tol);
+    }
+}
+
+/// Before this test the sparsity family's derivatives were checked only against
+/// re-typed closed forms, or not at all. Nothing tied the learnable-smoothing
+/// `grad_rho` coordinate (`log ε`, `log δ`), the dense Hoyer gradient and HVP,
+/// the smooth-threshold gradient, Hessian and per-axis `grad_rho`, or the TopK
+/// activation gradient and Hessian to the value. This pins all of them against
+/// central differences with `h = 1e-5`.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h`, and the
+/// grad -> Hessian comparisons carry the largest truncation term.
+/// - Smoothed L¹ with `ε = 0.3`, `λ = e^{0.2}`: the third derivative of
+///   `λ x / sqrt(x² + ε²)` peaks at `3λ/ε³ ≈ 136` (at `x = 0`), which gives
+///   about `2.3e-9`.
+/// - Log with `δ = 0.5`, `λ = e^{−0.1}`: the third derivative of
+///   `2λx/(δ² + x²)` peaks at `12λ/δ⁴ ≈ 174`, which gives about `2.9e-9`.
+/// - Smooth threshold with `ε = 0.2`: the gradient is `wτ σ'(z)/ε` with
+///   `z = (x − τ)/ε`. Its third x-derivative is `wτ σ''''(z)/ε⁴`, and
+///   `|σ''''| ≤ 1/8`, `wτ ≤ 1.3 · 0.8 e^{−0.2}`, so it is at most about 66,
+///   which gives about `1.1e-9`.
+/// - Hoyer and TopK stay at least `0.05` from every kink and every magnitude
+///   tie, so the stencil never crosses one. Hoyer's terms are `O(1)`
+///   (about `2e-11`), and TopK's value is quadratic, which leaves pure
+///   roundoff.
+/// Every value/`grad_rho` term is `O(1)`, so its roundoff is at most about `1e-10`.
+/// A `1e-7` tolerance leaves at least 30× margin.
+#[test]
+fn sparsity_threshold_and_topk_derivatives_match_central_differences() {
+    let x = array![0.7_f64, -0.35, 0.05, -1.2, 0.4, -0.08];
+    let tol = 1e-7;
+
+    let smoothed_l1 = SparsityPenalty::smoothed_l1(PenaltyTier::Psi, 0.3)
+        .expect("smoothed L1")
+        .with_learnable_smoothing()
+        .expect("learnable eps");
+    let rho = array![0.2_f64, 0.3_f64.ln()];
+    smoothed_l1.validate_rho(rho.view()).expect("interior rho");
+    let diag = smoothed_l1
+        .hessian_diag(x.view(), rho.view())
+        .expect("smoothed L1 Hessian is diagonal");
+    assert_diagonal_penalty_matches_central_differences(&smoothed_l1, &x, &rho, &diag, tol);
+
+    let log = SparsityPenalty::log(PenaltyTier::Psi, 0.5)
+        .expect("log sparsity")
+        .with_learnable_smoothing()
+        .expect("learnable delta");
+    let rho = array![-0.1_f64, 0.5_f64.ln()];
+    log.validate_rho(rho.view()).expect("interior rho");
+    let diag = log
+        .hessian_diag(x.view(), rho.view())
+        .expect("log sparsity Hessian is diagonal");
+    assert!(
+        diag.iter().any(|&d| d < 0.0),
+        "the fixture must reach the nonconvex region |x| > delta"
+    );
+    assert_diagonal_penalty_matches_central_differences(&log, &x, &rho, &diag, tol);
+
+    let h = 1e-5;
+    let hoyer = SparsityPenalty::hoyer(PenaltyTier::Psi);
+    let rho = array![0.3_f64];
+    let worst = value_grad_fd_max_abs_error(&hoyer, x.view(), rho.view(), h);
+    assert!(
+        worst <= tol,
+        "Hoyer value -> grad FD max abs error = {worst:.3e}"
+    );
+    let v = Array1::from_shape_fn(x.len(), |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let hv = hoyer.hvp(x.view(), rho.view(), v.view());
+    let gp = hoyer.grad_target((&x + &(h * &v)).view(), rho.view());
+    let gm = hoyer.grad_target((&x - &(h * &v)).view(), rho.view());
+    for i in 0..x.len() {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+    let gr = hoyer.grad_rho(x.view(), rho.view());
+    assert_eq!(gr.len(), 1);
+    let fd_rho = (hoyer.value(x.view(), array![0.3 + h].view())
+        - hoyer.value(x.view(), array![0.3 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let t = array![0.1_f64, 0.5, 0.3, 0.9, 0.45, 1.1];
+    let threshold = SmoothThresholdPenalty::new(
+        PsiSlice::full(t.len(), Some(2)),
+        array![0.25_f64, 0.8],
+        1.3,
+        0.2,
+    )
+    .expect("smooth threshold");
+    let rho = array![0.1_f64, -0.2];
+    threshold.validate_rho(rho.view()).expect("interior rho");
+    let diag = threshold
+        .hessian_diag(t.view(), rho.view())
+        .expect("smooth threshold Hessian is diagonal");
+    assert!(
+        diag.iter().any(|&d| d < 0.0) && diag.iter().any(|&d| d > 0.0),
+        "the fixture must straddle the gate inflection"
+    );
+    assert_diagonal_penalty_matches_central_differences(&threshold, &t, &rho, &diag, tol);
+
+    let t = array![0.9_f64, -0.2, 0.5, 0.1, -0.7, 0.4, 0.3, 0.6, -1.0];
+    let topk = TopKActivationPenalty::new(PsiSlice::full(t.len(), Some(3)), 2, 0.9)
+        .expect("topk activation");
+    let rho = Array1::<f64>::zeros(0);
+    let diag = topk
+        .hessian_diag(t.view(), rho.view())
+        .expect("topk Hessian is diagonal");
+    assert_eq!(
+        diag.iter().filter(|&&d| d > 0.0).count(),
+        6,
+        "two active axes per row"
+    );
+    assert_diagonal_penalty_matches_central_differences(&topk, &t, &rho, &diag, tol);
+}
+
 #[test]
 fn log_sparsity_hessian_is_exact_true_second_derivative() {
     // Log sparsifier  P(x) = λ·log(1 + x²/δ²),  P'(x) = 2λx/(δ²+x²).
@@ -1223,6 +1571,234 @@ fn ard_rho_grad_includes_occam_log_det_term() {
     assert!((dr[1] - 1.0).abs() < 1e-12);
 }
 
+// ----- TotalVariationPenalty / ShapeMonotonicityPenalty tests -----
+
+/// Row-major `(n_eff = 5, d = 2)` target whose edge differences run from
+/// about 0.08 to about 0.92. That span covers both the curved core and the
+/// near-linear tails of the smoothed-L¹ and softplus kernels.
+fn tv_monotonicity_test_target() -> (usize, Array1<f64>, Array1<f64>) {
+    let (n_eff, d) = (5usize, 2usize);
+    let n = n_eff * d;
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.37 * (1.3 * x).sin() + 0.11 * x
+    });
+    let v = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.6 * (0.9 * x + 0.4).cos()
+    });
+    (n_eff, t, v)
+}
+
+/// Total variation had no Rust test of its analytic derivatives or of its
+/// closed-form curvature channels. For both difference operators this pins:
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional),
+/// value -> `grad_rho` (learnable log-weight), the `as_dense` columns against
+/// `hvp` of the unit vectors, and `diag_target` against the dense diagonal.
+/// It also pins the tridiagonal pivot recursion
+/// `log_det_plus_lambda_i_forward_1d` against a dense eigendecomposition, and
+/// the frozen operator's `diag` and `log det(S + λI)` against the dense matrix.
+///
+/// Tolerances. The FD errors come from the central stencil,
+/// `h²/6 |f'''| + ε_mach |f| / h` with `h = 1e-5`. Here `w = 0.7 e^{0.2} ≈ 0.86`,
+/// `ε = 0.5`, and a node has at most 3 edges. The kernel has
+/// `|φ'''| ≤ 0.86/ε² ≈ 3.4` and `|φ''''| ≤ 3/ε³ = 24`.
+/// - value -> grad: about `1.5e-10 + 2.2e-10` (with `|f| ≲ 10`).
+/// - grad -> hvp: along `v` with `|Δv| ≤ 1.2`, about `3e-9`.
+/// - value -> grad_rho: the value is `w₀ e^ρ A`, so its third ρ-derivative is
+///   the value itself, and the error is about `2e-10`.
+/// A `1e-7` tolerance leaves at least 30× margin. The dense and diagonal
+/// channels evaluate the same per-edge curvature `w ε² / r³` as `hvp`, so they
+/// agree to rounding (`1e-12` relative). The log-determinants run on a 10 × 10
+/// SPD matrix with eigenvalues `≥ λ = 0.3` and norm `≲ 20`. Each `log`
+/// therefore carries about `ε_mach · 20 / 0.3`, and `1e-10 · max(|log det|, 1)`
+/// leaves several orders of margin.
+#[test]
+fn total_variation_derivatives_and_curvature_channels_match_central_differences() {
+    let (n_eff, t, v) = tv_monotonicity_test_target();
+    let n = t.len();
+    let h = 1e-5;
+    let tol = 1e-7;
+    let lambda = 0.3;
+    let rho = array![0.2_f64];
+    let graph = vec![(0, 1), (1, 3), (3, 2), (4, 0), (2, 4), (1, 4)];
+    for op_kind in [
+        DifferenceOpKind::ForwardDiff1D,
+        DifferenceOpKind::GraphEdges(graph),
+    ] {
+        let pen = TotalVariationPenalty::new(0.7, n_eff, op_kind.clone(), 0.5, true)
+            .expect("total variation penalty");
+        let label = format!("{op_kind:?}");
+
+        let g = pen.grad_target(t.view(), rho.view());
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += h;
+            tm[i] -= h;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+            assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        }
+
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let tp = &t + &(h * &v);
+        let tm = &t - &(h * &v);
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for i in 0..n {
+            assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+        }
+
+        let gr = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(gr.len(), 1, "{label}: one learnable log-weight");
+        let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+            - pen.value(t.view(), array![0.2 - h].view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+        let dense = pen.as_dense(t.view(), rho.view());
+        let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            scale > 0.0,
+            "{label}: curvature must be nonzero on this target"
+        );
+        let diag = pen.diag_target(t.view(), rho.view());
+        for col in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[col] = 1.0;
+            let column = pen.hvp(t.view(), rho.view(), e.view());
+            for row in 0..n {
+                assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            }
+            assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+        }
+
+        let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+            .expect("dense TV log det");
+        let log_det_tol = 1e-10 * expected.abs().max(1.0);
+        let forward = pen.log_det_plus_lambda_i_forward_1d(t.view(), rho.view(), lambda);
+        match op_kind {
+            DifferenceOpKind::ForwardDiff1D => {
+                let forward = forward.expect("tridiagonal TV log det");
+                assert_abs_diff_eq!(forward, expected, epsilon = log_det_tol);
+            }
+            DifferenceOpKind::GraphEdges(_) => {
+                assert!(
+                    forward.is_err(),
+                    "{label}: the pivot recursion is path-only"
+                );
+            }
+        }
+
+        let op = FrozenAnalyticPenaltyOp::new(
+            AnalyticPenaltyKind::TotalVariation(Arc::new(pen)),
+            t.clone(),
+            rho.clone(),
+        )
+        .expect("frozen TV operator");
+        let frozen_diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(frozen_diag[i], dense[[i, i]], epsilon = 1e-12 * scale);
+        }
+        let frozen_log_det = op.log_det_plus_lambda_i(lambda).expect("frozen TV log det");
+        assert_abs_diff_eq!(frozen_log_det, expected, epsilon = log_det_tol);
+    }
+}
+
+/// Soft monotonicity had no Rust test of its analytic derivatives. For both
+/// directions this pins value -> `grad_target`, `grad_target` -> `hvp`
+/// (directional) and value -> `grad_rho`. It also checks that the Hessian
+/// assembled from `hvp` of the unit vectors is symmetric and PSD, as the
+/// convexity of softplus requires.
+///
+/// Tolerances. The per-edge value is `w ε softplus(z)` with `z = ∓Δ/ε`,
+/// `w = 0.7 e^{0.2} ≈ 0.86` and `ε = 0.3`. Its slope derivatives are bounded
+/// by `|softplus'''| ≤ 1/(6√3)` and `|softplus''''| ≤ 1/8`. So
+/// `|f'''| ≤ 2 w · 0.096 / ε² ≈ 1.8` and `|f''''| ≤ 2 w · 0.125 / ε³ ≈ 8`
+/// (at most 2 edges per node). With `h = 1e-5`, `|f| ≲ 5` and `|Δv| ≤ 1.2`:
+/// - value -> grad: about `3e-11 + 1.1e-10`.
+/// - grad -> hvp: about `2.4e-10`.
+/// - value -> grad_rho: about `1e-10`.
+/// A `1e-7` tolerance leaves at least 400× margin. Symmetry is exact up to the
+/// shared edge factor (`1e-12` relative). The smallest eigenvalue of a PSD
+/// matrix computed by `eigh` is off by about `ε_mach ‖H‖`, which is covered
+/// by `-1e-12 · scale`.
+#[test]
+fn monotonicity_derivatives_match_central_differences_and_hessian_is_psd() {
+    let (n_eff, t, v) = tv_monotonicity_test_target();
+    let n = t.len();
+    let h = 1e-5;
+    let tol = 1e-7;
+    let rho = array![0.2_f64];
+    for direction in [1.0_f64, -1.0] {
+        let pen = ShapeMonotonicityPenalty::new(0.7, n_eff, direction, 0.3, true)
+            .expect("monotonicity penalty");
+
+        let g = pen.grad_target(t.view(), rho.view());
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += h;
+            tm[i] -= h;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+            assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        }
+
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let tp = &t + &(h * &v);
+        let tm = &t - &(h * &v);
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for i in 0..n {
+            assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+        }
+
+        let gr = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(
+            gr.len(),
+            1,
+            "direction {direction}: one learnable log-weight"
+        );
+        let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+            - pen.value(t.view(), array![0.2 - h].view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        for col in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[col] = 1.0;
+            let column = pen.hvp(t.view(), rho.view(), e.view());
+            for row in 0..n {
+                hessian[[row, col]] = column[row];
+            }
+        }
+        let scale = hessian.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            scale > 0.0,
+            "direction {direction}: curvature must be nonzero"
+        );
+        for row in 0..n {
+            for col in 0..n {
+                assert_abs_diff_eq!(
+                    hessian[[row, col]],
+                    hessian[[col, row]],
+                    epsilon = 1e-12 * scale
+                );
+            }
+        }
+        let (evals, _) = hessian
+            .eigh(Side::Lower)
+            .expect("monotonicity Hessian eigh");
+        let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+        assert!(
+            min_eval >= -1e-12 * scale,
+            "direction {direction}: softplus curvature must be PSD; min eigenvalue {min_eval:.3e}"
+        );
+    }
+}
 // ----- BlockOrthogonalityPenalty tests -----
 
 fn block_ortho_test_target() -> Array1<f64> {
@@ -1319,7 +1895,11 @@ fn block_orthogonality_hvp_matches_gradient_directional_derivative() {
 }
 
 #[test]
-fn block_orthogonality_hessian_diag_matches_finite_difference() {
+fn block_orthogonality_hessian_is_dense_so_it_exposes_no_diagonal_3863() {
+    // The exact Hessian couples every row, so a `Some` diagonal would be read
+    // as the curvature (default `psd_majorizer_hvp`, SAE `htt`, spatial
+    // hyper-direction Hessian) and understate it. The exact curvature is the
+    // HVP, whose unit-probe diagonal matches finite differences of the gradient.
     let t = block_ortho_test_target();
     let n = t.len();
     let target = PsiSlice::full(n, Some(4));
@@ -1327,25 +1907,212 @@ fn block_orthogonality_hessian_diag_matches_finite_difference() {
         BlockOrthogonalityPenalty::new(target, vec![vec![0_usize, 1], vec![2, 3]], 0.9, 4, false)
             .expect("valid block orthogonality penalty");
     let rho = array![0.0_f64];
-    let diag = pen
-        .hessian_diag(t.view(), rho.view())
-        .expect("hessian_diag must be available");
-    assert_eq!(diag.len(), n);
+    assert!(pen.hessian_diag(t.view(), rho.view()).is_none());
+    assert!(pen.psd_majorizer_diag(t.view(), rho.view()).is_none());
     let eps = 1e-5;
+    let mut e = Array1::<f64>::zeros(n);
     for i in 0..n {
+        e[i] = 1.0;
+        let h_ii = pen.hvp(t.view(), rho.view(), e.view())[i];
+        e[i] = 0.0;
         let mut tp = t.clone();
         let mut tm = t.clone();
         tp[i] += eps;
         tm[i] -= eps;
         let gp = pen.grad_target(tp.view(), rho.view())[i];
         let gm = pen.grad_target(tm.view(), rho.view())[i];
-        let fd = (gp - gm) / (2.0 * eps);
-        assert_abs_diff_eq!(diag[i], fd, epsilon = 1e-5);
+        assert_abs_diff_eq!(h_ii, (gp - gm) / (2.0 * eps), epsilon = 1e-5);
+    }
+}
+
+/// Dense matrix of `op(e_j)` over the standard basis.
+fn dense_from_probes(n: usize, op: impl Fn(ArrayView1<'_, f64>) -> Array1<f64>) -> Array2<f64> {
+    let mut dense = Array2::<f64>::zeros((n, n));
+    let mut e = Array1::<f64>::zeros(n);
+    for j in 0..n {
+        e[j] = 1.0;
+        dense.column_mut(j).assign(&op(e.view()));
+        e[j] = 0.0;
+    }
+    dense
+}
+
+fn symmetric_eigenvalues(m: &Array2<f64>) -> Array1<f64> {
+    let (evals, _) = m.eigh(Side::Lower).expect("symmetric eigendecomposition");
+    evals
+}
+
+fn min_eigenvalue(m: &Array2<f64>) -> f64 {
+    symmetric_eigenvalues(m)
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn spectral_radius(m: &Array2<f64>) -> f64 {
+    symmetric_eigenvalues(m)
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+/// Deterministic, non-degenerate `n × d` latent block, row-major.
+fn pseudo_random_block(n_obs: usize, d: usize, amplitude: f64) -> Array1<f64> {
+    Array1::from_shape_fn(n_obs * d, |i| {
+        amplitude * ((1.7 * i as f64 + 0.3).sin() + 0.5 * (0.9 * (i * i) as f64 + 1.1).cos())
+    })
+}
+
+/// #3863 — BlockOrthogonality's PSD majorizer used to be the exact Hessian
+/// diagonal, which is not `⪰ H` (the issue's FD table: λ_min(diag(H) − H) =
+/// −14.46 and −11.78). The row-block majorizer `I_n ⊗ M` must dominate the
+/// exact, indefinite Hessian, be PSD, and be row-block diagonal with the block
+/// `psd_majorizer_row_block` reports (the shape the SAE `htt` probe assumes).
+#[test]
+fn block_orthogonality_psd_majorizer_dominates_exact_hessian_3863() {
+    let cases: Vec<(Array1<f64>, usize, usize, Vec<Vec<usize>>, f64)> = vec![
+        (block_ortho_test_target(), 4, 4, vec![vec![0, 1], vec![2, 3]], 0.9),
+        (pseudo_random_block(4, 2, 1.0), 4, 2, vec![vec![0], vec![1]], 1.0),
+        (pseudo_random_block(6, 3, 1.0), 6, 3, vec![vec![0], vec![1, 2]], 1.0),
+        (pseudo_random_block(7, 5, 0.6), 7, 5, vec![vec![0, 3], vec![1], vec![2, 4]], 2.3),
+    ];
+    let rho = array![0.0_f64];
+    for (t, n_obs, d, groups, weight) in cases {
+        let dim = n_obs * d;
+        let pen = BlockOrthogonalityPenalty::new(
+            PsiSlice::full(dim, Some(d)),
+            groups.clone(),
+            weight,
+            n_obs,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let exact = pen.as_dense(t.view(), rho.view());
+        let majorizer =
+            dense_from_probes(dim, |v| pen.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let block = pen
+            .psd_majorizer_row_block(t.view(), rho.view())
+            .expect("row-block majorizer");
+        let scale = spectral_radius(&exact).max(spectral_radius(&majorizer));
+        let tol = 1e-12 * scale;
+        for i in 0..dim {
+            for j in 0..dim {
+                let expected = if i / d == j / d {
+                    block[[i % d, j % d]]
+                } else {
+                    0.0
+                };
+                assert_eq!(majorizer[[i, j]], expected, "{groups:?}: B is not I_n ⊗ M");
+            }
+        }
         assert!(
-            diag[i] >= 0.0,
-            "hessian_diag entry must be PSD; got {}",
-            diag[i]
+            min_eigenvalue(&majorizer) >= -tol,
+            "{groups:?}: majorizer is not PSD"
         );
+        let gap = &majorizer - &exact;
+        let gap_min = min_eigenvalue(&gap);
+        assert!(
+            gap_min >= -tol,
+            "{groups:?}: λ_min(B − H) = {gap_min:.3e} < 0; B does not majorize H"
+        );
+        if n_obs != 4 || d != 4 {
+            // The generic blocks reproduce the issue's defect: H is indefinite
+            // and its own diagonal does not majorize it.
+            assert!(min_eigenvalue(&exact) < -tol, "{groups:?}: H should be indefinite");
+            let diag_gap = Array2::from_diag(&exact.diag()) - &exact;
+            assert!(
+                min_eigenvalue(&diag_gap) < -tol,
+                "{groups:?}: diag(H) should fail to majorize H"
+            );
+        }
+    }
+}
+
+/// #3863 — OrthogonalityPenalty had no majorizer, so `psd_majorizer_hvp` was
+/// the exact, indefinite HVP. Replacing `G = TᵀT − I` by its PSD part must give
+/// a PSD operator that dominates `H`, and where `G ⪰ 0` already (every
+/// eigenvalue of `TᵀT` above one) it must coincide with `H` up to the
+/// certified rounding lift.
+#[test]
+fn orthogonality_psd_majorizer_dominates_exact_hessian_3863() {
+    let rho = array![0.0_f64];
+    for (n_obs, d, amplitude, expect_indefinite) in
+        [(5_usize, 2_usize, 0.3, true), (6, 3, 0.4, true), (6, 2, 3.0, false)]
+    {
+        let dim = n_obs * d;
+        let pen = OrthogonalityPenalty::new(PsiSlice::full(dim, Some(d)), d, 1.7, n_obs, false)
+            .expect("valid orthogonality penalty");
+        let t = pseudo_random_block(n_obs, d, amplitude);
+        let exact = dense_from_probes(dim, |v| pen.hvp(t.view(), rho.view(), v));
+        let majorizer =
+            dense_from_probes(dim, |v| pen.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let scale = spectral_radius(&exact).max(spectral_radius(&majorizer));
+        let tol = 1e-12 * scale;
+        assert_eq!(min_eigenvalue(&exact) < -tol, expect_indefinite);
+        assert!(min_eigenvalue(&majorizer) >= -tol, "majorizer is not PSD");
+        let gap = &majorizer - &exact;
+        assert!(min_eigenvalue(&gap) >= -tol, "B does not majorize H");
+        if !expect_indefinite {
+            assert!(
+                spectral_radius(&gap) <= 1e-10 * scale,
+                "majorizer must equal H where TᵀT ⪰ I"
+            );
+        }
+    }
+}
+
+/// #3863 — the frozen operator answered `matvec`/`diag` from the majorizer but
+/// `as_dense`/`log det` from the exact Hessian (BlockOrthogonality), or refused
+/// the log det outright (Orthogonality). All four faces now read one PSD
+/// majorizer.
+#[test]
+fn frozen_orthogonality_operators_read_one_psd_majorizer_3863() {
+    let n_obs = 6;
+    let d = 3;
+    let dim = n_obs * d;
+    let t = pseudo_random_block(n_obs, d, 0.4);
+    let kinds = vec![
+        AnalyticPenaltyKind::BlockOrthogonality(Arc::new(
+            BlockOrthogonalityPenalty::new(
+                PsiSlice::full(dim, Some(d)),
+                vec![vec![0], vec![1, 2]],
+                1.3,
+                n_obs,
+                false,
+            )
+            .expect("block orthogonality"),
+        )),
+        AnalyticPenaltyKind::Orthogonality(Arc::new(
+            OrthogonalityPenalty::new(PsiSlice::full(dim, Some(d)), d, 1.3, n_obs, false)
+                .expect("orthogonality"),
+        )),
+    ];
+    for kind in kinds {
+        let rho = Array1::<f64>::zeros(kind.rho_count());
+        let majorizer =
+            dense_from_probes(dim, |v| kind.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let op = FrozenAnalyticPenaltyOp::new(kind, t.clone(), rho).expect("frozen operator");
+        let scale = spectral_radius(&majorizer);
+        let dense = op.as_dense();
+        let diag = op.diag();
+        let mut matvec_dense = Array2::<f64>::zeros((dim, dim));
+        let mut e = Array1::<f64>::zeros(dim);
+        for j in 0..dim {
+            e[j] = 1.0;
+            op.matvec(e.view(), matvec_dense.column_mut(j));
+            e[j] = 0.0;
+        }
+        for i in 0..dim {
+            assert_abs_diff_eq!(diag[i], majorizer[[i, i]], epsilon = 1e-12 * scale);
+            for j in 0..dim {
+                assert_abs_diff_eq!(dense[[i, j]], majorizer[[i, j]], epsilon = 1e-12 * scale);
+                assert_abs_diff_eq!(matvec_dense[[i, j]], majorizer[[i, j]], epsilon = 1e-12 * scale);
+            }
+        }
+        let lambda = 0.3;
+        let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&majorizer, lambda)
+            .expect("dense log det");
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-10 * expected.abs().max(1.0));
     }
 }
 
@@ -1362,6 +2129,218 @@ fn block_orthogonality_rejects_groups_missing_an_axis() {
         err.contains("must partition latent axes") && err.contains("missing axis 3"),
         "unexpected error message: {err}"
     );
+}
+
+// ----- BlockSparsityPenalty tests -----
+
+fn block_sparsity_test_target() -> Array1<f64> {
+    // n_eff = 2 rows, latent_dim = 3, row-major (row*d + axis):
+    // T = [[ 0.4, -0.3,  0.2],
+    //      [-0.1,  0.6,  0.5]]
+    // Group {0, 1} spans both rows (norm² 0.62), group {2} both rows (norm² 0.29).
+    array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5]
+}
+
+fn build_block_sparsity(learnable_weight: bool) -> BlockSparsityPenalty {
+    let t = block_sparsity_test_target();
+    BlockSparsityPenalty::new(
+        PsiSlice::full(t.len(), Some(3)),
+        vec![vec![0_usize, 1], vec![2]],
+        0.8,
+        2,
+        1e-2,
+        learnable_weight,
+    )
+    .expect("valid block sparsity penalty")
+}
+
+/// Smallest smoothed group norm `s_g = sqrt(‖T_g‖² + ε²)` of the fixture, and the
+/// largest `sqrt(|g|)` factor: the two numbers the finite-difference truncation bounds
+/// below read.
+fn block_sparsity_fixture_scales(penalty: &BlockSparsityPenalty, t: &Array1<f64>) -> (f64, f64) {
+    let d = t.len() / penalty.n_eff;
+    let mut min_norm = f64::INFINITY;
+    let mut max_size_factor = 0.0_f64;
+    for group in &penalty.groups {
+        let mut norm2 = penalty.smoothing_eps * penalty.smoothing_eps;
+        for row in 0..penalty.n_eff {
+            for &axis in group {
+                norm2 += t[row * d + axis] * t[row * d + axis];
+            }
+        }
+        min_norm = min_norm.min(norm2.sqrt());
+        max_size_factor = max_size_factor.max((group.len() as f64).sqrt());
+    }
+    (min_norm, max_size_factor)
+}
+
+/// The group-lasso gradient `w·sqrt(|g|)·t_i / s_g` is the derivative of the value.
+///
+/// Tolerance: a central difference with step `h` of a value `P` evaluated to relative
+/// accuracy `k·ε` (k = 32 bounds the rounded operations in one value: the squares and
+/// sums of a group norm, its square root, the `sqrt(|g|)` scaling and the group sum)
+/// errs by at most `k·ε·|P|/h` from rounding plus `h²/6·max|∂³P/∂t_i³|` from
+/// truncation. Along one coordinate `P` is `w·sqrt(|g|)·sqrt(x² + c)`, whose third
+/// derivative `-3xc/(x² + c)^{5/2}` is bounded by `3/s²`; at `h ≪ s_min` the bound
+/// holds at `s_min/2`, giving `h²/6·w·sqrt(|g|)·12/s_min²`.
+#[test]
+fn block_sparsity_grad_matches_finite_difference() {
+    let penalty = build_block_sparsity(false);
+    let t = block_sparsity_test_target();
+    let rho = Array1::<f64>::zeros(0);
+    let grad = penalty.grad_target(t.view(), rho.view());
+    let h = 1e-6;
+    let fd = gam_linalg_test_support::fd_checker::numerical_gradient_central_diff(
+        |tv| penalty.value(tv.view(), rho.view()),
+        &t,
+        h,
+    );
+    let (s_min, size_factor) = block_sparsity_fixture_scales(&penalty, &t);
+    let value = penalty.value(t.view(), rho.view());
+    let tol = 32.0 * f64::EPSILON * value.abs() / h
+        + h * h / 6.0 * penalty.weight * size_factor * 12.0 / (s_min * s_min);
+    for i in 0..t.len() {
+        assert!(
+            (grad[i] - fd[i]).abs() <= tol,
+            "grad[{i}] = {:.15e}, central difference {:.15e}, bound {tol:.3e}",
+            grad[i],
+            fd[i]
+        );
+    }
+}
+
+/// The closed-form Hessian-vector product `w·sqrt(|g|)·(v/s − t·(tᵀv)/s³)` is the
+/// directional derivative of the gradient.
+///
+/// Tolerance: the gradient is formed to relative accuracy `k·ε` (k = 32 as above), so
+/// the central difference of it along `v` rounds by at most `k·ε·‖∇P‖∞/h`. Its
+/// truncation is `h²/6` times the fourth directional derivative of the smoothed norm,
+/// bounded by `15·‖v‖³/s³` for `sqrt(‖x‖² + ε²)`; again evaluated at `s_min/2`.
+#[test]
+fn block_sparsity_hvp_matches_gradient_directional_derivative() {
+    let penalty = build_block_sparsity(false);
+    let t = block_sparsity_test_target();
+    let n = t.len();
+    let rho = Array1::<f64>::zeros(0);
+    let v: Array1<f64> = Array1::from_shape_fn(n, |i| 0.2 * ((i as f64) + 1.3).cos());
+    let hv = penalty.hvp(t.view(), rho.view(), v.view());
+    let h = 1e-5;
+    let tp = &t + &(&v * h);
+    let tm = &t - &(&v * h);
+    let gp = penalty.grad_target(tp.view(), rho.view());
+    let gm = penalty.grad_target(tm.view(), rho.view());
+    let grad = penalty.grad_target(t.view(), rho.view());
+    let grad_scale = grad.iter().fold(0.0_f64, |acc, &g| acc.max(g.abs()));
+    let v_norm = v.dot(&v).sqrt();
+    let (s_min, size_factor) = block_sparsity_fixture_scales(&penalty, &t);
+    let half = 0.5 * s_min;
+    let tol = 32.0 * f64::EPSILON * grad_scale / h
+        + h * h / 6.0 * penalty.weight * size_factor * 15.0 * v_norm.powi(3) / (half * half * half);
+    for i in 0..n {
+        let fd = (gp[i] - gm[i]) / (2.0 * h);
+        assert!(
+            (hv[i] - fd).abs() <= tol,
+            "hvp[{i}] = {:.15e}, directional difference {fd:.15e}, bound {tol:.3e}",
+            hv[i]
+        );
+    }
+}
+
+/// `as_dense` and `diag_target` feed the frozen operator's dense log-determinant and
+/// its diagonal. Each column of `as_dense` is the finite-difference-checked `hvp` of
+/// the matching unit vector, and `diag_target` is `as_dense`'s diagonal. The three
+/// evaluate the same closed form entry by entry, so they agree to the rounding of
+/// one entry, bounded by `32·ε` times the largest entry.
+#[test]
+fn block_sparsity_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_block_sparsity(true);
+    let t = block_sparsity_test_target();
+    let n = t.len();
+    let rho = array![0.3_f64];
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0);
+    let tol = 32.0 * f64::EPSILON * scale;
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        let column = penalty.hvp(t.view(), rho.view(), e.view());
+        for i in 0..n {
+            assert!(
+                (dense[[i, j]] - column[i]).abs() <= tol,
+                "as_dense[{i}, {j}] = {:.15e}, hvp(e_{j})[{i}] = {:.15e}",
+                dense[[i, j]],
+                column[i]
+            );
+        }
+        assert!(
+            (diag[j] - dense[[j, j]]).abs() <= tol,
+            "diag_target[{j}] = {:.15e}, as_dense[{j}, {j}] = {:.15e}",
+            diag[j],
+            dense[[j, j]]
+        );
+    }
+}
+
+/// With a learnable weight `w·exp(ρ)`, `grad_rho` is the ρ-derivative of the value.
+///
+/// Tolerance: `P(ρ) = P(0)·exp(ρ)`, so the central difference rounds by at most
+/// `k·ε·|P|/h` and truncates by `h²/6·|∂³P/∂ρ³| = h²/6·|P|` (at `h ≪ 1`).
+#[test]
+fn block_sparsity_grad_rho_matches_finite_difference() {
+    let penalty = build_block_sparsity(true);
+    let t = block_sparsity_test_target();
+    let rho = array![0.3_f64];
+    let grad_rho = penalty.grad_rho(t.view(), rho.view());
+    assert_eq!(grad_rho.len(), 1);
+    let h = 1e-6;
+    let value = penalty.value(t.view(), rho.view());
+    let fd = (penalty.value(t.view(), array![0.3 + h].view())
+        - penalty.value(t.view(), array![0.3 - h].view()))
+        / (2.0 * h);
+    let tol = 32.0 * f64::EPSILON * value.abs() / h + h * h / 6.0 * value.abs();
+    assert!(
+        (grad_rho[0] - fd).abs() <= tol,
+        "grad_rho = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+        grad_rho[0]
+    );
+}
+
+/// `MechanismSparsityPenalty::as_dense` and `diag_target` feed the frozen operator
+/// like the block penalty's; each column of `as_dense` is the finite-difference-checked
+/// `hvp` of the matching unit vector and `diag_target` is its diagonal, to the rounding
+/// of one entry (`32·ε` times the largest entry).
+#[test]
+fn mechanism_sparsity_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_mech_sparsity(0.5);
+    let t = mech_sparsity_test_target();
+    let n = t.len();
+    let rho = Array1::<f64>::zeros(0);
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0);
+    let tol = 32.0 * f64::EPSILON * scale;
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        let column = penalty.hvp(t.view(), rho.view(), e.view());
+        for i in 0..n {
+            assert!(
+                (dense[[i, j]] - column[i]).abs() <= tol,
+                "as_dense[{i}, {j}] = {:.15e}, hvp(e_{j})[{i}] = {:.15e}",
+                dense[[i, j]],
+                column[i]
+            );
+        }
+        assert!(
+            (diag[j] - dense[[j, j]]).abs() <= tol,
+            "diag_target[{j}] = {:.15e}, as_dense[{j}, {j}] = {:.15e}",
+            diag[j],
+            dense[[j, j]]
+        );
+    }
 }
 
 // ----- MechanismSparsityPenalty tests -----
@@ -1681,6 +2660,142 @@ fn scadmcp_value_grad_self_consistent_fd() {
         worst <= 1.0e-5,
         "ScadMcp value↔grad FD max abs error = {worst:.3e}"
     );
+}
+
+/// The frozen SCAD/MCP operator applies the PSD majorizer in `matvec`, but its
+/// `diag` and `log_det_plus_lambda_i` used to read the exact Hessian diagonal,
+/// which carries the concave constant `−1/γ` (MCP) / `−1/(γ−1)` (SCAD) across
+/// the taper region: the operator disagreed with itself, and a small `λ`
+/// shift made the log-determinant refuse. All three must be the majorizer.
+#[test]
+fn scadmcp_frozen_diag_and_log_det_are_the_psd_majorizer() {
+    let n_eff = 6usize;
+    let t = array![0.02_f64, 0.3, 0.9, 1.6, -1.1, -2.5];
+    let rho = Array1::<f64>::zeros(0);
+    for (variant, gamma) in [(PenaltyConcavity::Mcp, 3.0), (PenaltyConcavity::Scad, 3.7)] {
+        let pen = ScadMcpPenalty::new(
+            PsiSlice::full(n_eff, Some(1)),
+            0.5,
+            n_eff,
+            gamma,
+            1.0e-4,
+            variant,
+            false,
+        )
+        .unwrap();
+        let exact = pen.hessian_diag(t.view(), rho.view()).unwrap();
+        let majorizer = pen.psd_majorizer_diag(t.view(), rho.view()).unwrap();
+        let lambda = 0.1;
+        assert!(
+            exact.iter().any(|&h| h + lambda < 0.0),
+            "{variant:?}: the exact diagonal is negative past the λ shift in the taper"
+        );
+        let kind = AnalyticPenaltyKind::ScadMcp(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, t.clone(), rho.clone()).unwrap();
+        let diag = op.diag();
+        let mut e = Array1::<f64>::zeros(n_eff);
+        let mut column = Array1::<f64>::zeros(n_eff);
+        let mut expected = 0.0;
+        for i in 0..n_eff {
+            assert!(majorizer[i] >= 0.0, "{variant:?}: B must be PSD");
+            assert!(
+                majorizer[i] >= exact[i],
+                "{variant:?}: B must dominate the exact Hessian"
+            );
+            e[i] = 1.0;
+            op.matvec(e.view(), column.view_mut());
+            e[i] = 0.0;
+            assert_eq!(diag[i], majorizer[i], "{variant:?}: diag is the majorizer");
+            assert_eq!(column[i], diag[i], "{variant:?}: diag agrees with matvec");
+            expected += (majorizer[i] + lambda).ln();
+        }
+        let log_det = op
+            .log_det_plus_lambda_i(lambda)
+            .expect("the majorizer log-determinant is finite for every λ > 0");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
+}
+
+/// Both SCAD and MCP, with a learnable weight, checked against central
+/// differences in every analytic channel: `grad_target` against `value`,
+/// `hessian_diag` against `grad_target` (the penalty is coordinate-separable,
+/// so the diagonal is the whole Hessian), and `grad_rho` against `value` in
+/// the log-weight.
+///
+/// The effective weight is `w = 0.5·e^{0.2} ≈ 0.611` and `ε = 0.05`. The SCAD
+/// knots (`γ = 3.7`) are at `r = w ≈ 0.611` and `r = γw ≈ 2.260`; the MCP knot
+/// (`γ = 3`) is at `r = γw ≈ 1.832`. Every probe sits at least 0.16 from a knot,
+/// so the `h = 1e-5` stencil never straddles one, and together the probes hit
+/// every branch of both variants (SCAD linear / quadratic / flat, MCP
+/// active / flat).
+///
+/// Tolerances come from the stencil error `h²/6·|f'''| + ε_mach·|f|/h`. The
+/// largest third derivative is at `t = 0.03` (`r ≈ 0.058`, closest to the
+/// smoothing scale):
+/// * value→grad: `|f'''| = 3wε²|t|/r⁵ ≈ 2e2`, so the error is ≈ `3e-9`
+///   (tolerance `1e-7`);
+/// * grad→hessian: `|f''''| = 3wε²|r⁻⁵ − 5t²r⁻⁷| ≈ 2.2e3`, so the error is
+///   ≈ `4e-8` (tolerance `1e-6`);
+/// * value→grad_rho: on each branch `value = a·w + b·w² + c` in `w = w₀e^ρ`,
+///   so `∂³/∂ρ³ = a·w + 8b·w²`, which sums to ≈ 16 over these probes. The
+///   error is then ≈ `3e-10` (tolerance `1e-7`).
+#[test]
+fn scadmcp_learnable_hessian_and_grad_rho_match_central_differences() {
+    let t = array![0.03_f64, -0.2, 0.9, -1.4, 2.0, 2.8, -3.1];
+    let n_eff = t.len();
+    let rho = array![0.2_f64];
+    let h = 1.0e-5;
+    for (variant, gamma) in [(PenaltyConcavity::Scad, 3.7), (PenaltyConcavity::Mcp, 3.0)] {
+        let pen = ScadMcpPenalty::new(
+            PsiSlice::full(n_eff, Some(1)),
+            0.5,
+            n_eff,
+            gamma,
+            0.05,
+            variant,
+            true,
+        )
+        .unwrap();
+        assert_eq!(pen.rho_count(), 1);
+
+        let worst_grad = value_grad_fd_max_abs_error(&pen, t.view(), rho.view(), h);
+        assert!(
+            worst_grad <= 1.0e-7,
+            "{variant:?} value↔grad FD max abs error = {worst_grad:.3e}"
+        );
+
+        let hess = pen
+            .hessian_diag(t.view(), rho.view())
+            .expect("SCAD/MCP expose an exact Hessian diagonal");
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        for i in 0..n_eff {
+            tp[i] = t[i] + h;
+            tm[i] = t[i] - h;
+            let fd = (pen.grad_target(tp.view(), rho.view())[i]
+                - pen.grad_target(tm.view(), rho.view())[i])
+                / (2.0 * h);
+            tp[i] = t[i];
+            tm[i] = t[i];
+            assert!(
+                (hess[i] - fd).abs() <= 1.0e-6,
+                "{variant:?} hessian_diag[{i}] = {} vs FD {fd} at t = {}",
+                hess[i],
+                t[i]
+            );
+        }
+
+        let grad_rho = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(grad_rho.len(), 1);
+        let fd_rho = (pen.value(t.view(), array![rho[0] + h].view())
+            - pen.value(t.view(), array![rho[0] - h].view()))
+            / (2.0 * h);
+        assert!(
+            (grad_rho[0] - fd_rho).abs() <= 1.0e-7,
+            "{variant:?} grad_rho = {} vs FD {fd_rho}",
+            grad_rho[0]
+        );
+    }
 }
 
 #[test]
@@ -2597,6 +3712,151 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
 }
 
+/// Checks `grad_target`, `hvp` and `grad_rho` of a learnable-weight quadratic penalty
+/// `P(t, ρ) = ½·w·tᵀHt − ½·len·ln w`, `w = w₀·exp(ρ)`, against central differences
+/// of `value` and `grad_target`.
+///
+/// `unit_abs(x)` is `|H|·x` for `w = 1`: applied to `|t|` it bounds, entry by entry,
+/// the sums of absolute terms a component of `H·t` is formed from, so `k·ε·w·unit_abs`
+/// bounds the rounding of the analytic gradient (k = 32 covers the few rounded
+/// operations per term). The value rounds by at most `k·ε·value_scale`, with
+/// `value_scale(x, w) = ½·w·xᵀ·unit_abs(x) + ½·len·(|ln w| + 1)`.
+///
+/// * `P` is quadratic in `t`, so the central difference of the value along `e_i` has
+///   no truncation error; it rounds by at most `k·ε·value_scale(|t| + h, w)/h`.
+/// * `grad_target` is linear in `t`, so its central difference along `v` is exact in
+///   exact arithmetic and rounds by at most `k·ε·w·unit_abs(|t| + h|v|)_i/h`; the
+///   product itself rounds by `k·ε·w·unit_abs(|v|)_i`.
+/// * Along `ρ`, `∂³P/∂ρ³ = ½·w·tᵀHt`, so the central difference in `ρ` truncates by at
+///   most `h²/6·½·w(ρ + h)·|t|ᵀ·unit_abs(|t|)` and rounds by
+///   `k·ε·value_scale(|t|, w(ρ ± h))/h`.
+fn assert_learnable_quadratic_penalty_derivatives<P: AnalyticPenalty>(
+    penalty: &P,
+    base_weight: f64,
+    t: &Array1<f64>,
+    rho: f64,
+    v: &Array1<f64>,
+    unit_abs: impl Fn(&Array1<f64>) -> Array1<f64>,
+) {
+    let k = 32.0 * f64::EPSILON;
+    let n = t.len();
+    let len = n as f64;
+    let value_scale =
+        |x: &Array1<f64>, w: f64| 0.5 * w * x.dot(&unit_abs(x)) + 0.5 * len * (w.ln().abs() + 1.0);
+    let rho_at = |r: f64| array![r];
+    let rho_v = rho_at(rho);
+    let w = base_weight * rho.exp();
+    let t_abs = t.mapv(f64::abs);
+    let v_abs = v.mapv(f64::abs);
+
+    let h = 1e-3;
+    let grad = penalty.grad_target(t.view(), rho_v.view());
+    let grad_bound = unit_abs(&t_abs);
+    let value_round = k * value_scale(&t_abs.mapv(|x| x + h), w) / h;
+    for i in 0..n {
+        let mut tp = t.clone();
+        tp[i] += h;
+        let mut tm = t.clone();
+        tm[i] -= h;
+        let fd = (penalty.value(tp.view(), rho_v.view()) - penalty.value(tm.view(), rho_v.view()))
+            / (2.0 * h);
+        let tol = value_round + k * w * grad_bound[i];
+        assert!(
+            (grad[i] - fd).abs() <= tol,
+            "grad[{i}] = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+            grad[i]
+        );
+    }
+
+    let hv = penalty.hvp(t.view(), rho_v.view(), v.view());
+    let gp = penalty.grad_target((t + &(v * h)).view(), rho_v.view());
+    let gm = penalty.grad_target((t - &(v * h)).view(), rho_v.view());
+    let fd_bound = unit_abs(&(&t_abs + &(&v_abs * h)));
+    let hv_bound = unit_abs(&v_abs);
+    for i in 0..n {
+        let fd = (gp[i] - gm[i]) / (2.0 * h);
+        let tol = k * (w * fd_bound[i] / h + w * hv_bound[i]);
+        assert!(
+            (hv[i] - fd).abs() <= tol,
+            "hvp[{i}] = {:.15e}, directional difference {fd:.15e}, bound {tol:.3e}",
+            hv[i]
+        );
+    }
+
+    let h_rho = 1e-4;
+    let grad_rho = penalty.grad_rho(t.view(), rho_v.view());
+    assert_eq!(grad_rho.len(), 1);
+    let fd = (penalty.value(t.view(), rho_at(rho + h_rho).view())
+        - penalty.value(t.view(), rho_at(rho - h_rho).view()))
+        / (2.0 * h_rho);
+    let w_hi = base_weight * (rho + h_rho).exp();
+    let w_lo = base_weight * (rho - h_rho).exp();
+    let tol = k * value_scale(&t_abs, w_hi).max(value_scale(&t_abs, w_lo)) / h_rho
+        + h_rho * h_rho / 6.0 * 0.5 * w_hi * t_abs.dot(&grad_bound);
+    assert!(
+        (grad_rho[0] - fd).abs() <= tol,
+        "grad_rho = {:.15e}, central difference {fd:.15e}, bound {tol:.3e}",
+        grad_rho[0]
+    );
+}
+
+fn build_row_precision_fixture() -> RowPrecisionPriorPenalty {
+    let lambda = array![
+        [[2.0_f64, 0.3], [0.3, 1.0]],
+        [[1.5, -0.4], [-0.4, 0.9]],
+        [[0.8, 0.2], [0.2, 1.2]]
+    ];
+    RowPrecisionPriorPenalty::new(PsiSlice::full(6, Some(2)), lambda, 0.6, 3, true)
+        .expect("valid row precision prior")
+}
+
+/// The row-precision prior's gradient `w·Λ_n t_n`, its curvature `w·Λ_n v_n` and its
+/// strength derivative `½·w·Σ t_nᵀΛ_n t_n − ½·len` are the derivatives of its value.
+#[test]
+fn row_precision_prior_derivatives_match_finite_differences() {
+    let penalty = build_row_precision_fixture();
+    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5];
+    let v = Array1::from_shape_fn(t.len(), |i| 0.2 * ((i as f64) + 1.3).cos());
+    let lambda = penalty.lambda_per_row.clone();
+    assert_learnable_quadratic_penalty_derivatives(&penalty, 0.6, &t, -0.2, &v, |x| {
+        Array1::from_shape_fn(x.len(), |row| {
+            let (n, i) = (row / 2, row % 2);
+            (0..2)
+                .map(|j| lambda[[n, i, j]].abs() * x[n * 2 + j])
+                .sum::<f64>()
+        })
+    });
+}
+
+/// `as_dense` and `diag_target` of the row-precision prior feed the frozen operator's
+/// exact log-determinant and its diagonal. Every entry of all three is the single
+/// product `w·Λ_nij` (a column of `hvp` adds exact zeros to it), so they agree
+/// exactly; the off-diagonal `Λ` makes the diagonal-only `hessian_diag` decline.
+#[test]
+fn row_precision_prior_dense_hessian_and_diagonal_match_hvp() {
+    let penalty = build_row_precision_fixture();
+    let t = array![0.4_f64, -0.3, 0.2, -0.1, 0.6, 0.5];
+    let n = t.len();
+    let rho = array![-0.2_f64];
+    let dense = penalty.as_dense(t.view(), rho.view());
+    let diag = penalty.diag_target(t.view(), rho.view());
+    for j in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[j] = 1.0;
+        assert_eq!(
+            dense.column(j).to_owned(),
+            penalty.hvp(t.view(), rho.view(), e.view()),
+            "as_dense column {j} differs from hvp(e_{j})"
+        );
+        assert_eq!(
+            diag[j],
+            dense[[j, j]],
+            "diag_target[{j}] differs from as_dense"
+        );
+    }
+    assert!(penalty.hessian_diag(t.view(), rho.view()).is_none());
+}
+
 /// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
 /// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
 /// value, gradient, curvature and the log-determinant agree exactly. An input
@@ -2653,3 +3913,947 @@ fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
     let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
     assert!(refused.unwrap_err().contains("must be positive definite"));
 }
+
+// ----- IvaeRidgeMeanGauge tests -----
+
+/// The iVAE ridge gauge had no Rust test of `hvp`, `grad_rho`, `as_dense`,
+/// `diag_target` or its frozen operator. The only check was a Python
+/// value -> grad test with a fixed weight and `ε = 1e-6`. At that ε the ridge
+/// hat matrix `P = U(UᵀU + εI)⁻¹Uᵀ` is almost idempotent, so it could not tell
+/// `tᵀ(I - P)t` from `||t - Pt||²`. Here `ε = 0.5` separates the two by about
+/// 15%. The value is pinned against the minimized ridge objective
+/// `0.5 μ (||T - UB̂||² + ε||B̂||²)`, with `B̂` solved by an explicit 2 × 2
+/// inverse that is independent of the penalty's eigendecomposition. The test
+/// then checks value -> `grad_target`, `grad_target` -> `hvp`, value ->
+/// `grad_rho` (learnable log-weight), the `as_dense` columns against `hvp`, and
+/// `diag_target` and the frozen operator against the dense matrix. It also
+/// checks that the curvature `μ(I - P) ⊗ I_d` is symmetric positive definite.
+///
+/// Tolerances. The value is quadratic in `t`, so the central stencil has no
+/// truncation error in `t`. Only rounding remains, about
+/// `ε_mach |f| / h ≈ 2.2e-16 · 2 / 1e-5 ≈ 4e-11`. In ρ the value is
+/// `0.5 w₀ e^ρ A - 0.5 N ln(w₀ e^ρ)`. Its third ρ-derivative is
+/// `0.5 w₀ e^ρ A ≲ 1`, so the truncation error is `h²/6 ≈ 2e-11`. A `1e-8`
+/// tolerance leaves more than 100× margin. The dense, diagonal and `hvp`
+/// channels all apply the same `P` entries, so they agree to rounding (`1e-12`
+/// relative). The ridge-objective check is a reassociation of the same sums,
+/// hence `1e-12` relative. The curvature eigenvalues lie in
+/// `[μ ε / (σ_max² + ε), μ] ≈ [0.059, 0.86]`. With `λ = 0.3`, each `log` in
+/// `log det` carries about `ε_mach · 1.2 / 0.3`, so `1e-10 · max(|log det|, 1)`
+/// leaves several orders of margin.
+#[test]
+fn ivae_ridge_mean_gauge_is_the_ridge_objective_and_its_derivatives_match_central_differences() {
+    let (n_eff, d, q) = (6usize, 2usize, 2usize);
+    let n = n_eff * d;
+    let ridge_eps = 0.5;
+    let w0 = 0.7;
+    let h = 1e-5;
+    let tol = 1e-8;
+    let lambda = 0.3;
+    let aux = Array2::from_shape_fn((n_eff, q), |(row, col)| {
+        if col == 0 {
+            1.0
+        } else {
+            0.8 * (0.7 * row as f64 + 0.2).sin()
+        }
+    });
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.45 * (1.1 * x + 0.3).cos() + 0.07 * x
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.5 * (0.8 * i as f64 + 1.0).sin());
+
+    let fixed = IvaeRidgeMeanGauge::new(
+        PsiSlice::full(n, Some(d)),
+        aux.clone(),
+        ridge_eps,
+        w0,
+        n_eff,
+        false,
+    )
+    .expect("fixed-weight iVAE gauge");
+    let gram = aux.t().dot(&aux) + ridge_eps * Array2::<f64>::eye(q);
+    let det = gram[[0, 0]] * gram[[1, 1]] - gram[[0, 1]] * gram[[1, 0]];
+    let gram_inv = array![
+        [gram[[1, 1]] / det, -gram[[0, 1]] / det],
+        [-gram[[1, 0]] / det, gram[[0, 0]] / det]
+    ];
+    let t_mat = t
+        .clone()
+        .into_shape_with_order((n_eff, d))
+        .expect("row-major latent");
+    let b_hat = gram_inv.dot(&aux.t().dot(&t_mat));
+    let fit_residual = &t_mat - &aux.dot(&b_hat);
+    let ridge_objective = 0.5
+        * w0
+        * (fit_residual.iter().map(|x| x * x).sum::<f64>()
+            + ridge_eps * b_hat.iter().map(|x| x * x).sum::<f64>());
+    let empty_rho = Array1::<f64>::zeros(0);
+    let fixed_value = fixed.value(t.view(), empty_rho.view());
+    assert_abs_diff_eq!(
+        fixed_value,
+        ridge_objective,
+        epsilon = 1e-12 * ridge_objective.abs()
+    );
+    assert_eq!(fixed.grad_rho(t.view(), empty_rho.view()).len(), 0);
+
+    let pen = IvaeRidgeMeanGauge::new(PsiSlice::full(n, Some(d)), aux, ridge_eps, w0, n_eff, true)
+        .expect("learnable iVAE gauge");
+    let rho = array![0.2_f64];
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1, "one learnable log-weight");
+    let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+        - pen.value(t.view(), array![0.2 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "the gauge curvature must be nonzero");
+    let diag = pen.diag_target(t.view(), rho.view());
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(
+                dense[[row, col]],
+                dense[[col, row]],
+                epsilon = 1e-12 * scale
+            );
+        }
+        assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+    }
+    let (evals, _) = dense.eigh(Side::Lower).expect("iVAE gauge curvature eigh");
+    let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+    assert!(
+        min_eval > 0.0,
+        "μ(I - P) is positive definite for ε > 0; min eigenvalue {min_eval:.3e}"
+    );
+
+    let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+        .expect("dense iVAE gauge log det");
+    let op = FrozenAnalyticPenaltyOp::new(
+        AnalyticPenaltyKind::IvaeRidgeMeanGauge(Arc::new(pen)),
+        t.clone(),
+        rho.clone(),
+    )
+    .expect("frozen iVAE gauge operator");
+    let frozen_diag = op.diag();
+    for i in 0..n {
+        assert_abs_diff_eq!(frozen_diag[i], dense[[i, i]], epsilon = 1e-12 * scale);
+    }
+    let frozen_log_det = op
+        .log_det_plus_lambda_i(lambda)
+        .expect("frozen iVAE gauge log det");
+    assert_abs_diff_eq!(
+        frozen_log_det,
+        expected,
+        epsilon = 1e-10 * expected.abs().max(1.0)
+    );
+}
+
+// ----- BlockSparsityPenalty tests -----
+
+/// The group-lasso penalty's only Rust test compared the frozen operator's
+/// diagonal and log-determinant with `as_dense`. Nothing checked `as_dense`,
+/// `grad_target`, `hvp` or `grad_rho` against the value itself. This pins
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional) and
+/// value -> `grad_rho` (learnable log-weight) against central differences.
+/// It also checks the `as_dense` columns against `hvp` of the unit vectors,
+/// `diag_target` against the dense diagonal, and that the Hessian
+/// `w √|g| (I/s - x xᵀ/s³)` of the smoothed norm `s = √(‖x‖² + ε²)` is
+/// positive definite: its smallest eigenvalue per group is `w √|g| ε²/s³ > 0`.
+///
+/// Tolerances. The smoothed norm's directional derivatives are bounded by
+/// `|s'''| ≤ 0.86/ε²` and `|s''''| ≤ 3/ε³`. With `ε = 0.3`,
+/// `w = 0.7 e^{0.2} ≈ 0.86` and `√|g| ≤ √2`, that gives
+/// `|f'''| ≲ 12` and `|f''''| ≲ 140`. With `h = 1e-5`:
+/// - value -> grad: `h²/6 · 12 + ε_mach · 3/h ≈ 3e-10`.
+/// - grad -> hvp: along `v` with `‖v‖ ≈ 1.5`, `h²/6 · 140 · 1.5³ ≈ 8e-9`.
+/// - value -> grad_rho: the value is `w₀ e^ρ A`, so its third ρ-derivative is
+///   the value (`≈ 2.8`), which gives `≈ 5e-11`.
+/// A `1e-7` tolerance leaves at least 10× margin. The dense, diagonal and
+/// `hvp` channels evaluate the same per-group factors, so they agree to
+/// rounding (`1e-12` relative).
+#[test]
+fn block_sparsity_derivatives_and_dense_hessian_match_central_differences() {
+    let (n_eff, d) = (4usize, 3usize);
+    let n = n_eff * d;
+    let h = 1e-5;
+    let tol = 1e-7;
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.37 * (1.3 * x).sin() + 0.11 * x - 0.4
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let pen = BlockSparsityPenalty::new(
+        PsiSlice::full(n, Some(d)),
+        vec![vec![0, 2], vec![1]],
+        0.7,
+        n_eff,
+        0.3,
+        true,
+    )
+    .expect("block sparsity penalty");
+    let rho = array![0.2_f64];
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1, "one learnable log-weight");
+    let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+        - pen.value(t.view(), array![0.2 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "group-lasso curvature must be nonzero");
+    let diag = pen.diag_target(t.view(), rho.view());
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+        }
+        assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+    }
+    let (evals, _) = dense.eigh(Side::Lower).expect("group-lasso Hessian eigh");
+    let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+    assert!(
+        min_eval > 0.0,
+        "smoothed group-lasso Hessian must be positive definite; min eigenvalue {min_eval:.3e}"
+    );
+}
+
+/// `OrthogonalityPenalty`, `½ (w e^ρ / n_eff) ‖TᵀT − I‖²_F`, had no Rust test.
+/// On a target with `TᵀT ≺ I` (Gram eigenvalues about 0.13 and 0.93), where the
+/// exact Hessian is indefinite, this pins
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional),
+/// value -> `grad_rho` (learnable log-weight), and the closed-form dense Hessian
+/// `as_dense_with_precomputed_m` against `hvp` of the unit vectors. It also
+/// checks that the dense Hessian is symmetric.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h` with
+/// `h = 1e-5` and `s = 0.9 e^{0.25} / 4 ≈ 0.29`.
+/// - The value is quartic in `T`. Along a coordinate `|f'''| ≲ 1.8` on this
+///   target and `|f| ≈ 0.11`, which gives about `3e-11`.
+/// - The gradient `2 s T (TᵀT − I)` is cubic. Its third derivative along `V` is
+///   bounded by `12 s ‖V‖³_F ≈ 6` (`‖V‖²_F ≈ 1.4`), and `|g| ≲ 1`, which gives
+///   about `1e-10 + 2e-11`.
+/// - The value is `e^ρ` times a constant, so its third ρ-derivative is the
+///   value itself, and the error is about `2e-12`.
+/// A `1e-8` tolerance leaves at least 80× margin. The dense form and `hvp`
+/// evaluate the same bilinear terms in a different order, so they agree to
+/// rounding (`1e-12` relative).
+#[test]
+fn orthogonality_derivatives_and_dense_hessian_match_central_differences() {
+    let (n_obs, d) = (4usize, 2usize);
+    let n = n_obs * d;
+    let pen = OrthogonalityPenalty::new(PsiSlice::full(n, Some(d)), d, 0.9, n_obs, true)
+        .expect("orthogonality penalty");
+    assert_eq!(pen.rho_count(), 1);
+    let rho = array![0.25_f64];
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.5 * (0.7 * x + 0.2).sin() + 0.15 * (1.9 * x).cos()
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let h = 1e-5;
+    let tol = 1e-8;
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1);
+    let fd_rho = (pen.value(t.view(), array![0.25 + h].view())
+        - pen.value(t.view(), array![0.25 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let t_mat = pen.target_matrix(t.view()).expect("n_obs x d target");
+    let gram = OrthogonalityPenalty::gram_minus_identity(t_mat.view());
+    let dense = pen.as_dense_with_precomputed_m(t_mat.view(), gram.view(), pen.scale(rho.view()));
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "curvature must be nonzero on this target");
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(
+                dense[[row, col]],
+                dense[[col, row]],
+                epsilon = 1e-12 * scale
+            );
+        }
+    }
+}
+
+/// The nested-prefix Hessian diagonal had only a sign check. This pins the full
+/// FD Jacobian of `grad_target` against `diag(hessian_diag)`, so it also checks
+/// that the Hessian is exactly diagonal. The fixture has three shells, so the
+/// per-axis weights `W_i` take three distinct values, and it includes a zero entry.
+///
+/// Tolerance. The per-entry gradient is `W x / sqrt(x² + ε²)`. Its third
+/// derivative is `−3 W ε² (r² − 5x²) / r⁷`, bounded by `3 W / ε³` (at `x = 0`).
+/// With `ε = 0.3` and `W ≤ 0.7 e^{0.1} + 0.5 e^{−0.2} + 0.3 e^{0.3} ≈ 1.59`,
+/// that is `≈ 176`, so the `h = 1e-5` stencil error is at most about `3e-9`.
+/// The roundoff is `ε_mach · 1.6 / h ≈ 4e-11`. A `1e-7` tolerance leaves 30× margin.
+#[test]
+fn nested_prefix_hessian_diag_matches_finite_difference_of_gradient() {
+    let (t, _n, f) = nested_prefix_test_target();
+    let n = t.len();
+    let pen = NestedPrefixPenalty::new(
+        PsiSlice::full(n, Some(f)),
+        PenaltyTier::Psi,
+        vec![1_usize, 2, 4],
+        vec![0.7, 0.5, 0.3],
+        0.3,
+    )
+    .expect("valid nested-prefix penalty");
+    let rho = array![0.1_f64, -0.2, 0.3];
+    let diag = pen
+        .hessian_diag(t.view(), rho.view())
+        .expect("nested-prefix Hessian is diagonal");
+    let h = 1e-5;
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = 1e-7);
+        }
+    }
+}
+
+
+
+// ---------------------------------------------------------------------------
+// Central-difference consistency for analytic derivatives that had no FD pin:
+// smoothed total variation (path and graph operators), soft monotonicity, the
+// iVAE ridge conditional-mean gauge, group-lasso block sparsity, the coupled
+// row-precision prior, the Stiefel orthogonality gauge, and the normalized
+// cross-Gram composition behind the decoder-incoherence and subspace-overlap
+// priors.
+//
+// Tolerance derivation. A central difference with step h along a probe v has
+// truncation error h²/6 · |∂³_v f| and roundoff ≈ u·|f|/h (u = 2.2e-16). The
+// fixtures keep every coordinate and probe entry O(1) and every smoothing scale
+// ≥ 0.2, so the largest third directional derivative that enters any check
+// (the TV kernel's fourth derivative 3/ε³ ≈ 375 times |D v|³ ≤ 13) is below
+// 5e3: at h = 1e-5 truncation is ≤ 1e-7 and roundoff ≤ 1e-10. The asserted
+// 1e-6·(1 + |analytic|) bound therefore has an order of magnitude of margin,
+// while any dropped, mis-signed or mis-scaled analytic term (an O(1) relative
+// error) exceeds it by several orders.
+// ---------------------------------------------------------------------------
+
+const DERIV_FD_STEP: f64 = 1.0e-5;
+const DERIV_FD_TOL: f64 = 1.0e-6;
+
+fn assert_fd_close(label: &str, analytic: f64, fd: f64) {
+    let bound = DERIV_FD_TOL * (1.0 + analytic.abs());
+    let err = (analytic - fd).abs();
+    assert!(
+        err <= bound,
+        "{label}: analytic {analytic:.12e} vs central difference {fd:.12e} (|Δ| = {err:.3e} > {bound:.3e})"
+    );
+}
+
+/// Pins value→`grad_target`, `grad_target`→`hvp` along every probe, the convex
+/// identity `psd_majorizer_hvp == hvp`, and value→`grad_rho`.
+fn assert_penalty_derivatives_match_fd(
+    label: &str,
+    pen: &dyn AnalyticPenalty,
+    target: ArrayView1<'_, f64>,
+    rho: ArrayView1<'_, f64>,
+    probes: &[Array1<f64>],
+) {
+    let h = DERIV_FD_STEP;
+    let grad = pen.grad_target(target, rho);
+    let mut tp = target.to_owned();
+    let mut tm = target.to_owned();
+    for i in 0..target.len() {
+        tp[i] = target[i] + h;
+        tm[i] = target[i] - h;
+        let fd = (pen.value(tp.view(), rho) - pen.value(tm.view(), rho)) / (2.0 * h);
+        tp[i] = target[i];
+        tm[i] = target[i];
+        assert_fd_close(&format!("{label} grad[{i}]"), grad[i], fd);
+    }
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(target, rho, v.view());
+        let majorized = pen.psd_majorizer_hvp(target, rho, v.view());
+        let step = v.mapv(|x| x * h);
+        let gp = pen.grad_target((&target + &step).view(), rho);
+        let gm = pen.grad_target((&target - &step).view(), rho);
+        for i in 0..target.len() {
+            let fd = (gp[i] - gm[i]) / (2.0 * h);
+            assert_fd_close(&format!("{label} hvp[{k}][{i}]"), hv[i], fd);
+            // Every penalty checked here is convex, so its PSD majorizer is the
+            // exact Hessian and the two operators must agree to roundoff.
+            assert_abs_diff_eq!(majorized[i], hv[i], epsilon = 1e-12 * (1.0 + hv[i].abs()));
+        }
+    }
+    let grad_rho = pen.grad_rho(target, rho);
+    assert_eq!(grad_rho.len(), pen.rho_count(), "{label} grad_rho length");
+    for k in 0..rho.len() {
+        let mut rp = rho.to_owned();
+        let mut rm = rho.to_owned();
+        rp[k] += h;
+        rm[k] -= h;
+        let fd = (pen.value(target, rp.view()) - pen.value(target, rm.view())) / (2.0 * h);
+        assert_fd_close(&format!("{label} grad_rho[{k}]"), grad_rho[k], fd);
+    }
+}
+
+/// The materialized Hessian must act exactly like the matrix-free `hvp`.
+fn assert_dense_matches_hvp(
+    label: &str,
+    dense: &Array2<f64>,
+    pen: &dyn AnalyticPenalty,
+    target: ArrayView1<'_, f64>,
+    rho: ArrayView1<'_, f64>,
+    probes: &[Array1<f64>],
+) {
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(target, rho, v.view());
+        let dv = dense.dot(v);
+        for i in 0..v.len() {
+            assert!(
+                (dv[i] - hv[i]).abs() <= 1e-12 * (1.0 + hv[i].abs()),
+                "{label} dense·v[{k}][{i}] = {:.12e} but hvp = {:.12e}",
+                dv[i],
+                hv[i]
+            );
+        }
+    }
+}
+
+/// `ln det A` of a symmetric positive-definite matrix by an unpivoted Cholesky
+/// factorization, as an independent dense reference.
+fn cholesky_log_det(a: &Array2<f64>) -> f64 {
+    let n = a.nrows();
+    let mut l = Array2::<f64>::zeros((n, n));
+    let mut log_det = 0.0;
+    for j in 0..n {
+        let mut pivot = a[[j, j]];
+        for k in 0..j {
+            pivot -= l[[j, k]] * l[[j, k]];
+        }
+        assert!(pivot > 0.0, "reference matrix is not positive definite");
+        let ljj = pivot.sqrt();
+        l[[j, j]] = ljj;
+        log_det += 2.0 * ljj.ln();
+        for i in j + 1..n {
+            let mut s = a[[i, j]];
+            for k in 0..j {
+                s -= l[[i, k]] * l[[j, k]];
+            }
+            l[[i, j]] = s / ljj;
+        }
+    }
+    log_det
+}
+
+/// Row-major `(5, 2)` latent block whose edge differences mix the quadratic
+/// regime (|Δ| = 0.05 ≪ ε) with the L¹ regime (|Δ| up to 2.25 ≫ ε), plus two
+/// dense probes.
+fn five_by_two_fixture() -> (Array1<f64>, Vec<Array1<f64>>) {
+    let t = array![
+        0.10_f64, -0.40, 0.15, 0.90, -0.60, 0.95, -0.55, -1.30, 0.40, -1.20
+    ];
+    let probes = vec![
+        array![1.0_f64, -0.5, 0.3, 0.8, -1.1, 0.2, 0.6, -0.4, 0.9, -0.7],
+        array![-0.2_f64, 0.7, 1.0, -0.3, 0.5, 0.4, -0.8, 1.2, -0.6, 0.1],
+    ];
+    (t, probes)
+}
+
+#[test]
+fn total_variation_forward_1d_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.3_f64];
+    let pen = TotalVariationPenalty::new(0.7, 5, DifferenceOpKind::ForwardDiff1D, 0.2, true)
+        .expect("valid forward-difference TV");
+    assert_penalty_derivatives_match_fd("TV forward", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("TV forward", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]])
+        );
+    }
+    // The tridiagonal pivot recurrence behind the frozen operator's log-det must
+    // equal the dense log-det of the same Hessian, including a λ small enough
+    // that the path Laplacian's constant null direction dominates.
+    for &lambda in &[1.0e-3_f64, 0.5, 4.0] {
+        let tridiagonal = pen
+            .log_det_plus_lambda_i_forward_1d(t.view(), rho.view(), lambda)
+            .expect("positive pivots");
+        let mut shifted = dense.clone();
+        for i in 0..t.len() {
+            shifted[[i, i]] += lambda;
+        }
+        let reference = cholesky_log_det(&shifted);
+        assert_abs_diff_eq!(
+            tridiagonal,
+            reference,
+            epsilon = 1e-10 * (1.0 + reference.abs())
+        );
+    }
+}
+
+#[test]
+fn total_variation_graph_edges_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.4_f64];
+    let edges = vec![(0, 2), (2, 1), (3, 1), (0, 4), (4, 3)];
+    let pen = TotalVariationPenalty::new(1.3, 5, DifferenceOpKind::GraphEdges(edges), 0.25, true)
+        .expect("valid graph TV");
+    assert_penalty_derivatives_match_fd("TV graph", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("TV graph", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]])
+        );
+    }
+}
+
+#[test]
+fn shape_monotonicity_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.2_f64];
+    for direction in [1.0_f64, -1.0] {
+        let pen = ShapeMonotonicityPenalty::new(0.6, 5, direction, 0.25, true)
+            .expect("valid monotonicity penalty");
+        assert_penalty_derivatives_match_fd(
+            &format!("monotonicity dir {direction}"),
+            &pen,
+            t.view(),
+            rho.view(),
+            &probes,
+        );
+    }
+}
+
+#[test]
+fn ivae_ridge_mean_gauge_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![0.25_f64];
+    let aux = array![
+        [1.0_f64, 0.2],
+        [0.4, -0.7],
+        [-0.3, 0.5],
+        [0.8, 1.1],
+        [-1.2, 0.1]
+    ];
+    let pen = IvaeRidgeMeanGauge::new(PsiSlice::full(10, Some(2)), aux, 0.1, 0.8, 5, true)
+        .expect("valid iVAE gauge");
+    // grad_rho includes the Gaussian normalizer −½·len·ln μ, so the ρ check
+    // pins the normalizer's derivative as well as the quadratic's.
+    assert_penalty_derivatives_match_fd("iVAE gauge", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("iVAE gauge", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]].abs())
+        );
+    }
+}
+
+fn ncg_split(
+    theta: ArrayView1<'_, f64>,
+    left_rows: usize,
+    right_rows: usize,
+    cols: usize,
+) -> (Array2<f64>, Array2<f64>) {
+    let split = left_rows * cols;
+    let left = Array2::from_shape_vec((left_rows, cols), theta.slice(s![..split]).to_vec())
+        .expect("left block shape");
+    let right = Array2::from_shape_vec((right_rows, cols), theta.slice(s![split..]).to_vec())
+        .expect("right block shape");
+    (left, right)
+}
+
+/// `u^p v^p = ∂φ/∂E`, recomputed from the `GramNormalization` definitions.
+fn ncg_normalizer(
+    left: &Array2<f64>,
+    right: &Array2<f64>,
+    normalization: normalized_gram::GramNormalization,
+) -> f64 {
+    let sum_sq = |m: &Array2<f64>| m.iter().map(|x| x * x).sum::<f64>();
+    match normalization {
+        normalized_gram::GramNormalization::DecoderNorm => 1.0 / (sum_sq(left) * sum_sq(right)),
+        normalized_gram::GramNormalization::SelfGramNorm => {
+            let left_gram = left.dot(&left.t());
+            let right_gram = right.dot(&right.t());
+            1.0 / (sum_sq(&left_gram).sqrt() * sum_sq(&right_gram).sqrt())
+        }
+    }
+}
+
+fn assert_normalized_cross_gram_derivatives_match_fd(
+    normalization: normalized_gram::GramNormalization,
+) {
+    let (left_rows, right_rows, cols) = (2, 3, 3);
+    let theta = array![
+        0.9_f64, -0.3, 0.5, 0.2, 1.1, -0.6, 0.4, 0.8, -0.2, -0.7, 0.3, 0.9, 0.6, -0.5, 1.0
+    ];
+    let l_dir = array![
+        0.3_f64, 1.0, -0.4, 0.7, -0.2, 0.5, -0.9, 0.1, 0.6, 0.4, -0.8, 0.2, -0.3, 0.9, 0.5
+    ];
+    let r_dir = array![
+        -0.6_f64, 0.2, 0.8, -0.1, 0.4, 1.1, 0.3, -0.7, 0.5, 0.9, 0.2, -0.4, 0.7, 0.1, -0.5
+    ];
+    let dim = theta.len();
+    let h = DERIV_FD_STEP;
+    let label = format!("{normalization:?}");
+    let at = |t: &Array1<f64>| {
+        let (left, right) = ncg_split(t.view(), left_rows, right_rows, cols);
+        normalized_gram::NormalizedCrossGram::new(left.view(), right.view(), normalization)
+            .expect("positive normalizers")
+    };
+    let value = |t: &Array1<f64>| {
+        let (left, right) = ncg_split(t.view(), left_rows, right_rows, cols);
+        let cross = left.dot(&right.t());
+        cross.iter().map(|x| x * x).sum::<f64>() * ncg_normalizer(&left, &right, normalization)
+    };
+    // Frozen-direction Gauss–Newton form 2·u^p v^p·⟨C_l, C_r⟩ with
+    // C_l = l_X Yᵀ + X l_Yᵀ; its θ-gradient is what the GN bilinear returns.
+    let gn_form = |t: &Array1<f64>| {
+        let (x, y) = ncg_split(t.view(), left_rows, right_rows, cols);
+        let (lx, ly) = ncg_split(l_dir.view(), left_rows, right_rows, cols);
+        let (rx, ry) = ncg_split(r_dir.view(), left_rows, right_rows, cols);
+        let cl = lx.dot(&y.t()) + x.dot(&ly.t());
+        let cr = rx.dot(&y.t()) + x.dot(&ry.t());
+        2.0 * ncg_normalizer(&x, &y, normalization) * (&cl * &cr).sum()
+    };
+    let bilinear_hessian = |t: &Array1<f64>| l_dir.dot(&at(t).hessian_action(r_dir.view()));
+    let coordinate_fd = |f: &dyn Fn(&Array1<f64>) -> f64, i: usize| {
+        let mut tp = theta.clone();
+        let mut tm = theta.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        (f(&tp) - f(&tm)) / (2.0 * h)
+    };
+
+    let base = at(&theta);
+    let grad = base.gradient();
+    let third = base.third_bilinear(l_dir.view(), r_dir.view());
+    let gn = base.gauss_newton_bilinear_gradient(l_dir.view(), r_dir.view());
+    let diag = base.diagonal();
+    for i in 0..dim {
+        assert_fd_close(
+            &format!("{label} gradient[{i}]"),
+            grad[i],
+            coordinate_fd(&value, i),
+        );
+        assert_fd_close(
+            &format!("{label} third_bilinear[{i}]"),
+            third[i],
+            coordinate_fd(&bilinear_hessian, i),
+        );
+        assert_fd_close(
+            &format!("{label} gauss_newton_bilinear_gradient[{i}]"),
+            gn[i],
+            coordinate_fd(&gn_form, i),
+        );
+        let mut e = Array1::<f64>::zeros(dim);
+        e[i] = 1.0;
+        let column = base.hessian_action(e.view());
+        assert_abs_diff_eq!(
+            diag[i],
+            column[i],
+            epsilon = 1e-12 * (1.0 + column[i].abs())
+        );
+    }
+    for (k, v) in [l_dir.view(), r_dir.view()].into_iter().enumerate() {
+        let hv = base.hessian_action(v);
+        let step = v.mapv(|x| x * h);
+        let gp = at(&(&theta + &step)).gradient();
+        let gm = at(&(&theta - &step)).gradient();
+        for i in 0..dim {
+            assert_fd_close(
+                &format!("{label} hessian_action[{k}][{i}]"),
+                hv[i],
+                (gp[i] - gm[i]) / (2.0 * h),
+            );
+        }
+    }
+}
+
+#[test]
+fn normalized_cross_gram_decoder_norm_derivatives_match_fd() {
+    assert_normalized_cross_gram_derivatives_match_fd(
+        normalized_gram::GramNormalization::DecoderNorm,
+    );
+}
+
+#[test]
+fn normalized_cross_gram_self_gram_norm_derivatives_match_fd() {
+    assert_normalized_cross_gram_derivatives_match_fd(
+        normalized_gram::GramNormalization::SelfGramNorm,
+    );
+}
+
+#[test]
+fn block_sparsity_derivatives_match_fd() {
+    // Row-major (4, 3) block. Group {0, 2} sits in the L² regime (norm ≫ ε),
+    // where the rank-one −x xᵀ/s³ correction nearly cancels I/s along x;
+    // group {1} has entries ≪ ε, so its smoothed norm stays in the quadratic
+    // regime s ≈ ε.
+    let t = array![
+        0.8_f64, 0.02, -0.5, -0.3, -0.03, 1.1, 0.6, 0.01, 0.2, -0.9, 0.04, -0.4
+    ];
+    let probes = vec![
+        array![0.5_f64, -1.0, 0.3, 0.7, 0.4, -0.6, -0.2, 0.9, 1.1, 0.3, -0.5, 0.8],
+        array![-0.7_f64, 0.2, 1.0, -0.4, 0.6, 0.1, 0.9, -0.3, -0.8, 0.5, 0.7, -0.2],
+    ];
+    let rho = array![0.15_f64];
+    let pen = BlockSparsityPenalty::new(
+        PsiSlice::full(12, Some(3)),
+        vec![vec![0, 2], vec![1]],
+        0.9,
+        4,
+        0.3,
+        true,
+    )
+    .expect("valid block sparsity");
+    assert_penalty_derivatives_match_fd("block sparsity", &pen, t.view(), rho.view(), &probes);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("block sparsity", &dense, &pen, t.view(), rho.view(), &probes);
+    let diag = pen.diag_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        assert_abs_diff_eq!(
+            diag[i],
+            dense[[i, i]],
+            epsilon = 1e-12 * (1.0 + dense[[i, i]].abs())
+        );
+    }
+}
+
+#[test]
+fn row_precision_prior_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.35_f64];
+    // One symmetric positive-definite precision per row, with off-diagonal
+    // coupling so the Hessian is not diagonal.
+    let lambda = array![
+        [[2.0_f64, 0.6], [0.6, 1.0]],
+        [[1.5, -0.4], [-0.4, 0.9]],
+        [[0.7, 0.2], [0.2, 2.2]],
+        [[3.0, 1.1], [1.1, 1.4]],
+        [[1.2, -0.5], [-0.5, 0.8]]
+    ];
+    let pen = RowPrecisionPriorPenalty::new(PsiSlice::full(10, Some(2)), lambda, 1.4, 5, true)
+        .expect("valid row-precision prior");
+    // grad_rho carries the normalizer derivative −½·len alongside ½μ·tᵀΛt.
+    assert_penalty_derivatives_match_fd("row precision", &pen, t.view(), rho.view(), &probes);
+    assert!(
+        pen.hessian_diag(t.view(), rho.view()).is_none(),
+        "a coupled per-row precision has no diagonal Hessian"
+    );
+    let dense = pen.as_dense(t.view(), rho.view());
+    assert_dense_matches_hvp("row precision", &dense, &pen, t.view(), rho.view(), &probes);
+}
+
+/// ½·(μ/n)·‖TᵀT − I‖²_F is quartic and nonconvex, so it is checked outside the
+/// convex helper: value→`grad_target`, `grad_target`→`hvp`, the materialized
+/// Hessian against `hvp`, and value→`grad_rho`.
+#[test]
+fn orthogonality_derivatives_match_fd() {
+    let (t, probes) = five_by_two_fixture();
+    let rho = array![-0.2_f64];
+    let pen = OrthogonalityPenalty::new(PsiSlice::full(10, Some(2)), 2, 1.1, 5, true)
+        .expect("valid orthogonality penalty");
+    let h = DERIV_FD_STEP;
+    let grad = pen.grad_target(t.view(), rho.view());
+    for i in 0..t.len() {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_fd_close(&format!("orthogonality grad[{i}]"), grad[i], fd);
+    }
+    for (k, v) in probes.iter().enumerate() {
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let step = v.mapv(|x| x * h);
+        let gp = pen.grad_target((&t + &step).view(), rho.view());
+        let gm = pen.grad_target((&t - &step).view(), rho.view());
+        for i in 0..t.len() {
+            assert_fd_close(
+                &format!("orthogonality hvp[{k}][{i}]"),
+                hv[i],
+                (gp[i] - gm[i]) / (2.0 * h),
+            );
+        }
+    }
+    let t_mat = pen.target_matrix(t.view()).expect("(5, 2) target");
+    let m = OrthogonalityPenalty::gram_minus_identity(t_mat);
+    let dense = pen.as_dense_with_precomputed_m(t_mat, m.view(), pen.scale(rho.view()));
+    assert_dense_matches_hvp("orthogonality", &dense, &pen, t.view(), rho.view(), &probes);
+    let grad_rho = pen.grad_rho(t.view(), rho.view());
+    let mut rp = rho.clone();
+    let mut rm = rho.clone();
+    rp[0] += h;
+    rm[0] -= h;
+    let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * h);
+    assert_fd_close("orthogonality grad_rho", grad_rho[0], fd);
+}
+
+/// `FrozenAnalyticPenaltyOp` is one PSD curvature operator: `matvec` applies the
+/// penalty's PSD majorizer, so `diag`, `as_dense` and `log det(S + λI)` must read
+/// that same operator. Isometry is nonconvex and its majorizer is the Gauss-Newton
+/// block `B_GN`, while its cached HVP state builds the exact Hessian, which also
+/// carries the residual and third-jet terms and is indefinite. The fixture installs
+/// the third jet so the exact Hessian is available and differs from `B_GN`; every
+/// frozen query must still return `B_GN`, the matrix whose columns are `matvec`
+/// of the unit vectors.
+///
+/// Tolerances: `diag` and `as_dense` probe the same `psd_majorizer_hvp` as
+/// `matvec` on the same inputs, so they agree to rounding (a relative
+/// `1e-12` of the largest entry). The log-determinant is an eigensolve of a
+/// 6 × 6 symmetric matrix with `λ = 0.3` added. Its eigenvalues are therefore at
+/// least 0.3, each `log` term carries a relative error of about `n·ε / 0.3`, and
+/// `1e-10` of `max(|log det|, 1)` leaves several orders of margin.
+#[test]
+fn frozen_isometry_operator_reads_the_gauss_newton_majorizer_everywhere() {
+    let (n_obs, p, d, j, h) = isometry_gn_fixture();
+    let n = n_obs * d;
+    let pen = IsometryPenalty::new_euclidean(PsiSlice::full(n, Some(d)), p);
+    pen.refresh_caches(Some(j), Some(h));
+    let k = ndarray::Array3::<f64>::from_shape_fn((n_obs, p, d * d * d), |(row, output, axes)| {
+        let (a, c, e) = (axes / (d * d), (axes / d) % d, axes % d);
+        0.11 * (row as f64 + 1.0) - 0.07 * (output as f64) + 0.05 * ((a + c + e) as f64)
+    });
+    pen.set_third_decoder_derivative(Some(Arc::new(k)));
+    let kind = AnalyticPenaltyKind::Isometry(Arc::new(pen));
+    let rho = array![0.0_f64];
+    let t = Array1::<f64>::zeros(n);
+
+    let mut majorizer = Array2::<f64>::zeros((n, n));
+    let mut exact = Array2::<f64>::zeros((n, n));
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let b = kind.psd_majorizer_hvp(t.view(), rho.view(), e.view());
+        let hv = kind.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            majorizer[[row, col]] = b[row];
+            exact[[row, col]] = hv[row];
+        }
+    }
+    let scale = majorizer.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    let gap = (&exact - &majorizer).iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+    assert!(scale > 0.0, "the Gauss-Newton majorizer must be nonzero on this fixture");
+    assert!(
+        gap > 1e-6 * scale,
+        "the fixture must separate the exact Hessian from B_GN; max gap {gap:.3e}"
+    );
+
+    let op = FrozenAnalyticPenaltyOp::new(kind, t, rho).expect("frozen isometry operator");
+    let mut applied = Array2::<f64>::zeros((n, n));
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let mut out = Array1::<f64>::zeros(n);
+        op.matvec(e.view(), out.view_mut());
+        for row in 0..n {
+            applied[[row, col]] = out[row];
+        }
+    }
+    let dense = op.as_dense();
+    let diag = op.diag();
+    for row in 0..n {
+        assert_abs_diff_eq!(diag[row], majorizer[[row, row]], epsilon = 1e-12 * scale);
+        for col in 0..n {
+            assert_abs_diff_eq!(applied[[row, col]], majorizer[[row, col]], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(dense[[row, col]], majorizer[[row, col]], epsilon = 1e-12 * scale);
+        }
+    }
+
+    let lambda = 0.3;
+    let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&majorizer, lambda)
+        .expect("log det of the Gauss-Newton majorizer");
+    let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen isometry log det");
+    assert_abs_diff_eq!(log_det, expected, epsilon = 1e-10 * expected.abs().max(1.0));
+}
+

@@ -2509,6 +2509,280 @@ mod tests {
         }
     }
 
+    /// `ψ⁽ᵏ⁾` (`order` 0 or 1) of a Dual3 argument, composed through third order
+    /// by the chain rule from the scalar stack `[ψ, ψ₁, ψ₂, ψ₃, ψ₄]`.
+    fn polygamma_dual3(order: usize, x: num_dual::Dual3_64) -> num_dual::Dual3_64 {
+        let stack = gam_math::special::polygamma_stack(x.re, order + 4);
+        let (f1, f2, f3) = (stack[order + 1], stack[order + 2], stack[order + 3]);
+        num_dual::Dual3_64::new(
+            stack[order],
+            f1 * x.v1,
+            f2 * x.v1 * x.v1 + f1 * x.v2,
+            f3 * x.v1 * x.v1 * x.v1 + 3.0 * f2 * x.v1 * x.v2 + f1 * x.v3,
+        )
+    }
+
+    /// The Beta-logit row inputs exactly as `compute_observed_hessian_curvature_arrays`
+    /// assembles them, dispatched through `observed_weight_dispatch`.
+    fn beta_logit_dispatched(y: f64, eta: f64, precision: f64, prior_weight: f64) -> (f64, f64, f64) {
+        let link = InverseLink::Standard(StandardLink::Logit);
+        let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta)
+            .expect("logit jet");
+        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+            .expect("logit fourth derivative");
+        let one_minus_mu =
+            crate::mixture_link::inverse_link_complement_for_inverse_link(&link, eta, jet.mu);
+        observed_weight_dispatch(
+            WeightFamily::Beta { phi: precision },
+            WeightLink::Other,
+            y,
+            jet.mu,
+            one_minus_mu,
+            1.0,
+            prior_weight,
+            jet,
+            h4,
+        )
+    }
+
+    #[test]
+    fn beta_logit_observed_curvature_matches_dual3() {
+        use num_dual::DualNum;
+        let prior_weight = 1.3;
+        for precision in [0.8_f64, 4.0] {
+            for y in [0.1_f64, 0.6] {
+                let y_star = y.ln() - (-y).ln_1p();
+                for eta in [-2.0_f64, 0.3, 1.7] {
+                    // ℓ = lnΓ(φ) − lnΓ(μφ) − lnΓ((1−μ)φ) + (μφ−1)ln y + ((1−μ)φ−1)ln(1−y)
+                    // with μ = logistic(η), q = dμ/dη = μ(1−μ), q' = q(1−2μ):
+                    // −∂²ℓ/∂η² = φ²q²(ψ₁(μφ) + ψ₁((1−μ)φ)) − φq'(y* − ψ(μφ) + ψ((1−μ)φ)).
+                    // The Dual3 carries this unshifted form, a separate route from
+                    // the recurrence-shifted closed form in the dispatch.
+                    assert_observed_tower_matches_dual3(
+                        &format!("Beta logit phi={precision} y={y}"),
+                        beta_logit_dispatched(y, eta, precision, prior_weight),
+                        |x| {
+                            let mu = ((-x).exp() + 1.0).recip();
+                            let one_minus_mu = -mu + 1.0;
+                            let q = mu * one_minus_mu;
+                            let q1 = q * (one_minus_mu - mu);
+                            let a = mu * precision;
+                            let b = one_minus_mu * precision;
+                            let trigamma_sum = polygamma_dual3(1, a) + polygamma_dual3(1, b);
+                            let residual = polygamma_dual3(0, b) - polygamma_dual3(0, a) + y_star;
+                            (q * q * trigamma_sum * (precision * precision) - q1 * residual * precision)
+                                * prior_weight
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn beta_logit_observed_curvature_keeps_its_tail_order() {
+        // Far in either logit tail the Fisher weight φ²q²(ψ₁(a) + ψ₁(b)) tends to
+        // ω, while the observed weight vanishes like ω·μ(1−μ): its two O(ω)
+        // terms cancel exactly. References: −∂ᵏℓ/∂ηᵏ (k = 2, 3, 4) of the Beta
+        // log-likelihood at y = 0.6, φ = 4, ω = 1, evaluated with 60-digit
+        // arithmetic. The recurrence-shifted form keeps them to rounding, where
+        // the unshifted difference keeps only about three digits at |η| = 30.
+        let (y, precision) = (0.6_f64, 4.0_f64);
+        for (eta, reference) in [
+            (
+                -30.0_f64,
+                [
+                    -7.4441703904022336e-13,
+                    -7.4441703903938675e-13,
+                    -7.4441703903771354e-13,
+                ],
+            ),
+            (
+                30.0,
+                [
+                    -4.4088187034463916e-13,
+                    4.4088187034391617e-13,
+                    -4.4088187034247019e-13,
+                ],
+            ),
+        ] {
+            let (w, c, d) = beta_logit_dispatched(y, eta, precision, 1.0);
+            for (channel, got, want) in [
+                ("W", w, reference[0]),
+                ("dW/deta", c, reference[1]),
+                ("d2W/deta2", d, reference[2]),
+            ] {
+                assert!(
+                    (got - want).abs() <= 1.0e-12 * want.abs(),
+                    "Beta logit {channel} at eta={eta}: {got:+.17e} vs 60-digit reference {want:+.17e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beta_logit_prices_the_laplace_with_observed_information() {
+        let likelihood = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Beta { phi: 4.0 },
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            scale: LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 4.0 },
+        };
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &InverseLink::Standard(StandardLink::Logit),
+        ));
+        let eta = array![-30.0, -2.0, 0.3, 1.7, 30.0];
+        let y = array![0.6, 0.1, 0.6, 0.1, 0.6];
+        let prior = array![1.0, 1.3, 1.3, 1.3, 1.0];
+        let (w, c, d) = compute_observed_hessian_curvature_arrays(
+            &likelihood,
+            &InverseLink::Standard(StandardLink::Logit),
+            &eta,
+            y.view(),
+            &Array1::zeros(eta.len()),
+            prior.view(),
+        )
+        .expect("Beta-logit observed curvature");
+        for i in 0..eta.len() {
+            assert_eq!(
+                (w[i], c[i], d[i]),
+                beta_logit_dispatched(y[i], eta[i], 4.0, prior[i]),
+                "row {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn tweedie_log_observed_curvature_matches_dual3() {
+        use num_dual::DualNum;
+        let (phi, prior_weight) = (0.6_f64, 1.4_f64);
+        for p in [1.2_f64, 1.5, 1.9] {
+            for y in [0.0_f64, 0.7, 3.0] {
+                for eta in [-2.0_f64, 0.3, 2.5] {
+                    let mu = eta.exp();
+                    let jet = MixtureInverseLinkJet {
+                        mu,
+                        d1: mu,
+                        d2: mu,
+                        d3: mu,
+                    };
+                    let dispatched = observed_weight_dispatch(
+                        WeightFamily::Tweedie { p },
+                        WeightLink::Log,
+                        y,
+                        mu,
+                        1.0 - mu,
+                        phi,
+                        prior_weight,
+                        jet,
+                        mu,
+                    );
+                    // −∂²ℓ/∂η² for ℓ = [y·e^{(1−p)η}/(1−p) − e^{(2−p)η}/(2−p)]/φ is
+                    // [(p−1)·y·e^{(1−p)η} + (2−p)·e^{(2−p)η}]/φ.
+                    assert_observed_tower_matches_dual3(
+                        &format!("Tweedie log p={p} y={y}"),
+                        dispatched,
+                        |x| {
+                            ((x * (1.0 - p)).exp() * ((p - 1.0) * y)
+                                + (x * (2.0 - p)).exp() * (2.0 - p))
+                                * (prior_weight / phi)
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Tweedie with the log link is non-canonical for 1<p<2, so it must be
+    /// served observed information. On a zero row the observed weight is
+    /// `(2−p)` times the Fisher weight `ω μ^{2−p}/φ`.
+    #[test]
+    fn tweedie_log_is_served_observed_curvature() {
+        let p = 1.5_f64;
+        let link = InverseLink::Standard(StandardLink::Log);
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Tweedie { p },
+            link.clone(),
+        ));
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &link
+        ));
+        let phi = super::fixed_glm_dispersion(&likelihood).expect("Tweedie dispersion");
+        let eta = array![0.4, -0.3, 1.1];
+        let mu = eta.mapv(f64::exp);
+        let y = array![0.0, 2.5, 0.2];
+        let prior = array![1.0, 0.8, 1.6];
+        let fisher = Array1::from_iter(
+            (0..eta.len()).map(|i| prior[i] * mu[i].powf(2.0 - p) / phi),
+        );
+        let (w_obs, _, _) = compute_observed_hessian_curvature_arrays(
+            &likelihood,
+            &link,
+            &eta,
+            y.view(),
+            &fisher,
+            prior.view(),
+        )
+        .expect("Tweedie-log observed curvature should evaluate");
+        for i in 0..eta.len() {
+            let expected = fisher[i] * ((p - 1.0) * y[i] / mu[i] + (2.0 - p));
+            assert_relative_eq!(w_obs[i], expected, epsilon = 0.0, max_relative = 1e-13);
+            assert!(
+                (w_obs[i] - fisher[i]).abs() > 1e-3 * fisher[i],
+                "row {i}: y != mu, so observed and Fisher weights must differ"
+            );
+        }
+        assert_relative_eq!(w_obs[0], (2.0 - p) * fisher[0], epsilon = 0.0, max_relative = 1e-13);
+    }
+
+    /// In the Poisson limit `mu << theta` the NB2 observed weight is
+    /// `≈ prior·mu·(y+theta)/theta`. Forming `s = 1 − r` there loses
+    /// `log10(theta/mu)` digits and returns exactly zero once `mu/theta < eps/2`.
+    #[test]
+    fn negative_binomial_log_observed_curvature_keeps_poisson_limit_precision() {
+        use num_dual::DualNum;
+        let prior_weight = 0.9;
+        for theta in [1.0e7_f64, 1.0e12] {
+            for y in [0.0_f64, 2.0] {
+                for eta in [-27.6_f64, -5.0, 0.0] {
+                    let mu = eta.exp();
+                    let jet = MixtureInverseLinkJet {
+                        mu,
+                        d1: mu,
+                        d2: mu,
+                        d3: mu,
+                    };
+                    let dispatched = observed_weight_dispatch(
+                        WeightFamily::NegativeBinomial { theta },
+                        WeightLink::Log,
+                        y,
+                        mu,
+                        1.0 - mu,
+                        1.0,
+                        prior_weight,
+                        jet,
+                        mu,
+                    );
+                    assert!(dispatched.0 > 0.0, "theta={theta} eta={eta}: W collapsed to {dispatched:?}");
+                    assert_observed_tower_matches_dual3(
+                        &format!("NB2 log Poisson limit theta={theta} y={y}"),
+                        dispatched,
+                        |x| {
+                            let mu = x.exp();
+                            (mu * theta) / ((mu + theta) * (mu + theta)) * (prior_weight * (y + theta))
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     pub(crate) fn gamma_log_observed_curvature_dispatch_avoids_generic_overflow() {
         let y = 1.25;
@@ -2707,6 +2981,54 @@ mod tests {
                 w_obs[i],
                 fisher[i]
             );
+        }
+    }
+
+    #[test]
+    fn latent_cloglog_observed_hessian_matches_log_likelihood_finite_difference() {
+        let link = InverseLink::LatentCLogLog(
+            gam_problem::types::LatentCLogLogState::new(0.4).unwrap(),
+        );
+        let likelihood = GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            link.clone(),
+        ));
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &link,
+        ));
+        // Differentiate only log probabilities, independently of every
+        // derivative field and observed-weight recurrence under test.
+        for eta in [-4.0, -2.0, -0.7, 0.0, 0.6, 1.4] {
+            for y in [0.0, 1.0] {
+                for prior in [0.25, 2.0] {
+                    let nll = |value| {
+                        let mu = crate::mixture_link::inverse_link_jet_for_inverse_link(
+                            &link, value,
+                        ).unwrap().mu;
+                        let probability = if y == 1.0 {
+                            mu
+                        } else {
+                            crate::mixture_link::inverse_link_complement_for_inverse_link(
+                                &link, value, mu,
+                            )
+                        };
+                        -prior * probability.ln()
+                    };
+                    let (weights, _, _) = compute_observed_hessian_curvature_arrays(
+                        &likelihood, &link, &array![eta], array![y].view(),
+                        &array![0.0], array![prior].view(),
+                    ).unwrap();
+                    for h in [0.002_f64, 0.001] {
+                        let reference = (-nll(eta + 2.0 * h) + 16.0 * nll(eta + h)
+                            - 30.0 * nll(eta) + 16.0 * nll(eta - h)
+                            - nll(eta - 2.0 * h)) / (12.0 * h * h);
+                        let tolerance = 1e-8 + 1e-6 * reference.abs();
+                        assert!((weights[0] - reference).abs() < tolerance,
+                            "eta={eta}, y={y}, prior={prior}, h={h}: observed={}, likelihood FD={reference}", weights[0]);
+                    }
+                }
+            }
         }
     }
 
@@ -5935,4 +6257,115 @@ fn beta_half_unit_deviance_from_shape_differences_is_exact_and_resolved() {
         ((direct_curv - analytic) / analytic).abs() > 1e-5,
         "positive control: the direct form should be noise-dominated at this φ, got {direct_curv:.9e} vs {analytic:.9e}"
     );
+}
+
+/// Beta-logit Fisher working rows in both logit tails (#4527).
+#[cfg(test)]
+mod beta_logit_fisher_row_tail_tests {
+    use super::super::exact_beta_logit_row;
+
+    fn relative_error(value: f64, reference: f64) -> f64 {
+        ((value - reference) / reference).abs()
+    }
+
+    /// Fisher `W`, `z`, `c = dW/dη` and `d = d²W/dη²` of one row
+    /// (`ω = 1`, `φ = 4`, `y = 1/3` as an f64). The references are the
+    /// closed forms evaluated in 60-digit arithmetic and rounded to 17
+    /// significant digits.
+    ///
+    /// The shifted-polygamma forms are well conditioned at every point here.
+    /// Their float64 evaluation stays within 1.6e-15 of the reference, so
+    /// 1e-12 leaves room for the polygamma implementation's own error and
+    /// still refuses main's unshifted forms. Those forms cancel O(1) poles:
+    /// they miss by 9.5e-10 at η = 8, by 7.3e-4 at η = 15 and by a factor
+    /// 1e10 at η = 30, where the rounded `1 − μ` compounds the cancellation.
+    #[test]
+    fn beta_logit_fisher_curvature_matches_reference_in_both_tails() {
+        let phi = 4.0;
+        let y = 1.0 / 3.0;
+        // (η, W, z, c, d)
+        let references = [
+            (-30.0, 9.9999999999981285e-1, -28.99999999999948, -1.871524593762105e-13, -1.8715245937561751e-13),
+            (-15.0, 9.9999938819852749e-1, -13.999998298961095, -6.1179830402406552e-7, -6.1179196706819654e-7),
+            (-8.0, 9.9933287479558206e-1, -6.9981415182408401, -6.6333553141763312e-4, -6.5577689451943296e-4),
+            (0.3, 1.2765364075355014, -0.52855793718461334, -0.087181825644534897, -0.26828185644214066),
+            (8.0, 9.9933287479558206e-1, 6.996281324888551, 6.6333553141763312e-4, -6.5577689451943296e-4),
+            (15.0, 9.9999938819852749e-1, 13.999996602678447, 6.1179830402406552e-7, -6.1179196706819654e-7),
+            (30.0, 9.9999999999981285e-1, 28.999999999998961, 1.871524593762105e-13, -1.8715245937561751e-13),
+        ];
+        for (eta, weight, z, c, d) in references {
+            let row = exact_beta_logit_row(0, eta, Some(y), 1.0, phi)
+                .unwrap_or_else(|error| panic!("beta-logit row at eta={eta} refused: {error:?}"));
+            for (label, value, reference) in
+                [("W", row.weight, weight), ("z", row.z, z), ("c", row.c, c), ("d", row.d, d)]
+            {
+                let error = relative_error(value, reference);
+                assert!(
+                    error <= 1e-12,
+                    "eta={eta}: {label} = {value:e} vs reference {reference:e} (relative error {error:e})"
+                );
+            }
+        }
+    }
+
+    /// The Beta model is symmetric under `y ↔ 1 − y`, `η ↔ −η`: `W` and `d` are
+    /// even and `z` and `c` are odd. The responses are dyadic, so `1 − y` is exact.
+    /// Past η ≈ 36.7 the rounded mean is exactly 1.0, so the upper row can
+    /// only exist by forming its second shape from the exact logit complement.
+    /// The mirrored rows run the same float operations except the order of the
+    /// jet's `q″` polynomial, so they agree to a few ulps. 1e-13 is a bound on
+    /// that, not a tolerance on an approximation.
+    #[test]
+    fn beta_logit_fisher_row_is_mirror_symmetric_past_the_rounded_mean() {
+        let phi = 4.0;
+        let tail_response = 2.0_f64.powi(-40);
+        for eta in [20.0, 30.0, 40.0, 60.0] {
+            let upper = exact_beta_logit_row(0, eta, Some(1.0 - tail_response), 1.0, phi)
+                .unwrap_or_else(|error| panic!("upper-tail row at eta={eta} refused: {error:?}"));
+            let lower = exact_beta_logit_row(0, -eta, Some(tail_response), 1.0, phi)
+                .unwrap_or_else(|error| panic!("lower-tail row at eta={} refused: {error:?}", -eta));
+            for (label, up, mirrored) in [
+                ("W", upper.weight, lower.weight),
+                ("z", upper.z, -lower.z),
+                ("c", upper.c, -lower.c),
+                ("d", upper.d, lower.d),
+            ] {
+                let error = relative_error(up, mirrored);
+                assert!(
+                    error <= 1e-13,
+                    "eta=±{eta}: {label} upper {up:e} vs mirrored lower {mirrored:e} (relative error {error:e})"
+                );
+            }
+        }
+        // At η = 40 the 60-digit reference is W = 1 − 8.5e-18, z = 39 + 4.4e-16,
+        // c = 8.4967085105831768e-18 and d = −8.4967085105831755e-18.
+        let upper = exact_beta_logit_row(0, 40.0, Some(1.0 - tail_response), 1.0, phi)
+            .expect("upper-tail row at eta=40");
+        assert!(relative_error(upper.c, 8.4967085105831768e-18) <= 1e-12, "c = {:e}", upper.c);
+        assert!(relative_error(upper.d, -8.4967085105831755e-18) <= 1e-12, "d = {:e}", upper.d);
+    }
+
+    /// The Beta precision refresh reads the same exact logit pair as the row.
+    /// Main formed the moment statistic from the rounded mean and refused
+    /// every row past η ≈ 36.7, where `μ` rounds to 1 although `1 − μ` is a
+    /// normal number. The mirrored sample (η → −η, y → 1 − y) must give the
+    /// same precision. The reference is the moment estimator in 60-digit
+    /// arithmetic on these f64 inputs.
+    #[test]
+    fn beta_precision_moment_estimate_accepts_rows_past_the_rounded_mean() {
+        use super::super::estimate_beta_phi_from_eta;
+        use ndarray::array;
+        let weights = array![1.0, 1.0, 1.0, 1.0];
+        let eta = array![-2.0, 0.5, 38.0, 45.0];
+        let y = array![0.25, 0.625, 1.0 - 2f64.powi(-53), 1.0 - 2f64.powi(-50)];
+        let mirrored_eta = eta.mapv(|e: f64| -e);
+        let mirrored_y = y.mapv(|v: f64| 1.0 - v);
+        let phi = estimate_beta_phi_from_eta(y.view(), &eta, weights.view())
+            .expect("the upper-tail sample has a finite moment precision");
+        let mirrored = estimate_beta_phi_from_eta(mirrored_y.view(), &mirrored_eta, weights.view())
+            .expect("the lower-tail sample has a finite moment precision");
+        let reference = 23.544459333498157;
+        assert!(relative_error(phi, reference) <= 1e-13, "phi = {phi:e}");
+        assert!(relative_error(mirrored, reference) <= 1e-13, "mirrored phi = {mirrored:e}");
+    }
 }

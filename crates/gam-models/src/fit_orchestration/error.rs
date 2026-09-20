@@ -57,8 +57,8 @@ pub enum TransformationNormalConflict {
 /// be resumed is refused by the rule it breaks rather than dropped for a cold fit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WarmStartRefusal {
-    /// The model was saved before payload v25 recorded a certified outer point.
-    /// Refit it with this version to resume from it.
+    /// The model was saved at another payload version, whose record this binary
+    /// does not read. Refit it with this version to resume from it.
     RefitRequired { payload_version: u32 },
     /// The model's fit recorded no certified outer point: its route records none.
     NoRecordedPoint,
@@ -252,8 +252,9 @@ impl std::fmt::Display for WorkflowError {
             WorkflowError::WarmStartRefused { refusal } => match refusal {
                 WarmStartRefusal::RefitRequired { payload_version } => write!(
                     f,
-                    "warm_start_from: the model (payload v{payload_version}) records no certified \
-                     outer point; refit it with this version to resume from it"
+                    "warm_start_from: the model was saved at payload v{payload_version}, whose \
+                     certified outer point this binary does not read; refit it with this version \
+                     to resume from it"
                 ),
                 WarmStartRefusal::NoRecordedPoint => f.write_str(
                     "warm_start_from: the model's fit recorded no certified outer point, because \
@@ -315,6 +316,16 @@ impl WorkflowError {
                     .to_string(),
             ),
             Self::Data(source) => source.advice(),
+            // The estimation error a fit failure ends in owns its remediation;
+            // the Python boundary reads the same `estimation_error()` for its
+            // `help:` line, so the CLI must not drop it here.
+            Self::Fit(failure) => failure.estimation_error().and_then(EstimationError::advice),
+            Self::SpatialUnderresolved { refit_failure, .. } => match refit_failure.as_deref() {
+                Some(Self::Fit(failure)) => {
+                    failure.estimation_error().and_then(EstimationError::advice)
+                }
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -696,9 +707,11 @@ impl FitFailure {
         }
     }
 
-    /// The Jeffreys arming evidence the custom-family refusal this failure ends
-    /// in carries ([`CustomFamilyError::jeffreys_arming_evidence`]), seen
-    /// through the wrappers that only carry it.
+    /// The Jeffreys arming evidence the refusal this failure ends in carries,
+    /// seen through the wrappers that only carry it: a custom-family refusal's
+    /// ([`CustomFamilyError::jeffreys_arming_evidence`]), or a pre-fit
+    /// separation certificate's
+    /// ([`EstimationError::separation_arming_evidence`]).
     #[must_use]
     pub fn jeffreys_arming_evidence(&self) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
         match self {
@@ -706,9 +719,9 @@ impl FitFailure {
                 source.jeffreys_arming_evidence()
             }
             Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
-            Self::Estimation(err) => {
-                Self::custom_family_leaf(err).and_then(CustomFamilyError::jeffreys_arming_evidence)
-            }
+            Self::Estimation(err) => Self::custom_family_leaf(err)
+                .and_then(CustomFamilyError::jeffreys_arming_evidence)
+                .or_else(|| err.separation_arming_evidence()),
             Self::Workflow(err) => match err.as_ref() {
                 WorkflowError::Fit(failure) => failure.jeffreys_arming_evidence(),
                 _ => None,
@@ -1006,6 +1019,38 @@ mod fit_failure_tests {
             ]
         );
         assert!(std::error::Error::source(&failure).is_some());
+    }
+
+    /// The CLI prints `WorkflowError::advice` as its `help:` line and the Python
+    /// boundary appends the fit failure's `estimation_error().advice()`; both
+    /// must carry the same remediation for a fit that ends in separation.
+    #[test]
+    fn a_fit_failure_carries_its_estimation_error_advice_through_the_workflow_boundary() {
+        let separation = EstimationError::PerfectSeparationDetected {
+            iteration: 3,
+            max_abs_eta: 40.0,
+        };
+        let expected = separation.advice().expect("separation carries advice");
+        let failure = FitFailure::from(separation).context("outer smoothing failed");
+        let python_help = failure
+            .estimation_error()
+            .and_then(EstimationError::advice)
+            .expect("the Python boundary reads advice off the estimation error");
+        assert_eq!(python_help, expected);
+        let boundary = WorkflowError::from(failure);
+        assert!(matches!(boundary, WorkflowError::Fit(_)), "{boundary}");
+        assert_eq!(boundary.advice().as_deref(), Some(expected.as_str()));
+
+        let refused = WorkflowError::SpatialUnderresolved {
+            term: "s(x)".to_string(),
+            current_resolution: "8 centers".to_string(),
+            attempted_resolution: "16 centers".to_string(),
+            reason: boundary.to_string(),
+            refit_failure: Some(Box::new(boundary)),
+        };
+        assert_eq!(refused.advice().as_deref(), Some(expected.as_str()));
+        // A failure whose estimation error has no remediation stays silent.
+        assert!(WorkflowError::from(FitFailure::from(seeds_refused())).advice().is_none());
     }
 
     #[test]

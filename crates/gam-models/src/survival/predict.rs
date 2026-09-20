@@ -38,7 +38,9 @@ use crate::survival::location_scale::{
 };
 use crate::survival::latent::fixed_latent_hazard_frailty;
 use crate::survival::lognormal_kernel::FrailtySpec;
-use crate::survival::{CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints};
+use crate::survival::{
+    CompetingRisksCifResult, assemble_competing_risks_cif_from_endpoints_with_rounding,
+};
 use crate::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam_linalg::matrix::DesignMatrix;
 use gam_math::probability::normal_pdf;
@@ -236,6 +238,7 @@ impl SurvivalPredictionCovarianceMode {
 }
 
 /// Inputs to the unified survival predict pipeline.
+#[derive(Clone, Copy)]
 pub struct SurvivalPredictRequest<'a> {
     pub model: &'a SavedModel,
     pub data: ArrayView2<'a, f64>,
@@ -1192,20 +1195,69 @@ impl SurvivalPosteriorIntegration {
 /// [`SurvivalPosteriorIntegration::ExactAnchor`] and
 /// [`SurvivalPosteriorIntegration::TruncatedLaw`] are refused for a model they do
 /// not cover.
+///
+/// The published point is always the conditional-posterior mean
+/// `E[S | D, ρ̂]`, exactly as on the competing-risks and standard-family paths:
+/// `covariance_mode` governs only the reported uncertainty, so requesting an
+/// interval (or a covariance definition for it) never moves the point
+/// (gam#398, gam#3421). A smoothing-corrected band integrates its second
+/// moments under the corrected law in a separate pass over the same rule.
 pub fn predict_survival_posterior_mean_with(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
     integration: SurvivalPosteriorIntegration,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    predict_survival_posterior_mean_integrated(req, covariance_mode, integration, integration)
+}
+
+/// [`predict_survival_posterior_mean_with`] with the point's conditional law
+/// integrated by `point_integration` and a smoothing-corrected band's law by
+/// `band_integration`.
+fn predict_survival_posterior_mean_integrated(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    point_integration: SurvivalPosteriorIntegration,
+    band_integration: SurvivalPosteriorIntegration,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    let point_request = SurvivalPredictRequest {
+        with_uncertainty: false,
+        ..req
+    };
+    let (mut result, point) = survival_posterior_moments(
+        point_request,
+        SurvivalPredictionCovarianceMode::Conditional,
+        point_integration,
+    )?;
+    let band = match (req.with_uncertainty, covariance_mode) {
+        (false, _) => None,
+        (true, SurvivalPredictionCovarianceMode::Conditional) => None,
+        (true, SurvivalPredictionCovarianceMode::SmoothingCorrected) => Some(
+            survival_posterior_moments(point_request, covariance_mode, band_integration)?.1,
+        ),
+    };
+    let uncertainty = req
+        .with_uncertainty
+        .then(|| (band.as_ref().unwrap_or(&point), covariance_mode));
+    publish_survival_posterior_moments(&mut result, &point, uncertainty)?;
+    Ok(result)
+}
+
+/// The plug-in prediction beside the posterior moments of every cell under
+/// the `covariance_mode` coefficient law, integrated by `integration`.
+fn survival_posterior_moments(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    integration: SurvivalPosteriorIntegration,
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     match integration {
         SurvivalPosteriorIntegration::SigmaPoint => {
-            predict_survival_sigma_point_posterior_mean(req, covariance_mode)
+            survival_sigma_point_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::ExactAnchor => {
-            predict_survival_exact_anchor_posterior_mean(req, covariance_mode)
+            survival_exact_anchor_posterior_moments(req, covariance_mode)
         }
         SurvivalPosteriorIntegration::TruncatedLaw => {
-            predict_survival_truncated_law_posterior_mean(req, covariance_mode)
+            survival_truncated_law_posterior_moments(req, covariance_mode)
         }
     }
 }
@@ -1214,8 +1266,21 @@ fn predict_survival_posterior_mean(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
-    predict_survival_posterior_mean_with(req, covariance_mode, integration)
+    // Each law takes the integration that covers it: the cone truncates only
+    // the conditional posterior (gam#3038), so a truncated location-scale
+    // point integrates the truncated law while its smoothing-corrected band
+    // integrates the corrected normal.
+    let point_integration = SurvivalPosteriorIntegration::default_for(
+        req.model,
+        SurvivalPredictionCovarianceMode::Conditional,
+    )?;
+    let band_integration = SurvivalPosteriorIntegration::default_for(req.model, covariance_mode)?;
+    predict_survival_posterior_mean_integrated(
+        req,
+        covariance_mode,
+        point_integration,
+        band_integration,
+    )
 }
 
 /// First and second posterior moments of a single-event survival prediction,
@@ -1249,30 +1314,32 @@ impl SurvivalPosteriorMoments {
 /// predictive law's own hazard; the posterior mean of the hazard, `E_θ[f/S]`,
 /// is a different quantity wherever `S` varies across the posterior and is
 /// never published (`hazard_mean` only tells a zero hazard from an infinite
-/// one where `S̄ = 0`). Posterior standard deviations are added when uncertainty
-/// was requested, and the plug-in survival is kept by name in `survival_plugin`.
+/// one where `S̄ = 0`). When `uncertainty` names the band's moments and their
+/// covariance definition, the posterior standard deviations under that law are
+/// added; the plug-in survival is kept by name in `survival_plugin`.
 fn publish_survival_posterior_moments(
     result: &mut SurvivalPredictResult,
     moments: &SurvivalPosteriorMoments,
-    with_uncertainty: bool,
-    covariance_mode: SurvivalPredictionCovarianceMode,
+    uncertainty: Option<(&SurvivalPosteriorMoments, SurvivalPredictionCovarianceMode)>,
 ) -> Result<(), SurvivalPredictError> {
     let (n_rows, n_times) = result.survival.dim();
-    if moments.survival_mean.dim() != (n_rows, n_times) || moments.eta_mean.len() != n_rows {
-        return Err(SurvivalPredictError::IncompatibleSchema {
-            reason: format!(
-                "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
-                moments.survival_mean.dim()
-            ),
-        });
+    for published in std::iter::once(moments).chain(uncertainty.map(|(band, _)| band)) {
+        if published.survival_mean.dim() != (n_rows, n_times)
+            || published.eta_mean.len() != n_rows
+        {
+            return Err(SurvivalPredictError::IncompatibleSchema {
+                reason: format!(
+                    "posterior survival moments have shape {:?}, but the prediction is {n_rows}x{n_times}",
+                    published.survival_mean.dim()
+                ),
+            });
+        }
     }
     let SurvivalPosteriorMoments {
         survival_mean,
-        survival_second,
         density_mean,
         hazard_mean,
-        eta_mean,
-        eta_second,
+        ..
     } = moments;
     // `result` is the plug-in prediction and the loop below overwrites its
     // surfaces with the posterior means, so the plug-in survival is taken
@@ -1305,21 +1372,21 @@ fn publish_survival_posterior_moments(
             };
         }
     }
-    result.survival_se = with_uncertainty.then(|| {
+    result.survival_se = uncertainty.map(|(band, _)| {
         Array2::from_shape_fn((n_rows, n_times), |(row, time)| {
-            (survival_second[[row, time]] - survival_mean[[row, time]] * survival_mean[[row, time]])
+            let mean = band.survival_mean[[row, time]];
+            (band.survival_second[[row, time]] - mean * mean)
                 .max(0.0)
                 .sqrt()
         })
     });
-    result.eta_se = with_uncertainty.then(|| {
+    result.eta_se = uncertainty.map(|(band, _)| {
         Array1::from_shape_fn(n_rows, |row| {
-            (eta_second[row] - eta_mean[row] * eta_mean[row])
-                .max(0.0)
-                .sqrt()
+            let mean = band.eta_mean[row];
+            (band.eta_second[row] - mean * mean).max(0.0).sqrt()
         })
     });
-    result.covariance_source = with_uncertainty.then_some(covariance_mode);
+    result.covariance_source = uncertainty.map(|(_, covariance_mode)| covariance_mode);
     result.survival_plugin = Some(survival_plugin);
     Ok(())
 }
@@ -1540,17 +1607,16 @@ impl ExactAnchorPosterior {
     }
 }
 
-fn predict_survival_exact_anchor_posterior_mean(
+fn survival_exact_anchor_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (_, active_covariance, _) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
     let posterior = ExactAnchorPosterior {
         covariance: active_covariance,
     };
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1566,8 +1632,7 @@ fn predict_survival_exact_anchor_posterior_mean(
     // (`survival_plugin`), so its curve is held to the same domain as when it
     // is published alone.
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 /// The cone-truncated coefficient posterior of a location-scale fit under
@@ -1591,11 +1656,10 @@ fn truncated_survival_posterior_draws(
         .map_err(|reason| SurvivalPredictError::PosteriorCovariance { reason })
 }
 
-fn predict_survival_truncated_law_posterior_mean(
+fn survival_truncated_law_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
-    let with_uncertainty = req.with_uncertainty;
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
         SurvivalPredictError::UnsupportedConfiguration {
             reason: format!(
@@ -1605,7 +1669,7 @@ fn predict_survival_truncated_law_posterior_mean(
             ),
         }
     })?;
-    let (mut result, moments) = predict_survival_surfaces(
+    let (result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
             estimand: SurvivalPredictEstimand::Plugin,
@@ -1618,17 +1682,16 @@ fn predict_survival_truncated_law_posterior_mean(
         "internal error: the truncated-law survival pass returned no posterior moments".to_string()
     })?;
     refuse_decreasing_survival(&result)?;
-    publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
-fn predict_survival_sigma_point_posterior_mean(
+fn survival_sigma_point_posterior_moments(
     req: SurvivalPredictRequest<'_>,
     covariance_mode: SurvivalPredictionCovarianceMode,
-) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+) -> Result<(SurvivalPredictResult, SurvivalPosteriorMoments), SurvivalPredictError> {
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    let mut result = predict_survival(
+    let result = predict_survival(
         SurvivalPredictRequest {
             model: req.model,
             data: req.data,
@@ -1702,8 +1765,7 @@ fn predict_survival_sigma_point_posterior_mean(
         Ok(())
     })?;
 
-    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
-    Ok(result)
+    Ok((result, moments))
 }
 
 fn predict_competing_risks_with_posterior(
@@ -1711,16 +1773,20 @@ fn predict_competing_risks_with_posterior(
     covariance_mode: SurvivalPredictionCovarianceMode,
 ) -> Result<CompetingRisksPredictResult, SurvivalPredictError> {
     let posterior_mean_estimand = req.estimand == SurvivalPredictEstimand::PosteriorMean;
+    // The public posterior-mean point is always the conditional-posterior
+    // estimand. `covariance_mode` governs only the reported uncertainty,
+    // exactly as on the single-event and standard-family paths, so a request
+    // without uncertainty integrates the conditional law whatever mode it
+    // names, and a smoothing-corrected interval computes the conditional point
+    // once and the corrected second moments separately (gam#3421).
+    let covariance_mode = if req.with_uncertainty {
+        covariance_mode
+    } else {
+        SurvivalPredictionCovarianceMode::Conditional
+    };
     let (posterior_mean, active_covariance, cone_coords) =
         survival_prediction_posterior_factor(req.model, covariance_mode)?;
-    // The public posterior-mean point is always the conditional-posterior
-    // estimand. A smoothing-corrected interval changes only its reported
-    // uncertainty, exactly as on the standard-family path. If corrected
-    // covariance becomes available for this model class, compute the
-    // conditional point once and the corrected second moments separately;
-    // never silently change the point estimand with the interval mode.
     let separate_conditional_point = posterior_mean_estimand
-        && req.with_uncertainty
         && covariance_mode == SurvivalPredictionCovarianceMode::SmoothingCorrected;
     let mut result = if separate_conditional_point {
         predict_competing_risks_with_posterior(
@@ -2082,54 +2148,125 @@ impl CompetingRisksPredictResult {
 
 /// Harrell's concordance index (C-index) of a survival risk score against
 /// held-out outcomes. A larger `risk[i]` must predict a SHORTER survival time
-/// (higher hazard). Over every orderable pair — pairs whose earlier observed
-/// time is a genuine event, so the failure ordering is observed — a pair is
-/// concordant when the earlier-failing subject carries the larger risk; equal
-/// risks score half credit. `C = (concordant + 0.5·tied) / comparable`.
-/// `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
+/// (higher hazard). A pair is comparable exactly when its failure ordering is
+/// observed: subject `a` had an event (`event[a] > 0.5`) and subject `b` was
+/// still at risk afterwards — either `time[b] > time[a]`, or `time[b] ==
+/// time[a]` with `b` censored (a censoring recorded at a death time happened
+/// after the death). Two events at the same time are NOT comparable: neither
+/// failed first, so the pair carries no ordering information. A comparable pair
+/// is concordant when the earlier-failing subject carries the larger risk;
+/// equal risks score half credit. `C = (concordant + 0.5·tied_risk) /
+/// comparable`. `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
 ///
-/// This is the standard discrimination metric (`survival::concordance`,
-/// `lifelines.utils.concordance_index`, scikit-survival `concordance_index_censored`).
+/// These are the pair rules of `survival::concordance`,
+/// `lifelines.utils.concordance_index` and scikit-survival
+/// `concordance_index_censored`.
+///
+/// Evaluated in `O(n log n)`: subjects are swept in descending time order one
+/// tie block at a time against a Fenwick tree of the risk ranks of every subject
+/// observed strictly later. A block's censored subjects enter the tree before
+/// its events are queried (they are comparable partners of those events) and
+/// its events enter after (tied events are not partners of each other). Counts
+/// are exact integers, so the value equals the pair-loop definition exactly.
+///
 /// `time`, `event` (1 = event, 0 = censored), and `risk` must share length `n`.
-/// Returns `None` if there are no comparable pairs (e.g. all rows censored).
+/// Returns `None` on a length mismatch, on any non-finite `time`, `event` or
+/// `risk` (the ordering of such a row is undefined), or when there are no
+/// comparable pairs
+/// (e.g. all rows censored).
 pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
     let n = time.len();
     if n != event.len() || n != risk.len() {
         return None;
     }
-    let mut comparable = 0.0_f64;
-    let mut concordant = 0.0_f64;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let (early, late) = if time[i] < time[j] {
-                (i, j)
-            } else if time[j] < time[i] {
-                (j, i)
-            } else {
-                // Tied times are comparable only if both failed; such a pair is a
-                // pure tie (no strict outcome ordering).
-                if event[i] > 0.5 && event[j] > 0.5 {
-                    comparable += 1.0;
-                    concordant += 0.5;
-                }
-                continue;
-            };
-            if event[early] < 0.5 {
-                // The earlier subject was censored: the true ordering is unknown.
-                continue;
-            }
-            comparable += 1.0;
-            if risk[early] > risk[late] {
-                concordant += 1.0;
-            } else if risk[early] == risk[late] {
-                concordant += 0.5;
-            }
-        }
-    }
-    if comparable == 0.0 {
+    if time
+        .iter()
+        .chain(event)
+        .chain(risk)
+        .any(|value| !value.is_finite())
+    {
         return None;
     }
-    Some(concordant / comparable)
+    let mut levels = risk.to_vec();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let rank_of = |value: f64| levels.partition_point(|&level| level < value);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| time[a].total_cmp(&time[b]));
+
+    let mut later = RiskRankCounts::new(levels.len());
+    let mut comparable: u64 = 0;
+    // Twice the concordance numerator: 2 per concordant pair, 1 per risk tie.
+    let mut concordant_halves: u64 = 0;
+    let mut block_end = n;
+    while block_end > 0 {
+        let block_time = time[order[block_end - 1]];
+        let mut block_start = block_end - 1;
+        while block_start > 0 && time[order[block_start - 1]] == block_time {
+            block_start -= 1;
+        }
+        let block = &order[block_start..block_end];
+        for &row in block {
+            if event[row] <= 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                let rank = rank_of(risk[row]);
+                let below = later.count_below(rank);
+                let tied = later.count_below(rank + 1) - below;
+                comparable += later.total;
+                concordant_halves += 2 * below + tied;
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        block_end = block_start;
+    }
+    if comparable == 0 {
+        return None;
+    }
+    Some(concordant_halves as f64 / (2.0 * comparable as f64))
+}
+
+/// Fenwick (binary indexed) tree counting inserted risk ranks, for
+/// [`harrell_concordance`].
+struct RiskRankCounts {
+    tree: Vec<u64>,
+    total: u64,
+}
+
+impl RiskRankCounts {
+    fn new(levels: usize) -> Self {
+        Self {
+            tree: vec![0; levels + 1],
+            total: 0,
+        }
+    }
+
+    fn insert(&mut self, rank: usize) {
+        self.total += 1;
+        let mut node = rank + 1;
+        while node < self.tree.len() {
+            self.tree[node] += 1;
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// Number of inserted entries whose rank is strictly below `rank`.
+    fn count_below(&self, rank: usize) -> u64 {
+        let mut node = rank;
+        let mut sum = 0;
+        while node > 0 {
+            sum += self.tree[node];
+            node &= node - 1;
+        }
+        sum
+    }
 }
 
 /// IPCW (inverse-probability-of-censoring-weighted) Brier score of a predicted
@@ -2138,15 +2275,23 @@ pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<
 /// `survival::brier`.
 ///
 /// `s_pred[i]` is the model's predicted survival probability `S(tau | x_i)`.
-/// `time`/`event` are the held-out observed time and event indicator. `g_cens`
-/// is the censoring survival distribution `G(t) = P(C > t)` evaluated at the two
-/// weighting times the estimator needs per subject — supplied as a callable so
-/// the caller can pass a Kaplan–Meier fit of the censoring process. Each
-/// subject's squared residual `(target − Ŝ_i(τ))²` is reweighted by the inverse
-/// censoring probability:
-///   * event at/before `τ` (`T_i ≤ τ, δ_i = 1`) → target `0` (dead), weight `1/G(T_i)`;
+/// `time`/`event` are the held-out observed time and event indicator.
+/// `censoring` is the Kaplan–Meier fit of the censoring survival
+/// `G(t) = P(C > t)` ([`KaplanMeier::fit_censoring`]). Each subject's squared
+/// residual `(target − Ŝ_i(τ))²` is reweighted by the inverse probability that
+/// the subject's outcome at `τ` was observed:
+///   * event at/before `τ` (`T_i ≤ τ, δ_i = 1`) → target `0` (dead), weight `1/G(T_i−)`;
 ///   * still alive past `τ` (`T_i > τ`)         → target `1` (alive), weight `1/G(τ)`;
 ///   * censored at/before `τ`                    → target undefined, contributes `0`.
+///
+/// The event weight is the left limit `G(T_i−) = P(C ≥ T_i)`, not `G(T_i)`: an
+/// event tied with a censoring is recorded as an event, so the probability that
+/// an event at `T_i` is observed is `P(C ≥ T_i)`, and
+/// `E[δ·1{T ≤ τ}/G(T−)] = P(T ≤ τ)` is the identity that makes the estimator
+/// unbiased (Gerds & Schumacher 2006). The right-continuous `G(T_i)` also removes
+/// the censorings tied at `T_i`, so on tied (discretised) times it overweights
+/// every such event by `1/(1 − c_j/n_j)`. A survivor past `τ` is observed when
+/// `C > τ`, so its weight is the right-continuous `1/G(τ)`.
 ///
 /// The score is the **sample mean over all valid subjects** (Graf normalization,
 /// dividing by `n`, not by the sum of weights):
@@ -2159,13 +2304,14 @@ pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<
 /// numerator and denominator. When `G` collapses to `0` at a weighting time the
 /// IPCW weight is undefined; such a subject contributes `0` (rather than `∞`),
 /// which keeps the estimator finite at the extreme tail where the censoring KM
-/// runs out of support.
+/// runs out of support. (A censoring fit on the scored sample itself never has
+/// `G(T_i−) = 0` at an observed `T_i`: subject `i` is in every earlier risk set.)
 pub fn ipcw_brier_score(
     s_pred: &[f64],
     time: &[f64],
     event: &[f64],
     tau: f64,
-    g_cens: impl Fn(f64) -> f64,
+    censoring: &KaplanMeier,
 ) -> Option<f64> {
     let n = s_pred.len();
     if n != time.len() || n != event.len() {
@@ -2181,15 +2327,15 @@ pub fn ipcw_brier_score(
         // IPCW contribution is zero (censored before τ, or G undefined).
         n_valid += 1.0;
         let (target, weight) = if time[i] <= tau && event[i] > 0.5 {
-            // Failed at or before the horizon: contributes via 1/G(T_i).
-            let g = g_cens(time[i]);
+            // Failed at or before the horizon: contributes via 1/G(T_i−).
+            let g = censoring.before(time[i]);
             if !(g > 0.0) {
                 continue;
             }
             (0.0, 1.0 / g)
         } else if time[i] > tau {
             // Survived past the horizon: contributes via 1/G(τ).
-            let g = g_cens(tau);
+            let g = censoring.at(tau);
             if !(g > 0.0) {
                 continue;
             }
@@ -2239,8 +2385,9 @@ pub struct HazardPathScores {
 /// differently-repaired matrix would make the two metrics disagree about which
 /// prediction they scored.
 ///
-/// `grid` must be strictly increasing with at least two points, `observed[i]`
-/// is `δ_i`, and every `event_times[i]` must be finite and positive — callers
+/// `grid` must start at the time origin `0` (the only time where `S = 1`, which
+/// the pinned first column asserts) and be strictly increasing with at least two
+/// points, `observed[i]` is `δ_i`, and every `event_times[i]` must be finite and positive — callers
 /// validate that, since what to do about a malformed input is theirs to decide.
 pub fn monotone_survival_and_hazard_scores(
     raw: ArrayView2<f64>,
@@ -2333,7 +2480,8 @@ pub fn monotone_survival_and_hazard_scores(
 /// trapezoidal rule over the grid and normalized by the integration span:
 ///   `IBS = (1 / (t_max − t_min)) ∫_{t_min}^{t_max} BS(t) dt`.
 ///
-/// `g_cens` is the censoring survival `G(t) = P(C > t)` (see [`KaplanMeier`]).
+/// `censoring` is the Kaplan–Meier fit of the censoring survival
+/// `G(t) = P(C > t)` ([`KaplanMeier::fit_censoring`]).
 /// Integration is restricted to grid points within `[grid[0], horizon]`; pass
 /// `horizon = f64::INFINITY` to integrate the full grid. Restricting to the
 /// observed support is the standard guard against the extrapolation tail where
@@ -2347,7 +2495,7 @@ pub fn integrated_ipcw_brier_score(
     event: &[f64],
     grid: &[f64],
     horizon: f64,
-    g_cens: impl Fn(f64) -> f64,
+    censoring: &KaplanMeier,
 ) -> Option<f64> {
     let m = grid.len();
     if m < 2 || s_pred.ncols() != m || s_pred.nrows() != time.len() {
@@ -2364,7 +2512,7 @@ pub fn integrated_ipcw_brier_score(
         }
         let col = s_pred.column(k);
         let col_slice: Vec<f64> = col.to_vec();
-        if let Some(bs) = ipcw_brier_score(&col_slice, time, event, grid[k], &g_cens) {
+        if let Some(bs) = ipcw_brier_score(&col_slice, time, event, grid[k], censoring) {
             pts.push((grid[k], bs));
         }
     }
@@ -2451,9 +2599,12 @@ pub struct SurvivalPredictionScores {
 /// scored on the same fold gets the same IPCW weights, and integration stops at
 /// the largest observed time, before the tail where those weights blow up.
 ///
-/// Every field is `None` when the shapes disagree, the grid is not strictly
-/// increasing with at least two points, or an event time is not finite and
-/// positive. What a malformed input means is decided here, once, for every front
+/// Every field is `None` when the shapes disagree, the grid does not start at
+/// the time origin `0` or is not strictly increasing with at least two points,
+/// or an event time is not finite and positive. The hazard-path scores integrate
+/// from `t = 0`, where `S = 1`: a grid starting later has no column for the
+/// hazard accumulated before its first point, and no interval containing an
+/// event before it. What a malformed input means is decided here, once, for every front
 /// door.
 pub fn survival_prediction_scores(
     event_times: &[f64],
@@ -2469,6 +2620,7 @@ pub fn survival_prediction_scores(
         || survival.nrows() != event_times.len()
         || survival.ncols() != grid.len()
         || grid.len() < 2
+        || grid[0] != 0.0
         || grid.windows(2).any(|pair| pair[1] <= pair[0])
         || event_times.iter().any(|time| !time.is_finite() || *time <= 0.0)
     {
@@ -2486,7 +2638,7 @@ pub fn survival_prediction_scores(
             events,
             grid,
             horizon,
-            |t| censoring.at(t),
+            &censoring,
         );
         (brier, path)
     };
@@ -2568,6 +2720,14 @@ impl KaplanMeier {
         Self { steps }
     }
 
+    /// Left limit `Ŝ(t−)`: survival at the last event time strictly before `t`
+    /// (and `1.0` at or before the first event). This is `P(T ≥ t)` where
+    /// [`Self::at`] is `P(T > t)`; the two differ exactly at an event time.
+    pub fn before(&self, t: f64) -> f64 {
+        let idx = self.steps.partition_point(|&(time, _)| time < t);
+        if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
+    }
+
     /// Fit the censoring survival `G(t) = P(C > t)` by reversing the event role:
     /// a censored observation (`event ≤ 0.5`) is an "event" of the censoring
     /// process and a death (`event > 0.5`) is a censoring of it.
@@ -2579,31 +2739,19 @@ impl KaplanMeier {
         Self::fit(time, &flipped)
     }
 
-    /// [`Self::at`] evaluated across a whole grid. `steps` is sorted by
-    /// construction, so each lookup is a binary search rather than the linear
-    /// scan `at` does — the difference matters when a caller evaluates a dense
-    /// grid against a step function with one step per event time.
+    /// [`Self::at`] evaluated across a whole grid.
     pub fn on_grid(&self, grid: &[f64]) -> Vec<f64> {
-        grid.iter()
-            .map(|&t| {
-                let idx = self.steps.partition_point(|&(time, _)| time <= t);
-                if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
-            })
-            .collect()
+        grid.iter().map(|&t| self.at(t)).collect()
     }
 
     /// Right-continuous step lookup: `Ŝ(t)` = survival at the last event time
-    /// `≤ t` (and `1.0` before the first event).
+    /// `≤ t` (and `1.0` before the first event). `steps` is sorted by
+    /// construction, so the lookup is a binary search: IPCW scoring evaluates
+    /// the censoring curve once per subject per grid point against one step per
+    /// distinct censoring time. A NaN `t` precedes no step and reads `1.0`.
     pub fn at(&self, t: f64) -> f64 {
-        let mut s = 1.0_f64;
-        for &(time, surv) in &self.steps {
-            if time <= t {
-                s = surv;
-            } else {
-                break;
-            }
-        }
-        s
+        let idx = self.steps.partition_point(|&(time, _)| time <= t);
+        if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
     }
 }
 
@@ -3518,6 +3666,11 @@ pub fn predict_competing_risks_survival(
     let mut cumulative_hazard_refined = (0..cause_count)
         .map(|_| Array2::<f64>::zeros((n, refined_cols)))
         .collect::<Vec<_>>();
+    // Rounding band of each refined cumulative hazard, so the AJ assembly
+    // clamps only decreases that are rounding of these evaluations (#3529).
+    let mut cumulative_hazard_refined_band = (0..cause_count)
+        .map(|_| Array2::<f64>::zeros((n, refined_cols)))
+        .collect::<Vec<_>>();
     let mut linear_predictor = (0..cause_count)
         .map(|_| Array1::<f64>::zeros(n))
         .collect::<Vec<_>>();
@@ -3531,6 +3684,8 @@ pub fn predict_competing_risks_survival(
         /// Cumulative hazard on the refined AJ grid (gam#1385); empty on the
         /// per-row-eval path.
         cumulative_refined: Vec<f64>,
+        /// Rounding band of each `cumulative_refined` entry (#3529).
+        cumulative_refined_band: Vec<f64>,
         eta_exit: f64,
     }
 
@@ -3541,7 +3696,7 @@ pub fn predict_competing_risks_survival(
             let i = flat % n;
             let block = &fit.blocks[cause];
             let timewiggle = saved_timewiggle_by_cause[cause].as_ref();
-            let evaluate_at = |t_query: f64| -> Result<(f64, f64, f64), SurvivalPredictError> {
+            let evaluate_at = |t_query: f64| -> Result<RpRowEvaluation, SurvivalPredictError> {
                 let t_entry = age_entry[i].min(t_query);
                 let single_entry = Array1::from_elem(1, t_entry);
                 let single_exit = Array1::from_elem(1, t_query);
@@ -3584,10 +3739,11 @@ pub fn predict_competing_risks_survival(
                 survival: vec![0.0; t_cols],
                 cumulative: vec![0.0; t_cols],
                 cumulative_refined: vec![0.0; refined_cols],
+                cumulative_refined_band: vec![0.0; refined_cols],
                 eta_exit: 0.0,
             };
             if per_row_eval {
-                let (eta_t, cum_t, haz_t) = evaluate_at(age_exit[i])?;
+                let (eta_t, cum_t, haz_t, cum_band_t) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
                 out.hazard[0] = haz_t;
                 out.cumulative[0] = cum_t;
@@ -3601,16 +3757,19 @@ pub fn predict_competing_risks_survival(
                 for s in 1..=CIF_REFINE_SUBINTERVALS {
                     let frac = (s as f64) / (CIF_REFINE_SUBINTERVALS as f64);
                     let t_query = age_exit[i] * frac;
-                    out.cumulative_refined[s - 1] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else if s == CIF_REFINE_SUBINTERVALS {
                         // frac == 1 exactly: reuse the exit evaluation so the
                         // assembled CIF and the reported cumulative hazard
                         // agree to the bit.
-                        cum_t
+                        (cum_t, cum_band_t)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[s - 1] = cum;
+                    out.cumulative_refined_band[s - 1] = cum_band;
                 }
             } else {
                 for (j, &t_query) in eval_times.iter().enumerate() {
@@ -3625,7 +3784,7 @@ pub fn predict_competing_risks_survival(
                         out.cumulative[j] = 0.0;
                         out.survival[j] = 1.0;
                     } else {
-                        let (_eta_t, cum_t, haz_t) = evaluate_at(t_query)?;
+                        let (_eta_t, cum_t, haz_t, _) = evaluate_at(t_query)?;
                         out.hazard[j] = haz_t;
                         out.cumulative[j] = cum_t;
                         out.survival[j] = (-cum_t).exp().clamp(0.0, 1.0);
@@ -3637,13 +3796,16 @@ pub fn predict_competing_risks_survival(
                 // per-cause cumulative_hazard and the assembly agree at the user
                 // times to the bit.
                 for (jr, &t_query) in refined_times.iter().enumerate() {
-                    out.cumulative_refined[jr] = if t_query <= 0.0 {
-                        0.0
+                    let (cum, cum_band) = if t_query <= 0.0 {
+                        (0.0, 0.0)
                     } else {
-                        evaluate_at(t_query)?.1
+                        let (_, cum, _, cum_band) = evaluate_at(t_query)?;
+                        (cum, cum_band)
                     };
+                    out.cumulative_refined[jr] = cum;
+                    out.cumulative_refined_band[jr] = cum_band;
                 }
-                let (eta_t, _, _) = evaluate_at(age_exit[i])?;
+                let (eta_t, _, _, _) = evaluate_at(age_exit[i])?;
                 out.eta_exit = eta_t;
             }
             Ok(out)
@@ -3659,6 +3821,8 @@ pub fn predict_competing_risks_survival(
         }
         for jr in 0..refined_cols {
             cumulative_hazard_refined[row.cause][[row.row, jr]] = row.cumulative_refined[jr];
+            cumulative_hazard_refined_band[row.cause][[row.row, jr]] =
+                row.cumulative_refined_band[jr];
         }
     }
 
@@ -3675,9 +3839,10 @@ pub fn predict_competing_risks_survival(
         let assembly_times = Array1::from_shape_fn(CIF_REFINE_SUBINTERVALS, |s| {
             ((s + 1) as f64) / (CIF_REFINE_SUBINTERVALS as f64)
         });
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         let last = CIF_REFINE_SUBINTERVALS - 1;
@@ -3699,9 +3864,10 @@ pub fn predict_competing_risks_survival(
         }
     } else {
         let assembly_times = Array1::from_vec(refined_times.clone());
-        let refined_assembled = assemble_competing_risks_cif_from_endpoints(
+        let refined_assembled = assemble_competing_risks_cif_from_endpoints_with_rounding(
             assembly_times.view(),
             &cumulative_hazard_refined,
+            &cumulative_hazard_refined_band,
         )
         .map_err(|err| err.to_string())?;
         // Project refined CIF / overall-survival columns onto the user grid.
@@ -4575,8 +4741,23 @@ fn evaluate_rp_row(
         derivative_time_offset_row,
         primary_offset_row,
     )
+    .map(|(eta, cumulative_hazard, hazard, _)| (eta, cumulative_hazard, hazard))
 }
 
+/// `(eta, H, h, band_H)` of one Royston-Parmar row; see [`evaluate_rp_row_with_beta`].
+type RpRowEvaluation = (f64, f64, f64, f64);
+
+/// Evaluate one Royston-Parmar row: `(eta, H, h, band_H)`.
+///
+/// `band_H` bounds the rounding of `H = exp(eta)` as evaluated here, for the
+/// design row as built. `eta = Σ_j x_j β_j + (eta_time_offset + primary_offset)`
+/// is a sum of `p + 2` terms, so its forward error is at most
+/// `δ = γ_{p+2} · (Σ_j |x_j β_j| + |eta_time_offset| + |primary_offset|)`
+/// (Higham, Lemma 3.1 / inner-product bound). `exp` is faithfully rounded, a
+/// relative error below `ε`, so
+/// `|Ĥ − H| ≤ Ĥ · (expm1(δ) + ε) / (1 − ε)`.
+/// The competing-risks Aalen-Johansen assembly uses it to tell a rounding-level
+/// decrease of `H` between two evaluations from a real one (#3529).
 fn evaluate_rp_row_with_beta(
     beta: &Array1<f64>,
     saved_timewiggle: Option<&SavedBaselineTimeWiggleRuntime>,
@@ -4585,7 +4766,7 @@ fn evaluate_rp_row_with_beta(
     eta_time_offset_row: f64,
     derivative_time_offset_row: f64,
     primary_offset_row: f64,
-) -> Result<(f64, f64, f64), SurvivalPredictError> {
+) -> Result<RpRowEvaluation, SurvivalPredictError> {
     let p_time = row_time.x_exit_time.ncols();
     let p_timewiggle = saved_timewiggle.map_or(0, |runtime| runtime.beta.len());
     let p_cov = cov_row.len();
@@ -4682,7 +4863,20 @@ fn evaluate_rp_row_with_beta(
     let eta =
         predict_royston_parmar_eta(x_exit.view(), beta.view(), offset_view.view(), &likelihood)?[0];
     let (cum, haz) = royston_parmar_survival_hazard_components(eta, eta_derivative)?;
-    Ok((eta, cum, haz))
+    let eta_magnitude = x_exit
+        .row(0)
+        .iter()
+        .zip(beta.iter())
+        .map(|(x, b)| (x * b).abs())
+        .sum::<f64>()
+        + eta_time_offset_row.abs()
+        + primary_offset_row.abs();
+    let eta_band = gam_linalg::roundoff::accumulation_growth(p + 2) * eta_magnitude;
+    // `cum = exp(eta)` is accurate to one ulp, `2u`, so the exact cumulative
+    // hazard lies within `(1 + γ₂)·exp(±eta_band)` of it.
+    let exp_growth = gam_linalg::roundoff::accumulation_growth(2);
+    let cum_band = cum * (eta_band.exp_m1() * (1.0 + exp_growth) + exp_growth);
+    Ok((eta, cum, haz, cum_band))
 }
 
 fn predict_royston_parmar_eta<X>(
@@ -7431,15 +7625,11 @@ mod tests {
             survival_prediction_scores(&time, &event, &grid, model.view(), Some(null.view()));
         let censoring = KaplanMeier::fit_censoring(&time, &event);
         let model_ibs =
-            integrated_ipcw_brier_score(model.view(), &time, &event, &grid, 10.0, |t| {
-                censoring.at(t)
-            })
-            .expect("model integrated Brier");
+            integrated_ipcw_brier_score(model.view(), &time, &event, &grid, 10.0, &censoring)
+                .expect("model integrated Brier");
         let null_ibs =
-            integrated_ipcw_brier_score(null.view(), &time, &event, &grid, 10.0, |t| {
-                censoring.at(t)
-            })
-            .expect("null integrated Brier");
+            integrated_ipcw_brier_score(null.view(), &time, &event, &grid, 10.0, &censoring)
+                .expect("null integrated Brier");
         assert_eq!(scores.brier, Some(model_ibs));
         let lifted = scores.lifted_brier.expect("lifted Brier");
         assert!((lifted - (null_ibs - model_ibs) / null_ibs.abs()).abs() <= 1e-15);
@@ -7456,6 +7646,29 @@ mod tests {
             survival_prediction_scores(&time, &event, &repeated_knot, model.view(), None),
             SurvivalPredictionScores::default()
         );
+    }
+
+    #[test]
+    fn a_scoring_grid_that_does_not_start_at_the_origin_is_refused_3609() {
+        // S = 1 holds only at t = 0. On a grid starting at 1.0 the repair would
+        // pin the model's S(1.0) < 1 to 1, dropping −ln S(1.0) from every H(T_i),
+        // and the event at T = 0.5 would sit before the first interval and read a
+        // negative cumulative hazard.
+        let time = [0.5, 2.0, 8.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let origin = [0.0, 1.0, 2.0, 3.0, 5.0];
+        let model = Array2::from_shape_fn((4, 5), |(row, col)| {
+            1.0 - col as f64 * (0.05 + 0.02 * row as f64)
+        });
+        let scored = survival_prediction_scores(&time, &event, &origin, model.view(), None);
+        assert!(scored.brier.is_some() && scored.logloss.is_some());
+        for late in [[1.0, 2.0, 3.0, 5.0, 7.0], [-1.0, 1.0, 2.0, 3.0, 5.0]] {
+            assert_eq!(
+                survival_prediction_scores(&time, &event, &late, model.view(), None),
+                SurvivalPredictionScores::default(),
+                "grid {late:?}"
+            );
+        }
     }
 
     // ---- IPCW Brier score (Graf et al. 1999) -------------------------------
@@ -7477,6 +7690,97 @@ mod tests {
         assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
         // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
         assert!(g.at(8.0).abs() <= 1e-15);
+        // `on_grid` is `at` mapped over the grid, NaN included (it precedes no step).
+        let probe = [f64::NAN, -1.0, 0.0, 3.999, 4.0, 7.5, 8.0, 9.0, f64::INFINITY];
+        let mapped: Vec<f64> = probe.iter().map(|&t| g.at(t)).collect();
+        assert_eq!(g.on_grid(&probe), mapped);
+        assert_eq!(g.at(f64::NAN), 1.0);
+        assert_eq!(g.at(f64::INFINITY), 0.0);
+    }
+
+    /// The pair-loop definition of Harrell's C, written independently of the
+    /// Fenwick sweep: a pair is comparable when one subject had an event and the
+    /// other was observed strictly later, or at the same time but censored.
+    fn harrell_concordance_by_pairs(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
+        let mut comparable = 0.0_f64;
+        let mut concordant = 0.0_f64;
+        for i in 0..time.len() {
+            for j in 0..time.len() {
+                let i_fails_first = event[i] > 0.5
+                    && (time[j] > time[i] || (time[j] == time[i] && event[j] <= 0.5));
+                if !i_fails_first {
+                    continue;
+                }
+                comparable += 1.0;
+                if risk[i] > risk[j] {
+                    concordant += 1.0;
+                } else if risk[i] == risk[j] {
+                    concordant += 0.5;
+                }
+            }
+        }
+        if comparable > 0.0 {
+            Some(concordant / comparable)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn harrell_concordance_tie_rules_match_hand_count() {
+        // Tied block at t=2: two events (rows 1, 2) and one censoring (row 3).
+        // Comparable pairs (early, late): row 0 with all four later rows
+        // (risk 5 beats 4, 1, 3, 2: 4 concordant); rows 1 and 2 with the tied
+        // censoring row 3 (4>3 concordant, 1<3 discordant) and with row 4
+        // (4>2 concordant, 1<2 discordant). The tied event pair (1, 2) is not
+        // comparable, and row 3 (censored) orders nothing after it.
+        // C = (4 + 1 + 1) / (4 + 2 + 2) = 0.75.
+        let time = [1.0, 2.0, 2.0, 2.0, 3.0];
+        let event = [1.0, 1.0, 1.0, 0.0, 0.0];
+        let risk = [5.0, 4.0, 1.0, 3.0, 2.0];
+        assert_eq!(harrell_concordance(&time, &event, &risk), Some(0.75));
+
+        // Two events at the same time are not comparable: nothing is orderable.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[1.0, 1.0], &[1.0, 0.0]), None);
+        // An event tied with a censoring is comparable; the censored subject
+        // outlived the death, so the larger risk on the event is concordant.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[0.0, 1.0], &[1.0, 3.0]), Some(1.0));
+        // Equal risks score half credit.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[7.0, 7.0]), Some(0.5));
+        // All censored: no comparable pair.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[0.0, 0.0], &[1.0, 2.0]), None);
+        // Non-finite inputs have no defined ordering.
+        assert_eq!(harrell_concordance(&[1.0, f64::NAN], &[1.0, 1.0], &[1.0, 2.0]), None);
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[f64::NAN, 2.0]), None);
+        // Length mismatch.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0], &[1.0, 2.0]), None);
+    }
+
+    #[test]
+    fn harrell_concordance_sweep_equals_pair_definition_under_heavy_ties() {
+        // Coarse integer times and risks force many tied time blocks and tied
+        // risks; the O(n log n) sweep must reproduce the pair loop exactly.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |modulus: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % modulus
+        };
+        for trial in 0..200 {
+            let n = (next(40) + 1) as usize;
+            let time: Vec<f64> = (0..n).map(|_| (next(6) + 1) as f64).collect();
+            let event: Vec<f64> = (0..n)
+                .map(|_| if next(5) < 3 { 1.0 } else { 0.0 })
+                .collect();
+            let risk: Vec<f64> = (0..n).map(|_| next(5) as f64 - 2.0).collect();
+            let sweep = harrell_concordance(&time, &event, &risk);
+            let pairs = harrell_concordance_by_pairs(&time, &event, &risk);
+            // Both are one correctly rounded division of the same exact rational
+            // (the numerators are integer and half-integer counts), so they are
+            // bitwise equal, not merely close.
+            assert_eq!(sweep, pairs, "trial {trial}");
+        }
     }
 
     #[test]
@@ -7488,7 +7792,7 @@ mod tests {
         let event = [1.0, 1.0, 0.0, 1.0];
         let tau = 5.0;
         let g = KaplanMeier::fit_censoring(&time, &event);
-        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, |t| g.at(t)).unwrap();
+        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, &g).unwrap();
         // targets: dead→0 (subj1,4), alive→1 (subj2,3).
         let expected =
             (0.3f64.powi(2) + (1.0 - 0.7f64).powi(2) + (1.0 - 0.6f64).powi(2) + 0.2f64.powi(2))
@@ -7509,7 +7813,7 @@ mod tests {
         let event = [1.0, 0.0, 1.0, 0.0];
         let tau = 5.0;
         let g = KaplanMeier::fit_censoring(&time, &event);
-        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, |t| g.at(t)).unwrap();
+        let bs = ipcw_brier_score(&s_pred, &time, &event, tau, &g).unwrap();
         // subj1 dead by 5: weight 1/G(2)=1, contrib 0.4²=0.16.
         // subj2 censored before 5: contributes 0.
         // subj3 alive: weight 1/G(5)=1.5, contrib 1.5·0.3²=0.135.
@@ -7522,13 +7826,40 @@ mod tests {
     }
 
     #[test]
+    fn ipcw_brier_weights_an_event_tied_with_a_censoring_by_the_left_limit() {
+        // Discretised follow-up: a death and a censoring tie at t = 2, and again
+        // at t = 5. The censoring KM steps at each tie (G(2) = 4/5, G(5) = 8/15),
+        // but a death at T was observed because C ≥ T, whose probability is the
+        // left limit G(T−) (G(2−) = 1, G(5−) = 4/5). Weighting by the
+        // right-continuous G(T) would count each tied death 1/(1 − c/n) times.
+        let s_pred = [0.4, 0.6, 0.7, 0.8, 0.9];
+        let time = [2.0, 2.0, 5.0, 5.0, 7.0];
+        let event = [1.0, 0.0, 1.0, 0.0, 1.0];
+        let g = KaplanMeier::fit_censoring(&time, &event);
+        assert_eq!(g.before(2.0), 1.0);
+        assert!((g.at(2.0) - 0.8).abs() <= 1e-15);
+        assert!((g.before(5.0) - 0.8).abs() <= 1e-15);
+        assert!((g.at(5.0) - 8.0 / 15.0).abs() <= 1e-15);
+        // tau = 3: subj1 dead, weight 1/G(2−) = 1, contrib 0.4²; subj2 censored
+        // at 2 contributes 0; subj3..5 alive, weight 1/G(3) = 5/4.
+        let bs = ipcw_brier_score(&s_pred, &time, &event, 3.0, &g).unwrap();
+        let expected = (0.16 + 1.25 * (0.09 + 0.04 + 0.01)) / 5.0;
+        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+        // tau = 5: subj3 dead at the tie, weight 1/G(5−) = 5/4; subj5 alive,
+        // weight 1/G(5) = 15/8; the two censored subjects contribute 0.
+        let bs = ipcw_brier_score(&s_pred, &time, &event, 5.0, &g).unwrap();
+        let expected = (0.16 + 1.25 * 0.49 + 1.875 * 0.01) / 5.0;
+        assert!((bs - expected).abs() <= 1e-12, "bs={bs} expected={expected}");
+    }
+
+    #[test]
     fn ipcw_brier_drops_invalid_rows_from_both_numerator_and_denominator() {
         // A NaN-time row and a non-positive-time row must not be counted at all.
         let s_pred = [0.3, 0.7, 0.5, 0.5];
         let time = [2.0, 8.0, f64::NAN, -1.0];
         let event = [1.0, 1.0, 1.0, 0.0];
         let g = KaplanMeier::fit_censoring(&time, &event);
-        let bs = ipcw_brier_score(&s_pred, &time, &event, 5.0, |t| g.at(t)).unwrap();
+        let bs = ipcw_brier_score(&s_pred, &time, &event, 5.0, &g).unwrap();
         // Only subj1 (dead, contrib 0.3²) and subj2 (alive, contrib 0.3²) count;
         // censoring KM has no censorings so G≡1.
         let expected = (0.3f64.powi(2) + (1.0 - 0.7f64).powi(2)) / 2.0;
@@ -7556,7 +7887,7 @@ mod tests {
             }
         }
         let g = KaplanMeier::fit_censoring(&time, &event);
-        let per_time = ipcw_brier_score(&col, &time, &event, grid[2], |t| g.at(t)).unwrap();
+        let per_time = ipcw_brier_score(&col, &time, &event, grid[2], &g).unwrap();
         // Because the predicted survival is identical at every grid time, BS(t)
         // is *not* constant (tau changes which subjects are "alive"), so use a
         // direct trapezoid as the oracle.
@@ -7564,7 +7895,7 @@ mod tests {
         for k in 0..grid.len() {
             oracle_pts.push((
                 grid[k],
-                ipcw_brier_score(&col, &time, &event, grid[k], |t| g.at(t)).unwrap(),
+                ipcw_brier_score(&col, &time, &event, grid[k], &g).unwrap(),
             ));
         }
         let mut integral = 0.0;
@@ -7573,10 +7904,8 @@ mod tests {
         }
         let oracle = integral / (grid[grid.len() - 1] - grid[0]);
         let ibs =
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| {
-                g.at(t)
-            })
-            .unwrap();
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, &g)
+                .unwrap();
         assert!((ibs - oracle).abs() <= 1e-12, "ibs={ibs} oracle={oracle}");
         // Sanity: per-time value is in a sensible [0,1]-ish range.
         assert!(per_time >= 0.0);
@@ -7597,13 +7926,10 @@ mod tests {
         let g = KaplanMeier::fit_censoring(&time, &event);
         // Horizon 5 drops the extrapolation point at t=100: integral runs [0,4].
         let restricted =
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, 5.0, |t| g.at(t))
-                .unwrap();
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, 5.0, &g).unwrap();
         let full =
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, |t| {
-                g.at(t)
-            })
-            .unwrap();
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &grid, f64::INFINITY, &g)
+                .unwrap();
         // The huge [4,100] tail interval dominates the full integral, so the two
         // must differ substantially — the horizon guard is doing real work.
         assert!(
@@ -7621,16 +7947,14 @@ mod tests {
         // Non-increasing grid.
         let bad = [0.0, 2.0, 1.0];
         assert!(
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &bad, f64::INFINITY, |t| g
-                .at(t))
-            .is_none()
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &bad, f64::INFINITY, &g)
+                .is_none()
         );
         // Grid width mismatched to the survival matrix.
         let short = [0.0, 1.0];
         assert!(
-            integrated_ipcw_brier_score(surv.view(), &time, &event, &short, f64::INFINITY, |t| g
-                .at(t))
-            .is_none()
+            integrated_ipcw_brier_score(surv.view(), &time, &event, &short, f64::INFINITY, &g)
+                .is_none()
         );
     }
 

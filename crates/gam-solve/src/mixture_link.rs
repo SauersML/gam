@@ -1,8 +1,8 @@
 use crate::estimate::EstimationError;
-use crate::quadrature::latent_cloglog_jet5;
+use crate::quadrature::{latent_cloglog_d6, latent_cloglog_jet5};
 use gam_math::{
     probability::{normal_cdf, normal_pdf},
-    special::trigamma,
+    special::{digamma, trigamma},
 };
 use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use gam_problem::{
@@ -11,7 +11,6 @@ use gam_problem::{
 };
 use ndarray::{Array1, Array2};
 use statrs::function::beta::{beta_reg, ln_beta};
-use statrs::function::gamma::digamma;
 use std::ops::Neg;
 use std::sync::OnceLock;
 
@@ -188,25 +187,27 @@ fn finite_inverse_link_eta(link: &'static str, eta: f64) -> Result<f64, Estimati
 }
 
 #[derive(Clone, Copy)]
-struct AsinhJet5 {
+struct AsinhJet6 {
     value: f64,
     d1: f64,
     d2: f64,
     d3: f64,
     d4: f64,
     d5: f64,
+    d6: f64,
 }
 
 /// Exact eta derivatives of `asinh(eta)`, factored through `hypot` so powers
 /// of a large finite eta never form `inf * 0` in the derivative tails.
 #[inline]
-fn asinh_jet5(eta: f64) -> AsinhJet5 {
+fn asinh_jet6(eta: f64) -> AsinhJet6 {
     let q = eta.hypot(1.0);
     let inv_q = q.recip();
     let inv_q2 = inv_q * inv_q;
     let inv_q3 = inv_q2 * inv_q;
     let inv_q4 = inv_q2 * inv_q2;
     let inv_q5 = inv_q4 * inv_q;
+    let inv_q6 = inv_q3 * inv_q3;
     let t = eta / q;
     let t2 = t * t;
     let t4 = t2 * t2;
@@ -225,13 +226,15 @@ fn asinh_jet5(eta: f64) -> AsinhJet5 {
             eta.signum() * (eta.abs().ln() + std::f64::consts::LN_2)
         }
     };
-    AsinhJet5 {
+    AsinhJet6 {
         value,
         d1: inv_q,
         d2: -t * inv_q2,
         d3: (2.0 * t2 - inv_q2) * inv_q3,
         d4: t * (9.0 * inv_q2 - 6.0 * t2) * inv_q4,
         d5: (9.0 * inv_q4 - 72.0 * t2 * inv_q2 + 24.0 * t4) * inv_q5,
+        // -15 eta (8 eta^4 - 40 eta^2 + 15) / (1 + eta^2)^(11/2).
+        d6: -15.0 * t * (8.0 * t4 - 40.0 * t2 * inv_q2 + 15.0 * inv_q4) * inv_q6,
     }
 }
 
@@ -329,6 +332,37 @@ fn cauchit_inverse_link_d5(eta: f64) -> f64 {
 }
 
 #[inline]
+fn cauchit_inverse_link_d6(eta: f64) -> f64 {
+    let (q, r) = cauchit_rational_factors(eta);
+    let q2 = q * q;
+    let r2 = r * r;
+    // -240 eta (3 - 10eta^2 + 3eta^4) / [pi (1+eta^2)^6].
+    canonicalzero((-240.0 * r * (3.0 * q2 * q2 - 10.0 * q2 * r2 + 3.0 * r2 * r2))
+        * (q / std::f64::consts::PI))
+}
+
+/// Sixth derivative of the logistic CDF, the order after
+/// [`logit_inverse_link_jet5`]'s `d5`, in the same overflow-free `z = e^{-|eta|}`
+/// form: `z(1 - 57z + 302z² - 302z³ + 57z⁴ - z⁵)/(1 + z)⁷` for `eta < 0` and its
+/// odd reflection for `eta ≥ 0`.
+#[inline]
+pub(crate) fn logit_inverse_link_d6(eta: f64) -> f64 {
+    if eta.is_nan() {
+        return f64::NAN;
+    }
+    if !eta.is_finite() {
+        return 0.0;
+    }
+    let z = (-eta.abs()).exp();
+    let opz = 1.0 + z;
+    let opz2 = opz * opz;
+    let opz7 = opz2 * opz2 * opz2 * opz;
+    let polynomial = 1.0 + z * (-57.0 + z * (302.0 + z * (-302.0 + z * (57.0 - z))));
+    let value = z * polynomial / opz7;
+    canonicalzero(if eta >= 0.0 { -value } else { value })
+}
+
+#[inline]
 pub fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     if eta.is_nan() {
         return LogitJet5 {
@@ -410,7 +444,7 @@ pub fn logit_inverse_link_jet5(eta: f64) -> LogitJet5 {
     }
 }
 
-/// Multiply a degree-at-most-four Hermite factor by the normal density.
+/// Multiply a degree-at-most-five Hermite factor by the normal density.
 /// A subnormal density can regain representable digits after multiplication;
 /// include the factor before exponentiation in that tail.
 #[inline]
@@ -419,8 +453,8 @@ fn probit_density_product(x: f64, density: f64, polynomial: f64) -> f64 {
         return polynomial * density;
     }
     if x.abs() > 40.0 {
-        // Even the fourth-degree factor times phi(40) is below half the
-        // smallest subnormal. Larger finite arguments also round to zero.
+        // Even the fifth-degree factor times phi(40), about 1.5e-340, is below
+        // half the smallest subnormal. Larger finite arguments also round to zero.
         return 0.0;
     }
     if polynomial == 0.0 {
@@ -506,6 +540,21 @@ fn probit_pdffourth_derivative(eta: f64) -> f64 {
     canonicalzero(probit_density_product(x, phi, x * x * x * x - 6.0 * x * x + 3.0))
 }
 
+#[inline]
+fn probit_pdffifth_derivative(eta: f64) -> f64 {
+    // mu'''''' = Phi^{(6)}(eta) = -(eta^5 - 10*eta^3 + 15*eta) * phi(eta).
+    if eta.is_nan() {
+        return f64::NAN;
+    }
+    if !eta.is_finite() {
+        return 0.0;
+    }
+    let x = eta;
+    let x2 = x * x;
+    let phi = normal_pdf(x);
+    canonicalzero(probit_density_product(x, phi, -x * (x2 * x2 - 10.0 * x2 + 15.0)))
+}
+
 /// Multiply two 5-term truncated Taylor series (coefficients `a_k = g^(k)/k!`,
 /// `k = 0..=4`) and return the truncated product coefficients.
 #[inline]
@@ -552,7 +601,7 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// terms and a separately evaluated log weight. Direct complementary tails
 /// retain variance information after the reported mean rounds to an endpoint;
 /// each derivative is rescaled separately, including when W itself underflows.
-pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+pub fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
             let jet = logit_inverse_link_jet5(eta);
@@ -898,7 +947,7 @@ fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
 
 /// η-derivatives of the two Bernoulli log-probabilities (#3317):
 /// `log_mu[k] = ∂^{k+1} log μ(η)/∂η^{k+1}` and `log_complement[k]` the same for
-/// `log(1 − μ(η))`, for `k = 0..4`.
+/// `log(1 − μ(η))`, for `k = 0..5`.
 ///
 /// A Bernoulli row's log-likelihood is `y·log μ + (1−y)·log(1−μ)`, so its
 /// observed information and every η-derivative of it are linear in these two
@@ -920,48 +969,48 @@ fn probit_fisher_weight_jet5(eta: f64) -> (f64, f64, f64, f64, f64) {
 /// derivative of `log Φ(−30)`, whose second is `−0.9989`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BernoulliLogJet {
-    pub(crate) log_mu: [f64; 5],
-    pub(crate) log_complement: [f64; 5],
+    pub(crate) log_mu: [f64; 6],
+    pub(crate) log_complement: [f64; 6],
 }
 
-pub(crate) fn bernoulli_log_jet5_for_inverse_link(
+pub(crate) fn bernoulli_log_jet6_for_inverse_link(
     link: &InverseLink,
     eta: f64,
 ) -> Result<BernoulliLogJet, EstimationError> {
     if eta.is_nan() {
         return Ok(BernoulliLogJet {
-            log_mu: [f64::NAN; 5],
-            log_complement: [f64::NAN; 5],
+            log_mu: [f64::NAN; 6],
+            log_complement: [f64::NAN; 6],
         });
     }
     match link {
         InverseLink::Standard(StandardLink::Logit) => {
-            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Logistic, eta))
+            Ok(symmetric_bernoulli_log_jet6(SymmetricBernoulliCdf::Logistic, eta))
         }
         InverseLink::Standard(StandardLink::Probit) => {
-            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Normal, eta))
+            Ok(symmetric_bernoulli_log_jet6(SymmetricBernoulliCdf::Normal, eta))
         }
         InverseLink::Standard(StandardLink::Cauchit) => {
-            Ok(symmetric_bernoulli_log_jet5(SymmetricBernoulliCdf::Cauchy, eta))
+            Ok(symmetric_bernoulli_log_jet6(SymmetricBernoulliCdf::Cauchy, eta))
         }
         InverseLink::Standard(StandardLink::CLogLog) => Ok(BernoulliLogJet {
-            log_mu: cloglog_log_mean_jet5(eta),
+            log_mu: cloglog_log_mean_jet6(eta),
             // log(1 − μ) = −e^η: every derivative is −e^η.
-            log_complement: [-eta.exp(); 5],
+            log_complement: [-eta.exp(); 6],
         }),
         // loglog μ(η) = 1 − cloglog μ(−η): the two sides trade places.
         InverseLink::Standard(StandardLink::LogLog) => Ok(BernoulliLogJet {
-            log_mu: reflect_log_jet5([-(-eta).exp(); 5]),
-            log_complement: reflect_log_jet5(cloglog_log_mean_jet5(-eta)),
+            log_mu: reflect_log_jet6([-(-eta).exp(); 6]),
+            log_complement: reflect_log_jet6(cloglog_log_mean_jet6(-eta)),
         }),
-        _ => bernoulli_log_jet5_from_inverse_link_jet(link, eta),
+        _ => bernoulli_log_jet6_from_inverse_link_jet(link, eta),
     }
 }
 
-/// The link-generic construction behind [`bernoulli_log_jet5_for_inverse_link`],
-/// from the inverse-link jet and its fourth and fifth derivatives, normalizing
-/// each side by its own probability.
-pub(crate) fn bernoulli_log_jet5_from_inverse_link_jet(
+/// The link-generic construction behind [`bernoulli_log_jet6_for_inverse_link`],
+/// from the inverse-link jet and its fourth through sixth derivatives,
+/// normalizing each side by its own probability.
+pub(crate) fn bernoulli_log_jet6_from_inverse_link_jet(
     link: &InverseLink,
     eta: f64,
 ) -> Result<BernoulliLogJet, EstimationError> {
@@ -972,36 +1021,40 @@ pub(crate) fn bernoulli_log_jet5_from_inverse_link_jet(
         jet.d3,
         inverse_link_pdfthird_derivative_for_inverse_link(link, eta)?,
         inverse_link_pdffourth_derivative_for_inverse_link(link, eta)?,
+        inverse_link_pdffifth_derivative_for_inverse_link(link, eta)?,
     ];
     let complement = inverse_link_complement_for_inverse_link(link, eta, jet.mu);
-    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
-    let mut mean_series = [0.0; 5];
-    let mut complement_series = [0.0; 5];
-    for m in 0..5 {
+    let factorial = SERIES_FACTORIALS6;
+    let mut mean_series = [0.0; 6];
+    let mut complement_series = [0.0; 6];
+    for m in 0..6 {
         mean_series[m] = derivatives[m] / (factorial[m] * jet.mu);
         complement_series[m] = -derivatives[m] / (factorial[m] * complement);
     }
     Ok(BernoulliLogJet {
-        log_mu: log_of_normalized_series5(mean_series),
-        log_complement: log_of_normalized_series5(complement_series),
+        log_mu: log_of_normalized_series6(mean_series),
+        log_complement: log_of_normalized_series6(complement_series),
     })
 }
 
 /// `f(−η)`'s derivative jet from `f`'s jet evaluated at `−η`:
 /// order `m` picks up `(−1)^m`.
 #[inline]
-fn reflect_log_jet5(jet: [f64; 5]) -> [f64; 5] {
-    [-jet[0], jet[1], -jet[2], jet[3], -jet[4]]
+fn reflect_log_jet6(jet: [f64; 6]) -> [f64; 6] {
+    [-jet[0], jet[1], -jet[2], jet[3], -jet[4], jet[5]]
 }
 
-/// Derivatives of `log P(t)` at `t = 0` for `P(t) = 1 + Σ_{m=1}^{5} p_m t^m`,
+/// `m!` for `m = 1..=6`, the Taylor normalizers of the six-term log-jet series.
+const SERIES_FACTORIALS6: [f64; 6] = [1.0, 2.0, 6.0, 24.0, 120.0, 720.0];
+
+/// Derivatives of `log P(t)` at `t = 0` for `P(t) = 1 + Σ_{m=1}^{6} p_m t^m`,
 /// given `p_m` as `series[m-1]`. From `P' = (log P)'·P`, the Taylor coefficients
 /// `l_m` of `log P` obey `l_m = p_m − (1/m) Σ_{j=1}^{m-1} j l_j p_{m-j}`.
 #[inline]
-fn log_of_normalized_series5(series: [f64; 5]) -> [f64; 5] {
-    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
-    let mut log_coefficients = [0.0_f64; 5];
-    for m in 1..=5 {
+fn log_of_normalized_series6(series: [f64; 6]) -> [f64; 6] {
+    let factorial = SERIES_FACTORIALS6;
+    let mut log_coefficients = [0.0_f64; 6];
+    for m in 1..=6 {
         let mut convolution = 0.0;
         for j in 1..m {
             let p = series[m - j - 1];
@@ -1011,8 +1064,8 @@ fn log_of_normalized_series5(series: [f64; 5]) -> [f64; 5] {
         }
         log_coefficients[m - 1] = series[m - 1] - convolution / m as f64;
     }
-    let mut derivatives = [0.0; 5];
-    for m in 0..5 {
+    let mut derivatives = [0.0; 6];
+    for m in 0..6 {
         derivatives[m] = canonicalzero(log_coefficients[m] * factorial[m]);
     }
     derivatives
@@ -1021,11 +1074,11 @@ fn log_of_normalized_series5(series: [f64; 5]) -> [f64; 5] {
 /// `p_m = ratio·density_ratios[m-1]/m!`; a zero ratio is an exactly zero series
 /// whatever the polynomials' size.
 #[inline]
-fn density_ratio_series5(ratio: f64, density_ratios: [f64; 5]) -> [f64; 5] {
-    let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
-    let mut series = [0.0; 5];
+fn density_ratio_series6(ratio: f64, density_ratios: [f64; 6]) -> [f64; 6] {
+    let factorial = SERIES_FACTORIALS6;
+    let mut series = [0.0; 6];
     if ratio != 0.0 {
-        for m in 0..5 {
+        for m in 0..6 {
             series[m] = ratio * density_ratios[m] / factorial[m];
         }
     }
@@ -1042,27 +1095,41 @@ enum SymmetricBernoulliCdf {
 
 /// Both sides of a symmetric link: `1 − F(η) = F(−η)`, so the complement's
 /// jet is the mean's evaluated at `−η` and reflected.
-fn symmetric_bernoulli_log_jet5(cdf: SymmetricBernoulliCdf, eta: f64) -> BernoulliLogJet {
+fn symmetric_bernoulli_log_jet6(cdf: SymmetricBernoulliCdf, eta: f64) -> BernoulliLogJet {
     BernoulliLogJet {
-        log_mu: symmetric_log_cdf_jet5(cdf, eta),
-        log_complement: reflect_log_jet5(symmetric_log_cdf_jet5(cdf, -eta)),
+        log_mu: symmetric_log_cdf_jet6(cdf, eta),
+        log_complement: reflect_log_jet6(symmetric_log_cdf_jet6(cdf, -eta)),
     }
 }
 
 /// Derivatives of `log F(x)` for a symmetric Bernoulli CDF `F`.
-fn symmetric_log_cdf_jet5(cdf: SymmetricBernoulliCdf, x: f64) -> [f64; 5] {
+fn symmetric_log_cdf_jet6(cdf: SymmetricBernoulliCdf, x: f64) -> [f64; 6] {
     match cdf {
         SymmetricBernoulliCdf::Logistic => {
             // (log F)' = 1 − F and (1 − F)' = −F', so order m ≥ 2 is −F^(m−1).
             let jet = logit_inverse_link_jet5(x);
-            [logit_inverse_link_jet5(-x).mu, -jet.d1, -jet.d2, -jet.d3, -jet.d4]
+            [
+                logit_inverse_link_jet5(-x).mu,
+                -jet.d1,
+                -jet.d2,
+                -jet.d3,
+                -jet.d4,
+                -jet.d5,
+            ]
         }
         SymmetricBernoulliCdf::Normal => {
             let x2 = x * x;
-            let density_ratios = [1.0, -x, x2 - 1.0, -x * (x2 - 3.0), x2 * x2 - 6.0 * x2 + 3.0];
+            let density_ratios = [
+                1.0,
+                -x,
+                x2 - 1.0,
+                -x * (x2 - 3.0),
+                x2 * x2 - 6.0 * x2 + 3.0,
+                -x * (x2 * x2 - 10.0 * x2 + 15.0),
+            ];
             let (log_p, ratio) = gam_math::probability::signed_probit_logcdf_and_mills_ratio(x);
             if ratio >= f64::MIN_POSITIVE {
-                return log_of_normalized_series5(density_ratio_series5(ratio, density_ratios));
+                return log_of_normalized_series6(density_ratio_series6(ratio, density_ratios));
             }
             // φ(x) is subnormal or zero, which happens only at x ≫ 0 where
             // log Φ(x) is an exact −Φ(−x): form each coefficient φ·dr/(Φ·m!)
@@ -1070,18 +1137,18 @@ fn symmetric_log_cdf_jet5(cdf: SymmetricBernoulliCdf, x: f64) -> [f64; 5] {
             // polynomial overflows only where e^{−x²/2} times it is zero.
             let log_ratio = -0.5 * x2 - 0.5 * (2.0 * std::f64::consts::PI).ln() - log_p;
             if log_ratio == f64::NEG_INFINITY || density_ratios.iter().any(|v| !v.is_finite()) {
-                return [0.0; 5];
+                return [0.0; 6];
             }
-            let factorial = [1.0_f64, 2.0, 6.0, 24.0, 120.0];
-            let mut series = [0.0; 5];
-            for m in 0..5 {
+            let factorial = SERIES_FACTORIALS6;
+            let mut series = [0.0; 6];
+            for m in 0..6 {
                 let ratio_poly = density_ratios[m];
                 if ratio_poly != 0.0 {
                     series[m] =
                         ratio_poly.signum() * (log_ratio + ratio_poly.abs().ln()).exp() / factorial[m];
                 }
             }
-            log_of_normalized_series5(series)
+            log_of_normalized_series6(series)
         }
         SymmetricBernoulliCdf::Cauchy => {
             let (a, b) = cauchit_rational_factors(x);
@@ -1093,16 +1160,17 @@ fn symmetric_log_cdf_jet5(cdf: SymmetricBernoulliCdf, x: f64) -> [f64; 5] {
                 6.0 * b2 - 2.0 * a2,
                 24.0 * b * (a2 - b2),
                 24.0 * a2 * a2 - 240.0 * a2 * b2 + 120.0 * b2 * b2,
+                -240.0 * b * (3.0 * a2 * a2 - 10.0 * a2 * b2 + 3.0 * b2 * b2),
             ];
             let log_density = -std::f64::consts::PI.ln() - 2.0 * x.hypot(1.0).ln();
             let ratio = (log_density - cauchit_mean(x).ln()).exp();
-            log_of_normalized_series5(density_ratio_series5(ratio, density_ratios))
+            log_of_normalized_series6(density_ratio_series6(ratio, density_ratios))
         }
     }
 }
 
 /// Derivatives of `log μ(η)` for `μ = 1 − exp(−e^η)`.
-fn cloglog_log_mean_jet5(eta: f64) -> [f64; 5] {
+fn cloglog_log_mean_jet6(eta: f64) -> [f64; 6] {
     let u = eta.exp();
     let survival = (-u).exp();
     let series = if 1.0 - survival == 1.0 {
@@ -1116,11 +1184,12 @@ fn cloglog_log_mean_jet5(eta: f64) -> [f64; 5] {
             eval(&[0.0, 1.0, -3.0, 1.0]) / 6.0,
             eval(&[0.0, 1.0, -7.0, 6.0, -1.0]) / 24.0,
             eval(&[0.0, 1.0, -15.0, 25.0, -10.0, 1.0]) / 120.0,
+            eval(&[0.0, 1.0, -31.0, 90.0, -65.0, 15.0, -1.0]) / 720.0,
         ]
     } else {
         let u2 = u * u;
         // μ'/μ = 1/exprel(u), with the exact u → 0 limit.
-        density_ratio_series5(
+        density_ratio_series6(
             (-gam_math::special::log_exprel(u)).exp(),
             [
                 1.0,
@@ -1128,10 +1197,11 @@ fn cloglog_log_mean_jet5(eta: f64) -> [f64; 5] {
                 1.0 - 3.0 * u + u2,
                 1.0 - 7.0 * u + 6.0 * u2 - u2 * u,
                 1.0 - 15.0 * u + 25.0 * u2 - 10.0 * u2 * u + u2 * u2,
+                1.0 - 31.0 * u + 90.0 * u2 - 65.0 * u2 * u + 15.0 * u2 * u2 - u2 * u2 * u,
             ],
         )
     };
-    log_of_normalized_series5(series)
+    log_of_normalized_series6(series)
 }
 
 #[inline]
@@ -1234,6 +1304,47 @@ fn component_inverse_link_pdffourth_derivative(component: LinkComponent, eta: f6
             ))
         }
         LinkComponent::Cauchit => cauchit_inverse_link_d5(eta),
+    }
+}
+
+/// Sixth derivative of a component inverse-link CDF (= fifth derivative of PDF).
+/// Extends `component_inverse_link_pdffourth_derivative` by one derivative order.
+#[inline]
+fn component_inverse_link_pdffifth_derivative(component: LinkComponent, eta: f64) -> f64 {
+    match component {
+        LinkComponent::Probit => probit_pdffifth_derivative(eta),
+        LinkComponent::Logit => logit_inverse_link_d6(eta),
+        LinkComponent::CLogLog => {
+            // d6 = exp(-t) * (t - 31t^2 + 90t^3 - 65t^4 + 15t^5 - t^6), t = exp(eta).
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let t = eta.exp();
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                t,
+                &[0.0, 1.0, -31.0, 90.0, -65.0, 15.0, -1.0],
+            ))
+        }
+        LinkComponent::LogLog => {
+            // mu(eta) = 1 - cloglog mu(-eta), so the even order flips sign:
+            // d6 = -exp(-r) * (r - 31r^2 + 90r^3 - 65r^4 + 15r^5 - r^6),
+            // r = exp(-eta).
+            if eta.is_nan() {
+                return f64::NAN;
+            }
+            if !eta.is_finite() {
+                return 0.0;
+            }
+            let r = (-eta).exp();
+            canonicalzero(stable_nonnegative_poly_times_exp_neg(
+                r,
+                &[0.0, -1.0, 31.0, -90.0, 65.0, -15.0, 1.0],
+            ))
+        }
+        LinkComponent::Cauchit => cauchit_inverse_link_d6(eta),
     }
 }
 
@@ -1354,7 +1465,7 @@ pub fn state_from_beta_logisticspec(spec: SasLinkSpec) -> Result<SasLinkState, S
 /// splice then runs from there to `±B` at `(2 - SPLICE_INTERIOR_FRAC) * B`.
 const SPLICE_INTERIOR_FRAC: f64 = 0.8;
 
-/// Value and first five derivatives of the bounded latent map `g` at one point.
+/// Value and first six derivatives of the bounded latent map `g` at one point.
 #[derive(Clone, Copy, Debug)]
 struct SmoothBoundJet {
     g: f64,
@@ -1363,6 +1474,7 @@ struct SmoothBoundJet {
     d3: f64,
     d4: f64,
     d5: f64,
+    d6: f64,
 }
 
 /// Interior-exact bounded latent map for the sinh-arcsinh link, replacing the
@@ -1379,12 +1491,14 @@ struct SmoothBoundJet {
 /// Three regions (odd in `x`; `B = bound`, `a = 0.8B`, `c = 1.2B`):
 ///
 ///   |x| ≤ a:      g(x) = x            (exact identity — every g^(k≥2) is 0)
-///   a < |x| < c:  C⁵ splice of x → ±B
+///   a < |x| < c:  C⁶ splice of x → ±B
 ///   |x| ≥ c:      g(x) = ±B           (compact support — every g^(k≥1) is 0)
 ///
-/// On the splice `g'(x) = 1 − S(w)`, `w = (|x|−a)/(c−a)`, with `S` the order-4
-/// smoothstep `70w⁹−315w⁸+540w⁷−420w⁶+126w⁵` (its first four derivatives vanish
-/// at `w = 0, 1`), so `g` is C⁵ at both seams — the order the SAS jet tower needs.
+/// On the splice `g'(x) = 1 − S(w)`, `w = (|x|−a)/(c−a)`, with `S` the order-5
+/// smoothstep `462w⁶−1980w⁷+3465w⁸−3080w⁹+1386w¹⁰−252w¹¹` (its first five
+/// derivatives vanish at `w = 0, 1`), so `g` is C⁶ at both seams — the order the
+/// SAS jet tower needs: the Bernoulli observed information's third η-derivative,
+/// which the exact outer ρ-Hessian reads, is `μ⁽⁶⁾`.
 /// `S` is symmetric with `∫₀¹S = ½`, so matching `g(c)=B` fixes `c = 2B − a` with
 /// no free constant and keeps `g` non-expansive (`0 ≤ g′ ≤ 1`) and monotone.
 ///
@@ -1409,6 +1523,7 @@ fn smooth_bound_jet(value: f64, bound: f64) -> SmoothBoundJet {
             d3: 0.0,
             d4: 0.0,
             d5: 0.0,
+            d6: 0.0,
         };
     }
     let sign = if value < 0.0 { -1.0 } else { 1.0 };
@@ -1421,10 +1536,11 @@ fn smooth_bound_jet(value: f64, bound: f64) -> SmoothBoundJet {
             d3: 0.0,
             d4: 0.0,
             d5: 0.0,
+            d6: 0.0,
         };
     }
-    // Splice seam. `w ∈ (0, 1)`; `S` is the order-4 smoothstep and `Sp..Spppp`
-    // its w-derivatives (all vanish at the endpoints, giving C⁵ seams).
+    // Splice seam. `w ∈ (0, 1)`; `S` is the order-5 smoothstep and `s1..s5`
+    // its w-derivatives (all vanish at the endpoints, giving C⁶ seams).
     let w = (ax - a) / l;
     let w2 = w * w;
     let w3 = w2 * w;
@@ -1435,24 +1551,36 @@ fn smooth_bound_jet(value: f64, bound: f64) -> SmoothBoundJet {
     let w8 = w7 * w;
     let w9 = w8 * w;
     let w10 = w9 * w;
-    let s = 70.0 * w9 - 315.0 * w8 + 540.0 * w7 - 420.0 * w6 + 126.0 * w5;
-    let sp = 630.0 * w8 - 2520.0 * w7 + 3780.0 * w6 - 2520.0 * w5 + 630.0 * w4;
-    let spp = 5040.0 * w7 - 17640.0 * w6 + 22680.0 * w5 - 12600.0 * w4 + 2520.0 * w3;
-    let sppp = 35280.0 * w6 - 105840.0 * w5 + 113400.0 * w4 - 50400.0 * w3 + 7560.0 * w2;
-    let spppp = 211680.0 * w5 - 529200.0 * w4 + 453600.0 * w3 - 151200.0 * w2 + 15120.0 * w;
+    let w11 = w10 * w;
+    let w12 = w11 * w;
+    let s = 462.0 * w6 - 1980.0 * w7 + 3465.0 * w8 - 3080.0 * w9 + 1386.0 * w10 - 252.0 * w11;
+    let s1 = 2772.0 * w5 - 13860.0 * w6 + 27720.0 * w7 - 27720.0 * w8 + 13860.0 * w9
+        - 2772.0 * w10;
+    let s2 = 13860.0 * w4 - 83160.0 * w5 + 194040.0 * w6 - 221760.0 * w7 + 124740.0 * w8
+        - 27720.0 * w9;
+    let s3 = 55440.0 * w3 - 415800.0 * w4 + 1164240.0 * w5 - 1552320.0 * w6 + 997920.0 * w7
+        - 249480.0 * w8;
+    let s4 = 166320.0 * w2 - 1663200.0 * w3 + 5821200.0 * w4 - 9313920.0 * w5
+        + 6985440.0 * w6
+        - 1995840.0 * w7;
+    let s5 = 332640.0 * w - 4989600.0 * w2 + 23284800.0 * w3 - 46569600.0 * w4
+        + 41912640.0 * w5
+        - 13970880.0 * w6;
     // `I(w) = ∫₀ʷ (1 − S)` is the nonneg-branch value offset above `a`.
-    let iw = w - 7.0 * w10 + 35.0 * w9 - 67.5 * w8 + 60.0 * w7 - 21.0 * w6;
+    let iw = w - 66.0 * w7 + 247.5 * w8 - 385.0 * w9 + 308.0 * w10 - 126.0 * w11 + 21.0 * w12;
     let g0 = a + l * iw;
     // `g'(x) = 1 − S(w)`; higher x-orders differentiate `−S(w)` through the `1/l`
-    // chain, then odd symmetry sets the parities (value/d2/d4 odd; d1/d3/d5 even).
+    // chain, then odd symmetry sets the parities (value/d2/d4/d6 odd; d1/d3/d5 even).
     let l2 = l * l;
+    let l4 = l2 * l2;
     SmoothBoundJet {
         g: sign * g0,
         d1: 1.0 - s,
-        d2: sign * (-sp / l),
-        d3: -spp / l2,
-        d4: sign * (-sppp / (l2 * l)),
-        d5: -spppp / (l2 * l2),
+        d2: sign * (-s1 / l),
+        d3: -s2 / l2,
+        d4: sign * (-s3 / (l2 * l)),
+        d5: -s4 / l4,
+        d6: sign * (-s5 / (l4 * l)),
     }
 }
 
@@ -1884,14 +2012,22 @@ pub fn inverse_link_complement_for_inverse_link(
             beta_logistic_link_complement(eta, state.log_delta, state.epsilon, mu)
         }
         InverseLink::Mixture(state) => mixture_link_complement(state, eta, mu),
-        // The latent-cloglog mean is a lognormal-Laplace quadrature
-        // (`latent_cloglog_jet5`), whose kernel reports `mean` and its
-        // derivatives but not the complementary `E[exp(-Z e^eta)]` the exact
-        // complement would need. Until that kernel exposes the survival output,
-        // the naive complement leaves this link's saturation behaviour exactly as
-        // it was, so it retains the `V = mu(1-mu) -> 0` limitation the sibling
-        // links no longer have.
-        InverseLink::LatentCLogLog(_) => 1.0 - mu,
+        // The latent-cloglog mean is `1 − S(eta, σ_L)` with the lognormal-Laplace
+        // survival `S(m, σ) = E[exp(−exp η)]`, `η ~ N(m, σ²)`
+        // (`latent_cloglog_jet5` forms it as `−expm1(ln S)`). Its complement is
+        // `S` itself, read from the same log-space survival surface, so it keeps
+        // its digits where the mean rounds to one.
+        InverseLink::LatentCLogLog(state) => {
+            if eta.is_nan() {
+                f64::NAN
+            } else {
+                crate::quadrature::survival_posterior_mean(
+                    latent_cloglog_quadctx(),
+                    eta,
+                    state.latent_sd,
+                )
+            }
+        }
     };
     if raw.is_nan() {
         raw
@@ -2021,7 +2157,7 @@ fn mixture_link_complement(state: &MixtureLinkState, eta: f64, mu: f64) -> f64 {
 /// `SAS_U_CLAMP` sinh scale), which is the correct value there. `Phi(-z)` is
 /// always in `[0, 1]`, so no clamp is needed.
 ///
-/// The latent `asinh(eta)` is taken through the overflow-free [`asinh_jet5`]
+/// The latent `asinh(eta)` is taken through the overflow-free [`asinh_jet6`]
 /// value — exactly as `sas_inverse_link_mu_d1` does — NOT the raw `f64::asinh`.
 /// The library `asinh` forms `x·x` internally, which overflows to `±∞` for
 /// `|eta| > 1.34e154` even though `asinh(±f64::MAX) ≈ ±710` is finite and well
@@ -2041,7 +2177,7 @@ pub(crate) fn sas_link_complement(eta: f64, epsilon: f64, log_delta: f64, mu: f6
     if epsilon == 0.0 && delta == 1.0 {
         return standard_link_complement(StandardLink::Probit, eta, mu);
     }
-    let u_raw = delta * asinh_jet5(eta).value + epsilon;
+    let u_raw = delta * asinh_jet6(eta).value + epsilon;
     let u = smooth_bound_jet(u_raw, SAS_U_CLAMP).g;
     normal_cdf(-u.sinh())
 }
@@ -2080,7 +2216,7 @@ pub(crate) fn sas_latent_probit_argument(
     if epsilon == 0.0 && delta == 1.0 {
         return Ok((eta, 1.0));
     }
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let u_raw = delta * asinh.value + epsilon;
     let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
     let u = sb.g;
@@ -2195,7 +2331,7 @@ fn sas_inverse_link_mu_d1(
     if epsilon == 0.0 && delta_id == 1.0 {
         return Ok(component_inverse_link_mu_d1(LinkComponent::Probit, eta));
     }
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let delta = delta_id;
     let u_raw = delta * asinh.value + epsilon;
     let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
@@ -2239,6 +2375,7 @@ fn mixture_inverse_link_mu_d1(state: &MixtureLinkState, eta: f64) -> (f64, f64) 
 enum PdfDerivativeOrder {
     Third,
     Fourth,
+    Fifth,
 }
 
 impl PdfDerivativeOrder {
@@ -2246,6 +2383,7 @@ impl PdfDerivativeOrder {
         match self {
             Self::Third => probit_pdfthird_derivative(eta),
             Self::Fourth => probit_pdffourth_derivative(eta),
+            Self::Fifth => probit_pdffifth_derivative(eta),
         }
     }
 
@@ -2253,21 +2391,24 @@ impl PdfDerivativeOrder {
         match self {
             Self::Third => component_inverse_link_pdfthird_derivative(component, eta),
             Self::Fourth => component_inverse_link_pdffourth_derivative(component, eta),
+            Self::Fifth => component_inverse_link_pdffifth_derivative(component, eta),
         }
     }
 
     fn latent_cloglog(self, eta: f64, latent_sd: f64) -> Result<f64, EstimationError> {
-        let jet = latent_cloglog_jet5(latent_cloglog_quadctx(), eta, latent_sd)?;
-        Ok(match self {
-            Self::Third => jet.d4,
-            Self::Fourth => jet.d5,
-        })
+        let ctx = latent_cloglog_quadctx();
+        match self {
+            Self::Third => Ok(latent_cloglog_jet5(ctx, eta, latent_sd)?.d4),
+            Self::Fourth => Ok(latent_cloglog_jet5(ctx, eta, latent_sd)?.d5),
+            Self::Fifth => latent_cloglog_d6(ctx, eta, latent_sd),
+        }
     }
 
     fn sas(self, eta: f64, epsilon: f64, log_delta: f64) -> Result<f64, EstimationError> {
         match self {
             Self::Third => sas_inverse_link_pdfthird_derivative(eta, epsilon, log_delta),
             Self::Fourth => sas_inverse_link_pdffourth_derivative(eta, epsilon, log_delta),
+            Self::Fifth => sas_inverse_link_pdffifth_derivative(eta, epsilon, log_delta),
         }
     }
 
@@ -2278,6 +2419,9 @@ impl PdfDerivativeOrder {
             }
             Self::Fourth => {
                 beta_logistic_inverse_link_pdffourth_derivative(eta, log_shape_center, epsilon)
+            }
+            Self::Fifth => {
+                beta_logistic_inverse_link_pdffifth_derivative(eta, log_shape_center, epsilon)
             }
         }
     }
@@ -2298,6 +2442,12 @@ fn inverse_link_pdf_derivative_for_inverse_link(
             Ok(match order {
                 PdfDerivativeOrder::Third => jet[4],
                 PdfDerivativeOrder::Fourth => jet[5],
+                PdfDerivativeOrder::Fifth => {
+                    // d6 = d5·(−a − 5)/η: the next step of the jet's
+                    // `c_{k+1} = c_k·(−a − k)` recursion.
+                    let exponent = if *link == StandardLink::Inverse { 1.0 } else { 0.5 };
+                    jet[5] * (-exponent - 5.0) / eta
+                }
             })
         }
         InverseLink::Standard(StandardLink::Probit) => Ok(order.probit(eta)),
@@ -2362,6 +2512,19 @@ pub fn inverse_link_pdffourth_derivative_for_inverse_link(
     eta: f64,
 ) -> Result<f64, EstimationError> {
     inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Fourth)
+}
+
+/// Sixth derivative of the inverse-link CDF (= fifth derivative of the PDF).
+///
+/// Extends [`inverse_link_pdffourth_derivative_for_inverse_link`] by one order.
+/// It is the top order of the Bernoulli log-probability jet the Firth
+/// observed-information tower differentiates, so the TK outer ρ-Hessian's
+/// `d⁴W/dη⁴` term is analytic for every Firth link.
+pub fn inverse_link_pdffifth_derivative_for_inverse_link(
+    link: &InverseLink,
+    eta: f64,
+) -> Result<f64, EstimationError> {
+    inverse_link_pdf_derivative_for_inverse_link(link, eta, PdfDerivativeOrder::Fifth)
 }
 
 /// θ-partials of the inverse-link density's third derivative `f‴ = ∂⁴μ/∂η⁴`,
@@ -2614,8 +2777,8 @@ struct LogisticU {
 
 #[inline]
 fn logistic_uwith_derivatives(eta: f64) -> LogisticU {
-    let ln_u = -gam_linalg::utils::stable_softplus(-eta);
-    let ln_one_minus_u = -gam_linalg::utils::stable_softplus(eta);
+    let ln_u = -gam_math::special::softplus(-eta);
+    let ln_one_minus_u = -gam_math::special::softplus(eta);
     let u = ln_u.exp();
     let one_minus_u = ln_one_minus_u.exp();
     let du = (ln_u + ln_one_minus_u).exp();
@@ -3204,6 +3367,18 @@ pub(crate) fn beta_logistic_inverse_link_pdffourth_derivative(
         * beta_logistic_latent_pdffourth_derivative(standardization.latent, a, b)
 }
 
+/// Sixth derivative of the beta-logistic link, `s⁶·K⁽⁶⁾(x)`.
+pub(crate) fn beta_logistic_inverse_link_pdffifth_derivative(
+    eta: f64,
+    log_shape_center: f64,
+    epsilon: f64,
+) -> f64 {
+    let (a, b) = beta_logistic_shapes(log_shape_center, epsilon);
+    let standardization = beta_logistic_standardization(eta, a, b);
+    standardization.scale.powi(6)
+        * beta_logistic_latent_pdffifth_derivative(standardization.latent, a, b)
+}
+
 /// Fourth derivative of the latent kernel `K(x) = I_{logistic(x)}(a, b)`, the
 /// CDF of `Z = logit(U)`, `U ~ Beta(a, b)` (= third derivative of its density).
 fn beta_logistic_latent_pdfthird_derivative(x: f64, a: f64, b: f64) -> f64 {
@@ -3257,6 +3432,38 @@ fn beta_logistic_latent_pdffourth_derivative(x: f64, a: f64, b: f64) -> f64 {
     d1 * (t2 * t2 - 6.0 * c * t2 * logistic.du - 4.0 * c * t * u2
         + 3.0 * c * c * logistic.du * logistic.du
         - c * u3)
+}
+
+/// Sixth derivative of the latent kernel `K(x)` (= 5th derivative of its density).
+///
+/// `log d1 = a·log u + b·log(1-u) + const` has x-derivatives `L1 = t` and
+/// `L_{k+1} = -c·u⁽ᵏ⁾`, so `K⁽ⁿ⁺¹⁾ = d1·Y_n(L1..Ln)` with the complete Bell
+/// polynomial `Y_n` (`Y4` is the bracket of the fifth derivative above). Order
+/// five:
+///
+///   d6 = d1 * [L1^5 + 10 L1^3 L2 + 15 L1 L2^2 + 10 L1^2 L3 + 10 L2 L3 + 5 L1 L4 + L5]
+///
+/// with u'''' = u'''(1-2u) - 6u'u''.
+fn beta_logistic_latent_pdffifth_derivative(x: f64, a: f64, b: f64) -> f64 {
+    let logistic = logistic_uwith_derivatives(x);
+    let log_d1 = beta_logistic_log_d1(a, b, logistic);
+    let d1 = log_d1.exp();
+    let c = a + b;
+    let one_minus_2u = logistic.one_minus_u - logistic.u;
+    let u1 = logistic.du;
+    let u2 = u1 * one_minus_2u;
+    let u3 = u2 * one_minus_2u - 2.0 * u1 * u1;
+    let u4 = u3 * one_minus_2u - 6.0 * u1 * u2;
+    let l1 = a * logistic.one_minus_u - b * logistic.u;
+    let (l2, l3, l4, l5) = (-c * u1, -c * u2, -c * u3, -c * u4);
+    let l1_2 = l1 * l1;
+    d1 * (l1_2 * l1_2 * l1
+        + 10.0 * l1_2 * l1 * l2
+        + 15.0 * l1 * l2 * l2
+        + 10.0 * l1_2 * l3
+        + 10.0 * l2 * l3
+        + 5.0 * l1 * l4
+        + l5)
 }
 
 /// Parameter partials of the latent kernel `K(x; a, b)` at a fixed latent `x`, in
@@ -3527,7 +3734,7 @@ pub fn sas_inverse_link_jet(
     if epsilon == 0.0 && delta_id == 1.0 {
         return Ok(component_inverse_link_jet(LinkComponent::Probit, eta));
     }
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let delta = delta_id;
     let u_raw = delta * asinh.value + epsilon;
     let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
@@ -3594,7 +3801,7 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative(
     //
     // which is the standard scalar Arbogast expansion for order four.
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let delta = sas_delta_from_raw_log_delta(log_delta);
     let u_raw = delta * asinh.value + epsilon;
     let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
@@ -3633,96 +3840,92 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative(
     Ok(canonicalzero(out))
 }
 
-/// Fifth derivative of the SAS inverse-link CDF (= fourth derivative of the PDF).
-///
-/// Extends `sas_inverse_link_pdfthird_derivative` by one more derivative order,
-/// using the same composition chain u(eta) = g(r(eta)), z = sinh(u), mu = Phi(z).
-///
-/// The Arbogast expansion at order 5 for u(eta) = g(r(eta)) is:
-///   u5 = g5 r1^5 + 10 g4 r1^3 r2 + 15 g3 r1 r2^2 + 10 g3 r1^2 r3
-///        + 10 g2 r2 r3 + 5 g2 r1 r4 + g1 r5
-///
-/// The z = sinh(u) expansion at order 5 is the standard Arbogast for sinh:
-///   z5 = c*u1^5 + 10*s*u1^3*u2 + 15*c*u1*u2^2 + 10*c*u1^2*u3
-///        + 10*s*u2*u3 + 5*s*u1*u4 + c*u5
-///
-/// The mu = Phi(z) expansion at order 5 uses probit derivatives:
-///   mu^(5) = Phi5*z1^5 + 10*Phi4*z1^3*z2 + 15*Phi3*z1*z2^2 + 10*Phi3*z1^2*z3
-///            + 10*Phi2*z2*z3 + 5*Phi2*z1*z4 + Phi1*z5
-///
-/// Non-finite eta is rejected by the shared SAS finite-domain contract.
+/// Fifth derivative of the SAS inverse-link CDF (= fourth derivative of the PDF),
+/// on the same finite domain as [`sas_inverse_link_jet`]: order five of the
+/// composed chain [`sas_inverse_link_derivatives6`], so the fifth and sixth
+/// orders share one evaluation of the bounded latent map.
 pub(crate) fn sas_inverse_link_pdffourth_derivative(
     eta: f64,
     epsilon: f64,
     log_delta: f64,
 ) -> Result<f64, EstimationError> {
+    Ok(sas_inverse_link_derivatives6(eta, epsilon, log_delta)?[4])
+}
+
+/// Derivatives `1..=6` of a composition `f(h(η))` from the outer derivatives
+/// `outer[k-1] = f⁽ᵏ⁾(h(η))` and the inner derivatives `inner[j-1] = h⁽ʲ⁾(η)`
+/// (Faà di Bruno), by composing truncated Taylor series: with
+/// `a(t) = Σ_j h⁽ʲ⁾ tʲ/j!`, `(f∘h)⁽ⁿ⁾ = n!·Σ_k f⁽ᵏ⁾/k!·[tⁿ] a(t)ᵏ`.
+fn compose_derivatives6(outer: [f64; 6], inner: [f64; 6]) -> [f64; 6] {
+    const FACTORIAL: [f64; 7] = [1.0, 1.0, 2.0, 6.0, 24.0, 120.0, 720.0];
+    let mut a = [0.0_f64; 7];
+    for j in 1..=6 {
+        a[j] = inner[j - 1] / FACTORIAL[j];
+    }
+    let mut power = a;
+    let mut out = [0.0_f64; 6];
+    for k in 1..=6 {
+        let weight = outer[k - 1] / FACTORIAL[k];
+        for n in k..=6 {
+            out[n - 1] += weight * power[n];
+        }
+        let mut next = [0.0_f64; 7];
+        for i in (k)..=6 {
+            for j in 1..=(6 - i) {
+                next[i + j] += power[i] * a[j];
+            }
+        }
+        power = next;
+    }
+    for n in 1..=6 {
+        out[n - 1] *= FACTORIAL[n];
+    }
+    out
+}
+
+/// Bounded SAS core `u = smooth_bound(δ·asinh(η) + ε, SAS_U_CLAMP)` and its
+/// derivatives in the raw core, shared by the chains that differentiate it.
+#[inline]
+fn sas_bounded_core_jet(delta: f64, asinh_value: f64, epsilon: f64) -> SmoothBoundJet {
+    smooth_bound_jet(delta * asinh_value + epsilon, SAS_U_CLAMP)
+}
+
+/// Sixth derivative of the SAS inverse-link CDF (= fifth derivative of the PDF),
+/// on the same finite domain as [`sas_inverse_link_jet`]. The chain
+/// `r = δ·asinh(η) + ε`, `u = smooth_bound(r)`, `z = sinh(u)`, `μ = Φ(z)` is
+/// composed link by link with [`compose_derivatives6`].
+pub(crate) fn sas_inverse_link_pdffifth_derivative(
+    eta: f64,
+    epsilon: f64,
+    log_delta: f64,
+) -> Result<f64, EstimationError> {
+    Ok(sas_inverse_link_derivatives6(eta, epsilon, log_delta)?[5])
+}
+
+/// `μ⁽¹⁾..μ⁽⁶⁾` of the SAS inverse link through the composed chain.
+fn sas_inverse_link_derivatives6(
+    eta: f64,
+    epsilon: f64,
+    log_delta: f64,
+) -> Result<[f64; 6], EstimationError> {
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let delta = sas_delta_from_raw_log_delta(log_delta);
-    let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
-    let u = sb.g;
-    let g1 = sb.d1;
-    let g2 = sb.d2;
-    let g3 = sb.d3;
-    let g4 = sb.d4;
-    let g5 = sb.d5;
-    let s = u.sinh();
-    let c = u.cosh();
-    let z = s;
-
-    // Probit derivatives at z.
-    let base = probit_jet(z);
-    let phi3 = probit_pdfthird_derivative(z); // Phi^{(4)}
-    let phi4 = probit_pdffourth_derivative(z); // Phi^{(5)}
-
-    let r1 = delta * asinh.d1;
-    let r2 = delta * asinh.d2;
-    let r3 = delta * asinh.d3;
-    let r4 = delta * asinh.d4;
-    let r5 = delta * asinh.d5;
-
-    // u1..u5 via Arbogast for g(r(eta)).
-    let u1 = g1 * r1;
-    let u2 = g2 * r1 * r1 + g1 * r2;
-    let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
-    let u4 = g4 * r1.powi(4)
-        + 6.0 * g3 * r1 * r1 * r2
-        + 3.0 * g2 * r2 * r2
-        + 4.0 * g2 * r1 * r3
-        + g1 * r4;
-    let u5 = g5 * r1.powi(5)
-        + 10.0 * g4 * r1 * r1 * r1 * r2
-        + 15.0 * g3 * r1 * r2 * r2
-        + 10.0 * g3 * r1 * r1 * r3
-        + 10.0 * g2 * r2 * r3
-        + 5.0 * g2 * r1 * r4
-        + g1 * r5;
-
-    // z1..z5 via Arbogast for sinh(u(eta)).
-    let z1 = c * u1;
-    let z2 = s * u1 * u1 + c * u2;
-    let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
-    let z4 =
-        s * u1.powi(4) + 6.0 * c * u1 * u1 * u2 + 3.0 * s * u2 * u2 + 4.0 * s * u1 * u3 + c * u4;
-    let z5 = c * u1.powi(5)
-        + 10.0 * s * u1 * u1 * u1 * u2
-        + 15.0 * c * u1 * u2 * u2
-        + 10.0 * c * u1 * u1 * u3
-        + 10.0 * s * u2 * u3
-        + 5.0 * s * u1 * u4
-        + c * u5;
-
-    // mu^(5) = Phi^(5)*z1^5 + 10*Phi^(4)*z1^3*z2 + 15*Phi^(3)*z1*z2^2
-    //        + 10*Phi^(3)*z1^2*z3 + 10*Phi^(2)*z2*z3 + 5*Phi^(2)*z1*z4 + Phi^(1)*z5
-    let out = phi4 * z1.powi(5)
-        + 10.0 * phi3 * z1 * z1 * z1 * z2
-        + 15.0 * base.d3 * z1 * z2 * z2
-        + 10.0 * base.d3 * z1 * z1 * z3
-        + 10.0 * base.d2 * z2 * z3
-        + 5.0 * base.d2 * z1 * z4
-        + base.d1 * z5;
-    Ok(canonicalzero(out))
+    let sb = sas_bounded_core_jet(delta, asinh.value, epsilon);
+    let r = [asinh.d1, asinh.d2, asinh.d3, asinh.d4, asinh.d5, asinh.d6].map(|d| delta * d);
+    let u = compose_derivatives6([sb.d1, sb.d2, sb.d3, sb.d4, sb.d5, sb.d6], r);
+    let (s, c) = (sb.g.sinh(), sb.g.cosh());
+    let z = compose_derivatives6([c, s, c, s, c, s], u);
+    let base = probit_jet(s);
+    let phi = [
+        base.d1,
+        base.d2,
+        base.d3,
+        probit_pdfthird_derivative(s),
+        probit_pdffourth_derivative(s),
+        probit_pdffifth_derivative(s),
+    ];
+    Ok(compose_derivatives6(phi, z).map(canonicalzero))
 }
 
 /// `(∂f‴/∂ε, ∂f‴/∂log δ)` of the SAS density's third derivative `f‴ = μ⁗`
@@ -3737,11 +3940,11 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative_param_partials(
     log_delta: f64,
 ) -> Result<[f64; 2], EstimationError> {
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let (ld_eff, dld_eff_draw) = sas_effective_log_delta(log_delta);
     let delta = ld_eff.exp();
     let ddelta_draw = delta * dld_eff_draw;
-    let sb = smooth_bound_jet(delta * asinh.value + epsilon, SAS_U_CLAMP);
+    let sb = sas_bounded_core_jet(delta, asinh.value, epsilon);
     let (g1, g2, g3, g4, g5) = (sb.d1, sb.d2, sb.d3, sb.d4, sb.d5);
     let s = sb.g.sinh();
     let c = sb.g.cosh();
@@ -3827,7 +4030,7 @@ pub fn sas_inverse_link_jetwith_param_partials(
     log_delta: f64,
 ) -> Result<SasJetWithParamPartials, EstimationError> {
     let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
-    let asinh = asinh_jet5(eta);
+    let asinh = asinh_jet6(eta);
     let ld_sb = smooth_bound_jet(log_delta, SAS_LOG_DELTA_BOUND);
     let (ld_eff, dld_eff_draw) = (ld_sb.g, ld_sb.d1);
     let d2ld_eff_draw2 = ld_sb.d2;
@@ -4270,6 +4473,8 @@ mod tests {
                 .expect("finite SAS boundary fourth derivative");
             let h5 = sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta)
                 .expect("finite SAS boundary fifth derivative");
+            let h6 = sas_inverse_link_pdffifth_derivative(eta, state.epsilon, state.log_delta)
+                .expect("finite SAS boundary sixth derivative");
             for value in [
                 jet.mu,
                 jet.d1,
@@ -4289,6 +4494,7 @@ mod tests {
                 partials.djet_dlog_delta.d3,
                 h4,
                 h5,
+                h6,
             ] {
                 assert!(
                     value.is_finite(),
@@ -4797,9 +5003,9 @@ mod tests {
         let etas = [-40.0, -30.0, -5.0, 0.42, 5.0, 30.0, 40.0];
         for eta in etas {
             let j_bl = beta_logistic_inverse_link_jet(eta, 0.0, 0.0);
-            let expected_mu = gam_linalg::utils::stable_logistic(eta);
-            let expected_d1 = (-gam_linalg::utils::stable_softplus(-eta)
-                - gam_linalg::utils::stable_softplus(eta))
+            let expected_mu = gam_math::special::logistic(eta);
+            let expected_d1 = (-gam_math::special::softplus(-eta)
+                - gam_math::special::softplus(eta))
             .exp();
             assert!(
                 (j_bl.mu - expected_mu).abs() <= 1e-15 * expected_mu.abs().max(1.0),
@@ -5014,10 +5220,10 @@ mod tests {
     /// interior (the splice needs `|δ·asinh(η)+ε| ∈ (0.8B, 1.2B)`, i.e. η≈1e17).
     /// This pins `smooth_bound_jet` directly: exact identities in the two flat
     /// regimes and at the seams, odd symmetry, non-expansiveness, and a
-    /// derivative ladder (`d_{k} = d/dx d_{k-1}`) through fifth order in the
+    /// derivative ladder (`d_{k} = d/dx d_{k-1}`) through sixth order in the
     /// splice — where a wrong smoothstep coefficient would otherwise hide.
     #[test]
-    fn smooth_bound_jet_tower_is_c5_and_fd_exact() {
+    fn smooth_bound_jet_tower_is_c6_and_fd_exact() {
         let b = SAS_U_CLAMP;
         let a = SPLICE_INTERIOR_FRAC * b; // 40
         let c = (2.0 - SPLICE_INTERIOR_FRAC) * b; // 60
@@ -5028,18 +5234,21 @@ mod tests {
             let j = jet(x);
             assert_eq!(j.g, x, "interior identity value at x={x}");
             assert_eq!(j.d1, 1.0, "interior d1 at x={x}");
-            assert_eq!((j.d2, j.d3, j.d4, j.d5), (0.0, 0.0, 0.0, 0.0));
+            assert_eq!((j.d2, j.d3, j.d4, j.d5, j.d6), (0.0, 0.0, 0.0, 0.0, 0.0));
         }
         // Saturation |x| ≥ c: exact ±B plateau, every derivative exactly 0.
         for &x in &[c, c + 1e-9, 75.0, 1e12, f64::MAX] {
             let j = jet(x);
             assert_eq!(j.g, b, "saturation value at x={x}");
-            assert_eq!((j.d1, j.d2, j.d3, j.d4, j.d5), (0.0, 0.0, 0.0, 0.0, 0.0));
+            assert_eq!(
+                (j.d1, j.d2, j.d3, j.d4, j.d5, j.d6),
+                (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+            );
         }
         // Seam value + compactness: g(c) = B exactly (the c = 2B − a closure).
         assert_eq!(jet(c).g, b);
 
-        // Odd symmetry: g,d2,d4 flip sign; d1,d3,d5 are even.
+        // Odd symmetry: g,d2,d4,d6 flip sign; d1,d3,d5 are even.
         for &x in &[3.0, a - 2.0, 44.0, 50.0, 56.0, 100.0] {
             let p = jet(x);
             let m = jet(-x);
@@ -5049,6 +5258,7 @@ mod tests {
             assert_eq!(m.d3, p.d3, "d3 even at x={x}");
             assert_eq!(m.d4, -p.d4, "d4 odd at x={x}");
             assert_eq!(m.d5, p.d5, "d5 even at x={x}");
+            assert_eq!(m.d6, -p.d6, "d6 odd at x={x}");
         }
 
         // Non-expansive + monotone + bounded across the whole range.
@@ -5059,7 +5269,7 @@ mod tests {
             assert!(j.g.abs() <= b + 1e-12, "|g| exceeds B at x={x}: {}", j.g);
         }
 
-        // FD derivative ladder through fifth order, at splice-INTERIOR points
+        // FD derivative ladder through sixth order, at splice-INTERIOR points
         // (kept ≥ 5 away from both seams so the O(h²) truncation stays small and
         // the h-stencil never straddles a regime change). d_k must be the
         // x-derivative of d_{k-1}; per-order tolerances track the realistic
@@ -5077,6 +5287,7 @@ mod tests {
                 ("d3", j0.d3, fd(jp.d2, jm.d2), 2e-4),
                 ("d4", j0.d4, fd(jp.d3, jm.d3), 2e-3),
                 ("d5", j0.d5, fd(jp.d4, jm.d4), 2e-2),
+                ("d6", j0.d6, fd(jp.d5, jm.d5), 2e-1),
             ];
             for (name, analytic, numeric, tol) in checks {
                 assert!(
@@ -5092,7 +5303,7 @@ mod tests {
     /// `μ + (1−μ) = 1` holds to full precision across the ENTIRE finite-`f64`
     /// eta domain — including `|η| > 1.34e154`, where `η·η` overflows.
     ///
-    /// The forward map routes `asinh` through the overflow-free [`asinh_jet5`]
+    /// The forward map routes `asinh` through the overflow-free [`asinh_jet6`]
     /// (`hypot`-based value with an asymptotic `ln|η|+ln2` fallback), but
     /// `sas_link_complement` used the raw `f64::asinh`, whose internal `x·x`
     /// overflows to `+∞` near the domain edge. With a compressing `δ<1` the true
@@ -5567,6 +5778,140 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn composed_sas_derivatives_reproduce_the_hand_arbogast_orders_3203() {
+        // `compose_derivatives6` is the Faà di Bruno sum the SAS fifth and sixth
+        // orders are built from; its orders 1..4 must be the hand-expanded
+        // Arbogast chains of the SAS jet and `f‴` to rounding.
+        for (epsilon, log_delta) in [(-0.25, 0.35), (0.4, -0.3), (0.0, 0.0)] {
+            let state = sas_link_state_from_raw(epsilon, log_delta).expect("sas state");
+            for eta in [-3.1, -0.8, 0.0, 0.45, 2.2] {
+                let composed = sas_inverse_link_derivatives6(eta, state.epsilon, state.log_delta)
+                    .expect("composed SAS derivatives");
+                let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta)
+                    .expect("SAS jet");
+                let fourth = |x: f64| {
+                    sas_inverse_link_pdfthird_derivative(x, state.epsilon, state.log_delta)
+                        .expect("SAS fourth derivative")
+                };
+                let hand = [jet.d1, jet.d2, jet.d3, fourth(eta)];
+                for (order, (&got, &want)) in composed.iter().zip(hand.iter()).enumerate() {
+                    assert!(
+                        (got - want).abs() <= 1e-12 * (1.0 + want.abs()),
+                        "SAS order {} at eta={eta}, (eps, log_delta)=({epsilon}, {log_delta}): \
+                         composed {got:e}, hand {want:e}",
+                        order + 1
+                    );
+                }
+                // Order five has no hand chain of its own: it is the eta-slope of
+                // the hand `f⁗`. The central difference errs by `h²|μ⁽⁷⁾|/6` plus
+                // `ε|μ⁽⁴⁾|/h` of rounding, both far inside the band at `h = 1e-4`.
+                let h = 1e-4;
+                let fd = (fourth(eta + h) - fourth(eta - h)) / (2.0 * h);
+                assert!(
+                    (composed[4] - fd).abs() <= 1e-6 * (1.0 + composed[4].abs()),
+                    "SAS order 5 at eta={eta}, (eps, log_delta)=({epsilon}, {log_delta}): \
+                     composed {:e}, fd of the hand fourth {fd:e}",
+                    composed[4]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_link_pdffifth_derivative_matches_fd_of_the_fourth_3203() {
+        // `μ⁽⁶⁾` is the top order of the Bernoulli log jet behind the Firth TK
+        // outer ρ-Hessian (#3203). Each link's closed form must be the η-slope
+        // of its own `μ⁽⁵⁾`. The central difference errs by `h²|μ⁽⁷⁾|/6`
+        // plus `ε|μ⁽⁵⁾|/h` of rounding, both far inside the band at `h = 1e-4`.
+        let sas = InverseLink::Sas(sas_link_state_from_raw(-0.25, 0.35).expect("sas state"));
+        let beta_logistic = InverseLink::BetaLogistic(SasLinkState {
+            epsilon: 0.18,
+            log_delta: -0.22,
+            delta: (-0.22_f64).exp(),
+        });
+        let mixture = InverseLink::Mixture(
+            state_fromspec(&MixtureLinkSpec {
+                components: vec![
+                    LinkComponent::Probit,
+                    LinkComponent::Logit,
+                    LinkComponent::CLogLog,
+                    LinkComponent::LogLog,
+                    LinkComponent::Cauchit,
+                ],
+                initial_rho: Array1::from_vec(vec![0.35, -0.45, 0.2, -0.1]),
+            })
+            .expect("mixture state"),
+        );
+        let latent = InverseLink::LatentCLogLog(
+            gam_problem::types::LatentCLogLogState::new(0.4).expect("valid latent SD"),
+        );
+        let links = [
+            InverseLink::Standard(StandardLink::Logit),
+            InverseLink::Standard(StandardLink::Probit),
+            InverseLink::Standard(StandardLink::Cauchit),
+            InverseLink::Standard(StandardLink::CLogLog),
+            InverseLink::Standard(StandardLink::LogLog),
+            sas,
+            beta_logistic,
+            mixture,
+            latent,
+        ];
+        let h = 1e-4;
+        let mut failures = Vec::new();
+        for link in &links {
+            for eta in [-2.3, -1.1, -0.2, 0.35, 0.6, 1.7] {
+                let fifth = |x: f64| {
+                    inverse_link_pdffourth_derivative_for_inverse_link(link, x).expect("mu^(5)")
+                };
+                let fd = (fifth(eta + h) - fifth(eta - h)) / (2.0 * h);
+                let sixth = inverse_link_pdffifth_derivative_for_inverse_link(link, eta)
+                    .expect("mu^(6)");
+                if !((sixth - fd).abs() <= 1e-6 * (1.0 + sixth.abs())) {
+                    failures.push(format!("{link:?} eta={eta}: analytic {sixth:e}, fd {fd:e}"));
+                }
+            }
+        }
+        assert!(failures.is_empty(), "#3203:\n  {}", failures.join("\n  "));
+    }
+
+    /// The latent-cloglog complement is the survival `S(eta, σ_L)`, not
+    /// `1 − mu`: at `(eta, σ_L) = (8, 0.5)` the mean rounds to one while
+    /// `ln S = −70.97988851759840` (the #2714 high-precision reference row, which
+    /// `ln S` meets to `1e-13` relative).
+    #[test]
+    fn latent_cloglog_complement_keeps_the_survival_tail() {
+        let link = InverseLink::LatentCLogLog(
+            gam_problem::types::LatentCLogLogState::new(0.5).expect("valid latent SD"),
+        );
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 8.0).expect("latent jet");
+        assert_eq!(mu, 1.0, "the mean saturates, so 1 - mu carries nothing");
+        let complement = inverse_link_complement_for_inverse_link(&link, 8.0, mu);
+        assert!(
+            complement > 0.0,
+            "the complement must keep the representable survival tail, got {complement:e}"
+        );
+        let reference_log_survival = -7.097_988_851_759_84e1;
+        let relative =
+            (complement.ln() - reference_log_survival).abs() / reference_log_survival.abs();
+        assert!(
+            relative <= 1.0e-12,
+            "ln complement = {:.17e}, reference {reference_log_survival:.17e} \
+             (relative {relative:.3e})",
+            complement.ln()
+        );
+
+        // Where the mean does not saturate, the complement and the mean share
+        // one `ln S`, so they add to one up to the rounding of each.
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 0.35).expect("latent jet");
+        let complement = inverse_link_complement_for_inverse_link(&link, 0.35, mu);
+        assert!(
+            (mu + complement - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "mu {mu:.17e} + complement {complement:.17e} must be one"
+        );
+        assert!(inverse_link_complement_for_inverse_link(&link, f64::NAN, f64::NAN).is_nan());
     }
 
     #[test]

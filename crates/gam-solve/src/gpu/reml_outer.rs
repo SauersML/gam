@@ -51,9 +51,6 @@ pub(crate) struct RemlOuterGpuInput {
     /// Projected-gradient band a cost stall must clear to count as stationary
     /// rather than as a non-converged floor. Mirrors the host arm's band.
     pub cost_stall_projected_grad_tol: f64,
-    /// Per-axis step caps applied to BFGS line-search trial points. `None`
-    /// disables axis-wise capping (matches the default opt::Bfgs behaviour).
-    pub axis_step_caps: Option<Array1<f64>>,
     /// Admission descriptor used by the predicate. The driver keeps it on
     /// hand so it can re-check on each outer step that the inner family /
     /// curvature / device-availability still hold; a flip mid-run (e.g. the
@@ -221,9 +218,6 @@ where
             crate::rho_optimizer::COST_STALL_WINDOW,
             input.cost_stall_projected_grad_tol,
         ));
-    if let Some(caps) = input.axis_step_caps {
-        optimizer = optimizer.with_axis_step_caps(caps);
-    }
 
     let (solution, converged) = match optimizer.run() {
         Ok(solution) => {
@@ -280,7 +274,6 @@ mod tests {
             max_iterations: 10,
             cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
-            axis_step_caps: None,
             admission: dummy_admission(0),
             seed_objective: 42.0,
             seed_gradient: Array1::zeros(0),
@@ -312,7 +305,6 @@ mod tests {
             max_iterations: 100,
             cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
-            axis_step_caps: None,
             admission: dummy_admission(4),
             seed_objective: 0.5 * seed_diff.dot(&seed_diff),
             seed_gradient: seed_diff,
@@ -341,7 +333,6 @@ mod tests {
             max_iterations: 10,
             cost_stall_resolution: 0.0,
             cost_stall_projected_grad_tol: 1.0e-3,
-            axis_step_caps: None,
             admission: dummy_admission(1),
             seed_objective: 3.0,
             seed_gradient: Array1::zeros(1),

@@ -2365,17 +2365,15 @@ fn exact_joint_jeffreys_completion_at<F: CustomFamily + Clone + Send + Sync + 's
             h_information.dim(),
         )));
     }
+    // An inactive plan has a vanishing completion.
     let completion = custom_family_joint_jeffreys_second_order_completion(
         family,
         states,
         specs,
         &h_information,
         z_joint,
-        JeffreysCompletionAssembly::Exact,
     )?
-    .ok_or_else(|| {
-        format!("{context}: active Jeffreys term did not supply its exact second-order completion")
-    })?;
+    .unwrap_or_else(|| Array2::zeros((total_p, total_p)));
     if completion.dim() != (total_p, total_p) || completion.iter().any(|value| !value.is_finite()) {
         return Err(CustomFamilyError::trial_point(format!(
             "{context}: Jeffreys completion is non-finite or has shape {:?}, expected ({total_p}, {total_p})",
@@ -3572,9 +3570,11 @@ pub(crate) fn single_block_simplified_newton_corrections<
 /// `dβ̂/dρ_k = −(H + S_λ)⁻¹ λ_k S_k β̂`.
 ///
 /// `curvature` is the exact-Newton working set the mode's own solve ended on, so `H` is the
-/// curvature that solve certified at `β̂`, and `S_λ` is the penalty at `from`. The step is the
-/// block's update step ([`ExactNewtonBlockUpdater::step_for_rhs`]) with right-hand side
-/// `−Σ_k Δρ_k λ_k S_k β̂`: the stabilized solve and the linear constraints are the ones the
+/// curvature that solve certified at `β̂`, and `S_λ` is the penalty at `from`, formed from the
+/// structural roots `S_k = R_kᵀR_k` the solve reads
+/// ([`crate::blockwise_solve::block_penalty_roots`]). The step is the block's update step
+/// ([`ExactNewtonBlockUpdater::step_for_rhs`]) with right-hand side
+/// `−Σ_k Δρ_k λ_k R_kᵀ(R_k β̂)`: the stabilized solve and the linear constraints are the ones the
 /// Newton-region test that judges the predictor uses, and on an active face the step is the
 /// face's one-sided tangent. Forming it needs no evaluation of the family and no outer pricing.
 pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -3616,17 +3616,9 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
             reason: "the IFT predictor needs the mode's exact-Newton curvature".to_string(),
         });
     };
-    let p = spec.design.ncols();
-    let lambdas = exact_lambdas_from_log_strengths(from, "IFT predictor log strength")?;
-    let mut s_lambda = Array2::<f64>::zeros((p, p));
-    let mut tangent_direction = Array2::<f64>::zeros((p, p));
-    for (k, s) in spec.penalties.iter().enumerate() {
-        s.add_scaled_to(lambdas[k], &mut s_lambda);
-        let delta = to[k] - from[k];
-        if delta != 0.0 {
-            s.add_scaled_to(delta * lambdas[k], &mut tangent_direction);
-        }
-    }
+    // The solver's own penalty: the structural roots at `from` (#2954), so `S_λ` is the curvature
+    // the mode's solve ended on and each `S_k β̂` is `R_kᵀ(R_k β̂)` of the same roots.
+    let (s_lambda, terms) = crate::blockwise_solve::block_penalty_roots(0, spec, from)?;
     let mut states = buildblock_states(family, specs)?;
     if mode_beta.len() != states[0].beta.len() {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -3636,6 +3628,19 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
                 states[0].beta.len()
             ),
         });
+    }
+    let mut tangent_rhs = Array1::<f64>::zeros(mode_beta.len());
+    for (term, (&to_k, &from_k)) in terms.iter().zip(to.iter().zip(from.iter())) {
+        let delta = to_k - from_k;
+        if delta != 0.0 {
+            let root = term.root.as_ref();
+            let pulled = root
+                .t()
+                .dot(&root.dot(&mode_beta.slice(ndarray::s![term.columns.clone()])));
+            tangent_rhs
+                .slice_mut(ndarray::s![term.columns.clone()])
+                .scaled_add(-delta * term.lambda, &pulled);
+        }
     }
     states[0].beta.assign(mode_beta);
     refresh_all_block_etas(family, specs, &mut states)?;
@@ -3651,7 +3656,7 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
             linear_constraints: constraints.as_ref(),
             cached_active_set: active_set,
         },
-        -tangent_direction.dot(mode_beta),
+        tangent_rhs,
     )?;
     Ok(vec![family.post_update_block_beta(&states, 0, spec, step.beta_new_raw)?])
 }
@@ -4310,6 +4315,12 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             lastobjective,
         );
         let mut max_proposed_beta_step = 0.0_f64;
+        // The block update's own step BEFORE the trust-region truncation. It is
+        // zero exactly at a fixed point of the block map (the penalized score
+        // `rhs` vanishes under a positive-definite `H + S`), whereas the
+        // truncated step also goes to zero when the radius collapses, so only
+        // this one can stand in for stationarity when no residual is measured.
+        let mut max_untruncated_beta_step = 0.0_f64;
         let mut max_accepted_beta_step = 0.0_f64;
         let mut trust_boundary_hit_in_cycle = false;
 
@@ -4380,6 +4391,11 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             )?;
             let beta_old = states[b].beta.clone();
             let raw_delta = &beta_new - &beta_old;
+            max_untruncated_beta_step = raw_delta
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(max_untruncated_beta_step, f64::max);
             // Per-block trust-region radius in the block's local
             // penalized-Hessian metric. The cap is the current value of
             // `block_max_step[b]`, updated below via
@@ -4618,7 +4634,41 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 block_accumulation.roundoff_ceiling(),
                 false,
             );
-            block_max_step[b] = trust_update.radius;
+            // A KEPT STEP NEITHER SIDE OF THE RATIO CAN RESOLVE IS NEUTRAL, NOT
+            // REJECTED (gam#3289). On this path the line search above decides
+            // whether the step is kept; the controller only sizes the next
+            // region. It reads a prediction inside the `|f|·1e-14` floor as
+            // `rho = -inf`, and it calls a realized change neutral only while
+            // that change sits inside the same floor. A realized decrease above
+            // the floor but inside the evaluation's own rounding ceiling
+            // satisfies neither the neutral test nor the gam#2637 override, so
+            // the controller shrinks the region to half the kept step. Neither
+            // reading of that change supports the shrink. If it is rounding,
+            // the step is neutral and the region holds. If it is a genuine
+            // decrease, the override accepts it and the region again holds.
+            // Only a model that predicts ascent is evidence against the region,
+            // and this one predicted a non-negative decrease.
+            //
+            // Measured on a railed `bounded()` slope, whose latent logit walks
+            // toward the injective clamp at one unit per cycle while the
+            // objective contracts by `e^-1` per cycle. At cycle 30 the realized
+            // change was `5.400e-13` against a floor of `5.366e-13`. The radius
+            // went from `40` to `5e-6`, the next step hit it, and the
+            // frozen-likelihood divergence exit refused the fit three cycles
+            // before the clamp would have produced the exactly-zero accepted
+            // step that certifies it.
+            let kept_step_is_numerically_neutral = accepted
+                && !trust_update.accepted
+                && trust_update.rho == f64::NEG_INFINITY
+                && predicted_reduction.is_finite()
+                && predicted_reduction >= 0.0
+                && actual_reduction >= 0.0
+                && actual_reduction <= block_accumulation.roundoff_ceiling();
+            block_max_step[b] = if kept_step_is_numerically_neutral {
+                block_max_step[b]
+            } else {
+                trust_update.radius
+            };
             if !accepted {
                 states[b].beta.assign(&beta_old);
                 eta_checkpoint.restore_eta(&mut states[b]);
@@ -4842,8 +4892,11 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         } else {
             None
         };
+        // `true` only for a residual that was MEASURED and is within tolerance.
+        // A family with no exact joint curvature has no residual to measure, and
+        // an unmeasured residual is not a passed one.
         let exact_joint_stationarity_ok =
-            stationarity_residual.is_none_or(|residual| residual <= residual_tol);
+            stationarity_residual.is_some_and(|residual| residual <= residual_tol);
         // A residual inside its own rounding band drives a step that is rounding too: the
         // iterate is at its root to the arithmetic, so a step this cycle took from it is not a
         // step it needed (the Newton-region test's rule, gam#2973).
@@ -4852,9 +4905,10 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             (Some(residual), Some(band)) if residual <= band
         );
         log::debug!(
-            "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
+            "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (untruncated={:.3e}, tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
             cycle,
             max_proposed_beta_step,
+            max_untruncated_beta_step,
             step_tol,
             max_accepted_beta_step,
             objective_change,
@@ -4870,7 +4924,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         terminal_convergence_state = Some(gam_problem::InnerConvergenceTerminalState::Blockwise {
             cycle,
             max_accepted_step: max_accepted_beta_step,
-            max_proposed_step: max_proposed_beta_step,
+            max_proposed_step: max_untruncated_beta_step,
             step_tol,
             objective_change,
             objective_tol,
@@ -4929,7 +4983,17 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         if (max_accepted_beta_step <= step_tol || step_is_rounding)
             && objective_change <= objective_tol
         {
-            if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
+            // "Nothing moved" is not a certificate. When the line search accepts
+            // no step, `max_accepted_beta_step` and `objective_change` are both
+            // exactly zero, so the conjunction above holds at ANY iterate (the
+            // gam#2612 finding). What certifies the iterate is either the joint
+            // residual, when one can be measured, or the untruncated block step:
+            // it vanishes exactly where the penalized score does. An UNMEASURED
+            // residual (`stationarity_residual == None`, a family with no exact
+            // joint curvature) certifies nothing by itself, and the truncated
+            // step is not a stand-in either, because a collapsed trust radius
+            // drives it to zero at a non-stationary point.
+            if exact_joint_stationarity_ok || max_untruncated_beta_step <= step_tol {
                 converged = true;
             }
             break;

@@ -251,14 +251,6 @@ pub(crate) enum CostStallVerdict {
 /// it goes with the `opt` bump that brings the window-free stall rule (#3018).
 pub(crate) const COST_STALL_WINDOW: usize = 6;
 
-/// One sample the cost-stall guard judges (#3018).
-///
-/// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`:
-/// the objective band the evaluation's own evidence forms, or the criterion's
-/// resolution `τ` where it publishes none ([`sample_resolution`]).
-/// `grad_norm` is the bound-projected gradient norm. `trusted` is the inner
-/// solve's convergence flag for this sample (#1426). `curvature_psd` is its
-/// reduced-Hessian verdict, `Some(false)` for a certified strict saddle.
 /// Whether `value`, computed to within `resolution`, is resolvably below
 /// `reference`, computed to within `reference_resolution` (#3018).
 ///
@@ -279,15 +271,17 @@ pub(crate) fn resolvably_below(
     reference - value > reference_resolution + resolution
 }
 
+pub(crate) use super::decrement_bands::value_representation_band;
+
 /// The resolution of a criterion value an evaluation computed (#3018): a bound
 /// `R` on its evaluation error, `|V̂ − V| ≤ R`. It is the objective band the
 /// evaluation's own evidence forms
 /// ([`outer_objective_band`](super::decrement_bands::outer_objective_band)), and
-/// the criterion's resolution `tau` where it forms none
-/// ([`super::run::outer_criterion_resolution`]).
+/// the value's own representation error where it forms none. Statistical
+/// resolution bounds the decrease left at a certified point, not the error of
+/// one computed value, so it does not floor this resolved-progress test.
 pub(crate) fn sample_resolution(
     config: &OuterConfig,
-    tau: f64,
     cost: f64,
     evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
 ) -> f64 {
@@ -295,9 +289,16 @@ pub(crate) fn sample_resolution(
         .ok()
         .map(|band| band.total())
         .filter(|band| band.is_finite())
-        .unwrap_or(tau)
+        .unwrap_or_else(|| value_representation_band(cost))
 }
 
+/// One sample the cost-stall guard judges (#3018).
+///
+/// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`
+/// ([`sample_resolution`]). `grad_norm` is the bound-projected gradient norm.
+/// `trusted` is the inner solve's convergence flag for this sample (#1426).
+/// `curvature_psd` is its reduced-Hessian verdict, `Some(false)` for a certified
+/// strict saddle.
 pub(crate) struct StallSample<'a> {
     pub(crate) point: &'a Array1<f64>,
     pub(crate) value: f64,
@@ -397,10 +398,6 @@ pub(crate) struct CostStallGuard {
     /// `1e-3·(1 + |V|)` term and a probe-noise widening, none derived; a stall
     /// claimed points the certificate then refused.
     claim_config: OuterConfig,
-    /// The criterion's resolution `τ` ([`super::run::outer_criterion_resolution`]):
-    /// the resolution of a value whose evaluation forms no objective band
-    /// ([`Self::value_resolution`], #3018).
-    resolution: f64,
     /// Set when a replay cut proved that reopening the window replays a
     /// deterministic procedure from a bit-identical incumbent. From then on the
     /// run stops at its incumbent: no continuation licence overrides a proven
@@ -501,14 +498,9 @@ pub(crate) struct CostStallGuard {
 }
 
 impl CostStallGuard {
-    pub(crate) fn new(
-        resolution: f64,
-        claim_config: &OuterConfig,
-        exit: Arc<Mutex<Option<CostStallExit>>>,
-    ) -> Self {
+    pub(crate) fn new(claim_config: &OuterConfig, exit: Arc<Mutex<Option<CostStallExit>>>) -> Self {
         Self {
             claim_config: claim_config.clone(),
-            resolution,
             replay_proven: false,
             best_value: f64::INFINITY,
             best_resolution: 0.0,
@@ -777,20 +769,20 @@ impl CostStallGuard {
     }
 
     /// The configuration the guard judges by: the band it claims against, and
-    /// the resolution a bridge charges a value that publishes no evidence.
+    /// the problem size used to form the evaluation objective band.
     pub(crate) fn claim_config(&self) -> &OuterConfig {
         &self.claim_config
     }
 
     /// The resolution of `cost` as its evaluation computed it (#3018): the
-    /// objective band its `evidence` forms, or the guard's `τ` where it forms none
-    /// ([`sample_resolution`]).
+    /// objective band its `evidence` forms, or its own representation error
+    /// where it forms none ([`sample_resolution`]).
     pub(crate) fn value_resolution(
         &self,
         cost: f64,
         evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
     ) -> f64 {
-        sample_resolution(&self.claim_config, self.resolution, cost, evidence)
+        sample_resolution(&self.claim_config, cost, evidence)
     }
 
     pub(crate) fn best_value(&self) -> f64 {
@@ -816,6 +808,13 @@ impl CostStallGuard {
 
     pub(crate) fn off_stratum_streak(&self) -> usize {
         self.off_stratum_streak
+    }
+
+    /// A feasible trial ends a refusal streak even when Wolfe does not accept
+    /// it. It grants no cost progress and does not consume an accepted step.
+    pub(crate) fn observe_feasible_probe(&mut self) {
+        self.infeasible_streak = 0;
+        self.off_stratum_streak = 0;
     }
 
     pub(crate) fn accepted_iters(&self) -> usize {
@@ -1728,12 +1727,8 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
-        // Per-axis line-search step caps now live natively in opt::Bfgs
-        // (`with_axis_step_caps`), which shortens the BFGS direction before
-        // line search instead of poisoning the Wolfe bracket with a
-        // sentinel cost. This entry point can therefore stay honest: any
-        // call that lands here is a real line-search probe, not a too-far
-        // attempt the bridge needs to swat away.
+        // Every call that lands here is a real line-search probe: no step
+        // budget shortens or refuses a probe, on this side or in opt.
         //
         // Uncap the inner solve for the line-search cost probe (see the field
         // doc on `outer_inner_cap`): the deciding cost MUST be the true
@@ -1780,6 +1775,11 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     );
                 }
             }
+            if matches!(entry.outcome, CachedValueProbeOutcome::Cost(_))
+                && let Some(guard) = self.cost_stall.as_mut()
+            {
+                guard.observe_feasible_probe();
+            }
             return cached_value_probe_result(&entry.outcome);
         }
         log::debug!(
@@ -1808,6 +1808,9 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
             Ok(cost) => {
+                if let Some(guard) = self.cost_stall.as_mut() {
+                    guard.observe_feasible_probe();
+                }
                 log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
@@ -1855,7 +1858,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     let verdict = match (left_stratum, self.stratum_rank) {
                         (Some(refused_cost), Some(kept_rank)) => {
                             // The value lane publishes no evidence, so the trial's
-                            // value carries the criterion's resolution.
+                            // value carries only its own rounding.
                             let refused_resolution =
                                 guard.value_resolution(refused_cost, &Default::default());
                             guard.observe_off_stratum(
@@ -1952,6 +1955,20 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     }
 }
 
+// Keep the bridge available after BFGS returns so its terminal refusal streak
+// can accompany a line-search failure without changing the solver's verdict.
+impl ZerothOrderObjective for &mut OuterFirstOrderBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        (**self).eval_cost(x)
+    }
+}
+
+impl FirstOrderObjective for &mut OuterFirstOrderBridge<'_> {
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        (**self).eval_grad(x)
+    }
+}
+
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
@@ -1959,6 +1976,19 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
+        // Rescue steps can ask for a gradient without a preceding value probe.
+        // On a rank-constrained search, establish feasibility first: derivatives
+        // across the rank boundary belong to another criterion. Ordinary Wolfe
+        // probes already have a cached value and pay no additional evaluation.
+        let at_incumbent = self.incumbent.as_ref()
+            .is_some_and(|incumbent| same_outer_point(&incumbent.rho, x));
+        let priced_here = self.value_probe_cache.iter().any(|entry| {
+            same_outer_point(&entry.rho, x)
+                && matches!(entry.outcome, CachedValueProbeOutcome::Cost(_))
+        });
+        if self.stratum_rank.is_some() && !at_incumbent && !priced_here {
+            self.eval_cost(x)?;
+        }
         // Drive the outer-aware inner-PIRLS cap from accepted outer
         // iterations, BEFORE invoking the inner solve. Cap stays fixed
         // within line-search cost probes (`eval_cost` never touches the
@@ -2127,6 +2157,24 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
 }
 
 impl OuterFirstOrderBridge<'_> {
+    /// Evidence for a line search exhausted solely by rank refusals at its
+    /// accepted checkpoint. This reports the cause; it grants no convergence.
+    pub(crate) fn terminal_rank_boundary(&self, point: &Array1<f64>) -> Option<RankBoundaryStall> {
+        let incumbent = self.incumbent.as_ref()?;
+        let guard = self.cost_stall.as_ref()?;
+        if !same_outer_point(&incumbent.rho, point)
+            || guard.off_stratum_streak == 0
+            || guard.off_stratum_streak != guard.infeasible_streak
+        {
+            return None;
+        }
+        Some(RankBoundaryStall {
+            kept_rank: self.stratum_rank?,
+            refused_trials: guard.off_stratum_streak,
+            band: guard.stationarity_band(),
+        })
+    }
+
     /// Refuse a trial whose criterion keeps a different rank than this run's start (#2765).
     ///
     /// Called once an evaluation has validated, with the criterion value it returned. The
@@ -2630,10 +2678,12 @@ pub(crate) struct OuterSecondOrderBridge<'a> {
     /// [`CostStallGuard`] stationarity test consumes. See the matching field on
     /// [`OuterFirstOrderBridge`].
     pub(crate) cost_stall_bounds: Option<(Array1<f64>, Array1<f64>)>,
-    /// The criterion's absolute resolution `τ`
+    /// The criterion's statistical resolution `τ_stat`
     /// ([`super::run::outer_criterion_resolution`]) for the online decrement
-    /// stop, or `None` on a route that does not apply it (which is every route
-    /// with no synchronized analytic Hessian at the evaluated point). See
+    /// stop, which decides at the resolution it and each evaluated value's band
+    /// give ([`outer_resolution`](super::decrement_bands::outer_resolution),
+    /// #3286), or `None` on a route that does not apply the stop (which is every
+    /// route with no synchronized analytic Hessian at the evaluated point). See
     /// [`ARC_CURVATURE_STATIONARY_SENTINEL`].
     pub(crate) curvature_stationary_resolution: Option<f64>,
     /// The last evaluated trial, held until `opt::Arc`'s ratio test decides it,
@@ -2838,6 +2888,11 @@ impl OuterSecondOrderBridge<'_> {
         let Some(guard) = self.cost_stall.as_mut() else {
             return None;
         };
+        // What this accepted step bought against the incumbent it left, and the
+        // evaluation error of that difference: the measure the
+        // curvature-resolvability rung is gated on (#3287).
+        let step_decrease = guard.best_value() - cost;
+        let step_resolution = guard.best_resolution() + *resolution;
         guard.stage_sample_curvature(curvature.clone());
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
@@ -2861,7 +2916,6 @@ impl OuterSecondOrderBridge<'_> {
         } else {
             guard.observe(stall_sample(projected_g_norm), predicted_decrease)
         };
-        let mut adjudicate_second_order = false;
         let stalled = !matches!(verdict, CostStallVerdict::Continue);
         match verdict {
             CostStallVerdict::Continue => {}
@@ -2895,14 +2949,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.stuck_escapes(),
                     guard.best_value(),
                 );
-                // The search stalled, so the criterion has stopped moving, and that
-                // is the condition the certificate's curvature-resolvability rung
-                // decides whatever the first-order band says (#2817). A stall used
-                // to reach the adjudication only by halting inside 1.5x the old
-                // score-relative term; every stall above the band now escapes, so
-                // the escape is adjudicated too. The exit refuses available descent,
-                // a strict saddle and a non-incumbent by construction.
-                adjudicate_second_order = true;
             }
             CostStallVerdict::Converged => {
                 log::debug!(
@@ -2917,7 +2963,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
-                adjudicate_second_order = true;
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::debug!(
@@ -2932,7 +2977,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
-                adjudicate_second_order = true;
             }
         }
         // #1082: an escape granted just now at a strict-saddle incumbent is
@@ -2942,17 +2986,16 @@ impl OuterSecondOrderBridge<'_> {
         }
         // The guard's own verdict is FIRST-ORDER and, on this route, deferred:
         // only ARC holds a synchronized reduced Hessian at the point, so the
-        // guard may not halt a second-order search on a gradient reading. What
-        // it CAN do is say the criterion has stopped moving — and that is
-        // exactly the condition under which the certificate's own
-        // curvature-resolvability rung becomes the deciding test (#2817). The
-        // deferral above is unchanged; what follows is the adjudication it was
-        // always waiting for and never had.
+        // guard may not halt a second-order search on a gradient reading. The
+        // certificate's own second-order test decides instead (#2817), whatever
+        // the first-order band says; it refuses available descent, a strict
+        // saddle and a non-incumbent by construction.
         //
-        // The Newton-decrement verdict (#2954) needs no such wait: it is the
-        // certificate's own stationarity decision, so it is taken at every
-        // evaluated point and stops the run the first time it certifies. Only
-        // the curvature-resolvability rung is held for a stall.
+        // The Newton-decrement verdict (#2954) is the certificate's own
+        // stationarity decision, so it is taken at every evaluated point and
+        // stops the run the first time it certifies. The curvature-resolvability
+        // rung is held until the criterion stops moving at that rung's own
+        // resolution `τ`: this step did not resolvably buy more than `τ`.
         let verdict = self.curvature_stationary_exit(
             x,
             cost,
@@ -2960,7 +3003,8 @@ impl OuterSecondOrderBridge<'_> {
             hessian.as_ref(),
             hessian_psd,
             evidence.as_ref(),
-            adjudicate_second_order,
+            step_decrease,
+            step_resolution,
         );
         if verdict.is_some() {
             return verdict;
@@ -3047,7 +3091,18 @@ impl OuterSecondOrderBridge<'_> {
     /// at n = 10⁴: certified at ρ ≈ 19.6, stopped at ρ ≈ 22.7). The
     /// curvature-resolvability rung is not the certificate's decision where a
     /// verdict is taken, only its fallback, and it decides only once the
-    /// criterion has stopped moving (`criterion_stalled`, a stall).
+    /// criterion has stopped moving at the rung's own resolution: the accepted
+    /// step did not resolvably buy more than `τ` against the incumbent it left,
+    /// `step_decrease ≤ τ + step_resolution`, where `step_resolution` is the
+    /// two values' evaluation errors ([`resolvably_below`]). The rung says at
+    /// most `τ` of decrease is left; a step that resolvably bought more is the
+    /// criterion contradicting it. The gate used to be the cost-stall guard's
+    /// verdict, which asks whether the step bought anything resolvable at all:
+    /// where no band is published a value's error is its rounding (#3287), far
+    /// below `τ`, and a step crawling between the two is not a stall although it
+    /// contradicts nothing the rung claims. Every step the guard stalls passes
+    /// this gate too, since a decrease no larger than `step_resolution` is no
+    /// larger than `τ + step_resolution`.
     fn curvature_stationary_exit(
         &mut self,
         x: &Array1<f64>,
@@ -3056,9 +3111,20 @@ impl OuterSecondOrderBridge<'_> {
         hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
         evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
-        criterion_stalled: bool,
+        step_decrease: f64,
+        step_resolution: f64,
     ) -> Option<ObjectiveEvalError> {
-        let resolution = self.curvature_stationary_resolution?;
+        let tau_stat = self.curvature_stationary_resolution?;
+        // The resolution at this point's own value (#3286): at a route that
+        // declares no size, its arithmetic resolution, never zero.
+        let resolution = super::decrement_bands::outer_resolution(
+            tau_stat,
+            super::decrement_bands::outer_value_band(
+                self.cost_stall.as_ref()?.claim_config(),
+                cost,
+                evidence,
+            ),
+        );
         if hessian_psd != Some(true)
             || !cost.is_finite()
             || !resolution.is_finite()
@@ -3129,7 +3195,7 @@ impl OuterSecondOrderBridge<'_> {
                 format!("Newton-decrement verdict {verdict:?} (bound {bound:.3e})")
             }
             None => {
-                if !criterion_stalled {
+                if !(step_decrease <= resolution + step_resolution) {
                     return None;
                 }
                 // The decrement travels with the verdict (#2817, #1082).
@@ -3221,9 +3287,12 @@ impl OuterSecondOrderBridge<'_> {
         &mut self,
         x: &Array1<f64>,
     ) -> Option<ObjectiveEvalError> {
-        let objective_resolution = self.curvature_stationary_resolution?;
+        let tau_stat = self.curvature_stationary_resolution?;
         let bounds = self.cost_stall_bounds.clone()?;
         let guard = self.cost_stall.as_mut()?;
+        // The resolution at the incumbent's own value (#3286).
+        let objective_resolution =
+            super::decrement_bands::outer_resolution(tau_stat, guard.best_resolution());
         if !guard.take_strict_saddle_refusal()
             || !(guard.best_grad_norm() <= guard.stationarity_band())
             || !guard.best_value().is_finite()
@@ -3504,7 +3573,20 @@ impl SecondOrderObjective for OuterSecondOrderBridge<'_> {
         // from. No resolution configured keeps the arithmetic shift alone.
         let curvature_resolution = self
             .curvature_stationary_resolution
-            .map_or(0.0, super::run::criterion_curvature_resolution);
+            .map_or(0.0, |tau_stat| {
+                // At this trial's own value (#3286).
+                let band = match self.cost_stall.as_ref() {
+                    Some(guard) => super::decrement_bands::outer_value_band(
+                        guard.claim_config(),
+                        eval.cost,
+                        Some(&evidence),
+                    ),
+                    None => super::decrement_bands::value_representation_band(eval.cost),
+                };
+                super::run::criterion_curvature_resolution(
+                    super::decrement_bands::outer_resolution(tau_stat, band),
+                )
+            });
         let hessian_psd = hessian.as_ref().and_then(|dense| {
             reduced_hessian_psd_at_point(
                 x,
@@ -4452,8 +4534,9 @@ pub(crate) fn rail_projected_gradient_norm(
 /// — the certificate's single owner of "resolvable curvature" (#2748) — rather
 /// than at the arithmetic shift alone (#1082).
 ///
-/// The search route passes `2·ε_f`, with `ε_f = τ`
-/// (`run::outer_criterion_resolution`) the criterion's own resolution. Along an eigenvector of `λ < 0` at a stationary
+/// The search route passes `2·ε_f`, with `ε_f` the criterion's own resolution at the
+/// evaluated value (`decrement_bands::outer_resolution`, #3286). Along an eigenvector
+/// of `λ < 0` at a stationary
 /// point the claim predicts the decrease `½|λ|α²`, and the largest step the
 /// negative-curvature adjudication takes is one e-fold of `log λ` (`α = 1`), so
 /// a direction with `½|λ| ≤ ε_f` predicts nothing the criterion can represent
@@ -4745,7 +4828,7 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// - a resolved improvement of the incumbent: a value [`resolvably_below`] the
 ///   best one so far. An EFS evaluation publishes no certificate evidence, so
 ///   each value is charged only its own rounding `γ₁·|V|`
-///   ([`gam_math::roundoff::accumulation_growth`]`(1)`): the improvement is
+///   ([`value_representation_band`]): the improvement is
 ///   judged against `γ₁|V_best| + γ₁|V|`. The criterion's statistical
 ///   resolution `τ` is a decrease-*left* quantity, the certificate's decrement
 ///   tolerance, not the arithmetic error of one value; charging it here would
@@ -4788,12 +4871,11 @@ impl FixedPointProgress {
         if !value.is_finite() || !step_norm.is_finite() {
             return false;
         }
-        let rounding = |v: f64| gam_math::roundoff::accumulation_growth(1) * v.abs();
         let improved = resolvably_below(
             self.best_value,
-            rounding(self.best_value),
+            value_representation_band(self.best_value),
             value,
-            rounding(value),
+            value_representation_band(value),
         );
         let contracted = step_norm < self.previous_step_norm;
         self.best_value = self.best_value.min(value);
@@ -4822,13 +4904,6 @@ pub(crate) struct OuterFixedPointBridge<'a> {
     /// a later trial rho is refused and the analytic-gradient fallback resumes
     /// from the last finite fixed-point incumbent.
     pub(crate) evaluated_inner_seed: Arc<Mutex<Option<BoundInnerSeed>>>,
-    /// Consecutive HybridEFS iterations whose ψ block was zeroed after
-    /// exhausting backtracking. When this reaches
-    /// [`MAX_CONSECUTIVE_PSI_STAGNATION`], the bridge surfaces the
-    /// typed [`FirstOrderFallbackRequest`] so the runner aborts the
-    /// HybridEFS attempt and the fallback ladder routes to a joint
-    /// gradient-based solver where ψ stationarity ∇_ψ V = 0 can be enforced.
-    pub(crate) consecutive_psi_zero_iters: usize,
     /// Restore streak reported by the previous fixed-point evaluation.  Keeping
     /// this in the bridge requires the certificate to recur across two distinct
     /// outer evaluations; multiple inner-refinement chunks at one rho cannot
@@ -4901,55 +4976,43 @@ impl OuterFixedPointBridge<'_> {
     }
 }
 
-/// Maximum number of α halvings for the cost line search wrapping the EFS
-/// step.
-///
-/// The Wood–Fasiolo paper proves that the EFS update direction is an *ascent
-/// direction* for REML/LAML on penalty-like coordinates, but full-step
-/// monotonicity is not guaranteed — both the original Fellner–Schall paper
-/// and the extension recommend step-length control. We backtrack the entire
-/// θ vector by halving α ∈ {1, 1/2, …, 1/2⁸ ≈ 0.004}, accepting the first
-/// trial point with a strictly lower cost. With 8 halvings the smallest
-/// trial step is ≈ 0.4% of the raw EFS step in every coordinate, which is
-/// enough to clear pathologies near the identifiability boundary while
-/// staying inside one cache-warm Hessian factorization budget.
-pub(crate) const MAX_EFS_BACKTRACK: usize = 8;
+/// Contraction of the EFS cost line search: each rejected trial halves α.
+const EFS_BACKTRACK_CONTRACTION: f64 = 0.5;
 
-/// Maximum infinity-norm of the EFS step (in θ-space) at which we skip the
-/// cost line search and trust the multiplicative formula's quadratic
-/// convergence. Above this, we always backtrack.
+/// Whether every component of `α·step` is at the fixed-point map's own
+/// arithmetic resolution at `x`.
 ///
-/// At small step magnitudes the canonical formula `Δρ = log((d−t)/q_eff)`
-/// is itself a Newton step on the REML stationarity equation, with
-/// quadratic local convergence. Under Wood–Fasiolo's Loewner-order
-/// assumptions on the penalty derivative, sufficiently small steps are
-/// always descent on `V`, so the line search would add an inner P-IRLS
-/// solve per outer iteration with essentially zero chance of finding a
-/// halving that beats the full step. The threshold is set to ~exp(0.5)
-/// ≈ 1.65× change in any single λ_i (well inside the local-convergence
-/// regime) and gates only the line-search call — the step itself is
-/// applied unchanged, so correctness is preserved.
-pub(crate) const EFS_LINESEARCH_THRESHOLD: f64 = 0.5;
+/// An EFS step is computed from traces and logs, so its roundoff is `√ε`
+/// relative to the coordinate it moves: a component at or below
+/// `√ε·(1 + |x_i|)` cannot be told from the map's arithmetic (the same test
+/// [`OuterFixedPointBridge::reject_nonstationary_tiny_psi_step`] and
+/// `run::fixed_point_step_resolution` read).
+fn efs_step_at_resolution(x: &Array1<f64>, step: &Array1<f64>, alpha: f64) -> bool {
+    x.iter()
+        .zip(step.iter())
+        .all(|(value, delta)| (alpha * delta).abs() <= f64::EPSILON.sqrt() * (1.0 + value.abs()))
+}
 
-/// Relative tolerance for the descent condition `c < current_cost` during
-/// EFS backtracking. Without this, ULP-level cost noise near a fixed point
-/// can cause spurious backtracking even when the step is mathematically
-/// correct. We accept any trial whose cost is within
-/// `EFS_COST_DESCENT_TOL · |current_cost|` of the current value.
-pub(crate) const EFS_COST_DESCENT_TOL: f64 = 1e-12;
-
-/// Maximum number of consecutive HybridEFS iterations whose ψ block was
-/// zeroed before the bridge bails out and triggers a solver switch.
+/// The number of trials `α ∈ {1, 1/2, 1/4, …}` along `step` that the EFS cost
+/// line search can take (#3539).
 ///
-/// On hard problems (Matérn additive at large scale, Duchon60, anisotropic
-/// joint penalties) a single zeroed-ψ iteration after exhausted backtracking
-/// is already strong evidence the EFS ψ direction is not descent-correlated
-/// at the current iterate; continuing on ρ alone with Δψ = 0 cannot enforce
-/// ∇_ψ V = 0 and burns outer iterations on a non-stationary direction.
-/// Bail out immediately so the fallback ladder routes to a joint
-/// gradient-based solver (BFGS / L-BFGS) where ψ stationarity is part of
-/// the optimality condition.
-pub(crate) const MAX_CONSECUTIVE_PSI_STAGNATION: usize = 1;
+/// Wood–Fasiolo prove the EFS direction is an ascent direction for REML/LAML on
+/// penalty-like coordinates but not full-step monotonicity, so the step is
+/// contracted until its cost is within the criterion's resolution of the
+/// current value. The search ends at the first contraction whose every
+/// component is at the map's arithmetic resolution
+/// ([`efs_step_at_resolution`]), not after a picked count of halvings: such a
+/// trial is a step the map cannot distinguish from its own roundoff, so it
+/// carries no evidence about the direction.
+fn efs_resolvable_trials(x: &Array1<f64>, step: &Array1<f64>) -> usize {
+    let mut alpha = 1.0_f64;
+    let mut trials = 0usize;
+    while alpha > 0.0 && !efs_step_at_resolution(x, step, alpha) {
+        trials += 1;
+        alpha *= EFS_BACKTRACK_CONTRACTION;
+    }
+    trials
+}
 
 impl FixedPointObjective for OuterFixedPointBridge<'_> {
     fn eval_step(&mut self, x: &Array1<f64>) -> Result<FixedPointSample, ObjectiveEvalError> {
@@ -5109,7 +5172,29 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             eval.psi_gradient.as_ref(),
             eval.cost,
         )?;
-        let max_step_abs = raw_step.iter().map(|s| s.abs()).fold(0.0_f64, f64::max);
+        // The EFS step arrives whole, with no box on its length (#2902). The
+        // only bound on it is the outer domain, the same box opt's fixed-point
+        // loop projects every applied step onto, so the step is clipped to that
+        // domain here and the progress test, the resolution test and the cost
+        // line search all read the step that can actually be taken.
+        let raw_step = {
+            let (lower, upper) =
+                super::run::outer_search_bounds_template(self.config, self.layout.n_params);
+            if lower.len() != x.len() || upper.len() != x.len() {
+                return Err(ObjectiveEvalError::fatal(format!(
+                    "outer EFS eval failed: outer domain dimension mismatch \
+                     (parameters={}, lower={}, upper={})",
+                    x.len(),
+                    lower.len(),
+                    upper.len(),
+                )));
+            }
+            let mut clipped = raw_step;
+            for (i, delta) in clipped.iter_mut().enumerate() {
+                *delta = (x[i] + *delta).max(lower[i]).min(upper[i]) - x[i];
+            }
+            clipped
+        };
         let current_cost = eval.cost;
         // #2241 — an objective may certify that consecutive inner solves
         // returned to the same banked incumbent after non-monotone boundary
@@ -5130,9 +5215,6 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
         self.last_restored_incumbent_streak = eval.consecutive_restored_incumbents;
         if restored_incumbent_recurred {
             let restores = eval.consecutive_restored_incumbents.unwrap_or_default();
-            if psi_indices.is_some() {
-                self.consecutive_psi_zero_iters = 0;
-            }
             if let Ok(mut slot) = self.recurrent_incumbent_exit.lock() {
                 *slot = Some(restores);
             }
@@ -5172,16 +5254,14 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
                 status: FixedPointStatus::Stop,
             });
         }
-        // A raw step that no longer moves the iterate: `x + s` rounds back to `x`
-        // in every coordinate, so the iteration is at a fixed point to working
-        // precision and every backtracking trial would evaluate `x` itself. Pass
-        // it through so opt's step-norm test stops the walk and the runner
-        // screens the point (#2817). The test is the representable one, not a
-        // picked step size (#2469).
-        if x.iter().zip(raw_step.iter()).all(|(value, delta)| value + delta == *value) {
-            if psi_indices.is_some() {
-                self.consecutive_psi_zero_iters = 0;
-            }
+        // A raw step at the map's own arithmetic resolution in every coordinate
+        // (which includes a step that no longer moves the iterate at all): the
+        // iteration is at a fixed point to the map's precision and no
+        // contraction of it is a resolvable trial. Pass it through so opt's
+        // step-norm test (`run::fixed_point_step_resolution`, the same
+        // per-coordinate bound) stops the walk and the runner screens the point
+        // (#2817, #2469).
+        if efs_step_at_resolution(x, &raw_step, 1.0) {
             return Ok(FixedPointSample {
                 value: current_cost,
                 step: raw_step,
@@ -5189,38 +5269,19 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             });
         }
 
-        // Small-step fast path. The canonical Wood–Fasiolo formula is
-        // locally quadratically convergent, so once we are inside the
-        // multiplicative-Newton basin (`||Δθ||∞ < EFS_LINESEARCH_THRESHOLD`)
-        // a halving is essentially never accepted over the full step. Skip
-        // the inner P-IRLS solve we'd otherwise burn on backtracking. When a
-        // barrier is configured, every accepted rho-step must still pass
-        // through the barrier-aware cost because feasibility can change even
-        // under a small smoothing-parameter move. For hybrid runs we still
-        // need to reset the ψ-stagnation counter.
-        if self.barrier_config.is_none() && max_step_abs < EFS_LINESEARCH_THRESHOLD {
-            if psi_indices.is_some() {
-                self.consecutive_psi_zero_iters = 0;
-            }
-            return Ok(FixedPointSample {
-                value: current_cost,
-                step: raw_step,
-                status,
-            });
-        }
-
-        // ── Stage 1: full-vector cost backtracking ──
+        // Every EFS step passes the sufficient-decrease test (#3539). A
+        // small-step exemption (‖Δθ‖∞ below a picked radius in log λ) assumed the
+        // multiplicative update is inside its quadratic basin there, but that
+        // radius depends on the problem's curvature and the Wood–Fasiolo
+        // monotonicity assumptions fail on the HybridEFS / non-Gaussian LAML
+        // routes this bridge serves, so an uphill step inside it was applied
+        // with no test at all.
         //
-        // Wood–Fasiolo gives ascent in the EFS direction but not full-step
-        // monotonicity, so backtrack α ∈ {1, 1/2, …} on the *whole* step
-        // vector (not just ψ). This is a uniform requirement: even on the
-        // pure-ρ path, the additive log-λ formula is exact only at the
-        // fixed point and is otherwise just a Newton-flavoured Wood–Fasiolo
-        // surrogate that benefits from line search at large iterations.
-        if let Some(scaled) = self.efs_backtrack(x, &raw_step, current_cost, MAX_EFS_BACKTRACK)? {
-            if psi_indices.is_some() {
-                self.consecutive_psi_zero_iters = 0;
-            }
+        // Wood–Fasiolo give ascent in the EFS direction but not full-step
+        // monotonicity, so the *whole* step vector (ρ and ψ alike) is
+        // contracted until its cost is within the criterion's resolution of the
+        // current value.
+        if let Some(scaled) = self.efs_backtrack(x, &raw_step, current_cost)? {
             return Ok(FixedPointSample {
                 value: current_cost,
                 step: scaled,
@@ -5228,104 +5289,30 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
             });
         }
 
-        // ── Stage 2 (hybrid only): ψ-zeroed retry ──
-        //
-        // Full-vector backtracking exhausted means *every* α we tried gave
-        // a worse cost. On the hybrid path, the most common cause is a
-        // bad ψ direction polluting an otherwise-good ρ step (preconditioned
-        // gradient step on a near-singular ψ-ψ Gram matrix overshoots).
-        // Try the ρ/τ block alone with the same backtracking schedule. If
-        // that succeeds, we make progress on ρ this iteration; the ψ
-        // stagnation counter advances and triggers the joint-solver
-        // fallback once it crosses MAX_CONSECUTIVE_PSI_STAGNATION.
-        if let Some(psi_idx) = psi_indices.as_ref() {
-            let mut rho_only = raw_step.clone();
-            for &i in psi_idx {
-                rho_only[i] = 0.0;
-            }
-            let rho_only_moves = x
-                .iter()
-                .zip(rho_only.iter())
-                .any(|(value, delta)| value + delta != *value);
-            if rho_only_moves
-                && let Some(scaled) =
-                    self.efs_backtrack(x, &rho_only, current_cost, MAX_EFS_BACKTRACK)?
-            {
-                self.consecutive_psi_zero_iters = self.consecutive_psi_zero_iters.saturating_add(1);
-                log::debug!(
-                    "[HYBRID-EFS] full-vector backtrack exhausted; ρ/τ-only step \
-                         accepted. Consecutive ψ-zero iters = {}",
-                    self.consecutive_psi_zero_iters,
-                );
-                if self.consecutive_psi_zero_iters >= MAX_CONSECUTIVE_PSI_STAGNATION {
-                    log::debug!(
-                        "[STAGE] HybridEFS -> joint gradient (BFGS/L-BFGS) fallback: \
-                             {} consecutive ψ-zero iterations after exhausted backtracking \
-                             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                        self.consecutive_psi_zero_iters,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        current_cost,
-                    );
-                    return Err(first_order_fallback_error(format!(
-                        "HybridEFS ψ stagnation: {} consecutive iterations \
-                             exhausted backtracking and zeroed ψ step \
-                             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                        self.consecutive_psi_zero_iters,
-                        self.layout.rho_dim(),
-                        self.layout.psi_dim,
-                        self.layout.n_params,
-                        current_cost,
-                    )));
-                }
-                return Ok(FixedPointSample {
-                    value: current_cost,
-                    step: scaled,
-                    status,
-                });
-            }
-            // ρ/τ-only backtracking also failed — surface the typed
-            // joint-solver request so the runner abandons EFS for this attempt.
-            log::debug!(
-                "[STAGE] HybridEFS -> joint gradient fallback: ρ/τ-only step also \
-                 failed all {} halvings (rho_dim={}, psi_dim={}, n_params={}, \
-                 cost={:.6e})",
-                MAX_EFS_BACKTRACK,
-                self.layout.rho_dim(),
-                self.layout.psi_dim,
-                self.layout.n_params,
-                current_cost,
-            );
-            return Err(first_order_fallback_error(format!(
-                "HybridEFS step rejected after {} halvings on full vector \
-                 and {} halvings on ρ/τ-only fallback \
-                 (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
-                MAX_EFS_BACKTRACK,
-                MAX_EFS_BACKTRACK,
-                self.layout.rho_dim(),
-                self.layout.psi_dim,
-                self.layout.n_params,
-                current_cost,
-            )));
-        }
-
-        // Pure-EFS path with full backtracking exhausted: there is no ψ block
-        // to escape to. Surface the same typed request so the runner switches
-        // to a gradient-based solver instead of looping.
+        // No resolvable contraction of the EFS direction stays within the
+        // criterion's resolution of the current cost: the direction is not a
+        // descent direction here, which the ratio-of-traces map cannot repair.
+        // Surface the typed request so the runner continues on a joint
+        // gradient-based solver, where stationarity in every coordinate (ψ
+        // included) is part of the optimality condition. A ψ-zeroed retry used
+        // to run here, but every outcome of it surfaced this same request, so it
+        // only spent inner solves.
+        let kind = if psi_indices.is_some() { "HybridEFS" } else { "EFS" };
         log::debug!(
-            "[STAGE] EFS -> gradient fallback: no α ∈ {{1, …, 2^-{}}} decreased the \
-             cost (rho_dim={}, n_params={}, cost={:.6e})",
-            MAX_EFS_BACKTRACK,
+            "[STAGE] {kind} -> gradient fallback: no resolvable contraction of the \
+             step stays within the criterion resolution of the current cost \
+             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
             self.layout.rho_dim(),
+            self.layout.psi_dim,
             self.layout.n_params,
             current_cost,
         );
         Err(first_order_fallback_error(format!(
-            "EFS step rejected after {} halvings on pure-ρ vector \
-             (rho_dim={}, n_params={}, cost={:.6e})",
-            MAX_EFS_BACKTRACK,
+            "{kind} step rejected: no resolvable contraction of the step stays within \
+             the criterion resolution of the current cost \
+             (rho_dim={}, psi_dim={}, n_params={}, cost={:.6e})",
             self.layout.rho_dim(),
+            self.layout.psi_dim,
             self.layout.n_params,
             current_cost,
         )))
@@ -5333,9 +5320,10 @@ impl FixedPointObjective for OuterFixedPointBridge<'_> {
 }
 
 impl OuterFixedPointBridge<'_> {
-    /// Backtrack the cost along `raw_step` by halving α ∈ {1, 1/2, …, 2^-k}
-    /// up to `max_halvings` times. Returns `Some(α·raw_step)` for the first
-    /// α that yields a strictly lower finite cost, or `None` when every
+    /// Backtrack the cost along `raw_step` by halving α ∈ {1, 1/2, …} while the
+    /// trial is resolvable ([`efs_resolvable_trials`]).
+    /// Returns `Some(α·raw_step)` for the first α whose finite cost is within
+    /// the criterion resolution `τ` of the current cost, or `None` when every
     /// evaluable trial is rejected. A typed objective error means the evaluation
     /// artifact could not be constructed and is propagated without further probes.
     fn efs_backtrack(
@@ -5343,12 +5331,13 @@ impl OuterFixedPointBridge<'_> {
         x: &Array1<f64>,
         raw_step: &Array1<f64>,
         current_cost: f64,
-        max_halvings: usize,
     ) -> Result<Option<Array1<f64>>, ObjectiveEvalError> {
-        // Relaxed Armijo: accept any trial within ULP noise of the current
-        // cost. Pure `<` rejects ULP-noise dithering on flat regions of V
-        // and forces unnecessary halvings.
-        let cost_floor = current_cost + EFS_COST_DESCENT_TOL * current_cost.abs().max(1.0);
+        // Accept `c(x + αs) ≤ c(x) + τ` with `τ` the criterion's own resolution
+        // (`outer_criterion_resolution`), the band BFGS/ARC and the cost-stall
+        // guard use for "not resolvably worse" (#3539). A cost difference under
+        // `τ` is not evidence the step went uphill. With no resolution declared
+        // (`τ = 0`) the test is plain non-increase.
+        let cost_floor = current_cost + super::run::outer_criterion_resolution(self.config);
         // `bt` counts trials so the accepted step can report its halving count
         // (trial `bt` runs at α = 2^-bt). A refusal arrives as a typed error
         // (`is_trial_point_infeasible`) and is contracted as `Ok(None)` without an
@@ -5357,8 +5346,9 @@ impl OuterFixedPointBridge<'_> {
         let mut bt = 0usize;
         let accepted = backtracking_line_search::<_, ObjectiveEvalError>(
             BacktrackConfig {
-                max_steps: max_halvings + 1,
-                ..BacktrackConfig::default()
+                initial_step: 1.0,
+                contraction: EFS_BACKTRACK_CONTRACTION,
+                max_steps: efs_resolvable_trials(x, raw_step),
             },
             |alpha| {
                 bt += 1;

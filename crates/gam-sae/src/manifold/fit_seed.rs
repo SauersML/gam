@@ -18,10 +18,6 @@ use super::*;
 /// facade-specific default.
 pub const DEFAULT_SAE_SPARSITY_STRENGTH: f64 = 1.0;
 
-/// Atom count at which native ARD switches from per-atom coordinates to one
-/// shared coordinate per intrinsic axis.
-pub(crate) const SAE_SHARED_ARD_K_THRESHOLD: usize = 256;
-
 /// Strict typed assignment family for fit-seed construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SaeFitAssignmentKind {
@@ -455,16 +451,13 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
     }
 
     // #2822 — every coordinate atom carries its proper coordinate prior: a full ARD block,
-    // one log-precision per latent axis.
+    // one log-precision per latent axis, and each of them is its own outer
+    // coordinate at every K (#3824): the prior family does not depend on the atom
+    // count.
     let log_ard: Vec<Array1<f64>> = latent_dims.iter().map(|&d| Array1::<f64>::zeros(d)).collect();
     let seed_dispersion = base_term.seed_reconstruction_dispersion(request.target)?;
-    let use_shared_ard = k_atoms >= SAE_SHARED_ARD_K_THRESHOLD;
-    let initial_rho = if use_shared_ard {
-        SaeManifoldRho::new_shared_ard(sparsity_strength.ln(), smoothness.ln(), log_ard)
-    } else {
-        SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
-    }
-    .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &base_term.assignment)?;
+    let initial_rho = SaeManifoldRho::new(sparsity_strength.ln(), smoothness.ln(), log_ard)
+        .seed_scaled_by_dispersion_for_assignment(seed_dispersion, &base_term.assignment)?;
     let isometry_pin_active = request
         .registry
         .penalties

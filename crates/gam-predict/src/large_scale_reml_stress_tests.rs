@@ -31,8 +31,8 @@ use gam_models::fit_orchestration::drivers::{
     fit_term_collection_forspec, fit_term_collectionwith_spatial_length_scale_optimization,
 };
 use crate::{
-    InferenceCovarianceMode, PosteriorMeanOptions, PredictInput, PredictPosteriorMeanResult,
-    PredictableModel, StandardPredictor,
+    InferenceCovarianceMode, IntervalReference, PosteriorMeanOptions, PredictInput,
+    PredictPosteriorMeanResult, PredictableModel, StandardPredictor,
 };
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use faer::Side;
@@ -94,12 +94,12 @@ const PC_DIM_COVERAGE: usize = 4;
 // ends `Exhausted`, and the seed cascade moves on. So the fit's existence is the
 // convergence proof, and the fixture takes the library's default per-run cap
 // instead of a smaller number of its own.
-const NORMAL_95_TWO_SIDED_Z: f64 = 1.959_963_984_540_054;
-
-/// The two-sided standard-normal mass inside `NORMAL_95_TWO_SIDED_Z`. Bound to
-/// a constant so the level the interval is BUILT at and the level it is SCORED
-/// against cannot drift apart: change the `z` above and this is the number that
-/// has to move with it.
+/// The nominal level every interval here is built at. Its two-sided multiplier
+/// is the fit's own interval reference, `IntervalReference::of_fit` (Student-t
+/// on `n − edf` for this estimated-scale Gaussian fit, since 698df1148d), read
+/// once per replicate. So the published interval, the widths the test reads
+/// back from it and the intervals it builds itself use one multiplier at one
+/// level, and the multiplier cannot drift from the one `predict()` uses.
 const NOMINAL_COVERAGE: f64 = 0.95;
 
 /// False-alarm budget for the two-sided coverage band, in standard errors of
@@ -433,6 +433,7 @@ fn gaussian_identity_posterior(
                 covariance_mode: InferenceCovarianceMode::SmoothingCorrected,
                 include_observation_interval: false,
                 extrapolation_variance: None,
+                observation_prior_weights: None,
             },
         )
         .expect("production Gaussian posterior prediction")
@@ -922,6 +923,11 @@ fn large_scale_reml_stress_coverage() {
             fitted.fit.smoothing_correction_method(),
             Some(SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace { .. })
         );
+        // The multiplier `predict()` builds this fit's published interval with
+        // (see `NOMINAL_COVERAGE`).
+        let multiplier = IntervalReference::of_fit(&fitted.fit)
+            .and_then(|reference| reference.central_multiplier(NOMINAL_COVERAGE))
+            .expect("the coverage fit has an interval reference");
         let offset_te = Array1::<f64>::zeros(N_COVERAGE_HOLDOUT);
         let (pred_mean, pred_lower, pred_upper) = gaussian_identity_posterior_mean_interval(
             holdout_dense.view(),
@@ -935,7 +941,7 @@ fn large_scale_reml_stress_coverage() {
             let truth_i = truth_te[i];
             // The corrected interval is what `predict()` ships, and it is what
             // the half-width below reports.
-            let se_corr = (pred_upper[i] - pred_lower[i]) / (2.0 * NORMAL_95_TWO_SIDED_Z);
+            let se_corr = (pred_upper[i] - pred_lower[i]) / (2.0 * multiplier);
             let row = holdout_dense.row(i);
             let se_cond = row.dot(&covariance_conditional.dot(&row)).max(0.0).sqrt();
             let resid = truth_i - pred_mean[i];
@@ -963,7 +969,7 @@ fn large_scale_reml_stress_coverage() {
                 worst_relative_widening =
                     worst_relative_widening.min(widening / (se_cond * se_cond));
             }
-            if resid.abs() <= NORMAL_95_TWO_SIDED_Z * se_first_order {
+            if resid.abs() <= multiplier * se_first_order {
                 in_first_order += 1;
             }
             if published_is_first_order {
@@ -993,7 +999,7 @@ fn large_scale_reml_stress_coverage() {
                 in_corrected += 1;
                 sim_in_corrected += 1;
             }
-            if resid.abs() <= NORMAL_95_TWO_SIDED_Z * se_cond {
+            if resid.abs() <= multiplier * se_cond {
                 in_conditional += 1;
             }
             total_pts += 1;
