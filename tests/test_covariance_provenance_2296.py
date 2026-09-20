@@ -280,9 +280,35 @@ def test_summary_reports_definition_consistent_se_source() -> None:
     summary = model.summary()
     se_source = summary["coefficient_se_source"]
     assert se_source in ("conditional", "smoothing-corrected")
+    # This fixture has p = 10 coefficients, far below any size at which the
+    # fit keeps its inference factorized (#3283), so it publishes the dense
+    # matrix of the definition it reports. A missing matrix is a dropped
+    # export, not a case to skip.
     kind = summary.covariance_kind
-    if kind is not None:
-        assert kind == se_source, (
-            "summary paired a covariance matrix from one definition with SEs "
-            f"from another: covariance_kind={kind!r}, se source={se_source!r}"
-        )
+    covariance = summary.covariance
+    assert kind is not None and covariance is not None, (
+        "a dense p=10 Gaussian fit must export its covariance matrix and label: "
+        f"covariance_kind={kind!r}, covariance is None={covariance is None}"
+    )
+    assert kind == se_source, (
+        "summary paired a covariance matrix from one definition with SEs "
+        f"from another: covariance_kind={kind!r}, se source={se_source!r}"
+    )
+    # The labels above are written from the same field, so their agreement
+    # alone cannot detect a mixed pair. The numbers can: the SE column must be
+    # sqrt(diag) of the exported matrix, coefficient by coefficient.
+    covariance = np.asarray(covariance, dtype=float)
+    p = len(summary.coefficients)
+    assert covariance.shape == (p, p), (
+        f"covariance shape {covariance.shape} does not match {p} coefficients"
+    )
+    std_errors = np.array(
+        [float(row["std_error"]) for row in summary.coefficients], dtype=float
+    )
+    np.testing.assert_allclose(
+        std_errors,
+        np.sqrt(np.diag(covariance)),
+        rtol=1e-12,
+        atol=0.0,
+        err_msg="summary std_error column is not sqrt(diag) of the exported covariance",
+    )
