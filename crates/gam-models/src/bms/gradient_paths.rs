@@ -1240,17 +1240,6 @@ pub(super) fn marginal_slope_standard_normal_scalar_eta(
     q * (1.0 + observed_slope * observed_slope).sqrt() + observed_slope * z
 }
 
-pub(super) fn unary_derivatives_normal_cdf(x: f64) -> [f64; 5] {
-    let pdf = normal_pdf(x);
-    [
-        normal_cdf(x),
-        pdf,
-        -x * pdf,
-        (x * x - 1.0) * pdf,
-        (-x.powi(3) + 3.0 * x) * pdf,
-    ]
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarginalSlopeCovarianceShape {
     Diagonal,

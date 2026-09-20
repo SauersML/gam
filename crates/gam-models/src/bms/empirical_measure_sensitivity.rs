@@ -78,6 +78,7 @@
 use super::{
     EmpiricalZGrid, LatentMeasureKind,
 };
+use crate::latent_anchor::CalibrationUnit;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// A tied `ζ` group whose mass a bin boundary cuts, which is the only way the
@@ -612,16 +613,23 @@ pub(crate) fn rigid_empirical_score_zeta_channels(
             &grid.weights,
         )?;
         let observed_slope = s * g;
+        // The calibration constraint in the unit `N = Φ(−|q|)` the flex row
+        // program writes it in (gam#3639). Every quantity below is a ratio of
+        // two of `Ψ`, `Ξ`, `φ` and `μ′` (`a_m = μ′/Ψ₁`, `a_{x_b} ∝ φ_b/Ψ₁`, and
+        // their derivatives), homogeneous of degree zero in the constraint, so
+        // the unit leaves them unchanged while keeping each density a ratio
+        // of order `|q|` where `φ` and `μ′` both underflow past `|q| ≈ 37.5`.
+        let unit = CalibrationUnit::new(marginal.q);
 
         // Ψ_1, Ψ_2, Ξ_1, Ξ_2 and the per-node CDF derivatives they are built
-        // from. `Φ' = φ`, `Φ'' = −η·φ`, taken from the same stack the row jet
-        // uses so the two paths cannot drift.
+        // from. `Φ' = φ`, `Φ'' = −η·φ` over `N`, taken from the same stack the
+        // flex row program uses so the two paths cannot drift.
         let (mut psi1, mut psi2, mut xi1, mut xi2) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
         for b in 0..m {
             let node = grid.nodes[b];
             let pi = grid.weights[b];
             let eta_b = a + observed_slope * node;
-            let stack = super::gradient_paths::unary_derivatives_normal_cdf(eta_b);
+            let stack = unit.cdf_stack(eta_b);
             let d1 = pi * stack[1];
             let d2 = pi * stack[2];
             phi1[b] = d1;
@@ -637,7 +645,7 @@ pub(crate) fn rigid_empirical_score_zeta_channels(
                  row {i}"
             ));
         }
-        let a_m = marginal.mu1 / psi1;
+        let a_m = unit.density(marginal.q) / psi1;
         let a_g = -xi1 / psi1;
 
         // The row's own observed index and the shared signed-probit stack. `k`

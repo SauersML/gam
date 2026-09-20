@@ -4,7 +4,10 @@ use crate::bms::{
     bernoulli_marginal_link_map, empirical_intercept, replay_saved_bernoulli_marginal_slope_alo,
 };
 use crate::inference::model::{SavedCompiledFlexBlock, SavedLatentZNormalization};
-use crate::latent_anchor::{CalibrationTail, smaller_tail_log_target, solve_log_tail_root};
+use crate::latent_anchor::{
+    CalibrationTail, CalibrationUnit, smaller_tail_log_target, solve_log_tail_root,
+    sum_calibration_tail,
+};
 use crate::marginal_slope_shared::{
     ObservedDenestedCellPartials, eval_coeff4_at,
     probit_frailty_scale as marginal_slope_probit_frailty_scale, scale_coeff4,
@@ -1331,12 +1334,12 @@ impl BernoulliMarginalSlopePredictor {
             )
             .map_err(EstimationError::InvalidInput)?;
         }
-        Ok(CalibrationTail {
+        Ok(CalibrationTail::from_linear(
             tail,
             density,
-            density_slope: Some(density_slope),
+            Some(density_slope),
             summands,
-        })
+        ))
     }
 
     fn observed_denested_cell_partials_at_z(
@@ -1411,7 +1414,9 @@ impl BernoulliMarginalSlopePredictor {
     }
 
     /// The calibration `P(a) = Σ_k w_k Φ(η(a, z_k))` over an empirical latent
-    /// grid, read on its smaller tail `Σ_k w_k Φ(∓η_k)` (gam#3216, gam#3333).
+    /// grid, read on its smaller tail `Σ_k w_k Φ(∓η_k)` (gam#3216, gam#3333)
+    /// and summed by the finite-law driver the fit uses, which falls back to
+    /// log-sum-exp in the deep tail (gam#3639).
     fn evaluate_empirical_denested_calibration_tail(
         &self,
         a: f64,
@@ -1423,33 +1428,25 @@ impl BernoulliMarginalSlopePredictor {
         link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
         survival_side: bool,
     ) -> Result<CalibrationTail, EstimationError> {
-        let tail_sign = if survival_side { -1.0 } else { 1.0 };
-        let mut tail = 0.0;
-        let mut density = 0.0;
-        let mut density_slope = 0.0;
-        for (node, weight) in grid.pairs() {
-            let obs = self.observed_denested_cell_partials_at_z(
-                node,
-                a,
-                slope,
-                beta_score_warp,
-                beta_link_dev,
-                score_warp_correction_for_row,
-                link_dev_correction_for_row,
-            )?;
-            let eta = eval_coeff4_at(&obs.coeff, node);
-            let eta_a = eval_coeff4_at(&obs.dc_da, node);
-            let eta_aa = eval_coeff4_at(&obs.dc_daa, node);
-            let pdf = normal_pdf(eta);
-            tail += weight * normal_cdf(tail_sign * eta);
-            density += weight * pdf * eta_a;
-            density_slope += weight * pdf * (eta_aa - eta * eta_a * eta_a);
-        }
-        Ok(CalibrationTail {
-            tail,
-            density,
-            density_slope: Some(density_slope),
-            summands: grid.nodes.len(),
+        sum_calibration_tail(survival_side, grid.nodes.len(), |sum| {
+            for (node, weight) in grid.pairs() {
+                let obs = self.observed_denested_cell_partials_at_z(
+                    node,
+                    a,
+                    slope,
+                    beta_score_warp,
+                    beta_link_dev,
+                    score_warp_correction_for_row,
+                    link_dev_correction_for_row,
+                )?;
+                sum.push(
+                    weight,
+                    eval_coeff4_at(&obs.coeff, node),
+                    eval_coeff4_at(&obs.dc_da, node),
+                    eval_coeff4_at(&obs.dc_daa, node),
+                );
+            }
+            Ok(())
         })
     }
 
@@ -1486,6 +1483,58 @@ impl BernoulliMarginalSlopePredictor {
                 survival_side,
             )
         }
+    }
+
+    /// The calibration's intercept slope `F_a` and the marginal's `F_q` at a
+    /// solved row intercept, in the unit the row's constraint is written in,
+    /// for the implicit derivatives `a_u = −F_u/F_a` (gam#3639).
+    ///
+    /// A finite-law row divides its constraint by `N = Φ(−|q|)`
+    /// ([`CalibrationUnit`], the unit the fit's row program uses): `F_a` is
+    /// `(P′/T)·exp(log T − log N)` from the tail on the side `q` fixes, `F_q`
+    /// is `φ(q)/N`, and the returned unit gives each node's `φ(η)/N` for the
+    /// remaining `F_u`. Every implicit derivative is a ratio in that unit, so
+    /// none underflows where `P′` and `φ(q)` both would. The cells route keeps
+    /// the unit one: `F_a = P′`, `F_q = marginal_mu1`, no unit returned.
+    fn prediction_intercept_slopes(
+        &self,
+        row: usize,
+        q: f64,
+        marginal_mu1: f64,
+        intercept: f64,
+        slope: f64,
+        beta_score_warp: Option<&Array1<f64>>,
+        beta_link_dev: Option<&Array1<f64>>,
+        empirical_grid: Option<&EmpiricalZGrid>,
+        score_warp_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+        link_dev_correction_for_row: Option<ndarray::ArrayView1<'_, f64>>,
+    ) -> Result<(Option<CalibrationUnit>, f64, f64), EstimationError> {
+        let unit = empirical_grid.map(|_| CalibrationUnit::new(q));
+        let tail = self.evaluate_prediction_calibration_tail(
+            intercept,
+            slope,
+            beta_score_warp,
+            beta_link_dev,
+            empirical_grid,
+            score_warp_correction_for_row,
+            link_dev_correction_for_row,
+            unit.is_some() && q >= 0.0,
+        )?;
+        let (m_a, m_q) = match unit {
+            Some(unit) => (tail.density_in_unit(unit.log_unit()), unit.density(q)),
+            None => (tail.density_in_unit(0.0), marginal_mu1),
+        };
+        // The calibration is increasing in a, so F_a is positive unless it
+        // has stopped moving with a; the intercept then has no finite
+        // gradient and the row is refused.
+        if !(m_a > 0.0 && m_a.is_finite()) {
+            return Err(EstimationError::InvalidInput(format!(
+                "bernoulli marginal-slope prediction row {row}: the intercept \
+                 calibration derivative dF/da is {m_a:e} (in the row's calibration \
+                 unit), so the intercept has no finite gradient"
+            )));
+        }
+        Ok((unit, m_a, m_q))
     }
 
     pub fn from_unified(
@@ -2157,8 +2206,10 @@ impl BernoulliMarginalSlopePredictor {
                     }
 
                     let intercept = intercepts_view[local_row];
-                    let m_a = self
-                        .evaluate_prediction_calibration_tail(
+                    let (unit, m_a, m_q) = self.prediction_intercept_slopes(
+                        i,
+                        q,
+                        marginal_map[i].mu1,
                         intercept,
                         slope,
                         score_warp_beta_owned.as_ref(),
@@ -2166,26 +2217,13 @@ impl BernoulliMarginalSlopePredictor {
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                        false,
-                    )?
-                        .density;
-                    // ∂a/∂θ = −F_θ/F_a by the implicit function theorem. The
-                    // calibration F is increasing in a, so F_a is positive unless
-                    // every quadrature density has underflowed; the intercept then
-                    // has no finite gradient and the row is refused.
-                    if !(m_a > 0.0 && m_a.is_finite()) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "bernoulli marginal-slope prediction row {i}: the intercept \
-                             calibration derivative dF/da is {m_a:e}, so the intercept has \
-                             no finite gradient"
-                        )));
-                    }
+                    )?;
                     a_q.as_mut().expect("a_q allocated when need_gradient")[local_row] =
-                        marginal_map[i].mu1 / m_a;
+                        m_q / m_a;
                     let mut f_b = 0.0;
                     f_h_row.fill(0.0);
                     f_w_row.fill(0.0);
-                    if let Some(grid) = empirical_grid.as_ref() {
+                    if let (Some(grid), Some(unit)) = (empirical_grid.as_ref(), unit) {
                         for (node_idx, (node, weight)) in grid.pairs().enumerate() {
                             let obs = self.observed_denested_cell_partials_at_z(
                                 node,
@@ -2197,7 +2235,7 @@ impl BernoulliMarginalSlopePredictor {
                                 link_corr_row,
                             )?;
                             let eta = eval_coeff4_at(&obs.coeff, node);
-                            let pdf = normal_pdf(eta);
+                            let pdf = unit.density(eta);
                             f_b += weight * pdf * eval_coeff4_at(&obs.dc_db, node);
 
                             if let Some(runtime) = self.score_warp_runtime.as_ref() {
@@ -2784,8 +2822,10 @@ impl BernoulliMarginalSlopePredictor {
                         score_corr_row,
                         link_corr_row,
                     )?;
-                    let m_a = self
-                        .evaluate_prediction_calibration_tail(
+                    let (unit, m_a, m_q) = self.prediction_intercept_slopes(
+                        i,
+                        q,
+                        marginal_map[i].mu1,
                         intercept,
                         slope,
                         self.beta_score_warp.as_ref(),
@@ -2793,20 +2833,9 @@ impl BernoulliMarginalSlopePredictor {
                         empirical_grid.as_ref(),
                         score_corr_row,
                         link_corr_row,
-                        false,
-                    )?
-                        .density;
-                    // ∂a/∂θ = −F_θ/F_a: a non-positive F_a leaves the intercept
-                    // with no finite gradient, so the row is refused.
-                    if !(m_a > 0.0 && m_a.is_finite()) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "bernoulli marginal-slope prediction row {i}: the intercept \
-                             calibration derivative dF/da is {m_a:e}, so the intercept has \
-                             no finite gradient"
-                        )));
-                    }
+                    )?;
                     let mut f_b = 0.0;
-                    if let Some(grid) = empirical_grid.as_ref() {
+                    if let (Some(grid), Some(unit)) = (empirical_grid.as_ref(), unit) {
                         for (node, weight) in grid.pairs() {
                             let obs = self.observed_denested_cell_partials_at_z(
                                 node,
@@ -2818,7 +2847,8 @@ impl BernoulliMarginalSlopePredictor {
                                 link_corr_row,
                             )?;
                             let eta = eval_coeff4_at(&obs.coeff, node);
-                            f_b += weight * normal_pdf(eta) * eval_coeff4_at(&obs.dc_db, node);
+                            let pdf = unit.density(eta);
+                            f_b += weight * pdf * eval_coeff4_at(&obs.dc_db, node);
                         }
                     } else {
                         for partition_cell in self.denested_partition_cells(
@@ -2847,11 +2877,7 @@ impl BernoulliMarginalSlopePredictor {
                             .map_err(EstimationError::InvalidInput)?;
                         }
                     }
-                    Ok((
-                        intercept,
-                        marginal_map[i].mu1 / m_a,
-                        -f_b / m_a,
-                    ))
+                    Ok((intercept, m_q / m_a, -f_b / m_a))
                 },
             )
             .collect();

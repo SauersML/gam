@@ -47,7 +47,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use gam_linalg::utils::splitmix64_hash;
 use gam_math::nested_dual::JetField;
 use gam_math::probability::{
-    normal_cdf_and_pdf, normal_logcdf, signed_probit_logcdf_and_mills_ratio,
+    normal_cdf, normal_cdf_and_pdf, normal_logcdf, normal_pdf,
+    signed_probit_logcdf_and_mills_ratio,
 };
 use smallvec::SmallVec;
 
@@ -655,26 +656,48 @@ pub(crate) struct LogTailResidual {
 }
 
 /// A calibration `P(a) = E[Φ(η(a, Z))]` at one intercept, read on its smaller
-/// tail (gam#3216, gam#3333).
+/// tail (gam#3216, gam#3333) and held in log form (gam#3639).
 ///
-/// `tail` is `T = E[Φ(∓η)]` summed from positive terms: `1 − P` on the
-/// survival side (`q ≥ 0`), `P` on the complement side. It is never formed as
-/// `1 − P`, so it keeps its relative accuracy where `P` rounds to one. The
-/// slopes stay in probability space, `P′ = E[φ(η)·η_a]` and, where evaluated,
-/// `P″`; the implicit derivatives `a_u = −P_u/P′` read `density` directly.
+/// `T = E[Φ(∓η)]` is `1 − P` on the survival side (`q ≥ 0`) and `P` on the
+/// complement side, summed from positive terms and never formed as `1 − P`.
+/// It is kept as `log T`, and the slopes as ratios to it: `P′/T` and, where
+/// evaluated, `P″/T`. Every consumer reads a ratio — the log residual's
+/// `F′ = ∓P′/T`, and the implicit derivatives `a_u = −P_u/P′` in whatever unit
+/// the calibration is divided by ([`Self::density_in_unit`]) — so nothing
+/// needs `T` or `P′` themselves, which both underflow past `|q| ≈ 37.5` while
+/// their ratio stays of order `|q|`.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct CalibrationTail {
-    pub(crate) tail: f64,
-    pub(crate) density: f64,
-    pub(crate) density_slope: Option<f64>,
-    /// The terms summed into `tail`, for its rounding.
+    pub(crate) log_tail: f64,
+    pub(crate) density_ratio: f64,
+    pub(crate) density_slope_ratio: Option<f64>,
+    /// The terms summed into `T`, for its rounding.
     pub(crate) summands: usize,
 }
 
 impl CalibrationTail {
+    /// The log form of a tail summed in linear space: `log T`, `P′/T` and
+    /// `P″/T`, each one rounded operation on the sums. Every route whose tail
+    /// is summed linearly — the standard-normal cells, and a finite law above
+    /// [`LINEAR_RESIDUAL_FLOOR`] — reads it through here, so its log residual
+    /// is bitwise the one the linear sums gave before the log form.
+    pub(crate) fn from_linear(
+        tail: f64,
+        density: f64,
+        density_slope: Option<f64>,
+        summands: usize,
+    ) -> Self {
+        Self {
+            log_tail: tail.ln(),
+            density_ratio: density / tail,
+            density_slope_ratio: density_slope.map(|slope| slope / tail),
+            summands,
+        }
+    }
+
     /// The residual `log T − log Φ(∓q)` with its slopes: `T′ = ∓P′`,
     /// `F′ = T′/T`, and `F″ = T″/T − F′²` where `P″` was evaluated, else zero
-    /// so the solve takes Newton's step. A tail that has underflowed, or a
+    /// so the solve takes Newton's step. A tail with no logarithm, or a
     /// calibration that no longer moves with `a`, has no root to resolve and
     /// is refused.
     pub(crate) fn log_residual(
@@ -682,28 +705,241 @@ impl CalibrationTail {
         survival_side: bool,
         log_target: f64,
     ) -> Result<LogTailResidual, String> {
-        if !(self.tail.is_finite() && self.tail > 0.0 && self.density.is_finite() && self.density > 0.0)
+        if !(self.log_tail.is_finite()
+            && self.density_ratio.is_finite()
+            && self.density_ratio > 0.0)
         {
             return Err(format!(
-                "calibration tail has no resolvable log residual: tail={:e}, density={:e}",
-                self.tail, self.density
+                "calibration tail has no resolvable log residual: log T={:e}, P'/T={:e}",
+                self.log_tail, self.density_ratio
             ));
         }
         let sign = if survival_side { -1.0 } else { 1.0 };
-        let first = sign * self.density / self.tail;
-        let second = match self.density_slope {
-            Some(slope) if slope.is_finite() => sign * slope / self.tail - first * first,
+        let first = sign * self.density_ratio;
+        let second = match self.density_slope_ratio {
+            Some(slope) if slope.is_finite() => sign * slope - first * first,
             Some(slope) => {
-                return Err(format!("calibration tail has a non-finite P''={slope:e}"));
+                return Err(format!("calibration tail has a non-finite P''/T={slope:e}"));
             }
             None => 0.0,
         };
         Ok(LogTailResidual {
-            value: self.tail.ln() - log_target,
+            value: self.log_tail - log_target,
             first,
             second,
             rounding: anchor_residual_rounding(log_target, self.summands),
         })
+    }
+
+    /// `P′/U` for a calibration divided by the unit `U = exp(log_unit)`:
+    /// `(P′/T)·exp(log T − log U)`, finite wherever `T` and `U` are within
+    /// the exponential's range of each other. At a root on the unit
+    /// [`CalibrationUnit`] fixes, `T = U` up to the root's residual, so the
+    /// exponent is that residual and the result is `P′/T` to within it; its
+    /// only rounding beyond the ratio's own is the exponential's argument,
+    /// `ε·(|log T| + |log U|)` absolute.
+    #[inline]
+    pub(crate) fn density_in_unit(&self, log_unit: f64) -> f64 {
+        self.density_ratio * (self.log_tail - log_unit).exp()
+    }
+}
+
+/// The running sums of a finite-law calibration tail
+/// `T = Σ_k w_k Φ(∓η_k)`, `P′ = Σ w φ(η)·η_a`, `P″ = Σ w φ(η)·(η_aa − η·η_a²)`
+/// (gam#3639), in linear space or by streaming log-sum-exp.
+///
+/// The linear pass is bitwise the sums every finite-law route formed before
+/// the log form. The log pass holds each term as
+/// `t_k = log w_k + log Φ(∓η_k)` against the running maximum `m`, adding
+/// `e_k = exp(t_k − m)` to the tail and `e_k·ρ_k·η_a` and
+/// `e_k·ρ_k·(η_aa − η·η_a²)` to the slopes, with `ρ_k = φ(η_k)/Φ(∓η_k)` the
+/// Mills ratio from the same `erfcx` evaluation as `log Φ`; a new maximum
+/// rescales all three sums by `exp(m_old − m_new) ≤ 1`. Then
+/// `log T = m + log Σ e`, `P′/T = Σ e·ρ·η_a / Σ e` and likewise `P″/T`, so no
+/// quantity ever leaves the range of its ratio to `T`. Nothing is stored per
+/// node, so a pass allocates nothing.
+pub(crate) struct CalibrationTailSum {
+    survival_side: bool,
+    log_space: bool,
+    log_max: f64,
+    tail: f64,
+    density: f64,
+    density_slope: f64,
+}
+
+impl CalibrationTailSum {
+    fn new(survival_side: bool, log_space: bool) -> Self {
+        Self {
+            survival_side,
+            log_space,
+            log_max: f64::NEG_INFINITY,
+            tail: 0.0,
+            density: 0.0,
+            density_slope: 0.0,
+        }
+    }
+
+    /// Add node `k`: weight `w_k`, index `η_k` and its first two intercept
+    /// derivatives.
+    #[inline]
+    pub(crate) fn push(&mut self, weight: f64, eta: f64, eta_a: f64, eta_aa: f64) {
+        let tail_arg = if self.survival_side { -eta } else { eta };
+        let curvature = eta_aa - eta * eta_a * eta_a;
+        if !self.log_space {
+            let pdf = normal_pdf(eta);
+            self.tail += weight * normal_cdf(tail_arg);
+            self.density += weight * pdf * eta_a;
+            self.density_slope += weight * pdf * curvature;
+            return;
+        }
+        let (log_cdf, mills) = signed_probit_logcdf_and_mills_ratio(tail_arg);
+        let term = weight.ln() + log_cdf;
+        if term == f64::NEG_INFINITY {
+            // A zero weight or a tail that is exactly zero contributes nothing.
+            return;
+        }
+        if term > self.log_max {
+            let rescale = (self.log_max - term).exp();
+            self.tail *= rescale;
+            self.density *= rescale;
+            self.density_slope *= rescale;
+            self.log_max = term;
+        }
+        let scaled = (term - self.log_max).exp();
+        let scaled_density = scaled * mills;
+        self.tail += scaled;
+        self.density += scaled_density * eta_a;
+        self.density_slope += scaled_density * curvature;
+    }
+
+    fn finish(self, summands: usize) -> CalibrationTail {
+        if !self.log_space {
+            return CalibrationTail::from_linear(
+                self.tail,
+                self.density,
+                Some(self.density_slope),
+                summands,
+            );
+        }
+        CalibrationTail {
+            log_tail: self.log_max + self.tail.ln(),
+            density_ratio: self.density / self.tail,
+            density_slope_ratio: Some(self.density_slope / self.tail),
+            summands,
+        }
+    }
+}
+
+/// A finite-law calibration tail on `survival_side` from `visit`, which pushes
+/// every node of the law once into the sum it is handed (gam#3639).
+///
+/// The tail is summed in linear space; where it falls below
+/// [`LINEAR_RESIDUAL_FLOOR`] or leaves the finite range, `visit` runs once more
+/// into a log-space sum — the same rule and floor the declared-law anchor uses
+/// ([`anchor_log_residual`]), so the two forms agree to rounding wherever both
+/// are finite and the log form alone serves the deep tail. A `visit` that
+/// records per-node values must start its record afresh on each call.
+pub(crate) fn sum_calibration_tail<E>(
+    survival_side: bool,
+    summands: usize,
+    mut visit: impl FnMut(&mut CalibrationTailSum) -> Result<(), E>,
+) -> Result<CalibrationTail, E> {
+    let mut linear = CalibrationTailSum::new(survival_side, false);
+    visit(&mut linear)?;
+    if linear.tail.is_finite() && linear.tail >= LINEAR_RESIDUAL_FLOOR {
+        return Ok(linear.finish(summands));
+    }
+    let mut log_space = CalibrationTailSum::new(survival_side, true);
+    visit(&mut log_space)?;
+    Ok(log_space.finish(summands))
+}
+
+/// The unit a probit calibration constraint `Σ_k w_k Φ(η_k) − Φ(q)` is
+/// written in (gam#3639): the smaller marginal tail `N = Φ(−|q|)`, fixed at
+/// the row's `q`.
+///
+/// Divided by `N`, the constraint on the survival side (`q ≥ 0`) is
+/// `1 − Σ_k w_k Φ(−η_k)/N` (using `Σ w = 1`), node value `−Φ(−η)/N` and
+/// marginal value `−1`; on the complement side it is `Σ_k w_k Φ(η_k)/N − 1`.
+/// Both are the original constraint times the constant `1/N`, so the root and
+/// every implicit derivative `a_u = −F_u/F_a`, which is homogeneous of degree
+/// zero in `F`, are unchanged; only the representation moves, from
+/// probabilities and densities that underflow together past `|q| ≈ 37.5` to
+/// ratios of order `|q|`. The derivative channels are
+/// `φ(η)/N · (1, −η, η² − 1, −(η³ − 3η))`, with
+///
+/// ```text
+///     φ(η)/N = ρ_q · exp(½(q − η)(q + η)),     ρ_q = φ(q)/N,
+/// ```
+///
+/// the Mills ratio at `q` from the same evaluation as `log N`. Its relative
+/// rounding is `ε·(1 + |q² − η²|/2)` beyond `ρ_q`'s own, so it is exact at the
+/// marginal (`η = q` gives `ρ_q` itself) and nowhere pays `ε·η²/2` the way
+/// `exp(log φ(η) − log N)` would. At a root, each node's weighted unit
+/// density obeys `w_k φ(η_k)/N = ρ(∓η_k)·w_k Φ(∓η_k)/N ≤ ρ(∓η_k)` (each
+/// term of `T = N` is at most `N`), so it stays of order `|η_k| + 1`. The
+/// node value `Φ(∓η)/N` is `exp(log Φ(∓η) − log N)`, rounding
+/// `ε·(|log Φ(∓η)| + |log N|)` absolute in its exponent; at `|q| = 39` that
+/// is `≈ 3.4e-13` relative, below the root's own residual resolution there
+/// (`≈ 1.4e-12`, [`anchor_residual_rounding`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CalibrationUnit {
+    q: f64,
+    survival_side: bool,
+    log_unit: f64,
+    mills: f64,
+}
+
+impl CalibrationUnit {
+    pub(crate) fn new(q: f64) -> Self {
+        // `Φ(−|q|)`: bitwise `smaller_tail_log_target(q)`, which is the log
+        // target every tail residual on this row is solved against.
+        let (log_unit, mills) = signed_probit_logcdf_and_mills_ratio(-q.abs());
+        Self {
+            q,
+            survival_side: q >= 0.0,
+            log_unit,
+            mills,
+        }
+    }
+
+    /// `log N`.
+    #[inline]
+    pub(crate) fn log_unit(&self) -> f64 {
+        self.log_unit
+    }
+
+    /// `φ(η)/N`.
+    #[inline]
+    pub(crate) fn density(&self, eta: f64) -> f64 {
+        self.mills * (0.5 * (self.q - eta) * (self.q + eta)).exp()
+    }
+
+    /// The unary Taylor stack of one node's term of the unit constraint:
+    /// `(∓Φ(∓η)/N, φ(η)/N·(1, −η, η² − 1, −(η³ − 3η)))`.
+    #[inline]
+    pub(crate) fn cdf_stack(&self, eta: f64) -> [f64; 5] {
+        let value = if self.survival_side {
+            -(normal_logcdf(-eta) - self.log_unit).exp()
+        } else {
+            (normal_logcdf(eta) - self.log_unit).exp()
+        };
+        let density = self.density(eta);
+        let eta2 = eta * eta;
+        [
+            value,
+            density,
+            -eta * density,
+            (eta2 - 1.0) * density,
+            -(eta2 - 3.0) * eta * density,
+        ]
+    }
+
+    /// The marginal's stack, `cdf_stack(q)`: value exactly `∓1` and first
+    /// derivative exactly `ρ_q`.
+    #[inline]
+    pub(crate) fn marginal_stack(&self) -> [f64; 5] {
+        self.cdf_stack(self.q)
     }
 }
 

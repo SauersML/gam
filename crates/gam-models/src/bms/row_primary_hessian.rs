@@ -14,7 +14,9 @@ use super::gradient_paths::*;
 use super::hessian_paths::*;
 use super::row_kernel::*;
 use super::*;
-use crate::latent_anchor::{anchor_residual_resolution, smaller_tail_log_target, solve_log_tail_root};
+use crate::latent_anchor::{
+    CalibrationUnit, anchor_residual_resolution, smaller_tail_log_target, solve_log_tail_root,
+};
 use gam_math::probability::normal_logcdf_derivatives;
 
 #[inline]
@@ -293,7 +295,11 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// The row's calibrated intercept `a(β)`, the root of `P(a) = Φ(q)` with
-    /// `P(a) = E[Φ(η(a, Z))]` over the row's latent law, and `P′(a)` there.
+    /// `P(a) = E[Φ(η(a, Z))]` over the row's latent law, and `P′(a)` there in
+    /// the row's calibration unit: `P′/N` with `N = Φ(−|q|)` on a finite-law
+    /// row, whose program writes its constraint in that unit
+    /// ([`CalibrationUnit`], gam#3639), and `P′` itself on the
+    /// standard-normal cells route.
     ///
     /// The root is solved on the smaller marginal tail in log units,
     /// `log E[Φ(∓η)] = log Φ(∓q)` (gam#3216), by the safeguarded solve the
@@ -354,6 +360,7 @@ impl BernoulliMarginalSlopeFamily {
         let grid = self.training_row_grid(row)?;
         let mut seed_residual = None;
         let mut density = f64::NAN;
+        let log_unit = if grid.is_some() { log_target } else { 0.0 };
         let (a, evaluations) = solve_log_tail_root(
             a_init,
             survival_side,
@@ -380,7 +387,7 @@ impl BernoulliMarginalSlopeFamily {
                     residual.value,
                     anchor_residual_resolution(a, residual.first, residual.rounding),
                 ));
-                density = tail.density;
+                density = tail.density_in_unit(log_unit);
                 Ok(residual)
             },
             "bernoulli marginal-slope intercept",
@@ -2813,6 +2820,9 @@ impl BernoulliMarginalSlopeFamily {
         &self,
         program: BmsFlexProgramPoint<'_>,
         empirical_grid: &crate::bms::EmpiricalZGrid,
+        // The unit the program's constraint is written in; every node density
+        // below is `w φ(η)/N` in it (gam#3639).
+        unit: CalibrationUnit,
         need_hessian: bool,
         // Per-row coefficient scratch, owned by the caller and reused across rows
         // (`lower_bms_flex_row_order2_from_parts` sizes these to `r` on its
@@ -2956,7 +2966,7 @@ impl BernoulliMarginalSlopeFamily {
                 let node = empirical_grid.nodes[node_idx];
                 let weight = empirical_grid.weights[node_idx];
                 let eta = eval_coeff4_at(&obs.coeff, node);
-                moments.push(node, weight * normal_pdf(eta), eta, need_hessian);
+                moments.push(node, weight * unit.density(eta), eta, need_hessian);
             }
 
             EmpiricalCubicPrimaryJet2Schedule {
@@ -3031,6 +3041,25 @@ impl BernoulliMarginalSlopeFamily {
         let w_i = self.weights[row];
         let s_y = 2.0 * y_i - 1.0;
         let marginal = self.marginal_link_map(q)?;
+        // `f_a = m_a` is `P′` in the row's calibration unit (gam#3639): `P′/N`
+        // with `N = Φ(−|q|)` on a finite-law row, whose constraint and marginal
+        // stack are written in that unit, and `P′` on the standard-normal
+        // cells route, whose marginal stack is `μ = Φ(q)`'s own.
+        let (unit, marginal_stack) = if empirical_grid.is_some() {
+            let unit = CalibrationUnit::new(marginal.q);
+            (Some(unit), unit.marginal_stack())
+        } else {
+            (
+                None,
+                [
+                    marginal.mu,
+                    marginal.mu1,
+                    marginal.mu2,
+                    marginal.mu3,
+                    marginal.mu4,
+                ],
+            )
+        };
         let inv_ma = 1.0 / f_a;
         let h_range = primary.h.as_ref();
         let w_range = primary.w.as_ref();
@@ -3054,7 +3083,7 @@ impl BernoulliMarginalSlopeFamily {
         let zero_family: &[[f64; 4]] = scratch.zero_family.as_slice();
         let mut f_aa = 0.0f64;
 
-        if let Some(grid) = empirical_grid.as_deref() {
+        if let (Some(grid), Some(unit)) = (empirical_grid.as_deref(), unit) {
             // Pinned order-two lowering of the canonical empirical row
             // algebra. The exact row context already owns the certified
             // scalar root and Jacobian; materializing the full higher-order
@@ -3070,17 +3099,12 @@ impl BernoulliMarginalSlopeFamily {
                 a,
                 inv_ma,
                 scale,
-                [
-                    marginal.mu,
-                    marginal.mu1,
-                    marginal.mu2,
-                    marginal.mu3,
-                    marginal.mu4,
-                ],
+                marginal_stack,
             )?;
             f_aa = self.lower_empirical_bms_calibration_order2(
                 program,
                 grid,
+                unit,
                 need_hessian,
                 coeff_u.as_mut_slice(),
                 coeff_au.as_mut_slice(),
@@ -3353,9 +3377,9 @@ impl BernoulliMarginalSlopeFamily {
             }
         }
 
-        f_u[0] = -marginal.mu1;
+        f_u[0] = -marginal_stack[1];
         if need_hessian {
-            f_uv[[0, 0]] = -marginal.mu2;
+            f_uv[[0, 0]] = -marginal_stack[2];
         }
 
         let z_obs = self.z[row];
