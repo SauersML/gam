@@ -2745,7 +2745,7 @@
     "evidence": "At base b3832b92 each name has exactly one definition (rho_posterior.rs:136 SplitMix64::normal, bms/mod.rs:1938 signed_weighted_gram, bms/mod.rs:2039 weighted_ridge_sandwich_cov, families_bms_identifiability_rigid_tests.rs:7072 the test); at the head git grep -w 'fn <name>' finds none of them in those files, and the other fn normal hits are unrelated local RNGs in other files. cargo check --workspace --tests is clean; first_stage_variance_stage (4), murphy_topel (1), gam-inference lib, rho_domain and perf rho_posterior_tier0 pass on the head."
   },
   {
-    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
+    "base": "c71ab489e70eefb87c90a1fa5826491a8781b986",
     "items": [
       "crates/gam-models/src/multinomial_reml.rs:fn:second_difference_penalty",
       "crates/gam-solve/src/estimate/binomial_reml_outer_cost_1575_tests.rs:fn:second_difference_penalty",
