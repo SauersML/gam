@@ -173,8 +173,9 @@ impl<'a> RemlState<'a> {
             return false;
         }
         // A latched #784 block correction splices `Δ_b` with its exact
-        // gradient but no ρ-Hessian, so the criterion it defines has none.
-        !self.block_correction_latched()
+        // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
+        // this fit, when the criterion it defines has none.
+        self.block_correction_hessian_refusal().is_none()
     }
 
     /// Whether the exact analytic outer Hessian of the Tierney-Kadane
@@ -6416,7 +6417,7 @@ impl<'a> RemlState<'a> {
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
             applied_canonical_penalties: std::sync::OnceLock::new(),
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 
@@ -6576,7 +6577,7 @@ impl<'a> RemlState<'a> {
                 cell
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
-            block_local_correction: std::sync::OnceLock::new(),
+            block_local_correction: Default::default(),
         })
     }
 

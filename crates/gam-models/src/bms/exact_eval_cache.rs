@@ -437,6 +437,9 @@ impl Drop for RowPrimaryEvalPin {
 ///   through device entry points. Widths above the direct dense kernel's
 ///   shared-memory bound materialize through bounded multi-RHS device HVPs;
 ///   device failures propagate instead of changing algorithms.
+/// - `Racing` (Linux/CUDA only): both executors' states for one race of the
+///   row kernel (gam#3024). Every consumer reads the CPU state; the HVP also
+///   applies the device state, timed.
 pub enum RowPrimaryEvalCache {
     Empty,
     Host(RowPrimaryEvalPin),
@@ -452,24 +455,46 @@ pub enum RowPrimaryEvalCache {
     /// device-aware entry points.
     #[cfg(target_os = "linux")]
     Device(crate::bms::gpu::row::DeviceResidentRowHess),
+    #[cfg(target_os = "linux")]
+    Racing(Box<RowPrimaryEvalRace>),
+}
+
+/// One race of the BMS FLEX row-primary Hessian (gam#3024): the state the CPU
+/// executor built (`Host`, `Tiled`, or `Empty` for streaming rows), the device
+/// executor's resident state, and the race that times the inner step on each,
+/// the build and every HVP against it. The executor that step selects is the
+/// CPU's, so every consumer reads `cpu`; the race records when this state is
+/// dropped at the next β.
+#[cfg(target_os = "linux")]
+pub struct RowPrimaryEvalRace {
+    pub(crate) cpu: RowPrimaryEvalCache,
+    pub(crate) device: crate::bms::gpu::row::DeviceResidentRowHess,
+    pub(crate) race: gam_gpu::ReusedStateRace,
 }
 
 impl RowPrimaryEvalCache {
     /// Returns `true` when the cache is materialized (host or device).
     #[inline]
     pub(crate) fn is_some(&self) -> bool {
-        !matches!(self, Self::Empty)
+        match self {
+            Self::Empty => false,
+            #[cfg(target_os = "linux")]
+            Self::Racing(race) => race.cpu.is_some(),
+            _ => true,
+        }
     }
 
     #[inline]
     pub(crate) fn is_tiled(&self) -> bool {
-        matches!(self, Self::Tiled(_))
+        self.tiles().is_some()
     }
 
     #[inline]
     pub(crate) fn tiles(&self) -> Option<&RowPrimaryEvalTiles> {
         match self {
             Self::Tiled(tiles) => Some(tiles),
+            #[cfg(target_os = "linux")]
+            Self::Racing(race) => race.cpu.tiles(),
             _ => None,
         }
     }
@@ -486,16 +511,29 @@ impl RowPrimaryEvalCache {
             Self::Empty => None,
             #[cfg(target_os = "linux")]
             Self::Device(_) => None,
+            #[cfg(target_os = "linux")]
+            Self::Racing(race) => race.cpu.host_pin(),
         }
     }
 
     /// Returns the device-resident Hessian state when the cache lives on the
-    /// GPU. `None` on every other variant (and on non-Linux builds).
+    /// GPU. `None` on every other variant (and on non-Linux builds), a racing
+    /// one included: its selected state is the CPU's.
     #[cfg(target_os = "linux")]
     #[inline]
     pub(crate) fn device(&self) -> Option<&crate::bms::gpu::row::DeviceResidentRowHess> {
         match self {
             Self::Device(hess) => Some(hess),
+            _ => None,
+        }
+    }
+
+    /// The race this cache holds, when the row kernel is racing its executors.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn race(&self) -> Option<&RowPrimaryEvalRace> {
+        match self {
+            Self::Racing(race) => Some(race),
             _ => None,
         }
     }

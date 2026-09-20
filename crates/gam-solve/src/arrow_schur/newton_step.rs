@@ -1,6 +1,6 @@
 //! The inner Gauss-Newton step: the public `solve_arrow_newton_step_*` entry
-//! points, LM/proximal escalation, mixed-precision iterative refinement, and
-//! the Schur reduced-RHS / back-substitution kernels they drive.
+//! points, LM/proximal escalation, and the Schur reduced-RHS /
+//! back-substitution kernels they drive.
 
 use super::*;
 use super::certified_shift::ArrowShiftCertificate;
@@ -376,16 +376,9 @@ pub fn solve_arrow_newton_step_core(
     let resolved = resolve_arrow_route(sys, options);
     let options = resolved.as_ref();
     if let Some(chunk_size) = options.streaming_chunk_size {
-        // #1014: the streaming/residency path is the memory-bound assembly wall,
-        // so its reduced dense Schur solve runs certified mixed precision by
-        // default (κ-gated f32 factor + f64 residual refinement, automatic f64
-        // fallback). The reduced-Schur f64 factor — and therefore every evidence
-        // log-determinant — is unaffected: only the Δβ solve drops to f32. An
-        // explicit caller policy is honored as-is.
-        let streaming_options = options.with_streaming_solve_precision_default();
         let mut streaming = StreamingArrowSchur::from_system(sys, chunk_size);
         return streaming
-            .solve(ridge_t, ridge_beta, &streaming_options)
+            .solve(ridge_t, ridge_beta, options)
             .map(|(delta_t, delta_beta, _)| (delta_t, delta_beta, ArrowPcgDiagnostics::default()));
     }
     // #1017 phase-3 production seam: when a device is present and the dense
@@ -1536,18 +1529,6 @@ pub(crate) fn factor_blocks_for_system<B: BatchedBlockSolver>(
     })
 }
 
-pub(crate) enum MixedPrecisionAttempt {
-    Certified {
-        delta_t: Array1<f64>,
-        delta_beta: Array1<f64>,
-        schur_factor: Array2<f64>,
-        refinement_steps: usize,
-    },
-    Fallback {
-        reason: String,
-    },
-}
-
 /// The eliminated blocks' displacement induced by a border DIRECTION, with no
 /// gradient term: `t(v)_i = -(H_tt^(i))^-1 H_tβ^(i) v`.
 ///
@@ -1687,288 +1668,6 @@ fn back_substitute_rows<B: BatchedBlockSolver + Sync>(
     delta_t
 }
 
-pub(crate) fn try_mixed_precision_arrow_solve(
-    sys: &ArrowSchurSystem,
-    ridge_t: f64,
-    ridge_beta: f64,
-    htt_factors: &ArrowFactorSlab,
-    schur: &Array2<f64>,
-    options: &ArrowSolveOptions,
-) -> Result<Option<MixedPrecisionAttempt>, ArrowSchurError> {
-    let ArrowSolvePrecisionPolicy::CertifiedMixed {
-        max_refinement_steps,
-        residual_relative_tolerance,
-        kappa_unit_roundoff_margin,
-    } = options.solve_precision
-    else {
-        return Ok(None);
-    };
-
-    if options.trust_region.radius.is_finite() {
-        return Ok(Some(MixedPrecisionAttempt::Fallback {
-            reason: "trust-region-truncated dense solves are not certified by the mixed-precision refinement path".to_string(),
-        }));
-    }
-
-    let DenseReducedSchurFactorization {
-        factor: schur_factor,
-        conditioned_schur: floored_schur,
-        beta_conditioning: _,
-    } = factor_dense_reduced_schur(
-        schur,
-        ReducedSchurPolicy::newton(options.newton_schur_tikhonov_rel_floor),
-    )?;
-    if floored_schur.is_some() {
-        return Ok(Some(MixedPrecisionAttempt::Fallback {
-            reason: "reduced Schur required the spectral PD-floor; using the f64 dense solve"
-                .to_string(),
-        }));
-    }
-    let schur_kappa = cholesky_factor_kappa_estimate(&schur_factor);
-    if !schur_kappa.is_finite() || schur_kappa > safe_spd_kappa_max(schur.nrows()) {
-        return Err(ArrowSchurError::SchurFactorFailed {
-            reason: format!(
-                "reduced Schur complement Cholesky succeeded but is ill-conditioned \
-                 (kappa_estimate={schur_kappa:e}); accumulated per-row \
-                 (H_tt)^-1 contamination would yield an inaccurate delta_beta"
-            ),
-        });
-    }
-
-    if let Some(reason) =
-        mixed_precision_kappa_gate_failure(htt_factors, &schur_factor, kappa_unit_roundoff_margin)
-    {
-        return Ok(Some(MixedPrecisionAttempt::Fallback { reason }));
-    }
-
-    let row_factors_f32 = arrow_factor_slab_to_f32(htt_factors);
-    let schur_factor_f32 = schur_factor.mapv(|v| v as f32);
-    let (rhs_t, rhs_beta) = arrow_rhs(sys);
-    let mut x = solve_arrow_system_f32(
-        sys,
-        &row_factors_f32,
-        &schur_factor_f32,
-        rhs_t.view(),
-        rhs_beta.view(),
-    )?;
-    let certificate_tol = residual_relative_tolerance
-        .max(MIXED_PRECISION_CERTIFICATE_EPSILON_MULTIPLIER * f64::EPSILON);
-    for refinement_steps in 0..=max_refinement_steps {
-        let (res_t, res_beta) = arrow_residual(
-            sys,
-            ridge_t,
-            ridge_beta,
-            x.0.view(),
-            x.1.view(),
-            rhs_t.view(),
-            rhs_beta.view(),
-        );
-        let certificate = arrow_backward_error_certificate(
-            sys,
-            ridge_t,
-            ridge_beta,
-            x.0.view(),
-            x.1.view(),
-            rhs_t.view(),
-            rhs_beta.view(),
-            res_t.view(),
-            res_beta.view(),
-        )?;
-        if certificate <= certificate_tol {
-            return Ok(Some(MixedPrecisionAttempt::Certified {
-                delta_t: x.0,
-                delta_beta: x.1,
-                schur_factor,
-                refinement_steps,
-            }));
-        }
-        if refinement_steps == max_refinement_steps {
-            return Ok(Some(MixedPrecisionAttempt::Fallback {
-                reason: format!(
-                    "f64 residual certificate did not converge after {max_refinement_steps} refinement steps \
-                     (backward_error={certificate:e}, tolerance={certificate_tol:e})"
-                ),
-            }));
-        }
-        let correction = solve_arrow_system_f32(
-            sys,
-            &row_factors_f32,
-            &schur_factor_f32,
-            res_t.view(),
-            res_beta.view(),
-        )?;
-        if !correction
-            .0
-            .iter()
-            .chain(correction.1.iter())
-            .all(|v| v.is_finite())
-        {
-            return Ok(Some(MixedPrecisionAttempt::Fallback {
-                reason: "f32 refinement correction produced a non-finite value".to_string(),
-            }));
-        }
-        for i in 0..x.0.len() {
-            x.0[i] += correction.0[i];
-        }
-        for i in 0..x.1.len() {
-            x.1[i] += correction.1[i];
-        }
-    }
-
-    Ok(Some(MixedPrecisionAttempt::Fallback {
-        reason: "mixed refinement loop exhausted without certification".to_string(),
-    }))
-}
-
-pub(crate) fn mixed_precision_kappa_gate_failure(
-    htt_factors: &ArrowFactorSlab,
-    schur_factor: &Array2<f64>,
-    margin: f64,
-) -> Option<String> {
-    let mut max_kappa = cholesky_factor_kappa_estimate(schur_factor);
-    let mut min_pivot = lower_cholesky_min_pivot(schur_factor.view());
-    let mut max_pivot = lower_cholesky_max_pivot(schur_factor.view());
-    for factor in htt_factors.iter() {
-        let owned = factor.to_owned();
-        max_kappa = max_kappa.max(cholesky_factor_kappa_estimate(&owned));
-        if let Some(pivot) = lower_cholesky_min_pivot(owned.view()) {
-            min_pivot = Some(match min_pivot {
-                Some(current) => current.min(pivot),
-                None => pivot,
-            });
-        }
-        if let Some(pivot) = lower_cholesky_max_pivot(owned.view()) {
-            max_pivot = Some(match max_pivot {
-                Some(current) => current.max(pivot),
-                None => pivot,
-            });
-        }
-    }
-    if let (Some(min_pivot), Some(max_pivot)) = (min_pivot, max_pivot) {
-        if min_pivot > 0.0 && max_pivot.is_finite() {
-            max_kappa = max_kappa.max(max_pivot / min_pivot);
-        } else {
-            max_kappa = f64::INFINITY;
-        }
-    }
-    let kappa_u = max_kappa * F32_UNIT_ROUNDOFF;
-    let threshold = margin
-        .min(MIXED_PRECISION_KAPPA_MARGIN_CEILING)
-        .max(F32_UNIT_ROUNDOFF);
-    if !(max_kappa.is_finite() && kappa_u < threshold) {
-        Some(format!(
-            "kappa gate refused f32 refinement: kappa_estimate={max_kappa:e}, \
-             kappa*u_f32={kappa_u:e}, required < {threshold:e}"
-        ))
-    } else {
-        None
-    }
-}
-
-pub(crate) fn arrow_factor_slab_to_f32(htt_factors: &ArrowFactorSlab) -> Vec<Array2<f32>> {
-    htt_factors
-        .iter()
-        .map(|factor| factor.mapv(|v| v as f32))
-        .collect()
-}
-
-pub(crate) fn arrow_rhs(sys: &ArrowSchurSystem) -> (Array1<f64>, Array1<f64>) {
-    let n = sys.rows.len();
-    let mut rhs_t = Array1::<f64>::zeros(sys.row_offsets[n]);
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let base = sys.row_offsets[i];
-        for c in 0..di {
-            rhs_t[base + c] = -sys.rows[i].gt[c];
-        }
-    }
-    let mut rhs_beta = Array1::<f64>::zeros(sys.k);
-    for c in 0..sys.k {
-        rhs_beta[c] = -sys.gb[c];
-    }
-    (rhs_t, rhs_beta)
-}
-
-pub(crate) fn solve_arrow_system_f32(
-    sys: &ArrowSchurSystem,
-    row_factors: &[Array2<f32>],
-    schur_factor: &Array2<f32>,
-    rhs_t: ArrayView1<'_, f64>,
-    rhs_beta: ArrayView1<'_, f64>,
-) -> Result<(Array1<f64>, Array1<f64>), ArrowSchurError> {
-    let n = sys.rows.len();
-    let mut y_rows = Vec::<Array1<f32>>::with_capacity(n);
-    let mut reduced_beta = rhs_beta.mapv(|v| v as f32);
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let base = sys.row_offsets[i];
-        let rhs_i = rhs_t.slice(ndarray::s![base..base + di]).mapv(|v| v as f32);
-        let y_i = cholesky_solve_lower_f32(&row_factors[i], &rhs_i);
-        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?.mapv(|v| v as f32);
-        for beta_col in 0..sys.k {
-            let mut acc = 0.0_f32;
-            for row_axis in 0..di {
-                acc += htbeta[[row_axis, beta_col]] * y_i[row_axis];
-            }
-            reduced_beta[beta_col] -= acc;
-        }
-        y_rows.push(y_i);
-    }
-
-    let x_beta_f32 = cholesky_solve_lower_f32(schur_factor, &reduced_beta);
-    let mut x_t = Array1::<f64>::zeros(sys.row_offsets[n]);
-    for i in 0..n {
-        let di = sys.row_dims[i];
-        let base = sys.row_offsets[i];
-        let htbeta = sys_htbeta_materialize_row(sys, i, &sys.rows[i])?.mapv(|v| v as f32);
-        let mut cross = Array1::<f32>::zeros(di);
-        for row_axis in 0..di {
-            let mut acc = 0.0_f32;
-            for beta_col in 0..sys.k {
-                acc += htbeta[[row_axis, beta_col]] * x_beta_f32[beta_col];
-            }
-            cross[row_axis] = acc;
-        }
-        let correction = cholesky_solve_lower_f32(&row_factors[i], &cross);
-        for row_axis in 0..di {
-            x_t[base + row_axis] = (y_rows[i][row_axis] - correction[row_axis]) as f64;
-        }
-    }
-    let x_beta = x_beta_f32.mapv(|v| v as f64);
-    Ok((x_t, x_beta))
-}
-
-pub(crate) fn cholesky_solve_lower_f32(l: &Array2<f32>, b: &Array1<f32>) -> Array1<f32> {
-    let n = l.nrows();
-    // Precondition: positive, finite factor diagonals (see
-    // `cholesky_solve_vector_fixed`). The certified mixed-precision streaming
-    // path refines in f64 and falls back when this f32 solve is not usable, but
-    // guard the precondition loudly — always, release included — so a future
-    // factor source that skips that refinement cannot divide by a
-    // zero/non-finite pivot silently.
-    assert!(
-        (0..n).all(|i| l[[i, i]].is_finite() && l[[i, i]].abs() >= f32::MIN_POSITIVE),
-        "cholesky_solve_lower_f32: factor diagonal must be finite and non-subnormal"
-    );
-    let mut y = Array1::<f32>::zeros(n);
-    for i in 0..n {
-        let mut sum = b[i];
-        for j in 0..i {
-            sum -= l[[i, j]] * y[j];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f32>::zeros(n);
-    for i in (0..n).rev() {
-        let mut sum = y[i];
-        for j in (i + 1)..n {
-            sum -= l[[j, i]] * x[j];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    x
-}
-
 pub(crate) fn arrow_residual(
     sys: &ArrowSchurSystem,
     ridge_t: f64,
@@ -1996,8 +1695,7 @@ pub(crate) fn arrow_residual(
 /// beta equation. Consequently the raw beta residual may retain only a
 /// declared gauge-orbit component; the identifiable residual is `P r_beta`.
 /// Project that component away, then use the same
-/// [`arrow_backward_error_certificate`] normalization as the host-side
-/// refinement certificate. This value is surfaced through
+/// [`arrow_backward_error_certificate`] normalization. This value is surfaced through
 /// [`ArrowPcgDiagnostics::final_relative_residual`] even though Direct executes
 /// no CG iterations.
 pub(crate) fn arrow_quotient_backward_error_certificate(
@@ -2305,8 +2003,7 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
     // this β-only Steihaug problem is Euclidean.
 
     // 3. Solve reduced shared system using the selected BA mode.
-    let mut mixed_precision_status = MixedPrecisionStatus::Off;
-    let (delta_beta, schur_factor, mut pcg_diagnostics, step_schur) = match options.mode {
+    let (delta_beta, schur_factor, pcg_diagnostics, step_schur) = match options.mode {
         ArrowSolverMode::Direct => {
             // #2660 — Direct has one numerical owner. A Priced request selects it
             // where the dense route costs less than one reduced-Schur product, or to
@@ -2332,43 +2029,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             } else {
                 schur
             };
-            if !beta_gauge_active
-                && let Some(attempt) = try_mixed_precision_arrow_solve(
-                    sys,
-                    ridge_t,
-                    ridge_beta,
-                    &htt_factors,
-                    &schur,
-                    options,
-                )?
-            {
-                match attempt {
-                    MixedPrecisionAttempt::Certified {
-                        delta_t,
-                        delta_beta,
-                        schur_factor,
-                        refinement_steps,
-                    } => {
-                        let mut pcg_diagnostics = ArrowPcgDiagnostics::default();
-                        pcg_diagnostics.mixed_precision_status =
-                            MixedPrecisionStatus::Certified { refinement_steps };
-                        return Ok(ArrowNewtonStepArtifacts {
-                            delta_t,
-                            delta_beta,
-                            htt_factors,
-                            schur_factor: Some(schur_factor),
-                            schur_log_det_override: None,
-                            pcg_diagnostics,
-                            step_schur: Some(schur),
-                            step_ridge_escalated_rows,
-                        });
-                    }
-                    MixedPrecisionAttempt::Fallback { reason } => {
-                        log::debug!("arrow-Schur mixed precision fallback to f64: {reason}");
-                        mixed_precision_status = MixedPrecisionStatus::F64Fallback;
-                    }
-                }
-            }
             let (db, sf, diag) = solve_dense_reduced_system(
                 &schur,
                 &rhs_beta_evidence,
@@ -2389,43 +2049,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             } else {
                 schur
             };
-            if !beta_gauge_active
-                && let Some(attempt) = try_mixed_precision_arrow_solve(
-                    sys,
-                    ridge_t,
-                    ridge_beta,
-                    &htt_factors,
-                    &schur,
-                    options,
-                )?
-            {
-                match attempt {
-                    MixedPrecisionAttempt::Certified {
-                        delta_t,
-                        delta_beta,
-                        schur_factor,
-                        refinement_steps,
-                    } => {
-                        let mut pcg_diagnostics = ArrowPcgDiagnostics::default();
-                        pcg_diagnostics.mixed_precision_status =
-                            MixedPrecisionStatus::Certified { refinement_steps };
-                        return Ok(ArrowNewtonStepArtifacts {
-                            delta_t,
-                            delta_beta,
-                            htt_factors,
-                            schur_factor: Some(schur_factor),
-                            schur_log_det_override: None,
-                            pcg_diagnostics,
-                            step_schur: None,
-                            step_ridge_escalated_rows,
-                        });
-                    }
-                    MixedPrecisionAttempt::Fallback { reason } => {
-                        log::debug!("arrow-Schur mixed precision fallback to f64: {reason}");
-                        mixed_precision_status = MixedPrecisionStatus::F64Fallback;
-                    }
-                }
-            }
             let (db, sf, diag) = solve_dense_reduced_system(
                 &schur,
                 &rhs_beta_evidence,
@@ -2451,12 +2074,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             // `steihaug_pcg_auto` lane projects today; the device
             // `solve_sae_matrix_free_pcg` kernel does NOT yet apply the pin, so a
             // set quotient forces the CPU path (gated below).
-            if options.solve_precision.is_enabled() {
-                log::debug!(
-                    "arrow-Schur mixed precision fallback to f64: InexactPCG does not expose a dense Schur factor for certified f32 refinement"
-                );
-                mixed_precision_status = MixedPrecisionStatus::F64Fallback;
-            }
             // Auto-select preconditioner level: starts with JacobiPreconditioner
             // (Diagonal / BetaBlockJacobi) and escalates to ClusterJacobi or
             // AdditiveSchwarz when K > 100 and PCG spends its product budget.
@@ -2659,9 +2276,6 @@ pub(crate) fn solve_arrow_newton_step_artifacts(
             (delta, None, diag, None)
         }
     };
-    if mixed_precision_status != MixedPrecisionStatus::Off {
-        pcg_diagnostics.mixed_precision_status = mixed_precision_status;
-    }
 
     // 4. Back-substitute Δt_i = -(H_tt^(i))⁻¹ (g_t^(i) + H_tβ^(i) Δβ).
     let delta_beta = if beta_gauge_active {

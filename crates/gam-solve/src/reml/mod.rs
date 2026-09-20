@@ -4919,34 +4919,86 @@ pub(crate) struct EvalShared {
     /// `get_or_init`+`into_par_iter` deadlock trap does not apply).
     pub(crate) penalty_scores_at_mode: std::sync::OnceLock<Arc<Vec<Array1<f64>>>>,
     /// Per-evaluation-point cache of the #784 block-local Laplace-to-sampling
-    /// correction `TkCorrectionTerms { value, gradient }`. The correction is a
-    /// deterministic function of ONLY this bundle's converged inner state
-    /// (`pirls_result`, `h_total`), the `RemlState`'s fixed
-    /// `canonical_penalties`, and the bundle's ρ — never of the eval `mode`:
-    /// the diagnostic eigendecomposition, the fixed-seed importance sampler,
-    /// and the (b)–(d) gradient channels all read mode-invariant fields, and
-    /// the term carries no Hessian, so the value+gradient are identical for the
-    /// value-only, value+gradient, and value+gradient+Hessian assemble calls
-    /// that share this bundle at a single ρ. The expensive path (eigendecomp +
-    /// O(draws·n·m) sampler) previously reran on every one of those 2–3 calls
-    /// per outer iteration; hoisting it onto the bundle computes it exactly
-    /// once per inner solution (exact hoist, identical values — #784, #1082).
-    /// Keyed only on the external-coordinate count `n_ext`: with no ψ
-    /// coordinates (`n_ext == 0`) the correction engages; with ψ present the
-    /// seam declines (returns the cheap zero), and n_ext is fixed for a fit, so
-    /// a single cell suffices.
-    /// The third slot carries the #2623 ρ-block audit record for the SAME
-    /// computation, so a later assemble call at this ρ that reads the cache can
-    /// re-publish it. Without that, the audit window — which is cleared at the
-    /// start of every assemble call — would report the second and third calls at
-    /// an engaged ρ as DECLINED, and an FD row asserting engagement would fail
-    /// on a fit where the splice ran. `None` when the splice declined or when
-    /// the audit was disarmed (the production case, which allocates nothing).
-    pub(crate) block_local_correction: std::sync::OnceLock<(
-        usize,
-        Arc<outer_eval::TkCorrectionTerms>,
-        Option<crate::estimate::outer_eval_capture::QuadratureMarginalAudit>,
-    )>,
+    /// correction. The correction is a deterministic function of ONLY this
+    /// bundle's converged inner state (`pirls_result`, `h_total`), the
+    /// `RemlState`'s fixed `canonical_penalties`, and the bundle's ρ, so its
+    /// value and gradient are identical for the value-only, value+gradient,
+    /// and value+gradient+Hessian assemble calls that share this bundle at a
+    /// single ρ, and are computed once per inner solution (exact hoist — #784,
+    /// #1082). Its ρ-Hessian is a second pass over the quadrature nodes, paid
+    /// only by an evaluation that asks for the Hessian; an entry computed
+    /// without it serves every call that does not.
+    pub(crate) block_local_correction: BlockLocalCorrectionCell,
+}
+
+/// The [`EvalShared::block_local_correction`] slot. Unlike the bundle's
+/// `OnceLock` caches it can be upgraded once, from an entry computed without
+/// the ρ-Hessian to one with it; a clone copies the entry, as a cloned
+/// `OnceLock` does.
+#[derive(Default)]
+pub(crate) struct BlockLocalCorrectionCell(std::sync::Mutex<Option<BlockLocalCorrectionCache>>);
+
+impl BlockLocalCorrectionCell {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<BlockLocalCorrectionCache>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The cached entry for `n_ext`, when it serves an evaluation that does or
+    /// does not (`want_hessian`) ask for the ρ-Hessian.
+    pub(crate) fn get(
+        &self,
+        n_ext: usize,
+        want_hessian: bool,
+    ) -> Option<BlockLocalCorrectionCache> {
+        self.slot()
+            .as_ref()
+            .filter(|entry| entry.n_ext == n_ext && (entry.carries_hessian || !want_hessian))
+            .cloned()
+    }
+
+    /// Store `entry` unless the slot already holds one that serves at least
+    /// as much. Racing writers built from identical inputs, so either is
+    /// correct.
+    pub(crate) fn store(&self, entry: BlockLocalCorrectionCache) {
+        let mut slot = self.slot();
+        let keep = slot.as_ref().is_some_and(|held| {
+            held.n_ext == entry.n_ext && (held.carries_hessian || !entry.carries_hessian)
+        });
+        if !keep {
+            *slot = Some(entry);
+        }
+    }
+}
+
+impl Clone for BlockLocalCorrectionCell {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(self.slot().clone()))
+    }
+}
+
+/// One bundle's #784 block-local correction, as
+/// [`EvalShared::block_local_correction`] holds it.
+#[derive(Clone)]
+pub(crate) struct BlockLocalCorrectionCache {
+    /// The external-coordinate count the terms were laid out for. With ψ
+    /// coordinates present the seam declines (the cheap zero), and `n_ext` is
+    /// fixed for a fit, so one entry suffices.
+    pub(crate) n_ext: usize,
+    pub(crate) terms: Arc<outer_eval::TkCorrectionTerms>,
+    /// Whether `terms` was computed for an evaluation that asked for the
+    /// ρ-Hessian. Its `hessian` is then the correction's exact ρ-Hessian, or
+    /// `None` because the correction declined or has none on this fit.
+    pub(crate) carries_hessian: bool,
+    /// The #2623 ρ-block audit record for the SAME computation, so a later
+    /// assemble call at this ρ that reads the cache can re-publish it. Without
+    /// that, the audit window — which is cleared at the start of every
+    /// assemble call — would report the second and third calls at an engaged ρ
+    /// as DECLINED, and an FD row asserting engagement would fail on a fit
+    /// where the splice ran. `None` when the splice declined or when the audit
+    /// was disarmed (the production case, which allocates nothing).
+    pub(crate) audit: Option<crate::estimate::outer_eval_capture::QuadratureMarginalAudit>,
 }
 
 /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, for an inner
@@ -5668,12 +5720,15 @@ pub(crate) enum BlockCorrectionDecision {
 /// rule over the whole block. Beside them sit the paired-rule errors measured
 /// at that admission: the certificate every later evaluation at those orders
 /// carries, since the paired error no longer switches anything once the
-/// orders are latched (#2748).
+/// orders are latched (#2748). `hessian_refusal` is the mathematical reason
+/// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
+/// correction carries its exact ρ-Hessian into the criterion.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
+    pub(crate) hessian_refusal: Option<String>,
 }
 
 pub(crate) struct RemlState<'a> {
