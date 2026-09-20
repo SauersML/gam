@@ -2171,100 +2171,146 @@ mod tests {
         assert!(compared > 0, "no grid was compared");
     }
 
-    /// PROBE: slow-atom node-0 smoothed moments against a dense reference.
+    /// A slow atom's first smoothed marginal is resolved at the forward
+    /// filter's own accuracy (#3013). The fixture is the issue's: 41 evenly
+    /// spaced recurrent events on [0, 6], η = 0.53, loading 0.845, rate
+    /// 2.6e-3. Node 0's filtered density there is essentially the N(0, 1)
+    /// prior, while its smoothed marginal has seen every event and sits near
+    /// z ≈ 1.95 with σ ≈ 0.21, two filtered σ off centre and five times
+    /// narrower. The reference is a dense forward-backward pass on a uniform
+    /// grid; the trapezoid rule is spectrally accurate for these analytic
+    /// integrands, and the reference's own error is measured by doubling
+    /// its spacing.
+    ///
+    /// The bar is derived, not chosen. The smoothed marginal at node 0 is
+    /// built from the forward filter, whose own error at order G is visible
+    /// at the last node, where smoothed and filtered coincide. So at every
+    /// order node 0's smoothed mean and standard deviation must be within the
+    /// larger of that last-node error and the reference's own error. On the
+    /// filtered grid (the smoother before this issue) node 0 misses by
+    /// orders of magnitude more than the filter's error.
     #[test]
-    fn slow_atom_first_node_smoothed_moments_match_a_dense_forward_backward_3013() {
+    fn slow_atom_first_smoothed_marginal_is_resolved_at_the_filter_accuracy_3013() {
         use ndarray::Array2;
         let n_nodes = 41;
+        let spacing = 0.15;
         let rate = 2.6e-3;
         let loading = 0.845;
         let eta0_value = 0.53;
-        let spacing = 0.15;
         let times: Vec<f64> = (0..n_nodes).map(|n| n as f64 * spacing).collect();
-        let counts = |_n: usize| 1.0;
         let nodes = SubjectNodes {
             first_row: 0,
             times: times.clone(),
             gaps: times.windows(2).map(|w| w[1] - w[0]).collect(),
             weights: vec![spacing; n_nodes],
             exposures: Array2::from_elem((n_nodes, 1), spacing),
-            counts: Array2::from_shape_fn((n_nodes, 1), |(n, _)| counts(n)),
+            counts: Array2::from_elem((n_nodes, 1), 1.0),
             covariate_rows: vec![0; n_nodes],
         };
         let eta0 = vec![eta0_value; n_nodes];
         let loadings = [loading];
         let rates = [rate];
-        // Dense reference on a uniform grid.
-        let h = 0.002;
-        let half = 4000_i64;
-        let zs: Vec<f64> = (-half..=half).map(|i| i as f64 * h).collect();
-        let log_lik = |n: usize, z: f64| -> f64 {
-            let eta = log_intensity(&eta0_value, &loadings, &[z], None);
-            counts(n) * eta - spacing * eta.exp()
-        };
         let phi = (-rate * spacing).exp();
         let q = 1.0 - phi * phi;
-        let kernel_sd = q.sqrt();
-        let reach = (12.0 * kernel_sd / h).ceil() as i64;
-        let normalise = |v: &mut Vec<f64>| {
-            let m = v.iter().cloned().fold(0.0_f64, f64::max);
-            v.iter_mut().for_each(|x| *x /= m);
-        };
-        let lik_vec = |n: usize| -> Vec<f64> {
-            let l: Vec<f64> = zs.iter().map(|&z| log_lik(n, z)).collect();
-            let m = l.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-            l.iter().map(|x| (x - m).exp()).collect()
-        };
-        let kernel = |from: f64, to: f64| (-(to - phi * from).powi(2) / (2.0 * q)).exp();
-        let size = zs.len() as i64;
-        let window = |i: i64| {
-            let centre = ((phi * zs[i as usize]) / h).round() as i64 + half;
-            ((centre - reach).max(0), (centre + reach).min(size - 1))
-        };
-        let mut alpha0: Vec<f64> = zs
-            .iter()
-            .zip(lik_vec(0))
-            .map(|(&z, l)| (-0.5 * z * z).exp() * l)
-            .collect();
-        normalise(&mut alpha0);
-        let mut beta = vec![1.0; zs.len()];
-        for n in (0..n_nodes - 1).rev() {
-            let lik = lik_vec(n + 1);
-            let carried: Vec<f64> = lik.iter().zip(&beta).map(|(l, b)| l * b).collect();
-            let mut next = vec![0.0; zs.len()];
-            for i in 0..size {
-                let (lo, hi) = window(i);
-                let mut acc = 0.0;
-                for j in lo..=hi {
-                    acc += kernel(zs[i as usize], zs[j as usize]) * carried[j as usize];
+        // (mean, sd) of node 0's smoothed marginal and of the last node's
+        // filtered one, by dense forward-backward at spacing `h` over ±8.
+        let dense = |h: f64| -> [(f64, f64); 2] {
+            let half = (8.0 / h).round() as i64;
+            let zs: Vec<f64> = (-half..=half).map(|i| i as f64 * h).collect();
+            let size = zs.len();
+            let likelihood: Vec<f64> = {
+                let log: Vec<f64> = zs
+                    .iter()
+                    .map(|&z| {
+                        let eta = log_intensity(&eta0_value, &loadings, &[z], None);
+                        eta - spacing * eta.exp()
+                    })
+                    .collect();
+                let top = log.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                log.iter().map(|l| (l - top).exp()).collect()
+            };
+            let normalise = |v: Vec<f64>| -> Vec<f64> {
+                let top = v.iter().cloned().fold(0.0_f64, f64::max);
+                v.into_iter().map(|x| x / top).collect()
+            };
+            // The kernel is negligible past 12 innovation σ.
+            let reach = (12.0 * q.sqrt() / h).ceil() as i64;
+            let kernel = |from: f64, to: f64| (-(to - phi * from).powi(2) / (2.0 * q)).exp();
+            let moments = |density: &[f64]| -> (f64, f64) {
+                let mass: f64 = density.iter().sum();
+                let mean = density.iter().zip(&zs).map(|(d, z)| d * z).sum::<f64>() / mass;
+                let variance = density
+                    .iter()
+                    .zip(&zs)
+                    .map(|(d, z)| d * (z - mean).powi(2))
+                    .sum::<f64>()
+                    / mass;
+                (mean, variance.sqrt())
+            };
+            let first: Vec<f64> = zs
+                .iter()
+                .zip(&likelihood)
+                .map(|(&z, l)| (-0.5 * z * z).exp() * l)
+                .collect();
+            let mut forward = normalise(first.clone());
+            let mut beta = vec![1.0; size];
+            for _ in 1..n_nodes {
+                // Forward: from `from` to every `to` in reach of φ·from.
+                let mut predicted = vec![0.0; size];
+                // Backward: to every `from` whose φ·from reaches `to`.
+                let carried: Vec<f64> = likelihood.iter().zip(&beta).map(|(l, b)| l * b).collect();
+                let mut backward = vec![0.0; size];
+                for i in 0..size {
+                    let centre = (phi * zs[i] / h).round() as i64 + half;
+                    let lo = (centre - reach).max(0) as usize;
+                    let hi = ((centre + reach) as usize).min(size - 1);
+                    for j in lo..=hi {
+                        let k = kernel(zs[i], zs[j]);
+                        predicted[j] += forward[i] * k;
+                        backward[i] += k * carried[j];
+                    }
                 }
-                next[i as usize] = acc;
+                forward = normalise(predicted.iter().zip(&likelihood).map(|(p, l)| p * l).collect());
+                beta = normalise(backward);
             }
-            normalise(&mut next);
-            beta = next;
-        }
-        let smoothed: Vec<f64> = alpha0.iter().zip(&beta).map(|(a, b)| a * b).collect();
-        let mass: f64 = smoothed.iter().sum();
-        let mean: f64 = smoothed.iter().zip(&zs).map(|(s, z)| s * z).sum::<f64>() / mass;
-        let variance: f64 = smoothed
-            .iter()
-            .zip(&zs)
-            .map(|(s, z)| s * (z - mean).powi(2))
-            .sum::<f64>()
-            / mass;
-        eprintln!("dense: mean {mean:.10} sd {:.10}", variance.sqrt());
-        for order in [5, 7, 9, 13, 17, 25, 33] {
+            let smoothed: Vec<f64> = first.iter().zip(&beta).map(|(a, b)| a * b).collect();
+            [moments(&smoothed), moments(&forward)]
+        };
+        let [smoothed, last] = dense(0.002);
+        let [coarse_smoothed, coarse_last] = dense(0.004);
+        let reference_error = [
+            (smoothed.0 - coarse_smoothed.0).abs(),
+            (smoothed.1 - coarse_smoothed.1).abs(),
+            (last.0 - coarse_last.0).abs(),
+            (last.1 - coarse_last.1).abs(),
+        ]
+        .into_iter()
+        .fold(0.0_f64, f64::max);
+        eprintln!(
+            "dense: node 0 smoothed N({:.8}, {:.8}²), last filtered N({:.8}, {:.8}²), reference error {reference_error:.2e}",
+            smoothed.0, smoothed.1, last.0, last.1
+        );
+        assert!(smoothed.0 > 1.5, "the fixture's smoothed marginal must sit off the prior");
+        for order in [9, 17, 33] {
             let gh = GaussHermite::new(order).unwrap();
             let inputs = SubjectInputs {
                 nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
                 gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
             };
             let moments = latent_state_moments(&inputs).unwrap();
-            let (m, v) = &moments[0];
-            let (ml, vl) = &moments[n_nodes - 1];
+            let node_0 = (moments[0].0[0], moments[0].1[0].sqrt());
+            let final_node = (moments[n_nodes - 1].0[0], moments[n_nodes - 1].1[0].sqrt());
+            let filter_error = (final_node.0 - last.0).abs().max((final_node.1 - last.1).abs());
+            let bar = filter_error.max(reference_error);
+            let (mean_error, sd_error) = (node_0.0 - smoothed.0, node_0.1 - smoothed.1);
             eprintln!(
-                "order {order}: node0 mean {:.10} sd {:.10} err_mean {:.3e} err_sd {:.3e} | last mean {:.6} sd {:.6}",
-                m[0], v[0].sqrt(), m[0] - mean, v[0].sqrt() - variance.sqrt(), ml[0], vl[0].sqrt()
+                "order {order}: node 0 mean error {mean_error:+.3e}, sd error {sd_error:+.3e}; bar {bar:.3e} (filter error {filter_error:.3e})"
+            );
+            assert!(
+                mean_error.abs() <= bar && sd_error.abs() <= bar,
+                "order {order}: node 0's smoothed marginal N({:.6}, {:.6}²) misses the dense N({:.6}, {:.6}²) by \
+                 ({mean_error:+.3e}, {sd_error:+.3e}), past the forward filter's own error {bar:.3e}",
+                node_0.0, node_0.1, smoothed.0, smoothed.1
             );
         }
     }
