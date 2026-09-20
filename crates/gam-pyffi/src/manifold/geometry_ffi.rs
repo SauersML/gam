@@ -7515,7 +7515,9 @@ fn predict_encoded_table_full_conformal_impl(
              (exact ≥{:.0}% set given the frozen penalty, score |∂ℓ/∂η|, seeded tie \
              randomization; a union of conformal_set_components intervals whose envelope is \
              posterior_mean_lower/upper; conformal_certificate 0 when the fit selected no \
-             smoothing parameter, -7 glm_frozen_penalty otherwise)",
+             smoothing parameter, 1 where a Bernoulli-logit row re-selects its one \
+             smoothing strength by LAML on the augmented rows, -7 glm_frozen_penalty for \
+             a Poisson, negative-binomial or Gamma fit that selected one)",
             conformal_level * 100.0
         )
     };
@@ -7545,10 +7547,13 @@ fn predict_encoded_table_full_conformal_impl(
 /// without an offset. A Gaussian row's set is that of the fit that re-selects
 /// the smoothing strength by REML on the augmented rows, which carries the
 /// distribution-free finite-sample ≥`conformal_level` marginal-coverage
-/// theorem; a GLM row's set is the certified augmented refit at the frozen
-/// penalty. The returned `conformal_certificate` column is `0` (exact_frozen)
-/// or `1` (honest_refit) for guaranteed rows and a negative refusal code
-/// otherwise (`-7` glm_frozen_penalty for a GLM that selected λ or θ). Returns
+/// theorem. A Bernoulli-logit row with one smoothing parameter gets the set of
+/// the fit that re-selects that strength by LAML on the augmented rows, which
+/// carries the same theorem; any other GLM row's set is the certified
+/// augmented refit at the frozen penalty. The returned `conformal_certificate`
+/// column is `0` (exact_frozen) or `1` (honest_refit) for guaranteed rows and a
+/// negative refusal code otherwise (`-7` glm_frozen_penalty for a Poisson,
+/// negative-binomial or Gamma fit that selected λ or θ). Returns
 /// the same column payload as `predict_table` plus `conformal_set_components`
 /// and that column.
 ///

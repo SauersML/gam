@@ -15,9 +15,11 @@ the fitted smoothing parameters (``gam_models::inference::full_conformal_glm``):
 Discrete ties are randomized with a seed drawn from the data, so the set is
 exact (coverage ``1 - alpha`` on average) rather than conservative. A
 prior-weighted fit has no exchangeable augmented problem, so it refuses with a
-typed error that names split conformal. GLM rows of a smooth fit report
-``conformal_certificate`` -7 (glm_frozen_penalty) because only the Gaussian
-route re-selects the smoothing parameters on the augmented rows.
+typed error that names split conformal. A binomial fit with one smoothing
+parameter re-selects it by LAML on the augmented rows, one selection per label
+(``conformal_certificate`` 1, honest_refit); with several it reports -1
+(multi_penalty), and Poisson, negative-binomial and Gamma rows of a smooth fit
+report -7 (glm_frozen_penalty) because their route keeps the fitted penalty.
 """
 
 from __future__ import annotations
@@ -84,7 +86,11 @@ def test_glm_full_conformal_set_is_a_set_in_the_support(family: str) -> None:
     hi = np.asarray(out["posterior_mean_upper"], dtype=float)
     comps = np.asarray(out["conformal_set_components"], dtype=float)
     certificate = np.asarray(out["conformal_certificate"], dtype=float)
-    assert np.all(certificate == -7.0), "a smooth GLM fit is refused as glm_frozen_penalty"
+    if family == "binomial":
+        # The default smooth carries a null-space penalty too: two strengths.
+        assert np.all(certificate == -1.0), "a two-penalty binomial fit is multi_penalty"
+    else:
+        assert np.all(certificate == -7.0), "a smooth count or Gamma fit is glm_frozen_penalty"
     assert np.all(comps >= 1), f"{family}: empty set at alpha={ALPHA}"
     assert np.all(lo <= hi)
     if family == "gamma":
@@ -95,6 +101,27 @@ def test_glm_full_conformal_set_is_a_set_in_the_support(family: str) -> None:
         assert np.all(lo >= 0.0)
     if family == "binomial":
         assert np.all(hi <= 1.0)
+
+
+def test_single_penalty_binomial_set_reselects_the_strength() -> None:
+    rng = np.random.default_rng(4103)
+    formula = "y ~ s(x, k=8, double_penalty=false)"
+    train = _draw("binomial", rng, 120)
+    model = gamfit.fit(train, formula, family="binomial")
+    test = _draw("binomial", rng, 25)
+    out = model.predict(
+        test[["x"]],
+        interval="conformal",
+        training_data=train,
+        conformal_level=1.0 - ALPHA,
+        return_type="dict",
+    )
+    certificate = np.asarray(out["conformal_certificate"], dtype=float)
+    assert np.all(certificate == 1.0), "a one-penalty binomial row is honest_refit"
+    lo = np.asarray(out["posterior_mean_lower"], dtype=float)
+    hi = np.asarray(out["posterior_mean_upper"], dtype=float)
+    assert np.all(np.isin(lo, [0.0, 1.0])) and np.all(np.isin(hi, [0.0, 1.0]))
+    assert np.all(lo <= hi)
 
 
 def _penalty_model(family: str, rng: np.random.Generator):
@@ -128,8 +155,8 @@ def test_glm_full_conformal_covers_at_the_nominal_level(family: str) -> None:
     tests the set construction itself. With the penalty selected on the labeled
     rows (the usual call) the smoothing step sees the labeled rows but not the
     candidate, which costs O(1/n) coverage; ``conformal_certificate`` is -7
-    (glm_frozen_penalty) for every smooth GLM row for that reason, and bench/pygam_audit/conformal_coverage.md
-    reports that route's coverage.
+    (glm_frozen_penalty) for every smooth count or Gamma row for that reason,
+    and -1 (multi_penalty) for a binomial fit with a null-space penalty.
     """
 
     rng = np.random.default_rng(20260919)

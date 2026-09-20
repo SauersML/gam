@@ -93,8 +93,13 @@ impl From<String> for FullConformalError {
 ///   test offset. It is the set of the fitting map that re-selects the
 ///   smoothing strength by REML on the augmented rows, so the finite-sample
 ///   coverage theorem holds for it, or the frozen-ρ set with a typed refusal.
-/// * Bernoulli logit, Poisson log, negative binomial log (θ frozen at its
-///   fitted value, like λ) and Gamma log: the certified augmented-refit set of
+/// * Bernoulli logit with one smoothing parameter: the set of
+///   [`gam_models::inference::full_conformal_glm`] for the fitting map that
+///   re-selects the strength by LAML on the augmented rows, one selection per
+///   label, so the finite-sample coverage theorem holds for it.
+/// * Poisson log, negative binomial log (θ frozen at its fitted value, like λ),
+///   Gamma log, and Bernoulli logit with several smoothing parameters: the
+///   certified augmented-refit set of
 ///   [`gam_models::inference::full_conformal_glm`] at the frozen penalty, with
 ///   the score `|∂ℓ/∂η|` (the Pearson residual for Gamma). Discrete candidates
 ///   are enumerated up to a data-derived tail beyond which no candidate can
@@ -239,13 +244,13 @@ pub fn full_conformal_prediction_columns(
             }
         }
         Some(family) => {
-            let glm_certificate = f64::from(family.certificate(penalty.penalty_count()).code());
             let substrate = GlmFullConformalSubstrate::new(
                 family,
                 x_labeled,
                 y_labeled,
                 offset_labeled,
                 penalty.s_lambda().clone(),
+                penalty.penalty_count(),
                 fit.beta.clone(),
             )?;
             for i in 0..n_test {
@@ -263,7 +268,7 @@ pub fn full_conformal_prediction_columns(
                 lower_vec.push(lo);
                 upper_vec.push(hi);
                 components_vec.push(set.intervals.len() as f64);
-                certificate_vec.push(glm_certificate);
+                certificate_vec.push(f64::from(set.certificate.code()));
             }
         }
     }

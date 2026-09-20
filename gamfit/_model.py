@@ -199,8 +199,12 @@ class Model:
             smoothing strength by REML on the augmented rows (#942 Layer 3), so
             the finite-sample ``conformal_level`` coverage theorem holds; it
             costs one Cholesky per test point plus a cold REML refit at each
-            finite endpoint. Bernoulli-logit (the set is a subset of
-            ``{0, 1}``), Poisson-log and negative-binomial-log (candidates
+            finite endpoint. A Bernoulli-logit model with one smoothing
+            parameter gets the set of the fit that re-selects that strength
+            by LAML on the augmented rows, one selection per label in
+            ``{0, 1}``, so the same theorem holds. Other Bernoulli-logit
+            models (the set is a subset of ``{0, 1}``), Poisson-log and
+            negative-binomial-log (candidates
             enumerated up to a data-derived tail beyond which none can conform;
             NB theta frozen at its fitted value) and Gamma-log (Pearson score,
             so the set is a band in ``y / mu``) refit the augmented penalized
@@ -217,8 +221,10 @@ class Model:
             negative code is a typed refusal where the row carries the
             frozen-penalty set with no finite-sample guarantee for the
             selection step (several smoothing parameters, a payload without the
-            count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
-            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            count, a degenerate criterion, a Bernoulli strength selection that
+            did not certify, or ``-7`` glm_frozen_penalty for a Poisson,
+            negative-binomial or Gamma fit that selected a smoothing parameter
+            or NB theta).
             The set is a union of ``conformal_set_components`` intervals and
             the bounds report its outer envelope (NaN for an empty randomized
             set). With ``calibration`` it is the

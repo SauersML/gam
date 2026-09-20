@@ -121,10 +121,10 @@ pub enum ConformalRefusal {
     RefitOutsideTube,
     /// The outer engine could not complete a local refit.
     RefitFailed,
-    /// A non-Gaussian likelihood whose fit selected a smoothing strength (or a
-    /// negative-binomial θ) on the training rows: the set is that of the
-    /// frozen-penalty certified refit, and no REML re-selecting map is built
-    /// for these families.
+    /// A Poisson, negative-binomial or Gamma likelihood whose fit selected a
+    /// smoothing strength (or a negative-binomial θ) on the training rows: the
+    /// set is that of the frozen-penalty certified refit, and no re-selecting
+    /// map is built for these families.
     GlmFrozenPenalty,
 }
 
@@ -160,7 +160,8 @@ pub enum ConformalCertificate {
     /// The fitting map has no smoothing parameter to re-select, so the exact
     /// Layer-1 set at the stored penalty IS the honest set.
     ExactFrozen,
-    /// The set of the REML re-selecting map, from the bound plus local refits.
+    /// The set of the re-selecting map: Gaussian REML from the bound plus local
+    /// refits, or Bernoulli LAML re-selected at each label.
     HonestRefit,
     /// The frozen-ρ set, carrying no finite-sample guarantee, and why.
     Refused(ConformalRefusal),
