@@ -1053,7 +1053,7 @@ impl PosteriorMoment {
     }
 
     /// The same law with every node weight multiplied by `factor > 0`.
-    fn scaled(self, factor: f64) -> Self {
+    pub(crate) fn scaled(self, factor: f64) -> Self {
         Self {
             weight: self.weight * factor,
             mean: self.mean,

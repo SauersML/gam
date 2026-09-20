@@ -282,48 +282,34 @@ pub fn predict_survival_location_scalewith_uncertainty(
     } else {
         None
     };
-    let posterior_mean_response = exact_response_moments
-        .as_ref()
-        .map(|(mean, _)| mean.clone());
-    let posterior_second_moment = exact_response_moments
-        .as_ref()
-        .map(|(_, second)| second.clone());
 
     let survival_prob = if posterior_mean {
-        posterior_mean_response
+        exact_response_moments
             .as_ref()
+            .map(|(mean, _)| mean.clone())
             .expect("posterior-mean path computes exact response moments")
-            .clone()
     } else {
         base.survival_prob.clone()
     };
 
+    // The producers report the centred variance itself, non-negative by
+    // construction, so the standard deviation is its square root with nothing
+    // subtracted and nothing clipped (gam#4086).
     let response_standard_error = if include_response_sd {
-        let mean = posterior_mean_response
+        let (_, variance) = exact_response_moments
             .as_ref()
             .expect("response-sd path computes exact response moments");
-        let second = posterior_second_moment
-            .as_ref()
-            .expect("response-sd path computes exact response moments");
-        let mut sd = Array1::<f64>::zeros(n);
-        if n >= SURVIVAL_ROW_PARALLEL_THRESHOLD {
-            sd.as_slice_mut()
-                .expect("fresh response standard-error array is contiguous")
-                .par_chunks_mut(SURVIVAL_ROW_PARALLEL_CHUNK)
-                .enumerate()
-                .for_each(|(chunk_idx, sd_chunk)| {
-                    let row_start = chunk_idx * SURVIVAL_ROW_PARALLEL_CHUNK;
-                    for (offset, slot) in sd_chunk.iter_mut().enumerate() {
-                        let i = row_start + offset;
-                        *slot = (second[i] - mean[i] * mean[i]).max(0.0).sqrt();
-                    }
-                });
-        } else {
-            for i in 0..n {
-                sd[i] = (second[i] - mean[i] * mean[i]).max(0.0).sqrt();
-            }
+        if let Some((row, value)) = variance
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(format!(
+                "predict_survival_location_scale: posterior response variance must be finite; \
+                 row {row} has {value}"
+            ));
         }
-        Some(sd)
+        Some(variance.mapv(f64::sqrt))
     } else {
         None
     };

@@ -703,7 +703,7 @@ impl TruncatedResponseRow {
 ///
 /// Every replicate is extended from `N` to `2N` nodes, visiting only the new
 /// nodes. A row is read and retired once the replicate standard error of its
-/// `E[S]` and of its response standard error `sqrt(E[S²] − E[S]²)`, less the
+/// `E[S]` and of its response standard error `sqrt(Var S)`, less the
 /// integrand's f64 rounding, is within the law's certified relative accuracy of
 /// `sqrt(E[S]·(1 − E[S]))`; the rows still uncertified are evaluated on the next
 /// doubling.
@@ -723,6 +723,8 @@ impl TruncatedResponseRow {
 /// proposal dominated by a handful of nodes moves slowly between doublings while
 /// being nowhere near the answer. Past the rule's maximum node count the moments
 /// are refused, not reported.
+///
+/// Returns each row's `E[S]` and centred `Var S` (gam#4086).
 pub(crate) fn truncated_survival_response_moments(
     input: &SurvivalLocationScalePredictInput,
     fit: &UnifiedFitResult,
@@ -765,7 +767,7 @@ pub(crate) fn truncated_survival_response_moments(
             .take(replicates)
             .collect();
     let mut first = Array1::<f64>::zeros(n);
-    let mut second = Array1::<f64>::zeros(n);
+    let mut variance = Array1::<f64>::zeros(n);
     let mut active: Vec<usize> = (0..n).collect();
     let mut evaluated = 0usize;
     while !active.is_empty() {
@@ -796,7 +798,7 @@ pub(crate) fn truncated_survival_response_moments(
         {
             if certificate.error <= tolerance {
                 first[certificate.row] = certificate.first;
-                second[certificate.row] = certificate.second;
+                variance[certificate.row] = certificate.variance;
             } else {
                 uncertified.push(certificate.row);
                 if worst
@@ -822,7 +824,7 @@ pub(crate) fn truncated_survival_response_moments(
             ));
         }
     }
-    Ok(Some((first, second)))
+    Ok(Some((first, variance)))
 }
 
 /// What one node's response evaluation reads, shared by every replicate.
@@ -835,28 +837,30 @@ struct ResponseMomentIntegrand<'a> {
     ambient_probabilities: Vec<f64>,
 }
 
-/// One replicate lattice's running sums `Σw`, and `Σw·d` and `Σw·d²` for every
-/// row, where `d = S − S_ambient` is the node's survival probability less the
-/// row's probability at the ambient centre, all on ONE log scale.
+/// One replicate lattice's weight sum `Σw`, and for every row the weighted
+/// centred moment of `d = S − S_ambient`, the node's survival probability less
+/// the row's probability at the ambient centre, all on ONE log scale.
 ///
 /// Every row sees the same node weights, so one rescale serves them all. The
 /// weights span hundreds of decades between a barely-truncated face and a deeply
-/// pinned one, so the sums carry an explicit log scale and are rescaled whenever
-/// a heavier node arrives; accumulating the weights directly would underflow the
-/// face to zero and leave the normalized moments as `0/0`.
+/// pinned one, so the moments carry an explicit log scale and are rescaled
+/// whenever a heavier node arrives; accumulating the weights directly would
+/// underflow the face to zero and leave the normalized moments as `0/0`.
 ///
-/// The sums run about `S_ambient` rather than over `S` because the standard
-/// error is read by subtraction. Running sums of `w·S` and `w·S²` each carry
-/// rounding of order `ε·√N` relative to `S`, and on a row whose survival is
-/// nearly certain `E[S²] − E[S]²` is then that rounding rather than the variance:
-/// the replicate spread stops falling with `N` and the row cannot certify. About
-/// the ambient centre both sums are of the variance's own order, so their
-/// rounding is relative to it.
+/// Each node is merged into the row's [`PosteriorMoment`] by the pairwise
+/// update, so the variance is a sum of non-negative terms resolved relative to
+/// itself (gam#4086). The raw sums `Σw·d` and `Σw·d²` this replaced read the
+/// variance as `E[d²] − E[d]²`, which cancels whenever the posterior mean sits
+/// many posterior standard deviations from the ambient centre, as it does on a
+/// deeply truncated face: the variance was then the rounding of `E[d]²`, the
+/// replicate spread of the standard deviation stopped falling with `N`, and the
+/// row could not certify. The shift to `S_ambient` still keeps `E[S]` of a row
+/// whose survival is nearly certain resolved relative to `1 − S` rather than to
+/// `ulp(1)` in every replicate, which is what its mean spread is measured on.
 struct ResponseMomentAccumulator {
     log_scale: f64,
     weight_sum: f64,
-    deviation_sum: Array1<f64>,
-    deviation_square_sum: Array1<f64>,
+    deviations: Vec<PosteriorMoment>,
 }
 
 impl ResponseMomentAccumulator {
@@ -864,8 +868,7 @@ impl ResponseMomentAccumulator {
         Self {
             log_scale: f64::NEG_INFINITY,
             weight_sum: 0.0,
-            deviation_sum: Array1::zeros(n),
-            deviation_square_sum: Array1::zeros(n),
+            deviations: vec![PosteriorMoment::EMPTY; n],
         }
     }
 
@@ -881,11 +884,16 @@ impl ResponseMomentAccumulator {
         if log_weight > self.log_scale {
             let rescale = (self.log_scale - log_weight).exp();
             self.weight_sum *= rescale;
-            self.deviation_sum *= rescale;
-            self.deviation_square_sum *= rescale;
+            for moment in &mut self.deviations {
+                *moment = moment.scaled(rescale);
+            }
             self.log_scale = log_weight;
         }
         let weight = (log_weight - self.log_scale).exp();
+        // A node whose weight underflowed on this scale contributes nothing.
+        if weight == 0.0 {
+            return Ok(());
+        }
         let displacement = normal_coordinates - &integrand.law.normal_center;
         self.weight_sum += weight;
         for &row in active {
@@ -895,8 +903,7 @@ impl ResponseMomentAccumulator {
                 &displacement,
                 tangent,
             )? - integrand.ambient_probabilities[row];
-            self.deviation_sum[row] += weight * deviation;
-            self.deviation_square_sum[row] += weight * deviation * deviation;
+            self.deviations[row].merge(weight, PosteriorMoment::point(deviation));
         }
         Ok(())
     }
@@ -908,8 +915,8 @@ struct RowCertificate {
     row: usize,
     /// `E[S]`.
     first: f64,
-    /// `E[S²]`.
-    second: f64,
+    /// `Var S`, centred.
+    variance: f64,
     /// The larger replicate standard error of `E[S]` and of the response standard
     /// error, less the integrand's rounding, as a fraction of
     /// `sqrt(E[S]·(1 − E[S]))`.
@@ -940,33 +947,26 @@ fn certify_response_moments(
         .iter()
         .map(|accumulator| (accumulator.log_scale - top).exp())
         .collect();
-    let pooled_weight = accumulators
-        .iter()
-        .zip(&pooling_scales)
-        .map(|(accumulator, scale)| scale * accumulator.weight_sum)
-        .sum::<f64>();
     let mut means = vec![0.0; accumulators.len()];
     let mut standard_errors = vec![0.0; accumulators.len()];
     let mut certificates = Vec::with_capacity(active.len());
     for &row in active {
-        let mut pooled_deviation = 0.0;
-        let mut pooled_square = 0.0;
-        for (replicate, (accumulator, scale)) in
+        // The replicates merge by the same pairwise update their nodes did, so
+        // the pooled variance carries the spread between replicate means as a
+        // non-negative term instead of recovering it by subtraction.
+        let mut pooled = PosteriorMoment::EMPTY;
+        for (replicate, (accumulator, &scale)) in
             accumulators.iter().zip(&pooling_scales).enumerate()
         {
-            let mean = accumulator.deviation_sum[row] / accumulator.weight_sum;
-            let square = accumulator.deviation_square_sum[row] / accumulator.weight_sum;
-            means[replicate] = mean;
-            standard_errors[replicate] = (square - mean * mean).max(0.0).sqrt();
-            pooled_deviation += scale * accumulator.deviation_sum[row];
-            pooled_square += scale * accumulator.deviation_square_sum[row];
+            let deviation = accumulator.deviations[row];
+            means[replicate] = deviation.mean();
+            standard_errors[replicate] = deviation.variance().sqrt();
+            pooled.merge(scale, deviation);
         }
-        let mean_deviation = pooled_deviation / pooled_weight;
-        let variance = (pooled_square / pooled_weight - mean_deviation * mean_deviation).max(0.0);
+        let variance = pooled.variance();
         // A weighted mean of probabilities lies in [0, 1]; the bound only removes
-        // the rounding of the division.
-        let first = (ambient_probabilities[row] + mean_deviation).clamp(0.0, 1.0);
-        let second = (variance + first * first).clamp(0.0, 1.0);
+        // the rounding of the running mean's updates.
+        let first = (ambient_probabilities[row] + pooled.mean()).clamp(0.0, 1.0);
         let spread =
             replicate_standard_error(&means).max(replicate_standard_error(&standard_errors));
         // `S = 1 − F(η)` is evaluated in f64, which resolves a probability to
@@ -984,7 +984,7 @@ fn certify_response_moments(
         certificates.push(RowCertificate {
             row,
             first,
-            second,
+            variance,
             error,
         });
     }
@@ -1321,12 +1321,22 @@ mod tests {
         let reference_first = reference_first / reference_mass;
         let reference_second = reference_second / reference_mass;
 
-        let (gaussian_mean, gaussian_second) =
+        let (gaussian_mean, gaussian_variance) =
             exact_survival_response_moments(&input, &gaussian_fit, &sigma_pi)
                 .expect("moment-matched normal response moments");
-        let (truncated_mean, truncated_second) =
+        let (truncated_mean, truncated_variance) =
             exact_survival_response_moments(&input, &truncated_fit, &sigma_pi)
                 .expect("truncated response moments");
+        // Both producers report a centred variance, non-negative by construction.
+        for (label, variance) in [("normal", &gaussian_variance), ("truncated", &truncated_variance)]
+        {
+            assert!(
+                variance.iter().all(|value| *value >= 0.0),
+                "{label} response variances must be non-negative: {variance:?}"
+            );
+        }
+        let gaussian_second = &gaussian_variance + &(&gaussian_mean * &gaussian_mean);
+        let truncated_second = &truncated_variance + &(&truncated_mean * &truncated_mean);
 
         let gaussian_error = (gaussian_mean[0] - reference_first).abs();
         let truncated_error = (truncated_mean[0] - reference_first).abs();
@@ -1371,10 +1381,7 @@ mod tests {
         // surely as row 0, whose `1 − E[S]` is orders of magnitude larger than any
         // integration error the certificate admits.
         for row in 1..4 {
-            let response_standard_error = (truncated_second[row]
-                - truncated_mean[row] * truncated_mean[row])
-                .max(0.0)
-                .sqrt();
+            let response_standard_error = truncated_variance[row].sqrt();
             eprintln!(
                 "[2917] row {row}: truncated E[S]={:.15e} 1-E[S]={:.3e} sd={:.3e}; \
                  moment-matched normal E[S]={:.15e}",
