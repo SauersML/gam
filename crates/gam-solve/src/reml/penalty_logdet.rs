@@ -218,7 +218,8 @@ fn disjoint_diagonal_blocks(s_k_matrices: &[Array2<f64>]) -> Option<Vec<(usize, 
 /// Structural rank of a set of penalty components — ONE rule, shared with the
 /// reparameterization's penalized/null split
 /// (`gam_terms::construction::balanced_penalty_structural_rank`): the rank of
-/// the Frobenius-balanced sum `Σ_k S_k/‖S_k‖_F` at its relative cut. Components
+/// the Frobenius-balanced sum `Σ_k S_k/‖S_k‖_F`, counting the eigenvalues
+/// resolved from zero at the sum's own assembly band (#4057). Components
 /// whose `λ` is zero are excluded, exactly as before; what changed is that the
 /// rank is no longer read from the UNWEIGHTED sum at `100·p·ε·max`, which
 /// disagreed with the split whenever one component's norm was small against
