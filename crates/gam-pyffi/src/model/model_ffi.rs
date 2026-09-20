@@ -219,29 +219,6 @@ struct PyPredictOptionsPayload {
     observation_interval: Option<bool>,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PySharedPrecisionRequest {
-    models: Vec<PySharedPrecisionModel>,
-    groups: Vec<PySharedPrecisionGroup>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PySharedPrecisionModel {
-    key: serde_json::Value,
-    state_json: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PySharedPrecisionGroup {
-    name: String,
-    shape: f64,
-    rate: f64,
-    labels: Vec<String>,
-}
-
 #[derive(Serialize)]
 struct SchemaIssue {
     kind: String,
