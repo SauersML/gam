@@ -1139,11 +1139,12 @@ pub enum SurvivalPosteriorIntegration {
     /// per-coefficient hazard; the cumulative hazard is `−log E_θ[S]` and the
     /// cumulative incidence `1 − E_θ[S]`.
     ExactAnchor,
-    /// The inequality-truncated posterior a location-scale fit reports
-    /// (gam#3038): `N(β_unc, Σ)` truncated to the fit's cone, integrated on
-    /// the joint constraint-normal × tangent rule the location-scale response
+    /// The inequality-truncated posterior a location-scale fit (gam#3038) or a
+    /// Royston-Parmar fit with an active monotone-baseline bound (gam#3575)
+    /// reports: `N(β_unc, Σ)` truncated to the fit's cone, integrated on the
+    /// joint constraint-normal × tangent rule the location-scale response
     /// moments use (#2679), every node a feasible coefficient vector replayed
-    /// through the plug-in location-scale surfaces. The moment-matched normal
+    /// through the plug-in survival surfaces. The moment-matched normal
     /// [`Self::SigmaPoint`] integrates instead puts nodes outside the cone,
     /// where the model has no hazard.
     ///
@@ -1157,15 +1158,15 @@ pub enum SurvivalPosteriorIntegration {
 impl SurvivalPosteriorIntegration {
     /// The integration [`predict_survival`] runs for `model` under
     /// `covariance_mode`: exact wherever the saved model is a function of
-    /// `(q(t), b(t))`, the truncated law wherever a location-scale posterior is
-    /// cone-truncated, sigma-point otherwise.
+    /// `(q(t), b(t))`, the truncated law wherever a location-scale or
+    /// Royston-Parmar posterior is cone-truncated, sigma-point otherwise.
     pub fn default_for(
         model: &SavedModel,
         covariance_mode: SurvivalPredictionCovarianceMode,
     ) -> Result<Self, SurvivalPredictError> {
         match require_saved_survival_likelihood_mode(model)? {
             SurvivalLikelihoodMode::MarginalSlope => {}
-            SurvivalLikelihoodMode::LocationScale => {
+            SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::Transformation => {
                 return Ok(if truncated_survival_posterior_draws(model, covariance_mode)?.is_some() {
                     Self::TruncatedLaw
                 } else {
@@ -1570,9 +1571,9 @@ fn predict_survival_exact_anchor_posterior_mean(
     Ok(result)
 }
 
-/// The cone-truncated coefficient posterior of a location-scale fit under
-/// `covariance_mode`, as a rule over whole coefficient vectors, or `None` when
-/// the selected covariance is not one a cone truncated.
+/// The cone-truncated coefficient posterior of a location-scale or
+/// Royston-Parmar fit under `covariance_mode`, as a rule over whole coefficient
+/// vectors, or `None` when the selected covariance is not one a cone truncated.
 fn truncated_survival_posterior_draws(
     model: &SavedModel,
     covariance_mode: SurvivalPredictionCovarianceMode,
@@ -1599,12 +1600,15 @@ fn predict_survival_truncated_law_posterior_mean(
     let draws = truncated_survival_posterior_draws(req.model, covariance_mode)?.ok_or_else(|| {
         SurvivalPredictError::UnsupportedConfiguration {
             reason: format!(
-                "the truncated-law survival posterior needs a location-scale fit whose {} \
-                 posterior carries an active inequality cone",
+                "the truncated-law survival posterior needs a location-scale or Royston-Parmar \
+                 fit whose {} posterior carries an active inequality cone",
                 covariance_mode.as_str()
             ),
         }
     })?;
+    if require_saved_survival_likelihood_mode(req.model)? != SurvivalLikelihoodMode::LocationScale {
+        return predict_survival_replayed_truncated_law_posterior_mean(req, covariance_mode, &draws);
+    }
     let (mut result, moments) = predict_survival_surfaces(
         SurvivalPredictRequest {
             with_uncertainty: false,
@@ -1619,6 +1623,94 @@ fn predict_survival_truncated_law_posterior_mean(
     })?;
     refuse_decreasing_survival(&result)?;
     publish_survival_posterior_moments(&mut result, &moments, with_uncertainty, covariance_mode)?;
+    Ok(result)
+}
+
+/// [`SurvivalPosteriorIntegration::TruncatedLaw`] for a fit whose plug-in
+/// survival law is replayed whole at each coefficient vector rather than from
+/// a location-scale batch — the Royston-Parmar fit, whose monotone I-spline
+/// baseline is the cone `β_j ≥ 0` (gam#3575).
+///
+/// Every node of the law's joint rule is a feasible coefficient vector, so its
+/// baseline is monotone and [`predict_survival_coefficient_law`] evaluates it
+/// as it evaluates the fit's own coefficients. The cells are the plug-in
+/// surfaces flattened row-major, `k = row·n_times + time`, followed by one
+/// linear-predictor cell per row, and are certified exactly as the
+/// location-scale surfaces are ([`truncated_survival_surface_moments`]).
+fn predict_survival_replayed_truncated_law_posterior_mean(
+    req: SurvivalPredictRequest<'_>,
+    covariance_mode: SurvivalPredictionCovarianceMode,
+    draws: &TruncatedCoefficientDraws,
+) -> Result<SurvivalPredictResult, SurvivalPredictError> {
+    fn plugin_request<'a>(
+        req: &SurvivalPredictRequest<'a>,
+        model: &'a SavedModel,
+    ) -> SurvivalPredictRequest<'a> {
+        SurvivalPredictRequest {
+            model,
+            data: req.data,
+            col_map: req.col_map,
+            training_headers: req.training_headers,
+            primary_offset: req.primary_offset,
+            noise_offset: req.noise_offset,
+            time_grid: req.time_grid,
+            with_uncertainty: false,
+            estimand: SurvivalPredictEstimand::Plugin,
+        }
+    }
+    let fit = fit_result_from_saved_model_for_prediction(req.model)?;
+    let mut result = predict_survival(plugin_request(&req, req.model), covariance_mode)?;
+    let (n_rows, n_times) = result.survival.dim();
+    let surface_width = n_rows * n_times;
+    let times = result.times.clone();
+    let likelihood_mode = result.likelihood_mode;
+    let node_cells = |node_fit: &UnifiedFitResult| -> Result<SurvivalNodeCells, String> {
+        let draw_model = saved_model_with_survival_coefficients(req.model, &node_fit.beta)?;
+        let draw =
+            predict_survival_coefficient_law(plugin_request(&req, &draw_model), covariance_mode)?;
+        if draw.survival.dim() != (n_rows, n_times)
+            || draw.hazard.dim() != (n_rows, n_times)
+            || draw.cumulative_hazard.dim() != (n_rows, n_times)
+            || draw.linear_predictor.len() != n_rows
+            || draw.times != times
+            || draw.likelihood_mode != likelihood_mode
+        {
+            return Err(
+                "truncated posterior survival node changed the prediction schema".to_string(),
+            );
+        }
+        let mut eta = Array1::<f64>::zeros(surface_width + n_rows);
+        let mut log_survival = Array1::<f64>::zeros(surface_width + n_rows);
+        let mut hazard = Array1::<f64>::zeros(surface_width + n_rows);
+        for row in 0..n_rows {
+            let linear_predictor = draw.linear_predictor[row];
+            eta[surface_width + row] = linear_predictor;
+            for time in 0..n_times {
+                let k = row * n_times + time;
+                eta[k] = linear_predictor;
+                log_survival[k] = -draw.cumulative_hazard[[row, time]];
+                hazard[k] = draw.hazard[[row, time]];
+            }
+        }
+        Ok(SurvivalNodeCells {
+            eta,
+            log_survival,
+            hazard,
+        })
+    };
+    let surface_cells: Vec<(usize, usize, usize)> = (0..n_rows)
+        .flat_map(|row| (0..n_times).map(move |time| (row, time, row * n_times + time)))
+        .collect();
+    let eta_cells: Vec<usize> = (0..n_rows).map(|row| surface_width + row).collect();
+    let moments = truncated_survival_surface_moments(
+        draws,
+        &fit,
+        &node_cells,
+        &surface_cells,
+        &eta_cells,
+        n_times,
+    )?;
+    publish_survival_posterior_moments(&mut result, &moments, req.with_uncertainty, covariance_mode)?;
     Ok(result)
 }
 
@@ -5271,7 +5363,7 @@ fn predict_survival_location_scale_batch(
             // node's coefficients. The hazard keeps the sign of the node's rate,
             // so the node's density `S·h` is exactly `−dS/dt` there and the
             // integrated density is `−dE[S]/dt` ([`conditional_event_density`]).
-            let node_cells = |fit: &UnifiedFitResult| -> Result<LocationScaleNodeCells, String> {
+            let node_cells = |fit: &UnifiedFitResult| -> Result<SurvivalNodeCells, String> {
                 let pred = predict_survival_location_scale(&pred_input, fit)
                     .map_err(|err| format!("survival location-scale predict failed: {err}"))?;
                 let rate = index_rate(fit)?;
@@ -5288,7 +5380,7 @@ fn predict_survival_location_scale_batch(
                         }
                     })
                     .collect::<Result<Array1<f64>, String>>()?;
-                Ok(LocationScaleNodeCells {
+                Ok(SurvivalNodeCells {
                     eta: pred.eta,
                     log_survival: pred.log_survival_prob,
                     hazard,
@@ -5309,7 +5401,7 @@ fn predict_survival_location_scale_batch(
             let eta_cells: Vec<usize> = (0..n)
                 .map(|i| if per_row_eval { i } else { i * eval_width + t_cols })
                 .collect();
-            Some(truncated_location_scale_surface_moments(
+            Some(truncated_survival_surface_moments(
                 draws,
                 &saved_fit,
                 &node_cells,
@@ -5424,16 +5516,17 @@ fn predict_survival_location_scale_batch(
     ))
 }
 
-/// One coefficient vector's location-scale cells, in the batch's flattened
-/// `(row, time)` layout: the index, `log S`, and the hazard with the sign of the
-/// index's rate.
-struct LocationScaleNodeCells {
+/// One coefficient vector's survival cells, in the caller's flattened
+/// `(row, time)` layout: the linear predictor, `log S`, and the hazard, signed
+/// where the node's survival rises (the location-scale index's rate, the
+/// Royston-Parmar `dH/dt`).
+struct SurvivalNodeCells {
     eta: Array1<f64>,
     log_survival: Array1<f64>,
     hazard: Array1<f64>,
 }
 
-impl LocationScaleNodeCells {
+impl SurvivalNodeCells {
     /// `(S, f)` at flattened cell `k`, `f = S·h` the node's event density.
     fn survival_and_density(&self, k: usize) -> Result<(f64, f64), String> {
         let log_survival = self.log_survival[k];
@@ -5444,8 +5537,9 @@ impl LocationScaleNodeCells {
     }
 }
 
-/// The posterior moments of the location-scale surfaces over the
-/// cone-truncated coefficient law (gam#3038), certified per cell.
+/// The posterior moments of the survival surfaces over the cone-truncated
+/// coefficient law — location-scale (gam#3038) and Royston-Parmar (gam#3575) —
+/// certified per cell.
 ///
 /// Every node of the law's joint rule is a feasible coefficient vector, and the
 /// surfaces are replayed at it through `node_cells`. Each replicate lattice keeps
@@ -5466,10 +5560,10 @@ impl LocationScaleNodeCells {
 /// `surface_cells` lists `(row, time column, flattened cell)` for every
 /// published cell after the origin; origin cells are `S = 1`, `f = h = 0`
 /// exactly. `eta_cells` is each row's linear-predictor cell.
-fn truncated_location_scale_surface_moments(
+fn truncated_survival_surface_moments(
     draws: &TruncatedCoefficientDraws,
     fit: &UnifiedFitResult,
-    node_cells: &(dyn Fn(&UnifiedFitResult) -> Result<LocationScaleNodeCells, String> + Sync),
+    node_cells: &(dyn Fn(&UnifiedFitResult) -> Result<SurvivalNodeCells, String> + Sync),
     surface_cells: &[(usize, usize, usize)],
     eta_cells: &[usize],
     t_cols: usize,
@@ -5480,7 +5574,7 @@ fn truncated_location_scale_surface_moments(
     let replicates = rule.replicates();
     if replicates < 2 {
         return Err(format!(
-            "survival location-scale truncated posterior surfaces need at least two replicate \
+            "survival truncated posterior surfaces need at least two replicate \
              lattices to certify on; the joint rule carries {replicates}"
         ));
     }
@@ -5602,7 +5696,7 @@ fn truncated_location_scale_surface_moments(
             && nodes >= rule.maximum_points()
         {
             return Err(format!(
-                "survival location-scale truncated posterior surfaces did not certify: after \
+                "survival truncated posterior surfaces did not certify: after \
                  {nodes} joint cubature nodes over {replicates} replicate lattices, the replicate \
                  standard error at {cell}, less the integrand's rounding, is {error:.3e} of its \
                  scale, above the law's certified relative accuracy {tolerance:.1e}"
@@ -5628,7 +5722,7 @@ fn certified_fraction(excess: f64, scale: f64) -> f64 {
 struct SurfaceMomentCells<'a> {
     surface_cells: &'a [(usize, usize, usize)],
     eta_cells: &'a [usize],
-    reference: &'a LocationScaleNodeCells,
+    reference: &'a SurvivalNodeCells,
     reference_surface: &'a [(f64, f64)],
     active_surface: &'a [usize],
     active_eta: &'a [usize],
@@ -5669,7 +5763,7 @@ impl SurfaceMomentAccumulator {
         &mut self,
         cells: &SurfaceMomentCells<'_>,
         log_weight: f64,
-        node: &LocationScaleNodeCells,
+        node: &SurvivalNodeCells,
     ) -> Result<(), String> {
         if log_weight > self.log_scale {
             let rescale = (self.log_scale - log_weight).exp();
@@ -5739,7 +5833,7 @@ impl<'a> PooledSurfaceMoments<'a> {
             .find(|accumulator| !(accumulator.weight_sum.is_finite() && accumulator.weight_sum > 0.0))
         {
             return Err(format!(
-                "survival location-scale truncated posterior surfaces: a replicate lattice \
+                "survival truncated posterior surfaces: a replicate lattice \
                  accumulated no finite node weight (weight sum {})",
                 accumulator.weight_sum
             ));
