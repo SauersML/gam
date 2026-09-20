@@ -2642,5 +2642,14 @@
     ],
     "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
     "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "f10039cc745a25ab816b20958151e1d5e629289d",
+    "items": [
+      "crates/gam-models/src/spatial_psi_bridge.rs:fn:transform_design",
+      "crates/gam-models/src/survival/location_scale/covariate_blocks.rs:fn:transform_design"
+    ],
+    "reason": "#3681: the dense-design branch of spatial_psi_bridge was unreachable. When x_psi_local is non-empty, build_embedded_dense_psi_operator always yields Some, so materialize_dense_design was always false. The branch, the trait method transform_design and both overrides (coefficient and survival time-varying) are deleted.",
+    "evidence": "Emitted blocks keep x_psi = 0x0 and x_psi_psi = None as before. survival_static_spatial_psi_blocks_match_shared_engine and build_block_spatial_psi_derivatives_supports_3d_aniso_matern pin the operator path."
   }
 ]
