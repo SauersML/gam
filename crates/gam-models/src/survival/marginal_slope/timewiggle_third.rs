@@ -1023,7 +1023,6 @@ impl SurvivalMarginalSlopeFamily {
     fn timewiggle_order_four_axes(
         &self,
         frame: &ZetaFrame<'_>,
-        block_states: &[ParameterBlockState],
         calc: &ZetaRowCalculus,
         u_zeta: &Array1<f64>,
     ) -> Result<Vec<Array2<f64>>, String> {
@@ -1091,7 +1090,6 @@ impl SurvivalMarginalSlopeFamily {
     fn timewiggle_order_five_axes(
         &self,
         frame: &ZetaFrame<'_>,
-        block_states: &[ParameterBlockState],
         calc: &ZetaRowCalculus,
         u_zeta: &Array1<f64>,
         v_zeta: &Array1<f64>,
@@ -1223,7 +1221,7 @@ impl SurvivalMarginalSlopeFamily {
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, false)?;
                     let images = &calc.zeta_row.images;
                     let u_zeta = zeta_image_of(images, d_u, width);
-                    let phi_axes = self.timewiggle_order_four_axes(&frame, block_states, &calc, &u_zeta)?;
+                    let phi_axes = self.timewiggle_order_four_axes(&frame, &calc, &u_zeta)?;
                     pull_back_axes(&phi_axes, images, &mut scratch, &mut phi_axis, &mut acc);
                 }
                 Ok(acc)
@@ -1263,7 +1261,7 @@ impl SurvivalMarginalSlopeFamily {
                     let images = &calc.zeta_row.images;
                     let u_zeta = zeta_image_of(images, d_u, width);
                     let v_zeta = zeta_image_of(images, d_v, width);
-                    let phi_axes = self.timewiggle_order_five_axes(&frame, block_states, &calc, &u_zeta, &v_zeta)?;
+                    let phi_axes = self.timewiggle_order_five_axes(&frame, &calc, &u_zeta, &v_zeta)?;
                     pull_back_axes(&phi_axes, images, &mut scratch, &mut phi_axis, &mut acc);
                 }
                 Ok(acc)
@@ -1339,9 +1337,9 @@ impl SurvivalMarginalSlopeFamily {
                     let w = zeta_image_of(&psi_images, &beta, width);
                     let v_zeta = zeta_image_of(images, d_beta, width);
                     let psi_v_zeta = zeta_image_of(&psi_images, d_beta, width);
-                    let fourth_v = self.timewiggle_order_four_axes(&frame, block_states, &calc, &v_zeta)?;
-                    let fifth_wv = self.timewiggle_order_five_axes(&frame, block_states, &calc, &w, &v_zeta)?;
-                    let fourth_psi_v = self.timewiggle_order_four_axes(&frame, block_states, &calc, &psi_v_zeta)?;
+                    let fourth_v = self.timewiggle_order_four_axes(&frame, &calc, &v_zeta)?;
+                    let fifth_wv = self.timewiggle_order_five_axes(&frame, &calc, &w, &v_zeta)?;
+                    let fourth_psi_v = self.timewiggle_order_four_axes(&frame, &calc, &psi_v_zeta)?;
                     for c in 0..p_total {
                         let (image, psi_image) = (&images[c], &psi_images[c]);
                         if image.entries().is_empty() && psi_image.entries().is_empty() {
@@ -1431,7 +1429,7 @@ impl SurvivalMarginalSlopeFamily {
                     let psi_images = psi_zeta_images(self, &frame, row, block_idx, &x_psi)?;
                     let w = zeta_image_of(&psi_images, &beta, width);
                     let third_axes = order_three_axes(&frame, &calc)?;
-                    let fourth_w = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w)?;
+                    let fourth_w = self.timewiggle_order_four_axes(&frame, &calc, &w)?;
                     for c in 0..p_total {
                         let (image, psi_image) = (&images[c], &psi_images[c]);
                         if image.entries().is_empty() && psi_image.entries().is_empty() {
@@ -1604,7 +1602,7 @@ impl SurvivalMarginalSlopeFamily {
                     let w = Self::baseline_zeta_motion(geometry, row, axis, width)?;
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, false)?;
                     let images = &calc.zeta_row.images;
-                    let fourth_w = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w)?;
+                    let fourth_w = self.timewiggle_order_four_axes(&frame, &calc, &w)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1665,7 +1663,7 @@ impl SurvivalMarginalSlopeFamily {
                     let images = &calc.zeta_row.images;
                     let v_zeta = zeta_image_of(images, d_beta, width);
                     let fifth_wv =
-                        self.timewiggle_order_five_axes(&frame, block_states, &calc, &w, &v_zeta)?;
+                        self.timewiggle_order_five_axes(&frame, &calc, &w, &v_zeta)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1730,8 +1728,8 @@ impl SurvivalMarginalSlopeFamily {
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, true)?;
                     let images = &calc.zeta_row.images;
                     let fifth_ij =
-                        self.timewiggle_order_five_axes(&frame, block_states, &calc, &w_i, &w_j)?;
-                    let fourth_ij = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_ij)?;
+                        self.timewiggle_order_five_axes(&frame, &calc, &w_i, &w_j)?;
+                    let fourth_ij = self.timewiggle_order_four_axes(&frame, &calc, &w_ij)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1856,15 +1854,14 @@ impl SurvivalMarginalSlopeFamily {
                     let w_i = zeta_image_of(&images_i, &beta, width);
                     let w_j = zeta_image_of(&images_j, &beta, width);
                     let third_axes = order_three_axes(&frame, &calc)?;
-                    let fourth_i = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_i)?;
-                    let fourth_j = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_j)?;
-                    let fifth_ij = self.timewiggle_order_five_axes(&frame, block_states, &calc, &w_i, &w_j)?;
+                    let fourth_i = self.timewiggle_order_four_axes(&frame, &calc, &w_i)?;
+                    let fourth_j = self.timewiggle_order_four_axes(&frame, &calc, &w_j)?;
+                    let fifth_ij = self.timewiggle_order_five_axes(&frame, &calc, &w_i, &w_j)?;
                     let fourth_ij = images_ij
                         .as_ref()
                         .map(|images_ij| {
                             self.timewiggle_order_four_axes(
                                 &frame,
-                                block_states,
                                 &calc,
                                 &zeta_image_of(images_ij, &beta, width),
                             )

@@ -4,7 +4,7 @@
 //! The event Jacobian also depends on the slope rate; its log derivative is a
 //! finite Taylor composition in (q, qdot, g, gdot), including the q*gdot term.
 
-use super::information_third::{FACTORIAL, PrimaryThirdDirections, mixed_fifth, static_row_fifth};
+use super::information_third::{FACTORIAL, PrimaryThirdDirections, mixed_fifth};
 use super::*;
 
 // Base-six indexing makes multiplication an index addition when total degree
