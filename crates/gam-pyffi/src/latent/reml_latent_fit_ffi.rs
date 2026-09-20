@@ -3695,6 +3695,31 @@ fn debiased_query_design_full_schema(
     })
 }
 
+/// The optional per-row importance weights of an average functional. An
+/// absent or `null` `"weights"` means unweighted. Anything else must be an
+/// array of numbers: a malformed entry is refused rather than replaced, which
+/// would report a different estimand than the one asked for (#4277).
+fn debiased_functional_weights(
+    spec_val: &serde_json::Value,
+) -> Result<Option<ndarray::Array1<f64>>, String> {
+    let entries = match spec_val.get("weights") {
+        None | Some(serde_json::Value::Null) => return Ok(None),
+        Some(value) => value.as_array().ok_or_else(|| {
+            format!("debiased_functional: \"weights\" must be an array of numbers, got {value}")
+        })?,
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(row, value)| {
+            value.as_f64().ok_or_else(|| {
+                format!("debiased_functional: weights[{row}] must be a number, got {value}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|weights| Some(ndarray::Array1::from(weights)))
+}
+
 fn weighted_affine_mean(
     values: ndarray::ArrayView1<'_, f64>,
     weights: Option<ndarray::ArrayView1<'_, f64>>,
@@ -3933,15 +3958,7 @@ fn model_debiased_functional_dataset_json_impl(
         }
         "average_derivative" | "average_value" => {
             // Uses the full training design; optional per-row weights from spec.
-            let weights: Option<ndarray::Array1<f64>> = spec_val
-                .get("weights")
-                .and_then(|v| v.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .map(|v| v.as_f64().unwrap_or(1.0))
-                        .collect::<Vec<_>>()
-                })
-                .map(ndarray::Array1::from);
+            let weights = debiased_functional_weights(&spec_val)?;
             let x_ref = x.as_ref();
             if target == "average_value" {
                 let gradient = SmoothFunctional::AverageValue {
@@ -4042,7 +4059,16 @@ fn resolve_average_derivative_column(
     dataset: &EncodedDataset,
     spec_val: &serde_json::Value,
 ) -> Result<usize, String> {
-    if let Some(name) = spec_val.get("deriv_var").and_then(|v| v.as_str()) {
+    let deriv_var = match spec_val.get("deriv_var") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            format!(
+                "debiased_functional: average_derivative \"deriv_var\" must be a column \
+                 name string, got {value}"
+            )
+        })?),
+    };
+    if let Some(name) = deriv_var {
         return dataset.column_map().get(name).copied().ok_or_else(|| {
             format!(
                 "debiased_functional: average_derivative \"deriv_var\" '{name}' \
@@ -5744,5 +5770,47 @@ where
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(err);
         }
+    }
+}
+
+/// #4277: the average functionals' weights are the caller's values or an error.
+#[cfg(test)]
+mod debiased_functional_spec_tests {
+    use super::debiased_functional_weights;
+
+    #[test]
+    fn absent_or_null_weights_are_unweighted() {
+        assert_eq!(
+            debiased_functional_weights(&serde_json::json!({"target": "average_value"})),
+            Ok(None)
+        );
+        assert_eq!(
+            debiased_functional_weights(&serde_json::json!({"weights": null})),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn numeric_weights_are_kept_exactly() {
+        let weights = debiased_functional_weights(&serde_json::json!({"weights": [0.5, 2, 3.25]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(weights.to_vec(), vec![0.5, 2.0, 3.25]);
+    }
+
+    #[test]
+    fn a_non_numeric_weight_is_refused_not_replaced_by_one() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": [1.0, null, 2.0]}))
+            .unwrap_err();
+        assert!(
+            err.contains("weights[1]"),
+            "the error must name the entry: {err}"
+        );
+    }
+
+    #[test]
+    fn a_weights_value_that_is_not_an_array_is_refused_not_dropped() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": 2.0})).unwrap_err();
+        assert!(err.contains("must be an array"), "{err}");
     }
 }
