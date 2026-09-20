@@ -61,7 +61,8 @@ pub(crate) use rayon::iter::{
     ParallelIterator,
 };
 
-pub(crate) use statrs::function::gamma::{digamma, ln_gamma};
+pub(crate) use gam_math::special::digamma;
+pub(crate) use statrs::function::gamma::ln_gamma;
 
 pub(crate) use faer::linalg::cholesky::llt::factor::LltParams;
 

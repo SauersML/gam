@@ -13,8 +13,33 @@
 //! the fit of `z` on the other columns at their own penalties. `s` is linear in
 //! `z`, so under the null it is exactly Gaussian for a Gaussian response, with
 //! covariance `φ·C`, and `Q` is exactly `Σ w_i χ²₁` with `w = eig(K^½ C K^½)`.
-//! When `φ` is estimated, `Q ≥ q` is `Σ w_i χ²₁ ≥ q·χ²_ρ/ρ` and the tail is the
-//! signed weighted chi-square `P(Σ w_i χ²₁ − (q/ρ)·χ²_ρ > 0)`.
+//!
+//! When `φ` is estimated, `φ̂ = D′/ν` is read off the residual of the full model
+//! fit UNPENALIZED, `D′ = min_β ‖z − Xβ‖²_W` on `ν = n⁺ − rank(G)`, and not off
+//! the penalized fit. The unpenalized residual is `W`-orthogonal to `span(X)`,
+//! which holds the score (`s = L·XᵀWz` for a fixed `L`), so `s` and `D′` are
+//! independent and `D′/φ ~ χ²_ν` exactly; `Q ≥ q` is `Σ w_i χ²₁ ≥ q·χ²_ν/ν`
+//! and the tail is the signed weighted chi-square `P(Σ w_i χ²₁ − (q/ν)·χ²_ν > 0)`.
+//! The penalized fit's residual has neither property: it is biased low by the
+//! directions the penalty only partly shrinks, it is not `χ²` on `n − edf`, and
+//! it is correlated with the score through the part of the score direction the
+//! shrunk fit absorbs, all three of which make the test anti-conservative
+//! (gam#3832; `random_effect_test` refers its score to the same `D′`).
+//!
+//! `D′` needs no rows. The unpenalized fit is one Newton step from `β̂` in the
+//! same `W`: with `d = XᵀW(z − Xβ̂) = S(λ)β̂ = Hβ̂ − Gβ̂` it is
+//! `β̂ + G⁺d`, and `D′ = ‖z − Xβ̂‖²_W − dᵀG⁺d`. The fit supplies the penalized
+//! working residual `‖z − Xβ̂‖²_W` and its row count `n⁺`
+//! ([`WorkingResidual`]); the ratio `Q` does not depend on the units of `W`, so
+//! the same construction serves a family whose `W` already carries `1/φ̂`.
+//!
+//! Beyond the Gaussian the row norm is the Pearson term `u_i²/W_F,i` in the
+//! expected (Fisher) weight, whose null mean is `φ` per row whatever the
+//! link, and not `u_i²/W_H,i` in the observed curvature of `G`: for a
+//! non-canonical link the two differ, and the observed form is biased (a Gamma
+//! log link has `W_H = y/μ`, so `E[(y/μ − 1)²·μ/y] = φ/(1 − φ)`), which
+//! overstates `φ̂` and makes the test conservative. For a canonical link the
+//! two weights coincide.
 //!
 //! Everything is read off the one full fit. `b = Hβ̂` equals `XᵀWz` at
 //! convergence (the penalized score vanishes, so `XᵀW(z − Xβ̂) = S(λ)β̂`), so
@@ -91,17 +116,15 @@
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_math::probability::{WeightedChiSquareTerm, signed_weighted_chi_square_sf};
 use ndarray::{Array1, Array2, ArrayView1};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
-use crate::inference::smooth_test::{SmoothTestResult, SmoothTestScale};
+use crate::inference::smooth_test::SmoothTestResult;
 
 /// Inputs to [`smooth_score_test`]. `beta`, `penalized_hessian` (`H = G + S(λ)`)
 /// and `weighted_gram` (`G = XᵀWX`) are the full fit in one coefficient layout;
 /// the term is `coeff_range`. `structural_penalties` are the term-local
-/// structural penalties `S_l`, each `m × m`, at any scale. `covariance_scale` is the `φ̂` that turns `H⁻¹` into the
-/// coefficient covariance (the profiled `σ̂²` for a Gaussian, `1` for a family
-/// whose working weight carries the dispersion). `residual_df` is `ρ` for the
-/// estimated-scale reference.
+/// structural penalties `S_l`, each `m × m`, at any scale.
 #[derive(Debug, Clone)]
 pub struct SmoothScoreTestInput<'a> {
     pub beta: ArrayView1<'a, f64>,
@@ -109,9 +132,60 @@ pub struct SmoothScoreTestInput<'a> {
     pub weighted_gram: &'a Array2<f64>,
     pub coeff_range: Range<usize>,
     pub structural_penalties: &'a [Array2<f64>],
-    pub covariance_scale: f64,
-    pub residual_df: Option<f64>,
-    pub scale: SmoothTestScale,
+    pub scale: ScoreTestScale,
+}
+
+/// The dispersion the score is referred to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ScoreTestScale {
+    /// `φ` is known, and `covariance_scale` is the `φ` that turns `G` into the
+    /// score's information (`1` for a family whose working weight carries it).
+    Known { covariance_scale: f64 },
+    /// `φ` is estimated from the full model's unpenalized residual, built from
+    /// the fit's penalized working residual; see the module docs. A fit that
+    /// recorded none has no estimated-scale reference.
+    Estimated { residual: Option<WorkingResidual> },
+}
+
+/// The penalized fit's working residual in its Pearson form.
+///
+/// `weighted_norm = Σ_i u_i²/W_i`, where `u_i` is the row's score in `η` (so
+/// `XᵀW(z − Xβ̂) = Xᵀu` and `Hβ̂ = XᵀWz`) and `W` its expected (Fisher) weight,
+/// so each term has null mean `φ` in the units of `G`; `rows` is `n⁺`, the rows
+/// with `W_i > 0`. See the module docs for why the weight is not the observed
+/// curvature of `G`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WorkingResidual {
+    pub weighted_norm: f64,
+    pub rows: usize,
+}
+
+impl WorkingResidual {
+    /// The working residual of rows with curvature weights `weights` and
+    /// scores `scores`. A row with `W_i = 0` and `u_i = 0` carries nothing and
+    /// is left out; a negative weight, or a score on a row with no weight,
+    /// leaves the working response undefined, and there is no residual.
+    pub fn of(weights: ArrayView1<'_, f64>, scores: ArrayView1<'_, f64>) -> Option<Self> {
+        if weights.len() != scores.len() {
+            return None;
+        }
+        let mut weighted_norm = 0.0;
+        let mut rows = 0;
+        for (&w, &u) in weights.iter().zip(scores.iter()) {
+            if !(w.is_finite() && u.is_finite()) || w < 0.0 {
+                return None;
+            }
+            if w == 0.0 {
+                if u != 0.0 {
+                    return None;
+                }
+                continue;
+            }
+            weighted_norm += u * u / w;
+            rows += 1;
+        }
+        Some(Self { weighted_norm, rows })
+    }
 }
 
 /// Why no score test exists for a term.
@@ -131,7 +205,9 @@ pub enum SmoothScoreTestRefusal {
     /// The likelihood curvature `G` leaves the term's score an indefinite
     /// covariance, so the score has no variance law to refer it to.
     IndefiniteCurvature,
-    /// The scale is estimated but the fit has no residual degrees of freedom.
+    /// The scale is estimated but the fit records no working residual, or the
+    /// full model fit unpenalized leaves it no residual: `n⁺ ≤ rank(G)`, or a
+    /// residual `D′` not resolved from zero.
     ResidualDfUnavailable,
 }
 
@@ -140,7 +216,7 @@ pub enum SmoothScoreTestRefusal {
 /// The returned `statistic` is `Q` rescaled so that its null mean equals the
 /// reported `ref_df = (Σw)²/Σw²`, the two-moment effective degrees of freedom
 /// of the null law. The rescaling is a unit choice for display and does not
-/// change the p-value, which is the exact tail of `Σ w_i χ²₁` (over `χ²_ρ/ρ`
+/// change the p-value, which is the exact tail of `Σ w_i χ²₁` (over `χ²_ν/ν`
 /// when the scale is estimated).
 pub fn smooth_score_test(
     input: SmoothScoreTestInput<'_>,
@@ -156,7 +232,10 @@ pub fn smooth_score_test(
         || h.dim() != (p, p)
         || g.dim() != (p, p)
         || penalties.iter().any(|penalty| penalty.dim() != (m, m))
-        || !(input.covariance_scale.is_finite() && input.covariance_scale > 0.0)
+        || matches!(input.scale, ScoreTestScale::Known { covariance_scale }
+            if !(covariance_scale.is_finite() && covariance_scale > 0.0))
+        || matches!(input.scale, ScoreTestScale::Estimated { residual: Some(residual) }
+            if !(residual.weighted_norm.is_finite() && residual.weighted_norm >= 0.0))
         || input
             .beta
             .iter()
@@ -246,8 +325,17 @@ pub fn smooth_score_test(
         column.mapv_inplace(|v| v * kernel_evals[i].sqrt());
     }
 
+    // The dispersion `Q` is on, and the `χ²_ν` it carries when estimated.
+    let (dispersion, residual_df) = match input.scale {
+        ScoreTestScale::Known { covariance_scale } => (covariance_scale, None),
+        ScoreTestScale::Estimated { residual } => {
+            let residual = residual.ok_or(SmoothScoreTestRefusal::ResidualDfUnavailable)?;
+            let (deviance, df) = unpenalized_residual(&b, g, input.beta, residual)?;
+            (deviance / df, Some(df))
+        }
+    };
     let whitened_score = root.t().dot(&score);
-    let q = whitened_score.dot(&whitened_score) / input.covariance_scale;
+    let q = whitened_score.dot(&whitened_score) / dispersion;
     let whitened_cov = symmetrized(&root.t().dot(&score_cov.dot(&root)));
     let (weights, _) = whitened_cov
         .eigh(faer::Side::Lower)
@@ -267,14 +355,10 @@ pub fn smooth_score_test(
         .iter()
         .map(|&w| WeightedChiSquareTerm { weight: w * unit, degrees_of_freedom: 1.0 })
         .collect();
-    let tail = match input.scale {
-        SmoothTestScale::Known => signed_weighted_chi_square_sf(&terms, statistic),
-        SmoothTestScale::Estimated => {
-            let rho = input
-                .residual_df
-                .filter(|rho| rho.is_finite() && *rho > 0.0)
-                .ok_or(SmoothScoreTestRefusal::ResidualDfUnavailable)?;
-            terms.push(WeightedChiSquareTerm { weight: -statistic / rho, degrees_of_freedom: rho });
+    let tail = match residual_df {
+        None => signed_weighted_chi_square_sf(&terms, statistic),
+        Some(df) => {
+            terms.push(WeightedChiSquareTerm { weight: -statistic / df, degrees_of_freedom: df });
             signed_weighted_chi_square_sf(&terms, 0.0)
         }
     };
@@ -282,6 +366,43 @@ pub fn smooth_score_test(
         return Err(SmoothScoreTestRefusal::InconsistentFit);
     }
     Ok(SmoothTestResult { statistic, ref_df, p_value: tail.probability.clamp(0.0, 1.0) })
+}
+
+/// The full model's unpenalized residual `D′` and its degrees of freedom
+/// `ν = n⁺ − rank(G)`, from the penalized fit's working residual; see the
+/// module docs. `b = Hβ̂`, so `d = b − Gβ̂ = XᵀW(z − Xβ̂)`.
+fn unpenalized_residual(
+    b: &Array1<f64>,
+    g: &Array2<f64>,
+    beta: ArrayView1<'_, f64>,
+    residual: WorkingResidual,
+) -> Result<(f64, f64), SmoothScoreTestRefusal> {
+    let d = b - &g.dot(&beta);
+    let (evals, evecs) = symmetrized(g)
+        .eigh(faer::Side::Lower)
+        .map_err(|_| SmoothScoreTestRefusal::InconsistentFit)?;
+    let tolerance = crate::basis::spectral_tolerance(&evals);
+    let mut rank = 0usize;
+    let mut explained = 0.0;
+    for (i, &value) in evals.iter().enumerate() {
+        if value > tolerance {
+            let projection = evecs.column(i).dot(&d);
+            explained += projection * projection / value;
+            rank += 1;
+        }
+    }
+    let df = residual.rows as f64 - rank as f64;
+    let deviance = residual.weighted_norm - explained;
+    // `‖z − Xβ̂‖²_W` sums `n⁺` terms and `dᵀG⁺d` sums `rank` more; a difference
+    // inside their accumulation band is not resolved from zero.
+    let band = gam_linalg::roundoff::accumulation_band(
+        residual.rows + rank,
+        residual.weighted_norm + explained,
+    );
+    if !(df > 0.0) || !(deviance > band) {
+        return Err(SmoothScoreTestRefusal::ResidualDfUnavailable);
+    }
+    Ok((deviance, df))
 }
 
 /// One structural penalty `S = V·diag(d)·Vᵀ` with `V` the orthonormal
@@ -361,6 +482,7 @@ fn select_vector(vector: &Array1<f64>, rows: &[usize]) -> Array1<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inference::smooth_test::SmoothTestScale;
     use rand::rngs::StdRng;
     use rand::{RngExt, SeedableRng};
 
@@ -447,8 +569,7 @@ mod tests {
         beta: Array1<f64>,
         hessian: Array2<f64>,
         gram: Array2<f64>,
-        sigma2_hat: f64,
-        residual_df: f64,
+        residual: WorkingResidual,
     }
 
     /// The weighted penalized least-squares fit at the design's fixed λ.
@@ -458,12 +579,9 @@ mod tests {
         let hessian = &gram + &design.penalty;
         let factor = hessian.cholesky(faer::Side::Lower).expect("H is positive definite");
         let beta = factor.solvevec(&wx.t().dot(y));
-        let influence = factor.solve_mat(&gram);
-        let edf = influence.diag().sum();
-        let residual = y - &design.x.dot(&beta);
-        let rss = residual.iter().zip(design.weights.iter()).map(|(r, w)| w * r * r).sum::<f64>();
-        let residual_df = y.len() as f64 - edf;
-        Fit { beta, hessian, gram, sigma2_hat: rss / residual_df, residual_df }
+        let scores = (y - &design.x.dot(&beta)) * &design.weights;
+        let residual = WorkingResidual::of(design.weights.view(), scores.view()).expect("the residual is finite");
+        Fit { beta, hessian, gram, residual }
     }
 
     fn test(design: &Design, fit: &Fit, scale: SmoothTestScale) -> SmoothTestResult {
@@ -477,9 +595,9 @@ mod tests {
         scale: SmoothTestScale,
         structural_penalties: &[Array2<f64>],
     ) -> Result<SmoothTestResult, SmoothScoreTestRefusal> {
-        let covariance_scale = match scale {
-            SmoothTestScale::Known => 1.0,
-            SmoothTestScale::Estimated => fit.sigma2_hat,
+        let scale = match scale {
+            SmoothTestScale::Known => ScoreTestScale::Known { covariance_scale: 1.0 },
+            SmoothTestScale::Estimated => ScoreTestScale::Estimated { residual: Some(fit.residual) },
         };
         smooth_score_test(SmoothScoreTestInput {
             beta: fit.beta.view(),
@@ -487,8 +605,6 @@ mod tests {
             weighted_gram: &fit.gram,
             coeff_range: design.term.clone(),
             structural_penalties,
-            covariance_scale,
-            residual_df: Some(fit.residual_df),
             scale,
         })
     }
@@ -792,7 +908,7 @@ mod tests {
         assert_eq!(refused.unwrap_err(), SmoothScoreTestRefusal::IndefiniteCurvature);
     }
 
-    /// The estimated-scale reference needs its denominator degrees of freedom.
+    /// The estimated-scale reference needs the fit's working residual.
     #[test]
     fn an_estimated_scale_without_residual_df_is_refused() {
         let design = design(60);
@@ -804,10 +920,62 @@ mod tests {
             weighted_gram: &fitted.gram,
             coeff_range: design.term.clone(),
             structural_penalties: &[design.wiggle.clone(), design.null_space.clone()],
-            covariance_scale: fitted.sigma2_hat,
-            residual_df: None,
-            scale: SmoothTestScale::Estimated,
+            scale: ScoreTestScale::Estimated { residual: None },
         });
         assert_eq!(refused.unwrap_err(), SmoothScoreTestRefusal::ResidualDfUnavailable);
+    }
+
+    /// `D′ = ‖z − Xβ̂‖²_W − dᵀG⁺d` is the residual of the unpenalized weighted
+    /// least-squares fit on the same design, read off the penalized fit, and
+    /// `ν = n − rank(X)`.
+    #[test]
+    fn the_scale_is_the_unpenalized_residual() {
+        let design = design(40);
+        let mut rng = StdRng::seed_from_u64(0xd1);
+        let y = null_response(&design, &mut rng);
+        let fitted = fit(&design, &y);
+        let (deviance, df) = unpenalized_residual(
+            &fitted.hessian.dot(&fitted.beta),
+            &fitted.gram,
+            fitted.beta.view(),
+            fitted.residual,
+        )
+        .expect("the unpenalized residual is resolved");
+        let wx = &design.x * &design.weights.view().insert_axis(ndarray::Axis(1));
+        let unpenalized = fitted
+            .gram
+            .cholesky(faer::Side::Lower)
+            .expect("X has full column rank")
+            .solvevec(&wx.t().dot(&y));
+        let residual = &y - &design.x.dot(&unpenalized);
+        let rss: f64 = residual.iter().zip(design.weights.iter()).map(|(r, w)| w * r * r).sum();
+        assert_eq!(df, (design.x.nrows() - design.x.ncols()) as f64);
+        assert!((deviance - rss).abs() <= 1e-9 * rss, "D′ {deviance} vs unpenalized RSS {rss}");
+    }
+
+    /// At small `n` with the other terms penalized, the penalized residual
+    /// `‖z − Xβ̂‖²_W/(n − edf)` is not independent of the score, and its
+    /// `χ²_{n−edf}` reference over-states the denominator's precision: the
+    /// test rejected 11.7% at 0.10 and 5.8% at 0.05 here (gam#3832). The
+    /// unpenalized residual is independent of the score exactly, so the size
+    /// holds at any `n`: 10.1%, 5.0% and 0.95% at 0.10, 0.05 and 0.01.
+    #[test]
+    fn the_estimated_scale_is_calibrated_at_small_n() {
+        let mut design = design(32);
+        design.penalty[[2, 2]] = 0.5;
+        design.penalty[[3, 3]] = 0.5;
+        let reps = 8000;
+        let mut rng = StdRng::seed_from_u64(0x3832);
+        let p_values: Vec<f64> = (0..reps)
+            .map(|_| {
+                test(&design, &fit(&design, &null_response(&design, &mut rng)), SmoothTestScale::Estimated)
+                    .p_value
+            })
+            .collect();
+        for level in [0.10, 0.05, 0.01] {
+            let size = p_values.iter().filter(|&&p| p <= level).count() as f64 / reps as f64;
+            let mcse = (level * (1.0 - level) / reps as f64).sqrt();
+            assert!((size - level).abs() <= 3.0 * mcse, "size {size} at level {level} (MCSE {mcse})");
+        }
     }
 }
