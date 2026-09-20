@@ -900,14 +900,12 @@ mod tests {
         let (contrast, covariance) = correlated_curve_fixture();
         let beta = Array1::zeros(covariance.nrows());
         let level = 0.95;
+        let options = SimultaneousBandOptions::at_level(level).unwrap();
         let simultaneous = effect_report(
             beta.view(),
             covariance.view(),
             contrast.view(),
-            BandOptions::Simultaneous(SimultaneousBandOptions {
-                level,
-                ..SimultaneousBandOptions::default()
-            }),
+            BandOptions::Simultaneous(options),
         )
         .unwrap();
         let pointwise = effect_report(
@@ -934,9 +932,9 @@ mod tests {
                 / replicates as f64
         };
         // Coverage error from the replicate count and from the calibration's
-        // own quantile estimate at the default simulation count.
+        // own quantile estimate at the level's derived simulation count.
         let mcse = (level * (1.0 - level) / replicates as f64
-            + level * (1.0 - level) / DEFAULT_SIMULATIONS as f64)
+            + level * (1.0 - level) / options.simulations as f64)
             .sqrt();
         let whole_curve = coverage(simultaneous.critical);
         assert!(
