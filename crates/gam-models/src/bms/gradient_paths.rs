@@ -506,6 +506,44 @@ pub(super) fn pooled_probit_baseline(
         }
     };
 
+    // The descent step `M⁻¹g` on the metric and its decrement `gᵀM⁻¹g ≥ 0`,
+    // solved on the metric and the gradient divided by the metric's largest
+    // diagonal (the step is invariant to that common scale; the raw products
+    // are not representable). A metric whose determinant sits inside its
+    // rounding band is rank one, `trace·vvᵀ` with `v` its dominant column
+    // normalised, and the step is its Moore–Penrose solve rather than a ridged
+    // one. The armed metric is never rank one here: its evaluation refused a
+    // singular information.
+    let descent_step = |e: &PooledProbitEval| -> Result<(f64, f64, f64), PooledPilotRefusal> {
+        if e.scale == 0.0 {
+            return Err(
+                "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
+                 so the pooled information is zero and no Newton direction exists"
+                    .to_string()
+                    .into(),
+            );
+        }
+        let (h00, h01, h11) = (e.m00, e.m01, e.m11);
+        let (g0, g1) = (e.g0 / e.scale, e.g1 / e.scale);
+        let (det, det_band) = determinant(h00, h01, e.m01_abs, h11);
+        let (step0, step1) = if det > det_band {
+            ((h11 * g0 - h01 * g1) / det, (h00 * g1 - h01 * g0) / det)
+        } else {
+            let trace = h00 + h11;
+            let (c0, c1) = if h00 >= h11 { (h00, h01) } else { (h01, h11) };
+            let norm = c0.hypot(c1);
+            let (v0, v1) = (c0 / norm, c1 / norm);
+            let along = (v0 * g0 + v1 * g1) / trace;
+            (along * v0, along * v1)
+        };
+        if !(step0.is_finite() && step1.is_finite()) {
+            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite"
+                .to_string()
+                .into());
+        }
+        Ok((step0, step1, e.g0 * step0 + e.g1 * step1))
+    };
+
     loop {
         let Some(e) = evaluate(beta0, beta1) else {
             return Err(format!(
@@ -525,39 +563,15 @@ pub(super) fn pooled_probit_baseline(
         if e.g0.abs() <= e.g0_band && e.g1.abs() <= e.g1_band {
             break;
         }
-        if e.scale == 0.0 {
-            return Err(
-                "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
-                 so the pooled information is zero and no Newton direction exists"
-                    .to_string()
-                    .into(),
-            );
-        }
-        let (h00, h01, h11) = (e.m00, e.m01, e.m11);
-        let (g0, g1) = (e.g0 / e.scale, e.g1 / e.scale);
-        let (det, det_band) = determinant(h00, h01, e.m01_abs, h11);
-        let (step0, step1) = if det > det_band {
-            ((h11 * g0 - h01 * g1) / det, (h00 * g1 - h01 * g0) / det)
-        } else {
-            // A rank-one information is `trace·vvᵀ`, `v` its dominant column
-            // normalised. The armed metric is never rank one here: its evaluation
-            // refused a singular information.
-            let trace = h00 + h11;
-            let (c0, c1) = if h00 >= h11 { (h00, h01) } else { (h01, h11) };
-            let norm = c0.hypot(c1);
-            let (v0, v1) = (c0 / norm, c1 / norm);
-            let along = (v0 * g0 + v1 * g1) / trace;
-            (along * v0, along * v1)
-        };
-        if !(step0.is_finite() && step1.is_finite()) {
-            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite"
-                .to_string()
-                .into());
-        }
+        let (step0, step1, decrement) = descent_step(&e)?;
         // Halve until a trial lowers the objective by more than the two evaluations'
-        // rounding bands, or no longer moves the iterate in floating point. An
-        // objective whose descent direction admits no such decrease at any
-        // representable length is at its minimum to working precision.
+        // rounding bands, or, not raising it, lowers the decrement `gᵀM⁻¹g`: near
+        // the mode the objective's change is below its resolution while the
+        // gradient's is not, so the gradient decides there. The objective never
+        // rises, so no sequence of accepted steps returns to an iterate: one that
+        // kept it level throughout would have lowered the decrement at every step.
+        // An iterate no representable length improves by either is at its minimum
+        // to working precision.
         let mut length = 1.0_f64;
         let accepted = loop {
             let cand0 = beta0 - length * step0;
@@ -567,9 +581,19 @@ pub(super) fn pooled_probit_baseline(
             }
             if let Some(cand) = evaluate(cand0, cand1)
                 && cand.obj.is_finite()
-                && e.obj - cand.obj > e.obj_band + cand.obj_band
+                && cand.g0.is_finite()
+                && cand.g1.is_finite()
             {
-                break Some((cand0, cand1));
+                let band = e.obj_band + cand.obj_band;
+                if e.obj - cand.obj > band {
+                    break Some((cand0, cand1));
+                }
+                if cand.obj <= e.obj
+                    && let Ok((_, _, cand_decrement)) = descent_step(&cand)
+                    && cand_decrement < decrement
+                {
+                    break Some((cand0, cand1));
+                }
             }
             length *= 0.5;
         };
@@ -685,16 +709,32 @@ mod pooled_probit_prevalence_tests {
         let (intercept, slope) =
             pooled_probit_baseline(&y, &z, &weights, true).expect("Jeffreys pilot");
         assert!(intercept.is_finite() && slope.is_finite() && slope > 0.0);
-        // The Jeffreys mode's margins keep the pooled information resolvable,
-        // which the confound audit's row metric is built from.
-        let min_density = z
-            .iter()
-            .map(|&zi| {
-                let eta = intercept * (1.0 + slope * slope).sqrt() + slope * zi;
-                (-0.5 * eta * eta).exp()
-            })
-            .fold(f64::INFINITY, f64::min);
-        assert!(min_density > 0.0, "slope {slope}, intercept {intercept}");
+        // The Jeffreys mode keeps the pooled information resolvable, which the
+        // confound audit's row metric is built from, and it is a minimum of
+        // `F = NLL − ½ log|I|`, formed here independently from the CDF: no
+        // relative move of either coordinate lowers it.
+        let beta0 = intercept * (1.0 + slope * slope).sqrt();
+        let objective = |b0: f64, b1: f64| {
+            let (mut nll, mut i00, mut i01, mut i11) = (0.0, 0.0, 0.0, 0.0);
+            for (&yi, &zi) in y.iter().zip(z.iter()) {
+                let eta = b0 + b1 * zi;
+                let p = gam_math::probability::normal_cdf(eta);
+                let q = gam_math::probability::normal_cdf(-eta);
+                nll -= if yi > 0.5 { p.ln() } else { q.ln() };
+                let density = (-0.5 * eta * eta).exp() / (std::f64::consts::TAU).sqrt();
+                let omega = if density > 0.0 { density * density / (p * q) } else { 0.0 };
+                i00 += omega;
+                i01 += omega * zi;
+                i11 += omega * zi * zi;
+            }
+            (nll - 0.5 * (i00 * i11 - i01 * i01).ln(), i00)
+        };
+        let (at_mode, information) = objective(beta0, slope);
+        assert!(information > 0.0, "slope {slope}, intercept {intercept}");
+        for (d0, d1) in [(1e-3, 0.0), (-1e-3, 0.0), (0.0, 1e-3), (0.0, -1e-3)] {
+            let moved = objective(beta0 + d0, slope * (1.0 + d1)).0;
+            assert!(moved > at_mode, "F({d0}, {d1}) = {moved} <= F(mode) = {at_mode}");
+        }
     }
 }
 
