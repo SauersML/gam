@@ -1126,6 +1126,12 @@ impl EstimationError {
             Self::OuterObjectiveEvaluationFailed { source, .. } => {
                 source.estimation_error().and_then(Self::advice)
             }
+            // The wrapper `innermost_estimation_error` (and so `variant_name`
+            // and `error_category`) reads through: the advice must name the
+            // same failure the variant does.
+            Self::CustomFamily(CustomFamilyError::OuterSmoothingFailed { outer_error, .. }) => {
+                outer_error.advice()
+            }
             Self::PerfectSeparationDetected { .. } | Self::MultinomialSeparationDetected { .. } => {
                 Some(format!("Detected (quasi-)separation. {SEPARATION}"))
             }
@@ -1590,7 +1596,8 @@ mod advice_policy_tests {
         };
         let advice = separation.advice().expect("separation advice");
         assert!(advice.contains("column 3"), "{advice}");
-        assert!(advice.contains("Firth"), "{advice}");
+        assert!(advice.contains("Jeffreys"), "{advice}");
+        assert!(advice.contains("Fix the SAS or mixture link parameters"), "{advice}");
 
         let conditioning = EstimationError::ModelIsIllConditioned {
             condition_number: 1e18,
@@ -1613,6 +1620,26 @@ mod advice_policy_tests {
                 .advice()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn advice_reads_through_a_custom_family_outer_smoothing_failure() {
+        let wrapped = EstimationError::CustomFamily(CustomFamilyError::OuterSmoothingFailed {
+            reason: "outer smoothing optimization failed".to_string(),
+            last_refusal: None,
+            search_inner_refusal: None,
+            outer_error: std::sync::Arc::new(EstimationError::ModelIsIllConditioned {
+                condition_number: 1e18,
+            }),
+        });
+        assert_eq!(
+            wrapped.variant_name(),
+            "EstimationError::ModelIsIllConditioned"
+        );
+        let advice = wrapped
+            .advice()
+            .expect("the wrapped failure's advice survives the custom-family wrapper");
+        assert!(advice.contains("collinear"), "{advice}");
     }
 }
 
