@@ -1365,15 +1365,24 @@ pub(crate) fn matern_operator_psi_triplet(
     let a = s * r;
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = exp_poly_scaled_s2_psi_triplet(s, a, rr, 1.0);
 
-    // nu=1/2 has singular phi'(r)/r ~ -kappa/r as r->0.
-    // We use the same finite r-floor regularization as operator assembly.
+    // nu=1/2: phi'(r)/r = -(s/r)·e^{-a} diverges at a center collision. The
+    // value path (`build_matern_collocation_operator_matrices`) defines it
+    // there by the exact 1-D convention phi'/r = 0 (the 1-D Laplacian is
+    // phi'' alone) and refuses d > 1, so the ψ-derivatives follow that same
+    // convention instead of evaluating the divergent ratio at a floored r.
     let (ratio, ratio_psi, ratio_psi_psi) = if matches!(nu, MaternNu::Half) {
-        let r_eff = r.max(1e-12);
-        let e_eff = (-a).exp();
-        let g = -(s / r_eff) * e_eff;
-        let g_psi = -(s / r_eff) * e_eff * (1.0 - a);
-        let g_psi_psi = -(s / r_eff) * e_eff * (1.0 - 3.0 * a + a * a);
-        (g, g_psi, g_psi_psi)
+        if r == 0.0 {
+            if dimension > 1 {
+                crate::bail_invalid_basis!(
+                    "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers"
+                );
+            }
+            (0.0, 0.0, 0.0)
+        } else {
+            let e = (-a).exp();
+            let g = -(s / r) * e;
+            (g, g * (1.0 - a), g * (1.0 - 3.0 * a + a * a))
+        }
     } else {
         exp_poly_scaled_s2_psi_triplet(s, a, q, -1.0)
     };
@@ -3424,14 +3433,23 @@ pub(crate) fn build_matern_basis_log_kappa_derivativeswithworkspace(
             )?,
         )
     } else {
-        build_matern_operator_penalty_psi_derivatives(
+        // The builder returns the canonical `[mass, tension, stiffness]` blocks
+        // (plus third-order when the kernel carries it), while the forward build
+        // keeps only the operators `matern_for_smoothness` admits (ν = 1/2 keeps
+        // mass alone, #707). Select each surviving penalty's block by source so
+        // the derivative list is index-aligned with `base.active_penalties`.
+        let (first_blocks, second_blocks) = build_matern_operator_penalty_psi_derivatives(
             centers.view(),
             length_scale,
             spec.nu,
             spec.include_intercept,
             z_opt.as_ref(),
             aniso,
-        )?
+        )?;
+        (
+            active_operator_penalty_derivatives(&base.active_penalties, &first_blocks, "Matérn")?,
+            active_operator_penalty_derivatives(&base.active_penalties, &second_blocks, "Matérn")?,
+        )
     };
 
     Ok(BasisPsiDerivativeBundle {
@@ -4361,3 +4379,97 @@ mod harmonic_penalty_invariants_tests {
 
 #[cfg(test)]
 mod sphere_harmonic_default_degree_tests;
+
+#[cfg(test)]
+mod matern_rough_kernel_log_kappa_alignment_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn centers_1d() -> Array2<f64> {
+        Array2::from_shape_vec((6, 1), vec![0.0, 0.15, 0.4, 0.55, 0.8, 1.0]).expect("6x1 centers")
+    }
+
+    fn rough_spec(centers: &Array2<f64>, log_kappa: f64) -> MaternBasisSpec {
+        MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            periodic: None,
+            length_scale: MaternLengthScale::fixed((-log_kappa).exp()),
+            nu: MaternNu::Half,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: Default::default(),
+            aniso_log_scales: None,
+        }
+    }
+
+    fn forward_penalties(centers: &Array2<f64>, log_kappa: f64) -> Vec<Array2<f64>> {
+        build_matern_basis(centers.view(), &rough_spec(centers, log_kappa))
+            .expect("ν = 1/2 Matérn basis in 1-D")
+            .active_penalties
+            .into_iter()
+            .map(|penalty| penalty.matrix)
+            .collect()
+    }
+
+    fn max_abs(a: &Array2<f64>) -> f64 {
+        a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()))
+    }
+
+    /// ν = 1/2 keeps only the mass operator (#707), so the non-double-penalty
+    /// κ-derivative bundle must carry exactly the forward active blocks — not the
+    /// canonical tension/stiffness blocks the forward build never has, which the
+    /// positional `penalty_start + j` numbering downstream would attach to other
+    /// penalties — and the surviving block must be the derivative of the forward
+    /// penalty.
+    #[test]
+    fn rough_matern_log_kappa_derivatives_align_with_forward_penalties() {
+        let centers = centers_1d();
+        let log_kappa: f64 = 0.4;
+        let bundle = build_matern_basis_log_kappa_derivatives(
+            centers.view(),
+            &rough_spec(&centers, log_kappa),
+        )
+        .expect("ν = 1/2 κ-derivative bundle");
+        let first = bundle.first.penalties_derivative;
+        let second = bundle.second.penaltiessecond_derivative;
+        let center = forward_penalties(&centers, log_kappa);
+        assert_eq!(center.len(), 1, "ν = 1/2 keeps the mass operator alone");
+        assert_eq!(
+            first.len(),
+            center.len(),
+            "first-derivative blocks must match the forward list"
+        );
+        assert_eq!(
+            second.len(),
+            center.len(),
+            "second-derivative blocks must match the forward list"
+        );
+
+        let h = 1e-4;
+        let plus = forward_penalties(&centers, log_kappa + h);
+        let minus = forward_penalties(&centers, log_kappa - h);
+        let fd_first = (&plus[0] - &minus[0]) / (2.0 * h);
+        let fd_second = (&plus[0] - &(&center[0] * 2.0) + &minus[0]) / (h * h);
+        let first_gap = max_abs(&(&first[0] - &fd_first));
+        let second_gap = max_abs(&(&second[0] - &fd_second));
+        let first_scale = max_abs(&fd_first).max(1.0);
+        let second_scale = max_abs(&fd_second).max(1.0);
+        assert!(first_gap < 1e-5 * first_scale, "∂S₀/∂ψ gap {first_gap:.3e}");
+        assert!(
+            second_gap < 1e-3 * second_scale,
+            "∂²S₀/∂ψ² gap {second_gap:.3e}"
+        );
+    }
+
+    /// At a center collision the ν = 1/2 ratio φ'/r takes the value path's exact
+    /// 1-D convention (0, constant in ψ), and d > 1 is refused as the forward
+    /// collocation builder refuses it — no finite r-floor stands in for either.
+    #[test]
+    fn rough_matern_collision_ratio_follows_the_value_path_convention() {
+        let (_, _, _, ratio, ratio_psi, ratio_psi_psi, _, _, _) =
+            matern_operator_psi_triplet(0.0, 0.7, MaternNu::Half, 1)
+                .expect("1-D ν = 1/2 collision is defined");
+        assert_eq!((ratio, ratio_psi, ratio_psi_psi), (0.0, 0.0, 0.0));
+        assert!(matern_operator_psi_triplet(0.0, 0.7, MaternNu::Half, 2).is_err());
+    }
+}
