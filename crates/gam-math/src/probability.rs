@@ -616,47 +616,108 @@ pub fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
                 break;
             }
         }
-        // The series branch is entered only for `x < a + 1`, where `P` is bounded
-        // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
-        // magnitudes and keeps every digit `P` has.
         let p = (sum.ln() + a * x.ln() - x - gln).exp();
-        (p, 1.0 - p)
+        // The complement `1 − P` keeps absolute accuracy ε, so its relative
+        // error is ε·P/Q. For `a ≥ 1` this branch has `Q ≥ Q(1, 2) = e^{-2}`, so
+        // the loss is below a factor `e² − 1`. For `a < 1`, however,
+        // `Q(a, x) ≈ a·E₁(x)` goes to 0 with `a`, so there `Q` is summed
+        // directly (#4242).
+        if a < 1.0 {
+            (p, small_shape_upper_gamma_below_split(a, x))
+        } else {
+            (p, 1.0 - p)
+        }
     } else {
-        // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
         // Evaluating the *upper* tail here keeps the directly-computed quantity
         // small wherever P is near 1, so `1 − Q` loses no significant digits.
-        // Lentz's modified continued-fraction algorithm substitutes a tiny value
-        // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
-        // component of the algorithm, not a floor on a result: any value below
-        // the smallest normal quotient works and the converged fraction does not
-        // depend on it, so it is the arithmetic's own smallest normal, not a
-        // chosen magnitude (#2469).
-        const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
-        let mut b = x + 1.0 - a;
-        let mut c = 1.0 / LENTZ_TINY;
-        let mut d = 1.0 / b;
-        let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
-            b += 2.0;
-            d = an * d + b;
-            if d.abs() < LENTZ_TINY {
-                d = LENTZ_TINY;
-            }
-            c = b + an / c;
-            if c.abs() < LENTZ_TINY {
-                c = LENTZ_TINY;
-            }
-            d = 1.0 / d;
-            let del = d * c;
-            h *= del;
-            if (del - 1.0).abs() <= f64::EPSILON {
-                break;
-            }
-        }
-        let q = (a * x.ln() - x - gln + h.ln()).exp();
+        let q = (a * x.ln() - x - gln + upper_gamma_continued_fraction(a, x).ln()).exp();
         (1.0 - q, q)
     }
+}
+
+/// The modified-Lentz continued fraction `h(a, x)` with
+/// `Γ(a, x) = x^a·e^{−x}·h(a, x)`, the upper incomplete gamma function,
+/// evaluated for `x ≥ a + 1`, where it converges rapidly (Numerical Recipes
+/// §6.2).
+fn upper_gamma_continued_fraction(a: f64, x: f64) -> f64 {
+    // Lentz's modified continued-fraction algorithm substitutes a tiny value
+    // for an exact zero in its recurrence (Numerical Recipes §6.2). It is a
+    // component of the algorithm, not a floor on a result: any value below
+    // the smallest normal quotient works and the converged fraction does not
+    // depend on it, so it is the arithmetic's own smallest normal, not a
+    // chosen magnitude (#2469).
+    const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / LENTZ_TINY;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for i in 1..1000 {
+        let an = -(i as f64) * (i as f64 - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < LENTZ_TINY {
+            d = LENTZ_TINY;
+        }
+        c = b + an / c;
+        if c.abs() < LENTZ_TINY {
+            c = LENTZ_TINY;
+        }
+        d = 1.0 / d;
+        let del = d * c;
+        h *= del;
+        if (del - 1.0).abs() <= f64::EPSILON {
+            break;
+        }
+    }
+    h
+}
+
+/// `Q(a, x)` for `0 < a < 1`, `0 < x < s = a + 1`, summed without the
+/// complement `1 − P`.
+///
+/// `Γ(a, x) = Γ(a, s) + ∫_x^s t^{a−1}e^{−t} dt`, and both parts are positive.
+/// `Γ(a, s) = s^a e^{−s} h(a, s)` comes from the continued fraction at its own
+/// convergence boundary. Expanding `e^{−t}` gives
+///
+/// `∫_x^s t^{a−1}e^{−t} dt = Σ_{n≥0} (−1)^n c_n`, where
+/// `c_n = s^{a+n}(1 − r^{a+n}) / ((a+n)·n!)` and `r = x/s < 1`.
+///
+/// Each `1 − r^{a+n} = −expm1((a+n)·ln r)` lies in `(0, 1)`, so no term
+/// overflows or cancels. For `m > 0`, `(1 − r^{m+1})/(1 − r^m) ≤ 1 + 1/m`
+/// (`1 − r^m − m·r^m(1−r)` falls to 0 at `r = 1`). So `c_{n+1}/c_n ≤ s/(n+1) < 1`
+/// for every `n ≥ 1`, because `s < 2`. The alternating tail past term `n − 1` is
+/// then bounded by `c_n`, and the sum stops once `c_n` is below one rounding of
+/// the positive total. Dividing by `Γ(a) = Γ(1+a)/a` uses `ln Γ(1+a)`, whose
+/// argument lies in `[1, 2)`, so the division costs only the absolute error of
+/// that logarithm and not the `ln(1/a)` magnitude of `ln Γ(a)`.
+fn small_shape_upper_gamma_below_split(a: f64, x: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    let s = a + 1.0;
+    let ln_r = (x / s).ln();
+    let s_pow_a = (a * s.ln()).exp();
+    let mut total = s_pow_a * (-s).exp() * upper_gamma_continued_fraction(a, s)
+        + s_pow_a * (-(a * ln_r).exp_m1()) / a;
+    // `s^{a+n} / n!`, carried as a ratio so neither factor overflows.
+    let mut scaled_power = s_pow_a;
+    let mut n = 1.0_f64;
+    loop {
+        scaled_power *= s / n;
+        let m = a + n;
+        let term = scaled_power * (-(m * ln_r).exp_m1()) / m;
+        // Negated so that a NaN (from an unvalidated `a ≤ 0`) ends the sum and
+        // propagates, rather than never satisfying the comparison.
+        if !(term > total * f64::EPSILON) {
+            break;
+        }
+        // `(−1)^n`: odd `n` subtracts.
+        if n % 2.0 == 1.0 {
+            total -= term;
+        } else {
+            total += term;
+        }
+        n += 1.0;
+    }
+    total * a / ln_gamma(s).exp()
 }
 
 /// Inverse of the regularized lower incomplete gamma function: the `x ≥ 0` with
@@ -1925,6 +1986,38 @@ mod tests {
             }
         }
         assert!(chi_square_quantile(0.5, 0.0).is_nan());
+    }
+
+    /// #4242: below the split `x < a + 1` with shape `a < 1`, `Q(a, x)` keeps
+    /// relative accuracy as `a → 0`. The references are 50-digit
+    /// `mpmath.gammainc(a, x, inf, regularized=True)` values at the exact
+    /// binary `a` and `x`. The bar, 64ε, is twice the ≈32ε that the continued
+    /// fraction the sum reuses reaches at `x = a + 1` as `a → 0`. The complement
+    /// `1 − P` that the sum replaces has relative error ≈ ε·P/Q, which grows
+    /// without bound as `a → 0`; it misses the `a ≤ 1e-3` rows by more than the
+    /// bar (1.9e5ε at `a = 1e-4`).
+    #[test]
+    fn small_shape_upper_gamma_keeps_relative_accuracy_4242() {
+        let bar = 64.0 * f64::EPSILON;
+        let cases: [(f64, f64, f64); 8] = [
+            (1e-2, 0.909, 2.585_880_246_514_324_190_4e-3),
+            (1e-3, 0.99099, 2.229_549_549_437_722_252_1e-4),
+            (1e-4, 0.9901, 2.230_849_540_126_837_447_8e-5),
+            (1e-8, 0.5, 5.597_735_977_099_587_104_9e-9),
+            (1e-12, 0.7, 3.737_688_432_337_938_572_5e-13),
+            (0.5, 1.2, 0.121_335_250_358_482_153_42),
+            (0.9, 1e-3, 0.997_926_400_133_915_959_51),
+            (0.3, 1e-20, 0.999_998_885_757_491_452_7),
+        ];
+        for (a, x, expected) in cases {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let rel = (q - expected).abs() / expected;
+            assert!(rel <= bar, "Q({a}, {x}) = {q:e}, expected {expected:e}: rel {rel:e}");
+            if a <= 1e-3 {
+                let complement = ((1.0 - p) - expected).abs() / expected;
+                assert!(complement > bar, "1 − P already meets the bar at a = {a}");
+            }
+        }
     }
 
     const TOL: f64 = 1e-12;
