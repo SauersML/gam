@@ -47,18 +47,23 @@ LoadedModel: TypeAlias = (
 
 @dataclass(frozen=True, slots=True)
 class SharedPrecisionGroup:
-    """Cross-fit coefficient precision group.
+    """Cross-fit shared precision group of one penalized term.
 
     ``name`` is the shared precision coordinate. By default it selects the
-    same named coefficient term/column/label in every model. ``labels`` can
-    override that with either one label for all models or a mapping keyed by
-    the model name/index supplied to :func:`cross_fit_shared_precision_groups`.
+    penalized term of that name in every model. ``labels`` can override that
+    with either one term name for all models or a mapping keyed by the model
+    name/index supplied to :func:`cross_fit_shared_precision_groups`.
+    ``penalty`` picks one penalty block, by its 0-based position among the
+    term's blocks, when the term has several (a double-penalty smooth, a
+    tensor product). ``shape`` and ``rate`` are the ``Gamma(a, b)`` hyperprior
+    on the shared precision.
     """
 
     name: str
     shape: float = 1.0
     rate: float = 0.0
     labels: str | Mapping[str | int, str] | None = None
+    penalty: int | None = None
 
 
 def _normalize_shared_precision_group(
@@ -74,11 +79,13 @@ def _normalize_shared_precision_group(
         shape = value.get("shape", 1.0)
         rate = value.get("rate", 0.0)
         labels = value.get("labels")
+        penalty = value.get("penalty")
         return SharedPrecisionGroup(
             name=str(name),
             shape=float(shape),
             rate=float(rate),
             labels=labels,
+            penalty=None if penalty is None else int(penalty),
         )
     if default_name is not None:
         shape, rate = value
@@ -88,23 +95,11 @@ def _normalize_shared_precision_group(
 
 def _normalize_shared_precision_groups(groups: Any) -> list[SharedPrecisionGroup]:
     if isinstance(groups, Mapping):
-        normalized = [
+        return [
             _normalize_shared_precision_group(value, str(name))
             for name, value in groups.items()
         ]
-    else:
-        normalized = [_normalize_shared_precision_group(value) for value in groups]
-    seen: set[str] = set()
-    duplicates: list[str] = []
-    for group in normalized:
-        if group.name in seen:
-            duplicates.append(group.name)
-        seen.add(group.name)
-    if duplicates:
-        raise ValueError(
-            "duplicate shared precision group name(s): " + ", ".join(sorted(set(duplicates)))
-        )
-    return normalized
+    return [_normalize_shared_precision_group(value) for value in groups]
 
 
 def _normalize_model_mapping(models: Any) -> list[tuple[str | int, Model]]:
@@ -112,8 +107,6 @@ def _normalize_model_mapping(models: Any) -> list[tuple[str | int, Model]]:
         items = list(models.items())
     else:
         items = list(enumerate(models))
-    if not items:
-        raise ValueError("at least one model is required")
     out: list[tuple[str | int, Model]] = []
     for key, model in items:
         if not isinstance(model, Model):
@@ -144,13 +137,21 @@ def cross_fit_shared_precision_groups(
 ) -> dict[str, dict[str, Any]]:
     """Compute EB precision updates shared across separately fitted models.
 
-    For each declared group ``p``, the update is
+    Each group gives one penalized term a single precision ``tau`` across the
+    models, with the term's penalty ``S`` (on the function, in each model's
+    own basis) as its prior: ``beta | tau ~ N(m, c (tau nu S)^+)``,
+    ``tau ~ Gamma(a, b)``. The EM / Fellner-Schall update computed by the
+    engine (``gam::inference::shared_precision``) is
 
-    ``lambda_p = (N_fits(p) * d_p + 2 * (a_p - 1)) / (sum_q_p + 2 * b_p)``,
+    ``tau = (sum_f rank(S_f) + 2 (a - 1)) / (sum_f E_f + 2 b)``, with
+    ``E_f = nu_f ((beta_f - m_f)' S_f (beta_f - m_f) + tr(S_f Vb_f)) / c_f``,
 
-    where ``sum_q_p`` pools ``||beta_p||² + tr(Sigma_pp)`` over models where
-    the selected term/column/label appears. If a model does not contain the
-    selected block, it is skipped for that group.
+    where ``Vb_f`` is the model's conditional coefficient covariance, ``c_f``
+    its covariance scale (``sigma²`` for a Gaussian fit) and ``nu_f`` the
+    normalization its stored penalty was divided by. ``lambda`` is ``tau``,
+    and each fit's ``implied_lambda = tau nu_f`` is its smoothing parameter
+    under the shared precision. A model without the term is skipped for that
+    group.
 
     Parameters
     ----------
@@ -171,22 +172,16 @@ def cross_fit_shared_precision_groups(
         If ``models`` does not contain :class:`Model` instances or a group
         cannot be normalized.
     ValueError
-        If no models/groups are supplied or group names are duplicated.
+        If the engine refuses the request: no models or groups, duplicate
+        group names, a bad hyperprior, a group matching no model, matched
+        penalties of different ranks, or a multi-block term without
+        ``penalty``.
     """
 
     model_items = _normalize_model_mapping(models)
     group_specs = _normalize_shared_precision_groups(groups)
-    if not group_specs:
-        raise ValueError("at least one shared precision group is required")
 
     rust = rust_module()
-    model_payloads: list[dict[str, Any]] = []
-    for key, model in model_items:
-        try:
-            state_json = rust.coefficient_state_json(model._prediction_model)
-        except Exception as exc:
-            raise map_exception(exc) from exc
-        model_payloads.append({"key": key, "state_json": state_json})
     group_payloads: list[dict[str, Any]] = []
     for group in group_specs:
         group_payloads.append(
@@ -197,11 +192,18 @@ def cross_fit_shared_precision_groups(
                 "labels": [
                     _shared_group_label(group, key) for key, _model in model_items
                 ],
+                "penalty": group.penalty,
             }
         )
     try:
         raw = rust.cross_fit_shared_precision_groups_json(
-            json.dumps({"models": model_payloads, "groups": group_payloads})
+            [model._prediction_model for _key, model in model_items],
+            json.dumps(
+                {
+                    "models": [key for key, _model in model_items],
+                    "groups": group_payloads,
+                }
+            ),
         )
     except Exception as exc:
         raise map_exception(exc) from exc

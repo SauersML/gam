@@ -19,11 +19,13 @@ from ._model import (
     TermBlock,
 )
 from ._sampling import (
-    CumulativeIncidenceDraws,
-    PairedPosteriorSamples,
     PosteriorPredictive,
     PosteriorSamples,
     SamplingConfig,
+)
+from ._partial_effect import (
+    AxisLevels,
+    PartialEffect,
 )
 from ._tables import (
     PredictionResult,
@@ -41,13 +43,13 @@ from ._validation import (
 
 __all__ = [
     "AffineDesign",
+    "AxisLevels",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
-    "CumulativeIncidenceDraws",
     "Diagnostics",
     "FormulaValidation",
     "MultinomialPrediction",
-    "PairedPosteriorSamples",
+    "PartialEffect",
     "PosteriorPredictive",
     "PosteriorSamples",
     "PredictionResult",

@@ -50,16 +50,15 @@ fn sphere_rejects_bc_option() {
                 panic!("sphere accepted meaningless `{opt}` silently — must reject or document",)
             }
             Err(e) => {
-                let lower = e.to_string().to_lowercase();
-                // Acceptable: option-validation error that names the bad option,
-                // OR a sphere-doesn't-have-endpoints diagnostic.
+                // The refusal must name the offending option key
+                // (`sphere() does not accept option `bc_left``). The former
+                // disjunction also accepted any error mentioning "sphere",
+                // which every sphere-smooth failure does, so it could not fail.
+                let key = opt.split('=').next().expect("option has a key");
+                let msg = e.to_string();
                 assert!(
-                    lower.contains("bc")
-                        || lower.contains("unknown")
-                        || lower.contains("sphere")
-                        || lower.contains("not supported")
-                        || lower.contains("unsupported"),
-                    "sphere bc rejection must name the option / sphere / unknown: {e}",
+                    msg.contains(&format!("`{key}`")),
+                    "sphere bc rejection must name the option `{key}`: {e}",
                 );
                 eprintln!("[sphere-bc] `{opt}`: clean rejection: {e}");
             }

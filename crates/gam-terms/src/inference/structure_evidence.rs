@@ -552,6 +552,9 @@ pub fn run_atom_birth_gate<S, A>(
 pub enum EBhError {
     InvalidAlpha { alpha: f64 },
     InvalidLogEvidence { claim: usize, value: f64 },
+    /// The declared family is smaller than the number of claims that carry
+    /// evidence, so those claims cannot all be members of it.
+    FamilySmallerThanClaims { family_size: usize, claims: usize },
 }
 
 impl std::fmt::Display for EBhError {
@@ -569,6 +572,15 @@ impl std::fmt::Display for EBhError {
                     "e-BH log evidence for claim {claim} must be finite or -infinity; got {value}"
                 )
             }
+            Self::FamilySmallerThanClaims {
+                family_size,
+                claims,
+            } => {
+                write!(
+                    f,
+                    "e-BH family of {family_size} hypotheses cannot hold {claims} evidence-bearing claims"
+                )
+            }
         }
     }
 }
@@ -576,10 +588,38 @@ impl std::fmt::Display for EBhError {
 impl std::error::Error for EBhError {}
 
 pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Result<Vec<usize>, EBhError> {
+    e_benjamini_hochberg_in_family(log_e_values, log_e_values.len(), alpha)
+}
+
+/// e-BH over a declared family of `family_size` hypotheses, of which only the
+/// `log_e_values.len()` claims passed in carry evidence. Every other member of
+/// the family holds the exact zero e-value (`log e = −∞`): it can never be
+/// rejected and enters only through `m = family_size` in the `m/(α·k)`
+/// thresholds, so the family never has to be materialized.
+///
+/// This is the form a screen-then-test pipeline needs. A data-dependent screen
+/// `S_i` that decides which candidates get an e-value keeps validity when the
+/// screened-out candidates bank zero: `E_i·1{S_i}` is itself an e-value
+/// (`E[E_i·1{S_i}] ≤ E[E_i] ≤ 1`), and e-BH is valid under arbitrary dependence
+/// over a FIXED family. Running e-BH at `m = |screened|` instead redefines the
+/// family after the data have been seen and carries no FDR guarantee, so
+/// `family_size` must be the size of the universe the screen chooses from,
+/// fixed before the data are seen. Returned indices are into `log_e_values`.
+pub fn e_benjamini_hochberg_in_family(
+    log_e_values: &[f64],
+    family_size: usize,
+    alpha: f64,
+) -> Result<Vec<usize>, EBhError> {
     if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
         return Err(EBhError::InvalidAlpha { alpha });
     }
     let m = log_e_values.len();
+    if family_size < m {
+        return Err(EBhError::FamilySmallerThanClaims {
+            family_size,
+            claims: m,
+        });
+    }
     if m == 0 {
         return Ok(Vec::new());
     }
@@ -596,7 +636,7 @@ pub fn e_benjamini_hochberg(log_e_values: &[f64], alpha: f64) -> Result<Vec<usiz
     }
     let mut order: Vec<usize> = (0..m).collect();
     order.sort_by(|&a, &b| log_e_values[b].total_cmp(&log_e_values[a]));
-    let m_f = m as f64;
+    let m_f = family_size as f64;
     let mut k_star = 0usize;
     for (rank0, &idx) in order.iter().enumerate() {
         let k = (rank0 + 1) as f64;
@@ -832,27 +872,48 @@ pub struct CandidateProbe {
 /// both hypotheses predict identically teaches nothing.
 ///
 /// Returns the index of the best probe and its expected log-growth (nats
-/// per observation), or None if no probe discriminates.
+/// per observation), `Ok(None)` if no probe discriminates, and `Err` when
+/// the inputs are malformed (non-square `fisher`, a probe whose predicted
+/// responses do not match `fisher`'s dimension, or a non-finite score). A
+/// malformed probe is never skipped: dropping it could turn a caller error
+/// into the finding "no probe discriminates".
 pub fn select_probe_by_expected_evidence(
     probes: &[CandidateProbe],
     fisher: &Array2<f64>,
-) -> Option<(usize, f64)> {
+) -> Result<Option<(usize, f64)>, String> {
+    let (p_out, p_cols) = fisher.dim();
+    if p_out != p_cols {
+        return Err(format!(
+            "select_probe_by_expected_evidence: fisher must be square, got {p_out}x{p_cols}"
+        ));
+    }
     let mut best: Option<(usize, f64)> = None;
     for (idx, probe) in probes.iter().enumerate() {
-        let diff = &probe.predicted_mean_alt - &probe.predicted_mean_null;
-        if diff.len() != fisher.nrows() {
-            continue;
+        if probe.predicted_mean_null.len() != p_out || probe.predicted_mean_alt.len() != p_out {
+            return Err(format!(
+                "select_probe_by_expected_evidence: probe {idx} predicts responses of length \
+                 {} (null) and {} (alt), but fisher is {p_out}x{p_out}",
+                probe.predicted_mean_null.len(),
+                probe.predicted_mean_alt.len()
+            ));
         }
+        let diff = &probe.predicted_mean_alt - &probe.predicted_mean_null;
         let f_diff = fisher.dot(&diff);
         let growth = 0.5 * diff.dot(&f_diff);
-        if growth.is_finite() && growth > 0.0 {
+        if !growth.is_finite() {
+            return Err(format!(
+                "select_probe_by_expected_evidence: probe {idx} has non-finite expected \
+                 log-growth {growth}"
+            ));
+        }
+        if growth > 0.0 {
             match best {
                 Some((_, g)) if g >= growth => {}
                 _ => best = Some((idx, growth)),
             }
         }
     }
-    best
+    Ok(best)
 }
 
 /// Expected number of observations for the chosen probe to push a claim's
@@ -861,11 +922,26 @@ pub fn select_probe_by_expected_evidence(
 /// abstract guarantee into an experiment plan ("this probe should resolve
 /// the claim in ~N tokens; if it hasn't, the alternative is weaker than
 /// hypothesized — itself evidence").
-pub fn expected_resolution_budget(alpha: f64, growth_nats_per_obs: f64) -> Option<f64> {
-    if alpha <= 0.0 || alpha >= 1.0 || growth_nats_per_obs <= 0.0 {
-        return None;
+///
+/// `Err` for a level outside the open interval (0, 1) (NaN included) or a
+/// NaN growth rate; `Ok(None)` for a non-positive growth rate (the probe
+/// buys no evidence, so no finite budget exists).
+pub fn expected_resolution_budget(
+    alpha: f64,
+    growth_nats_per_obs: f64,
+) -> Result<Option<f64>, String> {
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(format!(
+            "expected_resolution_budget: alpha must be in (0, 1), got {alpha}"
+        ));
     }
-    Some(-(alpha.ln()) / growth_nats_per_obs)
+    if growth_nats_per_obs.is_nan() {
+        return Err("expected_resolution_budget: growth_nats_per_obs is NaN".to_string());
+    }
+    if growth_nats_per_obs <= 0.0 {
+        return Ok(None);
+    }
+    Ok(Some(-(alpha.ln()) / growth_nats_per_obs))
 }
 
 /// The experiment plan for one contested claim: which probe to run, the
@@ -903,22 +979,41 @@ pub struct ProbePlan {
 /// no probe discriminates (all candidates score zero growth: the
 /// hypotheses agree on everything reachable inside the validity radius —
 /// the claim is undecidable by steering and needs a different instrument,
-/// which is a finding, not a failure).
+/// which is a finding, not a failure). Malformed inputs (an `alpha` outside
+/// (0, 1), a NaN `current_log_e`, or malformed probes) are `Err`, never
+/// `None`: `None` is reserved for that finding.
 pub fn plan_probe_for_contested_claim(
     probes: &[CandidateProbe],
     fisher: &Array2<f64>,
     alpha: f64,
     current_log_e: f64,
-) -> Option<ProbePlan> {
-    let (probe, expected_log_growth) = select_probe_by_expected_evidence(probes, fisher)?;
-    let budget_from_scratch = expected_resolution_budget(alpha, expected_log_growth)?;
+) -> Result<Option<ProbePlan>, String> {
+    if !(alpha > 0.0 && alpha < 1.0) {
+        return Err(format!(
+            "plan_probe_for_contested_claim: alpha must be in (0, 1), got {alpha}"
+        ));
+    }
+    if current_log_e.is_nan() {
+        return Err("plan_probe_for_contested_claim: current_log_e is NaN".to_string());
+    }
+    let Some((probe, expected_log_growth)) = select_probe_by_expected_evidence(probes, fisher)?
+    else {
+        return Ok(None);
+    };
+    let budget_from_scratch =
+        expected_resolution_budget(alpha, expected_log_growth)?.ok_or_else(|| {
+            format!(
+                "plan_probe_for_contested_claim: selected probe {probe} has non-positive \
+                 growth {expected_log_growth}"
+            )
+        })?;
     let nats_remaining = (-(alpha.ln()) - current_log_e).max(0.0);
-    Some(ProbePlan {
+    Ok(Some(ProbePlan {
         probe,
         expected_log_growth,
         budget_from_scratch,
         budget_remaining: nats_remaining / expected_log_growth,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -971,6 +1066,49 @@ mod tests {
         assert!(matches!(
             error,
             EBhError::InvalidLogEvidence { claim: 1, value } if value.is_nan()
+        ));
+    }
+
+    /// Members of the declared family that carry no evidence still count in
+    /// `m`: the same evidence that clears the bar in a family of its own size
+    /// must not clear it once the family is the full screened universe.
+    #[test]
+    fn e_bh_in_family_counts_the_unscored_members() {
+        // Alone: m = 1, α = 0.1 → threshold 10; e = 45 is rejected.
+        let log_e = [45.0f64.ln(), 1.0f64.ln()];
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e[..1], 1, 0.1).unwrap(),
+            vec![0]
+        );
+        // Declared family of 10 (nine members banked zero): threshold 100 at
+        // k = 1, so the same e = 45 is no longer a discovery.
+        assert!(
+            e_benjamini_hochberg_in_family(&log_e[..1], 10, 0.1)
+                .unwrap()
+                .is_empty()
+        );
+        // family_size = len reproduces the plain rule exactly.
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e, log_e.len(), 0.1).unwrap(),
+            e_benjamini_hochberg(&log_e, 0.1).unwrap()
+        );
+        // Equivalent to materializing the zero-evidence members (m = 3:
+        // threshold 30 at k = 1, so e = 45 is rejected in both forms).
+        let padded = [45.0f64.ln(), 1.0f64.ln(), f64::NEG_INFINITY];
+        assert_eq!(
+            e_benjamini_hochberg_in_family(&log_e, 3, 0.1).unwrap(),
+            e_benjamini_hochberg(&padded, 0.1).unwrap()
+        );
+    }
+
+    #[test]
+    fn e_bh_in_family_refuses_a_family_smaller_than_its_claims() {
+        assert!(matches!(
+            e_benjamini_hochberg_in_family(&[1.0, 2.0], 1, 0.1),
+            Err(EBhError::FamilySmallerThanClaims {
+                family_size: 1,
+                claims: 2
+            })
         ));
     }
 
@@ -1084,13 +1222,16 @@ mod tests {
                 predicted_mean_alt: array![1.0, 0.2],
             },
         ];
-        let (idx, growth) =
-            select_probe_by_expected_evidence(&probes, &fisher).expect("a probe discriminates");
+        let (idx, growth) = select_probe_by_expected_evidence(&probes, &fisher)
+            .expect("well-formed probes")
+            .expect("a probe discriminates");
         assert_eq!(idx, 1);
         // ½·(1,0.2)ᵀ diag(2,0.5) (1,0.2) = ½·(2 + 0.02) = 1.01 nats/obs.
         assert!((growth - 1.01).abs() < 1e-12);
         // Budget: ~3 observations to certify at α=0.05.
-        let budget = expected_resolution_budget(0.05, growth).expect("budget");
+        let budget = expected_resolution_budget(0.05, growth)
+            .expect("valid level")
+            .expect("budget");
         assert!(budget > 2.0 && budget < 4.0);
     }
 
@@ -1157,15 +1298,21 @@ mod tests {
             predicted_mean_alt: array![1.0, 0.2],
         }];
         // growth = 1.01 nats/obs (checked above); α=0.05 → need ln(20) ≈ 3.0 nats.
-        let from_zero = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 0.0).expect("plan");
+        let from_zero = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 0.0)
+            .expect("well-formed plan inputs")
+            .expect("plan");
         assert_eq!(from_zero.probe, 0);
         assert!((from_zero.budget_remaining - from_zero.budget_from_scratch).abs() < 1e-12);
 
-        let halfway = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 1.5).expect("plan");
+        let halfway = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 1.5)
+            .expect("well-formed plan inputs")
+            .expect("plan");
         assert!(halfway.budget_remaining < from_zero.budget_remaining);
         assert!((halfway.budget_remaining - (-(0.05f64.ln()) - 1.5) / 1.01).abs() < 1e-12);
 
-        let across = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 10.0).expect("plan");
+        let across = plan_probe_for_contested_claim(&probes, &fisher, 0.05, 10.0)
+            .expect("well-formed plan inputs")
+            .expect("plan");
         assert_eq!(across.budget_remaining, 0.0);
 
         // No discriminating probe → no plan (undecidable by steering).
@@ -1174,7 +1321,49 @@ mod tests {
             predicted_mean_null: array![5.0, 5.0],
             predicted_mean_alt: array![5.0, 5.0],
         }];
-        assert!(plan_probe_for_contested_claim(&blind, &fisher, 0.05, 0.0).is_none());
+        assert!(
+            plan_probe_for_contested_claim(&blind, &fisher, 0.05, 0.0)
+                .expect("well-formed plan inputs")
+                .is_none()
+        );
+    }
+
+    /// Malformed inputs are errors, never the `None` that means "steering
+    /// cannot distinguish the hypotheses", and never a NaN or zero budget.
+    #[test]
+    fn probe_plan_rejects_malformed_inputs_instead_of_reporting_undecidable() {
+        let fisher = array![[2.0, 0.0], [0.0, 0.5]];
+        let probes = vec![CandidateProbe {
+            delta: array![0.0, 1.0],
+            predicted_mean_null: array![0.0, 0.0],
+            predicted_mean_alt: array![1.0, 0.2],
+        }];
+        for alpha in [0.0, 1.0, 1.5, -0.1, f64::NAN] {
+            assert!(plan_probe_for_contested_claim(&probes, &fisher, alpha, 0.0).is_err());
+            assert!(expected_resolution_budget(alpha, 1.01).is_err());
+        }
+        assert!(plan_probe_for_contested_claim(&probes, &fisher, 0.05, f64::NAN).is_err());
+        assert!(expected_resolution_budget(0.05, f64::NAN).is_err());
+        assert_eq!(expected_resolution_budget(0.05, 0.0), Ok(None));
+
+        // A probe whose responses do not match the Fisher dimension is an
+        // error, not a silently skipped candidate.
+        let mis_sized = vec![
+            CandidateProbe {
+                delta: array![0.0, 1.0],
+                predicted_mean_null: array![0.0, 0.0, 0.0],
+                predicted_mean_alt: array![1.0, 0.2, 0.0],
+            },
+            CandidateProbe {
+                delta: array![0.0, 1.0],
+                predicted_mean_null: array![0.0, 0.0],
+                predicted_mean_alt: array![1.0, 0.2],
+            },
+        ];
+        assert!(select_probe_by_expected_evidence(&mis_sized, &fisher).is_err());
+        assert!(plan_probe_for_contested_claim(&mis_sized, &fisher, 0.05, 0.0).is_err());
+        let non_square = array![[2.0, 0.0, 0.0], [0.0, 0.5, 0.0]];
+        assert!(select_probe_by_expected_evidence(&probes, &non_square).is_err());
     }
 
     /// The p→e calibrator on hand-checkable values, including its edges.
@@ -1317,7 +1506,9 @@ mod tests {
         }
         // Realized time-to-certification (first-passage of the running sup over
         // `ln(1/α)`) == the design-time budget, rounded up.
-        let budget = expected_resolution_budget(0.05, growth).expect("budget");
+        let budget = expected_resolution_budget(0.05, growth)
+            .expect("valid level")
+            .expect("budget");
         assert_eq!(gate.certified_at_step(), Some(budget.ceil() as usize));
         assert_eq!(gate.certified_at_step(), Some(6));
         // Absorption does NOT stop at the crossing: every shard is banked.

@@ -22,6 +22,7 @@ use super::tests_recovery_split_780::{
     FiniteDifferenceStratumCertificate, certified_central_logdet_difference,
     fixed_state_logdet_sample,
 };
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 use ndarray::array;
 

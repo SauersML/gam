@@ -335,6 +335,56 @@ impl DecrementTolerance {
     }
 }
 
+/// The criterion's resolution at a comparison whose evaluated values carry the
+/// summed band `band` (#3286, #3192): the certificate's own tolerance
+/// [`DecrementTolerance::value`], `max(τ_stat − band, band)`, over the criterion's
+/// statistical resolution `tau_stat` ([`outer_criterion_resolution`]).
+///
+/// A decrease is of consequence exactly when it exceeds this. A measured decrease
+/// `d` between two values within `b_a` and `b_b` of the exact criterion proves no
+/// true decrease above `τ_stat` once `d + b_a + b_b ≤ τ_stat`, so the upper arm is
+/// `τ_stat − (b_a + b_b)`; and no comparison can claim a resolution finer than the
+/// arithmetic's own `b_a + b_b`, the lower arm. Every consumer asking whether a
+/// decrease matters reads this one number: the cost-stall guard's resolved-descent
+/// and stall tests, the fixed-point progress certificate, the online decrement
+/// stops, and the certificate's rungs.
+///
+/// A route that declares no observation count has `τ_stat = 0`, no statistical
+/// slack, and decides at its arithmetic resolution `band`. Reading the bare
+/// `τ_stat` there resolved every difference and so switched both of ARC's stops
+/// off (#3286).
+///
+/// [`outer_criterion_resolution`]: super::run::outer_criterion_resolution
+pub(crate) fn outer_resolution(tau_stat: f64, band: f64) -> f64 {
+    DecrementTolerance {
+        tau_stat,
+        band_f: band,
+    }
+    .value()
+}
+
+/// The evaluation band `b` of a computed criterion value (#3286): the objective
+/// band `band_f` its evaluation's evidence forms ([`outer_objective_band`]), or,
+/// where that evidence forms none, the value's own representation error
+/// ([`value_representation_band`]).
+pub(crate) fn outer_value_band(
+    config: &OuterConfig,
+    cost: f64,
+    evidence: Option<&CertificateEvidence>,
+) -> f64 {
+    evidence
+        .and_then(|evidence| outer_objective_band(config, cost, evidence).ok())
+        .map(ObjectiveBand::total)
+        .filter(|band| band.is_finite())
+        .unwrap_or_else(|| value_representation_band(cost))
+}
+
+/// `γ₁·|V|`, the representation error every computed criterion value carries: the
+/// band of a value whose evaluation publishes no evidence (#3286).
+pub(crate) fn value_representation_band(cost: f64) -> f64 {
+    gam_linalg::roundoff::accumulation_growth(1) * cost.abs()
+}
+
 /// A Newton-decrement verdict with the face it was taken on (#2954).
 #[derive(Debug, Clone)]
 pub(crate) struct OuterDecrementDecision {

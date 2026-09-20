@@ -5379,6 +5379,87 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
         }
     }
 
+    // Fused lowerings (#3473). Each override writes the four order-two parts
+    // once, upper Hessian triangles only, and mirrors at the end. The trait
+    // defaults stream the same algebra through chains of complete four-part
+    // temporaries (a composition alone forms three order-two compositions,
+    // five order-two products and a sum), which is what the fixed-width BMS
+    // FLEX fourth jet paid per calibration node on the score-warp branch while
+    // its runtime opponent ran fused lane kernels.
+
+    #[inline(always)]
+    fn linear_combination(inputs: &[Self], weights: &[f64]) -> Self {
+        assert_eq!(inputs.len(), weights.len());
+        let mut parts = [crate::jet_tower::Tower2::<K>::zero(); 4];
+        for (input, &weight) in inputs.iter().zip(weights) {
+            for (part, source) in parts.iter_mut().zip(two_seed_parts(input)) {
+                tower2_add_scaled_upper(part, source, weight);
+            }
+        }
+        two_seed_from_upper_parts(parts)
+    }
+
+    #[inline(always)]
+    fn add_constant(&self, constant: f64) -> Self {
+        let mut out = *self;
+        out.base.0.v += constant;
+        out
+    }
+
+    #[inline(always)]
+    fn multiply_add(&self, right: &Self, addend: &Self) -> Self {
+        // (L + εLe + δLd + εδLx)(R + εRe + δRd + εδRx) + A with ε² = δ² = 0.
+        let mut parts = two_seed_parts(addend).map(|part| *part);
+        two_seed_add_product_upper(&mut parts, self, right);
+        two_seed_from_upper_parts(parts)
+    }
+
+    #[inline(always)]
+    fn product(&self, right: &Self) -> Self {
+        let mut parts = [crate::jet_tower::Tower2::<K>::zero(); 4];
+        two_seed_add_product_upper(&mut parts, self, right);
+        two_seed_from_upper_parts(parts)
+    }
+
+    #[inline(always)]
+    fn affine_compose(
+        &self,
+        input_scale: f64,
+        input_shift: f64,
+        derivative_stack: [f64; 5],
+    ) -> Self {
+        assert!(input_shift.is_finite(), "affine input shift must be finite");
+        let mut parts = [crate::jet_tower::Tower2::<K>::zero(); 4];
+        two_seed_add_scaled_composition_upper(&mut parts, self, &derivative_stack, input_scale);
+        two_seed_from_upper_parts(parts)
+    }
+
+    #[inline(always)]
+    fn affine_composed_sum(
+        inputs: &[Self],
+        input_scales: &[f64],
+        derivative_stacks: &[[f64; 5]],
+    ) -> Self {
+        assert_eq!(inputs.len(), input_scales.len());
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut parts = [crate::jet_tower::Tower2::<K>::zero(); 4];
+        for ((input, &input_scale), stack) in inputs.iter().zip(input_scales).zip(derivative_stacks)
+        {
+            two_seed_add_scaled_composition_upper(&mut parts, input, stack, input_scale);
+        }
+        two_seed_from_upper_parts(parts)
+    }
+
+    #[inline(always)]
+    fn composed_sum(inputs: &[Self], derivative_stacks: &[[f64; 5]]) -> Self {
+        assert_eq!(inputs.len(), derivative_stacks.len());
+        let mut parts = [crate::jet_tower::Tower2::<K>::zero(); 4];
+        for (input, stack) in inputs.iter().zip(derivative_stacks) {
+            two_seed_add_scaled_composition_upper(&mut parts, input, stack, 1.0);
+        }
+        two_seed_from_upper_parts(parts)
+    }
+
     #[inline(always)]
     fn weighted_compose_sum(
         lefts: &[Self],
@@ -5478,6 +5559,152 @@ impl<const K: usize> JetScalar<K> for TwoSeed<K> {
             eps_del,
         }
     }
+}
+
+/// The four order-two parts `[base, ε, δ, εδ]` of a two-seed scalar.
+#[inline(always)]
+fn two_seed_parts<const K: usize>(x: &TwoSeed<K>) -> [&crate::jet_tower::Tower2<K>; 4] {
+    [&x.base.0, &x.eps.0, &x.del.0, &x.eps_del.0]
+}
+
+/// Mirror the upper Hessian triangles an accumulating two-seed lowering wrote
+/// and assemble the scalar.
+#[inline(always)]
+fn two_seed_from_upper_parts<const K: usize>(
+    mut parts: [crate::jet_tower::Tower2<K>; 4],
+) -> TwoSeed<K> {
+    for part in parts.iter_mut() {
+        mirror_upper_hessian(part);
+    }
+    let [base, eps, del, eps_del] = parts;
+    TwoSeed {
+        base: Order2(base),
+        eps: Order2(eps),
+        del: Order2(del),
+        eps_del: Order2(eps_del),
+    }
+}
+
+/// `out += weight · source`, upper Hessian triangle only.
+#[inline(always)]
+fn tower2_add_scaled_upper<const K: usize>(
+    out: &mut crate::jet_tower::Tower2<K>,
+    source: &crate::jet_tower::Tower2<K>,
+    weight: f64,
+) {
+    out.v += source.v * weight;
+    for i in 0..K {
+        out.g[i] += source.g[i] * weight;
+        for j in i..K {
+            out.h[i][j] += source.h[i][j] * weight;
+        }
+    }
+}
+
+/// `out += left · right` through the order-two Leibniz rule. Reads and writes
+/// upper Hessian triangles only: the product's `h[i][j]` depends on the
+/// operands' `h[i][j]` and gradients alone.
+#[inline(always)]
+fn tower2_add_product_upper<const K: usize>(
+    out: &mut crate::jet_tower::Tower2<K>,
+    left: &crate::jet_tower::Tower2<K>,
+    right: &crate::jet_tower::Tower2<K>,
+) {
+    out.v += left.v * right.v;
+    for i in 0..K {
+        out.g[i] += left.v * right.g[i] + left.g[i] * right.v;
+        for j in i..K {
+            out.h[i][j] += left.v * right.h[i][j]
+                + left.g[i] * right.g[j]
+                + left.g[j] * right.g[i]
+                + left.h[i][j] * right.v;
+        }
+    }
+}
+
+/// `g(point)` as an order-two tower for the outer function whose value,
+/// first and second derivative at `point.v` are `value`, `first`, `second`.
+/// Upper Hessian triangle only; the lower triangle is left zero.
+#[inline(always)]
+fn tower2_compose_upper<const K: usize>(
+    point: &crate::jet_tower::Tower2<K>,
+    value: f64,
+    first: f64,
+    second: f64,
+) -> crate::jet_tower::Tower2<K> {
+    let mut out = crate::jet_tower::Tower2::<K>::zero();
+    out.v = value;
+    for i in 0..K {
+        out.g[i] = first * point.g[i];
+        for j in i..K {
+            out.h[i][j] = first * point.h[i][j] + second * point.g[i] * point.g[j];
+        }
+    }
+    out
+}
+
+/// `parts += left · right` for two-seed operands, truncating `ε² = δ² = 0`:
+/// the ε part is `L·Re + Le·R`, the δ part `L·Rd + Ld·R`, and the εδ part
+/// `L·Rx + Le·Rd + Ld·Re + Lx·R`. Upper Hessian triangles only.
+#[inline(always)]
+fn two_seed_add_product_upper<const K: usize>(
+    parts: &mut [crate::jet_tower::Tower2<K>; 4],
+    left: &TwoSeed<K>,
+    right: &TwoSeed<K>,
+) {
+    let [lb, le, ld, lx] = two_seed_parts(left);
+    let [rb, re, rd, rx] = two_seed_parts(right);
+    let [base, eps, del, eps_del] = parts;
+    tower2_add_product_upper(base, lb, rb);
+    tower2_add_product_upper(eps, lb, re);
+    tower2_add_product_upper(eps, le, rb);
+    tower2_add_product_upper(del, lb, rd);
+    tower2_add_product_upper(del, ld, rb);
+    tower2_add_product_upper(eps_del, lb, rx);
+    tower2_add_product_upper(eps_del, le, rd);
+    tower2_add_product_upper(eps_del, ld, re);
+    tower2_add_product_upper(eps_del, lx, rb);
+}
+
+/// `parts += f(input_scale · input)` for a two-seed input, upper Hessian
+/// triangles only. `derivative_stack` holds `f` and its derivatives at the
+/// scaled input's value, so `e_r = f^{(r)} · input_scale^r` are the outer
+/// derivatives with respect to the unscaled input. With
+/// `input = B + εE + δD + εδX` and `g_r(B)` the order-two composition of `B`
+/// with `(e_r, e_{r+1}, e_{r+2})`:
+///   base += g_0(B),  ε += g_1(B)·E,  δ += g_1(B)·D,
+///   εδ   += g_2(B)·E·D + g_1(B)·X,
+/// the channels `TwoSeed::compose_unary` writes after `scale`.
+#[inline(always)]
+fn two_seed_add_scaled_composition_upper<const K: usize>(
+    parts: &mut [crate::jet_tower::Tower2<K>; 4],
+    input: &TwoSeed<K>,
+    derivative_stack: &[f64; 5],
+    input_scale: f64,
+) {
+    let mut outer = [0.0; 5];
+    let mut power = 1.0;
+    for (entry, &derivative) in outer.iter_mut().zip(derivative_stack) {
+        *entry = derivative * power;
+        power *= input_scale;
+    }
+    let [b, e, d, x] = two_seed_parts(input);
+    let [base, eps, del, eps_del] = parts;
+    base.v += outer[0];
+    for i in 0..K {
+        base.g[i] += outer[1] * b.g[i];
+        for j in i..K {
+            base.h[i][j] += outer[1] * b.h[i][j] + outer[2] * b.g[i] * b.g[j];
+        }
+    }
+    let first = tower2_compose_upper(b, outer[1], outer[2], outer[3]);
+    let second = tower2_compose_upper(b, outer[2], outer[3], outer[4]);
+    tower2_add_product_upper(eps, &first, e);
+    tower2_add_product_upper(del, &first, d);
+    tower2_add_product_upper(eps_del, &first, x);
+    let mut cross = crate::jet_tower::Tower2::<K>::zero();
+    tower2_add_product_upper(&mut cross, e, d);
+    tower2_add_product_upper(eps_del, &second, &cross);
 }
 
 impl<const K: usize> crate::nested_dual::JetField for TwoSeed<K> {
@@ -7884,6 +8111,81 @@ mod two_seed_fused_932_tests {
             "weighted_compose_sum empty",
             &TwoSeed::weighted_compose_sum(&[], &right, &[], &addend),
             &addend,
+        );
+    }
+
+    /// The fused two-seed linear combination, multiply-add, product and
+    /// (affine) composed sums against the field program each one names
+    /// (#3473). The references use only `add`, `scale`, `mul` and
+    /// `compose_unary`, so they share no lowering with the overrides.
+    #[test]
+    fn fused_two_seed_semantic_primitives_match_the_field_program_3473() {
+        let (lefts, right, addend) = operands();
+        let derivative_stacks = stacks();
+        let weights = [0.7, -1.3, 0.45, 2.1];
+        let input_scales = [1.0, -0.8, 1.7, 0.35];
+
+        let combined = lefts
+            .iter()
+            .zip(weights)
+            .fold(TwoSeed::constant(0.0), |sum, (input, weight)| {
+                sum.add(&input.scale(weight))
+            });
+        assert_two_seed_agrees(
+            "linear_combination",
+            &TwoSeed::linear_combination(&lefts, &weights),
+            &combined,
+        );
+
+        assert_two_seed_agrees(
+            "multiply_add",
+            &lefts[0].multiply_add(&right, &addend),
+            &lefts[0].mul(&right).add(&addend),
+        );
+        assert_two_seed_agrees(
+            "product",
+            &lefts[1].product(&right),
+            &lefts[1].mul(&right),
+        );
+
+        let shift = 0.27;
+        assert_two_seed_agrees(
+            "affine_compose",
+            &right.affine_compose(-0.8, shift, derivative_stacks[1]),
+            &right
+                .scale(-0.8)
+                .add(&TwoSeed::constant(shift))
+                .compose_unary(derivative_stacks[1]),
+        );
+        assert_eq!(
+            right.add_constant(shift).base.0.v,
+            right.base.0.v + shift,
+            "add_constant shifts only the primal value"
+        );
+
+        let affine_reference = lefts
+            .iter()
+            .zip(input_scales)
+            .zip(derivative_stacks)
+            .fold(TwoSeed::constant(0.0), |sum, ((input, scale), stack)| {
+                sum.add(&input.scale(scale).compose_unary(stack))
+            });
+        assert_two_seed_agrees(
+            "affine_composed_sum",
+            &TwoSeed::affine_composed_sum(&lefts, &input_scales, &derivative_stacks),
+            &affine_reference,
+        );
+
+        let composed_reference = lefts
+            .iter()
+            .zip(derivative_stacks)
+            .fold(TwoSeed::constant(0.0), |sum, (input, stack)| {
+                sum.add(&input.compose_unary(stack))
+            });
+        assert_two_seed_agrees(
+            "composed_sum",
+            &TwoSeed::composed_sum(&lefts, &derivative_stacks),
+            &composed_reference,
         );
     }
 }

@@ -189,11 +189,10 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// Conditional location-scale calibration of the latent score (#905),
     /// `Some(_)` only under the declared `conditional-location-scale` law when
     /// its `E[z|C]`/`Var(z|C)` Rao test fired: the training z was then replaced
-    /// in place by `ζ = (z − m(C))/√v(C)` (via
-    /// [`LatentZConditionalCalibration::apply`]) before any downstream consumer
-    /// saw it, and the residual is anchored on its empirical law. Persisted so
-    /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
-    /// applies the identical map.
+    /// in place by `ζ = (z − m(C))/√v(C)` (through the fitted latent score map,
+    /// gam#3016) before any downstream consumer saw it, and the residual is
+    /// anchored on its empirical law. Persisted so prediction rebuilds `a(C)` from
+    /// the (reproducible) marginal design and applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
     /// The latent score of each training row as the kernel consumed it: the raw
     /// score through the fitted score map (the saved normalisation, then the
@@ -1043,11 +1042,13 @@ pub enum LocalLawMixture {
     /// Kernel weights `K(d) = exp(−d²/2h²)` of the `top_k` nearest centres less
     /// the `(top_k + 1)`-th centre's value, so a centre's weight reaches zero
     /// exactly where it leaves the top `top_k`, plus the pooled law — the grid
-    /// after the context grids — at the fixed weight `floor` in units of
-    /// `K(0) = 1`, renormalised. The floor keeps the normaliser positive where
-    /// the `top_k + 1` nearest centres tie, so the law is continuous in the
-    /// covariates everywhere. New fits mint it with `top_k = 4`, `bandwidth = 1`
-    /// in the scaled covariates, and `floor = 1e-3`.
+    /// after the context grids — at the weight `floor` in units of `K(0) = 1`,
+    /// renormalised. The floor keeps the normaliser positive where the
+    /// `top_k + 1` nearest centres tie, so the law is continuous in the
+    /// covariates everywhere. New fits mint it with `top_k = 4`, and with the
+    /// bandwidth in the scaled covariates and the floor that minimise the
+    /// cross-fitted CRPS of the score
+    /// ([`local_law_resolution::select_local_law_resolution`], gam#3610).
     VanishingAtTruncation { floor: f64 },
 }
 
@@ -1808,8 +1809,11 @@ impl LatentZConditionalCalibration {
 
     /// Apply `ζ = (z − m(C))/√v(C)` to a batch. `a_block` is the marginal
     /// design (`n × basis_ncols`); `z` is the (normalized) latent score. Used
-    /// at both training and predict time, so the map is identical.
-    pub fn apply(
+    /// at both training and predict time, so the map is identical. Crate-private:
+    /// every reader goes through the fitted latent score map
+    /// (`FittedLatentScoreMap`, gam#3016), outside the crate through
+    /// `FittedModel::fitted_latent_score`.
+    pub(crate) fn apply(
         &self,
         z: ArrayView1<'_, f64>,
         a_block: ArrayView2<'_, f64>,
@@ -3761,6 +3765,7 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 pub(crate) mod block_specs;
 pub mod conditional_score_covariance;
 pub(crate) mod estimated_latent_law;
+pub(crate) mod local_law_resolution;
 pub(crate) mod moving_law_rule;
 pub(crate) mod exact_eval_cache;
 mod expected_information;

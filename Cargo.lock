@@ -4212,7 +4212,7 @@ dependencies = [
 [[package]]
 name = "general-mcmc"
 version = "0.10.1"
-source = "git+https://github.com/SauersML/general-mcmc.git?rev=adc78bb049a81da80089330f9db43d8a45d8ed2d#adc78bb049a81da80089330f9db43d8a45d8ed2d"
+source = "git+https://github.com/SauersML/general-mcmc.git?rev=c6e415dc8fd7f0f88e191173688f418b176507ad#c6e415dc8fd7f0f88e191173688f418b176507ad"
 dependencies = [
  "burn",
  "indicatif",
