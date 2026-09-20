@@ -106,7 +106,7 @@ fn perfectly_separated_binomial(n: usize) -> gam_data::EncodedDataset {
 /// Whether [`perfectly_separated_binomial`]'s two class supports are
 /// disjoint, i.e. the largest class-0 `x` lies below the smallest class-1 `x`.
 fn fixture_is_separated(n: usize) -> bool {
-    1.0 + 0.1 * (n / 2 - 1) as f64 < 10.0
+    1.0 + 0.1 * ((n / 2 - 1) as f64) < 10.0
 }
 
 /// Fit `formula` on the exact-separation fixture at `n` through the
