@@ -53,6 +53,7 @@ pub use gam_sae::inference::riesz;
 pub use gam_solve::row_sampling_measure as row_measure;
 pub mod row_metric;
 pub mod sample;
+pub mod shared_precision;
 pub mod skovgaard;
 pub use gam_sae::inference::steering;
 pub use gam_terms::inference::smooth_test;

@@ -4458,13 +4458,43 @@ fn py_list_append_json_number(list: &Bound<'_, PyList>, value: serde_json::Numbe
     }
 }
 
+/// Marshalling for [`gam::inference::shared_precision::shared_precision_updates`]
+/// (#3523): `request_json` is `{"models": [key per model], "groups": [...]}`.
 #[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
+    models: Vec<PyRef<'_, PyFittedModel>>,
     request_json: String,
 ) -> PyResult<String> {
+    let models = models
+        .iter()
+        .map(|model| Arc::clone(&model.model))
+        .collect::<Vec<_>>();
     detach_py_result(py, "cross_fit_shared_precision_groups_json", move || {
-        cross_fit_shared_precision_groups_json_impl(&request_json)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            models: Vec<serde_json::Value>,
+            groups: Vec<gam::inference::shared_precision::SharedPrecisionGroup>,
+        }
+        let request: Request = serde_json::from_str(&request_json)
+            .map_err(|err| format!("failed to parse shared precision request json: {err}"))?;
+        if request.models.len() != models.len() {
+            return Err(format!(
+                "shared precision request names {} model key(s) for {} model(s)",
+                request.models.len(),
+                models.len()
+            ));
+        }
+        let fits = request
+            .models
+            .into_iter()
+            .zip(models.iter().map(|model| &**model))
+            .collect::<Vec<_>>();
+        let updates =
+            gam::inference::shared_precision::shared_precision_updates(&fits, &request.groups)?;
+        serde_json::to_string(&updates)
+            .map_err(|err| format!("failed to serialize shared precision result: {err}"))
     })
 }
 
