@@ -52,7 +52,11 @@ This is supported for:
 - Gaussian location-scale: joint mean and scale.
 - Binomial location-scale: joint threshold and scale. The default
   inverse link is logit; explicit links such as probit/cloglog use the
-  same threshold-scale parameterization.
+  same threshold-scale parameterization. Bernoulli data identify only
+  `q = -threshold / sigma`, so the log-sigma level is not a parameter:
+  it is fixed at `sigma = 1` where the scale covariates are zero, and
+  `noise_formula` must be a parametric-linear formula with at least one
+  covariate (`"1"`, smooths and random effects are refused, #3879).
 - Dispersion GAMLSS: Gamma shape, Beta precision, negative-binomial
   size, and Tweedie inverse-dispersion submodels.
 - Survival location-scale: pair with `survival_likelihood="location-scale"`:
@@ -86,7 +90,8 @@ gamfit.fit(
 deviance at the fitted mean, `D = 2·Σ w·d(y, μ̂)`, in the same unscaled
 convention every standard fit reports: no dispersion factor and no
 normalizing constants. `noise_formula="1"` is therefore the identical model
-to the standard fit and reports the identical deviance (#2786). The
+to the standard fit and reports the identical deviance (#2786); binomial
+refuses it, since a constant scale there is not a free parameter (#3879). The
 fitted precision channel enters only where the unit deviance depends on
 it — per-row `θ̂ᵢ` for the negative binomial, per-row `φ̂ᵢ` for beta — and
 not at all for the Gaussian (weighted residual sum of squares), gamma, or
