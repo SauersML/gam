@@ -4583,8 +4583,9 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 - 0.5 * alpha_accepted * alpha_accepted * delta_dot_hpen;
             let actual_reduction = obj_before_block - objective_cycle_prev;
             // What comparing the two block objectives accumulates, so the
-            // controller's rejection override is judged against the rounding
-            // this evaluation can carry (gam#2977 S2). Only this block's
+            // controller's ratio carries the rounding this evaluation can
+            // carry in both its numerator and denominator (gam#2977 S2,
+            // gam#3240). Only this block's
             // penalty moved; the other blocks' penalty values enter through
             // the objective magnitudes.
             let old_block_penalty_value = penalty_roots.block_penalty_value(b, &beta_old);
@@ -4607,13 +4608,13 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 // Growth is judged on the step's own prediction, which leaves
                 // this route byte-identical (gam#2714).
                 predicted_reduction,
-                obj_before_block,
                 inner_tol * (1.0 + obj_before_block.abs()),
                 // The blockwise path takes ONE step per block per cycle rather
                 // than a backtracking ladder, so it has no shrink sequence to
                 // read a resolution off (gam#2612). `0.0` means "nothing
-                // measured", which leaves this site byte-identical — and with
-                // nothing measured the residual flag cannot be consulted.
+                // measured"; the band is then the accumulation ceiling alone,
+                // and with nothing measured the residual flag cannot be
+                // consulted.
                 0.0,
                 block_accumulation.roundoff_ceiling(),
                 false,

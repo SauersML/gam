@@ -1948,8 +1948,9 @@ pub(crate) enum JointTrustRegionDecision {
     HoldInside,
     /// `0.25 <= rho <= 0.75` (moderate model fidelity) — radius held.
     HoldModerate,
-    /// `rho < 0.25` but step accepted (positive descent above noise).
-    /// Radius shrunk to a quarter to be more conservative next cycle.
+    /// `eta_accept = 0.1 < rho < 0.25`: step accepted, but the model was only
+    /// marginally faithful beyond the evaluation band. Radius shrunk to a
+    /// quarter to be more conservative next cycle.
     ShrinkOnMarginalAccept,
     /// Step rejected — radius shrunk and capped at half the proposed
     /// step norm so a re-proposal is constrained inside the rejected
@@ -1958,12 +1959,6 @@ pub(crate) enum JointTrustRegionDecision {
     /// Radius was already at the floor before this update.  Persistent
     /// `RejectFloor` is the unambiguous signal of a degenerate ρ region.
     RejectFloor,
-    /// The quadratic model's predicted decrease fell to or below the
-    /// objective's own round-off floor while the REALIZED decrease stayed
-    /// measurably above it (gam#2637). The step is taken on the measurement
-    /// and the radius is held: there is no model evidence for a larger
-    /// region, and shrinking would be self-reinforcing.
-    AcceptBelowModelNoiseFloor,
 }
 
 impl JointTrustRegionDecision {
@@ -1975,7 +1970,6 @@ impl JointTrustRegionDecision {
             Self::ShrinkOnMarginalAccept => "shrink_marginal_accept",
             Self::ShrinkOnRejection => "shrink_reject",
             Self::RejectFloor => "reject_floor",
-            Self::AcceptBelowModelNoiseFloor => "accept_model_noise_floor",
         }
     }
 
@@ -2003,17 +1997,42 @@ pub(crate) struct JointTrustRegionUpdate {
     pub(crate) decision: JointTrustRegionDecision,
 }
 
-/// Relative round-off noise floor handed to the shared trust-region
-/// controller when the solve has measured NOTHING better: a change in the
-/// inner objective below `|objective| ×` this is indistinguishable from f64
-/// round-off *for an evaluation that does not cancel*. Named because
-/// [`update_joint_trust_region_radius`] has to reason about the SAME floor the
-/// controller applies, and two spellings of the number would be free to drift.
+/// The band `ε_f` one evaluation of the inner objective is accurate to, as the
+/// Sun–Nocedal ratio of [`opt::TrustRegionPolicy::noise_tolerant`] reads it:
+/// every realized reduction is `F(β) − F(β + δ)`, a difference of two
+/// evaluations, so its error is at most `2ε_f` (gam#3240).
 ///
-/// It is a FLOOR, not the floor: an evaluation that cancels carries orders
-/// more, and [`ObjectiveResolutionWitness`] is how the solve finds that out
-/// (gam#2612). `measured_resolution` overrides this whenever it is larger.
-pub(crate) const JOINT_TRUST_NOISE_FLOOR_REL: f64 = 1.0e-14;
+/// `evaluation_roundoff_ceiling` is [`ObjectiveAccumulation::roundoff_ceiling`]
+/// of [`ObjectiveAccumulation::between_endpoints`]: the arithmetic's upper bound
+/// on the rounding of that DIFFERENCE, both endpoints' sums and log-determinants
+/// charged. Half of it is therefore a per-evaluation band whose `2ε_f` bounds
+/// the difference's error, which is exactly the hypothesis of the ratio's
+/// lemma. `measured_resolution` is [`ObjectiveResolutionWitness::measured`], a
+/// backtracking ladder's reading of what one evaluation carried; the witness
+/// refuses readings above the ceiling, but it bounds ONE evaluation, and an
+/// evaluation whose rounding is concentrated at one endpoint can carry more
+/// than the symmetric half. The band is the larger of the two, so it is never
+/// below what the solve has seen.
+///
+/// A ceiling the accumulation cannot size (`+∞`, non-finite inputs) bounds
+/// nothing; the band is then whatever was measured, `0` before any ladder,
+/// which is the classical ratio. Every term is computed from this evaluation's
+/// own arithmetic: there is no relative constant and no objective scale.
+pub(crate) fn joint_objective_evaluation_band(
+    measured_resolution: f64,
+    evaluation_roundoff_ceiling: f64,
+) -> f64 {
+    let measured = if measured_resolution.is_finite() && measured_resolution > 0.0 {
+        measured_resolution
+    } else {
+        0.0
+    };
+    if evaluation_roundoff_ceiling.is_finite() && evaluation_roundoff_ceiling > 0.0 {
+        (0.5 * evaluation_roundoff_ceiling).max(measured)
+    } else {
+        measured
+    }
+}
 
 pub(crate) fn update_joint_trust_region_radius(
     old_radius: f64,
@@ -2021,31 +2040,61 @@ pub(crate) fn update_joint_trust_region_radius(
     actual_reduction: f64,
     predicted_reduction: f64,
     reduction_along_ray: f64,
-    objective_scale: f64,
     objective_tol: f64,
     measured_resolution: f64,
     evaluation_roundoff_ceiling: f64,
     residual_above_tolerance: bool,
 ) -> JointTrustRegionUpdate {
-    // Round-off-aware trust-region radius control, delegated to the shared
-    // `opt::TrustRegionPolicy::noise_aware` controller. The
-    // `|objective_scale|·1e-14` floating-point noise floor (which treats a
-    // realized change within round-off as a numerically neutral `rho = 1`
-    // step rather than dividing two round-off-level quantities — the gam#797
-    // last-mile / clustered-bernoulli pinning guard), the `rho > 0` accept
-    // test above that floor, the `×0.25` shrink capped at `0.5·step_norm` on
-    // rejection, the `×2` grow at a boundary that constrains a model-resolvable
-    // decrease, the `[1e-12, 1e6]` clamp, and the `RejectFloor` promotion at the
-    // floor are all reproduced by that controller. Geometry alone is not
-    // evidence for growth: when `reduction_along_ray <= objective_tol`, the
-    // quadratic model says no larger step in this direction would buy a
-    // decrease above the solver's own objective resolution, and where the
-    // model is not certified convex that reading is `predicted_reduction`, the
-    // constrained step's own. Treating such a chord as a useful boundary hit
-    // doubled the next chord and made transformation-normal walk away from its
-    // best iterate (gam#2600). The gam#2637 override below is the other deliberate
-    // specialization, and it only ever converts a rejection the controller could
-    // not justify into an accept.
+    // Trust-region radius control, delegated to the shared
+    // `opt::TrustRegionPolicy::noise_tolerant` controller: the step is judged
+    // on Sun and Nocedal's noise-tolerant ratio (2023, Algorithm 1)
+    //
+    //     rho = (actual + r·ε_f) / (predicted + r·ε_f),   r = 2/(1 − eta_expand) = 8,
+    //
+    // with `ε_f` the evaluation band of `joint_objective_evaluation_band`
+    // (gam#3240). The realized reduction is a difference of two evaluations,
+    // so it is off from the noise-free one by at most `2ε_f`; a model that is
+    // exact to within that has `|rho − 1| ≤ 2ε_f/(predicted + 8ε_f) < 1/4`, so
+    // it is accepted and never shrunk for rounding, at every scale of
+    // prediction. A prediction the band resolves that realizes nothing has
+    // `rho ≈ 0 < eta_accept = 0.1` and is rejected. A model that predicts an
+    // ascent beyond what the band excuses (`predicted ≤ −8ε_f`) forms no ratio
+    // (`rho = −∞`) and is rejected; a prediction that is non-positive only at
+    // rounding — the step-floor polish of `fit_exact_joint`, whose `rhs·δ` and
+    // `½δᵀHδ` cancel — keeps a positive denominator and is judged on what it
+    // realized. The `×0.25` shrink
+    // capped at `0.5·step_norm` on rejection, the `×2` grow at a boundary that
+    // constrains a model-resolvable decrease, the `[1e-12, 1e6]` clamp and the
+    // `RejectFloor` promotion are the controller's.
+    //
+    // THE BAND REPLACES TWO WORKAROUNDS. The controller used to divide
+    // `actual/predicted` and guard it with a relative `|F|·1e-14` floor that
+    // forced `rho = 1` inside it, and this function carried a second override
+    // (gam#2637) that turned the controller's `predicted <= floor` rejection
+    // back into an accept when the realized decrease cleared the floor and the
+    // evaluation's ceiling (gam#2977 S2). Both were ways of saying "a ratio of
+    // rounding to a promise is not evidence about the region"; the band says it
+    // in the ratio itself, from the evaluation's own arithmetic. The measured
+    // cases they were written for:
+    //
+    //   * gam#2637 (`binomial_location_scale_engine_matches_reference_flow`,
+    //     cycle 8): realized `+2.090e-9` against a prediction of `+2.944e-13`
+    //     was rejected three times running and the radius went `1 → 4.4e-8`.
+    //     With the band the ratio is `(a + 8ε_f)/(p + 8ε_f) ≥ 1`: very
+    //     successful, taken, and held or grown by the boundary rule below.
+    //   * gam#2977 S2 (gnomon#2370): a realized `+2.33e-11` inside a ceiling of
+    //     `2.64e-11` was taken as a decrease by the override, after a ladder of
+    //     noise-decided shrinks had already put the radius at `1.16e-10`. With
+    //     the band none of that ladder's rounding-level attempts is a rejection,
+    //     so there are no noise-decided shrinks for the accept to leave standing.
+    //
+    // Geometry alone is not evidence for growth: when `reduction_along_ray <=
+    // objective_tol`, the quadratic model says no larger step in this direction
+    // would buy a decrease above the solver's own objective resolution, and
+    // where the model is not certified convex that reading is
+    // `predicted_reduction`, the constrained step's own. Treating such a chord
+    // as a useful boundary hit doubled the next chord and made
+    // transformation-normal walk away from its best iterate (gam#2600).
     //
     // DO NOT REPLACE `objective_tol` WITH THE ROUND-OFF FLOOR. It is the
     // obvious-looking repair and it is measurably wrong (gam#2600).
@@ -2089,12 +2138,12 @@ pub(crate) fn update_joint_trust_region_radius(
     // convergence-aware damping against the OBJECTIVE, and the inner solve does
     // not certify on the objective — it certifies on the stationarity residual.
     // While the two agree about where the solve is, damping on one governs the
-    // other. They stop agreeing exactly where `ObjectiveResolutionWitness` has
-    // MEASURED that a single evaluation of `F` carries more rounding than the
-    // model's whole predicted decrease: there, `predicted_reduction <=
-    // objective_tol` is not "the model has run out of useful descent", it is
-    // "the objective has run out of digits", and it holds for every remaining
-    // cycle no matter how far the residual still is from its own target.
+    // other. They stop agreeing exactly where a single evaluation of `F`
+    // carries more rounding than the model's whole predicted decrease: there,
+    // `predicted_reduction <= objective_tol` is not "the model has run out of
+    // useful descent", it is "the objective has run out of digits", and it
+    // holds for every remaining cycle no matter how far the residual still is
+    // from its own target.
     //
     // Measured on the penguins witness with the measurement in place and this
     // clause absent: the ratchet is gone and every cycle accepts (`rho = 1`,
@@ -2103,27 +2152,27 @@ pub(crate) fn update_joint_trust_region_radius(
     // decades above it — so the Newton proposal `|prop|inf = 1.365e-4` is
     // served in `|d|inf = 1.9e-6` slices, a 70x truncation, and the residual
     // contracts at ~0.95/cycle instead of squaring: `3.57e-6` to `3.72e-7`
-    // over 140 cycles and then flat, terminating on the cycle budget.
+    // over 140 cycles and then flat, terminating on the cycle budget. The
+    // penguins armed refit showed the same fixed point held for 167 cycles
+    // (`r = 1.463e-6`, `|prop|∞ = 8.961e-5` served in `|δ|∞ = 6.023e-8`
+    // slices).
     //
     // So in that regime the boundary IS the binding constraint and growth is
     // justified by the criterion the solve is actually judged on: the step sits
-    // on the boundary, the model predicts a genuine (if unreadable) decrease,
-    // and the residual is still above its tolerance. All three are required.
-    // Outside it — anywhere no ladder has measured a resolution, which is every
-    // solve whose cycles accept on the first attempt — `measured_resolution` is
-    // `0`, the clause cannot fire, and the gam#2600 / wine-arm behaviour above
-    // is byte-identical.
-    let objective_unreadable_at_this_step = measured_resolution > 0.0
+    // on the boundary, the model predicts a genuine decrease no larger than one
+    // evaluation's band, and the residual is still above its tolerance. All
+    // three are required, and the controller grows only on a very successful
+    // ratio. "Unreadable" is read against the same band the ratio carries, so a
+    // prediction the arithmetic can resolve is judged by `objective_tol` and the
+    // gam#2600 / wine-arm behaviour above is unchanged. The growth is
+    // self-limiting: once the region is large enough for the Newton step to be
+    // interior, the step is no longer on the boundary and this stops.
+    let objective_band =
+        joint_objective_evaluation_band(measured_resolution, evaluation_roundoff_ceiling);
+    let objective_unreadable_at_this_step = objective_band > 0.0
         && predicted_reduction > 0.0
-        && predicted_reduction <= measured_resolution
+        && predicted_reduction <= objective_band
         && residual_above_tolerance;
-    // Geometry alone: did the region, rather than the model, decide the step
-    // length? Kept separate from `hit_boundary` because the noise-floor branch
-    // below needs the geometric fact without the model's opinion attached —
-    // there the model has already been established unable to resolve its own
-    // prediction, so asking it whether the step was worth taking is asking a
-    // question it cannot answer (gam#2612).
-    let step_reached_boundary = joint_block_step_hit_trust_boundary(step_norm, old_radius);
     // ... AND THE STANDARD IS READ ON THE RAY, NOT ON THE CHORD (gam#2714).
     //
     // `predicted_reduction` is the decrease at the step the region ALLOWED. On
@@ -2141,24 +2190,12 @@ pub(crate) fn update_joint_trust_region_radius(
     // the minimum exists and bounds what any radius could buy along that ray;
     // everywhere else they pass `predicted_reduction` and the wine-arm
     // behaviour above, measured on an indefinite Hessian, is byte-identical.
-    let hit_boundary = step_reached_boundary
+    let hit_boundary = joint_block_step_hit_trust_boundary(step_norm, old_radius)
         && (reduction_along_ray > objective_tol || objective_unreadable_at_this_step);
-    // THE NOISE FLOOR IS MEASURED WHEN IT CAN BE (gam#2612). The controller
-    // sizes its floor as `|objective_scale| × noise_floor_rel`, so passing the
-    // measured ABSOLUTE resolution as a ratio against the same scale makes its
-    // internal floor exactly that resolution — one number, one spelling, and
-    // the relative constant survives only as the never-measured fallback. See
-    // [`ObjectiveResolutionWitness`] for what the measurement reads and why
-    // `ε|F|` is not it.
-    let objective_scale_floor = objective_scale.abs().max(1.0);
-    let noise_floor = (objective_scale_floor * JOINT_TRUST_NOISE_FLOOR_REL)
-        .max(measured_resolution.max(0.0))
-        .min(f64::MAX);
-    let noise_floor_rel = noise_floor / objective_scale_floor;
-    let policy = opt::TrustRegionPolicy::noise_aware(
+    let policy = opt::TrustRegionPolicy::noise_tolerant(
         JOINT_TRUST_RADIUS_FLOOR,
         JOINT_TRUST_RADIUS_CEILING,
-        noise_floor_rel,
+        objective_band,
     );
     let step = policy.update(
         old_radius,
@@ -2166,109 +2203,7 @@ pub(crate) fn update_joint_trust_region_radius(
         hit_boundary,
         actual_reduction,
         predicted_reduction,
-        objective_scale,
     );
-    // MODEL EXHAUSTION IS NOT MODEL DISAGREEMENT (gam#2637).
-    //
-    // The controller maps two different situations onto one `rho = -inf`
-    // rejection: a model that predicts ASCENT, and a model whose predicted
-    // DESCENT is too small to resolve against the objective's own round-off
-    // floor (`predicted_reduction <= |objective| × 1e-14`). Only the first is
-    // evidence that the region was too large.
-    //
-    // The second is a trap, because the ranked candidate on the constrained
-    // path is the active-set QP chord scaled to the radius, so its predicted
-    // reduction goes as `alpha²`: shrinking makes the next prediction smaller
-    // and guarantees the next rejection. Measured on
-    // `binomial_location_scale_engine_matches_reference_flow`, cycle 8: a step
-    // whose REALIZED reduction was `+2.090494888e-9` — 5,030× the
-    // `4.156290748e-13` floor — was rejected for a prediction of
-    // `+2.944376434e-13`; three consecutive shrinks took the radius from
-    // `1.000e0` to `4.448471e-8`, below the Newton proposal's
-    // own `1.878e-7`, and the solve then spent 31 of its 40 cycles with the
-    // stationarity residual bit-frozen at `3.009e-6` against a `1.129e-11`
-    // tolerance while every accepted step moved beta by `<= 1e-10`.
-    //
-    // When the model has merely run out of resolution but the realized change
-    // is a genuine decrease ABOVE the same floor, the measurement is the better
-    // evidence: take the step. Held, not grown — a model that cannot resolve
-    // its own prediction is not evidence for a larger region either. A model
-    // that predicts ascent (`predicted_reduction < 0`) or is non-finite still
-    // rejects and shrinks exactly as before, and so does any step whose
-    // realized change fails to clear the floor.
-    //
-    // ... EXCEPT WHERE HOLDING IS A FIXED POINT (gam#2612). "Held, not grown"
-    // is right when the step was INTERIOR: the region is not what limited it,
-    // so enlarging it changes nothing. On the BOUNDARY it is a trap of the
-    // same shape as the rejection ratchet this branch was written to break.
-    // The step is short because the radius is small; the predicted reduction
-    // is unreadable BECAUSE the step is short; and "unreadable ⇒ do not grow"
-    // then freezes the radius at whatever value some earlier rejection left,
-    // for every remaining cycle. Measured on this issue's penguins armed
-    // refit: `r = 1.463e-6` held for 167 cycles with the Newton proposal at
-    // `|prop|∞ = 8.961e-5` served in `|δ|∞ = 6.023e-8` slices — a 1500×
-    // truncation — while the residual crawled `0.9922×/cycle` against a
-    // tolerance five orders below it, and the solve exited on the slow-rate
-    // stall guard.
-    //
-    // The evidence for enlarging is not the model. It is the same measurement
-    // this branch already accepted on, plus two facts that are not opinions:
-    //
-    //   * `actual_reduction > noise_floor` — the step DID something the
-    //     objective can resolve (the branch's own precondition);
-    //   * `step_reached_boundary` — the region, not the model, chose the step
-    //     length, so it is the binding constraint;
-    //   * `residual_above_tolerance` — the criterion the inner solve actually
-    //     certifies on is not satisfied, so there is still work to do.
-    //
-    // All three are required, none is a prediction, and the growth is
-    // self-limiting: the moment the region is large enough for the Newton step
-    // to be interior, `step_reached_boundary` is false and this stops. The
-    // factor and the cap are the SHARED controller's own (`policy`), not a
-    // second opinion about how fast a trust region should grow.
-    //
-    // "RESOLVABLE" MEANS ABOVE WHAT THE ARITHMETIC CAN CARRY, NOT ABOVE WHAT
-    // HAS BEEN SEEN (gam#2977 S2). This branch overrides a rejection, so its
-    // premise — the realized change is a fact about `β` — must hold for every
-    // rounding the evaluation could carry, and the only number that bounds
-    // that from above is the evaluation's own arithmetic ceiling
-    // `γ_m·Σ|terms| + logdet_roundoff` ([`ObjectiveAccumulation`]). `noise_floor`
-    // is a LOWER bound: before any ladder has measured, it is the `|F|·1e-14`
-    // fallback, which is exactly what a cancelling evaluation exceeds. Measured
-    // on gnomon#2370's 48-row location-scale fixture: floor `2.4e-14`, the
-    // evaluation's rounding `2.64e-11` (the witness measured it one ladder
-    // later), and a realized `+2.330e-11` accepted here as a decrease. That
-    // accept ended the ladder the witness needed, the noise-decided shrinks
-    // stood at `r = 1.160e-10`, the next cycle's exact face was declined as
-    // touching the ball, and the solve refused on a fully-rejected stall.
-    // Requiring the change to clear the ceiling keeps that attempt a
-    // rejection, so the ladder continues and the witness undoes its shrinks.
-    //
-    // The asymmetry is deliberate: the controller's own "indistinguishable ⇒
-    // `rho = 1`" test above stays on the lower bound, because treating a
-    // resolvable change as noise is the error in THAT direction. A
-    // non-finite ceiling (an evaluation this module cannot size) cannot
-    // certify any change, so the override does not fire.
-    if !step.accepted
-        && step.predicted_nonpositive
-        && predicted_reduction.is_finite()
-        && predicted_reduction >= 0.0
-        && actual_reduction > noise_floor
-        && actual_reduction > evaluation_roundoff_ceiling
-    {
-        let region_is_the_binding_constraint = step_reached_boundary && residual_above_tolerance;
-        let radius = if region_is_the_binding_constraint {
-            (old_radius * policy.expand_factor).min(policy.max_radius)
-        } else {
-            old_radius
-        };
-        return JointTrustRegionUpdate {
-            rho: 1.0,
-            radius,
-            accepted: true,
-            decision: JointTrustRegionDecision::AcceptBelowModelNoiseFloor,
-        };
-    }
     JointTrustRegionUpdate {
         rho: step.rho,
         radius: step.new_radius,
