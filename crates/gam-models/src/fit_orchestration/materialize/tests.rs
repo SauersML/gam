@@ -1302,6 +1302,67 @@ fn competing_risks_all_causes_weighted_passes_per_cause_gate_issue_2276() {
     }
 }
 
+/// An explicit `survival_likelihood='transformation'` is the user's choice, not
+/// the unset default: `linkwiggle(...)` must not silently swap it for the
+/// location-scale model. The existing linkwiggle refusal fires instead.
+#[test]
+fn explicit_transformation_likelihood_with_linkwiggle_is_refused_not_swapped() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: Some("transformation".to_string()),
+        ..FitConfig::default()
+    };
+    let err = materialize(
+        "Surv(age_entry, age_exit, event) ~ bmi + linkwiggle(degree=2, internal_knots=1)",
+        &data,
+        &config,
+    )
+    .err()
+    .expect("an explicit transformation likelihood must not be promoted by linkwiggle");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("linkwiggle(...) is not defined for survival_likelihood='transformation'"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Same contract for `noise_formula`: an explicit transformation likelihood has
+/// no log-sigma predictor, so the noise formula is refused.
+#[test]
+fn explicit_transformation_likelihood_with_noise_formula_is_refused_not_swapped() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        survival_likelihood: Some("transformation".to_string()),
+        noise_formula: Some("bmi".to_string()),
+        ..FitConfig::default()
+    };
+    let err = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config)
+        .err()
+        .expect("an explicit transformation likelihood must not be promoted by noise_formula");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("noise_formula requires the survival location-scale likelihood"),
+        "unexpected error: {msg}"
+    );
+}
+
+/// Control: with the likelihood unset, a noise formula still selects the
+/// location-scale model, so the transformation refusal never fires.
+#[test]
+fn unset_likelihood_with_noise_formula_still_selects_location_scale() {
+    let data = competing_risks_weighted_dataset([1.0, 0.0, 1.0, 0.0], [1.0, 1.0, 1.0, 1.0]);
+    let config = FitConfig {
+        noise_formula: Some("bmi".to_string()),
+        ..FitConfig::default()
+    };
+    if let Err(err) = materialize("Surv(age_entry, age_exit, event) ~ bmi", &data, &config) {
+        assert!(
+            !err.to_string().contains("noise_formula requires"),
+            "an unset likelihood must be promoted to location-scale: {err}"
+        );
+    }
+}
+
 /// Two-cause competing-risks dataset (`event` codes `{0, 1, 2}`) with a weight
 /// column `w`, parallel to `codes`/`weights`.
 fn competing_risks_weighted_dataset(codes: [f64; 4], weights: [f64; 4]) -> Dataset {
