@@ -1,7 +1,7 @@
-//! #2754: the transformation-normal entry points REACH the measure-jet range
-//! resolver — asserted on the reaching, not on the fit that follows it.
+//! #2754: the transformation-normal entry point REACHES the measure-jet range
+//! resolver, and the fit that follows it mints.
 //!
-//! ## What is being pinned, and why not end to end
+//! ## What is being pinned
 //!
 //! `length_scale == 0.0` is an unresolved representer range with two resolvers
 //! in the tree — the basis builder's pure-geometry median-nearest-node rule and
@@ -12,23 +12,21 @@
 //! `f64` equality of the realized range against a standard fit on the same
 //! response.
 //!
-//! CTN cannot be gated that way today, and the reason is not this lane's. On a
-//! near-noiseless Gaussian response the outer search rails at the box floor and
-//! declines to mint a fit (`NOT STATIONARY (|Pg| = 4.224e-1 > 3.493e-2)`,
-//! `railed = [0, 1, 2, 3]`), legitimately: a `p_resp × p_cov` tensor can
-//! interpolate a smooth surface at that noise level. On a right-skewed positive
-//! response — the shape CTN exists for — it refuses in the inner solve instead
-//! (`physical reduced-face first-order KKT failed`,
-//! `projected_residual_inf = 5.99` against `6.2e-3`), which is the gam#2600
-//! refusal class, open and not about ranges at all.
+//! Here the claim is pinned at the moment it is made: the screen runs before
+//! the design is built and logs what it resolved, so the record is counted
+//! whether or not the fit that follows converges, and a missing record names
+//! the resolver bypass rather than some later failure.
 //!
-//! Tying a range-resolver gate to an open refusal class in another subsystem
-//! would make it red for a reason it does not measure. So this pins the claim
-//! that is actually being made — *the resolver is REACHED from this entry
-//! point* — at the moment it is reached: the screen runs before the design is
-//! built and logs what it resolved, so the record exists whether or not the fit
-//! that follows converges. The day gam#2600 lifts, the sibling gate's exact
-//! equality assertion is the stronger statement to add here.
+//! The fit itself is asserted too. The fixture is a right-skewed positive
+//! (log-normal) response, the shape CTN exists for. This test used to leave the
+//! fit's outcome unasserted because CTN refused such a response inside the
+//! inner solve (`physical reduced-face first-order KKT failed`), which was the
+//! gam#2600 refusal class. That class is closed: the old likelihood
+//! renormalized every row by the normal mass between two FITTED endpoints, so
+//! the objective had no finite mode, and the untruncated `φ(h)·h′` density that
+//! replaced it is convex and coercive. A refusal on this fixture is therefore
+//! no longer an open defect in another subsystem to route around; it is a
+//! solver failure, and SPEC.md says not to paper over those.
 //!
 //! ## Why this is its own test binary
 //!
@@ -37,7 +35,9 @@
 //! eagerly, so a logger installed by one test silently taxes every other test in
 //! the same process — `measure_jet`'s target carries a wall-clock speed gate.
 
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use gam::utils::splitmix64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -119,23 +119,27 @@ fn transformation_normal_entry_reaches_the_measure_jet_range_screen_2754() {
         ..FitConfig::default()
     };
 
-    // The fit's outcome is deliberately not asserted (see the module docs): what
-    // is asserted is that the resolver ran before the design was built. Its
-    // result is reported either way so a future reader can see which arm of
-    // gam#2600 this fixture is in today.
-    match fit_from_formula(
+    // The screen's record is counted by the sink as the design is built, so it
+    // is read after the fit whatever the fit's outcome; the fit is judged first
+    // only so its failure is reported with its own reason.
+    let fit = fit_from_formula(
         "w ~ mjs(x1, x2, centers=10, learn_length_scale=false)",
         &ds,
         &config,
-    ) {
-        Ok(_) => println!("[2754-ctn] the CTN fit converged on this fixture"),
-        Err(e) => println!(
-            "[2754-ctn] the CTN fit declined (not asserted here): {}",
-            e.to_string().chars().take(220).collect::<String>()
+    );
+    let screened = SCREENED_RECORDS.load(Ordering::Relaxed);
+    match fit {
+        Ok(FitResult::TransformationNormal(_)) => {
+            println!("[2754-ctn] the CTN fit converged on this fixture")
+        }
+        Ok(_) => panic!("a transformation-normal config must return a TransformationNormal fit"),
+        Err(e) => panic!(
+            "the transformation-normal fit on a log-normal response must mint (screen records \
+             seen: {screened}); its gam#2600 refusal class is closed, so this refusal is a \
+             solver failure, not an expected decline: {e}"
         ),
     }
 
-    let screened = SCREENED_RECORDS.load(Ordering::Relaxed);
     assert!(
         screened >= 1,
         "the transformation-normal entry point built its covariate design without reaching the \
