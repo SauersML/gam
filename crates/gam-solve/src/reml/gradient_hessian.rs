@@ -3489,13 +3489,13 @@ impl<'a> RemlState<'a> {
     /// priors also need the log-precision Jacobian. Every distribution consumer
     /// adds the same correction to the fitting criterion.
     ///
-    /// Returned as `(cost, gradient)` only: the ρ-posterior samplers consume a
-    /// log-density and its gradient, and no consumer of this correction needs
-    /// its curvature.
+    /// The samplers consume the cost and gradient; the curvature (diagonal,
+    /// since every term is per-coordinate) is what places them on the sampled
+    /// density's own Laplace geometry (#3293).
     pub(crate) fn rho_prior_distribution_correction(
         &self,
         rho: &Array1<f64>,
-    ) -> Result<(f64, Array1<f64>), EstimationError> {
+    ) -> Result<crate::rho_prior_eval::DistributionCorrection, EstimationError> {
         // The SAME weight anchoring the criterion's own prior evaluation uses
         // (#877), so the correction is taken at the coordinate the terms it
         // corrects were evaluated at.

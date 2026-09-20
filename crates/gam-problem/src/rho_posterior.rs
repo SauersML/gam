@@ -379,14 +379,15 @@ pub trait RhoPosteriorEscalator: Send + Sync {
     ) -> Result<Option<RhoPosteriorAdequacy>, RhoPosteriorRefusal>;
 
     /// Auto-selected escalation (Tier-1 quadrature / Tier-2 NUTS / honest
-    /// `Unavailable`). `criterion` returns the exact profiled criterion value,
-    /// `criterion_and_grad` the value plus the exact LAML `ρ`-gradient; either
-    /// failing at a node or a sampler position makes the tier `Unavailable`
-    /// with that reason.
+    /// `Unavailable`). `criterion` returns the negative log of the sampled
+    /// density, `criterion_and_grad` the value plus its exact `ρ`-gradient;
+    /// either failing at a node or a sampler position makes the tier
+    /// `Unavailable` with that reason. `mode` and `hessian` are that density's
+    /// own Laplace geometry (#3293): the tiers centre and whiten by them.
     fn escalate_rho_posterior(
         &self,
-        rho_hat: &Array1<f64>,
-        outer_hessian: &Array2<f64>,
+        mode: &Array1<f64>,
+        hessian: &Array2<f64>,
         criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
         criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
                   + Send),

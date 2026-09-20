@@ -152,3 +152,166 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
     }
 }
 
+/// The #3293 geometry, measured on the block-corrected Poisson `te` fit: the
+/// LAML at `ρ̂` is nearly flat in its last two coordinates, and the sampled
+/// density adds the default PC distribution correction (#2450) to every
+/// coordinate, `c(r) = r/2 + θe^{−r/2}` with `θ = −ln(0.01)/10`.
+struct PriorDominatedDensity {
+    rho_hat: Array1<f64>,
+    laml_diagonal: Array1<f64>,
+    theta: f64,
+}
+
+impl PriorDominatedDensity {
+    fn issue_3293() -> Self {
+        Self {
+            rho_hat: array![7.80, 7.93, 1.85, 4.33, 4.90],
+            laml_diagonal: array![6.08, 6.13, 0.209, 0.00957, 0.00268],
+            theta: -(0.01f64).ln() / 10.0,
+        }
+    }
+
+    /// Cost, gradient and curvature of coordinate `i` of the separable density.
+    fn coordinate(&self, i: usize, r: f64) -> (f64, f64, f64) {
+        let h = self.laml_diagonal[i];
+        let d = r - self.rho_hat[i];
+        let e = (-0.5 * r).exp();
+        (
+            0.5 * h * d * d + 0.5 * r + self.theta * e,
+            h * d + 0.5 - 0.5 * self.theta * e,
+            h + 0.25 * self.theta * e,
+        )
+    }
+
+    fn cost_and_gradient(&self, rho: &Array1<f64>) -> (f64, Array1<f64>) {
+        let mut cost = 0.0;
+        let mut gradient = Array1::zeros(rho.len());
+        for i in 0..rho.len() {
+            let (c, g, _) = self.coordinate(i, rho[i]);
+            cost += c;
+            gradient[i] = g;
+        }
+        (cost, gradient)
+    }
+
+    /// The density's mode and Hessian there: per-coordinate Newton, which the
+    /// strictly convex coordinate costs make globally convergent from `ρ̂`
+    /// once each step is halved until it lowers the cost.
+    fn laplace_geometry(&self) -> (Array1<f64>, Array2<f64>) {
+        let k = self.rho_hat.len();
+        let mut mode = self.rho_hat.clone();
+        let mut curvature = Array1::zeros(k);
+        for i in 0..k {
+            let mut r = self.rho_hat[i];
+            loop {
+                let (c, g, h) = self.coordinate(i, r);
+                if g * g / h <= f64::EPSILON * c.abs() {
+                    break;
+                }
+                let mut step = -g / h;
+                while self.coordinate(i, r + step).0 > c {
+                    step *= 0.5;
+                }
+                r += step;
+            }
+            mode[i] = r;
+            curvature[i] = self.coordinate(i, r).2;
+        }
+        (mode, Array2::from_diag(&curvature))
+    }
+
+    /// Exact mean, variance and fourth central moment of coordinate `i`, by
+    /// the trapezoid rule, which converges geometrically for a smooth
+    /// integrand that has decayed to rounding at both ends of the grid.
+    fn coordinate_moments(&self, i: usize, centre: f64, scale: f64) -> (f64, f64, f64) {
+        let nodes = 40_001;
+        // Below the mode the density falls double-exponentially; above it
+        // no slower than `e^{−r/2}`: 150 units carry it to `e^{−75}`.
+        let (lo, hi) = (centre - 40.0 * scale, centre + 150.0);
+        let dx = (hi - lo) / (nodes - 1) as f64;
+        let c0 = self.coordinate(i, centre).0;
+        let grid: Vec<(f64, f64)> = (0..nodes)
+            .map(|n| {
+                let r = lo + n as f64 * dx;
+                (r, (c0 - self.coordinate(i, r).0).exp())
+            })
+            .collect();
+        let integral = |f: &dyn Fn(f64) -> f64| -> f64 {
+            grid.iter()
+                .enumerate()
+                .map(|(n, &(r, w))| {
+                    let edge = if n == 0 || n == nodes - 1 { 0.5 } else { 1.0 };
+                    edge * w * f(r)
+                })
+                .sum::<f64>()
+                * dx
+        };
+        let mass = integral(&|_| 1.0);
+        let mean = integral(&|r| r) / mass;
+        let variance = integral(&|r| (r - mean).powi(2)) / mass;
+        let fourth = integral(&|r| (r - mean).powi(4)) / mass;
+        (mean, variance, fourth)
+    }
+}
+
+/// #3293. NUTS placed on the sampled density's own Laplace geometry recovers
+/// that density's exact moments, and does so for fewer density evaluations
+/// than NUTS placed on the criterion's geometry `(ρ̂, H_LAML)`, which is what
+/// the escalation was handed before and which saturated the sampler's tree
+/// depth on the real fit.
+#[test]
+fn nuts_on_the_sampled_density_geometry_recovers_prior_dominated_moments_3293() {
+    let density = PriorDominatedDensity::issue_3293();
+    let run = |centre: &Array1<f64>, hessian: &Array2<f64>| {
+        let mut evaluations = 0usize;
+        let samples = rho_posterior_nuts(
+            centre,
+            hessian,
+            |rho: &Array1<f64>| {
+                evaluations += 1;
+                Ok(density.cost_and_gradient(rho))
+            },
+            super::ESCALATION_NUTS_SAMPLES,
+            super::ESCALATION_NUTS_SEED,
+        )
+        .expect("rho-posterior NUTS");
+        (samples, evaluations)
+    };
+    let (mode, hessian) = density.laplace_geometry();
+    let (samples, evaluations) = run(&mode, &hessian);
+    let (_, criterion_evaluations) =
+        run(&density.rho_hat, &Array2::from_diag(&density.laml_diagonal));
+    assert!(
+        samples.converged,
+        "rhat {} ess {}",
+        samples.rhat, samples.ess
+    );
+    assert!(
+        evaluations < criterion_evaluations,
+        "the sampled density's geometry took {evaluations} evaluations, the criterion's \
+         {criterion_evaluations}"
+    );
+
+    // Monte-Carlo standard errors from the chain's own effective sample size:
+    // `σ/√n` for the mean and, by the delta method on `Var(s²) = (μ₄−σ⁴)/n`,
+    // `√((μ₄−σ⁴)/n) / (2σ)` for the standard deviation. Four of them bound a
+    // deterministic run's error far outside Monte-Carlo chance.
+    let n = samples.ess;
+    for i in 0..mode.len() {
+        let (mean, variance, fourth) =
+            density.coordinate_moments(i, mode[i], hessian[[i, i]].recip().sqrt());
+        let sd = variance.sqrt();
+        let mean_se = sd / n.sqrt();
+        let sd_se = ((fourth - variance * variance) / n).sqrt() / (2.0 * sd);
+        let sampled_sd = samples.covariance[[i, i]].sqrt();
+        assert!(
+            (samples.mean[i] - mean).abs() <= 4.0 * mean_se,
+            "coordinate {i}: sampled mean {} vs exact {mean} (se {mean_se})",
+            samples.mean[i]
+        );
+        assert!(
+            (sampled_sd - sd).abs() <= 4.0 * sd_se,
+            "coordinate {i}: sampled sd {sampled_sd} vs exact {sd} (se {sd_se})"
+        );
+    }
+}

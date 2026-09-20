@@ -93,13 +93,13 @@ impl gam_problem::rho_posterior::RhoPosteriorEscalator for HmcIoRhoPosteriorEsca
 
     fn escalate_rho_posterior(
         &self,
-        rho_hat: &Array1<f64>,
-        outer_hessian: &Array2<f64>,
+        mode: &Array1<f64>,
+        hessian: &Array2<f64>,
         criterion: &mut dyn FnMut(&Array1<f64>) -> Result<f64, String>,
         criterion_and_grad: &mut (dyn FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String>
                   + Send),
     ) -> RhoPosteriorEscalation {
-        escalate_rho_posterior(rho_hat, outer_hessian, criterion, criterion_and_grad)
+        escalate_rho_posterior(mode, hessian, criterion, criterion_and_grad)
     }
 }
 
@@ -401,8 +401,9 @@ where
 }
 
 /// Tier-2 of the marginal-smoothing inference stack (#938): NUTS over `ρ`
-/// with the exact profiled gradient, whitened by the exact outer Hessian at
-/// `ρ̂` (the `hmc` module's whitening design reused one level up).
+/// with the exact profiled gradient, centred at `rho_hat` and whitened by
+/// `outer_hessian` (the `hmc` module's whitening design reused one level up).
+/// The escalation passes the sampled density's own mode and Hessian (#3293).
 ///
 /// * `criterion_and_grad` — `ρ ↦ (criterion(ρ), ∇_ρ criterion(ρ))`, both EXACT
 ///   (the engine's LAML value and ρ-gradient), or the reason it cannot value a
@@ -472,12 +473,15 @@ where
 /// [`RhoPosteriorEscalation::Unavailable`] beyond that. Magic by default: no
 /// flags, the tier is chosen from the problem.
 ///
-/// Both closures evaluate the SAME live objective the fit converged on
-/// (`criterion` = `OuterObjective::eval_cost`, `criterion_and_grad` = value +
-/// exact LAML ρ-gradient); run this while that objective is still alive.
+/// Both closures evaluate the SAME sampled density (`criterion` its negative
+/// log, `criterion_and_grad` that value plus its exact ρ-gradient); run this
+/// while the objective behind them is still alive. `mode` and `hessian` are
+/// that density's Laplace geometry, which both tiers centre and whiten by
+/// (#3293): a geometry taken from a different density leaves the quadrature
+/// proposal and the NUTS metric mis-scaled exactly where the two differ.
 pub fn escalate_rho_posterior<F, G>(
-    rho_hat: &Array1<f64>,
-    outer_hessian: &Array2<f64>,
+    mode: &Array1<f64>,
+    hessian: &Array2<f64>,
     criterion: F,
     criterion_and_grad: G,
 ) -> RhoPosteriorEscalation
@@ -485,7 +489,7 @@ where
     F: FnMut(&Array1<f64>) -> Result<f64, String>,
     G: FnMut(&Array1<f64>) -> Result<(f64, Array1<f64>), String> + Send,
 {
-    let k = rho_hat.len();
+    let k = mode.len();
     if k == 0 {
         return RhoPosteriorEscalation::Unavailable {
             n_params: 0,
@@ -493,7 +497,7 @@ where
         };
     }
     if k <= TIER1_MAX_DIM {
-        match rho_posterior_quadrature(rho_hat, outer_hessian, criterion, None) {
+        match rho_posterior_quadrature(mode, hessian, criterion, None) {
             Ok(mixture) => RhoPosteriorEscalation::Quadrature(mixture),
             Err(e) => RhoPosteriorEscalation::Unavailable {
                 n_params: k,
@@ -502,8 +506,8 @@ where
         }
     } else if k <= TIER2_MAX_DIM {
         match rho_posterior_nuts(
-            rho_hat,
-            outer_hessian,
+            mode,
+            hessian,
             criterion_and_grad,
             ESCALATION_NUTS_SAMPLES,
             ESCALATION_NUTS_SEED,

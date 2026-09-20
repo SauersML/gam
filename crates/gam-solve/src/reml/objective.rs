@@ -3332,10 +3332,9 @@ mod tk_math_tests {
         let theta = pc_prior_rate(upper, RHO_DISTRIBUTION_PC_TAIL_PROB);
 
         for &r in &[-30.0, -20.0, -4.7, 0.0, 5.0, 30.0] {
-            let (pc_cost, pc_grad, _) = pc_prior_terms(theta, r);
             assert_eq!(
                 rho_distribution_default_terms(theta, r),
-                (pc_cost, pc_grad),
+                pc_prior_terms(theta, r),
                 "the sampler correction is the PC prior at ρ={r}"
             );
         }
@@ -3344,7 +3343,7 @@ mod tk_math_tests {
         // `+1/2`, so the sampled density decays like `e^{−ρ/2}`. The shortfall is
         // exactly `(θ/2)·e^{−ρ/2}`, which is below 1e-7 by ρ = 30 — the ρ box bound,
         // i.e. the far edge of the region a sampler can reach.
-        let (_, tail_grad) = rho_distribution_default_terms(theta, 30.0);
+        let (_, tail_grad, _) = rho_distribution_default_terms(theta, 30.0);
         let shortfall = 0.5 * theta * (-0.5 * 30.0f64).exp();
         assert!(
             (0.5 - tail_grad - shortfall).abs() < 1e-15,
