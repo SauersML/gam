@@ -1,19 +1,25 @@
 //! Periodic 1D B-spline with non-default degree. Default is cubic
-//! (degree=3); verify lower (linear=1, quadratic=2) and higher
-//! (quintic=5) all fit + predict cleanly.
+//! (degree=3); lower (linear=1, quadratic=2) and higher (quintic=5) degrees are
+//! all well-posed here (k = degree + 10 on 200 distinct points), so each must
+//! fit and is scored against the known truth by the across-the-function
+//! coverage statistic of its own posterior.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{AcrossFunctionCoverage, audit_across_function_coverage};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
 const TAU: f64 = std::f64::consts::TAU;
+
+/// Family-wise upper-tail size of the sweep's coverage gates.
+const FAMILY_ALPHA: f64 = 0.01;
 
 fn make_dataset() -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
@@ -34,7 +40,7 @@ fn make_dataset() -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn try_fit(degree: usize) -> Result<f64, String> {
+fn try_fit(degree: usize, alpha: f64) -> Result<AcrossFunctionCoverage, String> {
     let data = make_dataset();
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -64,36 +70,41 @@ fn try_fit(degree: usize) -> Result<f64, String> {
         .iter()
         .map(|t| t.cos() + 0.3 * (2.0 * t).sin())
         .collect();
-    let sumsq: f64 = pred
-        .iter()
-        .zip(truth.iter())
-        .map(|(p, t)| (p - t).powi(2))
-        .sum();
-    let rmse = (sumsq / pred.len() as f64).sqrt();
-    eprintln!("[per-deg{degree}] rmse={rmse:.4}");
-    Ok(rmse)
+    let error = Array1::from_shape_fn(pred.len(), |i| pred[i] - truth[i]);
+    let cov = fit
+        .fit
+        .beta_covariance()
+        .ok_or_else(|| "no coefficient covariance".to_string())?;
+    let coverage = audit_across_function_coverage(
+        error.view(),
+        design.design.to_dense().view(),
+        cov.view(),
+        alpha,
+    );
+    let rmse = (error.dot(&error) / error.len() as f64).sqrt();
+    eprintln!(
+        "[per-deg{degree}] rmse={rmse:.4} Q={:.3} (E=1, bound={:.3}, h={:.1})",
+        coverage.q, coverage.bound, coverage.dof,
+    );
+    Ok(coverage)
 }
 
 #[test]
 fn periodic_1d_degree_sweep() {
     init_parallelism();
     let mut failures = Vec::new();
-    for degree in [1usize, 2, 3, 4, 5] {
-        match try_fit(degree) {
-            Ok(rmse) => {
-                // σ=0.05 noise → 5σ = 0.25 budget for hard case
-                if rmse > 0.25 {
-                    failures.push(format!("degree={degree}: rmse={rmse:.4}"));
+    let degrees = [1usize, 2, 3, 4, 5];
+    for degree in degrees {
+        match try_fit(degree, FAMILY_ALPHA / degrees.len() as f64) {
+            Ok(coverage) => {
+                if !coverage.passes() {
+                    failures.push(format!(
+                        "degree={degree}: Q={:.3} > bound {:.3} (α={:.4})",
+                        coverage.q, coverage.bound, coverage.alpha,
+                    ));
                 }
             }
-            Err(e) => {
-                let lower = e.to_lowercase();
-                if lower.contains("panic") || lower.contains("nan") {
-                    failures.push(format!("degree={degree}: opaque: {e}"));
-                } else {
-                    eprintln!("[per-deg{degree}] clean rejection: {e}");
-                }
-            }
+            Err(e) => failures.push(format!("degree={degree}: well-posed fit refused: {e}")),
         }
     }
     assert!(

@@ -1,14 +1,18 @@
 //! Run matern fit with all supported nu values (1/2, 3/2, 5/2, 7/2, 9/2)
-//! on a moderate-frequency smooth truth + noise. Verify each ν fits
-//! reasonably (RMSE < 5σ) and produces a non-flat fit.
+//! on a moderate-frequency smooth truth + noise. Each ν is scored against the
+//! known truth by the across-the-function coverage statistic of its own
+//! posterior (`audit_across_function_coverage`), at a Bonferroni share of a
+//! stated family-wise size — a bound derived from the fit, not a multiple of
+//! the observation noise.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{AcrossFunctionCoverage, audit_across_function_coverage};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -34,7 +38,10 @@ fn make_dataset(n: usize, sigma: f64, seed: u64) -> (Vec<f64>, gam::data::Encode
     (x, data)
 }
 
-fn try_fit(nu: &str) -> (String, Result<f64, String>) {
+/// Family-wise upper-tail size of the sweep's coverage gates.
+const FAMILY_ALPHA: f64 = 0.01;
+
+fn try_fit(nu: &str, alpha: f64) -> (String, Result<AcrossFunctionCoverage, String>) {
     let (_, data) = make_dataset(300, 0.05, 41);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -66,16 +73,22 @@ fn try_fit(nu: &str) -> (String, Result<f64, String>) {
     if !pred.iter().all(|v| v.is_finite()) {
         return (formula, Err("non-finite predictions".into()));
     }
-    let sumsq: f64 = pred
-        .iter()
-        .zip(truth_g.iter())
-        .map(|(p, t)| (p - t).powi(2))
-        .sum();
-    let rmse = (sumsq / pred.len() as f64).sqrt();
-    let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
-    let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!("[matern-nu] `{formula}` rmse={rmse:.4} pred_range=[{mn:.3}, {mx:.3}]");
-    (formula, Ok(rmse))
+    let error = Array1::from_shape_fn(pred.len(), |i| pred[i] - truth_g[i]);
+    let Some(cov) = fit.fit.beta_covariance() else {
+        return (formula, Err("no coefficient covariance".into()));
+    };
+    let coverage = audit_across_function_coverage(
+        error.view(),
+        design.design.to_dense().view(),
+        cov.view(),
+        alpha,
+    );
+    let rmse = (error.dot(&error) / error.len() as f64).sqrt();
+    eprintln!(
+        "[matern-nu] `{formula}` rmse={rmse:.4} Q={:.3} (E=1, bound={:.3}, h={:.1})",
+        coverage.q, coverage.bound, coverage.dof,
+    );
+    (formula, Ok(coverage))
 }
 
 #[test]
@@ -84,12 +97,14 @@ fn matern_all_nu_values_fit_reasonably() {
     let nus = ["1/2", "3/2", "5/2", "7/2", "9/2"];
     let mut failures = Vec::new();
     for nu in nus {
-        let (formula, r) = try_fit(nu);
+        let (formula, r) = try_fit(nu, FAMILY_ALPHA / nus.len() as f64);
         match r {
-            Ok(rmse) => {
-                // σ=0.05, allow up to 5σ for hardest case
-                if rmse > 0.25 {
-                    failures.push(format!("`{formula}` rmse={rmse:.4} > 0.25 (5σ)"));
+            Ok(coverage) => {
+                if !coverage.passes() {
+                    failures.push(format!(
+                        "`{formula}` Q={:.3} > bound {:.3} (α={:.4})",
+                        coverage.q, coverage.bound, coverage.alpha,
+                    ));
                 }
             }
             Err(e) => failures.push(format!("`{formula}`: {e}")),

@@ -30,6 +30,9 @@
 //! (a deliberately over-confident posterior) is required to *fail* the gate,
 //! which proves the rank + uniformity logic has teeth.
 
+use ndarray::{ArrayView1, ArrayView2};
+use statrs::distribution::ContinuousCDF;
+
 /// Posterior draws per SBC replication.
 ///
 /// One less than a round power of ten so the reachable rank set `{0, …, L}` has
@@ -732,6 +735,91 @@ pub fn assert_registry_well_formed(registry: &[CalibrationTarget]) {
     );
 }
 
+/// Across-the-function coverage audit of a fitted smooth against its known truth
+/// (Nychka 1988; Wahba 1983).
+///
+/// At `P` probes with design rows `x_i` and Bayesian coefficient covariance `Σ`,
+/// the prediction SE is `s_i = √(x_iᵀ Σ x_i)` and the statistic is
+/// `Q = (1/P) Σ_i e_i² / s_i²` for the function errors `e_i = f̂(x_i) − f(x_i)`.
+/// Under the Bayesian model behind the intervals `e ~ N(0, X Σ Xᵀ)`, so with `R`
+/// the probe correlation matrix `E[Q] = tr(R)/P = 1` and
+/// `Var[Q] = 2·tr(R²)/P²`. The gate is the upper `1 − α` quantile of the
+/// moment-matched scaled `χ²` (Satterthwaite): `Q ≈ g·χ²_h` with `g = Var[Q]/2`,
+/// `h = 2/Var[Q]`. Over-smoothing adds bias to `e` while shrinking `s`, and a
+/// fit collapsed to the mean has `Q ≫ 1`, so both exceed the bound.
+#[derive(Clone, Debug)]
+pub struct AcrossFunctionCoverage {
+    /// The realized statistic `Q`.
+    pub q: f64,
+    /// `Var[Q]` under the model (`E[Q] = 1`).
+    pub variance: f64,
+    /// Satterthwaite degrees of freedom `h = 2/Var[Q]`.
+    pub dof: f64,
+    /// The upper `1 − α` quantile of `(Var[Q]/2)·χ²_h`.
+    pub bound: f64,
+    /// Upper-tail size of the gate.
+    pub alpha: f64,
+}
+
+impl AcrossFunctionCoverage {
+    /// Whether the realized `Q` lies at or below its `1 − α` bound.
+    pub fn passes(&self) -> bool {
+        self.q <= self.bound
+    }
+}
+
+/// Compute [`AcrossFunctionCoverage`] from the function errors at the probes,
+/// the dense probe design (`P × p`) and the coefficient covariance (`p × p`).
+/// Every probe must carry a strictly positive prediction variance.
+pub fn audit_across_function_coverage(
+    error: ArrayView1<'_, f64>,
+    probe_design: ArrayView2<'_, f64>,
+    beta_covariance: ArrayView2<'_, f64>,
+    alpha: f64,
+) -> AcrossFunctionCoverage {
+    let probes = probe_design.nrows();
+    assert_eq!(error.len(), probes, "one error per probe row");
+    assert_eq!(
+        probe_design.ncols(),
+        beta_covariance.nrows(),
+        "probe design columns must match the coefficient covariance"
+    );
+    assert!(alpha > 0.0 && alpha < 1.0, "alpha must be in (0, 1)");
+    let prediction_cov = probe_design.dot(&beta_covariance).dot(&probe_design.t());
+    let se: Vec<f64> = (0..probes)
+        .map(|i| {
+            let v = prediction_cov[[i, i]];
+            assert!(
+                v.is_finite() && v > 0.0,
+                "probe {i} prediction variance must be finite and positive, got {v}"
+            );
+            v.sqrt()
+        })
+        .collect();
+    let p = probes as f64;
+    let q = (0..probes)
+        .map(|i| (error[i] / se[i]).powi(2))
+        .sum::<f64>()
+        / p;
+    let mut trace_r2 = 0.0;
+    for i in 0..probes {
+        for j in 0..probes {
+            trace_r2 += (prediction_cov[[i, j]] / (se[i] * se[j])).powi(2);
+        }
+    }
+    let variance = 2.0 * trace_r2 / (p * p);
+    let dof = 2.0 / variance;
+    let chi2 = statrs::distribution::ChiSquared::new(dof).expect("positive Satterthwaite dof");
+    let bound = 0.5 * variance * chi2.inverse_cdf(1.0 - alpha);
+    AcrossFunctionCoverage {
+        q,
+        variance,
+        dof,
+        bound,
+        alpha,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1061,5 +1149,37 @@ mod tests {
             FieldAudit::audited("eta_lower", "band").disposition,
             FieldDisposition::AuditedBy("band")
         );
+    }
+
+    #[test]
+    fn across_function_coverage_bounds_independent_probes_by_chi_square() {
+        use super::audit_across_function_coverage;
+        use ndarray::{Array1, Array2};
+        use statrs::distribution::ContinuousCDF;
+        // Identity design and covariance: R = I, so Q = mean(e²), Var[Q] = 2/P
+        // and the bound is χ²_P(1 − α)/P exactly.
+        let probes = 40usize;
+        let design = Array2::<f64>::eye(probes);
+        let cov = Array2::<f64>::eye(probes);
+        let zero = audit_across_function_coverage(
+            Array1::zeros(probes).view(),
+            design.view(),
+            cov.view(),
+            0.01,
+        );
+        assert!((zero.dof - probes as f64).abs() < 1e-12);
+        let chi2 = statrs::distribution::ChiSquared::new(probes as f64).unwrap();
+        let exact = chi2.inverse_cdf(0.99) / probes as f64;
+        assert!((zero.bound - exact).abs() < 1e-12 * exact);
+        assert!(zero.passes());
+        // A mean collapse: every error three SEs out gives Q = 9 ≫ bound.
+        let collapsed = audit_across_function_coverage(
+            Array1::from_elem(probes, 3.0).view(),
+            design.view(),
+            cov.view(),
+            0.01,
+        );
+        assert_eq!(collapsed.q, 9.0);
+        assert!(!collapsed.passes());
     }
 }

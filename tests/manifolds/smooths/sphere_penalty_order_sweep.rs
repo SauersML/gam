@@ -1,14 +1,16 @@
-//! Sphere fit with each supported `penalty_order` (m=1..4).
-//! Each should produce a finite, bounded fit; the smoothness biases vary
-//! but the pipeline must never NaN/panic.
+//! Sphere fit with each supported `penalty_order` (m=1..4). Each sweep case is
+//! scored against the known truth by the across-the-function coverage
+//! statistic of its own posterior, at a Bonferroni share of a stated
+//! family-wise size.
 
 use csv::StringRecord;
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
+use gam::test_support::calibration::{AcrossFunctionCoverage, audit_across_function_coverage};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
@@ -36,7 +38,17 @@ fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     encode_recordswith_inferred_schema(headers, rows).expect("encode")
 }
 
-fn run(formula: &str) -> Result<(f64, f64, f64), String> {
+/// Family-wise upper-tail size of each sweep's coverage gates.
+const FAMILY_ALPHA: f64 = 0.01;
+
+struct SweepFit {
+    rmse: f64,
+    min: f64,
+    max: f64,
+    coverage: AcrossFunctionCoverage,
+}
+
+fn run(formula: &str, alpha: f64) -> Result<SweepFit, String> {
     let data = make_dataset(400);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
@@ -73,16 +85,40 @@ fn run(formula: &str) -> Result<(f64, f64, f64), String> {
                 + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
         })
         .collect();
-    let sumsq: f64 = pred
-        .iter()
-        .zip(truth.iter())
-        .map(|(p, t)| (p - t).powi(2))
-        .sum();
-    let rmse = (sumsq / pred.len() as f64).sqrt();
-    let mn = pred.iter().cloned().fold(f64::INFINITY, f64::min);
-    let mx = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    eprintln!("[m-sweep] `{formula}` rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]");
-    Ok((rmse, mn, mx))
+    let error = Array1::from_shape_fn(pred.len(), |i| pred[i] - truth[i]);
+    let cov = fit
+        .fit
+        .beta_covariance()
+        .ok_or_else(|| "no coefficient covariance".to_string())?;
+    let coverage = audit_across_function_coverage(
+        error.view(),
+        design.design.to_dense().view(),
+        cov.view(),
+        alpha,
+    );
+    let rmse = (error.dot(&error) / error.len() as f64).sqrt();
+    let min = pred.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = pred.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    eprintln!(
+        "[m-sweep] `{formula}` rmse={rmse:.4} range=[{min:.3}, {max:.3}] Q={:.3} \
+         (E=1, bound={:.3}, h={:.1})",
+        coverage.q, coverage.bound, coverage.dof,
+    );
+    Ok(SweepFit {
+        rmse,
+        min,
+        max,
+        coverage,
+    })
+}
+
+fn push_coverage_failure(failures: &mut Vec<String>, m: usize, fit: &SweepFit) {
+    if !fit.coverage.passes() {
+        failures.push(format!(
+            "m={m}: Q={:.3} > bound {:.3} (α={:.4}); rmse={:.4}",
+            fit.coverage.q, fit.coverage.bound, fit.coverage.alpha, fit.rmse,
+        ));
+    }
 }
 
 #[test]
@@ -99,18 +135,15 @@ fn sphere_wahba_penalty_order_sweep_low_orders() {
     // builder refuses the family (#2475); `lmax=` is the shipped way to state
     // the spectral resolution a finite m=1 diagonal implies.
     let mut failures = Vec::new();
-    for m in [1usize, 2, 3] {
+    let orders = [1usize, 2, 3];
+    for m in orders {
         let formula = if m == 1 {
             "y ~ sphere(lat, lon, k=30, penalty_order=1, lmax=200)".to_string()
         } else {
             format!("y ~ sphere(lat, lon, k=30, penalty_order={m})")
         };
-        match run(&formula) {
-            Ok((rmse, mn, mx)) => {
-                if rmse > 0.25 || mn < -5.0 || mx > 5.0 {
-                    failures.push(format!("m={m}: rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"));
-                }
-            }
+        match run(&formula, FAMILY_ALPHA / orders.len() as f64) {
+            Ok(fit) => push_coverage_failure(&mut failures, m, &fit),
             Err(e) => failures.push(format!("m={m}: {e}")),
         }
     }
@@ -138,8 +171,13 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
     // someone derives the correct m=4 kernel constants. Don't silence
     // it — that's the whole point of failing here.
     init_parallelism();
-    let (rmse, mn, mx) =
-        run("y ~ sphere(lat, lon, k=30, penalty_order=4)").expect("wahba m=4 fit must succeed");
+    let SweepFit {
+        rmse,
+        min: mn,
+        max: mx,
+        ..
+    } = run("y ~ sphere(lat, lon, k=30, penalty_order=4)", FAMILY_ALPHA)
+        .expect("wahba m=4 fit must succeed");
     // The other Wahba orders (m=1, 2, 3) all hit rmse ≤ 0.018 on the
     // same data. Require m=4 to be in the same ballpark — generous 5×
     // budget = 0.10.
@@ -156,14 +194,11 @@ fn sphere_wahba_m4_must_fit_smooth_truth() {
 fn sphere_harmonic_penalty_order_sweep() {
     init_parallelism();
     let mut failures = Vec::new();
-    for m in [1usize, 2, 3, 4] {
+    let orders = [1usize, 2, 3, 4];
+    for m in orders {
         let formula = format!("y ~ sphere(lat, lon, method=harmonic, max_degree=4, penalty_order={m})");
-        match run(&formula) {
-            Ok((rmse, mn, mx)) => {
-                if rmse > 0.25 || mn < -5.0 || mx > 5.0 {
-                    failures.push(format!("m={m}: rmse={rmse:.4} range=[{mn:.3}, {mx:.3}]"));
-                }
-            }
+        match run(&formula, FAMILY_ALPHA / orders.len() as f64) {
+            Ok(fit) => push_coverage_failure(&mut failures, m, &fit),
             Err(e) => failures.push(format!("m={m}: {e}")),
         }
     }
