@@ -2551,22 +2551,30 @@ fn consumed_coordinates(dimension: usize, profiled: bool) -> usize {
 /// them. That is the control variate, and this is its own sample variance
 /// rather than the `√(p(1−p)/N)` of either term alone. Empty is `(0, 0)`: no
 /// replay, no shift.
+///
+/// The spread is accumulated CENTRED (Welford): `M₂ = Σ (dᵢ − d̄)²` grows by
+/// `(d − d̄_old)(d − d̄_new)`, and `d̄_new = d̄_old + (d − d̄_old)/i` is the
+/// rounding of a point between `d̄_old` and `d`, so it lies in that closed
+/// interval and both factors carry the same sign. Every increment is therefore `≥ 0` in floating
+/// point, a constant sample gives exactly `M₂ = 0`, and no clamp is needed. The
+/// one-pass `Σd²/N − d̄²` it replaces differences two quantities of size `d̄²`
+/// and resolves the variance only in steps of `ulp(d̄²)`, reporting a positive
+/// error on a draw set that is constant (#4086).
 fn paired_mean_with_error(differences: impl Iterator<Item = f64>) -> (f64, f64) {
     let mut count = 0usize;
-    let mut sum = 0.0_f64;
-    let mut sum_squares = 0.0_f64;
+    let mut shift = 0.0_f64;
+    let mut centred_squares = 0.0_f64;
     for difference in differences {
         count += 1;
-        sum += difference;
-        sum_squares += difference * difference;
+        let before = difference - shift;
+        shift += before / count as f64;
+        centred_squares += before * (difference - shift);
     }
     if count == 0 {
         return (0.0, 0.0);
     }
     let count = count as f64;
-    let shift = sum / count;
-    let variance = (sum_squares / count - shift * shift).max(0.0);
-    (shift, (variance / count).sqrt())
+    (shift, (centred_squares / count / count).sqrt())
 }
 
 /// Deterministic `χ²_1` draws for the selection replay.
@@ -4853,9 +4861,52 @@ mod selection_replay_tests {
         AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
         SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
         SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
-        SmoothLrSelectionProfile, SmoothLrSelectionReplay, split_mix64, stratified_chi_square,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, paired_mean_with_error, split_mix64,
+        stratified_chi_square,
     };
     use ndarray::Array2;
+
+    /// #4086 sibling: the paired-difference spread is centred, so it cannot
+    /// cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
+    /// power of two) have mean exactly `c` and population variance exactly
+    /// `s²`, so the reference is exact with no second implementation. The
+    /// retired one-pass `Σd²/N − d̄²` is evaluated alongside to show this is
+    /// the regime where it loses the variance (it resolves only `ulp(c²)`),
+    /// and a constant sample must report an error of exactly zero.
+    #[test]
+    fn paired_standard_error_is_centred_and_exact_under_a_large_mean_4086() {
+        let c = 0.75_f64;
+        let mut one_pass_lost = 0usize;
+        for k in 20..32_i32 {
+            let s = 2.0_f64.powi(-k);
+            let mut sample = vec![c + s; 128];
+            sample.extend(std::iter::repeat_n(c - s, 128));
+            let n = sample.len() as f64;
+            let exact_error = (s * s / n).sqrt();
+            let (shift, error) = paired_mean_with_error(sample.iter().copied());
+            assert_eq!(shift, c, "the construction gives the mean exactly");
+            assert!(
+                (error - exact_error).abs() <= 4.0 * f64::EPSILON * exact_error,
+                "s = 2^-{k}: centred error {error:.17e} vs exact {exact_error:.17e}"
+            );
+            let sum: f64 = sample.iter().sum();
+            let sum_squares: f64 = sample.iter().map(|d| d * d).sum();
+            let one_pass = sum_squares / n - (sum / n) * (sum / n);
+            if (one_pass - s * s).abs() > 0.5 * s * s {
+                one_pass_lost += 1;
+            }
+        }
+        assert!(
+            one_pass_lost > 0,
+            "the retired one-pass form must be seen to lose the variance, or this \
+             test is not exercising the cancelling regime"
+        );
+        for value in [0.1_f64, 1.0 / 3.0, -0.7, 1.0] {
+            let (shift, error) = paired_mean_with_error(std::iter::repeat_n(value, 10));
+            assert_eq!(error, 0.0, "a constant sample of {value} has no spread");
+            assert!((shift - value).abs() <= 2.0 * f64::EPSILON * value.abs());
+        }
+    }
 
     /// A shrunk-smooth generalized spectrum: one direction the data can still
     /// see and a geometric tail the penalty has taken.
