@@ -997,8 +997,7 @@ impl FittedModelPredictExt for FittedModel {
             PredictModelClass::GaussianLocationScale => {
                 let fit = self.fit_result.as_ref()?;
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let beta_noise = location_scale_noise_beta(fit)?;
                 let response_scale = self.payload().gaussian_response_scale.unwrap_or(1.0);
                 let sigma_floor =
                     gam_models::inference::model::gaussian_location_scale_saved_sigma_floor(
@@ -1071,8 +1070,7 @@ impl FittedModelPredictExt for FittedModel {
                 let inverse_link = runtime.inverse_link.clone()?;
                 let fit = self.fit_result.as_ref()?;
                 let beta_threshold = binomial_location_scale_threshold_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let beta_noise = location_scale_noise_beta(fit)?;
                 Some(Box::new(BinomialLocationScalePredictor {
                     beta_threshold,
                     beta_noise,
@@ -1084,8 +1082,7 @@ impl FittedModelPredictExt for FittedModel {
             PredictModelClass::DispersionLocationScale => {
                 let fit = self.fit_result.as_ref()?;
                 let beta_mu = gaussian_location_scale_mean_beta(fit)?;
-                let beta_noise = location_scale_noise_beta(fit)
-                    .or_else(|| self.payload().beta_noise.clone().map(Array1::from_vec))?;
+                let beta_noise = location_scale_noise_beta(fit)?;
                 let inverse_link = runtime.inverse_link.clone();
                 Some(Box::new(DispersionLocationScalePredictor {
                     beta_mu,

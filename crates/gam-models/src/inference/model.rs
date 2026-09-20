@@ -12,7 +12,7 @@ use crate::wiggle::{
     WigglePenaltyMetadata, canonical_wiggle_function_penalties,
     monotone_wiggle_basis_with_derivative_order, validate_monotone_wiggle_beta_nonnegative,
 };
-use gam_linalg::faer_ndarray::{FaerCholesky, array2_to_nested_vec};
+use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::matrix::DesignMatrix;
 use gam_problem::types::{
     InverseLink, LatentCLogLogState, LikelihoodSpec, MixtureLinkState, ResponseFamily, SasLinkSpec,
@@ -703,15 +703,9 @@ pub struct FittedModelPayload {
     pub data_schema: Option<DataSchema>,
     pub link: Option<InverseLink>,
     #[serde(default)]
-    pub mixture_link_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
-    pub sas_param_covariance: Option<Vec<Vec<f64>>>,
-    #[serde(default)]
     pub formula_noise: Option<String>,
     #[serde(default)]
     pub slope_formula: Option<String>,
-    #[serde(default)]
-    pub slope_formulas: Option<Vec<String>>,
     #[serde(default)]
     pub offset_column: Option<String>,
     #[serde(default)]
@@ -722,8 +716,6 @@ pub struct FittedModelPayload {
     /// `sigma_i = sigma_hat / sqrt(w_i)` (#2025). `None` for an unweighted fit.
     #[serde(default)]
     pub weight_column: Option<String>,
-    #[serde(default)]
-    pub beta_noise: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_projection: Option<Vec<Vec<f64>>>,
     #[serde(default)]
@@ -784,8 +776,6 @@ pub struct FittedModelPayload {
     #[serde(default)]
     pub latent_z_normalization: Option<SavedLatentZNormalization>,
     #[serde(default)]
-    pub latent_score_contract: Option<SavedLatentScoreContract>,
-    #[serde(default)]
     pub latent_measure: Option<LatentMeasureKind>,
     /// The declared atoms of a survival marginal-slope fit anchored on the
     /// certified compression of its declared law (gam#2928). `latent_measure`
@@ -833,8 +823,6 @@ pub struct FittedModelPayload {
     pub marginal_baseline: Option<f64>,
     #[serde(default)]
     pub baseline_slope: Option<f64>,
-    #[serde(default)]
-    pub baseline_slopes: Option<Vec<f64>>,
     /// Resolved follow-up time margin of the survival marginal-slope slope
     /// block (gam#2765, gam#2767). `None` is the time-constant slope every model
     /// saved before this existed carries.
@@ -1137,16 +1125,6 @@ pub fn append_deployment_extension_columns(
     Ok(out)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SavedLatentScoreContract {
-    pub semantics: String,
-    pub source_transform_id: Option<String>,
-    pub normalization_mean: f64,
-    pub normalization_sd: f64,
-    pub clip_eps: Option<f64>,
-    pub conditioning_columns: Vec<String>,
-}
-
 impl FittedModelPayload {
     pub fn new(
         version: u32,
@@ -1173,15 +1151,11 @@ impl FittedModelPayload {
             residual_cascade: None,
             data_schema: None,
             link: None,
-            mixture_link_param_covariance: None,
-            sas_param_covariance: None,
             formula_noise: None,
             slope_formula: None,
-            slope_formulas: None,
             offset_column: None,
             noise_offset_column: None,
             weight_column: None,
-            beta_noise: None,
             noise_projection: None,
             noise_center: None,
             noise_scale: None,
@@ -1203,7 +1177,6 @@ impl FittedModelPayload {
             z_column: None,
             z_columns: None,
             latent_z_normalization: None,
-            latent_score_contract: None,
             latent_measure: None,
             declared_latent_law: None,
             declared_latent_law_compression: None,
@@ -1213,7 +1186,6 @@ impl FittedModelPayload {
             latent_law_consumed: None,
             marginal_baseline: None,
             baseline_slope: None,
-            baseline_slopes: None,
             slope_time_basis: None,
             score_warp_runtime: None,
             link_deviation_runtime: None,
@@ -3901,10 +3873,11 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Sas { state, covariance } => {
+            // The link-parameter covariance stays on `fit_result.fitted_link`,
+            // its single serialized home; only the point state has a family slot.
+            FittedLinkState::Sas { state, .. } => {
                 if likelihood.is_binomial_sas() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted SAS link state discarded: likelihood {likelihood:?} is not \
@@ -3912,10 +3885,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::BetaLogistic { state, covariance } => {
+            FittedLinkState::BetaLogistic { state, .. } => {
                 if likelihood.is_binomial_beta_logistic() {
                     *sas_state = Some(*state);
-                    payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted beta-logistic link state discarded: likelihood {likelihood:?} is \
@@ -3923,11 +3895,9 @@ impl FittedModel {
                     );
                 }
             }
-            FittedLinkState::Mixture { state, covariance } => {
+            FittedLinkState::Mixture { state, .. } => {
                 if likelihood.is_binomial_mixture() {
                     *mixture_state = Some(state.clone());
-                    payload.mixture_link_param_covariance =
-                        covariance.as_ref().map(array2_to_nested_vec);
                 } else {
                     log::debug!(
                         "fitted mixture link state discarded: likelihood {likelihood:?} is not a \
@@ -6494,9 +6464,6 @@ impl FittedModel {
             }
         }
 
-        if let Some(v) = self.beta_noise.as_ref() {
-            validate_all_finite("beta_noise", v.iter().copied()).map_err(corrupt)?;
-        }
         if let Some(v) = self.noise_projection.as_ref() {
             validate_all_finite("noise_projection", v.iter().flatten().copied())
                 .map_err(corrupt)?;
@@ -6558,14 +6525,6 @@ impl FittedModel {
         }
         if let Some(v) = self.survival_beta_log_sigma.as_ref() {
             validate_all_finite("survival_beta_log_sigma", v.iter().copied()).map_err(corrupt)?;
-        }
-        if let Some(v) = self.mixture_link_param_covariance.as_ref() {
-            validate_all_finite("mixture_link_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
-        }
-        if let Some(v) = self.sas_param_covariance.as_ref() {
-            validate_all_finite("sas_param_covariance", v.iter().flatten().copied())
-                .map_err(corrupt)?;
         }
         Ok(())
     }
@@ -7567,7 +7526,6 @@ mod tests {
         payload.resolved_termspec = Some(empty_termspec());
         payload.resolved_termspec_noise = Some(empty_termspec());
         payload.formula_noise = Some("x".to_string());
-        payload.beta_noise = Some(vec![0.0]);
         payload.link = Some(InverseLink::Standard(StandardLink::Log));
         payload
     }

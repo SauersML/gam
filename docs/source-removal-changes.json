@@ -2890,5 +2890,15 @@
     ],
     "reason": "#3735: the stable softplus/logistic kernels were implemented more than once in the Rust core. gam_math::special::{softplus, logistic} is canonical; gam_linalg::utils::{stable_softplus, stable_logistic} and the private honest.rs softplus re-derived the identical expressions (max(x,0)+ln1p(exp(-|x|)) and the sign-split logistic). SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. The 10 removed tests re-tested the same kernel through the aliases; their tail and symmetry assertions move into gam-math's softplus_and_logistic_agree_with_their_definitions_away_from_the_tails. The gam-pyffi copy and its numerics_* pyfunctions stay for now, because open PR #3076 edits geometry_ffi.rs and the stubs.",
     "evidence": "At head git grep -w finds no stable_softplus or stable_logistic anywhere; every former caller imports gam_math::special::{softplus, logistic}. The remaining softplus/sigmoid_stable name occurrences are other, untouched items."
+  },
+  {
+    "base": "00b33efd500f54529a61bab8ba3dcc5da54a8745",
+    "items": [
+      "crates/gam-models/src/inference/model.rs:struct:SavedLatentScoreContract",
+      "crates/gam-solve/src/model_types/result_types.rs:fn:working_geometry",
+      "crates/gam-solve/src/model_types/result_types.rs:fn:working_response"
+    ],
+    "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
+    "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
   }
 ]
