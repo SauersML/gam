@@ -577,8 +577,9 @@ fn load_model_rejects_payload_version_mismatch() {
         Err(e) => e,
     };
     assert!(
-        err.contains("saved model payload schema mismatch"),
-        "unexpected error: {err}"
+        matches!(err, gam::inference::model::FittedModelError::SchemaMismatch { .. })
+            && err.to_string().contains("saved model payload schema mismatch"),
+        "unexpected error: {err:?}"
     );
 }
 
@@ -1486,6 +1487,10 @@ fn batched_state_round_trip_matches_refit() {
                 coefficient_basis: forward
                     .cache_coefficient_basis
                     .slice(s![b, .., ..])
+                    .to_owned(),
+                data_null_basis: forward
+                    .cache_data_null_basis
+                    .slice(s![b, .., 0..0])
                     .to_owned(),
                 xtwx_fingerprint: forward.cache_xtwx_fingerprints[b],
                 penalty_fingerprint: forward.cache_penalty_fingerprints[b],

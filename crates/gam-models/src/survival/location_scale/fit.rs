@@ -337,6 +337,43 @@ pub(crate) fn fit_survival_location_scale_terms_with_selected_wiggle(
     fit_survival_location_scale_terms(data, spec, kappa_options)
 }
 
+/// Whether this term fit removes the I-spline time warp and carries `−log t` on
+/// the location channel (#892).
+///
+/// This is the time-block identification [`prepare_survival_location_scale_model`]
+/// runs, on the two facts it reads: a constant scale (the log-σ design carries no
+/// penalty) and no time wiggle. The collapsed block reads none of the time
+/// block's offsets, so a baseline target's parameters do not enter the fit.
+pub(crate) fn survival_location_scale_terms_collapse_time_warp(
+    data: ndarray::ArrayView2<'_, f64>,
+    spec: &SurvivalLocationScaleTermSpec,
+) -> Result<bool, FitFailure> {
+    let protected_timewiggle_cols = spec.timewiggle_block.as_ref().map_or(0, |w| w.ncols);
+    if protected_timewiggle_cols != 0
+        || !build_term_collection_design(data, &spec.log_sigmaspec)?
+            .penalties
+            .is_empty()
+    {
+        return Ok(false);
+    }
+    let log_time = |times: &Array1<f64>| {
+        times.mapv(|t| {
+            t.max(crate::survival::construction::SURVIVAL_TIME_FLOOR)
+                .ln()
+        })
+    };
+    let time_block = prepare_identified_time_block(
+        &spec.time_block,
+        spec.derivative_guard,
+        protected_timewiggle_cols,
+        true,
+        log_time(&spec.age_entry).view(),
+        log_time(&spec.age_exit).view(),
+    )
+    .map_err(SurvivalLocationScaleError::from)?;
+    Ok(time_block.location_log_time_offset)
+}
+
 pub(crate) fn fit_survival_location_scale_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: SurvivalLocationScaleTermSpec,
@@ -773,7 +810,6 @@ pub(crate) fn fit_survival_location_scale_terms(
                 offset_entry: spec.time_block.offset_entry.clone(),
                 offset_exit: spec.time_block.offset_exit.clone(),
                 derivative_offset_exit: spec.time_block.derivative_offset_exit.clone(),
-                time_monotonicity: spec.time_block.time_monotonicity,
                 penalties: spec.time_block.penalties.clone(),
                 nullspace_dims: spec.time_block.nullspace_dims.clone(),
                 // `initial_log_lambdas` is the per-penalty seed for THIS block's
@@ -881,11 +917,9 @@ pub(crate) fn fit_survival_location_scale_terms(
         &[threshold_terms, log_sigma_terms],
         kappa_options,
         &joint_setup,
-        crate::seeding::SeedRiskProfile::Survival,
         analytic_joint_gradient_available,
         analytic_joint_hessian_available,
         true,
-        None,
         None,
         outer_policy,
         // The final fit: the solver's error is carried whole (#2937). Its link and

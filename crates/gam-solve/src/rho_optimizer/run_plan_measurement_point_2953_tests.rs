@@ -11,7 +11,7 @@
 use super::*;
 use ndarray::array;
 
-/// Off the integer seed lattice, so no generated seed starts at the centre.
+/// Off every start the fixtures search from.
 const CENTER: f64 = -3.5;
 const WIDTH: f64 = 0.5;
 const DEPTH: f64 = 10.0;
@@ -26,22 +26,16 @@ fn well_derivative(x: f64) -> f64 {
     -well_value(x) * (x - CENTER) / (WIDTH * WIDTH)
 }
 
-/// The well searched from `WELL_START` under a one-iteration budget, the neutral
-/// seed next in the cascade. That seed certifies on the flat top at ρ = 0, the
-/// search inside the well beats it, and the attempt declines it.
+/// The well searched from `WELL_START` under a one-iteration budget. The search
+/// stops inside the well without certifying, and a later search from the flat top
+/// at ρ = 0, which certifies there, carries that stop as its checkpoint, as the
+/// next plan attempt does, and declines the flat top.
 fn well_problem() -> OuterProblem {
     OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_bounds(array![-6.0], array![6.0])
         .with_initial_rho(array![WELL_START])
-        .with_screen_initial_rho(false)
-        .with_seed_config(gam_problem::SeedConfig {
-            max_seeds: 1,
-            seed_budget: 1,
-            risk_profile: gam_problem::SeedRiskProfile::Gaussian,
-            ..Default::default()
-        })
         .with_max_iter(1)
 }
 
@@ -72,7 +66,19 @@ fn dominated_well_incumbent(
 ) -> Result<OuterResult, String> {
     let cap = obj.capability();
     let the_plan = plan(&cap);
-    match run_outer_with_plan(obj, config, context, &cap, &the_plan, continue_from_incumbent) {
+    let stop = match run_outer_with_plan(obj, config, context, &cap, &the_plan, false) {
+        Ok(PlanRunOutcome::Exhausted(stop)) => stop,
+        Ok(_) => {
+            return Err(format!(
+                "{context}: a one-iteration search inside the well must stop without certifying"
+            ));
+        }
+        Err(error) => return Err(format!("{context}: the capped well search failed: {error}")),
+    };
+    let mut flat_top = config.clone();
+    flat_top.initial_rho = Some(array![0.0]);
+    flat_top.carried_checkpoint = Some(carried_checkpoint_of(&stop));
+    match run_outer_with_plan(obj, &flat_top, context, &cap, &the_plan, continue_from_incumbent) {
         Ok(PlanRunOutcome::DominatedPlateau(dominated)) => Ok(dominated.incumbent),
         Ok(_) => Err(format!(
             "{context}: a one-iteration search inside the well cannot certify, so the flat \
@@ -171,6 +177,13 @@ fn the_dominance_incumbent_does_not_certify_on_the_slope_between_two_points_2953
 fn certify_flat_point_with_recorded_measurement(
     recorded_rho: f64,
 ) -> Result<OuterCriterionCertificate, EstimationError> {
+    let (mut obj, config, mut result) = flat_point_with_recorded_measurement(recorded_rho);
+    certify_outer_optimality(&mut obj, &config, "reproducibility floor #2953", &mut result)
+}
+
+fn flat_point_with_recorded_measurement(
+    recorded_rho: f64,
+) -> (impl OuterObjective, OuterConfig, OuterResult) {
     const POINT: f64 = 0.5;
     const FLAT_VALUE: f64 = 1.0;
     const CERT_GRADIENT: f64 = 3.0;
@@ -179,7 +192,7 @@ fn certify_flat_point_with_recorded_measurement(
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable);
     let config = problem.config();
-    let mut obj = problem.build_objective(
+    let obj = problem.build_objective(
         (),
         |_: &mut (), _: &Array1<f64>| Ok(FLAT_VALUE),
         |_: &mut (), _: &Array1<f64>| {
@@ -208,7 +221,50 @@ fn certify_flat_point_with_recorded_measurement(
         FLAT_VALUE,
         array![RECORDED_GRADIENT],
     ));
-    certify_outer_optimality(&mut obj, &config, "reproducibility floor #2953", &mut result)
+    (obj, config, result)
+}
+
+/// The run plan screens a candidate and then mints the winner, both on one
+/// result at one ρ. Each pass re-measures from a reset, so the mint's evaluation
+/// replays the screening's bit for bit; the solver's own measurement, the one
+/// that differs, is the one screening displaced. Before the mint weighed it, the
+/// mint saw a spread of exactly zero and refused the point screening certified
+/// (inverse-Gaussian `y ~ s(x0)`, n = 100: |Pg| = 5.307e-10, screening bound
+/// 9.943e-10 from the floor, mint bound 1.500e-10).
+#[test]
+fn the_mint_keeps_the_solver_measurement_screening_displaced() {
+    let (mut obj, config, mut result) = flat_point_with_recorded_measurement(0.5);
+    let screened = certify_outer_optimality_with_fidelity(
+        &mut obj,
+        &config,
+        "screening before the mint",
+        &mut result,
+        CertificationFidelity::Screening,
+    )
+    .expect("screening holds the solver's measurement and the reset one at one rho");
+    assert_eq!(
+        screened.stationarity.rung().label,
+        StationarityBoundSource::GradientReproducibility.label(),
+        "{}",
+        screened.summary(),
+    );
+    let minted = certify_outer_optimality(&mut obj, &config, "mint after screening", &mut result)
+        .expect("the mint holds the same two measurements screening certified on");
+    assert!(minted.certifies(), "{}", minted.summary());
+    assert_eq!(
+        minted.stationarity.rung().label,
+        StationarityBoundSource::GradientReproducibility.label(),
+        "{}",
+        minted.summary(),
+    );
+    assert_eq!(
+        minted.stationarity.bound().to_bits(),
+        screened.stationarity.bound().to_bits(),
+        "the mint must judge by the bound screening derived at the same rho: screening {}, \
+         mint {}",
+        screened.summary(),
+        minted.summary(),
+    );
 }
 
 #[test]

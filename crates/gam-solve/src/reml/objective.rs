@@ -166,29 +166,13 @@ impl<'a> RemlState<'a> {
         p: &Array1<f64>,
         synthetic_ext_count: usize,
     ) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, synthetic_ext_count, true)
-    }
-
-    /// Evaluate the outer criterion WITHOUT charging the outer-loop
-    /// cost-evaluation counter.
-    ///
-    /// `outer_cost_evals` measures the work the smoothing-parameter SEARCH did,
-    /// and is gated as such (`tests/perf_1689_pspline_thinplate_profile.rs`
-    /// caps it). Post-convergence covariance work — the sigma-node calibration
-    /// in [`super::eval::RemlState::calibrate_sigma_node`], which reads the
-    /// criterion at a handful of fixed ρ to find where one posterior sigma
-    /// actually is — is not part of that search, and charging it there would
-    /// make a work guard read a covariance refinement as an outer-loop
-    /// regression (#2728).
-    pub(crate) fn compute_cost_uncharged(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        self.compute_cost_charging(p, 0, false)
+        self.compute_cost_charging(p, synthetic_ext_count)
     }
 
     fn compute_cost_charging(
         &self,
         p: &Array1<f64>,
         synthetic_ext_count: usize,
-        charge: bool,
     ) -> Result<f64, EstimationError> {
         let cost_call_idx = {
             let mut calls = self
@@ -196,9 +180,7 @@ impl<'a> RemlState<'a> {
                 .cost_eval_count
                 .write()
                 .expect("cost-eval counter lock is never held across a panic");
-            if charge {
-                *calls += 1;
-            }
+            *calls += 1;
             *calls
         };
         let t_eval_start = std::time::Instant::now();
@@ -254,7 +236,7 @@ impl<'a> RemlState<'a> {
             return Ok(f64::INFINITY);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_value_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -342,8 +324,8 @@ impl<'a> RemlState<'a> {
 
             // Hot diagnostics walk the Hessian eigenspectrum and emit
             // ill-conditioning warnings. They are only meaningful for fully
-            // converged inner modes — partial fits accepted from seed
-            // screening (cap=3) routinely yield indefinite Hessians, and
+            // converged inner modes — partial fits under an outer-imposed
+            // inner cap routinely yield indefinite Hessians, and
             // surfacing those as `Penalized Hessian not PD` warnings would
             // confuse log readers and mask real production-fit issues.
             let want_hot_diag = !pirls_result.status.is_failed_max_iterations()
@@ -402,52 +384,6 @@ impl<'a> RemlState<'a> {
             t_eval_start.elapsed().as_secs_f64() * 1000.0
         );
         Ok(cost)
-    }
-
-    /// Seed-screening ranking proxy.
-    ///
-    /// In screening mode (`screening_max_inner_iterations > 0`), runs the
-    /// inner P-IRLS solve under the active iteration cap and returns the
-    /// minimum penalized deviance (`-2·log L + βᵀSβ`, plus the structural
-    /// ridge contribution carried in `stable_penalty_term`) observed across
-    /// all inner iterations. Penalized deviance descends monotonically along
-    /// any inner descent path P-IRLS takes, so this minimum is a meaningful
-    /// quality signal even when the inner solver was capped before reaching
-    /// the mode — strictly better than ranking by the partial-fit V_LAML
-    /// criterion, whose `0.5·log|H|` term is dominated by noise at a
-    /// poorly-conditioned partial β̂.
-    ///
-    /// Outside of screening mode this delegates to `Self::compute_cost` so
-    /// the optimization objective itself is never changed by this method's
-    /// presence.
-    pub(crate) fn compute_screening_proxy(&self, p: &Array1<f64>) -> Result<f64, EstimationError> {
-        let in_screening = self.screening_max_inner_iterations.load(Ordering::Relaxed) > 0;
-        if !in_screening {
-            return self.compute_cost(p);
-        }
-        // Use the same bundle pipeline as `compute_cost`, but read the proxy
-        // directly from `pirls_result.min_penalized_deviance` instead of
-        // assembling the LAML criterion. Bundle assembly already runs
-        // P-IRLS under the screening cap; reusing it keeps the screening
-        // path's behavioural invariants (no warm-start update, no LRU write,
-        // no KKT enforcement at partial fits).
-        let bundle = match self.obtain_eval_bundle(p) {
-            Ok(bundle) => bundle,
-            Err(err) if err.is_inner_solve_retreat() => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Ok(f64::INFINITY);
-            }
-            Err(e) => {
-                self.cache_manager.invalidate_eval_bundle();
-                return Err(e);
-            }
-        };
-        let proxy = bundle.pirls_result.min_penalized_deviance;
-        if proxy.is_finite() {
-            Ok(proxy)
-        } else {
-            Ok(f64::INFINITY)
-        }
     }
 
     ///
@@ -2237,15 +2173,21 @@ impl<'a> RemlState<'a> {
         // the same value+gradient splicing contract as the TK correction so the
         // outer REML/LAML stays consistent. A no-op when every direction is
         // Laplace-trustworthy.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms = self.block_local_quadrature_correction(
+            rho,
+            bundle,
+            assembly_ext_len,
+            mode == super::reml_outer_engine::EvalMode::ValueGradientHessian,
+        )?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut result = self.apply_theta_correction_atom_to_result(result, &block_atom)?;
-        // A latched correction's `Δ_b` has no ρ-Hessian: the spliced criterion
-        // declares none rather than the Laplace Hessian without `∂²Δ_b`.
-        if self.block_correction_latched() {
+        // A latched correction whose `Δ_b` has no closed-form ρ-Hessian: the
+        // spliced criterion declares none rather than the Laplace Hessian
+        // without `∂²Δ_b`. Otherwise the atom carried `∂²(−Δ_b)` in.
+        if self.block_correction_hessian_refusal().is_some() {
             result.hessian = HessianValue::Unavailable;
         }
         let components = [
@@ -2363,14 +2305,15 @@ impl<'a> RemlState<'a> {
         // surface. The correction enters through the gradient channel exactly
         // like TK, which the universal EFS step already folds in. No-op when no
         // direction is non-Gaussian.
-        let block_terms = self.block_local_quadrature_correction(rho, bundle, assembly_ext_len)?;
+        let block_terms =
+            self.block_local_quadrature_correction(rho, bundle, assembly_ext_len, false)?;
         let block_atom = super::atoms::ThetaOnlyCorrectionAtom::from_tk_terms(
             "sampled_block_marginal",
             block_terms,
         );
         let mut cost_result =
             self.apply_theta_correction_atom_to_result(cost_result, &block_atom)?;
-        if self.block_correction_latched() {
+        if self.block_correction_hessian_refusal().is_some() {
             cost_result.hessian = HessianValue::Unavailable;
         }
         crate::estimate::outer_eval_capture::record_outer_criterion_components(
@@ -2723,7 +2666,7 @@ impl<'a> RemlState<'a> {
             return Ok(eval.gradient);
         }
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err @ EstimationError::ModelIsIllConditioned { .. }) => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2841,7 +2784,7 @@ impl<'a> RemlState<'a> {
         }
 
         let t_pirls = std::time::Instant::now();
-        let bundle = match self.obtain_eval_bundle(p) {
+        let bundle = match self.obtain_outer_eval_bundle(p) {
             Ok(bundle) => bundle,
             Err(err) if err.is_inner_solve_retreat() => {
                 self.cache_manager.invalidate_eval_bundle();
@@ -2858,7 +2801,7 @@ impl<'a> RemlState<'a> {
         };
 
         // Genuinely value-only fulfilment (#979). A `Value` request never needs
-        // the outer gradient. The inner solve above (`obtain_eval_bundle`) has
+        // the outer gradient. The inner solve above (`obtain_outer_eval_bundle`) has
         // already established its owned mode, so assemble only the scalar cost,
         // return a zero-length gradient, and surface the coefficient hint for a
         // typed reactive waypoint when one is active. Line-search, screening,

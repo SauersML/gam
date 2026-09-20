@@ -551,22 +551,6 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for BernoulliMargi
     }
 }
 
-impl crate::custom_family::JeffreysArming for BernoulliMarginalSlopeFamily {
-    fn with_jeffreys_armed(
-        &self,
-        evidence: Option<&gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
-    ) -> Self {
-        Self {
-            jeffreys_armed: evidence.is_some(),
-            // Each member runs its own auto-subsample schedule from zero, as a
-            // freshly built family does at the start of a fit.
-            auto_subsample_phase_counter: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            auto_subsample_last_rho: Arc::new(Mutex::new(None)),
-            ..self.clone()
-        }
-    }
-}
-
 impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMarginalSlopeFamily>
     for BernoulliMarginalSlopeFamily
 {
@@ -595,6 +579,17 @@ impl gam_model_api::families::custom_family::IndependentOuterSearch<BernoulliMar
             search: Some(Arc::new(BmsSearchMember::new(lane))),
             ..self.clone()
         }
+    }
+
+    /// A start value is an upper bound on its basin's minimum, never a lower
+    /// bound, so no start comparison can skip a basin. On gnomon#2359's 200-row
+    /// calibration the fit's own start publishes a certified basin 1.49 nats above
+    /// the one ρ = −2 reaches. Two positive-definite certified minima are not
+    /// joined by any negative-curvature direction, so the saddle escape cannot
+    /// reach the second from the first; each of these starts gets its own full,
+    /// certified search and the lowest certified value wins.
+    fn additional_outer_start_levels(&self) -> Vec<f64> {
+        vec![0.0, f64::INFINITY, 2.0, 4.0, -2.0]
     }
 }
 
@@ -761,28 +756,6 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
             );
         }
         order
-    }
-
-    fn outer_seed_config(&self, n_params: usize) -> gam_solve::seeding::SeedConfig {
-        let mut config = gam_solve::seeding::SeedConfig::default();
-        if n_params == 0 {
-            return config;
-        }
-        // Every one of the 6 generated seeds gets a full search (gnomon#2359),
-        // each on its own member in a parallel multistart
-        // (`IndependentOuterSearch`). A seed's start value is an upper bound on
-        // its basin's minimum, never a lower bound, so no start comparison can
-        // skip one: the single screened start this replaced (#979) published a
-        // certified basin 1.49 nats above the one the rho = -2 seed reaches on
-        // gnomon#2359's 200-row calibration.
-        config.max_seeds = 6;
-        config.seed_budget = config.max_seeds;
-        // Two cycles is below the observed KKT reachability floor for
-        // marginal-slope startup seeds: it rejects every candidate, then pays
-        // an immediate second screening pass at cap=8. Start at the first
-        // viable cap and let the existing cascade escalate only when needed.
-        config.screen_max_inner_iterations = 8;
-        config
     }
 
     fn exact_newton_joint_psi_workspace_for_first_order_terms(&self) -> bool {

@@ -304,7 +304,10 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// transfer, or validation failure; the dispatcher must not substitute the
     /// per-row CPU algorithm after that selection. The batched result MUST be
     /// bit-close (≤1e-9) to the per-row path because it runs the same unified
-    /// row program on device.
+    /// row program on device. An override whose `auto` decision races an
+    /// untimed shape (gam#3024) runs [`evaluate_every_row`] against its
+    /// accelerator pass through `gam_gpu::race_row_kernel` and returns the
+    /// per-row result as `Some(Ok(_))`.
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String>> {
@@ -351,9 +354,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row path; overrides return `None` only for row sets they explicitly
     /// decline.
     ///
-    /// `rows == RowSet::All` is the only case an override should claim; under a
-    /// subsample / non-unit-weight `RowSet` the override must return `None` so
-    /// the generic Horvitz-Thompson per-row path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn directional_derivative_dense_override(
         &self,
         rows: &RowSet,
@@ -386,14 +391,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// per-row third tensor is INDEPENDENT of the swept axis, so it is built once
     /// and each axis closed with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs. The
     /// default declines this batched optimization, so the dispatcher runs the
-    /// exact generic per-axis path bit-for-bit. Overrides should claim only the
-    /// full-data unit-weight
-    /// `RowSet::All` case; under a subsample / non-unit-weight `RowSet` return
-    /// `None` so the generic Horvitz-Thompson per-row path runs per axis.
+    /// exact generic per-axis path bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_directional_derivative(self, rows, e_a)` reduced in
-    /// deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_directional_derivative(self, rows, e_a)` up to reassociation
+    /// of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn directional_derivative_all_axes_dense_override(
         &self,
@@ -433,9 +440,11 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// BLAS-3 products. The default returns the exact generic per-row path;
     /// overrides return `None` only for row sets they explicitly decline and
     /// surface failures from an algorithm they did select through `Err`.
-    /// Overrides should claim only the full-data unit-weight `RowSet::All` case;
-    /// under a subsample / non-unit-weight `RowSet` return `None` so the generic
-    /// HT path runs.
+    /// An override handles every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     fn hessian_dense_override(
         &self,
         rows: &RowSet,
@@ -472,14 +481,16 @@ pub trait RowKernel<const K: usize>: gam_math::jet_tower::RowProgram<K> + Send +
     /// swept axis, so it can be hoisted out of the `p`-loop and each axis closed
     /// with chunked `Xᵀ diag(w) X`-style BLAS-3 GEMMs reading the shared cached
     /// fourth tensor. The default returns `None`, preserving the exact generic
-    /// per-axis path for every other kernel bit-for-bit. Overrides should claim
-    /// only the full-data unit-weight `RowSet::All` case; under a subsample /
-    /// non-unit-weight `RowSet` return `None` so the generic Horvitz-Thompson
-    /// per-row path runs per axis.
+    /// per-axis path for every other kernel bit-for-bit. An override handles
+    /// every `RowSet`, subsamples with their Horvitz–Thompson weights included: walk
+    /// `rows`' positions, fold each position's weight into its row's
+    /// contribution, and keep every row-indexed cache addressed by the full-data
+    /// row. Declining a subsample would silently move the subsampled outer
+    /// objective onto the slow per-row path.
     ///
-    /// **Correctness contract.** Output `a` must equal, bit-for-bit, the generic
-    /// per-axis `row_kernel_second_directional_derivative(self, rows, d_beta_u,
-    /// e_a)` reduced in deterministic in-row order (same contract as
+    /// **Correctness contract.** Output `a` must equal the generic per-axis
+    /// `row_kernel_second_directional_derivative(self, rows, d_beta_u, e_a)` up
+    /// to reassociation of the row sums, for every `RowSet` (same contract as
     /// [`Self::hessian_dense_override`]).
     fn second_directional_derivative_all_axes_dense_override(
         &self,
@@ -677,28 +688,6 @@ pub(crate) fn row_kernel_design_jf_column_dot(
     out
 }
 
-/// Validate that shared row-kernel caches have one entry per observation.
-pub(crate) fn validate_row_kernel_cache_lengths(
-    context: &str,
-    expected_len: usize,
-    caches: &[(&str, usize)],
-) -> Result<(), String> {
-    let mismatches = caches
-        .iter()
-        .filter_map(|(name, actual)| {
-            (*actual != expected_len).then_some(format!("{name}={actual}"))
-        })
-        .collect::<Vec<_>>();
-    if mismatches.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{context} row-kernel cache length mismatch: {} expected={expected_len}",
-            mismatches.join(" ")
-        ))
-    }
-}
-
 // ── Cache ────────────────────────────────────────────────────────────
 
 /// Cached row-level kernel outputs (NLL + gradient + Hessian in primary space).
@@ -710,6 +699,80 @@ pub struct RowKernelCache<const K: usize> {
     pub nll: Vec<f64>,
     pub gradients: Vec<[f64; K]>,
     pub hessians: Vec<[[f64; K]; K]>,
+}
+
+/// Write every row's `(nll, gradient, Hessian)` into its `n`-length slots
+/// through the per-row `row_kernel(row)` loop. This is the CPU executor of the
+/// full-data cache build, and the one a batched accelerator pass races against
+/// (gam#3024).
+pub(crate) fn evaluate_every_row_into<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+    nll: &mut [f64],
+    gradients: &mut [[f64; K]],
+    hessians: &mut [[[f64; K]; K]],
+) -> Result<(), String> {
+    let n = kern.n_rows();
+    let progress_ticker =
+        (n >= ROW_KERNEL_CACHE_PROGRESS_MIN_ROWS).then(LoopProgress::default_interval);
+    // Pool-aware block size (issue #1045): a few-per-worker partition of
+    // the row range instead of one task per 256-row arrow tile, so the
+    // light per-row jet build does not pay `n/256` task entries of
+    // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
+    // is bit-identical — every slot is written by its absolute row index.
+    let block_rows = cache_build_chunk_rows(n);
+    let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
+        (0..cache_build_block_count(n, block_rows))
+            .into_par_iter()
+            .map(|block_idx| {
+                let start = block_idx * block_rows;
+                let end = (start + block_rows).min(n);
+                let mut chunk = Vec::with_capacity(end - start);
+                let mut block_progress = progress_ticker.as_ref().map(|ticker| {
+                    ticker.chunk(|progress, elapsed| {
+                        log::debug!(
+                            "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
+                            progress.min(n),
+                            n,
+                            100.0 * progress.min(n) as f64 / n.max(1) as f64,
+                            elapsed,
+                            rayon::current_num_threads(),
+                        );
+                    })
+                });
+                for row in start..end {
+                    let out = kern.row_kernel(row)?;
+                    if let Some(block_progress) = block_progress.as_mut() {
+                        block_progress.advance(1);
+                    }
+                    chunk.push(out);
+                }
+                Ok(chunk)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+    for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
+        let start = block_idx * block_rows;
+        for (local, (l, g, h)) in chunk.into_iter().enumerate() {
+            let i = start + local;
+            nll[i] = l;
+            gradients[i] = g;
+            hessians[i] = h;
+        }
+    }
+    Ok(())
+}
+
+/// Every row's `(nll, gradient, Hessian)` through the per-row loop
+/// ([`evaluate_every_row_into`]), as the three `n`-length channels a batched
+/// pass returns.
+pub(crate) fn evaluate_every_row<const K: usize>(
+    kern: &(impl RowKernel<K> + ?Sized),
+) -> Result<(Vec<f64>, Vec<[f64; K]>, Vec<[[f64; K]; K]>), String> {
+    let n = kern.n_rows();
+    let mut nll = vec![0.0_f64; n];
+    let mut gradients = vec![[0.0_f64; K]; n];
+    let mut hessians = vec![[[0.0_f64; K]; K]; n];
+    evaluate_every_row_into(kern, &mut nll, &mut gradients, &mut hessians)?;
+    Ok((nll, gradients, hessians))
 }
 
 /// Build the cache by evaluating all row kernels in parallel over the
@@ -770,50 +833,7 @@ pub fn build_row_kernel_cache<const K: usize>(
                     hessians: bh,
                 });
             }
-            // Pool-aware block size (issue #1045): a few-per-worker partition of
-            // the row range instead of one task per 256-row arrow tile, so the
-            // light per-row jet build does not pay `n/256` task entries of
-            // crossbeam-epoch / rayon-scheduling overhead on a wide pool. Output
-            // is bit-identical — every slot is written by its absolute row index.
-            let block_rows = cache_build_chunk_rows(n);
-            let evaluated_chunks: Vec<Vec<(f64, [f64; K], [[f64; K]; K])>> =
-                (0..cache_build_block_count(n, block_rows))
-                    .into_par_iter()
-                    .map(|block_idx| {
-                        let start = block_idx * block_rows;
-                        let end = (start + block_rows).min(n);
-                        let mut chunk = Vec::with_capacity(end - start);
-                        let mut block_progress = progress_ticker.as_ref().map(|ticker| {
-                            ticker.chunk(|progress, elapsed| {
-                                log::debug!(
-                                    "[STAGE] row-kernel cache (all) progress={}/{} ({:.1}%) elapsed={:.1}s threads={}",
-                                    progress.min(n),
-                                    n,
-                                    100.0 * progress.min(n) as f64 / n.max(1) as f64,
-                                    elapsed,
-                                    rayon::current_num_threads(),
-                                );
-                            })
-                        });
-                        for row in start..end {
-                            let out = kern.row_kernel(row)?;
-                            if let Some(block_progress) = block_progress.as_mut() {
-                                block_progress.advance(1);
-                            }
-                            chunk.push(out);
-                        }
-                        Ok(chunk)
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-            for (block_idx, chunk) in evaluated_chunks.into_iter().enumerate() {
-                let start = block_idx * block_rows;
-                for (local, (l, g, h)) in chunk.into_iter().enumerate() {
-                    let i = start + local;
-                    nll[i] = l;
-                    gradients[i] = g;
-                    hessians[i] = h;
-                }
-            }
+            evaluate_every_row_into(kern, &mut nll, &mut gradients, &mut hessians)?;
         }
         RowSet::Subsample { rows: list, .. } => {
             // Evaluate only the sampled rows in parallel; scatter into
@@ -1271,6 +1291,41 @@ pub fn row_kernel_second_directional_derivative_all_axes<const K: usize>(
         .collect::<Result<Vec<_>, _>>()
 }
 
+/// `J·F` for walk positions `[start, end)` of `rows`, one output row per
+/// position. Under `RowSet::All` a position is its row, so this is exactly
+/// [`RowKernel::jacobian_action_matrix_rows`]; under a subsample each run of
+/// consecutive stored rows is one row-range block, so a kernel's structured
+/// GEMM path still serves the gathered rows.
+fn row_set_jacobian_tile<const P: usize, R: RowKernel<P> + ?Sized>(
+    kern: &R,
+    rows: &RowSet,
+    factor: ArrayView2<'_, f64>,
+    start: usize,
+    end: usize,
+) -> Array2<f64> {
+    let RowSet::Subsample { rows: stored, .. } = rows else {
+        return kern.jacobian_action_matrix_rows(factor, start, end);
+    };
+    let positions = &stored[start..end];
+    let mut tile = Array2::<f64>::zeros((positions.len(), P * factor.ncols()));
+    let mut run_start = 0;
+    while run_start < positions.len() {
+        let mut run_end = run_start + 1;
+        while run_end < positions.len() && positions[run_end].index == positions[run_end - 1].index + 1 {
+            run_end += 1;
+        }
+        let first = positions[run_start].index;
+        let block = kern.jacobian_action_matrix_rows(factor, first, first + run_end - run_start);
+        if block.dim() != (run_end - run_start, tile.ncols()) {
+            // Surface the kernel's wrong shape through the caller's tile check.
+            return block;
+        }
+        tile.slice_mut(s![run_start..run_end, ..]).assign(&block);
+        run_start = run_end;
+    }
+    tile
+}
+
 /// Why [`all_axes_symmetric_tensor_pullback`] refused its inputs.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub(crate) enum AllAxesPullbackError {
@@ -1289,8 +1344,10 @@ pub(crate) enum AllAxesPullbackError {
 /// axis: `Hdot[e_a] = Σ_i J_iᵀ T_i[J_i e_a] J_i` for every canonical axis `e_a`,
 /// with `J_i` the row's Jacobian from [`RowKernel::jacobian_action_matrix_rows`].
 /// Higher information derivatives first contract their fixed directions into
-/// `tensors`, so every order shares this one assembly. The result is
-/// bit-identical at every thread count.
+/// `tensors`, so every order shares this one assembly. `tensors` holds one
+/// tensor per walk position of `rows`, each pulled back at that position's row
+/// and scaled by its Horvitz–Thompson weight, so every `RowSet` is handled. The
+/// result is bit-identical at every thread count.
 ///
 /// Two contracts, which the assembly does not check:
 /// - Each `tensors[i]` must be FULLY symmetric in `(α, β, γ)`. Only one
@@ -1302,6 +1359,7 @@ pub(crate) enum AllAxesPullbackError {
 ///   caller adds the terms carrying the primaries' own second derivatives.
 pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P> + ?Sized>(
     kern: &R,
+    rows: &RowSet,
     tensors: &[[[[f64; P]; P]; P]],
 ) -> Result<Vec<Array2<f64>>, AllAxesPullbackError> {
     use faer::Accum;
@@ -1317,7 +1375,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
     const ALL_AXES_PULLBACK_ACCUMULATOR_BYTES: usize = 256 << 20;
 
     let p = kern.n_coefficients();
-    let n = gam_math::jet_tower::RowProgram::n_rows(kern);
+    let n = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(kern));
     if tensors.len() != n {
         return Err(AllAxesPullbackError::TensorRowCount {
             tensors: tensors.len(),
@@ -1360,7 +1418,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
             for tile_index in group * n_tiles / n_groups..(group + 1) * n_tiles / n_groups {
                 let start = tile_index * tile;
                 let end = (start + tile).min(n);
-                let jacobian = kern.jacobian_action_matrix_rows(identity.view(), start, end);
+                let jacobian = row_set_jacobian_tile(kern, rows, identity.view(), start, end);
                 if jacobian.dim() != (end - start, P * p) {
                     return Err(AllAxesPullbackError::TileShape {
                         got: jacobian.dim(),
@@ -1384,6 +1442,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                 for local in 0..end - start {
                     let row = &jacobian_flat[local * P * p..][..P * p];
                     let tensor = &tensors[start + local];
+                    let weight = rows.row_at(start + local).1;
                     let primary_rows: [&[f64]; P] =
                         std::array::from_fn(|primary| &row[primary * p..][..p]);
                     for beta in 0..P {
@@ -1394,7 +1453,7 @@ pub(crate) fn all_axes_symmetric_tensor_pullback<const P: usize, R: RowKernel<P>
                                 for alpha in 0..P {
                                     sum += tensor[alpha][beta][gamma] * primary_rows[alpha][a];
                                 }
-                                *value = sum;
+                                *value = weight * sum;
                             }
                         }
                     }
@@ -2603,20 +2662,6 @@ mod gram_inner_contraction_tests {
                 vec![1.0, 2.0, 0.0, 0.0, 5.0, 6.0, 3.0, 4.0, 0.0, 0.0, 7.0, 8.0,],
             )
             .unwrap()
-        );
-    }
-
-    #[test]
-    fn validate_row_kernel_cache_lengths_reports_all_mismatches() {
-        validate_row_kernel_cache_lengths("ctx", 3, &[("third", 3), ("fourth", 3)])
-            .expect("matching lengths pass");
-
-        let err = validate_row_kernel_cache_lengths("ctx", 3, &[("third", 2), ("fourth", 4)])
-            .expect_err("mismatches fail");
-
-        assert_eq!(
-            err,
-            "ctx row-kernel cache length mismatch: third=2 fourth=4 expected=3"
         );
     }
 

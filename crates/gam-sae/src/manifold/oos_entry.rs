@@ -128,8 +128,6 @@ pub struct SaeOosRequest {
     pub alpha: f64,
     pub tau: f64,
     pub regularization: SaeOosRegularization,
-    pub max_iter: usize,
-    pub learning_rate: f64,
     pub ridge_ext_coord: f64,
     pub initial_logits: Option<Array2<f64>>,
     pub initial_coords: Option<Array3<f64>>,
@@ -212,12 +210,15 @@ fn build_oos_atom(
     .with_geometry_plan(geometry.clone())?)
 }
 
+/// The trained terminal ρ of `term`, validated by the criterion's own rules: every
+/// coordinate atom carries a full `log_ard` block
+/// ([`SaeManifoldTerm::validated_ard_precisions`], #2822), and every strength lies in
+/// its closed domain.
 fn build_rho(
     regularization: SaeOosRegularization,
-    latent_dims: &[usize],
-    assignment: &SaeAssignment,
+    term: &SaeManifoldTerm,
 ) -> Result<SaeManifoldRho, String> {
-    let k_atoms = latent_dims.len();
+    let k_atoms = term.k_atoms();
     let SaeOosRegularization {
         log_lambda_sparse,
         log_lambda_smooth,
@@ -236,19 +237,11 @@ fn build_rho(
             log_ard.len()
         ));
     }
-    let mut ard = Vec::with_capacity(k_atoms);
-    for (atom_index, (values, &dim)) in log_ard.iter().zip(latent_dims).enumerate() {
-        if !(values.is_empty() || values.len() == dim)
-            || !values.iter().all(|value| value.is_finite())
-        {
-            return Err(format!(
-                "run_sae_manifold_oos: trained log_ard[{atom_index}] must be empty or contain {dim} finite values"
-            ));
-        }
-        ard.push(Array1::from(values.clone()));
-    }
+    let ard = log_ard.into_iter().map(Array1::from).collect();
     let rho = SaeManifoldRho::with_per_atom_smooth(log_lambda_sparse, log_lambda_smooth, ard)
-        .for_assignment(assignment);
+        .for_assignment(&term.assignment);
+    term.validated_ard_precisions(&rho)
+        .map_err(|error| format!("run_sae_manifold_oos: trained {error}"))?;
     rho.validate_log_strength_domain()
         .map_err(|error| format!("run_sae_manifold_oos: {error}"))?;
     Ok(rho)
@@ -264,8 +257,6 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         alpha,
         tau,
         regularization,
-        max_iter,
-        learning_rate,
         ridge_ext_coord,
         initial_logits,
         initial_coords,
@@ -284,11 +275,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     }
     finite_positive("alpha", alpha)?;
     finite_positive("tau", tau)?;
-    finite_positive("learning_rate", learning_rate)?;
     finite_positive("ridge_ext_coord", ridge_ext_coord)?;
-    if max_iter == 0 {
-        return Err("run_sae_manifold_oos: max_iter must be positive".to_string());
-    }
     if let SaeOosAssignmentKind::ThresholdGate { threshold } = assignment {
         if !threshold.is_finite() {
             return Err(format!(
@@ -412,7 +399,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     if !hybrid_linear_images.is_empty() {
         term.set_hybrid_linear_images(hybrid_linear_images.clone())?;
     }
-    let mut rho = build_rho(regularization, &latent_dims, &term.assignment)?;
+    let mut rho = build_rho(regularization, &term)?;
     if cold_coords {
         term.seed_coords_by_decoder_projection(target.view())?;
     }
@@ -427,14 +414,8 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
         term.seed_oos_ordered_beta_bernoulli_logits_from_projected_decoder_lsq(target.view(), tau);
     }
 
-    let loss = term.run_fixed_decoder_arrow_schur(
-        target.view(),
-        &mut rho,
-        None,
-        max_iter,
-        learning_rate,
-        ridge_ext_coord,
-    )?;
+    let loss =
+        term.run_fixed_decoder_arrow_schur(target.view(), &mut rho, None, ridge_ext_coord)?;
     let assignments = term.assignment.assignments();
     let (fitted, atom_reconstructions, effective_coords) =
         term.reconstruct_with_atom_images_target_aware(target.view(), assignments.view())?;
@@ -1003,7 +984,6 @@ pub fn run_sae_manifold_certify_external(
         }
     };
 
-    let latent_dims: Vec<usize> = atom_specs.iter().map(SaeOosAtomSpec::latent_dim).collect();
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     let mut atoms = Vec::with_capacity(k_atoms);
     for (atom_index, spec) in atom_specs.iter().enumerate() {
@@ -1037,7 +1017,7 @@ pub fn run_sae_manifold_certify_external(
     }
     base_term.install_tier0_frame(tier0_frame)?;
 
-    let initial_rho = build_rho(regularization, &latent_dims, &base_term.assignment)?;
+    let initial_rho = build_rho(regularization, &base_term)?;
 
     run_sae_manifold_certify(SaeCertifyRequest {
         base_term,
@@ -1084,10 +1064,8 @@ mod tests {
             regularization: SaeOosRegularization {
                 log_lambda_sparse: 0.01_f64.ln(),
                 log_lambda_smooth: vec![0.01_f64.ln()],
-                log_ard: vec![Vec::new()],
+                log_ard: vec![vec![0.01_f64.ln()]],
             },
-            max_iter: 1,
-            learning_rate: 1.0,
             ridge_ext_coord: 1.0e-6,
             initial_logits: Some(Array2::zeros((4, 1))),
             initial_coords: Some(coords),
@@ -1214,6 +1192,7 @@ mod tests {
     fn typed_oos_entry_reconstructs_frozen_periodic_dictionary() {
         let request = periodic_request();
         let expected = request.target.clone();
+        let ard_strength = request.regularization.log_ard[0][0].exp();
         let report = run_sae_manifold_oos(request).unwrap();
         assert_eq!(report.assignments.dim(), (4, 1));
         assert!(
@@ -1229,7 +1208,24 @@ mod tests {
             .iter()
             .map(|value| value.abs())
             .fold(0.0_f64, f64::max);
-        assert!(max_error <= 1.0e-12, "max reconstruction error={max_error}");
+        // The target lies exactly on the frozen dictionary, so the only pull
+        // off it is the ARD coordinate prior (#2822): the miss is at most of
+        // the prior's order and vanishes linearly as the prior weakens.
+        assert!(
+            max_error <= ard_strength,
+            "max reconstruction error={max_error} exceeds the ARD strength {ard_strength}"
+        );
+        let mut weak = periodic_request();
+        weak.regularization.log_ard = vec![vec![(ard_strength * 1.0e-2).ln()]];
+        let weak_report = run_sae_manifold_oos(weak).unwrap();
+        let weak_error = (&weak_report.fitted - &expected)
+            .iter()
+            .map(|value| value.abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            weak_error <= 1.0e-1 * max_error,
+            "a 100x weaker ARD prior must shrink the miss: {weak_error} vs {max_error}"
+        );
         let atom_error = (&report.atoms[0].reconstruction - &report.fitted)
             .iter()
             .map(|value| value.abs())
@@ -1238,6 +1234,80 @@ mod tests {
             atom_error <= 1.0e-12,
             "unit-mass atom image must equal the fitted reconstruction; max error={atom_error}"
         );
+    }
+
+    /// #3277: the encode returns only a certified stationary state, so that
+    /// state is a fixed point of the encode. Re-encoding warm from the returned
+    /// coordinates and logits must certify at once and leave them unchanged.
+    /// The encode used to stop at its iteration budget, and the fixture's
+    /// one-step budget returned a state with Newton decrement 1.28e-7 at
+    /// objective −3.67, which a second pass moved.
+    #[test]
+    fn fixed_decoder_encode_returns_only_certified_stationary_state_3277() {
+        let first = run_sae_manifold_oos(periodic_request()).unwrap();
+        let (n_obs, k_atoms) = first.logits.dim();
+        let width = first
+            .atoms
+            .iter()
+            .map(|atom| atom.coords.ncols())
+            .max()
+            .unwrap();
+        let mut coords = Array3::<f64>::zeros((k_atoms, n_obs, width));
+        for (atom_index, atom) in first.atoms.iter().enumerate() {
+            coords
+                .slice_mut(s![atom_index, .., 0..atom.coords.ncols()])
+                .assign(&atom.coords);
+        }
+        let mut again = periodic_request();
+        again.initial_logits = Some(first.logits.clone());
+        again.initial_coords = Some(coords.clone());
+        let second = run_sae_manifold_oos(again).unwrap();
+        for (atom_index, atom) in second.atoms.iter().enumerate() {
+            assert_eq!(
+                atom.coords,
+                coords.slice(s![atom_index, .., 0..atom.coords.ncols()]),
+                "a certified encode must not move the coordinates of atom {atom_index}"
+            );
+        }
+        assert_eq!(second.logits, first.logits);
+        assert_eq!(second.loss.total(), first.loss.total());
+    }
+
+    /// #3277: an annealing schedule changes the objective between iterates,
+    /// so the frozen-decoder encode refuses it rather than returning a state
+    /// that is stationary for no single objective.
+    #[test]
+    fn fixed_decoder_encode_refuses_temperature_schedule_3277() {
+        let request = periodic_request();
+        let coords = request
+            .initial_coords
+            .as_ref()
+            .unwrap()
+            .slice(s![0, .., 0..1])
+            .to_owned();
+        let atom = build_oos_atom(0, &request.atoms[0], coords.view(), 2).unwrap();
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            request.initial_logits.clone().unwrap(),
+            vec![coords],
+            vec![SaeAtomBasisKind::Periodic.latent_manifold(1)],
+            AssignmentMode::softmax(request.tau),
+        )
+        .unwrap();
+        let mut term = SaeManifoldTerm::new(vec![atom], assignment).unwrap();
+        term.set_temperature_schedule(
+            crate::manifold::schedule::GumbelTemperatureSchedule::new(
+                1.0,
+                0.5,
+                crate::manifold::schedule::ScheduleKind::ReciprocalIter,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut rho = build_rho(request.regularization, &term).unwrap();
+        let error = term
+            .run_fixed_decoder_arrow_schur(request.target.view(), &mut rho, None, 1.0e-6)
+            .unwrap_err();
+        assert!(error.contains("temperature schedule"), "{error}");
     }
 
     #[test]
@@ -1276,6 +1346,18 @@ mod tests {
         let error = run_sae_manifold_oos(request).err().unwrap();
         assert!(
             error.contains("trained log_ard must contain 1 atom blocks"),
+            "{error}"
+        );
+
+        // #2822 — an empty per-atom ARD block is refused at the entry, by the
+        // criterion's own rule (`validated_ard_precisions`), not accepted and then
+        // rejected by the rho domain check.
+        let mut request = periodic_request();
+        request.regularization.log_ard = vec![Vec::new()];
+        let error = run_sae_manifold_oos(request).err().unwrap();
+        assert!(
+            error.starts_with("run_sae_manifold_oos: trained ARD rho atom 0 has 0 axes")
+                && error.contains("full log_ard block"),
             "{error}"
         );
     }

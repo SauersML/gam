@@ -5,10 +5,17 @@ and then draws from the posterior of the coefficients. The sampler
 dispatches among NUTS, Polya-Gamma Gibbs, and a Gaussian Laplace
 approximation based on model class; see
 [Sampler dispatch](#sampler-dispatch) below. The MCMC routes sample the
-exact likelihood conditional on the fitted smoothing parameters; the
-Laplace route draws from the covariance the fit *publishes* — the
-smoothing-corrected `Vp` whenever the fit carries one — so its draw spread
-agrees with `summary().std_error` and with the default
+exact likelihood at the fitted smoothing parameters; on a standard GLM
+(NUTS and Pólya-Gamma) the draws are then mapped about their mean through
+the linear optimal-transport map `T = Vb^{-1/2}(Vb^{1/2} V_c Vb^{1/2})^{1/2}
+Vb^{-1/2}` that carries the conditional `Vb` onto the published
+smoothing-corrected `V_c` (`T Vb T = V_c`), so the draws integrate the
+smoothing uncertainty for every family while keeping the exact likelihood's
+shape. `V_c` may be wider or narrower than `Vb` in a given direction (the
+sigma-point cubature correction averages the curvature over `ρ`); the map
+reaches it either way. The Laplace route draws from the covariance the
+fit *publishes* — the smoothing-corrected `Vp` whenever the fit carries one —
+so its draw spread agrees with `summary().std_error` and with the default
 `predict(interval=...)` band on the same object. Every draw set reports
 which covariance it describes in `covariance_source`.
 
@@ -188,7 +195,6 @@ Fields:
 | `n_samples` | `int` |
 | `n_warmup` | `int` |
 | `n_chains` | `int` |
-| `target_accept` | `float` |
 | `seed` | `int` |
 
 `n_warmup` is the warmup the run spent per chain (`0` for independent
@@ -212,7 +218,7 @@ Frozen dataclass holding the draws and convergence diagnostics.
 | `method` | `str` | `"nuts"`, `"polya-gamma"`, `"polya-gamma-jeffreys"`, `"laplace"`, or `"truncated-laplace"` — the sampler that ran (table above). |
 | `acceptance_rate` | `float \| None` | Fraction of Metropolis proposals accepted over the kept draws, for a sampler with an accept/reject step (`"polya-gamma-jeffreys"`); `None` otherwise. |
 | `exact` | `bool` | Whether `method` targets the exact posterior; the value behind `is_exact`. |
-| `covariance_source` | `str` | `"conditional"` (MCMC routes, and Laplace draws on a fit without a smoothing correction) or `"smoothing-corrected"` (Laplace draws from the published `Vp`). Same vocabulary as `predict()`. |
+| `covariance_source` | `str` | `"smoothing-corrected"` (standard-GLM NUTS / Pólya-Gamma draws transported onto `V_c`, and Laplace draws from the published `Vp`) or `"conditional"` (the other MCMC routes, and any fit without a smoothing correction). Same vocabulary as `predict()`. |
 | `model_class` | `str` | Saved-model predictive class. |
 | `family_kind` | `str` | Inverse-link tag (`"identity"`, `"logit"`, `"probit"`, `"cloglog"`, `"log"`, ...). |
 | `config` | `SamplingConfig` | Echo of the sampler configuration. |
@@ -329,7 +335,7 @@ pp.summary(level=0.95)   # same dict as posterior.predict
 large prediction sets prefer `posterior.predict(...)`.
 
 The response-scale inverse link supports `identity`, `logit`, `probit`,
-`cloglog`, and `log`; other tags raise a `gamfit.errors.GamError`.
+`cloglog`, and `log`; other tags raise a `gamfit.errors.GamfitError`.
 
 ### Trace plots
 
@@ -385,7 +391,6 @@ from the coefficient count `p`:
 | Parameter | Rule |
 | --- | --- |
 | `n_samples` | `clamp(floor(100 * p * (1 + 2 * max(1, sqrt(p))) * 1.5), 500, 10_000)`. |
-| `target_accept` | `0.9`, not user-settable; `robust_target_accept` floors it by dimension and caps it. |
 | `seed` | `42` unless `seed=` is passed. |
 
 Every keyword on `Model.sample`, and the matching `gam sample` flag, overrides the corresponding default.

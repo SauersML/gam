@@ -203,37 +203,6 @@ pub(crate) fn lower_bound_constraints(
     LinearInequalityConstraints::from_per_coordinate_lower_bounds(lower_bounds)
 }
 
-pub(crate) fn append_linear_constraints(
-    first: Option<LinearInequalityConstraints>,
-    second: Option<LinearInequalityConstraints>,
-) -> Result<Option<LinearInequalityConstraints>, String> {
-    match (first, second) {
-        (None, None) => Ok(None),
-        (Some(constraints), None) | (None, Some(constraints)) => Ok(Some(constraints)),
-        (Some(lhs), Some(rhs)) => {
-            if lhs.a.ncols() != rhs.a.ncols() {
-                return Err(SurvivalLocationScaleError::DimensionMismatch {
-                    reason: format!(
-                        "time linear constraint width mismatch: left={}, right={}",
-                        lhs.a.ncols(),
-                        rhs.a.ncols()
-                    ),
-                }
-                .into());
-            }
-            let rows = lhs.a.nrows() + rhs.a.nrows();
-            let cols = lhs.a.ncols();
-            let mut a = Array2::<f64>::zeros((rows, cols));
-            let mut b = Array1::<f64>::zeros(rows);
-            a.slice_mut(s![..lhs.a.nrows(), ..]).assign(&lhs.a);
-            a.slice_mut(s![lhs.a.nrows().., ..]).assign(&rhs.a);
-            b.slice_mut(s![..lhs.b.len()]).assign(&lhs.b);
-            b.slice_mut(s![lhs.b.len()..]).assign(&rhs.b);
-            LinearInequalityConstraints::new(a, b).map(Some)
-        }
-    }
-}
-
 pub(crate) fn structural_time_coefficient_lower_bounds(
     design_value_entry: &DesignMatrix,
     design_value_exit: &DesignMatrix,
@@ -515,7 +484,7 @@ pub(crate) fn structural_time_coefficient_lower_bounds_with_monotone_time_wiggle
 /// dim` and the `&beta + &corrections.row(i)` add panicked with
 /// `IncompatibleShape`). A length mismatch is a caller contract violation,
 /// so it is surfaced as a structured `Result::Err` that the marginal-slope /
-/// location-scale pipelines turn into a clean `GamError` instead of a panic
+/// location-scale pipelines turn into a clean `GamfitError` instead of a panic
 /// crossing the Rust/Python boundary.
 pub fn project_onto_linear_constraints(
     dim: usize,
@@ -1245,12 +1214,6 @@ pub(crate) fn prepare_identified_time_block(
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
-    if !input.time_monotonicity.is_coordinate_cone() {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
-            "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
-            input.time_monotonicity
-        ) }.into());
-    }
     // Materialize to dense at the location-scale boundary — the hot path
     // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense_with_parallelism).
     let design_entry = input.design_entry.to_dense();
@@ -1519,14 +1482,18 @@ pub(crate) fn prepare_identified_time_block(
         "structural time block requires derivative offsets to encode the derivative guard and a non-negative derivative basis"
             .to_string()
     })?;
-    let coefficient_constraints = lower_bound_constraints(&coefficient_lower_bounds);
-    let derivative_constraints = time_derivative_guard_constraints(
-        &input.design_derivative_exit,
-        &input.derivative_offset_exit,
-        derivative_guard,
-    )?;
-    let linear_constraints =
-        append_linear_constraints(coefficient_constraints.clone(), derivative_constraints)?;
+    // The coordinate cone is this block's whole constraint set, declared once.
+    // Every training row's derivative guard `D_i β + o_i ≥ guard` already holds
+    // on it. The I-spline derivative design is non-negative entrywise (the
+    // builder zeroes round-off negatives and refuses the rest). Every column
+    // that carries it is bounded `β_k ≥ 0` above, and the offsets encode the
+    // guard, so on the cone `D_i β + o_i ≥ o_i ≥ guard`. Declaring those `n`
+    // rows as well wrote the same set with `p + n` rows (gam#3037). Where one
+    // bound (`o_i = guard` under the default linear baseline), the cone rows on
+    // `supp(D_i)` bound with it, so the active normals were dependent and LICQ
+    // failed at that vertex, and the constrained Laplace normalizer priced all
+    // `p + n` rows.
+    let linear_constraints = lower_bound_constraints(&coefficient_lower_bounds);
     let initial_beta = match (linear_constraints.as_ref(), input.initial_beta.as_ref()) {
         (Some(constraints), Some(beta0)) => {
             let mut clipped = beta0.clone();

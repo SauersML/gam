@@ -14,6 +14,7 @@ use crate::fit_orchestration::drivers::{
     build_term_collection_designs_and_freeze_joint, optimize_spatial_length_scale_exact_joint_typed,
     spatial_length_scale_term_indices,
 };
+use crate::inference::predict_io::FittedLatentScoreMap;
 use crate::marginal_slope_shared::{
     CoeffSupport, ObservedDenestedCellPartials, SparsePrimaryCoeffJetView, add_optional_matrix,
     add_optional_vector, add_two_surface_psi_outer,
@@ -55,7 +56,6 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2, ArrayViewMut1, s};
 use rayon::iter::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -195,6 +195,12 @@ pub struct BernoulliMarginalSlopeFitResult {
     /// prediction rebuilds `a(C)` from the (reproducible) marginal design and
     /// applies the identical map.
     pub latent_z_conditional_calibration: Option<LatentZConditionalCalibration>,
+    /// The latent score of each training row as the kernel consumed it: the raw
+    /// score through the fitted score map (the saved normalisation, then the
+    /// conditional calibration when one was minted). Under the conditional law
+    /// a saved model returns these same values at these rows through
+    /// `FittedModel::latent_conditional_residual` (gam#3016).
+    pub latent_score: Array1<f64>,
     /// The fitted residual repair geometry (gam#2924) when a residual block was
     /// supplied: column names, the pooled joint `(z, r)` covariance, the
     /// conditional model when the pairwise gate escalated, and the centring
@@ -2149,7 +2155,8 @@ pub(crate) fn weighted_mean(
 /// names: `s = Σ_i w_i u_i ã(C_i)`, `Ω̂ = Σ_i w_i² u_i² ã(C_i)ã(C_i)ᵀ`,
 /// `D = sᵀ Ω̂⁺ s ⟶ χ²_{rank Ω̂}`. Both the conditional-mean test
 /// (`u_i = z_i − z̄`) and the conditional-variance / Breusch-Pagan test
-/// (`u_i = (z_i − z̄)² − σ̂²`) are this statistic with the same centered basis.
+/// (`u_i = û_i² − σ̂²_û` on the conditional-mean residual `û = z − m̂(C)`)
+/// are this statistic with the same centered basis.
 ///
 /// Returns `None` when the test is degenerate (no usable basis directions),
 /// otherwise the asymptotic p-value.
@@ -2171,15 +2178,12 @@ pub(crate) fn robust_conditional_score_pvalue(
         ));
     }
     // Build the per-row scaled basis `B` with `B_i = (w_i u_i) ã_i` once, then
-    // recover both the score and the HC0 robust meat from it with two BLAS-3
-    // GEMMs over chunked row-blocks instead of an `O(n · r²)` per-row scatter:
+    // recover both the score and the HC0 robust meat from it:
     //   • score  `s   = ãᵀ (w ∘ u) = Bᵀ 1`     (column sums of `B`),
     //   • meat   `Ω̂  = Σ_i w_i² u_i² ã_i ã_iᵀ = BᵀB` since `(w_i u_i)² = w_i² u_i²`.
     // A non-positive weight zeroes that row of `B` (its score and meat
     // contributions both vanish), reproducing the `wi <= 0.0` skip EXACTLY.
-    // `fast_ata` is the same parallel Gramian the second-stage sandwich uses, so
-    // the statistic is numerically identical to the row-accumulated form up to
-    // the deterministic GEMM reduction order.
+    // `b_ij = (w_i·u_i)·ã_ij` takes three roundings.
     let mut b = a_centered.to_owned();
     for i in 0..n {
         let wi = weights[i];
@@ -2190,22 +2194,41 @@ pub(crate) fn robust_conditional_score_pvalue(
         }
         b.row_mut(i).iter_mut().for_each(|value| *value *= scale);
     }
-    let s = b.sum_axis(ndarray::Axis(0));
-    let omega = gam_linalg::faer_ndarray::fast_ata(&b);
+    robust_score_contributions_pvalue(&b, 3)
+}
+
+/// The robust score test from its per-row contributions `ψ_i` (the rows of
+/// `contributions`): `s = Σ_i ψ_i`, `Ω̂ = Σ_i ψ_i ψ_iᵀ`, `D = sᵀ Ω̂⁺ s ⟶
+/// χ²_{rank Ω̂}`. A contribution that carries an estimated nuisance's
+/// first-order effect makes `Ω̂` the variance of the score as it is actually
+/// computed, not as if the nuisance were known. `row_roundings` bounds the
+/// roundings that formed each `ψ_ij`, for the rank cutoff.
+pub(crate) fn robust_score_contributions_pvalue(
+    contributions: &Array2<f64>,
+    row_roundings: usize,
+) -> Result<Option<f64>, String> {
+    let n = contributions.nrows();
+    let r = contributions.ncols();
+    if r == 0 || n == 0 {
+        return Ok(None);
+    }
+    let s = contributions.sum_axis(ndarray::Axis(0));
+    let omega = gam_linalg::faer_ndarray::fast_ata(contributions);
     if !s.iter().all(|v| v.is_finite()) || !omega.iter().all(|v| v.is_finite()) {
         return Ok(None);
     }
     // Rank cutoff: `Ω̂`'s formation band against `λ_max(Ω̂)`. Each entry sums `n`
-    // products `b_ij·b_ik` with `b_ij = (w_i·u_i)·ã_ij`, three roundings each, so
-    // `|E_jk| ≤ γ_{n+3}·√(Ω̂_jj·Ω̂_kk)` and `‖E‖₂ ≤ γ_{n+3}·tr Ω̂`, against
-    // `λ_max(Ω̂) ≥ max_j Ω̂_jj`. The `r·ε` term is the eigensolver's backward
-    // error. A PSD Gram with a zero largest diagonal is the zero matrix, which
-    // has no usable direction.
+    // products `ψ_ij·ψ_ik`, each factor formed with `row_roundings` roundings,
+    // so `|E_jk| ≤ γ_{n+row_roundings}·√(Ω̂_jj·Ω̂_kk)` and
+    // `‖E‖₂ ≤ γ_{n+row_roundings}·tr Ω̂`, against `λ_max(Ω̂) ≥ max_j Ω̂_jj`. The
+    // `r·ε` term is the eigensolver's backward error. A PSD Gram with a zero
+    // largest diagonal is the zero matrix, which has no usable direction.
     let omega_max_diagonal = omega.diag().iter().copied().fold(0.0_f64, f64::max);
     if omega_max_diagonal == 0.0 {
         return Ok(None);
     }
-    let relative_cutoff = gam_linalg::roundoff::accumulation_growth(n + 3) * omega.diag().sum()
+    let relative_cutoff = gam_linalg::roundoff::accumulation_growth(n + row_roundings)
+        * omega.diag().sum()
         / omega_max_diagonal
         + r as f64 * f64::EPSILON;
     let omega_geometry = gam_linalg::utils::rank_certified_psd_pseudoinverse(&omega, relative_cutoff)
@@ -2261,51 +2284,93 @@ pub(crate) fn fit_conditional_latent_calibration_if_needed(
         return Ok(None);
     }
 
-    let z_mean = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * zi)
-        .sum::<f64>()
-        / total_weight;
-    let global_var = z
-        .iter()
-        .zip(weights.iter())
-        .map(|(&zi, &wi)| wi * (zi - z_mean) * (zi - z_mean))
-        .sum::<f64>()
-        / total_weight;
-    if !(global_var.is_finite() && global_var > 0.0) {
-        return Ok(None);
-    }
-
-    // Center each basis column by its weighted mean so the score test is about
-    // conditional structure *beyond* the global level (the intercept nuisance).
-    // A constant marginal-design column collapses to ~0 and is dropped by the
-    // pseudo-inverse rank, so an intercept already present in a(C) is harmless.
-    let mut a_centered = a_block.to_owned();
-    for j in 0..p {
-        let col = a_block.column(j);
-        let col_mean = col
-            .iter()
-            .zip(weights.iter())
-            .map(|(&v, &w)| w * v)
-            .sum::<f64>()
-            / total_weight;
-        a_centered.column_mut(j).mapv_inplace(|v| v - col_mean);
-    }
-
-    // Conditional-mean Rao test: u = z − z̄.
-    let u_mean: Vec<f64> = z.iter().map(|&zi| zi - z_mean).collect();
-    let p_mean = robust_conditional_score_pvalue(a_centered.view(), &u_mean, weights.view())?;
-    // Conditional-variance (Breusch-Pagan) Rao test: u = (z − z̄)² − σ̂².
-    let u_var: Vec<f64> = u_mean.iter().map(|&e| e * e - global_var).collect();
-    let p_var = robust_conditional_score_pvalue(a_centered.view(), &u_var, weights.view())?;
-
-    let mean_fires = p_mean.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
-    let var_fires = p_var.is_some_and(|p| p < AUTO_Z_CONDITIONAL_RAO_ALPHA);
+    // The conditional mean is tested on `z − z̄`, and the conditional variance
+    // on the residual of the conditional mean, `û² − Σwû²/Σw` with
+    // `û = z − m̂(C)`, as a Breusch-Pagan test is on OLS residuals. Testing
+    // `(z − z̄)²` instead has score expectation `Cov(a, (m(a) − m̄)²) +
+    // Cov(a, Var(z|a))`: a moving mean masks or fakes heteroskedasticity
+    // (gam#3335). The estimated mean's first-order effect on that score is
+    // propagated into its meat, so the χ² law holds under a curved mean too.
+    let evidence = estimated_latent_law::conditional_law_evidence(z, weights, Some(a_block))?;
+    let mean_fires = ConditionalLawEvidence::fires(evidence.mean_p_value, evidence.alpha);
+    let var_fires = ConditionalLawEvidence::fires(evidence.variance_p_value, evidence.alpha);
     if !mean_fires && !var_fires {
         return Ok(None);
     }
     fit_conditional_latent_calibration(z, weights, a_block, var_fires).map(Some)
+}
+
+/// The conditional-mean stage `m(C)` of the location-scale calibration.
+pub(crate) struct ConditionalMeanStage {
+    /// `[1 | a(C)]`.
+    pub(crate) basis: Array2<f64>,
+    /// Per-column relative Tikhonov penalty `R` (diagonal).
+    pub(crate) penalty: Array2<f64>,
+    /// `M = AᵀWA + λR`, the normal matrix the ridge factorizes.
+    pub(crate) normal: Array2<f64>,
+    pub(crate) coeffs: Vec<f64>,
+    /// `û = z − m̂(C)`.
+    pub(crate) residuals: Vec<f64>,
+}
+
+/// Fit the conditional mean over the full basis `[1 | a(C)]` via a weighted
+/// ridge (the ridge stabilizes a rank-deficient marginal-index span; it does
+/// not meaningfully shrink the few directions that trigger the gate). Shared
+/// by the Rao gates, whose variance tests run on this residual, and the fit.
+pub(crate) fn fit_conditional_mean_stage(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    a_block: ArrayView2<'_, f64>,
+) -> Result<ConditionalMeanStage, String> {
+    let basis = build_intercept_basis(a_block);
+    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
+    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
+    // be negligible against an O(n) Gram and would not stabilize a
+    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
+    // floored positive so the all-zero (already-dropped) directions still
+    // receive a finite ridge and the factorization cannot fail.
+    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+    for j in 0..basis.ncols() {
+        let diag_jj = basis
+            .column(j)
+            .iter()
+            .zip(weights.iter())
+            .map(|(&x, &w)| w * x * x)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        penalty[[j, j]] = diag_jj;
+    }
+    let z_col = z.view().insert_axis(ndarray::Axis(1));
+    let (coeffs_mat, fitted) = gam_linalg::utils::gaussian_weighted_ridge(
+        basis.view(),
+        z_col,
+        penalty.view(),
+        weights.view(),
+        AUTO_Z_CONDITIONAL_RIDGE_REL,
+    )?;
+    let residuals = z
+        .iter()
+        .zip(fitted.column(0).iter())
+        .map(|(&zi, &mi)| zi - mi)
+        .collect();
+    // The same system rebuilt as a dense `(p+1)²` form, so its inverse can
+    // propagate the mean stage into the Rao gates and the Murphy–Topel `V₁`.
+    let normal = {
+        let mut wa = basis.to_owned();
+        for (mut row, &wi) in wa.rows_mut().into_iter().zip(weights.iter()) {
+            row.iter_mut().for_each(|value| *value *= wi);
+        }
+        let mut m = basis.t().dot(&wa);
+        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
+        m
+    };
+    Ok(ConditionalMeanStage {
+        basis,
+        penalty,
+        normal,
+        coeffs: coeffs_mat.column(0).to_vec(),
+        residuals,
+    })
 }
 
 /// Fit the conditional location-scale calibration at a given structure, with no
@@ -2359,60 +2424,16 @@ pub(crate) fn fit_conditional_latent_calibration(
         ));
     }
 
-    // Escalation fires. Fit the conditional mean over the full basis
-    // [1 | a(C)] via a weighted ridge (the ridge stabilizes a rank-deficient
-    // marginal-index span; it does not meaningfully shrink the few directions
-    // that triggered the gate). The conditional-mean correction is applied
-    // whenever the gate fires (a pure-variance trigger leaves the C-slopes of
-    // m(C) ≈ 0, so it reduces to harmless global centering).
-    let basis = build_intercept_basis(a_block);
-    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
-    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
-    // be negligible against an O(n) Gram and would not stabilize a
-    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
-    // floored positive so the all-zero (already-dropped) directions still
-    // receive a finite ridge and the factorization cannot fail.
-    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
-    for j in 0..basis.ncols() {
-        let diag_jj = basis
-            .column(j)
-            .iter()
-            .zip(weights.iter())
-            .map(|(&x, &w)| w * x * x)
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        penalty[[j, j]] = diag_jj;
-    }
-    let z_col = z.view().insert_axis(ndarray::Axis(1));
-    let (mean_coeffs_mat, mean_fitted) = gam_linalg::utils::gaussian_weighted_ridge(
-        basis.view(),
-        z_col,
-        penalty.view(),
-        weights.view(),
-        AUTO_Z_CONDITIONAL_RIDGE_REL,
-    )?;
-    let mean_coeffs: Vec<f64> = mean_coeffs_mat.column(0).to_vec();
-
-    // First-stage (generated-regressor) normal matrix `M = AᵀWA + λR`, the same
-    // weighted-ridge system `gaussian_weighted_ridge` factorizes internally;
-    // rebuilt here so its inverse can form the closed-form coefficient sandwich
-    // `V₁` that the second-stage Murphy–Topel correction consumes. `p` is the
-    // marginal-index width (small), so this is a cheap dense `(p+1)²` form.
-    let normal_matrix = {
-        let mut wa = basis.to_owned();
-        for i in 0..wa.nrows() {
-            let wi = weights[i];
-            wa.row_mut(i).iter_mut().for_each(|value| *value *= wi);
-        }
-        let mut m = basis.t().dot(&wa);
-        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
-        m
-    };
-    let mean_residuals: Vec<f64> = z
-        .iter()
-        .zip(mean_fitted.column(0).iter())
-        .map(|(&zi, &mi)| zi - mi)
-        .collect();
+    // Escalation fires. The conditional-mean correction is applied whenever
+    // the gate fires (a pure-variance trigger leaves the C-slopes of m(C) ≈ 0,
+    // so it reduces to harmless global centering).
+    let ConditionalMeanStage {
+        basis,
+        penalty,
+        normal: normal_matrix,
+        coeffs: mean_coeffs,
+        residuals: mean_residuals,
+    } = fit_conditional_mean_stage(z, weights, a_block)?;
     let mean_cov = weighted_ridge_sandwich_cov(
         basis.view(),
         &mean_residuals,
@@ -2497,12 +2518,14 @@ pub(crate) fn fit_conditional_latent_calibration(
         theta1_cov,
     };
 
-    // Sanity-check post-correction moments on the training sample.
-    let calibrated = calibration.apply(z.view(), a_block)?;
+    // Sanity-check post-correction moments on the training sample, whose
+    // calibrated score is the fitted score map's (gam#3016).
+    let calibrated = FittedLatentScoreMap::conditional_only(&calibration)
+        .calibrate(z.view(), Some(a_block))?;
     let post_mean = weighted_mean(
         calibrated
             .as_slice()
-            .expect("calibration.apply returns an owned standard-layout 1-D array"),
+            .expect("the fitted score map returns an owned standard-layout 1-D array"),
         weights.view(),
         total_weight,
     );
@@ -2746,8 +2769,10 @@ pub(crate) fn build_latent_measure_decision(
                 .to_string()
             })?;
             // The law moves, so it is chosen among nested arms by the moving-law
-            // certificate at the converged fit. The fit starts on the simplest arm
-            // that follows a moving mean and variance.
+            // certificate at the converged fit. The fit starts on the simplest
+            // admissible arm that follows a moving mean and variance: the
+            // location-scale Gaussian law only if its residual passes the adequacy
+            // screen.
             let a_block = conditioning.ok_or_else(|| {
                 format!(
                     "{context}: the conditional-law evidence moved without a marginal-index span \
@@ -2760,6 +2785,7 @@ pub(crate) fn build_latent_measure_decision(
                 a_block,
                 local,
                 grid_size,
+                policy,
                 evidence.clone(),
                 context,
             )
@@ -2877,7 +2903,8 @@ pub(crate) fn build_latent_measure_decision(
                     // closed form: a two-point residual survives location-scale
                     // correction unchanged in shape, and only a declaration may
                     // make it Gaussian.
-                    let zeta = cal.apply(z.view(), a_block)?;
+                    let zeta = FittedLatentScoreMap::conditional_only(&cal)
+                        .calibrate(z.view(), Some(a_block))?;
                     let (kind, build) =
                         build_global_empirical_latent_measure(&zeta, weights, grid_size)?;
                     log::debug!(
@@ -3321,7 +3348,6 @@ pub(crate) fn weighted_tail_mass(
 // Cross-module constants — declared here so all submodules can reach them
 // via `use super::*` without promoting implementation details to pub(crate).
 // ---------------------------------------------------------------------------
-pub(super) const BERNOULLI_LINK_PROBABILITY_EPS: f64 = 1e-12;
 /// Upper bound (and large-`n` default) for rows-per-chunk in the parallel
 /// row-accumulation phases.
 ///
@@ -3603,6 +3629,8 @@ mod stacked_first_stage_sandwich_2484_tests {
 pub(crate) mod axis_direction_search;
 pub(crate) mod cell_moment_assembly;
 #[cfg(test)]
+mod conditional_law_gate_tests;
+#[cfg(test)]
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
@@ -3635,6 +3663,8 @@ mod flex_verify_932_tests;
 // timing is eprintln-only per the SPEC ban on wall-clock correctness budgets.
 #[cfg(test)]
 mod flex_measure_932_tests;
+#[cfg(test)]
+mod third_trace_2998_tests;
 // gam#2768 unit gates on the shared latent-measure decision and the conditional
 // location-scale calibration it escalates to. Bare `#[cfg(test)] mod` with the
 // allowed `*_tests` name so the build.rs ban-scanner exempts it.
@@ -3648,6 +3678,10 @@ mod psi_axis_contractions_979_tests;
 // `#[cfg(test)] mod` with the allowed `*_tests` name.
 #[cfg(test)]
 mod multistart_member_2359_tests;
+// gam#3022: the rigid row kernel's per-row tensor tables. Bare
+// `#[cfg(test)] mod` with the allowed `*_tests` name.
+#[cfg(test)]
+mod rigid_row_tensors_3022_tests;
 pub(crate) mod row_primary_hessian;
 mod second_correction_traces;
 
@@ -3678,8 +3712,7 @@ pub(crate) use family::{
 pub(crate) use gradient_paths::MarginalSlopeCovarianceRef;
 pub(crate) use gradient_paths::standardize_latent_z_with_policy;
 pub(crate) use gradient_paths::{
-    empirical_intercept_from_marginal, empirical_intercept_from_marginal_within,
-    empirical_intercept_tail_tolerance, signed_probit_neglog_derivatives_up_to_fourth,
+    empirical_intercept, signed_probit_neglog_derivatives_up_to_fourth,
     unary_derivatives_inverse_sqrt, unary_derivatives_log, unary_derivatives_log_normal_pdf,
     unary_derivatives_neglog_phi, unary_derivatives_sqrt,
 };

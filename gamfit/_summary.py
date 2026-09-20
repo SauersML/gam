@@ -12,13 +12,23 @@ from __future__ import annotations
 import operator
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import Any, Iterator, Mapping, overload
+from typing import TYPE_CHECKING, Any, Iterator, Mapping, overload
 
 from ._binding import rust_module
 
+if TYPE_CHECKING:
+    import numpy as np
+
 
 #: Columns of :meth:`Summary.smooth_terms_frame`, in the documented order.
-_SMOOTH_TERM_COLUMNS: tuple[str, ...] = ("name", "edf", "ref_df", "chi_sq", "p_value")
+_SMOOTH_TERM_COLUMNS: tuple[str, ...] = (
+    "name",
+    "edf",
+    "ref_df",
+    "chi_sq",
+    "p_value",
+    "lambdas",
+)
 
 # Canonical schema mirrors ``SummaryPayload`` in
 # ``crates/gam-models/src/inference/saved_summary.rs``. Adding a new field on the
@@ -28,16 +38,21 @@ _SMOOTH_TERM_COLUMNS: tuple[str, ...] = ("name", "edf", "ref_df", "chi_sq", "p_v
 _SUMMARY_FIELDS: tuple[str, ...] = (
     "formula",
     "family_name",
+    "link",
     "model_class",
     "n_obs",
     "deviance",
+    "null_deviance",
+    "deviance_explained",
+    "adjusted_r_squared",
+    "deviance_explained_unavailable",
+    "scale",
     "log_likelihood",
     "reml_score",
     "raw_reml_score",
     "reml_score_unavailable",
     "null_space_logdet",
     "null_dim",
-    "scale",
     "edf_total",
     "edf_rank_bound",
     "aic_conditional",
@@ -47,13 +62,15 @@ _SUMMARY_FIELDS: tuple[str, ...] = (
     "aic_corrected_unavailable",
     "lambdas",
     "coefficients",
+    "parametric_statistic",
+    "parametric_terms",
+    "parametric_terms_unavailable",
     "smooth_terms",
     "smooth_terms_unavailable",
     "curvature_estimands",
     "basis_checks",
     "covariance_kind",
-    "covariance_n",
-    "covariance_flat",
+    "covariance",
     "coefficient_se_source",
     "group_metadata",
     "deployment_extensions",
@@ -168,6 +185,8 @@ class Summary:
     family_name : str
         Human-readable family + link label, e.g. ``"Gaussian Identity"``;
         an expectile fit reports its estimator, e.g. ``"Expectile(tau=0.9)"``.
+    link : str
+        The link function's name, e.g. ``"identity"`` or ``"logit"``.
     model_class : str
         Internal model class, e.g. ``"standard"`` / ``"marginal-slope"``.
     n_obs : int or None
@@ -177,6 +196,25 @@ class Summary:
     deviance : float or None
         Model deviance at the converged fit. ``None`` for models that do not
         report a deviance.
+    null_deviance : float or None
+        Deviance of the intercept-only model on the training data, recorded at
+        fit time. ``None`` for a fit with no single intercept, with an offset,
+        or saved before it was recorded.
+    deviance_explained : float or None
+        The proportion of null deviance explained, :math:`1 - D/D_0`,
+        unclamped.
+    adjusted_r_squared : float or None
+        :math:`1 - (D/(n - \\mathrm{edf})) / (D_0/(n - 1))` for a Gaussian
+        response; ``None`` for every other family.
+    deviance_explained_unavailable : str or None
+        Why :attr:`deviance_explained` is ``None``. Present exactly when it is.
+    scale : float or None
+        Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
+        Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
+        (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
+        families (Poisson, binomial). ``None`` exactly when the family's scale
+        contract has no scalar dispersion: a custom family that declares none,
+        or Royston-Parmar survival.
     log_likelihood : float or None
         Ordinary reported log-likelihood at the converged fit. Every rankable
         model carries a finite value; ``None`` is reserved for the exact
@@ -207,12 +245,6 @@ class Summary:
         evidence calculation.
     null_dim : float or None
         Dimension of the penalty null space.
-    scale : float or None
-        Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
-        Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
-        (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
-        families (Poisson, binomial). ``None`` only for a custom family that
-        declares no dispersion.
     edf_total : float or None
         Total effective degrees of freedom across all blocks.
     edf_rank_bound : list of mapping
@@ -248,15 +280,47 @@ class Summary:
         and ``std_error`` (when available). Posterior summaries use a lazy
         columnar sequence so indexing and iteration do not require an eager
         list of per-coefficient dictionaries.
+    parametric_statistic : str or None
+        The Wald reference of :attr:`parametric_terms`: ``"t"`` (Student-t on
+        the residual degrees of freedom) when the scale is estimated, ``"z"``
+        when it is known.
+    parametric_terms : list of dict
+        The intercept and linear-term coefficients, one record per coefficient
+        with ``name``, ``estimate``, ``std_error``, ``statistic`` and
+        ``p_value``.
+    parametric_terms_unavailable : str or None
+        Why :attr:`parametric_terms` could not be built; the same causes as
+        :attr:`smooth_terms_unavailable`.
     smooth_terms : list of dict
         The mgcv-style per-smooth significance table: one record per
         smooth / random-effect term with keys ``name``, ``edf``, ``ref_df``,
-        and — for penalized smooths — ``chi_sq`` (Wood 2013 rank-truncated
-        Wald statistic) and ``p_value``. Random-effect smooths report ``edf``
-        only. A shape-constrained smooth (``shape=...``) has no ``chi_sq`` or
-        ``p_value``; it carries ``p_value_unavailable = "shape_constrained"``
-        instead, because its null ``f = 0`` is the apex of the constraint cone
-        and no calibrated reference exists for the truncated posterior mean.
+        ``lambdas`` (the term's smoothing parameters) and — for penalized
+        smooths — ``chi_sq`` and ``p_value`` from the
+        variance-component score test of ``f = 0`` (Lin 1997; Zhang & Lin 2003).
+        The score fits the other terms only and weights the term's directions by
+        its fixed structural penalties, one variance component per penalty on
+        its own null scale, so it never reads the term's own fitted
+        smoothing parameter, and its reference law (a weighted
+        :math:`\\chi^2_1` sum, over :math:`\\chi^2_\\rho/\\rho` when the scale is
+        estimated) is the null law at the fitted smoothing parameters of the
+        other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
+        Random-effect blocks carry the score test of their variance component
+        against its exact boundary null law, or a ``"random_effect_*"``
+        reason when it could not be scored. A smooth with no valid
+        p-value has no ``chi_sq`` or ``p_value`` and carries a
+        ``p_value_unavailable`` reason instead: ``"shape_constrained"`` (the
+        null is the apex of the constraint cone), ``"unpenalized_direction"``
+        (a direction no penalty shrinks is a fixed effect the variance-component
+        null does not remove), ``"fit_curvature_unavailable"`` (the model kept no
+        exact penalized Hessian and weighted Gram), ``"dispersion_unavailable"``
+        (the coefficient covariance scale cannot be resolved),
+        ``"not_identified"``, ``"indefinite_curvature"`` (a custom family's
+        observed information leaves the term's score no covariance), or
+        ``"residual_df_unavailable"``.
+        A model with more than one linear predictor (the Bernoulli
+        marginal-slope family) tags each record with ``predictor`` —
+        ``"marginal"`` or ``"slope"`` — naming the formula the smooth belongs
+        to; each row is tested against its own predictor's block.
         Empty when the model has no smooth or random-effect terms; every
         other absence is labeled by :attr:`smooth_terms_unavailable`.
     smooth_terms_unavailable : str or None
@@ -266,8 +330,7 @@ class Summary:
         reason, so an absence is never reported without its reason — the same
         contract as :attr:`reml_score_unavailable`.
 
-        This ``p_value`` is the *first-order* Wald reference; computing it needs
-        only the saved model. For the **second-order-accurate**, Bartlett-corrected
+        This ``p_value`` needs only the saved model. For the **second-order-accurate**, Bartlett-corrected
         likelihood-ratio p-value (the exact Lawley factor auto-applied whenever the
         family carries closed-form cumulant jets, #939/#1063) call
         :meth:`Model.smooth_significance(data) <gamfit.Model.smooth_significance>`,
@@ -275,12 +338,11 @@ class Summary:
     covariance_kind : str or None
         ``"smoothing-corrected"`` or ``"conditional"`` depending on which
         posterior covariance variant was returned. The kind, the ``std_error``
-        column, and ``covariance_flat`` always come from the SAME covariance
+        column, and ``covariance`` always come from the SAME covariance
         definition (#2296); see ``coefficient_se_source``.
-    covariance_n : int or None
-        Side length of the coefficient covariance matrix.
-    covariance_flat : list of float or None
-        Row-major flat coefficient covariance matrix.
+    covariance : numpy.ndarray or None
+        The ``(p, p)`` float64 coefficient covariance matrix, in coefficient
+        order.
     group_metadata : dict or None
         Saved group-level metadata for grouped fits.
     deployment_extensions : list of dict
@@ -290,6 +352,8 @@ class Summary:
         record per smooth term with ``name``, ``term_idx``, ``basis_dim`` (the
         realized ``k'``), ``nullspace_dim``, ``edf``, ``enrichment_dim``,
         ``enrichment_rank``, ``statistic``, ``p_value`` and ``provenance``. A
+        field the check did not measure is omitted, so a row whose
+        ``provenance`` is not ``"radial_enrichment"`` carries no ``p_value``. A
         small ``p_value`` says the fit's residuals still carry structure in that
         smooth's covariates which its realized basis cannot represent. See
         :meth:`gamfit.Model.basis_check` for the construction and its limits.
@@ -326,6 +390,11 @@ class Summary:
         :class:`gamfit.errors.GamInferenceWarning`) first, then informational notes
         on defaults the engine chose (e.g. the knot count of a default
         B-spline smooth). Empty when the fit recorded none.
+    text : str or None
+        The rendered report ``print(summary)`` shows: the same string
+        ``gam summary MODEL`` prints, rendered in Rust from these fields.
+        ``None`` for summaries that are not of a fitted model (posterior-draw
+        summaries).
     extras : dict
         Any keys returned by the Rust engine that are not in the typed
         schema. Kept so newer engine versions can add fields without
@@ -343,16 +412,21 @@ class Summary:
 
     formula: str = ""
     family_name: str = ""
+    link: str = ""
     model_class: str = ""
     n_obs: int | None = None
     deviance: float | None = None
+    null_deviance: float | None = None
+    deviance_explained: float | None = None
+    adjusted_r_squared: float | None = None
+    deviance_explained_unavailable: str | None = None
+    scale: float | None = None
     log_likelihood: float | None = None
     reml_score: float | None = None
     raw_reml_score: float | None = None
     reml_score_unavailable: str | None = None
     null_space_logdet: float | None = None
     null_dim: float | None = None
-    scale: float | None = None
     edf_total: float | None = None
     #: Per-block rank-bound status beside the EDF fields (#2901).
     edf_rank_bound: list[Any] = field(default_factory=list)
@@ -363,6 +437,9 @@ class Summary:
     aic_corrected_unavailable: str | None = None
     lambdas: list[float] = field(default_factory=list)
     coefficients: Sequence[Mapping[str, Any]] = field(default_factory=list)
+    parametric_statistic: str | None = None
+    parametric_terms: list[dict[str, Any]] = field(default_factory=list)
+    parametric_terms_unavailable: str | None = None
     smooth_terms: list[dict[str, Any]] = field(default_factory=list)
     smooth_terms_unavailable: str | None = None
     #: Fitted curvature κ̂ point estimates for any ``curv(...)`` constant-curvature
@@ -390,8 +467,7 @@ class Summary:
     #: converged on was rich enough.
     basis_checks: list[dict[str, Any]] = field(default_factory=list)
     covariance_kind: str | None = None
-    covariance_n: int | None = None
-    covariance_flat: list[float] | None = None
+    covariance: np.ndarray | None = None
     #: Exact covariance definition behind the coefficient ``std_error`` column
     #: (#2296): ``"conditional"`` or ``"smoothing-corrected"``, recorded from
     #: the definition-consistent pair the engine summary actually consumed.
@@ -499,11 +575,12 @@ class Summary:
         """Return :attr:`smooth_terms` as a :class:`pandas.DataFrame`.
 
         This is the canonical mgcv ``summary.gam`` per-smooth significance
-        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq``, ``p_value``
-        (``chi_sq`` / ``p_value`` are absent for random-effect smooths and any
-        shape-constrained term, matching the engine, which only computes the
-        Wood Wald test for ordinary penalized smooths). A shape-constrained row
-        adds a ``p_value_unavailable`` column naming the reason.
+        table: columns ``name``, ``edf``, ``ref_df``, ``chi_sq`` (the
+        variance-component score statistic, scaled so its null mean is
+        ``ref_df``), ``p_value``, ``lambdas``. A row with no valid p-value has
+        no ``chi_sq`` or ``p_value`` and adds a ``p_value_unavailable`` column
+        naming the reason, and a multi-predictor model adds a ``predictor``
+        column (``"marginal"`` / ``"slope"``).
         """
         import pandas as pd
 
@@ -522,9 +599,7 @@ class Summary:
         ``Model.__str__`` delegates here. A summary without rendered text
         prints its compact form.
         """
-        if self.text is None:
-            return repr(self)
-        return self.text
+        return self.text if self.text is not None else repr(self)
 
     def __repr__(self) -> str:
         """Compact developer one-liner. Stable across engine versions."""

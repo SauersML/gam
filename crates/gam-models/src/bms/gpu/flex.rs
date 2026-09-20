@@ -3,7 +3,9 @@
 use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
-use gam_gpu::{GpuDecision, GpuEligibility, GpuKernel, decide};
+use gam_gpu::{
+    GpuDecision, RowKernelAdmission, RowKernelShape, RuntimeDeviceProbe, decide_row_kernel,
+};
 
 use crate::bms::LatentIntegral;
 
@@ -65,43 +67,34 @@ impl BmsFlexRowKernelCapability {
     }
 }
 
-/// Decide which kernel builds the row-primary Hessian for `model` over `n`
-/// rows. The stages run in the order of what they cost to evaluate: the device
-/// kernel is eligible only for a model it declares, then only when compiled
-/// in, then only at or above the row-kernel threshold. Fewer rows than
-/// `MIN_CALIBRATABLE_ROW_KERNEL_N`, the smallest threshold any policy can
-/// carry, are below it on every device, so the device is probed for its own
-/// threshold only above that floor.
+/// Decide which kernel builds the row-primary Hessian for `model` on `shape`,
+/// through the one row-kernel decision: the device kernel is eligible only for
+/// a model it declares, then only when compiled in, and under `auto` its own
+/// timings of `shape` pick the executor, or `shape` races (gam#3024).
+/// `shape.kernel` names the device executor the designs admit: resident with
+/// dense designs, or a host pin.
 pub(crate) fn row_primary_hessian_decision(
     model: &BmsFlexRowModel,
-    n: usize,
+    shape: RowKernelShape,
 ) -> Result<GpuDecision, GpuError> {
-    let eligibility = if let Some(missing) = BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model) {
-        GpuEligibility::CapabilityMissing { missing }
-    } else if !BmsFlexGpuBackend::compiled() {
-        GpuEligibility::BackendNotCompiled
-    } else if n < gam_gpu::GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N {
-        GpuEligibility::WorkloadBelowThreshold
-    } else {
-        match gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())? {
-            Some(runtime) if n < runtime.policy().row_kernel_min_n => {
-                GpuEligibility::WorkloadBelowThreshold
-            }
-            // At or above this device's threshold, or no device at all, which
-            // `decide` reports as such.
-            Some(_) | None => GpuEligibility::Eligible,
-        }
-    };
-    decide(GpuKernel::MarginalSlopeRows, eligibility)
+    decide_row_kernel(
+        gam_gpu::global_policy(),
+        RowKernelAdmission {
+            missing_capability: BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model),
+            compiled: BmsFlexGpuBackend::compiled(),
+            shape,
+        },
+        &mut RuntimeDeviceProbe,
+    )
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns `gpu=required` for a
 /// kernel that cannot run `model` into an `Err` string at the call site.
 pub(crate) fn require_row_primary_hessian_supported(
     model: &BmsFlexRowModel,
-    n: usize,
+    shape: RowKernelShape,
 ) -> Result<GpuDecision, String> {
-    let decision = row_primary_hessian_decision(model, n).map_err(String::from)?;
+    let decision = row_primary_hessian_decision(model, shape).map_err(String::from)?;
     decision.clone().log();
     decision.require_supported()?;
     Ok(decision)
@@ -222,6 +215,7 @@ impl BmsFlexGpuBackend {
 #[cfg(test)]
 mod bms_flex_gpu_tests {
     use super::*;
+    use gam_gpu::GpuKernel;
 
     fn full_flex_model(latent_integral: LatentIntegral) -> BmsFlexRowModel {
         BmsFlexRowModel {
@@ -232,11 +226,20 @@ mod bms_flex_gpu_tests {
         }
     }
 
+    fn resident_shape(rows: usize) -> RowKernelShape {
+        RowKernelShape {
+            kernel: GpuKernel::MarginalSlopeRows,
+            rows,
+            widths: [20, 12, 8, 24],
+            threads: 1,
+        }
+    }
+
     #[test]
     pub(crate) fn bms_flex_gpu_policy_decision_is_explicit() {
         let decision = row_primary_hessian_decision(
             &full_flex_model(LatentIntegral::GaussianCellMoments),
-            50_000,
+            resident_shape(50_000),
         )
         .expect("GPU policy resolution must be lossless");
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
@@ -276,14 +279,16 @@ mod bms_flex_gpu_tests {
 
     /// gam#3000: an empirical-law FLEX model is never handed to the device row
     /// kernel, at any row count and under whichever policy this process runs,
-    /// and the decision names the capability it lacks. On a CUDA host at
-    /// `n >= row_kernel_min_n` this is the decision `auto` used to get wrong.
+    /// and the decision names the capability it lacks. On a CUDA host above the
+    /// old borrowed row threshold this is the decision `auto` used to get wrong.
     #[test]
     fn empirical_law_flex_model_selects_the_cpu_row_kernel_3000() {
         for n in [0, 50_000, 10_000_000] {
-            let decision =
-                row_primary_hessian_decision(&full_flex_model(LatentIntegral::DiscreteGrid), n)
-                    .expect("a capability refusal probes no device");
+            let decision = row_primary_hessian_decision(
+                &full_flex_model(LatentIntegral::DiscreteGrid),
+                resident_shape(n),
+            )
+            .expect("a capability refusal probes no device");
             assert!(!decision.use_gpu, "n={n}: {decision:?}");
             assert_eq!(
                 decision.missing_capability,

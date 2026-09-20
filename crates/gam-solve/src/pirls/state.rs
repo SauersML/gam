@@ -100,11 +100,12 @@ pub struct WorkingState {
     pub firth: FirthDiagnostics,
     pub hessian_curvature: HessianCurvatureKind,
     // Natural scale of the penalized gradient, used to form a scale-invariant
-    // KKT certificate.  Equal to ||X'(weighted_residual)||_2 + ||S*beta||_2.
-    // Under
-    // stochastic noise the score component scales as O(sqrt(n)), so an
-    // absolute ||g||_2 < tol test rejects fits whose normalized stationarity
-    // residual is already negligible. Convergence uses ||g||_2 / (1 + this).
+    // KKT certificate: [`penalized_gradient_natural_scale`] of the terms whose
+    // combination is the gradient, ||X'W eta||_2 + ||X'W z||_2 + ||S*beta||_2.
+    // Under stochastic noise the score operands scale as O(sqrt(n)) or faster,
+    // so an absolute ||g||_2 < tol test rejects fits whose normalized
+    // stationarity residual is already negligible. Convergence uses
+    // ||g||_2 / this.
     pub gradient_natural_scale: f64,
 }
 
@@ -120,48 +121,45 @@ impl WorkingState {
         self.firth.jeffreys_logdet()
     }
 
-    /// Scale-invariant relative gradient residual.
+    /// Scale-invariant relative gradient residual
+    /// `‖g‖ / (‖XᵀWη‖ + ‖XᵀWz‖ + ‖S·β‖)`.
     ///
-    /// Returns ||g||_2 / (1 + ||score||_2 + ||S*beta||_2 + ridge*||beta||_2).
     /// `g_norm` is the projected/constrained stationarity residual in the
     /// current PIRLS basis; the denominator is the natural magnitude of the
-    /// penalized gradient and is invariant under uniform rescaling of the
-    /// objective.
+    /// penalized gradient `g = score + S·β`, so the ratio carries no units: it
+    /// is unchanged when the objective is rescaled (`F → c·F`) and when the
+    /// coefficients are (`β → β/d`, which rescales every gradient by `d`). An
+    /// additive constant in the denominator (the former `1 + …`) would give the
+    /// ratio the gradient's own units, and then a response recorded in small
+    /// units, whose gradients are all tiny, would certify any iterate: a
+    /// canonical inverse-Gaussian fit stopped after two P-IRLS steps at edf
+    /// 1.4 where the same data in larger units took nine steps to its edf-13
+    /// mode, so its REML surface read the `λ → ∞` plateau. A zero residual is exactly stationary
+    /// whatever its scale; a nonzero residual on a zero natural scale is not
+    /// resolved by this ratio (it is infinite) and is left to the exact Newton
+    /// decrement.
     #[inline]
     pub fn relative_gradient_norm(&self, g_norm: f64) -> f64 {
-        g_norm / (1.0 + self.gradient_natural_scale)
+        relative_gradient_residual(g_norm, self.gradient_natural_scale)
     }
 
-    /// Dimension-based scale `√n · max(1, √p)` for the structural KKT bound.
+    /// Strict KKT acceptance: the relative stationarity residual
+    /// [`Self::relative_gradient_norm`] is below `tol`.
     ///
-    /// Under standardized columns, the score `Xᵀ(μ − y)` has components of
-    /// order O(√n), so the absolute test ‖g‖ < τ becomes systematically too
-    /// tight at large n. Multiplying τ by this scale restores the advertised
-    /// per-observation meaning.
-    #[inline]
-    pub(crate) fn kkt_dimension_scale(&self) -> f64 {
-        let n = self.eta.len().max(1) as f64;
-        let p = (self.gradient.len() as f64).max(1.0);
-        n.sqrt() * p.sqrt()
-    }
-
-    /// Strict KKT acceptance: `g_norm` certifies stationarity under EITHER
-    /// scale-invariant criterion (dimension-based or data-driven natural-scale).
-    ///
-    /// Both certificates are invariant under uniform rescaling of the objective
-    /// `F → c·F` (in the limit where the natural scale dominates the additive
-    /// `1` floor). Acceptance under either is sufficient because:
-    ///   - the natural-scale bound is tighter when the data are well-scaled
-    ///     (it tracks actual gradient component magnitudes);
-    ///   - the dimension bound is tighter when the design matrix has unusual
-    ///     scaling (so the natural scale is dominated by a single component).
+    /// The certificate is dimensionless, so `tol` means the same thing at
+    /// every sample size and in every response unit. At large `n` the score
+    /// and `S·β` grow together (both `O(√n)` for standardized columns), so the
+    /// ratio does not tighten with `n` the way an absolute `‖g‖ < τ` test does.
+    /// Ill-conditioned states whose gradient stays large while `H⁻¹g` is below
+    /// the objective's rounding are certified by the exact Newton decrement,
+    /// the solver's other acceptance.
     #[inline]
     pub fn certifies_kkt(&self, g_norm: f64, tol: f64) -> bool {
-        g_norm < tol * self.kkt_dimension_scale() || self.relative_gradient_norm(g_norm) < tol
+        self.relative_gradient_norm(g_norm) < tol
     }
 
-    /// Near-stationary band (10× the strict KKT tolerance) under EITHER
-    /// scale-invariant criterion. Used as a "good-enough" plateau check
+    /// Near-stationary band (10× the strict KKT tolerance) on the same
+    /// dimensionless residual. Used as a "good-enough" plateau check
     /// that classifies a fit as `StalledAtValidMinimum` rather than as a
     /// hard non-convergence. The band is `10 · tol` without a
     /// floor — a caller asking for `tol = 1e-12` gets a 1e-11 band, not
@@ -172,10 +170,48 @@ impl WorkingState {
     /// precision).
     #[inline]
     pub(crate) fn near_stationary_kkt(&self, g_norm: f64, tol: f64) -> bool {
-        let near_tol = tol * 10.0;
-        g_norm <= near_tol * self.kkt_dimension_scale()
-            || self.relative_gradient_norm(g_norm) <= near_tol
+        self.relative_gradient_norm(g_norm) <= tol * 10.0
     }
+}
+
+/// `‖g‖ / natural_scale`, the dimensionless stationarity residual of
+/// [`WorkingState::relative_gradient_norm`], with an exactly zero residual
+/// reading zero on any natural scale (including zero).
+#[inline]
+pub fn relative_gradient_residual(g_norm: f64, natural_scale: f64) -> f64 {
+    if g_norm == 0.0 {
+        0.0
+    } else {
+        g_norm / natural_scale
+    }
+}
+
+/// Natural scale of the penalized gradient `g = XᵀW(η − z) + S_λβ`: the norms
+/// of the terms whose combination forms it, `‖XᵀWη‖ + ‖XᵀWz‖ + ‖S_λβ‖`.
+///
+/// The scale is read at the optimum, where `g` cancels, so it has to be built
+/// from the operands of that cancellation rather than from any part of the
+/// result. The score `XᵀW(η − z)` is itself cancelled: at an interior optimum
+/// of an unpenalised coefficient `S_λβ = 0` and the score is rounding-level,
+/// so a scale `‖score‖ + ‖S_λβ‖` collapsed to the gradient's own magnitude and
+/// the stationarity ratio read about 1 on a fully converged fit (#3339).
+/// `XᵀWη` and `XᵀWz` are the P-IRLS analogue of the metric projection's `Hβ`
+/// and `rhs`: they are what the score subtracts, they stay at the data's
+/// magnitude however well the fit has converged, and they scale with the
+/// objective (`W → cW`) and with the coefficients (`X → XD`) exactly as the
+/// gradient does, so the ratio stays unit-free. By the triangle inequality the
+/// scale is never smaller than `‖score‖ + ‖S_λβ‖`.
+///
+/// `xt_w_eta` and `xt_w_z` must be in the basis the gradient is reported in,
+/// and `s_beta` is the penalty's shifted gradient `S_λβ − shift` the producer
+/// added to the score.
+#[inline]
+pub fn penalized_gradient_natural_scale(
+    xt_w_eta: &Array1<f64>,
+    xt_w_z: &Array1<f64>,
+    s_beta: &Array1<f64>,
+) -> f64 {
+    array1_l2_norm(xt_w_eta) + array1_l2_norm(xt_w_z) + array1_l2_norm(s_beta)
 }
 
 /// Numerically stable Euclidean norm of an `Array1<f64>`.
@@ -231,7 +267,7 @@ pub struct WorkingModelPirlsResult {
     ///
     /// Carried because a refusal that says "the inner mode did not converge"
     /// is unreadable without it: the certificate is
-    /// `‖g‖ < tol·√n·√p  OR  ‖g‖/(1+natural scale) < tol`, and both bounds move
+    /// `‖g‖/natural scale < tol`, and the bound moves
     /// with `tol` while `tol` itself tightens monotonically toward
     /// `reml_tolerance/100` as the outer search converges. Without this number
     /// a reader cannot tell a fit that stalled from a fit that was asked for
@@ -263,8 +299,8 @@ pub struct WorkingModelPirlsResult {
     /// observed across all iterations whose state was computed during the
     /// inner P-IRLS loop. The penalized objective is monotonically decreasing
     /// along any descent path the inner solver takes, so this minimum is a
-    /// principled seed-screening proxy that remains meaningful even when the
-    /// solver hit its iteration cap before reaching the mode. `f64::INFINITY`
+    /// diagnostic that remains meaningful even when the solver hit its
+    /// iteration cap before reaching the mode. `f64::INFINITY`
     /// when no state was ever computed (paths that synthesize a result
     /// without iterating, e.g. zero-iteration warm-only paths).
     pub min_penalized_deviance: f64,
@@ -451,7 +487,7 @@ pub struct PirlsResult {
     /// Natural scale of the penalized gradient at the accepted PIRLS state,
     /// equal to ‖Xᵀ(weighted residual)‖₂ + ‖Sβ‖₂ (+ ridge·‖β‖₂ when active).
     /// Mirrors `WorkingState::gradient_natural_scale` so that callers reading
-    /// `PirlsResult` directly (e.g. seed-screening cost augmentation) can form
+    /// `PirlsResult` directly (e.g. diagnostics) can form
     /// the scale-invariant residual r_g = ‖g‖ / (1 + this) without rebuilding
     /// the score and penalty norms.
     pub gradient_natural_scale: f64,
@@ -508,11 +544,8 @@ pub struct PirlsResult {
     /// bundle construction.
     pub cache_compacted: bool,
     /// Minimum penalized objective observed across the inner P-IRLS loop.
-    /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`. Used as the
-    /// seed-screening ranking proxy: the penalized objective descends monotonically
-    /// along any inner descent path, so the per-seed minimum tells the outer
-    /// cascade "how good a fit this rho's neighbourhood can support" even
-    /// when the inner solver was capped before reaching the mode.
+    /// Mirrors `WorkingModelPirlsResult::min_penalized_deviance`; reported in
+    /// inner-solve diagnostics.
     pub min_penalized_deviance: f64,
 }
 
@@ -554,12 +587,13 @@ impl PirlsResult {
 
     /// Scale-invariant relative gradient residual at the accepted PIRLS state.
     ///
-    /// Returns ‖g‖ / (1 + ‖score‖ + ‖Sβ‖ + ridge·‖β‖). Numerator is
-    /// `lastgradient_norm`; denominator is `1 + gradient_natural_scale`.
-    /// This is the "r_g" used by seed-screening cost augmentation.
+    /// Returns ‖g‖ / (‖score‖ + ‖Sβ‖ + ridge·‖β‖), the dimensionless residual
+    /// of [`WorkingState::relative_gradient_norm`]. Numerator is
+    /// `lastgradient_norm`; denominator is `gradient_natural_scale`.
+    /// This is the scale-invariant inner gradient residual "r_g".
     #[inline]
     pub fn relative_gradient_norm(&self) -> f64 {
-        self.lastgradient_norm / (1.0 + self.gradient_natural_scale)
+        relative_gradient_residual(self.lastgradient_norm, self.gradient_natural_scale)
     }
 
     pub(crate) fn compact_for_reml_cache(&self) -> Self {

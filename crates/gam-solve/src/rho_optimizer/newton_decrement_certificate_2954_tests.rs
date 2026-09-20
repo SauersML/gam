@@ -10,6 +10,10 @@ use ndarray::array;
 const OUTER_TOL_2954: f64 = 1.0e-3;
 const COEFFICIENTS_2954: usize = 10;
 const ROWS_2954: [usize; 3] = [2_000, 20_000, 200_000];
+/// The statistical resolution `τ_stat = 1/(2n)` of a criterion summed over the
+/// 2,000 rows most scripted criteria below declare: the log-likelihood change
+/// one observation's worth of information can resolve.
+const TAU_STAT_2954: f64 = 0.5 / 2_000.0;
 /// A scripted criterion has no inner solve, so its mode is exact: it charges a
 /// zero inner-residual energy wherever a REML evaluator publishes its own.
 const EXACT_INNER_MODE_2954: crate::estimate::outer_eval_capture::InnerResidualCharge =
@@ -246,11 +250,12 @@ fn an_evaluation_without_parts_takes_no_decrement_verdict_2954() {
 }
 
 /// A gradient component summed from two channels that cancel, `+1e6` and
-/// `−1e6 + 1e-9`. Charged on the assembled `|g| = 1e-9` its rounding band is
-/// about `1e-22`, and the decrement `5e-19` certifies against `band_f = u·|V| ≈
-/// 1.1e-16`. Charged on the channels it was summed from, its band is about
-/// `2.4e-7`, so `band_λ² ≈ 4.9e-16` reaches the objective band and the verdict
-/// cannot certify.
+/// `−1e6 + 1e-9`, along a direction of curvature `1e-13`. Charged on the
+/// assembled `|g| = 1e-9` its rounding band is about `1e-22`, and the decrement
+/// `λ̂² = 1e-5` certifies against `τ_stat = 1/(2n) = 5e-4`. Charged on the
+/// channels it was summed from, its band is about `2.4e-7`, so `band_λ²`, at
+/// least `2λ̂·band_g/√H ≈ 4.9e-3`, passes the tolerance and the verdict cannot
+/// certify.
 #[test]
 fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
     let n_obs = 1_000;
@@ -261,7 +266,8 @@ fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
         },
         ..OuterConfig::default()
     };
-    let hessian = array![[1.0]];
+    let curvature = 1.0e-13;
+    let hessian = array![[curvature]];
     let gradient = array![1.0e-9];
     let cost = 1.0;
     let fixed_beta = 1.0e6;
@@ -281,10 +287,16 @@ fn a_cancelling_gradient_is_charged_on_its_channels_not_its_sum_2954() {
     }];
     let growth =
         gam_linalg::roundoff::accumulation_growth(n_obs + COEFFICIENTS_2954 * COEFFICIENTS_2954);
+    let band_f = gam_linalg::roundoff::accumulation_growth(1) * cost;
     let assembled = opt::DecrementBands {
-        objective: gam_linalg::roundoff::accumulation_growth(1) * cost,
+        objective: band_f,
+        tolerance: crate::rho_optimizer::decrement_bands::DecrementTolerance {
+            tau_stat: 0.5 / n_obs as f64,
+            band_f,
+        }
+        .value(),
         gradient: gradient.mapv(|component: f64| growth * component.abs()),
-        hessian: growth,
+        hessian: growth * curvature,
     };
     assert!(
         opt::newton_decrement_verdict(&hessian, &gradient, None, &assembled).is_certified(),
@@ -406,20 +418,21 @@ fn certify_scripted_2954(
     (outcome, result.rho)
 }
 
-/// The #2954 census's exponential tail, `V = n·(0.6 + a·e^(−ρ))` with `n·a·e^(−5) = 1e-4`.
+/// The #2954 census's exponential tail, `V = n·(0.6 + a·e^(−ρ))` with
+/// `n·a·e^(−5) = 3e-2`, `120·τ_stat` at `n = 2000`.
 const TAIL_2954: fn(f64) -> [f64; 3] = |rho| {
-    let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+    let a = 3.0e-2 * 5.0_f64.exp() / 2_000.0;
     let tail = a * (-rho).exp();
     [0.6 + tail, -tail, tail]
 };
 
 /// [`TAIL_2954`]'s infimum is at `ρ → ∞`, and the route declares both bounds the
-/// term's limit model. From `ρ = 5`, where `λ̂² = n·a·e^(−5) = 1e-4`, the Newton
-/// step moves ρ by exactly one and `λ̂²` contracts by `e^(−1)`: `λ₊ ≈ 6.1e-3` against
-/// Newton's quadratic rate `2λ² = 2e-4`, so the decrement contracts at a linear
-/// rate, the tail's signature, with `λ̂² ≈ 3.7e-5` still five orders above the
-/// channel band `γ_(n+p²)·|V| ≈ 2.8e-10`. The coordinate carrying that step heads to
-/// its bound `ρ = 20`, and railing it there lowers the criterion by about `3.7e-5`,
+/// term's limit model. From `ρ = 5`, where `λ̂² = n·a·e^(−5) = 3e-2`, the Newton
+/// step moves ρ by exactly one and `λ̂²` contracts by `e^(−1)`: `λ₊ ≈ 0.105` against
+/// Newton's quadratic rate `2λ² = 6e-2`, so the decrement contracts at a linear
+/// rate, the tail's signature, with `λ̂² ≈ 1.1e-2` still forty times the
+/// statistical resolution `τ_stat = 1/(2n) = 2.5e-4`. The coordinate carrying that step heads to
+/// its bound `ρ = 20`, and railing it there lowers the criterion by about `1.1e-2`,
 /// the whole decrease `λ̂² = V − V∞` left, so the mint rails it and certifies the
 /// railed point on the decrement rung rather than refusing it.
 #[test]
@@ -455,7 +468,7 @@ fn an_exponential_tail_is_railed_at_its_bound_and_certified_there_2954() {
     let rail = &polish.rails[0];
     assert_eq!((rail.index, rail.to.to_bits()), (0, 20.0_f64.to_bits()));
     assert_eq!(rail.steps_before, 1);
-    assert!(rail.decrease > 1.0e-7, "{rail:?}");
+    assert!(rail.decrease > TAU_STAT_2954, "{rail:?}");
     assert_eq!(rail.face, crate::model_types::RailFaceKind::LimitModel);
     assert!(
         certificate.railed_facts.iter().any(|fact| {
@@ -466,20 +479,20 @@ fn an_exponential_tail_is_railed_at_its_bound_and_certified_there_2954() {
     );
 }
 
-/// `V = n·(0.6 + s·(e^ρ − 1 − ρ))` with `n·s = 1e-4`: an interior optimum at
+/// `V = n·(0.6 + s·(e^ρ − 1 − ρ))` with `n·s = 1e-2`: an interior optimum at
 /// `ρ = 0` whose third derivative equals its second, so `½V‴/V″^(3/2) =
-/// 1/(2√(n·s)) = 50` and Newton converges quadratically at fifty times the unit
+/// 1/(2√(n·s)) = 5` and Newton converges quadratically at five times the unit
 /// self-concordant rate, as a LAML criterion does along a smooth whose penalty
-/// barely binds. From `ρ = 0.5` (`λ̂ ≈ 5.0e-3`) the decrement contracts at
-/// fifty times Newton's unit rate, slower than the measured test `λ₊ ≤ 2λ²` admits,
+/// barely binds. From `ρ = 1.5` (`λ̂² ≈ 2.7e-2`) the decrement contracts at
+/// five times Newton's unit rate, slower than the measured test `λ₊ ≤ 2λ²` admits,
 /// and there is no limit-model face to rail. The decrement is still contracting and
-/// each step lowers the criterion by more than the channel band `≈ 2.8e-10`, so the
-/// polish keeps taking Newton steps (#3012), and the third reaches the band: the
+/// each step lowers the criterion by more than the tolerance, so the polish keeps
+/// taking Newton steps (#3012), and the third is inside `τ_stat = 2.5e-4`: the
 /// mint certifies the optimum instead of refusing a walk that is converging.
 #[test]
 fn a_criterion_at_a_steep_quadratic_rate_is_polished_to_its_optimum_2954() {
     const STEEP_2954: fn(f64) -> [f64; 3] = |rho| {
-        let s = 1.0e-4 / 2_000.0;
+        let s = 1.0e-2 / 2_000.0;
         [
             0.6 + s * (rho.exp() - 1.0 - rho),
             s * (rho.exp() - 1.0),
@@ -487,7 +500,7 @@ fn a_criterion_at_a_steep_quadratic_rate_is_polished_to_its_optimum_2954() {
         ]
     };
     let (outcome, published) =
-        certify_scripted_2954(2_000, 0.5, (-20.0, 20.0), None, STEEP_2954, None);
+        certify_scripted_2954(2_000, 1.5, (-20.0, 20.0), None, STEEP_2954, None);
     let certificate = outcome.expect("Newton at the measured rate reaches the optimum");
     assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
     let polish = certificate
@@ -495,8 +508,9 @@ fn a_criterion_at_a_steep_quadratic_rate_is_polished_to_its_optimum_2954() {
         .expect("the certificate records the polish");
     assert_eq!(polish.decreases.len(), 3, "{polish:?}");
     assert!(polish.rails.is_empty(), "{polish:?}");
+    assert!(polish.lambda_sq_after <= TAU_STAT_2954, "{polish:?}");
     assert!(
-        published[0].abs() <= 1.0e-4,
+        published[0].abs() <= 5.0e-2,
         "published at ρ = {:.3e}",
         published[0]
     );
@@ -535,72 +549,92 @@ fn a_railed_coordinate_with_resolvable_inward_descent_is_released_2954() {
     assert!(polish.rails.is_empty(), "{polish:?}");
 }
 
-/// `V = n·(0.6 + ½ρ²)` at `ρ = 3.16e-6`, `n = 2000`: `λ̂² ≈ 2e-8` is seventy times
-/// the channel band `γ_(n+p²)·|V| ≈ 2.8e-10`, so a criterion evaluated to rounding
-/// accuracy polishes it. When the evaluation reports an inner KKT residual energy
-/// `½rᵀH_β⁻¹r = 1e-7`, its value is uncertain by that much, the decrement is
-/// inside the band, and the point certifies at that floor where it stands.
+/// `V = n·(0.6 + ½ρ²)` at `ρ = 3.16e-4`, `n = 2000`: `λ̂² ≈ 2e-4` is inside the
+/// statistical resolution `τ_stat = 1/(2n) = 2.5e-4` less the channel band
+/// `γ_(n+p²)·|V| ≈ 2.8e-10`, so a criterion evaluated to rounding accuracy
+/// certifies where it stands. When the evaluation reports an inner KKT residual
+/// energy `½rᵀH_β⁻¹r = 1e-4`, its value is uncertain by that much, the tolerance
+/// left to the decrement is `τ_stat − 1e-4 ≈ 1.5e-4`, and the point is not
+/// certified where it stands: the polish takes the step that reaches the optimum.
 #[test]
 fn the_inner_residual_energy_is_charged_to_the_objective_band_2954() {
     const QUADRATIC_2954: fn(f64) -> [f64; 3] = |rho| [0.6 + 0.5 * rho * rho, rho, 1.0];
-    let theta = 3.16e-6;
-    let (rounding_only, polished) =
-        certify_scripted_2954(2_000, theta, (-20.0, 20.0), None, QUADRATIC_2954, None);
-    let rounding_only = rounding_only.expect("the Newton polish reaches the optimum");
-    assert_eq!(
-        rounding_only
-            .newton_polish
-            .map(|polish| polish.decreases.len()),
-        Some(1),
-        "control: against rounding alone the decrement is resolvable",
-    );
+    let theta = 3.16e-4;
+    let energy = 1.0e-4;
+    let lambda_sq = 2_000.0 * theta * theta;
     assert!(
-        polished[0].abs() <= 1e-6 * theta,
-        "control: the step reaches the optimum, ρ = {:.3e}",
-        polished[0],
+        lambda_sq < TAU_STAT_2954 && lambda_sq > TAU_STAT_2954 - energy,
+        "control: λ̂²={lambda_sq:.3e} sits between τ_stat − E and τ_stat",
     );
-    let (at_floor, published) = certify_scripted_2954(
+    let (rounding_only, standing) =
+        certify_scripted_2954(2_000, theta, (-20.0, 20.0), None, QUADRATIC_2954, None);
+    let rounding_only = rounding_only.expect("against rounding alone the point certifies");
+    assert_eq!(rounding_only.stationarity.rung().label, "newton-decrement");
+    assert!(
+        rounding_only.newton_polish.is_none(),
+        "control: against rounding alone the decrement is inside the tolerance: {:?}",
+        rounding_only.newton_polish,
+    );
+    assert_eq!(standing[0].to_bits(), theta.to_bits());
+    let (charged, polished) = certify_scripted_2954(
         2_000,
         theta,
         (-20.0, 20.0),
         None,
         QUADRATIC_2954,
-        Some(1.0e-7),
+        Some(energy),
     );
-    let at_floor = at_floor.expect("inside the inner-residual band the point certifies");
-    assert_eq!(at_floor.stationarity.rung().label, "newton-decrement");
+    let charged = charged.expect("the polish reaches the optimum");
+    assert_eq!(charged.stationarity.rung().label, "newton-decrement");
+    assert_eq!(
+        charged.newton_polish.map(|polish| polish.decreases.len()),
+        Some(1),
+        "the charged residual leaves the decrement above its tolerance",
+    );
     assert!(
-        at_floor.newton_polish.is_none(),
-        "{:?}",
-        at_floor.newton_polish
+        polished[0].abs() <= 1e-6 * theta,
+        "the step reaches the optimum, ρ = {:.3e}",
+        polished[0],
     );
-    assert_eq!(published[0].to_bits(), theta.to_bits());
 }
 
-/// `V = n·(0.6 + ½ρ²)`, `n = 2000`, handed over where `λ̂² = n·ρ² = 1.5·band_f`.
-/// The decrement bounds the decrease left, `V − V* = ½λ̂²` here, only up to the
-/// factor two a general self-concordant criterion needs, so `λ̂² > band_f` leaves a
-/// decrease the arithmetic may resolve and the point is not certified where it
-/// stands, although `½λ̂² = 0.75·band_f` would have certified it (#3012). The full
-/// step's own model decrease is inside the band, so no step could show a
-/// resolvable decrease: the polish takes it as a settling step, which may not
-/// raise `V` by more than `band_f` and whose point must certify, and it reaches
-/// the optimum.
+/// `V = n·(0.6 + ½ρ²)`, handed over where `λ̂² = n·ρ² = 1.5·tol`, with `tol` the
+/// decrease the verdict may leave to the minimum. The decrement bounds the
+/// decrease left, `V − V* = ½λ̂²` here, only up to the factor two a general
+/// self-concordant criterion needs. So `λ̂² > tol` leaves a decrease the
+/// statistics may resolve, and the point is not certified where it stands,
+/// although `½λ̂² = 0.75·tol` would have certified it (#3012).
+///
+/// A step's decrease is real only above the rounding band `band_f`. At
+/// `n = 180 000` the band has grown past half of `τ_stat = 1/(2n)`, so
+/// `tol = band_f` and the full step's own model decrease `½λ̂² = 0.75·band_f` is
+/// not resolvable: no step could show a decrease. The polish takes the full step
+/// as a settling step, which may not raise `V` by more than `band_f` and whose
+/// point must certify, and it reaches the optimum.
+///
+/// At `n = 2000` the same `1.5·tol` is some 10⁶ rounding bands, so the full step
+/// is an ordinary resolvable step there, not a settling step
+/// (`a_damped_step_that_buys_less_than_the_tolerance_is_kept_3012`).
 #[test]
 fn a_decrement_whose_full_step_is_unresolvable_takes_a_settling_step_3012() {
     const QUADRATIC_3012: fn(f64) -> [f64; 3] = |rho| [0.6 + 0.5 * rho * rho, rho, 1.0];
-    let n_obs = 2_000;
+    let n_obs = 180_000;
     let n = n_obs as f64;
     // The criterion channel is the whole value, `n·f(ρ)`, charged at the
     // formation count of `n` rows and `p²` coefficient pairs.
     let band_f = gam_linalg::roundoff::accumulation_growth(n_obs + COEFFICIENTS_2954 * COEFFICIENTS_2954)
         * n
         * 0.6;
-    let theta = (1.5 * band_f / n).sqrt();
+    let tol = crate::rho_optimizer::decrement_bands::DecrementTolerance {
+        tau_stat: 0.5 / n,
+        band_f,
+    }
+    .value();
+    let theta = (1.5 * tol / n).sqrt();
     let lambda_sq = n * theta * theta;
     assert!(
-        0.5 * lambda_sq <= band_f && lambda_sq > band_f,
-        "control: ½λ̂²={:.3e} ≤ band_f={band_f:.3e} < λ̂²={lambda_sq:.3e}",
+        0.5 * lambda_sq <= band_f && lambda_sq > tol,
+        "control: ½λ̂²={:.3e} ≤ band_f={band_f:.3e}, tol={tol:.3e} < λ̂²={lambda_sq:.3e}",
         0.5 * lambda_sq,
     );
     let (outcome, published) =
@@ -609,18 +643,79 @@ fn a_decrement_whose_full_step_is_unresolvable_takes_a_settling_step_3012() {
     assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
     let polish = certificate
         .newton_polish
-        .expect("a point whose λ̂² exceeds band_f is not certified where it stands");
+        .expect("a point whose λ̂² exceeds tol is not certified where it stands");
     assert_eq!(polish.decreases.len(), 1, "{polish:?}");
     assert!(polish.settled, "the step is recorded as a settling step: {polish:?}");
     assert!(
         (polish.lambda_sq_before / lambda_sq - 1.0).abs() <= 1.0e-12,
         "{polish:?}"
     );
-    assert!(polish.lambda_sq_after <= band_f, "{polish:?}");
+    assert!(polish.lambda_sq_after <= tol, "{polish:?}");
     assert!(
         published[0].abs() <= 4.0 * f64::EPSILON * theta,
         "published at ρ = {:.3e}, not at the optimum",
         published[0],
+    );
+}
+
+/// A polish step is kept when its decrease is above the criterion's rounding band,
+/// even when it is below the verdict's tolerance (#3012).
+///
+/// `V = n·(0.6 + s·ln cosh ρ)` at `n = 2000`, `n·s = 2.2e-4`, handed over at
+/// `ρ = 1.5`, where `λ̂² = n·s·sinh²(1.5) ≈ 9.97e-4`, four times
+/// `τ_stat = 1/(2n) = 2.5e-4`.
+/// - The full Newton step overshoots to `ρ ≈ −3.5` and raises the criterion.
+/// - The half step lands at `ρ ≈ −1.0` and lowers it by about `9.3e-5`. That is
+///   below the tolerance and some 10⁵ rounding bands. While 9470a51ccc wrote
+///   the tolerance into the evidence's `band_f` field, the polish judged this
+///   step against the tolerance, treated it as noise, and refused the mint
+///   after 0 steps.
+/// - Judged against the rounding band it is kept, and the full step from there
+///   (a decrease of about `2.9e-5`, again below the tolerance) reaches
+///   `λ̂² ≈ 1.9e-4`, inside it, where the mint certifies.
+#[test]
+fn a_damped_step_that_buys_less_than_the_tolerance_is_kept_3012() {
+    const SCALE: f64 = 1.1e-7;
+    let (outcome, published) = certify_scripted_2954(
+        2_000,
+        1.5,
+        (-20.0, 20.0),
+        Some((true, true)),
+        |rho| {
+            [
+                0.6 + SCALE * rho.cosh().ln(),
+                SCALE * rho.tanh(),
+                SCALE / (rho.cosh() * rho.cosh()),
+            ]
+        },
+        None,
+    );
+    let certificate = outcome.expect("the walk of sub-tolerance steps reaches the tolerance");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
+    let half = 1.5 - 0.5 * 1.5_f64.sinh() * 1.5_f64.cosh();
+    let expected = 2_000.0 * SCALE * (1.5_f64.cosh().ln() - half.cosh().ln());
+    let first = polish.decreases[0];
+    assert!(
+        (first - expected).abs() <= 64.0 * f64::EPSILON * 2_000.0 * 0.6,
+        "the first step is the half Newton step: decrease {first:.9e} against {expected:.9e}",
+    );
+    assert_eq!(polish.decreases.len(), 2, "{polish:?}");
+    assert!(
+        polish
+            .decreases
+            .iter()
+            .all(|&decrease| decrease < TAU_STAT_2954),
+        "every kept step buys less than the tolerance: {polish:?}",
+    );
+    assert!(!polish.settled, "{polish:?}");
+    assert!(polish.lambda_sq_after <= TAU_STAT_2954, "{polish:?}");
+    assert!(
+        published[0].abs() <= (polish.lambda_sq_after / (2_000.0 * SCALE)).sqrt(),
+        "published {:.3e}",
+        published[0]
     );
 }
 
@@ -630,7 +725,7 @@ fn a_decrement_whose_full_step_is_unresolvable_takes_a_settling_step_3012() {
 /// rails the coordinate there. Along the tail, though, `λ̂² = V − V∞` is the whole
 /// decrease left, and although it contracts slower than Newton's quadratic rate the
 /// polish keeps following it inside the box while `λ̂²` contracts (#3012). It certifies
-/// on the decrement rung once that decrease is below the band, short of the face.
+/// on the decrement rung once that decrease is inside `τ_stat`, short of the face.
 #[test]
 fn a_tail_heading_to_a_representability_face_is_certified_inside_the_box_3012() {
     let (outcome, published) = certify_scripted_2954(
@@ -704,7 +799,7 @@ fn a_tail_that_needs_a_representability_face_is_refused_by_type_3012() {
         other => panic!("expected a typed outer refusal, got {other:?}"),
     }
     assert!(
-        published[0] > 9.0 && published[0] < 9.5,
+        published[0] > 8.5 && published[0] < 9.5,
         "the checkpoint stays short of the literal face's rail margin: {}",
         published[0],
     );
@@ -715,11 +810,11 @@ fn a_tail_that_needs_a_representability_face_is_refused_by_type_3012() {
 /// lower bound a representability face (`rho_domain::unpenalized_fit_is_identified`).
 /// λ → 0 is then no limit model, and the mint never rails there; the polish
 /// follows the tail inside the box and certifies it once the decrease left is
-/// below the band (#3012).
+/// below the tolerance (#3012).
 #[test]
 fn a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_3012() {
     const LOWER_TAIL_2954: fn(f64) -> [f64; 3] = |rho| {
-        let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+        let a = 3.0e-2 * 5.0_f64.exp() / 2_000.0;
         let tail = a * rho.exp();
         [0.6 + tail, tail, tail]
     };
@@ -747,15 +842,19 @@ fn a_tail_toward_an_unidentified_unpenalized_fit_is_certified_inside_the_box_301
     );
 }
 
-/// The objective band is the error the evaluated `V` carries, by term (#2954). A
-/// criterion `V = 1` summed from channels `+1e6` and `−1e6 + 1` rounds like its
-/// channels, `γ_(n+p²)·2e6 ≈ 2.4e-7`, not like its sum, so `λ̂² = 2e-8` is inside
-/// the channel band and outside `γ_1·|V|`. A `log|H_β|` read from a factor whose
-/// own first-order forward error is `δ_logdet = 1.2e-5` carries `½·δ_logdet = 6e-6`
-/// into the `½·log|H_β|` channel, so `λ̂² = 2e-6` is inside the factor band and
-/// outside the channels'. A `log|H_β|` channel from a factor that derives no
-/// forward error takes no verdict. Nor does a band past the objective resolution
-/// the certificate asserts.
+/// The objective band is the error the evaluated `V` carries, by term (#2954),
+/// and the verdict certifies the decrease left against the statistical
+/// resolution `τ_stat = 1/(2n) = 5e-4` less that band (C3). A criterion `V = 1`
+/// summed from channels `+6e8` and `−6e8 + 1` rounds like its channels,
+/// `γ_(n+p²)·1.2e9 ≈ 1.5e-4`, not like its sum, so `λ̂² = 4e-4` certifies against
+/// `τ_stat − γ_1·|V|` and not against `τ_stat` less the channel band. Channels
+/// `±1.4e9` round past `τ_stat/2`: the arithmetic, not the statistics, limits the
+/// verdict, which then certifies against the band itself. A `log|H_β|` read from
+/// a factor whose own first-order forward error is `δ_logdet = 4e-4` carries
+/// `½·δ_logdet = 2e-4` into the `½·log|H_β|` channel, so `λ̂² = 4e-4` certifies on
+/// the channels alone and not once the factor is charged. A `log|H_β|` channel
+/// from a factor that derives no forward error takes no verdict. Nor does a band
+/// past `τ_stat`, which would read any statistically resolvable decrease as noise.
 #[test]
 fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
     let config = OuterConfig {
@@ -809,48 +908,61 @@ fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
     let exact = Some(crate::estimate::outer_eval_capture::InnerFactorCondition {
         logdet_forward_error: 0.0,
     });
-    let cancelling = Some((1.0e6, -1.0e6 + 1.0));
-    let control = verdict(2.0e-8, None, None).expect("the parts cover the coordinate");
+    let tau_stat = 0.5 / 1_000.0;
+    let control = verdict(4.0e-4, None, None).expect("the parts cover the coordinate");
     assert!(
-        !control.verdict.is_certified(),
-        "control: against γ_1·|V| the decrement is resolvable",
+        control.verdict.is_certified(),
+        "control: against τ_stat − γ_1·|V| the decrement certifies: {control:?}",
     );
-    let charged = verdict(2.0e-8, cancelling, exact).expect("the parts cover the coordinate");
-    assert!(charged.verdict.is_certified(), "{charged:?}");
-    assert!(charged.objective_band.channels > 1.0e-7, "{charged:?}");
+    assert_eq!(control.tolerance.tau_stat, tau_stat);
+    let cancelling = Some((6.0e8, -6.0e8 + 1.0));
+    let charged = verdict(4.0e-4, cancelling, exact).expect("the parts cover the coordinate");
+    assert!(!charged.verdict.is_certified(), "{charged:?}");
+    assert!(charged.objective_band.channels > 1.0e-4, "{charged:?}");
+    assert!(!charged.tolerance.arithmetic_limited(), "{charged:?}");
+    // Channels whose band passes `τ_stat/2` leave the arithmetic, not the
+    // statistics, to limit the verdict: it certifies against the band itself.
+    let limited = verdict(3.0e-4, Some((1.4e9, -1.4e9 + 1.0)), exact)
+        .expect("the parts cover the coordinate");
+    assert!(limited.tolerance.arithmetic_limited(), "{limited:?}");
+    assert_eq!(
+        limited.tolerance.value(),
+        limited.objective_band.total(),
+        "{limited:?}"
+    );
+    assert!(limited.verdict.is_certified(), "{limited:?}");
     let plain = Some((0.5, 0.5));
     let factor = crate::estimate::outer_eval_capture::InnerFactorCondition {
-        logdet_forward_error: 1.2e-5,
+        logdet_forward_error: 4.0e-4,
     };
-    let channels_only = verdict(2.0e-6, plain, exact).expect("the parts cover the coordinate");
+    let channels_only = verdict(4.0e-4, plain, exact).expect("the parts cover the coordinate");
     assert!(
-        !channels_only.verdict.is_certified(),
-        "control: against the channels alone the decrement is resolvable",
+        channels_only.verdict.is_certified(),
+        "control: against the channels alone the decrement certifies: {channels_only:?}",
     );
-    let conditioned = verdict(2.0e-6, plain, Some(factor)).expect("the parts cover the coordinate");
-    assert!(conditioned.verdict.is_certified(), "{conditioned:?}");
+    let conditioned = verdict(4.0e-4, plain, Some(factor)).expect("the parts cover the coordinate");
+    assert!(!conditioned.verdict.is_certified(), "{conditioned:?}");
     assert!(
-        conditioned.objective_band.factor > 1.0e-6,
+        conditioned.objective_band.factor > 1.0e-4,
         "{conditioned:?}"
     );
     // A nonzero `log|H_β|` channel whose factor derives no forward error takes no
     // verdict, rather than being charged nothing for it.
     assert_eq!(
-        verdict(2.0e-6, plain, None).err(),
+        verdict(4.0e-4, plain, None).err(),
         Some(DecrementVerdictNotTaken::NoLogdetForwardError)
     );
-    // A band past the objective resolution `τ = rel_cost_floor·(1 + |V|) = 2e-5` the
-    // certificate asserts would read any decrease as noise: no verdict is taken, and
-    // nothing is certified.
+    // A band past `τ_stat` would read any statistically resolvable decrease as
+    // noise: no verdict is taken, and nothing is certified.
     let vacuous = crate::estimate::outer_eval_capture::InnerFactorCondition {
         logdet_forward_error: 1.0,
     };
     let refused =
-        verdict(2.0e-6, plain, Some(vacuous)).expect_err("a vacuous band takes no verdict");
-    let DecrementVerdictNotTaken::ObjectiveNotResolvable { band_f, tau } = refused else {
+        verdict(4.0e-4, plain, Some(vacuous)).expect_err("a vacuous band takes no verdict");
+    let DecrementVerdictNotTaken::ObjectiveNotResolvable { band_f, tau_stat } = refused else {
         panic!("a vacuous band is refused as unresolvable: {refused}");
     };
-    assert!(band_f > tau, "{refused}");
+    assert!(band_f > tau_stat, "{refused}");
     assert!(
         refused
             .to_string()
@@ -869,7 +981,7 @@ fn the_objective_band_charges_the_channels_and_the_inner_factor_2954() {
 fn a_coupled_tail_is_railed_as_one_face_2954() {
     let n_obs = 2_000;
     let n = n_obs as f64;
-    let a = 0.5e-4 * 5.0_f64.exp() / n;
+    let a = 1.5e-2 * 5.0_f64.exp() / n;
     let b = 1.0e-3;
     let value = move |rho: &Array1<f64>| {
         let gap = rho[0] - rho[1];
@@ -946,10 +1058,15 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
         certify_outer_optimality(&mut obj, &config, "newton-decrement-2954", &mut result)
             .expect("the pair railed together certifies");
     assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
-    assert_eq!(
-        result.rho.to_vec(),
-        vec![20.0, 20.0],
-        "both railed at their bounds"
+    // The leader is railed at its bound, and the path carries its partner there
+    // up to the rounding of the step.
+    assert!(
+        result
+            .rho
+            .iter()
+            .all(|rho| (20.0 - rho).abs() <= 64.0 * f64::EPSILON * 20.0),
+        "both at their bounds: {:?}",
+        result.rho
     );
     let polish = certificate
         .newton_polish
@@ -981,13 +1098,14 @@ fn a_coupled_tail_is_railed_as_one_face_2954() {
 /// first to arrive is railed there; the other two arrive within the step's own
 /// solve error of the face, where the decrement certifies them free, and 0 and 1
 /// stay free near their optimum. "On the face" is the resolution every rail is
-/// accepted by: railing the arrivals too would lower `V` by no more than `band_f`,
-/// here `γ_1·|V|` because the scripted criterion publishes no channels.
+/// accepted by: railing the arrivals too would lower `V` by no more than the
+/// tolerance `τ_stat − band_f`, with `band_f = γ_1·|V|` because the scripted
+/// criterion publishes no channels.
 #[test]
 fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
     let n_obs = 2_000;
     let n = n_obs as f64;
-    let a = 1.0e-4 / 3.0 * 15.7_f64.exp() / n;
+    let a = 3.0e-2 / 3.0 * 15.7_f64.exp() / n;
     let (b, c, optimum) = (1.0e-3, 1.0e-3, -10.4 + 1.0e-5);
     let value = move |rho: &Array1<f64>| {
         let tail: f64 = (2..5).map(|k| a * (-rho[k]).exp()).sum();
@@ -1092,11 +1210,15 @@ fn projected_newton_path_rails_the_tail_and_leaves_the_interior_free_2954() {
     for k in 2..5 {
         on_face[k] = 20.0;
     }
-    let band_f = gam_linalg::roundoff::accumulation_growth(1) * result.final_value.abs();
+    let tol = crate::rho_optimizer::decrement_bands::DecrementTolerance {
+        tau_stat: TAU_STAT_2954,
+        band_f: gam_linalg::roundoff::accumulation_growth(1) * result.final_value.abs(),
+    }
+    .value();
     assert!(
-        result.final_value - value(&on_face) <= band_f,
+        result.final_value - value(&on_face) <= tol,
         "the tail ends on its face to the criterion's resolution: railing it lowers V by \
-         {:.3e} against band_f {band_f:.3e} at {:?}",
+         {:.3e} against the tolerance {tol:.3e} at {:?}",
         result.final_value - value(&on_face),
         result.rho,
     );
@@ -1245,7 +1367,7 @@ fn certify_two_route_walk_2954(
 }
 
 /// A polish step is kept only when the evaluation order the certificate judged
-/// the current point at says it lowers `V` by more than `band_f` (#2954).
+/// the current point at says it lowers `V` by more than the tolerance (#2954).
 ///
 /// `V = n·(0.6 + s·√(1 + ρ²))` from `ρ = 1.5` with `n·s = 0.01`: `λ₀ ≈ 0.20` is
 /// inside the quadratic region, but the Newton step `−ρ(1 + ρ²) = −4.875`
@@ -1254,7 +1376,7 @@ fn certify_two_route_walk_2954(
 /// own order it is a rise: the step is not kept, the judged point stays where it
 /// is, and the mint refuses by name.
 ///
-/// Conversely, on `V = n·(0.6 + ½ρ²)` from `ρ = 5e-4` a value-only probe that
+/// Conversely, on `V = n·(0.6 + ½ρ²)` from `ρ = 2e-3` a value-only probe that
 /// reads `1.0` high would refuse the step that reaches the optimum. Judged at the
 /// certificate's order it lowers `V` by the full-order decrease the record
 /// carries, and the point it reaches is published with its full-order value. The
@@ -1284,10 +1406,17 @@ fn a_polish_step_is_judged_at_the_certificates_own_evaluation_order_2954() {
         overshoot_full_order(1.5) - overshoot_full_order(half),
         "the first kept step is the half step, judged at full order: {polish:?}",
     );
-    assert!(judged.rho[0].abs() < 1.0e-3, "published {:?}", judged.rho);
+    // Near its minimum `λ̂² = n·s·ρ²·√(1 + ρ²) ≥ n·s·ρ²`, so the certified
+    // decrement bounds the distance left.
+    assert!(polish.lambda_sq_after <= TAU_STAT_2954, "{polish:?}");
+    assert!(
+        judged.rho[0].abs() <= (polish.lambda_sq_after / 0.01).sqrt(),
+        "published {:?}",
+        judged.rho
+    );
 
     const QUADRATIC_2954: fn(f64) -> [f64; 3] = |rho| [0.6 + 0.5 * rho * rho, rho, 1.0];
-    let (reaching, reached) = certify_two_route_2954(5.0e-4, QUADRATIC_2954, 1.0);
+    let (reaching, reached) = certify_two_route_2954(2.0e-3, QUADRATIC_2954, 1.0);
     let certificate = reaching.expect("the full-order decrease is kept and the optimum certifies");
     assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
     let polish = certificate
@@ -1297,7 +1426,7 @@ fn a_polish_step_is_judged_at_the_certificates_own_evaluation_order_2954() {
     assert_eq!(polish.decreases.len(), 1, "{polish:?}");
     assert_eq!(
         polish.decreases[0],
-        full_order(5.0e-4) - full_order(reached.rho[0]),
+        full_order(2.0e-3) - full_order(reached.rho[0]),
         "the recorded decrease is the full-order one",
     );
     assert_eq!(
@@ -1378,9 +1507,21 @@ fn two_walks_at_one_point_certify_from_their_own_evidence_2954() {
         [0.6 + 0.5 * rho * rho + bump, rho, 1.0]
     };
     let ((walk_a, _), evaluated) = certify_two_route_walk_2954(5.0e-4, bumped, 0.0, false);
+    // Walk A declines the full Newton step, which lands in the bump, and keeps the
+    // half step. Landing at `ρ = 2.5e-4` lowers `n·V` by `n·½·(ρ₀² − ρ₀²/4) =
+    // 1.875e-4`: below `τ_stat = 2.5e-4`, but some 10⁶ rounding bands, so it is a
+    // decrease (#3012). There `λ̂² = n·ρ² = 1.25e-4` certifies, and the decrease left
+    // to the infimum at the bump's edge is `n·½·(ρ² − 1e-8) = 5.25e-5`, inside `τ_stat`.
+    let certificate =
+        walk_a.expect("walk A declines its rising trial and certifies after the half step");
+    let polish = certificate
+        .newton_polish
+        .expect("walk A records its polish");
+    let half_step = 2_000.0 * 0.5 * (5.0e-4_f64.powi(2) - 2.5e-4_f64.powi(2));
+    assert_eq!(polish.decreases.len(), 1, "{polish:?}");
     assert!(
-        walk_a.is_err(),
-        "walk A refuses its rising trial: {walk_a:?}"
+        (polish.decreases[0] - half_step).abs() <= 64.0 * f64::EPSILON * 2_000.0 * 0.6,
+        "walk A keeps the half step: {polish:?}",
     );
     let trial = *evaluated
         .iter()
@@ -1405,24 +1546,24 @@ fn two_walks_at_one_point_certify_from_their_own_evidence_2954() {
 /// `y ~ s(x)` of #3012: `V = n·(0.6 + a·e^(−ρ) + b·e^(ρ−20))` with `b = a·e^(−6)`,
 /// so `V` is least at `ρ* = 13` and rises again toward the bound.
 const INTERIOR_TAIL_3012: fn(f64) -> [f64; 3] = |rho| {
-    let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+    let a = 3.0e-2 * 10.0_f64.exp() / 2_000.0;
     let b = a * (-6.0_f64).exp();
     let tail = a * (-rho).exp();
     let rise = b * (rho - 20.0).exp();
     [0.6 + tail + rise, rise - tail, tail + rise]
 };
 
-/// From `ρ = 5`, [`INTERIOR_TAIL_3012`] contracts `λ̂²` by about `e^(−1)` per Newton
+/// From `ρ = 10`, where `λ̂² ≈ 3e-2`, [`INTERIOR_TAIL_3012`] contracts `λ̂²` by about `e^(−1)` per Newton
 /// step, a linear rate `λ₊ > 2λ²`, until the rising term takes over near `ρ* = 13`.
 /// Railing the coordinate at its bound `ρ = 20` raises the criterion, so the rail
 /// is declined (#3012). The polish continues while the decrement contracts and each
-/// step lowers the criterion by more than `band_f`, and certifies the interior
+/// step lowers the criterion by more than the tolerance, and certifies the interior
 /// minimum on the decrement rung.
 #[test]
 fn a_linearly_converging_polish_certifies_its_interior_minimum_3012() {
     let (outcome, published) = certify_scripted_2954(
         2_000,
-        5.0,
+        10.0,
         (-20.0, 20.0),
         Some((true, true)),
         INTERIOR_TAIL_3012,
@@ -1442,7 +1583,7 @@ fn a_linearly_converging_polish_certifies_its_interior_minimum_3012() {
     // certified point is one Newton step `√(λ̂²/V'')` from the minimum, up to the
     // curvature's variation over that step (a factor two covers it) and the
     // rounding of `ρ` itself.
-    let a = 1.0e-4 * 5.0_f64.exp() / 2_000.0;
+    let a = 3.0e-2 * 10.0_f64.exp() / 2_000.0;
     let curvature = 2.0 * 2_000.0 * a * (-13.0_f64).exp();
     let reach = 2.0 * (polish.lambda_sq_after / curvature).sqrt() + 64.0 * f64::EPSILON * 13.0;
     assert!(
@@ -1455,10 +1596,10 @@ fn a_linearly_converging_polish_certifies_its_interior_minimum_3012() {
 /// `V = n·(0.6 + s·ln cosh ρ)` handed over at `ρ = 1.5`, where the full Newton
 /// step `−sinh ρ·cosh ρ` overshoots to `ρ ≈ −3.5` and raises the criterion. The
 /// polish damps it (#3012): the half step lowers the criterion by more than
-/// `band_f`, and the walk then converges to `ρ = 0` and certifies there.
+/// the tolerance, and the walk then converges to `ρ = 0` and certifies there.
 #[test]
 fn a_full_newton_step_that_raises_the_criterion_is_damped_3012() {
-    const SCALE: f64 = 6.0e-6;
+    const SCALE: f64 = 5.0e-4;
     let (outcome, published) = certify_scripted_2954(
         2_000,
         1.5,
@@ -1485,49 +1626,69 @@ fn a_full_newton_step_that_raises_the_criterion_is_damped_3012() {
         (first - expected).abs() <= 64.0 * f64::EPSILON * 2_000.0 * 0.6,
         "the first step is the half Newton step: decrease {first:.9e} against {expected:.9e}",
     );
+    // `λ̂² = n·s·sinh²ρ ≥ n·s·ρ²`, so the certified decrement bounds the distance
+    // left to the minimum.
+    assert!(polish.lambda_sq_after <= TAU_STAT_2954, "{polish:?}");
     assert!(
-        published[0].abs() < 1.0e-3,
+        published[0].abs() <= (polish.lambda_sq_after / (2_000.0 * SCALE)).sqrt(),
         "published {:.3e}",
         published[0]
     );
 }
 
-/// A scripted criterion whose Newton step lowers it but lands where the
-/// decrement is larger: at `ρ = 1` the gradient and curvature are `c` (so
-/// `λ̂² = n·c`), and at `ρ = 0` the gradient doubles (`λ̂² = 4n·c`). The polish
-/// does not move along a Newton sequence that stopped contracting (#3012): it
-/// refuses by name.
+/// `V = n·(0.6 + s·φ(ρ))` with `φ(ρ) = ρ²/2 + w·ln cosh((ρ − m)/w)`: a convex
+/// criterion with its minimum at `ρ* = 1` and a curvature bump of height `1/w`
+/// at `m = 5`, where the polish is handed the point.
+const BUMP_3012: fn(f64) -> [f64; 3] = |rho| {
+    const S: f64 = 1.0e-2 / 2_000.0;
+    const W: f64 = 0.1;
+    const M: f64 = 5.0;
+    let z = (rho - M) / W;
+    let a = z.abs();
+    let ln_cosh = a + (-2.0 * a).exp().ln_1p() - std::f64::consts::LN_2;
+    let sech = 1.0 / z.cosh();
+    [
+        0.6 + S * (0.5 * rho * rho + W * ln_cosh),
+        S * (rho + z.tanh()),
+        S * (1.0 + sech * sech / W),
+    ]
+};
+
+/// From `ρ = 5`, on top of [`BUMP_3012`]'s curvature bump, the Newton step is
+/// short (`λ̂² ≈ 2.3e-2`) and lowers the criterion by `≈ 1.8e-2`, a resolvable
+/// decrease, but lands at `ρ ≈ 4.55` off the bump, where the decrement has grown
+/// to `λ̂² ≈ 0.125`. The criterion fell, so the walk is still descending: the
+/// polish keeps taking Newton steps (#3012), which reach `ρ* = 1` in two more,
+/// and certifies there on the decrement rung.
 #[test]
-fn a_decrement_that_stops_contracting_ends_the_polish_3012() {
-    const C: f64 = 1.0e-5;
-    let (outcome, _) = certify_scripted_2954(
-        2_000,
-        1.0,
-        (-20.0, 20.0),
-        None,
-        |rho| {
-            if rho > 0.5 {
-                [0.6 + C * rho, C, C]
-            } else {
-                [0.6 + C * rho, 2.0 * C, C]
-            }
-        },
-        None,
-    );
-    let message = outcome
-        .expect_err("a decrement that grew after the step must not certify")
-        .to_string();
+fn a_decrement_that_grows_after_a_resolvable_step_keeps_polishing_3012() {
+    let (outcome, published) =
+        certify_scripted_2954(2_000, 5.0, (-20.0, 20.0), None, BUMP_3012, None);
+    let certificate =
+        outcome.expect("a criterion that fell along the step is polished to its minimum");
+    assert_eq!(certificate.stationarity.rung().label, "newton-decrement");
+    let polish = certificate
+        .newton_polish
+        .expect("the certificate records the polish");
     assert!(
-        message.contains("Newton-decrement above tolerance after polish")
-            && message.contains("the Newton decrement stopped contracting"),
-        "{message}",
+        polish.decreases.len() >= 2,
+        "the polish must continue past the step after which λ̂² grew: {polish:?}",
+    );
+    assert!(polish.rails.is_empty(), "{polish:?}");
+    // Near `ρ*` the curvature is `n·s·(1 + sech²(40)/w) ≈ n·s = 1e-2`, so the
+    // certified decrement bounds the distance left to the minimum.
+    let reach = 2.0 * (polish.lambda_sq_after / 1.0e-2).sqrt() + 64.0 * f64::EPSILON;
+    assert!(
+        (published[0] - 1.0).abs() <= reach,
+        "published {:.9} against the minimum 1 within {reach:.3e}",
+        published[0],
     );
 }
 
 /// A criterion whose value does not fall along the Newton step its own gradient
 /// and Hessian describe, on a route whose bounds are both limit models: the
 /// backtrack halves the step down to where the quadratic model's own decrease
-/// reaches `band_f` and finds no resolved decrease, no limit face lowers the
+/// reaches the tolerance and finds no resolved decrease, no limit face lowers the
 /// criterion either, and the mint refuses by the typed
 /// `newton-backtrack-unresolved` rung (#3012), with the checkpoint where it was
 /// judged.
@@ -1561,4 +1722,107 @@ fn a_backtrack_without_a_resolved_decrease_is_a_typed_refusal_3012() {
         other => panic!("expected a typed outer refusal, got {other:?}"),
     }
     assert_eq!(published[0].to_bits(), theta.to_bits());
+}
+
+/// The decrement tolerance is the statistical resolution less the objective
+/// band while the arithmetic resolves more than half of it, and the band itself
+/// once it does not (C3): continuous at `band_f = τ_stat/2`, never above
+/// `τ_stat`, and, while the statistics limit it, leaving `tol + band_f = τ_stat`
+/// so a certified decrement plus the error in `V` stays inside one observation's
+/// worth of log-likelihood.
+#[test]
+fn the_decrement_tolerance_is_the_statistical_resolution_less_the_band_c3() {
+    use crate::rho_optimizer::decrement_bands::DecrementTolerance;
+    let tau_stat = 0.5 / 2_000.0;
+    let tolerance = |band_f: f64| DecrementTolerance { tau_stat, band_f };
+    assert_eq!(tolerance(0.0).value(), tau_stat);
+    assert!(!tolerance(0.0).arithmetic_limited());
+    for fraction in [0.0, 0.1, 0.25, 0.49] {
+        let band_f = fraction * tau_stat;
+        let tol = tolerance(band_f);
+        assert!(!tol.arithmetic_limited(), "{tol:?}");
+        assert!(
+            (tol.value() + band_f - tau_stat).abs() <= f64::EPSILON * tau_stat,
+            "{tol:?}"
+        );
+    }
+    for fraction in [0.51, 0.75, 1.0] {
+        let band_f = fraction * tau_stat;
+        let tol = tolerance(band_f);
+        assert!(tol.arithmetic_limited(), "{tol:?}");
+        assert_eq!(tol.value(), band_f, "{tol:?}");
+    }
+    let half = 0.5 * tau_stat;
+    assert_eq!(tolerance(half).value(), half);
+    let below = tolerance(half * (1.0 - f64::EPSILON)).value();
+    let above = tolerance(half * (1.0 + f64::EPSILON)).value();
+    assert!(
+        (below - half).abs() <= 2.0 * f64::EPSILON * half
+            && (above - half).abs() <= 2.0 * f64::EPSILON * half,
+        "continuous at τ_stat/2: {below:e}, {above:e}",
+    );
+    for fraction in [0.0, 0.3, 0.5, 0.8, 1.0] {
+        assert!(tolerance(fraction * tau_stat).value() <= tau_stat);
+    }
+}
+
+/// Rescaling `y` by `c` shifts a Gaussian criterion by the constant `n·log c`,
+/// and an additive constant changes no decision a likelihood supports. The
+/// verdict's tolerance is the statistical resolution `τ_stat = 1/(2n)`, not a
+/// fraction of `|V|`: at `n = 2000` and `n = 20000`, a decrement of `0.9·τ_stat`
+/// certifies and one of `1.1·τ_stat` does not, whether `V` is `10` or `1e6`.
+#[test]
+fn the_decrement_verdict_is_invariant_to_an_additive_cost_shift_c3() {
+    for n_obs in [2_000, 20_000] {
+        let config = OuterConfig {
+            tolerance: OUTER_TOL_2954,
+            problem_size: crate::rho_optimizer::OuterProblemSize {
+                n_obs: Some(n_obs),
+                p_coefficients: Some(COEFFICIENTS_2954),
+            },
+            ..OuterConfig::default()
+        };
+        let tau_stat = 0.5 / n_obs as f64;
+        let certified = |lambda_sq: f64, cost: f64| {
+            let gradient = array![lambda_sq.sqrt()];
+            crate::rho_optimizer::decrement_bands::outer_decrement_verdict(
+                &config,
+                &array![[1.0]],
+                &gradient,
+                &[],
+                cost,
+                &crate::estimate::outer_eval_capture::CertificateEvidence {
+                    parts: vec![crate::estimate::outer_eval_capture::RhoGradientParts {
+                        index: 0,
+                        lambda: 1.0,
+                        block_quadratic: 0.0,
+                        rank: 1,
+                        dim: 1,
+                        fixed_beta: gradient[0],
+                        logdet_h: 0.0,
+                        frozen_logdet_h: 0.0,
+                        mode_response_logdet_h: 0.0,
+                        logdet_s: 0.0,
+                        total: gradient[0],
+                    }],
+                    criterion: None,
+                    inner_factor: None,
+                    inner_residual: Some(EXACT_INNER_MODE_2954),
+                },
+            )
+            .expect("the parts cover the coordinate")
+            .verdict
+            .is_certified()
+        };
+        for cost in [10.0, 1.0e6] {
+            assert!(
+                certified(0.9 * tau_stat, cost),
+                "n={n_obs}, V={cost:e}: 0.9·τ_stat must certify",
+            );
+            assert!(
+                !certified(1.1 * tau_stat, cost),
+                "n={n_obs}, V={cost:e}: 1.1·τ_stat must not certify",
+            );
+        }
+    }
 }

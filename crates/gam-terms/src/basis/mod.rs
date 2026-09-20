@@ -71,6 +71,8 @@ pub mod radial_profile;
 
 // ---- Flat re-exports: preserve the external `basis::X` path surface ----
 
+pub use internal::generate_full_knot_vector;
+
 pub use constant_curvature_smooth::{
     ConstantCurvatureBasisSpec, ConstantCurvatureIdentifiability, ConstantCurvatureKernelPsiJets,
     ConstantCurvaturePsiJets, build_constant_curvature_basis,
@@ -159,3 +161,5 @@ mod zz_aniso_psi_rotation_2760_tests;
 mod zz_duchon_axis_psi_2735_tests;
 #[cfg(test)]
 mod zz_duchon_chart_psi_979_tests;
+#[cfg(test)]
+mod zz_exterior_boundary_slopes_tests;

@@ -286,7 +286,6 @@ fn gam_nuts_poisson_loglink_predicts_heldout_counts() {
     let train_values = agg_ds.values.select(Axis(0), &train_idx);
     let nuts_cfg = gam::hmc::NutsConfig {
         n_samples: 1000,
-        target_accept: 0.9,
         seed: 42,
     };
     let agg_col_map = agg_ds.column_map();

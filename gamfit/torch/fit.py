@@ -17,6 +17,7 @@ engine's analytic VJP.
 
 from __future__ import annotations
 
+import collections.abc
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
@@ -132,6 +133,32 @@ def _weighted_sum_to_zero_chart(
     constrained_design = design @ transform
     constrained_penalty = transform.mT @ penalty @ transform
     return constrained_design, constrained_penalty, transform
+
+
+def _per_smooth_points(
+    points: torch.Tensor | Sequence[torch.Tensor], n_smooths: int,
+) -> list[torch.Tensor]:
+    """Split ``points`` into one tensor per smooth.
+
+    One tensor is shared by every smooth; any other sequence holds exactly one
+    tensor per smooth. ``fit`` and the frozen forward both read ``points``
+    through this, so a sequence the one accepts the other accepts too.
+    """
+    if isinstance(points, torch.Tensor):
+        return [points] * n_smooths
+    if not isinstance(points, collections.abc.Sequence):
+        raise TypeError(
+            "points must be a torch.Tensor or a sequence of torch.Tensor, "
+            f"got {type(points).__name__}"
+        )
+    points_list = list(points)
+    validate_points_list_length(len(points_list), n_smooths)
+    bad = [type(p).__name__ for p in points_list if not isinstance(p, torch.Tensor)]
+    if bad:
+        raise TypeError(
+            f"every per-smooth points entry must be a torch.Tensor, got: {bad}"
+        )
+    return points_list
 
 
 def _coerce_2d(t: torch.Tensor, name: str) -> torch.Tensor:
@@ -516,13 +543,12 @@ def _build_design_penalty(
         return design.to(torch.float64), penalty
 
     if entry == "categorical" and isinstance(smooth, Categorical):
-        # Sum-to-zero coded categorical contrast = i.i.d. Gaussian random
-        # effect with an identity ridge penalty on the level contrasts. This
-        # mirrors the Rust `RandomEffectTermSpec` (one-hot dummy block with an
-        # identity penalty on group coefficients) and the `Pca` torch branch
-        # (linear projection design + identity ridge penalty). The level codes
-        # are structural (integer category labels), so the design carries no
-        # autograd path back to `points`.
+        # Sum-to-zero coded categorical contrast: an i.i.d. Gaussian random
+        # effect on the level effects, restricted to effects that sum to zero.
+        # The ridge prices the level effects, as the Rust `RandomEffectTermSpec`
+        # prices its one-hot group coefficients. The level codes are structural
+        # (integer category labels), so the design carries no autograd path
+        # back to `points`.
         if smooth.levels is None:
             raise ValueError("Categorical requires `levels` on the torch path")
         n_levels = int(smooth.n_levels)
@@ -552,9 +578,12 @@ def _build_design_penalty(
         )
         onehot[torch.arange(N, device=points.device), levels] = 1.0
         design = onehot[:, :contrast] - onehot[:, contrast:contrast + 1]
-        penalty = torch.eye(
-            contrast, dtype=torch.float64, device=points.device
-        )
+        # The design's level effects are e = C·c with C = [I; -1ᵀ], so the
+        # ridge on them is ‖e‖² = cᵀ(I + 11ᵀ)c. It treats every level alike: an
+        # identity ridge on c would give the last-coded level K - 1 times the
+        # prior variance of the others, and the fit would move with the coding.
+        identity = torch.eye(contrast, dtype=torch.float64, device=points.device)
+        penalty = identity + torch.ones_like(identity)
         return design, penalty
 
     raise NotImplementedError(
@@ -867,8 +896,9 @@ def fit(
 
     if isinstance(smooths, Smooth) and _shape is not None:
         if not isinstance(points, torch.Tensor):
-            raise ValueError(
-                "got a list of points but a single smooth; pass one points tensor."
+            raise TypeError(
+                "a single smooth takes one points torch.Tensor, "
+                f"got {type(points).__name__}"
             )
         if response.dim() == 1:
             response_in = response.unsqueeze(1)
@@ -905,8 +935,9 @@ def fit(
     # Branch: single smooth vs list of smooths
     if isinstance(smooths, Smooth):
         if not isinstance(points, torch.Tensor):
-            raise ValueError(
-                "got a list of points but a single smooth; pass one points tensor."
+            raise TypeError(
+                "a single smooth takes one points torch.Tensor, "
+                f"got {type(points).__name__}"
             )
         design, penalty = _build_design_penalty(smooths, points)
         by_t = _smooth_by_tensor(smooths, design)
@@ -926,13 +957,7 @@ def fit(
 
     smooths_list = validate_smooths_arg(smooths)
 
-    # Per-smooth points
-    if isinstance(points, (list, tuple)):
-        points_list = list(points)
-        validate_points_list_length(len(points_list), len(smooths_list))
-    else:
-        # Same points for every smooth.
-        points_list = [points] * len(smooths_list)
+    points_list = _per_smooth_points(points, len(smooths_list))
 
     # Mode dispatch — large-F additive fits route through `independent`;
     # small-F diagnostics route through `joint`. ``auto`` thresholding and

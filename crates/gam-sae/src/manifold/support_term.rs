@@ -151,17 +151,61 @@ impl SaeSupportNewtonDisplacement {
     pub fn max_abs(&self) -> f64 {
         self.decoder_max_abs.max(self.coordinate_max_abs)
     }
+}
 
-    /// The inner certificate: every parameter's remaining Newton displacement is
-    /// within `tolerance` of the iterate scale.
-    pub(crate) fn certifies(&self, parameter_scale: f64, tolerance: f64) -> bool {
-        parameter_scale.is_finite()
-            && parameter_scale >= 1.0
-            && tolerance.is_finite()
-            && tolerance > 0.0
-            && self.max_abs().is_finite()
-            && self.max_abs() <= tolerance * parameter_scale
+#[cfg(test)]
+mod test_support {
+    impl super::SaeSupportNewtonDisplacement {
+        /// Every parameter's remaining first-order Newton displacement is within
+        /// `tolerance` of the iterate scale. The inner certificate is Newton–Kantorovich's
+        /// (`SaeSupportSparseTerm::support_kantorovich_certificate`, #2576), which bounds the
+        /// displacement's Euclidean norm off the exact symmetry directions; this
+        /// per-parameter reading of it is what the tests of the displacement assert.
+        pub(crate) fn certifies(&self, parameter_scale: f64, tolerance: f64) -> bool {
+            parameter_scale.is_finite()
+                && parameter_scale >= 1.0
+                && tolerance.is_finite()
+                && tolerance > 0.0
+                && self.max_abs().is_finite()
+                && self.max_abs() <= tolerance * parameter_scale
+        }
     }
+}
+
+/// What the Newton–Kantorovich certificate decided at an installed support state
+/// ([`SaeSupportSparseTerm::support_kantorovich_certificate`], #2576).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SupportKantorovichVerdict {
+    /// A local minimum lies within `radius` (Euclidean, over the whole state) of the
+    /// iterate: a point with positive definite Hessian, unique in that ball, or, where
+    /// `symmetry_directions` exact symmetry directions were projected off, the orbit of
+    /// one, unique on the slice. `shift` is the certified `μ` with `A − μ·I ≻ 0` on the
+    /// slice, `lipschitz` the Hessian's Lipschitz bound and `eta` the bound on `‖A⁻¹g‖₂`.
+    Certified {
+        radius: f64,
+        shift: f64,
+        lipschitz: f64,
+        eta: f64,
+        symmetry_directions: usize,
+    },
+    /// A hypothesis was not established at this iterate; the reason names it.
+    NotCertified(String),
+}
+
+/// The exact Hessian's Lipschitz constant on a ball
+/// ([`SaeSupportSparseTerm::support_hessian_lipschitz_bound`], #2576), or why a basis ball
+/// bound it is built from does not exist there.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SupportHessianLipschitz {
+    Bounded(f64),
+    Unavailable(String),
+}
+
+/// Why one row's terms of the Lipschitz bound were not formed: a basis ball bound that
+/// does not exist on the ball, or a failed evaluation.
+enum LipschitzRowRefusal {
+    Unavailable(String),
+    Failed(String),
 }
 
 /// Typed refusal to mint a support-term stationarity certificate. Evaluation
@@ -250,9 +294,11 @@ pub struct SaeSupportFixedPointReport {
     /// The exact Newton displacement the state certified on (#2933 F08).
     pub newton_displacement: SaeSupportNewtonDisplacement,
     pub max_recurrence_change: f64,
-    /// True only after a second complete decoder/coordinate cycle recurs within
-    /// the same tolerance at the raw (undamped) stationarity point and the exact
-    /// Newton displacement there is within tolerance.
+    /// True only when the Newton–Kantorovich certificate places a local minimum (the orbit
+    /// of one, under an exact symmetry) within the tolerance (times the iterate scale) of
+    /// the returned state (#2576). It is priced after two consecutive cycles pass the
+    /// first-order and recurrence screens, or at a cycle that neither the sweeps nor the
+    /// coupled step move.
     pub recurred: bool,
 }
 
@@ -982,6 +1028,90 @@ pub(crate) fn certify_shifted_pd(
     }
     let mut scaled = a.to_owned();
     scaled.scaled_add(-tau, &b);
+    certify_formed_shifted_pd(scaled, tau)
+}
+
+/// [`certify_shifted_pd`] with `B = I`, on an owned `A` that is shifted in place, so
+/// no dense identity is formed (#2576: the Newton–Kantorovich certificate's
+/// `A − μ·I ≻ 0`).
+pub(crate) fn certify_shifted_identity_pd(
+    mut a: Array2<f64>,
+    tau: f64,
+) -> Result<CertifiedShiftedPd, ShiftedPdRefusal> {
+    let dim = a.nrows();
+    if a.dim() != (dim, dim) {
+        return Err(ShiftedPdRefusal::ShapeMismatch {
+            a: a.dim(),
+            b: (dim, dim),
+        });
+    }
+    if !tau.is_finite() {
+        return Err(ShiftedPdRefusal::NonFinite);
+    }
+    for index in 0..dim {
+        a[[index, index]] -= tau;
+    }
+    certify_formed_shifted_pd(a, tau)
+}
+
+/// An orthonormal basis, as columns, of the span of `vectors` in `ℝ^dim` (#2576: the
+/// exact symmetry directions the Newton–Kantorovich certificate projects off). Two
+/// passes of [`support_orthonormalize_columns`]: the first loses orthonormality in
+/// proportion to the Gram's conditioning, the second restores it to rounding.
+fn support_orthonormal_span(dim: usize, vectors: &[Array1<f64>]) -> Result<Array2<f64>, String> {
+    let mut columns = Array2::<f64>::zeros((dim, vectors.len()));
+    for (column, vector) in vectors.iter().enumerate() {
+        if vector.len() != dim {
+            return Err(format!(
+                "support symmetry span: vector {column} has length {}, expected {dim}",
+                vector.len()
+            ));
+        }
+        columns.column_mut(column).assign(vector);
+    }
+    support_orthonormalize_columns(support_orthonormalize_columns(columns)?)
+}
+
+/// `V·W·Λ^{-1/2}` from the Gram `VᵀV = WΛWᵀ`, keeping the eigenvalues the decomposition
+/// resolves from zero ([`gam_linalg::roundoff::resolved_eigenvalue_count`]; the Gram's
+/// formation band is `γ_dim·max‖vᵢ‖²` by Cauchy–Schwarz), so a dependent or vanishing
+/// column adds no direction.
+fn support_orthonormalize_columns(columns: Array2<f64>) -> Result<Array2<f64>, String> {
+    let (dim, count) = columns.dim();
+    if count == 0 {
+        return Ok(columns);
+    }
+    let gram = columns.t().dot(&columns);
+    let (values, vectors) = gram
+        .eigh(Side::Lower)
+        .map_err(|error| format!("support symmetry span Gram spectrum: {error}"))?;
+    let largest = gram.diag().iter().copied().fold(0.0_f64, f64::max);
+    let resolved = gam_linalg::roundoff::resolved_eigenvalue_count(
+        &values.to_vec(),
+        gam_linalg::roundoff::accumulation_growth(dim) * largest,
+    );
+    let mut out = Array2::<f64>::zeros((dim, resolved));
+    for (position, mode) in ((count - resolved)..count).enumerate() {
+        let combination = vectors.column(mode).mapv(|value| value / values[mode].sqrt());
+        out.column_mut(position).assign(&columns.dot(&combination));
+    }
+    Ok(out)
+}
+
+/// `x − V·(Vᵀx)`: `x` without its component in the span of `V`'s orthonormal columns.
+fn support_project_off(basis: &Array2<f64>, vector: ndarray::ArrayView1<'_, f64>) -> Array1<f64> {
+    if basis.ncols() == 0 {
+        return vector.to_owned();
+    }
+    &vector - &basis.dot(&basis.t().dot(&vector))
+}
+
+/// The factorization [`certify_shifted_pd`] documents, on an already formed `A − τ·B`.
+fn certify_formed_shifted_pd(
+    mut scaled: Array2<f64>,
+    tau: f64,
+) -> Result<CertifiedShiftedPd, ShiftedPdRefusal> {
+    let dim = scaled.nrows();
     if scaled.iter().any(|value| !value.is_finite()) {
         return Err(ShiftedPdRefusal::NonFinite);
     }
@@ -4291,21 +4421,23 @@ impl SaeSupportSparseTerm {
         Ok(solutions)
     }
 
-    /// Return `A^+ Gamma`, the one adjoint needed for the implicit derivative of
-    /// the Gauss--Newton arrow's log determinant
-    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|` (#2933 F27 S2). `Gamma` is the exact
-    /// derivative, with respect to the fitted inner state, of the row blocks' log
-    /// determinants and of the frozen rational surrogate of `log|S|`. The latter is
-    /// assembled from the surrogate's own low-rank derivative vectors. `A` is the
-    /// exact stationarity Jacobian of the penalized inner objective, not its
-    /// Gauss--Newton majorizer.
+    /// Return `(Gamma, A^+ Gamma)`: the inner-state derivative of the
+    /// Gauss--Newton arrow's log determinant
+    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|`, and the one adjoint needed for its
+    /// implicit derivative (#2933 F27 S2). `Gamma` is the exact derivative, with
+    /// respect to the fitted inner state, of the row blocks' log determinants and of
+    /// the frozen rational surrogate of `log|S|`. The latter is assembled from the
+    /// surrogate's own low-rank derivative vectors. `A` is the exact stationarity
+    /// Jacobian of the penalized inner objective, not its Gauss--Newton majorizer.
+    /// `Gamma` itself prices the log determinant's error at an inexact inner state
+    /// (#3340): it moves by `−⟨Gamma, Δ⟩` along the Newton displacement `Δ`.
     pub(crate) fn support_reduced_logdet_profile_adjoint(
         &self,
         target: ArrayView2<'_, f64>,
         ard_precisions: &[Vec<f64>],
         system: &ArrowSchurSystem,
         derivative: &RationalLogdetDerivativeBundle,
-    ) -> Result<SaeArrowVector, String> {
+    ) -> Result<(SaeArrowVector, SaeArrowVector), String> {
         let derivative_vectors = derivative.vectors.as_slice();
         if derivative_vectors.is_empty() {
             return Err(
@@ -4390,16 +4522,18 @@ impl SaeSupportSparseTerm {
                     .to_string(),
             );
         }
-        self.support_reduced_logdet_adjoint_solves(
-            system,
-            &rows,
-            std::slice::from_ref(&gamma),
-            derivative,
-        )?
-        .pop()
-        .ok_or_else(|| {
-            "support reduced-logdet profile adjoint solve returned no solution".to_string()
-        })
+        let adjoint = self
+            .support_reduced_logdet_adjoint_solves(
+                system,
+                &rows,
+                std::slice::from_ref(&gamma),
+                derivative,
+            )?
+            .pop()
+            .ok_or_else(|| {
+                "support reduced-logdet profile adjoint solve returned no solution".to_string()
+            })?;
+        Ok((gamma, adjoint))
     }
 
     /// Per-probe implicit responses of a surrogate `log|S|` derivative bundle
@@ -4804,6 +4938,166 @@ impl SaeSupportSparseTerm {
             Ok(band)
         } else {
             Err(format!("support gradient rounding band is not finite: {band:e}"))
+        }
+    }
+
+    /// A Lipschitz constant `L` of the exact Hessian `A` of the penalized objective on
+    /// the closed ball `B(θ, radius)` in the Euclidean norm of the whole state (#2576):
+    /// `‖A(x) − A(y)‖₂ ≤ L‖x − y‖₂` there, the constant the Newton–Kantorovich
+    /// certificate needs ([`Self::support_kantorovich_certificate`]).
+    ///
+    /// The smoothing quadratic has a constant Hessian and the admission charges are
+    /// constant, so `A` varies only through the data term `½Σᵢ‖rᵢ‖²` and the coordinate
+    /// priors, and by the mean value theorem `L` may be any bound on `‖D³F‖` over the
+    /// ball. Row `i` decodes `fᵢ = Σ_s B_sᵀφ_s(t_s)`, which is linear in the decoder, so
+    /// for directions `u, v, w`
+    /// `D³Fᵢ[u,v,w] = ⟨D²fᵢ[u,v], Dfᵢ[w]⟩ + ⟨D²fᵢ[u,w], Dfᵢ[v]⟩ + ⟨D²fᵢ[v,w], Dfᵢ[u]⟩
+    /// − ⟨rᵢ, D³fᵢ[u,v,w]⟩`, every `D²fᵢ` term carries at least one coordinate direction
+    /// and every `D³fᵢ` term at least two. For unit directions write `|uᵢ|` for the norm
+    /// of `u`'s coordinates on row `i`, so `Σᵢ|uᵢ|² ≤ 1`, and bound its decoder part by
+    /// one. Slot `s` decodes `Σ_b φ_{s,b}(t_s) B_{s,b}` over its atom's basis columns
+    /// `b` and decoder rows `B_{s,b}`. The basis ball bounds `σ_{k,b} ≥ sup‖∂^kφ_b‖`
+    /// ([`SaeBasisSecondJet::jet_ball_bound`]) bound a unit-weighted jet by
+    /// `U_k = (Σ_b σ_{k,b}²)^{1/2}` (Cauchy–Schwarz over the columns) and a
+    /// decoder-weighted one, for every decoder in the ball, by
+    /// `W_k = Σ_b σ_{k,b}‖B_{s,b}‖ + radius·U_k`. The row's slots are distinct atoms with
+    /// disjoint decoder blocks, so
+    /// `‖Dfᵢ[w]‖ ≤ N1tᵢ|wᵢ| + N1Bᵢ`, `‖D²fᵢ[u,v]‖ ≤ N2ttᵢ|uᵢ||vᵢ| + N2tBᵢ(|uᵢ| + |vᵢ|)` and
+    /// `‖D³fᵢ[u,v,w]‖ ≤ N3tttᵢ|uᵢ||vᵢ||wᵢ| + N3ttBᵢ(|uᵢ||vᵢ| + |uᵢ||wᵢ| + |vᵢ||wᵢ|)`, where
+    /// `N1t = (Σ_s W₁²)^{1/2}`, `N1B = (Σ_s U₀²)^{1/2}`, `N2tt = max_s W₂`,
+    /// `N2tB = max_s U₁`, `N3ttt = max_s W₃` and `N3ttB = max_s U₂`.
+    ///
+    /// Summed over rows, a term with at least two coordinate factors is at most its
+    /// largest row coefficient, since `Σᵢ|uᵢ||vᵢ| ≤ 1`. The one term with a single
+    /// coordinate factor, `N2tB·N1B`, is at most `(Σᵢ (N2tBᵢ N1Bᵢ)²)^{1/2}` per factor by
+    /// Cauchy–Schwarz. On the ball the residual is at most `‖rᵢ‖ + (N1tᵢ + N1Bᵢ)·radius`,
+    /// and the priors add `sup|V‴|`: zero on a Euclidean axis and `ακ` on a periodic one.
+    /// So `L = 3·(max N2tt N1t + max N2tt N1B + 2 max N2tB N1t + 2 (Σ (N2tB N1B)²)^{1/2})
+    /// + max ‖r‖N3ttt + 3 max ‖r‖N3ttB + max sup|V‴|`. Where a basis has no ball bound
+    /// (the ball reaches a kernel center whose jets are unbounded), this construction has
+    /// no constant to offer, and the bound is `Unavailable` with that reason.
+    fn support_hessian_lipschitz_bound(
+        &self,
+        target: ArrayView2<'_, f64>,
+        ard_precisions: &[Vec<f64>],
+        radius: f64,
+    ) -> Result<SupportHessianLipschitz, String> {
+        if !(radius.is_finite() && radius >= 0.0) {
+            return Err(format!(
+                "support Hessian Lipschitz bound: radius must be finite and nonnegative, \
+                 got {radius}"
+            ));
+        }
+        let residual = self.raw_residual(target)?;
+        let decoder_row_norms: Vec<Vec<f64>> = self
+            .atoms
+            .iter()
+            .map(|atom| {
+                atom.decoder_coefficients()
+                    .rows()
+                    .into_iter()
+                    .map(|row| row.dot(&row).sqrt())
+                    .collect()
+            })
+            .collect();
+        // Per row: the three maxima over two-or-more-coordinate terms, the residual
+        // terms, and the squared single-coordinate term.
+        let rows = (0..self.n_obs())
+            .into_par_iter()
+            .map(|row| -> Result<([f64; 3], [f64; 2], f64), LipschitzRowRefusal> {
+                let (mut n1t_sq, mut n1b_sq) = (0.0_f64, 0.0_f64);
+                let (mut n2tt, mut n2tb) = (0.0_f64, 0.0_f64);
+                let (mut n3ttt, mut n3ttb) = (0.0_f64, 0.0_f64);
+                for (slot, &atom) in self.assignment.support_indices(row).iter().enumerate() {
+                    let atom = atom as usize;
+                    let evaluator = self.atoms[atom].basis_second_jet.as_ref().ok_or_else(|| {
+                        LipschitzRowRefusal::Failed(format!(
+                            "support Hessian Lipschitz bound: atom {atom} ('{}') carries no \
+                             second-jet evaluator, so its jet ball bound is unavailable",
+                            self.atoms[atom].name
+                        ))
+                    })?;
+                    let center =
+                        ndarray::ArrayView1::from(self.assignment.coords_for_slot(row, slot));
+                    let bound = match evaluator
+                        .jet_ball_bound(center, radius)
+                        .map_err(LipschitzRowRefusal::Failed)?
+                    {
+                        crate::basis::SaeBasisJetBallCapability::Bounded(bound) => bound,
+                        crate::basis::SaeBasisJetBallCapability::Unavailable(reason) => {
+                            return Err(LipschitzRowRefusal::Unavailable(format!(
+                                "atom {atom} ('{}') on row {row}: {reason}",
+                                self.atoms[atom].name
+                            )));
+                        }
+                    };
+                    let row_norms = &decoder_row_norms[atom];
+                    if bound.columns.len() != row_norms.len() {
+                        return Err(LipschitzRowRefusal::Failed(format!(
+                            "support Hessian Lipschitz bound: atom {atom} ('{}') has a ball \
+                             bound over {} basis columns but {} decoder rows",
+                            self.atoms[atom].name,
+                            bound.columns.len(),
+                            row_norms.len()
+                        )));
+                    }
+                    n1t_sq += bound.decoder_weighted(1, row_norms, radius).powi(2);
+                    n1b_sq += bound.unit_weighted(0).powi(2);
+                    n2tt = n2tt.max(bound.decoder_weighted(2, row_norms, radius));
+                    n2tb = n2tb.max(bound.unit_weighted(1));
+                    n3ttt = n3ttt.max(bound.decoder_weighted(3, row_norms, radius));
+                    n3ttb = n3ttb.max(bound.unit_weighted(2));
+                }
+                let (n1t, n1b) = (n1t_sq.sqrt(), n1b_sq.sqrt());
+                let row_residual =
+                    residual.row(row).iter().map(|value| value * value).sum::<f64>().sqrt()
+                        + (n1t + n1b) * radius;
+                Ok((
+                    [n2tt * n1t, n2tt * n1b, n2tb * n1t],
+                    [row_residual * n3ttt, row_residual * n3ttb],
+                    (n2tb * n1b).powi(2),
+                ))
+            })
+            .try_reduce(
+                || ([0.0; 3], [0.0; 2], 0.0),
+                |left, right| {
+                    Ok((
+                        [
+                            left.0[0].max(right.0[0]),
+                            left.0[1].max(right.0[1]),
+                            left.0[2].max(right.0[2]),
+                        ],
+                        [left.1[0].max(right.1[0]), left.1[1].max(right.1[1])],
+                        left.2 + right.2,
+                    ))
+                },
+            );
+        let (three, residual_terms, single_sq) = match rows {
+            Ok(terms) => terms,
+            Err(LipschitzRowRefusal::Unavailable(reason)) => {
+                return Ok(SupportHessianLipschitz::Unavailable(reason));
+            }
+            Err(LipschitzRowRefusal::Failed(error)) => return Err(error),
+        };
+        let mut prior = 0.0_f64;
+        for atom in 0..self.k_atoms() {
+            if self.atom_rows[atom].is_empty() {
+                continue;
+            }
+            for (axis, period) in self.atom_ard_axis_periods(atom).iter().enumerate() {
+                if let Some(period) = period {
+                    prior = prior.max(ard_precisions[atom][axis] * std::f64::consts::TAU / period);
+                }
+            }
+        }
+        let bound = 3.0 * (three[0] + three[1] + 2.0 * three[2] + 2.0 * single_sq.sqrt())
+            + residual_terms[0]
+            + 3.0 * residual_terms[1]
+            + prior;
+        if bound.is_finite() {
+            Ok(SupportHessianLipschitz::Bounded(bound))
+        } else {
+            Err(format!("support Hessian Lipschitz bound is not finite: {bound:e}"))
         }
     }
 
@@ -7603,15 +7897,18 @@ impl SaeSupportSparseTerm {
         Ok(None)
     }
 
-    fn admitted_support_negative_curvature_mode(
-        &self,
-        target: ArrayView2<'_, f64>,
-        lambda_smooth: &[f64],
-        ard_precisions: &[Vec<f64>],
-    ) -> Result<Option<SupportNegativeCurvatureMode>, String> {
-        let (beta_offsets, beta_dim) = self.beta_layout()?;
-        let coordinate_dim = self.coordinate_state_len();
-        let full_dim = coordinate_dim
+    /// The dimension of the dense exact stationarity pencil, once its workspace is
+    /// admitted by the cgroup-aware in-core ledger (#2576). A certified fixed point is
+    /// stationary AND curvature-audited, so neither the audit nor the Newton–Kantorovich
+    /// certificate is ever skipped for the work a solve has or has not done; admitting
+    /// them by a cycle count let a solve that certified in fewer cycles than the pencil's
+    /// dimension certify a saddle. Their one admission is the resource they need. Where
+    /// the workspace does not fit, this lane has no matrix-free certificate, so the
+    /// stationary state is refused instead of certified.
+    fn admitted_dense_pencil_dim(&self) -> Result<usize, String> {
+        let (_, beta_dim) = self.beta_layout()?;
+        let full_dim = self
+            .coordinate_state_len()
             .checked_add(beta_dim)
             .ok_or_else(|| "support saddle classifier dimension overflow".to_string())?;
         let dense_workspace = (full_dim as u128)
@@ -7619,16 +7916,6 @@ impl SaeSupportSparseTerm {
             .saturating_mul(std::mem::size_of::<f64>() as u128)
             .saturating_mul(6);
         let in_core_budget = crate::manifold::sae_host_in_core_budget_bytes().0 as u128;
-        // #2576: a certified fixed point is stationary AND curvature-audited, so the audit
-        // is never skipped for the work a solve has or has not done; admitting it by a
-        // cycle count let a solve that certified in fewer cycles than the pencil's dimension
-        // certify a saddle. Its one admission is the resource it needs: the dense pencil
-        // runs wherever its workspace fits the cgroup-aware in-core ledger. Where it does
-        // not fit, this lane has no matrix-free curvature certificate, so the stationary
-        // state is refused as unaudited instead of certified.
-        if full_dim == 0 {
-            return Ok(None);
-        }
         if dense_workspace > in_core_budget {
             return Err(format!(
                 "SaeSupportSparseTerm::solve_fixed_point: curvature not audited: the exact \
@@ -7638,9 +7925,528 @@ impl SaeSupportSparseTerm {
                  state is refused instead of certified"
             ));
         }
+        Ok(full_dim)
+    }
+
+    fn admitted_support_negative_curvature_mode(
+        &self,
+        target: ArrayView2<'_, f64>,
+        lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
+    ) -> Result<Option<SupportNegativeCurvatureMode>, String> {
+        if self.admitted_dense_pencil_dim()? == 0 {
+            return Ok(None);
+        }
+        let (beta_offsets, _) = self.beta_layout()?;
         let system = self.assemble_arrow_schur(target, lambda_smooth, ard_precisions)?;
         let rows = self.support_outer_differential_rows(target, ard_precisions, &beta_offsets)?;
         self.support_outer_negative_curvature_mode(&system, &rows)
+    }
+
+    /// The exact continuous symmetries of the penalized support objective at the
+    /// installed state, as tangent vectors in the pencil layout (the compact coordinates,
+    /// then every decoder block in `beta_layout` order), #2576.
+    ///
+    /// A direction along which the objective is exactly invariant makes `A` singular at
+    /// every stationary point, so no `A − μ·I ≻ 0` exists there and the minimum is an
+    /// orbit, not a point. The Newton–Kantorovich certificate is then taken on a slice
+    /// transverse to those orbits ([`Self::support_kantorovich_certificate`]). The families
+    /// below are admitted only where their invariance holds exactly, by bitwise equalities
+    /// on the state; a symmetry they do not name leaves `A` singular, and the certificate
+    /// refuses there instead of certifying.
+    ///
+    /// A `Linear` atom of dimension `d ≥ 2` decodes `c₀ + uᵀC` through the basis
+    /// `[1, u₁, …, u_d]`. Rotating its rows' coordinates and its slope rows together,
+    /// `u ↦ Ru`, `C ↦ RC` with `R ∈ O(d)`, leaves every decode unchanged. The coordinate ARD
+    /// energy `½Σ α_a u_a²` is unchanged when every axis has the same `α`, and the smoothing
+    /// energy `½λ tr(BᵀSB)` when `S` has no constant–slope coupling and a scalar slope
+    /// block. Each generator `E_jk = e_k e_jᵀ − e_j e_kᵀ`, `j < k`, moves `u` by `E_jk u` on
+    /// every row of the atom and `C` by `E_jk C`. The basis is checked against `[1, u]` and
+    /// its unit Jacobian at the atom's own rows.
+    ///
+    /// Atoms routed to rows whose basis carries an unpenalized constant column (exactly `1`,
+    /// zero jet, a zero row and column of `S`) can trade constant among themselves: moving
+    /// `v_a` into every such atom leaves each decode unchanged when the routed atoms of
+    /// every row sum to zero, and neither the penalty nor the priors see it. Each null
+    /// vector of the integer co-selection Gram `CᵀC` (`C` the row-by-atom incidence), in
+    /// each output channel, is such a translation. The noisy-ring pair chart
+    /// (`pair_chart_fit_is_certified_reml_on_a_noisy_ring`, five periodic atoms routed two
+    /// to a row) has one, and `A` there has two eigenvalues of order `1e-15`, one per
+    /// channel.
+    ///
+    /// An atom no row selects enters the objective only through `½λ βᵀSβ`. Where the null
+    /// space of `S` lies on basis axes, those decoder coordinates are exactly zero rows of
+    /// the pencil, which the certificate drops; elsewhere `A` stays singular there and the
+    /// certificate refuses, as the exact Newton solve does.
+    fn support_exact_symmetry_generators(
+        &self,
+        ard_precisions: &[Vec<f64>],
+        beta_offsets: &[usize],
+        beta_dim: usize,
+    ) -> Result<Vec<Array1<f64>>, String> {
+        let t_len = self.coordinate_state_len();
+        let width = self.output_dim;
+        let full_dim = t_len + beta_dim;
+        let mut row_starts = Vec::with_capacity(self.n_obs());
+        let mut cursor = 0usize;
+        for row in 0..self.n_obs() {
+            row_starts.push(cursor);
+            cursor += self.assignment.coords_row(row).len();
+        }
+        if cursor != t_len {
+            return Err(format!(
+                "support symmetry generators: compact coordinates span {cursor}, expected {t_len}"
+            ));
+        }
+        let slot_start = |row: usize, slot: usize| -> usize {
+            row_starts[row]
+                + self.assignment.support_indices(row)[..slot]
+                    .iter()
+                    .map(|&atom| self.assignment.atom_coord_dim(atom as usize))
+                    .sum::<usize>()
+        };
+        let mut generators = Vec::new();
+        for atom in 0..self.k_atoms() {
+            let penalty = self.atoms[atom].smooth_penalty();
+            if self.atom_rows[atom].is_empty() {
+                continue;
+            }
+            let d = self.assignment.atom_coord_dim(atom);
+            if self.atoms[atom].basis_kind() != &SaeAtomBasisKind::Linear
+                || d < 2
+                || self.atoms[atom].basis_size() != d + 1
+                || penalty.dim() != (d + 1, d + 1)
+            {
+                continue;
+            }
+            let alpha = &ard_precisions[atom];
+            if alpha.len() != d
+                || alpha.iter().any(|value| value.to_bits() != alpha[0].to_bits())
+                || self.atom_ard_axis_periods(atom).iter().any(Option::is_some)
+            {
+                continue;
+            }
+            let slope_ridge = penalty[[1, 1]];
+            let rotation_invariant_penalty = (1..=d).all(|j| {
+                penalty[[0, j]] == 0.0
+                    && penalty[[j, 0]] == 0.0
+                    && (1..=d).all(|k| penalty[[j, k]] == if j == k { slope_ridge } else { 0.0 })
+            });
+            if !rotation_invariant_penalty {
+                continue;
+            }
+            let Some(evaluator) = self.atoms[atom].basis_second_jet.as_ref() else {
+                continue;
+            };
+            let rows = &self.atom_rows[atom];
+            let mut coords = Array2::<f64>::zeros((rows.len(), d));
+            for (index, &(row, slot)) in rows.iter().enumerate() {
+                coords
+                    .row_mut(index)
+                    .assign(&ndarray::ArrayView1::from(self.assignment.coords_for_slot(row, slot)));
+            }
+            let (phi, jet) = evaluator.evaluate(coords.view())?;
+            let affine = phi.dim() == (rows.len(), d + 1)
+                && jet.dim() == (rows.len(), d + 1, d)
+                && (0..rows.len()).all(|index| {
+                    phi[[index, 0]] == 1.0
+                        && (0..d).all(|axis| {
+                            jet[[index, 0, axis]] == 0.0
+                                && phi[[index, 1 + axis]] == coords[[index, axis]]
+                                && (0..d).all(|other| {
+                                    jet[[index, 1 + axis, other]]
+                                        == if axis == other { 1.0 } else { 0.0 }
+                                })
+                        })
+                });
+            if !affine {
+                continue;
+            }
+            let decoder = self.atoms[atom].decoder_coefficients();
+            for j in 0..d {
+                for k in (j + 1)..d {
+                    let mut generator = Array1::<f64>::zeros(full_dim);
+                    for &(row, slot) in rows {
+                        let start = slot_start(row, slot);
+                        let u = self.assignment.coords_for_slot(row, slot);
+                        generator[start + j] = -u[k];
+                        generator[start + k] = u[j];
+                    }
+                    for channel in 0..width {
+                        generator[t_len + beta_offsets[atom] + (1 + j) * width + channel] =
+                            -decoder[[1 + k, channel]];
+                        generator[t_len + beta_offsets[atom] + (1 + k) * width + channel] =
+                            decoder[[1 + j, channel]];
+                    }
+                    generators.push(generator);
+                }
+            }
+        }
+        // Constant redistribution. An atom whose basis has a column that is exactly `1`
+        // with zero jet at its rows, and whose penalty leaves that column unpenalized,
+        // contributes its constant `c_a` to every row it is routed to. Moving `v_a` of
+        // constant between such atoms leaves every decode unchanged exactly when every
+        // row's routed members sum to zero, `Cv = 0` for the row-by-member incidence `C`,
+        // and the penalty and priors do not see it: an exact translation symmetry, one per
+        // null vector of the integer co-selection Gram `CᵀC` and output channel.
+        let mut members: Vec<(usize, usize)> = Vec::new();
+        for atom in 0..self.k_atoms() {
+            let rows = &self.atom_rows[atom];
+            let Some(evaluator) = self.atoms[atom].basis_evaluator.as_ref() else {
+                continue;
+            };
+            if rows.is_empty() {
+                continue;
+            }
+            let d = self.assignment.atom_coord_dim(atom);
+            let mut coords = Array2::<f64>::zeros((rows.len(), d));
+            for (index, &(row, slot)) in rows.iter().enumerate() {
+                coords
+                    .row_mut(index)
+                    .assign(&ndarray::ArrayView1::from(self.assignment.coords_for_slot(row, slot)));
+            }
+            let (phi, jet) = evaluator.evaluate(coords.view())?;
+            let penalty = self.atoms[atom].smooth_penalty();
+            let constant = (0..phi.ncols()).find(|&column| {
+                column < penalty.nrows()
+                    && phi.column(column).iter().all(|value| *value == 1.0)
+                    && jet.slice(ndarray::s![.., column, ..]).iter().all(|value| *value == 0.0)
+                    && penalty.row(column).iter().all(|value| *value == 0.0)
+                    && penalty.column(column).iter().all(|value| *value == 0.0)
+            });
+            if let Some(column) = constant {
+                members.push((atom, column));
+            }
+        }
+        if !members.is_empty() {
+            let position: std::collections::HashMap<usize, usize> = members
+                .iter()
+                .enumerate()
+                .map(|(index, &(atom, _))| (atom, index))
+                .collect();
+            let mut coselection = Array2::<f64>::zeros((members.len(), members.len()));
+            for row in 0..self.n_obs() {
+                let routed: Vec<usize> = self
+                    .assignment
+                    .support_indices(row)
+                    .iter()
+                    .filter_map(|&atom| position.get(&(atom as usize)).copied())
+                    .collect();
+                for &first in &routed {
+                    for &second in &routed {
+                        coselection[[first, second]] += 1.0;
+                    }
+                }
+            }
+            let (values, vectors) = coselection.eigh(Side::Lower).map_err(|error| {
+                format!("support symmetry generators: co-selection spectrum: {error}")
+            })?;
+            let band = gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values.to_vec());
+            for (mode, &value) in values.iter().enumerate() {
+                if value > band {
+                    continue;
+                }
+                for channel in 0..width {
+                    let mut generator = Array1::<f64>::zeros(full_dim);
+                    for (index, &(atom, column)) in members.iter().enumerate() {
+                        generator[t_len + beta_offsets[atom] + column * width + channel] =
+                            vectors[[index, mode]];
+                    }
+                    generators.push(generator);
+                }
+            }
+        }
+        Ok(generators)
+    }
+
+    /// The inner certificate (#2576, #2933 F08): the Newton–Kantorovich theorem, with
+    /// each hypothesis established at the installed state `θ`, on a slice transverse to
+    /// the objective's exact symmetry orbits.
+    ///
+    /// Kantorovich (Ortega–Rheinboldt 12.6.2): let `‖A(x) − A(y)‖₂ ≤ L‖x − y‖₂` on
+    /// `B(θ, r)`, `‖A(θ)⁻¹‖₂ ≤ β`, `‖A(θ)⁻¹g(θ)‖₂ ≤ η` and `h = βLη ≤ ½`. Then `g` has a
+    /// zero `θ*` with `‖θ − θ*‖₂ ≤ t* = (1 − √(1 − 2h))/(βL)` whenever `t* ≤ r`, unique in
+    /// that ball. With `A(θ) ⪰ μ·I`, every `x` in `B(θ, t*)` has
+    /// `A(x) ⪰ (μ − L·t*)·I ⪰ 0` because `t* ≤ 1/(βL) ≤ μ/L`, so the objective is convex
+    /// on that ball and `θ*` minimizes it there. Every parameter is then within `t*` of
+    /// the minimum, so the certificate asks `t* ≤ bound`, the iterate scale times the
+    /// tolerance.
+    ///
+    /// Where the objective is exactly invariant along the flows of the generators
+    /// [`Self::support_exact_symmetry_generators`] returns, `A` is singular at every
+    /// stationary point and the minimum is an orbit. The theorem is then applied to the
+    /// objective restricted to the slice `θ + N⊥`, `N` the generators' span and `P` its
+    /// orthogonal projector: Hessian `(I − P)A(I − P)`, gradient `(I − P)g`, and `L` still
+    /// bounds its Hessian's variation because the projection has norm one. It gives the
+    /// slice's unique minimum `θ*` within `t*`. There `(I − P)g(θ*) = 0`, and invariance
+    /// makes `g(θ*)` orthogonal to the generators at `θ*`, which span a complement of
+    /// `N⊥` that close to `θ`, so `g(θ*) = 0`. Every nearby state lies on the orbit of a
+    /// slice state and the objective is constant on orbits (the slice theorem), so the
+    /// orbit of `θ*` is a local minimum and every parameter is within `t*` of it.
+    /// `(I − P)A(I − P) ≻ μ` on `N⊥` is certified as `(I − P)A(I − P) + σ·P − μ·I ≻ 0` with
+    /// `σ` above `μ`, whose eigenvalues on `N` are `σ − μ > 0`. Without generators `P = 0`
+    /// and this is the theorem as stated.
+    ///
+    /// The hypotheses, at `θ`, over the pencil's non-null coordinates (a coordinate whose
+    /// rows of both `A` and the majorizer are exactly zero is one the objective does not
+    /// depend on, so its gradient and step must be exactly zero too):
+    /// - `L` on `B(θ, bound)` ([`Self::support_hessian_lipschitz_bound`]).
+    /// - `η`: the computed step `Δ` solves `AΔ = g − ρ`, and the computed `g` is within
+    ///   its rounding band `ε_g` of the exact gradient
+    ///   ([`Self::gradient_rounding_band`]), so `η ≤ ‖Δ‖ + β·e` with
+    ///   `e = ‖ρ‖ + γ_{n+1}·‖|A||Δ| + |g|‖ + ε_g`, where the middle term bounds the
+    ///   rounding of forming `ρ = g − AΔ` densely; on the slice every one of these is
+    ///   projected, and the projected gradient is within `ε_g` too.
+    /// - `β ≤ 1/μ` from a certified `A − μ·I ≻ 0` ([`certify_shifted_identity_pd`]).
+    ///
+    /// Take `β = 1/μ`, so `u = βL = L/μ` and `η = ‖Δ‖ + e/μ`, both falling as `μ` grows;
+    /// the smallest `μ` meeting both conditions is the one to certify. `h ≤ ½` is
+    /// `μ² ≥ 2L(‖Δ‖μ + e)`, i.e. `μ ≥ μ₀ = L‖Δ‖ + √(L²‖Δ‖² + 2Le)`, where `t* = 1/u =
+    /// μ₀/L`. So `μ* = μ₀` when `μ₀ ≤ L·bound`. Otherwise `u·bound < 1`, and there
+    /// `t* ≤ bound` holds exactly when `u ≤ 2(bound − η)/bound²`. That gives
+    /// `μ* = μ₁ = (L·bound² + 2e)/(2(bound − ‖Δ‖))`, which is at least `μ₀` because
+    /// `bound² ≥ 4η(bound − η)`. Without curvature variation (`L = 0`), `μ* = e/(bound −
+    /// ‖Δ‖)` makes `η ≤ bound`. Every case needs `‖Δ‖ < bound`, which is read first, before
+    /// any dense work. `μ*` is computed against `bound·(1 − γ₁₆)` and raised by `γ₈`, the
+    /// rounding of its own formula, so it is at least the exact threshold and the radius
+    /// computed from it is at most `bound`. A single dense Cholesky then decides the
+    /// certificate.
+    /// It also certifies that `A` has no negative curvature off the orbits. A failed
+    /// factorization is a refusal to certify, not a claim that `A` is indefinite: the
+    /// caller audits the curvature and steps. The assembled `A` and the computed
+    /// projector are taken as the Hessian and the orthogonal projector, as the curvature
+    /// audit and the Newton solve take `A`.
+    fn support_kantorovich_certificate(
+        &self,
+        target: ArrayView2<'_, f64>,
+        lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
+        displacement: &SaeSupportNewtonDisplacement,
+        bound: f64,
+    ) -> Result<SupportKantorovichVerdict, String> {
+        let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let generators =
+            self.support_exact_symmetry_generators(ard_precisions, &beta_offsets, beta_dim)?;
+        self.support_kantorovich_certificate_on_slice(
+            target,
+            lambda_smooth,
+            ard_precisions,
+            displacement,
+            bound,
+            &generators,
+        )
+    }
+
+    /// [`Self::support_kantorovich_certificate`] on the slice transverse to `generators`,
+    /// the exact symmetry directions it projects off (#2576). A symmetry of the objective
+    /// missing from `generators` leaves `A` singular on that slice, so no
+    /// `A − μ·I ≻ 0` is certified there and the verdict is a refusal: a symmetry this
+    /// certificate is not given is never certified over.
+    fn support_kantorovich_certificate_on_slice(
+        &self,
+        target: ArrayView2<'_, f64>,
+        lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
+        displacement: &SaeSupportNewtonDisplacement,
+        bound: f64,
+        generators: &[Array1<f64>],
+    ) -> Result<SupportKantorovichVerdict, String> {
+        if !(bound.is_finite() && bound > 0.0) {
+            return Err(format!(
+                "support Newton-Kantorovich certificate: the bound must be finite and positive, \
+                 got {bound}"
+            ));
+        }
+        let full_dim = self.admitted_dense_pencil_dim()?;
+        let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let t_len = self.coordinate_state_len();
+        if t_len + beta_dim != full_dim
+            || displacement.coordinates.len() != t_len
+            || displacement.decoder.len() != beta_dim
+        {
+            return Err(format!(
+                "support Newton-Kantorovich certificate: displacement ({}, {}) does not match \
+                 the pencil ({t_len}, {beta_dim})",
+                displacement.coordinates.len(),
+                displacement.decoder.len(),
+            ));
+        }
+        let mut step = Array1::<f64>::zeros(full_dim);
+        step.slice_mut(ndarray::s![..t_len]).assign(&displacement.coordinates);
+        step.slice_mut(ndarray::s![t_len..]).assign(&displacement.decoder);
+        // `‖Δ‖ < bound` on the slice, read before any dense work. No generator carries
+        // weight on a coordinate the pencil drops, so this is the norm checked below.
+        let screen = support_orthonormal_span(full_dim, generators)?;
+        let screened = support_project_off(&screen, step.view());
+        let projected_norm = screened.dot(&screened).sqrt();
+        // Each shift formula below rounds at most eight times and the radius formula as
+        // often, so the shift is raised by `γ₈` over its computed value, which then bounds
+        // the exact threshold, and aimed at `bound·(1 − γ₁₆)`, so the radius computed from it
+        // stays at or below `bound`.
+        let formula_rounding = gam_linalg::roundoff::accumulation_growth(8);
+        let aim = bound * (1.0 - gam_linalg::roundoff::accumulation_growth(16));
+        if !(projected_norm < aim) {
+            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "Newton displacement off {} exact symmetry directions ‖Δ‖₂ = \
+                 {projected_norm:.6e} is not below the bound {bound:.6e}",
+                screen.ncols()
+            )));
+        }
+        let system = self.assemble_arrow_schur(target, lambda_smooth, ard_precisions)?;
+        if *system.row_offsets.last().unwrap_or(&0) != t_len {
+            return Err(format!(
+                "support Newton-Kantorovich certificate: the arrow system's coordinates span {}, \
+                 the state's {t_len}",
+                system.row_offsets.last().unwrap_or(&0)
+            ));
+        }
+        let mut gradient = Array1::<f64>::zeros(full_dim);
+        for (row, block) in system.rows.iter().enumerate() {
+            gradient
+                .slice_mut(ndarray::s![system.row_offsets[row]..system.row_offsets[row + 1]])
+                .assign(&block.gt);
+        }
+        gradient.slice_mut(ndarray::s![t_len..]).assign(&system.gb);
+        let rows = self.support_outer_differential_rows(target, ard_precisions, &beta_offsets)?;
+        let (exact, majorizer) =
+            self.support_outer_dense_hessian_matrices(&system, &rows, t_len, beta_dim)?;
+        let kept: Vec<usize> = (0..full_dim)
+            .filter(|&index| {
+                !(exact.row(index).iter().all(|value| *value == 0.0)
+                    && majorizer.row(index).iter().all(|value| *value == 0.0))
+            })
+            .collect();
+        drop(majorizer);
+        if let Some(index) = (0..full_dim)
+            .filter(|index| kept.binary_search(index).is_err())
+            .find(|&index| gradient[index] != 0.0 || step[index] != 0.0)
+        {
+            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "coordinate {index} has exactly zero curvature rows but gradient {:.3e} and step \
+                 {:.3e}",
+                gradient[index], step[index]
+            )));
+        }
+        let (mut exact, gradient, step, generators) = if kept.len() == full_dim {
+            (exact, gradient, step, generators.to_vec())
+        } else {
+            (
+                exact.select(ndarray::Axis(0), &kept).select(ndarray::Axis(1), &kept),
+                gradient.select(ndarray::Axis(0), &kept),
+                step.select(ndarray::Axis(0), &kept),
+                generators
+                    .iter()
+                    .map(|generator| generator.select(ndarray::Axis(0), &kept))
+                    .collect(),
+            )
+        };
+        let symmetry = support_orthonormal_span(kept.len(), &generators)?;
+        let gradient = support_project_off(&symmetry, gradient.view());
+        let step = support_project_off(&symmetry, step.view());
+        if symmetry.ncols() > 0 {
+            // `(I − P)A(I − P) = A − V·W − Wᵀ·Vᵀ + V·(W·V)·Vᵀ` with `W = VᵀA`, formed in place.
+            let projected_rows = symmetry.t().dot(&exact);
+            let corner = projected_rows.dot(&symmetry);
+            ndarray::linalg::general_mat_mul(-1.0, &symmetry, &projected_rows, 1.0, &mut exact);
+            ndarray::linalg::general_mat_mul(
+                -1.0,
+                &projected_rows.t(),
+                &symmetry.t(),
+                1.0,
+                &mut exact,
+            );
+            let lifted = symmetry.dot(&corner);
+            ndarray::linalg::general_mat_mul(1.0, &lifted, &symmetry.t(), 1.0, &mut exact);
+        }
+        let applied = exact.dot(&step);
+        let magnitude = exact.mapv(f64::abs).dot(&step.mapv(f64::abs)) + gradient.mapv(f64::abs);
+        let residual = &gradient - &applied;
+        let gradient_band = self.gradient_rounding_band(target, lambda_smooth, ard_precisions)?;
+        let error = residual.dot(&residual).sqrt()
+            + gam_linalg::roundoff::accumulation_growth(kept.len() + 1)
+                * magnitude.dot(&magnitude).sqrt()
+            + gradient_band;
+        let step_norm = step.dot(&step).sqrt();
+        if !(error.is_finite() && step_norm.is_finite()) {
+            return Err(format!(
+                "support Newton-Kantorovich certificate: non-finite step {step_norm:e} or solve \
+                 error {error:e}"
+            ));
+        }
+        if !(step_norm < aim) {
+            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "Newton displacement off {} exact symmetry directions ‖Δ‖₂ = {step_norm:.6e} is \
+                 not below the bound {bound:.6e}",
+                symmetry.ncols()
+            )));
+        }
+        let lipschitz = match self.support_hessian_lipschitz_bound(target, ard_precisions, bound)?
+        {
+            SupportHessianLipschitz::Bounded(lipschitz) => lipschitz,
+            SupportHessianLipschitz::Unavailable(reason) => {
+                return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                    "the exact Hessian has no Lipschitz bound on the ball of radius {bound:.6e}: \
+                     {reason}"
+                )));
+            }
+        };
+        let computed_shift = if lipschitz > 0.0 {
+            let half_curvature = lipschitz * step_norm
+                + (lipschitz * lipschitz * step_norm * step_norm + 2.0 * lipschitz * error).sqrt();
+            if half_curvature <= lipschitz * aim {
+                half_curvature
+            } else {
+                (lipschitz * aim * aim + 2.0 * error) / (2.0 * (aim - step_norm))
+            }
+        } else {
+            error / (aim - step_norm)
+        };
+        let shift = computed_shift * (1.0 + formula_rounding);
+        if symmetry.ncols() > 0 {
+            // Any stiffness above `μ` on `N` leaves `A − μ·I ≻ 0` on the slice as the question;
+            // `μ` plus the largest diagonal entry keeps the factored matrix at `A`'s own scale.
+            let orbit_stiffness =
+                shift + exact.diag().iter().copied().fold(0.0_f64, f64::max);
+            ndarray::linalg::general_mat_mul(
+                orbit_stiffness,
+                &symmetry,
+                &symmetry.t(),
+                1.0,
+                &mut exact,
+            );
+        }
+        match certify_shifted_identity_pd(exact, shift) {
+            Ok(_) => {
+                // With no solve or rounding error at all (an exactly zero gradient and step)
+                // the shift is zero, `A ≻ 0` was certified outright, and `η = ‖Δ‖`.
+                let eta = if error > 0.0 { step_norm + error / shift } else { step_norm };
+                // `(1 − √(1 − 2h))/u`, rationalized so a small `h` does not cancel.
+                let radius = if lipschitz > 0.0 && eta > 0.0 {
+                    let h = lipschitz / shift * eta;
+                    2.0 * eta / (1.0 + (1.0 - 2.0 * h).max(0.0).sqrt())
+                } else {
+                    eta
+                };
+                if !(radius <= bound) {
+                    return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                        "the certified radius {radius:.17e} exceeds the bound {bound:.17e}"
+                    )));
+                }
+                Ok(SupportKantorovichVerdict::Certified {
+                    radius,
+                    shift,
+                    lipschitz,
+                    eta,
+                    symmetry_directions: symmetry.ncols(),
+                })
+            }
+            Err(refusal) => Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "A − μ·I ≻ 0 not certified at μ = {shift:.6e} off {} exact symmetry directions \
+                 (L = {lipschitz:.6e}, ‖Δ‖₂ = {step_norm:.6e}, solve and rounding error \
+                 {error:.6e}, bound {bound:.6e}): {refusal:?}",
+                symmetry.ncols()
+            ))),
+        }
     }
 
     /// Every row's discrete support, flattened with its length, so a carried
@@ -8137,10 +8943,13 @@ impl SaeSupportSparseTerm {
         // took.
         //
         // Inside the coupled phase such a cycle forces the coupled step, whatever its skip
-        // schedule says. If that step is refused too, the state is a proven stall: neither
-        // block sweep nor the coupled step moves it measurably, so the next cycle would
-        // start from the same state and take the same decisions. The solve refuses there
-        // instead of spending cycles on it.
+        // schedule says. If that step is refused too, the certificate is priced at that
+        // state. The rule measured no progress, but that is not a fixed point of the cycle:
+        // the objective can tie inside its band and the KKT norm can rise while the state
+        // still moves toward the minimum, since block Gauss–Seidel lowers the objective and
+        // not the gradient norm. Only the certificate's own refusals end the solve there:
+        // a saddle no exact mode escapes, a Newton displacement that did not contract, or
+        // a Newton step that neither descends nor avoids a resolved increase.
         let mut joint_armed = false;
         let mut joint_skip_width = 1usize;
         let mut joint_accepted = 0usize;
@@ -8283,6 +9092,9 @@ impl SaeSupportSparseTerm {
             }
             // Whether this cycle ends in the state `kkt_norm` and `gradient_band` describe.
             let mut end_state_held = true;
+            // Why this cycle made no measured progress, when neither the sweeps nor the
+            // coupled step moved it: the certificate is then priced at this state.
+            let mut stall: Option<String> = None;
             if joint_armed && joint_skip_remaining > 0 && !stalled {
                 joint_skip_remaining -= 1;
             } else if joint_armed && !screened {
@@ -8333,12 +9145,18 @@ impl SaeSupportSparseTerm {
                             .map_err(SaeSupportStationarityError::ParameterScale)?;
                     }
                     None if stalled => {
-                        // A proven stall (see PHASE): refuse at the state reached.
+                        // #2576: neither the block sweeps nor the coupled step moved the
+                        // state measurably. That does not prove that no later cycle
+                        // reaches the certificate. Block Gauss–Seidel makes the objective
+                        // monotone but not the KKT norm, and the 3000x48 harness state
+                        // this used to refuse (job 1264475, cycle 1654) had moved
+                        // 1.05e-6 = 1.8·τP in its last cycle while its parameter-scaled
+                        // KKT still fell. So the certificate itself is priced below, and
+                        // only its own refusals end the solve.
                         let last_newton =
                             last_newton_displacement.as_ref().map(|(value, _)| *value);
-                        return Err(format!(
-                            "SaeSupportSparseTerm::solve_fixed_point stalled at cycle {iteration}: \
-                             neither the block sweeps nor the coupled step moved the state \
+                        stall = Some(format!(
+                            "neither the block sweeps nor the coupled step moved the state \
                              measurably (objective {objective:.9e} tied within its rounding band \
                              {:.3e}; raw KKT norm {kkt_norm:.6e} against {:?} at the last cycle, \
                              gradient rounding bands {:?} and {gradient_band:?}; raw KKT \
@@ -8439,277 +9257,301 @@ impl SaeSupportSparseTerm {
                     && max_change <= tolerance * parameter_scale;
             }
             last_objective = Some(objective);
-            if candidate && previous_candidate {
-                // The alternating sweeps hold the SUPPORT fixed, so a point that
-                // is stationary in the coordinates and the decoders can still be
-                // improved by re-routing rows onto atoms that now explain them
-                // better -- a TopK SAE re-selects its latents on every forward
-                // pass, and this loop never did. Proposing the move HERE, at the
-                // inner fixed point, is the dictionary-learning alternation the
-                // scheme was missing, and it needs no cadence constant because
-                // convergence is itself the trigger.
-                //
-                // The move is guarded on the certificate's own objective. A
-                // re-route changes the objective discontinuously, so accepting
-                // it unconditionally would destroy the monotonicity the
-                // certificate rests on; accepting only a strict decrease keeps
-                // the scheme monotone and makes the returned point locally
-                // optimal against a support move as well as stationary within
-                // one, which is strictly stronger than certifying a frozen
-                // support.
-                //
-                // SCOPE: "locally optimal against a support move" means against
-                // the proposal THIS router generates at its own fixed point --
-                // residual-greedy selection at basis resolution, then polished.
-                // It is not optimality over the space of supports, which is
-                // combinatorial and is not claimed here.
-                let support_k = match self.assignment.mode() {
-                    AssignmentMode::TopK { k } => k,
-                    _ => 0,
-                };
-                if support_k > 0 {
-                    let mut moved =
-                        self.reroute_fixed_decoder_ard(target, support_k, 0, ard_precisions)?;
-                    // The re-routed term is freshly constructed, which resets
-                    // typed solver knobs to their defaults -- carrying the
-                    // decoder strategy across is what keeps an accepted move
-                    // from silently reverting the solve to the colour sweep.
-                    moved.set_decoder_fista_passes(self.decoder_fista_passes);
-                    // The proposal arrives on the routing grid -- one of
-                    // `basis_size` samples per atom -- while the incumbent sits
-                    // at a converged continuous fixed point. Comparing them
-                    // directly charges the proposal a quantization tax on every
-                    // one of `n * support_k` slots and rejects good support
-                    // moves for a reason that has nothing to do with the
-                    // support. Solving the proposal's coordinates at frozen
-                    // decoders is a strict decrease of its own objective, so
-                    // this test accepts everything the unpolished one accepted
-                    // and additionally the moves quantization was vetoing.
-                    // A proposal that cannot be polished is a REJECTED proposal,
-                    // never a dead fit.
+            let screened_twice = candidate && previous_candidate;
+            if screened_twice || stall.is_some() {
+                if screened_twice {
+                    // The alternating sweeps hold the SUPPORT fixed, so a point that
+                    // is stationary in the coordinates and the decoders can still be
+                    // improved by re-routing rows onto atoms that now explain them
+                    // better -- a TopK SAE re-selects its latents on every forward
+                    // pass, and this loop never did. Proposing the move HERE, at the
+                    // inner fixed point, is the dictionary-learning alternation the
+                    // scheme was missing, and it needs no cadence constant because
+                    // convergence is itself the trigger.
                     //
-                    // This branch runs INSIDE `candidate && previous_candidate`:
-                    // the certificate has already been met, and the code
-                    // immediately below it returns that certificate. So a bare
-                    // `?` on the polish threw away a stationary,
-                    // certificate-meeting incumbent because a speculative move
-                    // nobody asked for would not converge — and it reported the
-                    // PROPOSAL's non-convergence as the whole fit's error, from a
-                    // function whose caller has no way to know a proposal was
-                    // ever made.
+                    // The move is guarded on the certificate's own objective. A
+                    // re-route changes the objective discontinuously, so accepting
+                    // it unconditionally would destroy the monotonicity the
+                    // certificate rests on; accepting only a strict decrease keeps
+                    // the scheme monotone and makes the returned point locally
+                    // optimal against a support move as well as stationary within
+                    // one, which is strictly stronger than certifying a frozen
+                    // support.
                     //
-                    // The plateau branch below already refuses to make that
-                    // trade, for this reason, in these words. This one did not.
-                    // Measured on `examples/issue_2575_joint_rate`: the
-                    // `n=120 P=8 K=12 s=2` arm reaches certified 5.793e-7 against
-                    // a 1e-6 tolerance and is nonetheless reported as stalled,
-                    // carrying `solve_coordinates_fixed_decoder did not recur
-                    // within 256 cycles` as its refusal (#2575).
-                    if self.has_same_support_as(&moved) {
-                        log::debug!(
-                            "support move at cycle {iteration} retained every discrete support; \
-                             treating it as the no-op it is"
-                        );
-                    } else {
-                        // #2576: the polish only has to descend. Adoption needs a measured
-                        // decrease on the actual objective and resets the recurrence, so a
-                        // polish that descended without recurring is still a valid
-                        // comparison; only an objective that cannot be evaluated rejects
-                        // the move. At the derived tolerance, job 604148 (3cf917ddf, 3000x48
-                        // chart) logged 20 proposals as unpolishable; its plateau proposals'
-                        // polishes did not recur within 200 cycles, at relative coordinate
-                        // KKT ~1e-6.
-                        let polish = moved.solve_coordinates_fixed_decoder(
-                            target,
-                            ard_precisions,
-                            tolerance,
-                            trust_radius,
-                        );
-                        if let Err(error) = &polish {
+                    // SCOPE: "locally optimal against a support move" means against
+                    // the proposal THIS router generates at its own fixed point --
+                    // residual-greedy selection at basis resolution, then polished.
+                    // It is not optimality over the space of supports, which is
+                    // combinatorial and is not claimed here.
+                    let support_k = match self.assignment.mode() {
+                        AssignmentMode::TopK { k } => k,
+                        _ => 0,
+                    };
+                    if support_k > 0 {
+                        let mut moved =
+                            self.reroute_fixed_decoder_ard(target, support_k, 0, ard_precisions)?;
+                        // The re-routed term is freshly constructed, which resets
+                        // typed solver knobs to their defaults -- carrying the
+                        // decoder strategy across is what keeps an accepted move
+                        // from silently reverting the solve to the colour sweep.
+                        moved.set_decoder_fista_passes(self.decoder_fista_passes);
+                        // The proposal arrives on the routing grid -- one of
+                        // `basis_size` samples per atom -- while the incumbent sits
+                        // at a converged continuous fixed point. Comparing them
+                        // directly charges the proposal a quantization tax on every
+                        // one of `n * support_k` slots and rejects good support
+                        // moves for a reason that has nothing to do with the
+                        // support. Solving the proposal's coordinates at frozen
+                        // decoders is a strict decrease of its own objective, so
+                        // this test accepts everything the unpolished one accepted
+                        // and additionally the moves quantization was vetoing.
+                        // A proposal that cannot be polished is a REJECTED proposal,
+                        // never a dead fit.
+                        //
+                        // This branch runs INSIDE `candidate && previous_candidate`:
+                        // the certificate has already been met, and the code
+                        // immediately below it returns that certificate. So a bare
+                        // `?` on the polish threw away a stationary,
+                        // certificate-meeting incumbent because a speculative move
+                        // nobody asked for would not converge — and it reported the
+                        // PROPOSAL's non-convergence as the whole fit's error, from a
+                        // function whose caller has no way to know a proposal was
+                        // ever made.
+                        //
+                        // The plateau branch below already refuses to make that
+                        // trade, for this reason, in these words. This one did not.
+                        // Measured on `examples/issue_2575_joint_rate`: the
+                        // `n=120 P=8 K=12 s=2` arm reaches certified 5.793e-7 against
+                        // a 1e-6 tolerance and is nonetheless reported as stalled,
+                        // carrying `solve_coordinates_fixed_decoder did not recur
+                        // within 256 cycles` as its refusal (#2575).
+                        if self.has_same_support_as(&moved) {
                             log::debug!(
-                                "support move polish did not recur at cycle {iteration}; \
-                                 comparing the objective it reached: {error}"
+                                "support move at cycle {iteration} retained every discrete support; \
+                                 treating it as the no-op it is"
                             );
-                        }
-                        match moved.penalized_objective(target, lambda_smooth, ard_precisions) {
-                            Err(error) => {
+                        } else {
+                            // #2576: the polish only has to descend. Adoption needs a measured
+                            // decrease on the actual objective and resets the recurrence, so a
+                            // polish that descended without recurring is still a valid
+                            // comparison; only an objective that cannot be evaluated rejects
+                            // the move. At the derived tolerance, job 604148 (3cf917ddf, 3000x48
+                            // chart) logged 20 proposals as unpolishable; its plateau proposals'
+                            // polishes did not recur within 200 cycles, at relative coordinate
+                            // KKT ~1e-6.
+                            let polish = moved.solve_coordinates_fixed_decoder(
+                                target,
+                                ard_precisions,
+                                tolerance,
+                                trust_radius,
+                            );
+                            if let Err(error) = &polish {
                                 log::debug!(
-                                    "support move unevaluable at cycle {iteration}, \
-                                     rejected: {error}"
+                                    "support move polish did not recur at cycle {iteration}; \
+                                     comparing the objective it reached: {error}"
                                 );
                             }
-                            Ok(after) => {
-                                if objective - after > self.objective_descent_resolution(objective) {
+                            match moved.penalized_objective(target, lambda_smooth, ard_precisions) {
+                                Err(error) => {
                                     log::debug!(
-                                        "support move accepted at cycle {iteration}: objective \
+                                        "support move unevaluable at cycle {iteration}, \
+                                         rejected: {error}"
+                                    );
+                                }
+                                Ok(after) => {
+                                    if objective - after > self.objective_descent_resolution(objective) {
+                                        log::debug!(
+                                            "support move accepted at cycle {iteration}: objective \
+                                             {objective:.6e} -> {after:.6e}"
+                                        );
+                                        *self = moved;
+                                        self.reconstruct_into(&mut fitted_state)?;
+                                        plateau_window_start = iteration;
+                                        objective_at_window_start = after;
+                                        // The map itself changed, so every difference the
+                                        // accelerator holds describes a map that no longer
+                                        // exists, and the two-cycle recurrence has to be
+                                        // re-established against the new support.
+                                        accelerator.reset();
+                                        taken_step.clear();
+                                        taken_step.resize(self.coordinate_state_len(), 0.0);
+                                        last_objective = None;
+                                        previous_candidate = false;
+                                        continue;
+                                    }
+                                    log::debug!(
+                                        "support move rejected at cycle {iteration}: objective \
                                          {objective:.6e} -> {after:.6e}"
                                     );
-                                    *self = moved;
+                                }
+                            }
+                        }
+                    }
+                }
+                // #2576 — the certificate, priced where the screen passed twice and where
+                // neither the sweeps nor the coupled step moved the state. Every limb
+                // above is a schedule: the objective recurrence is relative to an
+                // objective that can carry any additive constant, the state recurrence
+                // sees `(1 − ρ)` of the remaining error of a slowly contracting
+                // alternation, and the diagonal-scaled residual cannot see coupled weakly
+                // curved directions. The state is returned only when the Newton–Kantorovich
+                // theorem places a strict local minimum within tolerance of the iterate
+                // scale of it ([`Self::support_kantorovich_certificate`]). The exact Newton
+                // displacement is its first-order distance, so one whose largest entry
+                // already exceeds the bound is refused without the dense factorization.
+                let refusal = match &stall {
+                    Some(diagnosis) => format!(
+                        "SaeSupportSparseTerm::solve_fixed_point stalled at cycle {iteration}: \
+                         {diagnosis}; "
+                    ),
+                    None => "SaeSupportSparseTerm::solve_fixed_point: ".to_string(),
+                };
+                let (newton_displacement, newton_direction) =
+                    self.exact_newton_solve(target, lambda_smooth, ard_precisions)?;
+                let bound = tolerance * parameter_scale;
+                let verdict = self.support_kantorovich_certificate(
+                    target,
+                    lambda_smooth,
+                    ard_precisions,
+                    &newton_displacement,
+                    bound,
+                )?;
+                match verdict {
+                    SupportKantorovichVerdict::Certified {
+                        radius,
+                        shift,
+                        lipschitz,
+                        eta,
+                        symmetry_directions,
+                    } => {
+                        log::debug!(
+                            "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
+                             diagonal-scaled max={:.3e} rel={:.3e} exact Newton displacement={:.3e} \
+                             rel={:.3e} max_change={:.3e} objective={:.6e} \
+                             anderson_accepted={accepted_extrapolations} \
+                             joint_accepted={joint_accepted}; Newton-Kantorovich: minimum within \
+                             {radius:.3e} <= {bound:.3e} (eta {eta:.3e}, A - {shift:.3e} I > 0 off \
+                             {symmetry_directions} exact symmetry directions, L {lipschitz:.3e}){}",
+                            stationarity.max_abs(),
+                            stationarity.max_abs() / kkt_scale,
+                            stationarity.scaled_max_abs(),
+                            stationarity.scaled_max_abs() / parameter_scale,
+                            newton_displacement.max_abs(),
+                            newton_displacement.max_abs() / parameter_scale,
+                            max_change,
+                            objective,
+                            if stall.is_some() { ", priced at a stalled cycle" } else { "" },
+                        );
+                        return Ok(SaeSupportFixedPointReport {
+                            iterations: iteration,
+                            objective,
+                            stationarity,
+                            newton_displacement,
+                            max_recurrence_change: max_change,
+                            recurred: true,
+                        });
+                    }
+                    SupportKantorovichVerdict::NotCertified(reason) => {
+                        if let Some(mode) = self.admitted_support_negative_curvature_mode(
+                            target,
+                            lambda_smooth,
+                            ard_precisions,
+                        )? {
+                            match self.escape_support_negative_curvature(
+                                target,
+                                lambda_smooth,
+                                ard_precisions,
+                                &mode,
+                                objective,
+                                trust_radius,
+                                &mut joint_snapshot,
+                                &mut joint_scaled_step,
+                            )? {
+                                Some(escaped_objective) => {
                                     self.reconstruct_into(&mut fitted_state)?;
-                                    plateau_window_start = iteration;
-                                    objective_at_window_start = after;
-                                    // The map itself changed, so every difference the
-                                    // accelerator holds describes a map that no longer
-                                    // exists, and the two-cycle recurrence has to be
-                                    // re-established against the new support.
                                     accelerator.reset();
                                     taken_step.clear();
                                     taken_step.resize(self.coordinate_state_len(), 0.0);
                                     last_objective = None;
                                     previous_candidate = false;
+                                    joint_skip_remaining = 0;
+                                    joint_skip_width = 1;
+                                    objective_at_window_start = escaped_objective;
+                                    // A saddle escape starts a new basin; displacements
+                                    // priced before it do not bound the ones after it.
+                                    last_newton_displacement = None;
                                     continue;
                                 }
+                                None => {
+                                    return Err(format!(
+                                        "{refusal}support fixed point reached a resolved \
+                                         stationary saddle (generalized curvature {:.6e}, \
+                                         backward error {:.3e}) but neither sign of its exact \
+                                         mode produced a representable objective decrease",
+                                        mode.curvature, mode.backward_error,
+                                    ));
+                                }
+                            }
+                        }
+                        // A Newton step from inside the basin contracts the displacement.
+                        // One that does not, under the same discrete support, is a state
+                        // this iteration cannot bring to a certifiable stationary point,
+                        // and refusing now spends no further exact solves on it.
+                        let support = self.support_fingerprint();
+                        if let Some((previous, _)) = last_newton_displacement
+                            .as_ref()
+                            .filter(|(_, previous_support)| *previous_support == support)
+                        {
+                            if !(newton_displacement.max_abs() < *previous) {
+                                return Err(format!(
+                                    "{refusal}exact Newton displacement {:.6e} did not contract \
+                                     from {previous:.6e} after a Newton step (decoder {:.6e}, \
+                                     coordinate {:.6e}; certificate: {reason})",
+                                    newton_displacement.max_abs(),
+                                    newton_displacement.decoder_max_abs,
+                                    newton_displacement.coordinate_max_abs,
+                                ));
+                            }
+                        }
+                        last_newton_displacement = Some((newton_displacement.max_abs(), support));
+                        match self.exact_newton_step(
+                            target,
+                            lambda_smooth,
+                            ard_precisions,
+                            objective,
+                            &newton_direction,
+                            newton_displacement.decrement_sq,
+                            &mut joint_snapshot,
+                            &mut joint_scaled_step,
+                            &mut trial_fitted,
+                        )? {
+                            Some(stepped_objective) => {
                                 log::debug!(
-                                    "support move rejected at cycle {iteration}: objective \
-                                     {objective:.6e} -> {after:.6e}"
+                                    "support fixed-point cycle {iteration}: not certified ({reason}); \
+                                     Newton step installed, objective {objective:.6e} -> \
+                                     {stepped_objective:.6e}{}",
+                                    if stall.is_some() { ", at a stalled cycle" } else { "" },
                                 );
+                                self.reconstruct_into(&mut fitted_state)?;
+                                accelerator.reset();
+                                taken_step.clear();
+                                taken_step.resize(self.coordinate_state_len(), 0.0);
+                                last_objective = None;
+                                previous_candidate = false;
+                                objective_at_window_start = stepped_objective;
+                                continue;
+                            }
+                            None => {
+                                return Err(format!(
+                                    "{refusal}the Newton-Kantorovich certificate refused ({reason}), \
+                                     and the exact Newton step neither descends (decrement² \
+                                     {:.6e}) nor avoids a resolved objective increase at any scale",
+                                    newton_displacement.decrement_sq,
+                                ));
                             }
                         }
                     }
                 }
-                if let Some(mode) = self.admitted_support_negative_curvature_mode(
-                    target,
-                    lambda_smooth,
-                    ard_precisions,
-                )? {
-                    match self.escape_support_negative_curvature(
-                        target,
-                        lambda_smooth,
-                        ard_precisions,
-                        &mode,
-                        objective,
-                        trust_radius,
-                        &mut joint_snapshot,
-                        &mut joint_scaled_step,
-                    )? {
-                        Some(escaped_objective) => {
-                            self.reconstruct_into(&mut fitted_state)?;
-                            accelerator.reset();
-                            taken_step.clear();
-                            taken_step.resize(self.coordinate_state_len(), 0.0);
-                            last_objective = None;
-                            previous_candidate = false;
-                            joint_skip_remaining = 0;
-                            joint_skip_width = 1;
-                            objective_at_window_start = escaped_objective;
-                            // A saddle escape starts a new basin; displacements priced
-                            // before it do not bound the ones after it.
-                            last_newton_displacement = None;
-                            continue;
-                        }
-                        None => {
-                            return Err(format!(
-                                "support fixed point reached a resolved stationary saddle \
-                                 (generalized curvature {:.6e}, backward error {:.3e}) but \
-                                 neither sign of its exact mode produced a representable \
-                                 objective decrease",
-                                mode.curvature, mode.backward_error,
-                            ));
-                        }
-                    }
-                }
-                // #2933 F08 — the certificate. Every limb above is a schedule: the
-                // objective recurrence is relative to an objective that can carry
-                // any additive constant, the state recurrence sees `(1 − ρ)` of the
-                // remaining error of a slowly contracting alternation, and the
-                // diagonal-scaled residual cannot see coupled weakly curved
-                // directions. The exact Newton displacement is the first-order
-                // distance to the stationary point, so the state is returned only
-                // when every parameter's is within tolerance of the iterate scale.
-                let (newton_displacement, newton_direction) =
-                    self.exact_newton_solve(target, lambda_smooth, ard_precisions)?;
-                if !newton_displacement.certifies(parameter_scale, tolerance) {
-                    // A Newton step from inside the basin contracts the displacement.
-                    // One that does not, under the same discrete support, is a state
-                    // this iteration cannot bring to a certifiable stationary point,
-                    // and refusing now spends no further exact solves on it.
-                    let support = self.support_fingerprint();
-                    if let Some((previous, _)) = last_newton_displacement
-                        .as_ref()
-                        .filter(|(_, previous_support)| *previous_support == support)
-                    {
-                        if !(newton_displacement.max_abs() < *previous) {
-                            return Err(format!(
-                                "SaeSupportSparseTerm::solve_fixed_point: exact Newton displacement \
-                                 {:.6e} did not contract from {previous:.6e} after a Newton step \
-                                 (decoder {:.6e}, coordinate {:.6e}; bound {:.6e} = tolerance \
-                                 {tolerance:.6e} x scale {parameter_scale:.6e})",
-                                newton_displacement.max_abs(),
-                                newton_displacement.decoder_max_abs,
-                                newton_displacement.coordinate_max_abs,
-                                tolerance * parameter_scale,
-                            ));
-                        }
-                    }
-                    last_newton_displacement = Some((newton_displacement.max_abs(), support));
-                    match self.exact_newton_step(
-                        target,
-                        lambda_smooth,
-                        ard_precisions,
-                        objective,
-                        &newton_direction,
-                        newton_displacement.decrement_sq,
-                        &mut joint_snapshot,
-                        &mut joint_scaled_step,
-                        &mut trial_fitted,
-                    )? {
-                        Some(stepped_objective) => {
-                            log::debug!(
-                                "support fixed-point cycle {iteration}: exact Newton displacement \
-                                 {:.3e} (decoder {:.3e}, coordinate {:.3e}) exceeds {:.3e} while \
-                                 the screen passed; Newton step installed, objective \
-                                 {objective:.6e} -> {stepped_objective:.6e}",
-                                newton_displacement.max_abs(),
-                                newton_displacement.decoder_max_abs,
-                                newton_displacement.coordinate_max_abs,
-                                tolerance * parameter_scale,
-                            );
-                            self.reconstruct_into(&mut fitted_state)?;
-                            accelerator.reset();
-                            taken_step.clear();
-                            taken_step.resize(self.coordinate_state_len(), 0.0);
-                            last_objective = None;
-                            previous_candidate = false;
-                            objective_at_window_start = stepped_objective;
-                            continue;
-                        }
-                        None => {
-                            return Err(format!(
-                                "SaeSupportSparseTerm::solve_fixed_point: exact Newton displacement \
-                                 {:.6e} (decoder {:.6e}, coordinate {:.6e}) exceeds the bound \
-                                 {:.6e}, and the Newton step neither descends (decrement² \
-                                 {:.6e}) nor avoids a resolved objective increase at any scale",
-                                newton_displacement.max_abs(),
-                                newton_displacement.decoder_max_abs,
-                                newton_displacement.coordinate_max_abs,
-                                tolerance * parameter_scale,
-                                newton_displacement.decrement_sq,
-                            ));
-                        }
-                    }
-                }
-                log::debug!(
-                    "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
-                     diagonal-scaled max={:.3e} rel={:.3e} exact Newton displacement={:.3e} \
-                     rel={:.3e} max_change={:.3e} objective={:.6e} \
-                     anderson_accepted={accepted_extrapolations} joint_accepted={joint_accepted}",
-                    stationarity.max_abs(),
-                    stationarity.max_abs() / kkt_scale,
-                    stationarity.scaled_max_abs(),
-                    stationarity.scaled_max_abs() / parameter_scale,
-                    newton_displacement.max_abs(),
-                    newton_displacement.max_abs() / parameter_scale,
-                    max_change,
-                    objective
-                );
-                return Ok(SaeSupportFixedPointReport {
-                    iterations: iteration,
-                    objective,
-                    stationarity,
-                    newton_displacement,
-                    max_recurrence_change: max_change,
-                    recurred: true,
-                });
             }
             previous_candidate = candidate;
 

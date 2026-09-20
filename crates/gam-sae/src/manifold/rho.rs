@@ -54,8 +54,8 @@ mod log_strength_domain_tests {
             AssignmentMode::softmax(1.0),
         )
         .expect("one logit column, coordinate block and manifold");
-        let rho = SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)])
-            .for_assignment(&softmax);
+        let rho =
+            SaeManifoldRho::new(17.0, 0.0, vec![Array1::<f64>::zeros(0)]).for_assignment(&softmax);
         assert_eq!(rho.sparse_flat_index(), None);
         let mut irrelevant_placeholder = rho.clone();
         irrelevant_placeholder.log_lambda_sparse = f64::INFINITY;
@@ -302,7 +302,11 @@ impl SaeManifoldRho {
                 self.k_atoms()
             ));
         }
-        if self.kappa_atoms.last().is_some_and(|&previous| previous >= atom) {
+        if self
+            .kappa_atoms
+            .last()
+            .is_some_and(|&previous| previous >= atom)
+        {
             return Err(format!(
                 "cannot append curvature atom {atom} after {:?}",
                 self.kappa_atoms.last()
@@ -435,6 +439,19 @@ impl SaeManifoldRho {
         self.log_lambda_block.len()
     }
 
+    /// Flat coordinates of the crosscoder block weights, consistent with
+    /// [`Self::to_flat`]: after the ARD block and BEFORE the per-atom curvature
+    /// tail. Empty for a plain SAE.
+    #[must_use]
+    pub(crate) fn block_flat_range(&self) -> std::ops::Range<usize> {
+        let ard_len = match self.ard_sharing {
+            ArdSharing::PerAtom => self.log_ard.iter().map(|a| a.len()).sum::<usize>(),
+            ArdSharing::Shared => self.max_ard_axes(),
+        };
+        let start = self.smooth_flat_start() + self.log_lambda_smooth.len() + ard_len;
+        start..start + self.log_lambda_block.len()
+    }
+
     /// Largest per-atom ARD axis count `max_k d_k` (0 when ARD is disabled on
     /// every atom). This is the number of SHARED outer ARD coordinates in
     /// [`ArdSharing::Shared`] mode.
@@ -483,15 +500,8 @@ impl SaeManifoldRho {
     /// `ard_flat_index` uses.
     pub(crate) fn kappa_flat_index(&self, atom: usize) -> Option<usize> {
         let curvature_index = self.kappa_atoms.binary_search(&atom).ok()?;
-        let k = self.log_lambda_smooth.len();
-        let prefix = self.smooth_flat_start();
-        let ard_len = match self.ard_sharing {
-            ArdSharing::PerAtom => self.log_ard.iter().map(|a| a.len()).sum::<usize>(),
-            ArdSharing::Shared => self.max_ard_axes(),
-        };
-        Some(prefix + k + ard_len + self.log_lambda_block.len() + curvature_index)
+        Some(self.block_flat_range().end + curvature_index)
     }
-
 
     pub fn ard_flat_index(&self, atom: usize, axis: usize) -> usize {
         let k = self.log_lambda_smooth.len();
@@ -552,72 +562,23 @@ impl SaeManifoldRho {
             bound.validate_log_strength_domain()?;
             return Ok(bound);
         }
-        // Separable-gate modes (softmax entropy / ThresholdGate gated-L1).
-        //
-        // #1782 — a SINGLE-atom (K = 1) fit has no cross-atom routing, so the
-        // response-dispersion identity `λ/φ` is exactly the effective stiffness
-        // and full scaling is well-founded: keep it BYTE-FOR-BYTE (this is the
-        // regime the planted-circle noise-scale sweep pins). But a MULTI-atom
-        // (K > 1) fit couples the per-atom decoders and coordinates through the
-        // shared routing gate, and on clean data `φ_seed ≪ 1` the dispersion
-        // shift `ln φ_seed` WEAKENS the decoder-smoothness / ARD seed toward
-        // zero. That hands the coupled `(coords, decoders)` block enough slack to
-        // overfit AT THE SEED, driving the undamped per-row / cross-row joint
-        // Hessian indefinite — a non-PD seed whose quasi-Laplace score log-det is
-        // undefined. Because the SAE fit runs a single seed (`max_seeds = 1`),
-        // the EFS startup validation then rejects it with "no candidate seeds
-        // passed outer startup validation" (the #1782 softmax / threshold-gate failure),
-        // exactly where ordered_beta_bernoulli — which is never dispersion-weakened — survives.
-        //
-        // Fix: for K > 1 keep the seed decoder-smoothness / ARD from being
-        // WEAKENED below their (dimensionless) construction strength — floor the
-        // shift at 0 so noisy data (`φ > 1`) still STRENGTHENS smoothing (the
-        // well-founded direction) while clean data can no longer collapse the
-        // seed penalties into the non-PD basin. The sparse (gate) coordinate,
-        // which does not enter the decoder Hessian, keeps its full dispersion
-        // scaling. The EFS fixed point then descends each λ from this feasible,
-        // PD seed to the same interior optimum.
-        if bound.log_lambda_smooth.len() <= 1 {
-            return bound.seed_scaled_by_dispersion_with_sparse_policy(dispersion, true);
-        }
-        if !(dispersion.is_finite() && dispersion > 0.0) {
-            return Err(format!(
-                "SaeManifoldRho::seed_scaled_by_dispersion_for_assignment: dispersion must \
-                 be finite and positive; got {dispersion}"
-            ));
-        }
-        let shift = dispersion.ln();
-        let smooth_ard_shift = shift.max(0.0);
-        let mut scaled = bound;
-        if scaled.sparse_flat_index().is_some() {
-            scaled.log_lambda_sparse += shift;
-        }
-        for value in &mut scaled.log_lambda_smooth {
-            *value += smooth_ard_shift;
-        }
-        for atom in &mut scaled.log_ard {
-            for value in atom.iter_mut() {
-                *value += smooth_ard_shift;
-            }
-        }
-        scaled.validate_log_strength_domain()?;
-        Ok(scaled)
+        // Separable-gate modes (softmax entropy / ThresholdGate gated-L1): every
+        // scale-coupled coordinate (the gate strength, each smoothness and each ARD
+        // log-strength) takes the full shift `ln φ` at every K, so the seed's
+        // effective stiffness `λ/φ` is the construction value (#3233).
+        bound.seed_scaled_by_dispersion(dispersion)
     }
 
-    pub(crate) fn seed_scaled_by_dispersion_with_sparse_policy(
-        &self,
-        dispersion: f64,
-        scale_sparse: bool,
-    ) -> Result<Self, String> {
+    fn seed_scaled_by_dispersion(&self, dispersion: f64) -> Result<Self, String> {
         if !(dispersion.is_finite() && dispersion > 0.0) {
             return Err(format!(
-                "SaeManifoldRho::seed_scaled_by_dispersion_with_sparse_policy: dispersion must be \
-                 finite and positive; got {dispersion}"
+                "SaeManifoldRho::seed_scaled_by_dispersion: dispersion must be finite and \
+                 positive; got {dispersion}"
             ));
         }
         let shift = dispersion.ln();
         let mut scaled = self.clone();
-        if scale_sparse && scaled.sparse_flat_index().is_some() {
+        if scaled.sparse_flat_index().is_some() {
             scaled.log_lambda_sparse += shift;
         }
         for value in &mut scaled.log_lambda_smooth {
@@ -741,11 +702,8 @@ impl SaeManifoldRho {
             ));
         }
         let mut previous_atom = None;
-        for (coordinate, (&atom, &value)) in self
-            .kappa_atoms
-            .iter()
-            .zip(self.kappa.iter())
-            .enumerate()
+        for (coordinate, (&atom, &value)) in
+            self.kappa_atoms.iter().zip(self.kappa.iter()).enumerate()
         {
             if atom >= self.k_atoms() {
                 return Err(format!(
@@ -936,8 +894,9 @@ impl SaeManifoldRho {
                 }
                 // #2231 §2a — the appended crosscoder block tail (empty ⇒ no-op).
                 let log_lambda_block: Vec<f64> = (0..block_len).map(|b| flat[cursor + b]).collect();
-                let kappa: Vec<f64> =
-                    (0..kappa_len).map(|b| flat[cursor + block_len + b]).collect();
+                let kappa: Vec<f64> = (0..kappa_len)
+                    .map(|b| flat[cursor + block_len + b])
+                    .collect();
                 SaeManifoldRho {
                     log_lambda_sparse: self
                         .sparse_flat_index()
@@ -1025,9 +984,7 @@ mod curvature_coordinate_tests {
         let base = SaeManifoldRho::new(-1.0, -2.0, vec![Array1::zeros(2), Array1::zeros(2)]);
         let without = base.flat_coordinates();
 
-        let with_kappa = base
-            .clone()
-            .with_curvature(vec![(0, 0.75), (1, -1.25)]);
+        let with_kappa = base.clone().with_curvature(vec![(0, 0.75), (1, -1.25)]);
         let flat = with_kappa.flat_coordinates();
         assert_eq!(
             flat.len(),

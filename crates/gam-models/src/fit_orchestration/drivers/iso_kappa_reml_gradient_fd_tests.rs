@@ -37,6 +37,7 @@ mod iso_kappa_reml_gradient_fd_tests {
         OneDimensionalBoundary, SpatialIdentifiability,
     };
     use gam_test_support::FdDerivativeJudgement;
+    use gam_linalg_test_support::numeric_derivative::{RiddersConfig, StencilErrorPowers, ridders_from_stencil};
     use ndarray::{Array1, Array2, s};
 
 /// gam#2735 — the PER-AXIS ψ gate, and the reason it lives beside the
@@ -3004,8 +3005,11 @@ fn zz_measure_rho_gradient_part_decomposition_2454() {
 
 struct DuchonPsiComponentReport {
     design_rel_gap: f64,
+    /// The Ridders ladder's own error estimate, relative to the same norm.
+    design_rel_uncertainty: f64,
     design_norm_ratio: f64,
     penalty_rel_gaps: Vec<f64>,
+    penalty_rel_uncertainties: Vec<f64>,
     penalty_norm_ratios: Vec<f64>,
 }
 
@@ -3097,73 +3101,88 @@ fn duchon_psi_component_report(label: &str, n: usize, axis: usize) -> DuchonPsiC
             .collect();
         (x, penalties)
     };
-    // Two central-difference steps, ratio 2: a truncation-limited estimate
-    // moves by 4× between them, a defect does not — and the Richardson
-    // combination `(4·D(h) − D(2h))/3` removes the `O(h²)` term outright, so
-    // the reported gap is the formula's, not the oracle's.
-    let mut best_design_gap = f64::INFINITY;
-    let mut design_norm_ratio = f64::NAN;
-    let mut best_penalty_gaps = vec![f64::INFINITY; penalty_components.len()];
-    let mut penalty_norm_ratios = vec![f64::NAN; penalty_components.len()];
-    let mut design_fd_by_step: Vec<Array2<f64>> = Vec::new();
-    let mut penalty_fd_by_step: Vec<Vec<Array2<f64>>> = Vec::new();
-    for &h in &[2.0e-3_f64, 1.0e-3] {
+    // One Ridders ladder (`gam_linalg_test_support::numeric_derivative`, the
+    // default 12 rungs from h = 1e-2 at ratio 2): each rung realizes the design
+    // and every penalty once at ψ ± h, and each entry is Neville-extrapolated
+    // along that ladder together with an estimate of its own error. Two fixed
+    // steps were not an oracle for this family: the order-0, power-9, 3-D mass
+    // Gram's ψ-profile has f‴ ≈ −1e7 (its fingerprint's third differences are
+    // constant at −1.93e-8 across 33 steps of 1.25e-5), so at h ∈ {2e-3, 1e-3}
+    // its O(h²) and O(h⁴) terms were not small, and the Richardson gap still
+    // fell from 8.3e-3 to 2.1e-7 as h went 2e-3 → 6.25e-5 (gam#2959 M6a).
+    let config = RiddersConfig::default();
+    let mut ladder: Vec<(Array2<f64>, Vec<Array2<f64>>)> = Vec::with_capacity(config.rungs);
+    let mut h = config.initial_step;
+    for _ in 0..config.rungs {
         let (x_plus, s_plus) = realize(&mut cache, h);
         let (x_minus, s_minus) = realize(&mut cache, -h);
-        let x_fd = (&x_plus - &x_minus) / (2.0 * h);
-        let design_gap = frobenius(&(&x_psi_an - &x_fd)) / frobenius(&x_fd).max(1e-300);
-        eprintln!(
-            "[{label} COMPONENT] h={h:.1e} design |an|={:.6e} |fd|={:.6e} rel_gap={design_gap:.3e}",
-            frobenius(&x_psi_an),
-            frobenius(&x_fd)
-        );
-        if design_gap < best_design_gap {
-            best_design_gap = design_gap;
-            design_norm_ratio = frobenius(&x_psi_an) / frobenius(&x_fd).max(1e-300);
-        }
-        let mut penalty_fds = Vec::with_capacity(penalty_components.len());
-        for (k, (idx, analytic)) in penalty_components.iter().enumerate() {
-            let s_fd = (&s_plus[k] - &s_minus[k]) / (2.0 * h);
-            let gap = frobenius(&(analytic - &s_fd)) / frobenius(&s_fd).max(1e-300);
-            eprintln!(
-                "[{label} COMPONENT] h={h:.1e} penalty[{idx}] |an|={:.6e} |fd|={:.6e} rel_gap={gap:.3e}",
-                frobenius(analytic),
-                frobenius(&s_fd)
-            );
-            if gap < best_penalty_gaps[k] {
-                best_penalty_gaps[k] = gap;
-                penalty_norm_ratios[k] = frobenius(analytic) / frobenius(&s_fd).max(1e-300);
-            }
-            penalty_fds.push(s_fd);
-        }
-        design_fd_by_step.push(x_fd);
-        penalty_fd_by_step.push(penalty_fds);
+        let s_fd: Vec<Array2<f64>> = s_plus
+            .iter()
+            .zip(s_minus.iter())
+            .map(|(plus, minus)| (plus - minus) / (2.0 * h))
+            .collect();
+        ladder.push(((&x_plus - &x_minus) / (2.0 * h), s_fd));
+        h /= config.shrink;
     }
-    // Richardson: steps were pushed as [2h, h].
-    if design_fd_by_step.len() == 2 {
-        let x_rich = (&design_fd_by_step[1] * 4.0 - &design_fd_by_step[0]) / 3.0;
-        let gap = frobenius(&(&x_psi_an - &x_rich)) / frobenius(&x_rich).max(1e-300);
-        eprintln!("[{label} COMPONENT] Richardson design rel_gap={gap:.3e}");
-        if gap < best_design_gap {
-            best_design_gap = gap;
-            design_norm_ratio = frobenius(&x_psi_an) / frobenius(&x_rich).max(1e-300);
-        }
-        for (k, (idx, analytic)) in penalty_components.iter().enumerate() {
-            let s_rich = (&penalty_fd_by_step[1][k] * 4.0 - &penalty_fd_by_step[0][k]) / 3.0;
-            let gap = frobenius(&(analytic - &s_rich)) / frobenius(&s_rich).max(1e-300);
-            eprintln!("[{label} COMPONENT] Richardson penalty[{idx}] rel_gap={gap:.3e}");
-            if gap < best_penalty_gaps[k] {
-                best_penalty_gaps[k] = gap;
-                penalty_norm_ratios[k] = frobenius(analytic) / frobenius(&s_rich).max(1e-300);
+    // Entry-wise extrapolation of one matrix along the ladder: its value and the
+    // ladder's own error estimate, both as matrices.
+    let extrapolate = |rung_matrix: &dyn Fn(usize) -> Array2<f64>| -> (Array2<f64>, Array2<f64>) {
+        let rungs: Vec<Array2<f64>> = (0..config.rungs).map(rung_matrix).collect();
+        let mut value = Array2::<f64>::zeros(rungs[0].raw_dim());
+        let mut uncertainty = Array2::<f64>::zeros(rungs[0].raw_dim());
+        for i in 0..value.nrows() {
+            for j in 0..value.ncols() {
+                let mut rung = 0usize;
+                let fd = ridders_from_stencil(
+                    |_| {
+                        let entry = rungs[rung][(i, j)];
+                        rung += 1;
+                        entry
+                    },
+                    config,
+                    StencilErrorPowers::Even,
+                );
+                value[(i, j)] = fd.value;
+                uncertainty[(i, j)] = fd.uncertainty;
             }
         }
+        (value, uncertainty)
+    };
+    let (x_fd, x_uncertainty) = extrapolate(&|rung| ladder[rung].0.clone());
+    let design_rel_gap = frobenius(&(&x_psi_an - &x_fd)) / frobenius(&x_fd).max(1e-300);
+    let design_rel_uncertainty = frobenius(&x_uncertainty) / frobenius(&x_fd).max(1e-300);
+    let design_norm_ratio = frobenius(&x_psi_an) / frobenius(&x_fd).max(1e-300);
+    eprintln!(
+        "[{label} COMPONENT] design |an|={:.6e} |fd|={:.6e} rel_gap={design_rel_gap:.3e} \
+         rel_uncertainty={design_rel_uncertainty:.3e}",
+        frobenius(&x_psi_an),
+        frobenius(&x_fd)
+    );
+    let mut penalty_rel_gaps = Vec::with_capacity(penalty_components.len());
+    let mut penalty_rel_uncertainties = Vec::with_capacity(penalty_components.len());
+    let mut penalty_norm_ratios = Vec::with_capacity(penalty_components.len());
+    for (k, (idx, analytic)) in penalty_components.iter().enumerate() {
+        let (s_fd, s_uncertainty) = extrapolate(&|rung| ladder[rung].1[k].clone());
+        let gap = frobenius(&(analytic - &s_fd)) / frobenius(&s_fd).max(1e-300);
+        let uncertainty = frobenius(&s_uncertainty) / frobenius(&s_fd).max(1e-300);
+        eprintln!(
+            "[{label} COMPONENT] penalty[{idx}] |an|={:.6e} |fd|={:.6e} rel_gap={gap:.3e} \
+             rel_uncertainty={uncertainty:.3e}",
+            frobenius(analytic),
+            frobenius(&s_fd)
+        );
+        penalty_rel_gaps.push(gap);
+        penalty_rel_uncertainties.push(uncertainty);
+        penalty_norm_ratios.push(frobenius(analytic) / frobenius(&s_fd).max(1e-300));
     }
     // Restore the seed so the cache is left where it was found.
     cache.ensure_theta(&theta).expect("ensure_theta back at the seed");
     DuchonPsiComponentReport {
-        design_rel_gap: best_design_gap,
+        design_rel_gap,
+        design_rel_uncertainty,
         design_norm_ratio,
-        penalty_rel_gaps: best_penalty_gaps,
+        penalty_rel_gaps,
+        penalty_rel_uncertainties,
         penalty_norm_ratios,
     }
 }
@@ -3177,20 +3196,23 @@ fn assert_duchon_psi_components_at_axis(label: &str, n: usize, axis: usize) {
         report.penalty_rel_gaps,
         report.penalty_norm_ratios
     );
-    // A central difference at h = 1e-3 on an analytic interpoland is accurate
-    // to ~1e-6 relative; 1e-4 leaves room for the evaluator's own rounding at
-    // the tiny-magnitude high-dimensional kernels without admitting a defect.
+    // 1e-4 leaves room for the evaluator's own rounding at the tiny-magnitude
+    // high-dimensional kernels without admitting a defect. The ladder's own error
+    // counts against it: |an − true| ≤ |an − fd| + |fd − true|, so a pass means the
+    // analytic derivative is within the tolerance of the true one.
     let tol = 1e-4;
     assert!(
-        report.design_rel_gap < tol,
-        "{label}: analytic ∂X/∂ψ differs from the rebuilt design by {:.3e} (norm ratio {:.3e})",
+        report.design_rel_gap + report.design_rel_uncertainty < tol,
+        "{label}: analytic ∂X/∂ψ differs from the rebuilt design by {:.3e} ± {:.3e} (norm ratio {:.3e})",
         report.design_rel_gap,
+        report.design_rel_uncertainty,
         report.design_norm_ratio
     );
     for (k, gap) in report.penalty_rel_gaps.iter().enumerate() {
         assert!(
-            *gap < tol,
-            "{label}: analytic ∂S_{k}/∂ψ differs from the rebuilt penalty by {gap:.3e} (norm ratio {:.3e})",
+            *gap + report.penalty_rel_uncertainties[k] < tol,
+            "{label}: analytic ∂S_{k}/∂ψ differs from the rebuilt penalty by {gap:.3e} ± {:.3e} (norm ratio {:.3e})",
+            report.penalty_rel_uncertainties[k],
             report.penalty_norm_ratios[k]
         );
     }
@@ -3269,8 +3291,6 @@ fn a_root_priced_rho_gradient_matches_its_value_2959() {
         random_effect_terms: vec![RandomEffectTermSpec {
             name: "grp".to_string(),
             feature_col: 1,
-            drop_first_level: false,
-            penalized: true,
             frozen_levels: None,
             lenient_unseen: true,
         }],
@@ -3489,6 +3509,7 @@ fn assert_production_kappa_route_psi_gradient_matches_its_value(
         family,
         &fit_opts,
         &kappa_options,
+        None,
     )
     .unwrap_or_else(|e| panic!("{label}: incumbent failed: {e:?}"))
     else {
@@ -3712,12 +3733,12 @@ fn iso_kappa_gradient_is_certified_six_e_folds_past_the_box_2461() {
 /// Why this direction is the one worth pinning. Every rail path in
 /// `rho_optimizer::run` decides by asking whether `ĉ = −e^ρ·∂V/∂ρ` is CONSTANT
 /// over a probe run (`try_certify_asymptote_rail` #2348 Inc 1,
-/// `try_tail_snap_to_rail`, `detect_wrong_rail_pullback` #2392). That law is a
+/// `detect_wrong_rail_pullback` #2392). That law is a
 /// statement about a REML/LAML criterion, whose λ=∞ face gives
 /// `∂V/∂ρ = O(e^{−ρ})`. A ρ-prior whose gradient survives into the tail makes
 /// `ĉ` divergent and no coordinate can ever be certified at an asymptote — one
-/// `Default` disabled the face certificate, the tail snap, AND the pullback
-/// that repairs a coordinate stuck on the wrong bound.
+/// `Default` disabled the face certificate AND the pullback that repairs a
+/// coordinate stuck on the wrong bound.
 ///
 /// Measured under the fixed default (same fixture, same ladder, A10):
 ///

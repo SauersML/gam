@@ -13,8 +13,8 @@ use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::basis::{
-    closed_form_anisotropic_pair_block, closed_form_anisotropic_pair_value_with_powers,
-    closed_form_penalty, pure_duchon_diagonal_epsilon,
+    closed_form_anisotropic_pair_block_with_origin, closed_form_anisotropic_pair_value_with_powers,
+    closed_form_pair_origin, closed_form_penalty, pure_duchon_diagonal_epsilon,
 };
 use gam_linalg::faer_ndarray::{fast_ab, fast_atb};
 
@@ -171,6 +171,7 @@ impl ClosedFormPenaltyOperator {
             &self.eta_metric_powers,
             r0.as_slice(),
             self.diagonal_epsilon,
+            closed_form_pair_origin(self.kernel_nullspace.as_ref()),
         )
     }
 
@@ -292,7 +293,7 @@ impl ClosedFormPenaltyOperator {
     fn build_dense(&self) -> Array2<f64> {
         // Build raw K×K kernel block via the existing dense path so we share
         // its cancellation-detector logic for small κ.
-        let g_raw = closed_form_anisotropic_pair_block(
+        let g_raw = closed_form_anisotropic_pair_block_with_origin(
             self.centers.view(),
             self.q,
             self.m,
@@ -303,6 +304,7 @@ impl ClosedFormPenaltyOperator {
             } else {
                 Some(self.eta_raw.as_slice())
             },
+            closed_form_pair_origin(self.kernel_nullspace.as_ref()),
         );
         let kernel_cols = self
             .kernel_nullspace
@@ -343,6 +345,7 @@ impl ClosedFormPenaltyOperator {
         );
         let k = self.centers.nrows();
         let d = self.centers.ncols();
+        let origin = closed_form_pair_origin(self.kernel_nullspace.as_ref());
         let rows: Vec<f64> = (0..k)
             .into_par_iter()
             .map(|i| {
@@ -363,6 +366,7 @@ impl ClosedFormPenaltyOperator {
                         &self.eta_metric_powers,
                         r.as_slice(),
                         self.diagonal_epsilon,
+                        origin,
                     );
                     let y = gij * v[j] - correction;
                     let next = sum + y;

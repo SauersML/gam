@@ -152,10 +152,10 @@ fn covariate_constant_slope_survival_fit_passes_seed_validation_2930() {
     fit_and_report("smooth", "Surv(time, event) ~ s(x, k=5)", &data, &config);
 }
 
-/// gam#2945: a learned Gaussian frailty σ moves the priced completion, whose explicit σ derivative
-/// is not derived, so such a fit has neither an exact outer gradient nor a curvature certificate. It
-/// is refused once, by name, before the smoothing search: not on every value+gradient evaluation,
-/// and not after the search at the curvature guard.
+/// gam#2945, gam#2938: a learned Gaussian frailty σ on this fixture is refused once, by name, before
+/// the smoothing search. Its slope carries an intercept and a constant offset, so the likelihood
+/// reads σ only as the observed slope `s(σ)·g` and does not identify it: the inner objective was
+/// flat in σ to seven figures while the criterion fell (gam#2938, job 1230170).
 #[test]
 fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
     use gam_models::survival::lognormal_kernel::{FrailtyScale, FrailtySpec};
@@ -173,11 +173,13 @@ fn covariate_constant_slope_learned_sigma_is_refused_by_name_2945() {
         ..constant_slope_config()
     };
     let message = match fit_from_formula("Surv(time, event) ~ x", &data, &config) {
-        Ok(_) => panic!("a learned frailty σ with the armed Jeffreys completion must be refused"),
+        Ok(_) => panic!("a learned frailty σ the likelihood does not identify must be refused"),
         Err(error) => error.to_string(),
     };
     assert!(
-        message.contains("a learned Gaussian frailty σ with the armed Jeffreys completion is refused"),
+        message.contains(
+            "a learned Gaussian-shift frailty σ is refused: σ is not identified by the likelihood"
+        ),
         "the refusal must name its reason, got: {message}"
     );
 }
@@ -218,8 +220,9 @@ fn derived_band(delta_1: f64, magnitude: f64, step: f64, summands: usize) -> f64
 
 /// Central differences of the value-only criterion along `theta[j]` on a halving ladder whose
 /// first rung is one hundredth of the coordinate's scale and at most half its room inside the
-/// seed box. Returns the rung that agrees best with its predecessor: its difference, its step, that
-/// disagreement, and its [`derived_band`].
+/// seed box. Returns, among the rungs that exhibit [`derived_band`]'s halving premise, the one that
+/// agrees best with its predecessor: its difference, its step, that disagreement, and its
+/// [`derived_band`].
 fn value_central_difference(
     probe: &mut dyn OuterSeedProbe,
     theta: &Array1<f64>,
@@ -249,10 +252,23 @@ fn value_central_difference(
         estimates.push((step, (plus - minus) / (2.0 * step), plus.abs().max(minus.abs())));
         step *= 0.5;
     }
-    let (index, settle) = (1..estimates.len())
-        .map(|i| (i, (estimates[i - 1].1 - estimates[i].1).abs()))
+    eprintln!("[2930-LADDER] j={j} rungs={:?}", estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>());
+    // [`derived_band`] bounds `|E(h)|` by `|Δ₁|` only under its premise `|E(2h)| ≥ 2·|E(h)|`. The
+    // ladder shows that premise at rung `i` as the preceding disagreement being at least twice this
+    // one with the same sign, `Δ(2h)/Δ(h) ≥ 2` (4 in the asymptotic range). A rung where evaluation
+    // noise cancels the truncation term breaks that ratio while its `|Δ₁|` is the smallest on the
+    // ladder, so the smallest disagreement is chosen only among rungs that exhibit the premise.
+    let disagreement = |i: usize| estimates[i - 1].1 - estimates[i].1;
+    let (index, settle) = (2..estimates.len())
+        .filter(|&i| disagreement(i - 1) / disagreement(i) >= 2.0)
+        .map(|i| (i, disagreement(i).abs()))
         .min_by(|left, right| left.1.total_cmp(&right.1))
-        .expect("the ladder has six rungs");
+        .ok_or_else(|| {
+            format!(
+                "coordinate {j}: no rung of the ladder shows the halving premise Δ(2h)/Δ(h) ≥ 2: {:?}",
+                estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+            )
+        })?;
     let delta_1 = estimates[index - 1].1 - estimates[index].1;
     let magnitude = estimates[index - 1..=index]
         .iter()

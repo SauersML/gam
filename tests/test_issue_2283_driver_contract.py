@@ -64,7 +64,8 @@ def test_sparse_fit_is_fail_closed_and_reports_every_route(monkeypatch):
         return Fit()
 
     fake_gamfit = types.ModuleType("gamfit")
-    fake_gamfit.sparse_dictionary_fit = sparse_dictionary_fit
+    fake_gamfit.sae = types.ModuleType("gamfit.sae")
+    fake_gamfit.sae.sparse_dictionary_fit = sparse_dictionary_fit
     monkeypatch.setitem(sys.modules, "gamfit", fake_gamfit)
 
     train = np.array([[1.0, 0.0], [0.0, 1.0]], dtype=np.float32)
@@ -179,7 +180,7 @@ def test_flat_checkpoint_round_trip_is_manifested_and_pair_bound(tmp_path):
 
 def test_required_route_certificate_rejects_any_cpu_minibatch():
     driver = _load_driver()
-    driver._assert_required_device_routes(
+    driver._certify_sparse_routes(
         {
             "fit": {
                 "minibatches": 3,
@@ -187,10 +188,11 @@ def test_required_route_certificate_rejects_any_cpu_minibatch():
                 "device_minibatches": 3,
                 "cpu_minibatches": 0,
             }
-        }
+        },
+        "required",
     )
     with np.testing.assert_raises_regex(RuntimeError, "not wholly device-resident"):
-        driver._assert_required_device_routes(
+        driver._certify_sparse_routes(
             {
                 "fit": {
                     "minibatches": 3,
@@ -198,10 +200,11 @@ def test_required_route_certificate_rejects_any_cpu_minibatch():
                     "device_minibatches": 2,
                     "cpu_minibatches": 1,
                 }
-            }
+            },
+            "required",
         )
     with np.testing.assert_raises_regex(RuntimeError, "contradictory minibatch totals"):
-        driver._assert_required_device_routes(
+        driver._certify_sparse_routes(
             {
                 "fit": {
                     "minibatches": 4,
@@ -209,5 +212,31 @@ def test_required_route_certificate_rejects_any_cpu_minibatch():
                     "device_minibatches": 3,
                     "cpu_minibatches": 0,
                 }
-            }
+            },
+            "required",
+        )
+
+
+def test_host_route_certificate_rejects_any_device_minibatch():
+    """A host-declared measurement is certified wholly host-resident, so a pair
+    measured without a device cannot mix in a device route either (#2283)."""
+    driver = _load_driver()
+    driver._certify_sparse_routes(
+        {"fit": {"minibatches": 3, "device_minibatches": 0, "cpu_minibatches": 3}},
+        "off",
+    )
+    with np.testing.assert_raises_regex(RuntimeError, "not wholly host-resident"):
+        driver._certify_sparse_routes(
+            {"fit": {"minibatches": 3, "device_minibatches": 1, "cpu_minibatches": 2}},
+            "off",
+        )
+    with np.testing.assert_raises_regex(RuntimeError, "not wholly host-resident"):
+        driver._certify_sparse_routes(
+            {"fit": {"minibatches": 0, "device_minibatches": 0, "cpu_minibatches": 0}},
+            "off",
+        )
+    with np.testing.assert_raises_regex(RuntimeError, "unknown sparse score mode"):
+        driver._certify_sparse_routes(
+            {"fit": {"minibatches": 3, "device_minibatches": 0, "cpu_minibatches": 3}},
+            "auto",
         )

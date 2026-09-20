@@ -98,6 +98,22 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         dir: ArrayView1<'_, f64>,
     ) -> Result<[[f64; P]; P], String> {
+        let inputs = rigid_row_inputs(
+            self,
+            block_states,
+            row,
+            "survival marginal-slope rigid row helper third",
+        )?;
+        let primaries = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
+        Self::rigid_third_contracted_at::<P, G>(&primaries, &inputs, dir)
+    }
+
+    /// `Σ_c ℓ_{abc} dir_c` of the rigid row program at a resolved primary point.
+    pub(crate) fn rigid_third_contracted_at<const P: usize, G: SlopeRowGeometry<P>>(
+        primaries: &[f64; P],
+        inputs: &RigidRowInputs,
+        dir: ArrayView1<'_, f64>,
+    ) -> Result<[[f64; P]; P], String> {
         if dir.len() != P {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
@@ -107,20 +123,9 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        let mut dir_arr = [0.0_f64; P];
-        dir_arr.copy_from_slice(dir.as_slice().ok_or_else(|| {
-            "survival rigid third contracted: non-contiguous direction".to_string()
-        })?);
-        let inputs = rigid_row_inputs(
-            self,
-            block_states,
-            row,
-            "survival marginal-slope rigid row helper third",
-        )?;
-        let p = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
         let vars: [OneSeed<P>; P] =
-            std::array::from_fn(|a| OneSeed::seed_direction(p[a], a, dir_arr[a]));
-        Ok(rigid_row_nll::<P, G, _>(&vars, &inputs)?.contracted_third())
+            std::array::from_fn(|a| OneSeed::seed_direction(primaries[a], a, dir[a]));
+        Ok(rigid_row_nll::<P, G, _>(&vars, inputs)?.contracted_third())
     }
 
     /// Build the row's fourth-order contracted tensor
@@ -130,6 +135,23 @@ impl SurvivalMarginalSlopeFamily {
         &self,
         row: usize,
         block_states: &[ParameterBlockState],
+        dir_u: ArrayView1<'_, f64>,
+        dir_v: ArrayView1<'_, f64>,
+    ) -> Result<[[f64; P]; P], String> {
+        let inputs = rigid_row_inputs(
+            self,
+            block_states,
+            row,
+            "survival marginal-slope rigid row helper fourth",
+        )?;
+        let primaries = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
+        Self::rigid_fourth_contracted_at::<P, G>(&primaries, &inputs, dir_u, dir_v)
+    }
+
+    /// `Σ_{cd} ℓ_{abcd} u_c v_d` of the rigid row program at a resolved primary point.
+    pub(crate) fn rigid_fourth_contracted_at<const P: usize, G: SlopeRowGeometry<P>>(
+        primaries: &[f64; P],
+        inputs: &RigidRowInputs,
         dir_u: ArrayView1<'_, f64>,
         dir_v: ArrayView1<'_, f64>,
     ) -> Result<[[f64; P]; P], String> {
@@ -143,24 +165,9 @@ impl SurvivalMarginalSlopeFamily {
             }
             .into());
         }
-        let mut u_arr = [0.0_f64; P];
-        u_arr.copy_from_slice(dir_u.as_slice().ok_or_else(|| {
-            "survival rigid fourth contracted: non-contiguous u direction".to_string()
-        })?);
-        let mut v_arr = [0.0_f64; P];
-        v_arr.copy_from_slice(dir_v.as_slice().ok_or_else(|| {
-            "survival rigid fourth contracted: non-contiguous v direction".to_string()
-        })?);
-        let inputs = rigid_row_inputs(
-            self,
-            block_states,
-            row,
-            "survival marginal-slope rigid row helper fourth",
-        )?;
-        let p = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
         let vars: [TwoSeed<P>; P] =
-            std::array::from_fn(|a| TwoSeed::seed(p[a], a, u_arr[a], v_arr[a]));
-        Ok(rigid_row_nll::<P, G, _>(&vars, &inputs)?.contracted_fourth())
+            std::array::from_fn(|a| TwoSeed::seed(primaries[a], a, dir_u[a], dir_v[a]));
+        Ok(rigid_row_nll::<P, G, _>(&vars, inputs)?.contracted_fourth())
     }
 
     /// Compute per-row primary gradient and Hessian from the direct symbolic
@@ -201,8 +208,16 @@ impl SurvivalMarginalSlopeFamily {
             row,
             "survival marginal-slope rigid row helper kernel",
         )?;
-        let p = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
-        let (nll, grad_arr, hess_arr) = rigid_row_order2::<P, G>(&p, &inputs)?;
+        let primaries = rigid_row_kernel_primaries::<P, G>(self, block_states, row)?;
+        Self::rigid_gradient_hessian_at::<P, G>(&primaries, &inputs)
+    }
+
+    /// The rigid row program's value, primary gradient and Hessian at a resolved primary point.
+    pub(crate) fn rigid_gradient_hessian_at<const P: usize, G: SlopeRowGeometry<P>>(
+        primaries: &[f64; P],
+        inputs: &RigidRowInputs,
+    ) -> Result<(f64, Array1<f64>, Array2<f64>), String> {
+        let (nll, grad_arr, hess_arr) = rigid_row_order2::<P, G>(primaries, inputs)?;
         // Convert stack arrays to ndarray types at the boundary.
         let grad = Array1::from_vec(grad_arr.to_vec());
         let mut hess = Array2::zeros((P, P));

@@ -4,14 +4,13 @@ with a clean, typed configuration error *before* the sampling engine is invoked
 
 The pre-fix behaviour was:
 
-    samples=0 -> GamError: sample_table panicked inside Rust boundary:
+    samples=0 -> GamfitError: sample_table panicked inside Rust boundary:
                  expected thread to succeed in generating observation.
 
 i.e. the panic-payload was caught at the FFI boundary and surfaced as a
-"panicked inside Rust boundary" message. The fix validates `n_samples` up front
-(mirroring the existing `target_accept` guard), so it now raises a clean message
-that does NOT contain "panicked inside Rust boundary". The chain count is no
-longer configurable: every run uses two chains.
+"panicked inside Rust boundary" message. The fix validates `n_samples` up front,
+so it now raises a clean message that does NOT contain "panicked inside Rust
+boundary". The chain count is no longer configurable: every run uses two chains.
 """
 
 from __future__ import annotations
@@ -45,7 +44,7 @@ def _logit_model():
 
 
 def _assert_clean_config_error(rows, model, **bad_cfg) -> None:
-    with pytest.raises(gamfit.errors.GamError) as exc_info:
+    with pytest.raises(gamfit.errors.GamfitError) as exc_info:
         model.sample(rows, **bad_cfg)
     message = str(exc_info.value)
     assert "panicked inside Rust boundary" not in message, (

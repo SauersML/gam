@@ -150,6 +150,7 @@ mod jeffreys;
 mod jeffreys_arming;
 mod joint_derivatives;
 mod joint_newton;
+mod mode_selection;
 mod outer_objective;
 mod penalty_labels;
 mod psi_design;
@@ -162,6 +163,9 @@ pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
 pub use assembly::*;
 pub(crate) use blockwise_solve::*;
+// The one penalty evaluator on structural roots (#2954), public so every
+// consumer, and #2977's trust-region acceptance, reads the same function.
+pub use blockwise_solve::{BlockPenaltyRoots, PenaltyIncrement, PenaltyRootTerm, PenaltyValue};
 pub(crate) use branch_continuation::*;
 pub(crate) use covariance::*;
 // Covariance helpers that are part of the public flat-namespace API: one consumed
@@ -175,12 +179,13 @@ pub use covariance::{
 pub use fit::*;
 pub(crate) use inner_blockwise_fit::*;
 pub use jeffreys_arming::{
-    JeffreysArming, fit_custom_family_arming_on_evidence,
+    JeffreysArming, arm_on_evidence, fit_custom_family_arming_on_evidence,
     fit_custom_family_arming_on_evidence_with_rho_prior,
 };
 pub(crate) use jeffreys::*;
 pub(crate) use joint_derivatives::*;
 pub use joint_newton::*;
+pub(crate) use mode_selection::*;
 pub(crate) use outer_objective::*;
 pub(crate) use penalty_labels::*;
 // ψ design-derivative operators / actions / joint-ψ operator / resolvers

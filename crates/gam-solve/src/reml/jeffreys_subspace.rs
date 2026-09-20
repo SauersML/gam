@@ -113,8 +113,73 @@ pub(crate) fn jeffreys_cap(floor: f64) -> f64 {
     CONDITIONING_GATE_ABSOLUTE_CLEAR.max(floor)
 }
 
+/// The bottom saturation's profile `w(t) = 1/(1 + t⁴)` at `t = λ/floor < 0`,
+/// held as the bounded factors `e_k = tᵏ·w(t)`, `k = 0..=4` (gam#2982).
+///
+/// `w = 1 − t⁴ + O(t⁸)`, so the bottom branch `d = w(t)/floor` leaves the
+/// plateau `d = 1/floor` with its first three `λ`-derivatives zero, and every
+/// `tᵖ·w⁽ᑫ⁾` the branch's floor partials read is a sum of `c·t^{n}·w^{q+1}`
+/// with `n ≤ 4(q + 1)`: a product of `q + 1` factors `e_k`, each bounded by one,
+/// so no partial overflows or cancels to `∞·0` at any `|t|`.
+struct BottomProfile {
+    e: [f64; 5],
+}
+
+impl BottomProfile {
+    fn new(lam: f64, floor: f64) -> Self {
+        let t = lam / floor;
+        let e = if t.abs() <= 1.0 {
+            let w = (1.0 + t.powi(4)).recip();
+            [w, t * w, t * t * w, t.powi(3) * w, t.powi(4) * w]
+        } else {
+            // tᵏ/(1 + t⁴) = s^{4−k}/(1 + s⁴) with s = 1/t.
+            let s = t.recip();
+            let v = (1.0 + s.powi(4)).recip();
+            [s.powi(4) * v, s.powi(3) * v, s * s * v, s * v, v]
+        };
+        Self { e }
+    }
+
+    /// `tᵖ·w⁽ᑫ⁾(t)` for `q ≤ 3`, `p ≤ q + 4`, from `w' = −4t³w²`,
+    /// `w'' = (20t⁶ − 12t²)w³` and `w''' = (−120t⁹ + 240t⁵ − 24t)w⁴`.
+    fn monomial(&self, p: usize, q: usize) -> f64 {
+        const TERMS: [&[(usize, f64)]; 4] = [
+            &[(0, 1.0)],
+            &[(3, -4.0)],
+            &[(6, 20.0), (2, -12.0)],
+            &[(9, -120.0), (5, 240.0), (1, -24.0)],
+        ];
+        TERMS[q]
+            .iter()
+            .map(|&(degree, coefficient)| {
+                let mut remaining = p + degree;
+                let mut value = coefficient;
+                for _ in 0..=q {
+                    let k = remaining.min(4);
+                    value *= self.e[k];
+                    remaining -= k;
+                }
+                assert_eq!(remaining, 0, "t^{p}·w^({q}) needs p ≤ q + 4");
+                value
+            })
+            .sum()
+    }
+}
+
+/// `G(t) = ∫₀ᵗ ds/(1 + s⁴)`, the antiderivative of the bottom profile: odd, with
+/// `G(t) = [½·ln((t² + √2t + 1)/(t² − √2t + 1)) + atan2(√2t, 1 − t²)]/(2√2)` for
+/// `t ≥ 0` and `G(±∞) = ±π/(2√2)`.
+fn bottom_profile_antiderivative(t: f64) -> f64 {
+    let s = t.abs();
+    let root2 = std::f64::consts::SQRT_2;
+    let magnitude = (0.5 * (2.0 * root2 * s / (s * s - root2 * s + 1.0)).ln_1p()
+        + (root2 * s).atan2(1.0 - s * s))
+        / (2.0 * root2);
+    magnitude.copysign(t)
+}
+
 /// Slope `d(λ) = g'(λ)` of the Jeffreys eigenvalue antiderivative `g`, a
-/// BOUNDED, MONOTONE, C¹ function of the reduced eigenvalue (gam#979), with
+/// BOUNDED, MONOTONE function of the reduced eigenvalue (gam#979), with
 /// `Λ = jeffreys_cap(floor)`:
 ///
 ///   * `λ ≥ Λ`:           `g = ln Λ + 1 − Λ/λ`,                `d = Λ/λ²`
@@ -127,10 +192,17 @@ pub(crate) fn jeffreys_cap(floor: f64) -> f64 {
 ///   * `0 ≤ λ < floor`:   `g = λ/floor + ln(floor) − 1`,       `d = 1/floor`
 ///     (the #787 linear continuation — C¹ at `+floor`, preserves the
 ///     1/floor separation bound);
-///   * `λ < 0`:           `g = ln(floor) − 1 + λ/(floor − λ)`, `d = floor/(floor − λ)²`
-///     (BOTTOM saturation). C¹ at `0` (`g(0) = ln(floor) − 1`,
-///     `d(0) = 1/floor` from both sides), `g → ln(floor) − 2`, `d → 0` as
-///     `λ → −∞`.
+///   * `λ < 0`:           `g = ln(floor) − 1 + G(λ/floor)`,    `d = w(λ/floor)/floor`
+///     with `w(t) = 1/(1 + t⁴)` and `G = ∫₀ᵗ w` (BOTTOM saturation;
+///     [`BottomProfile`], [`bottom_profile_antiderivative`]). `g → ln(floor) − 1 −
+///     π/(2√2)`, `d → 0` as `λ → −∞`, and `d ≤ 1/floor` keeps the separation bound.
+///
+/// The joins at `floor` and `Λ` are C¹. The join at `0` is C⁴: `w = 1 − t⁴ + O(t⁸)`
+/// puts `g − g_plateau = O(λ⁵)`, so `g`, `d` and every mixed floor partial reading
+/// at most four `λ`-derivatives of `g` agree from both sides (gam#2982). A reduced
+/// eigenvalue that is structurally zero — a penalty null direction, landing at
+/// `±` roundoff — therefore sits on no knot: the criterion's first four
+/// derivatives there are the plateau's, whichever side roundoff puts it.
 ///
 /// WHY BOTH ENDS SATURATE (gam#979; supersedes the gam#814 `ln|λ|` magnitude
 /// branch and the unbounded top). An unbounded `g` lets the Φ-augmented inner
@@ -148,7 +220,7 @@ pub(crate) fn jeffreys_cap(floor: f64) -> f64 {
 /// is the per-eigenvalue, smooth realisation of the same self-limitation the
 /// binary conditioning gate states globally: exact `ln λ` inside the
 /// under-identified window `[floor, Λ)`, flat outside it. `g` spans the
-/// range `(ln floor − 2, ln Λ + 1]`. That range is bounded only while the floor
+/// range `(ln floor − 1 − π/(2√2), ln Λ + 1]`. That range is bounded only while the floor
 /// is: the relative floor tracks `λ_max`, which a likelihood-domain face drives
 /// without limit, and past `floor = Λ` every eigenvalue's `g` is `ln floor ± 1`.
 /// The conditioning gate's floor-collapse factor
@@ -165,8 +237,7 @@ pub(crate) fn floored_inverse(lam: f64, floor: f64) -> f64 {
     } else if lam >= 0.0 {
         1.0 / floor
     } else {
-        let denom = floor - lam;
-        floor / (denom * denom)
+        BottomProfile::new(lam, floor).monomial(0, 0) / floor
     }
 }
 
@@ -186,7 +257,7 @@ pub(crate) fn floored_inverse(lam: f64, floor: f64) -> f64 {
 ///   * `λ ≥ Λ`:           `g = ln Λ + 1 − Λ/λ`        (TOP saturation);
 ///   * `floor ≤ λ < Λ`:   `g = ln λ`                  (exact Jeffreys log-volume);
 ///   * `0 ≤ λ < floor`:   `g = λ/floor + ln(floor) − 1` (#787 linear continuation);
-///   * `λ < 0`:           `g = ln(floor) − 1 + λ/(floor − λ)` (BOTTOM saturation).
+///   * `λ < 0`:           `g = ln(floor) − 1 + G(λ/floor)` (BOTTOM saturation).
 #[inline]
 pub(crate) fn jeffreys_antiderivative(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -197,7 +268,7 @@ pub(crate) fn jeffreys_antiderivative(lam: f64, floor: f64) -> f64 {
     } else if lam >= 0.0 {
         lam / floor + floor.ln() - 1.0
     } else {
-        floor.ln() - 1.0 + lam / (floor - lam)
+        floor.ln() - 1.0 + bottom_profile_antiderivative(lam / floor)
     }
 }
 
@@ -212,7 +283,10 @@ pub(crate) fn jeffreys_antiderivative(lam: f64, floor: f64) -> f64 {
 ///     not move with the floor, so the value does not either);
 ///   * `floor ≤ λ < Λ`:   `0`            (`g = ln λ` is floor-free here);
 ///   * `0 ≤ λ < floor`:   `1/floor − λ/floor²` (the #787 linear continuation);
-///   * `λ < 0`:           `1/floor − λ/(floor − λ)²` (BOTTOM saturation).
+///   * `λ < 0`:           `(1 − t·w)/floor`, `t = λ/floor` (BOTTOM saturation).
+///
+/// On the bottom saturation every floor partial follows from `∂t/∂floor = −t/floor`:
+/// `∂_floor[tᵖ·w⁽ᑫ⁾/floorᵏ] = [−(k + p)·tᵖ·w⁽ᑫ⁾ − t^{p+1}·w^{(q+1)}]/floor^{k+1}`.
 #[inline]
 pub(crate) fn jeffreys_antiderivative_floor_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -228,8 +302,7 @@ pub(crate) fn jeffreys_antiderivative_floor_sensitivity(lam: f64, floor: f64) ->
     } else if lam >= 0.0 {
         1.0 / floor - lam / (floor * floor)
     } else {
-        let denom = floor - lam;
-        1.0 / floor - lam / (denom * denom)
+        (1.0 - BottomProfile::new(lam, floor).monomial(1, 0)) / floor
     }
 }
 
@@ -240,10 +313,11 @@ pub(crate) fn jeffreys_antiderivative_floor_sensitivity(lam: f64, floor: f64) ->
 /// first-order floor response requires both `g_{λ,floor}` (provided by
 /// [`floored_inverse_floor_sensitivity`]) and this `g_{floor,floor}` term.
 ///
-/// The antiderivative is C¹, but not C², at the branch knots (`λ = floor`,
-/// `λ = jeffreys_cap(floor)`, and `λ = 0`).  Callers requesting a Hessian
-/// must remain on one fixed branch; [`JointJeffreysPlan`] checks those stratum
-/// boundaries before emitting second-order trace weights.
+/// The antiderivative is C¹, but not C², at the branch knots `λ = floor` and
+/// `λ = jeffreys_cap(floor)`; it is C⁴ at `λ = 0` (see [`floored_inverse`]).
+/// Callers requesting a Hessian must remain on one side of each C¹ knot;
+/// [`JointJeffreysPlan`] checks those stratum boundaries before emitting
+/// second-order trace weights.
 #[inline]
 pub(crate) fn jeffreys_antiderivative_floor_second_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -262,15 +336,15 @@ pub(crate) fn jeffreys_antiderivative_floor_second_sensitivity(lam: f64, floor: 
         // g = λ/floor + ln(floor) - 1.
         -1.0 / (floor * floor) + 2.0 * lam / (floor * floor * floor)
     } else {
-        // g = ln(floor) - 1 + λ/(floor-λ).
-        let denom = floor - lam;
-        -1.0 / (floor * floor) + 2.0 * lam / (denom * denom * denom)
+        // g = ln(floor) - 1 + G(t).
+        let profile = BottomProfile::new(lam, floor);
+        (-1.0 + 2.0 * profile.monomial(1, 0) + profile.monomial(2, 1)) / (floor * floor)
     }
 }
 
 /// `d'(λ)` with the floor held fixed: `−2Λ/λ³` on the top saturation,
 /// `−1/λ²` in the log window, `0` inside the band (the linear continuation
-/// has no curvature in `λ`), `2·floor/(floor − λ)³` on the bottom saturation.
+/// has no curvature in `λ`), `w'(t)/floor²` on the bottom saturation.
 #[inline]
 pub(crate) fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -281,16 +355,14 @@ pub(crate) fn floored_inverse_prime(lam: f64, floor: f64) -> f64 {
     } else if lam >= 0.0 {
         0.0
     } else {
-        let denom = floor - lam;
-        2.0 * floor / (denom * denom * denom)
+        BottomProfile::new(lam, floor).monomial(0, 1) / (floor * floor)
     }
 }
-
 
 /// `∂d/∂floor` with `λ` held fixed: `1/λ²` on the top saturation when the cap
 /// is floor-bound (`Λ = floor`, the extreme-scale regime; `0` otherwise — the
 /// gate-bound cap does not move with the floor), `0` in the log window,
-/// `−1/floor²` inside the band, `−(floor + λ)/(floor − λ)³` on the bottom
+/// `−1/floor²` inside the band, `−(w + t·w')/floor²` on the bottom
 /// saturation. Feeds the floor-motion term of the kernel drift when the floor
 /// is in its active relative regime (`floor = REL·λ_max(β)`).
 #[inline]
@@ -308,16 +380,15 @@ pub(crate) fn floored_inverse_floor_sensitivity(lam: f64, floor: f64) -> f64 {
     } else if lam >= 0.0 {
         -1.0 / (floor * floor)
     } else {
-        let denom = floor - lam;
-        -(floor + lam) / (denom * denom * denom)
+        let profile = BottomProfile::new(lam, floor);
+        -(profile.monomial(0, 0) + profile.monomial(1, 1)) / (floor * floor)
     }
 }
-
 
 /// `∂²d/∂λ∂floor` on the branch of [`floored_inverse_floor_sensitivity`]: `−2/λ³` on
 /// a floor-bound top saturation (`d = floor/λ²`), `0` in the log window and inside
 /// the band (`d = 1/floor` there does not vary with `λ`), and
-/// `−(4·floor + 2λ)/(floor − λ)⁴` on the bottom saturation. A third-order channel
+/// `−(2w' + t·w'')/floor³` on the bottom saturation. A third-order channel
 /// of the moving relative floor in the Jeffreys motion drift (gam#1082).
 #[inline]
 pub(crate) fn floored_inverse_lambda_floor_sensitivity(lam: f64, floor: f64) -> f64 {
@@ -331,14 +402,14 @@ pub(crate) fn floored_inverse_lambda_floor_sensitivity(lam: f64, floor: f64) -> 
     } else if lam >= 0.0 {
         0.0
     } else {
-        let denom = floor - lam;
-        -(4.0 * floor + 2.0 * lam) / (denom * denom * denom * denom)
+        let profile = BottomProfile::new(lam, floor);
+        -(2.0 * profile.monomial(0, 1) + profile.monomial(1, 2)) / floor.powi(3)
     }
 }
 
 /// `∂²d/∂floor²` on the branch of [`floored_inverse_floor_sensitivity`]: `0` on the
 /// top saturation and in the log window, `2/floor³` inside the band, and
-/// `(2·floor + 4λ)/(floor − λ)⁴` on the bottom saturation (gam#1082).
+/// `(2w + 4t·w' + t²·w'')/floor³` on the bottom saturation (gam#1082).
 #[inline]
 pub(crate) fn floored_inverse_floor_second_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -347,15 +418,16 @@ pub(crate) fn floored_inverse_floor_second_sensitivity(lam: f64, floor: f64) -> 
     } else if lam >= 0.0 {
         2.0 / (floor * floor * floor)
     } else {
-        let denom = floor - lam;
-        (2.0 * floor + 4.0 * lam) / (denom * denom * denom * denom)
+        let profile = BottomProfile::new(lam, floor);
+        (2.0 * profile.monomial(0, 0) + 4.0 * profile.monomial(1, 1) + profile.monomial(2, 2))
+            / floor.powi(3)
     }
 }
 
 /// `∂³g/∂floor³` on the branch of [`jeffreys_antiderivative_floor_second_sensitivity`]:
 /// `2/floor³` on a floor-bound top saturation (`0` on a gate-bound one), `0` in the
-/// log window, `2/floor³ − 6λ/floor⁴` inside the band, and `2/floor³ − 6λ/(floor − λ)⁴`
-/// on the bottom saturation (gam#1082).
+/// log window, `2/floor³ − 6λ/floor⁴` inside the band, and
+/// `(2 − 6t·w − 6t²·w' − t³·w'')/floor³` on the bottom saturation (gam#1082).
 #[inline]
 pub(crate) fn jeffreys_antiderivative_floor_third_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -371,15 +443,18 @@ pub(crate) fn jeffreys_antiderivative_floor_third_sensitivity(lam: f64, floor: f
     } else if lam >= 0.0 {
         2.0 / floor_cubed - 6.0 * lam / (floor_cubed * floor)
     } else {
-        let denom = floor - lam;
-        2.0 / floor_cubed - 6.0 * lam / (denom * denom * denom * denom)
+        let profile = BottomProfile::new(lam, floor);
+        (2.0 - 6.0 * profile.monomial(1, 0)
+            - 6.0 * profile.monomial(2, 1)
+            - profile.monomial(3, 2))
+            / floor_cubed
     }
 }
 
 /// `∂⁴g/∂floor⁴` on the branch of [`jeffreys_antiderivative_floor_third_sensitivity`]:
 /// `−6/floor⁴` on a floor-bound top saturation (`0` on a gate-bound one), `0` in the log
-/// window, `−6/floor⁴ + 24λ/floor⁵` inside the band, and `−6/floor⁴ + 24λ/(floor − λ)⁵` on
-/// the bottom saturation (gam#2894).
+/// window, `−6/floor⁴ + 24λ/floor⁵` inside the band, and
+/// `(−6 + 24t·w + 36t²·w' + 12t³·w'' + t⁴·w''')/floor⁴` on the bottom saturation (gam#2894).
 #[inline]
 pub(crate) fn jeffreys_antiderivative_floor_fourth_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -395,12 +470,18 @@ pub(crate) fn jeffreys_antiderivative_floor_fourth_sensitivity(lam: f64, floor: 
     } else if lam >= 0.0 {
         -6.0 / floor_fourth + 24.0 * lam / (floor_fourth * floor)
     } else {
-        -6.0 / floor_fourth + 24.0 * lam / (floor - lam).powi(5)
+        let profile = BottomProfile::new(lam, floor);
+        (-6.0 + 24.0 * profile.monomial(1, 0)
+            + 36.0 * profile.monomial(2, 1)
+            + 12.0 * profile.monomial(3, 2)
+            + profile.monomial(4, 3))
+            / floor_fourth
     }
 }
 
 /// `∂³d/∂floor³` of the floored inverse (gam#2894): `0` above the floor, `−6/floor⁴` on the
-/// floor plateau, and `−(6·floor + 18λ)/(floor − λ)⁵` on the saturating negative branch.
+/// floor plateau, and `−(6w + 18t·w' + 9t²·w'' + t³·w''')/floor⁴` on the saturating
+/// negative branch.
 #[inline]
 pub(crate) fn floored_inverse_floor_third_sensitivity(lam: f64, floor: f64) -> f64 {
     let cap = jeffreys_cap(floor);
@@ -409,7 +490,12 @@ pub(crate) fn floored_inverse_floor_third_sensitivity(lam: f64, floor: f64) -> f
     } else if lam >= 0.0 {
         -6.0 / floor.powi(4)
     } else {
-        -(6.0 * floor + 18.0 * lam) / (floor - lam).powi(5)
+        let profile = BottomProfile::new(lam, floor);
+        -(6.0 * profile.monomial(0, 0)
+            + 18.0 * profile.monomial(1, 1)
+            + 9.0 * profile.monomial(2, 2)
+            + profile.monomial(3, 3))
+            / floor.powi(4)
     }
 }
 
@@ -424,7 +510,8 @@ pub(crate) fn floored_inverse_floor_third_sensitivity(lam: f64, floor: f64) -> f
 /// separating direction, so it is O(1) exactly where the term arms),
 ///   `∂²Φ[a,b] = ½ Σ_ij Ψ_ij (Ṽ_a)_ij (Ṽ_b)_ij`,  `Ṽ_k = Vᵀ D_k V`.
 /// With the saturating negative branch `d` is continuous everywhere, so every
-/// divided difference is bounded by `max|d'| ≤ 2/floor`.
+/// divided difference is bounded by `max|d'| = 4·(3/5)^{3/4}/(1.6²·floor²) ≈ 1.07/floor²`,
+/// the bottom branch's steepest slope (at `t⁴ = 3/5`; the log window's is `1/floor²`).
 pub(crate) fn floored_inverse_divided_differences(evals: &Array1<f64>, floor: f64) -> Array2<f64> {
     let m = evals.len();
     let mut psi = Array2::<f64>::zeros((m, m));
@@ -2002,6 +2089,12 @@ impl JointJeffreysPlan {
         (self.lambda_min, self.lambda_max)
     }
 
+    /// The numerical zero [`Self::reduced_information_is_singular`] compares
+    /// `λ_min` against, for a consumer that reports the verdict's evidence.
+    pub fn floor(&self) -> f64 {
+        self.floor
+    }
+
     /// Smooth conditioning-gate weight in `[0, 1]` evaluated from
     /// [`Self::information_extrema`].
     pub fn conditioning_gate_weight(&self) -> f64 {
@@ -2467,10 +2560,10 @@ impl JointJeffreysPlan {
             ));
         }
 
+        // `λ = 0` is no stratum: the bottom saturation joins the plateau C⁴ (gam#2982).
         let cap = jeffreys_cap(self.floor);
         for (index, &lambda) in self.evals.iter().enumerate() {
-            if lambda.abs() <= branch_tol
-                || (lambda - self.floor).abs() <= branch_tol
+            if (lambda - self.floor).abs() <= branch_tol
                 || (lambda - cap).abs() <= branch_tol
             {
                 return Err(format!(
@@ -4319,19 +4412,21 @@ mod tests {
     // gam#2894: the λ–floor partials of the capped inverse, read only by their finite-difference pin.
 
     /// `∂³d/∂λ∂floor²` of the floored inverse (gam#2894): nonzero only on the saturating negative
-    /// branch, `(12·floor + 12λ)/(floor − λ)⁵`.
+    /// branch, `(6w' + 6t·w'' + t²·w''')/floor⁴`.
     #[inline]
     pub(crate) fn floored_inverse_lambda_floor_second_sensitivity(lam: f64, floor: f64) -> f64 {
         if lam >= 0.0 {
             0.0
         } else {
-            (12.0 * floor + 12.0 * lam) / (floor - lam).powi(5)
+            let profile = BottomProfile::new(lam, floor);
+            (6.0 * profile.monomial(0, 1) + 6.0 * profile.monomial(1, 2) + profile.monomial(2, 3))
+                / floor.powi(4)
         }
     }
 
     /// `∂³d/∂λ²∂floor` of the floored inverse (gam#2894): `6/λ⁴` on a floor-bound top saturation
     /// (`0` on a gate-bound one), `0` in the log window and on the plateau, and
-    /// `−(18·floor + 6λ)/(floor − λ)⁵` on the saturating negative branch.
+    /// `−(3w'' + t·w''')/floor⁴` on the saturating negative branch.
     #[inline]
     pub(crate) fn floored_inverse_lambda_lambda_floor_sensitivity(lam: f64, floor: f64) -> f64 {
         let cap = jeffreys_cap(floor);
@@ -4344,7 +4439,8 @@ mod tests {
         } else if lam >= 0.0 {
             0.0
         } else {
-            -(18.0 * floor + 6.0 * lam) / (floor - lam).powi(5)
+            let profile = BottomProfile::new(lam, floor);
+            -(3.0 * profile.monomial(0, 2) + profile.monomial(1, 3)) / floor.powi(4)
         }
     }
 
@@ -6372,6 +6468,64 @@ mod tests {
         );
     }
 
+    /// gam#2982: a reduced eigenvalue that is structurally zero sits on no stratum. The
+    /// bottom saturation joins the floor plateau C⁴, so the mixed trace weights exist at
+    /// `λ = 0`, at a roundoff-negative `λ`, and on the bottom branch, and they are the
+    /// derivative of the explicit first derivative along the coefficient direction.
+    ///
+    /// The zero direction's perturbations are block-diagonal and floor-sized: an
+    /// eigenvector off by `ε` then moves `Ṽ₀₀` only at `O(ε²)`, where a coupling would move
+    /// it at `O(ε)` and the `1/floor` weight would carry that into the difference quotient.
+    #[test]
+    fn joint_jeffreys_mixed_weights_exist_at_a_structural_zero_eigenvalue_2982() {
+        let z = Array2::<f64>::eye(3);
+        let with_first = |lambda: f64| array![[lambda, 0.0, 0.0], [0.0, 1.0, 0.3], [0.0, 0.3, 2.0]];
+        let floor = JointJeffreysPlan::prepare(with_first(0.0).view(), z.view())
+            .unwrap()
+            .floor;
+        let explicit = array![[0.3 * floor, 0.0, 0.0], [0.0, 0.2, 0.05], [0.0, 0.05, -0.1]];
+        let beta_derivative = array![[0.4 * floor, 0.0, 0.0], [0.0, -0.1, 0.07], [0.0, 0.07, 0.25]];
+        let mixed_derivative = array![[-0.2 * floor, 0.0, 0.0], [0.0, 0.3, -0.02], [0.0, -0.02, 0.15]];
+        for (label, lambda) in [
+            ("zero", 0.0),
+            ("roundoff-negative", -3e-17),
+            ("bottom saturation", -0.7 * floor),
+        ] {
+            let h0 = with_first(lambda);
+            let plan = JointJeffreysPlan::prepare(h0.view(), z.view()).unwrap();
+            assert!(plan.floor_in_relative_regime, "{label}: the floor tracks λ_max");
+            assert_eq!(plan.gate_weight, 1.0, "{label}: the Jeffreys term is armed");
+            let weights = plan
+                .explicit_param_mixed_trace_weights(&explicit)
+                .unwrap_or_else(|error| panic!("{label}: λ = {lambda:e} is no stratum: {error}"));
+            let analytic = weights.contract(&beta_derivative, &mixed_derivative).unwrap();
+            let scalar = joint_jeffreys_phi_explicit_param_second_derivative(
+                h0.view(),
+                z.view(),
+                &explicit,
+                &beta_derivative,
+                &mixed_derivative,
+            )
+            .unwrap();
+            assert!(
+                (scalar - analytic).abs() <= 1e-14 * analytic.abs().max(1.0),
+                "{label}: scalar {scalar} vs prepared contraction {analytic}"
+            );
+            let first_at = |t: f64| {
+                let h = &h0 + &(t * &beta_derivative);
+                JointJeffreysPlan::prepare(h.view(), z.view())
+                    .unwrap()
+                    .explicit_param_derivative(&(&explicit + &(t * &mixed_derivative)))
+                    .unwrap()
+            };
+            let step = 1e-4;
+            let fd = (first_at(step) - first_at(-step)) / (2.0 * step);
+            let error = (analytic - fd).abs() / analytic.abs().max(1.0);
+            eprintln!("[2982] {label}: analytic {analytic:.12e}, FD {fd:.12e}, relative {error:.2e}");
+            assert!(error < 1e-6, "{label}: analytic {analytic} vs FD {fd} (relative {error:e})");
+        }
+    }
+
     /// gam#979: preparing the snapshot spectrum ONCE and differentiating along
     /// many directions from it must agree, to the bit, with re-preparing it for
     /// every direction.
@@ -6571,7 +6725,7 @@ mod tests {
         // branch): the moderate negative direction must NOT carry a phantom
         // 1/floor-scale Firth score. With the original signed floor, |grad|
         // would be ~1/floor ≈ 1.7e9 here; with the saturating branch the
-        // negative direction's slope is `floor/(floor − λ)² ≈ 0`.
+        // negative direction's slope is `w(λ/floor)/floor ≈ floor³/λ⁴ ≈ 0`.
         assert!(
             grad.iter().all(|g| g.abs() < 1e3),
             "indefinite direction must carry no phantom Firth score; grad={grad:?}"
@@ -6586,8 +6740,9 @@ mod tests {
             grad[1]
         );
         // Φ = ½(ln λ0 + g_sat(λ1)) with the saturating continuation on λ1 < 0:
-        // g_sat(λ) = ln(floor) − 1 + λ/(floor − λ). λ_max = e^{b0}, so
-        // floor = REL · λ_max here (relative regime).
+        // g_sat(λ) = ln(floor) − 1 + G(λ/floor), G = ∫₀ᵗ ds/(1 + s⁴) in its
+        // textbook closed form. λ_max = e^{b0}, so floor = REL · λ_max here
+        // (relative regime).
         let lam0 = beta[0].exp();
         let lam1 = -(1.0 + beta[1] * beta[1]);
         let floor = 1e-10_f64 * lam0;
@@ -6597,7 +6752,12 @@ mod tests {
             } else if lam >= 0.0 {
                 lam / floor + floor.ln() - 1.0
             } else {
-                floor.ln() - 1.0 + lam / (floor - lam)
+                let t = lam / floor;
+                let r = std::f64::consts::SQRT_2;
+                let antiderivative = ((t * t + r * t + 1.0) / (t * t - r * t + 1.0)).ln()
+                    / (4.0 * r)
+                    + ((r * t + 1.0).atan() + (r * t - 1.0).atan()) / (2.0 * r);
+                floor.ln() - 1.0 + antiderivative
             }
         };
         let expected_phi = 0.5 * (lam0.ln() + g_sat(lam1, floor));
@@ -7327,6 +7487,122 @@ mod tests {
         }
         // The floor-bound cap, the plateau and the negative branch carry nonzero channels.
         assert!(nonzero_points >= 3, "only {nonzero_points} points reach a floor-sensitive branch");
+    }
+
+    /// gam#2982: on the bottom saturation `g = ln(floor) − 1 + G(λ/floor)`, every published
+    /// partial is the central difference of the one it differentiates, from `t = λ/floor` near
+    /// zero through the steepest slope (`t⁴ = 3/5`) to deep saturation; and every partial is
+    /// continuous across `λ = 0`, so a structurally null eigenvalue that roundoff lands on
+    /// either side of zero sees one criterion.
+    #[test]
+    fn bottom_saturation_partials_match_finite_difference_and_join_the_plateau_2982() {
+        let floor = 2.0;
+        type Channel = fn(f64, f64) -> f64;
+        // (label, analytic, differentiated function, true to difference in λ, false in floor).
+        let channels: [(&str, Channel, Channel, bool); 14] = [
+            ("d = ∂λ g", floored_inverse, jeffreys_antiderivative, true),
+            ("g_f = ∂f g", jeffreys_antiderivative_floor_sensitivity, jeffreys_antiderivative, false),
+            (
+                "g_ff = ∂f g_f",
+                jeffreys_antiderivative_floor_second_sensitivity,
+                jeffreys_antiderivative_floor_sensitivity,
+                false,
+            ),
+            (
+                "g_fff = ∂f g_ff",
+                jeffreys_antiderivative_floor_third_sensitivity,
+                jeffreys_antiderivative_floor_second_sensitivity,
+                false,
+            ),
+            (
+                "g_ffff = ∂f g_fff",
+                jeffreys_antiderivative_floor_fourth_sensitivity,
+                jeffreys_antiderivative_floor_third_sensitivity,
+                false,
+            ),
+            ("d_λ = ∂λ d", floored_inverse_prime, floored_inverse, true),
+            ("d_f = ∂f d", floored_inverse_floor_sensitivity, floored_inverse, false),
+            (
+                "d_f = ∂λ g_f",
+                floored_inverse_floor_sensitivity,
+                jeffreys_antiderivative_floor_sensitivity,
+                true,
+            ),
+            (
+                "d_λf = ∂λ d_f",
+                floored_inverse_lambda_floor_sensitivity,
+                floored_inverse_floor_sensitivity,
+                true,
+            ),
+            ("d_λf = ∂f d_λ", floored_inverse_lambda_floor_sensitivity, floored_inverse_prime, false),
+            (
+                "d_ff = ∂f d_f",
+                floored_inverse_floor_second_sensitivity,
+                floored_inverse_floor_sensitivity,
+                false,
+            ),
+            (
+                "d_fff = ∂f d_ff",
+                floored_inverse_floor_third_sensitivity,
+                floored_inverse_floor_second_sensitivity,
+                false,
+            ),
+            (
+                "d_λff = ∂λ d_ff",
+                floored_inverse_lambda_floor_second_sensitivity,
+                floored_inverse_floor_second_sensitivity,
+                true,
+            ),
+            (
+                "d_λλf = ∂λ d_λf",
+                floored_inverse_lambda_lambda_floor_sensitivity,
+                floored_inverse_lambda_floor_sensitivity,
+                true,
+            ),
+        ];
+        let steepest = -(0.6_f64).powf(0.25) * floor;
+        for lam in [-0.01, -0.6, steepest, -3.0, -80.0] {
+            let step = 1e-6 * lam.abs().max(1.0);
+            for &(label, analytic, antiderivative, in_lambda) in &channels {
+                let fd = if in_lambda {
+                    (antiderivative(lam + step, floor) - antiderivative(lam - step, floor)) / (2.0 * step)
+                } else {
+                    (antiderivative(lam, floor + 1e-6) - antiderivative(lam, floor - 1e-6)) / 2e-6
+                };
+                let value = analytic(lam, floor);
+                assert!(
+                    (fd - value).abs() <= 1e-6 * value.abs().max(fd.abs()) + 1e-9,
+                    "{label} at λ = {lam}, floor = {floor}: analytic {value:e} vs central difference {fd:e}"
+                );
+            }
+        }
+        // The steepest slope is the divided-difference bound the kernel documents.
+        let slope = floored_inverse_prime(steepest, floor).abs() * floor * floor;
+        assert!(
+            (slope - 4.0 * 0.6_f64.powf(0.75) / 2.56).abs() <= 1e-14,
+            "steepest bottom slope {slope} · floor²"
+        );
+        // G against its textbook closed form, and its limit.
+        let r = std::f64::consts::SQRT_2;
+        for t in [-1e-4, -0.3, -1.0, -2.5, -1e3] {
+            let textbook = ((t * t + r * t + 1.0) / (t * t - r * t + 1.0)).ln() / (4.0 * r)
+                + ((r * t + 1.0).atan() + (r * t - 1.0).atan()) / (2.0 * r);
+            let value = bottom_profile_antiderivative(t);
+            assert!((value - textbook).abs() <= 1e-15 * (1.0 + textbook.abs()), "G({t}) = {value} vs {textbook}");
+        }
+        let floor_limit = floor.ln() - 1.0 - std::f64::consts::PI / (2.0 * r);
+        assert!((jeffreys_antiderivative(-1e12 * floor, floor) - floor_limit).abs() <= 1e-15 * floor_limit.abs());
+        // Across zero: a partial reading at most four λ-derivatives of g joins the plateau, so
+        // `λ = −δ` and `λ = 0` agree to O(δ) on every channel. The old `floor/(floor − λ)²`
+        // branch put `d_λ(0⁻) = 2/floor²` against the plateau's 0.
+        let delta = 1e-9 * floor;
+        for &(label, analytic, _, _) in &channels {
+            let (below, at) = (analytic(-delta, floor), analytic(0.0, floor));
+            assert!(
+                (below - at).abs() <= 1e-8 * (1.0 + at.abs()),
+                "{label} jumps across λ = 0: {below:e} below vs {at:e} on the plateau"
+            );
+        }
     }
 
     #[test]

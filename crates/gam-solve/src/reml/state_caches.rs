@@ -31,9 +31,9 @@ pub(crate) const IFT_STEP_CAP_SHRINK_FACTOR: f64 = 0.5;
 // 5e-6 because the gradient is scaled by penalised Hessian curvature
 // that can carry an extra ~order of magnitude of roundoff at convergence.
 // The gradient-unit channels (dual, complementarity, stationarity) are judged
-// relative to `max(1, ‖g‖∞)` as well as absolutely, through
-// `active_set::exceeds_at_gradient_scale`, so the verdict does not depend on
-// the response's units.
+// relative to the gradient's natural (operand) scale and only relative to it,
+// through `active_set::exceeds_at_gradient_scale`, so the verdict does not
+// depend on the response's units or on any rescaling of the objective.
 pub(crate) const KKT_TOL_PRIMAL: f64 = 1e-7;
 
 pub(crate) const KKT_TOL_DUAL: f64 = 1e-7;
@@ -1661,6 +1661,93 @@ impl BlockExcessTarget for Gam784BlockTarget<'_> {
             .into_iter()
             .map(|(excess, _)| excess)
             .collect()
+    }
+
+    /// A one-axis block of a reciprocal-power link: the row surface is defined
+    /// only on `η > 0` ([`crate::pirls::linear_predictor_positive_domain`]), and
+    /// along the axis `η_i(t) = η̂_i + xv_i·t` with `xv = X_t·v`, so each row with
+    /// likelihood mass and `xv_i ≠ 0` ends the domain at `t_i = −η̂_i/xv_i`. The
+    /// feasible interval is the intersection of those half-lines, which contains
+    /// `t = 0` because the mode is feasible.
+    fn axis_truncation(
+        &self,
+    ) -> Option<Box<dyn gam_problem::laplace_sampler_contract::BlockAxisTruncation + '_>> {
+        use gam_problem::laplace_sampler_contract::BlockAxisCut;
+        if self.block_dim() != 1
+            || !crate::pirls::linear_predictor_positive_domain(&self.likelihood, &self.inverse_link)
+        {
+            return None;
+        }
+        let xv = gam_linalg::faer_ndarray::fast_av(
+            self.x_transformed,
+            &self.block_vecs.column(0).to_owned(),
+        );
+        let mut lower: Option<BlockAxisCut> = None;
+        let mut upper: Option<BlockAxisCut> = None;
+        let mut curvature = 0.0_f64;
+        for (row, ((&slope, &eta), (&prior_weight, &weight))) in xv
+            .iter()
+            .zip(self.eta_hat.iter())
+            .zip(self.prior_weights.iter().zip(self.weights_obs.iter()))
+            .enumerate()
+        {
+            curvature += weight * slope * slope;
+            if !(prior_weight > 0.0) || slope == 0.0 {
+                continue;
+            }
+            let cut = BlockAxisCut {
+                t: -eta / slope,
+                row,
+                row_slope: slope,
+            };
+            if slope > 0.0 {
+                if lower.is_none_or(|bound| cut.t > bound.t) {
+                    lower = Some(cut);
+                }
+            } else if upper.is_none_or(|bound| cut.t < bound.t) {
+                upper = Some(cut);
+            }
+        }
+        Some(Box::new(PositiveDomainAxis {
+            xv,
+            curvature,
+            base_neg_score: &self.base_neg_score_at_mode,
+            lower,
+            upper,
+        }))
+    }
+}
+
+/// The feasible interval of a one-axis [`Gam784BlockTarget`] on `η > 0`.
+struct PositiveDomainAxis<'a> {
+    /// `X_t·v`, the per-row displacement per unit `t`.
+    xv: Array1<f64>,
+    /// `Σ_i W_i xv_i²`, the curvature the Taylor remainder subtracts.
+    curvature: f64,
+    base_neg_score: &'a Array1<f64>,
+    lower: Option<gam_problem::laplace_sampler_contract::BlockAxisCut>,
+    upper: Option<gam_problem::laplace_sampler_contract::BlockAxisCut>,
+}
+
+impl gam_problem::laplace_sampler_contract::BlockAxisTruncation for PositiveDomainAxis<'_> {
+    fn lower(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+        self.lower
+    }
+
+    fn upper(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+        self.upper
+    }
+
+    /// `∂ΔF/∂t = xvᵀ(ψ'(η̂ + xv·t) − ψ'(η̂)) − (Σ_i W_i xv_i²)·t`, the derivative of
+    /// the row Taylor remainder along the axis.
+    fn excess_slope(&self, t: f64, displaced_neg_score: &Array1<f64>) -> f64 {
+        let score_change: f64 = self
+            .xv
+            .iter()
+            .zip(displaced_neg_score.iter().zip(self.base_neg_score.iter()))
+            .map(|(slope, (displaced, base))| slope * (displaced - base))
+            .sum();
+        score_change - self.curvature * t
     }
 }
 

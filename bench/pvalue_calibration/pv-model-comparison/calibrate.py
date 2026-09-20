@@ -2,8 +2,15 @@
 
 Surface 2, ``basis_check``: the penalized score lack-of-fit p-value that
 ``Summary.basis_checks`` / ``Model.basis_check`` report per smooth. Under an
-adequate basis (a smooth truth, default ``s(x)``) it must satisfy
-``P(p <= a) <= a``; on a ``k=4`` fit of a ``sin(6x)`` truth it should reject.
+adequate basis (a smooth truth, default ``s(x)``) it must be U(0, 1): a
+two-sided KS test and ``P(p <= a) = a`` within Monte Carlo error at every
+level, so a conservative p-value fails exactly as an anti-conservative one
+does. On a ``k=4`` fit of a ``sin(6x)`` truth it should reject.
+
+The binomial and Poisson null cells repeat at two lower baselines, ``sin(2 pi
+x) - 1`` and ``sin(2 pi x) - 2``, where counts are small and events rare. A row
+whose conditional reference is unavailable reports no p-value; it is counted
+under its provenance and left out of ``tested``.
 
 Surface 1, ``compare_models``: it returns no nested-model p-value, only an
 information-criterion ranking and its gaps. The null-nested cells record how
@@ -62,7 +69,10 @@ def summarize(p_values: list[float], reps: int) -> dict:
 TRUTHS = {
     "sin2pi": lambda x: np.sin(2.0 * np.pi * x),
     "sin6": lambda x: np.sin(6.0 * x),
+    "sin2pi_minus1": lambda x: np.sin(2.0 * np.pi * x) - 1.0,
+    "sin2pi_minus2": lambda x: np.sin(2.0 * np.pi * x) - 2.0,
 }
+LOW_RATE_TRUTHS = ("sin2pi_minus1", "sin2pi_minus2")
 
 
 def basis_check_cell(family, n, formula, truth, reps, seed):
@@ -74,14 +84,15 @@ def basis_check_cell(family, n, formula, truth, reps, seed):
         y = draw_response(family, truth_fn(x), rng)
         try:
             model = gamfit.fit({"x": x, "y": y}, formula, family=family)
-        except gamfit.errors.FitError:
+        except gamfit.errors.ConvergenceError:
             # A fit the outer optimizer could not certify is refused, so it
             # has no basis_check to calibrate; count it and move on.
             fit_refused += 1
             continue
         row = model.summary().basis_checks[0]
         provenances[row["provenance"]] = provenances.get(row["provenance"], 0) + 1
-        if row["p_value"] is not None:
+        # A row that is not measured omits its p-value.
+        if row.get("p_value") is not None:
             p_values.append(float(row["p_value"]))
     result = summarize(p_values, reps)
     result.update(
@@ -103,7 +114,7 @@ def compare_models_cell(family, n, reps, seed):
         try:
             small = gamfit.fit(data, "y ~ s(x)", family=family)
             large = gamfit.fit(data, "y ~ s(x) + s(z)", family=family)
-        except gamfit.errors.FitError:
+        except gamfit.errors.ConvergenceError:
             unranked["fit refused"] = unranked.get("fit refused", 0) + 1
             continue
         try:
@@ -134,6 +145,11 @@ def cells(null_reps: int, power_reps: int, compare_reps: int, with_compare: bool
         for n in SIZES:
             seed += 1
             out.append(("null", basis_check_cell, (family, n, "y ~ s(x)", "sin2pi", null_reps, seed)))
+    for truth in LOW_RATE_TRUTHS:
+        for family in ("binomial", "poisson"):
+            for n in SIZES:
+                seed += 1
+                out.append(("null", basis_check_cell, (family, n, "y ~ s(x)", truth, null_reps, seed)))
     for family in FAMILIES:
         for n in SIZES:
             seed += 1
