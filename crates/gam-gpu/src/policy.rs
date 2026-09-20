@@ -4,12 +4,14 @@ use serde::{Deserialize, Serialize};
 pub enum GpuMixedPrecisionPolicy {
     /// Always use fp64 factorization; no refinement attempted.
     Off,
-    /// Attempt fp32 Cholesky factorization followed by up to
-    /// `REFINEMENT_MAX_STEPS` fp64-residual refinement steps. Policy admits
-    /// the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64 GEMV
-    /// overhead is amortized) and the measured residual drops monotonically.
-    /// Falls back to fp64 factorization automatically when the residual does
-    /// not decrease (κ(A)·u ≥ 1 regime) or when the fp32 POTRF itself fails.
+    /// Attempt fp32 Cholesky factorization followed by fp64-residual
+    /// refinement until the residual meets its own rounding band. Policy
+    /// admits the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64
+    /// GEMV overhead is amortized). Falls back to fp64 factorization when the
+    /// fp32 POTRF fails, when the residual does not decrease (κ(A)·u ≥ 1
+    /// regime), or when the band is out of reach within the corrections that
+    /// cost less than the fp64 factorization
+    /// (`crate::solver::refinement_step_budget`).
     Refinement,
     /// Always use fp64 factorization; equivalent to `Off` but signals that
     /// an explicit policy decision was taken.
@@ -92,14 +94,6 @@ impl GpuDispatchPolicy {
     /// `potrf_min_p = 512` floor for GPU dispatch, so the refinement path only
     /// activates when the GPU factorization path is already chosen.
     pub const REFINEMENT_MIN_P: usize = 64;
-
-    /// Maximum number of fp32-correction steps per solve.
-    ///
-    /// Two steps suffice for κ(A) ≤ 10⁵ at fp32 (u ≈ 6 × 10⁻⁸): after step
-    /// 1 the error is O(κ u)² ≈ 10⁻⁶, after step 2 it is O(κ u)⁴ ≈ 10⁻¹²,
-    /// which is well within the fp64 unit roundoff of 10⁻¹⁶ × κ. A cap of 3
-    /// is used defensively.
-    pub const REFINEMENT_MAX_STEPS: usize = 3;
 
     /// Return `true` when the policy and problem size together suggest that
     /// attempting fp32 factorization + iterative refinement will be profitable.
