@@ -477,7 +477,11 @@ fn streaming_gradient_is_affine_in_the_derivative_bundle_second_moment_2933() {
 #[test]
 fn surrogate_certificate_is_rescored_on_unseen_probes_before_stamping_2933() {
     gam_runtime::test_support::install_diagnostic_logger();
-    let (mut term, target) = planted_arc_seed_term(256, 4, 0.02);
+    let target = planted_circle_embedded(256, 4, 0.02);
+    let mut term = planted_circle_seed_term(target.view(), PlantedCircleAssignmentMode::Softmax).0;
+    term.atoms[0].basis_second_jet = Some(Arc::new(
+        PeriodicHarmonicEvaluator::new(3).expect("periodic evaluator"),
+    ));
     term.gpu_policy = gam_gpu::GpuPolicy::Off;
     let default_plan = term
         .streaming_plan()
