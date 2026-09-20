@@ -280,7 +280,19 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
                 bending_order,
             )?;
         }
-        let poly_block = thin_plate_polynomial_block(data);
+        // Same knot-mean-centered polynomial chart `{1, x − x̄_C, …}` the dense
+        // builder emits (#1269), so a fit and its replay agree column for
+        // column whichever side of the materialization cap each lands on. The
+        // kernel block reads only `data − centers` and needs no shift.
+        let poly_block = {
+            let k_centers = centers.nrows().max(1) as f64;
+            let mut data_centered = data.to_owned();
+            for axis in 0..data.ncols() {
+                let mu = centers.column(axis).sum() / k_centers;
+                data_centered.column_mut(axis).mapv_inplace(|v| v - mu);
+            }
+            thin_plate_polynomial_block(data_centered.view())
+        };
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
         let shared_data = shared_owned_data_matrix(data, &workspace.cache);
@@ -4916,6 +4928,8 @@ mod matern_basis_size_tests {
     }
 }
 
+#[cfg(test)]
+mod thin_plate_constraint_frame_tests;
 #[cfg(test)]
 mod thin_plate_workspace_equivalence_regression_tests;
 #[cfg(test)]
