@@ -3615,7 +3615,7 @@ where
                             "exact smoothing-corrected covariance unavailable: {reason:?}"
                         )));
                     }
-                    log::info!(
+                    log::debug!(
                         "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
                          fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
                     );
