@@ -8373,7 +8373,7 @@ pub(crate) fn run_fixed_point_outer_solver(
             &mut seed_result,
             CertificationFidelity::Screening,
         ) {
-            log::info!(
+            log::debug!(
                 "[OUTER] {context}: {label} seed is already stationary at cost={:.6e}; \
                  no fixed-point step taken",
                 seed_result.final_value,

@@ -4968,6 +4968,58 @@ mod fisher_override_tests {
         assert!(format!("{err}").contains("fisher_w_override shape"));
     }
 
+    /// A curvature override enters the Newton model only through its quadratic
+    /// form, so an asymmetric block fits exactly as its symmetric part does, and
+    /// the fit does not depend on which triangle the Hessian factorization reads
+    /// (#2469). Negative control: a different symmetric part moves the fit.
+    #[test]
+    fn fisher_override_is_consumed_through_its_symmetric_part_2469() {
+        let (design, y, penalty, lambdas) = toy();
+        let n = design.nrows();
+        let fit = |over: &Array3<f64>| {
+            fit_penalized_multinomial(MultinomialFitInputs {
+                design: design.view(),
+                y_one_hot: y.view(),
+                penalty: penalty.view(),
+                lambdas: lambdas.view(),
+                row_weights: None,
+                fisher_w_override: Some(over.view()),
+                max_iter: 50,
+                tol: 1.0e-9,
+                resume_from: None,
+            })
+            .expect("override fit must converge")
+        };
+        // Dyadic entries, so (W + Wᵀ)/2 of the skewed block rounds to the
+        // symmetric block exactly and the two fits must agree bit for bit.
+        let symmetric = Array3::from_shape_fn((n, 2, 2), |(_, a, b)| {
+            if a == b { 0.25 } else { -0.125 }
+        });
+        let skew = Array3::from_shape_fn((n, 2, 2), |(row, a, b)| match (a, b) {
+            (0, 1) => 0.0625 * (row as f64 + 1.0),
+            (1, 0) => -0.0625 * (row as f64 + 1.0),
+            _ => 0.0,
+        });
+        let asymmetric = &symmetric + &skew;
+        let from_symmetric = fit(&symmetric);
+        let from_asymmetric = fit(&asymmetric);
+        assert_eq!(
+            from_asymmetric.coefficients_active,
+            from_symmetric.coefficients_active
+        );
+        assert_eq!(from_asymmetric.iterations, from_symmetric.iterations);
+        assert_eq!(
+            from_asymmetric.coefficient_covariance,
+            from_symmetric.coefficient_covariance
+        );
+
+        let other_symmetric = symmetric.mapv(|value| 2.0 * value);
+        assert_ne!(
+            fit(&other_symmetric).coefficient_covariance,
+            from_symmetric.coefficient_covariance
+        );
+    }
+
     #[test]
     fn formula_outer_route_uses_exact_curvature_for_medium_d() {
         // The 2-smooth reference formula fit (K = 3, double-penalty terms)

@@ -244,12 +244,14 @@ impl<'a> RemlState<'a> {
     /// an error.
     ///
     /// The Tier-0 diagnostic costs `M` outer-criterion evaluations (each an
-    /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, and the returned fit does
-    /// not need it, so the caller runs it only when ρ-posterior inference was
-    /// requested. When the diagnostic grades the plug-in [`Escalate`], the
-    /// tiers (#938) run HERE, against the same live objective — Tier 1
-    /// quadrature for `K ≤ 4`, Tier 2 NUTS with the exact LAML `ρ`-gradient
-    /// (`Self::compute_gradient`) for `K ≤ 16`, honest `Unavailable` beyond.
+    /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, `M` the 2155 draws at
+    /// which PSIS is reliable for a tail shape at the escalation cutoff; the
+    /// returned fit does not need it, so the caller runs it only when
+    /// ρ-posterior inference was requested. When the diagnostic grades the
+    /// plug-in [`Escalate`], the tiers (#938) run HERE, against the same live objective — Tier 1
+    /// quadrature or Tier 2 NUTS with the exact LAML `ρ`-gradient
+    /// (`Self::compute_gradient`), whichever needs fewer criterion evaluations,
+    /// with an honest `Unavailable` when the chosen tier fails.
     /// Post-hoc escalation after the `RemlState` is gone would need an owned
     /// rebuild recipe; running at the live seam avoids that entirely.
     ///
@@ -271,7 +273,6 @@ impl<'a> RemlState<'a> {
         &self,
         final_rho: &Array1<f64>,
         continuation: &crate::estimate::rho_domain::CriterionContinuation,
-        n_samples: Option<usize>,
     ) -> (
         gam_problem::rho_posterior::RhoPosteriorOutcome,
         Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
@@ -325,7 +326,6 @@ impl<'a> RemlState<'a> {
             final_rho,
             &outer_hessian,
             &|rho| continuation.value(rho, cost, cost_and_gradient),
-            n_samples,
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
             Ok(None) => RhoPosteriorOutcome::NotApplicable,
@@ -451,7 +451,7 @@ impl<'a> RemlState<'a> {
         };
         match &outcome {
             SmoothingCorrectionOutcome::FirstOrder { method, .. } => {
-                log::info!("[smoothing-correction] branch=first-order method={method:?}");
+                log::debug!("[smoothing-correction] branch=first-order method={method:?}");
             }
             SmoothingCorrectionOutcome::Unavailable {
                 reason: SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { error },
