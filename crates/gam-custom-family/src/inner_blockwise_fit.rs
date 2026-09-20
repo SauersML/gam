@@ -2365,17 +2365,15 @@ fn exact_joint_jeffreys_completion_at<F: CustomFamily + Clone + Send + Sync + 's
             h_information.dim(),
         )));
     }
+    // An inactive plan has a vanishing completion.
     let completion = custom_family_joint_jeffreys_second_order_completion(
         family,
         states,
         specs,
         &h_information,
         z_joint,
-        JeffreysCompletionAssembly::Exact,
     )?
-    .ok_or_else(|| {
-        format!("{context}: active Jeffreys term did not supply its exact second-order completion")
-    })?;
+    .unwrap_or_else(|| Array2::zeros((total_p, total_p)));
     if completion.dim() != (total_p, total_p) || completion.iter().any(|value| !value.is_finite()) {
         return Err(CustomFamilyError::trial_point(format!(
             "{context}: Jeffreys completion is non-finite or has shape {:?}, expected ({total_p}, {total_p})",

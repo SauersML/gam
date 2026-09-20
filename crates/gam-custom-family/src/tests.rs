@@ -4791,7 +4791,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4814,7 +4813,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("half-strength completion")
     .expect("half-strength completion present");
@@ -4826,10 +4824,9 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
     );
 }
 
-/// gam#1020: for an expected-information family without a contracted hook, exact
-/// assembly dispatches to the mathematically identical pairwise second-directional
-/// path. The contracted-only policy must decline because that family contract is
-/// absent.
+/// gam#1020: for an expected-information family without a contracted hook, the
+/// completion dispatches to the mathematically identical pairwise second-directional
+/// path.
 #[derive(Clone)]
 struct PairwiseJeffreysSeamFamily;
 
@@ -4896,7 +4893,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4919,20 +4915,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
     assert!(
         completion.iter().any(|value| value.abs() > 0.0),
         "pairwise completion should be nonzero on this gated fixture"
-    );
-
-    let contracted_only = custom_family_joint_jeffreys_second_order_completion(
-        &family,
-        &states,
-        &specs,
-        &h_joint,
-        &z_joint,
-        JeffreysCompletionAssembly::Contracted,
-    )
-    .expect("contracted-only completion");
-    assert!(
-        contracted_only.is_none(),
-        "contracted-only assembly must decline when the family has no contracted hook"
     );
 }
 
@@ -5044,7 +5026,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_contracts_span_directions_2
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
