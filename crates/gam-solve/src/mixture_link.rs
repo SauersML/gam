@@ -2,7 +2,7 @@ use crate::estimate::EstimationError;
 use crate::quadrature::{latent_cloglog_d6, latent_cloglog_jet5};
 use gam_math::{
     probability::{normal_cdf, normal_pdf},
-    special::trigamma,
+    special::{digamma, trigamma},
 };
 use gam_math::special::stable_polynomial_times_exp_neg as stable_nonnegative_poly_times_exp_neg;
 use gam_problem::{
@@ -11,7 +11,6 @@ use gam_problem::{
 };
 use ndarray::{Array1, Array2};
 use statrs::function::beta::{beta_reg, ln_beta};
-use statrs::function::gamma::digamma;
 use std::ops::Neg;
 use std::sync::OnceLock;
 
@@ -602,7 +601,7 @@ fn taylor5_inv(a: &[f64; 5]) -> [f64; 5] {
 /// terms and a separately evaluated log weight. Direct complementary tails
 /// retain variance information after the reported mean rounds to an endpoint;
 /// each derivative is rescaled separately, including when W itself underflows.
-pub(crate) fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
+pub fn fisher_weight_jet5(link: StandardLink, eta: f64) -> (f64, f64, f64, f64, f64) {
     match link {
         StandardLink::Logit => {
             let jet = logit_inverse_link_jet5(eta);
@@ -2013,14 +2012,22 @@ pub fn inverse_link_complement_for_inverse_link(
             beta_logistic_link_complement(eta, state.log_delta, state.epsilon, mu)
         }
         InverseLink::Mixture(state) => mixture_link_complement(state, eta, mu),
-        // The latent-cloglog mean is a lognormal-Laplace quadrature
-        // (`latent_cloglog_jet5`), whose kernel reports `mean` and its
-        // derivatives but not the complementary `E[exp(-Z e^eta)]` the exact
-        // complement would need. Until that kernel exposes the survival output,
-        // the naive complement leaves this link's saturation behaviour exactly as
-        // it was, so it retains the `V = mu(1-mu) -> 0` limitation the sibling
-        // links no longer have.
-        InverseLink::LatentCLogLog(_) => 1.0 - mu,
+        // The latent-cloglog mean is `1 − S(eta, σ_L)` with the lognormal-Laplace
+        // survival `S(m, σ) = E[exp(−exp η)]`, `η ~ N(m, σ²)`
+        // (`latent_cloglog_jet5` forms it as `−expm1(ln S)`). Its complement is
+        // `S` itself, read from the same log-space survival surface, so it keeps
+        // its digits where the mean rounds to one.
+        InverseLink::LatentCLogLog(state) => {
+            if eta.is_nan() {
+                f64::NAN
+            } else {
+                crate::quadrature::survival_posterior_mean(
+                    latent_cloglog_quadctx(),
+                    eta,
+                    state.latent_sd,
+                )
+            }
+        }
     };
     if raw.is_nan() {
         raw
@@ -3833,96 +3840,16 @@ pub(crate) fn sas_inverse_link_pdfthird_derivative(
     Ok(canonicalzero(out))
 }
 
-/// Fifth derivative of the SAS inverse-link CDF (= fourth derivative of the PDF).
-///
-/// Extends `sas_inverse_link_pdfthird_derivative` by one more derivative order,
-/// using the same composition chain u(eta) = g(r(eta)), z = sinh(u), mu = Phi(z).
-///
-/// The Arbogast expansion at order 5 for u(eta) = g(r(eta)) is:
-///   u5 = g5 r1^5 + 10 g4 r1^3 r2 + 15 g3 r1 r2^2 + 10 g3 r1^2 r3
-///        + 10 g2 r2 r3 + 5 g2 r1 r4 + g1 r5
-///
-/// The z = sinh(u) expansion at order 5 is the standard Arbogast for sinh:
-///   z5 = c*u1^5 + 10*s*u1^3*u2 + 15*c*u1*u2^2 + 10*c*u1^2*u3
-///        + 10*s*u2*u3 + 5*s*u1*u4 + c*u5
-///
-/// The mu = Phi(z) expansion at order 5 uses probit derivatives:
-///   mu^(5) = Phi5*z1^5 + 10*Phi4*z1^3*z2 + 15*Phi3*z1*z2^2 + 10*Phi3*z1^2*z3
-///            + 10*Phi2*z2*z3 + 5*Phi2*z1*z4 + Phi1*z5
-///
-/// Non-finite eta is rejected by the shared SAS finite-domain contract.
+/// Fifth derivative of the SAS inverse-link CDF (= fourth derivative of the PDF),
+/// on the same finite domain as [`sas_inverse_link_jet`]: order five of the
+/// composed chain [`sas_inverse_link_derivatives6`], so the fifth and sixth
+/// orders share one evaluation of the bounded latent map.
 pub(crate) fn sas_inverse_link_pdffourth_derivative(
     eta: f64,
     epsilon: f64,
     log_delta: f64,
 ) -> Result<f64, EstimationError> {
-    let eta = finite_inverse_link_eta("SAS inverse link", eta)?;
-    let asinh = asinh_jet6(eta);
-    let delta = sas_delta_from_raw_log_delta(log_delta);
-    let u_raw = delta * asinh.value + epsilon;
-    let sb = smooth_bound_jet(u_raw, SAS_U_CLAMP);
-    let u = sb.g;
-    let g1 = sb.d1;
-    let g2 = sb.d2;
-    let g3 = sb.d3;
-    let g4 = sb.d4;
-    let g5 = sb.d5;
-    let s = u.sinh();
-    let c = u.cosh();
-    let z = s;
-
-    // Probit derivatives at z.
-    let base = probit_jet(z);
-    let phi3 = probit_pdfthird_derivative(z); // Phi^{(4)}
-    let phi4 = probit_pdffourth_derivative(z); // Phi^{(5)}
-
-    let r1 = delta * asinh.d1;
-    let r2 = delta * asinh.d2;
-    let r3 = delta * asinh.d3;
-    let r4 = delta * asinh.d4;
-    let r5 = delta * asinh.d5;
-
-    // u1..u5 via Arbogast for g(r(eta)).
-    let u1 = g1 * r1;
-    let u2 = g2 * r1 * r1 + g1 * r2;
-    let u3 = g3 * r1 * r1 * r1 + 3.0 * g2 * r1 * r2 + g1 * r3;
-    let u4 = g4 * r1.powi(4)
-        + 6.0 * g3 * r1 * r1 * r2
-        + 3.0 * g2 * r2 * r2
-        + 4.0 * g2 * r1 * r3
-        + g1 * r4;
-    let u5 = g5 * r1.powi(5)
-        + 10.0 * g4 * r1 * r1 * r1 * r2
-        + 15.0 * g3 * r1 * r2 * r2
-        + 10.0 * g3 * r1 * r1 * r3
-        + 10.0 * g2 * r2 * r3
-        + 5.0 * g2 * r1 * r4
-        + g1 * r5;
-
-    // z1..z5 via Arbogast for sinh(u(eta)).
-    let z1 = c * u1;
-    let z2 = s * u1 * u1 + c * u2;
-    let z3 = c * u1 * u1 * u1 + 3.0 * s * u1 * u2 + c * u3;
-    let z4 =
-        s * u1.powi(4) + 6.0 * c * u1 * u1 * u2 + 3.0 * s * u2 * u2 + 4.0 * s * u1 * u3 + c * u4;
-    let z5 = c * u1.powi(5)
-        + 10.0 * s * u1 * u1 * u1 * u2
-        + 15.0 * c * u1 * u2 * u2
-        + 10.0 * c * u1 * u1 * u3
-        + 10.0 * s * u2 * u3
-        + 5.0 * s * u1 * u4
-        + c * u5;
-
-    // mu^(5) = Phi^(5)*z1^5 + 10*Phi^(4)*z1^3*z2 + 15*Phi^(3)*z1*z2^2
-    //        + 10*Phi^(3)*z1^2*z3 + 10*Phi^(2)*z2*z3 + 5*Phi^(2)*z1*z4 + Phi^(1)*z5
-    let out = phi4 * z1.powi(5)
-        + 10.0 * phi3 * z1 * z1 * z1 * z2
-        + 15.0 * base.d3 * z1 * z2 * z2
-        + 10.0 * base.d3 * z1 * z1 * z3
-        + 10.0 * base.d2 * z2 * z3
-        + 5.0 * base.d2 * z1 * z4
-        + base.d1 * z5;
-    Ok(canonicalzero(out))
+    Ok(sas_inverse_link_derivatives6(eta, epsilon, log_delta)?[4])
 }
 
 /// Derivatives `1..=6` of a composition `f(h(η))` from the outer derivatives
@@ -5855,9 +5782,9 @@ mod tests {
 
     #[test]
     fn composed_sas_derivatives_reproduce_the_hand_arbogast_orders_3203() {
-        // `compose_derivatives6` is the Faà di Bruno sum the SAS sixth order is
-        // built from; its orders 1..5 must be the hand-expanded Arbogast chains
-        // of the SAS jet, `f‴` and `f⁗` to rounding.
+        // `compose_derivatives6` is the Faà di Bruno sum the SAS fifth and sixth
+        // orders are built from; its orders 1..4 must be the hand-expanded
+        // Arbogast chains of the SAS jet and `f‴` to rounding.
         for (epsilon, log_delta) in [(-0.25, 0.35), (0.4, -0.3), (0.0, 0.0)] {
             let state = sas_link_state_from_raw(epsilon, log_delta).expect("sas state");
             for eta in [-3.1, -0.8, 0.0, 0.45, 2.2] {
@@ -5865,15 +5792,11 @@ mod tests {
                     .expect("composed SAS derivatives");
                 let jet = sas_inverse_link_jet(eta, state.epsilon, state.log_delta)
                     .expect("SAS jet");
-                let hand = [
-                    jet.d1,
-                    jet.d2,
-                    jet.d3,
-                    sas_inverse_link_pdfthird_derivative(eta, state.epsilon, state.log_delta)
-                        .expect("SAS fourth derivative"),
-                    sas_inverse_link_pdffourth_derivative(eta, state.epsilon, state.log_delta)
-                        .expect("SAS fifth derivative"),
-                ];
+                let fourth = |x: f64| {
+                    sas_inverse_link_pdfthird_derivative(x, state.epsilon, state.log_delta)
+                        .expect("SAS fourth derivative")
+                };
+                let hand = [jet.d1, jet.d2, jet.d3, fourth(eta)];
                 for (order, (&got, &want)) in composed.iter().zip(hand.iter()).enumerate() {
                     assert!(
                         (got - want).abs() <= 1e-12 * (1.0 + want.abs()),
@@ -5882,6 +5805,17 @@ mod tests {
                         order + 1
                     );
                 }
+                // Order five has no hand chain of its own: it is the eta-slope of
+                // the hand `f⁗`. The central difference errs by `h²|μ⁽⁷⁾|/6` plus
+                // `ε|μ⁽⁴⁾|/h` of rounding, both far inside the band at `h = 1e-4`.
+                let h = 1e-4;
+                let fd = (fourth(eta + h) - fourth(eta - h)) / (2.0 * h);
+                assert!(
+                    (composed[4] - fd).abs() <= 1e-6 * (1.0 + composed[4].abs()),
+                    "SAS order 5 at eta={eta}, (eps, log_delta)=({epsilon}, {log_delta}): \
+                     composed {:e}, fd of the hand fourth {fd:e}",
+                    composed[4]
+                );
             }
         }
     }
@@ -5941,6 +5875,43 @@ mod tests {
             }
         }
         assert!(failures.is_empty(), "#3203:\n  {}", failures.join("\n  "));
+    }
+
+    /// The latent-cloglog complement is the survival `S(eta, σ_L)`, not
+    /// `1 − mu`: at `(eta, σ_L) = (8, 0.5)` the mean rounds to one while
+    /// `ln S = −70.97988851759840` (the #2714 high-precision reference row, which
+    /// `ln S` meets to `1e-13` relative).
+    #[test]
+    fn latent_cloglog_complement_keeps_the_survival_tail() {
+        let link = InverseLink::LatentCLogLog(
+            gam_problem::types::LatentCLogLogState::new(0.5).expect("valid latent SD"),
+        );
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 8.0).expect("latent jet");
+        assert_eq!(mu, 1.0, "the mean saturates, so 1 - mu carries nothing");
+        let complement = inverse_link_complement_for_inverse_link(&link, 8.0, mu);
+        assert!(
+            complement > 0.0,
+            "the complement must keep the representable survival tail, got {complement:e}"
+        );
+        let reference_log_survival = -7.097_988_851_759_84e1;
+        let relative =
+            (complement.ln() - reference_log_survival).abs() / reference_log_survival.abs();
+        assert!(
+            relative <= 1.0e-12,
+            "ln complement = {:.17e}, reference {reference_log_survival:.17e} \
+             (relative {relative:.3e})",
+            complement.ln()
+        );
+
+        // Where the mean does not saturate, the complement and the mean share
+        // one `ln S`, so they add to one up to the rounding of each.
+        let (mu, _) = inverse_link_mu_d1_for_inverse_link(&link, 0.35).expect("latent jet");
+        let complement = inverse_link_complement_for_inverse_link(&link, 0.35, mu);
+        assert!(
+            (mu + complement - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "mu {mu:.17e} + complement {complement:.17e} must be one"
+        );
+        assert!(inverse_link_complement_for_inverse_link(&link, f64::NAN, f64::NAN).is_nan());
     }
 
     #[test]

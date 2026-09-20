@@ -874,8 +874,44 @@ mod pca_function_mass_tests {
         );
         assert!(
             message.contains("rank 1 < 2"),
-            "missing RRQR evidence: {message}"
+            "missing rank evidence: {message}"
         );
+    }
+
+    /// A score column that is an exact copy, or an exact combination, of the
+    /// others has a Gram eigenvalue that is zero up to the Gram's formation
+    /// rounding. Its computed sign is arbitrary; on the positive side the
+    /// eigen-square-root resurrects it as a pivot of order `√ε·σ_max`, far above
+    /// a column-pivoted QR cutoff of order `n·ε·|R₀₀|`, so a pivot-magnitude
+    /// test passes such a design as full rank about half the time. The rank
+    /// read against the Gram's resolution band must refuse every case.
+    #[test]
+    fn dependent_pca_score_components_are_rejected_whatever_the_rounding_sign() {
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut uniform = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ((state >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+        };
+        let duplicated = array![[1.0, 0.0, 1.0], [0.0, 1.0, 0.0]];
+        let summed = array![[1.0, 0.0, 1.0], [0.0, 1.0, 1.0]];
+        for dataset in 0..8 {
+            let rows = 64 + 17 * dataset;
+            let data = Array2::from_shape_fn((rows, 2), |_| uniform());
+            for (label, basis) in [("duplicated", &duplicated), ("summed", &summed)] {
+                let result =
+                    build_pca_smooth_basis(data.view(), &[0, 1], basis, false, None, None, 16);
+                let err = result.err().unwrap_or_else(|| {
+                    panic!("{label} component in dataset {dataset} must be rejected")
+                });
+                let message = err.to_string();
+                assert!(
+                    message.contains("rank 2 < 3"),
+                    "{label} dataset {dataset}: unexpected error: {message}"
+                );
+            }
+        }
     }
 
     #[test]

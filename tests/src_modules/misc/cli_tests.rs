@@ -6,7 +6,7 @@ use super::{
     SurvivalLikelihoodMode, build_survival_time_basis,
     compact_fit_result_for_batch,
     covariance_from_model, family_arg_canonical_name,
-    fit_required_columns, formula_columns, load_dataset_projected, parse_formula,
+    fit_required_columns, formula_columns, load_prediction_id_values, parse_formula,
     parse_surv_response, parse_survival_time_basis_config, predict_gam,
     prepend_id_column_to_prediction_csv,
     validate_cli_firth_configuration, validate_fit_args_preflight,
@@ -61,6 +61,7 @@ use gam::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam::generative::sampleobservation_seeded_replicates;
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
+    load_dataset_projected,
 };
 use gam::inference::formula_dsl::{
     ParsedTerm, effectivelinkwiggle_formulaspec, parse_link_choice, parse_linkwiggle_formulaspec,
@@ -3812,6 +3813,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         }),
         fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
         geometry: Some(FitGeometry {
@@ -5675,6 +5677,30 @@ fn prediction_csv_can_prepend_id_column() {
     assert_eq!(lines.next(), Some("person_id,eta,mean"));
     assert_eq!(lines.next(), Some("p1,0.500000000000,0.620000000000"));
     assert_eq!(lines.next(), Some("p2,-0.250000000000,0.440000000000"));
+
+    remove_temp_file(&path);
+}
+
+#[test]
+fn prediction_id_column_echoes_the_written_ids() {
+    // Every cell here parses as a number, so the numeric loader typed the
+    // column Continuous and printed `00123` as `123`, the int64 key 2^53+1 as
+    // 2^53, and refused `NA`. The IDs must come back exactly as written.
+    let mut path = std::env::temp_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
+    path.push(format!("gam_prediction_id_verbatim_{ts}.csv"));
+    fs::write(&path, "id,x\n00123,0.5\n9007199254740993,1.5\nNA,2.0\n1.10,2.5\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write id csv", e));
+
+    let ids = load_prediction_id_values(&path, "id", 4)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load id column", e));
+    assert_eq!(ids, vec!["00123", "9007199254740993", "NA", "1.10"]);
+    let err = load_prediction_id_values(&path, "id", 3)
+        .expect_err("an id column whose length differs from the predictions is refused");
+    assert!(err.contains("row count 4"), "unexpected error: {err}");
 
     remove_temp_file(&path);
 }
