@@ -110,6 +110,10 @@ pub enum RandomEffectTestUnavailable {
     /// The design could not be read, or it or the row state held a non-finite
     /// value.
     DesignUnavailable,
+    /// The scale is known but the fit's dispersion could not be resolved to a
+    /// finite positive value, so the score's variance has no scale to be read
+    /// against.
+    DispersionUnavailable,
     /// Every direction of the term lies inside the span of the model's other
     /// columns, so the data carry no information about it.
     NoEstimableDirection,
@@ -126,6 +130,7 @@ impl RandomEffectTestUnavailable {
         match self {
             Self::NoIrlsRowState => "random_effect_no_irls_row_state",
             Self::DesignUnavailable => "random_effect_design_unavailable",
+            Self::DispersionUnavailable => "random_effect_dispersion_unavailable",
             Self::NoEstimableDirection => "random_effect_no_estimable_direction",
             Self::NoResidualDegreesOfFreedom => "random_effect_no_residual_degrees_of_freedom",
             Self::TailUnresolved => "random_effect_tail_unresolved",
@@ -140,6 +145,9 @@ impl RandomEffectTestUnavailable {
             }
             Self::DesignUnavailable => {
                 "the design or IRLS row state could not be read as finite values"
+            }
+            Self::DispersionUnavailable => {
+                "the fit's known dispersion could not be resolved to a finite positive value"
             }
             Self::NoEstimableDirection => {
                 "every direction of this term is spanned by the model's other terms"
@@ -268,7 +276,7 @@ impl<'a> RandomEffectTestBasis<'a> {
         if let RandomEffectTestScale::Known { dispersion } = input.scale
             && !(dispersion.is_finite() && dispersion > 0.0)
         {
-            return Err(RandomEffectTestUnavailable::DesignUnavailable);
+            return Err(RandomEffectTestUnavailable::DispersionUnavailable);
         }
 
         let mut hessian_gram = Array2::<f64>::zeros((p, p));
@@ -873,6 +881,26 @@ mod tests {
         )
         .expect_err("no residual d.f.");
         assert_eq!(reason, RandomEffectTestUnavailable::NoResidualDegreesOfFreedom);
+    }
+
+    #[test]
+    fn unresolvable_known_dispersion_is_a_typed_dispersion_absence() {
+        let levels = 3;
+        let groups: Vec<usize> = (0..30).map(|i| i % levels).collect();
+        let design = intercept_and_groups(&groups, levels);
+        let y: Array1<f64> = groups.iter().map(|&g| g as f64).collect();
+        let beta = Array1::<f64>::zeros(design.ncols());
+        for dispersion in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let reason = gaussian_test(
+                &design,
+                &y,
+                &beta,
+                1..1 + levels,
+                RandomEffectTestScale::Known { dispersion },
+            )
+            .expect_err("no usable dispersion");
+            assert_eq!(reason, RandomEffectTestUnavailable::DispersionUnavailable);
+        }
     }
 
     #[test]
