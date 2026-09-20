@@ -1020,7 +1020,14 @@ impl<'a> RemlState<'a> {
         // onto the same subspace so each `coord.dim()` matches the reduced
         // `beta.len()` that `InnerSolutionBuilder::build` asserts. The Hessian
         // operator and `e_for_logdet` are already projected by the caller; this
-        // moves the penalty roots in lockstep (`R_k → R_k z`).
+        // moves the penalty roots in lockstep (`R_k → R_k z`). The face is
+        // affine — every point on it is `z β_f + (I − z zᵀ) β̂`, and the
+        // off-face part is non-zero whenever an active constraint has a
+        // non-zero right-hand side — so each restricted coordinate also carries
+        // the root-space offset `R_k(μ_k − (I − z zᵀ) β̂)`, read at the converged
+        // face point `β̂_transformed`. Without it the reduced shifted score is
+        // `zᵀS_k z (β_f − zᵀμ_k)` instead of `zᵀS_k(β̂ − μ_k)` and the outer
+        // ρ-gradient disagrees with the value (gam#4170).
         //
         // Frame consistency (#509 second face): the free basis `z`, the
         // projected Hessian `ZᵀHZ`, the projected design `XZ`, and the reduced
@@ -1056,6 +1063,7 @@ impl<'a> RemlState<'a> {
         let null_split = pirls_result.reparam_result.null_split();
         let penalty_coords = match free_basis {
             Some(z) => {
+                let face_point = pirls_result.beta_transformed.as_ref().view();
                 let original_coords = self.build_penalty_coords();
                 if pirls_result.reparam_result.canonical_transformed.len() == original_coords.len() {
                     pirls_result
@@ -1068,7 +1076,10 @@ impl<'a> RemlState<'a> {
                             ))
                         })?
                         .iter()
-                        .map(|cp| cp.to_penalty_coordinate().project_into_subspace(z))
+                        .map(|cp| {
+                            cp.to_penalty_coordinate()
+                                .project_into_subspace(z, face_point)
+                        })
                         .collect()
                 } else {
                     original_coords
@@ -1076,7 +1087,7 @@ impl<'a> RemlState<'a> {
                         .map(|coord| {
                             null_split
                                 .project_coordinate(coord, PenaltyFrame::Original)
-                                .project_into_subspace(z)
+                                .project_into_subspace(z, face_point)
                         })
                         .collect()
                 }
