@@ -42,12 +42,29 @@ is `P(p ≤ α)`; `z` is its distance from α in MCSE, on either side.
 | binom | after | 0.1057 (+0.46) | 0.0352 (−1.65) | 0.0050 (−1.22) | 0.610 | 0.9094 |
 
 Every cell is inside two MCSE on both sides at every level and none rejects
-uniformity. The binom cell is on 596 of 600 replicates, before and after:
-replicates 241, 366, 498 and 552 fail the fit itself (the outer REML
-optimizer does not certify a stationary optimum with λ on its rail), which is
-upstream of the LR test and not this lane's.
+uniformity. The binom cell there is on 596 of 600 replicates, before and
+after: at df02753c replicates 241, 366, 498 and 552 fail the fit itself (the
+outer REML optimizer does not certify a stationary optimum with λ on its
+rail), upstream of the LR test.
 
-pois and binom agree with main replicate for replicate (largest null
+### Final state: this branch merged with origin/main 89bea032
+
+Main's later outer-optimizer work fits all 600 binom replicates and moves
+every λ̂ slightly, so the whole study was re-run on the merge:
+
+| cell | size .10 (z) | size .05 (z) | size .01 (z) | KS p | power .05 |
+|---|---|---|---|---|---|
+| gauss_small | 0.1167 (+1.36) | 0.0617 (+1.31) | 0.0100 (0.00) | 0.195 | 0.7533 |
+| gauss | 0.1000 (0.00) | 0.0433 (−0.75) | 0.0083 (−0.41) | 0.266 | 0.7050 |
+| pois | 0.1000 (0.00) | 0.0500 (0.00) | 0.0083 (−0.41) | 0.441 | 0.8417 |
+| binom | 0.1200 (+1.63) | 0.0533 (+0.37) | 0.0067 (−0.82) | 0.331 | 0.9150 |
+
+600 of 600 fits and a published null p-value on every one, in every cell.
+Every size is within two MCSE of nominal on both sides, no cell rejects
+uniformity over the whole range, and every cell's weak-term power is at or
+above main df02753c's.
+
+In the df02753c A/B, pois and binom agree with main replicate for replicate (largest null
 p-value difference 5e-4 on pois, 1.4e-5 on binom). Their known scale never
 enters the profiled-scale path this lane changes, and on these fits the null
 block's Lawley factor stays within 1.000 to 1.023, where the bounded factor
