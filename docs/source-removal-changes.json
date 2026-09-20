@@ -1927,5 +1927,59 @@
     ],
     "reason": "gam#3037: the flexible survival location-scale time block declared its coordinate cone and, appended to it by append_linear_constraints, one derivative-guard row per training row. The cone implies every one of those rows (the I-spline derivative design is non-negative entrywise, every column carrying it is bounded at zero, and the offsets encode the guard), so the block now declares the cone alone. The flexible path was its only caller, so the concatenation helper is deleted with it.",
     "evidence": "At the base, git grep finds append_linear_constraints only in crates/gam-models/src/survival/location_scale/time_block.rs: its declaration and its one call in prepare_identified_time_block's flexible path, which this commit replaces with the cone. No bench, script, example or Python file names it. source_removal_guard.py, run without this acknowledgement, refused exactly this one identity (public, 0 production occurrences)."
+  },
+  {
+    "base": "89bea032636428fd8e2ca7e7d5b1762854ff886a",
+    "items": [
+      "crates/gam-models/src/bms/estimated_latent_law.rs:fn:closed_form_survival_anchor_log_probabilities"
+    ],
+    "reason": "gam#2926 (moving-law certificate at the fitted law's anchor): the certificate scores a rigid survival row at the intercept the fit solved on its own law. closed_form_survival_anchor_log_probabilities(q, b, law) computed the closed-form intercept q·sqrt(1 + b²) itself, which is the fit's anchor only when the fitted law is Gaussian. It becomes survival_anchor_log_probabilities(alpha, b, law), which takes the intercept: calibration.rs's rigid arm passes solve_anchor(q, s·b, fitted law), the root the fit solved (#2983), or the closed form on the Gaussian law, where the two coincide.",
+    "evidence": "source_removal_guard.py and public_api_census.py each reported exactly this one identity at base de9b43848b (gateDr4 on acl42), and both passed with this entry at base 136b8383a5 (gateD5). git grep -w closed_form_survival_anchor_log_probabilities finds no occurrence under crates, src or tests at the head tree; survival_anchor_log_probabilities is declared at crates/gam-models/src/bms/estimated_latent_law.rs:253 and called at moving_law_rule.rs:1580, survival/marginal_slope/calibration.rs:197 and timepoint_exact/law_node_tests.rs:490, whose the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926 pins the intercept it takes."
+  },
+  {
+    "base": "94e6a59c5b31edf06a4d4b4b52885099ff721b22",
+    "items": [
+      "crates/gam-custom-family/src/blockwise_solve.rs:const:TOTAL_QUADRATIC_PENALTY_PAR_MIN_BLOCKS",
+      "crates/gam-custom-family/src/blockwise_solve.rs:const:TOTAL_QUADRATIC_PENALTY_PAR_MIN_DENSE_WORK",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty_accumulation_matches_the_blas_value_2959",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:block_quadratic_penalty_with_accumulation",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty_parallel_worthwhile",
+      "crates/gam-custom-family/src/blockwise_solve.rs:fn:total_quadratic_penalty_with_accumulation",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_form_with_accumulation",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_form_with_accumulation_matches_the_mat_vec_value_2959",
+      "crates/gam-problem/src/joint_penalty.rs:fn:quadratic_with_accumulation",
+      "crates/gam-solve/src/reml/assembly.rs:fn:penalty_coords_from_blocks",
+      "crates/gam-solve/src/reml/assembly.rs:struct:PenaltyBlockDesc"
+    ],
+    "reason": "#2954 stage 1b, ruling (C): the custom-family penalty is evaluated on its structural roots by one function, gam_custom_family::BlockPenaltyRoots (value, penalty_increment, s_lambdas, block_value, terms), which replaces block_quadratic_penalty, block_quadratic_penalty_with_accumulation, total_quadratic_penalty_with_accumulation, total_quadratic_penalty, total_quadratic_penalty_parallel_worthwhile and its two TOTAL_QUADRATIC_PENALTY_PAR_* thresholds in place. The dense 1/2 b'S_lambda b carried lambda times the stored matrix's null eigenvalue (representation error, measured lambda*2.14e-16 on 2923's time block). The joint bundle's quadratic_with_accumulation and JointPenaltySpec::quadratic_form_with_accumulation go the same way: the bundle's quadratic now reads its validated roots, and BlockPenaltyRoots carries the accumulation for per-block and joint terms alike. gam-solve's penalty_coords_from_blocks and PenaltyBlockDesc built the criterion's coordinates from the dense matrices with their own rank threshold; their one caller, the custom-family assembly, now builds them from the same roots, so they had no caller left. The two #2959 pins are superseded by the_root_form_value_is_within_its_band_of_a_double_double_reference_2954 and the_bundle_quadratic_is_the_root_form_at_any_strength_2954, which pin the same property on the root form.",
+    "evidence": "source_removal_guard.py and public_api_census.py, run against this base, report exactly these identities, and git grep -w finds none of the 13 names under crates, src or tests at the head tree. The landing gate at this base ran every lib and integration test target of gam-problem, gam-custom-family, gam-solve and gam-models, and every test that fails at the head fails at the base. The two #2959 pins are superseded by the_root_form_value_is_within_its_band_of_a_double_double_reference_2954 and the_bundle_quadratic_is_the_root_form_at_any_strength_2954, which pass in gam-custom-family and gam-problem."
+  },
+  {
+    "base": "890f20cb3e96f1fa3856ec167bebd9cc6734845f",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:disable_duchon_operator_penalties_in_basis",
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:gate_duchon_operator_penalties_for_family",
+      "tests/src_modules/misc/cli_tests.rs:fn:issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson"
+    ],
+    "reason": "Duchon operator penalties: one penalty structure for every family. gate_duchon_operator_penalties_for_family (with its helper disable_duchon_operator_penalties_in_basis) stripped the Duchon mass and tension operator penalties from every standard fit that was not Gaussian-identity (#1074), on the claim that fixed-dispersion LAML mis-rewards those blocks. Both LAML arms keep log|H| and log|S|+ (the Fixed arm sets include_logdet_h and include_logdet_s exactly as ProfiledGaussian does), so the claim has no criterion basis. What the gate did in practice was make scale_dimensions a no-op for GLMs: the promoted anisotropic s=0 Duchon carries per-axis relevance only through the tension-ARD penalties it removed. The gate and its call in materialize/standard.rs are deleted; every family now fits the resolved Duchon operator penalties as specified. The CLI test that pinned the gate (issue_2116_..._for_poisson) asserted the stripped structure; it is replaced by cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family in the same file, which asserts mass Active, tension Active, stiffness Disabled for Gaussian and Poisson alike.",
+    "evidence": "In the landing tree neither function name occurs (git grep -c 0). The only production caller was materialize/standard.rs, whose call is deleted in the same change, and materialize/mod.rs's re-export is removed. tests/regressions/smooths/glm_duchon_operator_penalties_recover_truth.rs fails with the gate (the formula-path Poisson scale_dimensions fit resolves all-disabled operator penalties) and passes without it; on the same basis the fit with the operator penalties converges and has held-out RMSE(eta) no worse than the gated structure for Poisson and binomial."
+  },
+  {
+    "base": "7b249280deb52c24f0f413208659dc4328c68fb3",
+    "items": [
+      "crates/gam-models/src/inference/full_conformal.rs:fn:eval",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:gaussian_reml_reselection_is_stationary_on_the_augmented_criterion",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:new",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:penalized_rss",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:residual_sum_of_squares",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:select_rho",
+      "crates/gam-models/src/inference/full_conformal.rs:fn:select_rho_domain_is_the_resolvability_interval_of_its_gram_2902",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:GaussianRemlRhoResponse",
+      "crates/gam-models/src/inference/full_conformal.rs:struct:RemlEval"
+    ],
+    "reason": "#3275: GaussianRemlRhoResponse::select_rho, the full-conformal rho-hat(z) Newton polish with the contraction-ratio stop, had no production caller. Since #3213 (63d0074714) the Layer-3 map re-selects rho-hat(z) in full_conformal/honest.rs (branch and bound, then refit_at through OuterProblem, which takes the engine's certified result with no polish), and 1d6a22a6b0 moved the coverage study's training strength off select_rho(None) to the oracle's brute_force_rho because the ratio stop refused it. select_rho was a second, unused route to rho-hat(z), so it is deleted with its polish, not re-tuned. The deny-warnings cascade goes with it: the oracle's gradient, gradient band and Hessian (read only by select_rho), and the rounding scale of residual_sum_of_squares that fed that band. The rest of GaussianRemlRhoResponse (new, eval, penalized_rss, the rho domains) is the independent REML oracle that only the honest tests and the #2280/#2902 pins use, so it moves unchanged in arithmetic into a private #[cfg(test)] mod test_support (full_conformal/test_support.rs), with RemlEval and residual_sum_of_squares. select_rho_domain_is_the_resolvability_interval_of_its_gram_2902 is renamed oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902 (same body), and gaussian_reml_reselection_is_stationary_on_the_augmented_criterion, which tested only select_rho, is deleted.",
+    "evidence": "git grep -w select_rho at base 7fff1617da finds only the definition and that one unit test; git grep GaussianRemlRhoResponse finds uses only in full_conformal.rs tests and full_conformal/honest/tests.rs. At the head tree git grep -w select_rho -- crates src tests finds nothing, and under crates GaussianRemlRhoResponse, RemlEval and residual_sum_of_squares occur only in full_conformal/test_support.rs and the two test modules. Gate direct-dy5-w2oc-3275-g1.log, TIPCHECK at tip 94e6a59c5b (tree d165e56dc0): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, source_removal_guard and public_api_census RC 0, and 16 of 17 gam-models full_conformal:: tests pass, including oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902, the #2280 penalized-RSS pin and honest_set_matches_brute_force_reml_refits. The 17th, full_conformal_coverage_holds_for_every_row_class, hit nextest's 600 s per-test cap after 5 of its 9 (scenario, n) cells. It executes no code this change touches except the oracle's eval, which now does strictly less work (no A^-1 S solve, traces or Hessian), so the cap is not this change's (read, not measured at main)."
   }
 ]

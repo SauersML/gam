@@ -1460,22 +1460,16 @@ fn cli_firth_preflight_accepts_redundant_survival_marginal_slope_flag() {
 }
 
 #[test]
-fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
-    // #2116: the `gam` CLI and the `gamfit` Python API are two front-ends of ONE
-    // shared engine (#1191/#1196). The Python/materialize standard path drops the
-    // Duchon *operator* penalties (the mass/tension collocation-Gram blocks) for a
-    // non-Gaussian-identity family via `gate_duchon_operator_penalties_for_family`
-    // (materialize/standard.rs), but the CLI's hand-built `StandardFitRequest`
-    // never applied that gate — so a Duchon smooth under e.g. Poisson fit a
-    // DIFFERENT penalty structure through the CLI than through Python, a genuine
-    // single-engine-contract violation. `run_fit` now applies the SAME gate. This
-    // test drives the real CLI fit end-to-end and pins that the persisted (frozen)
-    // Duchon term carries ALL operator penalties DISABLED under Poisson — matching
-    // the materialize path. Before the fix the frozen term kept the default
-    // (mass + tension Active), so the assertion failed; after the fix it passes.
+fn cli_scale_dimensions_fit_keeps_one_duchon_penalty_structure_for_every_family() {
+    // `scale_dimensions` promotes a multi-D thin-plate smooth to an anisotropic
+    // Duchon whose per-axis relevance is carried ONLY by the tension-ARD
+    // penalties. The materialize path used to switch the Duchon operator
+    // penalties off for every non-Gaussian-identity family, which silently
+    // turned `scale_dimensions` into a no-op for a GLM. The penalty structure is
+    // a property of the smooth, not of the likelihood: a Poisson fit must
+    // persist the same mass + tension operator penalties a Gaussian fit does.
     let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
     let train_path = td.path().join("duchon_poisson.csv");
-    let model_path = td.path().join("model.json");
 
     // Deterministic 7x7 spatial grid with a smooth log-linear Poisson mean; every
     // count is a non-negative integer so the Poisson support check passes.
@@ -1491,75 +1485,72 @@ fn issue_2116_cli_standard_fit_gates_duchon_operator_penalties_for_poisson() {
     }
     fs::write(&train_path, csv).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
 
-    run_fit(FitArgs {
-        expectile_tau: None,
-        data: train_path,
-        request: None,
-        formula_positional: Some("y ~ s(pc1, pc2, type=duchon, centers=6)".to_string()),
-        predict_noise: None,
-        slope_formula: None,
-        z_column: None,
-        residual_columns: Vec::new(),
-        weights_column: None,
-        offset_column: None,
-        noise_offset_column: None,
-        frailty_kind: None,
-        frailty_sd: None,
-        hazard_loading: None,
-        transformation_normal: false,
-        firth: false,
-        family: FamilyArg::PoissonLog,
-        negative_binomial_theta: None,
-        // `survival_likelihood` is read exclusively by the survival fit path.
-        // On a Poisson response nothing consumes it, so the requested survival
-        // model would silently degrade to an ordinary GAM -- the fit now refuses
-        // it rather than ignoring it. This test gates Duchon operator penalties
-        // and never needed the option.
-        survival_likelihood: None,
-        baseline_target: "linear".to_string(),
-        baseline_scale: None,
-        baseline_shape: None,
-        baseline_rate: None,
-        baseline_makeham: None,
-        time_basis: "ispline".to_string(),
-        threshold_time_k: None,
-        sigma_time_k: None,
-        slope_time_k: None,
-        scale_dimensions: false,
-        out: Some(model_path.clone()),
-    })
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "CLI Poisson Duchon fit should succeed", e
-        )
-    });
-
-    let saved = SavedModel::load_from_path(&model_path)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
-    let spec = saved
-        .resolved_termspec
-        .as_ref()
-        .expect("standard fit must persist a resolved termspec");
-    let duchon = spec
-        .smooth_terms
-        .iter()
-        .find_map(|term| match &term.basis {
-            SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
-            _ => None,
+    for family in [FamilyArg::Gaussian, FamilyArg::PoissonLog] {
+        let model_path = td.path().join(format!("model_{family:?}.json"));
+        run_fit(FitArgs {
+            expectile_tau: None,
+            data: train_path.clone(),
+            request: None,
+            formula_positional: Some("y ~ s(pc1, pc2)".to_string()),
+            predict_noise: None,
+            slope_formula: None,
+            z_column: None,
+            residual_columns: Vec::new(),
+            weights_column: None,
+            offset_column: None,
+            noise_offset_column: None,
+            frailty_kind: None,
+            frailty_sd: None,
+            hazard_loading: None,
+            transformation_normal: false,
+            firth: false,
+            family,
+            negative_binomial_theta: None,
+            survival_likelihood: None,
+            baseline_target: "linear".to_string(),
+            baseline_scale: None,
+            baseline_shape: None,
+            baseline_rate: None,
+            baseline_makeham: None,
+            time_basis: "ispline".to_string(),
+            threshold_time_k: None,
+            sigma_time_k: None,
+            slope_time_k: None,
+            scale_dimensions: true,
+            out: Some(model_path.clone()),
         })
-        .expect("resolved termspec must contain the Duchon smooth");
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "CLI scale_dimensions fit should succeed", e
+            )
+        });
 
-    use gam::basis::OperatorPenaltySpec::Disabled;
-    assert!(
-        matches!(duchon.operator_penalties.mass, Disabled)
-            && matches!(duchon.operator_penalties.tension, Disabled)
-            && matches!(duchon.operator_penalties.stiffness, Disabled),
-        "CLI standard fit under Poisson must gate the Duchon operator penalties \
-         (mass/tension collocation-Gram blocks) off, matching the Python/materialize \
-         path (#2116); got {:?}",
-        duchon.operator_penalties
-    );
+        let saved = SavedModel::load_from_path(&model_path)
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+        let spec = saved
+            .resolved_termspec
+            .as_ref()
+            .expect("standard fit must persist a resolved termspec");
+        let duchon = spec
+            .smooth_terms
+            .iter()
+            .find_map(|term| match &term.basis {
+                SmoothBasisSpec::Duchon { spec, .. } => Some(spec),
+                _ => None,
+            })
+            .expect("resolved termspec must contain the Duchon smooth");
+
+        use gam::basis::OperatorPenaltySpec::{Active, Disabled};
+        assert!(
+            matches!(duchon.operator_penalties.mass, Active { .. })
+                && matches!(duchon.operator_penalties.tension, Active { .. })
+                && matches!(duchon.operator_penalties.stiffness, Disabled),
+            "{family:?} scale_dimensions fit must keep the Duchon mass + tension \
+             operator penalties that carry the per-axis relevance; got {:?}",
+            duchon.operator_penalties
+        );
+    }
 }
 
 /// #2631: the CLI and the engine must resolve the SAME baseline time anchor for

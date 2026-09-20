@@ -4394,7 +4394,7 @@ fn compare_models(
         serde_json::to_value(comparison)
             .map_err(|err| format!("failed to serialize model comparison: {err}"))
     })?;
-    json_value_to_py(py, comparison)
+    json_value_to_py(py, &comparison)
 }
 
 fn extract_reml_score_raw_impl(fit: &Bound<'_, PyAny>) -> PyResult<f64> {

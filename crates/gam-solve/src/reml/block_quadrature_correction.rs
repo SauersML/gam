@@ -477,7 +477,7 @@ impl<'a> RemlState<'a> {
         let mut admissible: Vec<usize> = (0..evals.len().min(directional.len()))
             .filter(|&r| evals[r] > 0.0 && directional[r].is_finite())
             .collect();
-        let block_cols: Vec<usize> = match latched_block_dim {
+        let mut block_cols: Vec<usize> = match latched_block_dim {
             Some(m) => {
                 // Descending |γ_r|, ties broken by index so the selection is a
                 // deterministic function of (H, γ) and not of sort stability.
@@ -489,7 +489,6 @@ impl<'a> RemlState<'a> {
                         .then(a.cmp(&b))
                 });
                 admissible.truncate(m);
-                admissible.sort_unstable();
                 admissible
             }
             None => verdict
@@ -499,6 +498,7 @@ impl<'a> RemlState<'a> {
                 .filter(|&r| r < evals.len() && evals[r] > 0.0)
                 .collect(),
         };
+        order_block_axes_by_curvature(&mut block_cols, &evals);
         if block_cols.is_empty() {
             return Ok(zero());
         }
@@ -1235,6 +1235,24 @@ fn block_correction_design_admission(
     Ok(())
 }
 
+/// Put the block's eigendirections in ascending-curvature order, ties broken by
+/// index.
+///
+/// The latched Gauss-Hermite orders are bound to axis *positions*, so the
+/// position of each direction must be a property of the direction, not of the
+/// eigensolver that produced it. `eigh` of the assembled `H` returns ascending
+/// eigenvalues; the stacked-root SVD the criterion switches to once the
+/// assembled spectrum cannot resolve `log|H|` (#2644) returns descending ones.
+/// Ordered by index, the block's two axes traded their latched orders at that
+/// switch: on the prostate `s(pc1) + s(pc2)` binomial fit the 16-node rule
+/// moved to the axis certified at 9, `Δ_b` stepped by 1.2e-5 between
+/// `ρ₂ = 18.4366` and `18.4473` where its smooth variation is 1e-7, and the
+/// corrected BFGS continuation failed its line search on the step until
+/// `StepSizeTooSmall`.
+fn order_block_axes_by_curvature(block_cols: &mut [usize], evals: &Array1<f64>) {
+    block_cols.sort_by(|&a, &b| evals[a].total_cmp(&evals[b]).then(a.cmp(&b)));
+}
+
 /// One integrated piece of the block marginal: the whole block under a tensor
 /// rule, or one axis of it under the split, with its gradient channels.
 struct BlockPieceQuadrature {
@@ -1598,5 +1616,33 @@ mod design_admission_tests {
                 ..
             }) if (rows, cols, requested_bytes, cap_bytes) == (n_obs, p, bytes, bytes - 1)
         ));
+    }
+}
+
+#[cfg(test)]
+mod block_axis_order_tests {
+    use super::*;
+
+    /// The same block read from an ascending (`eigh`) and a descending
+    /// (stacked-root SVD) eigensystem must give every axis position the same
+    /// direction, or the latched per-axis orders land on different directions
+    /// when the criterion switches route.
+    #[test]
+    fn axis_positions_do_not_depend_on_the_eigensolver_order() {
+        let ascending = Array1::from(vec![2.092e-1, 1.545, 2.772, 1.160e1, 1.753e1, 1.054e2]);
+        let descending = Array1::from_iter(ascending.iter().rev().copied());
+        let n = ascending.len();
+        let mut from_eigh = vec![4usize, 1];
+        let mut from_root = vec![n - 1 - 4, n - 1 - 1];
+        order_block_axes_by_curvature(&mut from_eigh, &ascending);
+        order_block_axes_by_curvature(&mut from_root, &descending);
+        let curvatures = |cols: &[usize], evals: &Array1<f64>| -> Vec<f64> {
+            cols.iter().map(|&r| evals[r]).collect()
+        };
+        assert_eq!(curvatures(&from_eigh, &ascending), vec![1.545, 1.753e1]);
+        assert_eq!(
+            curvatures(&from_eigh, &ascending),
+            curvatures(&from_root, &descending)
+        );
     }
 }
