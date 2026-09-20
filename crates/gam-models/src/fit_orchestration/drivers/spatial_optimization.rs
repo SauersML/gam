@@ -6420,7 +6420,7 @@ fn try_exact_joint_latent_coord_optimization(
     // search actually starts from.
     let direct_slots =
         latent_coord_direct_hyper_slots(latent.values.id_mode(), latent.values.latent_dim());
-    debug_assert_eq!(direct_slots.len(), direct_hypers.len());
+    assert_eq!(direct_slots.len(), direct_hypers.len());
 
     struct LatentJointContext<'d> {
         rho_dim: usize,

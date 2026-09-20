@@ -1396,6 +1396,6 @@ mod tests {
         let coord =
             PenaltyCoordinate::from_dense_root_with_offset(array![[1.0_f64, 0.0]], array![0.5]);
         let n = 1.0_f64 / 2.0_f64.sqrt();
-        let _ = coord.project_out_null_directions(array![[n], [n]].view());
+        coord.project_out_null_directions(array![[n], [n]].view());
     }
 }

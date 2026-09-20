@@ -130,7 +130,12 @@ fn assert_finite_fit(fit: &LatentSurvivalTermFitResult, case: &str) {
 /// interval fit.
 #[test]
 fn an_all_interval_fit_seeds_from_the_lower_endpoint_surrogate_3711() {
-    let fit = fit_interval_fixture(|_| {})
+    let fit = fit_interval_fixture(|spec| {
+        assert!(
+            spec.event_target.iter().all(|&code| code == 0),
+            "#3711: the all-interval fixture must carry no exact-failure rows"
+        );
+    })
         .expect("#3711: an all-interval latent fit must converge from its surrogate seed");
     assert_finite_fit(&fit, "all-interval");
 }

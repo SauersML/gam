@@ -502,7 +502,7 @@ fn feasible_unaccepted_probe_ends_refusal_streak_without_granting_progress() {
     let resolution = guard.value_resolution(value, &Default::default());
     let best = guard.best_value();
     let accepted = guard.accepted_iters();
-    let _ = guard.observe_off_stratum(
+    guard.observe_off_stratum(
         &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
     );
     assert_eq!(guard.off_stratum_streak(), 1);
@@ -515,7 +515,7 @@ fn feasible_unaccepted_probe_ends_refusal_streak_without_granting_progress() {
     assert_eq!(publication.value, best);
     assert_eq!(publication.iterations, accepted);
     assert!(publication.rank_boundary.is_none());
-    let _ = guard.observe_off_stratum(
+    guard.observe_off_stratum(
         &refused, KEPT_RANK_INSIDE, value, resolution, ADAPTING_DECREASE,
     );
     assert_eq!(guard.off_stratum_streak(), 1);

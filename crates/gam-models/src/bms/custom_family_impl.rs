@@ -710,9 +710,15 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     // policy and multistart state are numerics-only and stay out.
     fn persistent_warm_start_fingerprint(
         &self,
-        _specs: &[ParameterBlockSpec],
-        _options: &BlockwiseFitOptions,
+        specs: &[ParameterBlockSpec],
+        options: &BlockwiseFitOptions,
     ) -> Option<String> {
+        if !crate::marginal_slope_shared::parameter_block_specs_match_rows(specs, self.y.len())
+            || !options.inner_tol.is_finite()
+            || options.inner_tol <= 0.0
+        {
+            return None;
+        }
         let mut hasher = gam_runtime::warm_start::Fingerprinter::new();
         hasher.write_str("bernoulli-marginal-slope-family");
         hasher.write_f64_array1(&self.y);
