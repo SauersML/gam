@@ -233,6 +233,28 @@ fn self_concordant_damped_step_alpha(newton_decrement: f64) -> Option<f64> {
     Some(1.0 / (1.0 + lambda_n))
 }
 
+/// Largest decrease a block's local quadratic model
+/// `m(t) = −t·(rhs·δ) + ½t²·(δᵀH_pen δ)` offers anywhere along the proposed
+/// direction `δ`: `(rhs·δ)² / (2·δᵀH_pen δ)`.
+///
+/// The ratio is invariant to rescaling `δ`, so the trust-region truncation of
+/// a Newton step does not change it, and for the Newton step itself
+/// (`H_pen δ = rhs`) it is `½·rhsᵀH_pen⁻¹rhs = ½λ²`, the Newton decrement in the
+/// same convention as [`self_concordant_damped_step_alpha`]. `λ` is the length of
+/// the remaining step measured in the posterior metric `H_pen`, i.e. in units of
+/// the coefficients' own posterior standard deviations — the resolution the
+/// data carry — rather than in raw coefficient units.
+///
+/// A direction with non-positive or non-finite curvature bounds nothing, so it
+/// reports `+∞`.
+fn line_model_decrease(rhs_dot_delta: f64, delta_dot_hpen: f64) -> f64 {
+    if delta_dot_hpen > 0.0 && delta_dot_hpen.is_finite() && rhs_dot_delta.is_finite() {
+        rhs_dot_delta * rhs_dot_delta / (2.0 * delta_dot_hpen)
+    } else {
+        f64::INFINITY
+    }
+}
+
 /// Exact reduced Moré--Sorensen step from the generalized eigensystem `(H, D)`.
 ///
 /// `D` is the existing affine-covariant trust/preconditioner metric. Whitening
@@ -4311,6 +4333,9 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         );
         let mut max_proposed_beta_step = 0.0_f64;
         let mut max_accepted_beta_step = 0.0_f64;
+        // Largest decrease any block's local quadratic model offered along its
+        // proposed direction this cycle (see `line_model_decrease`).
+        let mut max_model_decrease = 0.0_f64;
         let mut trust_boundary_hit_in_cycle = false;
 
         let mut objective_cycle_prev = lastobjective;
@@ -4579,6 +4604,8 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             };
             let rhs_dot_delta = rhs_block.dot(&delta);
             let delta_dot_hpen = delta.dot(&hpen_delta_full);
+            max_model_decrease =
+                max_model_decrease.max(line_model_decrease(rhs_dot_delta, delta_dot_hpen));
             let predicted_reduction = alpha_accepted * rhs_dot_delta
                 - 0.5 * alpha_accepted * alpha_accepted * delta_dot_hpen;
             let actual_reduction = obj_before_block - objective_cycle_prev;
@@ -4877,6 +4904,51 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             joint_stationarity_ok: exact_joint_stationarity_ok,
         });
 
+        // NOTE: there is deliberately NO wall-clock-driven "adaptive
+        // early-exit" here — the same discipline the joint-Newton sibling loop
+        // documents above. A verdict that fires when a cycle's wall-clock falls
+        // below a fraction of a running EMA is non-deterministic: under CPU
+        // contention (a parallel sweep) the same fit accepts at a different
+        // iterate than it does run alone, and it accepts iterates up to 10×
+        // outside the real KKT/objective tolerance, biasing the REML/LAML
+        // criterion the inner residual feeds. Convergence is certified ONLY by
+        // the exact stationarity gate below.
+        //
+        // A step still being taken is evidence the iterate has not arrived only
+        // when that step is resolvable. Coefficient units cannot say so on a
+        // saturating chart: a bounded coefficient `β = lo + w·σ(θ)` whose
+        // constrained optimum is its rail lives at `θ → −∞`, where every Newton
+        // step in `θ` stays O(1) while the gradient, the curvature and the
+        // objective it buys all vanish like `σ(θ)` (gam#3289: `bounded(x, min=1,
+        // max=3, prior=none)` on data whose free slope is below 1 proposed and
+        // accepted `5e-1` every cycle against a step tolerance of `3.5e-9`, with
+        // the objective flat to `1.3e-13` and exact joint stationarity holding,
+        // until the frozen-log-likelihood exit below refused the fit). The
+        // posterior metric resolves it: `max_model_decrease` is the largest
+        // decrease any block's local model offers along its proposed direction —
+        // `½λ²`, `λ` the remaining Newton step in posterior-SD units. When that
+        // is inside the objective's own tolerance, with the exact joint
+        // stationarity residual measured and passing, no resolvable movement is
+        // left, whatever the step's size in coefficient units. The route needs
+        // the exact joint Hessian, the only case where stationarity is measured
+        // rather than assumed.
+        let measured_stationarity_ok =
+            stationarity_residual.is_some_and(|residual| residual <= residual_tol);
+        let model_decrease_resolved =
+            measured_stationarity_ok && max_model_decrease <= objective_tol;
+        // This gate runs ahead of the divergence early-exit: an iterate this
+        // cycle certifies is a converged mode, not a near-null divergence, and
+        // the frozen-log-likelihood signature it would otherwise match is exactly
+        // what a certified mode looks like.
+        if (max_accepted_beta_step <= step_tol || step_is_rounding || model_decrease_resolved)
+            && objective_change <= objective_tol
+        {
+            if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
+                converged = true;
+            }
+            break;
+        }
+
         // Divergence early-exit. See the rationale block at the top of
         // this loop. We treat "log-likelihood unchanged + Newton step
         // pinned at the trust-region cap" as a near-null direction
@@ -4914,24 +4986,6 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
                 step_tol,
             );
             converged = false;
-            break;
-        }
-
-        // NOTE: there is deliberately NO wall-clock-driven "adaptive
-        // early-exit" here — the same discipline the joint-Newton sibling loop
-        // documents above. A verdict that fires when a cycle's wall-clock falls
-        // below a fraction of a running EMA is non-deterministic: under CPU
-        // contention (a parallel sweep) the same fit accepts at a different
-        // iterate than it does run alone, and it accepts iterates up to 10×
-        // outside the real KKT/objective tolerance, biasing the REML/LAML
-        // criterion the inner residual feeds. Convergence is certified ONLY by
-        // the exact stationarity gate below.
-        if (max_accepted_beta_step <= step_tol || step_is_rounding)
-            && objective_change <= objective_tol
-        {
-            if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
-                converged = true;
-            }
             break;
         }
     }

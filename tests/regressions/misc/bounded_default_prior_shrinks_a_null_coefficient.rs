@@ -140,11 +140,7 @@ fn bounded_shrinkage_prior_centres_at_the_midpoint_when_zero_is_outside_the_box(
     let (x, y) = fixture();
     let data = dataset(&x, &y);
     let slope = bounded_slope("y ~ bounded(x, min=1, max=3)", &data);
-    // The unpenalised fit is the box-constrained least-squares slope. With the
-    // intercept profiled out the Gaussian objective is a convex quadratic in
-    // the slope with its minimum at the OLS slope, so the constrained optimum
-    // is that slope clamped to the box: here the rail `min = 1`.
-    let unpenalised = ols_slope(&x, &y).clamp(1.0, 3.0);
+    let unpenalised = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
     assert!(
         (1.0..=3.0).contains(&slope),
         "the shrunk slope must honour the box, got {slope}"
@@ -153,6 +149,43 @@ fn bounded_shrinkage_prior_centres_at_the_midpoint_when_zero_is_outside_the_box(
         (slope - 2.0).abs() < (unpenalised - 2.0).abs(),
         "the shrinkage prior must pull a null slope toward the box midpoint 2: shrunk {slope}, \
          unpenalised {unpenalised}"
+    );
+}
+
+/// An unpenalised bounded coefficient whose free optimum lies outside its box
+/// fits to the rail (#3289). With the intercept profiled out the Gaussian
+/// objective is a convex quadratic in the slope with its minimum at the OLS
+/// slope, so the box-constrained optimum is that slope clamped to the box: here
+/// the rail `min = 1`, since the fixture's noise slope is about 0.03.
+///
+/// The family fits `β = 1 + 2·σ(θ)`, so the rail sits at `θ → −∞` and every
+/// Newton step in `θ` stays O(1) there; the fit used to walk down the chart
+/// until a divergence exit refused it, although the objective was flat and the
+/// iterate stationary. The band is the certificate's own resolution. Under the
+/// family's unit dispersion `f = ½A(β − b̂)²` with `A = Σ(x − x̄)² ≈ 67`, and with
+/// `s = σ(θ)` both the gradient and the curvature in `θ` are `≈ 2A(1 − b̂)·s`, so
+/// the Newton decrement is `½λ² ≈ A(1 − b̂)·s`. The inner solve stops once that
+/// falls inside its objective tolerance `τ = inner_tol·(1 + |f|)`, which leaves
+/// `β − 1 = 2s ≲ 2τ/(A(1 − b̂))`, i.e. `≲ 2τ/√A` standard errors `1/√A` — about
+/// 1e-9 SE for the default `inner_tol` and `|f| ≈ 54`. `1e-6` SE sits three
+/// orders above that and is still far inside anything a user could resolve.
+#[test]
+fn bounded_prior_none_on_a_rail_certifies_the_constrained_optimum_3289() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let ols = ols_slope(&x, &y);
+    // Non-vacuity: the free optimum lies strictly below the box.
+    assert!(ols < 1.0, "the fixture's free slope must sit below the rail, got {ols}");
+    let x_mean = x.iter().sum::<f64>() / N as f64;
+    let sxx: f64 = x.iter().map(|a| (a - x_mean) * (a - x_mean)).sum();
+    let standard_error = 1.0 / sxx.sqrt();
+    let slope = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
+    assert!(
+        slope >= 1.0 && slope - 1.0 <= 1e-6 * standard_error,
+        "the unpenalised bounded slope must be the box-constrained optimum, the rail 1 \
+         (within 1e-6 SE = {:.3e}), got {slope}",
+        1e-6 * standard_error
     );
 }
 
