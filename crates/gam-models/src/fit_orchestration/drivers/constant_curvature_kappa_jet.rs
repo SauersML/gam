@@ -96,14 +96,36 @@ impl ProfiledRemlPsiJet {
         (self.value, self.gradient[0], self.hessian[0][0])
     }
 
-    /// The η-PROFILED κ jet: `V_p(κ) = min_η V(κ, η)`, valid only AT an interior
-    /// η̂ where `V_η = 0`. The envelope theorem gives `V_p′ = V_κ`, and one more
-    /// differentiation the Schur complement `V_p″ = V_κκ − V_κη²/V_ηη` — the
-    /// same reduction this file already applies to the ρ̂ response.
+    /// The η-PROFILED κ jet: `V_p(κ) = min_η V(κ, η)`, read off the jet at an
+    /// interior η̂ with `V_ηη > 0`.
+    ///
+    /// The envelope theorem `V_p′ = V_κ` holds only where `V_η = 0` exactly, and
+    /// the inner solve does not stop there: its certificate bounds the Newton
+    /// decrement `V_η²/V_ηη` by the criterion's statistical resolution `1/(2n)`,
+    /// which leaves the minimizer `δ = −V_η/V_ηη` away. `V_κ` at η̂ then misses
+    /// `V_p′` by `V_κη·δ` — FIRST order in the residual, and not small where κ
+    /// and η are coupled: measured `V_η = −9.0e-3`, `V_ηη = 8.96`,
+    /// `V_κη = 14.9` gives a slope error of `1.5e-2` on `V_p′ = −131`, with a
+    /// decrement of `9e-6` the certificate rightly accepts (gam#3426).
+    ///
+    /// So the profile is taken at the Newton minimizer of the jet's own
+    /// quadratic in η, `η̂ + δ`, rather than at η̂:
+    ///
+    /// ```text
+    /// V_p  = V − ½·V_η²/V_ηη          (error O(δ³))
+    /// V_p′ = V_κ − V_κη·V_η/V_ηη       (error O(δ²))
+    /// V_p″ = V_κκ − V_κη²/V_ηη         (error O(δ), the Schur complement)
+    /// ```
+    ///
+    /// Each line is the exact κ-derivative of the one above up to the order it
+    /// carries, so the triple is the jet of one function wherever the inner
+    /// solve stopped inside its band — and at `V_η = 0` it is the plain envelope
+    /// and Schur reduction, the same one this file applies to the ρ̂ response.
     ///
     /// Refuses rather than substituting a number when `V_ηη` cannot identify the
     /// reduction: at a non-positive η-curvature the inner problem is not at a
-    /// minimum and the profile's second derivative is not defined there.
+    /// minimum and neither the Newton minimizer nor the profile's second
+    /// derivative is defined there.
     fn eta_profiled_kappa_jet(&self) -> Result<(f64, f64, f64), EstimationError> {
         let v_ee = self.hessian[1][1];
         if !(v_ee.is_finite() && v_ee > 0.0) {
@@ -112,10 +134,11 @@ impl ProfiledRemlPsiJet {
                  so the inner minimum in η is not identified"
             );
         }
+        let v_e = self.gradient[1];
         let v_ke = self.hessian[0][1];
         Ok((
-            self.value,
-            self.gradient[0],
+            self.value - 0.5 * v_e * v_e / v_ee,
+            self.gradient[0] - v_ke * v_e / v_ee,
             self.hessian[0][0] - v_ke * v_ke / v_ee,
         ))
     }

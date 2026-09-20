@@ -410,7 +410,7 @@ fn observed_state(
     )?;
     let last = observed.subjects[0].len() - 1;
     Ok(LatentState {
-        grid: pass.grids.pop().expect("at least one node"),
+        grid: std::sync::Arc::unwrap_or_clone(pass.grids.pop().expect("at least one node")),
         alpha: pass.alpha.pop().expect("at least one node"),
         time: observed.subjects[0].times[last],
     })
@@ -660,7 +660,7 @@ impl WindowIntegrand<'_> {
                 log_decrement: pass.log_normalisers.iter().sum(),
                 sub_densities,
                 state: Some(LatentState {
-                    grid: pass.grids.pop().expect("cell has nodes"),
+                    grid: std::sync::Arc::unwrap_or_clone(pass.grids.pop().expect("cell has nodes")),
                     alpha: pass.alpha.pop().expect("cell has nodes"),
                     time: outer_times[q - 1],
                 }),

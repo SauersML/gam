@@ -442,25 +442,22 @@ pub fn census_shattered_circles(
     // One e-BH ledger over the whole screened family. e-BH is valid under
     // ARBITRARY dependence between the pairs' e-values, which is the property this
     // census needs: candidate planes share atoms, share rows, and are anything but
-    // independent.
+    // independent. The family is every candidate the search generated, not only
+    // the planes that could be adjudicated: a pair whose plane has no frame
+    // (collinear or zero directions) or no radius law (`m₂ = 0`) is still a
+    // hypothesis the search looked at, and carries `e = 0` into the ledger.
     let mut out = out;
     let e_values: Vec<f64> = out.iter().map(|p| p.e_value).collect();
-    let rejected = ebh_reject(&e_values, cfg.fdr_alpha);
-    let m = e_values.len() as f64;
-    let ebh_threshold = if rejected.is_empty() {
-        f64::INFINITY
-    } else {
-        m / (cfg.fdr_alpha * rejected.len() as f64)
-    };
-    for i in rejected {
+    let ledger = ebh_ledger(&e_values, candidate_pairs.len(), cfg.fdr_alpha);
+    for &i in &ledger.rejected {
         out[i].fdr_discovery = true;
     }
-    let n_max_e = out.iter().filter(|p| p.e_value > 0.0).count();
-    let replicates_required = if n_max_e == 0 {
-        f64::INFINITY
-    } else {
-        m / (cfg.fdr_alpha * n_max_e as f64) - 1.0
-    };
+    let CensusLedger {
+        ebh_threshold,
+        n_max_e,
+        replicates_required,
+        ..
+    } = ledger;
 
     Ok(CurlCensus {
         sigma,
@@ -474,6 +471,55 @@ pub fn census_shattered_circles(
         replicates_drawn: replicates,
         replicates_required,
     })
+}
+
+/// The e-BH ledger's verdict over a census family.
+struct CensusLedger {
+    /// Indices into the adjudicated e-values that e-BH rejects.
+    rejected: Vec<usize>,
+    /// `m/(α·k)` at the rejection count `k`; `∞` when nothing is rejected.
+    ebh_threshold: f64,
+    /// Adjudicated pairs that attained the maximum e-value.
+    n_max_e: usize,
+    /// `m/(α·n_max_e) − 1`; `∞` when no pair attained the maximum.
+    replicates_required: f64,
+}
+
+/// Run e-BH at level `alpha` over a family of `family` hypotheses of which the
+/// first `adjudicated.len()` carry the given e-values and the rest carry `e = 0`
+/// (candidates the census generated but could not adjudicate). Padding with the
+/// valid e-value `0` is what keeps `m` the size of the search: dropping those
+/// candidates instead would shrink every threshold `m/(α·k)` to the survivors
+/// and let the ledger reject at a level the search never paid for.
+fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
+    debug_assert!(
+        adjudicated.len() <= family,
+        "curl census: {} adjudicated e-values from a family of {family}",
+        adjudicated.len()
+    );
+    let mut e_values = adjudicated.to_vec();
+    e_values.resize(family.max(adjudicated.len()), 0.0);
+    // A padded `e = 0` can never clear the positive threshold `m/(α·k)`, so every
+    // rejected index points into `adjudicated`.
+    let rejected = ebh_reject(&e_values, alpha);
+    let m = e_values.len() as f64;
+    let ebh_threshold = if rejected.is_empty() {
+        f64::INFINITY
+    } else {
+        m / (alpha * rejected.len() as f64)
+    };
+    let n_max_e = adjudicated.iter().filter(|&&e| e > 0.0).count();
+    let replicates_required = if n_max_e == 0 {
+        f64::INFINITY
+    } else {
+        m / (alpha * n_max_e as f64) - 1.0
+    };
+    CensusLedger {
+        rejected,
+        ebh_threshold,
+        n_max_e,
+        replicates_required,
+    }
 }
 
 #[cfg(test)]
@@ -616,6 +662,30 @@ mod tests {
                 .map(|p| (p.verdict.kappa, p.verdict.z_below_gaussian))
                 .collect::<Vec<_>>()
         );
+    }
+
+    /// A candidate the census could not adjudicate still counts toward `m`. One
+    /// adjudicated plane at the budget's maximum e-value `B + 1 = 20` is a
+    /// discovery in a family of one (`20 ≥ 1/0.05`), but not when the search
+    /// generated a second candidate whose plane had no radius law: then rank 1
+    /// needs `2/0.05 = 40`. Dropping that candidate would halve the threshold and
+    /// report a discovery that e-BH at the stated level over the search does not
+    /// make.
+    #[test]
+    fn unadjudicated_candidates_keep_their_place_in_the_ebh_family() {
+        let alone = ebh_ledger(&[20.0], 1, 0.05);
+        assert_eq!(alone.rejected, vec![0]);
+        assert_eq!(alone.ebh_threshold, 20.0);
+
+        let with_refused = ebh_ledger(&[20.0], 2, 0.05);
+        assert!(
+            with_refused.rejected.is_empty(),
+            "a family of two needs e >= 40 at rank 1; got rejections {:?}",
+            with_refused.rejected
+        );
+        assert_eq!(with_refused.ebh_threshold, f64::INFINITY);
+        assert_eq!(with_refused.n_max_e, 1);
+        assert_eq!(with_refused.replicates_required, 2.0 / 0.05 - 1.0);
     }
 
     /// Without coalescing, the SAME shattered dictionary yields no accepted plane:
