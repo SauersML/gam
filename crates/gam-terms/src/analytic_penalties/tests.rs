@@ -1223,6 +1223,234 @@ fn ard_rho_grad_includes_occam_log_det_term() {
     assert!((dr[1] - 1.0).abs() < 1e-12);
 }
 
+// ----- TotalVariationPenalty / ShapeMonotonicityPenalty tests -----
+
+/// Row-major `(n_eff = 5, d = 2)` target whose edge differences run from
+/// about 0.08 to about 0.92. That span covers both the curved core and the
+/// near-linear tails of the smoothed-L¹ and softplus kernels.
+fn tv_monotonicity_test_target() -> (usize, Array1<f64>, Array1<f64>) {
+    let (n_eff, d) = (5usize, 2usize);
+    let n = n_eff * d;
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.37 * (1.3 * x).sin() + 0.11 * x
+    });
+    let v = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.6 * (0.9 * x + 0.4).cos()
+    });
+    (n_eff, t, v)
+}
+
+/// Total variation had no Rust test of its analytic derivatives or of its
+/// closed-form curvature channels. For both difference operators this pins:
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional),
+/// value -> `grad_rho` (learnable log-weight), the `as_dense` columns against
+/// `hvp` of the unit vectors, and `diag_target` against the dense diagonal.
+/// It also pins the tridiagonal pivot recursion
+/// `log_det_plus_lambda_i_forward_1d` against a dense eigendecomposition, and
+/// the frozen operator's `diag` and `log det(S + λI)` against the dense matrix.
+///
+/// Tolerances. The FD errors come from the central stencil,
+/// `h²/6 |f'''| + ε_mach |f| / h` with `h = 1e-5`. Here `w = 0.7 e^{0.2} ≈ 0.86`,
+/// `ε = 0.5`, and a node has at most 3 edges. The kernel has
+/// `|φ'''| ≤ 0.86/ε² ≈ 3.4` and `|φ''''| ≤ 3/ε³ = 24`.
+/// - value -> grad: about `1.5e-10 + 2.2e-10` (with `|f| ≲ 10`).
+/// - grad -> hvp: along `v` with `|Δv| ≤ 1.2`, about `3e-9`.
+/// - value -> grad_rho: the value is `w₀ e^ρ A`, so its third ρ-derivative is
+///   the value itself, and the error is about `2e-10`.
+/// A `1e-7` tolerance leaves at least 30× margin. The dense and diagonal
+/// channels evaluate the same per-edge curvature `w ε² / r³` as `hvp`, so they
+/// agree to rounding (`1e-12` relative). The log-determinants run on a 10 × 10
+/// SPD matrix with eigenvalues `≥ λ = 0.3` and norm `≲ 20`. Each `log`
+/// therefore carries about `ε_mach · 20 / 0.3`, and `1e-10 · max(|log det|, 1)`
+/// leaves several orders of margin.
+#[test]
+fn total_variation_derivatives_and_curvature_channels_match_central_differences() {
+    let (n_eff, t, v) = tv_monotonicity_test_target();
+    let n = t.len();
+    let h = 1e-5;
+    let tol = 1e-7;
+    let lambda = 0.3;
+    let rho = array![0.2_f64];
+    let graph = vec![(0, 1), (1, 3), (3, 2), (4, 0), (2, 4), (1, 4)];
+    for op_kind in [
+        DifferenceOpKind::ForwardDiff1D,
+        DifferenceOpKind::GraphEdges(graph),
+    ] {
+        let pen = TotalVariationPenalty::new(0.7, n_eff, op_kind.clone(), 0.5, true)
+            .expect("total variation penalty");
+        let label = format!("{op_kind:?}");
+
+        let g = pen.grad_target(t.view(), rho.view());
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += h;
+            tm[i] -= h;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+            assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        }
+
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let tp = &t + &(h * &v);
+        let tm = &t - &(h * &v);
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for i in 0..n {
+            assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+        }
+
+        let gr = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(gr.len(), 1, "{label}: one learnable log-weight");
+        let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+            - pen.value(t.view(), array![0.2 - h].view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+        let dense = pen.as_dense(t.view(), rho.view());
+        let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            scale > 0.0,
+            "{label}: curvature must be nonzero on this target"
+        );
+        let diag = pen.diag_target(t.view(), rho.view());
+        for col in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[col] = 1.0;
+            let column = pen.hvp(t.view(), rho.view(), e.view());
+            for row in 0..n {
+                assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            }
+            assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+        }
+
+        let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+            .expect("dense TV log det");
+        let log_det_tol = 1e-10 * expected.abs().max(1.0);
+        let forward = pen.log_det_plus_lambda_i_forward_1d(t.view(), rho.view(), lambda);
+        match op_kind {
+            DifferenceOpKind::ForwardDiff1D => {
+                let forward = forward.expect("tridiagonal TV log det");
+                assert_abs_diff_eq!(forward, expected, epsilon = log_det_tol);
+            }
+            DifferenceOpKind::GraphEdges(_) => {
+                assert!(
+                    forward.is_err(),
+                    "{label}: the pivot recursion is path-only"
+                );
+            }
+        }
+
+        let op = FrozenAnalyticPenaltyOp::new(
+            AnalyticPenaltyKind::TotalVariation(Arc::new(pen)),
+            t.clone(),
+            rho.clone(),
+        )
+        .expect("frozen TV operator");
+        let frozen_diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(frozen_diag[i], dense[[i, i]], epsilon = 1e-12 * scale);
+        }
+        let frozen_log_det = op.log_det_plus_lambda_i(lambda).expect("frozen TV log det");
+        assert_abs_diff_eq!(frozen_log_det, expected, epsilon = log_det_tol);
+    }
+}
+
+/// Soft monotonicity had no Rust test of its analytic derivatives. For both
+/// directions this pins value -> `grad_target`, `grad_target` -> `hvp`
+/// (directional) and value -> `grad_rho`. It also checks that the Hessian
+/// assembled from `hvp` of the unit vectors is symmetric and PSD, as the
+/// convexity of softplus requires.
+///
+/// Tolerances. The per-edge value is `w ε softplus(z)` with `z = ∓Δ/ε`,
+/// `w = 0.7 e^{0.2} ≈ 0.86` and `ε = 0.3`. Its slope derivatives are bounded
+/// by `|softplus'''| ≤ 1/(6√3)` and `|softplus''''| ≤ 1/8`. So
+/// `|f'''| ≤ 2 w · 0.096 / ε² ≈ 1.8` and `|f''''| ≤ 2 w · 0.125 / ε³ ≈ 8`
+/// (at most 2 edges per node). With `h = 1e-5`, `|f| ≲ 5` and `|Δv| ≤ 1.2`:
+/// - value -> grad: about `3e-11 + 1.1e-10`.
+/// - grad -> hvp: about `2.4e-10`.
+/// - value -> grad_rho: about `1e-10`.
+/// A `1e-7` tolerance leaves at least 400× margin. Symmetry is exact up to the
+/// shared edge factor (`1e-12` relative). The smallest eigenvalue of a PSD
+/// matrix computed by `eigh` is off by about `ε_mach ‖H‖`, which is covered
+/// by `-1e-12 · scale`.
+#[test]
+fn monotonicity_derivatives_match_central_differences_and_hessian_is_psd() {
+    let (n_eff, t, v) = tv_monotonicity_test_target();
+    let n = t.len();
+    let h = 1e-5;
+    let tol = 1e-7;
+    let rho = array![0.2_f64];
+    for direction in [1.0_f64, -1.0] {
+        let pen = ShapeMonotonicityPenalty::new(0.7, n_eff, direction, 0.3, true)
+            .expect("monotonicity penalty");
+
+        let g = pen.grad_target(t.view(), rho.view());
+        for i in 0..n {
+            let mut tp = t.clone();
+            let mut tm = t.clone();
+            tp[i] += h;
+            tm[i] -= h;
+            let fd =
+                (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+            assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+        }
+
+        let hv = pen.hvp(t.view(), rho.view(), v.view());
+        let tp = &t + &(h * &v);
+        let tm = &t - &(h * &v);
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for i in 0..n {
+            assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+        }
+
+        let gr = pen.grad_rho(t.view(), rho.view());
+        assert_eq!(
+            gr.len(),
+            1,
+            "direction {direction}: one learnable log-weight"
+        );
+        let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+            - pen.value(t.view(), array![0.2 - h].view()))
+            / (2.0 * h);
+        assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        for col in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[col] = 1.0;
+            let column = pen.hvp(t.view(), rho.view(), e.view());
+            for row in 0..n {
+                hessian[[row, col]] = column[row];
+            }
+        }
+        let scale = hessian.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+        assert!(
+            scale > 0.0,
+            "direction {direction}: curvature must be nonzero"
+        );
+        for row in 0..n {
+            for col in 0..n {
+                assert_abs_diff_eq!(
+                    hessian[[row, col]],
+                    hessian[[col, row]],
+                    epsilon = 1e-12 * scale
+                );
+            }
+        }
+        let (evals, _) = hessian
+            .eigh(Side::Lower)
+            .expect("monotonicity Hessian eigh");
+        let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+        assert!(
+            min_eval >= -1e-12 * scale,
+            "direction {direction}: softplus curvature must be PSD; min eigenvalue {min_eval:.3e}"
+        );
+    }
+}
 // ----- BlockOrthogonalityPenalty tests -----
 
 fn block_ortho_test_target() -> Array1<f64> {
