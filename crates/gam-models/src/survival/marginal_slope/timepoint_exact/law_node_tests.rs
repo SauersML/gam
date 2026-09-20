@@ -471,8 +471,10 @@ fn the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926(
     };
     let (beta_h, beta_w) = warp_and_deviation(&gaussian_flex_family(), 0.0);
     let states = block_states(&rigid, 0.25, &beta_h, &beta_w)[..3].to_vec();
-    let fitted = EmpiricalZGrid::new(law.nodes.clone(), law.weights.clone(), "gam#2926 test law")
-        .expect("a valid finite law");
+    let fitted = crate::bms::moving_law_rule::MovingLawRowLaw::Finite(
+        EmpiricalZGrid::new(law.nodes.clone(), law.weights.clone(), "gam#2926 test law")
+            .expect("a valid finite law"),
+    );
     let scale = rigid.probit_frailty_scale();
     for row in ROWS {
         let values = rigid.row_dynamic_q_values(row, &states).expect("row q");
@@ -488,12 +490,12 @@ fn the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926(
                  ln Φ(−q) = {target:.17e}"
             );
             let observed = scale * slope;
-            let (closed_form, _) = crate::bms::estimated_latent_law::survival_anchor_log_probabilities(
-                q * (1.0 + observed * observed).sqrt(),
-                observed,
-                &fitted,
-            )
-            .expect("closed-form anchor probabilities");
+            let (closed_form, _) = fitted
+                .affine_anchor_log_probabilities::<crate::bms::moving_law_rule::MovingLawError>(
+                    -q * (1.0 + observed * observed).sqrt(),
+                    -observed,
+                )
+                .expect("closed-form anchor probabilities");
             assert!(
                 (closed_form - target).abs() > 1e-5,
                 "fixture invariant: the closed form must miss this law's identity, or the pin \

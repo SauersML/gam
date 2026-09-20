@@ -4128,8 +4128,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
                 };
                 let (arms, own) = if let Some(runtime) = residual_runtime.as_ref() {
                     // gam#2985: the joint (z, r) anchor read on the score. Each arm's
-                    // event probability is Σ_k w_k Φ(ã + B u_k) on its held-out law,
-                    // and the row's own is Φ at its observed index, residual included.
+                    // event probability is E[Φ(ã + B U)] on its held-out law, a finite
+                    // sum or the Gaussian closed form (gam#4028), and the row's own is
+                    // Φ at its observed index, residual included.
                     let joint = super::residual_repair::residual_certificate_row(
                         &certificate_family,
                         runtime,
@@ -4143,9 +4144,9 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         .row_laws(row)?
                         .iter()
                         .map(|law| {
-                            moving_law_rule::log_grid_anchor_probabilities(law, |node| {
-                                Ok::<f64, moving_law_rule::MovingLawError>(intercept + slope * node)
-                            })
+                            law.affine_anchor_log_probabilities::<moving_law_rule::MovingLawError>(
+                                intercept, slope,
+                            )
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let own = moving_law_rule::log_grid_anchor_probabilities(&own_point, |_| {
@@ -4156,8 +4157,8 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     let (intercept, _, _) = certificate_family
                         .solve_row_intercept_base(row, marginal_eta, slope, beta_h, beta_w, None)
                         .map_err(|reason| moving_law_rule::MovingLawError::AnchorProgram { reason })?;
-                    let anchor = |law: &EmpiricalZGrid| {
-                        certificate_family.empirical_grid_anchor_log_probabilities(
+                    let anchor = |law: &moving_law_rule::MovingLawRowLaw| {
+                        certificate_family.moving_law_anchor_log_probabilities(
                             intercept,
                             slope,
                             beta_h,
@@ -4167,7 +4168,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
                     };
                     // The row's own score as a one-point law: the observed row's event
                     // probability, which each arm's is scored against.
-                    let own = anchor(&own_point)?;
+                    let own = anchor(&moving_law_rule::MovingLawRowLaw::Finite(own_point))?;
                     let arms = candidates
                         .row_laws(row)?
                         .iter()

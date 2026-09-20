@@ -124,15 +124,17 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// The moving-law certificate's `(ln S, ln(1 − S))` of one flex survival anchor
-    /// under `law` (gam#2926): `S = Σ_k w_k Φ(−η(u_k))` at the program's own
-    /// intercept, through [`crate::bms::moving_law_rule::log_grid_anchor_probabilities`].
+    /// under `law` (gam#2926, gam#4028): `S = E[Φ(−η(U))]` at the program's own
+    /// intercept, `Σ_k w_k Φ(−η(u_k))` on a finite law and the exact integral over
+    /// the negated cubic cells on a Gaussian law, through
+    /// [`crate::bms::moving_law_rule::MovingLawRowLaw::denested_anchor_log_probabilities`].
     fn flex_survival_anchor_log_probabilities(
         &self,
         q: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
-        law: &crate::bms::EmpiricalZGrid,
+        law: &crate::bms::moving_law_rule::MovingLawRowLaw,
     ) -> Result<(f64, f64), MovingLawError> {
         if self.score_dim() != 1 {
             return Err(MovingLawError::Unsupported {
@@ -143,11 +145,21 @@ impl SurvivalMarginalSlopeFamily {
         let (a, _) = self
             .solve_row_survival_intercept_with_slot(q, slope, beta_h, beta_w, None)
             .map_err(program)?;
-        crate::bms::moving_law_rule::log_grid_anchor_probabilities(law, |u| {
-            Ok(-self
-                .flex_survival_denested_index(u, a, slope, beta_h, beta_w)
-                .map_err(program)?)
-        })
+        law.denested_anchor_log_probabilities(
+            |u| {
+                Ok(-self
+                    .flex_survival_denested_index(u, a, slope, beta_h, beta_w)
+                    .map_err(program)?)
+            },
+            || {
+                Ok(self
+                    .denested_partition_cells(a, slope, beta_h, beta_w)
+                    .map_err(program)?
+                    .into_iter()
+                    .map(|partition| partition.cell.negated())
+                    .collect())
+            },
+        )
     }
 
     /// The moving-law certificate's two anchors of `row` (gam#2926): the exit and
@@ -165,7 +177,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         time_row: usize,
         block_states: &[ParameterBlockState],
-        law: &crate::bms::EmpiricalZGrid,
+        law: &crate::bms::moving_law_rule::MovingLawRowLaw,
     ) -> Result<[(f64, f64); 2], MovingLawError> {
         if self.flex_timewiggle_active() {
             return Err(MovingLawError::Unsupported {
@@ -195,11 +207,8 @@ impl SurvivalMarginalSlopeFamily {
                 Some(grid) => solve_anchor(q, observed_slope, grid).map_err(program)?,
                 None => q * (1.0 + observed_slope * observed_slope).sqrt(),
             };
-            Ok(crate::bms::estimated_latent_law::survival_anchor_log_probabilities(
-                alpha,
-                observed_slope,
-                law,
-            )?)
+            // S = E[Φ(−(α + b·U))], affine in the score.
+            law.affine_anchor_log_probabilities(-alpha, -observed_slope)
         };
         Ok([anchor(q1, slopes.exit)?, anchor(q0, slopes.entry)?])
     }

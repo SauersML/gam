@@ -24,8 +24,10 @@
 //! ℓ = −Σ_anchors [ y·ln P + (1 − y)·ln(1 − P) ],   0·ln 0 = 0,
 //! ```
 //!
-//! where `P = Σ_k w_k Φ(ι(u_k))` is the anchor's event probability under the arm's
-//! held-out law and `y = Φ(ι(z_i))` is the same at the row's own score. `ℓ` is
+//! where `P = E[Φ(ι(U))]` is the anchor's event probability under the arm's
+//! held-out law — `Σ_k w_k Φ(ι(u_k))` on a finite law, and the exact Gaussian
+//! expectation on a Gaussian arm ([`MovingLawRowLaw`]) — and `y = Φ(ι(z_i))` is
+//! the same at the row's own score. `ℓ` is
 //! linear in `y`, and `z_i` is not in the law the row is scored on, so over the
 //! row's score its expectation is `H(m) + KL(m ‖ P)` for `m` the anchor's
 //! expectation under the true law: a proper score whose excess over the truth is
@@ -67,9 +69,6 @@ pub(crate) const MOVING_LAW_FOLDS: usize = 10;
 
 /// The declared seed of the fold hash.
 pub(crate) const MOVING_LAW_FOLD_SEED: u64 = 0x2926_F01D_0000_0001;
-
-/// Nodes of the Gauss–Hermite rule the Gaussian arms are scored on.
-const MOVING_LAW_GAUSS_HERMITE_NODES: usize = 64;
 
 /// One candidate law of the moving-law certificate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -660,6 +659,137 @@ pub(crate) fn log_grid_anchor_probabilities<E: From<AnchorProbabilityFailure>>(
     )
 }
 
+/// One arm's held-out law of a row's score on the fitted axis (gam#2926,
+/// gam#4028): a finite law, scored node by node, or a Gaussian law
+/// `N(mean, sd²)`, scored by its exact expectation.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum MovingLawRowLaw {
+    /// A finite law of the score.
+    Finite(EmpiricalZGrid),
+    /// The Gaussian law `N(mean, sd²)` of the score.
+    Gaussian { mean: f64, sd: f64 },
+}
+
+impl MovingLawRowLaw {
+    /// `(ln P, ln(1 − P))` of an anchor whose probit index is affine in the
+    /// score, `η(u) = intercept + slope·u`. On a Gaussian law `U ~ N(μ, σ²)` it is
+    /// the one exact term `(0, (intercept + slope·μ)/√(1 + slope²·σ²))`: for
+    /// independent standard normals `X` and `T`,
+    /// `E[Φ(a + bU)] = P(X − bσ·T ≤ a + bμ)` and `X − bσ·T ~ N(0, 1 + b²σ²)`.
+    pub(crate) fn affine_anchor_log_probabilities<E: From<AnchorProbabilityFailure>>(
+        &self,
+        intercept: f64,
+        slope: f64,
+    ) -> Result<(f64, f64), E> {
+        match *self {
+            Self::Finite(ref law) => {
+                log_grid_anchor_probabilities(law, |u| Ok(intercept + slope * u))
+            }
+            Self::Gaussian { mean, sd } => log_anchor_probabilities(std::iter::once(Ok((
+                0.0,
+                (intercept + slope * mean) / (slope * sd).hypot(1.0),
+            )))),
+        }
+    }
+
+    /// `(ln P, ln(1 − P))` of an anchor whose probit index is the de-nested,
+    /// piecewise-cubic `η(u)`: node by node through `eta` on a finite law, and on
+    /// a Gaussian law the exact integral over `cells`, the partition of the score
+    /// axis `η` is cubic on ([`gaussian_cell_anchor_log_probabilities`]). Only the
+    /// branch the law takes is evaluated.
+    pub(crate) fn denested_anchor_log_probabilities(
+        &self,
+        eta: impl FnMut(f64) -> Result<f64, MovingLawError>,
+        cells: impl FnOnce() -> Result<Vec<exact_kernel::DenestedCubicCell>, MovingLawError>,
+    ) -> Result<(f64, f64), MovingLawError> {
+        match *self {
+            Self::Finite(ref law) => log_grid_anchor_probabilities(law, eta),
+            Self::Gaussian { mean, sd } => {
+                gaussian_cell_anchor_log_probabilities(cells()?, mean, sd)
+            }
+        }
+    }
+}
+
+/// `(ln P, ln(1 − P))` for `P = E[Φ(η(U))]`, `U ~ N(μ, σ²)`, with `η` given by its
+/// cubic cells on the score axis (gam#4028). With `u = μ + σ·t` a cell is the
+/// same cubic on the standard axis, on `[(left − μ)/σ, (right − μ)/σ]` with
+///
+/// ```text
+/// d0 = c0 + c1·μ + c2·μ² + c3·μ³,   d1 = σ·(c1 + 2·c2·μ + 3·c3·μ²),
+/// d2 = σ²·(c2 + 3·c3·μ),            d3 = σ³·c3,
+/// ```
+///
+/// so `P = Σ_cells ∫ φ(t)·Φ(d(t)) dt`, the cell integral the fit anchors a
+/// Gaussian law with ([`exact_kernel::evaluate_cell_moments`]): a bivariate normal
+/// probability on an affine cell and the kernel's Gauss–Legendre rule on a finite
+/// cubic one. A zero coefficient stays exactly zero, so an affine tail stays
+/// affine. `1 − P` is summed over the negated cells, from positive terms, and the
+/// larger probability is one less the smaller, as in [`log_anchor_probabilities`].
+/// An index affine on the whole line is the one exact term of
+/// [`MovingLawRowLaw::affine_anchor_log_probabilities`], taken in log space.
+///
+/// A cell whose ends round to one point of the standard axis is narrower than
+/// one unit in the last place of `t`, so its mass is below `φ(t)` times that unit
+/// and it carries no term.
+pub(crate) fn gaussian_cell_anchor_log_probabilities(
+    cells: impl IntoIterator<Item = exact_kernel::DenestedCubicCell>,
+    mean: f64,
+    sd: f64,
+) -> Result<(f64, f64), MovingLawError> {
+    if !(mean.is_finite() && sd.is_finite() && sd > 0.0) {
+        return Err(MovingLawError::Law {
+            what: "Gaussian arm",
+            reason: format!("N({mean}, {sd}²) is not a Gaussian law"),
+        });
+    }
+    let standard: Vec<exact_kernel::DenestedCubicCell> = cells
+        .into_iter()
+        .map(|cell| exact_kernel::DenestedCubicCell {
+            left: (cell.left - mean) / sd,
+            right: (cell.right - mean) / sd,
+            c0: cell.c0 + mean * (cell.c1 + mean * (cell.c2 + mean * cell.c3)),
+            c1: sd * (cell.c1 + mean * (2.0 * cell.c2 + 3.0 * mean * cell.c3)),
+            c2: sd * sd * (cell.c2 + 3.0 * mean * cell.c3),
+            c3: sd * sd * sd * cell.c3,
+        })
+        .filter(|cell| cell.left < cell.right)
+        .collect();
+    if let [cell] = standard[..]
+        && cell.left == f64::NEG_INFINITY
+        && cell.right == f64::INFINITY
+        && cell.c2 == 0.0
+        && cell.c3 == 0.0
+    {
+        return log_anchor_probabilities(std::iter::once(Ok((
+            0.0,
+            cell.c0 / cell.c1.hypot(1.0),
+        ))));
+    }
+    let value = |cell: exact_kernel::DenestedCubicCell| {
+        exact_kernel::evaluate_cell_moments(cell, 0)
+            .map(|state| state.value)
+            .map_err(|reason| MovingLawError::AnchorProgram { reason })
+    };
+    let (mut event, mut complement) = (0.0, 0.0);
+    for &cell in &standard {
+        event += value(cell)?;
+        complement += value(cell.negated())?;
+    }
+    if !(event >= 0.0 && complement >= 0.0 && event + complement > 0.0) {
+        return Err(MovingLawError::AnchorProgram {
+            reason: format!(
+                "a Gaussian arm's cell masses are no probability: P = {event}, 1 − P = {complement}"
+            ),
+        });
+    }
+    Ok(if event <= complement {
+        (event.ln(), (-event).ln_1p())
+    } else {
+        ((-complement).ln_1p(), complement.ln())
+    })
+}
+
 /// One anchor of one row in the certificate pass: `(ln P, ln(1 − P))` of its
 /// event under each arm's held-out law, in ladder order, and `(ln y, ln(1 − y))`
 /// at the row's own score, each from [`log_anchor_probabilities`].
@@ -753,7 +883,6 @@ pub(crate) struct MovingLawCandidates {
     /// Per row, its position among its fold's scored rows.
     position: Vec<usize>,
     fold_laws: Vec<FoldLaws>,
-    gauss_hermite: EmpiricalZGrid,
     /// The full-data location-scale empirical arm: the residual law of `ζ` and
     /// its compression record.
     residual: Option<(
@@ -763,19 +892,6 @@ pub(crate) struct MovingLawCandidates {
     pooled: EmpiricalZGrid,
     local: LatentMeasureKind,
     contexts: usize,
-}
-
-fn probabilists_gauss_hermite(nodes: usize) -> Result<EmpiricalZGrid, MovingLawError> {
-    let law = |reason: String| MovingLawError::Law { what: "Gauss-Hermite law", reason };
-    let rule =
-        gam_math::quadrature::gauss_hermite_rule(nodes).map_err(|error| law(error.to_string()))?;
-    let root_pi = std::f64::consts::PI.sqrt();
-    EmpiricalZGrid::new(
-        rule.nodes.iter().map(|&x| std::f64::consts::SQRT_2 * x).collect(),
-        rule.weights.iter().map(|&w| w / root_pi).collect(),
-        "moving-law certificate Gauss-Hermite law",
-    )
-    .map_err(law)
 }
 
 fn location_at(
@@ -951,7 +1067,6 @@ impl MovingLawCandidates {
             folds,
             position,
             fold_laws,
-            gauss_hermite: probabilists_gauss_hermite(MOVING_LAW_GAUSS_HERMITE_NODES)?,
             residual,
             pooled,
             local,
@@ -1051,8 +1166,13 @@ impl MovingLawCandidates {
     }
 
     /// Each arm's law of a scored row's score, built without the row's fold, on
-    /// the fitted axis, in [`Self::arms`] order.
-    pub(crate) fn row_laws(&self, row: usize) -> Result<Vec<EmpiricalZGrid>, MovingLawError> {
+    /// the fitted axis, in [`Self::arms`] order. A law of `shift + scale·u` on the
+    /// score is the law of `(shift + scale·u − m)/s` on the fitted axis `(m, s)`:
+    /// the Gaussian arm, `u ~ N(0, 1)` with `(shift, scale) = (0, 1)`, is
+    /// `N(−m/s, 1/s²)` there, and the location-scale Gaussian arm at its fold's
+    /// `(shift, scale)` is `N((shift − m)/s, (scale/s)²)`, each scored exactly
+    /// ([`MovingLawRowLaw`]).
+    pub(crate) fn row_laws(&self, row: usize) -> Result<Vec<MovingLawRowLaw>, MovingLawError> {
         let (m, s) = self.fitted_location(row);
         let fold = &self.fold_laws[self.folds.fold_of(row)];
         let on_fitted_axis = |nodes: &[f64], weights: &[f64], shift: f64, scale: f64| {
@@ -1061,7 +1181,12 @@ impl MovingLawCandidates {
                 weights.to_vec(),
                 "moving-law held-out latent law",
             )
+            .map(MovingLawRowLaw::Finite)
             .map_err(|reason| MovingLawError::Law { what: "held-out law", reason })
+        };
+        let gaussian_on_fitted_axis = |shift: f64, scale: f64| MovingLawRowLaw::Gaussian {
+            mean: (shift - m) / s,
+            sd: scale / s,
         };
         let location_scale = |arm: MovingLawArm| {
             match (&fold.location_scale, self.fold_location.get(row)) {
@@ -1069,17 +1194,16 @@ impl MovingLawCandidates {
                 _ => Err(MovingLawError::NoLocationScale(arm)),
             }
         };
-        let gh = &self.gauss_hermite;
         self.arms()
             .iter()
             .map(|arm| match arm {
-                MovingLawArm::Gaussian => on_fitted_axis(&gh.nodes, &gh.weights, 0.0, 1.0),
+                MovingLawArm::Gaussian => Ok(gaussian_on_fitted_axis(0.0, 1.0)),
                 MovingLawArm::PooledEmpirical => {
                     on_fitted_axis(&fold.pooled.nodes, &fold.pooled.weights, 0.0, 1.0)
                 }
                 MovingLawArm::LocationScaleGaussian => {
                     let (_, (shift, scale)) = location_scale(*arm)?;
-                    on_fitted_axis(&gh.nodes, &gh.weights, shift, scale)
+                    Ok(gaussian_on_fitted_axis(shift, scale))
                 }
                 MovingLawArm::LocationScaleEmpirical => {
                     let (laws, (shift, scale)) = location_scale(*arm)?;
@@ -1529,6 +1653,162 @@ mod tests {
         assert!(loss[0] < loss[1], "the heavier tail scores better on a row in it: {loss:?}");
     }
 
+    /// `(P, 1 − P)` of `E[Φ(η(U))]`, `U ~ N(μ, σ²)`, for `η` cubic on each piece
+    /// `(left, right, [c0, c1, c2, c3])`, by composite 16-point Gauss–Legendre in
+    /// `u` on panels of width `σ/256` over each piece cut to `μ ± 12σ`, outside
+    /// which the law's mass is below `4e-33`. It shares nothing with the closed
+    /// form or the cell kernel: every node is a plain `φ·Φ`.
+    fn reference_gaussian_anchor(pieces: &[(f64, f64, [f64; 4])], mean: f64, sd: f64) -> (f64, f64) {
+        let (nodes, weights) = gam_math::special::gauss_legendre(16);
+        let (mut event, mut complement) = (0.0, 0.0);
+        for &(left, right, c) in pieces {
+            let (lo, hi) = (left.max(mean - 12.0 * sd), right.min(mean + 12.0 * sd));
+            if !(lo < hi) {
+                continue;
+            }
+            let panels = ((hi - lo) * 256.0 / sd).ceil() as usize;
+            let width = (hi - lo) / panels as f64;
+            for panel in 0..panels {
+                let center = lo + (panel as f64 + 0.5) * width;
+                for (&x, &w) in nodes.iter().zip(weights.iter()) {
+                    let u = center + 0.5 * width * x;
+                    let t = (u - mean) / sd;
+                    let density =
+                        0.5 * width * w * (-0.5 * t * t).exp() / (sd * std::f64::consts::TAU.sqrt());
+                    let eta = c[0] + u * (c[1] + u * (c[2] + u * c[3]));
+                    event += density * normal_cdf(eta);
+                    complement += density * normal_cdf(-eta);
+                }
+            }
+        }
+        (event, complement)
+    }
+
+    /// gam#4028: a Gaussian arm is scored by its exact expectation, not on a
+    /// fixed-node rule. On `U ~ N(0.3, 0.8²)` at slopes 5, 10 and 20, with the
+    /// intercept that puts the exact `P` at `Φ(q)` for `q ∈ {−2, −1, 0, 0.5, 1, 2}`:
+    ///
+    /// - the affine closed form `Φ((a + bμ)/√(1 + b²σ²))`, the same index cut into
+    ///   three affine cells, and a piecewise-cubic index through the cell kernel on
+    ///   the standard axis all match the independent reference in both `P` and
+    ///   `1 − P`, to `1e-12` relative. The reference itself meets the closed form
+    ///   to `1.3e-15` on these fixtures; the rest of the tolerance is the kernel's
+    ///   bivariate-normal bound and the rounding of the moved coefficients;
+    /// - the 64-node Gauss–Hermite rule the arms were scored on before misses the
+    ///   same reference in `1 − P` by `7.4e-5`, `2.0e-2` and `8.8e-2`: the defect
+    ///   this pins shut.
+    #[test]
+    fn gaussian_arms_are_scored_exactly_at_steep_slopes_4028() {
+        const TOLERANCE: f64 = 1e-12;
+        let (mean, sd) = (0.3, 0.8);
+        let law = MovingLawRowLaw::Gaussian { mean, sd };
+        let hermite = gam_math::quadrature::standard_normal_gauss_hermite_rule(64)
+            .expect("the 64-node Gauss-Hermite rule");
+        let relative = |got: f64, want: f64| (got / want - 1.0).abs();
+        let unused = |_: f64| -> Result<f64, MovingLawError> {
+            unreachable!("a Gaussian law is scored on its cells, never node by node")
+        };
+        let (k1, k2, k3) = (-0.4, 0.9, 0.2);
+        for (slope, hermite_floor) in [(5.0, 5e-5), (10.0, 1e-2), (20.0, 5e-2)] {
+            let mut hermite_error = 0.0_f64;
+            for q in [-2.0, -1.0, 0.0, 0.5, 1.0, 2.0] {
+                let intercept = q * (slope * sd).hypot(1.0) - slope * mean;
+                let affine = [intercept, slope, 0.0, 0.0];
+                let (want_event, want_complement) = reference_gaussian_anchor(
+                    &[(f64::NEG_INFINITY, f64::INFINITY, affine)],
+                    mean,
+                    sd,
+                );
+                let check = |what: &str, (event, complement): (f64, f64), want: (f64, f64)| {
+                    assert!(
+                        relative(event.exp(), want.0) < TOLERANCE
+                            && relative(complement.exp(), want.1) < TOLERANCE,
+                        "{what} at slope {slope}, q = {q}: P = {} vs {}, 1 − P = {} vs {}",
+                        event.exp(),
+                        want.0,
+                        complement.exp(),
+                        want.1
+                    );
+                };
+                check(
+                    "closed form",
+                    law.affine_anchor_log_probabilities::<MovingLawError>(intercept, slope)
+                        .expect("closed form"),
+                    (want_event, want_complement),
+                );
+                let affine_cell = |left: f64, right: f64| exact_kernel::DenestedCubicCell {
+                    left,
+                    right,
+                    c0: intercept,
+                    c1: slope,
+                    c2: 0.0,
+                    c3: 0.0,
+                };
+                check(
+                    "affine cells",
+                    law.denested_anchor_log_probabilities(unused, || {
+                        Ok(vec![
+                            affine_cell(f64::NEG_INFINITY, k1),
+                            affine_cell(k1, k2),
+                            affine_cell(k2, f64::INFINITY),
+                        ])
+                    })
+                    .expect("affine cells"),
+                    (want_event, want_complement),
+                );
+
+                // `η(u) = a + b·u + γ·(u − k1)(u − k2)(u − k3)` on `[k1, k2]`, affine
+                // outside it and continuous at both knots.
+                let gamma = 0.6 * slope;
+                let cubic = [
+                    intercept - gamma * k1 * k2 * k3,
+                    slope + gamma * (k1 * k2 + k1 * k3 + k2 * k3),
+                    -gamma * (k1 + k2 + k3),
+                    gamma,
+                ];
+                let cubic_cell = exact_kernel::DenestedCubicCell {
+                    left: k1,
+                    right: k2,
+                    c0: cubic[0],
+                    c1: cubic[1],
+                    c2: cubic[2],
+                    c3: cubic[3],
+                };
+                check(
+                    "cubic cells",
+                    law.denested_anchor_log_probabilities(unused, || {
+                        Ok(vec![
+                            affine_cell(f64::NEG_INFINITY, k1),
+                            cubic_cell,
+                            affine_cell(k2, f64::INFINITY),
+                        ])
+                    })
+                    .expect("cubic cells"),
+                    reference_gaussian_anchor(
+                        &[
+                            (f64::NEG_INFINITY, k1, affine),
+                            (k1, k2, cubic),
+                            (k2, f64::INFINITY, affine),
+                        ],
+                        mean,
+                        sd,
+                    ),
+                );
+
+                let hermite_complement: f64 = hermite
+                    .iter()
+                    .map(|&(x, w)| w * normal_cdf(-(intercept + slope * (mean + sd * x))))
+                    .sum();
+                hermite_error = hermite_error.max(relative(hermite_complement, want_complement));
+            }
+            assert!(
+                hermite_error > hermite_floor,
+                "the reference must resolve the fixed rule's error at slope {slope}: \
+                 {hermite_error:.3e}"
+            );
+        }
+    }
+
     /// gam#2949 at one score, both ways: on survival anchors the certificate is
     /// sound only where a row is anchored at a time its own score did not shape.
     /// `z | x` is `N(0.6·x, 0.64)`, location-scale with a Gaussian residual, and the
@@ -1592,15 +1872,15 @@ mod tests {
             let losses: Vec<Option<Vec<f64>>> = (0..ROWS)
                 .map(|row| {
                     let q = index_at(anchor_time(row));
-                    let own = EmpiricalZGrid {
+                    let own = MovingLawRowLaw::Finite(EmpiricalZGrid {
                         nodes: vec![candidates.own_score(row)],
                         weights: vec![1.0],
-                    };
-                    let anchor = |law: &EmpiricalZGrid| {
-                        estimated_latent_law::survival_anchor_log_probabilities(
-                            q * (1.0 + slope * slope).sqrt(),
-                            slope,
-                            law,
+                    });
+                    // `S = E[Φ(−(α + b·u))]` at the anchor `α = q·√(1 + b²)`.
+                    let anchor = |law: &MovingLawRowLaw| {
+                        law.affine_anchor_log_probabilities::<MovingLawError>(
+                            -q * (1.0 + slope * slope).sqrt(),
+                            -slope,
                         )
                         .expect("anchor log probabilities")
                     };

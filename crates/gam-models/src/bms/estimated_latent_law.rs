@@ -342,18 +342,6 @@ pub(crate) fn closed_form_survival_anchoring_residual(
     (residual, law_sd, scale, probabilities)
 }
 
-/// The moving-law certificate's `(ln S, ln(1 − S))` of one rigid survival anchor
-/// under `law` (gam#2926): `S = Σ_k w_k Φ(−(α + b·u_k))` at the anchor's intercept `α`,
-/// the one the fit solved on its own law, through
-/// [`moving_law_rule::log_grid_anchor_probabilities`].
-pub(crate) fn survival_anchor_log_probabilities(
-    alpha: f64,
-    observed_slope: f64,
-    law: &EmpiricalZGrid,
-) -> Result<(f64, f64), moving_law_rule::AnchorProbabilityFailure> {
-    moving_law_rule::log_grid_anchor_probabilities(law, |u| Ok(-(alpha + observed_slope * u)))
-}
-
 /// A survival anchor's probability at de-nested index `η` on the smaller tail of
 /// the anchor at marginal index `q`: `Φ(−η)` when `q ≥ 0`, `Φ(η)` otherwise.
 pub(crate) fn survival_tail_probability(q: f64, eta: f64) -> f64 {
