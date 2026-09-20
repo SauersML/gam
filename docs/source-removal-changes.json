@@ -2667,22 +2667,12 @@
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
   },
   {
-    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
     "items": [
-      "crates/gam-models/src/survival/risk_calibration.rs:const:NEWTON_MAX_ITERATIONS",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:a_separating_risk_score_is_refused_not_calibrated",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:constant_risk_degenerates_to_the_marginal_km_curve",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:cox_calibrated_survival_matrix",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:higher_risk_survives_less_and_rows_are_monotone",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:km_curve_on_grid",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:length_mismatch_is_an_error",
-      "crates/gam-models/src/survival/risk_calibration.rs:fn:no_usable_training_rows_gives_an_all_ones_surface",
-      "crates/gam-models/src/survival/risk_calibration.rs:struct:PartialLikelihood",
-      "crates/gam-models/src/survival/risk_calibration.rs:struct:RiskSetSums",
-      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:benchmark_survival_matrix_from_risk",
-      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:survival_matrix_from_risk_calibration"
+      "crates/gam-solve/src/gaussian_reml.rs:fn:fnv1a_mix",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:matrix_fingerprint"
     ],
-    "reason": "#3606: risk_calibration.rs held cox_calibrated_survival_matrix, a univariate Cox + Breslow calibration of a risk score, reachable only through the pyffi survival_matrix_from_risk_calibration, which nothing called: the benchmarks calibrate through lifelines (bench/_survival_calibration.py, CoxPHFitter). The dead path scored a non-finite test risk as the mean risk, cost O(n * events) per partial-likelihood evaluation, and pinned the first grid column to 1 wherever the grid started. The module, its private Newton machinery (NEWTON_MAX_ITERATIONS, RiskSetSums, PartialLikelihood) and its unit tests are deleted with the pyffi wrapper pair and its stubs. km_curve_on_grid was a one-line alias of KaplanMeier::fit(..).on_grid(..); its one caller, survival_null_curve_from_train, now calls KaplanMeier directly.",
-    "evidence": "At base 6942363169, git grep -w finds survival_matrix_from_risk_calibration only at its pyfunction, its registration in geometry_ffi.rs and the generated stubs; cox_calibrated_survival_matrix only in risk_calibration.rs and benchmark_survival_matrix_from_risk; km_curve_on_grid only in risk_calibration.rs and survival_null_curve_from_train. scripts/gen_rust_stub.py --check passes on the regenerated stubs."
+    "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
+    "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
   }
 ]
