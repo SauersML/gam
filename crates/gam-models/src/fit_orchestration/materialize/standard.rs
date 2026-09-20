@@ -334,7 +334,6 @@ pub(crate) fn materialize_standard<'a>(
             offset: Arc::new(offset),
             spec,
             family,
-            estimate_tweedie_p: false,
             options,
             kappa_options,
             wiggle,
