@@ -7293,6 +7293,9 @@ mod custom_family;
 mod tests_rho_domain_2902;
 
 #[cfg(test)]
+mod tests_interval_warm_surrogate_3711;
+
+#[cfg(test)]
 mod tests;
 
 #[cfg(test)]
