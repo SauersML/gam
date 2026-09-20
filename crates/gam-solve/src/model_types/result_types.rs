@@ -696,7 +696,7 @@ pub enum FacePositivityRoute {
 ///
 /// The two routes are not two ways of measuring one quantity. They apply
 /// different standards to different evidence, and the floors they clear are not
-/// comparable: one is a threshold on a finite-difference estimate of `ĉ`, the
+/// comparable: one is a settlement radius on a measured estimate of `ĉ`, the
 /// other a backward-error threshold on the smallest eigenvalue of a matrix.
 /// Carrying both in a single `noise_margin: f64` — documented as "the
 /// pencil-constant noise floor for a measured tail, or the eigen-backward-error
@@ -731,14 +731,17 @@ pub enum RailTailEvidence {
         band: f64,
     },
     /// MEASURED by probing back from the rail: the pencil constant
-    /// `ĉ = −e^{ρ}·∂V/∂ρ` held across a finite-difference-clean window. The
-    /// evidence is a window at finite `λ`, so a constant that is not strictly
-    /// positive is the instrument reporting itself rather than a tail law.
+    /// `ĉ = ∓e^{±ρ}·∂V/∂ρ`, read off analytic gradients that each cleared their
+    /// own rounding band, settled within those bands to a limit `c` with a
+    /// derived settlement radius. The evidence is a window at finite `λ`, so a
+    /// constant the radius cannot separate from zero is the instrument
+    /// reporting itself rather than a tail law.
     ProbedTail {
-        /// The finite-difference floor `ĉ` had to exceed to count as signal.
-        noise_floor: f64,
-        /// The relative drift band the window was held to.
-        drift_band: f64,
+        /// The rounding bound on the rail-most probe's gradient, from the
+        /// measured magnitudes of the parts that gradient was summed from.
+        gradient_band: f64,
+        /// The settlement radius `R`: `|c − ĉ| ≤ R` for the reported constant.
+        extrapolation_radius: f64,
     },
 }
 
@@ -746,8 +749,8 @@ impl RailTailEvidence {
     /// Whether `tail_constant` is well formed FOR THIS ROUTE.
     ///
     /// The routes disagree about zero, and both are right. A probed tail reads
-    /// `ĉ` off a finite-difference window, where a non-positive constant is
-    /// noise being reported as a law. A proven face derives `ĉ` from the limit
+    /// `ĉ` off a window of measured gradients, where a constant its settlement
+    /// radius cannot separate from zero is noise being reported as a law. A proven face derives `ĉ` from the limit
     /// itself, and derives exactly zero for a coordinate the rest of the face
     /// has already pinned; refusing that would refuse a face the proof covers.
     /// Such a coordinate needs another face coordinate to pin its directions, so
@@ -770,7 +773,18 @@ impl RailTailEvidence {
                     && *band >= 0.0
                     && *statistic > *band
             }
-            Self::ProbedTail { noise_floor, .. } => noise_floor.is_finite() && tail_constant > 0.0,
+            Self::ProbedTail {
+                gradient_band,
+                extrapolation_radius,
+            } => {
+                // Deserialized certificates carry only numbers someone
+                // supplied, so the settlement inequality is re-checked here.
+                gradient_band.is_finite()
+                    && *gradient_band >= 0.0
+                    && extrapolation_radius.is_finite()
+                    && *extrapolation_radius >= 0.0
+                    && tail_constant > *extrapolation_radius
+            }
         }
     }
 
@@ -796,7 +810,7 @@ pub struct RailCoordinate {
     /// Which rail (`λ → ∞` upper, `λ → 0` lower) it is approaching.
     pub side: crate::rho_optimizer::asymptote_certificate::AsymptoteSide,
     /// The pencil constant `ĉ` of the tail law `∂V/∂ρ = −ĉ·e^{−ρ}`: either the
-    /// window mean measured by probing back from the rail, or — when the
+    /// settled limit measured by probing back from the rail, or — when the
     /// objective can form its λ=∞ limit exactly — the analytic constant
     /// `½tr((QᵀS_kQ)⁻¹QᵀCQ)` of the face proof (#2348 Inc 5). A face
     /// coordinate the rest of the face has already pinned reports `0`: the
@@ -2057,8 +2071,8 @@ mod tests_certification_refusal_2550 {
         // conjunct.
         let mut rails = vec![proven_rail(0, 4.25), proven_rail(1, 0.0)];
         rails[1].evidence = RailTailEvidence::ProbedTail {
-            noise_floor: 1.0e-12,
-            drift_band: 1.0e-3,
+            gradient_band: 1.0e-12,
+            extrapolation_radius: 0.0,
         };
         let certificate = certifying(rails);
 
@@ -2266,9 +2280,10 @@ mod rail_tail_evidence_tests {
     }
 
     /// The measured route keeps its own rule. A probed tail reads `ĉ` off a
-    /// finite-difference window, where a non-positive constant is the
-    /// instrument reporting itself rather than a tail law — that must still
-    /// refuse, or the fix above would have widened both routes at once.
+    /// window of measured gradients, where a constant its settlement radius
+    /// cannot separate from zero is the instrument reporting itself rather
+    /// than a tail law — that must still refuse, or the fix above would have
+    /// widened both routes at once.
     #[test]
     fn a_probed_tail_still_refuses_a_non_positive_constant_2348() {
         let probed = RailCoordinate {
@@ -2278,14 +2293,32 @@ mod rail_tail_evidence_tests {
             value_gap: 0.0,
             estimand_travel_bound: 1.0e-9,
             evidence: RailTailEvidence::ProbedTail {
-                noise_floor: 1.0e-6,
-                drift_band: 1.0e-2,
+                gradient_band: 1.0e-6,
+                extrapolation_radius: 1.0e-3,
             },
         };
         assert!(
             !certificate(vec![probed]).certifies(),
             "a probed tail with c = 0 carries no evidence of a tail law at all"
         );
+    }
+
+    /// A probed constant is evidence only once its settlement radius separates
+    /// it from zero: `|c − ĉ| ≤ R` with `ĉ ≤ R` admits `c = 0`.
+    #[test]
+    fn a_probed_tail_inside_its_settlement_radius_is_refused_3565() {
+        let evidence = RailTailEvidence::ProbedTail {
+            gradient_band: 1.0e-9,
+            extrapolation_radius: 1.0e-3,
+        };
+        assert!(!evidence.admits(1.0e-3));
+        assert!(!evidence.admits(5.0e-4));
+        assert!(evidence.admits(2.0e-3));
+        let unbounded = RailTailEvidence::ProbedTail {
+            gradient_band: 1.0e-9,
+            extrapolation_radius: f64::INFINITY,
+        };
+        assert!(!unbounded.admits(1.0e6));
     }
 
     /// A DESERIALIZED certificate cannot claim a proof it does not carry: the
