@@ -2338,5 +2338,33 @@
     ],
     "reason": "The #2898 mint-once pin custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 counted d2H calls across an unarmed custom-family quartic fit on the gradient-only BFGS plan. #3306 makes custom families search gradient-only only when joint_jeffreys_term_required() (the order-five Jeffreys curvature exists only when armed), so the unarmed quartic now runs exact-curvature ARC and legitimately assembles the outer Hessian per step; the pin therefore no longer described the plan it runs. The pin moved to the gam-solve gradient-only lifecycle test a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939, which asserts exactly one Hessian-order request, at the mint. D2hCountingQuarticFamily and its CustomFamily impl methods (evaluate, exact_newton_hessian_directional_derivative, exact_newton_hessian_second_directional_derivative, exact_newton_joint_hessian_beta_dependent) existed only for the removed pin.",
     "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
+  },
+  {
+    "base": "3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af",
+    "items": [
+      "crates/gam-custom-family/src/joint_newton.rs:const:JOINT_PCG_REL_TOL",
+      "crates/gam-custom-family/src/joint_newton.rs:const:PCG_ETA_MIN",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:a_non_positive_spectrum_records_nothing",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:cg_route",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:from_spectrum",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:geometric",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:planted_hessian",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:preconditioned_condition",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:record",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:the_bound_contains_the_preconditioned_spectrum",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:the_bound_is_exact_when_the_preconditioner_is_the_metric",
+      "crates/gam-custom-family/src/joint_newton.rs:fn:the_route_is_cg_only_when_its_bound_costs_less_than_the_dense_route",
+      "crates/gam-custom-family/src/joint_newton.rs:struct:JointPcgConditionRecord",
+      "crates/gam-custom-family/src/joint_newton.rs:struct:JointPcgRoute",
+      "crates/gam-linalg/src/pcg.rs:fn:a_multiple_of_the_identity_needs_one_iteration",
+      "crates/gam-linalg/src/pcg.rs:fn:pcg_iteration_bound",
+      "crates/gam-linalg/src/pcg.rs:fn:pcg_products",
+      "crates/gam-linalg/src/pcg.rs:fn:planted_spectra_converge_within_the_bound",
+      "crates/gam-linalg/src/pcg.rs:fn:products_count_the_residual_refreshes",
+      "crates/gam-linalg/src/pcg.rs:fn:the_bound_is_monotone_and_rejects_non_condition_numbers",
+      "crates/gam-linalg/src/pcg.rs:fn:the_bound_is_the_chebyshev_count_and_sits_under_its_half_root_form"
+    ],
+    "reason": "#3285: the joint-Newton CG route is priced by the inner solve's own measured costs and a CG prediction on its last dense Hessian, which replaces the Chebyshev iteration bound of 3d640034c0 (#3424). On the #3285 replay (n = 80,016, p = 71) the Jacobi-preconditioned condition number had median 1.3e10, so the bound asked for a median 750,000 products where CG measured 17, and the route went dense on every step. JointPcgConditionRecord, JointPcgRoute, pcg_iteration_bound and pcg_products priced only that bound. JOINT_PCG_REL_TOL and PCG_ETA_MIN were the literal 1e-8 floor and fallback of joint_pcg_eisenstat_walker_forcing, which the derived floor joint_cg_forcing (stationarity rounding band over the right-hand side) replaces. The listed tests exercised only the deleted items. The retained a_spent_budget_returns_an_iterate_that_lowers_the_model keeps solve_spd_pcg_bounded_into's inexact-iterate contract, which the route still uses.",
+    "evidence": "At base 3fc95ce70a, pcg_iteration_bound and pcg_products occur only in crates/gam-linalg/src/pcg.rs (declarations, docs, iteration_bound_tests) and in joint_newton.rs's JointPcgConditionRecord::cg_route. JointPcgConditionRecord and JointPcgRoute occur only in joint_newton.rs and in exact_joint_fit.rs's route decision, which this commit rewrites. JOINT_PCG_REL_TOL and PCG_ETA_MIN occur only in joint_newton.rs's joint_pcg_eisenstat_walker_forcing. At head none of these names occurs under crates (grep -c 0 in joint_newton.rs, pcg.rs and exact_joint_fit.rs). The replacement route tests are exact_joint_fit.rs joint_route_3285_tests (the decision, the break-even boundary, the gradient prior, a system CG cannot solve, and the forcing floor) and tests/joint_route_invariance_3285.rs (measured costs send one solve through CG and one through dense, and both certify one mode). source_removal_guard at the dry-run commit ad1503ac4a reported exactly these 21 identities."
   }
 ]

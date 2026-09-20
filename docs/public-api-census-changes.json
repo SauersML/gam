@@ -4791,5 +4791,17 @@
     },
     "reason": "#2946 census T10: these functions implemented or gated the arrow-Schur CertifiedMixed solve, which copied already-computed f64 Cholesky factors to f32 and refined f32 solves with f64 residuals. That work was strictly additional to the one f64 triangular solve the same factor answers, and it was gated by chosen constants. SPEC: 'Unnecessary choices and options should be deleted, not included.' arrow_rhs and matrix_inf_norm had no other caller.",
     "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
+  },
+  {
+    "base": "3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af",
+    "removed": {
+      "crates/gam-custom-family/src/joint_newton.rs::cg_route": 1,
+      "crates/gam-custom-family/src/joint_newton.rs::from_spectrum": 1,
+      "crates/gam-custom-family/src/joint_newton.rs::preconditioned_condition": 1,
+      "crates/gam-linalg/src/pcg.rs::pcg_iteration_bound": 1,
+      "crates/gam-linalg/src/pcg.rs::pcg_products": 1
+    },
+    "reason": "#3285: the joint-Newton CG route is priced by the inner solve's own measured costs and a CG prediction on its last dense Hessian, which replaces the Chebyshev iteration bound of 3d640034c0 (#3424). That bound asked for a median 750,000 products where CG measured 17 on the #3285 replay (condition number median 1.3e10), so the route went dense on every step. These functions priced only that bound.",
+    "evidence": "Replacement: joint_step_cg_products in crates/gam-custom-family/src/inner_blockwise_fit/exact_joint_fit.rs, which runs gam_linalg::utils::solve_spd_pcg_bounded_into on the solve's last dense Hessian. At base 3fc95ce70a, pcg_iteration_bound and pcg_products are called only from joint_newton.rs's JointPcgConditionRecord::cg_route and pcg.rs's iteration_bound_tests. cg_route, from_spectrum and preconditioned_condition are called only from exact_joint_fit.rs's route decision and joint_newton.rs's joint_pcg_route_tests. At head none of the five names occurs under crates. public_api_census at the dry-run commit ad1503ac4a reported exactly these 5 identities."
   }
 ]

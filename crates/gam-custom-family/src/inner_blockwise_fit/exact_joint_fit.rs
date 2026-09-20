@@ -36,6 +36,160 @@ pub(super) fn joint_stationarity_rounding_band(
     data_band + penalty_band
 }
 
+/// The CG forcing term of a joint Newton step with its derived floor (#3285).
+///
+/// The Eisenstat–Walker term tightens toward zero near the mode, but no Newton
+/// step needs a linear residual below the stationarity residual's own rounding
+/// band: the next iterate's gradient cannot be resolved below it either. CG stops
+/// on `‖r‖₂ ≤ η·‖rhs‖₂`, so `η ≥ band/‖rhs‖₂` keeps every residual component
+/// inside the band (`‖r‖∞ ≤ ‖r‖₂`). This replaces the literal lower clamp of
+/// `1e-8` the forcing term used to carry. On the #3285 replay (n = 80,016,
+/// p = 71) the floor raised η on 601 of 1,833 steps, and there the CG count fell
+/// from a median of 40 products to 2.
+fn joint_cg_forcing(eisenstat_walker: f64, stationarity_band: f64, rhs_norm: f64) -> f64 {
+    if rhs_norm > 0.0 && stationarity_band.is_finite() && stationarity_band > 0.0 {
+        eisenstat_walker.max(stationarity_band / rhs_norm)
+    } else {
+        eisenstat_walker
+    }
+}
+
+/// What one inner solve's joint Newton steps have measured about their two
+/// routes, CG and the dense build (#3285).
+///
+/// It feeds ONE decision per step, whether that step takes CG or the dense
+/// route, and never enters a step. It lives for one inner solve and is never
+/// carried to the next: the next solve runs at other smoothing parameters, and a
+/// route carried there under-predicted the products its steps needed (on the
+/// #3285 fixture at n = 5,008, p = 731 the carried route took 373 inner cycles
+/// to the first certified outer point where this solve-local one took 114). So
+/// every solve's first step is dense, and later steps predict from that solve's
+/// own last dense step.
+#[derive(Default)]
+struct JointRoute {
+    /// The likelihood Hessian of the last dense step.
+    hessian: Option<Array2<f64>>,
+    /// The routes' measured costs.
+    cost: JointRouteCost,
+}
+
+/// The measured cost of a joint Newton step's two routes in one inner solve,
+/// in seconds (#3285).
+///
+/// Operation counts cannot price the routes against each other, and neither
+/// can the memory bound. How many products one dense step is worth depends on
+/// the family and its caches: 2.2 on the #3285 replay (n = 80,016, p = 71),
+/// about 200 at n = 5,008, p = 731, and about 20 for a BMS flex workspace that
+/// streams its row kernel (gam#2900, `matrix_free_inner_route`), where the flop
+/// ratio of `PcgAttempt::Budgeted` gives 35, 383 and 22. So both costs are
+/// measured where they are paid: the dense route on every dense step, and a
+/// product on every CG step. Until a product has been measured it is priced at
+/// twice the joint gradient reload, which is one transpose pass over the rows.
+///
+/// The route therefore depends on the machine and its load: two identical fits
+/// can take different routes at a step. Both routes solve the same Newton system
+/// to the same forcing term, so the certified mode is the same to within its
+/// resolution whichever route each step took
+/// (`tests/joint_route_invariance_3285.rs`).
+#[derive(Clone, Copy, Debug, Default)]
+struct JointRouteCost {
+    dense_seconds: Option<f64>,
+    product_seconds: Option<f64>,
+    gradient_seconds: Option<f64>,
+}
+
+/// The CG products a joint Newton step spends, or why it takes the dense route
+/// (#3285).
+///
+/// One decision, made before any operator product. CG is the route only when
+/// the products it is predicted to need cost less than the dense route. The
+/// prediction is the CG solve itself, run on this solve's last dense Hessian
+/// with this step's penalty, preconditioner, right-hand side and forcing term:
+/// only `H` is stale, by the one or more steps since it was built. On the #3285
+/// replay (n = 80,016, p = 71) a prediction from the previous step's Hessian
+/// matched the measured count with median ratio 1.00 (p10 0.93, p90 1.05),
+/// where the Chebyshev bound at the same spectrum asked for a median of 750,000
+/// products. Both costs are this solve's own measurements ([`JointRouteCost`]).
+/// The prediction stops at the break-even count, the most products that still
+/// cost less than the dense route, since past it the answer is the dense route
+/// whatever the count. Without a Hessian or a priced product and dense route
+/// the step is dense, so a solve's first step is dense. A CG solve that overruns
+/// its prediction returns its iterate as an inexact Newton step; the dense
+/// route never answers a CG miss.
+fn joint_step_cg_products(
+    route: &JointRoute,
+    rhs: &Array1<f64>,
+    preconditioner: &Array1<f64>,
+    forcing: f64,
+    apply_penalty: impl Fn(&Array1<f64>, &mut Array1<f64>),
+) -> Result<usize, JointDenseReason> {
+    let hessian = route.hessian.as_ref().ok_or(JointDenseReason::NoHessian)?;
+    let product_seconds = route
+        .cost
+        .product_seconds
+        .or_else(|| route.cost.gradient_seconds.map(|gradient| 2.0 * gradient))
+        .ok_or(JointDenseReason::UnpricedProduct)?;
+    let dense_seconds = route.cost.dense_seconds.ok_or(JointDenseReason::UnpricedDense)?;
+    if hessian.nrows() != rhs.len() || hessian.ncols() != rhs.len() {
+        return Err(JointDenseReason::NoPrediction);
+    }
+    // The largest count `k` with `k · product < dense`, within the product cap
+    // of a CG solve that has no dense route.
+    let break_even = ((dense_seconds / product_seconds).ceil() as usize)
+        .saturating_sub(1)
+        .min(JOINT_PCG_MAX_ITER_MULTIPLIER * rhs.len());
+    let dense_cheaper = JointDenseReason::DenseCheaper {
+        break_even,
+        product_seconds,
+        dense_seconds,
+    };
+    if break_even == 0 {
+        return Err(dense_cheaper);
+    }
+    let penalty = RefCell::new(Array1::<f64>::zeros(rhs.len()));
+    let predicted = gam_linalg::utils::solve_spd_pcg_bounded_into(
+        |v, out| {
+            gam_linalg::faer_ndarray::fast_av_view_into(hessian, v, out.view_mut());
+            let mut penalty = penalty.borrow_mut();
+            apply_penalty(v, &mut penalty);
+            *out += &*penalty;
+        },
+        rhs,
+        preconditioner,
+        forcing,
+        break_even,
+    );
+    match predicted {
+        Some((_, info, gam_linalg::pcg::PcgStop::Converged)) => Ok(info.iterations.max(1)),
+        Some((_, _, gam_linalg::pcg::PcgStop::MaxIters)) => Err(dense_cheaper),
+        Some((_, _, gam_linalg::pcg::PcgStop::Breakdown))
+        | Some((_, _, gam_linalg::pcg::PcgStop::BadPreconditioner))
+        | None => Err(JointDenseReason::NoPrediction),
+    }
+}
+
+/// Why a joint Newton step whose system CG could solve took the dense route
+/// (#3285).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum JointDenseReason {
+    /// No dense step of this solve has built its Hessian yet.
+    NoHessian,
+    /// Neither a product nor a gradient reload has been timed in this solve.
+    UnpricedProduct,
+    /// The dense route has not been timed in this solve.
+    UnpricedDense,
+    /// CG breaks down on the last dense system (it is not positive definite
+    /// there), so it has no prediction.
+    NoPrediction,
+    /// CG is predicted to need more than the `break_even` products that cost
+    /// less than the dense route.
+    DenseCheaper {
+        break_even: usize,
+        product_seconds: f64,
+        dense_seconds: f64,
+    },
+}
+
 /// The rounding band of the penalty product `Sβ` per coefficient in flattened
 /// block order, returned as the local penalties' band and the full-width joint
 /// penalty's band.
@@ -529,6 +683,145 @@ fn arm_jeffreys_completion_endgame(
         merit_window,
         geometric_tail_history,
     );
+}
+
+#[cfg(test)]
+mod joint_route_3285_tests {
+    use super::{
+        JointDenseReason, JointRoute, JointRouteCost, joint_cg_forcing, joint_step_cg_products,
+    };
+    use ndarray::{Array1, Array2};
+
+    /// #3285: near the mode the Eisenstat–Walker term asks for digits the
+    /// stationarity residual does not have, and the derived floor keeps CG at the
+    /// residual's rounding band instead.
+    #[test]
+    fn cg_forcing_stops_at_the_stationarity_rounding_band_3285() {
+        assert_eq!(joint_cg_forcing(1.0e-2, 1.0e-9, 1.0), 1.0e-2);
+        assert_eq!(joint_cg_forcing(1.0e-12, 1.0e-9, 1.0e-2), 1.0e-9 / 1.0e-2);
+        assert_eq!(joint_cg_forcing(0.0, 1.0e-9, 0.0), 0.0);
+    }
+
+    const P: usize = 20;
+    const RIDGE: f64 = 1.0e-3;
+
+    /// A one-dimensional Laplacian plus `shift` on the diagonal: Jacobi leaves its
+    /// spread spectrum spread, so CG needs several products on it.
+    fn laplacian(shift: f64) -> Array2<f64> {
+        Array2::from_shape_fn((P, P), |(i, j)| match i.abs_diff(j) {
+            0 => 2.0 + shift,
+            1 => -1.0,
+            _ => 0.0,
+        })
+    }
+
+    fn ridge(v: &Array1<f64>, out: &mut Array1<f64>) {
+        out.assign(&(v * RIDGE));
+    }
+
+    fn route_of(hessian: Option<Array2<f64>>, cost: JointRouteCost) -> JointRoute {
+        JointRoute { hessian, cost }
+    }
+
+    /// #3285: one decision per step. Without a Hessian or a measured cost the
+    /// step is dense; with both, CG is the route only when its predicted products
+    /// cost less than the dense route, and then its budget is that prediction,
+    /// which is the count the same CG solve takes on the recorded system.
+    #[test]
+    fn a_step_takes_cg_only_when_its_predicted_products_are_cheaper_3285() {
+        let hessian = laplacian(0.1);
+        let rhs = Array1::from_elem(P, 1.0);
+        let preconditioner = Array1::from_elem(P, 2.1 + RIDGE);
+        let forcing = 1.0e-6;
+        let measured = JointRouteCost {
+            dense_seconds: Some(1.0),
+            product_seconds: Some(1.0e-3),
+            gradient_seconds: None,
+        };
+        let decide = |route: &JointRoute| {
+            joint_step_cg_products(route, &rhs, &preconditioner, forcing, ridge)
+        };
+        assert_eq!(decide(&route_of(None, measured)), Err(JointDenseReason::NoHessian));
+        assert_eq!(
+            decide(&route_of(Some(hessian.clone()), JointRouteCost::default())),
+            Err(JointDenseReason::UnpricedProduct)
+        );
+        let predicted = decide(&route_of(Some(hessian.clone()), measured))
+            .expect("a cheap product and a positive-definite system take CG");
+        let (_, info, stop) = gam_linalg::utils::solve_spd_pcg_bounded_into(
+            |v, out| {
+                gam_linalg::faer_ndarray::fast_av_view_into(&hessian, v, out.view_mut());
+                *out += &(v * RIDGE);
+            },
+            &rhs,
+            &preconditioner,
+            forcing,
+            4 * P,
+        )
+        .expect("an SPD system with a positive preconditioner");
+        assert_eq!(stop, gam_linalg::pcg::PcgStop::Converged);
+        assert!(predicted > 1, "the Laplacian needs more than one product");
+        assert_eq!(predicted, info.iterations, "the prediction is the CG solve itself");
+        // At exactly the predicted count the products cost the dense route, so
+        // the step is dense; half a product cheaper and it is CG. The costs are
+        // dyadic so that their ratio is exact.
+        let at_break_even = JointRouteCost {
+            dense_seconds: Some(predicted as f64 / 1024.0),
+            product_seconds: Some(1.0 / 1024.0),
+            gradient_seconds: None,
+        };
+        assert!(
+            matches!(
+                decide(&route_of(Some(hessian.clone()), at_break_even)),
+                Err(JointDenseReason::DenseCheaper { break_even, .. }) if break_even == predicted - 1
+            ),
+            "CG predicted to cost what the dense route costs does not take the step"
+        );
+        let below_break_even = JointRouteCost {
+            dense_seconds: Some((predicted as f64 + 0.5) / 1024.0),
+            ..at_break_even
+        };
+        assert_eq!(decide(&route_of(Some(hessian.clone()), below_break_even)), Ok(predicted));
+        // Before any product is measured, twice the gradient reload prices one.
+        let gradient_priced = JointRouteCost {
+            product_seconds: None,
+            gradient_seconds: Some(0.5e-3),
+            ..measured
+        };
+        assert_eq!(decide(&route_of(Some(hessian.clone()), gradient_priced)), Ok(predicted));
+        let slow_gradient = JointRouteCost {
+            gradient_seconds: Some(1.0),
+            ..gradient_priced
+        };
+        assert!(matches!(
+            decide(&route_of(Some(hessian), slow_gradient)),
+            Err(JointDenseReason::DenseCheaper { break_even: 0, .. })
+        ));
+    }
+
+    /// #3285: CG breaks down on a recorded system that is not positive
+    /// definite, and a recorded system of another size predicts nothing, so the
+    /// step is dense whatever the costs.
+    #[test]
+    fn a_last_hessian_cg_cannot_solve_routes_dense_3285() {
+        let rhs = Array1::from_elem(P, 1.0);
+        let preconditioner = Array1::from_elem(P, 1.0);
+        let cost = JointRouteCost {
+            dense_seconds: Some(1.0),
+            product_seconds: Some(1.0e-9),
+            gradient_seconds: None,
+        };
+        let negative = Array2::from_diag(&Array1::from_elem(P, -1.0));
+        assert_eq!(
+            joint_step_cg_products(&route_of(Some(negative), cost), &rhs, &preconditioner, 1.0e-6, ridge),
+            Err(JointDenseReason::NoPrediction)
+        );
+        let other_size = Array2::from_diag(&Array1::from_elem(P + 1, 1.0));
+        assert_eq!(
+            joint_step_cg_products(&route_of(Some(other_size), cost), &rhs, &preconditioner, 1.0e-6, ridge),
+            Err(JointDenseReason::NoPrediction)
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1129,10 +1422,11 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
     // per-block + spectrum breakdown without re-materializing H_pen.
     let mut last_kkt_refusal_report: Option<KktRefusalReport> = None;
     let mut prev_kkt_norm: Option<f64> = None;
-    // The spectrum of the last dense step, which prices the CG route of the steps
-    // after it (gam#3285). None before the first dense step and after a CG step
-    // missed its bound, so those steps go dense and measure it again.
-    let mut joint_pcg_condition: Option<JointPcgConditionRecord> = None;
+    // What this solve's steps have measured about their two routes, from which
+    // the next steps choose theirs, and the steps whose CG overran its predicted
+    // products (#3285).
+    let mut joint_route = JointRoute::default();
+    let mut joint_cg_overruns = 0usize;
     // The projected stationarity residual and its target at the state a tentative
     // convergence mark was made on, recorded by the mark itself (#2627).
     let mut tentative_mark_kkt: Option<(f64, f64)> = None;
@@ -2390,16 +2684,17 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     _ => None,
                 };
             let pcg_started = std::time::Instant::now();
-            // One route per step, decided before any solve (gam#3285). CG is
-            // eligible only for the plain penalized system `H + S`: a dense
+            // One route per step, decided before any operator product (gam#3285).
+            // CG is eligible only for the plain penalized system `H + S`: a dense
             // source, a pending returned-mode curvature or a Jeffreys-augmented
             // system goes dense. `Only` (no dense route fits the memory cap) runs
-            // CG under the historical cap and refuses a miss. `Budgeted` takes CG
-            // only when the Chebyshev bound at the last dense step's spectrum says
-            // it costs fewer products than the dense route; a cold start has no
-            // spectrum and goes dense. A CG step that misses its bound is an
-            // inexact Newton step for the trust region below, never a reason to
-            // solve the same system again densely.
+            // CG under the historical cap. `Budgeted` takes CG only when its
+            // products, predicted on this solve's last dense Hessian, cost less
+            // than the dense route by this solve's own measurements
+            // (`joint_step_cg_products`); a solve's first step has no Hessian and
+            // goes dense. Either way a CG step that stops short of its forcing
+            // term is an inexact Newton step for the trust region below, never a
+            // reason to solve the same system again densely.
             let pcg_eligible = !joint_hessian_is_dense
                 && !returned_mode_curvature_pending
                 && !true_jeffreys_hessian_required
@@ -2420,32 +2715,66 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     joint_bundle,
                 ),
             });
-            let pcg_route =
+            let cg_forcing = if pcg_eligible {
+                let block_betas: Vec<&Array1<f64>> = states.iter().map(|s| &s.beta).collect();
+                let band = joint_stationarity_rounding_band(
+                    &s_lambdas,
+                    &block_betas,
+                    joint_bundle,
+                    grad_joint.iter().map(|value| value.abs()).fold(0.0_f64, f64::max),
+                    total_joint_n,
+                );
+                joint_cg_forcing(pcg_rel_tol, band, rhs.dot(&rhs).sqrt())
+            } else {
+                pcg_rel_tol
+            };
+            let cg_products =
                 pcg_preconditioner
                     .as_ref()
                     .and_then(|preconditioner| match joint_pcg_attempt {
-                        gam_linalg::pcg::PcgAttempt::Only => Some(None),
-                        gam_linalg::pcg::PcgAttempt::Budgeted { products } => joint_pcg_condition
-                            .as_ref()
-                            .and_then(|record| {
-                                record.cg_route(
-                                    preconditioner,
-                                    joint_solver_diagonal_ridge,
-                                    pcg_rel_tol,
-                                    products,
-                                )
-                            })
-                            .map(Some),
+                        gam_linalg::pcg::PcgAttempt::Only => {
+                            Some(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1))
+                        }
+                        gam_linalg::pcg::PcgAttempt::Budgeted { .. } => {
+                            match joint_step_cg_products(
+                                &joint_route,
+                                &rhs,
+                                preconditioner,
+                                cg_forcing,
+                                |v, out| {
+                                    apply_joint_block_penalty_into(
+                                        &ranges,
+                                        &s_lambdas,
+                                        v,
+                                        joint_solver_diagonal_ridge,
+                                        out,
+                                        joint_bundle,
+                                    )
+                                },
+                            ) {
+                                Ok(products) => Some(products),
+                                Err(reason) => {
+                                    log::debug!(
+                                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route=dense reason={:?} forcing={:.3e} decided={:.3e}s",
+                                        cycle,
+                                        total_joint_n,
+                                        total_p,
+                                        reason,
+                                        cg_forcing,
+                                        pcg_started.elapsed().as_secs_f64()
+                                    );
+                                    None
+                                }
+                            }
+                        }
                     });
+            let route_decided = pcg_started.elapsed().as_secs_f64();
             let mut spectral_nullity_for_step = 0usize;
             let mut delta = None;
-            if let (Some(preconditioner_diag), Some(route)) =
-                (pcg_preconditioner.as_ref(), pcg_route)
+            if let (Some(preconditioner_diag), Some(max_iter)) =
+                (pcg_preconditioner.as_ref(), cg_products)
             {
-                let max_iter = route
-                    .map_or(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p.max(1), |route| {
-                        route.iterations
-                    });
+                let cg_started = std::time::Instant::now();
                 // Pre-allocate the penalty workspace ONCE outside the
                 // PCG closure so each CG iter (called hundreds-to-
                 // thousands of times per outer iter at large scale)
@@ -2477,7 +2806,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             },
                             &rhs,
                             preconditioner_diag,
-                            pcg_rel_tol,
+                            cg_forcing,
                             max_iter,
                         )
                     }
@@ -2509,7 +2838,7 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                             },
                             &rhs,
                             preconditioner_diag,
-                            pcg_rel_tol,
+                            cg_forcing,
                             max_iter,
                         );
                         if let Some(error) = matvec_failure.into_inner() {
@@ -2535,19 +2864,14 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     preconditioner_diag,
                     &info,
                 );
+                if info.iterations > 0 {
+                    joint_route.cost.product_seconds =
+                        Some(cg_started.elapsed().as_secs_f64() / info.iterations as f64);
+                }
                 if stop != gam_linalg::pcg::PcgStop::Converged {
-                    if route.is_none() {
-                        return Err(CustomFamilyError::trial_point(format!(
-                            "exact joint Newton at cycle {cycle}: the preconditioned CG solve of \
-                             the penalized Newton system stopped with {stop:?} after {} \
-                             iterations (relative residual {:.3e}, target {pcg_rel_tol:.3e}), and \
-                             the dense Hessian exceeds the materialization cap",
-                            info.iterations, info.relative_residual_norm,
-                        )));
-                    }
-                    // The recorded spectrum no longer bounds this Hessian, so the
-                    // next step goes dense and measures it again.
-                    joint_pcg_condition = None;
+                    // Past the cap there is no dense route to answer a miss either:
+                    // the iterate is the step, as it is below the cap.
+                    joint_cg_overruns += 1;
                     if solution.iter().all(|v| *v == 0.0) {
                         // Breakdown on the first direction leaves the zero start.
                         // That direction, `M⁻¹ rhs`, is the step CG would have taken
@@ -2557,42 +2881,33 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                 }
                 log::debug!(
                     "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route=pcg attempt={:?} \
-                     bound_iterations={} bound_condition={} stop={:?} cg_iterations={} \
-                     relative_residual={:.3e} target={:.3e} elapsed={:.3}s",
+                     predicted_products={} stop={:?} cg_iterations={} relative_residual={:.3e} \
+                     forcing={:.3e} overruns={} decided={:.3e}s elapsed={:.3}s",
                     cycle,
                     total_joint_n,
                     total_p,
                     joint_pcg_attempt,
                     max_iter,
-                    route.map_or_else(
-                        || "none".to_string(),
-                        |route| format!("{:.3e}", route.condition)
-                    ),
                     stop,
                     info.iterations,
                     info.relative_residual_norm,
-                    pcg_rel_tol,
+                    cg_forcing,
+                    joint_cg_overruns,
+                    route_decided,
                     pcg_started.elapsed().as_secs_f64()
                 );
                 delta = Some(solution);
             }
             if delta.is_none() {
+                let dense_started = std::time::Instant::now();
                 let likelihood_hessian = materialize_joint_hessian_source(
                     &joint_hessian_source,
                     total_p,
                     "joint Newton inner dense Hessian materialization",
                 )?;
-                if pcg_eligible {
-                    log::debug!(
-                        "[PIRLS/joint-PCG] cycle {:>3} | n={} p={} route=dense attempt={:?} \
-                         recorded_spectrum={}",
-                        cycle,
-                        total_joint_n,
-                        total_p,
-                        joint_pcg_attempt,
-                        joint_pcg_condition.is_some(),
-                    );
-                }
+                // The Hessian the next steps of this solve predict their CG
+                // products on (#3285); a system CG does not solve prices nothing.
+                let route_hessian = pcg_eligible.then(|| likelihood_hessian.clone());
                 // Capture the unpenalized dense `H` for the rest of this
                 // cycle (gam#1040): the Cauchy leg and trust-region
                 // predicted-reduction matvecs below can then reuse it as a
@@ -2687,14 +3002,12 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
                     &joint_trust_metric_diag,
                     KKT_REFUSAL_RANK_TOL,
                 )?;
-                // The spectrum of the plain `H + S` prices the next step's CG
-                // route; a Jeffreys-augmented matrix is not the system CG solves.
-                joint_pcg_condition =
-                    if inner_jeffreys_term.is_none() && !true_jeffreys_hessian_required {
-                        JointPcgConditionRecord::from_spectrum(&spectrum)
-                    } else {
-                        None
-                    };
+                // The dense route's cost, through its decomposition, and its
+                // Hessian price the next steps' route (#3285).
+                if let Some(hessian) = route_hessian {
+                    joint_route.cost.dense_seconds = Some(dense_started.elapsed().as_secs_f64());
+                    joint_route.hessian = Some(hessian);
+                }
                 // A positive-definite M_true owns the exact Newton step and
                 // therefore the quadratic endgame. An indefinite M_true is
                 // not reflected into a fake local minimum: start directly
@@ -5424,6 +5737,9 @@ pub(super) fn fit_exact_joint<F: CustomFamily + Clone + Send + Sync + 'static>(
             accepted_joint_workspace.take(),
         )?;
         let grad_reload_elapsed = grad_reload_started.elapsed();
+        // The joint gradient is one transpose pass over the rows, so twice it
+        // prices a CG product until one has been measured (#3285).
+        joint_route.cost.gradient_seconds = Some(grad_reload_elapsed.as_secs_f64());
         // Reset the fully-rejected stall guard's bookkeeping: an accepted
         // cycle moved β and may have grown the trust radius, so the next
         // rejected-cycle comparison must start fresh rather than carry

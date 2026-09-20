@@ -40,57 +40,6 @@ fn attainable_relative_residual(rows: usize) -> f64 {
 /// operator product.
 pub const PCG_RESIDUAL_REFRESH_PERIOD: usize = 32;
 
-/// Operator products a refreshed SPD solve spends on `iterations` CG
-/// iterations: one per iteration plus one per residual refresh.
-pub fn pcg_products(iterations: usize) -> usize {
-    iterations.saturating_add(iterations / PCG_RESIDUAL_REFRESH_PERIOD)
-}
-
-/// Iterations after which preconditioned CG from `x₀ = 0` has reached
-/// `‖r_k‖₂ ≤ max(rel_tol, γ_rows)·‖rhs‖₂` in exact arithmetic, the stop test of
-/// `pcg_core`.
-///
-/// `condition` bounds `κ = λ_max/λ_min` of the preconditioned operator
-/// `P = M^{-½} A M^{-½}`, and `preconditioner_condition` is `max M / min M` of
-/// the diagonal preconditioner. With `ρ = (√κ − 1)/(√κ + 1)` the Chebyshev bound
-/// gives `‖e_k‖_P ≤ 2ρᵏ‖e₀‖_P` for the preconditioned error. The preconditioned
-/// residual `r̂ = M^{-½} r = P ê` satisfies `λ_min‖ê‖²_P ≤ ‖r̂‖² ≤ λ_max‖ê‖²_P`,
-/// so `‖r̂_k‖/‖r̂₀‖ ≤ 2√κ·ρᵏ`, and returning to the unpreconditioned residual
-/// costs `√(max M / min M)` more. The target is therefore met once
-/// `2√(κ·κ_M)·ρᵏ ≤ η`, at
-/// `k = ⌈ln(2√(κ·κ_M)/η) / ln((√κ + 1)/(√κ − 1))⌉ ≤ ⌈½√κ·ln(2√(κ·κ_M)/η)⌉`.
-///
-/// Finite-precision CG can overrun this count at large `κ`, so a caller that
-/// spends the bound as a budget must accept the iterate it reaches. `None` when
-/// a condition number is not finite and at least one, or the tolerance is not
-/// finite and positive.
-pub fn pcg_iteration_bound(
-    condition: f64,
-    preconditioner_condition: f64,
-    rel_tol: f64,
-    rows: usize,
-) -> Option<usize> {
-    if !(condition.is_finite() && condition >= 1.0)
-        || !(preconditioner_condition.is_finite() && preconditioner_condition >= 1.0)
-        || !(rel_tol.is_finite() && rel_tol > 0.0)
-    {
-        return None;
-    }
-    let target = rel_tol.max(attainable_relative_residual(rows));
-    let amplification = 2.0 * (condition * preconditioner_condition).sqrt();
-    if amplification <= target {
-        return Some(1);
-    }
-    // ln((√κ + 1)/(√κ − 1)) = ln(1 + 2/(√κ − 1)). It is infinite at κ = 1, where
-    // `P` is a multiple of the identity and the first iteration is exact.
-    let contraction = (2.0 / (condition.sqrt() - 1.0)).ln_1p();
-    let iterations = ((amplification / target).ln() / contraction).ceil();
-    if !iterations.is_finite() {
-        return None;
-    }
-    Some((iterations as usize).max(1))
-}
-
 /// Work of the two routes for one symmetric positive-definite solve, in flops.
 ///
 /// The dense route assembles the `p × p` matrix once (`build`) and factors it
@@ -1824,76 +1773,6 @@ mod iteration_bound_tests {
         (0..p)
             .map(|i| low * (high / low).powf(i as f64 / (p - 1) as f64))
             .collect()
-    }
-
-    #[test]
-    fn a_multiple_of_the_identity_needs_one_iteration() {
-        assert_eq!(pcg_iteration_bound(1.0, 1.0, 1e-8, 10), Some(1));
-        assert_eq!(pcg_iteration_bound(1.0, 1e6, 1e-12, 10), Some(1));
-    }
-
-    #[test]
-    fn the_bound_is_the_chebyshev_count_and_sits_under_its_half_root_form() {
-        // κ = 100, κ_M = 1, η = 1e-6: ρ = 9/11 and 2√κ = 20, so
-        // k = ⌈ln(2e7) / ln(11/9)⌉ = ⌈16.81 / 0.2007⌉ = 84.
-        assert_eq!(pcg_iteration_bound(100.0, 1.0, 1e-6, 10), Some(84));
-        for &(kappa, kappa_m, eta) in &[(58.0, 1.0, 0.1), (5.2e3, 4.0, 4.9e-2), (8.7e6, 30.0, 1e-8)]
-        {
-            let k = pcg_iteration_bound(kappa, kappa_m, eta, 81).expect("finite inputs");
-            let half_root = (0.5 * f64::sqrt(kappa) * (2.0 * f64::sqrt(kappa * kappa_m) / eta).ln())
-                .ceil() as usize;
-            assert!(k <= half_root, "κ={kappa}: {k} > {half_root}");
-            assert!(
-                k + 1 >= half_root / 2,
-                "κ={kappa}: {k} far below {half_root}"
-            );
-        }
-    }
-
-    #[test]
-    fn the_bound_is_monotone_and_rejects_non_condition_numbers() {
-        let base = pcg_iteration_bound(1e3, 2.0, 1e-4, 50).unwrap();
-        assert!(pcg_iteration_bound(1e4, 2.0, 1e-4, 50).unwrap() > base);
-        assert!(pcg_iteration_bound(1e3, 2.0, 1e-6, 50).unwrap() > base);
-        assert!(pcg_iteration_bound(1e3, 20.0, 1e-4, 50).unwrap() >= base);
-        assert_eq!(pcg_iteration_bound(0.5, 1.0, 1e-4, 50), None);
-        assert_eq!(pcg_iteration_bound(f64::INFINITY, 1.0, 1e-4, 50), None);
-        assert_eq!(pcg_iteration_bound(10.0, f64::NAN, 1e-4, 50), None);
-        assert_eq!(pcg_iteration_bound(10.0, 1.0, 0.0, 50), None);
-    }
-
-    #[test]
-    fn products_count_the_residual_refreshes() {
-        assert_eq!(pcg_products(0), 0);
-        assert_eq!(pcg_products(31), 31);
-        assert_eq!(pcg_products(32), 33);
-        assert_eq!(pcg_products(100), 103);
-    }
-
-    #[test]
-    fn planted_spectra_converge_within_the_bound() {
-        let p = 60;
-        let preconditioner = geometric(p, 0.5, 40.0);
-        let kappa_m = 80.0;
-        for &kappa in &[4.0, 1e2, 1e4] {
-            for &eta in &[1e-1, 1e-4, 1e-8] {
-                let (a, rhs, m) = planted_system(&geometric(p, 1.0, kappa), &preconditioner);
-                let bound = pcg_iteration_bound(kappa * (1.0 + 1e-12), kappa_m, eta, p).unwrap();
-                let (x, info, stop) = solve_spd_pcg_bounded_into(
-                    |v, out| out.assign(&a.dot(v)),
-                    &rhs,
-                    &m,
-                    eta,
-                    bound,
-                )
-                .expect("SPD system with a positive preconditioner");
-                assert_eq!(stop, PcgStop::Converged, "κ={kappa} η={eta} bound={bound}");
-                assert!(info.iterations <= bound);
-                let residual = &rhs - &a.dot(&x);
-                let achieved = residual.dot(&residual).sqrt() / rhs.dot(&rhs).sqrt();
-                assert!(achieved <= eta.max(attainable_relative_residual(p)) * 1.5);
-            }
-        }
     }
 
     #[test]
