@@ -29,6 +29,7 @@ class FittedFeaturizer:
     fit_seconds: float
     native_bits_per_token: float | None = None
     atom_intrinsic_coords: Callable[[int], np.ndarray] | None = None
+    atom_chart: Callable[[int], dict[str, Any]] | None = None
     extras: dict[str, Any] | None = None
 
 
@@ -48,10 +49,19 @@ def description_length(
     this only coerces the arrays to the core's dtypes and adapts
     ``atom_contribution`` into the row-fetch callback the core drives (one atom at
     a time, so a lazy contribution still only materialises the sampled firing
-    rows). The score is an ambient Gaussian linear-code surrogate: modes beyond an
-    atom's ``code_dims`` are residual-coded (``truncation_bits_at_r2_*``, inside
-    ``resid_bits_at_r2_*``) and nothing is centered, so a reconstruction bias is
-    paid.
+    rows). By default the score is an ambient Gaussian linear-code surrogate:
+    modes beyond an atom's ``code_dims`` are residual-coded
+    (``truncation_bits_at_r2_*``, inside ``resid_bits_at_r2_*``) and nothing is
+    centered, so a reconstruction bias is paid.
+
+    A featurizer that supplies ``atom_chart`` is priced by the intrinsic
+    decoder-aware code instead (#3437): ``atom_chart(atom)`` returns
+    ``{"code": (n, k), "jacobian": (n, d, k), "axes": [...]}`` over all ``n``
+    rows, with ``k = code_dims[atom]``, the decoder Jacobian ``dc/du`` at each
+    row's chart coordinates, and one axis per coordinate (``"euclidean"``,
+    ``"amplitude"``, or a float period for a circle coordinate). The core then
+    codes the chart coordinates under the pulled-back metric ``J^T J`` and
+    reports how many atoms it priced this way as ``intrinsic_atoms``.
 
     ``amortization_horizon`` is the DECLARED ``N`` of the dictionary term, a
     BIC-inspired amortised parameter penalty
@@ -78,7 +88,18 @@ def description_length(
     gate = np.ascontiguousarray(np.asarray(fitted.gate, dtype=np.float64))
     code_dims = np.ascontiguousarray(np.asarray(fitted.code_dims))
 
-    def _fetch(atom: int, take: np.ndarray) -> np.ndarray:
+    def _fetch(atom: int, take: np.ndarray) -> np.ndarray | dict[str, Any]:
+        if fitted.atom_chart is not None:
+            chart = fitted.atom_chart(atom)
+            return {
+                "code": np.ascontiguousarray(
+                    np.asarray(chart["code"], dtype=np.float64)[take]
+                ),
+                "jacobian": np.ascontiguousarray(
+                    np.asarray(chart["jacobian"], dtype=np.float64)[take]
+                ),
+                "axes": list(chart["axes"]),
+            }
         return np.ascontiguousarray(
             np.asarray(fitted.atom_contribution(atom)[take], dtype=np.float64)
         )
