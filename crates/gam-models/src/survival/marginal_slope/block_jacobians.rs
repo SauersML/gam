@@ -62,6 +62,25 @@ fn scaled_channel_major_rows(
     Ok(jacobian)
 }
 
+/// Rows `rows` of `design` as a dense `(rows.len(), ncols)` block. A design
+/// that holds or has memoized a dense copy lends a view of it. Any other design
+/// streams this one chunk through its operator. The rigid and time-wiggle
+/// callbacks read their designs only through this helper, so an
+/// operator-backed design is never materialized whole to build a callback.
+fn design_row_block<'a>(
+    design: &'a DesignMatrix,
+    rows: std::ops::Range<usize>,
+    label: &str,
+) -> Result<ndarray::CowArray<'a, f64, ndarray::Ix2>, String> {
+    match design.as_dense_ref() {
+        Some(dense) => Ok(ndarray::CowArray::from(dense.slice(ndarray::s![rows, ..]))),
+        None => design
+            .try_row_chunk(rows)
+            .map(ndarray::CowArray::from)
+            .map_err(|error| format!("{label}: design row chunk failed: {error}")),
+    }
+}
+
 impl SurvivalMarginalSlopeFamilyScalars {
     /// Construct the exact current primary geometry. The score covariance FIELD
     /// is part of the construction contract, so `c_i` cannot drift away from the
@@ -413,13 +432,13 @@ impl crate::custom_family::BlockEffectiveJacobian for SlopeBlockJacobian {
 ///
 /// At g=0 (β=0 init): c=1, so each row is just M\[i,:\].
 pub(crate) struct MarginalBlockJacobian {
-    /// The marginal basis design (n × p_marginal), `Arc`-shared with its
-    /// owner rather than copied for the callback lifetime.
-    pub(crate) design: Arc<Array2<f64>>,
+    /// The marginal basis design (n × p_marginal), shared with its owner in
+    /// the storage the owner holds (dense, streamed or sparse).
+    pub(crate) design: DesignMatrix,
 }
 
 impl MarginalBlockJacobian {
-    pub fn new(design: impl Into<Arc<Array2<f64>>>) -> Self {
+    pub fn new(design: impl Into<DesignMatrix>) -> Self {
         Self {
             design: design.into(),
         }
@@ -457,6 +476,11 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
                 .to_string());
         }
 
+        let design = design_row_block(
+            &self.design,
+            rows.clone(),
+            "survival marginal-slope marginal block Jacobian",
+        )?;
         let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
         for i in rows.clone() {
@@ -467,7 +491,7 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
                 None => 1.0_f64,
             };
             for j in 0..p {
-                let m_ij = c * self.design[[i, j]];
+                let m_ij = c * design[[local_i, j]];
                 jac[[local_i, j]] = m_ij;
                 jac[[chunk + local_i, j]] = m_ij;
                 // jac[[2*n + i, j]] = 0 -- ad1 row stays zero
@@ -501,17 +525,17 @@ impl crate::custom_family::BlockEffectiveJacobian for MarginalBlockJacobian {
 ///
 /// At g=0 (β=0 init): c=1.
 pub(crate) struct TimeBlockJacobian {
-    // `Arc`-shared with their owners.
-    pub(crate) design_entry: Arc<Array2<f64>>,
-    pub(crate) design_exit: Arc<Array2<f64>>,
-    pub(crate) design_deriv: Arc<Array2<f64>>,
+    // Shared with their owners in the storage the owners hold.
+    pub(crate) design_entry: DesignMatrix,
+    pub(crate) design_exit: DesignMatrix,
+    pub(crate) design_deriv: DesignMatrix,
 }
 
 impl TimeBlockJacobian {
     pub fn new(
-        design_entry: impl Into<Arc<Array2<f64>>>,
-        design_exit: impl Into<Arc<Array2<f64>>>,
-        design_deriv: impl Into<Arc<Array2<f64>>>,
+        design_entry: impl Into<DesignMatrix>,
+        design_exit: impl Into<DesignMatrix>,
+        design_deriv: impl Into<DesignMatrix>,
     ) -> Self {
         Self {
             design_entry: design_entry.into(),
@@ -567,6 +591,10 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
                 .to_string());
         }
 
+        let label = "survival marginal-slope time block Jacobian";
+        let entry = design_row_block(&self.design_entry, rows.clone(), label)?;
+        let exit = design_row_block(&self.design_exit, rows.clone(), label)?;
+        let deriv = design_row_block(&self.design_deriv, rows.clone(), label)?;
         let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
         for i in rows.clone() {
@@ -577,9 +605,9 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
                 None => 1.0_f64,
             };
             for j in 0..p {
-                jac[[local_i, j]] = c * self.design_entry[[i, j]];
-                jac[[chunk + local_i, j]] = c * self.design_exit[[i, j]];
-                jac[[2 * chunk + local_i, j]] = c * self.design_deriv[[i, j]];
+                jac[[local_i, j]] = c * entry[[local_i, j]];
+                jac[[chunk + local_i, j]] = c * exit[[local_i, j]];
+                jac[[2 * chunk + local_i, j]] = c * deriv[[local_i, j]];
             }
         }
         Ok(jac)
@@ -634,10 +662,10 @@ impl crate::custom_family::BlockEffectiveJacobian for TimeBlockJacobian {
 /// is active. Current `c_i` values come from the family-owned vector
 /// slope state, so nonzero β requires `family_scalars`.
 pub struct SmsTimewiggleTimeJacobian {
-    pub(crate) design_entry: Arc<Array2<f64>>,
-    pub(crate) design_exit: Arc<Array2<f64>>,
-    pub(crate) design_deriv: Arc<Array2<f64>>,
-    pub(crate) design_marginal: Arc<Array2<f64>>,
+    pub(crate) design_entry: DesignMatrix,
+    pub(crate) design_exit: DesignMatrix,
+    pub(crate) design_deriv: DesignMatrix,
+    pub(crate) design_marginal: DesignMatrix,
     pub(crate) offset_entry: Arc<Array1<f64>>,
     pub(crate) offset_exit: Arc<Array1<f64>>,
     pub(crate) offset_deriv: Arc<Array1<f64>>,
@@ -658,10 +686,10 @@ pub struct SmsTimewiggleTimeJacobian {
 impl SmsTimewiggleTimeJacobian {
     /// Construct.
     pub fn new(
-        design_entry: Arc<Array2<f64>>,
-        design_exit: Arc<Array2<f64>>,
-        design_deriv: Arc<Array2<f64>>,
-        design_marginal: Arc<Array2<f64>>,
+        design_entry: impl Into<DesignMatrix>,
+        design_exit: impl Into<DesignMatrix>,
+        design_deriv: impl Into<DesignMatrix>,
+        design_marginal: impl Into<DesignMatrix>,
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
@@ -671,12 +699,13 @@ impl SmsTimewiggleTimeJacobian {
         p_tw: usize,
         p_m: usize,
     ) -> Self {
+        let design_entry = design_entry.into();
         let p_time = design_entry.ncols();
         Self {
             design_entry,
-            design_exit,
-            design_deriv,
-            design_marginal,
+            design_exit: design_exit.into(),
+            design_deriv: design_deriv.into(),
+            design_marginal: design_marginal.into(),
             offset_entry,
             offset_exit,
             offset_deriv,
@@ -762,6 +791,11 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
         }
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
+        let label = "timewiggle time Jacobian";
+        let entry = design_row_block(&self.design_entry, rows.clone(), label)?;
+        let exit = design_row_block(&self.design_exit, rows.clone(), label)?;
+        let deriv = design_row_block(&self.design_deriv, rows.clone(), label)?;
+        let marginal = design_row_block(&self.design_marginal, rows.clone(), label)?;
 
         let mut jac = Array2::<f64>::zeros((3 * chunk, p));
 
@@ -773,8 +807,8 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
             let eta_m: f64 = beta_m
                 .iter()
                 .enumerate()
-                .filter(|&(j, _)| j < self.design_marginal.ncols())
-                .map(|(j, &b)| self.design_marginal[[i, j]] * b)
+                .filter(|&(j, _)| j < marginal.ncols())
+                .map(|(j, &b)| marginal[[local_i, j]] * b)
                 .sum();
 
             // The marginal predictor (coefficient part `eta_m` plus the fixed
@@ -783,18 +817,18 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
             let h0: f64 = self.offset_entry[i]
                 + eta_m
                 + self.marginal_offset[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
-                    .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(entry.ncols()))
+                    .map(|j| entry[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let h1: f64 = self.offset_exit[i]
                 + eta_m
                 + self.marginal_offset[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
-                    .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(exit.ncols()))
+                    .map(|j| exit[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let d_raw: f64 = self.offset_deriv[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_deriv.ncols()))
-                    .map(|j| self.design_deriv[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(deriv.ncols()))
+                    .map(|j| deriv[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
 
             let beta_tw_view = ndarray::ArrayView1::from(beta_tw);
@@ -825,10 +859,10 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
                 };
 
             // Base columns j < p_base.
-            for j in 0..p_base.min(self.design_entry.ncols()) {
-                let xe = self.design_entry[[i, j]];
-                let xx = self.design_exit[[i, j]];
-                let xd = self.design_deriv[[i, j]];
+            for j in 0..p_base.min(entry.ncols()) {
+                let xe = entry[[local_i, j]];
+                let xx = exit[[local_i, j]];
+                let xd = deriv[[local_i, j]];
                 jac[[local_i, j]] = c_i * entry_dq * xe;
                 jac[[chunk + local_i, j]] = c_i * exit_dq * xx;
                 jac[[2 * chunk + local_i, j]] = c_i * (exit_d2q * d_raw * xx + exit_dq * xd);
@@ -866,10 +900,10 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleTimeJacobian 
 /// n_outputs = 3 stacked Jacobian for the **marginal** block when timewiggle
 /// is active.
 pub struct SmsTimewiggleMarginalJacobian {
-    pub(crate) design_entry: Arc<Array2<f64>>,
-    pub(crate) design_exit: Arc<Array2<f64>>,
-    pub(crate) design_deriv: Arc<Array2<f64>>,
-    pub(crate) design_marginal: Arc<Array2<f64>>,
+    pub(crate) design_entry: DesignMatrix,
+    pub(crate) design_exit: DesignMatrix,
+    pub(crate) design_deriv: DesignMatrix,
+    pub(crate) design_marginal: DesignMatrix,
     pub(crate) offset_entry: Arc<Array1<f64>>,
     pub(crate) offset_exit: Arc<Array1<f64>>,
     pub(crate) offset_deriv: Arc<Array1<f64>>,
@@ -885,10 +919,10 @@ pub struct SmsTimewiggleMarginalJacobian {
 impl SmsTimewiggleMarginalJacobian {
     /// Construct.
     pub fn new(
-        design_entry: Arc<Array2<f64>>,
-        design_exit: Arc<Array2<f64>>,
-        design_deriv: Arc<Array2<f64>>,
-        design_marginal: Arc<Array2<f64>>,
+        design_entry: impl Into<DesignMatrix>,
+        design_exit: impl Into<DesignMatrix>,
+        design_deriv: impl Into<DesignMatrix>,
+        design_marginal: impl Into<DesignMatrix>,
         offset_entry: Arc<Array1<f64>>,
         offset_exit: Arc<Array1<f64>>,
         offset_deriv: Arc<Array1<f64>>,
@@ -899,10 +933,10 @@ impl SmsTimewiggleMarginalJacobian {
         p_tw: usize,
     ) -> Self {
         Self {
-            design_entry,
-            design_exit,
-            design_deriv,
-            design_marginal,
+            design_entry: design_entry.into(),
+            design_exit: design_exit.into(),
+            design_deriv: design_deriv.into(),
+            design_marginal: design_marginal.into(),
             offset_entry,
             offset_exit,
             offset_deriv,
@@ -980,6 +1014,11 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
         }
         let knots = &self.time_wiggle_knots;
         let degree = self.time_wiggle_degree;
+        let label = "timewiggle marginal Jacobian";
+        let entry = design_row_block(&self.design_entry, rows.clone(), label)?;
+        let exit = design_row_block(&self.design_exit, rows.clone(), label)?;
+        let deriv = design_row_block(&self.design_deriv, rows.clone(), label)?;
+        let marginal = design_row_block(&self.design_marginal, rows.clone(), label)?;
 
         let mut jac = Array2::<f64>::zeros((3 * chunk, p_m));
 
@@ -991,7 +1030,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
                 .iter()
                 .enumerate()
                 .filter(|&(j, _)| j < p_m)
-                .map(|(j, &b)| self.design_marginal[[i, j]] * b)
+                .map(|(j, &b)| marginal[[local_i, j]] * b)
                 .sum();
 
             // Marginal predictor (eta_m + fixed marginal_offset) enters entry
@@ -999,18 +1038,18 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
             let h0: f64 = self.offset_entry[i]
                 + eta_m
                 + self.marginal_offset[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_entry.ncols()))
-                    .map(|j| self.design_entry[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(entry.ncols()))
+                    .map(|j| entry[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let h1: f64 = self.offset_exit[i]
                 + eta_m
                 + self.marginal_offset[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_exit.ncols()))
-                    .map(|j| self.design_exit[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(exit.ncols()))
+                    .map(|j| exit[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
             let d_raw: f64 = self.offset_deriv[i]
-                + (0..p_base.min(beta_t_base.len()).min(self.design_deriv.ncols()))
-                    .map(|j| self.design_deriv[[i, j]] * beta_t_base[j])
+                + (0..p_base.min(beta_t_base.len()).min(deriv.ncols()))
+                    .map(|j| deriv[[local_i, j]] * beta_t_base[j])
                     .sum::<f64>();
 
             let beta_tw_view = ndarray::ArrayView1::from(beta_tw);
@@ -1033,7 +1072,7 @@ impl crate::custom_family::BlockEffectiveJacobian for SmsTimewiggleMarginalJacob
             };
 
             for j in 0..p_m {
-                let m_ij = self.design_marginal[[i, j]];
+                let m_ij = marginal[[local_i, j]];
                 jac[[local_i, j]] = c_i * entry_dq * m_ij;
                 jac[[chunk + local_i, j]] = c_i * exit_dq * m_ij;
                 jac[[2 * chunk + local_i, j]] = c_i * exit_d2q * d_raw * m_ij;

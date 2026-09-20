@@ -445,8 +445,10 @@ fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f
     }
 }
 
+/// `(μ, 1 − μ)` of the logistic inverse link, each formed from its own tail so
+/// the smaller member keeps full relative precision on both sides of `η = 0`.
 #[inline]
-fn logit_probability_pair(eta: f64) -> (f64, f64) {
+pub(crate) fn logit_probability_pair(eta: f64) -> (f64, f64) {
     if eta >= 0.0 {
         let tail = (-eta).exp();
         let one_minus_mu = tail / (1.0 + tail);
@@ -1783,7 +1785,13 @@ pub(crate) fn beta_eta_for_logit_target(target: f64, phi: f64) -> Result<f64, Es
             "Beta score root could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
         )));
     }
-    for _ in 0..256 {
+    if lower_score == 0.0 {
+        return Ok(lower);
+    }
+    if upper_score == 0.0 {
+        return Ok(upper);
+    }
+    loop {
         let midpoint = lower + 0.5 * (upper - lower);
         if midpoint == lower || midpoint == upper {
             return Ok(if lower_score.abs() <= upper_score.abs() {
@@ -1809,9 +1817,6 @@ pub(crate) fn beta_eta_for_logit_target(target: f64, phi: f64) -> Result<f64, Es
             upper_score = score;
         }
     }
-    Err(EstimationError::InvalidInput(
-        "Beta score root did not reach an adjacent-float bracket".into(),
-    ))
 }
 
 /// Solve the fixed-precision Beta intercept score in its unbounded logit
@@ -1841,59 +1846,7 @@ fn beta_null_eta(
         },
     )?;
 
-    let mut lower = -1.0_f64;
-    let mut upper = 1.0_f64;
-    let mut lower_score = beta_null_score(lower, phi, target);
-    let mut upper_score = beta_null_score(upper, phi, target);
-    while lower_score > 0.0 && lower > -1024.0 {
-        lower *= 2.0;
-        lower_score = beta_null_score(lower, phi, target);
-    }
-    while upper_score < 0.0 && upper < 1024.0 {
-        upper *= 2.0;
-        upper_score = beta_null_score(upper, phi, target);
-    }
-    if lower_score.is_nan() || upper_score.is_nan() || lower_score > 0.0 || upper_score < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "Beta null score could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
-        )));
-    }
-    if lower_score == 0.0 {
-        return Ok(lower);
-    }
-    if upper_score == 0.0 {
-        return Ok(upper);
-    }
-
-    for _ in 0..256 {
-        let midpoint = lower + 0.5 * (upper - lower);
-        if midpoint == lower || midpoint == upper {
-            return Ok(if lower_score.abs() <= upper_score.abs() {
-                lower
-            } else {
-                upper
-            });
-        }
-        let score = beta_null_score(midpoint, phi, target);
-        if score.is_nan() {
-            return Err(EstimationError::InvalidInput(format!(
-                "Beta null score is NaN at eta={midpoint}, precision={phi}, target={target}"
-            )));
-        }
-        if score == 0.0 {
-            return Ok(midpoint);
-        }
-        if score < 0.0 {
-            lower = midpoint;
-            lower_score = score;
-        } else {
-            upper = midpoint;
-            upper_score = score;
-        }
-    }
-    Err(EstimationError::InvalidInput(format!(
-        "Beta null score did not reach an adjacent-float bracket: lower=({lower},{lower_score}), upper=({upper},{upper_score})"
-    )))
+    beta_eta_for_logit_target(target, phi)
 }
 
 /// Exact intercept-only deviance for reporting and deviance-explained metrics.

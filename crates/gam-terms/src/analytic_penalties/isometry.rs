@@ -30,27 +30,6 @@ impl std::fmt::Debug for IsometryReference {
     }
 }
 
-/// Radial Duchon decoder metadata used to materialize
-/// `∂J_n[i, a] / ∂t_{n, c}` from `φ'(r)` and `φ''(r)` on demand.
-///
-/// `radial_coefficients[k, i]` is the decoder coefficient that maps radial
-/// basis column `k` into output channel `i`. Polynomial-tail columns are not
-/// represented here; callers whose decoder contains a non-linear polynomial
-/// tail should provide `jacobian_second_cache` directly.
-#[derive(Debug, Clone)]
-pub struct IsometryDuchonRadialSource {
-    pub centers: Arc<Array2<f64>>,
-    pub radial_coefficients: Arc<Array2<f64>>,
-    pub length_scale: Option<f64>,
-    pub nullspace_order: DuchonNullspaceOrder,
-    /// Forward hybrid spectral order `s = spec.power`. The Cartesian
-    /// derivative engine must resolve the same `(p, s, κ)` the forward
-    /// `build_duchon_basis` used, so it differentiates the exact resolved
-    /// hybrid Green's function `φ_{p,s,κ}` rather than a hard-coded `s = 0`
-    /// surrogate (issue #440).
-    pub power: usize,
-}
-
 /// Isometry-to-reference penalty (canonical-coordinate gauge term).
 ///
 /// Lives on ext-coords: the target slice is a row of the `LatentCoordValues` flat
@@ -113,10 +92,10 @@ pub struct IsometryDuchonRadialSource {
 ///   canonical units of latent motion.
 ///
 /// The per-row Jacobian `J_n` is exactly the radial-derivative jet
-/// `design_gradient_wrt_t` already computes for `LatentCoordValues`; the
-/// second derivative `∂J/∂t` is built by the shared
-/// `crate::basis::radial_basis_cartesian_derivative` engine from the
-/// radial Hessian identity. A finite-difference oracle for the docstring is
+/// `design_gradient_wrt_t` already computes for `LatentCoordValues`; its
+/// motion `H = ∂J/∂t` and the third jet `K = ∂H/∂t` are decoder jets the owner
+/// installs ([`Self::refresh_caches`] / [`Self::set_third_decoder_derivative`]).
+/// A finite-difference oracle for the docstring is
 /// to central-difference `value(t ± h e_j)` against `grad_target(t)[j]`;
 /// the analytic value follows the oracle until finite-difference
 /// cancellation dominates. No autograd needed.
@@ -145,15 +124,10 @@ pub struct IsometryPenalty {
     pub jacobian_cache_slot: RwLock<Option<Arc<Array2<f64>>>>,
     /// Optional cached per-row Jacobian *second derivative*
     /// `H_n ∈ ℝ^{p × d × d}`, flattened row-major as `(n_obs, p*d*d)`.
-    /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. Either this cache or
-    /// `duchon_radial_source` must be present for exact isometry
-    /// gradient/HVP calls. Access through [`Self::jacobian_second_cache`] /
+    /// `H_n[i, a, c] = ∂J_n[i, a] / ∂t_{n, c}`. It must be installed for
+    /// exact isometry gradient/HVP calls. Access through [`Self::jacobian_second_cache`] /
     /// [`Self::set_jacobian_second_cache`].
     pub jacobian_second_cache_slot: RwLock<Option<Arc<Array2<f64>>>>,
-    /// Optional radial-Duchon source used to build `jacobian_second_cache`
-    /// analytically from `φ'(r)` and the public `φ''(r)` jet helper. This is
-    /// the exact chain-rule path for callers that do not pre-cache `∂J/∂t`.
-    pub duchon_radial_source: Option<Arc<IsometryDuchonRadialSource>>,
     /// Optional cached per-row Jacobian *third derivative*
     /// `K_n ∈ ℝ^{p × d × d × d}`, stored as an `Array3` with shape
     /// `(n_obs, p, d * d * d)` where the third axis packs `(a, c, d)` in
@@ -161,8 +135,7 @@ pub struct IsometryPenalty {
     /// residual-curvature Hessian (proposal §4(b)):
     ///   B_{ab,cd} = K_{a,cd}^T W J_b + H_{a,c}^T W H_{b,d}
     ///             + H_{a,d}^T W H_{b,c} + J_a^T W K_{b,cd}.
-    /// Either this cache or `duchon_radial_source` must be present for
-    /// analytic `hvp` calls. Interior-mutable (mirrors
+    /// It must be installed for analytic `hvp` calls. Interior-mutable (mirrors
     /// `jacobian_second_cache_slot`) so the SAE outer loop can refresh `K` in
     /// place each step. Access through [`Self::third_decoder_derivative`] /
     /// [`Self::set_third_decoder_derivative`].
@@ -179,12 +152,12 @@ pub struct IsometryPenalty {
     pub weight_schedule: Option<ScalarWeightSchedule>,
 }
 
-pub(crate) struct IsometryHvpState<'a> {
+pub(crate) struct IsometryHvpState {
     d: usize,
     n_obs: usize,
     p: usize,
-    jac2: CowArray<'a, f64, Ix2>,
-    jac3: CowArray<'a, f64, Ix3>,
+    jac2: Arc<Array2<f64>>,
+    jac3: Arc<ndarray::Array3<f64>>,
     metric: IsometryMetricState,
     wj_rows: Vec<Array2<f64>>,
 }
@@ -325,6 +298,11 @@ pub enum IsometryEvaluationOrder {
 const INSTALLED_JACOBIAN: &str =
     "the isometry evaluation precondition established an installed, dimensioned decoder Jacobian";
 
+/// The decoder jets `H`/`K` read after `IsometryPenalty::require_evaluation_state`
+/// has established that the order being evaluated has them installed and dimensioned.
+const INSTALLED_JETS: &str =
+    "the isometry evaluation precondition established installed, dimensioned decoder jets H/K";
+
 impl IsometryPenalty {
     #[must_use]
     pub fn new_euclidean(target: PsiSlice, p_out: usize) -> Self {
@@ -334,7 +312,6 @@ impl IsometryPenalty {
             rho_index: 0,
             jacobian_cache_slot: RwLock::new(None),
             jacobian_second_cache_slot: RwLock::new(None),
-            duchon_radial_source: None,
             third_decoder_derivative_slot: RwLock::new(None),
             p_out,
             weight: WeightField::Identity,
@@ -417,8 +394,8 @@ impl IsometryPenalty {
     /// outer loop can install fresh caches on an `Arc<IsometryPenalty>` held
     /// in the analytic-penalty registry without disturbing the surrounding
     /// dispatcher. Pass `None` for either argument to clear that cache (an
-    /// evaluation then reads the Duchon radial source if one is installed, and
-    /// otherwise [`Self::evaluation_state_precondition`] refuses it by name).
+    /// evaluation that reads it is then refused by name, see
+    /// [`Self::evaluation_state_precondition`]).
     pub fn refresh_caches(&self, jac: Option<Arc<Array2<f64>>>, jac2: Option<Arc<Array2<f64>>>) {
         *self
             .jacobian_cache_slot
@@ -430,8 +407,7 @@ impl IsometryPenalty {
             .expect("IsometryPenalty::jacobian_second_cache_slot poisoned") = jac2;
     }
 
-    /// In-place writer for just the Jacobian cache (used by callers that
-    /// already own the radial Duchon source and only want to refresh `J`).
+    /// In-place writer for just the Jacobian cache.
     pub(crate) fn set_jacobian_cache(&self, jac: Option<Arc<Array2<f64>>>) {
         *self
             .jacobian_cache_slot
@@ -474,7 +450,6 @@ impl Clone for IsometryPenalty {
             rho_index: self.rho_index,
             jacobian_cache_slot: RwLock::new(self.jacobian_cache()),
             jacobian_second_cache_slot: RwLock::new(self.jacobian_second_cache()),
-            duchon_radial_source: self.duchon_radial_source.clone(),
             third_decoder_derivative_slot: RwLock::new(self.third_decoder_derivative()),
             p_out: self.p_out,
             weight: self.weight.clone(),
@@ -485,7 +460,6 @@ impl Clone for IsometryPenalty {
 }
 
 impl IsometryPenalty {
-
     #[must_use]
     pub fn with_jacobian_cache(self, j: Arc<Array2<f64>>) -> Self {
         self.set_jacobian_cache(Some(j));
@@ -505,7 +479,7 @@ impl IsometryPenalty {
     ///
     /// The penalty is a function of the decoder Jacobian `J = ∂f/∂t`, never of
     /// the target directly: without `J` it has no value, and without `H = ∂J/∂t`
-    /// (or a Duchon radial source) no target derivative. Every evaluation route
+    /// no target derivative. Every evaluation route
     /// installs the jets it reads (the SAE atom refresh), or checks this first
     /// and refuses by the returned text (the pyffi `analytic_penalty_*` entry
     /// points and the latent-coordinate fit routes, through
@@ -549,11 +523,11 @@ impl IsometryPenalty {
             return Ok(());
         }
         match self.jacobian_second_cache() {
-            None if self.duchon_radial_source.is_none() => {
+            None => {
                 return Err(format!(
                     "IsometryPenalty target derivatives read the decoder Jacobian's motion \
-                     H = ∂J/∂t, shaped (n_obs, p_out·latent_dim²) = ({n_obs}, {}), and neither \
-                     H nor a Duchon radial source is installed",
+                     H = ∂J/∂t, shaped (n_obs, p_out·latent_dim²) = ({n_obs}, {}), and none \
+                     is installed",
                     p * d * d
                 ));
             }
@@ -565,17 +539,16 @@ impl IsometryPenalty {
                     p * d * d
                 ));
             }
-            None | Some(_) => {}
+            Some(_) => {}
         }
         if order == IsometryEvaluationOrder::Gradient {
             return Ok(());
         }
         match self.third_decoder_derivative() {
-            None if self.duchon_radial_source.is_none() => {
+            None => {
                 return Err(format!(
                     "IsometryPenalty exact Hessian reads the third decoder jet K = ∂H/∂t, shaped \
-                     (n_obs, p_out, latent_dim³) = ({n_obs}, {p}, {}), and neither K nor a \
-                     Duchon radial source is installed",
+                     (n_obs, p_out, latent_dim³) = ({n_obs}, {p}, {}), and none is installed",
                     d * d * d
                 ));
             }
@@ -587,7 +560,7 @@ impl IsometryPenalty {
                     d * d * d
                 ));
             }
-            None | Some(_) => {}
+            Some(_) => {}
         }
         Ok(())
     }
@@ -611,7 +584,7 @@ impl IsometryPenalty {
     }
 
     /// Log an evaluation that returns zero because the decoder metric is
-    /// degenerate or a Duchon radial jet failed to materialize.
+    /// degenerate.
     fn log_zero_default(&self, method: &str, detail: &str) {
         log::debug!("IsometryPenalty::{method} {detail}; returning the zero default");
     }
@@ -716,131 +689,7 @@ impl IsometryPenalty {
         }
     }
 
-    fn target_matrix(target: ArrayView1<'_, f64>, n_obs: usize, d: usize) -> Array2<f64> {
-        let mut out = Array2::<f64>::zeros((n_obs, d));
-        for n in 0..n_obs {
-            for a in 0..d {
-                out[[n, a]] = target[n * d + a];
-            }
-        }
-        out
-    }
-
-    /// Second-order input-location derivative tensor of the Duchon decoder,
-    /// flattened to `(n_obs, p_out · d²)` with column layout
-    /// `i·d² + (a·d + c)`.
-    ///
-    /// Thin adapter over the shared [`radial_basis_cartesian_derivative`]
-    /// engine: it owns the radial-jet evaluation and the radial→Cartesian map;
-    /// here we only forward the source geometry.
-    fn duchon_radial_jacobian_second(
-        &self,
-        target: ArrayView1<'_, f64>,
-        n_obs: usize,
-        d: usize,
-        source: &IsometryDuchonRadialSource,
-    ) -> Result<Array2<f64>, BasisError> {
-        assert_eq!(source.centers.ncols(), d);
-        assert_eq!(source.radial_coefficients.nrows(), source.centers.nrows());
-        assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-        let t = Self::target_matrix(target, n_obs, d);
-        radial_basis_cartesian_derivative(
-            2,
-            t.view(),
-            source.centers.view(),
-            source.radial_coefficients.view(),
-            source.length_scale,
-            source.nullspace_order,
-            source.power,
-        )
-    }
-
-    /// Third-order input-location derivative tensor of the Duchon decoder,
-    /// shaped `(n_obs, p_out, d³)` with last-axis layout `(a·d + c)·d + e`.
-    ///
-    /// Thin adapter over the shared [`radial_basis_cartesian_derivative`]
-    /// engine; the flat `(n_obs, p_out · d³)` result is reshaped to the
-    /// `Array3` consumed by the HVP path (row-major flatten of `(p_out, d³)`
-    /// is exactly `i·d³ + idx`).
-    fn duchon_radial_jacobian_third(
-        &self,
-        target: ArrayView1<'_, f64>,
-        n_obs: usize,
-        d: usize,
-        source: &IsometryDuchonRadialSource,
-    ) -> Result<ndarray::Array3<f64>, BasisError> {
-        assert_eq!(source.centers.ncols(), d);
-        assert_eq!(source.radial_coefficients.nrows(), source.centers.nrows());
-        assert_eq!(source.radial_coefficients.ncols(), self.p_out);
-        let t = Self::target_matrix(target, n_obs, d);
-        let flat = radial_basis_cartesian_derivative(
-            3,
-            t.view(),
-            source.centers.view(),
-            source.radial_coefficients.view(),
-            source.length_scale,
-            source.nullspace_order,
-            source.power,
-        )?;
-        Ok(flat
-            .into_shape_with_order((n_obs, self.p_out, d * d * d))
-            .expect("radial_basis_cartesian_derivative order-3 output reshapes to (n_obs, p, d³)"))
-    }
-
-    fn jacobian_second<'a>(
-        &'a self,
-        target: ArrayView1<'_, f64>,
-        n_obs: usize,
-        d: usize,
-    ) -> Option<CowArray<'a, f64, Ix2>> {
-        if let Some(jac2) = self.jacobian_second_cache() {
-            // Clone the underlying Array2 to detach from the Arc — the
-            // CowArray needs to outlive the temporary Arc returned by the
-            // accessor. The clone is `n_obs × p·d²` floats, paid once per
-            // grad_target / hvp_state invocation; same per-step cost as the
-            // pre-refactor code path which also took ownership via
-            // `jac2.view().to_owned()` semantics implicitly.
-            return Some(CowArray::from((*jac2).clone()));
-        }
-        let source = self.duchon_radial_source.as_ref()?;
-        match self.duchon_radial_jacobian_second(target, n_obs, d, source) {
-            Ok(jac2) => Some(CowArray::from(jac2)),
-            Err(err) => {
-                self.log_zero_default(
-                    "jacobian_second",
-                    &format!("failed to materialize Duchon radial second derivative: {err}"),
-                );
-                None
-            }
-        }
-    }
-
-    fn jacobian_third<'a>(
-        &'a self,
-        target: ArrayView1<'_, f64>,
-        n_obs: usize,
-        d: usize,
-    ) -> Option<CowArray<'a, f64, Ix3>> {
-        if let Some(jac3) = self.third_decoder_derivative() {
-            return Some(CowArray::from(jac3.as_ref().clone()));
-        }
-        let source = self.duchon_radial_source.as_ref()?;
-        match self.duchon_radial_jacobian_third(target, n_obs, d, source) {
-            Ok(jac3) => Some(CowArray::from(jac3)),
-            Err(err) => {
-                self.log_zero_default(
-                    "jacobian_third",
-                    &format!("failed to materialize Duchon radial third derivative: {err}"),
-                );
-                None
-            }
-        }
-    }
-
-    pub(crate) fn hvp_state<'a>(
-        &'a self,
-        target: ArrayView1<'_, f64>,
-    ) -> Option<IsometryHvpState<'a>> {
+    pub(crate) fn hvp_state(&self, target: ArrayView1<'_, f64>) -> Option<IsometryHvpState> {
         let d = self
             .target
             .latent_dim
@@ -848,8 +697,8 @@ impl IsometryPenalty {
         let n_obs = target.len() / d;
         self.require_evaluation_state("hvp", IsometryEvaluationOrder::Hessian, target.len());
         let p = self.p_out;
-        let jac2 = self.jacobian_second(target.view(), n_obs, d)?;
-        let jac3 = self.jacobian_third(target.view(), n_obs, d)?;
+        let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
+        let jac3 = self.third_decoder_derivative().expect(INSTALLED_JETS);
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let metric = self.normalized_metric_state(g, n_obs, d)?;
         let mut wj_rows = Vec::with_capacity(n_obs);
@@ -869,7 +718,7 @@ impl IsometryPenalty {
 
     pub(crate) fn hvp_with_precomputed_state(
         &self,
-        state: &IsometryHvpState<'_>,
+        state: &IsometryHvpState,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
@@ -1226,9 +1075,7 @@ impl AnalyticPenalty for IsometryPenalty {
         //   ∂P/∂t_c
         //         = μ Σ_{a,b} A_{a,b} · ∂g_{ab}/∂t_c
         //
-        // `H = ∂J/∂t` comes either from the live cache or from the radial
-        // Duchon `φ''(r)` helper. The sign is positive: differentiating
-        // `t - c` with respect to `t` contributes `+I`.
+        // `H = ∂J/∂t` is the installed decoder jet.
         let d = self
             .target
             .latent_dim
@@ -1246,9 +1093,7 @@ impl AnalyticPenalty for IsometryPenalty {
         let p = self.p_out;
         let mu = validated_learnable_weight(self.scalar_weight, rho[self.rho_index]);
         let mut grad = Array1::<f64>::zeros(target.len());
-        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
-            return grad;
-        };
+        let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
         assert_eq!(jac2.ncols(), p * d * d);
 
         for n in 0..n_obs {
@@ -1271,16 +1116,14 @@ impl AnalyticPenalty for IsometryPenalty {
         grad
     }
 
-    /// Fully analytic - wired through `radial_basis_cartesian_derivative`.
+    /// Fully analytic, reading the installed decoder jets `H` and `K`.
     fn hvp(
         &self,
         target: ArrayView1<'_, f64>,
         rho: ArrayView1<'_, f64>,
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
-        // Fully analytic isometry Hessian-vector product wired through the
-        // shared `radial_basis_cartesian_derivative` engine when no
-        // third-derivative cache is supplied.
+        // Fully analytic isometry Hessian-vector product.
         //
         // The full Hessian of P_iso = (μ/2) Σ_n ||J^T W J / gbar - G_ref||²_F
         // (per proposal §4(b)) is
@@ -1320,9 +1163,7 @@ impl AnalyticPenalty for IsometryPenalty {
             IsometryEvaluationOrder::Gradient,
             target.len(),
         );
-        let Some(jac2) = self.jacobian_second(target, n_obs, d) else {
-            return Array1::<f64>::zeros(v.len());
-        };
+        let jac2 = self.jacobian_second_cache().expect(INSTALLED_JETS);
         let g = self.pullback_metric(d).expect(INSTALLED_JACOBIAN);
         let Some(metric) = self.normalized_metric_state(g, n_obs, d) else {
             return Array1::<f64>::zeros(v.len());

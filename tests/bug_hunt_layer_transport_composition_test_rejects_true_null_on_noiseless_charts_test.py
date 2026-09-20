@@ -1,28 +1,23 @@
 """Bug hunt: the ``layer_transport_ladder`` composition-law test rejects a TRUE
-null on near-noiseless chart chains (issue #2143).
+null on near-noiseless chart chains (issue #2143), revisited by #3364.
 
 The two-hop composition test studentizes the composition defect
 ``d(t) = h_ac(t) ⊖ (h_bc ∘ h_ab)(t)`` against the composed delta-method band
-variance ``var(h_ac) + var(h_bc) + h_bc′²·var(h_ab)``. That variance is a pure
-SAMPLING variance: it collapses toward zero as the adjacent REML transports
-approach noiselessness. But composing two penalized-spline chart maps is not
-closed in a single finite basis, so even a perfectly composable chain carries an
-irreducible defect at the spline-representation scale that the sampling variance
-does not model. With only a relative numerical variance floor, that defect is
-studentized against a collapsed variance and inflated into a spurious
-``composition_p_value = 0`` — and the test is inverted: adding realistic noise
-makes the defect LARGER yet the test correctly ACCEPTS, so a smaller,
-more-composable defect is judged far more significant.
+variance ``var(h_ac) + var(h_bc) + h_bc′²·var(h_ab)``. That variance is a
+SAMPLING variance, and a noiseless chart chain has no sampling variability:
+there is no null distribution to calibrate a p-value against.
 
-The fix calibrates the statistic to the fitted maps' observed approximation
-resolution. Their residual RMS values are propagated through the composition
-with Minkowski's inequality, so no fixed coordinate-scale tolerance is needed:
-representation-level defects read as non-significant while genuine violations
-well above the maps' resolution remain detectable.
+So the pair law is declared by the caller. ``pairs="deterministic"`` says every
+coordinate is an exact function of the row, and each transport is the exact
+minimum-curvature interpolant of its pairs: no smoothing parameter, no
+dispersion, zero band. The composition defect is then a pure interpolation
+error, which collapses with the site spacing, and the report carries
+``composition_p_value = None`` rather than a statistic divided by a variance
+that does not exist. ``pairs="stochastic"`` (the default) keeps the REML band
+and the calibrated test, which must accept a composable noisy chain.
 
 For a deterministic 1-D chart chain the composition law is a mathematical
-identity, so these are type-I (true-null) calibration tests: a composable chain
-must NOT be flagged as a law violation.
+identity, so a composable chain must never be flagged as a law violation.
 """
 
 import os
@@ -43,74 +38,73 @@ def _circle_chain(noise, seed=3, n=400):
     return [t + jit(), b1 + jit(), b2 + jit()]
 
 
-def _two_hop(chain, topology="circle"):
-    return gamfit.sae.layer_transport_ladder(chain, topology=topology)["two_hop"][0]
+def _two_hop(chain, topology="circle", pairs="stochastic"):
+    return gamfit.sae.layer_transport_ladder(chain, topology=topology, pairs=pairs)[
+        "two_hop"
+    ][0]
 
 
 def test_noiseless_composable_chain_is_accepted():
-    """The core #2143 defect: a machine-level composition defect on a noiseless
-    composable chain was reported as a strong violation (p = 0)."""
-    r = _two_hop(_circle_chain(0.0, seed=3))
-    # The defect really is at the spline-representation level (tiny relative to
-    # the 2π coordinate span) — so it must NOT read as a law violation.
+    """The core #2143 defect: a noiseless composable chain was reported as a
+    strong violation (p = 0). Declared deterministic, it carries only the
+    interpolation error and no p-value at all."""
+    r = _two_hop(_circle_chain(0.0, seed=3), pairs="deterministic")
+    assert r["pairs"] == "deterministic"
+    # The defect is interpolation error, tiny relative to the 2π coordinate span.
     assert r["composition_defect"] < 1e-3, (
-        f"defect should be machine-level, got {r['composition_defect']:.3e}"
+        f"defect should be interpolation-level, got {r['composition_defect']:.3e}"
     )
-    assert r["composition_p_value"] > 0.05, (
-        f"noiseless composable chain flagged as a law violation: "
-        f"p={r['composition_p_value']:.3e}, defect={r['composition_defect']:.3e}"
+    assert r["composition_p_value"] is None, (
+        f"a deterministic chain has no sampling null; got p={r['composition_p_value']}"
     )
 
 
 def test_noiseless_accept_is_robust_across_seeds():
     for seed in (0, 3, 7, 11):
-        r = _two_hop(_circle_chain(0.0, seed=seed))
-        assert r["composition_p_value"] > 0.05, (
-            f"seed {seed}: noiseless composable chain rejected "
-            f"(p={r['composition_p_value']:.3e}, defect={r['composition_defect']:.3e})"
+        r = _two_hop(_circle_chain(0.0, seed=seed), pairs="deterministic")
+        assert r["composition_defect"] < 1e-3, (
+            f"seed {seed}: defect {r['composition_defect']:.3e}"
         )
+        assert r["composition_p_value"] is None
 
 
 def test_noisy_composable_chain_is_accepted_control():
-    """Control: with realistic noise the sampling variance is well above the
-    representation resolution, so the test correctly accepts."""
+    """Control: with realistic noise the stochastic law's sampling band is the
+    right yardstick, and the composable chain is accepted."""
     r = _two_hop(_circle_chain(0.05, seed=3))
+    assert r["pairs"] == "stochastic"
     assert r["composition_p_value"] > 0.05, (
         f"noisy composable chain rejected: p={r['composition_p_value']:.3e}"
     )
 
 
 def test_smaller_defect_is_not_more_significant_than_larger():
-    """The inversion the bug produced: the near-noiseless chain (smaller, more
-    composable defect) must not be judged MORE significant than the noisy chain
-    (larger defect). Both are composable, so both must accept."""
-    clean = _two_hop(_circle_chain(0.0, seed=3))
+    """The inversion the bug produced: the noiseless chain (smaller, more
+    composable defect) was judged MORE significant than the noisy chain. Under
+    the declared laws the clean chain has the smaller defect and no p-value,
+    and the noisy chain is accepted."""
+    clean = _two_hop(_circle_chain(0.0, seed=3), pairs="deterministic")
     noisy = _two_hop(_circle_chain(0.05, seed=3))
     assert clean["composition_defect"] < noisy["composition_defect"], (
         "setup: the noiseless defect should be the smaller one"
     )
-    assert clean["composition_p_value"] > 0.05 and noisy["composition_p_value"] > 0.05
-    # A smaller defect must not yield a (much) smaller p-value than a larger one.
-    assert clean["composition_p_value"] >= 0.5 * noisy["composition_p_value"], (
-        f"test inverted: smaller defect p={clean['composition_p_value']:.3e} "
-        f"< larger defect p={noisy['composition_p_value']:.3e}"
-    )
+    assert clean["composition_p_value"] is None
+    assert noisy["composition_p_value"] > 0.05
 
 
 def test_interval_topology_noiseless_is_accepted():
-    """A composable interval chain must also accept at fitted-map resolution."""
-    # Interval charts are the unit interval [0, 1]; keep every coordinate
-    # strictly interior so the fold-free homeomorphism fits cleanly.
+    """A composable interval chain declared deterministic has an
+    interpolation-level defect and no p-value."""
     rng = np.random.default_rng(5)
     n = 400
     a = np.sort(rng.uniform(0.03, 0.97, n))
     b = a + 0.02 * np.sin(2 * np.pi * a)
     c = b + 0.015 * np.sin(4 * np.pi * b)
-    r = gamfit.sae.layer_transport_ladder([a, b, c], topology="interval")["two_hop"][0]
-    assert r["composition_p_value"] > 0.05, (
-        f"noiseless composable interval chain rejected: "
-        f"p={r['composition_p_value']:.3e}, defect={r['composition_defect']:.3e}"
+    r = _two_hop([a, b, c], topology="interval", pairs="deterministic")
+    assert r["composition_defect"] < 1e-3, (
+        f"noiseless interval defect {r['composition_defect']:.3e}"
     )
+    assert r["composition_p_value"] is None
 
 
 if __name__ == "__main__":

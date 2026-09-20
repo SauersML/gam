@@ -539,10 +539,32 @@ fn reroute_against_atoms(
     top_k: usize,
     config: &LinearDictionaryConfig,
 ) -> Result<Array2<f64>, String> {
-    match config.assignment {
-        LinearDictionaryAssignment::TopK => top_k_assignments(x, atoms, top_k, config.code_ridge),
+    route_against_atoms(
+        x,
+        atoms,
+        top_k,
+        config.assignment,
+        config.temperature,
+        config.code_ridge,
+    )
+}
+
+/// Dispatch one global routing of `x` against `atoms` on the assignment rule.
+/// Both the fit ([`reroute_against_atoms`]) and the out-of-sample
+/// [`linear_dictionary_transform`] route through here, so a fitted model's
+/// held-out encoder is exactly the encoder that produced its training codes.
+fn route_against_atoms(
+    x: ArrayView2<'_, f64>,
+    atoms: ArrayView2<'_, f64>,
+    top_k: usize,
+    assignment: LinearDictionaryAssignment,
+    temperature: f64,
+    code_ridge: f64,
+) -> Result<Array2<f64>, String> {
+    match assignment {
+        LinearDictionaryAssignment::TopK => top_k_assignments(x, atoms, top_k, code_ridge),
         LinearDictionaryAssignment::Softmax => {
-            softmax_assignments(x, atoms, top_k, config.temperature, config.code_ridge)
+            softmax_assignments(x, atoms, top_k, temperature, code_ridge)
         }
     }
 }
@@ -881,16 +903,20 @@ fn top_k_assignments(
 }
 
 /// Encode held-out rows `x` (`M x P`) against a frozen dictionary `atoms`
-/// (`K x P`) using the same top-`top_k` ridge least-squares routing the fit
-/// uses against its final atoms. Returns the `(M, K)` sparse code matrix.
+/// (`K x P`) using the same routing the fit uses against its final atoms:
+/// the fitted model's `assignment` rule (top-`top_k` ridge least squares, or
+/// the top-`top_k` softmax at `temperature`) with its `code_ridge`. Returns the
+/// `(M, K)` sparse code matrix.
 ///
 /// This is the out-of-sample `transform`/encode step for a fitted linear
-/// dictionary; the math (top-k selection + active-set ridge solve) lives in
-/// the Rust core so the Python facade stays a thin wrapper.
+/// dictionary; the math lives in the Rust core so the Python facade stays a
+/// thin wrapper. `temperature` is read only by the softmax rule.
 pub fn linear_dictionary_transform(
     x: ArrayView2<'_, f64>,
     atoms: ArrayView2<'_, f64>,
     top_k: usize,
+    assignment: LinearDictionaryAssignment,
+    temperature: f64,
     code_ridge: f64,
 ) -> Result<Array2<f64>, String> {
     let k = atoms.nrows();
@@ -904,8 +930,15 @@ pub fn linear_dictionary_transform(
             atoms.ncols()
         ));
     }
+    if assignment == LinearDictionaryAssignment::Softmax
+        && !(temperature.is_finite() && temperature > 0.0)
+    {
+        return Err(format!(
+            "linear_dictionary_transform: softmax temperature must be finite and positive; got {temperature}"
+        ));
+    }
     let effective_k = top_k.min(k).max(1);
-    top_k_assignments(x, atoms, effective_k, code_ridge)
+    route_against_atoms(x, atoms, effective_k, assignment, temperature, code_ridge)
 }
 
 fn softmax_assignments(
@@ -1757,5 +1790,86 @@ mod tests {
         };
 
         (x, config)
+    }
+
+    #[test]
+    fn transform_routes_with_the_fitted_assignment_rule() {
+        // Non-orthogonal atoms with top_k = 2: the softmax code (projection
+        // weighted by a tempered softmax over the active atoms) and the top-k
+        // ridge least-squares code differ, so the transform must dispatch on
+        // the fitted rule to reproduce the fit's own routing.
+        let atoms = array![[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 0.3, 0.9]];
+        let x = array![
+            [1.0, 0.5, 0.1],
+            [0.2, 1.1, -0.4],
+            [-0.7, 0.3, 0.9],
+            [0.4, -0.2, 0.6],
+        ];
+        let top_k = 2;
+        let temperature = 0.25;
+        for assignment in [
+            LinearDictionaryAssignment::TopK,
+            LinearDictionaryAssignment::Softmax,
+        ] {
+            let config = LinearDictionaryConfig {
+                n_atoms: 3,
+                top_k,
+                assignment,
+                temperature,
+                ..LinearDictionaryConfig::default()
+            };
+            let fitted_route =
+                reroute_against_atoms(x.view(), atoms.view(), top_k, &config).expect("fit routing");
+            let transformed = linear_dictionary_transform(
+                x.view(),
+                atoms.view(),
+                top_k,
+                assignment,
+                temperature,
+                config.code_ridge,
+            )
+            .expect("transform");
+            for (a, b) in transformed.iter().zip(fitted_route.iter()) {
+                assert_abs_diff_eq!(*a, *b, epsilon = 1.0e-14);
+            }
+        }
+        let top_k_codes = linear_dictionary_transform(
+            x.view(),
+            atoms.view(),
+            top_k,
+            LinearDictionaryAssignment::TopK,
+            temperature,
+            DEFAULT_CODE_RIDGE,
+        )
+        .expect("top-k transform");
+        let softmax_codes = linear_dictionary_transform(
+            x.view(),
+            atoms.view(),
+            top_k,
+            LinearDictionaryAssignment::Softmax,
+            temperature,
+            DEFAULT_CODE_RIDGE,
+        )
+        .expect("softmax transform");
+        let max_gap = top_k_codes
+            .iter()
+            .zip(softmax_codes.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            max_gap > 1.0e-3,
+            "softmax and top-k codes must differ on this design; max gap {max_gap}"
+        );
+        assert!(
+            linear_dictionary_transform(
+                x.view(),
+                atoms.view(),
+                top_k,
+                LinearDictionaryAssignment::Softmax,
+                0.0,
+                DEFAULT_CODE_RIDGE,
+            )
+            .is_err()
+        );
     }
 }

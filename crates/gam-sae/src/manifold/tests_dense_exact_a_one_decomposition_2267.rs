@@ -196,19 +196,12 @@ fn the_evaluations_block_prices_what_a_fresh_decomposition_prices_2267() {
         );
     }
 
-    let lambda_smooth = rho
-        .lambda_smooth_vec()
-        .expect("#2267: the fixture's smoothing strengths are finite");
-    let solver = term
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("#2267: the evaluation's outer solver factors");
     let components = |geometry: &DenseExactAGeometry| {
         term.analytic_outer_rho_gradient_components_with_bundle(
             target.view(),
             &rho,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(geometry),

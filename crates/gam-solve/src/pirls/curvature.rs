@@ -357,7 +357,13 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     if GenericEdmCell::classify(&spec.response, inverse_link).is_some() {
         return true;
     }
-    if matches!(spec.response, ResponseFamily::NegativeBinomial { .. }) {
+    // NB-log and Tweedie-log (1<p<2; the canonical Tweedie link is
+    // μ^{1−p}/(1−p)) are non-canonical: their observed information carries the
+    // residual term and has a closed form in `observed_weight_dispatch`.
+    if matches!(
+        spec.response,
+        ResponseFamily::NegativeBinomial { .. } | ResponseFamily::Tweedie { .. }
+    ) {
         return matches!(inverse_link, InverseLink::Standard(StandardLink::Log));
     }
     // Every link of these continuous families has an analytic 5-jet, and the
@@ -369,6 +375,15 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
         ResponseFamily::Gamma | ResponseFamily::InverseGaussian | ResponseFamily::StudentT { .. }
     ) {
         return true;
+    }
+    // Beta regression is not an exponential-dispersion family, and its logit
+    // mean link is not canonical for the sufficient statistic `logit(y)`: the
+    // observed information carries the residual term `−φ h''(η)(y* − ψ(μφ) +
+    // ψ((1−μ)φ))`, and
+    // the Fisher weight does not even share its tail order (it tends to `ω`
+    // as `μ → 0` or `μ → 1`, while the observed weight vanishes like `ω μ`).
+    if matches!(spec.response, ResponseFamily::Beta { .. }) {
+        return matches!(inverse_link, InverseLink::Standard(StandardLink::Logit));
     }
     // A non-identity Gaussian link is non-canonical: the residual-dependent
     // correction `(y-μ)·B` is nonzero and the Laplace approximation needs it.
@@ -386,6 +401,7 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
             | InverseLink::Standard(StandardLink::CLogLog)
             | InverseLink::Standard(StandardLink::LogLog)
             | InverseLink::Standard(StandardLink::Cauchit)
+            | InverseLink::LatentCLogLog(_)
             | InverseLink::Sas(_)
             | InverseLink::BetaLogistic(_)
             | InverseLink::Mixture(_)
@@ -795,8 +811,8 @@ pub(crate) fn e_obs_from_jets(
     pw * e_obs
 }
 
-// Closed-form observed-information weights for the log-link Gamma and
-// negative-binomial pairs: algebraically identical to the generic tower, but
+// Closed-form observed-information weights for the log-link Gamma, Tweedie
+// and negative-binomial pairs: algebraically identical to the generic tower, but
 // free of its large-η intermediates (each item states its algebra).
 
 /// Gamma family with log link: `V(μ)=μ²`, `μ=exp(η)`.
@@ -820,10 +836,59 @@ pub(crate) fn observed_weight_gamma_log(y: f64, mu: f64, phi: f64, pw: f64) -> (
     (w, -w, w)
 }
 
+/// Tweedie family (1<p<2) with log link: `V(μ)=μ^p`, `μ=exp(η)`.
+///
+/// Up to `ω/φ` the row's negative log-likelihood is
+/// `ψ(η) = e^{(2−p)η}/(2−p) − y e^{(1−p)η}/(1−p)`, so `W_obs = ψ''` is a sum
+/// of two exponentials of `η`:
+///
+/// ```text
+/// A = (ω/φ) (p−1) y μ^{1−p}   (η-rate 1−p),   B = (ω/φ) (2−p) μ^{2−p}   (η-rate 2−p)
+/// w_obs = A + B
+/// c_obs = (1−p) A + (2−p) B
+/// d_obs = (1−p)² A + (2−p)² B
+/// ```
+///
+/// `A, B ≥ 0`, so `w_obs` and `d_obs` are sums of non-negative terms, and the
+/// only sign change (in `c_obs`) is the true one. The generic tower forms the
+/// same `w_obs` as `W_F − (y−μ)·T₁`, which at `y = 0` subtracts two same-sign
+/// terms and keeps only a `(2−p)` fraction of them, amplifying the relative
+/// error by about `(2−p)^{−k}` in the k-th η-derivative. The closed form
+/// reduces to Gamma-log at `p = 2` and to Poisson-log at `p = 1`.
+#[inline]
+pub(crate) fn observed_weight_tweedie_log(
+    y: f64,
+    mu: f64,
+    p: f64,
+    phi: f64,
+    pw: f64,
+) -> (f64, f64, f64) {
+    let rate_y = 1.0 - p;
+    let rate_mu = 2.0 - p;
+    let scale = pw / phi;
+    // A zero row has no `y`-term; skipping it keeps an underflowed `μ = 0`
+    // from forming `0·∞`.
+    let term_y = if y == 0.0 {
+        0.0
+    } else {
+        scale * (p - 1.0) * y * mu.powf(rate_y)
+    };
+    let term_mu = scale * rate_mu * mu.powf(rate_mu);
+    let w = term_y + term_mu;
+    let c = rate_y * term_y + rate_mu * term_mu;
+    let d = rate_y * rate_y * term_y + rate_mu * rate_mu * term_mu;
+    (w, c, d)
+}
+
 /// NB2 observed information under the log link, evaluated through bounded
-/// ratios.  With `r = theta/(theta+mu)` and `s = 1-r`,
+/// ratios.  With `r = theta/(theta+mu)` and `s = mu/(theta+mu) = 1-r`,
 /// `W_obs = prior (y+theta) r s`, `W' = W(r-s)`, and
 /// `W'' = W((r-s)^2 - 2rs)`.
+///
+/// Both `r` and `s` are formed directly from the ratio `q = mu/theta` (or its
+/// reciprocal) instead of computing `s` as `1 - r`. In the Poisson limit
+/// `mu << theta`, `1 - r` would lose `log10(theta/mu)` digits, and it becomes
+/// exactly zero once `mu/theta < eps/2`.
 #[inline]
 pub(crate) fn observed_weight_negative_binomial_log(
     y: f64,
@@ -831,17 +896,82 @@ pub(crate) fn observed_weight_negative_binomial_log(
     theta: f64,
     prior_weight: f64,
 ) -> (f64, f64, f64) {
-    let r = if theta >= mu {
-        1.0 / (1.0 + mu / theta)
+    let (r, s) = if theta >= mu {
+        let mu_over_theta = mu / theta;
+        (
+            1.0 / (1.0 + mu_over_theta),
+            mu_over_theta / (1.0 + mu_over_theta),
+        )
     } else {
         let theta_over_mu = theta / mu;
-        theta_over_mu / (1.0 + theta_over_mu)
+        (
+            theta_over_mu / (1.0 + theta_over_mu),
+            1.0 / (1.0 + theta_over_mu),
+        )
     };
-    let s = 1.0 - r;
     let w = prior_weight * (y + theta) * r * s;
     let c = w * (r - s);
     let d = w * ((r - s) * (r - s) - 2.0 * r * s);
     (w, c, d)
+}
+
+/// Beta(μφ, (1−μ)φ) observed information under the logit link and its first
+/// two η-derivatives, pre-multiplied by the prior weight.
+///
+/// With `a = μφ`, `b = (1−μ)φ`, `y* = log y − log(1−y)` and `q = h'(η)`, the
+/// row log-likelihood has `∂ℓ/∂η = ω φ q (y* − ψ(a) + ψ(b))`, so
+///
+/// ```text
+/// W_obs = ω [φ² q² (ψ'(a) + ψ'(b)) − φ q' (y* − ψ(a) + ψ(b))].
+/// ```
+///
+/// Evaluated as written, the two terms are each `≈ ω` in either tail
+/// (`ψ'(a) ≈ 1/a²`, `ψ(a) ≈ −1/a` as `a → 0`) and cancel to leave the `O(ω μ)`
+/// weight, losing every digit once `μ < ε`. The recurrences
+/// `ψ(x) = ψ(x+1) − 1/x` and `ψ'(x) = ψ'(x+1) + 1/x²` remove both poles; the
+/// logit identities `q = μ(1−μ)`, `q' = q(1−2μ)` collect the pole parts into
+/// exactly `2q`, which leaves the division-free form
+///
+/// ```text
+/// T₁ = ψ'(a+1) + ψ'(b+1),   r₁ = y* − ψ(a+1) + ψ(b+1),
+/// P₂ = ψ''(a+1) − ψ''(b+1), P₃ = ψ'''(a+1) + ψ'''(b+1),
+/// W = φ² q² T₁ + 2q − φ q' r₁,
+/// c = φ² (3 q q' T₁ + φ q³ P₂) + 2q' − φ q'' r₁,
+/// d = φ² ((3q'² + 4 q q'') T₁ + 6 φ q² q' P₂ + φ² q⁴ P₃) + 2q'' − φ q''' r₁,
+/// ```
+///
+/// using `dT₁/dη = φ q P₂`, `dP₂/dη = φ q P₃` and `dr₁/dη = −φ q T₁`. The
+/// identity that produces `2q` holds for the logit link only, which is the one
+/// link the Beta family admits.
+#[inline]
+pub(crate) fn observed_weight_beta_logit(
+    y: f64,
+    mu: f64,
+    one_minus_mu: f64,
+    precision: f64,
+    prior_weight: f64,
+    jet: MixtureInverseLinkJet,
+    h4: f64,
+) -> (f64, f64, f64) {
+    let phi = precision;
+    let a1 = mu * phi + 1.0;
+    let b1 = one_minus_mu * phi + 1.0;
+    let (q, q1, q2, q3) = (jet.d1, jet.d2, jet.d3, h4);
+    let t1 = trigamma(a1) + trigamma(b1);
+    let r1 = (y.ln() - (-y).ln_1p()) - digamma(a1) + digamma(b1);
+    let p2 = polygamma2(a1) - polygamma2(b1);
+    let p3 = polygamma3(a1) + polygamma3(b1);
+    let phi_sq = phi * phi;
+    let q_sq = q * q;
+    let w = phi_sq * q_sq * t1 + 2.0 * q - phi * q1 * r1;
+    let c = phi_sq * (3.0 * q * q1 * t1 + phi * q_sq * q * p2) + 2.0 * q1 - phi * q2 * r1;
+    let d = phi_sq
+        * ((3.0 * q1 * q1 + 4.0 * q * q2) * t1
+            + 6.0 * phi * q_sq * q1 * p2
+            + phi_sq * q_sq * q_sq * p3)
+        + 2.0 * q2
+        - phi * q3 * r1;
+    (prior_weight * w, prior_weight * c, prior_weight * d)
 }
 
 /// Family tag for the observed-information weight dispatch.
@@ -971,11 +1101,20 @@ pub(crate) fn observed_weight_dispatch(
     h4: f64,
 ) -> (f64, f64, f64) {
     match (family, link) {
+        // The Beta family is logit-only (the gate and the deviance row both
+        // enforce it), and its likelihood is not the quasi-likelihood the
+        // generic variance tower below would evaluate.
+        (WeightFamily::Beta { phi: precision }, _) => {
+            observed_weight_beta_logit(y, mu, one_minus_mu, precision, prior_weight, jet, h4)
+        }
         (WeightFamily::Gamma, WeightLink::Log) => {
             observed_weight_gamma_log(y, mu, phi, prior_weight)
         }
         (WeightFamily::NegativeBinomial { theta }, WeightLink::Log) => {
             observed_weight_negative_binomial_log(y, mu, theta, prior_weight)
+        }
+        (WeightFamily::Tweedie { p }, WeightLink::Log) => {
+            observed_weight_tweedie_log(y, mu, p, phi, prior_weight)
         }
         _ => {
             // Generic noncanonical path via the full variance-function jet.
