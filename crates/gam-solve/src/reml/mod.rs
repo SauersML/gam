@@ -5696,12 +5696,21 @@ pub(crate) enum BlockCorrectionDecision {
 /// orders are latched (#2748). `hessian_refusal` is the mathematical reason
 /// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
 /// correction carries its exact ρ-Hessian into the criterion.
+///
+/// `block_ranks` are the block's spectral positions: for each block axis, the
+/// rank of its curvature `λ_r` in the ascending spectrum of `H` (#3113). The
+/// block at every later ρ is the eigenpairs at those ranks, so each latched
+/// order stays on the direction it was certified on and the block moves with ρ
+/// as continuously as those eigenpairs do. A rank, not an index, because the
+/// criterion's eigensolver returns ascending pairs from `eigh` and descending
+/// ones from the stacked-root SVD (#2644).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
     pub(crate) hessian_refusal: Option<String>,
+    pub(crate) block_ranks: Vec<usize>,
 }
 
 pub(crate) struct RemlState<'a> {
