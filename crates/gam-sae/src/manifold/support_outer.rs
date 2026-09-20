@@ -1800,19 +1800,19 @@ fn run_support_outer_search(
 
 /// One evaluation's gradient split by probe block: the search's probes `[..seen]` and
 /// the unseen rest.
-struct ProbeBlockGradients {
+pub(crate) struct ProbeBlockGradients {
     /// The gradient re-estimated from the unseen probes alone.
-    unseen_gradient: Array1<f64>,
+    pub(crate) unseen_gradient: Array1<f64>,
     /// Its Hutchinson standard error, from the unseen probes' spread.
-    unseen_std_err: Array1<f64>,
+    pub(crate) unseen_std_err: Array1<f64>,
     /// The Hutchinson standard error of a gradient taken from the seen probes alone.
-    seen_std_err: Array1<f64>,
+    pub(crate) seen_std_err: Array1<f64>,
 }
 
 /// Split one evaluation's per-probe samples of the gradient's log-determinant half at
 /// `seen` (see [`ProbeBlockGradients`]). The rest of `gradient` is deterministic and
-/// common to every probe.
-fn probe_block_gradients(
+/// common to every probe. Both surrogate lanes judge their certified points here.
+pub(crate) fn probe_block_gradients(
     gradient: &Array1<f64>,
     samples: &Array2<f64>,
     seen: usize,
@@ -1820,8 +1820,8 @@ fn probe_block_gradients(
     let probes = samples.nrows();
     if seen >= probes || samples.ncols() != gradient.len() {
         return Err(outer_error(format!(
-            "support LAML per-probe gradient samples {probes}x{} cannot hold {seen} seen probes \
-             and {} outer coordinates",
+            "per-probe gradient samples {probes}x{} cannot hold {seen} seen probes and {} \
+             outer coordinates",
             samples.ncols(),
             gradient.len()
         )));
@@ -1832,7 +1832,7 @@ fn probe_block_gradients(
     let mut seen_std_err = Array1::<f64>::zeros(groups);
     let unmeasurable = |count: usize| {
         outer_error(format!(
-            "support LAML cannot measure a gradient standard error from {count} probes"
+            "cannot measure a gradient standard error from {count} probes"
         ))
     };
     for group in 0..groups {
@@ -1856,8 +1856,9 @@ fn probe_block_gradients(
 /// Refuse a frozen plan the host cannot store: `probes` probe vectors, plus one
 /// shifted solve per probe per quadrature node, each of border width. The ceiling is
 /// the host's single-materialization cap, the one the rational ladder's deflation
-/// rank is admitted against.
-fn admit_logdet_probe_plan(
+/// rank is admitted against. Both surrogate lanes (this support LAML and the dense
+/// manifold criterion's streaming evidence) size their validation plans here.
+pub(crate) fn admit_logdet_probe_plan(
     probes: usize,
     nodes: usize,
     border: usize,
@@ -1871,9 +1872,9 @@ fn admit_logdet_probe_plan(
     match bytes {
         Some(bytes) if bytes <= cap => Ok(()),
         _ => Err(outer_error(format!(
-            "support LAML cannot check its certified point on {probes} probes: a plan of \
-             {nodes} nodes on border {border} needs {} bytes against the host's \
-             single-materialization cap of {cap}",
+            "the rational log-determinant surrogate cannot check its certified point on \
+             {probes} probes: a plan of {nodes} nodes on border {border} needs {} bytes \
+             against the host's single-materialization cap of {cap}",
             bytes.map_or_else(|| "more than usize::MAX".to_string(), |bytes| bytes.to_string())
         ))),
     }

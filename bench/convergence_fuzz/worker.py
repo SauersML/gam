@@ -46,6 +46,10 @@ INTERVAL_LEVEL = 0.95
 # the pygam_compare harness's job, not this one's.
 INTERVAL_ROWS = 500
 REFIT_SEED_OFFSET = 7_919
+# Families whose default prediction, the posterior mean E[exp(eta) | data],
+# can exceed the float64 range with every input finite.
+LOG_LINK_FAMILIES = ("poisson",)
+LOG_DBL_MAX = float(np.log(np.finfo(np.float64).max))
 
 
 def _cpu() -> float:
@@ -66,6 +70,35 @@ def _summary_fields(model: Any) -> dict[str, Any]:
         "notes": list(summ.notes),
     }
     return out
+
+
+def _overflows_exactly(
+    model: Any, test: dict[str, np.ndarray], pred: np.ndarray
+) -> bool:
+    """Whether every non-finite log-link posterior mean is the correctly
+    rounded value of a number beyond float64.
+
+    Under the conditional Gaussian posterior of ``eta`` the log-link posterior
+    mean is exactly ``exp(eta + Var(eta) / 2)``. Both pieces come from the
+    fit's own affine design and conditional covariance, the same pair the
+    engine prices the prediction from, so a far extrapolation whose exact
+    value is past ``DBL_MAX`` must round to ``+inf``; anything else that is
+    non-finite is a defect.
+    """
+    bad = ~np.isfinite(pred)
+    if not np.all(np.isposinf(pred[bad])):
+        return False
+    design = model.design_matrix({k: v[bad] for k, v in test.items()})
+    if design.covariance_conditional is None:
+        return False
+    eta = design.offset + design.matrix @ design.coefficients
+    var = np.einsum(
+        "ij,jk,ik->i",
+        design.eta_gradient,
+        design.covariance_conditional,
+        design.eta_gradient,
+    )
+    return bool(np.all(eta + 0.5 * var > LOG_DBL_MAX))
 
 
 def _refit_table(
@@ -124,6 +157,13 @@ def run(case: int, family: str, n: int) -> dict[str, Any]:
                 out["pred_finite"] = bool(np.all(np.isfinite(pred)))
                 if out["pred_finite"]:
                     out["rmse_mu"] = float(np.sqrt(np.mean((pred - data.mu_test) ** 2)))
+                elif family in LOG_LINK_FAMILIES:
+                    exact = phase(
+                        "predict_exact",
+                        lambda: _overflows_exactly(model, data.test, pred),
+                    )
+                    if exact is not None:
+                        out["pred_nonfinite_exact"] = exact
             head = {k: v[:INTERVAL_ROWS] for k, v in data.test.items()}
             iv = phase(
                 "interval",
