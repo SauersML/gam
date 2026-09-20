@@ -2396,9 +2396,11 @@ pub fn arrow_factor_min_pivot(cache: &ArrowFactorCache) -> ArrowFactorMinPivot {
 /// Largest cached Cholesky pivot across the row blocks and the dense Schur
 /// factor (Hessian scale, i.e. squared lower-factor diagonal). This is the
 /// diagonal magnitude scale a safe-SPD pivot floor is measured against: the
-/// curvature-homotopy tracker (#1007) compares the min pivot against
-/// `√eps · max(this, 1)`, the same floor the inner solver's
-/// `safe_spd_pivot_min` uses. `None` only for an empty cache.
+/// curvature-homotopy tracker (#1007) compares the min pivot against a
+/// `√eps`-relative floor of this scale; the inner solver's
+/// `safe_spd_pivot_min` is `√eps · max_a |H_aa|` with no unit clamp, so it is
+/// covariant under a rescaling of the row's units (#4483). `None` only for an
+/// empty cache.
 pub fn arrow_factor_max_pivot(cache: &ArrowFactorCache) -> Option<f64> {
     let mut max_pivot: Option<f64> = None;
     for factor in cache.htt_factors.iter() {
