@@ -628,8 +628,11 @@ pub(crate) fn record_certificate_inner_factor(factor: InnerFactorCondition) {
 }
 
 /// Publish the inner-mode error an evaluation's value carries to an armed
-/// capture (no-op when disarmed).
-pub(crate) fn record_certificate_inner_residual(charge: InnerResidualCharge) {
+/// capture (no-op when disarmed). Public for the reason
+/// [`record_certificate_parts`] is: without it an outer objective outside this
+/// crate forms no objective band, and every comparison of its values falls back
+/// to the criterion's statistical resolution (#3340).
+pub fn record_certificate_inner_residual(charge: InnerResidualCharge) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.inner_residual = Some(charge);
