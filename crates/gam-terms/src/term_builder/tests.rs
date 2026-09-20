@@ -2645,8 +2645,8 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             (_, "chunk_size") => &["64"],
             // Flags and selectors.
             // Both polarities: the default is not the same on every arm
-            // (`sz` defaults the null-space penalty OFF, `fs`/`s()` ON), and
-            // a single polarity would probe the default on half of them.
+            // (`mjs` defaults the null-space penalty OFF, `s()`/`fs`/`sz`
+            // ON), and a single polarity would probe the default on some.
             (_, "double_penalty") => &["false", "true"],
             (_, "identifiability") => &["none"],
             (_, "include_intercept") => &["true"],
