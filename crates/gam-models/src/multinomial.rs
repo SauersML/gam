@@ -1009,14 +1009,6 @@ fn handle_multinomial_fixed_lambda_stall(
         // reuses the same coupled joint-Newton Jeffreys machinery the formula
         // REML path arms on separation evidence (see
         // `fit_penalized_multinomial_formula`), only here at the caller's fixed λ.
-        // Engage the fallback, but never let an internal consistency panic in
-        // the coupled joint-Newton assembly (e.g. the #1395 logdet-collapse
-        // guard) escape as a process abort: convert any panic into the
-        // documented hard separation diagnostic, exactly as if the refit had
-        // returned Err. This mirrors the catch_unwind panic-to-typed-error
-        // boundary already used around the faer / cudarc entry points, and keeps
-        // the separation path no worse than the pre-#1854 clean error while the
-        // Firth refit is still being hardened.
         // Start the Firth refit from the well-conditioned origin (β = 0), NOT
         // from the stalled Newton iterate. That stalled iterate is the runaway
         // separated point (`|η| ≥ 25`), where the softmax Fisher information
@@ -1032,31 +1024,30 @@ fn handle_multinomial_fixed_lambda_stall(
         // information is well-conditioned, so a plain from-zero refit converges
         // reliably on exactly the separated data that defeated the fixed-λ
         // Newton above.
-        let firth = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            fit_penalized_multinomial_firth_fallback(
-                design,
-                y_one_hot,
-                penalty,
-                lambdas,
-                row_weights,
-                max_iter,
-                tol,
-                None,
-            )
-        }));
+        let firth = fit_penalized_multinomial_firth_fallback(
+            design,
+            y_one_hot,
+            penalty,
+            lambdas,
+            row_weights,
+            max_iter,
+            tol,
+            None,
+        );
         match firth {
             // SPEC: a fit object must only ever come from a converged
             // optimization — the Firth fallback itself surfaces a
             // budget-exhausted refit as the typed
             // `FixedLambdaNewtonDidNotConverge`, which is forwarded verbatim so
             // the caller sees which lane stalled and its evidence.
-            Ok(Ok(out)) => return Ok(out),
-            Ok(Err(err @ EstimationError::FixedLambdaNewtonDidNotConverge { .. })) => {
+            Ok(out) => return Ok(out),
+            Err(err @ EstimationError::FixedLambdaNewtonDidNotConverge { .. }) => {
                 return Err(err);
             }
-            // Firth refit errored, or an internal consistency guard panicked:
-            // fall back to the explicit hard separation diagnostic.
-            Ok(Err(_)) | Err(_) => {
+            // The Firth refit refused the separated problem (a singular
+            // information or penalized Hessian, a non-finite iterate): report
+            // the explicit hard separation diagnostic.
+            Err(_) => {
                 return Err(EstimationError::MultinomialSeparationDetected {
                     iteration: stall.iterations,
                     max_abs_eta,
