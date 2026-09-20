@@ -288,7 +288,7 @@ form from the basis. This is a Sobolev penalty on the represented *function*,
 not the classical Eilers–Marx P-spline coefficient-difference penalty
 `‖Δ²β‖²`: the two share a null space (polynomials of degree below
 `penalty_order`) but are different matrices — most visibly on non-uniform
-knots and at the boundary — so `type=ps` names this basis family, not a
+knots and at the boundary — so `bs=ps` names this basis family, not a
 difference-penalty model, and fits are not expected to coincide with a
 difference-penalized P-spline of the same dimension.
 
@@ -570,7 +570,7 @@ Radial-basis surface smooth with thin-plate kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (`k`, `basis_dim`) | auto | Number of radial centres. |
+| `centers` (`k`) | auto | Number of radial centres. |
 | `length_scale` | `1.0` | Global length-scale init. |
 | `double_penalty` | `true` | Ridge + main penalty. |
 | `by`, `identifiability` | — | `identifiability` takes `none` or `orthogonal_to_parametric`; see [univariate smooths](#univariate-smooths). |
@@ -586,7 +586,7 @@ Radial basis with Matérn covariance kernel.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `centers` (`k`) | auto | Number of centres. |
 | `length_scale` | `1.0` | Global length-scale init. |
 | `nu` | `5/2` | Smoothness, one of `1/2`, `3/2`, `5/2`, `7/2`, `9/2`. |
 | `include_intercept` | `false` | Append a constant column. |
@@ -621,7 +621,7 @@ zero (recover the null by default; opt into overfitting). Scale-free unless
 | --- | --- | --- |
 | `order` (alias `nullspace_order`) | `1` (Linear, affine null space) | Polynomial nullspace order `p`. Polynomial block has `C(d + p, d)` columns (`p=0` → constant only, `p=1` (Linear) → `d+1` columns, `p=2` → `(d+1)(d+2)/2`). Honoured whether or not `power` is also given. |
 | `power` (alias `p`) | cubic default `s = (d−1)/2` | Riesz fractional smoothness `s`. The default gives `φ(r)=r³` in every dimension; an explicit value (e.g. `power=0` → `r²·log r` thin-plate in even `d`) is honored verbatim. |
-| `centers` (`k`, `basis_dim`) | auto | Number of centres. |
+| `centers` (`k`) | auto | Number of centres. |
 | `length_scale` | none (scale-free) | Optional global scale. Without it, the kernel is pure polyharmonic; with it, the kernel is the hybrid Duchon-Matérn (κ = 1/length_scale). |
 | `scale_dims` | `false` | Per-axis **relevance** (ARD by shrinkage): one gradient penalty `Σ(∂f/∂x_a)²` per input axis, each its own REML `λ_a`. REML flattens the surface along axes that don't earn their keep — automatic variable relevance via plain penalties. The kernel metric is held fixed at its knot-geometry init (not separately optimized). |
 | `periodic`, `period`, `period_start`, `period_end` | — | 1-D cyclic Duchon (see below). |
@@ -662,9 +662,9 @@ the poles.
 ### Specialized smooths (`mjs`, `curv`, `pca`)
 
 Three further radial/geometry smooths share the `s(...)` materialization
-path through a distinct `type=`:
+path through a distinct `bs=`:
 
-- `mjs(...)` (aliases `measurejet`, `measure_jet`, `web`) — measure-jet
+- `mjs(...)` — measure-jet
   spline for a response varying along an unknown low-dimensional set
   inside a higher-dimensional ambient space.
   Its design is a Gaussian representer basis `K(data, centers; ℓ)`, so the
@@ -684,7 +684,7 @@ path through a distinct `type=`:
   against the response and the slope surface's against the conditional
   covariance of the response with the latent driver, which is the function that
   surface actually carries.
-- `curv(...)` (aliases `curvature`, `constant_curvature`, `mkappa`) —
+- `curv(...)` —
   constant-curvature `M_κ` geodesic-kernel smooth, the κ-generic sibling
   of `sphere()` that interpolates `Sᵈ → ℝᵈ → Hᵈ` via `kappa=` (default
   `0`, flat). See [response-geometry.md](response-geometry.md).
