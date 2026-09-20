@@ -19,8 +19,6 @@ from ._model import (
     TermBlock,
 )
 from ._sampling import (
-    CumulativeIncidenceDraws,
-    PairedPosteriorSamples,
     PosteriorPredictive,
     PosteriorSamples,
     SamplingConfig,
@@ -48,11 +46,9 @@ __all__ = [
     "AxisLevels",
     "CompetingRisksCIF",
     "CompetingRisksPrediction",
-    "CumulativeIncidenceDraws",
     "Diagnostics",
     "FormulaValidation",
     "MultinomialPrediction",
-    "PairedPosteriorSamples",
     "PartialEffect",
     "PosteriorPredictive",
     "PosteriorSamples",

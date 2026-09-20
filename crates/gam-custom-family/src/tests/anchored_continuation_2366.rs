@@ -1435,6 +1435,67 @@ fn the_ift_predictor_is_the_closed_form_tangent_2973() {
     );
 }
 
+/// #2973: the IFT predictor moves along the tangent of the penalty the solve minimizes.
+///
+/// The rounded quadratic's stored penalty here is `vvᵀ + ε·nnᵀ` with `n = (3, 1)` its declared
+/// null direction and `ε = 1e-12` the formation error on it. The solve reads the structural root,
+/// which the declared nullity caps at rank one (#2954), so its penalty is `½λ(vᵀβ)²` and its
+/// tangent `dβ̂/dρ = −λ(vᵀβ̂)/(w + λ‖v‖²)·v` has no component along `n`. The predictor from
+/// `λ = 1e9` to `2e9` must be `β̂ + ln 2·dβ̂/dρ` to rounding. A predictor that formed `S_λ` and
+/// `S_k β̂` from the stored matrix moved `β̂` by `−ln 2·λε(nᵀβ̂)/(w + λε‖n‖²)·n`, a coefficient of
+/// 2.4e-3 at this fixture's centre, off the branch the solve publishes.
+#[test]
+fn the_ift_predictor_moves_along_the_solves_own_penalty_2973() {
+    let v = array![1.0, -3.0];
+    let n = array![3.0, 1.0];
+    let formation_error = 1.0e-12;
+    let mut spec = rounded_quadratic_spec();
+    let stored = {
+        let range = v.view().insert_axis(ndarray::Axis(1));
+        let null = n.view().insert_axis(ndarray::Axis(1));
+        range.dot(&range.t()) + null.dot(&null.t()) * formation_error
+    };
+    spec.penalties = vec![PenaltyMatrix::Dense(stored)];
+    let specs = [spec];
+    let options = double_well_options();
+    let curvature = 1.0;
+    let center = array![1.3, -0.4];
+    let family = RoundedQuadraticFamily {
+        center: center.clone(),
+        curvature,
+    };
+    let from = 1.0e9_f64.ln();
+    let to = 2.0e9_f64.ln();
+    let lambda = from.exp();
+    let mode = &center - &(&v * (lambda * v.dot(&center) / (curvature + lambda * v.dot(&v))));
+    let working_set = BlockWorkingSet::ExactNewton {
+        gradient: (&center - &mode) * curvature,
+        hessian: SymmetricMatrix::Dense(Array2::eye(2) * curvature),
+    };
+    let predictor = single_block_ift_predictor(
+        &family,
+        &specs,
+        &[array![from]],
+        &[array![to]],
+        &options,
+        std::slice::from_ref(&mode),
+        &working_set,
+        None,
+    )
+    .expect("the IFT predictor forms at the closed-form mode")
+    .remove(0);
+    let tangent = &v * (-lambda * v.dot(&mode) / (curvature + lambda * v.dot(&v)));
+    let expected = &mode + &(&tangent * (to - from));
+    let miss = (&predictor - &expected)
+        .mapv(f64::abs)
+        .fold(0.0_f64, |a, &b| a.max(b));
+    assert!(
+        miss <= 1e-12 * (1.0 + mode.dot(&mode).sqrt()),
+        "the IFT predictor {predictor} is not the tangent predictor {expected} of the solve's \
+         penalty (miss {miss:.3e})"
+    );
+}
+
 /// #2973 pin 2: a walk that tries to cross the fold publishes one branch per θ.
 ///
 /// Census 1334963's scripted walk: `CustomOuterState` driven as the fit's closures drive it, from
