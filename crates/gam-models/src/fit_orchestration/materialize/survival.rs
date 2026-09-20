@@ -1,5 +1,4 @@
 use super::*;
-use crate::fit_orchestration::FitFailure;
 
 pub(crate) fn materialize_survival<'a>(
     parsed: &ParsedFormula,

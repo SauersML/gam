@@ -815,14 +815,13 @@ struct SlsOuterPlan<const ORDER: usize> {
     g_log_scale: f64,
 }
 
-/// Exactly the six diagonal index-space NLL channels consumed by the
-/// inner-Newton update: orders one and two for `(u0, u1, g)`. The channel
-/// count is encoded in the array widths, so no unconsumed higher order can be
-/// materialized or accidentally consumed.
+/// Exactly the three index-space NLL gradient channels read by the row
+/// derivatives: order one for `(u0, u1, g)`. The channel count is encoded in
+/// the array width, so no unconsumed higher order can be materialized or
+/// accidentally consumed.
 #[derive(Clone, Copy, Debug)]
 struct SlsIndexDerivativeChannels {
     gradient: [f64; 3],
-    hessian_diagonal: [f64; 3],
 }
 
 /// Project one derivative order from the canonical outer stacks. Both the
@@ -839,7 +838,7 @@ fn project_index_diagonal<const CHANNELS: usize, const ORDER: usize>(
 
 impl SlsOuterPlan<5> {
     /// Mechanically lower the canonical `(u0, u1, g)` outer derivative stacks
-    /// to the sparse diagonal channels read by the inner-Newton consumer.
+    /// to the sparse gradient channels read by the row derivatives.
     /// Inactive event/censoring branches are structural zero stacks, while the
     /// active `u1` stack retains [`sls_outer_plan`]'s censored-then-event
     /// accumulation order. No derivative formula exists in this lowering.
@@ -852,7 +851,6 @@ impl SlsOuterPlan<5> {
         ];
         SlsIndexDerivativeChannels {
             gradient: project_index_diagonal::<3, 1>(&stacks),
-            hessian_diagonal: project_index_diagonal::<3, 2>(&stacks),
         }
     }
 }
@@ -5950,13 +5948,9 @@ impl SurvivalLocationScaleFamily {
         };
         let channels = sls_outer_plan::<5>(&kernel).lower_index_derivative_channels();
         let [nll_d1_q0, nll_d1_q1, nll_d1_qdot1] = channels.gradient;
-        let [nll_d2_q0, nll_d2_q1, nll_d2_qdot1] = channels.hessian_diagonal;
         let d1_q0 = -nll_d1_q0;
-        let d2_q0 = -nll_d2_q0;
         let d1_q1 = -nll_d1_q1;
-        let d2_q1 = -nll_d2_q1;
         let d1_qdot1 = -nll_d1_qdot1;
-        let d2_qdot1 = -nll_d2_qdot1;
         Ok(Some(SurvivalRowDerivatives {
             ll: kernel.log_likelihood_at(&state),
             d1_q0,
@@ -5965,9 +5959,6 @@ impl SurvivalLocationScaleFamily {
             grad_time_eta_h0: d1_q0,
             grad_time_eta_h1: d1_q1,
             grad_time_eta_d: d1_qdot1,
-            h_time_h0: d2_q0,
-            h_time_h1: d2_q1,
-            h_time_d: d2_qdot1,
         }))
     }
 }
@@ -6166,19 +6157,11 @@ mod index_derivative_lowering_tests {
         let nll = sls_row_nll(&vars, kernel).expect("canonical survival row NLL");
         SlsIndexDerivativeChannels {
             gradient: [nll.g[0], nll.g[1], nll.g[2]],
-            hessian_diagonal: [nll.h[0][0], nll.h[1][1], nll.h[2][2]],
         }
     }
 
-    fn flatten(channels: SlsIndexDerivativeChannels) -> [f64; 6] {
-        [
-            channels.gradient[0],
-            channels.gradient[1],
-            channels.gradient[2],
-            channels.hessian_diagonal[0],
-            channels.hessian_diagonal[1],
-            channels.hessian_diagonal[2],
-        ]
+    fn flatten(channels: SlsIndexDerivativeChannels) -> [f64; 3] {
+        channels.gradient
     }
 
     #[test]
@@ -6219,15 +6202,6 @@ mod index_derivative_lowering_tests {
             / (12.0 * h)
     }
 
-    fn finite_difference_second(point: [f64; 3], axis: usize, d: f64) -> f64 {
-        let h = 3.0e-4;
-        (-sample_shifted(point, axis, 2.0 * h, d) + 16.0 * sample_shifted(point, axis, h, d)
-            - 30.0 * analytic_index_nll(point, d)
-            + 16.0 * sample_shifted(point, axis, -h, d)
-            - sample_shifted(point, axis, -2.0 * h, d))
-            / (12.0 * h * h)
-    }
-
     fn assert_fd_close(d: f64, order: usize, axis: usize, exact: f64, fd: f64) {
         let tolerance = 2.0e-7;
         let error = (exact - fd).abs();
@@ -6250,13 +6224,6 @@ mod index_derivative_lowering_tests {
                     axis,
                     channels.gradient[axis],
                     finite_difference_first(point, axis, d),
-                );
-                assert_fd_close(
-                    d,
-                    2,
-                    axis,
-                    channels.hessian_diagonal[axis],
-                    finite_difference_second(point, axis, d),
                 );
             }
         }
