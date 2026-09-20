@@ -7219,8 +7219,22 @@ pub(crate) fn bspline_smooth_spans_constant(basis: &SmoothBasisSpec) -> bool {
 /// by-variable that carries nothing collapses to `f ≡ 0`. Only the default
 /// model-space centring is released; explicit structural or frozen choices
 /// are kept, exactly as for the factor-level wrapper.
+///
+/// The rule is about the varying coefficient, not the basis, so it covers
+/// every B-spline inner whose default gauge deletes the constant in the inner
+/// build itself. For `te(...)` that is the full-tensor sum-to-zero `Z`
+/// (`Σ_i f(x_i) = 0`), which would leave `z·c` unrepresentable (#4191). A
+/// `ti(...)` inner keeps its per-margin centring, which is its structure
+/// (no main effects), not an intercept gauge.
 pub(crate) fn keep_constant_in_numeric_by_smooth(basis: &mut SmoothBasisSpec) {
-    defer_inner_model_centering_to_factor_level_wrapper(basis);
+    match basis {
+        SmoothBasisSpec::TensorBSpline { spec, .. }
+            if matches!(spec.identifiability, TensorBSplineIdentifiability::SumToZero) =>
+        {
+            spec.identifiability = TensorBSplineIdentifiability::None;
+        }
+        _ => defer_inner_model_centering_to_factor_level_wrapper(basis),
+    }
 }
 
 pub(crate) fn apply_by_variable_to_local_build(
