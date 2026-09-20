@@ -171,10 +171,16 @@ impl OuterProblemSize {
     ///
     /// `None` when the route declares no observation count.
     pub(crate) fn statistical_resolution(&self) -> Option<f64> {
-        self.n_obs
-            .filter(|&n| n > 0)
-            .map(|n| 0.5 / n as f64)
+        self.n_obs.and_then(criterion_statistical_resolution)
     }
+}
+
+/// `τ_stat = 1/(2n)` over `n_obs` observations, the criterion resolution
+/// [`OuterProblemSize::statistical_resolution`] documents, for callers outside
+/// this crate that judge a criterion the outer engine certified at it (the
+/// κ-profile inference endpoints, #3245). `None` when `n_obs` is zero.
+pub fn criterion_statistical_resolution(n_obs: usize) -> Option<f64> {
+    (n_obs > 0).then(|| 0.5 / n_obs as f64)
 }
 
 /// Configuration for the outer optimization runner.

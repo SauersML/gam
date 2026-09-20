@@ -1198,7 +1198,6 @@ fn curvature_inference_dataset_json_impl(
             &spec,
             term_idx,
             family.clone(),
-            &standard.options,
             level,
         )
         .map_err(|e| format!("curvature_inference for term {term_idx}: {e}"))?;

@@ -43,43 +43,41 @@ pub struct CurvatureInference {
 /// fit inputs used to produce it.
 ///
 /// The point estimate and inference share the same continuously smoothing-
-/// profiled Gaussian REML evidence and its analytic profile score. Each CI
+/// profiled Gaussian REML evidence and its analytic profile jet. Each CI
 /// endpoint solves the Wilks likelihood-ratio equation directly inside the
 /// chart-bound bracket with safeguarded Newton steps; bisection is the
-/// guaranteed-progress fallback. A bound is reported as open only when the
-/// analytic score certifies that the connected likelihood set containing κ̂
-/// remains monotone all the way to that bound.
+/// guaranteed-progress fallback.
+///
+/// Every decision here is made in the criterion's own units against its
+/// statistical resolution `τ` ([`gam_solve::rho_optimizer::criterion_statistical_resolution`],
+/// `1/(2n)`, #3245): an endpoint is resolved once the likelihood-ratio residual
+/// at one end of the bracket is within `τ` of the threshold, and a descent is
+/// refused only when the exact profile jet predicts a decrease larger than `τ`.
+/// There is no separate relative or absolute tolerance to choose.
 fn curvature_profile_lr_endpoint<F>(
     profile: &mut F,
     kappa_hat: f64,
     value_hat: f64,
     bound: f64,
     half_threshold: f64,
-    x_tolerance: f64,
-    score_tolerance: f64,
+    resolution: f64,
 ) -> Result<(f64, bool), String>
 where
-    F: FnMut(f64) -> Result<(f64, f64), String>,
+    F: FnMut(f64) -> Result<(f64, f64, f64), String>,
 {
     let direction = (bound - kappa_hat).signum();
-    let span = (bound - kappa_hat).abs();
-    if direction == 0.0 || span <= x_tolerance {
+    if direction == 0.0 {
         return Ok((bound, true));
     }
 
-    let (bound_value, bound_score) = profile(bound)?;
-    let outward_score = direction * bound_score;
-    if outward_score < -score_tolerance {
-        return Err(format!(
-            "curvature profile is not outward-monotone at chart bound {bound}: \
-             outward score {outward_score:.6e} is below tolerance {score_tolerance:.6e}"
-        ));
-    }
-    let value_tolerance = score_tolerance * span;
-    if bound_value < value_hat - value_tolerance {
+    // Nothing lies beyond the chart bound, so the profile's slope there makes
+    // no claim about the likelihood set; only its value does.
+    let (bound_value, bound_score, _) = profile(bound)?;
+    if bound_value < value_hat - resolution {
         return Err(format!(
             "fitted curvature is not the minimum of its inference profile: \
-             V(bound={bound})={bound_value:.6e} < V(kappa_hat)={value_hat:.6e}"
+             V(bound={bound})={bound_value:.6e} < V(kappa_hat)={value_hat:.6e} \
+             by more than the criterion resolution {resolution:.6e}"
         ));
     }
     let bound_residual = bound_value - value_hat - half_threshold;
@@ -94,11 +92,15 @@ where
     // first threshold crossing. Newton uses the exact profile score. It is
     // accepted only in the central half of the current bracket, so every other
     // iteration is a bisection-quality contraction even on a nearly flat score.
+    // The bracket is resolved once either end's residual is within the
+    // criterion resolution of the threshold: a value that close to the crossing
+    // is not statistically distinguishable from it.
     let mut inside_x = kappa_hat;
+    let mut inside_residual = -half_threshold;
     let mut outside_x = bound;
     let mut outside_residual = bound_residual;
     let mut outside_score = bound_score;
-    while (outside_x - inside_x).abs() > x_tolerance {
+    while outside_residual > resolution && inside_residual < -resolution {
         let lo = inside_x.min(outside_x);
         let hi = inside_x.max(outside_x);
         let width = hi - lo;
@@ -113,13 +115,20 @@ where
         if !(probe > lo && probe < hi) {
             break;
         }
-        let (value, score) = profile(probe)?;
+        let (value, score, curvature) = profile(probe)?;
+        // The search assumes the profile rises outward through the likelihood
+        // set. A downward outward slope at a probe is refused only when the
+        // exact jet predicts a decrease larger than the resolution over the
+        // part of the bracket that is still outward of the probe.
         let outward_score = direction * score;
-        if outward_score < -score_tolerance {
+        let outward_decrease =
+            profile_model_decrease(outward_score, curvature, 0.0, (outside_x - probe).abs());
+        if outward_decrease > resolution {
             return Err(format!(
                 "curvature profile changed direction before its likelihood crossing at \
-                 kappa={probe}: outward score {outward_score:.6e} is below tolerance \
-                 {score_tolerance:.6e}"
+                 kappa={probe}: outward score {outward_score:.6e} and curvature \
+                 {curvature:.6e} predict a decrease of {outward_decrease:.6e}, above the \
+                 criterion resolution {resolution:.6e}"
             ));
         }
         let residual = value - value_hat - half_threshold;
@@ -129,13 +138,10 @@ where
             outside_score = score;
         } else {
             inside_x = probe;
+            inside_residual = residual;
         }
     }
-    // The bracket is only contracted to `x_tolerance`, so its midpoint carries
-    // an error of half that width -- a floor the reported endpoint inherits no
-    // matter how exact the profile score is, and `x_tolerance` is itself
-    // floored at `sqrt(EPSILON)` regardless of the tolerance the caller asked
-    // for. `outside_x` already holds the analytic score and residual evaluated
+    // `outside_x` already holds the analytic score and residual evaluated
     // there, so one final Newton step costs no additional profile evaluation
     // and resolves the crossing to the accuracy of the score itself. It is
     // taken only when it lands inside the certified bracket; otherwise the
@@ -152,16 +158,37 @@ where
     Ok((endpoint, false))
 }
 
+/// The largest decrease the second-order model `m(t) = s·t + ½·max(c, 0)·t²`
+/// of the profile predicts over the feasible displacements `t ∈ [lower, upper]`
+/// (`lower ≤ 0 ≤ upper`). Negative curvature is dropped rather than trusted, so
+/// a non-convex point is judged by its slope over the whole feasible range —
+/// which is the conservative reading, never a smaller predicted decrease.
+///
+/// At an interior minimum this is `s²/(2c)`, half the squared Newton decrement
+/// the outer certificate bounds; at a rail with the slope pointing out of the
+/// box the feasible side has zero length and the decrease is exactly zero.
+fn profile_model_decrease(score: f64, curvature: f64, lower: f64, upper: f64) -> f64 {
+    let convex = curvature.max(0.0);
+    let step = if convex > 0.0 {
+        (-score / convex).clamp(lower, upper)
+    } else if score > 0.0 {
+        lower
+    } else {
+        upper
+    };
+    -(score * step + 0.5 * convex * step * step)
+}
+
 fn curvature_profile_ci_from_analytic_score<F>(
     profile: &mut F,
     kappa_hat: f64,
     kappa_min: f64,
     kappa_max: f64,
     level: f64,
-    relative_tolerance: f64,
+    resolution: f64,
 ) -> Result<gam_geometry::curvature_estimand::KappaProfileCi, String>
 where
-    F: FnMut(f64) -> Result<(f64, f64), String>,
+    F: FnMut(f64) -> Result<(f64, f64, f64), String>,
 {
     if !(kappa_min < kappa_max && kappa_hat >= kappa_min && kappa_hat <= kappa_max) {
         return Err("curvature profile requires kappa_hat inside valid chart bounds".to_string());
@@ -169,20 +196,21 @@ where
     if !(level > 0.0 && level < 1.0) {
         return Err("curvature profile level must lie in (0, 1)".to_string());
     }
+    if !(resolution.is_finite() && resolution > 0.0) {
+        return Err(format!(
+            "curvature profile resolution must be finite and positive, got {resolution}"
+        ));
+    }
     let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
         .ok_or_else(|| "curvature profile threshold is not finite".to_string())?;
     let half_threshold = 0.5 * z * z;
-    let (value_hat, score_hat) = profile(kappa_hat)?;
-    let relative_tolerance = relative_tolerance.max(f64::EPSILON.sqrt());
-    let x_tolerance = relative_tolerance * (1.0 + kappa_min.abs().max(kappa_max.abs()));
-    let score_tolerance = relative_tolerance * (1.0 + value_hat.abs());
-    // These two already exist because the stationarity check has to relax at a
-    // rail: at a bound, "stationary" means the score points OUT of the box, not
-    // that it vanishes. That is the routine knowing κ̂ is a box readout — and
-    // before #2687 it then threw the knowledge away and reported κ̂ as an
-    // estimate. It is now carried on the report.
-    let at_lower = (kappa_hat - kappa_min).abs() <= x_tolerance;
-    let at_upper = (kappa_hat - kappa_max).abs() <= x_tolerance;
+    let (value_hat, score_hat, curvature_hat) = profile(kappa_hat)?;
+    // The bounded solve projects onto the box, so a railed κ̂ sits EXACTLY on
+    // its face; no proximity tolerance is needed to recognise it. The rail is
+    // carried on the report (#2687) because κ̂ there is a box readout, not an
+    // estimate.
+    let at_lower = kappa_hat == kappa_min;
+    let at_upper = kappa_hat == kappa_max;
     let kappa_hat_support = if at_lower {
         gam_geometry::curvature_estimand::KappaEstimateSupport::RailedAtLowerBound
     } else if at_upper {
@@ -190,25 +218,28 @@ where
     } else {
         gam_geometry::curvature_estimand::KappaEstimateSupport::Interior
     };
-    let stationary = if at_lower {
-        score_hat >= -score_tolerance
-    } else if at_upper {
-        score_hat <= score_tolerance
-    } else {
-        score_hat.abs() <= score_tolerance
-    };
-    if !stationary {
+    // Stationarity on the box: the decrease the exact profile jet predicts for
+    // any feasible move away from κ̂ must be below the criterion resolution. At
+    // a rail the infeasible side has zero length, so a score pointing out of
+    // the box is stationary by construction — the rail relaxation is the
+    // feasible set, not a separate rule.
+    let predicted_decrease = profile_model_decrease(
+        score_hat,
+        curvature_hat,
+        kappa_min - kappa_hat,
+        kappa_max - kappa_hat,
+    );
+    if predicted_decrease > resolution {
         // Name what was refused AGAINST, not just that something was refused.
         // A κ̂ that failed this check is either a genuine interior non-optimum or
-        // a rail the `x_tolerance` did not recognise, and the two need opposite
-        // repairs — so the message has to carry the box, both gaps, and the rail
-        // tolerance that classified it (#2687).
+        // a rail the solver did not land on, and the two need opposite repairs —
+        // so the message has to carry the box and both gaps (#2687).
         return Err(format!(
             "curvature inference rejected a non-stationary point estimate: \
-             kappa_hat={kappa_hat}, score={score_hat:.6e}, \
-             stationarity_bound={score_tolerance:.6e}; \
+             kappa_hat={kappa_hat}, score={score_hat:.6e}, curvature={curvature_hat:.6e}, \
+             predicted_decrease={predicted_decrease:.6e} > resolution={resolution:.6e}; \
              box=[{kappa_min}, {kappa_max}], gap_to_lower={:.6e}, gap_to_upper={:.6e}, \
-             rail_tolerance={x_tolerance:.6e}, classified={}",
+             classified={}",
             kappa_hat - kappa_min,
             kappa_max - kappa_hat,
             kappa_hat_support.label()
@@ -221,8 +252,7 @@ where
         value_hat,
         kappa_min,
         half_threshold,
-        x_tolerance,
-        score_tolerance,
+        resolution,
     )?;
     let (ci_hi, hi_at_bound) = curvature_profile_lr_endpoint(
         profile,
@@ -230,8 +260,7 @@ where
         value_hat,
         kappa_max,
         half_threshold,
-        x_tolerance,
-        score_tolerance,
+        resolution,
     )?;
     let verdict = if ci_lo > 0.0 {
         gam_geometry::curvature_estimand::CurvatureVerdict::Spherical
@@ -259,7 +288,6 @@ pub fn curvature_inference_forspec(
     resolvedspec: &TermCollectionSpec,
     term_idx: usize,
     family: LikelihoodSpec,
-    options: &FitOptions,
     level: f64,
 ) -> Result<CurvatureInference, EstimationError> {
     let kappa_hat = get_constant_curvature_kappa(resolvedspec, term_idx).ok_or_else(|| {
@@ -301,16 +329,21 @@ pub fn curvature_inference_forspec(
     let x_term = select_columns(data, feature_cols).map_err(EstimationError::from)?;
     let profile = ConstantCurvatureProfile::new(x_term.view(), y, base_spec)?;
 
+    // The profile is a total negative log-evidence, so its resolution is the
+    // one the outer certificate that produced κ̂ used.
+    let resolution = gam_solve::rho_optimizer::criterion_statistical_resolution(y.len())
+        .ok_or_else(|| {
+            EstimationError::InvalidInput("curvature inference requires observations".to_string())
+        })?;
     // CI and flatness revisit κ̂ and κ=0. The shared profile caches each joint
-    // value/analytic-score pair so every statistic consumes the same evaluation.
-    let mut v_p = |kappa: f64| -> Result<(f64, f64), String> {
+    // value/analytic-jet triple so every statistic consumes the same evaluation.
+    let mut v_p = |kappa: f64| -> Result<(f64, f64, f64), String> {
         if !kappa.is_finite() {
             return Err(format!("V_p probed a non-finite κ = {kappa}"));
         }
-        let (value, score, _curvature) = profile.evaluate(kappa).map_err(|error| {
+        profile.evaluate(kappa).map_err(|error| {
             format!("analytic curvature profile at kappa={kappa} failed: {error}")
-        })?;
-        Ok((value, score))
+        })
     };
     let ci = curvature_profile_ci_from_analytic_score(
         &mut v_p,
@@ -318,11 +351,11 @@ pub fn curvature_inference_forspec(
         kappa_min,
         kappa_max,
         level,
-        options.tol,
+        resolution,
     )
     .map_err(EstimationError::RemlOptimizationFailed)?;
     let flatness = gam_geometry::curvature_estimand::flatness_lr_test(
-        |kappa| v_p(kappa).map(|(value, _)| value),
+        |kappa| v_p(kappa).map(|(value, _, _)| value),
         kappa_hat,
     )
     .map_err(EstimationError::RemlOptimizationFailed)?;
@@ -343,16 +376,21 @@ pub fn curvature_inference_forspec(
 mod curvature_profile_score_tests {
     use super::*;
 
+    /// The criterion resolution of a 1000-row fit.
+    const TEST_RESOLUTION: f64 = 0.5 / 1000.0;
+
     #[test]
     fn analytic_profile_score_finds_exact_quadratic_lr_crossings() {
         let kappa_hat = -0.37;
         let curvature = 16.0;
         let level = 0.95;
-        let mut profile = |kappa: f64| -> Result<(f64, f64), String> {
+        let resolution = TEST_RESOLUTION;
+        let mut profile = |kappa: f64| -> Result<(f64, f64, f64), String> {
             let displacement = kappa - kappa_hat;
             Ok((
                 7.0 + 0.5 * curvature * displacement * displacement,
                 curvature * displacement,
+                curvature,
             ))
         };
         let ci = curvature_profile_ci_from_analytic_score(
@@ -361,24 +399,35 @@ mod curvature_profile_score_tests {
             -3.0,
             3.0,
             level,
-            1.0e-10,
+            resolution,
         )
         .expect("analytic quadratic profile CI");
         let z = gam_geometry::curvature_estimand::wald_half_width(1.0, level)
             .expect("valid normal quantile");
         let expected_half_width = z / curvature.sqrt();
-        assert!((ci.ci_lo - (kappa_hat - expected_half_width)).abs() <= 1.0e-8);
-        assert!((ci.ci_hi - (kappa_hat + expected_half_width)).abs() <= 1.0e-8);
+        // The bracket stops once the residual is within the resolution, i.e.
+        // within `resolution / slope` of the crossing, with the slope there
+        // `curvature · half_width`; the closing Newton step only tightens it.
+        let endpoint_bound = resolution / (curvature * expected_half_width);
+        assert!((ci.ci_lo - (kappa_hat - expected_half_width)).abs() <= endpoint_bound);
+        assert!((ci.ci_hi - (kappa_hat + expected_half_width)).abs() <= endpoint_bound);
         assert!(!ci.lo_at_bound && !ci.hi_at_bound);
     }
 
     #[test]
     fn analytic_profile_marks_chart_bound_when_wilks_set_never_crosses() {
-        let mut profile =
-            |kappa: f64| -> Result<(f64, f64), String> { Ok((0.5 * kappa * kappa, kappa)) };
-        let ci =
-            curvature_profile_ci_from_analytic_score(&mut profile, 0.0, -0.1, 0.1, 0.95, 1.0e-10)
-                .expect("open bounded profile CI");
+        let mut profile = |kappa: f64| -> Result<(f64, f64, f64), String> {
+            Ok((0.5 * kappa * kappa, kappa, 1.0))
+        };
+        let ci = curvature_profile_ci_from_analytic_score(
+            &mut profile,
+            0.0,
+            -0.1,
+            0.1,
+            0.95,
+            TEST_RESOLUTION,
+        )
+        .expect("open bounded profile CI");
         assert_eq!(ci.ci_lo, -0.1);
         assert_eq!(ci.ci_hi, 0.1);
         assert!(ci.lo_at_bound && ci.hi_at_bound);
@@ -400,14 +449,15 @@ mod curvature_profile_score_tests {
         // V_p(κ) = −κ, score = −1: strictly decreasing, never stationary in the
         // interior. κ̂ can only be the upper bound.
         let kappa_max = 1.388_888_888_888_888_9_f64;
-        let mut monotone = |kappa: f64| -> Result<(f64, f64), String> { Ok((-kappa, -1.0)) };
+        let mut monotone =
+            |kappa: f64| -> Result<(f64, f64, f64), String> { Ok((-kappa, -1.0, 0.0)) };
         let ci = curvature_profile_ci_from_analytic_score(
             &mut monotone,
             kappa_max,
             -kappa_max,
             kappa_max,
             0.95,
-            1.0e-10,
+            TEST_RESOLUTION,
         )
         .expect("a boundary optimum with the score pointing out of the box is stationary");
         assert_eq!(
@@ -417,14 +467,15 @@ mod curvature_profile_score_tests {
         );
         // The mirrored sign, so the relaxation and the declaration agree on both
         // sides rather than one of them being written for a single branch.
-        let mut increasing = |kappa: f64| -> Result<(f64, f64), String> { Ok((kappa, 1.0)) };
+        let mut increasing =
+            |kappa: f64| -> Result<(f64, f64, f64), String> { Ok((kappa, 1.0, 0.0)) };
         let ci_lo = curvature_profile_ci_from_analytic_score(
             &mut increasing,
             -kappa_max,
             -kappa_max,
             kappa_max,
             0.95,
-            1.0e-10,
+            TEST_RESOLUTION,
         )
         .expect("the mirrored boundary optimum");
         assert_eq!(
@@ -433,7 +484,8 @@ mod curvature_profile_score_tests {
         );
         // An interior non-stationary point is still refused: the relaxation is
         // tied to the rail, not a blanket loosening.
-        let mut interior_slope = |kappa: f64| -> Result<(f64, f64), String> { Ok((-kappa, -1.0)) };
+        let mut interior_slope =
+            |kappa: f64| -> Result<(f64, f64, f64), String> { Ok((-kappa, -1.0, 0.0)) };
         assert!(
             curvature_profile_ci_from_analytic_score(
                 &mut interior_slope,
@@ -441,7 +493,7 @@ mod curvature_profile_score_tests {
                 -kappa_max,
                 kappa_max,
                 0.95,
-                1.0e-10,
+                TEST_RESOLUTION,
             )
             .is_err(),
             "a non-stationary INTERIOR point is not an optimum and must still be refused"
