@@ -220,7 +220,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "cg_relative_residual": solve.cg_relative_residual,
                 "cg_residual_stop": solve.cg_residual_stop,
                 "stopping_rule": "EV, gamma and frame residuals <= tolerance with no pending birth or frame trial",
-                "minibatch_admission": "refresh atom k only when n_k >= (z_alpha*sigma/(a_bar_k*margin_k))^2; otherwise accumulate",
+                "minibatch_admission": "refresh atom k only when its tangent score T_k = |(I - d_k d_k^T) r_k|^2/(sigma^2 A_kk) >= (p-1) ln n_k; otherwise accumulate",
             },
             "shards": shard_reports.len(),
         }));
