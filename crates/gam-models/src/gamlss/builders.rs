@@ -220,6 +220,86 @@ pub(crate) fn two_block_rho_seed(
     rho0vec
 }
 
+/// The certified mode of a pilot fit whose model the refit nests (#2940).
+///
+/// The Gaussian link-wiggle refit adds a third block to the pilot's
+/// (mean, log σ) model, and at wiggle coefficients zero its likelihood is the
+/// pilot's, so the pilot's certified (ρ, β) of the shared blocks is the nested
+/// optimum of the refit's criterion restricted to the wiggle-free face. The
+/// refit enters its single outer start (`outer_start_point`) there instead of at
+/// unit strength on every shared coordinate.
+pub(crate) struct LocationScaleNestedStart {
+    /// The pilot's log-strengths in `[mean | noise]` penalty order.
+    log_lambdas: Array1<f64>,
+    mean_beta: Array1<f64>,
+    noise_beta: Array1<f64>,
+}
+
+impl LocationScaleNestedStart {
+    /// The start carried by a Gaussian location-scale pilot. Its blocks are the
+    /// engine's own, so a pilot missing one is an engine defect.
+    pub(crate) fn from_gaussian_pilot(pilot: &BlockwiseTermFitResult) -> Result<Self, FitFailure> {
+        let block_beta = |index: usize, name: &str| {
+            pilot
+                .fit
+                .block_states
+                .get(index)
+                .map(|state| state.beta.clone())
+                .ok_or_else(|| {
+                    assembly_failure(format!("pilot Gaussian fit is missing its {name} block"))
+                })
+        };
+        Ok(Self {
+            log_lambdas: pilot.fit.log_lambdas.clone(),
+            mean_beta: block_beta(GaussianLocationScaleFamily::BLOCK_MU, "mean")?,
+            noise_beta: block_beta(GaussianLocationScaleFamily::BLOCK_LOG_SIGMA, "log-sigma")?,
+        })
+    }
+
+    /// Overwrite the shared `[mean | noise]` coordinates of `rho_seed` with the
+    /// pilot's certified values, leaving the refit's own extra coordinates (the
+    /// wiggle's) at their seed.
+    ///
+    /// A pilot coordinate on a face of the refit's resolvability interval
+    /// `[ln(√ε γ_min), ln(γ_max/√ε)]` (#2812) keeps its seed: on either face the
+    /// penalized direction is resolved to zero or left unpenalized to working
+    /// precision, so the criterion's gradient in that coordinate is flat to
+    /// resolution and a start there carries no information the search can move
+    /// on. Only the pilot's interior coordinates are informative starts.
+    fn warm_rho_seed(
+        &self,
+        mut rho_seed: Array1<f64>,
+        shared_len: usize,
+        rho_lower: &Array1<f64>,
+        rho_upper: &Array1<f64>,
+    ) -> Result<Array1<f64>, FitFailure> {
+        if self.log_lambdas.len() != shared_len
+            || rho_seed.len() < shared_len
+            || rho_lower.len() != rho_seed.len()
+            || rho_upper.len() != rho_seed.len()
+        {
+            return Err(FitFailure::raised(
+                FailureCategory::Invariant,
+                format!(
+                    "nested location-scale start carries {} log-strengths for {} shared \
+                     coordinates of a {}-coordinate seed (domain {}/{})",
+                    self.log_lambdas.len(),
+                    shared_len,
+                    rho_seed.len(),
+                    rho_lower.len(),
+                    rho_upper.len()
+                ),
+            ));
+        }
+        for (i, &rho) in self.log_lambdas.iter().enumerate() {
+            if rho > rho_lower[i] && rho < rho_upper[i] {
+                rho_seed[i] = rho;
+            }
+        }
+        Ok(rho_seed)
+    }
+}
+
 pub(crate) fn build_two_block_exact_joint_setup(
     data: ArrayView2<'_, f64>,
     meanspec: &TermCollectionSpec,
@@ -2867,6 +2947,11 @@ pub(crate) trait LocationScaleFamilyBuilder {
         Ok(Array1::zeros(0))
     }
 
+    /// The certified pilot mode a refit of a nested model enters from (#2940).
+    fn nested_start(&self) -> Option<&LocationScaleNestedStart> {
+        None
+    }
+
     fn build_psiderivative_blocks(
         &self,
         arr: ndarray::ArrayView2<'_, f64>,
@@ -2888,8 +2973,11 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
     // representation from the realized (n, p, K) work model, so there is no
     // large-scale downgrade to BFGS here.
 
-    let mut mean_beta_hint: Option<Array1<f64>> = None;
-    let mut noise_beta_hint: Option<Array1<f64>> = None;
+    // A refit of a nested model starts its coefficients at the pilot's mode.
+    let mut mean_beta_hint: Option<Array1<f64>> =
+        builder.nested_start().map(|start| start.mean_beta.clone());
+    let mut noise_beta_hint: Option<Array1<f64>> =
+        builder.nested_start().map(|start| start.noise_beta.clone());
     // The only extra seeds are the selected link-wiggle block's, which the
     // engine built itself, so a refusal here is an engine defect.
     let extra_rho0 = builder
@@ -2980,7 +3068,8 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
             // coordinate, the noise ridge and the link wiggle included. The
             // family reports its capability on them, and the search takes its ρ
             // domain from them by the #2812 law `fit_custom_family` applies to
-            // the same blocks (#2902 item 15).
+            // the same blocks (#2902 item 15). Neither depends on ρ: the domain
+            // is a function of each block's design and penalties only.
             let seed_blocks = builder
                 .build_blocks(
                     &rho_seed,
@@ -2996,6 +3085,15 @@ pub(crate) fn fit_location_scale_terms<B: LocationScaleFamilyBuilder>(
                     options,
                     rho_seed.len(),
                 )?;
+            let rho_seed = match builder.nested_start() {
+                Some(start) => start.warm_rho_seed(
+                    rho_seed,
+                    mean_penalty_count + noise_penalty_count,
+                    &rho_lower,
+                    &rho_upper,
+                )?,
+                None => rho_seed,
+            };
             let joint_setup = build_two_block_exact_joint_setup(
                 data,
                 builder.meanspec(),
@@ -3460,6 +3558,8 @@ pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     pub(crate) wiggle_knots: Array1<f64>,
     pub(crate) wiggle_degree: usize,
     pub(crate) wiggle_block: ParameterBlockInput,
+    /// The wiggle-free pilot's certified mode, which this model nests.
+    pub(crate) nested_start: LocationScaleNestedStart,
 }
 
 impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
@@ -3493,6 +3593,10 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
 
     fn extra_rho0(&self) -> Result<Array1<f64>, String> {
         initial_log_lambdas_orzeros(&self.wiggle_block)
+    }
+
+    fn nested_start(&self) -> Option<&LocationScaleNestedStart> {
+        Some(&self.nested_start)
     }
 
     fn build_blocks(
@@ -3934,6 +4038,7 @@ pub(crate) fn fit_gaussian_location_scale_terms(
 pub(crate) fn fit_gaussian_location_scalewiggle_terms(
     data: ndarray::ArrayView2<'_, f64>,
     spec: GaussianLocationScaleWiggleTermSpec,
+    nested_start: LocationScaleNestedStart,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermFitResult, FitFailure> {
@@ -3958,6 +4063,7 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
             wiggle_knots: spec.wiggle_knots,
             wiggle_degree: spec.wiggle_degree,
             wiggle_block: spec.wiggle_block,
+            nested_start,
         },
         options,
         kappa_options,
@@ -3982,13 +4088,18 @@ pub(crate) fn select_gaussian_location_scale_link_wiggle_basis_from_pilot(
         .map_err(wiggle_basis_failure)
 }
 
+/// Refit the Gaussian location-scale model with the link wiggle selected on
+/// `pilot`'s predictor, entering from the pilot's certified mode of the mean and
+/// log-σ blocks (`LocationScaleNestedStart`, #2940).
 pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
     data: ndarray::ArrayView2<'_, f64>,
     spec: GaussianLocationScaleTermSpec,
+    pilot: &BlockwiseTermFitResult,
     selected_wiggle_basis: SelectedWiggleBasis,
     options: &BlockwiseFitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<BlockwiseTermWiggleFitResult, FitFailure> {
+    let nested_start = LocationScaleNestedStart::from_gaussian_pilot(pilot)?;
     let SelectedWiggleBasis {
         knots: wiggle_knots,
         degree: wiggle_degree,
@@ -4008,6 +4119,7 @@ pub(crate) fn fit_gaussian_location_scale_terms_with_selected_wiggle(
             wiggle_degree,
             wiggle_block,
         },
+        nested_start,
         options,
         kappa_options,
     )?;

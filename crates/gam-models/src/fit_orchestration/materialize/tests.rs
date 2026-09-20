@@ -2852,6 +2852,7 @@ fn reference_gaussian_wiggle(
     let ref_solved = fit_gaussian_location_scale_terms_with_selected_wiggle(
         data,
         spec,
+        &ref_pilot,
         ref_basis,
         options,
         kappa_options,
@@ -3897,6 +3898,7 @@ fn gaussian_location_scale_wiggle_face_criterion_gradient_matches_central_differ
         fit_gaussian_location_scale_terms_with_selected_wiggle(
             req_data,
             spec,
+            &pilot,
             basis,
             &options,
             &kappa_options,
