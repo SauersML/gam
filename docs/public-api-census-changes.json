@@ -4672,5 +4672,13 @@
     },
     "reason": "gam#3018: CostStallGuard takes each sample's evaluation resolution in a StallSample (sample_resolution over #3186's outer_objective_band) instead of a band staged beside it, so objective_band and stage_objective_band have no caller; observe_second_order folds into observe(StallSample, predicted_decrease), whose sample carries the curvature verdict it used to take.",
     "evidence": "public_api_census.py with this entry passed at base 94e6a59c5b (13652 public function declarations before, 13669 after); the tip check reruns it at this base. bridges.rs declares none of the three names in the landing tree (git grep -w). Gate on the landing tree (gate5, acn112, base 94e6a59c5b): workspace lib (ban scanner) and workspace check green; gam-solve 2101 of 2104 distinct tests pass, and the 3 reds also fail at base; the gam-models separation, multinomial and stall receipts pass 63 of 67, and the 4 reds also fail at base with the same messages."
+  },
+  {
+    "base": "96a81f3bca96c060ec79f9c0d52158e9e2389ed5",
+    "removed": {
+      "crates/gam-sae/src/manifold/tests.rs::assignment_logit_step_cap_bounds_single_iteration_gate_motion": 1
+    },
+    "reason": "#2902: the test pinned SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS, a +-4 tau hand box on each accepted Newton step of the assignment logits (SPEC 18-22). The cap is deleted (the Armijo line search on the realised objective globalises the step), so the test that asserted the clamp retires with it.",
+    "evidence": "Replaced by manifold::tests::assignment_logit_newton_step_is_realised_unboxed, which asserts the realised within-row logit move equals step_size * delta for a 1e3 tau raw delta; it fails on main f4db2a2b (the cap realises 4 tau instead of 500 tau) and passes on this branch."
   }
 ]

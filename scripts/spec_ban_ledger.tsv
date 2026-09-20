@@ -15,11 +15,6 @@
 box	crates/gam-model-api/src/families/custom_family/options.rs	const FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-models/src/fit_orchestration/drivers/design_construction.rs	clamp(+-limit)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs	const SPATIAL_PSI_BFGS_STEP_CAP	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/assignment.rs	const SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
-box	crates/gam-sae/src/manifold/fit_drivers.rs	clamp(+-logit_step_cap)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/estimate/optimizer.rs	smooth_bound_support(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902
 box	crates/gam-solve/src/mixture_link.rs	smooth_bound_jet(SAS_LOG_DELTA_BOUND)	https://github.com/SauersML/gam/issues/2902

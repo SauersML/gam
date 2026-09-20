@@ -70,11 +70,26 @@ def test_fit_duchon_single_multioutput_D5():
 
 
 def test_fit_additive_two_duchon():
+    # Each Duchon block leaves its global mean unpenalized, so two ungated
+    # Duchon blocks share that direction and the joint coefficient map is not
+    # identified. Per-row amplitude gates, the documented additive form, give
+    # each block its own mean direction.
     t, y = _inputs()
+    g = torch.Generator().manual_seed(11)
+    gates = [torch.rand(40, generator=g, dtype=torch.float64) for _ in range(2)]
+    with pytest.raises(ValueError, match="joint coefficient map is not identified"):
+        gt.fit(
+            [t, t],
+            y,
+            [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)],
+        )
     res = gt.fit(
         [t, t],
         y,
-        [gt.Duchon(centers=_centers(6), m=2), gt.Duchon(centers=_centers(7), m=2)],
+        [
+            gt.Duchon(centers=_centers(6), m=2, by=gates[0]),
+            gt.Duchon(centers=_centers(7), m=2, by=gates[1]),
+        ],
     )
 
     assert isinstance(res.coefficients, list)
@@ -198,7 +213,7 @@ def test_matern_fit_autograd_flows_to_points():
     assert float(grad.abs().sum()) > 0.0
 
 
-def _tensor_bspline_inputs(n=24, seed=1):
+def _tensor_bspline_inputs(n=200, seed=1):
     """2D (x, z) grid-ish points and a separable interaction target."""
     g = torch.Generator().manual_seed(seed)
     x = torch.rand(n, generator=g, dtype=torch.float64)
@@ -215,7 +230,17 @@ def test_tensorbspline_fit_te_2d():
     over both marginal B-spline bases, Kronecker-sum tensor penalty. The fit
     must recover the interaction target on a 2D (x, z) input."""
     points, y = _tensor_bspline_inputs()
-    knots = torch.linspace(0.0, 1.0, 8, dtype=torch.float64)
+    # An explicit knot tensor is the FULL knot vector, so a cubic basis needs
+    # its boundary knots repeated to cover the data on [0, 1]. The bare grid
+    # linspace(0, 1, 8) spans only [t_3, t_4] = [3/7, 4/7]; the rows outside it
+    # fall on the linear boundary continuation and the design loses rank.
+    knots = torch.cat(
+        [
+            torch.zeros(3, dtype=torch.float64),
+            torch.linspace(0.0, 1.0, 8, dtype=torch.float64),
+            torch.ones(3, dtype=torch.float64),
+        ]
+    )
     res = gt.fit(
         points,
         y,
@@ -242,6 +267,7 @@ def test_tensorbspline_fit_te_2d():
     assert res.coefficients.shape[0] == marg_cols * marg_cols
     assert res.fitted.shape == (points.shape[0], 1)
     assert torch.isfinite(res.coefficients).all()
+    assert torch.isfinite(res.lambdas).all()
     # The interaction surface must actually be tracked (additive s(x)+s(z)
     # cannot represent sin(x)cos(z); the te must beat the variance floor).
     y2d = y.unsqueeze(1)
@@ -286,6 +312,10 @@ def test_categorical_fit_wired_backend_shapes_and_recovery():
     y = group_means[levels] + 0.01 * torch.randn(
         n, generator=g, dtype=torch.float64,
     )
+    # The contrast is sum-to-zero and carries no constant
+    # (`gamfit.smooth.Categorical`), so it represents the level effects about
+    # the grand mean. Centre the response so its level means are such effects.
+    y = y - y.mean()
 
     result = gt.fit(t, y, gt.Categorical(levels=levels, n_levels=n_levels))
 
@@ -302,6 +332,30 @@ def test_categorical_fit_wired_backend_shapes_and_recovery():
         fitted_k = fitted[mask].mean()
         data_k = y[mask].mean()
         assert torch.abs(fitted_k - data_k) < 0.5
+
+
+def test_categorical_fit_is_invariant_to_level_relabeling():
+    # Level codes are labels: relabeling them permutes the level effects and
+    # must leave the fit unchanged. The ridge therefore prices the level
+    # effects e = C·c the drop-last design produces, not the contrast
+    # coordinates c. An identity ridge on c gives the last-coded level K - 1
+    # times the prior variance of the others, so the fit moved with the coding.
+    n = 12
+    n_levels = 3
+    g = torch.Generator().manual_seed(3)
+    levels = torch.arange(n, dtype=torch.int64) % n_levels
+    t = torch.linspace(0.0, 1.0, n, dtype=torch.float64)
+    effects = torch.tensor([0.6, -0.4, -0.2], dtype=torch.float64)
+    y = effects[levels] + torch.randn(n, generator=g, dtype=torch.float64)
+    y = y - y.mean()
+
+    ref = gt.fit(t, y, gt.Categorical(levels=levels, n_levels=n_levels))
+    for relabel in ([2, 0, 1], [1, 2, 0]):
+        codes = torch.tensor(relabel, dtype=torch.int64)[levels]
+        got = gt.fit(t, y, gt.Categorical(levels=codes, n_levels=n_levels))
+        torch.testing.assert_close(got.fitted, ref.fitted)
+        torch.testing.assert_close(got.lambdas, ref.lambdas)
+        torch.testing.assert_close(got.reml_score, ref.reml_score)
 
 
 def test_gam_module_train_then_freeze_then_eval():
