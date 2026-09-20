@@ -696,9 +696,11 @@ impl FitFailure {
         }
     }
 
-    /// The Jeffreys arming evidence the custom-family refusal this failure ends
-    /// in carries ([`CustomFamilyError::jeffreys_arming_evidence`]), seen
-    /// through the wrappers that only carry it.
+    /// The Jeffreys arming evidence the refusal this failure ends in carries,
+    /// seen through the wrappers that only carry it: a custom-family refusal's
+    /// ([`CustomFamilyError::jeffreys_arming_evidence`]), or a pre-fit
+    /// separation certificate's
+    /// ([`EstimationError::separation_arming_evidence`]).
     #[must_use]
     pub fn jeffreys_arming_evidence(&self) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
         match self {
@@ -706,9 +708,9 @@ impl FitFailure {
                 source.jeffreys_arming_evidence()
             }
             Self::CustomFamily(err) => err.jeffreys_arming_evidence(),
-            Self::Estimation(err) => {
-                Self::custom_family_leaf(err).and_then(CustomFamilyError::jeffreys_arming_evidence)
-            }
+            Self::Estimation(err) => Self::custom_family_leaf(err)
+                .and_then(CustomFamilyError::jeffreys_arming_evidence)
+                .or_else(|| err.separation_arming_evidence()),
             Self::Workflow(err) => match err.as_ref() {
                 WorkflowError::Fit(failure) => failure.jeffreys_arming_evidence(),
                 _ => None,

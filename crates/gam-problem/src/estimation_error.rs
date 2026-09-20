@@ -614,6 +614,17 @@ pub enum EstimationError {
     },
 
     #[error(
+        "Pre-fit separation detected in the Bernoulli marginal-slope latent score: the threshold \
+        {threshold:.6e} on z separates the binary outcomes (positive_above_threshold={positive_above_threshold}), \
+        so the pooled probit likelihood of y on z has no finite mode. Enable Firth/Jeffreys bias \
+        reduction or supply a latent score that does not separate the outcomes."
+    )]
+    PrefitLatentScoreSeparationDetected {
+        threshold: f64,
+        positive_above_threshold: bool,
+    },
+
+    #[error(
         "Not enough observations to identify the model: {n_observations} positive-weight rows but \
         {unpenalized_dim} unpenalized coefficient directions (intercept, parametric terms and the \
         penalty null spaces, out of {total_columns} columns). REML/LAML estimate the smoothing \
@@ -1160,6 +1171,9 @@ impl EstimationError {
             Self::PrefitLinearSeparationDetected { column_indices, .. } => Some(format!(
                 "Detected separation driven by unpenalized columns {column_indices:?}. {SEPARATION}"
             )),
+            Self::PrefitLatentScoreSeparationDetected { .. } => Some(format!(
+                "Detected separation driven by the marginal-slope latent score. {SEPARATION}"
+            )),
             Self::LinkFeasibilityBoundaryOptimum { link, .. } => Some(format!(
                 "The {link} link's range exceeds the family's mean domain and the data put \
                  a fitted mean on the edge of that domain. Use a link whose range is the \
@@ -1241,6 +1255,7 @@ impl EstimationError {
             | Self::BetaPrecisionRefinementDidNotConverge { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1432,6 +1447,7 @@ impl EstimationError {
             | Self::LinkFeasibilityBoundaryOptimum { .. }
             | Self::PrefitPerfectSeparationDetected { .. }
             | Self::PrefitLinearSeparationDetected { .. }
+            | Self::PrefitLatentScoreSeparationDetected { .. }
             | Self::PrefitUnpenalizedSpaceExceedsObservations { .. }
             | Self::PrefitRankDeficientDesignDetected { .. }
             | Self::PrefitNearDegenerateDesignDetected { .. }
@@ -1513,6 +1529,9 @@ impl EstimationError {
             }
             Self::PrefitLinearSeparationDetected { .. } => {
                 "EstimationError::PrefitLinearSeparationDetected"
+            }
+            Self::PrefitLatentScoreSeparationDetected { .. } => {
+                "EstimationError::PrefitLatentScoreSeparationDetected"
             }
             Self::PrefitUnpenalizedSpaceExceedsObservations { .. } => {
                 "EstimationError::PrefitUnpenalizedSpaceExceedsObservations"

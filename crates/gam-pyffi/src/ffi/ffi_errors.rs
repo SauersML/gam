@@ -494,6 +494,9 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         EstimationError::PrefitLinearSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
+        EstimationError::PrefitLatentScoreSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
         EstimationError::MultinomialSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }

@@ -2270,7 +2270,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
     armed: bool,
     search_refusal: &RefCell<Option<JeffreysArmingEvidence>>,
 ) -> Result<CertifiedFit, FitFailure> {
-    use gam_problem::FailureCategory;
+    use gam_problem::{EstimationError, FailureCategory};
     search_refusal.replace(None);
     let mut spec = spec;
     let data_view = data;
@@ -2621,11 +2621,25 @@ fn fit_bernoulli_marginal_slope_terms_under(
             Some(Arc::new(runtime))
         }
     };
-    // Unclassified by name (#2937): the pooled pilot refuses the data (a
-    // length mismatch, no positive weight, one outcome carrying all of it) and
-    // reports its own Newton solve's failure in the same text.
-    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights)
-        .map_err(|reason| FitFailure::raised(FailureCategory::Unclassified, reason))?;
+    // Unarmed, a latent score that separates the outcomes gives the pooled
+    // probit no finite mode: its certificate is typed arming evidence, so the
+    // route re-solves armed, where the pilot is the Jeffreys-penalized mode
+    // (#3217). Every other refusal is Unclassified by name (#2937): the pilot
+    // refuses the data (a length mismatch, no positive weight, one outcome
+    // carrying all of it) and reports its own Newton solve's failure in the
+    // same text.
+    let pilot_baseline = pooled_probit_baseline(&spec.y, z_train, &spec.weights, armed)
+        .map_err(|refusal| match refusal {
+            PooledPilotRefusal::Separated(separation) => {
+                FitFailure::from(EstimationError::PrefitLatentScoreSeparationDetected {
+                    threshold: separation.threshold,
+                    positive_above_threshold: separation.positive_above_threshold,
+                })
+            }
+            PooledPilotRefusal::Refused(reason) => {
+                FitFailure::raised(FailureCategory::Unclassified, reason)
+            }
+        })?;
     // The probit marginal index is the pilot's own probit intercept: `q = η`
     // exactly (gam#2978), with no probability formed and inverted.
     require_probit_marginal_slope_link(&spec.base_link, "bernoulli marginal-slope baseline")
