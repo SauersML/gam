@@ -5341,7 +5341,6 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
         1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
         _ => (i % 3) as f64,
     });
-    let mut random_effects_checked = 0;
     for formula in [
         "y ~ s(x) + g",
         "y ~ s(x) + s(z)",
