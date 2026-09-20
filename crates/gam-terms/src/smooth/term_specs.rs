@@ -702,10 +702,15 @@ pub struct SmoothTermSpec {
 /// The predict-time replay record of a span-preserving parametric
 /// orthogonalization (#2747): this term's realized block is `X·T − C·R`.
 ///
-/// `T` is not here — it is the ordinary coefficient transform, already absorbed
-/// into the basis metadata, so a rebuilt `design_local` arrives with it applied.
-/// What cannot be absorbed is `R`, because it multiplies the CONSTRAINT block
-/// rather than the basis.
+/// `T` is recorded here, beside `R`, rather than folded into the basis metadata
+/// (#3001). The fit applies the term-local chart, the joint-null rotation `Q`
+/// and `T` as three successive products, `((B·z_local)·Q)·T`, and floating-point
+/// products do not reassociate: a replay that forms `B·(z_local·Q·T)` from one
+/// composed chart rebuilds a design that differs from the fit's in the last
+/// bits, so the saved model does not predict its own fitted values. The frozen
+/// spec therefore keeps the local chart in its basis, `Q` on
+/// [`SmoothTermSpec::joint_null_rotation`], and `T` here, and the replay applies
+/// them in the fit's order.
 ///
 /// `R` is TRAINING-ROW data and is never re-derived, for the same reason
 /// `frozen_global_orthogonality` is not (#978): the fit already decided this
@@ -726,6 +731,9 @@ pub struct ParametricResidualizationChart {
     /// constraint block. Recorded rather than recomputed so a spec that changes
     /// shape cannot silently re-order the columns `correction`'s rows index.
     pub has_parametric_block: bool,
+    /// `T`, `p × k`: the collection's coefficient chart, stated on the columns of
+    /// the term-local build after its joint-null rotation.
+    pub coefficient_transform: Array2<f64>,
     /// `R`, `q × k`, stated against the RAW constraint columns.
     pub correction: Array2<f64>,
 }
@@ -786,11 +794,15 @@ pub struct SmoothCollectionGauge {
     /// The TERM-LOCAL identifiability chart the gauged block was derived ON —
     /// `z_local`, before this gauge composed its own `T` on top of it (gam#2760).
     ///
-    /// The term's `BasisMetadata` records the COMPOSITION `z_local · T0`, which
-    /// is what a predict-time replay wants. A caller that moves `ψ` must rebuild
-    /// in `z_local`, then apply the separately stored fixed
-    /// [`Self::coefficient_transform`] and fixed row-space projection. Starting
-    /// from the composition would apply `T0` twice.
+    /// The term's `BasisMetadata` records the COMPOSITION `z_local · Q · T0`, the
+    /// chart its coefficients and penalties live in. A caller that rebuilds the
+    /// design — a moving-`ψ` trial or a predict-time replay — must rebuild in
+    /// `z_local`, then apply `Q`, the separately stored fixed
+    /// [`Self::coefficient_transform`] and the row-space correction, in that
+    /// order. Starting from the composition would apply `T0` twice, and even a
+    /// composition applied once rounds differently from the fit's three products
+    /// (#3001); `freeze_term_collection_from_design` freezes this chart for that
+    /// reason.
     ///
     /// Measured before this existed, on a one-Duchon-term collection with
     /// `C = [1]` and the `Delete` arm: the replay spec carried
@@ -7339,12 +7351,23 @@ pub(crate) fn build_by_smooth_local(
     by_kind: &ByVarKind,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    // A numeric by-variable only rescales the inner rows, so its inner build
+    // decides this term's joint-null rotation and carries the term's frozen
+    // rotation decision (#3001). A factor by-variable derives its rotation on
+    // the level-gated block below, whose chart the inner build does not share.
+    let (inner_rotation, inner_residualization) = match by_kind {
+        ByVarKind::Numeric { .. } => (
+            term.joint_null_rotation.clone(),
+            term.frozen_parametric_residualization.clone(),
+        ),
+        ByVarKind::Factor { .. } => (None, None),
+    };
     let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+        frozen_parametric_residualization: inner_residualization,
         name: term.name.clone(),
         basis: (*smooth).clone(),
         shape: term.shape.clone(),
-        joint_null_rotation: None,
+        joint_null_rotation: inner_rotation,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
 
@@ -7466,7 +7489,13 @@ pub(crate) fn build_by_smooth_local(
             // joint-null rotation absent. The canonical filter authors matrix,
             // rank, nullity, null basis, and metadata together.
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
-            let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
+            // A frozen parametric residualization is the fit's whole
+            // collection-chart decision, `Q` included (#3001).
+            let joint_null_rotation = match term.joint_null_rotation.clone() {
+                Some(persisted) => Some(persisted),
+                None if term.frozen_parametric_residualization.is_some() => None,
+                None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
+            };
             let mut dropped_penalties = inner.dropped_penalties;
             dropped_penalties.extend(filtered.dropped);
 
@@ -8226,15 +8255,18 @@ pub(crate) fn build_single_local_smooth_term_for(
         if matches!(by, ByVariableSpec::Level { .. }) {
             defer_inner_model_centering_to_factor_level_wrapper(&mut inner_basis);
         }
+        // The inner build is the one that decides this term's joint-null
+        // rotation, so it carries the term's frozen rotation decision: the
+        // persisted `Q` and the frozen residualization that states the fit
+        // applied none (#3001). Row gating only rescales the inner design, so
+        // the inner term needs exactly the penalties the caller needs.
         let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+            frozen_parametric_residualization: term.frozen_parametric_residualization.clone(),
             name: term.name.clone(),
             basis: inner_basis,
             shape: term.shape.clone(),
-            joint_null_rotation: None,
+            joint_null_rotation: term.joint_null_rotation.clone(),
         };
-        // Row gating only rescales the inner design, so the inner term needs
-        // exactly the penalties the caller needs.
         let built = build_single_local_smooth_term_for(data, &inner_term, workspace, demand)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
     }
@@ -8247,9 +8279,12 @@ pub(crate) fn build_single_local_smooth_term_for(
 
     // A frozen chart needs no penalty to place its design: the joint-null
     // rotation is the only penalty-derived design input, and a frozen spec
-    // persists it or has none.
+    // persists it or has none. The condition is the one under which the
+    // rotation below is derived rather than taken from the spec.
     let realize_penalties = demand == SmoothPenaltyDemand::Realize
-        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
+        || (term.joint_null_rotation.is_none()
+            && !smooth_has_frozen_identifiability(term)
+            && term.frozen_parametric_residualization.is_none());
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
@@ -9047,9 +9082,13 @@ pub(crate) fn build_single_local_smooth_term_for(
     // coefficient chart in their `FrozenTransform`; recomputing Q there would
     // rotate an already-frozen chart a second time and desynchronize value
     // rebuilds from derivative operators.
+    // A frozen parametric residualization is the fit's whole collection-chart
+    // decision, `Q` included: its spec carries the fit's rotation, so an absent
+    // one means the fit applied none (#3001).
     let joint_null_rotation = match term.joint_null_rotation.clone() {
         Some(persisted) => Some(persisted),
         None if smooth_has_frozen_identifiability(term) => None,
+        None if term.frozen_parametric_residualization.is_some() => None,
         None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
     };
 

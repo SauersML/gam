@@ -164,111 +164,22 @@ use std::path::Path;
 // recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
 // correction refuses the narrower covariance by name, so no interval is published
 // without the stage.
-pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+// v36 freezes a gauged smooth's term-local chart and its joint-null rotation `Q` apart, and
+// records the collection chart `T` on the term's parametric residualization chart
+// (`ParametricResidualizationChart::coefficient_transform`, #3001), so the replay forms
+// `((B·z_local)·Q)·T − C·R` in the fit's own order instead of `B·(z_local·Q·T) − C·R`, which
+// moved μ by up to 2 ulp. An older payload froze the composed chart and no `T`, so it cannot
+// be replayed in that order: every older version is refused by name, and a v35 binary refuses
+// a v36 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 36;
 
-/// The schema before the constant variance stage in the first-stage covariance
-/// (gam#3030), whose only difference is that covariance's width.
-const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
-
-/// The schema before the closed-form certificate's null law (gam#2926), whose only
-/// difference from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is those fields'
-/// absence.
-const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
-
-/// The schema before the full-conformal penalty count (gam#3296), whose only difference
-/// from [`CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION: u32 = 32;
-
-/// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
-/// difference from [`CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
-
-/// The schema before the Gaussian location-scale σ floor record, whose only difference
-/// from [`MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
-
-/// The schema whose Newton-polish record may carry its step budget (#2954), or already
-/// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
-/// [`SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION`] is that record's `step_budget`, which
-/// this binary reads past.
-const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
-
-/// The schema before the saved model stopped persisting training rows (speed F6), whose
-/// only difference is the conformal field's `x` and `y` and the serialized working
-/// geometry, both of which this binary reads past.
-const TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION: u32 = 28;
-
-/// The schema before the certified point's value and input fingerprint (gam#3002), whose only
-/// difference from [`TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION`] is those fields' absence.
-const WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION: u32 = 27;
-
-/// The schema before the coefficient-mode record (gam#2661), whose only difference from
-/// [`WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 26;
-
-/// The first payload version whose survival location-scale kernel divides the whole
-/// residual by σ (#2695).
-pub const WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION: u32 = 26;
-
-/// The schema before [`WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION`]. Its only difference is
-/// the survival location-scale kernel, whose old payloads the family validator judges.
-const LOCATION_ONLY_SCALE_PAYLOAD_VERSION: u32 = 25;
-
-/// The schema before the certified outer point (`warm_start_from`), whose only difference
-/// from [`LOCATION_ONLY_SCALE_PAYLOAD_VERSION`] is that record's absence.
-pub(crate) const OUTER_WARM_START_ABSENT_PAYLOAD_VERSION: u32 = 24;
-
-/// The schema before the residual repair block's covariance declination (gam#2985),
-/// whose only difference from [`OUTER_WARM_START_ABSENT_PAYLOAD_VERSION`] is that
-/// variant's absence.
-const RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION: u32 = 23;
-
-/// The schema before the latent-law record (gam#2926), whose only difference from
-/// [`RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION`] is that field's absence.
-const LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 22;
-
-/// The schema before the certificate's Newton polish and face kinds (#2954), whose only
-/// difference from [`LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION`] is those fields' absence.
-const NEWTON_POLISH_ABSENT_PAYLOAD_VERSION: u32 = 21;
-
-/// The schema before the rho-posterior adequacy tokens (#2946 T2), whose only
-/// difference is the old tokens, which this binary reads as aliases.
-const RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION: u32 = 20;
-
-/// The schema before the EDF rank-bound status (#2901), whose only difference from
-/// [`RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION`] is that field's absence.
-const EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION: u32 = 19;
-
-/// The schema whose only difference from [`EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION`]
-/// is the inference block's redundant covariance copies (#2955).
-const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
-
-/// Every payload version this binary reads: its own, and each older schema
-/// whose only differences it reads through. A payload written at any other
-/// version is refused by name (`payload_version_mismatch`). Callers that need a
-/// refused or an accepted version read it from here rather than offsetting
-/// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
+/// Every payload version this binary reads. Each older schema froze a gauged smooth's
+/// composed chart without the collection chart `T` its replay now applies (#3001), so a
+/// payload written at any other version is refused by name (`payload_version_mismatch`).
+/// Callers that need a refused or an accepted version read it from here rather than
+/// offsetting [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
-    MODEL_PAYLOAD_VERSION,
-    CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
-    CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-    CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-    MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-    POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-    TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-    WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-    MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-    LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-    OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-    RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-    LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-    NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
-    RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
-    EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
-    COVARIANCE_COPIES_PAYLOAD_VERSION,
-];
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 1] = [MODEL_PAYLOAD_VERSION];
 
 /// Whether this binary reads a payload written at `version`.
 fn payload_version_is_readable(version: u32) -> bool {
@@ -1887,35 +1798,6 @@ fn validate_survival_location_scale_saved_fit(
         payload.survival_beta_log_sigma.as_ref(),
         "log-sigma",
     )?;
-    // #2695: before WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION the kernel divided only the
-    // location by σ, `u = h(t) − η_t·e^{−η_σ}`, where it now divides the whole residual,
-    // `u = (h(t) − η_t)·e^{−η_σ}`. The two differ by `h·(1 − e^{−η_σ})`, so an old payload
-    // is refused only when its log-σ predictor can move (a nonzero coefficient, or a
-    // declared noise offset) and its time-warp coefficients can too. The reduced
-    // parametric-AFT lift and the σ-scaled log-t baseline (#892) save an all-zero warp
-    // and fit `h ≡ 0`, so the two kernels agree on their rows. Any other such payload was
-    // fit as a different model, and reading it as the current one would silently move
-    // every prediction.
-    let block_can_move = |role: BlockRole| {
-        fit.block_by_role(role)
-            .is_some_and(|block| block.beta.iter().any(|value| *value != 0.0))
-    };
-    let scale_can_move = block_can_move(BlockRole::Scale) || payload.noise_offset_column.is_some();
-    if payload.version < WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION
-        && scale_can_move
-        && block_can_move(BlockRole::Time)
-    {
-        return Err(FittedModelError::SchemaMismatch {
-            reason: format!(
-                "location-scale survival model written at payload version {} was fit under \
-                 the pre-#2695 location-only kernel u = h(t) − η_t/σ, and neither its log-σ \
-                 predictor nor its time warp is identically zero, so it means something else \
-                 under the current kernel u = (h(t) − η_t)/σ; refit required: σ was \
-                 unidentified under the pre-#2695 likelihood",
-                payload.version
-            ),
-        });
-    }
     if let Some(basis) = structure.threshold_time_basis.as_ref() {
         let width =
             validate_survival_covariate_time_basis(basis, "location-scale survival threshold time basis")?;
@@ -4805,8 +4687,7 @@ impl FittedModel {
         col_map: &HashMap<String, usize>,
     ) -> Result<Option<Array1<f64>>, FittedModelError> {
         use gam_terms::basis::{
-            CenterStrategy, MeasureJetExtrapolationSpectrum, MeasureJetIdentifiability,
-            PenaltySource,
+            CenterStrategy, MeasureJetExtrapolationSpectrum, PenaltySource,
         };
         use gam_terms::smooth::SmoothBasisSpec;
         use gam_terms::smooth::build_term_collection_design;
@@ -5084,16 +4965,6 @@ impl FittedModel {
             // `mj.length_scale`, and σ_coord are all standardized consistently.
             if let Some(sigma_coord) = frozen.sigma_coord {
                 'input_var: {
-                    let MeasureJetIdentifiability::FrozenTransform { transform } =
-                        &mj.identifiability
-                    else {
-                        log::debug!(
-                            "measure-jet term '{}': identifiability is not a frozen transform; \
-                             skipping its input-measurement-error variance",
-                            term.name
-                        );
-                        break 'input_var;
-                    };
                     let full_cols = design.design.ncols();
                     if fit.beta.len() != full_cols {
                         log::debug!(
@@ -5116,6 +4987,23 @@ impl FittedModel {
                         );
                         break 'input_var;
                     }
+                    // The replayed term's composed chart `z_local·Q·T` maps its
+                    // reduced coefficients to the raw representer+head ones. The
+                    // frozen spec carries only the term-local `z_local`; `Q` and
+                    // the collection chart `T` are applied on top of it (#3001),
+                    // so the composition is read off the replayed metadata.
+                    let gam_terms::basis::BasisMetadata::MeasureJet {
+                        constraint_transform: Some(transform),
+                        ..
+                    } = &design.smooth.terms[smooth_idx].metadata
+                    else {
+                        log::debug!(
+                            "measure-jet term '{}': replayed metadata carries no coefficient \
+                             chart; skipping its input-measurement-error variance",
+                            term.name
+                        );
+                        break 'input_var;
+                    };
                     let m = centers.nrows();
                     let m_aug = transform.nrows();
                     let reduced = transform.ncols();
@@ -8195,12 +8083,11 @@ mod tests {
         assert!(err.to_string().contains("payload schema mismatch"));
     }
 
-    /// #2955: the schema one version before the one-store covariance is still
-    /// read, because its only difference is the inference block's covariance
-    /// copies, which were checked against the top-level stores at save and which
-    /// the reader drops. The version before that one is refused.
+    /// #3001: an older payload froze a gauged smooth's composed chart and no collection
+    /// chart, so this binary cannot replay it in the fit's order. Every version but its own,
+    /// older or later, is refused by the named version error before a field is read.
     #[test]
-    fn the_covariance_copies_payload_version_is_readable_and_its_predecessor_is_not_2955() {
+    fn every_payload_version_but_this_binarys_is_refused_by_name_3001() {
         let blocks = || {
             vec![FittedBlock {
                 beta: array![0.1],
@@ -8209,122 +8096,24 @@ mod tests {
                 lambdas: Array1::zeros(0),
             }]
         };
-        FittedModel::from_payload(marginal_slope_payload(
-            COVARIANCE_COPIES_PAYLOAD_VERSION,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect("a payload written with the covariance copies is readable");
-        let err = FittedModel::from_payload(marginal_slope_payload(
-            COVARIANCE_COPIES_PAYLOAD_VERSION - 1,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect_err("the version before the covariance-copies schema is refused");
-        assert!(err.to_string().contains("payload schema mismatch"));
-    }
-
-    /// #2901: a payload written before the EDF rank-bound status, at v19 or at the
-    /// covariance-copies v18, passes the version gate. The field it lacks,
-    /// `FitInference::edf_rank_bound`, carries `#[serde(default)]`, so it reads as empty.
-    /// The v20 schema before the rho-posterior adequacy tokens (#2946 T2) passes too;
-    /// its old tokens read as aliases.
-    /// The v22 schema before the latent-law record (gam#2926) passes too; the field it lacks
-    /// carries `#[serde(default)]`.
-    #[test]
-    fn the_payload_before_the_edf_rank_bound_status_is_readable_2901() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        for version in [
-            MODEL_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-            NEWTON_POLISH_ABSENT_PAYLOAD_VERSION,
-            RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION,
-            EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION,
-            COVARIANCE_COPIES_PAYLOAD_VERSION,
-        ] {
-            FittedModel::from_payload(marginal_slope_payload(version, saved_fit(blocks())))
+        FittedModel::from_payload(marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks())))
+            .payload()
+            .validate_payload_version()
+            .expect("a payload at this binary's version is readable");
+        assert_eq!(READABLE_PAYLOAD_VERSIONS, [MODEL_PAYLOAD_VERSION]);
+        for version in (0..MODEL_PAYLOAD_VERSION).chain([MODEL_PAYLOAD_VERSION + 1]) {
+            let err = FittedModel::from_payload(marginal_slope_payload(version, saved_fit(blocks())))
                 .payload()
                 .validate_payload_version()
-                .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
+                .expect_err("a payload at another version is refused");
+            let message = err.to_string();
+            assert!(
+                message.contains("payload schema mismatch")
+                    && message.contains(&format!("file has version={version}"))
+                    && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
+                "payload version {version} must be refused by its version: {message}"
+            );
         }
-        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
-        assert_eq!(
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
-            CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
-            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
-            TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION,
-            WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            WHOLE_RESIDUAL_SCALE_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION
-        );
-        assert_eq!(
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION,
-            MODE_SELECTION_RECORD_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION,
-            LOCATION_ONLY_SCALE_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION,
-            OUTER_WARM_START_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(
-            LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION,
-            RESIDUAL_REPAIR_DECLINATION_ABSENT_PAYLOAD_VERSION - 1
-        );
-        assert_eq!(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION - 1);
-        assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
-        assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
-        assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
     }
 
     /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
@@ -8348,267 +8137,6 @@ mod tests {
         let text = serde_json::to_string(&current).expect("a v28 point writes");
         let read: OuterWarmStartRecord = serde_json::from_str(&text).expect("a v28 point reads");
         assert_eq!(read, current);
-    }
-
-    /// #2954: a payload written before the certificate recorded its Newton polish and each
-    /// railed coordinate's face kind loads, with no polish and the face `Unrecorded`, never as a
-    /// kind the record did not hold; and a payload claiming a later version than this binary
-    /// writes is refused by the named version error.
-    #[test]
-    fn a_payload_before_the_newton_polish_loads_with_unrecorded_faces_2954() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let mut fit = saved_fit(blocks());
-        fit.artifacts.criterion_certificate =
-            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
-                stationarity: gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                    grad_norm: 2e-7,
-                    projected_grad_norm: 2e-7,
-                    bound: 1e-5,
-                    rung: gam_solve::rho_optimizer::CertifiedRung {
-                        label: "solver-band".to_string(),
-                        derived_standard: false,
-                    },
-                },
-                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
-                lambdas_railed: vec![0],
-                railed_facts: vec![gam_solve::rho_optimizer::RailedCoordinateFact {
-                    index: 0,
-                    theta: 20.0,
-                    lower: -20.0,
-                    upper: 20.0,
-                    margin: 0.5,
-                    face: gam_solve::model_types::RailFaceKind::LimitModel,
-                }],
-                newton_polish: None,
-                curvature_floor: None,
-            });
-        let payload = marginal_slope_payload(NEWTON_POLISH_ABSENT_PAYLOAD_VERSION, fit);
-        let mut older = serde_json::to_value(&payload).expect("serialize the payload");
-        for materialization in ["fit_result", "unified"] {
-            if let Some(certificate) = older
-                .get_mut(materialization)
-                .and_then(|fit| fit.get_mut("artifacts"))
-                .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
-                .and_then(serde_json::Value::as_object_mut)
-            {
-                certificate.remove("newton_polish");
-                certificate["railed_facts"][0]
-                    .as_object_mut()
-                    .expect("a railed fact serializes as an object")
-                    .remove("face")
-                    .expect("the face kind was written");
-            }
-        }
-        let loaded: FittedModelPayload =
-            serde_json::from_value(older).expect("a payload before the Newton polish parses");
-        FittedModel::from_payload(loaded.clone())
-            .payload()
-            .validate_payload_version()
-            .expect("a payload before the Newton polish is readable");
-        let certificate = loaded
-            .fit_result
-            .as_ref()
-            .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
-            .expect("the loaded fit keeps its certificate");
-        assert!(certificate.newton_polish.is_none());
-        assert_eq!(
-            certificate.railed_facts[0].face,
-            gam_solve::model_types::RailFaceKind::Unrecorded
-        );
-
-        let err = FittedModel::from_payload(marginal_slope_payload(
-            MODEL_PAYLOAD_VERSION + 1,
-            saved_fit(blocks()),
-        ))
-        .payload()
-        .validate_payload_version()
-        .expect_err("a payload from a later schema is refused");
-        assert!(
-            err.to_string().contains(&format!(
-                "file has version={}, this binary expects MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}",
-                MODEL_PAYLOAD_VERSION + 1
-            )),
-            "{err}"
-        );
-    }
-
-    /// gam#3166: 996d0af2c1 replaced the Newton-polish record's `step_budget` with
-    /// `settled` without a version bump, so v29 has two shapes.
-    /// - A v29 payload written before that commit carries `step_budget` and no `settled`.
-    ///   It loads with `settled` false.
-    /// - A v29 payload written after it carries `settled` and no `step_budget`. It loads
-    ///   as written.
-    /// - A payload claiming the version after this binary's is refused by the named
-    ///   version error, as a v29 binary refuses a v30 payload.
-    #[test]
-    fn both_v29_polish_record_shapes_load_and_a_later_version_is_refused_by_name_3166() {
-        use gam_solve::model_types::NewtonPolishRecord;
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let polish = NewtonPolishRecord {
-            lambda_sq_before: 1.5e-6,
-            lambda_sq_after: 2.0e-9,
-            decreases: vec![7.0e-7, -3.0e-8],
-            settled: true,
-            rails: Vec::new(),
-            entry: vec![0.3],
-        };
-        let mut fit = saved_fit(blocks());
-        fit.artifacts.criterion_certificate =
-            Some(gam_solve::rho_optimizer::OuterCriterionCertificate {
-                stationarity:
-                    gam_solve::rho_optimizer::OuterStationarityCertificate::AnalyticGradient {
-                        grad_norm: 2e-7,
-                        projected_grad_norm: 2e-7,
-                        bound: 1e-5,
-                        rung: gam_solve::rho_optimizer::CertifiedRung {
-                            label: "newton-decrement".to_string(),
-                            derived_standard: true,
-                        },
-                    },
-                curvature: gam_solve::rho_optimizer::CurvatureEvidence::Measured { psd: true },
-                lambdas_railed: Vec::new(),
-                railed_facts: Vec::new(),
-                newton_polish: Some(polish.clone()),
-                curvature_floor: None,
-            });
-        let written = serde_json::to_value(marginal_slope_payload(
-            POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            fit,
-        ))
-        .expect("serialize a v29 payload");
-        // The record as each v29 writer left it: before 996d0af2c1 it held the step
-        // budget and no settling flag.
-        let as_written = |before_996d: bool| {
-            let mut value = written.clone();
-            let mut records = 0;
-            for materialization in ["fit_result", "unified"] {
-                if let Some(record) = value
-                    .get_mut(materialization)
-                    .and_then(|fit| fit.get_mut("artifacts"))
-                    .and_then(|artifacts| artifacts.get_mut("criterion_certificate"))
-                    .and_then(|certificate| certificate.get_mut("newton_polish"))
-                    .and_then(serde_json::Value::as_object_mut)
-                {
-                    records += 1;
-                    if before_996d {
-                        record
-                            .remove("settled")
-                            .expect("the settling flag was written");
-                        record.insert("step_budget".to_string(), serde_json::json!(2));
-                    }
-                }
-            }
-            assert!(records > 0, "the payload carries the polish record");
-            value
-        };
-        for (before_996d, settled) in [(true, false), (false, true)] {
-            let loaded: FittedModelPayload = serde_json::from_value(as_written(before_996d))
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "a v29 payload (written before 996d0af2c1: {before_996d}) parses: {error}"
-                    )
-                });
-            FittedModel::from_payload(loaded.clone())
-                .payload()
-                .validate_payload_version()
-                .expect("a v29 payload is readable");
-            let record = loaded
-                .fit_result
-                .as_ref()
-                .and_then(|fit| fit.artifacts.criterion_certificate.as_ref())
-                .and_then(|certificate| certificate.newton_polish.as_ref())
-                .expect("the loaded certificate keeps its polish");
-            assert_eq!(
-                record,
-                &NewtonPolishRecord {
-                    settled,
-                    ..polish.clone()
-                },
-                "written before 996d0af2c1: {before_996d}"
-            );
-        }
-
-        let newer = MODEL_PAYLOAD_VERSION + 1;
-        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
-            .payload()
-            .validate_payload_version()
-            .expect_err("a payload from a later schema is refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("payload schema mismatch")
-                && message.contains(&format!("file has version={newer}"))
-                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-            "a later payload must be refused by its version: {message}"
-        );
-    }
-
-    /// gam#2926: a v22 payload, written before `latent_law_consumed` existed, is read
-    /// by this binary and records no latent law; a current payload with no record
-    /// round-trips; and a payload claiming a schema above this binary's is refused by
-    /// its version, not by a field it cannot parse.
-    #[test]
-    fn a_payload_before_the_latent_law_record_is_read_and_a_newer_one_is_refused_2926() {
-        let blocks = || {
-            vec![FittedBlock {
-                beta: array![0.1],
-                role: BlockRole::Mean,
-                edf: 1.0,
-                lambdas: Array1::zeros(0),
-            }]
-        };
-        let payload =
-            marginal_slope_payload(LATENT_LAW_RECORD_ABSENT_PAYLOAD_VERSION, saved_fit(blocks()));
-        let mut value = serde_json::to_value(&payload).expect("serialize a v22 payload");
-        value
-            .as_object_mut()
-            .expect("a payload is a JSON object")
-            .remove("latent_law_consumed")
-            .expect("the record is written, as null when there is none");
-        let older: FittedModelPayload =
-            serde_json::from_value(value).expect("a v22 payload without the record deserializes");
-        assert!(older.latent_law_consumed.is_none());
-        FittedModel::from_payload(older)
-            .payload()
-            .validate_payload_version()
-            .expect("a v22 payload is readable");
-
-        let current = marginal_slope_payload(MODEL_PAYLOAD_VERSION, saved_fit(blocks()));
-        assert!(current.latent_law_consumed.is_none());
-        let text = serde_json::to_string(&current).expect("serialize a current payload");
-        let reloaded: FittedModelPayload =
-            serde_json::from_str(&text).expect("a current payload round-trips");
-        assert!(reloaded.latent_law_consumed.is_none());
-        FittedModel::from_payload(reloaded)
-            .payload()
-            .validate_payload_version()
-            .expect("a current payload is readable");
-
-        let newer = MODEL_PAYLOAD_VERSION + 1;
-        let err = FittedModel::from_payload(marginal_slope_payload(newer, saved_fit(blocks())))
-            .payload()
-            .validate_payload_version()
-            .expect_err("a payload from a newer schema is refused");
-        let message = err.to_string();
-        assert!(
-            message.contains("payload schema mismatch")
-                && message.contains(&format!("file has version={newer}"))
-                && message.contains(&format!("MODEL_PAYLOAD_VERSION={MODEL_PAYLOAD_VERSION}")),
-            "a newer payload must be refused by its version: {message}"
-        );
     }
 
     /// #2902 row 34: at payload version 17 a binomial beta-logistic link's

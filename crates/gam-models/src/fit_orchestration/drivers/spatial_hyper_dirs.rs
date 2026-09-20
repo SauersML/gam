@@ -108,9 +108,8 @@ fn try_build_spatial_term_log_kappa_derivative(
             // gradient (#1122). `double_penalty: false` reproduces the operator
             // triplet exactly (verified: the 2-D iso-κ FD matches to ~1e-9).
             // The jet is built in the FITTED coefficient chart. The incremental
-            // realizer hands this builder a spec whose identifiability has been
-            // put back into the TERM-LOCAL chart `z_local`
-            // (`restore_local_identifiability_chart`, gam#2760) so that a design
+            // realizer hands this builder a spec whose identifiability the freeze
+            // wrote in the TERM-LOCAL chart `z_local` (gam#2760, #3001) so that a design
             // REBUILD can apply the collection gauge's fixed `T0` itself; the
             // design the criterion is built on lives in the composition
             // `z_local · T0` the realized term's metadata records. Built on
