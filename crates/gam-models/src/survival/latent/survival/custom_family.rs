@@ -46,6 +46,27 @@ impl crate::custom_family::JeffreysThirdInformationDerivative for LatentSurvival
         )
         .map(Some)
     }
+
+    /// The rows `vec(sym(Uᵀ D³H[u, v, e_a] U))` from each row's fifth-order primary lifts,
+    /// without the `p` dense axis matrices (#2992).
+    fn third_directional_rotated_all_axes(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_beta_v_flat: &Array1<f64>,
+        basis: ndarray::ArrayView2<'_, f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "third_directional_rotated_all_axes: {} parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        self.third_directional_rotated_axis_rows(block_states, d_beta_u_flat, d_beta_v_flat, basis)
+            .map(Some)
+    }
 }
 
 impl CustomFamily for LatentSurvivalFamily {
@@ -59,6 +80,39 @@ impl CustomFamily for LatentSurvivalFamily {
         &self,
     ) -> Option<&dyn crate::custom_family::JeffreysThirdInformationDerivative> {
         Some(self)
+    }
+
+    /// The latent-survival Jeffreys term, its drift base and its gate read the first
+    /// information derivative as rotated rows formed in one row pass (#2992).
+    fn jeffreys_rotated_first_derivative(
+        &self,
+    ) -> Option<&dyn crate::custom_family::JeffreysRotatedFirstDerivative> {
+        Some(self)
+    }
+
+    /// Every direction's rotated second information rows from one row pass that builds each row
+    /// once, in place of the trait default's `p` row passes per direction (#2992).
+    fn joint_jeffreys_information_second_directional_rotated_all_axes_each_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        directions: &[Array1<f64>],
+        basis: ndarray::ArrayView2<'_, f64>,
+        consume: &mut dyn FnMut(usize, Array2<f64>) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if specs.len() != block_states.len() {
+            return Err(format!(
+                "joint_jeffreys_information_second_directional_rotated_all_axes_each_with_specs: {} \
+                 parameter-block specs for {} block states",
+                specs.len(),
+                block_states.len()
+            ));
+        }
+        let all_rows = self.second_directional_rotated_axis_rows_each(block_states, directions, basis)?;
+        for (index, rows) in all_rows.into_iter().enumerate() {
+            consume(index, rows)?;
+        }
+        Ok(true)
     }
 
     fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
