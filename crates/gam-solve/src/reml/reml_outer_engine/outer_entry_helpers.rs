@@ -1373,6 +1373,11 @@ impl HessianFactorization for TangentProjectedHessianOperator {
     fn logdet(&self) -> f64 {
         self.h_t_op.logdet()
     }
+    /// `logdet` is `log|ZᵀHZ|` read off the tangent factor, so its forward error
+    /// is that factor's (#3321).
+    fn logdet_forward_error(&self) -> Option<f64> {
+        self.h_t_op.logdet_forward_error()
+    }
     fn solve(&self, rhs: &Array1<f64>) -> Array1<f64> {
         let r_t = self.z.t().dot(rhs);
         let q_t = self.h_t_op.solve(&r_t);

@@ -293,11 +293,20 @@ pub(crate) fn sample_resolution(
     cost: f64,
     evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
 ) -> f64 {
-    super::decrement_bands::outer_objective_band(config, cost, evidence)
-        .ok()
-        .map(|band| band.total())
-        .filter(|band| band.is_finite())
-        .unwrap_or(tau)
+    match super::decrement_bands::outer_objective_band(config, cost, evidence) {
+        Ok(band) if band.total().is_finite() => band.total(),
+        Ok(band) => {
+            log::debug!(
+                "[outer resolution] objective band {:.3e} is not finite; resolution is tau={tau:.3e}",
+                band.total()
+            );
+            tau
+        }
+        Err(reason) => {
+            log::debug!("[outer resolution] no objective band ({reason}); resolution is tau={tau:.3e}");
+            tau
+        }
+    }
 }
 
 pub(crate) struct StallSample<'a> {
