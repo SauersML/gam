@@ -1595,7 +1595,6 @@ pub fn saved_model_report_input(
             .inner_status()
             .label()
             .to_string(),
-        converged: true,
         outer_gradient_norm: fit.outer_gradient_norm,
         criterion_certificate,
         smoothing_forensics,
@@ -1695,7 +1694,6 @@ fn spline_scan_report_input(
         raw_reml_score: Some(-scan.restricted_loglik),
         iterations: 0,
         convergence_status: "exact (state-space spline scan)".to_string(),
-        converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
@@ -1800,7 +1798,6 @@ fn residual_cascade_report_input(
         raw_reml_score: Some(-fit.restricted_loglik),
         iterations: 0,
         convergence_status: "exact (multiresolution residual cascade)".to_string(),
-        converged: true,
         outer_gradient_norm: None,
         criterion_certificate: None,
         smoothing_forensics: Vec::new(),
