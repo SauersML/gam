@@ -1501,6 +1501,14 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         &self,
         ctx: &BlockUpdateContext<'_>,
     ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        self.solve_for_rhs(ctx, self.newton_rhs(ctx)?)
+            .map(|(_, step)| step)
+    }
+}
+
+impl ExactNewtonBlockUpdater<'_> {
+    /// The Newton update's right-hand side `gradient − S_λβ`.
+    fn newton_rhs(&self, ctx: &BlockUpdateContext<'_>) -> Result<Array1<f64>, CustomFamilyError> {
         let p = ctx.spec.design.ncols();
         if self.gradient.len() != p {
             return Err(CustomFamilyError::DimensionMismatch {
@@ -1514,12 +1522,9 @@ impl ParameterBlockUpdater for ExactNewtonBlockUpdater<'_> {
         // Solve in delta-space for both constrained and unconstrained blocks.
         // That keeps the linear system consistent even when we add a
         // numerical ridge to stabilize an indefinite exact-Newton Hessian.
-        let rhs_step = self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta);
-        self.step_for_rhs(ctx, rhs_step)
+        Ok(self.gradient - &ctx.s_lambda.dot(&ctx.states[ctx.block_idx].beta))
     }
-}
 
-impl ExactNewtonBlockUpdater<'_> {
     /// The block step `δ` for the right-hand side `rhs_step`: `(H + S_λ) δ = rhs_step` on the
     /// stabilized penalized curvature and under the block's linear constraints, returned as
     /// `β + δ`. The Newton update takes it with `rhs_step = gradient − S_λβ`; a branch
@@ -1530,8 +1535,68 @@ impl ExactNewtonBlockUpdater<'_> {
         ctx: &BlockUpdateContext<'_>,
         rhs_step: Array1<f64>,
     ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        self.solve_for_rhs(ctx, rhs_step).map(|(_, step)| step)
+    }
+
+    /// The one exact-Newton block step routine: the stabilized curvature and the step on it for
+    /// `rhs_step`. Every block step comes from here, and the curvature is returned for a caller
+    /// that also sizes the step's resolution on it.
+    fn solve_for_rhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_step: Array1<f64>,
+    ) -> Result<(Array2<f64>, BlockUpdateResult), CustomFamilyError> {
+        let lhs_dense = self.stabilized_penalized_lhs(ctx, rhs_step.len())?;
+        let step = self.step_on_lhs(ctx, &lhs_dense, rhs_step)?;
+        Ok((lhs_dense, step))
+    }
+
+    /// The Newton update step at `ctx` ([`ParameterBlockUpdater::compute_update_step`], through
+    /// the same routine) beside its arithmetic resolution (gam#2973), for the right-hand side
+    /// `gradient − S_λβ` known to within `rhs_band` per coordinate.
+    ///
+    /// The resolution is the largest Euclidean norm the step can take from that rounding alone:
+    /// the solve's image of the band on the face the step ends on
+    /// ([`newton_step_rounding_image`]), plus the rounding of forming `β + δ`. A step within it
+    /// is zero on this arithmetic, so the iterate it starts from is at its root. The band is the
+    /// caller's; the rounding of the curvature, of the solve and of forming `S_λ` from its terms
+    /// is not charged, so the resolution can only be too narrow, never resolve a correction the
+    /// arithmetic cannot.
+    pub(crate) fn update_step_with_resolution(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_band: &Array1<f64>,
+    ) -> Result<(BlockUpdateResult, f64), CustomFamilyError> {
+        let (lhs_dense, step) = self.solve_for_rhs(ctx, self.newton_rhs(ctx)?)?;
+        let face = match (ctx.linear_constraints, step.active_set.as_deref()) {
+            (Some(constraints), Some(active)) => {
+                let rows = constraints.gather_rows(active)?;
+                match active_constraint_tangent_geometry(&rows.a)? {
+                    ActiveConstraintTangentGeometry::Tangent(z) => NewtonStepFace::Tangent(z),
+                    ActiveConstraintTangentGeometry::FullyPinned => NewtonStepFace::Pinned,
+                }
+            }
+            _ => NewtonStepFace::Free,
+        };
+        let solve = newton_step_rounding_image(&lhs_dense, &face, rhs_band)?;
+        let landing = gam_linalg::roundoff::UNIT_ROUNDOFF
+            * step
+                .beta_new_raw
+                .iter()
+                .map(|value| value * value)
+                .sum::<f64>()
+                .sqrt();
+        Ok((step, solve + landing))
+    }
+
+    /// `H + S_λ` stabilized as every exact-Newton block step solves on it.
+    fn stabilized_penalized_lhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        rhs_len: usize,
+    ) -> Result<Array2<f64>, CustomFamilyError> {
         let p = ctx.spec.design.ncols();
-        if self.hessian.nrows() != p || self.hessian.ncols() != p || rhs_step.len() != p {
+        if self.hessian.nrows() != p || self.hessian.ncols() != p || rhs_len != p {
             return Err(CustomFamilyError::DimensionMismatch {
                 reason: format!(
                     "block {} exact-newton step shape mismatch: Hessian {}x{} and right-hand \
@@ -1539,7 +1604,7 @@ impl ExactNewtonBlockUpdater<'_> {
                     ctx.block_idx,
                     self.hessian.nrows(),
                     self.hessian.ncols(),
-                    rhs_step.len(),
+                    rhs_len,
                 ),
             });
         }
@@ -1570,7 +1635,17 @@ impl ExactNewtonBlockUpdater<'_> {
             &data_hessian_dense,
             ctx.options.ridge_floor,
         );
+        Ok(lhs_dense)
+    }
 
+    /// The block step for `rhs_step` on the stabilized curvature `lhs_dense`.
+    fn step_on_lhs(
+        &self,
+        ctx: &BlockUpdateContext<'_>,
+        lhs_dense: &Array2<f64>,
+        rhs_step: Array1<f64>,
+    ) -> Result<BlockUpdateResult, CustomFamilyError> {
+        let p = ctx.spec.design.ncols();
         if let Some(constraints) = ctx.linear_constraints {
             check_linear_feasibility(&ctx.states[ctx.block_idx].beta, constraints).map_err(
                 |e| {
@@ -1587,9 +1662,9 @@ impl ExactNewtonBlockUpdater<'_> {
                 )
             })?;
             let (beta_new_raw, active_set) = if let Some(bounds) = lower_bounds.as_ref() {
-                let rhs_beta = &lhs_dense.dot(&ctx.states[ctx.block_idx].beta) + &rhs_step;
+                let rhs_beta = lhs_dense.dot(&ctx.states[ctx.block_idx].beta) + &rhs_step;
                 solve_quadratic_with_simple_lower_bounds(
-                    &lhs_dense,
+                    lhs_dense,
                     &rhs_beta,
                     &ctx.states[ctx.block_idx].beta,
                     bounds,
@@ -1607,7 +1682,7 @@ impl ExactNewtonBlockUpdater<'_> {
                 let delta_start = Array1::zeros(p);
                 let (delta, active_set) =
                     gam_solve::active_set::solve_quadratic_with_constraint_set(
-                        &lhs_dense,
+                        lhs_dense,
                         &rhs_step,
                         &delta_start,
                         &delta_constraints,
@@ -1657,7 +1732,7 @@ impl ExactNewtonBlockUpdater<'_> {
             // the failure is returned, not traded for a diagonally scaled
             // steepest-descent step. β is recovered in the raw basis, so
             // dimensionality and identifiability are untouched.
-            let delta = strict_solve_spd_or_spectral_step(&lhs_dense, &rhs_step)?;
+            let delta = strict_solve_spd_or_spectral_step(lhs_dense, &rhs_step)?;
             let beta = &ctx.states[ctx.block_idx].beta + &delta;
             Ok(BlockUpdateResult {
                 beta_new_raw: beta,
@@ -1665,6 +1740,74 @@ impl ExactNewtonBlockUpdater<'_> {
             })
         }
     }
+}
+
+/// The face an exact-Newton block step ends on, which its right-hand side's rounding moves it
+/// along.
+enum NewtonStepFace {
+    /// No active constraint: every coordinate is free.
+    Free,
+    /// The orthonormal tangent `Z` of the active constraint rows.
+    Tangent(Array2<f64>),
+    /// The active rows pin every coordinate, so the step does not depend on the right-hand side.
+    Pinned,
+}
+
+/// The largest Euclidean norm the step on `face`, `Z (ZᵀAZ)⁻¹ Zᵀ e` with `A = lhs`, reaches over
+/// right-hand-side errors `|e_i| ≤ band_i` (gam#2973).
+///
+/// With `ZᵀAZ = VΓVᵀ` and `W = ZV` (`Z = I` on a free block), each coordinate of the image is
+/// `|Σ_k w_jk (Σ_i w_ik e_i) / γ_k| ≤ Σ_k |w_jk| (Σ_i |w_ik| band_i) / |γ_k|`, a componentwise bound
+/// that holds for every sign pattern of `e`. An exactly singular face system resolves no step, so
+/// its image is unbounded.
+fn newton_step_rounding_image(
+    lhs: &Array2<f64>,
+    face: &NewtonStepFace,
+    band: &Array1<f64>,
+) -> Result<f64, CustomFamilyError> {
+    if band.len() != lhs.nrows() {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "exact-Newton step resolution: right-hand-side band has {} coordinates for a \
+                 {}-coefficient block",
+                band.len(),
+                lhs.nrows()
+            ),
+        });
+    }
+    let mut reduced = match face {
+        NewtonStepFace::Pinned => return Ok(0.0),
+        NewtonStepFace::Free => lhs.clone(),
+        NewtonStepFace::Tangent(z) => z.t().dot(lhs).dot(z),
+    };
+    symmetrize_dense_in_place(&mut reduced);
+    let (eigenvalues, eigenvectors) = FaerEigh::eigh(&reduced, Side::Lower).map_err(|error| {
+        CustomFamilyError::NumericalFailure {
+            reason: format!("exact-Newton step resolution: eigendecomposition failed: {error}"),
+        }
+    })?;
+    if eigenvalues.iter().any(|&gamma| gamma == 0.0) {
+        return Ok(f64::INFINITY);
+    }
+    let w = match face {
+        NewtonStepFace::Tangent(z) => z.dot(&eigenvectors),
+        NewtonStepFace::Free | NewtonStepFace::Pinned => eigenvectors,
+    };
+    let modes: Vec<f64> = (0..w.ncols())
+        .map(|k| {
+            (0..w.nrows())
+                .map(|i| w[[i, k]].abs() * band[i])
+                .sum::<f64>()
+                / eigenvalues[k].abs()
+        })
+        .collect();
+    Ok((0..w.nrows())
+        .map(|j| {
+            let coordinate: f64 = (0..w.ncols()).map(|k| w[[j, k]].abs() * modes[k]).sum();
+            coordinate * coordinate
+        })
+        .sum::<f64>()
+        .sqrt())
 }
 
 /// Extension trait providing `updater()` on the relocated `gam_problem::BlockWorkingSet`.
