@@ -3302,6 +3302,116 @@ fn collect_by_variable_numeric_axes(
     }
 }
 
+/// Recursively collect the periodic feature columns of a smooth basis — sphere
+/// longitude, a periodic 1D B-spline axis, periodic tensor-B-spline margins —
+/// so they can be exempted from the predict-time axis clip (see
+/// [`FittedModel::training_periodic_axes`]). Wrapper bases (`by=`,
+/// sum-to-zero) delegate to the inner smooth they modulate / replicate: the
+/// wrapper changes how the inner design is gated or scaled, never the
+/// coordinate the inner basis is evaluated at, so a periodic axis stays
+/// periodic when wrapped. Returned indices reference the training headers.
+fn collect_periodic_axes(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashSet<usize>,
+) {
+    use gam_terms::basis::BSplineKnotSpec;
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        // Sphere terms: longitude (second feature col) is always periodic and
+        // exempt from clipping. Latitude is not periodic but is a
+        // closed-manifold coordinate, so it is clipped to the manifold's
+        // intrinsic bounds rather than the sampled range — see
+        // `collect_sphere_latitude_bounds`.
+        SmoothBasisSpec::Sphere { feature_cols, .. } => {
+            if let Some(&lon_col) = feature_cols.get(1)
+                && lon_col < n_training_headers
+            {
+                out.insert(lon_col);
+            }
+        }
+        // 1D periodic B-spline: the single feature column is periodic.
+        SmoothBasisSpec::BSpline1D { feature_col, spec } => {
+            if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                && *feature_col < n_training_headers
+            {
+                out.insert(*feature_col);
+            }
+        }
+        // Tensor B-spline: each axis whose marginal knotspec is
+        // PeriodicUniform is periodic; mark those columns.
+        SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
+            for (i, marginal) in spec.marginalspecs.iter().enumerate() {
+                if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
+                    && let Some(&col) = feature_cols.get(i)
+                    && col < n_training_headers
+                {
+                    out.insert(col);
+                }
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_periodic_axes(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_periodic_axes(smooth, n_training_headers, out)
+        }
+        // Leaf bases with no wrap-around coordinate. Enumerated rather than
+        // wildcarded so a newly added periodic basis breaks this match instead
+        // of silently having its axis clipped.
+        SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
+    }
+}
+
+/// Recursively collect the manifold-intrinsic clip bounds of every sphere
+/// latitude column in a smooth basis (see
+/// [`FittedModel::training_sphere_latitude_bounds`]), descending through
+/// `by=` / sum-to-zero wrappers exactly as [`collect_periodic_axes`] does.
+fn collect_sphere_latitude_bounds(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    n_training_headers: usize,
+    out: &mut std::collections::HashMap<usize, (f64, f64)>,
+) {
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        SmoothBasisSpec::Sphere { feature_cols, spec } => {
+            if let Some(&lat_col) = feature_cols.first()
+                && lat_col < n_training_headers
+            {
+                let bound = if spec.radians {
+                    std::f64::consts::FRAC_PI_2
+                } else {
+                    90.0
+                };
+                out.insert(lat_col, (-bound, bound));
+            }
+        }
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => {
+            collect_sphere_latitude_bounds(inner, n_training_headers, out)
+        }
+        SmoothBasisSpec::BySmooth { smooth, .. } => {
+            collect_sphere_latitude_bounds(smooth, n_training_headers, out)
+        }
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::TensorBSpline { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. } => {}
+    }
+}
+
 impl FittedModel {
     /// Axis-clip each continuous new-data column to the (min, max) range
     /// observed in training. Categorical and binary columns are left
@@ -3440,71 +3550,20 @@ impl FittedModel {
     /// Collect the set of training-column indices that are periodic axes —
     /// i.e. features for which a periodic basis (sphere longitude, periodic
     /// B-spline 1D, periodic tensor margin) must be allowed to take any
-    /// real value at predict time and not be clamped to the training range.
-    /// Returned indices reference `self.training_headers` (training-time
-    /// layout), matching the iteration in `axis_clip_to_training_ranges`.
+    /// real value at predict time and not be clamped to the training range —
+    /// on *any* modelled surface (mean, noise/scale, slope), including a
+    /// periodic basis nested inside a `by=` / sum-to-zero wrapper (see
+    /// [`collect_periodic_axes`]). Returned indices reference
+    /// `self.training_headers` (training-time layout), matching the iteration
+    /// in `axis_clip_to_training_ranges`.
     fn training_periodic_axes(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashSet<usize> {
-        use gam_terms::basis::BSplineKnotSpec;
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashSet<usize> = std::collections::HashSet::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            match &term.basis {
-                // Sphere terms: longitude (second feature col) is always
-                // periodic and exempt from clipping. Latitude is not periodic
-                // but is a closed-manifold coordinate, so it is clipped to the
-                // manifold's intrinsic bounds rather than the sampled range —
-                // see `training_sphere_latitude_bounds`.
-                SmoothBasisSpec::Sphere { feature_cols, .. } => {
-                    if let Some(&lon_col) = feature_cols.get(1)
-                        && lon_col < training_headers.len()
-                    {
-                        out.insert(lon_col);
-                    }
-                }
-                // 1D periodic B-spline: the single feature column is periodic.
-                SmoothBasisSpec::BSpline1D { feature_col, spec } => {
-                    if matches!(spec.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                        && *feature_col < training_headers.len()
-                    {
-                        out.insert(*feature_col);
-                    }
-                }
-                // Tensor B-spline: each axis whose marginal knotspec is
-                // PeriodicUniform is periodic; mark those columns.
-                SmoothBasisSpec::TensorBSpline { feature_cols, spec } => {
-                    for (i, marginal) in spec.marginalspecs.iter().enumerate() {
-                        if matches!(marginal.knotspec, BSplineKnotSpec::PeriodicUniform { .. })
-                            && let Some(&col) = feature_cols.get(i)
-                            && col < training_headers.len()
-                        {
-                            out.insert(col);
-                        }
-                    }
-                }
-                // No periodic axis is exempted for these. The leaf bases have
-                // no wrap-around coordinate at all; the three wrappers
-                // (`ByVariable`, `BySmooth`, `FactorSumToZero`) are matched at
-                // top level only and are deliberately not descended into here,
-                // so a periodic marginal nested inside one stays subject to the
-                // training-range clip. Enumerated rather than wildcarded so a
-                // newly added periodic basis breaks this match instead of
-                // silently having its axis clipped.
-                SmoothBasisSpec::ByVariable { .. }
-                | SmoothBasisSpec::BySmooth { .. }
-                | SmoothBasisSpec::FactorSumToZero { .. }
-                | SmoothBasisSpec::FactorSmooth { .. }
-                | SmoothBasisSpec::ThinPlate { .. }
-                | SmoothBasisSpec::ConstantCurvature { .. }
-                | SmoothBasisSpec::Matern { .. }
-                | SmoothBasisSpec::MeasureJet { .. }
-                | SmoothBasisSpec::Duchon { .. }
-                | SmoothBasisSpec::Pca { .. } => {}
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_periodic_axes(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -3635,30 +3694,20 @@ impl FittedModel {
     /// (single-valued in longitude) while still mapping any out-of-domain
     /// latitude onto the manifold boundary. Longitude needs no entry here: it
     /// is periodic and already exempted from clipping entirely
-    /// (`training_periodic_axes`). Returned indices reference
-    /// `self.training_headers`, matching the iteration in
-    /// `axis_clip_to_training_ranges`.
+    /// (`training_periodic_axes`). Like the periodic set, this covers a sphere
+    /// on *any* modelled surface (mean, noise/scale, slope) and a sphere nested
+    /// inside a `by=` / sum-to-zero wrapper (see [`collect_sphere_latitude_bounds`]).
+    /// Returned indices reference `self.training_headers`, matching the
+    /// iteration in `axis_clip_to_training_ranges`.
     fn training_sphere_latitude_bounds(
         &self,
         training_headers: &[String],
     ) -> std::collections::HashMap<usize, (f64, f64)> {
-        use gam_terms::smooth::SmoothBasisSpec;
         let mut out: std::collections::HashMap<usize, (f64, f64)> =
             std::collections::HashMap::new();
-        let Some(spec) = self.resolved_termspec.as_ref() else {
-            return out;
-        };
-        for term in &spec.smooth_terms {
-            if let SmoothBasisSpec::Sphere { feature_cols, spec } = &term.basis
-                && let Some(&lat_col) = feature_cols.first()
-                && lat_col < training_headers.len()
-            {
-                let bound = if spec.radians {
-                    std::f64::consts::FRAC_PI_2
-                } else {
-                    90.0
-                };
-                out.insert(lat_col, (-bound, bound));
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_sphere_latitude_bounds(&term.basis, training_headers.len(), &mut out);
             }
         }
         out
@@ -7550,6 +7599,88 @@ mod tests {
             None,
             "numeric group labels must reach RandomEffectOperator as unseen levels, not be clipped to boundary seen levels"
         );
+    }
+
+    /// A `sphere(lat, lon)` smooth must get the same predict-time axis
+    /// treatment wherever it sits: on the mean surface, on the noise/scale
+    /// surface, or wrapped in a numeric `by=`. Longitude is periodic and is
+    /// never clipped; latitude is clipped to the manifold bounds `[-90, 90]`,
+    /// not to the sampled latitude range. The periodic and latitude collectors
+    /// used to read only the bare mean-surface smooths, so a noise-surface or
+    /// `by=`-wrapped sphere had both axes clamped to the training box.
+    #[test]
+    fn axis_clip_treats_noise_and_by_wrapped_sphere_like_a_mean_sphere() {
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{ByVarKind, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec};
+        let sphere = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 1],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let single_smooth = |basis: SmoothBasisSpec| TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                frozen_parametric_residualization: None,
+                name: "sphere(lat, lon)".to_string(),
+                basis,
+                shape: ShapeConstraint::None.into(),
+                joint_null_rotation: None,
+            }],
+            level: Default::default(),
+        };
+        let headers = ["lat", "lon", "z"];
+        let data = array![[85.0, 170.0, 0.5], [-95.0, -175.0, -0.5], [20.0, 10.0, 0.0]];
+        let col_map: HashMap<String, usize> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_string(), i))
+            .collect();
+        let mut base = standard_gaussian_payload();
+        base.data_schema = Some(DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                })
+                .collect(),
+        });
+        base.set_training_feature_metadata(
+            headers.iter().map(|name| name.to_string()).collect(),
+            vec![(-10.0, 40.0), (-20.0, 60.0), (-1.0, 1.0)],
+        );
+        base.resolved_termspec = Some(empty_termspec());
+
+        let mut mean_surface = base.clone();
+        mean_surface.resolved_termspec = Some(single_smooth(sphere.clone()));
+        let mut noise_surface = base.clone();
+        noise_surface.resolved_termspec_noise = Some(single_smooth(sphere.clone()));
+        let mut by_wrapped = base;
+        by_wrapped.resolved_termspec = Some(single_smooth(SmoothBasisSpec::BySmooth {
+            smooth: Box::new(sphere),
+            by_kind: ByVarKind::Numeric { feature_col: 2 },
+        }));
+
+        for (label, payload) in [
+            ("mean-surface sphere", mean_surface),
+            ("noise-surface sphere", noise_surface),
+            ("by=-wrapped sphere", by_wrapped),
+        ] {
+            let clipped = FittedModel::from_payload(payload)
+                .axis_clip_to_training_ranges(data.view(), &col_map)
+                .unwrap_or_else(|| panic!("{label}: the -95 latitude must clip to the pole"));
+            assert_eq!(
+                clipped.column(0).to_vec(),
+                vec![85.0, -90.0, 20.0],
+                "{label}: latitude must clip to [-90, 90], not the sampled [-10, 40]"
+            );
+            assert_eq!(
+                clipped.column(1).to_vec(),
+                vec![170.0, -175.0, 10.0],
+                "{label}: periodic longitude must never be clipped"
+            );
+        }
     }
 
     /// #2102/#2137: a FIXED categorical factor — a bare `y ~ g` or an explicit
