@@ -3710,7 +3710,7 @@ impl<'a> RemlState<'a> {
         if reml_is_gaussian_identity(&self.config.likelihood) {
             return Ok(self.weights.to_owned());
         }
-        let pilot = self.execute_pirls_if_needed(rho)?;
+        let (pilot, _) = self.execute_pirls_if_needed(rho, BundleRows::Observed)?;
         if pilot.solveweights.len() != self.weights.len() {
             return Err(EstimationError::InvalidInput(format!(
                 "P-IRLS returned {} working weights for {} rows",
@@ -9280,6 +9280,7 @@ mod firth_hessian_direction_reuse_tests {
 
 #[cfg(test)]
 mod capped_request_cache_tests {
+    use super::BundleRows;
     use super::super::super::RemlConfig;
     use super::super::super::tests::{binomial_logit_glm_spec, build_logit_state};
     use ndarray::{Array1, array};
@@ -9312,16 +9313,18 @@ mod capped_request_cache_tests {
             .compute_outer_eval_with_order(&rho, crate::rho_optimizer::OuterEvalOrder::Value)
             .expect("uncapped value probe should succeed");
         let uncapped = state
-            .execute_pirls_if_needed(&rho)
-            .expect("uncapped mode is cached");
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("uncapped mode is cached")
+            .0;
 
         // A fresh solve records its iteration count; a cache answer does not.
         let untouched = usize::MAX;
         state.last_inner_iters.store(untouched, Ordering::Relaxed);
         state.outer_inner_cap.store(5, Ordering::Relaxed);
         let capped = state
-            .execute_pirls_if_needed(&rho)
-            .expect("capped request should succeed");
+            .execute_pirls_if_needed(&rho, BundleRows::Observed)
+            .expect("capped request should succeed")
+            .0;
 
         assert_eq!(
             state.last_inner_iters.load(Ordering::Relaxed),
@@ -9334,12 +9337,12 @@ mod capped_request_cache_tests {
         // answers an uncapped request.
         let rho_capped_only = array![0.5];
         state
-            .execute_pirls_if_needed(&rho_capped_only)
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
             .expect("capped solve should succeed");
         state.outer_inner_cap.store(0, Ordering::Relaxed);
         state.last_inner_iters.store(untouched, Ordering::Relaxed);
         state
-            .execute_pirls_if_needed(&rho_capped_only)
+            .execute_pirls_if_needed(&rho_capped_only, BundleRows::Observed)
             .expect("uncapped solve should succeed");
         assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
