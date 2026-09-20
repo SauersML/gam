@@ -59,7 +59,10 @@
 //! Both tests are exact sign statements about quadratics in the chart variable
 //! (monotonicity of `γ`, `δ`, `L` in `ρ`), decided with their rounding band.
 //! On the same cell every rank comparison `e_i ≥ e_*` is enclosed over the tube
-//! (a centered form in `δ`), so the cell is a member, a non-member, or
+//! (a centered form in `δ`), and the cell is a member when at least
+//! `⌊α(n+1) − U⌋ + 1` rows dominate: Layer 1's smoothed p-value with its
+//! tie-break uniform `U`, a tie (a null event for a continuous response)
+//! counted as dominating. So the cell is a member, a non-member, or
 //! undecided. A box whose own `ρ`-width keeps it undecided is bisected in `ρ`;
 //! an undecided cell is bisected in `z`. Three undecided states are final and
 //! the cell is kept, so the returned set is a superset of the honest set, equal
@@ -97,9 +100,9 @@ use ndarray::{Array1, Array2};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 
 use super::{
-    ConformalInterval, ExactGaussianFullConformal, FullConformalSet, required_dominating_count,
-    response_solve_growth, solve_lower_triangular, solve_lower_triangular_transposed,
-    validate_inputs,
+    ConformalInterval, ExactGaussianFullConformal, FullConformalSet, conformal_tie_uniform,
+    required_dominating_count, response_solve_growth, solve_lower_triangular,
+    solve_lower_triangular_transposed, validate_inputs,
 };
 
 /// Why a row's set is the frozen-ρ set rather than the honest one.
@@ -566,8 +569,8 @@ impl Basis {
     }
 
     /// The frozen (`ρ = 0`) Layer-1 engine in this basis — no second
-    /// factorization.
-    fn frozen_engine(&self) -> ExactGaussianFullConformal {
+    /// factorization — drawing ties with the test row's `tie_uniform`.
+    fn frozen_engine(&self, tie_uniform: f64) -> ExactGaussianFullConformal {
         let n = self.n;
         let delta: Vec<f64> = self.shrinkage(0.0).iter().map(|&(_, d)| d).collect();
         let mut u = Array1::<f64>::zeros(n + 1);
@@ -583,7 +586,12 @@ impl Basis {
             u[i] = value[0];
             w[i] = value[1];
         }
-        ExactGaussianFullConformal { u, w, n }
+        ExactGaussianFullConformal {
+            u,
+            w,
+            n,
+            tie_uniform,
+        }
     }
 }
 
@@ -1503,12 +1511,13 @@ pub fn honest_full_conformal(
             ));
         }
     };
-    let frozen = basis.frozen_engine();
+    let tie_uniform = conformal_tie_uniform(y, x_star, 0.0);
+    let frozen = basis.frozen_engine(tie_uniform);
     if basis.ln_s.is_empty() {
         return Ok(frozen_answer(frozen, ConformalCertificate::ExactFrozen, cost));
     }
     let n = basis.n;
-    let required = required_dominating_count(n, alpha);
+    let required = required_dominating_count(n, alpha, frozen.tie_uniform());
     let plug_in_mean = frozen.plug_in_mean();
     let honest = |intervals: Vec<ConformalInterval>, cost: HonestConformalCost| HonestFullConformal {
         set: FullConformalSet {

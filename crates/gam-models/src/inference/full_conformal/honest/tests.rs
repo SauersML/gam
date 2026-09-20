@@ -134,8 +134,9 @@ fn brute_force_rho(response: &GaussianRemlRhoResponse<'_>, z: Option<f64>) -> f6
 }
 
 /// Brute-force membership of `z` in the honest set: the global REML minimizer
-/// over the augmented domain, then the explicit augmented fit and its residual
-/// rank.
+/// over the augmented domain, then the explicit augmented fit and its smoothed
+/// residual rank `#{e_i > e_*} + U·(1 + #{e_i = e_*}) > α(n + 1)`.
+#[allow(clippy::too_many_arguments)]
 fn oracle_member(
     response: &GaussianRemlRhoResponse<'_>,
     x: &Array2<f64>,
@@ -143,7 +144,8 @@ fn oracle_member(
     s_lambda: &Array2<f64>,
     x_star: &Array1<f64>,
     z: f64,
-    required: usize,
+    alpha: f64,
+    tie_uniform: f64,
 ) -> bool {
     let lambda = brute_force_rho(response, Some(z)).exp();
     let mut normal = x.t().dot(x) + s_lambda * lambda;
@@ -158,13 +160,15 @@ fn oracle_member(
         .expect("augmented normal matrix is SPD")
         .solvevec(&rhs);
     let test_score = (z - x_star.dot(&beta)).abs();
-    let dominating = x
+    let scores: Vec<f64> = x
         .rows()
         .into_iter()
         .zip(y.iter())
-        .filter(|(row, yi)| (*yi - row.dot(&beta)).abs() >= test_score)
-        .count();
-    dominating >= required
+        .map(|(row, yi)| (*yi - row.dot(&beta)).abs())
+        .collect();
+    let greater = scores.iter().filter(|&&e| e > test_score).count();
+    let tied = scores.iter().filter(|&&e| e == test_score).count();
+    greater as f64 + tie_uniform * (1.0 + tied as f64) > alpha * (x.nrows() + 1) as f64
 }
 
 struct OracleReport {
@@ -192,11 +196,11 @@ fn oracle_compare(
         ConformalCertificate::HonestRefit,
         "single-penalty Gaussian row must carry the honest certificate"
     );
-    let frozen = ExactGaussianFullConformal::new(x, y, &unit_weights(n), s_lambda, x_star)
-        .expect("frozen engine")
-        .prediction_set(alpha);
+    let frozen_engine = ExactGaussianFullConformal::new(x, y, &unit_weights(n), s_lambda, x_star)
+        .expect("frozen engine");
+    let tie_uniform = frozen_engine.tie_uniform();
+    let frozen = frozen_engine.prediction_set(alpha);
     let response = GaussianRemlRhoResponse::new(x, y, s_lambda, x_star).expect("response");
-    let required = required_dominating_count(n, alpha);
 
     let center = honest.plug_in_mean;
     let endpoints: Vec<f64> = honest
@@ -222,7 +226,7 @@ fn oracle_compare(
         .into_iter()
         .flat_map(|scale| [center - scale * half_width, center + scale * half_width]);
     for z in grid.chain(tails) {
-        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, required);
+        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, alpha, tie_uniform);
         let near_breakpoint = endpoints.iter().any(|e| (z - e).abs() <= spacing);
         if contains(&honest.set, z) != truth && !near_breakpoint {
             honest_mismatches.push(z);
@@ -420,7 +424,10 @@ fn replicate(scenario: Scenario, n: usize, seed: u64) -> Replicate {
 
 /// Coverage of every row class, `n ∈ {20, 50, 200}`, three misspecified noise
 /// laws, `α ∈ {0.1, 0.05}` from the same replicates: `≥ 1 − α − 2·MCSE`, no row
-/// excluded. Also reports the cost of the honest rows: one factorization each,
+/// excluded. The symmetric maps — the honest refit and the fixed penalty — are
+/// exact with the smoothed p-value, so their coverage is also `≤ 1 − α +
+/// 3·MCSE`; the refused rows freeze a λ̂ that saw `y` but not `y_*`, and only
+/// the lower bound is claimed for them. Also reports the cost of the honest rows: one factorization each,
 /// and the median number of local refits.
 #[test]
 fn full_conformal_coverage_holds_for_every_row_class() {
@@ -463,6 +470,13 @@ fn full_conformal_coverage_holds_for_every_row_class() {
                         1.0 - alpha - 2.0 * mcse
                     ));
                 }
+                let symmetric = label == "honest_refit" || label == "exact_frozen";
+                if symmetric && coverage > 1.0 - alpha + 3.0 * mcse {
+                    failures.push(format!(
+                        "{scenario:?} n={n} α={alpha} {label}: {coverage:.4} > {:.4}",
+                        1.0 - alpha + 3.0 * mcse
+                    ));
+                }
             }
             // Every K = 1 row is honest: none silently fell back.
             for a in 0..ALPHAS.len() {
@@ -481,6 +495,6 @@ fn full_conformal_coverage_holds_for_every_row_class() {
         "honest rows: median extra refits {median}, max {}, one factorization each",
         all_refits.last().copied().unwrap_or(0)
     );
-    assert!(failures.is_empty(), "coverage below 1 − α − 2·MCSE: {failures:#?}");
+    assert!(failures.is_empty(), "coverage outside its band: {failures:#?}");
     assert!(median <= 2, "median extra refits per honest row is {median}");
 }

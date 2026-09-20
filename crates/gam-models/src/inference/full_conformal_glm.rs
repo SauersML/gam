@@ -90,23 +90,22 @@
 //!   mapped by its own certified solve at that `s`, so the set's edges are
 //!   exact boundaries to solver accuracy.
 //!
-//! # Ties in the discrete families
+//! # The smoothed p-value
 //!
-//! The discrete families use the smoothed (randomised) conformal p-value
-//! `π = (#{s_i > s_*} + U·(1 + T))/(n + 1)`, with `T` the training rows tied
-//! with the test point (same covariates, offset and response), so coverage is
-//! exactly `1 − α` rather than conservative. `U` is a uniform seeded from a
-//! hash of the labeled responses and the test row: the same inputs give the
-//! same set in every front end. Gamma scores are continuous and use the plain
-//! p-value `(1 + #{s_i ≥ s_*})/(n + 1)`.
+//! Every family uses the smoothed (randomised) conformal p-value
+//! `π = (#{s_i > s_*} + U·(1 + T))/(n + 1)`, so coverage is exactly `1 − α`
+//! rather than conservative. In the discrete families `T` counts the training
+//! rows tied with the test point (same covariates, offset and response). Gamma
+//! scores are continuous, so `T = 0` off a null set and `π = (#{s_i > s_*} +
+//! U)/(n + 1)`: the self-rank `U` in place of the plain p-value's `1` is what
+//! makes `π` uniform rather than discrete on `{1/(n+1), …, 1}` (#4514). `U` is
+//! [`conformal_tie_uniform`] of the labeled responses and the test row: the
+//! same inputs give the same set in every front end.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use faer::Side;
 use ndarray::{Array1, Array2, Axis};
-use rand::{RngExt, SeedableRng};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_av, fast_xt_diag_x};
 use gam_linalg::utils::{stable_logistic as sigmoid, stable_softplus as softplus};
@@ -116,7 +115,8 @@ use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
     ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL,
-    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
+    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold,
+    conformal_tie_uniform, vec_norm,
 };
 
 /// A non-Gaussian family the certified full-conformal set supports. Each has a
@@ -757,12 +757,7 @@ impl GlmFullConformalSubstrate {
 
     /// The seeded tie-break uniform of one test row.
     fn tie_break_uniform(&self, row: &TestRow<'_>) -> f64 {
-        let mut hasher = DefaultHasher::new();
-        for v in self.y.iter().chain(row.x.iter()) {
-            v.to_bits().hash(&mut hasher);
-        }
-        row.offset.to_bits().hash(&mut hasher);
-        rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
+        conformal_tie_uniform(self.y.iter(), row.x.iter(), row.offset)
     }
 
     /// The discrete set with randomised ties: both Bernoulli levels by their
@@ -1081,11 +1076,13 @@ impl GlmFullConformalSubstrate {
     /// (Gamma) family.
     fn continuous_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
         let whole = self.family.whole_support();
-        if tau < 1.0 {
+        let u_tie = self.tie_break_uniform(row);
+        if tau < u_tie {
             return whole;
         }
-        // r: the fewest dominating training rows that keep a candidate in.
-        let r = (tau - 1.0).floor() + 1.0;
+        // r: the fewest dominating training rows that keep a candidate in,
+        // `r + U > τ`.
+        let r = (tau - u_tie).floor() + 1.0;
         let Some(c) = self.intercept else {
             return whole;
         };
@@ -1148,7 +1145,7 @@ impl GlmFullConformalSubstrate {
             } else {
                 (a.abs().min(b.abs()), a.abs().max(b.abs()))
             };
-            let included = match self.verdict(&node, e, t_lo, t_hi, 1.0, tau, None) {
+            let included = match self.verdict(&node, e, t_lo, t_hi, u_tie, tau, None) {
                 Verdict::Member => true,
                 Verdict::NonMember => false,
                 Verdict::Undecided => {
@@ -1325,6 +1322,7 @@ pub fn penalty_from_normal_and_gram(
 mod tests {
     use super::*;
     use rand::rngs::StdRng;
+    use rand::{RngExt, SeedableRng};
     use rand_distr::{Distribution, Gamma as GammaDist, Poisson as PoissonDist};
 
     const ALPHA: f64 = 0.1;
@@ -1470,14 +1468,9 @@ mod tests {
         let n = sub.n();
         let tau = conformal_rank_threshold(alpha, n + 1);
         let s_star = node.score_star.abs();
-        if sub.family.is_discrete() {
-            let u = sub.tie_break_uniform(&row);
-            let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
-            greater as f64 + u > tau
-        } else {
-            let geq = (0..n).filter(|&i| node.score[i].abs() >= s_star).count();
-            geq as f64 + 1.0 > tau
-        }
+        let u = sub.tie_break_uniform(&row);
+        let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
+        greater as f64 + u > tau
     }
 
     #[test]
@@ -1750,6 +1743,37 @@ mod tests {
                 2.0 * mcse
             );
         }
+    }
+
+    /// Seeded Monte Carlo for the continuous walk where `α(n+1)` is
+    /// fractional: n = 14, α = 0.1, `τ = 1.5`. The smoothed p-value covers
+    /// with probability exactly `0.9`; the plain p-value's `1 − ⌊τ⌋/(n+1)`
+    /// is `0.9333`, `5·MCSE` above it at 2000 draws. Two-sided within `3·MCSE`.
+    #[test]
+    fn gamma_coverage_is_nominal_at_a_fractional_rank_threshold() {
+        let reps = 2000;
+        let n = 14;
+        let family = ConformalGlmFamily::GammaLog;
+        let mut rng = StdRng::seed_from_u64(4514);
+        let mut covered = 0usize;
+        for _ in 0..reps {
+            let d = data(family, n, &mut rng);
+            let x = rng.random::<f64>() * 2.0 - 1.0;
+            let o = rng.random::<f64>() * 0.4 - 0.2;
+            let y_star = draw(family, eta_true(x) + o, &mut rng);
+            let set = substrate(family, &d)
+                .prediction_set(&row(x), o, ALPHA)
+                .unwrap();
+            covered += usize::from(contains(&set, y_star));
+        }
+        let cov = covered as f64 / reps as f64;
+        let target = 1.0 - ALPHA;
+        let mcse = (target * ALPHA / reps as f64).sqrt();
+        assert!(
+            (cov - target).abs() <= 3.0 * mcse,
+            "coverage {cov} vs {target} ± {}",
+            3.0 * mcse
+        );
     }
     /// The count `0` sits exactly on the low end of the score walk, where
     /// rounding in `z(s)` once pushed its image just above `0` and dropped it

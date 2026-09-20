@@ -13,12 +13,21 @@
 //!
 //! ```text
 //!   e_i(z) = |y_i − μ̂^z(x_i)| ,  e_*(z) = |z − μ̂^z(x_*)|
-//!   C_α = { z :  1 + #{ i : e_i(z) ≥ e_*(z) }  >  α (n+1) }
+//!   C_α = { z :  #{ i : e_i(z) > e_*(z) } + U·(1 + #{ i : e_i(z) = e_*(z) })  >  α (n+1) }
 //! ```
 //!
 //! Validity needs ONLY exchangeability of the n+1 points and SYMMETRY of
 //! the fitting map (it must treat the augmented row like any other row).
 //! No model correctness, no asymptotics, no held-out fold.
+//!
+//! `U ~ Uniform(0, 1)` is drawn once per test row ([`conformal_tie_uniform`])
+//! and makes the rank p-value exactly uniform: the test point's rank among
+//! the n+1 exchangeable scores is uniform on `{1, …, n+1}`, and spreading
+//! its own unit of rank mass by `U` turns that discrete law into
+//! `Uniform(0, 1)`, so `P(y_* ∈ C_α) = 1 − α` for every n and α. The plain
+//! p-value `(1 + #{e_i ≥ e_*})/(n+1)` is super-uniform: its set covers with
+//! probability `1 − ⌊α(n+1)⌋/(n+1)`, which is the whole line whenever
+//! `α(n+1) < 1` (#4514).
 //!
 //! The field treats this as computationally infeasible because it seems to
 //! require refitting at a continuum of `z` — solved exactly only for ridge
@@ -75,10 +84,12 @@
 //! The comparison `e_i(z) ≥ e_*(z)` ⟺ `(r_i−r_*)(r_i+r_*) ≥ 0` flips only
 //! at roots of two LINEAR equations per i. Collect ≤ 2n roots, sort, and
 //! the rank of e_* is constant on each open interval between consecutive
-//! roots: evaluate the rank at interval midpoints (and at the roots
-//! themselves, closed-set convention — coverage uses `≥`, so boundary
-//! points belong to the set when their rank qualifies) and assemble the
-//! set as a union of intervals. EXACT — no grid, no tolerance, no refits.
+//! roots: evaluate the smoothed rank at interval midpoints and at the roots
+//! themselves, and assemble the closure of the member set as a union of
+//! closed intervals. The closure differs from the set by at most the
+//! finitely many roots, where a row's score ties the test score — a null
+//! event for a continuous response. EXACT — no grid, no tolerance, no
+//! refits.
 //!
 //! Unboundedness is honest, not an error: if `|slope(r_*)| ≤ |slope(r_i)|`
 //! for enough i, far-out candidates are never extreme and the set is a
@@ -137,8 +148,12 @@
 //! unsupported regimes are refused with a typed error naming split conformal,
 //! never silently — an invalid guarantee is worse than a wider valid one.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use faer::Side;
 use ndarray::{Array1, Array2};
+use rand::{RngExt, SeedableRng};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
 
@@ -221,12 +236,34 @@ fn validate_inputs(
     Ok(())
 }
 
-/// The smallest dominating count `k` with `1 + k > α(n + 1)` — membership's
-/// threshold — or `n + 1` when no count of `n` training rows reaches it.
-fn required_dominating_count(n: usize, alpha: f64) -> usize {
+/// The tie-break uniform `U` of the smoothed conformal p-value
+/// `(#{s_i > s_*} + U·(1 + #{s_i = s_*}))/(n + 1)`, drawn once per test row.
+///
+/// Seeded from a hash of the labeled responses, the test row's covariates and
+/// its offset, so the same inputs give the same set in every front end, and a
+/// new data set or test row draws a fresh `U`.
+pub(crate) fn conformal_tie_uniform<'a>(
+    labels: impl IntoIterator<Item = &'a f64>,
+    test_row: impl IntoIterator<Item = &'a f64>,
+    offset: f64,
+) -> f64 {
+    let mut hasher = DefaultHasher::new();
+    for v in labels.into_iter().chain(test_row) {
+        v.to_bits().hash(&mut hasher);
+    }
+    offset.to_bits().hash(&mut hasher);
+    rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
+}
+
+/// The smallest count `k` of training rows strictly dominating the test score
+/// with `k + U > α(n + 1)` — the smoothed p-value's threshold off ties — or
+/// `n + 1` when no count of `n` training rows reaches it. `0` exactly when
+/// `α(n + 1) < U`: the whole line, with probability `1 − α(n + 1)` over `U`
+/// when `n + 1 < 1/α`, never with certainty.
+fn required_dominating_count(n: usize, alpha: f64, tie_uniform: f64) -> usize {
     let threshold = conformal_rank_threshold(alpha, n + 1);
     (0..=n)
-        .find(|&count| 1.0 + count as f64 > threshold)
+        .find(|&count| count as f64 + tie_uniform > threshold)
         .unwrap_or(n + 1)
 }
 
@@ -240,6 +277,8 @@ pub struct ExactGaussianFullConformal {
     u: Array1<f64>,
     w: Array1<f64>,
     n: usize,
+    /// The test row's tie-break uniform ([`conformal_tie_uniform`]).
+    tie_uniform: f64,
 }
 
 impl ExactGaussianFullConformal {
@@ -299,21 +338,35 @@ impl ExactGaussianFullConformal {
                     .to_string(),
             );
         }
-        Ok(Self { u, w, n })
+        let tie_uniform = conformal_tie_uniform(y, x_star, 0.0);
+        Ok(Self {
+            u,
+            w,
+            n,
+            tie_uniform,
+        })
     }
 
-    /// Number of training rows whose score weakly dominates the test score
-    /// at candidate z: `#{ i ≤ n : e_i(z) ≥ e_*(z) }`.
-    fn dominating_count(&self, z: f64) -> usize {
-        let e_star = (self.u[self.n] + self.w[self.n] * z).abs();
-        (0..self.n)
-            .filter(|&i| (self.u[i] + self.w[i] * z).abs() >= e_star)
-            .count()
-    }
-
-    /// Membership at candidate z: conformal p-value `(1 + count)/(n+1) > α`.
+    /// Membership at candidate z: the smoothed conformal p-value
+    /// `(#{e_i > e_*} + U·(1 + #{e_i = e_*}))/(n+1) > α`.
     fn member(&self, z: f64, alpha: f64) -> bool {
-        (1.0 + self.dominating_count(z) as f64) > conformal_rank_threshold(alpha, self.n + 1)
+        let e_star = (self.u[self.n] + self.w[self.n] * z).abs();
+        let (mut greater, mut tied) = (0usize, 0usize);
+        for i in 0..self.n {
+            let e_i = (self.u[i] + self.w[i] * z).abs();
+            if e_i > e_star {
+                greater += 1;
+            } else if e_i == e_star {
+                tied += 1;
+            }
+        }
+        greater as f64 + self.tie_uniform * (1.0 + tied as f64)
+            > conformal_rank_threshold(alpha, self.n + 1)
+    }
+
+    /// The test row's tie-break uniform `U`.
+    pub(crate) fn tie_uniform(&self) -> f64 {
+        self.tie_uniform
     }
 
     /// The frozen plug-in mean `x_*ᵀ(XᵀX + Sλ)⁻¹Xᵀy`: the candidate at which
@@ -336,8 +389,10 @@ impl ExactGaussianFullConformal {
     /// Breakpoints: for each i, roots of `r_*(z) = ±r_i(z)` — two linear
     /// equations. Between consecutive roots the comparison pattern (hence
     /// the rank of e_*) is constant; evaluate membership on midpoints and
-    /// at every root (closed-set convention), then merge runs into maximal
-    /// intervals. Cost O(n log n) after the single factorization.
+    /// at every root, then merge runs into maximal closed intervals — the
+    /// closure of the member set (a root where a tie drops the smoothed rank
+    /// below the threshold is interior to its closure). Cost O(n log n)
+    /// after the single factorization.
     pub fn prediction_set(&self, alpha: f64) -> FullConformalSet {
         let n = self.n;
         let (us, ws) = (self.u[n], self.w[n]);
@@ -372,8 +427,15 @@ impl ExactGaussianFullConformal {
         }
 
         // Scan witnesses into maximal intervals. A member midpoint/tail claims
-        // its whole open gap; member roots close the endpoints.
+        // its whole open gap; member roots close the endpoints, and runs that
+        // meet at a non-member root join into one closed interval.
         let mut intervals: Vec<ConformalInterval> = Vec::new();
+        let close = |intervals: &mut Vec<ConformalInterval>, lo: f64, hi: f64| match intervals
+            .last_mut()
+        {
+            Some(last) if last.hi == lo => last.hi = hi,
+            _ => intervals.push(ConformalInterval { lo, hi }),
+        };
         let mut open_lo: Option<f64> = None;
         let gap_bounds = |idx: usize| -> (f64, f64) {
             // bounds of the gap a witness at sorted position idx represents
@@ -403,16 +465,10 @@ impl ExactGaussianFullConformal {
                     open_lo = Some(lo);
                 }
                 if idx == witnesses.len() - 1 {
-                    intervals.push(ConformalInterval {
-                        lo: open_lo.take().expect("open interval"),
-                        hi,
-                    });
+                    close(&mut intervals, open_lo.take().expect("open interval"), hi);
                 }
             } else if let Some(lo_open) = open_lo.take() {
-                intervals.push(ConformalInterval {
-                    lo: lo_open,
-                    hi: lo,
-                });
+                close(&mut intervals, lo_open, lo);
             }
         }
 
@@ -1642,7 +1698,9 @@ mod tests {
         let set = engine.prediction_set(alpha);
         assert!(!set.intervals.is_empty(), "set should be non-empty");
 
-        // Independent oracle: explicit augmented refit per grid z.
+        // Independent oracle: explicit augmented refit per grid z, ranked by
+        // the smoothed p-value with the row's tie-break uniform.
+        let tie_uniform = conformal_tie_uniform(&y, &x_star, 0.0);
         let m_base = x.t().dot(&x) + &s_lambda;
         let oracle = |z: f64| -> bool {
             let mut m = m_base.clone();
@@ -1658,13 +1716,12 @@ mod tests {
             }
             let beta = chol.solvevec(&rhs);
             let e_star = (z - x_star.dot(&beta)).abs();
-            let count = (0..n)
-                .filter(|&i| {
-                    let mu_i: f64 = x.row(i).dot(&beta);
-                    (y[i] - mu_i).abs() >= e_star
-                })
-                .count();
-            (1.0 + count as f64) > alpha * (n as f64 + 1.0)
+            let scores: Vec<f64> = (0..n)
+                .map(|i| (y[i] - x.row(i).dot(&beta)).abs())
+                .collect();
+            let greater = scores.iter().filter(|&&e| e > e_star).count();
+            let tied = scores.iter().filter(|&&e| e == e_star).count();
+            greater as f64 + tie_uniform * (1.0 + tied as f64) > alpha * (n as f64 + 1.0)
         };
 
         let z_lo = set.intervals.first().map(|i| i.lo).unwrap_or(-5.0) - 2.0;
@@ -1695,8 +1752,12 @@ mod tests {
         );
     }
 
+    /// One training row whose score is `0` for every z and a test score
+    /// `|z|/2`: the only tie is at `z = 0`, where the smoothed rank is `2U`
+    /// against `τ = 1`. The set is the point `{0}` when `U > 1/2` and empty
+    /// otherwise — never a neighbourhood of it.
     #[test]
-    fn boundary_tie_is_a_closed_point_set() {
+    fn boundary_tie_is_a_point_set_iff_its_smoothed_rank_qualifies() {
         let x = Array2::from_shape_vec((1, 1), vec![0.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
@@ -1706,13 +1767,18 @@ mod tests {
             ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
 
         let set = engine.prediction_set(0.5);
-        assert_eq!(set.intervals.len(), 1);
-        assert_eq!(set.intervals[0].lo, 0.0);
-        assert_eq!(set.intervals[0].hi, 0.0);
+        if 2.0 * engine.tie_uniform() > 1.0 {
+            assert_eq!(set.intervals, vec![ConformalInterval { lo: 0.0, hi: 0.0 }]);
+        } else {
+            assert!(set.intervals.is_empty(), "{:?}", set.intervals);
+        }
     }
 
+    /// A training row tied with the test row at every z: the smoothed rank
+    /// `U·(1 + 1)` never changes, so the set is the whole line when
+    /// `2U > α(n+1) = 1` and empty otherwise.
     #[test]
-    fn identically_tied_rows_give_the_whole_line() {
+    fn identically_tied_rows_give_the_whole_line_or_nothing() {
         let x = Array2::from_shape_vec((1, 1), vec![1.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
@@ -1722,23 +1788,99 @@ mod tests {
             ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
 
         let set = engine.prediction_set(0.5);
-        assert_eq!(set.intervals.len(), 1);
-        assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
-        assert_eq!(set.intervals[0].hi, f64::INFINITY);
+        if 2.0 * engine.tie_uniform() > 1.0 {
+            assert_eq!(
+                set.intervals,
+                vec![ConformalInterval {
+                    lo: f64::NEG_INFINITY,
+                    hi: f64::INFINITY,
+                }]
+            );
+        } else {
+            assert!(set.intervals.is_empty(), "{:?}", set.intervals);
+        }
     }
 
+    /// Both training slopes exceed the test slope, and at every z at least one
+    /// training score strictly dominates (they vanish at `z = ∓1`, where the
+    /// other is `2 > 0.1`). At `α(n+1) = 1` one strict dominator and any
+    /// `U > 0` qualify, so the set is the whole line for every `U`.
     #[test]
     fn strictly_separated_slopes_give_the_whole_line() {
-        let engine = ExactGaussianFullConformal {
-            u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
-            w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
-            n: 2,
-        };
+        for tie_uniform in [1.0e-9, 0.5, 1.0 - 1.0e-9] {
+            let engine = ExactGaussianFullConformal {
+                u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
+                w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
+                n: 2,
+                tie_uniform,
+            };
 
-        let set = engine.prediction_set(0.5);
-        assert_eq!(set.intervals.len(), 1);
-        assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
-        assert_eq!(set.intervals[0].hi, f64::INFINITY);
+            let set = engine.prediction_set(1.0 / 3.0);
+            assert_eq!(
+                set.intervals,
+                vec![ConformalInterval {
+                    lo: f64::NEG_INFINITY,
+                    hi: f64::INFINITY,
+                }],
+                "U = {tie_uniform}"
+            );
+        }
+    }
+
+    /// Seeded Monte Carlo at a fixed penalty, where the map is symmetric and
+    /// the smoothed p-value is exactly uniform: coverage is `1 − α` within
+    /// `3·MCSE`, two-sided, at `n = 9` and `α ∈ {0.05, 0.15}`. There
+    /// `α(n+1) ∈ {0.5, 1.5}` is fractional, and the plain p-value would cover
+    /// with probability `1 − ⌊α(n+1)⌋/(n+1) ∈ {1, 0.9}` — the whole line at
+    /// `α = 0.05`, and `0.05` above nominal at `α = 0.15` (#4514).
+    #[test]
+    fn exact_set_coverage_is_nominal_at_a_fractional_rank_threshold() {
+        use rand::rngs::StdRng;
+        use rand::{RngExt, SeedableRng};
+        use rand_distr::{Distribution, Normal};
+
+        let n = 9usize;
+        let p = 3usize;
+        let reps = 4000usize;
+        let noise = Normal::new(0.0, 0.4).expect("normal");
+        let basis = |t: f64| Array1::from_vec(vec![1.0, t, t * t]);
+        let mut s_lambda = Array2::<f64>::zeros((p, p));
+        s_lambda[[2, 2]] = 2.0;
+        let weights = Array1::<f64>::ones(n);
+        for alpha in [0.05, 0.15] {
+            let mut rng = StdRng::seed_from_u64(4514);
+            let mut covered = 0usize;
+            for _ in 0..reps {
+                let draw = |rng: &mut StdRng| {
+                    let t = rng.random::<f64>() * 2.0 - 1.0;
+                    (basis(t), (2.0 * t).sin() + noise.sample(rng))
+                };
+                let mut x = Array2::<f64>::zeros((n, p));
+                let mut y = Array1::<f64>::zeros(n);
+                for i in 0..n {
+                    let (row, yi) = draw(&mut rng);
+                    x.row_mut(i).assign(&row);
+                    y[i] = yi;
+                }
+                let (x_star, y_star) = draw(&mut rng);
+                let set = ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star)
+                    .expect("engine")
+                    .prediction_set(alpha);
+                covered += usize::from(
+                    set.intervals
+                        .iter()
+                        .any(|itv| itv.lo <= y_star && y_star <= itv.hi),
+                );
+            }
+            let coverage = covered as f64 / reps as f64;
+            let mcse = (alpha * (1.0 - alpha) / reps as f64).sqrt();
+            assert!(
+                (coverage - (1.0 - alpha)).abs() <= 3.0 * mcse,
+                "α = {alpha}: coverage {coverage} vs {} ± {}",
+                1.0 - alpha,
+                3.0 * mcse
+            );
+        }
     }
 
     /// A smooth Gaussian fixture: cosine basis design (column 0 constant,
