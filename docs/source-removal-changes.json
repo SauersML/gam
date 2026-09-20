@@ -2562,5 +2562,15 @@
     ],
     "reason": "The te() joint-unpenalized-dimension guess is retired: joint_unpenalized_dim no longer reports 0 (or a single penalty's own null dim) for a penalty whose stored block is a Kronecker factor, it reads the materialized p_local x p_local block of every penalty. The removed test pinned that fallback, including a shape (a 1x1 factor for p_local = 2) the builder never produces now.",
     "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
+  },
+  {
+    "base": "b3832b9299c77b4f036b06d88d10e5a988126257",
+    "items": [
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:exclusive_subspaces",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:inverse_on_subspace",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:normalized"
+    ],
+    "reason": "Port of #3220 item (a): the smooth score test's component covariances are now K_l = P⁻¹(a_l S_l)P⁻¹ at P = Σ a_l S_l, a_l = 1/tr(G_jj⁺ S_l), for every penalty set. On complementary ranges this equals the exact N_l(N_lᵀS_lN_l)⁻¹N_lᵀ / a_l that exclusive_subspaces + inverse_on_subspace computed (a_l cancels in the per-component null-mean normalization), and on overlapping ranges it replaces the chart-dependent S_l⁺ fallback. PenaltyRange::normalized only served exclusive_subspaces' rank decision.",
+    "evidence": "All three were private to crates/gam-terms/src/inference/smooth_score_test.rs; after the change git grep -w finds none of exclusive_subspaces / inverse_on_subspace, and PenaltyRange::normalized has no caller (the 1054 production occurrences are other items named normalized). cargo test -p gam-terms --lib smooth_score_test: 11/11, including the new overlapping_penalties_do_not_depend_on_the_coefficient_chart, which fails under the old S_l⁺ fallback along with the two chart/functional-ridge tests; cargo check --workspace --tests RC 0."
   }
 ]
