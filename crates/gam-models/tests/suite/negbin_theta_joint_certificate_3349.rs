@@ -33,18 +33,34 @@ fn count_fixture(seed: u64) -> EncodedDataset {
     encode_recordswith_inferred_schema(headers, records).expect("encode the fixture")
 }
 
+/// Seeds whose alternation reached an accurate joint point that the literal
+/// `1e-10` theta bound refused after 200 rounds (theta residuals 2.1e-10 to
+/// 7.9e-8, rho residuals a fifth of their bound), plus one it always accepted.
+const SEEDS: [u64; 6] = [
+    0x3002_5001,
+    0x3002_5002,
+    0x3002_5003,
+    0x5001,
+    0x3002,
+    0x57A2_7F20,
+];
+
 #[test]
 fn estimated_theta_negative_binomial_certifies_its_accurate_joint_point() {
-    let data = count_fixture(0x3002_5001);
     let config = FitConfig {
         family: Some("negative-binomial".to_string()),
         ..FitConfig::default()
     };
-    let payload = fit_formula_to_payload("y ~ s(x)".to_string(), &data, &config)
-        .unwrap_or_else(|error| panic!("the estimated-theta fit must certify: {error}"));
-    let fit = payload.fit_result.as_ref().expect("the payload carries its fit");
-    assert!(
-        fit.reml_score().is_some_and(f64::is_finite),
-        "the certified fit has a finite criterion"
-    );
+    for seed in SEEDS {
+        let data = count_fixture(seed);
+        let payload = fit_formula_to_payload("y ~ s(x)".to_string(), &data, &config)
+            .unwrap_or_else(|error| {
+                panic!("seed {seed:#x}: the estimated-theta fit must certify: {error}")
+            });
+        let fit = payload.fit_result.as_ref().expect("the payload carries its fit");
+        assert!(
+            fit.reml_score().is_some_and(f64::is_finite),
+            "seed {seed:#x}: the certified fit has a finite criterion"
+        );
+    }
 }
