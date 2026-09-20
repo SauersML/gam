@@ -426,7 +426,6 @@ __all__ = [
     "survival_failure_from_survival",
     "survival_ffi_surface",
     "survival_lifted_metrics_from_predictions",
-    "survival_matrix_from_risk_calibration",
     "survival_null_curve_from_train",
     "survival_parameters_matrix",
     "survival_prediction_payload_from_json",
@@ -2244,8 +2243,6 @@ def survival_failure_from_survival(survival: NDArray[np.float64]) -> NDArray[np.
 def survival_ffi_surface(times: NDArray[np.float64], surface: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None: ...
 
 def survival_lifted_metrics_from_predictions(event_times: Sequence[float], events: Sequence[float], grid: Sequence[float], survival_matrix: NDArray[np.float64], null_survival_matrix: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
-
-def survival_matrix_from_risk_calibration(train_times: Sequence[float], train_events: Sequence[float], train_risk: Sequence[float], test_risk: Sequence[float], grid: Sequence[float]) -> NDArray[np.float64]: ...
 
 def survival_null_curve_from_train(train_times: Sequence[float], train_events: Sequence[float], grid: Sequence[float]) -> NDArray[np.float64]: ...
 
