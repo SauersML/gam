@@ -43,6 +43,8 @@ mod bernoulli_log_jet_3317_tests;
 #[cfg(test)]
 mod gaussian_row_log_free_tests;
 #[cfg(test)]
+mod negative_curvature_saddle_3318_tests;
+#[cfg(test)]
 mod residuals_tests;
 #[cfg(test)]
 mod sas_saturated_row_2733_tests;
