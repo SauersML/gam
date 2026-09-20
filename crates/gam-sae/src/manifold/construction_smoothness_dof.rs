@@ -13,10 +13,8 @@ impl SaeManifoldTerm {
     /// atom `k`'s β-block is nonzero, so this is exactly `tr((S⁻¹)_{kk} M_k)`,
     /// matching the dense path's per-atom column trace). Reuses ONE
     /// `(probes, S⁻¹·probes)` pair across every gradient channel so the value and
-    /// the ρ-gradient never desync — the matrix-free replacement for the dense
-    /// `beta_inv` in
-    /// [`SaeManifoldTerm::decoder_smoothness_effective_dof_with_solver_per_atom`]
-    /// on the massive-`K` surrogate lane. The probe/solve vectors have length
+    /// the ρ-gradient never desync — the matrix-free replacement for a dense
+    /// `(H⁻¹)_ββ` on the massive-`K` surrogate lane. The probe/solve vectors have length
     /// `border_dim` (the reduced-Schur dimension `cache.k`).
     pub(crate) fn decoder_smoothness_effective_dof_per_atom_from_probes(
         &self,

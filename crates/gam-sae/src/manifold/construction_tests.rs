@@ -491,21 +491,21 @@ mod outer_gradient_error_classification_1451_tests {
     /// #1451 — the three numerical/linear-algebra failure sites inside the
     /// deflation path (`apply_cached_arrow_hessian`, the projected `h_span.eigh`,
     /// and `DeflatedArrowSolver::from_orthonormal_gauges`) must distinguish a
-    /// genuine near-singular conditioning trip (`IllConditioned`) from an
+    /// genuine near-singular conditioning trip (`NonIdentifiable`) from an
     /// internal-invariant defect — a shape/dimension mismatch or a non-finite
     /// intermediate (`InternalInvariant`). Both propagate if the projected
     /// implicit solve cannot complete, but the typed diagnosis must stay exact.
     ///
     /// `OuterGradientError::classify_arrow_solver_error` is the helper all three
     /// sites route through. Before the #1451 fix every failure there was
-    /// re-labelled `IllConditioned` (the original `conditioning_err`), so the
+    /// re-labelled with the original `conditioning_err` class, so the
     /// shape/non-finite cases below would have been misdiagnosed as numerical
     /// conditioning. This test pins that a shape/non-finite error classifies to
     /// `InternalInvariant` while a genuine finite, correctly-shaped
-    /// near-singular failure stays `IllConditioned`.
+    /// near-singular failure keeps the caller's conditioning class.
     #[test]
     fn classify_arrow_solver_error_routes_shape_and_nonfinite_to_internal_1451() {
-        let conditioning = || OuterGradientError::IllConditioned {
+        let conditioning = || OuterGradientError::NonIdentifiable {
             reason: "near-singular joint Hessian (min/max pivot ratio 5.3e-16)".to_string(),
         };
 
@@ -541,7 +541,7 @@ mod outer_gradient_error_classification_1451_tests {
         // A genuine near-singular linear-algebra failure on a finite, correctly
         // shaped input (back-solve / Cholesky/Woodbury factor that tripped on
         // rank-deficiency) is the legitimate #1273 conditioning case: it must
-        // KEEP IllConditioned.
+        // KEEP the caller's conditioning class.
         let conditioning_messages = [
             "DeflatedArrowSolver: gauge Woodbury factor failed: matrix is not positive definite",
             "DeflatedArrowSolver: gauge back-solve: singular factor",
@@ -549,9 +549,9 @@ mod outer_gradient_error_classification_1451_tests {
         for msg in conditioning_messages {
             let classified = OuterGradientError::classify_arrow_solver_error(msg, conditioning());
             assert!(
-                matches!(classified, OuterGradientError::IllConditioned { .. }),
+                matches!(classified, OuterGradientError::NonIdentifiable { .. }),
                 "a finite, correctly-shaped near-singular failure must KEEP \
-                 IllConditioned (#1451 / #1273); got {classified}"
+                 the conditioning class (#1451 / #1273); got {classified}"
             );
         }
     }
@@ -636,6 +636,7 @@ mod softmax_majorizer_active_entry_1410_tests {
 /// stationarity Jacobian `A = ∇²_θθ L`, not the assembled surrogate `B`.
 #[cfg(test)]
 mod exact_stationarity_solve_1418_tests {
+    use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
     use super::*;
     use approx::assert_abs_diff_eq;
     use ndarray::Array1;

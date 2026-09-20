@@ -40,26 +40,44 @@
 //!
 //! # Which object this is
 //!
-//! Every spectral term is a GAUSSIAN rate–distortion SURROGATE over AMBIENT
-//! second moments: a linear transform code of each component, not an
-//! operational codec and not an intrinsic nonlinear code. Two consequences are
-//! load-bearing (#2933 F17, F18):
+//! Every spectral term is a GAUSSIAN rate–distortion SURROGATE: not an
+//! operational codec. Each atom is coded one of two ways, chosen by what the
+//! caller hands back for it ([`AtomFiringCode`]):
 //!
-//! * The receiver is handed no per-component mean, so every component (each
+//! * **Ambient** — a linear transform code of the atom's `(rows, d)`
+//!   contribution matrix. Two consequences are load-bearing (#2933 F17, F18).
+//!   The receiver is handed no per-component mean, so every component (each
 //!   atom's contribution and the residual) is priced at its RAW second moment
-//!   `E[v vᵀ]`. A reconstruction bias or a nonzero mean code is paid per token.
-//!   The moments are those of the scored batch alone; nothing is estimated on
-//!   training data or carried to a held-out batch. Only the R² baseline
-//!   (`reference_variance`) is centered, because R² is defined against the
-//!   column-mean predictor.
-//! * The whole ambient spectrum of each contribution is priced. A curve spans
-//!   more ambient directions than its intrinsic dimension (`(cos t, sin t,
-//!   cos 2t, sin 2t)` is one-dimensional with four eigenvalues of ½), and a linear
-//!   code of `d_g` scalars cannot carry the rest, so the rest is residual-coded
-//!   or left as distortion at the shared water level. An intrinsic chart code
-//!   that transmits `(t, a)` and decodes the curve through the decoder would
-//!   need the chart coordinates and the decoder's pullback metric. This callback
-//!   supplies neither, so the scorer does not credit such a code.
+//!   `E[v vᵀ]`: a reconstruction bias or a nonzero mean code is paid per token.
+//!   And the whole ambient spectrum is priced. A curve spans more ambient
+//!   directions than its intrinsic dimension (`(cos t, sin t, cos 2t, sin 2t)`
+//!   is one-dimensional with four eigenvalues of ½), and a linear code of `d_g`
+//!   scalars cannot carry the rest, so the rest is residual-coded or left as
+//!   distortion at the shared water level.
+//! * **Intrinsic** ([`AtomChart`]) — the decoder-aware code of the `d_g` chart
+//!   variables `u = (t, a)` themselves, decoded through the atom's nonlinear
+//!   decoder `c(u)`. A quantisation error `δu` decodes to the output error
+//!   `c(u + δu) − c(u) = J(u) δu + O(‖δu‖²)`, `J = ∂c/∂u`, so to leading order
+//!   the distortion is `δuᵀ G(u) δu` with the pullback metric `G = JᵀJ`. A
+//!   subtractively dithered quantiser on one fixed lattice has an error `n`
+//!   independent of `u` with covariance `E`, so its expected distortion over the
+//!   firing rows is `tr(Ḡ E)`, `Ḡ = mean_i G(u_i)`. The Gaussian surrogate of
+//!   `u` (second moment `Σ_u`) under that weighted squared error is the reverse
+//!   water-filling of `eig(Ḡ^{1/2} Σ_u Ḡ^{1/2})`: exactly `d_g` modes, so an
+//!   intrinsic atom has no truncation tail. A harmonic curve of order `H` then
+//!   costs two modes (phase, amplitude) whose rates grow like `log₂ H` through
+//!   the pullback metric `Σ k²`, where its ambient code pays `2H` modes. The code
+//!   is the same one the native coder builds
+//!   ([`crate::native_code_source`]); it credits no point-density adaptation
+//!   (a lattice matched to `G(u)` row by row would save at most
+//!   `½·(log₂det Ḡ − E log₂det G) ≥ 0` bits per firing, by Jensen), and the
+//!   linearisation overprices a coarse code of a strongly curved chart, so at a
+//!   loose target an intrinsic circle can cost more than its two ambient modes.
+//!
+//! The moments are those of the scored batch alone; nothing is estimated on
+//! training data or carried to a held-out batch. Only the R² baseline
+//! (`reference_variance`) is centered, because R² is defined against the
+//! column-mean predictor.
 //!
 //! Unlike [`crate::description_length::reverse_water_filling`] (which water-fills
 //! a single unweighted spectrum), the Eq. 4 scorer water-fills a collection of
@@ -73,13 +91,15 @@
 //! fires on). That contribution is produced by the caller's fitted model — a
 //! closure the Python surface supplies — so [`eq4_fixed_distortion_description_length`]
 //! is generic over a `fetch_contribution` callback that returns the
-//! `(take, d)` contribution matrix for the selected firing rows. Rust owns the
-//! firing-row selection, the certified rank-one / SVD contribution spectrum, the
+//! `(take, d)` contribution matrix for the selected firing rows, or the atom's
+//! chart ([`AtomChart`]: chart coordinates, decoder Jacobian and axis kinds) on
+//! those rows. Rust owns the firing-row selection, the certified rank-one / SVD
+//! contribution spectrum, the chart origin and pullback-metric spectrum, the
 //! residual second-moment eigendecomposition, the water-filling and the bit
 //! assembly; the callback ONLY materialises the atom's rows. This keeps peak
-//! memory to one atom's contribution at a time (the caller may fetch lazily).
+//! memory to one atom's rows at a time (the caller may fetch lazily).
 
-use ndarray::{Array1, Array2, ArrayView2};
+use ndarray::{Array1, Array2, Array3, ArrayView2};
 
 use gam_linalg::faer_ndarray::{FaerEigh, FaerSvd};
 
@@ -87,6 +107,64 @@ use crate::atom_codes::{combinatorial_support_bits, kt_code_bits};
 use crate::description_length::{
     DescriptionLengthScoreKind, gate_is_transmitted, weighted_reverse_water_filling,
 };
+use crate::native_code_source::{output_metric_spectrum, unwrap_circle_values};
+
+/// How one chart coordinate's origin is fixed in the intrinsic code.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ChartAxis {
+    /// A translation-gauge coordinate (a curve or surface parameter on an
+    /// interval). Where the decoder puts `u = 0` is a choice of parametrisation,
+    /// `c̃(u) = c(u + m)` decodes the same set, so the coordinate is priced about
+    /// its firing-row mean `m`, one stored scalar per axis that the declared
+    /// `dictionary_params` count carries.
+    Euclidean,
+    /// A circle coordinate identified modulo `period` (finite, positive). The
+    /// firing rows are unwrapped at the cut of least variance (exact over the
+    /// `|R|` candidate cuts, the same unwrapping the native coder uses) and then
+    /// priced about their mean like [`Self::Euclidean`].
+    Periodic {
+        /// The identification period of the coordinate.
+        period: f64,
+    },
+    /// A gate amplitude. `a = 0` is the atom-off state the support code already
+    /// names, not a gauge, so the coordinate is priced at its RAW second moment
+    /// about zero, as the ambient code prices a flat atom's scalar code (#2933
+    /// F18). A flat atom `c = a·w` coded as the chart `u = a`, `J = w` therefore
+    /// costs exactly its ambient price.
+    Amplitude,
+}
+
+/// The intrinsic chart of one atom on its firing rows (see the module docs).
+#[derive(Clone, Debug)]
+pub struct AtomChart {
+    /// `(rows, k)` chart coordinates `u_i` the code transmits, `k = d_g`.
+    pub code: Array2<f64>,
+    /// `(rows, d, k)` decoder Jacobian `J_i = ∂c/∂u` at each firing row's `u_i`.
+    pub jacobian: Array3<f64>,
+    /// One [`ChartAxis`] per chart coordinate (length `k`).
+    pub axes: Vec<ChartAxis>,
+}
+
+/// What the Eq. 4 callback hands back for one atom's firing rows.
+#[derive(Clone, Debug)]
+pub enum AtomFiringCode {
+    /// The `(rows, d)` contribution matrix, priced by the ambient linear code.
+    Ambient(Array2<f64>),
+    /// The atom's chart, priced by the intrinsic decoder-aware code.
+    Intrinsic(AtomChart),
+}
+
+impl From<Array2<f64>> for AtomFiringCode {
+    fn from(contribution: Array2<f64>) -> Self {
+        Self::Ambient(contribution)
+    }
+}
+
+impl From<AtomChart> for AtomFiringCode {
+    fn from(chart: AtomChart) -> Self {
+        Self::Intrinsic(chart)
+    }
+}
 
 /// Standard fixed-distortion reporting points shared by every front-end.
 pub const DEFAULT_EQ4_R2_TARGETS: &[f64] = &[0.99, 0.95, 0.90, 0.80];
@@ -182,17 +260,21 @@ pub struct Eq4DescriptionLength {
     pub per_target: Vec<Eq4TargetBits>,
     /// The featurizer's own native bits/token, echoed through when supplied.
     pub native_bits_per_token: Option<f64>,
+    /// How many firing atoms were priced by the intrinsic chart code
+    /// ([`AtomFiringCode::Intrinsic`]); every other firing atom used the ambient
+    /// code.
+    pub intrinsic_atoms: usize,
     /// Always [`DescriptionLengthScoreKind::GaussianSurrogate`] (#2933 F21): every
-    /// code and residual term is a joint weighted reverse-water-filling rate of RAW
-    /// second-moment spectra (nothing centered, so means are paid per token) over
-    /// each atom's full ambient contribution spectrum — its top `d_g` modes as code
-    /// bits, the rest residual-coded as truncation bits — under squared error, with
-    /// the components treated as independent Gaussian sources whose distortions add.
-    /// It is a linear transform-code surrogate with no intrinsic chart credit, and
-    /// the dictionary term is a declared BIC-inspired count penalty, not a codec. No
-    /// encoder runs and no reconstruction is measured, so the total is not an
-    /// operational message length and compares only with other Gaussian-surrogate
-    /// figures.
+    /// code and residual term is a joint weighted reverse-water-filling rate of
+    /// Gaussian surrogate spectra under squared error, with the components treated
+    /// as independent Gaussian sources whose distortions add. An ambient atom
+    /// contributes its full RAW second-moment contribution spectrum (its top `d_g`
+    /// modes as code bits, the rest residual-coded as truncation bits); an
+    /// intrinsic atom contributes the leading-order pullback-metric spectrum of its
+    /// `d_g` chart variables. The dictionary term is a declared BIC-inspired count
+    /// penalty, not a codec. No encoder runs and no reconstruction is measured, so
+    /// the total is not an operational message length and compares only with other
+    /// Gaussian-surrogate figures.
     pub score_kind: DescriptionLengthScoreKind,
 }
 
@@ -319,6 +401,104 @@ fn atom_code_spectrum(
     Ok(AtomSpectrum { coded, tail })
 }
 
+/// The intrinsic code spectrum of one atom's chart on its `rows` firing rows in
+/// a `d`-dimensional output: `eig(Ḡ^{1/2} Σ_u Ḡ^{1/2})` with the mean pullback
+/// metric `Ḡ = (1/rows) Σ_i J_iᵀ J_i` and the second moment `Σ_u` of the chart
+/// coordinates about their origin (the firing-row mean for a Euclidean or
+/// unwrapped periodic axis, zero for an amplitude). The moment divides by `rows`:
+/// the source is the scored batch's empirical distribution, as for every other
+/// Eq. 4 moment. All `k = d_g` modes are coded and the tail is empty; the rest of
+/// the atom's output variation is carried by the decoder, not by extra scalars.
+///
+/// A chart with `k = 0` is refused: it transmits nothing, so it could only price
+/// a constant contribution, and a varying one would be scored free (#2933 F17).
+/// A zero-dimensional atom is handed as an ambient contribution instead, whose
+/// raw spectrum is paid as truncation bits whatever it holds.
+fn atom_chart_spectrum(
+    atom: usize,
+    chart: &AtomChart,
+    rows: usize,
+    d: usize,
+    code_dim: usize,
+) -> Result<AtomSpectrum, String> {
+    let k = chart.axes.len();
+    if k != code_dim {
+        return Err(format!(
+            "atom {atom} chart has {k} axes but code_dims declares {code_dim} transmitted \
+             scalars; an intrinsic chart transmits exactly its coordinates"
+        ));
+    }
+    if k == 0 {
+        return Err(format!(
+            "atom {atom} chart is zero-dimensional: it transmits no coordinate, so it \
+             cannot price the contribution it decodes; hand a zero-dimensional atom's \
+             contribution as an ambient code"
+        ));
+    }
+    if chart.code.dim() != (rows, k) {
+        return Err(format!(
+            "atom {atom} chart code has shape {:?}; expected {:?}",
+            chart.code.dim(),
+            (rows, k)
+        ));
+    }
+    if chart.jacobian.dim() != (rows, d, k) {
+        return Err(format!(
+            "atom {atom} chart jacobian has shape {:?}; expected {:?}",
+            chart.jacobian.dim(),
+            (rows, d, k)
+        ));
+    }
+    if !chart.code.iter().all(|v| v.is_finite()) || !chart.jacobian.iter().all(|v| v.is_finite())
+    {
+        return Err(format!(
+            "atom {atom} chart code and jacobian must contain only finite values"
+        ));
+    }
+    let inv_rows = (rows as f64).recip();
+    let mut code = chart.code.clone();
+    for (axis, kind) in chart.axes.iter().enumerate() {
+        let origin = match *kind {
+            ChartAxis::Amplitude => continue,
+            ChartAxis::Euclidean => code.column(axis).sum() * inv_rows,
+            ChartAxis::Periodic { period } => {
+                if !(period.is_finite() && period > 0.0) {
+                    return Err(format!(
+                        "atom {atom} chart axis {axis} period must be finite and positive, \
+                         got {period}"
+                    ));
+                }
+                let mut values = code.column(axis).to_vec();
+                unwrap_circle_values(&mut values, period);
+                for (slot, value) in code.column_mut(axis).iter_mut().zip(values) {
+                    *slot = value;
+                }
+                code.column(axis).sum() * inv_rows
+            }
+        };
+        code.column_mut(axis).mapv_inplace(|value| value - origin);
+    }
+    let gram = code.t().dot(&code);
+    let moment =
+        Array2::from_shape_fn((k, k), |(i, j)| 0.5 * (gram[[i, j]] + gram[[j, i]]) * inv_rows);
+    let mut metric = Array2::<f64>::zeros((k, k));
+    for jacobian in chart.jacobian.outer_iter() {
+        metric += &jacobian.t().dot(&jacobian);
+    }
+    let metric = Array2::from_shape_fn((k, k), |(i, j)| {
+        0.5 * (metric[[i, j]] + metric[[j, i]]) * inv_rows
+    });
+    let coded = output_metric_spectrum(
+        &format!("Eq. 4 intrinsic atom {atom}"),
+        &moment,
+        &metric,
+    )?;
+    Ok(AtomSpectrum {
+        coded,
+        tail: Vec::new(),
+    })
+}
+
 /// Score `test_x` against a featurizer's reconstruction at each R² target and
 /// return the Eq. 4 fixed-distortion description length.
 ///
@@ -329,10 +509,11 @@ fn atom_code_spectrum(
 ///   native coder prices). A negative gate is a firing: its contribution is in
 ///   `recon`, so it is paid for in the support code and the spectrum.
 /// * `code_dims` — the number `d_g` of scalars each of the `G` atoms transmits
-///   per firing (length `G`, nonnegative). The top `d_g` modes of the atom's raw
-///   contribution spectrum are priced as code bits, and every further mode as
-///   residual-coded truncation bits. `d_g = 0` is valid: all of the atom's
-///   variation goes to the residual coder.
+///   per firing (length `G`, nonnegative). For an ambient atom the top `d_g`
+///   modes of its raw contribution spectrum are priced as code bits, and every
+///   further mode as residual-coded truncation bits; `d_g = 0` is valid there:
+///   all of the atom's variation goes to the residual coder. An intrinsic atom's
+///   chart must have exactly `d_g ≥ 1` axes.
 /// * `dictionary_params` — the stored decoder scalar COUNT fed to the declared
 ///   BIC-inspired amortised parameter penalty
 ///   (`K_flat·P + K_curved·b·P` for the #2283 arms). It is a representation
@@ -351,10 +532,13 @@ fn atom_code_spectrum(
 /// * `r2_targets` — the fixed-distortion R² operating points, each finite and in
 ///   `[0, 1)`; must be nonempty.
 /// * `native_bits_per_token` — echoed onto the report when present.
-/// * `fetch_contribution` — a callback returning the `(take.len, d)` contribution
-///   matrix of atom `g` restricted to the supplied firing-row indices `take`.
-///   Invoked once for every atom that fires at least once, with all of its firing
-///   rows, one atom at a time.
+/// * `fetch_contribution` — a callback returning atom `g`'s code on the supplied
+///   firing-row indices `take`: either the `(take.len, d)` contribution matrix
+///   (priced by the ambient code) or the atom's [`AtomChart`] on those rows
+///   (priced by the intrinsic code, with exactly `d_g` chart axes). Anything
+///   convertible into an [`AtomFiringCode`] is accepted. Invoked once for every
+///   atom that fires at least once, with all of its firing rows, one atom at a
+///   time.
 ///
 /// The number of rows of `test_x` / `recon` / `gate` is the `estimation_rows`
 /// Monte-Carlo estimator size: it drives ONLY the variance of the support / code
@@ -363,7 +547,7 @@ fn atom_code_spectrum(
 /// firing atom's spectrum is estimated from ALL of its firing rows, however few or
 /// many: there is neither a subsampling stride (#2933 F19) nor a low-count branch
 /// that declares a rarely firing atom free (#2933 F16).
-pub fn eq4_fixed_distortion_description_length<F>(
+pub fn eq4_fixed_distortion_description_length<F, C>(
     test_x: ArrayView2<f64>,
     recon: ArrayView2<f64>,
     gate: ArrayView2<f64>,
@@ -375,7 +559,8 @@ pub fn eq4_fixed_distortion_description_length<F>(
     mut fetch_contribution: F,
 ) -> Result<Eq4DescriptionLength, String>
 where
-    F: FnMut(usize, &[usize]) -> Result<Array2<f64>, String>,
+    F: FnMut(usize, &[usize]) -> Result<C, String>,
+    C: Into<AtomFiringCode>,
 {
     let (n, d) = (test_x.nrows(), test_x.ncols());
     if test_x.dim() != recon.dim() {
@@ -492,6 +677,7 @@ where
 
     // Per-atom firing-contribution spectra (weight-`p_g` water-fill components).
     let mut code_spectra: Vec<AtomSpectrum> = Vec::with_capacity(n_atoms);
+    let mut intrinsic_atoms = 0_usize;
     for atom in 0..n_atoms {
         let code_dim = code_dims[atom] as usize;
         let rows: Vec<usize> = (0..n)
@@ -517,20 +703,29 @@ where
         // order, and the one-atom matrix is bounded by the `(N, d)` residual the
         // scorer already holds.
         let take = rows;
-        let contribution = fetch_contribution(atom, &take)?;
-        if contribution.dim() != (take.len(), d) {
-            return Err(format!(
-                "atom {atom} contribution has shape {:?}; expected {:?}",
-                contribution.dim(),
-                (take.len(), d)
-            ));
-        }
-        if !contribution.iter().all(|v| v.is_finite()) {
-            return Err(format!(
-                "atom {atom} contribution contains non-finite values"
-            ));
-        }
-        code_spectra.push(atom_code_spectrum(contribution.view(), code_dim)?);
+        let firing_code: AtomFiringCode = fetch_contribution(atom, &take)?.into();
+        let spectrum = match firing_code {
+            AtomFiringCode::Ambient(contribution) => {
+                if contribution.dim() != (take.len(), d) {
+                    return Err(format!(
+                        "atom {atom} contribution has shape {:?}; expected {:?}",
+                        contribution.dim(),
+                        (take.len(), d)
+                    ));
+                }
+                if !contribution.iter().all(|v| v.is_finite()) {
+                    return Err(format!(
+                        "atom {atom} contribution contains non-finite values"
+                    ));
+                }
+                atom_code_spectrum(contribution.view(), code_dim)?
+            }
+            AtomFiringCode::Intrinsic(chart) => {
+                intrinsic_atoms += 1;
+                atom_chart_spectrum(atom, &chart, take.len(), d, code_dim)?
+            }
+        };
+        code_spectra.push(spectrum);
     }
 
     // Dictionary bits are the same at every target AND independent of the
@@ -575,6 +770,7 @@ where
         amortization_horizon,
         per_target,
         native_bits_per_token,
+        intrinsic_atoms,
         score_kind: DescriptionLengthScoreKind::GaussianSurrogate,
     })
 }
@@ -1206,5 +1402,290 @@ mod tests {
             assert_eq!(other.per_target[0].code_bits, unfactored.per_target[0].code_bits);
             assert_eq!(other.per_target[0].resid_bits, unfactored.per_target[0].resid_bits);
         }
+    }
+
+    /// A `fetch_contribution` callback serving one atom's chart restricted to the
+    /// requested firing rows.
+    fn serve_chart(chart: AtomChart) -> impl FnMut(usize, &[usize]) -> Result<AtomChart, String> {
+        move |_, take| {
+            Ok(AtomChart {
+                code: chart.code.select(ndarray::Axis(0), take),
+                jacobian: chart.jacobian.select(ndarray::Axis(0), take),
+                axes: chart.axes.clone(),
+            })
+        }
+    }
+
+    /// Score one always-firing atom whose contribution is `values` (also the
+    /// held-out data and the reconstruction, so the residual is zero).
+    fn score_single<F, C>(
+        values: &Array2<f64>,
+        code_dim: i64,
+        targets: &[f64],
+        fetch: F,
+    ) -> Result<Eq4DescriptionLength, String>
+    where
+        F: FnMut(usize, &[usize]) -> Result<C, String>,
+        C: Into<AtomFiringCode>,
+    {
+        let gate = Array2::ones((values.nrows(), 1));
+        eq4_fixed_distortion_description_length(
+            values.view(),
+            values.view(),
+            gate.view(),
+            &[code_dim],
+            0,
+            FIXTURE_HORIZON,
+            targets,
+            None,
+            fetch,
+        )
+    }
+
+    /// The harmonic curve `c(t, a) = a·(cos kt, sin kt)_{k=1..H}` on the 16-point
+    /// phase grid at `a ≡ 1`, with its chart `(t, a)` and decoder Jacobian
+    /// `∂c/∂t = a·(−k sin kt, k cos kt)`, `∂c/∂a = (cos kt, sin kt)`.
+    fn harmonic_curve_chart(order: usize) -> (Array2<f64>, AtomChart) {
+        let grid = 16;
+        let features = harmonic_features(order, grid, false);
+        let phase = |i: usize| std::f64::consts::TAU * i as f64 / grid as f64;
+        let code = Array2::from_shape_fn((grid, 2), |(i, j)| if j == 0 { phase(i) } else { 1.0 });
+        let jacobian = Array3::from_shape_fn((grid, 2 * order, 2), |(i, j, axis)| {
+            let k = (j / 2 + 1) as f64;
+            let t = phase(i);
+            match (axis, j % 2) {
+                (0, 0) => -k * (k * t).sin(),
+                (0, _) => k * (k * t).cos(),
+                (_, 0) => (k * t).cos(),
+                _ => (k * t).sin(),
+            }
+        });
+        let chart = AtomChart {
+            code,
+            jacobian,
+            axes: vec![
+                ChartAxis::Periodic {
+                    period: std::f64::consts::TAU,
+                },
+                ChartAxis::Amplitude,
+            ],
+        };
+        (features, chart)
+    }
+
+    /// #3437 (#2933 F17 intrinsic mode). The order-`H` harmonic curve coded
+    /// through its decoder transmits two chart scalars. Its mean pullback metric
+    /// is `Ḡ = diag(S, H)` with `S = Σ_k k² = H(H+1)(2H+1)/6` (the cross term
+    /// `Σ_k (−k sin kt cos kt + k cos kt sin kt)` vanishes), the unwrapped phase
+    /// has the plug-in grid variance `v = (2π/16)²·(16² − 1)/12`, and the
+    /// amplitude has raw moment 1, so the intrinsic spectrum is `{vS, H}`. The
+    /// reference variance is `H`, the budget `(1−R²)H`, both modes lie above the
+    /// level `θ = (1−R²)H/2`, and the total is
+    /// `1 + ½log₂(vS/θ) + ½log₂(H/θ)` with no truncation bits. It grows like
+    /// `log₂ H` only through the metric (the phase must be sent finer as the
+    /// curve's speed `√S` rises), whereas the ambient code pays
+    /// `1 + H·log₂(1/(1−R²))`, linear in `H`. The ambient code wins at `H = 1`
+    /// (the linearised circle overprices a coarse phase code) and loses from
+    /// `H = 2` on. A rotated, padded embedding of the same decoder (contribution
+    /// AND Jacobian columns reflected) prices identically.
+    #[test]
+    fn eq4_intrinsic_harmonic_curve_rate_follows_the_pullback_metric_not_the_harmonic_count() {
+        let targets = [0.9, 0.99];
+        let step = std::f64::consts::TAU / 16.0;
+        let phase_variance = step * step * (16.0 * 16.0 - 1.0) / 12.0;
+        let mut previous: Option<Vec<f64>> = None;
+        for order in 1..=6_usize {
+            let (features, chart) = harmonic_curve_chart(order);
+            let h = order as f64;
+            let speed = h * (h + 1.0) * (2.0 * h + 1.0) / 6.0;
+            let intrinsic =
+                score_single(&features, 2, &targets, serve_chart(chart.clone())).unwrap();
+            let ambient = score_single(&features, 2, &targets, serve_rows(vec![features.clone()]))
+                .unwrap();
+            assert_eq!(intrinsic.intrinsic_atoms, 1);
+            assert_eq!(ambient.intrinsic_atoms, 0);
+
+            let rotated_features = householder_embed(&features);
+            let width = rotated_features.ncols();
+            let mut rotated_jacobian = Array3::<f64>::zeros((features.nrows(), width, 2));
+            for axis in 0..2 {
+                let column = chart
+                    .jacobian
+                    .index_axis(ndarray::Axis(2), axis)
+                    .to_owned();
+                rotated_jacobian
+                    .index_axis_mut(ndarray::Axis(2), axis)
+                    .assign(&householder_embed(&column));
+            }
+            let rotated = score_single(
+                &rotated_features,
+                2,
+                &targets,
+                serve_chart(AtomChart {
+                    code: chart.code.clone(),
+                    jacobian: rotated_jacobian,
+                    axes: chart.axes.clone(),
+                }),
+            )
+            .unwrap();
+
+            let mut totals = Vec::new();
+            for (index, &target) in targets.iter().enumerate() {
+                let level = (1.0 - target) * h / 2.0;
+                let expected = 1.0
+                    + 0.5 * (phase_variance * speed / level).log2()
+                    + 0.5 * (h / level).log2();
+                let row = intrinsic.per_target[index];
+                assert!(
+                    (row.bits - expected).abs() <= 1.0e-10 * expected,
+                    "order {order} at R²={target}: intrinsic {} bits, closed form {expected}",
+                    row.bits
+                );
+                assert_eq!(row.truncation_bits, 0.0, "order {order}: {row:?}");
+                assert!(
+                    (rotated.per_target[index].bits - row.bits).abs() <= 1.0e-10 * row.bits,
+                    "order {order} at R²={target}: rotated {} vs {}",
+                    rotated.per_target[index].bits,
+                    row.bits
+                );
+                let ambient_expected = 1.0 + h * (1.0 / (1.0 - target)).log2();
+                let ambient_bits = ambient.per_target[index].bits;
+                assert!(
+                    (ambient_bits - ambient_expected).abs() <= 1.0e-10 * ambient_expected,
+                    "order {order} at R²={target}: ambient {ambient_bits}, closed form \
+                     {ambient_expected}"
+                );
+                if order == 1 {
+                    assert!(row.bits > ambient_bits, "order 1 at R²={target}");
+                } else {
+                    assert!(row.bits < ambient_bits, "order {order} at R²={target}");
+                }
+                totals.push(row.bits);
+            }
+            if let Some(previous) = &previous {
+                for (index, &target) in targets.iter().enumerate() {
+                    // From H−1 to H the level rises by h/(h−1) in both modes and the
+                    // speed by S_H/S_{H−1}: the step is ½log₂(S_H/S_{H−1}) −
+                    // ½log₂(h/(h−1)), never the ambient step log₂(1/(1−R²)).
+                    let previous_speed = (h - 1.0) * h * (2.0 * h - 1.0) / 6.0;
+                    let step = 0.5 * (speed / previous_speed).log2() - 0.5 * (h / (h - 1.0)).log2();
+                    let ambient_step = (1.0 / (1.0 - target)).log2();
+                    let got = totals[index] - previous[index];
+                    assert!((got - step).abs() <= 1.0e-9, "order {order}: step {got} vs {step}");
+                    assert!(got < ambient_step);
+                }
+            }
+            previous = Some(totals);
+        }
+    }
+
+    /// #3437 rank-one contract: a flat atom `c = s·w` coded as the one-axis chart
+    /// `u = s`, `J = w` with an [`ChartAxis::Amplitude`] axis prices its raw
+    /// moment `E[s²]‖w‖²`, bitwise the ambient price up to rounding. Declared a
+    /// Euclidean (translation-gauge) axis it prices `Var(s)‖w‖²`, whose single
+    /// mode costs `½log₂(1/(1−R²))` against the centered reference variance.
+    #[test]
+    fn eq4_intrinsic_flat_atom_matches_its_ambient_price() {
+        let rows = 64;
+        let target = 0.9;
+        let decoder = [1.5_f64, -0.5, 2.0, 0.25];
+        let code = |i: usize| 2.0 + (std::f64::consts::TAU * i as f64 / rows as f64).cos();
+        let contribution =
+            Array2::from_shape_fn((rows, decoder.len()), |(i, j)| code(i) * decoder[j]);
+        let chart = |axis: ChartAxis| AtomChart {
+            code: Array2::from_shape_fn((rows, 1), |(i, _)| code(i)),
+            jacobian: Array3::from_shape_fn((rows, decoder.len(), 1), |(_, j, _)| decoder[j]),
+            axes: vec![axis],
+        };
+        let ambient =
+            score_single(&contribution, 1, &[target], serve_rows(vec![contribution.clone()]))
+                .unwrap();
+        let amplitude =
+            score_single(&contribution, 1, &[target], serve_chart(chart(ChartAxis::Amplitude)))
+                .unwrap();
+        let (a, b) = (ambient.per_target[0].bits, amplitude.per_target[0].bits);
+        assert!((a - b).abs() <= 1.0e-12 * a, "ambient {a} vs amplitude chart {b}");
+        let gauge =
+            score_single(&contribution, 1, &[target], serve_chart(chart(ChartAxis::Euclidean)))
+                .unwrap();
+        let expected = 1.0 + 0.5 * (1.0 / (1.0 - target)).log2();
+        let got = gauge.per_target[0].bits;
+        assert!((got - expected).abs() <= 1.0e-10 * expected, "gauge chart {got} vs {expected}");
+    }
+
+    /// #3437 period-aware chart: an arc `t ∈ [−0.3, 0.3]` handed as its canonical
+    /// `[0, 2π)` representatives (split across the cut at 0) must price as the
+    /// same arc handed as a Euclidean coordinate shifted by an arbitrary origin.
+    /// Without the minimum-variance unwrap the phase variance is that of two
+    /// clusters `2π` apart, about `π²`, instead of the arc's `≈ 0.031`.
+    #[test]
+    fn eq4_intrinsic_periodic_axis_is_unwrapped_and_gauge_invariant() {
+        let rows = 33;
+        let target = 0.99;
+        let arc = |i: usize| -0.3 + 0.6 * i as f64 / (rows - 1) as f64;
+        let features = Array2::from_shape_fn((rows, 2), |(i, j)| {
+            if j == 0 { arc(i).cos() } else { arc(i).sin() }
+        });
+        let jacobian = Array3::from_shape_fn((rows, 2, 1), |(i, j, _)| {
+            if j == 0 { -arc(i).sin() } else { arc(i).cos() }
+        });
+        let score = |code: Array2<f64>, axis: ChartAxis| {
+            score_single(
+                &features,
+                1,
+                &[target],
+                serve_chart(AtomChart {
+                    code,
+                    jacobian: jacobian.clone(),
+                    axes: vec![axis],
+                }),
+            )
+            .unwrap()
+            .per_target[0]
+                .bits
+        };
+        let periodic = score(
+            Array2::from_shape_fn((rows, 1), |(i, _)| arc(i).rem_euclid(std::f64::consts::TAU)),
+            ChartAxis::Periodic {
+                period: std::f64::consts::TAU,
+            },
+        );
+        let shifted = score(
+            Array2::from_shape_fn((rows, 1), |(i, _)| arc(i) + 5.0),
+            ChartAxis::Euclidean,
+        );
+        assert!(
+            (periodic - shifted).abs() <= 1.0e-10 * shifted,
+            "periodic {periodic} vs shifted euclidean {shifted}"
+        );
+        let wrapped_as_euclidean = score(
+            Array2::from_shape_fn((rows, 1), |(i, _)| arc(i).rem_euclid(std::f64::consts::TAU)),
+            ChartAxis::Euclidean,
+        );
+        assert!(wrapped_as_euclidean > periodic + 1.0);
+    }
+
+    /// #3437 callback contracts for the intrinsic code: a zero-dimensional chart,
+    /// an axis count that disagrees with `code_dims`, a Jacobian of the wrong
+    /// shape and a non-positive period are refused with typed errors rather than
+    /// priced.
+    #[test]
+    fn eq4_intrinsic_chart_contracts_are_refused_typed() {
+        let rows = 8;
+        let values = Array2::from_shape_fn((rows, 2), |(i, j)| (i + j) as f64);
+        let chart = |k: usize, width: usize, axes: Vec<ChartAxis>| AtomChart {
+            code: Array2::from_shape_fn((rows, k), |(i, _)| i as f64),
+            jacobian: Array3::ones((rows, width, k)),
+            axes,
+        };
+        let err = |code_dim: i64, chart: AtomChart| {
+            score_single(&values, code_dim, &[0.9], serve_chart(chart)).unwrap_err()
+        };
+        assert!(err(0, chart(0, 2, Vec::new())).contains("zero-dimensional"));
+        assert!(err(2, chart(1, 2, vec![ChartAxis::Euclidean])).contains("axes"));
+        assert!(err(1, chart(1, 3, vec![ChartAxis::Euclidean])).contains("jacobian"));
+        assert!(
+            err(1, chart(1, 2, vec![ChartAxis::Periodic { period: 0.0 }])).contains("period")
+        );
     }
 }
