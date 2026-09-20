@@ -56,6 +56,88 @@ pub fn accumulation_band(terms: usize, absolute_sum: f64) -> f64 {
     accumulation_growth(terms) * absolute_sum
 }
 
+/// How the two triangles of a square matrix handed to a strict symmetric
+/// routine were produced (#4350).
+///
+/// A strict routine (a certified solve, an unjittered Cholesky, a self-adjoint
+/// eigendecomposition) reads one triangle, so it must first establish that the
+/// other one says the same thing. How far the two may legitimately disagree is
+/// not a property of the matrix: it is a property of the arithmetic that
+/// assembled it, which only the caller can see. A fixed allowance in ULPs
+/// cannot be right, because the legitimate disagreement is exactly zero for a
+/// mirrored matrix and grows linearly with the accumulation length for a full
+/// GEMM. [`symmetric_assembly_band`] turns this provenance into the band.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SymmetricAssembly {
+    /// Every off-diagonal value was rounded once and written to both
+    /// triangles: a triangular accumulation mirrored across the diagonal
+    /// (`fast_ata`, `fast_xt_diag_x`), an explicit `(M + Mᵀ)/2`, an entrywise
+    /// sum or scaling of such matrices, or a structurally symmetric
+    /// construction (diagonal, tridiagonal, a Gram written once per pair).
+    ///
+    /// IEEE-754 addition and multiplication are commutative and correctly
+    /// rounded, so the same operations on the same operands give the same bits:
+    /// every such matrix is bitwise symmetric. The band is exactly zero, and
+    /// any disagreement is a construction defect rather than rounding.
+    Mirrored,
+    /// Each triangle is its own floating-point accumulation of
+    /// positive-semidefinite pieces: the rows `w_k·x_k·x_kᵀ` (`w_k ≥ 0`) of a
+    /// weighted Gram computed by a full GEMM, plus any PSD blocks (penalties,
+    /// ridges) added on top, with at most `depth` rounded operations on any
+    /// entry's accumulation path.
+    ///
+    /// `depth` is counted as [`accumulation_band`] counts it: an `n`-row Gram
+    /// forms each product in one rounding (two when a weight multiplies in) and
+    /// sums the `n` products in `n − 1` additions, and each further matrix
+    /// added onto the result is one more addition on every entry's path.
+    PsdAccumulation { depth: usize },
+}
+
+/// The largest disagreement `|A_ij − A_ji|` the assembly `assembly` can leave
+/// between the two triangles of a matrix whose computed diagonal entries at
+/// rows `i` and `j` are `diagonal_i` and `diagonal_j` (#4350).
+///
+/// This is the single definition every strict symmetric routine reads.
+///
+/// * [`SymmetricAssembly::Mirrored`]: `0` — both triangles hold one rounded
+///   value.
+/// * [`SymmetricAssembly::PsdAccumulation`]: both triangles accumulate the
+///   same summands `t_ij = t_ji` (the pieces are symmetric), each with error
+///   at most `γ_d·Σ_t |t_ij|` (Higham, *ASNA* 2nd ed., §3.1), so
+///   `|fl(A_ij) − fl(A_ji)| ≤ 2γ_d·Σ_t |t_ij|`. Every piece `T` is PSD, so
+///   `|T_ij| ≤ √(T_ii·T_jj)`, and Cauchy–Schwarz over the pieces gives
+///   `Σ_t √(T_t,ii·T_t,jj) ≤ √(Σ_t T_t,ii · Σ_t T_t,jj) = √(A_ii·A_jj)` in exact
+///   arithmetic. The diagonal summands are all non-negative, so the computed
+///   diagonal underestimates the exact one by at most a factor `1 − γ_d`, and
+///
+///   ```text
+///   |fl(A_ij) − fl(A_ji)|  ≤  2γ_d · √(fl(A_ii)·fl(A_jj)) / (1 − γ_d).
+///   ```
+///
+///   The bound is scale-covariant (`A ↦ cA` scales it by `c`) and local to the
+///   `(i, j)` block, so a well-scaled block inside a badly scaled matrix keeps
+///   a tight band; and it is read at the scale the accumulation ran at, not at
+///   `|A_ij|`, which is free to cancel to nothing.
+pub fn symmetric_assembly_band(
+    assembly: SymmetricAssembly,
+    diagonal_i: f64,
+    diagonal_j: f64,
+) -> f64 {
+    match assembly {
+        SymmetricAssembly::Mirrored => 0.0,
+        SymmetricAssembly::PsdAccumulation { depth } => {
+            let growth = accumulation_growth(depth);
+            if !(growth < 1.0) {
+                return f64::INFINITY;
+            }
+            // Each factor is square-rooted before multiplying so a large finite
+            // diagonal cannot overflow the product.
+            let scale = diagonal_i.abs().sqrt() * diagonal_j.abs().sqrt();
+            2.0 * growth * scale / (1.0 - growth)
+        }
+    }
+}
+
 /// Rounding band `p·ε·‖H‖₂` of a symmetric `p×p` matrix's computed spectrum,
 /// read off its eigenvalues.
 ///
