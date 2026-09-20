@@ -558,6 +558,26 @@ impl SaeManifoldTerm {
                 Err(err) => break Err(SaeCriterionError::from(err)),
             };
             loss.criterion_gauge_deflated_directions = cache.gauge_deflated_directions;
+            // #3434 — the fixed-frame inner moves `(t, C)` only, so its root need not be
+            // stationary, let alone a minimum, in the lifted chart `ξ = (vec δC, vec W)`
+            // the frame-integrated information prices. The root is accepted there
+            // before it is priced: a lifted step that commits converges again, and a
+            // lifted saddle no step descends is refused typed.
+            if inner_max_iter > 0 {
+                match self.settle_frame_lifted_root(target, rho, registry, &cache) {
+                    Ok(FrameLiftedRoot::Moved) => {
+                        criterion_fixed_point = false;
+                        continue;
+                    }
+                    Ok(FrameLiftedRoot::Settled) => {}
+                    Ok(FrameLiftedRoot::Saddle) => {
+                        break Err(SaeCriterionError::IndefiniteObservedInformation {
+                            block: FRAME_LIFTED_ROOT_BLOCK,
+                        });
+                    }
+                    Err(err) => break Err(SaeCriterionError::from(err)),
+                }
+            }
             // #2933 F05 — the root is priced under the gates frozen where the initial
             // joint fit ended, and they are not re-derived at the root. Re-deriving
             // `w ← W(θ̂)` and converging again until the root reproduced its own gates
@@ -6461,11 +6481,40 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         registry: Option<&AnalyticPenaltyRegistry>,
     ) -> Result<FrameMarginalInformation, String> {
-        let (unframed, sys, cache) = self.unframed_evidence_factorization(rho, target, registry)?;
+        let (unframed, mut sys, cache) =
+            self.unframed_evidence_factorization(rho, target, registry)?;
         let tangent = LearnedFrameTangentMap::new(self, sys.gb.view())?;
         let total_t = cache.delta_t_len();
-        let (a, _gap_border) =
+        // #3434 — `g_ξ = (g_t, Tᵀ·∇_B L)`, the gradient of the objective in the lifted
+        // chart, with the row directions the factor unit-stiffened removed as the
+        // fixed-frame root verdict removes them.
+        Self::remove_unit_stiffened_directions_from_rows(&mut sys, &cache.deflated_row_directions)?;
+        let mut gradient = Array1::<f64>::zeros(total_t + tangent.lift.ncols());
+        let mut offset = 0usize;
+        for row in &sys.rows {
+            if offset + row.gt.len() > total_t {
+                return Err(format!(
+                    "frame-integrated information: the unframed system's coordinate rows exceed \
+                     the factor's {total_t} coordinates"
+                ));
+            }
+            gradient
+                .slice_mut(s![offset..offset + row.gt.len()])
+                .assign(&row.gt);
+            offset += row.gt.len();
+        }
+        if offset != total_t {
+            return Err(format!(
+                "frame-integrated information: the unframed system carries {offset} coordinates \
+                 against the factor's {total_t}"
+            ));
+        }
+        gradient
+            .slice_mut(s![total_t..])
+            .assign(&tangent.lift.t().dot(&sys.gb));
+        let (a, gap_border) =
             unframed.materialize_exact_hessian_dense_with_gap_border(rho, target, &cache)?;
+        let gap_border = gap_border.map(|gap| tangent.congruence(&gap));
         let operator = tangent.joint_operator(&a, total_t)?;
         // #2933 F07 — the tangent coordinates' pencil, in the pulled-back evidence metric
         // `diag(I, liftᵀ)·Φ·diag(I, lift)`, so the pushed-forward covariance is covariant in
@@ -6481,6 +6530,8 @@ impl SaeManifoldTerm {
         Ok(FrameMarginalInformation {
             tangent,
             joint,
+            gradient,
+            gap_border,
             cache,
             total_t,
             unframed,
@@ -6665,6 +6716,12 @@ pub(crate) struct FrameMarginalInformation {
     /// The joint `(t, ξ)` operator `[[A_tt, A_tB·T], [Tᵀ·A_Bt, Tᵀ·A_BB·T + E]]` and
     /// its pencil eigensystem in the pulled-back metric `ArrowMetric::JointLifted`.
     joint: ExactHessianSpectralBlock,
+    /// `g_ξ = (g_t, Tᵀ·∇_B L)`, the objective's gradient in the joint `(t, ξ)`
+    /// coordinates (#3434).
+    gradient: Array1<f64>,
+    /// The β-tier decoder priors' majorization gap lifted to `ξ`, `Tᵀ·E_β·T`, which
+    /// the basin classification of the joint operator reads (#3434).
+    gap_border: Option<Array2<f64>>,
     /// The frozen evidence factor of the unframed assembly, in `(t, vec B)`.
     cache: ArrowFactorCache,
     /// Latent coordinate dimension of the joint layout.
@@ -6866,6 +6923,8 @@ fn orthonormal_frame_complement(frame: ArrayView2<'_, f64>) -> Result<Array2<f64
 include!("construction_undamped_inner.rs");
 // #2228/#2822 — the evidence root refinement and its gauge-projected exact step.
 include!("construction_evidence_root.rs");
+// #3434 — the evidence root's acceptance in the lifted chart of the learned frames.
+include!("construction_frame_lifted_root.rs");
 
 #[cfg(test)]
 mod shape_covariance_observed_information_2933_f33_tests {

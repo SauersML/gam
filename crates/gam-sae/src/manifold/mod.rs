@@ -89,8 +89,8 @@
 //!   jet bookkeeping the curvature assembly threads through it.
 //! * `row_layout` — the per-row active-set layout for sparse assignment.
 //! * `shape_uncertainty` — the posterior shape-band payload types.
-//! * `certificate` — the curved-dictionary global-optimality certificate and
-//!   the post-fit diagnostics it feeds.
+//! * `certificate` — the curved-dictionary incoherence/curvature measurements
+//!   and the post-fit diagnostics that carry them.
 //! * `term` — the `SaeManifoldTerm` aggregate, its shared numeric constants,
 //!   and the mutable-state snapshot the inner line search restores.
 //! * `construction` — term construction, accessors, frame/border bookkeeping,
@@ -393,6 +393,11 @@ mod tests_fitted_response_sphere_2933;
 /// re-solved response matrix.
 #[cfg(test)]
 mod tests_fitted_response_frames_2933;
+
+/// #3434 — the priced evidence root of a framed fit is a certified minimum in the
+/// lifted chart of its learned frames.
+#[cfg(test)]
+mod tests_frame_lifted_acceptance_3434;
 
 /// #2933 F37/F38 — the dispersion is conditional on the fitted routing and its
 /// scale equation is explicit.

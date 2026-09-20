@@ -51,7 +51,7 @@ fn framed_circle(
 /// [`framed_circle`] in `p` outputs: the decoder, the target's signal and its
 /// perturbations live on the same first three output axes, and the remaining axes
 /// carry no data, so only the frame's complement grows with `p`.
-fn framed_circle_in(
+pub(super) fn framed_circle_in(
     p: usize,
     rank: usize,
     off_span_constant: f64,

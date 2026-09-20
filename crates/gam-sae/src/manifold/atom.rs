@@ -1979,6 +1979,49 @@ impl SaeManifoldAtom {
         Ok(())
     }
 
+    /// #3434 — move this framed decoder along the lifted tangent chart of the
+    /// fixed-rank manifold, `B(α) = (C + α·δC)(U + α·N)ᵀ`, with `C = B·U` and
+    /// `N = U⊥·W` the normal velocity of the frame (`p × r`, `UᵀN = 0`).
+    ///
+    /// `dB/dα|₀ = δC·Uᵀ + C·Nᵀ` is the lift `T·ξ` of `ξ = (vec δC, vec W)`, and
+    /// the curve's only second-order term `α²·δC·Nᵀ` is the one the cross
+    /// curvature `E` prices, so the objective along it has exactly the slope and
+    /// curvature of the frame-integrated `(g_ξ, A_ξ)`. The frame is then the polar
+    /// factor of `U + α·N`, whose span holds every row of `B(α)`, so the
+    /// re-projection onto it leaves `B(α)` unchanged: the frame is re-orthonormal
+    /// and the decoder is exactly the curve's point.
+    pub(crate) fn advance_decoder_frame_along_tangent(
+        &mut self,
+        delta_coordinates: ArrayView2<'_, f64>,
+        normal_velocity: ArrayView2<'_, f64>,
+        step: f64,
+    ) -> Result<(), String> {
+        let Some(frame) = self.decoder_frame.as_ref() else {
+            return Err(
+                "SaeManifoldAtom::advance_decoder_frame_along_tangent: no active frame".into(),
+            );
+        };
+        let u = frame.frame().to_owned();
+        let (m, r) = (self.basis_size(), u.ncols());
+        if delta_coordinates.dim() != (m, r) || normal_velocity.dim() != u.dim() {
+            return Err(format!(
+                "SaeManifoldAtom::advance_decoder_frame_along_tangent: δC {:?} and N {:?} for a \
+                 {m}×{r} coordinate block on a {:?} frame",
+                delta_coordinates.dim(),
+                normal_velocity.dim(),
+                u.dim(),
+            ));
+        }
+        let coordinates = self.decoder_coefficients.dot(&u) + &(&delta_coordinates * step);
+        let span = &u + &(&normal_velocity * step);
+        let decoder = coordinates.dot(&span.t());
+        let new_frame = GrassmannFrame::polar_update(span.view())?;
+        let projected = new_frame.project_decoder(decoder.view())?;
+        self.decoder_coefficients = new_frame.reconstruct_decoder(projected.view())?;
+        self.decoder_frame = Some(new_frame);
+        Ok(())
+    }
+
     /// `g_k(t_{ik}) = Phi_k(t_{ik}) B_k`.
     pub fn decoded_row(&self, row: usize) -> Array1<f64> {
         let p = self.output_dim();
