@@ -832,11 +832,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // hosted as a dedicated additive absorber block whose coefficient `γ` shifts
     // the de-nested observed index `η₁` by `+Z̃_infl·γ`. β̂₀(x_i) is the
     // rigid-pilot slope `baseline_slope + slope_offset[i]`; `s_f =
-    // probit_scale`. The math (residualize-vs-marginal/retain-slope +
-    // fixed-ridge absorber) is the single source of truth shared with the BMS
-    // family via `marginal_slope_orthogonal`; survival differs only in the host
-    // structure — a dedicated `η₁` channel rather than BMS's widened marginal
-    // index, because the survival marginal block feeds the time-quantile
+    // probit_scale`. The math (residualize against the protected span +
+    // REML-learned ridge absorber) is the single source of truth shared with the
+    // BMS family via `marginal_slope_orthogonal`; survival differs in the
+    // protected span (marginal only, retaining slope, where BMS protects
+    // marginal + slope) and in the host structure — a dedicated `η₁` channel
+    // rather than BMS's widened marginal index, because the survival marginal
+    // block feeds the time-quantile
     // location `q·c(g)` (scaled), not a flat additive index. `None` ⇒ raw `z`,
     // and the free `score_warp` spline below is the x-free-column fallback.
     let influence_absorber_residualized: Option<Array2<f64>> = if let Some(jac) = spec
@@ -850,18 +852,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .design
             .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")
             .map_err(FitFailure::input)?;
-        // `β̂₀(x_i)` is the rigid-pilot slope; `s_f = probit_scale`; `z_primary`
-        // is the OOF latent z on these rows.
+        // `β̂₀(x_i)` is the rigid-pilot slope; `s_f = probit_scale`.
         let rigid_slope_at_rows = &spec.slope_offset + baseline_slope;
         // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W) — the combined core
         // builder (single source of truth shared with the BMS absorber site). It
-        // takes the raw n×p₁ J + OOF z and encapsulates the full §3 sequence: build
-        // Z_infl, derive the weighted marginal-Gram ridge internally (max diag·1e-10,
-        // floored 1e-12), residualize, and finite-check (Err on non-finite), so this
-        // caller passes no ε and propagates the error.
+        // takes the raw n×p₁ J and encapsulates the full §3 sequence: build
+        // Z_infl, project out the marginal span through the rank-certified
+        // pseudo-inverse of the weighted marginal Gram, and finite-check (Err on
+        // non-finite), so this caller passes no tolerance and propagates the error.
         let residualized = residualized_influence_block(
             jac,
-            &z_primary,
             &rigid_slope_at_rows,
             probit_scale,
             marginal_dense.view(),
@@ -1587,65 +1587,39 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         if p_tw > 0 {
             if let Some(timewiggle) = spec.timewiggle_block.as_ref() {
                 let p_m = marginal_design.design.ncols();
-                // Densify time designs (already densified earlier in the
-                // V+M-exact path; densify again cheaply here — or reuse
-                // if the earlier path failed and we are on the raw path).
-                let maybe_tw_jac: Option<(
-                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
-                    Arc<dyn crate::custom_family::BlockEffectiveJacobian>,
-                )> = (|| {
-                    let d_entry = design_entry
-                        .try_to_dense_arc("build_blocks::tw_jac::entry")
-                        .ok()?;
-                    let d_exit = design_exit
-                        .try_to_dense_arc("build_blocks::tw_jac::exit")
-                        .ok()?;
-                    let d_deriv = design_derivative_exit
-                        .try_to_dense_arc("build_blocks::tw_jac::deriv")
-                        .ok()?;
-                    let d_marg = marginal_design
-                        .design
-                        .try_to_dense_arc("build_blocks::tw_jac::marginal")
-                        .ok()?;
-                    let knots = timewiggle.knots.clone();
-                    let degree = timewiggle.degree;
-                    let marginal_offset = Arc::new(spec.marginal_offset.clone());
-                    let time_jac = Arc::new(SmsTimewiggleTimeJacobian::new(
-                        Arc::clone(&d_entry),
-                        Arc::clone(&d_exit),
-                        Arc::clone(&d_deriv),
-                        Arc::clone(&d_marg),
-                        Arc::clone(&offset_entry),
-                        Arc::clone(&offset_exit),
-                        Arc::clone(&derivative_offset_exit),
-                        Arc::clone(&marginal_offset),
-                        knots.clone(),
-                        degree,
-                        p_tw,
-                        p_m,
-                    ))
-                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
-                    let marginal_jac = Arc::new(SmsTimewiggleMarginalJacobian::new(
-                        d_entry,
-                        d_exit,
-                        d_deriv,
-                        d_marg,
-                        Arc::clone(&offset_entry),
-                        Arc::clone(&offset_exit),
-                        Arc::clone(&derivative_offset_exit),
-                        marginal_offset,
-                        knots,
-                        degree,
-                        design_exit.ncols(),
-                        p_tw,
-                    ))
-                        as Arc<dyn crate::custom_family::BlockEffectiveJacobian>;
-                    Some((time_jac, marginal_jac))
-                })();
-                if let Some((time_jac, marginal_jac)) = maybe_tw_jac {
-                    blocks[0].jacobian_callback = Some(time_jac);
-                    blocks[1].jacobian_callback = Some(marginal_jac);
-                }
+                // The callbacks share the designs in the storage they already
+                // have and read them one row chunk at a time.
+                let knots = timewiggle.knots.clone();
+                let degree = timewiggle.degree;
+                let marginal_offset = Arc::new(spec.marginal_offset.clone());
+                blocks[0].jacobian_callback = Some(Arc::new(SmsTimewiggleTimeJacobian::new(
+                    &design_entry,
+                    &design_exit,
+                    &design_derivative_exit,
+                    &marginal_design.design,
+                    Arc::clone(&offset_entry),
+                    Arc::clone(&offset_exit),
+                    Arc::clone(&derivative_offset_exit),
+                    Arc::clone(&marginal_offset),
+                    knots.clone(),
+                    degree,
+                    p_tw,
+                    p_m,
+                )));
+                blocks[1].jacobian_callback = Some(Arc::new(SmsTimewiggleMarginalJacobian::new(
+                    &design_entry,
+                    &design_exit,
+                    &design_derivative_exit,
+                    &marginal_design.design,
+                    Arc::clone(&offset_entry),
+                    Arc::clone(&offset_exit),
+                    Arc::clone(&derivative_offset_exit),
+                    marginal_offset,
+                    knots,
+                    degree,
+                    design_exit.ncols(),
+                    p_tw,
+                )));
             }
         }
         Ok(blocks)
@@ -2557,12 +2531,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let weight_sum = spec.weights.iter().sum::<f64>();
         let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
         let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
-        let to_rows = |per_anchor: [(f64, f64, f64); 2], weight: f64| {
-            per_anchor.map(|(anchoring_residual, law_sd, scale)| {
-                (anchoring_residual, law_sd / sqrt_effective_n, scale, weight)
-            })
-        };
-        let (anchors, nodes) = if spec.z.ncols() == 1 {
+        let row_weights = spec.weights.as_slice().ok_or_else(|| {
+            FitFailure::invariant("survival marginal-slope: the row weights are not contiguous")
+        })?;
+        let effective_n = sqrt_effective_n * sqrt_effective_n;
+        let (rows, noise, nodes) = if spec.z.ncols() == 1 {
             let law = laws
                 .as_ref()
                 .and_then(|laws| laws.first())
@@ -2572,21 +2545,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          estimated law to certify it against",
                     )
                 })?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map(|row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                    Ok(to_rows(
-                        certificate_family.closed_form_certificate_anchors(
-                            row,
-                            block_states,
-                            law,
-                        )?,
-                        spec.weights[row],
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, law.nodes.len())
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                &law.weights,
+                effective_n,
+                || Ok(()),
+                |_, row| certificate_family.closed_form_certificate_anchors(row, block_states, law),
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, law.nodes.len())
         } else {
             let (_, joint_law) = build_joint_latent_law(
                 spec.z.view(),
@@ -2599,35 +2567,34 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map_init(
-                    || super::calibration::JointCertificateWorkspace::new(
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                joint_law.weights(),
+                effective_n,
+                || {
+                    super::calibration::JointCertificateWorkspace::new(
                         &certificate_family,
                         &joint_law,
-                    ),
-                    |workspace, row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                        let workspace = workspace.as_mut().map_err(|error| error.clone())?;
-                        Ok(to_rows(
-                            certificate_family.closed_form_joint_certificate_anchors(
-                                row,
-                                block_states,
-                                &joint_law,
-                                workspace,
-                            )?,
-                            spec.weights[row],
-                        ))
-                    },
-                )
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, joint_law.node_count())
+                    )
+                },
+                |workspace, row| {
+                    certificate_family.closed_form_joint_certificate_anchors(
+                        row,
+                        block_states,
+                        &joint_law,
+                        workspace,
+                    )
+                },
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, joint_law.node_count())
         };
-        let rows: Vec<(f64, f64, f64, f64)> = anchors.into_iter().flatten().collect();
         let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
             &rows,
+            &noise,
             nodes,
-            sqrt_effective_n * sqrt_effective_n,
+            effective_n,
         )
         .map_err(FitFailure::numerical)?;
         let mut uncertified = None;

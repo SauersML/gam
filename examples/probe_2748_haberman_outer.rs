@@ -159,7 +159,7 @@ fn main() {
     let dp = if double_penalty { "true" } else { "false" };
     let body = selected
         .iter()
-        .map(|name| format!("s({name}, type=ps, knots={knots}, double_penalty={dp})"))
+        .map(|name| format!("s({name}, bs=ps, knots={knots}, double_penalty={dp})"))
         .collect::<Vec<_>>()
         .join(" + ");
     let formula = format!("y ~ {body}");

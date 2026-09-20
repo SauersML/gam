@@ -480,10 +480,15 @@ model_a, model_b = gamfit.fit(df, "y ~ x"), gamfit.fit(df, "y ~ s(x)")
 gamfit.compare_models([model_a, model_b])
 ```
 
-Diagnostics and reports. `model.summary()` gives the coefficient table and
-per-term effective degrees of freedom; `model.diagnose(data)` returns
-residuals and fit metrics; `model.plot(...)` draws partial effects and
-residuals; `model.report("out.html")` writes a self-contained HTML report.
+Diagnostics and reports. `model.summary()` gives the parametric and
+smooth-term tables, deviance explained, AIC and the convergence certificate
+(`gam summary MODEL` prints the same text); `model.diagnose(data)` returns
+residuals and fit metrics; `model.plot_terms()` draws each term's partial
+effect with pointwise intervals and a simultaneous band, from the numbers
+`model.partial_dependence(term)` returns (see
+[docs/partial-effects.md](docs/partial-effects.md)); `model.plot(data, kind=...)`
+draws residual and observed-vs-predicted panels; `model.report("out.html")`
+writes a self-contained HTML report.
 
 PyTorch bridge. Differentiable REML primitives, smooth-basis layers, and
 frozen fitted-model modules are available under `gamfit.torch` and

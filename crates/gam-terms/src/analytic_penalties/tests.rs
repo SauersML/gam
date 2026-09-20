@@ -304,6 +304,89 @@ fn ordered_beta_bernoulli_majorized_channels_match_fd_of_psd_majorized_operator(
     );
 }
 
+/// The trait-level PSD majorizer of the ordered Beta--Bernoulli prior used to be
+/// the trait default, i.e. the exact Hessian diagonal: it carries the negative
+/// mass-coupled rank-one diagonal `s'_k·u_ik²` and the negative part of the
+/// row-local term, so it was neither PSD nor a majorizer, and it disagreed with
+/// the `max(diagonal_term, 0)` majorizer the Laplace path assembles. It must be
+/// that majorizer: PSD, dominating the exact Hessian, and the frozen operator's
+/// diagonal and log-determinant must be built from it.
+#[test]
+fn ordered_beta_bernoulli_trait_psd_majorizer_is_the_declared_loewner_majorizer() {
+    let w = [1.6_f64, 0.4, 1.2, 0.8];
+    let cases = [
+        (
+            OrderedBetaBernoulliPenalty::new(3, 5.0, 0.85, false),
+            array![
+                0.3_f64, -0.2, 0.6, 0.5, 0.1, -0.4, -0.1, 0.7, 0.2, 0.4, -0.3, 0.8
+            ],
+            Array1::<f64>::zeros(0),
+        ),
+        (
+            OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true).with_row_weights(Some(&w)),
+            array![
+                2.5_f64, -1.8, 0.6, 3.1, 0.1, -2.4, -0.1, 1.7, 0.2, 2.4, -0.3, 0.8
+            ],
+            array![0.15_f64],
+        ),
+    ];
+    for (case, (pen, target, rho)) in cases.iter().enumerate() {
+        let n = target.len();
+        let mut hessian = Array2::<f64>::zeros((n, n));
+        for j in 0..n {
+            let mut e = Array1::<f64>::zeros(n);
+            e[j] = 1.0;
+            hessian
+                .column_mut(j)
+                .assign(&pen.hvp(target.view(), rho.view(), e.view()));
+        }
+        let declared = pen
+            .psd_majorizer_logit_third_channels(target.view(), rho.view())
+            .diagonal_term
+            .mapv(|value| value.max(0.0));
+        let diag = pen
+            .psd_majorizer_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli majorizer diagonal");
+        let exact_diag = pen
+            .hessian_diag(target.view(), rho.view())
+            .expect("ordered Beta--Bernoulli Hessian diagonal");
+        let scale = hessian.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        assert!(scale > 0.0, "case {case}: nonzero curvature");
+        let tol = 1e-12 * scale;
+        assert!(
+            exact_diag.iter().any(|&v| v < -1e-3 * scale),
+            "case {case}: the exact Hessian diagonal has negative entries"
+        );
+        let mut majorizer = Array2::<f64>::zeros((n, n));
+        for i in 0..n {
+            assert_abs_diff_eq!(diag[i], declared[i], epsilon = tol);
+            assert!(diag[i] >= 0.0, "case {case}: B must be PSD");
+            majorizer[[i, i]] = diag[i];
+        }
+        let min_eig = <Array2<f64> as PenaltyOp>::eigendecompose(&(&majorizer - &hessian))
+            .expect("symmetric eigensolve")
+            .0
+            .iter()
+            .fold(f64::INFINITY, |acc, &v| acc.min(v));
+        assert!(
+            min_eig >= -tol,
+            "case {case}: B must dominate the exact Hessian; min eig(B - H) = {min_eig:.3e}"
+        );
+
+        let kind = AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, target.clone(), rho.clone())
+            .expect("frozen operator");
+        let op_diag = op.diag();
+        for i in 0..n {
+            assert_abs_diff_eq!(op_diag[i], declared[i], epsilon = tol);
+        }
+        let lambda = 0.3;
+        let expected: f64 = declared.iter().map(|&d| (d + lambda).ln()).sum();
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
+}
+
 #[test]
 fn ordered_beta_bernoulli_assignment_learnable_alpha_grad_rho_matches_value_finite_difference() {
     let pen = OrderedBetaBernoulliPenalty::new(3, 6.0, 0.8, true);
@@ -1319,7 +1402,11 @@ fn block_orthogonality_hvp_matches_gradient_directional_derivative() {
 }
 
 #[test]
-fn block_orthogonality_hessian_diag_matches_finite_difference() {
+fn block_orthogonality_hessian_is_dense_so_it_exposes_no_diagonal_3863() {
+    // The exact Hessian couples every row, so a `Some` diagonal would be read
+    // as the curvature (default `psd_majorizer_hvp`, SAE `htt`, spatial
+    // hyper-direction Hessian) and understate it. The exact curvature is the
+    // HVP, whose unit-probe diagonal matches finite differences of the gradient.
     let t = block_ortho_test_target();
     let n = t.len();
     let target = PsiSlice::full(n, Some(4));
@@ -1327,25 +1414,212 @@ fn block_orthogonality_hessian_diag_matches_finite_difference() {
         BlockOrthogonalityPenalty::new(target, vec![vec![0_usize, 1], vec![2, 3]], 0.9, 4, false)
             .expect("valid block orthogonality penalty");
     let rho = array![0.0_f64];
-    let diag = pen
-        .hessian_diag(t.view(), rho.view())
-        .expect("hessian_diag must be available");
-    assert_eq!(diag.len(), n);
+    assert!(pen.hessian_diag(t.view(), rho.view()).is_none());
+    assert!(pen.psd_majorizer_diag(t.view(), rho.view()).is_none());
     let eps = 1e-5;
+    let mut e = Array1::<f64>::zeros(n);
     for i in 0..n {
+        e[i] = 1.0;
+        let h_ii = pen.hvp(t.view(), rho.view(), e.view())[i];
+        e[i] = 0.0;
         let mut tp = t.clone();
         let mut tm = t.clone();
         tp[i] += eps;
         tm[i] -= eps;
         let gp = pen.grad_target(tp.view(), rho.view())[i];
         let gm = pen.grad_target(tm.view(), rho.view())[i];
-        let fd = (gp - gm) / (2.0 * eps);
-        assert_abs_diff_eq!(diag[i], fd, epsilon = 1e-5);
+        assert_abs_diff_eq!(h_ii, (gp - gm) / (2.0 * eps), epsilon = 1e-5);
+    }
+}
+
+/// Dense matrix of `op(e_j)` over the standard basis.
+fn dense_from_probes(n: usize, op: impl Fn(ArrayView1<'_, f64>) -> Array1<f64>) -> Array2<f64> {
+    let mut dense = Array2::<f64>::zeros((n, n));
+    let mut e = Array1::<f64>::zeros(n);
+    for j in 0..n {
+        e[j] = 1.0;
+        dense.column_mut(j).assign(&op(e.view()));
+        e[j] = 0.0;
+    }
+    dense
+}
+
+fn symmetric_eigenvalues(m: &Array2<f64>) -> Array1<f64> {
+    let (evals, _) = m.eigh(Side::Lower).expect("symmetric eigendecomposition");
+    evals
+}
+
+fn min_eigenvalue(m: &Array2<f64>) -> f64 {
+    symmetric_eigenvalues(m)
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min)
+}
+
+fn spectral_radius(m: &Array2<f64>) -> f64 {
+    symmetric_eigenvalues(m)
+        .iter()
+        .fold(0.0_f64, |acc, value| acc.max(value.abs()))
+}
+
+/// Deterministic, non-degenerate `n × d` latent block, row-major.
+fn pseudo_random_block(n_obs: usize, d: usize, amplitude: f64) -> Array1<f64> {
+    Array1::from_shape_fn(n_obs * d, |i| {
+        amplitude * ((1.7 * i as f64 + 0.3).sin() + 0.5 * (0.9 * (i * i) as f64 + 1.1).cos())
+    })
+}
+
+/// #3863 — BlockOrthogonality's PSD majorizer used to be the exact Hessian
+/// diagonal, which is not `⪰ H` (the issue's FD table: λ_min(diag(H) − H) =
+/// −14.46 and −11.78). The row-block majorizer `I_n ⊗ M` must dominate the
+/// exact, indefinite Hessian, be PSD, and be row-block diagonal with the block
+/// `psd_majorizer_row_block` reports (the shape the SAE `htt` probe assumes).
+#[test]
+fn block_orthogonality_psd_majorizer_dominates_exact_hessian_3863() {
+    let cases: Vec<(Array1<f64>, usize, usize, Vec<Vec<usize>>, f64)> = vec![
+        (block_ortho_test_target(), 4, 4, vec![vec![0, 1], vec![2, 3]], 0.9),
+        (pseudo_random_block(4, 2, 1.0), 4, 2, vec![vec![0], vec![1]], 1.0),
+        (pseudo_random_block(6, 3, 1.0), 6, 3, vec![vec![0], vec![1, 2]], 1.0),
+        (pseudo_random_block(7, 5, 0.6), 7, 5, vec![vec![0, 3], vec![1], vec![2, 4]], 2.3),
+    ];
+    let rho = array![0.0_f64];
+    for (t, n_obs, d, groups, weight) in cases {
+        let dim = n_obs * d;
+        let pen = BlockOrthogonalityPenalty::new(
+            PsiSlice::full(dim, Some(d)),
+            groups.clone(),
+            weight,
+            n_obs,
+            false,
+        )
+        .expect("valid block orthogonality penalty");
+        let exact = pen.as_dense(t.view(), rho.view());
+        let majorizer =
+            dense_from_probes(dim, |v| pen.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let block = pen
+            .psd_majorizer_row_block(t.view(), rho.view())
+            .expect("row-block majorizer");
+        let scale = spectral_radius(&exact).max(spectral_radius(&majorizer));
+        let tol = 1e-12 * scale;
+        for i in 0..dim {
+            for j in 0..dim {
+                let expected = if i / d == j / d {
+                    block[[i % d, j % d]]
+                } else {
+                    0.0
+                };
+                assert_eq!(majorizer[[i, j]], expected, "{groups:?}: B is not I_n ⊗ M");
+            }
+        }
         assert!(
-            diag[i] >= 0.0,
-            "hessian_diag entry must be PSD; got {}",
-            diag[i]
+            min_eigenvalue(&majorizer) >= -tol,
+            "{groups:?}: majorizer is not PSD"
         );
+        let gap = &majorizer - &exact;
+        let gap_min = min_eigenvalue(&gap);
+        assert!(
+            gap_min >= -tol,
+            "{groups:?}: λ_min(B − H) = {gap_min:.3e} < 0; B does not majorize H"
+        );
+        if n_obs != 4 || d != 4 {
+            // The generic blocks reproduce the issue's defect: H is indefinite
+            // and its own diagonal does not majorize it.
+            assert!(min_eigenvalue(&exact) < -tol, "{groups:?}: H should be indefinite");
+            let diag_gap = Array2::from_diag(&exact.diag()) - &exact;
+            assert!(
+                min_eigenvalue(&diag_gap) < -tol,
+                "{groups:?}: diag(H) should fail to majorize H"
+            );
+        }
+    }
+}
+
+/// #3863 — OrthogonalityPenalty had no majorizer, so `psd_majorizer_hvp` was
+/// the exact, indefinite HVP. Replacing `G = TᵀT − I` by its PSD part must give
+/// a PSD operator that dominates `H`, and where `G ⪰ 0` already (every
+/// eigenvalue of `TᵀT` above one) it must coincide with `H` up to the
+/// certified rounding lift.
+#[test]
+fn orthogonality_psd_majorizer_dominates_exact_hessian_3863() {
+    let rho = array![0.0_f64];
+    for (n_obs, d, amplitude, expect_indefinite) in
+        [(5_usize, 2_usize, 0.3, true), (6, 3, 0.4, true), (6, 2, 3.0, false)]
+    {
+        let dim = n_obs * d;
+        let pen = OrthogonalityPenalty::new(PsiSlice::full(dim, Some(d)), d, 1.7, n_obs, false)
+            .expect("valid orthogonality penalty");
+        let t = pseudo_random_block(n_obs, d, amplitude);
+        let exact = dense_from_probes(dim, |v| pen.hvp(t.view(), rho.view(), v));
+        let majorizer =
+            dense_from_probes(dim, |v| pen.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let scale = spectral_radius(&exact).max(spectral_radius(&majorizer));
+        let tol = 1e-12 * scale;
+        assert_eq!(min_eigenvalue(&exact) < -tol, expect_indefinite);
+        assert!(min_eigenvalue(&majorizer) >= -tol, "majorizer is not PSD");
+        let gap = &majorizer - &exact;
+        assert!(min_eigenvalue(&gap) >= -tol, "B does not majorize H");
+        if !expect_indefinite {
+            assert!(
+                spectral_radius(&gap) <= 1e-10 * scale,
+                "majorizer must equal H where TᵀT ⪰ I"
+            );
+        }
+    }
+}
+
+/// #3863 — the frozen operator answered `matvec`/`diag` from the majorizer but
+/// `as_dense`/`log det` from the exact Hessian (BlockOrthogonality), or refused
+/// the log det outright (Orthogonality). All four faces now read one PSD
+/// majorizer.
+#[test]
+fn frozen_orthogonality_operators_read_one_psd_majorizer_3863() {
+    let n_obs = 6;
+    let d = 3;
+    let dim = n_obs * d;
+    let t = pseudo_random_block(n_obs, d, 0.4);
+    let kinds = vec![
+        AnalyticPenaltyKind::BlockOrthogonality(Arc::new(
+            BlockOrthogonalityPenalty::new(
+                PsiSlice::full(dim, Some(d)),
+                vec![vec![0], vec![1, 2]],
+                1.3,
+                n_obs,
+                false,
+            )
+            .expect("block orthogonality"),
+        )),
+        AnalyticPenaltyKind::Orthogonality(Arc::new(
+            OrthogonalityPenalty::new(PsiSlice::full(dim, Some(d)), d, 1.3, n_obs, false)
+                .expect("orthogonality"),
+        )),
+    ];
+    for kind in kinds {
+        let rho = Array1::<f64>::zeros(kind.rho_count());
+        let majorizer =
+            dense_from_probes(dim, |v| kind.psd_majorizer_hvp(t.view(), rho.view(), v));
+        let op = FrozenAnalyticPenaltyOp::new(kind, t.clone(), rho).expect("frozen operator");
+        let scale = spectral_radius(&majorizer);
+        let dense = op.as_dense();
+        let diag = op.diag();
+        let mut matvec_dense = Array2::<f64>::zeros((dim, dim));
+        let mut e = Array1::<f64>::zeros(dim);
+        for j in 0..dim {
+            e[j] = 1.0;
+            op.matvec(e.view(), matvec_dense.column_mut(j));
+            e[j] = 0.0;
+        }
+        for i in 0..dim {
+            assert_abs_diff_eq!(diag[i], majorizer[[i, i]], epsilon = 1e-12 * scale);
+            for j in 0..dim {
+                assert_abs_diff_eq!(dense[[i, j]], majorizer[[i, j]], epsilon = 1e-12 * scale);
+                assert_abs_diff_eq!(matvec_dense[[i, j]], majorizer[[i, j]], epsilon = 1e-12 * scale);
+            }
+        }
+        let lambda = 0.3;
+        let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&majorizer, lambda)
+            .expect("dense log det");
+        let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-10 * expected.abs().max(1.0));
     }
 }
 
@@ -1681,6 +1955,60 @@ fn scadmcp_value_grad_self_consistent_fd() {
         worst <= 1.0e-5,
         "ScadMcp value↔grad FD max abs error = {worst:.3e}"
     );
+}
+
+/// The frozen SCAD/MCP operator applies the PSD majorizer in `matvec`, but its
+/// `diag` and `log_det_plus_lambda_i` used to read the exact Hessian diagonal,
+/// which carries the concave constant `−1/γ` (MCP) / `−1/(γ−1)` (SCAD) across
+/// the taper region: the operator disagreed with itself, and a small `λ`
+/// shift made the log-determinant refuse. All three must be the majorizer.
+#[test]
+fn scadmcp_frozen_diag_and_log_det_are_the_psd_majorizer() {
+    let n_eff = 6usize;
+    let t = array![0.02_f64, 0.3, 0.9, 1.6, -1.1, -2.5];
+    let rho = Array1::<f64>::zeros(0);
+    for (variant, gamma) in [(PenaltyConcavity::Mcp, 3.0), (PenaltyConcavity::Scad, 3.7)] {
+        let pen = ScadMcpPenalty::new(
+            PsiSlice::full(n_eff, Some(1)),
+            0.5,
+            n_eff,
+            gamma,
+            1.0e-4,
+            variant,
+            false,
+        )
+        .unwrap();
+        let exact = pen.hessian_diag(t.view(), rho.view()).unwrap();
+        let majorizer = pen.psd_majorizer_diag(t.view(), rho.view()).unwrap();
+        let lambda = 0.1;
+        assert!(
+            exact.iter().any(|&h| h + lambda < 0.0),
+            "{variant:?}: the exact diagonal is negative past the λ shift in the taper"
+        );
+        let kind = AnalyticPenaltyKind::ScadMcp(Arc::new(pen.clone()));
+        let op = FrozenAnalyticPenaltyOp::new(kind, t.clone(), rho.clone()).unwrap();
+        let diag = op.diag();
+        let mut e = Array1::<f64>::zeros(n_eff);
+        let mut column = Array1::<f64>::zeros(n_eff);
+        let mut expected = 0.0;
+        for i in 0..n_eff {
+            assert!(majorizer[i] >= 0.0, "{variant:?}: B must be PSD");
+            assert!(
+                majorizer[i] >= exact[i],
+                "{variant:?}: B must dominate the exact Hessian"
+            );
+            e[i] = 1.0;
+            op.matvec(e.view(), column.view_mut());
+            e[i] = 0.0;
+            assert_eq!(diag[i], majorizer[i], "{variant:?}: diag is the majorizer");
+            assert_eq!(column[i], diag[i], "{variant:?}: diag agrees with matvec");
+            expected += (majorizer[i] + lambda).ln();
+        }
+        let log_det = op
+            .log_det_plus_lambda_i(lambda)
+            .expect("the majorizer log-determinant is finite for every λ > 0");
+        assert_abs_diff_eq!(log_det, expected, epsilon = 1e-12 * expected.abs().max(1.0));
+    }
 }
 
 #[test]
@@ -2595,4 +2923,61 @@ fn frozen_penalty_diag_and_log_det_are_exact_past_dimension_1024_2900() {
         .expect("dense log det");
     let log_det = op.log_det_plus_lambda_i(lambda).expect("frozen log det");
     assert_abs_diff_eq!(log_det, exact, epsilon = 1e-9 * exact.abs().max(1.0));
+}
+
+/// The row-precision energy ½ tᵀΛt reads only the symmetric part of Λ, so a
+/// penalty built from an asymmetric Λ is the penalty built from (Λ + Λᵀ)/2:
+/// value, gradient, curvature and the log-determinant agree exactly. An input
+/// whose symmetric part is singular is still refused as not positive definite,
+/// whatever its skew part (#2469).
+#[test]
+fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
+    let target = PsiSlice::full(4, Some(2));
+    let asymmetric = array![[[2.0_f64, 1.5], [0.5, 2.0]], [[3.0, -0.25], [0.75, 1.0]]];
+    let symmetric = array![[[2.0_f64, 1.0], [1.0, 2.0]], [[3.0, 0.25], [0.25, 1.0]]];
+    let from_asymmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), asymmetric, 1.3, 2, true).unwrap();
+    let from_symmetric =
+        RowPrecisionPriorPenalty::new(target.clone(), symmetric.clone(), 1.3, 2, true).unwrap();
+    assert_eq!(from_asymmetric.lambda_per_row, symmetric);
+
+    let t = array![0.7_f64, -1.1, 0.4, 2.3];
+    let rho = array![0.2_f64];
+    assert_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        from_symmetric.value(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.grad_target(t.view(), rho.view()),
+        from_symmetric.grad_target(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.as_dense(t.view(), rho.view()),
+        from_symmetric.as_dense(t.view(), rho.view())
+    );
+    assert_eq!(
+        from_asymmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap(),
+        from_symmetric.log_det_plus_lambda_i(rho.view(), 0.5).unwrap()
+    );
+    // The value is the quadratic form of the stored matrix plus the Gaussian
+    // normalizer −½·len·ln μ of the learnable strength.
+    let weight = 1.3 * 0.2_f64.exp();
+    let mut energy = 0.0;
+    for n in 0..2 {
+        for i in 0..2 {
+            for j in 0..2 {
+                energy += t[2 * n + i] * symmetric[[n, i, j]] * t[2 * n + j];
+            }
+        }
+    }
+    assert_abs_diff_eq!(
+        from_asymmetric.value(t.view(), rho.view()),
+        0.5 * weight * energy - 0.5 * 4.0 * weight.ln(),
+        epsilon = 1e-12
+    );
+
+    // [[1, 3], [−1, 1]] has symmetric part [[1, 1], [1, 1]], eigenvalues {0, 2}.
+    let singular_part = array![[[1.0_f64, 3.0], [-1.0, 1.0]], [[1.0, 0.0], [0.0, 1.0]]];
+    let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
+    assert!(refused.unwrap_err().contains("must be positive definite"));
 }

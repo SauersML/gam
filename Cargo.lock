@@ -3923,6 +3923,7 @@ dependencies = [
  "gam",
  "gam-build-identity",
  "gam-math",
+ "gam-model-api",
  "gam-predict",
  "gam-runtime",
  "log",
@@ -4210,7 +4211,7 @@ dependencies = [
 [[package]]
 name = "general-mcmc"
 version = "0.10.1"
-source = "git+https://github.com/SauersML/general-mcmc.git?rev=adc78bb049a81da80089330f9db43d8a45d8ed2d#adc78bb049a81da80089330f9db43d8a45d8ed2d"
+source = "git+https://github.com/SauersML/general-mcmc.git?rev=c6e415dc8fd7f0f88e191173688f418b176507ad#c6e415dc8fd7f0f88e191173688f418b176507ad"
 dependencies = [
  "burn",
  "indicatif",
@@ -6427,7 +6428,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opt"
 version = "0.9.0"
-source = "git+https://github.com/SauersML/opt.git?rev=766b721ef230868f63b9b0e9ec7b904dc88d0218#766b721ef230868f63b9b0e9ec7b904dc88d0218"
+source = "git+https://github.com/SauersML/opt.git?rev=4d26c445cde3fccd62aedaa87910a85af734c69a#4d26c445cde3fccd62aedaa87910a85af734c69a"
 dependencies = [
  "faer",
  "log",

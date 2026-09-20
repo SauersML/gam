@@ -9,10 +9,11 @@ use super::evaluation::{
     sas_effective_epsilon, sas_effective_epsilon_second, sas_log_delta_edge_barriercostgrad,
     sas_log_delta_edge_barriercostgradhess,
 };
-use super::external_options::resolve_external_family;
+use super::external_options::{resolve_external_family, resolved_external_config};
 use super::optimizer::freeze_lambda_search_nuisance_at_canonical_anchor;
 use super::prefit::{
-    PrefitRegularityDiagnostic, detect_prefit_binomial_single_column_separation_in_design,
+    PrefitRegularityDiagnostic, arm_jeffreys_on_prefit_binomial_separation,
+    detect_prefit_binomial_single_column_separation_in_design,
     detect_prefit_unpenalized_rank_deficiency_in_design, reject_prefit_binomial_separation,
     reject_prefit_unidentifiable_unpenalized_space, reject_prefit_unpenalized_rank_deficiency,
 };
@@ -451,6 +452,154 @@ fn prefit_binomial_logit_rejects_before_outer_solver() {
             ..
         }
     ));
+}
+
+fn binomial_arming_options(link: InverseLink, sas_link: Option<SasLinkSpec>) -> ExternalOptimOptions {
+    ExternalOptimOptions {
+        family: LikelihoodSpec::new(ResponseFamily::Binomial, link),
+        latent_cloglog: None,
+        mixture_link: None,
+        optimize_mixture: false,
+        optimize_sas: sas_link.is_some(),
+        sas_link,
+        compute_inference: false,
+        skip_rho_posterior_inference: false,
+        max_iter: 50,
+        tol: 1e-7,
+        nullspace_dims: Vec::new(),
+        linear_constraints: None,
+        firth_bias_reduction: None,
+        rho_prior: Default::default(),
+        persistent_warm_start_store: None,
+    }
+}
+
+fn dense_design(x: Array2<f64>) -> DesignMatrix {
+    DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(x))
+}
+
+/// #3129: the prior is decided from the realized design before any solve. A
+/// certified separator arms the Jeffreys prior and returns the certificate as
+/// the recorded reason; a design with a finite maximum likelihood keeps the
+/// flat prior and records nothing.
+#[test]
+fn prefit_separation_certificate_arms_jeffreys_before_any_solve_3129() {
+    let w = Array1::<f64>::ones(4);
+    for link in [StandardLink::Logit, StandardLink::Probit, StandardLink::CLogLog] {
+        let opts = binomial_arming_options(InverseLink::Standard(link), None);
+
+        let separated = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        assert!(!cfg.firth_bias_reduction);
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &separated,
+            &[],
+        )
+        .expect("a Firth-capable separated design is fitted, not refused");
+        assert!(
+            matches!(
+                evidence,
+                Some(gam_problem::jeffreys_arming::JeffreysArmingEvidence::PrefitColumnSeparation {
+                    column_index: 1,
+                    ..
+                })
+            ),
+            "{link:?}: {evidence:?}"
+        );
+        assert!(cfg.firth_bias_reduction, "{link:?}: the Jeffreys prior must be armed");
+
+        // The class supports interleave, so no line separates them and the
+        // MLE is finite.
+        let overlapping = dense_design(array![[1.0, -2.0], [1.0, 1.0], [1.0, -1.0], [1.0, 2.0]]);
+        let y = array![0.0, 0.0, 1.0, 1.0];
+        let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+        let evidence = arm_jeffreys_on_prefit_binomial_separation(
+            &mut cfg,
+            &opts,
+            y.view(),
+            w.view(),
+            &overlapping,
+            &[],
+        )
+        .expect("an overlapping design has a finite maximum likelihood");
+        assert!(evidence.is_none(), "{link:?}: {evidence:?}");
+        assert!(!cfg.firth_bias_reduction, "{link:?}: the flat prior must be kept");
+    }
+}
+
+/// #3129: the decision is a function of the design, so a perturbation of the
+/// covariate far below any separating gap cannot switch the estimator. The
+/// old reactive rescue switched on whether the flat-prior solve happened to
+/// fail, which such a perturbation can change.
+#[test]
+fn prefit_jeffreys_decision_is_stable_under_covariate_perturbation_3129() {
+    let n = 40;
+    let mut rng = StdRng::seed_from_u64(3129);
+    let opts = binomial_arming_options(InverseLink::Standard(StandardLink::Logit), None);
+    let w = Array1::<f64>::ones(n);
+    let base: Vec<f64> = (0..n).map(|i| -2.0 + 4.0 * i as f64 / (n as f64 - 1.0)).collect();
+    // Separated at 0, and overlapping through two swapped labels at the ends.
+    let separated_y = Array1::from_iter(base.iter().map(|&x| if x > 0.0 { 1.0 } else { 0.0 }));
+    let mut overlapping_y = separated_y.clone();
+    overlapping_y[0] = 1.0;
+    overlapping_y[n - 1] = 0.0;
+    for (y, expect_armed) in [(&separated_y, true), (&overlapping_y, false)] {
+        for trial in 0..8 {
+            let jitter = if trial == 0 { 0.0 } else { 1e-9 };
+            let mut x = Array2::<f64>::ones((n, 2));
+            for (i, &value) in base.iter().enumerate() {
+                x[[i, 1]] = value + jitter * (rng.random::<f64>() - 0.5);
+            }
+            let (mut cfg, _) = resolved_external_config(&opts).expect("binomial config");
+            let evidence = arm_jeffreys_on_prefit_binomial_separation(
+                &mut cfg,
+                &opts,
+                y.view(),
+                w.view(),
+                &dense_design(x),
+                &[],
+            )
+            .expect("a Firth-capable binomial design is never refused");
+            assert_eq!(evidence.is_some(), expect_armed, "trial {trial}: {evidence:?}");
+            assert_eq!(cfg.firth_bias_reduction, expect_armed, "trial {trial}");
+        }
+    }
+}
+
+/// #2654: an optimized SAS link appends outer coordinates the Firth outer
+/// derivative does not define, so its separation certificate stays a
+/// refusal instead of arming a prior the fit cannot carry.
+#[test]
+fn prefit_separation_with_optimized_sas_link_stays_a_refusal_3129() {
+    let sas = SasLinkSpec {
+        initial_epsilon: 0.0,
+        initial_log_delta: 0.0,
+    };
+    let state = crate::mixture_link::state_from_sasspec(sas).expect("valid SAS state");
+    let opts = binomial_arming_options(InverseLink::Sas(state), Some(sas));
+    let (mut cfg, _) = resolved_external_config(&opts).expect("SAS binomial config");
+    let design = dense_design(array![[1.0, -2.0], [1.0, -1.0], [1.0, 1.0], [1.0, 2.0]]);
+    let y = array![0.0, 0.0, 1.0, 1.0];
+    let w = Array1::<f64>::ones(4);
+    let err = arm_jeffreys_on_prefit_binomial_separation(
+        &mut cfg,
+        &opts,
+        y.view(),
+        w.view(),
+        &design,
+        &[],
+    )
+    .expect_err("an optimized SAS link cannot carry the Jeffreys prior");
+    assert!(matches!(
+        err,
+        EstimationError::PrefitPerfectSeparationDetected { column_index: 1, .. }
+    ));
+    assert!(!cfg.firth_bias_reduction);
 }
 
 #[test]
@@ -1108,6 +1257,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         }),
         fitted_link: FittedLinkState::Standard(None),
         geometry: Some(FitGeometry {

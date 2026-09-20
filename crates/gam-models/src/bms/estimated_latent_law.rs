@@ -13,10 +13,13 @@
 //!   ([`local_law_parts`]). The contexts are the covariates
 //!   the marginal formula reads, so a saved model replays the law from the
 //!   prediction table exactly as `LatentMeasureKind::LocalEmpirical` always has:
-//!   scale the columns, mix the `top_k` nearest centres and a fixed share of the
+//!   scale the columns, mix the `top_k` nearest centres and a share of the
 //!   pooled law, combine their grids. Every training row's mixture comes from the
-//!   same [`local_empirical_mixture_for_point`] prediction calls, so the law a
-//!   row is fitted under and the law it is predicted under are one object.
+//!   same [`nearest_centres`] and [`mixture_from_neighbours`] that prediction's
+//!   [`local_empirical_mixture_for_point`] composes, so the law a row is fitted
+//!   under and the law it is predicted under are one object. The kernel width
+//!   and the pooled share are chosen from the data
+//!   ([`super::local_law_resolution`]).
 
 use super::*;
 
@@ -35,17 +38,8 @@ const LOCAL_LAW_MAX_LLOYD_PASSES: usize = 50;
 const LOCAL_LAW_MIN_ROWS_PER_CONTEXT: usize = 3;
 /// A row's law mixes its four nearest contexts, the count the removed fit-time
 /// builder used (bd1c5ac5c5); it bounds a row's law at `4·grid_size` context
-/// nodes plus the pooled floor whatever the covariate dimension.
+/// nodes plus the pooled law whatever the covariate dimension.
 const LOCAL_LAW_TOP_K: usize = 4;
-/// The kernel bandwidth in the scaled covariates, one training standard
-/// deviation per column: the value the removed fit-time builder used
-/// (bd1c5ac5c5).
-const LOCAL_LAW_BANDWIDTH: f64 = 1.0;
-/// The fixed share of the pooled law in every row's mixture, in units of the
-/// kernel's peak `K(0) = 1`: `law(x) = (Σ_c w_c(x)·F_c + ε·F_pooled)/(Σ_c w_c(x) + ε)`.
-/// It keeps the normaliser positive where the `top_k + 1` nearest contexts tie
-/// and every truncated weight is zero, so the law is continuous everywhere.
-const LOCAL_LAW_POOLED_FLOOR: f64 = 1.0e-3;
 /// Fixed k-means++ seed, so a fit is a deterministic function of its data.
 const LOCAL_LAW_SEED: u64 = 0x2926_0CA1_1A77_0001;
 
@@ -85,9 +79,12 @@ pub(crate) fn marginal_formula_context_columns(
 }
 
 /// Robust Rao score tests of whether the conditional law of `z` moves on the
-/// marginal-index span `a(C)`: the conditional mean `z − z̄`, the conditional
-/// variance `(z − z̄)² − σ̂²`, and the third standardised moment
-/// `((z − z̄)/σ̂)³ − μ̂₃`, each against the weighted-centred span.
+/// marginal-index span `a(C)`: the conditional mean `z − z̄`, and on the
+/// conditional-mean residual `û = z − m̂(C)` the conditional variance
+/// `û² − σ̂²_û` and the third standardised moment `(û/σ̂_û)³ − μ̂₃`, each
+/// against the weighted-centred span. The higher moments are tested on `û`,
+/// not on `z − z̄`: a moving mean puts `(m(a) − m̄)²` into `(z − z̄)²`, which
+/// masks or fakes a moving variance (gam#3335).
 ///
 /// Centring the columns makes each test about structure beyond the global
 /// level; a constant column collapses and is dropped by the pseudo-inverse rank.
@@ -145,7 +142,6 @@ pub(crate) fn conditional_law_evidence(
         // refuses it for what it is.
         return Ok(untestable);
     }
-    let sd = var.sqrt();
     let mut a_centered = a_block.to_owned();
     for j in 0..a_block.ncols() {
         let col_mean = a_block
@@ -158,31 +154,122 @@ pub(crate) fn conditional_law_evidence(
         a_centered.column_mut(j).mapv_inplace(|v| v - col_mean);
     }
     let centred: Vec<f64> = z.iter().map(|&zi| zi - mean).collect();
-    let squared: Vec<f64> = centred.iter().map(|&e| e * e - var).collect();
-    let third_moment = centred
+    let mean_p_value =
+        robust_conditional_score_pvalue(a_centered.view(), &centred, weights.view())?;
+    let mean_stage = fit_conditional_mean_stage(z, weights, a_block)?;
+    let residuals = &mean_stage.residuals;
+    let residual_var = residuals
+        .iter()
+        .zip(weights.iter())
+        .map(|(&e, &w)| w * e * e)
+        .sum::<f64>()
+        / total_weight;
+    if !(residual_var.is_finite() && residual_var > 0.0) {
+        // `z` lies exactly on the span: there is no residual law whose scale or
+        // shape could move.
+        return Ok(ConditionalLawEvidence {
+            mean_p_value,
+            ..untestable
+        });
+    }
+    let sd = residual_var.sqrt();
+    let squared: Vec<f64> = residuals.iter().map(|&e| e * e - residual_var).collect();
+    let squared_slope: Vec<f64> = residuals.iter().map(|&e| 2.0 * e).collect();
+    let third_moment = residuals
         .iter()
         .zip(weights.iter())
         .map(|(&e, &w)| w * (e / sd).powi(3))
         .sum::<f64>()
         / total_weight;
-    let cubed: Vec<f64> = centred
+    let cubed: Vec<f64> = residuals
         .iter()
         .map(|&e| (e / sd).powi(3) - third_moment)
         .collect();
+    let cubed_slope: Vec<f64> = residuals
+        .iter()
+        .map(|&e| 3.0 * (e / sd).powi(2) / sd)
+        .collect();
     Ok(ConditionalLawEvidence {
-        mean_p_value: robust_conditional_score_pvalue(a_centered.view(), &centred, weights.view())?,
-        variance_p_value: robust_conditional_score_pvalue(
+        mean_p_value,
+        variance_p_value: residual_moment_score_pvalue(
             a_centered.view(),
+            weights.view(),
+            &mean_stage,
             &squared,
-            weights.view(),
+            &squared_slope,
         )?,
-        skewness_p_value: robust_conditional_score_pvalue(
+        skewness_p_value: residual_moment_score_pvalue(
             a_centered.view(),
-            &cubed,
             weights.view(),
+            &mean_stage,
+            &cubed,
+            &cubed_slope,
         )?,
         alpha: AUTO_Z_CONDITIONAL_RAO_ALPHA,
     })
+}
+
+/// Robust score test of a residual moment `g(û_i) − ḡ` against the centred span
+/// `ã`, with the conditional-mean stage `β̂` ESTIMATED.
+///
+/// The score `S(β̂) = Σ_i w_i (g(û_i) − ḡ) ã_i` moves with the mean stage at
+/// first order, `∂S/∂β = −G` with `G = Σ_i w_i g'(û_i) ã_i A_iᵀ`, and the ridge
+/// solve gives `β̂ − β = M⁻¹ Σ_i w_i A_i û_i`. `G` is not small: a curved mean
+/// (`E[û | a] ≠ 0`) makes it `O(n)` for the variance moment, and
+/// `E[ã·aᵀ·û²] = Var(a)·σ²` makes it `O(n)` for the third moment on any mean.
+/// The naive meat is then the variance of a score whose nuisance is known,
+/// which this one's is not, so the contributions carry the propagated stage,
+///
+/// ```text
+/// ψ_i = w_i (g(û_i) − ḡ) ã_i − G M⁺ (w_i û_i A_i),
+/// ```
+///
+/// the cross-stage channel of the stacked first-stage bread
+/// ([`stacked_first_stage_inverse_bread`]). The estimated `ḡ` and the weighted
+/// centring of `ã` need no term: `Σ_i w_i ã_i = 0` and
+/// `Σ_i w_i (g(û_i) − ḡ) = 0` exactly. `moment` holds `g(û_i) − ḡ` and
+/// `moment_slope` holds `g'(û_i)`.
+fn residual_moment_score_pvalue(
+    a_centered: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    mean_stage: &ConditionalMeanStage,
+    moment: &[f64],
+    moment_slope: &[f64],
+) -> Result<Option<f64>, String> {
+    let n = a_centered.nrows();
+    let p = mean_stage.basis.ncols();
+    // `diag(w g') A` for `G = ãᵀ diag(w g') A` (r × p), and the mean-stage
+    // influence rows `w_i û_i A_iᵀ` (n × p). A non-positive weight is a row the
+    // ridge did not see.
+    let mut weighted_slope_basis = mean_stage.basis.to_owned();
+    let mut mean_influence = mean_stage.basis.to_owned();
+    let mut contributions = a_centered.to_owned();
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        let slope_scale = wi * moment_slope[i];
+        let influence_scale = wi * mean_stage.residuals[i];
+        let moment_scale = wi * moment[i];
+        weighted_slope_basis
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= slope_scale);
+        mean_influence
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= influence_scale);
+        contributions
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= moment_scale);
+    }
+    let g = a_centered.t().dot(&weighted_slope_basis);
+    let m_pinv = preconditioned_normal_pseudoinverse(&mean_stage.normal, n)?;
+    // Row `i` of `mean_influence · (G M⁺)ᵀ` is the propagated stage `G M⁺ (w_i û_i A_i)`.
+    let propagation = g.dot(&m_pinv).reversed_axes();
+    contributions -= &mean_influence.dot(&propagation);
+    // `w_i·(g_i − ḡ)·ã_ij` takes three roundings, the length-`p` correction
+    // `p + 2`, and the subtraction one.
+    robust_score_contributions_pvalue(&contributions, p + 6)
 }
 
 /// Equal-mass compression of `(z, weights)` into an at-most-`grid_size`-node
@@ -230,20 +317,23 @@ pub(crate) fn build_empirical_law_on_own_axis(
 /// The Gaussian closed form's anchoring residual at one survival anchor under a
 /// finite law (gam#2926): `r = Σ_k w_k Φ(−(α_cf + b·u_k)) − Φ(−q)` at
 /// `α_cf = q·√(1+b²)`, the standard deviation of `Φ(−(α_cf + b·U))` under the
-/// law, and `π(1−π)` with `π = Φ(−q)`. The sums run on the smaller tail, so a
-/// survival probability near one keeps its precision.
+/// law, `π(1−π)` with `π = Φ(−q)`, and the smaller-tail probabilities at the law's
+/// nodes. The sums run on the smaller tail, so a survival probability near one keeps
+/// its precision.
 pub(crate) fn closed_form_survival_anchoring_residual(
     q: f64,
     observed_slope: f64,
     law: &EmpiricalZGrid,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, Vec<f64>) {
     let alpha = q * (1.0 + observed_slope * observed_slope).sqrt();
     let probabilities: Vec<f64> = law
         .nodes
         .iter()
         .map(|&u| survival_tail_probability(q, alpha + observed_slope * u))
         .collect();
-    anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities)
+    let (residual, law_sd, scale) =
+        anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities);
+    (residual, law_sd, scale, probabilities)
 }
 
 /// The moving-law certificate's `(ln S, ln(1 − S))` of one rigid survival anchor
@@ -392,10 +482,28 @@ fn recompute_centers(
     }
 }
 
+/// The kernel width and pooled share of a local law (gam#3610): a row's law is
+/// `(Σ_c u_c(x)·F_c + floor·F_pooled)/(Σ_c u_c(x) + floor)` with
+/// `u_c = K(d_c) − K(d_{top_k+1})` and `K(d) = exp(−d²/2·bandwidth²)` in the
+/// scaled covariates. Both are chosen from the data by
+/// [`super::local_law_resolution::select_local_law_resolution`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LocalLawResolution {
+    pub(crate) bandwidth: f64,
+    pub(crate) floor: f64,
+}
+
+impl LocalLawResolution {
+    fn mixture(self) -> LocalLawMixture {
+        LocalLawMixture::VanishingAtTruncation { floor: self.floor }
+    }
+}
+
 /// A local law before any row's mixture (gam#2926): the kept context columns
 /// and their scales, every row's scaled point, and the contexts' centres and
-/// laws with the pooled floor last. [`Self::into_kind`] mixes every training row;
-/// the moving-law certificate mixes only the rows a held-out law scores.
+/// laws with the pooled law last. [`Self::into_kind`] mixes every training row
+/// at a resolution; the moving-law certificate keeps only the rows a held-out
+/// law scores ([`Self::held_out`]).
 pub(crate) struct LocalLawParts {
     feature_cols: Vec<usize>,
     input_scales: Vec<f64>,
@@ -403,8 +511,6 @@ pub(crate) struct LocalLawParts {
     centers: Vec<Vec<f64>>,
     grids: Vec<EmpiricalZGrid>,
     top_k: usize,
-    bandwidth: f64,
-    mixture: LocalLawMixture,
 }
 
 impl LocalLawParts {
@@ -413,50 +519,59 @@ impl LocalLawParts {
         self.centers.len()
     }
 
-    /// The `(grid, weight)` pairs of row `row`'s law: its nearest centres and the
-    /// pooled floor, from the one function prediction uses.
-    pub(crate) fn row_mixture(&self, row: usize) -> Result<Vec<(usize, f64)>, String> {
+    /// Row `row`'s nearest centres, from the one function prediction uses.
+    fn row_neighbours(&self, row: usize) -> Result<Vec<(usize, f64)>, String> {
         let point = self.points.row(row).to_vec();
-        local_empirical_mixture_for_point(
-            &point,
-            &self.centers,
-            self.top_k,
-            self.bandwidth,
-            self.mixture,
-        )
+        nearest_centres(&point, &self.centers, self.top_k)
     }
 
-    /// The law, keeping only the mixtures of `rows`, in that order: a held-out law
-    /// of the moving-law certificate is read at its own fold's rows alone, so it
-    /// stores `(top_k + 1)` pairs per such row and nothing for the rest.
+    /// The law, keeping only the nearest centres of `rows`, in that order: a
+    /// held-out law of the moving-law certificate is read at its own fold's rows
+    /// alone, so it stores `top_k + 1` `(centre, squared distance)` pairs per such
+    /// row and nothing for the rest. The pairs do not depend on the resolution, so
+    /// the resolution is chosen on them ([`HeldOutLocalLaw::grid`] reads a row's
+    /// law at any).
     pub(crate) fn held_out(self, rows: &[usize]) -> Result<HeldOutLocalLaw, String> {
-        let mixtures = rows
+        let neighbours = rows
             .par_iter()
-            .map(|&row| self.row_mixture(row))
+            .map(|&row| self.row_neighbours(row))
             .collect::<Result<Vec<_>, String>>()?;
         let mut offsets = Vec::with_capacity(rows.len() + 1);
         offsets.push(0);
-        let mut entries = Vec::with_capacity(mixtures.iter().map(Vec::len).sum());
-        for mixture in mixtures {
-            entries.extend(mixture);
+        let mut entries = Vec::with_capacity(neighbours.iter().map(Vec::len).sum());
+        for row in neighbours {
+            entries.extend(row);
             offsets.push(entries.len());
         }
         Ok(HeldOutLocalLaw {
             grids: self.grids,
+            top_k: self.top_k,
             offsets,
-            entries,
+            neighbours: entries,
         })
     }
 
-    /// The local latent measure, with the mixture of every row of the table the
-    /// law was built over: the rows it was estimated from and the zero-weight
-    /// rows alike, since a row's mixture reads only its covariates. A held-out
-    /// law of the moving-law certificate keeps its fold's rows alone
+    /// The local latent measure at `resolution`, with the mixture of every row of
+    /// the table the law was built over: the rows it was estimated from and the
+    /// zero-weight rows alike, since a row's mixture reads only its covariates. A
+    /// held-out law of the moving-law certificate keeps its fold's rows alone
     /// ([`Self::held_out`]); the full-data law is the one copy with all `n`.
-    pub(crate) fn into_kind(self) -> Result<LatentMeasureKind, String> {
+    pub(crate) fn into_kind(
+        self,
+        resolution: LocalLawResolution,
+    ) -> Result<LatentMeasureKind, String> {
+        let pooled = self.centers.len();
         let train_row_mixtures = (0..self.points.nrows())
             .into_par_iter()
-            .map(|row| self.row_mixture(row))
+            .map(|row| {
+                mixture_from_neighbours(
+                    &self.row_neighbours(row)?,
+                    pooled,
+                    self.top_k,
+                    resolution.bandwidth,
+                    resolution.mixture(),
+                )
+            })
             .collect::<Result<Vec<_>, String>>()?;
         let kind = LatentMeasureKind::LocalEmpirical {
             feature_cols: self.feature_cols,
@@ -464,8 +579,8 @@ impl LocalLawParts {
             centers: self.centers,
             grids: self.grids,
             top_k: self.top_k,
-            bandwidth: self.bandwidth,
-            mixture: self.mixture,
+            bandwidth: resolution.bandwidth,
+            mixture: resolution.mixture(),
             train_row_mixtures: Arc::new(train_row_mixtures),
         };
         kind.validate("estimated local latent law")?;
@@ -473,28 +588,62 @@ impl LocalLawParts {
     }
 }
 
-/// A local law's context laws and the mixtures of the rows it is read at
-/// ([`LocalLawParts::held_out`]).
+/// A local law's context laws, the pooled law last, and the nearest centres of
+/// the rows it is read at ([`LocalLawParts::held_out`]).
 pub(crate) struct HeldOutLocalLaw {
     grids: Vec<EmpiricalZGrid>,
+    top_k: usize,
     offsets: Vec<usize>,
-    entries: Vec<(usize, f64)>,
+    neighbours: Vec<(usize, f64)>,
 }
 
 impl HeldOutLocalLaw {
-    /// The law of the `position`-th of the rows the law was kept for.
-    pub(crate) fn grid(&self, position: usize) -> Result<EmpiricalZGrid, String> {
-        let next = position.checked_add(1).and_then(|next| self.offsets.get(next));
-        let (start, end) = match (self.offsets.get(position), next) {
-            (Some(&start), Some(&end)) => (start, end),
-            _ => {
-                return Err(format!(
-                    "held-out local latent law has no row at position {position} of {}",
-                    self.offsets.len().saturating_sub(1)
-                ));
-            }
-        };
-        combine_empirical_grids(&self.grids, &self.entries[start..end])
+    /// The context laws, with the pooled law last.
+    pub(crate) fn grids(&self) -> &[EmpiricalZGrid] {
+        &self.grids
+    }
+
+    /// How many nearest contexts a row's law mixes.
+    pub(crate) fn top_k(&self) -> usize {
+        self.top_k
+    }
+
+    /// The number of rows the law was kept for.
+    pub(crate) fn rows(&self) -> usize {
+        self.offsets.len().saturating_sub(1)
+    }
+
+    /// The nearest `(centre, squared distance)` pairs of the `position`-th of the
+    /// rows the law was kept for, nearest first: `top_k + 1` of them, or every
+    /// centre when there are no more.
+    pub(crate) fn neighbours(&self, position: usize) -> Result<&[(usize, f64)], String> {
+        let next = position
+            .checked_add(1)
+            .and_then(|next| self.offsets.get(next));
+        match (self.offsets.get(position), next) {
+            (Some(&start), Some(&end)) => Ok(&self.neighbours[start..end]),
+            _ => Err(format!(
+                "held-out local latent law has no row at position {position} of {}",
+                self.rows()
+            )),
+        }
+    }
+
+    /// The law of the `position`-th of the rows the law was kept for, at
+    /// `resolution`.
+    pub(crate) fn grid(
+        &self,
+        position: usize,
+        resolution: LocalLawResolution,
+    ) -> Result<EmpiricalZGrid, String> {
+        let mixture = mixture_from_neighbours(
+            self.neighbours(position)?,
+            self.grids.len() - 1,
+            self.top_k,
+            resolution.bandwidth,
+            resolution.mixture(),
+        )?;
+        combine_empirical_grids(&self.grids, &mixture)
     }
 }
 
@@ -511,9 +660,9 @@ impl HeldOutLocalLaw {
 /// certificate reuses from its full-data law. Each context's grid is the
 /// equal-mass law of its own rows on the score's own axis, and the pooled law of
 /// every row follows the context grids. A row's law mixes its four nearest
-/// centres, with Gaussian-kernel weights of bandwidth `LOCAL_LAW_BANDWIDTH` that
-/// vanish where a centre leaves the four, and the pooled law at the fixed share
-/// `LOCAL_LAW_POOLED_FLOOR`. Only the (context, weight) pairs are kept per row.
+/// centres, with Gaussian-kernel weights that vanish where a centre leaves the
+/// four, and the pooled law; the kernel width and the pooled share are the
+/// [`LocalLawResolution`] a caller chooses from the held-out laws.
 pub(crate) fn local_law_parts(
     z: &Array1<f64>,
     weights: &Array1<f64>,
@@ -672,7 +821,7 @@ pub(crate) fn local_law_parts(
         z.view(),
         weights.view(),
         grid_size,
-        "estimated local latent law, pooled floor",
+        "estimated local latent law, pooled law",
     )?);
 
     let top_k = centers.len().min(LOCAL_LAW_TOP_K);
@@ -683,10 +832,6 @@ pub(crate) fn local_law_parts(
         centers,
         grids,
         top_k,
-        bandwidth: LOCAL_LAW_BANDWIDTH,
-        mixture: LocalLawMixture::VanishingAtTruncation {
-            floor: LOCAL_LAW_POOLED_FLOOR,
-        },
     })
 }
 
@@ -701,7 +846,7 @@ pub(crate) fn local_law_parts(
 /// [`LocalLawMixture::VanishingAtTruncation`] a kept centre's weight is its
 /// kernel value `K(d) = exp(−d²/2h²)` less the `(top_k + 1)`-th centre's, which
 /// is zero exactly where the centre enters or leaves the top `top_k`, and the
-/// pooled law — the grid after the context grids — enters at the fixed weight
+/// pooled law — the grid after the context grids — enters at the weight
 /// `floor`, so the normaliser never vanishes and every weight is continuous in
 /// the point.
 pub(crate) fn local_empirical_mixture_for_point(
@@ -711,18 +856,24 @@ pub(crate) fn local_empirical_mixture_for_point(
     bandwidth: f64,
     mixture: LocalLawMixture,
 ) -> Result<Vec<(usize, f64)>, String> {
+    let neighbours = nearest_centres(point, centers, top_k)?;
+    mixture_from_neighbours(&neighbours, centers.len(), top_k, bandwidth, mixture)
+}
+
+/// The `top_k + 1` centres nearest `point` as `(centre, squared distance)`,
+/// nearest first (every centre when there are no more): all a row's mixture
+/// reads of its point, at any bandwidth and pooled share.
+pub(crate) fn nearest_centres(
+    point: &[f64],
+    centers: &[Vec<f64>],
+    top_k: usize,
+) -> Result<Vec<(usize, f64)>, String> {
     if centers.is_empty() {
         return Err("local empirical latent law has no centers".to_string());
     }
     if top_k == 0 {
         return Err("local empirical latent law top_k must be positive".to_string());
     }
-    if !(bandwidth.is_finite() && bandwidth > 0.0) {
-        return Err(format!(
-            "local empirical latent law bandwidth must be finite and positive, got {bandwidth}"
-        ));
-    }
-    let bw2 = bandwidth * bandwidth;
     let mut distances = Vec::<(usize, f64)>::with_capacity(centers.len());
     for (idx, center) in centers.iter().enumerate() {
         if center.len() != point.len() {
@@ -746,13 +897,38 @@ pub(crate) fn local_empirical_mixture_for_point(
         distances.push((idx, d2));
     }
     distances.sort_by(|left, right| left.1.total_cmp(&right.1));
-    let k = top_k.min(distances.len());
+    distances.truncate(top_k.saturating_add(1));
+    Ok(distances)
+}
+
+/// A row's mixture from its [`nearest_centres`]; `pooled` is the index of the
+/// pooled law, the grid after the context grids.
+pub(crate) fn mixture_from_neighbours(
+    neighbours: &[(usize, f64)],
+    pooled: usize,
+    top_k: usize,
+    bandwidth: f64,
+    mixture: LocalLawMixture,
+) -> Result<Vec<(usize, f64)>, String> {
+    if neighbours.is_empty() {
+        return Err("local empirical latent law has no centers".to_string());
+    }
+    if top_k == 0 {
+        return Err("local empirical latent law top_k must be positive".to_string());
+    }
+    if !(bandwidth.is_finite() && bandwidth > 0.0) {
+        return Err(format!(
+            "local empirical latent law bandwidth must be finite and positive, got {bandwidth}"
+        ));
+    }
+    let bw2 = bandwidth * bandwidth;
+    let k = top_k.min(neighbours.len());
     let mut weights = Vec::with_capacity(k + 1);
     let mut total = 0.0;
     match mixture {
         LocalLawMixture::NearestNormalized => {
-            let d2_nearest = distances.first().map_or(0.0, |&(_, d2)| d2);
-            for &(idx, d2) in distances.iter().take(k) {
+            let d2_nearest = neighbours[0].1;
+            for &(idx, d2) in neighbours.iter().take(k) {
                 let weight = (-0.5 * (d2 - d2_nearest) / bw2).exp();
                 weights.push((idx, weight));
                 total += weight;
@@ -765,15 +941,15 @@ pub(crate) fn local_empirical_mixture_for_point(
                 ));
             }
             let kernel = |d2: f64| (-0.5 * d2 / bw2).exp();
-            let truncation = distances.get(k).map_or(0.0, |&(_, d2)| kernel(d2));
-            for &(idx, d2) in distances.iter().take(k) {
+            let truncation = neighbours.get(k).map_or(0.0, |&(_, d2)| kernel(d2));
+            for &(idx, d2) in neighbours.iter().take(k) {
                 let weight = kernel(d2) - truncation;
                 if weight > 0.0 {
                     weights.push((idx, weight));
                     total += weight;
                 }
             }
-            weights.push((centers.len(), floor));
+            weights.push((pooled, floor));
             total += floor;
         }
     }
@@ -913,7 +1089,7 @@ mod tests {
     #[test]
     fn local_law_is_continuous_across_swaps_and_ties_2926() {
         let floored = LocalLawMixture::VanishingAtTruncation {
-            floor: LOCAL_LAW_POOLED_FLOOR,
+            floor: 1.0e-3,
         };
         let cases = [
             ("rank 2/3 swap, top_k=2", triangle(), [0.2, 0.2], [0.0, 1.0]),

@@ -115,7 +115,7 @@ pub(crate) fn build_bspline_basis_1d_realizing(
     spec: &BSplineBasisSpec,
     realize_penalties: bool,
 ) -> Result<BasisBuildResult, BasisError> {
-    // Natural cubic regression spline (bs="cr"/"cs", #1074): a dense
+    // Natural cubic regression spline (bs="cr", #1074): a dense
     // value-at-knot basis with its own roughness penalty, not a B-spline
     // derivative penalty. Route to the dedicated builder BEFORE the B-spline-only
     // auto-shrink and periodic logic so neither touches a cr spec.
@@ -790,7 +790,7 @@ pub(crate) fn build_bspline_basis_1d_realizing(
     })
 }
 
-/// Build a natural cubic regression spline (mgcv `bs="cr"`/`"cs"`, #1074) basis
+/// Build a natural cubic regression spline (`bs="cr"`, #1074) basis
 /// from a fixed Lancaster–Salkauskas knot set.
 ///
 /// Mirrors the dense-penalty tail of the other dense bases (design + penalty
@@ -1680,27 +1680,51 @@ pub(crate) fn symmetrize_penalty(penalty: &Array2<f64>) -> Array2<f64> {
     gam_linalg::matrix::symmetrize(penalty)
 }
 
-/// Project a (nearly-)symmetric matrix to the PSD cone by clamping
-/// negative eigenvalues to zero. A PenaltyMatrix is by definition PSD;
-/// this enforces that contract against the f64 noise floor so callers
-/// downstream (PIRLS, REML/LAML, outer-Hessian assembly) never see a
+/// Project a (nearly-)symmetric PSD matrix to the PSD cone by clamping its
+/// roundoff-level negative eigenvalues to zero. A PenaltyMatrix is by
+/// definition PSD; this enforces that contract against the f64 noise floor so
+/// callers downstream (PIRLS, REML/LAML, outer-Hessian assembly) never see a
 /// quadratic form that goes negative on legitimate β.
-pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
+///
+/// Only the noise floor is clamped. A negative eigenvalue below
+/// `−spectral_noise_tolerance` is genuine negative curvature — the matrix is
+/// not the roughness functional it claims to be — and is refused as
+/// [`BasisError::IndefinitePenalty`] rather than silently replaced by a
+/// different PSD penalty (which would also make every later
+/// `try_from_dense_psd` refusal unreachable). An eigensolver failure is
+/// propagated, never answered with the unprojected matrix.
+pub(crate) fn project_penalty_to_psd_cone(
+    matrix: &Array2<f64>,
+    context: &str,
+) -> Result<Array2<f64>, BasisError> {
     let sym = symmetrize_penalty(matrix);
     let n = sym.nrows();
-    if n == 0 || n != sym.ncols() {
-        return sym;
+    if n != sym.ncols() {
+        crate::bail_dim_basis!(
+            "{context}: penalty must be square for the PSD projection, got {}x{}",
+            n,
+            sym.ncols()
+        );
     }
-    let (evals, evecs) = match FaerEigh::eigh(&sym, Side::Lower) {
-        Ok(pair) => pair,
-        Err(_) => return sym,
-    };
-    if evals.is_empty() {
-        return sym;
+    if n == 0 {
+        return Ok(sym);
     }
+    let (evals, evecs) = FaerEigh::eigh(&sym, Side::Lower).map_err(BasisError::LinalgError)?;
     let min_ev = evals.iter().copied().fold(f64::INFINITY, f64::min);
     if min_ev >= 0.0 {
-        return sym;
+        return Ok(sym);
+    }
+    let noise = spectral_noise_tolerance(&evals);
+    if min_ev < -noise {
+        return Err(BasisError::IndefinitePenalty {
+            context: context.to_string(),
+            min_eigenvalue: min_ev,
+            tolerance: noise,
+            guidance: "a PSD roughness penalty has no negative curvature beyond the \
+                       eigensolver's noise floor; the assembled matrix is not the \
+                       functional it claims to be"
+                .to_string(),
+        });
     }
     // `Σ_{λ_k > 0} λ_k v_k v_kᵀ` as one GEMM over the kept eigenvectors.
     let kept: Vec<usize> = (0..evals.len()).filter(|&k| evals[k] > 0.0).collect();
@@ -1718,7 +1742,7 @@ pub(crate) fn project_penalty_to_psd_cone(matrix: &Array2<f64>) -> Array2<f64> {
             clamped[[j, i]] = v;
         }
     }
-    clamped
+    Ok(clamped)
 }
 
 /// The relative width of the canonical penalty-spectrum rank cutoff, in
@@ -4436,48 +4460,73 @@ mod anchor_offset_tests {
 #[cfg(test)]
 mod psd_cone_projection_tests {
     use super::project_penalty_to_psd_cone;
+    use super::BasisError;
     use gam_linalg::faer_ndarray::FaerEigh;
     use ndarray::Array2;
 
-    /// The cone projection keeps exactly the positive part of the spectrum:
-    /// `Σ_{λ_k > 0} λ_k v_k v_kᵀ`. Build a symmetric matrix with a known
-    /// eigenbasis and two negative eigenvalues, and check the projection is the
-    /// positive-part reconstruction, symmetric, and leaves a PSD input unchanged.
-    #[test]
-    fn keeps_exactly_the_positive_spectrum() {
-        let n = 7;
-        let seed = Array2::from_shape_fn((n, n), |(i, j)| {
+    const N: usize = 7;
+
+    /// A symmetric matrix with a known orthonormal eigenbasis and the given
+    /// spectrum.
+    fn build(values: &[f64]) -> Array2<f64> {
+        let seed = Array2::from_shape_fn((N, N), |(i, j)| {
             ((i * 13 + j * 7) % 11) as f64 - 5.0 + if i == j { 3.0 } else { 0.0 }
         });
         let (_, basis) = FaerEigh::eigh(&(&seed + &seed.t()), faer::Side::Lower).unwrap();
-        let spectrum = [4.0, 2.5, 1.0, 0.5, 0.0, -0.3, -1.2];
-        let build = |values: &[f64]| {
-            let mut out = Array2::<f64>::zeros((n, n));
-            for (k, &value) in values.iter().enumerate() {
-                let v = basis.column(k);
-                for i in 0..n {
-                    for j in 0..n {
-                        out[[i, j]] += value * v[i] * v[j];
-                    }
+        let mut out = Array2::<f64>::zeros((N, N));
+        for (k, &value) in values.iter().enumerate() {
+            let v = basis.column(k);
+            for i in 0..N {
+                for j in 0..N {
+                    out[[i, j]] += value * v[i] * v[j];
                 }
             }
-            out
-        };
-        let indefinite = build(&spectrum);
+        }
+        out
+    }
+
+    /// Noise-floor negative residue is clamped: the projection is exactly the
+    /// positive-part reconstruction `Σ_{λ_k > 0} λ_k v_k v_kᵀ`, symmetric, and
+    /// a PSD input comes back unchanged. The residue here (`−1e-10`, `−1e-9`
+    /// against `λ_max = 4`) sits inside the noise band `7·1e-10·4 = 2.8e-9`,
+    /// and its reconstruction (~1e-9 per entry) is well above the 1e-12 check,
+    /// so the test sees whether it was removed.
+    #[test]
+    fn clamps_exactly_the_noise_floor_negative_residue() {
+        let spectrum = [4.0, 2.5, 1.0, 0.5, 0.0, -1e-10, -1e-9];
+        let noisy = build(&spectrum);
         let expected = build(&spectrum.map(|value: f64| value.max(0.0)));
-        let projected = project_penalty_to_psd_cone(&indefinite);
+        let projected = project_penalty_to_psd_cone(&noisy, "noise-floor fixture")
+            .expect("noise-floor residue is clamped, not refused");
         for (got, want) in projected.iter().zip(expected.iter()) {
             assert!((got - want).abs() < 1e-12, "{got} vs {want}");
         }
-        for i in 0..n {
-            for j in 0..n {
+        for i in 0..N {
+            for j in 0..N {
                 assert_eq!(projected[[i, j]], projected[[j, i]]);
             }
         }
         let psd = build(&[3.0, 2.0, 1.0, 1.0, 0.5, 0.25, 0.1]);
         let sym = (&psd + &psd.t()) * 0.5;
-        for (got, want) in project_penalty_to_psd_cone(&psd).iter().zip(sym.iter()) {
+        let unchanged = project_penalty_to_psd_cone(&psd, "PSD fixture").expect("PSD input");
+        for (got, want) in unchanged.iter().zip(sym.iter()) {
             assert!((got - want).abs() < 1e-14, "{got} vs {want}");
+        }
+    }
+
+    /// Genuine negative curvature is refused (#3673). Clamping `−0.3` and
+    /// `−1.2` would hand the caller a different penalty than the one it
+    /// assembled, and would leave `try_from_dense_psd`'s own refusal nothing
+    /// to see.
+    #[test]
+    fn refuses_material_negative_curvature() {
+        let indefinite = build(&[4.0, 2.5, 1.0, 0.5, 0.0, -0.3, -1.2]);
+        match project_penalty_to_psd_cone(&indefinite, "indefinite fixture") {
+            Err(BasisError::IndefinitePenalty { min_eigenvalue, tolerance, .. }) => {
+                assert!((min_eigenvalue + 1.2).abs() < 1e-12, "min eigenvalue {min_eigenvalue}");
+                assert!(tolerance > 0.0 && tolerance < 1e-6, "noise tolerance {tolerance}");
+            }
+            other => panic!("expected IndefinitePenalty, got {other:?}"),
         }
     }
 }

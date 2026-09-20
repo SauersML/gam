@@ -11,7 +11,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
-from ._paired import CumulativeIncidenceDraws, PairedPosteriorSamples
 from ._summary import Summary, _ColumnarCoefficientRecords
 
 
@@ -124,7 +123,6 @@ class SamplingConfig:
     n_samples: int
     n_warmup: int
     n_chains: int
-    target_accept: float
     seed: int
 
     def to_dict(self) -> dict[str, Any]:
@@ -132,7 +130,6 @@ class SamplingConfig:
             "n_samples": self.n_samples,
             "n_warmup": self.n_warmup,
             "n_chains": self.n_chains,
-            "target_accept": self.target_accept,
             "seed": self.seed,
         }
 
@@ -142,7 +139,6 @@ def _config_from_payload(cfg: Mapping[str, Any]) -> SamplingConfig:
         n_samples=int(cfg.get("n_samples", 0)),
         n_warmup=int(cfg.get("n_warmup", 0)),
         n_chains=int(cfg.get("n_chains", 0)),
-        target_accept=float(cfg.get("target_accept", 0.0)),
         seed=int(cfg.get("seed", 0)),
     )
 
@@ -405,5 +401,4 @@ class PosteriorSamples:
         return self.summary()._repr_html_()
 
 
-__all__ = ["CumulativeIncidenceDraws", "PairedPosteriorSamples", "PosteriorPredictive",
-           "PosteriorSamples", "SamplingConfig"]
+__all__ = ["PosteriorPredictive", "PosteriorSamples", "SamplingConfig"]

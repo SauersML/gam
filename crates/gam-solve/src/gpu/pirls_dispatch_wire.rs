@@ -85,8 +85,7 @@ mod linux_impl {
     use crate::pirls::{
         ExportedLaplaceCurvature, FirthDiagnostics, GaussianFrozenRows, HessianCurvatureKind,
         PirlsCoordinateFrame, PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
-        compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
-        pirls_data_log_kernel_from_eta,
+        penalized_gradient_natural_scale, pirls_data_log_kernel_from_eta,
     };
     use gam_gpu::device_runtime::GpuRuntime;
     use gam_gpu::gpu_error::GpuError;
@@ -136,8 +135,6 @@ mod linux_impl {
         /// Convergence tolerance (deviance-relative; the loop's stop test
         /// is `|Δdev| < tol · max(1, |dev|)`).
         pub convergence_tolerance: f64,
-        /// Linear inequality constraints in transformed coordinates.
-        pub linear_constraints: Option<LinearInequalityConstraints>,
         /// Reparameterisation `qs` (transformed → original). Passed to
         /// the loop's postpass to populate `beta_transformed`.
         pub qs: Option<ArrayView2<'a, f64>>,
@@ -148,10 +145,6 @@ mod linux_impl {
         pub x_transformed_design: DesignMatrix,
         /// Coordinate frame label propagated onto the result.
         pub coordinate_frame: PirlsCoordinateFrame,
-        /// EDF computed host-side from the penalty root + Hessian.
-        /// `None` makes the assembler use NaN (will be patched by REML
-        /// downstream).
-        pub edf: Option<f64>,
         /// Whether the outer caller wants the observed-information
         /// curvature exported. Drives the postpass and the
         /// `exported_laplace_curvature` label.
@@ -316,10 +309,8 @@ mod linux_impl {
             y: input.y,
             priorweights: input.priorweights,
             offset: input.offset,
-            linear_constraints: input.linear_constraints.as_ref(),
             exported_curvature: input.exported_curvature,
             firth: Some(firth_default.clone()),
-            edf: input.edf,
         };
         // step_lm_lambda = lm_ridge (temporary Newton stabilization only).
         let outcome = pirls_gpu::pirls_loop_on_stream(
@@ -370,8 +361,6 @@ mod linux_impl {
             derivatives_unsupported,
             status,
             firth,
-            constraint_kkt,
-            edf,
             last_deviance_change,
             last_step_halving,
             last_step_size,
@@ -403,11 +392,41 @@ mod linux_impl {
             "GPU outcome converged flag inconsistent with status",
         );
 
+        // The dispatch always hands the loop its `PirlsLoopExtra`, and with it
+        // the postpass computes every converged-mode row array: the
+        // derivative jets, the curvature-promoted `finalweights` / `c` / `d`
+        // for `input.exported_curvature`, and the echoed offset. An outcome
+        // missing any of them is a broken loop contract, never something to
+        // patch over here (a `z = η` working response from an absent
+        // `dμ/dη` would corrupt the gradient's natural scale).
+        let row_arrays = [
+            ("finalweights", finalweights.len()),
+            ("solveweights", solveweights.len()),
+            ("final_offset", final_offset.len()),
+            ("solve_dmu_deta", solve_dmu_deta.len()),
+            ("solve_d2mu_deta2", solve_d2mu_deta2.len()),
+            ("solve_d3mu_deta3", solve_d3mu_deta3.len()),
+            ("solve_c_array", solve_c_array.len()),
+            ("solve_d_array", solve_d_array.len()),
+        ];
+        if derivatives_unsupported {
+            return Err(EstimationError::InvalidInput(
+                "GPU PIRLS loop postpass reported unsupported derivatives although the \
+                 dispatch supplied its PirlsLoopExtra"
+                    .to_string(),
+            ));
+        }
+        if let Some((name, len)) = row_arrays.iter().find(|(_, len)| *len != n) {
+            return Err(EstimationError::InvalidInput(format!(
+                "GPU PIRLS loop postpass returned {name} of length {len}, expected {n}"
+            )));
+        }
+
         // working response z_i = eta_i + (y - mu) / dmu/deta (0 on zero deriv).
         let finalz = {
             let mut z = final_eta.clone();
             for i in 0..n {
-                let d = solve_dmu_deta.get(i).copied().unwrap_or(0.0);
+                let d = solve_dmu_deta[i];
                 let resid = input.y[i] - final_mu[i];
                 if d.is_finite() && d.abs() > 0.0 {
                     z[i] += resid / d;
@@ -416,68 +435,10 @@ mod linux_impl {
             z
         };
 
-        // If the outcome lacks derivative arrays (extra was None on a
-        // mis-wired call), recompute host-side so PirlsResult is whole.
-        let (final_dmu_deta, final_d2mu_deta2, final_d3mu_deta3, final_c, final_d) =
-            if derivatives_unsupported
-                || solve_dmu_deta.is_empty()
-                || solve_d2mu_deta2.is_empty()
-                || solve_d3mu_deta3.is_empty()
-            {
-                let (sc, sd, sdmu, sd2, sd3) = computeworkingweight_derivatives_from_eta(
-                    input.likelihood,
-                    input.inverse_link,
-                    input.y,
-                    &final_eta,
-                    input.priorweights,
-                )?;
-                (sdmu, sd2, sd3, sc, sd)
-            } else {
-                (
-                    solve_dmu_deta.clone(),
-                    solve_d2mu_deta2.clone(),
-                    solve_d3mu_deta3.clone(),
-                    solve_c_array.clone(),
-                    solve_d_array.clone(),
-                )
-            };
-
-        // Observed-curvature finalisation if the outer caller requested
-        // it and the GPU loop did not already promote (i.e. ran Fisher).
-        let (finalweights_arr, final_c_arr, final_d_arr) =
-            if matches!(input.exported_curvature, HessianCurvatureKind::Observed)
-                && curvature == CurvatureMode::Fisher
-            {
-                compute_observed_hessian_curvature_arrays(
-                    input.likelihood,
-                    input.inverse_link,
-                    &final_eta,
-                    input.y,
-                    &final_w_solver,
-                    input.priorweights,
-                )?
-            } else {
-                (finalweights.clone(), final_c.clone(), final_d.clone())
-            };
-        // Echo through whichever finalweights array we ended with for use below.
-        let finalweights_for_state = if finalweights_arr.is_empty() {
-            final_w_hessian.clone()
-        } else {
-            finalweights_arr.clone()
-        };
-
         // No stabilization ridge (#2901 V22): the stabilized Hessian is the
         // penalized Hessian itself.
         let penalized_hessian_sym = SymmetricMatrix::Dense(penalized_hessian.clone());
         let stabilizedhessian_sym = penalized_hessian_sym.clone();
-
-        // max_abs_eta — recompute from the actual eta if outcome's was zero
-        // (older GPU outcomes pre-dating the field surface stamp 0.0).
-        let max_abs_eta_used = if max_abs_eta > 0.0 {
-            max_abs_eta
-        } else {
-            final_eta.iter().fold(0.0_f64, |a, &x| a.max(x.abs()))
-        };
 
         // Gradient in transformed coordinates: Qsᵀ (X_originalᵀ · score_eta).
         // X_originalᵀ · score_eta is p-vector; then project through Qsᵀ.
@@ -514,9 +475,23 @@ mod linux_impl {
         gradient_total -= &input.linear_shift;
         gradient_total -= &xt_grad_eta;
         let lastgradient_norm = gradient_total.dot(&gradient_total).sqrt();
-        let score_norm = xt_grad_eta.dot(&xt_grad_eta).sqrt();
-        let s_beta_norm = s_beta.dot(&s_beta).sqrt();
-        let gradient_natural_scale = score_norm + s_beta_norm;
+        // The η-space score is `w_solver ⊙ (z − η)`, so `−Xᵀ·score_eta` is the
+        // difference of `XᵀWη` and `XᵀWz`; the natural scale is built from
+        // those operands, which do not cancel at the optimum (#3339).
+        let to_transformed = |row_vector: Array1<f64>| {
+            let xo_row = input.x_original.t().dot(&row_vector);
+            if let Some(qs) = input.qs {
+                qs.t().dot(&xo_row)
+            } else {
+                xo_row
+            }
+        };
+        let xt_w_eta = to_transformed(&final_w_solver * &final_eta);
+        let xt_w_z = to_transformed(&final_w_solver * &finalz);
+        let mut shifted_s_beta = s_beta.clone();
+        shifted_s_beta -= &input.linear_shift;
+        let gradient_natural_scale =
+            penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &shifted_s_beta);
 
         // Penalty term = βᵀSβ.
         let penalty_term = beta.dot(&s_beta);
@@ -532,22 +507,11 @@ mod linux_impl {
         let coefficients = Coefficients::new(beta.clone());
         let beta_transformed_coef = Coefficients::new(beta_transformed.clone());
 
-        let constraint_kkt_final = if constraint_kkt.is_some() {
-            constraint_kkt.clone()
-        } else if let Some(lin) = input.linear_constraints.as_ref() {
-            Some(compute_constraint_kkt_diagnostics(
-                &beta,
-                &gradient_total,
-                gradient_natural_scale,
-                lin,
-            ))
-        } else {
-            None
-        };
-
-        let exported_label = match (input.exported_curvature, derivatives_unsupported) {
-            (HessianCurvatureKind::Observed, false) => ExportedLaplaceCurvature::ObservedExact,
-            _ => ExportedLaplaceCurvature::ExpectedInformationSurrogate,
+        // The host admission gate only routes unconstrained problems to this
+        // loop, so there is no constraint KKT certificate to report.
+        let exported_label = match input.exported_curvature {
+            HessianCurvatureKind::Observed => ExportedLaplaceCurvature::ObservedExact,
+            HessianCurvatureKind::Fisher => ExportedLaplaceCurvature::ExpectedInformationSurrogate,
         };
 
         let working_state = WorkingState {
@@ -582,8 +546,8 @@ mod linux_impl {
             last_deviance_change,
             last_step_size,
             last_step_halving,
-            max_abs_eta: max_abs_eta_used,
-            constraint_kkt: constraint_kkt_final.clone(),
+            max_abs_eta,
+            constraint_kkt: None,
             final_kkt_tolerance: Some(input.convergence_tolerance),
             final_lm_lambda,
             final_accept_rho: None,
@@ -591,16 +555,7 @@ mod linux_impl {
             exported_laplace_curvature: exported_label.clone(),
         };
 
-        let edf_final = if edf.is_finite() { edf } else { f64::NAN };
-
-        // final_offset is `n` zeros when the loop did not echo offset
-        // through. Use the caller-supplied offset in that case.
-        let final_offset_arr = if final_offset.len() == n {
-            final_offset
-        } else {
-            input.offset.to_owned()
-        };
-        let solve_c_nontrivial = final_c_arr.iter().any(|&value| value != 0.0);
+        let solve_c_nontrivial = solve_c_array.iter().any(|&value| value != 0.0);
 
         let pirls_result = PirlsResult {
             likelihood: input.likelihood.clone(),
@@ -608,33 +563,30 @@ mod linux_impl {
             penalized_hessian_transformed: penalized_hessian_sym,
             stabilizedhessian_transformed: stabilizedhessian_sym,
             deviance,
-            edf: edf_final,
+            // The EDF is a function of the smoothing parameters; the outer
+            // REML layer recomputes it from the returned factorization.
+            edf: f64::NAN,
             stable_penalty_term: penalty_term,
             firth,
             // #1868: length-n row fields are shared `ArcArray1`; `.into_shared()`
             // moves the owned GPU-returned buffers into an `Arc` (O(1)).
-            finalweights: finalweights_for_state.into_shared(),
-            final_offset: final_offset_arr.into_shared(),
+            finalweights: finalweights.into_shared(),
+            final_offset: final_offset.into_shared(),
             final_eta: final_eta.clone().into_shared(),
             finalmu: final_mu.clone().into_shared(),
-            solveweights: if solveweights.is_empty() {
-                final_w_solver.clone()
-            } else {
-                solveweights.clone()
-            }
-            .into_shared(),
+            solveweights: solveweights.into_shared(),
             solveworking_response: finalz.into_shared(),
             solvemu: final_mu.clone().into_shared(),
-            solve_dmu_deta: final_dmu_deta.into_shared(),
-            solve_d2mu_deta2: final_d2mu_deta2.into_shared(),
-            solve_d3mu_deta3: final_d3mu_deta3.into_shared(),
-            solve_c_array: final_c_arr.into_shared(),
+            solve_dmu_deta: solve_dmu_deta.into_shared(),
+            solve_d2mu_deta2: solve_d2mu_deta2.into_shared(),
+            solve_d3mu_deta3: solve_d3mu_deta3.into_shared(),
+            solve_c_array: solve_c_array.into_shared(),
             solve_c_nontrivial,
-            solve_d_array: final_d_arr.into_shared(),
-            derivatives_unsupported,
+            solve_d_array: solve_d_array.into_shared(),
+            derivatives_unsupported: false,
             status,
             iteration: iterations,
-            max_abs_eta: max_abs_eta_used,
+            max_abs_eta,
             lastgradient_norm,
             gradient_natural_scale,
             penalized_gradient_transformed: working_summary.state.gradient.clone(),
@@ -647,9 +599,9 @@ mod linux_impl {
             exported_laplace_curvature: exported_label,
             final_lm_lambda,
             final_accept_rho: None,
-            constraint_kkt: constraint_kkt_final,
+            constraint_kkt: None,
             final_kkt_tolerance: Some(input.convergence_tolerance),
-            linear_constraints_transformed: input.linear_constraints,
+            linear_constraints_transformed: None,
             reparam_result: input.reparam_result,
             x_transformed: input.x_transformed_design,
             coordinate_frame: input.coordinate_frame,
@@ -658,10 +610,6 @@ mod linux_impl {
             min_penalized_deviance,
         };
 
-        // Hessian-side weights are kept on the working_summary surface for
-        // outer LM consumers; if the loop did not stamp a separate
-        // `finalweights`, fall back to `final_w_hessian` so REML's
-        // `H = XᵀW_HX + S_λ` reconstruction has the curvature it expects.
         assert_eq!(final_w_hessian.len(), n);
         assert_eq!(final_grad_eta.len(), n);
 
@@ -795,20 +743,28 @@ mod linux_impl {
         // cached Gram statistics and every row array is an O(1) `ArcArray1`
         // clone. One optimisation, both routes.
         let frozen = input.frozen_rows.clone();
-        let (gradient_data, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
+        // Original-basis coefficient vectors to the transformed basis.
+        let to_transformed = |v: Array1<f64>| -> Array1<f64> {
+            if let Some(qs_v) = input.qs {
+                qs_v.t().dot(&v)
+            } else {
+                v
+            }
+        };
+        let (gradient_data, score_operands, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
             frozen.as_ref()
         {
             // grad = Qsᵀ(XᵀWX·Qsβ − XᵀWy), identical to the row form by the
             // normal equations, evaluated entirely in coefficient space.
-            let mut grad_orig = input.xtwx_orig.dot(&qbeta);
+            let gram_qbeta = input.xtwx_orig.dot(&qbeta);
+            let mut grad_orig = gram_qbeta.clone();
             grad_orig -= &input.xtwy_orig;
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&grad_orig)
-            } else {
-                grad_orig
-            };
             (
-                grad,
+                to_transformed(grad_orig),
+                [
+                    to_transformed(gram_qbeta),
+                    to_transformed(input.xtwy_orig.to_owned()),
+                ],
                 bundle.eta.clone(),
                 bundle.eta.clone(),
                 bundle.z.clone(),
@@ -828,22 +784,29 @@ mod linux_impl {
             let xt_wr_orig = input
                 .x_original
                 .transpose_vector_multiply(&weighted_residual);
-            // Rotate to transformed coords: QsᵀXᵀWr.
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&xt_wr_orig)
-            } else {
-                xt_wr_orig
-            };
+            // The score's operands XᵀWμ and XᵀWy, whose difference is XᵀWr.
+            let score_operands = [
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalmu * &input.priorweights)),
+                ),
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalz * &input.priorweights)),
+                ),
+            ];
             (
-                grad,
+                // Rotate to transformed coords: QsᵀXᵀWr.
+                to_transformed(xt_wr_orig),
+                score_operands,
                 eta.into_shared(),
                 finalmu.into_shared(),
                 finalz.into_shared(),
                 input.priorweights.to_owned().into_shared(),
             )
         };
-        let score_norm = array1_l2_norm(&gradient_data);
-
         // s_beta = S·β − linear_shift.
         let mut s_beta: Array1<f64> = Array1::zeros(p);
         for i in 0..p {
@@ -853,7 +816,8 @@ mod linux_impl {
             }
             s_beta[i] = acc - input.linear_shift[i];
         }
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let [xt_w_eta, xt_w_z] = &score_operands;
+        let gradient_natural_scale = penalized_gradient_natural_scale(xt_w_eta, xt_w_z, &s_beta);
 
         let mut gradient = gradient_data.clone();
         gradient += &s_beta;
@@ -932,14 +896,14 @@ mod linux_impl {
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
         };
 
         let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
             Some(compute_constraint_kkt_diagnostics(
                 &beta,
                 &gradient,
-                score_norm + s_beta_norm,
+                gradient_natural_scale,
                 lin,
             ))
         } else {
@@ -1033,7 +997,7 @@ mod linux_impl {
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
             penalized_gradient_transformed: working_summary.state.gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,

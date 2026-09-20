@@ -2,7 +2,7 @@
 //! forecast through the one Rust model path the CLI also calls. This layer only
 //! moves arrays into the model's tables; every record is checked in Rust.
 
-use crate::ffi::ffi_errors::{detach_py_result, py_value_error};
+use crate::ffi::ffi_errors::{detach_py_result, py_value_error, saved_document_error_to_pyerr};
 use gam::event_history::MarkKind;
 use gam::event_history::joint::{self, EventTable, JointEventModel, JointTables, SubjectTable};
 use numpy::PyArray2;
@@ -36,7 +36,7 @@ impl PyJointEventModel {
     fn save(&self, path: &str) -> PyResult<()> {
         self.model
             .save(Path::new(path))
-            .map_err(|e| py_value_error(e.to_string()))
+            .map_err(saved_document_error_to_pyerr)
     }
 
     /// Condition on one history (entry, exit, and its events as parallel time
@@ -135,7 +135,7 @@ fn fit_joint_event_model(
 #[pyfunction]
 fn load_joint_event_model(path: &str) -> PyResult<PyJointEventModel> {
     let model =
-        JointEventModel::load(Path::new(path)).map_err(|e| py_value_error(e.to_string()))?;
+        JointEventModel::load(Path::new(path)).map_err(saved_document_error_to_pyerr)?;
     Ok(PyJointEventModel {
         model: Arc::new(model),
     })

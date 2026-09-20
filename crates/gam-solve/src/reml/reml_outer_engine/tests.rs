@@ -4759,7 +4759,7 @@ pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
     for (q_eff, target) in cases {
         let g_base = (q_eff - target) / 2.0;
         let universal = efs_log_step_from_grad(q_eff, g_base).unwrap();
-        let canonical = (target / q_eff).ln().clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+        let canonical = (target / q_eff).ln();
         assert!(
             (universal - canonical).abs() < 1e-12,
             "universal {universal} ≠ canonical {canonical} at q={q_eff}, t={target}"
@@ -4788,16 +4788,23 @@ pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
     let s = efs_log_step_from_grad(0.75, 0.0).expect("zero gradient");
     assert!(s.abs() < 1e-12);
 
-    // Over-correction (2·g_full ≥ q_eff ⇒ ratio ≤ 0): clamp to max descent.
-    for &(q_eff, g) in &[(1.0_f64, 0.6), (2.0, 1.5), (0.5, 1e6)] {
-        let s = efs_log_step_from_grad(q_eff, g).expect("over-correction");
-        assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12);
-    }
+    // A far root is taken whole (#2902): d − t = 1000·q_eff puts the
+    // root at log(1000) ≈ 6.91, which the removed ±5 box truncated.
+    let s = efs_log_step_from_grad(1.0, -499.5).expect("far stable root");
+    assert!((s - 1000.0_f64.ln()).abs() < 1e-12, "far root truncated: {s}");
+    let s = efs_log_step_from_grad(1.0, 0.5 - 1e-9).expect("near-singular root");
+    assert!((s - (2e-9_f64).ln()).abs() < 1e-6, "near-singular root: {s}");
 
-    // Asymptotic clamp on the lower side: ratio → 0⁺ ⇒ floor at -MAX.
-    let s = efs_log_step_from_grad(1.0, 0.5 - 1e-30).expect("near-singular");
-    assert!((s + EFS_MAX_STEP).abs() < 1e-12);
-    assert!(s <= 0.0);
+    // Over-correction (2·g_full ≥ q_eff): the multiplicative model has no
+    // root, so the step is its Newton step −2·g_full/q_eff.
+    for &(q_eff, g) in &[(1.0_f64, 0.6), (2.0, 1.5), (0.5, 1e6), (1.0, 0.5)] {
+        let s = efs_log_step_from_grad(q_eff, g).expect("over-correction");
+        let newton = -2.0 * g / q_eff;
+        assert!(
+            (s - newton).abs() <= 1e-12 * newton.abs(),
+            "over-correction step {s} ≠ Newton {newton} at q={q_eff}, g={g}"
+        );
+    }
 
     // Pathological: q_eff ≤ 0, non-finite inputs.
     assert!(efs_log_step_from_grad(0.0, 0.0).is_none());
@@ -5828,6 +5835,57 @@ pub(crate) fn sparse_takahashi_block_root_traces_match_dense_reference() {
             max_relative = 1e-12
         );
     }
+}
+
+/// #3294: the sparse Cholesky operator publishes the componentwise bound on its
+/// `log|H|` forward error, `p·γ_(r+1)·Σ_i H_ii·(H⁻¹)_ii` with `r` the most
+/// entries in a row of `L`, so the Newton-decrement verdict is taken on the
+/// sparse exact path as it is on the dense one. It never exceeds the dense
+/// Cholesky bound, which charges every inner product at the full `p`.
+#[test]
+pub(crate) fn sparse_cholesky_publishes_its_logdet_forward_error_3294() {
+    let h = random_effect_shaped_hessian();
+    let p = h.nrows();
+    let h_sparse = gam_linalg_test_support::dense_to_upper_csc(&h);
+    let factor =
+        std::sync::Arc::new(gam_linalg::sparse_exact::factorize_sparse_spd(&h_sparse).unwrap());
+    let inverse = gam_linalg::sparse_exact::solve_sparse_spdmulti(&factor, &Array2::eye(p)).unwrap();
+    let row_length = factor.factor_max_row_nnz();
+    assert!((1..=p).contains(&row_length));
+    let reference = p as f64
+        * gam_linalg::roundoff::accumulation_growth(row_length + 1)
+        * (0..p).map(|i| h[[i, i]] * inverse[[i, i]]).sum::<f64>();
+
+    let bare = SparseCholeskyOperator::new(factor.clone(), 0.0, p);
+    assert_eq!(
+        bare.logdet_forward_error(),
+        None,
+        "without the factored H there is no diagonal to equilibrate by"
+    );
+    let with_hessian = bare.with_hessian(std::sync::Arc::new(h_sparse.clone()));
+    let solved = with_hessian
+        .logdet_forward_error()
+        .expect("the factored H and its selected inverse give the bound");
+    assert_relative_eq!(solved, reference, max_relative = 1e-12);
+
+    let sfactor = gam_linalg::sparse_exact::factorize_simplicial(&h_sparse).unwrap();
+    let taka =
+        std::sync::Arc::new(gam_linalg::sparse_exact::TakahashiInverse::compute(&sfactor).unwrap());
+    let cached = SparseCholeskyOperator::new(factor, 0.0, p)
+        .with_hessian(std::sync::Arc::new(h_sparse))
+        .with_takahashi(taka)
+        .logdet_forward_error()
+        .expect("the cached selected inverse gives the same bound");
+    assert_relative_eq!(cached, reference, max_relative = 1e-12);
+
+    let dense = DenseCholeskyOperator::from_positive_definite(&h)
+        .unwrap()
+        .logdet_forward_error()
+        .expect("the dense Cholesky factor publishes its bound");
+    assert!(
+        solved <= dense * (1.0 + 1e-12),
+        "sparse bound {solved:.6e} exceeds the dense bound {dense:.6e}"
+    );
 }
 
 #[test]

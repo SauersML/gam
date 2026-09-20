@@ -122,23 +122,20 @@ fn resolved_wiggle_inverse_link(
     Ok(resolved)
 }
 
-/// Run the base standard fit (the three-way latent / coefficient-group /
-/// spatial dispatch) at an explicit [`FitOptions`], leaving the caller's
-/// `request.options` untouched. Split out of [`fit_standard_model`] so the
-/// #1762 near-separation Firth fallback can re-run the identical fit with the
-/// Jeffreys penalty enabled without duplicating the dispatch.
 type StandardBaseFit = crate::fit_orchestration::drivers::FittedTermCollectionWithSpec;
 
+/// Run the base standard fit: the three-way latent / coefficient-group /
+/// spatial dispatch.
 ///
 /// `realized_design` is the design already realized from `request.spec`,
 /// `request.data` and `options.resource_policy`, when a caller holds one. Only
 /// the spatial dispatch below can fit on it; the others realize their own.
 fn fit_standard_base(
     request: &StandardFitRequest<'_>,
-    family: &LikelihoodSpec,
-    options: &FitOptions,
     realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
+    let family = &request.family;
+    let options = &request.options;
     if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
         {
@@ -196,36 +193,6 @@ fn fit_standard_base(
             &request.kappa_options,
             realized_design,
         )
-    }
-}
-
-/// The separation certificate that lets a binomial fit switch to the Jeffreys
-/// prior, or `None`. Only a proof that the likelihood has no finite maximizer
-/// changes the estimator: a solve that did not converge is reported as it is.
-fn firth_rescue_evidence(
-    error: &gam_solve::estimate::EstimationError,
-) -> Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence> {
-    error.separation_arming_evidence()
-}
-
-/// Whether an automatic Firth retry can use the same outer-coordinate model as
-/// the failed base fit.
-///
-/// Optimized SAS and mixture links append link-parameter coordinates to the
-/// REML problem. The Firth outer derivative does not define those coordinates,
-/// so the solver rejects that combination before evaluating its seed. Decline
-/// the rescue here, where the configuration is already known, instead of
-/// launching a retry that is statically incapable of producing a fit (#2654).
-fn firth_rescue_has_compatible_outer_coordinates(
-    options: &gam_solve::estimate::FitOptions,
-) -> bool {
-    !options.optimize_mixture && !options.optimize_sas
-}
-
-fn certified_retry_or_original<T, E>(original: E, retry: Result<T, E>) -> Result<T, E> {
-    match retry {
-        Ok(value) => Ok(value),
-        Err(_) => Err(original),
     }
 }
 
@@ -317,13 +284,11 @@ fn compose_raw_unit_map_into_gauge(
 #[cfg(test)]
 mod standard_convergence_gate_tests {
     use super::{
-        certified_retry_or_original, compose_raw_unit_map_into_gauge, firth_rescue_evidence,
-        firth_rescue_has_compatible_outer_coordinates, rescale_covariance_coordinates,
+        compose_raw_unit_map_into_gauge, rescale_covariance_coordinates,
         rescale_precision_coordinates, survival_baseline_parameter_checkpoint,
         survival_pirls_status_is_certified,
     };
     use crate::survival::construction::{SurvivalBaselineConfig, SurvivalBaselineTarget};
-    use gam_solve::estimate::{EstimationError, FitOptions};
     use gam_solve::pirls::PirlsStatus;
     use ndarray::array;
 
@@ -404,16 +369,6 @@ mod standard_convergence_gate_tests {
     }
 
     #[test]
-    fn failed_retry_returns_original_evidence() {
-        let result = certified_retry_or_original::<(), _>("base evidence", Err("retry evidence"));
-        assert_eq!(result, Err("base evidence"));
-        assert_eq!(
-            certified_retry_or_original("base evidence", Ok::<_, &str>(7)),
-            Ok(7)
-        );
-    }
-
-    #[test]
     fn survival_gate_rejects_every_exhausted_or_stalled_status() {
         assert!(survival_pirls_status_is_certified(PirlsStatus::Converged));
         for status in [
@@ -438,59 +393,36 @@ mod standard_convergence_gate_tests {
         .expect("valid baseline checkpoint");
         assert_eq!(checkpoint, vec![2.0_f64.ln(), -0.25, 4.0_f64.ln()]);
     }
+}
 
-    #[test]
-    fn firth_retry_is_limited_to_proven_separation() {
-        // A fit that did not converge is not evidence of separation, so it must
-        // not switch the estimator.
-        assert_eq!(
-            firth_rescue_evidence(&EstimationError::PirlsDidNotConverge {
-                iterations: 20,
-                budget: 20,
-                stop: "max iterations reached".to_string(),
-                last_change: 1.0,
-            }),
-            None
-        );
-        assert_eq!(
-            firth_rescue_evidence(&EstimationError::RemlOptimizationFailed(
-                "railed smoothing strength".to_string()
-            )),
-            None
-        );
-        assert!(
-            firth_rescue_evidence(&EstimationError::PrefitPerfectSeparationDetected {
-                column_index: 0,
-                threshold: 0.0,
-                positive_above_threshold: true,
-            })
-            .is_some()
-        );
-        assert_eq!(
-            firth_rescue_evidence(&EstimationError::InvalidInput(
-                "structural mismatch".to_string()
-            )),
-            None
-        );
-    }
-
-    #[test]
-    fn firth_retry_declines_every_link_parameter_outer_problem() {
-        let ordinary = FitOptions::default();
-        assert!(firth_rescue_has_compatible_outer_coordinates(&ordinary));
-
-        let sas = FitOptions {
-            optimize_sas: true,
-            ..ordinary.clone()
-        };
-        assert!(!firth_rescue_has_compatible_outer_coordinates(&sas));
-
-        let mixture = FitOptions {
-            optimize_mixture: true,
-            ..ordinary
-        };
-        assert!(!firth_rescue_has_compatible_outer_coordinates(&mixture));
-    }
+/// Record the intercept-only deviance `D₀` on the fit, the denominator of its
+/// reported deviance explained `1 − D/D₀` (a saved model keeps no response to
+/// recompute it from). Only a fit with exactly one intercept column and no
+/// offset nests the intercept-only model; any other fit records `None`.
+fn record_null_deviance(
+    fit: &mut UnifiedFitResult,
+    design: &gam_terms::smooth::TermCollectionDesign,
+    request_family: &LikelihoodSpec,
+    y: ArrayView1<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    offset: ArrayView1<'_, f64>,
+) {
+    let nested = design.intercept_range.len() == 1 && offset.iter().all(|&o| o == 0.0);
+    fit.artifacts.null_deviance = nested
+        .then(|| {
+            let likelihood = gam_spec::GlmLikelihoodSpec {
+                spec: fit
+                    .likelihood_family
+                    .clone()
+                    .unwrap_or_else(|| request_family.clone()),
+                scale: fit.likelihood_scale,
+            };
+            gam_solve::pirls::calculate_null_deviance(y, &likelihood, weights)
+            .map_err(|error| log::warn!("null-model deviance is unavailable: {error}"))
+            .ok()
+        })
+        .flatten()
+        .filter(|d| d.is_finite());
 }
 
 pub(crate) fn fit_standard_model(
@@ -528,9 +460,7 @@ pub(crate) fn fit_standard_model_on_design(
     //
     // Idempotent by construction: the screen only fires on the `0.0` sentinel, so
     // the call still inside the spatial driver (reached directly by other
-    // drivers and by tests) is a no-op after this one, and the #1762 Firth retry
-    // re-enters the dispatch with the range already resolved rather than
-    // screening a second time. Failure to screen is never an error — every
+    // drivers and by tests) is a no-op after this one. Failure to screen is never an error — every
     // refusal path leaves the term at the geometry heuristic, which is the
     // pre-#2750 behaviour.
     let seeded = crate::fit_orchestration::drivers::seed_measure_jet_auto_ranges(
@@ -549,92 +479,21 @@ pub(crate) fn fit_standard_model_on_design(
     // realized from.
     let realized_design = realized_design.filter(|_| seeded == 0);
 
-    // #1762/#2273: a separated binomial design has no finite maximum
-    // likelihood, on every binomial link. The Jeffreys prior |I(β)|^½ bounds
-    // the coefficients there, so a Firth-capable binomial fit whose base fit
-    // refused with a pre-fit separation certificate is refit ONCE under it.
-    //
-    // The estimator changes only on that proof. A base fit that did not
-    // converge, railed a smoothing strength or had a trial point refused is a
-    // numerical failure of the penalized likelihood fit and is reported as it
-    // is: refitting a different model to get past it would hand back an
-    // estimator nobody asked for. The adopted fit records the certificate in
-    // `FitArtifacts::jeffreys_arming_evidence`, and every summary surface
-    // names the estimator and this reason.
-    //
-    // The retry is adopted only if it carries its own inner and outer
-    // certificates. If it fails, the ORIGINAL base error is returned; a failed
-    // rescue can never replace its evidence. Link-parameter outer problems are
-    // declined before solving because the Firth outer derivative does not
-    // define their appended link coordinates (#2654).
-    let is_firth_capable_binomial = request.family.supports_firth();
-    let base = fit_standard_base(&request, &request.family, &request.options, realized_design);
-    let fitted = match base {
-        Ok(fitted) => fitted,
-        Err(original_error) => {
-            let rescue_is_defined = is_firth_capable_binomial
-                && !request.options.firth_bias_reduction
-                && firth_rescue_has_compatible_outer_coordinates(&request.options);
-            let Some(evidence) = rescue_is_defined
-                .then(|| firth_rescue_evidence(&original_error))
-                .flatten()
-            else {
-                return Err(original_error.into());
-            };
-            let original_report = original_error.to_string();
-            let mut firth_options = request.options.clone();
-            firth_options.firth_bias_reduction = true;
-            let firth = fit_standard_base(&request, &request.family, &firth_options, None);
-            let firth_failure = firth.as_ref().err().map(ToString::to_string);
-            match certified_retry_or_original(original_error, firth) {
-                Ok(mut firth_fitted) => {
-                    log::debug!(
-                        "[#1762/#2273] Firth-capable binomial base fit ({}) refused with a \
-                         separation certificate ({original_report}); the Jeffreys-prior refit \
-                         certified — adopting it (edf {:.2}).",
-                        request.family.pretty_name(),
-                        firth_fitted.fit.edf_total().unwrap_or(f64::NAN),
-                    );
-                    firth_fitted.fit.artifacts.jeffreys_arming_evidence = Some(evidence);
-                    firth_fitted
-                }
-                Err(original_error) => {
-                    let retry_report = firth_failure
-                        .unwrap_or_else(|| "unknown retry failure".to_string());
-                    log::debug!(
-                        "[#1762/#2273] Firth-capable binomial base fit ({}) failed \
-                         ({original_report}); Firth retry also failed to certify \
-                         ({retry_report}) — returning the original typed base evidence, not \
-                         either abandoned iterate.",
-                        request.family.pretty_name(),
-                    );
-                    // #2273 — the RETURNED error has to say that the rescue was
-                    // attempted and why it failed, not only the log line.
-                    //
-                    // The base evidence is preserved unchanged, because a failed
-                    // rescue may not replace it. But the base evidence for a
-                    // separated design ends with "enable Firth/Jeffreys bias
-                    // reduction or remove/reparameterize the separating column" --
-                    // advice to do the thing that was just done automatically and
-                    // failed. A caller following it gets the same refusal, and the
-                    // reason the rescue failed lives only in a `log::debug!`, which
-                    // is not present in a test panic message and is inert through
-                    // the Python extension where this pathology is reported.
-                    //
-                    // So the outcome of the rescue is appended to the returned
-                    // message. The typed original is still what was raised; what
-                    // changes is that the refusal stops recommending a remedy it
-                    // has already tried without saying so.
-                    return Err(FitFailure::from(original_error).annotated(format!(
-                        "the automatic Firth/Jeffreys rescue WAS attempted \
-                         and also failed to certify, so enabling Firth explicitly will not \
-                         change this outcome: {retry_report}"
-                    )));
-                }
-            }
-        }
-    };
+    // #1762/#2273/#3129: a separated binomial design has no finite maximum
+    // likelihood. The solver decides that from the realized design before its
+    // first solve and, on a Firth-capable family, fits under the Jeffreys prior
+    // from the start, recording the certificate in
+    // `FitArtifacts::jeffreys_arming_evidence`. Nothing here refits.
+    let mut fitted = fit_standard_base(&request, realized_design)?;
 
+    record_null_deviance(
+        &mut fitted.fit,
+        &fitted.design,
+        &request.family,
+        request.y.view(),
+        request.weights.view(),
+        request.offset.view(),
+    );
     let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
@@ -756,6 +615,14 @@ pub(crate) fn fit_standard_model_on_design(
     // solver. Preserve the resolved response and inverse link explicitly;
     // response-scale prediction after assembly or reload depends on it (#2748).
     solved.fit.likelihood_family = Some(fitted_wiggle_family);
+    record_null_deviance(
+        &mut solved.fit,
+        &solved.design,
+        &request.family,
+        request.y.view(),
+        request.weights.view(),
+        request.offset.view(),
+    );
 
     Ok(StandardFitResult {
         saved_link_state: result.saved_link_state,
@@ -2661,6 +2528,7 @@ fn survival_unified_fit_result(
         coefficient_influence: None,
         weighted_gram: None,
         identified_subspace: None,
+        working_residual: None,
     };
 
     UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {

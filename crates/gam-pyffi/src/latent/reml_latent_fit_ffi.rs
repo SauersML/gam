@@ -704,6 +704,10 @@ fn set_ok_glm_latent_items<'py>(
         "cache_coefficient_basis",
         Array2::<f64>::zeros((0, 0)).into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        Array2::<f64>::zeros((0, 0)).into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", 0_u64)?;
     out.set_item("cache_penalty_fingerprint", 0_u64)?;
     out.set_item("cache_logdet_xtwx", f64::NAN)?;
@@ -1181,6 +1185,10 @@ fn set_ok_gaussian_reml_items<'py>(
         "cache_coefficient_basis",
         fit.cache.coefficient_basis.into_pyarray(py),
     )?;
+    out.set_item(
+        "cache_data_null_basis",
+        fit.cache.data_null_basis.into_pyarray(py),
+    )?;
     out.set_item("cache_xtwx_fingerprint", fit.cache.xtwx_fingerprint)?;
     out.set_item("cache_penalty_fingerprint", fit.cache.penalty_fingerprint)?;
     out.set_item("cache_logdet_xtwx", fit.cache.logdet_xtwx)?;
@@ -1218,6 +1226,11 @@ fn gaussian_reml_fit_state_from_pydict(
         .map_err(|err| err.to_string())?
         .as_array()
         .to_owned();
+    let data_null_basis = get(state, "cache_data_null_basis")?
+        .extract::<PyReadonlyArray2<'_, f64>>()
+        .map_err(|err| err.to_string())?
+        .as_array()
+        .to_owned();
     let coefficients = get(state, "coefficients")?
         .extract::<PyReadonlyArray2<'_, f64>>()
         .map_err(|err| err.to_string())?
@@ -1238,6 +1251,7 @@ fn gaussian_reml_fit_state_from_pydict(
         penalty_eigenvalues,
         eigenvectors,
         coefficient_basis,
+        data_null_basis,
         xtwx_fingerprint: get(state, "cache_xtwx_fingerprint")?
             .extract::<u64>()
             .map_err(|err| err.to_string())?,
@@ -1374,6 +1388,10 @@ fn batched_gaussian_reml_fits_from_pydict(
         .extract::<PyReadonlyArray3<'_, f64>>()
         .map_err(|err| err.to_string())?;
     let cache_coefficient_basis = cache_coefficient_basis.as_array();
+    let cache_data_null_basis = get(state, "cache_data_null_basis")?
+        .extract::<PyReadonlyArray3<'_, f64>>()
+        .map_err(|err| err.to_string())?;
+    let cache_data_null_basis = cache_data_null_basis.as_array();
     let cache_xtwx_fingerprints = get(state, "cache_xtwx_fingerprints")?
         .extract::<PyReadonlyArray1<'_, u64>>()
         .map_err(|err| err.to_string())?;
@@ -1421,10 +1439,24 @@ fn batched_gaussian_reml_fits_from_pydict(
                 fitted.nrows()
             ));
         }
+        let p = cache_coefficient_basis.dim().1;
+        let data_rank = (rank + nullity) as usize;
+        if data_rank > p {
+            return Err(format!(
+                "forward_state cache_penalty_ranks[{b}] + cache_nullities[{b}] = {data_rank} exceeds p={p}"
+            ));
+        }
         let cache = gam::solver::gaussian_reml::GaussianRemlEigenCache {
-            penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..]).to_owned(),
-            eigenvectors: cache_eigenvectors.slice(s![b, .., ..]).to_owned(),
-            coefficient_basis: cache_coefficient_basis.slice(s![b, .., ..]).to_owned(),
+            penalty_eigenvalues: cache_penalty_eigenvalues.slice(s![b, ..data_rank]).to_owned(),
+            eigenvectors: cache_eigenvectors
+                .slice(s![b, ..data_rank, ..data_rank])
+                .to_owned(),
+            coefficient_basis: cache_coefficient_basis
+                .slice(s![b, .., ..data_rank])
+                .to_owned(),
+            data_null_basis: cache_data_null_basis
+                .slice(s![b, .., ..p - data_rank])
+                .to_owned(),
             xtwx_fingerprint: cache_xtwx_fingerprints[b],
             penalty_fingerprint: cache_penalty_fingerprints[b],
             logdet_xtwx: cache_logdet_xtwx[b],
@@ -1473,6 +1505,8 @@ struct BatchedGaussianRemlResult {
     cache_penalty_eigenvalues: Array2<f64>,
     cache_eigenvectors: Array3<f64>,
     cache_coefficient_basis: Array3<f64>,
+    /// Left-aligned: fit `b` of design rank `r` fills the first `p − r` columns.
+    cache_data_null_basis: Array3<f64>,
     cache_xtwx_fingerprints: Array1<u64>,
     cache_penalty_fingerprints: Array1<u64>,
     cache_logdet_xtwx: Array1<f64>,
@@ -1742,6 +1776,7 @@ fn gaussian_reml_fit_batched_impl(
     let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
     let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
     let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_data_null_basis = Array3::<f64>::zeros((batch, p, p));
     let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
@@ -1772,15 +1807,22 @@ fn gaussian_reml_fit_batched_impl(
                 .assign(&fit.coefficients);
             fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
             sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            // A design of rank `r < p` has an `r`-mode spectrum and `p − r` data-null
+            // modes (#3366); both are stored left-aligned in the `p`-wide stacks and
+            // the importer slices them back by `r = penalty_rank + nullity`.
+            let data_rank = fit.cache.coefficient_basis.ncols();
             cache_penalty_eigenvalues
-                .slice_mut(s![b, ..])
+                .slice_mut(s![b, ..data_rank])
                 .assign(&fit.cache.penalty_eigenvalues);
             cache_eigenvectors
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, ..data_rank, ..data_rank])
                 .assign(&fit.cache.eigenvectors);
             cache_coefficient_basis
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, .., ..data_rank])
                 .assign(&fit.cache.coefficient_basis);
+            cache_data_null_basis
+                .slice_mut(s![b, .., ..p - data_rank])
+                .assign(&fit.cache.data_null_basis);
             cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
             cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
             cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
@@ -1806,6 +1848,7 @@ fn gaussian_reml_fit_batched_impl(
         cache_penalty_eigenvalues,
         cache_eigenvectors,
         cache_coefficient_basis,
+        cache_data_null_basis,
         cache_xtwx_fingerprints,
         cache_penalty_fingerprints,
         cache_logdet_xtwx,
@@ -2532,6 +2575,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
     let mut cache_penalty_eigenvalues = Array2::<f64>::zeros((batch, p));
     let mut cache_eigenvectors = Array3::<f64>::zeros((batch, p, p));
     let mut cache_coefficient_basis = Array3::<f64>::zeros((batch, p, p));
+    let mut cache_data_null_basis = Array3::<f64>::zeros((batch, p, p));
     let mut cache_xtwx_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_penalty_fingerprints = Array1::<u64>::zeros(batch);
     let mut cache_logdet_xtwx = Array1::<f64>::zeros(batch);
@@ -2562,15 +2606,22 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
                 .assign(&fit.coefficients);
             fitted.slice_mut(s![start..end, ..]).assign(&fit.fitted);
             sigma2.slice_mut(s![b, ..]).assign(&fit.sigma2);
+            // A design of rank `r < p` has an `r`-mode spectrum and `p − r` data-null
+            // modes (#3366); both are stored left-aligned in the `p`-wide stacks and
+            // the importer slices them back by `r = penalty_rank + nullity`.
+            let data_rank = fit.cache.coefficient_basis.ncols();
             cache_penalty_eigenvalues
-                .slice_mut(s![b, ..])
+                .slice_mut(s![b, ..data_rank])
                 .assign(&fit.cache.penalty_eigenvalues);
             cache_eigenvectors
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, ..data_rank, ..data_rank])
                 .assign(&fit.cache.eigenvectors);
             cache_coefficient_basis
-                .slice_mut(s![b, .., ..])
+                .slice_mut(s![b, .., ..data_rank])
                 .assign(&fit.cache.coefficient_basis);
+            cache_data_null_basis
+                .slice_mut(s![b, .., ..p - data_rank])
+                .assign(&fit.cache.data_null_basis);
             cache_xtwx_fingerprints[b] = fit.cache.xtwx_fingerprint;
             cache_penalty_fingerprints[b] = fit.cache.penalty_fingerprint;
             cache_logdet_xtwx[b] = fit.cache.logdet_xtwx;
@@ -2596,6 +2647,7 @@ fn gaussian_reml_fit_positions_batched_streaming_impl(
         cache_penalty_eigenvalues,
         cache_eigenvectors,
         cache_coefficient_basis,
+        cache_data_null_basis,
         cache_xtwx_fingerprints,
         cache_penalty_fingerprints,
         cache_logdet_xtwx,
@@ -3326,22 +3378,6 @@ fn posterior_draw_bands(
 }
 
 #[pyfunction]
-#[pyo3(signature = (eta, family_kind, level, link_spec=None))]
-fn posterior_eta_bands(
-    py: Python<'_>,
-    eta: PyReadonlyArray2<'_, f64>,
-    family_kind: String,
-    level: f64,
-    link_spec: Option<String>,
-) -> PyResult<Py<PyDict>> {
-    let eta = owned_row_major_f64(eta.as_array());
-    let payload = detach_py_result(py, "posterior_eta_bands", move || {
-        posterior_eta_bands_impl(eta, &family_kind, level, link_spec.as_deref())
-    })?;
-    posterior_bands_payload_to_py(py, payload)
-}
-
-#[pyfunction]
 fn posterior_credible_interval(
     py: Python<'_>,
     samples: PyReadonlyArray2<'_, f64>,
@@ -3434,11 +3470,9 @@ fn curvature_inference_json(
 }
 
 /// #1063 per-term LR significance report for every penalized smooth term:
-/// `statistic_lr`, `ref_df`, `bartlett_factor`,
-/// `bartlett_factor_conditional`, `rho_variation_shift`,
-/// `statistic_corrected`, `p_value_uncorrected`, `p_value_corrected`,
-/// `correction_provenance` (`"lawley_lr_estimated_lambda"` |
-/// `"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
+/// `statistic_lr`, `ref_df`, `bartlett_factor`, `statistic_corrected`,
+/// `p_value_uncorrected`, `p_value_corrected`, `correction_provenance`
+/// (`"lawley_lr_fixed_lambda"` | `"none"`), and exactly one of `p_value`,
 /// `p_value_upper_bound` or `unavailable_reason` (with `unavailable_message`).
 /// Every row carries every key.
 ///
@@ -4230,7 +4264,16 @@ fn summary_estimator_text<'py>(
 
 #[pyfunction]
 fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    // Pure presentation layer; no math.
+    // Pure presentation layer; no math. A fitted model's summary carries the
+    // one rendered report, which the notebook shows verbatim.
+    if let Some(text) = payload.get_item("text")?
+        && !text.is_none()
+    {
+        return Ok(format!(
+            "<pre style='font-family: ui-monospace, monospace;'>{}</pre>",
+            summary_html_escape(&text.extract::<String>()?)
+        ));
+    }
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
@@ -4397,13 +4440,43 @@ fn py_list_append_json_number(list: &Bound<'_, PyList>, value: serde_json::Numbe
     }
 }
 
+/// Marshalling for [`gam::inference::shared_precision::shared_precision_updates`]
+/// (#3523): `request_json` is `{"models": [key per model], "groups": [...]}`.
 #[pyfunction]
 fn cross_fit_shared_precision_groups_json(
     py: Python<'_>,
+    models: Vec<PyRef<'_, PyFittedModel>>,
     request_json: String,
 ) -> PyResult<String> {
+    let models = models
+        .iter()
+        .map(|model| Arc::clone(&model.model))
+        .collect::<Vec<_>>();
     detach_py_result(py, "cross_fit_shared_precision_groups_json", move || {
-        cross_fit_shared_precision_groups_json_impl(&request_json)
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            models: Vec<serde_json::Value>,
+            groups: Vec<gam::inference::shared_precision::SharedPrecisionGroup>,
+        }
+        let request: Request = serde_json::from_str(&request_json)
+            .map_err(|err| format!("failed to parse shared precision request json: {err}"))?;
+        if request.models.len() != models.len() {
+            return Err(format!(
+                "shared precision request names {} model key(s) for {} model(s)",
+                request.models.len(),
+                models.len()
+            ));
+        }
+        let fits = request
+            .models
+            .into_iter()
+            .zip(models.iter().map(|model| &**model))
+            .collect::<Vec<_>>();
+        let updates =
+            gam::inference::shared_precision::shared_precision_updates(&fits, &request.groups)?;
+        serde_json::to_string(&updates)
+            .map_err(|err| format!("failed to serialize shared precision result: {err}"))
     })
 }
 
@@ -4588,13 +4661,12 @@ fn survival_concordance(
         )));
     }
     // Delegate to the single source of truth for Harrell's C-index in
-    // gam-models (`survival::predict::harrell_concordance`). The core counts
-    // tied event times as a comparable half-credit pair and returns None when
-    // there are no comparable pairs at all (e.g. every row censored); the old
-    // hand-rolled pair loop here dropped tied-time pairs entirely and returned
-    // a silent 0.5 sentinel. Where the two disagreed the core wins — a None
-    // degenerate result is surfaced as Python None, matching how the
-    // neighboring metric pyfunctions report an undefined score.
+    // gam-models (`survival::predict::harrell_concordance`), which applies the
+    // standard pair rules (tied events are not comparable; an event tied with a
+    // censoring is, the censored subject being the survivor) and returns None
+    // when the score is undefined (no comparable pair, or a non-finite input).
+    // None is surfaced as Python None, matching how the neighboring metric
+    // pyfunctions report an undefined score.
     Ok(gam::families::survival::predict::harrell_concordance(
         &event_times,
         &events,
@@ -4629,53 +4701,9 @@ fn survival_null_curve_from_train<'py>(
             train_events.len()
         )));
     }
-    let curve = gam::families::survival::risk_calibration::km_curve_on_grid(
-        &train_times,
-        &train_events,
-        &grid,
-    );
+    let curve = gam::families::survival::predict::KaplanMeier::fit(&train_times, &train_events)
+        .on_grid(&grid);
     Ok(Array1::from_vec(curve).into_pyarray(py).unbind())
-}
-
-/// Thin wrapper over
-/// [`gam::families::survival::risk_calibration::cox_calibrated_survival_matrix`],
-/// which owns the univariate Cox fit and the Breslow baseline. pyffi only maps
-/// the core error into a Python exception.
-fn benchmark_survival_matrix_from_risk(
-    train_times: &[f64],
-    train_events: &[f64],
-    train_risk: &[f64],
-    test_risk: &[f64],
-    grid: &[f64],
-) -> PyResult<Array2<f64>> {
-    gam::families::survival::risk_calibration::cox_calibrated_survival_matrix(
-        train_times,
-        train_events,
-        train_risk,
-        test_risk,
-        grid,
-    )
-    .map_err(PyValueError::new_err)
-}
-
-#[pyfunction]
-fn survival_matrix_from_risk_calibration<'py>(
-    py: Python<'py>,
-    train_times: Vec<f64>,
-    train_events: Vec<f64>,
-    train_risk: Vec<f64>,
-    test_risk: Vec<f64>,
-    grid: Vec<f64>,
-) -> PyResult<Py<PyArray2<f64>>> {
-    Ok(benchmark_survival_matrix_from_risk(
-        &train_times,
-        &train_events,
-        &train_risk,
-        &test_risk,
-        &grid,
-    )?
-    .into_pyarray(py)
-    .unbind())
 }
 
 #[pyfunction(signature = (event_times, events, grid, survival_matrix, null_survival_matrix = None))]
@@ -5217,8 +5245,8 @@ mod latent_glm_family_validation_tests {
             "gaussian-identity",
             "poisson",
             "poisson-log",
-            "negbin",
-            "negbin-log",
+            "negative-binomial",
+            "negative-binomial-log",
             "binomial",
             "logistic",
             "probit",
@@ -5232,12 +5260,12 @@ mod latent_glm_family_validation_tests {
 
     /// #983: an explicitly supplied θ *pins* the negative-binomial shape. The
     /// FFI's private table hardcoded `theta_fixed: false`, so the identical
-    /// `family="negbin", negbin_theta=2.5` request estimated θ from Python and
+    /// `family="negative-binomial", negbin_theta=2.5` request estimated θ from Python and
     /// held it fixed from the CLI — one request, two models.
     #[test]
     fn an_explicit_negative_binomial_theta_pins_it() {
         let (spec, _) = scalar_family_from_name(
-            "negbin-log",
+            "negative-binomial-log",
             FamilyNuisanceOverrides {
                 negative_binomial_theta: Some(2.5),
                 ..FamilyNuisanceOverrides::default()
@@ -5260,7 +5288,7 @@ mod latent_glm_family_validation_tests {
     /// supplied means estimate it.
     #[test]
     fn an_absent_negative_binomial_theta_is_estimated() {
-        let (spec, _) = scalar_family_from_name("negbin", FamilyNuisanceOverrides::default())
+        let (spec, _) = scalar_family_from_name("negative-binomial", FamilyNuisanceOverrides::default())
             .expect("an absent theta seeds the estimate");
         match spec.response {
             ResponseFamily::NegativeBinomial { theta_fixed, .. } => {

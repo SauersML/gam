@@ -1486,6 +1486,25 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
         }
 
         let z = &self.lastz;
+        // The score's operands `XᵀWη` and `XᵀWz`, for the natural gradient
+        // scale: the score is their difference and cancels at the optimum, so
+        // the scale is built from them rather than from it (#3339). The
+        // residual buffer holds each weighted operand in turn before the score
+        // residual below overwrites it.
+        ndarray::Zip::from(&mut self.workspace.weighted_residual)
+            .and(&self.workspace.eta_buf)
+            .and(&self.lastweights)
+            .par_for_each(|wr, &eta, &wi| {
+                *wr = eta * wi;
+            });
+        let xt_w_eta = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
+        ndarray::Zip::from(&mut self.workspace.weighted_residual)
+            .and(z)
+            .and(&self.lastweights)
+            .par_for_each(|wr, &zi, &wi| {
+                *wr = zi * wi;
+            });
+        let xt_w_z = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
         // Single-pass score residual: W(eta - z).
         ndarray::Zip::from(&mut self.workspace.weighted_residual)
             .and(&self.workspace.eta_buf)
@@ -1495,12 +1514,8 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
                 *wr = (eta - zi) * wi;
             });
         let mut gradient = self.transformed_transpose_matvec(&self.workspace.weighted_residual);
-        // Score norm ||X' (weighted residual)||_2 — captured before adding the
-        // penalty contribution so the natural gradient scale can be assembled
-        // for the scale-invariant convergence certificate.
-        let score_norm = array1_l2_norm(&gradient);
         let s_beta = self.penalty.shifted_gradient(beta.as_ref());
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let gradient_natural_scale = penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &s_beta);
         gradient += &s_beta;
         let hessian_curvature = self.update_hessian_curvature_arrays(requested_curvature)?;
         self.lasthessian_curvature = hessian_curvature;
@@ -1563,7 +1578,6 @@ impl<'a> WorkingModel for GamWorkingModel<'a> {
 
         let penalty_term = self.penalty.shifted_quadratic(beta.as_ref());
         self.last_penalty_term = penalty_term;
-        let gradient_natural_scale = score_norm + s_beta_norm;
 
         self.working_array_beta_bits
             .extend(beta.as_ref().iter().map(|value| value.to_bits()));

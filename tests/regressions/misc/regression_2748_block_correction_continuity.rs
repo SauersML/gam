@@ -103,7 +103,7 @@ fn haberman_dataset() -> gam::data::EncodedDataset {
 fn formula_for(features: &[&str]) -> String {
     let body = features
         .iter()
-        .map(|name| format!("s({name}, type=ps, knots=8, double_penalty=true)"))
+        .map(|name| format!("s({name}, bs=ps, knots=8, double_penalty=true)"))
         .collect::<Vec<_>>()
         .join(" + ");
     format!("y ~ {body}")
