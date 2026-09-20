@@ -2732,5 +2732,16 @@
     ],
     "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "e5e926b4bfc6f5f3b77b314c8f0b66f5c4e2769b",
+    "items": [
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:forward",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:fn:vjp",
+      "crates/gam-sae/src/parameter_decomposition/lift.rs:trait:ParameterExecutor",
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs:fn:retained_normals"
+    ],
+    "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds no ParameterExecutor or retained_normals under crates, src, tests or python in the head tree."
   }
 ]

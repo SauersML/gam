@@ -4894,5 +4894,13 @@
     },
     "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
     "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "e5e926b4bfc6f5f3b77b314c8f0b66f5c4e2769b",
+    "removed": {
+      "crates/gam-solve/src/constrained_posterior/cone_laplace.rs::retained_normals": 1
+    },
+    "reason": "#4485: ParameterExecutor had no implementor, bound or caller anywhere (its doc claimed a native Rust implementation and a Python wrapper that do not exist); executed rows are built directly as ExecutedExperiment. ConeLaplace::retained_normals (A^T) had no caller; its cone_normalizer twin was already deleted as dead.",
+    "evidence": "public_api_census.py with this base and the landing commit as head refuses exactly this identity; git grep -w retained_normals finds 0 occurrences under crates, src, tests or python in the head tree."
   }
 ]
