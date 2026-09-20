@@ -127,8 +127,39 @@ fn gamma_shape_statistic(response: f64, mean: f64) -> f64 {
     }
 }
 
+/// Weighted Gamma shape score `Σ_g f_g·[ln(w_g α) − ψ(w_g α) − t̄]`.
+///
+/// `groups` holds each distinct positive prior weight `w_g` with its share
+/// `f_g = (count_g · w_g) / Σ w` of the total prior weight, so `Σ f_g = 1` and
+/// the score equals `(Σ w)⁻¹ · ∂ℓ/∂α` of the precision-weighted Gamma
+/// log-likelihood (row shape `wᵢ α`). Every term is strictly decreasing in
+/// `α`. A product `w_g α` that underflows to zero has the `α → 0⁺` limit
+/// `+∞`; one that overflows has the `α → ∞` limit `0 − t̄`, which the
+/// asymptotic branch of [`gamma_shape_score`] already returns at `+∞`.
+fn weighted_gamma_shape_score(groups: &[(f64, f64)], shape: f64, target: f64) -> f64 {
+    let mut score = 0.0;
+    for &(weight, share) in groups {
+        let row_shape = weight * shape;
+        if row_shape == 0.0 {
+            return f64::INFINITY;
+        }
+        score += share * gamma_shape_score(row_shape, target);
+    }
+    score
+}
+
 /// Exact Gamma shape MLE at a certified linear predictor, with `μ` read from
 /// the fit's own inverse link.
+///
+/// Prior weights are precisions, exactly as in the reported log-likelihood
+/// (`gamma_saturated_log_normalizer` evaluates row `i` at shape `wᵢ α`) and in
+/// the Gaussian identity scale `φ̂ = Σ wᵢ rᵢ² / (n₊ − edf)`: row `i` is
+/// `Gamma(shape = wᵢ α, mean = μᵢ)`. The shape score is therefore
+/// `∂ℓ/∂α = Σ wᵢ [ln(wᵢ α) − ψ(wᵢ α) − tᵢ]`, `tᵢ = yᵢ/μᵢ − ln(yᵢ/μᵢ) − 1`,
+/// not the frequency-weight score `Σ wᵢ [ln α − ψ(α) − tᵢ]`. Only weight
+/// ratios carry information: a global rescale `w → c·w` maps the MLE to
+/// `α̂/c`, so every row shape `wᵢ α̂` — hence `β̂`, its covariance and the
+/// log-likelihood — is unchanged. With unit weights both scores coincide.
 pub(crate) fn estimate_gamma_shape_from_eta(
     inverse_link: &InverseLink,
     y: ArrayView1<'_, f64>,
@@ -169,11 +200,37 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         );
     }
 
-    // `ln α − ψ(α)` falls from `+∞` as `α → 0⁺` to `0` as `α → ∞`, so for a
-    // positive statistic the score has exactly one root. Bracket it by halving
-    // and doubling outward from the closed-form approximation; the only way out
-    // of either walk is the representable range itself.
-    let approx = if target < 3.0 {
+    // Group the positive prior weights by value: the score depends on a row
+    // only through its weight, and a uniform-weight design (the common case)
+    // collapses to a single scalar term.
+    let mut positive_weights: Vec<f64> = priorweights.iter().copied().filter(|&w| w > 0.0).collect();
+    positive_weights.sort_by(f64::total_cmp);
+    let mut groups: Vec<(f64, f64)> = Vec::new();
+    let mut start = 0;
+    while start < positive_weights.len() {
+        let weight = positive_weights[start];
+        let mut end = start + 1;
+        while end < positive_weights.len() && positive_weights[end] == weight {
+            end += 1;
+        }
+        let share = ((end - start) as f64 * weight) / total_weight;
+        // A share below the smallest subnormal carries no representable part
+        // of the normalized score; keeping it would only turn `0 · ∞` into NaN
+        // at the `α → 0⁺` edge.
+        if share > 0.0 {
+            groups.push((weight, share));
+        }
+        start = end;
+    }
+    // The closed-form approximation solves the unit-weight score `g(a) = t̄`;
+    // the weighted root sits near that row shape divided by the mean weight.
+    let mean_weight = total_weight / positive_weights.len() as f64;
+
+    // Each `ln(wα) − ψ(wα)` falls from `+∞` as `α → 0⁺` to `0` as `α → ∞`, so
+    // for a positive statistic the score has exactly one root. Bracket it by
+    // halving and doubling outward from the closed-form approximation; the only
+    // way out of either walk is the representable range itself.
+    let row_shape_approx = if target < 3.0 {
         let delta = 3.0 - target;
         (delta + (delta * delta + 24.0 * target).sqrt()) / 12.0 / target
     } else {
@@ -182,14 +239,16 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         let inv = target.recip();
         (2.0 * inv) / ((1.0 + 18.0 * inv + 9.0 * inv * inv).sqrt() + 1.0 - 3.0 * inv)
     };
+    let approx = row_shape_approx / mean_weight;
     if !(approx.is_finite() && approx > 0.0) {
         crate::bail_invalid_estim!(
-            "Gamma shape approximation is not representable (profile target={target:?}, approximation={approx:?})"
+            "Gamma shape approximation is not representable (profile target={target:?}, approximation={approx:?}, mean prior weight={mean_weight:?})"
         );
     }
+    let score = |shape: f64| weighted_gamma_shape_score(&groups, shape, target);
     let mut lo = approx;
     let mut hi = approx;
-    while gamma_shape_score(lo, target) <= 0.0 {
+    while score(lo) <= 0.0 {
         lo *= 0.5;
         if !(lo > 0.0) {
             crate::bail_invalid_estim!(
@@ -197,7 +256,7 @@ pub(crate) fn estimate_gamma_shape_from_eta(
             );
         }
     }
-    while gamma_shape_score(hi, target) > 0.0 {
+    while score(hi) > 0.0 {
         if hi == f64::MAX {
             crate::bail_invalid_estim!(
                 "Gamma shape MLE exceeds the representable range (profile target={target:?})"
@@ -211,7 +270,7 @@ pub(crate) fn estimate_gamma_shape_from_eta(
         if !(mid > lo && mid < hi) {
             break;
         }
-        if gamma_shape_score(mid, target) > 0.0 {
+        if score(mid) > 0.0 {
             lo = mid;
         } else {
             hi = mid;
@@ -278,6 +337,14 @@ pub(crate) fn estimate_beta_phi_from_eta(
 }
 
 /// Exact Pearson Tweedie dispersion on the represented log-link surface.
+///
+/// Prior weights are precisions, `Var(yᵢ) = φ μᵢ^p / wᵢ` — the same convention
+/// as the reported Tweedie log-likelihood (evaluated at dispersion `φ/wᵢ`) and
+/// the Gaussian identity scale. The moment identity `E[wᵢ (yᵢ−μᵢ)²/μᵢ^p] = φ`
+/// holds row by row, so `φ̂ = Σ wᵢ (yᵢ−μᵢ)²/μᵢ^p / n₊` over the `n₊`
+/// positive-weight rows. Dividing by `Σ wᵢ` instead would read the weights as
+/// replicate counts: a global rescale `w → c·w` would then leave `φ̂` fixed
+/// while the working weights `w/φ̂` grow by `c`, shrinking every SE by `√c`.
 pub(crate) fn estimate_tweedie_phi_from_eta(
     y: ArrayView1<'_, f64>,
     eta: &Array1<f64>,
@@ -313,15 +380,15 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
                 statistic,
             ));
         }
-        Ok((statistic, wi))
+        Ok((statistic, 1.0))
     })?;
-    let (weighted_pearson, total_weight) = certified_pairs_sum(&rows)?;
-    if !(total_weight > 0.0 && weighted_pearson > 0.0) {
+    let (weighted_pearson, positive_rows) = certified_pairs_sum(&rows)?;
+    if !(positive_rows > 0.0 && weighted_pearson > 0.0) {
         crate::bail_invalid_estim!(
-            "Tweedie dispersion is not finite and positive (Pearson={weighted_pearson:?}, weight={total_weight:?})"
+            "Tweedie dispersion is not finite and positive (Pearson={weighted_pearson:?}, positive-weight rows={positive_rows:?})"
         );
     }
-    let phi = weighted_pearson / total_weight;
+    let phi = weighted_pearson / positive_rows;
     if phi.is_finite() && phi > 0.0 {
         Ok(phi)
     } else {
@@ -329,9 +396,16 @@ pub(crate) fn estimate_tweedie_phi_from_eta(
     }
 }
 
-/// Exact dispersion MLE `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` for the families whose
+/// Exact dispersion MLE `φ̂ = Σ wᵢ dᵢ / n₊` for the families whose
 /// log-likelihood is `−dᵢ/(2φ/wᵢ) − ½ log(φ/wᵢ) + c(yᵢ)`: the Gaussian
 /// (`d = (y−μ)²`) and the inverse Gaussian (`d = (y−μ)²/(y μ²)`).
+///
+/// Prior weights are precisions (`Var(yᵢ) ∝ φ/wᵢ`), exactly as in the reported
+/// log-likelihood and the Gaussian identity scale `Σ wᵢ rᵢ² / (n₊ − edf)`.
+/// `∂ℓ/∂φ = Σᵢ [wᵢ dᵢ/(2φ²) − 1/(2φ)]` over the `n₊` positive-weight rows, so
+/// the stationary point divides by `n₊`, not by `Σ wᵢ` (which would be the MLE
+/// of the frequency-weight likelihood `Σ wᵢ [−dᵢ/(2φ) − ½ log φ]`). A global
+/// rescale `w → c·w` maps `φ̂ → c·φ̂` and leaves `β̂` and its covariance fixed.
 ///
 /// `μ` is read from the same inverse-link surface as the working state
 /// (the generic variance × link cell's link, a reciprocal power
@@ -395,15 +469,15 @@ pub(crate) fn estimate_dispersion_phi_from_eta(
                 statistic,
             ));
         }
-        Ok((statistic, wi))
+        Ok((statistic, 1.0))
     })?;
-    let (weighted_deviance, total_weight) = certified_pairs_sum(&rows)?;
-    if !(total_weight > 0.0 && weighted_deviance > 0.0) {
+    let (weighted_deviance, positive_rows) = certified_pairs_sum(&rows)?;
+    if !(positive_rows > 0.0 && weighted_deviance > 0.0) {
         crate::bail_invalid_estim!(
-            "dispersion MLE is not finite and positive (deviance={weighted_deviance:?}, weight={total_weight:?})"
+            "dispersion MLE is not finite and positive (deviance={weighted_deviance:?}, positive-weight rows={positive_rows:?})"
         );
     }
-    let phi = weighted_deviance / total_weight;
+    let phi = weighted_deviance / positive_rows;
     if phi.is_finite() && phi > 0.0 {
         Ok(phi)
     } else {
@@ -457,6 +531,96 @@ mod gamma_tweedie_profile_math_tests {
         assert!((shape * large_y[0] - 1.0).abs() < 1.0e-12);
 
         assert!(estimate_gamma_shape_from_eta(&InverseLink::Standard(StandardLink::Log), Array1::ones(2).view(), &eta, weights.view()).is_err());
+    }
+
+    /// Prior weights are precisions (row shape `wᵢ α`): the shape MLE is the
+    /// root of `Σ wᵢ [ln(wᵢ α) − ψ(wᵢ α) − tᵢ]`, and a global rescale
+    /// `w → c·w` maps it to `α̂/c`. A zero-weight row carries no information.
+    #[test]
+    fn gamma_shape_reads_prior_weights_as_precisions() {
+        let log = InverseLink::Standard(StandardLink::Log);
+        let y = Array1::from(vec![0.4, 1.3, 0.9, 2.2, 0.7, 1.6, 3.0]);
+        let eta = Array1::from(vec![-0.3, 0.1, 0.0, 0.5, -0.2, 0.4, 0.6]);
+        let weights = Array1::from(vec![0.5, 2.0, 1.0, 3.5, 0.25, 1.5, 0.0]);
+        let shape = estimate_gamma_shape_from_eta(&log, y.view(), &eta, weights.view())
+            .expect("weighted Gamma shape is finite");
+        let precision_score = |alpha: f64| -> f64 {
+            (0..y.len())
+                .filter(|&i| weights[i] > 0.0)
+                .map(|i| {
+                    let w = weights[i];
+                    let t = gamma_shape_statistic(y[i], eta[i].exp());
+                    w * ((w * alpha).ln() - digamma(w * alpha) - t)
+                })
+                .sum()
+        };
+        assert!(precision_score(shape * (1.0 - 1.0e-6)) > 0.0);
+        assert!(precision_score(shape * (1.0 + 1.0e-6)) < 0.0);
+
+        for c in [1.0e-3_f64, 7.0, 1.0e3] {
+            let scaled = weights.mapv(|w| c * w);
+            let scaled_shape = estimate_gamma_shape_from_eta(&log, y.view(), &eta, scaled.view())
+                .expect("rescaled weighted Gamma shape is finite");
+            assert!(
+                (scaled_shape * c / shape - 1.0).abs() < 1.0e-12,
+                "shape must scale as 1/c under w -> c w: c={c}, {scaled_shape} vs {shape}"
+            );
+        }
+    }
+
+    /// Tweedie Pearson φ̂ and the Gaussian / inverse-Gaussian dispersion MLE
+    /// divide by the positive-weight row count: `E[wᵢ dᵢ] = φ` per row when
+    /// `Var(yᵢ) ∝ φ/wᵢ`, so a global rescale `w → c·w` maps `φ̂ → c·φ̂`.
+    #[test]
+    fn dispersion_estimates_read_prior_weights_as_precisions() {
+        let log = InverseLink::Standard(StandardLink::Log);
+        let y = Array1::from(vec![0.4, 1.3, 0.9, 2.2, 0.7, 1.6, 3.0]);
+        let eta = Array1::from(vec![-0.3, 0.1, 0.0, 0.5, -0.2, 0.4, 0.6]);
+        let weights = Array1::from(vec![0.5, 2.0, 1.0, 3.5, 0.25, 1.5, 0.0]);
+        let positive_rows = weights.iter().filter(|&&w| w > 0.0).count() as f64;
+        let p = 1.5;
+        let tweedie_expected = (0..y.len())
+            .map(|i| {
+                let mu = eta[i].exp();
+                weights[i] * (y[i] - mu).powi(2) / mu.powf(p)
+            })
+            .sum::<f64>()
+            / positive_rows;
+        let gaussian_expected = (0..y.len())
+            .map(|i| weights[i] * (y[i] - eta[i].exp()).powi(2))
+            .sum::<f64>()
+            / positive_rows;
+        let inverse_gaussian_expected = (0..y.len())
+            .map(|i| {
+                let mu = eta[i].exp();
+                weights[i] * (y[i] - mu).powi(2) / (y[i] * mu * mu)
+            })
+            .sum::<f64>()
+            / positive_rows;
+        for c in [1.0_f64, 1.0e-3, 7.0, 1.0e3] {
+            let scaled = weights.mapv(|w| c * w);
+            let tweedie = estimate_tweedie_phi_from_eta(y.view(), &eta, scaled.view(), p)
+                .expect("weighted Tweedie phi is finite");
+            assert!((tweedie / (c * tweedie_expected) - 1.0).abs() < 1.0e-12);
+            let gaussian = estimate_dispersion_phi_from_eta(
+                &ResponseFamily::Gaussian,
+                &log,
+                y.view(),
+                &eta,
+                scaled.view(),
+            )
+            .expect("weighted Gaussian phi is finite");
+            assert!((gaussian / (c * gaussian_expected) - 1.0).abs() < 1.0e-12);
+            let inverse_gaussian = estimate_dispersion_phi_from_eta(
+                &ResponseFamily::InverseGaussian,
+                &log,
+                y.view(),
+                &eta,
+                scaled.view(),
+            )
+            .expect("weighted inverse Gaussian phi is finite");
+            assert!((inverse_gaussian / (c * inverse_gaussian_expected) - 1.0).abs() < 1.0e-12);
+        }
     }
 
     #[test]

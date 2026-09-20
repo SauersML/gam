@@ -2,13 +2,13 @@
 
 Two bug-hunt issues (#1617, #1618) claimed a defect: a Gaussian fit with integer
 weights does not reproduce the row-expanded fit (each row repeated ``w`` times),
-even though Poisson / binomial / Gamma do. That asymmetry is **correct and
+even though Poisson / binomial do. That asymmetry is **correct and
 intended**, not a bug — this test pins it down so the false premise is not
 re-filed and the behaviour cannot silently drift.
 
 Why the asymmetry is correct
 ----------------------------
-* Fixed-dispersion families (Poisson, binomial, Gamma) have **no scale
+* Fixed-dispersion families (Poisson, binomial) have **no scale
   parameter**. A prior weight ``w`` and ``w`` literal copies enter the LAML
   identically, so the weighted fit reproduces the row-expanded fit exactly.
   Frequency-weight and inverse-variance-weight interpretations coincide.
@@ -19,7 +19,12 @@ Why the asymmetry is correct
   ``phi_hat = sum(w_i r_i^2) / (n - edf)`` with ``n`` the number of *rows*. Only
   weight *ratios* carry information; a global rescale ``w -> c*w`` is absorbed by
   ``phi_hat -> c*phi_hat`` (``lambda_hat -> c*lambda_hat``) leaving the fit —
-  predictions, EDF and **standard errors** — invariant (issue #877).
+  predictions, EDF and **standard errors** — invariant (issue #877). Every
+  other estimated-scale continuous family follows the same convention: the
+  Gaussian non-identity / inverse-Gaussian dispersion ``sum(w_i d_i) / n``, the
+  Tweedie Pearson ``sum(w_i r_i^2 / mu_i^p) / n`` and the Gamma shape (row
+  shape ``w_i * alpha``) are the estimators of the ``phi / w_i`` likelihood the
+  fit reports, so none of them is row-expansion-equivalent either.
 
 These two facts are mutually exclusive with row-expansion equivalence for the
 Gaussian scale: row expansion by ``c`` would shrink every SE by ``sqrt(c)``,
