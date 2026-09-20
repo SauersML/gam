@@ -858,15 +858,12 @@ pub fn saved_model_summary(model: &FittedModel) -> Result<SummaryPayload, String
     let reml_score = fit
         .comparable_reml_score()
         .map_err(|err| format!("failed to compute comparable REML score: {err}"))?;
-    // A custom family has no scalar response distribution, hence no single
-    // dispersion to report; every built-in family resolves one.
-    let scale = match fit.likelihood_family {
-        None => None,
-        Some(_) => Some(
-            fit.dispersion_phi()
-                .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?,
-        ),
-    };
+    // A custom family, and a family whose scale contract has no scalar
+    // response dispersion (Royston-Parmar), report no scale; every other
+    // family resolves one or the summary refuses.
+    let scale = fit
+        .scalar_dispersion_phi()
+        .map_err(|err| format!("failed to resolve the fitted dispersion: {err}"))?;
     let information_criteria = summary_information_criteria(&fit)?;
     Ok(SummaryPayload {
         formula: model.payload().formula.clone(),
@@ -1193,8 +1190,8 @@ pub struct SummaryPayload {
     /// a Gaussian REML fit reports the residual-d.f. estimator
     /// `φ̂ = Σ wᵢ(yᵢ − μ̂ᵢ)² / (n − edf)`, with `n` the positive-weight rows and
     /// `edf = p − Σ_k tr(λ_k H⁻¹ S_k)` (the `edf_total` field); a spline-scan fit reports the smoother's
-    /// REML-profiled `σ̂²`. `None` only for a custom-family fit, which has no
-    /// scalar response distribution.
+    /// REML-profiled `σ̂²`. `None` exactly when the scale contract has no scalar
+    /// response dispersion: a custom-family fit, or Royston-Parmar survival.
     pub scale: Option<f64>,
     /// Reported log-likelihood at the converged mode. Carried so
     /// `compare_models` can form the Occam-penalised conditional AIC it ranks on

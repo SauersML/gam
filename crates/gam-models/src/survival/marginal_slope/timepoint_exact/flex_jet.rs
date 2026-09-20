@@ -142,22 +142,22 @@ pub(crate) fn pack_flex_timepoint_base(base: &SurvivalFlexTimepointExact) -> Fle
     }
 }
 
-thread_local! {
-    /// Per-worker FLEX directional workspace. The largest row tape is retained
-    /// across contractions, so warmed production calls do not revisit the
-    /// global allocator for runtime-sized derivative channels.
-    static FLEX_THIRD_JET_ARENA: std::cell::RefCell<DynamicJetArena> =
-        std::cell::RefCell::new(DynamicJetArena::new());
-}
-
-pub(crate) fn with_flex_third_jet_arena<R>(evaluate: impl FnOnce(&mut DynamicJetArena) -> R) -> R {
-    FLEX_THIRD_JET_ARENA.with(|workspace| {
-        let mut arena = workspace.borrow_mut();
-        arena.reset();
-        let result = evaluate(&mut arena);
-        arena.reset();
-        result
-    })
+impl SurvivalMarginalSlopeFamily {
+    /// Run `evaluate` on an empty FLEX jet arena checked out of the fit's pool
+    /// (gam#3266). The arena is reset before it goes back, so a warmed arena
+    /// keeps its tape's high-water mark as one chunk, and the ledger charges it
+    /// at exactly that. A checked-out arena is always empty: a new one is
+    /// empty, and each arena was reset before it was checked in.
+    pub(crate) fn with_flex_jet_arena<R>(
+        &self,
+        evaluate: impl FnOnce(&mut DynamicJetArena) -> R,
+    ) -> R {
+        self.flex_jet_arenas.with(|arena| {
+            let result = evaluate(arena);
+            arena.reset();
+            result
+        })
+    }
 }
 
 /// The `[f64; 5]` Faà di Bruno stack of `g(η) = logΦ(−η)` at `η`.
@@ -919,25 +919,6 @@ impl FlexJet for Jet1 {
 }
 
 // ── ArenaJet2 / ArenaJet1: the timepoint builder's row-arena carriers ──────
-
-thread_local! {
-    /// Per-worker order-≤2 FLEX timepoint workspace (gam#2971). The largest
-    /// timepoint tape is retained across rows, so a warmed value/gradient/Hessian
-    /// or value/gradient timepoint writes its channels without visiting the
-    /// global allocator.
-    static FLEX_TIMEPOINT_JET_ARENA: std::cell::RefCell<DynamicJetArena> =
-        std::cell::RefCell::new(DynamicJetArena::new());
-}
-
-fn with_flex_timepoint_jet_arena<R>(evaluate: impl FnOnce(&DynamicJetArena) -> R) -> R {
-    FLEX_TIMEPOINT_JET_ARENA.with(|workspace| {
-        let mut arena = workspace.borrow_mut();
-        arena.reset();
-        let result = evaluate(&arena);
-        arena.reset();
-        result
-    })
-}
 
 /// [`Jet2`] with its channels in a row arena (gam#2971): the same channels and
 /// the same per-entry formulas in the same operand order, so every channel is
@@ -3624,7 +3605,8 @@ impl SurvivalMarginalSlopeFamily {
         cached: &CachedPartitionCells,
     ) -> Result<SurvivalFlexTimepointExact, String> {
         let p = primary.total;
-        with_flex_timepoint_jet_arena(|arena| {
+        self.with_flex_jet_arena(|arena| {
+            let arena: &DynamicJetArena = arena;
             let (eta, chi, d) = self.survival_timepoint_jets(
                 row,
                 primary,
@@ -3727,7 +3709,8 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<SurvivalFlexTimepointFirstOrderExact, String> {
         let cached = self.build_cached_partition(row, primary, a, b, beta_h, beta_w)?;
         let p = primary.total;
-        with_flex_timepoint_jet_arena(|arena| {
+        self.with_flex_jet_arena(|arena| {
+            let arena: &DynamicJetArena = arena;
             let (eta, chi, d) = self.survival_timepoint_jets(
                 row,
                 primary,
@@ -6071,10 +6054,11 @@ mod moment_engine_tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         }
     }
 
-    /// The runtime Jet3 arena retains one bounded tape per worker and reuses it
+    /// The runtime Jet3 arena the fit's pool keeps is reused, without growth,
     /// for an identical-width production row.
     #[test]
     fn flex_third_arena_reuses_warmed_tape_932() {
@@ -6099,7 +6083,7 @@ mod moment_engine_tests {
         let dir = Array1::from_iter((0..primary.total).map(|axis| 0.1 + 0.03 * axis as f64));
 
         let run = || {
-            with_flex_third_jet_arena(|arena| {
+            family.with_flex_jet_arena(|arena| {
                 family
                     .compute_survival_timepoint_directional_jet_from_cached(
                         row, &primary, q1, primary.q1, a1, g, None, None, 0.0, &cached, &dir, arena,
@@ -6107,7 +6091,7 @@ mod moment_engine_tests {
                     .expect("production third-order timepoint")
             })
         };
-        let retained_bytes = || with_flex_third_jet_arena(|arena| arena.allocated_bytes());
+        let retained_bytes = || family.flex_jet_arenas.retained_bytes();
         run();
         let first = retained_bytes();
         assert!(first > 0, "FLEX third arena did not retain its warm tape");
@@ -6116,6 +6100,119 @@ mod moment_engine_tests {
             retained_bytes(),
             first,
             "same-width FLEX third row grew its warmed arena"
+        );
+    }
+
+    /// gam#3266: the FLEX jet arenas belong to the fit. The order-≤2 timepoint
+    /// builder and the third-order directional contraction draw on the family's
+    /// pool, and the one arena they leave idle is on the pool's governor at
+    /// exactly the bytes it retains. Dropping the family's last clone frees it
+    /// and its charge, and a ledger that cannot carry it frees it on check-in.
+    /// A per-worker thread-local kept the largest arena on every pool worker for
+    /// the life of the process, and no ledger saw those bytes.
+    #[test]
+    fn flex_jet_arenas_are_charged_and_end_with_the_family_3266() {
+        let pool_on = |governor: &gam_runtime::resource::MemoryGovernor| {
+            Arc::new(gam_runtime::resource::GovernedScratchPool::new(
+                governor.clone(),
+                "test flex jet arena",
+                DynamicJetArena::new,
+                DynamicJetArena::allocated_bytes,
+            ))
+        };
+        // The ledger's own admission shows what it carries: with `held` bytes
+        // reserved, exactly `budget - held` more are admitted.
+        let carries = |governor: &gam_runtime::resource::MemoryGovernor,
+                       budget: usize,
+                       held: usize| {
+            let admits_the_rest = governor.try_reserve(budget - held, "probe").is_ok();
+            let refuses_one_more = governor.try_reserve(budget - held + 1, "probe").is_err();
+            admits_the_rest && refuses_one_more
+        };
+        let budget = 1usize << 30;
+        let governor = gam_runtime::resource::MemoryGovernor::with_budget_bytes(budget);
+        let mut family = make_g_only_flex_family(16);
+        family.flex_jet_arenas = pool_on(&governor);
+        let primary = flex_primary_slices(&family);
+        let row = 5usize;
+        let g = 0.21_f64;
+        let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * 0.15;
+        let a1 = family
+            .solve_row_survival_intercept_with_slot(
+                q1,
+                g,
+                None,
+                None,
+                Some((row, SurvivalInterceptSlotKind::Exit)),
+            )
+            .expect("intercept solve")
+            .0;
+        let cached = family
+            .build_cached_partition(row, &primary, a1, g, None, None)
+            .expect("cached partition");
+        let dir = Array1::from_iter((0..primary.total).map(|axis| 0.1 + 0.03 * axis as f64));
+        assert_eq!(family.flex_jet_arenas.idle_len(), 0, "a new fit holds no arena");
+        assert!(carries(&governor, budget, 0));
+
+        family
+            .compute_survival_timepoint_exact_jet_from_cached(
+                row, &primary, q1, primary.q1, a1, g, None, None, 0.0, &cached,
+            )
+            .expect("production timepoint");
+        assert_eq!(
+            family.flex_jet_arenas.idle_len(),
+            1,
+            "the timepoint builder's arena returns to the fit's pool"
+        );
+        let timepoint_bytes = family.flex_jet_arenas.retained_bytes();
+        assert!(timepoint_bytes > 0, "the idle arena keeps its tape");
+        assert!(
+            carries(&governor, budget, timepoint_bytes),
+            "the idle arena is charged to the governor at its retained bytes"
+        );
+
+        family.with_flex_jet_arena(|arena| {
+            family
+                .compute_survival_timepoint_directional_jet_from_cached(
+                    row, &primary, q1, primary.q1, a1, g, None, None, 0.0, &cached, &dir, arena,
+                )
+                .expect("production third-order timepoint")
+        });
+        assert_eq!(
+            family.flex_jet_arenas.idle_len(),
+            1,
+            "the third-order contraction reuses the idle arena"
+        );
+        let third_bytes = family.flex_jet_arenas.retained_bytes();
+        assert!(third_bytes >= timepoint_bytes);
+        assert!(
+            carries(&governor, budget, third_bytes),
+            "the charge follows the arena to its grown size"
+        );
+
+        let clone = family.clone();
+        let pool = Arc::downgrade(&family.flex_jet_arenas);
+        drop(family);
+        assert!(pool.upgrade().is_some(), "a live clone keeps the fit's pool");
+        drop(clone);
+        assert!(pool.upgrade().is_none(), "the pool ends with the fit's families");
+        assert!(
+            carries(&governor, budget, 0),
+            "ending the fit releases the idle arena's charge"
+        );
+
+        let full = gam_runtime::resource::MemoryGovernor::with_budget_bytes(0);
+        let mut family = make_g_only_flex_family(16);
+        family.flex_jet_arenas = pool_on(&full);
+        family
+            .compute_survival_timepoint_exact_jet_from_cached(
+                row, &primary, q1, primary.q1, a1, g, None, None, 0.0, &cached,
+            )
+            .expect("production timepoint on a full ledger");
+        assert_eq!(
+            family.flex_jet_arenas.idle_len(),
+            0,
+            "an arena the ledger cannot carry is freed on check-in"
         );
     }
 
@@ -6227,7 +6324,7 @@ mod moment_engine_tests {
                 );
             }
         }
-        let retained = with_flex_timepoint_jet_arena(|arena| arena.allocated_bytes());
+        let retained = family.flex_jet_arenas.retained_bytes();
         assert!(retained > 0, "the timepoint arena did not retain its warm tape");
         let row = 6usize;
         let q1 = family.offset_exit[row] + family.marginal_design.to_dense()[[row, 0]] * 0.15;
@@ -6244,7 +6341,7 @@ mod moment_engine_tests {
             )
             .expect("warmed timepoint");
         assert_eq!(
-            with_flex_timepoint_jet_arena(|arena| arena.allocated_bytes()),
+            family.flex_jet_arenas.retained_bytes(),
             retained,
             "a same-width timepoint grew its warmed arena"
         );

@@ -170,7 +170,7 @@ class _ColumnarCoefficientRecords(Sequence[Mapping[str, Any]]):
 
 @dataclass(frozen=True, slots=True)
 class Summary:
-    r"""Frozen, typed view of a fitted-model summary.
+    """Frozen, typed view of a fitted-model summary.
 
     Each attribute mirrors a field of the Rust ``SummaryPayload`` struct.
     Subscript access (``summary["formula"]``) is supported for callers that
@@ -212,8 +212,9 @@ class Summary:
         Estimated dispersion :math:`\\hat\\varphi` of the fitted family:
         Gaussian :math:`\\hat\\sigma^2 = \\mathrm{RSS}_w / (n - \\mathrm{edf})`
         (mgcv's ``gam.scale``), Gamma ``1 / shape``, ``1`` for fixed-scale
-        families (Poisson, binomial). ``None`` only for a custom family that
-        declares no dispersion.
+        families (Poisson, binomial). ``None`` exactly when the family's scale
+        contract has no scalar dispersion: a custom family that declares none,
+        or Royston-Parmar survival.
     log_likelihood : float or None
         Ordinary reported log-likelihood at the converged fit. Every rankable
         model carries a finite value; ``None`` is reserved for the exact
@@ -300,7 +301,7 @@ class Summary:
         its fixed structural penalties, one variance component per penalty on
         its own null scale, so it never reads the term's own fitted
         smoothing parameter, and its reference law (a weighted
-        :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
+        :math:`\\chi^2_1` sum, over :math:`\\chi^2_\\rho/\\rho` when the scale is
         estimated) is the null law at the fitted smoothing parameters of the
         other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
         Random-effect blocks carry the score test of their variance component

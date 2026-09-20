@@ -173,6 +173,34 @@ pub(crate) struct SurvivalClosedFormFallback {
     hints: ThetaHints,
 }
 
+/// Seeds the one-step non-rigid pilot's `[time, marginal, slope]` coefficients
+/// (#808, #2627) into each of those blocks `hints` does not already carry, and
+/// returns which it seeded. A re-solve's hints carry its converged fit's mode
+/// (gam#2926), which is the nearby problem's operating point, so a carried block
+/// keeps it; the pilot seeds a block the re-solve drops and every block of a
+/// fresh fit. A seed that is not finite, or whose width is not its current
+/// design's (#374), is not installed.
+pub(crate) fn seed_uncarried_blocks(
+    hints: &mut ThetaHints,
+    pilot: [&Array1<f64>; 3],
+    widths: [usize; 3],
+) -> [bool; 3] {
+    let slots = [
+        &mut hints.time_beta,
+        &mut hints.marginal_beta,
+        &mut hints.slope_beta,
+    ];
+    let mut seeded = [false; 3];
+    for (block, slot) in slots.into_iter().enumerate() {
+        let seed = pilot[block];
+        if slot.is_none() && seed.len() == widths[block] && seed.iter().all(|v| v.is_finite()) {
+            *slot = Some(seed.clone());
+            seeded[block] = true;
+        }
+    }
+    seeded
+}
+
 /// One survival fit's outcome under its latent-law certificate.
 pub(crate) enum SurvivalCertifiedFit {
     Fitted(Box<SurvivalMarginalSlopeFitResult>),
@@ -1094,7 +1122,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         kappa_options,
     )?;
 
-    // A re-solve on the estimated law starts from the closed-form coefficients.
+    // A re-solve on another law starts from its converged fit's coefficients
+    // (gam#2926). That fit's mode is the nearby problem's operating point, so a
+    // block it carries is never reseeded: the one-step pilot below seeds only
+    // the blocks it drops, and the rigid pilot does not run.
+    let re_solve = fallback_hints.is_some();
     let hints = RefCell::new(fallback_hints.unwrap_or_default());
     // #808 operating-point warm start for the slope block. The inner
     // joint-Newton seeds each block at `spec.initial_beta` (→ `hints.slope_beta`
@@ -1108,11 +1140,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // so the converged β is the data optimum (zero bias; the slope estimand is
     // recovered, NOT dropped or pinned to zero). Width-guarded against any
     // slope design rebuild.
-    if pilot_slope_beta.len() == slope_design.design.ncols()
-        && pilot_slope_beta.iter().all(|v| v.is_finite())
-    {
-        hints.borrow_mut().slope_beta = Some(pilot_slope_beta.clone());
-    }
+    //
     // #2627 operating-point warm start for the time and marginal blocks — the
     // other half of the very same one-step joint Newton solve that produced
     // the slope seed above. Until now that half was computed, used to form
@@ -1145,20 +1173,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // a warm start that did not help.
     {
         let mut hints_mut = hints.borrow_mut();
-        let time_installed = pilot_time_beta.len() == spec.time_block.design_exit.ncols()
-            && pilot_time_beta.iter().all(|v| v.is_finite());
-        if time_installed {
-            hints_mut.time_beta = Some(pilot_time_beta.clone());
-        }
-        let marginal_installed = pilot_marginal_beta.len() == marginal_design.design.ncols()
-            && pilot_marginal_beta.iter().all(|v| v.is_finite());
-        if marginal_installed {
-            hints_mut.marginal_beta = Some(pilot_marginal_beta.clone());
-        }
+        let carried = [
+            hints_mut.time_beta.is_some(),
+            hints_mut.marginal_beta.is_some(),
+            hints_mut.slope_beta.is_some(),
+        ];
+        let [time_installed, marginal_installed, slope_installed] = seed_uncarried_blocks(
+            &mut hints_mut,
+            [&pilot_time_beta, &pilot_marginal_beta, &pilot_slope_beta],
+            [
+                spec.time_block.design_exit.ncols(),
+                marginal_design.design.ncols(),
+                slope_design.design.ncols(),
+            ],
+        );
         log::debug!(
             "[survival-marginal-slope/pilot] #2627 location warm start: \
              time_installed={time_installed} (len={} vs design_exit={}), \
              marginal_installed={marginal_installed} (len={} vs marginal={}), \
+             slope_installed={slope_installed}, \
+             re-solve carries [time, marginal, slope]={carried:?}, \
              |time_beta|_inf={:.6e}, |marginal_beta|_inf={:.6e}",
             pilot_time_beta.len(),
             spec.time_block.design_exit.ncols(),
@@ -1226,6 +1260,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
+    let flex_jet_arenas = new_flex_jet_arena_pool();
     let initial_hyper_theta = setup.theta0();
     let family_coordinate_start = setup.rho_dim() + setup.log_kappa_dim();
     let baseline_axis_count = baseline_initial_theta.len();
@@ -1354,6 +1389,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
             time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
+            flex_jet_arenas: Arc::clone(&flex_jet_arenas),
         };
         family.memoize_operator_backed_designs();
         Ok(family)
@@ -1616,6 +1652,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // evidence: the coupled objective remains non-concave at small n, and the
     // n=800 outer-gradient audit demonstrates that its one-step operating-point
     // hint can still lie outside every startup seed's basin.
+    //
+    // A re-solve is not a cold start either (gam#2926). It starts from its
+    // converged fit's mode, which the pilot would replace with the optimum of
+    // another problem (ρ = 0, no flex blocks), at the pilot's full cost (19.6 s
+    // at n = 10000). A block the re-solve drops (the slope, when the chosen arm
+    // reads another axis) keeps the one-step pilot's seed above, the #808
+    // device for exactly that block.
     let outer_cache_seed_available = options
         .cache_session
         .as_ref()
@@ -1664,6 +1707,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             log::debug!(
                 "[survival-marginal-slope/pilot] skip reason=unarmed-member-seeded n={n}: the \
                  coefficient hints hold the unarmed member's converged solve",
+            );
+        } else if re_solve {
+            log::debug!(
+                "[survival-marginal-slope/pilot] skip reason=re-solve-from-converged-fit n={n} \
+                 (gam#2926)",
             );
         } else {
             let pilot_started = std::time::Instant::now();

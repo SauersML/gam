@@ -42,7 +42,7 @@
 //! The API is held to the first-order rounding of a stable evaluation of its
 //! closed form: an operation count times `ε` on the summed magnitudes of the
 //! form's terms, plus the conditioning of each special function on its rounded
-//! standardized argument, plus `Φ₂`'s owner contract times its coefficient. A
+//! standardized argument, plus `Φ₂`'s owner per-call bound times its coefficient. A
 //! form that amplifies rounding through an ill-conditioned intermediate, such
 //! as `arccos(−ρ)` from a rounded `ρ` as `ρ → −1`, is outside that contract.
 
@@ -75,13 +75,6 @@ const CLOSED_FORM_OPERATIONS: f64 = 32.0;
 /// regions 2-4). A form around it adds its own standardization, products and
 /// Hermite recurrence of three operations per degree up to degree 6 (18): 64.
 const SPECIAL_FUNCTION_OPERATIONS: f64 = 64.0;
-
-/// The bivariate normal owner's absolute contract per value of `Φ₂`
-/// (`gam_math::bivariate_normal`, "Contract"): truncation at most `ε/6`, and
-/// rounding in `Φ`, the core sum and the combination of at most two core
-/// evaluations, each within `SPECIAL_FUNCTION_OPERATIONS ε` of a value in
-/// `[0, 1]`.
-const BIVARIATE_NORMAL_CONTRACT: f64 = (2.0 * SPECIAL_FUNCTION_OPERATIONS + 1.0 / 6.0) * EPSILON;
 
 /// Derivative orders `σ⁽⁰⁾ … σ⁽⁶⁾` the oracle integrands reach.
 const ACTIVATION_ORDERS: usize = 7;
@@ -628,6 +621,8 @@ struct StandardizedPair {
     quotient_h: f64,
     quotient_k: f64,
     orthant: f64,
+    /// The bivariate normal owner's per-call bound on `orthant` (`gam_math::bivariate_normal`, "Contract").
+    orthant_rounding: f64,
     tilted_h: f64,
     tilted_k: f64,
     density: f64,
@@ -658,7 +653,8 @@ impl StandardizedPair {
             root_complement,
             quotient_h,
             quotient_k,
-            orthant,
+            orthant: orthant.value,
+            orthant_rounding: orthant.rounding,
             tilted_h: normal_pdf(h) * normal_cdf(quotient_h),
             tilted_k: normal_pdf(k) * normal_cdf(quotient_k),
             density: normal_pdf(h) * normal_pdf(quotient_h) / root_complement,
@@ -674,7 +670,7 @@ impl StandardizedPair {
 /// - `ψ_h = φ(h) Φ(q_h)` reading a rounded `h`, which moves `φ(h)` by `h² ε`, and
 ///   a rounded `q_h`, whose numerator `k − ρh` errs by `ε (|k| + |ρh|)` before
 ///   division by `√n`; likewise `φ₂`, which reads `q_h` through `φ`;
-/// - `Φ₂`'s owner contract, with its partials times the rounding of `h`, `k`
+/// - `Φ₂`'s owner per-call bound, with its partials times the rounding of `h`, `k`
 ///   and of `ρ` resolved from the complement, `ε (|ρ| + n)`;
 /// - the cancellation in `b̃` and `c̃`.
 fn biased_pair_contract(
@@ -701,7 +697,7 @@ fn biased_pair_contract(
     let density_error = rounding
         * pair.density
         * (1.0 + h * h + h.abs() + pair.quotient_h.abs() * (numerator_h + pair.quotient_h.abs()));
-    let orthant_error = BIVARIATE_NORMAL_CONTRACT
+    let orthant_error = pair.orthant_rounding
         + rounding
             * (pair.tilted_h * h.abs()
                 + pair.tilted_k * k.abs()

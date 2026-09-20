@@ -655,21 +655,17 @@ pub(crate) fn probit_posterior_meanwith_deriv_exact(mu: f64, sigma: f64) -> Inte
     }
 }
 
+/// `σ(x)` and `σ'(x) = σ(x)σ(-x)` from `z = e^{-|x|} ∈ (0, 1]`, which never
+/// overflows: `σ(x) = 1/(1+z)` for `x ≥ 0` and `z/(1+z)` otherwise, and
+/// `σ'(x) = z/(1+z)²` on both sides. The tails keep their full relative
+/// accuracy down to the subnormal range and underflow to zero only where
+/// `e^{-|x|}` itself does.
 #[inline]
 fn stable_sigmoidwith_derivative(x: f64) -> (f64, f64) {
-    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
-    if x_clamped != x {
-        return (sigmoid(x), 0.0);
-    }
-    if x_clamped >= 0.0 {
-        let z = (-x_clamped).exp();
-        let denom = 1.0 + z;
-        (1.0 / denom, z / (denom * denom))
-    } else {
-        let z = x_clamped.exp();
-        let denom = 1.0 + z;
-        (z / denom, z / (denom * denom))
-    }
+    let z = (-x.abs()).exp();
+    let denom = 1.0 + z;
+    let mean = if x >= 0.0 { 1.0 / denom } else { z / denom };
+    (mean, z / (denom * denom))
 }
 
 // ── Logistic-normal integral (F7) ───────────────────────────────────────────
@@ -3741,13 +3737,6 @@ pub fn survival_posterior_meanvariance(
     (m1.clamp(0.0, 1.0), (m2 - m1 * m1).max(0.0))
 }
 
-/// Standard sigmoid function with numerical stability.
-#[inline]
-fn sigmoid(x: f64) -> f64 {
-    let x_clamped = x.clamp(-QUADRATURE_EXP_LOG_MAX, QUADRATURE_EXP_LOG_MAX);
-    1.0 / (1.0 + f64::exp(-x_clamped))
-}
-
 // CLogLog Gaussian convolution via differentiated Gauss-Hermite quadrature
 //
 // For location-scale (GAMLSS) models with CLogLog link we need to evaluate
@@ -4263,18 +4252,21 @@ mod tests {
     }
 
     #[test]
-    fn test_logit_exact_clamped_degenerate_branch_is_locally_flat() {
-        let out = logit_posterior_meanwith_deriv_exact(-710.0, 0.0).expect("exact logit");
-        let h = 1e-6;
-        let plus = logit_posterior_meanwith_deriv_exact(-710.0 + h, 0.0)
-            .expect("exact logit plus")
-            .mean;
-        let minus = logit_posterior_meanwith_deriv_exact(-710.0 - h, 0.0)
-            .expect("exact logit minus")
-            .mean;
-        let fd = (plus - minus) / (2.0 * h);
-        assert_eq!(fd, 0.0);
-        assert_eq!(out.dmean_dmu, 0.0);
+    fn test_logit_exact_point_mass_keeps_its_tails_past_the_exp_log_limit() {
+        // Beyond |μ| = 700 the logistic tail is still e^{-|μ|} to full relative
+        // accuracy (subnormal, not zero), and so is its slope: the point-mass
+        // branch is not flat there.
+        for magnitude in [710.0f64, 720.0] {
+            let tail = (-magnitude).exp();
+            assert!(tail > 0.0);
+            assert_eq!(stable_sigmoidwith_derivative(-magnitude), (tail, tail));
+            assert_eq!(stable_sigmoidwith_derivative(magnitude), (1.0, tail));
+            let lower = logit_posterior_meanwith_deriv_exact(-magnitude, 0.0).expect("exact logit");
+            assert_eq!(lower.mode, IntegratedExpectationMode::ExactClosedForm);
+            assert_eq!((lower.mean, lower.dmean_dmu), (tail, tail));
+            let upper = logit_posterior_meanwith_deriv_exact(magnitude, 0.0).expect("exact logit");
+            assert_eq!((upper.mean, upper.dmean_dmu), (1.0, tail));
+        }
     }
 
     fn simpson_integrate<F>(a: f64, b: f64, n_intervals: usize, f: F) -> f64

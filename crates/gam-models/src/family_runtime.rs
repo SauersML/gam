@@ -47,6 +47,20 @@ pub trait FamilyStrategy: std::fmt::Debug + Send + Sync {
         se_eta: f64,
     ) -> Result<(f64, f64), EstimationError>;
 
+    /// `E[1 − g⁻¹(η)]` under `η ~ N(eta, se_eta²)` for a response whose mean is a
+    /// probability (Binomial, Beta, Royston–Parmar's survival probability).
+    ///
+    /// The complement is integrated as its own function of `η`, never formed as
+    /// `1 − E[g⁻¹(η)]`: where the mean rounds to one, `1 − mean` is exactly zero
+    /// while the complement is a representable positive number, and the Bernoulli
+    /// variance `μ(1 − μ)` an observation band is built from lives on it (#3140).
+    fn posterior_complement_mean(
+        &self,
+        quadctx: &QuadratureContext,
+        eta: f64,
+        se_eta: f64,
+    ) -> Result<f64, EstimationError>;
+
     fn simulate_noise(
         &self,
         mean: &Array1<f64>,
@@ -431,6 +445,72 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             (ResponseFamily::RoystonParmar, _) => {
                 Ok(survival_posterior_meanvariance(quadctx, eta, se_eta))
             }
+        }
+    }
+
+    fn posterior_complement_mean(
+        &self,
+        quadctx: &QuadratureContext,
+        eta: f64,
+        se_eta: f64,
+    ) -> Result<f64, EstimationError> {
+        match (&self.spec.response, &self.spec.link) {
+            // The logistic is point-symmetric, `1 − σ(η) = σ(−η)`, so the complement's
+            // posterior mean is the mean at the reflected centre. Beta's mean is the
+            // logistic of η whatever its link tag, as `posterior_mean` integrates it.
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Logit))
+            | (ResponseFamily::Beta { .. }, _) => {
+                logit_posterior_meanwith_deriv(-eta, se_eta).map(|(mean, _)| mean)
+            }
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::Probit)) => {
+                // E[Φ(η)] = Φ(eta / √(1 + se²)), so E[1 − Φ(η)] = Φ(−eta / √(1 + se²)).
+                Ok(gam_math::probability::normal_cdf(
+                    -eta / (1.0 + se_eta * se_eta).sqrt(),
+                ))
+            }
+            // cloglog: 1 − μ = exp(−exp η), the survival term the survival path owns.
+            (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
+                Ok(survival_posterior_mean(quadctx, eta, se_eta))
+            }
+            // The latent-cloglog kernel reports its mean but not the survival
+            // output the exact complement needs (mixture_link.rs,
+            // `inverse_link_complement_for_inverse_link`), so its complement is the
+            // mean's, as the working response already takes it.
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => self
+                .posterior_mean(quadctx, eta, se_eta)
+                .map(|mean| 1.0 - mean),
+            (ResponseFamily::Binomial, link) => {
+                let spec = &self.spec;
+                Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
+                    inverse_link_jet_for_family_public(spec, x)
+                        .map(|jet| {
+                            gam_solve::mixture_link::inverse_link_complement_for_inverse_link(
+                                link, x, jet.mu,
+                            )
+                        })
+                        .unwrap_or(f64::NAN)
+                }))
+            }
+            // S = exp(−exp η), so 1 − S = −expm1(−exp η), whose digits survive where
+            // S rounds to one.
+            (ResponseFamily::RoystonParmar, _) => {
+                Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
+                    -(-x.exp()).exp_m1()
+                }))
+            }
+            (
+                ResponseFamily::Gaussian
+                | ResponseFamily::StudentT { .. }
+                | ResponseFamily::Poisson
+                | ResponseFamily::Tweedie { .. }
+                | ResponseFamily::NegativeBinomial { .. }
+                | ResponseFamily::Gamma
+                | ResponseFamily::InverseGaussian,
+                _,
+            ) => Err(EstimationError::InvalidInput(format!(
+                "{} has no probability-valued mean, so it has no posterior complement mean",
+                self.spec.pretty_name()
+            ))),
         }
     }
 

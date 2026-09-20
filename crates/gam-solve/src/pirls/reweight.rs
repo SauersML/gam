@@ -1009,6 +1009,11 @@ where
         // takes. Distinct from the reject escalator by design; see the
         // loop_guard module docs.
         let mut lm_bound = IterationBound::new(lm_max_attempts);
+        // An AA(1) candidate is an extrapolation of the LM step, not the step
+        // whose predicted reduction the gain ratio is measured against, so its
+        // rejection says nothing about the damping. Once one is rejected this
+        // iteration, the retry evaluates the plain LM step at the same λ.
+        let mut aa_declined_this_iter = false;
         // Snapshot the LM trajectory's starting λ for the
         // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
         // the runtime-layer adaptive clamp (commit 43be42be) selected for
@@ -1341,7 +1346,7 @@ where
             // reject the accelerated candidate, fall back to the plain Fisher
             // candidate transparently — no change to the rest of the loop.
             let mut aa_attempt = false;
-            if force_fisher_for_rest && !aa_state.disabled {
+            if force_fisher_for_rest && !aa_state.disabled && !aa_declined_this_iter {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
                     candidate_buf.assign(beta_accel);
@@ -1499,10 +1504,12 @@ where
                             );
                         }
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
+                            candidate_buf = candidate_beta.into();
                             if aa_attempt {
                                 aa_state.note_reject(iter);
+                                aa_declined_this_iter = true;
+                                continue;
                             }
-                            candidate_buf = candidate_beta.into();
                             // Exhaustion guard, identical to the screening-reject
                             // branch below. The screening test admitted this trial
                             // (cheap forward eval looked like a descent) but the full
@@ -1915,6 +1922,8 @@ where
                         candidate_buf = candidate_beta.into();
                         if aa_attempt {
                             aa_state.note_reject(iter);
+                            aa_declined_this_iter = true;
+                            continue;
                         }
                         if state.hessian_curvature == HessianCurvatureKind::Observed
                             && !used_fisher_fallback_this_iter
@@ -2061,6 +2070,11 @@ where
                 }
                 Err(err) => {
                     candidate_buf = candidate_beta.into();
+                    if aa_attempt && is_lm_retriable_candidate_error(&err) {
+                        aa_state.note_reject(iter);
+                        aa_declined_this_iter = true;
+                        continue;
+                    }
                     let witness = feasibility_witness(&err);
                     if witness.is_some() {
                         feasibility_witness_this_iter = witness;

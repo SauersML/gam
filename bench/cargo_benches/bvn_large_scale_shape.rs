@@ -32,8 +32,9 @@ fn bench_bivariate_normal_cdf_large_scale_shape(c: &mut Criterion) {
         b.iter(|| {
             let mut acc = 0.0;
             for &(h, k, rho) in &args {
-                acc +=
-                    bivariate_normal_cdf(black_box(h), black_box(k), black_box(rho)).expect("bvn");
+                acc += bivariate_normal_cdf(black_box(h), black_box(k), black_box(rho))
+                    .expect("bvn")
+                    .value;
             }
             black_box(acc)
         });
