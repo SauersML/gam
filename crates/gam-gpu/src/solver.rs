@@ -1041,7 +1041,7 @@ pub(crate) fn iterative_refinement_cholesky_solve(
 
     #[cfg(target_os = "linux")]
     {
-        let runtime = super::device_runtime::GpuRuntime::require().map_err(|error| {
+        super::device_runtime::GpuRuntime::require().map_err(|error| {
             let (rows, cols) = hessian.dim();
             format!(
                 "CUDA runtime unavailable; hessian={rows}x{cols}, rhs={}x{}: {error}",
@@ -1053,7 +1053,9 @@ pub(crate) fn iterative_refinement_cholesky_solve(
 
         // Attempt fp32 + refinement only for single-column RHS with p large
         // enough that the fp64 GEMV residual cost is amortised.
-        if rhs.ncols() == 1 && runtime.policy.iterative_refinement_should_attempt(p) {
+        if rhs.ncols() == 1
+            && crate::policy::GpuDispatchPolicy::iterative_refinement_should_attempt(p)
+        {
             let rhs_col = rhs.column(0);
             let rhs_slice: Vec<f64> = rhs_col.iter().copied().collect();
             if let Ok(solution) = cuda::iterative_refinement_solve_impl(hessian, &rhs_slice) {

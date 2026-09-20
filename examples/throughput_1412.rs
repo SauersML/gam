@@ -12,7 +12,7 @@
 //!
 //! The SAE/LLM fit is `q ≤ 6` row blocks × `p` in the thousands × `n` in the
 //! thousands — *thousands of small dense ops*, no single op large enough to
-//! trip the legacy row-count gate (`xtwx_n_min = 50_000`). The two device hot
+//! clear a one-shot dense launch floor. The two device hot
 //! kernels at this shape are:
 //!
 //!   1. **tile-GEMM**: the `Xᵀ·diag(w)·X` reduction (`n × p`) that forms each

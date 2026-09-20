@@ -344,6 +344,15 @@
   neither a marginal likelihood nor per atom. **Migration:** read the model's top-level
   `penalized_loss_score`. The `ManifoldSAE` artifact schema is now `v10`, without the
   per-atom `evidence`. A `v9` artifact still loads and drops that copy on read.
+- **`GpuDispatchPolicy` loses seven fields no dispatch read** (#3548). The removed
+  fields are `xtwx_n_min`, `xtwx_use_fused_below_p`, `syevd_min_p`, `sparse_min_nnz`,
+  `keep_design_resident_min_bytes`, `prefer_gpu_factorization_min_p` and
+  `mixed_precision`. Their seed values (50_000, 256, 256, 1M, 32 MiB, 512) gated
+  nothing, and the GPU diagnostics line printed two of them as if they did.
+  `GpuMixedPrecisionPolicy` is deleted: only `Refinement` was ever constructed, and
+  `Never` duplicated `Off`. `GpuDispatchPolicy::iterative_refinement_should_attempt(p)`
+  is now an associated function, `p >= REFINEMENT_MIN_P`. A calibration cache written
+  with the old fields still loads, because serde ignores the extra keys.
 
 ## gamfit 0.1.268 (2026-09-11)
 

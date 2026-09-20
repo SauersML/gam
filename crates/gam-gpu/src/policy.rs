@@ -1,37 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub enum GpuMixedPrecisionPolicy {
-    /// Always use fp64 factorization; no refinement attempted.
-    Off,
-    /// Attempt fp32 Cholesky factorization followed by up to
-    /// `REFINEMENT_MAX_STEPS` fp64-residual refinement steps. Policy admits
-    /// the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64 GEMV
-    /// overhead is amortized). The fp32 result is used only when its fp64
-    /// residual is certified inside its rounding band; fp64 factorization is
-    /// used instead when the residual does not decrease (κ(A)·u ≥ 1 regime),
-    /// when the step budget ends above the band, or when the fp32 POTRF itself
-    /// fails.
-    Refinement,
-    /// Always use fp64 factorization; equivalent to `Off` but signals that
-    /// an explicit policy decision was taken.
-    Never,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GpuDispatchPolicy {
-    pub xtwx_n_min: usize,
     pub xtwx_flops_min: usize,
-    pub xtwx_use_fused_below_p: usize,
     pub gemm_min_flops: usize,
     pub potrf_min_p: usize,
     pub small_dense_batched_potrf_max_p: usize,
     pub small_dense_batched_potrf_min_batch: usize,
-    pub syevd_min_p: usize,
-    pub sparse_min_nnz: usize,
-    pub keep_design_resident_min_bytes: usize,
-    pub prefer_gpu_factorization_min_p: usize,
-    pub mixed_precision: GpuMixedPrecisionPolicy,
 }
 
 impl Default for GpuDispatchPolicy {
@@ -45,18 +20,11 @@ impl Default for GpuDispatchPolicy {
     /// tests that exercise policy predicates without initializing CUDA.
     fn default() -> Self {
         Self {
-            xtwx_n_min: 50_000,
             xtwx_flops_min: 100_000_000,
-            xtwx_use_fused_below_p: 256,
             gemm_min_flops: 100_000_000,
             potrf_min_p: 512,
             small_dense_batched_potrf_max_p: 32,
             small_dense_batched_potrf_min_batch: 8,
-            syevd_min_p: 256,
-            sparse_min_nnz: 1_000_000,
-            keep_design_resident_min_bytes: 32 * 1024 * 1024,
-            prefer_gpu_factorization_min_p: 512,
-            mixed_precision: GpuMixedPrecisionPolicy::Refinement,
         }
     }
 }
@@ -108,24 +76,15 @@ impl GpuDispatchPolicy {
     /// is done by fp64 POTRF.
     pub const REFINEMENT_MAX_STEPS: usize = 3;
 
-    /// Return `true` when the policy and problem size together suggest that
-    /// attempting fp32 factorization + iterative refinement will be profitable.
-    ///
-    /// The predicate is conservative:
-    ///   * `GpuMixedPrecisionPolicy::Off` or `Never` → always `false`.
-    ///   * `Refinement` with `p < REFINEMENT_MIN_P` → `false` (GEMV overhead
-    ///     not amortised by fp32 POTRF savings below this threshold).
-    ///   * Otherwise `true`; the caller still falls back to fp64 factorization
-    ///     when the runtime fp32 POTRF fails or when the measured residual is
-    ///     non-monotone.
+    /// Return `true` when the problem size makes fp32 factorization + iterative
+    /// refinement worth attempting: `p ≥ REFINEMENT_MIN_P`, below which the fp64
+    /// residual GEMV is not amortised by the fp32 POTRF savings. The caller still
+    /// takes fp64 factorization when the fp32 POTRF fails or when the refined
+    /// residual does not certify inside its rounding band.
     #[inline]
-    pub const fn iterative_refinement_should_attempt(&self, p: usize) -> bool {
-        match self.mixed_precision {
-            GpuMixedPrecisionPolicy::Off | GpuMixedPrecisionPolicy::Never => false,
-            GpuMixedPrecisionPolicy::Refinement => p >= Self::REFINEMENT_MIN_P,
-        }
+    pub const fn iterative_refinement_should_attempt(p: usize) -> bool {
+        p >= Self::REFINEMENT_MIN_P
     }
-
 
     pub const fn xtwx_target_is_gpu(&self, n: usize, p: usize, materialized: bool) -> bool {
         materialized && n > 0 && p > 0 && self.xtwx_flops(n, p) >= self.dense_reduction_flops_min()
@@ -215,8 +174,7 @@ impl GpuDispatchPolicy {
     /// Work-based admission for offloading the **reduced-Schur PCG matvec** (the
     /// InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
     ///
-    /// The dense gates key on row count (`xtwx_n_min`) or on
-    /// one big factorization's flops, and the SAE LLM shape `(n≈2000) × (k≈2048)
+    /// The dense gates key on one big reduction's or factorization's flops, and the SAE LLM shape `(n≈2000) × (k≈2048)
     /// × (d≈8)` trips neither: it is thousands of small dense ops. But a CG solve
     /// stages the row frames once and reuses them for `cg_iters` applies, so its
     /// cost profile is one staging plus `cg_iters·n·(4·d·k + d²)` batched
@@ -383,35 +341,18 @@ mod refinement_policy_tests {
 
     #[test]
     fn refinement_policy_admits_large_p() {
-        let pol = GpuDispatchPolicy::default();
-        // Default policy is Refinement; large p should be admitted.
-        assert!(pol.iterative_refinement_should_attempt(512));
-        assert!(pol.iterative_refinement_should_attempt(GpuDispatchPolicy::REFINEMENT_MIN_P));
+        assert!(GpuDispatchPolicy::iterative_refinement_should_attempt(512));
+        assert!(GpuDispatchPolicy::iterative_refinement_should_attempt(
+            GpuDispatchPolicy::REFINEMENT_MIN_P
+        ));
     }
 
     #[test]
     fn refinement_policy_rejects_small_p() {
-        let pol = GpuDispatchPolicy::default();
-        assert!(!pol.iterative_refinement_should_attempt(GpuDispatchPolicy::REFINEMENT_MIN_P - 1));
-        assert!(!pol.iterative_refinement_should_attempt(0));
-    }
-
-    #[test]
-    fn off_policy_never_attempts_refinement() {
-        let pol = GpuDispatchPolicy {
-            mixed_precision: GpuMixedPrecisionPolicy::Off,
-            ..Default::default()
-        };
-        assert!(!pol.iterative_refinement_should_attempt(1024));
-    }
-
-    #[test]
-    fn never_policy_never_attempts_refinement() {
-        let pol = GpuDispatchPolicy {
-            mixed_precision: GpuMixedPrecisionPolicy::Never,
-            ..Default::default()
-        };
-        assert!(!pol.iterative_refinement_should_attempt(1024));
+        assert!(!GpuDispatchPolicy::iterative_refinement_should_attempt(
+            GpuDispatchPolicy::REFINEMENT_MIN_P - 1
+        ));
+        assert!(!GpuDispatchPolicy::iterative_refinement_should_attempt(0));
     }
 }
 
@@ -432,8 +373,8 @@ mod reduced_schur_matvec_offload_tests {
     }
 
     /// The LLM/SAE shape the #1017 Phase-1 re-keying targets: a few thousand row
-    /// blocks, a wide border and a modest frame depth. The row-count gate (50k)
-    /// misses it, but one apply is `2_000·(4·8·2_048 + 8²) ≈ 1.3e8` flops, which
+    /// blocks, a wide border and a modest frame depth. Its one-shot dense `XᵀWX`
+    /// (`n = 2_000`, `p = 8`) is far below the dense launch floor, but one apply is `2_000·(4·8·2_048 + 8²) ≈ 1.3e8` flops, which
     /// clears even the uncalibrated seed floor (`1e8`) at a single CG iteration.
     #[test]
     fn admits_llm_sae_matvec_shape() {
@@ -443,8 +384,8 @@ mod reduced_schur_matvec_offload_tests {
         assert!(GpuDispatchPolicy::reduced_schur_matvec_admissible_under_any_policy(
             2_000, 2_048, 8, 1
         ));
-        // The row-count-style dense gate rejects the same shape, confirming the
-        // work re-keying is what admits it.
+        // The one-shot dense gate rejects the same shape, confirming the work
+        // re-keying is what admits it.
         assert!(!pol.dense_hessian_work_target_is_gpu(2_000, 8));
     }
 
