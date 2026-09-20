@@ -1176,12 +1176,6 @@ pub(crate) fn prepare_identified_time_block(
     log_time_exit: ndarray::ArrayView1<f64>,
 ) -> Result<TimeBlockPrepared, String> {
     let p = input.design_exit.ncols();
-    if !input.time_monotonicity.is_coordinate_cone() {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration { reason: format!(
-            "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
-            input.time_monotonicity
-        ) }.into());
-    }
     // Materialize to dense at the location-scale boundary — the hot path
     // uses dense matrix operations (scale_dense_rows, weighted_crossprod_dense_with_parallelism).
     let design_entry = input.design_entry.to_dense();

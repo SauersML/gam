@@ -1316,11 +1316,26 @@ pub(crate) struct PreparedSoftmaxRowJets {
 struct PreparedSoftmaxRowJetTile {
     start: usize,
     q: usize,
-    path: crate::gpu_kernels::sae_rowjet::SaeRowJetPath,
+    executor: PreparedSoftmaxRowJetExecutor,
     inputs: Vec<crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput>,
     probe: Vec<f64>,
-    /// The CPU tile's per-state contractions, when the governor admits them.
-    bilinear: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+}
+
+/// Which executor applies against one prepared tile. The CPU executor keeps
+/// the tile's per-state contractions when the governor admits them (`kept`);
+/// the device executor re-reads the tile's inputs on every apply.
+enum PreparedSoftmaxRowJetExecutor {
+    Cpu {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+    },
+    Device,
+    /// `auto` with a device and a shape it has not timed: every apply runs
+    /// both, and the state's CPU build plus applies are weighed against the
+    /// device's applies when the state drops (gam#3024).
+    Racing {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+        race: gam_gpu::ReusedStateRace,
+    },
 }
 
 struct PreparedResidualCurvatureRow {
