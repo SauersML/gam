@@ -105,6 +105,7 @@
 //!   That is the accuracy the double-double gate pins, and the only reason to
 //!   prefer this schedule; it is not free, and a reader sizing a new call site
 //!   should plan for it.
+use crate::double_double::{DoubleDouble, two_product};
 use std::cell::RefCell;
 use wide::f64x4;
 
@@ -289,27 +290,18 @@ fn compose_unary_coefficients_into(
     out[0] = derivs[0];
 }
 
-/// Branchless TwoSum: returns `(s, e)` with `s = fl(a+b)` and `a+b = s+e`
-/// exactly (Knuth/Møller). Used by the compensated power recurrence and combine.
-#[inline(always)]
-fn two_sum(a: f64, b: f64) -> (f64, f64) {
-    let s = a + b;
-    let bb = s - a;
-    let e = (a - (s - bb)) + (b - bb);
-    (s, e)
-}
-
 /// One step of an Ogita–Rump–Oishi Dot2: accumulate `x·y` into `(s, c)` so that
 /// `s + c` carries the running sum in ~twice the working precision. The product
-/// is split into head plus exact FMA error, and the addition's rounding error is
-/// recovered by TwoSum, so neither the product nor the sum silently drops bits.
+/// is split into head plus exact FMA error ([`two_product`]), and the addition's
+/// rounding error is recovered by TwoSum ([`DoubleDouble::two_sum`]), so neither
+/// the product nor the sum silently drops bits. Both error-free transformations
+/// come from `crate::double_double`, gam-math's one owner of them.
 #[inline(always)]
 fn dot2_step(s: &mut f64, c: &mut f64, x: f64, y: f64) {
-    let prod = x * y;
-    let prod_err = x.mul_add(y, -prod); // exact: prod + prod_err == x*y
-    let (t, sum_err) = two_sum(*s, prod);
-    *s = t;
-    *c += prod_err + sum_err;
+    let product = two_product(x, y);
+    let sum = DoubleDouble::two_sum(*s, product.high);
+    *s = sum.high;
+    *c += product.low + sum.low;
 }
 
 /// `k·(s + c)` for a small integer multiplicity `k`, with `k·s` split into head
@@ -449,9 +441,9 @@ fn combine_powers(p1: &[f64], p2: &[f64], p3: &[f64], p4: &[f64], c: [f64; 4], o
         let mut comp = 0.0f64;
         for (cv, pv) in [(c2, p2), (c3, p3), (c4, p4)] {
             let term = cv * pv[mask];
-            let (t, e) = two_sum(s, term);
-            comp += e;
-            s = t;
+            let sum = DoubleDouble::two_sum(s, term);
+            comp += sum.low;
+            s = sum.high;
         }
         out[mask] = s + comp;
         mask += 1;
