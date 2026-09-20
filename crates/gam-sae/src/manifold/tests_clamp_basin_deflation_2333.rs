@@ -17,7 +17,7 @@
 #![cfg(test)]
 use super::*;
 use crate::assignment::AssignmentMode;
-use crate::manifold::arrow_solver::DeflatedArrowSolver;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use crate::manifold::tests_sparse_curvature_operator_2500::threshold_gate_tiny_fixture;
 use gam_solve::arrow_schur::{
     ArrowSolveOptions, SPECTRAL_DEFLATION_REL_FLOOR, solve_arrow_newton_step_with_options,

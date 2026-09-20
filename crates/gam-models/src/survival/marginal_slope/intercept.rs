@@ -50,7 +50,7 @@ impl SurvivalMarginalSlopeFamily {
         let tolerance = crate::latent_anchor::ANCHOR_LOG_RESIDUAL_TOL.max(rounding);
         let eval = |a: f64| -> Result<(f64, f64, f64), String> {
             let (tail, tail_a, tail_aa) =
-                self.calibration_smaller_tail(law, a, q, slope, beta_h, beta_w, survival_side)?;
+                self.calibration_smaller_tail(law, a, slope, beta_h, beta_w, survival_side)?;
             if !(tail.is_finite() && tail > 0.0) {
                 return Err(SurvivalMarginalSlopeError::NumericalFailure {
                     reason: format!(
@@ -180,28 +180,20 @@ impl SurvivalMarginalSlopeFamily {
     /// `(T, T′, T″)` of the calibration's smaller tail at `a` (gam#2971): the
     /// marginal survival `Σ Φ(−η)` on the survival side, the marginal failure
     /// `Σ Φ(η)` otherwise. On the Gaussian law every de-nested cell contributes
-    /// its own positive probability, so nothing subtracts probabilities near
-    /// one. A finite law's residual is already summed on this tail
-    /// (`F = T − Φ(−q)` on the survival side, `F = Φ(q) − T` otherwise), so `T`
-    /// is read back from it.
+    /// its own positive probability, and on a finite law every node does, so
+    /// nothing subtracts probabilities near one and nothing subtracts the
+    /// target `Φ(∓q)`.
     fn calibration_smaller_tail(
         &self,
         law: Option<AnchorGrid<'_>>,
         a: f64,
-        q: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         survival_side: bool,
     ) -> Result<(f64, f64, f64), String> {
         if let Some(grid) = law {
-            let (f, f_a, f_aa) =
-                self.evaluate_law_survival_calibration(grid, a, q, slope, beta_h, beta_w)?;
-            return Ok(if survival_side {
-                (f + crate::probability::normal_cdf(-q), f_a, f_aa)
-            } else {
-                (crate::probability::normal_cdf(q) - f, -f_a, -f_aa)
-            });
+            return self.evaluate_law_survival_tail(grid, a, slope, beta_h, beta_w, survival_side);
         }
         let cells = self.denested_partition_cells(a, slope, beta_h, beta_w)?;
         let scale = self.probit_frailty_scale();

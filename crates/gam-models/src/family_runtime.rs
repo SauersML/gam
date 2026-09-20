@@ -494,13 +494,21 @@ impl FamilyStrategy for ResolvedFamilyStrategy {
             (ResponseFamily::Binomial, InverseLink::Standard(StandardLink::CLogLog)) => {
                 Ok(survival_posterior_mean(quadctx, eta, se_eta))
             }
-            // The latent-cloglog kernel reports its mean but not the survival
-            // output the exact complement needs (mixture_link.rs,
-            // `inverse_link_complement_for_inverse_link`), so its complement is the
-            // mean's, as the working response already takes it.
-            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => self
-                .posterior_mean(quadctx, eta, se_eta)
-                .map(|mean| 1.0 - mean),
+            // The latent-cloglog mean is `1 − S(eta, √(se² + σ_L²))` with the
+            // lognormal-Laplace survival `S(m, σ) = E[exp(−exp η)]`, `η ~ N(m, σ²)`
+            // (`posterior_mean` forms it as `−expm1(ln S)`), so the complement is
+            // `S` itself, on the same survival surface.
+            (ResponseFamily::Binomial, InverseLink::LatentCLogLog(_)) => {
+                let state = self.require_latent_cloglog_state()?;
+                let total_sigma = se_eta.hypot(state.latent_sd);
+                if !eta.is_finite() || !total_sigma.is_finite() {
+                    return Err(EstimationError::InvalidInput(format!(
+                        "latent cloglog posterior complement requires finite eta and \
+                         sigma, got eta={eta}, sigma={total_sigma}"
+                    )));
+                }
+                Ok(survival_posterior_mean(quadctx, eta, total_sigma))
+            }
             (ResponseFamily::Binomial, link) => {
                 let spec = &self.spec;
                 Ok(normal_expectation_1d_adaptive(quadctx, eta, se_eta, |x| {
@@ -602,6 +610,62 @@ mod log_link_public_jet_tests {
         assert!(over.mu.is_infinite() && over.mu > 0.0, "exp(710) -> +inf");
         let under = strategy.inverse_link_jet(-746.0).expect("jet");
         assert_eq!(under.mu, 0.0, "exp(-746) -> 0.0");
+    }
+
+    /// The latent-cloglog posterior complement is the survival `S(eta, σ)`,
+    /// `σ = √(se² + σ_L²)`, not `1 − mean`: at `(eta, σ) = (8, 0.5)` the mean
+    /// rounds to one while `ln S = −70.97988851759840` (the #2714 high-precision
+    /// reference row, which `ln S` meets to `1e-13` relative).
+    #[test]
+    fn latent_cloglog_posterior_complement_keeps_the_survival_tail() {
+        let state = gam_problem::LatentCLogLogState::new(0.4).expect("latent SD");
+        let strategy = strategy_for_spec(&LikelihoodSpec::new(
+            ResponseFamily::Binomial,
+            InverseLink::LatentCLogLog(state),
+        ));
+        let quadctx = QuadratureContext::new();
+        let (eta, se_eta) = (8.0, 0.3);
+        let mean = strategy
+            .posterior_mean(&quadctx, eta, se_eta)
+            .expect("posterior mean");
+        assert_eq!(mean, 1.0, "the mean saturates, so 1 - mean carries nothing");
+        let complement = strategy
+            .posterior_complement_mean(&quadctx, eta, se_eta)
+            .expect("posterior complement");
+        assert!(
+            complement > 0.0,
+            "the complement must keep the representable survival tail, got {complement:e}"
+        );
+        let reference_log_survival = -7.097_988_851_759_84e1;
+        let relative =
+            (complement.ln() - reference_log_survival).abs() / reference_log_survival.abs();
+        assert!(
+            relative <= 1.0e-12,
+            "ln complement = {:.17e}, reference {reference_log_survival:.17e} \
+             (relative {relative:.3e})",
+            complement.ln()
+        );
+
+        // Where the mean does not saturate, the complement and the mean share
+        // one `ln S`, so they add to one up to the rounding of each.
+        let (eta, se_eta) = (0.35, 0.3);
+        let mean = strategy
+            .posterior_mean(&quadctx, eta, se_eta)
+            .expect("posterior mean");
+        let complement = strategy
+            .posterior_complement_mean(&quadctx, eta, se_eta)
+            .expect("posterior complement");
+        assert!(
+            (mean + complement - 1.0).abs() <= 4.0 * f64::EPSILON,
+            "mean {mean:.17e} + complement {complement:.17e} must be one"
+        );
+
+        assert!(
+            strategy
+                .posterior_complement_mean(&quadctx, f64::NAN, se_eta)
+                .is_err(),
+            "a non-finite eta is refused, as the mean refuses it"
+        );
     }
 
     fn standard_strategy(response: ResponseFamily, link: StandardLink) -> ResolvedFamilyStrategy {
