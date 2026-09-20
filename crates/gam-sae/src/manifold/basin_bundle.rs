@@ -83,6 +83,13 @@ impl<S> BasinBundle<S> {
         self.member_capacity
     }
 
+    /// Re-derive the capacity from the caller's current memory ledger. Retained
+    /// members are never evicted: a capacity at or below [`Self::len`] refuses
+    /// every further distinct admission and leaves each prior branch intact.
+    pub(crate) fn set_member_capacity(&mut self, member_capacity: usize) {
+        self.member_capacity = member_capacity;
+    }
+
     /// Drop every saved basin. Called by the outer
     /// objective at any seam that invalidates the saved states wholesale — a
     /// multi-start reset, a fresh β seed, a row-support swap (subsample

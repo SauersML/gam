@@ -920,10 +920,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let tb = build_transformed_lower_bound_constraints(
             &reparam.qs,
             penalty.coefficient_lower_bounds,
-        );
+        )?;
         let tl =
-            build_transformed_linear_constraints(&reparam.qs, penalty.linear_constraints_original);
-        merge_linear_constraints(tb, tl)
+            build_transformed_linear_constraints(&reparam.qs, penalty.linear_constraints_original)?;
+        merge_linear_constraints(tb, tl)?
     } else {
         // Sparse-native without dense reparam: constraints stay in original
         // coordinates (identity Qs).  Use an identity matrix of appropriate size.
@@ -932,10 +932,10 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
         let tb = build_transformed_lower_bound_constraints(
             &qs_identity,
             penalty.coefficient_lower_bounds,
-        );
+        )?;
         let tl =
-            build_transformed_linear_constraints(&qs_identity, penalty.linear_constraints_original);
-        merge_linear_constraints(tb, tl)
+            build_transformed_linear_constraints(&qs_identity, penalty.linear_constraints_original)?;
+        merge_linear_constraints(tb, tl)?
     };
 
     let coordinate_frame = if use_sparse_native {
@@ -1697,14 +1697,18 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             }
             if refresh_iter + 1 == MAX_SHAPE_REFRESH {
                 // Final allowed pass and the shape is still drifting (a
-                // pathological non-contraction). Do NOT re-solve: re-solving
-                // would advance `final_eta` past the η the just-installed shape
-                // was evaluated at, breaking the stored-shape == estimate(final_eta)
-                // invariant. Stopping here keeps the reported shape exactly the
-                // ML estimate at the reported η; the residual weight/φ drift is
-                // bounded by the last `rel_change` and never worse than the
-                // pre-fix frozen-warm-start value.
-                break;
+                // non-contracting alternation). The working state — β̂, weights,
+                // Hessian, EDF — was solved at the PREVIOUS shape, which differs
+                // from the just-installed one by more than the tolerance; the
+                // shape rescales the penalized objective `k·D + βᵀSβ`, so β̂ is
+                // not stationary at the reported shape. That is not a joint
+                // (β, shape) fixed point and may not be reported as a fit
+                // (#3544), exactly as the Gaussian φ refresh below refuses.
+                crate::bail_invalid_estim!(
+                    "Gamma shape did not reach its converged-η fixed point within \
+                     {MAX_SHAPE_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {SHAPE_REFRESH_REL_TOL:e})"
+                );
             }
             // The shape moved: re-solve β at the corrected shape, warm-started
             // at the converged β, so the final working state is rebuilt with the
@@ -1782,10 +1786,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     break;
                 }
                 if refresh_iter + 1 == MAX_PHI_REFRESH {
-                    // Final allowed pass and φ is still drifting. Do NOT re-solve:
-                    // re-solving would advance η past the point φ was evaluated at,
-                    // breaking the stored-φ == estimate(final_eta) invariant.
-                    break;
+                    // Final allowed pass and φ is still drifting: the working
+                    // state was solved at a φ that differs from the installed one
+                    // by more than the tolerance (φ rescales the effective
+                    // penalty, so β̂ is not stationary at the reported φ). Not a
+                    // joint (β, φ) fixed point, so not a fit (#3544).
+                    crate::bail_invalid_estim!(
+                        "Tweedie dispersion φ did not reach its converged-η fixed point \
+                         within {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
+                         tolerance {PHI_REFRESH_REL_TOL:e})"
+                    );
                 }
                 // φ moved materially: re-solve β at the corrected φ, warm-started
                 // at the converged β, so the final working state is rebuilt with
@@ -1803,9 +1813,9 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // ── Gaussian (non-identity link) / inverse Gaussian dispersion φ ─────────
     //
     // The same converged-η refresh as the Tweedie φ above, with the exact MLE
-    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. Unlike the Tweedie
-    // pass, a φ still moving on the last allowed pass is a failed fit, not a
-    // reported one: the reported φ must be the MLE at the reported η.
+    // `φ̂ = Σ wᵢ dᵢ / Σ wᵢ` in place of the Pearson moment. As in every
+    // converged-η refresh, a φ still moving on the last allowed pass is a failed
+    // fit, not a reported one: the reported φ must be the MLE at the reported η.
     if refine_dispersion_at_converged_eta
         && matches!(
             working_model
@@ -1939,12 +1949,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 break;
             }
             if refresh_iter + 1 == MAX_PHI_REFRESH {
-                // Final allowed pass and φ is still drifting. Do NOT re-solve:
-                // re-solving would advance η past the point the just-installed φ
-                // was evaluated at, breaking the stored-φ == estimate(final_eta)
-                // invariant. Stop here so the reported φ is exactly the moment
-                // estimate at the reported η.
-                break;
+                // Final allowed pass and φ is still drifting: the mean was solved
+                // at a precision that differs from the installed one by more than
+                // the tolerance, and φ feeds back through the digamma mean score,
+                // so β̂ is not stationary at the reported φ. Not a joint (β, φ)
+                // fixed point, so not a fit (#3544).
+                crate::bail_invalid_estim!(
+                    "Beta precision φ did not reach its converged-η fixed point within \
+                     {MAX_PHI_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {PHI_REFRESH_REL_TOL:e})"
+                );
             }
             // φ moved materially: re-solve β at the corrected φ, warm-started at
             // the converged β, so the mean is refit under the better precision
@@ -2078,12 +2092,16 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 break;
             }
             if refresh_iter + 1 == MAX_THETA_REFRESH {
-                // Final allowed pass and θ is still drifting. Do NOT re-solve:
-                // re-solving would advance η past the point the just-installed θ
-                // was evaluated at, breaking the stored-θ == estimate(final_eta)
-                // invariant. Stop here so the reported θ is exactly the ML
-                // estimate at the reported η.
-                break;
+                // Final allowed pass and θ is still drifting: the mean was solved
+                // under a variance function whose θ differs from the installed one
+                // by more than the tolerance, and θ enters the NB2 working
+                // response, so β̂ is not stationary at the reported θ. Not a joint
+                // (β, θ) fixed point, so not a fit (#3544).
+                crate::bail_invalid_estim!(
+                    "negative-binomial θ did not reach its converged-η fixed point within \
+                     {MAX_THETA_REFRESH} re-solves (relative change {rel_change:e} > \
+                     tolerance {THETA_REFRESH_REL_TOL:e})"
+                );
             }
             // θ moved materially: re-solve β at the corrected θ, warm-started at
             // the converged β, so the mean is refit under the better variance
@@ -2142,16 +2160,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
     // Use the workspace-backed variant for the dense path to reuse the
     // `final_aug_matrix` allocation; the sparse path still allocates
     // internally because no pre-computed factor is available at this site.
-    let mut edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
+    let edf = if let Some(dense_h) = penalized_hessian_transformed.as_dense() {
         calculate_edfwithworkspace_with_penalty(dense_h, &penalty_active, &mut saved_workspace)?
     } else {
         calculate_edf_with_penalty(&penalized_hessian_transformed, &penalty_active)?
     };
-    if !edf.is_finite() || edf.is_nan() {
-        let p = penalized_hessian_transformed.ncols() as f64;
-        let r = penalty_active.rank() as f64;
-        edf = (p - r).max(0.0);
-    }
 
     // An exhausted iteration budget stays an exhausted budget. The loop's own
     // post-loop soft acceptance (`pirls_soft_acceptance`) has already decided
@@ -2260,17 +2273,26 @@ pub(crate) fn make_reparam_operator(
 
 // solve_penalized_least_squares_implicit lives in pls_solver (imported above).
 
+// A constraint whose shape does not match the coefficient vector is a caller
+// error. It is refused, never dropped: dropping it would silently turn a
+// constrained fit into an unconstrained one.
 pub(super) fn build_transformed_lower_bound_constraints(
     qs: &Array2<f64>,
     coefficient_lower_bounds: Option<&Array1<f64>>,
-) -> Option<LinearInequalityConstraints> {
-    let lb = coefficient_lower_bounds?;
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    let Some(lb) = coefficient_lower_bounds else {
+        return Ok(None);
+    };
     if lb.len() != qs.nrows() {
-        return None;
+        crate::bail_invalid_estim!(
+            "coefficient lower bounds have length {} but the model has {} coefficients",
+            lb.len(),
+            qs.nrows()
+        );
     }
     let activerows: Vec<usize> = (0..lb.len()).filter(|&i| lb[i].is_finite()).collect();
     if activerows.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut a = Array2::<f64>::zeros((activerows.len(), qs.ncols()));
     let mut b = Array1::<f64>::zeros(activerows.len());
@@ -2278,36 +2300,44 @@ pub(super) fn build_transformed_lower_bound_constraints(
         a.row_mut(r).assign(&qs.row(idx));
         b[r] = lb[idx];
     }
-    Some(
-        LinearInequalityConstraints::new(a, b)
-            .expect("transformed lower-bound constraint shape invariant"),
-    )
+    LinearInequalityConstraints::new(a, b)
+        .map(Some)
+        .map_err(EstimationError::InvalidInput)
 }
 
 pub(super) fn build_transformed_linear_constraints(
     qs: &Array2<f64>,
     linear_constraints: Option<&LinearInequalityConstraints>,
-) -> Option<LinearInequalityConstraints> {
-    let lc = linear_constraints?;
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    let Some(lc) = linear_constraints else {
+        return Ok(None);
+    };
     if lc.a.ncols() != qs.nrows() {
-        return None;
+        crate::bail_invalid_estim!(
+            "linear constraint matrix has {} columns but the model has {} coefficients",
+            lc.a.ncols(),
+            qs.nrows()
+        );
     }
-    Some(
-        LinearInequalityConstraints::new(lc.a.dot(qs), lc.b.clone())
-            .expect("transformed linear constraint shape invariant"),
-    )
+    LinearInequalityConstraints::new(lc.a.dot(qs), lc.b.clone())
+        .map(Some)
+        .map_err(EstimationError::InvalidInput)
 }
 
 pub(super) fn merge_linear_constraints(
     first: Option<LinearInequalityConstraints>,
     second: Option<LinearInequalityConstraints>,
-) -> Option<LinearInequalityConstraints> {
-    match (first, second) {
+) -> Result<Option<LinearInequalityConstraints>, EstimationError> {
+    Ok(match (first, second) {
         (None, None) => None,
         (Some(c), None) | (None, Some(c)) => Some(c),
         (Some(c1), Some(c2)) => {
             if c1.a.ncols() != c2.a.ncols() {
-                return None;
+                crate::bail_invalid_estim!(
+                    "cannot merge constraint blocks with {} and {} columns",
+                    c1.a.ncols(),
+                    c2.a.ncols()
+                );
             }
             let rows = c1.a.nrows() + c2.a.nrows();
             let cols = c1.a.ncols();
@@ -2319,7 +2349,7 @@ pub(super) fn merge_linear_constraints(
             b.slice_mut(s![c1.b.len()..rows]).assign(&c2.b);
             Some(LinearInequalityConstraints { a, b })
         }
-    }
+    })
 }
 
 pub(super) fn sparse_from_denseview(x: ArrayView2<f64>) -> Option<DesignMatrix> {
