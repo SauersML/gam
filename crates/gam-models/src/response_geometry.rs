@@ -463,7 +463,15 @@ pub fn fit_shared_tangent_reml(
             .with_gradient(Derivative::Analytic)
             .with_hessian(DeclaredHessianForm::Dense)
             .with_bounds(rho_lower, rho_upper)
-            .with_disable_fixed_point(true);
+            .with_disable_fixed_point(true)
+            // The closed-form QR/root evaluation resolves the per-output
+            // smoothing score to the floating-point floor. The generic outer
+            // band also serves inexact inner solves and can stop equivalent
+            // response frames at distinguishable coefficient maps. State this
+            // exact engine's accuracy requirement before search/certification.
+            .with_required_projected_gradient_norm(Some(
+                f64::EPSILON.sqrt() * prepared.n_outputs as f64,
+            ));
         if let Some(initial) = initial_log_lambdas.as_ref() {
             problem = problem.with_initial_rho(Array1::from_iter(
                 prepared
