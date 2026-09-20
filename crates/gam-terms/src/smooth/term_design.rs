@@ -3083,16 +3083,22 @@ fn with_identifiability_transform(
             // fails on shape, or it matches `Z`'s shape when the transform
             // removes exactly one column, and is silently taken for `Z`. The
             // penalty is then built one column wider than the design (#3632).
-            // The appended constant is also exactly the direction centering
-            // exists to remove, because the collection's constraint block
-            // always carries the constant column. So only an uncentered term
-            // can keep it.
+            //
+            // A transform always arrives for such a term. The kernel penalty
+            // is zero on the appended constant. So the constant is either
+            // centered away against the model's constant, or, uncentered
+            // (`identifiability=none`), it lies in the joint penalty null
+            // space. The joint-null rotation then acts on all realized
+            // columns and absorbs the constant into the parametric block.
+            // Either way the model's own intercept carries that direction.
             if *include_intercept && transform.is_some() {
                 crate::bail_invalid_basis!(
-                    "matern include_intercept=true appends a constant column, but this term is \
-                     centered against the model's constant, which removes exactly that column; \
-                     drop include_intercept=true, or also pass identifiability=none to keep the \
-                     term uncentered"
+                    "matern include_intercept=true appends an unpenalized constant column after \
+                     the kernel chart, but this term collection transforms the term's realized \
+                     columns: it centers the term against the model's constant, or it absorbs \
+                     the unpenalized constant into the parametric block. The Matérn chart acts \
+                     on the kernel columns alone, so it cannot carry that transform. The \
+                     model's intercept already spans the constant; drop include_intercept=true"
                 );
             }
             Ok(BasisMetadata::Matern {
