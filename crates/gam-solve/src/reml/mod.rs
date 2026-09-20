@@ -4961,9 +4961,6 @@ pub(crate) struct EvalShared {
     pub(crate) h_total: Arc<Array2<f64>>,
     pub(crate) sparse_exact: Option<Arc<SparseExactEvalData>>,
     pub(crate) firth_dense_operator: Option<Arc<FirthDenseOperator>>,
-    /// Cached FirthDenseOperator built from the original (non-reparameterized)
-    /// design matrix, for use by the sparse evaluation path.
-    pub(crate) firth_dense_operator_original: Option<Arc<FirthDenseOperator>>,
     /// The ONE original-frame penalty pseudo-logdet factorization for this
     /// evaluation point (#931 atom discipline). `log|Σ λ_k S_k|₊`'s VALUE,
     /// ρ-derivatives, τ/ψ components, and ρ×τ cross blocks are all
