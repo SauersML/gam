@@ -370,6 +370,15 @@ pub(crate) fn supports_observed_hessian_curvature_for_likelihood(
     ) {
         return true;
     }
+    // Beta regression is not an exponential-dispersion family, and its logit
+    // mean link is not canonical for the sufficient statistic `logit(y)`: the
+    // observed information carries the residual term `−φ h''(η)(y* − ψ(μφ) +
+    // ψ((1−μ)φ))`, and
+    // the Fisher weight does not even share its tail order (it tends to `ω`
+    // as `μ → 0` or `μ → 1`, while the observed weight vanishes like `ω μ`).
+    if matches!(spec.response, ResponseFamily::Beta { .. }) {
+        return matches!(inverse_link, InverseLink::Standard(StandardLink::Logit));
+    }
     // A non-identity Gaussian link is non-canonical: the residual-dependent
     // correction `(y-μ)·B` is nonzero and the Laplace approximation needs it.
     if matches!(spec.response, ResponseFamily::Gaussian)
@@ -845,6 +854,65 @@ pub(crate) fn observed_weight_negative_binomial_log(
     (w, c, d)
 }
 
+/// Beta(μφ, (1−μ)φ) observed information under the logit link and its first
+/// two η-derivatives, pre-multiplied by the prior weight.
+///
+/// With `a = μφ`, `b = (1−μ)φ`, `y* = log y − log(1−y)` and `q = h'(η)`, the
+/// row log-likelihood has `∂ℓ/∂η = ω φ q (y* − ψ(a) + ψ(b))`, so
+///
+/// ```text
+/// W_obs = ω [φ² q² (ψ'(a) + ψ'(b)) − φ q' (y* − ψ(a) + ψ(b))].
+/// ```
+///
+/// Evaluated as written, the two terms are each `≈ ω` in either tail
+/// (`ψ'(a) ≈ 1/a²`, `ψ(a) ≈ −1/a` as `a → 0`) and cancel to leave the `O(ω μ)`
+/// weight, losing every digit once `μ < ε`. The recurrences
+/// `ψ(x) = ψ(x+1) − 1/x` and `ψ'(x) = ψ'(x+1) + 1/x²` remove both poles; the
+/// logit identities `q = μ(1−μ)`, `q' = q(1−2μ)` collect the pole parts into
+/// exactly `2q`, which leaves the division-free form
+///
+/// ```text
+/// T₁ = ψ'(a+1) + ψ'(b+1),   r₁ = y* − ψ(a+1) + ψ(b+1),
+/// P₂ = ψ''(a+1) − ψ''(b+1), P₃ = ψ'''(a+1) + ψ'''(b+1),
+/// W = φ² q² T₁ + 2q − φ q' r₁,
+/// c = φ² (3 q q' T₁ + φ q³ P₂) + 2q' − φ q'' r₁,
+/// d = φ² ((3q'² + 4 q q'') T₁ + 6 φ q² q' P₂ + φ² q⁴ P₃) + 2q'' − φ q''' r₁,
+/// ```
+///
+/// using `dT₁/dη = φ q P₂`, `dP₂/dη = φ q P₃` and `dr₁/dη = −φ q T₁`. The
+/// identity that produces `2q` holds for the logit link only, which is the one
+/// link the Beta family admits.
+#[inline]
+pub(crate) fn observed_weight_beta_logit(
+    y: f64,
+    mu: f64,
+    one_minus_mu: f64,
+    precision: f64,
+    prior_weight: f64,
+    jet: MixtureInverseLinkJet,
+    h4: f64,
+) -> (f64, f64, f64) {
+    let phi = precision;
+    let a1 = mu * phi + 1.0;
+    let b1 = one_minus_mu * phi + 1.0;
+    let (q, q1, q2, q3) = (jet.d1, jet.d2, jet.d3, h4);
+    let t1 = trigamma(a1) + trigamma(b1);
+    let r1 = (y.ln() - (-y).ln_1p()) - digamma(a1) + digamma(b1);
+    let p2 = polygamma2(a1) - polygamma2(b1);
+    let p3 = polygamma3(a1) + polygamma3(b1);
+    let phi_sq = phi * phi;
+    let q_sq = q * q;
+    let w = phi_sq * q_sq * t1 + 2.0 * q - phi * q1 * r1;
+    let c = phi_sq * (3.0 * q * q1 * t1 + phi * q_sq * q * p2) + 2.0 * q1 - phi * q2 * r1;
+    let d = phi_sq
+        * ((3.0 * q1 * q1 + 4.0 * q * q2) * t1
+            + 6.0 * phi * q_sq * q1 * p2
+            + phi_sq * q_sq * q_sq * p3)
+        + 2.0 * q2
+        - phi * q3 * r1;
+    (prior_weight * w, prior_weight * c, prior_weight * d)
+}
+
 /// Family tag for the observed-information weight dispatch.
 ///
 /// This is a simplified family tag that identifies the variance function,
@@ -972,6 +1040,12 @@ pub(crate) fn observed_weight_dispatch(
     h4: f64,
 ) -> (f64, f64, f64) {
     match (family, link) {
+        // The Beta family is logit-only (the gate and the deviance row both
+        // enforce it), and its likelihood is not the quasi-likelihood the
+        // generic variance tower below would evaluate.
+        (WeightFamily::Beta { phi: precision }, _) => {
+            observed_weight_beta_logit(y, mu, one_minus_mu, precision, prior_weight, jet, h4)
+        }
         (WeightFamily::Gamma, WeightLink::Log) => {
             observed_weight_gamma_log(y, mu, phi, prior_weight)
         }

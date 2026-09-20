@@ -2509,6 +2509,152 @@ mod tests {
         }
     }
 
+    /// `ψ⁽ᵏ⁾` (`order` 0 or 1) of a Dual3 argument, composed through third order
+    /// by the chain rule from the scalar stack `[ψ, ψ₁, ψ₂, ψ₃, ψ₄]`.
+    fn polygamma_dual3(order: usize, x: num_dual::Dual3_64) -> num_dual::Dual3_64 {
+        let stack = gam_math::special::polygamma_stack(x.re, order + 4);
+        let (f1, f2, f3) = (stack[order + 1], stack[order + 2], stack[order + 3]);
+        num_dual::Dual3_64::new(
+            stack[order],
+            f1 * x.v1,
+            f2 * x.v1 * x.v1 + f1 * x.v2,
+            f3 * x.v1 * x.v1 * x.v1 + 3.0 * f2 * x.v1 * x.v2 + f1 * x.v3,
+        )
+    }
+
+    /// The Beta-logit row inputs exactly as `compute_observed_hessian_curvature_arrays`
+    /// assembles them, dispatched through `observed_weight_dispatch`.
+    fn beta_logit_dispatched(y: f64, eta: f64, precision: f64, prior_weight: f64) -> (f64, f64, f64) {
+        let link = InverseLink::Standard(StandardLink::Logit);
+        let jet = crate::mixture_link::inverse_link_jet_for_inverse_link(&link, eta)
+            .expect("logit jet");
+        let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(&link, eta)
+            .expect("logit fourth derivative");
+        let one_minus_mu =
+            crate::mixture_link::inverse_link_complement_for_inverse_link(&link, eta, jet.mu);
+        observed_weight_dispatch(
+            WeightFamily::Beta { phi: precision },
+            WeightLink::Other,
+            y,
+            jet.mu,
+            one_minus_mu,
+            1.0,
+            prior_weight,
+            jet,
+            h4,
+        )
+    }
+
+    #[test]
+    fn beta_logit_observed_curvature_matches_dual3() {
+        use num_dual::DualNum;
+        let prior_weight = 1.3;
+        for precision in [0.8_f64, 4.0] {
+            for y in [0.1_f64, 0.6] {
+                let y_star = y.ln() - (-y).ln_1p();
+                for eta in [-2.0_f64, 0.3, 1.7] {
+                    // ℓ = lnΓ(φ) − lnΓ(μφ) − lnΓ((1−μ)φ) + (μφ−1)ln y + ((1−μ)φ−1)ln(1−y)
+                    // with μ = logistic(η), q = dμ/dη = μ(1−μ), q' = q(1−2μ):
+                    // −∂²ℓ/∂η² = φ²q²(ψ₁(μφ) + ψ₁((1−μ)φ)) − φq'(y* − ψ(μφ) + ψ((1−μ)φ)).
+                    // The Dual3 carries this unshifted form, a separate route from
+                    // the recurrence-shifted closed form in the dispatch.
+                    assert_observed_tower_matches_dual3(
+                        &format!("Beta logit phi={precision} y={y}"),
+                        beta_logit_dispatched(y, eta, precision, prior_weight),
+                        |x| {
+                            let mu = ((-x).exp() + 1.0).recip();
+                            let one_minus_mu = -mu + 1.0;
+                            let q = mu * one_minus_mu;
+                            let q1 = q * (one_minus_mu - mu);
+                            let a = mu * precision;
+                            let b = one_minus_mu * precision;
+                            let trigamma_sum = polygamma_dual3(1, a) + polygamma_dual3(1, b);
+                            let residual = polygamma_dual3(0, b) - polygamma_dual3(0, a) + y_star;
+                            (q * q * trigamma_sum * (precision * precision) - q1 * residual * precision)
+                                * prior_weight
+                        },
+                        eta,
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn beta_logit_observed_curvature_keeps_its_tail_order() {
+        // Far in either logit tail the Fisher weight φ²q²(ψ₁(a) + ψ₁(b)) tends to
+        // ω, while the observed weight vanishes like ω·μ(1−μ): its two O(ω)
+        // terms cancel exactly. References: −∂ᵏℓ/∂ηᵏ (k = 2, 3, 4) of the Beta
+        // log-likelihood at y = 0.6, φ = 4, ω = 1, evaluated with 60-digit
+        // arithmetic. The recurrence-shifted form keeps them to rounding, where
+        // the unshifted difference keeps only about three digits at |η| = 30.
+        let (y, precision) = (0.6_f64, 4.0_f64);
+        for (eta, reference) in [
+            (
+                -30.0_f64,
+                [
+                    -7.4441703904022336e-13,
+                    -7.4441703903938675e-13,
+                    -7.4441703903771354e-13,
+                ],
+            ),
+            (
+                30.0,
+                [
+                    -4.4088187034463916e-13,
+                    4.4088187034391617e-13,
+                    -4.4088187034247019e-13,
+                ],
+            ),
+        ] {
+            let (w, c, d) = beta_logit_dispatched(y, eta, precision, 1.0);
+            for (channel, got, want) in [
+                ("W", w, reference[0]),
+                ("dW/deta", c, reference[1]),
+                ("d2W/deta2", d, reference[2]),
+            ] {
+                assert!(
+                    (got - want).abs() <= 1.0e-12 * want.abs(),
+                    "Beta logit {channel} at eta={eta}: {got:+.17e} vs 60-digit reference {want:+.17e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn beta_logit_prices_the_laplace_with_observed_information() {
+        let likelihood = GlmLikelihoodSpec {
+            spec: LikelihoodSpec::new(
+                ResponseFamily::Beta { phi: 4.0 },
+                InverseLink::Standard(StandardLink::Logit),
+            ),
+            scale: LikelihoodScaleMetadata::EstimatedBetaPhi { phi: 4.0 },
+        };
+        assert!(super::supports_observed_hessian_curvature_for_likelihood(
+            &likelihood,
+            &InverseLink::Standard(StandardLink::Logit),
+        ));
+        let eta = array![-30.0, -2.0, 0.3, 1.7, 30.0];
+        let y = array![0.6, 0.1, 0.6, 0.1, 0.6];
+        let prior = array![1.0, 1.3, 1.3, 1.3, 1.0];
+        let (w, c, d) = compute_observed_hessian_curvature_arrays(
+            &likelihood,
+            &InverseLink::Standard(StandardLink::Logit),
+            &eta,
+            y.view(),
+            &Array1::zeros(eta.len()),
+            prior.view(),
+        )
+        .expect("Beta-logit observed curvature");
+        for i in 0..eta.len() {
+            assert_eq!(
+                (w[i], c[i], d[i]),
+                beta_logit_dispatched(y[i], eta[i], 4.0, prior[i]),
+                "row {i}"
+            );
+        }
+    }
+
     #[test]
     pub(crate) fn gamma_log_observed_curvature_dispatch_avoids_generic_overflow() {
         let y = 1.25;
