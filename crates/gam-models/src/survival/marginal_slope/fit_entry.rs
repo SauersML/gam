@@ -1269,8 +1269,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()
         .map_err(FitFailure::input)?;
-    // The time block is a coordinate cone: validation proved D >= 0 and
-    // offsets >= guard, so β >= 0 implies `D β + o >= guard` at every row.
+    // The time block is a coordinate cone: validation proved D >= 0 (up to the
+    // builder's accumulation roundoff) and offsets >= guard (under the shared
+    // guard feasibility band), so β >= 0 implies `D β + o >= guard` at every
+    // row within that same band.
     // A single identity cone lets the custom-family solver recognize the
     // simple lower-bound problem instead of hundreds of dense row constraints.
     let time_linear_constraints = LinearInequalityConstraints::from_per_coordinate_lower_bounds(

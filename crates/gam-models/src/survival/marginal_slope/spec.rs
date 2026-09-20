@@ -540,7 +540,9 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
             }
             .into());
         }
-        if offset < spec.derivative_guard - 1e-12 {
+        // The offset is the row's q' at β = 0, so it is held to the one
+        // guard predicate the solver and the row kernels use (#3766).
+        if survival_derivative_guard_violated(offset, spec.derivative_guard) {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                 reason: format!(
                     "survival-marginal-slope coordinate-cone time block requires derivative offset >= guard at row {row}: offset={offset:.3e}, guard={:.3e}",
@@ -555,6 +557,24 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
         .design_derivative_exit
         .try_to_dense_by_chunks("survival marginal-slope coordinate-cone derivative audit")
         .map_err(|reason| SurvivalMarginalSlopeError::IncompatibleDimensions { reason })?;
+    let p_time = derivative_design.ncols();
+    // Each coordinate-cone derivative entry is analytically ≥ 0 but is formed
+    // as a right-cumulative sum of at most `p_time` B-spline derivatives
+    // `dB_k`; since `dB_k = D_k − D_{k+1}`, `Σ_k |dB_k| ≤ 2 Σ_j |D_j|`, so the
+    // computed entry carries at most `accumulation_band(p_time, 2 Σ_j |D_j|)`
+    // of roundoff (depth `p_time`: one rounding forming each `dB_k` plus the
+    // `p_time − 1` additions). Only a negative entry beyond that band is a real sign
+    // violation.
+    let derivative_row_bands: Vec<f64> = derivative_design
+        .rows()
+        .into_iter()
+        .map(|row| {
+            gam_linalg::roundoff::accumulation_band(
+                p_time,
+                2.0 * row.iter().map(|v| v.abs()).sum::<f64>(),
+            )
+        })
+        .collect();
     for ((row, col), &value) in derivative_design.indexed_iter() {
         if !value.is_finite() {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
@@ -564,7 +584,7 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
             }
             .into());
         }
-        if value < -1e-12 {
+        if value < -derivative_row_bands[row] {
             return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                 reason: format!(
                     "survival-marginal-slope coordinate-cone time block requires nonnegative derivative design entries; row {row}, col {col} = {value:.3e}"
@@ -576,7 +596,11 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
     if let Some(beta0) = &spec.time_block.initial_beta {
         // Under a coordinate-cone time basis, the solver enforces β ≥ 0
         // directly. The row-wise derivative guard is redundant because
-        // validation above proves D ≥ 0 and offset ≥ guard.
+        // validation above proves D ≥ 0 up to its accumulation roundoff and
+        // offset ≥ guard under the shared feasibility band. The seed's β ≥ 0
+        // rows are the same active-set bound rows, so a seed coordinate is
+        // held to that band with guard 0: a projected seed that the active
+        // set certifies as primal feasible is accepted, a real negative is not.
         if spec.time_block.design_derivative_exit.ncols() != beta0.len() {
             return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
                 reason: format!(
@@ -596,7 +620,7 @@ pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), 
                 }
                 .into());
             }
-            if g < -1e-12 {
+            if survival_derivative_guard_violated(g, 0.0) {
                 return Err(SurvivalMarginalSlopeError::MonotonicityViolation {
                     reason: format!(
                         "survival-marginal-slope time_block initial_beta violates β ≥ 0 at coordinate {j} under coordinate-cone monotonicity: got {g:.3e}"
