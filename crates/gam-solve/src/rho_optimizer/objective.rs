@@ -1606,7 +1606,7 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
     if result.rho.len() == perm.len() {
         result.rho = permute_to_native(&result.rho, perm);
     }
-    if let Some(measurement) = result.final_measurement.take() {
+    let measurement_to_native = |measurement: OuterFirstOrderMeasurement| {
         let (rho, value, gradient) = measurement.into_parts();
         let to_native = |coordinates: Array1<f64>| {
             if coordinates.len() == perm.len() {
@@ -1615,12 +1615,13 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
                 coordinates
             }
         };
-        result.final_measurement = Some(OuterFirstOrderMeasurement::new(
-            to_native(rho),
-            value,
-            to_native(gradient),
-        ));
-    }
+        OuterFirstOrderMeasurement::new(to_native(rho), value, to_native(gradient))
+    };
+    result.final_measurement = result.final_measurement.take().map(measurement_to_native);
+    result.displaced_measurement = result
+        .displaced_measurement
+        .take()
+        .map(measurement_to_native);
     if let Some(h) = result.final_hessian.as_ref()
         && h.nrows() == perm.len()
         && h.ncols() == perm.len()

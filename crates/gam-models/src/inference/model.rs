@@ -427,6 +427,36 @@ impl_reason_error_boilerplate! {
     }
 }
 
+impl FittedModelError {
+    /// Who has to act on a saved model this binary refuses: the one category
+    /// every front end classifies it by. Each variant refuses the saved
+    /// payload's own contents (its schema, bytes, fields, options or values),
+    /// so each is a data refusal, remedied by refitting or re-saving the model
+    /// (gam#3008). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::SchemaMismatch { .. }
+            | Self::PayloadCorrupt { .. }
+            | Self::MissingField { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidInput { .. } => gam_problem::ErrorCategory::Data,
+        }
+    }
+
+    /// The `Enum::Variant` name a front end reports beside the category.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "FittedModelError::SchemaMismatch",
+            Self::PayloadCorrupt { .. } => "FittedModelError::PayloadCorrupt",
+            Self::MissingField { .. } => "FittedModelError::MissingField",
+            Self::IncompatibleConfig { .. } => "FittedModelError::IncompatibleConfig",
+            Self::InvalidInput { .. } => "FittedModelError::InvalidInput",
+        }
+    }
+}
+
 // Boundary conversions so external `Result<_, EstimationError>` /
 // `Result<_, SurvivalPredictError>` call sites can propagate with `?`.
 // Survival prediction keeps the model-layer source so the chain identifies
