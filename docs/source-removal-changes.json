@@ -2340,7 +2340,45 @@
     "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
   },
   {
-    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "base": "98e38107cebdf056bd726d03b0a7e2788e1b3ca6",
+    "items": [
+      "crates/gam-solve/src/estimate/smoothing_correction.rs:const:BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC",
+      "crates/gam-solve/src/reml/block_quadrature_correction.rs:fn:block_correction_latched",
+      "crates/gam-solve/src/reml/glm_outer_hessian_fd_tests.rs:fn:a_latched_block_correction_declares_no_outer_hessian_784"
+    ],
+    "reason": "The latched #784 block-local correction now carries its exact analytic rho-Hessian, so certified fits keep their smoothing-corrected covariance instead of shipping the plug-in V = H^-1. The refusal it replaces goes: BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC, the latch predicate block_correction_latched (replaced by block_correction_hessian_refusal, which names why a refused Hessian is absent), and the test that pinned a latched correction declaring no outer Hessian.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3204 (pygam-covariance-refusal, Fixes #3139 and #3198) merged as d4f20811be4720be65138012e033abcb05a91e42 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from d4f20811be4720be65138012e033abcb05a91e42's own tree with --base 98e38107cebdf056bd726d03b0a7e2788e1b3ca6 --head d4f20811be4720be65138012e033abcb05a91e42 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 3 items. Read-proof: git grep -w -c <name> d4f20811be4720be65138012e033abcb05a91e42 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "6dc41be97e6ad583601a08d993f49bcc275386ef",
+    "items": [
+      "crates/gam-solve/src/rho_optimizer/run_plan.rs:fn:certified_resume_is_already_stationary"
+    ],
+    "reason": "The certificate ladder's top is capped at the caller's |Pg| requirement, and a resumed terminal point is judged by the certificate: the zero-iteration shortcut certified_resume_is_already_stationary is replaced by claim_prior_terminal_certificate.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3429 (fix-3311-seed-certification, Fixes #3311 and #3312) merged as 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b's own tree with --base 6dc41be97e6ad583601a08d993f49bcc275386ef --head 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> 1c84d2a44acd352c766a2d6b80e1b2d9a864c06b -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "661649e5fa830748952a78960e77b193fc6858a5",
+    "items": [
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:drain_pending_call",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:lock_queue",
+      "crates/gam-pyffi/src/ffi/python_log.rs:fn:schedule_drain",
+      "crates/gam-pyffi/src/ffi/python_log.rs:static:DRAIN_SCHEDULED",
+      "crates/gam-pyffi/src/ffi/python_log.rs:type:PendingQueue"
+    ],
+    "reason": "Engine log records now stream to Python from one delivery thread that attaches whenever the GIL is free, instead of through Py_AddPendingCall, which CPython runs only on its main thread while it executes bytecode, so nothing was delivered during a detached fit. The pending-call machinery goes: drain_pending_call, schedule_drain, lock_queue, DRAIN_SCHEDULED and PendingQueue.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3378 (fix-3271-log-streaming, Fixes #3271) merged as c5eb78d6864c62efd309cf31043d55e891e7506e with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c5eb78d6864c62efd309cf31043d55e891e7506e's own tree with --base 661649e5fa830748952a78960e77b193fc6858a5 --head c5eb78d6864c62efd309cf31043d55e891e7506e (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 5 items. Read-proof: git grep -w -c <name> c5eb78d6864c62efd309cf31043d55e891e7506e -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "c5eb78d6864c62efd309cf31043d55e891e7506e",
+    "items": [
+      "crates/gam-solve/src/model_types/result_types.rs:fn:weighted_gram"
+    ],
+    "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 1 items. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "e80292d60d5628541767bbcd438ca7a8ce0b2a85",
     "items": [
       "crates/gam-cli/src/main/model_summary.rs:fn:build_model_summary",
       "crates/gam-models/src/inference/saved_summary.rs:fn:summary_smooth_terms",

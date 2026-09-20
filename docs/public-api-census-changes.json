@@ -4793,7 +4793,23 @@
     "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
   },
   {
-    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "base": "98e38107cebdf056bd726d03b0a7e2788e1b3ca6",
+    "removed": {
+      "crates/gam-solve/src/reml/block_quadrature_correction.rs::block_correction_latched": 1
+    },
+    "reason": "The latched #784 block-local correction now carries its exact analytic rho-Hessian, so certified fits keep their smoothing-corrected covariance instead of shipping the plug-in V = H^-1. The refusal it replaces goes: BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC, the latch predicate block_correction_latched (replaced by block_correction_hessian_refusal, which names why a refused Hessian is absent), and the test that pinned a latched correction declaring no outer Hessian.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3204 (pygam-covariance-refusal, Fixes #3139 and #3198) merged as d4f20811be4720be65138012e033abcb05a91e42 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from d4f20811be4720be65138012e033abcb05a91e42's own tree with --base 98e38107cebdf056bd726d03b0a7e2788e1b3ca6 --head d4f20811be4720be65138012e033abcb05a91e42 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> d4f20811be4720be65138012e033abcb05a91e42 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "c5eb78d6864c62efd309cf31043d55e891e7506e",
+    "removed": {
+      "crates/gam-solve/src/model_types/result_types.rs::weighted_gram": 1
+    },
+    "reason": "X'WX stays beside H in the active frame and is read in the saved frame through the gauge, so lift_to_saved_frame no longer refuses a fit carrying a weighted Gram: the frame-ambiguous accessor weighted_gram() is replaced by saved_frame_weighted_gram().",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3389 (fix-3346-lift-weighted-gram, Fixes #3346) merged as ed78ff5628326615b5ca13682cb99e0935bb8d15 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from ed78ff5628326615b5ca13682cb99e0935bb8d15's own tree with --base c5eb78d6864c62efd309cf31043d55e891e7506e --head ed78ff5628326615b5ca13682cb99e0935bb8d15 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> ed78ff5628326615b5ca13682cb99e0935bb8d15 -- <its path> gives 0 for every item except weighted_gram (17, other uses of the same word)."
+  },
+  {
+    "base": "e80292d60d5628541767bbcd438ca7a8ce0b2a85",
     "removed": {
       "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1
     },
