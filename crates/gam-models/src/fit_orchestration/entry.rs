@@ -1161,6 +1161,11 @@ fn deterministic_gaussian_standard_fit(
         // `Z'X'WX Z` is the penalized Hessian itself.
         weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
+        // Exact fit ⇒ no working residual on any row that carries weight.
+        working_residual: Some(gam_terms::inference::smooth_score_test::WorkingResidual {
+            weighted_norm: 0.0,
+            rows: weights.iter().filter(|&&w| w > 0.0).count(),
+        }),
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge,
@@ -1821,9 +1826,7 @@ pub fn drop_zero_weight_rows<'a>(
         return Ok(Cow::Borrowed(data));
     }
     if keep.is_empty() {
-        return Err(WorkflowError::InvalidConfig {
-            reason: format!("weight column '{name}' is zero on every row; there is nothing to fit"),
-        });
+        return Err(no_positive_weight_error(name, weights.len()));
     }
     data.select_rows(&keep)
         .map(Cow::Owned)
@@ -3801,6 +3804,21 @@ fn family_requests_transformation_normal(family: Option<&str>) -> bool {
         == Some("transformation-normal")
 }
 
+/// Refuse `firth=true` on a route whose fit reads no Firth setting.
+///
+/// Only the standard route passes `config.firth` to the solver; the survival,
+/// transformation-normal and location-scale fits run with Firth off. The CLI
+/// refused `--firth` on those routes itself, so `gamfit.fit(..., firth=True)`
+/// and a Rust caller got a fit without Firth instead of the refusal.
+fn refuse_unread_firth(config: &FitConfig, model: &str) -> Result<(), WorkflowError> {
+    if config.firth {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!("firth is not supported for {model}; that fit reads no Firth setting"),
+        });
+    }
+    Ok(())
+}
+
 /// Build the design/request geometry for a formula against a dataset. This is the
 /// FIT path: for survival location-scale / latent modes it resolves the baseline
 /// θ via a real inner fit. Use [`materialize_structural`] for formula validation,
@@ -3867,6 +3885,7 @@ fn materialize_impl<'a>(
                 conflict: TransformationNormalConflict::SurvIntervalResponse,
             });
         }
+        refuse_unread_firth(effective_config, "survival models")?;
         // Interval censoring `T ∈ (L, R]` is only defined for the latent
         // hazard-window survival likelihood, whose kernel carries the
         // `log[S(L) − S(R)]` interval contribution. Route the left boundary `L`
@@ -3891,6 +3910,7 @@ fn materialize_impl<'a>(
                 conflict: TransformationNormalConflict::SurvResponse,
             });
         }
+        refuse_unread_firth(effective_config, "survival models")?;
         if !effective_config.residual_columns.is_empty() {
             return Err(WorkflowError::InvalidConfig {
                 reason: "residual_columns is a Bernoulli marginal-slope block (gam#2924); the \
@@ -3943,10 +3963,25 @@ fn materialize_impl<'a>(
                     conflict: TransformationNormalConflict::NoiseFormula,
                 });
             }
+            refuse_unread_firth(effective_config, "the transformation-normal family")?;
+            // The transformation-normal fit has its own likelihood and reads no
+            // other family, so `transformation_normal=true` beside another family
+            // is a conflict, not a family to drop.
+            if let Some(family) = effective_config.family.as_deref()
+                && !family_requests_transformation_normal(Some(family))
+            {
+                return Err(WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "transformation_normal conflicts with family `{family}`; the \
+                         transformation-normal fit reads no other family"
+                    ),
+                });
+            }
             materialize_transformation_normal(&parsed, data, &col_map, effective_config)
         } else if requests_bernoulli_marginal_slope(effective_config) {
             materialize_bernoulli_marginal_slope(&parsed, data, &col_map, effective_config)
         } else if effective_config.noise_formula.is_some() {
+            refuse_unread_firth(effective_config, "noise_formula location-scale fits")?;
             materialize_location_scale(&parsed, data, &col_map, effective_config)
         } else {
             materialize_standard(&parsed, data, &col_map, effective_config)
@@ -4460,5 +4495,143 @@ mod expectile_front_end_tests {
                 "coefficients differ between front ends: {saved_coef} vs {library_coef}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod unread_firth_and_family_refusal_tests {
+    //! A setting the selected fit does not read is refused by the library, the
+    //! one place every front end reaches, rather than dropped for a fit without it.
+    use super::*;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    /// `t` a positive exit time, `e` a {0,1} event, `y` a continuous response,
+    /// `x` a covariate.
+    fn dataset() -> Dataset {
+        let names = ["t", "e", "y", "x"];
+        let kinds = [
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Binary,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+        ];
+        let t = [1.2, 2.5, 0.8, 3.1, 1.9, 2.2, 4.0, 0.6, 2.8, 1.4];
+        let e = [1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let y = [0.3, -0.2, 1.1, 0.7, -0.5, 0.2, 1.4, -0.9, 0.5, 0.0];
+        let x = [-1.0, -0.7, -0.4, -0.2, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0];
+        let values = Array2::from_shape_fn((t.len(), 4), |(i, j)| [t[i], e[i], y[i], x[i]][j]);
+        Dataset {
+            headers: names.iter().map(|n| n.to_string()).collect(),
+            values,
+            schema: DataSchema {
+                columns: names
+                    .iter()
+                    .zip(kinds)
+                    .map(|(name, kind)| SchemaColumn {
+                        name: name.to_string(),
+                        kind,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: kinds.to_vec(),
+        }
+    }
+
+    fn refusal(formula: &str, config: FitConfig) -> String {
+        match materialize(formula, &dataset(), &config) {
+            Ok(_) => panic!("`{formula}` with {config:?} must be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn firth_is_refused_where_the_fit_reads_no_firth_setting() {
+        let cases = [
+            (
+                "y ~ x",
+                FitConfig {
+                    transformation_normal: true,
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for the transformation-normal family",
+            ),
+            (
+                "y ~ x",
+                FitConfig {
+                    family: Some("transformation-normal".to_string()),
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for the transformation-normal family",
+            ),
+            (
+                "y ~ x",
+                FitConfig {
+                    family: Some("gaussian".to_string()),
+                    noise_formula: Some("1".to_string()),
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for noise_formula location-scale fits",
+            ),
+            (
+                "Surv(t, e) ~ x",
+                FitConfig {
+                    firth: true,
+                    ..FitConfig::default()
+                },
+                "firth is not supported for survival models",
+            ),
+        ];
+        for (formula, config, expected) in cases {
+            let message = refusal(formula, config);
+            assert!(message.contains(expected), "`{formula}`: expected `{expected}`, got: {message}");
+        }
+    }
+
+    #[test]
+    fn transformation_normal_beside_another_family_is_refused() {
+        let message = refusal(
+            "y ~ x",
+            FitConfig {
+                transformation_normal: true,
+                family: Some("poisson".to_string()),
+                ..FitConfig::default()
+            },
+        );
+        assert!(
+            message.contains("transformation_normal conflicts with family `poisson`"),
+            "got: {message}"
+        );
+    }
+
+    #[test]
+    fn the_routes_that_read_their_settings_still_materialize() {
+        let data = dataset();
+        let tn = materialize(
+            "y ~ x",
+            &data,
+            &FitConfig {
+                transformation_normal: true,
+                family: Some("transformation_normal".to_string()),
+                ..FitConfig::default()
+            },
+        )
+        .expect("transformation_normal=true with its own family name");
+        assert!(matches!(tn.request, FitRequest::TransformationNormal(_)));
+        let firth = materialize(
+            "e ~ x",
+            &data,
+            &FitConfig {
+                family: Some("binomial".to_string()),
+                firth: true,
+                ..FitConfig::default()
+            },
+        )
+        .expect("the standard binomial route reads firth");
+        assert!(matches!(firth.request, FitRequest::Standard(_)));
     }
 }
