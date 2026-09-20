@@ -583,6 +583,10 @@ impl OuterProblem {
         self.max_iter = n;
         self
     }
+    /// The outer iteration budget this problem declares.
+    pub fn max_iter(&self) -> usize {
+        self.max_iter
+    }
     pub fn with_bounds(mut self, lo: Array1<f64>, hi: Array1<f64>) -> Self {
         self.bounds = Some((lo, hi));
         self
