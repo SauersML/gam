@@ -4507,116 +4507,6 @@ impl SurvivalLocationScaleFamily {
         ))
     }
 
-    /// Per-row NLL gradient and curvature with respect to the three additive
-    /// time-block offset channels `(o_E, o_X, o_D)` (entry / exit / derivative-
-    /// at-exit). The baseline configuration enters the location-scale fit
-    /// **only** through these three offsets, so contracting these residuals
-    /// against `∂o/∂θ_baseline` gives the analytic θ-gradient of the
-    /// unpenalized NLL at converged β (envelope theorem on the penalized
-    /// objective; the penalty has no θ dependence).
-    ///
-    /// Algebra. With `ell_i = w_i[d(log f(u1) + log g − eta_ls) + (1-d) log S(u1) −
-    /// log S(u0)]`, `u0 = s0·h0 + q0`, `u1 = s1·h1 + q1` and
-    /// `g = (d_raw − h1·eta_ls') + qdot1` (`s = e^{−eta_ls}`: the scale divides the
-    /// whole residual, and `du1/dt = s1·g`, #2695), each offset enters its time
-    /// channel additively, so the map `J` from `(o_E, o_X, o_D)` to `(u0, u1, g)` is
-    /// linear:
-    ///
-    ///   J = [[s0, 0, 0], [0, s1, 0], [0, −eta_ls', 1]].
-    ///
-    /// The row likelihood factors through the functionally independent `u0`,
-    /// `u1`, `g`, whose NLL partials are
-    ///
-    ///   ∂(−ell_i)/∂u0 = − w_i r(u0)
-    ///   ∂(−ell_i)/∂u1 = − w_i [d ψ(u1) − (1−d) r(u1)]
-    ///   ∂(−ell_i)/∂g  = − w_i d / g                                (event-row only)
-    ///
-    /// with a diagonal index-space Hessian `C` (`− w_i r'(u0)`, `− w_i [d ψ'(u1) −
-    /// (1−d) r'(u1)]`, `w_i d / g²`). The offset residual is `Jᵀ ∂(−ell)/∂(u0,u1,g)`
-    /// and the offset curvature `Jᵀ C J`, which couples `o_X` and `o_D` exactly
-    /// when the scale is time-varying.
-    ///
-    /// The fields `grad_time_eta_*` / `h_time_*` produced by
-    /// [`Self::row_derivatives`] are log-likelihood (not NLL) partials in the
-    /// index channels `(u0, u1, g)`, stored as `+∂ℓ`/`+∂²ℓ`, so the
-    /// NLL gradient/curvature negates each **uniformly**. This site delegates
-    /// that to [`SurvivalRowDerivatives::time_channel_nll_gradient`] /
-    /// [`SurvivalRowDerivatives::time_channel_nll_curvature_diag`], which own
-    /// the sign in one place (gam#1396 — a prior `+h_time_d` outlier here and
-    /// in the joint assembler flipped the event-Jacobian self-term).
-    pub(crate) fn offset_channel_geometry(
-        &self,
-        block_states: &[ParameterBlockState],
-    ) -> Result<(OffsetChannelResiduals, OffsetChannelCurvatures), SurvivalLocationScaleError> {
-        let n = self.n;
-        // Missing fitted state means the row likelihood geometry is
-        // undefined. Returning zeros would assert a false stationary point to
-        // the outer baseline optimizer and manufacture convergence.
-        require_fitted_block_geometry(
-            block_states,
-            "SurvivalLocationScaleFamily::offset_channel_geometry",
-        )?;
-        let dynamic = self.build_dynamic_geometry(block_states)?;
-
-        let mut entry = Array1::<f64>::zeros(n);
-        let mut exit = Array1::<f64>::zeros(n);
-        let mut derivative = Array1::<f64>::zeros(n);
-        let mut curvatures = vec![[[0.0_f64; 3]; 3]; n];
-
-        let rows = (0..n)
-            .into_par_iter()
-            .map(
-                |i| -> Result<(usize, f64, f64, f64, [[f64; 3]; 3]), String> {
-                    let state = self.row_predictor_state_at(&dynamic, i);
-                    let Some(row) = self.row_derivatives(i, state)? else {
-                        // `row_derivatives` returns `None` only for a
-                        // non-positive-weight observation. Numerical geometry
-                        // failures on positive-weight rows propagate as errors.
-                        return Ok((i, 0.0, 0.0, 0.0, [[0.0; 3]; 3]));
-                    };
-                    // NLL gradient + curvature in the index channels (u0, u1, g).
-                    // Both helpers own the `-∂ℓ`/`-∂²ℓ` sign so the channels are
-                    // negated uniformly (gam#1396); the index-space curvature is
-                    // diagonal because (u0, u1, g) are functionally independent.
-                    let [g_u0, g_u1, g_g] = row.time_channel_nll_gradient();
-                    let [c_u0, c_u1, c_g] = row.time_channel_nll_curvature_diag();
-                    // Pull back through J (see the doc above).
-                    let s0 = dynamic.inv_sigma_entry[i];
-                    let s1 = dynamic.inv_sigma_exit[i];
-                    let j_gx = -dynamic.eta_ls_deriv_exit[i];
-                    let r_entry = s0 * g_u0;
-                    let r_exit = s1 * g_u1 + j_gx * g_g;
-                    let r_deriv = g_g;
-                    let mut curv = [[0.0_f64; 3]; 3];
-                    curv[0][0] = s0 * s0 * c_u0;
-                    curv[1][1] = s1 * s1 * c_u1 + j_gx * j_gx * c_g;
-                    curv[1][2] = j_gx * c_g;
-                    curv[2][1] = curv[1][2];
-                    curv[2][2] = c_g;
-                    Ok((i, r_entry, r_exit, r_deriv, curv))
-                },
-            )
-            .collect::<Result<Vec<_>, String>>()?;
-
-        for (i, r_entry, r_exit, r_deriv, curv) in rows {
-            entry[i] = r_entry;
-            exit[i] = r_exit;
-            derivative[i] = r_deriv;
-            curvatures[i] = curv;
-        }
-
-        Ok((
-            OffsetChannelResiduals {
-                exit,
-                entry,
-                derivative,
-                // Location-scale has no interval upper-bound channel.
-                right: Array1::<f64>::zeros(n),
-            },
-            OffsetChannelCurvatures { rows: curvatures },
-        ))
-    }
-
     /// Exact data-fit gradient `Σ_i ∂ℓ_i/∂θ_link` of the unpenalized
     /// log-likelihood with respect to the inverse-link parameters θ_link
     /// (SAS `(ε, log δ)`, BetaLogistic `(ε, log δ)`, or Mixture `ρ`), holding
@@ -4854,16 +4744,7 @@ impl SurvivalLocationScaleFamily {
         d_beta_flat: &[f64],
         rows: &crate::row_kernel::RowSet,
     ) -> Result<Option<Array2<f64>>, String> {
-        use gam_solve::mixture_link::{InverseLinkKernel, LinkParamPartials};
-        let axis_count = match self
-            .inverse_link
-            .param_partials(0.0)
-            .map_err(|e| format!("inverse-link param partials probe failed: {e}"))?
-        {
-            None => return Ok(None),
-            Some(LinkParamPartials::Sas(_)) => 2,
-            Some(LinkParamPartials::Mixture(partials)) => partials.djet_drho.len(),
-        };
+        let axis_count = self.link_param_axis_count()?;
         if axis_count == 0 {
             return Ok(None);
         }

@@ -102,14 +102,13 @@ use std::sync::Arc;
 // orchestration-entry, and materialization concerns, so they live at the parent
 // level where every submodule's `use super::*;` picks them up.
 use crate::survival::construction::{
-    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalMarginalSlopeFrozenOffsetChart,
-    SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, append_zero_tail_columns,
+    SurvivalBaselineTarget, SurvivalLikelihoodMode, SurvivalLocationScaleBaselineChart,
+    SurvivalMarginalSlopeFrozenOffsetChart, SurvivalTimeBasisConfig, add_survival_time_derivative_guard_offset, append_zero_tail_columns,
     baseline_chain_rule_gradient, build_latent_survival_baseline_offsets,
     build_survival_time_basis, build_survival_time_offsets_for_likelihood,
     build_survival_timewiggle_from_baseline, build_time_varying_survival_covariate_template,
     center_survival_time_designs_at_anchor, evaluate_survival_time_basis_row,
     fitted_weibull_baseline_from_linear_time_beta, initial_survival_baseline_config_for_fit,
-    location_scale_uses_probit_survival_baseline, marginal_slope_baseline_chain_rule_gradient,
     normalize_survival_time_pair, optimize_survival_baseline_config_with_gradient_only,
     parse_survival_likelihood_mode, parse_survival_time_basis_config,
     positive_survival_time_seed, require_structural_survival_time_basis,

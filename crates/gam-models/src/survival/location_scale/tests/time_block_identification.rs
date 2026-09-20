@@ -973,6 +973,7 @@ fn prepare_model_accepts_time_initializer_when_offset_completes_guard() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
     let prepared = prepare_survival_location_scale_model(&spec)
@@ -1046,6 +1047,7 @@ fn prepare_model_seeds_structural_time_initializer_when_offset_equals_guard() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
     let prepared = prepare_survival_location_scale_model(&spec)
@@ -1116,6 +1118,7 @@ fn prepare_model_assigns_distinct_descending_gauge_priorities() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
     let prepared =
@@ -1199,6 +1202,7 @@ fn prepare_model_fixes_the_constant_log_sigma_the_threshold_scale_aliases() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
     // Outside the σ-scaled log-t baseline every row depends on `η_t·e^{−η_σ}`
@@ -1388,7 +1392,7 @@ fn collapsed_warp_likelihood_is_invariant_in_the_weibull_target() {
                     .is_none_or(|offset| offset.iter().all(|&value| value == 0.0)),
             "the collapsed time block must read none of the target's offsets"
         );
-        let (fit, _) = fit_survival_location_scale_with_geometry(spec).expect("collapsed fit");
+        let fit = fit_survival_location_scale_spec(spec).expect("collapsed fit");
         (
             fit.log_likelihood_at_mode(),
             fit.beta_threshold(),

@@ -765,6 +765,15 @@ pub(crate) fn prepare_survival_location_scale_model(
     } else {
         None
     };
+    if location_log_time.is_some() && spec.baseline_theta_tangents.is_some() {
+        // The reduced parametric-AFT regime replaces the time offsets by the
+        // pinned `−log t` warp, so a baseline θ would move nothing the
+        // likelihood reads.
+        return Err(SurvivalLocationScaleError::InvalidConfiguration {
+            reason: "a nonlinear baseline chart cannot drive the parametric-AFT time warp"
+                .to_string(),
+        });
+    }
 
     let family = SurvivalLocationScaleFamily {
         n,
@@ -796,6 +805,7 @@ pub(crate) fn prepare_survival_location_scale_model(
             .collect(),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: spec.baseline_theta_tangents.clone(),
     };
 
     let mut blockspecs = vec![timespec, thresholdspec, log_sigmaspec];

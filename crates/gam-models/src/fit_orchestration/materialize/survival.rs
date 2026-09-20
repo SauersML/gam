@@ -828,26 +828,35 @@ pub(crate) fn materialize_survival<'a>(
         None
     };
 
-    let build_time_block = |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
+    // A location-scale fit prepares its time stack once, at the configured
+    // baseline, and freezes everything but the three offset channels. A
+    // nonlinear baseline's shape θ then moves only those offsets through a
+    // frozen chart, and the fit's outer optimizer selects θ together with ρ on
+    // the one LAML criterion (#3413).
+    let build_location_scale_request = || {
         let prepared = prepare_survival_time_stack(
             &age_entry,
             &age_exit,
-            candidate,
-            survival_mode,
-            (survival_mode == SurvivalLikelihoodMode::LocationScale)
-                .then_some(&survival_inverse_link),
+            &baseline_cfg,
+            SurvivalLikelihoodMode::LocationScale,
+            Some(&survival_inverse_link),
             time_anchor,
             exact_derivative_guard,
             &time_build,
             effective_timewiggle.as_ref(),
             None,
         )?;
-        let time_p = prepared.time_design_exit.ncols();
-        let time_initial_log_lambdas = prepared.time_initial_log_lambdas.clone();
-        let initial_beta = if survival_mode == SurvivalLikelihoodMode::LocationScale {
-            None
-        } else {
-            Some(Array1::from_elem(time_p, 1e-4))
+        let baseline_chart = match baseline_cfg.target {
+            SurvivalBaselineTarget::Linear => None,
+            _ => Some(SurvivalLocationScaleBaselineChart::new(
+                &age_entry,
+                &age_exit,
+                &baseline_cfg,
+                &survival_inverse_link,
+                &prepared.eta_offset_entry,
+                &prepared.eta_offset_exit,
+                &prepared.derivative_offset_exit,
+            )?),
         };
         let time_block = TimeBlockInput {
             design_entry: prepared.time_design_entry.clone(),
@@ -858,66 +867,46 @@ pub(crate) fn materialize_survival<'a>(
             derivative_offset_exit: prepared.derivative_offset_exit.clone(),
             penalties: prepared.time_penalties.clone(),
             nullspace_dims: prepared.time_nullspace_dims.clone(),
-            initial_log_lambdas: time_initial_log_lambdas,
-            initial_beta,
+            initial_log_lambdas: prepared.time_initial_log_lambdas.clone(),
+            initial_beta: None,
         };
-        Ok::<_, String>((prepared, time_block))
+        let spec = SurvivalLocationScaleTermSpec {
+            age_entry: age_entry.clone(),
+            age_exit: age_exit.clone(),
+            event_target: event.clone(),
+            weights: weights.clone(),
+            inverse_link: survival_inverse_link.clone(),
+            derivative_guard: exact_derivative_guard,
+            time_block,
+            thresholdspec: termspec.clone(),
+            log_sigmaspec: log_sigmaspec.clone(),
+            threshold_offset: threshold_offset.clone(),
+            log_sigma_offset: log_sigma_offset.clone(),
+            threshold_template: threshold_template.clone(),
+            log_sigma_template: log_sigma_template.clone(),
+            timewiggle_block: prepared.timewiggle_block,
+            linkwiggle_block: None,
+            baseline_chart,
+            cache_session: None,
+            persistent_warm_start_store: config.persistent_warm_start_store.clone(),
+            cache_mirror_sessions: Vec::new(),
+        };
+        Ok::<_, String>(SurvivalLocationScaleFitRequest {
+            data: data.values.view(),
+            spec,
+            wiggle: effective_linkwiggle_cfg.clone(),
+            kappa_options: config.spatial_optimization.clone(),
+        })
     };
-
-    // Warm-start cache for the outer baseline-config optimization: each probe
-    // runs a complete inner BFGS over ρ (log-smoothing) starting from zeros if cold; by
-    // capturing the previous probe's converged ρ (threshold + log_sigma blocks) and
-    // injecting it here, the next inner BFGS typically converges in 1-3 iterations
-    // instead of ~10, cutting per-probe cost roughly 5-10× across the probes per fit.
-    let location_scale_smoothing_warm_start: RefCell<Option<(Array1<f64>, Array1<f64>)>> =
-        RefCell::new(None);
-    let build_location_scale_request =
-        |candidate: &crate::survival::construction::SurvivalBaselineConfig| {
-            let (prepared, time_block) = build_time_block(candidate)?;
-            let (initial_threshold_log_lambdas, initial_log_sigma_log_lambdas) =
-                match location_scale_smoothing_warm_start.borrow().as_ref() {
-                    Some((thr, lsg)) => (Some(thr.clone()), Some(lsg.clone())),
-                    None => (None, None),
-                };
-            let spec = SurvivalLocationScaleTermSpec {
-                age_entry: age_entry.clone(),
-                age_exit: age_exit.clone(),
-                event_target: event.clone(),
-                weights: weights.clone(),
-                inverse_link: survival_inverse_link.clone(),
-                derivative_guard: exact_derivative_guard,
-                time_block,
-                thresholdspec: termspec.clone(),
-                log_sigmaspec: log_sigmaspec.clone(),
-                threshold_offset: threshold_offset.clone(),
-                log_sigma_offset: log_sigma_offset.clone(),
-                threshold_template: threshold_template.clone(),
-                log_sigma_template: log_sigma_template.clone(),
-                timewiggle_block: prepared.timewiggle_block,
-                linkwiggle_block: None,
-                initial_threshold_log_lambdas,
-                initial_log_sigma_log_lambdas,
-                cache_session: None,
-                persistent_warm_start_store: config.persistent_warm_start_store.clone(),
-                cache_mirror_sessions: Vec::new(),
-            };
-            Ok::<_, String>(SurvivalLocationScaleFitRequest {
-                data: data.values.view(),
-                spec,
-                wiggle: effective_linkwiggle_cfg.clone(),
-                kappa_options: config.spatial_optimization.clone(),
-            })
-        };
-    let location_scale_collapses_time_warp =
-        |candidate: &crate::survival::construction::SurvivalBaselineConfig| -> Result<bool, WorkflowError> {
-            let request = build_location_scale_request(candidate)
-                .map_err(|reason| WorkflowError::InvalidConfig { reason })?;
-            crate::survival::location_scale::survival_location_scale_terms_collapse_time_warp(
-                request.data,
-                &request.spec,
-            )
-            .map_err(WorkflowError::from)
-        };
+    let location_scale_collapses_time_warp = || -> Result<bool, WorkflowError> {
+        let request =
+            build_location_scale_request().map_err(|reason| WorkflowError::InvalidConfig { reason })?;
+        crate::survival::location_scale::survival_location_scale_terms_collapse_time_warp(
+            request.data,
+            &request.spec,
+        )
+        .map_err(WorkflowError::from)
+    };
 
     let build_marginal_slope_request = || {
         let (prepared, baseline_hyper) = marginal_slope_time_state.as_ref().ok_or_else(|| {
@@ -1141,28 +1130,15 @@ pub(crate) fn materialize_survival<'a>(
             })
         };
 
-    let baseline_cfg = if structural_only {
-        // Structural formula validation must NOT fit. The baseline-θ resolution
-        // for the location-scale and latent modes below is a real inner fit
-        // (BFGS over `fit_model` evaluations); it only refines scale/shape, which
-        // do not affect the request METADATA that validation reports
-        // (family / model_class / schema / support). Running it here made
-        // `validate_formula` — contractually "validate a formula against a
-        // dataset WITHOUT fitting" — execute the full survival baseline workflow,
-        // so a non-converging baseline fit surfaced as a *validation* error. Carry
-        // the seed baseline config unchanged; the real fit path (this flag false)
-        // still optimizes it below.
-        baseline_cfg
-    } else if matches!(
-        survival_mode,
-        SurvivalLikelihoodMode::Transformation
-            | SurvivalLikelihoodMode::Weibull
-            | SurvivalLikelihoodMode::MarginalSlope
-    ) {
-        baseline_cfg
-    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
+    // A location-scale fit selects a nonlinear baseline's θ together with ρ
+    // (#3413), and a latent survival or binary fit selects its baseline chart on
+    // the one LAML criterion (#2714), so the configured baseline is the seed of
+    // every request below. Structural formula validation builds no fit topology
+    // beyond the request metadata, so it skips the collapse check.
+    if !structural_only
+        && baseline_cfg.target != SurvivalBaselineTarget::Linear
         && survival_mode == SurvivalLikelihoodMode::LocationScale
-        && location_scale_collapses_time_warp(&baseline_cfg)?
+        && location_scale_collapses_time_warp()?
     {
         // The constant-scale fit replaces its time warp with `−log t` on the
         // location channel (#892) and reads none of the time block's offsets,
@@ -1177,125 +1153,7 @@ pub(crate) fn materialize_survival<'a>(
                 crate::survival::construction::survival_baseline_targetname(baseline_cfg.target)
             ),
         });
-    } else if baseline_cfg.target != SurvivalBaselineTarget::Linear
-        && survival_mode == SurvivalLikelihoodMode::LocationScale
-    {
-        // Analytic θ-gradient path. The baseline configuration enters the
-        // location-scale fit only through the three additive time-block
-        // offsets (entry η, exit η, exit ∂η/∂t); at the converged β the
-        // envelope theorem gives
-        //
-        //   d(NLL)/dθ_k = Σ_i r^(E)_i ∂o_E_i/∂θ_k
-        //               + r^(X)_i ∂o_X_i/∂θ_k
-        //               + r^(D)_i ∂o_D_i/∂θ_k
-        //
-        // where r^(*) are populated by
-        // `SurvivalLocationScaleFamily::offset_channel_geometry` and the
-        // partials by `baseline_offset_theta_partials`. When the inverse
-        // link is probit/SAS/Mixture/etc., the location-scale family uses
-        // the probit-channel baseline q(t) instead, so we contract against
-        // `marginal_slope_baseline_offset_theta_partials` exactly as the
-        // marginal-slope path does. BFGS w/ this analytic gradient
-        // typically converges in ≲10 outer evaluations.
-        let probit_channel =
-            location_scale_uses_probit_survival_baseline(Some(&survival_inverse_link));
-        // The search takes text, so a candidate's fit failure is kept typed here
-        // (#2937). The outer engine never retries a thrown objective error: it
-        // ends the search, so the kept failure is the one that stopped it.
-        let candidate_failure = std::cell::RefCell::new(None::<FitFailure>);
-        let stop_on = |failure: FitFailure| {
-            let reason = failure.to_string();
-            *candidate_failure.borrow_mut() = Some(failure);
-            reason
-        };
-        let baseline_outcome = optimize_survival_baseline_config_with_gradient_only(
-            &baseline_cfg,
-            age_exit.view(),
-            "workflow survival location-scale baseline",
-            |candidate| {
-                // A candidate spec that cannot be built is configuration.
-                let request = build_location_scale_request(candidate).map_err(|reason| {
-                    stop_on(FitFailure::from(WorkflowError::InvalidConfig { reason }))
-                })?;
-                let fit_result = fit_survival_location_scale_model(request).map_err(|failure| {
-                    stop_on(failure.context("survival location-scale fit failed"))
-                })?;
-                // Warm-start the next probe's threshold / log-σ smoothing parameters
-                // at the converged values for this probe.
-                let threshold_rho = fit_result.fit.fit.lambdas_threshold().mapv(f64::ln);
-                let log_sigma_rho = fit_result.fit.fit.lambdas_log_sigma().mapv(f64::ln);
-                *location_scale_smoothing_warm_start.borrow_mut() =
-                    Some((threshold_rho, log_sigma_rho));
-                let residuals = &fit_result.fit.baseline_offset_residuals;
-                let gradient = if probit_channel {
-                    marginal_slope_baseline_chain_rule_gradient(
-                        age_entry.view(),
-                        age_exit.view(),
-                        candidate,
-                        residuals,
-                    )
-                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
-                } else {
-                    baseline_chain_rule_gradient(
-                        age_entry.view(),
-                        age_exit.view(),
-                        // Location-scale has no interval channel; `residuals.right`
-                        // is all-zero so `age_exit` is an unconsulted placeholder.
-                        age_exit.view(),
-                        candidate,
-                        residuals,
-                    )
-                    .map_err(|reason| stop_on(FitFailure::unclassified(reason)))?
-                }
-                .ok_or_else(|| {
-                    stop_on(FitFailure::invariant(
-                        "workflow survival location-scale baseline unexpectedly has no theta gradient",
-                    ))
-                })?;
-                // The envelope-theorem residual contraction is the exact
-                // θ-gradient of the *profile penalized NLL* −ℓ + ½βᵀSβ at
-                // converged (β̂, ρ̂). Optimizing `reml_score` (which includes
-                // ½ log|S_λ| − ½ log|H| LAML corrections) against this
-                // gradient would mismatch the cost surface, because the
-                // log-determinant terms have their own θ-dependence through
-                // H(β̂, θ). Use the matching profile-NLL cost here; the final
-                // model refit downstream still picks ρ via the full REML
-                // surface at the converged baseline θ. The gradient belongs to
-                // the mode, so the cost reads the mode's log-likelihood, not the
-                // one at a published posterior mean (gam#2921).
-                let log_likelihood_at_mode = fit_result.fit.fit.log_likelihood_at_mode();
-                let profile_cost =
-                    -log_likelihood_at_mode + 0.5 * fit_result.fit.fit.stable_penalty_term;
-                if !profile_cost.is_finite() {
-                    return Err(stop_on(FitFailure::numerical(format!(
-                        "workflow survival location-scale baseline: non-finite profile cost \
-                         (log_likelihood_at_mode={}, stable_penalty_term={}, cost={})",
-                        log_likelihood_at_mode,
-                        fit_result.fit.fit.stable_penalty_term,
-                        profile_cost
-                    ))));
-                }
-                Ok((profile_cost, gradient))
-            },
-        );
-        match baseline_outcome {
-            Ok(baseline) => baseline,
-            Err(search) => {
-                return Err(match candidate_failure.take() {
-                    // A candidate's fit stopped the search: raise that failure
-                    // under its category.
-                    Some(failure) => WorkflowError::from(failure),
-                    // Otherwise the search's own typed verdict, or its
-                    // configuration refusal, stands.
-                    None => search,
-                });
-            }
-        }
-    } else {
-        // A latent survival or binary fit selects its baseline chart together with
-        // ρ on the one LAML criterion (#2714).
-        baseline_cfg
-    };
+    }
 
     let request = match survival_mode {
         SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull => {
@@ -1347,7 +1205,7 @@ pub(crate) fn materialize_survival<'a>(
             })
         }
         SurvivalLikelihoodMode::LocationScale => {
-            FitRequest::SurvivalLocationScale(build_location_scale_request(&baseline_cfg)?)
+            FitRequest::SurvivalLocationScale(build_location_scale_request()?)
         }
         SurvivalLikelihoodMode::MarginalSlope => {
             FitRequest::SurvivalMarginalSlope(build_marginal_slope_request()?)

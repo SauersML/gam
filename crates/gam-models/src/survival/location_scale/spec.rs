@@ -121,6 +121,9 @@ pub(crate) struct SurvivalLocationScaleSpec {
     pub log_sigma_block: CovariateBlockKind,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
+    /// Per-row θ-tangents of the time offsets when a nonlinear baseline's shape
+    /// is an outer hyper coordinate (#3413); `None` for a fixed baseline.
+    pub baseline_theta_tangents: Option<Arc<SurvivalBaselineThetaTangents>>,
     /// Explicit persistent warm-start cache session. See
     /// [`BlockwiseFitOptions::cache_session`].
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
@@ -173,15 +176,11 @@ pub struct SurvivalLocationScaleTermSpec {
     pub log_sigma_template: SurvivalCovariateTermBlockTemplate,
     pub timewiggle_block: Option<TimeWiggleBlockInput>,
     pub linkwiggle_block: Option<LinkWiggleBlockInput>,
-    /// Optional warm-start seed for the threshold-block log-smoothing parameters (ρ).
-    /// When `Some`, its length must equal the number of threshold penalties; values are
-    /// clamped to the outer-loop ρ bounds before being injected into `rho0`.
-    /// Used by the outer baseline-config optimizer to thread converged smoothing
-    /// from one probe into the next.
-    pub initial_threshold_log_lambdas: Option<Array1<f64>>,
-    /// Optional warm-start seed for the log-sigma-block log-smoothing parameters (ρ).
-    /// Same semantics as `initial_threshold_log_lambdas`.
-    pub initial_log_sigma_log_lambdas: Option<Array1<f64>>,
+    /// Frozen nonlinear-baseline offset chart (#3413). When `Some`, the
+    /// time block's offsets are the chart's realization at the baseline θ,
+    /// which the outer optimizer selects together with ρ; `time_block`'s own
+    /// offsets are the seed realization. `None` for a linear baseline.
+    pub baseline_chart: Option<crate::survival::construction::SurvivalLocationScaleBaselineChart>,
     /// Explicit persistent warm-start cache session. See
     /// [`crate::custom_family::BlockwiseFitOptions::cache_session`].
     pub cache_session: Option<std::sync::Arc<gam_runtime::warm_start::Session>>,
@@ -202,16 +201,9 @@ pub struct SurvivalLocationScaleTermFitResult {
     pub resolved_log_sigmaspec: TermCollectionSpec,
     pub threshold_design: TermCollectionDesign,
     pub log_sigma_design: TermCollectionDesign,
-    /// Per-row gradient of unpenalized NLL w.r.t. the three additive time-block
-    /// offset channels (entry / exit / derivative-at-exit) at the converged β.
-    /// Contracted with `∂o/∂θ_baseline` this yields the analytic θ-gradient
-    /// used by the with-gradient baseline optimizer.
-    pub baseline_offset_residuals: OffsetChannelResiduals,
-    /// 3×3 NLL Hessian per row on the offset channels, in
-    /// `(entry, exit, derivative)` order. Diagonal under location-scale —
-    /// the row likelihood is separable in `(u0, u1, g)`. Used by the analytic
-    /// θ-Hessian builder (chain rule second derivative).
-    pub baseline_offset_curvatures: OffsetChannelCurvatures,
+    /// The fitted nonlinear baseline: the chart point the outer optimizer
+    /// certified (#3413). `None` when the spec carried no baseline chart.
+    pub baseline_config: Option<crate::survival::construction::SurvivalBaselineConfig>,
     /// The inverse link the fit was certified at. Its shape parameters are outer
     /// coordinates that the LAML selects together with ρ (#2904), so this is the
     /// fitted link, not the caller's seed.

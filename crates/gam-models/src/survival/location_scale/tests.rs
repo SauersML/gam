@@ -455,6 +455,7 @@ fn survival_exact_newton_test_family() -> SurvivalLocationScaleFamily {
         entry_active: Arc::from(vec![true; 3]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     }
 }
 
@@ -496,7 +497,7 @@ fn survival_exact_newton_test_states(
 /// Total data-fit log-likelihood `ℓ = Σ_i w_i·log L_i` of the survival
 /// location-scale family at the given block states, evaluated with an
 /// arbitrary inverse link (the rest of the family fixed). Mirrors the
-/// `offset_channel_geometry` row loop: the dynamic geometry (u0 = h0+q0,
+/// family's row loop: the dynamic geometry (u0 = h0+q0,
 /// u1 = h1+q1) depends only on the block states, so swapping the link
 /// re-evaluates only the kernel coefficients. Used to finite-difference the
 /// inverse-link data-fit θ-gradient.
@@ -717,6 +718,115 @@ fn link_param_joint_psihessian_directional_derivative_matches_finite_difference_
                 (analytic - fd).abs() <= 1e-5 * fd.abs().max(1.0),
                 "axis {axis} mixed drift mismatch: analytic={analytic}, fd={fd}"
             );
+        }
+    }
+}
+
+/// #3413: the baseline θ hyper terms are the partials of the family's own row
+/// program along the offset tangent. Shifting the stacked `[entry; exit;
+/// deriv]` time predictor by `h·t_k` is the offset move of axis `k`, so central
+/// differences of `−ℓ`, `∇_β(−ℓ)`, the observed information and its drift along
+/// `u` reproduce `objective_psi`, `score_psi`, `hessian_psi` and the mixed
+/// drift, for a location-only and a SAS link.
+#[test]
+fn baseline_theta_joint_psi_terms_match_offset_finite_difference_3413() {
+    let tangents = Arc::new(SurvivalBaselineThetaTangents {
+        entry: array![[0.3, -0.2], [0.0, 0.0], [-0.5, 0.4]],
+        exit: array![[0.7, 0.1], [-0.4, 0.6], [0.2, -0.3]],
+        deriv: array![[0.15, -0.05], [0.25, 0.1], [-0.1, 0.2]],
+    });
+    let sas = InverseLink::Sas(
+        state_from_sasspec(SasLinkSpec {
+            initial_epsilon: 0.15,
+            initial_log_delta: -0.25,
+        })
+        .expect("sas state"),
+    );
+    let gaussian = survival_exact_newton_test_family().inverse_link;
+    for link in [gaussian, sas] {
+        let mut family = survival_exact_newton_test_family();
+        family.inverse_link = link;
+        family.baseline_theta_tangents = Some(tangents.clone());
+        let states = survival_exact_newton_test_states(&family, 0.35, 0.3, -0.1);
+        let n = family.n;
+        let shifted = |axis: usize, step: f64| {
+            let mut out = states.clone();
+            let eta = &mut out[SurvivalLocationScaleFamily::BLOCK_TIME].eta;
+            for i in 0..n {
+                eta[i] += step * tangents.entry[[i, axis]];
+                eta[n + i] += step * tangents.exit[[i, axis]];
+                eta[2 * n + i] += step * tangents.deriv[[i, axis]];
+            }
+            out
+        };
+        let nll_and_gradient = |at: &[ParameterBlockState]| {
+            let (ll, gradients) = family
+                .evaluate_log_likelihood_and_block_gradients(at)
+                .expect("block gradients");
+            let flat: Vec<f64> = gradients.iter().flat_map(|g| g.iter().map(|v| -v)).collect();
+            (-ll, Array1::from(flat))
+        };
+        let hessian_at = |at: &[ParameterBlockState]| {
+            CustomFamily::exact_newton_joint_hessian(&family, at)
+                .expect("joint hessian")
+                .expect("exact joint hessian")
+        };
+        let direction = array![0.4, -0.7, 0.25];
+        let drift_at = |at: &[ParameterBlockState]| {
+            family
+                .exact_newton_joint_hessian_directional_derivative_rescaled(at, &direction, 0.0)
+                .expect("observed-information drift")
+                .expect("survival location-scale serves the observed-information drift")
+        };
+        let close = |analytic: f64, fd: f64, what: &str| {
+            assert!(
+                (analytic - fd).abs() <= 1e-5 * fd.abs().max(1.0),
+                "{what}: analytic={analytic}, fd={fd}"
+            );
+        };
+        let h = 1e-6;
+        for axis in 0..tangents.axis_count() {
+            let terms = family
+                .baseline_theta_joint_psi_terms(&states, axis)
+                .expect("baseline θ psi terms")
+                .expect("baseline θ axis");
+            let drift = family
+                .baseline_theta_joint_psihessian_directional_derivative(
+                    &states,
+                    axis,
+                    direction.as_slice().expect("contiguous direction"),
+                    &crate::row_kernel::RowSet::All,
+                )
+                .expect("baseline θ mixed drift")
+                .expect("baseline θ axis");
+            let (plus, minus) = (shifted(axis, h), shifted(axis, -h));
+            let (nll_plus, gradient_plus) = nll_and_gradient(&plus);
+            let (nll_minus, gradient_minus) = nll_and_gradient(&minus);
+            close(
+                terms.objective_psi,
+                (nll_plus - nll_minus) / (2.0 * h),
+                &format!("axis {axis} objective_psi"),
+            );
+            let fd_score = (&gradient_plus - &gradient_minus) / (2.0 * h);
+            for (a, fd) in terms.score_psi.iter().zip(fd_score.iter()) {
+                close(*a, *fd, &format!("axis {axis} score_psi"));
+            }
+            let fd_hessian = (&hessian_at(&plus) - &hessian_at(&minus)) / (2.0 * h);
+            assert!(
+                fd_hessian.iter().any(|v| v.abs() > 1e-6),
+                "axis {axis}: the hessian_psi is not exercised"
+            );
+            for (a, fd) in terms.hessian_psi.iter().zip(fd_hessian.iter()) {
+                close(*a, *fd, &format!("axis {axis} hessian_psi"));
+            }
+            let fd_drift = (&drift_at(&plus) - &drift_at(&minus)) / (2.0 * h);
+            assert!(
+                fd_drift.iter().any(|v| v.abs() > 1e-6),
+                "axis {axis}: the mixed drift is not exercised"
+            );
+            for (a, fd) in drift.iter().zip(fd_drift.iter()) {
+                close(*a, *fd, &format!("axis {axis} mixed drift"));
+            }
         }
     }
 }
@@ -1092,6 +1202,7 @@ fn survival_ls_default_guard_unit_family() -> SurvivalLocationScaleFamily {
         entry_active: Arc::from(vec![true; 1]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     }
 }
 
@@ -1206,6 +1317,7 @@ fn survival_ls_joint_oracle_family(
         entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     }
 }
 
@@ -3290,9 +3402,10 @@ fn heart_failure_full_fit_structural_time_coefficients() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
-    match fit_survival_location_scale_with_geometry(spec).map(|(fit, _)| fit) {
+    match fit_survival_location_scale_spec(spec) {
         Ok(result) => {
             // Structural-monotonicity invariant implied by the test's
             // name: the I-spline-like time block carries structural
@@ -3391,6 +3504,7 @@ fn heart_failure_structural_time_small() {
         entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     };
 
     // Build initial states with beta=0 and a feasible positive derivative offset.
@@ -3522,6 +3636,7 @@ fn evaluate_survival_location_scale_rejects_non_finite_d_eta_dt() {
         entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     };
 
     let mut eta_time = Array1::<f64>::zeros(3 * n);
@@ -5063,6 +5178,7 @@ fn survival_ls_heteroscedastic_two_col_location_family()
         entry_active: Arc::from(vec![true; n]),
         policy: gam_runtime::resource::ResourcePolicy::default_library(),
         jeffreys_armed: true,
+        baseline_theta_tangents: None,
     };
     // Block betas: a small time β (so `u = inv_sigma·h` is O(1) where inv_sigma ≈ 148);
     // zero location β; β_ls = 1 so η_σ realizes the
@@ -5333,6 +5449,7 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     };
 
     // The fit must take the reduced parametric-AFT route (the fixed code path);
@@ -5345,7 +5462,7 @@ fn reduced_parametric_aft_converges_and_recovers_lognormal_mle_2112() {
 
     // The crux of gam#2112: on benign fully-observed lognormal data at n=2000 the
     // fit must CONVERGE (pre-fix it hard-errored after 200 Newton iterations).
-    let (fit, _geo) = fit_survival_location_scale_with_geometry(spec)
+    let fit = fit_survival_location_scale_spec(spec)
         .expect("reduced parametric-AFT MLE must converge on benign lognormal data (gam#2112)");
     // The fit existing at all is the convergence proof: the sealed
     // `FitConvergenceEvidence` constructor refuses non-converged assembly.
@@ -5485,6 +5602,7 @@ fn reduced_aft_lognormal_spec(
         cache_session: None,
         persistent_warm_start_store: None,
         cache_mirror_sessions: Vec::new(),
+        baseline_theta_tangents: None,
     }
 }
 
@@ -5522,7 +5640,7 @@ fn reduced_parametric_aft_converges_and_recovers_mle_at_scale() {
         // The core regression: this used to hard-error with
         // "direct parametric-AFT MLE: failed to converge after 200 Newton
         // iterations" for n ≳ 1000. It must now converge.
-        let (fit, _) = fit_survival_location_scale_with_geometry(spec)
+        let fit = fit_survival_location_scale_spec(spec)
             .unwrap_or_else(|e| panic!("n={n}: reduced parametric-AFT MLE must converge: {e}"));
 
         let (mu_hat, sigma_hat) = lognormal_closed_form_mle(&log_t);
@@ -5564,7 +5682,7 @@ fn reduced_parametric_aft_stopping_criterion_is_weight_scale_invariant() {
             prepared.is_reduced_parametric_aft(),
             "expected reduced parametric-AFT regime"
         );
-        let (fit, _) = fit_survival_location_scale_with_geometry(spec).unwrap_or_else(|e| {
+        let fit = fit_survival_location_scale_spec(spec).unwrap_or_else(|e| {
             panic!("reduced parametric-AFT MLE must converge at total-weight scale w={w}: {e}")
         });
         (fit.beta_threshold()[0], fit.beta_log_sigma()[0])

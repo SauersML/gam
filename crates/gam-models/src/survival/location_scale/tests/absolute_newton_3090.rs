@@ -102,7 +102,7 @@ fn reduced_parametric_aft_converges_from_indefinite_start_3090() {
 
     let prepared = prepare_survival_location_scale_model(&spec).expect("prepare");
     assert!(prepared.is_reduced_parametric_aft());
-    let (fit, _) = fit_survival_location_scale_with_geometry(spec)
+    let fit = fit_survival_location_scale_spec(spec)
         .unwrap_or_else(|e| panic!("reduced parametric-AFT MLE from an indefinite start: {e}"));
     let loc = fit.beta_threshold()[0];
     let sigma = fit.beta_log_sigma()[0].exp();

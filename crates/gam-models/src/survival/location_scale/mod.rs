@@ -52,8 +52,6 @@ use crate::scale_design::{
 
 use crate::sigma_link::exp_sigma_inverse_from_eta_scalar;
 
-use crate::survival::{OffsetChannelCurvatures, OffsetChannelResiduals};
-
 use crate::survival::predict::{LocationScaleEtaComponents, location_scale_eta_components};
 
 use crate::survival::time_constraints::{
@@ -117,6 +115,7 @@ pub(in crate::survival::location_scale) use numeric_guards::{
     sanitize_survival_weight_vector, softplus,
 };
 
+mod baseline_theta;
 mod constants;
 mod covariate_blocks;
 mod dense_linalg;
@@ -147,6 +146,7 @@ mod sls_wiggle_hand_932_tests;
 // library re-export) resolve unchanged. Only `pub` / `pub(crate)` items are
 // re-exported; private helpers stay encapsulated in their concern module.
 pub(crate) use constants::*;
+pub use baseline_theta::SurvivalBaselineThetaTangents;
 pub use covariate_blocks::*;
 pub(crate) use dense_linalg::*;
 pub use error::*;

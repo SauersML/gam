@@ -1657,8 +1657,13 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     ) -> Result<Option<ExactNewtonJointPsiTerms>, String> {
         if let Some(axis) = hyper_layout.family_axis(psi_index) {
             // The family-owned axes are the inverse-link shape parameters, in
-            // the link's own parameter order (#2904).
-            return self.link_param_joint_psi_terms(block_states, axis);
+            // the link's own parameter order (#2904), then the parametric
+            // baseline's shape θ (#3413).
+            let link_axes = self.link_param_axis_count()?;
+            if axis < link_axes {
+                return self.link_param_joint_psi_terms(block_states, axis);
+            }
+            return self.baseline_theta_joint_psi_terms(block_states, axis - link_axes);
         }
         self.exact_newton_joint_psi_terms_masked(
             block_states,
@@ -1680,7 +1685,7 @@ impl CustomFamily for SurvivalLocationScaleFamily {
         if hyper_layout.family_axis_count() != 0 {
             return Err(
                 "SurvivalLocationScaleFamily serves no second-order hyper terms while its \
-                 inverse-link shape axes are present"
+                 family-owned (inverse-link shape / baseline θ) axes are present"
                     .to_string(),
             );
         }
@@ -1714,8 +1719,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if hyper_layout.family_axis_count() != 0 {
             return Err(
-                "SurvivalLocationScaleFamily has no exact-psi workspace over its inverse-link \
-                 shape axes"
+                "SurvivalLocationScaleFamily has no exact-psi workspace over its family-owned \
+                 (inverse-link shape / baseline θ) axes"
                     .to_string(),
             );
         }
@@ -1749,8 +1754,8 @@ impl CustomFamily for SurvivalLocationScaleFamily {
     ) -> Result<Option<Arc<dyn ExactNewtonJointPsiWorkspace>>, String> {
         if hyper_layout.family_axis_count() != 0 {
             return Err(
-                "SurvivalLocationScaleFamily has no exact-psi workspace over its inverse-link \
-                 shape axes"
+                "SurvivalLocationScaleFamily has no exact-psi workspace over its family-owned \
+                 (inverse-link shape / baseline θ) axes"
                     .to_string(),
             );
         }
@@ -2167,14 +2172,26 @@ impl SurvivalLocationScaleFamily {
     ) -> Result<Option<Array2<f64>>, String> {
         if let Some(axis) = hyper_layout.family_axis(psi_index) {
             // The family-owned axes are the inverse-link shape parameters, in the
-            // link's own parameter order (#2904).
-            return self.link_param_joint_psihessian_directional_derivative(
+            // link's own parameter order (#2904), then the parametric baseline's
+            // shape θ (#3413).
+            let direction = d_beta_flat
+                .as_slice()
+                .ok_or_else(|| "joint psi Hessian direction must be contiguous".to_string())?;
+            let rows = row_set_from_survival_mask(row_mask, self.n);
+            let link_axes = self.link_param_axis_count()?;
+            if axis < link_axes {
+                return self.link_param_joint_psihessian_directional_derivative(
+                    block_states,
+                    axis,
+                    direction,
+                    &rows,
+                );
+            }
+            return self.baseline_theta_joint_psihessian_directional_derivative(
                 block_states,
-                axis,
-                d_beta_flat
-                    .as_slice()
-                    .ok_or_else(|| "joint psi Hessian direction must be contiguous".to_string())?,
-                &row_set_from_survival_mask(row_mask, self.n),
+                axis - link_axes,
+                direction,
+                &rows,
             );
         }
         let derivative_blocks = hyper_layout.design_derivative_blocks();
@@ -2613,6 +2630,7 @@ mod post_update_roundoff_floor_symmetry_2722_tests {
             entry_active: Arc::from(vec![true; 3]),
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             jeffreys_armed: true,
+            baseline_theta_tangents: None,
         }
     }
 

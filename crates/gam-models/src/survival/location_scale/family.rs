@@ -49,6 +49,12 @@ pub(crate) struct SurvivalLocationScaleFamily {
     /// on the unarmed fit's own evidence, through
     /// `fit_custom_family_arming_on_evidence` (#979).
     pub(crate) jeffreys_armed: bool,
+    /// θ-tangents of the parametric baseline's time offsets, one column per
+    /// baseline shape axis, when the baseline θ rides the outer criterion as
+    /// family-owned hyper axes after the inverse-link shape axes (#3413).
+    /// `None` for a Linear baseline target and in the reduced parametric-AFT
+    /// regime.
+    pub(crate) baseline_theta_tangents: Option<Arc<SurvivalBaselineThetaTangents>>,
 }
 
 /// The σ-scaled log-t AFT location baseline (issue #892), applied to the `q`
