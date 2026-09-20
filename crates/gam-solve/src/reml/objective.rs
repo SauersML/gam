@@ -1729,8 +1729,7 @@ impl<'a> RemlState<'a> {
         // reproduces the caller's `H`, and declines otherwise, so a Firth term,
         // an active-constraint projection or a frame mismatch keeps the
         // assembled value rather than silently getting the wrong one.
-        let root_lambdas: Vec<f64> =
-            gam_problem::checked_exp_log_strengths(rho.iter().copied()).unwrap_or_default();
+        let root_lambdas: Vec<f64> = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
         let root_penalties = bundle.applied_canonical_penalties(&self.canonical_penalties)?;
         let root_inputs = super::laml_logdet::HessianRootInputs {
             design: self.x(),
@@ -2849,25 +2848,13 @@ impl<'a> RemlState<'a> {
             ));
         }
 
-        let decision = match order {
-            // Value+gradient: this evaluator's assembly contract requires a
-            // gradient (see the `result.gradient` demand below), so fulfil it as
-            // value+gradient with the Hessian skipped.
-            crate::rho_optimizer::OuterEvalOrder::Value
-            | crate::rho_optimizer::OuterEvalOrder::ValueAndGradient => None,
-            crate::rho_optimizer::OuterEvalOrder::ValueGradientHessian => {
-                if allow_second_order {
-                    Some(self.selecthessian_strategy_policy(&bundle))
-                } else {
-                    None
-                }
-            }
-        };
-        let eval_mode = match decision.as_ref().map(|decision| decision.strategy) {
-            Some(HessianEvalStrategyKind::SpectralExact) => {
-                super::reml_outer_engine::EvalMode::ValueGradientHessian
-            }
-            _ => super::reml_outer_engine::EvalMode::ValueAndGradient,
+        // `Value` returned above. A ValueGradientHessian order whose analytic
+        // outer Hessian is disabled is fulfilled as value+gradient with the
+        // Hessian reported Unavailable.
+        let eval_mode = if allow_second_order {
+            super::reml_outer_engine::EvalMode::ValueGradientHessian
+        } else {
+            super::reml_outer_engine::EvalMode::ValueAndGradient
         };
 
         let pirls_ms = t_pirls.elapsed().as_secs_f64() * 1000.0;
@@ -2891,9 +2878,10 @@ impl<'a> RemlState<'a> {
             .gradient_for_mode(eval_mode, p.len())
             .map_err(|reason| EstimationError::TrialPointRefused { reason })?;
 
-        let hessian = match decision.map(|decision| decision.strategy) {
-            Some(HessianEvalStrategyKind::SpectralExact) => result.hessian,
-            None => HessianValue::Unavailable,
+        let hessian = if allow_second_order {
+            result.hessian
+        } else {
+            HessianValue::Unavailable
         };
 
         // Cost, gradient, and optional Hessian are projections of the same
