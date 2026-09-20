@@ -35,6 +35,7 @@ use super::{
     // misc helpers
     array1_l2_norm,
     attach_penalty_shift,
+    penalized_gradient_natural_scale,
     // compute functions
     calculate_deviance_from_eta,
     // edf helpers
@@ -1078,11 +1079,23 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             /// path.
             working_eta: LinearPredictor,
             gradient_data: Array1<f64>,
+            /// The data score's operands `XᵀWη` and `XᵀWz` in the active basis,
+            /// whose difference is `gradient_data`: the natural gradient scale
+            /// is built from them (#3339).
+            score_operands: [Array1<f64>; 2],
             deviance: f64,
             log_likelihood: f64,
             max_abs_eta: f64,
         }
 
+        // Original-basis coefficient vectors to the active basis the gradient
+        // is reported in.
+        let to_active_basis = |v: Array1<f64>| {
+            transform_active
+                .as_ref()
+                .map(|transform| transform.apply_transpose(&v))
+                .unwrap_or(v)
+        };
         let rows = if let Some(cache) = sufficient_only_row_cache {
             // #1868 FAST PATH: the criterion, gradient and inner solve are served
             // entirely from k-space Gram sufficient statistics; the length-`n`
@@ -1091,8 +1104,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // the producer attached the once-built frozen bundle we clone its
             // `ArcArray1` handles (O(1), zero element touches) instead of
             // re-materialising ~16·n elements per κ callback — the #1868 fix.
-            let mut grad_orig = cache.xtwx_orig.dot(&qbeta);
+            let gram_qbeta = cache.xtwx_orig.dot(&qbeta);
+            let mut grad_orig = gram_qbeta.clone();
             grad_orig -= &cache.xtwy_orig;
+            let score_operands = [
+                to_active_basis(gram_qbeta),
+                to_active_basis(cache.xtwy_orig.clone()),
+            ];
             // #2624: `z^T W z - 2 qb^T b + qb^T G qb` regrouped as
             // `(z^T W z - qb^T b) + qb^T (G qb - b)`. The two are the same
             // number in exact arithmetic; they are not the same computation.
@@ -1105,10 +1123,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             // of what this buys, which is much smaller than the claim it was
             // landed under.
             let residual_inner = qbeta.dot(&grad_orig);
-            let gradient_data = transform_active
-                .as_ref()
-                .map(|transform| transform.apply_transpose(&grad_orig))
-                .unwrap_or(grad_orig);
+            let gradient_data = to_active_basis(grad_orig);
             let weighted_rss = (cache.centered_weighted_y_sq
                 - compensated_dot(&qbeta, &cache.xtwy_orig)
                 + residual_inner)
@@ -1144,6 +1159,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     solve_d_array: bundle.solve_d_array.clone(),
                     working_eta: LinearPredictor::new(Array1::zeros(0)),
                     gradient_data,
+                    score_operands,
                     deviance,
                     log_likelihood: bundle.log_likelihood,
                     max_abs_eta: bundle.max_abs_eta,
@@ -1187,6 +1203,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                     solve_d_array: d.into_shared(),
                     working_eta: LinearPredictor::new(Array1::zeros(0)),
                     gradient_data,
+                    score_operands,
                     deviance,
                     log_likelihood,
                     max_abs_eta,
@@ -1207,10 +1224,11 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             weighted_residual *= &priorweights_owned;
             // gradient = Qs^T X^T (w * residual) (composed)
             let xt_wr = x_original.apply_transpose(&weighted_residual);
-            let gradient_data = transform_active
-                .as_ref()
-                .map(|transform| transform.apply_transpose(&xt_wr))
-                .unwrap_or(xt_wr);
+            let gradient_data = to_active_basis(xt_wr);
+            let score_operands = [
+                to_active_basis(x_original.apply_transpose(&(&finalmu * &priorweights_owned))),
+                to_active_basis(x_original.apply_transpose(&(&y * &priorweights_owned))),
+            ];
             let deviance = calculate_deviance_from_eta(
                 y,
                 &final_eta,
@@ -1248,6 +1266,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 solve_c_array: c.into_shared(),
                 solve_d_array: d.into_shared(),
                 gradient_data,
+                score_operands,
                 deviance,
                 log_likelihood,
                 max_abs_eta,
@@ -1266,13 +1285,13 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             solve_d_array,
             working_eta,
             gradient_data,
+            score_operands: [xt_w_eta, xt_w_z],
             deviance,
             log_likelihood,
             max_abs_eta,
         } = rows;
-        let score_norm = array1_l2_norm(&gradient_data);
         let s_beta = penalty_active.shifted_gradient(beta_transformed.as_ref());
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let gradient_natural_scale = penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &s_beta);
         let mut gradient = gradient_data;
         gradient += &s_beta;
         let penalty_term = penalty_active.shifted_quadratic(beta_transformed.as_ref());
@@ -1294,7 +1313,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
         };
 
         let zero_iter_penalized = deviance + penalty_term;
@@ -1312,7 +1331,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
                 compute_constraint_kkt_diagnostics(
                     beta_transformed.as_ref(),
                     &gradient,
-                    score_norm + s_beta_norm,
+                    gradient_natural_scale,
                     lin,
                 )
             }),
@@ -1370,7 +1389,7 @@ pub(crate) fn fit_model_for_fixed_rho_with_adaptive_kkt<'a, X: Into<DesignMatrix
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
             penalized_gradient_transformed: gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,

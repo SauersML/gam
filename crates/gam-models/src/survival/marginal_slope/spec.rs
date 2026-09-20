@@ -379,6 +379,19 @@ pub(crate) fn split_persisted_latent_calibrations(
     }
 }
 
+/// Why a learned Gaussian-shift frailty is refused where the likelihood does not
+/// identify it (gam#2938); see
+/// [`crate::survival::lognormal_kernel::frailty_identification`].
+pub(crate) const LEARNED_FRAILTY_NOT_IDENTIFIED: &str =
+    "a learned Gaussian-shift frailty σ is refused: σ is not identified by the likelihood. The \
+     survival marginal-slope likelihood reads σ only through the probit scale \
+     s(σ) = 1/√(1+σ²) on the observed slope s(σ)·(o + Xβ), and with the slope offset o inside \
+     every slope surface's span (a constant offset beside an intercept, by default), \
+     (σ, β, λ) ↦ (σ′, β′, λ/c²) with o + Xβ′ = c·(o + Xβ), c = s(σ)/s(σ′), leaves the \
+     likelihood and the slope penalty unchanged. The criterion then moves with σ only through \
+     the slope block's prior and Laplace terms (by −m·ln c for m unpenalized slope directions \
+     while λ is free). A fixed σ only rescales the reported slope (gam#2938)";
+
 pub(crate) fn validate_spec(spec: &SurvivalMarginalSlopeTermSpec) -> Result<(), String> {
     let n = spec.age_entry.len();
     log::debug!(

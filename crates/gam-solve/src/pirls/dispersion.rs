@@ -555,6 +555,52 @@ pub(crate) fn negbin_theta_score_and_info(
     negbin_theta_score_and_info_from_means(y, eta, &means, priorweights, theta)
 }
 
+/// The linear predictor's pull on the NB2 profile score: `∂(∂ℓ/∂θ)/∂η_i`
+/// under the log link, `w_i μ_i (y_i − μ_i) / (θ + μ_i)²`, from the per-row
+/// score `ψ(y+θ) − ψ(θ) + ln θ + 1 − ln(θ+μ) − (θ+y)/(θ+μ)` whose
+/// `μ`-derivative is `(y − μ)/(θ + μ)²` and `dμ/dη = μ`.
+pub(crate) fn negbin_theta_score_eta_gradient(
+    y: ArrayView1<'_, f64>,
+    eta: &Array1<f64>,
+    priorweights: ArrayView1<'_, f64>,
+    theta: f64,
+) -> Result<Array1<f64>, EstimationError> {
+    if !(theta.is_finite() && theta > 0.0) {
+        crate::bail_invalid_estim!("negative-binomial theta must be finite and positive");
+    }
+    let means = certified_log_means(eta)?;
+    let rows = super::par_certified_rows(eta.len(), |i| {
+        let wi = certified_prior_weight(i, eta[i], priorweights[i])?;
+        if wi == 0.0 {
+            return Ok(0.0);
+        }
+        let yi = y[i];
+        if !valid_count_response(yi) {
+            return Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial response",
+                eta[i],
+                yi,
+            ));
+        }
+        let theta_plus_mu = theta + means[i];
+        // Two bounded ratios instead of `(θ + μ)²`, which can overflow when
+        // the derivative itself is representable.
+        let pull = wi * (means[i] / theta_plus_mu) * ((yi - means[i]) / theta_plus_mu);
+        if pull.is_finite() {
+            Ok(pull)
+        } else {
+            Err(EstimationError::pirls_row_geometry_unrepresentable(
+                i,
+                "negative-binomial theta-score eta derivative",
+                eta[i],
+                pull,
+            ))
+        }
+    })?;
+    Ok(Array1::from_vec(rows))
+}
+
 /// Profile the NB2 theta: the smallest representable theta at which the profile
 /// score is not resolvably positive.
 ///

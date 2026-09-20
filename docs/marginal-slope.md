@@ -801,7 +801,12 @@ are `--offset-column` and `--noise-offset-column`.
 Survival marginal-slope supports no frailty, or
 `frailty_kind="gaussian-shift"` with a fixed `frailty_sd`.
 `"hazard-multiplier"` and a learnable gaussian-shift sigma are rejected
-at fit time.
+at fit time. With the default slope (an intercept in every slope surface and
+no offset, or a constant one), a learnable sigma is rejected because the
+likelihood does not identify it: it reads the frailty only as the observed
+slope `s(σ)·g`, `s(σ) = 1/√(1+σ²)`, so rescaling the slope undoes any change of
+σ and the data cannot tell two values apart (gam#2938). A fixed `frailty_sd`
+only rescales the reported slope.
 
 ```python
 import numpy as np
