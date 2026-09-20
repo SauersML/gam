@@ -88,6 +88,22 @@ impl SaeManifoldAtom {
 }
 
 impl SaeManifoldTerm {
+    /// Lift a steering output from the Tier-0 fit frame to raw activation units, in place:
+    /// `v ← σ ⊙ v`. A native fit decodes `(Z − μ)/σ`, so `Φ_k(t)·B_k` is an internal-frame
+    /// vector, while the fitted reconstruction, the row metric and every steering tangent
+    /// (`decode_at` / `decode_tangents_at`, gh#2249) are in raw units. A steer delta is a
+    /// chord and a steer decode is one atom's contribution, so the shared mean μ belongs to
+    /// neither and only the scale applies. A no-op when no scale is installed.
+    fn lift_steer_to_raw_units(&self, values: &mut Array2<f64>) {
+        if let Some(scale) = self.tier0_scale() {
+            for mut row in values.rows_mut() {
+                for (value, &s) in row.iter_mut().zip(scale.iter()) {
+                    *value *= s;
+                }
+            }
+        }
+    }
+
     fn honest_crosscoder_layer_values(
         &self,
         values: &Array2<f64>,
@@ -238,6 +254,9 @@ impl SaeManifoldTerm {
     /// chart's span), not in the gauge-arbitrary fitted parameter. Higher
     /// dimensional charts retain their manifold-coordinate group action.
     ///
+    /// The delta is in the same raw activation units as [`Self::try_fitted`]: on a
+    /// Tier-0 standardized term it is `σ ⊙` the internal-frame chord.
+    ///
     /// `δ` is a length-`d_k` intrinsic step (the SAME intrinsic displacement
     /// is applied to every selected row; its fitted-coordinate representation
     /// varies with local chart speed). The gate `a_{ik}` is held fixed, so the
@@ -274,6 +293,7 @@ impl SaeManifoldTerm {
                 out[[out_row, c]] = a * (steered_decode[[out_row, c]] - base_decode[[out_row, c]]);
             }
         }
+        self.lift_steer_to_raw_units(&mut out);
         Ok(out)
     }
 
@@ -299,7 +319,9 @@ impl SaeManifoldTerm {
     /// at `θ + δ`. Same moved coordinate and same amplitude/gate handling as
     /// [`Self::steer_rows`]: on a one-dimensional chart `δ` is the canonical
     /// arc-length displacement here too, so `steer_decode(δ) − steer_decode(0)`
-    /// is `steer_rows(δ)` up to rounding.
+    /// is `steer_rows(δ)` up to rounding. Raw activation units, like
+    /// [`Self::steer_rows`]: `σ ⊙` the internal-frame contribution, with no Tier-0
+    /// mean (the mean is shared by the whole reconstruction, not one atom's).
     pub fn steer_decode(
         &self,
         atom: usize,
@@ -320,6 +342,7 @@ impl SaeManifoldTerm {
                 out[[out_row, c]] = a * steered_decode[[out_row, c]];
             }
         }
+        self.lift_steer_to_raw_units(&mut out);
         Ok(out)
     }
 

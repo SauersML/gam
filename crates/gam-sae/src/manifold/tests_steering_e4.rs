@@ -162,3 +162,75 @@ fn zz_e4_zoo_circle_contrib_theta_steer_matches_planted_moved() {
          (best R²={r2:.4}; +={r2_plus:.4}, −={r2_minus:.4})"
     );
 }
+
+/// A Tier-0 standardized term decodes in the fit frame `(Z − μ)/σ`, while its
+/// reconstruction, its row metric and every steering tangent are in raw
+/// activation units. The steering surfaces must come back in those same raw
+/// units: `steer_rows` is `σ ⊙` the internal-frame chord and `steer_decode` is
+/// `σ ⊙` the internal-frame contribution, the same lift `try_fitted` applies.
+#[test]
+fn steer_outputs_lift_through_the_tier0_scale() {
+    let n = 240usize;
+    let p = 6usize;
+    let contrib = zoo_circle_contrib(n, p);
+    let z = &contrib.m;
+    let (mut term, _disp) = build_term(z.view(), 1, Topo::Circle, AssignmentMode::softmax(1.0));
+    let mut rho = SaeManifoldRho::new(
+        1.0e-3_f64.ln(),
+        1.0e-3_f64.ln(),
+        vec![array![1.0e-3_f64.ln()]; 1],
+    );
+    term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 1.0, 1.0e-6, 1.0e-6)
+        .expect("K=1 circle joint fit must run e2e");
+
+    let rows: Vec<usize> = (0..n).collect();
+    let delta = array![0.25];
+    let internal_delta = term
+        .steer_rows(0, &rows, delta.view())
+        .expect("internal-frame steer delta");
+    let internal_decode = term
+        .steer_decode(0, &rows, delta.view())
+        .expect("internal-frame steer decode");
+    let internal_fitted = term.try_fitted().expect("internal-frame reconstruction");
+    assert!(
+        internal_delta.iter().any(|v| *v != 0.0),
+        "a quarter-period steer must move the decode"
+    );
+
+    let scale = Array1::from_vec(vec![0.5, 2.0, 3.0, 1.0, 7.0, 0.25]);
+    term.set_tier0_scale(scale.clone())
+        .expect("install a non-uniform Tier-0 scale");
+
+    // The reconstruction lifts by σ; this is the frame the steer outputs must share.
+    let raw_fitted = term.try_fitted().expect("raw-unit reconstruction");
+    for row in 0..n {
+        for c in 0..p {
+            let want = scale[c] * internal_fitted[[row, c]];
+            assert!(
+                (raw_fitted[[row, c]] - want).abs() <= 1.0e-12 * want.abs().max(1.0),
+                "try_fitted must lift by σ at ({row}, {c})"
+            );
+        }
+    }
+
+    let raw_delta = term
+        .steer_rows(0, &rows, delta.view())
+        .expect("raw-unit steer delta");
+    let raw_decode = term
+        .steer_decode(0, &rows, delta.view())
+        .expect("raw-unit steer decode");
+    for row in 0..n {
+        for c in 0..p {
+            assert_eq!(
+                raw_delta[[row, c]],
+                internal_delta[[row, c]] * scale[c],
+                "steer_rows must return σ ⊙ the internal chord at ({row}, {c})"
+            );
+            assert_eq!(
+                raw_decode[[row, c]],
+                internal_decode[[row, c]] * scale[c],
+                "steer_decode must return σ ⊙ the internal contribution at ({row}, {c})"
+            );
+        }
+    }
+}
