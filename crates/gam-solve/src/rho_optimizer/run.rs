@@ -3158,7 +3158,7 @@ pub(crate) enum StationarityBoundSource {
     /// `|Pg|·√((tol − band_λ²)/λ̂²)` (#2954): the Newton-decrement verdict,
     /// rendered as a gradient bound along the measured direction. It certifies
     /// iff `λ̂² + band_λ² ≤ tol = max(τ_stat − band_f, band_f)` with `τ_stat =
-    /// 1/(2n)` (C3), so no caller tolerance and no scale anchor enters, and it
+    /// 1/(2·n_eff)` (C3), so no caller tolerance and no scale anchor enters, and it
     /// may TIGHTEN every rung above.
     NewtonDecrement,
     /// The decrement verdict was taken and could not certify anything: its own

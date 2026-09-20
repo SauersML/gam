@@ -59,7 +59,7 @@ use ndarray::{Array1, Array2};
 /// `τ_stat` or is not finite.
 ///
 /// The verdict's tolerance is [`DecrementTolerance::value`], `max(τ_stat −
-/// band_f, band_f)` over the statistical resolution `τ_stat = 1/(2n)` (C3,
+/// band_f, band_f)` over the statistical resolution `τ_stat = 1/(2·n_eff)` (C3,
 /// boundary-probability §3.6). It replaces `rel_cost_floor·(1 + |V|)`, which
 /// moved with the units of `y` and with any additive constant in `V`.
 ///
@@ -199,7 +199,7 @@ pub(crate) fn outer_objective_band(
 /// tolerance `rel_cost_floor·(1 + |V|)`. At `n = 300,000` the declared band was
 /// `6.0` and a seed certified in zero iterations. The decrement bounds the decrease
 /// left to the minimum, in the criterion's own units, so it needs no
-/// scale anchor; judged against `τ_stat = 1/(2n)` less the arithmetic's
+/// scale anchor; judged against `τ_stat = 1/(2·n_eff)` less the arithmetic's
 /// resolution it is independent of `outer_tol`, of the units of `y` and of any
 /// additive constant in `V` too.
 ///
@@ -262,7 +262,7 @@ pub(crate) enum DecrementVerdictNotTaken {
     /// value carries from stopping short of the exact mode is unknown.
     NoInnerResidual,
     /// The objective band `band_f` exceeds the statistical resolution
-    /// `τ_stat = 1/(2n)` (or is not finite): the evaluator cannot resolve a
+    /// `τ_stat = 1/(2·n_eff)` (or is not finite): the evaluator cannot resolve a
     /// decrease the data could distinguish, so a verdict at `band_f` would
     /// certify a point the criterion cannot tell from a better one (T1, #3192).
     ObjectiveNotResolvable { band_f: f64, tau_stat: f64 },
