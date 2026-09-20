@@ -2441,7 +2441,7 @@
     "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
   },
   {
-    "base": "8195d75d0aebc3f4c886b20efd5ef0201ac719c7",
+    "base": "c663ba6dbaaaab008f9ec054a7ea349637fb649a",
     "items": [
       "crates/gam-terms/src/smooth/term_specs_tests.rs:fn:non_materialized_penalty_falls_back_conservatively"
     ],
