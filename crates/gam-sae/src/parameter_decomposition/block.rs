@@ -94,7 +94,8 @@
 //! carries a forward-error radius against the exact layer at the exact rows under the same
 //! reads, so a receipt against another executor can use it as that side's band. Every read
 //! takes one route: its band is its rounding band at the computed rows (`read_band`:
-//! `γ_n |A| |x̂|` for apply.rs's kernel, with `n` the operations of the read's product) plus
+//! `γ_n |A| |x̂| + 𝒜 · 2^-1074` for apply.rs's kernel, with `n` the operations of the read's
+//! product and `𝒜` its allowance for products that round into the subnormal range) plus
 //! `|A| r`, the most the exact read can move between the computed rows and the exact ones,
 //! with `r` the rows' radius. Exact rows carry nothing, so their band is the rounding band
 //! itself. The query, key and value bands enter the attention core as its input radii, so
@@ -103,8 +104,9 @@
 //! the mixed radius, and the output adds the residual addition's rounding and the rows' own
 //! radius. A stack of layers, each fed the previous output with its radius and ending in
 //! [`linear_read`], so carries one radius from its input rows to its logits. Every magnitude
-//! is computed one output column at a time, so no `|A|` is formed, and each computed bound is
-//! divided by the factor its own arithmetic could have lost.
+//! is computed one output column at a time, so no `|A|` is formed, and each computed bound
+//! adds the underflow its own products could have lost and is divided by the factor its own
+//! arithmetic could have lost, every operation rounded up.
 
 use super::apply::{ApplyError, FactorView, apply_anchored_linear, native_linear};
 use super::attention::{
@@ -1579,43 +1581,79 @@ fn abs_map(matrix: ArrayView2<'_, f64>, rows: ArrayView2<'_, f64>) -> Array2<f64
     out
 }
 
-/// `|A| r` for nonnegative rows `r`, with `A` the map a read applies to each row, and the
-/// rounded operations of that read's product (`n`) and of this magnitude (`k`), per row.
+/// `|A| r` for nonnegative rows `r`, with `A` the map a read applies to each row, the rounded
+/// operations of that read's product (`n`) and of this magnitude (`k`), per row, and the
+/// read's underflow reach per entry.
+///
+/// Rounding in binary64 is `fl(a ∘ b) = (a ∘ b)(1 + δ) + η` with `|δ| ≤ u`, where `|η| ≤ 2^-1075`
+/// for a product or quotient that rounds into the subnormal range and `η = 0` for a sum, which is
+/// exact there (a fused multiply-add rounds once and adds one `η`). Higham's `γ_n |A| |x|` covers
+/// the `δ` terms only. Each product's `η` passes the later sums with a factor of at most
+/// `1 + γ_n ≤ 2`, and a later product scales an earlier stage's `η` by the magnitude it
+/// multiplies. So the entry's absolute term is at most `𝒜 · 2^-1074`, with the allowance `𝒜` of
+/// [`read_magnitude`]. The magnitude program runs the read's products on nonnegative operands,
+/// so `𝒜` bounds its underflow as well. `underflow` holds `𝒜 · 2^-1074`, rounded up.
 struct ReadMagnitude {
     magnitude: Array2<f64>,
+    underflow: Array2<f64>,
     read_operations: Vec<usize>,
     magnitude_operations: Vec<usize>,
 }
 
+/// `𝒜 · 2^-1074` rounded up, for an allowance `𝒜` computed as `computed` in `operations` rounded
+/// operations on nonnegative terms.
+///
+/// `𝒜` is either exactly zero (a read with no products) or at least one, since it counts the
+/// read's own last products. So the underflow inside its own computation, below
+/// `operations · 2^-1074`, lies far inside the step one float up from a value of at least one, and
+/// `𝒜 ≤ up(𝒜̂ / (1 − γ_k))`.
+fn underflow_allowance(computed: f64, operations: usize) -> f64 {
+    let dominance = down(1.0 - up(accumulation_growth(operations)));
+    up(up(computed / dominance) * SUBNORMAL_SPACING)
+}
+
 impl ReadMagnitude {
-    /// The magnitude itself as a bound on `|A| r`. Its `k` operations on nonnegative
-    /// terms each scale by `1 + δ`, `|δ| ≤ u`, so the exact value is at most
-    /// `M̂ / (1 − γ_k)`, and the division adds one more.
+    /// The magnitude itself as a bound on `|A| r`. Its `k` operations on nonnegative terms each
+    /// scale by `1 + δ`, `|δ| ≤ u`, and its products add at most the underflow reach `a`, so
+    /// `M̂ ≥ (1 − γ_k) |A| r − a` and the exact value is at most `(M̂ + a) / (1 − γ_k)`. Every
+    /// operation of that bound rounds to nearest and steps one float up (down for the
+    /// divisor), so a magnitude that underflowed to zero still carries `a`.
     fn dominated(self) -> Array2<f64> {
-        let mut bound = self.magnitude;
-        for (mut row, &operations) in bound.outer_iter_mut().zip(&self.magnitude_operations) {
-            let dominance = 1.0 - accumulation_growth(operations + 1);
-            row.mapv_inplace(|value| value / dominance);
-        }
-        bound
+        dominate(self.magnitude, self.underflow.view(), &self.magnitude_operations)
     }
 
-    /// `γ_n |A| |x| ≤ γ_n M̂ / (1 − γ_(k+3))` per row: the forward error of a product with `n`
-    /// rounded operations per entry in any summation order (Higham ASNA Lemma 3.1), from a
-    /// magnitude of `k` operations, with 3 more for this arithmetic (`γ_n` itself and the
-    /// product and quotient).
+    /// `|fl(A x) − A x| ≤ γ_n |A| |x| + a` per entry: the forward error of a product with `n`
+    /// rounded operations per entry in any summation order (Higham ASNA Lemma 3.1), plus the
+    /// read's underflow reach `a`, with `|A| |x|` bounded as in [`Self::dominated`] from a
+    /// magnitude of `k` operations. Evaluated with every operation stepped one float up, so a
+    /// subnormal band does not round to zero.
     fn rounding(self) -> Array2<f64> {
-        let mut band = self.magnitude;
-        for ((mut row, &read), &operations) in band
+        let mut band = dominate(self.magnitude, self.underflow.view(), &self.magnitude_operations);
+        for ((mut row, reach), &read) in band
             .outer_iter_mut()
+            .zip(self.underflow.outer_iter())
             .zip(&self.read_operations)
-            .zip(&self.magnitude_operations)
         {
-            let (growth, dominance) = (accumulation_growth(read), 1.0 - accumulation_growth(operations + 3));
-            row.mapv_inplace(|value| growth * value / dominance);
+            let growth = up(accumulation_growth(read));
+            Zip::from(&mut row)
+                .and(&reach)
+                .for_each(|value, &reach| *value = up(up(growth * *value) + reach));
         }
         band
     }
+}
+
+/// `(M̂ + a) / (1 − γ_k)` per entry, each operation rounded to nearest and stepped one float up
+/// (down for the divisor): the upper bound [`ReadMagnitude::dominated`] derives.
+fn dominate(magnitude: Array2<f64>, underflow: ArrayView2<'_, f64>, operations: &[usize]) -> Array2<f64> {
+    let mut bound = magnitude;
+    for ((mut row, reach), &operations) in bound.outer_iter_mut().zip(underflow.outer_iter()).zip(operations) {
+        let dominance = down(1.0 - up(accumulation_growth(operations)));
+        Zip::from(&mut row)
+            .and(&reach)
+            .for_each(|value, &reach| *value = up(up(*value + reach) / dominance));
+    }
+    bound
 }
 
 /// `a + b` for two nonnegative bounds, rounded up: the exact sum is at most the computed
@@ -1631,11 +1669,13 @@ fn is_exact(radius: ArrayView2<'_, f64>) -> bool {
 }
 
 /// `|W| r` for a native read of the nonnegative rows `r`: the inner product takes `n = d`
-/// rounded operations, and so does this magnitude.
+/// rounded operations, and so does this magnitude. Its `d` products give the allowance
+/// `𝒜 = d`, and `d · 2^-1074` is exact for `d < 2^53`.
 fn native_magnitude(weight: ArrayView2<'_, f64>, rows: ArrayView2<'_, f64>) -> ReadMagnitude {
     let (tokens, width) = rows.dim();
     ReadMagnitude {
         magnitude: abs_map(weight, rows),
+        underflow: Array2::from_elem((tokens, weight.nrows()), width as f64 * SUBNORMAL_SPACING),
         read_operations: vec![width; tokens],
         magnitude_operations: vec![width; tokens],
     }
@@ -1643,10 +1683,11 @@ fn native_magnitude(weight: ArrayView2<'_, f64>, rows: ArrayView2<'_, f64>) -> R
 
 /// A native linear read `x Wᵀ` of rows that carry a radius against their exact values, the
 /// way an attention-only layer reads a projection under [`ProjectionRead::Native`]:
-/// apply.rs's `native_linear`, its rounding band `γ_d |W| |x̂|`, and `|W| r`, the most the
-/// exact read can move between the computed rows and the exact ones. A stack of layers ends
-/// in such a read, its unembedding, so the logits carry the whole stack's radius. Returns the
-/// read and its radius against the exact read of the exact rows.
+/// apply.rs's `native_linear`, its rounding band `γ_d |W| |x̂| + d · 2^-1074` (the second term
+/// for its products that round into the subnormal range), and `|W| r`, the most the exact read
+/// can move between the computed rows and the exact ones. A stack of layers ends in such a
+/// read, its unembedding, so the logits carry the whole stack's radius. Returns the read and
+/// its radius against the exact read of the exact rows.
 pub fn linear_read(
     weight: ArrayView2<'_, f64>,
     rows: ProjectedRows<'_>,
@@ -1695,6 +1736,10 @@ fn expect_read_shape(
 ///   `C`-term product with `U` and the accumulation into the tile);
 /// - `Edited`: `|W| r` on every row, plus `|L| |Rᵀ| r` on the rows the edit reaches, whose
 ///   read takes `n = T + d + 2` (the native product, then the `T` edit terms the same way).
+///
+/// Each arm also carries the read's underflow allowance `𝒜` per entry ([`ReadMagnitude`]):
+/// `d` for `Native`, `C + |U| (𝟙 + d |m|)` for `Components(m)`, and `(d + T) + d |L| 𝟙` on the
+/// rows an edit reaches.
 fn read_magnitude(
     weight: ArrayView2<'_, f64>,
     factor: Option<&ProjectionFactor>,
@@ -1714,8 +1759,19 @@ fn read_magnitude(
             mask_groups(projection, &masks, tokens)?;
             // A `1 × C` center scales every row; a `rows × C` center scales its own row.
             let coordinates = abs_map(factor.read(), rows) * &masks.center.mapv(f64::abs);
+            // `𝒜 = C + |U| (1 + d |m|)`: the `C` products with `U`, and each coordinate's `d`
+            // products scaled by `|m_c|` plus the scale's own product, scaled by `|u_ic|`. It
+            // takes `C + 3` roundings: `d |m_c|`, `1 +`, the `C`-term product with `|U|`, `C +`.
+            let scaled = masks.center.mapv(|center| 1.0 + width as f64 * center.abs());
+            let allowance = abs_map(factor.write(), scaled.view())
+                .mapv(|reach| underflow_allowance(components as f64 + reach, components + 3));
+            let per_row = allowance.nrows() == tokens;
+            let underflow = Array2::from_shape_fn((tokens, allowance.ncols()), |(row, output)| {
+                allowance[[if per_row { row } else { 0 }, output]]
+            });
             Ok(ReadMagnitude {
                 magnitude: abs_map(factor.write(), coordinates.view()),
+                underflow,
                 read_operations: vec![components + width + 2; tokens],
                 magnitude_operations: vec![components + width + 1; tokens],
             })
@@ -1733,7 +1789,15 @@ fn read_magnitude(
             if !reached.is_empty() {
                 let selected = rows.select(Axis(0), &reached);
                 let edit = abs_map(scoped.edit.left(), abs_map(scoped.edit.right().t(), selected.view()).view());
+                // `𝒜 = (d + T) + d |L| 𝟙` on a reached row: the native and edit products, and
+                // each edit coordinate's `d` products scaled by `|l_it|` (the unit term scales
+                // multiply exactly). It takes `T + 1` roundings: the `T`-term product of `d`
+                // with `|L|`, then `(d + T) +`.
+                let spread = Array2::from_elem((1, terms), width as f64);
+                let allowance = abs_map(scoped.edit.left(), spread.view())
+                    .mapv(|reach| underflow_allowance((width + terms) as f64 + reach, terms + 1));
                 for (index, &row) in reached.iter().enumerate() {
+                    magnitude.underflow.row_mut(row).assign(&allowance.row(0));
                     let mut target = magnitude.magnitude.row_mut(row);
                     target += &edit.row(index);
                     magnitude.read_operations[row] = terms + width + 2;
@@ -1745,9 +1809,9 @@ fn read_magnitude(
     }
 }
 
-/// The rounding band of one read of `rows`: `|fl(A x) − A x| ≤ γ_n |A| |x|` entrywise, with
-/// `fl` apply.rs's kernel and `n` and `|A|` as in [`read_magnitude`]. Rows the read leaves
-/// unedited get the native band.
+/// The rounding band of one read of `rows`: `|fl(A x) − A x| ≤ γ_n |A| |x| + 𝒜 · 2^-1074`
+/// entrywise, with `fl` apply.rs's kernel and `n`, `|A|` and the underflow allowance `𝒜` as in
+/// [`read_magnitude`]. Rows the read leaves unedited get the native band.
 fn read_band(
     weight: ArrayView2<'_, f64>,
     factor: Option<&ProjectionFactor>,
@@ -3944,5 +4008,105 @@ mod tests {
                 "{layout:?}: a key mask must reach the gated MLP input exactly in the sequential layout"
             );
         }
+    }
+
+    /// A read whose products round into the subnormal range (#4005). Each of eight products
+    /// `3e-161 · 7e-162 ≈ 42.504 · 2^-1074` rounds to a multiple of `2^-1074` and loses about
+    /// `0.496 · 2^-1074`, which no relative band sees: the read's error is near
+    /// `3.96 · 2^-1074`. The exact error is measured by scaling both operands by `2^600` into
+    /// the normal range, where a fused multiply-add gives each product's rounding error exactly
+    /// and every power-of-two scaling is exact. Positive control: the relative band alone,
+    /// `γ_d |W| |x̂| / (1 − γ_(d+3))`, lies below that error.
+    #[test]
+    fn a_read_band_encloses_products_that_round_into_the_subnormal_range() {
+        const PRODUCTS: usize = 8;
+        let scale = 2.0_f64.powi(600);
+        let (weight_entry, row_entry) = (3.0e-161, 7.0e-162);
+        let weight = Array2::from_elem((1, PRODUCTS), weight_entry);
+        let rows = Array2::from_elem((1, PRODUCTS), row_entry);
+        let (read, band) = linear_read(weight.view(), ProjectedRows::exact(rows.view())).expect("subnormal read");
+        let (weight_scaled, row_scaled) = (weight_entry * scale, row_entry * scale);
+        let product = weight_scaled * row_scaled;
+        let residual = weight_scaled.mul_add(row_scaled, -product);
+        // The exact read times 2^1200 is `8 (product + residual)`. The computed read times
+        // 2^1200 is within a factor two of `8 product`, so their difference is exact.
+        let exact_scaled = PRODUCTS as f64;
+        let error = ((read[[0, 0]] * scale * scale - exact_scaled * product) - exact_scaled * residual).abs();
+        assert!(
+            error > 3.5 * SUBNORMAL_SPACING * scale * scale,
+            "the fixture must lose most of four subnormal spacings to underflow, lost {:e}",
+            error / (scale * scale)
+        );
+        assert!(
+            error <= band[[0, 0]] * scale * scale,
+            "the read band {:e} must enclose the underflow error {:e}",
+            band[[0, 0]],
+            error / (scale * scale)
+        );
+        let magnitude = abs_map(weight.view(), rows.view())[[0, 0]];
+        let relative = accumulation_growth(PRODUCTS) * magnitude / (1.0 - accumulation_growth(PRODUCTS + 3));
+        assert!(
+            relative * scale * scale < error,
+            "positive control: the relative band {relative:e} alone must miss the underflow error"
+        );
+    }
+
+    /// A radius read `|W| r` whose products underflow to zero still carries their allowance
+    /// (#4005): `1e-170 · 1e-170` rounds to zero, yet rows within `r = 1e-170` of the computed
+    /// ones can move the exact read by `1e-340`. The carried radius is at least one subnormal
+    /// spacing and exceeds the radius of the same read of exact rows. Positive control: the
+    /// computed magnitude `|W| r` is zero.
+    #[test]
+    fn an_underflowed_radius_read_carries_its_allowance() {
+        let weight = Array2::from_elem((1, 1), 1.0e-170);
+        let rows = Array2::from_elem((1, 1), 1.0e-170);
+        let radius = Array2::from_elem((1, 1), 1.0e-170);
+        assert_eq!(
+            native_magnitude(weight.view(), radius.view()).magnitude[[0, 0]],
+            0.0,
+            "positive control: the magnitude of the radius read underflows to zero"
+        );
+        let (_, exact) = linear_read(weight.view(), ProjectedRows::exact(rows.view())).expect("exact rows");
+        let (_, carried) = linear_read(
+            weight.view(),
+            ProjectedRows {
+                values: rows.view(),
+                radius: radius.view(),
+            },
+        )
+        .expect("rows with a radius");
+        assert!(
+            carried[[0, 0]] >= SUBNORMAL_SPACING && carried[[0, 0]] > exact[[0, 0]],
+            "an underflowed radius read must carry its allowance: carried {:e}, exact rows {:e}",
+            carried[[0, 0]],
+            exact[[0, 0]]
+        );
+    }
+
+    /// At normal scale the underflow allowance and the upward steps leave a read band at its
+    /// relative size `γ_d |W| |x̂| / (1 − γ_(d+3))`, plus at most `2 d · 2^-1074`. The band's five
+    /// stepped operations and its stepped divisor each scale by at most `(1 + u)(1 + 2u)`, and
+    /// this test's relative band rounds four times, so the ratio stays below
+    /// `(1 + 3u)^6 (1 + u)^4 < 1 + 16 ε`.
+    #[test]
+    fn the_underflow_allowance_leaves_a_normal_read_band_at_its_relative_size() {
+        let fixture = LayerFixture::new(4005);
+        let native = fixture.native();
+        let weight = native.weight(AttentionProjection::Query);
+        let width = weight.ncols();
+        let (_, band) = linear_read(weight, ProjectedRows::exact(fixture.residual.view())).expect("native read");
+        let magnitude = abs_map(weight, fixture.residual.mapv(f64::abs).view());
+        let relative = magnitude
+            .mapv(|value| accumulation_growth(width) * value / (1.0 - accumulation_growth(width + 3)));
+        Zip::from(&band).and(&relative).for_each(|&band, &relative| {
+            assert!(
+                band <= relative * (1.0 + 16.0 * f64::EPSILON) + 2.0 * width as f64 * SUBNORMAL_SPACING,
+                "a normal read band {band:e} must stay at its relative size {relative:e}"
+            );
+        });
+        assert!(
+            relative.iter().any(|&value| value > 0.0),
+            "the fixture's reads must round"
+        );
     }
 }

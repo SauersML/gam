@@ -161,7 +161,8 @@ impl Network {
         let values = Array2::from_shape_fn((tokens.len(), self.embedding.ncols()), |(position, column)| {
             self.embedding[[tokens[position] as usize, column]] + self.positional[[position, column]]
         });
-        let radius = values.mapv(|value| evaluation_band(1, value.abs()));
+        // One addition and no product: no underflow allowance.
+        let radius = values.mapv(|value| evaluation_band(1, value.abs(), 0.0));
         let mut residual = Rows { values, radius };
         let mut executions = Vec::with_capacity(self.layers.len());
         for (index, (layer, &reads)) in self.layers.iter().zip(reads).enumerate() {
