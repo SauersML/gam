@@ -670,6 +670,31 @@ pub(crate) fn realised_rank_charge_dof(
     lam_smooth: f64,
     smooth_penalty: Option<&Array2<f64>>,
 ) -> Result<f64, String> {
+    realised_rank_charge_stratum(
+        gram,
+        decoder,
+        n_eff,
+        p_out,
+        r_floor,
+        lam_smooth,
+        smooth_penalty,
+    )
+    .map(|stratum| stratum.production_dof())
+}
+
+/// The rank-charge branch one atom is priced on, with the DOF it charges
+/// ([`super::wbic_audit::RankChargeStratum::production_dof`]). The criterion
+/// seams read the branch as well as the DOF, because the outer search needs to
+/// know which smooth piece of the criterion a value came from (#3436).
+fn realised_rank_charge_stratum(
+    gram: &Array2<f64>,
+    decoder: &Array2<f64>,
+    n_eff: f64,
+    p_out: f64,
+    r_floor: f64,
+    lam_smooth: f64,
+    smooth_penalty: Option<&Array2<f64>>,
+) -> Result<super::wbic_audit::RankChargeStratum, String> {
     // One stratum producer for the value, its analytic derivative and the audit,
     // so all three classify the same branch of the same state (#2933 F32).
     let stratum = super::wbic_audit::rank_charge_stratum(
@@ -718,7 +743,19 @@ pub(crate) fn realised_rank_charge_dof(
             stratum.top_reconstruction_energy()
         );
     }
-    Ok(stratum.production_dof())
+    Ok(stratum)
+}
+
+/// Rank-charge pricing of every atom at one state (#3436).
+///
+/// The criterion's rank charge `Σ_k ½·r_k·edf_k·log max(N_eff,k, 1)` is smooth in
+/// the state while every `r_k` holds, and it jumps where the reconstruction energy
+/// of a direction crosses its Marchenko–Pastur edge. `dof` holds the charged
+/// `r_k·edf_k`. `chargeable_rank` holds the `r_k` it was priced on: this is the branch
+/// assignment that says which smooth piece of the criterion the value came from.
+pub(crate) struct RankChargePricing {
+    pub(crate) dof: Vec<f64>,
+    pub(crate) chargeable_rank: Vec<usize>,
 }
 
 /// The one production Laplace-complexity scalar:
@@ -918,6 +955,7 @@ impl SaeManifoldTerm {
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: None,
+            priced_rank_stratum: None,
             curvature_walk_report: None,
             dictionary_cocollapse_reseeds: 0,
             inner_globalization_hint: None,
@@ -1743,7 +1781,7 @@ impl SaeManifoldTerm {
         n_eff: &[f64],
         rho: &SaeManifoldRho,
         dispersion_r: f64,
-    ) -> Result<Vec<f64>, String> {
+    ) -> Result<RankChargePricing, String> {
         self.assignment.validate_rho_domain(rho)?;
         let lam = rho.lambda_smooth_vec()?;
         // Fixed noise floor R = residual variance (dispersion), as measured. A
@@ -1751,7 +1789,8 @@ impl SaeManifoldTerm {
         // `validate_rank_charge_problem` rather than replaced by a floor.
         let r_floor = dispersion_r;
         let p_out = self.output_dim() as f64;
-        let mut out = Vec::with_capacity(self.k_atoms());
+        let mut dof = Vec::with_capacity(self.k_atoms());
+        let mut chargeable_rank = Vec::with_capacity(self.k_atoms());
         for k in 0..self.k_atoms() {
             // Each atom is priced through the shared `realised_rank_charge_dof` core
             // (the SAME fn the #2023 migration gate uses), so dense, #9 streaming, and
@@ -1760,7 +1799,7 @@ impl SaeManifoldTerm {
                 format!("rank_dof_from_grams: missing effective sample size for atom {k}")
             })?;
             let lam_k = lam[k];
-            let d = realised_rank_charge_dof(
+            let stratum = realised_rank_charge_stratum(
                 &grams[k],
                 self.atoms[k].decoder_coefficients(),
                 n_eff_k,
@@ -1770,9 +1809,13 @@ impl SaeManifoldTerm {
                 Some(self.atoms[k].smooth_penalty()),
             )
             .map_err(|e| format!("rank_dof_from_grams: atom {k}: {e}"))?;
-            out.push(d);
+            dof.push(stratum.production_dof());
+            chargeable_rank.push(stratum.production_chargeable_rank());
         }
-        Ok(out)
+        Ok(RankChargePricing {
+            dof,
+            chargeable_rank,
+        })
     }
 
     /// Rung-2 — attach the behavioral data block, declaring this an augmented

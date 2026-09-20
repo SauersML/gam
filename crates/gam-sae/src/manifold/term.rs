@@ -542,6 +542,14 @@ pub struct SaeManifoldTerm {
     /// incoherence/curvature certificate-input report. `None` for synthetic terms
     /// or legacy internal callers that have not computed post-fit dispersion.
     pub(crate) certificate_dispersion: Option<f64>,
+    /// #3436 — the rank-charge branch of the latest criterion value priced at this
+    /// state: each atom's production chargeable rank `r_k` (#2933 F32), in atom
+    /// order. On a fixed assignment `r` the criterion is one smooth function
+    /// `V_r(ρ)`, and a change of any `r_k` jumps to another one, so the outer
+    /// objective publishes this assignment as its criterion rank. Only the two
+    /// production pricing seams write it, in the same step that returns the
+    /// value. `None` before any value has been priced at this state.
+    pub(crate) priced_rank_stratum: Option<Box<[usize]>>,
     /// Outcome of the most recent curvature-homotopy entry walk (#1007), or
     /// `None` when no walk has run (the seed cascade entry, or any consumer that
     /// never invokes the tracker). Recorded on the fit payload so the bifurcation
@@ -844,6 +852,9 @@ impl Clone for SaeManifoldTerm {
             border_hbb_workspace: Array2::<f64>::zeros((0, 0)),
             arrow_assembly_workspace: SaeArrowAssemblyWorkspace::default(),
             certificate_dispersion: self.certificate_dispersion,
+            // #3436 — the basin envelope hands its argmin to the gradient lane as a
+            // clone, and the objective reads the priced branch off that clone.
+            priced_rank_stratum: self.priced_rank_stratum.clone(),
             curvature_walk_report: self.curvature_walk_report.clone(),
             dictionary_cocollapse_reseeds: self.dictionary_cocollapse_reseeds,
             // Transient globalization hint — a fresh clone re-establishes the

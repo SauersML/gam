@@ -1,6 +1,6 @@
 use super::*;
 use gam_solve::rho_optimizer::{
-    FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
+    CriterionRank, FixedPointCertificateEval, FixedPointCoordinateCertificate, OuterResult,
 };
 
 pub(crate) fn reconstruction_explained_variance(
@@ -654,6 +654,18 @@ struct ProbeConvergedHandoff {
     priced: Option<OuterCriterionEvaluation>,
 }
 
+impl ProbeConvergedHandoff {
+    /// Whether this handoff holds the state probed at exactly `rho_flat` (bitwise).
+    fn is_at(&self, rho_flat: ArrayView1<'_, f64>) -> bool {
+        self.rho_flat.len() == rho_flat.len()
+            && self
+                .rho_flat
+                .iter()
+                .zip(rho_flat.iter())
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
 /// What `install_authoritative_envelope_basin` left installed at the requested ρ.
 enum InstalledEnvelopeBasin {
     /// Every admissible basin has an undefined quasi-Laplace value at this ρ.
@@ -711,6 +723,7 @@ struct ReactiveWaypointCheckpoint {
     terminal_penalized_quasi_laplace_criterion: Option<f64>,
     seeded_beta: Option<Array1<f64>>,
     probe_converged_handoff: Option<ProbeConvergedHandoff>,
+    last_priced_stratum: Option<CriterionRank>,
     basin_bundle: BasinBundle<SaeManifoldTerm>,
     termination: OuterTerminationLedger,
     fit_verdict: Option<SaeOuterVerdict>,
@@ -858,6 +871,15 @@ pub struct SaeManifoldOuterObjective {
     /// the exact derivative of the reported value. A reactive scalar waypoint installs
     /// another objective and chooses again.
     pub(crate) collapse_prevention_gates: Option<CollapsePreventionGates>,
+    /// #3436 — the realized-rank stratum of the value the latest evaluation returned:
+    /// one production chargeable rank `r_k` per atom, read from the state that value
+    /// was priced on. The rank charge `Σ_k ½·r_k·edf_k·log N_eff,k` is smooth only
+    /// while every `r_k` holds; an eigenvalue crossing its atom's Marchenko--Pastur
+    /// edge flips `r_k` and jumps the charge by `½·edf_k·log N_eff,k`. Two values on
+    /// different assignments are two criteria, so this is published through
+    /// [`OuterObjective::criterion_rank`] and the outer line search refuses a trial
+    /// off its run's stratum. `None` after a refused or non-finite evaluation.
+    last_priced_stratum: Option<CriterionRank>,
 }
 
 /// #2230/#2087 exact basin-bundle memory admission.
@@ -1168,6 +1190,7 @@ impl SaeManifoldOuterObjective {
             crosscoder_blocks: None,
             reactive_waypoint_checkpoint: None,
             collapse_prevention_gates,
+            last_priced_stratum: None,
         }
     }
 
@@ -2105,17 +2128,25 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
     ) -> Option<(SaeManifoldTerm, Option<OuterCriterionEvaluation>)> {
         let handoff = self.probe_converged_handoff.take()?;
-        let matches = handoff.rho_flat.len() == rho_flat.len()
-            && handoff
-                .rho_flat
-                .iter()
-                .zip(rho_flat.iter())
-                .all(|(a, b)| a.to_bits() == b.to_bits());
-        if matches {
+        if handoff.is_at(rho_flat) {
             Some((handoff.term, handoff.priced))
         } else {
             None
         }
+    }
+
+    /// #3436 — the realized-rank stratum of the value a value lane just returned at
+    /// `rho_flat`. Every finite value-lane result parks the state it was priced on as
+    /// the exact-ρ probe handoff, so that state's per-atom chargeable ranks are the
+    /// assignment the returned value lives on.
+    fn value_probe_stratum(&self, rho_flat: ArrayView1<'_, f64>) -> Option<CriterionRank> {
+        self.probe_converged_handoff
+            .as_ref()
+            .filter(|handoff| handoff.is_at(rho_flat))?
+            .term
+            .priced_rank_stratum
+            .as_ref()
+            .map(|ranks| CriterionRank::per_component(ranks.to_vec()))
     }
 
     /// Evaluate the authoritative penalized quasi-Laplace criterion at
@@ -3711,6 +3742,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // A reduced-budget finite iterate would define a second objective; only
         // an explicit refusal may represent unfinished computation.
         self.probe_telemetry.criterion_calls += 1;
+        self.last_priced_stratum = None;
         // #2230/#2087 — descend the basin lower envelope V*(ρ)=min_b V_b(ρ) here
         // instead of the single hysteretic warm-start trajectory. The shared
         // authoritative drive is also used by line-search and gradient handoff
@@ -3727,6 +3759,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(f64::INFINITY);
                 }
+                self.last_priced_stratum = self.value_probe_stratum(rho.view());
                 if self.reactive_waypoint_checkpoint.is_none() {
                     self.record_search_criterion(cost, None);
                 }
@@ -3748,6 +3781,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         self.check_cancelled()?;
         self.probe_telemetry.criterion_calls += 1;
+        self.last_priced_stratum = None;
         let rho_state = self
             .baseline_rho
             .from_flat(rho.view())
@@ -3863,6 +3897,12 @@ impl OuterObjective for SaeManifoldOuterObjective {
             self.probe_telemetry.infeasible_criterion_evals += 1;
             return Ok(OuterEval::infeasible(rho.len()));
         }
+        // #3436 — the installed state holds the stratum its value was priced on.
+        self.last_priced_stratum = self
+            .term
+            .priced_rank_stratum
+            .as_ref()
+            .map(|ranks| CriterionRank::per_component(ranks.to_vec()));
         let gradient = self
             .analytic_gradient_for_outer_evaluation(&rho_state, &evaluation)
             .map_err(EstimationError::from)?;
@@ -3917,6 +3957,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
         self.check_cancelled()?;
         match order {
             OuterEvalOrder::Value => {
+                self.last_priced_stratum = None;
                 // The `Value` order is the BFGS / ARC LINE-SEARCH cost probe
                 // (see `solver/rho_optimizer/bridges.rs`). Its cost is compared
                 // against steps whose DIRECTION came from `eval`'s penalized
@@ -3981,6 +4022,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 if !cost.is_finite() {
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
+                self.last_priced_stratum = self.value_probe_stratum(rho.view());
                 if self.reactive_waypoint_checkpoint.is_none() {
                     self.record_search_criterion(cost, None);
                 }
@@ -4042,9 +4084,14 @@ impl OuterObjective for SaeManifoldOuterObjective {
         })
     }
 
+    fn criterion_rank(&self) -> Option<CriterionRank> {
+        self.last_priced_stratum.clone()
+    }
+
     fn reset(&mut self) {
         self.reactive_waypoint_checkpoint = None;
         self.fit_verdict = None;
+        self.last_priced_stratum = None;
         // #2933 F05 — `collapse_prevention_gates` survive a reset: every seed of this
         // objective is ranked on the same objective, and the next drive declares them
         // on the restored term.
@@ -4413,6 +4460,8 @@ impl OuterObjective for SaeManifoldOuterObjective {
         // temperature and isometry weight), so its first priced root chooses its own
         // collapse-prevention gates.
         self.collapse_prevention_gates = None;
+        // #3436 — nor does a stratum priced on the previous objective carry over.
+        self.last_priced_stratum = None;
         self.probe_telemetry.reactive_scalar_installs += 1;
         if restoring_target {
             self.probe_telemetry.reactive_target_restores += 1;
@@ -4445,6 +4494,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
                 .terminal_penalized_quasi_laplace_criterion,
             seeded_beta: self.seeded_beta.clone(),
             probe_converged_handoff: self.probe_converged_handoff.take(),
+            last_priced_stratum: self.last_priced_stratum.clone(),
             basin_bundle,
             termination: self.termination.clone(),
             fit_verdict: self.fit_verdict,
@@ -4529,6 +4579,7 @@ impl OuterObjective for SaeManifoldOuterObjective {
             checkpoint.terminal_penalized_quasi_laplace_criterion;
         self.seeded_beta = checkpoint.seeded_beta;
         self.probe_converged_handoff = checkpoint.probe_converged_handoff;
+        self.last_priced_stratum = checkpoint.last_priced_stratum;
         self.basin_bundle = checkpoint.basin_bundle;
         self.termination = checkpoint.termination;
         self.fit_verdict = checkpoint.fit_verdict;

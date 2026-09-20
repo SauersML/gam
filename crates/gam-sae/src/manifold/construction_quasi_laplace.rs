@@ -708,7 +708,8 @@ impl SaeManifoldTerm {
                 // gradient.
                 geometry.rank_charge_dispersion = Some(dispersion);
                 let disp = dispersion.raw_output_noise_variance;
-                let d_eff = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
+                let rank_charge = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
+                let d_eff = rank_charge.dof;
                 // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
                 // per-atom BIC log-scale (same quantity `rank_dof_from_grams` uses
                 // internally for the MP edge; recomputed here — a cheap Σa² — to price the
@@ -725,6 +726,8 @@ impl SaeManifoldTerm {
                 let quasi_laplace_complexity =
                     rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &n_eff)?;
                 let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
+                // #3436 — the branch this value was priced on travels with it.
+                self.priced_rank_stratum = Some(rank_charge.chargeable_rank.into_boxed_slice());
                 // #2228 — the criterion's terms at the cache the `[SAE-ACCEPT]` line named, so
                 // a split between two lanes at one ρ says which term moved.
                 log::debug!(
@@ -3111,13 +3114,15 @@ impl SaeManifoldTerm {
                     )
                 })?
                 .raw_output_noise_variance;
-            let d_eff = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
+            let rank_charge = self.rank_dof_from_grams(&ri.grams, &ri.n_eff, rho, disp)?;
             // #5/#2498: the typed gated-signal proof above is the sole
             // disappearance verdict. The scalar rank-charge seam only prices the
             // already-certified live state.
             let quasi_laplace_complexity =
-                rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &ri.n_eff)?;
+                rank_adjusted_quasi_laplace_complexity(log_det, &rank_charge.dof, &ri.n_eff)?;
             let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
+            // #3436 — the branch this value was priced on travels with it.
+            self.priced_rank_stratum = Some(rank_charge.chargeable_rank.into_boxed_slice());
             // #2515 — the dense lane's `[SAE-CRITERION]` terms, on this lane, so a split
             // between the two routes at one ρ says which term moved.
             log::debug!(
