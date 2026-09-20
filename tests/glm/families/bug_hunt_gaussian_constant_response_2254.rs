@@ -279,9 +279,11 @@ fn gaussian_constant_response_inference_bundle_is_self_consistent_2254() {
 }
 
 /// The zero-dispersion shortcut is an exact boundary, not a tolerance-based
-/// approximation. A response with any represented variation must continue to
-/// the family-owned degeneracy check; otherwise a tiny but nonzero residual is
-/// silently assigned φ̂=0 and the fit lies about convergence/inference.
+/// approximation. A response with any represented variation takes the ordinary
+/// REML path, which is equivariant under `y -> c*y`, so a tiny spread is fit
+/// like any other; otherwise a tiny but nonzero residual is silently assigned
+/// φ̂=0 and the fit lies about convergence/inference. (An absolute spread floor
+/// once refused this response outright; it was removed as scale-dependent.)
 #[test]
 fn gaussian_constant_shortcut_does_not_absorb_near_constant_response_2254() {
     let n = 96usize;
@@ -291,13 +293,24 @@ fn gaussian_constant_shortcut_does_not_absorb_near_constant_response_2254() {
         .collect();
     let data = encode_columns(&["x", "y"], &[&x, &y]);
 
-    let error = match fit_from_formula("y ~ s(x, k=10)", &data, &gaussian_cfg()) {
-        Ok(_) => panic!("a nonconstant response entered the exact zero-dispersion shortcut"),
-        Err(error) => error,
+    let FitResult::Standard(fit) = fit_from_formula("y ~ s(x, k=10)", &data, &gaussian_cfg())
+        .unwrap_or_else(|e| panic!("a near-constant response must fit, not be refused: {e}"))
+    else {
+        panic!("near-constant Gaussian formula did not produce a standard fit");
     };
-    let message = error.to_string();
     assert!(
-        message.contains("effectively constant"),
-        "near-constant response reached the wrong path: {message}"
+        fit.fit.standard_deviation > 0.0,
+        "a nonconstant response entered the exact zero-dispersion shortcut"
     );
+    let (lo, hi) = y
+        .iter()
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| (lo.min(v), hi.max(v)));
+    let spread = hi - lo;
+    let fitted = fit.design.design.apply(&fit.fit.beta);
+    for (row, &value) in fitted.iter().enumerate() {
+        assert!(
+            value.is_finite() && value >= lo - spread && value <= hi + spread,
+            "row {row}: fitted value {value} escapes the response range [{lo}, {hi}]"
+        );
+    }
 }

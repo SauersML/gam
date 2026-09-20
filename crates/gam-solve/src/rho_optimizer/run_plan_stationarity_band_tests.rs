@@ -979,7 +979,6 @@ fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
         StationarityBoundSource::CoordinateBand,
         StationarityBoundSource::ArithmeticLimited,
         StationarityBoundSource::CurvatureResolvability,
-        StationarityBoundSource::GradientReproducibility,
         StationarityBoundSource::FixedPointResidual,
         StationarityBoundSource::CallerRequirement,
         StationarityBoundSource::NewtonDecrement,
@@ -1026,7 +1025,6 @@ fn only_exact_curvature_rungs_are_the_derived_standard_2458() {
         | StationarityBoundSource::CoordinateBand
         | StationarityBoundSource::ArithmeticLimited
         | StationarityBoundSource::CurvatureResolvability
-        | StationarityBoundSource::GradientReproducibility
         | StationarityBoundSource::FixedPointResidual
         | StationarityBoundSource::CallerRequirement
         | StationarityBoundSource::NewtonDecrement
