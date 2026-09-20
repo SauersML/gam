@@ -43,7 +43,9 @@ pub use dictionary_score::{
 pub use gpu_error::GpuError;
 pub use policy::{GpuDispatchPolicy, GpuMixedPrecisionPolicy};
 pub use pool::{balanced_partition, scatter_batched};
-pub use row_kernel_race::{RowKernelShape, race_row_kernel};
+pub use row_kernel_race::{
+    ReusedStateRace, RowKernelShape, race_row_kernel, run_measured_row_kernel,
+};
 
 // ---------------------------------------------------------------------------
 // User-facing policy and instrumentation hooks (formerly src/gpu.rs).
@@ -113,6 +115,13 @@ pub enum GpuKernel {
     MarginalSlopeRows,
     SurvivalMarginalSlopeRows,
     PolyaGammaDraws,
+    /// The SAE softmax row jet's packed channel tile.
+    SaeRowJetChannels,
+    /// The SAE softmax row jet contracted against one probe per row.
+    SaeRowJetLinear,
+    /// The SAE softmax row jet's bilinear residual-curvature HVP, raced over
+    /// one prepared state's lifetime: its build and every apply against it.
+    SaeRowJetBilinear,
     RemlTrace,
     FinalInference,
 }
@@ -131,6 +140,9 @@ impl GpuKernel {
             Self::MarginalSlopeRows => "marginal-slope-rows",
             Self::SurvivalMarginalSlopeRows => "survival-marginal-slope-rows",
             Self::PolyaGammaDraws => "polya-gamma-draws",
+            Self::SaeRowJetChannels => "sae-row-jet-channels",
+            Self::SaeRowJetLinear => "sae-row-jet-linear",
+            Self::SaeRowJetBilinear => "sae-row-jet-bilinear",
             Self::RemlTrace => "reml-trace",
             Self::FinalInference => "final-inference",
         }
@@ -520,7 +532,7 @@ pub fn log_backend_inventory_once() {
             "none"
         };
         log::trace!(
-            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,survival-marginal-slope-rows,polya-gamma-draws,reml-trace,final-inference",
+            "[GPU backend] policy={} compiled_backends={} kernels=dense-matvec,dense-transpose-matvec,dense-xtwx,candidate-screen,dense-solve,matrix-free-pcg,sparse-assembly,spatial-kernel-operator,marginal-slope-rows,survival-marginal-slope-rows,polya-gamma-draws,sae-row-jet-channels,sae-row-jet-linear,sae-row-jet-bilinear,reml-trace,final-inference",
             global_policy().as_str(),
             compiled_backends
         );

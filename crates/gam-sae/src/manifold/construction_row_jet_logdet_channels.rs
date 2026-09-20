@@ -656,6 +656,7 @@ impl SaeManifoldTerm {
                 q,
                 p,
                 n_beta,
+                crate::gpu_kernels::sae_rowjet::SaeRowJetContractionKind::Linear,
                 self.gpu_policy,
                 host_budget,
             )?;
@@ -783,16 +784,34 @@ impl SaeManifoldTerm {
                 v_t.extend_from_slice(&v_t_row);
                 v_beta.extend_from_slice(v_beta_row);
             }
-            let tile = match tile_plan.bilinear.as_ref() {
-                Some(kept) => kept.apply(&v_t, &v_beta)?,
-                None => crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile_contracted(
+            let contracted = |path| {
+                crate::gpu_kernels::sae_rowjet::execute_softmax_row_jet_tile_contracted(
                     &tile_plan.inputs,
                     1.0 / temperature,
-                    tile_plan.path,
+                    path,
                     crate::gpu_kernels::sae_rowjet::SaeRowJetContraction::Bilinear {
                         probe: &tile_plan.probe,
                         v_t: &v_t,
                         v_beta: &v_beta,
+                    },
+                )
+            };
+            let cpu = |kept: Option<
+                &crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions,
+            >| match kept {
+                Some(kept) => kept.apply(&v_t, &v_beta),
+                None => contracted(crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Cpu),
+            };
+            let tile = match &tile_plan.executor {
+                PreparedSoftmaxRowJetExecutor::Cpu { kept } => cpu(kept.as_ref())?,
+                PreparedSoftmaxRowJetExecutor::Device => {
+                    contracted(crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Device)?
+                }
+                PreparedSoftmaxRowJetExecutor::Racing { kept, race } => race.apply(
+                    || cpu(kept.as_ref()),
+                    || {
+                        contracted(crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Device)
+                            .map(|_| ())
                     },
                 )?,
             };
@@ -861,6 +880,7 @@ impl SaeManifoldTerm {
                 q,
                 p,
                 n_beta,
+                crate::gpu_kernels::sae_rowjet::SaeRowJetContractionKind::Bilinear,
                 self.gpu_policy,
                 host_budget,
             )?;
@@ -935,24 +955,40 @@ impl SaeManifoldTerm {
                 }
                 probe.extend_from_slice(&probe_row);
             }
-            let bilinear = match (plan.path, self.assignment.mode) {
-                (
-                    crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Cpu,
-                    AssignmentMode::Softmax { temperature, .. },
-                ) => crate::gpu_kernels::sae_rowjet::bilinear::prepare_bilinear_contractions(
-                    &inputs,
-                    1.0 / temperature,
-                    &probe,
-                )?,
-                _ => None,
+            let keep = || match self.assignment.mode {
+                AssignmentMode::Softmax { temperature, .. } => {
+                    crate::gpu_kernels::sae_rowjet::bilinear::prepare_bilinear_contractions(
+                        &inputs,
+                        1.0 / temperature,
+                        &probe,
+                    )
+                }
+                _ => Ok(None),
+            };
+            let executor = match plan.path {
+                crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Cpu => {
+                    PreparedSoftmaxRowJetExecutor::Cpu { kept: keep()? }
+                }
+                crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Device => {
+                    PreparedSoftmaxRowJetExecutor::Device
+                }
+                crate::gpu_kernels::sae_rowjet::SaeRowJetPath::Race(shape) => {
+                    let (race, kept) = gam_gpu::ReusedStateRace::build(
+                        gam_gpu::RowKernelShape {
+                            rows: inputs.len(),
+                            ..shape
+                        },
+                        keep,
+                    )?;
+                    PreparedSoftmaxRowJetExecutor::Racing { kept, race }
+                }
             };
             tiles.push(PreparedSoftmaxRowJetTile {
                 start,
                 q,
-                path: plan.path,
+                executor,
                 inputs,
                 probe,
-                bilinear,
             });
             start += tile_rows;
         }
