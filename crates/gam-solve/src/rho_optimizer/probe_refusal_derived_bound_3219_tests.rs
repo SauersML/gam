@@ -80,7 +80,7 @@ fn drive_refused_probes_3219(
     );
     let config = claim_band_config(1.0e-3);
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(outer_criterion_resolution(&config), &config, exit.clone());
+    let mut guard = CostStallGuard::new(&config, exit.clone());
     guard.observe_seed(&array![0.0], V0_3219, resolution_3219(), 1.0);
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,

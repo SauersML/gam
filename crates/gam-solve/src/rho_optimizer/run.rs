@@ -10,6 +10,9 @@ use super::asymptote_certificate::{
 use super::rail_face::{
     RailFaceLimitOutcome, RailFaceProof, RailFaceVerdict, certify_rail_face,
 };
+use super::zero_smoothing_face::{
+    ZeroSmoothingFaceOutcome, ZeroSmoothingProof, certify_zero_smoothing_face,
+};
 
 pub(crate) const OPERATOR_TRUST_RESTART_RADIUS_FLOOR: f64 = 1.0e-6;
 
@@ -881,6 +884,7 @@ impl OuterProblem {
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
             rail_face_limit_fn: None,
+            zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
@@ -921,6 +925,7 @@ impl OuterProblem {
             fixed_point_certificate_fn: None,
             exact_polish_fn: None,
             rail_face_limit_fn: None,
+            zero_smoothing_face_fn: None,
             criterion_invariance_fn: None,
             criterion_rank_fn: None,
             seed_fn: None::<fn(&mut S, &Array1<f64>) -> Result<SeedOutcome, EstimationError>>,
@@ -1655,14 +1660,14 @@ pub struct OuterResult {
 }
 
 /// What a first-order search publishes when it halts where its kept rank ends (#2939): a
-/// filled cost-stall window in which every trial was refused for keeping a different rank
-/// than the one the search started on (#2765). The incumbent it halted at is published
+/// cost-stall window or exhausted line search whose final refusal streak kept a different
+/// rank than the one the search started on (#2765). The incumbent it halted at is published
 /// non-converged, and the terminal certificate judges it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RankBoundaryStall {
     /// Kept rank of the face log-determinant this search searched.
     pub kept_rank: usize,
-    /// Consecutive trials the filled window refused for leaving that rank.
+    /// Consecutive trials the terminal refusal streak rejected for leaving that rank.
     pub refused_trials: usize,
     /// The certificate's stationarity band at the incumbent's value, which the incumbent's
     /// projected gradient exceeded.
@@ -5567,6 +5572,70 @@ fn try_certify_asymptote_rail(
         );
     }
 
+    // Which rail each coordinate sits on: the box endpoint it is nearest.
+    // `Upper` is λ → ∞ (the penalty pins the model), `Lower` is λ → 0 (the
+    // penalty leaves it). The two ends are different limits with different
+    // laws, so the face is proven at one end or the other, never across both.
+    let mut upper_face: Vec<usize> = Vec::with_capacity(tail_railed.len());
+    let mut lower_face: Vec<usize> = Vec::new();
+    for &k in tail_railed.iter() {
+        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
+            return Ok(Err(format!(
+                "railed coordinate {} outside the box layout",
+                native_coordinate(inputs.native_coordinate_order, k)
+            )));
+        }
+        if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
+            upper_face.push(k);
+        } else {
+            lower_face.push(k);
+        }
+    }
+
+    // #2348 Inc 5 — the λ → 0 end. A covered zero-smoothing face is ANALYTIC
+    // in λ, so its first-order law is exact and the face is proven from the
+    // signs of the slopes `c′_j = ∂V/∂λ_j`. There is no measured fallback:
+    // probing a λ → 0 tail never minted a rail (0 of 11 measured attempts
+    // across the regression suite), and a coordinate the law refuses is on a
+    // barrier, an exact fit, or outside the closed form — none of which a
+    // tail measurement can turn into a minimizer.
+    if !lower_face.is_empty() {
+        if !upper_face.is_empty() {
+            return Ok(Err(format!(
+                "the face spans both ends of the box: coordinate(s) {:?} rail at λ → ∞ and {:?} \
+                 at λ → 0, and no closed form expands the criterion jointly at that corner",
+                native_coordinates(inputs.native_coordinate_order, &upper_face),
+                native_coordinates(inputs.native_coordinate_order, &lower_face),
+            )));
+        }
+        return match try_certify_zero_smoothing_face_analytically(
+            obj,
+            inputs,
+            &lower_face,
+            estimand_tol,
+        )? {
+            Ok((rails, proof)) => {
+                log::debug!(
+                    "[CERTIFICATE] {}: analytic λ=0 face proof on {} coordinate(s): binding \
+                     slope c'={:.6e} > band {:.3e}, remaining value gap {:.3e}, estimand \
+                     travel {:.3e}",
+                    inputs.context,
+                    rails.len(),
+                    proof.statistic,
+                    proof.band,
+                    proof.value_gap,
+                    proof.estimand_travel,
+                );
+                Ok(Ok((
+                    interior_projected_grad_norm,
+                    effective_interior_bound,
+                    rails,
+                )))
+            }
+            Err(reason) => Ok(Err(reason)),
+        };
+    }
+
     // #2348 Inc 5 — the ANALYTIC face proof, first resort.
     //
     // Measuring a tail beside the ρ box asks the criterion for derivative
@@ -5581,7 +5650,7 @@ fn try_certify_asymptote_rail(
     // by a sound lower bound on that law over the whole release simplex. When
     // the objective cannot form that limit, or the proof does not hold, the
     // measured-tail path below is unchanged.
-    match try_certify_face_analytically(obj, inputs, &tail_railed, estimand_tol)? {
+    match try_certify_face_analytically(obj, inputs, &upper_face, estimand_tol)? {
         Ok((rails, proof)) => {
             log::debug!(
                 "[CERTIFICATE] {}: analytic λ=∞ face proof on {} coordinate(s) via {:?}: \
@@ -5612,27 +5681,15 @@ fn try_certify_asymptote_rail(
     let mut rails: Vec<RailCoordinate> = Vec::new();
     let mut decline: Option<String> = None;
     let mut probed_any = false;
-    for &k in tail_railed.iter() {
-        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
-            decline = Some(format!(
-                "railed coordinate {} outside the box layout",
-                native_coordinate(inputs.native_coordinate_order, k)
-            ));
-            break;
-        }
-        // Which rail: the box endpoint the coordinate sits nearest. `Upper`
-        // (λ → ∞) probes step ρ downward into the tail; `Lower` (λ → 0) step up.
-        let side = if (upper[k] - rho[k]).abs() <= (rho[k] - lower[k]).abs() {
-            AsymptoteSide::Upper
-        } else {
-            AsymptoteSide::Lower
-        };
+    for &k in upper_face.iter() {
+        // Every coordinate here rails at λ → ∞: the probes step ρ downward
+        // into the tail.
         probed_any = true;
         match build_and_assess_rail_coordinate(
             obj,
             rho,
             k,
-            side,
+            AsymptoteSide::Upper,
             &tol,
             (lower[k], upper[k]),
             native_coordinate(inputs.native_coordinate_order, k),
@@ -5687,27 +5744,12 @@ fn try_certify_asymptote_rail(
 fn try_certify_face_analytically(
     obj: &mut dyn OuterObjective,
     inputs: &AsymptoteRailInputs<'_>,
-    tail_railed: &[usize],
+    upper_face: &[usize],
     estimand_tol: f64,
 ) -> Result<Result<(Vec<RailCoordinate>, RailFaceProof), String>, EstimationError> {
-    let rho = inputs.rho;
-    let (lower, upper) = inputs.bounds;
-    // The analytic limit is the INFINITE-smoothing face. A coordinate railed at
-    // the zero-smoothing bound is the opposite limit (the penalty leaves the
-    // model rather than pinning it) and belongs to the measured-tail path.
-    for &k in tail_railed.iter() {
-        if k >= rho.len() || k >= lower.len() || k >= upper.len() {
-            return Ok(Err("railed coordinate outside the box layout".to_string()));
-        }
-        if (upper[k] - rho[k]).abs() > (rho[k] - lower[k]).abs() {
-            return Ok(Err(format!(
-                "coordinate {} rails at the zero-smoothing bound; the analytic face limit \
-                 covers λ→∞ only",
-                native_coordinate(inputs.native_coordinate_order, k)
-            )));
-        }
-    }
-    let limit = match obj.rail_face_limit(rho, tail_railed)? {
+    // `upper_face` rails at the INFINITE-smoothing bound only; the caller
+    // routes the zero-smoothing end to its own law.
+    let limit = match obj.rail_face_limit(inputs.rho, upper_face)? {
         RailFaceLimitOutcome::Available(limit) => *limit,
         // The decline is typed, and the distinction is worth carrying into the
         // refusal: "outside this closed form" invites a different one, while
@@ -5754,6 +5796,64 @@ fn try_certify_face_analytically(
             // floor, and not a quantity comparable with one.
             evidence: RailTailEvidence::AnalyticFaceProof {
                 route: proof.route,
+                statistic: proof.statistic,
+                band: proof.band,
+            },
+        })
+        .collect();
+    Ok(Ok((rails, proof)))
+}
+
+/// Prove a zero-smoothing rail face analytically (#2348 Inc 5, lower face):
+/// ask the objective for the exact first-order law at `λ_face = 0`, require
+/// every slope to clear its rounding band, and mint the rails from it.
+///
+/// Like the λ=∞ route this spends no criterion evaluation; the law's fidelity
+/// to the criterion production minimizes is pinned by the gradient-domain
+/// tests beside `RemlState::zero_smoothing_face`.
+fn try_certify_zero_smoothing_face_analytically(
+    obj: &mut dyn OuterObjective,
+    inputs: &AsymptoteRailInputs<'_>,
+    lower_face: &[usize],
+    estimand_tol: f64,
+) -> Result<Result<(Vec<RailCoordinate>, ZeroSmoothingProof), String>, EstimationError> {
+    let law = match obj.zero_smoothing_face(inputs.rho, lower_face)? {
+        ZeroSmoothingFaceOutcome::Available(law) => *law,
+        ZeroSmoothingFaceOutcome::OutsideClosedForm { reason } => {
+            return Ok(Err(format!(
+                "outside the zero-smoothing closed form: {reason}"
+            )));
+        }
+        ZeroSmoothingFaceOutcome::FaceUnavailable { reason } => {
+            return Ok(Err(format!("the λ=0 face is unavailable: {reason}")));
+        }
+    };
+    let proof = match certify_zero_smoothing_face(&law) {
+        Ok(proof) => proof,
+        Err(reason) => return Ok(Err(reason)),
+    };
+    if !(proof.estimand_travel <= estimand_tol) {
+        return Ok(Err(format!(
+            "λ=0 face proven, but the shipped fit has not reached it: coefficient travel \
+             {:.3e} > estimand tolerance {estimand_tol:.3e}",
+            proof.estimand_travel
+        )));
+    }
+    let rails: Vec<RailCoordinate> = law
+        .face
+        .iter()
+        .zip(law.face_rho.iter())
+        .zip(law.slopes.iter())
+        .map(|((&index, &rho_k), &slope)| RailCoordinate {
+            index,
+            side: AsymptoteSide::Lower,
+            // On the lower rail the pencil constant is `ĉ = e^{−ρ}·∂V/∂ρ`,
+            // which at `λ → 0` is exactly the slope `c′_k = ∂V/∂λ_k`.
+            tail_constant: slope,
+            value_gap: slope * rho_k.exp(),
+            estimand_travel_bound: proof.estimand_travel,
+            evidence: RailTailEvidence::AnalyticFaceProof {
+                route: FacePositivityRoute::CoveredZeroSmoothing,
                 statistic: proof.statistic,
                 band: proof.band,
             },

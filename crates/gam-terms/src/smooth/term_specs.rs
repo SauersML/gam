@@ -702,10 +702,15 @@ pub struct SmoothTermSpec {
 /// The predict-time replay record of a span-preserving parametric
 /// orthogonalization (#2747): this term's realized block is `X·T − C·R`.
 ///
-/// `T` is not here — it is the ordinary coefficient transform, already absorbed
-/// into the basis metadata, so a rebuilt `design_local` arrives with it applied.
-/// What cannot be absorbed is `R`, because it multiplies the CONSTRAINT block
-/// rather than the basis.
+/// `T` is recorded here, beside `R`, rather than folded into the basis metadata
+/// (#3001). The fit applies the term-local chart, the joint-null rotation `Q`
+/// and `T` as three successive products, `((B·z_local)·Q)·T`, and floating-point
+/// products do not reassociate: a replay that forms `B·(z_local·Q·T)` from one
+/// composed chart rebuilds a design that differs from the fit's in the last
+/// bits, so the saved model does not predict its own fitted values. The frozen
+/// spec therefore keeps the local chart in its basis, `Q` on
+/// [`SmoothTermSpec::joint_null_rotation`], and `T` here, and the replay applies
+/// them in the fit's order.
 ///
 /// `R` is TRAINING-ROW data and is never re-derived, for the same reason
 /// `frozen_global_orthogonality` is not (#978): the fit already decided this
@@ -726,6 +731,9 @@ pub struct ParametricResidualizationChart {
     /// constraint block. Recorded rather than recomputed so a spec that changes
     /// shape cannot silently re-order the columns `correction`'s rows index.
     pub has_parametric_block: bool,
+    /// `T`, `p × k`: the collection's coefficient chart, stated on the columns of
+    /// the term-local build after its joint-null rotation.
+    pub coefficient_transform: Array2<f64>,
     /// `R`, `q × k`, stated against the RAW constraint columns.
     pub correction: Array2<f64>,
 }
@@ -786,11 +794,15 @@ pub struct SmoothCollectionGauge {
     /// The TERM-LOCAL identifiability chart the gauged block was derived ON —
     /// `z_local`, before this gauge composed its own `T` on top of it (gam#2760).
     ///
-    /// The term's `BasisMetadata` records the COMPOSITION `z_local · T0`, which
-    /// is what a predict-time replay wants. A caller that moves `ψ` must rebuild
-    /// in `z_local`, then apply the separately stored fixed
-    /// [`Self::coefficient_transform`] and fixed row-space projection. Starting
-    /// from the composition would apply `T0` twice.
+    /// The term's `BasisMetadata` records the COMPOSITION `z_local · Q · T0`, the
+    /// chart its coefficients and penalties live in. A caller that rebuilds the
+    /// design — a moving-`ψ` trial or a predict-time replay — must rebuild in
+    /// `z_local`, then apply `Q`, the separately stored fixed
+    /// [`Self::coefficient_transform`] and the row-space correction, in that
+    /// order. Starting from the composition would apply `T0` twice, and even a
+    /// composition applied once rounds differently from the fit's three products
+    /// (#3001); `freeze_term_collection_from_design` freezes this chart for that
+    /// reason.
     ///
     /// Measured before this existed, on a one-Duchon-term collection with
     /// `C = [1]` and the `Delete` arm: the replay spec carried
@@ -1168,6 +1180,23 @@ impl LinearTermSpec {
         }
     }
 
+    /// Whether this term owns a one-column penalty block in the realized
+    /// design: the function-mass ridge of a `double_penalty` term, or the
+    /// latent-scale ridge a `bounded()` coefficient carries under the default
+    /// [`BoundedCoefficientPriorSpec::Shrinkage`] prior. The design builder
+    /// emits exactly one block per such term, in term order, ahead of the
+    /// random-effect ridges.
+    pub fn owns_penalty_block(&self) -> bool {
+        self.double_penalty
+            || matches!(
+                self.coefficient_geometry,
+                LinearCoefficientGeometry::Bounded {
+                    prior: BoundedCoefficientPriorSpec::Shrinkage,
+                    ..
+                }
+            )
+    }
+
     /// Realize this linear term's `(n,)` design column from `data`.
     ///
     /// The column is the elementwise product of every numeric feature column
@@ -1397,6 +1426,20 @@ impl TermCollectionSpec {
                 LinearCoefficientGeometry::Bounded { .. }
             )
         })
+    }
+
+    /// Global penalty-block index (and so smoothing-parameter index) of the
+    /// ridge owned by `random_effect_terms[term_idx]`.
+    ///
+    /// The realized layout is one block per penalty-owning linear term
+    /// ([`LinearTermSpec::owns_penalty_block`]), then one `RandomEffectRidge`
+    /// per random-effect term in term order, then the smooth penalties.
+    pub fn random_effect_penalty_index(&self, term_idx: usize) -> usize {
+        self.linear_terms
+            .iter()
+            .filter(|term| term.owns_penalty_block())
+            .count()
+            + term_idx
     }
 
     /// Return every feature column that is interpreted as a categorical factor
@@ -2484,6 +2527,31 @@ impl TermCollectionDesign {
             crate::bail_invalid_basis!("term-collection affine offset must be finite");
         }
         Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
+    }
+
+    /// The linear terms whose coefficient carries the REML-selected
+    /// `LinearTermRidge` (`double_penalty=true`), as `(name, block-local range)`
+    /// entries of `linear_ranges`.
+    ///
+    /// Read off the recorded `penaltyinfo` — the block this build actually
+    /// emitted, whose `original_index` is the term's position in
+    /// `linear_ranges` — rather than re-derived from the spec. A ridged slope
+    /// is a variance component with its null on the boundary, so its
+    /// significance is the variance-component score test
+    /// (`inference::random_effect_test`), never a Wald ratio of the shrunk
+    /// estimate.
+    pub fn ridged_linear_ranges(&self) -> Vec<(String, Range<usize>)> {
+        self.penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source) if source == "LinearTermRidge"
+                )
+            })
+            .filter_map(|info| self.linear_ranges.get(info.penalty.original_index))
+            .cloned()
+            .collect()
     }
 
     /// Number of global penalty blocks that precede the smooth-term penalty
@@ -6995,6 +7063,8 @@ fn pca_function_mass_penalty(
     mut raw_score_gram: Array2<f64>,
     n_rows: usize,
 ) -> Result<Array2<f64>, BasisError> {
+    use gam_linalg::faer_ndarray::FaerEigh;
+
     let k = raw_score_gram.ncols();
     if raw_score_gram.nrows() != k {
         crate::bail_dim_basis!(
@@ -7020,22 +7090,41 @@ fn pca_function_mass_penalty(
         crate::bail_invalid_basis!("Pca score design produced a non-finite function Gram");
     }
 
-    // Use the same design-rank convention as the global identifiability audit.
-    // `rrqr_from_gram_with_permutation` recovers the column-pivoted QR verdict
-    // from Z^T Z while retaining the tall design's row-count-aware tolerance.
-    let rrqr = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
-        &raw_score_gram,
-        n_rows,
-        gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
-    )
-    .map_err(BasisError::LinalgError)?;
-    if rrqr.rank != k {
-        let redundant_columns = &rrqr.column_permutation[rrqr.rank..];
+    // Rank of the realized score design, read off the Gram's spectrum against
+    // the Gram's own resolution. `G = ZᵀZ` is accumulated over `n_rows` rows,
+    // each entry product rounding at most twice (the streamed operator forms
+    // `x·w·x`), so its formation error is bounded in spectral norm by
+    // `γ_{n+1}·tr G` ([`gam_linalg::roundoff::weighted_gram_assembly_band`]);
+    // the eigensolver adds its own `k·ε·λ_max`. An eigenvalue inside that band
+    // is not resolved from zero: an exactly dependent score column lands there.
+    //
+    // The pivot magnitudes of a column-pivoted QR run on the Gram's eigen square
+    // root cannot make this call. Squaring floors a true zero singular value at
+    // the Gram's rounding, `≈ ε·σ_max²`, and the square root resurrects it as a
+    // pivot of order `√ε·σ_max`, far above that QR's `O(n·ε)·|R₀₀|` cutoff, so a
+    // duplicated component would pass as full rank whenever its computed
+    // eigenvalue rounded positive.
+    let (eigenvalues, _) = FaerEigh::eigh(&raw_score_gram, faer::Side::Lower)
+        .map_err(BasisError::LinalgError)?;
+    let eigenvalues = eigenvalues.to_vec();
+    let trace: f64 = raw_score_gram.diag().iter().sum();
+    let formation_band = gam_linalg::roundoff::weighted_gram_assembly_band(n_rows, 2, trace);
+    let rank = gam_linalg::roundoff::resolved_eigenvalue_count(&eigenvalues, formation_band);
+    if rank != k {
+        // Name the columns the pivoted order places last: the pivot sequence
+        // depends only on the column geometry, never on a rank cutoff.
+        let pivoted = gam_linalg::faer_ndarray::rrqr_from_gram_with_permutation(
+            &raw_score_gram,
+            n_rows,
+            gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
+        )
+        .map_err(BasisError::LinalgError)?;
+        let redundant_columns = &pivoted.column_permutation[rank..];
         crate::bail_invalid_basis!(
-            "Pca score design is rank deficient under canonical RRQR: rank {} < {} (tolerance {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
-            rrqr.rank,
+            "Pca score design is rank deficient: rank {} < {} (score Gram eigenvalues at or below the resolution band {:.6e}); redundant score columns {:?}; remove zero or dependent components instead of stabilizing them with a coefficient ridge",
+            rank,
             k,
-            rrqr.rank_tol,
+            gam_linalg::roundoff::resolved_eigenvalue_band(&eigenvalues, formation_band),
             redundant_columns
         );
     }
@@ -7293,12 +7382,23 @@ pub(crate) fn build_by_smooth_local(
     by_kind: &ByVarKind,
     workspace: &mut crate::basis::BasisWorkspace,
 ) -> Result<LocalSmoothTermBuild, BasisError> {
+    // A numeric by-variable only rescales the inner rows, so its inner build
+    // decides this term's joint-null rotation and carries the term's frozen
+    // rotation decision (#3001). A factor by-variable derives its rotation on
+    // the level-gated block below, whose chart the inner build does not share.
+    let (inner_rotation, inner_residualization) = match by_kind {
+        ByVarKind::Numeric { .. } => (
+            term.joint_null_rotation.clone(),
+            term.frozen_parametric_residualization.clone(),
+        ),
+        ByVarKind::Factor { .. } => (None, None),
+    };
     let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+        frozen_parametric_residualization: inner_residualization,
         name: term.name.clone(),
         basis: (*smooth).clone(),
         shape: term.shape.clone(),
-        joint_null_rotation: None,
+        joint_null_rotation: inner_rotation,
     };
     let inner = build_single_local_smooth_term(data, &inner_term, workspace)?;
 
@@ -7420,7 +7520,13 @@ pub(crate) fn build_by_smooth_local(
             // joint-null rotation absent. The canonical filter authors matrix,
             // rank, nullity, null basis, and metadata together.
             let filtered = crate::basis::filter_penalty_candidates(candidates)?;
-            let joint_null_rotation = crate::basis::compute_joint_null_rotation(&filtered.active)?;
+            // A frozen parametric residualization is the fit's whole
+            // collection-chart decision, `Q` included (#3001).
+            let joint_null_rotation = match term.joint_null_rotation.clone() {
+                Some(persisted) => Some(persisted),
+                None if term.frozen_parametric_residualization.is_some() => None,
+                None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
+            };
             let mut dropped_penalties = inner.dropped_penalties;
             dropped_penalties.extend(filtered.dropped);
 
@@ -8180,15 +8286,18 @@ pub(crate) fn build_single_local_smooth_term_for(
         if matches!(by, ByVariableSpec::Level { .. }) {
             defer_inner_model_centering_to_factor_level_wrapper(&mut inner_basis);
         }
+        // The inner build is the one that decides this term's joint-null
+        // rotation, so it carries the term's frozen rotation decision: the
+        // persisted `Q` and the frozen residualization that states the fit
+        // applied none (#3001). Row gating only rescales the inner design, so
+        // the inner term needs exactly the penalties the caller needs.
         let inner_term = SmoothTermSpec {
-            frozen_parametric_residualization: None,
+            frozen_parametric_residualization: term.frozen_parametric_residualization.clone(),
             name: term.name.clone(),
             basis: inner_basis,
             shape: term.shape.clone(),
-            joint_null_rotation: None,
+            joint_null_rotation: term.joint_null_rotation.clone(),
         };
-        // Row gating only rescales the inner design, so the inner term needs
-        // exactly the penalties the caller needs.
         let built = build_single_local_smooth_term_for(data, &inner_term, workspace, demand)?;
         return apply_by_variable_to_local_build(built, data, *by_col, by, &term.name);
     }
@@ -8201,9 +8310,12 @@ pub(crate) fn build_single_local_smooth_term_for(
 
     // A frozen chart needs no penalty to place its design: the joint-null
     // rotation is the only penalty-derived design input, and a frozen spec
-    // persists it or has none.
+    // persists it or has none. The condition is the one under which the
+    // rotation below is derived rather than taken from the spec.
     let realize_penalties = demand == SmoothPenaltyDemand::Realize
-        || (term.joint_null_rotation.is_none() && !smooth_has_frozen_identifiability(term));
+        || (term.joint_null_rotation.is_none()
+            && !smooth_has_frozen_identifiability(term)
+            && term.frozen_parametric_residualization.is_none());
     let mut built: BasisBuildResult = match &term.basis {
         SmoothBasisSpec::FactorSumToZero {
             inner,
@@ -8246,22 +8358,42 @@ pub(crate) fn build_single_local_smooth_term_for(
                     term.name
                 );
             }
-            // Split the marginal penalty's null space into its function
-            // components BEFORE the penalty vector is rebuilt below; the
-            // sum-to-zero null-space ridges replicate these into the contrast
-            // space.
+            // The marginal's `double_penalty=` decides whether the deviation
+            // null space is penalized, and that null penalty has exactly ONE
+            // representation here: the pooled `(I + 11ᵀ) ⊗ R_k` ridges below
+            // (#3969). The marginal's own null-space ridge `R` is therefore
+            // never replicated per level. Its function components satisfy
+            // `Σ_k R_k = R` and the per-level structures `E_k` satisfy
+            // `Σ_k E_k = I + 11ᵀ`, so carrying both `E_k ⊗ R` and
+            // `(I + 11ᵀ) ⊗ R_k` would make the total null penalty
+            // `Σ_{k,j} (μ_k + ν_j) E_k ⊗ R_j`, whose smoothing parameters
+            // cannot be identified (`μ_k += c`, `ν_j -= c` leaves it unchanged).
+            let null_space_penalized = inner_built
+                .active_penalties
+                .iter()
+                .any(|penalty| {
+                    matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            // Split the marginal curvature penalty's null space into its
+            // function components BEFORE the penalty vector is rebuilt below;
+            // the sum-to-zero null-space ridges replicate these into the
+            // contrast space.
             let inner_degree = match inner.as_ref() {
                 SmoothBasisSpec::BSpline1D { spec, .. } => Some(spec.degree),
                 _ => None,
             };
-            let inner_null_components = match inner_built.active_penalties.first() {
-                Some(penalty) => factor_smooth_null_component_penalties(
+            let inner_primary = inner_built
+                .active_penalties
+                .iter()
+                .find(|penalty| matches!(penalty.info.source, PenaltySource::Primary));
+            let inner_null_components = match (null_space_penalized, inner_primary) {
+                (true, Some(penalty)) => factor_smooth_null_component_penalties(
                     &penalty.matrix,
                     &inner_built.metadata,
                     inner_degree,
                     &term.name,
                 )?,
-                None => Vec::new(),
+                _ => Vec::new(),
             };
             let base = inner_built
                 .design
@@ -8360,8 +8492,15 @@ pub(crate) fn build_single_local_smooth_term_for(
                     }
                     s_big
                 };
-            for base_penalty in &inner_built.active_penalties {
-                // Emit `L` independent per-level blocks for this marginal penalty.
+            let curvature_penalties = inner_built
+                .active_penalties
+                .iter()
+                .filter(|penalty| {
+                    !matches!(penalty.info.source, PenaltySource::DoublePenaltyNullspace)
+                });
+            for base_penalty in curvature_penalties {
+                // Emit `L` independent per-level blocks for this marginal
+                // curvature penalty (the null-space ridge is pooled below).
                 for which_level in 0..=l_minus_one {
                     let raw = stz_per_group_penalty(&base_penalty.matrix, which_level);
                     let (s_big, group_scale) = normalize_penalty_in_constrained_space(&raw)?;
@@ -8392,7 +8531,10 @@ pub(crate) fn build_single_local_smooth_term_for(
             // contrast space, so the constraint (and the identifiability of `sz`
             // vs `fs`) is preserved. The split is made with the marginal's
             // function metric, so which deviations each `λ` shrinks does not
-            // depend on the coefficient chart (SPEC rule 5).
+            // depend on the coefficient chart (SPEC rule 5). The components are
+            // empty unless the marginal requests its null-space penalty
+            // (`double_penalty=`, on by default), so `double_penalty=false`
+            // really leaves the deviation null space unpenalized.
             for p_k in &inner_null_components {
                 // Null ridges stay POOLED (the `(I + 11ᵀ) ⊗ R_k` form): each is
                 // one shared variance for that null component of every level's
@@ -8971,9 +9113,13 @@ pub(crate) fn build_single_local_smooth_term_for(
     // coefficient chart in their `FrozenTransform`; recomputing Q there would
     // rotate an already-frozen chart a second time and desynchronize value
     // rebuilds from derivative operators.
+    // A frozen parametric residualization is the fit's whole collection-chart
+    // decision, `Q` included: its spec carries the fit's rotation, so an absent
+    // one means the fit applied none (#3001).
     let joint_null_rotation = match term.joint_null_rotation.clone() {
         Some(persisted) => Some(persisted),
         None if smooth_has_frozen_identifiability(term) => None,
+        None if term.frozen_parametric_residualization.is_some() => None,
         None => crate::basis::compute_joint_null_rotation(&filtered.active)?,
     };
 

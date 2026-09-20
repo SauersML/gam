@@ -1,12 +1,5 @@
 use super::*;
 
-pub(crate) fn load_dataset_projected(
-    path: &Path,
-    requested_columns: &[String],
-) -> Result<Dataset, gam::data::DataError> {
-    load_dataset_auto_projected(path, requested_columns)
-}
-
 /// Collect the columns a parsed formula uses in a *factor-by-construction*
 /// role, so the untyped CSV/TSV/parquet-numeric loader can force them to a
 /// categorical encoding (the role-based analogue of the typed-frame

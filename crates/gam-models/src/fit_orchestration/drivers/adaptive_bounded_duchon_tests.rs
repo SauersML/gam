@@ -958,8 +958,8 @@ mod adaptive_bounded_duchon_tests {
             bounded_prior_terms(theta, &BoundedCoefficientPriorSpec::Beta { a: 2.0, b: 3.0 })
                 .expect("tail prior geometry");
         let jet = logit_inverse_link_jet5(theta);
-        let expected_value = -2.0 * gam_linalg::utils::stable_softplus(-theta)
-            - 3.0 * gam_linalg::utils::stable_softplus(theta);
+        let expected_value = -2.0 * gam_math::special::softplus(-theta)
+            - 3.0 * gam_math::special::softplus(theta);
         assert_eq!(terms.0, expected_value);
         assert_eq!(terms.2, 5.0 * jet.d1);
         assert_eq!(terms.3, 5.0 * jet.d2);

@@ -6,7 +6,7 @@
 //! `super::` references resolve to the parent `basis` module's Duchon
 //! partial-fraction helpers.
 
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 use gam_math::special::binomial_coefficient_f64 as binomial_f64;
 use statrs::function::gamma::{gamma as gamma_fn, ln_gamma};
 use std::sync::OnceLock;
@@ -121,7 +121,7 @@ pub(crate) fn stable_hybrid_duchon_radial(
         ln_gamma(p_eff as f64) + ln_gamma(q_eff as f64) - ln_gamma((p_eff + q_eff) as f64);
     let inv_beta = (-log_beta).exp();
 
-    let mut accum = vec![KahanSum::default(); max_order + 1];
+    let mut accum = vec![CompensatedSum::default(); max_order + 1];
     for (xi, wi) in nodes.iter().zip(weights.iter()) {
         // Map [-1, 1] -> [0, 1] via u = (1 + ξ)/2; Jacobian du/dξ = 1/2.
         let u = 0.5 * (1.0 + xi);
@@ -140,7 +140,7 @@ pub(crate) fn stable_hybrid_duchon_radial(
             accum[k].add(weight * v);
         }
     }
-    accum.iter().map(|acc| inv_beta * acc.sum()).collect()
+    accum.iter().map(|acc| inv_beta * acc.value()).collect()
 }
 
 /// κ-partials of [`stable_hybrid_duchon_radial`], differentiated under the same
@@ -174,7 +174,10 @@ fn stable_hybrid_duchon_radial_kappa_partial(
 ) -> Vec<f64> {
     assert!(m >= 1, "stable_hybrid_duchon_radial_kappa_partial: m ≥ 1");
     assert!(s >= 1, "stable_hybrid_duchon_radial_kappa_partial: s ≥ 1");
-    assert!(kappa > 0.0, "stable_hybrid_duchon_radial_kappa_partial: κ > 0");
+    assert!(
+        kappa > 0.0,
+        "stable_hybrid_duchon_radial_kappa_partial: κ > 0"
+    );
     assert!(r > 0.0, "stable_hybrid_duchon_radial_kappa_partial: r > 0");
     assert!(
         max_order <= 6,
@@ -198,7 +201,7 @@ fn stable_hybrid_duchon_radial_kappa_partial(
         ln_gamma(p_eff as f64) + ln_gamma(q_eff as f64) - ln_gamma((p_eff + q_eff) as f64);
     let inv_beta = (-log_beta).exp();
 
-    let mut accum = vec![KahanSum::default(); max_order + 1];
+    let mut accum = vec![CompensatedSum::default(); max_order + 1];
     for (xi, wi) in nodes.iter().zip(weights.iter()) {
         // The same node map and weight as the value, times the `u²` the chain
         // rule brings down from `κ_u = u·κ`.
@@ -227,7 +230,7 @@ fn stable_hybrid_duchon_radial_kappa_partial(
             }
         }
     }
-    accum.iter().map(|acc| inv_beta * acc.sum()).collect()
+    accum.iter().map(|acc| inv_beta * acc.value()).collect()
 }
 
 pub(crate) fn factorial_f64(n: usize) -> f64 {
@@ -324,7 +327,11 @@ pub(crate) fn bessel_k_temme(mu: f64, x: f64) -> (f64, f64) {
     let fact = if pimu == 0.0 { 1.0 } else { pimu / pimu.sin() };
     let dlog = -half_x.ln();
     let sigma = mu * dlog;
-    let fact2 = if sigma == 0.0 { 1.0 } else { sigma.sinh() / sigma };
+    let fact2 = if sigma == 0.0 {
+        1.0
+    } else {
+        sigma.sinh() / sigma
+    };
     let (gam1, gam2, gampl, gammi) = bessel_k_beschb(mu);
     let mut ff = fact * (gam1 * sigma.cosh() + gam2 * fact2 * dlog);
     let mut sum = ff;
@@ -515,7 +522,7 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
         "matern kernel derivative supports kappa_derivative_order <= 2: order={kappa_derivative_order}"
     );
 
-    let mut total = vec![KahanSum::default(); max_order + 1];
+    let mut total = vec![CompensatedSum::default(); max_order + 1];
     // `Σ|terms|` per output order, tracked alongside the compensated `Σ terms`
     // because the truncation band below is charged on the terms and not on
     // their (alternating, cancelling) total.
@@ -637,7 +644,7 @@ pub(crate) fn duchon_small_chi_riesz_series_radial_derivatives(
         return vec![f64::NAN; total.len()];
     }
 
-    total.iter().map(|acc| acc.sum()).collect()
+    total.iter().map(|acc| acc.value()).collect()
 }
 
 /// Bundled value + first/second derivatives of the anisotropic pair-block
@@ -1377,7 +1384,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon(
     }
 
     let kappa_sq = kappa * kappa;
-    let mut total_acc = vec![KahanSum::default(); max_order + 1];
+    let mut total_acc = vec![CompensatedSum::default(); max_order + 1];
     for j in 1..=a {
         let sign = if (a - j).is_multiple_of(2) { 1.0 } else { -1.0 };
         let binom = binomial_f64(a + b - j - 1, a - j);
@@ -1398,7 +1405,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon(
             total_acc[k].add(term);
         }
     }
-    total_acc.iter().map(|acc| acc.sum()).collect()
+    total_acc.iter().map(|acc| acc.value()).collect()
 }
 
 /// Radial-form bare anisotropic Duchon pair-block penalty
@@ -1732,7 +1739,7 @@ pub(crate) fn bessel_shape_origin_reduced(nu: f64, z: f64) -> f64 {
         }
     }
     let quarter = 0.25 * z * z;
-    let mut total = KahanSum::default();
+    let mut total = CompensatedSum::default();
     if nu.fract() == 0.0 {
         let n = nu as usize;
         // Regular part, k = 1..n−1: 2^{n−1} (n−k−1)! (−z²/4)^k / k!.
@@ -1752,7 +1759,7 @@ pub(crate) fn bessel_shape_origin_reduced(nu: f64, z: f64) -> f64 {
                 - log_half;
             let contribution = sign * weight * bracket;
             total.add(contribution);
-            if contribution.abs() <= f64::EPSILON * total.sum().abs() || k >= 200 {
+            if contribution.abs() <= f64::EPSILON * total.value().abs() || k >= 200 {
                 break;
             }
             weight *= quarter / ((k + 1) as f64 * (n + k + 1) as f64);
@@ -1765,24 +1772,30 @@ pub(crate) fn bessel_shape_origin_reduced(nu: f64, z: f64) -> f64 {
         loop {
             term *= -quarter / (k as f64 * (nu - k as f64));
             total.add(term);
-            if (k as f64 > nu && term.abs() <= f64::EPSILON * total.sum().abs()) || k >= 400 {
+            if (k as f64 > nu && term.abs() <= f64::EPSILON * total.value().abs()) || k >= 400 {
                 break;
             }
             k += 1;
         }
         // z^{2ν} part: π / (2 sin νπ) = ±π/2 for half-integer ν.
-        let sin_sign = if ((nu - 0.5) as i64) % 2 == 0 { 1.0 } else { -1.0 };
-        let mut weight = -0.5 * std::f64::consts::PI * sin_sign
+        let sin_sign = if ((nu - 0.5) as i64) % 2 == 0 {
+            1.0
+        } else {
+            -1.0
+        };
+        let mut weight = -0.5
+            * std::f64::consts::PI
+            * sin_sign
             * (2.0 * z.ln() * nu - nu * std::f64::consts::LN_2 - ln_gamma(nu + 1.0)).exp();
         for k in 0.. {
             total.add(weight);
-            if weight.abs() <= f64::EPSILON * total.sum().abs() || k >= 200 {
+            if weight.abs() <= f64::EPSILON * total.value().abs() || k >= 200 {
                 break;
             }
             weight *= quarter / ((k + 1) as f64 * (k as f64 + nu + 1.0));
         }
     }
-    total.sum()
+    total.value()
 }
 
 /// The shifted radial channels `Q_0, …, Q_{2q+2}` of one gated hybrid pair
@@ -1813,10 +1826,9 @@ impl ReducedPairChannels {
         let p_eff = 2 * self.m;
         let q_eff = 2 * self.s;
         let order = (p_eff + q_eff) as f64;
-        let inv_beta =
-            (ln_gamma(order) - ln_gamma(p_eff as f64) - ln_gamma(q_eff as f64)).exp();
+        let inv_beta = (ln_gamma(order) - ln_gamma(p_eff as f64) - ln_gamma(q_eff as f64)).exp();
         let (nodes, weights) = gauss_legendre_64();
-        let mut accum = vec![KahanSum::default(); highest + 1];
+        let mut accum = vec![CompensatedSum::default(); highest + 1];
         for (xi, wi) in nodes.iter().zip(weights.iter()) {
             let u = 0.5 * (1.0 + xi);
             if u <= 0.0 || u >= 1.0 {
@@ -1847,7 +1859,7 @@ impl ReducedPairChannels {
                 if j < self.q {
                     0.0
                 } else {
-                    (-2.0 * std::f64::consts::PI).powi(j as i32) * inv_beta * accum[j].sum()
+                    (-2.0 * std::f64::consts::PI).powi(j as i32) * inv_beta * accum[j].value()
                 }
             })
             .collect()
@@ -2080,7 +2092,6 @@ pub(crate) fn reduced_g_q_hessian(
     }
 }
 
-
 pub(crate) fn aniso_invariants_with_powers(
     powers: &AnisoMetricPowers,
     r: &[f64],
@@ -2226,7 +2237,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon_kappa_partial(
     }
 
     let kappa_sq = kappa * kappa;
-    let mut total = vec![KahanSum::default(); max_order + 1];
+    let mut total = vec![CompensatedSum::default(); max_order + 1];
 
     // Riesz piece: A_j'(κ) = -(2 n_j / κ) · A_j(κ).
     for j in 1..=a {
@@ -2257,7 +2268,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon_kappa_partial(
         }
     }
 
-    total.iter().map(|acc| acc.sum()).collect()
+    total.iter().map(|acc| acc.value()).collect()
 }
 
 /// Second κ-partial of `radial_derivatives_of_isotropic_duchon`: returns
@@ -2302,7 +2313,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
     }
 
     let kappa_sq = kappa * kappa;
-    let mut total = vec![KahanSum::default(); max_order + 1];
+    let mut total = vec![CompensatedSum::default(); max_order + 1];
 
     for j in 1..=a {
         let n_j = a + b - j;
@@ -2345,7 +2356,7 @@ pub(crate) fn radial_derivatives_of_isotropic_duchon_kappa_partial2(
         }
     }
 
-    total.iter().map(|acc| acc.sum()).collect()
+    total.iter().map(|acc| acc.value()).collect()
 }
 
 /// Value `g_q` and its partial derivatives w.r.t. the invariants
@@ -2698,9 +2709,7 @@ pub(crate) fn pair_block_radial_with_j_second_derivatives_with_powers(
         .map(|s_int| ReducedPairChannels::new(q, d, m, s_int, kappa));
     let fr = match &reduced {
         Some(channels) => channels.values(big_r),
-        None => {
-            radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h)
-        }
+        None => radial_derivatives_of_isotropic_duchon(d, m, (s) as f64, kappa, big_r, max_order_h),
     };
     let (reduced_first, reduced_second) = reduced
         .as_ref()
@@ -2982,18 +2991,30 @@ mod tests {
     pub(crate) fn pure_duchon_self_pair_is_zero_above_the_uv_exponent_in_the_log_case_2469() {
         let eta = [0.0_f64; 6];
         // d = 6, m = 2, s = 1, q = 2: p = 6 > 4, even d, the log case.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 1.0, &eta), Some(0.0));
+        assert_eq!(
+            super::pure_duchon_self_pair_value(2, 6, 2, 1.0, &eta),
+            Some(0.0)
+        );
         // d = 8, m = 2, s = 1, q = 2: p = 4 = 2q, the log divergence.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 8, 2, 1.0, &[0.0_f64; 8]), None);
+        assert_eq!(
+            super::pure_duchon_self_pair_value(2, 8, 2, 1.0, &[0.0_f64; 8]),
+            None
+        );
         // The κ = 0 radial chain approaches that zero from R > 0.
         let powers = super::AnisoMetricPowers::new(&eta);
         let magnitude_at = |r: f64| {
             let mut lag = [0.0_f64; 6];
             lag[0] = r;
-            super::anisotropic_duchon_penalty_radial_with_powers(2, 2, 1.0, 0.0, &eta, &powers, &lag)
-                .abs()
+            super::anisotropic_duchon_penalty_radial_with_powers(
+                2, 2, 1.0, 0.0, &eta, &powers, &lag,
+            )
+            .abs()
         };
-        let (coarse, middle, fine) = (magnitude_at(1.0e-2), magnitude_at(1.0e-3), magnitude_at(1.0e-4));
+        let (coarse, middle, fine) = (
+            magnitude_at(1.0e-2),
+            magnitude_at(1.0e-3),
+            magnitude_at(1.0e-4),
+        );
         assert!(
             fine < middle && middle < coarse,
             "|g_2(R)| must shrink toward the zero self-pair: R=1e-2 {coarse:e}, 1e-3 {middle:e}, 1e-4 {fine:e}"
@@ -3008,18 +3029,30 @@ mod tests {
     pub(crate) fn pure_duchon_self_pair_is_exactly_zero_for_fractional_s_3545() {
         let eta = [0.0_f64; 6];
         // d = 6, m = 2, s = 1.5, q = 2: p = 8 > 4.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 1.5, &eta), Some(0.0));
+        assert_eq!(
+            super::pure_duchon_self_pair_value(2, 6, 2, 1.5, &eta),
+            Some(0.0)
+        );
         // d = 6, m = 2, s = 0.25, q = 2: p = 3 < 4, a negative power of R.
-        assert_eq!(super::pure_duchon_self_pair_value(2, 6, 2, 0.25, &eta), None);
+        assert_eq!(
+            super::pure_duchon_self_pair_value(2, 6, 2, 0.25, &eta),
+            None
+        );
         // The κ = 0 radial chain approaches that zero from R > 0 (∝ R^4).
         let powers = super::AnisoMetricPowers::new(&eta);
         let magnitude_at = |r: f64| {
             let mut lag = [0.0_f64; 6];
             lag[0] = r;
-            super::anisotropic_duchon_penalty_radial_with_powers(2, 2, 1.5, 0.0, &eta, &powers, &lag)
-                .abs()
+            super::anisotropic_duchon_penalty_radial_with_powers(
+                2, 2, 1.5, 0.0, &eta, &powers, &lag,
+            )
+            .abs()
         };
-        let (coarse, middle, fine) = (magnitude_at(1.0e-2), magnitude_at(1.0e-3), magnitude_at(1.0e-4));
+        let (coarse, middle, fine) = (
+            magnitude_at(1.0e-2),
+            magnitude_at(1.0e-3),
+            magnitude_at(1.0e-4),
+        );
         assert!(
             fine < middle && middle < coarse,
             "|g_2(R)| must shrink toward the zero self-pair: R=1e-2 {coarse:e}, 1e-3 {middle:e}, 1e-4 {fine:e}"
@@ -3253,7 +3286,9 @@ mod origin_reduced_pair_tests {
     #[test]
     fn bessel_shape_origin_reduced_matches_the_half_order_closed_form() {
         let root = (0.5 * std::f64::consts::PI).sqrt();
-        for &z in &[1e-6_f64, 1e-3, 0.05, 0.3, 0.69, 0.7, 1.0, 1.5, 3.0, 9.0, 40.0] {
+        for &z in &[
+            1e-6_f64, 1e-3, 0.05, 0.3, 0.69, 0.7, 1.0, 1.5, 3.0, 9.0, 40.0,
+        ] {
             let reduced = bessel_shape_origin_reduced(0.5, z);
             let exact = root * (-z).exp_m1();
             let rel = (reduced - exact).abs() / exact.abs();
@@ -3286,10 +3321,13 @@ mod origin_reduced_pair_tests {
             (2, 2, 3, 11, 0.8),
         ] {
             assert!(
-                reduced_pair_channels_apply(q, m, s as f64, kappa, d, PairOrigin::Reduced).is_some(),
+                reduced_pair_channels_apply(q, m, s as f64, kappa, d, PairOrigin::Reduced)
+                    .is_some(),
                 "q={q} m={m} s={s} d={d} must be a gated hybrid order"
             );
-            let eta: Vec<f64> = (0..d).map(|axis| 0.15 * (1.3 * axis as f64).sin()).collect();
+            let eta: Vec<f64> = (0..d)
+                .map(|axis| 0.15 * (1.3 * axis as f64).sin())
+                .collect();
             let powers = AnisoMetricPowers::new(&eta);
             let self_pair = components(
                 &analytic_self_pair_bundle(q, m, s, kappa, &eta)
@@ -3322,7 +3360,10 @@ mod origin_reduced_pair_tests {
                 worst.0, worst.1, worst.2
             );
             if worst.0 > 5e-11 {
-                failures.push(format!("q={q} m={m} s={s} d={d} κ={kappa}: {:.3e}", worst.0));
+                failures.push(format!(
+                    "q={q} m={m} s={s} d={d} κ={kappa}: {:.3e}",
+                    worst.0
+                ));
             }
         }
         assert!(

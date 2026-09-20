@@ -92,10 +92,16 @@ fn squared_distance(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
 /// present if either endpoint chose the other), then bridged to a single connected
 /// component so every landmark reaches every row and no geodesic is infinite.
 ///
-/// Bridging is deterministic: while more than one component remains, the globally
-/// shortest edge joining two distinct components (ties by `(min_row, max_row)`) is
-/// added. This restores connectivity using the true nearest cross-component pair,
-/// so a graph that is already connected is returned untouched.
+/// Bridging is deterministic: the added edges are the minimum spanning tree of
+/// the component graph under the strict order `(squared distance, min_row,
+/// max_row)`, so connectivity is restored through the true nearest
+/// cross-component pairs, and a graph that is already connected is returned
+/// untouched. Because that order is strict, the spanning tree is unique. Each
+/// Borůvka pass joins every component to its own nearest other component, which
+/// at least halves the component count. So `C` components cost `⌈log₂ C⌉`
+/// all-pairs scans, rather than the `C − 1` scans of adding one global-minimum
+/// edge at a time. Both methods yield that same unique tree, so the graph is
+/// bit-identical to the one-edge-per-scan result.
 pub(crate) fn deterministic_knn_graph(z: ArrayView2<'_, f64>, k: usize) -> Vec<Vec<(usize, f64)>> {
     let n = z.nrows();
     let mut adj: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
@@ -114,8 +120,17 @@ pub(crate) fn deterministic_knn_graph(z: ArrayView2<'_, f64>, k: usize) -> Vec<V
                 dists.push((squared_distance(z, i, j), j));
             }
         }
-        dists.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        for &(dist2, j) in dists.iter().take(k) {
+        // Only the `k` nearest are kept: partition them out in linear time and
+        // order just that prefix. `(distance, index)` is a strict total order,
+        // so the prefix is the same set in the same order a full sort yields.
+        let by_distance_then_index =
+            |a: &(f64, usize), b: &(f64, usize)| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1));
+        let keep = k.min(dists.len());
+        if keep > 0 && keep < dists.len() {
+            dists.select_nth_unstable_by(keep - 1, by_distance_then_index);
+        }
+        dists[..keep].sort_unstable_by(by_distance_then_index);
+        for &(dist2, j) in &dists[..keep] {
             let key = (i.min(j), i.max(j));
             edges.entry(key).or_insert_with(|| dist2.sqrt());
         }
@@ -137,33 +152,49 @@ pub(crate) fn deterministic_knn_graph(z: ArrayView2<'_, f64>, k: usize) -> Vec<V
             parent[ra.max(rb)] = ra.min(rb);
         }
     }
+    // Borůvka passes: every component records its nearest outgoing pair under the
+    // strict order `(d², i, j)`. Pairs are scanned in ascending `(i, j)`, and a
+    // candidate replaces the incumbent only when strictly closer, so the first
+    // minimum is kept and it is the lexicographic minimum. Under a strict edge
+    // order every such pick is an edge of the unique minimum spanning tree, so
+    // the whole batch is added at once. Passes ≤ ⌈log₂ #components⌉.
     loop {
-        // Best bridging edge per unordered component pair does not need tracking;
-        // a single global-minimum inter-component edge per pass suffices and is
-        // deterministic (ties by (i, j)). Passes ≤ #components − 1.
-        let mut best: Option<(f64, usize, usize)> = None;
+        let roots: Vec<usize> = (0..n).map(|x| find(&mut parent, x)).collect();
+        let mut nearest: Vec<Option<(f64, usize, usize)>> = vec![None; n];
         for i in 0..n {
-            let ri = find(&mut parent, i);
+            let ri = roots[i];
             for j in (i + 1)..n {
-                if find(&mut parent, j) == ri {
+                let rj = roots[j];
+                if rj == ri {
                     continue;
                 }
                 let d2 = squared_distance(z, i, j);
-                let better = match best {
-                    None => true,
-                    Some((bd, _, _)) => d2 < bd,
-                };
-                if better {
-                    best = Some((d2, i, j));
+                for root in [ri, rj] {
+                    let closer = match nearest[root] {
+                        None => true,
+                        Some((bd, _, _)) => d2.total_cmp(&bd) == Ordering::Less,
+                    };
+                    if closer {
+                        nearest[root] = Some((d2, i, j));
+                    }
                 }
             }
         }
-        match best {
-            None => break, // single component
-            Some((d2, i, j)) => {
+        let mut bridges: Vec<(f64, usize, usize)> = nearest.into_iter().flatten().collect();
+        if bridges.is_empty() {
+            break; // single component
+        }
+        bridges.sort_unstable_by(|a, b| {
+            a.0.total_cmp(&b.0)
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.2.cmp(&b.2))
+        });
+        bridges.dedup_by(|a, b| a.1 == b.1 && a.2 == b.2);
+        for (d2, i, j) in bridges {
+            let ri = find(&mut parent, i);
+            let rj = find(&mut parent, j);
+            if ri != rj {
                 edges.insert((i, j), d2.sqrt());
-                let ri = find(&mut parent, i);
-                let rj = find(&mut parent, j);
                 parent[ri.max(rj)] = ri.min(rj);
             }
         }
@@ -512,6 +543,109 @@ mod tests {
         assert_eq!(embed[[0, 0]], -5.0);
         assert_eq!(embed[[1, 0]], 5.0);
         assert_eq!(embed[[0, 0]] + embed[[1, 0]], 0.0);
+    }
+
+    /// The Borůvka bridging must produce exactly the graph of the one-edge-per-scan
+    /// reference (full sort, then add the global-minimum cross-component edge until
+    /// connected). The data are well-separated clusters with a small `k`, so the
+    /// kNN graph starts with many components.
+    #[test]
+    fn knn_graph_bridging_matches_one_edge_per_scan_reference() {
+        fn reference(z: ArrayView2<'_, f64>, k: usize) -> Vec<Vec<(usize, f64)>> {
+            let n = z.nrows();
+            let k = k.min(n.saturating_sub(1)).max(1);
+            let mut edges = std::collections::BTreeMap::new();
+            for i in 0..n {
+                let mut dists: Vec<(f64, usize)> = (0..n)
+                    .filter(|&j| j != i)
+                    .map(|j| (squared_distance(z, i, j), j))
+                    .collect();
+                dists.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+                for &(dist2, j) in dists.iter().take(k) {
+                    edges
+                        .entry((i.min(j), i.max(j)))
+                        .or_insert_with(|| dist2.sqrt());
+                }
+            }
+            let mut comp: Vec<usize> = (0..n).collect();
+            let relabel = |comp: &mut Vec<usize>, from: usize, to: usize| {
+                for c in comp.iter_mut() {
+                    if *c == from {
+                        *c = to;
+                    }
+                }
+            };
+            for &(a, b) in edges.keys() {
+                let (ca, cb) = (comp[a], comp[b]);
+                if ca != cb {
+                    relabel(&mut comp, ca.max(cb), ca.min(cb));
+                }
+            }
+            loop {
+                let mut best: Option<(f64, usize, usize)> = None;
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        if comp[i] == comp[j] {
+                            continue;
+                        }
+                        let d2 = squared_distance(z, i, j);
+                        if best.is_none_or(|(bd, _, _)| d2 < bd) {
+                            best = Some((d2, i, j));
+                        }
+                    }
+                }
+                let Some((d2, i, j)) = best else { break };
+                edges.insert((i, j), d2.sqrt());
+                let (ci, cj) = (comp[i], comp[j]);
+                relabel(&mut comp, ci.max(cj), ci.min(cj));
+            }
+            let mut adj = vec![Vec::new(); n];
+            for (&(a, b), &w) in &edges {
+                adj[a].push((b, w));
+                adj[b].push((a, w));
+            }
+            adj
+        }
+
+        // Nine tight 4-point clusters on an irregular 3-D layout: k = 2 keeps
+        // every cluster its own component, so bridging joins nine components.
+        let centers = [
+            [0.0, 0.0, 0.0],
+            [7.0, 1.0, 0.5],
+            [2.5, 9.0, -1.0],
+            [-6.0, 3.5, 2.0],
+            [11.0, 8.0, 3.0],
+            [-3.0, -8.0, 1.5],
+            [5.0, -4.5, -6.0],
+            [-9.5, -2.0, -4.0],
+            [1.0, 4.0, 10.0],
+        ];
+        let offsets = [
+            [0.0, 0.0, 0.0],
+            [0.11, 0.0, 0.02],
+            [0.0, 0.13, 0.05],
+            [0.07, 0.09, 0.17],
+        ];
+        let mut z = Array2::<f64>::zeros((centers.len() * offsets.len(), 3));
+        for (ci, c) in centers.iter().enumerate() {
+            for (oi, o) in offsets.iter().enumerate() {
+                for axis in 0..3 {
+                    z[[ci * offsets.len() + oi, axis]] = c[axis] + o[axis];
+                }
+            }
+        }
+        for k in 1..=4 {
+            assert_eq!(
+                deterministic_knn_graph(z.view(), k),
+                reference(z.view(), k),
+                "bridged kNN graph must equal the one-edge-per-scan reference at k = {k}"
+            );
+        }
+        // A single row has no neighbour to keep and nothing to bridge.
+        assert_eq!(
+            deterministic_knn_graph(z.slice(ndarray::s![0..1, ..]), 3),
+            vec![Vec::new()]
+        );
     }
 
     /// Determinism doctrine: the embedding is bit-identical run-to-run.

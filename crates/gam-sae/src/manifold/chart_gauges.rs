@@ -50,39 +50,12 @@ impl SaeManifoldTerm {
             // translation + scale gauge orbit on its tangent coordinate (its
             // constant column carries the translation gauge, its `t` column
             // the scale gauge), so it deflates the same step-gauge vectors.
+            // The Duchon sheet is a flat Euclidean chart as well and carries
+            // the identical translation + per-axis scale menu.
             SaeAtomBasisKind::Linear
             | SaeAtomBasisKind::EuclideanPatch
-            | SaeAtomBasisKind::Poincare => {
-                for axis in 0..d {
-                    let mut field = Array2::<f64>::zeros((n, d));
-                    field.column_mut(axis).fill(1.0);
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        field.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
-                    }
-                }
-                for axis in 0..d {
-                    let mut field = Array2::<f64>::zeros((n, d));
-                    for row in 0..n {
-                        field[[row, axis]] = coords[[row, axis]];
-                    }
-                    if let Some(g) = self.dense_step_gauge_vector_from_field(
-                        atom_idx,
-                        field.view(),
-                        &coord_offsets,
-                        &beta_offsets,
-                        total_len,
-                    )? {
-                        out.push(g);
-                    }
-                }
-            }
-            SaeAtomBasisKind::Duchon => {
+            | SaeAtomBasisKind::Poincare
+            | SaeAtomBasisKind::Duchon => {
                 for axis in 0..d {
                     let mut field = Array2::<f64>::zeros((n, d));
                     field.column_mut(axis).fill(1.0);
@@ -285,70 +258,6 @@ impl SaeManifoldTerm {
         Ok(dense.to_owned())
     }
 
-    /// Orthonormal analytic chart-gauge basis in one assembled arrow layout.
-    /// Both dense exact-A quotient geometry and matrix-free arrow consumers use
-    /// this basis, so the physical subspace cannot depend on representation.
-    pub(crate) fn joint_chart_gauge_basis_for_arrow_layout(
-        &self,
-        row_offsets: &[usize],
-        border_dim: usize,
-        owner: &str,
-    ) -> Result<Vec<Array1<f64>>, String> {
-        let mut basis = Vec::<Array1<f64>>::new();
-        // #2653 — a BORDER-dimension disagreement is not a stale layout, it is a
-        // different chart. Hard TopK compaction drops inactive per-row coordinate
-        // BLOCKS and retains the decoder border unchanged, so a genuine
-        // full-to-compact map always agrees on the border; only the row widths
-        // move (the filed 132 -> 84 case). When the border itself differs, this
-        // operator is not a compaction of the joint chart at all and the
-        // closed-form chart gauges simply do not live in its space. That is the
-        // "no matching gauge" condition the caller already diagnoses as
-        // `NonIdentifiable` — reporting it as an internal invariant error instead
-        // converts a legitimate, more specific refusal into a bug report
-        // (regression: `outer_gradient_solver_rejects_near_singular_cache_without_matching_gauge`
-        // saw `arrow border dimension 1 != term border dimension 3`).
-        // Row-layout disagreement stays a typed invariant error below, because
-        // there the gauge IS mappable and silently skipping it would put an
-        // analytic chart null back into the physical spectrum.
-        if border_dim != self.factored_border_dim() {
-            return Ok(Vec::new());
-        }
-        let mut orthogonality_defect = 0.0_f64;
-        for dense in self.dense_step_gauge_vectors()? {
-            let mut gauge = self.dense_joint_vector_in_arrow_layout(
-                dense.view(),
-                row_offsets,
-                border_dim,
-                owner,
-            )?;
-            let original_norm = gauge.dot(&gauge).max(0.0).sqrt();
-            if !(original_norm.is_finite() && original_norm > 0.0) {
-                continue;
-            }
-            // Two-pass MGS gives the same stable quotient basis to the dense and
-            // matrix-free paths. A dependent candidate leaves only rounding: two
-            // passes over `k` bases stay inside `2k·(γ_{N+4} + Σω)·‖g₀‖` (as in 10347d95e).
-            for _ in 0..2 {
-                for kept in &basis {
-                    let coefficient = gauge.dot(kept);
-                    gauge.scaled_add(-coefficient, kept);
-                }
-            }
-            let residual_norm = gauge.dot(&gauge).max(0.0).sqrt();
-            let growth = gam_linalg::roundoff::accumulation_growth(gauge.len() + 4);
-            let band = 2.0 * basis.len() as f64 * (growth + orthogonality_defect);
-            if !(residual_norm.is_finite()
-                && residual_norm > band * original_norm)
-            {
-                continue;
-            }
-            orthogonality_defect += band * original_norm / residual_norm;
-            gauge.mapv_inplace(|value| value / residual_norm);
-            basis.push(gauge);
-        }
-        Ok(basis)
-    }
-
     /// The design `a·Φ` that atom `atom_idx`'s decoder compensation `δβ` is solved
     /// against: one row per observation, zero where the atom is inactive.
     fn atom_compensation_design(&self, atom_idx: usize) -> Result<Array2<f64>, String> {
@@ -534,8 +443,10 @@ impl SaeManifoldTerm {
                     ) {
                         continue;
                     }
+                    // The Killing field is an ambient 3-vector; every component is
+                    // part of the orbit direction the evidence factor qualifies.
                     let mut rotation = Array1::<f64>::zeros(q_row);
-                    for axis in 0..2 {
+                    for axis in 0..3 {
                         rotation[coord_start + axis] = direction[axis];
                     }
                     row_dirs.push(rotation);
@@ -640,5 +551,53 @@ impl SaeManifoldTerm {
             }
         }
         Ok(Some(gauge))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manifold::tests_gauge_posterior_flatness_2720::{
+        planted_circle_cloud, seeded_term_of_kind,
+    };
+
+    /// Every per-row sphere deflation candidate must be the whole ambient Killing
+    /// field `e_g × u` at that row's cover point, not a truncation of it: only the
+    /// full field is tangent to the sphere and hence an orbit direction.
+    #[test]
+    fn sphere_row_gauge_deflations_are_full_killing_fields() {
+        let target = planted_circle_cloud();
+        let term = seeded_term_of_kind(target.view(), "sphere", 2);
+        assert!(matches!(
+            term.atoms[0].basis_kind(),
+            SaeAtomBasisKind::Sphere
+        ));
+        let coords = term.assignment.coords[0].as_matrix();
+        let start = term.assignment.coord_offsets()[0];
+        let deflation = term
+            .row_gauge_deflation_for_layout(None)
+            .expect("row gauge deflation")
+            .expect("a seeded sphere atom declares row gauge candidates");
+        let mut checked = 0usize;
+        let mut third_component_exercised = false;
+        for (row, directions) in deflation.directions.iter().enumerate() {
+            let u = [coords[[row, 0]], coords[[row, 1]], coords[[row, 2]]];
+            let killing = ambient_sphere_killing_directions(u);
+            for direction in directions {
+                let candidate = [direction[start], direction[start + 1], direction[start + 2]];
+                assert!(
+                    killing.iter().any(|field| field == &candidate),
+                    "row {row}: candidate {candidate:?} is not one of the Killing fields {killing:?}"
+                );
+                let tangency: f64 = (0..3).map(|axis| candidate[axis] * u[axis]).sum();
+                let magnitude: f64 = (0..3).map(|axis| (candidate[axis] * u[axis]).abs()).sum();
+                assert!(tangency.abs() <= 8.0*f64::EPSILON*magnitude,
+                    "sphere orbit direction must be tangent: {candidate:?} at {u:?}");
+                third_component_exercised |= candidate[2] != 0.0;
+                checked += 1;
+            }
+        }
+        assert!(checked > 0, "no sphere row gauge candidate was emitted");
+        assert!(third_component_exercised, "fixture must exercise the missing third component");
     }
 }

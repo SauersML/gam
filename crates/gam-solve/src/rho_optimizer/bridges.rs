@@ -271,19 +271,17 @@ pub(crate) fn resolvably_below(
     reference - value > reference_resolution + resolution
 }
 
+pub(crate) use super::decrement_bands::value_representation_band;
+
 /// The resolution of a criterion value an evaluation computed (#3018): a bound
 /// `R` on its evaluation error, `|V̂ − V| ≤ R`. It is the objective band the
 /// evaluation's own evidence forms
 /// ([`outer_objective_band`](super::decrement_bands::outer_objective_band)), and
-/// where it forms none, the criterion's statistical resolution `tau`
-/// ([`super::run::outer_criterion_resolution`]) floored at the value's own
-/// representation error ([`value_representation_band`](super::decrement_bands::value_representation_band)).
-/// The floor is what a route that declares no size, `tau = 0`, is charged: its
-/// unbanded values used to carry a resolution of `0`, which reads every difference
-/// as resolved progress and so never stalled (#3286).
+/// the value's own representation error where it forms none. Statistical
+/// resolution bounds the decrease left at a certified point, not the error of
+/// one computed value, so it does not floor this resolved-progress test.
 pub(crate) fn sample_resolution(
     config: &OuterConfig,
-    tau: f64,
     cost: f64,
     evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
 ) -> f64 {
@@ -291,7 +289,7 @@ pub(crate) fn sample_resolution(
         .ok()
         .map(|band| band.total())
         .filter(|band| band.is_finite())
-        .unwrap_or_else(|| tau.max(super::decrement_bands::value_representation_band(cost)))
+        .unwrap_or_else(|| value_representation_band(cost))
 }
 
 /// One sample the cost-stall guard judges (#3018).
@@ -400,10 +398,6 @@ pub(crate) struct CostStallGuard {
     /// `1e-3·(1 + |V|)` term and a probe-noise widening, none derived; a stall
     /// claimed points the certificate then refused.
     claim_config: OuterConfig,
-    /// The criterion's statistical resolution `τ` ([`super::run::outer_criterion_resolution`]):
-    /// the resolution of a value whose evaluation forms no objective band, floored at
-    /// that value's own representation error ([`Self::value_resolution`], #3018, #3286).
-    resolution: f64,
     /// Set when a replay cut proved that reopening the window replays a
     /// deterministic procedure from a bit-identical incumbent. From then on the
     /// run stops at its incumbent: no continuation licence overrides a proven
@@ -504,14 +498,9 @@ pub(crate) struct CostStallGuard {
 }
 
 impl CostStallGuard {
-    pub(crate) fn new(
-        resolution: f64,
-        claim_config: &OuterConfig,
-        exit: Arc<Mutex<Option<CostStallExit>>>,
-    ) -> Self {
+    pub(crate) fn new(claim_config: &OuterConfig, exit: Arc<Mutex<Option<CostStallExit>>>) -> Self {
         Self {
             claim_config: claim_config.clone(),
-            resolution,
             replay_proven: false,
             best_value: f64::INFINITY,
             best_resolution: 0.0,
@@ -780,20 +769,20 @@ impl CostStallGuard {
     }
 
     /// The configuration the guard judges by: the band it claims against, and
-    /// the resolution a bridge charges a value that publishes no evidence.
+    /// the problem size used to form the evaluation objective band.
     pub(crate) fn claim_config(&self) -> &OuterConfig {
         &self.claim_config
     }
 
     /// The resolution of `cost` as its evaluation computed it (#3018): the
-    /// objective band its `evidence` forms, or the guard's `τ` floored at the value's
-    /// representation error where it forms none ([`sample_resolution`]).
+    /// objective band its `evidence` forms, or its own representation error
+    /// where it forms none ([`sample_resolution`]).
     pub(crate) fn value_resolution(
         &self,
         cost: f64,
         evidence: &crate::estimate::outer_eval_capture::CertificateEvidence,
     ) -> f64 {
-        sample_resolution(&self.claim_config, self.resolution, cost, evidence)
+        sample_resolution(&self.claim_config, cost, evidence)
     }
 
     pub(crate) fn best_value(&self) -> f64 {
@@ -819,6 +808,13 @@ impl CostStallGuard {
 
     pub(crate) fn off_stratum_streak(&self) -> usize {
         self.off_stratum_streak
+    }
+
+    /// A feasible trial ends a refusal streak even when Wolfe does not accept
+    /// it. It grants no cost progress and does not consume an accepted step.
+    pub(crate) fn observe_feasible_probe(&mut self) {
+        self.infeasible_streak = 0;
+        self.off_stratum_streak = 0;
     }
 
     pub(crate) fn accepted_iters(&self) -> usize {
@@ -1779,6 +1775,11 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     );
                 }
             }
+            if matches!(entry.outcome, CachedValueProbeOutcome::Cost(_))
+                && let Some(guard) = self.cost_stall.as_mut()
+            {
+                guard.observe_feasible_probe();
+            }
             return cached_value_probe_result(&entry.outcome);
         }
         log::debug!(
@@ -1807,6 +1808,9 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
         remember_value_probe(&mut self.value_probe_cache, x, cached_outcome);
         match &result {
             Ok(cost) => {
+                if let Some(guard) = self.cost_stall.as_mut() {
+                    guard.observe_feasible_probe();
+                }
                 log::debug!(
                     "[STAGE] outer eval end order=Value elapsed={:.3}s cost={:.6e} trial_rho_distance={:.3e} (first-order bridge, eval={}) theta={}",
                     stage_start.elapsed().as_secs_f64(),
@@ -1854,7 +1858,7 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
                     let verdict = match (left_stratum, self.stratum_rank) {
                         (Some(refused_cost), Some(kept_rank)) => {
                             // The value lane publishes no evidence, so the trial's
-                            // value carries the criterion's resolution.
+                            // value carries only its own rounding.
                             let refused_resolution =
                                 guard.value_resolution(refused_cost, &Default::default());
                             guard.observe_off_stratum(
@@ -1951,6 +1955,20 @@ impl ZerothOrderObjective for OuterFirstOrderBridge<'_> {
     }
 }
 
+// Keep the bridge available after BFGS returns so its terminal refusal streak
+// can accompany a line-search failure without changing the solver's verdict.
+impl ZerothOrderObjective for &mut OuterFirstOrderBridge<'_> {
+    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, ObjectiveEvalError> {
+        (**self).eval_cost(x)
+    }
+}
+
+impl FirstOrderObjective for &mut OuterFirstOrderBridge<'_> {
+    fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
+        (**self).eval_grad(x)
+    }
+}
+
 impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
     fn eval_grad(&mut self, x: &Array1<f64>) -> Result<FirstOrderSample, ObjectiveEvalError> {
         self.layout.validate_point_len(x, "outer eval failed")?;
@@ -1958,6 +1976,19 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
         // evaluation before doing anything else: a stalled verdict must halt
         // this call rather than pay another inner solve first (#2613).
         self.drain_accepted_steps()?;
+        // Rescue steps can ask for a gradient without a preceding value probe.
+        // On a rank-constrained search, establish feasibility first: derivatives
+        // across the rank boundary belong to another criterion. Ordinary Wolfe
+        // probes already have a cached value and pay no additional evaluation.
+        let at_incumbent = self.incumbent.as_ref()
+            .is_some_and(|incumbent| same_outer_point(&incumbent.rho, x));
+        let priced_here = self.value_probe_cache.iter().any(|entry| {
+            same_outer_point(&entry.rho, x)
+                && matches!(entry.outcome, CachedValueProbeOutcome::Cost(_))
+        });
+        if self.stratum_rank.is_some() && !at_incumbent && !priced_here {
+            self.eval_cost(x)?;
+        }
         // Drive the outer-aware inner-PIRLS cap from accepted outer
         // iterations, BEFORE invoking the inner solve. Cap stays fixed
         // within line-search cost probes (`eval_cost` never touches the
@@ -2126,6 +2157,24 @@ impl FirstOrderObjective for OuterFirstOrderBridge<'_> {
 }
 
 impl OuterFirstOrderBridge<'_> {
+    /// Evidence for a line search exhausted solely by rank refusals at its
+    /// accepted checkpoint. This reports the cause; it grants no convergence.
+    pub(crate) fn terminal_rank_boundary(&self, point: &Array1<f64>) -> Option<RankBoundaryStall> {
+        let incumbent = self.incumbent.as_ref()?;
+        let guard = self.cost_stall.as_ref()?;
+        if !same_outer_point(&incumbent.rho, point)
+            || guard.off_stratum_streak == 0
+            || guard.off_stratum_streak != guard.infeasible_streak
+        {
+            return None;
+        }
+        Some(RankBoundaryStall {
+            kept_rank: self.stratum_rank?,
+            refused_trials: guard.off_stratum_streak,
+            band: guard.stationarity_band(),
+        })
+    }
+
     /// Refuse a trial whose criterion keeps a different rank than this run's start (#2765).
     ///
     /// Called once an evaluation has validated, with the criterion value it returned. The
@@ -2839,6 +2888,11 @@ impl OuterSecondOrderBridge<'_> {
         let Some(guard) = self.cost_stall.as_mut() else {
             return None;
         };
+        // What this accepted step bought against the incumbent it left, and the
+        // evaluation error of that difference: the measure the
+        // curvature-resolvability rung is gated on (#3287).
+        let step_decrease = guard.best_value() - cost;
+        let step_resolution = guard.best_resolution() + *resolution;
         guard.stage_sample_curvature(curvature.clone());
         // Rail-relaxed box (#2412) — see the first-order bridge's matching
         // read. `separation_bound_stationary` above deliberately keeps the raw
@@ -2862,7 +2916,6 @@ impl OuterSecondOrderBridge<'_> {
         } else {
             guard.observe(stall_sample(projected_g_norm), predicted_decrease)
         };
-        let mut adjudicate_second_order = false;
         let stalled = !matches!(verdict, CostStallVerdict::Continue);
         match verdict {
             CostStallVerdict::Continue => {}
@@ -2896,14 +2949,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.stuck_escapes(),
                     guard.best_value(),
                 );
-                // The search stalled, so the criterion has stopped moving, and that
-                // is the condition the certificate's curvature-resolvability rung
-                // decides whatever the first-order band says (#2817). A stall used
-                // to reach the adjudication only by halting inside 1.5x the old
-                // score-relative term; every stall above the band now escapes, so
-                // the escape is adjudicated too. The exit refuses available descent,
-                // a strict saddle and a non-incumbent by construction.
-                adjudicate_second_order = true;
             }
             CostStallVerdict::Converged => {
                 log::debug!(
@@ -2918,7 +2963,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
-                adjudicate_second_order = true;
             }
             CostStallVerdict::FlatValleyStall { residual_grad_norm } => {
                 log::debug!(
@@ -2933,7 +2977,6 @@ impl OuterSecondOrderBridge<'_> {
                     guard.best_value(),
                 );
                 guard.defer_finite_second_order_stall();
-                adjudicate_second_order = true;
             }
         }
         // #1082: an escape granted just now at a strict-saddle incumbent is
@@ -2943,17 +2986,16 @@ impl OuterSecondOrderBridge<'_> {
         }
         // The guard's own verdict is FIRST-ORDER and, on this route, deferred:
         // only ARC holds a synchronized reduced Hessian at the point, so the
-        // guard may not halt a second-order search on a gradient reading. What
-        // it CAN do is say the criterion has stopped moving — and that is
-        // exactly the condition under which the certificate's own
-        // curvature-resolvability rung becomes the deciding test (#2817). The
-        // deferral above is unchanged; what follows is the adjudication it was
-        // always waiting for and never had.
+        // guard may not halt a second-order search on a gradient reading. The
+        // certificate's own second-order test decides instead (#2817), whatever
+        // the first-order band says; it refuses available descent, a strict
+        // saddle and a non-incumbent by construction.
         //
-        // The Newton-decrement verdict (#2954) needs no such wait: it is the
-        // certificate's own stationarity decision, so it is taken at every
-        // evaluated point and stops the run the first time it certifies. Only
-        // the curvature-resolvability rung is held for a stall.
+        // The Newton-decrement verdict (#2954) is the certificate's own
+        // stationarity decision, so it is taken at every evaluated point and
+        // stops the run the first time it certifies. The curvature-resolvability
+        // rung is held until the criterion stops moving at that rung's own
+        // resolution `τ`: this step did not resolvably buy more than `τ`.
         let verdict = self.curvature_stationary_exit(
             x,
             cost,
@@ -2961,7 +3003,8 @@ impl OuterSecondOrderBridge<'_> {
             hessian.as_ref(),
             hessian_psd,
             evidence.as_ref(),
-            adjudicate_second_order,
+            step_decrease,
+            step_resolution,
         );
         if verdict.is_some() {
             return verdict;
@@ -3048,7 +3091,18 @@ impl OuterSecondOrderBridge<'_> {
     /// at n = 10⁴: certified at ρ ≈ 19.6, stopped at ρ ≈ 22.7). The
     /// curvature-resolvability rung is not the certificate's decision where a
     /// verdict is taken, only its fallback, and it decides only once the
-    /// criterion has stopped moving (`criterion_stalled`, a stall).
+    /// criterion has stopped moving at the rung's own resolution: the accepted
+    /// step did not resolvably buy more than `τ` against the incumbent it left,
+    /// `step_decrease ≤ τ + step_resolution`, where `step_resolution` is the
+    /// two values' evaluation errors ([`resolvably_below`]). The rung says at
+    /// most `τ` of decrease is left; a step that resolvably bought more is the
+    /// criterion contradicting it. The gate used to be the cost-stall guard's
+    /// verdict, which asks whether the step bought anything resolvable at all:
+    /// where no band is published a value's error is its rounding (#3287), far
+    /// below `τ`, and a step crawling between the two is not a stall although it
+    /// contradicts nothing the rung claims. Every step the guard stalls passes
+    /// this gate too, since a decrease no larger than `step_resolution` is no
+    /// larger than `τ + step_resolution`.
     fn curvature_stationary_exit(
         &mut self,
         x: &Array1<f64>,
@@ -3057,7 +3111,8 @@ impl OuterSecondOrderBridge<'_> {
         hessian: Option<&Array2<f64>>,
         hessian_psd: Option<bool>,
         evidence: Option<&crate::estimate::outer_eval_capture::CertificateEvidence>,
-        criterion_stalled: bool,
+        step_decrease: f64,
+        step_resolution: f64,
     ) -> Option<ObjectiveEvalError> {
         let tau_stat = self.curvature_stationary_resolution?;
         // The resolution at this point's own value (#3286): at a route that
@@ -3140,7 +3195,7 @@ impl OuterSecondOrderBridge<'_> {
                 format!("Newton-decrement verdict {verdict:?} (bound {bound:.3e})")
             }
             None => {
-                if !criterion_stalled {
+                if !(step_decrease <= resolution + step_resolution) {
                     return None;
                 }
                 // The decrement travels with the verdict (#2817, #1082).
@@ -4773,7 +4828,7 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// - a resolved improvement of the incumbent: a value [`resolvably_below`] the
 ///   best one so far. An EFS evaluation publishes no certificate evidence, so
 ///   each value is charged only its own rounding `γ₁·|V|`
-///   ([`gam_math::roundoff::accumulation_growth`]`(1)`): the improvement is
+///   ([`value_representation_band`]): the improvement is
 ///   judged against `γ₁|V_best| + γ₁|V|`. The criterion's statistical
 ///   resolution `τ` is a decrease-*left* quantity, the certificate's decrement
 ///   tolerance, not the arithmetic error of one value; charging it here would
@@ -4816,12 +4871,11 @@ impl FixedPointProgress {
         if !value.is_finite() || !step_norm.is_finite() {
             return false;
         }
-        let rounding = |v: f64| gam_math::roundoff::accumulation_growth(1) * v.abs();
         let improved = resolvably_below(
             self.best_value,
-            rounding(self.best_value),
+            value_representation_band(self.best_value),
             value,
-            rounding(value),
+            value_representation_band(value),
         );
         let contracted = step_norm < self.previous_step_norm;
         self.best_value = self.best_value.min(value);
