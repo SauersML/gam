@@ -2734,7 +2734,7 @@
     "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
   },
   {
-    "base": "5918b6a8f8b59e4138bdf2e8e13679386c46b2eb",
+    "base": "0b9dc2c6b850eff58b11003192136420ef7233e7",
     "items": [
       "crates/gam-models/src/fit_orchestration/drivers/spatial_hyper_dirs.rs:fn:add_analytic_penalty_hessian_to_eval"
     ],
