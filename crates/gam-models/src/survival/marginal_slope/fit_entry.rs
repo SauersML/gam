@@ -2557,12 +2557,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let weight_sum = spec.weights.iter().sum::<f64>();
         let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
         let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
-        let to_rows = |per_anchor: [(f64, f64, f64); 2], weight: f64| {
-            per_anchor.map(|(anchoring_residual, law_sd, scale)| {
-                (anchoring_residual, law_sd / sqrt_effective_n, scale, weight)
-            })
-        };
-        let (anchors, nodes) = if spec.z.ncols() == 1 {
+        let row_weights = spec.weights.as_slice().ok_or_else(|| {
+            FitFailure::invariant("survival marginal-slope: the row weights are not contiguous")
+        })?;
+        let effective_n = sqrt_effective_n * sqrt_effective_n;
+        let (rows, noise, nodes) = if spec.z.ncols() == 1 {
             let law = laws
                 .as_ref()
                 .and_then(|laws| laws.first())
@@ -2572,21 +2571,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          estimated law to certify it against",
                     )
                 })?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map(|row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                    Ok(to_rows(
-                        certificate_family.closed_form_certificate_anchors(
-                            row,
-                            block_states,
-                            law,
-                        )?,
-                        spec.weights[row],
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, law.nodes.len())
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                &law.weights,
+                effective_n,
+                || Ok(()),
+                |_, row| certificate_family.closed_form_certificate_anchors(row, block_states, law),
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, law.nodes.len())
         } else {
             let (_, joint_law) = build_joint_latent_law(
                 spec.z.view(),
@@ -2599,35 +2593,34 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map_init(
-                    || super::calibration::JointCertificateWorkspace::new(
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                joint_law.weights(),
+                effective_n,
+                || {
+                    super::calibration::JointCertificateWorkspace::new(
                         &certificate_family,
                         &joint_law,
-                    ),
-                    |workspace, row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                        let workspace = workspace.as_mut().map_err(|error| error.clone())?;
-                        Ok(to_rows(
-                            certificate_family.closed_form_joint_certificate_anchors(
-                                row,
-                                block_states,
-                                &joint_law,
-                                workspace,
-                            )?,
-                            spec.weights[row],
-                        ))
-                    },
-                )
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, joint_law.node_count())
+                    )
+                },
+                |workspace, row| {
+                    certificate_family.closed_form_joint_certificate_anchors(
+                        row,
+                        block_states,
+                        &joint_law,
+                        workspace,
+                    )
+                },
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, joint_law.node_count())
         };
-        let rows: Vec<(f64, f64, f64, f64)> = anchors.into_iter().flatten().collect();
         let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
             &rows,
+            &noise,
             nodes,
-            sqrt_effective_n * sqrt_effective_n,
+            effective_n,
         )
         .map_err(FitFailure::numerical)?;
         let mut uncertified = None;

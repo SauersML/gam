@@ -55,10 +55,12 @@ pub const SAVED_MODEL_KIND: &str = "gam";
 /// document that is not a `gam` envelope, is refused by name and must be
 /// refitted. Bump it whenever the on-wire shape or the meaning of any saved
 /// field changes, so that a reader never decodes a file it would misread.
-// v34 moves the version into the shared `{kind, version, model}` envelope, stores
+// v34 records the closed-form certificate's null law (gam#2926):
+// `ClosedFormAnchorResidual::{null_p_value, null_p_value_relative_error, null_modes}`.
+// v35 moves the version into the shared `{kind, version, model}` envelope, stores
 // the fit once (the `unified` copy of `fit_result` is gone) and reads the file in
 // one streaming pass (#3350). Earlier files are refused by name.
-pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+pub const MODEL_PAYLOAD_VERSION: u32 = 35;
 
 /// Coefficient parameterization of a saved transformation-normal (CTN) fit.
 ///

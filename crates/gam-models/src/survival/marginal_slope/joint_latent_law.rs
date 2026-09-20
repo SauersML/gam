@@ -3435,7 +3435,7 @@ mod joint_latent_law_tests {
             let anchors = family
                 .closed_form_joint_certificate_anchors(row, &states, &gaussian, &mut workspace)
                 .expect("Gaussian certificate anchors");
-            for (residual, sd, scale) in anchors {
+            for (residual, sd, scale, _) in anchors {
                 assert!(
                     residual.abs() <= 1e-9,
                     "row {row}: the closed form solves the anchoring equation on a Gaussian law; \
