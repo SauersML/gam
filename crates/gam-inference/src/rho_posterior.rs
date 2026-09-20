@@ -1110,7 +1110,7 @@ mod tests {
         let std_err = (var / n as f64).sqrt();
         let std = |v: f64, i: usize| (v - rho_hat[i]) / [s0, s1][i];
         let cdf = |a: f64, b: f64| {
-            gam_math::bivariate_normal::bivariate_normal_cdf(a, b, r).expect("bivariate CDF")
+            gam_math::bivariate_normal::bivariate_normal_cdf(a, b, r).expect("bivariate CDF").value
         };
         let (a0, b0, a1, b1) =
             (std(lower[0], 0), std(upper[0], 0), std(lower[1], 1), std(upper[1], 1));
