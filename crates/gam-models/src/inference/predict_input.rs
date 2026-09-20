@@ -209,13 +209,36 @@ pub fn build_marginal_slope_local_auxiliary_matrix(
     let n = data.nrows();
     let d = feature_cols.len();
     let mut out = Array2::<f64>::zeros((n, d));
-    let training_headers = model.training_headers.as_ref();
+    // The conditioning columns are fit-time indices; the prediction table is
+    // read by name, exactly as the term specs are remapped
+    // (`resolve_termspec_for_prediction`). A name the table does not carry is
+    // refused: the fit-time index would read whatever column sits there.
+    let training_headers =
+        model
+            .training_headers
+            .as_ref()
+            .ok_or_else(|| PredictInputError::MissingMetadata {
+                reason: "local empirical marginal-slope prediction requires the saved \
+                         training_headers to map its conditioning columns by name; refit the \
+                         model"
+                    .to_string(),
+            })?;
     for (local_col, &fit_col) in feature_cols.iter().enumerate() {
-        let prediction_col = training_headers
-            .and_then(|headers| headers.get(fit_col))
-            .and_then(|name| col_map.get(name))
-            .copied()
-            .unwrap_or(fit_col);
+        let name =
+            training_headers
+                .get(fit_col)
+                .ok_or_else(|| PredictInputError::DimensionMismatch {
+                    reason: format!(
+                        "local empirical marginal-slope conditioning column {fit_col} is out of \
+                     bounds for {} training headers",
+                        training_headers.len()
+                    ),
+                })?;
+        let prediction_col = gam_terms::term_builder::resolve_role_col(
+            col_map,
+            name,
+            "local latent-law conditioning",
+        )?;
         if prediction_col >= data.ncols() {
             return Err(PredictInputError::DimensionMismatch {
                 reason: format!(
@@ -1746,5 +1769,70 @@ mod tests {
                 "z={z}: root {d} against {expected}"
             );
         }
+    }
+
+    /// A saved local-law marginal-slope model whose one conditioning column is
+    /// the training table's `ctx`, the second of `[z, ctx]`.
+    fn local_law_model() -> FittedModel {
+        use crate::inference::model::{FittedFamily, FittedModelPayload, ModelKind};
+        let mut payload = FittedModelPayload::new(
+            crate::inference::model::MODEL_PAYLOAD_VERSION,
+            "y ~ 1".to_string(),
+            ModelKind::MarginalSlope,
+            FittedFamily::MarginalSlope {
+                likelihood: gam_problem::types::LikelihoodSpec::binomial_probit(),
+                base_link: gam_problem::types::InverseLink::Standard(
+                    gam_problem::types::StandardLink::Probit,
+                ),
+                frailty: crate::survival::lognormal_kernel::FrailtySpec::None,
+            },
+            "bernoulli-marginal-slope".to_string(),
+        );
+        payload.set_training_feature_metadata(
+            vec!["z".to_string(), "ctx".to_string()],
+            vec![(0.0, 0.0), (0.0, 0.0)],
+        );
+        let grid = crate::bms::EmpiricalZGrid {
+            nodes: vec![-1.0, 1.0],
+            weights: vec![0.5, 0.5],
+        };
+        payload.latent_measure = Some(LatentMeasureKind::LocalEmpirical {
+            feature_cols: vec![1],
+            input_scales: Some(vec![2.0]),
+            centers: vec![vec![-1.0], vec![1.0]],
+            grids: vec![grid.clone(), grid],
+            top_k: 1,
+            bandwidth: 0.25,
+            mixture: crate::bms::LocalLawMixture::default(),
+            train_row_mixtures: std::sync::Arc::new(Vec::new()),
+        });
+        FittedModel::from_payload(payload)
+    }
+
+    /// The conditioning column is read by its training name wherever the
+    /// prediction table puts it, and a table without it is refused rather than
+    /// read at the fit-time index (which here holds `z`).
+    #[test]
+    fn local_law_conditioning_columns_resolve_by_name_or_refuse() {
+        let model = local_law_model();
+        let data = ndarray::array![[4.0, 0.5, 9.0], [6.0, -0.5, 7.0]];
+        let reordered: HashMap<String, usize> = [
+            ("ctx".to_string(), 0),
+            ("z".to_string(), 1),
+            ("w".to_string(), 2),
+        ]
+        .into_iter()
+        .collect();
+        let local = build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &reordered)
+            .expect("the conditioning column is present by name")
+            .expect("a local law has conditioning values");
+        assert_eq!(local, ndarray::array![[2.0], [3.0]]);
+
+        let missing: HashMap<String, usize> = [("w".to_string(), 0), ("z".to_string(), 1)]
+            .into_iter()
+            .collect();
+        let err = build_marginal_slope_local_auxiliary_matrix(&model, data.view(), &missing)
+            .expect_err("a table without the conditioning column is refused");
+        assert!(err.to_string().contains("ctx"), "got: {err}");
     }
 }
