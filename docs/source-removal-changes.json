@@ -2691,5 +2691,15 @@
     ],
     "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
     "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "ce58f233747b48bce75d1063007317ae9e128080",
+    "items": [
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_and_deriv",
+      "crates/gam-solve/src/reml/jeffreys_subspace.rs:fn:ramp_down_value_d1_d2"
+    ],
+    "reason": "The conditioning-gate value, gradient and Hessian each defined a private inner copy of the cubic smoothstep ramp (ramp_down, ramp_down_value_and_deriv, ramp_down_value_d1_d2) duplicating conditioning_ramp_down_derivatives, which the third and fourth partials already read. All orders now read both sub-weights through conditioning_sub_weight_derivatives over that one ramp, so the value and every partial select the active max-branch from the same numbers.",
+    "evidence": "Each removed inner fn was local to one function body (spectral_gate_weight, spectral_gate_weight_grad, spectral_gate_weight_hess) and called only there; the ramp arithmetic 1 - t^2(3 - 2t), -6t(1-t)/span, -6(1-2t)/span^2 is identical in conditioning_ramp_down_derivatives, so every gate value and partial is bit-identical. The other ramp_down occurrences the guard counts are the call sites inside these bodies and the explicit mixed trace weights stratum closure, which now also reads conditioning_sub_weight_derivatives."
   }
 ]
