@@ -27,3 +27,4 @@ mod two_level_label_response_and_row_floor;
 mod warm_start_from;
 mod weibull_survival_summary_3297;
 mod binomial_outer_certificate_3305;
+mod matern_gamma_surface_3236;
