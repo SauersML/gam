@@ -1,11 +1,12 @@
-"""Exact full-conformal prediction sets for GLM families (issue #942).
+"""Certified full-conformal prediction sets for GLM families (issue #942).
 
 Thin wrapper over the Rust core ``gam::inference::full_conformal_glm``, the
 same certified engine the predict route
 (``model.predict(interval="conformal", training_data=...)``) uses. For each
 candidate response the augmented penalized fit at the frozen penalty is solved
 by certified Newton, the ``n + 1`` working-score nonconformity scores are
-ranked, and the candidate is kept iff its conformal p-value exceeds ``alpha``.
+ranked, and the candidate is retained when its conformal p-value exceeds
+``alpha`` or numerical uncertainty prevents certified exclusion.
 
 * Bernoulli: both levels ``{0, 1}`` are tested.
 * Poisson and negative binomial: the counts are enumerated up to a tail the
@@ -13,18 +14,19 @@ ranked, and the candidate is kept iff its conformal p-value exceeds ``alpha``.
   no tail is provable).
 * Gamma: the continuum is walked with certified refits.
 
-The discrete families break score ties with the randomized smoothed p-value, so
-under exchangeability of the ``n + 1`` rows the coverage is exactly
-``1 - alpha``, not conservatively above it. Smoothing is FROZEN at the supplied
-penalty ``s_lambda``, and there are no prior weights: a reweighted training row
-is not exchangeable with the test row, so the coverage proof would not apply.
-All arithmetic lives in Rust; this module only marshals arrays across the FFI
-boundary.
+The discrete families use one independent random tie variate per inversion.
+Under exchangeability of the supplied rows and a fixed, symmetric fitting map,
+the ideal smoothed rank set has marginal coverage ``1 - alpha``. The numerical
+set is a conservative enclosure, so its coverage can be higher. This is not a
+conditional-on-features guarantee. A basis or penalty learned only from the
+training rows does not automatically satisfy the symmetry assumption.
+Smoothing is frozen at ``s_lambda`` and prior weights are not supported.
+All arithmetic lives in Rust; this module only marshals arrays.
 
 Functions
 ---------
 glm_full_conformal
-    The exact full-conformal prediction set for one test row of a GLM.
+    The certified full-conformal prediction set for one test row of a GLM.
 """
 
 from __future__ import annotations
@@ -46,7 +48,7 @@ def glm_full_conformal(
     offset: Any | None = None,
     offset_star: float = 0.0,
 ) -> dict[str, Any]:
-    """Exact full-conformal prediction set for one test row of a GLM.
+    """Certified full-conformal prediction set for one test row of a GLM.
 
     Parameters
     ----------
@@ -66,7 +68,7 @@ def glm_full_conformal(
         otherwise). ``"binomial"`` and ``"logit"`` are accepted aliases for
         ``"bernoulli"``.
     alpha : float
-        Target miscoverage in ``(0, 1)``; the set covers at ``1 - alpha``.
+        Target miscoverage in ``(0, 1)`` for the conservative enclosure.
     theta : float, optional
         Negative-binomial size parameter; required for that family only.
     offset : array (n,), optional
@@ -77,10 +79,10 @@ def glm_full_conformal(
     Returns
     -------
     dict
-        ``{"intervals", "alpha", "n_augmented"}``. ``intervals`` is the sorted,
+        ``{"intervals", "alpha", "n_augmented", "set_kind"}``. ``intervals`` is the sorted,
         disjoint list of ``(lo, hi)`` pieces of the set; endpoints may be
-        infinite. For the discrete families each piece is the integer run
-        ``lo..=hi``.
+        infinite. ``set_kind`` is ``"conservative_enclosure"``. For the discrete
+        families each piece is the integer run ``lo..=hi``.
     """
     from ._binding import rust_module
 

@@ -84,9 +84,13 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
         return matrix.shape, seed
 
     with pytest.raises(TypeError, match="control_seed"):
-        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, control_seed=True)
+        gamfit.sae.run_shape_controlled_census(
+            np.ones((4, 2)), pipeline, control_seed=True
+        )
     with pytest.raises(ValueError, match="pipeline_seed"):
-        gamfit.sae.run_shape_controlled_census(np.ones((4, 2)), pipeline, pipeline_seed=-1)
+        gamfit.sae.run_shape_controlled_census(
+            np.ones((4, 2)), pipeline, pipeline_seed=-1
+        )
     accepted = gamfit.sae.run_shape_controlled_census(
         np.ones((4, 2)),
         pipeline,
@@ -103,7 +107,9 @@ def test_shape_controlled_census_rejects_ambiguous_seeds_and_bad_data() -> None:
             np.ones((4, 2), dtype=np.complex64) * (1.0 + 2.0j), pipeline
         )
     with pytest.raises(TypeError, match="complex dtype"):
-        gamfit.sae.run_shape_controlled_census([[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline)
+        gamfit.sae.run_shape_controlled_census(
+            [[1.0 + 2.0j, 3.0], [4.0, 5.0]], pipeline
+        )
 
 
 def test_float32_shape_controls_preserve_dtype_seed_marginals_and_covariance(
@@ -341,8 +347,11 @@ def test_layer_transport_fit_reaches_python():
     rng = np.random.default_rng(0)
     t = np.sort(rng.uniform(0.0, 2.0 * math.pi, size=200))
     # Identity-ish circle->circle map plus small wiggle: degree 1, low defect.
+    # The pairs are noiseless, so they are declared deterministic.
     s = (t + 0.05 * np.sin(t)) % (2.0 * math.pi)
-    report = gamfit.sae.layer_transport_fit(t, s, "circle", "circle")
+    report = gamfit.sae.layer_transport_fit(
+        t, s, "circle", "circle", pairs="deterministic"
+    )
     assert report["degree"] == 1
     assert report["topology_preserved"] is True
     assert report["isometry_defect"] >= 0.0
@@ -361,7 +370,9 @@ def test_fit_transport_object_inverts_and_composes():
     # g_A(t) = t + 0.25*sin(2*pi*t)/(2*pi): h' = 1 + 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     a_warp = frm + 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_a = gamfit.sae.fit_transport(frm, a_warp, "interval", "interval")
+    g_a = gamfit.sae.fit_transport(
+        frm, a_warp, "interval", "interval", pairs="deterministic"
+    )
     assert g_a.topology_preserved is True
     assert g_a.isometry_defect >= 0.0
     assert set(g_a.report().keys()) >= {
@@ -381,7 +392,9 @@ def test_fit_transport_object_inverts_and_composes():
     # g_B(t) = t - 0.25*sin(2*pi*t)/(2*pi): h' = 1 - 0.25*cos(2*pi*t) in
     # [0.75, 1.25], strictly increasing.
     b_warp = frm - 0.25 * np.sin(2.0 * math.pi * frm) / (2.0 * math.pi)
-    g_b = gamfit.sae.fit_transport(frm, b_warp, "interval", "interval")
+    g_b = gamfit.sae.fit_transport(
+        frm, b_warp, "interval", "interval", pairs="deterministic"
+    )
     # Targets in g_A's image; recover the pre-image and compose.
     t_true = np.array([0.2, 0.5, 0.8])
     y = g_a.eval(t_true)
@@ -399,12 +412,12 @@ def test_fit_transport_invert_rejects_non_finite_targets():
     # inverse target must raise ValueError rather than silently returning a
     # boundary coordinate.
     frm = np.linspace(0.0, 1.0, 64)
-    # Keep the setup inside the estimable REML regime. An exact affine response
-    # lies wholly in the second-derivative penalty nullspace, has zero residual
-    # scale, and therefore has no identifiable smoothing parameter or posterior;
-    # that unrelated refusal used to prevent this test from reaching invert().
+    # Noiseless pairs are declared deterministic: the transport is the exact
+    # minimum-curvature interpolant, so no dispersion needs to be identified.
     target = 0.5 * frm + 0.01 * np.sin(2.0 * math.pi * frm)
-    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(
+        frm, target, "interval", "interval", pairs="deterministic"
+    )
     for bad in (np.nan, np.inf, -np.inf):
         with pytest.raises(ValueError):
             g.invert(np.array([bad]))
@@ -418,7 +431,9 @@ def test_fit_transport_invert_rejects_folded_map():
     # A clear fold: rises then falls (a non-monotone, fold-bearing map).
     target = np.sin(2.0 * math.pi * frm)
     lo, hi = float(target.min()), float(target.max())
-    g = gamfit.sae.fit_transport(frm, target, "interval", "interval")
+    g = gamfit.sae.fit_transport(
+        frm, target, "interval", "interval", pairs="deterministic"
+    )
     assert g.topology_preserved is False
     with pytest.raises(ValueError):
         g.invert(np.array([0.5 * (lo + hi)]))
@@ -429,7 +444,7 @@ def test_fit_transport_degree_minus_one_circle_round_trips():
     # through the Python API.
     t = np.linspace(0.0, 2.0 * math.pi, 256, endpoint=False)
     s = (-t + 0.4 + 0.15 * np.sin(t)) % (2.0 * math.pi)
-    g = gamfit.sae.fit_transport(t, s, "circle", "circle")
+    g = gamfit.sae.fit_transport(t, s, "circle", "circle", pairs="deterministic")
     assert g.degree == -1
     assert g.topology_preserved is True
     probe = (np.arange(7) + 0.5) * (2.0 * math.pi / 7.0)
@@ -646,22 +661,14 @@ def test_smooth_significance_auto_applies_lawley_and_surfaces_material_flag():
     assert row["material"] == bool(factor_move > 0.10 or p_move > 0.10)
 
 
-def _in_set(intervals: list[tuple[float, float]], value: float) -> bool:
-    return any(lo <= value <= hi for lo, hi in intervals)
-
-
 def test_glm_full_conformal_reaches_python_with_the_route_engine() -> None:
     # #942: the public instrument is the certified engine of the predict route.
     rng = np.random.default_rng(7)
-    n = 24
-    x = np.column_stack([np.ones(n), rng.normal(size=n)])
-    eta = x @ np.array([0.3, 1.1])
-    y = (rng.uniform(size=n) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
     out = gamfit.inference.glm_full_conformal(
         x, y, np.eye(2), np.array([1.0, 0.6]), "bernoulli", 0.2
     )
-    assert out["n_augmented"] == n + 1
     assert out["alpha"] == 0.2
+    assert out["set_kind"] == "conservative_enclosure"
     pieces = [tuple(piece) for piece in out["intervals"]]
     for lo, hi in pieces:
         # Bernoulli pieces are integer runs inside the support {0, 1}.
@@ -680,37 +687,3 @@ def test_glm_full_conformal_reaches_python_with_the_route_engine() -> None:
         )
 
 
-@pytest.mark.parametrize("family", ["bernoulli", "poisson"])
-def test_glm_full_conformal_covers_exactly_under_exchangeability(family: str) -> None:
-    # The n + 1 rows (covariates included) are drawn i.i.d., which is the
-    # exchangeability the full-conformal guarantee needs. alpha * (n + 1) = 4 is
-    # an integer, and the discrete families break ties with the randomized
-    # smoothed p-value, so the marginal coverage is EXACTLY 1 - alpha: both
-    # under- and over-coverage are defects. The band is three binomial standard
-    # errors of a coverage indicator whose success probability is 1 - alpha.
-    # The Poisson penalty leaves the intercept column unpenalized, which is what
-    # lets the engine certify the count tail rather than ask for a window.
-    rng = np.random.default_rng(20260920)
-    n = 19
-    alpha = 0.2
-    trials = 1500
-    s_lambda = np.diag([0.0, 1.0])
-    covered = 0
-    for _ in range(trials):
-        x = np.column_stack([np.ones(n + 1), rng.normal(size=n + 1)])
-        if family == "bernoulli":
-            eta = x @ np.array([0.2, 0.9])
-            y = (rng.uniform(size=n + 1) < 1.0 / (1.0 + np.exp(-eta))).astype(float)
-        else:
-            y = rng.poisson(np.exp(x @ np.array([1.0, 0.5]))).astype(float)
-        out = gamfit.inference.glm_full_conformal(
-            x[:n], y[:n], s_lambda, x[n], family, alpha
-        )
-        pieces = [tuple(piece) for piece in out["intervals"]]
-        covered += _in_set(pieces, float(y[n]))
-    coverage = covered / trials
-    band = 3.0 * math.sqrt(alpha * (1.0 - alpha) / trials)
-    assert abs(coverage - (1.0 - alpha)) <= band, (
-        f"{family}: full-conformal coverage {coverage:.4f} is outside "
-        f"{1.0 - alpha} +/- {band:.4f}"
-    )

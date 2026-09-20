@@ -1022,14 +1022,17 @@ fn conformal_glm_family(name: &str, theta: Option<f64>) -> PyResult<ConformalGlm
     Ok(family)
 }
 
-/// Exact (finite-sample-valid) full-conformal prediction set for a GLM at a
+/// Conservative full-conformal numerical enclosure for a GLM at a
 /// frozen penalty (issue #942), computed by the same certified engine the
 /// predict route uses (`gam::inference::full_conformal_glm`). For each
 /// candidate response the augmented penalized fit is solved by certified
 /// Newton, the `n + 1` working-score nonconformity scores are ranked, and the
-/// candidate is kept iff its conformal p-value exceeds `alpha`. The discrete
-/// families use the randomized smoothed p-value, so the coverage under
-/// exchangeability is exactly `1 − alpha`; the count families enumerate the
+/// candidate is retained if its conformal p-value exceeds `alpha` or a
+/// numerical comparison cannot certify exclusion. The discrete
+/// families use one independent randomized smoothed p-value per inversion.
+/// The enclosure has at least nominal marginal coverage under exchangeable
+/// supplied rows and a fixed symmetric fitting map; it is not a conditional
+/// guarantee for a training-only learned basis. The count families enumerate the
 /// whole support up to a certified tail, and Gamma walks the continuum.
 ///
 /// Smoothing is FROZEN at the supplied penalty `s_lambda`, and there are no
@@ -1050,7 +1053,7 @@ fn conformal_glm_family(name: &str, theta: Option<f64>) -> PyResult<ConformalGlm
 /// * `offset`, `offset_star` — training offsets (default zeros) and the test
 ///   row's offset (default `0`).
 ///
-/// Returns `{"intervals", "alpha", "n_augmented"}`: `intervals` is the sorted,
+/// Returns `{"intervals", "alpha", "n_augmented", "set_kind"}`: `intervals` is the sorted,
 /// disjoint list of `(lo, hi)` pieces of the set (endpoints may be infinite).
 /// For the discrete families each piece is the integer run `lo..=hi`.
 #[pyfunction]
@@ -1090,6 +1093,7 @@ pub(crate) fn glm_full_conformal<'py>(
     out.set_item("intervals", intervals)?;
     out.set_item("alpha", set.alpha)?;
     out.set_item("n_augmented", set.n_augmented)?;
+    out.set_item("set_kind", "conservative_enclosure")?;
     Ok(out)
 }
 
@@ -1629,12 +1633,14 @@ pub(crate) fn check_parameter_use_site_reads(
     let executed = ExecutedParameterReads::new(
         reads
             .into_iter()
-            .map(|(parameter, ordinal, read_module, read_op)| ExecutedParameterRead {
-                parameter,
-                ordinal,
-                read_module,
-                read_op,
-            })
+            .map(
+                |(parameter, ordinal, read_module, read_op)| ExecutedParameterRead {
+                    parameter,
+                    ordinal,
+                    read_module,
+                    read_op,
+                },
+            )
             .collect(),
     )
     .map_err(|refusal| py_value_error(format!("{refusal:?}: {refusal}")))?;
@@ -1646,7 +1652,9 @@ pub(crate) fn check_parameter_use_site_reads(
             positions: None,
         }
         .check_executed_reads(&parameter, &executed)
-        .map_err(|refusal| py_value_error(format!("use-site edit {index}: {refusal:?}: {refusal}")))?;
+        .map_err(|refusal| {
+            py_value_error(format!("use-site edit {index}: {refusal:?}: {refusal}"))
+        })?;
     }
     Ok(())
 }

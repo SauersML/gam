@@ -3,7 +3,7 @@
 
 use crate::double_double::SMALLEST_SUBNORMAL;
 use crate::roundoff::{UNIT_ROUNDOFF, accumulation_growth};
-use crate::special::softplus;
+use crate::special::{logaddexp, softplus};
 
 /// One term `λ_j·χ²_{h_j}` of a weighted sum of independent central chi-squares, with the
 /// weight's SIGN and the term's degrees of freedom both carried explicitly.
@@ -240,14 +240,7 @@ enum Chart {
     Log,
 }
 
-/// `ln(eᵃ + eᵇ)`.
-fn log_add(a: f64, b: f64) -> f64 {
-    let (high, low) = if a >= b { (a, b) } else { (b, a) };
-    if high == f64::NEG_INFINITY {
-        return high;
-    }
-    high + (low - high).exp().ln_1p()
-}
+
 
 /// The saddle-point quantities at one value of the parameter `y`.
 struct Point {
@@ -628,9 +621,9 @@ fn saddle(chart: Chart, scaled: &[Scaled], xi: f64, total: f64) -> Point {
             // At `low` every positive `ρ ≤ e^y` and `−θξ ≤ θ·max(0, −ξ)`, so the slope is `≤ 0`; at
             // `high` the reference terms alone give `1 + H₋/2 + max(ξ, 0)`, which outweighs every
             // negative `ρ > −1` and `θξ < max(ξ, 0)`, so it is `≥ 0`.
-            let low = -if xi < 0.0 { log_add(positive.ln(), (-xi).ln()) } else { positive.ln() };
+            let low = -if xi < 0.0 { logaddexp(positive.ln(), (-xi).ln()) } else { positive.ln() };
             let base = (1.0 + negative).ln();
-            let high = if xi > 0.0 { log_add(base, xi.ln()) } else { base } - reference.ln();
+            let high = if xi > 0.0 { logaddexp(base, xi.ln()) } else { base } - reference.ln();
             (low, high)
         }
         Chart::Log => {
@@ -674,7 +667,7 @@ fn evaluate(chart: Chart, scaled: &[Scaled], xi: f64, y: f64) -> Point {
         let (m, rho) = match term.kind {
             Kind::Reference => (ln_eta, y),
             Kind::Inner { ln_gap } => {
-                let m = log_add(ln_gap, term.ln_ratio + ln_eta);
+                let m = logaddexp(ln_gap, term.ln_ratio + ln_eta);
                 (m, ln_theta + term.ln_ratio - m)
             }
             Kind::Negative => {

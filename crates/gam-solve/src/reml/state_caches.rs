@@ -512,9 +512,8 @@ pub(crate) fn hash_analytic_penalty_kind(
             // cached J / H / K reflect the Jacobian at the *current* outer θ.
             // They are NOT part of this penalty's identity — they are a pure
             // (recomputable) function of the basis + θ, and the basis identity
-            // is already captured exactly by `duchon_radial_source` (below) for
-            // the Duchon path and by the hashed design matrix / latent
-            // fingerprint for the SAE path. Hashing the live cache snapshot made
+            // is already captured exactly by the hashed design matrix / latent
+            // fingerprint. Hashing the live cache snapshot made
             // the persistent warm-start key non-reproducible across otherwise
             // identical fits: a cold fit opens its session with the slots empty
             // (`None`), while a repeat fit sees them populated from the prior
@@ -523,22 +522,6 @@ pub(crate) fn hash_analytic_penalty_kind(
             // the converged (ρ, β) — equivalence to recomputing is unaffected by
             // dropping these derived snapshots from the key, so we deliberately
             // do NOT hash them.
-            match p.duchon_radial_source.as_ref() {
-                Some(source) => {
-                    hasher.write_bool(true);
-                    hash_array2(hasher, source.centers.as_ref());
-                    hash_array2(hasher, source.radial_coefficients.as_ref());
-                    match source.length_scale {
-                        Some(length_scale) => {
-                            hasher.write_bool(true);
-                            hasher.write_f64(length_scale);
-                        }
-                        None => hasher.write_bool(false),
-                    }
-                    hasher.write_str(&format!("{:?}", source.nullspace_order));
-                }
-                None => hasher.write_bool(false),
-            }
         }
         AnalyticPenaltyKind::Sparsity(p) => {
             hasher.write_str("sparsity");

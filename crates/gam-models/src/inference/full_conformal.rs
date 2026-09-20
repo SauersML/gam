@@ -37,10 +37,12 @@
 //! - **Layer 2 — GLM families (implemented in
 //!   [`super::full_conformal_glm`], certified):** Binomial, Poisson,
 //!   negative binomial and Gamma at the frozen penalty. Discrete supports
-//!   are enumerated exactly (with a certified tail for count families), the
-//!   Gamma continuum is walked with certified Newton refits, and ties among
-//!   exchangeable scores are broken by the randomized smoothed p-value so
-//!   the coverage is exactly `1 − α`, not conservatively above it.
+//!   are searched with certified tails for count families, and the Gamma
+//!   continuum is walked with certified Newton refits. Discrete ties use
+//!   independent smoothed-rank randomization. Unresolved comparisons are
+//!   retained as a conservative numerical enclosure: its coverage need not
+//!   equal `1 − α`. Marginal coverage assumes exchangeable supplied rows and
+//!   a fixed symmetric basis/penalty construction, not arbitrary learned bases.
 //! - **Layer 3 (implemented in [`honest`], exact up to breakpoint
 //!   resolution):** the Gaussian-identity map that RE-SELECTS the smoothing
 //!   strength by REML on every augmented data set — the first
@@ -48,6 +50,7 @@
 //!   training row all the way up to ρ̂. A proven bound on where the global
 //!   REML minimizer can lie, plus cold local refits at the set's endpoints.
 //!   Every row carries a [`ConformalCertificate`]: `exact_frozen`,
+//!   `conservative_frozen`,
 //!   `honest_refit`, or `refused:<reason>` with the frozen set.
 //!
 //! # Layer 1 math (what the code below implements)
@@ -91,9 +94,10 @@
 //!
 //! `β̂(z)` solves the augmented penalized score equation of the family at
 //! the frozen Sλ. Discrete families (Binomial, Poisson, negative binomial)
-//! are FINITE or have a provable tail: full conformal is exact by
-//! enumerating the response support with one certified Newton refit per
-//! candidate. Gamma is continuous and is walked with certified refits. The
+//! have finite support or use a certified tail when one is available. The
+//! numerical engine encloses unresolved candidates conservatively, including
+//! the full support if a tail cannot be certified. Gamma is continuous and
+//! is walked with certified refits and conservative bounds. The
 //! predict route and the Python `glm_full_conformal` instrument both call
 //! that one engine.
 //!
@@ -417,9 +421,7 @@ impl ExactGaussianFullConformal {
 /// `n`-terms count the residual sums the penalized RSS is formed from (#2280):
 /// two passes of `X·β` over the rows, with their subtractions, squares and sums.
 fn response_solve_growth(n: usize, p: usize) -> f64 {
-    gam_linalg::roundoff::accumulation_growth(
-        2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n,
-    )
+    gam_linalg::roundoff::accumulation_growth(2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n)
 }
 
 /// `L⁻¹·B` for a lower-triangular `L`, by forward substitution.
@@ -1072,6 +1074,10 @@ mod tests {
             row.certificate,
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
         );
-        assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
+        assert!(
+            penalty
+                .with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y)
+                .is_err()
+        );
     }
 }

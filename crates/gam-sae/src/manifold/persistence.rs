@@ -120,9 +120,11 @@ impl BettiSignature {
     }
 }
 
-/// Which side of the persistence landmark cap this atom's sampled support is
-/// on. At the cap, the audit reads a fixed-size farthest-point cover; below it,
-/// every positive-support row is used.
+/// Which side of the persistence landmark caps this atom's sampled support is
+/// on. At the cap, the audit read at least one fixed-size farthest-point cover;
+/// below it, every positive-support row is used. The audit reads two covers:
+/// H₀/H₁ read one capped at [`PERSISTENCE_H1_MAX_POINTS`], and a closed-surface
+/// H₂ claim adds one capped at [`PERSISTENCE_MAX_POINTS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PersistenceStabilityBand {
     BelowLandmarkCap,
@@ -1412,7 +1414,11 @@ fn topology_persistence_verdict_impl(
             expected_betti
         )
     };
-    let stability_band = if full > PERSISTENCE_MAX_POINTS {
+    // The band describes the covers this audit actually read: the H₀/H₁ cover,
+    // plus the smaller H₂ cover only when the raced type makes an H₂ claim.
+    let h1_cover_subsampled = h1_landmarks.len() < full;
+    let h2_cover_subsampled = expected_betti.b2.is_some() && full > PERSISTENCE_MAX_POINTS;
+    let stability_band = if h1_cover_subsampled || h2_cover_subsampled {
         PersistenceStabilityBand::AtLandmarkCap
     } else {
         PersistenceStabilityBand::BelowLandmarkCap
@@ -1612,6 +1618,39 @@ mod tests {
             !verdict.contested,
             "measured circle topology must agree with the raced Periodic prediction: {}",
             verdict.note
+        );
+    }
+
+    /// The stability band reports the covers the audit read. A 100-row loop sits
+    /// above the H₂ cap but below the H₀/H₁ cap, and a periodic atom makes no H₂
+    /// claim, so every row is persisted and the band is below the cap. A 64-point
+    /// torus makes an H₂ claim, and its H₂ cover subsamples to the 48-point cap.
+    #[test]
+    fn stability_band_reports_the_covers_the_audit_read() {
+        let n = 100usize;
+        assert!(PERSISTENCE_MAX_POINTS < n && n <= PERSISTENCE_H1_MAX_POINTS);
+        let loop_verdict =
+            topology_persistence_verdict(circle(n, 2.0).view(), &SaeAtomBasisKind::Periodic)
+                .expect("circle verdict");
+        assert_eq!(loop_verdict.support_size, n);
+        assert_eq!(
+            loop_verdict.landmark_count, n,
+            "the H₀/H₁ cover keeps every row below its cap"
+        );
+        assert_eq!(
+            loop_verdict.stability_band,
+            PersistenceStabilityBand::BelowLandmarkCap,
+            "no cover dropped a row, so the audit is below the landmark cap"
+        );
+
+        let torus = clifford_torus(8, 8);
+        assert!(torus.nrows() > PERSISTENCE_MAX_POINTS);
+        let torus_verdict = topology_persistence_verdict(torus.view(), &SaeAtomBasisKind::Torus)
+            .expect("torus verdict");
+        assert_eq!(
+            torus_verdict.stability_band,
+            PersistenceStabilityBand::AtLandmarkCap,
+            "the H₂ shell cover subsampled the torus to its cap"
         );
     }
 
