@@ -49,6 +49,9 @@ mod decrement_bands;
 #[cfg(test)]
 #[path = "rho_optimizer/efs_fallback_routing_tests.rs"]
 mod efs_fallback_routing_tests;
+#[cfg(test)]
+#[path = "rho_optimizer/efs_step_domain_2902_tests.rs"]
+mod efs_step_domain_2902_tests;
 mod hessian_operator;
 #[cfg(test)]
 #[path = "rho_optimizer/ladder_incumbent_resume_3306_tests.rs"]
@@ -68,6 +71,7 @@ mod run;
 mod run_plan;
 mod inner_progress;
 mod saddle_escape_latch;
+pub mod zero_smoothing_face;
 
 pub(crate) use crate::model_types::CERTIFICATE_RAIL_MARGIN;
 pub use crate::model_types::{

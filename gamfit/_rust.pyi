@@ -307,7 +307,6 @@ __all__ = [
     "posterior_coefficient_names_json",
     "posterior_credible_interval",
     "posterior_draw_bands",
-    "posterior_eta_bands",
     "posterior_predict_bands_table",
     "posterior_predict_multinomial_pyfunc",
     "posterior_predict_table",
@@ -426,7 +425,6 @@ __all__ = [
     "survival_failure_from_survival",
     "survival_ffi_surface",
     "survival_lifted_metrics_from_predictions",
-    "survival_matrix_from_risk_calibration",
     "survival_null_curve_from_train",
     "survival_parameters_matrix",
     "survival_prediction_payload_from_json",
@@ -1689,7 +1687,7 @@ def coordinate_posterior_from_precision(mean: Sequence[float], precision_row_maj
 
 def coupling_robustness_certificate(gate_i: Sequence[float], gate_j: Sequence[float], rows: Sequence[int], likelihood_weights: Sequence[float], epsilon: float = ...) -> dict[Any, Any]: ...
 
-def cross_fit_shared_precision_groups_json(request_json: str) -> str: ...
+def cross_fit_shared_precision_groups_json(models: list[_FittedModel], request_json: str) -> str: ...
 
 def ctn_required_fit_columns(formula: str, config_json: str) -> list[str]: ...
 
@@ -2007,8 +2005,6 @@ def posterior_credible_interval(samples: NDArray[np.float64], level: float) -> N
 
 def posterior_draw_bands(eta: NDArray[np.float64], mean: NDArray[np.float64], level: float) -> dict[Any, Any]: ...
 
-def posterior_eta_bands(eta: NDArray[np.float64], family_kind: str, level: float, link_spec: str | None = ...) -> dict[Any, Any]: ...
-
 def posterior_predict_bands_table(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, samples: NDArray[np.float64], level: float) -> dict[Any, Any]: ...
 
 def posterior_predict_multinomial_pyfunc(model_bytes: Sequence[int], headers: Sequence[str], rows: _EncodedTable, n_draws: int, seed: int = ...) -> dict[Any, Any]: ...
@@ -2244,8 +2240,6 @@ def survival_failure_from_survival(survival: NDArray[np.float64]) -> NDArray[np.
 def survival_ffi_surface(times: NDArray[np.float64], surface: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]] | None: ...
 
 def survival_lifted_metrics_from_predictions(event_times: Sequence[float], events: Sequence[float], grid: Sequence[float], survival_matrix: NDArray[np.float64], null_survival_matrix: NDArray[np.float64] | None = ...) -> dict[Any, Any]: ...
-
-def survival_matrix_from_risk_calibration(train_times: Sequence[float], train_events: Sequence[float], train_risk: Sequence[float], test_risk: Sequence[float], grid: Sequence[float]) -> NDArray[np.float64]: ...
 
 def survival_null_curve_from_train(train_times: Sequence[float], train_events: Sequence[float], grid: Sequence[float]) -> NDArray[np.float64]: ...
 
