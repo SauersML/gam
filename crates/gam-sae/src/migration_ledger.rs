@@ -71,16 +71,19 @@ impl MoveStage {
 }
 
 /// Where a [`SaeMove::Birth`] seeded from. The residual-factor pool is the ONLY
-/// admissible source; every other variant is an accounting record of a seed that
-/// must NOT occur, kept so it is loud rather than silent.
+/// admissible source of new structure; the atom-derived variants record a birth
+/// that copies or promotes an atom already in the dictionary, and the
+/// principal-component variant is a seed that must NOT occur, kept so it is loud
+/// rather than silent.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BirthSeed {
     /// The residual-factor subspace (worst-reconstructed residual directions /
-    /// rows). The architecture's only sanctioned birth seed.
+    /// rows). The architecture's only sanctioned seed of new structure.
     ResidualFactor,
     /// Promoted from an existing linear atom (linear → curved co-fit promotion).
     LinearAtom,
-    /// Promoted / refined from an existing curved chart.
+    /// Promoted / refined from an existing curved chart, or a fission child
+    /// cloned from the chart it splits.
     CurvedChart,
     /// A principal-component reseed — FORBIDDEN. Present only so a stray PC seed
     /// is recorded and trips [`SaeMigrationLedger::pc_reseed_events`]; the tiered
