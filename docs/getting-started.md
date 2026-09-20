@@ -124,7 +124,8 @@ and `mean` for marginal-slope probabilities. Survival models return a
 `.cumulative_hazard_at(...)`, chunk iterators, and CSV writers.
 
 See [predictions.md](predictions.md) for details on `return_type`,
-`id_column`, and `SurvivalPrediction`.
+`id_column`, and `SurvivalPrediction`, and
+[partial-effects.md](partial-effects.md) for per-term curves and their bands.
 
 ## Inspect
 
@@ -138,7 +139,8 @@ model = gamfit.fit(train, "y ~ s(x)")
 model.summary()                     # Summary object
 model.diagnose(train).metrics       # n_obs, mae, rmse, bias, optional r_squared
 model.check(test).ok                # schema check against training
-model.plot(train, x="x")            # matplotlib (requires gamfit[plot])
+model.partial_dependence("s(x)")    # a term's curve with pointwise and simultaneous bands
+model.plot_terms()                  # draw every term (requires gamfit[plot])
 model.report("out.html")            # standalone HTML report
 ```
 
