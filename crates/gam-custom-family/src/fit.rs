@@ -2846,18 +2846,25 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         )
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
-        // #2359's optimize-3/certify-4 lifecycle (#2898). The exact Hessian stays
-        // declared, and the terminal mint requests `ValueGradientHessian` from
-        // that declaration whatever the search plan is. The search itself runs
-        // BFGS on the exact analytic gradient, so the order-five Jeffreys
-        // curvature (D²H_Φ, the completion pair correction, the third information
-        // derivative) is priced once at the certificate instead of on every ARC
-        // trial, rejected trials included. At 2f844874e on survival
-        // marginal-slope 160×6, ARC search took 178.2 s to V=264.68231024 with 11
-        // strict-saddle windows, and order five was 59-60% of that time;
-        // gradient-only search took 19.6 s to V=264.68203561 and minted (6,0,0)
-        // with λ_min=1.68e-4.
-        .with_prefer_gradient_only(true)
+        // #2359's optimize-3/certify-4 lifecycle (#2898), for an armed Jeffreys
+        // term only. The exact Hessian stays declared, and the terminal mint
+        // requests `ValueGradientHessian` from that declaration whatever the
+        // search plan is. With the term armed, the search runs BFGS on the exact
+        // analytic gradient, so the order-five Jeffreys curvature (D²H_Φ, the
+        // completion pair correction, the third information derivative) is
+        // priced once at the certificate instead of on every ARC trial, rejected
+        // trials included. At 2f844874e on survival marginal-slope 160×6, ARC
+        // search took 178.2 s to V=264.68231024 with 11 strict-saddle windows,
+        // and order five was 59-60% of that time; gradient-only search took
+        // 19.6 s to V=264.68203561 and minted (6,0,0) with λ_min=1.68e-4.
+        //
+        // An unarmed family has no order-five pieces, so that saving does not
+        // exist, and the exact-curvature search is the cheaper plan (#3306). On
+        // the unarmed binary Bernoulli marginal-slope fit (80,016 rows, p=81,
+        // 13 ρ), BFGS spent ~380 s per seed and ended in a line-search
+        // refusal, while ARC reached the certified value in 16-19 evaluations
+        // (~40-95 s).
+        .with_prefer_gradient_only(family.joint_jeffreys_term_required())
         // The mode-selection consumer below requires a certified local minimum,
         // not merely a stationary point whose raw negative curvature was cleared
         // by the generic gradient-residue floor. Declare that requirement before
