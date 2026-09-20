@@ -476,8 +476,10 @@ pub(crate) fn assemble_custom_family_fit_result(
         exact_lambdas_from_log_strengths(&log_lambdas, "custom-family fitted log strength")?;
     let (block_states, covariance_conditional, geometry, precomputed_edf, smoothing_corrected) =
         if let Some(canonical) = canonical {
-            let precomputed_edf = precomputed_edf
-                .or_else(|| reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas));
+            let precomputed_edf = match precomputed_edf {
+                Some(edf) => Some(edf),
+                None => reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas)?,
+            };
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
