@@ -36,6 +36,7 @@ use gam::matrix::LinearOperator;
 use gam::smooth::{build_term_collection_design, freeze_term_collection_from_design};
 use gam::test_support::reference::{Column, QualityPair, run_python};
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
+use gam_math::special::logistic;
 use ndarray::Array2;
 use std::path::Path;
 
@@ -68,11 +69,6 @@ const GAM_MAX_HOLDOUT_NLL: f64 = 0.66;
 /// than this many nats/row. NLL is far more sensitive to calibration than AUC,
 /// so 0.03 nats is a generous-but-real sampling slack at ~130 test rows.
 const BASELINE_NLL_MARGIN: f64 = 0.03;
-
-/// Logistic inverse-link: linear predictor eta -> probability.
-fn inv_logit(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
 
 /// Area under the ROC curve via the Mann-Whitney U statistic (tie-aware via
 /// average ranks). This is the rank agreement of a probability score against
@@ -219,7 +215,7 @@ fn gam_binomial_logit_holdout_predictive_quality() {
         let design = build_term_collection_design(grid.view(), &frozenspec)
             .expect("rebuild gam design at held-out test rows");
         let eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-        let prob: Vec<f64> = eta.iter().map(|&e| inv_logit(e)).collect();
+        let prob: Vec<f64> = eta.iter().map(|&e| logistic(e)).collect();
         let labels: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
         gam_fold_auc.push(auc(&prob, &labels));
     }
@@ -417,7 +413,7 @@ fn gam_binomial_logit_holdout_predictive_quality_on_real_data() {
     let design = build_term_collection_design(grid.view(), &frozenspec)
         .expect("rebuild gam design at held-out test rows");
     let eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_prob: Vec<f64> = eta.iter().map(|&e| inv_logit(e)).collect();
+    let gam_prob: Vec<f64> = eta.iter().map(|&e| logistic(e)).collect();
     let test_labels: Vec<f64> = test_rows.iter().map(|&i| y[i]).collect();
     let gam_nll = log_loss(&gam_prob, &test_labels);
     let gam_auc_holdout = auc(&gam_prob, &test_labels);

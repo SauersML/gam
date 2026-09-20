@@ -35,6 +35,7 @@ use gam::{
 // ----- deterministic sampling primitives (no external RNG crate) -----
 
 use gam::utils::splitmix64;
+use gam_math::special::logistic;
 struct SplitMix64 {
     state: u64,
 }
@@ -78,11 +79,6 @@ impl SplitMix64 {
         let gb = self.gamma_ge1(b);
         ga / (ga + gb)
     }
-}
-
-#[inline]
-fn logistic(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
 }
 
 /// High-precision Beta data: `logit(mu) = 0.4 + 0.8*x1 - 0.5*x2`, precision

@@ -32,6 +32,7 @@ use gam::{
     DispersionLocationScaleFitResult, FitConfig, FitResult, encode_recordswith_inferred_schema,
     fit_from_formula, init_parallelism,
 };
+use gam_math::special::logistic;
 use ndarray::Array2;
 
 /// Deterministic seeded uniform in [0,1) (Numerical Recipes LCG, high bits).
@@ -74,9 +75,6 @@ impl Lcg {
     }
 }
 
-fn logistic(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
-}
 fn mu_true(x: f64) -> f64 {
     logistic(0.2 + 0.9 * x)
 }

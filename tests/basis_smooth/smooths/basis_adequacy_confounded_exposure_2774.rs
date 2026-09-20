@@ -43,6 +43,7 @@
 use gam::data::EncodedDataset;
 use gam::inference::model::{ColumnKindTag, DataSchema, SchemaColumn};
 use gam::{FitConfig, FitResult, fit_from_formula_with_notes};
+use gam_math::special::logistic;
 
 /// Number of population PCs in the fixture. Sixteen is load-bearing: the Duchon
 /// KERNEL's polynomial null space is `d + 1 = 17` columns, so `centers=24`
@@ -105,10 +106,6 @@ impl Lcg {
     fn next_bernoulli(&mut self, probability: f64) -> f64 {
         f64::from(self.next_uniform() < probability)
     }
-}
-
-fn logistic(value: f64) -> f64 {
-    1.0 / (1.0 + (-value).exp())
 }
 
 /// Which PC effect the outcome carries.

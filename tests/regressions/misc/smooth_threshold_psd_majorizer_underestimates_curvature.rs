@@ -50,11 +50,8 @@
 //! magnitude), #793.
 
 use gam::terms::analytic_penalties::{AnalyticPenalty, PsiSlice, SmoothThresholdPenalty};
+use gam_math::special::logistic;
 use ndarray::Array1;
-
-fn sigmoid(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
-}
 
 #[test]
 fn smooth_threshold_psd_majorizer_dominates_exact_hessian_below_threshold() {
@@ -86,7 +83,7 @@ fn smooth_threshold_psd_majorizer_dominates_exact_hessian_below_threshold() {
     // positive (the convex, below-threshold region).
     let tol = 1e-12;
     for i in 0..target.len() {
-        let g = sigmoid((target[i] - tau) / eps);
+        let g = logistic((target[i] - tau) / eps);
         assert!(
             majorizer[i] + tol >= exact[i],
             "PSD majorizer fails to dominate the exact Hessian at x = {} (gate g = {g:.4}): \

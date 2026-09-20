@@ -20,26 +20,13 @@ use gam::terms::smooth::{
 };
 use gam::types::{InverseLink, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::time::Instant;
 
 const SEED: u64 = 0x5CA1_AB1E_5C0F_E5A1;
-
-fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    sign * y
-}
 
 fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec) {
     let mut rng = StdRng::seed_from_u64(SEED.wrapping_add(n as u64));
@@ -71,7 +58,7 @@ fn build_problem(n: usize, flex: bool) -> (Array2<f64>, BernoulliMarginalSlopeTe
             .map(|(&xi, &zi)| (two_pi * xi).sin() + 0.5 * (two_pi * 2.0 * xi).cos() + 0.3 * zi),
     );
     let y = Array1::from_iter(true_eta.iter().map(|&eta| {
-        let p = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
+        let p = normal_cdf(eta);
         if rng.random::<f64>() < p { 1.0 } else { 0.0 }
     }));
     let weights = Array1::ones(n);

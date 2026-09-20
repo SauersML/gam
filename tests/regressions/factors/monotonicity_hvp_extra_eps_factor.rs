@@ -47,16 +47,8 @@
 //! fail; both pass once the `(eps * eps)` is corrected to `eps`.
 
 use gam::terms::analytic_penalties::{AnalyticPenalty, ShapeMonotonicityPenalty};
+use gam_math::special::logistic;
 use ndarray::Array1;
-
-fn sigmoid(z: f64) -> f64 {
-    if z > 0.0 {
-        1.0 / (1.0 + (-z).exp())
-    } else {
-        let ez = z.exp();
-        ez / (1.0 + ez)
-    }
-}
 
 #[test]
 fn monotonicity_hvp_matches_exact_hessian() {
@@ -76,7 +68,7 @@ fn monotonicity_hvp_matches_exact_hessian() {
     // Exact second derivative of P w.r.t. t_b (= t1), derived above.
     let slope = t1 - t0;
     let z = -direction * slope / eps;
-    let sigma = sigmoid(z);
+    let sigma = logistic(z);
     let kappa = weight * sigma * (1.0 - sigma) / eps; // correct curvature magnitude
 
     // H = kappa * [[1, -1], [-1, 1]]. Probe column 0 via v = e_0.

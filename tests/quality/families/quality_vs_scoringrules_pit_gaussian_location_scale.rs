@@ -58,26 +58,9 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::probability::normal_cdf;
 use ndarray::Array2;
 use std::path::Path;
-
-/// Standard normal CDF via the error function (`Phi(z) = 0.5*erfc(-z/sqrt2)`),
-/// implemented with the Abramowitz & Stegun 7.1.26 rational `erf` approximation
-/// (max abs error ~1.5e-7). This is gam's PIT on its OWN predictions; the Python
-/// reference recomputes the same `Phi` analytically (`scipy.stats.norm.cdf`) and
-/// the test asserts the two agree to within that approximation error.
-fn standard_normal_cdf(z: f64) -> f64 {
-    // erf via A&S 7.1.26
-    let sign = if z < 0.0 { -1.0 } else { 1.0 };
-    let x = (z / std::f64::consts::SQRT_2).abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-x * x).exp();
-    0.5 * (1.0 + sign * y)
-}
 
 /// One-sample Kolmogorov-Smirnov distance of `samples` against `Uniform(0,1)`:
 /// `D = sup_u |F_n(u) - u|`. With the sorted samples `u_(1) <= ... <= u_(n)` the
@@ -237,7 +220,7 @@ fn gam_location_scale_pit_is_calibrated_on_holdout() {
 
     // ---- gam's PIT on its own hold-out predictions -------------------------
     let pit: Vec<f64> = (0..grid_n)
-        .map(|i| standard_normal_cdf((holdout_y[i] - mu[i]) / sigma[i]))
+        .map(|i| normal_cdf((holdout_y[i] - mu[i]) / sigma[i]))
         .collect();
 
     // ---- OBJECTIVE calibration metric: KS distance of gam's PIT to U(0,1) --
@@ -465,7 +448,7 @@ fn gam_location_scale_pit_is_calibrated_on_holdout_on_real_data() {
 
     // ---- gam's PIT on its own held-out predictions, KS to U(0,1) in Rust ---
     let pit: Vec<f64> = (0..n_test)
-        .map(|i| standard_normal_cdf((test_gag[i] - mu[i]) / sigma[i]))
+        .map(|i| normal_cdf((test_gag[i] - mu[i]) / sigma[i]))
         .collect();
     let ks_gam = ks_distance_to_uniform(&pit);
 
@@ -504,7 +487,7 @@ fn gam_location_scale_pit_is_calibrated_on_holdout_on_real_data() {
         "gamlss sigma test length mismatch"
     );
     let gamlss_pit: Vec<f64> = (0..n_test)
-        .map(|i| standard_normal_cdf((test_gag[i] - gamlss_mu[i]) / gamlss_sigma[i]))
+        .map(|i| normal_cdf((test_gag[i] - gamlss_mu[i]) / gamlss_sigma[i]))
         .collect();
     let ks_gamlss = ks_distance_to_uniform(&gamlss_pit);
 

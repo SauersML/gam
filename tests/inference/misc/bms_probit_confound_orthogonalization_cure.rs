@@ -34,27 +34,12 @@ use gam::terms::smooth::{
 };
 use gam::types::{InverseLink, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
 const SEED: u64 = 0x_B115_C0FF_EE_15_900D;
-
-fn normal_cdf(x: f64) -> f64 {
-    // Φ(x) = ½(1 + erf(x/√2)); Abramowitz–Stegun erf approximation.
-    let a1 = 0.254_829_592;
-    let a2 = -0.284_496_736;
-    let a3 = 1.421_413_741;
-    let a4 = -1.453_152_027;
-    let a5 = 1.061_405_429;
-    let p = 0.327_591_1;
-    let s = x / std::f64::consts::SQRT_2;
-    let sign = if s < 0.0 { -1.0 } else { 1.0 };
-    let ax = s.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    0.5 * (1.0 + sign * y)
-}
 
 /// Build the confounded BMS-probit cohort.
 ///

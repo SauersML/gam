@@ -64,6 +64,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::special::logistic;
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -77,11 +78,6 @@ use std::path::Path;
 /// fighting a boundary discontinuity.
 fn g_of_x(x: f64) -> f64 {
     0.9 * (std::f64::consts::PI * x / 3.0).sin()
-}
-
-/// Logistic CDF (inverse logit).
-fn inv_logit(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
 }
 
 /// The real-data arm's shared-slope weather model and its cutpoint-only null, on
@@ -154,7 +150,7 @@ fn wine_stopping_ratio_probs(
             .design
             .apply(&fit.fit.beta)
             .iter()
-            .map(|&e| inv_logit(e))
+            .map(|&e| logistic(e))
             .collect()
     };
     let (q1, q2) = (stop_prob(0.0), stop_prob(1.0));
@@ -195,7 +191,7 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         // Sequentially decide where to stop. Level in 1..=4.
         let mut level = 4.0;
         for (j, &th) in theta.iter().enumerate() {
-            let q_j = inv_logit(th + shared); // P(Y = j+1 | Y >= j+1)
+            let q_j = logistic(th + shared); // P(Y = j+1 | Y >= j+1)
             if uunit.sample(&mut rng) < q_j {
                 level = (j + 1) as f64;
                 break;
@@ -315,7 +311,7 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         let thr3s = vec![thr3; n_grid];
         let eta = gam_eta(&xs, &x2s, &thr2s, &thr3s);
         for &e in &eta {
-            gam_q[jdx].push(inv_logit(e));
+            gam_q[jdx].push(logistic(e));
         }
     }
     // Per-level class probabilities P(Y = j) via the stopping-ratio chain rule:
@@ -432,9 +428,9 @@ fn gam_continuation_ratio_matches_vgam_sratio() {
         .collect();
     for &gx in &grid_x {
         let shared = g_of_x(gx); // x2 = 0 on the grid
-        let q1 = inv_logit(theta[0] + shared);
-        let q2 = inv_logit(theta[1] + shared);
-        let q3 = inv_logit(theta[2] + shared);
+        let q1 = logistic(theta[0] + shared);
+        let q2 = logistic(theta[1] + shared);
+        let q3 = logistic(theta[2] + shared);
         let c1 = q1;
         let c2 = (1.0 - q1) * q2;
         let c3 = (1.0 - q1) * (1.0 - q2) * q3;

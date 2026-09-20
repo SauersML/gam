@@ -59,6 +59,7 @@ use gam::terms::smooth::{
 };
 use gam::types::{InverseLink, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -66,24 +67,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const SEED: u64 = 0x370_0BAD_BA5E_11AE;
-
-fn erf_approx(x: f64) -> f64 {
-    let a1 = 0.254829592;
-    let a2 = -0.284496736;
-    let a3 = 1.421413741;
-    let a4 = -1.453152027;
-    let a5 = 1.061405429;
-    let p = 0.3275911;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    sign * y
-}
-
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + erf_approx(x / std::f64::consts::SQRT_2))
-}
 
 /// Build a small `disease ~ s(bmi)` BMS problem (the issue's repro shape) with a
 /// **forced large nonzero slope offset** so that `g_i = offset_s[i]` is far

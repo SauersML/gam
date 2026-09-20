@@ -40,6 +40,7 @@ use gam::test_support::reference::{
     Column, QualityPair, r_package_available, relative_l2, rmse, run_r,
 };
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
+use gam_math::probability::normal_cdf;
 use ndarray::Array2;
 use std::io::Write;
 
@@ -215,11 +216,6 @@ fn gam_posterior_mean_sd(
     (mean, sd)
 }
 
-/// Standard-normal CDF via erf (for the PIT uniformity check).
-fn norm_cdf(z: f64) -> f64 {
-    gam_math::probability::normal_cdf(z)
-}
-
 /// One-sample Kolmogorov–Smirnov statistic of `samples` against Uniform(0,1).
 fn ks_vs_uniform(samples: &mut [f64]) -> f64 {
     let m = samples.len();
@@ -299,7 +295,7 @@ fn gam_credible_intervals_are_calibrated_against_truth() {
             }
             // PIT: probability mass the gam posterior puts below the truth.
             let s = sd[i].max(1e-12);
-            pit.push(norm_cdf((eta_true[i] - mean[i]) / s));
+            pit.push(normal_cdf((eta_true[i] - mean[i]) / s));
         }
 
         if rep == 0 {

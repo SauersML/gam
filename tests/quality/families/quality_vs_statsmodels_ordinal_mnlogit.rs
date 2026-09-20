@@ -56,6 +56,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2, s};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -68,26 +69,10 @@ const J: usize = 5; // number of categorical levels {0,1,2,3,4}
 // ordinal bins. Y = #{c : latent > cut_c}, so there are J-1 = 4 interior cuts.
 const CUTS: [f64; 4] = [-1.0, 0.0, 1.0, 2.0];
 
-/// Standard normal CDF Φ via the error function identity Φ(z) = ½(1 + erf(z/√2)),
-/// with an Abramowitz–Stegun 7.1.26 rational approximation of erf (|err| < 1.5e-7).
-/// Used to evaluate the exact ordered-probit ground-truth simplex; precision far
-/// exceeds the multinomial approximation error the test actually measures.
-fn norm_cdf(z: f64) -> f64 {
-    let x = z / std::f64::consts::SQRT_2;
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * ax);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    let erf = sign * (1.0 - poly * (-ax * ax).exp());
-    0.5 * (1.0 + erf)
-}
-
 /// Exact ground-truth class probabilities for the ordered-probit generator at a
 /// systematic value `m = 0.6*x1 + sin(2π x2)`. Returns the length-J simplex.
 fn truth_simplex(m: f64) -> [f64; J] {
-    let surv = |k: usize| norm_cdf(m - CUTS[k]); // P(Y >= k+1) = Φ(m - CUTS[k])
+    let surv = |k: usize| normal_cdf(m - CUTS[k]); // P(Y >= k+1) = Φ(m - CUTS[k])
     let mut p = [0.0f64; J];
     p[0] = 1.0 - surv(0);
     for j in 1..(J - 1) {

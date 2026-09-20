@@ -35,6 +35,7 @@
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
+use gam_math::special::logistic;
 use gam_models::fit_orchestration::{FitConfig, FitResult, fit_from_formula};
 use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
@@ -61,15 +62,6 @@ const NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
 /// Fixed seed: the harness is a replicate-null consumer and inherits the repo
 /// determinism requirement, so the whole gate reproduces from this constant.
 const SEED: u64 = 0x1891_B1_C0DE_A11;
-
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
 
 /// A single smooth truth η(x) drawn from the prior over low-frequency
 /// functions: a sinusoid whose level / amplitude / frequency / phase are drawn
@@ -109,7 +101,7 @@ fn simulate_dataset(x: &[f64], truth: &SmoothTruth, rng: &mut CalibrationRng) ->
     let rows: Vec<StringRecord> = x
         .iter()
         .map(|&xi| {
-            let p = sigmoid(truth.eta(xi));
+            let p = logistic(truth.eta(xi));
             let y = if rng.uniform_open01() < p { 1.0 } else { 0.0 };
             StringRecord::from(vec![xi.to_string(), y.to_string()])
         })
@@ -182,7 +174,7 @@ fn binomial_glm_response_band_covers_truth_at_nominal() {
         // One independent interior evaluation point per replication.
         let span = interior_hi - interior_lo;
         let j = interior_lo + (rng.uniform_open01() * span as f64) as usize % span;
-        let p_true = sigmoid(truth.eta(x[j]));
+        let p_true = logistic(truth.eta(x[j]));
 
         for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
             let (lower, upper) = response_band(&fit, level);

@@ -68,34 +68,12 @@ use gam::test_support::reference::{Column, QualityPair, relative_l2, rmse, run_p
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::normal_cdf;
 use ndarray::Array2;
-
-/// Standard normal CDF via erfc (matches scipy / lifelines `norm.cdf`).
-fn norm_cdf(z: f64) -> f64 {
-    0.5 * erfc(-z / std::f64::consts::SQRT_2)
-}
-
-/// Complementary error function (Numerical-Recipes rational approximation,
-/// ~1e-7 absolute — far below any survival-curve tolerance asserted here).
-fn erfc(x: f64) -> f64 {
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.5 * z);
-    let ans = t
-        * (-z * z - 1.26551223
-            + t * (1.00002368
-                + t * (0.37409196
-                    + t * (0.09678418
-                        + t * (-0.18628806
-                            + t * (0.27886807
-                                + t * (-1.13520398
-                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
-            .exp();
-    if x >= 0.0 { ans } else { 2.0 - ans }
-}
 
 /// Lognormal-AFT survival `S(t|x) = 1 - Phi((log t - mu) / sigma)`.
 fn lognormal_survival(t: f64, mu: f64, sigma: f64) -> f64 {
-    1.0 - norm_cdf((t.ln() - mu) / sigma)
+    1.0 - normal_cdf((t.ln() - mu) / sigma)
 }
 
 #[test]

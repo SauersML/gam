@@ -13,10 +13,7 @@
 
 use gam::inference::quadrature::{QuadratureContext, integrated_inverse_link_mean_and_derivative};
 use gam::types::LinkFunction;
-
-fn sigmoid(x: f64) -> f64 {
-    1.0 / (1.0 + (-x).exp())
-}
+use gam_math::special::logistic;
 
 /// E[f(eta)] for eta ~ N(mu, sigma^2) via composite Simpson over +/-18 sigma.
 fn gaussian_expectation(f: impl Fn(f64) -> f64, mu: f64, sigma: f64) -> f64 {
@@ -48,7 +45,7 @@ fn logit_integrated_mean_is_accurate_at_large_sigma() {
     for (mu, sigma) in cases {
         let got = integrated_inverse_link_mean_and_derivative(&ctx, LinkFunction::Logit, mu, sigma)
             .unwrap();
-        let want = gaussian_expectation(sigmoid, mu, sigma);
+        let want = gaussian_expectation(logistic, mu, sigma);
         let err = (got.mean - want).abs();
         if err > worst {
             worst = err;

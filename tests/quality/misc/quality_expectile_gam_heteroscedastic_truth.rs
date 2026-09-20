@@ -47,6 +47,7 @@ use gam::smooth::build_term_collection_design;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
+use gam_math::probability::{normal_cdf, normal_pdf};
 use ndarray::Array2;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -62,16 +63,6 @@ fn truth_scale(x: f64) -> f64 {
     0.35 + 0.9 * x
 }
 
-/// Standard-normal pdf.
-fn phi(z: f64) -> f64 {
-    (-(z * z) / 2.0).exp() / (2.0 * std::f64::consts::PI).sqrt()
-}
-
-/// Standard-normal cdf via erf.
-fn big_phi(z: f64) -> f64 {
-    gam_math::probability::normal_cdf(z)
-}
-
 /// τ-expectile of the standard normal, the root `m` of the defining equation
 /// `τ · E[(Z−m)_+] = (1−τ) · E[(m−Z)_+]` with the closed-form partial
 /// expectations `E[(Z−m)_+] = φ(m) − m(1−Φ(m))` and
@@ -80,8 +71,8 @@ fn big_phi(z: f64) -> f64 {
 /// scale factor σ(x).
 fn standard_normal_expectile(tau: f64) -> f64 {
     let balance = |m: f64| -> f64 {
-        let upper = phi(m) - m * (1.0 - big_phi(m)); // E[(Z−m)_+]
-        let lower = phi(m) + m * big_phi(m); // E[(m−Z)_+]
+        let upper = normal_pdf(m) - m * (1.0 - normal_cdf(m)); // E[(Z−m)_+]
+        let lower = normal_pdf(m) + m * normal_cdf(m); // E[(m−Z)_+]
         tau * upper - (1.0 - tau) * lower
     };
     let (mut lo, mut hi) = (-8.0_f64, 8.0_f64);

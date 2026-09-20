@@ -25,6 +25,7 @@ use gam::families::multinomial::{
     predict_multinomial_formula_with_intervals, predict_multinomial_formula_with_intervals_in_mode,
 };
 use gam::{FitConfig, encode_recordswith_inferred_schema};
+use gam_math::special::logistic;
 use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
 
 const N_TRAIN: usize = 240;
@@ -34,15 +35,6 @@ const SEED: u64 = 0x1891_A17_1_C0DE;
 
 const CLASS_LO: &str = "lo";
 const CLASS_HI: &str = "hi";
-
-fn sigmoid(x: f64) -> f64 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
-}
 
 /// A low-frequency smooth log-odds truth η(x) drawn from the prior — the same
 /// shape family the other #1891 mean-band gates use.
@@ -89,7 +81,7 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
 
         let mut rows: Vec<StringRecord> = Vec::with_capacity(N_TRAIN);
         for &xi in &x {
-            let p_hi = sigmoid(truth.eta(xi));
+            let p_hi = logistic(truth.eta(xi));
             let label = if rng.uniform_open01() < p_hi {
                 CLASS_HI
             } else {
@@ -117,7 +109,7 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
 
         let j = interior_lo + (rng.uniform_open01() * span as f64) as usize % span;
         let x_star = x[j];
-        let p_true = sigmoid(truth.eta(x_star));
+        let p_true = logistic(truth.eta(x_star));
 
         let new_headers = vec!["x".to_string()];
         let new_rows = vec![StringRecord::from(vec![x_star.to_string()])];
@@ -193,7 +185,7 @@ fn multinomial_conditional_band_is_narrower_than_the_corrected_band() {
 
     let mut rows: Vec<StringRecord> = Vec::with_capacity(N_TRAIN);
     for &xi in &x {
-        let p_hi = sigmoid(truth.eta(xi));
+        let p_hi = logistic(truth.eta(xi));
         let label = if rng.uniform_open01() < p_hi {
             CLASS_HI
         } else {

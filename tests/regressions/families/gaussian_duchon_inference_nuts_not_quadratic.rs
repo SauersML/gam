@@ -30,6 +30,7 @@ use gam::basis::{
 use gam::estimate::FitOptions;
 use gam::smooth::{ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec};
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -62,22 +63,6 @@ fn duchon2_smooth(name: &str, centers: usize) -> SmoothTermSpec {
     }
 }
 
-fn erf_approx(x: f64) -> f64 {
-    let (a1, a2, a3, a4, a5, p) = (
-        0.254829592,
-        -0.284496736,
-        1.421413741,
-        -1.453152027,
-        1.061405429,
-        0.3275911,
-    );
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let ax = x.abs();
-    let t = 1.0 / (1.0 + p * ax);
-    let y = 1.0 - (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t * (-ax * ax).exp();
-    sign * y
-}
-
 /// Two spatial coordinates and a BINARY 0/1 response from a thresholded latent
 /// field — the regime where the Gaussian-identity ρ posterior is poorly
 /// identified and escalates to Tier-2 NUTS.
@@ -107,7 +92,7 @@ fn simulate(n: usize) -> (Array2<f64>, Array1<f64>) {
         let f = (0.8 * p1).sin() + 0.5 * (0.6 * p2).cos();
         let slope = 0.3 + 0.2 * p1;
         let eta = f + slope * z[i];
-        let prob = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
+        let prob = normal_cdf(eta);
         if rng.random::<f64>() < prob { 1.0 } else { 0.0 }
     }));
     (data, y)

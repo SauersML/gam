@@ -31,6 +31,7 @@ use gam::terms::smooth::{
 };
 use gam::types::{InverseLink, StandardLink};
 use gam::{BernoulliMarginalSlopeFitRequest, FitRequest, FitResult, fit_model};
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -58,19 +59,6 @@ fn matern_smooth(name: &str, centers: usize) -> SmoothTermSpec {
         shape: ShapeConstraint::None.into(),
         joint_null_rotation: None,
     }
-}
-
-fn erf_approx(x: f64) -> f64 {
-    // Abramowitz-Stegun 7.1.26 — only used to synthesize labels, identical
-    // across both fits so it cannot itself introduce a difference.
-    let t = 1.0 / (1.0 + 0.327_591_1 * x.abs());
-    let y = 1.0
-        - (((((1.061_405_429 * t - 1.453_152_027) * t) + 1.421_413_741) * t - 0.284_496_736) * t
-            + 0.254_829_592)
-            * t
-            * (-x * x).exp();
-    let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    sign * y
 }
 
 fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSpec) {
@@ -101,7 +89,7 @@ fn build(n: usize, centers: usize) -> (Array2<f64>, BernoulliMarginalSlopeTermSp
         f + slope * z[i]
     }));
     let y = Array1::from_iter(true_eta.iter().map(|&eta| {
-        let p = 0.5 * (1.0 + erf_approx(eta / std::f64::consts::SQRT_2));
+        let p = normal_cdf(eta);
         if rng.random::<f64>() < p { 1.0 } else { 0.0 }
     }));
 

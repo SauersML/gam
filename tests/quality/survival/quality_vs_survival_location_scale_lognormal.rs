@@ -90,6 +90,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::probability::normal_cdf;
 use ndarray::Array2;
 use std::path::Path;
 
@@ -394,37 +395,6 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
          > ref_err+0.05={:.4}",
         ref_log_sigma_err + 0.05
     );
-}
-
-/// Standard normal CDF via the error function (Abramowitz & Stegun 7.1.26-grade
-/// rational `erf` is not accurate enough for survival-tail log-likelihoods, so
-/// use a high-accuracy `erfc` approximation). Returns Phi(x) = 0.5*erfc(-x/sqrt2).
-fn normal_cdf(x: f64) -> f64 {
-    0.5 * erfc(-x * std::f64::consts::FRAC_1_SQRT_2)
-}
-
-/// Complementary error function, W. J. Cody's rational Chebyshev approximation
-/// (relative error < 1e-15 across the real line). Needed because the censored
-/// log-likelihood evaluates the upper tail `log(1 - Phi(z))` where naive
-/// `1 - Phi` cancels catastrophically; `erfc` keeps the tail accurate.
-fn erfc(x: f64) -> f64 {
-    // Cody's algorithm 715 / `calerf` for k=1 (erfc). Constants reproduce the
-    // double-precision reference to machine epsilon.
-    let z = x.abs();
-    let t = 1.0 / (1.0 + 0.5 * z);
-    // Numerical Recipes `erfcc`: fractional error everywhere < 1.2e-7, then
-    // refined by one more polynomial term set used widely in survival codes.
-    let tau = t
-        * (-z * z - 1.26551223
-            + t * (1.00002368
-                + t * (0.37409196
-                    + t * (0.09678418
-                        + t * (-0.18628806
-                            + t * (0.27886807
-                                + t * (-1.13520398
-                                    + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
-            .exp();
-    if x >= 0.0 { tau } else { 2.0 - tau }
 }
 
 /// Mean per-observation lognormal-AFT negative log-likelihood under right

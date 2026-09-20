@@ -33,15 +33,11 @@ use gam::test_support::reference::{
     Column, auc_no_skill_floor, pad_to, relative_l2, run_python, run_r,
 };
 use gam::{FitConfig, FitResult, fit_from_formula, init_parallelism, load_csvwith_inferred_schema};
+use gam_math::special::logistic;
 use ndarray::Array2;
 use std::path::Path;
 
 const PROSTATE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/prostate.csv");
-
-/// Logistic (inverse-logit) link: eta -> probability.
-fn inv_logit(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
 
 /// Area under the ROC curve via the Mann-Whitney U statistic — the rank
 /// agreement of a probability score against the binary truth.
@@ -155,7 +151,7 @@ fn gam_binomial_logit_generalizes_on_heldout_prostate() {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at held-out test points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
+    let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| logistic(e)).collect();
     assert_eq!(gam_prob.len(), ntest, "gam held-out probability length");
 
     // Every reference column is shipped at the common wire width `n` (the
@@ -433,7 +429,7 @@ fn gam_binomial_logit_generalizes_on_heldout_prostate_on_real_data() {
     let design = build_term_collection_design(grid.view(), &fit.resolvedspec)
         .expect("rebuild design at held-out test points");
     let gam_eta: Vec<f64> = design.design.apply(&fit.fit.beta).to_vec();
-    let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| inv_logit(e)).collect();
+    let gam_prob: Vec<f64> = gam_eta.iter().map(|&e| logistic(e)).collect();
     assert_eq!(gam_prob.len(), ntest, "gam held-out probability length");
 
     // ---- (B) mgcv smooth baseline: fit TRAIN, predict TEST ----------------

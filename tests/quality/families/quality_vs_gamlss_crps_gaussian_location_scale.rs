@@ -54,6 +54,7 @@ use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
     load_csvwith_inferred_schema,
 };
+use gam_math::probability::{normal_cdf, normal_pdf};
 use ndarray::Array2;
 use std::path::Path;
 
@@ -63,33 +64,12 @@ use std::path::Path;
 /// a textbook heteroscedastic Gaussian relationship, hence a location-scale fit.
 const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
 
-/// Standard-normal CDF via the error function (Abramowitz & Stegun 7.1.26
-/// rational approximation of erf, |error| < 1.5e-7) — plain Rust so the CRPS
-/// floor used in the assertion never routes through a reference tool.
-fn norm_cdf(x: f64) -> f64 {
-    // erf(z) for z >= 0; erf(-z) = -erf(z).
-    let z = x / std::f64::consts::SQRT_2;
-    let sign = if z < 0.0 { -1.0 } else { 1.0 };
-    let a = z.abs();
-    let t = 1.0 / (1.0 + 0.3275911 * a);
-    let poly = t
-        * (0.254829592
-            + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
-    let erf = sign * (1.0 - poly * (-a * a).exp());
-    0.5 * (1.0 + erf)
-}
-
-/// Standard-normal PDF.
-fn norm_pdf(x: f64) -> f64 {
-    (-(0.5 * x * x)).exp() / (2.0 * std::f64::consts::PI).sqrt()
-}
-
 /// Closed-form CRPS of a Gaussian predictive law N(mean, sd) evaluated at the
 /// realized observation `y` (Gneiting & Raftery 2007). Lower is better; the
 /// minimum over all predictive laws is attained by the true generating law.
 fn crps_gaussian(y: f64, mean: f64, sd: f64) -> f64 {
     let w = (y - mean) / sd;
-    sd * (w * (2.0 * norm_cdf(w) - 1.0) + 2.0 * norm_pdf(w) - 1.0 / std::f64::consts::PI.sqrt())
+    sd * (w * (2.0 * normal_cdf(w) - 1.0) + 2.0 * normal_pdf(w) - 1.0 / std::f64::consts::PI.sqrt())
 }
 
 #[test]

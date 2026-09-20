@@ -19,14 +19,10 @@
 
 use csv::StringRecord;
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam_math::probability::normal_cdf;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Uniform};
-
-/// Φ(x): standard normal CDF via erf, so the data-generating link is exact probit.
-fn norm_cdf(x: f64) -> f64 {
-    0.5 * (1.0 + libm::erf(x / std::f64::consts::SQRT_2))
-}
 
 fn encode(x: &[f64], y: &[f64]) -> gam::inference::data::EncodedDataset {
     let headers: Vec<String> = ["y", "x"].into_iter().map(String::from).collect();
@@ -124,7 +120,7 @@ fn flexible_link_linkwiggle_smooth_mean_engages_or_fails_loud() {
     let y: Vec<f64> = x
         .iter()
         .map(|&xi| {
-            let p = norm_cdf(0.8 * xi);
+            let p = normal_cdf(0.8 * xi);
             if uu.sample(&mut rng) < p { 1.0 } else { 0.0 }
         })
         .collect();
@@ -146,7 +142,7 @@ fn flexible_link_linkwiggle_parametric_mean_engages_or_fails_loud() {
     let y: Vec<f64> = x
         .iter()
         .map(|&xi| {
-            let p = norm_cdf(1.8 * (0.7 * xi).tanh());
+            let p = normal_cdf(1.8 * (0.7 * xi).tanh());
             if uu.sample(&mut rng) < p { 1.0 } else { 0.0 }
         })
         .collect();

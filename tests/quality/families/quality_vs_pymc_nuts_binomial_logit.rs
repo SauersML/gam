@@ -38,6 +38,7 @@ use gam::{
     FitConfig, FitResult, fit_from_formula, hmc::NutsConfig, init_parallelism,
     load_csvwith_inferred_schema, sample::sample_saved_model,
 };
+use gam_math::special::logistic;
 use ndarray::{Array1, Array2};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -82,10 +83,6 @@ impl SplitMix64 {
     }
 }
 
-fn inv_logit(eta: f64) -> f64 {
-    1.0 / (1.0 + (-eta).exp())
-}
-
 /// True latent linear predictor at x — the function the smooth must recover.
 fn eta_true(x: f64) -> f64 {
     0.3 + 0.8 * (2.0 * std::f64::consts::PI * x / 10.0).sin()
@@ -117,7 +114,7 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated() {
     for i in 0..n {
         // Evenly spaced x for a well-conditioned design, then jittered draws.
         let xi = 10.0 * (i as f64) / ((n - 1) as f64);
-        let p = inv_logit(eta_true(xi));
+        let p = logistic(eta_true(xi));
         let yi = if rng.unit() < p { 1.0 } else { 0.0 };
         x.push(xi);
         y.push(yi);
@@ -671,7 +668,7 @@ fn gam_nuts_binomial_logit_recovers_truth_and_is_calibrated_on_real_data() {
         }
         let eta = x_test.dot(&beta_draw);
         for i in 0..n_test {
-            prob_sum[i] += inv_logit(eta[i]);
+            prob_sum[i] += logistic(eta[i]);
         }
     }
     let gam_prob: Vec<f64> = prob_sum.iter().map(|&s| s / ndraw as f64).collect();

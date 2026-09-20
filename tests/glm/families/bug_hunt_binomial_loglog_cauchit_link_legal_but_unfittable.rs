@@ -34,6 +34,7 @@ use csv::StringRecord;
 use gam::smooth::build_term_collection_design;
 use gam::types::{LinkFunction, ResponseFamily};
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula};
+use gam_math::special::logistic;
 use gam_predict::predict_gam;
 use ndarray::{Array1, Array2};
 
@@ -53,10 +54,6 @@ impl SplitMix64 {
     fn unit(&mut self) -> f64 {
         ((self.next_u64() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
     }
-}
-
-fn logistic(z: f64) -> f64 {
-    1.0 / (1.0 + (-z).exp())
 }
 
 /// `n` rows of a single-covariate binomial dataset with `x ~ U(-1.6, 1.6)` and
