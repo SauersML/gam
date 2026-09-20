@@ -451,7 +451,7 @@ impl<'a> RemlState<'a> {
         };
         match &outcome {
             SmoothingCorrectionOutcome::FirstOrder { method, .. } => {
-                log::info!("[smoothing-correction] branch=first-order method={method:?}");
+                log::debug!("[smoothing-correction] branch=first-order method={method:?}");
             }
             SmoothingCorrectionOutcome::Unavailable {
                 reason: SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { error },

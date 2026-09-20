@@ -1156,7 +1156,10 @@ fn deterministic_gaussian_standard_fit(
         smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
-        weighted_gram: Some(xtwx),
+        // `X'WX` is stored beside `H` in the gauge's active frame (gam#3346).
+        // Every penalty vanishes on the tangent face, so there the Gram
+        // `Z'X'WX Z` is the penalized Hessian itself.
+        weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
