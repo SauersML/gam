@@ -37,17 +37,12 @@ magic	crates/gam-custom-family/src/joint_newton.rs	<= 1e-3	https://github.com/Sa
 magic	crates/gam-event-history/src/static_state.rs	> 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/block_specs.rs	.max(2.0e-5)	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/bms/deviation_runtime.rs	> 1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/mod.rs	< 1e-18	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/bms/mod.rs	<= 1e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/drivers/constant_curvature_kappa_jet.rs	> 1.0e-7	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/drivers/constant_curvature_kappa_jet.rs	> 1.0e-8	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs	.max(1e-12)	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/fit_orchestration/fit.rs	<= 1e-10	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/inference/saved_summary.rs	< -1e-6	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/inference/saved_summary.rs	> 1e-6	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/latent_outer.rs	> 1.0e-6	https://github.com/SauersML/gam/issues/2469
-magic	crates/gam-models/src/latent_outer.rs	> 1.0e-6	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< -1e-12	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469
 magic	crates/gam-models/src/survival/construction.rs	< 1e-15	https://github.com/SauersML/gam/issues/2469

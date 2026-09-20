@@ -2550,6 +2550,22 @@
   {
     "base": "5994ad54c4c39f086905591da98990d8a21a87dd",
     "items": [
+      "crates/gam-predict/src/large_scale_reml_stress_tests.rs:const:NORMAL_95_TWO_SIDED_Z"
+    ],
+    "reason": "large_scale_reml_stress_coverage read the published interval's standard error as width / (2 * NORMAL_95_TWO_SIDED_Z). Since 698df1148d predict() builds an estimated-scale Gaussian interval on the Student-t reference on n - edf (IntervalReference::of_fit), so that read-back overstated the published variance by (t/z)^2 and the FirstOrderIdentifiedSubspace positive control refused a correct Vp. The test now takes one multiplier per replicate from IntervalReference::of_fit(&fit).central_multiplier(NOMINAL_COVERAGE), the one predict() uses, for the read-back and for the intervals it builds itself. The fixed normal quantile has no use left and is deleted.",
+    "evidence": "direct gate dy3 w2thb-g9pred (direct-dy3-w2thb-g9pred.log): TIPCHECK at 32560e9b3d, check --workspace --all-targets, pyffi, source-removal guard and census RC 0, large_scale_reml_stress_coverage PASS; mutant dy4 w2thb-m8pred arm mcov FIRED"
+  },
+  {
+    "base": "d91ee7df76138dce9bb5e0e1cade3b39ac1a2bea",
+    "items": [
+      "crates/gam-terms/src/smooth/term_specs_tests.rs:fn:non_materialized_penalty_falls_back_conservatively"
+    ],
+    "reason": "The te() joint-unpenalized-dimension guess is retired: joint_unpenalized_dim no longer reports 0 (or a single penalty's own null dim) for a penalty whose stored block is a Kronecker factor, it reads the materialized p_local x p_local block of every penalty. The removed test pinned that fallback, including a shape (a 1x1 factor for p_local = 2) the builder never produces now.",
+    "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
+  },
+  {
+    "base": "2c78a5aa48b8e797413ec1ffab95cb0cccbe557c",
+    "items": [
       "crates/gam-model-api/src/families/custom_family/options.rs:const:FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP",
       "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs:const:SPATIAL_PSI_BFGS_STEP_CAP",
       "crates/gam-solve/src/rho_optimizer/run.rs:fn:bfgs_axis_step_caps",
