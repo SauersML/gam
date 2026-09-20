@@ -1099,6 +1099,7 @@ fn deterministic_gaussian_standard_fit(
         // Exact fit ⇒ residual variance is exactly zero.
         dispersion: gam_solve::estimate::Dispersion::ZERO_ESTIMATE,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
         weighted_gram: Some(xtwx),
@@ -3174,6 +3175,7 @@ fn publish_expectile_sandwich_covariance(
         fit.covariance_corrected = None;
         if let Some(inference) = fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
+            inference.smoothing_correction_factorized = None;
         }
         fit.artifacts.covariance_declined = Some(declined);
         return Ok(());

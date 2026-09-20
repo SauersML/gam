@@ -3806,6 +3806,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             dispersion: gam::estimate::Dispersion::known(1.0)
                 .expect("unit known dispersion is valid"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,

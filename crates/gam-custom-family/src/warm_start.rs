@@ -1148,6 +1148,7 @@ pub fn blockwise_fit_from_parts(
         reparam_qs: None,
         dispersion: gam_solve::model_types::Dispersion::UNIT,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram,

@@ -1443,6 +1443,17 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
                 *value *= factor;
             }
         }
+        // The factorized branch's correction `C = B·Bᵀ` takes `D·C·D`, so its
+        // factor's rows scale like the coefficients, as do its corrected
+        // standard errors (#3283).
+        if let Some(factorized) = inference.smoothing_correction_factorized.as_mut() {
+            for (mut row, &factor) in factorized.factor.rows_mut().into_iter().zip(row_factors.iter()) {
+                row *= factor;
+            }
+            for (value, &factor) in factorized.standard_errors.iter_mut().zip(row_factors.iter()) {
+                *value *= factor;
+            }
+        }
         // X'WX is a precision-side quadratic form exactly like H, and the influence
         // map acts on the same coordinates, so both change with the units only
         // where H does.
@@ -2533,6 +2544,7 @@ fn survival_unified_fit_result(
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,

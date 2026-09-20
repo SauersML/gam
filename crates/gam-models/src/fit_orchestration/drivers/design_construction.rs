@@ -3479,6 +3479,7 @@ fn fit_bounded_term_collection_with_design(
                 reparam_qs: None,
                 dispersion,
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
