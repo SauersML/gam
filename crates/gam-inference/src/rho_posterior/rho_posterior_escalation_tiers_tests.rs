@@ -11,7 +11,9 @@
 //! mixture-corrected coefficient covariance must reduce to the plug-in
 //! `Vb(ρ̂)` when all mixture weight concentrates at `ρ̂`.
 
-use super::{rho_posterior_nuts, rho_posterior_quadrature};
+use super::{
+    RhoPosteriorEscalation, escalate_rho_posterior, rho_posterior_nuts, rho_posterior_quadrature,
+};
 use ndarray::{Array1, Array2, array};
 
 /// `½ (ρ−ρ̂)ᵀ H (ρ−ρ̂)` — the criterion whose exact posterior is `N(ρ̂, H⁻¹)`.
@@ -115,7 +117,6 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
                     gaussian_quadratic_grad(rho, &rho_hat, &h),
                 ))
             },
-            512,
             seed,
         )
         .expect("tier-2 NUTS on a Gaussian quadratic must succeed")
@@ -123,7 +124,14 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
     let samples = run();
 
     assert!(samples.converged, "rhat = {} must be < 1.1", samples.rhat);
-    assert!(samples.samples.nrows() >= 512);
+    // #3187: the draw count is derived from the run, not requested. The ESS
+    // estimator never credits more than one effective draw per draw.
+    assert!(
+        samples.samples.nrows() as f64 >= samples.ess,
+        "{} draws, ess = {}",
+        samples.samples.nrows(),
+        samples.ess
+    );
     for i in 0..2 {
         assert!(
             (samples.mean[i] - rho_hat[i]).abs() < 0.12,
@@ -152,3 +160,44 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
     }
 }
 
+/// (c) #3187: the seam routes by cost, not by a dimension cap. The `3^4 = 81`
+/// node grid is cheaper than any converged NUTS run, so `K = 4` runs quadrature;
+/// the `3^5 = 243` node grid is not, so `K = 5` runs NUTS; and `K = 17`, past the
+/// old cap, still runs NUTS instead of reporting escalation unavailable.
+#[test]
+fn escalation_routes_to_the_tier_with_fewer_criterion_evaluations() {
+    for (k, quadrature) in [(4, true), (5, false), (17, false)] {
+        let rho_hat = Array1::from_shape_fn(k, |i| 0.1 * i as f64);
+        let h = Array2::from_shape_fn((k, k), |(i, j)| if i == j { 2.0 } else { 0.0 });
+        let escalation = escalate_rho_posterior(
+            &rho_hat,
+            &h,
+            |rho: &Array1<f64>| Ok(gaussian_quadratic(rho, &rho_hat, &h)),
+            |rho: &Array1<f64>| {
+                Ok((
+                    gaussian_quadratic(rho, &rho_hat, &h),
+                    gaussian_quadratic_grad(rho, &rho_hat, &h),
+                ))
+            },
+        );
+        match escalation {
+            RhoPosteriorEscalation::Quadrature(mixture) => {
+                assert!(quadrature, "K = {k} must not run quadrature");
+                assert_eq!(mixture.nodes.len(), 3usize.pow(k as u32));
+            }
+            RhoPosteriorEscalation::Nuts(samples) => {
+                assert!(!quadrature, "K = {k} must not run NUTS");
+                assert!(
+                    samples.converged,
+                    "K = {k}: rhat = {}, ess = {}",
+                    samples.rhat,
+                    samples.ess
+                );
+                assert_eq!(samples.mean.len(), k);
+            }
+            RhoPosteriorEscalation::Unavailable { reason, .. } => {
+                panic!("K = {k} escalation must run, got Unavailable: {reason}")
+            }
+        }
+    }
+}
