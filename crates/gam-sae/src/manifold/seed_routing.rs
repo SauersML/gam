@@ -1,15 +1,14 @@
 //! Cold-start seed routing for the SAE-manifold fit (issues #174, #629, #630).
 //!
 //! These are the closed-form seeding-policy primitives the fit entry uses
-//! before the joint Arrow-Schur solve: the joint ridge-LSQ decoder seed, the
+//! before the joint Arrow-Schur solve: the joint minimum-norm LSQ decoder seed, the
 //! mean-centred residual-logit routing seed, the output-energy clustering that
 //! separates periodic seed coordinates, and the deterministic alternating initialization that
 //! refines all three together. Moved here from `gam-pyffi` (issue #2236) so the
 //! CLI, Rust library users, and the Python binding seed identically; the
 //! binding is marshalling only.
 
-use faer::Side;
-use gam_linalg::faer_ndarray::{FaerCholesky, FaerSvd, fast_ata, fast_atb};
+use gam_linalg::faer_ndarray::{FaerSvd, fast_atb};
 use ndarray::{Array1, Array2, Array3, ArrayView2, ArrayView3, Axis};
 
 use crate::assignment::{ordered_beta_bernoulli_row, threshold_gate_row, topk_row};
@@ -614,7 +613,7 @@ pub(crate) fn sae_refine_mobius_seed_coords_by_cluster(
     Ok(())
 }
 
-/// Seed each atom's decoder coefficient block via a joint ridge-regularized
+/// Seed each atom's decoder coefficient block via the joint minimum-norm
 /// least-squares projection of `Z` onto the atom design `[a_init * Phi_1, ...,
 /// a_init * Phi_K]`, where `a_init` is the assignment map that the inner Newton
 /// driver will produce at iteration 0 from the supplied `initial_logits`.
@@ -765,7 +764,8 @@ pub fn sae_decoder_lsq_init(
     // with column count M_total = sum_k basis_sizes[k]. If every atom has zero
     // weight on a row, that row contributes nothing — but with all the
     // supported initial logits we use, a_init has at least one non-zero
-    // column per row. Solve (X^T X + ridge I) B = X^T Z, then split.
+    // column per row. Take the minimum-norm least-squares solution
+    // B = X^+ Z, then split.
     let offsets: Vec<usize> = {
         let mut acc = 0usize;
         let mut v = Vec::with_capacity(k_atoms + 1);
@@ -794,7 +794,14 @@ pub fn sae_decoder_lsq_init(
             }
         }
     }
-    // EXPERIMENT #3260: min-norm LSQ seed, no ridge.
+    // Minimum-norm least-squares seed through the thin SVD of X (#3260). The
+    // near-collinear per-atom column blocks of a cold multi-atom seed put
+    // near-null directions in X; the pseudo-inverse assigns them zero weight
+    // (singular values at or below the shared numerical-rank cutoff are
+    // dropped), so the seed carries no coefficient along a direction the data
+    // does not resolve. A diagonal ridge instead shrinks every resolved
+    // direction and moves the seed off the least-squares manifold that the
+    // inner data-fit solve refines from.
     let b_joint = crate::manifold::solve_design_least_squares(x.view(), z)?;
     if !b_joint.iter().all(|v| v.is_finite()) {
         return Err("sae_decoder_lsq_init: non-finite LSQ solution".to_string());
@@ -929,6 +936,8 @@ pub(crate) fn sae_refine_routing_seed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use faer::Side;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata};
 
     #[test]
     fn mobius_double_cover_seed_reconstructs_planted_band() {
