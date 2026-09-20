@@ -2665,5 +2665,14 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "7c825599cae63f30b4d038924165db8a1e5c1bdc",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:assembled_operator_fingerprint",
+      "crates/gam-custom-family/src/assembly.rs:fn:hash_f64"
+    ],
+    "reason": "#3641: the assembled-operator cache keyed an Operator-source joint Hessian on a 64-bit hash of its diagonal plus (rho, beta-hat, penalties, knobs) and folded the pseudo-logdet mode to mode == Smooth, so fits sharing the process-global cache could be handed another matrix's operator. The key is now the assembled symmetrized J itself plus the PseudoLogdetMode, compared by exact element equality; the fingerprint and its f64 hashing helper have no remaining caller.",
+    "evidence": "assembly::assembled_operator_cache_tests::same_diagonal_different_curvature_never_shares_an_operator_3641: [[2,0],[0,2]] and [[2,1],[1,2]] (same diagonal) are priced ln 4 and ln 3 under Smooth, HardPseudo and PositiveDefinite; the_cache_key_is_the_exact_matrix_and_mode_3641: a different mode or a one-ulp entry change misses, -0.0 hits +0.0."
   }
 ]
