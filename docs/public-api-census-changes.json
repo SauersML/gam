@@ -4737,5 +4737,59 @@
     },
     "reason": "#3015: no location-scale family residualizes its log-sigma design. location_scale_log_sigma_design (the raw noise design, row-checked) replaces prepared_gaussian_log_sigma_design for Gaussian and identified_binomial_log_sigma_design for binomial: the binomial likelihood sees the blocks only through q = -eta_t*exp(-eta_sigma), whose tangent null space is {d eta_t = eta_t * d eta_sigma}, so a log-sigma column the threshold spans is identified wherever the threshold varies, and residualizing it erased that scale effect before the audit dropped the zeroed column. The saved-model builder no longer derives a transform (LocationScaleResponse::Binomial carries only its link), so the transform-fitting route in gam-model-kernels scale_design.rs (build_scale_deviation_transform, build_scale_deviation_transform_design, build_scale_deviation_transform_impl, solve_scale_projection, build_weighted_primary_design, choose_scale_projection_ridge_alpha, SCALE_PROJECTION_REPLAY_RCOND_FLOOR) has no caller and is deleted; saved models that carry a transform still replay it through scale_transform_from_payload and build_scale_deviation_operator. The three tests of the deleted fitting code go with it; scale_transform_payload_round_trips_alpha is restated on a hand-built transform as scale_transform_payload_round_trips_every_field.",
     "evidence": "Lane gate ls-surv (acn112 60-63). Lane commit c14fde8317 on c93dda4199: the guards name exactly these removals without this entry; cargo check --workspace --all-targets (root ban scanner, 0 rows) and the gam-pyffi check exit 0. Lane probe on gamfit's #3015 truth (log-sigma slope 0.3 on x3, which the threshold's duchon(x2, x3) spans): the fitted slope is 0.257 +- 0.059 at n = 2000 and 0.277 +- 0.029 at n = 20000; the residualized design zeroed and dropped that column (log-likelihood -11782.10 against -11738.08 at n = 20000). a_saved_scale_transform_replays_its_noise_design_bit_for_bit pins the replay of a saved transform. Re-run at base ac93f7247f402591f76e040bd2bf94342ee753e4: the guards pass with this entry and git grep -w finds none of the removed names under crates/."
+  },
+  {
+    "base": "fc7e17b7b3644b88ef26d2de092a186b5d5a3087",
+    "removed": {
+      "crates/gam-predict/src/lib.rs::family_response_variance": 1,
+      "crates/gam-predict/src/interval_policy.rs::response_support": 1,
+      "crates/gam-spec/src/lib.rs::response_support_bounds": 1
+    },
+    "reason": "#3140: family_predictive_variance replaces family_response_variance (the total predictive variance as a sum of non-negative terms, no floored m(1-m) - v), and the observation-band support clamp is deleted from both band drivers, which leaves ResponseBounds::response_support and ResponseFamily::response_support_bounds without a reader.",
+    "evidence": "git grep at 4d529db085e4eb5925afb3057c584afeab57b2dd: family_response_variance's only callers are the six skew arms of family_observation_band and the conformal predictive_standard_error in crates/gam-predict/src/lib.rs; response_support's only callers are the two band clamps at crates/gam-predict/src/lib.rs:2328 and :2651; response_support_bounds's only callers are response_support and its three unit tests in crates/gam-spec/src/lib.rs. The landing tree names none of the three."
+  },
+  {
+    "base": "04346780239dc8e32810c476bb12d0eef4033440",
+    "removed": {
+      "crates/gam-gpu/src/device_runtime.rs::resolve_if_fused_batch_exceeds_floor": 1,
+      "crates/gam-gpu/src/policy.rs::polya_gamma_batch_target_is_gpu": 1
+    },
+    "reason": "#3024 slice A: GpuDispatchPolicy::fused_kernel_min_n, twice the xtwx Gram's crossover borrowed as the survival row jet's and the Polya-Gamma batch's admission threshold, is deleted, and both kernels are admitted on their own measured executors (gam_gpu::row_kernel_race). The two public functions built on that threshold go with it: GpuRuntime::resolve_if_fused_batch_exceeds_floor (the pre-probe floor) and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu (the PG predicate). draw_batch now decides through gam_gpu::decide_row_kernel.",
+    "evidence": "public_api_census.py, run against this entry's base with the slice-A commit as head, reports exactly these two identities as removed (13600 public function declarations before and 13604 after at the gate base 15c6d195ef). git grep -w finds neither name under crates, src or tests at the head tree."
+  },
+  {
+    "base": "b7f57a0fd4754157b2068201f65d69b8ea35b192",
+    "removed": {
+      "crates/gam-custom-family/src/assembly.rs::outerobjectivegradienthessian_internal": 1,
+      "crates/gam-custom-family/src/blockwise_solve.rs::outerobjectivegradienthessian_labeled": 1
+    },
+    "reason": "#3173: every production outer evaluation of a custom family now goes through evaluate_on_branch, which solves a certified mode from each start (correct_labeled_laplace_mode, or the branch continuation for the incumbent) and prices only the mode the lowest-penalized-objective rule selects (outerobjective_from_coefficient_mode_labeled). The single-seed evaluators outerobjectivegradienthessian_labeled and outerobjectivegradienthessian_internal were the solve-and-price route that evaluation used; they have no production caller left and move verbatim into the cfg(test) test_support module, where tests that price the criterion at a mode they chose still call them.",
+    "evidence": "At the gate base 4b87357bf0 source_removal_guard.py and public_api_census.py report exactly these two identities (production_occurrences 0 for both). At the head tree git grep -w finds both names only in crates/gam-custom-family/src/test_support.rs (the moved definitions) and in test modules. cargo check --workspace --all-targets rc 0 and cargo build --workspace --lib rc 0 at the gate; the gam-custom-family lib suite passes except the main red a_double_well_fit_publishes_its_uncertified_trace_2901, identical at base."
+  },
+  {
+    "base": "45d1a4328ec82034e602ca762a1232a27a3934bc",
+    "removed": {
+      "crates/gam-custom-family/src/inner_blockwise_fit.rs::polish_joint_newton_step": 1
+    },
+    "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
+    "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
+    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_factor_slab_to_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_rhs": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::cholesky_solve_lower_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::mixed_precision_kappa_gate_failure": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::solve_arrow_system_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::try_mixed_precision_arrow_solve": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::matrix_inf_norm": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::mixed_precision_reduced_beta": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::certified_mixed": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::is_enabled": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::with_streaming_solve_precision_default": 1
+    },
+    "reason": "#2946 census T10: these functions implemented or gated the arrow-Schur CertifiedMixed solve, which copied already-computed f64 Cholesky factors to f32 and refined f32 solves with f64 residuals. That work was strictly additional to the one f64 triangular solve the same factor answers, and it was gated by chosen constants. SPEC: 'Unnecessary choices and options should be deleted, not included.' arrow_rhs and matrix_inf_norm had no other caller.",
+    "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
   }
 ]

@@ -1137,14 +1137,6 @@ pub(crate) fn validate_time_block(
     if b.design_entry.ncols() != p || b.design_derivative_exit.ncols() != p {
         bail_dim_sls!("time_block design column mismatch across entry/exit/derivative");
     }
-    if !b.time_monotonicity.is_coordinate_cone() {
-        return Err(SurvivalLocationScaleError::InvalidConfiguration {
-            reason: format!(
-                "time_block requires a coordinate-cone monotonicity strategy by construction; got {:?}",
-                b.time_monotonicity
-            ),
-        });
-    }
     structural_time_coefficient_lower_bounds_with_monotone_time_wiggle(
         &b.design_entry,
         &b.design_exit,
