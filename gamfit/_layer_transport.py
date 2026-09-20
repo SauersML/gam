@@ -44,6 +44,7 @@ def layer_transport_fit(
     *,
     layer_from: int = 0,
     layer_to: int = 1,
+    pairs: str = "stochastic",
 ) -> dict[str, Any]:
     """Estimate the transport map between two layer charts with evidence.
 
@@ -55,6 +56,12 @@ def layer_transport_fit(
     Returns a dict with the winding ``degree`` (circle->circle),
     ``topology_preserved``, ``isometry_defect`` / ``isometry_defect_se``,
     ``transport_edf``, ``smoothing_lambda``, and friends.
+
+    ``pairs`` declares how the pairs were produced: ``"stochastic"`` pairs
+    scatter about the map (estimated chart coordinates) and get the REML smooth;
+    ``"deterministic"`` pairs are one function of the source coordinate (a held
+    executed transport, a noise-free synthetic map) and get the
+    minimum-curvature interpolant, which carries no sampling law.
     """
     return rust_module().layer_transport_fit(
         _as_coord_array(coords_from, "coords_from"),
@@ -63,6 +70,7 @@ def layer_transport_fit(
         topology_to,
         int(layer_from),
         int(layer_to),
+        pairs,
     )
 
 
@@ -71,6 +79,8 @@ def fit_transport(
     coords_to: Any,
     topology_from: str = "circle",
     topology_to: str = "circle",
+    *,
+    pairs: str = "stochastic",
 ) -> Any:
     """Fit a transport map and return a live, invertible ``FittedTransport``.
 
@@ -84,13 +94,14 @@ def fit_transport(
 
     ``coords_from[i]`` and ``coords_to[i]`` must coordinatize the same
     observation in the source and target charts; topologies are ``"circle"`` or
-    ``"interval"``.
+    ``"interval"``. ``pairs`` is as in :func:`layer_transport_fit`.
     """
     return rust_module().fit_transport(
         _as_coord_array(coords_from, "coords_from"),
         _as_coord_array(coords_to, "coords_to"),
         topology_from,
         topology_to,
+        pairs,
     )
 
 
@@ -99,23 +110,27 @@ def layer_transport_ladder(
     topology: str = "circle",
     *,
     layers: Sequence[int] | None = None,
+    pairs: str = "stochastic",
 ) -> dict[str, Any]:
     """Fit a whole ladder of layer charts and test the composition law.
 
     ``coords`` is a sequence of equal-length 1-D coordinate arrays (one per
     layer, same rows). Returns ``{"adjacent": [...], "two_hop": [...]}``
     where each two-hop report carries ``composition_defect`` /
-    ``composition_p_value`` from the gauge-quotiented defect test.
+    ``composition_p_value`` from the gauge-quotiented defect test. ``pairs``
+    declares every pair's law, as in :func:`layer_transport_fit`.
     """
     arrays = [_as_coord_array(c, f"coords[{i}]") for i, c in enumerate(coords)]
     layer_list = None if layers is None else [int(v) for v in layers]
-    return rust_module().layer_transport_ladder(arrays, topology, layer_list)
+    return rust_module().layer_transport_ladder(arrays, topology, layer_list, pairs)
 
 
 def _as_operator_stack(arr: Any, name: str) -> np.ndarray:
     a = np.ascontiguousarray(arr, dtype=np.float64)
     if a.ndim != 3:
-        raise ValueError(f"{name} must be 3-D [n_tokens, ambient, d], got shape {a.shape}")
+        raise ValueError(
+            f"{name} must be 3-D [n_tokens, ambient, d], got shape {a.shape}"
+        )
     return a
 
 

@@ -223,6 +223,12 @@ pub struct SurvivalLocationScaleTermFitResult {
 pub struct SurvivalLocationScaleFitResultParts {
     /// Number of original survival records used by every parameter block.
     pub training_sample_size: usize,
+    /// Authoritative log strengths from the fitted optimizer, in concatenated
+    /// block order. Preserve these across the coefficient-gauge lift: taking
+    /// `ln` of an already-rounded strength can erase a small nonzero rho, and
+    /// `exp(ln(lambda))` need not reproduce lambda bitwise. Block lambdas must
+    /// be the checked exponentials of these same values.
+    pub log_lambdas: Array1<f64>,
     pub beta_time: Array1<f64>,
     pub beta_threshold: Array1<f64>,
     pub beta_log_sigma: Array1<f64>,
@@ -276,8 +282,10 @@ pub struct SurvivalLocationScaleFitResultParts {
     /// The correction term `C` alone (raw frame) with the typed provenance that
     /// produced it. `V_c = V_cond + C`, so this is the same lift as the two
     /// covariances above. `None` is a typed absence, never an error.
-    pub smoothing_correction:
-        Option<(Array2<f64>, gam_solve::model_types::SmoothingCorrectionMethod)>,
+    pub smoothing_correction: Option<(
+        Array2<f64>,
+        gam_solve::model_types::SmoothingCorrectionMethod,
+    )>,
     /// Why the inner fit minted no correction although it selected ρ, carried through
     /// finalization with the correction it stands in for (#2677).
     pub smoothing_correction_absence: Option<gam_solve::model_types::SmoothingCorrectionAbsence>,
@@ -391,6 +399,7 @@ pub fn survival_fit_from_parts(
 ) -> Result<UnifiedFitResult, String> {
     let SurvivalLocationScaleFitResultParts {
         training_sample_size,
+        log_lambdas,
         beta_time,
         beta_threshold,
         beta_log_sigma,
@@ -619,9 +628,25 @@ pub fn survival_fit_from_parts(
     let n_log_sigma = lambdas_log_sigma.len();
     let n_wiggle = lambdas_linkwiggle.as_ref().map_or(0, |l| l.len());
     let total_penalties = n_time + n_threshold + n_log_sigma + n_wiggle;
-    // Only trust the plumbed traces when they align 1:1 with the block lambdas;
-    // otherwise (traces unavailable) fall back to the nominal column count.
-    let traces_available = penalty_block_trace.len() == total_penalties;
+    // Each per-penalty channel is either unrecorded (empty) or aligned 1:1 with
+    // the block lambdas. Any other length is a misaligned slice: refuse it
+    // rather than read it as "unrecorded" and publish nominal column counts.
+    for (channel, len) in [
+        ("penalty_block_trace", penalty_block_trace.len()),
+        ("edf_by_block", edf_by_block.len()),
+        ("edf_rank_bound", edf_rank_bound.len()),
+    ] {
+        if len != 0 && len != total_penalties {
+            return Err(SurvivalLocationScaleError::DimensionMismatch {
+                reason: format!(
+                    "survival_fit.{channel} has {len} entries but the blocks carry \
+                     {total_penalties} smoothing parameters"
+                ),
+            }
+            .into());
+        }
+    }
+    let traces_available = !penalty_block_trace.is_empty();
     let block_trace_sum = |offset: usize, count: usize| -> f64 {
         if traces_available && count > 0 {
             penalty_block_trace[offset..offset + count].iter().sum()
@@ -636,7 +661,7 @@ pub fn survival_fit_from_parts(
     let block_certified = |offset: usize, count: usize| -> bool {
         !traces_available
             || count == 0
-            || (edf_rank_bound.len() == total_penalties
+            || (!edf_rank_bound.is_empty()
                 && edf_rank_bound[offset..offset + count]
                     .iter()
                     .all(gam_solve::estimate::EdfRankBound::is_certified))
@@ -692,31 +717,6 @@ pub fn survival_fit_from_parts(
         .iter()
         .flat_map(|b| b.lambdas.iter().copied())
         .collect();
-    let log_lambdas = Array1::from_vec(
-        all_lambdas
-            .iter()
-            .map(|&v| if v > 0.0 { v.ln() } else { f64::NEG_INFINITY })
-            .collect(),
-    );
-    // Report the genuine per-penalty trace / effective-d.f. channels when the
-    // inner solver supplied them (aligned 1:1 with `all_lambdas`); otherwise
-    // leave them empty so downstream consumers treat them as unavailable rather
-    // than reading a fabricated uniform split (issue #2106).
-    let inference_penalty_block_trace = if penalty_block_trace.len() == all_lambdas.len() {
-        penalty_block_trace.clone()
-    } else {
-        Vec::new()
-    };
-    let inference_edf_by_block = if edf_by_block.len() == all_lambdas.len() {
-        edf_by_block.clone()
-    } else {
-        Vec::new()
-    };
-    let inference_edf_rank_bound = if edf_rank_bound.len() == all_lambdas.len() {
-        edf_rank_bound.clone()
-    } else {
-        Vec::new()
-    };
     // One gate owns the negative-diagonal judgement for every lane's
     // `sqrt(diag(V))` (`gam_problem::se_from_covariance`), and the published
     // standard errors derive from this matrix (#2955). The location-scale
@@ -773,9 +773,11 @@ pub fn survival_fit_from_parts(
     let inference = geometry
         .as_ref()
         .map(|geom| gam_solve::estimate::FitInference {
-            edf_by_block: inference_edf_by_block.clone(),
-            penalty_block_trace: inference_penalty_block_trace.clone(),
-            edf_rank_bound: inference_edf_rank_bound.clone(),
+            // Validated above: empty (unrecorded) or aligned 1:1 with the
+            // concatenated block lambdas (issue #2106).
+            edf_by_block: edf_by_block.clone(),
+            penalty_block_trace: penalty_block_trace.clone(),
+            edf_rank_bound: edf_rank_bound.clone(),
             edf_total,
             // This lane's correction is only ever the first-order IFT term
             // (the custom-family fit never runs a cubature upgrade), so the
@@ -795,6 +797,7 @@ pub fn survival_fit_from_parts(
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         });
 
     let deviance = -2.0 * log_likelihood;

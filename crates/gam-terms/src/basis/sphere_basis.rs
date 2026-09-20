@@ -207,6 +207,86 @@ pub(crate) fn harmonic_degree_for_wahba_basis_width(
     Ok(degree.max(8))
 }
 
+/// Refuse a harmonic truncation degree the dense harmonic engine cannot build.
+fn validate_spherical_harmonic_degree(l_max: usize) -> Result<(), BasisError> {
+    if l_max < 1 {
+        crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
+    }
+    if l_max > SPHERICAL_HARMONIC_MAX_DEGREE {
+        crate::bail_invalid_basis!(
+            "spherical-harmonic max_degree {l_max} too large; cap is {SPHERICAL_HARMONIC_MAX_DEGREE}"
+        );
+    }
+    Ok(())
+}
+
+/// Column count of the basis [`build_spherical_spline_basis`] builds from `spec`
+/// on `n_rows` rows, read without evaluating it: the one width rule, so a caller
+/// that needs a static shape (the Python `Sphere.basis_size`) asks for it
+/// instead of restating it. The harmonic engine, which the pseudo Wahba kernel
+/// routes through, spans the `L(L+2)` harmonics of degrees `1..=L`; a Wahba
+/// center basis keeps one column per center (the section `[K Z - H C | H]`
+/// splits the centers between the kernel null-space block and the low-degree
+/// harmonics). Its center count is known before selection only for
+/// caller-supplied centers and for the farthest-point selector, which returns
+/// exactly its budget (completing from a lattice when the data hold fewer
+/// distinct directions); any other strategy is refused rather than guessed. A
+/// degree or center count the builder refuses is refused here with the same
+/// error. A frozen identifiability transform returns its active column count
+/// after validating its rows against that raw basis width.
+pub fn spherical_spline_basis_width(
+    spec: &SphericalSplineBasisSpec,
+    n_rows: usize,
+) -> Result<usize, BasisError> {
+    let degree = if matches!(spec.method, SphereMethod::Harmonic) {
+        spec.max_degree.unwrap_or_else(|| {
+            default_spherical_harmonic_degree(n_rows, spec.penalty_order)
+        })
+    } else if matches!(spec.wahba_kernel, SphereWahbaKernel::Pseudo) {
+        match spec.max_degree {
+            Some(degree) => degree,
+            None => harmonic_degree_for_wahba_basis_width(spec, n_rows)?,
+        }
+    } else {
+        let centers = match realized_center_strategy(&spec.center_strategy) {
+            CenterStrategy::FarthestPoint { num_centers } => *num_centers,
+            CenterStrategy::UserProvided(centers) => centers.nrows(),
+            _ => {
+                crate::bail_invalid_basis!(
+                    "a Wahba sphere basis under this center strategy has its width fixed only \
+                     by center selection; use farthest-point or explicit centers for a static \
+                     width"
+                );
+            }
+        };
+        if centers < 2 {
+            return Err(BasisError::InsufficientColumnsForConstraint { found: centers });
+        }
+        return sphere_width_after_identifiability(spec, centers);
+    };
+    validate_spherical_harmonic_degree(degree)?;
+    sphere_width_after_identifiability(spec, degree * (degree + 2))
+}
+
+/// A frozen identifiability chart changes the builder's output column count.
+fn sphere_width_after_identifiability(
+    spec: &SphericalSplineBasisSpec,
+    raw_width: usize,
+) -> Result<usize, BasisError> {
+    match &spec.identifiability {
+        SphericalSplineIdentifiability::CenterSumToZero => Ok(raw_width),
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != raw_width {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {raw_width} raw basis columns but transform has {} rows",
+                    transform.nrows()
+                );
+            }
+            Ok(transform.ncols())
+        }
+    }
+}
+
 fn real_spherical_harmonic_design_up_to_degree(
     data: ArrayView2<'_, f64>,
     max_degree: usize,
@@ -616,6 +696,40 @@ pub(crate) fn fill_real_spherical_harmonics_row(
 /// Highest spherical-harmonic degree the dense harmonic engine evaluates.
 pub(crate) const SPHERICAL_HARMONIC_MAX_DEGREE: usize = 32;
 
+/// Column target of the provisioned harmonic sphere default: mgcv's `sos`
+/// default of 50 columns (`L = 6`, `L(L+2) = 48`).
+const PROVISIONED_HARMONIC_TARGET_COLUMNS: f64 = 50.0;
+
+/// Rows per column of the provisioned harmonic sphere default at small `n`.
+const PROVISIONED_HARMONIC_ROWS_PER_COLUMN: f64 = 4.0;
+
+/// Smallest column target of the provisioned harmonic sphere default.
+const PROVISIONED_HARMONIC_MIN_COLUMNS: f64 = 3.0;
+
+/// Highest degree of the provisioned harmonic sphere default (168 columns).
+const PROVISIONED_HARMONIC_MAX_DEGREE: usize = 12;
+
+/// Lowest degree of the provisioned harmonic sphere default.
+const PROVISIONED_HARMONIC_MIN_DEGREE: usize = 2;
+
+/// Provisioned degree `L` of the harmonic sphere basis for `n_rows` rows: the
+/// formula default, which only a basis the standard workflow grows replaces
+/// with its pilot ([`default_spherical_harmonic_degree`], via
+/// `smooth::starting_resolution`); every other route keeps the basis it is
+/// given. The least `L` whose span `L(L+2)` reaches `n/4` columns, at most 50
+/// and at least 3, held to degrees 2..=12: the pre-#3191 default, restored
+/// because #3191's pilot replaced it on routes with nothing to grow it (#3149).
+pub(crate) fn provisioned_spherical_harmonic_degree(n_rows: usize) -> usize {
+    let target_cols = ((n_rows as f64) / PROVISIONED_HARMONIC_ROWS_PER_COLUMN)
+        .min(PROVISIONED_HARMONIC_TARGET_COLUMNS)
+        .max(PROVISIONED_HARMONIC_MIN_COLUMNS);
+    let mut l = 1usize;
+    while (l as f64) * (l as f64 + 2.0) < target_cols && l < PROVISIONED_HARMONIC_MAX_DEGREE {
+        l += 1;
+    }
+    l.max(PROVISIONED_HARMONIC_MIN_DEGREE)
+}
+
 /// Pilot degree `L` of the harmonic sphere basis when the user does not set
 /// `max_degree`, for `n_rows` rows under an order-`penalty_order` Laplace–
 /// Beltrami penalty.
@@ -645,14 +759,7 @@ pub(crate) fn build_spherical_harmonic_basis(
     let l_max = spec
         .max_degree
         .unwrap_or_else(|| default_spherical_harmonic_degree(n, spec.penalty_order));
-    if l_max < 1 {
-        crate::bail_invalid_basis!("spherical-harmonic max_degree must be >= 1");
-    }
-    if l_max > SPHERICAL_HARMONIC_MAX_DEGREE {
-        crate::bail_invalid_basis!(
-            "spherical-harmonic max_degree {l_max} too large; cap is {SPHERICAL_HARMONIC_MAX_DEGREE}"
-        );
-    }
+    validate_spherical_harmonic_degree(l_max)?;
     if !(1..=4).contains(&spec.penalty_order) {
         crate::bail_invalid_basis!(
             "spherical-harmonic penalty_order must be one of 1, 2, 3, 4; got {}",
@@ -1331,15 +1438,24 @@ pub(crate) fn matern_operator_psi_triplet(
     let a = s * r;
     let (phi_rr, phi_rr_psi, phi_rr_psi_psi) = exp_poly_scaled_s2_psi_triplet(s, a, rr, 1.0);
 
-    // nu=1/2 has singular phi'(r)/r ~ -kappa/r as r->0.
-    // We use the same finite r-floor regularization as operator assembly.
+    // nu=1/2: phi'(r)/r = -(s/r)·e^{-a} diverges at a center collision. The
+    // value path (`build_matern_collocation_operator_matrices`) defines it
+    // there by the exact 1-D convention phi'/r = 0 (the 1-D Laplacian is
+    // phi'' alone) and refuses d > 1, so the ψ-derivatives follow that same
+    // convention instead of evaluating the divergent ratio at a floored r.
     let (ratio, ratio_psi, ratio_psi_psi) = if matches!(nu, MaternNu::Half) {
-        let r_eff = r.max(1e-12);
-        let e_eff = (-a).exp();
-        let g = -(s / r_eff) * e_eff;
-        let g_psi = -(s / r_eff) * e_eff * (1.0 - a);
-        let g_psi_psi = -(s / r_eff) * e_eff * (1.0 - 3.0 * a + a * a);
-        (g, g_psi, g_psi_psi)
+        if r == 0.0 {
+            if dimension > 1 {
+                crate::bail_invalid_basis!(
+                    "Matérn nu=1/2 has singular Laplacian at center collisions for d>1; choose nu>=3/2 or avoid collocation at centers"
+                );
+            }
+            (0.0, 0.0, 0.0)
+        } else {
+            let e = (-a).exp();
+            let g = -(s / r) * e;
+            (g, g * (1.0 - a), g * (1.0 - 3.0 * a + a * a))
+        }
     } else {
         exp_poly_scaled_s2_psi_triplet(s, a, q, -1.0)
     };
@@ -4327,3 +4443,149 @@ mod harmonic_penalty_invariants_tests {
 
 #[cfg(test)]
 mod sphere_harmonic_default_degree_tests;
+
+#[cfg(test)]
+mod width_rule_tests {
+    use super::*;
+
+    #[test]
+    fn static_sphere_width_matches_raw_and_frozen_builders() {
+        let data = Array2::from_shape_fn((40, 2), |(i,j)| {
+            if j == 0 { 70.0*(i as f64*0.73).sin() } else { 170.0*(i as f64*0.41).cos() }
+        });
+        for (method,kernel,degree) in [
+            (SphereMethod::Wahba,SphereWahbaKernel::Sobolev,None),
+            (SphereMethod::Wahba,SphereWahbaKernel::Pseudo,None),
+            (SphereMethod::Harmonic,SphereWahbaKernel::Sobolev,Some(3)),
+        ] {
+            let mut spec=SphericalSplineBasisSpec {
+                center_strategy:CenterStrategy::FarthestPoint {num_centers:20},
+                penalty_order:2,double_penalty:false,radians:false,method,
+                max_degree:degree,wahba_kernel:kernel,
+                identifiability:SphericalSplineIdentifiability::CenterSumToZero,
+                adaptive_degree:false,
+            };
+            let raw_width=spherical_spline_basis_width(&spec,data.nrows()).unwrap();
+            assert_eq!(raw_width,build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols());
+            let transform=Array2::from_shape_fn((raw_width,5),|(i,j)| if i==j {1.0}else{0.0});
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform};
+            assert_eq!(spherical_spline_basis_width(&spec,data.nrows()).unwrap(),5);
+            assert_eq!(build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols(),5);
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform:Array2::zeros((raw_width+1,5))};
+            assert!(spherical_spline_basis_width(&spec,data.nrows()).is_err());
+            assert!(build_spherical_spline_basis(data.view(),&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn static_sphere_width_refuses_unsupported_degrees_and_center_counts() {
+        let mut spec=SphericalSplineBasisSpec::default();
+        spec.method=SphereMethod::Harmonic;
+        for degree in [0,33,50] {
+            spec.max_degree=Some(degree);
+            assert!(spherical_spline_basis_width(&spec,40).is_err());
+        }
+        spec.method=SphereMethod::Wahba;
+        spec.wahba_kernel=SphereWahbaKernel::Sobolev;
+        spec.max_degree=None;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+        spec.wahba_kernel=SphereWahbaKernel::Pseudo;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1089};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+    }
+}
+
+#[cfg(test)]
+mod matern_rough_kernel_log_kappa_alignment_tests {
+    use super::*;
+    use ndarray::Array2;
+
+    fn centers_1d() -> Array2<f64> {
+        Array2::from_shape_vec((6, 1), vec![0.0, 0.15, 0.4, 0.55, 0.8, 1.0]).expect("6x1 centers")
+    }
+
+    fn rough_spec(centers: &Array2<f64>, log_kappa: f64) -> MaternBasisSpec {
+        MaternBasisSpec {
+            center_strategy: CenterStrategy::UserProvided(centers.clone()),
+            periodic: None,
+            length_scale: MaternLengthScale::fixed((-log_kappa).exp()),
+            nu: MaternNu::Half,
+            include_intercept: false,
+            double_penalty: false,
+            identifiability: Default::default(),
+            aniso_log_scales: None,
+        }
+    }
+
+    fn forward_penalties(centers: &Array2<f64>, log_kappa: f64) -> Vec<Array2<f64>> {
+        build_matern_basis(centers.view(), &rough_spec(centers, log_kappa))
+            .expect("ν = 1/2 Matérn basis in 1-D")
+            .active_penalties
+            .into_iter()
+            .map(|penalty| penalty.matrix)
+            .collect()
+    }
+
+    fn max_abs(a: &Array2<f64>) -> f64 {
+        a.iter().fold(0.0_f64, |m, &v| m.max(v.abs()))
+    }
+
+    /// ν = 1/2 keeps only the mass operator (#707), so the non-double-penalty
+    /// κ-derivative bundle must carry exactly the forward active blocks — not the
+    /// canonical tension/stiffness blocks the forward build never has, which the
+    /// positional `penalty_start + j` numbering downstream would attach to other
+    /// penalties — and the surviving block must be the derivative of the forward
+    /// penalty.
+    #[test]
+    fn rough_matern_log_kappa_derivatives_align_with_forward_penalties() {
+        let centers = centers_1d();
+        let log_kappa: f64 = 0.4;
+        let bundle = build_matern_basis_log_kappa_derivatives(
+            centers.view(),
+            &rough_spec(&centers, log_kappa),
+        )
+        .expect("ν = 1/2 κ-derivative bundle");
+        let first = bundle.first.penalties_derivative;
+        let second = bundle.second.penaltiessecond_derivative;
+        let center = forward_penalties(&centers, log_kappa);
+        assert_eq!(center.len(), 1, "ν = 1/2 keeps the mass operator alone");
+        assert_eq!(
+            first.len(),
+            center.len(),
+            "first-derivative blocks must match the forward list"
+        );
+        assert_eq!(
+            second.len(),
+            center.len(),
+            "second-derivative blocks must match the forward list"
+        );
+
+        let h = 1e-4;
+        let plus = forward_penalties(&centers, log_kappa + h);
+        let minus = forward_penalties(&centers, log_kappa - h);
+        let fd_first = (&plus[0] - &minus[0]) / (2.0 * h);
+        let fd_second = (&plus[0] - &(&center[0] * 2.0) + &minus[0]) / (h * h);
+        let first_gap = max_abs(&(&first[0] - &fd_first));
+        let second_gap = max_abs(&(&second[0] - &fd_second));
+        let first_scale = max_abs(&fd_first).max(1.0);
+        let second_scale = max_abs(&fd_second).max(1.0);
+        assert!(first_gap < 1e-5 * first_scale, "∂S₀/∂ψ gap {first_gap:.3e}");
+        assert!(
+            second_gap < 1e-3 * second_scale,
+            "∂²S₀/∂ψ² gap {second_gap:.3e}"
+        );
+    }
+
+    /// At a center collision the ν = 1/2 ratio φ'/r takes the value path's exact
+    /// 1-D convention (0, constant in ψ), and d > 1 is refused as the forward
+    /// collocation builder refuses it — no finite r-floor stands in for either.
+    #[test]
+    fn rough_matern_collision_ratio_follows_the_value_path_convention() {
+        let (_, _, _, ratio, ratio_psi, ratio_psi_psi, _, _, _) =
+            matern_operator_psi_triplet(0.0, 0.7, MaternNu::Half, 1)
+                .expect("1-D ν = 1/2 collision is defined");
+        assert_eq!((ratio, ratio_psi, ratio_psi_psi), (0.0, 0.0, 0.0));
+        assert!(matern_operator_psi_triplet(0.0, 0.7, MaternNu::Half, 2).is_err());
+    }
+}

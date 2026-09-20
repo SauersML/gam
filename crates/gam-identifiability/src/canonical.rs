@@ -51,11 +51,10 @@ use crate::audit::{
     priority_tiered_rank_from_gram, rank_of_gram,
 };
 use crate::families::compiler::{
-    IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks, symmetric_sqrt_into,
+    CompilerError, IdentityRowHessian, RowJacobianOperator, orthogonalize_design_blocks,
+    symmetric_sqrt_into,
 };
-use gam_linalg::faer_ndarray::{
-    default_rrqr_rank_alpha, fast_ata, fast_atb, rrqr_with_permutation,
-};
+use gam_linalg::faer_ndarray::{default_rrqr_rank_alpha, fast_ata, fast_atb};
 use gam_linalg::matrix::{CoefficientTransformOperator, DenseDesignMatrix, DesignMatrix};
 use gam_problem::Gauge;
 use gam_problem::{
@@ -253,7 +252,7 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
         }
         out
     }
-    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Result<Array2<f64>, CompilerError> {
         let n = self.nrows();
         let p = self.ncols();
         let k = self.k();
@@ -273,7 +272,12 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
                         h_i[[a, b]] = h_full[[row, a, b]];
                     }
                 }
-                symmetric_sqrt_into(&h_i, &mut sqrt_h);
+                symmetric_sqrt_into(&h_i, &mut sqrt_h).map_err(|reason| {
+                    CompilerError::LinalgFailure(format!(
+                        "BlockJacobianAsRowOp block '{}' row {row}: {reason}",
+                        self.block_name
+                    ))
+                })?;
                 for ch in 0..k {
                     let dst = row * k + ch;
                     for col in 0..p {
@@ -286,7 +290,7 @@ impl RowJacobianOperator for BlockJacobianAsRowOp {
                 }
             }
         }
-        out
+        Ok(out)
     }
     fn channel_flattened_column(&self, col: usize, out: &mut [f64]) {
         let n = self.nrows();
@@ -421,26 +425,47 @@ impl ConvergedChannelAwareVerdict {
     /// means its re-audit drops a column. Under the identity gauge (the width-preserving
     /// path) the reduced problem is the raw problem.
     ///
-    /// A recovered column refuses exactly when it moves a rank. Either the raw rank rose,
-    /// meaning the gauge removed a direction convergence identifies and the solve ran
-    /// over-reduced, or the reduced problem lost one. A column that another member of its
-    /// alias class replaced does neither.
+    /// Under a reducing gauge, a recovered column refuses exactly when it moves a rank.
+    /// Either the raw rank rose, meaning the gauge removed a direction convergence
+    /// identifies and the solve ran over-reduced, or the reduced problem lost one. A
+    /// column that another member of its alias class replaced does neither.
+    ///
+    /// Under the identity gauge the fit ran every raw column, so the gauge removed
+    /// nothing, and a raw rank that rose is a problem the fit ran that convergence
+    /// identifies better than the pilot did. That is not a refusal. The pilot of a
+    /// survival time-wiggle linearizes at the zero warp, where the wiggle columns act
+    /// as constants; at the converged warp they are identified (#3304). A rank that fell
+    /// still refuses: the fit then ran directions it no longer identifies.
     pub fn refuses(&self) -> bool {
         let gauge_fatal = self
             .pilot_gauge_reaudit
             .as_ref()
             .map_or(self.drift.current_fatal, |audit| audit.fatal);
-        self.drift.pilot_rank != self.drift.current_rank
-            || self.drift.pilot_fatal != self.drift.current_fatal
-            || self.pilot_gauge_rank() != self.drift.pilot_rank
-            || gauge_fatal != self.drift.pilot_fatal
+        let fatality_changed = self.drift.pilot_fatal != self.drift.current_fatal
+            || gauge_fatal != self.drift.pilot_fatal;
+        let rank_moved = if self.pilot_gauge_reaudit.is_some() {
+            self.drift.pilot_rank != self.drift.current_rank
+                || self.pilot_gauge_rank() != self.drift.pilot_rank
+        } else {
+            self.drift.current_rank < self.drift.pilot_rank
+        };
+        fatality_changed || rank_moved
     }
 
     /// The pivot picked other representatives of the same identified span: the drop
-    /// labels differ, and the verdict does not refuse.
+    /// labels differ at an unchanged rank, and the verdict does not refuse.
     pub fn representative_swap(&self) -> bool {
         !self.refuses()
+            && self.drift.pilot_rank == self.drift.current_rank
             && (!self.drift.newly_dropped.is_empty() || !self.drift.recovered.is_empty())
+    }
+
+    /// The fit ran every raw column (the identity gauge), and convergence identifies
+    /// columns the pilot dropped. The verdict does not refuse.
+    pub fn recovered_under_identity_gauge(&self) -> bool {
+        !self.refuses()
+            && self.pilot_gauge_reaudit.is_none()
+            && self.drift.current_rank > self.drift.pilot_rank
     }
 }
 
@@ -545,9 +570,11 @@ pub fn channel_aware_audit_at_operating_scalars(
         operators.push(op);
     }
     let row_hess = IdentityRowHessian::new(n_rows, k);
-    let audit_result = audit_identifiability_channel_aware(specs, &operators, &row_hess)
-        .map_err(|reason| CustomFamilyError::DimensionMismatch {
-            reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
+    let audit_result =
+        audit_identifiability_channel_aware(specs, &operators, &row_hess).map_err(|reason| {
+            CustomFamilyError::DimensionMismatch {
+                reason: format!("pre-fit channel-aware identifiability audit failed: {reason}"),
+            }
         })?;
     log::debug!(
         "[CANON] channel-aware audit: {} blocks, joint_rank={}/{} \
@@ -630,20 +657,66 @@ pub fn channel_aware_audit_at_operating_scalars(
 ///     `rank_alpha·ε·n·σ_max`; the old eigenvalue cutoff `λ > scale·64·n·ε` was
 ///     ~ε larger and demoted penalty-covered modes whose `λ` sits between
 ///     `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale: 16 vs p_red 18).
-/// The bare data Gram is recovered when no block is penalised (or the block
-/// layout does not tile the columns), so unpenalised channel-aware fits are
-/// unaffected.
-fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlock]) -> usize {
+/// An empty block list explicitly requests the bare data Gram. A supplied
+/// block layout must tile the columns and carry valid structural penalties.
+fn validate_post_t_rank_inputs(
+    j: &Array2<f64>,
+    blocks: &[FlatRankBlock],
+    permit_bare_design: bool,
+) -> Result<(), CustomFamilyError> {
+    if j.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "post-T rank certificate: non-finite design entry".to_string(),
+        });
+    }
+    let declared = blocks
+        .iter()
+        .try_fold(0usize, |sum, block| sum.checked_add(block.width))
+        .ok_or_else(|| CustomFamilyError::DimensionMismatch {
+            reason: "post-T rank certificate: block widths overflow the column count".to_string(),
+        })?;
+    if declared != j.ncols() && !(permit_bare_design && blocks.is_empty()) {
+        return Err(CustomFamilyError::DimensionMismatch {
+            reason: format!(
+                "post-T rank certificate: block widths cover {declared} columns, design has {}",
+                j.ncols()
+            ),
+        });
+    }
+    for block in blocks {
+        if let Some(penalty) = &block.structural_penalty {
+            if penalty.dim() != (block.width, block.width) {
+                return Err(CustomFamilyError::DimensionMismatch {
+                    reason: "post-T rank certificate: structural penalty does not match its block"
+                        .to_string(),
+                });
+            }
+            if penalty.iter().any(|value| !value.is_finite()) {
+                return Err(CustomFamilyError::NumericalFailure {
+                    reason: "post-T rank certificate: non-finite structural penalty entry"
+                        .to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn audit_convention_rank(
+    j: &Array2<f64>,
+    nk_scale: usize,
+    blocks: &[FlatRankBlock],
+) -> Result<usize, CustomFamilyError> {
+    validate_post_t_rank_inputs(j, blocks, true)?;
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
-        return 0;
+        return Ok(0);
     }
     // G = JᵀJ (p × p), symmetric PSD — same Gram the audit eigendecomposes.
     let mut gram = fast_ata(j);
     // Augment block-diagonally with each block's SᵀS, exactly as the audit's
     // `channel_aware_penalty_aware_joint_rank` builds its augmented Gram. Only
-    // applied when the declared block widths tile the design columns; otherwise
-    // fall back to the bare Gram (no spurious augmentation).
+    // applied to a validated block layout; an empty list requests the bare Gram.
     let declared: usize = blocks.iter().map(|b| b.width).sum();
     let mut n_penalty_rows = 0usize;
     if declared == p {
@@ -673,10 +746,23 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlo
     // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
     // σ-space `rank_alpha·ε·n·σ_max` floor and demoted penalty-covered modes whose
     // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
-    // 16 vs p_red 18). On eigendecomposition failure fall back to the structural
-    // column count (no demotion), so a numerical hiccup never becomes a spurious
-    // violation.
-    rank_of_gram(&gram, nk_scale.saturating_add(n_penalty_rows)).unwrap_or(p)
+    // 16 vs p_red 18). A failed eigendecomposition is refused, not read as full
+    // rank: substituting the column count would certify the invariant unverified
+    // when both sides fail, and report a spurious T-construction violation when
+    // only one side does.
+    if gram.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "post-T rank certificate: non-finite augmented Gram".to_string(),
+        });
+    }
+    rank_of_gram(&gram, nk_scale.saturating_add(n_penalty_rows)).map_err(|error| {
+        CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "canonicalize_for_identifiability: the post-T rank certificate could not rank \
+                 the penalty-augmented joint Gram ({p} columns): {error}"
+            ),
+        }
+    })
 }
 
 /// Per-block descriptor for the penalty-augmented priority-tiered rank: the
@@ -718,21 +804,15 @@ struct FlatRankBlock {
 /// column-selection `T` (which removes exactly the audit-demoted columns) leaves
 /// the kept columns independent under this metric, while a defective `T` that
 /// drops a column the audit kept makes `J_can` rank-deficient and is caught.
-fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usize {
+fn flat_audit_convention_rank(
+    j: &Array2<f64>,
+    blocks: &[FlatRankBlock],
+) -> Result<usize, CustomFamilyError> {
+    validate_post_t_rank_inputs(j, blocks, false)?;
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
-        return 0;
+        return Ok(0);
     }
-    // Sum of declared block widths must cover the design columns; if the layout
-    // is inconsistent, fall back to the bare RRQR rank (no spurious demotion).
-    let declared: usize = blocks.iter().map(|b| b.width).sum();
-    if declared != p {
-        return match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
-            Ok(rrqr) => rrqr.rank,
-            Err(_) => p,
-        };
-    }
-
     // Gram G = JᵀJ (p × p), the same column inner products the audit's
     // priority-tiered pivoted Cholesky consumes.
     let mut gram = fast_ata(j);
@@ -761,10 +841,15 @@ fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usiz
         col_off += b.width;
     }
 
+    if gram.iter().any(|value| !value.is_finite()) {
+        return Err(CustomFamilyError::NumericalFailure {
+            reason: "post-T rank certificate: non-finite augmented Gram".to_string(),
+        });
+    }
     let m_rows = j.nrows() + n_penalty_rows;
     let tiered =
         priority_tiered_rank_from_gram(&gram, &col_priority, m_rows, default_rrqr_rank_alpha());
-    tiered.rank
+    Ok(tiered.rank)
 }
 
 fn canonicalize_for_identifiability_inner(
@@ -1092,10 +1177,9 @@ fn canonicalize_for_identifiability_inner(
             if drop.column >= p {
                 return false;
             }
-            match spec
-                .design
-                .try_to_dense_arc("canonicalize_for_identifiability_with_operating_scalars: dead-column veto probe")
-            {
+            match spec.design.try_to_dense_arc(
+                "canonicalize_for_identifiability_with_operating_scalars: dead-column veto probe",
+            ) {
                 Ok(dense) => {
                     // A zero-placeholder design (all entries zero) means the true
                     // geometry lives entirely in the callback; `GaugeComposedJacobian`
@@ -1385,20 +1469,46 @@ fn canonicalize_for_identifiability_inner(
                 col_off += p_b;
                 continue;
             }
-            let zeros = vec![0.0f64; p_b];
+            // Match the streaming joint audit's linearization exactly.
             let state = FamilyLinearizationState {
-                beta: &zeros,
-                family_scalars: None,
+                beta: &[],
+                family_scalars: operating_scalars.clone(),
                 channel_hessian: None,
                 probit_frailty_scale: 1.0,
             };
             match spec.effective_jacobian_at("canonicalize_rank_check", &state) {
                 Ok(j_b) => {
+                    let outputs = spec
+                        .jacobian_callback
+                        .as_ref()
+                        .map_or(1, |callback| callback.n_outputs());
+                    let expected_rows = outputs.checked_mul(n_rows).ok_or_else(|| {
+                        CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "MAP uniqueness check: Jacobian row count overflows for block '{}'",
+                                spec.name
+                            ),
+                        }
+                    })?;
+                    if outputs == 0 || j_b.dim() != (expected_rows, p_b) || expected_rows > r_map {
+                        return Err(CustomFamilyError::DimensionMismatch {
+                            reason: format!(
+                                "MAP uniqueness check: effective Jacobian for block '{}' has shape {:?}, expected ({expected_rows}, {p_b}) within {r_map} rows",
+                                spec.name,
+                                j_b.dim()
+                            ),
+                        });
+                    }
                     // j_b is channel-major (k_b·n_rows, p_b): row `r·n_rows + i`
-                    // carries observation `i`'s channel-`r` row Jacobian. A
-                    // single-channel plain block (k_b == 1) packs at its native
-                    // `n_rows` rows, as in the joint audit; a genuinely multi-
-                    // channel block keeps its own channel-major rows.
+                    // carries observation `i`'s channel-`r` row Jacobian. Every
+                    // block packs at these native rows, as in the joint audit, so
+                    // a row of `j_pre` is one (observation, channel) pair in every
+                    // column: a single-channel plain block fills channel 0 (rows
+                    // `..n_rows`) and a stacked block its `[entry; exit; deriv]`
+                    // bands. Interleaving only the multi-channel blocks (`i·k + r`)
+                    // would pair a plain block's observation `i` with another
+                    // observation's channel, and `JᵀJ` would carry cross-block
+                    // terms of a geometry the fit never sees.
                     let k_b = j_b.nrows() / n_rows;
                     if k_b <= 1 {
                         for i in 0..n_rows.min(r_map) {
@@ -1411,28 +1521,23 @@ fn canonicalize_for_identifiability_inner(
                         for r in 0..r_max {
                             let src_row_base = r * n_rows;
                             for i in 0..n_rows {
-                                let dst_row = i * k + r;
-                                let src_row = src_row_base + i;
+                                let row = src_row_base + i;
                                 for j in 0..p_b {
-                                    j_pre[[dst_row, col_off + j]] = j_b[[src_row, j]];
+                                    j_pre[[row, col_off + j]] = j_b[[row, j]];
                                 }
                             }
                         }
                     }
                 }
-                Err(_) => {
-                    // Fall back: embed the flat design at its native rows.
-                    if let Ok(flat) = spec
-                        .design
-                        .try_to_dense_arc("canonicalize_rank_check")
-                        .map(|a| a.as_ref().clone())
-                    {
-                        for i in 0..n_rows.min(flat.nrows()).min(r_map) {
-                            for j in 0..p_b.min(flat.ncols()) {
-                                j_pre[[i, col_off + j]] = flat[[i, j]];
-                            }
-                        }
-                    }
+                Err(reason) => {
+                    return Err(CustomFamilyError::DimensionMismatch {
+                        reason: format!(
+                            "canonicalize_for_identifiability_with_operating_scalars: the MAP-uniqueness \
+                             check could not evaluate the effective Jacobian of block '{}', so its \
+                             column span cannot be seen: {reason}",
+                            spec.name,
+                        ),
+                    });
                 }
             }
             col_off += p_b;
@@ -1556,9 +1661,9 @@ fn canonicalize_for_identifiability_inner(
                 })
                 .collect();
             let rank_j_can = if use_channel_aware {
-                audit_convention_rank(&j_can, nk_scale, &flat_blocks_can)
+                audit_convention_rank(&j_can, nk_scale, &flat_blocks_can)?
             } else {
-                flat_audit_convention_rank(&j_can, &flat_blocks_can)
+                flat_audit_convention_rank(&j_can, &flat_blocks_can)?
             };
 
             // Same convention applied to the FULL pre-reduction design `J_pre`,
@@ -1587,9 +1692,9 @@ fn canonicalize_for_identifiability_inner(
                 })
                 .collect();
             let rank_j_pre = if use_channel_aware {
-                audit_convention_rank(&j_pre, nk_scale, &flat_blocks_pre)
+                audit_convention_rank(&j_pre, nk_scale, &flat_blocks_pre)?
             } else {
-                flat_audit_convention_rank(&j_pre, &flat_blocks_pre)
+                flat_audit_convention_rank(&j_pre, &flat_blocks_pre)?
             };
             // The achievable target: a faithful `T` leaves `J_can` at the FULL
             // design's rank when the design is over-determined (`rank_j_pre ==
@@ -1711,9 +1816,8 @@ fn canonicalize_for_identifiability_inner(
                 &reduced_specs,
                 &red_col_offsets,
             )
-            .map_err(|error| {
-                log::debug!("[CANON] MAP uniqueness check failed: {}", error.message,);
-                CustomFamilyError::MapUniquenessFailure { error }
+            .inspect_err(|error| {
+                log::debug!("[CANON] MAP uniqueness check failed: {error}");
             })?;
 
             log::trace!(
@@ -2213,7 +2317,7 @@ mod tests {
 
         // The single joint eigendecomposition counts the near-separable column:
         // J_pre is full rank under `audit_convention_rank`.
-        let rank_pre = audit_convention_rank(&j_pre, nk_scale, &[]);
+        let rank_pre = audit_convention_rank(&j_pre, nk_scale, &[]).expect("rank certificate");
         assert_eq!(
             rank_pre, p_total,
             "fixture must make the joint eigendecomposition count the near-separable \
@@ -2231,7 +2335,7 @@ mod tests {
             }
         }
 
-        let rank_can = audit_convention_rank(&j_can, nk_scale, &[]);
+        let rank_can = audit_convention_rank(&j_can, nk_scale, &[]).expect("rank certificate");
 
         // OLD compare (full J_pre vs reduced J_can) WOULD have tripped: the joint
         // eigendecomposition over-counts J_pre relative to the reduced design.
@@ -2323,7 +2427,7 @@ mod tests {
             },
         ];
 
-        let rank_can = flat_audit_convention_rank(&j_can, &blocks_can);
+        let rank_can = flat_audit_convention_rank(&j_can, &blocks_can).expect("rank certificate");
         assert_eq!(
             rank_can, p_red,
             "reduced J_can must be full rank ({rank_can} != p_red {p_red}) under the \
@@ -2391,7 +2495,7 @@ mod tests {
                 priority: 100,
             },
         ];
-        let rank_j_pre = flat_audit_convention_rank(&j_pre, &blocks_pre);
+        let rank_j_pre = flat_audit_convention_rank(&j_pre, &blocks_pre).expect("rank certificate");
         assert!(
             rank_j_pre < p_total_raw,
             "fixture must be under-determined: rank(J_pre)={rank_j_pre} must be < \
@@ -2413,7 +2517,7 @@ mod tests {
             structural_penalty: None,
             priority: 100,
         }];
-        let rank_j_can = flat_audit_convention_rank(&j_can, &blocks_can);
+        let rank_j_can = flat_audit_convention_rank(&j_can, &blocks_can).expect("rank certificate");
 
         // (a) The OLD strict invariant `rank(J_can) == p_total_red` WOULD have
         // tripped: the reduced design is row-capped below its column count.
@@ -2471,7 +2575,6 @@ mod tests {
             "one direction dropped from block 1"
         );
     }
-
 
     // ─── #2748 coefficient-coordinate declaration, restored (#2818) ─────────
     //
@@ -2539,12 +2642,9 @@ mod tests {
 
         let specs = dealiased_warp_against_mean_block_specs(100, 80);
         let declarations = vec![CoefficientCoordinate::Spanning; specs.len()];
-        let canon = canonicalize_for_identifiability_with_operating_scalars(
-            &specs,
-            &declarations,
-            None,
-        )
-            .expect("a rank-deficient overlap must canonicalise, not fail closed");
+        let canon =
+            canonicalize_for_identifiability_with_operating_scalars(&specs, &declarations, None)
+                .expect("a rank-deficient overlap must canonicalise, not fail closed");
         assert_eq!(
             canon.reduced_specs[1].design.ncols(),
             specs[1].design.ncols() - 1,
@@ -2608,8 +2708,8 @@ mod tests {
         // The carried declaration is the reduced penalty's resolved nullity.
         use gam_linalg::faer_ndarray::FaerEigh;
         let reduced = eta.penalties[0].as_dense_cow().into_owned();
-        let (values, _) = FaerEigh::eigh(&reduced, faer::Side::Lower)
-            .expect("reduced penalty spectrum");
+        let (values, _) =
+            FaerEigh::eigh(&reduced, faer::Side::Lower).expect("reduced penalty spectrum");
         assert_eq!(
             gam_linalg::roundoff::resolved_eigenvalue_count(&values.to_vec(), 0.0),
             2,
@@ -2762,11 +2862,40 @@ mod tests {
             &[CoefficientCoordinate::Spanning],
             None,
         )
-            .expect_err("one declaration for two blocks is not a declaration");
+        .expect_err("one declaration for two blocks is not a declaration");
         let text = format!("{err:?}");
         assert!(
             text.contains("coefficient-coordinate declaration"),
             "the refusal must name what was missing: {text}"
+        );
+    }
+
+    #[test]
+    fn post_t_rank_refuses_invalid_inputs_instead_of_certifying_a_substitute() {
+        let valid = ndarray::array![[1.0], [2.0]];
+        let block = |width, structural_penalty| FlatRankBlock {
+            width,
+            structural_penalty,
+            priority: 100,
+        };
+        assert!(flat_audit_convention_rank(&valid, &[]).is_err());
+        let overflow = [block(usize::MAX, None), block(1, None)];
+        assert!(flat_audit_convention_rank(&valid, &overflow).is_err());
+        assert!(audit_convention_rank(&valid, 2, &overflow).is_err());
+        assert!(audit_convention_rank(&valid, 2, &[block(2, None)]).is_err());
+        assert!(audit_convention_rank(&valid, 2, &[block(1, Some(Array2::eye(2)))]).is_err());
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, f64::MAX] {
+            let design = ndarray::array![[1.0], [invalid]];
+            assert!(audit_convention_rank(&design, 2, &[]).is_err());
+            assert!(flat_audit_convention_rank(&design, &[block(1, None)]).is_err());
+            let penalty = ndarray::array![[invalid]];
+            assert!(audit_convention_rank(&valid, 2, &[block(1, Some(penalty.clone()))]).is_err());
+            assert!(flat_audit_convention_rank(&valid, &[block(1, Some(penalty))]).is_err());
+        }
+        assert_eq!(audit_convention_rank(&valid, 2, &[]).unwrap(), 1);
+        assert_eq!(
+            flat_audit_convention_rank(&valid, &[block(1, None)]).unwrap(),
+            1
         );
     }
 }

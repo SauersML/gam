@@ -314,25 +314,4 @@ impl PredictableModel for BernoulliMarginalSlopePredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        2 + usize::from(self.beta_residual.is_some())
-            + usize::from(self.beta_score_warp.is_some())
-            + usize::from(self.beta_link_dev.is_some())
-    }
-
-    fn block_roles(&self) -> Vec<BlockRole> {
-        let mut roles = vec![BlockRole::Location, BlockRole::Scale];
-        if self.beta_residual.is_some() {
-            // The residual repair block reads the genome beside the score: a
-            // mean-model read of the outcome, not a link or scale correction.
-            roles.push(BlockRole::Mean);
-        }
-        if self.beta_score_warp.is_some() {
-            roles.push(BlockRole::Mean);
-        }
-        if self.beta_link_dev.is_some() {
-            roles.push(BlockRole::LinkWiggle);
-        }
-        roles
-    }
 }

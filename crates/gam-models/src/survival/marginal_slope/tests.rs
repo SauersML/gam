@@ -4744,11 +4744,12 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline-pair callback")
         .expect("FLEX baseline-pair terms are present");
     assert_eq!(baseline_pair.score_psi_psi.len(), dimension);
-    let baseline_pair_hessian = baseline_pair
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-pair Hessian operator")
-        .to_dense();
+    // gam#3304: the ζ composition serves chart pairs with a dense θθ Hessian too.
+    assert!(
+        baseline_pair.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-pair Hessian"
+    );
+    let baseline_pair_hessian = baseline_pair.hessian_psi_psi.clone();
     assert_eq!(baseline_pair_hessian.dim(), (dimension, dimension));
     assert!(
         baseline_pair
@@ -4785,11 +4786,11 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         mixed.score_psi_psi.iter().any(|value| value.abs() > 1e-12),
         "active FLEX/timewiggle baseline-by-design score must not collapse to zero"
     );
-    let mixed_hessian = mixed
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-by-design Hessian operator")
-        .to_dense();
+    assert!(
+        mixed.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-by-design Hessian"
+    );
+    let mixed_hessian = mixed.hessian_psi_psi.clone();
     assert_eq!(mixed_hessian.dim(), (dimension, dimension));
     assert!(mixed_hessian.iter().all(|value| value.is_finite()));
     assert!(mixed_hessian.iter().any(|value| *value != 0.0));
@@ -9036,13 +9037,21 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
         .solve_row_survival_intercept_with_slot(q1v, gv, Some(&beta_h), Some(&beta_w), None)
         .expect("cold survival intercept solve");
 
-    let cache = new_intercept_warm_start_cache(1);
-    cache.store(
-        0,
-        SurvivalInterceptSlotKind::Exit,
-        a_cold + 0.5,
-        hash_intercept_warm_start_key(Some(&beta_h), Some(&beta_w)),
+    // The slot is keyed on every input of the exit equation, exactly as the
+    // production solve keys it; the entry equation at `q₀` shares the
+    // coefficients and the row but must not share the key.
+    let law = cold.flex_law_grid(Some(0)).expect("row law");
+    let probit_scale = cold.probit_frailty_scale();
+    let exit_key =
+        hash_intercept_warm_start_key(q1v, gv, probit_scale, law, Some(&beta_h), Some(&beta_w));
+    let entry_key =
+        hash_intercept_warm_start_key(q0v, gv, probit_scale, law, Some(&beta_h), Some(&beta_w));
+    assert_ne!(
+        exit_key, entry_key,
+        "equations with different targets must not share a warm-start key"
     );
+    let cache = new_intercept_warm_start_cache(1);
+    cache.store(0, SurvivalInterceptSlotKind::Exit, a_cold + 0.5, exit_key);
     let warm = make_family(Some(Arc::clone(&cache)));
     let (a_warm, density_warm) = warm
         .solve_row_survival_intercept_with_slot(

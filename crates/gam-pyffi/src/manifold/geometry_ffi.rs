@@ -327,7 +327,36 @@ fn sae_fit_admission<'py>(
     Ok(out.unbind())
 }
 
-#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+/// Assemble the fit-measured Theorem-4 coding ingredients from the optional
+/// scalar kwargs: all five supplied gives `Some`, none gives `None`, and a
+/// partial set is refused rather than silently dropped.
+fn measured_coding_from_kwargs(
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
+) -> PyResult<Option<gam::terms::sae::k_selection::MeasuredCoding>> {
+    match (d_eff_atom, n_eff, n_rows, k_bar, d_bar) {
+        (Some(d_eff_atom), Some(n_eff), Some(n_rows), Some(k_bar), Some(d_bar)) => {
+            Ok(Some(gam::terms::sae::k_selection::MeasuredCoding {
+                d_eff_atom,
+                n_eff,
+                n_rows,
+                k_bar,
+                d_bar,
+            }))
+        }
+        (None, None, None, None, None) => Ok(None),
+        _ => Err(py_value_error(
+            "the measured coding ingredients d_eff_atom, n_eff, n_rows, k_bar and d_bar \
+             must be supplied together or not at all"
+                .to_string(),
+        )),
+    }
+}
+
+#[pyfunction(signature = (points, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_select_k(
     py: Python<'_>,
     points: Vec<(usize, f64)>,
@@ -335,6 +364,11 @@ fn sae_select_k(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let curve = gam::terms::sae::k_selection::curve_from_pairs(&points).map_err(py_value_error)?;
     let config = gam::terms::sae::k_selection::KSelectionConfig {
@@ -342,11 +376,10 @@ fn sae_select_k(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
-    let selected = gam::terms::sae::k_selection::select_k(&curve, &config);
+    let selected =
+        gam::terms::sae::k_selection::select_k(&curve, &config).map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", selected.k)?;
     out.set_item("ev", selected.ev)?;
@@ -356,7 +389,7 @@ fn sae_select_k(
     Ok(out.into())
 }
 
-#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6))]
+#[pyfunction(signature = (manifold_points, linear_points, manifold_params_per_atom, linear_params_per_atom, mode = "kneedle", knee_slope_fraction = 0.10, complexity_penalty = 0.05, flat_span_tol = 1.0e-6, d_eff_atom = None, n_eff = None, n_rows = None, k_bar = None, d_bar = None))]
 fn sae_auto_k_recommendation(
     py: Python<'_>,
     manifold_points: Vec<(usize, f64)>,
@@ -367,6 +400,11 @@ fn sae_auto_k_recommendation(
     knee_slope_fraction: f64,
     complexity_penalty: f64,
     flat_span_tol: f64,
+    d_eff_atom: Option<f64>,
+    n_eff: Option<f64>,
+    n_rows: Option<f64>,
+    k_bar: Option<f64>,
+    d_bar: Option<f64>,
 ) -> PyResult<PyObject> {
     let manifold =
         gam::terms::sae::k_selection::curve_from_pairs(&manifold_points).map_err(py_value_error)?;
@@ -377,9 +415,7 @@ fn sae_auto_k_recommendation(
         knee_slope_fraction,
         complexity_penalty,
         flat_span_tol,
-        // This scalar-curve FFI carries no fit-measured coding ingredients; a
-        // `MeasuredMdl` mode string falls back to Kneedle when this is `None`.
-        measured_coding: None,
+        measured_coding: measured_coding_from_kwargs(d_eff_atom, n_eff, n_rows, k_bar, d_bar)?,
     };
     // The manifold-vs-linear advantage is now measured in DECODER PARAMETERS, not
     // atom count: a manifold atom stores `basis_size·p` scalars, a linear atom
@@ -392,7 +428,8 @@ fn sae_auto_k_recommendation(
         &config,
         manifold_params_per_atom,
         linear_params_per_atom,
-    );
+    )
+    .map_err(py_value_error)?;
     let out = PyDict::new(py);
     out.set_item("k", rec.selection.k)?;
     out.set_item("ev", rec.selection.ev)?;
@@ -496,7 +533,14 @@ fn format_g(x: f64) -> String {
 /// `amortization_horizon`, `bits_at_r2_{g}` / `code_bits_at_r2_{g}` /
 /// `resid_bits_at_r2_{g}` / `truncation_bits_at_r2_{g}` per target (truncation
 /// bits are the residual-coded atom modes beyond `code_dims`, already inside the
-/// residual bits), and `native_bits_per_token` when given.
+/// residual bits), `intrinsic_atoms` (how many atoms the callback priced by
+/// their chart), and `native_bits_per_token` when given.
+///
+/// `atom_contribution(atom, take)` returns either the `(|take|, d)` float64
+/// contribution matrix (ambient linear code) or a chart mapping `{"code":
+/// (|take|, k), "jacobian": (|take|, d, k), "axes": [...]}` with
+/// `k = code_dims[atom]`, priced by the intrinsic decoder-aware code
+/// (#2933 F17, #3437).
 #[pyfunction]
 #[pyo3(signature = (
     test_x, recon, gate, code_dims, dictionary_params, amortization_horizon,
@@ -527,23 +571,19 @@ fn sae_eq4_description_length<'py>(
     // propagates with its original type instead of being flattened to a
     // ValueError; the closure returns the message the core threads back.
     let callback_err: std::cell::RefCell<Option<PyErr>> = std::cell::RefCell::new(None);
-    let fetch = |atom: usize, take: &[usize]| -> Result<Array2<f64>, String> {
+    let fetch = |atom: usize, take: &[usize]| -> Result<AtomFiringCode, String> {
+        let keep = |e: PyErr| {
+            let message = e.to_string();
+            *callback_err.borrow_mut() = Some(e);
+            message
+        };
         let take_arr = take
             .iter()
             .map(|&i| i as i64)
             .collect::<Vec<i64>>()
             .into_pyarray(py);
-        let result = atom_contribution.call1((atom, take_arr)).map_err(|e| {
-            let message = e.to_string();
-            *callback_err.borrow_mut() = Some(e);
-            message
-        })?;
-        let array = result.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
-            let message = format!("atom {atom} contribution must be a float64 matrix: {e}");
-            *callback_err.borrow_mut() = Some(PyErr::from(e));
-            message
-        })?;
-        Ok(array.as_array().to_owned())
+        let result = atom_contribution.call1((atom, take_arr)).map_err(keep)?;
+        eq4_atom_firing_code(atom, &result).map_err(keep)
     };
 
     let dl = gam::terms::sae::eq4_description_length::eq4_fixed_distortion_description_length(
@@ -581,8 +621,84 @@ fn sae_eq4_description_length<'py>(
     if let Some(native) = dl.native_bits_per_token {
         out.set_item("native_bits_per_token", native)?;
     }
+    out.set_item("intrinsic_atoms", dl.intrinsic_atoms)?;
     out.set_item("score_kind", dl.score_kind.as_str())?;
     Ok(out.into())
+}
+
+use gam::terms::sae::eq4_description_length::{AtomChart, AtomFiringCode, ChartAxis};
+
+/// Read one `atom_contribution` callback return: a float64 `(rows, d)`
+/// contribution matrix (the ambient code) or a chart mapping with `code`
+/// `(rows, k)`, `jacobian` `(rows, d, k)` and `axes` (one per chart coordinate:
+/// `"euclidean"`, `"amplitude"`, or a float period for a circle coordinate),
+/// priced by the intrinsic decoder-aware code (#3437).
+fn eq4_atom_firing_code<'py>(atom: usize, value: &Bound<'py, PyAny>) -> PyResult<AtomFiringCode> {
+    let Ok(chart) = value.cast::<PyDict>() else {
+        let contribution = value.extract::<PyReadonlyArray2<f64>>().map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} contribution must be a float64 (rows, d) matrix or a chart \
+                 mapping with code / jacobian / axes: {}",
+                PyErr::from(e)
+            ))
+        })?;
+        return Ok(AtomFiringCode::Ambient(contribution.as_array().to_owned()));
+    };
+    let entry = |name: &str| -> PyResult<Bound<'py, PyAny>> {
+        chart.get_item(name)?.ok_or_else(|| {
+            PyValueError::new_err(format!("atom {atom} chart mapping is missing `{name}`"))
+        })
+    };
+    let code = entry("code")?
+        .extract::<PyReadonlyArray2<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `code` must be a float64 (rows, k) matrix: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let jacobian = entry("jacobian")?
+        .extract::<PyReadonlyArray3<f64>>()
+        .map_err(|e| {
+            PyTypeError::new_err(format!(
+                "atom {atom} chart `jacobian` must be a float64 (rows, d, k) array: {}",
+                PyErr::from(e)
+            ))
+        })?
+        .as_array()
+        .to_owned();
+    let mut axes = Vec::new();
+    for item in entry("axes")?.try_iter()? {
+        let item = item?;
+        let axis = match item.extract::<String>() {
+            Ok(tag) => match tag.as_str() {
+                "euclidean" => ChartAxis::Euclidean,
+                "amplitude" => ChartAxis::Amplitude,
+                other => {
+                    return Err(PyValueError::new_err(format!(
+                        "atom {atom} chart axis {other:?} is not \"euclidean\", \"amplitude\" \
+                         or a float period"
+                    )));
+                }
+            },
+            Err(_) => ChartAxis::Periodic {
+                period: item.extract::<f64>().map_err(|_| {
+                    PyTypeError::new_err(format!(
+                        "atom {atom} chart axes must be \"euclidean\", \"amplitude\" or a \
+                         float period"
+                    ))
+                })?,
+            },
+        };
+        axes.push(axis);
+    }
+    Ok(AtomFiringCode::Intrinsic(AtomChart {
+        code,
+        jacobian,
+        axes,
+    }))
 }
 
 #[pyfunction]
@@ -1386,7 +1502,6 @@ fn sinkhorn_barycenter_forward<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
 ) -> PyResult<Py<PyArray1<f64>>> {
     let atoms_owned = atoms.as_array().to_owned();
     let weights_owned = weights.as_array().to_owned();
@@ -1397,7 +1512,6 @@ fn sinkhorn_barycenter_forward<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
         )
     })?;
     Ok(out.into_pyarray(py).unbind())
@@ -1410,7 +1524,6 @@ fn sinkhorn_barycenter_vjp<'py>(
     weights: PyReadonlyArray1<'py, f64>,
     cost: PyReadonlyArray2<'py, f64>,
     eps: f64,
-    n_iter: usize,
     cotangent: PyReadonlyArray1<'py, f64>,
 ) -> PyResult<(Py<PyArray2<f64>>, Py<PyArray1<f64>>)> {
     let atoms_owned = atoms.as_array().to_owned();
@@ -1423,7 +1536,6 @@ fn sinkhorn_barycenter_vjp<'py>(
             weights_owned.view(),
             cost_owned.view(),
             eps,
-            n_iter,
             cot_owned.view(),
         )
     })?;
@@ -4594,13 +4706,12 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     module.add_function(wrap_pyfunction!(flat_to_matrix_f64, module)?)?;
     module.add_function(wrap_pyfunction!(extract_row_ids, module)?)?;
-    module.add_function(wrap_pyfunction!(default_survival_time_grid, module)?)?;
     module.add_function(wrap_pyfunction!(torch_from_fitted, module)?)?;
     module.add_function(wrap_pyfunction!(fit_table, module)?)?;
     module.add_function(wrap_pyfunction!(fit_array, module)?)?;
     module.add_class::<PyFittedModel>()?;
     module.add_function(wrap_pyfunction!(compile_model, module)?)?;
-    module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
+    module.add_function(wrap_pyfunction!(evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
     module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
@@ -4684,6 +4795,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(duchon_function_norm_penalty, module)?)?;
     module.add_function(wrap_pyfunction!(duchon_operator_penalties, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis, module)?)?;
+    module.add_function(wrap_pyfunction!(sphere_basis_size, module)?)?;
     module.add_function(wrap_pyfunction!(sphere_basis_with_centers, module)?)?;
     module.add_function(wrap_pyfunction!(
         sphere_select_farthest_point_centers,
@@ -4891,7 +5003,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(posterior_predict_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_predict_bands_table, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_draw_bands, module)?)?;
-    module.add_function(wrap_pyfunction!(posterior_eta_bands, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_credible_interval, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_coefficient_names_json, module)?)?;
     module.add_function(wrap_pyfunction!(posterior_trace_selection_json, module)?)?;
@@ -4909,7 +5020,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(summary_html, module)?)?;
     module.add_function(wrap_pyfunction!(coefficient_state_json, module)?)?;
     module.add_function(wrap_pyfunction!(term_blocks_for_model, module)?)?;
-    module.add_function(wrap_pyfunction!(model_partial_dependence, module)?)?;
+    module.add_function(wrap_pyfunction!(model_partial_effect, module)?)?;
     module.add_function(wrap_pyfunction!(model_variance_share, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_json, module)?)?;
     module.add_function(wrap_pyfunction!(difference_smooth_rows, module)?)?;
@@ -4937,10 +5048,6 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(survival_concordance, module)?)?;
     module.add_function(wrap_pyfunction!(survival_score_grid_from_times, module)?)?;
     module.add_function(wrap_pyfunction!(survival_null_curve_from_train, module)?)?;
-    module.add_function(wrap_pyfunction!(
-        survival_matrix_from_risk_calibration,
-        module
-    )?)?;
     module.add_function(wrap_pyfunction!(
         survival_lifted_metrics_from_predictions,
         module
@@ -5512,20 +5619,38 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 }
 
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
-/// linear dictionary `atoms` (`K x P`) via the Rust top-`top_k` ridge solve,
-/// returning the `(M, K)` code matrix.
-#[pyfunction(signature = (x, atoms, top_k, code_ridge = 1.0e-8))]
+/// linear dictionary `atoms` (`K x P`) with the fitted model's assignment rule
+/// (`"top_k"` ridge solve or `"softmax"` at `temperature`), returning the
+/// `(M, K)` code matrix.
+#[pyfunction(signature = (
+    x,
+    atoms,
+    top_k,
+    code_ridge = 1.0e-8,
+    assignment = "top_k",
+    temperature = 0.25
+))]
 fn linear_dictionary_transform_ffi<'py>(
     py: Python<'py>,
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
     code_ridge: f64,
+    assignment: &str,
+    temperature: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
     let atoms_values = atoms.as_array().to_owned();
+    let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
     let codes = detach_py_result(py, "linear_dictionary_transform", move || {
-        linear_dictionary_transform(x_values.view(), atoms_values.view(), top_k, code_ridge)
+        linear_dictionary_transform(
+            x_values.view(),
+            atoms_values.view(),
+            top_k,
+            assignment_kind,
+            temperature,
+            code_ridge,
+        )
     })?;
     Ok(codes.into_pyarray(py).unbind())
 }
@@ -7179,7 +7304,7 @@ fn predict_columns(
     )?;
     let predictor = model
         .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
 
     let mut columns = BTreeMap::<String, Vec<f64>>::new();
@@ -7416,48 +7541,80 @@ fn predict_encoded_table_conformal_impl(
     })
 }
 
-/// #1098 Gaussian full-conformal prediction set at frozen `Sλ` — no
-/// calibration fold.
+/// A full-conformal predict failure: a schema or input rejection of either
+/// table, or a conformal-route refusal or numerical failure, each kept typed
+/// until it is mapped to its Python class.
+enum FullConformalPredictError {
+    Predict(PredictError),
+    Conformal(gam_predict::conformal_routes::FullConformalError),
+}
+
+/// #1098 full-conformal prediction set at the frozen penalty — no calibration
+/// fold.
 ///
 /// Evaluated by `gam_predict::conformal_routes::full_conformal_prediction_columns`
 /// on the prediction rows and the labeled rows, both projected onto the model
-/// schema.
+/// schema, with the model's offset column resolved on each.
 fn predict_encoded_table_full_conformal_impl(
     model: &FittedModel,
     source: EncodedDataset,
     training_source: EncodedDataset,
     conformal_level: f64,
-) -> Result<PredictionPayload, String> {
-    let dataset = dataset_with_model_schema_from_encoded(model, &source)?;
-    let training = dataset_with_model_schema_from_encoded(model, &training_source)?;
+) -> Result<PredictionPayload, FullConformalPredictError> {
+    let dataset = dataset_with_model_schema_from_encoded(model, &source)
+        .map_err(FullConformalPredictError::Predict)?;
+    let training = dataset_with_model_schema_from_encoded(model, &training_source)
+        .map_err(FullConformalPredictError::Predict)?;
     let test_col_map = dataset.column_map();
     let training_col_map = training.column_map();
+    let test_offset =
+        resolve_offset_column(&dataset, &test_col_map, model.offset_column.as_deref())
+            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
+    let training_offset =
+        resolve_offset_column(&training, &training_col_map, model.offset_column.as_deref())
+            .map_err(|err| FullConformalPredictError::Predict(PredictError::Other(err.to_string())))?;
     let columns = gam_predict::conformal_routes::full_conformal_prediction_columns(
         model,
         &gam_predict::conformal_routes::DesignRows {
             data: dataset.values.view(),
             col_map: &test_col_map,
+            offset: &test_offset,
         },
         &gam_predict::conformal_routes::DesignRows {
             data: training.values.view(),
             col_map: &training_col_map,
+            offset: &training_offset,
         },
         conformal_level,
-    )?;
+    )
+    .map_err(FullConformalPredictError::Conformal)?;
+    let likelihood = model_likelihood_spec(&model);
+    let interval_method = if likelihood.is_gaussian_identity() {
+        format!(
+            "full-conformal with REML re-selection of the smoothing strength on the \
+             augmented rows (finite-sample ≥{:.0}% coverage wherever \
+             conformal_certificate ≥ 0; a negative code is a typed refusal carrying \
+             the frozen-ρ set)",
+            conformal_level * 100.0
+        )
+    } else {
+        format!(
+            "full-conformal at frozen smoothing parameters by certified augmented refits \
+             (exact ≥{:.0}% set given the frozen penalty, score |∂ℓ/∂η|, seeded tie \
+             randomization; a union of conformal_set_components intervals whose envelope is \
+             posterior_mean_lower/upper; conformal_certificate 0 when the fit selected no \
+             smoothing parameter, -7 glm_frozen_penalty otherwise)",
+            conformal_level * 100.0
+        )
+    };
     Ok(PredictionPayload {
         columns,
         model_class: prediction_model_class_label(&model),
         point_column: model.predict_model_class().point_column(),
         point_shape: model.predict_model_class().point_shape(),
         point_columns: None,
-        family: family_link_kind(&model_likelihood_spec(&model)).to_string(),
-        interval_method: Some(format!(
-            "full-conformal with REML re-selection of the smoothing strength on the \
-             augmented rows (finite-sample ≥{:.0}% coverage wherever \
-             conformal_certificate ≥ 0; a negative code is a typed refusal carrying \
-             the frozen-ρ set)",
-            conformal_level * 100.0
-        )),
+        family: family_link_kind(&likelihood).to_string(),
+        interval_method: Some(interval_method),
         covariance_source: None,
         point_covariance_source: None,
         point_covariance_note: None,
@@ -7471,16 +7628,21 @@ fn predict_encoded_table_full_conformal_impl(
 /// full-conformal set: the saved model carries only the frozen `p x p` penalty
 /// `Sλ`, and the labeled `(training_headers, training_rows)` — which must
 /// contain the response column — supply the design and responses the set
-/// augments. Each row's set is that of the fit that re-selects the smoothing
-/// strength by REML on the augmented rows, which carries the distribution-free
-/// finite-sample ≥`conformal_level` marginal-coverage theorem. The returned
-/// `conformal_certificate` column is `0` (exact_frozen) or `1` (honest_refit)
-/// for such rows and a negative refusal code otherwise (the frozen-ρ set, no
-/// guarantee). Returns the same column payload as `predict_table` plus that
-/// column.
+/// augments. Gaussian-identity, Bernoulli-logit, Poisson-log,
+/// negative-binomial-log and Gamma-log standard models are supported, with or
+/// without an offset. A Gaussian row's set is that of the fit that re-selects
+/// the smoothing strength by REML on the augmented rows, which carries the
+/// distribution-free finite-sample ≥`conformal_level` marginal-coverage
+/// theorem; a GLM row's set is the certified augmented refit at the frozen
+/// penalty. The returned `conformal_certificate` column is `0` (exact_frozen)
+/// or `1` (honest_refit) for guaranteed rows and a negative refusal code
+/// otherwise (`-7` glm_frozen_penalty for a GLM that selected λ or θ). Returns
+/// the same column payload as `predict_table` plus `conformal_set_components`
+/// and that column.
 ///
-/// Raises a descriptive Python exception for ineligible models (non-Gaussian,
-/// weighted, scan-routed, …) directing the user to split conformal.
+/// Raises `InvalidConfigurationError` for ineligible models (prior weights —
+/// pointing to split conformal with `calibration=` — unsupported family,
+/// scan-routed, …) and `PredictionError` for a numerical failure.
 #[pyfunction(signature = (model, headers, rows, training_headers, training_rows, conformal_level=0.9))]
 fn predict_table_full_conformal(
     py: Python<'_>,
@@ -7491,6 +7653,7 @@ fn predict_table_full_conformal(
     training_rows: PyRef<'_, PyEncodedTable>,
     conformal_level: f64,
 ) -> PyResult<PyObject> {
+    use gam_predict::conformal_routes::FullConformalError;
     let model = Arc::clone(&model.model);
     rows.require_headers(&headers).map_err(py_value_error)?;
     training_rows
@@ -7498,9 +7661,20 @@ fn predict_table_full_conformal(
         .map_err(py_value_error)?;
     let dataset = rows.dataset.clone();
     let training = training_rows.dataset.clone();
-    let payload = detach_py_result(py, "predict_table_full_conformal", move || {
-        predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level)
-    })?;
+    let payload = detach_typed_py_result(
+        py,
+        "predict_table_full_conformal",
+        move || predict_encoded_table_full_conformal_impl(&model, dataset, training, conformal_level),
+        |_, err| match err {
+            FullConformalPredictError::Predict(err) => predict_error_to_pyerr(err),
+            FullConformalPredictError::Conformal(
+                err @ (FullConformalError::PriorWeights { .. } | FullConformalError::Unsupported(_)),
+            ) => InvalidConfigurationError::new_err(err.to_string()),
+            FullConformalPredictError::Conformal(FullConformalError::Failed(msg)) => {
+                PredictionError::new_err(msg)
+            }
+        },
+    )?;
     prediction_payload_into_py(py, payload)
 }
 
@@ -7822,121 +7996,6 @@ fn affine_design_array_impl(
     affine_design_for_dataset(&model, dataset)
 }
 
-struct PartialDependenceOutput {
-    table: gam::inference::partial_dependence::PartialDependenceTable,
-    predicted: Vec<f64>,
-    standard_error: Vec<f64>,
-    covariance_source: String,
-}
-
-/// A term's partial dependence on the grid its saved term specification defines
-/// (`gam::inference::partial_dependence`), evaluated by
-/// `gam_predict::term_diagnostics::term_partial_dependence` on the model's
-/// mean-block design at the grid rows, with the covariance the fit publishes.
-fn model_partial_dependence_impl(
-    model: &FittedModel,
-    term: &str,
-    grid: gam::inference::partial_dependence::PartialDependenceGrid,
-) -> Result<PartialDependenceOutput, String> {
-    let payload = model.payload();
-    let schema = payload
-        .data_schema
-        .as_ref()
-        .ok_or_else(|| "partial_dependence requires a saved model schema".to_string())?;
-    let training_feature_ranges = payload
-        .training_feature_ranges
-        .as_deref()
-        .ok_or_else(|| "partial_dependence requires saved training feature ranges".to_string())?;
-    let termspec = payload.resolved_termspec.as_ref().ok_or_else(|| {
-        "partial_dependence requires a saved resolved term specification".to_string()
-    })?;
-    let training_headers = model
-        .training_headers
-        .as_deref()
-        .ok_or_else(|| "partial_dependence requires saved training headers".to_string())?;
-    let table = gam::inference::partial_dependence::partial_dependence_table(
-        gam::inference::partial_dependence::PartialDependenceInputs {
-            schema,
-            training_headers,
-            training_feature_ranges,
-            termspec,
-        },
-        term,
-        grid,
-    )?;
-    let spec = standard_mean_termspec(model, &table.table)?;
-    if gam::terms::smooth::term_collection_has_nonzero_anchor(&spec) {
-        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
-    }
-    let fit = gam::families::survival::predict::saved_fit_result(model)?;
-    let beta = &fit.beta;
-    // The partial-effect band prices its SEs off the covariance the fit
-    // publishes — the same choice `summary()` makes — and names it in the
-    // result (#2779). A fit with no corrected matrix reports the conditional
-    // band under the `conditional` label, never an empty table.
-    let covariance_source = fit.published_covariance_mode();
-    let cov = match covariance_source {
-        gam_predict::InferenceCovarianceMode::SmoothingCorrected => fit.beta_covariance_corrected(),
-        gam_predict::InferenceCovarianceMode::Conditional => fit.beta_covariance(),
-    }
-    .ok_or_else(|| {
-        "partial_dependence requires a persisted coefficient covariance; refit before requesting \
-         partial-dependence standard errors"
-            .to_string()
-    })?;
-    // The term's coefficient range is a property of the layout, not of the
-    // rows, so one grid row places it; the grid itself then realizes only the
-    // term's own columns and the blocks they read.
-    let rows = table.table.values.view();
-    let layout = gam::terms::smooth::build_term_collection_prediction_design(
-        rows.slice(ndarray::s![..rows.nrows().min(1), ..]),
-        &spec,
-    )
-    .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    let mut terms = layout.linear_ranges.iter().chain(&layout.smooth_ranges);
-    let range = terms
-        .find(|(name, _)| name.as_str() == term)
-        .map(|(_, range)| range.clone())
-        .ok_or_else(|| {
-            let available: Vec<&str> = layout
-                .linear_ranges
-                .iter()
-                .chain(&layout.smooth_ranges)
-                .map(|(name, _)| name.as_str())
-                .collect();
-            format!("partial_dependence: term {term:?} not found; available: {available:?}")
-        })?;
-    if range.end > beta.len() || range.end > cov.nrows() || range.end > cov.ncols() {
-        return Err(format!(
-            "partial_dependence: term {term:?} columns {range:?} lie outside the {} saved \
-             coefficients or the {:?} covariance",
-            beta.len(),
-            cov.dim()
-        ));
-    }
-    let term_design = gam::terms::smooth::build_term_prediction_columns(rows, &spec, term)
-        .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    if term_design.ncols() != range.len() {
-        return Err(format!(
-            "partial_dependence: term {term:?} realizes {} columns on the grid but spans \
-             {range:?} in the model layout",
-            term_design.ncols()
-        ));
-    }
-    let (predicted, standard_error) = gam_predict::term_diagnostics::term_partial_dependence(
-        term_design.view(),
-        beta.slice(ndarray::s![range.clone()]),
-        cov.slice(ndarray::s![range.clone(), range]),
-        0..term_design.ncols(),
-    )?;
-    Ok(PartialDependenceOutput {
-        table,
-        predicted,
-        standard_error,
-        covariance_source: covariance_source.as_str().to_string(),
-    })
-}
-
 /// Per-term variance share for each non-intercept term block (or the single
 /// `term` when supplied), evaluated by
 /// `gam_predict::term_diagnostics::term_variance_shares` on the model's
@@ -7947,7 +8006,7 @@ fn model_variance_share_encoded_impl(
     term: Option<String>,
 ) -> Result<Vec<(String, f64)>, String> {
     let dataset = dataset_with_model_schema_from_encoded(&model, &source)?;
-    let x = standard_mean_design(&model, dataset)?;
+    let x = gam_predict::partial_effect::standard_mean_design(&model, dataset)?;
     let fit = gam::families::survival::predict::saved_fit_result(model)?;
     let selected: Vec<(String, std::ops::Range<usize>)> = term_blocks_for_model_impl(model)?
         .into_iter()
@@ -7959,41 +8018,71 @@ fn model_variance_share_encoded_impl(
     gam_predict::term_diagnostics::term_variance_shares(x.view(), fit.beta.view(), &selected)
 }
 
+/// A term's partial effect with pointwise and simultaneous bands at `level`,
+/// from `gam_predict::partial_effect::partial_effect` — the function the CLI's
+/// `partial-effect` command also reads.
 #[pyfunction]
-fn model_partial_dependence<'py>(
+fn model_partial_effect<'py>(
     py: Python<'py>,
     model: PyRef<'_, PyFittedModel>,
     term: String,
     grid: Option<PyReadonlyArray2<'py, f64>>,
     n_points: usize,
+    level: f64,
 ) -> PyResult<Py<PyDict>> {
     let model = Arc::clone(&model.model);
-    use gam::inference::partial_dependence::{
-        HeldValue, PARTIAL_DEPENDENCE_SCALE, PartialDependenceGrid,
-    };
+    use gam::inference::partial_dependence::PartialDependenceGrid;
     let grid = match grid {
         Some(points) => PartialDependenceGrid::Explicit(points.as_array().to_owned()),
         None => PartialDependenceGrid::TrainingRange { n_points },
     };
-    let output = detach_py_result(py, "model_partial_dependence", move || {
-        model_partial_dependence_impl(&model, &term, grid)
+    let effect = detach_py_result(py, "model_partial_effect", move || {
+        gam_predict::partial_effect::partial_effect(&model, &term, grid, level)
     })?;
-    let contribution = output.table.contribution();
-    let table = output.table;
+    let record = effect.record();
     let out = PyDict::new(py);
-    out.set_item("grid", table.grid.into_pyarray(py))?;
-    out.set_item("axes", table.axes)?;
-    out.set_item("predicted", output.predicted.into_pyarray(py))?;
-    out.set_item("standard_error", output.standard_error.into_pyarray(py))?;
-    out.set_item("covariance_source", output.covariance_source)?;
-    out.set_item("scale", PARTIAL_DEPENDENCE_SCALE)?;
-    out.set_item("quantity", table.quantity.as_str())?;
-    out.set_item("contribution", contribution)?;
+    out.set_item("term", record.term)?;
+    out.set_item("grid", effect.table.grid.into_pyarray(py))?;
+    out.set_item("axes", record.axes)?;
+    let axis_levels = PyList::empty(py);
+    for levels in record.axis_levels {
+        match levels {
+            Some(levels) => {
+                let entry = PyDict::new(py);
+                entry.set_item("values", levels.values)?;
+                entry.set_item("labels", levels.labels)?;
+                axis_levels.append(entry)?;
+            }
+            None => axis_levels.append(py.None())?,
+        }
+    }
+    out.set_item("axis_levels", axis_levels)?;
+    out.set_item("axis_values", record.axis_values)?;
+    let bands = effect.bands;
+    out.set_item("fit", bands.fit.into_pyarray(py))?;
+    out.set_item("se", bands.se.into_pyarray(py))?;
+    out.set_item("lower", bands.lower.into_pyarray(py))?;
+    out.set_item("upper", bands.upper.into_pyarray(py))?;
+    out.set_item("simultaneous_lower", bands.simultaneous_lower.into_pyarray(py))?;
+    out.set_item("simultaneous_upper", bands.simultaneous_upper.into_pyarray(py))?;
+    out.set_item("level", record.level)?;
+    out.set_item("pointwise_critical", record.pointwise_critical)?;
+    out.set_item("simultaneous_critical", record.simultaneous_critical)?;
+    out.set_item("simulations", record.simulations)?;
+    out.set_item("seed", record.seed)?;
+    out.set_item("covariance_source", record.covariance_source)?;
+    out.set_item("scale", record.scale)?;
+    out.set_item("quantity", record.quantity)?;
+    out.set_item("contribution", record.contribution)?;
     let held = PyDict::new(py);
-    for (column, value) in table.held {
+    for (column, value) in record.held {
         match value {
-            HeldValue::Level(label) => held.set_item(column, label)?,
-            HeldValue::Number(number) => held.set_item(column, number)?,
+            gam_predict::partial_effect::PartialEffectCell::Level(label) => {
+                held.set_item(column, label)?
+            }
+            gam_predict::partial_effect::PartialEffectCell::Number(number) => {
+                held.set_item(column, number)?
+            }
         }
     }
     out.set_item("held", held)?;
@@ -8014,93 +8103,6 @@ fn model_variance_share(
     detach_py_result(py, "model_variance_share", move || {
         model_variance_share_encoded_impl(&model, dataset, term)
     })
-}
-
-/// Internal full mean-block design used by term diagnostics.
-///
-/// This is deliberately distinct from the public affine predictor design.  A
-/// link-wiggle's final fitted predictor uses the mean block as its row offset
-/// and a LinkWiggle-frame matrix, so returning this internal matrix from the
-/// public API was the architectural root cause of #2299.
-fn standard_mean_design(
-    model: &FittedModel,
-    dataset: EncodedDataset,
-) -> Result<Array2<f64>, String> {
-    let design = standard_mean_prediction_design(model, &dataset)?;
-    let dense = design
-        .design
-        .try_to_dense_by_chunks("design_matrix prediction design")?;
-    append_deployment_extension_columns(
-        model.payload(),
-        dataset.values.view(),
-        &dataset.column_map(),
-        model.training_headers.as_ref(),
-        dense,
-    )
-    .map_err(|err| err.to_string())
-}
-
-/// The frozen mean-block term specification a term-design diagnostic
-/// evaluates, resolved against the dataset's columns.
-fn standard_mean_termspec(
-    model: &FittedModel,
-    dataset: &EncodedDataset,
-) -> Result<gam::terms::smooth::TermCollectionSpec, String> {
-    // A scan-routed model never materializes a dense B-spline design — the
-    // exact O(n) state-space smoother is the whole point — so there is no model
-    // matrix to export. Replace the cryptic "missing resolved_termspec" error
-    // with a precise, actionable one (#1046).
-    if let Some(scan) = scan_introspection(model)? {
-        return Err(format!(
-            "{} is fit by the exact O(n) state-space spline scan, which does not \
-             build a finite coefficient-frame design; term-design diagnostics \
-             are unavailable for this fitted model.",
-            scan_smooth_label(&scan)
-        ));
-    }
-    if !matches!(model.predict_model_class(), PredictModelClass::Standard) {
-        return Err(format!(
-            "design_matrix currently supports only standard GAM models; got '{}'. \
-             For other classes use Model.predict / posterior.predict, which dispatch \
-             through the saved-model predictor.",
-            prediction_model_class_label(model)
-        ));
-    }
-    if model.saved_link_wiggle()?.is_some() {
-        return Err(
-            "term-design diagnostics do not define an additive mean-block \
-             decomposition for link-wiggle models; use design_matrix() for the \
-             exact fitted affine predictor or Model.predict for response-scale output."
-                .to_string(),
-        );
-    }
-    let spec = gam::families::survival::predict::resolve_termspec_for_prediction(
-        &model.resolved_termspec,
-        model.training_headers.as_ref(),
-        &dataset.column_map(),
-        "resolved_termspec",
-    )?;
-    Ok(spec)
-}
-
-const NONZERO_ANCHOR_DESIGN_ERROR: &str = "design_matrix cannot represent a model with non-zero \
-     smooth anchors as a single coefficient matrix; use Model.predict for the complete affine \
-     predictor";
-
-/// The undensified mean-block design behind [`standard_mean_design`], so a
-/// caller that reads one term's columns never materializes the rest.
-fn standard_mean_prediction_design(
-    model: &FittedModel,
-    dataset: &EncodedDataset,
-) -> Result<gam::terms::smooth::TermCollectionPredictionDesign, String> {
-    let spec = standard_mean_termspec(model, dataset)?;
-    let design =
-        gam::terms::smooth::build_term_collection_prediction_design(dataset.values.view(), &spec)
-            .map_err(|err| format!("failed to build design matrix: {err}"))?;
-    if design.affine_offset.iter().any(|value| *value != 0.0) {
-        return Err(NONZERO_ANCHOR_DESIGN_ERROR.to_string());
-    }
-    Ok(design)
 }
 
 fn posterior_credible_interval_impl(

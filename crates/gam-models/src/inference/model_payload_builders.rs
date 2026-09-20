@@ -22,9 +22,9 @@ use crate::bms::{
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, ExpectileFit, ExpectileLocationScaleFitResult, FitConfig,
-    FitNoteSink, FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
-    expectile_levels_for_config, fit_expectile_if_requested,
+    DispersionLocationScaleFitResult, ExpectileLocationScaleFitResult, FitConfig, FitNoteSink,
+    FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
+    expectile_levels_for_config, fit_formula_through_adaptive_resolution,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
 use crate::gamlss::{
@@ -49,9 +49,7 @@ use crate::survival::location_scale::{
 use crate::transformation_normal::{TransformationNormalFamily, TransformationNormalFitResult};
 use crate::wiggle::{WigglePenaltyMetadata, canonical_wiggle_function_penalties};
 use gam_data::{DataSchema, EncodedDataset};
-use gam_linalg::faer_ndarray::array2_to_nested_vec;
 use gam_linalg::matrix::LinearOperator;
-use gam_problem::BlockRole;
 use gam_problem::types::{
     InverseLink, LikelihoodSpec, ResponseFamily, StandardLink, inverse_link_to_binomial_spec,
 };
@@ -275,9 +273,14 @@ impl RealizedRawPenaltyTopology {
     }
 }
 
-/// The frozen penalty the exact full-conformal set of an eligible standard fit
-/// needs, recovered as `Sλ = M₀ − XᵀX` from the unit-weight training Gram. Only
-/// the p × p penalty is persisted: the labeled rows the set is built on are
+/// The frozen penalty the full-conformal set of an eligible standard fit needs.
+/// For Gaussian identity it is recovered as `Sλ = M₀ − XᵀX` from the unit-weight
+/// training Gram; for the GLM families of
+/// [`crate::inference::full_conformal_glm`] as `φ·(H − XᵀW_H X)` from the
+/// observed-information weights `W_H` the converged P-IRLS Hessian was built
+/// from, which puts it on the unit-dispersion likelihood the conformal refits
+/// minimize. Offsets are allowed: they enter only the linear predictor. Only the
+/// p × p penalty is persisted: the labeled rows the set is built on are
 /// supplied again at prediction time, so the saved model never grows with `n`.
 fn standard_conformal_penalty(
     fit_config: &FitConfig,
@@ -289,27 +292,46 @@ fn standard_conformal_penalty(
         let family = family.trim().to_ascii_lowercase();
         family == "expectile" || family.starts_with("expectile(")
     });
+    // The conformal refits minimize the plain penalized likelihood: a shifted
+    // prior mean or an inequality-constrained coefficient space is a different
+    // fitting map.
+    let shifted_prior = design
+        .penalties
+        .iter()
+        .any(|penalty| !matches!(penalty.prior_mean, gam_problem::CoefficientPriorMean::Zero));
+    let constrained = design.linear_constraints.is_some()
+        || design
+            .coefficient_lower_bounds
+            .as_ref()
+            .is_some_and(|bounds| bounds.iter().any(|bound| bound.is_finite()));
     if expectile
-        || !family.is_gaussian_identity()
         || fit_config.weight_column.is_some()
-        || fit_config.offset_column.is_some()
         || fit_config.flexible_link
-        || design.affine_offset.iter().any(|value| *value != 0.0)
+        || shifted_prior
+        || constrained
     {
         return None;
     }
     let normal_matrix = fit.penalized_hessian()?;
-    let unit_weights = Array1::<f64>::ones(design.design.nrows());
     // The penalty may legitimately be unavailable (the Gram cannot be formed
     // for this design). `None` is the contract, but the reason is what explains
     // a fit that ships without exact full-conformal intervals.
-    let penalty = design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
-        crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
-            &gram,
-            normal_matrix,
-            fit.lambdas.len(),
-        )
-    });
+    let penalty = if family.is_gaussian_identity() {
+        let unit_weights = Array1::<f64>::ones(design.design.nrows());
+        design.design.diag_xtw_x(&unit_weights).and_then(|gram| {
+            crate::inference::full_conformal::ExactFullConformalPenalty::from_gram_and_normal_matrix(
+                &gram,
+                normal_matrix,
+                fit.lambdas.len(),
+            )
+        })
+    } else if let Some(glm) =
+        crate::inference::full_conformal_glm::ConformalGlmFamily::from_likelihood(family)
+    {
+        glm_conformal_penalty(glm, fit, design, normal_matrix)
+    } else {
+        return None;
+    };
     match penalty {
         Ok(penalty) => Some(penalty),
         Err(reason) => {
@@ -317,6 +339,60 @@ fn standard_conformal_penalty(
             None
         }
     }
+}
+
+fn glm_conformal_penalty(
+    glm: crate::inference::full_conformal_glm::ConformalGlmFamily,
+    fit: &UnifiedFitResult,
+    design: &TermCollectionDesign,
+    normal_matrix: &Array2<f64>,
+) -> Result<crate::inference::full_conformal::ExactFullConformalPenalty, String> {
+    let pirls = fit
+        .artifacts
+        .pirls
+        .as_ref()
+        .ok_or_else(|| "the fit retains no P-IRLS observed-information weights".to_string())?;
+    let n = design.design.nrows();
+    if pirls.finalweights.len() != n {
+        return Err(format!(
+            "P-IRLS observed-information weights have {} rows but the design has {n}",
+            pirls.finalweights.len()
+        ));
+    }
+    if normal_matrix.nrows() != design.design.ncols() {
+        return Err(format!(
+            "penalized Hessian is {0}×{0} but the design has {1} columns",
+            normal_matrix.nrows(),
+            design.design.ncols()
+        ));
+    }
+    let weights = pirls.finalweights.to_owned();
+    let gram = design.design.diag_xtw_x(&weights)?;
+    // The P-IRLS weights carry the Gamma dispersion as `w/φ`; the other
+    // supported families have unit dispersion.
+    let scale = match glm {
+        crate::inference::full_conformal_glm::ConformalGlmFamily::GammaLog => pirls
+            .likelihood
+            .resolved_scale()
+            .and_then(|scale| scale.gamma_phi())
+            .map_err(|err| err.to_string())?,
+        _ => 1.0,
+    };
+    let penalized: Vec<std::ops::Range<usize>> = design
+        .penalties
+        .iter()
+        .map(|penalty| penalty.col_range.clone())
+        .collect();
+    let s_lambda = crate::inference::full_conformal_glm::penalty_from_normal_and_gram(
+        normal_matrix,
+        &gram,
+        &penalized,
+        scale,
+    )?;
+    crate::inference::full_conformal::ExactFullConformalPenalty::from_s_lambda(
+        s_lambda,
+        fit.lambdas.len(),
+    )
 }
 
 /// The comparable REML/LAML criterion of a standard fit: its raw criterion
@@ -443,16 +519,6 @@ pub fn assemble_standard_payload(
     payload.linkwiggle_penalty_metadata = wiggle_penalty_metadata;
     payload.beta_link_wiggle = wiggle_saved_warp_beta;
     payload.link_wiggle_index_shift = wiggle_saved_index_shift;
-    match &fit.fitted_link {
-        FittedLinkState::Mixture { covariance, .. } => {
-            payload.mixture_link_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
-        }
-        FittedLinkState::Sas { covariance, .. }
-        | FittedLinkState::BetaLogistic { covariance, .. } => {
-            payload.sas_param_covariance = covariance.as_ref().map(array2_to_nested_vec);
-        }
-        FittedLinkState::Standard(_) | FittedLinkState::LatentCLogLog { .. } => {}
-    }
     payload.set_training_feature_metadata(dataset.headers.clone(), dataset.feature_ranges());
     payload.resolved_termspec = Some(resolved_termspec);
     payload.basis_adequacy = basis_adequacy;
@@ -733,8 +799,7 @@ pub fn assemble_residual_cascade_payload(
 ///
 /// This is the single place that decides which payload fields a marginal-slope
 /// model carries and how the singular/vector mirror fields
-/// (`slope_formula(s)`, `z_column(s)`, `baseline_slope(s)`,
-/// `resolved_slopespec(s)`) are kept consistent — so the CLI and FFI
+/// (`z_column(s)`, `resolved_slopespec(s)`) are kept consistent — so the CLI and FFI
 /// saved models are byte-equivalent for identical semantic content.
 pub fn assemble_bernoulli_marginal_slope_payload(
     inputs: BernoulliMarginalSlopeInputs<'_>,
@@ -784,9 +849,8 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.unified = Some(fit_result.clone());
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(data_schema);
-    payload.slope_formula = Some(slope_formula.clone());
+    payload.slope_formula = Some(slope_formula);
     payload.z_column = Some(z_column.clone());
-    payload.slope_formulas = Some(vec![slope_formula]);
     payload.z_columns = Some(vec![z_column]);
     payload.latent_z_normalization = Some(latent_z_normalization);
     payload.latent_measure = Some(latent_measure);
@@ -795,7 +859,6 @@ pub fn assemble_bernoulli_marginal_slope_payload(
     payload.latent_z_conditional_calibration = latent_z_conditional_calibration;
     payload.marginal_baseline = Some(baseline_marginal);
     payload.baseline_slope = Some(baseline_slope);
-    payload.baseline_slopes = Some(vec![baseline_slope]);
     payload.link = Some(base_link);
     payload.resolved_termspec = Some(resolved_marginalspec);
     payload.resolved_slopespecs = Some(vec![resolved_slopespec.clone()]);
@@ -934,7 +997,7 @@ pub enum LocationScaleResponse {
     /// Tweedie) whose log-precision channel carries `noise_formula` (#913). The
     /// `likelihood` is the family's own [`LikelihoodSpec`]; `base_link` is the
     /// mean inverse link (log, or logit for Beta). The log-precision block
-    /// coefficients ride in [`LocationScaleInputs::beta_noise`].
+    /// coefficients are the fit's `BlockRole::Scale` block.
     Dispersion {
         likelihood: LikelihoodSpec,
         base_link: InverseLink,
@@ -962,7 +1025,6 @@ pub struct LocationScaleInputs {
     pub resolved_termspec: TermCollectionSpec,
     pub resolved_termspec_noise: TermCollectionSpec,
     pub fit_result: UnifiedFitResult,
-    pub beta_noise: Option<Vec<f64>>,
     pub wiggle: Option<LocationScaleWiggle>,
 }
 
@@ -1034,7 +1096,6 @@ pub fn assemble_location_scale_payload(
     payload.data_schema = Some(inputs.data_schema);
     payload.link = link;
     payload.formula_noise = Some(inputs.noise_formula);
-    payload.beta_noise = inputs.beta_noise;
     payload.gaussian_response_scale = gaussian_scales.map(|(response_scale, _)| response_scale);
     payload.gaussian_sigma_floor = gaussian_scales.map(|(_, sigma_floor)| sigma_floor);
     payload.resolved_termspec = Some(inputs.resolved_termspec);
@@ -1050,8 +1111,7 @@ pub fn assemble_location_scale_payload(
 
 /// Source-agnostic semantic content of a survival marginal-slope
 /// (Royston-Parmar net) saved model. Centralizing assembly also fixes the
-/// FFI's prior omission of the `*_slopes`/`*_columns`/`slope_formulas`
-/// vector mirrors the CLI wrote.
+/// FFI's prior omission of the `*_columns` vector mirrors the CLI wrote.
 pub struct SurvivalMarginalSlopeInputs<'a> {
     pub formula: String,
     pub data_schema: DataSchema,
@@ -1190,8 +1250,7 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.resolved_slopespecs = Some(vec![inputs.resolved_slopespec.clone()]);
     payload.resolved_slopespec = Some(inputs.resolved_slopespec);
     payload.slope_time_basis = inputs.slope_time_basis;
-    payload.slope_formula = Some(inputs.slope_formula.clone());
-    payload.slope_formulas = Some(vec![inputs.slope_formula]);
+    payload.slope_formula = Some(inputs.slope_formula);
     payload.z_column = Some(inputs.z_column.clone());
     payload.z_columns = Some(vec![inputs.z_column]);
     payload.latent_z_normalization = Some(inputs.latent_z_normalization);
@@ -1208,7 +1267,6 @@ pub fn assemble_survival_marginal_slope_payload(
     payload.latent_law_consumed = Some(inputs.latent_law_consumed);
     payload.latent_z_conditional_calibration = inputs.latent_z_conditional_calibration;
     payload.baseline_slope = Some(inputs.baseline_slope);
-    payload.baseline_slopes = Some(vec![inputs.baseline_slope]);
     if let Some(timewiggle) = inputs.timewiggle {
         payload.baseline_timewiggle_degree = Some(timewiggle.degree);
         payload.baseline_timewiggle_knots = Some(timewiggle.knots);
@@ -1589,25 +1647,31 @@ fn fit_expanded_formula_to_payload(
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
     // asymmetric reweighting, so it is selected *before* `materialize` (which has
-    // no expectile arm) — exactly as the in-process `fit_from_formula` does. We
-    // route it through the single shared dispatch seam so the Python API reaches
-    // the same estimator the library call does instead of failing with
-    // `unknown family 'expectile(τ)'`. The driver returns an ordinary
-    // `StandardFitResult`, so the persistence payload is built by the same
-    // `assemble_standard_payload` used for every other standard fit.
-    if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        let mut payload = match expectile_result {
-            ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
+    // no expectile arm). It runs through the same resolve → structural start →
+    // resolution-loop owner the library call uses, so a one-level fit reaches the
+    // same basis on every front end (#4062), and the inner materialization's notes
+    // are carried like any other fit's (#4027). One level returns an ordinary
+    // `StandardFitResult`, assembled by the shared `assemble_standard_payload`.
+    if expectile_levels_for_config(fit_config)?.is_some() {
+        let outcome = fit_formula_through_adaptive_resolution(&formula, dataset, fit_config)?;
+        let mut payload = match outcome.result {
+            FitResult::Standard(result) => assemble_standard_payload(StandardPayloadInputs {
                 formula,
                 dataset,
                 fit_config,
                 result,
             })?,
-            ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
+            FitResult::ExpectileLocationScale(joint) => {
+                payload_for_joint_expectile(formula, dataset, fit_config, joint)?
+            }
+            _ => {
+                return Err(WorkflowError::SchemaMismatch {
+                    reason: "an expectile request returned a non-expectile fit result".to_string(),
+                });
+            }
         };
-        // The LAWS driver materializes its inner Gaussian design itself; there are
-        // no outer materialize advisories to carry (matches `fit_from_formula`).
-        apply_request_metadata(&mut payload, fit_config, FitNotes::default());
+        apply_request_metadata(&mut payload, fit_config, outcome.inference_notes);
+        payload.unidentified_scalar_terms = outcome.unidentified_scalar_terms;
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:
@@ -2339,10 +2403,8 @@ fn payload_for_survival_marginal_slope(
         },
     )?;
     if let Some((law, z_columns, surface_specs)) = joint_state {
-        let k = law.score_dim;
         payload.z_columns = Some(z_columns);
         payload.resolved_slopespecs = Some(surface_specs);
-        payload.baseline_slopes = Some(vec![ms_result.baseline_slope; k]);
         payload.survival_marginal_slope_joint_latent_law = Some(law);
     }
     Ok(payload)
@@ -2484,9 +2546,6 @@ pub fn payload_for_gaussian_location_scale(
         .ok_or_else(|| "gaussian location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
     let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
@@ -2504,7 +2563,6 @@ pub fn payload_for_gaussian_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle,
         },
         LocationScaleResponse::Gaussian {
@@ -2592,9 +2650,6 @@ fn payload_for_binomial_location_scale(
         .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
     let wiggle = location_scale_wiggle_from_parts(
         ls_result.wiggle_knots,
         ls_result.wiggle_degree,
@@ -2612,7 +2667,6 @@ fn payload_for_binomial_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle,
         },
         LocationScaleResponse::Binomial { link: link_kind },
@@ -2631,8 +2685,8 @@ fn payload_for_binomial_location_scale(
 /// (`assemble_location_scale_payload` + `LocationScaleResponse::Dispersion`),
 /// deriving the persisted likelihood and mean base-link from the single
 /// source of truth on [`DispersionFamilyKind`]. The log-precision block
-/// coefficients ride in `beta_noise`; there is no link-wiggle and no response
-/// standardization for these families.
+/// coefficients are the fit's `BlockRole::Scale` block; there is no
+/// link-wiggle and no response standardization for these families.
 fn payload_for_dispersion_location_scale(
     formula: String,
     dataset: &EncodedDataset,
@@ -2657,9 +2711,6 @@ fn payload_for_dispersion_location_scale(
         .ok_or_else(|| "dispersion location-scale requires noise_formula".to_string())?;
 
     let fit = ls_result.fit.fit;
-    let scale_beta = fit
-        .block_by_role(BlockRole::Scale)
-        .map(|block| block.beta.to_vec());
 
     assemble_location_scale_payload(
         LocationScaleInputs {
@@ -2669,7 +2720,6 @@ fn payload_for_dispersion_location_scale(
             resolved_termspec: frozen_meanspec,
             resolved_termspec_noise: frozen_noisespec,
             fit_result: fit,
-            beta_noise: scale_beta,
             wiggle: None,
         },
         LocationScaleResponse::Dispersion {
@@ -3479,6 +3529,7 @@ mod latent_saved_baseline_tests {
 mod survival_payload_decline_tests {
     use super::*;
     use crate::survival::lognormal_kernel::FrailtySpec;
+    use gam_problem::BlockRole;
     use gam_problem::LinearInequalityConstraints;
     use gam_problem::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
     use gam_solve::constrained_posterior::{

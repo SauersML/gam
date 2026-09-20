@@ -6,7 +6,7 @@ use super::{
     SurvivalLikelihoodMode, build_survival_time_basis,
     compact_fit_result_for_batch,
     covariance_from_model, family_arg_canonical_name,
-    fit_required_columns, formula_columns, load_dataset_projected, parse_formula,
+    fit_required_columns, formula_columns, load_prediction_id_values, parse_formula,
     parse_surv_response, parse_survival_time_basis_config, predict_gam,
     prepend_id_column_to_prediction_csv,
     validate_cli_firth_configuration, validate_fit_args_preflight,
@@ -15,7 +15,7 @@ use super::{
 };
 use super::{
     Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs, log_level_for_verbosity,
-    run_fit, run_predict, run_sample, write_model_json,
+    run_fit, run_partial_effect, run_predict, run_sample, write_model_json,
 };
 use crate::config_resolve::{
     SurvivalInverseLinkInput, parse_survival_inverse_link as parse_config_survival_inverse_link,
@@ -61,6 +61,7 @@ use gam::families::wiggle::monotone_wiggle_basis_with_derivative_order;
 use gam::generative::sampleobservation_seeded_replicates;
 use gam::inference::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy, encode_recordswith_schema,
+    load_dataset_projected,
 };
 use gam::inference::formula_dsl::{
     ParsedTerm, effectivelinkwiggle_formulaspec, parse_link_choice, parse_linkwiggle_formulaspec,
@@ -3549,7 +3550,6 @@ fn intercept_only_gaussian_location_scale_model(
     );
     payload.fit_result = Some(fit_result);
     payload.formula_noise = Some("1".to_string());
-    payload.beta_noise = Some(vec![beta_log_sigma]);
     payload.gaussian_response_scale = Some(response_scale);
     payload.gaussian_sigma_floor = Some(INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR);
     payload.set_training_feature_metadata(vec![], vec![]);
@@ -3612,7 +3612,6 @@ fn intercept_only_binomial_location_scale_model(
     payload.fit_result = Some(fit_result);
     payload.link = Some(InverseLink::Standard(StandardLink::Probit));
     payload.formula_noise = Some("1".to_string());
-    payload.beta_noise = Some(vec![beta_ls]);
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.beta_link_wiggle = beta_link_wiggle;
@@ -3812,6 +3811,7 @@ fn compact_fit_result_for_batch_preserves_unified_geometry_invariant() {
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         }),
         fitted_link: FittedLinkState::Standard(Some(StandardLink::Logit)),
         geometry: Some(FitGeometry {
@@ -4884,14 +4884,9 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     // The semantic mirror fields the marginal-slope contract depends on must
     // match exactly between the two routes — this is what used to drift.
     assert_eq!(cli_payload.slope_formula, ffi_payload.slope_formula);
-    assert_eq!(cli_payload.slope_formulas, ffi_payload.slope_formulas);
     assert_eq!(cli_payload.z_column, ffi_payload.z_column);
     assert_eq!(cli_payload.z_columns, ffi_payload.z_columns);
     assert_eq!(cli_payload.baseline_slope, ffi_payload.baseline_slope);
-    assert_eq!(
-        cli_payload.baseline_slopes,
-        ffi_payload.baseline_slopes
-    );
     assert_eq!(cli_payload.marginal_baseline, ffi_payload.marginal_baseline);
     // `TermCollectionSpec` is not `PartialEq`; the resolved-termspec
     // singular/vector mirrors are covered by the full serialized snapshot
@@ -4902,19 +4897,11 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     );
     assert_eq!(cli_payload.latent_measure, ffi_payload.latent_measure);
 
-    // The vector mirror fields must be the singletons of their scalar peers
+    // The vector mirror field must be the singleton of its scalar peer
     // — the core assembler is the single place that guarantees this.
-    assert_eq!(
-        cli_payload.slope_formulas.as_deref(),
-        Some([cli_payload.slope_formula.clone().unwrap()].as_slice())
-    );
     assert_eq!(
         cli_payload.z_columns.as_deref(),
         Some([cli_payload.z_column.clone().unwrap()].as_slice())
-    );
-    assert_eq!(
-        cli_payload.baseline_slopes.as_deref(),
-        Some([cli_payload.baseline_slope.unwrap()].as_slice())
     );
 
     // Full snapshot parity: serialize both, normalize away the
@@ -5675,6 +5662,30 @@ fn prediction_csv_can_prepend_id_column() {
     assert_eq!(lines.next(), Some("person_id,eta,mean"));
     assert_eq!(lines.next(), Some("p1,0.500000000000,0.620000000000"));
     assert_eq!(lines.next(), Some("p2,-0.250000000000,0.440000000000"));
+
+    remove_temp_file(&path);
+}
+
+#[test]
+fn prediction_id_column_echoes_the_written_ids() {
+    // Every cell here parses as a number, so the numeric loader typed the
+    // column Continuous and printed `00123` as `123`, the int64 key 2^53+1 as
+    // 2^53, and refused `NA`. The IDs must come back exactly as written.
+    let mut path = std::env::temp_dir();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
+        .as_nanos();
+    path.push(format!("gam_prediction_id_verbatim_{ts}.csv"));
+    fs::write(&path, "id,x\n00123,0.5\n9007199254740993,1.5\nNA,2.0\n1.10,2.5\n")
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write id csv", e));
+
+    let ids = load_prediction_id_values(&path, "id", 4)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load id column", e));
+    assert_eq!(ids, vec!["00123", "9007199254740993", "NA", "1.10"]);
+    let err = load_prediction_id_values(&path, "id", 3)
+        .expect_err("an id column whose length differs from the predictions is refused");
+    assert!(err.contains("row count 4"), "unexpected error: {err}");
 
     remove_temp_file(&path);
 }
@@ -8336,7 +8347,7 @@ fn binomial_location_scale_wiggle_uses_unified_generate_path() {
         Some(vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0]),
         Some(3),
     );
-    assert!(model.predictor().is_some());
+    assert!(model.predictor().is_ok());
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
     let col_map = HashMap::new();
@@ -8541,5 +8552,127 @@ fn survival_location_scale_sas_link_shape_is_selected_by_the_outer_2904() {
         "the certified outer left the SAS shape at its seed (epsilon={}, log_delta={})",
         fitted.epsilon,
         fitted.log_delta
+    );
+}
+
+/// pyGAM audit G2 / DOC-5: `gam partial-effect` writes the partial effect that
+/// `Model.partial_dependence` returns, from the same Rust function: a smooth's
+/// curve with pointwise intervals inside a wider simultaneous band, and a factor
+/// term's per-level effects on a labelled `--grid` given in any level order.
+#[test]
+fn cli_partial_effect_writes_bands_and_labelled_factor_levels() {
+    fn run(argv: &[&str]) -> Result<(), String> {
+        match Cli::try_parse_from(argv).map_err(|e| e.to_string())?.command {
+            Command::Fit(args) => run_fit(args).map_err(|error| error.to_string()),
+            Command::PartialEffect(args) => run_partial_effect(args),
+            _ => panic!("expected a fit or partial-effect command"),
+        }
+    }
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("partial_effect.csv");
+    let model_path = td.path().join("partial_effect.model.json");
+    let mut csv = String::from("y,x,g\n");
+    let mut state = 0x6232_0000_0000_0001_u64;
+    let levels = [("a", 0.0), ("b", 1.0), ("c", -0.5)];
+    for row in 0..240 {
+        let x = (row as f64 + 0.5) / 240.0;
+        let (label, shift) = levels[row % 3];
+        let noise = (gam::utils::splitmix64(&mut state) >> 11) as f64 / (1u64 << 53) as f64 - 0.5;
+        let y = (std::f64::consts::TAU * x).sin() + shift + 0.4 * noise;
+        csv.push_str(&format!("{y},{x},{label}\n"));
+    }
+    fs::write(&train_path, csv).unwrap_or_else(|e| panic!("{} failed: {:?}", "write csv", e));
+    let train = train_path.to_str().expect("utf-8 path");
+    let model = model_path.to_str().expect("utf-8 path");
+    run(&["gam", "fit", train, "y ~ s(x) + g", "--out", model])
+        .unwrap_or_else(|e| panic!("fit failed: {e}"));
+
+    let curve_path = td.path().join("s_x.json");
+    run(&[
+        "gam", "partial-effect", model, "--term", "s(x)", "--n-points", "40", "--out",
+        curve_path.to_str().expect("utf-8 path"),
+    ])
+    .unwrap_or_else(|e| panic!("partial-effect s(x) failed: {e}"));
+    let curve: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(&curve_path).unwrap_or_else(|e| panic!("read json: {e}")),
+    )
+    .unwrap_or_else(|e| panic!("parse json: {e}"));
+    assert_eq!(curve["term"], "s(x)");
+    assert_eq!(curve["axes"], serde_json::json!(["x"]));
+    assert_eq!(curve["scale"], "linear_predictor");
+    assert_eq!(curve["simulations"], 7600);
+    let series = |name: &str| -> Vec<f64> {
+        curve[name]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} must be an array"))
+            .iter()
+            .map(|v| v.as_f64().expect("number"))
+            .collect()
+    };
+    let (fit, lower, upper) = (series("fit"), series("lower"), series("upper"));
+    let (sim_lower, sim_upper) = (series("simultaneous_lower"), series("simultaneous_upper"));
+    assert_eq!(fit.len(), 40);
+    for i in 0..40 {
+        assert!(sim_lower[i] < lower[i] && lower[i] < fit[i], "row {i}");
+        assert!(fit[i] < upper[i] && upper[i] < sim_upper[i], "row {i}");
+    }
+    let pointwise = curve["pointwise_critical"].as_f64().expect("number");
+    let simultaneous = curve["simultaneous_critical"].as_f64().expect("number");
+    assert!(simultaneous > pointwise, "{simultaneous} <= {pointwise}");
+
+    let grid_path = td.path().join("levels.csv");
+    fs::write(&grid_path, "g\nc\na\nb\n").unwrap_or_else(|e| panic!("write grid: {e}"));
+    let grid = grid_path.to_str().expect("utf-8 path");
+    let levels_path = td.path().join("g.csv");
+    run(&[
+        "gam", "partial-effect", model, "--term", "g", "--grid", grid, "--out",
+        levels_path.to_str().expect("utf-8 path"),
+    ])
+    .unwrap_or_else(|e| panic!("partial-effect g failed: {e}"));
+    let table = fs::read_to_string(&levels_path).unwrap_or_else(|e| panic!("read csv: {e}"));
+    let mut lines = table.lines();
+    assert_eq!(
+        lines.next(),
+        Some("g,fit,se,lower,upper,simultaneous_lower,simultaneous_upper")
+    );
+    let rows: Vec<Vec<&str>> = lines.map(|line| line.split(',').collect()).collect();
+    assert_eq!(
+        rows.iter().map(|row| row[0]).collect::<Vec<_>>(),
+        ["c", "a", "b"],
+        "rows follow the caller's grid order"
+    );
+    let effect = |row: &[&str]| row[1].parse::<f64>().expect("number");
+    let (c, a, b) = (effect(&rows[0]), effect(&rows[1]), effect(&rows[2]));
+    assert!(((b - a) - 1.0).abs() < 0.2, "b - a = {}", b - a);
+    assert!(((c - a) + 0.5).abs() < 0.2, "c - a = {}", c - a);
+
+    fs::write(&grid_path, "g\nd\n").unwrap_or_else(|e| panic!("write grid: {e}"));
+    let unknown = run(&[
+        "gam", "partial-effect", model, "--term", "g", "--grid", grid,
+    ])
+    .expect_err("an unknown level must be refused");
+    assert!(unknown.contains('d'), "{unknown}");
+    let wrong_axis = td.path().join("wrong_axis.csv");
+    fs::write(&wrong_axis, "x\n0.5\n").unwrap_or_else(|e| panic!("write grid: {e}"));
+    run(&[
+        "gam", "partial-effect", model, "--term", "g", "--grid",
+        wrong_axis.to_str().expect("utf-8 path"),
+    ])
+    .expect_err("a grid must name exactly the term's axes");
+    let bad_out = td.path().join("s_x.txt");
+    let error = run(&[
+        "gam", "partial-effect", model, "--term", "s(x)", "--out",
+        bad_out.to_str().expect("utf-8 path"),
+    ])
+    .expect_err("an --out that is neither .csv nor .json must be refused");
+    assert!(error.contains(".csv or .json"), "{error}");
+    run(&["gam", "partial-effect", model, "--term", "s(nope)"])
+        .expect_err("an unknown term must be refused");
+    assert!(
+        Cli::try_parse_from([
+            "gam", "partial-effect", model, "--term", "s(x)", "--n-points", "5", "--grid", grid,
+        ])
+        .is_err(),
+        "--grid conflicts with --n-points"
     );
 }

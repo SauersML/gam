@@ -74,7 +74,7 @@
 
 use std::collections::VecDeque;
 
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 
 /// Default ring-buffer capacity for [`AsymptoteWindow`]. Enough recent iterates
 /// for a stable constant-`ĉ` drift test while staying local to the current tail.
@@ -283,7 +283,7 @@ fn mean_and_rel_spread(values: &[f64]) -> Option<(f64, f64)> {
     if values.is_empty() {
         return None;
     }
-    let mut sum = KahanSum::default();
+    let mut sum = CompensatedSum::default();
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for &v in values {
@@ -294,7 +294,7 @@ fn mean_and_rel_spread(values: &[f64]) -> Option<(f64, f64)> {
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    let mean = sum.sum() / values.len() as f64;
+    let mean = sum.value() / values.len() as f64;
     if !(mean.abs() > 0.0) {
         return None;
     }
@@ -346,7 +346,7 @@ pub(crate) fn assess_coordinate(
         None => {
             return AsymptoteVerdict::NoAsymptote {
                 reason: "empty window".to_string(),
-            }
+            };
         }
     };
     let side = match AsymptoteSide::from_gradient(latest.grad, tol.interior_grad_tol) {
@@ -358,7 +358,7 @@ pub(crate) fn assess_coordinate(
                     latest.grad.abs(),
                     tol.interior_grad_tol
                 ),
-            }
+            };
         }
     };
 
@@ -380,8 +380,9 @@ pub(crate) fn assess_coordinate(
         .collect();
     if constants.iter().any(|&c| !(c > 0.0)) {
         return AsymptoteVerdict::NoAsymptote {
-            reason: "pencil constant ĉ not uniformly positive across the window (not a single tail)"
-                .to_string(),
+            reason:
+                "pencil constant ĉ not uniformly positive across the window (not a single tail)"
+                    .to_string(),
         };
     }
     let (mean_c, spread) = match mean_and_rel_spread(&constants) {
@@ -389,7 +390,7 @@ pub(crate) fn assess_coordinate(
         None => {
             return AsymptoteVerdict::NoAsymptote {
                 reason: "pencil constant ĉ has no usable mean".to_string(),
-            }
+            };
         }
     };
     if mean_c <= tol.tail_noise_floor {
@@ -419,7 +420,7 @@ pub(crate) fn assess_coordinate(
             return AsymptoteVerdict::NoAsymptote {
                 reason: "coefficient moves not geometrically contracting (estimand not settling)"
                     .to_string(),
-            }
+            };
         }
     };
     let last_step = samples
@@ -541,7 +542,9 @@ mod asymptote_certificate_tests {
                 assert_eq!(side, AsymptoteSide::Lower);
                 assert!(estimand_travel_bound > expected_travel * 0.5);
             }
-            other => panic!("expected OnTailNotYetEquivalent under a tight estimand tol, got {other:?}"),
+            other => {
+                panic!("expected OnTailNotYetEquivalent under a tight estimand tol, got {other:?}")
+            }
         }
     }
 
@@ -644,7 +647,9 @@ mod asymptote_certificate_tests {
         ];
         let mut tail = AsymptoteWindow::with_capacity(confirmed.len());
         // ‖b−b_inf‖ from exp4 at these rows, used as the per-step estimand move.
-        let coef = [6.196e-05, 8.398e-06, 1.137e-06, 1.539e-07, 2.082e-08, 2.818e-09];
+        let coef = [
+            6.196e-05, 8.398e-06, 1.137e-06, 1.539e-07, 2.082e-08, 2.818e-09,
+        ];
         for (i, (rho, grad)) in confirmed.iter().enumerate() {
             tail.push(AsymptoteSample {
                 rho: *rho,
@@ -664,7 +669,11 @@ mod asymptote_certificate_tests {
             );
         }
         match assess_coordinate(&tail, &tol(1.0)) {
-            AsymptoteVerdict::CertifiedAtAsymptote { side, tail_constant, .. } => {
+            AsymptoteVerdict::CertifiedAtAsymptote {
+                side,
+                tail_constant,
+                ..
+            } => {
                 assert_eq!(side, AsymptoteSide::Upper);
                 assert!((tail_constant - 6723.0).abs() / 6723.0 < 5.0e-3);
             }

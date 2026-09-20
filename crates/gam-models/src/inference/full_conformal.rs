@@ -103,9 +103,11 @@
 //! `c`-array bounds ‖D_βH\[v\]‖ along the step, giving a computable Newton
 //! attraction radius) — the corrector cannot silently skip a basin. Score
 //! crossings between steps are localized by bisection on the corrected
-//! path. Discrete families (Binomial, Poisson) are FINITE: full conformal is
-//! exact by enumerating the response support — no homotopy subtlety at all —
-//! and this module carries no enumeration arm.
+//! path. Discrete families (Binomial, Poisson, negative binomial) are
+//! FINITE or have a provable tail: full conformal is exact by enumerating the
+//! response support. That arm, together with the certified Gamma walk, lives
+//! in [`super::full_conformal_glm`]; the predict route uses it for every
+//! non-Gaussian fit.
 //!
 //! # Layer 3: the honest map (see [`honest`])
 //!
@@ -128,9 +130,11 @@
 //! # Wiring
 //!
 //! No flags. The predict path requests full conformal exactly like split
-//! conformal (`conformal_level`); Gaussian-identity fits get Layer 3 with its
-//! certificate per row, GLMs the Layer-2 homotopy. Unit-weight violation and
-//! unsupported regimes fall back to the split/ALO calibrator LOUDLY (logged),
+//! conformal (`conformal_level`), and the dispatcher picks: Gaussian-identity
+//! fits get Layer 3 with its certificate per row; Binomial, Poisson, negative
+//! binomial and Gamma log/logit fits get the enumeration / certified-walk arm
+//! of [`super::full_conformal_glm`] at the frozen penalty. Prior weights and
+//! unsupported regimes are refused with a typed error naming split conformal,
 //! never silently — an invalid guarantee is worse than a wider valid one.
 
 use faer::Side;
@@ -156,6 +160,26 @@ mod test_support;
 pub struct ConformalInterval {
     pub lo: f64,
     pub hi: f64,
+}
+
+/// The rank threshold `τ = α(n + 1)` a conformal p-value is compared with
+/// (member iff `(1 + #dominating) > τ`).
+///
+/// `α` arrives as `1 − level` from a decimal level, and neither the level nor
+/// the subtraction is exact in binary: at the nominal `level = 0.9` the product
+/// is `5.999…` rather than `6`, which would let one more rank in and over-cover
+/// by exactly `1/(n + 1)`. The two roundings put `α` within `ε` of the decimal
+/// it stands for, and the product adds `ε·τ/2`; a `τ` that close to an integer
+/// is that integer.
+pub fn conformal_rank_threshold(alpha: f64, n_augmented: usize) -> f64 {
+    let n1 = n_augmented as f64;
+    let tau = alpha * n1;
+    let nearest = tau.round();
+    if (tau - nearest).abs() <= f64::EPSILON * (n1 + tau) {
+        nearest
+    } else {
+        tau
+    }
 }
 
 /// A full-conformal prediction set: a finite union of closed intervals.
@@ -200,7 +224,7 @@ fn validate_inputs(
 /// The smallest dominating count `k` with `1 + k > α(n + 1)` — membership's
 /// threshold — or `n + 1` when no count of `n` training rows reaches it.
 fn required_dominating_count(n: usize, alpha: f64) -> usize {
-    let threshold = alpha * (n + 1) as f64;
+    let threshold = conformal_rank_threshold(alpha, n + 1);
     (0..=n)
         .find(|&count| 1.0 + count as f64 > threshold)
         .unwrap_or(n + 1)
@@ -289,8 +313,7 @@ impl ExactGaussianFullConformal {
 
     /// Membership at candidate z: conformal p-value `(1 + count)/(n+1) > α`.
     fn member(&self, z: f64, alpha: f64) -> bool {
-        let n1 = (self.n + 1) as f64;
-        (1.0 + self.dominating_count(z) as f64) > alpha * n1
+        (1.0 + self.dominating_count(z) as f64) > conformal_rank_threshold(alpha, self.n + 1)
     }
 
     /// The frozen plug-in mean `x_*ᵀ(XᵀX + Sλ)⁻¹Xᵀy`: the candidate at which
@@ -466,16 +489,16 @@ const GLM_HOMOTOPY_MAX_HALVINGS: usize = 24;
 const GLM_CORRECTOR_MAX_ITERS: usize = 80;
 
 /// Maximum damped-Newton iterations for a cold augmented GLM fit.
-const GLM_NEWTON_MAX_ITERS: usize = 200;
+pub(crate) const GLM_NEWTON_MAX_ITERS: usize = 200;
 
 /// Maximum Armijo backtracking halvings per cold Newton iteration.
-const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+pub(crate) const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
 
 /// Strict scale-invariant KKT tolerance declaring convergence, applied to the
 /// RAW penalized gradient via [`GlmHomotopyFullConformal::kkt_converged`]
 /// (dimension-scaled OR natural-scale relative — the same certificate the main
 /// P-IRLS solver uses). NOT a tolerance on the preconditioned Newton step.
-const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+pub(crate) const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
 
 /// Near-stationary acceptance tolerance: a stalled iterate sitting at the
 /// floating-point floor of the raw gradient is still accepted when it
@@ -494,18 +517,18 @@ const GLM_CONTRACTION_ACCEPT: f64 = 0.5;
 /// Armijo sufficient-decrease constant for the cold-fit line search —
 /// sourced from the shared optimizer constants so the workspace has exactly
 /// one `c₁`.
-const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
+pub(crate) const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
 
 /// `η` location of the extrema of the logistic third derivative
 /// `b‴(η) = σ(1−σ)(1−2σ)`: `σ = (3±√3)/6 ⇔ η = ±ln(2+√3)`.
 const LOGIT_THIRD_DERIV_CRITICAL_ETA: f64 = 1.316_957_896_924_816_6;
 
 #[inline]
-fn vec_norm(v: &Array1<f64>) -> f64 {
+pub(crate) fn vec_norm(v: &Array1<f64>) -> f64 {
     v.dot(v).sqrt()
 }
 
-use gam_linalg::utils::stable_softplus as softplus;
+use gam_math::special::softplus;
 
 /// Canonical-link GLM families supported by the certified z-homotopy
 /// ([`GlmHomotopyFullConformal`]). Canonical links make the candidate
@@ -863,29 +886,29 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         g
     }
 
-    /// Natural magnitude of the augmented penalized gradient, mirroring the
-    /// main P-IRLS convergence certificate's `gradient_natural_scale`
-    /// (`src/solver/pirls/state.rs`): `‖Xᵀ(μ − y)‖₂ + ‖Sβ‖₂` plus the test
-    /// row's score contribution `‖x_*‖·|μ̂_* − z|`. The penalized score is a
-    /// difference of these O(√(n+1)) sums, so at the optimum the raw gradient
-    /// floor scales with this quantity, NOT with `(1 + ‖β‖)`. Dividing by
-    /// `1 + this` yields a stationarity residual that is invariant under
-    /// uniform rescaling of the objective and per-observation in meaning.
+    /// Natural magnitude of the augmented penalized gradient
+    /// `Xᵀμ − Xᵀy + Sβ + x_*(μ_* − z)`: the norms of the terms it is a
+    /// difference of, `‖Xᵀμ‖₂ + ‖Xᵀy‖₂ + ‖Sβ‖₂ + ‖x_*‖·(|μ̂_*| + |z|)`. At
+    /// the optimum those terms keep the data's magnitude while the gradient
+    /// cancels to rounding, so its floor scales with this quantity. The
+    /// cancelled score `‖Xᵀ(μ − y)‖₂` is not a scale: at an interior optimum
+    /// of an unpenalised coefficient it is itself rounding-level (gam#3451,
+    /// the P-IRLS form is gam#3339). The resulting stationarity residual is
+    /// invariant under uniform rescaling of the objective.
     fn gradient_natural_scale(&self, beta: &Array1<f64>, z: f64) -> f64 {
         let eta = fast_av(self.x, beta);
-        let mut resid = Array1::<f64>::zeros(self.n);
-        for i in 0..self.n {
-            resid[i] = self.family.mean(eta[i]) - self.y[i];
-        }
-        let score = self.x.t().dot(&resid);
-        let r_star = self.family.mean(self.x_star.dot(beta)) - z;
-        vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
+        let mu = eta.mapv(|eta_i| self.family.mean(eta_i));
+        let mu_star = self.family.mean(self.x_star.dot(beta));
+        vec_norm(&self.x.t().dot(&mu))
+            + vec_norm(&self.x.t().dot(self.y))
+            + vec_norm(&self.s_lambda.dot(beta))
+            + self.star_norm * (mu_star.abs() + z.abs())
     }
 
     /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
     /// the `WorkingState::certifies_kkt` certificate the engine's main solver
-    /// uses: the dimensionless residual `‖g‖ / (‖score‖ + ‖S·β‖)` is below
-    /// `tol`. The earlier predicate compared the PRECONDITIONED Newton step
+    /// uses: the dimensionless residual `‖g‖ / gradient_natural_scale` is
+    /// below `tol`. The earlier predicate compared the PRECONDITIONED Newton step
     /// `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose floating-point floor is
     /// `~ε·(n+1)/λ_min(H)` — n-dependent and not compensated by `(1 + ‖β‖)`,
     /// so genuinely-converged fits (e.g. raw gradient floor `3.6e-8` at
@@ -1241,9 +1264,10 @@ impl<'a> GlmHomotopyFullConformal<'a> {
             }
         }
         let n1 = (self.n + 1) as f64;
-        let member = (1.0 + count as f64) > alpha * n1;
-        let member_lo = (1.0 + count_certain as f64) > alpha * n1;
-        let member_hi = (1.0 + count_possible as f64) > alpha * n1;
+        let tau = conformal_rank_threshold(alpha, self.n + 1);
+        let member = (1.0 + count as f64) > tau;
+        let member_lo = (1.0 + count_certain as f64) > tau;
+        let member_hi = (1.0 + count_possible as f64) > tau;
         GlmCandidateVerdict {
             p_value: (1.0 + count as f64) / n1,
             member,
@@ -1392,9 +1416,33 @@ impl ExactFullConformalPenalty {
         })
     }
 
+    /// Wrap an already-recovered frozen penalty. The GLM arm recovers it from
+    /// the observed-information Gram with
+    /// [`super::full_conformal_glm::penalty_from_normal_and_gram`].
+    pub fn from_s_lambda(s_lambda: Array2<f64>, penalty_count: usize) -> Result<Self, String> {
+        if s_lambda.nrows() != s_lambda.ncols() {
+            return Err("exact full conformal penalty: Sλ is not square".to_string());
+        }
+        Ok(Self {
+            s_lambda,
+            penalty_count: Some(penalty_count),
+        })
+    }
+
+    /// The frozen penalty `Sλ` (p × p).
+    pub fn s_lambda(&self) -> &Array2<f64> {
+        &self.s_lambda
+    }
+
     /// Coefficient dimension `p`.
     pub fn p(&self) -> usize {
         self.s_lambda.nrows()
+    }
+
+    /// Number of smoothing parameters the fit selected; `None` for a payload
+    /// written before the count was persisted.
+    pub fn penalty_count(&self) -> Option<usize> {
+        self.penalty_count
     }
 
     /// Join the frozen penalty to labeled rows `(X, y)` for the per-test-row
@@ -2360,5 +2408,81 @@ mod tests {
             ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
         );
         assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
+    }
+
+    /// gam#3451: an unpenalised Poisson fit whose test row sits at its own fitted
+    /// mean, `z = μ̂_*`, is the augmented optimum with the training optimum's β̂:
+    /// the test row's residual is zero and the training score cancels to rounding.
+    /// A stationarity scale built from that score and residual is itself rounding,
+    /// so the certificate refused the exact solution. The scale is the operands'
+    /// norms; `‖Xᵀy‖` alone is at least `Σy` through the intercept column.
+    #[test]
+    fn unpenalised_optimum_at_its_own_fitted_test_mean_certifies_3451() {
+        use std::f64::consts::PI;
+        let n = 16usize;
+        let p = 2usize;
+        let mut x = Array2::<f64>::zeros((n, p));
+        let mut y = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let t = i as f64 / (n as f64 - 1.0);
+            x[[i, 0]] = 1.0;
+            x[[i, 1]] = (PI * t).cos();
+            y[i] = (1.0 + (2.0 * PI * t).sin()).exp().round();
+        }
+        let s = Array2::<f64>::zeros((p, p));
+        let weights = Array1::<f64>::ones(n);
+        let no_test_row = Array1::<f64>::zeros(p);
+        let training = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &no_test_row,
+        )
+        .expect("training engine");
+        // Newton on the convex training likelihood; a zero test row adds nothing.
+        let mut beta = Array1::<f64>::zeros(p);
+        for _ in 0..50 {
+            let g = training.penalized_score(&beta, 0.0);
+            let step = training
+                .penalized_hessian(&beta)
+                .cholesky(Side::Lower)
+                .expect("training Hessian SPD")
+                .solvevec(&g);
+            beta -= &step;
+        }
+
+        let x_star = cosine_row(p, 0.37);
+        let eng = GlmHomotopyFullConformal::new(
+            CanonicalGlmFamily::PoissonLog,
+            &x,
+            &y,
+            &weights,
+            &s,
+            &x_star,
+        )
+        .expect("augmented engine");
+        let z = CanonicalGlmFamily::PoissonLog.mean(x_star.dot(&beta));
+        let y_total: f64 = y.sum();
+        let scale = eng.gradient_natural_scale(&beta, z);
+        assert!(
+            scale >= y_total,
+            "the stationarity scale {scale:.3e} fell below Σy = {y_total}: it is built from \
+             the cancelled score, not from its operands"
+        );
+        assert!(
+            eng.kkt_converged(&beta, z, GLM_CONVERGENCE_RTOL),
+            "the exact augmented optimum must certify: |g|={:.3e}, scale={scale:.3e}",
+            vec_norm(&eng.penalized_score(&beta, z))
+        );
+        let (refit, _) = eng
+            .cold_fit(z, Array1::<f64>::zeros(p))
+            .expect("the cold refit at z = μ̂_* must certify");
+        let gap = vec_norm(&(&refit - &beta));
+        assert!(
+            gap <= 1e-9 * (1.0 + vec_norm(&beta)),
+            "the cold refit at z = μ̂_* must return the training optimum (gap {gap:.3e})"
+        );
     }
 }

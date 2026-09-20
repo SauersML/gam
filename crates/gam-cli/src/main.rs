@@ -20,7 +20,6 @@ pub(crate) use gam::sample::NutsConfig;
 
 pub(crate) use gam::data::{
     EncodedDataset as Dataset, UnseenCategoryPolicy,
-    load_dataset_projected as load_dataset_auto_projected,
     load_dataset_projected_with_categorical_roles as load_dataset_auto_projected_with_categorical_roles,
     load_datasetwith_schema_projected as load_dataset_auto_with_schema_projected,
 };
@@ -35,7 +34,6 @@ pub(crate) use gam::inference::model::{
     FittedFamily, FittedModel as SavedModel, FittedModelPayload, PredictModelClass,
     load_survival_time_basis_config_from_model,
 };
-pub(crate) use gam_data::ColumnKindTag;
 
 pub(crate) use gam::inference::model_payload_builders::{
     StandardPayloadInputs,
@@ -163,6 +161,8 @@ mod run_parameter_decomposition;
 mod run_compare;
 #[path = "main/run_diagnose.rs"]
 mod run_diagnose;
+#[path = "main/run_partial_effect.rs"]
+mod run_partial_effect;
 #[path = "main/run_summary.rs"]
 mod run_summary;
 #[path = "main/run_fit.rs"]
@@ -190,6 +190,7 @@ pub(crate) use run_crosscoder::*;
 pub(crate) use run_parameter_decomposition::*;
 pub(crate) use run_compare::*;
 pub(crate) use run_diagnose::*;
+pub(crate) use run_partial_effect::*;
 pub(crate) use run_summary::*;
 pub(crate) use run_fit::*;
 pub(crate) use run_joint_events::*;
@@ -302,6 +303,7 @@ fn run() -> CliResult<()> {
         }
         Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
+        Command::PartialEffect(args) => run_partial_effect(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
