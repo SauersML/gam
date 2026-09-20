@@ -744,6 +744,10 @@ pub(crate) struct MovingLawCandidates {
     /// Per row, `(m_f(a_i), √v_f(a_i))` under its own fold's calibration. Empty
     /// without a calibration.
     fold_location: Vec<(f64, f64)>,
+    /// `(m, s)` of the score's standard units, the axis `(z − m)/s` a fit on an
+    /// uncalibrated estimated law solves in (gam#3231); `(0, 1)` until the
+    /// caller sets them.
+    standard_units: (f64, f64),
     z: Array1<f64>,
     folds: MovingLawFolds,
     /// Per row, its position among its fold's scored rows.
@@ -942,6 +946,7 @@ impl MovingLawCandidates {
             calibration,
             location,
             fold_location,
+            standard_units: (0.0, 1.0),
             z: z.clone(),
             folds,
             position,
@@ -1008,14 +1013,29 @@ impl MovingLawCandidates {
         }
     }
 
+    /// Solve the uncalibrated estimated arms in the score's standard units
+    /// `(z − m)/s` (gam#3231), the axis the fit on such an arm anchors on.
+    pub(crate) fn set_standard_units(&mut self, mean: f64, sd: f64) {
+        self.standard_units = (mean, sd);
+    }
+
+    /// The score axis `(m, s)` a fit on `arm` solves in, with the fitted score
+    /// `(z − m)/s`: the score as given for the Gaussian arm, its standard units
+    /// for the uncalibrated estimated arms, and `None` for the location-scale
+    /// arms, which read the row-varying `ζ` axis.
+    pub(crate) fn score_axis(&self, arm: MovingLawArm) -> Option<(f64, f64)> {
+        match arm {
+            MovingLawArm::Gaussian => Some((0.0, 1.0)),
+            MovingLawArm::PooledEmpirical | MovingLawArm::Local => Some(self.standard_units),
+            MovingLawArm::LocationScaleGaussian | MovingLawArm::LocationScaleEmpirical => None,
+        }
+    }
+
     /// The fitted arm's axis at a row: `(m, √v)` with the fitted score
     /// `(z − m)/√v`.
     fn fitted_location(&self, row: usize) -> (f64, f64) {
-        if self.calibration.is_some() {
-            self.location[row]
-        } else {
-            (0.0, 1.0)
-        }
+        self.score_axis(self.fitted_arm())
+            .unwrap_or_else(|| self.location[row])
     }
 
     /// The scored row whose times a survival anchor of `row` is read at

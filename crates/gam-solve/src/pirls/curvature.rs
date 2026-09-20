@@ -506,7 +506,7 @@ pub(crate) fn compute_observed_hessian_curvature_arrays_into(
         // eta.  A non-representable tail is refused below rather than
         // projected onto a different Hessian surface.
         let (w_obs, c_obs, d_obs) = if matches!(weight_family, WeightFamily::Binomial) {
-            let [w, c, d, _] = bernoulli_observed_information_jet(
+            let [w, c, d, _, _] = bernoulli_observed_information_jet(
                 inverse_link,
                 eta_used,
                 y[i],
@@ -928,8 +928,8 @@ pub(crate) fn bernoulli_pair_residual(family: WeightFamily, y: f64, mu: f64, one
     y - mu
 }
 
-/// Observed information of one Bernoulli row and its first three η-derivatives,
-/// `[W_obs, dW/dη, d²W/dη², d³W/dη³]`, for the row log-likelihood
+/// Observed information of one Bernoulli row and its first four η-derivatives,
+/// `[W_obs, dW/dη, d²W/dη², d³W/dη³, d⁴W/dη⁴]`, for the row log-likelihood
 /// `(pw/φ)·[y·log μ + (1−y)·log(1−μ)]` (#3317).
 ///
 /// Each term is the response coefficient times a derivative of that side's own
@@ -944,14 +944,14 @@ pub(crate) fn bernoulli_observed_information_jet(
     y: f64,
     phi: f64,
     prior_weight: f64,
-) -> Result<[f64; 4], EstimationError> {
-    let jet = crate::mixture_link::bernoulli_log_jet5_for_inverse_link(inverse_link, eta)?;
-    let mut information = [0.0_f64; 4];
+) -> Result<[f64; 5], EstimationError> {
+    let jet = crate::mixture_link::bernoulli_log_jet6_for_inverse_link(inverse_link, eta)?;
+    let mut information = [0.0_f64; 5];
     for (coefficient, side) in [(y, jet.log_mu), (1.0 - y, jet.log_complement)] {
         if coefficient == 0.0 {
             continue;
         }
-        for k in 0..4 {
+        for k in 0..5 {
             information[k] -= coefficient * side[k + 1];
         }
     }
