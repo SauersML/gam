@@ -196,13 +196,17 @@ pub fn build_sae_minimal_seed(
         }
         None => seed_coords,
     };
-    if coords_are_cold
-        && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+    // The competitive routing maps (softmax, ordered Beta--Bernoulli, hard TopK) share one cold
+    // seeding policy: separate the atoms' charts by the data's energy clusters, then route each row
+    // by the atoms' own residuals (#4531). The smooth threshold gate opens every atom
+    // independently and keeps its threshold-centred seed.
+    let competitive_routing = matches!(
+        request.assignment_kind,
+        SaeFitAssignmentKind::Softmax
+            | SaeFitAssignmentKind::OrderedBetaBernoulli
+            | SaeFitAssignmentKind::TopK
+    );
+    if coords_are_cold && k_atoms > 1 && competitive_routing {
         let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
         let plan_kinds: Vec<SaeAtomBasisKind> =
             plans.iter().map(|plan| plan.kind().clone()).collect();
@@ -255,13 +259,12 @@ pub fn build_sae_minimal_seed(
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
-    if logits_are_cold
-        && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+    // #4531 — hard TopK reads only the ORDER of a row's logits (`topk_row`, ties toward the lower
+    // atom index), and the residual seed's per-row centring and positive gain preserve that order,
+    // so the cold support is the `top_k` atoms that best explain the row. Neutral logits instead
+    // tie every row and hand all of them to atoms `0..top_k`: every later atom's LSQ decoder is
+    // then fitted on no rows, is identically zero, and the entry refuses it (#2822).
+    if logits_are_cold && k_atoms > 1 && competitive_routing {
         const RESIDUAL_SEED_GAIN: f64 = 4.0;
         initial_logits = sae_residual_seed_logits(
             basis_values.view(),
@@ -371,6 +374,69 @@ mod tests {
             assert_eq!(
                 report.initial_logits, residual,
                 "random_state={random_state}: the cold logits must be the residual seed itself"
+            );
+        }
+    }
+
+    /// #4531 — a cold hard-TopK seed routes each row by the atoms' own residuals, as the other
+    /// competitive maps do. With neutral logits every row tied, `topk_row` handed all of them to
+    /// atom 0, atom 1's LSQ decoder was fitted on no rows and came out identically zero, and the
+    /// entry refused the seed (#2822). Two circles in orthogonal output planes: each atom must own
+    /// rows and carry a nonzero decoder, and the cold logits must be the residual seed itself.
+    #[test]
+    fn cold_topk_seed_routes_by_residual_and_seeds_every_decoder_4531() {
+        let n = 80usize;
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for row in 0..n {
+            let theta = std::f64::consts::TAU * (row / 2) as f64 / (n / 2) as f64;
+            let plane = 2 * (row % 2);
+            target[[row, plane]] = 2.0 * theta.cos();
+            target[[row, plane + 1]] = 2.0 * theta.sin();
+        }
+        let report = build_sae_minimal_seed(SaeMinimalSeedRequest {
+            target: target.view(),
+            atom_basis: vec!["periodic".to_string(); 2],
+            atom_dim: vec![1, 1],
+            assignment_kind: SaeFitAssignmentKind::TopK,
+            alpha: 1.0,
+            tau: 1.0,
+            threshold: 0.0,
+            top_k: Some(1),
+            random_state: 45,
+            initial_logits: None,
+            initial_coords: None,
+        })
+        .expect("a planted two-circle TopK seed must build");
+        let basis_sizes: Vec<usize> = report
+            .geometry_plans
+            .iter()
+            .map(|plan| plan.basis_size().expect("seed plans carry a basis size"))
+            .collect();
+        let residual =
+            sae_residual_seed_logits(report.basis_values.view(), &basis_sizes, target.view(), 4.0)
+                .expect("the residual seed of the report's own basis must build");
+        assert_eq!(
+            report.initial_logits, residual,
+            "the cold TopK logits must be the residual seed itself"
+        );
+        let mut owned_rows = [0usize; 2];
+        for row in 0..n {
+            let support = crate::assignment::topk_row(report.initial_logits.row(row), 1);
+            for atom in 0..2 {
+                if support[atom] == 1.0 {
+                    owned_rows[atom] += 1;
+                }
+            }
+        }
+        assert!(
+            owned_rows.iter().all(|&rows| rows > 0),
+            "every atom must own rows under the cold TopK(1) support; got {owned_rows:?}"
+        );
+        for atom in 0..2 {
+            let decoder = report.decoder_coefficients.index_axis(ndarray::Axis(0), atom);
+            assert!(
+                decoder.iter().any(|&value| value != 0.0),
+                "atom {atom}'s cold LSQ decoder must be seeded from the rows it owns"
             );
         }
     }
