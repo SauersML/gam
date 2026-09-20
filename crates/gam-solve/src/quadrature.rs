@@ -828,6 +828,41 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
             mode: IntegratedExpectationMode::ExactClosedForm,
         });
     }
+    let series = logistic_normal_series(mu, sigma, false);
+    Ok(IntegratedMeanDerivative {
+        mean: series.mean,
+        dmean_dmu: series.slope,
+        mode: IntegratedExpectationMode::ExactSpecialFunction,
+    })
+}
+
+/// `E[σ(η)]`, `E[σ'(η)]` and (when asked for) `E[σ(η)²]`, `η ~ N(μ, s²)`,
+/// `s > √ε`, from one pass of the CRVZ series.
+///
+/// The second moment uses the same polynomial `Q ≈ 1/(1+t)` and its
+/// derivative, split at `η = 0` exactly as the mean is:
+///
+/// ```text
+///   η ≤ 0:  σ²     = t²/(1+t)²          = −Σ_k k w_k t^{k+1}
+///   η > 0:  1 − σ² = 2t/(1+t) − t²/(1+t)² =  Σ_k (k+2) w_k t^{k+1}
+///   ⇒ E[σ²] = Φ(μ/s) − Σ_{j≥1} w_{j−1} ((j+1) m⁺_j + (j−1) m⁻_j).
+/// ```
+///
+/// Its pointwise truncation error is `t²|e'(t)|` below zero and
+/// `2t|e(t)| + t²|e'(t)|` above, with `e = 1/(1+t) − Q`, `|e| ≤ 1/T_n(3)` and
+/// `|e'| ≤ (2n²+1)/T_n(3)` (Markov). Against the pointwise lower bounds
+/// `σ² ≥ t²/4` (below) and `σ² ≥ ¼` (above) that is a relative error of at
+/// most `4(2n²+3)/T_n(3)`, about twice the slope's `(4n²+1)/T_n(3) ≤ u`. The
+/// remainder after term `j` is at most `(m⁺_j + m⁻_j)·Σ_{k≥j} (k+2)|w_k|`, and
+/// the series stops once that is below `u` times the lower bound
+/// `¼(Φ(μ/s) + m⁻_2)` of `E[σ²]`, as the mean and slope stop against theirs.
+struct LogisticNormalSeries {
+    mean: f64,
+    slope: f64,
+    second: f64,
+}
+
+fn logistic_normal_series(mu: f64, sigma: f64, with_second: bool) -> LogisticNormalSeries {
     const N: usize = LOGISTIC_NORMAL_SERIES_TERMS;
     let weights = &LOGISTIC_NORMAL_SERIES_WEIGHTS;
     let unit_roundoff = gam_linalg::roundoff::UNIT_ROUNDOFF;
@@ -839,8 +874,10 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
 
     let mut mean_series = 0.0;
     let mut slope_series = 0.0;
+    let mut second_series = 0.0;
     let mut mean_floor = 0.0;
     let mut slope_floor = 0.0;
+    let mut second_floor = 0.25 * upper_mass;
     for j in 1..=N {
         let jf = j as f64;
         let lower = logistic_normal_half_moment(mu, jf, s2, sqrt2_s, half_gauss);
@@ -855,20 +892,86 @@ pub(crate) fn logit_posterior_meanwith_deriv_exact(
             slope_floor = 0.25 * (lower + upper);
         }
         let largest_remaining = lower + upper;
+        let second_resolved = if with_second {
+            second_series +=
+                weights.weight[j - 1] * ((jf + 1.0) * upper + (jf - 1.0) * lower);
+            if j == 2 {
+                second_floor += 0.25 * lower;
+            }
+            // `j ≥ 2`: the floor needs `m⁻_2`.
+            j >= 2
+                && largest_remaining
+                    * (weights.index_abs_tail[j] + 2.0 * weights.abs_tail[j])
+                    <= unit_roundoff * second_floor
+        } else {
+            true
+        };
         if largest_remaining * weights.abs_tail[j] <= unit_roundoff * mean_floor
             && largest_remaining * weights.index_abs_tail[(j + 1).min(N)]
                 <= unit_roundoff * slope_floor
+            && second_resolved
         {
             break;
         }
     }
-    let mean = (upper_mass + mean_series).clamp(0.0, 1.0);
-    let dmean_dmu = (-slope_series).max(0.0);
-    Ok(IntegratedMeanDerivative {
-        mean,
-        dmean_dmu,
-        mode: IntegratedExpectationMode::ExactSpecialFunction,
-    })
+    LogisticNormalSeries {
+        mean: (upper_mass + mean_series).clamp(0.0, 1.0),
+        slope: (-slope_series).max(0.0),
+        second: upper_mass - second_series,
+    }
+}
+
+/// Logistic-normal posterior variance `Var σ(η)`, `η ~ N(μ, s²)`, as a
+/// CENTRED quantity: accurate relative to the variance itself, and
+/// non-negative by construction (#4124).
+///
+/// The raw difference `E[σ²] − E[σ]²` loses `u·E[σ]²/Var` relative accuracy,
+/// which is all of it once `s ≲ √u`. So it is read against the Gaussian
+/// chaos (Hermite) expansion `Var f(μ+sZ) = Σ_{n≥1} s^{2n}(E f⁽ⁿ⁾)²/n!`:
+///
+/// ```text
+///   B_lo = s²·(E σ')²                         (the n = 1 term; exact lower bound)
+///   Var − B_lo = Σ_{n≥2} … ≤ (s⁴/2)·E[σ''²]   (n(n−1) ≥ 2)
+///              ≤ (s⁴/2)·E[σ'²]                 (|σ''| = σ'|1 − 2σ| ≤ σ')
+///              ≤ s⁴·σ'(μ)²·e^{2s²}·Φ(2s)       (σ'(η) ≤ σ'(μ)e^{|η−μ|})
+/// ```
+///
+/// Both ends come from the same series (`E σ'` is its slope), so the returned
+/// `clamp(E[σ²] − E[σ]², B_lo, B_hi)` is inside a bracket that holds the true
+/// variance, with relative error at most `min(u/s², s²)` up to small factors:
+/// the raw difference is exact where the bracket is wide, and the bracket is
+/// narrower than the rounding of the difference where it is not. The worst
+/// case is `s ≈ u^{1/4}`, about `1e-8` relative. The variance is even in `μ`,
+/// so the series runs at `−|μ|`, where `E σ ≤ ½` and `E σ²` keep their
+/// relative accuracy into the tails.
+///
+/// For `s ≤ √ε` the leading chaos term alone is exact to `O(s²) ≤ ε`
+/// relative: `Var = (s·σ'(μ))²`.
+pub fn logit_posterior_variance(mu: f64, sigma: f64) -> Result<f64, EstimationError> {
+    if !(mu.is_finite() && sigma.is_finite() && sigma >= 0.0) {
+        crate::bail_invalid_estim!(
+            "logit posterior variance requires finite mu and finite non-negative sigma"
+        );
+    }
+    let mu = -mu.abs();
+    if sigma <= f64::EPSILON.sqrt() {
+        let slope = stable_sigmoidwith_derivative(mu).1;
+        let scaled = sigma * slope;
+        return Ok(scaled * scaled);
+    }
+    let series = logistic_normal_series(mu, sigma, true);
+    let raw_difference = series.second - series.mean * series.mean;
+    let leading = sigma * series.slope;
+    let lower_bound = leading * leading;
+    // ln σ'(μ) = −|μ| − 2·ln(1 + e^{−|μ|}); the bracket width in log form so
+    // neither the s⁴ nor the e^{2s²} factor over- or underflows into NaN.
+    let log_slope_at_mean = mu - 2.0 * mu.exp().ln_1p();
+    let log_width = 4.0 * sigma.ln()
+        + 2.0 * log_slope_at_mean
+        + 2.0 * sigma * sigma
+        + gam_math::probability::normal_cdf(2.0 * sigma).ln();
+    let upper_bound = lower_bound + log_width.exp();
+    Ok(raw_difference.max(lower_bound).min(upper_bound))
 }
 
 /// One Laplace-localized Clenshaw–Curtis panel for the log-space survival
@@ -4784,6 +4887,76 @@ mod tests {
             assert_relative_eq!(out.mean, ref_mean, epsilon = 1e-12, max_relative = 1e-11);
             assert_relative_eq!(out.dmean_dmu, ref_d1, epsilon = 1e-12, max_relative = 1e-11);
         }
+    }
+
+    #[test]
+    fn test_logit_posterior_variance_is_centred_at_small_sigma_4124() {
+        // Var σ(μ + sZ) = s²(E σ')² + O(s⁴); at μ = 0 the O(s⁴) chaos term is
+        // (Eσ'')²/2 = 0 and E σ' = ¼ − s²/16 + O(s⁴), so
+        // Var = s²/16 − s⁴/32 + O(s⁶). The raw E[σ²] − E[σ]² has absolute
+        // error ~u/4 here, i.e. relative error u/(4·s²/16) ≈ 5% at s = 1e-7
+        // (both the series branch and the point-mass branch below √ε).
+        for &sigma in &[1e-7, 1e-8] {
+            let v = logit_posterior_variance(0.0, sigma).expect("variance evaluates");
+            assert_relative_eq!(v, sigma * sigma / 16.0, max_relative = 1e-10);
+        }
+        let sigma = 1e-3;
+        let v = logit_posterior_variance(0.0, sigma).expect("variance evaluates");
+        let s2 = sigma * sigma;
+        assert_relative_eq!(v, s2 / 16.0 - s2 * s2 / 32.0, max_relative = 1e-8);
+        // Deep tail: σ(η) = e^η(1 + O(e^η)), so the variance is the lognormal
+        // one, e^{2μ+s²}·expm1(s²), to relative O(e^μ) ≈ 1e-13.
+        let (mu, sigma) = (-30.0_f64, 0.5_f64);
+        let lognormal = (2.0 * mu + sigma * sigma).exp() * (sigma * sigma).exp_m1();
+        for &m in &[mu, -mu] {
+            let v = logit_posterior_variance(m, sigma).expect("variance evaluates");
+            assert_relative_eq!(v, lognormal, max_relative = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_logit_posterior_variance_matches_independent_references_4124() {
+        // σ(1 − σ) = σ', so Var σ = E σ − E σ' − (E σ)²: the mean/slope series
+        // and the second-moment series are separate sums, and at s = 1 the
+        // variance is O(0.1), far from any cancellation.
+        for &mu in &[-6.0, -2.5, -0.7, 0.0, 0.3, 1.9, 4.0] {
+            let v = logit_posterior_variance(mu, 1.0).expect("variance evaluates");
+            let jet = logit_posterior_meanwith_deriv_exact(mu, 1.0).expect("series evaluates");
+            let identity = jet.mean * (1.0 - jet.mean) - jet.dmean_dmu;
+            assert_relative_eq!(v, identity, epsilon = 1e-13);
+        }
+        // A centred quadrature E[(σ(η) − Eσ)²] by adaptive Simpson.
+        let (mu, sigma) = (1.1, 0.8);
+        let mean = logit_posterior_meanwith_deriv_exact(mu, sigma)
+            .expect("series evaluates")
+            .mean;
+        let centred = integrate_normal_adaptive(mu, sigma, |eta| {
+            let d = stable_sigmoidwith_derivative(eta).0 - mean;
+            d * d
+        });
+        let v = logit_posterior_variance(mu, sigma).expect("variance evaluates");
+        assert_relative_eq!(v, centred, max_relative = 1e-8);
+    }
+
+    #[test]
+    fn test_logit_posterior_variance_is_even_and_bounded_4124() {
+        for &sigma in &[0.0, 1e-9, 1e-6, 1e-4, 1e-2, 0.1, 0.5, 1.0, 3.0, 10.0, 50.0] {
+            for i in -40_i32..=40 {
+                let mu = f64::from(i);
+                let v = logit_posterior_variance(mu, sigma).expect("variance evaluates");
+                let mirrored = logit_posterior_variance(-mu, sigma).expect("variance evaluates");
+                assert_eq!(v.to_bits(), mirrored.to_bits(), "Var must be even in μ");
+                assert!(
+                    v.is_finite() && (0.0..=0.25).contains(&v),
+                    "Var σ at (μ={mu}, s={sigma}) must lie in [0, ¼]; got {v}"
+                );
+                if sigma > 0.0 && mu.abs() < 20.0 {
+                    assert!(v > 0.0, "Var σ at (μ={mu}, s={sigma}) must be positive");
+                }
+            }
+        }
+        assert!(logit_posterior_variance(0.0, -1.0).is_err());
+        assert!(logit_posterior_variance(f64::NAN, 1.0).is_err());
     }
 
     #[test]
