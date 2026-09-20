@@ -3819,8 +3819,7 @@ fn predict_competing_risks_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_competing_risks_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3830,22 +3829,7 @@ fn predict_competing_risks_survival_result(
         resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
     let noise_offset = ndarray::Array1::<f64>::zeros(dataset.values.nrows());
     let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        // Posterior-mean points always integrate the conditional posterior;
-        // covariance_mode controls uncertainty only.
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     let request = SurvivalPredictRequest {
         model,
         data: dataset.values.view(),
@@ -3869,8 +3853,7 @@ fn predict_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3903,27 +3886,33 @@ fn predict_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    // #2296: the user's covariance_mode governs single-cause survival
-    // uncertainty exactly as it does the competing-risks path. The default
-    // (None -> smoothing-corrected) is a REQUIRED request: when the saved fit
-    // carries no corrected covariance the engine refuses instead of silently
-    // narrowing the bands to conditional Vb. Posterior-mean points without an
-    // interval integrate the conditional posterior, as in the CR wrapper.
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     Ok(predict_survival(request, covariance_mode)?)
+}
+
+/// The covariance definition behind a survival prediction's uncertainty: the
+/// explicit `covariance_mode` when given (a requirement, refused when the fit
+/// cannot supply it), else the definition the saved fit publishes, the same
+/// resolution `gam predict` applies. The engine reads it for the band only;
+/// the posterior-mean point is always the conditional-posterior mean, so
+/// `interval=` never moves it (#2296, #3421).
+fn survival_band_covariance_mode(
+    model: &FittedModel,
+    options: &PyPredictOptions,
+) -> Result<gam::families::survival::predict::SurvivalPredictionCovarianceMode, String> {
+    use gam::families::survival::predict::{SurvivalPredictionCovarianceMode, saved_fit_result};
+    let mode = match parse_covariance_mode(options.covariance_mode.as_deref())? {
+        Some(mode) => mode,
+        None => saved_fit_result(model)?.published_covariance_mode(),
+    };
+    Ok(match mode {
+        gam_predict::InferenceCovarianceMode::Conditional => {
+            SurvivalPredictionCovarianceMode::Conditional
+        }
+        gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
+            SurvivalPredictionCovarianceMode::SmoothingCorrected
+        }
+    })
 }
 
 fn serialize_survival_prediction_payload(
