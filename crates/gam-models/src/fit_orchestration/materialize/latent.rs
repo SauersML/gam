@@ -588,8 +588,11 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
                         ));
                     }
                 };
+                // An unset strength is REML-selected, the same default as the
+                // direct latent-fit entry points (`aux_strength=None` ⇒ auto)
+                // and the `LatentCoord` contract: a fixed μ is a user choice.
                 let strength = match aux.get("strength") {
-                    None => AuxPriorStrength::Fixed(1.0),
+                    None | Some(JsonValue::Null) => AuxPriorStrength::Auto,
                     Some(value)
                         if value
                             .as_str()
@@ -752,6 +755,46 @@ fn parse_latent_specs(payload: Option<&JsonValue>) -> Result<Vec<LatentSpec>, St
         });
     }
     Ok(specs)
+}
+
+#[cfg(test)]
+mod aux_prior_strength_default_tests {
+    use super::*;
+
+    fn strength_of(aux_prior: JsonValue) -> AuxPriorStrength {
+        let payload = serde_json::json!({
+            "t": {"n": 3, "d": 1, "aux_prior": aux_prior}
+        });
+        let specs = parse_latent_specs(Some(&payload)).expect("latent spec parses");
+        specs[0]
+            .aux_prior
+            .as_ref()
+            .expect("aux_prior is carried")
+            .strength
+    }
+
+    /// An omitted (or null) aux-prior strength is REML-selected, matching the
+    /// direct latent-fit entry points; an explicit value stays fixed.
+    #[test]
+    fn unset_aux_prior_strength_is_reml_selected() {
+        let u = serde_json::json!([[0.0], [1.0], [2.0]]);
+        assert!(matches!(
+            strength_of(serde_json::json!({"u": u})),
+            AuxPriorStrength::Auto
+        ));
+        assert!(matches!(
+            strength_of(serde_json::json!({"u": u, "strength": null})),
+            AuxPriorStrength::Auto
+        ));
+        assert!(matches!(
+            strength_of(serde_json::json!({"u": u, "strength": "auto"})),
+            AuxPriorStrength::Auto
+        ));
+        assert!(matches!(
+            strength_of(serde_json::json!({"u": u, "strength": 2.5})),
+            AuxPriorStrength::Fixed(mu) if mu == 2.5
+        ));
+    }
 }
 
 fn deterministic_unit(seed: &mut u64) -> f64 {

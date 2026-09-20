@@ -50,17 +50,17 @@ fn gpu_solver_matches_cpu_to_numeric_tolerance_on_small_input() {
 
     let cpu_sol = cpu_cholesky_solve(&h, &rhs);
 
-    // `cholesky_solve_gpu` requires a CUDA runtime (`iterative_refinement_cholesky_solve`
-    // returns Err on typed runtime absence) and otherwise routes a dense
-    // SPD solve through `cuda::cholesky_solve` — which has NO batch/size floor, so a
-    // 3×3 system runs on device whenever a runtime is present. Therefore:
+    // `cholesky_solve_only_gpu` requires a CUDA runtime (it returns Err on typed
+    // runtime absence) and otherwise routes a dense SPD solve below the
+    // refinement floor through `cuda::cholesky_solve` — which has NO batch/size
+    // floor, so a 3×3 system runs on device whenever a runtime is present. Therefore:
     //   * no runtime  → Err is a legitimate CPU-only skip,
     //   * runtime     → Err means the device solve FAULTED, which must fail loud
     //                   (the device-PCG skip-pass class fixed in eee12f6b2; the old
     //                   `if let Ok(..)` arm silently passed on a GPU kernel fault).
-    let result = gam::gpu::solver::cholesky_solve_gpu(h.view(), rhs.view());
+    let result = gam::gpu::solver::cholesky_solve_only_gpu(h.view(), rhs.view());
     let gpu_sol = match result {
-        Ok((sol, _)) => sol,
+        Ok(sol) => sol,
         Err(err) => {
             assert!(
                 gam::gpu::device_runtime::GpuRuntime::resolve(gam::gpu::GpuPolicy::Auto)
