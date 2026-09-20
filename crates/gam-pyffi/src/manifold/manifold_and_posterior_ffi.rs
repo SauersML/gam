@@ -5077,12 +5077,6 @@ impl ManifoldSaeCore {
             .map(|b| manifold_sae_owned2(b))
             .collect::<PyResult<_>>()?;
         let hybrid = manifold_sae_hybrid_linear_images(&inner.hybrid_split)?;
-        let max_iter = usize::try_from(inner.max_iter).map_err(|_| {
-            py_value_error(format!(
-                "ManifoldSAE: saved max_iter must be positive; got {}",
-                inner.max_iter
-            ))
-        })?;
         let top_k = inner
             .top_k
             .map(|support| {
@@ -5102,8 +5096,6 @@ impl ManifoldSaeCore {
             inner.alpha,
             inner.tau,
             inner.assignment.clone(),
-            max_iter,
-            inner.learning_rate,
             // Coordinate ridge: Python `_oos_payload` omits it, so the
             // `sae_manifold_predict_oos` pyfunction supplies this `1e-6` default.
             1.0e-6,
