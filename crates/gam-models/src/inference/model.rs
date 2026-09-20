@@ -3171,6 +3171,60 @@ fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Opt
     }
 }
 
+/// Collect the factor columns a smooth basis estimates a per-level CURVE for:
+/// a factor `by=` level smooth (`s(x, by=g)`, stored as one `ByVariable`
+/// `Level` term per level, or as a `BySmooth` `Factor`), a sum-to-zero factor
+/// smooth, and the `fs`/`sz` factor smooths. None of them has a population
+/// curve that an unseen level could fall back to. The `by=` level gate reads
+/// an out-of-vocabulary code as "no level matches", so the row's curve would be
+/// silently zero; the `fs`/`sz` operators refuse such a row. Either way the
+/// held-out-group policy does not apply to the column, even when a
+/// `group(g)` on the same column is itself a genuine random effect
+/// (see [`FittedModel::random_effect_group_columns`]).
+fn collect_per_level_curve_group_cols(
+    basis: &gam_terms::smooth::SmoothBasisSpec,
+    out: &mut HashSet<usize>,
+) {
+    use gam_terms::smooth::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
+    match basis {
+        SmoothBasisSpec::ByVariable {
+            inner, by_col, by, ..
+        } => {
+            if matches!(by, ByVariableSpec::Level { .. }) {
+                out.insert(*by_col);
+            }
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::FactorSumToZero { inner, by_col, .. } => {
+            out.insert(*by_col);
+            collect_per_level_curve_group_cols(inner, out);
+        }
+        SmoothBasisSpec::BySmooth { smooth, by_kind } => {
+            if let ByVarKind::Factor { feature_col, .. } = by_kind {
+                out.insert(*feature_col);
+            }
+            collect_per_level_curve_group_cols(smooth, out);
+        }
+        SmoothBasisSpec::FactorSmooth { spec } => {
+            if !matches!(spec.flavour, FactorSmoothFlavour::Re) {
+                out.insert(spec.group_col);
+            }
+        }
+        // Leaf bases read no grouping column. Enumerated rather than
+        // wildcarded so a newly added per-level basis breaks this match
+        // instead of silently inheriting the lenient held-out-group policy.
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Duchon { .. }
+        | SmoothBasisSpec::Pca { .. }
+        | SmoothBasisSpec::TensorBSpline { .. } => {}
+    }
+}
+
 /// Recursively collect the feature columns of a smooth basis whose out-of-hull
 /// evaluation is bounded, so they can be exempted from the predict-time axis
 /// clip (see [`FittedModel::training_smooth_extrapolation_axes`]). Wrapper bases
@@ -5373,10 +5427,29 @@ impl FittedModel {
     /// averaged to the factor's centering point (#2102/#2137). Such terms carry
     /// `lenient_unseen == false` and are excluded here so they hit the strict
     /// `UnseenCategoryPolicy::Error` arm.
+    ///
+    /// A column is lenient only if EVERY term that reads it tolerates an unseen
+    /// level. `y ~ s(x, by=g) + group(g)` pairs a genuine random intercept with
+    /// per-level curves `f_g(x)`. The random intercept has a population
+    /// fallback, but the curves do not: the `by=` level gate would read the
+    /// out-of-vocabulary code as "no level matches" and silently drop
+    /// `f_g(x)` from the prediction, its standard error and its band. Such a
+    /// column is therefore removed from the whitelist, so an unseen level hits
+    /// the strict schema encode (see [`collect_per_level_curve_group_cols`]).
     pub fn random_effect_group_columns(&self) -> HashSet<String> {
         let Some(training_headers) = self.training_headers.as_ref() else {
             return HashSet::new();
         };
+        let mut per_level_curve_cols = HashSet::<usize>::new();
+        for spec in self.saved_term_specs() {
+            for term in &spec.smooth_terms {
+                collect_per_level_curve_group_cols(&term.basis, &mut per_level_curve_cols);
+            }
+        }
+        let per_level_curve_names: HashSet<&String> = per_level_curve_cols
+            .iter()
+            .filter_map(|&col| training_headers.get(col))
+            .collect();
         let mut out = HashSet::<String>::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
@@ -5401,6 +5474,7 @@ impl FittedModel {
                 }
             }
         }
+        out.retain(|name| !per_level_curve_names.contains(name));
         out
     }
 
@@ -7817,6 +7891,133 @@ mod tests {
                 panic!("`{formula}` must tolerate an unseen level, got: {err}")
             });
         }
+    }
+
+    /// `y ~ s(x, by=g) + group(g)`: the random intercept alone would tolerate
+    /// an unseen `g`, but the per-level curves `f_g(x)` have no population
+    /// fallback. The `by=` level gate reads an out-of-vocabulary code as "no
+    /// level matches", so the lenient encode silently dropped `f_g(x)` from the
+    /// prediction. Such a column must reach the strict schema encode. A
+    /// `group(g)` whose column carries no per-level curve stays lenient.
+    #[test]
+    fn group_column_with_per_level_curves_is_not_lenient_on_unseen_levels() {
+        use csv::StringRecord;
+        use gam_data::{UnseenCategoryPolicy, encode_recordswith_schema};
+        use gam_terms::basis::SphericalSplineBasisSpec;
+        use gam_terms::smooth::{
+            BySmoothKind, ByVarKind, ByVariableSpec, RandomEffectTermSpec, ShapeConstraint,
+            SmoothBasisSpec, SmoothTermSpec,
+        };
+        let headers = ["x", "g", "h"];
+        let levels = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let schema = DataSchema {
+            columns: headers
+                .iter()
+                .map(|name| SchemaColumn {
+                    name: name.to_string(),
+                    kind: if *name == "x" {
+                        ColumnKindTag::Continuous
+                    } else {
+                        ColumnKindTag::Categorical
+                    },
+                    levels: if *name == "x" { vec![] } else { levels.clone() },
+                })
+                .collect(),
+        };
+        // The inner basis is irrelevant to the whitelist; only the wrapper's
+        // grouping column is read.
+        let inner = SmoothBasisSpec::Sphere {
+            feature_cols: vec![0, 0],
+            spec: SphericalSplineBasisSpec::default(),
+        };
+        let level_curve = |by_col: usize| SmoothBasisSpec::ByVariable {
+            inner: Box::new(inner.clone()),
+            by_col,
+            kind: BySmoothKind::Level {
+                level_bits: 0.0_f64.to_bits(),
+            },
+            by: ByVariableSpec::Level {
+                value_bits: 0.0_f64.to_bits(),
+                label: "a".to_string(),
+            },
+        };
+        let model_with = |curve: SmoothBasisSpec| -> FittedModel {
+            let mut payload = standard_gaussian_payload();
+            payload.data_schema = Some(schema.clone());
+            payload.set_training_feature_metadata(
+                headers.iter().map(|name| name.to_string()).collect(),
+                vec![(0.0, 1.0), (0.0, 2.0), (0.0, 2.0)],
+            );
+            payload.resolved_termspec = Some(TermCollectionSpec {
+                linear_terms: vec![],
+                random_effect_terms: vec![RandomEffectTermSpec {
+                    name: "g".to_string(),
+                    feature_col: 1,
+                    frozen_levels: None,
+                    lenient_unseen: true,
+                }],
+                smooth_terms: vec![SmoothTermSpec {
+                    frozen_parametric_residualization: None,
+                    name: "s(x):by".to_string(),
+                    basis: curve,
+                    shape: ShapeConstraint::None.into(),
+                    joint_null_rotation: None,
+                }],
+                level: Default::default(),
+            });
+            FittedModel::from_payload(payload)
+        };
+        let g_schema = DataSchema {
+            columns: vec![SchemaColumn {
+                name: "g".to_string(),
+                kind: ColumnKindTag::Categorical,
+                levels: levels.clone(),
+            }],
+        };
+        let encode_unseen_g = |model: &FittedModel| {
+            encode_recordswith_schema(
+                vec!["g".to_string()],
+                vec![StringRecord::from(vec!["NEW"])],
+                &g_schema,
+                UnseenCategoryPolicy::encode_unknown_for_columns(
+                    model.random_effect_group_columns(),
+                ),
+            )
+        };
+
+        for (label, curve) in [
+            ("by=g level smooth", level_curve(1)),
+            (
+                "BySmooth factor by=g",
+                SmoothBasisSpec::BySmooth {
+                    smooth: Box::new(inner.clone()),
+                    by_kind: ByVarKind::Factor {
+                        feature_col: 1,
+                        frozen_levels: None,
+                        ordered: false,
+                    },
+                },
+            ),
+        ] {
+            let model = model_with(curve);
+            assert!(
+                !model.random_effect_group_columns().contains("g"),
+                "{label}: g carries per-level curves, so it must not be lenient"
+            );
+            let err = encode_unseen_g(&model)
+                .expect_err("an unseen g must be refused when g carries per-level curves");
+            assert!(
+                err.contains("unseen level"),
+                "{label}: expected an unseen-level schema mismatch, got: {err}"
+            );
+        }
+
+        let model = model_with(level_curve(2));
+        assert!(
+            model.random_effect_group_columns().contains("g"),
+            "a group(g) whose column carries no per-level curve keeps the held-out-group policy"
+        );
+        encode_unseen_g(&model).expect("group(g) alone tolerates an unseen level");
     }
 
     #[test]
