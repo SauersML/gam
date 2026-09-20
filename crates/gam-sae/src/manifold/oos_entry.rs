@@ -347,18 +347,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
             }
             logits
         }
-        None => {
-            let mut logits = Array2::<f64>::zeros((n_obs, k_atoms));
-            if k_atoms == 1
-                && matches!(
-                    assignment,
-                    SaeOosAssignmentKind::OrderedBetaBernoulli { .. }
-                )
-            {
-                logits.column_mut(0).fill(4.0);
-            }
-            logits
-        }
+        None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
 
     let mode = match assignment {

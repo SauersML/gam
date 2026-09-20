@@ -7,9 +7,11 @@ pub enum GpuMixedPrecisionPolicy {
     /// Attempt fp32 Cholesky factorization followed by up to
     /// `REFINEMENT_MAX_STEPS` fp64-residual refinement steps. Policy admits
     /// the attempt only when `p ≥ REFINEMENT_MIN_P` (so that the fp64 GEMV
-    /// overhead is amortized) and the measured residual drops monotonically.
-    /// Falls back to fp64 factorization automatically when the residual does
-    /// not decrease (κ(A)·u ≥ 1 regime) or when the fp32 POTRF itself fails.
+    /// overhead is amortized). The fp32 result is used only when its fp64
+    /// residual is certified inside its rounding band; fp64 factorization is
+    /// used instead when the residual does not decrease (κ(A)·u ≥ 1 regime),
+    /// when the step budget ends above the band, or when the fp32 POTRF itself
+    /// fails.
     Refinement,
     /// Always use fp64 factorization; equivalent to `Off` but signals that
     /// an explicit policy decision was taken.
@@ -29,7 +31,6 @@ pub struct GpuDispatchPolicy {
     pub sparse_min_nnz: usize,
     pub keep_design_resident_min_bytes: usize,
     pub prefer_gpu_factorization_min_p: usize,
-    pub row_kernel_min_n: usize,
     pub mixed_precision: GpuMixedPrecisionPolicy,
 }
 
@@ -55,7 +56,6 @@ impl Default for GpuDispatchPolicy {
             sparse_min_nnz: 1_000_000,
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
-            row_kernel_min_n: 50_000,
             mixed_precision: GpuMixedPrecisionPolicy::Refinement,
         }
     }
@@ -84,14 +84,6 @@ impl GpuDispatchPolicy {
     /// `p` below this is inadmissible under every reachable policy.
     pub(crate) const MIN_CALIBRATABLE_POTRF_P: usize = 64;
 
-    /// The smallest `row_kernel_min_n` / `xtwx_n_min` ANY production dispatch
-    /// policy can carry: the smallest XtWX calibration row count
-    /// (`calibration::XTWX_DIMS[0].0`, pinned by a compile-time assert there).
-    /// A row-kernel workload with fewer rows is inadmissible under every
-    /// reachable policy, so per-fit GPU-eligibility deciders may refuse it
-    /// BEFORE probing the device.
-    pub const MIN_CALIBRATABLE_ROW_KERNEL_N: usize = 2_048;
-
     /// Minimum problem dimension for the fp32+refinement path.
     ///
     /// Below this threshold the fp64 GEMV needed for the residual check costs
@@ -103,12 +95,17 @@ impl GpuDispatchPolicy {
     /// activates when the GPU factorization path is already chosen.
     pub const REFINEMENT_MIN_P: usize = 64;
 
-    /// Maximum number of fp32-correction steps per solve.
+    /// Maximum number of fp32-correction steps per solve: a COST budget, not an
+    /// accuracy guarantee.
     ///
-    /// Two steps suffice for κ(A) ≤ 10⁵ at fp32 (u ≈ 6 × 10⁻⁸): after step
-    /// 1 the error is O(κ u)² ≈ 10⁻⁶, after step 2 it is O(κ u)⁴ ≈ 10⁻¹²,
-    /// which is well within the fp64 unit roundoff of 10⁻¹⁶ × κ. A cap of 3
-    /// is used defensively.
+    /// With a fixed fp32 factor, iterative refinement contracts the error
+    /// linearly — after `k` corrections it is ≈ (κ(A)·u_f32)^{k+1} relative,
+    /// u_f32 ≈ 6 × 10⁻⁸ — so reaching the fp64 band κ(A)·u_f64 within 3
+    /// corrections needs κ(A)³ ≲ u_f64 / u_f32⁴, i.e. κ(A) ≲ 2 × 10⁴. Accuracy
+    /// is decided by the solver's residual certificate
+    /// (`‖b − A·x‖ ≤ γ_{p+1}·(‖A‖_F‖x‖ + ‖b‖)`), not by this count: when the
+    /// budget ends above that band the fp32 path reports failure and the solve
+    /// is done by fp64 POTRF.
     pub const REFINEMENT_MAX_STEPS: usize = 3;
 
     /// Return `true` when the policy and problem size together suggest that
@@ -218,7 +215,7 @@ impl GpuDispatchPolicy {
     /// Work-based admission for offloading the **reduced-Schur PCG matvec** (the
     /// InexactPCG hot loop for matrix-free SAE β-blocks) to the device.
     ///
-    /// The dense gates key on row count (`xtwx_n_min`, `row_kernel_min_n`) or on
+    /// The dense gates key on row count (`xtwx_n_min`) or on
     /// one big factorization's flops, and the SAE LLM shape `(n≈2000) × (k≈2048)
     /// × (d≈8)` trips neither: it is thousands of small dense ops. But a CG solve
     /// stages the row frames once and reuses them for `cg_iters` applies, so its

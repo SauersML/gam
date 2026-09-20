@@ -1,6 +1,6 @@
 //! Regression gate: the `gam` CLI's untyped-CSV ingestion must encode a
 //! numeric-coded grouping column declared in a factor-by-construction role
-//! (`group(g)` / `factor(g)` / `re(g)`, or a categorical response) as a FACTOR,
+//! (`group(g)` / `factor(g)`, or a categorical response) as a FACTOR,
 //! exactly as the typed Python frame does — and must leave a genuinely
 //! continuous integer covariate (`s(x)` / bare `+ x`) as `Continuous`.
 //!

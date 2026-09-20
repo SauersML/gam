@@ -7384,10 +7384,9 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
     );
 }
 
-/// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
-/// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
-/// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
-/// through `BlockCoupledOperator::from_joint_hessian_with_mode` →
+/// gam#1854: the multinomial Firth/Jeffreys separation fallback assembles the outer
+/// joint Hessian `H_unpen + S_λ + scale·H_Φ` and realizes its `0.5·log|H|` Laplace
+/// term through `BlockCoupledOperator::from_joint_hessian_with_mode` →
 /// `DenseSpectralOperator::from_symmetric_with_mode` → `eigh(Side::Lower)`. That
 /// eigensolver reads ONLY the lower triangle and ASSUMES the input is symmetric.
 ///
@@ -7395,20 +7394,14 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
 /// second-order completion) carries an `O(1e10)` curvature scale, so reduction-order
 /// floating-point noise desyncs the assembled matrix's mirror entries by an amount
 /// that is *large in absolute terms*. Reading the raw lower triangle then yields a
-/// materially different spectrum — and logdet — than the symmetrized matrix. The
-/// gam#1395 ground-truth guard in `joint_outer_evaluate` reconstructs the SAME matrix
-/// but symmetrizes it first, so an unsymmetrized assembly makes the assembled-vs-
-/// reference logdet diverge and the guard `assert!` fires (caught by the fallback's
-/// `catch_unwind` and degraded to the clean separation error — the #1854 symptom).
+/// materially different spectrum — and logdet — than the symmetrized matrix, which
+/// is why `joint_outer_evaluate` symmetrizes the assembled joint Hessian in place
+/// before constructing the `BlockCoupledOperator`.
 ///
-/// The fix symmetrizes the assembled joint Hessian in place before constructing the
-/// `BlockCoupledOperator`, mirroring the guard's ground truth and the matrix-free
-/// dense-assemble path. This test pins that invariant at the operator boundary that
-/// the guard compares across: on a symmetric input the `BlockCoupledOperator` and the
-/// guard's `DenseSpectralOperator` realize the identical logdet (the guard's apples-to-
-/// apples assumption), while the RAW asymmetric matrix — the pre-symmetrization state —
-/// diverges by FAR more than the guard tolerance. That divergence is exactly why the
-/// symmetrization is load-bearing; removing it re-opens the #1854 guard trip.
+/// This test pins both halves at the operator boundary: on the symmetrized input the
+/// `BlockCoupledOperator` route IS the dense spectral operator (bit-identical logdet),
+/// while the raw asymmetric matrix shifts the logdet by the closed-form `ln 4` of the
+/// fixture below.
 #[test]
 fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     let mode = PseudoLogdetMode::Smooth;
@@ -7423,7 +7416,6 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     raw[[0, 1]] = 0.0; // upper mirror entry
     raw[[1, 0]] = 2.0e5; // lower mirror entry — desynced from the upper one
 
-    // Guard ground truth: symmetrize first, then the dense spectral operator.
     let mut symmetric = raw.clone();
     symmetrize_dense_in_place(&mut symmetric);
     let reference = DenseSpectralOperator::from_symmetric_with_mode(&symmetric, mode)
@@ -7434,38 +7426,30 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
         "reference logdet must be finite: {reference_logdet}"
     );
 
-    // Post-fix assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
+    // Assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
     let assembled = BlockCoupledOperator::from_joint_hessian_with_mode(&symmetric, mode)
         .expect("assembled BlockCoupledOperator on the symmetrized joint Hessian");
-    let assembled_logdet = assembled.logdet();
-
-    // Guard tolerance, verbatim from `joint_outer_evaluate`'s gam#1395 check.
-    let total = 3usize;
-    let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
-
-    // Apples-to-apples: on a symmetric input the two operator routes realize the
-    // identical logdet, so the guard passes. This is the property the symmetrization
-    // restores.
-    assert!(
-        (assembled_logdet - reference_logdet).abs() <= tol,
-        "symmetrized assembly must match the gam#1395 reference logdet within guard \
-         tolerance: assembled={assembled_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+    assert_eq!(
+        assembled.logdet().to_bits(),
+        reference_logdet.to_bits(),
+        "on a symmetric input the assembly route must realize the dense spectral \
+         operator's logdet exactly: assembled={:.9e} reference={reference_logdet:.9e}",
+        assembled.logdet()
     );
 
-    // Load-bearing check: feeding the RAW asymmetric matrix (the pre-symmetrization
-    // state) to the same operator route makes `eigh(Side::Lower)` read the desynced
-    // lower triangle, diverging from the guard's reference by FAR more than the guard
-    // tolerance — i.e. skipping the symmetrization trips the gam#1395 guard exactly as
-    // reported in #1854.
+    // Load-bearing check: the symmetrized off-diagonal pair is 1e5, so the leading
+    // 2×2 determinant is `5e10 − 1e10`; the lower triangle alone reads 2e5 and gives
+    // `5e10 − 4e10`. Skipping the symmetrization therefore moves the logdet by
+    // `ln 4`, an O(1) shift that factorization roundoff cannot produce.
     let unsymmetrized = BlockCoupledOperator::from_joint_hessian_with_mode(&raw, mode)
         .expect("BlockCoupledOperator on the raw asymmetric joint Hessian");
     let unsymmetrized_logdet = unsymmetrized.logdet();
+    let shift = reference_logdet - unsymmetrized_logdet;
     assert!(
-        (unsymmetrized_logdet - reference_logdet).abs() > 1.0e3 * tol,
-        "raw asymmetric assembly must diverge from the reference (symmetrization is \
+        shift > 0.5 * 4.0_f64.ln(),
+        "raw asymmetric assembly must shift the logdet by ln 4 (symmetrization is \
          load-bearing): raw={unsymmetrized_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+         shift={shift:.3e}"
     );
 }
 

@@ -296,16 +296,18 @@ fn gamma_log_outer_hessian_matches_gradient_fd() {
     );
 }
 
-/// A latched #784 block correction splices `Δ_b` with its exact gradient but no
-/// ρ-Hessian. The criterion it defines therefore declares no outer Hessian: the
+/// A latched #784 block correction whose `Δ_b` has no closed-form ρ-Hessian
+/// (`BlockQuadratureLatch::hessian_refusal`) defines a criterion with none: the
 /// search runs on BFGS curvature, the unified VGH evaluation reports none, and
-/// the smoothing correction's Hessian refuses with the typed not-analytic text.
-/// Before, the Laplace Hessian without `∂²Δ_b` was declared exact, ARC stepped
-/// on it, and its inversion at the fit's end read the missing curvature as the
-/// criterion contradicting itself (DOC-17: "criterion-contradicted negative
-/// curvature" on ISLR `Default`).
+/// the Hessian the smoothing-corrected covariance inverts is a typed error
+/// carrying the mathematical reason. The Laplace Hessian without `∂²Δ_b` is
+/// never declared in its place (DOC-17), and no plug-in covariance is shipped
+/// for it (pyGAM audit F17). A latch that carries its Hessian declares it;
+/// that splice is checked against finite differences of the spliced gradient
+/// in `regression_block_correction_outer_hessian_fd`, where the corrector is
+/// linked.
 #[test]
-fn a_latched_block_correction_declares_no_outer_hessian_784() {
+fn a_latched_block_correction_without_a_hessian_refuses_with_its_reason_784() {
     let (y, x, penalties) = simulate(&ResponseFamily::Binomial, StandardLink::Logit);
     let w = Array1::<f64>::ones(N);
     let offset = Array1::<f64>::zeros(N);
@@ -320,34 +322,46 @@ fn a_latched_block_correction_declares_no_outer_hessian_784() {
     assert!(reml.analytic_outer_hessian_enabled());
     assert!(reml.compute_lamlhessian_consistent(&rho).is_ok());
 
-    // Latch a one-direction block, as an admission does.
+    // Latch a one-direction block, as an admission does, whose Hessian the
+    // curvature support refused.
+    let reason = "the block's row curvature has no closed-form fourth η-derivative";
     reml.block_correction_admission
         .store(2, std::sync::atomic::Ordering::Relaxed);
+    *reml
+        .block_correction_axis_orders
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(super::BlockQuadratureLatch {
+        block_positions: vec![0],
+        axis_orders: vec![8],
+        axis_quadrature_errors: vec![0.0],
+        axis_split: false,
+        hessian_refusal: Some(reason.to_string()),
+    });
     reml.reset_outer_seed_state();
 
     assert!(
         !reml.analytic_outer_hessian_enabled(),
-        "a latched block correction has no analytic outer Hessian"
+        "a latched block correction without a ρ-Hessian declares no analytic outer Hessian"
     );
     let eval = reml
         .compute_outer_eval_with_order(&rho, OuterEvalOrder::ValueGradientHessian)
         .expect("value and gradient stay exact");
     assert!(matches!(eval.hessian, HessianValue::Unavailable));
-    let bundle = reml.obtain_eval_bundle(&rho).expect("bundle");
-    assert!(
-        reml.compute_lamlhessian_exact_from_bundle(&rho, &bundle)
-            .is_err(),
-        "the unified VGH evaluation must not declare the Laplace Hessian without ∂²Δ_b"
-    );
     let refusal = reml
         .compute_lamlhessian_consistent(&rho)
-        .expect_err("the smoothing correction's Hessian is typed-unavailable");
-    assert!(
-        refusal.to_string().contains(
-            crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
-        ),
-        "{refusal}"
-    );
+        .expect_err("the smoothing correction's Hessian is a typed refusal");
+    assert!(refusal.to_string().contains(reason), "{refusal}");
+
+    // The same latch with its Hessian declares it again.
+    reml.block_correction_axis_orders
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_mut()
+        .expect("latched")
+        .hessian_refusal = None;
+    reml.reset_outer_seed_state();
+    assert!(reml.analytic_outer_hessian_enabled());
+    assert!(reml.compute_lamlhessian_consistent(&rho).is_ok());
 }
 
 /// Linear predictor of a generic variance × link cell as a function of the

@@ -1490,9 +1490,6 @@ fn finalize_sae_fit_report(
     certificate_ledger.record(&TopologyPersistenceCertificate::new(
         &fit_diagnostics.topology_persistence,
     ));
-    if let Some(report) = &fit_diagnostics.incoherence_report {
-        certificate_ledger.record(report);
-    }
 
     let active_mask: Vec<bool> = (0..k_atoms)
         .map(|atom_idx| assignments.column(atom_idx).sum() > 1.0e-8)

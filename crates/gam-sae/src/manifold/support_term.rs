@@ -4421,21 +4421,23 @@ impl SaeSupportSparseTerm {
         Ok(solutions)
     }
 
-    /// Return `A^+ Gamma`, the one adjoint needed for the implicit derivative of
-    /// the Gauss--Newton arrow's log determinant
-    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|` (#2933 F27 S2). `Gamma` is the exact
-    /// derivative, with respect to the fitted inner state, of the row blocks' log
-    /// determinants and of the frozen rational surrogate of `log|S|`. The latter is
-    /// assembled from the surrogate's own low-rank derivative vectors. `A` is the
-    /// exact stationarity Jacobian of the penalized inner objective, not its
-    /// Gauss--Newton majorizer.
+    /// Return `(Gamma, A^+ Gamma)`: the inner-state derivative of the
+    /// Gauss--Newton arrow's log determinant
+    /// `log|H| = Σ_i log|H_tt^(i)| + log|S|`, and the one adjoint needed for its
+    /// implicit derivative (#2933 F27 S2). `Gamma` is the exact derivative, with
+    /// respect to the fitted inner state, of the row blocks' log determinants and of
+    /// the frozen rational surrogate of `log|S|`. The latter is assembled from the
+    /// surrogate's own low-rank derivative vectors. `A` is the exact stationarity
+    /// Jacobian of the penalized inner objective, not its Gauss--Newton majorizer.
+    /// `Gamma` itself prices the log determinant's error at an inexact inner state
+    /// (#3340): it moves by `−⟨Gamma, Δ⟩` along the Newton displacement `Δ`.
     pub(crate) fn support_reduced_logdet_profile_adjoint(
         &self,
         target: ArrayView2<'_, f64>,
         ard_precisions: &[Vec<f64>],
         system: &ArrowSchurSystem,
         derivative: &RationalLogdetDerivativeBundle,
-    ) -> Result<SaeArrowVector, String> {
+    ) -> Result<(SaeArrowVector, SaeArrowVector), String> {
         let derivative_vectors = derivative.vectors.as_slice();
         if derivative_vectors.is_empty() {
             return Err(
@@ -4520,16 +4522,18 @@ impl SaeSupportSparseTerm {
                     .to_string(),
             );
         }
-        self.support_reduced_logdet_adjoint_solves(
-            system,
-            &rows,
-            std::slice::from_ref(&gamma),
-            derivative,
-        )?
-        .pop()
-        .ok_or_else(|| {
-            "support reduced-logdet profile adjoint solve returned no solution".to_string()
-        })
+        let adjoint = self
+            .support_reduced_logdet_adjoint_solves(
+                system,
+                &rows,
+                std::slice::from_ref(&gamma),
+                derivative,
+            )?
+            .pop()
+            .ok_or_else(|| {
+                "support reduced-logdet profile adjoint solve returned no solution".to_string()
+            })?;
+        Ok((gamma, adjoint))
     }
 
     /// Per-probe implicit responses of a surrogate `log|S|` derivative bundle
@@ -8492,47 +8496,23 @@ impl SaeSupportSparseTerm {
         let mut options = ArrowSolveOptions::inexact_pcg();
         options.pcg.relative_tolerance = stationarity_tolerance;
         options.trust_region.steihaug_relative_tolerance = stationarity_tolerance;
-        // Levenberg ladder seeded from the system's OWN curvature scale, so the
-        // first trial is a true Newton step and any damping that follows is
-        // measured in the units the block diagonal is already in -- never an
-        // absolute number. `sqrt(EPSILON)` is the smallest relative shift that
-        // survives the f64 assembly of that diagonal.
-        let curvature_scale = system
-            .hbb_diag
-            .as_ref()
-            .map(|diag| diag.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs())))
-            .unwrap_or(0.0)
-            .max(
-                system
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        (0..row.htt.nrows())
-                            .map(|i| row.htt[[i, i]].abs())
-                            .fold(0.0_f64, f64::max)
-                    })
-                    .fold(0.0_f64, f64::max),
-            );
-        let seed_ridge = f64::EPSILON.sqrt() * curvature_scale;
-        let mut step_pair = None;
-        let mut ridge = 0.0_f64;
-        let mut solve_attempts = 0usize;
-        let mut solve_iterations = 0usize;
-        let mut solve_refusal = String::new();
-        for attempt in 0..4 {
-            solve_attempts += 1;
-            match system.solve_with_options(ridge, ridge, &options) {
+        // #3676: one undamped solve. `B` is the PSD majorizer of the coupled step, so
+        // the solve is the true Newton step on it; the trust radius is infinite, so
+        // an `Ok` stops either converged or at its resolved product budget. A refusal
+        // (negative curvature, a PCG breakdown, a factor failure) is a defect of this
+        // state's system, reported as "no coupled step this cycle" for the caller's
+        // block sweeps and stall certificate -- never retried under a growing ridge
+        // until the solver stops refusing.
+        let (step_pair, solve_iterations, solve_refusal) =
+            match system.solve_with_options(0.0, 0.0, &options) {
                 Ok((delta_t, delta_beta, diagnostics)) => {
-                    solve_iterations += diagnostics.iterations;
                     // #2576: every CG iterate from zero lowers the majorizer's reduced
                     // quadratic model, and eliminating Δt exactly only adds
                     // −½·g_tᵀH_tt⁻¹g_t, so the full model is negative and gᵀd < 0.
                     // An iterate that spent its product budget is therefore a
-                    // descent direction the line search below already guards.
-                    // Refusing it discarded the direction and re-ran the whole
-                    // preconditioner ladder at three more ridges. The derived
-                    // tolerance stays the CG's target and the certificate's bar. A
-                    // gauge-pinned solve that spends its budget returns `Err`,
+                    // descent direction the line search below already guards. The
+                    // derived tolerance stays the CG's target and the certificate's
+                    // bar. A gauge-pinned solve that spends its budget returns `Err`,
                     // and stays refused.
                     let admissible = matches!(
                         diagnostics.stopping_reason,
@@ -8540,40 +8520,26 @@ impl SaeSupportSparseTerm {
                             | gam_solve::arrow_schur::PcgStopReason::BudgetExhausted
                     ) && diagnostics.final_relative_residual.is_finite();
                     if admissible {
-                        step_pair = Some((delta_t, delta_beta));
-                        break;
+                        (Some((delta_t, delta_beta)), diagnostics.iterations, String::new())
+                    } else {
+                        let refusal = format!(
+                            "stop={:?}, relative residual {:.3e}, requested {:.3e}",
+                            diagnostics.stopping_reason,
+                            diagnostics.final_relative_residual,
+                            stationarity_tolerance,
+                        );
+                        (None, diagnostics.iterations, refusal)
                     }
-                    solve_refusal = format!(
-                        "stop={:?}, relative residual {:.3e}, requested {:.3e}",
-                        diagnostics.stopping_reason,
-                        diagnostics.final_relative_residual,
-                        stationarity_tolerance,
-                    );
-                    log::trace!(
-                        "support joint Newton linear solve refused at ridge {ridge:.3e} \
-                         (attempt {attempt}): {solve_refusal}"
-                    );
                 }
-                Err(error) => {
-                    solve_refusal = error.to_string();
-                    log::trace!(
-                        "support joint Newton refused at ridge {ridge:.3e} (attempt {attempt}): {error}"
-                    );
-                }
-            }
-            if !(seed_ridge > 0.0) {
-                break;
-            }
-            ridge = if ridge > 0.0 { ridge * 16.0 } else { seed_ridge };
-        }
+                Err(error) => (None, 0, error.to_string()),
+            };
         let solved = step_start.elapsed();
         let (delta_t, delta_beta) = match step_pair {
             Some(pair) => pair,
             None => {
                 log::debug!(
-                    "support joint Newton: linear solve refused after {solve_attempts} attempt(s) \
-                     and {solve_iterations} PCG iterations ({solve_refusal}); assemble {:.2}s, \
-                     solve {:.2}s",
+                    "support joint Newton: linear solve refused after {solve_iterations} PCG \
+                     iterations ({solve_refusal}); assemble {:.2}s, solve {:.2}s",
                     assembled.as_secs_f64(),
                     (solved - assembled).as_secs_f64(),
                 );
@@ -8807,8 +8773,8 @@ impl SaeSupportSparseTerm {
                     "support joint Newton: accepted scale={scale:.6e} (2^-{halving} of \
                      {first_scale:.6e}, {model} model) predicted={predicted:+.3e} \
                      actual={:+.3e} ratio={:.3} objective={objective:.9e} -> {trial:.9e}; \
-                     assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG iterations over \
-                     {solve_attempts} attempt(s)), exact curvature {:.2}s, line search {:.2}s \
+                     assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG iterations), \
+                     exact curvature {:.2}s, line search {:.2}s \
                      over {} objective evaluation(s)",
                     objective - trial,
                     if predicted != 0.0 { (objective - trial) / predicted } else { f64::NAN },
@@ -8837,7 +8803,7 @@ impl SaeSupportSparseTerm {
         log::debug!(
             "support joint Newton: no measurable decrease along the {model} step after {} \
              objective evaluation(s); assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG \
-             iterations over {solve_attempts} attempt(s)), exact curvature {:.2}s, line search \
+             iterations), exact curvature {:.2}s, line search \
              {:.2}s",
             halving + 1,
             assembled.as_secs_f64(),

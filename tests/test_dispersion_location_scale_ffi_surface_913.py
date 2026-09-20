@@ -73,7 +73,7 @@ def _heteroscedastic_count_rows(n: int, seed: int) -> list[dict[str, float]]:
 @pytest.mark.parametrize(
     "family, expected_tag",
     [
-        ("nb", "negbin-location-scale"),
+        ("negative-binomial", "negbin-location-scale"),
         ("gamma", "gamma-location-scale"),
         ("tweedie", "tweedie-location-scale"),
     ],

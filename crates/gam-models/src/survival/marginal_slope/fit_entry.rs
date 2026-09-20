@@ -339,6 +339,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map_err(|e| FitFailure::from(e).context("failed to rebuild frozen probe SMGS joint designs"))?;
     let marginal_design = joint_designs.remove(0);
     let marginalspec_boot = joint_specs.remove(0);
+    // gam#2938: a learned frailty is identified only where the slope's fixed offset
+    // leaves a slope surface's span, decided below once that offset is complete; the
+    // surfaces' covariate designs are kept for it.
+    let slope_surface_designs: Option<Vec<Array2<f64>>> =
+        learned_sigma_initial.is_some().then(|| {
+            joint_designs
+                .iter()
+                .map(|surface| surface.design.to_dense())
+                .collect()
+        });
     let (slope_design, slopespec_boot, slope_topology) =
         combine_slope_surface_designs(joint_designs, &joint_specs).map_err(FitFailure::invariant)?;
     // gam#2765 / gam#2767: if the request asked for a follow-up-varying slope,
@@ -365,27 +375,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     let slope_surface_specs: Option<Vec<TermCollectionSpec>> =
         slope_topology.is_per_score().then(|| joint_specs.clone());
     if slope_topology.is_per_score() {
-        // A Gaussian-shift frailty reaches a per-score row only through the
-        // probit scale s(σ) = 1/√(1+σ²) on every slope, so the likelihood reads
-        // σ and the slopes only through s·g: σ is not identified, and along the
-        // orbit that keeps s·g fixed only ½·log|H| moves, with no minimiser in σ
-        // (measured ∂V/∂log σ = −2σ²/(1+σ²), no data term; gam#2938). The
-        // design-ψ terms are formed on the shared-slope row program, so a
-        // spatial marginal term refuses rather than differentiate a likelihood
-        // other than the one it fits. Both are checked here, before the pilot.
-        if learned_sigma_initial.is_some() {
-            return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
-                reason: format!(
-                    "a learned Gaussian frailty on a per-score slope over K={} scores is \
-                     refused: σ reaches every per-score row only through the probit scale \
-                     1/√(1+σ²) on the slopes, so the likelihood depends on σ and the slopes \
-                     only through their product and σ is not identified (the Laplace \
-                     evidence has no minimiser in σ; gam#2938)",
-                    spec.z.ncols()
-                ),
-            }
-            .into());
-        }
+        // The design-ψ terms are formed on the shared-slope row program, so a
+        // per-score slope refuses a spatial marginal term rather than
+        // differentiate a likelihood other than the one it fits, before the
+        // pilot solve. A learned frailty is checked once the slope offset is
+        // composed, below.
         if !spatial_length_scale_term_indices(&marginalspec_boot).is_empty() {
             return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
                 reason: format!(
@@ -680,6 +674,51 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         baseline_started.elapsed().as_secs_f64(),
     );
     let common_slope_offset = &spec.slope_offset + baseline_slope;
+    if let Some(surfaces) = slope_surface_designs.as_ref() {
+        // gam#2938: the offset every slope surface carries is now complete. Where it
+        // lies in each surface's span nothing in the likelihood identifies σ, so the
+        // fit is refused before the pilot solve. On a follow-up-varying slope the
+        // time margin is a partition of unity, so a covariate design's span sits
+        // inside its channels' span at every follow-up time.
+        use crate::survival::lognormal_kernel::{FrailtyIdentification, frailty_identification};
+        let views: Vec<_> = surfaces.iter().map(|surface| surface.view()).collect();
+        match frailty_identification(&views, common_slope_offset.view())
+            .map_err(FitFailure::invariant)?
+        {
+            FrailtyIdentification::NotIdentified { .. } => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: LEARNED_FRAILTY_NOT_IDENTIFIED.to_string(),
+                }
+                .into());
+            }
+            FrailtyIdentification::Undecided { surface } => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "a learned Gaussian-shift frailty σ is refused: slope surface {surface}'s \
+                         column space is not separated from rounding at its rank boundary, so \
+                         whether the slope offset identifies σ cannot be decided (gam#2938)"
+                    ),
+                }
+                .into());
+            }
+            // Where the offset identifies σ, the log σ terms are formed on the
+            // shared-slope row program, so a per-score slope refuses rather than
+            // differentiate a likelihood other than the one it fits.
+            FrailtyIdentification::IdentifiedByOffset { .. } if slope_topology.is_per_score() => {
+                return Err(SurvivalMarginalSlopeError::UnsupportedConfiguration {
+                    reason: format!(
+                        "a learned Gaussian frailty on a per-score slope over K={} scores, \
+                         identified only by the slope's fixed offset, is refused: its log-σ \
+                         derivatives are formed on the shared-slope row program, not on the \
+                         per-score likelihood this fit optimises (gam#2938)",
+                        spec.z.ncols()
+                    ),
+                }
+                .into());
+            }
+            FrailtyIdentification::IdentifiedByOffset { .. } => {}
+        }
+    }
     if slope_topology.is_per_score() && slope_topology.score_count() != spec.z.ncols() {
         return Err(SurvivalMarginalSlopeError::IncompatibleDimensions {
             reason: format!(
@@ -1230,34 +1269,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         .map(|timewiggle| time_wiggle_basis_ncols(&timewiggle.knots, timewiggle.degree))
         .transpose()
         .map_err(FitFailure::input)?;
-    // Coordinate-cone time bases already encode monotonicity as β >= 0:
-    // validation proved D >= 0 and offsets absorb the derivative guard. Emitting
-    // row-wise `D β + o >= guard` constraints here duplicates the same condition
-    // as hundreds of dense rows and forces the generic active-set QP path. Use
-    // a single identity cone instead so the custom-family solver recognizes the
-    // simple lower-bound problem.
-    let time_linear_constraints = match spec.time_block.time_monotonicity {
-        monotonicity if monotonicity.is_coordinate_cone() => {
-            let p_total = design_exit.ncols();
-            LinearInequalityConstraints::from_per_coordinate_lower_bounds(&Array1::<f64>::zeros(
-                p_total,
-            ))
-        }
-        _ => {
-            let derivative_guard_constraints = time_derivative_guard_constraints(
-                &design_derivative_exit,
-                derivative_offset_exit.as_ref(),
-                derivative_guard,
-            )
-            .map_err(FitFailure::unclassified)?;
-            append_timewiggle_tail_nonnegative_constraints(
-                derivative_guard_constraints,
-                design_exit.ncols(),
-                derived_time_wiggle_ncols.unwrap_or(0),
-            )
-            .map_err(FitFailure::invariant)?
-        }
-    };
+    // The time block is a coordinate cone: validation proved D >= 0 and
+    // offsets >= guard, so β >= 0 implies `D β + o >= guard` at every row.
+    // A single identity cone lets the custom-family solver recognize the
+    // simple lower-bound problem instead of hundreds of dense row constraints.
+    let time_linear_constraints = LinearInequalityConstraints::from_per_coordinate_lower_bounds(
+        &Array1::<f64>::zeros(design_exit.ncols()),
+    );
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
     let flex_jet_arenas = new_flex_jet_arena_pool();
@@ -2539,12 +2557,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let weight_sum = spec.weights.iter().sum::<f64>();
         let weight_sq_sum = spec.weights.iter().map(|w| w * w).sum::<f64>();
         let sqrt_effective_n = weight_sum / weight_sq_sum.sqrt();
-        let to_rows = |per_anchor: [(f64, f64, f64); 2], weight: f64| {
-            per_anchor.map(|(anchoring_residual, law_sd, scale)| {
-                (anchoring_residual, law_sd / sqrt_effective_n, scale, weight)
-            })
-        };
-        let (anchors, nodes) = if spec.z.ncols() == 1 {
+        let row_weights = spec.weights.as_slice().ok_or_else(|| {
+            FitFailure::invariant("survival marginal-slope: the row weights are not contiguous")
+        })?;
+        let effective_n = sqrt_effective_n * sqrt_effective_n;
+        let (rows, noise, nodes) = if spec.z.ncols() == 1 {
             let law = laws
                 .as_ref()
                 .and_then(|laws| laws.first())
@@ -2554,21 +2571,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                          estimated law to certify it against",
                     )
                 })?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map(|row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                    Ok(to_rows(
-                        certificate_family.closed_form_certificate_anchors(
-                            row,
-                            block_states,
-                            law,
-                        )?,
-                        spec.weights[row],
-                    ))
-                })
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, law.nodes.len())
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                &law.weights,
+                effective_n,
+                || Ok(()),
+                |_, row| certificate_family.closed_form_certificate_anchors(row, block_states, law),
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, law.nodes.len())
         } else {
             let (_, joint_law) = build_joint_latent_law(
                 spec.z.view(),
@@ -2581,35 +2593,34 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 DEFAULT_JOINT_LATENT_NODES,
             )
             .map_err(FitFailure::unclassified)?;
-            let anchors = (0..n)
-                .into_par_iter()
-                .map_init(
-                    || super::calibration::JointCertificateWorkspace::new(
+            let (rows, noise) = crate::bms::closed_form_certificate_pass(
+                n,
+                row_weights,
+                joint_law.weights(),
+                effective_n,
+                || {
+                    super::calibration::JointCertificateWorkspace::new(
                         &certificate_family,
                         &joint_law,
-                    ),
-                    |workspace, row| -> Result<[(f64, f64, f64, f64); 2], String> {
-                        let workspace = workspace.as_mut().map_err(|error| error.clone())?;
-                        Ok(to_rows(
-                            certificate_family.closed_form_joint_certificate_anchors(
-                                row,
-                                block_states,
-                                &joint_law,
-                                workspace,
-                            )?,
-                            spec.weights[row],
-                        ))
-                    },
-                )
-                .collect::<Result<Vec<_>, String>>()
-                .map_err(FitFailure::numerical)?;
-            (anchors, joint_law.node_count())
+                    )
+                },
+                |workspace, row| {
+                    certificate_family.closed_form_joint_certificate_anchors(
+                        row,
+                        block_states,
+                        &joint_law,
+                        workspace,
+                    )
+                },
+            )
+            .map_err(FitFailure::numerical)?;
+            (rows, noise, joint_law.node_count())
         };
-        let rows: Vec<(f64, f64, f64, f64)> = anchors.into_iter().flatten().collect();
         let certificate = crate::bms::ClosedFormAnchorResidual::from_rows(
             &rows,
+            &noise,
             nodes,
-            sqrt_effective_n * sqrt_effective_n,
+            effective_n,
         )
         .map_err(FitFailure::numerical)?;
         let mut uncertified = None;

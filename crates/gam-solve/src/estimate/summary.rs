@@ -1,11 +1,12 @@
-use super::*;
-
 #[derive(Clone, Debug)]
 pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
     pub std_error: Option<f64>,
-    pub zvalue: Option<f64>,
+    /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
+    /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
+    /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
 }
 
@@ -27,6 +28,9 @@ pub struct SmoothTermSummary {
     /// published raw, so `edf` may lie outside `[0, dim]` and is not clamped. `None`
     /// when every block of the term is certified, or the fit recorded no bounds.
     pub edf_rank_bound: Option<String>,
+    /// The fitted smoothing parameters of the penalty blocks this term owns, in
+    /// the fit's flat layout order. Empty for an unpenalized term.
+    pub lambdas: Vec<f64>,
     /// Why `pvalue` is absent, when the term or the fit leaves no valid
     /// reference law. `None` whenever `pvalue` is present.
     pub pvalue_unavailable: Option<SmoothPValueUnavailable>,
@@ -170,26 +174,6 @@ pub struct ContinuousSmoothnessOrder {
     pub nu: Option<f64>,
     pub kappa2: Option<f64>,
     pub status: ContinuousSmoothnessOrderStatus,
-}
-
-#[derive(Clone, Debug)]
-pub struct ModelSummary {
-    pub family: String,
-    pub deviance_explained: Option<f64>,
-    /// The cross-model comparable REML/LAML criterion
-    /// (`UnifiedFitResult::comparable_reml_score`), the value the Python summary
-    /// publishes under the same name. `None` exactly when `raw_reml_score` is.
-    pub reml_score: Option<f64>,
-    /// The outer optimizer's own criterion, un-normalized
-    /// (`UnifiedFitResult::reml_score`).
-    pub raw_reml_score: Option<f64>,
-    pub parametric_terms: Vec<ParametricTermSummary>,
-    pub smooth_terms: Vec<SmoothTermSummary>,
-    /// Exact covariance definition behind the coefficient standard errors
-    /// (#2296). Result-owned: recorded from the pair the builder actually
-    /// consumed, never from a display policy. `None` when the fit carries no
-    /// coefficient standard errors at all.
-    pub coefficient_se_source: Option<crate::model_types::CoefficientCovarianceDefinition>,
 }
 
 /// Convert optimizer-scale lambdas into physical lambdas for raw operator penalties.
@@ -459,271 +443,6 @@ pub(crate) fn compute_continuous_smoothness_order(
     }
 }
 
-fn significance_stars(p: Option<f64>) -> &'static str {
-    match p {
-        Some(v) if v.is_finite() && v < 0.001 => "***",
-        Some(v) if v.is_finite() && v < 0.01 => "**",
-        Some(v) if v.is_finite() && v < 0.05 => "*",
-        Some(v) if v.is_finite() && v < 0.1 => ".",
-        _ => "",
-    }
-}
-
-fn format_pvalue(p: Option<f64>) -> String {
-    let Some(v) = p else {
-        return "NA".to_string();
-    };
-    if !v.is_finite() {
-        return "NA".to_string();
-    }
-    if v < 2e-16 {
-        "< 2e-16".to_string()
-    } else if v < 1e-4 {
-        format!("{v:.2e}")
-    } else {
-        format!("{v:.4}")
-    }
-}
-
-impl fmt::Display for ModelSummary {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let paramnamew = self
-            .parametric_terms
-            .iter()
-            .map(|t| t.name.len())
-            .max()
-            .unwrap_or(10)
-            .max("Term".len());
-        let smoothnamew = self
-            .smooth_terms
-            .iter()
-            .map(|t| t.name.len())
-            .max()
-            .unwrap_or(10)
-            .max("Term".len());
-
-        writeln!(f, "Family: {}", self.family)?;
-        let dev_txt = self
-            .deviance_explained
-            .map(|d| format!("{:.1}%", (100.0 * d).clamp(-9999.0, 9999.0)))
-            .unwrap_or_else(|| "NA".to_string());
-        let reml_txt = self
-            .reml_score
-            .map(|v| format!("{v:.4}"))
-            .unwrap_or_else(|| "NA".to_string());
-        let raw_reml_txt = self
-            .raw_reml_score
-            .map(|v| format!("{v:.4}"))
-            .unwrap_or_else(|| "NA".to_string());
-        writeln!(
-            f,
-            "Deviance Explained: {dev_txt} | REML Score: {reml_txt} | Raw REML Score: {raw_reml_txt}"
-        )?;
-        if let Some(source) = self.coefficient_se_source {
-            writeln!(f, "Coefficient SE Covariance: {source}")?;
-        }
-        writeln!(f)?;
-
-        writeln!(f, "Parametric Terms:")?;
-        writeln!(f, "{:-<1$}", "", paramnamew + 59)?;
-        writeln!(
-            f,
-            "{:<namew$} {:>10} {:>12} {:>10} {:>19}",
-            "Term",
-            "Estimate",
-            "Standard Error",
-            "Z Statistic",
-            "Two-Sided P-Value",
-            namew = paramnamew
-        )?;
-        writeln!(f, "{:-<1$}", "", paramnamew + 59)?;
-        for term in &self.parametric_terms {
-            let estimate = format!("{:.4}", term.estimate);
-            let se = term
-                .std_error
-                .filter(|v| v.is_finite())
-                .map(|v| format!("{v:.4}"))
-                .unwrap_or_else(|| "NA".to_string());
-            let z = term
-                .zvalue
-                .filter(|v| v.is_finite())
-                .map(|v| format!("{v:.2}"))
-                .unwrap_or_else(|| "NA".to_string());
-            let p = format_pvalue(term.pvalue);
-            let stars = significance_stars(term.pvalue);
-            writeln!(
-                f,
-                "{:<namew$} {:>10} {:>12} {:>10} {:>19} {}",
-                term.name,
-                estimate,
-                se,
-                z,
-                p,
-                stars,
-                namew = paramnamew
-            )?;
-        }
-        writeln!(f)?;
-
-        writeln!(f, "Smooth Terms:")?;
-        writeln!(f, "{:-<1$}", "", smoothnamew + 86)?;
-        writeln!(
-            f,
-            "{:<namew$} {:>26} {:>30} {:>12} {:>10}",
-            "Term",
-            "Effective Degrees of Freedom",
-            "Reference Degrees of Freedom",
-            "Chi-Square",
-            "P-Value",
-            namew = smoothnamew
-        )?;
-        writeln!(f, "{:-<1$}", "", smoothnamew + 86)?;
-        for term in &self.smooth_terms {
-            let chisq = term
-                .chi_sq
-                .filter(|v| v.is_finite())
-                .map(|v| format!("{v:.3}"))
-                .unwrap_or_else(|| "NA".to_string());
-            let p = format_pvalue(term.pvalue);
-            let stars = significance_stars(term.pvalue);
-            writeln!(
-                f,
-                "{:<namew$} {:>26.2} {:>30.2} {:>12} {:>10} {}",
-                term.name,
-                term.edf,
-                term.ref_df,
-                chisq,
-                p,
-                stars,
-                namew = smoothnamew
-            )?;
-        }
-        for term in &self.smooth_terms {
-            if let Some(reason) = term.pvalue_unavailable {
-                writeln!(f, "  {}: {}", term.name, reason.explanation())?;
-            }
-        }
-        // #2901: a term spending an uncertified penalty block publishes its EDF
-        // unclamped, and says so here rather than in a number that looks clamped.
-        for term in &self.smooth_terms {
-            if let Some(label) = term.edf_rank_bound.as_deref() {
-                writeln!(
-                    f,
-                    "  {}: {label}; its effective degrees of freedom are published unclamped",
-                    term.name
-                )?;
-            }
-        }
-        writeln!(f)?;
-        let order_terms = self
-            .smooth_terms
-            .iter()
-            .filter_map(|t| t.continuous_order.as_ref().map(|o| (&t.name, o)))
-            .collect::<Vec<_>>();
-        if !order_terms.is_empty() {
-            writeln!(f, "Continuous Smoothness Order:")?;
-            writeln!(
-                f,
-                "{:<namew$} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>20}",
-                "Term",
-                "lambda0",
-                "lambda1",
-                "lambda2",
-                "R",
-                "nu",
-                "kappa^2",
-                "status",
-                namew = smoothnamew
-            )?;
-            for (name, o) in order_terms {
-                let r_txt = o
-                    .r_ratio
-                    .filter(|v| v.is_finite())
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "NA".to_string());
-                let nu_txt =
-                    o.nu.filter(|v| v.is_finite())
-                        .map(|v| format!("{v:.4}"))
-                        .unwrap_or_else(|| "NA".to_string());
-                let kappa_txt = o
-                    .kappa2
-                    .filter(|v| v.is_finite())
-                    .map(|v| format!("{v:.4}"))
-                    .unwrap_or_else(|| "NA".to_string());
-                let status_txt = match o.status {
-                    ContinuousSmoothnessOrderStatus::Ok => "Ok",
-                    ContinuousSmoothnessOrderStatus::NonMaternRegime => "NonMaternRegime",
-                    ContinuousSmoothnessOrderStatus::FirstOrderLimit => "FirstOrderLimit",
-                    ContinuousSmoothnessOrderStatus::IntrinsicLimit => "IntrinsicLimit",
-                    ContinuousSmoothnessOrderStatus::UndefinedZeroLambda => "UndefinedZeroLambda",
-                };
-                writeln!(
-                    f,
-                    "{:<namew$} {:>10.3e} {:>10.3e} {:>10.3e} {:>10} {:>10} {:>10} {:>20}",
-                    name,
-                    o.lambda0,
-                    o.lambda1,
-                    o.lambda2,
-                    r_txt,
-                    nu_txt,
-                    kappa_txt,
-                    status_txt,
-                    namew = smoothnamew
-                )?;
-            }
-            writeln!(f)?;
-        }
-        write!(
-            f,
-            "Signif. codes: 0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1"
-        )?;
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod edf_rank_bound_label_tests {
-    use super::*;
-
-    /// #2901: a smooth term whose EDF spends an uncertified penalty block names the
-    /// label beside the table, and a certified term adds no line.
-    #[test]
-    fn the_summary_names_an_uncertified_terms_edf_label_2901() {
-        let row = |name: &str, edf: f64, label: Option<&str>| SmoothTermSummary {
-            name: name.to_string(),
-            edf,
-            ref_df: edf.max(0.0),
-            chi_sq: None,
-            pvalue: None,
-            continuous_order: None,
-            basis_note: None,
-            edf_rank_bound: label.map(str::to_string),
-            pvalue_unavailable: None,
-        };
-        let summary = ModelSummary {
-            family: "gaussian".to_string(),
-            deviance_explained: None,
-            reml_score: None,
-            raw_reml_score: None,
-            parametric_terms: Vec::new(),
-            smooth_terms: vec![
-                row("s(x1)", 3.2, None),
-                row("s(x2)", 5.0003, Some("rank bound not certified")),
-            ],
-            coefficient_se_source: None,
-        };
-        let text = summary.to_string();
-        assert!(
-            text.contains(
-                "s(x2): rank bound not certified; its effective degrees of freedom are published \
-                 unclamped"
-            ),
-            "{text}"
-        );
-        assert!(!text.contains("s(x1): rank bound"), "{text}");
-    }
-}
-
 #[cfg(test)]
 mod pvalue_unavailable_tests {
     use super::*;
@@ -762,40 +481,5 @@ mod pvalue_unavailable_tests {
             SmoothPValueUnavailable::ShapeConstrained.label(),
             "shape_constrained"
         );
-    }
-
-    /// The printed summary names the reason beside the table, so a blank
-    /// p-value column is never read as "not significant".
-    #[test]
-    fn the_summary_names_a_withheld_shape_pvalue() {
-        let row = |name: &str, reason: Option<SmoothPValueUnavailable>| SmoothTermSummary {
-            name: name.to_string(),
-            edf: 2.5,
-            ref_df: 3.0,
-            chi_sq: None,
-            pvalue: None,
-            continuous_order: None,
-            basis_note: None,
-            edf_rank_bound: None,
-            pvalue_unavailable: reason,
-        };
-        let summary = ModelSummary {
-            family: "gaussian".to_string(),
-            deviance_explained: None,
-            reml_score: None,
-            raw_reml_score: None,
-            parametric_terms: Vec::new(),
-            smooth_terms: vec![
-                row("s(x1)", None),
-                row("s(x2)", Some(SmoothPValueUnavailable::ShapeConstrained)),
-            ],
-            coefficient_se_source: None,
-        };
-        let text = summary.to_string();
-        assert!(
-            text.contains("s(x2): shape-constrained: the null f = 0 is the apex"),
-            "{text}"
-        );
-        assert!(!text.contains("s(x1): shape-constrained"), "{text}");
     }
 }

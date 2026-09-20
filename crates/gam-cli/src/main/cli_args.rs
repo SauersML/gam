@@ -113,6 +113,8 @@ pub(crate) enum Command {
     LatentResidual(LatentResidualArgs),
     /// Compute diagnostics (residuals, calibration, optional ALO) on a dataset.
     Diagnose(DiagnoseArgs),
+    /// Evaluate one term's partial effect with pointwise and simultaneous bands.
+    PartialEffect(PartialEffectArgs),
     /// Print a fitted model's per-row residuals on a labeled dataset as JSON.
     Residuals(ResidualsArgs),
     /// Rank fitted models on their smoothing-corrected AIC and print the
@@ -322,7 +324,7 @@ pub(crate) struct FitArgs {
         required_unless_present = "request",
         conflicts_with = "request",
         help = "Model formula, e.g. 'y ~ x + smooth(age) + bounded(mu_hat, min=0, max=1)'",
-        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): parametric effect with a zero-centered REML shrinkage ridge that can remove it\n- linear(x, double_penalty=false): opt out of the ridge (unpenalized/MLE parametric effect)\n- linear(x, min=..., max=...): shrunk parametric effect with coefficient box constraints via the active-set solver\n- constrain(x, min=..., max=...) / nonnegative(x) / nonpositive(x): sugar for generic coefficient constraints, shrunk like linear(x)\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and a REML shrinkage prior toward the null (0 when inside the box, else the box midpoint)\n- bounded(x, ..., prior=\"none\"): opt out of the shrinkage prior (constrained MLE)\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"log-jacobian\"): alias for prior=\"uniform\"\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), tensor(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- linear shrinkage uses each realized effect's function mass and is invariant to coefficient-basis rescaling\n- `type=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `type=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ linear(age, double_penalty=false) + smooth(bmi)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, type=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
+        long_help = "Model formula using linear columns and term wrappers.\n\nSupported wrappers:\n- x or linear(x): parametric effect with a zero-centered REML shrinkage ridge that can remove it\n- linear(x, double_penalty=false): opt out of the ridge (unpenalized/MLE parametric effect)\n- linear(x, min=..., max=...): shrunk parametric effect with coefficient box constraints via the active-set solver\n- nonnegative(x) / nonpositive(x): sign-constrained coefficients, shrunk like linear(x)\n- bounded(x, min=..., max=...): bounded linear coefficient with exact interval transform and a REML shrinkage prior toward the null (0 when inside the box, else the box midpoint)\n- bounded(x, ..., prior=\"none\"): opt out of the shrinkage prior (constrained MLE)\n- bounded(x, ..., prior=\"uniform\"): flat prior on the bounded user-scale coefficient (implemented via the latent log-Jacobian correction)\n- bounded(x, ..., prior=\"center\"): symmetric interior Beta prior\n- smooth(x), cyclic(x), thinplate(x1, x2), matern(pc1, pc2, ...), te(x, z), group(id), duchon(...)\n\nNumerics:\n- linear columns are centered/scaled internally during fitting for conditioning and then mapped back to the original coefficient scale in summaries, prediction, and saved models\n- linear shrinkage uses each realized effect's function mass and is invariant to coefficient-basis rescaling\n- `bs=cyclic` / `cyclic(x)` uses periodic cubic P-spline boundaries; `duchon(x, cyclic=true)` uses periodic 1D Duchon distances; `bs=duchon` is pure scale-free Duchon by default; add `length_scale=...` only to opt into the hybrid Duchon-Matern variant\n\nExamples:\n- 'y ~ age + smooth(bmi) + group(site)'\n- 'y ~ linear(age, double_penalty=false) + smooth(bmi)'\n- 'y ~ nonnegative(mu_hat) + matern(pc1, pc2, pc3)'\n- 'y ~ s(pc1, pc2, bs=duchon, centers=12)'\n- 'y ~ s(pc1, pc2, bs=duchon, centers=12, length_scale=0.7)'\n- 'y ~ linear(effect, min=0, max=1) + z'\n- 'y ~ bounded(logv_hat, min=0, max=2, target=1, strength=5) + x'"
     )]
     pub(crate) formula_positional: Option<String>,
     /// Fit a second RHS-only formula for the scale/noise block in
@@ -482,8 +484,10 @@ pub(crate) struct PredictArgs {
     pub(crate) covariance_mode: Option<InferenceCovarianceMode>,
     /// Replace the posterior band with a distribution-free conformal band at
     /// `--level`: with `--training-data` the exact full-conformal set of a
-    /// Gaussian-identity fit, or with `--calibration` the split-conformal band
-    /// calibrated on a held-out labeled table.
+    /// Gaussian, binomial, Poisson, negative-binomial or Gamma fit (offsets
+    /// honoured; a prior-weighted fit refuses and points to `--calibration`),
+    /// or with `--calibration` the split-conformal band calibrated on a
+    /// held-out labeled table.
     #[arg(long = "conformal", default_value_t = false, conflicts_with = "uncertainty")]
     pub(crate) conformal: bool,
     /// Held-out labeled table (CSV or parquet, including the response column)
@@ -545,6 +549,43 @@ pub(crate) struct DiagnoseArgs {
         help = "Dataset to evaluate diagnostics against (CSV or parquet); typically the training data"
     )]
     pub(crate) data: PathBuf,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct PartialEffectArgs {
+    #[arg(value_name = "MODEL", help = "Fitted model file produced by `gam fit`")]
+    pub(crate) model: PathBuf,
+    #[arg(
+        long = "term",
+        help = "Term to evaluate, named as the model summary names it, e.g. \"s(x)\" or \"te(x, z)\""
+    )]
+    pub(crate) term: String,
+    #[arg(
+        long = "level",
+        default_value_t = 0.95,
+        value_parser = parse_probability_open_cli,
+        help = "Coverage level of the pointwise intervals and the simultaneous band"
+    )]
+    pub(crate) level: f64,
+    #[arg(
+        long = "n-points",
+        default_value_t = 100,
+        value_parser = parse_positive_usize_cli,
+        help = "Evaluation points per numeric axis of the default training-range grid (factor axes take every level)"
+    )]
+    pub(crate) n_points: usize,
+    #[arg(
+        long = "grid",
+        value_name = "CSV",
+        conflicts_with = "n_points",
+        help = "Evaluation grid: one column per term axis, numbers for numeric axes and level labels for factor axes"
+    )]
+    pub(crate) grid: Option<PathBuf>,
+    #[arg(
+        long = "out",
+        help = "Output path: .csv writes one row per grid point, .json the full record; default: JSON on stdout"
+    )]
+    pub(crate) out: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -682,7 +723,6 @@ pub(crate) enum FamilyArg {
     Beta,
     /// Robust scaled Student-t response on the identity link; its scale and
     /// degrees of freedom are estimated jointly with the smoothing parameters.
-    #[value(alias = "student_t", alias = "t")]
     StudentT,
     RoystonParmar,
     Expectile,

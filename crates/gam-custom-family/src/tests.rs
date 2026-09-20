@@ -1631,8 +1631,8 @@ pub(crate) struct OneBlockIdentityFamily;
 #[test]
 pub(crate) fn large_scale_shape_margslope_flex_cycle0_bounds_cg_by_the_dense_route_cost() {
     // p = 51, n = 320k: the dense route builds n·p² and factors p³/3 while one
-    // product streams 2·n·p, so the cycle-0 CG attempt hands the step to the dense
-    // route after 25 products, not after the historical 4·p = 204.
+    // product streams 2·n·p, so a step takes CG only when its iteration bound
+    // costs fewer than 25 products, not the historical 4·p = 204 (gam#3285).
     let total_p = 51;
     let total_n = 320_000;
     assert_eq!(JOINT_PCG_MAX_ITER_MULTIPLIER * total_p, 204);
@@ -4357,141 +4357,6 @@ pub(crate) fn generic_single_block_fallback_includes_nonzero_d2h_drift() {
     );
 }
 
-/// [`OneBlockQuarticExactFamily`] with a counter on `d2H`, which enters only the
-/// outer Hessian.
-#[derive(Clone)]
-struct D2hCountingQuarticFamily {
-    inner: OneBlockQuarticExactFamily,
-    second_directional_calls: Arc<AtomicUsize>,
-}
-
-impl CustomFamily for D2hCountingQuarticFamily {
-    fn exact_newton_joint_hessian_beta_dependent(&self) -> bool {
-        self.inner.exact_newton_joint_hessian_beta_dependent()
-    }
-
-    fn evaluate(&self, block_states: &[ParameterBlockState]) -> Result<FamilyEvaluation, String> {
-        self.inner.evaluate(block_states)
-    }
-
-    fn exact_newton_hessian_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        direction: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.inner
-            .exact_newton_hessian_directional_derivative(block_states, block_idx, direction)
-    }
-
-    fn exact_newton_hessian_second_directional_derivative(
-        &self,
-        block_states: &[ParameterBlockState],
-        block_idx: usize,
-        u: &Array1<f64>,
-        v: &Array1<f64>,
-    ) -> Result<Option<Array2<f64>>, String> {
-        self.second_directional_calls.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .exact_newton_hessian_second_directional_derivative(block_states, block_idx, u, v)
-    }
-}
-
-/// #2898: a gradient-only custom-family fit assembles the outer Hessian once, at
-/// the mint.
-///
-/// The runner installs the selected point through `finalize_outer_result` and
-/// then certifies it. The mint requests `ValueGradientHessian` wherever the
-/// Hessian is declared and owns the Hessian the certificate judges; an
-/// installation at that order as well assembled the same Hessian at the same rho
-/// and discarded it. `d2H` is reached only by outer-Hessian assembly (the first
-/// arm checks that), so across the whole fit it must be called exactly as often
-/// as one `ValueGradientHessian` evaluation calls it.
-#[test]
-pub(crate) fn custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898() {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let family = D2hCountingQuarticFamily {
-        inner: OneBlockQuarticExactFamily {
-            linear: 3.0,
-            curvature: 0.5,
-            second_scale: 1.0,
-        },
-        second_directional_calls: Arc::clone(&calls),
-    };
-    let specs = vec![ParameterBlockSpec {
-        name: "quartic".to_string(),
-        design: DesignMatrix::Dense(gam_linalg::matrix::DenseDesignMatrix::from(array![[1.0]])),
-        offset: array![0.0],
-        penalties: vec![PenaltyMatrix::Dense(array![[1.0]])],
-        nullspace_dims: vec![],
-        initial_log_lambdas: array![0.0],
-        initial_beta: Some(array![0.75]),
-        gauge_priority: 100,
-        jacobian_callback: None,
-        stacked_design: None,
-        stacked_offset: None,
-    }];
-    let options = BlockwiseFitOptions {
-        inner_tol: 1e-11,
-        use_remlobjective: true,
-        use_outer_hessian: true,
-        compute_covariance: false,
-        ..BlockwiseFitOptions::default()
-    };
-    let penalty_counts = validate_blockspecs(&specs).expect("valid quartic spec");
-    let layout = penalty_label_layout_with_joint(&specs, penalty_counts, Vec::new())
-        .expect("valid label layout");
-    let calls_in_one_evaluation = |mode: EvalMode| {
-        calls.store(0, Ordering::Relaxed);
-        let evaluation = outerobjectivegradienthessian_labeled(
-            &family,
-            &specs,
-            &options,
-            &layout,
-            &array![0.0],
-            None,
-            &gam_problem::RhoPrior::Flat,
-            mode,
-        )
-        .expect("quartic outer evaluation");
-        assert!(
-            evaluation.inner_converged,
-            "the calibration evaluation must reach the inner mode"
-        );
-        calls.load(Ordering::Relaxed)
-    };
-    assert_eq!(
-        calls_in_one_evaluation(EvalMode::ValueAndGradient),
-        0,
-        "d2H must stay out of value-and-gradient evaluations, or its count does not price \
-         outer-Hessian assemblies"
-    );
-    let calls_per_assembly = calls_in_one_evaluation(EvalMode::ValueGradientHessian);
-    assert!(
-        calls_per_assembly > 0,
-        "one ValueGradientHessian evaluation must reach d2H"
-    );
-
-    calls.store(0, Ordering::Relaxed);
-    let fit = fit_custom_family(&family, &specs, &options).expect("the quartic REML fit must certify");
-    let fit_calls = calls.load(Ordering::Relaxed);
-    let certificate = fit
-        .artifacts
-        .criterion_certificate
-        .as_ref()
-        .expect("a certified outer optimum carries its criterion certificate");
-    assert!(
-        certificate.hessian_psd().is_some(),
-        "the mint must measure the declared outer Hessian: {certificate:?}"
-    );
-    assert_eq!(
-        fit_calls, calls_per_assembly,
-        "the fit must assemble the outer Hessian exactly once, at the mint: {fit_calls} d2H calls \
-         against {calls_per_assembly} per assembly (outer_iterations={})",
-        fit.outer_iterations
-    );
-}
-
 #[test]
 fn cached_mode_is_corrected_when_the_requested_accuracy_tightens_979() {
     let family = OneBlockQuarticExactFamily {
@@ -4653,7 +4518,11 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
         .expect("Jeffreys term")
         .expect("active Jeffreys term");
     assert!(completion.is_some());
-    assert_eq!(information_calls.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        information_calls.load(Ordering::Relaxed),
+        1,
+        "H_Phi and its second-order completion share one materialized information",
+    );
     assert_eq!(axis_batch_calls.load(Ordering::Relaxed), 1);
     assert_eq!(completion_calls.load(Ordering::Relaxed), 1);
 
@@ -4665,7 +4534,7 @@ fn outer_jeffreys_geometry_is_derivative_order_invariant() {
     );
     assert_eq!(
         information_calls.load(Ordering::Relaxed),
-        3,
+        2,
         "lazy drift construction must materialize the information matrix exactly once",
     );
     assert_eq!(
@@ -4926,7 +4795,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -4949,7 +4817,6 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("half-strength completion")
     .expect("half-strength completion present");
@@ -4961,10 +4828,9 @@ pub(crate) fn jeffreys_second_order_completion_prefers_contracted_hook() {
     );
 }
 
-/// gam#1020: for an expected-information family without a contracted hook, exact
-/// assembly dispatches to the mathematically identical pairwise second-directional
-/// path. The contracted-only policy must decline because that family contract is
-/// absent.
+/// gam#1020: for an expected-information family without a contracted hook, the
+/// completion dispatches to the mathematically identical pairwise second-directional
+/// path.
 #[derive(Clone)]
 struct PairwiseJeffreysSeamFamily;
 
@@ -5031,7 +4897,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -5054,20 +4919,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_pairwise_when_hook_absent()
     assert!(
         completion.iter().any(|value| value.abs() > 0.0),
         "pairwise completion should be nonzero on this gated fixture"
-    );
-
-    let contracted_only = custom_family_joint_jeffreys_second_order_completion(
-        &family,
-        &states,
-        &specs,
-        &h_joint,
-        &z_joint,
-        JeffreysCompletionAssembly::Contracted,
-    )
-    .expect("contracted-only completion");
-    assert!(
-        contracted_only.is_none(),
-        "contracted-only assembly must decline when the family has no contracted hook"
     );
 }
 
@@ -5179,7 +5030,6 @@ pub(crate) fn jeffreys_second_order_completion_exact_contracts_span_directions_2
         &specs,
         &h_joint,
         &z_joint,
-        JeffreysCompletionAssembly::Exact,
     )
     .expect("completion")
     .expect("completion present");
@@ -8247,15 +8097,10 @@ fn outer_jeffreys_hphi_drift_matches_a_central_difference_of_hphi_2765() {
 
     let hphi_at = |t: f64| -> Array2<f64> {
         let states = vec![jeffreys_seam_state(&beta + &(&direction * t))];
-        let (_, hphi, completion) =
-            custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
-                .expect("Jeffreys term")
-                .expect("the small information keeps the conditioning gate active");
-        assert!(
-            completion.is_none(),
-            "this fixture declares no contracted-trace completion, so the drift it \
-             differences is the bare divided-difference H_Phi"
-        );
+        // The drift is `D_β H_Φ`; the mode-response completion does not enter it.
+        let (_, hphi, _) = custom_family_outer_jeffreys_hphi(&family, &states, &specs, &ranges)
+            .expect("Jeffreys term")
+            .expect("the small information keeps the conditioning gate active");
         hphi
     };
 

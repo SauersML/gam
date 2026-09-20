@@ -52,14 +52,15 @@ fn unique_count_column_uses_canonical_level_bits() {
 }
 
 /// #1867: a 1-D radial smooth must not be dimensioned coarser than the
-/// univariate `s(x)` on the same data. The spline-equivalent floor is the
-/// rate-derived pilot `s(x)` starts from: the order-2 null space plus the
-/// penalized resolution rank `⌈n^{1/5}⌉`, held to the distinct values.
+/// univariate `s(x)` on the same data and route. On a route whose loop grows it
+/// the floor is the rate-derived pilot `s(x)` starts from: the order-2 null
+/// space plus the penalized resolution rank `⌈n^{1/5}⌉`, held to the distinct
+/// values; everywhere else it is the provisioned `s(x)`.
 #[test]
 fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
     for n in [30usize, 1_000, 100_000] {
         let col: Array1<f64> = Array1::from_iter((0..n).map(|i| i as f64 / (n as f64 - 1.0)));
-        let univariate_floor = univariate_spline_basis_dim(col.view());
+        let univariate_floor = pilot_univariate_spline_basis_dim(col.view(), col.len());
         assert_eq!(
             univariate_floor,
             DEFAULT_PENALTY_ORDER + penalized_resolution_rank(n, 1, DEFAULT_PENALTY_ORDER),
@@ -68,24 +69,31 @@ fn radial_1d_default_not_starved_below_univariate_spline_resolution_1867() {
         // A radial plan starved below the floor is lifted to it.
         let starved = 1usize;
         assert!(default_matern_center_count(n, 1, starved, univariate_floor) >= univariate_floor);
-        assert!(default_duchon_center_count(n, 1, 2, univariate_floor) >= univariate_floor);
-        // Without the floor the Duchon default is the rate pilot itself
+        assert!(pilot_duchon_center_count(n, 1, 2, univariate_floor) >= univariate_floor);
+        let provisioned_floor = univariate_spline_basis_dim(col.view());
+        assert!(default_duchon_center_count(n, 1, 2, provisioned_floor) >= provisioned_floor);
+        // Without the floor the Duchon pilot is the rate count itself
         // (bounded below only by the null-space identifiability floor).
         assert_eq!(
-            default_duchon_center_count(n, 1, 2, 0),
+            pilot_duchon_center_count(n, 1, 2, 0),
             starting_num_centers(n, 1, 2).max(3)
         );
     }
+    // The provisioned floor is the provisioned `s(x)`: 7 + 4 = 11 cubic
+    // functions on 30 distinct values.
+    let col: Array1<f64> = Array1::from_iter((0..30).map(|i| i as f64 / 29.0));
+    assert_eq!(univariate_spline_basis_dim(col.view()), 11);
     // The floor is scoped to 1-D: a multivariate smooth passes 0 and keeps
     // the generic n-scaling plan unchanged.
     assert_eq!(default_matern_center_count(200, 2, 40, 0), 40);
 }
 
 /// #1757 regression: an omitted `k=`/`centers=` on a 2-D Duchon smooth must
-/// stay a low-rank representer basis rather than the generic spatial width,
-/// and that rank is the data-derived pilot — the affine null space plus the
-/// penalized resolution rank at `n` rows — not a fixed `10 * 3^(d - 1)`: it
-/// grows with `n` instead of saturating at 30 in 2-D.
+/// stay a low-rank representer basis rather than the generic spatial width.
+/// Its provisioned default is held to `10 * 3^(d - 1)` = 30; the pilot the
+/// standard workflow starts it at is the data-derived rate — the affine null
+/// space plus the penalized resolution rank at `n` rows — which grows with `n`
+/// instead of saturating at 30.
 #[test]
 fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
     let d = 2usize;
@@ -93,11 +101,15 @@ fn duchon_2d_default_is_low_rank_not_generic_spatial_width_1757() {
     let mut previous = 0usize;
     for n in [500usize, 5_000, 50_000, 500_000] {
         let generic_plan = default_num_centers(n, d);
-        let duchon_default = default_duchon_center_count(n, d, polynomial_cols, 0);
+        assert!(
+            default_duchon_center_count(n, d, polynomial_cols, 0) <= 30,
+            "the provisioned 2-D Duchon default is held to the low-rank 30 at n={n}"
+        );
+        let duchon_default = pilot_duchon_center_count(n, d, polynomial_cols, 0);
         assert_eq!(
             duchon_default,
             starting_num_centers(n, d, polynomial_cols),
-            "2-D Duchon default at n={n} must be the rate-derived pilot"
+            "2-D Duchon pilot at n={n} must be the rate-derived count"
         );
         assert!(duchon_default < generic_plan, "low rank vs the generic width at n={n}");
         assert!(duchon_default > polynomial_cols, "affine null space plus a penalized span");
@@ -326,7 +338,7 @@ fn build_sphere_over_lat_lon(ds: &Dataset) -> Result<SmoothBasisSpec, String> {
     let mut options = BTreeMap::new();
     options.insert("bs".to_string(), "sphere".to_string());
     options.insert("k".to_string(), "10".to_string());
-    options.insert("kernel".to_string(), "sobolev".to_string());
+    options.insert("method".to_string(), "sobolev".to_string());
     let mut notes = Vec::new();
     build_smooth_basis(
         SmoothKind::S,
@@ -423,9 +435,6 @@ fn curvature_and_measurejet_explicit_count_aliases_remain_pinned() {
         for alias in [
             "centers",
             "k",
-            "basis_dim",
-            "basis-dim",
-            "basisdim",
             "knots",
         ] {
             let basis = build_two_dimensional_spatial_basis(&ds, selector, Some(alias));
@@ -443,8 +452,8 @@ fn curvature_and_measurejet_explicit_count_aliases_remain_pinned() {
     }
 }
 
-/// #1378: the DEFAULT univariate `s(x, bs="tp")` must build a *modest*
-/// mgcv-sized basis, not the n-scaled spatial heuristic. The oversized
+/// #1378: the DEFAULT univariate `s(x, bs="tps")` must build a *modest*
+/// basis, not the n-scaled spatial heuristic. The oversized
 /// default basis left the two-penalty REML ρ-surface with a flat valley
 /// whose optimizer landing point depended on row order, breaking
 /// row-permutation invariance. Pin the default 1-D center count so a
@@ -464,7 +473,7 @@ fn default_univariate_thinplate_basis_dim_is_modest() {
     let ds = continuous_dataset(&["y", "x"], rows);
 
     let mut options = BTreeMap::new();
-    options.insert("bs".to_string(), "tp".to_string());
+    options.insert("bs".to_string(), "tps".to_string());
 
     let mut notes = Vec::new();
     let basis = build_smooth_basis(
@@ -529,7 +538,7 @@ fn default_matern_2d_seeds_resolving_length_scale_not_overscaled_diameter() {
     let ds = continuous_dataset(&["y", "x1", "x2"], rows);
 
     let mut options = BTreeMap::new();
-    options.insert("bs".to_string(), "gp".to_string()); // gp ⇒ Matérn
+    options.insert("bs".to_string(), "matern".to_string());
     let mut notes = Vec::new();
     let mut basis = build_smooth_basis(
         SmoothKind::S,
@@ -620,7 +629,7 @@ fn matern_length_scale_provenance_drives_prebuild_kappa_locking() {
     );
     let build = |length_scale: Option<&str>| {
         let mut options = BTreeMap::new();
-        options.insert("bs".to_string(), "gp".to_string());
+        options.insert("bs".to_string(), "matern".to_string());
         if let Some(value) = length_scale {
             options.insert("length_scale".to_string(), value.to_string());
         }
@@ -720,7 +729,7 @@ fn matern_and_thinplate_accept_periodic_option() {
 
     // matern() with periodic=true must build without an unknown-option error.
     let mut matern_opts = BTreeMap::new();
-    matern_opts.insert("bs".to_string(), "gp".to_string()); // gp ⇒ Matérn
+    matern_opts.insert("bs".to_string(), "matern".to_string());
     matern_opts.insert("periodic".to_string(), "true".to_string());
     let mut notes = Vec::new();
     let matern_basis = build_smooth_basis(
@@ -742,7 +751,7 @@ fn matern_and_thinplate_accept_periodic_option() {
 
     // thinplate()/tps() with periodic=true must likewise be accepted.
     let mut tps_opts = BTreeMap::new();
-    tps_opts.insert("bs".to_string(), "tp".to_string());
+    tps_opts.insert("bs".to_string(), "tps".to_string());
     tps_opts.insert("periodic".to_string(), "true".to_string());
     let mut notes = Vec::new();
     let tps_basis = build_smooth_basis(
@@ -798,7 +807,7 @@ fn scalar_periodic_false_builds_non_periodic_radial_smooth() {
         .unwrap_or_else(|e| panic!("s(x, bs={bs}, periodic=false) must be accepted: {e}"))
     };
 
-    match &build("gp") {
+    match &build("matern") {
         SmoothBasisSpec::Matern { spec, .. } => assert!(
             spec.periodic.is_none(),
             "periodic=false must leave the matern spec non-periodic, got {:?}",
@@ -806,7 +815,7 @@ fn scalar_periodic_false_builds_non_periodic_radial_smooth() {
         ),
         other => panic!("expected Matern basis, got {other:?}"),
     }
-    match &build("tp") {
+    match &build("tps") {
         SmoothBasisSpec::ThinPlate { spec, .. } => assert!(
             spec.periodic.is_none(),
             "periodic=false must leave the thinplate spec non-periodic, got {:?}",
@@ -894,7 +903,7 @@ fn validate_known_options_lists_valid_option_names_for_unknown_parameter() {
     let err = validate_known_options(
         "matern",
         &options,
-        &["type", "bs", "length_scale", "centers", "k", "nu"],
+        &["bs", "length_scale", "centers", "k", "nu"],
     )
     .expect_err("unknown smooth option should be rejected");
     assert!(
@@ -1043,10 +1052,9 @@ fn default_te_gives_a_low_cardinality_margins_share_to_the_other_margin() {
     );
 }
 
-/// #1776 / #1752: a bare doubly-cyclic tensor `te(x, z, bs=c('cc','cc'))`
+/// #1776 / #1752: a bare doubly-cyclic tensor `te(x, z, bs=c('cyclic','cyclic'))`
 /// with NO explicit `period=` must build — each cyclic margin wraps on its
-/// own observed `[min, max]` data span (mirroring mgcv's `bs="cc"` and the
-/// 1-D cyclic fallback), instead of hard-erroring "periodic but requires an
+/// own observed `[min, max]` data span (like the 1-D cyclic fallback), instead of hard-erroring "periodic but requires an
 /// explicit period". The periodic-radial refactor (c8c3192fa) replaced that
 /// fallback with an unconditional `period=`-required error and orphaned the
 /// `margin_is_cc` binding that drives it (the #1776 dead-binding `-D
@@ -1067,7 +1075,7 @@ fn bare_doubly_cyclic_tensor_derives_period_from_data_range_1776() {
     );
 
     let parsed =
-        parse_formula("y ~ te(x, z, bs=c('cc','cc'))").expect("parse doubly-cyclic tensor formula");
+        parse_formula("y ~ te(x, z, bs=c('cyclic','cyclic'))").expect("parse doubly-cyclic tensor formula");
     let col_map = ds.column_map();
     let mut notes = Vec::new();
     // Must NOT hard-error: the bare cyclic margins derive their period from
@@ -1138,7 +1146,7 @@ fn parse_cylinder_periodic_options_match_requested_forms() {
 /// selectors and the other inert non-periodic markers, and still REJECT a
 /// genuine endpoint constraint like `anchored`. This locks the #415 /
 /// cylinder fix (`te(theta, z, boundary=['periodic','clamped'])`, mgcv
-/// `te(bs=c("cc","ps"))`) in the fast unit lane — the end-to-end cylinder
+/// `te(bs=c("cyclic","ps"))`) in the fast unit lane — the end-to-end cylinder
 /// recovery test is R-gated (`run_r` + mgcv), so without this the guard
 /// regressing back to rejecting `clamped` would slip through CPU CI.
 #[test]
@@ -1154,10 +1162,9 @@ fn tensor_boundary_tokens_accept_clamped_open_reject_anchored() {
     for raw in [
         "['periodic', 'clamped']",
         "['periodic', 'open']",
-        "['cc', 'clamped']",
         "['clamped', 'natural']",
         "[Periodic, CLAMPED]",
-        "c('cc', 'clamped')", // mgcv-style c(...) vector form round-trips
+        "c('periodic', 'clamped')", // c(...) vector form round-trips
     ] {
         assert!(
             boundary(raw, 2).is_ok(),
@@ -1233,7 +1240,7 @@ fn one_dimensional_bspline_accepts_boundary_periodic() {
 }
 
 #[test]
-fn univariate_smooth_accepts_mgcv_cubic_regression_aliases() {
+fn univariate_cr_smooth_recovers_its_null_space_by_default() {
     let ds = continuous_dataset(
         &["y", "x"],
         (0..32)
@@ -1245,9 +1252,9 @@ fn univariate_smooth_accepts_mgcv_cubic_regression_aliases() {
     );
     let col_map = ds.column_map();
 
-    for selector in ["cr", "cs"] {
+    for selector in ["cr"] {
         let formula = format!("y ~ s(x, bs='{selector}')");
-        let parsed = parse_formula(&formula).expect("parse cr/cs smooth");
+        let parsed = parse_formula(&formula).expect("parse cr smooth");
         let mut notes = Vec::new();
         let terms = build_termspec(
             &parsed.terms,
@@ -1276,7 +1283,7 @@ fn univariate_smooth_accepts_mgcv_cubic_regression_aliases() {
             &col_map,
             &mut notes,
         )
-        .expect("explicit cr/cs opt-out should build");
+        .expect("explicit cr opt-out should build");
         let SmoothBasisSpec::BSpline1D { spec, .. } = &terms.smooth_terms[0].basis else {
             panic!("bs='{selector}' must lower to a BSpline1D");
         };
@@ -1324,7 +1331,7 @@ fn non_intercept_linear_effects_default_to_null_recovery_with_explicit_opt_out()
     );
     for formula in [
         "y ~ linear(x)",
-        "y ~ constrain(x, min=0, max=2)",
+        "y ~ linear(x, min=0, max=2)",
         "y ~ nonnegative(x)",
         "y ~ nonpositive(x)",
     ] {
@@ -1650,8 +1657,12 @@ fn one_dimensional_duchon_length_scale_opts_into_hybrid_mode() {
     assert_eq!(spec.length_scale, Some(0.25));
 }
 
+/// A default 2-D Duchon is built at the provisioned low-rank default, the
+/// generic spatial count held to `10 · 3^(d - 1)` = 30 centers, and the
+/// standard workflow, whose loop grows it, starts it at the rate-derived pilot
+/// (#3149).
 #[test]
-fn multidimensional_duchon_default_uses_rate_derived_pilot_basis() {
+fn multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_pilot() {
     let ds = continuous_dataset(
         &["y", "x1", "x2"],
         (0..500)
@@ -1665,22 +1676,19 @@ fn multidimensional_duchon_default_uses_rate_derived_pilot_basis() {
     let parsed = parse_formula("y ~ duchon(x1, x2)").expect("parse");
     let col_map = ds.column_map();
     let mut notes = Vec::new();
-    let terms = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut notes,
-    )
-    .expect("build default 2D duchon termspec");
-    let SmoothBasisSpec::Duchon { spec, .. } = &terms.smooth_terms[0].basis else {
+    let terms = build_termspec(&parsed.terms, &ds, &col_map, &mut notes)
+        .expect("build default 2D duchon termspec");
+    let basis = &terms.smooth_terms[0].basis;
+    let SmoothBasisSpec::Duchon { spec, .. } = basis else {
         panic!("expected Duchon term");
     };
     let CenterStrategy::Auto(inner) = &spec.center_strategy else {
         panic!("expected auto center strategy");
     };
     let CenterStrategy::FarthestPoint { num_centers } = inner.as_ref() else {
-        panic!("expected farthest-point pilot centers, got {inner:?}");
+        panic!("expected farthest-point default centers, got {inner:?}");
     };
+    assert_eq!(*num_centers, 30, "the provisioned 2-D Duchon default is the low-rank 30");
     // The pilot is the polynomial null space plus the penalized resolution
     // rank at n=500 in 2-D — not a fixed per-dimension constant.
     let polynomial_cols = match spec.nullspace_order {
@@ -1688,7 +1696,69 @@ fn multidimensional_duchon_default_uses_rate_derived_pilot_basis() {
         DuchonNullspaceOrder::Linear => 3,
         DuchonNullspaceOrder::Degree(degree) => crate::basis::duchon_nullspace_dimension(2, degree),
     };
-    assert_eq!(*num_centers, starting_num_centers(500, 2, polynomial_cols));
+    assert_eq!(
+        crate::smooth::starting_resolution(basis, ds.values.view()),
+        Some(crate::smooth::AdaptiveResolution::Centers(starting_num_centers(
+            500,
+            2,
+            polynomial_cols
+        )))
+    );
+}
+
+/// #3149: the default `s(x)` is built at the provisioned default, adequate
+/// without growth, and only the standard workflow, whose loop grows it, starts
+/// it at its pilot: at n = 1000 the provisioned default is 8 internal knots (12
+/// cubic functions) and the pilot 2 (6).
+#[test]
+fn default_bspline_is_provisioned_and_the_loop_starts_it_at_its_pilot_3149() {
+    let n = 1_000;
+    let ds = continuous_dataset(
+        &["y", "x"],
+        (0..n)
+            .map(|i| {
+                let x = i as f64 / (n - 1) as f64;
+                vec![(6.0 * x).sin(), x]
+            })
+            .collect(),
+    );
+    let parsed = parse_formula("y ~ s(x)").expect("parse");
+    let mut notes = Vec::new();
+    let terms = build_termspec(&parsed.terms, &ds, &ds.column_map(), &mut notes)
+        .expect("default s(x)");
+    let basis = &terms.smooth_terms[0].basis;
+    let SmoothBasisSpec::BSpline1D { spec, .. } = basis else {
+        panic!("expected a 1-D B-spline");
+    };
+    let internal = match &spec.knotspec {
+        BSplineKnotSpec::Generate {
+            num_internal_knots, ..
+        }
+        | BSplineKnotSpec::Automatic {
+            num_internal_knots, ..
+        } => *num_internal_knots,
+        other => panic!("unexpected default knot spec {other:?}"),
+    };
+    assert_eq!(internal + spec.degree + 1, 12, "the provisioned default s(x) at n = 1000");
+    assert_eq!(
+        crate::smooth::starting_resolution(basis, ds.values.view()),
+        Some(crate::smooth::AdaptiveResolution::InternalKnots(
+            pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER)
+        ))
+    );
+    assert_eq!(pilot_internal_knots(n, DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER) + DEFAULT_BSPLINE_DEGREE + 1, 6);
+}
+
+/// The provisioned open B-spline default: `unique / 4` internal knots, held
+/// between 4 and 8.
+#[test]
+fn provisioned_internal_knots_follow_the_unique_value_rule() {
+    let few = Array1::from_iter((0..6).map(|v| v as f64));
+    assert_eq!(provisioned_internal_knots_for_column(few.view()), 4);
+    let many = Array1::from_iter((0..100).map(|v| v as f64));
+    assert_eq!(provisioned_internal_knots_for_column(many.view()), 8);
+    let boundary = Array1::from_iter((0..32).map(|v| v as f64));
+    assert_eq!(provisioned_internal_knots_for_column(boundary.view()), 8);
 }
 
 #[test]
@@ -2539,10 +2609,10 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
     // test drives, so probing them here would prove nothing about the arm.
     let structurally_inert = |kind: &str, key: &str| -> Option<&'static str> {
         match (kind, key) {
-            // `type`/`bs` select which arm runs at all; changing them builds
-            // a different smooth kind, which is what every other arm's row
-            // in this table already covers.
-            (_, "type" | "bs") => Some("selects the arm; covered by the other rows"),
+            // `bs` selects which arm runs at all; changing it builds a
+            // different smooth kind, which is what every other arm's row in
+            // this table already covers.
+            (_, "bs") => Some("selects the arm; covered by the other rows"),
             // `by=` is consumed by the `BySmooth` wrapper before the arm
             // dispatch (and `__by_col` is the engine-injected column index
             // that wrapper writes), so it never reaches the arm's options.
@@ -2627,12 +2697,12 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
                 | "anchor_right" | "right_anchor",
             ) => &["0.0"],
             // Sizes and orders.
-            (_, "k" | "basis_dim" | "basis-dim" | "basisdim") => &["6", "9"],
+            (_, "k") => &["6", "9"],
             (_, "centers") => &["6", "9"],
             (_, "knots") => &["13", "5"],
             (_, "knot_placement" | "knot-placement" | "knotplacement") => &["quantile"],
             (_, "degree") => &["2", "1"],
-            (_, "penalty_order" | "m") => &["1", "3"],
+            (_, "penalty_order") => &["1", "3"],
             (_, "l" | "l_max" | "l-max" | "lmax" | "max_degree" | "max-degree") => &["2", "1"],
             (_, "rank") => &["5"],
             (_, "order" | "nullspace_order") => &["3", "0"],
@@ -2662,7 +2732,6 @@ fn no_whitelisted_smooth_option_is_accepted_and_inert() {
             (_, "lazy_path") => &["true"],
             (_, "radians") => &["true"],
             (_, "units") => &["radians"],
-            (_, "kernel") => &["pseudo"],
             (_, "method") => &["harmonic"],
             (_, "path" | "pca_basis_path") => &["'/nonexistent/pca.npy'"],
             other => panic!(
@@ -3207,14 +3276,11 @@ fn random_effect_flavour_refuses_the_basis_options_it_cannot_honour_2791() {
 
     for (key, value) in [
         ("k", "9"),
-        ("basis_dim", "9"),
-        ("basisdim", "9"),
         ("knots", "5"),
         ("knot_placement", "quantile"),
         ("knotplacement", "quantile"),
         ("degree", "2"),
         ("penalty_order", "1"),
-        ("m", "1"),
         ("double_penalty", "false"),
     ] {
         let err = build(&format!("y ~ s(x, g, bs='re', {key}={value})"))
@@ -3226,12 +3292,13 @@ fn random_effect_flavour_refuses_the_basis_options_it_cannot_honour_2791() {
         );
     }
 
-    // The hyphenated aliases `basis-dim`/`knot-placement` are in the
+    // The hyphenated `knot-placement` is in the
     // whitelist but are not reachable through the formula grammar (a bare
     // `-` inside an option name does not lex), so they are not probed here.
     //
     // The paired positive: `bs='fs'` is a real penalized smooth, so the same
-    // keys build there. `knot_placement` is spelled three ways and `k` four;
+    // keys build there. `knot_placement` is spelled three ways and the basis
+    // size two (`k`, `knots`);
     // one representative of each family is enough to prove the refusal above
     // is about the flavour, not the spelling.
     for formula in [
@@ -3240,7 +3307,6 @@ fn random_effect_flavour_refuses_the_basis_options_it_cannot_honour_2791() {
         "y ~ s(x, g, bs='fs', knot_placement=quantile)",
         "y ~ s(x, g, bs='fs', degree=2)",
         "y ~ s(x, g, bs='fs', penalty_order=1)",
-        "y ~ s(x, g, bs='fs', m=1)",
         "y ~ s(x, g, bs='fs', double_penalty=false)",
     ] {
         build(formula).unwrap_or_else(|err| panic!("`{formula}` must build, got: {err}"));
@@ -3561,7 +3627,7 @@ fn tensor_smooth_uniform_k_is_capped_to_a_low_cardinality_margins_distinct_value
 
 #[test]
 fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
-    // `te(x1, x2, bs=c('tp','tp'), k=c(5,5))` is mgcv's per-margin tp tensor
+    // `te(x1, x2, bs=c('tps','tps'), k=c(5,5))` is a per-margin tps tensor
     // with per-margin basis sizes — a tensor product of two 1-D bases, each
     // of dimension 5. The list-valued `k=c(5,5)` is honored by
     // `parse_tensor_k_list`, producing one penalized B-spline margin per axis
@@ -3578,7 +3644,7 @@ fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
             })
             .collect(),
     );
-    let parsed = parse_formula("y ~ te(x1, x2, bs=c('tp','tp'), k=c(5,5))").expect("parse tensor");
+    let parsed = parse_formula("y ~ te(x1, x2, bs=c('tps','tps'), k=c(5,5))").expect("parse tensor");
     let col_map = ds.column_map();
     let mut notes = Vec::new();
     let terms = build_termspec(
@@ -3590,7 +3656,7 @@ fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
     .expect("build tensor terms with per-margin k");
     let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!(
-            "expected B-spline tensor when k=c(5,5) is supplied with bs=c('tp','tp'), got {:?}",
+            "expected B-spline tensor when k=c(5,5) is supplied with bs=c('tps','tps'), got {:?}",
             terms.smooth_terms[0].basis
         );
     };
@@ -3623,10 +3689,10 @@ fn tensor_all_tp_margins_with_per_margin_k_routes_to_bspline_tensor() {
 
 #[test]
 fn tensor_all_tp_margins_without_per_margin_k_builds_anisotropic_tensor() {
-    // `te(x1, x2, bs=c('tp','tp'))` is a tensor-product request and must
+    // `te(x1, x2, bs=c('tps','tps'))` is a tensor-product request and must
     // build a genuine anisotropic tensor product (one smoothing parameter
     // per margin), NOT a silently-substituted multi-D isotropic thin-plate
-    // radial smooth — that would be a different model (`s(x1,x2,bs='tp')`).
+    // radial smooth — that would be a different model (`s(x1,x2,bs='tps')`).
     // The routing is now consistent whether or not `k` is list-valued: a tp
     // margin vector always realizes each axis as a 1-D penalized B-spline
     // margin spanning the same per-axis thin-plate function space (#1082).
@@ -3639,7 +3705,7 @@ fn tensor_all_tp_margins_without_per_margin_k_builds_anisotropic_tensor() {
             })
             .collect(),
     );
-    let parsed = parse_formula("y ~ te(x1, x2, bs=c('tp','tp'))").expect("parse tensor");
+    let parsed = parse_formula("y ~ te(x1, x2, bs=c('tps','tps'))").expect("parse tensor");
     let col_map = ds.column_map();
     let mut notes = Vec::new();
     let terms = build_termspec(
@@ -3651,7 +3717,7 @@ fn tensor_all_tp_margins_without_per_margin_k_builds_anisotropic_tensor() {
     .expect("build tensor terms without per-margin k");
     let SmoothBasisSpec::TensorBSpline { spec, .. } = &terms.smooth_terms[0].basis else {
         panic!(
-            "te(...,bs=c('tp','tp')) must route to an anisotropic tensor product, not a \
+            "te(...,bs=c('tps','tps')) must route to an anisotropic tensor product, not a \
                  silent isotropic thin-plate substitution; got {:?}",
             terms.smooth_terms[0].basis
         );
@@ -4211,6 +4277,110 @@ fn by_level_thin_plate_sizes_default_centers_from_the_smallest_level() {
     );
 }
 
+/// #3179: the 1-D radial floor (#1867) is the basis dimension of the `s(x)`
+/// competing on the same rows and route. Under a categorical `by=` the pilot
+/// that spline starts from is sized from the smallest level, so the pilot
+/// floor, and with it the resolution loop's start of a by-level `duchon(x)`,
+/// must be too: sizing it from the pooled column length handed every by-level
+/// block the pooled spline's resolution, more than its own level supports. A
+/// route no loop grows keeps the provisioned default instead (#3149).
+#[test]
+fn by_level_radial_univariate_floor_sizes_from_the_smallest_level_3179() {
+    let n_a = 30usize;
+    let n_b = 30_000usize;
+    let n = n_a + n_b;
+    let rows: Vec<Vec<f64>> = (0..n)
+        .map(|i| {
+            let in_a = i < n_a;
+            let x = if in_a {
+                i as f64 / (n_a - 1) as f64
+            } else {
+                (i - n_a) as f64 / (n_b - 1) as f64
+            };
+            let g = if in_a { 0.0 } else { 1.0 };
+            vec![x + g, x, g]
+        })
+        .collect();
+    let ds = Dataset {
+        headers: vec!["y".into(), "x".into(), "g".into()],
+        values: Array2::from_shape_vec(
+            (rows.len(), 3),
+            rows.into_iter().flat_map(|row| row.into_iter()).collect(),
+        )
+        .expect("rectangular by-level test data"),
+        schema: DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "y".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "x".into(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: vec![],
+                },
+                SchemaColumn {
+                    name: "g".into(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".into(), "b".into()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    };
+    let ds_small = continuous_dataset(
+        &["y", "x"],
+        (0..n_a)
+            .map(|i| {
+                let x = i as f64 / (n_a - 1) as f64;
+                vec![x, x]
+            })
+            .collect(),
+    );
+    let start = |data: &Dataset, with_by: bool| -> Option<crate::smooth::AdaptiveResolution> {
+        let mut options = BTreeMap::new();
+        options.insert("bs".to_string(), "duchon".to_string());
+        if with_by {
+            options.insert("by".to_string(), "g".to_string());
+            options.insert("__by_col".to_string(), "2".to_string());
+        }
+        let mut notes = Vec::new();
+        let basis = build_smooth_basis(
+            SmoothKind::S,
+            &["x".to_string()],
+            &[1],
+            &options,
+            data,
+            &mut notes,
+        )
+        .unwrap_or_else(|e| panic!("s(x, bs=duchon) builds: {e}"));
+        crate::smooth::starting_resolution(&basis, data.values.view())
+    };
+    let col = ds.values.column(1);
+    let level_floor = pilot_univariate_spline_basis_dim(col, n_a);
+    let pooled_floor = pilot_univariate_spline_basis_dim(col, n);
+    // The fixture discriminates: the pooled pilot floor binds where the
+    // level's own does not, so pooled sizing would change the by-level start.
+    assert!(
+        pooled_floor > level_floor,
+        "fixture must separate the pooled floor {pooled_floor} from the level floor {level_floor}"
+    );
+    assert!(
+        start(&ds, true).is_some(),
+        "a default by-level duchon(x) is a resolution the loop grows"
+    );
+    assert_eq!(
+        start(&ds, true),
+        start(&ds_small, false),
+        "the loop must start a by-level duchon(x) where the smallest level's own starts"
+    );
+}
+
 /// A continuous `by=` smooth is a varying coefficient `f(x)·z` whose constant
 /// direction is `z` itself, so the inner smooth keeps its constant instead of
 /// being sum-to-zero centred: `f` is one penalised surface whose null-space
@@ -4311,7 +4481,9 @@ fn pilot_internal_knots_follow_the_resolution_rate_not_a_fixed_cap() {
     for (n, dim) in [(100usize, 5usize), (1_000, 6), (10_000, 9), (100_000, 12)] {
         let col = Array1::from_iter((0..n).map(|v| v as f64));
         assert_eq!(
-            pilot_internal_knots_for_column(col.view()) + DEFAULT_BSPLINE_DEGREE + 1,
+            pilot_internal_knots(col.len(), DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER)
+                + DEFAULT_BSPLINE_DEGREE
+                + 1,
             dim,
             "pilot s(x) dimension at n={n}"
         );
@@ -4355,7 +4527,7 @@ fn default_bspline_basis_dimension_is_capped_by_unique_covariate_values() {
         (internal + spec.degree + 1, spec.degree, spec.penalty_order)
     };
     // (unique, expected basis dimension, expected degree)
-    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 5, 3)] {
+    for (unique, dimension, degree) in [(2, 2, 1), (3, 3, 2), (4, 4, 3), (5, 5, 3), (16, 8, 3)] {
         let (got_dimension, got_degree, _) = dimension_of("y ~ s(x)", unique);
         assert_eq!(
             (got_dimension, got_degree),
@@ -4394,9 +4566,9 @@ fn canonical_penalty_partition_agrees_with_declared_nullity_across_families_2469
         "y ~ s(x, bs=ps, k=40)",
         "y ~ s(x, bs=ps, double_penalty=false)",
         "y ~ s(x, bs=cr)",
-        "y ~ s(x, bs=cc)",
-        "y ~ s(x, bs=tp)",
-        "y ~ s(x, z, bs=tp)",
+        "y ~ s(x, bs=cyclic)",
+        "y ~ s(x, bs=tps)",
+        "y ~ s(x, z, bs=tps)",
         "y ~ s(x, bs=duchon)",
         "y ~ s(x, z, bs=duchon)",
         "y ~ s(x, bs=matern)",
@@ -4533,8 +4705,8 @@ fn partition_owner_keeps_todays_ranks_where_they_are_correct_and_resolves_the_re
     let cases: Vec<(&Dataset, &str)> = vec![
         (&spatial, "y ~ s(x, bs=ps, k=40)"),
         (&spatial, "y ~ s(x, bs=cr, k=30)"),
-        (&spatial, "y ~ s(x, bs=cc, k=30)"),
-        (&spatial, "y ~ s(x, z, w, bs=tp)"),
+        (&spatial, "y ~ s(x, bs=cyclic, k=30)"),
+        (&spatial, "y ~ s(x, z, w, bs=tps)"),
         (&spatial, "y ~ duchon(x)"),
         (&spatial, "y ~ duchon(x, z)"),
         (&spatial, "y ~ s(x, bs=matern, nu=3/2)"),
@@ -5193,7 +5365,7 @@ fn domain_is_validated_against_the_data_and_its_own_shape() {
         ("te(x, z, domain=[[0, 1]])", "needs one [lower, upper] interval (or none) per margin"),
         ("te(x, z, domain=[[0, 1], [0.5, 1]])", "tensor margin 1"),
         ("cyclic(x, period=1, domain=[0, 1])", "period="),
-        ("s(x, bs=cc, period=1, domain=[0, 1])", "period="),
+        ("s(x, bs=cyclic, period=1, domain=[0, 1])", "period="),
     ] {
         let err = formula_error(&format!("y ~ {term}"), &ds);
         assert!(err.contains("in term"), "`{term}`: {err}");
@@ -5232,6 +5404,7 @@ fn prediction_design_matches_full_build_without_realizing_penalties() {
         _ => (i % 3) as f64,
     });
     for formula in [
+        "y ~ s(x) + g",
         "y ~ s(x) + s(z)",
         "y ~ x + s(x)",
         "y ~ s(x, double_penalty=true)",
@@ -5333,7 +5506,9 @@ fn term_prediction_columns_match_the_full_prediction_design() {
         1 | 2 => ((i * (j + 11)) % 37) as f64 / 36.0,
         _ => (i % 3) as f64,
     });
+    let mut random_effects_checked = 0;
     for formula in [
+        "y ~ s(x) + g",
         "y ~ s(x) + s(z)",
         "y ~ x + s(x)",
         "y ~ x + s(x) + s(z)",
@@ -5355,7 +5530,13 @@ fn term_prediction_columns_match_the_full_prediction_design() {
             .unwrap_or_else(|err| panic!("`{formula}` freeze: {err}"));
         let full = crate::smooth::build_term_collection_prediction_design(new_rows.view(), &frozen)
             .unwrap_or_else(|err| panic!("`{formula}` prediction design: {err}"));
-        for (name, range) in full.linear_ranges.iter().chain(&full.smooth_ranges) {
+        random_effects_checked += full.random_effect_ranges.len();
+        for (name, range) in full
+            .linear_ranges
+            .iter()
+            .chain(&full.random_effect_ranges)
+            .chain(&full.smooth_ranges)
+        {
             let columns =
                 crate::smooth::build_term_prediction_columns(new_rows.view(), &frozen, name)
                     .unwrap_or_else(|err| panic!("`{formula}` term {name}: {err}"));
@@ -5367,6 +5548,11 @@ fn term_prediction_columns_match_the_full_prediction_design() {
             );
         }
     }
+
+    assert!(
+        random_effects_checked > 0,
+        "the formulas must include a random-effect factor term"
+    );
 
     // `s(x)` reads nothing of `s(z)`, so a grid whose `z` the full build
     // rejects still evaluates it.
@@ -5454,7 +5640,7 @@ fn frozen_bspline_1d_design_is_built_without_its_penalties() {
         "y ~ s(x, double_penalty=true)",
         "y ~ s(x, bs=\"cr\")",
         "y ~ s(x, bs=\"cr\", double_penalty=true)",
-        "y ~ s(x, bs=\"cc\")",
+        "y ~ s(x, bs=\"cyclic\")",
         "y ~ s(x, shape=monotone_increasing)",
     ] {
         let spec = build_formula(formula, &train);
@@ -5645,7 +5831,7 @@ fn categorical_column_in_a_numeric_axis_term_is_rejected() {
         "y ~ s(g)",
         "y ~ linear(g)",
         "y ~ te(x, g)",
-        "y ~ s(g, bs=\"cc\")",
+        "y ~ s(g, bs=\"cyclic\")",
         "y ~ thinplate(x, g)",
         "y ~ matern(g)",
     ] {
@@ -5791,48 +5977,68 @@ fn factor_smooth_marginal_dim(spec: &FactorSmoothSpec) -> usize {
     }
 }
 
-/// #3264: the default `fs`/`sz` marginal is the univariate `s()` default on
-/// the least-informed group — the resolution-rate pilot of the smallest
-/// group's row count, held to the least per-group distinct-value support by
-/// the rank bound (a group with `u` distinct values identifies at most `u`
-/// marginal directions). The old rule subtracted two hand-set "residual
-/// points" from that support with a `degree + 2` floor, which both shrank a
-/// well-supported marginal below its pilot and, on a 4-value group, handed
-/// the marginal five functions the data could see only four of.
+/// #3264: the `fs`/`sz` marginal the standard workflow starts from is the
+/// univariate `s()` pilot on the least-informed group — the resolution-rate
+/// pilot of the smallest group's row count, held to the least per-group
+/// distinct-value support by the rank bound (a group with `u` distinct values
+/// identifies at most `u` marginal directions). The old rule subtracted two
+/// hand-set "residual points" from that support with a `degree + 2` floor,
+/// which both shrank a well-supported marginal below its pilot and, on a
+/// 4-value group, handed the marginal five functions the data could see only
+/// four of. The formula default itself is the provisioned pooled marginal
+/// (#3149), held to the same rank bound.
 #[test]
 fn factor_smooth_default_marginal_is_the_rank_bounded_group_pilot_3264() {
+    use crate::smooth::{AdaptiveResolution, starting_resolution};
     let degree = DEFAULT_BSPLINE_DEGREE;
     let order = DEFAULT_PENALTY_ORDER.min(degree);
+    let start_dim = |formula: &str, ds: &Dataset| -> (usize, usize) {
+        let col_map = ds.column_map();
+        let parsed = parse_formula(formula).expect("parse factor smooth formula");
+        let mut notes = Vec::new();
+        let terms = build_termspec(&parsed.terms, ds, &col_map, &mut notes)
+            .expect("build factor smooth term");
+        let basis = &terms.smooth_terms[0].basis;
+        let SmoothBasisSpec::FactorSmooth { spec } = basis else {
+            panic!("expected FactorSmooth basis for `{formula}`");
+        };
+        let Some(AdaptiveResolution::InternalKnots(knots)) =
+            starting_resolution(basis, ds.values.view())
+        else {
+            panic!("a default `{formula}` marginal is a resolution the loop grows");
+        };
+        (factor_smooth_marginal_dim(spec), knots + spec.marginal.degree + 1)
+    };
     for formula in ["y ~ s(x, g, bs=fs)", "y ~ s(x, g, bs=sz)"] {
-        // Every group resolves its pilot: the marginal is the pilot of the
-        // smallest group's rows, whatever the pooled column would get.
+        // Every group resolves its pilot: the start is the pilot of the
+        // smallest group's rows, whatever the pooled column would get. The
+        // provisioned default is the pooled 8 internal knots held at the
+        // provisioned 10-function marginal.
         let ds = two_group_factor_dataset((40, 40), (400, 400));
-        let spec = factor_smooth_spec_for(formula, &ds);
         assert_eq!(
-            factor_smooth_marginal_dim(&spec),
-            pilot_internal_knots(40, degree, order) + degree + 1,
-            "{formula}: well-supported marginal is the smallest group's pilot"
+            start_dim(formula, &ds),
+            (10, pilot_internal_knots(40, degree, order) + degree + 1),
+            "{formula}: well-supported marginal starts at the smallest group's pilot"
         );
 
         // A group with exactly as many distinct values as the pilot keeps the
-        // full pilot (the old `u − 2` rule cut it to five functions).
+        // full pilot (the old `u − 2` rule cut it to five functions); the
+        // rank bound holds the provisioned default to the same support.
         let pilot_dim = pilot_internal_knots(1_000, degree, order) + degree + 1;
         let ds = two_group_factor_dataset((1_000, pilot_dim), (1_000, 1_000));
-        let spec = factor_smooth_spec_for(formula, &ds);
         assert_eq!(
-            factor_smooth_marginal_dim(&spec),
-            pilot_dim,
+            start_dim(formula, &ds),
+            (pilot_dim, pilot_dim),
             "{formula}: marginal at the support bound keeps the pilot"
         );
 
         // A group with four distinct values bounds the marginal at four.
         let ds = two_group_factor_dataset((400, 4), (400, 400));
-        let spec = factor_smooth_spec_for(formula, &ds);
         assert_eq!(
-            factor_smooth_marginal_dim(&spec),
-            4,
+            start_dim(formula, &ds),
+            (4, 4),
             "{formula}: marginal is bounded by the least group support"
         );
-        assert_eq!(spec.marginal.degree, degree);
+        assert_eq!(factor_smooth_spec_for(formula, &ds).marginal.degree, degree);
     }
 }

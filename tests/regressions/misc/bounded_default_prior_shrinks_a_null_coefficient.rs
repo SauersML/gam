@@ -183,3 +183,65 @@ fn bounded_shrinkage_is_equivariant_in_the_units_of_the_response() {
         slope_scaled / UNITS
     );
 }
+
+/// An unpenalised bounded fit whose constrained optimum sits on a bound is the
+/// rail itself (gam#3289). The least-squares slope here is the noise's, about
+/// 0.035, so `bounded(x, min=1, max=3, prior=none)` has its box-constrained
+/// optimum at exactly `beta = min = 1`. The bounded term fits that coefficient
+/// on a logit chart, where the rail is at infinity, and the inner solve must
+/// certify the rail rather than return the fit unconverged.
+#[test]
+fn bounded_unpenalised_fit_certifies_an_optimum_on_the_rail() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let ols = ols_slope(&x, &y);
+    assert!(ols < 1.0, "non-vacuity: the least-squares slope {ols} must lie below the box");
+    let slope = bounded_slope("y ~ bounded(x, min=1, max=3, prior=none)", &data);
+    assert!(
+        (1.0..=3.0).contains(&slope),
+        "the railed slope must honour the box, got {slope}"
+    );
+    // What the railed fit publishes is not pinned here. On this fixture the
+    // unarmed fit certifies with the latent coordinate at its injective clamp
+    // `|logit| = ln(2/eps)`, where the Fisher information in that coordinate is
+    // about 1e-14. The certificate therefore reads the flat-latent posterior as
+    // improper, arms the Jeffreys term (#979), and the armed refit publishes
+    // 1.0076 rather than the constrained maximum-likelihood rail `min = 1` that
+    // docs/formulas.md promises for `prior=none`. That contract question is
+    // gam#3923, next to gam#3479 for `prior=uniform`.
+}
+
+/// A box that does not bind leaves the fit unconstrained, so on an unpenalised
+/// coefficient the box-constrained `linear(x, min, max)` route must return the `linear()` route's slope
+/// (#3339). Both solve the same two-column least-squares problem: the box is
+/// interior (the noise slope 0.03 sits deep inside `[-1, 1]`), and neither term
+/// carries a penalty. The constrained route used to refuse here: its
+/// constraint-KKT gate measured stationarity against `‖score‖ + ‖S_λβ‖`, and at
+/// an unpenalised interior optimum both vanish, so a fully converged fit read a
+/// relative stationarity residual of about 1.
+#[test]
+fn interior_constrain_box_on_an_unpenalised_slope_is_the_unconstrained_fit() {
+    init_parallelism();
+    let (x, y) = fixture();
+    let data = dataset(&x, &y);
+    let free = bounded_slope("y ~ linear(x, double_penalty=false)", &data);
+    let boxed = bounded_slope("y ~ linear(x, min=-1, max=1, double_penalty=false)", &data);
+    let ols = ols_slope(&x, &y);
+    // Every slope here solves the same two-column normal equations, whose
+    // right-hand side accumulates `n = 200` products of magnitude about 1: a
+    // rounding difference of order `n·ε ≈ 4e-14` there, divided by
+    // `Σ(x − x̄)² ≈ 67`, moves the slope by about 1e-15. The 1e-12 band sits
+    // three orders above that and ten orders below the slope itself.
+    // Non-vacuity: the unpenalised slope is the fixture's noise slope, well
+    // inside the box and well away from zero.
+    assert!(
+        (free - ols).abs() <= 1e-12 && free.abs() > 0.02 && free.abs() < 1.0,
+        "the unpenalised linear slope must be the least-squares slope {ols}, got {free}"
+    );
+    assert!(
+        (boxed - free).abs() <= 1e-12,
+        "an interior box on an unpenalised slope must not move it: boxed {boxed} against \
+         linear {free}"
+    );
+}

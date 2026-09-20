@@ -262,6 +262,16 @@ fn audit_converged_identifiability<F: CustomFamily + ?Sized>(
                 verdict.drift.recovered.join(", "),
             );
         }
+        if verdict.recovered_under_identity_gauge() {
+            log::debug!(
+                "[AUDIT-DRIFT] converged identifiability accepted a recovery on the identity \
+                 gauge: the fit ran every raw column, and convergence identifies rank {} where \
+                 the pilot identified {}; recovered=[{}]",
+                verdict.drift.current_rank,
+                verdict.drift.pilot_rank,
+                verdict.drift.recovered.join(", "),
+            );
+        }
         (verdict.drift, refuses, Some(pilot_gauge_rank))
     } else {
         let drift = gam_identifiability::audit::maybe_log_audit_drift(
@@ -2655,7 +2665,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let bfgs_step_cap = Some(FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β.
@@ -2851,18 +2860,25 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         )
         .with_gradient(cap_gradient)
         .with_hessian(hessian)
-        // #2359's optimize-3/certify-4 lifecycle (#2898). The exact Hessian stays
-        // declared, and the terminal mint requests `ValueGradientHessian` from
-        // that declaration whatever the search plan is. The search itself runs
-        // BFGS on the exact analytic gradient, so the order-five Jeffreys
-        // curvature (D²H_Φ, the completion pair correction, the third information
-        // derivative) is priced once at the certificate instead of on every ARC
-        // trial, rejected trials included. At 2f844874e on survival
-        // marginal-slope 160×6, ARC search took 178.2 s to V=264.68231024 with 11
-        // strict-saddle windows, and order five was 59-60% of that time;
-        // gradient-only search took 19.6 s to V=264.68203561 and minted (6,0,0)
-        // with λ_min=1.68e-4.
-        .with_prefer_gradient_only(true)
+        // #2359's optimize-3/certify-4 lifecycle (#2898), for an armed Jeffreys
+        // term only. The exact Hessian stays declared, and the terminal mint
+        // requests `ValueGradientHessian` from that declaration whatever the
+        // search plan is. With the term armed, the search runs BFGS on the exact
+        // analytic gradient, so the order-five Jeffreys curvature (D²H_Φ, the
+        // completion pair correction, the third information derivative) is
+        // priced once at the certificate instead of on every ARC trial, rejected
+        // trials included. At 2f844874e on survival marginal-slope 160×6, ARC
+        // search took 178.2 s to V=264.68231024 with 11 strict-saddle windows,
+        // and order five was 59-60% of that time; gradient-only search took
+        // 19.6 s to V=264.68203561 and minted (6,0,0) with λ_min=1.68e-4.
+        //
+        // An unarmed family has no order-five pieces, so that saving does not
+        // exist, and the exact-curvature search is the cheaper plan (#3306). On
+        // the unarmed binary Bernoulli marginal-slope fit (80,016 rows, p=81,
+        // 13 ρ), BFGS spent ~380 s per seed and ended in a line-search
+        // refusal, while ARC reached the certified value in 16-19 evaluations
+        // (~40-95 s).
+        .with_prefer_gradient_only(family.joint_jeffreys_term_required())
         // The mode-selection consumer below requires a certified local minimum,
         // not merely a stationary point whose raw negative curvature was cleared
         // by the generic gradient-residue floor. Declare that requirement before
@@ -2898,7 +2914,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
         .with_problem_size(n_obs, p_total.max(1))
         // Per-coordinate ρ domain (#2812): the interval on which each term's
@@ -2990,10 +3005,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         if matches!(order, OuterEvalOrder::Value) {
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3010,8 +3022,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
@@ -3086,10 +3100,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
         let starts = if force_cold {
-            ModeStarts {
-                incumbent: canonical_seed.as_ref(),
-                fixed: &fixed_starts,
-            }
+            outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
         } else {
             outer.mode_starts_for(rho)
         };
@@ -3130,6 +3141,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
+                // A cold evaluation's mode is served again at bitwise this θ (#3322).
+                if force_cold {
+                    outer.record_cold_mode(rho, canonical_seed.as_ref(), warm_start.clone());
+                }
                 outer.record_first_order_mode(warm_start.clone());
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_cache.as_ref(),
@@ -3249,10 +3264,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.last_criterion_rank = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3269,8 +3281,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
