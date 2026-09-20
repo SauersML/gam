@@ -11,7 +11,7 @@ penalty, so when the response is a constant plus noise REML should drive
 to the null-space dimension (~1), leaving a flat fit with no spurious harmonic
 wiggle.
 
-Root cause (#1366): the cyclic ``bs="cc"`` path shipped its
+Root cause (#1366): the cyclic ``bs="cyclic"`` path shipped its
 ``create_cyclic_difference_penalty_matrix`` wiggliness penalty un-normalized
 (``normalization_scale = 1.0``), and so did the periodic 1-D Duchon path
 (``build_cyclic_duchon_basis_1dwithworkspace``).

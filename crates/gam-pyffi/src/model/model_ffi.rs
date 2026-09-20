@@ -1694,6 +1694,19 @@ fn saved_model_kind(model_bytes: Vec<u8>) -> &'static str {
     "scalar"
 }
 
+/// Write a saved gamfit model's bytes to `path` through the one saved-model
+/// writer every surface shares (gam#3054): atomic, so a failed save leaves the
+/// previous file whole, and durable on Unix before it returns.
+#[pyfunction]
+fn write_saved_model_file(
+    py: Python<'_>,
+    path: std::path::PathBuf,
+    model_bytes: Vec<u8>,
+) -> PyResult<()> {
+    py.detach(move || gam_model_api::saved_model::write_saved_model(&path, &model_bytes))
+        .map_err(crate::ffi::ffi_errors::saved_document_error_to_pyerr)
+}
+
 #[pyfunction]
 fn build_extend_group_payload_json(
     spec_json: &str,
@@ -4658,9 +4671,9 @@ fn gaussian_reml_fit<'py>(
             x_values.nrows(),
         )
         .map_err(py_value_error)?;
-        // The closed form whitens by XᵀWX, so a design whose XᵀWX is singular
-        // (p > n, or rank-deficient) is refused with the engine's typed error
-        // rather than reported as a zero fit (gam#3310).
+        // A singular XᵀWX (p > n, or rank-deficient) is fit through the penalty
+        // pencil when the penalty identifies null(W½X) (gam#3366) and refused
+        // with the engine's typed error otherwise (gam#3310).
         gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
@@ -5764,6 +5777,10 @@ fn set_batched_gaussian_reml_dict_items<'py>(
         result.cache_coefficient_basis.into_pyarray(py),
     )?;
     out.set_item(
+        "cache_data_null_basis",
+        result.cache_data_null_basis.into_pyarray(py),
+    )?;
+    out.set_item(
         "cache_xtwx_fingerprints",
         result.cache_xtwx_fingerprints.into_pyarray(py),
     )?;
@@ -6017,7 +6034,8 @@ fn gaussian_reml_fit_positions<'py>(
             x.nrows(),
         )
         .map_err(py_value_error)?;
-        // A singular XᵀWX is refused with the engine's typed error (gam#3310).
+        // A singular XᵀWX is fit through the penalty pencil when the penalty
+        // identifies null(W½X) (gam#3366) and refused otherwise (gam#3310).
         let fit = gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
