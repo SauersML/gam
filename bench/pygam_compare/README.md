@@ -224,6 +224,15 @@ metric. Every loss is printed, and none is hidden or skipped.
   libraries are ok. A difference larger than 2 SE is a **LOSS** or a WIN.
   Anything smaller is "worse n.s." or "better n.s.". With a single seed there is
   no SE, so the sign alone decides, and the verdict says so.
+- **Coverage.** Calibration is judged on each library's mean coverage over the
+  paired seeds, `|mean cov - 0.95|`, not on per-seed `|cov - 0.95|`. One fit's
+  intervals move together with that fit's error, so even an exactly calibrated
+  interval scatters per seed, and a per-seed score would rank an interval that
+  over-covers every seed above it. Over-coverage is miscalibration, exactly
+  like under-coverage. Seed `s` contributes
+  `side_g (g_s - 0.95) - side_c (c_s - 0.95)`, with each side fixed at
+  `sign(mean - 0.95)`. These terms average to the mean-level difference, and
+  their spread gives its SE for the same 2 SE rule.
 - **Status.** If gamfit has fewer ok reps than the comparator in a cell, that is
   **LOSS(status)**. If the comparator reports a metric and gamfit does not, that
   is **LOSS(missing)**.

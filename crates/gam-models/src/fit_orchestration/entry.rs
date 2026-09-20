@@ -1161,6 +1161,11 @@ fn deterministic_gaussian_standard_fit(
         // `Z'X'WX Z` is the penalized Hessian itself.
         weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
+        // Exact fit ⇒ no working residual on any row that carries weight.
+        working_residual: Some(gam_terms::inference::smooth_score_test::WorkingResidual {
+            weighted_norm: 0.0,
+            rows: weights.iter().filter(|&&w| w > 0.0).count(),
+        }),
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
         coefficient_gauge,

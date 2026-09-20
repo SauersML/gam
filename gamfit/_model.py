@@ -803,14 +803,14 @@ class Model:
         :math:`\\nu` and ``reference_scale`` :math:`g` (the two-moment summary),
         ``reference_residual_df``/``reference_deterministic_offset`` (the
         estimated-scale channel above, ``None`` off the profiled Gaussian),
-        ``bartlett_factor``
-        :math:`c`, ``statistic_corrected`` :math:`W^*`, ``p_value_uncorrected``,
+        ``bartlett_factor`` :math:`c` (the fixed-λ Lawley scale),
+        ``statistic_corrected`` :math:`W^* = W/c`, ``p_value_uncorrected``,
         ``p_value_corrected`` (the raw evaluated tail behind ``p_value`` /
         ``p_value_upper_bound``), ``material`` (the
         n-too-small-here diagnostic — ``True`` when the correction moves the
         Bartlett factor or the p-value by more than 10%), and
-        ``correction_provenance`` — ``"lawley_lr_estimated_lambda"`` or
-        ``"lawley_lr_fixed_lambda"`` when the family carries
+        ``correction_provenance`` — ``"lawley_lr_fixed_lambda"`` when the
+        family carries
         closed-form cumulant jets (gaussian / poisson / binomial / gamma) and the
         factor is computable at this ``n``, else
         ``"none"`` (the uncorrected reference stands, never weakened).
