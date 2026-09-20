@@ -1,7 +1,7 @@
 //! #2754: the transformation-normal entry points REACH the measure-jet range
-//! resolver — asserted on the reaching, not on the fit that follows it.
+//! resolver, and the fit that follows converges.
 //!
-//! ## What is being pinned, and why not end to end
+//! ## What is being pinned
 //!
 //! `length_scale == 0.0` is an unresolved representer range with two resolvers
 //! in the tree — the basis builder's pure-geometry median-nearest-node rule and
@@ -12,23 +12,20 @@
 //! `f64` equality of the realized range against a standard fit on the same
 //! response.
 //!
-//! CTN cannot be gated that way today, and the reason is not this lane's. On a
-//! near-noiseless Gaussian response the outer search rails at the box floor and
-//! declines to mint a fit (`NOT STATIONARY (|Pg| = 4.224e-1 > 3.493e-2)`,
-//! `railed = [0, 1, 2, 3]`), legitimately: a `p_resp × p_cov` tensor can
-//! interpolate a smooth surface at that noise level. On a right-skewed positive
-//! response — the shape CTN exists for — it refuses in the inner solve instead
-//! (`physical reduced-face first-order KKT failed`,
-//! `projected_residual_inf = 5.99` against `6.2e-3`), which is the gam#2600
-//! refusal class, open and not about ranges at all.
+//! That sibling's near-noiseless Gaussian response is not a CTN fixture: there
+//! the outer search rails at the box floor and declines to mint a fit,
+//! legitimately, because a `p_resp × p_cov` tensor can interpolate a smooth
+//! surface at that noise level. This fixture is a log-normal response — the
+//! right-skewed positive shape CTN exists for — on which the model is
+//! identified, so the fit must converge to a transformation-normal model. It
+//! once refused in the inner solve (`physical reduced-face first-order KKT
+//! failed`, the gam#2600 refusal class); #2600 is closed at its root cause (the
+//! untruncated `φ(h)·h′` likelihood is convex and coercive), so a refusal here
+//! is a defect.
 //!
-//! Tying a range-resolver gate to an open refusal class in another subsystem
-//! would make it red for a reason it does not measure. So this pins the claim
-//! that is actually being made — *the resolver is REACHED from this entry
-//! point* — at the moment it is reached: the screen runs before the design is
-//! built and logs what it resolved, so the record exists whether or not the fit
-//! that follows converges. The day gam#2600 lifts, the sibling gate's exact
-//! equality assertion is the stronger statement to add here.
+//! The screen runs before the design is built and logs what it resolved, so
+//! the resolver's reaching is asserted on that record, independently of the
+//! fit.
 //!
 //! ## Why this is its own test binary
 //!
@@ -37,7 +34,9 @@
 //! eagerly, so a logger installed by one test silently taxes every other test in
 //! the same process — `measure_jet`'s target carries a wall-clock speed gate.
 
-use gam::{FitConfig, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
+use gam::{
+    FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
+};
 use gam::utils::splitmix64;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -119,23 +118,24 @@ fn transformation_normal_entry_reaches_the_measure_jet_range_screen_2754() {
         ..FitConfig::default()
     };
 
-    // The fit's outcome is deliberately not asserted (see the module docs): what
-    // is asserted is that the resolver ran before the design was built. Its
-    // result is reported either way so a future reader can see which arm of
-    // gam#2600 this fixture is in today.
-    match fit_from_formula(
+    let fit = fit_from_formula(
         "w ~ mjs(x1, x2, centers=10, learn_length_scale=false)",
         &ds,
         &config,
-    ) {
-        Ok(_) => println!("[2754-ctn] the CTN fit converged on this fixture"),
-        Err(e) => println!(
-            "[2754-ctn] the CTN fit declined (not asserted here): {}",
-            e.to_string().chars().take(220).collect::<String>()
+    );
+    let screened = SCREENED_RECORDS.load(Ordering::Relaxed);
+    match fit {
+        Ok(FitResult::TransformationNormal(_)) => {}
+        Ok(_) => panic!(
+            "a transformation-normal config returned a fit of another family on a log-normal \
+             response (screen records: {screened})"
+        ),
+        Err(e) => panic!(
+            "the transformation-normal fit refused a log-normal response, the shape CTN exists \
+             for and on which its model is identified (screen records: {screened}): {e}"
         ),
     }
 
-    let screened = SCREENED_RECORDS.load(Ordering::Relaxed);
     assert!(
         screened >= 1,
         "the transformation-normal entry point built its covariate design without reaching the \
