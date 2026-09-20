@@ -135,32 +135,23 @@ pub fn prepare_survival_time_stack(
     // Each penalty is seeded against the columns it acts on. The time design's
     // wiggle tail is a zero placeholder, because the family evaluates the warp
     // dynamically, so a wiggle penalty is seeded against the warp's Jacobian at
-    // the baseline predictor, B(h₀(t_exit)).
+    // the baseline predictor, B(h₀(t_exit)). The marginal-slope family seeds its
+    // time block through the same two functions (#3061).
     let time_initial_log_lambdas = if time_penalties.is_empty() {
         None
     } else {
-        let mut seeds = if time_build.penalties.is_empty() {
-            Vec::new()
-        } else {
-            crate::survival::marginal_slope::block_log_lambda_seeds(
-                &time_build.x_exit_time,
-                time_build.penalties.iter(),
-            )?
-        };
-        if let Some(wiggle) = timewiggle_build.as_ref() {
-            let warp_jacobian_exit = gam_linalg::matrix::DesignMatrix::from(
-                crate::wiggle::monotone_wiggle_basis_from_knots(
-                    eta_offset_exit.view(),
-                    &wiggle.knots,
-                    wiggle.degree,
-                )?,
-            );
-            seeds.extend(crate::survival::marginal_slope::block_log_lambda_seeds(
-                &warp_jacobian_exit,
-                wiggle.penalties.iter(),
-            )?);
-        }
-        Some(Array1::from_vec(seeds))
+        let acting_exit = crate::survival::marginal_slope::time_block_acting_exit_design(
+            &time_design_exit,
+            eta_offset_exit.view(),
+            timewiggle_block.as_ref(),
+        )?;
+        Some(Array1::from_vec(
+            crate::survival::marginal_slope::time_block_log_lambda_seeds(
+                &acting_exit,
+                &time_penalties,
+                timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
+            )?,
+        ))
     };
     Ok(PreparedSurvivalTimeStack {
         eta_offset_entry,

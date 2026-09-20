@@ -452,3 +452,53 @@ fn anchored_flex_row_matches_finite_differences_2948() {
         }
     }
 }
+
+/// gam#2926: the survival moving-law certificate scores every arm at the anchor the
+/// fit used, the intercept its family solves on its own law. On a rigid family
+/// anchored on the skewed law, scoring the rows against that same law therefore
+/// returns each anchor's own marginal identity `Σ_k w_k Φ(−η_k) = Φ(−q)`, at the exit
+/// and at the entry. The closed-form intercept the certificate used to read on a
+/// rigid row misses that identity on this law by a measurable margin, which is
+/// what this pin tells apart.
+#[test]
+fn the_moving_law_certificate_scores_a_rigid_row_at_its_fitted_laws_anchor_2926() {
+    let law = skewed_grid();
+    let rigid = SurvivalMarginalSlopeFamily {
+        score_warp: None,
+        link_dev: None,
+        ..anchored_on(&gaussian_flex_family(), &law)
+    };
+    let (beta_h, beta_w) = warp_and_deviation(&gaussian_flex_family(), 0.0);
+    let states = block_states(&rigid, 0.25, &beta_h, &beta_w)[..3].to_vec();
+    let fitted = EmpiricalZGrid::new(law.nodes.clone(), law.weights.clone(), "gam#2926 test law")
+        .expect("a valid finite law");
+    let scale = rigid.probit_frailty_scale();
+    for row in ROWS {
+        let values = rigid.row_dynamic_q_values(row, &states).expect("row q");
+        let slope = states[2].eta[row];
+        let anchors = rigid
+            .moving_law_certificate_anchors(row, row, &states, &fitted)
+            .expect("the certificate's anchors");
+        for ((log_survival, _), q) in anchors.into_iter().zip([values.q1, values.q0]) {
+            let target = crate::probability::normal_logcdf(-q);
+            assert!(
+                (log_survival - target).abs() <= 1e-8,
+                "row {row}, q={q}: ln S = {log_survival:.17e} against the anchor's identity \
+                 ln Φ(−q) = {target:.17e}"
+            );
+            let observed = scale * slope;
+            let (closed_form, _) = crate::bms::estimated_latent_law::survival_anchor_log_probabilities(
+                q * (1.0 + observed * observed).sqrt(),
+                observed,
+                &fitted,
+            )
+            .expect("closed-form anchor probabilities");
+            assert!(
+                (closed_form - target).abs() > 1e-5,
+                "fixture invariant: the closed form must miss this law's identity, or the pin \
+                 cannot tell the anchors apart; row {row}, miss {:.3e}",
+                (closed_form - target).abs()
+            );
+        }
+    }
+}

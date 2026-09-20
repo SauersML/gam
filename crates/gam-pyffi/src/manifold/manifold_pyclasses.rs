@@ -53,7 +53,7 @@ impl EuclideanManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dim = descriptor_dimension("EuclideanManifold.dim", self.dim)?;
-        json_value_to_py(py, ManifoldSpec::Euclidean(dim).descriptor())
+        json_value_to_py(py, &ManifoldSpec::Euclidean(dim).descriptor())
     }
 }
 
@@ -81,7 +81,7 @@ impl CircleManifold {
     }
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
-        json_value_to_py(py, ManifoldSpec::Circle.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Circle.descriptor())
     }
 }
 
@@ -121,7 +121,7 @@ impl SphereManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let intrinsic_dim = descriptor_dimension("SphereManifold.intrinsic_dim", self.intrinsic_dim)?;
-        json_value_to_py(py, ManifoldSpec::Sphere { intrinsic_dim }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Sphere { intrinsic_dim }.descriptor())
     }
 }
 
@@ -161,7 +161,7 @@ impl TorusManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let dim = descriptor_dimension("TorusManifold.dim", self.dim)?;
-        json_value_to_py(py, ManifoldSpec::Torus { dim }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Torus { dim }.descriptor())
     }
 }
 
@@ -248,7 +248,7 @@ impl GrassmannManifold {
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let k = descriptor_dimension("GrassmannManifold.k", self.k)?;
         let n = descriptor_dimension("GrassmannManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Grassmann { k, n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Grassmann { k, n }.descriptor())
     }
 }
 
@@ -302,7 +302,7 @@ impl StiefelManifold {
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let k = descriptor_dimension("StiefelManifold.k", self.k)?;
         let n = descriptor_dimension("StiefelManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Stiefel { k, n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Stiefel { k, n }.descriptor())
     }
 }
 
@@ -330,7 +330,7 @@ impl SpdManifold {
 
     fn to_json(&self, py: Python<'_>) -> PyResult<PyObject> {
         let n = descriptor_dimension("SpdManifold.n", self.n)?;
-        json_value_to_py(py, ManifoldSpec::Spd { n }.descriptor())
+        json_value_to_py(py, &ManifoldSpec::Spd { n }.descriptor())
     }
 }
 

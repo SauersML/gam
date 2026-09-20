@@ -4,6 +4,7 @@ use crate::fnv1a::Fnv1a;
 use crate::latent_anchor::{
     AnchorGrid, AnchorGridOwned, AnchorRootCache, AnchorRowContext, AnchorSolveCounts,
 };
+use crate::wiggle::WarpKnotEnds;
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
@@ -500,11 +501,13 @@ pub(super) struct ThetaHints {
     pub(super) link_dev_beta: Option<Array1<f64>>,
 }
 
+/// The score warp is evaluated at the data's `z` and the latent grid's fixed
+/// nodes, which no β moves, so a clamped end's multiplicity is never crossed.
 pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
+    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg, WarpKnotEnds::Clamped)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -585,18 +588,29 @@ pub(super) fn require_probit_marginal_slope_link(
     }
 }
 
+/// The link deviation is evaluated at `a + b·z`, which moves with β at every
+/// observed row and every calibration node, so its ends are simple: on a
+/// clamped vector each index crossing a support end steps the objective's
+/// gradient, and the inner Newton cannot certify a mode that sits on one
+/// (gam#3011).
 pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(knot_seed, design_seed, cfg)
+    build_deviation_block_from_knots_and_design_seed(
+        knot_seed,
+        design_seed,
+        cfg,
+        WarpKnotEnds::Simple,
+    )
 }
 
 pub(super) fn build_deviation_block_from_knots_and_design_seed(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
+    ends: WarpKnotEnds,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
@@ -605,14 +619,22 @@ pub(super) fn build_deviation_block_from_knots_and_design_seed(
         ));
     }
     let penalty_orders = resolve_deviation_operator_orders(cfg)?;
-    // Clamped ends: the BMS anchored-cubic SAVED-MODEL replay reconstructs the
-    // deviation on that convention, so its knots cannot move before it reads the
-    // ramp definition (gam#2695).
-    let knots = gam_terms::basis::initializewiggle_knots_from_seed(
-        knot_seed.view(),
-        cfg.degree,
-        cfg.num_internal_knots,
-    )?;
+    // A saved model replays its frozen span tables, not these knots, so either
+    // end convention replays exactly.
+    let knots = match ends {
+        // The seed range's spans, continued by `degree` spans past each end, so
+        // every ramp settles C2 outside the range the data occupy.
+        WarpKnotEnds::Simple => gam_terms::basis::monotone_warp_knots_from_seed(
+            knot_seed.view(),
+            cfg.degree,
+            cfg.num_internal_knots,
+        )?,
+        WarpKnotEnds::Clamped => gam_terms::basis::initializewiggle_knots_from_seed(
+            knot_seed.view(),
+            cfg.degree,
+            cfg.num_internal_knots,
+        )?,
+    };
     // The smoothness-null-space drop must remove the union of null spaces
     // across all configured penalties, which (for nested null spaces of
     // increasing-order derivative penalties) equals the largest order's

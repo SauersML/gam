@@ -220,14 +220,14 @@ fn whitened_metric_engages_normalized_gls_coordinate_read_2021() {
     let (mut term_w, mut rho_w) = build_circle_term(&evaluator, n, p, t_start);
     term_w.set_row_metric(metric).unwrap();
     term_w
-        .run_fixed_decoder_arrow_schur(target.view(), &mut rho_w, None, 300, 1.0, 1e-9)
+        .run_fixed_decoder_arrow_schur(target.view(), &mut rho_w, None, 1e-9)
         .expect("whitened frozen-decoder read");
     let t_white = term_w.assignment.coords[0].row(0)[0].rem_euclid(1.0);
 
     // --- Naive solve: no metric installed (isotropic path). ---
     let (mut term_i, mut rho_i) = build_circle_term(&evaluator, n, p, t_start);
     term_i
-        .run_fixed_decoder_arrow_schur(target.view(), &mut rho_i, None, 300, 1.0, 1e-9)
+        .run_fixed_decoder_arrow_schur(target.view(), &mut rho_i, None, 1e-9)
         .expect("naive frozen-decoder read");
     let t_naive = term_i.assignment.coords[0].row(0)[0].rem_euclid(1.0);
 

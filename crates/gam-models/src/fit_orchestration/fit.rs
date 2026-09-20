@@ -129,10 +129,15 @@ fn resolved_wiggle_inverse_link(
 /// Jeffreys penalty enabled without duplicating the dispatch.
 type StandardBaseFit = crate::fit_orchestration::drivers::FittedTermCollectionWithSpec;
 
+///
+/// `realized_design` is the design already realized from `request.spec`,
+/// `request.data` and `options.resource_policy`, when a caller holds one. Only
+/// the spatial dispatch below can fit on it; the others realize their own.
 fn fit_standard_base(
     request: &StandardFitRequest<'_>,
     family: &LikelihoodSpec,
     options: &FitOptions,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardBaseFit, gam_solve::estimate::EstimationError> {
     if let Some(latent_coord) = request.latent_coord.as_ref() {
         if !request.coefficient_groups.is_empty() || !request.penalty_block_gamma_priors.is_empty()
@@ -180,7 +185,7 @@ fn fit_standard_base(
             },
         )
     } else {
-        fit_term_collectionwith_spatial_length_scale_optimization(
+        fit_term_collectionwith_spatial_length_scale_optimization_on_design(
             request.data.view(),
             request.y.as_ref().clone(),
             request.weights.as_ref().clone(),
@@ -189,6 +194,7 @@ fn fit_standard_base(
             family.clone(),
             options,
             &request.kappa_options,
+            realized_design,
         )
     }
 }
@@ -488,7 +494,17 @@ mod standard_convergence_gate_tests {
 }
 
 pub(crate) fn fit_standard_model(
+    request: StandardFitRequest<'_>,
+) -> Result<StandardFitResult, FitFailure> {
+    fit_standard_model_on_design(request, None)
+}
+
+/// [`fit_standard_model`] handed the design an earlier stage realized from
+/// this request's `spec`, `data` and `options.resource_policy` (the exact
+/// Gaussian boundary certificate realizes it before refusing the request).
+pub(crate) fn fit_standard_model_on_design(
     mut request: StandardFitRequest<'_>,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<StandardFitResult, FitFailure> {
     if request.estimate_tweedie_p {
         return Err(FitFailure::raised(
@@ -529,6 +545,9 @@ pub(crate) fn fit_standard_model(
              the response before the standard-fit dispatch"
         );
     }
+    // A screened range is a different spec from the one the handed design was
+    // realized from.
+    let realized_design = realized_design.filter(|_| seeded == 0);
 
     // #1762/#2273: a separated binomial design has no finite maximum
     // likelihood, on every binomial link. The Jeffreys prior |I(β)|^½ bounds
@@ -549,7 +568,7 @@ pub(crate) fn fit_standard_model(
     // declined before solving because the Firth outer derivative does not
     // define their appended link coordinates (#2654).
     let is_firth_capable_binomial = request.family.supports_firth();
-    let base = fit_standard_base(&request, &request.family, &request.options);
+    let base = fit_standard_base(&request, &request.family, &request.options, realized_design);
     let fitted = match base {
         Ok(fitted) => fitted,
         Err(original_error) => {
@@ -565,7 +584,7 @@ pub(crate) fn fit_standard_model(
             let original_report = original_error.to_string();
             let mut firth_options = request.options.clone();
             firth_options.firth_bias_reduction = true;
-            let firth = fit_standard_base(&request, &request.family, &firth_options);
+            let firth = fit_standard_base(&request, &request.family, &firth_options, None);
             let firth_failure = firth.as_ref().err().map(ToString::to_string);
             match certified_retry_or_original(original_error, firth) {
                 Ok(mut firth_fitted) => {
@@ -616,16 +635,14 @@ pub(crate) fn fit_standard_model(
         }
     };
 
-    let adaptive_spatial_terms = adaptive_spatial_term_mask(&request.spec);
-    let adaptive_spatial_center_counts = adaptive_spatial_center_counts(&request.spec);
+    let adaptive_bases = adaptive_bases(&request.spec);
     let result = StandardFitResult {
         saved_link_state: fitted.fit.fitted_link.clone(),
         fit: fitted.fit,
         design: fitted.design,
         resolvedspec: fitted.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms: adaptive_spatial_terms.clone(),
-        adaptive_spatial_center_counts: adaptive_spatial_center_counts.clone(),
+        adaptive_bases: adaptive_bases.clone(),
         kappa_timing: fitted.kappa_timing,
         wiggle_knots: None,
         wiggle_degree: None,
@@ -746,8 +763,7 @@ pub(crate) fn fit_standard_model(
         design: solved.design,
         resolvedspec: solved.resolvedspec,
         basis_adequacy: Vec::new(),
-        adaptive_spatial_terms,
-        adaptive_spatial_center_counts,
+        adaptive_bases,
         kappa_timing: result.kappa_timing,
         wiggle_knots: Some(solved.wiggle_knots),
         wiggle_degree: Some(solved.wiggle_degree),
@@ -1443,6 +1459,17 @@ pub(crate) fn rescale_gaussian_location_scale_to_raw_with_units(
         }
         if let Some(se) = inference.factorized_standard_errors.as_mut() {
             for (value, &factor) in se.iter_mut().zip(row_factors.iter()) {
+                *value *= factor;
+            }
+        }
+        // The factorized branch's correction `C = B·Bᵀ` takes `D·C·D`, so its
+        // factor's rows scale like the coefficients, as do its corrected
+        // standard errors (#3283).
+        if let Some(factorized) = inference.smoothing_correction_factorized.as_mut() {
+            for (mut row, &factor) in factorized.factor.rows_mut().into_iter().zip(row_factors.iter()) {
+                row *= factor;
+            }
+            for (value, &factor) in factorized.standard_errors.iter_mut().zip(row_factors.iter()) {
                 *value *= factor;
             }
         }
@@ -2536,6 +2563,7 @@ fn survival_unified_fit_result(
         reparam_qs: None,
         dispersion: gam_solve::estimate::Dispersion::UNIT,
         factorized_standard_errors: None,
+        smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence: None,
         weighted_gram: None,

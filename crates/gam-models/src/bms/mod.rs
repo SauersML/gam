@@ -2711,8 +2711,10 @@ pub(crate) fn build_latent_measure_decision(
                 .to_string()
             })?;
             // The law moves, so it is chosen among nested arms by the moving-law
-            // certificate at the converged fit. The fit starts on the simplest arm
-            // that follows a moving mean and variance.
+            // certificate at the converged fit. The fit starts on the simplest
+            // admissible arm that follows a moving mean and variance: the
+            // location-scale Gaussian law only if its residual passes the adequacy
+            // screen.
             let a_block = conditioning.ok_or_else(|| {
                 format!(
                     "{context}: the conditional-law evidence moved without a marginal-index span \
@@ -2725,6 +2727,7 @@ pub(crate) fn build_latent_measure_decision(
                 a_block,
                 local,
                 grid_size,
+                policy,
                 evidence.clone(),
                 context,
             )

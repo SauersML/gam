@@ -146,6 +146,9 @@ pub use honest::{
     honest_full_conformal,
 };
 
+#[cfg(test)]
+mod test_support;
+
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /
 /// high-leverage regimes).
@@ -398,9 +401,8 @@ impl ExactGaussianFullConformal {
     }
 }
 
-/// Wilkinson growth for the response's arithmetic — the operation count `eval`
-/// charges its gradient band at, shared with [`honest`] so both bands are the
-/// same statement about the same arithmetic.
+/// Wilkinson growth for the Gaussian REML response's arithmetic: the factor
+/// [`honest`] charges against every magnitude sum.
 ///
 /// The `p`-terms count the Cholesky of `A(λ)`, its solves and its traces. The
 /// `n`-terms count the residual sums the penalized RSS is formed from (#2280):
@@ -409,29 +411,6 @@ fn response_solve_growth(n: usize, p: usize) -> f64 {
     gam_linalg::roundoff::accumulation_growth(
         2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n,
     )
-}
-
-/// `(Σ_i r_i², Σ_i r_i² + 2·|r_i|·s_i)` over the residuals `r_i = y_i − x_iᵀβ`,
-/// with `s_i = |y_i| + Σ_j |x_ij·β_j|`.
-///
-/// A residual is a difference, so it rounds against the magnitudes it cancelled,
-/// `u·s_i`, not against itself, and its square carries `2·|r_i|` times that. The
-/// second value is the scale that rounding is charged against (#2280).
-fn residual_sum_of_squares(x: &Array2<f64>, y: &Array1<f64>, beta: &Array1<f64>) -> (f64, f64) {
-    let mut total = 0.0;
-    let mut scale = 0.0;
-    for (row, &response) in x.rows().into_iter().zip(y.iter()) {
-        let mut fitted = 0.0;
-        let mut cancelled = response.abs();
-        for (&entry, &coefficient) in row.iter().zip(beta.iter()) {
-            fitted += entry * coefficient;
-            cancelled += (entry * coefficient).abs();
-        }
-        let residual = response - fitted;
-        total += residual * residual;
-        scale += residual * residual + 2.0 * residual.abs() * cancelled;
-    }
-    (total, scale)
 }
 
 /// `L⁻¹·B` for a lower-triangular `L`, by forward substitution.
@@ -464,372 +443,6 @@ fn solve_lower_triangular_transposed(lower: &Array2<f64>, b: &Array2<f64>) -> Ar
         }
     }
     out
-}
-
-/// Closed-form Gaussian-REML smoothing-parameter response for the
-/// single-penalty model `Sλ = λ S` (`ρ = log λ`).
-///
-/// # Why this object exists
-///
-/// Layer 1 ([`ExactGaussianFullConformal`]) holds ρ fixed, but the Gaussian
-/// fitting map re-selects ρ̂ by REML on whatever data it sees, including the
-/// augmented row `(x_*, z)`. [`honest`] computes that map's set without ever
-/// evaluating `ρ̂(z)` pointwise; this object evaluates it pointwise, one REML
-/// problem per candidate, which is what an independent oracle for [`honest`]
-/// needs.
-///
-/// # The closed forms (single penalty `Sλ = λ S`)
-///
-/// Augmented penalized least squares with the test row included:
-///
-/// ```text
-///   A(λ)   = XᵀX + x_* x_*ᵀ + λ S         (independent of z)
-///   c(z)   = Xᵀy + x_* z ,  β̂ = A(λ)⁻¹ c(z) = a + b z   (affine in z)
-///   D(ρ,z) = ‖y_aug‖² − c(z)ᵀ A(λ)⁻¹ c(z)              (penalized RSS)
-/// ```
-///
-/// The Gaussian REML criterion to MINIMIZE over ρ (σ² profiled out, additive
-/// constants dropped; `M₀ = nullity(S)`, `r = rank(S)`, `n_eff = n (+1` if the
-/// test row is present`)`):
-///
-/// ```text
-///   Ṽ(ρ,z) = (n_eff − M₀) · log D(ρ,z) + log|A(λ)| − r ρ
-/// ```
-///
-/// Its z- and ρ-derivatives are all closed form (`pen = λ β̂ᵀSβ̂`):
-///
-/// ```text
-///   ∂D/∂ρ = pen ,                ∂D/∂z = 2(z − x_*ᵀβ̂) = 2 r_*
-///   G    = ∂Ṽ/∂ρ      = (n_eff−M₀)·pen/D + λ tr(A⁻¹S) − r
-///   ∂²Ṽ/∂ρ²           = (n_eff−M₀)·(pen'·D − pen²)/D² + λ tr(A⁻¹S) − λ² tr((A⁻¹S)²)
-/// ```
-///
-/// with `pen' = pen − 2λ²·β̂ᵀS A⁻¹ S β̂`.
-///
-/// Everything is assembled from ONE Cholesky of `A(λ)` plus a handful of
-/// solves.
-pub struct GaussianRemlRhoResponse<'a> {
-    x: &'a Array2<f64>,
-    y: &'a Array1<f64>,
-    s: &'a Array2<f64>,
-    x_star: &'a Array1<f64>,
-    n: usize,
-    p: usize,
-    rank_s: usize,
-    xtx: Array2<f64>,
-    xty: Array1<f64>,
-    rho_domain: (f64, f64),
-    augmented_rho_domain: (f64, f64),
-}
-
-/// One closed-form evaluation of the (possibly augmented) Gaussian REML
-/// criterion at `ρ = log λ`, carrying the derivatives the ρ search uses.
-#[derive(Clone, Debug)]
-struct RemlEval {
-    /// `Ṽ(ρ,z)` (additive constants dropped — only differences in ρ matter).
-    value: f64,
-    /// `G = ∂Ṽ/∂ρ`.
-    grad: f64,
-    /// Rounding band of `grad`: Wilkinson's growth factor for the operations
-    /// the gradient accumulates (a `p×p` Cholesky, two solves, two traces and the
-    /// residual sums `D` is formed from) times the magnitude sum of its three
-    /// terms, plus `D`'s own rounding carried through `pen/D`. A gradient inside
-    /// this band is zero to the arithmetic; that is what "stationary" means here.
-    grad_band: f64,
-    /// `∂²Ṽ/∂ρ²`.
-    hess: f64,
-    /// The penalized RSS `D` the criterion's `log D` term is taken of.
-    penalized_rss: f64,
-}
-
-impl<'a> GaussianRemlRhoResponse<'a> {
-    /// Build the response object. Computes `rank(S)` once by symmetric
-    /// eigendecomposition, counting the eigenvalues above the REML engine's
-    /// `positive_eigenvalue_threshold`: the positive-eigenspace decision the
-    /// fit's own penalty pseudo-logdet makes.
-    pub fn new(
-        x: &'a Array2<f64>,
-        y: &'a Array1<f64>,
-        s: &'a Array2<f64>,
-        x_star: &'a Array1<f64>,
-    ) -> Result<Self, String> {
-        let n = x.nrows();
-        let p = x.ncols();
-        if y.len() != n {
-            return Err("gaussian reml response: row-count mismatch".to_string());
-        }
-        if s.nrows() != p || s.ncols() != p || x_star.len() != p {
-            return Err("gaussian reml response: column-count mismatch".to_string());
-        }
-        let (evals, _) = s.eigh(Side::Lower).map_err(|e| {
-            format!("gaussian reml response: penalty eigendecomposition failed: {e:?}")
-        })?;
-        let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-            evals.as_slice().ok_or_else(|| {
-                "gaussian reml response: penalty eigenvalues are not contiguous".to_string()
-            })?,
-        );
-        let rank_s = evals.iter().filter(|&&e| e > threshold).count();
-        let xtx = x.t().dot(x);
-        let xty = x.t().dot(y);
-        // #2902 row 8: ρ is searched in the #2812 resolvability domain of the Gram
-        // against S. The test row adds `x_* x_*ᵀ` to the Gram whatever z is, so
-        // every ρ̂(z) shares one augmented domain.
-        let domain_of = |gram: &Array2<f64>| {
-            gam_solve::estimate::rho_domain::coordinate_domain(
-                gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(gram, s)
-                    .as_deref()
-                    .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
-                None,
-            )
-        };
-        let rho_domain = domain_of(&xtx);
-        let mut augmented_xtx = xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                augmented_xtx[[i, j]] += x_star[i] * x_star[j];
-            }
-        }
-        let augmented_rho_domain = domain_of(&augmented_xtx);
-        Ok(Self {
-            x,
-            y,
-            s,
-            x_star,
-            n,
-            p,
-            rank_s,
-            xtx,
-            xty,
-            rho_domain,
-            augmented_rho_domain,
-        })
-    }
-
-    /// Closed-form REML evaluation at `ρ`. `z = Some(_)` augments with the
-    /// test row; `z = None` is the original-data criterion (used for ρ̂₀).
-    fn eval(&self, rho: f64, z: Option<f64>) -> Result<RemlEval, String> {
-        let p = self.p;
-        let n_eff = self.n + usize::from(z.is_some());
-        let m0 = p - self.rank_s;
-        if n_eff <= m0 {
-            return Err(format!(
-                "gaussian reml response: degrees of freedom n_eff−M₀ = {n_eff}−{m0} ≤ 0; \
-                 REML criterion undefined"
-            ));
-        }
-        let coef = (n_eff - m0) as f64;
-        let r = self.rank_s as f64;
-        let lambda = gam_problem::checked_exp_log_strength(rho)
-            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-
-        // A(λ) = XᵀX + λ S [+ x_* x_*ᵀ].
-        let mut a = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] += lambda * self.s[[i, j]];
-            }
-        }
-        if z.is_some() {
-            for i in 0..p {
-                for j in 0..p {
-                    a[[i, j]] += self.x_star[i] * self.x_star[j];
-                }
-            }
-        }
-        let chol = a
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
-
-        // c(z) = Xᵀy [+ x_* z].
-        let mut c = self.xty.clone();
-        if let Some(zv) = z {
-            for j in 0..p {
-                c[j] += self.x_star[j] * zv;
-            }
-        }
-        let beta = chol.solvevec(&c);
-        let sbeta = self.s.dot(&beta);
-        let pen = lambda * beta.dot(&sbeta);
-
-        // #2280: `D` is the penalized sum of squares at β̂, formed as one:
-        // `‖y − Xβ̂‖² [+ (z − x_*ᵀβ̂)²] + pen`. The closed form it equals at the exact
-        // solve, `yᵀy [+ z²] − cᵀβ̂`, is a difference that rounds at `u·yᵀy` and takes
-        // the solve's backward error `E` at first order, as `β̂ᵀEβ̂`, so a `D` below
-        // that scale came back as roundoff, or as a non-positive "degenerate fit".
-        // Formed from residuals, the solve's error enters `D` only at second order,
-        // and the rounding is charged against the residuals rather than against `yᵀy`.
-        let (training_rss, training_scale) = residual_sum_of_squares(self.x, self.y, &beta);
-        let (test_rss, test_scale) = match z {
-            Some(zv) => {
-                let mut fitted = 0.0;
-                let mut cancelled = zv.abs();
-                for (&entry, &coefficient) in self.x_star.iter().zip(beta.iter()) {
-                    fitted += entry * coefficient;
-                    cancelled += (entry * coefficient).abs();
-                }
-                let residual = zv - fitted;
-                (
-                    residual * residual,
-                    residual * residual + 2.0 * residual.abs() * cancelled,
-                )
-            }
-            None => (0.0, 0.0),
-        };
-        let d = training_rss + test_rss + pen;
-        if !(d > 0.0) {
-            return Err(format!(
-                "gaussian reml response: non-positive penalized RSS D = {d}; degenerate fit"
-            ));
-        }
-        let growth = response_solve_growth(n_eff, p);
-        let d_band = growth * (training_scale + test_scale + pen.abs());
-
-        // Z = A⁻¹ S for the trace terms tr(A⁻¹S), tr((A⁻¹S)²).
-        let z_mat = chol.solve_mat(self.s);
-        let mut tr_ainv_s = 0.0;
-        let mut tr_ainv_s_sq = 0.0;
-        for i in 0..p {
-            tr_ainv_s += z_mat[[i, i]];
-            for j in 0..p {
-                tr_ainv_s_sq += z_mat[[i, j]] * z_mat[[j, i]];
-            }
-        }
-
-        // v_s = A⁻¹ Sβ̂ (so dβ̂/dρ = −λ v_s); quad = β̂ᵀS A⁻¹ S β̂.
-        let v_s = chol.solvevec(&sbeta);
-        let quad = sbeta.dot(&v_s);
-
-        let logdet: f64 = 2.0 * chol.diag().iter().map(|d| d.ln()).sum::<f64>();
-        let value = coef * d.ln() + logdet - r * rho;
-        let grad = coef * pen / d + lambda * tr_ainv_s - r;
-        // `D`'s own rounding reaches the gradient through `pen/D`.
-        let grad_band = growth * ((coef * pen / d).abs() + (lambda * tr_ainv_s).abs() + r.abs())
-            + (coef * pen / d).abs() * d_band / d;
-        let pen_prime = pen - 2.0 * lambda * lambda * quad;
-        let hess = coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s
-            - lambda * lambda * tr_ainv_s_sq;
-
-        Ok(RemlEval {
-            value,
-            grad,
-            grad_band,
-            hess,
-            penalized_rss: d,
-        })
-    }
-
-    /// The penalized RSS `D(ρ, z)` of the augmented criterion (or the training
-    /// criterion for `z = None`): the quantity whose `log` the REML criterion
-    /// takes.
-    pub fn penalized_rss(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
-        Ok(self.eval(rho, z)?.penalized_rss)
-    }
-
-    /// The REML-selected log smoothing strength for the training response
-    /// with the test response set to `z` (or the training-only criterion for
-    /// `None`), found by the workspace's outer engine: one ρ coordinate with
-    /// the analytic gradient and Hessian `eval` already provides, searched in
-    /// the #2812 resolvability domain of its Gram against `S` (#2902 row 8),
-    /// with the engine's seed cascade and stationarity certificate. This replaced a
-    /// 61-point grid over a hand box `[−25, 25]` followed by an uncertified
-    /// Newton with a `±5` widening, a `1e-12` curvature floor and a `1e-13`
-    /// step tolerance that returned its last iterate after 100 steps (#2469,
-    /// #2670; SPEC forbids grid search and hand-supplied boxes outright).
-    pub fn select_rho(&self, z: Option<f64>) -> Result<f64, String> {
-        use gam_problem::{Derivative, HessianValue, OuterEval};
-        use gam_solve::estimate::EstimationError;
-        use gam_solve::rho_optimizer::OuterProblem;
-        let context = match z {
-            Some(z) => format!("full conformal REML strength at z={z}"),
-            None => "full conformal REML strength".to_string(),
-        };
-        // A criterion that cannot be evaluated at a trial ρ (a Cholesky that
-        // fails at an extreme strength) is a property of that trial point, so
-        // the search retreats from it rather than abandoning the problem.
-        let refuse = |error: String| EstimationError::TrialPointRefused { reason: error };
-        let (lower, upper) = if z.is_some() {
-            self.augmented_rho_domain
-        } else {
-            self.rho_domain
-        };
-        // The augmented criterion carries the test point as one more row.
-        let problem = OuterProblem::new(1)
-            .with_problem_size(self.n + usize::from(z.is_some()), self.p)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(gam_problem::DeclaredHessianForm::Dense)
-            .with_bounds(Array1::from_elem(1, lower), Array1::from_elem(1, upper));
-        let mut objective = problem.build_objective(
-            (),
-            |_: &mut (), rho: &Array1<f64>| self.eval(rho[0], z).map(|ev| ev.value).map_err(refuse),
-            |_: &mut (), rho: &Array1<f64>| {
-                let ev = self.eval(rho[0], z).map_err(refuse)?;
-                Ok(OuterEval {
-                    cost: ev.value,
-                    gradient: Array1::from_vec(vec![ev.grad]),
-                    hessian: HessianValue::Dense(Array2::from_elem((1, 1), ev.hess)),
-                    inner_beta_hint: None,
-                })
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
-        );
-        let result = problem
-            .run(&mut objective, &context)
-            .map_err(|error| format!("{context}: {error}"))?;
-        // The engine certifies the basin; from there the criterion is smooth
-        // with a positive analytic Hessian, so Newton converges quadratically
-        // to the arithmetic's own stationarity — a gradient inside its own
-        // rounding band. The response ρ̂(z) is differentiated downstream,
-        // which needs exactly that resolution. (A step below ρ's representation
-        // is not reachable: the gradient's rounding floor is what bounds the
-        // step, so the band, not the step, is the statement.) Quadratic
-        // convergence makes each step's contraction ratio `|G_{k+1}|/|G_k|`
-        // smaller than the last. A ratio that stops shrinking is refused with
-        // both ratios named. While the ratios keep shrinking below one, `|G|`
-        // falls at least geometrically and reaches the band in finitely many
-        // steps, so no step budget is needed. A zero band means a zero gradient,
-        // which returns at once.
-        let mut rho = result.rho[0];
-        let mut ev = self.eval(rho, z)?;
-        let mut previous_ratio = 1.0_f64;
-        loop {
-            if ev.grad.abs() <= ev.grad_band {
-                return Ok(rho);
-            }
-            if !(ev.hess.is_finite() && ev.hess > 0.0) {
-                return Err(format!(
-                    "{context}: the REML criterion's curvature is {} at ρ={rho}; the certified \
-                     point is not a minimum",
-                    ev.hess
-                ));
-            }
-            let candidate = rho - ev.grad / ev.hess;
-            let ev_candidate = self.eval(candidate, z)?;
-            // A step that lands inside its own rounding band is done, whatever its
-            // ratio: overshooting into the noise is the end of quadratic convergence,
-            // not a failure of it.
-            if ev_candidate.grad.abs() <= ev_candidate.grad_band {
-                return Ok(candidate);
-            }
-            let ratio = ev_candidate.grad.abs() / ev.grad.abs();
-            if !(ratio < previous_ratio) {
-                // The step does not contract the gradient faster than the one
-                // before it: the iteration sits on the gradient's noise floor,
-                // above the band the terms predict, or is not in Newton's
-                // quadratic regime — refused, with the numbers named.
-                return Err(format!(
-                    "{context}: Newton polish stopped contracting at ρ={rho} with gradient {} \
-                     above its rounding band {} (next step gave {}, contraction ratio {ratio} \
-                     not below the previous {previous_ratio})",
-                    ev.grad, ev.grad_band, ev_candidate.grad
-                ));
-            }
-            previous_ratio = ratio;
-            rho = candidate;
-            ev = ev_candidate;
-        }
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1944,6 +1557,7 @@ impl ExactFullConformalSubstrate {
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::GaussianRemlRhoResponse;
     use super::*;
     use ndarray::{Array1, Array2};
 
@@ -2108,13 +1722,13 @@ mod tests {
         r
     }
 
-    /// #2902 row 8: `select_rho` searches the #2812 resolvability domain of its
-    /// Gram against the penalty. Orthogonal columns make the generalized
+    /// #2902 row 8: the REML oracle's ρ domain is the #2812 resolvability domain
+    /// of its Gram against the penalty. Orthogonal columns make the generalized
     /// eigenvalue closed form, `γ = ‖x₁‖²/s₁₁`, so the domain is
     /// `[ln(√ε·γ), ln(γ/√ε)]`; the test row adds `x_*x_*ᵀ` to the Gram and moves
     /// γ from 2 to 5/2.
     #[test]
-    fn select_rho_domain_is_the_resolvability_interval_of_its_gram_2902() {
+    fn oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902() {
         let x = Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0])
             .expect("design");
         let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 5.0]);
@@ -2131,22 +1745,6 @@ mod tests {
                 (domain.0 - expected.0).abs() <= 1.0e-12 && (domain.1 - expected.1).abs() <= 1.0e-12,
                 "{label} ρ domain {domain:?} is not the resolvability interval {expected:?}"
             );
-        }
-    }
-
-    /// `select_rho(Some(z))` lands on a genuine stationary point of the
-    /// augmented criterion at every candidate: the gradient `eval` reports
-    /// there is below `1e-6`.
-    #[test]
-    fn gaussian_reml_reselection_is_stationary_on_the_augmented_criterion() {
-        let (x, y, s) = gauss_reml_fixture(45, 8);
-        let x_star = cosine_row(8, 0.42);
-        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-
-        for &z in &[0.15_f64, 0.4, 0.75] {
-            let rho_z = resp.select_rho(Some(z)).expect("select");
-            let g = resp.eval(rho_z, Some(z)).expect("eval").grad;
-            assert!(g.abs() < 1e-6, "select_rho not stationary: G={g} at z={z}");
         }
     }
 
@@ -2232,10 +1830,10 @@ mod tests {
                 .expect("A(λ) is SPD")
                 .solvevec(&resp.xty);
             let closed_form = y.dot(&y) - resp.xty.dot(&closed_beta);
-            let production = resp.penalized_rss(rho, Some(0.0)).expect("penalized RSS");
+            let oracle = resp.penalized_rss(rho, Some(0.0)).expect("penalized RSS");
             println!(
                 "[2280-conformal] rho={rho} condition={condition:.3e} \
-                 planted={expected_minimum:.6e} svd={svd_rss:.6e} production={production:.6e} \
+                 planted={expected_minimum:.6e} svd={svd_rss:.6e} oracle={oracle:.6e} \
                  closed_form={closed_form:.6e} band={band:.3e}"
             );
 
@@ -2250,8 +1848,8 @@ mod tests {
                  by more than half of it, or this fixture does not reach the defect"
             );
             assert!(
-                (production - svd_rss).abs() <= band,
-                "the penalized RSS {production:.6e} must match the SVD residual {svd_rss:.6e} \
+                (oracle - svd_rss).abs() <= band,
+                "the penalized RSS {oracle:.6e} must match the SVD residual {svd_rss:.6e} \
                  within {band:.3e} at rho={rho}"
             );
         }

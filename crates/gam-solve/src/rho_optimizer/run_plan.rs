@@ -169,7 +169,8 @@ struct RayRestorationDomain<'a> {
 /// evaluation repeated. Each restoration strictly raises the named
 /// coordinates; it stops at the model's own domain ceiling, or after as many
 /// restorations as there are ρ coordinates (a ray that survives that many
-/// closures is not closing), and then the original refusal is returned.
+/// closures is not closing), and then the original refusal is returned. The
+/// evaluation comes back with the certificate evidence it published (#3018).
 fn eval_seed_restoring_rays(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -178,12 +179,18 @@ fn eval_seed_restoring_rays(
     domain: RayRestorationDomain<'_>,
     context: &str,
     seed_idx: usize,
-) -> Result<OuterEval, EstimationError> {
+) -> Result<(OuterEval, crate::estimate::outer_eval_capture::CertificateEvidence), EstimationError> {
     let RayRestorationDomain { upper, rho_dim } = domain;
     let mut restorations = 0usize;
     loop {
-        let err = match eval_seed_at_full_inner_fidelity(obj, config, seed, order) {
-            Ok(eval) => return Ok(eval),
+        // What the evaluation publishes is charged to the seed value's
+        // resolution (#3018), each attempt's on its own so a refused attempt's
+        // evidence never reaches the seed that evaluated.
+        let (attempt, evidence) = super::bridges::evaluate_with_certificate_evidence(true, || {
+            eval_seed_at_full_inner_fidelity(obj, config, seed, order)
+        });
+        let err = match attempt {
+            Ok(eval) => return Ok((eval, evidence)),
             Err(err) => err,
         };
         let Some(ray) = ray_restoration_in(&err) else {
@@ -912,8 +919,8 @@ pub(crate) fn run_outer_with_plan(
                     seed_idx,
                 )
                     .map_err(|err| into_objective_error("outer eval failed", err));
-                let seed_eval = match seed_eval {
-                    Ok(seed_eval) => seed_eval,
+                let (seed_eval, seed_evidence) = match seed_eval {
+                    Ok(evaluated) => evaluated,
                     Err(err) if err.is_recoverable() => {
                         log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
@@ -1036,17 +1043,18 @@ pub(crate) fn run_outer_with_plan(
                     // own, so a boundary-limited crawl buying sub-resolution
                     // descent ended only when its iteration count ran out. The
                     // same progress certificate the dense route uses ends it
-                    // instead (#2817); its resolution is the criterion's
-                    // statistical resolution, exactly as the ARC arm below uses.
+                    // instead (#2817), on the same stall rule (#3018).
                     let mut cost_stall_guard = CostStallGuard::new(
                         super::run::outer_criterion_resolution(config),
-                        ARC_COST_STALL_WINDOW,
                         config,
                         Arc::new(Mutex::new(None)),
                     );
+                    let seed_resolution =
+                        cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_seed(
                         &seed,
                         seed_eval.cost,
+                        seed_resolution,
                         rail_projected_gradient_norm(
                             &seed,
                             &seed_eval.gradient,
@@ -1318,15 +1326,14 @@ pub(crate) fn run_outer_with_plan(
                         )
                     });
 
-                    let mut cost_stall_guard = CostStallGuard::new(
-                        cost_stall_resolution,
-                        ARC_COST_STALL_WINDOW,
-                        config,
-                        cost_stall_exit.clone(),
-                    );
+                    let mut cost_stall_guard =
+                        CostStallGuard::new(cost_stall_resolution, config, cost_stall_exit.clone());
+                    let seed_resolution =
+                        cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_second_order_seed(
                         &seed,
                         seed_eval.cost,
+                        seed_resolution,
                         // Same rail-relaxed box the guard's later observations
                         // and the terminal certificate use (#2412); a seed that
                         // starts on a rail must not be scored against a
@@ -1658,7 +1665,7 @@ pub(crate) fn run_outer_with_plan(
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err))
                     {
-                        Ok(e) => e,
+                        Ok((e, _)) => e,
                         Err(err) if err.is_recoverable() => {
                             log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before device-BFGS start: {err}"
@@ -1762,7 +1769,7 @@ pub(crate) fn run_outer_with_plan(
                         )
                                 .map_err(|err| into_objective_error("outer eval failed", err));
                             let seed_eval = match seed_eval {
-                                Ok(eval) => eval,
+                                Ok((eval, _)) => eval,
                                 Err(eval_error) if eval_error.is_recoverable() => {
                                     seed_rejections.push(SeedRejection::from_objective_error(
                                         seed_idx,
@@ -1812,8 +1819,8 @@ pub(crate) fn run_outer_with_plan(
                             seed_idx,
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err));
-                    let seed_eval = match seed_eval {
-                        Ok(seed_eval) => seed_eval,
+                    let (seed_eval, seed_evidence) = match seed_eval {
+                        Ok(evaluated) => evaluated,
                         Err(err) if err.is_recoverable() => {
                             log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
@@ -1880,6 +1887,7 @@ pub(crate) fn run_outer_with_plan(
                     let bfgs_start = std::time::Instant::now();
                     let mut stratum_start = seed.clone();
                     let mut stratum_eval = seed_eval;
+                    let mut stratum_evidence = seed_evidence;
                     let mut crossed_iterations = 0usize;
                     let (outcome, cost_stall_exit, last_objective_error) = loop {
                         let stratum_rank = obj.criterion_rank();
@@ -1910,11 +1918,17 @@ pub(crate) fn run_outer_with_plan(
                             stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         let mut cost_stall_guard = CostStallGuard::new(
                             super::run::outer_criterion_resolution(config),
-                            COST_STALL_WINDOW,
                             config,
                             cost_stall_exit.clone(),
                         );
-                        cost_stall_guard.observe_seed(&stratum_start, stratum_eval.cost, seed_grad_norm);
+                        let seed_resolution =
+                            cost_stall_guard.value_resolution(stratum_eval.cost, &stratum_evidence);
+                        cost_stall_guard.observe_seed(
+                            &stratum_start,
+                            stratum_eval.cost,
+                            seed_resolution,
+                            seed_grad_norm,
+                        );
                         let last_objective_error: Arc<Mutex<Option<ObjectiveEvalError>>> =
                             Arc::new(Mutex::new(None));
                         let objective = RetainingObjective::new(
@@ -1932,7 +1946,11 @@ pub(crate) fn run_outer_with_plan(
                                 consecutive_probe_refusals: 0,
                                 accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
-                                incumbent: Some((stratum_start.clone(), stratum_eval.cost)),
+                                incumbent: Some(OuterIncumbent {
+                                    rho: stratum_start.clone(),
+                                    cost: stratum_eval.cost,
+                                    gradient: stratum_eval.gradient.clone(),
+                                }),
                                 stratum_rank,
                                 stratum_probe: Some(Arc::clone(&stratum_probe)),
                             },
@@ -2100,12 +2118,16 @@ pub(crate) fn run_outer_with_plan(
                         if !(probe.cost < final_value - resolution) {
                             break (outcome, cost_stall_exit, last_objective_error);
                         }
-                        let crossing_eval = eval_seed_at_full_inner_fidelity(
-                            obj,
-                            config,
-                            &probe.rho,
-                            OuterEvalOrder::ValueAndGradient,
-                        )
+                        let (crossing_eval, crossing_evidence) =
+                            super::bridges::evaluate_with_certificate_evidence(true, || {
+                                eval_seed_at_full_inner_fidelity(
+                                    obj,
+                                    config,
+                                    &probe.rho,
+                                    OuterEvalOrder::ValueAndGradient,
+                                )
+                            });
+                        let crossing_eval = crossing_eval
                         .map_err(|err| into_objective_error("outer eval failed", err))
                         .and_then(|eval| {
                             finite_outer_first_order_eval_or_error("outer eval failed", layout, eval)
@@ -2125,6 +2147,7 @@ pub(crate) fn run_outer_with_plan(
                                 crossed_iterations = crossed_iterations.saturating_add(run_iterations);
                                 stratum_start = probe.rho;
                                 stratum_eval = eval;
+                                stratum_evidence = crossing_evidence;
                             }
                             Ok(eval) => {
                                 log::debug!(

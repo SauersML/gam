@@ -3,132 +3,132 @@ complete case manifest: /tmp/quality-report/quality_cases.txt (437 cases)
 === #1561 whole-suite quality meta-gate ===
 category        n scored GAMwin REFwin   medlogR  p(1-sided)      p_BH
 factors         1      1      0      1    0.0190      1.0000    1.0000
-families       51     51     33     18   -0.0090      0.0006    0.0036
+families       48     48     32     16   -0.0058      0.0012    0.0036
 manifolds      11     11      7      3   -0.0021      0.0967    0.1450
-misc           30     30     15     15    0.0000      0.2449    0.2939
-smooths        39     39     25     14   -0.0058      0.0037    0.0112
-survival       10     10      7      3   -0.0150      0.0654    0.1309
+misc           29     29     14     15    0.0000      0.3428    0.4113
+smooths        40     40     27     13   -0.0111      0.0012    0.0036
+survival       11     11      7      3   -0.0126      0.0654    0.1309
 ------------------------------------------------------------------------
-OVERALL       142    142     87     54   -0.0050      0.0000 
+OVERALL       140    140     87     51   -0.0050      0.0000 
 
-CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0050, wins 87 / losses 54)
-Experimental units: 142 cases from 183 metric pairs.
+CLOSURE (exact per-case p<0.05, negative median, valid metrics, complete successful execution): FAIL (p=0.0000, median log(gam/ref)=-0.0050, wins 87 / losses 51)
+Experimental units: 140 cases from 180 metric pairs.
 INCOMPLETE: absent manifest, mismatched execution, or failed cases; closure blocked.
 
 --- execution vs emission (silent-attrition guard) ---
 category     executed  failed  emitting
 calibration         8       0         0
 factors             2       0         1
-families           90       9        51
+families           90      14        48
 manifolds          11       0        11
-misc              247       8        30
+misc              247       7        29
 regressions         3       0         0
-smooths            49       5        39
-survival           27       9        10
+smooths            49       4        40
+survival           27       4        11
 
 SILENT ATTRITION: 21 test(s) failed BEFORE emitting a pair (excluded from the significance set):
+  GAM_ERROR/gam_fit_failed families::quality_vs_interpret_ml_pygam_binomial_logit_comparative::gam_binomial_logit_holdout_predictive_quality
+  GAM_ERROR/gam_fit_failed families::quality_vs_interpret_ml_pygam_binomial_logit_comparative::gam_binomial_logit_holdout_predictive_quality_on_real_data
+  GAM_ERROR/gam_fit_failed families::quality_vs_mgcv_tensor_te_2d_binomial::gam_tensor_te_2d_binomial_logit_matches_mgcv
+  TIMEOUT/per_test_bound families::quality_vs_pymc_nuts_binomial_logit::gam_nuts_binomial_logit_recovers_truth_and_is_calibrated
   METRIC_OFF/quality_metric families::quality_vs_sklearn_poisson_log::gam_poisson_log_recovers_truth_on_real_data
-  GAM_ERROR/gam_fit_failed families::quality_vs_statsmodels_ordinal_mnlogit::gam_multinomial_recovers_true_class_simplex
+  GAM_ERROR/gam_fit_failed families::quality_vs_statsmodels_binomial_probit::gam_binomial_probit_recovers_truth_on_real_data
   METRIC_OFF/quality_metric families::quality_vs_vgam_multinomial_softmax::gam_multinomial_softmax_recovers_true_simplex_on_real_data
   GAM_ERROR/gam_fit_failed families::quality_vs_mgcv_confidence_interval_gaussian_logistic_link::confidence_intervals_cover_truth_under_logistic_link
+  GAM_ERROR/gam_fit_failed families::quality_vs_vgam_beta_logistic_link_parameterization::gam_beta_logistic_link_matches_vgam_beta_parameterization
+  METRIC_OFF/quality_metric families::quality_vs_vgam_multinomial_smooth_by_factor::gam_multinomial_smooth_by_factor_recovers_truth
   GAM_ERROR/gam_fit_failed misc::mega_batch_k::matern_with_explicit_centers
   TIMEOUT/per_test_bound misc::quality_vs_lifelines_interval_censored_truth_recovery::gam_recovers_interval_censored_latent_truth_match_or_beat_lifelines
   TIMEOUT/per_test_bound misc::quality_vs_scipy_pit_transformation_normal::transformation_normal_held_out_pit_is_uniform
-  TIMEOUT/per_test_bound misc::quality_vs_scipy_yeojohnson_skewed_positive_transformation::gam_transform_objectively_normalizes_skewed_positive_sample
+  GAM_ERROR/gam_fit_failed misc::quality_vs_simplex_dirichlet_regression::gam_dirichlet_regression_recovers_truth_on_real_data
   GAM_ERROR/gam_fit_failed misc::quality_vs_statsmodels_gam_additive::gam_additive_matches_statsmodels_gam
   GAM_ERROR/gam_fit_failed smooths::quality_vs_mgcv_matern_smooth::gam_matern_smooth_recovers_truth
-  TIMEOUT/per_test_bound smooths::quality_vs_r_tram_smooth_continuous_covariate_transformation::gam_smooth_transformation_matches_r_tram_on_heart_failure
   METRIC_OFF/quality_metric smooths::quality_vs_rstpm2_pstpm2_smooth_covariate::gam_smooth_covariate_recovers_flat_noise_effect_and_valid_survival_on_bone
   GAM_ERROR/gam_fit_failed smooths::quality_vs_sklearn_gp_matern_regression::gam_matern_gp_recovers_truth_and_beats_sklearn
-  TIMEOUT/per_test_bound survival::quality_competing_risks_truth_recovery::joint_competing_risks_transformation_recovers_true_cause_specific_cifs
-  TIMEOUT/per_test_bound survival::quality_vs_gamlss_gaussian_survival_ls::gam_gaussian_survival_location_scale_matches_gamlss_on_real_data
   GAM_ERROR/gam_fit_failed survival::quality_vs_lifelines_weibull_aft_by::gam_weibull_aft_by_factor_recovers_true_survival
   GAM_ERROR/gam_fit_failed survival::quality_vs_lifelines_weibull_aft_by::gam_weibull_aft_by_factor_recovers_true_survival_curved_acceleration
-  TIMEOUT/per_test_bound survival::quality_vs_scipy_boxcox_univariate_lambda::gam_transformation_normal_normalizes_wine_price_at_least_as_well_as_boxcox
-  TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
-  TIMEOUT/per_test_bound survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty_on_real_data
-  METRIC_OFF/quality_metric survival::quality_vs_lifelines_competing_risks_cif::gam_competing_risks_cif_matches_lifelines_aalen_johansen_on_cirrhosis
+  GAM_ERROR/gam_fit_failed survival::quality_vs_survival_coxph_frailty_hazard_multiplier::gam_hazard_multiplier_frailty_matches_coxph_frailty
 
 --- #2395 paired-panel power ---
-31 of 183 pairs carry a paired fold panel: 5 resolved BETTER, 2 resolved WORSE, 24 unresolved.
-Pairing gain (unpaired SEM / paired SEM) over these panels: min 0.99x, median 5.22x, max 374.95x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
+31 of 180 pairs carry a paired fold panel: 5 resolved BETTER, 2 resolved WORSE, 24 unresolved.
+Pairing gain (unpaired SEM / paired SEM) over these panels: min 0.99x, median 5.21x, max 374.95x. Values above 1 are the common fold-draw swing that comparing two separately-averaged arms would have paid for.
 
 pair                                                         K   effect%    sem%  |e|/sem     d_z   wins  verdict
 smooths/quality_vs_mgcv_cyclic_cubic                        10   -35.020   8.571     5.24   -1.66  10/10  gam_resolved_better
+families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -7.523   1.740     4.53   -0.95  18/23  gam_resolved_better
 smooths/quality_vs_mgcv_duchon_regimes::heavy_noise_smooth  10    -8.873   2.162     4.34   -1.37  10/10  gam_resolved_better
-families/quality_vs_gamlss_gaussian_multi_smooth::mu        23    -7.243   1.746     4.34   -0.91  18/23  gam_resolved_better
 families/quality_vs_mgcv_gaussian_smooth::ps_basis          10    -2.399   0.568     4.29   -1.36  10/10  gam_resolved_better
-smooths/quality_vs_mgcv_matern_varying_nu                   25    +8.320   1.978     4.08   +0.82   6/25  gam_resolved_worse
-smooths/quality_vs_mgcv_matern_smooth::test                 10    -1.451   0.477     3.07   -0.97   9/10  unresolved_tie
+smooths/quality_vs_mgcv_matern_varying_nu                   25    +8.333   1.986     4.07   +0.81   6/25  gam_resolved_worse
+families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -20.538   6.765     3.51   -0.73  19/23  gam_resolved_better
 families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    +2.011   0.657     3.04   +0.61   4/25  gam_resolved_worse
-families/quality_vs_gamlss_gaussian_multi_smooth::log_sigm  23   -18.287   7.282     2.87   -0.60  17/23  gam_resolved_better
+smooths/quality_vs_mgcv_matern_smooth::test                 10    -1.435   0.487     2.97   -0.94   9/10  unresolved_tie
 smooths/quality_vs_mgcv_cyclic_cubic::test                  10    -0.593   0.213     2.79   -0.88   8/10  unresolved_tie
 misc/quality_vs_mgcv_thin_plate_1d::seeded_split            10    +0.049   0.019     2.53   +0.80   2/10  unresolved_tie
 families/quality_vs_mgcv_gaussian_smooth::default_basis     10    +0.223   0.090     2.49   +0.79   2/10  unresolved_tie
 misc/quality_vs_pygam_logistic_1d_shape                     25    -4.359   1.847     2.44   -0.49  17/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25   -10.404   4.693     2.40   -0.48  17/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4   +28.104  13.447     1.96   +0.98   1/4   unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -6.435   3.486     1.94   -0.39  14/25  unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4   +29.388  15.164     1.82   +0.91   1/4   unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -9.693   4.532     2.30   -0.46  17/25  unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale::gaguri   4   +28.110  13.449     1.96   +0.98   1/4   unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -6.432   3.486     1.94   -0.39  14/25  unresolved_tie
+families/quality_vs_gamlss_custom_family_location_scale_ga   4   +29.327  15.121     1.83   +0.91   1/4   unresolved_tie
 smooths/quality_vs_mgcv_pspline_smooth::real_data_alt       10    -0.183   0.108     1.70   -0.54   7/10  unresolved_tie
 smooths/quality_vs_mgcv_nottem_cyclic                       10    +0.575   0.358     1.60   +0.51   3/10  unresolved_tie
-families/quality_vs_mgcv_poisson_tensor                     25    +2.943   1.856     1.58   +0.32  11/25  unresolved_tie
 smooths/quality_vs_mgcv_duchon_regimes::mu                  10    -0.438   0.299     1.47   -0.46   7/10  unresolved_tie
-smooths/quality_vs_mgcv_matern_varying_nu                   25    +3.980   2.937     1.35   +0.27  10/25  unresolved_tie
-smooths/quality_vs_mgcv_matern_varying_nu                   25    -0.928   0.880     1.06   -0.21  16/25  unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +4.956   5.708     0.87   +0.44   2/4   unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4    +6.923   8.078     0.86   +0.43   3/4   unresolved_tie
+smooths/quality_vs_mgcv_matern_varying_nu                   25    +3.996   2.949     1.35   +0.27  10/25  unresolved_tie
+smooths/quality_vs_mgcv_matern_varying_nu                   25    -0.931   0.880     1.07   -0.21  16/25  unresolved_tie
+families/quality_vs_mgcv_poisson_tensor                     25    +2.027   2.186     0.93   +0.19  11/25  unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +4.961   5.708     0.87   +0.44   2/4   unresolved_tie
+families/quality_vs_gamlss_custom_family_location_scale_ga   4    +6.873   8.034     0.86   +0.43   3/4   unresolved_tie
 smooths/quality_vs_mgcv_duchon_regimes::two_component_k30   10    -0.296   0.399     0.75   -0.24   5/10  unresolved_tie
 smooths/quality_vs_mgcv_quakes_spatial_smooth               10    -0.030   0.041     0.72   -0.23   6/10  unresolved_tie
 misc/quality_vs_mgcv_thin_plate_1d::i_mod_4_split           10    +0.017   0.038     0.44   +0.14   2/10  unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    +1.182   3.520     0.34   +0.07  10/25  unresolved_tie
 smooths/quality_vs_mgcv_pspline_smooth                      10    +0.040   0.143     0.28   +0.09   3/10  unresolved_tie
-families/quality_vs_gamlss_custom_family_location_scale_ga   4    +2.927  27.078     0.12   +0.06   2/4   unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +1.619  25.425     0.07   +0.04   2/4   unresolved_tie
-families/quality_vs_gamlss_gaussian_location_scale_cyclic:  25    -0.129   2.783     0.05   -0.01  10/25  unresolved_tie
+families/quality_vs_gamlss_custom_family_location_scale_ga   4    +2.879  27.033     0.12   +0.06   2/4   unresolved_tie
+families/quality_vs_gamlss_gaussian_location_scale::gaguri   4    +1.623  25.428     0.07   +0.04   2/4   unresolved_tie
 
 REAL FINDINGS: 2 pair(s) where gam is worse by more than the paired fold spread can explain. These are systematic, not split noise, and each deserves its own investigation:
   families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::mu [mu_rmse_to_truth] vs gamlss: +2.011% over 25 folds (3.0 SEM, gam won 4/25)
-  smooths/quality_vs_mgcv_matern_varying_nu [rmse_vs_truth_nu2.5] vs mgcv: +8.320% over 25 folds (4.1 SEM, gam won 6/25)
+  smooths/quality_vs_mgcv_matern_varying_nu [rmse_vs_truth_nu2.5] vs mgcv: +8.333% over 25 folds (4.1 SEM, gam won 6/25)
 
 DILUTION: 24 paired pair(s) remain unresolved — their sign is not established even after fold averaging. They still enter the rank test above with full weight. Raising K on these is the lever that converts them into evidence:
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu: -0.129% +- 2.783% (0.05 SEM over 25 folds)
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::constant_sigma: +1.619% +- 25.425% (0.07 SEM over 4 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::constant_sigma: +2.927% +- 27.078% (0.12 SEM over 4 folds)
+  families/quality_vs_gamlss_gaussian_location_scale::gagurine::constant_sigma: +1.623% +- 25.428% (0.07 SEM over 4 folds)
+  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::constant_sigma: +2.879% +- 27.033% (0.12 SEM over 4 folds)
   smooths/quality_vs_mgcv_pspline_smooth: +0.040% +- 0.143% (0.28 SEM over 10 folds)
+  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::mu: +1.182% +- 3.520% (0.34 SEM over 25 folds)
   misc/quality_vs_mgcv_thin_plate_1d::i_mod_4_split: +0.017% +- 0.038% (0.44 SEM over 10 folds)
   smooths/quality_vs_mgcv_quakes_spatial_smooth: -0.030% +- 0.041% (0.72 SEM over 10 folds)
   smooths/quality_vs_mgcv_duchon_regimes::two_component_k30: -0.296% +- 0.399% (0.75 SEM over 10 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::mgcv: +6.923% +- 8.078% (0.86 SEM over 4 folds)
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::mgcv: +4.956% +- 5.708% (0.87 SEM over 4 folds)
-  smooths/quality_vs_mgcv_matern_varying_nu: -0.928% +- 0.880% (1.06 SEM over 25 folds)
-  smooths/quality_vs_mgcv_matern_varying_nu: +3.980% +- 2.937% (1.35 SEM over 25 folds)
+  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::mgcv: +6.873% +- 8.034% (0.86 SEM over 4 folds)
+  families/quality_vs_gamlss_gaussian_location_scale::gagurine::mgcv: +4.961% +- 5.708% (0.87 SEM over 4 folds)
+  families/quality_vs_mgcv_poisson_tensor: +2.027% +- 2.186% (0.93 SEM over 25 folds)
+  smooths/quality_vs_mgcv_matern_varying_nu: -0.931% +- 0.880% (1.07 SEM over 25 folds)
+  smooths/quality_vs_mgcv_matern_varying_nu: +3.996% +- 2.949% (1.35 SEM over 25 folds)
   smooths/quality_vs_mgcv_duchon_regimes::mu: -0.438% +- 0.299% (1.47 SEM over 10 folds)
-  families/quality_vs_mgcv_poisson_tensor: +2.943% +- 1.856% (1.58 SEM over 25 folds)
   smooths/quality_vs_mgcv_nottem_cyclic: +0.575% +- 0.358% (1.60 SEM over 10 folds)
   smooths/quality_vs_mgcv_pspline_smooth::real_data_alt: -0.183% +- 0.108% (1.70 SEM over 10 folds)
-  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss: +29.388% +- 15.164% (1.82 SEM over 4 folds)
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::log_sigma: -6.435% +- 3.486% (1.94 SEM over 25 folds)
-  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss: +28.104% +- 13.447% (1.96 SEM over 4 folds)
-  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::log_sigma: -10.404% +- 4.693% (2.40 SEM over 25 folds)
+  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss: +29.327% +- 15.121% (1.83 SEM over 4 folds)
+  families/quality_vs_gamlss_gaussian_location_scale_cyclic::above_fundamental::log_sigma: -6.432% +- 3.486% (1.94 SEM over 25 folds)
+  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss: +28.110% +- 13.449% (1.96 SEM over 4 folds)
+  families/quality_vs_gamlss_gaussian_location_scale_cyclic::fundamental::log_sigma: -9.693% +- 4.532% (2.30 SEM over 25 folds)
   misc/quality_vs_pygam_logistic_1d_shape: -4.359% +- 1.847% (2.44 SEM over 25 folds)
   families/quality_vs_mgcv_gaussian_smooth::default_basis: +0.223% +- 0.090% (2.49 SEM over 10 folds)
   misc/quality_vs_mgcv_thin_plate_1d::seeded_split: +0.049% +- 0.019% (2.53 SEM over 10 folds)
   smooths/quality_vs_mgcv_cyclic_cubic::test: -0.593% +- 0.213% (2.79 SEM over 10 folds)
-  smooths/quality_vs_mgcv_matern_smooth::test: -1.451% +- 0.477% (3.07 SEM over 10 folds)
+  smooths/quality_vs_mgcv_matern_smooth::test: -1.435% +- 0.487% (2.97 SEM over 10 folds)
 
 Top tests GAM loses (largest log(gam/ref) > 0):
-  +2.7773  survival/quality_vs_gamlss_gaussian_survival_ls::loc [rmse_to_truth] gam=5.0929 vs gamlss=0.31682
-  +1.1841  survival/quality_vs_gamlss_gaussian_survival_ls::log_sigma [rmse_to_truth] gam=1.2225 vs gamlss=0.37409
+  +2.7772  survival/quality_vs_gamlss_gaussian_survival_ls::loc [rmse_to_truth] gam=5.0924 vs gamlss=0.31682
+  +1.1841  survival/quality_vs_gamlss_gaussian_survival_ls::log_sigma [rmse_to_truth] gam=1.2224 vs gamlss=0.37409
   +0.5579  misc/quality_vs_mass_ordinal_polr::x2_slope [x2_slope_abs_err] gam=0.02965 vs mgcv=0.016971
-  +0.3097  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss [held_out_perplexity] gam=22.766 vs gamlss=16.703
-  +0.2992  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss [held_out_perplexity] gam=22.529 vs gamlss=16.703
+  +0.3091  families/quality_vs_gamlss_custom_family_location_scale_gaussian::gagurine::gamlss [held_out_perplexity] gam=22.751 vs gamlss=16.703
+  +0.2993  families/quality_vs_gamlss_gaussian_location_scale::gagurine::gamlss [held_out_perplexity] gam=22.531 vs gamlss=16.703
   +0.2961  manifolds/quality_vs_mgcv_sphere_s2_wahba_vs_sos [grid_rmse] gam=2.0782 vs mgcv=1.5456
   +0.2683  misc/quality_validation_baseline_1471::poisson_ci_coverage [ci_calibration_error] gam=0.031167 vs mgcv=0.023833
-  +0.2419  families/quality_vs_vgam_multinomial_softmax::main [simplex_rmse_to_truth] gam=0.074171 vs mgcv=0.058236
+  +0.2421  families/quality_vs_vgam_multinomial_softmax::main [simplex_rmse_to_truth] gam=0.074191 vs mgcv=0.058236
   +0.1960  families/quality_vs_mgcv_tensor_ti_2d_gaussian [interaction_rmse_to_truth] gam=0.034695 vs mgcv=0.028519
   +0.1672  misc/quality_vs_gamlss_negbin_dispersion_location_scale_1060::mu [rmse_log_mu] gam=0.048642 vs gamlss=0.041154
   +0.1347  misc/quality_vs_gpyto_gp_regression [truth_rmse] gam=0.016387 vs gpytorch=0.014322
-  +0.1305  families/quality_vs_gamlss_gaussian_location_scale::mu [mu_rmse_to_truth] gam=0.017205 vs gamlss=0.015101
+  +0.1304  families/quality_vs_gamlss_gaussian_location_scale::mu [mu_rmse_to_truth] gam=0.017205 vs gamlss=0.015101
   +0.1250  misc/quality_vs_gamlss_beta_dispersion_location_scale_1060::log_phi [rmse_log_phi] gam=0.074602 vs gamlss=0.065833
-  +0.1182  misc/quality_vs_gamlss_gagurine_location_scale [nll] gam=3.4908 vs gamlss=3.1015
-  +0.1144  misc/quality_vs_r_fields_mkriging [rmse] gam=0.115 vs fields=0.10258
+  +0.1183  misc/quality_vs_gamlss_gagurine_location_scale [nll] gam=3.491 vs gamlss=3.1015
+  +0.1143  misc/quality_vs_r_fields_mkriging [rmse] gam=0.115 vs fields=0.10258
