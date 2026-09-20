@@ -2642,5 +2642,13 @@
     ],
     "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
     "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "f10039cc745a25ab816b20958151e1d5e629289d",
+    "items": [
+      "crates/gam-models/src/survival/location_scale/numeric_guards.rs:fn:sanitize_survival_weight_vector"
+    ],
+    "reason": "#3650: sanitize_survival_weight_vector silently zeroed non-finite dense row weights. SPEC: \"In general, do not paper over solver issues.\" It is deleted. require_finite_row_weights now refuses a non-finite weight with a NumericalFailure naming the row, and the one legitimate case (a masked row times inf) is resolved at its source in the slot fill.",
+    "evidence": "dense_row_weighting_refuses_non_finite_row_weights pins the refusal in weighted_crossprod_dense_with_parallelism, scale_dense_rows and the DiagonalOnly Hessian path."
   }
 ]
