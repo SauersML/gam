@@ -52,7 +52,7 @@ use super::curl::{
     CurlVerdict, coalesce_antipodal, cooccurrence_pairs_sparse, curl_verdict,
     ring_permutation_evidence, orthonormal_pair_coords,
 };
-use super::pair_phase::ebh_reject;
+use gam_terms::inference::structure_evidence::e_benjamini_hochberg_in_family;
 
 /// One atom's per-row ambient image, supplied lazily.
 ///
@@ -278,6 +278,17 @@ pub fn census_shattered_circles(
             "curl census: sigma must be finite and > 0, got {sigma}"
         ));
     }
+    // The FDR level fixes the replicate budget `B + 1 = m/α` and every e-BH
+    // threshold `m/(α·k)`. Outside `(0, 1)` neither exists: `α = 0` asks for an
+    // unbounded budget, NaN collapses it to the floor, and `α ≥ 1` is no FDR
+    // control at all. Refuse up front instead of printing a census that looks
+    // like an absence of structure.
+    if !(cfg.fdr_alpha.is_finite() && cfg.fdr_alpha > 0.0 && cfg.fdr_alpha < 1.0) {
+        return Err(format!(
+            "curl census: fdr_alpha must be finite and lie in (0, 1), got {}",
+            cfg.fdr_alpha
+        ));
+    }
     if frames.len() < 2 {
         return Ok(CurlCensus {
             sigma,
@@ -448,7 +459,7 @@ pub fn census_shattered_circles(
     // hypothesis the search looked at, and carries `e = 0` into the ledger.
     let mut out = out;
     let e_values: Vec<f64> = out.iter().map(|p| p.e_value).collect();
-    let ledger = ebh_ledger(&e_values, candidate_pairs.len(), cfg.fdr_alpha);
+    let ledger = ebh_ledger(&e_values, candidate_pairs.len(), cfg.fdr_alpha)?;
     for &i in &ledger.rejected {
         out[i].fdr_discovery = true;
     }
@@ -487,22 +498,20 @@ struct CensusLedger {
 
 /// Run e-BH at level `alpha` over a family of `family` hypotheses of which the
 /// first `adjudicated.len()` carry the given e-values and the rest carry `e = 0`
-/// (candidates the census generated but could not adjudicate). Padding with the
-/// valid e-value `0` is what keeps `m` the size of the search: dropping those
-/// candidates instead would shrink every threshold `m/(α·k)` to the survivors
-/// and let the ledger reject at a level the search never paid for.
-fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
-    assert!(
-        adjudicated.len() <= family,
-        "curl census: {} adjudicated e-values from a family of {family}",
-        adjudicated.len()
-    );
-    let mut e_values = adjudicated.to_vec();
-    e_values.resize(family, 0.0);
-    // A padded `e = 0` can never clear the positive threshold `m/(α·k)`, so every
-    // rejected index points into `adjudicated`.
-    let rejected = ebh_reject(&e_values, alpha);
-    let m = e_values.len() as f64;
+/// (candidates the census generated but could not adjudicate). Counting those
+/// candidates in `m` is what keeps the family the size of the search: dropping
+/// them would shrink every threshold `m/(α·k)` to the survivors and let the
+/// ledger reject at a level the search never paid for.
+///
+/// The rule itself is the crate-wide
+/// [`e_benjamini_hochberg_in_family`], which carries the unadjudicated members
+/// as exact zero e-values through `family_size` without materializing them and
+/// refuses a NaN e-value or an `alpha` outside `(0, 1)` rather than ranking it.
+fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> Result<CensusLedger, String> {
+    let log_e: Vec<f64> = adjudicated.iter().map(|&e| e.ln()).collect();
+    let rejected = e_benjamini_hochberg_in_family(&log_e, family, alpha)
+        .map_err(|err| format!("curl census e-BH ledger: {err}"))?;
+    let m = family as f64;
     let ebh_threshold = if rejected.is_empty() {
         f64::INFINITY
     } else {
@@ -514,12 +523,12 @@ fn ebh_ledger(adjudicated: &[f64], family: usize, alpha: f64) -> CensusLedger {
     } else {
         m / (alpha * n_max_e as f64) - 1.0
     };
-    CensusLedger {
+    Ok(CensusLedger {
         rejected,
         ebh_threshold,
         n_max_e,
         replicates_required,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -673,11 +682,11 @@ mod tests {
     /// make.
     #[test]
     fn unadjudicated_candidates_keep_their_place_in_the_ebh_family() {
-        let alone = ebh_ledger(&[20.0], 1, 0.05);
+        let alone = ebh_ledger(&[20.0], 1, 0.05).unwrap();
         assert_eq!(alone.rejected, vec![0]);
         assert_eq!(alone.ebh_threshold, 20.0);
 
-        let with_refused = ebh_ledger(&[20.0], 2, 0.05);
+        let with_refused = ebh_ledger(&[20.0], 2, 0.05).unwrap();
         assert!(
             with_refused.rejected.is_empty(),
             "a family of two needs e >= 40 at rank 1; got rejections {:?}",
@@ -686,6 +695,49 @@ mod tests {
         assert_eq!(with_refused.ebh_threshold, f64::INFINITY);
         assert_eq!(with_refused.n_max_e, 1);
         assert_eq!(with_refused.replicates_required, 2.0 / 0.05 - 1.0);
+    }
+
+    /// One dominant e-value in a family of nulls is the only discovery; a flat
+    /// family of nulls makes none.
+    #[test]
+    fn ebh_ledger_rejects_only_the_dominant_e_value() {
+        let mut es = vec![1.0_f64; 20];
+        es[7] = 500.0;
+        assert_eq!(ebh_ledger(&es, 20, 0.05).unwrap().rejected, vec![7]);
+        assert!(
+            ebh_ledger(&[1.0; 20], 20, 0.05)
+                .unwrap()
+                .rejected
+                .is_empty()
+        );
+    }
+
+    /// A NaN e-value, an FDR level outside `(0, 1)`, or a family smaller than
+    /// its adjudicated members is a refusal, never a silent empty ledger.
+    #[test]
+    fn ebh_ledger_refuses_what_it_cannot_rank() {
+        assert!(ebh_ledger(&[f64::NAN, 30.0], 2, 0.05).is_err());
+        assert!(ebh_ledger(&[30.0], 1, 0.0).is_err());
+        assert!(ebh_ledger(&[30.0], 1, 1.0).is_err());
+        assert!(ebh_ledger(&[30.0, 30.0], 1, 0.05).is_err());
+    }
+
+    /// The census refuses an FDR level that fixes no replicate budget instead
+    /// of printing an empty census (`α = 0` would ask for `usize::MAX` draws).
+    #[test]
+    fn census_refuses_an_fdr_level_outside_the_unit_interval() {
+        let (dirs, coefs) = shattered_circle_frames(200, 8, 3.0, 0.05);
+        let frames = frames_from(&dirs, &coefs);
+        for alpha in [0.0, -0.1, 1.0, f64::NAN] {
+            let bad = CurlCensusConfig {
+                fdr_alpha: alpha,
+                ..cfg()
+            };
+            assert!(
+                census_shattered_circles(&frames, 200, 8, 0.05, &bad).is_err(),
+                "fdr_alpha = {alpha} must be refused"
+            );
+        }
     }
 
     /// Without coalescing, the SAME shattered dictionary yields no accepted plane:
