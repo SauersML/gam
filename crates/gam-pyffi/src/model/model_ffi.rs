@@ -353,7 +353,6 @@ struct SampleConfigPayload {
     n_samples: usize,
     n_warmup: usize,
     n_chains: usize,
-    target_accept: f64,
     seed: u64,
 }
 
@@ -2292,7 +2291,6 @@ fn sample_table(
     config.set_item("n_samples", payload.config.n_samples)?;
     config.set_item("n_warmup", payload.config.n_warmup)?;
     config.set_item("n_chains", payload.config.n_chains)?;
-    config.set_item("target_accept", payload.config.target_accept)?;
     config.set_item("seed", payload.config.seed)?;
     let out = PyDict::new(py);
     out.set_item("samples", payload.samples.into_pyarray(py))?;
