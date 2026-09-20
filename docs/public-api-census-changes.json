@@ -4833,5 +4833,13 @@
     },
     "reason": "One canonical spelling per behavior (SPEC: unnecessary choices and options are deleted). Alias spellings in the formula DSL and the family and link parsers now raise an error that names the canonical spelling, from one removed-spellings table per layer. The alias machinery goes: canonicalize_smooth_type, parse_penalty_order_alias, parse_optional_f64_option_alias, LinkFunction::aliases, and the tests that pinned alias spellings as accepted.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "988f269d7e9a40f8517673dcf48febd1e3bff748",
+    "removed": {
+      "crates/gam-terms/src/basis/implicit_psi_derivative.rs::project_design": 1
+    },
+    "reason": "#3001 step 2: the fit formed a gauged smooth's X*T0 - C*R through FixedRowSpaceProjector::project_design's own lazy block operator, while a saved model's replay formed it through subtract_row_space_correction, so the two evaluated different products. project_design is replaced by FixedRowSpaceProjector::row_space_correction, which returns R only; realize_smooth_collection_gauge then forms X*T0 - C*R through subtract_row_space_correction, the operator the replay uses.",
+    "evidence": "At base 988f269d7e, git grep -n project_design finds the pub(crate) declaration (crates/gam-terms/src/basis/implicit_psi_derivative.rs:152), its one production caller (crates/gam-terms/src/smooth/term_design.rs:1315) and one unit-test call (implicit_psi_derivative.rs:4164). Both callers now use row_space_correction; the unit test asserts that value - C*R equals the dense projector and is collection-orthogonal. git grep -w -c project_design at the head gives 0. The same removal is acknowledged in docs/source-removal-changes.json."
   }
 ]
