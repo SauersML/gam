@@ -3147,5 +3147,14 @@
     ],
     "reason": "#4097: remove the unused custom-compiler cache entry and its one forwarding wrapper; all three NVRTC compile paths use one shared-options implementation, preserving typed library failures and one diagnostic label. The keyed map recovers poisoned locks rather than bypassing caching.",
     "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
+  },
+  {
+    "base": "702edf4e88c5ccfde5c43f73c569c980f032382b",
+    "items": [
+      "crates/gam-solve/src/gpu_kernels/arrow_schur.rs:fn:fused_module_cache",
+      "crates/gam-solve/src/gpu_kernels/arrow_schur.rs:struct:FusedModuleCache"
+    ],
+    "reason": "#4344: route fused Arrow-Schur module compilation through KeyedPtxModuleCache, delete its private map/accessor, remove invariant architecture key fields, and preserve actual compiler/module-loader error text in SchurFactorFailed.",
+    "evidence": "MSI complete GPU unit binary builds in3.28seconds and the actual keyed-map poison/reacquisition regression passes. Coherent complete production dependency metadata is checked with warnings denied. Read audit confirms the removed custom-compiler entry had one caller using the identical shared options; fused consumers select the singleton runtime context. No GPU hardware execution is claimed."
   }
 ]
