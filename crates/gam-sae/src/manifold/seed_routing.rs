@@ -126,6 +126,13 @@ pub fn sae_residual_seed_logits(
     // shut (`sigmoid(-gain/τ)≈0`), which is worse than the neutral 0.5/0.5 state
     // the uniform saddle held. Centring restores `logit=0 ⇒ gate=0.5` on ties
     // and opens the gate (`logit>0`) only for atoms that beat the row mean.
+    //
+    // The floor enters the DIVISOR only. The centre is always the row's true
+    // mean: centring on the floored scale instead would give a row whose mean
+    // residual sits below the floor the logits `-gain·(r − floor)/floor ≈ +gain`
+    // on every atom — an exactly-fitted (or zero) row would open every ordered
+    // Beta--Bernoulli gate at `sigmoid(gain/τ)` rather than sit at the neutral
+    // 0.5 the centring exists to preserve.
     let mut global_mean = 0.0_f64;
     for row in 0..n_obs {
         for k in 0..k_atoms {
@@ -139,9 +146,10 @@ pub fn sae_residual_seed_logits(
         for k in 0..k_atoms {
             row_mean += resid[[row, k]];
         }
-        row_mean = (row_mean / k_atoms as f64).max(floor);
+        row_mean /= k_atoms as f64;
+        let row_scale = row_mean.max(floor);
         for k in 0..k_atoms {
-            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_mean;
+            logits[[row, k]] = -gain * (resid[[row, k]] - row_mean) / row_scale;
         }
     }
     Ok(logits)
@@ -1649,5 +1657,50 @@ mod tests {
             "residual seed routing accuracy {acc:.3} (up to permutation) is too low; \
                  the alternating seed should recover the planted one-hot assignment"
         );
+    }
+
+    /// Rows every atom explains equally well land at zero logits even when
+    /// their mean residual sits below the scale floor. Two atoms whose column
+    /// spaces both contain the target fit it to rounding, so every residual is
+    /// far below the `1e-12` floor; the seed must stay neutral there (an
+    /// ordered Beta--Bernoulli gate of 0.5), not open every gate at `+gain`.
+    #[test]
+    fn sae_residual_seed_logits_centre_rows_below_the_scale_floor() {
+        use ndarray::Array3;
+        let n = 8usize;
+        let k = 2usize;
+        let gain = 4.0_f64;
+        // Atom 0 spans {1, x}; atom 1 spans {1, x, x²}. Both contain the target.
+        let mut basis = Array3::<f64>::zeros((k, n, 3));
+        let mut exact = Array2::<f64>::zeros((n, 2));
+        for i in 0..n {
+            let x = i as f64 / n as f64;
+            basis[[0, i, 0]] = 1.0;
+            basis[[0, i, 1]] = x;
+            basis[[1, i, 0]] = 1.0;
+            basis[[1, i, 1]] = x;
+            basis[[1, i, 2]] = x * x;
+            exact[[i, 0]] = x;
+            exact[[i, 1]] = 1.0 - 2.0 * x;
+        }
+        let basis_sizes = vec![2, 3];
+        // A rounding-level residual is at most `p·(c·ε·‖z‖)²` with `‖z‖ ≤ 1`
+        // and a projection constant `c ≲ 10³` at this size, i.e. below 1e-25;
+        // over the 1e-12 floor and times the gain that is below 1e-12. The
+        // mis-centred seed put every logit at `gain` itself.
+        let bound = 1.0e-10;
+        for (label, z) in [("exact fit", exact), ("zero target", Array2::<f64>::zeros((n, 2)))] {
+            let logits = sae_residual_seed_logits(basis.view(), &basis_sizes, z.view(), gain)
+                .expect("residual seed must build");
+            for row in 0..n {
+                for atom in 0..k {
+                    assert!(
+                        logits[[row, atom]].abs() <= bound,
+                        "{label}: row {row} atom {atom} logit {} is not neutral",
+                        logits[[row, atom]]
+                    );
+                }
+            }
+        }
     }
 }

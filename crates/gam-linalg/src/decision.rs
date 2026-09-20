@@ -107,13 +107,15 @@ pub enum RankDecision {
         gap: f64,
     },
     /// The rank is undecidable at this tolerance: a singular value lands inside
-    /// the open guard band `(tol/(1+gap), tol·(1+gap))`.
+    /// the open guard band `(tol/(1+gap), tol·(1+gap))`, or a value (or the band
+    /// itself) is `NaN` and so has no position against the band at all.
     Ambiguous {
-        /// Rank if the in-band value is treated as dropped: `#{σ ≥ high}`.
+        /// Rank if every undecided value is treated as dropped: `#{σ ≥ high}`.
         rank_floor: usize,
-        /// Rank if the in-band value is treated as kept: `#{σ > low}`.
+        /// Rank if every undecided value is treated as kept: `#{σ > low}` plus
+        /// the `NaN` count.
         rank_ceil: usize,
-        /// The offending singular value sitting inside the band.
+        /// The offending value: one sitting inside the band, or `NaN`.
         sigma_in_band: f64,
         /// Tolerance the decision was posed at.
         tol: f64,
@@ -152,12 +154,39 @@ pub enum RankDecision {
 /// `O(u · σ_max)` in the decision's own linear currency, so a gap of a few `u`
 /// suffices to certify. This is why the caller equilibrates first, then
 /// certifies.
+///
+/// **A `NaN` is never a dropped value.** Every comparison against a `NaN` is
+/// false, so a `NaN` singular value (or a `NaN` band edge) would otherwise fall
+/// through both `σ ≥ high` and the in-band test and be counted as dropped: a
+/// Certified rank that silently lost a direction the spectrum never resolved.
+/// Such a value has no position against the band, so the decision is
+/// Ambiguous, bracketed by treating every `NaN` as dropped and as kept.
 pub fn certified_rank(singular_values: &[f64], tol: f64, gap: f64) -> RankDecision {
     let mut sv: Vec<f64> = singular_values.to_vec();
-    sv.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
     let n = sv.len();
     let high = tol * (1.0 + gap);
     let low = tol / (1.0 + gap);
+
+    if high.is_nan() || low.is_nan() {
+        return RankDecision::Ambiguous {
+            rank_floor: 0,
+            rank_ceil: n,
+            sigma_in_band: f64::NAN,
+            tol,
+            gap,
+        };
+    }
+    let unresolved = sv.iter().filter(|s| s.is_nan()).count();
+    if unresolved > 0 {
+        return RankDecision::Ambiguous {
+            rank_floor: sv.iter().filter(|&&s| s >= high).count(),
+            rank_ceil: sv.iter().filter(|&&s| s > low).count() + unresolved,
+            sigma_in_band: f64::NAN,
+            tol,
+            gap,
+        };
+    }
+    sv.sort_by(|a, b| b.total_cmp(a));
 
     // A singular value strictly inside the open band makes `r` undecidable.
     if let Some(&sigma_in_band) = sv.iter().find(|&&s| s > low && s < high) {
@@ -408,11 +437,20 @@ pub fn transport_certified_rank(decision: &RankDecision, excursion: f64) -> Rank
 /// query point, so the gate must re-decide there — a refusal-to-reuse trigger
 /// stated in the decision's own currency instead of in a coefficient-movement
 /// heuristic. It is silent (never a proof of transport) in the other direction.
+///
+/// A non-finite value in either spectrum returns `+∞`: the displacement is not
+/// measured, and a refusal gate must read it as void. Dropping it instead
+/// (`f64::max` discards a `NaN`, and `∞ − ∞` is one) would report the
+/// displacement of the remaining values as a bound, which is exactly the
+/// under-claim that lets a gate reuse a certificate it should re-decide.
 pub fn spectral_excursion_lower_bound(reference: &[f64], current: &[f64]) -> f64 {
+    if reference.iter().chain(current).any(|value| !value.is_finite()) {
+        return f64::INFINITY;
+    }
     let mut a: Vec<f64> = reference.to_vec();
     let mut b: Vec<f64> = current.to_vec();
-    a.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
-    b.sort_by(|x, y| y.partial_cmp(x).unwrap_or(std::cmp::Ordering::Equal));
+    a.sort_by(|x, y| y.total_cmp(x));
+    b.sort_by(|x, y| y.total_cmp(x));
     let n = a.len().max(b.len());
     let mut worst = 0.0_f64;
     for i in 0..n {
@@ -1018,5 +1056,68 @@ mod tests {
             }
             other => panic!("expected Ambiguous, got {other:?}"),
         }
+    }
+
+    /// A `NaN` compares false against both band edges; counted as dropped it
+    /// would certify a rank that lost an unresolved direction.
+    #[test]
+    fn a_nan_singular_value_or_band_is_never_certified() {
+        // tol = 1, gap = 1 ⇒ band (0.5, 2); without the NaN this certifies 2.
+        let clean = [10.0_f64, 3.0, 0.2];
+        assert!(matches!(
+            certified_rank(&clean, 1.0, 1.0),
+            RankDecision::Certified { rank: 2, .. }
+        ));
+        for sv in [
+            [10.0_f64, f64::NAN, 3.0, 0.2],
+            [f64::NAN, 10.0, 3.0, 0.2],
+            [10.0, 3.0, 0.2, f64::NAN],
+        ] {
+            match certified_rank(&sv, 1.0, 1.0) {
+                RankDecision::Ambiguous {
+                    rank_floor,
+                    rank_ceil,
+                    sigma_in_band,
+                    ..
+                } => {
+                    assert_eq!(rank_floor, 2);
+                    assert_eq!(rank_ceil, 3);
+                    assert!(sigma_in_band.is_nan());
+                }
+                other => panic!("a NaN singular value must not certify: {other:?}"),
+            }
+        }
+        for (tol, gap) in [(f64::NAN, 1.0), (1.0, f64::NAN)] {
+            assert!(matches!(
+                certified_rank(&clean, tol, gap),
+                RankDecision::Ambiguous { rank_floor: 0, rank_ceil: 3, .. }
+            ));
+        }
+    }
+
+    /// An unmeasured displacement is not a small one: the refusal gate must
+    /// see `+∞`, never the displacement of the values that happened to be finite.
+    #[test]
+    fn a_non_finite_spectrum_voids_the_excursion_lower_bound() {
+        let reference = [3.0_f64, 1.0, 0.25];
+        let measured = spectral_excursion_lower_bound(&reference, &[3.0, 1.0, 0.5]);
+        assert!((measured - 0.25).abs() < 1e-15);
+        for current in [
+            [3.0_f64, f64::NAN, 0.25],
+            [f64::INFINITY, 1.0, 0.25],
+            [3.0, 1.0, f64::NEG_INFINITY],
+        ] {
+            assert_eq!(spectral_excursion_lower_bound(&reference, &current), f64::INFINITY);
+            assert_eq!(spectral_excursion_lower_bound(&current, &reference), f64::INFINITY);
+        }
+        let decision = certified_rank(&reference, 0.5, 0.1);
+        assert!(rank_transport_radius(&decision).is_some());
+        assert_eq!(
+            transport_certified_rank(
+                &decision,
+                spectral_excursion_lower_bound(&reference, &[3.0, f64::NAN, 0.25])
+            ),
+            RankTransport::NoCertificate
+        );
     }
 }

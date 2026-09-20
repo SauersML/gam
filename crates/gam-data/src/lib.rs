@@ -668,6 +668,48 @@ pub enum ColumnKindTag {
     Categorical,
 }
 
+impl SchemaColumn {
+    /// The source label of one present encoded cell of this column: the level
+    /// name of a categorical code, `"0"`/`"1"` for a binary cell, the value
+    /// itself for a continuous one.
+    ///
+    /// Generic ingestion keeps an absent categorical or binary cell as NaN
+    /// because it cannot know whether the model consumes the column, and an
+    /// unseen level can be encoded one past the last level. Neither names a
+    /// label, so both are refused with the column and 1-based row instead of
+    /// being cast: `NaN as usize` is `0`, which relabels a missing cell as
+    /// the column's first level.
+    pub fn present_cell_label(&self, value: f64, row: usize) -> Result<String, String> {
+        let row = row + 1;
+        if !value.is_finite() {
+            return Err(format!(
+                "column '{}' has no value at row {row} (encoded {value})",
+                self.name
+            ));
+        }
+        match self.kind {
+            ColumnKindTag::Categorical => (value >= 0.0 && value.fract() == 0.0)
+                .then(|| self.levels.get(value as usize))
+                .flatten()
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "column '{}' has invalid category code {value} at row {row} ({} levels)",
+                        self.name,
+                        self.levels.len()
+                    )
+                }),
+            ColumnKindTag::Binary if value == 0.0 => Ok("0".to_string()),
+            ColumnKindTag::Binary if value == 1.0 => Ok("1".to_string()),
+            ColumnKindTag::Binary => Err(format!(
+                "column '{}' is binary but has value {value} at row {row}",
+                self.name
+            )),
+            ColumnKindTag::Continuous => Ok(format!("{value:?}")),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UnseenCategoryPolicy {
     Error,
@@ -3338,6 +3380,71 @@ mod tests {
             &mut reader,
             vec!["normalized".to_string()],
         )
+    }
+
+    /// A missing categorical cell is NaN in the encoded table. It used to be
+    /// cast `NaN as usize == 0` by the row-id path, silently naming the row
+    /// after the column's first level; it must be refused, naming the row.
+    #[test]
+    fn present_cell_label_refuses_a_missing_or_invalid_cell() {
+        let categorical = SchemaColumn {
+            name: "id".to_string(),
+            kind: ColumnKindTag::Categorical,
+            levels: vec!["alice".to_string(), "bob".to_string()],
+        };
+        assert_eq!(categorical.present_cell_label(1.0, 0).expect("bob"), "bob");
+        let err = categorical
+            .present_cell_label(f64::NAN, 2)
+            .expect_err("a missing id cell names no level");
+        assert!(err.contains("column 'id'") && err.contains("row 3"), "{err}");
+        for code in [-0.5, 0.5, 2.0] {
+            let err = categorical
+                .present_cell_label(code, 0)
+                .expect_err("a fractional, negative or unseen code names no level");
+            assert!(err.contains("invalid category code"), "{err}");
+        }
+
+        let binary = SchemaColumn {
+            name: "flag".to_string(),
+            kind: ColumnKindTag::Binary,
+            levels: Vec::new(),
+        };
+        assert_eq!(binary.present_cell_label(0.0, 0).expect("zero"), "0");
+        assert_eq!(binary.present_cell_label(1.0, 0).expect("one"), "1");
+        // A missing binary cell used to render as "1".
+        assert!(binary.present_cell_label(f64::NAN, 0).is_err());
+        assert!(binary.present_cell_label(0.5, 0).is_err());
+
+        let continuous = SchemaColumn {
+            name: "x".to_string(),
+            kind: ColumnKindTag::Continuous,
+            levels: Vec::new(),
+        };
+        assert_eq!(continuous.present_cell_label(3.0, 0).expect("value"), "3.0");
+        assert!(continuous.present_cell_label(f64::INFINITY, 0).is_err());
+    }
+
+    /// End to end: an Arrow categorical column with a null cell keeps that
+    /// cell as NaN, and its label is refused instead of becoming level 0.
+    #[test]
+    fn a_null_arrow_categorical_cell_has_no_label() {
+        let array: ArrayRef = Arc::new(arrow::array::StringArray::from(vec![
+            Some("alice"),
+            None,
+            Some("bob"),
+        ]));
+        let dataset = encode_single_arrow_array(array).expect("encode");
+        let column = &dataset.schema.columns[0];
+        assert_eq!(column.kind, ColumnKindTag::Categorical);
+        assert!(dataset.values[[1, 0]].is_nan());
+        let first = column
+            .present_cell_label(dataset.values[[0, 0]], 0)
+            .expect("present cell");
+        assert_eq!(first, "alice");
+        let err = column
+            .present_cell_label(dataset.values[[1, 0]], 1)
+            .expect_err("the null cell has no label");
+        assert!(err.contains("row 2"), "{err}");
     }
 
     #[test]

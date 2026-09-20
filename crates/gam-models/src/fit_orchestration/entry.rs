@@ -3074,7 +3074,6 @@ fn fit_expectile_laws(
         offset,
         spec,
         family: materialized_family,
-        estimate_tweedie_p: _,
         options,
         kappa_options,
         wiggle,
@@ -3141,7 +3140,6 @@ fn fit_expectile_laws(
             family: gaussian_family.clone(),
             // Expectile LAWS fits a Gaussian-identity inner family; no Tweedie
             // power to estimate (#2026).
-            estimate_tweedie_p: false,
             options: options.clone(),
             kappa_options: kappa_options.clone(),
             wiggle: None,
@@ -3407,8 +3405,8 @@ fn publish_expectile_sandwich_covariance(
 /// through to the dense path:
 /// - family is Gaussian + identity link;
 /// - no link wiggle, no latent coordinates, no coefficient groups, no penalty
-///   hyperpriors, no linear/box constraints, no Firth, no adaptive
-///   regularization, no externally injected null-space dims;
+///   hyperpriors, no linear/box constraints, no Firth, no externally
+///   injected null-space dims;
 /// - the term collection is exactly one smooth term — no linear terms, no
 ///   random effects, no by-variables / factor interactions;
 /// - that smooth is a plain 1-D B-spline whose penalty order is compatible
@@ -3424,7 +3422,8 @@ fn publish_expectile_sandwich_covariance(
 ///   through: their knot-value parameterization is a finite-rank regression
 ///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
-/// - at least 3 distinct finite abscissae (the scan's diffuse rank plus one).
+/// - at least `order + 1` distinct finite abscissae (the scan's `order`
+///   diffuse innovations plus one proper innovation to profile σ²).
 ///
 /// λ-mapping note: the scan's penalty is exactly `λ∫f″²` (state-space
 /// `q = 1/λ` at unit σ²). The dense 1-D B-spline path penalizes the same
@@ -3516,7 +3515,6 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
         || matches!(
             bspec.knotspec,
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
-                | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
         // `bs="cr"` materialises a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
@@ -3754,7 +3752,7 @@ pub fn residual_cascade_fast_path(
 }
 
 /// Parse a formula, resolve it against a dataset, and produce a ready-to-fit `FitRequest`.
-fn family_requests_transformation_normal(family: Option<&str>) -> bool {
+pub(crate) fn family_requests_transformation_normal(family: Option<&str>) -> bool {
     family
         .map(|name| name.trim().to_ascii_lowercase().replace('_', "-"))
         .as_deref()

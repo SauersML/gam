@@ -4315,6 +4315,12 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             lastobjective,
         );
         let mut max_proposed_beta_step = 0.0_f64;
+        // The block update's own step BEFORE the trust-region truncation. It is
+        // zero exactly at a fixed point of the block map (the penalized score
+        // `rhs` vanishes under a positive-definite `H + S`), whereas the
+        // truncated step also goes to zero when the radius collapses, so only
+        // this one can stand in for stationarity when no residual is measured.
+        let mut max_untruncated_beta_step = 0.0_f64;
         let mut max_accepted_beta_step = 0.0_f64;
         let mut trust_boundary_hit_in_cycle = false;
 
@@ -4385,6 +4391,11 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             )?;
             let beta_old = states[b].beta.clone();
             let raw_delta = &beta_new - &beta_old;
+            max_untruncated_beta_step = raw_delta
+                .iter()
+                .copied()
+                .map(f64::abs)
+                .fold(max_untruncated_beta_step, f64::max);
             // Per-block trust-region radius in the block's local
             // penalized-Hessian metric. The cap is the current value of
             // `block_max_step[b]`, updated below via
@@ -4881,8 +4892,11 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         } else {
             None
         };
+        // `true` only for a residual that was MEASURED and is within tolerance.
+        // A family with no exact joint curvature has no residual to measure, and
+        // an unmeasured residual is not a passed one.
         let exact_joint_stationarity_ok =
-            stationarity_residual.is_none_or(|residual| residual <= residual_tol);
+            stationarity_residual.is_some_and(|residual| residual <= residual_tol);
         // A residual inside its own rounding band drives a step that is rounding too: the
         // iterate is at its root to the arithmetic, so a step this cycle took from it is not a
         // step it needed (the Newton-region test's rule, gam#2973).
@@ -4891,9 +4905,10 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
             (Some(residual), Some(band)) if residual <= band
         );
         log::debug!(
-            "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
+            "[PIRLS/blockwise convergence] cycle {:>3} | max_proposed_step={:.3e} (untruncated={:.3e}, tol={:.3e}) | max_accepted_step={:.3e} | obj_change={:.3e} (tol={:.3e}) | beta_inf={:.3e} | joint_stationarity_ok={}",
             cycle,
             max_proposed_beta_step,
+            max_untruncated_beta_step,
             step_tol,
             max_accepted_beta_step,
             objective_change,
@@ -4909,7 +4924,7 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         terminal_convergence_state = Some(gam_problem::InnerConvergenceTerminalState::Blockwise {
             cycle,
             max_accepted_step: max_accepted_beta_step,
-            max_proposed_step: max_proposed_beta_step,
+            max_proposed_step: max_untruncated_beta_step,
             step_tol,
             objective_change,
             objective_tol,
@@ -4968,7 +4983,17 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
         if (max_accepted_beta_step <= step_tol || step_is_rounding)
             && objective_change <= objective_tol
         {
-            if exact_joint_stationarity_ok || max_proposed_beta_step <= step_tol {
+            // "Nothing moved" is not a certificate. When the line search accepts
+            // no step, `max_accepted_beta_step` and `objective_change` are both
+            // exactly zero, so the conjunction above holds at ANY iterate (the
+            // gam#2612 finding). What certifies the iterate is either the joint
+            // residual, when one can be measured, or the untruncated block step:
+            // it vanishes exactly where the penalized score does. An UNMEASURED
+            // residual (`stationarity_residual == None`, a family with no exact
+            // joint curvature) certifies nothing by itself, and the truncated
+            // step is not a stand-in either, because a collapsed trust radius
+            // drives it to zero at a non-stationary point.
+            if exact_joint_stationarity_ok || max_untruncated_beta_step <= step_tol {
                 converged = true;
             }
             break;
