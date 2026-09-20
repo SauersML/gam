@@ -87,10 +87,10 @@ fn gaulss_by_group_smooth_in_both_blocks_fits_without_hessian_shape_mismatch() {
     // #1504 this `.expect(...)` fired with the dense-Hessian shape mismatch.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
-        noise_formula: Some("s(x, bs='tp', by=group)".to_string()),
+        noise_formula: Some("s(x, bs='tps', by=group)".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x, bs='tp', by=group)", &data, &cfg).expect(
+    let result = fit_from_formula("y ~ s(x, bs='tps', by=group)", &data, &cfg).expect(
         "#1504: gaulss by-group fit in both blocks must not crash on a Hessian shape mismatch",
     );
 
