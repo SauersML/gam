@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **CLI: `gam crosscoder` exits with the code of the category `gamfit` raises for a failed SAE fit**
+  (#4436). The command flattened the typed `SaeFitError` into a bare message, so every failure,
+  including an outer search that stopped without a stationarity certificate, exited with the
+  invocation (formula) code and printed no `help:` line. `SaeFitError::error_category` and
+  `SaeFitError::advice` now state the category and remedy of each variant: an outer search that
+  stopped without a certificate is a convergence failure, as the `RemlConvergenceError` Python raises
+  for it, and a failed outer search keeps its estimation error's category and advice.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

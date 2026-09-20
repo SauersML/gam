@@ -124,3 +124,9 @@ impl From<gam::estimate::EstimationError> for CliError {
         Self::typed(err.to_string(), err.advice(), err.error_category())
     }
 }
+
+impl From<gam_sae::manifold::SaeFitError> for CliError {
+    fn from(err: gam_sae::manifold::SaeFitError) -> Self {
+        Self::typed(err.to_string(), err.advice(), err.error_category())
+    }
+}
