@@ -28,7 +28,7 @@ def _skewed_nb(rng, n, theta=1.5):
 def test_nb_observation_interval_is_equal_tailed_not_symmetric():
     rng = np.random.default_rng(61)
     train, test = _skewed_nb(rng, 6000), _skewed_nb(rng, 20000)
-    m = gamfit.fit(train, "y ~ s(x)", family="nb")
+    m = gamfit.fit(train, "y ~ s(x)", family="negative-binomial")
     p = m.predict(test, interval=0.95, observation_interval=True)
 
     y = test["y"].to_numpy()
@@ -59,7 +59,7 @@ def test_nb_observation_upper_edge_reaches_true_quantile():
 
     rng = np.random.default_rng(61)
     train, test = _skewed_nb(rng, 6000), _skewed_nb(rng, 20000)
-    m = gamfit.fit(train, "y ~ s(x)", family="nb")
+    m = gamfit.fit(train, "y ~ s(x)", family="negative-binomial")
     p = m.predict(test, interval=0.95, observation_interval=True)
 
     hi = p["observation_upper"].to_numpy()

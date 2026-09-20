@@ -3808,9 +3808,20 @@ fn inner_blockwise_fit_for_product<F: CustomFamily + Clone + Send + Sync + 'stat
     // latter still take the joint path (their objective is NOT separable, so
     // block-coordinate descent would drop the cross-block ∂²L/∂β_a∂β_b
     // curvature).
+    //
+    // An armed joint Jeffreys term Φ = ½ log|I(β)| is a joint objective term
+    // that only the joint path carries: its score ∇Φ enters the joint Newton
+    // stationarity `∇L − Sβ + ∇Φ = 0`, while the block-coordinate cycle
+    // below iterates the bare `∇L − Sβ`. The outer value prices −Φ at the
+    // returned β, so a blockwise mode would be the unarmed stationary point
+    // and the envelope ρ-gradient would not be the derivative of the value
+    // (gam#3371). Whenever the family arms Φ and a joint Hessian exists, the
+    // joint path owns the solve, single-block and separable alike.
     let blocks_separable = specs.len() >= 2 && family.likelihood_blocks_uncoupled();
-    let use_joint_newton =
-        has_joint_exacthessian && (specs.len() >= 2 || has_workspace_source) && !blocks_separable;
+    let jeffreys_armed = family.joint_jeffreys_term_required();
+    let use_joint_newton = has_joint_exacthessian
+        && (jeffreys_armed
+            || ((specs.len() >= 2 || has_workspace_source) && !blocks_separable));
     let joint_workspace_requested = use_joint_newton && has_workspace_source;
     // Row-measure consistency for the outer-score subsample (gam#1135 HT path).
     //

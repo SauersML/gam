@@ -130,7 +130,7 @@ def _sigma_feature_terms(ds: dict[str, typing.Any], *, scenario_name: str | None
     for col in leftover:
         if _feature_should_be_smooth(ds, col):
             if backend == "rust":
-                terms.append(f"s({col}, type=ps, knots={knot_count})")
+                terms.append(f"s({col}, bs=ps, knots={knot_count})")
             elif backend == "r_gamlss":
                 terms.append(f"pb({col}, inter={knot_expr})")
             elif backend == "mgcv":

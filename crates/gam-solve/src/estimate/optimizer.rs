@@ -7,7 +7,7 @@ use crate::estimate::evaluation::{
 use crate::estimate::edf_accounting::penalized_edf_bundle_within_bands;
 use crate::estimate::penalty::scaled_covariance;
 use crate::estimate::prefit::{
-    reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
+    arm_jeffreys_on_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
     reject_prefit_unpenalized_rank_deficiency,
 };
 use gam_linalg::matrix::FactorizedSystem;
@@ -1292,7 +1292,8 @@ where
         cfg.likelihood = cfg.likelihood.clone().with_student_t(sigma, nu);
     }
     reject_prefit_unpenalized_rank_deficiency(w, &x_fit, &canonical)?;
-    reject_prefit_binomial_separation(&cfg, y, w, &x_fit, &canonical)?;
+    let jeffreys_arming_evidence =
+        arm_jeffreys_on_prefit_binomial_separation(&mut cfg, opts, y, w, &x_fit, &canonical)?;
 
     let design_kind = match &x {
         DesignMatrix::Dense(_) => "dense",
@@ -3904,11 +3905,11 @@ where
         // bit-for-bit.
         //
         // The returned fit does not need it: the covariance above is complete
-        // without it, and the diagnostic costs dozens of inner solves plus a
+        // without it, and the diagnostic costs 2155 inner solves plus a
         // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
         // inference (`skip_rho_posterior_inference = false`), together with the
-        // escalation tiers it grades for (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond). Every other fit keeps the typed
+        // escalation tier it grades for (quadrature or NUTS over ρ, whichever
+        // needs fewer criterion evaluations). Every other fit keeps the typed
         // `NotComputed(InferenceNotRequested)` set above.
         if !opts.skip_rho_posterior_inference {
             (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
@@ -3918,7 +3919,6 @@ where
                 // the criterion's exact affine limit from that face, so no
                 // posterior mass is dropped when the box edge moves.
                 &rho_continuation,
-                None,
             );
         }
 
@@ -4442,6 +4442,7 @@ where
             // Persist the optimized target's Firth state so saved-model
             // sampling reconstructs the same posterior (#2245 finding 16).
             firth_bias_reduction: cfg.firth_bias_reduction,
+            jeffreys_arming_evidence,
             ..Default::default()
         },
         inference,

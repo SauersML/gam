@@ -15,7 +15,7 @@ numerically (the script is named), **[C]** conjectured or supported by evidence 
 
 1. **The "multinomial" ARC stall is not in the multinomial solver [P+N].** The panic in
    `tests/quality/families/quality_vs_statsmodels_ordinal_mnlogit.rs:150` comes from a *Gaussian*
-   standard-REML fit of `y ~ x1 + s(x2, bs="cc")`. The test runs that fit only to obtain the design
+   standard-REML fit of `y ~ x1 + s(x2, bs="cyclic")`. The test runs that fit only to obtain the design
    matrix; the multinomial fit that follows uses a fixed λ. That Gaussian model has three
    penalties:
    - the x1 null-recovery ridge;
@@ -271,7 +271,7 @@ any λ_c → 0.
 
 ### 3.5 Root cause of the Gaussian helper stall (mnlogit)
 
-Model: `y ~ x1 + s(x2, bs="cc")`, Gaussian, with penalties
+Model: `y ~ x1 + s(x2, bs="cyclic")`, Gaussian, with penalties
 - S_x1: the rank-1 ridge on the x1 coefficient;
 - S_bend: the harmonic roughness ∮(f'' + ω²(f − f̄))², null {1, sin, cos} (`bspline_build.rs:168-200`);
 - S_fund: the rank-2 function-space ridge on the fundamental (`bspline_build.rs:250-275`).

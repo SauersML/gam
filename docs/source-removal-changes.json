@@ -2391,5 +2391,53 @@
     ],
     "reason": "pyGAM audit F11/DOC-6/G1: the fitted-model summary text has exactly one renderer, gam_models::inference::summary_text::render_summary_text over the typed SummaryPayload, shared by `gam summary` and gamfit's Model.summary()/__str__. Removed as second implementations: the CLI's build_model_summary and gam_solve's ModelSummary with its Display fmt, format_pvalue and significance_stars (the renderer owns the p-value format and stars). the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue moved under the same names to summary_text.rs's tests against the one renderer, which prints the #2901 EDF label and the shape-constrained p-value reason from the payload rows. The saved summary's per-predictor smooth builder `summary_smooth_terms` is replaced by `predictor_block_smooth_terms`, which reads the same predictor block from one replayed design shared with the parametric table instead of replaying it a second time.",
     "evidence": "source_removal_guard.py with base 9af3c66f1b and head the merge commit refused exactly these seven items. crates/gam-models/src/inference/summary_text.rs defines significance_stars, format_p_value, the_summary_names_an_uncertified_terms_edf_label_2901 and the_summary_names_a_withheld_shape_pvalue. git grep -w finds no remaining reference to ModelSummary or build_model_summary (other than one historical doc sentence). The fmt removed is ModelSummary's own Display impl (the other production occurrences are other fmt fns). crates/gam-models/tests/suite/bms_per_smooth_summary_2997.rs pins both predictors' smooth and parametric rows through the replacement."
+  },
+  {
+    "base": "c7d45a067fb72352bc327b56741c4866536819e7",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:LOW_DIM_TARGET_ACCEPT_FLOOR",
+      "crates/gam-inference/src/hmc_io.rs:const:MAX_TARGET_ACCEPT",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:run_nuts_sampling_rejects_invalid_target_accept",
+      "crates/gam-inference/src/hmc_io.rs:fn:validate_nuts_target_accept",
+      "crates/gam-inference/src/rho_posterior.rs:const:DEFAULT_M",
+      "crates/gam-inference/src/rho_posterior.rs:const:ESCALATION_NUTS_SAMPLES",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER1_MAX_DIM",
+      "crates/gam-inference/src/rho_posterior.rs:const:TIER2_MAX_DIM"
+    ],
+    "reason": "#3187 / #3263: the rho-posterior tiers and NUTS tuning carried hand-set caps and knobs. TIER1_MAX_DIM / TIER2_MAX_DIM capped the escalation route by K; the route is now derived (quadrature iff nodes^K <= RHO_NUTS_MIN_EVALUATIONS = 2 * NUTS_CONVERGENCE.min_ess, else NUTS, no K cap). ESCALATION_NUTS_SAMPLES fixed the Tier-2 draw count; it is now the warmup transitions run_adaptive used. DEFAULT_M = 64 was the Tier-0 proposal draw count (callers could override it); it is now reliable_sample_size(ESCALATE_K_HAT) = 2155, the draws at which PSIS is reliable for a shape at the escalation cutoff (at M=100 a Cauchy-over-N(0,0.25) target, true k=1, read k<0.5 in 43.5% of 200 seeds, 13.5% at 2155). robust_target_accept and its floors/MAX_TARGET_ACCEPT clamped a user-tunable target_accept that no longer exists: NutsConfig.target_accept is deleted and NUTS uses NUTS_TARGET_ACCEPT = 0.9, so validate_nuts_target_accept and its rejects-invalid test have nothing to validate.",
+    "evidence": "At the head git grep -w finds none of these names under crates, src or tests. cargo check --workspace --tests passes on the merge of main into the branch; cargo test -p gam-inference --lib hmc_io 59/59 and rho_posterior (including the new escalation-routing test K=4 -> 81-node quadrature, K=5 and K=17 -> NUTS) pass; cargo test -p gam-solve --lib psis passes (reliable_sample_size S(0.5)=100, S(0.7)=2155). The Python sampling wrapper and its tests no longer pass target_accept."
+  },
+  {
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
+    "items": [
+      "crates/gam-sae/src/manifold/rho.rs:fn:seed_scaled_by_dispersion_with_sparse_policy"
+    ],
+    "reason": "A multi-atom separable-gate seed took only max(ln φ, 0) of the dispersion shift, a clamp nothing derives, so on clean data a K > 1 seed started 1/φ times stiffer than the construction value. The clamp and its scale_sparse policy flag go: seed_scaled_by_dispersion_with_sparse_policy is removed, and every scale-coupled log-strength takes the full ln φ at every K.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3357 (fix-3233-seed-dispersion-clamp, Fixes #3233) merged as 53dfd6479c37a261096d31a5bf0763668ca8a229 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 53dfd6479c37a261096d31a5bf0763668ca8a229's own tree with --base 1d02ffcb1218e325f5030aa3c767a7967264c05f --head 53dfd6479c37a261096d31a5bf0763668ca8a229 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly this 1 item. Read-proof: git grep -w -c <name> 53dfd6479c37a261096d31a5bf0763668ca8a229 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "53dfd6479c37a261096d31a5bf0763668ca8a229",
+    "items": [
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:inverse_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:linearized_fixed_point",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:log_det_i_plus_wt",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:normal_solves",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:posterior",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:quadratic_part",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:fn:retained_normals",
+      "crates/gam-solve/src/constrained_posterior/cone_normalizer.rs:struct:SiteMotionSystem"
+    ],
+    "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 8 items. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
+  },
+  {
+    "base": "391a766e1012d99b0e0b43d8ff0b3db941b82523",
+    "items": [
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:set_degenerate_gaussian_reml_items"
+    ],
+    "reason": "#3310 (backfill for e8568910a9, PR #3367, which landed the removal without an entry): the single-smooth closed-form Gaussian REML entries gaussian_reml_fit and gaussian_reml_fit_positions mapped EstimationError::ModelIsIllConditioned to this payload (status 'degenerate', lambda NaN, edf 0, all-zero coefficients and fitted values), which no Python caller read as a failure. Both entries now propagate the engine's typed error, so a singular X'WX raises IllConditionedError, and the payload has no producer left.",
+    "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
   }
 ]
