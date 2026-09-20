@@ -181,15 +181,57 @@ pub(crate) enum SupportKantorovichVerdict {
     /// `symmetry_directions` exact symmetry directions were projected off, the orbit of
     /// one, unique on the slice. `shift` is the certified `μ` with `A − μ·I ≻ 0` on the
     /// slice, `lipschitz` the Hessian's Lipschitz bound and `eta` the bound on `‖A⁻¹g‖₂`.
+    /// `profiled_phases` periodic atoms had their phase orbit profiled out (#3258): the
+    /// radius then also covers the phase representative's distance to the minimum.
     Certified {
         radius: f64,
         shift: f64,
         lipschitz: f64,
         eta: f64,
         symmetry_directions: usize,
+        profiled_phases: usize,
+    },
+    /// #3258: the orbit of a local minimum of the phase-profiled objective passes within
+    /// `radius` of the iterate, so every output invariant under the phases of
+    /// `phase_atoms` (each decode, the fitted values, the data fit and the smoothing
+    /// energy) is certified, but the minimum itself is only placed within
+    /// `radius + phase_bound` of the iterate, beyond the bound: the phases are unresolved
+    /// at this tolerance, and are not claimed.
+    PhaseUnresolved {
+        radius: f64,
+        shift: f64,
+        lipschitz: f64,
+        eta: f64,
+        symmetry_directions: usize,
+        phase_atoms: Vec<usize>,
+        phase_bound: f64,
     },
     /// A hypothesis was not established at this iterate; the reason names it.
     NotCertified(String),
+}
+
+/// One periodic atom's phase orbit at an installed state
+/// ([`SaeSupportSparseTerm::support_phase_orbits`], #3258).
+#[derive(Debug, Clone)]
+struct SupportPhaseOrbit {
+    atom: usize,
+    /// The atom's ARD precision `α` and the prior's `κ = 2π/P`.
+    alpha: f64,
+    kappa: f64,
+    /// `ρ = |Σᵢ e^{iκtᵢ}|`, its rounding band, and its lower bound over the certificate ball.
+    resultant: f64,
+    resultant_band: f64,
+    resultant_lower: f64,
+    /// `φ = arg Σᵢ e^{iκtᵢ}` in `(−π, π]`, and the resultant's components `ρcos φ`, `ρsin φ`.
+    phase: f64,
+    cosine: f64,
+    sine: f64,
+    /// `(pencil index, cos κtᵢ, sin κtᵢ)` per routed slot.
+    slots: Vec<(usize, f64, f64)>,
+    /// `ξ` over the full pencil.
+    generator: Array1<f64>,
+    /// A bound on `‖ξ‖` over the certificate ball and the orbits through it.
+    generator_reach: f64,
 }
 
 /// The exact Hessian's Lipschitz constant on a ball
@@ -300,6 +342,11 @@ pub struct SaeSupportFixedPointReport {
     /// first-order and recurrence screens, or at a cycle that neither the sweeps nor the
     /// coupled step move.
     pub recurred: bool,
+    /// #3258: periodic atoms whose phase the certificate profiled out and could not
+    /// resolve within the tolerance. The orbit of the minimum is certified, so every
+    /// output invariant under those phases is; the phase coordinate of each listed
+    /// atom is not. Empty when every parameter is certified.
+    pub phase_unresolved_atoms: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1104,6 +1151,119 @@ fn support_project_off(basis: &Array2<f64>, vector: ndarray::ArrayView1<'_, f64>
         return vector.to_owned();
     }
     &vector - &basis.dot(&basis.t().dot(&vector))
+}
+
+/// Whether a harmonic roughness Gram on `[1, sin ω₁t, cos ω₁t, …]` commutes exactly with
+/// every rotation of the harmonic pairs (#3258): diagonal, with bitwise equal entries on
+/// each sine–cosine pair (row `2h − 1` with row `2h`), so `T·S·Tᵀ = S` for every such
+/// rotation `T` without rounding.
+fn support_penalty_commutes_with_harmonic_rotations(penalty: &Array2<f64>, basis_size: usize) -> bool {
+    let partner = |index: usize| if index % 2 == 1 { index + 1 } else { index - 1 };
+    basis_size % 2 == 1
+        && penalty.dim() == (basis_size, basis_size)
+        && (0..basis_size).all(|i| {
+            (0..basis_size).all(|j| i == j || penalty[[i, j]] == 0.0)
+                && (i == 0 || penalty[[i, i]].to_bits() == penalty[[partner(i), partner(i)]].to_bits())
+        })
+}
+
+/// The Newton–Kantorovich slice transverse to `generators` (#2576): the orthonormal basis
+/// `V` of their span, and the Hessian `(I − P)A(I − P)`, gradient `(I − P)g` and step
+/// `(I − P)Δ` with `P = VVᵀ`.
+fn support_slice(
+    mut exact: Array2<f64>,
+    gradient: &Array1<f64>,
+    step: &Array1<f64>,
+    generators: &[Array1<f64>],
+) -> Result<(Array2<f64>, Array1<f64>, Array1<f64>, Array2<f64>), String> {
+    let symmetry = support_orthonormal_span(exact.nrows(), generators)?;
+    let gradient = support_project_off(&symmetry, gradient.view());
+    let step = support_project_off(&symmetry, step.view());
+    if symmetry.ncols() > 0 {
+        // `(I − P)A(I − P) = A − V·W − Wᵀ·Vᵀ + V·(W·V)·Vᵀ` with `W = VᵀA`, formed in place.
+        let projected_rows = symmetry.t().dot(&exact);
+        let corner = projected_rows.dot(&symmetry);
+        ndarray::linalg::general_mat_mul(-1.0, &symmetry, &projected_rows, 1.0, &mut exact);
+        ndarray::linalg::general_mat_mul(-1.0, &projected_rows.t(), &symmetry.t(), 1.0, &mut exact);
+        let lifted = symmetry.dot(&corner);
+        ndarray::linalg::general_mat_mul(1.0, &lifted, &symmetry.t(), 1.0, &mut exact);
+    }
+    Ok((exact, gradient, step, symmetry))
+}
+
+/// The Kantorovich solve error `e = ‖g − AΔ‖ + γ_{n+1}·‖|A||Δ| + |g|‖ + ε_g` of the
+/// sliced step (the middle term bounds the rounding of forming the residual densely), and
+/// `‖Δ‖`.
+fn support_slice_error(
+    exact: &Array2<f64>,
+    gradient: &Array1<f64>,
+    step: &Array1<f64>,
+    gradient_band: f64,
+) -> Result<(f64, f64), String> {
+    let applied = exact.dot(step);
+    let magnitude = exact.mapv(f64::abs).dot(&step.mapv(f64::abs)) + gradient.mapv(f64::abs);
+    let residual = gradient - &applied;
+    let error = residual.dot(&residual).sqrt()
+        + gam_linalg::roundoff::accumulation_growth(exact.nrows() + 1)
+            * magnitude.dot(&magnitude).sqrt()
+        + gradient_band;
+    let step_norm = step.dot(step).sqrt();
+    if !(error.is_finite() && step_norm.is_finite()) {
+        return Err(format!(
+            "support Newton-Kantorovich certificate: non-finite step {step_norm:e} or solve \
+             error {error:e}"
+        ));
+    }
+    Ok((error, step_norm))
+}
+
+/// The smallest shift `μ*` whose certified `A − μ*·I ≻ 0` gives a Kantorovich radius at
+/// most `aim` (`‖Δ‖ < aim`), raised by `γ₈`, the rounding of its own formula
+/// ([`SaeSupportSparseTerm::support_kantorovich_certificate`] derives it).
+fn support_kantorovich_shift(lipschitz: f64, step_norm: f64, error: f64, aim: f64) -> f64 {
+    let computed = if lipschitz > 0.0 {
+        let half_curvature = lipschitz * step_norm
+            + (lipschitz * lipschitz * step_norm * step_norm + 2.0 * lipschitz * error).sqrt();
+        if half_curvature <= lipschitz * aim {
+            half_curvature
+        } else {
+            (lipschitz * aim * aim + 2.0 * error) / (2.0 * (aim - step_norm))
+        }
+    } else {
+        error / (aim - step_norm)
+    };
+    computed * (1.0 + gam_linalg::roundoff::accumulation_growth(8))
+}
+
+/// `(η, t*)` of a certified shift: `η = ‖Δ‖ + e/μ` and `t* = (1 − √(1 − 2h))·μ/L`,
+/// `h = Lη/μ`, rationalized so a small `h` does not cancel. With no solve or rounding
+/// error at all (an exactly zero gradient and step) the shift is zero, `A ≻ 0` was
+/// certified outright, and `η = ‖Δ‖`.
+fn support_kantorovich_radius(
+    lipschitz: f64,
+    shift: f64,
+    step_norm: f64,
+    error: f64,
+) -> (f64, f64) {
+    let eta = if error > 0.0 { step_norm + error / shift } else { step_norm };
+    let radius = if lipschitz > 0.0 && eta > 0.0 {
+        let h = lipschitz / shift * eta;
+        2.0 * eta / (1.0 + (1.0 - 2.0 * h).max(0.0).sqrt())
+    } else {
+        eta
+    };
+    (eta, radius)
+}
+
+/// `A + σ·VVᵀ` with `σ = μ + max Aᵢᵢ`: any stiffness above `μ` on the span of `V` leaves
+/// `A − μ·I ≻ 0` on the slice as the question, and `μ` plus the largest diagonal entry
+/// keeps the factored matrix at `A`'s own scale.
+fn support_add_orbit_stiffness(exact: &mut Array2<f64>, symmetry: &Array2<f64>, shift: f64) {
+    if symmetry.ncols() == 0 {
+        return;
+    }
+    let stiffness = shift + exact.diag().iter().copied().fold(0.0_f64, f64::max);
+    ndarray::linalg::general_mat_mul(stiffness, symmetry, &symmetry.t(), 1.0, exact);
 }
 
 /// The factorization [`certify_shifted_pd`] documents, on an already formed `A − τ·B`.
@@ -2082,12 +2242,21 @@ impl SaeSupportSparseTerm {
                 &transport,
                 self.atoms[atom_index].decoder_coefficients(),
             );
-            // `B_new = T B_old`, hence `S_new = T S_old Tᵀ` for orthogonal T.
-            let smooth_left = fast_ab(&transport, self.atoms[atom_index].smooth_penalty());
-            let smooth_penalty = smooth_left.dot(&transport.t());
+            // `B_new = T B_old`, hence `S_new = T S_old Tᵀ` for orthogonal T. A Gram that
+            // commutes with every harmonic rotation is its own transport exactly, and is kept
+            // bitwise: rounding `T S Tᵀ` would break the exact commutation the phase orbit
+            // of the Newton–Kantorovich certificate is read from (#3258).
+            let transported = |penalty: &Array2<f64>| {
+                if support_penalty_commutes_with_harmonic_rotations(penalty, basis_size) {
+                    penalty.clone()
+                } else {
+                    fast_ab(&transport, penalty).dot(&transport.t())
+                }
+            };
+            let smooth_penalty = transported(self.atoms[atom_index].smooth_penalty());
             let kappa_derivative = self.atoms[atom_index]
                 .smooth_penalty_kappa_derivative()?
-                .map(|derivative| fast_ab(&transport, derivative).dot(&transport.t()));
+                .map(transported);
             let basis_values = self.atoms[atom_index].basis_values.clone();
             let basis_jacobian = self.atoms[atom_index].basis_jacobian.clone();
             self.atoms[atom_index].install_reparameterized_basis(
@@ -8159,6 +8328,137 @@ impl SaeSupportSparseTerm {
         Ok(generators)
     }
 
+    /// The phase orbit of every periodic atom whose phase only the periodic ARD prior
+    /// selects (#3258).
+    ///
+    /// A one-dimensional periodic atom's harmonic basis
+    /// `[1, sin(ω₁t), cos(ω₁t), …, sin(ω_H t), cos(ω_H t)]`, `ω_h = 2πh/P`, `P` its period,
+    /// turns a common shift `t ↦ t + δ` of every routed coordinate into a rotation of each
+    /// harmonic pair of decoder rows, and the counter-rotation `B_s ↦ B_s + δω_h B_c`,
+    /// `B_c ↦ B_c − δω_h B_s` (to first order) leaves every decode unchanged. A roughness
+    /// Gram that commutes with those rotations exactly (diagonal, with bitwise equal entries
+    /// on each pair) does not see them either, so the whole objective moves
+    /// along the orbit only through the atom's ARD energy
+    /// `E(t) = (α/κ²) Σᵢ (1 − cos κtᵢ)`, `κ = 2π/P`. The orbit's generator `ξ` is `1` on
+    /// every routed coordinate and `(ω_h B_c, −ω_h B_s)` on the harmonic decoder rows.
+    ///
+    /// Along the orbit `E(t + δ) = (α/κ²)(n − ρ cos(κδ + φ))`, `ρe^{iφ} = Σᵢ e^{iκtᵢ}`, so the
+    /// orbit's curvature is `αρ`: a weak prior on a well-spread ring pins the phase no
+    /// harder than `αρ`, however well the data resolve everything else. An atom is returned
+    /// only where that minimum is isolated over the whole certificate ball: `ρ` is above
+    /// its rounding band and its largest change over `B(θ, bound)`, `κ√n·bound`, since
+    /// `|∂ρ/∂tᵢ| ≤ κ`.
+    fn support_phase_orbits(
+        &self,
+        ard_precisions: &[Vec<f64>],
+        beta_offsets: &[usize],
+        beta_dim: usize,
+        bound: f64,
+    ) -> Result<Vec<SupportPhaseOrbit>, String> {
+        let t_len = self.coordinate_state_len();
+        let width = self.output_dim;
+        let full_dim = t_len + beta_dim;
+        let mut row_starts = Vec::with_capacity(self.n_obs());
+        let mut cursor = 0usize;
+        for row in 0..self.n_obs() {
+            row_starts.push(cursor);
+            cursor += self.assignment.coords_row(row).len();
+        }
+        let mut orbits = Vec::new();
+        for atom in 0..self.k_atoms() {
+            let rows = &self.atom_rows[atom];
+            let basis_size = self.atoms[atom].basis_size();
+            if self.atoms[atom].basis_kind() != &SaeAtomBasisKind::Periodic
+                || self.assignment.atom_coord_dim(atom) != 1
+                || rows.is_empty()
+                || basis_size < 3
+                || basis_size % 2 == 0
+            {
+                continue;
+            }
+            let alpha = ard_precisions[atom][0];
+            let (Some(period), Some(prior_period)) =
+                (self.atom_axis_periods(atom)[0], self.atom_ard_axis_periods(atom)[0])
+            else {
+                continue;
+            };
+            // The shift that holds every decode closes the prior's circle only when the
+            // chart, the prior and the harmonic basis share one period.
+            if !(alpha > 0.0
+                && period.to_bits() == prior_period.to_bits()
+                && period.to_bits() == super::compact_orbit::PERIODIC_HARMONIC_BASIS_PERIOD.to_bits())
+            {
+                continue;
+            }
+            if !support_penalty_commutes_with_harmonic_rotations(
+                self.atoms[atom].smooth_penalty(),
+                basis_size,
+            ) {
+                continue;
+            }
+            let kappa = std::f64::consts::TAU / prior_period;
+            let mut slots = Vec::with_capacity(rows.len());
+            let (mut cosine, mut sine, mut cosine_absolute, mut sine_absolute) =
+                (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+            let mut generator = Array1::<f64>::zeros(full_dim);
+            for &(row, slot) in rows {
+                let index = row_starts[row]
+                    + self.assignment.support_indices(row)[..slot]
+                        .iter()
+                        .map(|&other| self.assignment.atom_coord_dim(other as usize))
+                        .sum::<usize>();
+                // The prior's own phase formula, so `α·cos κt` cancels its Hessian entry.
+                let (sin, cos) = (kappa * self.assignment.coords_for_slot(row, slot)[0]).sin_cos();
+                cosine += cos;
+                sine += sin;
+                cosine_absolute += cos.abs();
+                sine_absolute += sin.abs();
+                slots.push((index, cos, sin));
+                generator[index] = 1.0;
+            }
+            let count = rows.len();
+            let resultant = sine.hypot(cosine);
+            // As in `profile_periodic_phase_origins`: `γ_{n+2}` of the components' sums.
+            let resultant_band = gam_linalg::roundoff::accumulation_growth(count + 2)
+                * sine_absolute.hypot(cosine_absolute);
+            let resultant_lower = resultant - resultant_band - kappa * (count as f64).sqrt() * bound;
+            if !(resultant_lower > 0.0) {
+                continue;
+            }
+            let decoder = self.atoms[atom].decoder_coefficients();
+            let harmonics = (basis_size - 1) / 2;
+            for harmonic in 1..=harmonics {
+                let frequency = kappa * harmonic as f64;
+                for channel in 0..width {
+                    generator[t_len + beta_offsets[atom] + (2 * harmonic - 1) * width + channel] =
+                        frequency * decoder[[2 * harmonic, channel]];
+                    generator[t_len + beta_offsets[atom] + 2 * harmonic * width + channel] =
+                        -frequency * decoder[[2 * harmonic - 1, channel]];
+                }
+            }
+            // `ξ` is linear in the decoder with norm `max_h ω_h = Hκ`, and a rotation keeps
+            // its norm along the orbit, so `‖ξ‖ ≤ ‖ξ(θ)‖ + Hκ·bound` on the ball and its orbits.
+            let generator_reach = generator.dot(&generator).sqrt()
+                * (1.0 + gam_linalg::roundoff::accumulation_growth(full_dim + 2))
+                + kappa * harmonics as f64 * bound;
+            orbits.push(SupportPhaseOrbit {
+                atom,
+                alpha,
+                kappa,
+                resultant,
+                resultant_band,
+                resultant_lower,
+                phase: sine.atan2(cosine),
+                cosine,
+                sine,
+                slots,
+                generator,
+                generator_reach,
+            });
+        }
+        Ok(orbits)
+    }
+
     /// The inner certificate (#2576, #2933 F08): the Newton–Kantorovich theorem, with
     /// each hypothesis established at the installed state `θ`, on a slice transverse to
     /// the objective's exact symmetry orbits.
@@ -8227,6 +8527,8 @@ impl SaeSupportSparseTerm {
         let (beta_offsets, beta_dim) = self.beta_layout()?;
         let generators =
             self.support_exact_symmetry_generators(ard_precisions, &beta_offsets, beta_dim)?;
+        let phase_orbits =
+            self.support_phase_orbits(ard_precisions, &beta_offsets, beta_dim, bound)?;
         self.support_kantorovich_certificate_on_slice(
             target,
             lambda_smooth,
@@ -8234,6 +8536,7 @@ impl SaeSupportSparseTerm {
             displacement,
             bound,
             &generators,
+            &phase_orbits,
         )
     }
 
@@ -8250,6 +8553,7 @@ impl SaeSupportSparseTerm {
         displacement: &SaeSupportNewtonDisplacement,
         bound: f64,
         generators: &[Array1<f64>],
+        phase_orbits: &[SupportPhaseOrbit],
     ) -> Result<SupportKantorovichVerdict, String> {
         if !(bound.is_finite() && bound > 0.0) {
             return Err(format!(
@@ -8279,11 +8583,10 @@ impl SaeSupportSparseTerm {
         let screen = support_orthonormal_span(full_dim, generators)?;
         let screened = support_project_off(&screen, step.view());
         let projected_norm = screened.dot(&screened).sqrt();
-        // Each shift formula below rounds at most eight times and the radius formula as
-        // often, so the shift is raised by `γ₈` over its computed value, which then bounds
-        // the exact threshold, and aimed at `bound·(1 − γ₁₆)`, so the radius computed from it
-        // stays at or below `bound`.
-        let formula_rounding = gam_linalg::roundoff::accumulation_growth(8);
+        // Each shift formula rounds at most eight times and the radius formula as often, so
+        // the shift is raised by `γ₈` over its computed value ([`support_kantorovich_shift`]),
+        // which then bounds the exact threshold, and aimed at `bound·(1 − γ₁₆)`, so the
+        // radius computed from it stays at or below `bound`.
         let aim = bound * (1.0 - gam_linalg::roundoff::accumulation_growth(16));
         if !(projected_norm < aim) {
             return Ok(SupportKantorovichVerdict::NotCertified(format!(
@@ -8327,7 +8630,7 @@ impl SaeSupportSparseTerm {
                 gradient[index], step[index]
             )));
         }
-        let (mut exact, gradient, step, generators) = if kept.len() == full_dim {
+        let (exact, gradient, step, generators) = if kept.len() == full_dim {
             (exact, gradient, step, generators.to_vec())
         } else {
             (
@@ -8340,39 +8643,37 @@ impl SaeSupportSparseTerm {
                     .collect(),
             )
         };
-        let symmetry = support_orthonormal_span(kept.len(), &generators)?;
-        let gradient = support_project_off(&symmetry, gradient.view());
-        let step = support_project_off(&symmetry, step.view());
-        if symmetry.ncols() > 0 {
-            // `(I − P)A(I − P) = A − V·W − Wᵀ·Vᵀ + V·(W·V)·Vᵀ` with `W = VᵀA`, formed in place.
-            let projected_rows = symmetry.t().dot(&exact);
-            let corner = projected_rows.dot(&symmetry);
-            ndarray::linalg::general_mat_mul(-1.0, &symmetry, &projected_rows, 1.0, &mut exact);
-            ndarray::linalg::general_mat_mul(
-                -1.0,
-                &projected_rows.t(),
-                &symmetry.t(),
-                1.0,
-                &mut exact,
-            );
-            let lifted = symmetry.dot(&corner);
-            ndarray::linalg::general_mat_mul(1.0, &lifted, &symmetry.t(), 1.0, &mut exact);
-        }
-        let applied = exact.dot(&step);
-        let magnitude = exact.mapv(f64::abs).dot(&step.mapv(f64::abs)) + gradient.mapv(f64::abs);
-        let residual = &gradient - &applied;
+        // A phase orbit is profiled only over coordinates the pencil keeps: its generator's
+        // support and its slots, re-indexed into the kept pencil.
+        let kept_index = |index: usize| kept.binary_search(&index).ok();
+        let candidates: Vec<SupportPhaseOrbit> = phase_orbits
+            .iter()
+            .filter_map(|orbit| {
+                let slots = orbit
+                    .slots
+                    .iter()
+                    .map(|&(index, cos, sin)| kept_index(index).map(|kept| (kept, cos, sin)))
+                    .collect::<Option<Vec<_>>>()?;
+                let lost = orbit
+                    .generator
+                    .iter()
+                    .enumerate()
+                    .any(|(index, value)| *value != 0.0 && kept_index(index).is_none());
+                (!lost).then(|| SupportPhaseOrbit {
+                    slots,
+                    generator: orbit.generator.select(ndarray::Axis(0), &kept),
+                    ..orbit.clone()
+                })
+            })
+            .collect();
         let gradient_band = self.gradient_rounding_band(target, lambda_smooth, ard_precisions)?;
-        let error = residual.dot(&residual).sqrt()
-            + gam_linalg::roundoff::accumulation_growth(kept.len() + 1)
-                * magnitude.dot(&magnitude).sqrt()
-            + gradient_band;
-        let step_norm = step.dot(&step).sqrt();
-        if !(error.is_finite() && step_norm.is_finite()) {
-            return Err(format!(
-                "support Newton-Kantorovich certificate: non-finite step {step_norm:e} or solve \
-                 error {error:e}"
-            ));
-        }
+        // The unprojected pencil is kept only while an orbit may still be profiled.
+        let unprojected = (!candidates.is_empty())
+            .then(|| (exact.clone(), gradient.clone(), step.clone(), generators.clone()));
+        let (sliced, sliced_gradient, sliced_step, symmetry) =
+            support_slice(exact, &gradient, &step, &generators)?;
+        let (error, step_norm) =
+            support_slice_error(&sliced, &sliced_gradient, &sliced_step, gradient_band)?;
         if !(step_norm < aim) {
             return Ok(SupportKantorovichVerdict::NotCertified(format!(
                 "Newton displacement off {} exact symmetry directions ‖Δ‖₂ = {step_norm:.6e} is \
@@ -8390,63 +8691,261 @@ impl SaeSupportSparseTerm {
                 )));
             }
         };
-        let computed_shift = if lipschitz > 0.0 {
-            let half_curvature = lipschitz * step_norm
-                + (lipschitz * lipschitz * step_norm * step_norm + 2.0 * lipschitz * error).sqrt();
-            if half_curvature <= lipschitz * aim {
-                half_curvature
-            } else {
-                (lipschitz * aim * aim + 2.0 * error) / (2.0 * (aim - step_norm))
-            }
-        } else {
-            error / (aim - step_norm)
-        };
-        let shift = computed_shift * (1.0 + formula_rounding);
-        if symmetry.ncols() > 0 {
-            // Any stiffness above `μ` on `N` leaves `A − μ·I ≻ 0` on the slice as the question;
-            // `μ` plus the largest diagonal entry keeps the factored matrix at `A`'s own scale.
-            let orbit_stiffness =
-                shift + exact.diag().iter().copied().fold(0.0_f64, f64::max);
-            ndarray::linalg::general_mat_mul(
-                orbit_stiffness,
-                &symmetry,
-                &symmetry.t(),
-                1.0,
-                &mut exact,
-            );
-        }
-        match certify_shifted_identity_pd(exact, shift) {
-            Ok(_) => {
-                // With no solve or rounding error at all (an exactly zero gradient and step)
-                // the shift is zero, `A ≻ 0` was certified outright, and `η = ‖Δ‖`.
-                let eta = if error > 0.0 { step_norm + error / shift } else { step_norm };
-                // `(1 − √(1 − 2h))/u`, rationalized so a small `h` does not cancel.
-                let radius = if lipschitz > 0.0 && eta > 0.0 {
-                    let h = lipschitz / shift * eta;
-                    2.0 * eta / (1.0 + (1.0 - 2.0 * h).max(0.0).sqrt())
-                } else {
-                    eta
-                };
-                if !(radius <= bound) {
-                    return Ok(SupportKantorovichVerdict::NotCertified(format!(
-                        "the certified radius {radius:.17e} exceeds the bound {bound:.17e}"
-                    )));
+        let shift = support_kantorovich_shift(lipschitz, step_norm, error, aim);
+        // #3258: a phase orbit whose unit direction `v̂` off the slice has
+        // `v̂ᵀ(I − P)A(I − P)v̂ ≤ μ` makes `A − μ·I ≻ 0` on the slice false, so the
+        // certificate above cannot hold at this iterate; those orbits, and only those, are
+        // profiled out.
+        let profiled: Vec<SupportPhaseOrbit> = candidates
+            .into_iter()
+            .filter(|orbit| {
+                let direction = support_project_off(&symmetry, orbit.generator.view());
+                let norm_squared = direction.dot(&direction);
+                norm_squared > 0.0 && sliced.dot(&direction).dot(&direction) <= shift * norm_squared
+            })
+            .collect();
+        if profiled.is_empty() {
+            let mut stiffened = sliced;
+            support_add_orbit_stiffness(&mut stiffened, &symmetry, shift);
+            return match certify_shifted_identity_pd(stiffened, shift) {
+                Ok(_) => {
+                    let (eta, radius) =
+                        support_kantorovich_radius(lipschitz, shift, step_norm, error);
+                    if !(radius <= bound) {
+                        return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                            "the certified radius {radius:.17e} exceeds the bound {bound:.17e}"
+                        )));
+                    }
+                    Ok(SupportKantorovichVerdict::Certified {
+                        radius,
+                        shift,
+                        lipschitz,
+                        eta,
+                        symmetry_directions: symmetry.ncols(),
+                        profiled_phases: 0,
+                    })
                 }
-                Ok(SupportKantorovichVerdict::Certified {
+                Err(refusal) => Ok(SupportKantorovichVerdict::NotCertified(format!(
+                    "A − μ·I ≻ 0 not certified at μ = {shift:.6e} off {} exact symmetry \
+                     directions (L = {lipschitz:.6e}, ‖Δ‖₂ = {step_norm:.6e}, solve and \
+                     rounding error {error:.6e}, bound {bound:.6e}): {refusal:?}",
+                    symmetry.ncols()
+                ))),
+            };
+        }
+        drop(sliced);
+        let Some((exact, gradient, step, generators)) = unprojected else {
+            return Err(
+                "support Newton-Kantorovich certificate: phase orbits profiled without \
+                 candidates"
+                    .to_string(),
+            );
+        };
+        self.support_phase_profiled_certificate(
+            exact,
+            gradient,
+            step,
+            generators,
+            &profiled,
+            gradient_band,
+            lipschitz,
+            aim,
+            bound,
+        )
+    }
+
+    /// The certificate on the phase-profiled objective (#3258), for the orbits `profiled`
+    /// [`Self::support_kantorovich_certificate_on_slice`] found the direct certificate
+    /// cannot resolve. `exact`, `gradient` and `step` are the kept pencil's, before any
+    /// projection, and `generators` the exact symmetry directions on it.
+    ///
+    /// Profiling. Only the ARD energy `E` of an orbit's atom moves along the orbit, so
+    /// `Φ(y) = min_δ F(g_δ y) = F(y) − E(t) + Ẽ(t)` with `Ẽ = (α/κ²)(n − ρ)`, attained at
+    /// `δ* = −φ/κ`. `Ẽ` is invariant along the orbit, so `ξ` joins the exact symmetry
+    /// generators of `Φ` and the slice is taken transverse to them all. With
+    /// `cᵢ = cos(κtᵢ − φ)`, `sᵢ = sin(κtᵢ − φ)`, `∂ρ/∂tᵢ = −κsᵢ` and `∂φ/∂tᵢ = κcᵢ/ρ`, so
+    /// - `∇Φ = g + (α/κ)(s − sin κt)` on the atom's slots,
+    /// - `∇²Φ = A + α·diag(c − cos κt) − (α/ρ)ccᵀ` on the atom's slot block.
+    ///
+    /// The Kantorovich hypotheses for `Φ` on `B(θ, bound)`:
+    /// - `L_Φ = L + max_a (α_aκ_a + L_Ẽ,a)`: `α·diag(cos κt)` varies by at most `ακ`, and
+    ///   `‖d∇²Ẽ‖ ≤ ακ[1 + 3√n/ρ⁻ + 3n^{3/2}/ρ⁻²]‖dy‖` from `|dcᵢ| ≤ κ(|dtᵢ| + |dφ|)`,
+    ///   `|dφ| ≤ κ√n‖dy‖/ρ⁻`, `|dρ| ≤ κ√n‖dy‖` and `‖ccᵀ‖ ≤ n`, with `ρ⁻` the resultant's
+    ///   lower bound on the ball; the atoms' slot blocks are disjoint, so the maximum.
+    /// - `e`: the residual `∇Φ − ∇²Φ·Δ` of the same displacement, with the gradient band
+    ///   raised by the rounding of `sᵢ` (its direction error `band/ρ⁻` times `|cᵢ|` and
+    ///   `γ₈` of the formula), and the computed `∇²Φ` within `ε_A` of the exact one in norm,
+    ///   `ε_A = γ₃(max|Aᵢᵢ| + αn/ρ⁻) + α[(band/ρ⁻ + γ₈)(1 + 3n/ρ⁻) + n·band/ρ⁻²]`, so
+    ///   `A − (μ + ε_A)·I ≻ 0` is what is factored.
+    ///
+    /// It gives a local minimum orbit `y*` of `Φ` within `t*` of `θ`. Then
+    /// `x* = g_{δ*(y*)} y*` minimizes `F` locally, since `F(g_δ y) ≥ Φ(y) ≥ Φ(y*) = F(x*)`
+    /// for every `y` near `y*`, and every output invariant under the phases is the same at
+    /// `x*` as at `y*`. For the minimum itself, `‖y − g_δ y‖ ≤ |δ|·‖ξ‖` along an orbit,
+    /// with `‖ξ‖ ≤ X_a` on the ball ([`Self::support_phase_orbits`]), and
+    /// `|δ*_a(y*)| ≤ (|φ_a| + band_a/ρ⁻_a)/κ_a + √n_a·t*/ρ⁻_a`. The atoms move disjoint
+    /// coordinates, so
+    /// `‖θ − x*‖ ≤ t* + D + t*·G`, `D = ‖((|φ_a| + band_a/ρ⁻_a)X_a/κ_a)_a‖`,
+    /// `G = ‖(√n_a X_a/ρ⁻_a)_a‖`.
+    ///
+    /// The verdict. `A_Φ − μ·I ≻ 0` at the `μ` aimed at `bound` certifies the invariant
+    /// outputs; without it the verdict is a refusal. The minimum itself is certified when
+    /// `A_Φ − μ·I ≻ 0` also holds at the `μ` aimed at `(bound − D)/(1 + G)`, so that
+    /// `t* + D + t*·G ≤ bound`. Otherwise the phases are reported unresolved.
+    #[allow(clippy::too_many_arguments)]
+    fn support_phase_profiled_certificate(
+        &self,
+        mut exact: Array2<f64>,
+        mut gradient: Array1<f64>,
+        step: Array1<f64>,
+        mut generators: Vec<Array1<f64>>,
+        profiled: &[SupportPhaseOrbit],
+        gradient_band: f64,
+        lipschitz: f64,
+        aim: f64,
+        bound: f64,
+    ) -> Result<SupportKantorovichVerdict, String> {
+        let formula = gam_linalg::roundoff::accumulation_growth(8);
+        let mut profile_band_squared = 0.0_f64;
+        let mut hessian_band = 0.0_f64;
+        let mut lipschitz_extra = 0.0_f64;
+        let mut offset_squared = 0.0_f64;
+        let mut growth_squared = 0.0_f64;
+        for orbit in profiled {
+            let (alpha, kappa, resultant) = (orbit.alpha, orbit.kappa, orbit.resultant);
+            let lower = orbit.resultant_lower;
+            let count = orbit.slots.len() as f64;
+            let angle_band = orbit.resultant_band / lower;
+            let centered: Vec<(usize, f64, f64, f64, f64)> = orbit
+                .slots
+                .iter()
+                .map(|&(index, cos, sin)| {
+                    (
+                        index,
+                        cos,
+                        sin,
+                        (cos * orbit.cosine + sin * orbit.sine) / resultant,
+                        (sin * orbit.cosine - cos * orbit.sine) / resultant,
+                    )
+                })
+                .collect();
+            let mut diagonal = 0.0_f64;
+            for &(index, cos, sin, c, s) in &centered {
+                exact[[index, index]] += alpha * (c - cos);
+                gradient[index] += (alpha / kappa) * (s - sin);
+                let rounding =
+                    (alpha / kappa) * (c.abs() * angle_band + formula * (s.abs() + sin.abs()));
+                profile_band_squared += rounding * rounding;
+            }
+            for &(row, _, _, c_row, _) in &centered {
+                for &(column, _, _, c_column, _) in &centered {
+                    exact[[row, column]] -= (alpha / resultant) * c_row * c_column;
+                }
+                diagonal = diagonal.max(exact[[row, row]].abs());
+            }
+            hessian_band = hessian_band.max(
+                gam_linalg::roundoff::accumulation_growth(3) * (diagonal + alpha * count / lower)
+                    + alpha
+                        * ((angle_band + formula) * (1.0 + 3.0 * count / lower)
+                            + count * orbit.resultant_band / (lower * lower)),
+            );
+            lipschitz_extra = lipschitz_extra.max(
+                alpha
+                    * kappa
+                    * (2.0
+                        + 3.0 * count.sqrt() / lower
+                        + 3.0 * count * count.sqrt() / (lower * lower)),
+            );
+            let offset = (orbit.phase.abs() + angle_band) / kappa * orbit.generator_reach;
+            let growth = count.sqrt() * orbit.generator_reach / lower;
+            offset_squared += offset * offset;
+            growth_squared += growth * growth;
+            generators.push(orbit.generator.clone());
+        }
+        // Each norm is a sum of `|Π|` squares and a root; the bound rounds a few more times.
+        let norm_rounding = 1.0 + gam_linalg::roundoff::accumulation_growth(2 * profiled.len() + 8);
+        let phase_offset = offset_squared.sqrt() * norm_rounding;
+        let phase_growth = growth_squared.sqrt() * norm_rounding;
+        let phase_atoms: Vec<usize> = profiled.iter().map(|orbit| orbit.atom).collect();
+        let (sliced, sliced_gradient, sliced_step, symmetry) =
+            support_slice(exact, &gradient, &step, &generators)?;
+        let (error, step_norm) = support_slice_error(
+            &sliced,
+            &sliced_gradient,
+            &sliced_step,
+            gradient_band + profile_band_squared.sqrt(),
+        )?;
+        let lipschitz = (lipschitz + lipschitz_extra) * (1.0 + formula);
+        if !(step_norm < aim) {
+            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "Newton displacement off {} exact symmetry and phase directions ‖Δ‖₂ = \
+                 {step_norm:.6e} is not below the bound {bound:.6e}",
+                symmetry.ncols()
+            )));
+        }
+        let orbit_shift = support_kantorovich_shift(lipschitz, step_norm, error, aim);
+        let full_aim = (aim - phase_offset) / (1.0 + phase_growth) * (1.0 - formula);
+        let full_shift = (full_aim > step_norm)
+            .then(|| support_kantorovich_shift(lipschitz, step_norm, error, full_aim));
+        // `μ*` falls as its aim grows, so the full shift is at least the orbit shift and a
+        // certificate at it certifies the orbit shift too.
+        let full_shift = full_shift.map(|full| full.max(orbit_shift));
+        let mut stiffened = sliced;
+        support_add_orbit_stiffness(
+            &mut stiffened,
+            &symmetry,
+            full_shift.unwrap_or(orbit_shift) + hessian_band,
+        );
+        let full_certified = match full_shift {
+            Some(full) => {
+                certify_shifted_identity_pd(stiffened.clone(), full + hessian_band).is_ok()
+            }
+            None => false,
+        };
+        if !full_certified {
+            if let Err(refusal) = certify_shifted_identity_pd(stiffened, orbit_shift + hessian_band)
+            {
+                return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                    "A_Φ − μ·I ≻ 0 not certified at μ = {orbit_shift:.6e} (+ {hessian_band:.3e}) \
+                     off {} exact symmetry and phase directions of atoms {phase_atoms:?} (L_Φ = \
+                     {lipschitz:.6e}, ‖Δ‖₂ = {step_norm:.6e}, solve and rounding error \
+                     {error:.6e}, bound {bound:.6e}): {refusal:?}",
+                    symmetry.ncols()
+                )));
+            }
+        }
+        let (orbit_eta, orbit_radius) =
+            support_kantorovich_radius(lipschitz, orbit_shift, step_norm, error);
+        if !(orbit_radius <= bound) {
+            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                "the certified phase-profiled radius {orbit_radius:.17e} exceeds the bound \
+                 {bound:.17e}"
+            )));
+        }
+        // The minimum itself: the stronger claim, at the shift aimed at `(bound − D)/(1 + G)`.
+        if let (true, Some(full)) = (full_certified, full_shift) {
+            let (eta, radius) = support_kantorovich_radius(lipschitz, full, step_norm, error);
+            let radius = (radius + phase_offset + radius * phase_growth) * norm_rounding;
+            if radius <= bound {
+                return Ok(SupportKantorovichVerdict::Certified {
                     radius,
-                    shift,
+                    shift: full,
                     lipschitz,
                     eta,
                     symmetry_directions: symmetry.ncols(),
-                })
+                    profiled_phases: profiled.len(),
+                });
             }
-            Err(refusal) => Ok(SupportKantorovichVerdict::NotCertified(format!(
-                "A − μ·I ≻ 0 not certified at μ = {shift:.6e} off {} exact symmetry directions \
-                 (L = {lipschitz:.6e}, ‖Δ‖₂ = {step_norm:.6e}, solve and rounding error \
-                 {error:.6e}, bound {bound:.6e}): {refusal:?}",
-                symmetry.ncols()
-            ))),
         }
+        Ok(SupportKantorovichVerdict::PhaseUnresolved {
+            radius: orbit_radius,
+            shift: orbit_shift,
+            lipschitz,
+            eta: orbit_eta,
+            symmetry_directions: symmetry.ncols(),
+            phase_atoms,
+            phase_bound: (phase_offset + orbit_radius * phase_growth) * norm_rounding,
+        })
     }
 
     /// Every row's discrete support, flattened with its length, so a carried
@@ -9423,6 +9922,7 @@ impl SaeSupportSparseTerm {
                         lipschitz,
                         eta,
                         symmetry_directions,
+                        profiled_phases,
                     } => {
                         log::debug!(
                             "support fixed-point cycle {iteration}: raw KKT max={:.3e} rel={:.3e} \
@@ -9431,7 +9931,8 @@ impl SaeSupportSparseTerm {
                              anderson_accepted={accepted_extrapolations} \
                              joint_accepted={joint_accepted}; Newton-Kantorovich: minimum within \
                              {radius:.3e} <= {bound:.3e} (eta {eta:.3e}, A - {shift:.3e} I > 0 off \
-                             {symmetry_directions} exact symmetry directions, L {lipschitz:.3e}){}",
+                             {symmetry_directions} exact symmetry directions, {profiled_phases} \
+                             profiled phases, L {lipschitz:.3e}){}",
                             stationarity.max_abs(),
                             stationarity.max_abs() / kkt_scale,
                             stationarity.scaled_max_abs(),
@@ -9449,6 +9950,42 @@ impl SaeSupportSparseTerm {
                             newton_displacement,
                             max_recurrence_change: max_change,
                             recurred: true,
+                            phase_unresolved_atoms: Vec::new(),
+                        });
+                    }
+                    SupportKantorovichVerdict::PhaseUnresolved {
+                        radius,
+                        shift,
+                        lipschitz,
+                        eta,
+                        symmetry_directions,
+                        phase_atoms,
+                        phase_bound,
+                    } => {
+                        // #3258: the orbit is resolved and the phase is not. Another
+                        // cycle cannot change that, since it is f64's resolution of the
+                        // prior that breaks the phase symmetry, so the state is returned
+                        // with the unresolved phases named instead of claimed.
+                        log::debug!(
+                            "support fixed-point cycle {iteration}: exact Newton displacement \
+                             {:.3e} objective={:.6e}; Newton-Kantorovich on the phase-profiled \
+                             objective: orbit of a minimum within {radius:.3e} <= {bound:.3e} \
+                             (eta {eta:.3e}, A_Φ - {shift:.3e} I > 0 off {symmetry_directions} \
+                             symmetry directions, L {lipschitz:.3e}); the phases of atoms \
+                             {phase_atoms:?} are placed only within {phase_bound:.3e} and are \
+                             unresolved{}",
+                            newton_displacement.max_abs(),
+                            objective,
+                            if stall.is_some() { ", priced at a stalled cycle" } else { "" },
+                        );
+                        return Ok(SaeSupportFixedPointReport {
+                            iterations: iteration,
+                            objective,
+                            stationarity,
+                            newton_displacement,
+                            max_recurrence_change: max_change,
+                            recurred: true,
+                            phase_unresolved_atoms: phase_atoms,
                         });
                     }
                     SupportKantorovichVerdict::NotCertified(reason) => {

@@ -31,7 +31,7 @@ use gam_math::special::bessel_i0_centered_terms_from_log_abs;
 /// `cos(2π·h·t)`, so a shift of `t` by one leaves every column unchanged
 /// ([`crate::basis::PeriodicHarmonicEvaluator`], `atom_build.rs`'s `PeriodicHarmonics` plan on
 /// `t ∈ [0, 1)`).
-const PERIODIC_HARMONIC_BASIS_PERIOD: f64 = 1.0;
+pub(crate) const PERIODIC_HARMONIC_BASIS_PERIOD: f64 = 1.0;
 
 /// Why an atom's chart orbit keeps the Laplace pricing of its tangent.
 #[derive(Debug, Clone, PartialEq)]

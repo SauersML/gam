@@ -331,3 +331,99 @@ fn noisy_ring_weak_direction_is_the_periodic_phase_3258() {
         );
     }
 }
+
+/// #3258 pins. Where a weak periodic ARD prior is the only thing that selects an atom's
+/// phase, the direct certificate on the slice off the exact symmetries cannot hold (the
+/// phase direction's curvature `αρ/‖ξ‖²` is below the shift it needs), and profiling the
+/// phase out must decide the verdict instead: the phase-profiled certificate is certified
+/// or names the unresolved phases, and withholding the phase orbits refuses at the same
+/// state. Where the prior is strong the phase is resolved directly and nothing is profiled.
+#[test]
+fn noisy_ring_certificate_profiles_the_weak_periodic_phase_3258() {
+    let (seed, target) = noisy_ring_seed_3258();
+    let k = seed.k_atoms();
+    for (log_lambda, alpha, weak) in [
+        (0.0_f64, 1.0_f64, false),
+        (2.0, 1.0e-3, true),
+        (4.0, 1.0e-4, true),
+    ] {
+        let lambda = vec![log_lambda.exp(); k];
+        let ard = vec![vec![alpha]; k];
+        let mut term = seed.clone();
+        let tolerance = term.fixed_point_tolerance();
+        let report = term
+            .solve_fixed_point(target.view(), &lambda, &ard, tolerance, 1.0)
+            .unwrap_or_else(|error| {
+                panic!("log λ = {log_lambda}, α = {alpha:e}: the fixed point certifies: {error}")
+            });
+        assert!(report.recurred, "log λ = {log_lambda}, α = {alpha:e}: {report:?}");
+        let parameter_scale = term.parameter_iterate_scale().expect("parameter scale");
+        let bound = tolerance * parameter_scale;
+        let (newton, _) = term
+            .exact_newton_solve(target.view(), &lambda, &ard)
+            .expect("exact Newton displacement");
+        let (offsets, beta_dim) = term.beta_layout().expect("beta layout");
+        let generators = term
+            .support_exact_symmetry_generators(&ard, &offsets, beta_dim)
+            .expect("generators");
+        let phase_orbits = term
+            .support_phase_orbits(&ard, &offsets, beta_dim, bound)
+            .expect("phase orbits");
+        let verdict = term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &generators,
+                &phase_orbits,
+            )
+            .expect("certificate");
+        let withheld = term
+            .support_kantorovich_certificate_on_slice(
+                target.view(),
+                &lambda,
+                &ard,
+                &newton,
+                bound,
+                &generators,
+                &[],
+            )
+            .expect("certificate without the phase orbits");
+        println!(
+            "[#3258 pin] log λ = {log_lambda}, α = {alpha:e}: {} phase orbits, unresolved \
+             {:?}, verdict {verdict:?}; without the orbits {withheld:?}",
+            phase_orbits.len(),
+            report.phase_unresolved_atoms,
+        );
+        if weak {
+            match &verdict {
+                SupportKantorovichVerdict::Certified { profiled_phases, .. } => {
+                    assert!(*profiled_phases > 0, "α = {alpha:e}: {verdict:?}");
+                    assert!(report.phase_unresolved_atoms.is_empty());
+                }
+                SupportKantorovichVerdict::PhaseUnresolved { phase_atoms, .. } => {
+                    assert!(!phase_atoms.is_empty());
+                    assert_eq!(&report.phase_unresolved_atoms, phase_atoms);
+                }
+                SupportKantorovichVerdict::NotCertified(reason) => {
+                    panic!("α = {alpha:e}: the phase-profiled certificate refused: {reason}")
+                }
+            }
+            assert!(
+                matches!(withheld, SupportKantorovichVerdict::NotCertified(_)),
+                "α = {alpha:e}: the weak phase must defeat the direct certificate: {withheld:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    verdict,
+                    SupportKantorovichVerdict::Certified { profiled_phases: 0, .. }
+                ),
+                "α = {alpha:e}: a strong prior resolves the phase directly: {verdict:?}"
+            );
+            assert!(report.phase_unresolved_atoms.is_empty());
+        }
+    }
+}
