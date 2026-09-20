@@ -344,6 +344,124 @@ fn production_gradient_lane_returns_the_streaming_gradient_where_direct_logdet_i
     }
 }
 
+/// A K=1 softmax term on a non-periodic `EuclideanPatch` atom (latent dimension 1,
+/// degree 2) decoding a planted parabolic arc embedded in `R^p`, seeded at the planted
+/// coordinate with its least-squares decoder. The chart has no orbit generator, so the
+/// streaming route prices it through the rational lane and its derivative bundle.
+fn planted_arc_seed_term(n: usize, p: usize, sigma: f64) -> (SaeManifoldTerm, Array2<f64>) {
+    use super::tests::deterministic_circle_noise;
+    use gam_linalg::faer_ndarray::{FaerCholesky, fast_ata, fast_atb};
+    let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| {
+        -1.0 + 2.0 * (row as f64) / (n as f64 - 1.0)
+    });
+    let target = Array2::<f64>::from_shape_fn((n, p), |(row, col)| {
+        let t = coords[[row, 0]];
+        deterministic_circle_noise(col, 0) * t
+            + deterministic_circle_noise(col, 1) * t * t
+            + sigma * deterministic_circle_noise(row, col)
+    });
+    let evaluator = Arc::new(
+        crate::basis::EuclideanPatchEvaluator::new(1, 2)
+            .expect("dim 1, degree 2 is a valid Euclidean patch"),
+    );
+    let (phi, jet) = evaluator
+        .evaluate(coords.view())
+        .expect("the planted coordinates lie in the Euclidean patch domain");
+    let decoder = fast_ata(&phi)
+        .cholesky(Side::Lower)
+        .expect("the planted arc's patch Gram is positive definite")
+        .solve_mat(&fast_atb(&phi, &target));
+    let m = phi.ncols();
+    let atom = SaeManifoldAtom::new_with_provided_function_gram(
+        "arc",
+        SaeAtomBasisKind::EuclideanPatch,
+        1,
+        phi,
+        jet,
+        decoder,
+        Array2::<f64>::eye(m),
+    )
+    .expect("phi, jet, decoder and gram were built with matching shapes")
+    .with_basis_evaluator(evaluator);
+    let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+        Array2::<f64>::zeros((n, 1)),
+        vec![coords],
+        vec![LatentManifold::Euclidean],
+        AssignmentMode::softmax(1.0),
+    )
+    .expect("one logit column, coordinate block and manifold");
+    (
+        SaeManifoldTerm::new(vec![atom], assignment).expect("one atom over the same rows"),
+        target,
+    )
+}
+
+/// #2933 F29 — the premise [`SaeManifoldOuterObjective::logdet_gradient_probe_samples`]
+/// splits the surrogate gradient on: the streaming gradient is affine in its derivative
+/// bundle's second moment under the channels' `1/|V|` normalization, so the gradient on
+/// the whole bundle `V` is the mean of the gradients taken on each vector of `V` alone.
+/// A channel normalized by anything else, or nonlinear in a vector, breaks the identity
+/// and with it the per-probe rows the recertification's standard error comes from.
+///
+/// The host reading is starved the way the #979 lane test starves it, so the evaluation
+/// takes the streaming route; the chart is a non-periodic arc, so that route carries a
+/// derivative bundle rather than the circle orbit lane's exact elimination.
+#[test]
+fn streaming_gradient_is_affine_in_the_derivative_bundle_second_moment_2933() {
+    gam_runtime::test_support::install_diagnostic_logger();
+    let (mut term, target) = planted_arc_seed_term(256, 4, 0.02);
+    term.gpu_policy = gam_gpu::GpuPolicy::Off;
+    let default_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the default host reading");
+    term.host_available_bytes = super::streaming_plan::SAE_HOST_MEMORY_RESERVE_FLOOR_BYTES
+        .saturating_add(default_plan.estimated_exact_stationarity_bytes)
+        .saturating_sub(1);
+    let starved_plan = term
+        .streaming_plan()
+        .expect("streaming plan at the starved host reading");
+    assert!(
+        starved_plan.matrix_free_admitted && !starved_plan.direct_logdet_admitted(),
+        "premise: the planner admits matrix-free evidence and refuses direct evidence; \
+         plan={starved_plan:?}"
+    );
+    let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
+    let mut objective =
+        SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6);
+    let rho_flat = objective.baseline_rho.flat_coordinates();
+    let rho = objective
+        .baseline_rho
+        .from_flat(rho_flat.view())
+        .expect("typed rho layout");
+    let evaluation = objective
+        .evaluate_outer_criterion_route(&rho, false, false)
+        .expect("streaming evaluation");
+    let (full, rows) = objective
+        .streaming_gradient_per_bundle_vector(&rho, &evaluation)
+        .expect("gradients on the bundle and on each of its vectors")
+        .expect("premise: the starved host reading evaluates on the streaming route");
+    assert!(
+        rows.len() >= 2,
+        "premise: the bundle carries several vectors to average; it carries {}",
+        rows.len()
+    );
+    let count = rows.len() as f64;
+    for coordinate in 0..full.len() {
+        let mean = rows.iter().map(|row| row[coordinate]).sum::<f64>() / count;
+        let magnitude = rows
+            .iter()
+            .map(|row| row[coordinate].abs())
+            .fold(full[coordinate].abs(), f64::max);
+        eprintln!(
+            "F29 affinity coord {coordinate}: full={:.17e} mean={mean:.17e} diff={:.3e} scale={magnitude:.3e} r={}",
+            full[coordinate],
+            (full[coordinate] - mean).abs(),
+            rows.len()
+        );
+    }
+    panic!("measure");
+}
+
 /// #2515 blocker 3 — WHICH assembly the stale-pair guard is comparing.
 ///
 /// `production_objective_forced_streaming_value_gradient_matches_dense` dies on
