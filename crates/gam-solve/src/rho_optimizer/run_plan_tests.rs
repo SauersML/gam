@@ -6491,6 +6491,11 @@ mod arc_rejected_trials_3017_tests;
 #[path = "cost_stall_objective_band_3018_tests.rs"]
 mod cost_stall_objective_band_3018_tests;
 
+// An ARC claim on a trial above the iterate it left is declined as a
+// dominated plateau (#3279).
+#[path = "arc_uphill_trial_claim_3279_tests.rs"]
+mod arc_uphill_trial_claim_3279_tests;
+
 // A run whose probes are refused ends on the refused step's own linear model,
 // not on a count of refusals (#3219).
 #[path = "probe_refusal_derived_bound_3219_tests.rs"]

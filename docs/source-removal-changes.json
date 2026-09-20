@@ -2433,11 +2433,19 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 8 items. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
   },
   {
-    "base": "e393d691f5e4ba55ff747cbd63759479aed75ffa",
+    "base": "391a766e1012d99b0e0b43d8ff0b3db941b82523",
+    "items": [
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:set_degenerate_gaussian_reml_items"
+    ],
+    "reason": "#3310 (backfill for e8568910a9, PR #3367, which landed the removal without an entry): the single-smooth closed-form Gaussian REML entries gaussian_reml_fit and gaussian_reml_fit_positions mapped EstimationError::ModelIsIllConditioned to this payload (status 'degenerate', lambda NaN, edf 0, all-zero coefficients and fitted values), which no Python caller read as a failure. Both entries now propagate the engine's typed error, so a singular X'WX raises IllConditionedError, and the payload has no producer left.",
+    "evidence": "git grep -n -w set_degenerate_gaussian_reml_items at 391a766e10 finds its declaration in crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs and exactly two calls, the ModelIsIllConditioned arms of gaussian_reml_fit and gaussian_reml_fit_positions in crates/gam-pyffi/src/model/model_ffi.rs, which 8fae1cc34e removes. scripts/source_removal_guard.py --base 391a766e10 --head e8568910a9 names exactly this item (production_occurrences 3). The removal was measured independently by the direct gate run dy5 w2saeb-3310-g1 (direct-dy5-w2saeb-3310-g1.log), whose source-removal guard named the same item for an equivalent change."
+  },
+  {
+    "base": "801ff9f60defaf03e13a5e950f4e6e45b2d106c7",
     "items": [
       "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817"
     ],
     "reason": "#3176: FixedPointProgress judges each evaluation on its own (a resolved improvement of the incumbent, charged each value's own rounding gamma_1*|V|, or a contraction of the step) instead of filling COST_STALL_WINDOW-evaluation windows, so a limit-cycling walk stops at its first unprogressing evaluation, not its second window. The pin restating the second-window stop is replaced by a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
-    "evidence": "At base e393d691f5 source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
+    "evidence": "At base 801ff9f60d source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
   }
 ]
