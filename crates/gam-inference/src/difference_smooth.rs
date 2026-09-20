@@ -8,6 +8,7 @@
 use crate::effects::{
     self, BandOptions, CovarianceSource, PointwiseBandOptions, SimultaneousBandOptions,
 };
+use crate::interval_reference::IntervalReference;
 use gam_data::{ColumnKindTag, DataSchema};
 use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array2, ArrayView1, ArrayView2, s};
@@ -55,6 +56,10 @@ pub struct DifferenceSmoothInputs<'a> {
     pub beta: ArrayView1<'a, f64>,
     pub covariance: ArrayView2<'a, f64>,
     pub covariance_source: CovarianceSource,
+    /// Law of the standardized band pivot, from [`IntervalReference::of_fit`]:
+    /// Student-t on `n − edf` when `covariance` carries an estimated
+    /// dispersion, normal otherwise.
+    pub reference: IntervalReference,
 }
 
 pub fn difference_smooth_report(
@@ -206,6 +211,7 @@ pub fn difference_smooth_report(
             inputs.covariance,
             contrast.view(),
             band_options,
+            inputs.reference,
         )
         .map_err(|error| error.to_string())?;
         for (index, &x) in grid.iter().enumerate() {
@@ -403,6 +409,7 @@ mod tests {
                 beta: beta.view(),
                 covariance: covariance.view(),
                 covariance_source: CovarianceSource::Conditional,
+                reference: IntervalReference::Normal,
             },
             request,
             |_, rows| {
