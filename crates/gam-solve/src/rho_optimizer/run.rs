@@ -4194,7 +4194,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // still carries the exact value/gradient that caused certification to stop.
     result.final_value = evaluation.cost;
     result.final_grad_norm = Some(projected_grad_norm);
-    result.record_measurement_at_rho(evaluation.cost, evaluation.gradient);
+    result.record_measurement_at_rho_after(
+        run_recorded.as_ref(),
+        evaluation.cost,
+        evaluation.gradient,
+    );
 
     // #2596 — a pass that spends LESS evidence must not produce a STRONGER
     // refusal than the pass that mints.
@@ -4560,43 +4564,67 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
             result.rho.to_vec(),
         );
     }
+
+    // Every measurement already taken at this ρ is a witness, not only the most
+    // recent one. The mint re-measures the ρ screening certified, from the same
+    // inner warm start screening left behind, so screening's evaluation and the
+    // mint's are bit-identical and their spread is zero; the run-recorded
+    // measurement that disagreed with screening's is carried in the record
+    // (`OuterFirstOrderMeasurement`'s earlier same-ρ measurements) and is read
+    // here. The spread is the largest over those witnesses whose objective
+    // value agrees with this evaluation's, each gated exactly as the single
+    // pair was: a gradient that reproduces across all of them still yields
+    // zero, so genuine descent is never masked.
     if decrement_decided.is_none()
         && projected_grad_norm > stationarity_bound
         && let Some(prior) = run_recorded.as_ref()
         && prior.is_at(&result.rho)
-        && layout
-            .validate_gradient_len(prior.gradient(), "outer run-recorded gradient")
-            .is_ok()
-        && prior.gradient().iter().all(|value| value.is_finite())
-        && prior.value().is_finite()
     {
         const GRADIENT_REPRODUCIBILITY_WIDENING: f64 = 2.0;
         let objective_tol = outer_criterion_resolution(config);
-        let cost_drift = (prior.value() - evaluation.cost).abs();
-        let prior_projected = project_gradient_vector(
-            &result.rho,
-            prior.gradient(),
-            Some(&rail_projection_bounds),
-        );
-        let spread = (&prior_projected - &projected_gradient)
-            .iter()
-            .map(|v| v * v)
-            .sum::<f64>()
-            .sqrt();
-        let repro_bound = GRADIENT_REPRODUCIBILITY_WIDENING * spread;
-        if cost_drift <= objective_tol
-            && repro_bound.is_finite()
-            && repro_bound > stationarity_bound
-            && projected_grad_norm <= repro_bound
-        {
-            log::debug!(
-                "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
-                 stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
-                 same-ρ spread between the run-recorded and certificate-time gradients \
-                 {spread:.3e}, cost drift {cost_drift:.3e} ≤ tol {objective_tol:.3e})"
-            );
-            stationarity_bound = repro_bound;
-            bound_source = StationarityBoundSource::GradientReproducibility;
+        let mut witnesses = 0usize;
+        let mut widest: Option<(f64, f64)> = None;
+        for (value, gradient) in prior.same_rho_measurements() {
+            if layout
+                .validate_gradient_len(gradient, "outer run-recorded gradient")
+                .is_err()
+                || !gradient.iter().all(|entry| entry.is_finite())
+                || !value.is_finite()
+            {
+                continue;
+            }
+            let cost_drift = (value - evaluation.cost).abs();
+            if cost_drift > objective_tol {
+                continue;
+            }
+            witnesses += 1;
+            let prior_projected =
+                project_gradient_vector(&result.rho, gradient, Some(&rail_projection_bounds));
+            let spread = (&prior_projected - &projected_gradient)
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt();
+            if widest.is_none_or(|(widest_spread, _)| spread > widest_spread) {
+                widest = Some((spread, cost_drift));
+            }
+        }
+        if let Some((spread, cost_drift)) = widest {
+            let repro_bound = GRADIENT_REPRODUCIBILITY_WIDENING * spread;
+            if repro_bound.is_finite()
+                && repro_bound > stationarity_bound
+                && projected_grad_norm <= repro_bound
+            {
+                log::debug!(
+                    "[CERTIFICATE] {context}: gradient-reproducibility floor widened the \
+                     stationarity bound to {repro_bound:.3e} (|Pg|={projected_grad_norm:.3e}, \
+                     widest same-ρ spread between the certificate-time gradient and \
+                     {witnesses} earlier measurement(s) {spread:.3e}, cost drift \
+                     {cost_drift:.3e} ≤ tol {objective_tol:.3e})"
+                );
+                stationarity_bound = repro_bound;
+                bound_source = StationarityBoundSource::GradientReproducibility;
+            }
         }
     }
 
@@ -4688,7 +4716,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                     projected_gradient: &projected_gradient,
                     railed: &certificate_railed,
                     layout,
-                    hessian,
+                    hessian: Some(hessian),
                     bounds: &bounds,
                     terminal_beta: terminal_beta.as_ref(),
                     stationarity_bound: StationarityBound::from_ladder(stationarity_bound, bound_source),
@@ -4999,10 +5027,20 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
     // FULL Inc 1 rail discipline judges the result — this path grants nothing
     // by itself.
     let mut tail_snap_note: Option<String> = None;
+    // A route that declares an analytic Hessian but did not materialize one at
+    // this fidelity keeps waiting for the tier that does. A route that declares
+    // no analytic Hessian at all (the #784 Hessian-free continuation, BFGS)
+    // never will, so its tail snap runs on first-order evidence: the probes
+    // themselves confirm each tail, the interior is judged on its gradient
+    // alone, and any at-point certificate records its curvature as not
+    // available. Withholding the snap because such a route does not
+    // materialize `H` would make tail recovery depend on solver class, exactly
+    // as the wrong-rail pull-back already refuses to.
+    let tail_snap_curvature = analytic_hessian.as_ref();
     if allow_tail_snap
         && !certificate.certifies()
         && grad_norm > stationarity_bound
-        && let Some(hessian) = analytic_hessian.as_ref()
+        && (tail_snap_curvature.is_some() || !capability.hessian.is_analytic())
     {
         probes_ran = true;
         match try_tail_snap_to_rail(
@@ -5012,7 +5050,7 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                 projected_gradient: &projected_gradient,
                 railed: &certificate_railed,
                 layout,
-                hessian,
+                hessian: tail_snap_curvature,
                 bounds: &bounds,
                 terminal_beta: terminal_beta.as_ref(),
                 stationarity_bound: StationarityBound::from_ladder(stationarity_bound, bound_source),
@@ -5073,7 +5111,11 @@ pub(super) fn certify_outer_optimality_at_terminal_fidelity(
                         rung: effective_interior_bound.rung().into(),
                         rails,
                     },
-                    curvature: CurvatureEvidence::Measured { psd: true },
+                    curvature: if tail_snap_curvature.is_some() {
+                        CurvatureEvidence::Measured { psd: true }
+                    } else {
+                        CurvatureEvidence::NotAvailable
+                    },
                     lambdas_railed: railed_lambda_block.clone(),
                     railed_facts: railed_coordinate_facts(
                         &result.rho,
@@ -5686,7 +5728,12 @@ struct AsymptoteRailInputs<'a> {
     /// certificate reads `railed` as-is; the tail law reads it through
     /// [`tail_law_coordinates`], which is the whole difference.
     layout: OuterThetaLayout,
-    hessian: &'a Array2<f64>,
+    /// The analytic outer Hessian at `rho`, or `None` on a route that declares
+    /// no analytic Hessian (`DeclaredHessianForm::Unavailable`). The railed
+    /// mint needs it for its interior PSD verdict and refuses without it; the
+    /// tail snap takes its rigorous evidence from probing and uses curvature
+    /// only where the route has some (see [`try_tail_snap_to_rail`]).
+    hessian: Option<&'a Array2<f64>>,
     bounds: &'a (Array1<f64>, Array1<f64>),
     terminal_beta: Option<&'a Array1<f64>>,
     /// The ladder bound the full problem was judged against, carrying the rung
@@ -5749,6 +5796,13 @@ fn try_certify_asymptote_rail(
     let rho = inputs.rho;
     let projected_gradient = inputs.projected_gradient;
     let railed = inputs.railed;
+    let Some(hessian) = inputs.hessian else {
+        return Ok(Err(
+            "the railed mint judges its interior Hessian sub-block, and this route \
+             supplied no analytic Hessian"
+                .to_string(),
+        ));
+    };
     // The interior (non-railed) coordinates must be stationary in their own
     // right: the asymptote certificate speaks only to the railed directions,
     // never rescues a still-descending interior. Judged by the SAME two-stage
@@ -5763,7 +5817,7 @@ fn try_certify_asymptote_rail(
     let (interior_projected_grad_norm, effective_interior_bound) =
         match certify_interior_stationarity(
             projected_gradient,
-            inputs.hessian,
+            hessian,
             &interior_indices,
             inputs.stationarity_bound,
             inputs.objective_tol,
@@ -5781,7 +5835,7 @@ fn try_certify_asymptote_rail(
     // two paths would disagree about one matrix.
     let criterion_invariance = obj.criterion_invariant_directions(rho);
     if certificate_hessian_is_psd_off_railed_above_gradient_floor(
-        inputs.hessian,
+        hessian,
         railed,
         projected_gradient,
         criterion_invariance.as_ref(),
@@ -6056,6 +6110,39 @@ pub(crate) fn interior_face_indices(
         .collect()
 }
 
+/// `‖g‖` over the supplied face indices.
+fn interior_residual_norm(gradient: &Array1<f64>, interior_indices: &[usize]) -> f64 {
+    interior_indices
+        .iter()
+        .map(|&k| gradient[k] * gradient[k])
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// The first stage of [`certify_interior_stationarity`], and the whole of it on
+/// a route with no analytic Hessian: the face residual judged directly against
+/// a gradient-magnitude ladder bound. A curvature-derived bound cannot admit a
+/// nonzero residual here, because its value already contains a Hessian and a
+/// Newton decrement taken on a different face (#2559).
+fn certify_interior_stationarity_first_order(
+    gradient: &Array1<f64>,
+    interior_indices: &[usize],
+    stationarity_bound: StationarityBound,
+) -> Result<(f64, StationarityBound), String> {
+    let interior_grad_norm = interior_residual_norm(gradient, interior_indices);
+    if interior_grad_norm <= stationarity_bound.value()
+        && (interior_grad_norm == 0.0 || !stationarity_bound.requires_face_local_derivation())
+    {
+        return Ok((interior_grad_norm, stationarity_bound));
+    }
+    Err(format!(
+        "interior not stationary: active-face |Pg|={interior_grad_norm:.3e}, caller bound \
+         {:.3e} from {}",
+        stationarity_bound.value(),
+        stationarity_bound.rung().label,
+    ))
+}
+
 /// Interior stationarity judgment shared by the Inc 1 railed mint and the
 /// Inc 2c at-point mint (#2348/#2559).
 ///
@@ -6080,17 +6167,12 @@ pub(crate) fn certify_interior_stationarity(
     stationarity_bound: StationarityBound,
     objective_tol: f64,
 ) -> Result<(f64, StationarityBound), String> {
-    let interior_grad_norm = interior_indices
-        .iter()
-        .map(|&k| gradient[k] * gradient[k])
-        .sum::<f64>()
-        .sqrt();
-    if interior_grad_norm <= stationarity_bound.value()
-        && (interior_grad_norm == 0.0
-            || !stationarity_bound.requires_face_local_derivation())
+    if let Ok(certified) =
+        certify_interior_stationarity_first_order(gradient, interior_indices, stationarity_bound)
     {
-        return Ok((interior_grad_norm, stationarity_bound));
+        return Ok(certified);
     }
+    let interior_grad_norm = interior_residual_norm(gradient, interior_indices);
     let m = interior_indices.len();
     let mut sub_h = Array2::<f64>::zeros((m, m));
     let mut sub_g = Array1::<f64>::zeros(m);
@@ -6218,8 +6300,7 @@ fn try_tail_snap_to_rail(
     let (lower, upper) = inputs.bounds;
     let n = gradient.len();
     if rho.len() != n
-        || hessian.nrows() != n
-        || hessian.ncols() != n
+        || hessian.is_some_and(|h| h.nrows() != n || h.ncols() != n)
         || lower.len() < n
         || upper.len() < n
     {
@@ -6271,6 +6352,16 @@ fn try_tail_snap_to_rail(
             ));
             continue;
         }
+        // The tie is a zero-cost prefilter, not evidence: the probing below is
+        // the rigorous gate, and it reads nothing but the analytic gradient.
+        // A route that declares no analytic Hessian has no `H_kk` to tie, so
+        // its candidates go straight to the probes. Withholding the snap there
+        // would make a λ → ∞ tail certifiable or not by solver class — the
+        // same reason the wrong-rail pull-back below runs without curvature.
+        let Some(hessian) = hessian else {
+            candidates.push((k, side));
+            continue;
+        };
         let h_kk = hessian[[k, k]];
         // The tie is judged on |H_kk|/|g_k| — MAGNITUDE only. On the exact
         // tail `H_kk = |g_k|` (positive), but the assembled ρ-Hessian's tail
@@ -6310,17 +6401,22 @@ fn try_tail_snap_to_rail(
         .copied()
         .chain(candidates.iter().map(|(k, _)| *k))
         .collect();
-    let criterion_invariance = obj.criterion_invariant_directions(rho);
-    if certificate_hessian_is_psd_off_railed_above_gradient_floor(
-        hessian,
-        &excluded,
-        gradient,
-        criterion_invariance.as_ref(),
-    ) != Some(true)
-    {
-        return Ok(TailSnapOutcome::Declined(
-            "interior Hessian sub-block not PSD".to_string(),
-        ));
+    // Without an analytic Hessian there is no sub-block to test, and the
+    // certificate this snap can lead to records `CurvatureEvidence::NotAvailable`,
+    // exactly as every other certificate on that route does.
+    if let Some(hessian) = hessian {
+        let criterion_invariance = obj.criterion_invariant_directions(rho);
+        if certificate_hessian_is_psd_off_railed_above_gradient_floor(
+            hessian,
+            &excluded,
+            gradient,
+            criterion_invariance.as_ref(),
+        ) != Some(true)
+        {
+            return Ok(TailSnapOutcome::Declined(
+                "interior Hessian sub-block not PSD".to_string(),
+            ));
+        }
     }
 
     let beta_norm = inputs
@@ -6507,15 +6603,24 @@ fn try_tail_snap_to_rail(
     // full-Hessian widening is unavailable here exactly because the
     // noise-corrupted tail entry makes the full matrix non-PD).
     if at_point_rails.len() == candidates.len() {
-        if let Ok((interior_projected_grad_norm, effective_interior_bound)) =
-            certify_interior_stationarity(
+        let interior = match hessian {
+            Some(hessian) => certify_interior_stationarity(
                 gradient,
                 hessian,
                 &interior_indices,
                 inputs.stationarity_bound,
                 inputs.objective_tol,
-            )
-        {
+            ),
+            // No curvature, so only the first stage exists: the interior
+            // residual against the ladder bound itself, which on such a
+            // route is never a curvature-derived rung.
+            None => certify_interior_stationarity_first_order(
+                gradient,
+                &interior_indices,
+                inputs.stationarity_bound,
+            ),
+        };
+        if let Ok((interior_projected_grad_norm, effective_interior_bound)) = interior {
             return Ok(TailSnapOutcome::TailStationaryAtPoint {
                 rails: at_point_rails,
                 interior_projected_grad_norm,

@@ -62,7 +62,7 @@ fn proven_face_certifies_a_shallow_rail_without_a_value_probe() {
         projected_gradient: &gradient,
         railed: &[0],
         layout: OuterThetaLayout::new(1, 0),
-        hessian: &hessian,
+        hessian: Some(&hessian),
         bounds: &bounds,
         terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
@@ -298,7 +298,7 @@ fn coupled_coordinate_stationary_before_snap_still_reseeds_2358() {
             projected_gradient: &gradient,
             railed: &[],
             layout: OuterThetaLayout::new(2, 0),
-            hessian: &hessian,
+            hessian: Some(&hessian),
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: StationarityBound::from_ladder(1.0e-3, StationarityBoundSource::SolverBand),
@@ -606,7 +606,7 @@ fn joint_face_tail_certifies_where_single_coordinate_law_drifts_2349() {
             projected_gradient: &gradient,
             railed: &[],
             layout: OuterThetaLayout::new(2, 0),
-            hessian: &hessian,
+            hessian: Some(&hessian),
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: StationarityBound::from_ladder(1.0e-3, StationarityBoundSource::SolverBand),
@@ -671,7 +671,7 @@ fn joint_face_with_unsettled_estimand_snaps_for_reoptimization_2349() {
             projected_gradient: &gradient,
             railed: &[],
             layout: OuterThetaLayout::new(2, 0),
-            hessian: &hessian,
+            hessian: Some(&hessian),
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: StationarityBound::from_ladder(1.0e-3, StationarityBoundSource::SolverBand),
@@ -739,7 +739,7 @@ fn joint_face_fallback_refuses_a_non_face_2349() {
             projected_gradient: &gradient,
             railed: &[],
             layout: OuterThetaLayout::new(2, 0),
-            hessian: &hessian,
+            hessian: Some(&hessian),
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: StationarityBound::from_ladder(1.0e-9, StationarityBoundSource::SolverBand),
@@ -864,7 +864,7 @@ fn asymptote_rail_requires_psd_interior_sub_block() {
         projected_gradient: &projected,
         railed: &railed,
         layout: OuterThetaLayout::new(2, 0),
-        hessian: &hessian_psd,
+        hessian: Some(&hessian_psd),
         bounds: &bounds,
         terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(1.0e-6, StationarityBoundSource::SolverBand),
@@ -886,7 +886,7 @@ fn asymptote_rail_requires_psd_interior_sub_block() {
 
     let hessian_indefinite = array![[1.0, 0.0], [0.0, -2.0]];
     let inputs_indefinite = AsymptoteRailInputs {
-        hessian: &hessian_indefinite,
+        hessian: Some(&hessian_indefinite),
         ..inputs_psd
     };
     let refused = try_certify_asymptote_rail(&mut obj, &inputs_indefinite)
@@ -929,7 +929,7 @@ fn asymptote_rail_refuses_a_psi_coordinate_with_a_perfect_tail() {
         // Both slots declared ψ: rho_dim = 0, so coordinate 0 is a
         // design-moving quantity whose box endpoint is attainable.
         layout: OuterThetaLayout::new(2, 2),
-        hessian: &hessian,
+        hessian: Some(&hessian),
         bounds: &bounds,
         terminal_beta: None,
         stationarity_bound: StationarityBound::from_ladder(
@@ -984,7 +984,7 @@ fn tail_snap_refuses_a_psi_coordinate() {
             projected_gradient: &gradient,
             railed: &[],
             layout: OuterThetaLayout::new(2, 2),
-            hessian: &hessian,
+            hessian: Some(&hessian),
             bounds: &bounds,
             terminal_beta: None,
             stationarity_bound: StationarityBound::from_ladder(

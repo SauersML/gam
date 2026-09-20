@@ -1607,19 +1607,13 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
         result.rho = permute_to_native(&result.rho, perm);
     }
     if let Some(measurement) = result.final_measurement.take() {
-        let (rho, value, gradient) = measurement.into_parts();
-        let to_native = |coordinates: Array1<f64>| {
+        result.final_measurement = Some(measurement.map_coordinates(|coordinates| {
             if coordinates.len() == perm.len() {
                 permute_to_native(&coordinates, perm)
             } else {
                 coordinates
             }
-        };
-        result.final_measurement = Some(OuterFirstOrderMeasurement::new(
-            to_native(rho),
-            value,
-            to_native(gradient),
-        ));
+        }));
     }
     if let Some(h) = result.final_hessian.as_ref()
         && h.nrows() == perm.len()
