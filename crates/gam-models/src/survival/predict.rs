@@ -1572,7 +1572,7 @@ fn predict_survival_exact_anchor_posterior_mean(
 
 /// The cone-truncated coefficient posterior of a location-scale fit under
 /// `covariance_mode`, as a rule over whole coefficient vectors, or `None` when
-/// the selected covariance is not one a cone truncated.
+/// the selected law retains no constraint row.
 fn truncated_survival_posterior_draws(
     model: &SavedModel,
     covariance_mode: SurvivalPredictionCovarianceMode,

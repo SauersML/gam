@@ -532,9 +532,11 @@ pub(crate) fn exact_survival_response_moments(
     // vectors the fit excluded. `truncated_survival_response_moments` prices
     // the truncated law itself, on a single joint low-discrepancy rule over the
     // constraint-normal and tangent coordinates whose per-row cost carries no
-    // factor of the cubature's node count. `None` means there is no cone the
-    // reported covariance was truncated against, and then the Gaussian rule
-    // below is not an approximation of the posterior but IS the posterior.
+    // factor of the cubature's node count. That holds for the conditional and
+    // for the smoothing-corrected covariance alike (#3524). `None` means the
+    // law this covariance belongs to retains no constraint row, and then the
+    // Gaussian rule below is not an approximation of the posterior but IS the
+    // posterior.
     if let Some((first, second)) = truncated_survival_response_moments(
         input,
         fit,
