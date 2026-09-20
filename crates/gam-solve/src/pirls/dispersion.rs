@@ -574,9 +574,9 @@ mod gamma_tweedie_profile_math_tests {
     #[test]
     fn dispersion_estimates_read_prior_weights_as_precisions() {
         let log = InverseLink::Standard(StandardLink::Log);
-        let y = Array1::from(vec![0.4, 1.3, 0.9, 2.2, 0.7, 1.6, 3.0]);
-        let eta = Array1::from(vec![-0.3, 0.1, 0.0, 0.5, -0.2, 0.4, 0.6]);
-        let weights = Array1::from(vec![0.5, 2.0, 1.0, 3.5, 0.25, 1.5, 0.0]);
+        let y = Array1::<f64>::from(vec![0.4, 1.3, 0.9, 2.2, 0.7, 1.6, 3.0]);
+        let eta = Array1::<f64>::from(vec![-0.3, 0.1, 0.0, 0.5, -0.2, 0.4, 0.6]);
+        let weights = Array1::<f64>::from(vec![0.5, 2.0, 1.0, 3.5, 0.25, 1.5, 0.0]);
         let positive_rows = weights.iter().filter(|&&w| w > 0.0).count() as f64;
         let p = 1.5;
         let tweedie_expected = (0..y.len())
