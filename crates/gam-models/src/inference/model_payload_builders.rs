@@ -1673,8 +1673,8 @@ fn fit_expanded_formula_to_payload(
     // `unknown family 'expectile(τ)'`. The driver returns an ordinary
     // `StandardFitResult`, so the persistence payload is built by the same
     // `assemble_standard_payload` used for every other standard fit.
-    if let Some(expectile_result) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        let mut payload = match expectile_result {
+    if let Some(outcome) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
+        let mut payload = match outcome.fit {
             ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
                 formula,
                 dataset,
@@ -1683,9 +1683,11 @@ fn fit_expanded_formula_to_payload(
             })?,
             ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
         };
-        // The LAWS driver materializes its inner Gaussian design itself; there are
-        // no outer materialize advisories to carry (matches `fit_from_formula`).
-        apply_request_metadata(&mut payload, fit_config, FitNotes::default());
+        // The expectile driver materializes its inner Gaussian design itself and
+        // hands back what that materialization reported, so a capped basis or a
+        // pruned scalar term is surfaced exactly as for any other fit (#1543).
+        apply_request_metadata(&mut payload, fit_config, outcome.materialized.inference_notes);
+        payload.unidentified_scalar_terms = outcome.materialized.unidentified_scalar_terms;
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:
