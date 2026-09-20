@@ -205,12 +205,7 @@ impl<'a> RemlState<'a> {
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
         let bundle = self.obtain_eval_bundle(rho)?;
-        let decision = self.selecthessian_strategy_policy(&bundle);
-        let hessian = match decision.strategy {
-            super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
-                self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
-            }
-        };
+        let hessian = self.compute_lamlhessian_exact_from_bundle(rho, &bundle);
         // Read after the evaluation: a first evaluation is what latches the
         // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
         if let Some(reason) = self.block_correction_hessian_refusal() {
