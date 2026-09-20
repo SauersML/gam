@@ -15,7 +15,7 @@
 use faer::Side;
 use gam_linalg::faer_ndarray::{FaerArrayView, FaerCholesky, FaerEigh, FaerQr, array2_to_matmut};
 use gam_linalg::matrix::{DesignMatrix, LinearOperator};
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 // `DeclaredHessianForm`/`Derivative` originate in `gam_problem` and are only
 // re-exported privately inside `gam_solve::rho_optimizer`; import them from the
 // canonical source, matching every other `gam-models` outer-objective site.
@@ -696,13 +696,16 @@ impl PreparedSharedTangent {
                     .collect();
                 gam_solve::estimate::rho_domain::resolvability_domain_from_gram_blocks(
                     gram,
-                    self.penalties.iter().zip(&joint_penalties).map(|(penalty, joint)| {
-                        (
-                            penalty.column_start * d
-                                ..(penalty.column_start + penalty.local.nrows()) * d,
-                            joint,
-                        )
-                    }),
+                    self.penalties
+                        .iter()
+                        .zip(&joint_penalties)
+                        .map(|(penalty, joint)| {
+                            (
+                                penalty.column_start * d
+                                    ..(penalty.column_start + penalty.local.nrows()) * d,
+                                joint,
+                            )
+                        }),
                     rho_dim,
                 )
             }
@@ -1109,7 +1112,7 @@ impl PreparedSharedTangent {
                 coefficients.dim()
             )));
         }
-        let mut quadratic = KahanSum::default();
+        let mut quadratic = CompensatedSum::default();
         let chunk_rows = gam_linalg::utils::row_chunk_for_byte_budget(n, k);
         for start in (0..n).step_by(chunk_rows) {
             let end = (start + chunk_rows).min(n);
@@ -1148,7 +1151,7 @@ impl PreparedSharedTangent {
                 }
             }
         }
-        Ok(quadratic.sum())
+        Ok(quadratic.value())
     }
 
     fn combined_penalty_spectrum(

@@ -445,8 +445,10 @@ fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f
     }
 }
 
+/// `(μ, 1 − μ)` of the logistic inverse link, each formed from its own tail so
+/// the smaller member keeps full relative precision on both sides of `η = 0`.
 #[inline]
-fn logit_probability_pair(eta: f64) -> (f64, f64) {
+pub(crate) fn logit_probability_pair(eta: f64) -> (f64, f64) {
     if eta >= 0.0 {
         let tail = (-eta).exp();
         let one_minus_mu = tail / (1.0 + tail);
@@ -2518,10 +2520,11 @@ fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
 fn gamma_saturated_log_normalizer(log_shape: f64, weight: f64, y: f64) -> f64 {
     let log_a = weight.ln() + log_shape;
     let core = if log_a >= 8.0_f64.ln() {
-        let inv = (-log_a).exp();
-        let inv2 = inv * inv;
-        let correction = inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0;
-        0.5 * log_a - HALF_LOG_2PI - correction
+        // Stirling: ln Gamma(a) = (a - 1/2) ln a - a + ln sqrt(2 pi) + c(a), so
+        // a ln a - a - ln Gamma(a) = (1/2) ln a - ln sqrt(2 pi) - c(a). The
+        // correction is the shared eight-term series (accurate to f64 for
+        // a >= 8); `exp` saturating to +inf gives c(inf) = 0, the exact limit.
+        0.5 * log_a - HALF_LOG_2PI - log_gamma_stirling_correction(log_a.exp())
     } else {
         let a = log_a.exp();
         if a == 0.0 {
@@ -3018,5 +3021,31 @@ mod tail_geometry_tests {
         let expected = (-eta - rate).exp();
         assert!(score > 0.0);
         assert!((score / expected - 1.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod gamma_saturated_normalizer_tests {
+    use super::gamma_saturated_log_normalizer;
+
+    #[test]
+    fn stirling_branch_matches_exact_factorial_normalizer() {
+        // For integer shape a, ln Gamma(a) = ln((a - 1)!) is exact to one
+        // rounding, so a ln a - a - ln Gamma(a) is a reference independent of
+        // any Stirling truncation. The a >= 8 branch must match it to f64
+        // accuracy; a three-term correction leaves an O(a^-7) residual
+        // (about 3e-10 at a = 8).
+        for (a, factorial) in [
+            (8.0_f64, 5_040.0_f64),
+            (9.0, 40_320.0),
+            (12.0, 39_916_800.0),
+        ] {
+            let exact = a * a.ln() - a - factorial.ln();
+            let got = gamma_saturated_log_normalizer(a.ln(), 1.0, 1.0);
+            assert!(
+                (got - exact).abs() < 1e-13,
+                "a = {a}: saturated Gamma normalizer {got} vs exact {exact}"
+            );
+        }
     }
 }

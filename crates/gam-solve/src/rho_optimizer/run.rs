@@ -1660,14 +1660,14 @@ pub struct OuterResult {
 }
 
 /// What a first-order search publishes when it halts where its kept rank ends (#2939): a
-/// filled cost-stall window in which every trial was refused for keeping a different rank
-/// than the one the search started on (#2765). The incumbent it halted at is published
+/// cost-stall window or exhausted line search whose final refusal streak kept a different
+/// rank than the one the search started on (#2765). The incumbent it halted at is published
 /// non-converged, and the terminal certificate judges it.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RankBoundaryStall {
     /// Kept rank of the face log-determinant this search searched.
     pub kept_rank: usize,
-    /// Consecutive trials the filled window refused for leaving that rank.
+    /// Consecutive trials the terminal refusal streak rejected for leaving that rank.
     pub refused_trials: usize,
     /// The certificate's stationarity band at the incumbent's value, which the incumbent's
     /// projected gradient exceeded.

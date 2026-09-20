@@ -178,7 +178,7 @@ pub(crate) fn k1_gate_modes_do_not_pin_assignment_to_one() {
     .unwrap();
     assert_abs_diff_eq!(
         jr.try_assignments_row(0).unwrap()[0],
-        gam_linalg::utils::stable_logistic(-1.0),
+        gam_math::special::logistic(-1.0),
         epsilon = 1e-12
     );
 
@@ -217,7 +217,7 @@ pub(crate) fn smooth_threshold_gate_is_centered_at_threshold() {
     // Below threshold the same smooth scalar remains positive and exact.
     assert_abs_diff_eq!(
         gates[1],
-        gam_linalg::utils::stable_logistic(-1.0),
+        gam_math::special::logistic(-1.0),
         epsilon = 1e-12
     );
 }
@@ -776,6 +776,22 @@ pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
     );
 }
 
+/// #3824 ARD flat-layout contract: every `(atom, axis)` ARD strength is its own
+/// outer coordinate at every atom count, so with `K=2` single-axis atoms the flat
+/// vector is `1+K+Σ d_k = 5` long and the two axes own coordinates 3 and 4.
+#[test]
+pub(crate) fn ard_flat_index_is_unique_per_atom_axis_3824() {
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
+    let flat = rho.flat_coordinates();
+    assert_eq!(flat.len(), 5, "flat len = 1+K+Σ d_k");
+    assert_eq!(rho.ard_flat_index(0, 0), 3);
+    assert_eq!(rho.ard_flat_index(1, 0), 4);
+    assert_eq!(flat[3], 0.1);
+    assert_eq!(flat[4], 0.2);
+    let rebuilt = rho.from_flat(flat.view()).expect("flat layout round-trips");
+    assert_eq!(rebuilt.log_ard, rho.log_ard);
+}
+
 /// The von-Mises coordinate-prior curvature `V'' = α·cos(κt)` is indefinite
 /// (negative for |t| past a quarter period). Writing it raw into the
 /// Newton/Schur `htt` diagonal at K=2 made the per-row coordinate block, and
@@ -783,41 +799,6 @@ pub(crate) fn scad_no_origin_pinning_occupancy_on_circle() {
 /// pivot (BUG 3). The assembled `htt` diagonal on every periodic coord axis
 /// must therefore be non-negative (the `max(V'',0)` PSD majorizer), while the
 /// gradient stays the exact `V'`.
-/// #1026 shared-ARD flat-layout contract. With `K=2` single-axis atoms the
-/// SHARED parameterization collapses both per-atom axis-0 ARD strengths onto ONE
-/// outer coordinate (`1+K+0 = 3`), so the flat outer vector is length
-/// `1+K+max_d = 4`. The former per-atom cursor walk in the gradient / EFS / IFT
-/// consumers wrote atom0→3 and atom1→4 — index 4 is OUT OF BOUNDS on a length-4
-/// vector (panic), and even when it did not panic it split one shared strength
-/// across two phantom slots. `ard_flat_index` maps every atom owning an axis onto
-/// the single shared coordinate (in-bounds), and the consumers accumulate into
-/// it. The PerAtom arm keeps unique coordinates matching the `to_flat` cursor.
-#[test]
-pub(crate) fn shared_ard_flat_index_aliases_in_bounds_1026() {
-    let shared = SaeManifoldRho::new_shared_ard(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
-    let shared_len = shared.flat_coordinates().len();
-    assert_eq!(shared_len, 4, "shared flat len = 1+K+max_d");
-    assert_eq!(shared.ard_flat_index(0, 0), 3);
-    assert_eq!(
-        shared.ard_flat_index(1, 0),
-        3,
-        "both atoms' axis 0 alias the single shared coordinate"
-    );
-    assert!(
-        shared.ard_flat_index(1, 0) < shared_len,
-        "shared index must stay in bounds (the old per-atom walk went OOB)"
-    );
-
-    let per_atom = SaeManifoldRho::new(0.0, 0.0, vec![array![0.1_f64], array![0.2_f64]]);
-    assert_eq!(per_atom.flat_coordinates().len(), 5, "per-atom flat len = 1+K+Σ d_k");
-    assert_eq!(per_atom.ard_flat_index(0, 0), 3);
-    assert_eq!(
-        per_atom.ard_flat_index(1, 0),
-        4,
-        "per-atom keeps unique coordinates (bit-for-bit the historical cursor)"
-    );
-}
-
 #[test]
 pub(crate) fn periodic_ard_curvature_is_psd_in_assembled_htt() {
     // Two rows past the quarter period (t in (0.25, 0.75)) where cos(2πt) < 0.

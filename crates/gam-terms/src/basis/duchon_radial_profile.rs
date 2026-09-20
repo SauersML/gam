@@ -96,7 +96,7 @@
 //! profile's own bar instead of an invented one.
 
 use super::*;
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -276,7 +276,7 @@ impl TermTable {
         }
         let mut out = [0.0_f64; CHANNELS];
         for (m, slot) in out.iter_mut().enumerate() {
-            let mut acc = KahanSum::default();
+            let mut acc = CompensatedSum::default();
             for (k_idx, row) in self.coef[m].iter().enumerate().take(m + 1) {
                 for (j, &c) in row.iter().enumerate() {
                     if c != 0.0 {
@@ -284,7 +284,7 @@ impl TermTable {
                     }
                 }
             }
-            *slot = acc.sum();
+            *slot = acc.value();
         }
         out
     }
@@ -358,8 +358,7 @@ fn tanh_sinh_level(level: u32) -> Vec<(f64, bool, f64)> {
             let t = sign * k as f64 * h;
             let y = std::f64::consts::FRAC_PI_2 * t.sinh();
             let offset_unit = 2.0 / ((2.0 * y.abs()).exp() + 1.0);
-            let weight_unit =
-                std::f64::consts::FRAC_PI_2 * t.cosh() / (y.cosh() * y.cosh());
+            let weight_unit = std::f64::consts::FRAC_PI_2 * t.cosh() / (y.cosh() * y.cosh());
             nodes.push((offset_unit, t < 0.0, weight_unit * h));
         }
         k += if first { 1 } else { 2 };
@@ -407,7 +406,12 @@ fn normalize_monomials(mut terms: Vec<Monomial>) -> Vec<Monomial> {
 /// `∂[c z^q ln(z/2)] = c q z^{q−1} ln(z/2) + c z^{q−1}`, merged.
 fn differentiate_monomials(terms: &[Monomial]) -> Vec<Monomial> {
     let mut out = Vec::with_capacity(2 * terms.len());
-    for &Monomial { coef, power, logged } in terms {
+    for &Monomial {
+        coef,
+        power,
+        logged,
+    } in terms
+    {
         if power != 0 {
             out.push(Monomial {
                 coef: coef * power as f64,
@@ -427,9 +431,14 @@ fn differentiate_monomials(terms: &[Monomial]) -> Vec<Monomial> {
 }
 
 fn evaluate_monomials(terms: &[Monomial], z: f64, ln_half_z: f64) -> f64 {
-    let mut plain = KahanSum::default();
-    let mut logged = KahanSum::default();
-    for &Monomial { coef, power, logged: is_logged } in terms {
+    let mut plain = CompensatedSum::default();
+    let mut logged = CompensatedSum::default();
+    for &Monomial {
+        coef,
+        power,
+        logged: is_logged,
+    } in terms
+    {
         let value = coef * z.powi(power);
         if is_logged {
             logged.add(value);
@@ -437,7 +446,7 @@ fn evaluate_monomials(terms: &[Monomial], z: f64, ln_half_z: f64) -> f64 {
             plain.add(value);
         }
     }
-    plain.sum() + ln_half_z * logged.sum()
+    plain.value() + ln_half_z * logged.value()
 }
 
 /// `T_m(z) = ∂_z^m [z^b K_b(z)]`, `m = 0..=4`, evaluated without the
@@ -539,7 +548,8 @@ impl TermEvaluator {
                     logged: true,
                 });
                 base.push(Monomial {
-                    coef: sign_n * 2.0_f64.powi(-(n as i32) - 1)
+                    coef: sign_n
+                        * 2.0_f64.powi(-(n as i32) - 1)
                         * (digamma_int(k + 1) + digamma_int(n + k + 1))
                         * shared,
                     power: 2 * (n + k) as i32,
@@ -622,7 +632,7 @@ impl ProfileShape {
         scale_floor: &[f64; CHANNELS],
     ) -> Result<PanelEstimate, BasisError> {
         let half = 0.5 * (b - a);
-        let mut sums: [KahanSum; CHANNELS] = Default::default();
+        let mut sums: [CompensatedSum; CHANNELS] = Default::default();
         let mut abs_sums = [0.0_f64; CHANNELS];
         let mut previous: Option<[f64; CHANNELS]> = None;
         let mut last_delta = [f64::NAN; CHANNELS];
@@ -630,8 +640,8 @@ impl ProfileShape {
             if level_idx > 0 {
                 // Halving the step halves every earlier node's weight.
                 for m in 0..channels {
-                    let s = sums[m].sum();
-                    sums[m] = KahanSum::default();
+                    let s = sums[m].value();
+                    sums[m] = CompensatedSum::default();
                     sums[m].add(0.5 * s);
                     abs_sums[m] *= 0.5;
                 }
@@ -662,7 +672,7 @@ impl ProfileShape {
                     abs_sums[m] += term.abs();
                 }
             }
-            let current: [f64; CHANNELS] = std::array::from_fn(|m| sums[m].sum());
+            let current: [f64; CHANNELS] = std::array::from_fn(|m| sums[m].value());
             if let Some(prev) = previous {
                 for m in 0..channels {
                     last_delta[m] = (current[m] - prev[m]).abs()
@@ -675,7 +685,7 @@ impl ProfileShape {
             previous = Some(current);
         }
         Ok(PanelEstimate::Unresolved {
-            values: std::array::from_fn(|m| sums[m].sum()),
+            values: std::array::from_fn(|m| sums[m].value()),
             abs_sums,
             last_delta,
         })
@@ -700,9 +710,11 @@ impl ProfileShape {
         let (values, abs_sums, last_delta) =
             match self.integrate_panel(rho, a, b, channels, scale_floor)? {
                 PanelEstimate::Converged(values) => return Ok(values),
-                PanelEstimate::Unresolved { values, abs_sums, last_delta } => {
-                    (values, abs_sums, last_delta)
-                }
+                PanelEstimate::Unresolved {
+                    values,
+                    abs_sums,
+                    last_delta,
+                } => (values, abs_sums, last_delta),
             };
         if depth >= REFERENCE_MAX_BISECTIONS {
             let report: Vec<String> = (0..channels)
@@ -723,8 +735,7 @@ impl ProfileShape {
                 report.join("; ")
             );
         }
-        let floor: [f64; CHANNELS] =
-            std::array::from_fn(|m| scale_floor[m].max(abs_sums[m]));
+        let floor: [f64; CHANNELS] = std::array::from_fn(|m| scale_floor[m].max(abs_sums[m]));
         let mid = 0.5 * (a + b);
         let left = self.integrate_adaptive(rho, a, mid, channels, &floor, depth + 1)?;
         let right = self.integrate_adaptive(rho, mid, b, channels, &floor, depth + 1)?;
@@ -741,7 +752,8 @@ impl ProfileShape {
         // resolves (a panel spanning `e^{-73}` converged only to `9e-14` at
         // `ρ = 1/√ε`, twice the bar), while the remainder — integrated too,
         // on the whole integral's scale — is below `ε` of the whole.
-        let largest_power = (self.d as i32 - 2 * self.p as i32 - 1 + MAX_DERIVATIVE_ORDER as i32) as f64;
+        let largest_power =
+            (self.d as i32 - 2 * self.p as i32 - 1 + MAX_DERIVATIVE_ORDER as i32) as f64;
         let cut = (2.0 / f64::EPSILON).ln() + 3.0 * largest_power;
         let v_star = (cut / rho).min(1.0);
         let mut total = self.integrate_adaptive(rho, 0.0, v_star, channels, &[0.0; CHANNELS], 0)?;
@@ -1007,11 +1019,11 @@ fn chebyshev_nodes() -> &'static [f64; PANEL_ORDER] {
 fn chebyshev_coefficients(values: &[f64; PANEL_ORDER]) -> [f64; PANEL_ORDER] {
     let n = PANEL_ORDER as f64;
     std::array::from_fn(|k| {
-        let mut acc = KahanSum::default();
+        let mut acc = CompensatedSum::default();
         for (i, &v) in values.iter().enumerate() {
             acc.add(v * (std::f64::consts::PI * k as f64 * (i as f64 + 0.5) / n).cos());
         }
-        2.0 * acc.sum() / n
+        2.0 * acc.value() / n
     })
 }
 
@@ -1077,10 +1089,12 @@ fn sample_panel(
         // A derivative channel crosses zero, and on the approach to a zero a
         // relative bound is not a meaningful demand: there the certificate is
         // the absolute bound on the panel's scale, which `resolution` reports.
-        let sign_definite = m == 0
-            && (samples.iter().all(|v| *v > 0.0) || samples.iter().all(|v| *v < 0.0));
+        let sign_definite =
+            m == 0 && (samples.iter().all(|v| *v > 0.0) || samples.iter().all(|v| *v < 0.0));
         let range = if sign_definite {
-            let smallest = samples.iter().fold(f64::INFINITY, |acc, v| acc.min(v.abs()));
+            let smallest = samples
+                .iter()
+                .fold(f64::INFINITY, |acc, v| acc.min(v.abs()));
             scale[m] / smallest
         } else {
             0.0
@@ -1327,7 +1341,10 @@ mod tests {
         for &(d, p, s) in &SHAPES {
             let profile = duchon_radial_profile(p, s, d).expect("profile builds");
             let (low, main) = profile.panel_counts();
-            assert!(low >= 1 && main >= 4, "(d={d}, p={p}, s={s}) panel counts {low}/{main}");
+            assert!(
+                low >= 1 && main >= 4,
+                "(d={d}, p={p}, s={s}) panel counts {low}/{main}"
+            );
             for rho in probe_radii() {
                 let reference = profile.reference(rho).expect("reference converges");
                 for m in 0..CHANNELS {
@@ -1377,7 +1394,11 @@ mod tests {
                 "(d={d}, p={p}, s={s}): G(ρ_lo) = {near:.16e} vs G(0) = {g0:.16e} (bar {bar:.2e})"
             );
             let below = profile.value(0.5 * rho_value_floor(d, p));
-            assert_eq!(below.to_bits(), g0.to_bits(), "below the value floor the profile is G(0)");
+            assert_eq!(
+                below.to_bits(),
+                g0.to_bits(),
+                "below the value floor the profile is G(0)"
+            );
         }
     }
 
@@ -1417,33 +1438,357 @@ mod tests {
     #[test]
     fn the_profile_agrees_with_an_independent_quadpack_oracle() {
         let rows: [(usize, usize, usize, f64, [f64; 5]); 27] = [
-            (6, 1, 3, 3.0e-01, [4.6985918744347777e-01, -1.5280509899838315e-01, -1.9816847111553884e-01, 9.2561975226344528e-01, -3.9694341175201573e+00]),
-            (6, 1, 3, 3.0e+00, [1.0914697710866623e-01, -6.5216440555166594e-02, 3.9215058819385841e-02, -2.1276924973236151e-02, 6.9381035837886417e-03]),
-            (6, 1, 3, 3.0e+01, [3.9506172790671214e-05, -5.2674896620681878e-06, 8.7791490102848121e-07, -1.7558293827270790e-07, 4.0969311059236578e-08]),
-            (6, 1, 3, 3.0e+02, [3.9506172839506188e-09, -5.2674897119341561e-11, 8.7791495198902613e-13, -1.7558299039780523e-14, 4.0969364426154538e-16]),
-            (6, 2, 2, 1.0e+00, [4.0505129895177810e-01, -1.1956079034782202e-01, 4.1440616094682572e-03, 7.2017547769282639e-02, -1.6811933626324055e-01]),
-            (6, 2, 2, 1.0e+01, [3.6810901080102675e-02, -6.7329643588438281e-03, 1.7756624741639996e-03, -5.9526359784749206e-04, 2.3537927072176507e-04]),
-            (6, 2, 2, 3.0e+02, [4.4440493827160507e-05, -2.9624362139917695e-07, 2.9620850480109740e-09, -3.9488614540466389e-11, 6.5802652034750789e-13]),
-            (6, 2, 2, 1.0e+04, [3.9999996800000020e-08, -7.9999987200000017e-12, 2.3999993600000012e-15, -9.5999961600000003e-19, 4.7999973120000002e-22]),
-            (5, 1, 3, 3.0e-01, [5.7728516709470501e-01, -8.2898535984488389e-02, -2.0775229494176811e-01, 3.9871733020347994e-01, -5.3363865834983748e-01]),
-            (5, 1, 3, 1.0e+01, [1.4059892518100654e-02, -4.1294515470580041e-03, 1.5713113384848453e-03, -7.1323331693790200e-04, 3.6356456589205617e-04]),
-            (5, 1, 3, 1.0e+03, [1.4179630807244130e-08, -4.2538892421732390e-11, 1.7015556968692956e-13, -8.5077784843464781e-16, 5.1046670906078874e-18]),
-            (5, 2, 2, 1.0e+00, [1.1021648736861631e+00, -1.2897521047617824e-01, -5.3421239984428652e-02, 1.0165169935384380e-01, -1.1354669441816742e-01]),
-            (5, 2, 2, 3.0e+01, [1.1763841854900088e-01, -3.8862691842207011e-03, 2.5558346888487324e-04, -2.5091527780010377e-05, 3.2677338632772836e-06]),
-            (5, 2, 2, 3.0e+02, [1.1815833834525396e-02, -3.9382611638342123e-05, 2.6251573282152214e-07, -2.6246905090939952e-09, 3.4988093135899478e-11]),
-            (3, 1, 2, 3.0e-01, [1.7495188441799354e+00, -1.4177634563722352e-01, -3.6789047048678736e-01, 6.1508378604185920e-01, -7.6040920150538838e-01]),
-            (3, 1, 2, 3.0e+00, [1.0345604321804829e+00, -2.2719310265493881e-01, 6.3216787382709264e-02, -4.3866000134315120e-03, -2.3566293666730211e-02]),
-            (3, 1, 2, 1.0e+02, [3.5449077018110321e-02, -3.5449077018110320e-04, 7.0898154036220673e-06, -2.1269446210866188e-07, 8.5077784843464801e-09]),
-            (4, 1, 3, 1.0e+00, [8.9873717526205488e-01, -1.7263545188893351e-01, -8.4000874530434450e-02, 1.5512070616520965e-01, -1.1443744630115851e-01]),
-            (4, 1, 3, 3.0e+01, [8.8888888881474906e-03, -5.9259259186006819e-04, 5.9259258535687199e-05, -7.9012338533590316e-06, 1.3168717225478964e-06]),
-            (8, 1, 4, 3.0e+00, [6.0953872337774703e-02, -4.1594882419161060e-02, 2.7575716872150619e-02, -1.6382052326866139e-02, 6.4381022935026989e-03]),
-            (8, 1, 4, 1.0e+02, [7.6800000000000004e-10, -4.6079999999999998e-11, 3.2255999999999995e-12, -2.5804799999999990e-13, 2.3224319999999999e-14]),
-            (16, 1, 9, 1.0e+00, [1.1886003289332642e-01, -3.9201561871392100e-02, -1.3883802126352989e-02, 4.1258042065121049e-02, -4.0220630582165504e-02]),
-            (16, 1, 9, 1.0e+01, [3.3036650726599696e-04, -2.4741494010306798e-04, 1.8463467561634622e-04, -1.3626363127830295e-04, 9.8500625583362153e-05]),
-            (16, 1, 9, 3.0e+02, [9.9443269149350568e-24, -4.6406858936363596e-25, 2.3203429468181794e-26, -1.2375162383030290e-27, 7.0125920170504993e-29]),
-            (10, 2, 5, 3.0e+00, [3.6612100958410623e-02, -1.5401471911417455e-02, 4.7637380557147158e-03, 5.0292547448374211e-04, -2.8214782576543706e-03]),
-            (10, 2, 5, 1.0e+03, [3.0718156800000003e-15, -1.8430525439999997e-17, 1.2901072896000000e-19, -1.0320592895999999e-21, 9.2882681855999984e-24]),
-            (9, 3, 4, 1.0e+01, [2.7040056431742739e-02, -5.8916911171334472e-03, 1.5341464221588009e-03, -4.3208855617272632e-04, 1.1618407984814464e-04]),
+            (
+                6,
+                1,
+                3,
+                3.0e-01,
+                [
+                    4.6985918744347777e-01,
+                    -1.5280509899838315e-01,
+                    -1.9816847111553884e-01,
+                    9.2561975226344528e-01,
+                    -3.9694341175201573e+00,
+                ],
+            ),
+            (
+                6,
+                1,
+                3,
+                3.0e+00,
+                [
+                    1.0914697710866623e-01,
+                    -6.5216440555166594e-02,
+                    3.9215058819385841e-02,
+                    -2.1276924973236151e-02,
+                    6.9381035837886417e-03,
+                ],
+            ),
+            (
+                6,
+                1,
+                3,
+                3.0e+01,
+                [
+                    3.9506172790671214e-05,
+                    -5.2674896620681878e-06,
+                    8.7791490102848121e-07,
+                    -1.7558293827270790e-07,
+                    4.0969311059236578e-08,
+                ],
+            ),
+            (
+                6,
+                1,
+                3,
+                3.0e+02,
+                [
+                    3.9506172839506188e-09,
+                    -5.2674897119341561e-11,
+                    8.7791495198902613e-13,
+                    -1.7558299039780523e-14,
+                    4.0969364426154538e-16,
+                ],
+            ),
+            (
+                6,
+                2,
+                2,
+                1.0e+00,
+                [
+                    4.0505129895177810e-01,
+                    -1.1956079034782202e-01,
+                    4.1440616094682572e-03,
+                    7.2017547769282639e-02,
+                    -1.6811933626324055e-01,
+                ],
+            ),
+            (
+                6,
+                2,
+                2,
+                1.0e+01,
+                [
+                    3.6810901080102675e-02,
+                    -6.7329643588438281e-03,
+                    1.7756624741639996e-03,
+                    -5.9526359784749206e-04,
+                    2.3537927072176507e-04,
+                ],
+            ),
+            (
+                6,
+                2,
+                2,
+                3.0e+02,
+                [
+                    4.4440493827160507e-05,
+                    -2.9624362139917695e-07,
+                    2.9620850480109740e-09,
+                    -3.9488614540466389e-11,
+                    6.5802652034750789e-13,
+                ],
+            ),
+            (
+                6,
+                2,
+                2,
+                1.0e+04,
+                [
+                    3.9999996800000020e-08,
+                    -7.9999987200000017e-12,
+                    2.3999993600000012e-15,
+                    -9.5999961600000003e-19,
+                    4.7999973120000002e-22,
+                ],
+            ),
+            (
+                5,
+                1,
+                3,
+                3.0e-01,
+                [
+                    5.7728516709470501e-01,
+                    -8.2898535984488389e-02,
+                    -2.0775229494176811e-01,
+                    3.9871733020347994e-01,
+                    -5.3363865834983748e-01,
+                ],
+            ),
+            (
+                5,
+                1,
+                3,
+                1.0e+01,
+                [
+                    1.4059892518100654e-02,
+                    -4.1294515470580041e-03,
+                    1.5713113384848453e-03,
+                    -7.1323331693790200e-04,
+                    3.6356456589205617e-04,
+                ],
+            ),
+            (
+                5,
+                1,
+                3,
+                1.0e+03,
+                [
+                    1.4179630807244130e-08,
+                    -4.2538892421732390e-11,
+                    1.7015556968692956e-13,
+                    -8.5077784843464781e-16,
+                    5.1046670906078874e-18,
+                ],
+            ),
+            (
+                5,
+                2,
+                2,
+                1.0e+00,
+                [
+                    1.1021648736861631e+00,
+                    -1.2897521047617824e-01,
+                    -5.3421239984428652e-02,
+                    1.0165169935384380e-01,
+                    -1.1354669441816742e-01,
+                ],
+            ),
+            (
+                5,
+                2,
+                2,
+                3.0e+01,
+                [
+                    1.1763841854900088e-01,
+                    -3.8862691842207011e-03,
+                    2.5558346888487324e-04,
+                    -2.5091527780010377e-05,
+                    3.2677338632772836e-06,
+                ],
+            ),
+            (
+                5,
+                2,
+                2,
+                3.0e+02,
+                [
+                    1.1815833834525396e-02,
+                    -3.9382611638342123e-05,
+                    2.6251573282152214e-07,
+                    -2.6246905090939952e-09,
+                    3.4988093135899478e-11,
+                ],
+            ),
+            (
+                3,
+                1,
+                2,
+                3.0e-01,
+                [
+                    1.7495188441799354e+00,
+                    -1.4177634563722352e-01,
+                    -3.6789047048678736e-01,
+                    6.1508378604185920e-01,
+                    -7.6040920150538838e-01,
+                ],
+            ),
+            (
+                3,
+                1,
+                2,
+                3.0e+00,
+                [
+                    1.0345604321804829e+00,
+                    -2.2719310265493881e-01,
+                    6.3216787382709264e-02,
+                    -4.3866000134315120e-03,
+                    -2.3566293666730211e-02,
+                ],
+            ),
+            (
+                3,
+                1,
+                2,
+                1.0e+02,
+                [
+                    3.5449077018110321e-02,
+                    -3.5449077018110320e-04,
+                    7.0898154036220673e-06,
+                    -2.1269446210866188e-07,
+                    8.5077784843464801e-09,
+                ],
+            ),
+            (
+                4,
+                1,
+                3,
+                1.0e+00,
+                [
+                    8.9873717526205488e-01,
+                    -1.7263545188893351e-01,
+                    -8.4000874530434450e-02,
+                    1.5512070616520965e-01,
+                    -1.1443744630115851e-01,
+                ],
+            ),
+            (
+                4,
+                1,
+                3,
+                3.0e+01,
+                [
+                    8.8888888881474906e-03,
+                    -5.9259259186006819e-04,
+                    5.9259258535687199e-05,
+                    -7.9012338533590316e-06,
+                    1.3168717225478964e-06,
+                ],
+            ),
+            (
+                8,
+                1,
+                4,
+                3.0e+00,
+                [
+                    6.0953872337774703e-02,
+                    -4.1594882419161060e-02,
+                    2.7575716872150619e-02,
+                    -1.6382052326866139e-02,
+                    6.4381022935026989e-03,
+                ],
+            ),
+            (
+                8,
+                1,
+                4,
+                1.0e+02,
+                [
+                    7.6800000000000004e-10,
+                    -4.6079999999999998e-11,
+                    3.2255999999999995e-12,
+                    -2.5804799999999990e-13,
+                    2.3224319999999999e-14,
+                ],
+            ),
+            (
+                16,
+                1,
+                9,
+                1.0e+00,
+                [
+                    1.1886003289332642e-01,
+                    -3.9201561871392100e-02,
+                    -1.3883802126352989e-02,
+                    4.1258042065121049e-02,
+                    -4.0220630582165504e-02,
+                ],
+            ),
+            (
+                16,
+                1,
+                9,
+                1.0e+01,
+                [
+                    3.3036650726599696e-04,
+                    -2.4741494010306798e-04,
+                    1.8463467561634622e-04,
+                    -1.3626363127830295e-04,
+                    9.8500625583362153e-05,
+                ],
+            ),
+            (
+                16,
+                1,
+                9,
+                3.0e+02,
+                [
+                    9.9443269149350568e-24,
+                    -4.6406858936363596e-25,
+                    2.3203429468181794e-26,
+                    -1.2375162383030290e-27,
+                    7.0125920170504993e-29,
+                ],
+            ),
+            (
+                10,
+                2,
+                5,
+                3.0e+00,
+                [
+                    3.6612100958410623e-02,
+                    -1.5401471911417455e-02,
+                    4.7637380557147158e-03,
+                    5.0292547448374211e-04,
+                    -2.8214782576543706e-03,
+                ],
+            ),
+            (
+                10,
+                2,
+                5,
+                1.0e+03,
+                [
+                    3.0718156800000003e-15,
+                    -1.8430525439999997e-17,
+                    1.2901072896000000e-19,
+                    -1.0320592895999999e-21,
+                    9.2882681855999984e-24,
+                ],
+            ),
+            (
+                9,
+                3,
+                4,
+                1.0e+01,
+                [
+                    2.7040056431742739e-02,
+                    -5.8916911171334472e-03,
+                    1.5341464221588009e-03,
+                    -4.3208855617272632e-04,
+                    1.1618407984814464e-04,
+                ],
+            ),
         ];
         for &(d, p, s, rho, want) in &rows {
             let profile = duchon_radial_profile(p, s, d).expect("profile builds");
@@ -1540,10 +1885,14 @@ mod tests {
             match built {
                 Ok(profile) => {
                     let (low, main) = profile.panel_counts();
-                    eprintln!("[profile-build] (d={d}, p={p}, s={s}): low={low} main={main} in {elapsed:.3}s");
+                    eprintln!(
+                        "[profile-build] (d={d}, p={p}, s={s}): low={low} main={main} in {elapsed:.3}s"
+                    );
                 }
                 Err(error) => {
-                    eprintln!("[profile-build] (d={d}, p={p}, s={s}): REFUSED after {elapsed:.3}s: {error}");
+                    eprintln!(
+                        "[profile-build] (d={d}, p={p}, s={s}): REFUSED after {elapsed:.3}s: {error}"
+                    );
                     panic!("(d={d}, p={p}, s={s}) must build: {error}");
                 }
             }
@@ -1628,8 +1977,12 @@ mod tests {
             DuchonRadialProfile::build(1, 0, 6).is_err(),
             "s = 0 is pure polyharmonic"
         );
-        let singular = duchon_radial_profile(1, 1, 6).expect("2(p + s) ≤ d builds: finite away from the origin");
-        assert!(singular.origin_value().is_err(), "but it has no origin value");
+        let singular = duchon_radial_profile(1, 1, 6)
+            .expect("2(p + s) ≤ d builds: finite away from the origin");
+        assert!(
+            singular.origin_value().is_err(),
+            "but it has no origin value"
+        );
         assert!(
             DuchonRadialProfile::build(0, 1, 16).is_err(),
             "p = 0 is a bare Matérn block, outside the single-integral reduction"

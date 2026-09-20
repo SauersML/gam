@@ -29,9 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.len() != 3 {
         return Err("expected INPUT_JSON OUTPUT_JSON".into());
     }
-    env_logger::Builder::new()
-        .filter_module("gam_solve::estimate::reml::eval", log::LevelFilter::Debug)
-        .try_init()?;
+    gam_runtime::test_support::install_diagnostic_logger();
     let mut problem: Value = serde_json::from_reader(std::fs::File::open(&args[1])?)?;
     let x = matrix(serde_json::from_value(problem["x"].clone())?);
     let y = Array1::from_vec(serde_json::from_value(problem["y"].clone())?);

@@ -1,12 +1,18 @@
 ## Unreleased
 
-- **The cgroup-v2 memory probe no longer admits zero bytes when `memory.stat` reports more
-  `inactive_file` than `memory.current`** (#4380). The probe used to fail closed with
-  `inconsistent-counters`, which the resource governor reads as zero capacity, so every governed
-  allocation under that ceiling was refused. The v1 probe already admitted such a level at its headroom
-  with no reclaim credit, and both probes now share that rule inside the one constructor. The
-  `CgroupMemoryProbeFailureKind::InconsistentCounters` variant is removed.
-
+- **Warm-start lookup cache rows belong to one store root and see sibling writes** (#3882, #3885).
+  The process-global lookup cache was keyed by fingerprint alone, so a second
+  `WarmStartStore` on a different root returned, touched and could TTL-expire the
+  first root's entry. Rows are now keyed by the key directory. The fast path also
+  checked only the chosen meta file's mtime, so it never saw a better entry that a
+  sibling process wrote into the same key dir, and its own access-stamp rewrite
+  invalidated the row on every hit. A hit now requires both the meta and the key-dir
+  mtimes to match, and the row is re-recorded after the touch. `touch_lookup_hit` is
+  removed.
+- **`process_monitor` reads every `/proc/self` field through one parser** (#4073).
+  `parse_status_kb`, `parse_status_count` and `parse_io_bytes` were three copies of
+  "the integer after the key"; they are replaced by `parse_proc_value`, which takes the
+  first whitespace-separated token after the key for `status` and `io` lines alike.
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

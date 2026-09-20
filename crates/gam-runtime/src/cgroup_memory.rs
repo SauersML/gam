@@ -1000,3 +1000,32 @@ mod non_linux_tests {
         assert_eq!(detect_cgroup_memory(), CgroupMemoryObservation::NotPresent);
     }
 }
+
+
+#[cfg(test)]
+mod counter_arithmetic_tests {
+    use super::CgroupMemoryAvailability;
+
+    #[test]
+    fn counter_extremes_preserve_raw_observation_and_conservative_headroom() {
+        let counters = [0, 1, 100, 101, u64::MAX - 1, u64::MAX];
+        for limit in counters {
+            for current in counters {
+                for inactive in counters {
+                    let observation = CgroupMemoryAvailability::from_counters(
+                        "/fixture", limit, current, inactive, 3);
+                    // Independently compute in a wider signed domain. A cache
+                    // credit above the charge cannot establish reclaimable bytes.
+                    let credit = if inactive <= current { inactive as i128 } else { 0 };
+                    let working = current as i128 - credit;
+                    let available = (limit as i128 - working).max(0) as u64;
+                    assert_eq!(observation.working_set_bytes, working as u64);
+                    assert_eq!(observation.available_bytes, available);
+                    assert_eq!(observation.current_bytes, current);
+                    assert_eq!(observation.inactive_file_bytes, inactive);
+                    assert_eq!(observation.inspected_levels, 3);
+                }
+            }
+        }
+    }
+}

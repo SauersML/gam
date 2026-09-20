@@ -1,15 +1,15 @@
+pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 use gam_linalg::faer_ndarray::{
     default_rrqr_rank_alpha, fast_ab, fast_abt, fast_ata, fast_atb, rrqr_nullspace_basis,
     rrqr_nullspace_basis_with_cutoff, rrqr_with_permutation,
 };
-pub(crate) use gam_linalg::faer_ndarray::FaerEigh;
 
-use gam_linalg::utils::KahanSum;
+use gam_math::sparse_grid::CompensatedSum;
 
+use crate::chunked_kernel_design::ChunkedKernelDesignOperator;
 use gam_linalg::matrix::{
     CoefficientTransformOperator, DenseDesignOperator, DesignMatrix, LinearOperator,
 };
-use crate::chunked_kernel_design::ChunkedKernelDesignOperator;
 
 use gam_math::special::{
     binomial_coefficient_f64 as binomial_f64,
@@ -55,6 +55,8 @@ mod prelude_lock_tests {
     /// `include!("prelude.rs")`. Also pins a representative re-exported symbol.
     #[test]
     fn basis_prelude_include_path_is_locked() {
-        assert!(core::any::type_name::<gam_linalg::matrix::DesignMatrix>().contains("DesignMatrix"));
+        assert!(
+            core::any::type_name::<gam_linalg::matrix::DesignMatrix>().contains("DesignMatrix")
+        );
     }
 }

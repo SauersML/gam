@@ -394,17 +394,6 @@ impl PredictableModel for GaussianLocationScalePredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        if self.link_wiggle.is_some() { 3 } else { 2 }
-    }
-
-    fn block_roles(&self) -> Vec<BlockRole> {
-        if self.link_wiggle.is_some() {
-            vec![BlockRole::Location, BlockRole::Scale, BlockRole::LinkWiggle]
-        } else {
-            vec![BlockRole::Location, BlockRole::Scale]
-        }
-    }
 }
 
 #[cfg(test)]
