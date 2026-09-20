@@ -5524,7 +5524,8 @@ pub(crate) enum BlockCorrectionDecision {
 /// criterion's eigensolver returns its pairs in). Each later ρ takes the eigenvectors at those
 /// positions, so axis `r`'s order stays attached to the direction it was
 /// certified on, and the block moves with ρ as continuously as the
-/// eigenvectors do.
+/// eigenvectors at those positions do (continuously away from an eigenvalue
+/// coincidence with a neighbouring position, steeply near an avoided one).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) block_positions: Vec<usize>,

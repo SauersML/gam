@@ -16,8 +16,8 @@
 //!
 //! The block is now latched as its SPECTRAL POSITIONS in the ascending
 //! eigen-order of the penalized Hessian. The eigenvector at a fixed position
-//! moves continuously with ρ away from an eigenvalue coincidence, which a path
-//! through ρ avoids generically, so the criterion is continuous again and the
+//! moves continuously with ρ away from an eigenvalue coincidence with a
+//! neighbouring position, so the criterion has no jump there and the
 //! frame-rotation channel differentiates exactly that motion.
 //!
 //! The fixture is that same `case0/binomial/n1000` training set (eight

@@ -85,5 +85,26 @@ problem has more than one optimum, which is a finding of its own).
 
 ## Results
 
-See the PR that introduced this directory for the before/after table by
-cause; `triage.py DIR_BEFORE DIR_AFTER` regenerates it from two runs.
+`triage.py DIR_BEFORE DIR_AFTER` regenerates the before/after table from two
+runs. The full plan on main at 99940493 (before) and with the latched
+spectral-position block of the #784 correction (after), by primary cause,
+message heads abbreviated:
+
+| cause | before | after |
+|---|---:|---:|
+| `raise:fit` outer optimization did not certify a stationary optimum | 157 | 147 |
+| `raise:fit` smooth term remains under-resolution-uncertain | 76 | 76 |
+| `raise:fit` #784 block-local correction: order search refused | 32 | 32 |
+| `hang` | 26 | 22 |
+| `raise:refit` outer optimization did not certify a stationary optimum | 19 | 24 |
+| `raise:fit` declined a certified optimum that an evaluated state beats | 8 | 8 |
+| `raise:fit` Newton decrement above tolerance | 5 | 5 |
+| `reml_mismatch:refit_worse` | 3 | 3 |
+| `reml_mismatch:fit_worse` | 1 | 2 |
+| `raise:fit` / `raise:refit` under-resolution-uncertain (other types) | 2 | 4 |
+| `nonfinite:*_reml_score` exactly interpolating Gaussian fit | 2 | 2 |
+| **total** | **331 / 1692 (19.56%)** | **325 / 1692 (19.21%)** |
+
+The fixed cause's fixture is `run.FIXTURES` (`case0/binomial/n1000`). The
+rest of the net change is outer-search trajectories moving, both ways, once
+the criterion no longer jumps; those failures belong to the causes above.

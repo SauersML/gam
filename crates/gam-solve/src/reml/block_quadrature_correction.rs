@@ -470,9 +470,12 @@ impl<'a> RemlState<'a> {
         // BFGS polish's trial points at |g| = 1.4e-4, so the line search could
         // not pass sufficient decrease and the fit ended `line_search_failed`.
         // The eigenvector at a fixed position is a continuous function of ρ
-        // away from an eigenvalue coincidence, which a path through ρ avoids
-        // generically, so the latched block is too, and the frame-rotation
-        // channel (c) below differentiates exactly that motion.
+        // away from an eigenvalue coincidence with a neighbouring position, so
+        // the latched block is too, and the frame-rotation channel (c) below
+        // differentiates exactly that motion. It is not uniformly smooth:
+        // near an avoided crossing the eigenvector rotates over a ρ-width
+        // about the size of the relative gap, and `Δ_b` moves as steeply
+        // there (gaps down to 7e-4 on the fuzzer's `case45/binomial/n1000`).
         //
         // A position is a rank in ASCENDING eigenvalue order, not an index into
         // `evals`: the criterion's operator above is an `eigh` of the assembled
