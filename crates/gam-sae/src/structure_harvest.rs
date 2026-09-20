@@ -4626,7 +4626,13 @@ fn race_birth_topology(
         Some(SaeAtomBasisKind::EuclideanPatch)
     );
     let intrinsic_winner = if template_is_sheet {
-        challenger_race(race_intrinsic_coords(target, weights, d_k, atlas.as_ref()))?
+        challenger_race(race_intrinsic_coords(
+            target,
+            weights,
+            d_k,
+            local_atlas.as_ref(),
+            atlas.as_ref(),
+        ))?
     } else {
         None
     };
@@ -4815,10 +4821,16 @@ fn race_template_coords(
 /// with the template race), and race the SAME topology candidate set on those
 /// unfolded coordinates. Returns the winning fit and its TK evidence, or `None`
 /// when the embedding is degenerate or no candidate is realizable.
+///
+/// `local_atlas` is the birth atlas `race_birth_topology` built on this same
+/// `target`; when its chart rank is `d_k`, `LocalAtlas::build` already computed
+/// this exact embedding (same kNN graph, same geodesic MDS) to audit its cover,
+/// so it is read back rather than recomputed.
 fn race_intrinsic_coords(
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     d_k: usize,
+    local_atlas: Option<&crate::manifold::LocalAtlas>,
     atlas: Option<&AtlasTopologyReadout>,
 ) -> Result<Option<TopologyRaceOutcome>, TopologyRaceError> {
     // Folds are a d ≥ 2 story: a 1-D manifold has no ambient fold a geodesic
@@ -4828,7 +4840,16 @@ fn race_intrinsic_coords(
     if d_k < 2 || target.nrows() < 3 {
         return Ok(None);
     }
-    let embed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
+    let computed;
+    let embed = match local_atlas {
+        Some(local_atlas) if local_atlas.intrinsic_dim() == d_k => {
+            local_atlas.intrinsic_coordinates()
+        }
+        _ => {
+            computed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
+            &computed
+        }
+    };
     let n = embed.nrows();
     let d = embed.ncols();
     if n == 0 || d == 0 {
