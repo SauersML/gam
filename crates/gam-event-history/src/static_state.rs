@@ -90,6 +90,14 @@ pub(crate) fn spells(inputs: &SubjectInputs<'_, f64>, compensated: &[bool]) -> R
     let mut opened = statistics.log_integral(inputs)?;
     let mut spells = Vec::new();
     let mut open = false;
+    // `before − opened` is off by at most both integrals' bounds plus
+    // `ε (|before| + |opened|)` for the subtraction.
+    let spell = |node: usize, before: (f64, f64), opened: (f64, f64), intensities: Option<Vec<f64>>| Spell {
+        node,
+        log_survival: before.0 - opened.0,
+        log_survival_roundoff: before.1 + opened.1 + f64::EPSILON * (before.0.abs() + opened.0.abs()),
+        intensities,
+    };
     for n in 0..nodes.len() {
         if !nodes.is_event(n) {
             statistics.push(inputs, compensated, n);
@@ -101,15 +109,15 @@ pub(crate) fn spells(inputs: &SubjectInputs<'_, f64>, compensated: &[bool]) -> R
         for d in 0..marks {
             let base = centred_baseline(&inputs.eta0[n * marks + d], &inputs.loadings[d * atoms..(d + 1) * atoms],
                 inputs.log_normaliser.map(|m| &m[n * marks + d]));
-            intensities.push((base + statistics.with_event(inputs, d).log_integral(inputs)? - before).exp());
+            intensities.push((base + statistics.with_event(inputs, d).log_integral(inputs)?.0 - before.0).exp());
         }
-        spells.push(Spell { node: n, log_survival: before - opened, intensities: Some(intensities) });
+        spells.push(spell(n, before, opened, Some(intensities)));
         statistics.push(inputs, compensated, n);
         opened = statistics.log_integral(inputs)?;
         open = false;
     }
     if open {
-        spells.push(Spell { node: nodes.len() - 1, log_survival: statistics.log_integral(inputs)? - opened, intensities: None });
+        spells.push(spell(nodes.len() - 1, statistics.log_integral(inputs)?, opened, None));
     }
     Ok(spells)
 }
@@ -332,27 +340,55 @@ impl<S: JetField> Statistics<S> {
     }
 
     /// `ln ∫ φ(z) exp(linear · z − Σ_d exp(log_hazard_d + a_d · z)) dz`, on the
-    /// grid placed from these statistics.
-    fn log_integral(&self, inputs: &SubjectInputs<'_, S>) -> Result<S, EventHistoryError> {
+    /// grid placed from these statistics, and the roundoff bound of its value
+    /// (Higham, *Accuracy and Stability*, ch. 3), accumulated as it is formed:
+    /// - A log term `t_i` is off by at most `ε m_i`, with `m_i` the summed
+    ///   magnitudes of the operands and partial results it forms; a rate
+    ///   `exp(r)` carries relative error `ε (1 + m_r)` from its exponent.
+    /// - `u_i = exp(t_i − shift)` has relative error at most `ε r_i`, with
+    ///   `r_i = 1 + m_i + |t_i| + |shift|`, and adding it to the partial sum
+    ///   `s_i` adds `ε s_i`, so the sum is off by at most `Σ_i ε (u_i r_i + s_i)`.
+    /// - The logarithm divides that by the sum, and restoring the shift adds
+    ///   `ε (|ln s| + |shift|)`.
+    fn log_integral(&self, inputs: &SubjectInputs<'_, S>) -> Result<(S, f64), EventHistoryError> {
         let grid = self.place(inputs)?;
         let atoms = grid.dimension();
         let half_log_tau = 0.5 * (2.0 * std::f64::consts::PI).ln();
-        let terms: Vec<S> = (0..grid.size()).map(|i| {
+        let (terms, magnitudes): (Vec<S>, Vec<f64>) = (0..grid.size()).map(|i| {
             let mut value = ln(&grid.weights[i]);
+            let mut magnitude = value.value().abs();
             for k in 0..atoms {
                 let z = grid.coordinate(i, k);
-                value = add_real(&value.add(&self.linear[k].mul(z)).sub(&z.mul(z).scale(0.5)), -half_log_tau);
+                let (linear, square) = (self.linear[k].mul(z), z.mul(z).scale(0.5));
+                value = add_real(&value.add(&linear).sub(&square), -half_log_tau);
+                magnitude += linear.value().abs() + square.value() + half_log_tau + value.value().abs();
             }
             for (d, log_hazard) in self.log_hazards.iter().enumerate() {
                 if let Some(log_hazard) = log_hazard {
-                    let log_rate = (0..atoms).fold(log_hazard.clone(),
-                        |acc, k| acc.add(&inputs.loadings[d * atoms + k].mul(grid.coordinate(i, k))));
-                    value = value.sub(&exp(&log_rate));
+                    let mut exponent = log_hazard.value().abs();
+                    let log_rate = (0..atoms).fold(log_hazard.clone(), |acc, k| {
+                        let step = acc.add(&inputs.loadings[d * atoms + k].mul(grid.coordinate(i, k)));
+                        exponent += step.value().abs()
+                            + (inputs.loadings[d * atoms + k].value() * grid.coordinate(i, k).value()).abs();
+                        step
+                    });
+                    let rate = exp(&log_rate);
+                    value = value.sub(&rate);
+                    magnitude += rate.value() * (1.0 + exponent) + value.value().abs();
                 }
             }
-            value
-        }).collect();
-        Ok(log_sum_exp(&terms))
+            (value, magnitude)
+        }).unzip();
+        let shift = terms.iter().map(|t| t.value()).fold(f64::NEG_INFINITY, f64::max);
+        let (mut sum, mut error) = (0.0_f64, 0.0_f64);
+        for (t, magnitude) in terms.iter().zip(&magnitudes) {
+            let u = (t.value() - shift).exp();
+            sum += u;
+            error += f64::EPSILON * (u * (1.0 + magnitude + t.value().abs() + shift.abs()) + sum);
+        }
+        let value = log_sum_exp(&terms);
+        let roundoff = error / sum + f64::EPSILON * (sum.ln().abs() + shift.abs());
+        Ok((value, roundoff))
     }
 }
 
@@ -433,6 +469,13 @@ mod tests {
             .expect("spells")
             .into_iter()
             .map(|spell| {
+                // The survival is at most one to within the roundoff the spell
+                // carries, and that bound is a finite positive charge.
+                assert!(spell.log_survival_roundoff.is_finite() && spell.log_survival_roundoff > 0.0,
+                    "spell at node {}: log survival roundoff {}", spell.node, spell.log_survival_roundoff);
+                assert!(spell.log_survival <= spell.log_survival_roundoff,
+                    "spell at node {}: log survival {} above its roundoff {}", spell.node, spell.log_survival,
+                    spell.log_survival_roundoff);
                 let probabilities = spell.intensities.map_or_else(Vec::new, |intensities| {
                     let total: f64 = intensities.iter().sum();
                     intensities.iter().map(|v| v / total).collect()
