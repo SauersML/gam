@@ -4018,7 +4018,10 @@ impl SurvivalLocationScaleFamily {
                             coefficient = -(paired_s2[row] * d1 * d1);
                         }
                     }
+                    // A zero-weight row contributes exactly 0, whatever its
+                    // curvature: `0 * inf` must not become a NaN weight.
                     row_slots[slot] = match weight {
+                        Some(weight) if weight == 0.0 => 0.0,
                         Some(weight) => coefficient * weight,
                         None => coefficient,
                     };
@@ -4065,7 +4068,8 @@ impl SurvivalLocationScaleFamily {
                     closing[group.left_channel].expect("active survival-LS pair has a left design");
                 let right = closing[group.right_channel]
                     .expect("active survival-LS pair has a right design");
-                let weights = sanitize_survival_weight_vector(&slots.row(slot).to_owned());
+                let weights = slots.row(slot).to_owned();
+                require_finite_row_weights(&weights, "survival-LS diagonal Hessian")?;
                 let multiplicity = if group.left_channel == group.right_channel {
                     1.0
                 } else {
