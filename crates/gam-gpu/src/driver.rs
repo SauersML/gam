@@ -1405,7 +1405,8 @@ mod compute_library_cache_tests {
             .unwrap_err();
         assert!(
             std::panic::catch_unwind(|| {
-                let _guard = cache.entries.lock().unwrap();
+                let entries = cache.entries.lock().unwrap();
+                assert_eq!(entries.len(), 2);
                 panic!("injected cache owner panic");
             })
             .is_err()
@@ -1433,7 +1434,8 @@ mod compute_library_cache_tests {
         let cache = ComputeLibraryCache::default();
         assert!(
             std::panic::catch_unwind(|| {
-                let _ = cache.require("panicked", || panic!("injected loader panic"));
+                cache.require("panicked", || panic!("injected loader panic"))
+                    .expect("loader returned instead of panicking");
             })
             .is_err()
         );
