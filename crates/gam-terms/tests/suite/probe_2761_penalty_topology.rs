@@ -1,6 +1,18 @@
-//! TEMPORARY probe: why does the active-penalty count of a 1-D measure-jet
-//! TERM COLLECTION change with the representer range? (`incremental realizer
-//! topology changed ... active_penalties=2, cached_penalties=1`)
+//! #2761: the penalty topology of a 1-D measure-jet term must not depend on the
+//! representer range ℓ.
+//!
+//! The outer search moves ℓ between trials and the incremental realizer
+//! rebuilds the term in the FROZEN composed chart at each one. When that
+//! rebuild's local penalty count differed from the collection's cached count,
+//! the search aborted with `incremental realizer topology changed ...
+//! active_penalties=2, cached_penalties=1`. The repair declares the Primary's
+//! structural null frame from the constraint transform `z` alone ("Nothing here
+//! reads `ℓ`", `measure_jet_primary_structural_null_frame`), and it decides the
+//! double-penalty ridge's fate in the local chart the way the collection
+//! decides it. So the topology is ℓ-invariant by construction, and both tests
+//! below assert that at every rung of a range ladder (32x for the
+//! collection, 128x for the frozen chart). (These started as
+//! print-only probes, which could not fail when the abort came back.)
 
 use gam_data::{ColumnKindTag, DataSchema, EncodedDataset as Dataset, SchemaColumn};
 use gam_terms::basis::{
@@ -46,7 +58,7 @@ fn dataset_1d(n: usize) -> Dataset {
 }
 
 #[test]
-fn probe_term_collection_topology_versus_range() {
+fn term_collection_topology_is_range_invariant_2761() {
     let ds = dataset_1d(200);
     let col_map = ds.column_map();
     let parsed = parse_formula("y ~ s(x, bs=\"mjs\")").expect("parse");
@@ -92,6 +104,12 @@ fn probe_term_collection_topology_versus_range() {
         gam_terms::basis::center_strategy_num_centers(&mj.center_strategy)
     );
 
+    let auto_sources: Vec<String> = realized
+        .penaltyinfo
+        .iter()
+        .map(|i| format!("{:?}", i.penalty.source))
+        .collect();
+    let mut mismatches = Vec::<String>::new();
     for f in [0.5_f64, 1.0, 2.0, 4.0, 8.0, 16.0] {
         let mut spec = base.clone();
         let auto = {
@@ -125,17 +143,33 @@ fn probe_term_collection_topology_versus_range() {
                     design.design.ncols(),
                     design.penalties.len()
                 );
+                if design.penalties.len() != realized.penalties.len() || sources != auto_sources {
+                    mismatches.push(format!(
+                        "f={f}: penalties={} src={sources:?} dropped={dropped:?}",
+                        design.penalties.len()
+                    ));
+                }
             }
-            Err(e) => println!("[coll] f={f:<5} FAILED: {e}"),
+            Err(e) => {
+                println!("[coll] f={f:<5} FAILED: {e}");
+                mismatches.push(format!("f={f}: design build failed: {e}"));
+            }
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "the measure-jet term collection's penalty topology moved with the representer range \
+         (auto: penalties={} src={auto_sources:?}):\n  - {}",
+        realized.penalties.len(),
+        mismatches.join("\n  - ")
+    );
 }
 
 /// The chart the incremental realizer actually rebuilds in: the FROZEN composed
 /// transform the collection produced. Its local topology must equal the
 /// collection's cached one, at every range.
 #[test]
-fn probe_frozen_chart_local_topology_versus_range() {
+fn frozen_chart_local_topology_matches_collection_at_every_range_2761() {
     use gam_terms::basis::{BasisMetadata, MeasureJetFrozenQuadrature};
 
     let ds = dataset_1d(200);
@@ -172,15 +206,18 @@ fn probe_frozen_chart_local_topology_versus_range() {
     else {
         panic!("expected measure-jet metadata");
     };
+    let SmoothBasisSpec::MeasureJet { spec: base_mj, .. } = &base.smooth_terms[0].basis else {
+        panic!("expected mjs");
+    };
     let frozen = MeasureJetBasisSpec {
         center_strategy: CenterStrategy::UserProvided(centers.clone()),
         order_s: *order_s,
         alpha: *alpha,
         num_scales: eps_band.len(),
         length_scale: length_scale.standardized_value(),
-        double_penalty: true,
-        learn_length_scale: true,
-        multiscale: false,
+        double_penalty: base_mj.double_penalty,
+        learn_length_scale: base_mj.learn_length_scale,
+        multiscale: base_mj.multiscale,
         identifiability: MeasureJetIdentifiability::FrozenTransform {
             transform: constraint_transform.clone().expect("fit-time z"),
         },
@@ -197,22 +234,44 @@ fn probe_frozen_chart_local_topology_versus_range() {
     // The frozen replay evaluates on the SAME (standardized) coordinates the
     // centers live in, so feed the term its own feature column.
     let feature_col = feature.slice(ndarray::s![.., 1..2]).to_owned();
+    let mut mismatches = Vec::<String>::new();
     for f in [0.25_f64, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0] {
         let mut spec = frozen.clone();
         spec.length_scale = frozen.length_scale * f;
         match build_measure_jet_basis(feature_col.view(), &spec) {
-            Ok(built) => println!(
-                "[frozen] f={f:<5} ell={:.6} p={} local_penalties={} sources={:?}",
-                spec.length_scale,
-                built.design.ncols(),
-                built.active_penalties.len(),
-                built
+            Ok(built) => {
+                let sources = built
                     .active_penalties
                     .iter()
                     .map(|p| format!("{:?}", p.info.source))
-                    .collect::<Vec<_>>()
-            ),
-            Err(e) => println!("[frozen] f={f:<5} BUILD FAILED: {e}"),
+                    .collect::<Vec<_>>();
+                println!(
+                    "[frozen] f={f:<5} ell={:.6} p={} local_penalties={} sources={sources:?}",
+                    spec.length_scale,
+                    built.design.ncols(),
+                    built.active_penalties.len(),
+                );
+                // The incremental realizer's own check: the local count must
+                // equal the term's cached penalty range, which for this
+                // single-smooth, intercept-only model is the collection's count.
+                if built.active_penalties.len() != realized.penalties.len() {
+                    mismatches.push(format!(
+                        "f={f}: local_penalties={} sources={sources:?}",
+                        built.active_penalties.len()
+                    ));
+                }
+            }
+            Err(e) => {
+                println!("[frozen] f={f:<5} BUILD FAILED: {e}");
+                mismatches.push(format!("f={f}: frozen rebuild failed: {e}"));
+            }
         }
     }
+    assert!(
+        mismatches.is_empty(),
+        "the frozen composed chart's local penalty topology differs from the collection's \
+         cached {} penalties (the `incremental realizer topology changed` abort):\n  - {}",
+        realized.penalties.len(),
+        mismatches.join("\n  - ")
+    );
 }
