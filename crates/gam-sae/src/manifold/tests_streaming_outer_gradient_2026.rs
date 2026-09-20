@@ -487,11 +487,9 @@ fn surrogate_certificate_is_rescored_on_unseen_probes_before_stamping_2933() {
         .saturating_sub(1);
     let p_beta = term.beta_dim();
     let seed_rho = SaeManifoldRho::new(0.0, 0.05_f64.ln(), vec![Array1::<f64>::zeros(1)]);
-    let seed = seed_rho
-        .to_flat(&term.assignment)
-        .expect("flat seed coordinates");
     let mut objective =
         SaeManifoldOuterObjective::new(term, target, None, seed_rho, 40, 1.0, 1.0e-6, 1.0e-6);
+    let seed = objective.baseline_rho.flat_coordinates();
     let problem = gam_solve::rho_optimizer::OuterProblem::new(seed.len())
         .with_problem_size(256 * 4, p_beta)
         .with_initial_rho(seed)
