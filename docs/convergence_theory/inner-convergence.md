@@ -435,7 +435,7 @@ Every inner solve returns `InnerCertificate { λ_cert, κ, r̄, gap, value_err =
   - Cause: the inner caps of 3–64 iterations (`bridges.rs:2311-2449`, log line `inner_max_iterations=3`) and adaptive-KKT η = 0.1 leave r > 0. Props 6 and 7 then put O(r·edf) noise into V and O(r) noise into G. When |Pg| is within 3× of the bound, that noise decides the line search.
   - Fix: delete the caps, stop at the fp floor, and apply 6.4(1)–(2).
   - This is the rail and box issue only in part. The box itself belongs to other lanes.
-- **x1+cc(x2) "Newton decrement stopped contracting"** (`rho_optimizer/newton_polish.rs:123`) and **multinomial "declined certified optimum"** (hessian_psd = NO, 7 railed coordinates).
+- **x1+cyclic(x2) "Newton decrement stopped contracting"** (`rho_optimizer/newton_polish.rs:123`) and **multinomial "declined certified optimum"** (hessian_psd = NO, 7 railed coordinates).
   - Cause: the outer Newton contraction test is impossible to satisfy when V and G carry O(r) inner noise. Multinomial also uses the hard-coded 1e-5 (`multinomial.rs:116`).
   - Fix: fp-floor inner with the block-q_i κ, error bars passed to the outer, and delete the 1e-5 and 1200-cycle constants.
 - **Iso-kappa Matérn** (|Pg| 0.331 vs 0.0181; 3.622 vs 0.065).

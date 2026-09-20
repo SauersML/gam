@@ -32,7 +32,7 @@ use crate::basis::{
 /// terms and by `by=`-wrapped / factor-sum-to-zero inner smooths. The wrapper
 /// arms recurse into this same function, so every inner basis kind is frozen
 /// with identical logic. A previous split implementation froze only B-spline
-/// inners, leaving spatial inner bases (`bs='tp'`/`matern`/`duchon`/`sos`)
+/// inners, leaving spatial inner bases (`bs='tps'`/`matern`/`duchon`/`sos`)
 /// unfrozen and recomputed on the prediction grid (#704).
 fn freeze_smooth_basis_from_metadata(
     basis: &mut SmoothBasisSpec,
@@ -623,7 +623,7 @@ fn freeze_smooth_basis_from_metadata(
             // Recurse so a spatial inner basis (thin-plate, Matern, Duchon,
             // sphere, tensor, …) is frozen identically to a stand-alone
             // term. Previously only a B-spline inner was frozen here, so a
-            // `s(x, by=g, bs='tp')` smooth left its data-dependent kernel
+            // `s(x, by=g, bs='tps')` smooth left its data-dependent kernel
             // and eigen-truncation to be recomputed on the prediction grid,
             // crashing the predict-time design rebuild (#704).
             freeze_smooth_basis_from_metadata(smooth, metadata, term_name)?;

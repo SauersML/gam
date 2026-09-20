@@ -130,7 +130,7 @@ pub(crate) fn evaluate_splines_at_point_full_support_into(
 /// to ensure the basis functions are well-supported across the entire data domain.
 /// This prevents "ghost" basis functions with support mostly outside the data range,
 /// which would create near-zero columns in the design matrix and ill-conditioned systems.
-pub(super) fn generate_full_knot_vector(
+pub fn generate_full_knot_vector(
     data_range: (f64, f64),
     num_internal_knots: usize,
     degree: usize,

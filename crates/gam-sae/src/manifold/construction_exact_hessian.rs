@@ -862,6 +862,7 @@ pub(crate) struct EvidenceRootCounters {
     negative_curvature_no_steps: std::sync::atomic::AtomicUsize,
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
+    exact_refused_acceptances: std::sync::atomic::AtomicUsize,
     rounding_floor_stops: std::sync::atomic::AtomicUsize,
     band_refused_commits: std::sync::atomic::AtomicUsize,
 }
@@ -883,6 +884,9 @@ pub(crate) struct EvidenceRootCounts {
     /// A refinement moved the state and recurred, but the refined root did not certify, so
     /// the accepted state was priced.
     pub(crate) uncertified_refinements: usize,
+    /// #2933 F08 — a state admitted on the majorizer Newton decrement whose exact verdict
+    /// refused it, so it was not priced and the solve continued.
+    pub(crate) exact_refused_acceptances: usize,
     /// #2822 — the gate sat inside its formation band, so no root step was solved for.
     pub(crate) rounding_floor_stops: usize,
     /// #2822 — a trial the strict contraction would have committed, refused because the two
@@ -903,6 +907,7 @@ impl EvidenceRootTelemetry {
                 .load(Ordering::Relaxed),
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
+            exact_refused_acceptances: self.0.exact_refused_acceptances.load(Ordering::Relaxed),
             rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
             band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }
@@ -1311,11 +1316,26 @@ pub(crate) struct PreparedSoftmaxRowJets {
 struct PreparedSoftmaxRowJetTile {
     start: usize,
     q: usize,
-    path: crate::gpu_kernels::sae_rowjet::SaeRowJetPath,
+    executor: PreparedSoftmaxRowJetExecutor,
     inputs: Vec<crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput>,
     probe: Vec<f64>,
-    /// The CPU tile's per-state contractions, when the governor admits them.
-    bilinear: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+}
+
+/// Which executor applies against one prepared tile. The CPU executor keeps
+/// the tile's per-state contractions when the governor admits them (`kept`);
+/// the device executor re-reads the tile's inputs on every apply.
+enum PreparedSoftmaxRowJetExecutor {
+    Cpu {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+    },
+    Device,
+    /// `auto` with a device and a shape it has not timed: every apply runs
+    /// both, and the state's CPU build plus applies are weighed against the
+    /// device's applies when the state drops (gam#3024).
+    Racing {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+        race: gam_gpu::ReusedStateRace,
+    },
 }
 
 struct PreparedResidualCurvatureRow {
@@ -4973,7 +4993,27 @@ impl SaeManifoldTerm {
             }
             values.log_det_correction
         };
-        Ok((joint_pricing.log_det + orbit_correction, geometry))
+        // #2933 F07 — the periodic phases integrated on their circles. An orbit-stiffened
+        // block integrates its orbit coordinates exactly already, and the phase rows it
+        // stiffened are priced there, not here.
+        let phase_correction = if geometry.orbit_generators.is_empty() {
+            match self
+                .periodic_phase_marginal(cache)
+                .map_err(SaeCriterionError::Numerical)?
+            {
+                Some((correction, _)) => {
+                    log::debug!(
+                        "[SAE-EXACT-DENSE] periodic phase circle volume: ½Δlog|A|={:.6e}",
+                        0.5 * correction
+                    );
+                    correction
+                }
+                None => 0.0,
+            }
+        } else {
+            0.0
+        };
+        Ok((joint_pricing.log_det + orbit_correction + phase_correction, geometry))
     }
 
     /// The generalized eigensystem of one already-materialized exact-Hessian block in the
@@ -6342,11 +6382,19 @@ impl SaeManifoldTerm {
         )?;
         // #2933 F07 — in-band pencil directions are priced at `Φ`'s own curvature, so the
         // value moves with the evidence factor there as well.
+        // The periodic phases' circle volume moves with `B_raw` alone; see
+        // `periodic_phase_marginal`, which the value priced off the same cache.
+        let phase_weight = if geometry.orbit_generators.is_empty() {
+            self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
+        } else {
+            None
+        };
         let (metric_trace, metric_gamma) = self.evidence_metric_derivative_channels(
             rho,
             target,
             cache,
             &pricing.metric_derivative,
+            phase_weight.as_ref(),
         )?;
         logdet_trace += &metric_trace;
         gamma.t += &metric_gamma.t;
@@ -6391,10 +6439,13 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
         weight: &Array2<f64>,
+        raw_addend: Option<&Array2<f64>>,
     ) -> Result<(Array1<f64>, SaeArrowVector), String> {
         let total_t = cache.delta_t_len();
         let mut trace = Array1::<f64>::zeros(rho.flat_coordinates().len());
-        if weight.iter().all(|&value| value == 0.0) {
+        if weight.iter().all(|&value| value == 0.0)
+            && raw_addend.is_none_or(|addend| addend.iter().all(|&value| value == 0.0))
+        {
             return Ok((
                 trace,
                 SaeArrowVector {
@@ -6403,7 +6454,17 @@ impl SaeManifoldTerm {
                 },
             ));
         }
-        let raw_weight = self.evidence_metric_raw_weight(cache, weight)?;
+        let mut raw_weight = self.evidence_metric_raw_weight(cache, weight)?;
+        if let Some(addend) = raw_addend {
+            if addend.dim() != raw_weight.dim() {
+                return Err(format!(
+                    "evidence_metric_derivative_channels: raw addend {:?} on weight {:?}",
+                    addend.dim(),
+                    raw_weight.dim()
+                ));
+            }
+            raw_weight += addend;
+        }
         for (flat, operator) in self.raw_penalty_curvature_operators_by_flat(rho, cache)? {
             trace[flat] = 0.5 * (&raw_weight * &operator).sum();
         }
@@ -6600,6 +6661,235 @@ impl SaeManifoldTerm {
             out.slice_mut(s![base..base + q, base..base + q]).assign(&folded);
         }
         Ok(out)
+    }
+
+    /// #2933 F07 — each periodic phase coordinate's posterior volume, integrated on its
+    /// circle instead of priced by the Gaussian factor `√(2π/κ)`.
+    ///
+    /// The ARD prior's periodic normalizer is exact on the circle
+    /// (`circle_log_marginal`), but `½log|A|` priced every row's phase as though it lived
+    /// on the line. The Gaussian factor has no ceiling: as the phase curvature `κ` falls
+    /// (a smaller ARD precision, a smaller decoder amplitude), `−log √(2π/κ)` falls
+    /// without bound while the phase's true volume stops at its period `P`, so the
+    /// criterion rewarded shrinking an atom towards nothing (N/2 per e-fold on e1, 64 rows).
+    ///
+    /// Per periodic local coordinate `j` of row `i`, with `v` the row's other coordinates,
+    /// `T` the row block of `Φ` and `B` the same block with its unit pins undone:
+    ///
+    /// ```text
+    ///   log|A| += −2·log M(Sᴮ_jj, P) − log Sᵀ_jj + log 2π
+    ///   Sᵀ = T_PP − T_Pv T_vv⁻¹ T_vP,     Sᴮ = B_PP − B_Pv T_vv⁻¹ B_vP
+    /// ```
+    ///
+    /// `Sᵀ_jj` is the conditional curvature the pricing gave the phase and `−log Sᵀ_jj +
+    /// log 2π` removes its Gaussian factor (the `−½log 2π` it paired with is the ARD
+    /// partition's, [`Self::ard_log_partition`]); `Sᴮ_jj` is the phase's curvature before
+    /// any pin, which can be zero or negative, and `circle_log_marginal_signed` integrates
+    /// it at any sign. With no pin the two agree and the correction is the von Mises
+    /// excess `−2·log(1 + 1/(8η) + …)`, which vanishes as `η → ∞`; as `κ → 0` it is
+    /// bounded by the period, `M ≤ P` for `κ ≥ 0`. A row with several periodic axes
+    /// integrates each one at its conditional curvature, which is exact when their
+    /// cross-curvature vanishes.
+    ///
+    /// The returned weight `X̃` is on `dB_raw` in the joint layout and in full log-det
+    /// units, `⟨X̃, dB_raw⟩ = d(correction)`, so it enters
+    /// [`Self::evidence_metric_derivative_channels`] as its raw addend. It is row-local in
+    /// `tt`, so it reaches the border through nothing: `T`'s border conditioning is
+    /// driven by `X_ββ`, which is zero here. A gauge-pinned row has `T = B_raw + Σvvᵀ`
+    /// with constant `v`, so both weights fold by identity; a spectrally pinned row folds
+    /// the `T` weight through its recorded spectrum and the `B` weight through the same
+    /// spectrum with its unit pins read raw.
+    ///
+    /// `None` when no row carries a periodic coordinate.
+    pub(crate) fn periodic_phase_marginal(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Option<(f64, Array2<f64>)>, String> {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let periods = self.all_ard_axis_periods();
+        if !periods
+            .iter()
+            .any(|axes| axes.iter().any(Option::is_some))
+        {
+            return Ok(None);
+        }
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let mut correction = 0.0_f64;
+        let mut raw_weight = Array2::<f64>::zeros((dim, dim));
+        let mut priced_any = false;
+        for row in 0..cache.n_rows() {
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let q = vars.len();
+            let mut phase: Vec<(usize, f64)> = Vec::new();
+            for (local, variable) in vars.iter().enumerate() {
+                if let SaeLocalRowVar::Coord { atom, axis } = *variable
+                    && let Some(period) = periods
+                        .get(atom)
+                        .and_then(|axes| axes.get(axis))
+                        .copied()
+                        .flatten()
+                {
+                    if !(period.is_finite() && period > 0.0) {
+                        return Err(format!(
+                            "periodic_phase_marginal: atom {atom} axis {axis} has period {period}"
+                        ));
+                    }
+                    phase.push((local, period));
+                }
+            }
+            if phase.is_empty() {
+                continue;
+            }
+            priced_any = true;
+            let factor = cache.undamped_factor(row);
+            if factor.dim() != (q, q) {
+                return Err(format!(
+                    "periodic_phase_marginal: row {row} has {q} variables but a {:?} factor",
+                    factor.dim()
+                ));
+            }
+            let t_block = factor.dot(&factor.t());
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            // `B` and the spectrum its fold differentiates: the recorded one with every unit
+            // pin read at its raw curvature.
+            let (b_block, raw_spectrum) = match spectrum {
+                Some(spec) => {
+                    if spec.evecs.dim() != (q, q)
+                        || spec.raw_evals.len() != q
+                        || spec.cond_evals.len() != q
+                        || spec.conditioning.len() != q
+                    {
+                        return Err(format!(
+                            "periodic_phase_marginal: row {row} has dimension {q}, but its \
+                             spectral carrier is {:?}",
+                            spec.evecs.dim()
+                        ));
+                    }
+                    let mut unpinned = spec.cond_evals.clone();
+                    let mut conditioning = spec.conditioning.to_vec();
+                    for m in 0..q {
+                        if conditioning[m] == RowSpectralConditioning::UnitDeflated {
+                            unpinned[m] = spec.raw_evals[m];
+                            conditioning[m] = RowSpectralConditioning::Raw;
+                        }
+                    }
+                    let scaled = &spec.evecs * &unpinned.view().insert_axis(ndarray::Axis(0));
+                    let b = scaled.dot(&spec.evecs.t());
+                    (
+                        b,
+                        Some(RowDeflationSpectrum {
+                            evecs: spec.evecs.clone(),
+                            raw_evals: spec.raw_evals.clone(),
+                            cond_evals: unpinned,
+                            conditioning: conditioning.into(),
+                        }),
+                    )
+                }
+                None => {
+                    let mut b = t_block.clone();
+                    for direction in cache.deflated_row_directions.get(row).into_iter().flatten() {
+                        if direction.len() != q {
+                            return Err(format!(
+                                "periodic_phase_marginal: row {row} gauge direction has length {}, \
+                                 row dimension {q}",
+                                direction.len()
+                            ));
+                        }
+                        for a in 0..q {
+                            for b_index in 0..q {
+                                b[[a, b_index]] -= direction[a] * direction[b_index];
+                            }
+                        }
+                    }
+                    (b, None)
+                }
+            };
+            let is_phase = |local: usize| phase.iter().any(|&(index, _)| index == local);
+            let others: Vec<usize> = (0..q).filter(|&local| !is_phase(local)).collect();
+            // `T_vv⁻¹ T_vP` and `T_vv⁻¹ B_vP`, one phase column at a time.
+            let (t_graph, b_graph) = if others.is_empty() {
+                (
+                    Array2::<f64>::zeros((0, phase.len())),
+                    Array2::<f64>::zeros((0, phase.len())),
+                )
+            } else {
+                let t_vv = t_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &others);
+                let chol = t_vv.cholesky(Side::Lower).map_err(|error| {
+                    format!("periodic_phase_marginal: row {row} T_vv is not positive definite: {error}")
+                })?;
+                let columns: Vec<usize> = phase.iter().map(|&(local, _)| local).collect();
+                let t_vp = t_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &columns);
+                let b_vp = b_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &columns);
+                (chol.solve_mat(&t_vp), chol.solve_mat(&b_vp))
+            };
+            let mut t_weight = Array2::<f64>::zeros((q, q));
+            let mut b_weight = Array2::<f64>::zeros((q, q));
+            for (column, &(j, period)) in phase.iter().enumerate() {
+                let mut t_schur = t_block[[j, j]];
+                let mut b_schur = b_block[[j, j]];
+                for (slot, &other) in others.iter().enumerate() {
+                    t_schur -= t_block[[j, other]] * t_graph[[slot, column]];
+                    b_schur -= b_block[[j, other]] * b_graph[[slot, column]];
+                }
+                if !(t_schur.is_finite() && t_schur > 0.0) {
+                    return Err(format!(
+                        "periodic_phase_marginal: row {row} phase {j} has conditional evidence \
+                         curvature {t_schur:.3e}"
+                    ));
+                }
+                let (log_marginal, log_marginal_derivative) =
+                    super::construction_ard::circle_log_marginal_signed(b_schur, period);
+                if !(log_marginal.is_finite() && log_marginal_derivative.is_finite()) {
+                    return Err(format!(
+                        "periodic_phase_marginal: row {row} phase {j} curvature {b_schur:.3e} \
+                         on period {period} has no finite circle volume"
+                    ));
+                }
+                correction +=
+                    -2.0 * log_marginal - t_schur.ln() + std::f64::consts::TAU.ln();
+                // d Sᵀ_jj = wᵀ dT w with w = e_j − T_vv⁻¹T_vj.
+                let mut w = Array1::<f64>::zeros(q);
+                w[j] = 1.0;
+                for (slot, &other) in others.iter().enumerate() {
+                    w[other] = -t_graph[[slot, column]];
+                }
+                t_weight.scaled_add(
+                    -1.0 / t_schur,
+                    &w.view()
+                        .insert_axis(ndarray::Axis(1))
+                        .dot(&w.view().insert_axis(ndarray::Axis(0))),
+                );
+                // d Sᴮ_jj = ⟨e_jeⱼᵀ + e_jaᵀ + aeⱼᵀ, dB⟩ + aᵀ dT_vv a with a = −T_vv⁻¹B_vj.
+                let coefficient = -2.0 * log_marginal_derivative;
+                let mut a = Array1::<f64>::zeros(q);
+                for (slot, &other) in others.iter().enumerate() {
+                    a[other] = -b_graph[[slot, column]];
+                }
+                b_weight[[j, j]] += coefficient;
+                for &other in &others {
+                    b_weight[[j, other]] += coefficient * a[other];
+                    b_weight[[other, j]] += coefficient * a[other];
+                    for &second in &others {
+                        t_weight[[other, second]] += coefficient * a[other] * a[second];
+                    }
+                }
+            }
+            let row_raw = match (spectrum, raw_spectrum.as_ref()) {
+                (Some(spec), Some(unpinned)) => {
+                    Self::deflation_folded_trace_weight(&t_weight, &[], Some(spec))
+                        + Self::deflation_folded_trace_weight(&b_weight, &[], Some(unpinned))
+                }
+                _ => t_weight + b_weight,
+            };
+            let base = cache.row_offsets[row];
+            let mut block = raw_weight.slice_mut(s![base..base + q, base..base + q]);
+            block += &row_raw;
+        }
+        Ok(priced_any.then_some((correction, raw_weight)))
     }
 
     /// `Dφ_S[X] = Q(F ∘ QᵀXQ)Qᵀ` for the reduced-Schur spectral conditioning the evidence
@@ -7757,11 +8047,17 @@ mod test_support {
             gamma.beta += &self.decoder_prior_gap_theta_trace(
                 cache, pricing.clamp_border_derivative.view(),
             )?;
+            let phase_weight = if geometry.orbit_generators.is_empty() {
+                self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
+            } else {
+                None
+            };
             let (_, metric_gamma) = self.evidence_metric_derivative_channels(
                 rho,
                 target,
                 cache,
                 &pricing.metric_derivative,
+                phase_weight.as_ref(),
             )?;
             gamma.t += &metric_gamma.t;
             gamma.beta += &metric_gamma.beta;

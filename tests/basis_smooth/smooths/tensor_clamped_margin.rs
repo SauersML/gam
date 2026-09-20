@@ -3,7 +3,7 @@
 //! In the tensor DSL a *non-periodic* margin is spelled `clamped` (in the
 //! B-spline sense of a **clamped knot vector**: the ordinary open spline that is
 //! free at its two ends and does not wrap) — the direct analog of mgcv
-//! `te(bs=c("cc","ps"))`. `clamped`/`open`/`natural`/`free` are therefore inert
+//! `te(bs=c("cyclic","ps"))`. `clamped`/`open`/`natural`/`free` are therefore inert
 //! non-periodic markers and must be ACCEPTED (the cylinder / torus mixed-boundary
 //! tensors the manifold quality suite builds depend on it; fix 47efdebe6, unit-
 //! locked by `tensor_boundary_tokens_accept_clamped_open_reject_anchored`).

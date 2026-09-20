@@ -3923,6 +3923,7 @@ dependencies = [
  "gam",
  "gam-build-identity",
  "gam-math",
+ "gam-model-api",
  "gam-predict",
  "gam-runtime",
  "log",
@@ -6427,7 +6428,7 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opt"
 version = "0.9.0"
-source = "git+https://github.com/SauersML/opt.git?rev=4053fcb6b7567b05fd1dee199fe8e2e43e6f1315#4053fcb6b7567b05fd1dee199fe8e2e43e6f1315"
+source = "git+https://github.com/SauersML/opt.git?rev=4d26c445cde3fccd62aedaa87910a85af734c69a#4d26c445cde3fccd62aedaa87910a85af734c69a"
 dependencies = [
  "faer",
  "log",

@@ -647,6 +647,22 @@ pub(crate) fn saved_model_error_to_pyerr(
     exc
 }
 
+/// A saved document that could not be written or read through
+/// `gam_model_api::saved_model`. A filesystem refusal raises the `OSError`
+/// subclass its kind names (`FileNotFoundError`, `PermissionError`, ...), with
+/// the path in its message; a document the engine refuses is a `DataError`, the
+/// category of a payload (gam#3008, gam#3054).
+pub(crate) fn saved_document_error_to_pyerr(
+    error: gam_model_api::saved_model::SavedModelError,
+) -> PyErr {
+    match error {
+        gam_model_api::saved_model::SavedModelError::Io { path, source } => {
+            PyErr::from(std::io::Error::new(source.kind(), format!("{path}: {source}")))
+        }
+        refused => DataError::new_err(refused.to_string()),
+    }
+}
+
 /// A Rust panic caught at the boundary is an engine defect whatever the input,
 /// so it reaches Python as `InternalError`, never as an abort.
 fn py_panic_error(context: &'static str, payload: Box<dyn std::any::Any + Send>) -> PyErr {
