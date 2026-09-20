@@ -148,6 +148,8 @@ pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bit
     let u_s = array![[0.8_f64, -0.2], [0.1, 0.9], [0.5, 0.3], [-0.4, 0.6]];
     let h_proj_inverse = array![[1.6_f64, -0.25], [-0.25, 2.1]];
     let subspace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: h_proj_inverse.clone(),
         logdet_correction: 0.0,
@@ -173,9 +175,59 @@ pub(crate) fn xt_projected_kernel_diagonal_iterator_matches_scalar_reference_bit
     }
 }
 
+/// gam#2952: where the kernel drops a nonzero (here negative) eigenvalue, the cross term of the
+/// exact second derivative of the kept-spectrum `log|M|₊` is `−tr(K E K G)` plus the kept–dropped
+/// rotation. `M(s, t) = M₀ + s E + t G` has `M̈ = 0`, so the mixed derivative of `Σ_kept ln σ` is
+/// that cross term alone, and a Richardson difference of the kept eigenvalues grades it.
+#[test]
+pub(crate) fn pseudo_logdet_cross_differentiates_the_kept_spectrum_logdet_2952() {
+    let q0 = array![[0.8, -0.6, 0.0], [0.36, 0.48, -0.8], [0.48, 0.64, 0.6]];
+    let m0 = q0.dot(&Array2::from_diag(&array![2.0, 0.9, -0.3])).dot(&q0.t());
+    let e = array![[0.3, -0.2, 0.5], [-0.2, 0.1, 0.4], [0.5, 0.4, -0.6]];
+    let g = array![[-0.1, 0.6, 0.2], [0.6, 0.3, -0.5], [0.2, -0.5, 0.4]];
+    let kept_logdet = |s: f64, t: f64| {
+        let m = &m0 + &(&e * s) + &(&g * t);
+        let operator = DenseSpectralOperator::from_symmetric(&m).expect("symmetric fixture");
+        let mut spectrum = operator.raw_spectrum().to_vec();
+        spectrum.sort_by(|a, b| b.total_cmp(a));
+        assert!(spectrum[2] < 0.0 && spectrum[1] > 0.0, "the kernel keeps the two positive pairs");
+        spectrum[0].ln() + spectrum[1].ln()
+    };
+    let kernel = PenaltySubspaceTrace {
+        u_s: q0.slice(ndarray::s![.., 0..2]).to_owned(),
+        h_proj_inverse: array![[1.0 / 2.0, 0.0], [0.0, 1.0 / 0.9]],
+        dropped_basis: q0.slice(ndarray::s![.., 2..3]).to_owned(),
+        dropped_eigenvalues: array![-0.3],
+        logdet_correction: 0.0,
+    };
+    let (reduced_e, reduced_g) = (kernel.reduce(&e), kernel.reduce(&g));
+    let analytic = kernel
+        .pseudo_logdet_cross(&reduced_e, &reduced_g, &kernel.couple_dropped(&e), &kernel.couple_dropped(&g))
+        .expect("spectral kernel");
+    let mixed = |h: f64| {
+        (kept_logdet(h, h) - kept_logdet(h, -h) - kept_logdet(-h, h) + kept_logdet(-h, -h))
+            / (4.0 * h * h)
+    };
+    let (coarse, fine) = (mixed(1.0e-3), mixed(5.0e-4));
+    let difference = (4.0 * fine - coarse) / 3.0;
+    let bar = (fine - coarse).abs() + 1.0e-8;
+    assert!(
+        (analytic - difference).abs() <= bar,
+        "cross term {analytic} against the mixed difference {difference} (bar {bar})"
+    );
+    // Positive control: the kept–kept cross trace alone misses by far more than the bar.
+    let kept_only = -kernel.trace_projected_logdet_cross_reduced(&reduced_e, &reduced_g);
+    assert!(
+        (kept_only - difference).abs() > 1.0e3 * bar,
+        "positive control: −tr(K E K G) alone gives {kept_only} against {difference} (bar {bar})"
+    );
+}
+
 #[test]
 pub(crate) fn projected_logdet_cross_reduced_uses_trace_product_reference() {
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: Array2::<f64>::eye(3),
         h_proj_inverse: array![[1.4, 0.2, -0.1], [0.2, 1.9, 0.3], [-0.1, 0.3, 1.6]],
         logdet_correction: 0.0,
@@ -1320,6 +1372,8 @@ pub(crate) fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditio
         m[[a, a]] = 1.0 / s;
     }
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: m,
         logdet_correction: 0.0,
@@ -1474,6 +1528,8 @@ pub(crate) fn active_projected_kkt_residual_drops_gauge_mass_of_any_magnitude() 
     // gauge mass, which is precisely what the inner solver leaves unmoved on an
     // oversmoothed marginal-slope fit.
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((2, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0], [0.0]],
         h_proj_inverse: array![[0.25]],
         logdet_correction: 0.0,
@@ -1500,6 +1556,8 @@ pub(crate) fn active_projected_kkt_residual_rejects_retained_range_leak() {
     // `U_Sᵀ(r_A − r_R) = −18 ≠ 0`: reducing this residual would CHANGE the IFT
     // correction rather than leave it invariant, so it must be rejected.
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((2, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[2.0], [0.0]],
         h_proj_inverse: array![[0.25]],
         logdet_correction: 0.0,
@@ -1556,6 +1614,8 @@ pub(crate) fn build_subspace_kernel(
         }
     }
     PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse,
         logdet_correction: 0.0,
@@ -2615,6 +2675,8 @@ pub(crate) fn theta_mode_response_kernel_matches_preport_assembly_bitwise() {
 
     // ── Constrained regime: lifted kernel K_T, selection + emission. ──
     let trace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]],
         h_proj_inverse: array![[0.5, 0.1], [0.1, 0.8]],
         logdet_correction: 0.0,
@@ -3117,6 +3179,107 @@ pub(crate) fn test_dense_spectral_operator_batched_logdet_crosses_match_pairwise
                 max_relative = 1e-12
             );
         }
+    }
+}
+
+#[test]
+pub(crate) fn test_dense_spectral_root_drift_crosses_match_pairwise_dense() {
+    // Block-root drifts contract through the logdet kernel factor W (H⁺ = WWᵀ)
+    // without forming p × p drifts; every (i, j) must match the pairwise kernel
+    // on the materialized drifts, for root–root, root–rotated and
+    // rotated–rotated pairs, with and without the factored exact spectrum.
+    fn unit(state: &mut u64) -> f64 {
+        let bits = gam_linalg::utils::splitmix64(state) >> 11;
+        (bits as f64) / ((1u64 << 53) as f64) * 2.0 - 1.0
+    }
+    fn random(state: &mut u64, rows: usize, cols: usize) -> Array2<f64> {
+        Array2::from_shape_fn((rows, cols), |_| unit(state))
+    }
+    let p = 13usize;
+    let mut state = 0x2F0C_4A11_u64;
+    let x = random(&mut state, p + 4, p);
+    let mut h = x.t().dot(&x);
+    for d in 0..p {
+        h[[d, d]] += 0.25;
+    }
+    let x_short = random(&mut state, p - 2, p);
+    let h_singular = x_short.t().dot(&x_short);
+    let root_a = random(&mut state, 3, 4);
+    let mut root_b = Array2::<f64>::zeros((2, 5));
+    root_b[[0, 1]] = 1.5;
+    root_b[[1, 4]] = -0.7;
+    let root_c = random(&mut state, 6, 6);
+    let roots = [
+        BlockRootDrift {
+            root: root_a.view(),
+            start: 0,
+            end: 4,
+            scale: 2.3,
+        },
+        BlockRootDrift {
+            root: root_b.view(),
+            start: 6,
+            end: 11,
+            scale: 0.4,
+        },
+        BlockRootDrift {
+            root: root_c.view(),
+            start: 7,
+            end: 13,
+            scale: 1.1e3,
+        },
+    ];
+    let dense: Vec<Array2<f64>> = (0..2)
+        .map(|_| {
+            let d = random(&mut state, p, p);
+            &d + &d.t()
+        })
+        .collect();
+    let operators = [
+        (DenseSpectralOperator::from_symmetric(&h).unwrap(), false),
+        (
+            DenseSpectralOperator::from_symmetric_with_mode(&h, PseudoLogdetMode::PositiveDefinite)
+                .unwrap(),
+            true,
+        ),
+        (
+            DenseSpectralOperator::from_symmetric_with_structural_rank(&h_singular, p - 2)
+                .unwrap(),
+            true,
+        ),
+    ];
+    for (op, factored) in operators {
+        assert_eq!(op.logdet_hessian_kernel_factor().is_some(), factored);
+        assert!(op.contracts_block_root_drifts());
+        let materialized: Vec<Array2<f64>> = roots
+            .iter()
+            .map(|root| root.to_dense(p))
+            .chain(dense.iter().cloned())
+            .collect();
+        let drifts: Vec<EigenbasisDrift<'_>> = roots
+            .iter()
+            .map(|root| EigenbasisDrift::Root(*root))
+            .chain(
+                dense
+                    .iter()
+                    .map(|d| EigenbasisDrift::Rotated(op.rotate_to_eigenbasis(d))),
+            )
+            .collect();
+        let batched = op.trace_logdet_hessian_crosses(drifts);
+        for i in 0..materialized.len() {
+            for j in 0..materialized.len() {
+                let pairwise = op.trace_logdet_hessian_cross(&materialized[i], &materialized[j]);
+                assert_relative_eq!(
+                    batched[[i, j]],
+                    pairwise,
+                    epsilon = 1e-10 * pairwise.abs().max(1.0),
+                    max_relative = 1e-10
+                );
+            }
+        }
+        let pair = op.trace_logdet_hessian_cross_block_roots(roots[0], roots[2]);
+        let pairwise = op.trace_logdet_hessian_cross(&materialized[0], &materialized[2]);
+        assert_relative_eq!(pair, pairwise, epsilon = 1e-10, max_relative = 1e-10);
     }
 }
 
@@ -3791,6 +3954,8 @@ pub(crate) fn subspace_projected_leverage_and_adjoint_shortcut_match_dense() {
     let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
     let h_proj_inverse = array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]];
     let subspace = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: u_s.clone(),
         h_proj_inverse: h_proj_inverse.clone(),
         logdet_correction: 0.0,
@@ -3858,6 +4023,8 @@ pub(crate) fn subspace_base_h2_traces_match_scalar_projected_kernel_path() {
     let u_s = array![[1.0, 0.0], [0.0, 1.0], [0.0, 0.0]];
     let det = 3.0_f64 * 5.0 - 0.1 * 0.1;
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s,
         h_proj_inverse: array![[5.0 / det, -0.1 / det], [-0.1 / det, 3.0 / det]],
         logdet_correction: 0.0,
@@ -3992,6 +4159,8 @@ pub(crate) fn outer_hessian_operator_matvec_matches_dense_subspace_with_null_alp
         firth: None,
         hessian_logdet_correction: logdet_h_proj - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s,
             h_proj_inverse,
             logdet_correction: 0.0,
@@ -4088,6 +4257,8 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
         firth: None,
         hessian_logdet_correction: h_proj.ln() - hop.logdet(),
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((2, 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s: array![[0.0], [1.0]],
             h_proj_inverse: array![[1.0 / h_proj]],
             logdet_correction: 0.0,
@@ -4160,6 +4331,8 @@ pub(crate) fn projected_operator_hessian_matches_dense_subspace_trace() {
 #[test]
 pub(crate) fn penalty_subspace_batched_reduction_matches_serial_operator_reduction() {
     let kernel = PenaltySubspaceTrace {
+        dropped_basis: Array2::zeros((3, 0)),
+        dropped_eigenvalues: Array1::zeros(0),
         u_s: array![[1.0, 0.0], [0.2, 0.8], [-0.1, 0.6]],
         h_proj_inverse: array![[0.8, 0.1], [0.1, 0.6]],
         logdet_correction: 0.0,
@@ -4919,6 +5092,8 @@ pub(crate) fn build_projected_rho_gradient_solution(rho: f64) -> InnerSolution<'
         firth: None,
         hessian_logdet_correction: projected_logdet - full_logdet,
         penalty_subspace_trace: Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((2, 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s: array![[0.0], [1.0]],
             h_proj_inverse: array![[1.0 / h[[1, 1]]]],
             logdet_correction: 0.0,
@@ -6962,6 +7137,8 @@ pub(crate) fn build_leak_proof_solution(
 
     let penalty_subspace_trace = if use_projected_kernel {
         Some(Arc::new(PenaltySubspaceTrace {
+            dropped_basis: Array2::zeros((u_s.nrows(), 0)),
+            dropped_eigenvalues: Array1::zeros(0),
             u_s,
             h_proj_inverse: h_proj_inv,
             logdet_correction: 0.0,

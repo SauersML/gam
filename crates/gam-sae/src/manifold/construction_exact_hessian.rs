@@ -4299,6 +4299,16 @@ impl SaeManifoldTerm {
                 )));
             }
         }
+        // #2231 — the crosscoder block weights reach `½log|A|` through the scaled target
+        // (`crosscoder_block_logdet_traces`), which only the dense and arrow-orbit routes
+        // contract; the probe bundle holds no weight on the eliminated coordinates' blocks.
+        if evidence.is_some() && !rho.block_flat_range().is_empty() {
+            return Err(OuterGradientError::internal(format!(
+                "analytic_outer_rho_gradient_components_with_bundle: the streaming exact-A \
+                 route has no log-determinant trace for the {} crosscoder block weights",
+                rho.block_flat_range().len()
+            )));
+        }
         let n_params = rho.flat_coordinates().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -4333,6 +4343,18 @@ impl SaeManifoldTerm {
         // the route alone decides. Before, a dense ThresholdGate fit ranked ½log|A|
         // and returned `½tr(B⁻¹∂B)` channels from cached `B` geometry.
         let exact_a_logdet_route = logdet_derivative_bundle.is_none();
+        // #2822 — an output-scale coordinate moves `A` through the target
+        // (`crosscoder_block_logdet_traces`). The streaming route's probes are β-space `S⁻¹`
+        // solves, which hold no joint weight to contract that operator against.
+        if !exact_a_logdet_route && !rho.log_lambda_block.is_empty() {
+            return Err(OuterGradientError::internal(
+                "analytic_outer_rho_gradient_components_with_bundle: output-scale coordinates \
+                 (crosscoder blocks or the global dispersion) need ½tr(A⁻¹ ∂A/∂log λ), whose \
+                 ∂A moves with the target; the streaming route's β-space probes do not price \
+                 it, so these coordinates are fitted on the dense exact-A route only"
+                    .to_string(),
+            ));
+        }
 
         // #2087/#2330 ROUTE-COHERENCE GUARD. The VALUE's log-determinant route and
         // THIS gradient's are selected by two unrelated predicates:
@@ -4763,9 +4785,11 @@ impl SaeManifoldTerm {
                 },
             )
         })?;
-        let block_tail_start = n_params - rho.log_lambda_block.len();
+        // The block weights sit before the curvature tail, so their range is
+        // derived forwards from the flat layout, not as an offset from the end.
+        let block_range = rho.block_flat_range();
         for coord in 0..n_params {
-            let rhs = if coord >= block_tail_start && !rho.log_lambda_block.is_empty() {
+            let rhs = if block_range.contains(&coord) {
                 let &(p_x, ref block_dims) =
                     self.crosscoder_pricing_spans.as_ref().ok_or_else(|| {
                         OuterGradientError::internal(
@@ -4774,7 +4798,7 @@ impl SaeManifoldTerm {
                                 .to_string(),
                         )
                     })?;
-                let block = coord - block_tail_start;
+                let block = coord - block_range.start;
                 let start = p_x + block_dims[..block].iter().sum::<usize>();
                 self.crosscoder_block_ift_rhs(cache, target, start..start + block_dims[block])
                     .map_err(OuterGradientError::internal)?
@@ -5884,6 +5908,119 @@ impl SaeManifoldTerm {
         Ok((delta_trace, delta_gamma_t))
     }
 
+    /// #2231 — `½⟨W, ∂A/∂log λ_ℓ⟩` for each crosscoder output block (or the global dispersion's
+    /// log precision, #2822), `W` the route's weight on `dA`; empty when no crosscoder pricing is installed. Block `ℓ` moves the scaled target
+    /// along `D_ℓ = ½·Z̃_ℓ` on its own columns. At a fixed state the exact Hessian reads the
+    /// target only through its residual-curvature legs, which are linear in the residual, so
+    /// `∂A/∂log λ_ℓ = A(t + D_ℓ) − A(t)` exactly: two probes of the same operator, differenced
+    /// before they are contracted.
+    pub(crate) fn crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+    ) -> Result<Vec<f64>, String> {
+        let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // An embedded-sphere row's `B` carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which
+        // reads the residual, so its `B` and `Φ` move with the target too. The probes hold
+        // the cache's `B`, so that leg is not priced here and the coordinate is refused.
+        if !self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
+            return Err(
+                "crosscoder_block_logdet_traces: an embedded-sphere row's B carries -c_g P_g \
+                 with c_g = <g_raw, x_g>, which moves with the target; that leg of \
+                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are \
+                 refused on sphere rows"
+                    .to_string(),
+            );
+        }
+        enum Probed {
+            Dense(Array2<f64>),
+            Arrow(ArrowJointBlocks),
+        }
+        let probe = |at: ArrayView2<'_, f64>| -> Result<Probed, String> {
+            if weight.dense().is_some() {
+                let (a, _) = self.materialize_exact_hessian_dense_with_gap_border(rho, at, cache)?;
+                Ok(Probed::Dense(a))
+            } else {
+                let mut blocks = ArrowJointBlocks::zeros(&cache.row_offsets, cache.k);
+                self.probe_exact_hessian_arrow(rho, at, cache, &mut blocks)?;
+                Ok(Probed::Arrow(blocks))
+            }
+        };
+        let base = probe(target)?;
+        let mut shifted = target.to_owned();
+        let mut traces = Vec::with_capacity(block_dims.len());
+        let mut start = *p_x;
+        for &p_l in block_dims {
+            shifted.assign(&target);
+            shifted
+                .slice_mut(s![.., start..start + p_l])
+                .mapv_inplace(|value| 1.5 * value);
+            let contraction = match (probe(shifted.view())?, &base) {
+                (Probed::Dense(mut moved), Probed::Dense(base)) => {
+                    moved -= base;
+                    let dense = weight.dense().ok_or_else(|| {
+                        "crosscoder_block_logdet_traces: the dense weight vanished".to_string()
+                    })?;
+                    (dense * &moved).sum()
+                }
+                (Probed::Arrow(mut moved), Probed::Arrow(base)) => {
+                    moved.subtract(base)?;
+                    moved.contract(weight)?
+                }
+                _ => {
+                    return Err(
+                        "crosscoder_block_logdet_traces: the two probes took different layouts"
+                            .to_string(),
+                    );
+                }
+            };
+            traces.push(0.5 * contraction);
+            start += p_l;
+        }
+        Ok(traces)
+    }
+
+    /// Write [`Self::crosscoder_block_logdet_traces`] into the block coordinates of a
+    /// flat log-determinant trace.
+    pub(crate) fn add_crosscoder_block_logdet_traces<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        weight: &W,
+        logdet_trace: &mut Array1<f64>,
+    ) -> Result<(), String> {
+        let traces = self.crosscoder_block_logdet_traces(rho, target, cache, weight)?;
+        let range = rho.block_flat_range();
+        if traces.is_empty() {
+            return if range.is_empty() {
+                Ok(())
+            } else {
+                Err(format!(
+                    "crosscoder block log-determinant traces: rho carries {} block coordinates \
+                     but no crosscoder pricing spans are installed",
+                    range.len()
+                ))
+            };
+        }
+        if traces.len() != range.len() {
+            return Err(format!(
+                "crosscoder block log-determinant traces: {} traces for the {} block \
+                 coordinates of rho",
+                traces.len(),
+                range.len()
+            ));
+        }
+        for (coord, trace) in range.zip(traces) {
+            logdet_trace[coord] += trace;
+        }
+        Ok(())
+    }
+
     pub(crate) fn dense_exact_a_logdet_channels(
         &self,
         target: ArrayView2<'_, f64>,
@@ -5952,6 +6089,8 @@ impl SaeManifoldTerm {
         }
         // One per-coordinate map at a time: the metric channel below builds its own.
         drop(da_by_flat);
+        // #2231 — the crosscoder block weights reach `A` through the scaled target.
+        self.add_crosscoder_block_logdet_traces(rho, target, cache, a_pinv, &mut logdet_trace)?;
         // Ordered-Beta–Bernoulli sparse coordinate: its ∂A/∂ρ_sparse is the exact
         // integrated-marginal logit Hessian (cross-row), absent from the operator
         // map above (softmax-only). Add its ½log|A| trace directly.
@@ -7211,7 +7350,7 @@ mod test_support {
                     .iter()
                     .enumerate()
                 {
-                    // A clone drops the three frozen gates, and
+                    // A clone of an undeclared term carries no gate, and
                     // `barrier_coactivation_pairs` then recomputes the barrier
                     // coactivation from the moved logits, so the border gap would
                     // move with theta. Production holds the gates fixed across a step.

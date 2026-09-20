@@ -1103,6 +1103,7 @@ fn decode_invariant_test_parts() -> UnifiedFitResultParts {
             dispersion: Dispersion::estimated(1.1 * 1.1)
                 .expect("profiled Gaussian phi-hat = sigma-hat^2 is a valid estimate"),
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -2256,7 +2257,7 @@ fn cubature_pirls_uses_lambda_search_frozen_beta_precision_2632() {
         .store(frozen_phi.to_bits(), Ordering::Relaxed);
 
     let result = state
-        .execute_pirls_stateless_for_cubature(&array![0.0], None)
+        .execute_pirls_stateless_for_test(&array![0.0])
         .expect("the Beta cubature sigma-point fit must converge");
     let (realized_phi, estimated) = match result
         .likelihood

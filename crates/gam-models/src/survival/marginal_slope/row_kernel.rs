@@ -988,6 +988,26 @@ fn nonfinite_signed_margin(row: usize, frame: &str, margin: f64) -> String {
     .into()
 }
 
+/// The model a rigid cache build on frame `G` asks the device row jet for,
+/// read from the frame's own declarations.
+pub(crate) const fn rigid_row_jet_model<const P: usize, G: SlopeRowGeometry<P>>()
+-> crate::gpu_kernels::survival_rowjet::SurvivalRowJetModel {
+    crate::gpu_kernels::survival_rowjet::SurvivalRowJetModel {
+        follow_up_varying_slope: G::FOLLOW_UP_VARYING,
+        anchored_latent_law: G::ANCHORED,
+    }
+}
+
+/// Which kernel evaluates a rigid cache build on frame `G`: the one decision,
+/// read at fit entry (where `gpu=required` for a frame the row jet does not
+/// compute is refused before any seed) and by every batched build.
+pub(crate) fn rigid_row_jet_decision<const P: usize, G: SlopeRowGeometry<P>>()
+-> Result<gam_gpu::GpuDecision, String> {
+    crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_decision(
+        &rigid_row_jet_model::<P, G>(),
+    )
+}
+
 /// #932: the canonical single-source seam. The row NLL is written ONCE as
 /// [`rigid_row_nll`]; this exposes it through [`gam_math::jet_tower::RowProgram`]
 /// so the `RowKernel` derivative channels below derive mechanically from `eval`
@@ -1052,29 +1072,21 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     fn batched_value_grad_hess_all(
         &self,
     ) -> Option<Result<(Vec<f64>, Vec<[f64; P]>, Vec<[[f64; P]; P]>), String>> {
-        use crate::gpu_kernels::survival_rowjet::survival_rigid_row_vgh_device_selected;
-
-        // The device pullback is written for the four-primary Gaussian frame. A
-        // follow-up-varying slope, or a declared latent law, is a capability the
-        // device kernel lacks: the ordinary per-row CPU path runs it rather than
-        // a silently different lowering, and `gpu=required` refuses it.
-        let missing = if G::FOLLOW_UP_VARYING {
-            Some("a follow-up-varying slope")
-        } else if G::ANCHORED {
-            Some("a declared latent law")
-        } else {
-            None
-        };
-        match survival_rigid_row_vgh_device_selected(missing) {
-            Ok(true) => {}
-            Ok(false) => return None,
+        // The device pullback is written for the four-primary Gaussian frame,
+        // and the decision reads that declaration: a follow-up-varying slope, or
+        // a declared latent law, takes the ordinary per-row CPU path under
+        // `auto` rather than a silently different lowering, and is refused
+        // under `required`.
+        let n = self.family.n;
+        match rigid_row_jet_decision::<P, G>() {
+            Ok(decision) if decision.use_gpu => {}
+            Ok(_) => return None,
             Err(error) => return Some(Err(error)),
         }
 
         #[cfg(target_os = "linux")]
         {
             use crate::gpu_kernels::survival_rowjet::{SurvivalRowInputs, survival_rigid_row_vgh};
-            let n = self.family.n;
             let probit_scale = self.family.probit_frailty_scale();
             // Gather per-row inputs in parallel (the pure-f64 score summary + primary
             // projections — the same quantities the per-row path computes).
@@ -1135,9 +1147,9 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
             Some(Ok((ch.value, grads, hesss)))
         }
 
-        // Off Linux the device backend is not compiled, so the decision above
-        // never selects it: `auto` has already returned `None` and `required`
-        // its refusal, and the per-row cache path handles every row.
+        // Non-Linux hosts can never pass device admission (the selector is
+        // `cfg!(target_os = "linux") && …`), so the early `None` above is the
+        // only exit and the per-row cache path handles every row.
         #[cfg(not(target_os = "linux"))]
         None
     }
@@ -1249,17 +1261,14 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     /// not a reason to force a small 800×12 derivative design through thousands
     /// of scalar row-view updates.
     /// Operator panels are materialized under a fixed byte budget, while
-    /// materialized designs are borrowed as zero-copy views. The method claims
-    /// only the full-data unit-weight row measure; Horvitz–Thompson row sets
-    /// retain their explicit weighted generic path.
+    /// materialized designs are borrowed as zero-copy views. Every `RowSet` is
+    /// handled: the Grams run over the row set's walk positions, with each
+    /// walked row's Horvitz–Thompson weight folded into its Gram weights.
     fn hessian_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
         row_hessians: &[[[f64; P]; P]],
     ) -> Option<Result<Array2<f64>, String>> {
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
         if row_hessians.len() != self.family.n {
             return Some(Err(format!(
                 "survival marginal-slope hessian_dense_override row-Hessian length mismatch: \
@@ -1279,35 +1288,50 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
         let slope_designs = slope_channels.as_slice();
 
         Some((|| {
+            /// Design rows at walk positions `positions` of `rows`: the
+            /// contiguous full-data block under `RowSet::All`, the stored rows
+            /// gathered in walk order under a subsample.
             fn dense_chunk<'a>(
                 design: &'a DesignMatrix,
-                rows: std::ops::Range<usize>,
+                rows: &crate::row_kernel::RowSet,
+                positions: std::ops::Range<usize>,
                 label: &str,
             ) -> Result<ndarray::CowArray<'a, f64, ndarray::Ix2>, String> {
-                match design.as_dense_ref() {
-                    Some(full) => Ok(full.slice(s![rows, ..]).into()),
-                    None => design
-                        .try_row_chunk(rows.clone())
-                        .map(Into::into)
-                        .map_err(|error| {
+                let (start, end) = (positions.start, positions.end);
+                match rows {
+                    crate::row_kernel::RowSet::All => match design.as_dense_ref() {
+                        Some(full) => Ok(full.slice(s![positions, ..]).into()),
+                        None => design.try_row_chunk(positions).map(Into::into).map_err(|error| {
                             format!(
                                 "survival marginal-slope dense Hessian {label} \
-                                 try_row_chunk({}..{}): {error}",
-                                rows.start, rows.end,
+                                 try_row_chunk({start}..{end}): {error}"
                             )
                         }),
+                    },
+                    crate::row_kernel::RowSet::Subsample { rows: stored, .. } => {
+                        let indices = stored[positions].iter().map(|row| row.index).collect::<Vec<_>>();
+                        design.try_row_gather(&indices).map(Into::into).map_err(|error| {
+                            format!(
+                                "survival marginal-slope dense Hessian {label} \
+                                 try_row_gather over positions {start}..{end}: {error}"
+                            )
+                        })
+                    }
                 }
             }
 
+            /// `target += Σ_k weights[k] · left[r_k]ᵀ right[r_k]` over the walk
+            /// positions `k` of `rows`, `r_k` the walked full-data row.
             fn add_weighted_cross(
                 left: &DesignMatrix,
                 right: &DesignMatrix,
+                rows: &crate::row_kernel::RowSet,
                 weights: &Array1<f64>,
                 mut target: ndarray::ArrayViewMut2<'_, f64>,
                 label: &str,
             ) -> Result<(), String> {
                 let n = weights.len();
-                if left.nrows() != n || right.nrows() != n {
+                if left.nrows() != right.nrows() || rows.walk_len(left.nrows()) != n {
                     return Err(format!(
                         "survival marginal-slope Hessian {label} row mismatch: \
                          left={} right={} weights={n}",
@@ -1331,11 +1355,12 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                 let sparse_requires_streaming = (left.is_sparse() || right.is_sparse())
                     && full_panel_bytes > PANEL_BUDGET_BYTES;
                 if sparse_requires_streaming {
-                    for row in 0..n {
-                        let weight = weights[row];
+                    for position in 0..n {
+                        let weight = weights[position];
                         if weight == 0.0 {
                             continue;
                         }
+                        let row = rows.row_at(position).0;
                         left.row_outer_into_view(
                             row,
                             right,
@@ -1371,9 +1396,9 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                         gam_problem::with_nested_parallel(|| {
                             let end = (start + chunk_rows).min(n);
                             let left_chunk =
-                                dense_chunk(left, start..end, &format!("{label}/left"))?;
+                                dense_chunk(left, rows, start..end, &format!("{label}/left"))?;
                             let right_chunk =
-                                dense_chunk(right, start..end, &format!("{label}/right"))?;
+                                dense_chunk(right, rows, start..end, &format!("{label}/right"))?;
                             let local_weights = weights.slice(s![start..end]).to_owned();
                             Ok(gam_linalg::faer_ndarray::fast_xt_diag_y(
                                 &left_chunk,
@@ -1409,13 +1434,14 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                     ));
                 }
             }
+            // Per walk position: the walked row's primary Hessian entry times its
+            // Horvitz–Thompson weight.
             let weights: [[Array1<f64>; P]; P] = std::array::from_fn(|primary_a| {
                 std::array::from_fn(|primary_b| {
-                    Array1::from_iter(
-                        row_hessians
-                            .iter()
-                            .map(|hessian| hessian[primary_a][primary_b]),
-                    )
+                    Array1::from_iter((0..rows.walk_len(n)).map(|position| {
+                        let (row, weight) = rows.row_at(position);
+                        weight * row_hessians[row][primary_a][primary_b]
+                    }))
                 })
             });
             let mut dense =
@@ -1426,6 +1452,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                     add_weighted_cross(
                         time_designs[primary_a],
                         time_designs[primary_b],
+                        rows,
                         &weights[primary_a][primary_b],
                         dense.slice_mut(s![
                             self.slices.time.clone(),
@@ -1441,6 +1468,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
             add_weighted_cross(
                 marginal_design,
                 marginal_design,
+                rows,
                 &mm_weight,
                 dense.slice_mut(s![
                     self.slices.marginal.clone(),
@@ -1453,6 +1481,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                     add_weighted_cross(
                         design_left,
                         design_right,
+                        rows,
                         &weights[primary_left][primary_right],
                         dense.slice_mut(s![
                             self.slices.slope.clone(),
@@ -1466,6 +1495,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                 add_weighted_cross(
                     marginal_design,
                     design_left,
+                    rows,
                     &mg_weight,
                     dense.slice_mut(s![
                         self.slices.marginal.clone(),
@@ -1480,6 +1510,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                     add_weighted_cross(
                         time_designs[primary_a],
                         design_slope,
+                        rows,
                         &weights[primary_a][primary_slope],
                         dense.slice_mut(s![
                             self.slices.time.clone(),
@@ -1492,6 +1523,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                 add_weighted_cross(
                     time_designs[primary_a],
                     marginal_design,
+                    rows,
                     &tm_weight,
                     dense.slice_mut(s![
                         self.slices.time.clone(),
@@ -1620,8 +1652,8 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     /// This preserves the derivatives, with floating-point reassociation of
     /// the row sums checked against the scalar per-axis implementation.
     ///
-    /// Claims only the full-data unit-weight `RowSet::All` case; otherwise
-    /// returns `None` so the generic per-axis Horvitz-Thompson sweep runs.
+    /// Every `RowSet` is handled: towers are built at the walked rows and each
+    /// row's pullback carries its Horvitz–Thompson weight.
     fn directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -1634,10 +1666,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                 self.n_coefficients(),
             )));
         }
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
-        Some(self.directional_derivative_all_axes_build_once())
+        Some(self.directional_derivative_all_axes_build_once(rows))
     }
 
     /// Batched all-axes SECOND directional derivative of the joint Hessian for
@@ -1650,7 +1679,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
     /// Contract each row's `t4` with the fixed direction once, then assemble
     /// every swept axis through the same weighted-Gram path as first order.
     ///
-    /// Claims only the full-data unit-weight `RowSet::All` case; otherwise `None`.
+    /// Every `RowSet` is handled, as in the first-order override.
     fn second_directional_derivative_all_axes_dense_override(
         &self,
         rows: &crate::row_kernel::RowSet,
@@ -1664,10 +1693,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> RowKernel<P>
                 self.n_coefficients(),
             )));
         }
-        if !matches!(rows, crate::row_kernel::RowSet::All) {
-            return None;
-        }
-        Some(self.second_directional_derivative_all_axes_build_once(d_beta_u))
+        Some(self.second_directional_derivative_all_axes_build_once(rows, d_beta_u))
     }
 }
 
@@ -1938,15 +1964,15 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// through [`SurvivalMarginalSlopeFamily::write_row_primary_tower`], so a
     /// split frame holds a row index and a slot pointer, never a tower or the
     /// row program (gam#2967).
-    fn build_row_towers(&self) -> Result<Vec<G::Tower4>, String> {
-        let n = gam_math::jet_tower::RowProgram::n_rows(self);
+    fn build_row_towers(&self, rows: &crate::row_kernel::RowSet) -> Result<Vec<G::Tower4>, String> {
+        let n = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
         let mut towers = vec![G::Tower4::constant(0.0); n];
         towers
             .par_iter_mut()
             .enumerate()
-            .try_for_each(|(row, tower)| {
+            .try_for_each(|(position, tower)| {
                 self.family.write_row_primary_tower::<P, G, _>(
-                    row,
+                    rows.row_at(position).0,
                     &self.block_states,
                     "survival marginal-slope rigid row fourth tower (build-once)",
                     tower,
@@ -1968,15 +1994,15 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// `t3` channel). The cached `t3` is bit-for-bit what the dense tower would
     /// produce. Built in place like [`Self::build_row_towers`], so no split frame
     /// holds a tower (gam#2967).
-    fn build_row_third_towers(&self) -> Result<Vec<G::Tower3>, String> {
-        let n = gam_math::jet_tower::RowProgram::n_rows(self);
+    fn build_row_third_towers(&self, rows: &crate::row_kernel::RowSet) -> Result<Vec<G::Tower3>, String> {
+        let n = rows.walk_len(gam_math::jet_tower::RowProgram::n_rows(self));
         let mut towers = vec![G::Tower3::constant(0.0); n];
         towers
             .par_iter_mut()
             .enumerate()
-            .try_for_each(|(row, tower)| {
+            .try_for_each(|(position, tower)| {
                 self.family.write_row_primary_tower::<P, G, _>(
-                    row,
+                    rows.row_at(position).0,
                     &self.block_states,
                     "survival marginal-slope rigid row third tower (build-once)",
                     tower,
@@ -2002,11 +2028,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             .map(|chunk_idx| {
                 let start = chunk_idx * chunk;
                 let end = (start + chunk).min(n);
-                let mut acc = Array2::<f64>::zeros((p, p));
-                for row in start..end {
-                    per_row(row, &mut acc)?;
-                }
-                Ok(acc)
+                Self::pullback_chunk(p, start..end, &per_row)
             })
             .collect();
         let mut total = Array2::<f64>::zeros((p, p));
@@ -2016,17 +2038,40 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         Ok(total)
     }
 
+    /// One chunk of [`Self::chunked_pullback_reduce`]: its rows' pullbacks folded in index
+    /// order into a fresh `p×p` accumulator. Out of line on purpose (gam#2967): the chunk is
+    /// mapped inside Rayon's split frame, which stays live across every join below it and is
+    /// stacked once per nested steal, so `per_row`'s row program must not be inlined there.
+    #[inline(never)]
+    fn pullback_chunk<F>(
+        p: usize,
+        rows: core::ops::Range<usize>,
+        per_row: &F,
+    ) -> Result<Array2<f64>, String>
+    where
+        F: Fn(usize, &mut Array2<f64>) -> Result<(), String>,
+    {
+        let mut acc = Array2::<f64>::zeros((p, p));
+        for row in rows {
+            per_row(row, &mut acc)?;
+        }
+        Ok(acc)
+    }
+
     /// gam#979 build-once all-axes FIRST directional derivative — see the trait
     /// override docstring. Builds the per-row `t3` towers once, then for each
     /// canonical axis runs the identical chunked pullback reduction the generic
     /// per-axis sweep runs, reusing the cached tower instead of rebuilding it.
-    fn directional_derivative_all_axes_build_once(&self) -> Result<Vec<Array2<f64>>, String> {
+    fn directional_derivative_all_axes_build_once(
+        &self,
+        rows: &crate::row_kernel::RowSet,
+    ) -> Result<Vec<Array2<f64>>, String> {
         // #1591: the consumer reads only `third_contracted` (a `t3` contraction),
         // so build the order-≤3 `Tower3<4>` per row — bit-identical on the read
         // channels to the dense `Tower4<4>` but without the discarded `t4` tensor.
-        let towers = self.build_row_third_towers()?;
+        let towers = self.build_row_third_towers(rows)?;
         let tensors: Vec<_> = towers.iter().map(|tower| *tower.t3()).collect();
-        self.all_axes_primary_tensor_pullback(&tensors)
+        self.all_axes_primary_tensor_pullback(rows, &tensors)
     }
 
     /// Pull back a symmetric primary third tensor along every coefficient axis.
@@ -2035,10 +2080,11 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// ([`crate::row_kernel::all_axes_symmetric_tensor_pullback`]).
     pub(super) fn all_axes_primary_tensor_pullback(
         &self,
+        rows: &crate::row_kernel::RowSet,
         tensors: &[[[[f64; P]; P]; P]],
     ) -> Result<Vec<Array2<f64>>, String> {
         use crate::row_kernel::AllAxesPullbackError;
-        crate::row_kernel::all_axes_symmetric_tensor_pullback(self, tensors).map_err(|error| match error {
+        crate::row_kernel::all_axes_symmetric_tensor_pullback(self, rows, tensors).map_err(|error| match error {
             AllAxesPullbackError::TensorRowCount { .. } => {
                 "survival all-axes primary tensor row count mismatch".to_string()
             }
@@ -2052,14 +2098,15 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
     /// pullback for every swept coefficient axis.
     fn second_directional_derivative_all_axes_from_towers(
         &self,
+        rows: &crate::row_kernel::RowSet,
         d_beta_u: &[f64],
         towers: &[G::Tower4],
     ) -> Result<Vec<Array2<f64>>, String> {
         let tensors: Vec<_> = towers
             .iter()
             .enumerate()
-            .map(|(row, tower)| {
-                let direction = self.jacobian_action(row, d_beta_u);
+            .map(|(position, tower)| {
+                let direction = self.jacobian_action(rows.row_at(position).0, d_beta_u);
                 let t4 = tower.t4();
                 std::array::from_fn(|a| {
                     std::array::from_fn(|b| {
@@ -2070,15 +2117,16 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 })
             })
             .collect();
-        self.all_axes_primary_tensor_pullback(&tensors)
+        self.all_axes_primary_tensor_pullback(rows, &tensors)
     }
 
     fn second_directional_derivative_all_axes_build_once(
         &self,
+        rows: &crate::row_kernel::RowSet,
         d_beta_u: &[f64],
     ) -> Result<Vec<Array2<f64>>, String> {
-        let towers = self.build_row_towers()?;
-        self.second_directional_derivative_all_axes_from_towers(d_beta_u, &towers)
+        let towers = self.build_row_towers(rows)?;
+        self.second_directional_derivative_all_axes_from_towers(rows, d_beta_u, &towers)
     }
 
     /// The all-axes second directional derivative along every direction of a
@@ -2098,11 +2146,12 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 direction.len()
             ));
         }
-        let towers = self.build_row_towers()?;
+        let rows = crate::row_kernel::RowSet::All;
+        let towers = self.build_row_towers(&rows)?;
         for (index, direction) in directions.iter().enumerate() {
             consume(
                 index,
-                self.second_directional_derivative_all_axes_from_towers(direction, &towers)?,
+                self.second_directional_derivative_all_axes_from_towers(&rows, direction, &towers)?,
             )?;
         }
         Ok(())
@@ -2139,7 +2188,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
                 weight.dim()
             ));
         }
-        let towers = self.build_row_towers()?;
+        let towers = self.build_row_towers(&crate::row_kernel::RowSet::All)?;
         self.chunked_pullback_reduce(p, |row, acc| -> Result<(), String> {
             let w_row = self.primary_trace_weight(row, weight)?;
             let t4 = towers[row].t4();

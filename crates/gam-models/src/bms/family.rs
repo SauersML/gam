@@ -4,6 +4,7 @@ use crate::fnv1a::Fnv1a;
 use crate::latent_anchor::{
     AnchorGrid, AnchorGridOwned, AnchorRootCache, AnchorRowContext, AnchorSolveCounts,
 };
+use crate::wiggle::WarpKnotEnds;
 
 #[derive(Clone)]
 pub(super) struct BernoulliMarginalSlopeFamily {
@@ -29,6 +30,11 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// eviction never changes numerical results.
     pub(super) cell_moment_lru: Arc<exact_kernel::CellMomentLruCache>,
     pub(super) cell_moment_cache_stats: Arc<exact_kernel::CellMomentCacheStats>,
+    /// Fit-lifetime pools of runtime-sized jet workspaces for the empirical
+    /// FLEX third and fourth contractions and the third trace. Idle
+    /// workspaces are charged to the governor and freed with the fit's
+    /// families (gam#2989).
+    pub(super) jet_scratch: Arc<super::hessian_paths::JetScratch>,
     /// Per-row warm-start cache for the scalar intercept root-finder
     /// (`solve_row_intercept_base`). The intercept `a` is solved per row at
     /// every inner PIRLS iteration; without a warm start, each call burns
@@ -71,8 +77,8 @@ pub(super) struct BernoulliMarginalSlopeFamily {
     /// double-bump.
     pub(super) auto_subsample_last_rho: Arc<Mutex<Option<Array1<f64>>>>,
     /// Whether this member's Jeffreys/Firth prior is armed. A fit arms it only
-    /// on the unarmed fit's own evidence, through
-    /// `fit_custom_family_arming_on_evidence` (#979).
+    /// on the unarmed route's own evidence: `fit_bernoulli_marginal_slope_terms`
+    /// runs the whole route through `arm_on_evidence` (#979, #3164).
     pub(super) jeffreys_armed: bool,
     /// The residual genetic repair block (gam#2924): `K` conditionally centred
     /// features with constant coefficients entering the genetic drive beside
@@ -495,11 +501,13 @@ pub(super) struct ThetaHints {
     pub(super) link_dev_beta: Option<Array1<f64>>,
 }
 
+/// The score warp is evaluated at the data's `z` and the latent grid's fixed
+/// nodes, which no β moves, so a clamped end's multiplicity is never crossed.
 pub(crate) fn build_score_warp_deviation_block_from_seed(
     seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg)
+    build_deviation_block_from_knots_and_design_seed(seed, seed, cfg, WarpKnotEnds::Clamped)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -521,62 +529,31 @@ pub(crate) struct BernoulliMarginalLinkMap {
     pub q4: f64,
 }
 
-#[inline]
-pub(super) fn clamp_bernoulli_link_probability(probability: f64) -> f64 {
-    probability.clamp(
-        BERNOULLI_LINK_PROBABILITY_EPS,
-        1.0 - BERNOULLI_LINK_PROBABILITY_EPS,
-    )
-}
-
-pub(crate) fn bernoulli_marginal_slope_eta_from_probability(
-    base_link: &InverseLink,
-    probability: f64,
-    context: &str,
-) -> Result<f64, String> {
-    require_probit_marginal_slope_link(base_link, context)?;
-    let target = clamp_bernoulli_link_probability(probability);
-    standard_normal_quantile(target)
-        .map_err(|e| format!("{context} failed to invert probit probability {target}: {e}"))
-}
-
+/// The probit marginal link at `η`. The marginal index is `q = Φ⁻¹(Φ(η)) = η`
+/// exactly, on every finite `η`: no probability is formed and inverted, so the
+/// likelihood keeps its exact slope and curvature in the marginal coefficients
+/// however deep into a tail a trial point walks (gam#2978). Every anchored
+/// route solves its calibration from `q` in log space on the smaller tail
+/// (`latent_anchor::solve_anchor`); `μ = Φ(η)` and its derivative stack are
+/// the exact probability for the routes that integrate in probability space.
 pub(crate) fn bernoulli_marginal_link_map(
     base_link: &InverseLink,
     eta: f64,
 ) -> Result<BernoulliMarginalLinkMap, String> {
     require_probit_marginal_slope_link(base_link, "bernoulli marginal-slope")?;
-    let raw_mu = normal_cdf(eta);
-    let mu = clamp_bernoulli_link_probability(raw_mu);
-    let q = standard_normal_quantile(mu).map_err(|e| {
-        format!("bernoulli marginal-slope probit target inversion failed at mu={mu}: {e}")
-    })?;
-    if raw_mu <= BERNOULLI_LINK_PROBABILITY_EPS || raw_mu >= 1.0 - BERNOULLI_LINK_PROBABILITY_EPS {
-        return Ok(BernoulliMarginalLinkMap {
-            eta,
-            mu,
-            mu1: 0.0,
-            mu2: 0.0,
-            mu3: 0.0,
-            mu4: 0.0,
-            q,
-            q1: 0.0,
-            q2: 0.0,
-            q3: 0.0,
-            q4: 0.0,
-        });
+    if !eta.is_finite() {
+        return Err(format!(
+            "bernoulli marginal-slope marginal index is non-finite: eta={eta}"
+        ));
     }
     let phi_eta = normal_pdf(eta);
     let mu1 = phi_eta;
     let mu2 = -eta * phi_eta;
     let mu3 = (eta * eta - 1.0) * phi_eta;
     let mu4 = -(eta.powi(3) - 3.0 * eta) * phi_eta;
-    // In the unclamped region Φ⁻¹∘Φ is exactly the identity. Numerically
-    // inverting a rounded probability and differentiating the inverse again
-    // manufactured spurious high derivatives (especially in the tails).
-    // This exact simplification also fixes all higher derivative orders.
     Ok(BernoulliMarginalLinkMap {
         eta,
-        mu,
+        mu: normal_cdf(eta),
         mu1,
         mu2,
         mu3,
@@ -611,18 +588,29 @@ pub(super) fn require_probit_marginal_slope_link(
     }
 }
 
+/// The link deviation is evaluated at `a + b·z`, which moves with β at every
+/// observed row and every calibration node, so its ends are simple: on a
+/// clamped vector each index crossing a support end steps the objective's
+/// gradient, and the inner Newton cannot certify a mode that sits on one
+/// (gam#3011).
 pub(crate) fn build_link_deviation_block_from_knots_design_seed_and_weights(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
 ) -> Result<DeviationPrepared, String> {
-    build_deviation_block_from_knots_and_design_seed(knot_seed, design_seed, cfg)
+    build_deviation_block_from_knots_and_design_seed(
+        knot_seed,
+        design_seed,
+        cfg,
+        WarpKnotEnds::Simple,
+    )
 }
 
 pub(super) fn build_deviation_block_from_knots_and_design_seed(
     knot_seed: &Array1<f64>,
     design_seed: &Array1<f64>,
     cfg: &DeviationBlockConfig,
+    ends: WarpKnotEnds,
 ) -> Result<DeviationPrepared, String> {
     if cfg.degree != 3 {
         return Err(format!(
@@ -631,14 +619,22 @@ pub(super) fn build_deviation_block_from_knots_and_design_seed(
         ));
     }
     let penalty_orders = resolve_deviation_operator_orders(cfg)?;
-    // Clamped ends: the BMS anchored-cubic SAVED-MODEL replay reconstructs the
-    // deviation on that convention, so its knots cannot move before it reads the
-    // ramp definition (gam#2695).
-    let knots = gam_terms::basis::initializewiggle_knots_from_seed(
-        knot_seed.view(),
-        cfg.degree,
-        cfg.num_internal_knots,
-    )?;
+    // A saved model replays its frozen span tables, not these knots, so either
+    // end convention replays exactly.
+    let knots = match ends {
+        // The seed range's spans, continued by `degree` spans past each end, so
+        // every ramp settles C2 outside the range the data occupy.
+        WarpKnotEnds::Simple => gam_terms::basis::monotone_warp_knots_from_seed(
+            knot_seed.view(),
+            cfg.degree,
+            cfg.num_internal_knots,
+        )?,
+        WarpKnotEnds::Clamped => gam_terms::basis::initializewiggle_knots_from_seed(
+            knot_seed.view(),
+            cfg.degree,
+            cfg.num_internal_knots,
+        )?,
+    };
     // The smoothness-null-space drop must remove the union of null spaces
     // across all configured penalties, which (for nested null spaces of
     // increasing-order derivative penalties) equals the largest order's

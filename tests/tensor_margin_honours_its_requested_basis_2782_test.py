@@ -155,7 +155,7 @@ def test_explicit_knot_placement_is_not_collapsed_onto_unset() -> None:
 )
 def test_malformed_per_margin_requests_are_refused(option: str, expected: str) -> None:
     """They used to fall back to the default instead of being refused."""
-    with pytest.raises(gamfit.errors.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamfitError) as excinfo:
         _fit(f"y ~ te(x, z, k=5, {option})")
     assert expected in str(excinfo.value), f"got: {excinfo.value}"
 
@@ -164,7 +164,7 @@ def test_scalar_boundary_token_reaches_every_margin() -> None:
     """`bc='periodic'` used to be dropped by a length guard, silently building
     an APERIODIC tensor. It now broadcasts, so it needs a period like any other
     periodic margin -- and is refused, loudly, when none is given."""
-    with pytest.raises(gamfit.errors.GamError) as excinfo:
+    with pytest.raises(gamfit.errors.GamfitError) as excinfo:
         _fit("y ~ te(x, z, k=5, bc='periodic')")
     assert "periodic" in str(excinfo.value)
 

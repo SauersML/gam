@@ -277,17 +277,23 @@ pub(crate) fn gaussian_location_scalewarm_start(
             "gaussian location-scale warm start could not estimate residual scale".to_string(),
         );
     }
-    // Warm-start σ̂ must clear the logb floor so the inverse link
-    //   η = log(σ − b)
-    // is finite. Use a relative cushion above b so the warm-start is in the
-    // smooth interior of the link domain.
-    let sigma_hat = (weighted_ss / weight_sum)
-        .sqrt()
-        .max(LOGB_SIGMA_FLOOR * 1.5);
+    // The warm start targets η = ln σ̂, i.e. σ₀ = b + σ̂ under σ = b + e^η. The
+    // floor b is the recording-grid bound δ/√12 (see `sigma_link`), which for a
+    // correctly specified model sits below the residual scale, so σ₀ exceeds σ̂
+    // by at most that quantization term; no clamp against b is needed. A zero
+    // residual scale means the mean interpolates every row, and there is no
+    // noise level to start the scale block from.
+    let sigma_hat = (weighted_ss / weight_sum).sqrt();
+    if !(sigma_hat > 0.0) {
+        return Err(format!(
+            "gaussian location-scale warm start: the penalized mean fit leaves no residual \
+             spread (σ̂ = {sigma_hat:.3e}), so there is no noise scale to start from"
+        ));
+    }
     let beta_log_sigma = if let Some(beta) = noise_beta_hint {
         beta.clone()
     } else {
-        let eta_sigma = (sigma_hat - LOGB_SIGMA_FLOOR).ln();
+        let eta_sigma = sigma_hat.ln();
         let sigma_target = Array1::from_elem(y.len(), eta_sigma);
         solve_penalizedweighted_projection(
             &log_sigma_block.design,
@@ -396,53 +402,42 @@ pub(crate) fn build_location_scale_wiggle_block(
     Ok(spec)
 }
 
-pub(crate) fn prepared_gaussian_log_sigma_design(
-    mu_design: &DesignMatrix,
+/// The log-σ design of a location-scale family: the noise formula's design, raw,
+/// for every likelihood.
+///
+/// Residualizing it against the location design, `X_σ → (I − P_{X_μ}) X_σ`, imposes a
+/// constraint the likelihood does not carry, for Gaussian and binomial alike:
+///
+/// * Gaussian, `L(μ, η) = ½ Σ_i [(y_i − μ_i)² e^{−2η_i} + 2η_i]`: β_μ and β_σ enter
+///   through different sufficient statistics (residual and residual²), so a shared
+///   basis is identified.
+/// * Binomial, `q = −η_t·e^{−η_σ}`: the likelihood sees the blocks only through `q`,
+///   whose tangent null space is `{(δη_t, δη_σ) : δη_t = η_t·δη_σ}`. A log-σ direction
+///   `f` is unidentified only where `η_t·f` lies in the threshold span. For the
+///   intercept that holds at every β (the exact gauge `pseudo_logdet_mode` names).
+///   For any other `f` it holds only at a constant threshold, so a log-σ column the
+///   threshold also spans is identified whenever the threshold varies.
+///
+/// The residualization zeroed every scale column in the location span, so the scale
+/// effect it carried could not be fitted. The identifiability audit then dropped the
+/// zero column beside a family that kept the full width, and every seed was refused
+/// (#3015: noise `x3` beside `duchon(x2, x3)`, truth `σ = e^{0.3·x3}`). Survival
+/// location-scale keeps its scale design raw for the same reason.
+pub(crate) fn location_scale_log_sigma_design(
+    location_design: &DesignMatrix,
     log_sigma_design: &DesignMatrix,
 ) -> Result<DesignMatrix, String> {
-    if mu_design.nrows() != log_sigma_design.nrows() {
+    if location_design.nrows() != log_sigma_design.nrows() {
         return Err(GamlssError::DimensionMismatch {
             reason: format!(
-                "gaussian log-sigma design row mismatch: mean rows={}, log_sigma rows={}",
-                mu_design.nrows(),
+                "location-scale log-sigma design row mismatch: location rows={}, log_sigma rows={}",
+                location_design.nrows(),
                 log_sigma_design.nrows()
             ),
         }
         .into());
     }
-    // Gaussian location-scale remains identifiable even when μ and log σ use
-    // the same covariate basis:
-    //
-    //   L(μ, η) = 0.5 * Σ_i [ (y_i - μ_i)^2 exp(-2η_i) + 2η_i ],
-    //   μ = X_μ β_μ,  η = X_σ β_σ.
-    //
-    // Shared columns are not a frame mismatch. β_μ and β_σ enter through
-    // different sufficient statistics (residual and residual²), so replacing
-    // X_σ with (I - P_{X_μ}) X_σ would impose an extra constraint and can
-    // erase real heteroscedastic signal when the two blocks share a basis.
     Ok(log_sigma_design.clone())
-}
-
-pub(crate) fn identified_binomial_log_sigma_design(
-    threshold_design: &TermCollectionDesign,
-    log_sigma_design: &TermCollectionDesign,
-    weights: &Array1<f64>,
-) -> Result<DesignMatrix, String> {
-    let non_intercept_start = log_sigma_design
-        .intercept_range
-        .end
-        .min(log_sigma_design.design.ncols());
-    let transform = build_scale_deviation_transform_design(
-        &threshold_design.design,
-        &log_sigma_design.design,
-        weights,
-        non_intercept_start,
-    )?;
-    build_scale_deviation_operator(
-        threshold_design.design.clone(),
-        log_sigma_design.design.clone(),
-        &transform,
-    )
 }
 
 pub(crate) fn identity_penalty(dim: usize) -> Array2<f64> {
@@ -514,7 +509,7 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
         &format!("{context}: mu"),
     )?;
     let prepared_noise_design =
-        prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)?;
+        location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
     // The formula-native penalty topology is authoritative. Smooth terms carry
     // their own REML-selected null-space penalty when `double_penalty=true`
     // (the default), while an explicit `double_penalty=false` remains a real
@@ -556,9 +551,9 @@ pub(crate) fn build_gaussian_mean_and_scale_blocks(
 
 /// Build the (threshold, log-σ) parameter-block pair for a Binomial
 /// location-scale family. Shared by the non-wiggle and wiggle Binomial builders;
-/// mirrors [`build_gaussian_mean_and_scale_blocks`] but with the binomial-
-/// identified log-σ design, the link-aware joint warm start, and the same
-/// REML-selected full-span scale shrinkage penalty.
+/// mirrors [`build_gaussian_mean_and_scale_blocks`], with the same raw log-σ
+/// design ([`location_scale_log_sigma_design`]), the link-aware joint warm
+/// start, and the same REML-selected full-span scale shrinkage penalty.
 pub(crate) fn build_binomial_threshold_and_scale_blocks(
     y: &Array1<f64>,
     weights: &Array1<f64>,
@@ -579,9 +574,9 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     let noise_offset = noise_design
         .compose_offset(noise_offset.view(), &format!("{context}: log_sigma"))
         .map_err(|error| error.to_string())?;
-    let identifiednoise_design =
-        identified_binomial_log_sigma_design(mean_design, noise_design, weights)?;
-    let p_noise = identifiednoise_design.ncols();
+    let raw_log_sigma_design =
+        location_scale_log_sigma_design(&mean_design.design, &noise_design.design)?;
+    let p_noise = raw_log_sigma_design.ncols();
     let mut log_sigma_penalty_matrices: Vec<PenaltyMatrix> =
         noise_design.penalties_as_penalty_matrix();
     log_sigma_penalty_matrices.push(PenaltyMatrix::Dense(identity_penalty(p_noise)));
@@ -599,7 +594,7 @@ pub(crate) fn build_binomial_threshold_and_scale_blocks(
     )?;
     let mut log_sigmaspec = build_location_scale_block(
         "log_sigma",
-        identifiednoise_design,
+        raw_log_sigma_design,
         noise_offset,
         log_sigma_penalty_matrices,
         vec![],
@@ -1159,33 +1154,30 @@ pub struct GaussianLocationScaleFitResult {
     pub beta_link_wiggle: Option<Vec<f64>>,
     /// Response standardization factor applied internally during fitting.
     ///
-    /// The Gaussian location-scale path fits on `y / response_scale` so the
-    /// fixed log-σ soft floor `LOGB_SIGMA_FLOOR = 0.01` is *operationally*
-    /// scale-relative (1 % of the response spread) rather than absolute,
-    /// keeping κ = dlogσ/dη ≈ 1 across the realistic σ range and informing the
-    /// scale block like gamlss. The returned coefficient `blocks`, `beta`, and
-    /// link-wiggle knots/coefficients are already mapped back to **raw response
-    /// units** (the Location/Mean block scaled by `response_scale`, the Scale
-    /// block intercept shifted by `+ln(response_scale)`), so downstream
-    /// reconstruction `μ = X_mean·β` comes out in raw units with no further
-    /// rescaling.
+    /// The Gaussian location-scale path fits on `y / response_scale`. The
+    /// returned coefficient `blocks`, `beta`, and link-wiggle knots/coefficients
+    /// are already mapped back to **raw response units** (the Location/Mean
+    /// block scaled by `response_scale`, the Scale block intercept shifted by
+    /// `+ln(response_scale)`), so downstream reconstruction `μ = X_mean·β` comes
+    /// out in raw units with no further rescaling.
     ///
-    /// The σ reconstruction, however, **must scale the floor too** to stay
+    /// The σ reconstruction must scale the floor too to stay
     /// response-scale-equivariant (#884):
     ///
     /// ```text
-    /// σ = response_scale·LOGB_SIGMA_FLOOR + exp(X_scale·β)
-    ///   = response_scale·(LOGB_SIGMA_FLOOR + exp(η_internal)).
+    /// σ = response_scale·sigma_floor + exp(X_scale·β)
+    ///   = response_scale·(sigma_floor + exp(η_internal)).
     /// ```
     ///
-    /// The intercept shift carries only the `exp(η)` term; reconstructing with a
-    /// raw `LOGB_SIGMA_FLOOR` instead of `response_scale·LOGB_SIGMA_FLOOR` leaves
-    /// the non-equivariant residual `LOGB_SIGMA_FLOOR·(1 − response_scale)`.
-    ///
-    /// This field records the factor that was applied for transparency,
-    /// covariance bookkeeping, and the equivariant σ-floor reconstruction; it is
-    /// `1.0` when no standardization was needed (degenerate constant response).
+    /// The intercept shift carries only the `exp(η)` term; the floor sits
+    /// outside the exponential, so it is carried by this factor instead.
     pub response_scale: f64,
+    /// The σ floor `b` of the link σ = b + exp(η), in standardized response
+    /// units: the recording-grid bound δ/√12 of the standardized response
+    /// (`sigma_link::gaussian_resolution_sigma_floor`). It is a property of the
+    /// data, so the raw-unit floor `response_scale·sigma_floor` is exactly the
+    /// raw grid bound δ_raw/√12.
+    pub sigma_floor: f64,
 }
 
 /// Exact coefficient-frame map for the frozen-basis binomial mean-wiggle
@@ -1236,61 +1228,16 @@ fn binomial_mean_wiggle_saved_frame_gauge(
     Ok(gauge)
 }
 
-fn binomial_mean_wiggle_saved_geometry(
-    geometry: &gam_solve::model_types::FitGeometry,
-    saved_frame: &gam_problem::Gauge,
-) -> Result<gam_solve::model_types::FitGeometry, String> {
-    let mut saved_geometry = geometry.clone();
-    saved_geometry.coefficient_gauge = geometry
-        .coefficient_gauge
-        .left_compose(saved_frame)
-        .map_err(|reason| {
-            format!(
-                "binomial mean-wiggle active geometry cannot compose with its exact saved-result gauge: {reason}"
-            )
-        })?;
-    Ok(saved_geometry)
-}
-
-fn binomial_mean_wiggle_saved_covariance(
-    covariance: &Array2<f64>,
-    saved_frame: &gam_problem::Gauge,
-    label: &str,
-) -> Result<Array2<f64>, String> {
-    let expected = saved_frame.reduced_total();
-    if covariance.dim() != (expected, expected) {
-        return Err(format!(
-            "binomial mean-wiggle {label} is {}x{}; exact saved-result gauge requires {expected}x{expected} solver-frame coordinates",
-            covariance.nrows(),
-            covariance.ncols(),
-        ));
-    }
-    if let Some(((row, column), value)) = covariance
-        .indexed_iter()
-        .find(|(_, value)| !value.is_finite())
-    {
-        return Err(format!(
-            "binomial mean-wiggle {label} is non-finite at ({row}, {column}): {value}"
-        ));
-    }
-    let saved = saved_frame.lift_covariance(covariance);
-    if let Some(((row, column), value)) = saved.indexed_iter().find(|(_, value)| !value.is_finite())
-    {
-        return Err(format!(
-            "binomial mean-wiggle saved-frame {label} is non-finite at ({row}, {column}): {value}"
-        ));
-    }
-    Ok(saved)
-}
-
 /// Atomically move a converged frozen-basis mean-wiggle fit from the solver's
 /// residualized-design coordinates into the saved prediction coordinates.
 ///
-/// The penalized Hessian remains in its exact active solver coordinates;
-/// composing its coefficient gauge records how raw saved rows pull back into
-/// that frame. Covariances, in contrast, push forward through the saved-frame
-/// map. No dimension mismatch is ignorable: returning a partially transformed
-/// fit would make point estimates and uncertainty describe different models.
+/// The move is the fit's one saved-frame lift
+/// ([`UnifiedFitResult::lift_to_saved_frame`]): the penalized Hessian stays in
+/// its exact active solver coordinates with its coefficient gauge composed,
+/// and every covariance and smoothing correction pushes forward through the
+/// saved-frame map. No dimension mismatch is ignorable: returning a partially
+/// transformed fit would make point estimates and uncertainty describe
+/// different models.
 fn finalize_binomial_mean_wiggle_saved_frame(
     fit: &mut UnifiedFitResult,
     alias: &Array2<f64>,
@@ -1340,97 +1287,13 @@ fn finalize_binomial_mean_wiggle_saved_frame(
             ));
         }
     }
-    let total_width = mean_width
-        .checked_add(wiggle_width)
-        .ok_or_else(|| "binomial mean-wiggle coefficient dimension overflows usize".to_string())?;
-    if fit.beta.len() != total_width {
-        return Err(format!(
-            "binomial mean-wiggle flat coefficient vector has width {}, expected {total_width}",
-            fit.beta.len(),
-        ));
-    }
-    if fit.beta.slice(s![0..mean_width]) != fit.blocks[0].beta
-        || fit.beta.slice(s![mean_width..total_width]) != fit.blocks[1].beta
-    {
-        return Err(
-            "binomial mean-wiggle flat and block coefficient vectors disagree before saved-frame finalization"
-                .to_string(),
-        );
-    }
-
     let saved_frame = binomial_mean_wiggle_saved_frame_gauge(alias, mean_width, wiggle_width)?;
-    let saved_blocks =
-        saved_frame.lift_block_betas(&[fit.blocks[0].beta.clone(), fit.blocks[1].beta.clone()]);
-    let saved_mean_eta = mean_design.dot(&saved_blocks[0]) + mean_offset;
-    let mut saved_beta = Array1::<f64>::zeros(total_width);
-    saved_beta
-        .slice_mut(s![0..mean_width])
-        .assign(&saved_blocks[0]);
-    saved_beta
-        .slice_mut(s![mean_width..total_width])
-        .assign(&saved_blocks[1]);
-
-    let saved_conditional = fit
-        .covariance_conditional
-        .as_ref()
-        .map(|covariance| {
-            binomial_mean_wiggle_saved_covariance(
-                covariance,
-                &saved_frame,
-                "conditional covariance",
-            )
-        })
-        .transpose()?;
-    let saved_corrected = fit
-        .covariance_corrected
-        .as_ref()
-        .map(|covariance| {
-            binomial_mean_wiggle_saved_covariance(covariance, &saved_frame, "corrected covariance")
-        })
-        .transpose()?;
-    let saved_geometry = binomial_mean_wiggle_saved_geometry(
-        fit.geometry.as_ref().ok_or_else(|| {
-            "binomial mean-wiggle fit is missing its exact active geometry".to_string()
-        })?,
-        &saved_frame,
-    )?;
-
-    let mut saved_inference = fit.inference.clone();
-    if let Some(inference) = saved_inference.as_mut() {
-        // Standard errors published without their covariance have no saved-frame
-        // map: a diagonal does not survive the frame change.
-        if inference.factorized_standard_errors.is_some() {
-            return Err(
-                "binomial mean-wiggle inference has standard errors without their covariance"
-                    .to_string(),
-            );
-        }
-        if let Some(covariance) = inference.beta_covariance_frequentist.take() {
-            inference.beta_covariance_frequentist = Some(binomial_mean_wiggle_saved_covariance(
-                &covariance,
-                &saved_frame,
-                "frequentist covariance",
-            )?);
-        }
-        if let Some(correction) = inference.smoothing_correction.take() {
-            inference.smoothing_correction = Some(binomial_mean_wiggle_saved_covariance(
-                &correction,
-                &saved_frame,
-                "smoothing covariance correction",
-            )?);
-        }
-    }
-
-    fit.blocks[0].beta = saved_blocks[0].clone();
-    fit.blocks[1].beta = saved_blocks[1].clone();
-    fit.block_states[0].beta = saved_blocks[0].clone();
-    fit.block_states[0].eta = saved_mean_eta;
-    fit.block_states[1].beta = saved_blocks[1].clone();
-    fit.beta = saved_beta;
-    fit.covariance_conditional = saved_conditional;
-    fit.covariance_corrected = saved_corrected;
-    fit.geometry = Some(saved_geometry);
-    fit.inference = saved_inference;
+    fit.lift_to_saved_frame(&saved_frame).map_err(|err| {
+        format!("binomial mean-wiggle saved-frame finalization: {err}")
+    })?;
+    // The de-alias moves `X·A·β_w` from the wiggle into the mean predictor; the
+    // total `q` is unchanged, the Mean block's own predictor is not.
+    fit.block_states[0].eta = mean_design.dot(&fit.blocks[0].beta) + mean_offset;
     Ok(())
 }
 
@@ -1452,33 +1315,16 @@ mod binomial_mean_wiggle_saved_frame_tests {
             &[2, 1],
             &[1, 1],
         );
-        let active_hessian = array![[7.0, 1.5], [1.5, 4.0]];
-        let geometry = gam_solve::model_types::FitGeometry {
-            coefficient_gauge: active_to_solver,
-            penalized_hessian: active_hessian.clone().into(),
-            constrained_posterior: None,
-            working: None,
-        };
-        let saved_geometry = binomial_mean_wiggle_saved_geometry(&geometry, &saved_frame)
+        let saved_gauge = active_to_solver
+            .left_compose(&saved_frame)
             .expect("non-square active geometry composes through saved frame");
 
         assert_eq!(
-            saved_geometry.coefficient_gauge.t_full,
+            saved_gauge.t_full,
             array![[1.0, -2.0], [0.0, 0.5], [0.0, 1.0]],
         );
-        assert_eq!(
-            saved_geometry.penalized_hessian.as_array(),
-            &active_hessian,
-            "precision stays in the canonical active frame",
-        );
-
         let solver_covariance = Array2::<f64>::eye(3);
-        let saved_covariance = binomial_mean_wiggle_saved_covariance(
-            &solver_covariance,
-            &saved_frame,
-            "test covariance",
-        )
-        .expect("covariance pushes into saved frame");
+        let saved_covariance = saved_frame.lift_covariance(&solver_covariance);
         assert_eq!(
             saved_covariance,
             array![[5.0, -1.0, -2.0], [-1.0, 1.25, 0.5], [-2.0, 0.5, 1.0]],
@@ -3494,6 +3340,8 @@ pub(crate) fn wiggle_basis_failure(reason: String) -> FitFailure {
 pub(crate) struct GaussianLocationScaleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3550,13 +3398,14 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
         let preparednoise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design)
-                .expect("prepared Gaussian log-sigma design should match block construction");
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         GaussianLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             cached_row_scalars: std::sync::RwLock::new(None),
         }
@@ -3602,6 +3451,8 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleTermBuilder {
 pub(crate) struct GaussianLocationScaleWiggleTermBuilder {
     pub(crate) y: Array1<f64>,
     pub(crate) weights: Array1<f64>,
+    /// σ floor of the fitted response, `gaussian_resolution_sigma_floor(y, weights)`.
+    pub(crate) sigma_floor: f64,
     pub(crate) meanspec: TermCollectionSpec,
     pub(crate) noisespec: TermCollectionSpec,
     pub(crate) mean_offset: Array1<f64>,
@@ -3698,14 +3549,15 @@ impl LocationScaleFamilyBuilder for GaussianLocationScaleWiggleTermBuilder {
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
         let preparednoise_design =
-            prepared_gaussian_log_sigma_design(&mean_design.design, &noise_design.design).expect(
-                "prepared Gaussian log-sigma design should match wiggle block construction",
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design).expect(
+                "the location-scale log-sigma design should match wiggle block construction",
             );
         GaussianLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             mu_design: Some(mean_design.design.clone()),
             log_sigma_design: Some(preparednoise_design),
+            sigma_floor: self.sigma_floor,
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -3831,15 +3683,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
-                .expect("identified binomial log-sigma design");
+        let raw_log_sigma_design =
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         BinomialLocationScaleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(identifiednoise_design),
+            log_sigma_design: Some(raw_log_sigma_design),
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
             jeffreys_armed: false,
         }
@@ -3992,15 +3844,15 @@ impl LocationScaleFamilyBuilder for BinomialLocationScaleWiggleTermBuilder {
         mean_design: &TermCollectionDesign,
         noise_design: &TermCollectionDesign,
     ) -> Self::Family {
-        let identifiednoise_design =
-            identified_binomial_log_sigma_design(mean_design, noise_design, &self.weights)
-                .expect("identified binomial log-sigma design should match block construction");
+        let raw_log_sigma_design =
+            location_scale_log_sigma_design(&mean_design.design, &noise_design.design)
+                .expect("the location-scale log-sigma design should match block construction");
         BinomialLocationScaleWiggleFamily {
             y: self.y.clone(),
             weights: self.weights.clone(),
             link_kind: self.link_kind.clone(),
             threshold_design: Some(mean_design.design.clone()),
-            log_sigma_design: Some(identifiednoise_design),
+            log_sigma_design: Some(raw_log_sigma_design),
             wiggle_knots: self.wiggle_knots.clone(),
             wiggle_degree: self.wiggle_degree,
             policy: gam_runtime::resource::ResourcePolicy::default_library(),
@@ -4061,11 +3913,14 @@ pub(crate) fn fit_gaussian_location_scale_terms(
 ) -> Result<BlockwiseTermFitResult, FitFailure> {
     validate_gaussian_location_scale_termspec(data, &spec, "fit_gaussian_location_scale_terms")
         .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,
@@ -4088,11 +3943,14 @@ pub(crate) fn fit_gaussian_location_scalewiggle_terms(
         "fit_gaussian_location_scalewiggle_terms",
     )
     .map_err(input_failure)?;
+    let sigma_floor = gaussian_resolution_sigma_floor(spec.y.view(), spec.weights.view())
+        .map_err(input_failure)?;
     fit_location_scale_terms(
         data,
         GaussianLocationScaleWiggleTermBuilder {
             y: spec.y,
             weights: spec.weights,
+            sigma_floor,
             meanspec: spec.meanspec,
             noisespec: spec.log_sigmaspec,
             mean_offset: spec.mean_offset,

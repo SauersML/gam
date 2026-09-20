@@ -2,6 +2,8 @@
 
     python -m bench.pygam_compare.run PLAN --out DIR [--reps R] [--timeout S]
                                               [--memcap-mb M] [--only-libs a,b]
+                                              [--designs d1,d2] [--shard I/K]
+                                              [--lib-path DIR]
 
 Writes ``DIR/records.jsonl`` (one JSON object per rep, including reps that
 timed out, blew the memory cap, errored or were not run), ``DIR/meta.json``
@@ -20,9 +22,15 @@ load hits all of them alike.
 The per-rep timeout and memory cap are a HARNESS SAFETY NET, not a solver
 budget: they only stop a runaway rep from stalling the whole plan. A rep that
 trips either is recorded with that status, the remaining reps of the cell and
-every larger ``n`` of the same (lib, family, design, threads, concurrency)
-are recorded as ``not_run_after_<status>``, and the report counts all of it
-against the library.
+every larger ``n`` of the same (lib, family, design, n_predict, threads,
+concurrency) are recorded as ``not_run_after_<status>``, and the report counts
+all of it against the library.
+
+Workers never inherit the caller's ``PYTHONPATH``; ``--lib-path DIR`` is the
+one way to put a pinned build first on their import path (for example a copy
+of an editable ``gamfit`` taken before a rebuild overwrites it), so a
+before/after comparison measures the build it names. Every gamfit record
+carries ``lib_file``, the imported package's path, so a run can be audited.
 """
 
 from __future__ import annotations
@@ -229,7 +237,14 @@ def run_isolated(
 
 
 def run_rep(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+    lib: str,
+    cell: Cell,
+    seed: int,
+    timeout_s: float,
+    memcap_mb: float,
+    cwd: str,
+    postfit: bool = False,
+    lib_path: str | None = None,
 ) -> dict[str, Any]:
     """Run one worker subprocess, policing the safety net; return its record."""
     cmd = [
@@ -241,7 +256,14 @@ def run_rep(
         cell.design,
         str(seed),
     ]
-    rec = run_isolated(cmd, cwd, timeout_s, memcap_mb, threads=cell.threads)
+    if cell.n_predict is not None:
+        cmd.append(str(cell.n_predict))
+    if postfit:
+        cmd.append("--postfit")
+    env_extra = None if lib_path is None else {"PYTHONPATH": lib_path}
+    rec = run_isolated(
+        cmd, cwd, timeout_s, memcap_mb, threads=cell.threads, env_extra=env_extra
+    )
     rec.update(
         lib=lib,
         family=cell.family,
@@ -250,19 +272,37 @@ def run_rep(
         threads=cell.threads,
         concurrency=cell.concurrency,
         seed=seed,
+        **({} if cell.n_predict is None else {"n_predict": cell.n_predict}),
     )
     return rec
 
 
 def run_batch(
-    lib: str, cell: Cell, seed: int, timeout_s: float, memcap_mb: float, cwd: str
+    lib: str,
+    cell: Cell,
+    seed: int,
+    timeout_s: float,
+    memcap_mb: float,
+    cwd: str,
+    postfit: bool = False,
+    lib_path: str | None = None,
 ) -> list[dict[str, Any]]:
     """Run ``cell.concurrency`` identical reps at once; one record per process,
     each carrying its ``slot`` and the wall time of the whole batch."""
     t0 = time.perf_counter()
     with ThreadPoolExecutor(max_workers=cell.concurrency) as pool:
         futures = [
-            pool.submit(run_rep, lib, cell, seed, timeout_s, memcap_mb, cwd)
+            pool.submit(
+                run_rep,
+                lib,
+                cell,
+                seed,
+                timeout_s,
+                memcap_mb,
+                cwd,
+                postfit=postfit,
+                lib_path=lib_path,
+            )
             for _ in range(cell.concurrency)
         ]
         recs = [f.result() for f in futures]
@@ -290,7 +330,11 @@ def git_sha() -> str | None:
 
 
 def run_plan(
-    plan: Plan, out_dir: Path, memcap_mb: float, progress: bool = True
+    plan: Plan,
+    out_dir: Path,
+    memcap_mb: float,
+    progress: bool = True,
+    lib_path: str | None = None,
 ) -> list[dict[str, Any]]:
     out_dir.mkdir(parents=True, exist_ok=True)
     records_path = out_dir / "records.jsonl"
@@ -306,6 +350,7 @@ def run_plan(
                 {c.threads for c in plan.cells}, key=lambda t: (t is None, t or 0)
             )
         ],
+        "lib_path": lib_path,
         "host": platform.node(),
         "platform": platform.platform(),
         "python": platform.python_version(),
@@ -315,8 +360,9 @@ def run_plan(
         "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     records: list[dict[str, Any]] = []
-    # (lib, family, design, threads, concurrency) -> status that stopped it at some n
-    stopped: dict[tuple[str, str, str, int | None, int], str] = {}
+    # (lib, family, design, n_predict, threads, concurrency) -> status that
+    # stopped it at some n
+    stopped: dict[tuple[str, str, str, int | None, int | None, int], str] = {}
     with (
         tempfile.TemporaryDirectory(prefix="pygam_compare_") as cwd,
         records_path.open("w") as fh,
@@ -329,6 +375,7 @@ def run_plan(
                         lib,
                         cell.family,
                         cell.design,
+                        cell.n_predict,
                         cell.threads,
                         cell.concurrency,
                     )
@@ -344,16 +391,37 @@ def run_plan(
                                 seed=rep,
                                 slot=slot,
                                 status=f"not_run_after_{stopped[key]}",
+                                **(
+                                    {}
+                                    if cell.n_predict is None
+                                    else {"n_predict": cell.n_predict}
+                                ),
                             )
                             for slot in range(cell.concurrency)
                         ]
                     elif cell.concurrency == 1:
                         batch = [
-                            run_rep(lib, cell, rep, plan.timeout_s, memcap_mb, cwd)
+                            run_rep(
+                                lib,
+                                cell,
+                                rep,
+                                plan.timeout_s,
+                                memcap_mb,
+                                cwd,
+                                postfit=plan.postfit,
+                                lib_path=lib_path,
+                            )
                         ]
                     else:
                         batch = run_batch(
-                            lib, cell, rep, plan.timeout_s, memcap_mb, cwd
+                            lib,
+                            cell,
+                            rep,
+                            plan.timeout_s,
+                            memcap_mb,
+                            cwd,
+                            postfit=plan.postfit,
+                            lib_path=lib_path,
                         )
                     if key not in stopped and _worst_status(batch) != "ok":
                         stopped[key] = _worst_status(batch)
@@ -397,6 +465,22 @@ def main(argv: list[str] | None = None) -> int:
         help="per-rep process-tree RSS safety net (default: half of total RAM)",
     )
     ap.add_argument("--only-libs", help="comma-separated subset of the plan's libs")
+    ap.add_argument(
+        "--designs",
+        help="comma-separated subset of the plan's designs (every n and family "
+        "of each), e.g. to re-run the designs a generator change touched",
+    )
+    ap.add_argument(
+        "--shard",
+        help="I/K: run only the designs whose index in the plan is I mod K, so "
+        "K drivers can split a plan across cores (merge with report.py)",
+    )
+    ap.add_argument(
+        "--lib-path",
+        type=Path,
+        help="directory put first on every worker's PYTHONPATH (a pinned "
+        "library build); the caller's own PYTHONPATH is never inherited",
+    )
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     plan = PLANS[args.plan]
@@ -410,7 +494,33 @@ def main(argv: list[str] | None = None) -> int:
         if unknown:
             ap.error(f"unknown libs {sorted(unknown)}")
         plan = dataclasses.replace(plan, libs=libs)
-    records = run_plan(plan, args.out, args.memcap_mb, progress=not args.quiet)
+    if args.designs:
+        wanted = set(args.designs.split(","))
+        unknown = wanted - {c.design for c in plan.cells}
+        if unknown:
+            ap.error(f"unknown designs {sorted(unknown)}")
+        plan = dataclasses.replace(
+            plan, cells=tuple(c for c in plan.cells if c.design in wanted)
+        )
+    if args.shard:
+        index, count = (int(v) for v in args.shard.split("/"))
+        if not 0 <= index < count:
+            ap.error(f"--shard {args.shard}: need 0 <= I < K")
+        # Shard by design, so every n of one design stays in one driver and
+        # the not-run-after-timeout rule still sees it.
+        designs = list(dict.fromkeys(c.design for c in plan.cells))
+        mine = {d for j, d in enumerate(designs) if j % count == index}
+        plan = dataclasses.replace(
+            plan, cells=tuple(c for c in plan.cells if c.design in mine)
+        )
+    lib_path = None
+    if args.lib_path is not None:
+        if not args.lib_path.is_dir():
+            ap.error(f"--lib-path {args.lib_path}: not a directory")
+        lib_path = str(args.lib_path.resolve())
+    records = run_plan(
+        plan, args.out, args.memcap_mb, progress=not args.quiet, lib_path=lib_path
+    )
     print(f"wrote {len(records)} records to {args.out}", file=sys.stderr)
     return 0
 

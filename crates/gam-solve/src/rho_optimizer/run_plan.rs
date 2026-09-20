@@ -169,7 +169,8 @@ struct RayRestorationDomain<'a> {
 /// evaluation repeated. Each restoration strictly raises the named
 /// coordinates; it stops at the model's own domain ceiling, or after as many
 /// restorations as there are ρ coordinates (a ray that survives that many
-/// closures is not closing), and then the original refusal is returned.
+/// closures is not closing), and then the original refusal is returned. The
+/// evaluation comes back with the certificate evidence it published (#3018).
 fn eval_seed_restoring_rays(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
@@ -178,12 +179,18 @@ fn eval_seed_restoring_rays(
     domain: RayRestorationDomain<'_>,
     context: &str,
     seed_idx: usize,
-) -> Result<OuterEval, EstimationError> {
+) -> Result<(OuterEval, crate::estimate::outer_eval_capture::CertificateEvidence), EstimationError> {
     let RayRestorationDomain { upper, rho_dim } = domain;
     let mut restorations = 0usize;
     loop {
-        let err = match eval_seed_at_full_inner_fidelity(obj, config, seed, order) {
-            Ok(eval) => return Ok(eval),
+        // What the evaluation publishes is charged to the seed value's
+        // resolution (#3018), each attempt's on its own so a refused attempt's
+        // evidence never reaches the seed that evaluated.
+        let (attempt, evidence) = super::bridges::evaluate_with_certificate_evidence(true, || {
+            eval_seed_at_full_inner_fidelity(obj, config, seed, order)
+        });
+        let err = match attempt {
+            Ok(eval) => return Ok((eval, evidence)),
             Err(err) => err,
         };
         let Some(ray) = ray_restoration_in(&err) else {
@@ -493,16 +500,16 @@ impl crate::estimate::outer_eval_capture::OuterSeedProbe for RunnerSeedProbe<'_>
 
 /// Execute a single plan attempt (derived start → solver loop → best result).
 ///
-/// `allow_tail_snap_reseed` gates the one-shot #2348 Inc 2b retry from a
-/// confirmed-tail snapped checkpoint (see [`OuterResult::tail_snap_reseed`]);
-/// the retry pass itself runs with it `false` so a reseed can never recurse.
+/// `allow_certify_reseed` gates the one-shot retries from a refused
+/// certificate's saddle-escape reseed and from a dominating incumbent; the
+/// retry pass itself runs with it `false` so a reseed can never recurse.
 pub(crate) fn run_outer_with_plan(
     obj: &mut dyn OuterObjective,
     config: &OuterConfig,
     context: &str,
     cap: &OuterCapability,
     the_plan: &OuterPlan,
-    allow_tail_snap_reseed: bool,
+    allow_certify_reseed: bool,
 ) -> Result<PlanRunOutcome, EstimationError> {
     // Derivative/IFT masking belongs to the model domain, never to a temporary
     // active-set search face. In particular, freezing a model-lower-rail
@@ -528,10 +535,6 @@ pub(crate) fn run_outer_with_plan(
     // it publishes (#2596, #2627). An earlier plan attempt's lowest state starts
     // it (#2953).
     let mut best_checkpoint: Option<OuterResult> = config.carried_checkpoint.clone();
-    // Confirmed-tail snapped reseed published by a refused certification
-    // (#2348 Inc 2b). Consumed once, after the search, for a single polishing
-    // retry pinned at the snapped rail point.
-    let mut tail_snap_reseed_point: Option<Array1<f64>> = None;
     // Negative-curvature escape reseed published by a refused certification
     // whose interior reduced Hessian is a certified strict saddle (#2357).
     // Consumed once, after the search, for a single retry seeded off the saddle
@@ -912,8 +915,8 @@ pub(crate) fn run_outer_with_plan(
                     seed_idx,
                 )
                     .map_err(|err| into_objective_error("outer eval failed", err));
-                let seed_eval = match seed_eval {
-                    Ok(seed_eval) => seed_eval,
+                let (seed_eval, seed_evidence) = match seed_eval {
+                    Ok(evaluated) => evaluated,
                     Err(err) if err.is_recoverable() => {
                         log::debug!(
                             "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
@@ -1036,17 +1039,18 @@ pub(crate) fn run_outer_with_plan(
                     // own, so a boundary-limited crawl buying sub-resolution
                     // descent ended only when its iteration count ran out. The
                     // same progress certificate the dense route uses ends it
-                    // instead (#2817); its resolution is the criterion's
-                    // statistical resolution, exactly as the ARC arm below uses.
+                    // instead (#2817), on the same stall rule (#3018).
                     let mut cost_stall_guard = CostStallGuard::new(
                         super::run::outer_criterion_resolution(config),
-                        ARC_COST_STALL_WINDOW,
                         config,
                         Arc::new(Mutex::new(None)),
                     );
+                    let seed_resolution =
+                        cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_seed(
                         &seed,
                         seed_eval.cost,
+                        seed_resolution,
                         rail_projected_gradient_norm(
                             &seed,
                             &seed_eval.gradient,
@@ -1318,15 +1322,14 @@ pub(crate) fn run_outer_with_plan(
                         )
                     });
 
-                    let mut cost_stall_guard = CostStallGuard::new(
-                        cost_stall_resolution,
-                        ARC_COST_STALL_WINDOW,
-                        config,
-                        cost_stall_exit.clone(),
-                    );
+                    let mut cost_stall_guard =
+                        CostStallGuard::new(cost_stall_resolution, config, cost_stall_exit.clone());
+                    let seed_resolution =
+                        cost_stall_guard.value_resolution(seed_eval.cost, &seed_evidence);
                     cost_stall_guard.observe_second_order_seed(
                         &seed,
                         seed_eval.cost,
+                        seed_resolution,
                         // Same rail-relaxed box the guard's later observations
                         // and the terminal certificate use (#2412); a seed that
                         // starts on a rail must not be scored against a
@@ -1658,7 +1661,7 @@ pub(crate) fn run_outer_with_plan(
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err))
                     {
-                        Ok(e) => e,
+                        Ok((e, _)) => e,
                         Err(err) if err.is_recoverable() => {
                             log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before device-BFGS start: {err}"
@@ -1762,7 +1765,7 @@ pub(crate) fn run_outer_with_plan(
                         )
                                 .map_err(|err| into_objective_error("outer eval failed", err));
                             let seed_eval = match seed_eval {
-                                Ok(eval) => eval,
+                                Ok((eval, _)) => eval,
                                 Err(eval_error) if eval_error.is_recoverable() => {
                                     seed_rejections.push(SeedRejection::from_objective_error(
                                         seed_idx,
@@ -1812,8 +1815,8 @@ pub(crate) fn run_outer_with_plan(
                             seed_idx,
                         )
                         .map_err(|err| into_objective_error("outer eval failed", err));
-                    let seed_eval = match seed_eval {
-                        Ok(seed_eval) => seed_eval,
+                    let (seed_eval, seed_evidence) = match seed_eval {
+                        Ok(evaluated) => evaluated,
                         Err(err) if err.is_recoverable() => {
                             log::debug!(
                                 "[OUTER] {context}: rejecting seed {seed_idx} before solver start: {err}"
@@ -1880,6 +1883,7 @@ pub(crate) fn run_outer_with_plan(
                     let bfgs_start = std::time::Instant::now();
                     let mut stratum_start = seed.clone();
                     let mut stratum_eval = seed_eval;
+                    let mut stratum_evidence = seed_evidence;
                     let mut crossed_iterations = 0usize;
                     let (outcome, cost_stall_exit, last_objective_error) = loop {
                         let stratum_rank = obj.criterion_rank();
@@ -1910,11 +1914,17 @@ pub(crate) fn run_outer_with_plan(
                             stratum_eval.gradient.iter().map(|g| g * g).sum::<f64>().sqrt();
                         let mut cost_stall_guard = CostStallGuard::new(
                             super::run::outer_criterion_resolution(config),
-                            COST_STALL_WINDOW,
                             config,
                             cost_stall_exit.clone(),
                         );
-                        cost_stall_guard.observe_seed(&stratum_start, stratum_eval.cost, seed_grad_norm);
+                        let seed_resolution =
+                            cost_stall_guard.value_resolution(stratum_eval.cost, &stratum_evidence);
+                        cost_stall_guard.observe_seed(
+                            &stratum_start,
+                            stratum_eval.cost,
+                            seed_resolution,
+                            seed_grad_norm,
+                        );
                         let last_objective_error: Arc<Mutex<Option<ObjectiveEvalError>>> =
                             Arc::new(Mutex::new(None));
                         let objective = RetainingObjective::new(
@@ -1932,7 +1942,11 @@ pub(crate) fn run_outer_with_plan(
                                 consecutive_probe_refusals: 0,
                                 accepted_steps: Arc::clone(&accepted_steps),
                                 pending_first_order: Vec::new(),
-                                incumbent: Some((stratum_start.clone(), stratum_eval.cost)),
+                                incumbent: Some(OuterIncumbent {
+                                    rho: stratum_start.clone(),
+                                    cost: stratum_eval.cost,
+                                    gradient: stratum_eval.gradient.clone(),
+                                }),
                                 stratum_rank,
                                 stratum_probe: Some(Arc::clone(&stratum_probe)),
                             },
@@ -2100,12 +2114,16 @@ pub(crate) fn run_outer_with_plan(
                         if !(probe.cost < final_value - resolution) {
                             break (outcome, cost_stall_exit, last_objective_error);
                         }
-                        let crossing_eval = eval_seed_at_full_inner_fidelity(
-                            obj,
-                            config,
-                            &probe.rho,
-                            OuterEvalOrder::ValueAndGradient,
-                        )
+                        let (crossing_eval, crossing_evidence) =
+                            super::bridges::evaluate_with_certificate_evidence(true, || {
+                                eval_seed_at_full_inner_fidelity(
+                                    obj,
+                                    config,
+                                    &probe.rho,
+                                    OuterEvalOrder::ValueAndGradient,
+                                )
+                            });
+                        let crossing_eval = crossing_eval
                         .map_err(|err| into_objective_error("outer eval failed", err))
                         .and_then(|eval| {
                             finite_outer_first_order_eval_or_error("outer eval failed", layout, eval)
@@ -2125,6 +2143,7 @@ pub(crate) fn run_outer_with_plan(
                                 crossed_iterations = crossed_iterations.saturating_add(run_iterations);
                                 stratum_start = probe.rho;
                                 stratum_eval = eval;
+                                stratum_evidence = crossing_evidence;
                             }
                             Ok(eval) => {
                                 log::debug!(
@@ -2465,7 +2484,6 @@ pub(crate) fn run_outer_with_plan(
                             "[OUTER] {context}: solver convergence claim failed analytic \
                              certification: {error}; retaining only a resume checkpoint"
                         );
-                        tail_snap_reseed_point = checkpoint.tail_snap_reseed.clone();
                         saddle_escape_reseed_point = checkpoint.saddle_escape_reseed.clone();
                         retain_best_outer_checkpoint(&mut best_checkpoint, checkpoint);
                         seed_rejections.push(SeedRejection::from_estimation_error(
@@ -2511,7 +2529,7 @@ pub(crate) fn run_outer_with_plan(
     // envelope, [`outer_value_agreement_bound`], because two values of one
     // criterion closer than that cannot be ranked. Beyond it the winner loses.
     // The search continues once from the incumbent, with the same one-shot reseed
-    // the tail-snap and saddle-escape retries use. If that does not certify, the
+    // the saddle-escape retry uses. If that does not certify, the
     // attempt returns the typed [`PlanRunOutcome::DominatedPlateau`], and the
     // incumbent is the resume checkpoint. When the objective refuses to
     // re-evaluate the incumbent, its stored value, the criterion's own evaluation
@@ -2593,7 +2611,7 @@ pub(crate) fn run_outer_with_plan(
                 DominanceContinuationStop::NotRun
             }
         };
-        if allow_tail_snap_reseed && reevaluated {
+        if allow_certify_reseed && reevaluated {
             let mut retry_config = config.clone();
             // The continuation judges what it certifies against the state it starts from, so it
             // cannot publish the optimum that state just beat (#2953).
@@ -2743,46 +2761,16 @@ pub(crate) fn run_outer_with_plan(
         return Ok(PlanRunOutcome::Converged(result));
     }
 
-    // #2348 Inc 2b: a refused certification CONFIRMED an exponential tail
-    // (probing passed) but the interior was still unpolished — the budget died
-    // mid-crawl while the interior tracked the crawling tail coordinate.
-    // Retry ONCE seeded at the snapped rail point: the box projection pins the
-    // tail coordinate at its bound while the interior converges in its few
-    // remaining Newton steps, and the Inc 1 railed mint then certifies through
-    // the natural path. The retry pass runs with the reseed gate closed, so
-    // this can never recurse; a failed retry falls back to the original
-    // exhaustion accounting.
-    if allow_tail_snap_reseed && let Some(reseed) = tail_snap_reseed_point {
-        log::debug!(
-            "[OUTER] {context}: retrying once from the confirmed-tail snapped \
-             reseed {reseed} (#2348 Inc 2b)"
-        );
-        let mut retry_config = config.clone();
-        retry_config.initial_rho = Some(reseed);
-        obj.reset();
-        match run_outer_with_plan(obj, &retry_config, context, cap, the_plan, false) {
-            Ok(outcome) => {
-                return Ok(with_enclosing_attempt_ledger(outcome, spent_seed_iterations));
-            }
-            Err(retry_error) => {
-                log::debug!(
-                    "[OUTER] {context}: confirmed-tail reseed retry failed ({retry_error}); \
-                     falling through to the original exhaustion accounting"
-                );
-            }
-        }
-    }
-
     // #2357 — saddle escape. A refused certification identified an interior
     // strict saddle (first-order stationary, indefinite curvature, no rail) and
     // published a negative-curvature escape point strictly below it. Retry ONCE
     // seeded there: the outer search resumes off the saddle ridge and descends
     // to the true PSD minimum — the deterministic form of the identical
     // warm-started resume that converges where the cold run refuses. The retry
-    // pass runs with the reseed gate closed (`allow_tail_snap_reseed = false`),
+    // pass runs with the reseed gate closed (`allow_certify_reseed = false`),
     // so it can never recurse; a failed retry falls back to the original
     // exhaustion accounting.
-    if allow_tail_snap_reseed && let Some(reseed) = saddle_escape_reseed_point {
+    if allow_certify_reseed && let Some(reseed) = saddle_escape_reseed_point {
         log::debug!(
             "[OUTER] {context}: retrying once from the negative-curvature saddle-escape \
              reseed {reseed} (#2357)"

@@ -814,14 +814,10 @@ where
         .unwrap_or(MADSEN_DAMPING_FLOOR);
     let lm_max_attempts = options.max_step_halving.max(1);
     // Convergence is decided by `WorkingState::certifies_kkt` /
-    // `WorkingState::near_stationary_kkt`, which combine a dimension-based
-    // bound  ‖g‖ < τ · √n · max(1, √p)  with a data-driven natural-scale
-    // bound  ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ  and accept under either.
-    // Both certificates are scale-invariant under F → c·F (the additive 1
-    // is a NaN-safe floor; for non-trivial fits the natural scale dominates
-    // it within one PIRLS iteration). The absolute test ‖g‖ < τ that this
-    // replaces was systematically too tight at large-scale n because ‖g‖₂ grows
-    // as O(√n) for standardized columns.
+    // `WorkingState::near_stationary_kkt` on the dimensionless residual
+    // ‖g‖ / (‖score‖ + ‖S·β‖) < τ, or by the exact Newton decrement. Neither
+    // carries the gradient's units, so both read the same at every n and in
+    // every response unit.
 
     // ─── Observed vs expected information in PIRLS (see response.md Section 3) ───
     //
@@ -1013,6 +1009,11 @@ where
         // takes. Distinct from the reject escalator by design; see the
         // loop_guard module docs.
         let mut lm_bound = IterationBound::new(lm_max_attempts);
+        // An AA(1) candidate is an extrapolation of the LM step, not the step
+        // whose predicted reduction the gain ratio is measured against, so its
+        // rejection says nothing about the damping. Once one is rejected this
+        // iteration, the retry evaluates the plain LM step at the same λ.
+        let mut aa_declined_this_iter = false;
         // Snapshot the LM trajectory's starting λ for the
         // `[PIRLS lm-trajectory]` log emitted at iter-end. This is what
         // the runtime-layer adaptive clamp (commit 43be42be) selected for
@@ -1345,7 +1346,7 @@ where
             // reject the accelerated candidate, fall back to the plain Fisher
             // candidate transparently — no change to the rest of the loop.
             let mut aa_attempt = false;
-            if force_fisher_for_rest && !aa_state.disabled {
+            if force_fisher_for_rest && !aa_state.disabled && !aa_declined_this_iter {
                 let beta_old_ref: &Array1<f64> = beta.as_ref();
                 if let Some(beta_accel) = aa_state.aa1_mix(beta_old_ref, &candidate_buf) {
                     candidate_buf.assign(beta_accel);
@@ -1503,10 +1504,12 @@ where
                             );
                         }
                         if !(rho > 0.0 && candidate_penalized.is_finite()) {
+                            candidate_buf = candidate_beta.into();
                             if aa_attempt {
                                 aa_state.note_reject(iter);
+                                aa_declined_this_iter = true;
+                                continue;
                             }
-                            candidate_buf = candidate_beta.into();
                             // Exhaustion guard, identical to the screening-reject
                             // branch below. The screening test admitted this trial
                             // (cheap forward eval looked like a descent) but the full
@@ -1725,13 +1728,12 @@ where
                             .is_some_and(|decrement_sq| decrement_sq <= exact_nd_threshold);
                         if should_check_exact_nd {
                             log::debug!(
-                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} dimension_scale={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
+                                "[PIRLS exact-decrement] decrement_sq={:.6e} threshold={:.6e} pass={} gradient_norm={:.6e} relative_gradient={:.6e} natural_scale={:.6e} objective={:.6e} actual_reduction={:.6e} predicted_reduction={:.6e} linear_model_term={:.6e} direction_norm={:.6e} data_reduction={:.6e} penalty_reduction={:.6e}",
                                 exact_decrement_sq.unwrap_or(f64::NAN),
                                 exact_nd_threshold,
                                 exact_nd_pass,
                                 convergence_grad_norm,
                                 final_state_ref.relative_gradient_norm(convergence_grad_norm),
-                                final_state_ref.kkt_dimension_scale(),
                                 final_state_ref.gradient_natural_scale,
                                 final_state_ref.penalized_objective(),
                                 actual_reduction,
@@ -1744,10 +1746,8 @@ where
                             );
                         }
 
-                        // Strict KKT: scale-invariant under EITHER the
-                        // dimension-based bound ‖g‖ < τ·√n·max(1,√p) OR the
-                        // data-driven natural-scale bound
-                        //     ‖g‖ / (1 + ‖score‖ + ‖S·β‖) < τ.
+                        // Strict KKT: the dimensionless residual
+                        //     ‖g‖ / (‖score‖ + ‖S·β‖) < τ.
                         // Newton decrement is an independent additional
                         // acceptance for ill-conditioned problems where ‖g‖
                         // is intrinsically large but H⁻¹g is already tiny.
@@ -1922,6 +1922,8 @@ where
                         candidate_buf = candidate_beta.into();
                         if aa_attempt {
                             aa_state.note_reject(iter);
+                            aa_declined_this_iter = true;
+                            continue;
                         }
                         if state.hessian_curvature == HessianCurvatureKind::Observed
                             && !used_fisher_fallback_this_iter
@@ -2068,6 +2070,11 @@ where
                 }
                 Err(err) => {
                     candidate_buf = candidate_beta.into();
+                    if aa_attempt && is_lm_retriable_candidate_error(&err) {
+                        aa_state.note_reject(iter);
+                        aa_declined_this_iter = true;
+                        continue;
+                    }
                     let witness = feasibility_witness(&err);
                     if witness.is_some() {
                         feasibility_witness_this_iter = witness;

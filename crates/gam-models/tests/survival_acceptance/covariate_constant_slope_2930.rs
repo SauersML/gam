@@ -218,8 +218,9 @@ fn derived_band(delta_1: f64, magnitude: f64, step: f64, summands: usize) -> f64
 
 /// Central differences of the value-only criterion along `theta[j]` on a halving ladder whose
 /// first rung is one hundredth of the coordinate's scale and at most half its room inside the
-/// seed box. Returns the rung that agrees best with its predecessor: its difference, its step, that
-/// disagreement, and its [`derived_band`].
+/// seed box. Returns, among the rungs that exhibit [`derived_band`]'s halving premise, the one that
+/// agrees best with its predecessor: its difference, its step, that disagreement, and its
+/// [`derived_band`].
 fn value_central_difference(
     probe: &mut dyn OuterSeedProbe,
     theta: &Array1<f64>,
@@ -249,10 +250,23 @@ fn value_central_difference(
         estimates.push((step, (plus - minus) / (2.0 * step), plus.abs().max(minus.abs())));
         step *= 0.5;
     }
-    let (index, settle) = (1..estimates.len())
-        .map(|i| (i, (estimates[i - 1].1 - estimates[i].1).abs()))
+    eprintln!("[2930-LADDER] j={j} rungs={:?}", estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>());
+    // [`derived_band`] bounds `|E(h)|` by `|Δ₁|` only under its premise `|E(2h)| ≥ 2·|E(h)|`. The
+    // ladder shows that premise at rung `i` as the preceding disagreement being at least twice this
+    // one with the same sign, `Δ(2h)/Δ(h) ≥ 2` (4 in the asymptotic range). A rung where evaluation
+    // noise cancels the truncation term breaks that ratio while its `|Δ₁|` is the smallest on the
+    // ladder, so the smallest disagreement is chosen only among rungs that exhibit the premise.
+    let disagreement = |i: usize| estimates[i - 1].1 - estimates[i].1;
+    let (index, settle) = (2..estimates.len())
+        .filter(|&i| disagreement(i - 1) / disagreement(i) >= 2.0)
+        .map(|i| (i, disagreement(i).abs()))
         .min_by(|left, right| left.1.total_cmp(&right.1))
-        .expect("the ladder has six rungs");
+        .ok_or_else(|| {
+            format!(
+                "coordinate {j}: no rung of the ladder shows the halving premise Δ(2h)/Δ(h) ≥ 2: {:?}",
+                estimates.iter().map(|e| (e.0, e.1)).collect::<Vec<_>>()
+            )
+        })?;
     let delta_1 = estimates[index - 1].1 - estimates[index].1;
     let magnitude = estimates[index - 1..=index]
         .iter()

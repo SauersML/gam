@@ -845,6 +845,7 @@ pub fn survival_fit_from_parts(
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,
@@ -902,6 +903,7 @@ pub fn survival_fit_from_parts(
             // seam, so it never withholds a covariance it could have published.
             covariance_declined: None,
             jeffreys_arming_evidence: None,
+            improper_penalty_null_posterior: None,
             // Assembled outside the custom-family outer search, so it records no
             // point `warm_start_from` could resume.
             outer_warm_start: None,

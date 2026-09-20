@@ -1,6 +1,6 @@
 # GPU Acceleration
 
-CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed hardware absence (unsupported platform, no driver, or no device) selects CPU; a present-but-broken driver, missing runtime dependency, or initialization fault remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
+CUDA support is compiled into the crate through the normal `cudarc` dependency and dynamically probes the driver at runtime. GPU acceleration auto-enables: under the default `Auto` policy, `GpuRuntime::resolve(GpuPolicy::Auto)` lazily probes for a usable CUDA device and dispatches to it when present. Typed absence (unsupported platform, no driver, no device, or a CUDA runtime library such as cuBLAS with no candidate on the host, which is where a CPU-only install lands on a driver-only GPU machine) selects CPU; a present-but-broken driver or runtime library, or an initialization fault, remains an error and never masquerades as absence. The policy decides whether a probe is permitted; the probe finds the hardware.
 
 The runtime policy is set through `crate::gpu::configure_global_policy`:
 
@@ -67,7 +67,7 @@ that declaration before anything else, so an empirical latent law (global,
 local, or the conditional location-scale route that resolves to one) always
 takes the CPU row kernel under `gpu=auto`. Under `gpu=required` the fit is
 refused at entry, naming the missing capability. When
-`row_primary_hessian_decision(model, n).use_gpu` is true, the BMS row path
+`row_primary_hessian_decision(model).use_gpu` is true, the BMS row path
 packs per-row cell coefficient families, derivative moments, row scalars,
 and observed point terms into a structure-of-arrays bundle and launches
 the FLEX row kernel. The kernel runs one CUDA block per row, parallelises the per-cell
@@ -94,9 +94,20 @@ evidence logdet also checks the same runtime switch before CPU
 eigendecomposition. Arrow-Schur selects dense CUDA helpers for dense
 Direct/SqrtBA solves and the GPU Schur matvec hook for large matrix-free
 PCG systems. The BMS marginal-slope FLEX row-Hessian path consults
-`row_primary_hessian_decision(model, n)`, which selects the device kernel
+`row_primary_hessian_decision(model)`, which selects the device kernel
 only for a model the kernel declares. Once the device kernel is selected,
 a GPU error propagates under every policy and is never retried on the CPU.
+The survival marginal-slope rigid row jet takes the same decision,
+`decide_row_kernel`: it declares the four-primary Gaussian frame, so a
+follow-up-varying slope or a declared latent law runs the CPU row program
+under `gpu=auto` and is refused at fit entry under `gpu=required`. Neither
+row kernel has a measured CPU/GPU crossover of its own (#3024: on an A40 at
+n = 50,000, r = 20 the BMS FLEX device build takes 1.17 s against 0.63 s on
+8 CPU threads), so `gpu=auto` keeps both on the CPU with the reason
+`cpu-gpu-kernel-crossover-unmeasured`, and only `gpu=required` selects the
+device. The same holds for the SAE row jet and the Polya-Gamma batch. A
+decision probes the device only under `gpu=required`; a model outside the
+declaration, `gpu=off`, or `gpu=auto` never creates a CUDA context.
 
 ## Transfer And Precision Policy
 

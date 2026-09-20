@@ -437,14 +437,14 @@ SPEC classes: **C** cap, **F** fallback/retry, **M** magic constant, **B** box, 
 | `opt/src/lib.rs:6780-6800` | ARC tol 1e−5, max_iter 100, σ_min 1e−10, σ_max 1e12, subproblem_max_iterations 80, AutoBfgs, history_cap 12 | M, C | tolerances from bands; no caps; exact-Hessian mode mandatory for the outer path |
 | `opt/src/lib.rs:~903-960` | within_noise_floor → ρ = 1; RejectFloor radius clamp | M, F | Sun–Nocedal relaxed ratio plus audit |
 | `opt/src/lib.rs:7500-7560` | σ_max saturation | C | delete (CGT Lemma 5.2 bound) |
-| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | delete; Kantorovich terminal phase |
+| `newton_polish.rs:118-126`, `367-372` | "stopped contracting", SC budget | M (false premise) | "stopped contracting" **deleted**; the λ₊ ≤ 2λ² face-ordering test remains |
 | `run.rs:1683` | ArcUnprogressingStallCheckpoint | F | delete; audit plus face candidate |
 | `run.rs:14` | OPERATOR_TRUST_RESTART_RADIUS_FLOOR=1e−6 | M, F | delete |
 | `run.rs:3080` | MAX_EXPANSIONS=64 | C | delete |
 | `run.rs:4678` | GRADIENT_REPRODUCIBILITY_WIDENING=2 | M | band_g |
 | `run.rs:4937` | LARGE_STEP_DELTA=1 | M | delete |
 | `run.rs:5744`, `5757`, `5769` | ASYMPTOTE_* (rel tol 1e−4, 18 probes, δ 0.5) | M, D | delete; face certificate |
-| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | delete; exact f_w(0) with band_μ |
+| `run.rs:6037`, `6050`, `6154` | FACE_LAW_* (slack 4, order band 0.5, margin 1e−6) | M | **deleted**: the analytic face proof mints rails with no value probe |
 | `run.rs:6417` | TAIL_SNAP_DRIFT_REL=1e−2 | M | delete |
 | `run.rs:6833`, `7114` | PROBE_DELTA=1.0 (FD tail probe) | D (SPEC violation) | delete |
 | `run.rs:6969` | PROBE_DOMAIN_MARGIN=1e−6 | M | delete |

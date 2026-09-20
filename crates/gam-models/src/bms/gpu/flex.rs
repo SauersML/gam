@@ -3,7 +3,9 @@
 use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
-use gam_gpu::{GpuDecision, GpuEligibility, GpuKernel, decide};
+use gam_gpu::{
+    GpuDecision, GpuKernel, RowKernelAdmission, RuntimeDeviceProbe, decide_row_kernel,
+};
 
 use crate::bms::LatentIntegral;
 
@@ -65,22 +67,24 @@ impl BmsFlexRowKernelCapability {
     }
 }
 
-/// Decide which kernel builds the row-primary Hessian for `model`. The device
-/// kernel is eligible only for a model it declares, then only when compiled
-/// in. No CPU/GPU crossover has been measured for this kernel (#3024), so no
-/// row count is known to favor the device: `auto` keeps the CPU kernel without
-/// probing, and `required` runs the device kernel at any size.
+/// Decide which kernel builds the row-primary Hessian for `model`, through
+/// the one row-kernel decision: the device kernel is eligible only for a model
+/// it declares, then only when compiled in. Its CPU/GPU crossover is
+/// unmeasured (#3024: on an A40 at n = 50,000, r = 20 the device build takes
+/// 1.17 s against 0.63 s on 8 CPU threads), so `auto` keeps the CPU row kernel
+/// and only `required` selects the device.
 pub(crate) fn row_primary_hessian_decision(
     model: &BmsFlexRowModel,
 ) -> Result<GpuDecision, GpuError> {
-    let eligibility = if let Some(missing) = BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model) {
-        GpuEligibility::CapabilityMissing { missing }
-    } else if !BmsFlexGpuBackend::compiled() {
-        GpuEligibility::BackendNotCompiled
-    } else {
-        GpuEligibility::CrossoverUnmeasured
-    };
-    decide(GpuKernel::MarginalSlopeRows, eligibility)
+    decide_row_kernel(
+        gam_gpu::global_policy(),
+        RowKernelAdmission {
+            kernel: GpuKernel::MarginalSlopeRows,
+            missing_capability: BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model),
+            compiled: BmsFlexGpuBackend::compiled(),
+        },
+        &mut RuntimeDeviceProbe,
+    )
 }
 
 /// Same as [`row_primary_hessian_decision`] but turns `gpu=required` for a
@@ -226,10 +230,10 @@ mod bms_flex_gpu_tests {
                 .expect("GPU policy resolution must be lossless");
         assert_eq!(decision.kernel, GpuKernel::MarginalSlopeRows);
         assert_eq!(decision.missing_capability, None);
-        // #3024: no crossover is measured for this kernel, so `auto` keeps the
-        // CPU kernel on every host.
-        if gam_gpu::global_policy() == gam_gpu::GpuPolicy::Auto {
+        if decision.policy == gam_gpu::GpuPolicy::Auto {
+            // #3024: no measured crossover, so auto keeps the CPU row kernel.
             assert!(!decision.use_gpu, "{decision:?}");
+            assert_eq!(decision.reason, "cpu-gpu-kernel-crossover-unmeasured");
         }
     }
 

@@ -87,6 +87,14 @@ pub struct PenaltyLogdetDerivs {
 pub struct PenaltySubspaceTrace {
     pub u_s: Array2<f64>,
     pub h_proj_inverse: Array2<f64>,
+    /// The eigenpairs of the priced precision this kernel drops, from the same
+    /// eigendecomposition as `u_s`: an orthonormal `p × d` basis and its `d`
+    /// eigenvalues. `K = M⁺` is a spectral function of `M`, so its derivative
+    /// couples every kept eigenpair to every dropped one (see
+    /// [`Self::pseudo_inverse_rotation`]); a kernel that keeps every eigenpair
+    /// carries `d = 0`.
+    pub dropped_basis: Array2<f64>,
+    pub dropped_eigenvalues: Array1<f64>,
     /// The additive scalar that turns the operator's own `logdet()` into the
     /// pseudo-log-determinant THIS kernel is the derivative kernel of (#2765).
     ///
@@ -123,6 +131,248 @@ impl PenaltySubspaceTrace {
         } else {
             operator_bound
         }
+    }
+}
+
+/// The kept–dropped part of the Fréchet derivative of a kept-spectrum
+/// pseudo-inverse along one precision drift, `L·U_Dᵀ + U_D·Lᵀ` (see
+/// [`PenaltySubspaceTrace::pseudo_inverse_rotation`]).
+#[derive(Clone, Debug)]
+pub struct PseudoInverseRotation<'a> {
+    left: Array2<f64>,
+    dropped_basis: &'a Array2<f64>,
+}
+
+impl PseudoInverseRotation<'_> {
+    /// The rotation applied to `v`.
+    pub fn apply(&self, v: &Array1<f64>) -> Array1<f64> {
+        self.left.dot(&self.dropped_basis.t().dot(v)) + self.dropped_basis.dot(&self.left.t().dot(v))
+    }
+
+    /// The rotation applied to every column of `v`.
+    pub fn apply_columns(&self, v: &Array2<f64>) -> Array2<f64> {
+        self.left.dot(&self.dropped_basis.t().dot(v)) + self.dropped_basis.dot(&self.left.t().dot(v))
+    }
+}
+
+impl PenaltySubspaceTrace {
+    /// The part of `D(M⁺)[Ṁ]` that `−K·Ṁ·K` omits, given `Ṁ·U_D`.
+    ///
+    /// `K = U_K Σ_K⁻¹ U_Kᵀ` is the spectral function `f(M)` with `f(σ) = 1/σ` on the kept
+    /// eigenpairs and `0` on the dropped ones. On a stratum where the kept set is fixed its
+    /// derivative is the Daleckii–Krein form `U (F ∘ UᵀṀU) Uᵀ` with the divided differences
+    /// `F_ij = (f(σ_i) − f(σ_j))/(σ_i − σ_j)`: `−1/(σ_iσ_j)` between two kept eigenpairs, which is
+    /// `−K·Ṁ·K`, `1/(σ_i(σ_i − σ_j))` between kept `i` and dropped `j`, and `0` between two dropped
+    /// ones. The kept–dropped block is this rotation, `L·U_Dᵀ + U_D·Lᵀ` with
+    /// `L = U_K (F ∘ U_KᵀṀU_D)`. It vanishes when the kernel drops nothing, and is not small
+    /// when a dropped eigenvalue is: an indefinite precision's negative eigenvalue enters
+    /// through `σ_i − σ_j` (gam#2952).
+    pub fn pseudo_inverse_rotation(
+        &self,
+        rate_on_dropped: &Array2<f64>,
+    ) -> Result<PseudoInverseRotation<'_>, String> {
+        let (p, _) = self.u_s.dim();
+        if rate_on_dropped.dim() != (p, self.dropped_eigenvalues.len()) {
+            return Err(format!(
+                "pseudo-inverse rotation: the drift on the dropped basis is {:?}, expected ({p}, {})",
+                rate_on_dropped.dim(),
+                self.dropped_eigenvalues.len()
+            ));
+        }
+        let coupling = self.u_s.t().dot(rate_on_dropped) * &self.kept_dropped_divided_differences()?;
+        Ok(PseudoInverseRotation {
+            left: self.u_s.dot(&coupling),
+            dropped_basis: &self.dropped_basis,
+        })
+    }
+
+    /// The part of the second derivative of `K = M⁺` along two drifts `Ė`, `Ġ` and their pair
+    /// drift `M̈` that the inverse identities omit, applied to every column of `vectors`:
+    /// `(D²K[Ė, Ġ] − K Ė K Ġ K − K Ġ K Ė K) v + (D K[M̈] + K M̈ K) v`.
+    ///
+    /// The second Daleckii–Krein form is `D²K[Ė, Ġ]_ab = Σ_c f[a,c,b] (Ė_ac Ġ_cb + Ġ_ac Ė_cb)` in
+    /// `M`'s eigenbasis, with the second divided differences of `f(σ) = 1/σ` kept and `0` dropped:
+    /// `1/(σ_aσ_cσ_b)` when all three are kept (the inverse's `K Ė K Ġ K + K Ġ K Ė K`),
+    /// `−(σ_a + σ_c − σ_j)/(σ_aσ_c(σ_a − σ_j)(σ_c − σ_j))` for two kept `a, c` and one dropped `j`,
+    /// `1/(σ_a(σ_a − σ_j)(σ_a − σ_l))` for one kept `a` and two dropped `j, l`, and `0` when all
+    /// three are dropped. Every term with a dropped index reads a kept–dropped or dropped–dropped
+    /// block of a drift, from `Ė·U_D` and `Ġ·U_D`, or a kept–kept block against one of `2d`
+    /// vectors per drift that do not depend on `vectors`. `D K[M̈] + K M̈ K` is the first-order
+    /// rotation of the pair drift, from `M̈·U_D` (gam#2952).
+    pub fn pseudo_inverse_second_rotation(
+        &self,
+        apply_e: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        apply_g: &dyn Fn(&Array1<f64>) -> Array1<f64>,
+        e_on_dropped: &Array2<f64>,
+        g_on_dropped: &Array2<f64>,
+        second_on_dropped: &Array2<f64>,
+        vectors: &Array2<f64>,
+    ) -> Result<Array2<f64>, String> {
+        let phi = self.kept_dropped_divided_differences()?;
+        let (p, r) = self.u_s.dim();
+        let d = self.dropped_eigenvalues.len();
+        let m = vectors.ncols();
+        for (what, block) in [("E", e_on_dropped), ("G", g_on_dropped), ("pair", second_on_dropped)] {
+            if block.dim() != (p, d) {
+                return Err(format!(
+                    "pseudo-inverse second rotation: the {what} drift on the dropped basis is {:?}, \
+                     expected ({p}, {d})",
+                    block.dim()
+                ));
+            }
+        }
+        if vectors.nrows() != p {
+            return Err(format!(
+                "pseudo-inverse second rotation: {} rows of vectors against p = {p}",
+                vectors.nrows()
+            ));
+        }
+        let mut out = self.pseudo_inverse_rotation(second_on_dropped)?.apply_columns(vectors);
+        if d == 0 {
+            return Ok(out);
+        }
+        let kept: Array1<f64> = (0..r).map(|i| 1.0 / self.h_proj_inverse[[i, i]]).collect();
+        let psi = Array2::from_shape_fn((r, d), |(i, j)| 1.0 / (kept[i] - self.dropped_eigenvalues[j]));
+        let v_kept = self.u_s.t().dot(vectors);
+        let v_dropped = self.dropped_basis.t().dot(vectors);
+        let mut alpha = Array2::<f64>::zeros((r, m));
+        let mut delta = Array2::<f64>::zeros((d, m));
+        // `(x, y)` runs over `(Ė, Ġ)` and `(Ġ, Ė)`: the two orderings of `Ė_ac Ġ_cb + Ġ_ac Ė_cb`.
+        let orderings: [(&dyn Fn(&Array1<f64>) -> Array1<f64>, &Array2<f64>, &dyn Fn(&Array1<f64>) -> Array1<f64>, &Array2<f64>); 2] = [
+            (apply_e, e_on_dropped, apply_g, g_on_dropped),
+            (apply_g, g_on_dropped, apply_e, e_on_dropped),
+        ];
+        // `U_Kᵀ X U_K w`, the kept–kept block of a drift against `w`.
+        let kept_block = |apply: &dyn Fn(&Array1<f64>) -> Array1<f64>, w: &Array1<f64>| {
+            self.u_s.t().dot(&apply(&self.u_s.dot(w)))
+        };
+        for (apply_x, x_on_dropped, apply_y, y_on_dropped) in orderings {
+            let x_kd = self.u_s.t().dot(x_on_dropped);
+            let x_dd = self.dropped_basis.t().dot(x_on_dropped);
+            let y_kd = self.u_s.t().dot(y_on_dropped);
+            let y_dd = self.dropped_basis.t().dot(y_on_dropped);
+            for j in 0..d {
+                let (phi_j, psi_j) = (phi.column(j).to_owned(), psi.column(j).to_owned());
+                // a, c kept, b = j dropped: Σ_c f[a,c,j] X_ac Y_cj v̂_j, with
+                // f[a,c,j] = −(1/σ_a)φ_cj − φ_aj ψ_cj.
+                let x_phi = kept_block(apply_x, &(&y_kd.column(j) * &phi_j));
+                let x_psi = kept_block(apply_x, &(&y_kd.column(j) * &psi_j));
+                let first = (&x_phi / &kept).mapv(|value| -value) - &(&x_psi * &phi_j);
+                for column in 0..m {
+                    alpha.column_mut(column).scaled_add(v_dropped[[j, column]], &first);
+                }
+                // a = j dropped, c, b kept: Σ_{c,b} f[c,b,j] X_jc Y_cb v̂_b, with
+                // f[c,b,j] = −(1/σ_c)φ_bj − φ_cj ψ_bj; Y is symmetric, so it is applied to the
+                // X-side vectors, which do not depend on the columns.
+                let y_over = kept_block(apply_y, &(&x_kd.column(j) / &kept));
+                let y_phi = kept_block(apply_y, &(&x_kd.column(j) * &phi_j));
+                for column in 0..m {
+                    let v = v_kept.column(column);
+                    let value: f64 = (0..r)
+                        .map(|c| -y_over[c] * phi_j[c] * v[c] - y_phi[c] * psi_j[c] * v[c])
+                        .sum();
+                    delta[[j, column]] += value;
+                }
+            }
+            let phi_x = &phi * &x_kd;
+            let psi_y = &psi * &y_kd;
+            // a, b kept, c dropped: f[a,b,c] = −(1/σ_a)φ_bc − φ_ac ψ_bc.
+            let s1 = (&phi * &y_kd).t().dot(&v_kept);
+            let s2 = psi_y.t().dot(&v_kept);
+            let mut middle = x_kd.dot(&s1);
+            for (a, mut row) in middle.rows_mut().into_iter().enumerate() {
+                row.mapv_inplace(|value| -value / kept[a]);
+            }
+            alpha += &(middle - phi_x.dot(&s2));
+            // a kept, c and b dropped: f[a,c,b] = φ_ac ψ_ab.
+            alpha += &((phi_x.dot(&y_dd) * &psi).dot(&v_dropped));
+            // a dropped, c kept, b dropped: f[a,c,b] = φ_ca ψ_cb.
+            delta += &phi_x.t().dot(&psi_y).dot(&v_dropped);
+            // a dropped, c dropped, b kept: f[a,c,b] = φ_ba ψ_bc.
+            for a in 0..d {
+                for c in 0..d {
+                    let weights = &phi.column(a) * &psi_y.column(c);
+                    let moved = weights.dot(&v_kept);
+                    delta.row_mut(a).scaled_add(x_dd[[a, c]], &moved);
+                }
+            }
+        }
+        out += &self.u_s.dot(&alpha);
+        out += &self.dropped_basis.dot(&delta);
+        Ok(out)
+    }
+
+    /// `F_ij = 1/(σ_i(σ_i − σ_j))` for kept `i` and dropped `j`: the divided difference of
+    /// `f(σ) = 1/σ` on the kept side and `0` on the dropped side, `r × d`.
+    fn kept_dropped_divided_differences(&self) -> Result<Array2<f64>, String> {
+        let (p, r) = self.u_s.dim();
+        let d = self.dropped_eigenvalues.len();
+        if self.dropped_basis.dim() != (p, d) || self.h_proj_inverse.dim() != (r, r) {
+            return Err(format!(
+                "kept-dropped divided differences: dropped basis {:?} and reduced kernel {:?} \
+                 against p = {p}, r = {r}, d = {d}",
+                self.dropped_basis.dim(),
+                self.h_proj_inverse.dim()
+            ));
+        }
+        if d > 0
+            && (0..r).any(|i| (0..r).any(|j| i != j && self.h_proj_inverse[[i, j]] != 0.0))
+        {
+            return Err("kept-dropped divided differences need the spectral kernel diag(1/σ)".to_string());
+        }
+        Ok(Array2::from_shape_fn((r, d), |(i, j)| {
+            let kept = 1.0 / self.h_proj_inverse[[i, i]];
+            1.0 / (kept * (kept - self.dropped_eigenvalues[j]))
+        }))
+    }
+
+    /// The cross term of the exact second derivative of `log|M|₊` along two drifts, from their
+    /// kept blocks `R = U_KᵀḢU_K` and kept–dropped blocks `B = U_KᵀḢU_D`:
+    /// `−tr(K Ḣ_i K Ḣ_j) + 2 Σ F_ab B_i,ab B_j,ab`.
+    ///
+    /// `∂_j log|M|₊ = tr(K Ḣ_j)` is exact on a stratum, and its derivative along `i` reads
+    /// `D(M⁺)[Ḣ_i] = −K Ḣ_i K + L U_Dᵀ + U_D Lᵀ` ([`Self::pseudo_inverse_rotation`]). The rotation
+    /// contributes `tr((L U_Dᵀ + U_D Lᵀ) Ḣ_j) = 2 Σ F ∘ B_i ∘ B_j`, which a kernel that drops a
+    /// nonzero eigenvalue cannot leave out (gam#2952).
+    pub(crate) fn pseudo_logdet_cross(
+        &self,
+        reduced_i: &Array2<f64>,
+        reduced_j: &Array2<f64>,
+        coupled_i: &Array2<f64>,
+        coupled_j: &Array2<f64>,
+    ) -> Result<f64, String> {
+        let divided = self.kept_dropped_divided_differences()?;
+        if coupled_i.dim() != divided.dim() || coupled_j.dim() != divided.dim() {
+            return Err(format!(
+                "pseudo-logdet cross: kept-dropped blocks {:?} and {:?} against {:?}",
+                coupled_i.dim(),
+                coupled_j.dim(),
+                divided.dim()
+            ));
+        }
+        let kept = -self.trace_projected_logdet_cross_reduced(reduced_i, reduced_j);
+        if divided.is_empty() {
+            return Ok(kept);
+        }
+        let rotation: f64 = divided
+            .iter()
+            .zip(coupled_i.iter().zip(coupled_j.iter()))
+            .map(|(f, (bi, bj))| f * bi * bj)
+            .sum();
+        Ok(kept + 2.0 * rotation)
+    }
+
+    /// `U_Kᵀ · A · U_D` for a dense `A`: the kept–dropped block [`Self::pseudo_logdet_cross`] reads.
+    pub fn couple_dropped(&self, a: &Array2<f64>) -> Array2<f64> {
+        gam_linalg::faer_ndarray::fast_atb(&self.u_s, &gam_linalg::faer_ndarray::fast_ab(a, &self.dropped_basis))
+    }
+
+    /// `U_Kᵀ · A · U_D` for `A` exposed only as a `HyperOperator`.
+    pub(crate) fn couple_dropped_operator<O>(&self, a: &O) -> Array2<f64>
+    where
+        O: HyperOperator + ?Sized,
+    {
+        gam_linalg::faer_ndarray::fast_atb(&self.u_s, &a.mul_mat(&self.dropped_basis))
     }
 }
 

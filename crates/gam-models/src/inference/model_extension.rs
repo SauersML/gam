@@ -514,6 +514,14 @@ fn insert_coefficient_into_saved_fit(
         if let Some(se) = inference.factorized_standard_errors.as_mut() {
             *se = insert_array1(se, index, variance_diag.sqrt());
         }
+        // The new coordinate carries no smoothing-parameter uncertainty, so the
+        // factorized correction `C = B·Bᵀ` gains a zero row in `B` and its
+        // corrected variance is the prior variance (#3283).
+        if let Some(factorized) = inference.smoothing_correction_factorized.as_mut() {
+            factorized.factor = insert_zero_row(&factorized.factor, index)?;
+            factorized.standard_errors =
+                insert_array1(&factorized.standard_errors, index, variance_diag.sqrt());
+        }
         if let Some(cov) = inference.beta_covariance_frequentist.as_mut() {
             *cov = insert_symmetric_array2(cov, index, 0.0)?;
         }
@@ -547,6 +555,21 @@ fn insert_array1(values: &Array1<f64>, index: usize, value: f64) -> Array1<f64> 
     out.push(value);
     out.extend(values.iter().skip(index).copied());
     Array1::from_vec(out)
+}
+
+fn insert_zero_row(matrix: &Array2<f64>, index: usize) -> Result<Array2<f64>, String> {
+    if index > matrix.nrows() {
+        return Err(format!(
+            "extend_with_group factor insert index {index} exceeds its {} rows",
+            matrix.nrows()
+        ));
+    }
+    let mut out = Array2::<f64>::zeros((matrix.nrows() + 1, matrix.ncols()));
+    for (old_i, row) in matrix.rows().into_iter().enumerate() {
+        let new_i = if old_i < index { old_i } else { old_i + 1 };
+        out.row_mut(new_i).assign(&row);
+    }
+    Ok(out)
 }
 
 fn insert_symmetric_array2(

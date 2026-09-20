@@ -454,13 +454,16 @@ fn preload_cuda_userspace_libraries() -> Result<(), String> {
 /// `libcuda.so.1` but no cuBLAS at all), those calls panic out of the
 /// PyO3 FFI boundary instead of returning a typed error.
 ///
-/// `GpuRuntime::probe()` calls this for every compute library it depends on.
-/// No candidate opening is [`GpuError::DriverLibraryUnavailable`] (the host
-/// ships no such library: typed absence to the probe); a candidate that exists
-/// but fails to load, or a userspace stack that cannot be preloaded, is a
-/// fault of a present installation. What keeps cudarc's loader panic off the
-/// call path is the probe's separate walk over cudarc's own names
-/// (`require_cudarc_library`).
+/// `GpuRuntime::probe()` calls this for every compute library it depends on;
+/// failure retains the exact stack-selection or loader error in the typed GPU
+/// refusal. What keeps cudarc's loader panic off the call path is the probe's
+/// separate walk over cudarc's own names (`require_cudarc_library`).
+///
+/// The loader's verdict is kept typed: `DriverLibraryUnavailable` when no
+/// candidate exists, `DriverLibraryLoadFailed` when one exists and does not
+/// load, and `RuntimeDependencyUnavailable` when a stack the host carries
+/// does not preload. The probe reads the first as absence and the rest as
+/// faults (#3000).
 pub fn require_cuda_compute_library(stem: &str) -> Result<(), GpuError> {
     // Cache the probe per stem and KEEP the loaded handle alive for the process
     // lifetime. Dropping the `Library` here dlclose's it; that dlopen+dlclose
@@ -482,18 +485,15 @@ pub fn require_cuda_compute_library(stem: &str) -> Result<(), GpuError> {
     #[cfg(target_os = "linux")]
     preload_cuda_userspace_libraries()
         .map_err(|reason| GpuError::RuntimeDependencyUnavailable { reason })?;
-    let outcome = match load_library_names(&cuda_compute_library_candidate_names(stem)) {
-        Ok(library) => {
+    let outcome =
+        load_library_names(&cuda_compute_library_candidate_names(stem)).map(|library| {
             if let Ok(mut keep) = KEEP_ALIVE
                 .get_or_init(|| std::sync::Mutex::new(Vec::new()))
                 .lock()
             {
                 keep.push(library);
             }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    };
+        });
     if let Ok(mut cache) = probed.lock() {
         cache.insert(stem.to_string(), outcome.clone());
     }

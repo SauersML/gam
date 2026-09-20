@@ -138,11 +138,29 @@ use std::path::Path;
 // carries `step_budget`, which this binary reads past, and one written after it carries
 // `settled`. Both load, and `settled` reads as false where it is absent. A v29 binary
 // refuses a v30 payload by version instead of failing on the missing `step_budget`.
-pub const MODEL_PAYLOAD_VERSION: u32 = 30;
+// v31 records the Gaussian location-scale σ floor (`gaussian_sigma_floor`): the recording-grid
+// bound δ/√12 of the standardized response, which replaced the fixed floor 0.01. The field carries
+// a serde default so every other family's older payload reads through; a Gaussian location-scale
+// payload without it was fitted under the old floor, and the saved-fit validator refuses it by name.
+// v32 records each moving-law arm's Gaussian-residual adequacy screen
+// (`MovingLawArmScore::adequacy`, gam#2926): an arm whose residual the screen rejects is
+// scored but not a candidate. It carries a serde default, so an older payload loads with no
+// screen, which reads as the rule it was chosen by, where every arm was a candidate; a v31
+// binary refuses a v32 payload by version.
+pub const MODEL_PAYLOAD_VERSION: u32 = 32;
+
+/// The schema before the moving-law arms' adequacy screens (gam#2926), whose only
+/// difference is that field's absence.
+const MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION: u32 = 31;
+
+/// The schema before the Gaussian location-scale σ floor record, whose only difference
+/// from [`MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION`] is that field's absence.
+const SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION: u32 = 30;
 
 /// The schema whose Newton-polish record may carry its step budget (#2954), or already
 /// its settling flag (#3012, from 996d0af2c1 on; gam#3166). Its only difference from
-/// [`MODEL_PAYLOAD_VERSION`] is that record's `step_budget`, which this binary reads past.
+/// [`SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION`] is that record's `step_budget`, which
+/// this binary reads past.
 const POLISH_STEP_BUDGET_PAYLOAD_VERSION: u32 = 29;
 
 /// The schema before the saved model stopped persisting training rows (speed F6), whose
@@ -200,8 +218,10 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 13] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 15] = [
     MODEL_PAYLOAD_VERSION,
+    MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+    SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
     POLISH_STEP_BUDGET_PAYLOAD_VERSION,
     TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
     WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
@@ -404,6 +424,36 @@ impl_reason_error_boilerplate! {
         MissingField,
         IncompatibleConfig,
         InvalidInput,
+    }
+}
+
+impl FittedModelError {
+    /// Who has to act on a saved model this binary refuses: the one category
+    /// every front end classifies it by. Each variant refuses the saved
+    /// payload's own contents (its schema, bytes, fields, options or values),
+    /// so each is a data refusal, remedied by refitting or re-saving the model
+    /// (gam#3008). Exhaustive with no wildcard arm.
+    #[must_use]
+    pub fn error_category(&self) -> gam_problem::ErrorCategory {
+        match self {
+            Self::SchemaMismatch { .. }
+            | Self::PayloadCorrupt { .. }
+            | Self::MissingField { .. }
+            | Self::IncompatibleConfig { .. }
+            | Self::InvalidInput { .. } => gam_problem::ErrorCategory::Data,
+        }
+    }
+
+    /// The `Enum::Variant` name a front end reports beside the category.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "FittedModelError::SchemaMismatch",
+            Self::PayloadCorrupt { .. } => "FittedModelError::PayloadCorrupt",
+            Self::MissingField { .. } => "FittedModelError::MissingField",
+            Self::IncompatibleConfig { .. } => "FittedModelError::IncompatibleConfig",
+            Self::InvalidInput { .. } => "FittedModelError::InvalidInput",
+        }
     }
 }
 
@@ -648,13 +698,18 @@ pub struct FittedModelPayload {
     pub noise_scale: Option<Vec<f64>>,
     #[serde(default)]
     pub noise_non_intercept_start: Option<usize>,
-    /// Tikhonov ridge alpha used by `solve_scale_projection` when fitting
-    /// `noise_projection`.  Persisted so prediction-time replay is identical
-    /// to fit-time projection.
+    /// The squared SVD cutoff a saved `noise_projection` was fitted with, by the
+    /// transform-fitting route #3015 retired. Persisted so a saved model's replay
+    /// reads exactly what it wrote.
     #[serde(default)]
     pub noise_projection_ridge_alpha: Option<f64>,
     #[serde(default)]
     pub gaussian_response_scale: Option<f64>,
+    /// Gaussian location-scale σ floor `b` of σ = b + exp(η) in standardized response
+    /// units (`sigma_link::gaussian_resolution_sigma_floor`); the raw-unit floor is
+    /// `gaussian_response_scale · gaussian_sigma_floor`. Required for that family.
+    #[serde(default)]
+    pub gaussian_sigma_floor: Option<f64>,
     #[serde(default)]
     pub linkwiggle_knots: Option<Vec<f64>>,
     #[serde(default)]
@@ -1099,6 +1154,7 @@ impl FittedModelPayload {
             noise_non_intercept_start: None,
             noise_projection_ridge_alpha: None,
             gaussian_response_scale: None,
+            gaussian_sigma_floor: None,
             linkwiggle_knots: None,
             linkwiggle_degree: None,
             linkwiggle_penalty_metadata: None,
@@ -1709,6 +1765,29 @@ fn validate_location_scale_saved_fit(
         });
     }
     Ok(())
+}
+
+/// The saved σ floor of a Gaussian location-scale model, in standardized response
+/// units. A payload without one was fitted before the floor became a property of
+/// the data (payload version 28) and predicts through a link this binary no longer
+/// has, so it is refused by name rather than read under any substitute floor.
+pub fn gaussian_location_scale_saved_sigma_floor(
+    payload: &FittedModelPayload,
+) -> Result<f64, FittedModelError> {
+    match payload.gaussian_sigma_floor {
+        Some(floor) if floor.is_finite() && floor > 0.0 => Ok(floor),
+        Some(floor) => Err(FittedModelError::SchemaMismatch {
+            reason: format!(
+                "gaussian-location-scale gaussian_sigma_floor must be finite and positive, got {floor}"
+            ),
+        }),
+        None => Err(FittedModelError::MissingField {
+            reason: "gaussian-location-scale model is missing gaussian_sigma_floor: it was saved \
+                     before payload version 30, when σ = b + exp(η) used a fixed floor b instead \
+                     of the response's recording-grid bound. Refit with the current version."
+                .to_string(),
+        }),
+    }
 }
 
 fn validate_survival_saved_block_matches_payload(
@@ -2399,10 +2478,19 @@ impl SavedLinkWiggleRuntime {
                 ),
             });
         }
+        Ok(base + &self.contribution(warp_index)?)
+    }
+
+    /// The wiggle's share `B(warp_index)·β` of the link, certified monotone at
+    /// `warp_index`. This is the one evaluation of that share:
+    /// [`Self::apply_with_index`] adds it to the base predictor, and a Gaussian
+    /// location-scale fit publishes it as its wiggle block's state, so the saved
+    /// model reproduces the fit's own mean bit for bit (#3001).
+    pub fn contribution(&self, warp_index: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
         self.validate_monotone_derivative(warp_index)?;
         let xwiggle = self.constrained_basis(warp_index, BasisOptions::value())?;
         let beta_link_wiggle = Array1::from_vec(self.beta.clone());
-        Ok(base + &xwiggle.dot(&beta_link_wiggle))
+        Ok(xwiggle.dot(&beta_link_wiggle))
     }
 
     pub fn derivative_q0(&self, q0: &Array1<f64>) -> Result<Array1<f64>, FittedModelError> {
@@ -3881,6 +3969,37 @@ impl FittedModel {
         Ok(required)
     }
 
+    /// Columns [`Self::latent_conditional_residual`] reads: the prediction
+    /// columns less a survival response's time columns, since ζ is a function
+    /// of the score and the conditioning covariates alone (gam#3016). A time
+    /// column the formula also names as a covariate stays. The CLI and PyFFI
+    /// residual commands project their frames onto this one set.
+    pub fn latent_conditional_residual_columns(
+        &self,
+    ) -> Result<std::collections::BTreeSet<String>, String> {
+        let mut required = self.prediction_required_columns()?;
+        let parsed = parse_formula(self.payload().formula.as_str()).map_err(|e| e.to_string())?;
+        let mut covariates = std::collections::BTreeSet::<String>::new();
+        parsed_term_column_names(&parsed.terms, &mut covariates);
+        let mut time_columns = Vec::new();
+        if let Some((entry, exit, _event)) =
+            parse_surv_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend(entry);
+            time_columns.push(exit);
+        } else if let Some((left, right, _event)) =
+            parse_surv_interval_response(parsed.response.as_str()).map_err(|e| e.to_string())?
+        {
+            time_columns.extend([left, right]);
+        }
+        for column in time_columns {
+            if !covariates.contains(&column) {
+                required.remove(&column);
+            }
+        }
+        Ok(required)
+    }
+
     /// Columns a *post-fit diagnostic* command (diagnose / sample / report)
     /// needs **beyond** [`Self::prediction_required_columns`].
     ///
@@ -4336,6 +4455,9 @@ impl FittedModel {
                 runtime.model_class,
                 runtime.link_wiggle.as_ref(),
             )?;
+            if matches!(runtime.model_class, PredictModelClass::GaussianLocationScale) {
+                gaussian_location_scale_saved_sigma_floor(self.payload())?;
+            }
         } else if matches!(runtime.model_class, PredictModelClass::Survival)
             && self
                 .payload()
@@ -5215,9 +5337,9 @@ impl FittedModel {
     /// end refuse the level before the design operator
     /// (`build_random_effect_block`) is reached.
     ///
-    /// Only terms with concrete `frozen_levels` (captured at fit) and the full
-    /// one-hot block (`!drop_first_level`, so the frozen set is the complete
-    /// training vocabulary) are checked, matching the operator's strict gate.
+    /// Only strict terms with concrete `frozen_levels` (captured at fit, the
+    /// complete training vocabulary) are checked, matching the operator's
+    /// strict gate.
     pub fn unseen_numeric_factor_levels(
         &self,
         headers: &[String],
@@ -5232,7 +5354,7 @@ impl FittedModel {
         let mut out = Vec::new();
         for spec in self.saved_term_specs() {
             for term in &spec.random_effect_terms {
-                if term.lenient_unseen || term.drop_first_level {
+                if term.lenient_unseen {
                     continue;
                 }
                 let Some(levels) = term.frozen_levels.as_ref() else {
@@ -6091,6 +6213,17 @@ impl FittedModel {
                 ),
             });
         }
+        // A converged constrained fit whose posterior moments were declined is
+        // persisted as its optimizer mode under that typed decline (#979 ruling
+        // (c)): the decline is the saved statement of why no posterior mean
+        // exists, and every posterior-mean consumer refuses by it through
+        // `require_posterior_mean`. The penalized precision of such a fit is
+        // not positive definite by construction — that is what was declined —
+        // so factoring it here would only re-derive the decline as an untyped
+        // "corrupt payload" and lose the certified fit (gam#3008).
+        if fit.posterior_moment_decline().is_some() {
+            return Ok(());
+        }
 
         if fit
             .geometry
@@ -6234,6 +6367,9 @@ impl FittedModel {
         }
         if let Some(v) = self.gaussian_response_scale {
             ensure_finite_scalar("gaussian_response_scale", v).map_err(corrupt)?;
+        }
+        if let Some(v) = self.gaussian_sigma_floor {
+            ensure_finite_scalar("gaussian_sigma_floor", v).map_err(corrupt)?;
         }
         if let Some(v) = self.beta_link_wiggle.as_ref() {
             validate_all_finite("beta_link_wiggle", v.iter().copied()).map_err(corrupt)?;
@@ -6889,6 +7025,7 @@ mod tests {
                 firth_bias_reduction: false,
                 covariance_declined: None,
                 jeffreys_arming_evidence: None,
+                improper_penalty_null_posterior: None,
                 outer_warm_start: None,
                 coefficient_mode_selection:
                     gam_solve::model_types::CoefficientModeSelection::NotRecorded,
@@ -7084,6 +7221,62 @@ mod tests {
             .expect_err("active-frame precision cannot be paired with raw prediction rows");
         assert!(error.to_string().contains("active gauge"));
         assert!(error.to_string().contains("lifted"));
+    }
+
+    /// gam#3008: a curved-link fit that converged on a constraint boundary and
+    /// declined its posterior moments (indefinite precision) persists as its
+    /// mode under the typed decline. Save/load validation accepts it, and the
+    /// posterior-mean refusal is the decline's own reason, never a strict
+    /// Cholesky of the declined precision reported as a corrupt payload.
+    #[test]
+    fn curved_link_persistence_keeps_a_declined_boundary_mode_3008() {
+        use gam_solve::constrained_posterior::{
+            ConePosteriorMomentDecline, ConePropernessEvidence, ConstrainedPosteriorGeometry,
+        };
+        let mut fit = saved_fit(vec![FittedBlock {
+            beta: array![0.0, 0.5],
+            role: BlockRole::Mean,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        }]);
+        fit.covariance_conditional = None;
+        fit.covariance_corrected = None;
+        fit.geometry = Some(gam_solve::estimate::FitGeometry {
+            coefficient_gauge: gam_problem::gauge::Gauge::identity(&[2]),
+            penalized_hessian: array![[1.0, 0.0], [0.0, -2.0]].into(),
+            constrained_posterior: Some(ConstrainedPosteriorGeometry::with_decline(
+                gam_problem::LinearInequalityConstraints::new(array![[1.0, 0.0]], array![0.0])
+                    .expect("a 1x2 inequality system with a matching bound is well formed"),
+                array![0.0, 0.5],
+                ConePosteriorMomentDecline {
+                    ambient_precision_failure: "fixture: the ambient precision is indefinite"
+                        .to_string(),
+                    properness: ConePropernessEvidence::CertificationFailed {
+                        reason: "fixture: the cone-truncated posterior is improper".to_string(),
+                    },
+                    active_rows: vec![0],
+                    boundary_approximation_refusal: None,
+                },
+            )),
+            working: None,
+        });
+        let model = standard_binomial_model(fit);
+        model
+            .validate_required_posterior_mean_state()
+            .expect("a declined boundary mode is a persistable converged fit");
+        let refusal = model
+            .payload()
+            .fit_result
+            .as_ref()
+            .expect("the model carries its fit")
+            .require_posterior_mean("posterior-mean prediction")
+            .expect_err("a declined fit has no posterior mean")
+            .to_string();
+        assert!(
+            refusal.contains("the ambient precision is indefinite"),
+            "the refusal must carry the decline's reason, got: {refusal}"
+        );
+        assert!(!refusal.contains("Cholesky"), "got: {refusal}");
     }
 
     fn marginal_slope_payload(version: u32, fit: UnifiedFitResult) -> FittedModelPayload {
@@ -7306,8 +7499,6 @@ mod tests {
             .push(gam_terms::smooth::RandomEffectTermSpec {
                 name: "g".to_string(),
                 feature_col: 0,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: Some(vec![0.0_f64.to_bits(), 7.0_f64.to_bits()]),
                 lenient_unseen: true,
             });
@@ -7729,6 +7920,8 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,
             WARM_START_PROVENANCE_ABSENT_PAYLOAD_VERSION,
@@ -7747,9 +7940,14 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
+        assert_eq!(MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION,
+            MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             POLISH_STEP_BUDGET_PAYLOAD_VERSION,
-            MODEL_PAYLOAD_VERSION - 1
+            SIGMA_FLOOR_RECORD_ABSENT_PAYLOAD_VERSION - 1
         );
         assert_eq!(
             TRAINING_ROWS_PERSISTED_PAYLOAD_VERSION,

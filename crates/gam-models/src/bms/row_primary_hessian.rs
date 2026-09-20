@@ -7353,6 +7353,7 @@ impl BernoulliMarginalSlopeFamily {
                         &ordered_pairs,
                         primary,
                         lanes,
+                        &self.jet_scratch.batch,
                     )
                 }
             }?;
