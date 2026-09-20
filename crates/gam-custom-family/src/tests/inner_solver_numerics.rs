@@ -3886,35 +3886,29 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
     assert!(err.to_string().contains("non-finite"), "unexpected error: {err}");
 }
 
+/// The inner solvers take the smallest eigenvalue of a block Hessian with
+/// `fold(f64::INFINITY, f64::min)` (`blockwise_solve.rs`, `fit.rs`,
+/// `inner_blockwise_fit.rs`). `f64::min` silently DROPS a NaN operand, so that
+/// fold is only sound because `FaerEigh::eigh` refuses a non-finite matrix
+/// before any eigenvalue exists. This pins that upstream refusal from the
+/// consumer's side: if `eigh` ever started returning eigenvalues for NaN input,
+/// every one of those folds would report a finite minimum for a poisoned
+/// Hessian.
 #[test]
-pub(crate) fn nan_propagating_min_detects_nan_eigenvalues() {
-    // Verify the fix: our NaN-propagating min correctly detects
-    // NaN eigenvalues, unlike f64::min which silently ignored them.
+pub(crate) fn eigh_refuses_nan_hessian_so_min_eigenvalue_folds_never_see_nan() {
     let mut mat = Array2::<f64>::eye(3);
     mat[[1, 0]] = f64::NAN;
     mat[[0, 1]] = f64::NAN;
 
-    use gam_linalg::faer_ndarray::FaerEigh;
-    match FaerEigh::eigh(&mat, faer::Side::Lower) {
-        Err(_) => {
-            // eigh failed — the fallback chain in compute_update_step
-            // now catches this and applies a conservative ridge.
-        }
-        Ok((evals, _)) => {
-            // NaN-propagating fold (matches the production code):
-            let new_min = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.min(b)
-                }
-            });
-            assert!(
-                !new_min.is_finite(),
-                "NaN-propagating min should detect NaN eigenvalues, got {new_min}"
-            );
-        }
-    }
+    use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError};
+    let error = FaerEigh::eigh(&mat, faer::Side::Lower).expect_err(
+        "eigh must refuse a NaN block Hessian; the production min-eigenvalue folds use \
+         f64::min, which would silently drop NaN eigenvalues",
+    );
+    assert!(
+        matches!(error, FaerLinalgError::SelfAdjointEigenNonFiniteInput { .. }),
+        "eigh must refuse NaN input as non-finite, got: {error}"
+    );
 }
 
 #[test]
