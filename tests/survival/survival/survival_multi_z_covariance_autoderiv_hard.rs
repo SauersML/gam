@@ -355,10 +355,15 @@ fn t06a_n_less_than_k_retains_nonzero_coupling_as_full() {
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
     let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    if let Ok(covariance) = result {
-        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
-        assert_eq!(covariance.dim(), k);
-    }
+    // N < K gives a rank-deficient (rank <= N-1) but PSD sample covariance.
+    // `MarginalSlopeCovariance::full` accepts it by construction: its PSD test
+    // is against the eigensolver's own roundoff band, precisely so collinear
+    // score geometry is not refused. An Err here is that regression.
+    let covariance = result.unwrap_or_else(|e| {
+        panic!("N={n} < K={k} rank-deficient PSD covariance must be accepted: {e}")
+    });
+    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+    assert_eq!(covariance.dim(), k);
 }
 
 #[test]
@@ -369,10 +374,15 @@ fn t06b_n_equal_k_retains_nonzero_coupling_as_full() {
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
     let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    if let Ok(covariance) = result {
-        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
-        assert_eq!(covariance.dim(), k);
-    }
+    // N == K gives a rank-deficient (rank <= N-1) but PSD sample covariance.
+    // `MarginalSlopeCovariance::full` accepts it by construction: its PSD test
+    // is against the eigensolver's own roundoff band, precisely so collinear
+    // score geometry is not refused. An Err here is that regression.
+    let covariance = result.unwrap_or_else(|e| {
+        panic!("N={n} == K={k} rank-deficient PSD covariance must be accepted: {e}")
+    });
+    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+    assert_eq!(covariance.dim(), k);
 }
 
 // ====================================================================
