@@ -85,11 +85,10 @@ pub enum DispersionFamilyKind {
     /// `log φ`.
     Beta,
     /// Tweedie compound Poisson–Gamma with `Var = φ μ^p`, fixed power `p`; the
-    /// precision channel models `log(1/φ)`. The per-row density uses the
-    /// saddlepoint (Nelder–Pregibon) approximation for `y > 0` and the exact
-    /// point mass at `y = 0`; this is the standard tractable Tweedie ML
-    /// surface (an exact-series φ-derivative is the remaining hard sub-item of
-    /// #913).
+    /// precision channel models `log(1/φ)`. The per-row density is the exact
+    /// one: the series density for `y > 0` (whose `φ`-derivatives are the
+    /// cumulants of the series index, see `tweedie_series`) and the point mass
+    /// at `y = 0` (#3511).
     Tweedie { p: f64 },
 }
 
@@ -323,7 +322,7 @@ fn validate_dispersion_row_kernel_output(
 #[cfg(test)]
 mod test_support {
     use super::*;
-    use crate::gamlss::test_support::order2_ln_gamma;
+    use crate::gamlss::test_support::{order2_ln_gamma, tweedie_log_series_jet};
     use gam_math::jet_scalar::JetScalar;
     use gam_math::nested_dual::JetField;
 
@@ -507,9 +506,10 @@ mod test_support {
 
     /// Pruned single-axis Tweedie dispersion tower seeded on the predictor `η_d`
     /// (axis 0), with `η_μ` a constant (so `μ = exp(η_μ)` carries no jet). The
-    /// `φ = exp(−η_d)` chain and its nonlinear `∂²φ/∂η_d²` curvature are carried
-    /// exactly as in `dispersion_tweedie_nll_generic`; `value`/`g[0]`/`h[0][0]`
-    /// match that program's `value`/`g[1]`/`h[1][1]` bit-for-bit.
+    /// exact density's `κ = exp(η_d)` precision and its series `ln W(y, η_d)`
+    /// are carried exactly as in `dispersion_tweedie_nll_generic`;
+    /// `value`/`g[0]`/`h[0][0]` match that program's `value`/`g[1]`/`h[1][1]`
+    /// bit-for-bit.
     #[inline]
     pub(super) fn dispersion_tweedie_disp_order2(
         yi: f64,
@@ -523,22 +523,21 @@ mod test_support {
         let one_minus_p = 1.0 - p;
         let two_minus_p = 2.0 - p;
         let mu = O1::constant(eta_mu).exp();
-        let phi = O1::variable(eta_d, 0).scale(-1.0).exp();
+        let eta_d = O1::variable(eta_d, 0);
         if yi > 0.0 {
-            let dev = mu
+            let kappa = eta_d.exp();
+            let kernel = mu
                 .powf(two_minus_p)
                 .scale(1.0 / two_minus_p)
-                .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p))
-                .add(&O1::constant(
-                    yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
-                ))
-                .scale(2.0);
-            let loglik = dev
-                .mul(&phi.recip().scale(-0.5))
-                .sub(&phi.scale(2.0 * std::f64::consts::PI).ln().scale(0.5))
-                .sub(&O1::constant(0.5 * p * yi.ln()));
+                .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p));
+            let loglik = kappa
+                .mul(&kernel)
+                .neg()
+                .add(&tweedie_log_series_jet::<O1, 1>(&eta_d, yi, p))
+                .sub(&O1::constant(yi.ln()));
             loglik.scale(-wi)
         } else {
+            let phi = eta_d.scale(-1.0).exp();
             let c = mu.powf(two_minus_p).scale(1.0 / two_minus_p);
             let loglik = c.mul(&phi.recip()).scale(-1.0);
             loglik.scale(-wi)
@@ -646,27 +645,203 @@ fn dispersion_beta_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     -(s * -wi)
 }
 
-/// Tweedie row log-likelihood, plain `f64`, bit-identical to
-/// `-dispersion_tweedie_disp_order2(..).value()` (both density branches).
+/// Term budget for the Tweedie series walk: the same budget gam-solve's exact
+/// Tweedie series (`tweedie_exact_series_loglik_from_eta`) carries. A row whose
+/// series mode lies beyond it, or that would need more terms than this to
+/// certify its tails, is reported as a non-finite evaluation rather than
+/// truncated silently.
+const TWEEDIE_SERIES_MAX_TERMS: usize = 100_000;
+
+/// The Tweedie series `ln W(y, η_d)` of a positive row and its first four
+/// `η_d`-derivatives (#3511).
+///
+/// For `y > 0` the exact compound Poisson–Gamma density is
+/// `ℓ = −κ (μ^{2−p}/(2−p) − y μ^{1−p}/(1−p)) + ln W − ln y` with `κ = e^{η_d}`,
+/// `W = Σ_{j≥1} e^{z_j}`, `z_j = j c − ln Γ(j+1) − ln Γ(jα)`, `α = (2−p)/(p−1)`
+/// and `c = α (ln y − ln(p−1)) − ln(2−p) + η_d/(p−1)`. `η_d` enters `z_j` only
+/// through `j η_d/(p−1)`, so `ln W` is the cumulant generating function of the
+/// index `j` under `π_j ∝ e^{z_j}`: `∂^k ln W/∂η_d^k = κ_k(j)/(p−1)^k`.
+#[derive(Clone, Copy, Debug)]
+struct TweedieSeries {
+    /// `ln W`.
+    log_series: f64,
+    /// `∂^k ln W/∂η_d^k` for `k = 1..=4`.
+    derivatives: [f64; 4],
+}
+
+/// Evaluate [`TweedieSeries`] for a positive row.
+///
+/// `z_j` is strictly concave in `j` (`−ln Γ(j+1)` is concave and `ln Γ(jα)` is
+/// convex), so the terms rise to a single mode and then fall with a term ratio
+/// that decreases monotonically away from it on either side. The mode is the
+/// least `j` with `z_{j+1} ≤ z_j`, found by bisection. The walk sums outward
+/// from the mode, accumulating the central power sums `Σ t_j (j − mode)^m`
+/// for `m ≤ 4` with `t_j = e^{z_j − z_mode}`. On each side it stops only when a
+/// geometric bound on the entire remaining tail is below the resolution of
+/// every accumulated absolute power sum: at distance `e` from the mode, with
+/// next term `t` and ratio `r = t/t_e`, every later term is at most `t r^k` and
+/// `(e+1+k)^m ≤ (e+1)^m ((e+2)/(e+1))^{mk}`, so the tail of power `m` is at most
+/// `t (e+1)^m / (1 − ρ_m)` with `ρ_m = r ((e+2)/(e+1))^m < 1`. The stopping rule
+/// is therefore a truncation certificate, not a tolerance.
+///
+/// Roundoff: each `z_j` carries an absolute error of order `ε · |ln Γ(j)|`, so a
+/// term's relative error is about `1e-12` for a mode near `j = 10³`, and the
+/// fourth cumulant `μ₄ − 3μ₂²` loses a further factor of order the series
+/// variance relative to `μ₄`. A non-finite term, a mode beyond
+/// [`TWEEDIE_SERIES_MAX_TERMS`], or a walk that exceeds that budget returns NaN
+/// in every slot, which the row validation reports as a non-finite evaluation.
+fn tweedie_series(yi: f64, p: f64, eta_d: f64) -> TweedieSeries {
+    let failed = TweedieSeries {
+        log_series: f64::NAN,
+        derivatives: [f64::NAN; 4],
+    };
+    let alpha = (2.0 - p) / (p - 1.0);
+    let rate = 1.0 / (p - 1.0);
+    let c = alpha * (yi.ln() - (p - 1.0).ln()) - (2.0 - p).ln() + rate * eta_d;
+    let log_term = |j: f64| j * c - ln_gamma(j + 1.0) - ln_gamma(j * alpha);
+    let descends = |j: f64| log_term(j + 1.0) <= log_term(j);
+
+    let budget = TWEEDIE_SERIES_MAX_TERMS as f64;
+    let z_budget = log_term(budget);
+    let z_beyond = log_term(budget + 1.0);
+    if !(z_budget.is_finite() && z_beyond.is_finite()) || z_beyond > z_budget {
+        return failed;
+    }
+    let mode = if descends(1.0) {
+        1.0
+    } else {
+        // Invariant: the terms still rise at `low` and no longer rise at `high`.
+        let (mut low, mut high) = (1.0_f64, budget);
+        while high - low > 1.0 {
+            let mid = ((low + high) * 0.5).floor();
+            if descends(mid) {
+                high = mid;
+            } else {
+                low = mid;
+            }
+        }
+        high
+    };
+    let z_mode = log_term(mode);
+    if !z_mode.is_finite() {
+        return failed;
+    }
+
+    let mut signed = [1.0_f64, 0.0, 0.0, 0.0, 0.0];
+    let mut absolute = [1.0_f64, 0.0, 0.0, 0.0, 0.0];
+    let mut terms = 1usize;
+    for direction in [-1.0_f64, 1.0] {
+        let mut distance = 0.0_f64;
+        let mut current = 1.0_f64;
+        loop {
+            let j = mode + direction * (distance + 1.0);
+            if j < 1.0 {
+                break;
+            }
+            let next = (log_term(j) - z_mode).exp();
+            if !next.is_finite() {
+                return failed;
+            }
+            let ratio = next / current;
+            let widening = (distance + 2.0) / (distance + 1.0);
+            let mut certified = true;
+            let mut spread = 1.0_f64;
+            let mut growth = 1.0_f64;
+            for m in 0..5 {
+                let contraction = ratio * growth;
+                let tail = next * spread / (1.0 - contraction);
+                if !(contraction < 1.0 && absolute[m] + tail == absolute[m]) {
+                    certified = false;
+                    break;
+                }
+                spread *= distance + 1.0;
+                growth *= widening;
+            }
+            if certified {
+                break;
+            }
+            terms += 1;
+            if terms > TWEEDIE_SERIES_MAX_TERMS {
+                return failed;
+            }
+            distance += 1.0;
+            let offset = direction * distance;
+            let mut signed_power = next;
+            let mut absolute_power = next;
+            for m in 0..5 {
+                signed[m] += signed_power;
+                absolute[m] += absolute_power;
+                signed_power *= offset;
+                absolute_power *= distance;
+            }
+            current = next;
+        }
+    }
+
+    let total = signed[0];
+    let m1 = signed[1] / total;
+    let e2 = signed[2] / total;
+    let e3 = signed[3] / total;
+    let e4 = signed[4] / total;
+    let m1_sq = m1 * m1;
+    let central2 = e2 - m1_sq;
+    let central3 = e3 - 3.0 * m1 * e2 + 2.0 * m1 * m1_sq;
+    let central4 = e4 - 4.0 * m1 * e3 + 6.0 * m1_sq * e2 - 3.0 * m1_sq * m1_sq;
+    let cumulants = [
+        mode + m1,
+        central2,
+        central3,
+        central4 - 3.0 * central2 * central2,
+    ];
+    let mut derivatives = [0.0; 4];
+    let mut rate_power = 1.0;
+    for k in 0..4 {
+        rate_power *= rate;
+        derivatives[k] = rate_power * cumulants[k];
+    }
+    TweedieSeries {
+        log_series: z_mode + total.ln(),
+        derivatives,
+    }
+}
+
+/// Tweedie row log-likelihood of the exact density, plain `f64`. `series` is
+/// the row's [`tweedie_series`] and is read only when `y > 0`.
 #[inline]
-fn dispersion_tweedie_loglik(yi: f64, eta_mu: f64, eta_d: f64, p: f64, wi: f64) -> f64 {
-    let one_minus_p = 1.0 - p;
+fn dispersion_tweedie_loglik_with_series(
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    p: f64,
+    wi: f64,
+    series: Option<TweedieSeries>,
+) -> f64 {
     let two_minus_p = 2.0 - p;
     let mu = eta_mu.exp();
-    let phi = (-eta_d).exp();
-    let s = if yi > 0.0 {
-        let dev = (mu.powf(two_minus_p) * (1.0 / two_minus_p)
-            - mu.powf(one_minus_p) * (yi / one_minus_p)
-            + yi.powf(two_minus_p) / (one_minus_p * two_minus_p))
-            * 2.0;
-        dev * ((1.0 / phi) * -0.5)
-            - (phi * (2.0 * std::f64::consts::PI)).ln() * 0.5
-            - 0.5 * p * yi.ln()
-    } else {
-        let c = mu.powf(two_minus_p) * (1.0 / two_minus_p);
-        (c * (1.0 / phi)) * -1.0
+    let kappa = eta_d.exp();
+    let mean_term = mu.powf(two_minus_p) * (1.0 / two_minus_p);
+    let s = match series {
+        Some(series) if yi > 0.0 => {
+            let one_minus_p = 1.0 - p;
+            let response_term = mu.powf(one_minus_p) * (yi / one_minus_p);
+            -(kappa * (mean_term - response_term)) + series.log_series - yi.ln()
+        }
+        _ => -(mean_term * kappa),
     };
     -(s * -wi)
+}
+
+/// The positive row's [`tweedie_series`], or `None` at the `y = 0` point mass,
+/// whose density has no series.
+#[inline]
+fn tweedie_row_series(yi: f64, p: f64, eta_d: f64) -> Option<TweedieSeries> {
+    (yi > 0.0).then(|| tweedie_series(yi, p, eta_d))
+}
+
+/// Tweedie row log-likelihood of the exact density, plain `f64`.
+#[inline]
+fn dispersion_tweedie_loglik(yi: f64, eta_mu: f64, eta_d: f64, p: f64, wi: f64) -> f64 {
+    dispersion_tweedie_loglik_with_series(yi, eta_mu, eta_d, p, wi, tweedie_row_series(yi, p, eta_d))
 }
 
 /// Value-only row negative log-likelihood for one observation — the pruned hot
@@ -723,17 +898,18 @@ pub(crate) fn dispersion_row_loglik(
 // from the declaration. The caller supplies only one-variable derivative stacks
 // at the row: `ln Γ` through tetragamma, softplus for the negative binomial log
 // shares, the logistic mean link, the Tweedie mean's power terms `e^{(2−p)t}` and
-// `e^{(1−p)t}` with their coefficients, and `e^t` at `t = 0`. Each argument's
+// `e^{(1−p)t}` with their coefficients, the Tweedie series' cumulant stack, and
+// `e^t` at `t = 0`. Each argument's
 // polygamma entries come from one walk of the recurrence
 // (`gam_math::special::polygamma_stack`), which divides once per step for every
 // order where the per-order scalars divide once each.
 //
 // A supplied value that enters the result only through `add` or `scale` reaches
 // the value channel and nothing else. The production stacks supply zero for those
-// values (every `ln Γ` value, the negative binomial `−ln q`, the Tweedie density
-// normalizer), and the row log-likelihood comes from the plain-f64 functions
-// above. Values that multiply a jet (the negative binomial `−ln r`, the Beta mean,
-// the Tweedie deviance terms) are always supplied. The programs emit through
+// values (every `ln Γ` value, the negative binomial `−ln q`, the Tweedie series
+// value `ln W` and its `−ln y` normalizer), and the row log-likelihood comes from
+// the plain-f64 functions above. Values that multiply a jet (the negative binomial
+// `−ln r`, the Beta mean, the Tweedie mean-kernel terms) are always supplied. The programs emit through
 // fourth order: the contracted fourth surface is the observed Hessian's second
 // directional derivative, which the exact outer rho-Hessian consumes. A surface of
 // order `k` reads the stack entries through `k`, so the polygamma entries above the
@@ -950,13 +1126,19 @@ row_program! {
     }
 }
 
-// Tweedie, positive y (saddlepoint density): ℓ = −½ κ dev + ½ η_d − ½ ln 2π
-// − ½ p ln y, with κ = 1/φ = e^{η_d} and
-// dev = 2 (μ^{2−p}/(2−p) − y μ^{1−p}/(1−p) + y^{2−p}/((1−p)(2−p))). About the
-// row, ½ dev = A e^{(2−p)δ_μ} − B e^{(1−p)δ_μ} + C with A = μ^{2−p}/(2−p),
-// B = y μ^{1−p}/(1−p) and C = y^{2−p}/((1−p)(2−p)). The caller supplies the two
-// exponential terms' stacks `A (2−p)^k` and `B (1−p)^k`; `deviance_offset` is C
-// and `log_normalizer` is `½ η_d − ½ ln 2π − ½ p ln y` at the row.
+// Tweedie, positive y (exact compound Poisson–Gamma density, #3511):
+// ℓ = −κ (μ^{2−p}/(2−p) − y μ^{1−p}/(1−p)) + ln W(y, η_d) − ln y, with
+// κ = 1/φ = e^{η_d} and the series W = Σ_{j≥1} e^{z_j},
+// z_j = j c(η_d) − ln Γ(j+1) − ln Γ(jα), α = (2−p)/(p−1),
+// c(η_d) = α (ln y − ln(p−1)) − ln(2−p) + η_d/(p−1). About the row the mean
+// kernel is A e^{(2−p)δ_μ} − B e^{(1−p)δ_μ} with A = μ^{2−p}/(2−p) and
+// B = y μ^{1−p}/(1−p); the caller supplies the two exponential terms' stacks
+// `A (2−p)^k` and `B (1−p)^k`. μ does not enter W, and η_d enters each term only
+// linearly through `j η_d/(p−1)`, so `ln W` is the cumulant generating function
+// of the series index `j`: its k-th η_d-derivative is `κ_k(j)/(p−1)^k` under
+// π_j ∝ e^{z_j} (see `tweedie_series`). The caller supplies that stack as
+// `series_first..series_fourth`; `series_value` is `ln W` and `log_normalizer`
+// is `−ln y` at the row, both value-only.
 row_program! {
     fn tweedie_positive_row_program(
         delta_mu,
@@ -972,7 +1154,11 @@ row_program! {
         response_second,
         response_third,
         response_fourth,
-        deviance_offset,
+        series_value,
+        series_first,
+        series_second,
+        series_third,
+        series_fourth,
         log_normalizer
     )
     emit [order2, third, fourth];
@@ -980,6 +1166,7 @@ row_program! {
         unit_exponential => supplied,
         mean_power => supplied,
         response_power => supplied,
+        series_cgf => supplied,
     }
     witnesses [];
     {
@@ -1003,9 +1190,17 @@ row_program! {
             response_third,
             response_fourth
         );
-        let half_deviance = add_constant(add(mean_jet, neg(response_jet)), deviance_offset);
-        let density = add(neg(mul(precision, half_deviance)), scale(delta_d, 0.5));
-        return add_constant(density, log_normalizer);
+        let kernel = add(mean_jet, neg(response_jet));
+        let series = compose(
+            series_cgf,
+            delta_d,
+            series_value,
+            series_first,
+            series_second,
+            series_third,
+            series_fourth
+        );
+        return add_constant(add(neg(mul(precision, kernel)), series), log_normalizer);
     }
 }
 
@@ -1117,7 +1312,11 @@ enum DispersionRowStacks {
         response_second: f64,
         response_third: f64,
         response_fourth: f64,
-        deviance_offset: f64,
+        series_value: f64,
+        series_first: f64,
+        series_second: f64,
+        series_third: f64,
+        series_fourth: f64,
         log_normalizer: f64,
     },
     TweedieZero {
@@ -1162,7 +1361,13 @@ impl DispersionRowStacks {
                     polygamma_stack((1.0 - logit.mu) * phi, order),
                 )
             }
-            DispersionFamilyKind::Tweedie { p } => Self::tweedie(yi, p, em.exp(), ed.exp()),
+            DispersionFamilyKind::Tweedie { p } => Self::tweedie(
+                yi,
+                p,
+                em.exp(),
+                ed.exp(),
+                tweedie_row_series(yi, p, ed),
+            ),
         }
     }
 
@@ -1269,17 +1474,19 @@ impl DispersionRowStacks {
         }
     }
 
-    /// The deviance's power terms are formed as `dispersion_tweedie_loglik` forms
-    /// them, so a row kernel that evaluates both shares their divisions.
+    /// The mean kernel's power terms are formed as
+    /// `dispersion_tweedie_loglik_with_series` forms them. `series` is the row's
+    /// [`tweedie_row_series`]: `Some` exactly when `y > 0`, whose exact density
+    /// carries the series `ln W`; the `y = 0` point mass has none.
     #[inline(always)]
-    fn tweedie(yi: f64, p: f64, mu: f64, kappa: f64) -> Self {
+    fn tweedie(yi: f64, p: f64, mu: f64, kappa: f64, series: Option<TweedieSeries>) -> Self {
         let two_minus_p = 2.0 - p;
         let mean_power_two = mu.powf(two_minus_p);
         let mean_term = mean_power_two * (1.0 / two_minus_p);
         let mean_second = mean_power_two * two_minus_p;
         let mean_third = mean_second * two_minus_p;
         let mean_fourth = mean_third * two_minus_p;
-        if yi > 0.0 {
+        if let Some(series) = series {
             let one_minus_p = 1.0 - p;
             let mean_power_one = mu.powf(one_minus_p);
             let response_first = yi * mean_power_one;
@@ -1297,7 +1504,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth: response_third * one_minus_p,
-                deviance_offset: yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
+                series_value: 0.0,
+                series_first: series.derivatives[0],
+                series_second: series.derivatives[1],
+                series_third: series.derivatives[2],
+                series_fourth: series.derivatives[3],
                 log_normalizer: 0.0,
             }
         } else {
@@ -1442,7 +1653,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
             } => tweedie_positive_row_program_order2(
                 0.0,
@@ -1458,7 +1673,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
             ),
             Self::TweedieZero {
@@ -1615,7 +1834,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
             } => tweedie_positive_row_program_third_contracted(
                 0.0,
@@ -1631,7 +1854,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
                 direction,
             ),
@@ -1793,7 +2020,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
             } => tweedie_positive_row_program_fourth_contracted(
                 0.0,
@@ -1809,7 +2040,11 @@ impl DispersionRowStacks {
                 response_second,
                 response_third,
                 response_fourth,
-                deviance_offset,
+                series_value,
+                series_first,
+                series_second,
+                series_third,
+                series_fourth,
                 log_normalizer,
                 direction_u,
                 direction_v,
@@ -2146,24 +2381,31 @@ pub(super) fn dispersion_row_kernel(
         }
         DispersionFamilyKind::Tweedie { p } => {
             let mu = em.exp();
-            // Precision channel models log(1/φ) ⇒ φ = exp(−η_d).
-            let phi = (-ed).exp();
+            // Precision channel models log(1/φ) ⇒ κ = 1/φ = exp(η_d).
+            let kappa = ed.exp();
             let two_minus_p = 2.0 - p;
-            let loglik = dispersion_tweedie_loglik(yi, em, ed, p, wi);
-            // κ = 1/φ is the reciprocal the log-likelihood forms, and the stacks form
-            // the deviance's power terms as it does, so the scores (the row
-            // program's gradient in (η_μ, η_d)) share its divisions.
-            let kappa = 1.0 / phi;
-            let [score_mu, score_eta] = DispersionRowStacks::tweedie(yi, p, mu, kappa).order2().1;
+            // One series walk serves the log-likelihood and the scores (the row
+            // program's gradient in (η_μ, η_d)), and the stacks form the mean
+            // kernel's power terms as the log-likelihood does.
+            let series = tweedie_row_series(yi, p, ed);
+            let loglik = dispersion_tweedie_loglik_with_series(yi, em, ed, p, wi, series);
+            let [score_mu, score_eta] =
+                DispersionRowStacks::tweedie(yi, p, mu, kappa, series).order2().1;
             // Mean channel: the Fisher weight `μ^{2−p}/φ` (the mean block is
             // Fisher-orthogonal to the dispersion block in this parameterization).
             let mean_information = mu.powf(two_minus_p) * kappa;
             let mean_weight = wi * mean_information;
             let mean_response = em + score_mu / mean_information;
-            // Dispersion channel in η_d, where φ = exp(−η_d). Positive y
-            // (saddlepoint density ℓ = −dev/(2φ) − ½ ln(2πφ) − ½ p ln y) keeps the
-            // constant curvature ½. The point mass at y = 0 (ℓ = −c/φ with
-            // c = μ^{2−p}/(2−p)) uses its observed information c/φ.
+            // Dispersion channel in η_d, where φ = exp(−η_d). The exact positive-y
+            // density has no closed-form expected information in η_d; its
+            // small-dispersion limit is the constant ½ (the saddlepoint density's
+            // information), which is the working curvature here. It only
+            // weights the working step: the score is the exact density's, and the
+            // objective the step is judged on is the exact log-likelihood. The
+            // exact observed information enters through the row program's Hessian
+            // surfaces. The point mass at
+            // y = 0 (ℓ = −c/φ with c = μ^{2−p}/(2−p)) uses its observed
+            // information c/φ.
             let curvature_eta = if yi > 0.0 {
                 0.5
             } else {
@@ -3772,7 +4014,9 @@ mod tests {
     /// reproduce, `to_bits`-exactly, the CONSUMED channels (`value`, dispersion-
     /// axis `g`/`h`) of the full `Order2<2>` towers — across ≥2000 randomized
     /// rows per family (both Tweedie density branches). This is the bit-identity guarantee that the K-prune changes no
-    /// observable float.
+    /// observable float. The Tweedie value-only path is the one exception: it
+    /// sums the positive-row series in its own certified order, so it is pinned
+    /// to the tower value within a derived roundoff band instead.
     #[test]
     pub(crate) fn pruned_disp_towers_bit_identical_to_full_order2() {
         use gam_math::jet_scalar::Order2;
@@ -3861,10 +4105,24 @@ mod tests {
                 assert_eq!(bits(full.value()), bits(prn.value()), "tweedie value");
                 assert_eq!(bits(full.g()[1]), bits(prn.g()[0]), "tweedie grad");
                 assert_eq!(bits(full.h()[1][1]), bits(prn.h()[0][0]), "tweedie hess");
-                assert_eq!(
-                    bits(dispersion_tweedie_loglik(yi, em, ed, p, wi)),
-                    bits(-prn.value()),
-                    "tweedie value-only"
+                // The production value path sums the series `ln W` outward
+                // from its mode with a certified tail, while the oracle sums
+                // the same terms left to right and forms each exponent in a
+                // different order, so the two agree to roundoff rather than
+                // bit-for-bit. Both call the same `ln_gamma`, so the only
+                // difference is the rounding of `z_j = j c − ln Γ(j+1) − ln Γ(jα)`,
+                // a few ε·|j c|. A log-sum-exp moves by at most the largest
+                // exponent error, and at the mode `j c / z_j ≈ (ln j + α ln(jα))/(1+α)`,
+                // at most ~15 for the budgeted `j`, so the gap is ≲ 100 ε·|ln W|
+                // plus the ε·|ℓ| of the final sums. The band below is ~4.5e4 ε
+                // on that scale.
+                let value_only = dispersion_tweedie_loglik(yi, em, ed, p, wi);
+                let oracle = -prn.value();
+                let log_series = tweedie_row_series(yi, p, ed).map_or(0.0, |s| s.log_series);
+                let band = 1e-11 * wi * (1.0 + oracle.abs() / wi + log_series.abs());
+                assert!(
+                    (value_only - oracle).abs() <= band,
+                    "tweedie value-only: {value_only:.17e} vs oracle {oracle:.17e}"
                 );
             }
         }

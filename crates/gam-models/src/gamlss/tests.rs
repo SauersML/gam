@@ -275,9 +275,9 @@ pub(crate) fn binomial_location_scale_joint_hessian_matches_single_sourced_tower
 // Regression for #1107: the Tweedie y=0 dispersion-channel curvature in the
 // η_d = −log φ link must equal the observed-information second derivative
 // ∂²(−ℓ)/∂η_d² = c/φ, NOT the Fisher-information shortcut 2c/φ. The shortcut
-// drops the first-order score term (valid only when E[score]=0, i.e. the
-// saddlepoint y>0 branch) and was 2× too large for the deterministic zero-mass
-// branch. This asserts the kernel's reported per-row curvature (`disp_weight`
+// drops the first-order score term (valid only when E[score]=0, which holds
+// for the full density but not for the deterministic zero-mass branch alone)
+// and was 2× too large there. This asserts the kernel's reported per-row curvature (`disp_weight`
 // at unit prior weight) matches a centered finite-difference of the NLL.
 pub(crate) fn tweedie_zero_mass_dispersion_curvature_matches_finite_difference() {
     // (p in (1,2), eta_mu, eta_d) cases spanning small/large μ and φ.
@@ -324,8 +324,8 @@ pub(crate) fn tweedie_zero_mass_dispersion_curvature_matches_finite_difference()
 // Tweedie row NLL; its mechanically-derived gradient and Hessian channels must
 // be the exact derivatives of its own value channel. Anchor every channel of
 // the tower against centered finite differences of the value, in BOTH predictor
-// directions (η_μ, η_d) and BOTH density branches (y > 0 saddlepoint, y = 0
-// point mass), so a dropped chain term or a sign flip in the Faà-di-Bruno
+// directions (η_μ, η_d) and BOTH density branches (y > 0 exact series
+// density, y = 0 point mass), so a dropped chain term or a sign flip in the Faà-di-Bruno
 // composition shows up here independent of any closed-form witness.
 pub(crate) fn tweedie_nll_tower_is_finite_difference_consistent() {
     // (p in (1,2), y, eta_mu, eta_d, weight); y = 0 hits the point-mass branch.

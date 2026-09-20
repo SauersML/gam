@@ -83,6 +83,59 @@ fn binomial_location_scale_nll_in_predictors<S: JetScalar<2>>(
     Ok(q.compose_unary([neg_ll, m1, m2, m3, m4]))
 }
 
+/// Test oracle for the Tweedie series `ln W(y, η_d)` as a jet in `η_d` (#3511).
+///
+/// `W = Σ_{j≥1} e^{z_j}` with `z_j = j (c₀ + η_d/(p−1)) − ln Γ(j+1) − ln Γ(jα)`,
+/// `α = (2−p)/(p−1)` and `c₀ = α (ln y − ln(p−1)) − ln(2−p)`, so each term is
+/// the algebra's own `exp` of an affine function of `η_d` and every derivative
+/// channel comes from the jet arithmetic, not from the production cumulant
+/// formulas. The walk runs upward from `j = 1` and stops once a term is `TAIL`
+/// nats below the running maximum: `z_j` is concave in `j`, so every later term
+/// is smaller still and falls geometrically, and `e^{−100}` is far below the
+/// double-precision resolution of the sum. The terms are scaled by the maximum
+/// before summation so the sum is formed at unit magnitude.
+pub(crate) fn tweedie_log_series_jet<S: JetScalar<K>, const K: usize>(
+    eta_d: &S,
+    yi: f64,
+    p: f64,
+) -> S {
+    const TAIL: f64 = 100.0;
+    let alpha = (2.0 - p) / (p - 1.0);
+    let rate = 1.0 / (p - 1.0);
+    let c0 = alpha * (yi.ln() - (p - 1.0).ln()) - (2.0 - p).ln();
+    let c = c0 + rate * eta_d.value();
+    let mut z_ref = f64::NEG_INFINITY;
+    let mut last = 1usize;
+    loop {
+        let jf = last as f64;
+        let z = jf * c - ln_gamma(jf + 1.0) - ln_gamma(jf * alpha);
+        assert!(z.is_finite(), "Tweedie series oracle term {last} is not finite");
+        if z > z_ref {
+            z_ref = z;
+        } else if z < z_ref - TAIL {
+            break;
+        }
+        last += 1;
+        assert!(last < 10_000_000, "Tweedie series oracle did not reach its tail");
+    }
+    let mut series: Option<S> = None;
+    for j in 1..=last {
+        let jf = j as f64;
+        let term = eta_d
+            .scale(jf * rate)
+            .add_constant(jf * c0 - ln_gamma(jf + 1.0) - ln_gamma(jf * alpha) - z_ref)
+            .exp();
+        series = Some(match series {
+            None => term,
+            Some(sum) => sum.add(&term),
+        });
+    }
+    series
+        .expect("the Tweedie series oracle sums at least one term")
+        .ln()
+        .add_constant(z_ref)
+}
+
 /// Tweedie compound Poisson–Gamma row NLL written ONCE over a generic
 /// [`JetScalar<2>`], seeded directly on the PREDICTOR primaries `(η_μ, η_d)`
 /// (#932).
@@ -90,23 +143,16 @@ fn binomial_location_scale_nll_in_predictors<S: JetScalar<2>>(
 /// Unlike the NB/Gamma/Beta oracles — which seed on the natural parameters and
 /// let the caller apply the precision→η chain via the Fisher-orthogonal
 /// `precision²·info` shortcut — this tower carries `μ = exp(η_μ)` and
-/// `φ = exp(−η_d)` INSIDE the program, so `tower.g[1]` / `tower.h[1][1]` are
-/// the η_d-space score and OBSERVED information directly, with the nonlinear
-/// `∂²φ/∂η_d²` chain correction the hand path documented (the `y = 0` branch's
-/// `2c/φ − c/φ = c/φ` cancellation) mechanically carried rather than re-derived.
+/// `κ = 1/φ = exp(η_d)` INSIDE the program, so `tower.g[1]` / `tower.h[1][1]`
+/// are the η_d-space score and OBSERVED information directly.
 ///
-/// Both density branches are smooth in `(η_μ, η_d)`:
-/// * `y > 0` — the Nelder–Pregibon saddlepoint density
-///   `ℓ = w·[ −dev/(2φ) − ½ln(2πφ) − ½p·ln y ]` with the unit deviance
-///   `dev = 2·[ y^{2−p}/((1−p)(2−p)) − y·μ^{1−p}/(1−p) + μ^{2−p}/(2−p) ]`.
-/// * `y = 0` — the exact compound-Poisson point mass
-///   `ℓ = w·[ −μ^{2−p}/(φ(2−p)) ]`.
+/// Both density branches are the exact Tweedie density (#3511):
+/// * `y > 0` — `ℓ = w·[ −κ (μ^{2−p}/(2−p) − y μ^{1−p}/(1−p)) + ln W(y, η_d) − ln y ]`
+///   with the series `ln W` from [`tweedie_log_series_jet`].
+/// * `y = 0` — the compound-Poisson point mass `ℓ = w·[ −μ^{2−p}/(φ(2−p)) ]`.
 ///
-/// `μ` and `φ` enter the deviance only through `powf` and a `recip`, whose
-/// `[f64; 5]` derivative stacks the tower owns, so no primitive is re-derived:
-/// only the Leibniz/Faà-di-Bruno composition is mechanized. Production consumes
-/// the pruned single-axis `dispersion_tweedie_disp_order2`; this `K=2` generic
-/// is the dense oracle / cross-tool witness that pins it.
+/// Production consumes the pruned single-axis `dispersion_tweedie_disp_order2`;
+/// this `K=2` generic is the dense oracle / cross-tool witness that pins it.
 #[inline]
 pub(crate) fn dispersion_tweedie_nll_generic<S: JetScalar<2>>(
     yi: f64,
@@ -117,28 +163,25 @@ pub(crate) fn dispersion_tweedie_nll_generic<S: JetScalar<2>>(
 ) -> S {
     let one_minus_p = 1.0 - p;
     let two_minus_p = 2.0 - p;
-    // μ = exp(η_μ), φ = exp(−η_d): the natural parameters as jets in the
-    // predictor primaries, so the whole derivative tower is in η-space.
+    // μ = exp(η_μ) and the precision predictor η_d as jets in the predictor
+    // primaries, so the whole derivative tower is in η-space.
     let mu = S::variable(eta_mu, 0).exp();
-    let phi = S::variable(eta_d, 1).scale(-1.0).exp();
+    let eta_d = S::variable(eta_d, 1);
     if yi > 0.0 {
-        // dev = 2·[ μ^{2−p}/(2−p) − y·μ^{1−p}/(1−p) + y^{2−p}/((1−p)(2−p)) ]
-        let dev = mu
+        let kappa = eta_d.exp();
+        let kernel = mu
             .powf(two_minus_p)
             .scale(1.0 / two_minus_p)
-            .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p))
-            .add(&S::constant(
-                yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
-            ))
-            .scale(2.0);
-        // ℓ = dev·(−0.5/φ) − 0.5·ln(2πφ) − 0.5·p·ln y
-        let loglik = dev
-            .mul(&phi.recip().scale(-0.5))
-            .sub(&phi.scale(2.0 * std::f64::consts::PI).ln().scale(0.5))
-            .sub(&S::constant(0.5 * p * yi.ln()));
+            .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p));
+        let loglik = kappa
+            .mul(&kernel)
+            .neg()
+            .add(&tweedie_log_series_jet::<S, 2>(&eta_d, yi, p))
+            .sub(&S::constant(yi.ln()));
         loglik.scale(-wi)
     } else {
         // Exact point mass P(Y=0) = exp(−μ^{2−p}/(φ(2−p))).
+        let phi = eta_d.scale(-1.0).exp();
         let c = mu.powf(two_minus_p).scale(1.0 / two_minus_p);
         let loglik = c.mul(&phi.recip()).scale(-1.0);
         loglik.scale(-wi)
@@ -218,18 +261,16 @@ pub(crate) fn dispersion_eta_nll_order2(
             let mu = eta_mu.exp();
             let phi = eta_d.scale(-1.0).exp();
             if yi > 0.0 {
-                let dev = mu
+                let kernel = mu
                     .powf(two_minus_p)
                     .scale(1.0 / two_minus_p)
-                    .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p))
-                    .add(&O2::constant(
-                        yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
-                    ))
-                    .scale(2.0);
-                let loglik = dev
-                    .mul(&phi.recip().scale(-0.5))
-                    .sub(&phi.scale(2.0 * std::f64::consts::PI).ln().scale(0.5))
-                    .sub(&O2::constant(0.5 * p * yi.ln()));
+                    .sub(&mu.powf(one_minus_p).scale(yi / one_minus_p));
+                let loglik = eta_d
+                    .exp()
+                    .mul(&kernel)
+                    .neg()
+                    .add(&tweedie_log_series_jet::<O2, 2>(&eta_d, yi, p))
+                    .sub(&O2::constant(yi.ln()));
                 loglik.scale(-wi)
             } else {
                 let c = mu.powf(two_minus_p).scale(1.0 / two_minus_p);
@@ -338,17 +379,14 @@ pub(crate) fn dispersion_eta_nll_order3(
             let mu = o3_exp(&eta_mu);
             let phi = o3_exp(&eta_d.scale(-1.0));
             if yi > 0.0 {
-                let dev = o3_powf(&mu, two_minus_p)
+                let kernel = o3_powf(&mu, two_minus_p)
                     .scale(1.0 / two_minus_p)
-                    .sub(&o3_powf(&mu, one_minus_p).scale(yi / one_minus_p))
-                    .add(&O3::constant(
-                        yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
-                    ))
-                    .scale(2.0);
-                let loglik = dev
-                    .mul(&o3_recip(&phi).scale(-0.5))
-                    .sub(&o3_ln(&phi.scale(2.0 * std::f64::consts::PI)).scale(0.5))
-                    .sub(&O3::constant(0.5 * p * yi.ln()));
+                    .sub(&o3_powf(&mu, one_minus_p).scale(yi / one_minus_p));
+                let loglik = o3_exp(&eta_d)
+                    .mul(&kernel)
+                    .neg()
+                    .add(&tweedie_log_series_jet::<O3, 2>(&eta_d, yi, p))
+                    .sub(&O3::constant(yi.ln()));
                 loglik.scale(-wi)
             } else {
                 let c = o3_powf(&mu, two_minus_p).scale(1.0 / two_minus_p);
