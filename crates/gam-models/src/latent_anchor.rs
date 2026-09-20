@@ -1299,6 +1299,19 @@ impl AnchorTaylor {
         }
     }
 
+    /// `∂_q^i ∂_b^j α = i!·j!·c[i][j]` for any `i + j ≤ 5`. The table is
+    /// solved in density-normalized units, so every partial it holds stays
+    /// finite where each node's density underflows; a consumer that reads the
+    /// anchor's fifth order from here needs no linear-probability Jacobian
+    /// (gam#3639).
+    pub(crate) fn partial(&self, i: usize, j: usize) -> f64 {
+        assert!(
+            i + j <= ANCHOR_TAYLOR_ORDER,
+            "anchor Taylor table holds partials through total order {ANCHOR_TAYLOR_ORDER}, asked for ({i}, {j})"
+        );
+        FACTORIAL[i] * FACTORIAL[j] * self.coefficients[i][j]
+    }
+
     /// `(i, j)` of each coefficient a [`RootSlot`] stores beside the root, by
     /// total degree: `c[d][0], c[d−1][1], …, c[0][d]` for `d = 1..=5`.
     fn stored_entries() -> impl Iterator<Item = (usize, usize)> {

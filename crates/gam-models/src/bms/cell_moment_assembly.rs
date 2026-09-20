@@ -506,6 +506,9 @@ impl BernoulliMarginalSlopeFamily {
     /// observed signed-probit NLL is composed on top. Reading `(value, g, H)`
     /// off `Order2<2>` serves `primary_grad_hess`; reading `.t3` / `.t4` off
     /// `Tower4<2>` serves `third_full` / `fourth_full`.
+    ///
+    /// The row's Taylor table comes back beside the lift, so a caller that
+    /// needs the intercept's fifth order reads it from the same solve.
     fn empirical_rigid_intercept_jet<S: gam_math::jet_scalar::JetScalar<2>>(
         &self,
         row: usize,
@@ -513,9 +516,9 @@ impl BernoulliMarginalSlopeFamily {
         slope: f64,
         nodes: &[f64],
         measure_weights: &[f64],
-    ) -> Result<S, String> {
+    ) -> Result<(S, AnchorTaylor), String> {
         let observed_slope = S::variable(slope, 1).scale(self.probit_frailty_scale());
-        self.empirical_rigid_intercept_lift(
+        self.empirical_rigid_intercept_lift_and_table(
             row,
             marginal,
             &S::variable(marginal.eta, 0),
@@ -610,6 +613,29 @@ impl BernoulliMarginalSlopeFamily {
         nodes: &[f64],
         measure_weights: &[f64],
     ) -> Result<S, String> {
+        Ok(self
+            .empirical_rigid_intercept_lift_and_table(
+                row,
+                marginal,
+                m_jet,
+                observed_slope,
+                nodes,
+                measure_weights,
+            )?
+            .0)
+    }
+
+    /// [`Self::empirical_rigid_intercept_lift`] together with the row's anchor
+    /// Taylor table the lift composed.
+    fn empirical_rigid_intercept_lift_and_table<S: gam_math::jet_scalar::JetScalar<2>>(
+        &self,
+        row: usize,
+        marginal: BernoulliMarginalLinkMap,
+        m_jet: &S,
+        observed_slope: &S,
+        nodes: &[f64],
+        measure_weights: &[f64],
+    ) -> Result<(S, AnchorTaylor), String> {
         let observed_slope_value = gam_math::nested_dual::JetField::value(observed_slope);
         let taylor = match self
             .intercept_warm_starts
@@ -630,16 +656,23 @@ impl BernoulliMarginalSlopeFamily {
             }
         };
         let q_jet = m_jet.compose_unary([marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4]);
-        Ok(taylor.lift(&q_jet, &observed_slope.with_value(0.0)))
+        Ok((taylor.lift(&q_jet, &observed_slope.with_value(0.0)), taylor))
     }
 }
 
 impl BernoulliMarginalSlopeFamily {
 
-    /// Analytic fifth-order implicit differentiation. The known fourth-order
-    /// intercept determines the fifth Bell remainder of every node. The only
-    /// unknown fifth derivative is multiplied by the scalar F_a, so one division
-    /// finishes every symmetric component; no additional root solve is needed.
+    /// Analytic fifth-order implicit differentiation, read from the anchor's
+    /// Taylor table. The probit marginal index is `q = m` exactly
+    /// ([`bernoulli_marginal_link_map`]), so the anchored intercept
+    /// `a(m, g) = α(m, s·g)` has fifth partials
+    /// `∂_m^{5−k} ∂_g^k a = s^k·∂_q^{5−k} ∂_b^k α`, which the table holds in
+    /// density-normalized units. A row whose every node density underflows
+    /// (|q| ≳ 37.5) therefore keeps an exact fifth order. The row NLL's fifth
+    /// derivative is its composition through the intercept's order-four jet
+    /// plus the single term that reads the intercept's fifth order,
+    /// `ℓ′·∂⁵a`; no linear-probability Jacobian `Σ w φ(η)` is formed
+    /// (gam#3639).
     pub(super) fn empirical_rigid_row_fifth_full(
         &self,
         row: usize,
@@ -651,7 +684,18 @@ impl BernoulliMarginalSlopeFamily {
         if self.weights[row] == 0.0 {
             return Ok([[[[[0.0; 2]; 2]; 2]; 2]; 2]);
         }
-        let a = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+        if !(marginal.q == marginal.eta
+            && marginal.q1 == 1.0
+            && marginal.q2 == 0.0
+            && marginal.q3 == 0.0
+            && marginal.q4 == 0.0)
+        {
+            return Err(format!(
+                "empirical fifth derivative requires the probit marginal index q = η, got q-stack [{}, {}, {}, {}, {}] at η={}",
+                marginal.q, marginal.q1, marginal.q2, marginal.q3, marginal.q4, marginal.eta
+            ));
+        }
+        let (a, taylor) = self.empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
             row,
             marginal,
             slope,
@@ -659,38 +703,9 @@ impl BernoulliMarginalSlopeFamily {
             measure_weights,
         )?;
         let s = self.probit_frailty_scale();
-        let mut fa = 0.0;
-        let mut remainder = [[[[[0.0; 2]; 2]; 2]; 2]; 2];
-        for (&node, &weight) in nodes.iter().zip(measure_weights) {
-            let eta = a.v + s * slope * node;
-            let d = unary_derivatives_normal_cdf(eta);
-            let fifth = (eta.powi(4) - 6.0 * eta * eta + 3.0) * d[1];
-            fa += weight * d[1];
-            let composed = implicit_intercept_fifth_composition(
-                &a,
-                s * node,
-                [d[0], d[1], d[2], d[3], d[4], fifth],
-            );
-            for i in 0..2 {
-                for j in 0..2 {
-                    for k in 0..2 {
-                        for l in 0..2 {
-                            for m in 0..2 {
-                                remainder[i][j][k][l][m] += weight * composed[i][j][k][l][m];
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        if !fa.is_finite() || fa <= 0.0 {
-            return Err(format!(
-                "empirical fifth derivative has non-positive calibration Jacobian {fa}"
-            ));
-        }
-        let eta = marginal.eta;
-        let mu5 = (eta.powi(4) - 6.0 * eta * eta + 3.0) * marginal.mu1;
-        remainder[0][0][0][0][0] -= mu5;
+        // ∂⁵a with k slope axes among the five: s^k·∂_q^{5−k} ∂_b^k α.
+        let intercept_fifth: [f64; 6] =
+            std::array::from_fn(|k| s.powi(k as i32) * taylor.partial(5 - k, k));
         let sign = 2.0 * self.y[row] - 1.0;
         let margin = sign * (a.v + s * slope * self.z[row]);
         let mut stack = signed_probit_neglog_unary_stack_fifth(margin, self.weights[row]);
@@ -708,11 +723,17 @@ impl BernoulliMarginalSlopeFamily {
                 for k in 0..2 {
                     for l in 0..2 {
                         for m in 0..2 {
-                            fifth[i][j][k][l][m] -= stack[1] * remainder[i][j][k][l][m] / fa;
+                            let slope_axes = i + j + k + l + m;
+                            fifth[i][j][k][l][m] += stack[1] * intercept_fifth[slope_axes];
                         }
                     }
                 }
             }
+        }
+        if !fifth.iter().flatten().flatten().flatten().flatten().all(|x| x.is_finite()) {
+            return Err(format!(
+                "empirical fifth derivative is non-finite at row {row}"
+            ));
         }
         Ok(fifth)
     }
@@ -4091,6 +4112,97 @@ mod empirical_rigid_jet_oracle_tests {
                                     (fd - exact).abs() < 2.0e-7 * (1.0 + fd.abs()),
                                     "frailty={frailty_sd:?} axes={a}{b}{c}{d}{axis} fifth={exact} fd={fd}"
                                 );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// gam#3639: past |q| ≈ 37.5 every node density `φ(a + s·g·x_k)` of the
+    /// rigid calibration underflows to zero, so a fifth order assembled from
+    /// linear densities divides a zero remainder by a zero Jacobian and
+    /// refuses. The anchor's Taylor table is density-normalized, and the fifth
+    /// tensor read from it is still the derivative of the fourth there.
+    #[test]
+    fn empirical_fifth_tensor_stays_exact_where_node_densities_underflow_3639() {
+        let grid = test_grid();
+        let map = |eta| {
+            bernoulli_marginal_link_map(
+                &InverseLink::Standard(gam_problem::StandardLink::Probit),
+                eta,
+            )
+            .unwrap()
+        };
+        for frailty_sd in [None, Some(0.3)] {
+            for y in [0.0, 1.0] {
+                let family =
+                    empirical_family(vec![y], vec![0.5], vec![0.8], frailty_sd, grid.clone());
+                for point in [[-39.0, -0.35], [39.0, 0.3]] {
+                    let (intercept, _) = family
+                        .empirical_rigid_intercept_jet::<gam_math::jet_tower::Tower4<2>>(
+                            0,
+                            map(point[0]),
+                            point[1],
+                            &grid.nodes,
+                            &grid.weights,
+                        )
+                        .unwrap();
+                    let s = family.probit_frailty_scale();
+                    let linear_jacobian: f64 = grid
+                        .nodes
+                        .iter()
+                        .zip(&grid.weights)
+                        .map(|(&x, &w)| {
+                            w * gam_math::probability::normal_pdf(intercept.v + s * point[1] * x)
+                        })
+                        .sum();
+                    assert_eq!(
+                        linear_jacobian, 0.0,
+                        "fixture must sit where the linear calibration Jacobian underflows"
+                    );
+                    let fifth = family
+                        .empirical_rigid_row_fifth_full(
+                            0,
+                            map(point[0]),
+                            point[1],
+                            &grid.nodes,
+                            &grid.weights,
+                        )
+                        .unwrap();
+                    for axis in 0..2 {
+                        let h = 2.0e-5;
+                        let mut plus = point;
+                        let mut minus = point;
+                        plus[axis] += h;
+                        minus[axis] -= h;
+                        let eval = |x: [f64; 2]| {
+                            family
+                                .empirical_rigid_fourth_full_closed_form(
+                                    0,
+                                    map(x[0]),
+                                    x[1],
+                                    &grid.nodes,
+                                    &grid.weights,
+                                )
+                                .unwrap()
+                        };
+                        let fp = eval(plus);
+                        let fm = eval(minus);
+                        for a in 0..2 {
+                            for b in 0..2 {
+                                for c in 0..2 {
+                                    for d in 0..2 {
+                                        let fd = (fp[a][b][c][d] - fm[a][b][c][d]) / (2.0 * h);
+                                        let exact = fifth[a][b][c][d][axis];
+                                        assert!(
+                                            exact.is_finite()
+                                                && (fd - exact).abs() < 2.0e-7 * (1.0 + fd.abs()),
+                                            "frailty={frailty_sd:?} y={y} point={point:?} axes={a}{b}{c}{d}{axis} fifth={exact} fd={fd}"
+                                        );
+                                    }
+                                }
                             }
                         }
                     }
