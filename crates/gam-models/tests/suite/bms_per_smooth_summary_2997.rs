@@ -47,7 +47,8 @@ fn bms_summary_has_one_row_per_smooth_of_both_predictors_2997() {
         ..FitConfig::default()
     };
     let payload = fit_formula_to_payload("y ~ s(x)".to_string(), &data, &config).expect("fit");
-    let summary = saved_model_summary(&FittedModel::from_payload(payload)).expect("summary");
+    let model = FittedModel::from_payload(payload);
+    let summary = saved_model_summary(&model).expect("summary");
     assert_eq!(
         summary.smooth_terms_unavailable, None,
         "per-smooth table absent; λ = {:?}",
@@ -70,6 +71,46 @@ fn bms_summary_has_one_row_per_smooth_of_both_predictors_2997() {
     assert!(
         names.iter().any(|name| name.contains('w')),
         "slope s(w) row: {names:?}"
+    );
+    let smooth_predictors: Vec<(Option<&str>, &str)> = summary
+        .smooth_terms
+        .iter()
+        .map(|row| (row.predictor, row.name.as_str()))
+        .collect();
+    assert!(
+        smooth_predictors
+            .iter()
+            .any(|(predictor, name)| *predictor == Some("marginal") && name.contains('x'))
+            && smooth_predictors
+                .iter()
+                .any(|(predictor, name)| *predictor == Some("slope") && name.contains('w')),
+        "each smooth row names its predictor: {smooth_predictors:?}"
+    );
+    // Both formulas carry an intercept; each is read at its own block's
+    // coefficient, so the parametric table holds one per predictor, tagged.
+    assert_eq!(
+        summary.parametric_terms_unavailable, None,
+        "parametric table absent"
+    );
+    let parametric: Vec<(Option<&str>, &str)> = summary
+        .parametric_terms
+        .iter()
+        .map(|row| (row.predictor, row.name.as_str()))
+        .collect();
+    assert_eq!(
+        parametric,
+        vec![(Some("marginal"), "Intercept"), (Some("slope"), "Intercept")],
+        "one intercept row per predictor"
+    );
+    // The slope predictor is the fitted baseline plus the slope block, so the
+    // slope intercept is read at the slope block's coefficient when baseline
+    // and intercept recover the simulated mean slope 0.6 (`E tanh(w) = 0`).
+    let baseline_slope = model.baseline_slope.expect("fitted slope baseline");
+    let mean_slope = baseline_slope + summary.parametric_terms[1].estimate;
+    assert!(
+        (mean_slope - 0.6).abs() < 0.15,
+        "slope baseline {baseline_slope} + slope intercept {} = {mean_slope}, simulated 0.6",
+        summary.parametric_terms[1].estimate
     );
     for row in &summary.smooth_terms {
         assert!(

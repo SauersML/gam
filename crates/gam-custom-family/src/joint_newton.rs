@@ -5718,6 +5718,124 @@ pub(crate) fn joint_pcg_eisenstat_walker_forcing(
     (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
 }
 
+/// The penalized Hessian spectrum a dense joint-Newton step measured, kept to
+/// price the CG route of the steps after it (gam#3285).
+///
+/// `lower` and `upper` are the extreme eigenvalues of `B = D^{-½}(H + S)D^{-½}`
+/// for the trust metric `D` the dense step whitened by.
+#[derive(Clone, Debug)]
+pub(crate) struct JointPcgConditionRecord {
+    lower: f64,
+    upper: f64,
+    metric: Array1<f64>,
+}
+
+/// The CG route of one joint-Newton step: its iteration budget and the
+/// condition bound the budget came from.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct JointPcgRoute {
+    pub(crate) iterations: usize,
+    pub(crate) condition: f64,
+}
+
+impl JointPcgConditionRecord {
+    /// The record of a positive-definite `H + S`. A spectrum whose smallest
+    /// eigenvalue is at or below its machine-rank floor `λ_max·√p·ε` (or is not
+    /// finite) is numerically singular and gives CG no condition number, so it
+    /// records nothing and the next step stays dense.
+    pub(crate) fn from_spectrum(
+        spectrum: &whitened_spectrum::WhitenedHessianSpectrum,
+    ) -> Option<Self> {
+        let (lower, upper) = spectrum
+            .gamma
+            .iter()
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &g| {
+                (lo.min(g), hi.max(g))
+            });
+        if !(lower.is_finite() && upper.is_finite() && lower > spectrum.numerical_floor.max(0.0)) {
+            return None;
+        }
+        let metric = spectrum.d_inv_sqrt.mapv(|s| 1.0 / (s * s));
+        metric
+            .iter()
+            .all(|d| d.is_finite() && *d > 0.0)
+            .then_some(Self {
+                lower,
+                upper,
+                metric,
+            })
+    }
+
+    /// A bound on the condition number of the CG operator
+    /// `P = M^{-½}(H + S + rI)M^{-½}` for the Jacobi preconditioner `M`, at the
+    /// Hessian this record measured.
+    ///
+    /// With `E² = D/M`, `M^{-½}(H + S)M^{-½} = E B E`, whose eigenvalues lie in
+    /// `[lower·min E², upper·max E²]` (Ostrowski). The ridge adds `r·M^{-1}`, whose
+    /// eigenvalues lie in `[r/max M, r/min M]`, and Weyl bounds the sum. The bound
+    /// is exact for the recorded `H`; it does not account for the change of `H`
+    /// between that step's `β` and this one.
+    pub(crate) fn preconditioned_condition(
+        &self,
+        preconditioner: &Array1<f64>,
+        ridge: f64,
+    ) -> Option<f64> {
+        if preconditioner.len() != self.metric.len() || !(ridge.is_finite() && ridge >= 0.0) {
+            return None;
+        }
+        let mut e2_min = f64::INFINITY;
+        let mut e2_max = 0.0_f64;
+        let mut m_min = f64::INFINITY;
+        let mut m_max = 0.0_f64;
+        for (&d, &m) in self.metric.iter().zip(preconditioner.iter()) {
+            if !(m.is_finite() && m > 0.0) {
+                return None;
+            }
+            let e2 = d / m;
+            e2_min = e2_min.min(e2);
+            e2_max = e2_max.max(e2);
+            m_min = m_min.min(m);
+            m_max = m_max.max(m);
+        }
+        let low = self.lower * e2_min + ridge / m_max;
+        let high = self.upper * e2_max + ridge / m_min;
+        let condition = high / low;
+        (condition.is_finite() && low > 0.0).then_some(condition.max(1.0))
+    }
+
+    /// The CG route when it is cheaper than the dense one.
+    ///
+    /// CG needs [`gam_linalg::pcg::pcg_iteration_bound`] iterations at the
+    /// forcing tolerance `rel_tol` and spends [`gam_linalg::pcg::pcg_products`]
+    /// of them. The route is CG only when that is fewer than `dense_products`,
+    /// the dense route's cost in products; otherwise it is `None` and the step
+    /// goes dense.
+    pub(crate) fn cg_route(
+        &self,
+        preconditioner: &Array1<f64>,
+        ridge: f64,
+        rel_tol: f64,
+        dense_products: usize,
+    ) -> Option<JointPcgRoute> {
+        let condition = self.preconditioned_condition(preconditioner, ridge)?;
+        let (m_min, m_max) = preconditioner
+            .iter()
+            .fold((f64::INFINITY, 0.0_f64), |(lo, hi), &m| {
+                (lo.min(m), hi.max(m))
+            });
+        let iterations = gam_linalg::pcg::pcg_iteration_bound(
+            condition,
+            m_max / m_min,
+            rel_tol,
+            preconditioner.len(),
+        )?;
+        (gam_linalg::pcg::pcg_products(iterations) < dense_products).then_some(JointPcgRoute {
+            iterations,
+            condition,
+        })
+    }
+}
+
 pub(crate) fn apply_joint_penalized_hessian_into(
     source: &JointHessianSource,
     ranges: &[(usize, usize)],
@@ -6540,6 +6658,149 @@ mod constrained_numerical_fixed_point_tests {
             empty.roundoff_ceiling(),
             0.0,
             "a sum of zero-magnitude summands is exact and carries no rounding"
+        );
+    }
+}
+
+#[cfg(test)]
+mod joint_pcg_route_tests {
+    use super::whitened_spectrum::WhitenedHessianSpectrum;
+    use super::{JointPcgConditionRecord, KKT_REFUSAL_RANK_TOL};
+    use ndarray::{Array1, Array2};
+
+    /// `A = Q diag(λ) Qᵀ` with a Householder `Q`, scaled to `D^{½} A D^{½}` so the
+    /// metric-whitened spectrum is exactly `λ`.
+    fn planted_hessian(eigenvalues: &[f64], metric: &Array1<f64>) -> Array2<f64> {
+        let p = eigenvalues.len();
+        let u = Array1::from_iter((0..p).map(|i| ((i as f64) * 0.7 + 0.3).sin()));
+        let u = &u / u.dot(&u).sqrt();
+        let mut q = Array2::<f64>::eye(p);
+        for i in 0..p {
+            for j in 0..p {
+                q[[i, j]] -= 2.0 * u[i] * u[j];
+            }
+        }
+        let mut a = Array2::<f64>::zeros((p, p));
+        for i in 0..p {
+            for j in 0..p {
+                let whitened: f64 = (0..p).map(|k| q[[i, k]] * eigenvalues[k] * q[[j, k]]).sum();
+                a[[i, j]] = metric[i].sqrt() * whitened * metric[j].sqrt();
+            }
+        }
+        a
+    }
+
+    fn record(hessian: &Array2<f64>, metric: &Array1<f64>) -> Option<JointPcgConditionRecord> {
+        let rhs = Array1::from_elem(metric.len(), 1.0);
+        let spectrum =
+            WhitenedHessianSpectrum::decompose(hessian, &rhs, metric, KKT_REFUSAL_RANK_TOL)
+                .expect("a finite symmetric matrix decomposes");
+        JointPcgConditionRecord::from_spectrum(&spectrum)
+    }
+
+    /// The exact condition number of `M^{-½}(A + rI)M^{-½}`.
+    fn preconditioned_condition(a: &Array2<f64>, preconditioner: &Array1<f64>, ridge: f64) -> f64 {
+        let p = preconditioner.len();
+        let mut operator = a.clone();
+        for i in 0..p {
+            operator[[i, i]] += ridge;
+        }
+        for i in 0..p {
+            for j in 0..p {
+                operator[[i, j]] /= (preconditioner[i] * preconditioner[j]).sqrt();
+            }
+        }
+        let rhs = Array1::from_elem(p, 1.0);
+        let spectrum = WhitenedHessianSpectrum::decompose(
+            &operator,
+            &rhs,
+            &Array1::from_elem(p, 1.0),
+            KKT_REFUSAL_RANK_TOL,
+        )
+        .expect("a finite symmetric matrix decomposes");
+        let lower = spectrum.gamma.iter().copied().fold(f64::INFINITY, f64::min);
+        let upper = spectrum
+            .gamma
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max);
+        upper / lower
+    }
+
+    fn geometric(lower: f64, upper: f64, p: usize) -> Vec<f64> {
+        (0..p)
+            .map(|i| lower * (upper / lower).powf(i as f64 / (p - 1) as f64))
+            .collect()
+    }
+
+    #[test]
+    fn the_bound_is_exact_when_the_preconditioner_is_the_metric() {
+        let metric = Array1::from(geometric(0.2, 30.0, 10));
+        let a = planted_hessian(&geometric(1.0, 250.0, 10), &metric);
+        let bound = record(&a, &metric)
+            .expect("a positive-definite Hessian records its spectrum")
+            .preconditioned_condition(&metric, 0.0)
+            .expect("a positive preconditioner has a condition bound");
+        assert!(
+            (bound / 250.0 - 1.0).abs() < 1e-9,
+            "bound {bound} vs planted 250"
+        );
+    }
+
+    #[test]
+    fn the_bound_contains_the_preconditioned_spectrum() {
+        let p = 10;
+        let metric = Array1::from(geometric(0.2, 30.0, p));
+        let a = planted_hessian(&geometric(0.5, 400.0, p), &metric);
+        let recorded = record(&a, &metric).expect("a positive-definite Hessian records");
+        for (preconditioner, ridge) in [
+            (Array1::from(geometric(1.0, 5.0, p)), 0.0),
+            (Array1::from(geometric(40.0, 0.1, p)), 1e-3),
+            (metric.mapv(|d| d * 3.0), 2.0),
+        ] {
+            let exact = preconditioned_condition(&a, &preconditioner, ridge);
+            let bound = recorded
+                .preconditioned_condition(&preconditioner, ridge)
+                .expect("a positive preconditioner has a condition bound");
+            assert!(
+                exact <= bound * (1.0 + 1e-10),
+                "exact condition {exact} exceeds the bound {bound}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_non_positive_spectrum_records_nothing() {
+        let metric = Array1::from_elem(6, 1.0);
+        let indefinite = planted_hessian(&[-1.0, 0.5, 1.0, 2.0, 3.0, 4.0], &metric);
+        assert!(record(&indefinite, &metric).is_none());
+        let singular = planted_hessian(&[0.0, 0.5, 1.0, 2.0, 3.0, 4.0], &metric);
+        assert!(record(&singular, &metric).is_none());
+    }
+
+    #[test]
+    fn the_route_is_cg_only_when_its_bound_costs_less_than_the_dense_route() {
+        let p = 40;
+        let metric = Array1::from_elem(p, 1.0);
+        let tame = record(&planted_hessian(&geometric(1.0, 10.0, p), &metric), &metric)
+            .expect("a positive-definite Hessian records");
+        let iterations = gam_linalg::pcg::pcg_iteration_bound(10.0, 1.0, 1e-6, p)
+            .expect("a condition number has a bound");
+        let products = gam_linalg::pcg::pcg_products(iterations);
+        let route = tame
+            .cg_route(&metric, 0.0, 1e-6, products + 1)
+            .expect("a bound below the dense cost routes to CG");
+        assert_eq!(route.iterations, iterations);
+        assert!((route.condition / 10.0 - 1.0).abs() < 1e-9);
+        assert!(
+            tame.cg_route(&metric, 0.0, 1e-6, products).is_none(),
+            "a bound that costs as much as the dense route goes dense"
+        );
+        let stiff = record(&planted_hessian(&geometric(1.0, 1e10, p), &metric), &metric)
+            .expect("a positive-definite Hessian records");
+        assert!(
+            stiff.cg_route(&metric, 0.0, 1e-6, products + 1).is_none(),
+            "an ill-conditioned bound goes dense"
         );
     }
 }

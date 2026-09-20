@@ -243,8 +243,9 @@ gamfit.fit(df,
 ```
 
 - `frailty_sd`: fix the frailty standard deviation. Required for
-  `gaussian-shift` (learnable sigma is not implemented for the exact
-  marginal-slope outer solver) and for some other modes; omit to let
+  `gaussian-shift` in marginal-slope survival, where the likelihood reads
+  sigma only through the slope and so does not identify a learned one
+  (gam#2938), and for some other modes; omit to let
   hazard-multiplier latent models learn it where supported.
 - `hazard_loading`: only used with `frailty_kind="hazard-multiplier"`.
   `"full"` loads frailty into every observation; `"loaded-vs-unloaded"`
