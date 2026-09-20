@@ -196,13 +196,17 @@ pub fn build_sae_minimal_seed(
         }
         None => seed_coords,
     };
-    if coords_are_cold
-        && k_atoms > 1
+    // Every routing map that picks atoms per row needs the atoms' cold charts
+    // separated by the data, or each atom sees the same shared PCA chart and no
+    // row prefers any atom. Hard TopK is such a map too (#4519).
+    let cold_routing = k_atoms > 1
         && matches!(
             request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+            SaeFitAssignmentKind::Softmax
+                | SaeFitAssignmentKind::OrderedBetaBernoulli
+                | SaeFitAssignmentKind::TopK
+        );
+    if coords_are_cold && cold_routing {
         let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
         let plan_kinds: Vec<SaeAtomBasisKind> =
             plans.iter().map(|plan| plan.kind().clone()).collect();
@@ -255,13 +259,12 @@ pub fn build_sae_minimal_seed(
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
-    if logits_are_cold
-        && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+    // Neutral cold logits are a tie on every row. Hard TopK breaks ties toward
+    // the lower atom index, so it would route every row to the first `top_k`
+    // atoms and leave the rest with an identically zero decoder (#4519). The
+    // residual seed is the data's own per-row preference; TopK reads only its
+    // order, and rows the data leave tied stay tied.
+    if logits_are_cold && cold_routing {
         const RESIDUAL_SEED_GAIN: f64 = 4.0;
         initial_logits = sae_residual_seed_logits(
             basis_values.view(),
@@ -371,6 +374,54 @@ mod tests {
             assert_eq!(
                 report.initial_logits, residual,
                 "random_state={random_state}: the cold logits must be the residual seed itself"
+            );
+        }
+    }
+
+    /// #4519 — a cold hard-TopK(1) seed over two planted circles routes rows to
+    /// both atoms and seeds a nonzero decoder for each. Neutral logits tie every
+    /// row, TopK breaks ties toward atom 0, and atom 1 used to get no rows and an
+    /// identically zero decoder, which the #2822 entry gate refuses.
+    #[test]
+    fn cold_topk_seed_routes_rows_to_every_atom_4519() {
+        let n = 48usize;
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for row in 0..n {
+            let theta = std::f64::consts::TAU * (row / 2) as f64 / (n / 2) as f64;
+            let plane = 2 * (row % 2);
+            target[[row, plane]] = 2.0 * theta.cos();
+            target[[row, plane + 1]] = 2.0 * theta.sin();
+        }
+        let report = build_sae_minimal_seed(SaeMinimalSeedRequest {
+            target: target.view(),
+            atom_basis: vec!["periodic".to_string(); 2],
+            atom_dim: vec![1, 1],
+            assignment_kind: SaeFitAssignmentKind::TopK,
+            alpha: 1.0,
+            tau: 1.0,
+            threshold: 0.0,
+            top_k: Some(1),
+            random_state: 45,
+            initial_logits: None,
+            initial_coords: None,
+        })
+        .expect("a planted two-circle TopK seed must build");
+        for atom_idx in 0..2 {
+            let won = (0..n)
+                .filter(|&row| {
+                    crate::assignment::topk_row(report.initial_logits.row(row), 1)[atom_idx] == 1.0
+                })
+                .count();
+            assert!(won > 0, "atom {atom_idx} wins no row of the cold TopK seed");
+            let decoder_energy: f64 = report
+                .decoder_coefficients
+                .index_axis(ndarray::Axis(0), atom_idx)
+                .iter()
+                .map(|value| value * value)
+                .sum();
+            assert!(
+                decoder_energy > 0.0,
+                "atom {atom_idx} has an identically zero cold decoder"
             );
         }
     }

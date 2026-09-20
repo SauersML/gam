@@ -14,13 +14,13 @@ pub(crate) fn faer_frob_inner(a: MatRef<'_, f64>, b: MatRef<'_, f64>) -> f64 {
         }
         sum
     } else {
-        let mut sum = KahanSum::default();
+        let mut sum = CompensatedSum::default();
         for j in 0..n {
             for i in 0..m {
                 sum.add(a[(i, j)] * b[(i, j)]);
             }
         }
-        sum.sum()
+        sum.value()
     }
 }
 
@@ -28,11 +28,11 @@ pub(crate) fn kahan_sum<I>(iter: I) -> f64
 where
     I: IntoIterator<Item = f64>,
 {
-    let mut acc = KahanSum::default();
+    let mut acc = CompensatedSum::default();
     for value in iter {
         acc.add(value);
     }
-    acc.sum()
+    acc.value()
 }
 
 #[derive(Clone, Debug)]
@@ -124,9 +124,7 @@ impl ParametricColumnConditioning {
     /// rewrites a conditioned column `j` from column `j` and, when `mean_j` is
     /// nonzero, the intercept column; both are zero outside `support`.
     pub(crate) fn leaves_matrix_supported_on(&self, support: &std::ops::Range<usize>) -> bool {
-        let intercept_in_support = self
-            .intercept_idx
-            .is_some_and(|idx| support.contains(&idx));
+        let intercept_in_support = self.intercept_idx.is_some_and(|idx| support.contains(&idx));
         self.columns
             .iter()
             .all(|&(j, mean, _)| !support.contains(&j) && (mean == 0.0 || !intercept_in_support))
@@ -428,12 +426,9 @@ impl ParametricColumnConditioning {
                 .backtransform_penalized_hessian(geometry.penalized_hessian.as_array())
                 .into();
             if let Some(posterior) = geometry.constrained_posterior.as_mut() {
-                posterior.constraints.a =
-                    self.right_multiply_by_m_inv(&posterior.constraints.a);
+                posterior.constraints.a = self.right_multiply_by_m_inv(&posterior.constraints.a);
                 posterior.mode = self.backtransform_beta(&posterior.mode);
-                if let Some((unconstrained_center, correction)) =
-                    posterior.available_parts_mut()
-                {
+                if let Some((unconstrained_center, correction)) = posterior.available_parts_mut() {
                     *unconstrained_center = self.backtransform_beta(unconstrained_center);
                     if let Some(correction) = correction {
                         correction.lift = self.left_multiply_by_m(&correction.lift);
@@ -874,14 +869,28 @@ mod factorized_standard_errors_2960_tests {
         ];
 
         let solve = |rhs: &Array2<f64>, rows: std::ops::Range<usize>| {
-            assert_eq!(rhs.ncols(), rows.len(), "one right-hand-side column per row");
+            assert_eq!(
+                rhs.ncols(),
+                rows.len(),
+                "one right-hand-side column per row"
+            );
             Ok::<_, EstimationError>(inverse_hessian.dot(rhs))
         };
         for (label, conditioning, factor, constraint) in [
             ("unconditioned", &unconditioned, None, None),
             ("conditioned", &conditioned, None, None),
-            ("conditioned and constrained", &conditioned, None, Some(&correction)),
-            ("conditioned, smoothing-corrected", &conditioned, Some(&smoothing_factor), None),
+            (
+                "conditioned and constrained",
+                &conditioned,
+                None,
+                Some(&correction),
+            ),
+            (
+                "conditioned, smoothing-corrected",
+                &conditioned,
+                Some(&smoothing_factor),
+                None,
+            ),
             (
                 "conditioned, constrained and smoothing-corrected",
                 &conditioned,

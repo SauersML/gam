@@ -2899,64 +2899,6 @@ fn freeze_geometry_from_metadata(
     }
 }
 
-/// Put a replay spec's identifiability back to the TERM-LOCAL chart the
-/// collection gauge was derived on (gam#2760).
-///
-/// Used for exactly one thing: a term whose collection applied a
-/// [`gam_terms::smooth::SmoothCollectionGauge`], whose `(T, R)` pair is re-derived
-/// at every ψ rebuild and must therefore not ALSO arrive frozen inside the spec.
-/// `Some(z)` replays the term's own chart verbatim (a center sum-to-zero frame,
-/// a linear-orthogonality frame, a caller's frozen chart — all ψ-independent);
-/// `None` states that the local build applied none, which is the radial families'
-/// ordinary case, where `OrthogonalToParametric` defers to the gauge entirely.
-///
-/// Only the families the spatial outer search rebuilds are listed. A gauged term
-/// of any other family is never re-realized by this realizer, so its replay spec
-/// is left exactly as the freeze wrote it.
-fn restore_local_identifiability_chart(
-    replay: &mut SmoothBasisSpec,
-    local_chart: Option<&Array2<f64>>,
-) {
-    let spatial = |chart: Option<&Array2<f64>>| match chart {
-        Some(transform) => SpatialIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        },
-        None => SpatialIdentifiability::None,
-    };
-    if let SmoothBasisSpec::Duchon { spec, .. } = &mut *replay {
-        spec.identifiability = spatial(local_chart);
-    }
-    if let SmoothBasisSpec::ThinPlate { spec, .. } = &mut *replay {
-        spec.identifiability = spatial(local_chart);
-    }
-    if let SmoothBasisSpec::Matern { spec, .. } = &mut *replay {
-        spec.identifiability = match local_chart {
-            Some(transform) => MaternIdentifiability::FrozenTransform {
-                transform: transform.clone(),
-            },
-            None => MaternIdentifiability::None,
-        };
-    }
-    // These two families have no "no chart" policy — their local build always
-    // applies a center sum-to-zero section — so a `None` here would be a claim
-    // the enum cannot express. It is left alone instead of invented, and a
-    // gauged term of theirs whose metadata carried no transform keeps whatever
-    // the freeze wrote (which is that same `CenterSumToZero` default).
-    if let (SmoothBasisSpec::ConstantCurvature { spec, .. }, Some(transform)) =
-        (&mut *replay, local_chart)
-    {
-        spec.identifiability = gam_terms::basis::ConstantCurvatureIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        };
-    }
-    if let (SmoothBasisSpec::MeasureJet { spec, .. }, Some(transform)) = (&mut *replay, local_chart)
-    {
-        spec.identifiability = gam_terms::basis::MeasureJetIdentifiability::FrozenTransform {
-            transform: transform.clone(),
-        };
-    }
-}
-
 /// Shape of the frozen radial chart a rebuild spec carries, for diagnostics.
 fn spatial_frozen_radial_chart_shape(termspec: &SmoothTermSpec) -> Option<(usize, usize)> {
     match &termspec.basis {
@@ -3337,15 +3279,17 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // derivatives, and the geometry cache all start from the same centers,
         // scaling, identifiability transform, and penalty topology.
         //
-        // EXCEPT the half a collection GAUGE owns (gam#2760). The gauge carries
-        // the fixed row space `C` AND the fixed reference coefficient chart
-        // `T0`; a moving-psi value is represented canonically as
-        // `P_C X_local(psi) T0`. The freeze above writes the metadata's composed
-        // `z_local*T0` into the replay spec. Leaving that composition in place
-        // would apply `T0` once in the local rebuild and once again when the
-        // gauge performs its fixed-chart placement.
+        // A collection GAUGE's half is frozen in the TERM-LOCAL chart
+        // (gam#2760, #3001). The gauge carries the fixed row space `C` AND the
+        // fixed reference coefficient chart `T0`; a moving-psi value is
+        // represented canonically as `P_C X_local(psi) T0`. The freeze writes
+        // a gauged term's local chart `z_local` into its basis and its `Q` onto
+        // the term, never the metadata's composed `z_local·Q·T0`. A replay spec
+        // carrying that composition would apply `T0` once in the local rebuild
+        // and once again when the gauge performs its fixed-chart placement.
         //
-        // MEASURED on the `kappa_loop_n_scaling` fixture's own spec
+        // MEASURED, when the freeze still wrote the composition, on the
+        // `kappa_loop_n_scaling` fixture's own spec
         // (`examples/probe_2760_replay_gauge_double_apply`, 12 centers, n = 600,
         // one Duchon term, `arm=Delete`, `C = [1]`, replay chart
         // `FrozenTransform(12, 11)`) — the orthogonality residual of the
@@ -3363,40 +3307,13 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
         // which is why the Matérn fixture the gauge work was verified on stayed
         // green while every Duchon one went red.
         //
-        // So a gauged term's replay spec is put back into the TERM-LOCAL chart
-        // the fixed `T0` was derived on. The gauge carries both pieces because
-        // the composition in metadata cannot be decomposed after the fact.
-        // Everything else the freeze decides (centers, input scale, radial
-        // chart, penalty topology) is psi-invariant and is kept.
-        //
-        // The caller's own spec is NOT the source: by the time it reaches this
-        // realizer it has already been frozen at least once upstream, so its
-        // policy is itself a composed transform.
-        let mut spec = freeze_term_collection_from_design(&spec, &design)
+        // The local build honours the persisted `Q` instead of re-deriving
+        // one, and `wrap_local_build_as_realization` applies it before the
+        // gauge applies `T0`: the collection's own order. Everything else the
+        // freeze decides (centers, input scale, radial chart, penalty topology)
+        // is psi-invariant.
+        let spec = freeze_term_collection_from_design(&spec, &design)
             .map_err(|e| format!("failed to freeze incremental replay specification: {e}"))?;
-        for (term_idx, term) in design.smooth.terms.iter().enumerate() {
-            let Some(gauge) = term.collection_gauge.as_ref() else {
-                continue;
-            };
-            let Some(replay) = spec.smooth_terms.get_mut(term_idx) else {
-                continue;
-            };
-            restore_local_identifiability_chart(
-                &mut replay.basis,
-                gauge.local_identifiability_transform.as_ref(),
-            );
-            // The rotation `Q` the collection applied BEFORE it derived `T0`
-            // (gam#2760). The freeze copied the term's own `joint_null_rotation`,
-            // which the collection cleared once it composed `Q·T0` into the
-            // metadata, and the chart restored above is the pre-`Q` one — so
-            // without this the replay put an unrotated block through a chart
-            // derived on the rotated one. The local build honours a persisted
-            // rotation instead of re-deriving one, and
-            // `wrap_local_build_as_realization` applies it before the gauge
-            // applies `T0`: the collection's own order.
-            replay.joint_null_rotation = gauge.joint_null_rotation.clone();
-        }
-        let spec = spec;
         let fixed_blocks = build_term_collection_fixed_blocks(data, &spec)
             .map_err(|e| format!("failed to cache fixed term-collection blocks: {e}"))?;
 
@@ -6146,6 +6063,299 @@ where
     })
 }
 
+/// Search domain of the latent joint theta past its smoothing block, laid out
+/// `[latent flat t | analytic-penalty rho | direct hypers]` (#4266).
+///
+/// A log-strength coordinate has no penalty geometry the design Gram can
+/// project. That covers every direct log-precision (the anchor's `ln μ`, each
+/// ARD `ln α_j`) and every analytic coordinate the registry publishes with
+/// finite faces. Those finite faces are a learnable weight's or a log-alpha's
+/// representable effective strength (`learnable_weight_coordinate_domain`).
+/// Such a coordinate searches the precision box
+/// [`coordinate_domain`](gam_solve::estimate::rho_domain::coordinate_domain)`(None, None)`,
+/// `[ln √ε, ln(1/√ε)]` around its declared strength. That is the law
+/// [`joint_rho_resolvability_domain`] applies to a smoothing coordinate
+/// without projectable geometry. An analytic coordinate also keeps its
+/// registry faces. A user `init_log_precision` seed is projected into this
+/// domain by the caller, so it always starts feasible.
+///
+/// The latent coordinates `t`, the behavioral-head coefficients and the
+/// analytic coordinates the registry leaves unbounded are not log-strengths.
+/// The unbounded ones are the parametric row-precision raw-beta and mean
+/// offsets. These have no derived domain yet (the #4266 remainder) and keep
+/// their previous box. For `t` that box is `±(max|t₀| + 10)`, taken around
+/// the seed the search actually starts from, including a persistent-cache
+/// seed. For the rest it is `±12`.
+fn latent_joint_auxiliary_domain(
+    auxiliary_seed: ndarray::ArrayView1<'_, f64>,
+    latent_flat_dim: usize,
+    registry: Option<&gam_terms::AnalyticPenaltyRegistry>,
+    direct_slots: &[LatentDirectHyperSlot],
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    let analytic_rho_count = registry.map_or(0, |registry| registry.total_rho_count());
+    let dim = latent_flat_dim + analytic_rho_count + direct_slots.len();
+    if auxiliary_seed.len() != dim {
+        crate::bail_invalid_estim!(
+            "latent joint auxiliary seed has length {} for {latent_flat_dim} latent, \
+             {analytic_rho_count} analytic and {} direct coordinates",
+            auxiliary_seed.len(),
+            direct_slots.len()
+        );
+    }
+    let log_strength_domain = gam_solve::estimate::rho_domain::coordinate_domain(None, None);
+    let underived_face = 12.0;
+    let mut lower = Array1::<f64>::from_elem(dim, -underived_face);
+    let mut upper = Array1::<f64>::from_elem(dim, underived_face);
+
+    let latent_bound = auxiliary_seed
+        .slice(s![..latent_flat_dim])
+        .iter()
+        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
+        + 10.0;
+    lower.slice_mut(s![..latent_flat_dim]).fill(-latent_bound);
+    upper.slice_mut(s![..latent_flat_dim]).fill(latent_bound);
+
+    if let Some(registry) = registry {
+        let (domain_lower, domain_upper) = registry
+            .rho_domain_bounds()
+            .map_err(EstimationError::InvalidInput)?;
+        for local in 0..analytic_rho_count {
+            let axis = latent_flat_dim + local;
+            let (lo, hi) = (domain_lower[local], domain_upper[local]);
+            if lo.is_finite() && hi.is_finite() {
+                lower[axis] = lo.max(log_strength_domain.0);
+                upper[axis] = hi.min(log_strength_domain.1);
+            } else {
+                lower[axis] = lower[axis].max(lo);
+                upper[axis] = upper[axis].min(hi);
+            }
+            if lower[axis] >= upper[axis] {
+                return Err(EstimationError::InvalidInput(format!(
+                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
+                    lower[axis], upper[axis]
+                )));
+            }
+        }
+    }
+
+    let direct_start = latent_flat_dim + analytic_rho_count;
+    for (slot_index, slot) in direct_slots.iter().enumerate() {
+        if *slot == LatentDirectHyperSlot::LogPrecision {
+            lower[direct_start + slot_index] = log_strength_domain.0;
+            upper[direct_start + slot_index] = log_strength_domain.1;
+        }
+    }
+    Ok((lower, upper))
+}
+
+#[cfg(test)]
+mod latent_joint_auxiliary_domain_tests {
+    use super::*;
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, OrderedBetaBernoulliPenalty, ParametricRowPrecisionPriorPenalty,
+        PsiSlice,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn direct_hyper_slots_match_the_seed_layout_4266() {
+        use gam_terms::latent::LatentIdMode;
+        for mode in [
+            LatentIdMode::None,
+            LatentIdMode::DimSelection {
+                init_log_precision: None,
+            },
+        ] {
+            let slots = latent_coord_direct_hyper_slots(&mode, 3);
+            let seeds = latent_coord_initial_direct_hypers(&mode, 3).unwrap();
+            assert_eq!(slots.len(), seeds.len());
+            assert_eq!(slots.len(), latent_coord_direct_hyper_count(&mode, 3));
+            assert!(
+                slots
+                    .iter()
+                    .all(|slot| *slot == LatentDirectHyperSlot::LogPrecision)
+            );
+        }
+    }
+
+    /// A user ARD seed past the old `±12` box started infeasible. Every
+    /// log-precision now searches the precision box and its seed is projected.
+    #[test]
+    fn ard_log_precisions_search_the_precision_box_and_seeds_are_feasible_4266() {
+        let mode = gam_terms::latent::LatentIdMode::DimSelection {
+            init_log_precision: Some(ndarray::array![15.0, -30.0]),
+        };
+        let slots = latent_coord_direct_hyper_slots(&mode, 2);
+        let direct = latent_coord_initial_direct_hypers(&mode, 2).unwrap();
+        let latent = ndarray::array![0.5, -2.0, 1.0, 0.25];
+        let mut seed = Array1::<f64>::zeros(latent.len() + direct.len());
+        seed.slice_mut(s![..latent.len()]).assign(&latent);
+        seed.slice_mut(s![latent.len()..]).assign(&direct);
+
+        let (lower, upper) =
+            latent_joint_auxiliary_domain(seed.view(), latent.len(), None, &slots).unwrap();
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        assert!(box_hi > 12.0 && box_lo < -12.0);
+        for axis in latent.len()..seed.len() {
+            assert_eq!((lower[axis], upper[axis]), (box_lo, box_hi));
+        }
+        let projected = ExactJointHyperSetup::project_rho_seed(seed.clone(), &lower, &upper);
+        assert_eq!(projected[latent.len()], 15.0);
+        assert_eq!(projected[latent.len() + 1], box_lo);
+        for axis in 0..seed.len() {
+            assert!(lower[axis] <= projected[axis] && projected[axis] <= upper[axis]);
+        }
+    }
+
+    /// A log-strength analytic coordinate searches its registry face inside the
+    /// precision box, not `[-12, 12]`. The parametric row-precision raw-beta
+    /// and mean offsets, which the registry leaves unbounded, keep the box
+    /// that is still to be derived.
+    #[test]
+    fn analytic_log_strengths_search_registry_faces_within_the_precision_box_4266() {
+        let mut registry = gam_terms::AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(
+            OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true),
+        )));
+        registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
+            ParametricRowPrecisionPriorPenalty::new(
+                PsiSlice::full(4, Some(2)),
+                ndarray::array![[0.0_f64], [1.0]],
+                ndarray::array![0.0_f64, 2.0_f64.ln()],
+                ndarray::array![0.0_f64, -0.5],
+                ndarray::array![[0.0_f64], [0.5]],
+                1.7,
+                2,
+                true,
+            )
+            .unwrap(),
+        )));
+        let analytic = registry.total_rho_count();
+        assert_eq!(analytic, 8);
+        let latent_flat_dim = 4;
+        let seed = Array1::<f64>::zeros(latent_flat_dim + analytic);
+        let (lower, upper) =
+            latent_joint_auxiliary_domain(seed.view(), latent_flat_dim, Some(&registry), &[])
+                .unwrap();
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        // Latent coordinates: `±(max|t₀| + 10)` around the zero seed.
+        for axis in 0..latent_flat_dim {
+            assert_eq!((lower[axis], upper[axis]), (-11.0, 11.0));
+        }
+        // Ordered-beta alpha, both row-precision log-alphas, row-precision weight.
+        for local in [0, 1, 2, 7] {
+            let axis = latent_flat_dim + local;
+            assert_eq!((lower[axis], upper[axis]), (box_lo, box_hi), "coordinate {local}");
+        }
+        // Row-precision raw-beta and mean offsets.
+        for local in 3..7 {
+            let axis = latent_flat_dim + local;
+            assert_eq!((lower[axis], upper[axis]), (-12.0, 12.0), "coordinate {local}");
+        }
+    }
+}
+
+/// Whether the latent-coordinate joint criterion carries objective terms the
+/// driver adds on top of the base REML/LAML evaluation: the identifiability
+/// objective of every gauge mode except `None` (the auxiliary or isometry
+/// prior with its log-precision normalizer, ARD, the behavioral head) and the
+/// analytic latent penalties.
+///
+/// The HybridEFS fixed point cannot optimize such a criterion. Its ρ and ψ
+/// steps are built inside the REML evaluator from the base gradient alone
+/// (`compute_hybrid_efs_update`), so the driver terms never reach a step: the
+/// latent coordinates move without their prior, and the direct hyperparameters
+/// and analytic-penalty ρ, whose design drift is zero, never move at all. Its
+/// cost line search also compares a full-criterion trial (`eval_cost`) against
+/// a current cost that lacks them. Such a criterion runs on the gradient lane,
+/// whose `eval_full` carries every term.
+fn latent_joint_criterion_has_driver_terms(
+    id_mode: &gam_terms::latent::LatentIdMode,
+    has_analytic_penalties: bool,
+) -> bool {
+    has_analytic_penalties || !matches!(id_mode, gam_terms::latent::LatentIdMode::None)
+}
+
+#[cfg(test)]
+mod latent_joint_efs_criterion_tests {
+    use super::*;
+    use gam_terms::latent::{AuxPriorStrength, LatentCoordValues, LatentIdMode, LatentManifold};
+
+    fn latent_block(id_mode: LatentIdMode) -> LatentCoordValues {
+        let t = ndarray::array![[0.4, -1.1], [1.3, 0.2], [-0.7, 0.9]];
+        LatentCoordValues::from_matrix_with_manifold(t.view(), id_mode, LatentManifold::Euclidean)
+    }
+
+    /// Only the bare `None` gauge without analytic penalties leaves the base
+    /// REML criterion whole, so only it may take the fixed point.
+    #[test]
+    fn only_a_bare_criterion_admits_the_fixed_point() {
+        let reference = Array2::<f64>::zeros((3, 2));
+        assert!(!latent_joint_criterion_has_driver_terms(&LatentIdMode::None, false));
+        assert!(latent_joint_criterion_has_driver_terms(&LatentIdMode::None, true));
+        for strength in [AuxPriorStrength::Auto, AuxPriorStrength::Fixed(2.0)] {
+            let mode = LatentIdMode::IsometryToReference {
+                reference: reference.clone(),
+                strength,
+            };
+            assert!(latent_joint_criterion_has_driver_terms(&mode, false));
+        }
+        assert!(latent_joint_criterion_has_driver_terms(
+            &LatentIdMode::DimSelection {
+                init_log_precision: None
+            },
+            false
+        ));
+    }
+
+    /// The terms the fixed point cannot see are live: an isometry anchor with a
+    /// REML-selected log-μ adds `½ μ ‖t − ref‖² − ½ K log μ` to the cost and a
+    /// nonzero gradient on the latent block and on its log-μ slot, a slot whose
+    /// zero design drift gives the base-REML EFS step nothing to move. The
+    /// `None` gauge adds exactly nothing.
+    #[test]
+    fn the_isometry_anchor_moves_cost_and_its_direct_slot() {
+        let reference = Array2::<f64>::zeros((3, 2));
+        let latent = latent_block(LatentIdMode::IsometryToReference {
+            reference,
+            strength: AuxPriorStrength::Auto,
+        });
+        let rho_dim = 1;
+        let log_mu = 0.5_f64;
+        let mut theta = Array1::<f64>::zeros(rho_dim + latent.len() + 1);
+        theta
+            .slice_mut(s![rho_dim..rho_dim + latent.len()])
+            .assign(latent.as_flat());
+        theta[rho_dim + latent.len()] = log_mu;
+        let contribution = latent_id_objective_contribution(&theta, rho_dim, 0, &latent)
+            .expect("isometry contribution");
+        let q: f64 = latent.as_flat().iter().map(|v| v * v).sum();
+        let mu = log_mu.exp();
+        let k = latent.len() as f64;
+        let expected_cost = 0.5 * mu * q - 0.5 * k * log_mu;
+        assert!((contribution.cost - expected_cost).abs() <= 1e-12 * (1.0 + expected_cost.abs()));
+        let expected_slot = 0.5 * mu * q - 0.5 * k;
+        let slot = contribution.gradient[rho_dim + latent.len()];
+        assert!((slot - expected_slot).abs() <= 1e-12 * (1.0 + expected_slot.abs()));
+        assert!(slot.abs() > 0.1, "the log-mu slot carries a live gradient: {slot}");
+        for (idx, &value) in latent.as_flat().iter().enumerate() {
+            let grad = contribution.gradient[rho_dim + idx];
+            assert!((grad - mu * value).abs() <= 1e-12 * (1.0 + (mu * value).abs()));
+        }
+        assert_eq!(contribution.gradient[0], 0.0);
+
+        let bare = latent_block(LatentIdMode::None);
+        let mut bare_theta = Array1::<f64>::zeros(rho_dim + bare.len());
+        bare_theta
+            .slice_mut(s![rho_dim..rho_dim + bare.len()])
+            .assign(bare.as_flat());
+        let none = latent_id_objective_contribution(&bare_theta, rho_dim, 0, &bare)
+            .expect("bare contribution");
+        assert_eq!(none.cost, 0.0);
+        assert!(none.gradient.iter().all(|&g| g == 0.0));
+    }
+}
+
 fn try_exact_joint_latent_coord_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -6189,34 +6399,33 @@ fn try_exact_joint_latent_coord_optimization(
             .assign(&direct_hypers);
     }
 
-    let mut lower = Array1::<f64>::from_elem(theta0.len(), -12.0);
-    let mut upper = Array1::<f64>::from_elem(theta0.len(), 12.0);
-    let latent_bound = latent
-        .values
-        .as_flat()
-        .iter()
-        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
-        + 10.0;
-    for axis in rho_dim..rho_dim + latent_flat_dim {
-        lower[axis] = -latent_bound;
-        upper[axis] = latent_bound;
-    }
-    if let Some(registry) = latent.analytic_penalties.as_ref() {
-        let (domain_lower, domain_upper) = registry
-            .rho_domain_bounds()
-            .map_err(EstimationError::InvalidInput)?;
-        let start = rho_dim + latent_flat_dim;
-        for local in 0..analytic_rho_count {
-            lower[start + local] = lower[start + local].max(domain_lower[local]);
-            upper[start + local] = upper[start + local].min(domain_upper[local]);
-            if lower[start + local] >= upper[start + local] {
-                return Err(EstimationError::InvalidInput(format!(
-                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
-                    lower[start + local],
-                    upper[start + local]
-                )));
-            }
-        }
+    let mut lower = Array1::<f64>::zeros(theta0.len());
+    let mut upper = Array1::<f64>::zeros(theta0.len());
+    // The smoothing coordinates search the resolvability domain of the
+    // incumbent's own design and penalties (#2812), the domain every other
+    // exact-joint route derives, and the incumbent's seed is projected into it
+    // (#4265).
+    let (rho_lower, rho_upper) =
+        joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
+    let rho_seed = ExactJointHyperSetup::project_rho_seed(
+        theta0.slice(s![..rho_dim]).to_owned(),
+        &rho_lower,
+        &rho_upper,
+    );
+    theta0.slice_mut(s![..rho_dim]).assign(&rho_seed);
+    lower.slice_mut(s![..rho_dim]).assign(&rho_lower);
+    upper.slice_mut(s![..rho_dim]).assign(&rho_upper);
+    // The rest of theta, `[t | analytic rho | direct hypers]`, is domained
+    // below, once the persistent latent cache has placed the latent seed the
+    // search actually starts from.
+    let direct_slots =
+        latent_coord_direct_hyper_slots(latent.values.id_mode(), latent.values.latent_dim());
+    if direct_slots.len() != direct_hypers.len() {
+        crate::bail_invalid_estim!(
+            "latent direct-hyperparameter layout has {} slots for {} initial values",
+            direct_slots.len(),
+            direct_hypers.len()
+        );
     }
 
     struct LatentJointContext<'d> {
@@ -6283,14 +6492,28 @@ fn try_exact_joint_latent_coord_optimization(
             self.cache
                 .ensure_theta(theta)
                 .map_err(EstimationError::InvalidInput)?;
+            let registry_for_key = self.cache.analytic_penalties();
+            let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
+            if latent_joint_criterion_has_driver_terms(
+                latent.id_mode(),
+                registry_for_key.is_some(),
+            ) {
+                // The outer problem disables the fixed point for this
+                // criterion (see `latent_joint_criterion_has_driver_terms`),
+                // so reaching here is a construction defect, not a trial point.
+                crate::bail_invalid_estim!(
+                    "latent-coordinate joint EFS was asked to step a criterion carrying \
+                     driver-side identifiability or analytic-penalty terms, which its \
+                     base-REML steps cannot see"
+                );
+            }
             let hyper_dirs = self
                 .cache
                 .hyper_dirs()
                 .map_err(EstimationError::InvalidInput)?;
-            let registry_for_key = self.cache.analytic_penalties();
             self.evaluator
                 .set_analytic_penalty_registry(registry_for_key.as_deref());
-            let mut efs = evaluate_joint_reml_efs_at_theta(
+            evaluate_joint_reml_efs_at_theta(
                 &mut self.evaluator,
                 self.cache.design(),
                 theta,
@@ -6298,32 +6521,7 @@ fn try_exact_joint_latent_coord_optimization(
                 hyper_dirs,
                 None,
                 Some(self.cache.design_revision()),
-            )?;
-            if let Some(registry) = registry_for_key {
-                let latent = self.cache.latent().map_err(EstimationError::InvalidInput)?;
-                let contribution = analytic_penalty_objective_contribution(
-                    theta,
-                    self.rho_dim,
-                    latent.as_ref(),
-                    registry.as_ref(),
-                )?;
-                efs.cost += contribution.cost;
-                if let (Some(psi_gradient), Some(psi_indices)) =
-                    (efs.psi_gradient.as_mut(), efs.psi_indices.as_ref())
-                {
-                    if psi_gradient.len() != psi_indices.len() {
-                        crate::bail_invalid_estim!(
-                            "latent-coordinate analytic penalty EFS psi gradient length mismatch: gradient={}, indices={}",
-                            psi_gradient.len(),
-                            psi_indices.len()
-                        );
-                    }
-                    for (local_idx, &theta_idx) in psi_indices.iter().enumerate() {
-                        psi_gradient[local_idx] += contribution.gradient[theta_idx];
-                    }
-                }
-            }
-            Ok(efs)
+            )
         }
 
         fn eval_cost(&mut self, theta: &Array1<f64>) -> f64 {
@@ -6430,6 +6628,20 @@ fn try_exact_joint_latent_coord_optimization(
             *dst = *src;
         }
     }
+    let (auxiliary_lower, auxiliary_upper) = latent_joint_auxiliary_domain(
+        theta0.slice(s![rho_dim..]),
+        latent_flat_dim,
+        latent.analytic_penalties.as_deref(),
+        &direct_slots,
+    )?;
+    let auxiliary_seed = ExactJointHyperSetup::project_rho_seed(
+        theta0.slice(s![rho_dim..]).to_owned(),
+        &auxiliary_lower,
+        &auxiliary_upper,
+    );
+    theta0.slice_mut(s![rho_dim..]).assign(&auxiliary_seed);
+    lower.slice_mut(s![rho_dim..]).assign(&auxiliary_lower);
+    upper.slice_mut(s![rho_dim..]).assign(&auxiliary_upper);
 
     let problem = exact_joint_outer_problem(
         &theta0,
@@ -6440,7 +6652,13 @@ fn try_exact_joint_latent_coord_optimization(
         theta0.len(),
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
-        false,
+        // The HybridEFS fixed point steps only the base REML criterion; a
+        // criterion with driver-side terms runs on the gradient lane, whose
+        // `eval_full` carries them.
+        latent_joint_criterion_has_driver_terms(
+            latent.values.id_mode(),
+            latent.analytic_penalties.is_some(),
+        ),
         options.tol,
         options.max_iter.max(1),
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
@@ -7021,11 +7239,10 @@ fn spatial_kappa_incumbent(
     //
     // So: κ free ⇒ both coordinates from the profile. κ pinned, range free ⇒ the
     // range alone, at that κ, from the SAME inner solve. Range pinned ⇒ neither.
-    // The pinned-κ arm is skipped rather than refused when the profile's
-    // Gaussian-identity/unit-weight precondition does not hold: the range is a
-    // nuisance coordinate there and the auto `ℓ_ref` is a valid fallback, while
-    // for a free κ the profile IS the estimand and there is nothing to fall back
-    // to.
+    // A free range is also a requested profile coordinate. If the profile's
+    // criterion cannot represent this model, refuse it for pinned κ as well;
+    // retaining an automatic range would silently replace the requested fit.
+    // Pin both kappa= and length_scale= to use fixed geometry in such a model.
     let free_curvature_terms: Vec<usize> = constant_curvature_term_indices(&resolvedspec)
         .into_iter()
         .filter(|&term_idx| !constant_curvature_kappa_is_fixed(&resolvedspec, term_idx))
@@ -7038,26 +7255,36 @@ fn spatial_kappa_incumbent(
                     && !constant_curvature_length_scale_is_fixed(&resolvedspec, term_idx)
             })
             .collect();
-    if !free_curvature_terms.is_empty() {
-        validate_constant_curvature_profile_inputs(weights.view(), offset.view(), &family)?;
+    for &term_idx in &free_curvature_terms {
+        validate_constant_curvature_profile_inputs(
+            &resolvedspec,
+            term_idx,
+            weights.view(),
+            offset.view(),
+            &family,
+        )?;
     }
-    if !pinned_kappa_free_range_terms.is_empty()
-        && validate_constant_curvature_profile_inputs(weights.view(), offset.view(), &family)
-            .is_ok()
-    {
-        for term_idx in pinned_kappa_free_range_terms {
-            let length_scale_hat =
-                constant_curvature_range_only_optimum(data, y.view(), &resolvedspec, term_idx)?;
-            if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) = resolvedspec
-                .smooth_terms
-                .get_mut(term_idx)
-                .map(|term| &mut term.basis)
-            {
-                // `length_scale_fixed` stays as the user left it, for the same
-                // reason the free-κ arm leaves it alone: a realized value frozen
-                // into the spec must not be mistaken for a pin on a later fit.
-                cc.length_scale = length_scale_hat;
-            }
+    for &term_idx in &pinned_kappa_free_range_terms {
+        validate_constant_curvature_profile_inputs(
+            &resolvedspec,
+            term_idx,
+            weights.view(),
+            offset.view(),
+            &family,
+        )?;
+    }
+    for term_idx in pinned_kappa_free_range_terms {
+        let length_scale_hat =
+            constant_curvature_range_only_optimum(data, y.view(), &resolvedspec, term_idx)?;
+        if let Some(SmoothBasisSpec::ConstantCurvature { spec: cc, .. }) = resolvedspec
+            .smooth_terms
+            .get_mut(term_idx)
+            .map(|term| &mut term.basis)
+        {
+            // `length_scale_fixed` stays as the user left it, for the same
+            // reason the free-κ arm leaves it alone: a realized value frozen
+            // into the spec must not be mistaken for a pin on a later fit.
+            cc.length_scale = length_scale_hat;
         }
     }
     for term_idx in free_curvature_terms {

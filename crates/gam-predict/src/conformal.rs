@@ -91,6 +91,7 @@
 
 use crate::interval_policy::ResponseBounds;
 use gam_math::quantile::order_statistic;
+use gam_models::inference::full_conformal::conformal_rank_threshold;
 use gam_problem::EstimationError;
 use ndarray::{Array1, ArrayView1};
 
@@ -170,8 +171,13 @@ pub(crate) fn conformal_multiplier(
             )));
         }
     }
-    // 1-based rank ⌈(n+1)(1−α)⌉.
-    let rank = ((n as f64 + 1.0) * (1.0 - alpha)).ceil() as usize;
+    // 1-based rank ⌈(n+1)(1−α)⌉ = (n+1) − ⌊α(n+1)⌋. The threshold α(n+1) goes
+    // through the full-conformal snap: α arrives as `1 − level` from a decimal
+    // level, and computing ⌈(n+1)(1−α)⌉ in floating point directly lands just
+    // above an integer for some (level, n) (level 0.68 at n = 74 gives 51.000…01),
+    // which takes one rank too many and over-covers by 1/(n+1).
+    let tau = conformal_rank_threshold(alpha, n + 1);
+    let rank = (n + 1 - tau.floor() as usize).max(1);
     if rank > n {
         // Too few calibration points to certify coverage at this level.
         return Ok(f64::INFINITY);
@@ -337,6 +343,32 @@ mod tests {
     }
 
     #[test]
+    fn multiplier_rank_is_exact_for_decimal_levels() {
+        // Level 0.68 at n = 74: the exact rank is ⌈75·0.68⌉ = 51, but
+        // 75·(1 − (1 − 0.68)) evaluates to 51.000…01 in floating point.
+        let scores: Array1<f64> = (1..=74).map(|k| k as f64).collect();
+        let q = conformal_multiplier(scores.view(), 1.0 - 0.68).expect("valid");
+        assert_eq!(q, 51.0);
+
+        // α = 0.95 at n = 19: the exact rank is ⌈20·0.05⌉ = 1.
+        let scores: Array1<f64> = (1..=19).map(|k| k as f64).collect();
+        let q = conformal_multiplier(scores.view(), 0.95).expect("valid");
+        assert_eq!(q, 1.0);
+
+        // Nominal levels whose product is an exact integer keep their rank:
+        // n = 99 at level 0.9 is rank 90, at level 0.95 is rank 95.
+        let scores: Array1<f64> = (1..=99).map(|k| k as f64).collect();
+        assert_eq!(
+            conformal_multiplier(scores.view(), 1.0 - 0.9).expect("valid"),
+            90.0
+        );
+        assert_eq!(
+            conformal_multiplier(scores.view(), 1.0 - 0.95).expect("valid"),
+            95.0
+        );
+    }
+
+    #[test]
     fn multiplier_does_not_interpolate() {
         // Unequally spaced scores: the exact order statistic must be one of the
         // observed values, never an interpolated value between two of them.
@@ -391,5 +423,29 @@ mod tests {
             .expect("interval");
         assert!(lower.iter().all(|&v| v == f64::NEG_INFINITY));
         assert!(upper.iter().all(|&v| v == f64::INFINITY));
+    }
+
+    #[test]
+    fn decimal_conformal_ranks_match_integer_arithmetic_with_ties_and_permutations() {
+        for n in [1usize, 2, 9, 19, 24, 49, 74, 99, 127] {
+            let ordered: Array1<f64> = (0..n).map(|i| (i / 3) as f64).collect();
+            let reversed: Array1<f64> = ordered.iter().rev().copied().collect();
+            for percent in 1..100usize {
+                let exact_rank = ((n + 1) * percent).div_ceil(100);
+                let expected = if exact_rank > n { f64::INFINITY } else { ordered[exact_rank - 1] };
+                let alpha = 1.0 - percent as f64 / 100.0;
+                for scores in [&ordered, &reversed] {
+                    assert_eq!(conformal_multiplier(scores.view(), alpha).unwrap(), expected,
+                        "n={n}, nominal level={percent}/100");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn conformal_rank_resolves_both_sides_outside_the_rounding_band() {
+        let scores: Array1<f64> = (1..=99).map(|i| i as f64).collect();
+        assert_eq!(conformal_multiplier(scores.view(), 0.1 - 1e-12).unwrap(), 91.0);
+        assert_eq!(conformal_multiplier(scores.view(), 0.1 + 1e-12).unwrap(), 90.0);
     }
 }

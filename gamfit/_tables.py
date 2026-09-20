@@ -87,7 +87,7 @@ def normalize_table(
         names = list(required_columns)
         missing = set(names) - set(columns)
         if missing:
-            raise ValueError(f"missing required columns: {sorted(missing)}")
+            raise _missing_columns_error(sorted(missing), list(columns))
         columns = {name: columns[name] for name in names}
         if kind in _ARROW_TABLE_KINDS:
             data = data.select(names)
@@ -96,7 +96,6 @@ def normalize_table(
         from ._exceptions import DataError
         raise DataError("column '<table>' has no columns")
     reject_duplicate_column_names(headers, kind)
-    validate_column_lengths(columns)
     if len(columns[headers[0]]) == 0:
         from ._exceptions import DataError
         raise DataError("column '<table>' has no observations")
@@ -193,7 +192,7 @@ def _table_column_views(
         if values.ndim == 1:
             values = values[:, None]
         if values.ndim != 2:
-            raise ValueError("numpy input must be 1D or 2D")
+            raise ValueError(f"numpy input must be 1D or 2D, got {values.ndim} dimensions")
         names = (
             [f"x{index}" for index in range(values.shape[1])]
             if positional_headers is None
@@ -213,7 +212,7 @@ def _table_column_views(
                     f"key collision: original key {key!r} normalizes to {name!r}, "
                     "which is already used"
                 )
-            columns[name] = _vector_view(value)
+            columns[name] = _vector_view(name, value)
         validate_column_lengths(columns)
         return columns, "mapping"
     # Record and row inputs are Python objects already; their existing
@@ -221,15 +220,15 @@ def _table_column_views(
     return table_columns(data)
 
 
-def _vector_view(values: Any) -> Any:
+def _vector_view(name: str, values: Any) -> Any:
     if isinstance(values, Mapping):
-        raise TypeError("target values must be a vector, not a mapping")
+        raise _not_a_vector_error(name, values)
     if isinstance(values, (str, bytes, bytearray)):
-        raise TypeError("target values must be a 1D array-like sequence")
+        raise _not_a_vector_error(name, values)
     ndim = getattr(values, "ndim", None)
     if ndim is not None:
         if int(ndim) != 1:
-            raise ValueError("target arrays must be 1D")
+            raise _column_ndim_error(name, values)
         return values
     if isinstance(values, Sequence):
         return values
@@ -237,7 +236,34 @@ def _vector_view(values: Any) -> Any:
     # registered as collections.abc.Sequence.
     if hasattr(values, "__len__") and hasattr(values, "__getitem__"):
         return values
-    raise TypeError("target values must be a 1D array-like sequence")
+    raise _not_a_vector_error(name, values)
+
+
+def _not_a_vector_error(name: str, values: Any) -> TypeError:
+    return TypeError(
+        f"column {name!r} must be a 1D array-like sequence of cells, "
+        f"got {type(values).__name__}"
+    )
+
+
+def _column_ndim_error(name: str, values: Any) -> Exception:
+    from ._exceptions import SchemaMismatchError
+
+    shape = getattr(values, "shape", None)
+    return SchemaMismatchError(
+        f"column {name!r} must be 1D, got {int(values.ndim)} dimensions"
+        + (f" (shape {tuple(shape)})" if shape is not None else "")
+    )
+
+
+def _missing_columns_error(missing: list[str], available: list[str]) -> Exception:
+    from ._exceptions import SchemaMismatchError
+
+    return SchemaMismatchError(
+        f"required column{'s' if len(missing) > 1 else ''} "
+        f"{', '.join(repr(name) for name in missing)} not found in the input "
+        f"table; available columns: [{', '.join(repr(name) for name in available)}]"
+    )
 
 
 def table_columns(data: Any) -> tuple[dict[str, list[Any]], str]:
@@ -360,7 +386,7 @@ def mapping_table_columns(data: Mapping[Any, Any]) -> dict[str, list[Any]]:
         key_str = str(key)
         if key_str in columns:
             raise ValueError(f"key collision: original key {key!r} normalizes to {key_str!r}, which is already used")
-        columns[key_str] = vector_values(value)
+        columns[key_str] = vector_values(key_str, value)
     validate_column_lengths(columns)
     return columns
 
@@ -401,7 +427,7 @@ def numpy_table_width(array: Any) -> int:
     if len(shape) == 1:
         return 1
     if len(shape) != 2:
-        raise ValueError("numpy input must be 1D or 2D")
+        raise ValueError(f"numpy input must be 1D or 2D, got {len(shape)} dimensions")
     return int(shape[1])
 
 
@@ -412,7 +438,7 @@ def numpy_table_columns(array: Any) -> dict[str, list[Any]]:
     if values.ndim == 1:
         return {"x0": values.tolist()}
     if values.ndim != 2:
-        raise ValueError("numpy input must be 1D or 2D")
+        raise ValueError(f"numpy input must be 1D or 2D, got {values.ndim} dimensions")
     headers = [f"x{index}" for index in range(values.shape[1])]
     return {header: values[:, index].tolist() for index, header in enumerate(headers)}
 
@@ -430,9 +456,20 @@ def reject_duplicate_column_names(names: Sequence[str], kind: str) -> None:
 
 
 def validate_column_lengths(columns: Mapping[str, Sequence[Any]]) -> None:
-    lengths = {len(values) for values in columns.values()}
-    if len(lengths) > 1:
-        raise ValueError("all columns must have the same length")
+    items = iter(columns.items())
+    first = next(items, None)
+    if first is None:
+        return
+    first_name, first_values = first
+    expected = len(first_values)
+    for name, values in items:
+        if len(values) != expected:
+            from ._exceptions import SchemaMismatchError
+
+            raise SchemaMismatchError(
+                f"column {name!r} has {len(values)} rows but column "
+                f"{first_name!r} has {expected}"
+            )
 
 
 def collect_record_headers(rows: list[Mapping[str, Any]]) -> tuple[list[str], dict[Any, str]]:
@@ -556,18 +593,18 @@ def drop_columns(data: Any, names: Sequence[str]) -> Any:
     return {name: values for name, values in columns.items() if name not in names}
 
 
-def vector_values(values: Any) -> list[Any]:
+def vector_values(name: str, values: Any) -> list[Any]:
     kind = detect_table_kind(values)
     if kind == "numpy":
         import numpy as np
 
         array = np.asarray(values)
         if array.ndim != 1:
-            raise ValueError("target arrays must be 1D")
+            raise _column_ndim_error(name, array)
         result: list[Any] = array.tolist()
         return result
     if isinstance(values, Mapping):
-        raise TypeError("target values must be a vector, not a mapping")
+        raise _not_a_vector_error(name, values)
     # pandas/polars/pyarrow columns (and other array-likes) expose tolist /
     # to_list / to_pylist; prefer those so we get native Python scalars rather
     # than library-specific scalar objects whose repr is not numeric-parseable.
@@ -579,4 +616,4 @@ def vector_values(values: Any) -> list[Any]:
                 return converted
     if isinstance(values, Sequence) and not isinstance(values, (str, bytes, bytearray)):
         return list(values)
-    raise TypeError("target values must be a 1D array-like sequence")
+    raise _not_a_vector_error(name, values)

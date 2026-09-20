@@ -5,7 +5,8 @@ use gam_linalg::faer_ndarray::{
     col_piv_qr_solve_lstsq, default_rrqr_rank_alpha, rrqr_nullspace_basis,
 };
 use gam_linalg::gram_schmidt::ReorthogonalizedRowBasis;
-use gam_linalg::utils::{KahanSum, StableSolver, array_is_finite};
+use gam_linalg::utils::{StableSolver, array_is_finite};
+use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{
     ConstraintRowId, ConstraintSet, KhatriRaoConeConstraints, LinearInequalityConstraints,
 };
@@ -472,7 +473,11 @@ pub(crate) fn null_space_complement(vt: &Array2<f64>, rank: usize) -> Option<Arr
         let (pivot, squared_norm) = (0..p)
             .map(|axis| (axis, residual.column(axis).dot(&residual.column(axis))))
             .fold((0usize, 0.0_f64), |best, candidate| {
-                if candidate.1 > best.1 { candidate } else { best }
+                if candidate.1 > best.1 {
+                    candidate
+                } else {
+                    best
+                }
             });
         if !(squared_norm > 0.0) {
             return None;
@@ -751,9 +756,7 @@ where
             if !(norm > 0.0) {
                 return None;
             }
-            design
-                .column_mut(col)
-                .assign(&(&rows.row(col) / norm));
+            design.column_mut(col).assign(&(&rows.row(col) / norm));
         }
         least_squares_min_norm_any_shape(&design, target)
     };
@@ -908,9 +911,8 @@ where
     let polar_floor = resolution(&residual, &residual_band);
     if final_values.len() != m
         || final_values.iter().any(|value| !value.is_finite())
-        || (0..m).any(|row| {
-            row_norms[row] > 0.0 && final_values[row] / row_norms[row] > polar_floor
-        })
+        || (0..m)
+            .any(|row| row_norms[row] > 0.0 && final_values[row] / row_norms[row] > polar_floor)
     {
         return None;
     }
@@ -922,9 +924,7 @@ where
             (lambda > 0.0).then_some((row, lambda))
         })
         .collect();
-    if multipliers.iter().any(|(_, value)| !value.is_finite())
-        || !array_is_finite(&residual)
-    {
+    if multipliers.iter().any(|(_, value)| !value.is_finite()) || !array_is_finite(&residual) {
         return None;
     }
     Some((multipliers, residual))
@@ -1320,7 +1320,11 @@ pub fn project_point_strictly_into_feasible_cone(
     // unchanged (#2469).
     for i in 0..m {
         let s = scaled_constraint_slack(&beta, constraints, i);
-        let clearance = if is_equality_member[i] { 0.0 } else { margin[i] };
+        let clearance = if is_equality_member[i] {
+            0.0
+        } else {
+            margin[i]
+        };
         let lower = clearance - ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
         if s < lower {
             return None;
@@ -1412,9 +1416,9 @@ fn certify_active_equalities(
     };
     let mut worst_ratio = 0.0_f64;
     for active_row in 0..m {
-        let mut dot = KahanSum::default();
-        let mut magnitude = KahanSum::default();
-        let mut row_magnitude = KahanSum::default();
+        let mut dot = CompensatedSum::default();
+        let mut magnitude = CompensatedSum::default();
+        let mut row_magnitude = CompensatedSum::default();
         for column in 0..p {
             let entry = active_a[[active_row, column]];
             let product = entry * direction[column];
@@ -1422,11 +1426,11 @@ fn certify_active_equalities(
             magnitude.add(product.abs());
             row_magnitude.add(entry.abs());
         }
-        let residual = (rhs[active_row] - dot.sum()).abs();
-        let solve_scale = row_magnitude.sum() * direction_scale;
+        let residual = (rhs[active_row] - dot.value()).abs();
+        let solve_scale = row_magnitude.value() * direction_scale;
         // An all-zero row, direction and rhs has no rounding to allow and a zero
         // residual, which `residual <= allowed` certifies exactly (#2469).
-        let allowed = gamma * (magnitude.sum() + rhs[active_row].abs() + solve_scale);
+        let allowed = gamma * (magnitude.value() + rhs[active_row].abs() + solve_scale);
         if !residual.is_finite() || !allowed.is_finite() {
             return ActiveEqualityResidualCertificate {
                 worst_row: active_row,
@@ -1434,7 +1438,11 @@ fn certify_active_equalities(
                 allowed,
             };
         }
-        let ratio = if residual == 0.0 { 0.0 } else { residual / allowed };
+        let ratio = if residual == 0.0 {
+            0.0
+        } else {
+            residual / allowed
+        };
         if ratio > worst_ratio {
             worst_ratio = ratio;
             worst = ActiveEqualityResidualCertificate {
@@ -1454,11 +1462,11 @@ fn compensated_active_residual(
     direction: &Array1<f64>,
 ) -> Array1<f64> {
     Array1::from_shape_fn(active_a.nrows(), |row| {
-        let mut dot = KahanSum::default();
+        let mut dot = CompensatedSum::default();
         for column in 0..active_a.ncols() {
             dot.add(active_a[[row, column]] * direction[column]);
         }
-        rhs[row] - dot.sum()
+        rhs[row] - dot.value()
     })
 }
 
@@ -1550,9 +1558,7 @@ pub(crate) fn solve_kkt_direction(
     for row in 0..m {
         let norm = active_a.row(row).dot(&active_a.row(row)).sqrt();
         if !(norm.is_finite() && norm > 0.0) {
-            crate::bail_invalid_estim!(
-                "active equality row {row} has invalid norm {norm}"
-            );
+            crate::bail_invalid_estim!("active equality row {row} has invalid norm {norm}");
         }
         row_norms[row] = norm;
         let inverse = 1.0 / norm;
@@ -1566,12 +1572,10 @@ pub(crate) fn solve_kkt_direction(
         )
     })?;
     let (Some(u), Some(vt)) = (u_opt, vt_opt) else {
-        crate::bail_invalid_estim!(
-            "null-space constrained quadratic SVD omitted singular vectors"
-        );
+        crate::bail_invalid_estim!("null-space constrained quadratic SVD omitted singular vectors");
     };
-    let (mut null_basis, rank) =
-        rrqr_nullspace_basis(&scaled_a.t(), default_rrqr_rank_alpha()).map_err(|_| {
+    let (mut null_basis, rank) = rrqr_nullspace_basis(&scaled_a.t(), default_rrqr_rank_alpha())
+        .map_err(|_| {
             EstimationError::InvalidInput(
                 "null-space constrained quadratic active-equation RRQR failed".to_string(),
             )
@@ -1581,10 +1585,7 @@ pub(crate) fn solve_kkt_direction(
             "null-space constrained quadratic active equations have numerical rank zero"
         );
     }
-    if rank > singular.len()
-        || !singular[rank - 1].is_finite()
-        || singular[rank - 1] <= 0.0
-    {
+    if rank > singular.len() || !singular[rank - 1].is_finite() || singular[rank - 1] <= 0.0 {
         crate::bail_invalid_estim!(
             "null-space constrained quadratic RRQR rank {rank} has no positive SVD pivot"
         );
@@ -1635,9 +1636,14 @@ pub(crate) fn solve_kkt_direction(
         // rather than the basis's. A column that collapses under the projection
         // was not independent of the row space to begin with; leave it as the
         // rank checks above left it rather than amplifying noise.
-        let norm = null_basis.column(column).dot(&null_basis.column(column)).sqrt();
+        let norm = null_basis
+            .column(column)
+            .dot(&null_basis.column(column))
+            .sqrt();
         if norm.is_finite() && norm > 0.0 {
-            null_basis.column_mut(column).mapv_inplace(|value| value / norm);
+            null_basis
+                .column_mut(column)
+                .mapv_inplace(|value| value / norm);
         }
     }
     if !array_is_finite(&null_basis) {
@@ -1653,8 +1659,7 @@ pub(crate) fn solve_kkt_direction(
         );
     }
 
-    let initial_affine_residual =
-        compensated_active_residual(&scaled_a, &scaled_rhs, &particular);
+    let initial_affine_residual = compensated_active_residual(&scaled_a, &scaled_rhs, &particular);
     let affine_correction =
         minimum_norm_from_svd(&u, &singular, &vt, rank, &initial_affine_residual);
     particular += &affine_correction;
@@ -1713,13 +1718,10 @@ pub(crate) fn solve_kkt_direction(
         direction += &null_basis.dot(&reduced_solution);
     }
 
-    let initial_certificate =
-        certify_active_equalities(&scaled_a, &scaled_rhs, &direction);
+    let initial_certificate = certify_active_equalities(&scaled_a, &scaled_rhs, &direction);
     if !initial_certificate.is_certified() {
-        let affine_residual =
-            compensated_active_residual(&scaled_a, &scaled_rhs, &direction);
-        let correction =
-            minimum_norm_from_svd(&u, &singular, &vt, rank, &affine_residual);
+        let affine_residual = compensated_active_residual(&scaled_a, &scaled_rhs, &direction);
+        let correction = minimum_norm_from_svd(&u, &singular, &vt, rank, &affine_residual);
         if !correction.iter().all(|value| value.is_finite()) {
             return Err(EstimationError::ParameterConstraintViolation(format!(
                 "null-space active-equality correction produced a non-finite value \
@@ -1730,8 +1732,7 @@ pub(crate) fn solve_kkt_direction(
             )));
         }
         direction += &correction;
-        let refined_certificate =
-            certify_active_equalities(&scaled_a, &scaled_rhs, &direction);
+        let refined_certificate = certify_active_equalities(&scaled_a, &scaled_rhs, &direction);
         if !refined_certificate.is_certified() {
             return Err(EstimationError::ParameterConstraintViolation(format!(
                 "null-space active equality is unresolved after affine correction \
@@ -2382,7 +2383,7 @@ impl<'a> ConstraintSetOps<'a> {
         })
     }
 
-/// Operator view of only the rows that are tight at `beta`. Inactive rows
+    /// Operator view of only the rows that are tight at `beta`. Inactive rows
     /// do not constrain the tangent cone, so make them vacuous by zeroing both
     /// their cached norm and bound while retaining the original row indexing.
     /// This avoids materializing the potentially enormous tight submatrix and
@@ -2463,7 +2464,6 @@ impl<'a> ConstraintSetOps<'a> {
         }
         Ok(gathered)
     }
-
 }
 
 /// Add every geometrically independent violated separator available at one
@@ -2495,9 +2495,7 @@ fn independent_violated_operator_rows(
     if max_new == 0 {
         return Ok(Vec::new());
     }
-    if values.len() != ops.nrows()
-        || is_active.len() != ops.nrows()
-        || banned.len() != ops.nrows()
+    if values.len() != ops.nrows() || is_active.len() != ops.nrows() || banned.len() != ops.nrows()
     {
         crate::bail_invalid_estim!(
             "operator batch-separation dimension mismatch: values={}, active_mask={}, \
@@ -2906,12 +2904,8 @@ fn refine_operator_metric_face(
         // so solving it directly with `A beta = b` is algebraically identical
         // and preserves the endpoint's own scale.
         let objective_gradient = -rhs;
-        let (candidate, system_multipliers) = solve_kkt_direction(
-            hessian,
-            &objective_gradient,
-            &rows.a,
-            Some(&rows.b),
-        )?;
+        let (candidate, system_multipliers) =
+            solve_kkt_direction(hessian, &objective_gradient, &rows.a, Some(&rows.b))?;
         let refined_multipliers = -system_multipliers;
         let leaving_position = refined_multipliers
             .iter()
@@ -3119,8 +3113,16 @@ pub(crate) fn kkt_dual_channel_violations(
     gradient_scale: f64,
 ) -> (bool, bool) {
     (
-        exceeds_at_gradient_scale(dual_violation, ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL, gradient_scale),
-        exceeds_at_gradient_scale(complementarity, ACTIVE_SET_KKT_COMPLEMENTARITY_TOL, gradient_scale),
+        exceeds_at_gradient_scale(
+            dual_violation,
+            ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL,
+            gradient_scale,
+        ),
+        exceeds_at_gradient_scale(
+            complementarity,
+            ACTIVE_SET_KKT_COMPLEMENTARITY_TOL,
+            gradient_scale,
+        ),
     )
 }
 
@@ -3139,7 +3141,11 @@ pub(crate) fn kkt_dual_channel_violations(
 /// startup gate both judge by, so a point the solver certifies is never one
 /// the gate then refuses. A non-finite residual or scale is never within
 /// tolerance.
-pub(crate) fn exceeds_at_gradient_scale(residual: f64, tolerance: f64, gradient_scale: f64) -> bool {
+pub(crate) fn exceeds_at_gradient_scale(
+    residual: f64,
+    tolerance: f64,
+    gradient_scale: f64,
+) -> bool {
     !(gradient_scale.is_finite() && residual <= tolerance * gradient_scale)
 }
 
@@ -3197,7 +3203,7 @@ fn stationarity_roundoff_excess(
         floor: 0.0,
     };
     for coordinate in 0..p {
-        let mut magnitude = KahanSum::default();
+        let mut magnitude = CompensatedSum::default();
         for column in 0..p {
             magnitude.add((hessian[[coordinate, column]] * beta[column]).abs());
         }
@@ -3207,7 +3213,7 @@ fn stationarity_roundoff_excess(
                 magnitude.add((rows[[row, coordinate]] * multipliers[row]).abs());
             }
         }
-        let floor = growth * magnitude.sum();
+        let floor = growth * magnitude.value();
         let value = residual[coordinate];
         let excess = if value.is_finite() && floor.is_finite() {
             (value.abs() - floor).max(0.0)
@@ -3361,9 +3367,7 @@ fn solve_operator_metric_projection_dual_active_set(
                 let (dual_direction, tangent) = if active.is_empty() {
                     (Array1::<f64>::zeros(0), whitened_normal.clone())
                 } else {
-                    let Some((q, r)) =
-                        thin_qr_reorthogonalized(&whitened_active)
-                    else {
+                    let Some((q, r)) = thin_qr_reorthogonalized(&whitened_active) else {
                         crate::bail_invalid_estim!(
                             "operator metric projection lost independence of its {} active normals",
                             active.len()
@@ -3371,8 +3375,7 @@ fn solve_operator_metric_projection_dual_active_set(
                     };
                     let projections =
                         Array1::from_iter(q.iter().map(|basis| basis.dot(&whitened_normal)));
-                    let Some(dual_direction) =
-                        upper_triangular_back_substitution(&r, &projections)
+                    let Some(dual_direction) = upper_triangular_back_substitution(&r, &projections)
                     else {
                         crate::bail_invalid_estim!(
                             "operator metric projection could not solve its {}-row dual direction",
@@ -3442,8 +3445,7 @@ fn solve_operator_metric_projection_dual_active_set(
                             "operator metric projection iterate left the finite range"
                         );
                     }
-                    for (multiplier, direction) in
-                        multipliers.iter_mut().zip(dual_direction.iter())
+                    for (multiplier, direction) in multipliers.iter_mut().zip(dual_direction.iter())
                     {
                         *multiplier = (*multiplier - step * direction).max(0.0);
                     }
@@ -3477,8 +3479,7 @@ fn solve_operator_metric_projection_dual_active_set(
                 // arithmetic. Track that algebraic residual instead of
                 // re-reading a cancellation-prone row dot-product; terminal
                 // original-metric conditioning owns the forward-error repair.
-                remaining_violation =
-                    (-step).mul_add(rate, remaining_violation).max(0.0);
+                remaining_violation = (-step).mul_add(rate, remaining_violation).max(0.0);
                 let leaving = blocking.expect("a finite partial step names a blocking row");
                 let leaving_row = active.remove(leaving);
                 whitened_active.remove(leaving);
@@ -3514,8 +3515,7 @@ fn solve_operator_metric_projection_dual_active_set(
         }
         if !active.is_empty() {
             let active_rows = ops.gather_unit_rows(&active)?;
-            let equality =
-                certify_active_equalities(&active_rows.a, &active_rows.b, &refined.0);
+            let equality = certify_active_equalities(&active_rows.a, &active_rows.b, &refined.0);
             if !equality.is_certified() {
                 return Err(EstimationError::ParameterConstraintViolation(format!(
                     "operator metric projection conditioned face failed its active-equality \
@@ -3628,7 +3628,11 @@ fn solve_operator_metric_projection_dual_active_set(
         None
     };
     if let Some(roundoff) = roundoff
-        && exceeds_at_gradient_scale(roundoff.excess, ACTIVE_SET_KKT_STATIONARITY_TOL, gradient_scale)
+        && exceeds_at_gradient_scale(
+            roundoff.excess,
+            ACTIVE_SET_KKT_STATIONARITY_TOL,
+            gradient_scale,
+        )
     {
         // WHICH of the two things failed is not recoverable from `residual`
         // alone, and they need opposite repairs (#2592).
@@ -3662,10 +3666,8 @@ fn solve_operator_metric_projection_dual_active_set(
                 Some(gradient_inf_norm(&tangent.dot(&tangent.t().dot(&gradient))))
             })
         };
-        let achievable_report = achievable.map_or_else(
-            || "unmeasured".to_string(),
-            |value| format!("{value:.3e}"),
-        );
+        let achievable_report =
+            achievable.map_or_else(|| "unmeasured".to_string(), |value| format!("{value:.3e}"));
         let verdict = match achievable {
             Some(value) if value > 0.5 * stationarity => {
                 "the face TANGENT carries the residual, so this point is not the \
@@ -3899,13 +3901,8 @@ pub(crate) fn solve_newton_direction_with_linear_constraints(
     // solver optimize a different object on the next cycle (#2366/#2432).
     let rhs = hessian.dot(beta) - gradient;
     let warm_active = active_hint.as_ref().map(|hint| hint.as_slice());
-    let (candidate, active) = solve_quadratic_with_linear_constraints(
-        hessian,
-        &rhs,
-        beta,
-        constraints,
-        warm_active,
-    )?;
+    let (candidate, active) =
+        solve_quadratic_with_linear_constraints(hessian, &rhs, beta, constraints, warm_active)?;
     if direction_out.len() != beta.len() {
         *direction_out = Array1::zeros(beta.len());
     }
@@ -4159,8 +4156,11 @@ mod tests {
                 )
         );
         assert!(
-            super::thin_qr_reorthogonalized(&[array![2.0_f64, 0.0, 0.0], array![3.0_f64, 0.0, 0.0]])
-                .is_none(),
+            super::thin_qr_reorthogonalized(&[
+                array![2.0_f64, 0.0, 0.0],
+                array![3.0_f64, 0.0, 0.0]
+            ])
+            .is_none(),
             "a column in its predecessors' span is dependent"
         );
 
@@ -4189,7 +4189,9 @@ mod tests {
             LinearInequalityConstraints::new(a, Array1::<f64>::ones(8)).expect("dense"),
         );
         let ops = ConstraintSetOps::new(&set, 0.0).expect("operator geometry");
-        let values = ops.values(&Array1::<f64>::zeros(8)).expect("values at the origin");
+        let values = ops
+            .values(&Array1::<f64>::zeros(8))
+            .expect("values at the origin");
         let active: Vec<usize> = (0..6).collect();
         let mut is_active = vec![false; 8];
         for &row in &active {
@@ -4254,7 +4256,13 @@ mod tests {
         let stiff_rhs = array![5.566932e12, 0.5];
         let one_unit = array![-9.765625e-4, 0.0];
         let measured = super::stationarity_roundoff_excess(
-            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &one_unit, 3,
+            &stiff,
+            &stiff_rhs,
+            &stiff_beta,
+            None,
+            &no_rows,
+            &one_unit,
+            3,
         );
         assert_eq!(
             measured.excess, 0.0,
@@ -4265,7 +4273,13 @@ mod tests {
         let unit = array![[1.0, 0.0], [0.0, 1.0]];
         let unit_state = array![0.5, 0.5];
         let at_unit_scale = super::stationarity_roundoff_excess(
-            &unit, &unit_state, &unit_state, None, &no_rows, &one_unit, 3,
+            &unit,
+            &unit_state,
+            &unit_state,
+            None,
+            &no_rows,
+            &one_unit,
+            3,
         );
         assert!(
             at_unit_scale.excess > super::ACTIVE_SET_KKT_STATIONARITY_TOL
@@ -4276,7 +4290,13 @@ mod tests {
         );
 
         let far_above = super::stationarity_roundoff_excess(
-            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &array![1.0, 0.0], 3,
+            &stiff,
+            &stiff_rhs,
+            &stiff_beta,
+            None,
+            &no_rows,
+            &array![1.0, 0.0],
+            3,
         );
         assert!(
             far_above.excess > 0.5 && far_above.coordinate == 0,
@@ -4294,10 +4314,22 @@ mod tests {
         let multipliers = array![4.0e12 - 0.5];
         let tangent_residual = array![0.0, 2.5e-3];
         let with_rows = super::stationarity_roundoff_excess(
-            &unit, &small_rhs, &tall_beta, Some(&rows), &multipliers, &tangent_residual, 4,
+            &unit,
+            &small_rhs,
+            &tall_beta,
+            Some(&rows),
+            &multipliers,
+            &tangent_residual,
+            4,
         );
         let without_rows = super::stationarity_roundoff_excess(
-            &unit, &small_rhs, &tall_beta, None, &no_rows, &tangent_residual, 3,
+            &unit,
+            &small_rhs,
+            &tall_beta,
+            None,
+            &no_rows,
+            &tangent_residual,
+            3,
         );
         assert!(
             with_rows.excess == 0.0 && without_rows.excess > super::ACTIVE_SET_KKT_STATIONARITY_TOL,
@@ -4309,7 +4341,13 @@ mod tests {
         );
 
         let non_finite = super::stationarity_roundoff_excess(
-            &stiff, &stiff_rhs, &stiff_beta, None, &no_rows, &array![f64::NAN, 0.0], 3,
+            &stiff,
+            &stiff_rhs,
+            &stiff_beta,
+            None,
+            &no_rows,
+            &array![f64::NAN, 0.0],
+            3,
         );
         assert!(
             non_finite.excess.is_infinite() && non_finite.coordinate == 0,
@@ -4325,17 +4363,36 @@ mod tests {
     #[test]
     fn dual_kkt_channels_are_judged_at_the_gradient_scale_2695() {
         let (dual, complementarity) = super::kkt_dual_channel_violations(0.0, 4.778e-6, 1.913580e9);
-        assert!(!dual && !complementarity, "a roundoff slack under a 2e9 multiplier is certified");
+        assert!(
+            !dual && !complementarity,
+            "a roundoff slack under a 2e9 multiplier is certified"
+        );
         let (dual, complementarity) = super::kkt_dual_channel_violations(0.0, 4.778e-6, 1.0);
-        assert!(!dual && complementarity, "the same product at unit gradient scale is refused");
-        let (dual, complementarity) = super::kkt_dual_channel_violations(0.0, 1.0e-4 * 1.913580e9, 1.913580e9);
-        assert!(!dual && complementarity, "a material relative complementarity is refused");
+        assert!(
+            !dual && complementarity,
+            "the same product at unit gradient scale is refused"
+        );
+        let (dual, complementarity) =
+            super::kkt_dual_channel_violations(0.0, 1.0e-4 * 1.913580e9, 1.913580e9);
+        assert!(
+            !dual && complementarity,
+            "a material relative complementarity is refused"
+        );
         let (dual, complementarity) = super::kkt_dual_channel_violations(0.0, 0.0, 1.0);
-        assert!(!dual && !complementarity, "a zero dual violation is certified");
+        assert!(
+            !dual && !complementarity,
+            "a zero dual violation is certified"
+        );
         let (dual, complementarity) = super::kkt_dual_channel_violations(3.0e-8, 0.0, 1.0);
-        assert!(dual && !complementarity, "a negative multiplier at unit scale is refused");
+        assert!(
+            dual && !complementarity,
+            "a negative multiplier at unit scale is refused"
+        );
         let (dual, complementarity) = super::kkt_dual_channel_violations(3.0e-8, 0.0, 1.0e9);
-        assert!(!dual && !complementarity, "the same multiplier under a 1e9 gradient is roundoff");
+        assert!(
+            !dual && !complementarity,
+            "the same multiplier under a 1e9 gradient is roundoff"
+        );
     }
     #[test]
     fn a_metric_projection_lands_on_the_binding_face_and_names_it_2695() {
@@ -4353,9 +4410,15 @@ mod tests {
         let (euclid, face) =
             super::project_point_onto_constraint_set_in_metric(&array![0.0, 0.0], None, &set, None)
                 .expect("euclidean projection");
-        assert!((euclid[0] - 0.5).abs() <= 1e-12 && (euclid[1] - 0.5).abs() <= 1e-12, "{euclid:?}");
+        assert!(
+            (euclid[0] - 0.5).abs() <= 1e-12 && (euclid[1] - 0.5).abs() <= 1e-12,
+            "{euclid:?}"
+        );
         assert_eq!(face, vec![2], "the binding row is reported exactly");
-        assert!((euclid[0] + euclid[1] - 1.0).abs() <= 1e-12, "the point sits ON the face");
+        assert!(
+            (euclid[0] + euclid[1] - 1.0).abs() <= 1e-12,
+            "the point sits ON the face"
+        );
         // In the metric diag(1, 4) the same projection minimises x² + 4y² on the
         // face, which is (4/5, 1/5): the metric is honoured, not merely accepted.
         let (metric, face) = super::project_point_onto_constraint_set_in_metric(
@@ -4365,7 +4428,10 @@ mod tests {
             None,
         )
         .expect("metric projection");
-        assert!((metric[0] - 0.8).abs() <= 1e-12 && (metric[1] - 0.2).abs() <= 1e-12, "{metric:?}");
+        assert!(
+            (metric[0] - 0.8).abs() <= 1e-12 && (metric[1] - 0.2).abs() <= 1e-12,
+            "{metric:?}"
+        );
         assert_eq!(face, vec![2]);
         // A feasible interior point is returned unchanged with an empty face.
         let (same, face) = super::project_point_onto_constraint_set_in_metric(
@@ -4376,7 +4442,10 @@ mod tests {
         )
         .expect("interior projection");
         assert!((same[0] - 0.7).abs() <= 1e-12 && (same[1] - 0.9).abs() <= 1e-12);
-        assert!(face.is_empty(), "no row binds at an interior point: {face:?}");
+        assert!(
+            face.is_empty(),
+            "no row binds at an interior point: {face:?}"
+        );
         // (-1, 0.2) projects onto the line x + y = 1 at x = -0.1, outside the
         // quadrant, so the true projection is the vertex (0, 1) where x >= 0 and
         // x + y >= 1 bind together — both are named.
@@ -4388,28 +4457,28 @@ mod tests {
         )
         .expect("vertex projection");
         face.sort_unstable();
-        assert!(vertex[0].abs() <= 1e-12 && (vertex[1] - 1.0).abs() <= 1e-12, "{vertex:?}");
+        assert!(
+            vertex[0].abs() <= 1e-12 && (vertex[1] - 1.0).abs() <= 1e-12,
+            "{vertex:?}"
+        );
         assert_eq!(face, vec![0, 2], "both rows bind at the vertex");
     }
 
     use super::{
         ACTIVE_SET_INTERIOR_SEED_MARGIN, ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL,
         ACTIVE_SET_PRIMAL_FEASIBILITY_TOL, ConstraintRowId, ConstraintSet, ConstraintSetOps,
-        ConstraintSetReducedFace, LinearInequalityConstraints,
-        array_is_finite, certify_active_equalities, compute_constraint_kkt_diagnostics,
-        constraint_set_rows_tight_at_point,
-        independent_violated_operator_rows,
+        ConstraintSetReducedFace, LinearInequalityConstraints, array_is_finite,
+        certify_active_equalities, compute_constraint_kkt_diagnostics,
+        constraint_set_rows_tight_at_point, independent_violated_operator_rows,
         khatri_rao_cone_reduced_face, least_squares_min_norm_any_shape,
-        nonnegative_cone_multipliers,
-        project_point_strictly_into_feasible_cone,
+        nonnegative_cone_multipliers, project_point_strictly_into_feasible_cone,
         project_point_strictly_into_feasible_constraint_set,
         project_stationarity_residual_on_constraint_cone,
         project_stationarity_residual_on_constraint_set,
-        rank_reduce_rows_pivoted_qr_with_dependence,
-        scaled_constraint_slack, scan_operator_violations, solve_kkt_direction,
+        rank_reduce_rows_pivoted_qr_with_dependence, scaled_constraint_slack,
+        scan_operator_violations, solve_kkt_direction,
         solve_newton_direction_with_linear_constraints, solve_quadratic_with_constraint_set,
         solve_quadratic_with_linear_constraints,
-
     };
     use crate::estimate::EstimationError;
     use approx::assert_relative_eq;
@@ -4455,14 +4524,9 @@ mod tests {
         let identity = Array2::<f64>::eye(p);
         let origin = Array1::<f64>::zeros(p);
         let rhs = -residual;
-        let (tangent_direction, tangent_active) = solve_quadratic_with_linear_constraints(
-            &identity,
-            &rhs,
-            &origin,
-            &constraints,
-            None,
-        )
-        .ok()?;
+        let (tangent_direction, tangent_active) =
+            solve_quadratic_with_linear_constraints(&identity, &rhs, &origin, &constraints, None)
+                .ok()?;
         if !array_is_finite(&tangent_direction) {
             return None;
         }
@@ -4582,8 +4646,7 @@ mod tests {
             solve_kkt_direction(&hessian, &gradient, &active_a, Some(&active_residual))
                 .expect("stiff null-space constrained solve");
 
-        let certificate =
-            certify_active_equalities(&active_a, &active_residual, &direction);
+        let certificate = certify_active_equalities(&active_a, &active_residual, &direction);
         assert!(
             certificate.is_certified(),
             "active equality residual {:.3e} exceeds its roundoff bound {:.3e}",
@@ -4598,11 +4661,7 @@ mod tests {
         // Two scaled copies of one equality describe one geometric face. The
         // SVD must retain that rank-one row space, optimize in its orthogonal
         // complement, and return a direction satisfying both original rows.
-        let hessian = array![
-            [1.0e12, 0.0, 0.0],
-            [0.0, 3.0, 0.5],
-            [0.0, 0.5, 2.0],
-        ];
+        let hessian = array![[1.0e12, 0.0, 0.0], [0.0, 3.0, 0.5], [0.0, 0.5, 2.0],];
         let gradient = array![2.0e5, -4.0, 1.0];
         let active_a = array![[1.0, 2.0, 0.0], [2.0, 4.0, 0.0]];
         let active_residual = array![1.0e-4, 2.0e-4];
@@ -5005,7 +5064,10 @@ mod tests {
             (lambda[0] - gap).abs() <= band,
             "the resolved correlation enters with its multiplier: {lambda:?}"
         );
-        assert!(projected[0].abs() <= band, "the projection is polar: {projected:?}");
+        assert!(
+            projected[0].abs() <= band,
+            "the projection is polar: {projected:?}"
+        );
         assert_eq!(projected[1], 1.0);
 
         let (lambda, projected) =
@@ -5125,7 +5187,8 @@ mod tests {
             b: array![0.0, 0.0],
         };
 
-        let finite = compute_constraint_kkt_diagnostics(&beta, &array![1.0, 2.0], 2.0, &constraints);
+        let finite =
+            compute_constraint_kkt_diagnostics(&beta, &array![1.0, 2.0], 2.0, &constraints);
         assert!(
             !finite.cone_projection_refused,
             "a finite gradient on a full-rank active face must be projected, not refused"
@@ -5136,8 +5199,12 @@ mod tests {
             "a projection that happened must contribute no note"
         );
 
-        let refused =
-            compute_constraint_kkt_diagnostics(&beta, &array![f64::NAN, 2.0], f64::NAN, &constraints);
+        let refused = compute_constraint_kkt_diagnostics(
+            &beta,
+            &array![f64::NAN, 2.0],
+            f64::NAN,
+            &constraints,
+        );
         assert_eq!(
             refused.n_active, 2,
             "the fixture must reach the projector: an empty active face skips it entirely"
@@ -5486,8 +5553,15 @@ mod tests {
              replaced cutoff {replaced:.3e}"
         );
         let resolved = array![[1.0_f64, 0.0, 0.0], [1.0, gap, 0.0]];
-        for face in [dense_face_at_origin(resolved.clone()), cone_face_at_origin(resolved.clone())] {
-            assert_eq!(face.representatives, rows(&[0, 1]), "a resolved residual is a representative");
+        for face in [
+            dense_face_at_origin(resolved.clone()),
+            cone_face_at_origin(resolved.clone()),
+        ] {
+            assert_eq!(
+                face.representatives,
+                rows(&[0, 1]),
+                "a resolved residual is a representative"
+            );
             assert!(face.dependence.iter().all(|d| d.is_empty()));
         }
         let (kept, _, _, _) = rank_reduce_rows_pivoted_qr_with_dependence(
@@ -5518,9 +5592,16 @@ mod tests {
             1.0 / (1.0 + tilt * tilt).sqrt() >= 1.0 - 1.0e-9 && tilt > band,
             "fixture premise: the tilted row passed the replaced cosine test and is resolved"
         );
-        let tilted =
-            array![[1.0_f64, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, tilt, 0.0], [2.0, 0.0, 0.0]];
-        for face in [dense_face_at_origin(tilted.clone()), cone_face_at_origin(tilted.clone())] {
+        let tilted = array![
+            [1.0_f64, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [1.0, tilt, 0.0],
+            [2.0, 0.0, 0.0]
+        ];
+        for face in [
+            dense_face_at_origin(tilted.clone()),
+            cone_face_at_origin(tilted.clone()),
+        ] {
             assert_eq!(face.representatives, rows(&[0, 1]));
             assert_eq!(
                 face.dependence[0].len(),
@@ -5538,7 +5619,11 @@ mod tests {
             (0..4).map(|row| vec![row]).collect(),
         );
         assert_eq!(kept.nrows(), 2);
-        assert_eq!(groups, vec![vec![0, 3], vec![1]], "the tilted row joins no group");
+        assert_eq!(
+            groups,
+            vec![vec![0, 3], vec![1]],
+            "the tilted row joins no group"
+        );
     }
 
     /// #2469: of two nearly parallel representatives, a dependent is recorded
@@ -5554,8 +5639,15 @@ mod tests {
             3,
             3.0,
         );
-        let near = array![[1.0_f64, 0.0, 0.0], [1.0, 1.0e-10, 0.0], [3.0, 3.0e-10, 0.0]];
-        for face in [dense_face_at_origin(near.clone()), cone_face_at_origin(near)] {
+        let near = array![
+            [1.0_f64, 0.0, 0.0],
+            [1.0, 1.0e-10, 0.0],
+            [3.0, 3.0e-10, 0.0]
+        ];
+        for face in [
+            dense_face_at_origin(near.clone()),
+            cone_face_at_origin(near),
+        ] {
             assert_eq!(face.representatives, rows(&[0, 1]));
             assert!(
                 face.dependence[0].is_empty(),
@@ -5792,9 +5884,8 @@ mod tests {
         // An identity-metric Moreau projection would return a different point,
         // so this pins the H-metric dual rather than only cone feasibility.
         let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
-        let cone =
-            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
-                .expect("nonnegative quadrant");
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+            .expect("nonnegative quadrant");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let hessian = array![[4.0_f64, 1.0], [1.0, 2.0]];
         let rhs = array![-1.0_f64, 2.0];
@@ -5821,23 +5912,17 @@ mod tests {
     #[test]
     fn operator_metric_dual_uses_the_certificate_multiplier_cone_2432() {
         let psi = array![[1.0_f64, 0.0], [0.0, 1.0]];
-        let cone =
-            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
-                .expect("nonnegative quadrant");
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+            .expect("nonnegative quadrant");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let hessian = Array2::<f64>::eye(2);
         let epsilon = 0.5 * ACTIVE_SET_KKT_DUAL_FEASIBILITY_TOL;
         let rhs = array![epsilon, 1.0];
         let beta_start = array![0.0_f64, 0.0];
 
-        let (candidate, active) = solve_quadratic_with_constraint_set(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &set,
-            Some(&[0]),
-        )
-        .expect("warm face must not perturb the unique cone projection");
+        let (candidate, active) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, Some(&[0]))
+                .expect("warm face must not perturb the unique cone projection");
 
         assert!(
             active.is_empty(),
@@ -5946,12 +6031,14 @@ mod tests {
     fn operator_metric_projection_batches_a_partial_warm_face_979() {
         let rows = 24_000;
         let p = 24;
-        let psi = Array2::from_shape_fn((rows, p), |(row, column)| {
-            if column == row % p { 1.0 } else { 0.0 }
-        });
-        let cone =
-            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
-                .expect("many-row coordinate cone");
+        let psi = Array2::from_shape_fn(
+            (rows, p),
+            |(row, column)| {
+                if column == row % p { 1.0 } else { 0.0 }
+            },
+        );
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+            .expect("many-row coordinate cone");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let hessian = Array2::<f64>::eye(p);
         let rhs = Array1::<f64>::from_elem(p, -1.0);
@@ -5981,14 +6068,9 @@ mod tests {
             "one scan must recover every coefficient-space direction missing from the warm face"
         );
 
-        let (candidate, active) = solve_quadratic_with_constraint_set(
-            &hessian,
-            &rhs,
-            &beta_start,
-            &set,
-            Some(&warm),
-        )
-        .expect("batched metric projection");
+        let (candidate, active) =
+            solve_quadratic_with_constraint_set(&hessian, &rhs, &beta_start, &set, Some(&warm))
+                .expect("batched metric projection");
         assert!(
             candidate.iter().all(|value| value.abs() <= 1e-12),
             "projection onto the repeated coordinate cone must be the origin: {candidate:?}"
@@ -6009,12 +6091,14 @@ mod tests {
     fn operator_strict_interior_projection_is_coefficient_bounded_on_repeated_rows_979() {
         let rows = 24_000;
         let p = 24;
-        let psi = Array2::from_shape_fn((rows, p), |(row, column)| {
-            if column == row % p { 1.0 } else { 0.0 }
-        });
-        let cone =
-            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
-                .expect("many-row coordinate cone");
+        let psi = Array2::from_shape_fn(
+            (rows, p),
+            |(row, column)| {
+                if column == row % p { 1.0 } else { 0.0 }
+            },
+        );
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+            .expect("many-row coordinate cone");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let point = Array1::<f64>::from_elem(p, -1.0);
 
@@ -6062,9 +6146,7 @@ mod tests {
         );
         assert_relative_eq!(scan.worst.violation, 0.0, epsilon = 0.0);
 
-        let active_rows = ops
-            .gather_unit_rows(&[0])
-            .expect("one-row active equality");
+        let active_rows = ops.gather_unit_rows(&[0]).expect("one-row active equality");
         let equality = certify_active_equalities(&active_rows.a, &active_rows.b, &beta);
         assert_eq!(
             equality.worst_row, 0,
@@ -6102,10 +6184,7 @@ mod tests {
             .expect("partial-drop operator cone");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let hessian = Array2::<f64>::eye(2);
-        let unconstrained = array![
-            -1.0_f64,
-            -sine / cosine - residual_after_drop / sine
-        ];
+        let unconstrained = array![-1.0_f64, -sine / cosine - residual_after_drop / sine];
         let beta_start = Array1::<f64>::zeros(2);
 
         let (candidate, active) = solve_quadratic_with_constraint_set(
@@ -6406,9 +6485,8 @@ mod tests {
         // Affine β has exactly zero second differences, so all m rows are
         // tight and the active face is the whole constraint set.
         let beta = Array1::from_shape_fn(p, |j| 0.5 + 2.0 * (j as f64));
-        let constraints =
-            LinearInequalityConstraints::new(a.clone(), Array1::<f64>::zeros(m))
-                .expect("second-difference constraints");
+        let constraints = LinearInequalityConstraints::new(a.clone(), Array1::<f64>::zeros(m))
+            .expect("second-difference constraints");
 
         // The diagnostic works in per-row-normalised units, so build the
         // gradient from the SAME scaled rows its λ will be expressed in.
@@ -6490,7 +6568,7 @@ mod tests {
             "the face is a property of β, not of the gradient's sign"
         );
     }
-/// #979 CTN plateau regression: the operator-native Lawson-Hanson Moreau
+    /// #979 CTN plateau regression: the operator-native Lawson-Hanson Moreau
     /// solve must certify a degenerate fully-pinned vertex directly instead of
     /// spending a primal-QP iteration budget on one-row blocker exchanges.
     #[test]
@@ -6510,13 +6588,9 @@ mod tests {
         );
         let beta = array![0.0_f64, 0.0, 0.0];
         let residual = array![3.0_f64, 2.0, 0.0]; // = a1 + 2·a4
-        let (projected, active) = project_stationarity_residual_on_constraint_set(
-            &residual,
-            &beta,
-            &set,
-            &[0, 1],
-        )
-        .expect("operator NNLS must solve the degenerate vertex");
+        let (projected, active) =
+            project_stationarity_residual_on_constraint_set(&residual, &beta, &set, &[0, 1])
+                .expect("operator NNLS must solve the degenerate vertex");
         let closure = projected.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
         assert!(
             closure <= 1e-9,
@@ -6534,7 +6608,7 @@ mod tests {
         assert_relative_eq!(projected_outside[2], -1.0, epsilon = 1e-9);
     }
 
-/// The projector is a KKT certificate input, so a row that is NOT tight at
+    /// The projector is a KKT certificate input, so a row that is NOT tight at
     /// `beta` must never enter the generator set: a residual
     /// aligned with a slack row must stay unprojected rather than be absorbed
     /// by a constraint that is not active at the iterate.
@@ -6557,7 +6631,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn separable_khatri_rao_tangent_projection_matches_dense_oracle() {
         let cone = small_cone();
         let set = ConstraintSet::KhatriRaoCone(cone.clone());
@@ -6581,7 +6655,7 @@ mod tests {
         }
     }
 
-/// The current #979 production shape has hundreds of thousands of
+    /// The current #979 production shape has hundreds of thousands of
     /// factored rows over only 24 coefficients. Projection work must scale
     /// with batched row products plus the coefficient-dimensional passive
     /// set, not with one primal-QP transition per row id.
@@ -6596,9 +6670,8 @@ mod tests {
                 0.0
             }
         });
-        let cone =
-            KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
-                .expect("many-row low-dimensional cone");
+        let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![0], 1)
+            .expect("many-row low-dimensional cone");
         let dense = cone.to_dense().expect("dense parity oracle");
         let set = ConstraintSet::KhatriRaoCone(cone);
         let beta = Array1::<f64>::zeros(3);
@@ -6625,7 +6698,7 @@ mod tests {
         );
     }
 
-#[test]
+    #[test]
     fn operator_tangent_projection_does_not_constrain_interior_rows() {
         let psi = array![[1.0_f64, 0.0], [1.0, 1.0], [1.0, -1.0]];
         let cone = KhatriRaoConeConstraints::new(std::sync::Arc::new(psi), vec![1], 2)
@@ -6647,7 +6720,7 @@ mod tests {
         assert!(active.is_empty(), "interior rows entered the tangent face");
     }
 
-#[test]
+    #[test]
     fn operator_tangent_projection_homogenizes_an_affine_boundary() {
         let set = ConstraintSet::Dense(
             LinearInequalityConstraints::new(array![[1.0_f64, 0.0]], array![2.0])
@@ -6663,5 +6736,4 @@ mod tests {
         assert_relative_eq!(projected[1], -1.0, epsilon = 1e-12);
         assert_eq!(active, vec![0]);
     }
-
 }

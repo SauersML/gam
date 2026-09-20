@@ -37,37 +37,30 @@
 //! also strictly increasing in the candidate (`du_*/dz > 0`), which is what
 //! turns the candidate line into a monotone walk and makes the tails provable.
 //!
-//! A penalty frozen at the training fit saw the n training responses and not
-//! the test response, so a fit that selected a smoothing parameter needs the
-//! map to re-select it on every augmented data set
-//! ([`ConformalGlmFamily::certificate`]).
+//! The penalty is frozen at the training fit, whose smoothing parameters saw
+//! the n training responses and not the test response. A row of a fit that
+//! selected a smoothing parameter (except the one-strength Bernoulli map below)
+//! or a negative-binomial θ therefore reports
+//! a typed refusal certificate: the numerical enclosure uses a frozen map
+//! without a guarantee for training-selected strengths. The one-strength
+//! Bernoulli map below re-selects its strength; see
+//! [`ConformalGlmFamily::certificate`].
 //!
-//! # The honest Bernoulli map (one smoothing parameter)
+//! # Bernoulli strength re-selection
 //!
-//! A Bernoulli fit that selected one strength is re-fitted, for each candidate
-//! level `z`, at `Sρ = e^ρ S` with `S = Sλ/‖Sλ‖_F` and `ρ̂(z)` the certified
-//! minimiser of the Laplace-REML criterion of the `n + 1` augmented rows
+//! With one selected smoothing strength, each candidate label uses the
+//! augmented-data LAML objective at a unit-Frobenius penalty shape. Scaling
+//! the stored penalty changes neither that shape nor the deterministic zero
+//! coefficient start. The shared outer solver certifies a local solution in
+//! the augmented Gram's resolvability domain; this is not a proof of global
+//! LAML minimization. Selection failures propagate as errors, without a
+//! frozen-fit replacement. The score comparison remains a conservative
+//! numerical enclosure, now for the re-selecting fitting map.
 //!
-//! ```text
-//!   V(ρ) = Σ_j ℓ(η̂_j; y_j) + ½ β̂ᵀSρβ̂ + ½ ln|X_aᵀŴX_a + Sρ| − ½ rank(S)·ρ
-//! ```
-//!
-//! over the #2812 resolvability domain of the augmented Gram `XᵀX + x_*x_*ᵀ`
-//! against `S`, found by the outer engine from its own start with the
-//! criterion's exact first and second derivatives. The criterion, its domain
-//! and its start are symmetric functions of the multiset of augmented rows
-//! (the unit-norm `S` carries no training λ), and the inner problem is strictly
-//! convex, so the fitting map, and with it the score of every point, is
-//! symmetric and the rank argument holds for the re-selecting map. The level's
-//! rank is then decided by the certified solve below at `e^{ρ̂(z)} S`. A row
-//! whose selection does not complete keeps the frozen set and reports
-//! [`ConformalRefusal::RefitFailed`].
-//!
-//! The count and Gamma families keep the frozen penalty and report
-//! [`ConformalRefusal::GlmFrozenPenalty`] when a strength (or a
-//! negative-binomial θ) was selected: their sets are walked monotonically in
-//! the test score, and that walk, with its provable tails, is a property of a
-//! fixed penalty.
+//! Symmetry requires a fixed basis and penalty shape that treat all augmented
+//! rows symmetrically. Removing the fitted strength cannot make a learned,
+//! training-only basis or penalty shape symmetric. Coverage statements are
+//! marginal under exchangeability, not conditional on the test features.
 //!
 //! # Certified solves
 //!
@@ -115,34 +108,56 @@
 //!   mapped by its own certified solve at that `s`, so the set's edges are
 //!   exact boundaries to solver accuracy.
 //!
-//! # Ties in the discrete families
+//! # Independent randomization and numerical ties
 //!
-//! The discrete families use the smoothed (randomised) conformal p-value
-//! `π = (#{s_i > s_*} + U·(1 + T))/(n + 1)`, with `T` the training rows tied
-//! with the test point (same covariates, offset and response), so coverage is
-//! exactly `1 − α` rather than conservative. `U` is a uniform seeded from a
-//! hash of the labeled responses and the test row: the same inputs give the
-//! same set in every front end. Gamma scores are continuous and use the plain
-//! p-value `(1 + #{s_i ≥ s_*})/(n + 1)`.
+//! All families use an independent `U ~ Uniform[0, 1)` drawn once per
+//! inversion and shared by all candidate labels. Exact smoothed ranks have
+//! marginal coverage `1 − α` for exchangeable supplied rows and a fitting map
+//! symmetric in all augmented rows. This is not a conditional-on-features
+//! guarantee; a training-only learned basis or penalty need not be symmetric.
+//! Numerical uncertainty is retained as a conservative enclosure, so this
+//! implementation does not claim exact coverage. Gamma uses the same independent-U
+//! threshold with conservative tie bounds. Fixed-U entry points support reproducible
+//! tests without deriving randomization from the observations.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
 use faer::Side;
 use ndarray::{Array1, Array2, Axis};
-use rand::{RngExt, SeedableRng};
+use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_atv, fast_av, fast_xt_diag_x};
-use gam_linalg::utils::{stable_logistic as sigmoid, stable_softplus as softplus};
+use gam_math::special::{logistic as sigmoid, softplus};
 use gam_problem::types::LikelihoodSpec;
 use gam_spec::FamilySpecKind;
 use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
-    ConformalCertificate, ConformalInterval, ConformalRefusal, GLM_ARMIJO_C1, GLM_CONVERGENCE_RTOL,
-    GLM_NEWTON_MAX_BACKTRACKS, GLM_NEWTON_MAX_ITERS, conformal_rank_threshold, vec_norm,
+    ConformalCertificate, ConformalInterval, ConformalRefusal, conformal_rank_threshold,
+    validate_tie_uniform,
 };
+
+/// Maximum damped-Newton iterations for a cold augmented GLM fit.
+const GLM_NEWTON_MAX_ITERS: usize = 200;
+
+/// Maximum Armijo backtracking halvings per cold Newton iteration.
+const GLM_NEWTON_MAX_BACKTRACKS: usize = 60;
+
+/// Strict scale-invariant KKT tolerance declaring convergence, applied to the
+/// RAW penalized gradient (dimension-scaled OR natural-scale relative — the
+/// same certificate the main P-IRLS solver uses). NOT a tolerance on the
+/// preconditioned Newton step.
+const GLM_CONVERGENCE_RTOL: f64 = 1e-12;
+
+/// Armijo sufficient-decrease constant for the cold-fit line search —
+/// sourced from the shared optimizer constants so the workspace has exactly
+/// one `c₁`.
+const GLM_ARMIJO_C1: f64 = opt::constants::ARMIJO_C1;
+
+#[inline]
+fn vec_norm(v: &Array1<f64>) -> f64 {
+    v.dot(v).sqrt()
+}
 
 /// A non-Gaussian family the certified full-conformal set supports. Each has a
 /// negative log-likelihood convex in `η` whose curvature satisfies
@@ -176,22 +191,18 @@ impl ConformalGlmFamily {
     ///
     /// With no smoothing parameter the frozen-penalty fitting map selects
     /// nothing from the responses (the Gamma dispersion does not enter an
-    /// unpenalized fit, and the score is dispersion-free), so the set is
-    /// exact. A Bernoulli fit with one smoothing parameter gets the honest
-    /// map, which re-selects that strength on every augmented data set (the
-    /// module doc); two or more are refused as
-    /// [`ConformalRefusal::MultiPenalty`], since their ratios were selected on
-    /// the training rows alone. A selected λ of the other families, or the
-    /// negative-binomial θ estimated from the responses, makes the frozen map
-    /// asymmetric in the augmented row; those rows are refused with
-    /// [`ConformalRefusal::GlmFrozenPenalty`].
+    /// unpenalized fit, and the score is dispersion-free), so the numerical set is
+    /// a conservative enclosure. One selected Bernoulli strength is re-selected
+    /// on the augmented rows. Other selected strengths, or negative-binomial θ
+    /// estimated from the responses, make the frozen map asymmetric; those
+    /// rows are refused with [`ConformalRefusal::GlmFrozenPenalty`].
     pub fn certificate(self, penalty_count: Option<usize>) -> ConformalCertificate {
         match (self, penalty_count) {
             (_, None) => ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure),
             (Self::NegativeBinomialLog { .. }, _) => {
                 ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty)
             }
-            (_, Some(0)) => ConformalCertificate::ExactFrozen,
+            (_, Some(0)) => ConformalCertificate::ConservativeFrozen,
             (Self::BernoulliLogit, Some(1)) => ConformalCertificate::HonestRefit,
             (Self::BernoulliLogit, Some(_)) => {
                 ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
@@ -272,6 +283,19 @@ impl ConformalGlmFamily {
         }
     }
 
+    /// Sum of the nonnegative operands of the score, before cancellation.
+    fn score_operand_scale(self, eta: f64, y: f64) -> f64 {
+        match self {
+            Self::BernoulliLogit => y + sigmoid(eta),
+            Self::PoissonLog => y + eta.exp(),
+            Self::NegativeBinomialLog { theta } => {
+                let t = eta - theta.ln();
+                y * sigmoid(-t) + theta * sigmoid(t)
+            }
+            Self::GammaLog => y * (-eta).exp() + 1.0,
+        }
+    }
+
     /// Response-scale mean `μ(η)`.
     pub fn mean(self, eta: f64) -> f64 {
         match self {
@@ -321,7 +345,7 @@ impl ConformalGlmFamily {
             Self::BernoulliLogit => 1.0,
             _ => f64::INFINITY,
         };
-        vec![ConformalInterval { lo: 0.0, hi }]
+        vec![ConformalInterval::closed(0.0, hi)]
     }
 }
 
@@ -405,9 +429,7 @@ pub struct GlmFullConformalSet {
     pub alpha: f64,
     /// `n + 1`.
     pub n_augmented: usize,
-    /// What this row's set guarantees: the substrate's certificate, or
-    /// [`ConformalRefusal::RefitFailed`] with the frozen-penalty set when a
-    /// strength re-selection of this row did not complete.
+    /// The validated fitting-map certificate for this inversion.
     pub certificate: ConformalCertificate,
 }
 
@@ -437,7 +459,7 @@ fn level_runs(levels: impl IntoIterator<Item = f64>) -> Vec<ConformalInterval> {
     for z in levels {
         match runs.last_mut() {
             Some(last) if last.hi + 1.0 == z => last.hi = z,
-            _ => runs.push(ConformalInterval { lo: z, hi: z }),
+            _ => runs.push(ConformalInterval::closed(z, z)),
         }
     }
     runs
@@ -460,17 +482,15 @@ pub struct GlmFullConformalSubstrate {
     /// penalty row and column: the unpenalised intercept the tail bounds use.
     intercept: Option<usize>,
     certificate: ConformalCertificate,
-    /// Present exactly when the certificate is the honest Bernoulli map's.
     reselection: Option<Reselection>,
 }
 
 impl GlmFullConformalSubstrate {
     /// `x` and `offset` are the labeled rows' design and offsets, `y` their
-    /// responses, `s_lambda` the fitted penalty in unit-dispersion units (it
-    /// must be positive semidefinite), `penalty_count` the number of smoothing
-    /// parameters the fit selected (`None` when the payload did not record it)
-    /// and `warm_start` the fitted coefficients, the Newton starting point of
-    /// every augmented solve.
+    /// responses, `s_lambda` the frozen penalty in unit-dispersion units (it
+    /// must be positive semidefinite), `penalty_count` declares how many strengths
+    /// were selected from the training responses, and `warm_start` gives the fitted
+    /// coefficients, the Newton starting point of every augmented solve.
     pub fn new(
         family: ConformalGlmFamily,
         x: Array2<f64>,
@@ -532,35 +552,67 @@ impl GlmFullConformalSubstrate {
                 && s_lambda.column(c).iter().all(|&v| v == 0.0)
         });
         let xt = x.t().to_owned();
-        let warm_start = if warm_start.iter().all(|v| v.is_finite()) {
-            warm_start
-        } else {
-            Array1::zeros(p)
-        };
+        if warm_start.iter().any(|v| !v.is_finite()) {
+            return Err("full conformal: warm-start coefficients must be finite".into());
+        }
         let mut certificate = family.certificate(penalty_count);
         let mut reselection = None;
         if certificate == ConformalCertificate::HonestRefit {
-            // The strength is re-selected in units of the unit-norm penalty, so
-            // neither the criterion nor its start carries the training fit's λ.
-            let norm = s_lambda.iter().map(|v| v * v).sum::<f64>().sqrt();
-            let unit = s_lambda.mapv(|v| v / norm);
-            let rank = if norm > 0.0 {
+            let largest = s_lambda.iter().map(|v| v.abs()).fold(0.0f64, f64::max);
+            if largest == 0.0 {
+                certificate = ConformalCertificate::ConservativeFrozen;
+            } else {
+                // Scale before squaring: a finite penalty of any magnitude
+                // must not become an infinite norm or a false zero penalty.
+                let scaled = s_lambda.mapv(|v| v / largest);
+                if s_lambda
+                    .iter()
+                    .zip(scaled.iter())
+                    .any(|(&original, &value)| original != 0.0 && value == 0.0)
+                {
+                    return Err(
+                        "honest Bernoulli conformal: penalty normalization loses a nonzero entry"
+                            .into(),
+                    );
+                }
+                let norm = scaled.iter().map(|v| v * v).sum::<f64>().sqrt();
+                let unit = scaled.mapv(|v| v / norm);
+                if scaled
+                    .iter()
+                    .zip(unit.iter())
+                    .any(|(&scaled, &value)| scaled != 0.0 && value == 0.0)
+                {
+                    return Err("honest Bernoulli conformal: unit penalty normalization loses a nonzero entry".into());
+                }
+                for a in 0..p {
+                    for b in 0..a {
+                        if s_lambda[[a, b]] != s_lambda[[b, a]] {
+                            return Err(
+                                "honest Bernoulli conformal: penalty must be symmetric".into()
+                            );
+                        }
+                    }
+                }
                 let (evals, _) = unit.eigh(Side::Lower).map_err(|e| {
-                    format!("binomial-logit full conformal: penalty eigendecomposition failed: {e:?}")
+                    format!("honest Bernoulli conformal: penalty eigendecomposition failed: {e:?}")
                 })?;
                 let evals = evals.to_vec();
                 let threshold =
                     gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
                         &evals,
                     );
-                evals.iter().filter(|&&e| e > threshold).count()
-            } else {
-                0
-            };
-            if rank == 0 {
-                // No penalized direction: the strength selects nothing.
-                certificate = ConformalCertificate::ExactFrozen;
-            } else {
+                if evals.iter().any(|&v| !v.is_finite() || v < -threshold) {
+                    return Err(
+                        "honest Bernoulli conformal: penalty is not resolved positive semidefinite"
+                            .into(),
+                    );
+                }
+                let rank = evals.iter().filter(|&&v| v > threshold).count();
+                if rank == 0 {
+                    return Err(
+                        "honest Bernoulli conformal: nonzero penalty rank is unresolved".into(),
+                    );
+                }
                 reselection = Some(Reselection {
                     unit,
                     rank,
@@ -616,6 +668,19 @@ impl GlmFullConformalSubstrate {
         offset_star: f64,
         alpha: f64,
     ) -> Result<GlmFullConformalSet, String> {
+        self.prediction_set_with_uniform(x_star, offset_star, alpha, rand::rng().random())
+    }
+
+    /// Invert with one externally supplied independent uniform variate.
+    /// Reusing this value across candidates defines a coherent randomized set.
+    pub fn prediction_set_with_uniform(
+        &self,
+        x_star: &Array1<f64>,
+        offset_star: f64,
+        alpha: f64,
+        tie_uniform: f64,
+    ) -> Result<GlmFullConformalSet, String> {
+        validate_tie_uniform(tie_uniform)?;
         if !(alpha > 0.0 && alpha < 1.0) {
             return Err(format!(
                 "full conformal: alpha must be in (0, 1), got {alpha}"
@@ -636,24 +701,18 @@ impl GlmFullConformalSubstrate {
             offset: offset_star,
         };
         let tau = conformal_rank_threshold(alpha, self.n() + 1);
-        let honest = self
-            .reselection
-            .as_ref()
-            .map(|reselection| self.honest_bernoulli_set(reselection, &row, tau));
-        let (intervals, certificate) = match honest {
-            Some(Some(intervals)) => (intervals, self.certificate),
-            Some(None) => (
-                self.discrete_set(&row, tau),
-                ConformalCertificate::Refused(ConformalRefusal::RefitFailed),
-            ),
-            None if self.family.is_discrete() => (self.discrete_set(&row, tau), self.certificate),
-            None => (self.continuous_set(&row, tau), self.certificate),
+        let intervals = if let Some(reselection) = &self.reselection {
+            self.honest_bernoulli_set(reselection, &row, tau, tie_uniform)?
+        } else if self.family.is_discrete() {
+            self.discrete_set(&row, tau, tie_uniform)
+        } else {
+            self.continuous_set(&row, tau, tie_uniform)
         };
         Ok(GlmFullConformalSet {
             intervals,
             alpha,
             n_augmented: self.n() + 1,
-            certificate,
+            certificate: self.certificate,
         })
     }
 
@@ -689,8 +748,22 @@ impl GlmFullConformalSubstrate {
         let s_beta = self.s_lambda.dot(beta);
         let mut grad = &s_beta - &xtu;
         grad.scaled_add(-score_star, row.x);
-        let natural_scale =
-            1.0 + vec_norm(&xtu) + vec_norm(&s_beta) + vec_norm(row.x) * score_star.abs();
+        let training_scale: f64 = (0..n)
+            .map(|i| {
+                self.x
+                    .row(i)
+                    .iter()
+                    .fold(0.0_f64, |norm, value| norm.hypot(*value))
+                    * self
+                        .family
+                        .score_operand_scale(eta[i] + self.offset[i], self.y[i])
+            })
+            .sum();
+        let test_scale = match aug {
+            Augmentation::Response(z) => self.family.score_operand_scale(eta_star, z),
+            Augmentation::Tilt(s) => s.abs(),
+        };
+        let natural_scale = 1.0 + training_scale + vec_norm(&s_beta) + vec_norm(row.x) * test_scale;
         State {
             score,
             weight,
@@ -719,8 +792,10 @@ impl GlmFullConformalSubstrate {
     fn kkt_converged(&self, state: &State) -> bool {
         let g_norm = vec_norm(&state.grad);
         let dimension_scale = ((self.n() + 1) as f64).sqrt() * (self.p() as f64).sqrt();
-        g_norm < GLM_CONVERGENCE_RTOL * dimension_scale
-            || g_norm / state.natural_scale < GLM_CONVERGENCE_RTOL
+        g_norm.is_finite()
+            && state.natural_scale.is_finite()
+            && (g_norm < GLM_CONVERGENCE_RTOL * dimension_scale
+                || g_norm / state.natural_scale < GLM_CONVERGENCE_RTOL)
     }
 
     /// Damped Newton on the augmented problem from `init`, then the solve
@@ -874,22 +949,9 @@ impl GlmFullConformalSubstrate {
         }
     }
 
-    /// The seeded tie-break uniform of one test row.
-    fn tie_break_uniform(&self, row: &TestRow<'_>) -> f64 {
-        let mut hasher = DefaultHasher::new();
-        for v in self.y.iter().chain(row.x.iter()) {
-            v.to_bits().hash(&mut hasher);
-        }
-        row.offset.to_bits().hash(&mut hasher);
-        rand::rngs::StdRng::seed_from_u64(hasher.finish()).random::<f64>()
-    }
-
     /// The discrete set with randomised ties: both Bernoulli levels by their
     /// own solves, the counts by [`Self::count_set`].
-    fn discrete_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
-        let u_tie = self.tie_break_uniform(row);
-        // `K`: the most training rows with score at least the test score that
-        // still leave a candidate outside the set, `k + U ≤ τ`.
+    fn discrete_set(&self, row: &TestRow<'_>, tau: f64, u_tie: f64) -> Vec<ConformalInterval> {
         if tau < u_tie {
             return self.family.whole_support();
         }
@@ -917,40 +979,47 @@ impl GlmFullConformalSubstrate {
 
     /// The Bernoulli set of the honest map: each level `z` is fitted at the
     /// strength `ρ̂(z)` the augmented data select, and its rank is decided by
-    /// the certified solve at `e^{ρ̂(z)} S`. `None` when a selection did not
-    /// complete.
+    /// the certified solve at `e^{ρ̂(z)} S`. Returns the reason when a selection does not
+    /// complete; there is no frozen-fit substitution.
     fn honest_bernoulli_set(
         &self,
         reselection: &Reselection,
         row: &TestRow<'_>,
         tau: f64,
-    ) -> Option<Vec<ConformalInterval>> {
-        let u_tie = self.tie_break_uniform(row);
+        u_tie: f64,
+    ) -> Result<Vec<ConformalInterval>, String> {
         if tau < u_tie {
-            return Some(self.family.whole_support());
+            return Ok(self.family.whole_support());
         }
         let twin = self.twin_rows(row);
         let mut kept = Vec::with_capacity(2);
         for z in [0.0, 1.0] {
-            let (rho, beta) = self.select_strength(reselection, row, z).ok()?;
-            let refit = self.at_strength(reselection, rho, beta);
+            let (rho, beta) = self.select_strength(reselection, row, z)?;
+            let refit = self.at_strength(reselection, rho, beta)?;
             if refit.count_member(row, z, u_tie, &twin, tau) {
                 kept.push(z);
             }
         }
-        Some(level_runs(kept))
+        Ok(level_runs(kept))
     }
 
     /// This substrate at the penalty `e^ρ S`, warm-started at `beta`.
-    fn at_strength(&self, reselection: &Reselection, rho: f64, beta: Array1<f64>) -> Self {
+    fn at_strength(
+        &self,
+        reselection: &Reselection,
+        rho: f64,
+        beta: Array1<f64>,
+    ) -> Result<Self, String> {
         let mut refit = self.clone();
-        refit.s_lambda = reselection.unit.mapv(|v| rho.exp() * v);
+        let strength = gam_problem::checked_exp_log_strength(rho)
+            .map_err(|e| format!("honest Bernoulli conformal strength: {e}"))?;
+        refit.s_lambda = reselection.unit.mapv(|v| strength * v);
         refit.warm_start = beta;
         refit.reselection = None;
-        refit
+        Ok(refit)
     }
 
-    /// `ρ̂(z)`: the Laplace-REML optimum of the `n + 1` augmented rows over the
+    /// `ρ̂(z)`: a certified local Laplace-REML solution for the augmented rows in the
     /// #2812 resolvability domain of their Gram against `S`, through the outer
     /// engine from its own start, with the fitted coefficients at that optimum.
     fn select_strength(
@@ -970,15 +1039,19 @@ impl GlmFullConformalSubstrate {
                 gram[[a, b]] += row.x[a] * row.x[b];
             }
         }
-        let (lower, upper) = gam_solve::estimate::rho_domain::coordinate_domain(
-            gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
-                &gram,
-                &reselection.unit,
-            )
-            .as_deref()
-            .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
-            None,
-        );
+        let spectrum = gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
+            &gram,
+            &reselection.unit,
+        )
+        .ok_or_else(|| {
+            "honest Bernoulli conformal: augmented penalty spectrum is unresolved".to_string()
+        })?;
+        let interval = gam_solve::estimate::rho_domain::resolvability_interval(&spectrum)
+            .ok_or_else(|| {
+                "honest Bernoulli conformal: smoothing domain is unresolved".to_string()
+            })?;
+        let (lower, upper) =
+            gam_solve::estimate::rho_domain::coordinate_domain(Some(interval), None);
         let context = format!("binomial-logit honest full conformal at z={z}");
         let refuse = |reason: String| EstimationError::TrialPointRefused { reason };
         let problem = OuterProblem::new(1)
@@ -987,7 +1060,7 @@ impl GlmFullConformalSubstrate {
             .with_hessian(gam_problem::DeclaredHessianForm::Dense)
             .with_bounds(Array1::from_elem(1, lower), Array1::from_elem(1, upper));
         let mut objective = problem.build_objective(
-            self.warm_start.clone(),
+            Array1::<f64>::zeros(p),
             |warm: &mut Array1<f64>, rho: &Array1<f64>| {
                 let jet = self
                     .laml_jet(reselection, row, z, rho[0], warm)
@@ -1016,7 +1089,7 @@ impl GlmFullConformalSubstrate {
             .run_certified(&mut objective, &context)
             .map_err(|e| format!("{context}: {e}"))?;
         let rho = result.rho()[0];
-        let jet = self.laml_jet(reselection, row, z, rho, &self.warm_start)?;
+        let jet = self.laml_jet(reselection, row, z, rho, &Array1::zeros(p))?;
         Ok((rho, jet.beta))
     }
 
@@ -1084,8 +1157,7 @@ impl GlmFullConformalSubstrate {
         })?;
         let s_beta = s_rho.dot(&beta);
         let penalty = beta.dot(&s_beta);
-        let mut value = 0.5 * penalty
-            + chol.diag().iter().map(|d| d.ln()).sum::<f64>()
+        let mut value = 0.5 * penalty + chol.diag().iter().map(|d| d.ln()).sum::<f64>()
             - 0.5 * reselection.rank as f64 * rho;
         for j in 0..=n {
             value += self.family.nll(eta[j], y_aug[j]);
@@ -1325,7 +1397,7 @@ impl GlmFullConformalSubstrate {
                 Kind::NonMember => {}
                 Kind::Unknown => {
                     let (lo, hi) = counts(first.z_lo, last.z_hi);
-                    ranges.push(ConformalInterval { lo, hi });
+                    ranges.push(ConformalInterval::closed(lo, hi));
                 }
                 Kind::Undecided => push_exact(first.z_lo, last.z_hi, &mut exact),
                 Kind::Member => {
@@ -1347,10 +1419,7 @@ impl GlmFullConformalSubstrate {
                         }
                         None => last.z_hi.floor(),
                     };
-                    ranges.push(ConformalInterval {
-                        lo: lo.max(0.0),
-                        hi,
-                    });
+                    ranges.push(ConformalInterval::closed(lo.max(0.0), hi));
                 }
             }
             i = j + 1;
@@ -1365,7 +1434,7 @@ impl GlmFullConformalSubstrate {
         let (kept, dropped): (Vec<f64>, Vec<f64>) = exact
             .into_iter()
             .partition(|&z| self.count_member(row, z, u_tie, twin, tau));
-        ranges.extend(kept.into_iter().map(|z| ConformalInterval { lo: z, hi: z }));
+        ranges.extend(kept.into_iter().map(|z| ConformalInterval::closed(z, z)));
         ranges.retain(|r| r.lo <= r.hi);
         ranges.sort_by(|p, q| p.lo.total_cmp(&q.lo));
         let mut merged = Vec::<ConformalInterval>::new();
@@ -1382,14 +1451,8 @@ impl GlmFullConformalSubstrate {
                 .flat_map(|r| {
                     if r.lo <= z && z <= r.hi {
                         [
-                            ConformalInterval {
-                                lo: r.lo,
-                                hi: z - 1.0,
-                            },
-                            ConformalInterval {
-                                lo: z + 1.0,
-                                hi: r.hi,
-                            },
+                            ConformalInterval::closed(r.lo, z - 1.0),
+                            ConformalInterval::closed(z + 1.0, r.hi),
                         ]
                         .into_iter()
                         .filter(|p| p.lo <= p.hi)
@@ -1405,13 +1468,18 @@ impl GlmFullConformalSubstrate {
 
     /// Certified walk over the test-score coordinate for the continuous
     /// (Gamma) family.
-    fn continuous_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
+    fn continuous_set(
+        &self,
+        row: &TestRow<'_>,
+        tau: f64,
+        tie_uniform: f64,
+    ) -> Vec<ConformalInterval> {
         let whole = self.family.whole_support();
-        if tau < 1.0 {
+        if tau < tie_uniform {
             return whole;
         }
         // r: the fewest dominating training rows that keep a candidate in.
-        let r = (tau - 1.0).floor() + 1.0;
+        let r = (tau - tie_uniform).floor() + 1.0;
         let Some(c) = self.intercept else {
             return whole;
         };
@@ -1474,7 +1542,7 @@ impl GlmFullConformalSubstrate {
             } else {
                 (a.abs().min(b.abs()), a.abs().max(b.abs()))
             };
-            let included = match self.verdict(&node, e, t_lo, t_hi, 1.0, tau, None) {
+            let included = match self.verdict(&node, e, t_lo, t_hi, tie_uniform, tau, None) {
                 Verdict::Member => true,
                 Verdict::NonMember => false,
                 Verdict::Undecided => {
@@ -1520,10 +1588,7 @@ impl GlmFullConformalSubstrate {
                     _ => runs.push(Run {
                         s_lo: leaf.s_lo,
                         s_hi: leaf.s_hi,
-                        piece: ConformalInterval {
-                            lo: leaf.z_lo,
-                            hi: leaf.z_hi,
-                        },
+                        piece: ConformalInterval::closed(leaf.z_lo, leaf.z_hi),
                         warm_lo: leaf.warm.clone(),
                         warm_hi: leaf.warm,
                     }),
@@ -1640,8 +1705,10 @@ pub fn penalty_from_normal_and_gram(
     }
     let psd = scaled.dot(&evecs.t());
     for (a, &ia) in idx.iter().enumerate() {
-        for (b, &ib) in idx.iter().enumerate() {
-            s[[ia, ib]] = psd[[a, b]];
+        for (b, &ib) in idx.iter().enumerate().take(a + 1) {
+            let value = 0.5 * psd[[a, b]] + 0.5 * psd[[b, a]];
+            s[[ia, ib]] = value;
+            s[[ib, ia]] = value;
         }
     }
     Ok(s)
@@ -1650,7 +1717,7 @@ pub fn penalty_from_normal_and_gram(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::rngs::StdRng;
+    use rand::{SeedableRng, rngs::StdRng};
     use rand_distr::{Distribution, Gamma as GammaDist, Poisson as PoissonDist};
 
     const ALPHA: f64 = 0.1;
@@ -1731,21 +1798,6 @@ mod tests {
         .unwrap()
     }
 
-    /// The same rows as a Bernoulli fit that selected the strength of
-    /// `penalty()`: the honest map re-selects it on every augmented data set.
-    fn honest_substrate(d: &Data) -> GlmFullConformalSubstrate {
-        GlmFullConformalSubstrate::new(
-            ConformalGlmFamily::BernoulliLogit,
-            d.x.clone(),
-            d.y.clone(),
-            d.offset.clone(),
-            penalty(),
-            Some(1),
-            Array1::zeros(3),
-        )
-        .unwrap()
-    }
-
     fn contains(set: &GlmFullConformalSet, z: f64) -> bool {
         set.intervals.iter().any(|iv| iv.lo <= z && z <= iv.hi)
     }
@@ -1812,14 +1864,9 @@ mod tests {
         let n = sub.n();
         let tau = conformal_rank_threshold(alpha, n + 1);
         let s_star = node.score_star.abs();
-        if sub.family.is_discrete() {
-            let u = sub.tie_break_uniform(&row);
-            let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
-            greater as f64 + u > tau
-        } else {
-            let geq = (0..n).filter(|&i| node.score[i].abs() >= s_star).count();
-            geq as f64 + 1.0 > tau
-        }
+        let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
+        let tied = (0..n).filter(|&i| node.score[i].abs() == s_star).count();
+        greater as f64 + 0.5 * (1 + tied) as f64 > tau
     }
 
     #[test]
@@ -1831,7 +1878,9 @@ mod tests {
                 let sub = substrate(*family, &d);
                 let x = rng.random::<f64>() * 2.0 - 1.0;
                 let o = 0.1;
-                let set = sub.prediction_set(&row(x), o, ALPHA).unwrap();
+                let set = sub
+                    .prediction_set_with_uniform(&row(x), o, ALPHA, 0.5)
+                    .unwrap();
                 let top = match family {
                     ConformalGlmFamily::BernoulliLogit => 1,
                     _ => 80,
@@ -1870,13 +1919,15 @@ mod tests {
             offset: 0.0,
         };
         let tau = conformal_rank_threshold(ALPHA, sub.n() + 1);
-        let k_max = (tau - sub.tie_break_uniform(&test)).floor() as usize;
+        let k_max = (tau - 0.5).floor() as usize;
         let tail = sub.count_score_tail(&test, k_max).unwrap();
         assert!(
             tail <= d.y.sum(),
             "tail score {tail} is not on the data scale"
         );
-        let set = sub.prediction_set(&x_star, 0.0, ALPHA).unwrap();
+        let set = sub
+            .prediction_set_with_uniform(&x_star, 0.0, ALPHA, 0.5)
+            .unwrap();
         let hi = set.intervals.last().unwrap().hi;
         assert!(hi <= d.y.sum(), "set edge {hi} is not on the data scale");
         for z in 0..=(hi as usize + 5) {
@@ -1913,7 +1964,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let sub = substrate(family, &d);
-            let set = sub.prediction_set(&row(0.2), 0.0, ALPHA).unwrap();
+            let set = sub
+                .prediction_set_with_uniform(&row(0.2), 0.0, ALPHA, 0.5)
+                .unwrap();
             tx.send((sub, set)).unwrap();
         });
         let (sub, set) = rx
@@ -1941,7 +1994,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_is_exact_only_when_nothing_was_selected() {
+    fn certificate_distinguishes_conservative_frozen_from_refused() {
         let refused = ConformalCertificate::Refused(ConformalRefusal::GlmFrozenPenalty);
         for family in [
             ConformalGlmFamily::BernoulliLogit,
@@ -1950,23 +2003,25 @@ mod tests {
         ] {
             assert_eq!(
                 family.certificate(Some(0)),
-                ConformalCertificate::ExactFrozen
+                ConformalCertificate::ConservativeFrozen
+            );
+            assert_eq!(
+                family.certificate(Some(1)),
+                if family == ConformalGlmFamily::BernoulliLogit {
+                    ConformalCertificate::HonestRefit
+                } else {
+                    refused
+                }
+            );
+            assert_eq!(
+                family.certificate(Some(3)),
+                if family == ConformalGlmFamily::BernoulliLogit {
+                    ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
+                } else {
+                    refused
+                }
             );
         }
-        for family in [ConformalGlmFamily::PoissonLog, ConformalGlmFamily::GammaLog] {
-            assert_eq!(family.certificate(Some(1)), refused);
-            assert_eq!(family.certificate(Some(3)), refused);
-        }
-        let bernoulli = ConformalGlmFamily::BernoulliLogit;
-        assert_eq!(
-            bernoulli.certificate(Some(1)),
-            ConformalCertificate::HonestRefit,
-            "one Bernoulli strength is re-selected by the honest map"
-        );
-        assert_eq!(
-            bernoulli.certificate(Some(3)),
-            ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)
-        );
         let nb = ConformalGlmFamily::NegativeBinomialLog { theta: 2.0 };
         assert_eq!(
             nb.certificate(Some(0)),
@@ -2001,7 +2056,9 @@ mod tests {
             let d = data(family, n, &mut rng);
             let sub = substrate(family, &d);
             let x = rng.random::<f64>() * 2.0 - 1.0;
-            let set = sub.prediction_set(&row(x), 0.0, alpha).unwrap();
+            let set = sub
+                .prediction_set_with_uniform(&row(x), 0.0, alpha, 0.5)
+                .unwrap();
             let hi = set.intervals.last().unwrap().hi;
             assert!(
                 hi.is_finite(),
@@ -2066,6 +2123,7 @@ mod tests {
         normal[[2, 1]] += 0.5;
         normal[[0, 0]] += 1e-15;
         let s = penalty_from_normal_and_gram(&normal, &gram, &[1..3], 2.0).unwrap();
+        assert_eq!(s, s.t(), "the recovered shape must be symmetric in storage");
         assert!(s.row(0).iter().all(|&v| v == 0.0) && s.column(0).iter().all(|&v| v == 0.0));
         assert!((s[[1, 1]] - 4.0).abs() < 1e-12 && (s[[1, 2]] - 1.0).abs() < 1e-12);
         let mut indefinite = gram.clone();
@@ -2073,240 +2131,6 @@ mod tests {
         let s = penalty_from_normal_and_gram(&indefinite, &gram, &[1..3], 1.0).unwrap();
         let (evals, _) = s.eigh(Side::Lower).unwrap();
         assert!(evals.iter().all(|&v| v >= -1e-15));
-    }
-
-    /// Seeded Monte Carlo: marginal coverage of the certified set at n = 99,
-    /// α = 0.1 (so α(n+1) is an integer and the target is exactly 0.9) is
-    /// within two Monte Carlo standard errors of 1 − α, two-sided.
-    #[test]
-    fn monte_carlo_coverage_is_nominal_for_every_family() {
-        let reps = 1000;
-        let n = 99;
-        for (k, family) in FAMILIES.into_iter().enumerate() {
-            let mut rng = StdRng::seed_from_u64(4242 + k as u64);
-            let mut covered = 0usize;
-            for _ in 0..reps {
-                let d = data(family, n, &mut rng);
-                let x = rng.random::<f64>() * 2.0 - 1.0;
-                let o = rng.random::<f64>() * 0.4 - 0.2;
-                let y_star = draw(family, eta_true(x) + o, &mut rng);
-                let set = substrate(family, &d)
-                    .prediction_set(&row(x), o, ALPHA)
-                    .unwrap();
-                covered += usize::from(contains(&set, y_star));
-            }
-            let cov = covered as f64 / reps as f64;
-            let target = 1.0 - ALPHA;
-            let mcse = (target * ALPHA / reps as f64).sqrt();
-            assert!(
-                (cov - target).abs() <= 2.0 * mcse,
-                "{family:?}: coverage {cov} vs {target} ± {}",
-                2.0 * mcse
-            );
-        }
-    }
-
-    /// Seeded Bernoulli rows with a selected strength, and a test row.
-    fn honest_case(seed: u64, n: usize) -> (GlmFullConformalSubstrate, Array1<f64>, f64) {
-        let mut rng = StdRng::seed_from_u64(seed);
-        let d = data(ConformalGlmFamily::BernoulliLogit, n, &mut rng);
-        let sub = honest_substrate(&d);
-        let x_star = row(rng.random::<f64>() * 2.0 - 1.0);
-        let o = rng.random::<f64>() * 0.4 - 0.2;
-        (sub, x_star, o)
-    }
-
-    /// The augmented rows' resolvability domain, as `select_strength` forms it.
-    fn honest_domain(sub: &GlmFullConformalSubstrate, x_star: &Array1<f64>) -> (f64, f64) {
-        let reselection = sub.reselection.as_ref().unwrap();
-        let mut gram = reselection.gram.clone();
-        for a in 0..3 {
-            for b in 0..3 {
-                gram[[a, b]] += x_star[a] * x_star[b];
-            }
-        }
-        gam_solve::estimate::rho_domain::coordinate_domain(
-            gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(
-                &gram,
-                &reselection.unit,
-            )
-            .as_deref()
-            .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
-            None,
-        )
-    }
-
-    #[test]
-    fn honest_bernoulli_criterion_derivatives_match_finite_differences() {
-        for seed in [11, 12, 13] {
-            let (sub, x_star, o) = honest_case(seed, 60);
-            let reselection = sub.reselection.as_ref().unwrap();
-            let test = TestRow {
-                x: &x_star,
-                offset: o,
-            };
-            for z in [0.0, 1.0] {
-                for rho in [-3.0, -0.5, 1.0, 3.5] {
-                    let jet = |r: f64| {
-                        sub.laml_jet(reselection, &test, z, r, &sub.warm_start)
-                            .unwrap()
-                    };
-                    let h = 1e-4;
-                    let (hi, mid, lo) = (jet(rho + h), jet(rho), jet(rho - h));
-                    let gradient = (hi.value - lo.value) / (2.0 * h);
-                    let hessian = (hi.gradient - lo.gradient) / (2.0 * h);
-                    assert!(
-                        (mid.gradient - gradient).abs() <= 1e-6 * (1.0 + gradient.abs()),
-                        "seed {seed} z={z} ρ={rho}: V′ {} vs {gradient}",
-                        mid.gradient
-                    );
-                    assert!(
-                        (mid.hessian - hessian).abs() <= 1e-6 * (1.0 + hessian.abs()),
-                        "seed {seed} z={z} ρ={rho}: V″ {} vs {hessian}",
-                        mid.hessian
-                    );
-                }
-            }
-        }
-    }
-
-    /// The criterion's minimum over the whole domain, located independently of
-    /// the outer engine by a dense scan and a golden-section refinement of the
-    /// criterion value alone: `(ρ, V(ρ))`.
-    fn scanned_minimum(
-        sub: &GlmFullConformalSubstrate,
-        x_star: &Array1<f64>,
-        o: f64,
-        z: f64,
-    ) -> (f64, f64) {
-        let reselection = sub.reselection.as_ref().unwrap();
-        let test = TestRow {
-            x: x_star,
-            offset: o,
-        };
-        let value = |r: f64| {
-            sub.laml_jet(reselection, &test, z, r, &sub.warm_start)
-                .unwrap()
-                .value
-        };
-        let (lower, upper) = honest_domain(sub, x_star);
-        let steps = 960;
-        let at = |k: usize| lower + (upper - lower) * k as f64 / steps as f64;
-        let best = (0..=steps)
-            .min_by(|&a, &b| value(at(a)).total_cmp(&value(at(b))))
-            .unwrap();
-        let (mut a, mut b) = (at(best.saturating_sub(1)), at((best + 1).min(steps)));
-        let ratio = 0.5 * (5.0_f64.sqrt() - 1.0);
-        for _ in 0..60 {
-            let (c, d) = (b - ratio * (b - a), a + ratio * (b - a));
-            if value(c) < value(d) {
-                b = d;
-            } else {
-                a = c;
-            }
-        }
-        let rho = 0.5 * (a + b);
-        (rho, value(rho))
-    }
-
-    /// The strength the outer engine selects meets the engine's own terminal
-    /// certificate and leaves no more than the criterion's statistical
-    /// resolution on the table against an independent search of the domain.
-    ///
-    /// The certificate is the Newton decrement: `½ V′²/V″ ≤ τ = 1/(2 n_aug)`,
-    /// the decrease the local quadratic model says is left. Where the
-    /// criterion falls to its infimum as `V′ ∝ −e^{−ρ}` (a smooth the data
-    /// cannot tell from its null space, minimised as `λ → ∞`), the decrease
-    /// actually left is `|V′| = V′²/V″`, twice the model's, so the value gap
-    /// is bounded by `2τ`; at an interior quadratic minimum it is at most `τ`.
-    #[test]
-    fn honest_bernoulli_strength_is_the_criterion_minimum() {
-        let n = 60;
-        let tau = 0.5 / (n + 1) as f64;
-        for seed in [21, 22, 23, 24] {
-            let (sub, x_star, o) = honest_case(seed, n);
-            let reselection = sub.reselection.as_ref().unwrap();
-            let test = TestRow {
-                x: &x_star,
-                offset: o,
-            };
-            let (lower, upper) = honest_domain(&sub, &x_star);
-            for z in [0.0, 1.0] {
-                let (rho, _) = sub.select_strength(reselection, &test, z).unwrap();
-                let jet = sub
-                    .laml_jet(reselection, &test, z, rho, &sub.warm_start)
-                    .unwrap();
-                let on_bound = (rho == lower && jet.gradient >= 0.0)
-                    || (rho == upper && jet.gradient <= 0.0);
-                assert!(
-                    on_bound || (jet.hessian > 0.0
-                        && 0.5 * jet.gradient * jet.gradient / jet.hessian <= tau),
-                    "seed {seed} z={z}: ρ̂={rho} is uncertified: V′={} V″={}",
-                    jet.gradient,
-                    jet.hessian
-                );
-                let (scanned, scanned_value) = scanned_minimum(&sub, &x_star, o, z);
-                assert!(
-                    jet.value - scanned_value <= 2.0 * tau,
-                    "seed {seed} z={z}: V(ρ̂={rho}) = {} vs scanned minimum V({scanned}) = \
-                     {scanned_value}",
-                    jet.value
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn honest_bernoulli_set_matches_brute_force_at_the_selected_strength() {
-        for seed in 31..39 {
-            let (sub, x_star, o) = honest_case(seed, 60);
-            let reselection = sub.reselection.as_ref().unwrap();
-            let set = sub.prediction_set(&x_star, o, ALPHA).unwrap();
-            assert_eq!(set.certificate, ConformalCertificate::HonestRefit);
-            let test = TestRow {
-                x: &x_star,
-                offset: o,
-            };
-            for z in [0.0, 1.0] {
-                let (rho, _) = sub.select_strength(reselection, &test, z).unwrap();
-                let refit = sub.at_strength(reselection, rho, sub.warm_start.clone());
-                assert_eq!(
-                    contains(&set, z),
-                    brute_force_member(&refit, &x_star, o, z, ALPHA),
-                    "seed {seed} z={z}: set {:?}",
-                    set.intervals
-                );
-            }
-        }
-    }
-
-    /// Seeded Monte Carlo of the honest Bernoulli map, whose strength every
-    /// augmented data set re-selects: marginal coverage at n = 99, α = 0.1 is
-    /// within two Monte Carlo standard errors of 1 − α, two-sided.
-    #[test]
-    fn honest_bernoulli_monte_carlo_coverage_is_nominal() {
-        let reps = 1000;
-        let n = 99;
-        let family = ConformalGlmFamily::BernoulliLogit;
-        let mut rng = StdRng::seed_from_u64(4103);
-        let mut covered = 0usize;
-        for _ in 0..reps {
-            let d = data(family, n, &mut rng);
-            let x = rng.random::<f64>() * 2.0 - 1.0;
-            let o = rng.random::<f64>() * 0.4 - 0.2;
-            let y_star = draw(family, eta_true(x) + o, &mut rng);
-            let set = honest_substrate(&d).prediction_set(&row(x), o, ALPHA).unwrap();
-            assert_eq!(set.certificate, ConformalCertificate::HonestRefit);
-            covered += usize::from(contains(&set, y_star));
-        }
-        let cov = covered as f64 / reps as f64;
-        let target = 1.0 - ALPHA;
-        let mcse = (target * ALPHA / reps as f64).sqrt();
-        assert!(
-            (cov - target).abs() <= 2.0 * mcse,
-            "honest Bernoulli coverage {cov} vs {target} ± {}",
-            2.0 * mcse
-        );
     }
 
     /// The count `0` sits exactly on the low end of the score walk, where
@@ -2330,10 +2154,10 @@ mod tests {
             let xs = row(x);
             let test = TestRow { x: &xs, offset: o };
             let tau = conformal_rank_threshold(ALPHA, n + 1);
-            let u = sub.tie_break_uniform(&test);
+            let u = 0.5;
             let twin = vec![false; n];
             assert!(sub.count_member(&test, 0.0, u, &twin, tau), "rep {rep}");
-            let set = sub.prediction_set(&xs, o, ALPHA).unwrap();
+            let set = sub.prediction_set_with_uniform(&xs, o, ALPHA, 0.5).unwrap();
             assert_eq!(
                 set.intervals.first().map(|r| r.lo),
                 Some(0.0),
@@ -2350,5 +2174,453 @@ mod tests {
                 "rep {rep}: y* {y_star}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod consolidation_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn uncancelled_poisson_stationarity_preserves_3451() {
+        let n = 16;
+        let x = Array2::from_shape_fn((n, 2), |(i, j)| {
+            if j == 0 {
+                1.0
+            } else {
+                (std::f64::consts::PI * i as f64 / 15.0).cos()
+            }
+        });
+        let y = Array1::from_shape_fn(n, |i| {
+            (1.0 + (2.0 * std::f64::consts::PI * i as f64 / 15.0).sin())
+                .exp()
+                .round()
+        });
+        let total = y.sum();
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::PoissonLog,
+            x,
+            y,
+            Array1::zeros(n),
+            Array2::zeros((2, 2)),
+            Some(0),
+            Array1::zeros(2),
+        )
+        .unwrap();
+        let beta = sub.refit_labeled_rows().unwrap();
+        let x_star = array![1.0, (std::f64::consts::PI * 0.37).cos()];
+        let row = TestRow {
+            x: &x_star,
+            offset: 0.0,
+        };
+        let z = x_star.dot(&beta).exp();
+        let state = sub.state(&beta, &row, Augmentation::Response(z));
+        assert!(state.natural_scale >= total);
+        assert!(sub.kkt_converged(&state));
+        let cold = sub
+            .solve(&row, Augmentation::Response(z), &Array1::zeros(2))
+            .unwrap();
+        assert!(cold.certifies(cold.error));
+        assert!(vec_norm(&(&cold.beta - &beta)) <= 1e-9 * (1.0 + vec_norm(&beta)));
+        let nonstationary = State {
+            natural_scale: f64::INFINITY,
+            grad: array![1.0, 1.0],
+            ..state
+        };
+        assert!(!sub.kkt_converged(&nonstationary));
+    }
+
+    #[test]
+    fn fixed_uniform_validates_endpoints_and_is_shared_by_labels() {
+        // Identical zero rows produce exactly tied scores for each Bernoulli
+        // candidate. For candidate 0 every score is 1/2, hence its p-value is U.
+        let sub = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            Array2::zeros((4, 1)),
+            Array1::zeros(4),
+            Array1::zeros(4),
+            array![[1.0]],
+            Some(0),
+            array![0.0],
+        )
+        .unwrap();
+        let row = array![0.0];
+        for u in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0] {
+            assert!(sub.prediction_set_with_uniform(&row, 0.0, 0.2, u).is_err());
+        }
+        for u in [0.0, 0.1, 0.2, 0.3, 1.0 - f64::EPSILON] {
+            let set = sub.prediction_set_with_uniform(&row, 0.0, 0.2, u).unwrap();
+            let member = set
+                .intervals
+                .iter()
+                .any(|piece| piece.lo <= 0.0 && piece.hi >= 0.0);
+            assert_eq!(member, u > 0.2, "tied candidate, U={u}");
+        }
+    }
+
+    #[test]
+    fn supplied_uniform_preserves_row_permutation() {
+        let x = array![
+            [1.0, -1.0],
+            [1.0, -0.4],
+            [1.0, 0.2],
+            [1.0, 0.8],
+            [1.0, 1.2],
+            [1.0, -0.8]
+        ];
+        let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0];
+        let offset = array![0.1, -0.2, 0.3, 0.0, -0.1, 0.2];
+        let order = [3, 0, 5, 1, 4, 2];
+        let make = |x, y, offset| {
+            GlmFullConformalSubstrate::new(
+                ConformalGlmFamily::BernoulliLogit,
+                x,
+                y,
+                offset,
+                array![[0.5, 0.0], [0.0, 0.7]],
+                Some(0),
+                Array1::zeros(2),
+            )
+            .unwrap()
+        };
+        let ordinary = make(x.clone(), y.clone(), offset.clone());
+        let permuted = make(
+            x.select(Axis(0), &order),
+            y.select(Axis(0), &order),
+            offset.select(Axis(0), &order),
+        );
+        let row = array![1.0, 0.35];
+        for u in [0.0, 0.17, 0.5, 0.93] {
+            for alpha in [0.1, 0.3, 0.7] {
+                let first = ordinary
+                    .prediction_set_with_uniform(&row, 0.15, alpha, u)
+                    .unwrap();
+                let second = permuted
+                    .prediction_set_with_uniform(&row, 0.15, alpha, u)
+                    .unwrap();
+                assert_eq!(first.intervals, second.intervals, "U={u}, alpha={alpha}");
+            }
+        }
+    }
+    #[test]
+    fn finite_exchangeability_and_uniform_grid_give_nominal_coverage() {
+        // Uniformly hold out one of five exchangeable rows, independently of
+        // U. The augmented fit is always the same, and its fitted p exceeds
+        // 1/2: two zero-label scores dominate the three one-label scores.
+        // The exact ranks are 2U/5 for zeros, (2+3U)/5 for ones.
+        let labels = array![0.0, 0.0, 1.0, 1.0, 1.0];
+        let mut covered = 0;
+        for held_out in 0..5 {
+            let train = Array1::from_iter((0..5).filter(|&i| i != held_out).map(|i| labels[i]));
+            let sub = GlmFullConformalSubstrate::new(
+                ConformalGlmFamily::BernoulliLogit,
+                Array2::ones((4, 1)),
+                train,
+                Array1::zeros(4),
+                array![[0.5]],
+                Some(0),
+                array![0.0],
+            )
+            .unwrap();
+            for k in 0..20 {
+                let u = (k as f64 + 0.5) / 20.0;
+                let z = labels[held_out];
+                let expected = if z == 0.0 {
+                    2.0 * u > 1.5
+                } else {
+                    2.0 + 3.0 * u > 1.5
+                };
+                let set = sub
+                    .prediction_set_with_uniform(&array![1.0], 0.0, 0.3, u)
+                    .unwrap();
+                let member = set
+                    .intervals
+                    .iter()
+                    .any(|piece| piece.lo <= z && z <= piece.hi);
+                assert_eq!(member, expected, "held out {held_out}, U={u}");
+                covered += usize::from(member);
+            }
+        }
+        assert_eq!(covered, 70);
+        let certificate = ConformalGlmFamily::BernoulliLogit.certificate(Some(0));
+        assert_eq!(certificate.label(), "conservative_frozen");
+        assert_eq!(certificate.code(), 2);
+    }
+}
+
+#[cfg(test)]
+mod reselection_tests {
+    use super::*;
+    use ndarray::{Axis, array};
+
+    fn fixture(scale: f64, warm: Array1<f64>) -> GlmFullConformalSubstrate {
+        let x = array![
+            [1., -1.4],
+            [1., -1.1],
+            [1., -0.8],
+            [1., -0.5],
+            [1., -0.2],
+            [1., 0.1],
+            [1., 0.4],
+            [1., 0.7],
+            [1., 1.0],
+            [1., 1.3],
+            [1., 1.6],
+            [1., 1.9]
+        ];
+        let y = array![0., 0., 1., 0., 0., 1., 0., 1., 0., 1., 1., 1.];
+        GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            x,
+            y,
+            Array1::zeros(12),
+            array![[0., 0.], [0., scale]],
+            Some(1),
+            warm,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn criterion_gradient_and_hessian_match_independent_differences() {
+        let sub = fixture(1.0, Array1::zeros(2));
+        let selected = sub.reselection.as_ref().unwrap();
+        let star = array![1., 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        for z in [0., 1.] {
+            for rho in [-3., -0.5, 1., 3.] {
+                let h = 1e-4;
+                let evaluate = |r| {
+                    sub.laml_jet(selected, &row, z, r, &Array1::zeros(2))
+                        .unwrap()
+                };
+                let left = evaluate(rho - h);
+                let mid = evaluate(rho);
+                let right = evaluate(rho + h);
+                let fd_gradient = (right.value - left.value) / (2. * h);
+                let fd_hessian = (right.gradient - left.gradient) / (2. * h);
+                assert!(
+                    (mid.gradient - fd_gradient).abs() < 2e-6 * (1. + fd_gradient.abs()),
+                    "rho={rho} z={z}: gradient={} fd={fd_gradient}",
+                    mid.gradient
+                );
+                assert!(
+                    (mid.hessian - fd_hessian).abs() < 2e-6 * (1. + fd_hessian.abs()),
+                    "rho={rho} z={z}: hessian={} fd={fd_hessian}",
+                    mid.hessian
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn penalty_units_and_training_warm_start_do_not_change_selection() {
+        let baseline = fixture(1., Array1::zeros(2));
+        let star = array![1., 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        for scale in [1e-200, 1., 1e200] {
+            let sub = fixture(scale, array![30., -25.]);
+            assert_eq!(sub.certificate, ConformalCertificate::HonestRefit);
+            assert_eq!(
+                sub.reselection.as_ref().unwrap().unit,
+                baseline.reselection.as_ref().unwrap().unit
+            );
+            for z in [0., 1.] {
+                let (rho, beta) = sub
+                    .select_strength(sub.reselection.as_ref().unwrap(), &row, z)
+                    .unwrap();
+                let (expected, expected_beta) = baseline
+                    .select_strength(baseline.reselection.as_ref().unwrap(), &row, z)
+                    .unwrap();
+                assert_eq!(rho, expected);
+                assert_eq!(beta, expected_beta);
+            }
+            let set = sub
+                .prediction_set_with_uniform(&star, 0.1, 0.3, 0.6)
+                .unwrap();
+            let expected = baseline
+                .prediction_set_with_uniform(&star, 0.1, 0.3, 0.6)
+                .unwrap();
+            assert_eq!(set.intervals, expected.intervals);
+        }
+    }
+
+    #[test]
+    fn selected_membership_matches_direct_refit_and_row_permutations() {
+        let sub = fixture(1., Array1::zeros(2));
+        let star = array![1., 0.35];
+        let row = TestRow {
+            x: &star,
+            offset: 0.1,
+        };
+        let order = [7, 2, 11, 0, 9, 1, 10, 3, 8, 4, 6, 5];
+        let reordered = GlmFullConformalSubstrate::new(
+            sub.family,
+            sub.x.select(Axis(0), &order),
+            sub.y.select(Axis(0), &order),
+            sub.offset.select(Axis(0), &order),
+            sub.s_lambda.clone(),
+            Some(1),
+            array![20., -30.],
+        )
+        .unwrap();
+        for uniform in [0.1, 0.6, 0.9] {
+            let set = sub
+                .prediction_set_with_uniform(&star, 0.1, 0.3, uniform)
+                .unwrap();
+            let permuted = reordered
+                .prediction_set_with_uniform(&star, 0.1, 0.3, uniform)
+                .unwrap();
+            assert_eq!(set.intervals, permuted.intervals);
+            for z in [0., 1.] {
+                let selected = sub.reselection.as_ref().unwrap();
+                let (rho, beta) = sub.select_strength(selected, &row, z).unwrap();
+                let refit = sub.at_strength(selected, rho, beta.clone()).unwrap();
+                let node = refit
+                    .solve(&row, Augmentation::Response(z), &Array1::zeros(2))
+                    .unwrap();
+                assert!(node.certifies(node.error));
+                let test_score = sub
+                    .family
+                    .score_weight(star.dot(&node.beta) + 0.1, z)
+                    .0
+                    .abs();
+                let scores = fast_av(&sub.x, &node.beta) + &sub.offset;
+                let greater = scores
+                    .iter()
+                    .zip(sub.y.iter())
+                    .filter(|(eta, y)| sub.family.score_weight(**eta, **y).0.abs() > test_score)
+                    .count();
+                let tied = scores
+                    .iter()
+                    .zip(sub.y.iter())
+                    .filter(|(eta, y)| sub.family.score_weight(**eta, **y).0.abs() == test_score)
+                    .count();
+                let expected = greater as f64 + uniform * (1 + tied) as f64 > 0.3 * 13.;
+                assert_eq!(
+                    set.intervals.iter().any(|piece| piece.contains(z)),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn selection_failures_and_invalid_strength_are_not_frozen_answers() {
+        let sub = fixture(1., Array1::zeros(2));
+        let selected = sub.reselection.as_ref().unwrap();
+        for rho in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1e6] {
+            assert!(sub.at_strength(selected, rho, Array1::zeros(2)).is_err());
+        }
+        let mut invalid = sub.clone();
+        invalid.reselection.as_mut().unwrap().gram.fill(f64::NAN);
+        let error = invalid
+            .prediction_set_with_uniform(&array![1., 0.35], 0.1, 0.3, 0.1)
+            .err()
+            .expect("invalid domain must propagate");
+        assert!(
+            error.contains("spectrum") || error.contains("domain"),
+            "{error}"
+        );
+        let zero = fixture(0., Array1::zeros(2));
+        assert_eq!(zero.certificate, ConformalCertificate::ConservativeFrozen);
+        assert!(zero.reselection.is_none());
+        assert!(
+            GlmFullConformalSubstrate::new(
+                sub.family,
+                sub.x.clone(),
+                sub.y.clone(),
+                sub.offset.clone(),
+                sub.s_lambda.clone(),
+                Some(1),
+                array![f64::NAN, 0.]
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn augmented_row_roles_preserve_the_selected_fitting_map() {
+        let x = array![
+            [1., -1.2],
+            [1., -0.83],
+            [1., -0.19],
+            [1., 0.36],
+            [1., 0.77],
+            [1., 1.41]
+        ];
+        let y = array![0., 0., 1., 0., 1., 1.];
+        let mut reference: Option<(f64, Array1<f64>)> = None;
+        let mut accepted = 0usize;
+        for held in 0..6 {
+            let retained: Vec<usize> = (0..6).filter(|&i| i != held).collect();
+            let sub = GlmFullConformalSubstrate::new(
+                ConformalGlmFamily::BernoulliLogit,
+                x.select(Axis(0), &retained),
+                y.select(Axis(0), &retained),
+                Array1::zeros(5),
+                array![[0., 0.], [0., 1.]],
+                Some(1),
+                array![held as f64, -10.],
+            )
+            .unwrap();
+            let star = x.row(held).to_owned();
+            let row = TestRow {
+                x: &star,
+                offset: 0.,
+            };
+            let (rho, beta) = sub
+                .select_strength(sub.reselection.as_ref().unwrap(), &row, y[held])
+                .unwrap();
+            if let Some((expected, coefficients)) = &reference {
+                assert!(
+                    (rho - expected).abs() < 1e-8,
+                    "held={held}, rho={rho}, reference={expected}"
+                );
+                assert!(
+                    beta.iter()
+                        .zip(coefficients.iter())
+                        .all(|(a, b)| (a - b).abs() < 1e-8)
+                );
+            } else {
+                reference = Some((rho, beta));
+            }
+            for uniform in [0.125, 0.375, 0.625, 0.875] {
+                let set = sub
+                    .prediction_set_with_uniform(&star, 0., 0.5, uniform)
+                    .unwrap();
+                accepted += usize::from(set.intervals.iter().any(|piece| piece.contains(y[held])));
+            }
+        }
+        // A finite rank/permutation regression, not a general coverage proof.
+        assert_eq!(accepted, 12);
+    }
+    #[test]
+    fn unit_normalization_refuses_subnormal_rank_loss() {
+        let tiny = f64::from_bits(1);
+        let mut penalty = Array2::<f64>::eye(5);
+        penalty[[4, 4]] = tiny;
+        // Max scaling leaves tiny intact; the following norm=2 division
+        // rounds tiny/2 to zero and would erase a real penalized direction.
+        assert_eq!(tiny / 1.0, tiny);
+        assert_eq!(tiny / 2.0, 0.0);
+        let error = GlmFullConformalSubstrate::new(
+            ConformalGlmFamily::BernoulliLogit,
+            Array2::eye(5),
+            array![0., 1., 0., 1., 0.],
+            Array1::zeros(5),
+            penalty,
+            Some(1),
+            Array1::zeros(5),
+        )
+        .err()
+        .expect("unit normalization must preserve each nonzero entry");
+        assert!(error.contains("unit penalty normalization"), "{error}");
     }
 }

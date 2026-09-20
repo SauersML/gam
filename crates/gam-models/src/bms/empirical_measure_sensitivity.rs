@@ -144,6 +144,21 @@ pub(crate) struct EmpiricalZGridBuild {
     /// `Some` when the equal-mass compression is not differentiable in `ζ`. The
     /// grid and the point estimates are unaffected; only `D` is refused.
     pub(crate) tie_straddle: Option<EmpiricalGridTieStraddle>,
+    /// The empirical quantile break closing each emitted bin, in FILL order
+    /// (ascending cumulative mass): the `ζ` of the last row the fill loop took
+    /// into that bin. Break `c` is bin `c`'s upper edge and bin `c + 1`'s lower
+    /// edge; the first bin has no lower edge and the last no upper one. These are
+    /// what [`Self::node_sampling_influence`] clamps against.
+    pub(crate) fill_breaks: Vec<f64>,
+    /// Emitted node index of each fill-order bin. The nodes are re-sorted after
+    /// the fill (gam#2926), so the two orders can differ on a tie.
+    pub(crate) fill_to_node: Vec<usize>,
+    /// Every row's `ζ` and weight, zero-weight rows included, as the builder
+    /// received them — the empirical law whose sampling error the grid inherits.
+    pub(crate) row_zeta: Vec<f64>,
+    pub(crate) row_weight: Vec<f64>,
+    /// `W = Σ_i w_i` over the positive-weight rows.
+    pub(crate) total_weight: f64,
 }
 
 impl EmpiricalZGridBuild {
@@ -172,6 +187,37 @@ impl EmpiricalZGridBuild {
                 tie.rows, tie.value, tie.boundary
             ));
         }
+        let p = v.ncols();
+        let mt_v = self.raw_node_adjoint(v)?;
+        // Aᵀ·(Mᵀ V), scattered through the recorded allocation:
+        // row i accumulates (α_{ci}/W_c)·(Mᵀ V)_{c·} for every bin it touched.
+        let mut out = Array2::<f64>::zeros((self.n_rows, p));
+        for &(node, row, mass) in &self.alpha {
+            let w_bin = self.bin_mass[node];
+            if !(w_bin.is_finite() && w_bin > 0.0) {
+                return Err(format!(
+                    "empirical grid node-sensitivity VJP: bin {node} has non-positive mass {w_bin}"
+                ));
+            }
+            let scale = mass / w_bin;
+            if scale == 0.0 {
+                continue;
+            }
+            for j in 0..p {
+                out[[row, j]] += scale * mt_v[[node, j]];
+            }
+        }
+        Ok(out)
+    }
+
+    /// `(1/sd)·Mᵀ·V`: carries an `m × p` adjoint on the STANDARDIZED nodes back
+    /// to the RAW bin means `n_c`. Row `c` is the first-order change in the
+    /// quantity `V` is the adjoint of per unit change in `n_c`.
+    ///
+    /// With `M_{bc} = (δ_{bc} − w_c) − x_b·w_c·x_c`,
+    /// `(Mᵀ V)_{c·} = V_{c·} − w_c·Σ_b V_{b·} − w_c·x_c·Σ_b x_b·V_{b·}`.
+    /// On the skipped-standardization branch `M = I` and this is the identity.
+    fn raw_node_adjoint(&self, v: ArrayView2<'_, f64>) -> Result<Array2<f64>, String> {
         let m = self.grid.nodes.len();
         if v.nrows() != m {
             return Err(format!(
@@ -180,9 +226,6 @@ impl EmpiricalZGridBuild {
             ));
         }
         let p = v.ncols();
-        // Mᵀ·V. With M_{bc} = (δ_{bc} − w_c) − x_b·w_c·x_c,
-        //   (Mᵀ V)_{c·} = V_{c·} − w_c·Σ_b V_{b·} − w_c·x_c·Σ_b x_b·V_{b·}.
-        // On the skipped-standardization branch M = I and this is the identity.
         let mut mt_v = v.to_owned();
         if let Some(sd) = self.standardization_sd {
             let mut sum_v = vec![0.0_f64; p];
@@ -203,23 +246,127 @@ impl EmpiricalZGridBuild {
                 }
             }
         }
-        // Aᵀ·(Mᵀ V), scattered through the recorded allocation:
-        // row i accumulates (α_{ci}/W_c)·(Mᵀ V)_{c·} for every bin it touched.
-        let mut out = Array2::<f64>::zeros((self.n_rows, p));
-        for &(node, row, mass) in &self.alpha {
-            let w_bin = self.bin_mass[node];
-            if !(w_bin.is_finite() && w_bin > 0.0) {
+        Ok(mt_v)
+    }
+
+    /// Per-row influence of the grid's OWN sampling error on the quantity whose
+    /// node adjoint is `V` (`m × p`): the `n × p` matrix whose row `i` is the
+    /// first-order contribution of row `i` to that quantity through the equal-mass
+    /// grid, holding every row's `ζ` fixed (gam#3452).
+    ///
+    /// [`Self::node_zeta_vjp`] carries rows MOVING through the grid (`ζ_i` changes
+    /// because `θ₁` does). This is the other half: at the true `θ₁` the grid is
+    /// still built from `n` draws of the latent law, so each raw node is an
+    /// L-estimator — a trimmed mean of the empirical quantile function over its
+    /// mass slice — with its own sampling error, and that error is a function of
+    /// the same `ζ_i` the first stage's influence is. Bin `c` spans mass fraction
+    /// `π_c = W_c/W` between quantiles `Q_{c−1}` and `Q_c`, so
+    ///
+    /// ```text
+    ///   n_c = (1/π_c)·∫_{slice c} F⁻¹(u) du
+    ///   IF_{n_c}(t) = [clamp(t, Q_{c−1}, Q_c) − E_F clamp(ζ, Q_{c−1}, Q_c)] / π_c
+    /// ```
+    ///
+    /// (`d/dt` of `∫_a^b F⁻¹` is `1{Q_a < t < Q_b}`: an observation moves the
+    /// slice's mean only while it sits inside the slice, and otherwise shifts the
+    /// quantiles that bound it.) Row `i`'s contribution is `(w_i/W)·IF(ζ_i)`,
+    /// pushed through the raw-node adjoint `(1/sd)·Mᵀ·V`, and centered under the
+    /// empirical law so the rows sum to zero.
+    ///
+    /// Evaluated in `O(n·log(m) + n·p + m·p)`: with `r_c = (Mᵀ V)_{c·}/(sd·π_c)` and `t` in
+    /// fill-order bin `k`, `Σ_c clamp_c(t)·r_c = Σ_{c<k} Q_c r_c + t·r_k +
+    /// Σ_{c>k} Q_{c−1} r_c` — a prefix sum, one term, and a suffix sum. The first
+    /// bin's missing lower edge and the last bin's missing upper edge only ever
+    /// meet `t` itself, so no infinity enters the arithmetic. `clamp` is
+    /// continuous, so a `t` equal to a break gives the same value on either side
+    /// and the bin search needs no tie rule.
+    pub(crate) fn node_sampling_influence(
+        &self,
+        v: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let raw = self.raw_node_adjoint(v)?;
+        let p = raw.ncols();
+        let bins = self.fill_breaks.len();
+        if self.fill_to_node.len() != bins || bins != self.grid.nodes.len() {
+            return Err(format!(
+                "empirical grid sampling influence: {bins} fill-order breaks, {} fill-order \
+                 nodes, {} emitted nodes",
+                self.fill_to_node.len(),
+                self.grid.nodes.len()
+            ));
+        }
+        if self.row_zeta.len() != self.n_rows || self.row_weight.len() != self.n_rows {
+            return Err(format!(
+                "empirical grid sampling influence: {} rows recorded, {} ζ values, {} weights",
+                self.n_rows,
+                self.row_zeta.len(),
+                self.row_weight.len()
+            ));
+        }
+        let total = self.total_weight;
+        if !(total.is_finite() && total > 0.0) {
+            return Err(format!(
+                "empirical grid sampling influence: total weight {total} is not positive"
+            ));
+        }
+        // r_c in fill order.
+        let mut r = Array2::<f64>::zeros((bins, p));
+        for (fill, &node) in self.fill_to_node.iter().enumerate() {
+            let mass = self.bin_mass[node];
+            if !(mass.is_finite() && mass > 0.0) {
                 return Err(format!(
-                    "empirical grid node-sensitivity VJP: bin {node} has non-positive mass {w_bin}"
+                    "empirical grid sampling influence: bin {node} has non-positive mass {mass}"
                 ));
             }
-            let scale = mass / w_bin;
-            if scale == 0.0 {
+            let inv_pi = total / mass;
+            for j in 0..p {
+                r[[fill, j]] = raw[[node, j]] * inv_pi;
+            }
+        }
+        // prefix[k] = Σ_{c<k} Q_c r_c,  suffix[k] = Σ_{c>k} Q_{c−1} r_c.
+        let mut prefix = Array2::<f64>::zeros((bins, p));
+        for k in 1..bins {
+            for j in 0..p {
+                prefix[[k, j]] = prefix[[k - 1, j]] + self.fill_breaks[k - 1] * r[[k - 1, j]];
+            }
+        }
+        let mut suffix = Array2::<f64>::zeros((bins, p));
+        for k in (0..bins.saturating_sub(1)).rev() {
+            for j in 0..p {
+                suffix[[k, j]] = suffix[[k + 1, j]] + self.fill_breaks[k] * r[[k + 1, j]];
+            }
+        }
+        // Only the interior breaks bound a bin from both sides; the last one is
+        // the sample maximum and closes nothing the search needs.
+        let interior = &self.fill_breaks[..bins - 1];
+        let mut out = Array2::<f64>::zeros((self.n_rows, p));
+        let mut mean = vec![0.0_f64; p];
+        for i in 0..self.n_rows {
+            let weight = self.row_weight[i];
+            if weight == 0.0 {
+                continue;
+            }
+            let t = self.row_zeta[i];
+            let k = interior.partition_point(|&q| q < t);
+            let share = weight / total;
+            for j in 0..p {
+                let h = prefix[[k, j]] + t * r[[k, j]] + suffix[[k, j]];
+                out[[i, j]] = share * h;
+                mean[j] += share * h;
+            }
+        }
+        // Center under the empirical law: IF(t) − E_F̂ IF, scaled by w_i/W.
+        for i in 0..self.n_rows {
+            let share = self.row_weight[i] / total;
+            if share == 0.0 {
                 continue;
             }
             for j in 0..p {
-                out[[row, j]] += scale * mt_v[[node, j]];
+                out[[i, j]] -= share * mean[j];
             }
+        }
+        if out.iter().any(|value| !value.is_finite()) {
+            return Err("empirical grid sampling influence is non-finite".to_string());
         }
         Ok(out)
     }
@@ -289,6 +436,7 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
     let mut out_weights = Vec::with_capacity(m);
     let mut bin_mass = Vec::with_capacity(m);
     let mut alpha = Vec::<(usize, usize, f64)>::with_capacity(pairs.len() + m);
+    let mut fill_breaks = Vec::<f64>::with_capacity(m);
     let bin_weight_target = total_weight / (m as f64);
     let mut cursor = 0usize;
     let mut remaining = pairs[0].1;
@@ -299,6 +447,7 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
         // Allocation entries for the bin under construction. Held aside because
         // the emitted node index is only known once the bin is known to emit.
         let mut bin_alpha = Vec::<(usize, f64)>::new();
+        let mut last_zeta = f64::NAN;
         // `need` loses one rounded subtraction per pair it takes and a pair's
         // `remaining` one per bin it feeds: a residual inside that accumulation's
         // band `γ·weight` is filled to working precision, so the cursor advances
@@ -309,6 +458,7 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
             bin_sum += take * pairs[cursor].0;
             bin_weight += take;
             bin_alpha.push((pairs[cursor].2, take));
+            last_zeta = pairs[cursor].0;
             need -= take;
             remaining -= take;
             if remaining <= gam_linalg::roundoff::accumulation_growth(m + 1) * pairs[cursor].1 {
@@ -323,6 +473,7 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
             nodes.push(bin_sum / bin_weight);
             out_weights.push(bin_weight / total_weight);
             bin_mass.push(bin_weight);
+            fill_breaks.push(last_zeta);
             for (row, take) in bin_alpha {
                 alpha.push((node_index, row, take));
             }
@@ -364,6 +515,11 @@ pub(crate) fn build_empirical_z_grid_with_alpha(
         standardization_sd: standardization.map(|(_, sd)| sd),
         n_rows: z.len(),
         tie_straddle,
+        fill_breaks,
+        fill_to_node: position_of,
+        row_zeta: z.to_vec(),
+        row_weight: weights.to_vec(),
+        total_weight,
     })
 }
 

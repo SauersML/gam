@@ -28,7 +28,7 @@ use ndarray::{Array1, Array2, ArrayView2};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use gam::inference::full_conformal::{CanonicalGlmFamily, GlmHomotopyFullConformal};
+use gam::inference::full_conformal_glm::{ConformalGlmFamily, GlmFullConformalSubstrate};
 use gam::inference::lawley::{
     RhoPenaltyComponent, RowExpectedJets, RowKappas, lawley_lr_bartlett_factor,
     lawley_lr_correction_estimated_lambda,
@@ -359,7 +359,8 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
         predicted_mean_alt.as_array(),
         fisher.as_array(),
     )?;
-    let Some((idx, expected_log_growth)) = core_select_probe_by_expected_evidence(&probes, &fisher)
+    let Some((idx, expected_log_growth)) =
+        core_select_probe_by_expected_evidence(&probes, &fisher).map_err(py_value_error)?
     else {
         return Ok(None);
     };
@@ -377,9 +378,14 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
 
 /// Expected observations needed for a probe with per-observation expected
 /// evidence growth `growth_nats_per_obs` to cross the Ville threshold `1/alpha`.
+/// Raises `ValueError` for a level outside (0, 1) or a NaN growth rate;
+/// returns `None` for non-positive growth.
 #[pyfunction]
-pub(crate) fn expected_resolution_budget(alpha: f64, growth_nats_per_obs: f64) -> Option<f64> {
-    core_expected_resolution_budget(alpha, growth_nats_per_obs)
+pub(crate) fn expected_resolution_budget(
+    alpha: f64,
+    growth_nats_per_obs: f64,
+) -> PyResult<Option<f64>> {
+    core_expected_resolution_budget(alpha, growth_nats_per_obs).map_err(py_value_error)
 }
 
 /// Plan the next steering probe for a contested structural claim (issue #1109):
@@ -412,6 +418,7 @@ pub(crate) fn plan_probe_for_contested_claim<'py>(
         fisher.as_array(),
     )?;
     let Some(plan) = core_plan_probe_for_contested_claim(&probes, &fisher, alpha, current_log_e)
+        .map_err(py_value_error)?
     else {
         return Ok(None);
     };
@@ -981,59 +988,79 @@ pub(crate) fn debiased_functional<'py>(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// #942 — exact full-conformal prediction set for canonical-link GLMs
+// #942 — exact full-conformal prediction set for GLM families
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Resolve the canonical-GLM family name shared with the homotopy engine.
-fn canonical_glm_family(name: &str) -> PyResult<CanonicalGlmFamily> {
-    match name {
+/// Resolve the family name of the certified GLM full-conformal engine.
+fn conformal_glm_family(name: &str, theta: Option<f64>) -> PyResult<ConformalGlmFamily> {
+    let family = match name {
         "bernoulli" | "binomial" | "logit" | "bernoulli_logit" => {
-            Ok(CanonicalGlmFamily::BernoulliLogit)
+            ConformalGlmFamily::BernoulliLogit
         }
-        "poisson" | "poisson_log" => Ok(CanonicalGlmFamily::PoissonLog),
-        other => Err(py_value_error(format!(
-            "glm_full_conformal: unknown family {other:?}; expected \"bernoulli\" or \"poisson\""
-        ))),
+        "poisson" | "poisson_log" => ConformalGlmFamily::PoissonLog,
+        "negative_binomial" | "negbin" | "nb" => match theta {
+            Some(theta) => ConformalGlmFamily::NegativeBinomialLog { theta },
+            None => {
+                return Err(py_value_error(
+                    "glm_full_conformal: the negative binomial family needs `theta`".to_string(),
+                ));
+            }
+        },
+        "gamma" | "gamma_log" => ConformalGlmFamily::GammaLog,
+        other => {
+            return Err(py_value_error(format!(
+                "glm_full_conformal: unknown family {other:?}; expected \"bernoulli\", \
+                 \"poisson\", \"negative_binomial\" or \"gamma\""
+            )));
+        }
+    };
+    if theta.is_some() && !matches!(family, ConformalGlmFamily::NegativeBinomialLog { .. }) {
+        return Err(py_value_error(format!(
+            "glm_full_conformal: `theta` applies only to the negative binomial family, not {name:?}"
+        )));
     }
+    Ok(family)
 }
 
-/// Exact (finite-sample-valid) full-conformal prediction set for a
-/// canonical-link GLM (issue #942). This surfaces the previously unreachable
-/// certified predictor–corrector engine in `src/inference/full_conformal.rs`:
-/// for each candidate response `z` the augmented penalized fit is tracked
-/// (or cold-refit when the step certificate refuses), the `n+1` absolute-
-/// residual nonconformity scores are ranked, and `z` is retained iff its
-/// conformal p-value exceeds `alpha`. The returned set has finite-sample
-/// coverage `≥ 1 − alpha` under exchangeability — a guarantee neither split
-/// conformal at small `n` nor any mature classification-conformal tool
-/// (MAPIE, glmnet, mgcv) provides for a GLM with a coverage certificate.
+/// Conservative full-conformal numerical enclosure for a GLM at a
+/// frozen penalty (issue #942), computed by the same certified engine the
+/// predict route uses (`gam::inference::full_conformal_glm`). For each
+/// candidate response the augmented penalized fit is solved by certified
+/// Newton, the `n + 1` working-score nonconformity scores are ranked, and the
+/// candidate is retained if its conformal p-value exceeds `alpha` or a
+/// numerical comparison cannot certify exclusion. The discrete
+/// families use one independent randomized smoothed p-value per inversion.
+/// The enclosure has at least nominal marginal coverage under exchangeable
+/// supplied rows and a fixed symmetric fitting map; it is not a conditional
+/// guarantee for a training-only learned basis. The count families enumerate the
+/// whole support up to a certified tail, and Gamma walks the continuum.
 ///
-/// Smoothing is FROZEN at the supplied penalty `s_lambda` (the honest ρ-re-
-/// selection is the engine's Layer-3 domain), and unit prior weights are
-/// required because a reweighted training row is not exchangeable with the
-/// test row — the proof would not apply, so the engine refuses rather than
-/// silently mis-cover.
+/// Smoothing is FROZEN at the supplied penalty `s_lambda`, and there are no
+/// prior weights: a reweighted training row is not exchangeable with the test
+/// row, so the guarantee would not apply.
 ///
 /// Inputs (all in the fitted coefficient basis):
 /// * `design` — training design `X` (`n × p`).
-/// * `response` — training response `y` (length `n`); `{0,1}` for Bernoulli,
-///   non-negative for Poisson.
-/// * `s_lambda` — the `p × p` penalty matrix `Sλ` (`≥ 0`); pass zeros for an
-///   unpenalized GLM.
+/// * `response` — training response `y` (length `n`): `{0,1}` for Bernoulli,
+///   non-negative integers for Poisson and negative binomial, positive for
+///   Gamma.
+/// * `s_lambda` — the `p × p` positive semidefinite penalty `Sλ` in
+///   unit-dispersion units; pass zeros for an unpenalized GLM.
 /// * `x_star` — the test design row `x_*` (length `p`).
-/// * `family` — `"bernoulli"` or `"poisson"`.
-/// * `candidates` — strictly increasing response candidates to test. Defaults
-///   to `[0, 1]` (the exhaustive Bernoulli support); a Poisson caller passes
-///   an explicit integer window.
+/// * `family` — `"bernoulli"`, `"poisson"`, `"negative_binomial"` or `"gamma"`.
 /// * `alpha` — target miscoverage in `(0, 1)`.
+/// * `theta` — the negative-binomial size (required for that family only).
+/// * `offset`, `offset_star` — training offsets (default zeros) and the test
+///   row's offset (default `0`).
 ///
-/// Returns `{"members", "p_values", "candidates", "alpha", "n_augmented",
-/// "refit_fallbacks", "margin_refits", "ties_unresolved",
-/// "max_beta_error_bound"}`. `max_beta_error_bound` is the largest certified
-/// `‖β − β̂(z)‖` over the tracked candidates — the homotopy's exactness
-/// witness (`0` when every candidate was cold-fit).
+/// Returns `{"intervals", "alpha", "n_augmented", "set_kind"}`: `intervals` is the sorted,
+/// disjoint list of `(lo, hi)` pieces of the set (endpoints may be infinite).
+/// For the discrete families each piece is the integer run `lo..=hi`.
 #[pyfunction]
-#[pyo3(signature = (design, response, s_lambda, x_star, family, alpha, candidates = None))]
+#[pyo3(signature = (
+    design, response, s_lambda, x_star, family, alpha,
+    theta = None, offset = None, offset_star = 0.0
+))]
 pub(crate) fn glm_full_conformal<'py>(
     py: Python<'py>,
     design: numpy::PyReadonlyArray2<'py, f64>,
@@ -1042,52 +1069,31 @@ pub(crate) fn glm_full_conformal<'py>(
     x_star: numpy::PyReadonlyArray1<'py, f64>,
     family: &str,
     alpha: f64,
-    candidates: Option<Vec<f64>>,
+    theta: Option<f64>,
+    offset: Option<numpy::PyReadonlyArray1<'py, f64>>,
+    offset_star: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
-    let fam = canonical_glm_family(family)?;
+    let family = conformal_glm_family(family, theta)?;
     let x = design.as_array().to_owned();
     let y = response.as_array().to_owned();
     let sl = s_lambda.as_array().to_owned();
     let star = x_star.as_array().to_owned();
-    let n = x.nrows();
-    let prior_weights = Array1::<f64>::ones(n);
-
-    let engine = GlmHomotopyFullConformal::new(fam, &x, &y, &prior_weights, &sl, &star)
-        .map_err(py_value_error)?;
-
-    // Default candidate grid: the exhaustive Bernoulli support {0, 1}. A
-    // Poisson caller must supply an explicit count window — there is no honest
-    // unbounded enumeration.
-    let grid = match candidates {
-        Some(c) => c,
-        None => match fam {
-            CanonicalGlmFamily::BernoulliLogit => vec![0.0, 1.0],
-            CanonicalGlmFamily::PoissonLog => {
-                return Err(py_value_error(
-                    "glm_full_conformal: Poisson requires an explicit `candidates` count window"
-                        .to_string(),
-                ));
-            }
-        },
+    let (n, p) = x.dim();
+    let offset = match offset {
+        Some(offset) => offset.as_array().to_owned(),
+        None => Array1::<f64>::zeros(n),
     };
 
-    let set = engine
-        .prediction_set(&grid, alpha)
+    let set = GlmFullConformalSubstrate::new(family, x, y, offset, sl, Some(0), Array1::zeros(p))
+        .and_then(|substrate| substrate.prediction_set(&star, offset_star, alpha))
         .map_err(py_value_error)?;
 
-    let p_values: Vec<f64> = set.candidates.iter().map(|c| c.p_value).collect();
-    let candidate_zs: Vec<f64> = set.candidates.iter().map(|c| c.z).collect();
-
+    let intervals: Vec<(f64, f64)> = set.intervals.iter().map(|i| (i.lo, i.hi)).collect();
     let out = PyDict::new(py);
-    out.set_item("members", set.members)?;
-    out.set_item("p_values", p_values)?;
-    out.set_item("candidates", candidate_zs)?;
+    out.set_item("intervals", intervals)?;
     out.set_item("alpha", set.alpha)?;
     out.set_item("n_augmented", set.n_augmented)?;
-    out.set_item("refit_fallbacks", set.refit_fallbacks)?;
-    out.set_item("margin_refits", set.margin_refits)?;
-    out.set_item("ties_unresolved", set.ties_unresolved)?;
-    out.set_item("max_beta_error_bound", set.max_beta_error_bound)?;
+    out.set_item("set_kind", "conservative_enclosure")?;
     Ok(out)
 }
 
@@ -1627,12 +1633,14 @@ pub(crate) fn check_parameter_use_site_reads(
     let executed = ExecutedParameterReads::new(
         reads
             .into_iter()
-            .map(|(parameter, ordinal, read_module, read_op)| ExecutedParameterRead {
-                parameter,
-                ordinal,
-                read_module,
-                read_op,
-            })
+            .map(
+                |(parameter, ordinal, read_module, read_op)| ExecutedParameterRead {
+                    parameter,
+                    ordinal,
+                    read_module,
+                    read_op,
+                },
+            )
             .collect(),
     )
     .map_err(|refusal| py_value_error(format!("{refusal:?}: {refusal}")))?;
@@ -1644,7 +1652,9 @@ pub(crate) fn check_parameter_use_site_reads(
             positions: None,
         }
         .check_executed_reads(&parameter, &executed)
-        .map_err(|refusal| py_value_error(format!("use-site edit {index}: {refusal:?}: {refusal}")))?;
+        .map_err(|refusal| {
+            py_value_error(format!("use-site edit {index}: {refusal:?}: {refusal}"))
+        })?;
     }
     Ok(())
 }
