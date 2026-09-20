@@ -1888,6 +1888,19 @@ fn fit_expanded_formula_with_notes(
                                     unidentified_scalar_terms: payload.unidentified_scalar_terms.clone(),
                                     result: FitResult::Ctn(Box::new(payload)) });
     }
+    fit_formula_through_adaptive_resolution(formula, data, config)
+}
+
+/// Resolve `config`, fit `formula` at the adaptive structural start, and
+/// continue through the saturation-driven resolution loop. This is the one
+/// owner of that loop for a formula fit, so the library and the payload
+/// service reach the same fitted basis for the same request (the expectile
+/// payload route used to fit the fully provisioned basis with no loop, #4062).
+pub(crate) fn fit_formula_through_adaptive_resolution(
+    formula: &str,
+    data: &Dataset,
+    config: &FitConfig,
+) -> Result<FormulaFitResult, WorkflowError> {
     let mut config = config
         .clone()
         .resolve()
@@ -4314,7 +4327,7 @@ mod joint_expectile_scale_posterior_tests {
 }
 
 #[cfg(test)]
-mod expectile_materialize_notes_tests {
+mod expectile_front_end_tests {
     use super::*;
 
     const CR_CAP: &str = "cubic-regression ('cr'/'sz') basis reduced from k=8 to k=5";
@@ -4383,5 +4396,69 @@ mod expectile_materialize_notes_tests {
         let library = fit_from_formula_with_notes(formula, &data, &joint)
             .expect("joint expectile fit");
         assert_cr_cap_reported(&library.inference_notes.advisories, "library, two levels");
+    }
+
+    /// `z = sin(3x₁)·cos(2x₂) + 0.3ε` on a scattered 2-D design, so the
+    /// default `s(x1, x2)` is a multivariate radial smooth whose adaptive start
+    /// is smaller than its fully provisioned basis.
+    fn scattered_surface_dataset(n: usize) -> Dataset {
+        let mut state: u64 = 0x4062_2026_0920_0011;
+        let mut unif = || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let rows = (0..n)
+            .map(|_| {
+                let x1 = unif();
+                let x2 = unif();
+                let u1 = 1.0 - unif();
+                let u2 = unif();
+                let e = (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos();
+                let z = (3.0 * x1).sin() * (2.0 * x2).cos() + 0.3 * e;
+                csv::StringRecord::from(vec![x1.to_string(), x2.to_string(), z.to_string()])
+            })
+            .collect();
+        let headers = ["x1", "x2", "z"].into_iter().map(String::from).collect();
+        gam_data::encode_recordswith_inferred_schema(headers, rows).expect("encode fixture")
+    }
+
+    /// A one-level expectile fit is a standard fit, so the library and the
+    /// saved payload must reach it through the same adaptive-resolution loop
+    /// and land on the same basis and coefficients (#4062). The payload route
+    /// used to fit the fully provisioned radial basis instead.
+    #[test]
+    fn single_level_expectile_payload_matches_the_library_fit() {
+        let data = scattered_surface_dataset(200);
+        let formula = "z ~ s(x1, x2)";
+        let config = expectile_config(&[0.5]);
+        let library = fit_from_formula_with_notes(formula, &data, &config)
+            .expect("library expectile fit");
+        let FitResult::Standard(library) = library.result else {
+            panic!("a one-level expectile fit is a standard fit");
+        };
+        let payload = crate::inference::model_payload_builders::fit_formula_to_payload(
+            formula.to_string(),
+            &data,
+            &config,
+        )
+        .expect("expectile payload");
+        let saved = payload
+            .fit_result
+            .as_ref()
+            .or(payload.unified.as_ref())
+            .expect("payload carries its fit");
+        assert_eq!(
+            saved.beta.len(),
+            library.fit.beta.len(),
+            "Python / CLI --out and the library must fit the same expectile basis"
+        );
+        for (saved_coef, library_coef) in saved.beta.iter().zip(library.fit.beta.iter()) {
+            assert!(
+                (saved_coef - library_coef).abs() <= 1e-4 * (1.0 + library_coef.abs()),
+                "coefficients differ between front ends: {saved_coef} vs {library_coef}"
+            );
+        }
     }
 }

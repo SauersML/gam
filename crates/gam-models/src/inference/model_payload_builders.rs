@@ -22,9 +22,9 @@ use crate::bms::{
 use crate::cubic_cell_kernel::ANCHORED_DEVIATION_KERNEL;
 use crate::fit_orchestration::drivers::freeze_term_collection_from_design;
 use crate::fit_orchestration::{
-    DispersionLocationScaleFitResult, ExpectileFit, ExpectileLocationScaleFitResult, FitConfig,
-    FitNoteSink, FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
-    expectile_levels_for_config, fit_expectile_if_requested,
+    DispersionLocationScaleFitResult, ExpectileLocationScaleFitResult, FitConfig, FitNoteSink,
+    FitNotes, FitRequest, FitResult, StandardFitResult, WorkflowError,
+    expectile_levels_for_config, fit_formula_through_adaptive_resolution,
     fit_materialized_standard_with_notes, fit_model, materialize,
 };
 use crate::gamlss::{
@@ -1667,27 +1667,31 @@ fn fit_expanded_formula_to_payload(
     // Expectile (Newey–Powell LAWS) family (#1777): the expectile estimator is an
     // OUTER driver that wraps the standard Gaussian-identity GAM with iterative
     // asymmetric reweighting, so it is selected *before* `materialize` (which has
-    // no expectile arm) — exactly as the in-process `fit_from_formula` does. We
-    // route it through the single shared dispatch seam so the Python API reaches
-    // the same estimator the library call does instead of failing with
-    // `unknown family 'expectile(τ)'`. The driver returns an ordinary
-    // `StandardFitResult`, so the persistence payload is built by the same
-    // `assemble_standard_payload` used for every other standard fit.
-    if let Some(outcome) = fit_expectile_if_requested(&formula, dataset, fit_config)? {
-        let mut payload = match outcome.fit {
-            ExpectileFit::Single(result) => assemble_standard_payload(StandardPayloadInputs {
+    // no expectile arm). It runs through the same resolve → structural start →
+    // resolution-loop owner the library call uses, so a one-level fit reaches the
+    // same basis on every front end (#4062), and the inner materialization's notes
+    // are carried like any other fit's (#4027). One level returns an ordinary
+    // `StandardFitResult`, assembled by the shared `assemble_standard_payload`.
+    if expectile_levels_for_config(fit_config)?.is_some() {
+        let outcome = fit_formula_through_adaptive_resolution(&formula, dataset, fit_config)?;
+        let mut payload = match outcome.result {
+            FitResult::Standard(result) => assemble_standard_payload(StandardPayloadInputs {
                 formula,
                 dataset,
                 fit_config,
                 result,
             })?,
-            ExpectileFit::Joint(joint) => payload_for_joint_expectile(formula, dataset, fit_config, joint)?,
+            FitResult::ExpectileLocationScale(joint) => {
+                payload_for_joint_expectile(formula, dataset, fit_config, joint)?
+            }
+            _ => {
+                return Err(WorkflowError::SchemaMismatch {
+                    reason: "an expectile request returned a non-expectile fit result".to_string(),
+                });
+            }
         };
-        // The expectile driver materializes its inner Gaussian design itself and
-        // hands back what that materialization reported, so a capped basis or a
-        // pruned scalar term is surfaced exactly as for any other fit (#1543).
-        apply_request_metadata(&mut payload, fit_config, outcome.materialized.inference_notes);
-        payload.unidentified_scalar_terms = outcome.materialized.unidentified_scalar_terms;
+        apply_request_metadata(&mut payload, fit_config, outcome.inference_notes);
+        payload.unidentified_scalar_terms = outcome.unidentified_scalar_terms;
         return Ok(payload);
     }
     // Standard-fit dispatch must materialize at the adaptive structural start:
