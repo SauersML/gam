@@ -2562,5 +2562,99 @@
     ],
     "reason": "The te() joint-unpenalized-dimension guess is retired: joint_unpenalized_dim no longer reports 0 (or a single penalty's own null dim) for a penalty whose stored block is a Kronecker factor, it reads the materialized p_local x p_local block of every penalty. The removed test pinned that fallback, including a shape (a 1x1 factor for p_local = 2) the builder never produces now.",
     "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
+  },
+  {
+    "base": "b3832b9299c77b4f036b06d88d10e5a988126257",
+    "items": [
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:exclusive_subspaces",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:inverse_on_subspace",
+      "crates/gam-terms/src/inference/smooth_score_test.rs:fn:normalized"
+    ],
+    "reason": "Port of #3220 item (a): the smooth score test's component covariances are now K_l = P⁻¹(a_l S_l)P⁻¹ at P = Σ a_l S_l, a_l = 1/tr(G_jj⁺ S_l), for every penalty set. On complementary ranges this equals the exact N_l(N_lᵀS_lN_l)⁻¹N_lᵀ / a_l that exclusive_subspaces + inverse_on_subspace computed (a_l cancels in the per-component null-mean normalization), and on overlapping ranges it replaces the chart-dependent S_l⁺ fallback. PenaltyRange::normalized only served exclusive_subspaces' rank decision.",
+    "evidence": "All three were private to crates/gam-terms/src/inference/smooth_score_test.rs; after the change git grep -w finds none of exclusive_subspaces / inverse_on_subspace, and PenaltyRange::normalized has no caller (the 1054 production occurrences are other items named normalized). cargo test -p gam-terms --lib smooth_score_test: 11/11, including the new overlapping_penalties_do_not_depend_on_the_coefficient_chart, which fails under the old S_l⁺ fallback along with the two chart/functional-ridge tests; cargo check --workspace --tests RC 0."
+  },
+  {
+    "base": "3c2b08bc13124f15576fef1513960f97053c1647",
+    "items": [
+      "crates/gam-inference/src/effects.rs:const:DEFAULT_SIMULATIONS",
+      "crates/gam-inference/src/effects.rs:fn:default",
+      "crates/gam-inference/src/partial_dependence.rs:fn:a_block_spanning_every_level_and_an_unknown_term_are_refused_by_name",
+      "crates/gam-inference/src/partial_dependence.rs:fn:a_linear_interaction_holds_its_gate_and_a_two_axis_term_needs_a_grid",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:const:NONZERO_ANCHOR_DESIGN_ERROR",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:model_partial_dependence",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:model_partial_dependence_impl",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_design",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_prediction_design",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:standard_mean_termspec",
+      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:struct:PartialDependenceOutput"
+    ],
+    "reason": "PR #3076 replaces the dict-returning partial-dependence path with a typed Rust partial effect (gam_predict::partial_effect::partial_effect). (1) The pyffi model_partial_dependence / model_partial_dependence_impl / PartialDependenceOutput pyfunction is replaced by model_partial_effect, and gamfit.Model.partial_dependence calls that instead. (2) The standard-mean design helpers standard_mean_design, standard_mean_termspec, standard_mean_prediction_design and NONZERO_ANCHOR_DESIGN_ERROR move out of gam-pyffi geometry_ffi.rs into gam_predict::partial_effect, where the CLI partial-effect command and pyffi share them; the variance-share and difference-smooth callers now call gam_predict::partial_effect::standard_mean_design. (3) The simultaneous-band draw count is no longer the magic constant DEFAULT_SIMULATIONS = 10_000 behind impl Default for SimultaneousBandOptions. It is SimultaneousBandOptions::at_level(level), which draws simultaneous_band_simulations(level) = ceil(level/((1-level)*0.05^2)) samples, 7,600 at 0.95. (4) Two partial_dependence unit tests asserted refusals this PR turns into supported behaviour: a two-axis term with no grid now sweeps the product grid, and a block spanning every factor level now sweeps the factor as an axis. They are renamed to a_linear_interaction_holds_its_gate_and_a_two_axis_term_sweeps_a_product_grid and a_block_spanning_every_level_sweeps_the_factor_as_an_axis. The second still carries the unknown-term refusal assertion (\"available\" plus the term list).",
+    "evidence": "scripts/source_removal_guard.py --base 3c2b08bc13124f15576fef1513960f97053c1647 --head d91b01836688765aadbbed2aff2ef0f78d7e9d41 (the landing session's merge of main into claude/pygam-partial-effects) lists exactly these 11 guarded removals and fails without this entry. Read-proof, git grep -w -c over *.rs at that head: DEFAULT_SIMULATIONS 0, model_partial_dependence 0, model_partial_dependence_impl 0, PartialDependenceOutput 0; standard_mean_design is in gam-predict/src/partial_effect.rs (2), geometry_ffi.rs (1, the variance-share caller) and manifold_and_posterior_ffi.rs (1, the difference-smooth caller); standard_mean_termspec (3), standard_mean_prediction_design (2) and NONZERO_ANCHOR_DESIGN_ERROR (3) are all in gam-predict/src/partial_effect.rs; SimultaneousBandOptions::at_level appears 5 times in gam-inference/src/effects.rs, and main's whole-curve coverage test is ported to it. The renamed tests are each declared once in gam-inference/src/partial_dependence.rs."
+  },
+  {
+    "base": "41fbd6c3376037036ca93f1c5274575fef526dc0",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs:fn:spatial_center_strategy_mut",
+      "crates/gam-terms/src/term_builder.rs:fn:cyclic_basis_dim_for_column",
+      "crates/gam-terms/src/term_builder.rs:fn:pilot_internal_knots_for_column",
+      "crates/gam-terms/src/term_builder/tests.rs:fn:multidimensional_duchon_default_uses_rate_derived_pilot_basis"
+    ],
+    "reason": "#3149 R0: formula defaults are built at their provisioned size on every route, and only the bases the standard workflow's resolution loop grows start at their penalized-resolution pilot, through the one rule gam_terms::smooth::starting_resolution. materialize/terms.rs spatial_center_strategy_mut served only the d>1 radial start special case that starting_resolution now owns; term_builder cyclic_basis_dim_for_column was the position basis's pilot cyclic default, now provisioned_cyclic_basis_dim; the test multidimensional_duchon_default_uses_rate_derived_pilot_basis is restated as multidimensional_duchon_default_is_provisioned_and_the_loop_starts_it_at_its_pilot (same fixture, both sizes asserted); term_builder pilot_internal_knots_for_column lost its last production caller (the position basis now takes the provisioned default, and the pilot floor sizes from the rows it is identified on, #3179), so its tests call pilot_internal_knots directly.",
+    "evidence": "Gate direct-dy6-w2a-r0v5-gt.log, TIPCHECK at tip 988f269d7e (tip tree 9598a61a74): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, gam-terms 114 of 114; its source_removal_guard and public_api_census flagged exactly these items and nothing else. Read-proof: git grep -w for spatial_center_strategy_mut, cyclic_basis_dim_for_column and pilot_internal_knots_for_column at 988f269d7e finds only their definitions, the callers this landing rewrites, and a doc comment in basis/types.rs that this landing also rewrites."
+  },
+  {
+    "base": "33e71f2363e2b5b2cc64043c2a865d2247b59452",
+    "items": [
+      "crates/gam-model-api/src/families/custom_family/options.rs:const:FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP",
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_optimization.rs:const:SPATIAL_PSI_BFGS_STEP_CAP",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:bfgs_axis_step_caps",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:with_bfgs_step_cap",
+      "crates/gam-solve/src/rho_optimizer/run.rs:fn:with_bfgs_step_cap_psi"
+    ],
+    "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
+    "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "d5f641efbdb2e3e5c9b1d26621a7ad3890d5eabe",
+    "items": [
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:IFT_RESIDUAL_TIER_EXCELLENT",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:IFT_RESIDUAL_TIER_MARGINAL",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:IFT_RESIDUAL_TIER_OK",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:IFT_RESIDUAL_TIER_VERY_GOOD",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:IFT_WARM_START_DEFAULT_MAX_DRHO",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:const:TANGENT_ALPHA_DEFAULT_CAP",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:adaptive_ift_max_drho",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:adaptive_tangent_alpha_cap",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:clear_ift_quality_runtime_state",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:ift_quality_step_cap",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:record_ift_prediction_quality",
+      "crates/gam-solve/src/reml/gradient_hessian.rs:fn:take_ift_quality_flat_override",
+      "crates/gam-solve/src/reml/mod.rs:const:DEFAULT_CAP",
+      "crates/gam-solve/src/reml/objective.rs:fn:adaptive_ift_max_drho_follows_quality_tiers",
+      "crates/gam-solve/src/reml/objective.rs:fn:adaptive_tangent_alpha_cap_follows_quality_tiers",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_QUALITY_FLAT_FALLBACK_BAND",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_QUALITY_GROW_BAND",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_QUALITY_HISTORY_CAP",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_QUALITY_SHRINK_BAND",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_STEP_CAP_GROW_FACTOR",
+      "crates/gam-solve/src/reml/state_caches.rs:const:IFT_STEP_CAP_SHRINK_FACTOR",
+      "crates/gam-solve/src/reml/state_caches.rs:struct:IftQualityRuntimeState"
+    ],
+    "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
+    "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
+    "items": [
+      "crates/gam-gpu/src/policy.rs:enum:GpuMixedPrecisionPolicy",
+      "crates/gam-gpu/src/policy.rs:fn:never_policy_never_attempts_refinement",
+      "crates/gam-gpu/src/policy.rs:fn:off_policy_never_attempts_refinement",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_logdet",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_logdet_from_col_major",
+      "crates/gam-gpu/src/solver.rs:fn:cholesky_solve_gpu",
+      "crates/gam-gpu/src/solver.rs:fn:iterative_refinement_cholesky_solve"
+    ],
+    "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
   }
 ]

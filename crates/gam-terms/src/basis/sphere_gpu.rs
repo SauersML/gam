@@ -462,12 +462,12 @@ impl<'a> S2KernelBuildInputs<'a> {
 }
 
 // ────────────────────────────────────────────────────────────────────────
-// NVRTC kernel source — raw and Householder-fused variants.
+// NVRTC kernel source for the raw kernel matrix.
 //
-// Both compile with `--std=c++17 --gpu-architecture=compute_${cc}` and
-// take LMAX as a compile-time `#define`. Block (32, 8, 1), shared-mem
-// tiles for one data row × 3 doubles per warp and one center × 3
-// doubles per warp.
+// Compiled through `compile_ptx_arch` with LMAX supplied as a compile-time
+// `#define`. Launched with block (32, 8, 1): x over centers, y over rows.
+// Each thread reads its data row and center straight from global memory;
+// no shared memory is used.
 // ────────────────────────────────────────────────────────────────────────
 
 #[cfg(target_os = "linux")]
@@ -558,87 +558,6 @@ void s2_wahba_legendre_colmajor(
 
     out[(long long) j * ld + (long long) i] = acc;
 }
-
-// Fused Householder-constrained kernel (Phase 3). Z = I - beta · v · v^T,
-// the constrained design is X_s = B[:, 1..m] - beta * (B · v) · v[1..m]^T,
-// i.e. drop the first column after applying Z. Each thread computes one
-// row of B in registers (m kernel evaluations), forms d_i = B_row · v,
-// then emits X_s[i, j_out] = B_row[j_out + 1] - beta * d_i * v[j_out + 1]
-// for j_out in 0..m-1.
-//
-// Grid: 1D over rows (block_dim.x rows per block). Each thread iterates
-// over centers in an inner loop — register-bound by the per-row state
-// (xyz_i, p_prev, p_curr, acc, and a small per-center scratch).
-extern "C" __global__
-__launch_bounds__(128)
-void s2_wahba_householder_constrained_colmajor(
-    const double* __restrict__ data_xyz,    // n × 3
-    const double* __restrict__ centers_xyz, // m × 3
-    const double* __restrict__ coeffs,      // length LMAX + 1
-    const double* __restrict__ v,           // length m, Householder vector
-    double beta,
-    int n,
-    int m,
-    long long ld_out,
-    double* __restrict__ out                // ld_out × (m-1) column-major
-) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-
-    const double xi = data_xyz[3 * i + 0];
-    const double yi = data_xyz[3 * i + 1];
-    const double zi = data_xyz[3 * i + 2];
-
-    // Pass 1: compute d_i = sum_j v[j] * B[i, j].
-    double d_i = 0.0;
-    for (int j = 0; j < m; ++j) {
-        const double cxj = centers_xyz[3 * j + 0];
-        const double cyj = centers_xyz[3 * j + 1];
-        const double czj = centers_xyz[3 * j + 2];
-        const double t = s2_chord_cos_gamma(xi, yi, zi, cxj, cyj, czj);
-
-        double p_prev = 1.0;
-        double p_curr = t;
-        double acc    = coeffs[0] * p_prev + coeffs[1] * p_curr;
-        #pragma unroll 8
-        for (int ell = 1; ell < LMAX; ++ell) {
-            const double lf  = (double) ell;
-            const double inv = 1.0 / (lf + 1.0);
-            const double p_next =
-                fma((2.0 * lf + 1.0) * t, p_curr, -lf * p_prev) * inv;
-            acc = fma(coeffs[ell + 1], p_next, acc);
-            p_prev = p_curr;
-            p_curr = p_next;
-        }
-        d_i = fma(v[j], acc, d_i);
-    }
-
-    // Pass 2: emit X_s[i, j_out] = B[i, j_out+1] - beta * d_i * v[j_out+1].
-    const double bd = beta * d_i;
-    for (int j_out = 0; j_out < m - 1; ++j_out) {
-        const int j = j_out + 1;
-        const double cxj = centers_xyz[3 * j + 0];
-        const double cyj = centers_xyz[3 * j + 1];
-        const double czj = centers_xyz[3 * j + 2];
-        const double t = s2_chord_cos_gamma(xi, yi, zi, cxj, cyj, czj);
-
-        double p_prev = 1.0;
-        double p_curr = t;
-        double acc    = coeffs[0] * p_prev + coeffs[1] * p_curr;
-        #pragma unroll 8
-        for (int ell = 1; ell < LMAX; ++ell) {
-            const double lf  = (double) ell;
-            const double inv = 1.0 / (lf + 1.0);
-            const double p_next =
-                fma((2.0 * lf + 1.0) * t, p_curr, -lf * p_prev) * inv;
-            acc = fma(coeffs[ell + 1], p_next, acc);
-            p_prev = p_curr;
-            p_curr = p_next;
-        }
-        const double xs = acc - bd * v[j];
-        out[(long long) j_out * ld_out + (long long) i] = xs;
-    }
-}
 "#;
 
 // ────────────────────────────────────────────────────────────────────────
@@ -647,10 +566,9 @@ void s2_wahba_householder_constrained_colmajor(
 
 /// Module cache key. The compiled PTX depends only on the device's compute
 /// capability (the NVRTC arch) and `LMAX`, which is prepended to the source.
-/// The kernel kind reaches the device as the uploaded `c_ℓ` array, and the
-/// column-major layout, `precision = f64` and the (32, 8, 1) raw-kernel block /
-/// (128, 1, 1) Householder-kernel block shapes are baked into the source, so
-/// none of them keys the cache.
+/// The kernel kind reaches the device as the uploaded `c_ℓ` array, the
+/// column-major layout and `precision = f64` are baked into the source, and the
+/// (32, 8, 1) block shape is a launch parameter, so none of them keys the cache.
 #[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct S2ModuleCacheKey {
@@ -857,7 +775,7 @@ impl SphereGpuBackend {
     }
 
     /// NVRTC-compile (or fetch from cache) the module for `key`. The
-    /// returned module exposes both raw and Householder-fused kernels.
+    /// returned module exposes the raw `s2_wahba_legendre_colmajor` kernel.
     fn module_for(&self, key: S2ModuleCacheKey) -> Result<Arc<CudaModule>, GpuError> {
         if let Ok(guard) = self.inner.modules.lock() {
             if let Some(existing) = guard.get(&key) {

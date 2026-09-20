@@ -570,6 +570,91 @@ fn converged_verdict_accepts_a_representative_swap_and_refuses_a_gauge_loss_2627
     );
 }
 
+/// #3304: a column the pilot drops and convergence identifies is judged by the gauge the
+/// fit ran. The second block's second column has zero effective weight at the pilot and
+/// unit weight at convergence.
+/// - A Structural block keeps its raw width (the identity gauge), so the fit ran that
+///   column. Its recovery raises the rank of the problem the fit ran, and the verdict
+///   accepts it.
+/// - The same fixture on a Spanning block (the positive control) is reduced by the gauge,
+///   so the fit ran without a direction convergence identifies, and the verdict refuses.
+#[test]
+fn converged_verdict_accepts_a_recovery_the_identity_gauge_ran_3304() {
+    use gam_identifiability::audit::audit_beta_relative_change;
+    use gam_identifiability::canonical::converged_channel_aware_verdict;
+    let n = 64;
+    let specs = two_channel_specs(
+        &legendre_columns(n, 4),
+        &[
+            vec![vec![(0, 1.0)], vec![(1, 1.0)]],
+            vec![vec![(2, 1.0)], vec![(3, 1.0)]],
+        ],
+        &[],
+        true,
+    );
+    let pilot = operating_point(vec![vec![1.0; 2], vec![1.0, 0.0]], false);
+    let converged = operating_point(vec![vec![1.0; 2], vec![1.0; 2]], false);
+    let beta_pilot = vec![0.0; 4];
+    let beta_current = vec![0.5; 4];
+    let change = audit_beta_relative_change(&beta_pilot, &beta_current);
+    let verdict_under = |coordinates: &[CoefficientCoordinate]| {
+        let canonical = canonicalize_for_identifiability_with_operating_scalars(
+            &specs,
+            coordinates,
+            Some(Arc::clone(&pilot)),
+        )
+        .expect("a penalty-covered dead column canonicalizes");
+        assert!(canonical.used_channel_aware_audit);
+        assert_eq!(
+            canonical
+                .audit
+                .dropped_columns
+                .iter()
+                .map(|dropped| (dropped.block.clone(), dropped.column))
+                .collect::<Vec<_>>(),
+            vec![("surface_2".to_string(), 1)],
+            "the pilot drops the zero-weight column"
+        );
+        assert!(!canonical.audit.fatal, "the penalty covers the dead column");
+        let reduced_width = canonical.reduced_specs[1].design.ncols();
+        let verdict =
+            converged_channel_aware_verdict(&specs, &canonical, Arc::clone(&converged), change, 0)
+                .expect("channel-aware converged verdict runs");
+        assert_eq!(
+            (verdict.drift.pilot_rank, verdict.drift.current_rank),
+            (3, 4),
+            "convergence identifies the column the pilot dropped"
+        );
+        (reduced_width, verdict)
+    };
+
+    let (structural_width, structural) =
+        verdict_under(&[CoefficientCoordinate::Spanning, CoefficientCoordinate::Structural]);
+    assert_eq!(structural_width, 2, "a Structural block keeps its raw width");
+    assert!(
+        !structural.refuses()
+            && structural.recovered_under_identity_gauge()
+            && !structural.representative_swap(),
+        "the fit ran the recovered column, so its recovery must be accepted \
+         (pilot_rank={} current_rank={} pilot_gauge_rank={})",
+        structural.drift.pilot_rank,
+        structural.drift.current_rank,
+        structural.pilot_gauge_rank()
+    );
+
+    let (spanning_width, spanning) = verdict_under(&[CoefficientCoordinate::Spanning; 2]);
+    assert_eq!(spanning_width, 1, "the reducing gauge removes the dead column");
+    assert!(
+        spanning.refuses() && !spanning.recovered_under_identity_gauge(),
+        "positive control: the gauge removed a direction convergence identifies, so the \
+         solve ran over-reduced and must refuse (pilot_rank={} current_rank={} \
+         pilot_gauge_rank={})",
+        spanning.drift.pilot_rank,
+        spanning.drift.current_rank,
+        spanning.pilot_gauge_rank()
+    );
+}
+
 #[test]
 fn penalty_covered_competing_risks_redundancy_canonicalises_cleanly_1590() {
     let n = 64;
