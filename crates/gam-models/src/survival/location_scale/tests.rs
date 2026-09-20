@@ -406,6 +406,39 @@ fn survival_fit_finalization_preserves_outer_certificate() {
     );
 }
 
+/// gam#3707: a per-penalty EDF channel is either unrecorded (empty) or aligned 1:1
+/// with the block lambdas. A present channel of any other length is a layout bug and
+/// must be refused, not read as "unrecorded" (which published the nominal column
+/// count as the block EDF and emptied the inference channels without a word).
+#[test]
+fn survival_fit_finalization_refuses_a_misaligned_edf_channel_3707() {
+    // The fixture carries exactly one smoothing parameter (on the time block).
+    let mut misaligned_trace = survival_fit_parts_with_outer_evidence(0, None);
+    misaligned_trace.penalty_block_trace = vec![0.4, 0.4];
+    let error = survival_fit_from_parts(misaligned_trace)
+        .expect_err("a two-entry trace for one smoothing parameter must be refused");
+    assert!(
+        error.contains("penalty_block_trace has 2 entries") && error.contains("1 smoothing"),
+        "unexpected misaligned-trace error: {error}"
+    );
+
+    let mut misaligned_edf = survival_fit_parts_with_outer_evidence(0, None);
+    misaligned_edf.edf_by_block = vec![0.6, 0.6, 0.6];
+    let error = survival_fit_from_parts(misaligned_edf)
+        .expect_err("a three-entry edf_by_block for one smoothing parameter must be refused");
+    assert!(
+        error.contains("edf_by_block has 3 entries"),
+        "unexpected misaligned-edf error: {error}"
+    );
+
+    // The aligned trace is read: the time block's EDF is |coeff| − tr = 1 − 0.4,
+    // unclamped because no rank bound certifies it (#2901).
+    let mut aligned = survival_fit_parts_with_outer_evidence(0, None);
+    aligned.penalty_block_trace = vec![0.4];
+    let fit = survival_fit_from_parts(aligned).expect("an aligned trace finalizes");
+    assert_eq!(fit.blocks[0].edf, 1.0 - 0.4);
+}
+
 /// gam#2661: finalization carries the inner fit's mode-selection record rather than
 /// defaulting it to `NotRecorded`.
 #[test]
