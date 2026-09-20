@@ -1014,7 +1014,8 @@ struct SmoothTermLrRow {
     /// Why this term has no LR p-value, when it has none:
     /// `"empty_coefficient_block"`, `"degenerate_reference"`, `"full_refit_failed"`,
     /// `"null_fit_not_converged"`, `"null_fit_unsupported"`,
-    /// `"null_log_likelihood_not_finite"`, or `"tail_not_computable"`.
+    /// `"null_log_likelihood_not_finite"`, `"tail_not_computable"`, or
+    /// `"selection_refused"`.
     unavailable_reason: Option<&'static str>,
     /// The human-readable form of `unavailable_reason`, carrying the solver's
     /// own message for the full-refit and reduced-fit reasons.
