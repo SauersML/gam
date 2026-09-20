@@ -450,13 +450,19 @@ class Adapter:
         raise NotImplementedError
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, offset: FloatArray | None, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
         """The post-fit operations timed under ``--postfit``, in run order.
 
-        ``X`` / ``y`` / ``offset`` are the training data (the posterior draws
-        and the significance refits need the response, and the offset of an
-        exposure family); ``path`` is a scratch file
+        ``X`` / ``y`` / ``weights`` / ``offset`` are the training data, as
+        passed to ``fit`` (the posterior draws and the significance refits need
+        the response, a grouped binomial its trials and an exposure family its
+        offset); ``path`` is a scratch file
         for the save / load round trip, written by ``save`` before ``load``.
         """
         raise NotImplementedError
@@ -549,10 +555,17 @@ class GamfitAdapter(Adapter):
         }
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, offset: FloatArray | None, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
         train = self._table(X, offset)
         train["y"] = y
+        if weights is not None:
+            train[WEIGHTS_COLUMN] = weights
         term = self.formula.split("~ ", 1)[1].split(" + ", 1)[0]
         return {
             "pd": lambda: self.model.partial_dependence(term, n_points=PD_POINTS),
@@ -659,11 +672,15 @@ class PygamAdapter(Adapter):
         }
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, offset: FloatArray | None, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
-        # The rate response and exposure weights the model was fitted on
-        # (see ``fit``).
-        extra: dict[str, Any] = {}
+        # The response and prior weights the model was fitted on (see ``fit``).
+        extra: dict[str, Any] = {} if weights is None else {"weights": weights}
         y_fit = y
         if offset is not None:
             exposure = np.exp(offset)
@@ -847,7 +864,7 @@ def run(
             out["logscore"] = mean_logscore(family, yt, pred, None, wt)
         if postfit:
             path = os.path.abspath(f"postfit_{lib}_{os.getpid()}.model")
-            for name, op in adapter.postfit_ops(X, y, off, path).items():
+            for name, op in adapter.postfit_ops(X, y, w, off, path).items():
                 phase(name, op)
             if os.path.exists(path):
                 out["save_bytes"] = os.path.getsize(path)
