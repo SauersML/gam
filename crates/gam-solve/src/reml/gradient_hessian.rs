@@ -3143,7 +3143,12 @@ impl<'a> RemlState<'a> {
     /// saturation handling).
     ///
     /// For non-canonical Bernoulli links (Probit, CLogLog, SAS,
-    /// BetaLogistic, Mixture) we use the analytic
+    /// BetaLogistic, Mixture) eᵢ is the third η-derivative of the row's
+    /// observed information from `pirls::bernoulli_observed_information_jet`,
+    /// linear in the derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317).
+    ///
+    /// Every other exact-curvature family uses the analytic
     /// `pirls::e_obs_from_jets` formula. It expresses
     ///   ∂³W_obs/∂η³ = W_F''' + h₃ T₁ + 3 h₂ T₂ + 3 h₁ T₃ − (y−μ) T₄
     /// where T = h₁/(φV), T_k = ∂^k T/∂η^k, and W_F = h₁ T. Everything
@@ -3239,53 +3244,65 @@ impl<'a> RemlState<'a> {
             .into_par_iter()
             .map(|i| -> Result<f64, EstimationError> {
                 let eta_raw = final_eta[i];
-                let h1 = dmu_deta[i];
-                let h2 = d2mu_deta2[i];
-                let h3 = d3mu_deta3[i];
-                let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                )?;
-                if !h1.is_finite()
-                    || !h2.is_finite()
-                    || !h3.is_finite()
-                    || !h4.is_finite()
-                    || !h5.is_finite()
-                {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian inverse-link five-jet",
-                        eta: eta_raw,
-                        value: h5,
-                    });
-                }
-                let mu_i = mu[i];
-                // #2273 — the complement comes from the LINK, not from `1.0 -
-                // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
-                // and `V = mu*(1-mu)` would be a hard zero the whole
-                // observed-information jet then divides by.
-                let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
-                    inverse_link_ref,
-                    eta_raw,
-                    mu_i,
-                );
-                let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
-                if !(vj.v.is_finite() && vj.v > 0.0) {
-                    return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                        row: i,
-                        quantity: "observed Hessian variance",
-                        eta: eta_raw,
-                        value: vj.v,
-                    });
-                }
-                let pw = weights[i];
-                let y_i = y_view[i];
-                let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
-                let e_i = pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw);
+                let e_i = if matches!(weight_family, pirls::WeightFamily::Binomial) {
+                    // #3317 — a Bernoulli row's jet is linear in the two sides'
+                    // log-probability jets, which never divide by μ(1−μ).
+                    pirls::bernoulli_observed_information_jet(
+                        inverse_link_ref,
+                        eta_raw,
+                        y_view[i],
+                        phi,
+                        weights[i],
+                    )?[3]
+                } else {
+                    let h1 = dmu_deta[i];
+                    let h2 = d2mu_deta2[i];
+                    let h3 = d3mu_deta3[i];
+                    let h4 = crate::mixture_link::inverse_link_pdfthird_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    let h5 = crate::mixture_link::inverse_link_pdffourth_derivative_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                    )?;
+                    if !h1.is_finite()
+                        || !h2.is_finite()
+                        || !h3.is_finite()
+                        || !h4.is_finite()
+                        || !h5.is_finite()
+                    {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian inverse-link five-jet",
+                            eta: eta_raw,
+                            value: h5,
+                        });
+                    }
+                    let mu_i = mu[i];
+                    // #2273 — the complement comes from the LINK, not from `1.0 -
+                    // mu`: a saturated cloglog/probit row has `mu == 1.0` exactly,
+                    // and `V = mu*(1-mu)` would be a hard zero the whole
+                    // observed-information jet then divides by.
+                    let one_minus_mu = crate::mixture_link::inverse_link_complement_for_inverse_link(
+                        inverse_link_ref,
+                        eta_raw,
+                        mu_i,
+                    );
+                    let vj = pirls::variance_jet_for_weight_family(weight_family, mu_i, one_minus_mu);
+                    if !(vj.v.is_finite() && vj.v > 0.0) {
+                        return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                            row: i,
+                            quantity: "observed Hessian variance",
+                            eta: eta_raw,
+                            value: vj.v,
+                        });
+                    }
+                    let pw = weights[i];
+                    let y_i = y_view[i];
+                    let resid_i = pirls::bernoulli_pair_residual(weight_family, y_i, mu_i, one_minus_mu);
+                    pirls::e_obs_from_jets(resid_i, h1, h2, h3, h4, h5, vj, phi, pw)
+                };
                 if e_i.is_finite() {
                     Ok(e_i)
                 } else {
