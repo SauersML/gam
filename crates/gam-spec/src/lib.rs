@@ -702,6 +702,45 @@ impl RhoPrior {
         (0..rho_dim).all(|k| self.upper_tail_gradient_vanishes(k))
     }
 
+    /// The prior's exact slope in `λ_k = e^{ρ_k}` on the zero-smoothing
+    /// (`ρ_k → −∞`) tail, when that slope is a constant.
+    ///
+    /// The covered zero-smoothing face certificate expands the criterion as
+    /// `V(λ_L) = V(0) + Σ_j c′_j λ_j + O(|λ|²)` and decides the face by the
+    /// signs of the `c′_j`. A prior enters that law only if its cost is itself
+    /// `rate·λ` plus a constant, i.e. `∂/∂ρ = rate·e^{ρ}` exactly:
+    ///
+    /// * `Flat` — contributes nothing: `Some(0)`.
+    /// * `GammaPrecision { shape: 1, rate }` — cost `rate·λ`, so its slope is
+    ///   exactly `rate` (and `Some(0)` for the flat spelling `rate = 0`).
+    ///
+    /// Every other family answers `None`, each because its ρ-gradient does not
+    /// vanish as `λ → 0`: `Normal` leaves `(ρ − mean)/sd² → −∞`,
+    /// `PenalizedComplexity` its exponential wall `−(θ/2)e^{−ρ/2}`, and a
+    /// `GammaPrecision` with `shape ≠ 1` the constant `−(shape − 1)`. Under any
+    /// of them `λ = 0` is not a face of the criterion. A malformed rate or a
+    /// nested / short `Independent` also answers `None`.
+    pub fn lower_tail_linear_rate(&self, coordinate: usize) -> Option<f64> {
+        fn scalar_rate(prior: &RhoPrior) -> Option<f64> {
+            match prior {
+                RhoPrior::Flat => Some(0.0),
+                RhoPrior::GammaPrecision { shape, rate }
+                    if *shape == 1.0 && rate.is_finite() && *rate >= 0.0 =>
+                {
+                    Some(*rate)
+                }
+                RhoPrior::GammaPrecision { .. }
+                | RhoPrior::Normal { .. }
+                | RhoPrior::PenalizedComplexity { .. }
+                | RhoPrior::Independent(_) => None,
+            }
+        }
+        match self {
+            RhoPrior::Independent(priors) => priors.get(coordinate).and_then(scalar_rate),
+            scalar => scalar_rate(scalar),
+        }
+    }
+
     /// Did the caller leave this prior UNSET, or did they configure it?
     ///
     /// `RhoPrior::default()` is `Flat`, so "unset" and "explicitly asked for a
@@ -4593,6 +4632,61 @@ mod tests {
         assert!(!mixed.upper_tail_gradient_vanishes_everywhere(2));
         // Out of range is malformed, not flat.
         assert!(!mixed.upper_tail_gradient_vanishes(2));
+    }
+
+    /// The zero-smoothing tail law admits exactly the priors whose cost is
+    /// `rate·λ`: their slope in `λ` is the rate itself.
+    #[test]
+    fn lower_tail_rate_is_exact_for_linear_in_lambda_priors_only() {
+        assert_eq!(RhoPrior::Flat.lower_tail_linear_rate(0), Some(0.0));
+        assert_eq!(
+            RhoPrior::GammaPrecision {
+                shape: 1.0,
+                rate: 0.0
+            }
+            .lower_tail_linear_rate(0),
+            Some(0.0)
+        );
+        assert_eq!(
+            RhoPrior::GammaPrecision {
+                shape: 1.0,
+                rate: 0.75
+            }
+            .lower_tail_linear_rate(0),
+            Some(0.75),
+            "Gamma(1, rate) costs rate*lambda, whose lambda-slope is the rate"
+        );
+        assert_eq!(
+            RhoPrior::GammaPrecision {
+                shape: 2.0,
+                rate: 0.75
+            }
+            .lower_tail_linear_rate(0),
+            None,
+            "shape != 1 leaves the constant rho-gradient -(shape - 1)"
+        );
+        assert_eq!(
+            RhoPrior::Normal { mean: 0.0, sd: 3.0 }.lower_tail_linear_rate(0),
+            None
+        );
+        assert_eq!(
+            RhoPrior::PenalizedComplexity {
+                upper: 10.0,
+                tail_prob: 0.01
+            }
+            .lower_tail_linear_rate(0),
+            None
+        );
+        let mixed = RhoPrior::Independent(vec![
+            RhoPrior::GammaPrecision {
+                shape: 1.0,
+                rate: 2.0,
+            },
+            RhoPrior::Normal { mean: 0.0, sd: 3.0 },
+        ]);
+        assert_eq!(mixed.lower_tail_linear_rate(0), Some(2.0));
+        assert_eq!(mixed.lower_tail_linear_rate(1), None);
+        assert_eq!(mixed.lower_tail_linear_rate(2), None);
     }
 
     // -----------------------------------------------------------------------
