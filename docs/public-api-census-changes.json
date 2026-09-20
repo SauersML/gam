@@ -4832,5 +4832,15 @@
     },
     "reason": "The cone normalizer's EP now runs over u = m0 + Bz in whichever is smaller, the rows or the supported columns (#3130's support-space EP, ported onto main), with rank-one site updates. It no longer Gauss-Jordan inverts the q x q (I + WT) on every evaluation. The q-row machinery goes with it: inverse_i_plus_wt, log_det_i_plus_wt, the row-space posterior and quadratic_part, the 2q x 2q SiteMotionSystem and its linearized_fixed_point, and the row-space accessors normal_solves (R = M^-1 A^T) and retained_normals (A^T).",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3392 (fix-3299-support-space-ep, Fixes #3299) merged as 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af's own tree with --base 53dfd6479c37a261096d31a5bf0763668ca8a229 --head 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit3). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> 3fc95ce70aa6fc001ada60cd38d86a57ca2dc3af -- <its path> gives 0 for every item except posterior (19, other uses of the same word)."
+  },
+  {
+    "base": "d7fe081e520efd4424c57728a42de1c683b3fb66",
+    "removed": {
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_solve_gpu": 1,
+      "crates/gam-gpu/src/solver.rs::iterative_refinement_cholesky_solve": 1
+    },
+    "reason": "#3547: the fp32+refinement Cholesky is solution-only and returns Ok only for a residual inside its rounding band. cholesky_solve_gpu (callers: three tests) and the need_logdet flag of iterative_refinement_cholesky_solve paid an fp64 POTRF after the fp32 one for a logdet, strictly more work than the fp64 solve; iterative_refinement_cholesky_solve is folded into cholesky_solve_only_gpu, and cuda::cholesky_logdet, used only by that logdet path, goes with them. REFINEMENT_MAX_STEPS (3) was a fixed correction cap justified by a quadratic rate that fixed-factor refinement does not have; refinement_step_budget(p) = (p + 6)/12 derives the cap from the fp64 solve's cost, and refinement_verdict refuses once the measured linear contraction predicts the band past it.",
+    "evidence": "At base d7fe081e52 public_api_census.py reports exactly these three removals. git grep -w finds none of the three names in the head tree; the three GPU tests call cholesky_solve_only_gpu."
   }
 ]
