@@ -5379,6 +5379,76 @@ fn domain_fixes_the_bspline_interval_independently_of_the_sample() {
     assert_eq!(knot_span(bspline_spec(&cr, 0)), (-1.0, 2.0));
 }
 
+/// `knots=[...]` on a cubic regression spline gives its interior value knots:
+/// the basis is indexed by exactly those positions plus the two boundary knots
+/// (the data range, or `domain=` when given). The list used to be dropped and
+/// the default quantile-knot basis fitted instead. A list fixes the basis size,
+/// so it conflicts with `k=`. A periodic B-spline is a uniform cyclic grid that
+/// cannot take arbitrary positions, so it refuses the list rather than
+/// ignoring it. `knot_placement=` is a rule for generating knots; where no
+/// knots are generated from it (cr quantile knots, a periodic grid, or an
+/// explicit list) it is refused instead of being accepted and never read. The
+/// cr builder reads neither `degree=` nor `penalty_order=`, so values other
+/// than the cr's own cubic / second-derivative pair are refused too.
+#[test]
+fn explicit_knots_and_placement_are_honoured_or_refused() {
+    let wide = smooth_option_subrange(0.0, 1.0);
+    let value_knots = |formula: &str| -> Vec<f64> {
+        let spec = build_formula(formula, &wide);
+        match &bspline_spec(&spec, 0).knotspec {
+            BSplineKnotSpec::NaturalCubicRegression { knots } => knots.to_vec(),
+            other => panic!("`{formula}` must build cr value knots, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.3, 0.6])"),
+        vec![0.0, 0.3, 0.6, 1.0]
+    );
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.6, 0.3])"),
+        vec![0.0, 0.3, 0.6, 1.0]
+    );
+    assert_eq!(
+        value_knots("y ~ s(x, bs=cr, knots=[0.3, 0.6], domain=[-1, 2])"),
+        vec![-1.0, 0.3, 0.6, 2.0]
+    );
+    let cr = build_formula("y ~ s(x, bs=cr, knots=[0.25, 0.5, 0.75])", &wide);
+    let design = crate::smooth::build_term_collection_design(wide.values.view(), &cr)
+        .expect("an explicit cr value-knot list builds a design");
+    assert_eq!(design.design.nrows(), wide.values.nrows());
+
+    let conflict = formula_error("y ~ s(x, bs=cr, k=8, knots=[0.3])", &wide);
+    assert!(conflict.contains("not both"), "{conflict}");
+    let duplicate = formula_error("y ~ s(x, bs=cr, knots=[0.3, 0.3])", &wide);
+    assert!(duplicate.contains("duplicate"), "{duplicate}");
+    let outside = formula_error("y ~ s(x, bs=cr, knots=[0.3, 1.5])", &wide);
+    assert!(outside.contains("strictly inside"), "{outside}");
+
+    let periodic = formula_error("y ~ s(x, periodic=true, period=1, knots=[0.2, 0.5])", &wide);
+    assert!(periodic.contains("uniform cyclic grid"), "{periodic}");
+
+    let cr_placement = formula_error("y ~ s(x, bs=cr, knot_placement=uniform)", &wide);
+    assert!(cr_placement.contains("does not apply to bs=cr"), "{cr_placement}");
+    // A cr basis is cubic with a second-derivative penalty by construction;
+    // its own values are accepted, any other value is refused.
+    build_formula("y ~ s(x, bs=cr, degree=3, penalty_order=2)", &wide);
+    let cr_degree = formula_error("y ~ s(x, bs=cr, degree=2)", &wide);
+    assert!(cr_degree.contains("degree=2 does not apply to bs=cr"), "{cr_degree}");
+    let cr_order = formula_error("y ~ s(x, bs=cr, penalty_order=1)", &wide);
+    assert!(cr_order.contains("penalty_order=1 does not apply to bs=cr"), "{cr_order}");
+    let periodic_placement = formula_error(
+        "y ~ s(x, periodic=true, period=1, knot_placement=quantile)",
+        &wide,
+    );
+    assert!(
+        periodic_placement.contains("knot_placement= does not apply on a periodic axis"),
+        "{periodic_placement}"
+    );
+    let list_placement =
+        formula_error("y ~ s(x, knots=[0.3, 0.6], knot_placement=quantile)", &wide);
+    assert!(list_placement.contains("cannot be combined"), "{list_placement}");
+}
+
 /// A tensor smooth takes one domain interval per margin, `none` keeping a
 /// margin's data range, for both the default cr margins and B-spline margins.
 #[test]
