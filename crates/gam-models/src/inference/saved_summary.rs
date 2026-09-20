@@ -1304,11 +1304,12 @@ pub struct SummaryPayload {
     pub information_criteria: SummaryInformationCriteria,
     pub lambdas: Vec<f64>,
     pub coefficients: Vec<SummaryCoefficientRow>,
-    /// The Wald reference of `parametric_terms`: `"t"` (Student-t on the
-    /// residual degrees of freedom) when the scale is estimated, `"z"` when it
-    /// is known.
+    /// The reference of `parametric_terms`: `"t"` (Student-t on the residual
+    /// degrees of freedom) when the scale is estimated, `"z"` when it is known.
     pub parametric_statistic: Option<&'static str>,
-    /// Intercept and linear-term coefficients with their Wald tests.
+    /// Intercept and linear-term coefficients with their tests: the Wald ratio
+    /// for an unpenalized coefficient, the recorded variance-component score
+    /// test for a ridged linear term (gam#3573).
     pub parametric_terms: Vec<SummaryParametricTermRow>,
     /// Why `parametric_terms` could not be built; the same causes as
     /// `smooth_terms_unavailable` short of the smoothing-parameter layout.

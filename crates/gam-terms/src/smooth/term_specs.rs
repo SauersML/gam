@@ -2486,6 +2486,31 @@ impl TermCollectionDesign {
         Ok(self.design.apply(&beta.to_owned()) + &self.affine_offset)
     }
 
+    /// The linear terms whose coefficient carries the REML-selected
+    /// `LinearTermRidge` (`double_penalty=true`), as `(name, block-local range)`
+    /// entries of `linear_ranges`.
+    ///
+    /// Read off the recorded `penaltyinfo` — the block this build actually
+    /// emitted, whose `original_index` is the term's position in
+    /// `linear_ranges` — rather than re-derived from the spec. A ridged slope
+    /// is a variance component with its null on the boundary, so its
+    /// significance is the variance-component score test
+    /// (`inference::random_effect_test`), never a Wald ratio of the shrunk
+    /// estimate.
+    pub fn ridged_linear_ranges(&self) -> Vec<(String, Range<usize>)> {
+        self.penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.penalty.source,
+                    crate::basis::PenaltySource::Other(source) if source == "LinearTermRidge"
+                )
+            })
+            .filter_map(|info| self.linear_ranges.get(info.penalty.original_index))
+            .cloned()
+            .collect()
+    }
+
     /// Number of global penalty blocks that precede the smooth-term penalty
     /// blocks in the flat smoothing-parameter / EDF-trace layout.
     ///
