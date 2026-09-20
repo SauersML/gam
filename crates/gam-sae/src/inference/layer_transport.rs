@@ -462,38 +462,20 @@ fn fit_penalized_1d(
     )
     .map_err(|error| format!("penalized 1-D Gaussian REML failed: {error}"))?;
 
-    // If C = L⁻ᵀU is the cache's coefficient basis and δᵢ are the
-    // eigenvalues of L⁻¹SL⁻ᵀ, then the exact penalized inverse is
-    //     (XᵀWX + λS)⁻¹ = C diag((1 + λδᵢ)⁻¹) Cᵀ.
-    // Reconstruct that same inverse directly: no eigenvalue flooring and no
-    // representative-selecting ridge that would change the REML objective.
+    // The exact penalized inverse `(XᵀWX + λS)⁻¹` in the cache's spectral modes:
+    // no eigenvalue flooring and no representative-selecting ridge that would
+    // change the REML objective.
     let lambda = reml.lambda;
-    let coefficient_basis = &reml.cache.coefficient_basis;
-    let penalty_eigenvalues = &reml.cache.penalty_eigenvalues;
-    if coefficient_basis.dim() != (m, m) || penalty_eigenvalues.len() != m {
+    let a_inv = reml
+        .cache
+        .inverse_hessian(lambda)
+        .map_err(|error| format!("penalized 1-D REML inverse Hessian failed: {error}"))?;
+    if a_inv.dim() != (m, m) {
         return Err(format!(
-            "penalized 1-D REML cache shape drift: basis is {}x{}, spectrum has {}, expected {m}",
-            coefficient_basis.nrows(),
-            coefficient_basis.ncols(),
-            penalty_eigenvalues.len(),
+            "penalized 1-D REML inverse Hessian is {}x{}, expected {m}x{m}",
+            a_inv.nrows(),
+            a_inv.ncols(),
         ));
-    }
-    let mut a_inv = Array2::<f64>::zeros((m, m));
-    for i in 0..m {
-        let delta = penalty_eigenvalues[i];
-        let denominator = 1.0 + lambda * delta;
-        if !(delta.is_finite() && delta >= 0.0 && denominator.is_finite() && denominator > 0.0) {
-            return Err(format!(
-                "penalized 1-D REML cache has invalid mode {i}: delta={delta}, denominator={denominator}"
-            ));
-        }
-        let inverse_denominator = denominator.recip();
-        for j in 0..m {
-            let scaled_basis = coefficient_basis[[j, i]] * inverse_denominator;
-            for k in 0..m {
-                a_inv[[j, k]] += scaled_basis * coefficient_basis[[k, i]];
-            }
-        }
     }
 
     let beta = reml.coefficients;

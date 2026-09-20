@@ -5767,6 +5767,10 @@ fn set_batched_gaussian_reml_dict_items<'py>(
         result.cache_coefficient_basis.into_pyarray(py),
     )?;
     out.set_item(
+        "cache_data_null_basis",
+        result.cache_data_null_basis.into_pyarray(py),
+    )?;
+    out.set_item(
         "cache_xtwx_fingerprints",
         result.cache_xtwx_fingerprints.into_pyarray(py),
     )?;
