@@ -467,9 +467,34 @@ fn host_row_hessian_decision(
     Ok(decision)
 }
 
+/// Run a host-resident row-Hessian operation on the executor `decision`
+/// selects: a race returns the CPU product; a selected device's fault is
+/// returned, never recomputed on the CPU.
+fn on_selected_executor<T>(
+    decision: gam_gpu::GpuDecision,
+    cpu: impl FnOnce() -> T,
+    mut device: impl FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    if let Some(shape) = decision.race {
+        return gam_gpu::race_row_kernel(shape, || Ok(cpu()), || device().map(|_| ()));
+    }
+    if decision.use_gpu {
+        return device();
+    }
+    Ok(cpu())
+}
+
+/// The device executor of a platform that compiles none. The decision is
+/// admitted with `compiled: false` there, so it never selects this.
+#[cfg(not(target_os = "linux"))]
+fn no_device_executor<T>(operation: &str) -> Result<T, String> {
+    Err(format!(
+        "BMS {operation}: no device executor is compiled on this platform"
+    ))
+}
+
 /// `y_i = H_i · v_i` for every host-resident row, on the executor
-/// [`host_row_hessian_decision`] selects. A race returns the CPU product; a
-/// selected device's fault is returned, never recomputed on the CPU.
+/// [`host_row_hessian_decision`] selects.
 pub(crate) fn row_hessian_matvec(
     operation: &str,
     inputs: RowHessianMatvecInputs<'_>,
@@ -480,29 +505,24 @@ pub(crate) fn row_hessian_matvec(
         inputs.r,
         operation,
     )?;
-    #[cfg(target_os = "linux")]
-    {
-        let device = || {
-            crate::bms::gpu::flex::require_selected_gpu_result(
-                operation,
-                launch_row_hessian_matvec(inputs),
-            )
-            .map(|outputs| outputs.y_rows)
-        };
-        if let Some(shape) = decision.race {
-            return gam_gpu::race_row_kernel(
-                shape,
-                || Ok(cpu_row_hessian_matvec(&inputs)),
-                || device().map(|_| ()),
-            );
-        }
-        if decision.use_gpu {
-            return device();
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = decision;
-    Ok(cpu_row_hessian_matvec(&inputs))
+    on_selected_executor(
+        decision,
+        || cpu_row_hessian_matvec(&inputs),
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                crate::bms::gpu::flex::require_selected_gpu_result(
+                    operation,
+                    launch_row_hessian_matvec(inputs),
+                )
+                .map(|outputs| outputs.y_rows)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                no_device_executor(operation)
+            }
+        },
+    )
 }
 
 /// `diag(H_i)` for every host-resident row, on the executor
@@ -517,29 +537,24 @@ pub(crate) fn row_hessian_diag(
         inputs.r,
         operation,
     )?;
-    #[cfg(target_os = "linux")]
-    {
-        let device = || {
-            crate::bms::gpu::flex::require_selected_gpu_result(
-                operation,
-                launch_row_hessian_diag(inputs),
-            )
-            .map(|outputs| outputs.d_rows)
-        };
-        if let Some(shape) = decision.race {
-            return gam_gpu::race_row_kernel(
-                shape,
-                || Ok(cpu_row_hessian_diag(&inputs)),
-                || device().map(|_| ()),
-            );
-        }
-        if decision.use_gpu {
-            return device();
-        }
-    }
-    #[cfg(not(target_os = "linux"))]
-    let _ = decision;
-    Ok(cpu_row_hessian_diag(&inputs))
+    on_selected_executor(
+        decision,
+        || cpu_row_hessian_diag(&inputs),
+        || {
+            #[cfg(target_os = "linux")]
+            {
+                crate::bms::gpu::flex::require_selected_gpu_result(
+                    operation,
+                    launch_row_hessian_diag(inputs),
+                )
+                .map(|outputs| outputs.d_rows)
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                no_device_executor(operation)
+            }
+        },
+    )
 }
 
 /// CPU execution of the same per-row Hessian matvec.
