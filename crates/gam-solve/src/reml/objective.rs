@@ -1729,8 +1729,7 @@ impl<'a> RemlState<'a> {
         // reproduces the caller's `H`, and declines otherwise, so a Firth term,
         // an active-constraint projection or a frame mismatch keeps the
         // assembled value rather than silently getting the wrong one.
-        let root_lambdas: Vec<f64> =
-            gam_problem::checked_exp_log_strengths(rho.iter().copied()).unwrap_or_default();
+        let root_lambdas: Vec<f64> = gam_problem::checked_exp_log_strengths(rho.iter().copied())?;
         let root_penalties = bundle.applied_canonical_penalties(&self.canonical_penalties)?;
         let root_inputs = super::laml_logdet::HessianRootInputs {
             design: self.x(),
