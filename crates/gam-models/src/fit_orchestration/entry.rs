@@ -670,12 +670,22 @@ fn deterministic_gaussian_standard_fit(
             // residual≡0 invariant even though the mathematical mean is
             // unchanged.
             let intercept = request.y[0] - request.offset[0];
-            let mut beta = Array1::<f64>::zeros(p);
-            for col in design.intercept_range.clone() {
-                if col < p {
-                    beta[col] = intercept;
-                }
+            // Dispatch only takes this branch for a spec with a global
+            // intercept; the realized design must agree, or the constant
+            // would land on no column (or on several) and the fit published
+            // as exact would not reproduce `y`.
+            if design.intercept_range.len() != 1 || design.intercept_range.end > p {
+                return Err(raised_fit_failure(
+                    FailureCategory::Invariant,
+                    format!(
+                        "constant-response Gaussian shortcut needs exactly one intercept \
+                         column, got {:?} in a design of width {p}",
+                        design.intercept_range,
+                    ),
+                ));
             }
+            let mut beta = Array1::<f64>::zeros(p);
+            beta[design.intercept_range.start] = intercept;
             (beta, vec![DeterministicPenaltyFace::Infinite; n_penalties])
         }
     };
@@ -1284,6 +1294,14 @@ fn gaussian_response_is_constant(request: &StandardFitRequest<'_>) -> bool {
     if gam_terms::smooth::term_collection_has_nonzero_anchor(&request.spec) {
         return false;
     }
+    // The shortcut carries the constant on the global intercept column. A
+    // design without one (`0 + x`, `0 + factor`, an anchored B-spline gauging
+    // the level) has nowhere to put it: β = 0 would leave η = offset ≠ y and
+    // still be certified exact with φ̂ = 0. Such models go to the exact-boundary
+    // certificate, which proves exactness from the realized design instead.
+    if !gam_terms::smooth::term_collection_has_global_intercept(&request.spec) {
+        return false;
+    }
     // The intercept-only shortcut is exact — residual ≡ 0 — precisely when the
     // OFFSET-ADJUSTED response `y − offset` is constant: then `η = offset +
     // intercept = y` at every row. Testing the raw `y` alone would (a) miss an
@@ -1604,6 +1622,65 @@ mod square_exact_gaussian_design_tests {
                 panic!("square-design interpolation was certified as an exact fit")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod constant_response_intercept_tests {
+    use super::*;
+    use csv::StringRecord;
+    use gam_data::encode_recordswith_inferred_schema;
+
+    fn constant_response() -> Dataset {
+        let headers: Vec<String> = ["x", "y"].iter().map(|h| h.to_string()).collect();
+        let rows = (0..40)
+            .map(|i| {
+                let x = 0.1 + 0.05 * i as f64;
+                StringRecord::from(vec![x.to_string(), "5".to_string()])
+            })
+            .collect();
+        encode_recordswith_inferred_schema(headers, rows).expect("encode")
+    }
+
+    fn standard_request<'a>(formula: &str, data: &'a Dataset) -> StandardFitRequest<'a> {
+        let config = FitConfig {
+            family: Some("gaussian".to_string()),
+            ..FitConfig::default()
+        };
+        match materialize(formula, data, &config)
+            .expect("materialize")
+            .request
+        {
+            FitRequest::Standard(request) => request,
+            _ => panic!("a Gaussian linear formula materializes a standard request"),
+        }
+    }
+
+    /// The constant-response shortcut places `y - offset` on the global
+    /// intercept column. With the intercept removed (`0 + x`) there is no
+    /// such column, so the shortcut would publish β = 0 — fitted η = 0 while
+    /// y = 5 — as an exact fit with φ̂ = 0 and zero covariance. The shortcut
+    /// must decline, and the exact-boundary certificate must refuse a design
+    /// that cannot reproduce the response.
+    #[test]
+    fn no_intercept_constant_response_is_not_an_exact_fit() {
+        let data = constant_response();
+        let with_intercept = standard_request("y ~ x", &data);
+        assert!(
+            gaussian_response_is_constant(&with_intercept),
+            "a constant response under an intercept is the exact intercept-only fit"
+        );
+
+        let request = standard_request("y ~ 0 + x", &data);
+        assert!(
+            !gaussian_response_is_constant(&request),
+            "no intercept column can carry the constant"
+        );
+        let route = try_deterministic_gaussian_standard_fit(&request).expect("route");
+        assert!(
+            matches!(route, GaussianStandardRoute::Iterative(_)),
+            "y = 5 is not in the span of 0 + x, so the fit is not exact"
+        );
     }
 }
 
