@@ -264,15 +264,20 @@ fn inner_with_abs(row: ArrayView1<f64>, x: ArrayView1<f64>) -> (f64, f64) {
 /// The log weights and their evaluation radii `e_s` come from gam-math's
 /// categorical owner, [`log_softmax_with_error`]. A logit within `r_s` of exact
 /// moves `ℓ_s` by `r_s` and `lse ℓ` by at most `max_t r_t`, so each log weight is
-/// within `b_s = r_s + max_t r_t + e_s` of exact. The weight `exp(log p_s)` adds
-/// one libm ulp, so its radius is `w_s (expm1(b_s) + ε)`.
+/// within `b_s = r_s + max_t r_t + e_s` of exact. `exp` is monotone, so the exact
+/// weight lies in `[exp(ℓ̂_s − b_s), exp(ℓ̂_s + b_s)]`. Each endpoint's argument is
+/// rounded outward and libm's `exp` is within one ulp, so one ulp step outward on each
+/// endpoint encloses it. The radius is the farther endpoint's distance from `ŵ_s`,
+/// rounded up. The ulp is absolute, not relative, and that matters: in the subnormal
+/// range it is `2^-1074`, and a weight that underflowed to `ŵ_s = 0` still has a
+/// positive exact weight up to `exp(ℓ̂_s + b_s)`. A relative bound `ŵ_s (expm1(b_s) + ε)`
+/// would give that weight a radius of zero. For a normal weight in a narrow box, the
+/// endpoints agree with that relative bound to first order.
 ///
 /// Every exact weight lies in `[0, 1]` whatever the logits, so it is also within
 /// `max(ŵ_s, 1 − ŵ_s)` of the computed one, and the radius is the smaller bound. A
-/// narrow box keeps the first; a wide one (a box of component masks) makes `expm1(b_s)`
-/// overflow, where `ŵ_s · ∞` is infinite, or `0 · ∞`, no number at all, for a weight that
-/// underflowed. So the range bound holds the radius finite and every weight's radius is a
-/// number.
+/// narrow box keeps the endpoint bound. A wide one (a box of component masks) makes the
+/// upper endpoint overflow to `∞`, and the range bound keeps the radius finite.
 fn attention_weights(logits: &[f64], logit_radius: &[f64]) -> Result<(Vec<f64>, Vec<f64>), CategoricalError> {
     let (log_weights, evaluation_radius) = log_softmax_with_error(logits)?;
     let widest = logit_radius.iter().copied().fold(0.0, f64::max);
@@ -281,10 +286,12 @@ fn attention_weights(logits: &[f64], logit_radius: &[f64]) -> Result<(Vec<f64>, 
     for ((&log_weight, &evaluation), &own) in log_weights.iter().zip(&evaluation_radius).zip(logit_radius) {
         let weight = log_weight.exp();
         weights.push(weight);
-        let growth = (own + widest + evaluation).exp_m1() + f64::EPSILON;
-        let boxed = if growth.is_finite() { weight * growth } else { f64::INFINITY };
+        let band = ((own + widest).next_up() + evaluation).next_up();
+        let highest = (log_weight + band).next_up().exp().next_up();
+        let lowest = (log_weight - band).next_down().exp().next_down().max(0.0);
+        let reach = (highest - weight).next_up().max((weight - lowest).next_up());
         let range = (1.0 - weight).next_up().max(weight);
-        radius.push(boxed.min(range));
+        radius.push(reach.min(range));
     }
     Ok((weights, radius))
 }
@@ -1896,7 +1903,8 @@ mod tests {
     /// A logit box too wide for `expm1` keeps every weight's radius a finite number within the
     /// weight's `[0, 1]` range: a weight near one, one that underflows to zero (where the box bound
     /// alone is `0 · ∞`), and one in between. The exact weights at the box's corners stay within
-    /// the radii. Control: a narrow box's radius is its box bound `w (expm1(b) + ε)`, bit for bit.
+    /// the radii. Control: a narrow box's radius is its first-order box bound `w (expm1(b) + ε)`
+    /// up to the endpoints' outward rounding.
     #[test]
     fn a_wide_logit_box_keeps_every_weight_radius_a_finite_number_in_the_unit_range() {
         let logits = [0.0, -800.0, -0.5];
@@ -1930,8 +1938,48 @@ mod tests {
         for s in 0..logits.len() {
             let boxed = weights[s] * ((narrow[s] + 1.0e-3 + evaluation[s]).exp_m1() + f64::EPSILON);
             assert_eq!(weights[s].to_bits(), log_weights[s].exp().to_bits());
-            assert_eq!(radius[s].to_bits(), boxed.to_bits(), "weight {s}: a narrow box keeps its box bound");
+            // The endpoints' outward roundings add a few ε to the relative bound, which is
+            // below 1e-9 of `expm1(2e-3)`. An underflowed weight keeps its two subnormal ulps.
+            assert!(
+                radius[s] >= boxed * (1.0 - 1.0e-9) && radius[s] <= boxed * (1.0 + 1.0e-9) + f64::from_bits(2),
+                "weight {s}: a narrow box keeps its first-order box bound {boxed}, got {}",
+                radius[s]
+            );
         }
+    }
+
+    /// A weight that underflows to zero in a logit box that is finite but wide enough to lift
+    /// it back above zero keeps a radius that encloses the exact weights at the box's corners.
+    /// The relative box bound `ŵ (expm1(b) + ε)` is `0` there, but the exact weight at the
+    /// raised corner is `exp(-720)`, a positive subnormal. Control: the weight that stays near
+    /// one keeps a finite radius within its range.
+    #[test]
+    fn an_underflowed_weight_in_a_finite_box_keeps_a_radius_enclosing_the_exact_weight() {
+        let logits = [0.0, -760.0];
+        let finite = [20.0; 2];
+        let (weights, radius) = attention_weights(&logits, &finite).expect("finite logits");
+        assert_eq!(weights[1], 0.0, "the second weight underflows");
+        assert!(radius[1] > 0.0, "an underflowed weight's exact value is positive");
+        for raised in 0..logits.len() {
+            let corner: Vec<f64> = logits
+                .iter()
+                .enumerate()
+                .map(|(t, &logit)| if t == raised { logit + finite[t] } else { logit - finite[t] })
+                .collect();
+            let (exact, _) = attention_weights(&corner, &[0.0; 2]).expect("finite corner logits");
+            if raised == 1 {
+                assert!(exact[1] > 0.0, "the raised corner lifts the weight out of underflow");
+            }
+            for s in 0..logits.len() {
+                assert!(
+                    (exact[s] - weights[s]).abs() <= radius[s],
+                    "corner {raised}, weight {s}: {} moved past {}",
+                    exact[s],
+                    radius[s]
+                );
+            }
+        }
+        assert!(radius[0].is_finite() && radius[0] <= (1.0 - weights[0]).next_up().max(weights[0]));
     }
 
     #[test]

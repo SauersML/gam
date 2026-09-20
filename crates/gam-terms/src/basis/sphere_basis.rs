@@ -616,6 +616,40 @@ pub(crate) fn fill_real_spherical_harmonics_row(
 /// Highest spherical-harmonic degree the dense harmonic engine evaluates.
 pub(crate) const SPHERICAL_HARMONIC_MAX_DEGREE: usize = 32;
 
+/// Column target of the provisioned harmonic sphere default: mgcv's `sos`
+/// default of 50 columns (`L = 6`, `L(L+2) = 48`).
+const PROVISIONED_HARMONIC_TARGET_COLUMNS: f64 = 50.0;
+
+/// Rows per column of the provisioned harmonic sphere default at small `n`.
+const PROVISIONED_HARMONIC_ROWS_PER_COLUMN: f64 = 4.0;
+
+/// Smallest column target of the provisioned harmonic sphere default.
+const PROVISIONED_HARMONIC_MIN_COLUMNS: f64 = 3.0;
+
+/// Highest degree of the provisioned harmonic sphere default (168 columns).
+const PROVISIONED_HARMONIC_MAX_DEGREE: usize = 12;
+
+/// Lowest degree of the provisioned harmonic sphere default.
+const PROVISIONED_HARMONIC_MIN_DEGREE: usize = 2;
+
+/// Provisioned degree `L` of the harmonic sphere basis for `n_rows` rows: the
+/// formula default, which only a basis the standard workflow grows replaces
+/// with its pilot ([`default_spherical_harmonic_degree`], via
+/// `smooth::starting_resolution`); every other route keeps the basis it is
+/// given. The least `L` whose span `L(L+2)` reaches `n/4` columns, at most 50
+/// and at least 3, held to degrees 2..=12: the pre-#3191 default, restored
+/// because #3191's pilot replaced it on routes with nothing to grow it (#3149).
+pub(crate) fn provisioned_spherical_harmonic_degree(n_rows: usize) -> usize {
+    let target_cols = ((n_rows as f64) / PROVISIONED_HARMONIC_ROWS_PER_COLUMN)
+        .min(PROVISIONED_HARMONIC_TARGET_COLUMNS)
+        .max(PROVISIONED_HARMONIC_MIN_COLUMNS);
+    let mut l = 1usize;
+    while (l as f64) * (l as f64 + 2.0) < target_cols && l < PROVISIONED_HARMONIC_MAX_DEGREE {
+        l += 1;
+    }
+    l.max(PROVISIONED_HARMONIC_MIN_DEGREE)
+}
+
 /// Pilot degree `L` of the harmonic sphere basis when the user does not set
 /// `max_degree`, for `n_rows` rows under an order-`penalty_order` Laplace–
 /// Beltrami penalty.

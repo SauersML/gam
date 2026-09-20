@@ -596,25 +596,22 @@ impl std::error::Error for SaeFitError {
 pub(crate) fn certify_outer_stage(
     objective: SaeManifoldOuterObjective,
     stage: SaeFitStage,
-    run_result: Result<OuterResult, EstimationError>,
+    run_result: Result<super::SaeOuterRun, EstimationError>,
 ) -> Result<SaeManifoldOuterObjective, SaeFitError> {
     match run_result {
-        Ok(result) if result.converged() => {
-            let mut objective = objective;
-            match objective.certify_outer_result(&result) {
-                Ok(()) => Ok(objective),
-                Err(refusal) => Err(SaeFitError::OuterDidNotConverge {
-                    stage,
-                    result: Box::new(result),
-                    certification_refusal: Some(refusal),
-                }),
-            }
-        }
-        Ok(result) => Err(SaeFitError::OuterDidNotConverge {
+        Ok(super::SaeOuterRun::Certified(_)) => Ok(objective),
+        Ok(super::SaeOuterRun::Unconverged(result)) => Err(SaeFitError::OuterDidNotConverge {
             stage,
             result: Box::new(result),
             certification_refusal: None,
         }),
+        Ok(super::SaeOuterRun::Refused { result, reason }) => {
+            Err(SaeFitError::OuterDidNotConverge {
+                stage,
+                result: Box::new(result),
+                certification_refusal: Some(reason),
+            })
+        }
         Err(source) => Err(SaeFitError::OuterRun { stage, source }),
     }
 }
@@ -737,12 +734,14 @@ fn fit_outer_stage_to_boundary(
             let problem = OuterProblem::new(rho_flat.len())
                 .with_problem_size(target.len(), p_beta)
                 .with_initial_rho(rho_flat);
-            match problem.run(&mut objective, "SAE manifold") {
-                Ok(result) if result.converged() => {
-                    return certify_outer_stage(objective, stage, Ok(result))
+            match objective.run_to_certificate(&problem, "SAE manifold") {
+                Ok(
+                    run @ (super::SaeOuterRun::Certified(_) | super::SaeOuterRun::Refused { .. }),
+                ) => {
+                    return certify_outer_stage(objective, stage, Ok(run))
                         .map(SaeStageFit::Certified);
                 }
-                Ok(result) => {
+                Ok(super::SaeOuterRun::Unconverged(result)) => {
                     let terminal_rho = Array1::from(result.rho.clone());
                     match objective.vanished_stage_state_at(terminal_rho.view()) {
                         Ok(Some(state)) => Some(state),
