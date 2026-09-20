@@ -17,7 +17,9 @@ use super::*;
 /// authorizing a degraded fallback direction.
 #[derive(Clone, Debug)]
 pub(crate) enum OuterGradientError {
-    /// Near-singular or ill-conditioned joint Hessian at a feasible ρ.
+    /// Near-singular B-cache pivots on the test-only dense deflated-solver
+    /// oracle lane (`outer_gradient_arrow_solver`).
+    #[cfg(test)]
     IllConditioned { reason: String },
     /// A non-identifiable / gauge-degenerate direction at this ρ.
     NonIdentifiable { reason: String },
@@ -42,8 +44,8 @@ impl OuterGradientError {
     ///
     /// A genuine rank-deficiency / near-singularity failure (a back-solve or
     /// Cholesky/Woodbury factor that tripped on a finite, correctly-shaped input)
-    /// is a legitimate #1273 conditioning failure and keeps `conditioning_err`
-    /// (`IllConditioned`). A
+    /// is a legitimate #1273 conditioning failure and keeps the caller's
+    /// `conditioning_err` class. A
     /// shape/dimension mismatch or a non-finite intermediate is an
     /// internal-invariant defect and MUST propagate ([`Self::internal`]) instead
     /// of being masked as a plausible-but-wrong descent direction — exactly the
@@ -77,6 +79,7 @@ impl OuterGradientError {
 impl std::fmt::Display for OuterGradientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            #[cfg(test)]
             Self::IllConditioned { reason } => write!(f, "ill-conditioned: {reason}"),
             Self::NonIdentifiable { reason } => write!(f, "non-identifiable: {reason}"),
             Self::InternalInvariant { reason } => write!(f, "internal invariant: {reason}"),
@@ -97,8 +100,11 @@ impl From<OuterGradientError> for EstimationError {
     fn from(error: OuterGradientError) -> Self {
         let reason = error.to_string();
         match error {
-            OuterGradientError::IllConditioned { .. }
-            | OuterGradientError::NonIdentifiable { .. } => {
+            #[cfg(test)]
+            OuterGradientError::IllConditioned { .. } => {
+                EstimationError::TrialPointRefused { reason }
+            }
+            OuterGradientError::NonIdentifiable { .. } => {
                 EstimationError::TrialPointRefused { reason }
             }
             OuterGradientError::InternalInvariant { .. } => {

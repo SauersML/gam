@@ -288,6 +288,7 @@ impl SaeManifoldTerm {
     /// Orthonormal analytic chart-gauge basis in one assembled arrow layout.
     /// Both dense exact-A quotient geometry and matrix-free arrow consumers use
     /// this basis, so the physical subspace cannot depend on representation.
+    #[cfg(test)]
     pub(crate) fn joint_chart_gauge_basis_for_arrow_layout(
         &self,
         row_offsets: &[usize],

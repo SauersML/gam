@@ -129,7 +129,9 @@ pub(crate) use gam_linalg::faer_ndarray::{FaerCholesky, FaerCholeskyFactor, Faer
 
 pub(crate) use gam_linalg::triangular::cholesky_solve_vector;
 
-pub(crate) use gam_solve::arrow_schur::{ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning, arrow_factor_max_pivot, arrow_factor_min_pivot, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options};
+#[cfg(test)]
+pub(crate) use gam_solve::arrow_schur::{arrow_factor_max_pivot, arrow_factor_min_pivot};
+pub(crate) use gam_solve::arrow_schur::{ArrowFactorCache, ArrowRowGaugeDeflation, RowDeflationSpectrum, RowSpectralConditioning, probe_undamped_evidence_row_factors, solve_arrow_newton_step_with_options};
 
 // #988 memory-matrix-free criterion log-det: the reduced-Schur SLQ entry point
 // and its shared tuning constants, used when the dense k×k Schur exceeds budget.

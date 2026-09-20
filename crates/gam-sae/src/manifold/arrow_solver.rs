@@ -6,6 +6,7 @@ pub(crate) struct SaeArrowVector {
     pub beta: Array1<f64>,
 }
 
+#[cfg(test)]
 pub(crate) struct DeflatedArrowSolver<'a> {
     pub(crate) cache: &'a ArrowFactorCache,
     pub(crate) gauge_basis: Vec<Array1<f64>>,
@@ -16,6 +17,7 @@ pub(crate) struct DeflatedArrowSolver<'a> {
     pub(crate) gauge_stiffness: f64,
 }
 
+#[cfg(test)]
 impl<'a> DeflatedArrowSolver<'a> {
     pub(crate) fn plain(cache: &'a ArrowFactorCache) -> Self {
         Self {

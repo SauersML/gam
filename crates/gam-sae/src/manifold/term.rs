@@ -14,8 +14,10 @@ pub(crate) const SAE_MANIFOLD_MAX_LINESEARCH_HALVINGS: usize = 12;
 /// Once `min_pivot / max_pivot` is below this floor, the gradient lane must
 /// either identify a closed-form gauge orbit and stiffen only that quotient
 /// direction, or reject the trial rho as numerically singular.
+#[cfg(test)]
 pub(crate) const SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR: f64 = 1.0e-12;
 
+#[cfg(test)]
 pub(crate) const SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR: f64 = 1.0e-8;
 
 /// Relative spectral cutoff below which a penalised decoder β-curvature

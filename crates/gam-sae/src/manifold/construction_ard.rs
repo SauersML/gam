@@ -717,6 +717,7 @@ impl SaeManifoldTerm {
     /// `ExactObservedInformation` differentiates `A`'s unmajorized `α·cos κt`.
     /// It must agree with the operator whose inverse `solver` factors, which is
     /// why every trace entry point takes it explicitly rather than defaulting.
+    #[cfg(test)]
     pub(crate) fn ard_log_precision_hessian_trace(
         &self,
         rho: &SaeManifoldRho,

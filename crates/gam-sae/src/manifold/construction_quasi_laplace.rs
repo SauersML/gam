@@ -2176,6 +2176,7 @@ impl SaeManifoldTerm {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn outer_gradient_arrow_solver<'a>(
         &'a self,
         cache: &'a ArrowFactorCache,
@@ -2488,6 +2489,7 @@ impl SaeManifoldTerm {
             .map_err(|err| OuterGradientError::classify_arrow_solver_error(&err, conditioning_err))
     }
 
+    #[cfg(test)]
     pub(crate) fn outer_gradient_conditioning_error(
         cache: &ArrowFactorCache,
     ) -> Result<(), OuterGradientError> {
@@ -3866,6 +3868,7 @@ impl SaeManifoldTerm {
         Ok(per_atom)
     }
 
+    #[cfg(test)]
     pub(crate) fn assignment_log_strength_hessian_trace(
         &self,
         rho: &SaeManifoldRho,
