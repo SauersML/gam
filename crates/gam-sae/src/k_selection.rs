@@ -251,9 +251,9 @@ pub struct KSelectionConfig {
     /// smallest `K` is returned.
     pub flat_span_tol: f64,
     /// The fit-measured coding ingredients for [`KSelectionMode::MeasuredMdl`].
-    /// `None` on the `Kneedle` / `PenalizedMdl` paths (they do not need it). When
-    /// the mode is `MeasuredMdl` but this is `None`, [`select_k`] falls back to
-    /// `Kneedle` (nothing to measure with).
+    /// `None` on the `Kneedle` / `PenalizedMdl` paths (they do not need it). The
+    /// `MeasuredMdl` mode requires it: [`select_k`] refuses the measured rule
+    /// without its ingredients rather than substituting the tuned knee.
     pub measured_coding: Option<MeasuredCoding>,
 }
 
@@ -339,18 +339,31 @@ pub struct KSelection {
 /// smallest) `K` is returned with the corresponding [`KSelectionFlag`] so the
 /// caller can decide whether to widen the sweep rather than trusting a spurious
 /// elbow.
-pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
+///
+/// Errors when the mode is [`KSelectionMode::MeasuredMdl`] but
+/// [`KSelectionConfig::measured_coding`] is `None`: the measured rule has
+/// nothing to measure with, and answering with the tuned knee instead would
+/// report a knob's choice as the tuning-free one.
+pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> Result<KSelection, String> {
+    let measured_coding = match config.mode {
+        KSelectionMode::MeasuredMdl => Some(config.measured_coding.ok_or_else(|| {
+            "select_k: the measured MDL rule needs the fit-measured coding ingredients \
+             (d_eff_atom, n_eff, n_rows, k_bar, d_bar); none were supplied"
+                .to_string()
+        })?),
+        KSelectionMode::Kneedle | KSelectionMode::PenalizedMdl => None,
+    };
     let pts = curve.points();
     let n = pts.len();
 
     // Single point: nothing to choose.
     if n == 1 {
-        return KSelection {
+        return Ok(KSelection {
             k: pts[0].k,
             ev: pts[0].ev,
             flag: KSelectionFlag::Flat,
             score: 0.0,
-        };
+        });
     }
 
     // Already-saturated curve (EV barely moves): smallest K wins.
@@ -358,23 +371,19 @@ pub fn select_k(curve: &EvVsKCurve, config: &KSelectionConfig) -> KSelection {
     let ev_max = pts.iter().map(|p| p.ev).fold(f64::NEG_INFINITY, f64::max);
     let span = ev_max - ev_min;
     if span <= config.flat_span_tol {
-        return KSelection {
+        return Ok(KSelection {
             k: pts[0].k,
             ev: pts[0].ev,
             flag: KSelectionFlag::Flat,
             score: span,
-        };
+        });
     }
 
-    match config.mode {
-        KSelectionMode::Kneedle => select_kneedle(curve, config, span),
-        KSelectionMode::PenalizedMdl => select_mdl(curve, config),
-        KSelectionMode::MeasuredMdl => match config.measured_coding {
-            Some(coding) => select_measured(curve, &coding),
-            // No coding ingredients to measure with: fall back to the knee.
-            None => select_kneedle(curve, config, span),
-        },
-    }
+    Ok(match measured_coding {
+        Some(coding) => select_measured(curve, &coding),
+        None if config.mode == KSelectionMode::PenalizedMdl => select_mdl(curve, config),
+        None => select_kneedle(curve, config, span),
+    })
 }
 
 /// The Theorem-4 measured MDL stopping rule ([`KSelectionMode::MeasuredMdl`]).
@@ -651,15 +660,15 @@ pub struct AutoKRecommendation {
 /// This is the intended battery entry point: feed it the manifold and linear
 /// EV-vs-`K` sweeps measured on real OLMo L25 activations and the returned
 /// [`AutoKRecommendation::selection`] is the engine's auto-`K`, ready to be
-/// checked against the human-chosen `K`.
+/// checked against the human-chosen `K`. Errors exactly when [`select_k`] does.
 pub fn recommend_auto_k(
     manifold: &EvVsKCurve,
     linear: &EvVsKCurve,
     config: &KSelectionConfig,
     manifold_params_per_atom: f64,
     linear_params_per_atom: f64,
-) -> AutoKRecommendation {
-    let selection = select_k(manifold, config);
+) -> Result<AutoKRecommendation, String> {
+    let selection = select_k(manifold, config)?;
     let advantage = manifold_vs_linear_advantage(
         manifold,
         linear,
@@ -667,10 +676,10 @@ pub fn recommend_auto_k(
         manifold_params_per_atom,
         linear_params_per_atom,
     );
-    AutoKRecommendation {
+    Ok(AutoKRecommendation {
         selection,
         advantage,
-    }
+    })
 }
 
 /// Build an [`EvVsKCurve`] from explicit `(K, EV)` pairs, e.g. the columns the
@@ -782,7 +791,7 @@ mod k_selection_tests {
     #[test]
     fn kneedle_picks_the_elbow() {
         let curve = knee_curve();
-        let sel = select_k(&curve, &KSelectionConfig::default());
+        let sel = select_k(&curve, &KSelectionConfig::default()).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::Knee);
         assert_eq!(sel.k, 4, "knee should sit at the saturation corner K=4");
         assert!((sel.ev - 0.90).abs() < 1e-9);
@@ -793,7 +802,7 @@ mod k_selection_tests {
         // EV grows exactly linearly in K: no curvature, no knee.
         let curve = curve_from_pairs(&[(1, 0.10), (2, 0.20), (3, 0.30), (4, 0.40), (5, 0.50)])
             .expect("linear curve");
-        let sel = select_k(&curve, &KSelectionConfig::default());
+        let sel = select_k(&curve, &KSelectionConfig::default()).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::Linear);
         assert_eq!(sel.k, 5, "linear curve returns the largest K");
     }
@@ -808,7 +817,7 @@ mod k_selection_tests {
             knee_slope_fraction: 0.01,
             ..KSelectionConfig::default()
         };
-        let sel = select_k(&curve, &cfg);
+        let sel = select_k(&curve, &cfg).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::NoKnee);
         assert_eq!(sel.k, 5);
     }
@@ -817,7 +826,7 @@ mod k_selection_tests {
     fn flat_curve_returns_smallest_k() {
         let curve =
             curve_from_pairs(&[(1, 0.900), (2, 0.9000001), (4, 0.9000002)]).expect("flat curve");
-        let sel = select_k(&curve, &KSelectionConfig::default());
+        let sel = select_k(&curve, &KSelectionConfig::default()).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::Flat);
         assert_eq!(sel.k, 1, "already-saturated curve returns smallest K");
     }
@@ -825,7 +834,7 @@ mod k_selection_tests {
     #[test]
     fn single_point_curve_is_flat() {
         let curve = curve_from_pairs(&[(7, 0.5)]).expect("single point");
-        let sel = select_k(&curve, &KSelectionConfig::default());
+        let sel = select_k(&curve, &KSelectionConfig::default()).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::Flat);
         assert_eq!(sel.k, 7);
     }
@@ -838,7 +847,7 @@ mod k_selection_tests {
             complexity_penalty: 0.05,
             ..KSelectionConfig::default()
         };
-        let sel = select_k(&curve, &cfg);
+        let sel = select_k(&curve, &cfg).expect("select_k");
         // MDL trades EV gain against K/K_max=K/32. Past the knee the EV gain is
         // tiny while the size penalty keeps growing, so the optimum is interior.
         assert!(
@@ -861,7 +870,7 @@ mod k_selection_tests {
             complexity_penalty: 0.0,
             ..KSelectionConfig::default()
         };
-        let sel = select_k(&curve, &cfg);
+        let sel = select_k(&curve, &cfg).expect("select_k");
         // With no complexity penalty, max EV (largest K) wins.
         assert_eq!(sel.k, 32);
     }
@@ -941,7 +950,8 @@ mod k_selection_tests {
             (32, 0.93),
         ])
         .expect("linear curve");
-        let rec = recommend_auto_k(&manifold, &linear, &KSelectionConfig::default(), 10.0, 10.0);
+        let rec = recommend_auto_k(&manifold, &linear, &KSelectionConfig::default(), 10.0, 10.0)
+            .expect("recommend_auto_k");
         assert_eq!(rec.selection.k, 4);
         assert_eq!(rec.selection.flag, KSelectionFlag::Knee);
         // At the auto-K EV (0.90) linear needs K=16; equal per-atom parameter
@@ -1056,7 +1066,7 @@ mod k_selection_tests {
         // selected K = 11.
         let (_p, coding) = saturating_coding(1.0 / 15.5);
         let curve = saturating_curve(5.0, 40);
-        let sel = select_k(&curve, &KSelectionConfig::measured(coding));
+        let sel = select_k(&curve, &KSelectionConfig::measured(coding)).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::Knee, "measured rule should bind");
         assert_eq!(sel.k, 11, "selected K = last atom that paid for itself");
         assert!(sel.score < 1.0, "marginal below threshold at the stop");
@@ -1067,7 +1077,7 @@ mod k_selection_tests {
         // Tiny c → threshold ≈ 0 → every atom always pays → NoKnee at K_max.
         let (_p, coding) = saturating_coding(1e-9);
         let curve = saturating_curve(5.0, 25);
-        let sel = select_k(&curve, &KSelectionConfig::measured(coding));
+        let sel = select_k(&curve, &KSelectionConfig::measured(coding)).expect("select_k");
         assert_eq!(sel.flag, KSelectionFlag::NoKnee, "must reproduce NoKnee");
         assert_eq!(sel.k, 25, "NoKnee returns K_max");
     }
@@ -1077,8 +1087,8 @@ mod k_selection_tests {
         let curve = saturating_curve(5.0, 40);
         let (_pe, expensive) = saturating_coding(1.0 / 6.5); // K > 2.5 → selected 2
         let (_pc, cheap) = saturating_coding(1.0 / 15.5); // selected 11
-        let k_exp = select_k(&curve, &KSelectionConfig::measured(expensive)).k;
-        let k_cheap = select_k(&curve, &KSelectionConfig::measured(cheap)).k;
+        let k_exp = select_k(&curve, &KSelectionConfig::measured(expensive)).expect("select_k").k;
+        let k_cheap = select_k(&curve, &KSelectionConfig::measured(cheap)).expect("select_k").k;
         assert_eq!(k_exp, 2);
         assert!(
             k_exp < k_cheap,
@@ -1086,18 +1096,25 @@ mod k_selection_tests {
         );
     }
 
+    /// The measured rule without its ingredients is refused, never answered by
+    /// the tuned knee: that would report `knee_slope_fraction`'s choice as the
+    /// tuning-free one (#3600). The refusal holds on every curve shape,
+    /// including the single-point and flat early exits.
     #[test]
-    fn measured_mode_without_coding_falls_back_to_knee() {
-        let curve = knee_curve();
+    fn measured_mode_without_coding_is_refused() {
         let cfg = KSelectionConfig {
             mode: KSelectionMode::MeasuredMdl,
             measured_coding: None,
             ..KSelectionConfig::default()
         };
-        let sel = select_k(&curve, &cfg);
-        // Falls back to Kneedle, which knees this curve at K=4.
-        assert_eq!(sel.k, 4);
-        assert_eq!(sel.flag, KSelectionFlag::Knee);
+        let single = curve_from_pairs(&[(4, 0.9)]).expect("single-point curve");
+        let flat = curve_from_pairs(&[(1, 0.5), (2, 0.5), (4, 0.5)]).expect("flat curve");
+        for curve in [knee_curve(), single, flat] {
+            let error = select_k(&curve, &cfg).expect_err("measured rule without coding");
+            assert!(error.contains("coding ingredients"), "{error}");
+        }
+        let linear = curve_from_pairs(&[(1, 0.2), (8, 0.8)]).expect("linear curve");
+        assert!(recommend_auto_k(&knee_curve(), &linear, &cfg, 10.0, 10.0).is_err());
     }
 
     #[test]

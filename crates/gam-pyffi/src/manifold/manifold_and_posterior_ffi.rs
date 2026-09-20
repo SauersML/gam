@@ -696,7 +696,9 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
     let fit = fit_result_from_saved_model_for_prediction(&model)?;
     // The band prices its SEs off the covariance the fit publishes, as
     // `summary()` and `partial_dependence` do (#2779); a fit whose correction
-    // is typed unavailable reports the conditional band under that label.
+    // is typed unavailable reports the conditional band under that label. The
+    // band's critical value reads the same fit-owned reference law as
+    // `predict()` intervals: Student-t on n - edf for an estimated dispersion.
     let selected_covariance = gam::inference::effects::select_published_covariance(&fit)
         .map_err(|error| error.to_string())?;
     let payload = model.payload();
@@ -719,229 +721,17 @@ fn difference_smooth_json_impl(model: &FittedModel, request_json: &str) -> Resul
             beta: fit.beta.view(),
             covariance: selected_covariance.matrix,
             covariance_source: selected_covariance.source,
+            reference: gam::inference::interval_reference::IntervalReference::of_fit(&fit)
+                .map_err(|error| error.to_string())?,
         },
         request,
         |headers, rows| {
             let dataset = dataset_with_model_schema(&model, headers, rows)?;
-            standard_mean_design(&model, dataset)
+            gam_predict::partial_effect::standard_mean_design(&model, dataset)
         },
     )?;
     serde_json::to_string(&rows)
         .map_err(|err| format!("failed to serialize difference_smooth rows: {err}"))
-}
-
-fn json_f64_vec(value: &serde_json::Value, key: &str) -> Result<Vec<f64>, String> {
-    let values = value
-        .get(key)
-        .and_then(|raw| raw.as_array())
-        .ok_or_else(|| format!("model coefficient state does not include {key}"))?;
-    values
-        .iter()
-        .enumerate()
-        .map(|(idx, raw)| {
-            raw.as_f64()
-                .filter(|value| value.is_finite())
-                .ok_or_else(|| format!("{key}[{idx}] must be finite numeric"))
-        })
-        .collect()
-}
-
-fn json_label_text(value: &serde_json::Value) -> Option<String> {
-    match value {
-        serde_json::Value::String(text) => Some(text.clone()),
-        serde_json::Value::Number(number) => Some(number.to_string()),
-        serde_json::Value::Bool(flag) => Some(flag.to_string()),
-        _ => None,
-    }
-}
-
-fn coefficient_indices_for_precision_label_json(
-    state: &serde_json::Value,
-    label: &str,
-) -> Result<Vec<usize>, String> {
-    let provenance = state
-        .get("coefficient_provenance")
-        .and_then(|raw| raw.as_array())
-        .ok_or_else(|| {
-            "model coefficient state does not include coefficient provenance".to_string()
-        })?;
-    let mut matches = Vec::<usize>::new();
-    for (fallback_index, item) in provenance.iter().enumerate() {
-        let Some(obj) = item.as_object() else {
-            continue;
-        };
-        let index = obj
-            .get("index")
-            .and_then(|raw| raw.as_u64())
-            .map(|raw| raw as usize)
-            .unwrap_or(fallback_index);
-        let matched = ["term", "column", "label"].into_iter().any(|key| {
-            obj.get(key)
-                .and_then(json_label_text)
-                .is_some_and(|candidate| candidate == label)
-        });
-        if matched {
-            matches.push(index);
-        }
-    }
-    Ok(matches)
-}
-
-fn cross_fit_shared_precision_groups_json_impl(request_json: &str) -> Result<String, String> {
-    let request: PySharedPrecisionRequest = serde_json::from_str(request_json)
-        .map_err(|err| format!("failed to parse shared precision request json: {err}"))?;
-    if request.models.is_empty() {
-        return Err("at least one model is required".to_string());
-    }
-    if request.groups.is_empty() {
-        return Err("at least one shared precision group is required".to_string());
-    }
-    let states = request
-        .models
-        .iter()
-        .map(|model| {
-            serde_json::from_str::<serde_json::Value>(&model.state_json).map_err(|err| {
-                format!(
-                    "failed to parse coefficient state for model {}: {err}",
-                    model.key
-                )
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut result = serde_json::Map::<String, serde_json::Value>::new();
-    for group in request.groups {
-        if group.labels.len() != request.models.len() {
-            return Err(format!(
-                "shared precision group {:?} has {} labels for {} model(s)",
-                group.name,
-                group.labels.len(),
-                request.models.len()
-            ));
-        }
-        if !(group.shape.is_finite() && group.shape > 0.0) {
-            return Err(format!(
-                "shared precision group {:?} requires finite shape > 0",
-                group.name
-            ));
-        }
-        if !(group.rate.is_finite() && group.rate >= 0.0) {
-            return Err(format!(
-                "shared precision group {:?} requires finite rate >= 0",
-                group.name
-            ));
-        }
-        let mut fit_entries = Vec::<serde_json::Value>::new();
-        let mut dims = BTreeSet::<usize>::new();
-        let mut quadratic_sum = 0.0;
-        for ((model, state), label) in request
-            .models
-            .iter()
-            .zip(states.iter())
-            .zip(group.labels.iter())
-        {
-            let indices = coefficient_indices_for_precision_label_json(state, label)?;
-            if indices.is_empty() {
-                continue;
-            }
-            let beta = json_f64_vec(state, "beta")?;
-            let cov_n = state
-                .get("covariance_n")
-                .and_then(|raw| raw.as_u64())
-                .ok_or_else(|| {
-                    "model coefficient state does not include covariance_n".to_string()
-                })? as usize;
-            let cov_flat = json_f64_vec(state, "covariance_flat")?;
-            if beta.len() != cov_n || cov_flat.len() != cov_n * cov_n {
-                return Err(format!(
-                    "model {} has inconsistent beta/covariance dimensions",
-                    model.key
-                ));
-            }
-            if indices.iter().any(|&index| index >= cov_n) {
-                return Err(format!(
-                    "model {} has coefficient provenance outside covariance bounds",
-                    model.key
-                ));
-            }
-            let trace_covariance = indices
-                .iter()
-                .map(|&index| cov_flat[index * cov_n + index])
-                .sum::<f64>();
-            let beta_norm_sq = indices
-                .iter()
-                .map(|&index| beta[index] * beta[index])
-                .sum::<f64>();
-            let contribution = beta_norm_sq + trace_covariance;
-            if !contribution.is_finite() {
-                return Err(format!(
-                    "shared precision group {:?} has non-finite contribution in model {}",
-                    group.name, model.key
-                ));
-            }
-            quadratic_sum += contribution;
-            dims.insert(indices.len());
-            fit_entries.push(serde_json::json!({
-                "model": model.key,
-                "label": label,
-                "coefficient_indices": indices,
-                "dimension": indices.len(),
-                "beta_norm_sq": beta_norm_sq,
-                "trace_covariance": trace_covariance,
-                "quadratic_contribution": contribution,
-            }));
-        }
-        if fit_entries.is_empty() {
-            return Err(format!(
-                "shared precision group {:?} did not match any model coefficients",
-                group.name
-            ));
-        }
-        if dims.len() != 1 {
-            return Err(format!(
-                "shared precision group {:?} matched inconsistent dimensions: {:?}",
-                group.name,
-                dims.into_iter().collect::<Vec<_>>()
-            ));
-        }
-        let dimension = dims.iter().next().copied().ok_or_else(|| {
-            format!(
-                "shared precision group {:?} did not establish a coefficient dimension",
-                group.name
-            )
-        })?;
-        let numerator = fit_entries.len() as f64 * dimension as f64 + 2.0 * (group.shape - 1.0);
-        let denominator = quadratic_sum + 2.0 * group.rate;
-        if numerator <= 0.0 {
-            return Err(format!(
-                "shared precision group {:?} has non-positive MAP numerator",
-                group.name
-            ));
-        }
-        if denominator <= 0.0 || !denominator.is_finite() {
-            return Err(format!(
-                "shared precision group {:?} has non-positive/non-finite denominator",
-                group.name
-            ));
-        }
-        let lambda = numerator / denominator;
-        result.insert(
-            group.name.clone(),
-            serde_json::json!({
-                "lambda": lambda,
-                "log_lambda": lambda.ln(),
-                "shape": group.shape,
-                "rate": group.rate,
-                "n_fits": fit_entries.len(),
-                "dimension": dimension,
-                "quadratic_sum": quadratic_sum,
-                "numerator": numerator,
-                "denominator": denominator,
-                "fits": fit_entries,
-            }),
-        );
-    }
-    serde_json::to_string(&result)
-        .map_err(|err| format!("failed to serialize shared precision result: {err}"))
 }
 
 /// One `curv(...)` term's #944 report, JSON-serialized for the Python surface.
@@ -1079,13 +869,9 @@ struct SmoothTermLrRow {
     /// quadrature's truncation bound plus twice the selection replay's own
     /// Monte-Carlo standard error. `0.0` on the closed-form lanes.
     p_value_bound: Option<f64>,
-    /// Lawley LR Bartlett factor `c = 1 + Δε/d` (1.0 when uncorrected).
+    /// Lawley LR Bartlett factor `c = 1 + Δε/d`, the fixed-λ scale of the
+    /// reference (1.0 when uncorrected).
     bartlett_factor: Option<f64>,
-    /// Fixed-λ conditional Lawley factor when the applied factor also includes
-    /// estimated-λ rho variation.
-    bartlett_factor_conditional: Option<f64>,
-    /// Mean-shift increment from ρ̂ sampling variation, when present.
-    rho_variation_shift: Option<f64>,
     /// Bartlett-corrected statistic `W* = W / c`.
     statistic_corrected: Option<f64>,
     /// Uncorrected p-value `P(χ²_d > W)`.
@@ -1097,9 +883,8 @@ struct SmoothTermLrRow {
     /// `n` is too small for first-order inference on this term. `false` when no
     /// correction was applied.
     material: Option<bool>,
-    /// `"lawley_lr_estimated_lambda"` when the full estimated-λ Bartlett
-    /// correction was applied, `"lawley_lr_fixed_lambda"` for the conditional
-    /// fixed-λ factor, else `"none"`.
+    /// `"lawley_lr_fixed_lambda"` when the Lawley factor was applied, else
+    /// `"none"`.
     correction_provenance: Option<&'static str>,
 }
 
@@ -1330,8 +1115,6 @@ fn smooth_term_lr_inference_dataset_json_impl(
                 p_value_conditional: Some(r.p_value_conditional),
                 p_value_bound: Some(r.p_value_bound),
                 bartlett_factor: Some(r.bartlett_factor),
-                bartlett_factor_conditional: r.bartlett_factor_conditional,
-                rho_variation_shift: r.rho_variation_shift,
                 statistic_corrected: Some(r.statistic_corrected),
                 p_value_uncorrected: Some(r.p_value_uncorrected),
                 p_value_corrected: Some(r.p_value_corrected),
@@ -3821,8 +3604,7 @@ fn predict_competing_risks_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::CompetingRisksPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_competing_risks_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_competing_risks_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3832,22 +3614,7 @@ fn predict_competing_risks_survival_result(
         resolve_offset_column(dataset, &col_map, payload.offset_column.as_deref())?;
     let noise_offset = ndarray::Array1::<f64>::zeros(dataset.values.nrows());
     let time_grid_slice: Option<&[f64]> = options.time_grid.as_deref();
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        // Posterior-mean points always integrate the conditional posterior;
-        // covariance_mode controls uncertainty only.
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     let request = SurvivalPredictRequest {
         model,
         data: dataset.values.view(),
@@ -3871,8 +3638,7 @@ fn predict_survival_result(
     options: &PyPredictOptions,
 ) -> Result<gam::families::survival::predict::SurvivalPredictResult, String> {
     use gam::families::survival::predict::{
-        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
-        predict_survival,
+        SurvivalPredictEstimand, SurvivalPredictRequest, predict_survival,
     };
 
     let col_map = dataset.column_map();
@@ -3905,27 +3671,33 @@ fn predict_survival_result(
         with_uncertainty: options.interval.is_some(),
         estimand: SurvivalPredictEstimand::PosteriorMean,
     };
-    // #2296: the user's covariance_mode governs single-cause survival
-    // uncertainty exactly as it does the competing-risks path. The default
-    // (None -> smoothing-corrected) is a REQUIRED request: when the saved fit
-    // carries no corrected covariance the engine refuses instead of silently
-    // narrowing the bands to conditional Vb. Posterior-mean points without an
-    // interval integrate the conditional posterior, as in the CR wrapper.
-    let covariance_mode = if options.interval.is_some() {
-        match parse_covariance_mode(options.covariance_mode.as_deref())?
-            .unwrap_or(gam_predict::InferenceCovarianceMode::SmoothingCorrected)
-        {
-            gam_predict::InferenceCovarianceMode::Conditional => {
-                SurvivalPredictionCovarianceMode::Conditional
-            }
-            gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
-                SurvivalPredictionCovarianceMode::SmoothingCorrected
-            }
-        }
-    } else {
-        SurvivalPredictionCovarianceMode::Conditional
-    };
+    let covariance_mode = survival_band_covariance_mode(model, options)?;
     Ok(predict_survival(request, covariance_mode)?)
+}
+
+/// The covariance definition behind a survival prediction's uncertainty: the
+/// explicit `covariance_mode` when given (a requirement, refused when the fit
+/// cannot supply it), else the definition the saved fit publishes, the same
+/// resolution `gam predict` applies. The engine reads it for the band only;
+/// the posterior-mean point is always the conditional-posterior mean, so
+/// `interval=` never moves it (#2296, #3421).
+fn survival_band_covariance_mode(
+    model: &FittedModel,
+    options: &PyPredictOptions,
+) -> Result<gam::families::survival::predict::SurvivalPredictionCovarianceMode, String> {
+    use gam::families::survival::predict::{SurvivalPredictionCovarianceMode, saved_fit_result};
+    let mode = match parse_covariance_mode(options.covariance_mode.as_deref())? {
+        Some(mode) => mode,
+        None => saved_fit_result(model)?.published_covariance_mode(),
+    };
+    Ok(match mode {
+        gam_predict::InferenceCovarianceMode::Conditional => {
+            SurvivalPredictionCovarianceMode::Conditional
+        }
+        gam_predict::InferenceCovarianceMode::SmoothingCorrected => {
+            SurvivalPredictionCovarianceMode::SmoothingCorrected
+        }
+    })
 }
 
 fn serialize_survival_prediction_payload(
@@ -5134,8 +4906,11 @@ impl ManifoldSaeCore {
 
     #[staticmethod]
     fn load(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Py<ManifoldSaeCore>> {
-        let payload_json = std::fs::read_to_string(path)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.load: {error}")))?;
+        // The one saved-model reader every surface shares (gam#3054): a
+        // filesystem refusal raises the `OSError` subclass its kind names, with
+        // the path in its message.
+        let payload_json = gam_model_api::saved_model::read_saved_model_file(&path)
+            .map_err(crate::saved_document_error_to_pyerr)?;
         Self::from_json(py, &payload_json)
     }
 
@@ -5154,8 +4929,12 @@ impl ManifoldSaeCore {
 
     fn save(&self, path: std::path::PathBuf) -> PyResult<()> {
         let payload = self.inner.to_json().map_err(py_value_error)?;
-        std::fs::write(path, payload)
-            .map_err(|error| py_value_error(format!("ManifoldSAE.save: {error}")))
+        // The one saved-model writer every surface shares (gam#3054): atomic,
+        // so a failed save leaves the previous file whole, and durable on Unix
+        // before it returns. A filesystem refusal raises the `OSError` subclass
+        // its kind names, with the path in its message.
+        gam_model_api::saved_model::write_saved_model(&path, payload.as_bytes())
+            .map_err(crate::saved_document_error_to_pyerr)
     }
 
     fn __repr__(&self) -> PyResult<String> {
