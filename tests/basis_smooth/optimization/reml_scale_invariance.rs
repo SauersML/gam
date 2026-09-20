@@ -102,8 +102,8 @@ fn reml_harmonic_and_sobolev_m4_both_recover_smooth_truth() {
     // predictions (different λ in each construction's units, same effective
     // smoother).
     init_parallelism();
-    let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let pred_har = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=harmonic)");
+    let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
+    let pred_har = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=harmonic)");
     let rmse_sob = rmse(&pred_sob);
     let rmse_har = rmse(&pred_har);
     eprintln!("[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_har={rmse_har:.4}");

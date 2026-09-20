@@ -254,7 +254,7 @@ pub enum BSplineKnotSpec {
         adaptive: bool,
     },
     Provided(Array1<f64>),
-    /// Natural cubic regression spline (`bs="cr"`/`"cs"`) knot set (#1074).
+    /// Natural cubic regression spline (`bs="cr"`) knot set (#1074).
     ///
     /// Unlike the open-spline variants above, these `knots` are the `k`
     /// Lancaster–Salkauskas knots `x*_1 < … < x*_k` that *directly* index the
@@ -1417,7 +1417,7 @@ pub enum BasisMetadata {
         /// (rebuilt at predict from the serialized frozen spec), not persisted.
         anchor_offset_coeffs: Option<Array1<f64>>,
     },
-    /// Natural cubic regression spline (`bs="cr"`/`"cs"`) metadata (#1074).
+    /// Natural cubic regression spline (`bs="cr"`) metadata (#1074).
     ///
     /// `knots` are the `k` Lancaster–Salkauskas knots that index the basis
     /// values directly (basis dim = `knots.len()`). Predict-time rebuilds

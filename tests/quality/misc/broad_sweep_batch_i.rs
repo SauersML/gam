@@ -292,7 +292,7 @@ fn sphere_harmonic_with_small_n() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=harmonic)", &data, &cfg)
+    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, method=harmonic)", &data, &cfg)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
     let FitResult::Standard(fit) = result else {
         panic!()
@@ -332,7 +332,7 @@ fn sphere_sobolev_with_small_n() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, kernel=sobolev)", &data, &cfg)
+    let result = fit_from_formula("y ~ sphere(lat, lon, k=10, method=sobolev)", &data, &cfg)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "fit", e));
     let FitResult::Standard(fit) = result else {
         panic!()

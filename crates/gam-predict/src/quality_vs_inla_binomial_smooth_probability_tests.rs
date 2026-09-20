@@ -53,7 +53,7 @@
 //! columns), so there is zero data-encoding skew and both are scored against the
 //! identical `p_true`.
 //!
-//! Both engines fit `y ~ s(age)` (gam: thin-plate `s(x, bs='tp')`; INLA:
+//! Both engines fit `y ~ s(age)` (gam: thin-plate `s(x, bs='tps')`; INLA:
 //! `f(age, model="rw2", scale.model=TRUE)`, the canonical INLA penalized smooth),
 //! binomial/logit.
 

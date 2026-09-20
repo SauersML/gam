@@ -46,7 +46,7 @@
 //! Capability under test: lognormal location-scale AFT with a thin-plate smooth
 //! covariate whose complexity is selected from the data, requested via the
 //! survival formula
-//!   `Surv(t, event) ~ x + s(z, bs="tp", k=10)`
+//!   `Surv(t, event) ~ x + s(z, bs="tps", k=10)`
 //! fit through gam's location-scale survival likelihood
 //! (`FitConfig{ survival_likelihood: "location-scale", survival_distribution:
 //! "gaussian" }`). A Gaussian residual on gam's monotone-time-warp channel IS
@@ -187,7 +187,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
     let z_idx = col["z"];
     let ncols = ds.headers.len();
 
-    // ---- fit with gam: lognormal location-scale AFT with s(z, bs="tp", k=10) -
+    // ---- fit with gam: lognormal location-scale AFT with s(z, bs="tps", k=10) -
     // Gaussian-residual survival location-scale == lognormal AFT (module doc).
     // k=10 gives the thin-plate smooth enough basis functions to resolve the
     // ~8-df z-effect; REML selects how much of that budget the data support.
@@ -203,7 +203,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg() {
         time_num_internal_knots: 2,
         ..FitConfig::default()
     };
-    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=10)"#, &ds, &cfg)
+    let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tps", k=10)"#, &ds, &cfg)
         .expect("gam lognormal location-scale AFT fit");
     let FitResult::SurvivalLocationScale(fit) = result else {
         panic!("expected a survival location-scale fit result");
@@ -465,7 +465,7 @@ fn lognormal_aft_mean_nll(time: &[f64], status: &[f64], mu: &[f64], sigma: f64) 
 /// under right censoring.
 ///
 /// Capability: SAME lognormal location-scale AFT as the synthetic arm above,
-///   `Surv(time, status) ~ age + s(karno, bs="tp", k=5)`
+///   `Surv(time, status) ~ age + s(karno, bs="tps", k=5)`
 /// — a parametric AFT with a thin-plate smooth on the Karnofsky performance
 /// score (the dominant prognostic covariate) plus a linear age term, fit through
 /// gam's location-scale survival likelihood (Gaussian residual == lognormal AFT).
@@ -549,7 +549,7 @@ fn gam_lognormal_location_scale_aft_smooth_matches_survreg_on_real_data() {
         ..FitConfig::default()
     };
     let result = fit_from_formula(
-        r#"Surv(time, status) ~ age + s(karno, bs="tp", k=5)"#,
+        r#"Surv(time, status) ~ age + s(karno, bs="tps", k=5)"#,
         &train_ds,
         &cfg,
     )

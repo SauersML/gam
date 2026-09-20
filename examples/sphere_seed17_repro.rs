@@ -54,11 +54,11 @@ fn main() {
     let formulas = [
         (
             "sobolev-k25-m4",
-            "y ~ sphere(lat, lon, k=25, m=4, kernel=sobolev)",
+            "y ~ sphere(lat, lon, k=25, penalty_order=4, method=sobolev)",
         ),
         (
             "sobolev-k25-m2",
-            "y ~ sphere(lat, lon, k=25, m=2, kernel=sobolev)",
+            "y ~ sphere(lat, lon, k=25, penalty_order=2, method=sobolev)",
         ),
         (
             "harmonic-deg8",
