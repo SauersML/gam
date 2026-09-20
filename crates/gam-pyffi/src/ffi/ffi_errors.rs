@@ -650,8 +650,9 @@ pub(crate) fn saved_model_error_to_pyerr(
 /// A saved document that could not be written or read through
 /// `gam_model_api::saved_model`. A filesystem refusal raises the `OSError`
 /// subclass its kind names (`FileNotFoundError`, `PermissionError`, ...), with
-/// the path in its message; a document the engine refuses is a `DataError`, the
-/// category of a payload (gam#3008, gam#3054).
+/// the path in its message; a document the engine refuses raises the class of
+/// [`SavedModelError::error_category`](gam_model_api::saved_model::SavedModelError::error_category),
+/// the category the CLI's exit code also names (gam#3008, gam#3054).
 pub(crate) fn saved_document_error_to_pyerr(
     error: gam_model_api::saved_model::SavedModelError,
 ) -> PyErr {
@@ -659,7 +660,7 @@ pub(crate) fn saved_document_error_to_pyerr(
         gam_model_api::saved_model::SavedModelError::Io { path, source } => {
             PyErr::from(std::io::Error::new(source.kind(), format!("{path}: {source}")))
         }
-        refused => DataError::new_err(refused.to_string()),
+        refused => category_error(refused.error_category(), refused.to_string()),
     }
 }
 

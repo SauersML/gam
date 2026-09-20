@@ -13,6 +13,7 @@ path = "src/main.rs"
 gam = { path = "../.." }
 gam-build-identity = { path = "../gam-build-identity" }
 gam-data = { path = "../gam-data" }
+gam-model-api = { path = "../gam-model-api" }
 gam-predict = { path = "../gam-predict" }
 gam-runtime = { path = "../gam-runtime" }
 gam-sae = { path = "../gam-sae" }

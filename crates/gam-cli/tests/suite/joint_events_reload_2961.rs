@@ -247,3 +247,81 @@ fn a_cli_fit_takes_event_rows_in_any_order_and_refuses_invalid_tables() {
         assert!(!std::path::Path::new(&out).exists(), "{reason}");
     }
 }
+
+/// A model file the reader refuses exits with the data code, the category
+/// `gamfit` raises (`DataError`) for the same file; a model path that cannot be
+/// read is the invocation's, so it exits with the formula code.
+#[test]
+fn a_cli_forecast_refuses_a_bad_model_file_with_its_category() {
+    let scratch = tempfile::tempdir().expect("scratch directory");
+    let write = |name: &str, text: &str| {
+        let path = scratch.path().join(name);
+        std::fs::write(&path, text).expect("write fixture");
+        path.to_str().expect("UTF-8 path").to_string()
+    };
+    let subjects = write("subjects.csv", "id,entry,exit\na,0,4\nb,0,6\n");
+    let events = write("events.csv", "id,time,mark\na,4,cvd_death\nb,1,visit\n");
+    let model = scratch
+        .path()
+        .join("model.json")
+        .to_str()
+        .expect("UTF-8 path")
+        .to_string();
+    let fit = gam(&[
+        "joint-events",
+        "fit",
+        "--subjects",
+        &subjects,
+        "--events",
+        &events,
+        "--marks",
+        "cvd_death:terminal,visit:recurrent",
+        "--out",
+        &model,
+    ]);
+    assert_eq!(fit.status.code(), Some(0), "{}", stderr(&fit));
+    let forecast = |model: &str| {
+        gam(&[
+            "joint-events",
+            "forecast",
+            "--model",
+            model,
+            "--subjects",
+            &subjects,
+            "--events",
+            &events,
+            "--horizons",
+            "1",
+        ])
+    };
+    // Positive control: the saved model forecasts.
+    let saved = forecast(&model);
+    assert_eq!(saved.status.code(), Some(0), "{}", stderr(&saved));
+
+    let data = Some(gam::ErrorCategory::Data.exit_code());
+    for (text, reason) in [
+        ("not a saved model", "is not a model document"),
+        (
+            r#"{"kind": "gam", "version": 1, "model": {}}"#,
+            r#"of kind Some("gam")"#,
+        ),
+    ] {
+        let refused = forecast(&write("refused.json", text));
+        let message = stderr(&refused);
+        assert_eq!(refused.status.code(), data, "{reason}: {message}");
+        assert!(message.contains(reason), "{reason}: {message}");
+    }
+    let missing = scratch.path().join("missing.json");
+    let unreadable = forecast(missing.to_str().expect("UTF-8 path"));
+    assert_eq!(
+        unreadable.status.code(),
+        Some(gam::ErrorCategory::Formula.exit_code()),
+        "{}",
+        stderr(&unreadable)
+    );
+    assert!(
+        stderr(&unreadable).contains(&missing.display().to_string()),
+        "{}",
+        stderr(&unreadable)
+    );
+}

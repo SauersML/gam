@@ -124,3 +124,9 @@ impl From<gam::estimate::EstimationError> for CliError {
         Self::typed(err.to_string(), err.advice(), err.error_category())
     }
 }
+
+impl From<gam_model_api::saved_model::SavedModelError> for CliError {
+    fn from(err: gam_model_api::saved_model::SavedModelError) -> Self {
+        Self::typed(err.to_string(), None, err.error_category())
+    }
+}

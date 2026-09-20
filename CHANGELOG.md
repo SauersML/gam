@@ -1,5 +1,13 @@
 ## Unreleased
 
+- **CLI: `gam joint-events forecast` exits with the data code for a model file it refuses**
+  (#4439). The joint-events commands flattened the typed `SavedModelError` into a bare message,
+  so a file that is not a model document, a document of another kind, a stale version or an
+  inconsistent model exited with the invocation (formula) code, while `gamfit` raises
+  `DataError` for the same file. `SavedModelError::error_category` now names the category of each
+  refusal once (data for a refused document, formula for a path that cannot be read or written),
+  and the CLI exit code and the Python exception class both read it.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

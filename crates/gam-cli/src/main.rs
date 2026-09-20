@@ -310,7 +310,7 @@ fn run() -> CliResult<()> {
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
         Command::Sample(args) => run_sample(args).map_err(CliError::from),
         Command::Generate(args) => run_generate(args).map_err(CliError::from),
-        Command::JointEvents(args) => run_joint_events(args).map_err(CliError::from),
+        Command::JointEvents(args) => run_joint_events(args),
         Command::FitEvents(args) => run_fit_events(args).map_err(CliError::from),
     }
 }

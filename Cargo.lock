@@ -3591,6 +3591,7 @@ dependencies = [
  "gam-build-identity",
  "gam-data",
  "gam-math",
+ "gam-model-api",
  "gam-predict",
  "gam-runtime",
  "gam-sae",
