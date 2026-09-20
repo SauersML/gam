@@ -2530,6 +2530,14 @@ pub struct FitArtifacts {
     pub null_space_logdet: Option<f64>,
     #[serde(default)]
     pub null_space_dim: Option<usize>,
+    /// Deviance `D₀` of the intercept-only model on the training rows, weights
+    /// and family, the denominator of the reported deviance explained
+    /// `1 − D/D₀`. Recorded at fit time because a saved model keeps no response.
+    /// `None` when the fit has no single intercept or carries an offset (the
+    /// intercept-only reference would then not be nested in the fitted model),
+    /// or on a saved model that predates the field.
+    #[serde(default)]
+    pub null_deviance: Option<f64>,
     #[serde(default)]
     pub survival_link_wiggle_knots: Option<Array1<f64>>,
     #[serde(default)]
@@ -2857,6 +2865,7 @@ impl std::fmt::Debug for FitArtifacts {
             .field("pirls", &self.pirls.as_ref().map(|_| "..."))
             .field("null_space_logdet", &self.null_space_logdet)
             .field("null_space_dim", &self.null_space_dim)
+            .field("null_deviance", &self.null_deviance)
             .field(
                 "survival_link_wiggle_knots",
                 &self
