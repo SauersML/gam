@@ -4663,17 +4663,33 @@ impl SaeManifoldTerm {
         // adjoint that used to be the bundle-free arm had no route left to serve.
         let majorizer_gamma = match logdet_derivative_bundle {
             None => None,
-            Some((probes, sinv)) => Some(
-                self.logdet_theta_adjoint_from_probes(
-                    rho,
-                    evidence_cache,
-                    probes,
-                    sinv,
-                    evidence_operator,
-                    Some(target),
-                )
-                .map_err(OuterGradientError::internal)?,
-            ),
+            Some((probes, sinv)) => {
+                let mut gamma = self
+                    .logdet_theta_adjoint_from_probes(
+                        rho,
+                        evidence_cache,
+                        probes,
+                        sinv,
+                        evidence_operator,
+                        Some(target),
+                    )
+                    .map_err(OuterGradientError::internal)?;
+                // #3439 — the streaming value adds the periodic phases' circle volume,
+                // priced off the caller's `B` cache as the dense lane prices it; its
+                // weight is on `dB_raw` of that cache.
+                if let Some((_, phase)) = self
+                    .periodic_phase_marginal(cache, &[])
+                    .map_err(OuterGradientError::internal)?
+                {
+                    let (phase_trace, phase_gamma) = self
+                        .raw_weight_derivative_channels(rho, target, cache, &phase)
+                        .map_err(OuterGradientError::internal)?;
+                    logdet_trace += &phase_trace;
+                    gamma.t += &phase_gamma.t;
+                    gamma.beta += &phase_gamma.beta;
+                }
+                Some(gamma)
+            }
         };
         // `½ Γ_joint·theta_hat + ∇R·theta_hat` is represented by one effective
         // logdet adjoint `Γ_eff = Γ_joint + 2∇R`, preserving the existing
@@ -4994,24 +5010,20 @@ impl SaeManifoldTerm {
             values.log_det_correction
         };
         // #2933 F07 — the periodic phases integrated on their circles. An orbit-stiffened
-        // block integrates its orbit coordinates exactly already, and the phase rows it
-        // stiffened are priced there, not here.
-        let phase_correction = if geometry.orbit_generators.is_empty() {
-            match self
-                .periodic_phase_marginal(cache)
-                .map_err(SaeCriterionError::Numerical)?
-            {
-                Some((correction, _)) => {
-                    log::debug!(
-                        "[SAE-EXACT-DENSE] periodic phase circle volume: ½Δlog|A|={:.6e}",
-                        0.5 * correction
-                    );
-                    correction
-                }
-                None => 0.0,
+        // block integrates its orbit atoms' collective shift exactly already, so only the
+        // phases outside every orbit are priced here (#3439).
+        let phase_correction = match self
+            .periodic_phase_marginal(cache, &geometry.orbit_generators)
+            .map_err(SaeCriterionError::Numerical)?
+        {
+            Some((correction, _)) => {
+                log::debug!(
+                    "[SAE-EXACT-DENSE] periodic phase circle volume: ½Δlog|A|={:.6e}",
+                    0.5 * correction
+                );
+                correction
             }
-        } else {
-            0.0
+            None => 0.0,
         };
         Ok((joint_pricing.log_det + orbit_correction + phase_correction, geometry))
     }
@@ -6384,11 +6396,9 @@ impl SaeManifoldTerm {
         // value moves with the evidence factor there as well.
         // The periodic phases' circle volume moves with `B_raw` alone; see
         // `periodic_phase_marginal`, which the value priced off the same cache.
-        let phase_weight = if geometry.orbit_generators.is_empty() {
-            self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
-        } else {
-            None
-        };
+        let phase_weight = self
+            .periodic_phase_marginal(cache, &geometry.orbit_generators)?
+            .map(|(_, weight)| weight);
         let (metric_trace, metric_gamma) = self.evidence_metric_derivative_channels(
             rho,
             target,
@@ -6439,34 +6449,43 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
         weight: &Array2<f64>,
-        raw_addend: Option<&Array2<f64>>,
+        raw_addend: Option<&ArrowJointBlocks>,
     ) -> Result<(Array1<f64>, SaeArrowVector), String> {
-        let total_t = cache.delta_t_len();
-        let mut trace = Array1::<f64>::zeros(rho.flat_coordinates().len());
-        if weight.iter().all(|&value| value == 0.0)
-            && raw_addend.is_none_or(|addend| addend.iter().all(|&value| value == 0.0))
-        {
+        if weight.iter().all(|&value| value == 0.0) && raw_addend.is_none() {
             return Ok((
-                trace,
+                Array1::<f64>::zeros(rho.flat_coordinates().len()),
                 SaeArrowVector {
-                    t: Array1::zeros(total_t),
+                    t: Array1::zeros(cache.delta_t_len()),
                     beta: Array1::zeros(cache.k),
                 },
             ));
         }
         let mut raw_weight = self.evidence_metric_raw_weight(cache, weight)?;
         if let Some(addend) = raw_addend {
-            if addend.dim() != raw_weight.dim() {
-                return Err(format!(
-                    "evidence_metric_derivative_channels: raw addend {:?} on weight {:?}",
-                    addend.dim(),
-                    raw_weight.dim()
-                ));
-            }
-            raw_weight += addend;
+            addend.add_to_dense(&mut raw_weight)?;
         }
-        for (flat, operator) in self.raw_penalty_curvature_operators_by_flat(rho, cache)? {
-            trace[flat] = 0.5 * (&raw_weight * &operator).sum();
+        self.raw_weight_derivative_channels(rho, target, cache, &raw_weight)
+    }
+
+    /// `(½⟨X̃, ∂B_raw/∂ρ⟩, ⟨X̃, ∂B_raw/∂θ⟩)` for a symmetric weight `X̃` on `dB_raw` in the
+    /// joint `(t, β)` layout, the raw-majorizer channels
+    /// [`Self::evidence_metric_derivative_channels`] reads once it has folded its weight.
+    /// Every channel reads `X̃` on the arrow's positions only (the ordered Beta--Bernoulli
+    /// legs read its diagonal), so an arrow-held weight such as
+    /// [`Self::periodic_phase_marginal`]'s contracts here without densifying (#3439).
+    pub(crate) fn raw_weight_derivative_channels<W: JointWeight + ?Sized>(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        raw_weight: &W,
+    ) -> Result<(Array1<f64>, SaeArrowVector), String> {
+        let total_t = cache.delta_t_len();
+        let mut trace = Array1::<f64>::zeros(rho.flat_coordinates().len());
+        let mut operator_traces = ContractingPenaltyDerivatives::new(raw_weight);
+        self.raw_penalty_curvature_operators_into(rho, cache, &mut operator_traces)?;
+        for (flat, contraction) in operator_traces.contractions {
+            trace[flat] = 0.5 * contraction;
         }
         let row_weights = self.row_loss_weights.as_deref();
         let ordered_channels = ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
@@ -6509,7 +6528,7 @@ impl SaeManifoldTerm {
                         let majorized = super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
                             channels, row, k_atoms, atom, hdiag[slot],
                         );
-                        accumulated += raw_weight[[global, global]] * majorized;
+                        accumulated += raw_weight.entry(global, global) * majorized;
                     }
                     trace[sparse] = 0.5 * accumulated;
                 }
@@ -6518,10 +6537,13 @@ impl SaeManifoldTerm {
         // θ: both conditionings are already folded into `raw_weight`, so the dense
         // adjoint's own row Daleckii--Krein correction is skipped.
         let mut gamma =
-            self.logdet_theta_adjoint_dense(rho, cache, &raw_weight, true, false, Some(target))?;
+            self.logdet_theta_adjoint_dense(rho, cache, raw_weight, true, false, Some(target))?;
         if cache.k > 0 {
             // `B_ββ` carries the decoder priors' majorizer, `A_ββ + E_ββ`.
-            let border = raw_weight.slice(s![total_t.., total_t..]);
+            let border = raw_weight.border_block(total_t).ok_or_else(|| {
+                "raw_weight_derivative_channels: the weight holds no border at this cache"
+                    .to_string()
+            })?;
             gamma.beta += &self.exact_decoder_prior_theta_trace(cache, border)?;
             gamma.beta += &self.decoder_prior_gap_theta_trace(cache, border)?;
         }
@@ -6534,10 +6556,10 @@ impl SaeManifoldTerm {
             let mut column_coefficient = vec![0.0_f64; k_atoms];
             for &(slot, global) in &logit_sites {
                 column_coefficient[slot % k_atoms] +=
-                    raw_weight[[global, global]] * channels.m_channel[slot];
+                    raw_weight.entry(global, global) * channels.m_channel[slot];
             }
             for &(slot, global) in &logit_sites {
-                gamma.t[global] += raw_weight[[global, global]] * channels.local_logit_third[slot]
+                gamma.t[global] += raw_weight.entry(global, global) * channels.local_logit_third[slot]
                     + column_coefficient[slot % k_atoms] * channels.z_jac[slot];
             }
         }
@@ -6700,11 +6722,22 @@ impl SaeManifoldTerm {
     /// the `T` weight through its recorded spectrum and the `B` weight through the same
     /// spectrum with its unit pins read raw.
     ///
-    /// `None` when no row carries a periodic coordinate.
+    /// #3439 — every exact-`A` lane prices this correction off its own `B` cache, so the
+    /// orbit and streaming lanes carry it as the dense lane does. An atom in
+    /// `orbit_generators` (#2234) already has its collective shift integrated on its
+    /// circle by the orbit integral, so its phase coordinates are not priced here: they
+    /// stay among the conditioned coordinates `v` of every other phase in their row, and
+    /// their `n − 1` relative phases keep the Gaussian pricing of `A_s`. Every other
+    /// periodic coordinate is priced as above.
+    ///
+    /// The weight is returned on the arrow's row blocks, the only positions it occupies.
+    ///
+    /// `None` when no row carries a periodic coordinate outside the orbits.
     pub(crate) fn periodic_phase_marginal(
         &self,
         cache: &ArrowFactorCache,
-    ) -> Result<Option<(f64, Array2<f64>)>, String> {
+        orbit_generators: &[CircleOrbitGenerator],
+    ) -> Result<Option<(f64, ArrowJointBlocks)>, String> {
         use gam_linalg::faer_ndarray::FaerCholesky;
         let periods = self.all_ard_axis_periods();
         if !periods
@@ -6713,10 +6746,10 @@ impl SaeManifoldTerm {
         {
             return Ok(None);
         }
-        let total_t = cache.delta_t_len();
-        let dim = total_t + cache.k;
+        let integrated_by_orbit =
+            |atom: usize| orbit_generators.iter().any(|generator| generator.atom == atom);
         let mut correction = 0.0_f64;
-        let mut raw_weight = Array2::<f64>::zeros((dim, dim));
+        let mut raw_weight = ArrowJointBlocks::zeros(&cache.row_offsets, cache.k);
         let mut priced_any = false;
         for row in 0..cache.n_rows() {
             let vars = self.row_vars_for_cache_row(row, cache)?;
@@ -6724,6 +6757,7 @@ impl SaeManifoldTerm {
             let mut phase: Vec<(usize, f64)> = Vec::new();
             for (local, variable) in vars.iter().enumerate() {
                 if let SaeLocalRowVar::Coord { atom, axis } = *variable
+                    && !integrated_by_orbit(atom)
                     && let Some(period) = periods
                         .get(atom)
                         .and_then(|axes| axes.get(axis))
@@ -6885,9 +6919,7 @@ impl SaeManifoldTerm {
                 }
                 _ => t_weight + b_weight,
             };
-            let base = cache.row_offsets[row];
-            let mut block = raw_weight.slice_mut(s![base..base + q, base..base + q]);
-            block += &row_raw;
+            raw_weight.add_to_row_block(row, &row_raw)?;
         }
         Ok(priced_any.then_some((correction, raw_weight)))
     }
@@ -8047,11 +8079,9 @@ mod test_support {
             gamma.beta += &self.decoder_prior_gap_theta_trace(
                 cache, pricing.clamp_border_derivative.view(),
             )?;
-            let phase_weight = if geometry.orbit_generators.is_empty() {
-                self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
-            } else {
-                None
-            };
+            let phase_weight = self
+                .periodic_phase_marginal(cache, &geometry.orbit_generators)?
+                .map(|(_, weight)| weight);
             let (_, metric_gamma) = self.evidence_metric_derivative_channels(
                 rho,
                 target,

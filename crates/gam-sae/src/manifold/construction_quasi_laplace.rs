@@ -3057,6 +3057,25 @@ impl SaeManifoldTerm {
         // exactly as dense caches do through their Schur-factor path.
         converged_cache.joint_hessian_log_det = Some(log_det);
         converged_cache.schur_factor_is_undamped = true;
+        // #3439 — the periodic phases' circle volume, priced off this `B` cache as the dense
+        // lane prices it off its own (`periodic_phase_marginal`). The orbit lane integrates its
+        // atoms' collective shift already, so only the phases outside its orbits are priced.
+        // The stamp above stays the operator's `log|A|`: the correction is not a determinant.
+        let orbit_atoms: &[CircleOrbitGenerator] = match evidence_artifacts.as_ref() {
+            Some(StreamingEvidence::ArrowOrbit(geometry)) => &geometry.orbit_generators,
+            _ => &[],
+        };
+        let phase_correction = match self.periodic_phase_marginal(&converged_cache, orbit_atoms)? {
+            Some((correction, _)) => {
+                log::debug!(
+                    "[SAE-CRITERION streaming] periodic phase circle volume: ½Δlog|A|={:.6e}",
+                    0.5 * correction
+                );
+                correction
+            }
+            None => 0.0,
+        };
+        let log_det = log_det + phase_correction;
         let occam = self.reml_occam_term(rho)?;
         // Extra penalized-objective energy (#671/#737 + full-objective
         // completion: registry penalties + repulsion + separation barrier),
@@ -3077,7 +3096,8 @@ impl SaeManifoldTerm {
             // realised decoder rank, priced through the SAME `rank_dof_from_grams`
             // MP hard count as the dense path off the chunk-accumulated Grams. The
             // shared seam is `0.5*log_det + rank_charge`. On THIS lane
-            // `log_det = Σ log|H_tt| + log|S_B|` by construction, so the per-row
+            // `log_det = Σ log|H_tt| + log|S_B|` by construction (plus the periodic
+            // phases' circle volume, which both lanes price alike), so the per-row
             // t-block log-dets enter both lanes identically and the criterion's
             // exposure to the A-vs-B operator split (#2509) is `log|S_A|` against
             // `log|S_B|`.

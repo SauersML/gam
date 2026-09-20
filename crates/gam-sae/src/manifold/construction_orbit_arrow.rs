@@ -361,6 +361,65 @@ impl ArrowJointBlocks {
         Ok(())
     }
 
+    /// `self += other`, block by block; both must hold the same layout.
+    pub(crate) fn accumulate(&mut self, other: &Self) -> Result<(), String> {
+        if self.row_offsets != other.row_offsets || self.k != other.k {
+            return Err(
+                "ArrowJointBlocks::accumulate: the operators hold different layouts".to_string(),
+            );
+        }
+        for (mine, theirs) in self.rows.iter_mut().zip(other.rows.iter()) {
+            *mine += theirs;
+        }
+        self.cross += &other.cross;
+        self.border += &other.border;
+        Ok(())
+    }
+
+    /// `+= block` on row `row`'s coordinate block.
+    pub(crate) fn add_to_row_block(&mut self, row: usize, block: &Array2<f64>) -> Result<(), String> {
+        let target = self.rows.get_mut(row).ok_or_else(|| {
+            format!("ArrowJointBlocks::add_to_row_block: no row {row}")
+        })?;
+        if target.dim() != block.dim() {
+            return Err(format!(
+                "ArrowJointBlocks::add_to_row_block: row {row} holds {:?}, the addend is {:?}",
+                target.dim(),
+                block.dim()
+            ));
+        }
+        *target += block;
+        Ok(())
+    }
+
+    /// `dense += self` on the joint `(t, β)` layout, the coordinate–border block on both sides.
+    pub(crate) fn add_to_dense(&self, dense: &mut Array2<f64>) -> Result<(), String> {
+        let (total_t, dim) = (self.total_t, self.dim());
+        if dense.dim() != (dim, dim) {
+            return Err(format!(
+                "ArrowJointBlocks::add_to_dense: the operator has dimension {dim}, the dense \
+                 matrix is {:?}",
+                dense.dim()
+            ));
+        }
+        for (row, block) in self.rows.iter().enumerate() {
+            let (start, end) = self.row_range(row);
+            let mut slice = dense.slice_mut(s![start..end, start..end]);
+            slice += block;
+        }
+        {
+            let mut upper = dense.slice_mut(s![..total_t, total_t..]);
+            upper += &self.cross;
+        }
+        {
+            let mut lower = dense.slice_mut(s![total_t.., ..total_t]);
+            lower += &self.cross.t();
+        }
+        let mut border = dense.slice_mut(s![total_t.., total_t..]);
+        border += &self.border;
+        Ok(())
+    }
+
     /// `⟨W, self⟩` over the arrow's positions, the coordinate–border block counted on both
     /// sides; every position off the arrow is zero in `self`.
     pub(crate) fn contract<W: JointWeight + ?Sized>(&self, weight: &W) -> Result<f64, String> {
@@ -1589,7 +1648,13 @@ impl SaeManifoldTerm {
             ));
         }
         let metric = ArrowMetric::Joint(cache).prepare()?;
-        let differential = Self::arrow_orbit_differential(geometry, &metric)?;
+        let mut differential = Self::arrow_orbit_differential(geometry, &metric)?;
+        // #3439 — the periodic phases the orbit does not integrate keep their circle volume,
+        // priced off this cache as the value priced it. Its weight is on `dB_raw`, which on
+        // this unpinned factor is the weight on `dΦ`, so it joins the metric weight.
+        if let Some((_, phase)) = self.periodic_phase_marginal(cache, &geometry.orbit_generators)? {
+            differential.metric_weight.accumulate(&phase)?;
+        }
         let mut logdet_trace = Array1::<f64>::zeros(rho.flat_coordinates().len());
         let mut operator_traces = ContractingPenaltyDerivatives::new(&differential.operator_weight);
         self.raw_penalty_curvature_operators_into(rho, cache, &mut operator_traces)?;
