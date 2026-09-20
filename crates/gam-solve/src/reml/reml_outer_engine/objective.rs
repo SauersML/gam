@@ -2340,6 +2340,31 @@ fn cone_normalizer_outer_hessian(
         .zip(moving_drift_values.iter())
         .filter_map(|(&key, value)| value.as_ref().map(|drift| (key, drift)))
         .collect();
+    // Where `M⁻¹` is the kernel's kept-spectrum pseudo-inverse, each pair also carries its second
+    // rotation (`PenaltySubspaceTrace::pseudo_inverse_second_rotation`), read off the drifts on the
+    // dropped basis in operator units and scaled like the solves (gam#2952).
+    let pseudo_inverse_kernel = solution.penalty_subspace_trace.as_deref();
+    let probes = pseudo_inverse_kernel.map(|_| {
+        let normals = normalizer.retained_normals();
+        let mut probes = Array2::<f64>::zeros((y.len(), 1 + normals.ncols()));
+        probes.column_mut(0).assign(&input.gradient);
+        probes.slice_mut(ndarray::s![.., 1..]).assign(&normals);
+        probes
+    });
+    let dropped_rates: Vec<Array2<f64>> = match pseudo_inverse_kernel {
+        Some(kernel) => drifts
+            .iter()
+            .map(|drift| {
+                let mut rate = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                for column in 0..kernel.dropped_basis.ncols() {
+                    rate.column_mut(column)
+                        .assign(&drift.apply(&kernel.dropped_basis.column(column).to_owned()));
+                }
+                rate
+            })
+            .collect(),
+        None => Vec::new(),
+    };
     let mut hessian = Array2::<f64>::zeros((total, total));
     for (state, correction) in states.iter().zip(corrections.iter()) {
         let (i, j) = (state.i, state.j);
@@ -2388,11 +2413,37 @@ fn cone_normalizer_outer_hessian(
                 .column_mut(column)
                 .assign(&second_drift(&r.column(column).to_owned()));
         }
+        let (inverse_rotation_on_gradient, inverse_rotation_on_normals) =
+            match (pseudo_inverse_kernel, probes.as_ref()) {
+                (Some(kernel), Some(probes)) => {
+                    let mut second_on_dropped = Array2::<f64>::zeros(kernel.dropped_basis.raw_dim());
+                    for column in 0..kernel.dropped_basis.ncols() {
+                        second_on_dropped.column_mut(column).assign(
+                            &(second_drift(&kernel.dropped_basis.column(column).to_owned()) * scale),
+                        );
+                    }
+                    let turned = kernel.pseudo_inverse_second_rotation(
+                        &|v: &Array1<f64>| drifts[i].apply(v),
+                        &|v: &Array1<f64>| drifts[j].apply(v),
+                        &dropped_rates[i],
+                        &dropped_rates[j],
+                        &second_on_dropped,
+                        probes,
+                    )? * scale;
+                    (
+                        turned.column(0).to_owned(),
+                        turned.slice(ndarray::s![.., 1..]).to_owned(),
+                    )
+                }
+                _ => (Array1::zeros(y.len()), Array2::zeros(r.raw_dim())),
+            };
         let pair_motion = crate::constrained_posterior::ConePairMotion {
             mode_response: state.second_response.clone(),
             gradient_rate,
             precision_rate_on_y: second_drift(y),
             precision_rate_on_r,
+            inverse_rotation_on_gradient,
+            inverse_rotation_on_normals,
         };
         let value = normalizer
             .second_order(

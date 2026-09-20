@@ -4637,7 +4637,52 @@
     "evidence": "public_api_census.py and source_removal_guard.py, run against this base, report exactly these eight public functions, and git grep -w finds none of them under crates, src or tests at the head tree. Every former caller reads gam_custom_family::BlockPenaltyRoots or the joint bundle's validated roots; the landing gate at this base ran every lib and integration test target of gam-problem, gam-custom-family, gam-solve and gam-models, and every test that fails at the head fails at the base."
   },
   {
-    "base": "2e40d97a5447847ecc0e5cacffb72472a03607c4",
+    "base": "890f20cb3e96f1fa3856ec167bebd9cc6734845f",
+    "removed": {
+      "crates/gam-models/src/fit_orchestration/materialize/terms.rs::gate_duchon_operator_penalties_for_family": 1
+    },
+    "reason": "Duchon operator penalties: one penalty structure for every family. gate_duchon_operator_penalties_for_family (with its helper disable_duchon_operator_penalties_in_basis) stripped the Duchon mass and tension operator penalties from every standard fit that was not Gaussian-identity (#1074), on the claim that fixed-dispersion LAML mis-rewards those blocks. Both LAML arms keep log|H| and log|S|+ (the Fixed arm sets include_logdet_h and include_logdet_s exactly as ProfiledGaussian does), so the claim has no criterion basis. What the gate did in practice was make scale_dimensions a no-op for GLMs: the promoted anisotropic s=0 Duchon carries per-axis relevance only through the tension-ARD penalties it removed. The gate and its call in materialize/standard.rs are deleted; every family now fits the resolved Duchon operator penalties as specified.",
+    "evidence": "Removed with no replacement: no caller should rewrite the Duchon penalty structure by family. In the landing tree the name occurs 0 times (git grep -c); its only caller, materialize/standard.rs, drops the call in the same change."
+  },
+  {
+    "base": "7b249280deb52c24f0f413208659dc4328c68fb3",
+    "removed": {
+      "crates/gam-models/src/inference/full_conformal.rs::new": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::penalized_rss": 1,
+      "crates/gam-models/src/inference/full_conformal.rs::select_rho": 1
+    },
+    "reason": "#3275: GaussianRemlRhoResponse::select_rho, the full-conformal rho-hat(z) Newton polish with the contraction-ratio stop, had no production caller. Since #3213 (63d0074714) the Layer-3 map re-selects rho-hat(z) in full_conformal/honest.rs (branch and bound, then refit_at through OuterProblem, which takes the engine's certified result with no polish), and 1d6a22a6b0 moved the coverage study's training strength off select_rho(None) to the oracle's brute_force_rho because the ratio stop refused it. select_rho was a second, unused route to rho-hat(z), so it is deleted with its polish, not re-tuned. The deny-warnings cascade goes with it: the oracle's gradient, gradient band and Hessian (read only by select_rho), and the rounding scale of residual_sum_of_squares that fed that band. The rest of GaussianRemlRhoResponse (new, eval, penalized_rss, the rho domains) is the independent REML oracle that only the honest tests and the #2280/#2902 pins use, so it moves unchanged in arithmetic into a private #[cfg(test)] mod test_support (full_conformal/test_support.rs), with RemlEval and residual_sum_of_squares. select_rho_domain_is_the_resolvability_interval_of_its_gram_2902 is renamed oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902 (same body), and gaussian_reml_reselection_is_stationary_on_the_augmented_criterion, which tested only select_rho, is deleted.",
+    "evidence": "git grep -w select_rho at base 7fff1617da finds only the definition and that one unit test; git grep GaussianRemlRhoResponse finds uses only in full_conformal.rs tests and full_conformal/honest/tests.rs. At the head tree git grep -w select_rho -- crates src tests finds nothing, and under crates GaussianRemlRhoResponse, RemlEval and residual_sum_of_squares occur only in full_conformal/test_support.rs and the two test modules. Gate direct-dy5-w2oc-3275-g1.log, TIPCHECK at tip 94e6a59c5b (tree d165e56dc0): cargo check --workspace --all-targets RC 0 with SCANNER_ERRORS=0, gam-pyffi check RC 0, source_removal_guard and public_api_census RC 0, and 16 of 17 gam-models full_conformal:: tests pass, including oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902, the #2280 penalized-RSS pin and honest_set_matches_brute_force_reml_refits. The 17th, full_conformal_coverage_holds_for_every_row_class, hit nextest's 600 s per-test cap after 5 of its 9 (scenario, n) cells. It executes no code this change touches except the oracle's eval, which now does strictly less work (no A^-1 S solve, traces or Hessian), so the cap is not this change's (read, not measured at main)."
+  },
+  {
+    "base": "12d4f8d71d84c11f6f7e4c6937efdf0d54688d7b",
+    "removed": {
+      "crates/gam-sae/src/assignment.rs::set_ordered_beta_bernoulli_alpha_override": 1,
+      "crates/gam-sae/src/manifold/tests.rs::per_fit_config_isolates_barrier_and_ordered_beta_bernoulli_alpha": 1
+    },
+    "reason": "#2933 F06 / #1777: the ordered-beta-Bernoulli alpha override is deleted. SaeFitConfig and SaeAssignment carried ordered_beta_bernoulli_alpha_override, a second path to a state that AssignmentMode::ordered_beta_bernoulli(tau, alpha, learnable) already declares; set_ordered_beta_bernoulli_alpha_override was its setter. A fixed concentration is now declared only through the mode (learnable_alpha: false), so the override-specific tests (the overridden_* finalization and reactive-box twins, the OVERRIDE_ALPHA fixtures, and the per_fit_config barrier-and-alpha isolation test) go with it; the surviving fixed/learnable finalization, layout-refusal and zero-trace tests move to tests_alpha_persistence_2933.rs and cover the single remaining path.",
+    "evidence": "source_removal_guard.py and public_api_census.py against this base report exactly these identities. At the head tree git grep -w alpha_override finds no occurrence under crates, src or tests. cargo check -p gam-sae --tests and cargo check -p gam-pyffi pass; tests_alpha_persistence_2933 keeps fixed_alpha_finalizes_without_changing_the_objective_2933, learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933, a_layout_contradicting_the_concentration_is_refused_2933 and fixed_alpha_reactive_box_has_no_sparse_face_2933."
+  },
+  {
+    "base": "9ad6cad14d20a214a2c5f6fe35c5b808dc94c17f",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/bridges.rs::objective_band": 1,
+      "crates/gam-solve/src/rho_optimizer/bridges.rs::observe_second_order": 1,
+      "crates/gam-solve/src/rho_optimizer/bridges.rs::stage_objective_band": 1
+    },
+    "reason": "gam#3018: CostStallGuard takes each sample's evaluation resolution in a StallSample (sample_resolution over #3186's outer_objective_band) instead of a band staged beside it, so objective_band and stage_objective_band have no caller; observe_second_order folds into observe(StallSample, predicted_decrease), whose sample carries the curvature verdict it used to take.",
+    "evidence": "public_api_census.py with this entry passed at base 94e6a59c5b (13652 public function declarations before, 13669 after); the tip check reruns it at this base. bridges.rs declares none of the three names in the landing tree (git grep -w). Gate on the landing tree (gate5, acn112, base 94e6a59c5b): workspace lib (ban scanner) and workspace check green; gam-solve 2101 of 2104 distinct tests pass, and the 3 reds also fail at base; the gam-models separation, multinomial and stall receipts pass 63 of 67, and the 4 reds also fail at base with the same messages."
+  },
+  {
+    "base": "96a81f3bca96c060ec79f9c0d52158e9e2389ed5",
+    "removed": {
+      "crates/gam-sae/src/manifold/tests.rs::assignment_logit_step_cap_bounds_single_iteration_gate_motion": 1
+    },
+    "reason": "#2902: the test pinned SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS, a +-4 tau hand box on each accepted Newton step of the assignment logits (SPEC 18-22). The cap is deleted (the Armijo line search on the realised objective globalises the step), so the test that asserted the clamp retires with it.",
+    "evidence": "Replaced by manifold::tests::assignment_logit_newton_step_is_realised_unboxed, which asserts the realised within-row logit move equals step_size * delta for a 1e3 tau raw delta; it fails on main f4db2a2b (the cap realises 4 tau instead of 500 tau) and passes on this branch."
+  },
+  {
+    "base": "847f0eb73d1e6e757b73d771b3d6d9be14072deb",
     "removed": {
       "crates/gam-solve/src/inference/residual_factor.rs::bic_penalized_log_likelihood": 1
     },

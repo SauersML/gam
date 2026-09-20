@@ -2030,11 +2030,7 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             .map(|chunk_idx| {
                 let start = chunk_idx * chunk;
                 let end = (start + chunk).min(n);
-                let mut acc = Array2::<f64>::zeros((p, p));
-                for row in start..end {
-                    per_row(row, &mut acc)?;
-                }
-                Ok(acc)
+                Self::pullback_chunk(p, start..end, &per_row)
             })
             .collect();
         let mut total = Array2::<f64>::zeros((p, p));
@@ -2042,6 +2038,26 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
             total += &acc?;
         }
         Ok(total)
+    }
+
+    /// One chunk of [`Self::chunked_pullback_reduce`]: its rows' pullbacks folded in index
+    /// order into a fresh `p×p` accumulator. Out of line on purpose (gam#2967): the chunk is
+    /// mapped inside Rayon's split frame, which stays live across every join below it and is
+    /// stacked once per nested steal, so `per_row`'s row program must not be inlined there.
+    #[inline(never)]
+    fn pullback_chunk<F>(
+        p: usize,
+        rows: core::ops::Range<usize>,
+        per_row: &F,
+    ) -> Result<Array2<f64>, String>
+    where
+        F: Fn(usize, &mut Array2<f64>) -> Result<(), String>,
+    {
+        let mut acc = Array2::<f64>::zeros((p, p));
+        for row in rows {
+            per_row(row, &mut acc)?;
+        }
+        Ok(acc)
     }
 
     /// gam#979 build-once all-axes FIRST directional derivative — see the trait

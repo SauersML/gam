@@ -1270,7 +1270,6 @@ fn sae_manifold_fit_inner<'py>(
         seed_refine_random_state,
         fit_config: gam::terms::sae::manifold::SaeFitConfig {
             separation_barrier_strength_override,
-            ordered_beta_bernoulli_alpha_override: None,
             gpu_policy,
         },
         temperature_schedule,

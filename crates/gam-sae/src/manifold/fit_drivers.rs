@@ -5551,10 +5551,8 @@ impl SaeManifoldTerm {
                     layout.expand_row(row, &compact_row, &mut full_delta[row * q..(row + 1) * q]);
                 }
             }
-            // Apply logits from expanded buffer, clamped to the #976 gate-scale
-            // step cap, then canonicalize each softmax row in the same worker.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
+            // Apply logits from expanded buffer, then canonicalize each softmax
+            // row in the same worker.
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5565,8 +5563,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5579,8 +5576,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * full_delta[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * full_delta[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(
@@ -5610,9 +5606,6 @@ impl SaeManifoldTerm {
                 ));
             }
             let coord_offsets = self.assignment.coord_offsets();
-            // #976 gate-scale step cap, as in the compact branch above.
-            let logit_step_cap =
-                SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS * self.assignment.mode.temperature();
             if parallel_rows {
                 use rayon::prelude::*;
                 self.assignment
@@ -5623,8 +5616,7 @@ impl SaeManifoldTerm {
                     .for_each(|(row, mut logits)| {
                         let row_base = row * q;
                         for atom_idx in 0..assignment_dim {
-                            logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                                .clamp(-logit_step_cap, logit_step_cap);
+                            logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                         }
                         if softmax {
                             canonicalize_softmax_logit_row(
@@ -5637,8 +5629,7 @@ impl SaeManifoldTerm {
                     let row_base = row * q;
                     let mut logits = self.assignment.logits.row_mut(row);
                     for atom_idx in 0..assignment_dim {
-                        logits[atom_idx] += (step_size * delta_ext_coord[row_base + atom_idx])
-                            .clamp(-logit_step_cap, logit_step_cap);
+                        logits[atom_idx] += step_size * delta_ext_coord[row_base + atom_idx];
                     }
                     if softmax {
                         canonicalize_softmax_logit_row(
@@ -5935,40 +5926,46 @@ impl SaeManifoldTerm {
         Ok(())
     }
 
+    /// Frozen-decoder encode: minimize the penalized objective over the row
+    /// coordinates and routing logits with every decoder held fixed (#3277).
+    ///
+    /// It returns only from a certified stationary point. The certificate is
+    /// the saddle-free Newton decrement `d = −gᵀΔ` reaching one of two
+    /// rounding floors. The first is the objective's own resolution
+    /// `γ_k·Σ|summands|`: a model decrease that small cannot be told apart
+    /// from the rounding of the computed objective. The second is the rounding band of the contraction itself,
+    /// where the sign of `d` is not resolved.
+    ///
+    /// Every accepted step is a STRICT Armijo decrease of a finite objective.
+    /// A strictly decreasing sequence of floats is finite, so the walk ends
+    /// without an iteration budget. It starts at the unit Newton step, the
+    /// natural length of the saddle-free step (#2267). A line search that finds
+    /// no strict decrease along a resolved descent direction is a typed error,
+    /// never a result.
     pub fn run_fixed_decoder_arrow_schur(
         &mut self,
         target: ArrayView2<'_, f64>,
         rho: &mut SaeManifoldRho,
         analytic_penalties: Option<&AnalyticPenaltyRegistry>,
-        max_iter: usize,
-        step_size: f64,
         ridge_ext_coord: f64,
     ) -> Result<SaeManifoldLoss, String> {
         *rho = rho.clone().for_assignment(&self.assignment);
         self.assignment.validate_rho_domain(rho)?;
-        if !(step_size.is_finite() && step_size > 0.0) {
-            return Err(format!(
-                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: step_size must be finite and positive; got {step_size}"
-            ));
-        }
-        // #2267 — the backtracking search only ever CONTRACTS from its first
-        // trial, so pinning that trial to the caller's `step_size` caps the
-        // per-iteration contraction at `1 - step_size` regardless of how good
-        // the direction is. Clean acceptances ratchet the trial toward the unit
-        // Newton step instead; the Armijo bound is unchanged.
-        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
-        let unit_step_ceiling = step_size.max(1.0);
-        let mut warm_step = step_size;
-        if max_iter < 1 {
+        // An annealing schedule moves the objective between iterates, so no
+        // iterate of the encode could be certified stationary for it.
+        if self.temperature_schedule.is_some() {
             return Err(
-                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: max_iter must be positive".into(),
+                "SaeManifoldTerm::run_fixed_decoder_arrow_schur: the frozen-decoder encode \
+                 minimizes one fixed objective; a temperature schedule is a training-time \
+                 construct"
+                    .to_string(),
             );
         }
+        let warm_growth = 1.0 / BacktrackConfig::default().contraction;
+        let mut warm_step = 1.0_f64;
         let beta_zero = Array1::<f64>::zeros(self.beta_dim());
-        let mut last_loss = self.loss(target, rho)?;
-        for _ in 0..max_iter {
-            self.advance_temperature_schedule()?;
-            let pre_step_loss = self.loss(target, rho)?;
+        let mut iteration = 0_usize;
+        loop {
             // #1407: assemble ONLY the per-row htt/gt block-diagonal — the frozen
             // decoder makes the entire β tier (G/gb/htbeta/hbb/β-penalties) dead
             // work. `fixed_decoder_step_from_rows` below reads only htt/gt.
@@ -5977,8 +5974,17 @@ impl SaeManifoldTerm {
             self.fixed_decoder_assembly = false;
             let sys = sys_result
                 .map_err(|err| format!("SaeManifoldTerm::run_fixed_decoder_arrow_schur: {err}"))?;
+            // The baseline is read after assembly, from the exact represented
+            // state whose gradient and Hessian produced `sys`.
+            let pre_step_loss = self.loss(target, rho)?;
             let pre_step_total =
                 self.penalized_objective_total(target, rho, analytic_penalties, 1.0)?;
+            if !pre_step_total.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite objective \
+                     {pre_step_total} at iteration {iteration}"
+                ));
+            }
             let delta_ext_coord = Self::fixed_decoder_step_from_rows(&sys, ridge_ext_coord)?;
             let decrease = sae_manifold_newton_directional_decrease(
                 &sys,
@@ -5986,16 +5992,25 @@ impl SaeManifoldTerm {
                 beta_zero.view(),
             );
             let directional_decrease = decrease.value;
-            let directional_decrease_floor = decrease.rounding_band;
-            let snapshot = self.snapshot_mutable_state();
-            if !(pre_step_total.is_finite()
-                && directional_decrease.is_finite()
-                && directional_decrease > 0.0
-                && directional_decrease > directional_decrease_floor)
-            {
-                self.restore_mutable_state(&snapshot)?;
-                last_loss = pre_step_loss;
-                break;
+            if !directional_decrease.is_finite() {
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: non-finite Newton \
+                     decrement {directional_decrease} at iteration {iteration}"
+                ));
+            }
+            // The penalized objective is the loss components plus the extra
+            // penalty terms. Its longest accumulation is the data fit over the
+            // `n·p` residual cells, then the five summands are added, so its
+            // computed value cannot resolve a change below `γ_k·Σ|summands|`.
+            let summand_scale = pre_step_loss.data_fit.abs()
+                + pre_step_loss.assignment_sparsity.abs()
+                + pre_step_loss.smoothness.abs()
+                + pre_step_loss.ard.abs()
+                + (pre_step_total - pre_step_loss.total()).abs();
+            let objective_resolution =
+                gam_linalg::roundoff::accumulation_band(target.len() + 4, summand_scale);
+            if directional_decrease <= decrease.rounding_band.max(objective_resolution) {
+                return Ok(pre_step_loss);
             }
 
             // Each trial re-applies the Newton step from the pre-step
@@ -6003,7 +6018,8 @@ impl SaeManifoldTerm {
             // first). A trial whose step application or objective evaluation
             // errors is INVALID (`Ok(None)`): halve without consulting the
             // Armijo test. On acceptance the mutable state already holds the
-            // accepted trial, so the loss is read after the search returns.
+            // accepted trial.
+            let snapshot = self.snapshot_mutable_state();
             let mut first_trial = true;
             let accepted = backtracking_line_search::<_, String>(
                 BacktrackConfig {
@@ -6030,31 +6046,33 @@ impl SaeManifoldTerm {
                 |trial_step_size, post_step_total| {
                     let armijo_bound = pre_step_total
                         - SAE_MANIFOLD_ARMIJO_C1 * trial_step_size * directional_decrease;
-                    post_step_total.is_finite() && post_step_total <= armijo_bound
+                    // Strict: a trial whose objective rounds to the baseline is
+                    // no progress, even when the Armijo bound rounds to it too.
+                    post_step_total.is_finite()
+                        && post_step_total < pre_step_total
+                        && post_step_total <= armijo_bound
                 },
             )?;
-            match accepted {
-                Some(step) => {
-                    // Same ratchet as the joint driver (#2267): this is a Newton
-                    // step too, so its natural length is one, and the caller's
-                    // `step_size` is the conservative first trial, not a ceiling
-                    // the accepted step may never exceed.
-                    warm_step = (if step.step >= warm_step {
-                        warm_step * warm_growth
-                    } else {
-                        step.step * warm_growth
-                    })
-                    .min(unit_step_ceiling);
-                    last_loss = self.loss(target, rho)?;
-                }
-                None => {
-                    self.restore_mutable_state(&snapshot)?;
-                    last_loss = pre_step_loss;
-                    break;
-                }
-            }
+            let Some(step) = accepted else {
+                self.restore_mutable_state(&snapshot)?;
+                return Err(format!(
+                    "SaeManifoldTerm::run_fixed_decoder_arrow_schur: no strict decrease along \
+                     the Newton direction at iteration {iteration} (decrement \
+                     {directional_decrease:.3e}, objective resolution \
+                     {objective_resolution:.3e}, objective {pre_step_total:.17e}); the encode \
+                     did not converge"
+                ));
+            };
+            // Same ratchet as the joint driver (#2267): clean acceptances grow
+            // the next first trial back toward the unit step.
+            warm_step = (if step.step >= warm_step {
+                warm_step * warm_growth
+            } else {
+                step.step * warm_growth
+            })
+            .min(1.0);
+            iteration += 1;
         }
-        Ok(last_loss)
     }
 
     /// Rank-revealing adaptive basis depth for rank-deficient decoder designs
@@ -9013,14 +9031,10 @@ impl SaeManifoldTerm {
         // Carry the assignment-defining metadata that `with_mode` resets to
         // defaults, so the chunk computes the SAME model as the resident term.
         // Without this the streaming/chunked path silently diverges from the dense
-        // path: frozen routing thaws back to the free logits (#1033), and the per-fit
-        // truncated-ordered Beta--Bernoulli α override is dropped (#1777). Both change the
-        // forward gate map, hence the loss, gradient, and log-det.
-        //   * `ordered_beta_bernoulli_alpha_override` is scalar — row-independent.
-        //   * frozen routing is per-row (n×K) — the caller slices it to the chunk's
-        //     rows and passes it as `chunk_frozen_logits`.
-        assignment.ordered_beta_bernoulli_alpha_override =
-            self.assignment.ordered_beta_bernoulli_alpha_override;
+        // path: frozen routing thaws back to the free logits (#1033), which changes
+        // the forward gate map, hence the loss, gradient, and log-det. Frozen routing
+        // is per-row (n×K): the caller slices it to the chunk's rows and passes it as
+        // `chunk_frozen_logits`.
         if let Some(frozen) = chunk_frozen_logits {
             if frozen.dim() != (n_chunk, k_atoms) {
                 return Err(format!(

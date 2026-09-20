@@ -3999,6 +3999,7 @@ fn fit_bernoulli_marginal_slope_terms_under(
         solved_fit.covariance_corrected = None;
         if let Some(inference) = solved_fit.inference.as_mut() {
             inference.factorized_standard_errors = None;
+            inference.smoothing_correction_factorized = None;
         }
         log::debug!("[BMS latent-z] {}", declined.explain());
         solved_fit.artifacts.covariance_declined = Some(declined);
