@@ -721,18 +721,11 @@ impl SurvivalLsRowKernel<'_> {
     /// `p` — the scalar-independent inputs the generic row NLL
     /// ([`sls_row_nll`]) consumes. Computed once per row; reused across every
     /// `JetScalar` instantiation (value/grad/Hessian, contracted third/fourth).
-    fn row_nll_inputs(
-        &self,
-        row: usize,
-    ) -> Result<([f64; SLS_ROW_K], SurvivalExactRowKernel), String> {
-        self.row_nll_inputs_opt(row)?
-            .ok_or_else(|| format!("survival location-scale row {row} has no exact kernel"))
-    }
-
-    /// Like [`Self::row_nll_inputs`] but returns `Ok(None)` for rows whose
-    /// observation weight is non-positive. A positive-weight row whose exact
-    /// derivatives cannot be represented is an error, never a zero
-    /// contribution.
+    ///
+    /// Returns `Ok(None)` for rows whose observation weight is non-positive:
+    /// such a row carries no likelihood term, and every consumer treats it as a
+    /// structural zero. A positive-weight row whose exact derivatives cannot be
+    /// represented is an error, never a zero contribution.
     fn row_nll_inputs_opt(
         &self,
         row: usize,
@@ -2152,7 +2145,11 @@ impl<'a> SurvivalLsWiggleRowKernel<'a> {
         row: usize,
         vars: &[S],
     ) -> Result<S, String> {
-        let kernel = self.base.row_nll_inputs(row)?.1;
+        // A non-positive-weight row carries no likelihood term: it is the same
+        // structural zero the non-wiggle `RowProgram::eval` returns, not an error.
+        let Some((_, kernel)) = self.base.row_nll_inputs_opt(row)? else {
+            return Ok(vars[0].constant_like(0.0));
+        };
         let r_u0_0 = self.b_u0_0.row(row);
         let r_u0_1 = self.b_u0_1.row(row);
         let r_u0_2 = self.b_u0_2.row(row);
