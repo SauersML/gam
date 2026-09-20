@@ -587,27 +587,28 @@ pub(crate) fn custom_family_blockwise_edf(
 /// trace edf is invariant under the canonical reparameterization, the resulting
 /// `edf_total` / per-penalty / per-block values are the same as they would be
 /// in the raw basis and are reported directly on the lifted raw fit. Returns
-/// `None` when no reduced geometry is available, so the caller can leave
-/// `precomputed_edf` unset (and the raw-geometry fallback applies).
+/// `Ok(None)` when no reduced geometry is available, so the caller can leave
+/// `precomputed_edf` unset (and the raw-geometry fallback applies). A reduced
+/// geometry whose trace fails is an error: the lifted raw geometry carries a
+/// non-identity gauge that refuses the raw fallback, so returning `None` here
+/// would replace the trace's own reason with that refusal.
 pub(crate) fn reduced_blockwise_edf(
     reduced_geometry: Option<&FitGeometry>,
     canonical: &gam_identifiability::canonical::CanonicalSpecs,
     lambdas: &Array1<f64>,
-) -> Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)> {
-    let geom = reduced_geometry?;
-    match custom_family_blockwise_edf(
+) -> Result<
+    Option<(f64, Vec<f64>, Vec<f64>, Vec<f64>, Vec<gam_solve::estimate::EdfRankBound>)>,
+    CustomFamilyError,
+> {
+    let Some(geom) = reduced_geometry else {
+        return Ok(None);
+    };
+    custom_family_blockwise_edf(
         geom.penalized_hessian.as_array(),
         &canonical.reduced_specs,
         &lambdas.view(),
-    ) {
-        Ok(triple) => Some(triple),
-        Err(err) => {
-            log::debug!(
-                "[custom-family inference] reduced-space effective degrees of freedom unavailable: {err}"
-            );
-            None
-        }
-    }
+    )
+    .map(Some)
 }
 
 fn require_converged_outer_for_assembly(outer_converged: bool) -> Result<(), CustomFamilyError> {
@@ -1153,6 +1154,7 @@ pub fn blockwise_fit_from_parts(
         coefficient_influence: None,
         weighted_gram,
         identified_subspace: None,
+        working_residual: None,
     });
 
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {
@@ -1476,6 +1478,51 @@ impl CustomOuterState {
             incumbent: self.warm_start_for(theta),
             fixed,
         }
+    }
+
+    /// The starts of one outer evaluation at `theta` once the cold-reeval latch holds
+    /// (#2349): the canonical seed and the fit's fixed starts, unless the latest filed mode
+    /// ([`Self::record_cold_mode`]) was solved at bitwise `theta` from a canonical seed of
+    /// this identity (#3322).
+    ///
+    /// A cold evaluation is one deterministic computation of θ and the canonical seed, so
+    /// solving it again at that θ reproduces the filed selection, and the filed mode is served
+    /// alone. Without this every cold value probe's gradient, and every re-evaluation of the
+    /// terminal point, solved all three starts again: 12 s of a 19 s outer iteration on the
+    /// event-history risk-set centred fit. Like a value probe's mode it is a start, not a
+    /// value: the inner solve reuses it only when its own same-ρ check accepts it.
+    pub(crate) fn cold_mode_starts_for<'a>(
+        &'a self,
+        theta: &Array1<f64>,
+        canonical: Option<&'a ConstrainedWarmStart>,
+    ) -> ModeStarts<'a> {
+        match &self.value_probe {
+            Some(probe)
+                if probe.theta == theta_bits(theta)
+                    && probe.seed == SeedIdentity::of(canonical) =>
+            {
+                ModeStarts {
+                    incumbent: Some(&probe.mode),
+                    fixed: &[],
+                }
+            }
+            _ => ModeStarts {
+                incumbent: canonical,
+                fixed: &self.fixed_starts,
+            },
+        }
+    }
+
+    /// File the selected mode of a converged cold evaluation at `theta`, value probe or
+    /// first-order, solved from the canonical seed `canonical` (#3322). It replaces the
+    /// previous filed mode, and [`Self::cold_mode_starts_for`] serves it at bitwise `theta`.
+    pub(crate) fn record_cold_mode(
+        &mut self,
+        theta: &Array1<f64>,
+        canonical: Option<&ConstrainedWarmStart>,
+        mode: ConstrainedWarmStart,
+    ) {
+        self.record_value_probe(theta, SeedIdentity::of(canonical), mode);
     }
 
     /// The seed of one outer evaluation at `theta`: the certified mode a walk

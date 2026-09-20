@@ -21,7 +21,6 @@
 pub(crate) use super::*;
 
 pub(crate) use super::sparse_penalty_block_count_from_canonical;
-use crate::estimate::reml::inner_strategy::HessianEvalStrategyKind;
 pub(crate) use crate::persistent_warm_start::{
     PersistentWarmStartRecord, load_record, store_record,
 };
