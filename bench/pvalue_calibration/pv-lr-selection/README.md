@@ -64,6 +64,20 @@ Every size is within two MCSE of nominal on both sides, no cell rejects
 uniformity over the whole range, and every cell's weak-term power is at or
 above main df02753c's.
 
+Re-run on this branch merged with origin/main 52b0d780 (main's #3018 stall
+rule and #2952 outer-Hessian terms): every p-value on every replicate that
+fits is bit-identical to the 89bea032 run, in all four cells. gauss_small,
+gauss and pois are unchanged. binom fits 598 of 600:
+
+| cell | size .10 (z) | size .05 (z) | size .01 (z) | KS p | power .05 |
+|---|---|---|---|---|---|
+| binom | 0.1187 (+1.53) | 0.0535 (+0.39) | 0.0067 (−0.81) | 0.345 | 0.9147 |
+
+Replicates 170 and 256 fail the fit itself at 52b0d780: the outer REML
+optimizer does not certify a stationary optimum, with λ on its rail. That is
+upstream of the LR test, and both replicates fit at 89bea032 on the same LR
+code. Every replicate that fits publishes a null p-value.
+
 In the df02753c A/B, pois and binom agree with main replicate for replicate (largest null
 p-value difference 5e-4 on pois, 1.4e-5 on binom). Their known scale never
 enters the profiled-scale path this lane changes, and on these fits the null
