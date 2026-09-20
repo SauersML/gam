@@ -1715,6 +1715,15 @@ fn nearest_orthogonal_3x3(m: [[f64; 3]; 3]) -> Option<[[f64; 3]; 3]> {
         return None;
     }
     let orthogonal = left?.dot(&right_t?);
+    // The computed SVD factors are orthogonal only to their own rounding, and
+    // their product carries both defects plus its own: `‖RᵀR − I‖` then exceeds
+    // the three-term dot-product bar `SphereChartTransition` validates exact
+    // transitions against in a fraction of a percent of seams, refusing a sound
+    // polar factor. One Newton–Schulz polar step `R ← ½·R·(3I − RᵀR)` has the
+    // polar factor as its fixed point and squares the orthogonality defect, so
+    // what remains is the step's own rounding.
+    let gram = orthogonal.t().dot(&orthogonal);
+    let orthogonal = orthogonal.dot(&(Array2::<f64>::eye(3) * 3.0 - &gram)) * 0.5;
     if orthogonal.iter().any(|value| !value.is_finite()) {
         return None;
     }
@@ -8459,3 +8468,37 @@ mod tests_atlas_prior_2280;
 
 #[cfg(test)]
 mod tests_torus_metric_residual_scale_2554;
+
+#[cfg(test)]
+mod tests_polar_factor_exact_transition {
+    use super::*;
+
+    /// A fitted pole seam's rotation is the SVD polar factor of the pooled cross
+    /// moment. It must pass the exact-transition orthonormality bar every time;
+    /// a raw `U·Vᵀ` fails it on a fraction of a percent of matrices.
+    #[test]
+    fn fitted_polar_factor_always_passes_the_exact_transition_bar() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut uniform = || {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            (z >> 11) as f64 / (1_u64 << 53) as f64 * 2.0 - 1.0
+        };
+        for case in 0..4000 {
+            let mut m = [[0.0; 3]; 3];
+            for row in &mut m {
+                for value in row.iter_mut() {
+                    *value = uniform();
+                }
+            }
+            let Some(rotation) = nearest_orthogonal_3x3(m) else {
+                continue;
+            };
+            SphereChartTransition::new_fitted(0, 1, rotation, AtlasSeamKind::Pole)
+                .unwrap_or_else(|error| panic!("case {case}: {error}"));
+        }
+    }
+}
