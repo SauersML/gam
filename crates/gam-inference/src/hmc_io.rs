@@ -1329,6 +1329,7 @@ mod tests {
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,
@@ -2773,6 +2774,263 @@ mod tests {
         assert_eq!(out.node_count, 25);
         assert_eq!(out.axis_orders, vec![5, 5]);
         assert_eq!(out.quadrature_error, 0.0);
+    }
+
+    /// A one-axis block whose likelihood is defined only on `(lower, upper)`. The
+    /// excess is `ΔF(t) = a·t⁴`, so the integrand jumps at each end, or with `root`
+    /// `ΔF(t) = −½·ln(1 + t/c)` for `c = −lower`, a square-root kink at the lower end
+    /// like the inverse-Gaussian canonical link's at `η = 0`. Row 0 bounds the lower
+    /// end and row 1 the upper. The per-row scores are zero, so the moment channels
+    /// carry only what the ends inject. `transported = false` describes no interval,
+    /// and the rule over the whole line drops the infeasible nodes.
+    struct CutBlock {
+        lambdas: Array1<f64>,
+        lower: f64,
+        upper: f64,
+        a: f64,
+        root: bool,
+        transported: bool,
+    }
+    const CUT_ROW_SLOPES: [f64; 2] = [1.5, -0.8];
+    impl CutBlock {
+        /// `ΔF(t)` without the domain, which the reference integral reads at the ends.
+        fn excess_formula(&self, t: f64) -> f64 {
+            if self.root {
+                -0.5 * (1.0 + t / -self.lower).ln()
+            } else {
+                self.a * t.powi(4)
+            }
+        }
+        fn excess_at(&self, t: f64) -> f64 {
+            if self.lower < t && t < self.upper {
+                self.excess_formula(t)
+            } else {
+                f64::INFINITY
+            }
+        }
+        /// `ln ∫ N(t; 0, 1/λ)·e^{−ΔF(t)} dt` over the interval by composite Simpson in
+        /// `v` with `t = lower + v²`, which makes a square-root kink at the lower end
+        /// smooth; the Gaussian tail past twelve standard deviations is below
+        /// roundoff.
+        fn reference_value(&self) -> f64 {
+            let lambda = self.lambdas[0];
+            let top = self.upper.min(12.0 / lambda.sqrt());
+            let v_top = (top - self.lower).sqrt();
+            let intervals = 20_000;
+            let h = v_top / intervals as f64;
+            // At `v = 0` a root's excess is `+∞` and the Jacobian `2v` is zero, so the
+            // integrand is zero there either way.
+            let integrand = |v: f64| {
+                let t = self.lower + v * v;
+                2.0 * v
+                    * (lambda / std::f64::consts::TAU).sqrt()
+                    * (-0.5 * lambda * t * t - self.excess_formula(t)).exp()
+            };
+            let interior: f64 = (1..intervals)
+                .map(|j| (if j % 2 == 1 { 4.0 } else { 2.0 }) * integrand(j as f64 * h))
+                .sum();
+            ((integrand(0.0) + interior + integrand(v_top)) * h / 3.0).ln()
+        }
+    }
+    impl super::BlockExcessTarget for CutBlock {
+        fn block_dim(&self) -> usize {
+            1
+        }
+        fn rho_dim(&self) -> usize {
+            1
+        }
+        fn block_curvatures(&self) -> &Array1<f64> {
+            &self.lambdas
+        }
+        fn excess(&self, t: &Array1<f64>) -> f64 {
+            self.excess_at(t[0])
+        }
+        fn excess_rounding_band(&self, t: &Array1<f64>) -> f64 {
+            gam_linalg::roundoff::accumulation_band(4, self.excess_at(t[0]).abs())
+        }
+        fn excess_rho_gradient(&self, t: &Array1<f64>) -> Array1<f64> {
+            // `ρ = ln a` scales the quartic; the root's excess does not depend on it.
+            t.mapv(|x| if self.root { 0.0 } else { self.a * x.powi(4) })
+        }
+        fn displaced_neg_score(&self, t: &Array1<f64>) -> Result<Array1<f64>, String> {
+            assert_eq!(t.len(), self.block_dim(), "displacement dim mismatch");
+            Ok(Array1::zeros(CUT_ROW_SLOPES.len()))
+        }
+        fn base_neg_score(&self) -> Result<Array1<f64>, String> {
+            Ok(Array1::zeros(CUT_ROW_SLOPES.len()))
+        }
+        fn node_working_bytes(&self) -> Option<usize> {
+            Some(std::mem::size_of::<(f64, Option<Array1<f64>>)>() + 3 * std::mem::size_of::<f64>())
+        }
+        fn axis_truncation(
+            &self,
+        ) -> Option<Box<dyn gam_problem::laplace_sampler_contract::BlockAxisTruncation + '_>>
+        {
+            self.transported.then(|| {
+                Box::new(CutAxis { block: self })
+                    as Box<dyn gam_problem::laplace_sampler_contract::BlockAxisTruncation>
+            })
+        }
+    }
+    struct CutAxis<'a> {
+        block: &'a CutBlock,
+    }
+    impl gam_problem::laplace_sampler_contract::BlockAxisTruncation for CutAxis<'_> {
+        fn lower(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+            self.block.lower.is_finite().then_some(
+                gam_problem::laplace_sampler_contract::BlockAxisCut {
+                    t: self.block.lower,
+                    row: 0,
+                    row_slope: CUT_ROW_SLOPES[0],
+                },
+            )
+        }
+        fn upper(&self) -> Option<gam_problem::laplace_sampler_contract::BlockAxisCut> {
+            self.block.upper.is_finite().then_some(
+                gam_problem::laplace_sampler_contract::BlockAxisCut {
+                    t: self.block.upper,
+                    row: 1,
+                    row_slope: CUT_ROW_SLOPES[1],
+                },
+            )
+        }
+        fn excess_slope(&self, t: f64, displaced_neg_score: &Array1<f64>) -> f64 {
+            // The engine hands over the score it already evaluated at this node.
+            let at_node = super::BlockExcessTarget::displaced_neg_score(self.block, &array![t])
+                .expect("the double's score");
+            assert_eq!(displaced_neg_score, &at_node, "score of another node at t = {t}");
+            if self.block.root {
+                -0.5 / (t - self.block.lower)
+            } else {
+                4.0 * self.block.a * t.powi(3)
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_block_integrates_a_jump_at_both_ends_geometrically() {
+        // The transported rule resolves a block cut at both ends at order 40, where
+        // the whole-line rule that drops infeasible nodes still misses by ≈1e-1.
+        let block = |transported| CutBlock {
+            lambdas: array![2.0],
+            lower: -0.6,
+            upper: 0.9,
+            a: 0.05,
+            root: false,
+            transported,
+        };
+        let reference = block(true).reference_value();
+        let out = super::block_quadrature_marginal_correction(&block(true), &[40])
+            .expect("transported correction");
+        assert!(
+            (out.value - reference).abs() <= 1e-9,
+            "order-40 transported value {} vs {reference}",
+            out.value
+        );
+        assert!(out.quadrature_error <= 1e-8, "paired error {}", out.quadrature_error);
+        let whole_line = super::block_quadrature_marginal_correction(&block(false), &[40])
+            .expect("whole-line correction");
+        assert!(
+            (whole_line.value - reference).abs() > 1e-3,
+            "the whole-line rule {} should still miss {reference}",
+            whole_line.value
+        );
+    }
+
+    #[test]
+    fn truncated_block_resolves_a_root_at_the_cut_below_the_order_ceiling() {
+        // A square-root kink at the cut (the inverse-Gaussian canonical link at η = 0)
+        // left the whole-line rule's paired difference near 1e-2 at every order, so
+        // the admission refused at the largest representable one. Transported, order
+        // 60 is exact to roundoff. The cut moves with the excess here, and the
+        // integrand vanishes there, so the end's derivative at a fixed excess is zero:
+        // `∂ln Z/∂e` must cancel the transported nodes' motion.
+        let block = |transported| CutBlock {
+            lambdas: array![2.0],
+            lower: -0.6,
+            upper: f64::INFINITY,
+            a: 0.0,
+            root: true,
+            transported,
+        };
+        let reference = block(true).reference_value();
+        let out = super::block_quadrature_marginal_correction(&block(true), &[60])
+            .expect("transported correction");
+        assert!(
+            (out.value - reference).abs() <= 1e-11,
+            "order-60 transported value {} vs {reference}",
+            out.value
+        );
+        assert!(out.quadrature_error <= 1e-11, "paired error {}", out.quadrature_error);
+        let moments = out.moments.expect("moments");
+        assert!(
+            moments.e_neg_score[0].abs() <= 1e-8,
+            "a vanishing integrand gives the cut no derivative, injected {}",
+            moments.e_neg_score[0]
+        );
+        let whole_line = super::block_quadrature_marginal_correction(&block(false), &[200])
+            .expect("whole-line correction");
+        assert!(
+            whole_line.quadrature_error > 1e-4,
+            "the whole-line rule's paired error {} should not resolve",
+            whole_line.quadrature_error
+        );
+    }
+
+    #[test]
+    fn truncated_block_end_derivatives_match_the_moved_cut() {
+        // With the excess fixed, moving an end moves the value by the integrand
+        // there: `∂value/∂t_lo = −N(t_lo)e^{−ΔF(t_lo)}/e^{value}` and the upper end
+        // with the opposite sign. The sampler injects `∂value/∂t_cut / x_row` into
+        // `E_p[ngs_row]` and `t_cut` times it into `E_p[t·ngs_row]`.
+        let block = |lower: f64, upper: f64| CutBlock {
+            lambdas: array![2.0],
+            lower,
+            upper,
+            a: 0.05,
+            root: false,
+            transported: true,
+        };
+        let (lower, upper) = (-0.6, 0.9);
+        let order = 100;
+        let out = super::block_quadrature_marginal_correction(&block(lower, upper), &[order])
+            .expect("correction");
+        let moments = out.moments.expect("moments");
+        let lambda: f64 = 2.0;
+        let integrand = |t: f64| {
+            (lambda / std::f64::consts::TAU).sqrt() * (-0.5 * lambda * t * t - 0.05 * t.powi(4)).exp()
+                / out.value.exp()
+        };
+        let value_at = |lower: f64, upper: f64| {
+            super::block_quadrature_marginal_correction(&block(lower, upper), &[order])
+                .expect("moved correction")
+                .value
+        };
+        let h = 1e-5;
+        let fd_lower = (value_at(lower + h, upper) - value_at(lower - h, upper)) / (2.0 * h);
+        let fd_upper = (value_at(lower, upper + h) - value_at(lower, upper - h)) / (2.0 * h);
+        let injected_lower = moments.e_neg_score[0] * CUT_ROW_SLOPES[0];
+        let injected_upper = moments.e_neg_score[1] * CUT_ROW_SLOPES[1];
+        assert!(
+            (injected_lower + integrand(lower)).abs() <= 1e-11,
+            "lower end {injected_lower} vs {}",
+            -integrand(lower)
+        );
+        assert!(
+            (injected_upper - integrand(upper)).abs() <= 1e-11,
+            "upper end {injected_upper} vs {}",
+            integrand(upper)
+        );
+        assert!((injected_lower - fd_lower).abs() <= 1e-8, "{injected_lower} vs FD {fd_lower}");
+        assert!((injected_upper - fd_upper).abs() <= 1e-8, "{injected_upper} vs FD {fd_upper}");
+        assert!(
+            (moments.e_t_neg_score[(0, 0)] - moments.e_neg_score[0] * lower).abs() <= 1e-15,
+            "lower end's t-moment"
+        );
+        assert!(
+            (moments.e_t_neg_score[(1, 0)] - moments.e_neg_score[1] * upper).abs() <= 1e-15,
+            "upper end's t-moment"
+        );
     }
 
     #[test]
@@ -6641,6 +6899,16 @@ fn batch_length_refusal(returned: usize, nodes: usize) -> BlockQuadratureRefusal
 /// the orders so every axis's difference resolves `min(|Δ_b|, 1/n_eff²)`
 /// ([`gam_problem::laplace_sampler_contract::select_block_quadrature_orders`]).
 ///
+/// A one-axis block whose likelihood ends inside the Gaussian's mass
+/// ([`BlockExcessTarget::axis_truncation`]) integrates `q` truncated to the feasible
+/// interval: `exp(Δ_b) = Z·E_{q|interval}[e^{−ΔF}]` with `Z` the interval's `q`-mass,
+/// by every rule transported onto the interval
+/// ([`gam_math::quadrature::TruncatedNormalTransport`]). This is the same integral
+/// the untransported rule approximates by dropping infeasible nodes, but its
+/// integrand has no jump at the ends, so the paired differences resolve at an order
+/// the whole-line rule never reaches. The ends move with the fit, and their
+/// derivative is carried into the moment channels at the rows that bound them.
+///
 /// The rule is streamed (#784): nodes are enumerated lazily and handed to the target
 /// in chunks, and every accumulator runs node by node in the rule's order, so no
 /// buffer grows with the node count. The chunk is the largest the process memory
@@ -6758,6 +7026,63 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
         }
         lower_rules.push(lower);
     }
+    // A one-axis block whose likelihood is defined only on part of the axis is the
+    // integral of the Laplace Gaussian truncated to that part. Every rule, fine and
+    // lower, is transported onto the interval (`TruncatedNormalTransport`) with its
+    // weights unchanged, and the interval's mass `ln Z` joins every estimate, so the
+    // value, the paired differences and the moments are those of the truncated
+    // integral. The fine rule's standard-normal nodes are kept for the ends'
+    // derivatives below.
+    let truncation = target.axis_truncation();
+    let axis_transport = match truncation.as_deref() {
+        Some(truncation) if truncation.lower().is_some() || truncation.upper().is_some() => {
+            if m != 1 {
+                return Err(Integration(format!(
+                    "block_quadrature_marginal_correction: a feasible interval is defined for \
+                     a one-axis block, not a {m}-direction block"
+                )));
+            }
+            let sqrt_lambda = lambdas[0].sqrt();
+            let transport = gam_math::quadrature::TruncatedNormalTransport::new(
+                truncation
+                    .lower()
+                    .map_or(f64::NEG_INFINITY, |cut| sqrt_lambda * cut.t),
+                truncation
+                    .upper()
+                    .map_or(f64::INFINITY, |cut| sqrt_lambda * cut.t),
+            )
+            .map_err(|error| {
+                Integration(format!(
+                    "block_quadrature_marginal_correction: the mode is not inside the block's \
+                     feasible interval: {error}"
+                ))
+            })?;
+            let transport_rule = |rule: &mut Vec<(f64, f64)>| {
+                rule.iter_mut().try_for_each(|(node, _)| {
+                    *node = transport.transport(*node).map_err(|error| {
+                        Integration(format!(
+                            "block_quadrature_marginal_correction: transporting a node onto \
+                             the feasible interval: {error}"
+                        ))
+                    })?;
+                    Ok::<(), BlockQuadratureRefusal>(())
+                })
+            };
+            let standard_nodes: Vec<f64> = log_rules[0].iter().map(|&(node, _)| node).collect();
+            transport_rule(&mut log_rules[0])?;
+            for (_, rule) in lower_rules.iter_mut().flatten() {
+                transport_rule(rule)?;
+            }
+            // `∂ψ_k/∂(lower, upper)` per fine node, in the rule's node order.
+            let sensitivities: Vec<(f64, f64)> = standard_nodes
+                .iter()
+                .zip(log_rules[0].iter())
+                .map(|(&u, &(psi, _))| transport.endpoint_sensitivities(u, psi))
+                .collect();
+            Some((truncation, transport, sensitivities))
+        }
+        _ => None,
+    };
     let Some(node_count) = axis_orders
         .iter()
         .try_fold(1usize, |nodes, &order| nodes.checked_mul(order))
@@ -6774,8 +7099,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // node's draw column (m) and log weight. For the whole evaluation: the
     // accumulators `E_p[t ⊗ ngs]` (n·m), `E_p[ngs]` (n), `E_p[t tᵀ]` (m²), `E_p[t]` and
     // the node `t` (m each), the explicit gradient and the target's per-node gradient
-    // (k each), the fine and lower rule tables, and the cursor's table slices and
-    // digits.
+    // (k each), the fine and lower rule tables, the cursor's table slices and
+    // digits, and on a truncated axis the fine nodes' end sensitivities.
     let f64_bytes = std::mem::size_of::<f64>();
     let working_memory_refusal = |reason: &str| BlockQuadratureRefusal::WorkingMemory {
         axis_orders: axis_orders.to_vec(),
@@ -6809,6 +7134,13 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             bytes.checked_add(
                 m.checked_mul(std::mem::size_of::<&[(f64, f64)]>() + std::mem::size_of::<usize>())?,
             )
+        })
+        .and_then(|bytes| {
+            bytes.checked_add(axis_transport.as_ref().map_or(Some(0), |(_, _, sensitivities)| {
+                sensitivities
+                    .len()
+                    .checked_mul(std::mem::size_of::<(f64, f64)>())
+            })?)
         })
         .ok_or_else(|| working_memory_refusal("the accumulators' working bytes overflow usize"))?;
     let governor = gam_runtime::resource::MemoryGovernor::global();
@@ -6852,6 +7184,10 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     // rule's weight-normalisation roundoff cancels rather than being reported
     // as part of the correction (see `StreamingLogSumExp`).
     let mut fine_norm = StreamingLogSumExp::new();
+    // On a truncated axis, `Σ_k w_k ∂ΔF/∂t(t_k)·∂ψ_k/∂(lower, upper)` on the same
+    // running scale as `sum_w`: the part of each end's derivative that moves the nodes.
+    let mut end_slope_acc = [0.0_f64; 2];
+    let mut node_index = 0usize;
     let mut t = Array1::<f64>::zeros(m);
     visit_product_rule_in_chunks(
         log_rules.iter().map(Vec::as_slice).collect(),
@@ -6862,6 +7198,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
             for &log_weight in log_weights {
                 fine_norm.push(log_weight);
             }
+            let chunk_start = node_index;
+            node_index += log_weights.len();
             // The per-node design matvec `s = X_t·(V_b·t_s)` is batched over the
             // chunk's columns (the #1082 hot path).
             let batched = target.excess_with_displaced_neg_score_batch(draws);
@@ -6888,6 +7226,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                     e_tt_acc *= rescale;
                     e_ngs_acc *= rescale;
                     e_t_ngs_acc *= rescale;
+                    end_slope_acc[0] *= rescale;
+                    end_slope_acc[1] *= rescale;
                     max_lw = lw;
                 }
                 let w = (lw - max_lw).exp();
@@ -6910,6 +7250,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                     }
                     e_t_ngs_acc.column_mut(r).scaled_add(wt_r, &ngs);
                 }
+                if let Some((truncation, _, sensitivities)) = axis_transport.as_ref() {
+                    let (d_lower, d_upper) = sensitivities[chunk_start + column];
+                    let slope = w * truncation.excess_slope(t[0], &ngs);
+                    end_slope_acc[0] += slope * d_lower;
+                    end_slope_acc[1] += slope * d_upper;
+                }
             }
             Ok(())
         },
@@ -6920,9 +7266,12 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                 .to_string(),
         ));
     }
-    let value = (max_lw + sum_w.ln()) - fine_norm.value();
+    let log_mass = axis_transport
+        .as_ref()
+        .map_or(0.0, |(_, transport, _)| transport.log_mass());
+    let value = (max_lw + sum_w.ln()) - fine_norm.value() + log_mass;
     // Self-normalized importance-weighted gradient E_p[−∂ΔF/∂ρ] and moments.
-    let (rho_gradient, moments) = if sum_w > 0.0 {
+    let (rho_gradient, mut moments) = if sum_w > 0.0 {
         (
             grad_acc / sum_w,
             Some(BlockQuadratureMoments {
@@ -6935,6 +7284,44 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
     } else {
         (Array1::zeros(k), None)
     };
+    // A truncated axis's ends move with the mode, the curvature and the block
+    // direction, and the value moves with them: through `ln Z` and through every
+    // transported node `t_k = ψ_k/√λ`,
+    //
+    //   D_e = ∂value/∂e = ∂ln Z/∂e − (1/√λ)·E_p[∂ΔF/∂t · ∂ψ/∂e],   e ∈ {lower, upper}.
+    //
+    // An end at row `i` with slope `x_i = ∂s_i/∂t` sits at `e = √λ·(c − η̂_i)/x_i`
+    // for the boundary constant `c`, so
+    //
+    //   de = −(√λ/x_i)·dη̂_i + (e/2λ)·dλ − (e/x_i)·dx_i.
+    //
+    // The moment channels read `E_p[ngs_i]` as `∂cost/∂η̂_i`, `x_iᵀE_p[t·ngs_i]`
+    // through `M = −½ xᵀE_p[t·ngs] + …` as `λ·∂cost/∂λ`, and `E_p[t·ngs_i]` against
+    // `dx_i = X_i·dv` as `∂cost/∂v`, with `cost = −value`. Adding `D_e·√λ/x_i` to
+    // the first and `D_e·e/x_i` to the second carries all three motions exactly.
+    if let (Some((truncation, transport, _)), Some(moments)) =
+        (axis_transport.as_ref(), moments.as_mut())
+    {
+        let sqrt_lambda = lambdas[0].sqrt();
+        let (log_mass_lower, log_mass_upper) = transport.log_mass_endpoint_gradient();
+        let ends = [
+            (truncation.lower(), transport.lower(), log_mass_lower),
+            (truncation.upper(), transport.upper(), log_mass_upper),
+        ];
+        for ((cut, end, log_mass_gradient), node_part) in ends.into_iter().zip(end_slope_acc) {
+            let Some(cut) = cut else { continue };
+            let end_derivative = log_mass_gradient - node_part / (sum_w * sqrt_lambda);
+            if cut.row >= n_obs || !(cut.row_slope != 0.0) {
+                return Err(Integration(format!(
+                    "block_quadrature_marginal_correction: a feasible-interval end names row {} \
+                     with slope {} in a {n_obs}-row block",
+                    cut.row, cut.row_slope
+                )));
+            }
+            moments.e_neg_score[cut.row] += end_derivative * sqrt_lambda / cut.row_slope;
+            moments.e_t_neg_score[(cut.row, 0)] += end_derivative * end / cut.row_slope;
+        }
+    }
     // Paired-rule difference per axis: repeat only the scalar integral with that
     // axis one and two orders lower, every other axis unchanged, and keep the
     // larger difference. The odd-order and even-order Gauss–Hermite sequences
@@ -6988,8 +7375,8 @@ fn block_quadrature_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>
                      {axis} at order {lower_order} was infeasible"
                 )));
             }
-            paired_error =
-                paired_error.max((value - (coarse_log_numerator - coarse_norm.value())).abs());
+            paired_error = paired_error
+                .max((value - (coarse_log_numerator - coarse_norm.value() + log_mass)).abs());
         }
         axis_quadrature_errors.push(paired_error);
     }
