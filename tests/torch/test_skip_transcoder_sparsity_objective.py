@@ -15,6 +15,8 @@ torch = pytest.importorskip("torch")
 
 from gamfit.torch.skip_transcoder import (
     SkipAffineSmooth,
+    SkipTranscoderCandidateFailed,
+    SkipTranscoderFailedCandidate,
     SkipTranscoderProfile,
     select_skip_transcoder,
     skip_transcoder,
@@ -135,3 +137,103 @@ def test_skip_transcoder_continuous_profile_and_rank_birth_death_certificate():
         transition.to_rank in {0, 1, 2, 3}
         for transition in selected.certificate.transitions
     )
+    assert (
+        selected.certificate.stationarity_defect
+        <= selected.certificate.stationarity_tolerance
+    )
+
+
+def _quadratic_profile(trials):
+    target_logs = (0.37, -0.61)
+
+    def profile(trial):
+        trials.append(trial)
+        dl = trial.log_lambda_sparse - target_logs[0]
+        dt = trial.log_activation_threshold - target_logs[1]
+        score = dl * dl + dt * dt + float((trial.rank_skip - 2) ** 2)
+        smooth = SkipAffineSmooth(
+            in_dim=3,
+            out_dim=3,
+            n_atoms=4,
+            rank_skip=trial.rank_skip,
+            dtype=torch.float64,
+        )
+        return SkipTranscoderProfile(
+            smooth=smooth,
+            rank_skip=trial.rank_skip,
+            log_lambda_sparse=trial.log_lambda_sparse,
+            log_activation_threshold=trial.log_activation_threshold,
+            negative_log_evidence=score,
+            gradient_log_hyperparameters=(2.0 * dl, 2.0 * dt),
+            gradient_scale=1.0 + abs(score),
+        )
+
+    return profile
+
+
+def test_skip_transcoder_selection_queries_each_iterate_once_and_warm_starts():
+    trials = []
+    selected = select_skip_transcoder(
+        3,
+        3,
+        _quadratic_profile(trials),
+        initial_lambda_sparse=0.2,
+        initial_activation_threshold=0.8,
+    )
+    keys = [
+        (t.rank_skip, t.log_lambda_sparse, t.log_activation_threshold) for t in trials
+    ]
+    assert len(keys) == len(set(keys))
+    assert trials[0].transition == "seed"
+    assert trials[0].warm_start is None
+    assert all(t.warm_start is not None for t in trials[1:])
+    assert [
+        (m.from_rank, m.to_rank)
+        for m in selected.certificate.transitions
+        if m.accepted
+    ] == [(0, 1), (1, 2)]
+
+
+def test_skip_transcoder_failed_candidate_is_raised_not_skipped():
+    trials = []
+    quadratic = _quadratic_profile(trials)
+
+    def profile(trial):
+        if trial.rank_skip == 1:
+            return SkipTranscoderFailedCandidate(trial, RuntimeError("diverged"))
+        return quadratic(trial)
+
+    with pytest.raises(SkipTranscoderCandidateFailed) as raised:
+        select_skip_transcoder(
+            3,
+            3,
+            profile,
+            initial_lambda_sparse=0.2,
+            initial_activation_threshold=0.8,
+        )
+    assert raised.value.failure.trial.rank_skip == 1
+
+
+def test_skip_transcoder_rejects_a_profile_of_a_different_point():
+    def profile(trial):
+        smooth = SkipAffineSmooth(
+            in_dim=3, out_dim=3, n_atoms=4, rank_skip=trial.rank_skip
+        )
+        return SkipTranscoderProfile(
+            smooth=smooth,
+            rank_skip=trial.rank_skip,
+            log_lambda_sparse=trial.log_lambda_sparse + 1.0,
+            log_activation_threshold=trial.log_activation_threshold,
+            negative_log_evidence=0.0,
+            gradient_log_hyperparameters=(0.0, 0.0),
+            gradient_scale=1.0,
+        )
+
+    with pytest.raises(ValueError, match="exactly the requested"):
+        select_skip_transcoder(
+            3,
+            3,
+            profile,
+            initial_lambda_sparse=0.2,
+            initial_activation_threshold=0.8,
+        )

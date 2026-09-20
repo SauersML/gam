@@ -4710,6 +4710,10 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
         select_topology_candidate_lifecycle,
         module
     )?)?;
+    module.add_function(wrap_pyfunction!(
+        select_rank_with_profiled_hyperparameters,
+        module
+    )?)?;
     module.add_function(wrap_pyfunction!(stacking_weights_from_log_density, module)?)?;
     module.add_function(wrap_pyfunction!(stack_topologies_gaussian, module)?)?;
     module.add_function(wrap_pyfunction!(stacked_predictive_mean, module)?)?;
