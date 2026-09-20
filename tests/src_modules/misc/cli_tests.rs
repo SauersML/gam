@@ -11,7 +11,7 @@ use super::{
     prepend_id_column_to_prediction_csv,
     validate_cli_firth_configuration, validate_fit_args_preflight,
     write_estimand_explicit_prediction_csv, write_prediction_csv,
-    write_survival_binary_prediction_csv, write_survival_prediction_csv,
+    write_survival_binary_prediction_csv, write_survival_prediction_csv, ResponseBand,
 };
 use super::{
     Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs, log_level_for_verbosity,
@@ -5407,15 +5407,7 @@ fn survival_prediction_csv_includes_explicit_semantics_columns() {
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
-    write_survival_prediction_csv(
-        &path,
-        eta.view(),
-        surv.view(),
-        surv.view(),
-        None,
-        None,
-        None,
-    )
+    write_survival_prediction_csv(&path, eta.view(), surv.view(), surv.view(), None, None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv", e));
 
     let text =
@@ -5440,15 +5432,7 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let event = array![0.7, 0.2];
-    write_survival_binary_prediction_csv(
-        &path,
-        eta.view(),
-        event.view(),
-        event.view(),
-        None,
-        None,
-        None,
-    )
+    write_survival_binary_prediction_csv(&path, eta.view(), event.view(), event.view(), None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
     let text =
@@ -5463,21 +5447,21 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
 }
 
 #[test]
-fn survival_prediction_csv_emits_bounds_without_std_error() {
-    // Contract invariant: when a caller supplies interval bounds without
-    // `eta_se` (e.g. latent-window survival predictions: see
-    // SavedLatentWindowKind::Survival::write_predictions), the writer must
-    // still emit mean_lower / mean_upper columns instead of silently
-    // discarding them.
+fn survival_prediction_csv_publishes_eta_and_survival_standard_errors_by_name() {
+    // `std_error` is the posterior SD of the published `survival_prob`, the
+    // response-scale quantity every prediction table's `std_error` carries;
+    // the link-scale SD of `eta` rides under its own `eta_std_error` name.
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
         .as_nanos();
-    path.push(format!("gam_survival_pred_bounds_only_{ts}.csv"));
+    path.push(format!("gam_survival_pred_band_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
     let surv = eta.mapv(|v| (-v.exp()).exp().clamp(0.0, 1.0));
+    let eta_se = array![0.25, 0.375];
+    let survival_se = array![0.0625, 0.125];
     let lower = array![0.3, 0.4];
     let upper = array![0.9, 0.8];
     write_survival_prediction_csv(
@@ -5485,112 +5469,121 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
         eta.view(),
         surv.view(),
         surv.view(),
-        None,
-        Some(lower.view()),
-        Some(upper.view()),
+        Some(eta_se.view()),
+        Some(ResponseBand {
+            std_error: survival_se.view(),
+            lower: lower.view(),
+            upper: upper.view(),
+        }),
     )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "write survival prediction csv with bounds", e
-        )
-    });
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv with band", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
-        "survival output must include bounds when supplied without std_error",
+        header,
+        "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,eta_std_error,std_error,mean_lower,mean_upper",
+    );
+    // Every value here is a dyadic rational, so the `{:.12}` cell is exact.
+    for row in 0..2 {
+        assert_eq!(csv_value_at(&path, row, "eta_std_error"), eta_se[row]);
+        assert_eq!(csv_value_at(&path, row, "std_error"), survival_se[row]);
+    }
+
+    // The latent window integrates over the local posterior of
+    // `(eta, q_entry, q_exit)` and has no single eta SD: its table carries the
+    // survival band alone.
+    write_survival_prediction_csv(
+        &path,
+        eta.view(),
+        surv.view(),
+        surv.view(),
+        None,
+        Some(ResponseBand {
+            std_error: survival_se.view(),
+            lower: lower.view(),
+            upper: upper.view(),
+        }),
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write latent-window survival csv", e));
+    let text =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
+    assert_eq!(
+        text.lines().next().unwrap_or(""),
+        "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,std_error,mean_lower,mean_upper",
     );
 
     remove_temp_file(&path);
 }
 
 #[test]
-fn survival_prediction_csv_errors_on_half_supplied_bounds() {
-    // Contract invariant: lower XOR upper is structurally invalid and must
-    // return an error rather than produce a malformed CSV.
-    let mut path = std::env::temp_dir();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
-        .as_nanos();
-    path.push(format!("gam_survival_pred_half_bounds_{ts}.csv"));
-
-    let eta: Array1<f64> = array![0.0];
-    let surv = array![0.5];
-    let lower = array![0.1];
+fn prediction_band_refuses_partial_parts_as_an_internal_error() {
+    // A band is its SD and both bounds together. An evaluator that returned
+    // part of one broke its own contract; that is an internal error, never a
+    // smaller table and never the formula category a caller could fix.
+    let se = array![0.1];
+    let lower = array![0.2];
     let upper = array![0.9];
-
-    let err_lower_only = write_survival_prediction_csv(
-        &path,
-        eta.view(),
-        surv.view(),
-        surv.view(),
-        None,
-        Some(lower.view()),
-        None,
-    )
-    .expect_err("lower-only survival bounds must be rejected");
-    assert!(
-        err_lower_only
-            .to_string()
-            .contains("survival_upper missing"),
-        "lower-only error message wrong: {err_lower_only}"
-    );
-
-    let err_upper_only = write_survival_prediction_csv(
-        &path,
-        eta.view(),
-        surv.view(),
-        surv.view(),
-        None,
-        None,
-        Some(upper.view()),
-    )
-    .expect_err("upper-only survival bounds must be rejected");
-    assert!(
-        err_upper_only
-            .to_string()
-            .contains("survival_lower missing"),
-        "upper-only error message wrong: {err_upper_only}"
-    );
-
-    remove_temp_file(&path);
+    let partial = [
+        (Some(se.view()), Some(lower.view()), None),
+        (Some(se.view()), None, Some(upper.view())),
+        (None, Some(lower.view()), Some(upper.view())),
+        (Some(se.view()), None, None),
+        (None, Some(lower.view()), None),
+        (None, None, Some(upper.view())),
+    ];
+    for (std_error, lower, upper) in partial {
+        let presence = (std_error.is_some(), lower.is_some(), upper.is_some());
+        match ResponseBand::from_parts(std_error, lower, upper) {
+            Err(CliError::Internal { .. }) => {}
+            Err(other) => panic!("partial band {presence:?}: wrong category {other:?}"),
+            Ok(band) => panic!(
+                "partial band {presence:?} was accepted (band present: {})",
+                band.is_some()
+            ),
+        }
+    }
+    let whole = ResponseBand::from_parts(Some(se.view()), Some(lower.view()), Some(upper.view()))
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "whole band", e));
+    assert!(whole.is_some());
+    let absent = ResponseBand::from_parts(None, None, None)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "absent band", e));
+    assert!(absent.is_none());
 }
 
 #[test]
-fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
-    // Parallel contract invariant to
-    // survival_prediction_csv_emits_bounds_without_std_error: the binary
-    // writer (used by SavedLatentWindowKind::EventProbability) must emit
-    // mean_lower / mean_upper when the caller supplies bounds without
-    // `eta_se`.
+fn survival_binary_prediction_csv_publishes_the_event_probability_band() {
+    // The binary writer (latent-window event probability and Bernoulli
+    // marginal slope) carries the band on `mean`: its posterior SD under
+    // `std_error`, beside the bounds.
     let mut path = std::env::temp_dir();
     let ts = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
         .as_nanos();
-    path.push(format!("gam_survival_binary_pred_bounds_only_{ts}.csv"));
+    path.push(format!("gam_survival_binary_pred_band_{ts}.csv"));
 
     let eta: Array1<f64> = array![0.5, -0.25];
-    let event = array![0.7, 0.2];
-    let lower = array![0.5, 0.1];
-    let upper = array![0.9, 0.4];
+    let event = array![0.75, 0.25];
+    let event_se = array![0.0625, 0.03125];
+    let lower = array![0.5, 0.125];
+    let upper = array![0.875, 0.375];
     write_survival_binary_prediction_csv(
         &path,
         eta.view(),
         event.view(),
         event.view(),
-        None,
-        Some(lower.view()),
-        Some(upper.view()),
+        Some(ResponseBand {
+            std_error: event_se.view(),
+            lower: lower.view(),
+            upper: upper.view(),
+        }),
     )
     .unwrap_or_else(|e| {
         panic!(
             "{} failed: {:?}",
-            "write survival binary prediction csv with bounds", e
+            "write survival binary prediction csv with band", e
         )
     });
 
@@ -5599,57 +5592,11 @@ fn survival_binary_prediction_csv_emits_bounds_without_std_error() {
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
         header,
-        "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score,mean_lower,mean_upper",
-        "survival binary output must include bounds when supplied without std_error",
+        "eta,mean_plugin,mean,event_prob,failure_prob,survival_prob,risk_score,std_error,mean_lower,mean_upper",
     );
-
-    remove_temp_file(&path);
-}
-
-#[test]
-fn survival_binary_prediction_csv_errors_on_half_supplied_bounds() {
-    // Parallel contract invariant: lower XOR upper is structurally invalid.
-    let mut path = std::env::temp_dir();
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "clock", e))
-        .as_nanos();
-    path.push(format!("gam_survival_binary_pred_half_bounds_{ts}.csv"));
-
-    let eta: Array1<f64> = array![0.0];
-    let event = array![0.5];
-    let lower = array![0.1];
-    let upper = array![0.9];
-
-    let err_lower_only = write_survival_binary_prediction_csv(
-        &path,
-        eta.view(),
-        event.view(),
-        event.view(),
-        None,
-        Some(lower.view()),
-        None,
-    )
-    .expect_err("lower-only binary bounds must be rejected");
-    assert!(
-        err_lower_only.to_string().contains("event_upper missing"),
-        "lower-only binary error message wrong: {err_lower_only}"
-    );
-
-    let err_upper_only = write_survival_binary_prediction_csv(
-        &path,
-        eta.view(),
-        event.view(),
-        event.view(),
-        None,
-        None,
-        Some(upper.view()),
-    )
-    .expect_err("upper-only binary bounds must be rejected");
-    assert!(
-        err_upper_only.to_string().contains("event_lower missing"),
-        "upper-only binary error message wrong: {err_upper_only}"
-    );
+    for row in 0..2 {
+        assert_eq!(csv_value_at(&path, row, "std_error"), event_se[row]);
+    }
 
     remove_temp_file(&path);
 }
@@ -5665,7 +5612,7 @@ fn prediction_csv_can_prepend_id_column() {
 
     let eta = array![0.5, -0.25];
     let mean = array![0.62, 0.44];
-    write_prediction_csv(&path, eta.view(), mean.view(), None, None, None)
+    write_prediction_csv(&path, eta.view(), mean.view(), None)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "write prediction csv", e));
     prepend_id_column_to_prediction_csv(&path, "person_id", &["p1".to_string(), "p2".to_string()])
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "prepend id column", e));
@@ -6664,7 +6611,8 @@ fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
         assert_published("survival_prob", i, mean);
         assert_published("survival_prob_plugin", i, plugin[[i, 0]]);
         assert_published("eta", i, library.linear_predictor[i]);
-        assert_published("std_error", i, eta_se[i]);
+        assert_published("eta_std_error", i, eta_se[i]);
+        assert_published("std_error", i, sd);
         assert_published("mean_lower", i, (mean - z * sd).clamp(0.0, 1.0));
         assert_published("mean_upper", i, (mean + z * sd).clamp(0.0, 1.0));
         let delta = normal_cdf(-library.linear_predictor[i] / (1.0 + eta_se[i] * eta_se[i]).sqrt());

@@ -39,6 +39,66 @@ pub(crate) const SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS: [&str; 7] = [
 ];
 pub(crate) const PREDICTION_INTERVAL_COLUMNS: [&str; 2] = ["mean_lower", "mean_upper"];
 pub(crate) const PREDICTION_STD_ERROR_COLUMN: &str = "std_error";
+/// Posterior SD of the linear predictor `η` on the class-specific schemas that
+/// publish it. `std_error` is the response-scale posterior SD of the published
+/// mean, the quantity every prediction table's `std_error` /
+/// `posterior_mean_standard_error` column carries; the link-scale η SD is a
+/// different quantity and never rides under that name.
+pub(crate) const PREDICTION_ETA_STD_ERROR_COLUMN: &str = "eta_std_error";
+
+/// A posterior band on the published response-scale mean: its posterior
+/// standard deviation and its credible bounds, which always travel together.
+#[derive(Clone, Copy)]
+pub(crate) struct ResponseBand<'a> {
+    pub(crate) std_error: ArrayView1<'a, f64>,
+    pub(crate) lower: ArrayView1<'a, f64>,
+    pub(crate) upper: ArrayView1<'a, f64>,
+}
+
+impl<'a> ResponseBand<'a> {
+    /// Pairs the three band columns an uncertainty evaluator returns. A partial
+    /// band is an internal contract violation, never a smaller table.
+    pub(crate) fn from_parts(
+        std_error: Option<ArrayView1<'a, f64>>,
+        lower: Option<ArrayView1<'a, f64>>,
+        upper: Option<ArrayView1<'a, f64>>,
+    ) -> CliResult<Option<Self>> {
+        match (std_error, lower, upper) {
+            (Some(std_error), Some(lower), Some(upper)) => Ok(Some(Self {
+                std_error,
+                lower,
+                upper,
+            })),
+            (None, None, None) => Ok(None),
+            (std_error, lower, upper) => Err(CliError::Internal {
+                reason: format!(
+                    "internal error: a prediction band needs its standard error and both bounds \
+                     together (std_error present: {}, lower present: {}, upper present: {})",
+                    std_error.is_some(),
+                    lower.is_some(),
+                    upper.is_some()
+                ),
+            }),
+        }
+    }
+
+    fn append_to(self, columns: &mut Vec<(&'static str, Vec<f64>)>) {
+        columns.push((PREDICTION_STD_ERROR_COLUMN, self.std_error.to_vec()));
+        columns.push((PREDICTION_INTERVAL_COLUMNS[0], self.lower.to_vec()));
+        columns.push((PREDICTION_INTERVAL_COLUMNS[1], self.upper.to_vec()));
+    }
+}
+
+fn write_owned_prediction_columns(
+    path: &Path,
+    columns: &[(&'static str, Vec<f64>)],
+) -> CliResult<()> {
+    let borrowed: Vec<(&str, &[f64])> = columns
+        .iter()
+        .map(|(name, values)| (*name, values.as_slice()))
+        .collect();
+    write_prediction_csv_unified(path, &borrowed)
+}
 
 pub(crate) fn load_prediction_id_values(
     path: &Path,
@@ -237,59 +297,23 @@ pub(crate) fn write_prediction_csv_unified(
     Ok(())
 }
 
-/// Convenience wrapper: builds a standard (non-survival, non-location-scale)
-/// prediction column list and delegates to [`write_prediction_csv_unified`].
+/// Class-specific `eta,mean` writer (transformation-normal and every other
+/// class without the estimand-explicit or survival schema), with the
+/// response-scale band when one was requested.
 pub(crate) fn write_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
     mean: ArrayView1<'_, f64>,
-    eta_se: Option<ArrayView1<'_, f64>>,
-    mean_lower: Option<ArrayView1<'_, f64>>,
-    mean_upper: Option<ArrayView1<'_, f64>>,
+    band: Option<ResponseBand<'_>>,
 ) -> CliResult<()> {
-    // Materialise views into contiguous vecs so we can pass &[f64] slices.
-    let eta_v: Vec<f64> = eta.to_vec();
-    let mean_v: Vec<f64> = mean.to_vec();
-
-    let mut cols: Vec<(&str, &[f64])> = vec![
-        (SPECIALIZED_PREDICTION_BASE_COLUMNS[0], &eta_v),
-        (SPECIALIZED_PREDICTION_BASE_COLUMNS[1], &mean_v),
+    let mut columns = vec![
+        (SPECIALIZED_PREDICTION_BASE_COLUMNS[0], eta.to_vec()),
+        (SPECIALIZED_PREDICTION_BASE_COLUMNS[1], mean.to_vec()),
     ];
-
-    let se_v: Vec<f64>;
-    let lo_v: Vec<f64>;
-    let hi_v: Vec<f64>;
-    if let Some(se) = eta_se {
-        se_v = se.to_vec();
-        lo_v = mean_lower
-            .ok_or_else(|| {
-                "internal error: mean_lower missing while std_error is present".to_string()
-            })?
-            .to_vec();
-        hi_v = mean_upper
-            .ok_or_else(|| {
-                "internal error: mean_upper missing while std_error is present".to_string()
-            })?
-            .to_vec();
-        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if let (Some(lo), Some(hi)) = (mean_lower, mean_upper) {
-        lo_v = lo.to_vec();
-        hi_v = hi.to_vec();
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if mean_lower.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: mean_upper missing while mean_lower is present".to_string(),
-        });
-    } else if mean_upper.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: mean_lower missing while mean_upper is present".to_string(),
-        });
+    if let Some(band) = band {
+        band.append_to(&mut columns);
     }
-
-    write_prediction_csv_unified(path, &cols)
+    write_owned_prediction_columns(path, &columns)
 }
 
 /// Prediction writer for every model class that publishes the
@@ -373,137 +397,75 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
     write_prediction_csv_unified(path, &columns)
 }
 
-/// Convenience wrapper for survival predictions. Survival output uses explicit
-/// probability semantics because the event probability is `1 - survival_prob`.
+/// Survival prediction writer. Survival output uses explicit probability
+/// semantics because the event probability is `1 - survival_prob`. The band's
+/// `std_error` is the posterior SD of `survival_prob`; `eta_std_error` is the
+/// posterior SD of `eta`.
 pub(crate) fn write_survival_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
     survival_prob_plugin: ArrayView1<'_, f64>,
     survival_prob: ArrayView1<'_, f64>,
-    eta_se: Option<ArrayView1<'_, f64>>,
-    survival_lower: Option<ArrayView1<'_, f64>>,
-    survival_upper: Option<ArrayView1<'_, f64>>,
+    eta_std_error: Option<ArrayView1<'_, f64>>,
+    band: Option<ResponseBand<'_>>,
 ) -> CliResult<()> {
-    let eta_v: Vec<f64> = eta.to_vec();
-    let plugin_v: Vec<f64> = survival_prob_plugin
+    let survival: Vec<f64> = survival_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
+    let failure: Vec<f64> = survival
         .iter()
-        .map(|&v| v.clamp(0.0, 1.0))
+        .map(|&s| (1.0 - s).clamp(0.0, 1.0))
         .collect();
-    let surv_v: Vec<f64> = survival_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
-    let risk_v: Vec<f64> = eta_v.clone();
-    let fail_v: Vec<f64> = surv_v.iter().map(|&s| (1.0 - s).clamp(0.0, 1.0)).collect();
-
-    let mut cols: Vec<(&str, &[f64])> = vec![
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[0], &eta_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[1], &plugin_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[2], &surv_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[3], &fail_v),
-        (SURVIVAL_PREDICTION_BASE_COLUMNS[4], &risk_v),
+    let mut columns = vec![
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[0], eta.to_vec()),
+        (
+            SURVIVAL_PREDICTION_BASE_COLUMNS[1],
+            survival_prob_plugin
+                .iter()
+                .map(|&v| v.clamp(0.0, 1.0))
+                .collect(),
+        ),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[2], survival),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[3], failure),
+        (SURVIVAL_PREDICTION_BASE_COLUMNS[4], eta.to_vec()),
     ];
-
-    let se_v: Vec<f64>;
-    let lo_v: Vec<f64>;
-    let hi_v: Vec<f64>;
-    if let Some(se) = eta_se {
-        se_v = se.to_vec();
-        lo_v = survival_lower
-            .ok_or_else(|| {
-                "internal error: survival_lower missing while std_error is present".to_string()
-            })?
-            .to_vec();
-        hi_v = survival_upper
-            .ok_or_else(|| {
-                "internal error: survival_upper missing while std_error is present".to_string()
-            })?
-            .to_vec();
-        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if let (Some(lo), Some(hi)) = (survival_lower, survival_upper) {
-        lo_v = lo.to_vec();
-        hi_v = hi.to_vec();
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if survival_lower.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: survival_upper missing while survival_lower is present"
-                .to_string(),
-        });
-    } else if survival_upper.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: survival_lower missing while survival_upper is present"
-                .to_string(),
-        });
+    if let Some(values) = eta_std_error {
+        columns.push((PREDICTION_ETA_STD_ERROR_COLUMN, values.to_vec()));
     }
-
-    write_prediction_csv_unified(path, &cols)
+    if let Some(band) = band {
+        band.append_to(&mut columns);
+    }
+    write_owned_prediction_columns(path, &columns)
 }
 
-/// Convenience wrapper for binary deployment predictions backed by a survival
-/// hazard window (includes explicit `event_prob`, `failure_prob`, and
-/// `survival_prob` columns).
+/// Writer for binary deployment predictions backed by a survival hazard window
+/// (includes explicit `event_prob`, `failure_prob`, and `survival_prob`
+/// columns). The band's `std_error` is the posterior SD of the event
+/// probability `mean`.
 pub(crate) fn write_survival_binary_prediction_csv(
     path: &Path,
     eta: ArrayView1<'_, f64>,
     event_prob_plugin: ArrayView1<'_, f64>,
     event_prob: ArrayView1<'_, f64>,
-    eta_se: Option<ArrayView1<'_, f64>>,
-    event_lower: Option<ArrayView1<'_, f64>>,
-    event_upper: Option<ArrayView1<'_, f64>>,
+    band: Option<ResponseBand<'_>>,
 ) -> CliResult<()> {
-    let eta_v: Vec<f64> = eta.to_vec();
-    let plugin_v: Vec<f64> = event_prob_plugin
-        .iter()
-        .map(|&v| v.clamp(0.0, 1.0))
-        .collect();
-    let event_v: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
-    let risk_v: Vec<f64> = eta_v.clone();
-    let survival_v: Vec<f64> = event_v.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
-
-    let mut cols: Vec<(&str, &[f64])> = vec![
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[0], &eta_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[1], &plugin_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[2], &event_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[3], &event_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[4], &event_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], &survival_v),
-        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[6], &risk_v),
+    let event: Vec<f64> = event_prob.iter().map(|&v| v.clamp(0.0, 1.0)).collect();
+    let survival: Vec<f64> = event.iter().map(|&p| (1.0 - p).clamp(0.0, 1.0)).collect();
+    let mut columns = vec![
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[0], eta.to_vec()),
+        (
+            SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[1],
+            event_prob_plugin
+                .iter()
+                .map(|&v| v.clamp(0.0, 1.0))
+                .collect(),
+        ),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[2], event.clone()),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[3], event.clone()),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[4], event),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[5], survival),
+        (SURVIVAL_BINARY_PREDICTION_BASE_COLUMNS[6], eta.to_vec()),
     ];
-
-    let se_v: Vec<f64>;
-    let lo_v: Vec<f64>;
-    let hi_v: Vec<f64>;
-    if let Some(se) = eta_se {
-        se_v = se.to_vec();
-        lo_v = event_lower
-            .ok_or_else(|| CliError::Internal {
-                reason: "internal error: event_lower missing while std_error is present"
-                    .to_string(),
-            })?
-            .to_vec();
-        hi_v = event_upper
-            .ok_or_else(|| CliError::Internal {
-                reason: "internal error: event_upper missing while std_error is present"
-                    .to_string(),
-            })?
-            .to_vec();
-        cols.push((PREDICTION_STD_ERROR_COLUMN, &se_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if let (Some(lo), Some(hi)) = (event_lower, event_upper) {
-        lo_v = lo.to_vec();
-        hi_v = hi.to_vec();
-        cols.push((PREDICTION_INTERVAL_COLUMNS[0], &lo_v));
-        cols.push((PREDICTION_INTERVAL_COLUMNS[1], &hi_v));
-    } else if event_lower.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: event_upper missing while event_lower is present".to_string(),
-        });
-    } else if event_upper.is_some() {
-        return Err(CliError::Internal {
-            reason: "internal error: event_lower missing while event_upper is present".to_string(),
-        });
+    if let Some(band) = band {
+        band.append_to(&mut columns);
     }
-
-    write_prediction_csv_unified(path, &cols)
+    write_owned_prediction_columns(path, &columns)
 }

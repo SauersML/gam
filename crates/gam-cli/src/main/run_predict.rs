@@ -1138,9 +1138,11 @@ pub(crate) fn run_predict_unified(
                 linear_predictor_plugin.view(),
                 mean_plugin.view(),
                 specialised_point.view(),
-                posterior_mean_standard_error.as_ref().map(|a| a.view()),
-                posterior_mean_lower.as_ref().map(|a| a.view()),
-                posterior_mean_upper.as_ref().map(|a| a.view()),
+                ResponseBand::from_parts(
+                    posterior_mean_standard_error.as_ref().map(|a| a.view()),
+                    posterior_mean_lower.as_ref().map(|a| a.view()),
+                    posterior_mean_upper.as_ref().map(|a| a.view()),
+                )?,
             )?;
         }
         _ => {
@@ -1148,9 +1150,11 @@ pub(crate) fn run_predict_unified(
                 &args.out,
                 linear_predictor_plugin.view(),
                 specialised_point.view(),
-                posterior_mean_standard_error.as_ref().map(|a| a.view()),
-                posterior_mean_lower.as_ref().map(|a| a.view()),
-                posterior_mean_upper.as_ref().map(|a| a.view()),
+                ResponseBand::from_parts(
+                    posterior_mean_standard_error.as_ref().map(|a| a.view()),
+                    posterior_mean_lower.as_ref().map(|a| a.view()),
+                    posterior_mean_upper.as_ref().map(|a| a.view()),
+                )?,
             )?;
         }
     }
@@ -1898,28 +1902,17 @@ impl SavedLatentWindowKind {
         eta: ArrayView1<'_, f64>,
         mean_plugin: ArrayView1<'_, f64>,
         mean: ArrayView1<'_, f64>,
-        mean_lower: Option<ArrayView1<'_, f64>>,
-        mean_upper: Option<ArrayView1<'_, f64>>,
+        band: Option<ResponseBand<'_>>,
     ) -> CliResult<()> {
         match self {
-            SavedLatentWindowKind::Survival => write_survival_prediction_csv(
-                path,
-                eta,
-                mean_plugin,
-                mean,
-                None,
-                mean_lower,
-                mean_upper,
-            ),
-            SavedLatentWindowKind::EventProbability => write_survival_binary_prediction_csv(
-                path,
-                eta,
-                mean_plugin,
-                mean,
-                None,
-                mean_lower,
-                mean_upper,
-            ),
+            // The window integrates the response over the local posterior of
+            // `(η, q_entry, q_exit)`; no single η SD describes that band.
+            SavedLatentWindowKind::Survival => {
+                write_survival_prediction_csv(path, eta, mean_plugin, mean, None, band)
+            }
+            SavedLatentWindowKind::EventProbability => {
+                write_survival_binary_prediction_csv(path, eta, mean_plugin, mean, band)
+            }
         }
     }
 }
@@ -2132,6 +2125,7 @@ pub(crate) fn run_predict_saved_latent_window_impl(
     };
 
     let mean: Array1<f64>;
+    let mut mean_sd = None;
     let mut mean_lo = None;
     let mut mean_hi = None;
     {
@@ -2202,16 +2196,11 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         if args.uncertainty {
             validate_level(args.level)?;
             let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
-            let (lo, hi) = response_interval_from_mean_sd(
-                mean.view(),
-                response_sd
-                    .as_ref()
-                    .ok_or_else(|| "internal error: latent window response SD missing".to_string())?
-                    .view(),
-                z,
-                0.0,
-                1.0,
-            );
+            let response_sd = response_sd
+                .ok_or_else(|| "internal error: latent window response SD missing".to_string())?;
+            let (lo, hi) =
+                response_interval_from_mean_sd(mean.view(), response_sd.view(), z, 0.0, 1.0);
+            mean_sd = Some(response_sd);
             mean_lo = Some(lo);
             mean_hi = Some(hi);
         }
@@ -2222,8 +2211,11 @@ pub(crate) fn run_predict_saved_latent_window_impl(
         state.eta.view(),
         plugin_mean.view(),
         mean.view(),
-        mean_lo.as_ref().map(|a| a.view()),
-        mean_hi.as_ref().map(|a| a.view()),
+        ResponseBand::from_parts(
+            mean_sd.as_ref().map(|a| a.view()),
+            mean_lo.as_ref().map(|a| a.view()),
+            mean_hi.as_ref().map(|a| a.view()),
+        )?,
     )?;
     cli_out!(
         "wrote predictions: {} (rows={}){}",
@@ -2340,7 +2332,7 @@ fn run_predict_saved_survival_marginal_slope(
         })?,
         "plug-in survival",
     )?;
-    let (eta_se, mean_lo, mean_hi) = if args.uncertainty {
+    let (eta_se, survival_sd, mean_lo, mean_hi) = if args.uncertainty {
         let eta_se = result.eta_se.clone().ok_or_else(|| {
             "internal error: survival marginal-slope eta_se missing under --uncertainty".to_string()
         })?;
@@ -2353,9 +2345,9 @@ fn run_predict_saved_survival_marginal_slope(
         )?;
         let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
         let (lo, hi) = response_interval_from_mean_sd(mean.view(), survival_sd.view(), z, 0.0, 1.0);
-        (Some(eta_se), Some(lo), Some(hi))
+        (Some(eta_se), Some(survival_sd), Some(lo), Some(hi))
     } else {
-        (None, None, None)
+        (None, None, None, None)
     };
     write_survival_prediction_csv(
         &args.out,
@@ -2363,8 +2355,11 @@ fn run_predict_saved_survival_marginal_slope(
         survival_plugin.view(),
         mean.view(),
         eta_se.as_ref().map(|values| values.view()),
-        mean_lo.as_ref().map(|values| values.view()),
-        mean_hi.as_ref().map(|values| values.view()),
+        ResponseBand::from_parts(
+            survival_sd.as_ref().map(|values| values.view()),
+            mean_lo.as_ref().map(|values| values.view()),
+            mean_hi.as_ref().map(|values| values.view()),
+        )?,
     )?;
     // Result-owned provenance (#2296): the point integral ran under the
     // requested covariance; the bands report what the engine says it used.
@@ -2738,17 +2733,11 @@ pub(crate) fn run_predict_survival(
             .as_ref()
             .map(|out| out.eta.clone())
             .unwrap_or_else(|| pred.eta.clone());
-        let eta_se_default = posterior_or_uncertainty
-            .as_ref()
-            .map(|out| out.eta_standard_error.clone());
         if args.uncertainty {
             validate_level(args.level)?;
             let out = posterior_or_uncertainty.as_ref().ok_or_else(|| {
                 "internal error: survival location-scale uncertainty output missing".to_string()
             })?;
-            let eta_se = eta_se_default
-                .clone()
-                .unwrap_or_else(|| out.eta_standard_error.clone());
             // This branch requests response SDs above. Substituting zeros on
             // None would silently collapse mean_lower/mean_upper to the point
             // estimate; fail loudly instead.
@@ -2764,9 +2753,12 @@ pub(crate) fn run_predict_survival(
                 eta_out.view(),
                 pred.survival_prob.view(),
                 mean.view(),
-                Some(eta_se.view()),
-                Some(mean_lo.view()),
-                Some(mean_hi.view()),
+                Some(out.eta_standard_error.view()),
+                Some(ResponseBand {
+                    std_error: response_sd.view(),
+                    lower: mean_lo.view(),
+                    upper: mean_hi.view(),
+                }),
             )?;
         } else {
             write_survival_prediction_csv(
@@ -2774,7 +2766,6 @@ pub(crate) fn run_predict_survival(
                 eta_out.view(),
                 pred.survival_prob.view(),
                 mean.view(),
-                None,
                 None,
                 None,
             )?;
@@ -2883,6 +2874,7 @@ pub(crate) fn run_predict_survival(
     .map_err(|e| format!("survival prediction failed: {e}"))?
     .mean;
     let mut eta_se = None;
+    let mut mean_sd = None;
     let mut mean_lo = None;
     let mut mean_hi = None;
     if args.uncertainty {
@@ -2911,6 +2903,7 @@ pub(crate) fn run_predict_survival(
             0.0,
             1.0,
         );
+        mean_sd = Some(uncertainty.mean_standard_error);
         mean_lo = Some(lo);
         mean_hi = Some(hi);
     }
@@ -2920,8 +2913,11 @@ pub(crate) fn run_predict_survival(
         survival_plugin.view(),
         mean.view(),
         eta_se.as_ref().map(|a| a.view()),
-        mean_lo.as_ref().map(|a| a.view()),
-        mean_hi.as_ref().map(|a| a.view()),
+        ResponseBand::from_parts(
+            mean_sd.as_ref().map(|a| a.view()),
+            mean_lo.as_ref().map(|a| a.view()),
+            mean_hi.as_ref().map(|a| a.view()),
+        )?,
     )?;
     cli_out!(
         "wrote predictions: {} (rows={}){}",

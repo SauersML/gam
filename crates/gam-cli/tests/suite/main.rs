@@ -23,3 +23,4 @@ mod regression_predict_cli_surfaces_covariance_provenance;
 mod regression_predict_uncertainty_point_mean_linear_link;
 mod regression_separated_binomial_predict_round_trips_2273;
 mod spline_scan_persistence_acceptance_2302;
+mod survival_predict_std_error_is_response_scale;
