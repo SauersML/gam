@@ -2979,5 +2979,20 @@
     ],
     "reason": "#3452: compute the covariance from joint per-observation first-stage and empirical-grid sampling influences, preserving their cross covariance. The former standalone sandwich production function is replaced by the live row-influence Gram. Tests independently assemble score meat and block inverse bread rather than retain the removed implementation.",
     "evidence": "MSI: seven numerical checks pass, including builder weight finite differences, independently assembled sandwich covariance, exact opposing-influence cancellation and 4000 grid-only Monte Carlo samples. Two complete BMS fits (Gaussian and heavy-tailed, n=2000) return finite corrected covariance. Complete model unit-source metadata compiles with warnings denied. No 800-fit CI sweep or timeout extension is introduced."
+  },
+  {
+    "base": "3f88cea464f45248c61a0f4f81ba792d79615573",
+    "items": [
+      "crates/gam-report/src/lib.rs:fn:fmt_num",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_at_1e4_uses_scientific",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_exactly_0_01_uses_scientific",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_above_0_01_threshold",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_below_1e4",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_negative",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_positive",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_zero_uses_scientific"
+    ],
+    "reason": "#2469: HTML summary numbers now use the canonical six-significant-digit formatter; its notation selection also honors rounding across decimal boundaries. The duplicate formatter and its obsolete tests are replaced by tests of the active implementation.",
+    "evidence": "All42 complete gam-report unit tests pass on MSI, including rounding boundaries, subnormal/maxfinite values, existing HTML checks, and no report-invented significance threshold. No fmt_num definition or call remains."
   }
 ]
