@@ -504,8 +504,8 @@ pub(crate) fn compute_outer_hessian(
     };
     let second_mode_kernel = mode_kernel();
 
-    let batched_rho_pair_corrections: Option<Vec<f64>> = if incl_logdet_h
-        && subspace.is_some()
+    let batched_rho_pair_corrections: Option<Vec<f64>> = if let Some(kernel) = subspace
+        && incl_logdet_h
         && effective_deriv.has_corrections()
         && effective_deriv.has_batched_hessian_second_derivative_corrections()
     {
@@ -532,23 +532,47 @@ pub(crate) fn compute_outer_hessian(
                 )
             })
             .collect();
-        let corrections = effective_deriv.hessian_second_derivative_corrections_result(&triples)?;
-        let mut correction_values = vec![0.0_f64; corrections.len()];
-        if let Some(kernel) = subspace {
-            let mut present_indices = Vec::new();
-            let mut present_drifts = Vec::new();
-            for (idx, correction) in corrections.into_iter().enumerate() {
-                if let Some(drift) = correction {
-                    present_indices.push(idx);
-                    present_drifts.push(drift);
+        // The subspace trace is `tr(Fᵀ·C·F)` with the kernel's own factor
+        // `F·Fᵀ = K`, so a provider whose row kernel contracts `F` itself
+        // answers every pair's trace without forming the drifts (gam#2922,
+        // #3322), exactly as on the full-space path below.
+        let traced = if effective_deriv.has_hessian_second_derivative_correction_traces() {
+            effective_deriv.hessian_second_derivative_correction_traces(
+                &penalty_subspace_trace_factor(kernel),
+                &triples,
+            )?
+        } else {
+            None
+        };
+        match traced {
+            Some(values) => {
+                if values.len() != rho_pair_count {
+                    return Err(format!(
+                        "outer Hessian correction traces: {} for {rho_pair_count} pairs",
+                        values.len()
+                    ));
                 }
+                Some(values)
             }
-            let traced = penalty_subspace_trace_drifts_batched(kernel, &present_drifts);
-            for (idx, value) in present_indices.into_iter().zip(traced) {
-                correction_values[idx] = value;
+            None => {
+                let corrections =
+                    effective_deriv.hessian_second_derivative_corrections_result(&triples)?;
+                let mut correction_values = vec![0.0_f64; corrections.len()];
+                let mut present_indices = Vec::new();
+                let mut present_drifts = Vec::new();
+                for (idx, correction) in corrections.into_iter().enumerate() {
+                    if let Some(drift) = correction {
+                        present_indices.push(idx);
+                        present_drifts.push(drift);
+                    }
+                }
+                let traced = penalty_subspace_trace_drifts_batched(kernel, &present_drifts);
+                for (idx, value) in present_indices.into_iter().zip(traced) {
+                    correction_values[idx] = value;
+                }
+                Some(correction_values)
             }
         }
-        Some(correction_values)
     } else {
         None
     };
