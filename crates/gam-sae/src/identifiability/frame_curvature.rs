@@ -1061,14 +1061,17 @@ pub fn streamed_lambda_max(
             operator.root_rows(),
         ));
     }
+    // The solve certified `residual / |θ|` against the unclamped Ritz value, so
+    // the reported ratio is read off that same `|θ|`, never off the clamp.
+    let relative_residual = if residual == 0.0 {
+        0.0
+    } else {
+        residual / lambda_max.abs()
+    };
     let lambda_max = lambda_max.clamp(0.0, trace);
     Ok(StreamedLambdaMax {
         lambda_max,
-        relative_residual: if residual == 0.0 {
-            0.0
-        } else {
-            residual / lambda_max
-        },
+        relative_residual,
         trace,
         passes: matvecs + 1,
     })
