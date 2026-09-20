@@ -6146,6 +6146,198 @@ where
     })
 }
 
+/// Search domain of the latent joint theta past its smoothing block, laid out
+/// `[latent flat t | analytic-penalty rho | direct hypers]` (#4266).
+///
+/// A log-strength coordinate has no penalty geometry the design Gram can
+/// project. That covers every direct log-precision (the anchor's `ln μ`, each
+/// ARD `ln α_j`) and every analytic coordinate the registry publishes with
+/// finite faces. Those finite faces are a learnable weight's or a log-alpha's
+/// representable effective strength (`learnable_weight_coordinate_domain`).
+/// Such a coordinate searches the precision box
+/// [`coordinate_domain`](gam_solve::estimate::rho_domain::coordinate_domain)`(None, None)`,
+/// `[ln √ε, ln(1/√ε)]` around its declared strength. That is the law
+/// [`joint_rho_resolvability_domain`] applies to a smoothing coordinate
+/// without projectable geometry. An analytic coordinate also keeps its
+/// registry faces. A user `init_log_precision` seed is projected into this
+/// domain by the caller, so it always starts feasible.
+///
+/// The latent coordinates `t`, the behavioral-head coefficients and the
+/// analytic coordinates the registry leaves unbounded are not log-strengths.
+/// The unbounded ones are the parametric row-precision raw-beta and mean
+/// offsets. These have no derived domain yet (the #4266 remainder) and keep
+/// their previous box. For `t` that box is `±(max|t₀| + 10)`, taken around
+/// the seed the search actually starts from, including a persistent-cache
+/// seed. For the rest it is `±12`.
+fn latent_joint_auxiliary_domain(
+    auxiliary_seed: ndarray::ArrayView1<'_, f64>,
+    latent_flat_dim: usize,
+    registry: Option<&gam_terms::AnalyticPenaltyRegistry>,
+    direct_slots: &[LatentDirectHyperSlot],
+) -> Result<(Array1<f64>, Array1<f64>), EstimationError> {
+    let analytic_rho_count = registry.map_or(0, |registry| registry.total_rho_count());
+    let dim = latent_flat_dim + analytic_rho_count + direct_slots.len();
+    if auxiliary_seed.len() != dim {
+        crate::bail_invalid_estim!(
+            "latent joint auxiliary seed has length {} for {latent_flat_dim} latent, \
+             {analytic_rho_count} analytic and {} direct coordinates",
+            auxiliary_seed.len(),
+            direct_slots.len()
+        );
+    }
+    let log_strength_domain = gam_solve::estimate::rho_domain::coordinate_domain(None, None);
+    let underived_face = 12.0;
+    let mut lower = Array1::<f64>::from_elem(dim, -underived_face);
+    let mut upper = Array1::<f64>::from_elem(dim, underived_face);
+
+    let latent_bound = auxiliary_seed
+        .slice(s![..latent_flat_dim])
+        .iter()
+        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
+        + 10.0;
+    lower.slice_mut(s![..latent_flat_dim]).fill(-latent_bound);
+    upper.slice_mut(s![..latent_flat_dim]).fill(latent_bound);
+
+    if let Some(registry) = registry {
+        let (domain_lower, domain_upper) = registry
+            .rho_domain_bounds()
+            .map_err(EstimationError::InvalidInput)?;
+        for local in 0..analytic_rho_count {
+            let axis = latent_flat_dim + local;
+            let (lo, hi) = (domain_lower[local], domain_upper[local]);
+            if lo.is_finite() && hi.is_finite() {
+                lower[axis] = lo.max(log_strength_domain.0);
+                upper[axis] = hi.min(log_strength_domain.1);
+            } else {
+                lower[axis] = lower[axis].max(lo);
+                upper[axis] = upper[axis].min(hi);
+            }
+            if lower[axis] >= upper[axis] {
+                return Err(EstimationError::InvalidInput(format!(
+                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
+                    lower[axis], upper[axis]
+                )));
+            }
+        }
+    }
+
+    let direct_start = latent_flat_dim + analytic_rho_count;
+    for (slot_index, slot) in direct_slots.iter().enumerate() {
+        if *slot == LatentDirectHyperSlot::LogPrecision {
+            lower[direct_start + slot_index] = log_strength_domain.0;
+            upper[direct_start + slot_index] = log_strength_domain.1;
+        }
+    }
+    Ok((lower, upper))
+}
+
+#[cfg(test)]
+mod latent_joint_auxiliary_domain_tests {
+    use super::*;
+    use gam_terms::analytic_penalties::{
+        AnalyticPenaltyKind, OrderedBetaBernoulliPenalty, ParametricRowPrecisionPriorPenalty,
+        PsiSlice,
+    };
+    use std::sync::Arc;
+
+    #[test]
+    fn direct_hyper_slots_match_the_seed_layout_4266() {
+        use gam_terms::latent::LatentIdMode;
+        for mode in [
+            LatentIdMode::None,
+            LatentIdMode::DimSelection {
+                init_log_precision: None,
+            },
+        ] {
+            let slots = latent_coord_direct_hyper_slots(&mode, 3);
+            let seeds = latent_coord_initial_direct_hypers(&mode, 3).unwrap();
+            assert_eq!(slots.len(), seeds.len());
+            assert_eq!(slots.len(), latent_coord_direct_hyper_count(&mode, 3));
+            assert!(
+                slots
+                    .iter()
+                    .all(|slot| *slot == LatentDirectHyperSlot::LogPrecision)
+            );
+        }
+    }
+
+    /// A user ARD seed past the old `±12` box started infeasible. Every
+    /// log-precision now searches the precision box and its seed is projected.
+    #[test]
+    fn ard_log_precisions_search_the_precision_box_and_seeds_are_feasible_4266() {
+        let mode = gam_terms::latent::LatentIdMode::DimSelection {
+            init_log_precision: Some(ndarray::array![15.0, -30.0]),
+        };
+        let slots = latent_coord_direct_hyper_slots(&mode, 2);
+        let direct = latent_coord_initial_direct_hypers(&mode, 2).unwrap();
+        let latent = ndarray::array![0.5, -2.0, 1.0, 0.25];
+        let mut seed = Array1::<f64>::zeros(latent.len() + direct.len());
+        seed.slice_mut(s![..latent.len()]).assign(&latent);
+        seed.slice_mut(s![latent.len()..]).assign(&direct);
+
+        let (lower, upper) =
+            latent_joint_auxiliary_domain(seed.view(), latent.len(), None, &slots).unwrap();
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        assert!(box_hi > 12.0 && box_lo < -12.0);
+        for axis in latent.len()..seed.len() {
+            assert_eq!((lower[axis], upper[axis]), (box_lo, box_hi));
+        }
+        let projected = ExactJointHyperSetup::project_rho_seed(seed.clone(), &lower, &upper);
+        assert_eq!(projected[latent.len()], 15.0);
+        assert_eq!(projected[latent.len() + 1], box_lo);
+        for axis in 0..seed.len() {
+            assert!(lower[axis] <= projected[axis] && projected[axis] <= upper[axis]);
+        }
+    }
+
+    /// A log-strength analytic coordinate searches its registry face inside the
+    /// precision box, not `[-12, 12]`. The parametric row-precision raw-beta
+    /// and mean offsets, which the registry leaves unbounded, keep the box
+    /// that is still to be derived.
+    #[test]
+    fn analytic_log_strengths_search_registry_faces_within_the_precision_box_4266() {
+        let mut registry = gam_terms::AnalyticPenaltyRegistry::new();
+        registry.push(AnalyticPenaltyKind::OrderedBetaBernoulli(Arc::new(
+            OrderedBetaBernoulliPenalty::new(3, 1.7, 0.8, true),
+        )));
+        registry.push(AnalyticPenaltyKind::ParametricRowPrecisionPrior(Arc::new(
+            ParametricRowPrecisionPriorPenalty::new(
+                PsiSlice::full(4, Some(2)),
+                ndarray::array![[0.0_f64], [1.0]],
+                ndarray::array![0.0_f64, 2.0_f64.ln()],
+                ndarray::array![0.0_f64, -0.5],
+                ndarray::array![[0.0_f64], [0.5]],
+                1.7,
+                2,
+                true,
+            )
+            .unwrap(),
+        )));
+        let analytic = registry.total_rho_count();
+        assert_eq!(analytic, 8);
+        let latent_flat_dim = 4;
+        let seed = Array1::<f64>::zeros(latent_flat_dim + analytic);
+        let (lower, upper) =
+            latent_joint_auxiliary_domain(seed.view(), latent_flat_dim, Some(&registry), &[])
+                .unwrap();
+        let (box_lo, box_hi) = gam_solve::estimate::rho_domain::precision_box();
+        // Latent coordinates: `±(max|t₀| + 10)` around the zero seed.
+        for axis in 0..latent_flat_dim {
+            assert_eq!((lower[axis], upper[axis]), (-11.0, 11.0));
+        }
+        // Ordered-beta alpha, both row-precision log-alphas, row-precision weight.
+        for local in [0, 1, 2, 7] {
+            let axis = latent_flat_dim + local;
+            assert_eq!((lower[axis], upper[axis]), (box_lo, box_hi), "coordinate {local}");
+        }
+        // Row-precision raw-beta and mean offsets.
+        for local in 3..7 {
+            let axis = latent_flat_dim + local;
+            assert_eq!((lower[axis], upper[axis]), (-12.0, 12.0), "coordinate {local}");
+        }
+    }
+}
+
 fn try_exact_joint_latent_coord_optimization(
     data: ArrayView2<'_, f64>,
     y: ArrayView1<'_, f64>,
@@ -6189,8 +6381,8 @@ fn try_exact_joint_latent_coord_optimization(
             .assign(&direct_hypers);
     }
 
-    let mut lower = Array1::<f64>::from_elem(theta0.len(), -12.0);
-    let mut upper = Array1::<f64>::from_elem(theta0.len(), 12.0);
+    let mut lower = Array1::<f64>::zeros(theta0.len());
+    let mut upper = Array1::<f64>::zeros(theta0.len());
     // The smoothing coordinates search the resolvability domain of the
     // incumbent's own design and penalties (#2812), the domain every other
     // exact-joint route derives, and the incumbent's seed is projected into it
@@ -6205,33 +6397,12 @@ fn try_exact_joint_latent_coord_optimization(
     theta0.slice_mut(s![..rho_dim]).assign(&rho_seed);
     lower.slice_mut(s![..rho_dim]).assign(&rho_lower);
     upper.slice_mut(s![..rho_dim]).assign(&rho_upper);
-    let latent_bound = latent
-        .values
-        .as_flat()
-        .iter()
-        .fold(1.0_f64, |acc, &v| acc.max(v.abs()))
-        + 10.0;
-    for axis in rho_dim..rho_dim + latent_flat_dim {
-        lower[axis] = -latent_bound;
-        upper[axis] = latent_bound;
-    }
-    if let Some(registry) = latent.analytic_penalties.as_ref() {
-        let (domain_lower, domain_upper) = registry
-            .rho_domain_bounds()
-            .map_err(EstimationError::InvalidInput)?;
-        let start = rho_dim + latent_flat_dim;
-        for local in 0..analytic_rho_count {
-            lower[start + local] = lower[start + local].max(domain_lower[local]);
-            upper[start + local] = upper[start + local].min(domain_upper[local]);
-            if lower[start + local] >= upper[start + local] {
-                return Err(EstimationError::InvalidInput(format!(
-                    "analytic-penalty rho domain has no searchable interval at coordinate {local}: lower={}, upper={}",
-                    lower[start + local],
-                    upper[start + local]
-                )));
-            }
-        }
-    }
+    // The rest of theta, `[t | analytic rho | direct hypers]`, is domained
+    // below, once the persistent latent cache has placed the latent seed the
+    // search actually starts from.
+    let direct_slots =
+        latent_coord_direct_hyper_slots(latent.values.id_mode(), latent.values.latent_dim());
+    debug_assert_eq!(direct_slots.len(), direct_hypers.len());
 
     struct LatentJointContext<'d> {
         rho_dim: usize,
@@ -6444,6 +6615,20 @@ fn try_exact_joint_latent_coord_optimization(
             *dst = *src;
         }
     }
+    let (auxiliary_lower, auxiliary_upper) = latent_joint_auxiliary_domain(
+        theta0.slice(s![rho_dim..]),
+        latent_flat_dim,
+        latent.analytic_penalties.as_deref(),
+        &direct_slots,
+    )?;
+    let auxiliary_seed = ExactJointHyperSetup::project_rho_seed(
+        theta0.slice(s![rho_dim..]).to_owned(),
+        &auxiliary_lower,
+        &auxiliary_upper,
+    );
+    theta0.slice_mut(s![rho_dim..]).assign(&auxiliary_seed);
+    lower.slice_mut(s![rho_dim..]).assign(&auxiliary_lower);
+    upper.slice_mut(s![rho_dim..]).assign(&auxiliary_upper);
 
     let problem = exact_joint_outer_problem(
         &theta0,
