@@ -3402,23 +3402,31 @@ fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
     let y = array![0.0, 1.0, 0.0, 1.0];
     let z = array![-1.5, -0.2, 0.4, 1.4];
     let weights = array![25.0, 2.0, 1.0, 20.0];
-    let weighted = pooled_probit_baseline(&y, &z, &weights)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "weighted baseline", e));
-    let unweighted = pooled_probit_baseline(&y, &z, &Array1::ones(y.len()))
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "unweighted baseline", e));
     let (y_expanded, z_expanded) = expand_integer_weight_rows(&y, &z, &weights);
-    let expanded =
-        pooled_probit_baseline(&y_expanded, &z_expanded, &Array1::ones(y_expanded.len()))
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "expanded baseline", e));
+    // The Jeffreys prior's information `Σ wᵢ ω(ηᵢ) xᵢxᵢᵀ` is weighted like the
+    // likelihood, so the armed pilot is weight-consistent too.
+    for armed in [false, true] {
+        let weighted = pooled_probit_baseline(&y, &z, &weights, armed)
+            .unwrap_or_else(|e| panic!("weighted baseline (armed={armed}) failed: {e:?}"));
+        let unweighted = pooled_probit_baseline(&y, &z, &Array1::ones(y.len()), armed)
+            .unwrap_or_else(|e| panic!("unweighted baseline (armed={armed}) failed: {e:?}"));
+        let expanded = pooled_probit_baseline(
+            &y_expanded,
+            &z_expanded,
+            &Array1::ones(y_expanded.len()),
+            armed,
+        )
+        .unwrap_or_else(|e| panic!("expanded baseline (armed={armed}) failed: {e:?}"));
 
-    assert!(
-        pair_distance(expanded, unweighted) > 1e-2,
-        "test data should distinguish weighted from unweighted seeding"
-    );
-    assert!(
-        pair_distance(weighted, expanded) < 1e-8,
-        "weighted pilot baseline should match the expanded integer-weight fit"
-    );
+        assert!(
+            pair_distance(expanded, unweighted) > 1e-2,
+            "test data should distinguish weighted from unweighted seeding (armed={armed})"
+        );
+        assert!(
+            pair_distance(weighted, expanded) < 1e-8,
+            "weighted pilot baseline should match the expanded integer-weight fit (armed={armed})"
+        );
+    }
 }
 
 #[test]
