@@ -4841,7 +4841,7 @@ mod outer_information_count_3192_tests {
     #[test]
     fn replication_weights_count_their_sum_and_a_profiled_scale_counts_rows() {
         let trials = array![3.0, 1.0, 5.0, 2.0];
-        let replicated_rows = array![1.0; 11];
+        let replicated_rows = ndarray::Array1::<f64>::from_elem(11, 1.0);
         assert_eq!(outer_information_count(Scale::Unit, trials.view()), 11.0);
         assert_eq!(
             outer_information_count(Scale::Unit, trials.view()),
