@@ -232,7 +232,8 @@ fn validate_spherical_harmonic_degree(l_max: usize) -> Result<(), BasisError> {
 /// exactly its budget (completing from a lattice when the data hold fewer
 /// distinct directions); any other strategy is refused rather than guessed. A
 /// degree or center count the builder refuses is refused here with the same
-/// error.
+/// error. A frozen identifiability transform returns its active column count
+/// after validating its rows against that raw basis width.
 pub fn spherical_spline_basis_width(
     spec: &SphericalSplineBasisSpec,
     n_rows: usize,
@@ -261,10 +262,29 @@ pub fn spherical_spline_basis_width(
         if centers < 2 {
             return Err(BasisError::InsufficientColumnsForConstraint { found: centers });
         }
-        return Ok(centers);
+        return sphere_width_after_identifiability(spec, centers);
     };
     validate_spherical_harmonic_degree(degree)?;
-    Ok(degree * (degree + 2))
+    sphere_width_after_identifiability(spec, degree * (degree + 2))
+}
+
+/// A frozen identifiability chart changes the builder's output column count.
+fn sphere_width_after_identifiability(
+    spec: &SphericalSplineBasisSpec,
+    raw_width: usize,
+) -> Result<usize, BasisError> {
+    match &spec.identifiability {
+        SphericalSplineIdentifiability::CenterSumToZero => Ok(raw_width),
+        SphericalSplineIdentifiability::FrozenTransform { transform } => {
+            if transform.nrows() != raw_width {
+                crate::bail_dim_basis!(
+                    "frozen spherical identifiability transform mismatch: {raw_width} raw basis columns but transform has {} rows",
+                    transform.nrows()
+                );
+            }
+            Ok(transform.ncols())
+        }
+    }
 }
 
 fn real_spherical_harmonic_design_up_to_degree(
@@ -4414,3 +4434,55 @@ mod harmonic_penalty_invariants_tests {
 
 #[cfg(test)]
 mod sphere_harmonic_default_degree_tests;
+
+#[cfg(test)]
+mod width_rule_tests {
+    use super::*;
+
+    #[test]
+    fn static_sphere_width_matches_raw_and_frozen_builders() {
+        let data = Array2::from_shape_fn((40, 2), |(i,j)| {
+            if j == 0 { 70.0*(i as f64*0.73).sin() } else { 170.0*(i as f64*0.41).cos() }
+        });
+        for (method,kernel,degree) in [
+            (SphereMethod::Wahba,SphereWahbaKernel::Sobolev,None),
+            (SphereMethod::Wahba,SphereWahbaKernel::Pseudo,None),
+            (SphereMethod::Harmonic,SphereWahbaKernel::Sobolev,Some(3)),
+        ] {
+            let mut spec=SphericalSplineBasisSpec {
+                center_strategy:CenterStrategy::FarthestPoint {num_centers:20},
+                penalty_order:2,double_penalty:false,radians:false,method,
+                max_degree:degree,wahba_kernel:kernel,
+                identifiability:SphericalSplineIdentifiability::CenterSumToZero,
+                adaptive_degree:false,
+            };
+            let raw_width=spherical_spline_basis_width(&spec,data.nrows()).unwrap();
+            assert_eq!(raw_width,build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols());
+            let transform=Array2::from_shape_fn((raw_width,5),|(i,j)| if i==j {1.0}else{0.0});
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform};
+            assert_eq!(spherical_spline_basis_width(&spec,data.nrows()).unwrap(),5);
+            assert_eq!(build_spherical_spline_basis(data.view(),&spec).unwrap().design.ncols(),5);
+            spec.identifiability=SphericalSplineIdentifiability::FrozenTransform {transform:Array2::zeros((raw_width+1,5))};
+            assert!(spherical_spline_basis_width(&spec,data.nrows()).is_err());
+            assert!(build_spherical_spline_basis(data.view(),&spec).is_err());
+        }
+    }
+
+    #[test]
+    fn static_sphere_width_refuses_unsupported_degrees_and_center_counts() {
+        let mut spec=SphericalSplineBasisSpec::default();
+        spec.method=SphereMethod::Harmonic;
+        for degree in [0,33,50] {
+            spec.max_degree=Some(degree);
+            assert!(spherical_spline_basis_width(&spec,40).is_err());
+        }
+        spec.method=SphereMethod::Wahba;
+        spec.wahba_kernel=SphereWahbaKernel::Sobolev;
+        spec.max_degree=None;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+        spec.wahba_kernel=SphereWahbaKernel::Pseudo;
+        spec.center_strategy=CenterStrategy::FarthestPoint {num_centers:1089};
+        assert!(spherical_spline_basis_width(&spec,40).is_err());
+    }
+}
