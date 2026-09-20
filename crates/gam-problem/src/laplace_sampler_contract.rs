@@ -679,7 +679,6 @@ pub trait LaplaceMarginalCorrector: Send + Sync {
         eigenvectors: &Array2<f64>,
         design: &DesignMatrix,
         c_weights: &Array1<f64>,
-        refine_supremum: bool,
     ) -> Result<(f64, Array1<f64>), String>;
 
     /// Integrate `Δ_b` and its ρ-gradient against the local Laplace Gaussian with

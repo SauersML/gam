@@ -448,7 +448,7 @@ impl<'a> RemlState<'a> {
 
         // Step 1: per-direction skewness diagnostic γ_r, aligned to those pairs.
         let (max_abs, directional) = corrector
-            .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights, false)
+            .directional_cubic_diagnostic(&evals, &evecs, x_design, c_weights)
             .map_err(EstimationError::InvalidInput)?;
         if !max_abs.is_finite() || max_abs == 0.0 {
             return Ok(zero());
