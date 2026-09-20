@@ -2327,7 +2327,7 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3361 (fix-3315-certified-gl-rule, Fixes #3315) merged as b3fbbbab2e0eae7c217bc986ddf46c6e36754731 with no source-removal entry. scripts/source_removal_guard.py from b3fbbbab2e0eae7c217bc986ddf46c6e36754731's own tree, run with --base 3f1da8e8f0b878d9fd40f44a615880cde1f85ff4 --head b3fbbbab2e0eae7c217bc986ddf46c6e36754731, lists exactly these 4 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> b3fbbbab2e0eae7c217bc986ddf46c6e36754731 -- <its path> gives 0 for every item."
   },
   {
-    "base": "1c84d2a44acd352c766a2d6b80e1b2d9a864c06b",
+    "base": "ed78ff5628326615b5ca13682cb99e0935bb8d15",
     "items": [
       "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_TARGET_ACCEPT_FLOOR",
       "crates/gam-inference/src/hmc_io.rs:const:LOW_DIM_TARGET_ACCEPT_FLOOR",
