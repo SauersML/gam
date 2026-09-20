@@ -1371,7 +1371,7 @@ mod frozen_host_sample_tests {
 }
 
 #[cfg(test)]
-mod matrix_free_admission_tests_4262 {
+mod matrix_free_admission_4262_tests {
     //! #4262 — the matrix-free admission must price what the route keeps
     //! resident, independently of the budget it is compared against.
     //!
