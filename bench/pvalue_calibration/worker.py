@@ -17,8 +17,13 @@ under the matched alternative, and fits every library to both. A rep records,
 per hypothesis, the p-value each library reports for the tested term on each
 surface it has:
 
-  gamfit.wald  ``summary().smooth_terms[...]["p_value"]``: Wood's rank-truncated
-               Wald test.
+  gamfit.wald  ``summary().smooth_terms[...]["p_value"]``, the headline
+               ``summary()`` p-value: for a penalized smooth the
+               variance-component score test of ``f = 0`` (Lin 1997; Zhang &
+               Lin 2003), for a random effect the variance-component score
+               test of ``sigma^2 = 0`` (Lin 1997), each referred to its exact
+               weighted chi-square law. The surface key predates the score
+               tests; it names the ``summary()`` table, not the statistic.
   gamfit.lr    ``smooth_significance(data)[...]["p_value_corrected"]``: the
                per-term likelihood-ratio test from a constrained null refit,
                the value that method documents as its headline.
