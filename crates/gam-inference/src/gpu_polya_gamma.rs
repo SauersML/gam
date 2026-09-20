@@ -372,15 +372,14 @@ fn draw_batch_decision(rows: usize) -> Result<gam_gpu::GpuDecision, String> {
     gam_gpu::decide_row_kernel(
         gam_gpu::global_policy(),
         gam_gpu::RowKernelAdmission {
-            kernel: gam_gpu::GpuKernel::PolyaGammaDraws,
             missing_capability: None,
             compiled: cfg!(target_os = "linux"),
-            size: gam_gpu::RowKernelSize::Measured(gam_gpu::RowKernelShape {
+            shape: gam_gpu::RowKernelShape {
                 kernel: gam_gpu::GpuKernel::PolyaGammaDraws,
                 rows,
                 widths: [0; 4],
                 threads: 1,
-            }),
+            },
         },
         &mut gam_gpu::RuntimeDeviceProbe,
     )

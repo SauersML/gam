@@ -856,8 +856,6 @@ pub(crate) fn materialize_survival<'a>(
             offset_entry: prepared.eta_offset_entry.clone(),
             offset_exit: prepared.eta_offset_exit.clone(),
             derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
             penalties: prepared.time_penalties.clone(),
             nullspace_dims: prepared.time_nullspace_dims.clone(),
             initial_log_lambdas: time_initial_log_lambdas,
@@ -934,8 +932,6 @@ pub(crate) fn materialize_survival<'a>(
             offset_entry: prepared.eta_offset_entry.clone(),
             offset_exit: prepared.eta_offset_exit.clone(),
             derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-            time_monotonicity:
-                crate::survival::location_scale::TimeBlockMonotonicity::StructuralISpline,
             penalties: prepared.time_penalties.clone(),
             nullspace_dims: prepared.time_nullspace_dims.clone(),
             initial_log_lambdas: time_initial_log_lambdas,
@@ -1060,8 +1056,6 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity:
-                    crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,
@@ -1122,8 +1116,6 @@ pub(crate) fn materialize_survival<'a>(
                 offset_entry: prepared.eta_offset_entry.clone(),
                 offset_exit: prepared.eta_offset_exit.clone(),
                 derivative_offset_exit: prepared.derivative_offset_exit.clone(),
-                time_monotonicity:
-                    crate::survival::location_scale::TimeBlockMonotonicity::EnforcedByCoordinateCone,
                 penalties: prepared.time_penalties.clone(),
                 nullspace_dims: prepared.time_nullspace_dims.clone(),
                 initial_log_lambdas: time_initial_log_lambdas,

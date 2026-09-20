@@ -20,6 +20,8 @@
 //! derivatives. Every ℓ contraction is linear in the ζ-axis direction. So each row contracts
 //! once per primary axis, assembles once per ζ axis, and pulls back once per coefficient axis.
 
+use super::information_third::static_row_fifth;
+use super::information_third_dynamic::{contract_fifth_all_primary_axes, dynamic_row_fifth};
 use super::*;
 
 /// z-block positions of the entry index, the exit index and the raw derivative index; the
@@ -387,7 +389,7 @@ struct ZetaRow {
 
 /// One row's ζ calculus: its geometry and images, the q-map Jacobian `Ĵ` and curvature `D²q`
 /// over the z block, and the ℓ derivatives every sweep contracts.
-struct ZetaRowCalculus {
+struct ZetaRowCalculus<'a> {
     zeta_row: ZetaRow,
     jq: Array2<f64>,
     k0: [Array2<f64>; 3],
@@ -396,9 +398,7 @@ struct ZetaRowCalculus {
     /// `ℓ³[e_k]` along every primary axis `k`.
     third: Vec<Array2<f64>>,
     /// The row program every higher ℓ contraction reads.
-    program: ZetaRowProgram,
-    /// The row this calculus describes.
-    row: usize,
+    program: ZetaRowProgram<'a>,
 }
 
 /// `Ã·direction` for the column images `images`.
@@ -649,9 +649,9 @@ fn add_pulled_back(images: &[ZetaImage], values: &Array1<f64>, scale: f64, out: 
     }
 }
 
-impl ZetaRowCalculus {
+impl ZetaRowCalculus<'_> {
     /// The direction-independent parts every order of the composition reads.
-    fn parts<'a>(&'a self, layout: &'a ZetaLayout) -> ZetaParts<'a> {
+    fn parts<'b>(&'b self, layout: &'b ZetaLayout) -> ZetaParts<'b> {
         ZetaParts {
             layout,
             geometry: &self.zeta_row.geometry,
@@ -664,26 +664,60 @@ impl ZetaRowCalculus {
 }
 
 /// A row's ℓ contractions along primary directions from the family's own row program: the FLEX
-/// program through its direction-independent base, built once per row, or the rigid program.
-enum ZetaRowProgram {
+/// program through its direction-independent base, or the rigid program at its resolved primary
+/// point, each built once per row.
+enum ZetaRowProgram<'a> {
     Flex(FlexThirdRowBase),
-    Rigid,
+    Rigid(RigidRowPoint<'a>),
+}
+
+/// A rigid row's program point, resolved once per row: its scalar inputs and its primaries in the
+/// family's slope frame, and, where the composition reaches order five, its fifth likelihood
+/// derivative tensor. Resolving the primaries rebuilds the row's time-wiggle I-spline geometry,
+/// and the ζ composition contracts ℓ once per primary axis and direction, so re-resolving them
+/// per contraction rebuilt that basis per row, per axis (gam#3304). Every contraction here runs
+/// only the jet at this point, and the direction-free fifth tensor is contracted per `(u, v)`.
+struct RigidRowPoint<'a> {
+    inputs: RigidRowInputs<'a>,
+    primaries: Vec<f64>,
+    fifth: Option<RigidRowFifth>,
+}
+
+/// The fifth likelihood derivatives `ℓ_{abcde}` of a rigid row, in its slope frame.
+enum RigidRowFifth {
+    Static(Box<[[[[[f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]>),
+    Dynamic(Box<[[[[[f64; DYNAMIC_SLOPE_PRIMARIES]; DYNAMIC_SLOPE_PRIMARIES]; DYNAMIC_SLOPE_PRIMARIES]; DYNAMIC_SLOPE_PRIMARIES]; DYNAMIC_SLOPE_PRIMARIES]>),
+}
+
+/// A stack `P × P` primary tensor as an `Array2`.
+fn primary_square_array<const P: usize>(tensor: [[f64; P]; P]) -> Array2<f64> {
+    Array2::from_shape_fn((P, P), |(a, b)| tensor[a][b])
+}
+
+/// `primaries` in the frame of width `P` it was resolved in.
+fn rigid_frame_point<const P: usize>(primaries: &[f64]) -> Result<[f64; P], String> {
+    <[f64; P]>::try_from(primaries).map_err(|_| {
+        format!(
+            "rigid row point holds {} primaries, but its slope frame has {P}",
+            primaries.len()
+        )
+    })
 }
 
 /// One row's ζ value calculus for the design-ψ terms: its geometry and images, `Ĵ` and `D²q` over
 /// the z block, and the ℓ gradient, Hessian and contractions of the family's own row program.
-struct ZetaPsiRow {
+struct ZetaPsiRow<'a> {
     zeta_row: ZetaRow,
     jq: Array2<f64>,
     k0: [Array2<f64>; 3],
     gradient: Array1<f64>,
     hessian: Array2<f64>,
-    program: ZetaRowProgram,
+    program: ZetaRowProgram<'a>,
 }
 
-impl ZetaPsiRow {
+impl ZetaPsiRow<'_> {
     /// The direction-independent parts every order of the composition reads.
-    fn parts<'a>(&'a self, layout: &'a ZetaLayout) -> ZetaParts<'a> {
+    fn parts<'b>(&'b self, layout: &'b ZetaLayout) -> ZetaParts<'b> {
         ZetaParts {
             layout,
             geometry: &self.zeta_row.geometry,
@@ -942,7 +976,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         row: usize,
         fifth_order: bool,
-    ) -> Result<ZetaRowCalculus, String> {
+    ) -> Result<ZetaRowCalculus<'_>, String> {
         let zeta_row = self.timewiggle_zeta_row(frame, block_states, row)?;
         let zero = [&ZetaDirection::ZERO; 3];
         let jq = zeta_row.geometry.q_rows(zero, 0);
@@ -962,16 +996,16 @@ impl SurvivalMarginalSlopeFamily {
             };
             (gradient, hessian, ZetaRowProgram::Flex(base))
         } else {
-            let (_, gradient, hessian) =
-                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-            (gradient, hessian, ZetaRowProgram::Rigid)
+            let point = self.rigid_row_point(block_states, row, fifth_order)?;
+            let (gradient, hessian) = self.rigid_row_point_gradient_hessian(&point)?;
+            (gradient, hessian, ZetaRowProgram::Rigid(point))
         };
         let p_primary = frame.primary.total;
         let mut third = Vec::with_capacity(p_primary);
         for k in 0..p_primary {
             let mut axis = Array1::<f64>::zeros(p_primary);
             axis[k] = 1.0;
-            third.push(self.zeta_row_third(&program, block_states, row, &axis)?);
+            third.push(self.zeta_row_third(&program, &axis)?);
         }
         Ok(ZetaRowCalculus {
             zeta_row,
@@ -981,7 +1015,6 @@ impl SurvivalMarginalSlopeFamily {
             hessian,
             third,
             program,
-            row,
         })
     }
 
@@ -990,7 +1023,6 @@ impl SurvivalMarginalSlopeFamily {
     fn timewiggle_order_four_axes(
         &self,
         frame: &ZetaFrame<'_>,
-        block_states: &[ParameterBlockState],
         calc: &ZetaRowCalculus,
         u_zeta: &Array1<f64>,
     ) -> Result<Vec<Array2<f64>>, String> {
@@ -1011,7 +1043,7 @@ impl SurvivalMarginalSlopeFamily {
         for k in 0..p_primary {
             let mut axis = Array1::<f64>::zeros(p_primary);
             axis[k] = 1.0;
-            fourth_u.push(self.zeta_row_fourth(&calc.program, block_states, calc.row, &ju, &axis)?);
+            fourth_u.push(self.zeta_row_fourth(&calc.program, &ju, &axis)?);
         }
         let t_u = combine_axes(&calc.third, &ju, p_primary);
         let c_z = hessian.dot(&ju);
@@ -1058,7 +1090,6 @@ impl SurvivalMarginalSlopeFamily {
     fn timewiggle_order_five_axes(
         &self,
         frame: &ZetaFrame<'_>,
-        block_states: &[ParameterBlockState],
         calc: &ZetaRowCalculus,
         u_zeta: &Array1<f64>,
         v_zeta: &Array1<f64>,
@@ -1089,18 +1120,12 @@ impl SurvivalMarginalSlopeFamily {
         for k in 0..p_primary {
             let mut axis = Array1::<f64>::zeros(p_primary);
             axis[k] = 1.0;
-            fourth_u.push(self.zeta_row_fourth(&calc.program, block_states, calc.row, &ju, &axis)?);
-            fourth_v.push(self.zeta_row_fourth(&calc.program, block_states, calc.row, &jv, &axis)?);
-            fourth_uv.push(self.zeta_row_fourth(
-                &calc.program,
-                block_states,
-                calc.row,
-                &g2uv,
-                &axis,
-            )?);
+            fourth_u.push(self.zeta_row_fourth(&calc.program, &ju, &axis)?);
+            fourth_v.push(self.zeta_row_fourth(&calc.program, &jv, &axis)?);
+            fourth_uv.push(self.zeta_row_fourth(&calc.program, &g2uv, &axis)?);
         }
         let fifth =
-            self.zeta_row_fifth_all_primary_axes(&calc.program, block_states, calc.row, &ju, &jv)?;
+            self.zeta_row_fifth_all_primary_axes(&calc.program, &ju, &jv)?;
         let t_u = combine_axes(third, &ju, p_primary);
         let t_v = combine_axes(third, &jv, p_primary);
         let q_uv = combine_axes(&fourth_u, &jv, p_primary);
@@ -1196,7 +1221,7 @@ impl SurvivalMarginalSlopeFamily {
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, false)?;
                     let images = &calc.zeta_row.images;
                     let u_zeta = zeta_image_of(images, d_u, width);
-                    let phi_axes = self.timewiggle_order_four_axes(&frame, block_states, &calc, &u_zeta)?;
+                    let phi_axes = self.timewiggle_order_four_axes(&frame, &calc, &u_zeta)?;
                     pull_back_axes(&phi_axes, images, &mut scratch, &mut phi_axis, &mut acc);
                 }
                 Ok(acc)
@@ -1236,7 +1261,7 @@ impl SurvivalMarginalSlopeFamily {
                     let images = &calc.zeta_row.images;
                     let u_zeta = zeta_image_of(images, d_u, width);
                     let v_zeta = zeta_image_of(images, d_v, width);
-                    let phi_axes = self.timewiggle_order_five_axes(&frame, block_states, &calc, &u_zeta, &v_zeta)?;
+                    let phi_axes = self.timewiggle_order_five_axes(&frame, &calc, &u_zeta, &v_zeta)?;
                     pull_back_axes(&phi_axes, images, &mut scratch, &mut phi_axis, &mut acc);
                 }
                 Ok(acc)
@@ -1312,9 +1337,9 @@ impl SurvivalMarginalSlopeFamily {
                     let w = zeta_image_of(&psi_images, &beta, width);
                     let v_zeta = zeta_image_of(images, d_beta, width);
                     let psi_v_zeta = zeta_image_of(&psi_images, d_beta, width);
-                    let fourth_v = self.timewiggle_order_four_axes(&frame, block_states, &calc, &v_zeta)?;
-                    let fifth_wv = self.timewiggle_order_five_axes(&frame, block_states, &calc, &w, &v_zeta)?;
-                    let fourth_psi_v = self.timewiggle_order_four_axes(&frame, block_states, &calc, &psi_v_zeta)?;
+                    let fourth_v = self.timewiggle_order_four_axes(&frame, &calc, &v_zeta)?;
+                    let fifth_wv = self.timewiggle_order_five_axes(&frame, &calc, &w, &v_zeta)?;
+                    let fourth_psi_v = self.timewiggle_order_four_axes(&frame, &calc, &psi_v_zeta)?;
                     for c in 0..p_total {
                         let (image, psi_image) = (&images[c], &psi_images[c]);
                         if image.entries().is_empty() && psi_image.entries().is_empty() {
@@ -1404,7 +1429,7 @@ impl SurvivalMarginalSlopeFamily {
                     let psi_images = psi_zeta_images(self, &frame, row, block_idx, &x_psi)?;
                     let w = zeta_image_of(&psi_images, &beta, width);
                     let third_axes = order_three_axes(&frame, &calc)?;
-                    let fourth_w = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w)?;
+                    let fourth_w = self.timewiggle_order_four_axes(&frame, &calc, &w)?;
                     for c in 0..p_total {
                         let (image, psi_image) = (&images[c], &psi_images[c]);
                         if image.entries().is_empty() && psi_image.entries().is_empty() {
@@ -1517,7 +1542,7 @@ impl SurvivalMarginalSlopeFamily {
                         let parts = psi_row.parts(&frame.layout);
                         let images = &psi_row.zeta_row.images;
                         let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
-                            self.zeta_row_third(&psi_row.program, block_states, row, direction)
+                            self.zeta_row_third(&psi_row.program, direction)
                         };
                         objective += weight * parts.order_one().dot(&w);
                         add_pulled_back(images, &parts.order_two().dot(&w), weight, &mut score);
@@ -1577,7 +1602,7 @@ impl SurvivalMarginalSlopeFamily {
                     let w = Self::baseline_zeta_motion(geometry, row, axis, width)?;
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, false)?;
                     let images = &calc.zeta_row.images;
-                    let fourth_w = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w)?;
+                    let fourth_w = self.timewiggle_order_four_axes(&frame, &calc, &w)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1638,7 +1663,7 @@ impl SurvivalMarginalSlopeFamily {
                     let images = &calc.zeta_row.images;
                     let v_zeta = zeta_image_of(images, d_beta, width);
                     let fifth_wv =
-                        self.timewiggle_order_five_axes(&frame, block_states, &calc, &w, &v_zeta)?;
+                        self.timewiggle_order_five_axes(&frame, &calc, &w, &v_zeta)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1703,8 +1728,8 @@ impl SurvivalMarginalSlopeFamily {
                     let calc = self.timewiggle_zeta_row_calculus(&frame, block_states, row, true)?;
                     let images = &calc.zeta_row.images;
                     let fifth_ij =
-                        self.timewiggle_order_five_axes(&frame, block_states, &calc, &w_i, &w_j)?;
-                    let fourth_ij = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_ij)?;
+                        self.timewiggle_order_five_axes(&frame, &calc, &w_i, &w_j)?;
+                    let fourth_ij = self.timewiggle_order_four_axes(&frame, &calc, &w_ij)?;
                     for (c, image) in images.iter().enumerate() {
                         if image.entries().is_empty() {
                             continue;
@@ -1829,15 +1854,14 @@ impl SurvivalMarginalSlopeFamily {
                     let w_i = zeta_image_of(&images_i, &beta, width);
                     let w_j = zeta_image_of(&images_j, &beta, width);
                     let third_axes = order_three_axes(&frame, &calc)?;
-                    let fourth_i = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_i)?;
-                    let fourth_j = self.timewiggle_order_four_axes(&frame, block_states, &calc, &w_j)?;
-                    let fifth_ij = self.timewiggle_order_five_axes(&frame, block_states, &calc, &w_i, &w_j)?;
+                    let fourth_i = self.timewiggle_order_four_axes(&frame, &calc, &w_i)?;
+                    let fourth_j = self.timewiggle_order_four_axes(&frame, &calc, &w_j)?;
+                    let fifth_ij = self.timewiggle_order_five_axes(&frame, &calc, &w_i, &w_j)?;
                     let fourth_ij = images_ij
                         .as_ref()
                         .map(|images_ij| {
                             self.timewiggle_order_four_axes(
                                 &frame,
-                                block_states,
                                 &calc,
                                 &zeta_image_of(images_ij, &beta, width),
                             )
@@ -1914,6 +1938,14 @@ impl SurvivalMarginalSlopeFamily {
             && !(self.flex_active() && self.slope_is_follow_up_varying())
     }
 
+    /// Whether the ζ composition serves the order-five sweeps: the Jeffreys third information
+    /// derivative and the ψ-mixed third information derivatives. The FLEX base carries a declared
+    /// latent law through its anchored timepoints (gam#2948); the rigid row reads the Gaussian
+    /// lowering's closed-form fifth tensor, which a declared law does not have (gam#3304).
+    pub(crate) fn timewiggle_zeta_fifth_available(&self) -> bool {
+        self.timewiggle_zeta_available() && (self.flex_active() || !self.anchored_law_active())
+    }
+
     /// Row `row`'s ζ value calculus for the design-ψ terms, from the FLEX row program when `flex`
     /// holds and from the rigid one otherwise.
     fn timewiggle_zeta_psi_row(
@@ -1922,7 +1954,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         row: usize,
         flex: bool,
-    ) -> Result<ZetaPsiRow, String> {
+    ) -> Result<ZetaPsiRow<'_>, String> {
         let zeta_row = self.timewiggle_zeta_row(frame, block_states, row)?;
         let zero = [&ZetaDirection::ZERO; 3];
         let jq = zeta_row.geometry.q_rows(zero, 0);
@@ -1939,9 +1971,9 @@ impl SurvivalMarginalSlopeFamily {
                 self.build_row_flex_third_base_with_states(row, block_states, &frame.primary)?;
             (gradient, hessian, ZetaRowProgram::Flex(base))
         } else {
-            let (_, gradient, hessian) =
-                self.compute_row_primary_gradient_hessian_uncached(row, block_states)?;
-            (gradient, hessian, ZetaRowProgram::Rigid)
+            let point = self.rigid_row_point(block_states, row, false)?;
+            let (gradient, hessian) = self.rigid_row_point_gradient_hessian(&point)?;
+            (gradient, hessian, ZetaRowProgram::Rigid(point))
         };
         Ok(ZetaPsiRow {
             zeta_row,
@@ -1953,28 +1985,78 @@ impl SurvivalMarginalSlopeFamily {
         })
     }
 
-    /// `ℓ³[dir]` on row `row` from `program`.
-    fn zeta_row_third(
+    /// Row `row`'s rigid program point, with its fifth likelihood derivatives where `fifth_order`
+    /// holds.
+    fn rigid_row_point(
         &self,
-        program: &ZetaRowProgram,
         block_states: &[ParameterBlockState],
         row: usize,
+        fifth_order: bool,
+    ) -> Result<RigidRowPoint<'_>, String> {
+        let inputs = rigid_row_inputs(self, block_states, row, "survival marginal-slope ζ rigid row")?;
+        let primaries = in_slope_frame!(self, P, Frame, {
+            rigid_row_kernel_primaries::<P, Frame>(self, block_states, row)?.to_vec()
+        });
+        let fifth = if !fifth_order {
+            None
+        } else if self.anchored_law_active() {
+            // The anchor is an implicit function of the declared law; its derivatives exist only
+            // through the jet lift, which stops at order four (gam#2923).
+            return Err(format!(
+                "survival marginal-slope ζ rigid row {row}: the fifth likelihood derivatives are \
+                 the Gaussian lowering's closed form, which a declared latent law does not have"
+            ));
+        } else if self.slope_is_follow_up_varying() {
+            let point = rigid_frame_point::<DYNAMIC_SLOPE_PRIMARIES>(&primaries)?;
+            Some(RigidRowFifth::Dynamic(Box::new(dynamic_row_fifth(&point, &inputs)?)))
+        } else {
+            let point = rigid_frame_point::<STATIC_SLOPE_PRIMARIES>(&primaries)?;
+            Some(RigidRowFifth::Static(Box::new(static_row_fifth(&point, &inputs)?)))
+        };
+        Ok(RigidRowPoint {
+            inputs,
+            primaries,
+            fifth,
+        })
+    }
+
+    /// The rigid row program's primary gradient and Hessian at `point`.
+    fn rigid_row_point_gradient_hessian(
+        &self,
+        point: &RigidRowPoint<'_>,
+    ) -> Result<(Array1<f64>, Array2<f64>), String> {
+        in_slope_frame!(self, P, Frame, {
+            let primaries = rigid_frame_point::<P>(&point.primaries)?;
+            let (_, gradient, hessian) =
+                Self::rigid_gradient_hessian_at::<P, Frame>(&primaries, &point.inputs)?;
+            Ok((gradient, hessian))
+        })
+    }
+
+    /// `ℓ³[dir]` of the row `program` describes.
+    fn zeta_row_third(
+        &self,
+        program: &ZetaRowProgram<'_>,
         dir: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         match program {
             ZetaRowProgram::Flex(base) => self.row_flex_third_contract_from_base(base, dir),
-            ZetaRowProgram::Rigid => {
-                self.row_primary_third_contracted(row, block_states, dir.view())
-            }
+            ZetaRowProgram::Rigid(point) => in_slope_frame!(self, P, Frame, {
+                let primaries = rigid_frame_point::<P>(&point.primaries)?;
+                Ok(primary_square_array(Self::rigid_third_contracted_at::<P, Frame>(
+                    &primaries,
+                    &point.inputs,
+                    dir.view(),
+                )?))
+            }),
         }
     }
 
-    /// `Σ_{cde} ℓ_{abcde} u_c v_d (e_k)_e` on row `row` for every primary axis `k`, from `program`.
+    /// `Σ_{cde} ℓ_{abcde} u_c v_d (e_k)_e` for every primary axis `k` of the row `program`
+    /// describes.
     fn zeta_row_fifth_all_primary_axes(
         &self,
-        program: &ZetaRowProgram,
-        block_states: &[ParameterBlockState],
-        row: usize,
+        program: &ZetaRowProgram<'_>,
         u: &Array1<f64>,
         v: &Array1<f64>,
     ) -> Result<Vec<Array2<f64>>, String> {
@@ -1982,26 +2064,36 @@ impl SurvivalMarginalSlopeFamily {
             ZetaRowProgram::Flex(base) => {
                 self.row_flex_fifth_contract_all_primary_axes_from_base(base, u, v)
             }
-            ZetaRowProgram::Rigid => {
-                self.rigid_row_fifth_contract_all_primary_axes(row, block_states, u, v)
-            }
+            ZetaRowProgram::Rigid(point) => match &point.fifth {
+                Some(RigidRowFifth::Static(fifth)) => contract_fifth_all_primary_axes(fifth, u, v),
+                Some(RigidRowFifth::Dynamic(fifth)) => contract_fifth_all_primary_axes(fifth, u, v),
+                None => Err(format!(
+                    "survival marginal-slope ζ rigid row {}: a fifth contraction reads a row \
+                     point resolved without its fifth likelihood derivatives",
+                    point.inputs.row
+                )),
+            },
         }
     }
 
-    /// `ℓ⁴[u, v]` on row `row` from `program`.
+    /// `ℓ⁴[u, v]` of the row `program` describes.
     fn zeta_row_fourth(
         &self,
-        program: &ZetaRowProgram,
-        block_states: &[ParameterBlockState],
-        row: usize,
+        program: &ZetaRowProgram<'_>,
         u: &Array1<f64>,
         v: &Array1<f64>,
     ) -> Result<Array2<f64>, String> {
         match program {
             ZetaRowProgram::Flex(base) => self.row_flex_fourth_contract_from_base(base, u, v),
-            ZetaRowProgram::Rigid => {
-                self.row_primary_fourth_contracted(row, block_states, u.view(), v.view())
-            }
+            ZetaRowProgram::Rigid(point) => in_slope_frame!(self, P, Frame, {
+                let primaries = rigid_frame_point::<P>(&point.primaries)?;
+                Ok(primary_square_array(Self::rigid_fourth_contracted_at::<P, Frame>(
+                    &primaries,
+                    &point.inputs,
+                    u.view(),
+                    v.view(),
+                )?))
+            }),
         }
     }
 
@@ -2080,7 +2172,7 @@ impl SurvivalMarginalSlopeFamily {
                         let psi_images = psi_zeta_images(self, &frame, row, block_idx, &x_psi)?;
                         let w = zeta_image_of(&psi_images, &beta, width);
                         let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
-                            self.zeta_row_third(&psi_row.program, block_states, row, direction)
+                            self.zeta_row_third(&psi_row.program, direction)
                         };
                         let gradient = parts.order_one();
                         let second = parts.order_two();
@@ -2160,11 +2252,11 @@ impl SurvivalMarginalSlopeFamily {
                     let v_zeta = zeta_image_of(images, d_beta, width);
                     let psi_v_zeta = zeta_image_of(&psi_images, d_beta, width);
                     let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
-                        self.zeta_row_third(&psi_row.program, block_states, row, direction)
+                        self.zeta_row_third(&psi_row.program, direction)
                     };
                     let fourth =
                         |left: &Array1<f64>, right: &Array1<f64>| -> Result<Array2<f64>, String> {
-                            self.zeta_row_fourth(&psi_row.program, block_states, row, left, right)
+                            self.zeta_row_fourth(&psi_row.program, left, right)
                         };
                     let inner = parts.order_four(&w, &v_zeta, &third, &fourth)?
                         + parts.order_three(&psi_v_zeta, &third)?;
@@ -2290,12 +2382,12 @@ impl SurvivalMarginalSlopeFamily {
                         let w_i = zeta_image_of(&images_i, &beta, width);
                         let w_j = zeta_image_of(&images_j, &beta, width);
                         let third = |direction: &Array1<f64>| -> Result<Array2<f64>, String> {
-                            self.zeta_row_third(&psi_row.program, block_states, row, direction)
+                            self.zeta_row_third(&psi_row.program, direction)
                         };
                         let fourth = |left: &Array1<f64>,
                                       right: &Array1<f64>|
                          -> Result<Array2<f64>, String> {
-                            self.zeta_row_fourth(&psi_row.program, block_states, row, left, right)
+                            self.zeta_row_fourth(&psi_row.program, left, right)
                         };
                         let gradient = parts.order_one();
                         let second = parts.order_two();
