@@ -7892,7 +7892,8 @@ fn model_partial_dependence_impl(
         rows.slice(ndarray::s![..rows.nrows().min(1), ..]),
         &spec,
     )
-    .map_err(|err| format!("failed to build design matrix: {err}"))?;
+    .map_err(|err| format!("failed to build design matrix: {err}"))?
+    .layout;
     let mut terms = layout.linear_ranges.iter().chain(&layout.smooth_ranges);
     let range = terms
         .find(|(name, _)| name.as_str() == term)

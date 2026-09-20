@@ -62,7 +62,7 @@ pub use term_design::{
     build_term_collection_prediction_design, build_term_prediction_columns,
     build_planned_term_collection_design_inner_with_policy,
     bspline_null_ridge_request, build_term_collection_design_with_policy,
-    duchon_operator_penalty_request,
+    duchon_operator_penalty_request, frozen_term_collection_layout,
     orthogonality_relative_residual_for_design, place_term_in_collection_gauge,
     smooth_intrinsic_parametric_feature_cols,
     term_collection_has_anchored_bspline, term_collection_has_global_intercept,

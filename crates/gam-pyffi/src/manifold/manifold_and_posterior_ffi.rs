@@ -345,222 +345,10 @@ struct CoefficientStatePayload {
     schema: Option<DataSchema>,
     training_feature_ranges: Option<Vec<(f64, f64)>>,
     random_column_ranges: Vec<(usize, usize)>,
-    coefficient_provenance: Vec<CoefficientProvenancePayload>,
-    term_blocks: Vec<TermBlock>,
+    coefficient_provenance: Vec<gam::inference::coefficient_layout::CoefficientProvenance>,
+    term_blocks: Vec<gam::inference::coefficient_layout::TermBlock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     group_metadata: Option<GroupMetadata>,
-}
-
-#[derive(Serialize, Clone)]
-struct TermBlock {
-    name: String,
-    kind: String,
-    start: usize,
-    end: usize,
-}
-
-#[derive(Serialize)]
-struct CoefficientProvenancePayload {
-    index: usize,
-    label: String,
-    source: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    term: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    column: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    level: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    metadata: Option<serde_json::Value>,
-}
-
-fn categorical_level_name_for_bits(
-    schema: Option<&DataSchema>,
-    column_name: &str,
-    bits: u64,
-) -> Option<String> {
-    let value = f64::from_bits(bits);
-    if !value.is_finite() {
-        return None;
-    }
-    // A level code is a stored integer, so it round-trips `usize` exactly; a
-    // fractional, negative or out-of-range value does not (the cast truncates
-    // or saturates) and names no level.
-    let idx = value as usize;
-    if idx as f64 != value {
-        return None;
-    }
-    schema
-        .and_then(|schema| {
-            schema
-                .columns
-                .iter()
-                .find(|column| column.name == column_name)
-        })
-        .and_then(|column| column.levels.get(idx))
-        .cloned()
-}
-
-fn smooth_basis_kind_label(basis: &gam::terms::smooth::SmoothBasisSpec) -> &'static str {
-    use gam::terms::smooth::SmoothBasisSpec as S;
-    match basis {
-        S::BSpline1D { .. } => "smooth_bspline1d",
-        S::TensorBSpline { .. } => "tensor",
-        S::ThinPlate { .. } => "thin_plate",
-        S::Sphere { .. } => "sphere",
-        S::ConstantCurvature { .. } => "constant_curvature",
-        S::Matern { .. } => "matern",
-        S::Duchon { .. } => "duchon",
-        S::Pca { .. } => "pca",
-        S::FactorSmooth { .. } => "factor_smooth",
-        S::BySmooth { .. } => "by_smooth",
-        S::ByVariable { .. } => "by_variable",
-        S::FactorSumToZero { .. } => "factor_sum_to_zero",
-        S::MeasureJet { .. } => "measurejet",
-    }
-}
-
-/// Try to derive per-smooth-term column ranges by building a synthetic
-/// two-row design from the saved training feature ranges. Returns
-/// `(name, range)` pairs in global-column coordinates, or `None` if the
-/// build fails (e.g. no training ranges available).
-fn smooth_term_column_ranges(
-    payload: &FittedModelPayload,
-) -> Option<Vec<(String, std::ops::Range<usize>)>> {
-    let spec = payload.resolved_termspec.as_ref()?;
-    if spec.smooth_terms.is_empty() {
-        return Some(Vec::new());
-    }
-    let ranges = payload.training_feature_ranges.as_ref()?;
-    let schema = payload.data_schema.as_ref()?;
-    let ncols = schema.columns.len();
-    if ranges.is_empty() || ncols == 0 {
-        return None;
-    }
-    let mut data = Array2::<f64>::zeros((2, ncols));
-    for (col, &(lo, hi)) in ranges.iter().take(ncols).enumerate() {
-        let (lo, hi) = if lo.is_finite() && hi.is_finite() {
-            (lo, hi)
-        } else {
-            (0.0, 1.0)
-        };
-        data[[0, col]] = lo;
-        data[[1, col]] = hi;
-    }
-    let design =
-        gam::terms::smooth::build_term_collection_prediction_design(data.view(), spec).ok()?;
-    Some(design.smooth_ranges)
-}
-
-fn coefficient_provenance_for_state(
-    payload: &FittedModelPayload,
-    beta_len: usize,
-) -> (Vec<CoefficientProvenancePayload>, Vec<TermBlock>) {
-    let mut provenance = (0..beta_len)
-        .map(|index| CoefficientProvenancePayload {
-            index,
-            label: "__global__".to_string(),
-            source: "global".to_string(),
-            term: None,
-            column: None,
-            level: None,
-            metadata: None,
-        })
-        .collect::<Vec<_>>();
-    let mut blocks: Vec<TermBlock> = Vec::new();
-
-    let Some(spec) = payload.resolved_termspec.as_ref() else {
-        return (provenance, blocks);
-    };
-
-    if !provenance.is_empty() {
-        provenance[0].term = Some("intercept".to_string());
-        provenance[0].label = "intercept".to_string();
-        blocks.push(TermBlock {
-            name: "intercept".to_string(),
-            kind: "intercept".to_string(),
-            start: 0,
-            end: 1,
-        });
-    }
-
-    for (offset, term) in spec.linear_terms.iter().enumerate() {
-        let index = 1 + offset;
-        if let Some(entry) = provenance.get_mut(index) {
-            entry.term = Some(term.name.clone());
-            entry.column = Some(term.name.clone());
-            entry.label = term.name.clone();
-            entry.source = "linear".to_string();
-        }
-        blocks.push(TermBlock {
-            name: term.name.clone(),
-            kind: "linear".to_string(),
-            start: index,
-            end: index + 1,
-        });
-    }
-
-    let mut col = 1 + spec.linear_terms.len();
-    for term in &spec.random_effect_terms {
-        let levels = term.frozen_levels.as_deref().unwrap_or(&[]);
-        let block_start = col;
-        for (local, bits) in levels.iter().copied().enumerate() {
-            let index = col + local;
-            let label =
-                categorical_level_name_for_bits(payload.data_schema.as_ref(), &term.name, bits)
-                    .unwrap_or_else(|| f64::from_bits(bits).to_string());
-            if let Some(entry) = provenance.get_mut(index) {
-                entry.label = label.clone();
-                entry.source = "group".to_string();
-                entry.term = Some(term.name.clone());
-                entry.column = Some(term.name.clone());
-                entry.level = Some(label.clone());
-                entry.metadata = payload
-                    .group_metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.get(&label))
-                    .cloned();
-            }
-        }
-        col += levels.len();
-        if col > block_start {
-            blocks.push(TermBlock {
-                name: term.name.clone(),
-                kind: "random_effect".to_string(),
-                start: block_start,
-                end: col,
-            });
-        }
-    }
-
-    // Smooth terms: derive per-term column widths by building a synthetic
-    // design from training_feature_ranges. If that fails (older payloads
-    // without saved ranges, or unusual basis variants), the columns simply
-    // keep their default `__global__` labels.
-    if !spec.smooth_terms.is_empty() {
-        if let Some(smooth_ranges) = smooth_term_column_ranges(payload) {
-            for ((name, range), term_spec) in smooth_ranges.iter().zip(spec.smooth_terms.iter()) {
-                let kind = smooth_basis_kind_label(&term_spec.basis);
-                for idx in range.clone() {
-                    if let Some(entry) = provenance.get_mut(idx) {
-                        entry.term = Some(name.clone());
-                        entry.column = Some(name.clone());
-                        entry.label = format!("{}[{}]", name, idx - range.start);
-                        entry.source = "smooth".to_string();
-                    }
-                }
-                blocks.push(TermBlock {
-                    name: name.clone(),
-                    kind: kind.to_string(),
-                    start: range.start,
-                    end: range.end,
-                });
-            }
-        }
-    }
-
-    blocks.sort_by_key(|block| block.start);
-    (provenance, blocks)
 }
 
 fn coefficient_state_json_impl(model: &FittedModel) -> Result<String, String> {
@@ -594,17 +382,13 @@ fn coefficient_state_json_impl(model: &FittedModel) -> Result<String, String> {
         Some(c) => (Some(c.iter().copied().collect()), Some(c.nrows())),
         None => (None, None),
     };
-    let mut random_ranges = Vec::<(usize, usize)>::new();
-    if let Some(spec) = payload.resolved_termspec.as_ref() {
-        let mut col = 1 + spec.linear_terms.len();
-        for re in &spec.random_effect_terms {
-            let n = re.frozen_levels.as_ref().map(|v| v.len()).unwrap_or(0);
-            random_ranges.push((col, col + n));
-            col += n;
-        }
-    }
-    let (coefficient_provenance, term_blocks) =
-        coefficient_provenance_for_state(payload, fit.beta.len());
+    let layout = gam::inference::coefficient_layout::coefficient_layout(payload, fit.beta.len())?;
+    let random_ranges = layout
+        .columns
+        .iter()
+        .flat_map(|columns| &columns.random_effect_ranges)
+        .map(|(_, range)| (range.start, range.end))
+        .collect();
     let out = CoefficientStatePayload {
         beta: fit.beta.to_vec(),
         covariance_flat: cov.iter().copied().collect(),
@@ -614,8 +398,8 @@ fn coefficient_state_json_impl(model: &FittedModel) -> Result<String, String> {
         schema: payload.data_schema.clone(),
         training_feature_ranges: payload.training_feature_ranges.clone(),
         random_column_ranges: random_ranges,
-        coefficient_provenance,
-        term_blocks,
+        coefficient_provenance: layout.provenance,
+        term_blocks: layout.term_blocks,
         group_metadata: payload.group_metadata.clone(),
     };
     serde_json::to_string(&out)
@@ -641,18 +425,12 @@ fn term_blocks_for_model_impl(
     let beta_len = gam::families::survival::predict::saved_fit_result(model)?
         .beta
         .len();
-    let (_, term_blocks) = coefficient_provenance_for_state(model.payload(), beta_len);
-    let mut blocks = Vec::with_capacity(term_blocks.len());
-    for (idx, block) in term_blocks.into_iter().enumerate() {
-        if block.end < block.start {
-            return Err(format!(
-                "term block {idx} has invalid range [{}, {})",
-                block.start, block.end
-            ));
-        }
-        blocks.push((block.name, block.kind, block.start, block.end));
-    }
-    Ok(blocks)
+    let layout = gam::inference::coefficient_layout::coefficient_layout(model.payload(), beta_len)?;
+    Ok(layout
+        .term_blocks
+        .into_iter()
+        .map(|block| (block.name, block.kind, block.start, block.end))
+        .collect())
 }
 
 #[pyfunction]

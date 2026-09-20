@@ -2368,10 +2368,49 @@ pub(crate) enum SmoothPenaltyDemand {
 pub struct TermCollectionPredictionDesign {
     pub design: DesignMatrix,
     pub affine_offset: Array1<f64>,
+    /// The global coefficient column each term owns in `design`.
+    pub layout: TermCollectionLayout,
+}
+
+/// Which global coefficient columns each term of a term collection owns: the
+/// layout the design builder realizes,
+/// `[intercept | linear | RE_0 | RE_1 | … | smooth_0 | smooth_1 | …]`.
+///
+/// The intercept block is `0..1` only when the collection keeps a global
+/// intercept (see [`term_collection_has_global_intercept`]); a `0 + …` / `- 1`
+/// formula or an anchored B-spline realizes `0..0`, and every later block
+/// starts one column earlier. This value is the single source of truth for
+/// term -> coefficient provenance: a consumer that needs a term's columns reads
+/// them here rather than re-deriving offsets from the spec (#3522).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TermCollectionLayout {
+    pub intercept_range: Range<usize>,
     /// Each linear term's name and global coefficient range, in spec order.
     pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Each random-effect term's name and global coefficient range, in spec order.
+    pub random_effect_ranges: Vec<(String, Range<usize>)>,
     /// Each smooth term's name and global coefficient range, in spec order.
     pub smooth_ranges: Vec<(String, Range<usize>)>,
+}
+
+impl TermCollectionLayout {
+    /// Total number of coefficient columns the layout spans.
+    pub fn ncols(&self) -> usize {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .map(|(_, range)| range.end)
+            .fold(self.intercept_range.end, usize::max)
+    }
+
+    /// The global columns of the random-effect term named `name`.
+    pub fn random_effect_range(&self, name: &str) -> Option<Range<usize>> {
+        self.random_effect_ranges
+            .iter()
+            .find(|(term, _)| term == name)
+            .map(|(_, range)| range.clone())
+    }
 }
 
 impl TermCollectionPredictionDesign {
@@ -2430,6 +2469,31 @@ pub struct TermCollectionDesign {
 }
 
 impl TermCollectionDesign {
+    /// The global coefficient column each term owns in `design`. The smooth
+    /// block closes the layout, so it starts one smooth-block width before the
+    /// design's last column; each smooth term's local `coeff_range` is placed
+    /// there.
+    pub fn column_layout(&self) -> TermCollectionLayout {
+        let smooth_start = self.design.ncols() - self.smooth.total_smooth_cols();
+        TermCollectionLayout {
+            intercept_range: self.intercept_range.clone(),
+            linear_ranges: self.linear_ranges.clone(),
+            random_effect_ranges: self.random_effect_ranges.clone(),
+            smooth_ranges: self
+                .smooth
+                .terms
+                .iter()
+                .map(|term| {
+                    let range = &term.coeff_range;
+                    (
+                        term.name.clone(),
+                        (smooth_start + range.start)..(smooth_start + range.end),
+                    )
+                })
+                .collect(),
+        }
+    }
+
     /// Add this collection's fixed affine channel to a caller-owned likelihood
     /// offset, validating the universal row/finite-value contract at the seam
     /// where the two offset sources become one.

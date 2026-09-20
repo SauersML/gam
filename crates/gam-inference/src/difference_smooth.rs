@@ -9,7 +9,7 @@ use crate::effects::{
     self, BandOptions, CovarianceSource, PointwiseBandOptions, SimultaneousBandOptions,
 };
 use gam_data::{ColumnKindTag, DataSchema};
-use gam_terms::smooth::TermCollectionSpec;
+use gam_terms::smooth::{TermCollectionSpec, frozen_term_collection_layout};
 use ndarray::{Array2, ArrayView1, ArrayView2, s};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -162,7 +162,23 @@ pub fn difference_smooth_report(
         inputs.schema,
         inputs.training_feature_ranges,
     )?;
-    let (random_ranges, group_ranges) = random_effect_ranges(inputs.termspec, &group)?;
+    // Which columns each random effect owns is read from the engine's layout
+    // of the fitted spec, never re-derived: a model without a global intercept
+    // column (`0 + …`, an anchored B-spline) starts every block one column
+    // earlier than `1 + linear_terms.len()` (#3522).
+    let layout = frozen_term_collection_layout(inputs.termspec, inputs.training_feature_ranges)
+        .map_err(|error| format!("difference_smooth coefficient layout: {error}"))?;
+    let random_ranges: Vec<(usize, usize)> = layout
+        .random_effect_ranges
+        .iter()
+        .map(|(_, range)| (range.start, range.end))
+        .collect();
+    let group_ranges: Vec<(usize, usize)> = layout
+        .random_effect_ranges
+        .iter()
+        .filter(|(name, _)| name == &group)
+        .map(|(_, range)| (range.start, range.end))
+        .collect();
     let band_options = if request.simultaneous {
         BandOptions::Simultaneous(SimultaneousBandOptions {
             level,
@@ -186,6 +202,13 @@ pub fn difference_smooth_report(
                 "difference_smooth candidate designs disagree in shape: {:?} vs {:?}",
                 left.raw_dim(),
                 right.raw_dim()
+            ));
+        }
+        if left.ncols() != layout.ncols() {
+            return Err(format!(
+                "difference_smooth candidate design has {} columns but the model layout spans {}",
+                left.ncols(),
+                layout.ncols()
             ));
         }
         // Pair orientation is level_1 - level_2, matching the row labels.
@@ -288,30 +311,6 @@ fn contrast_rows(
         .collect()
 }
 
-fn random_effect_ranges(
-    termspec: &TermCollectionSpec,
-    group: &str,
-) -> Result<(Vec<(usize, usize)>, Vec<(usize, usize)>), String> {
-    let mut column = 1 + termspec.linear_terms.len();
-    let mut all = Vec::with_capacity(termspec.random_effect_terms.len());
-    let mut selected = Vec::new();
-    for term in &termspec.random_effect_terms {
-        let levels = term.frozen_levels.as_ref().ok_or_else(|| {
-            format!(
-                "difference_smooth random effect {:?} has no frozen levels",
-                term.name
-            )
-        })?;
-        let range = (column, column + levels.len());
-        all.push(range);
-        if term.name == group {
-            selected.push(range);
-        }
-        column += levels.len();
-    }
-    Ok((all, selected))
-}
-
 fn subtract_ranges(ranges: &[(usize, usize)], excluded: &[(usize, usize)]) -> Vec<(usize, usize)> {
     let mut output = Vec::new();
     for &(start, end) in ranges {
@@ -356,7 +355,99 @@ fn zero_ranges(design: &mut Array2<f64>, ranges: &[(usize, usize)]) -> Result<()
 mod tests {
     use super::*;
     use gam_data::SchemaColumn;
-    use ndarray::{Array1, array};
+    use gam_terms::smooth::{LinearTermSpec, ModelLevel, RandomEffectTermSpec};
+    use ndarray::Array1;
+
+    fn categorical(name: &str, levels: &[&str]) -> SchemaColumn {
+        SchemaColumn {
+            name: name.to_string(),
+            kind: ColumnKindTag::Categorical,
+            levels: levels.iter().map(|level| level.to_string()).collect(),
+        }
+    }
+
+    fn random_effect(name: &str, feature_col: usize, levels: usize) -> RandomEffectTermSpec {
+        RandomEffectTermSpec {
+            name: name.to_string(),
+            feature_col,
+            frozen_levels: Some(
+                (0..levels)
+                    .map(|code| gam_data::canonical_level_bits(code as f64))
+                    .collect(),
+            ),
+            lenient_unseen: true,
+        }
+    }
+
+    /// The candidate-row design callback a front end supplies, realized by the
+    /// engine's own prediction builder so the columns are the real layout's.
+    fn engine_design<'a>(
+        schema: &'a DataSchema,
+        spec: &'a TermCollectionSpec,
+    ) -> impl FnMut(&[String], &[Vec<String>]) -> Result<Array2<f64>, String> + 'a {
+        move |headers, rows| {
+            assert_eq!(headers.len(), schema.columns.len());
+            let data = Array2::from_shape_fn((rows.len(), headers.len()), |(row, column)| {
+                let cell = &rows[row][column];
+                let saved = &schema.columns[column];
+                match saved.kind {
+                    ColumnKindTag::Categorical => saved
+                        .levels
+                        .iter()
+                        .position(|level| level == cell)
+                        .expect("a saved level")
+                        as f64,
+                    _ => cell.parse::<f64>().expect("a numeric cell"),
+                }
+            });
+            gam_terms::smooth::build_term_collection_prediction_design(data.view(), spec)
+                .map(|design| design.design.to_dense())
+                .map_err(|error| error.to_string())
+        }
+    }
+
+    fn request(
+        pairs: (&str, &str),
+        marginalise_random: bool,
+        group_means: bool,
+    ) -> DifferenceSmoothRequest {
+        DifferenceSmoothRequest {
+            view: "x".to_string(),
+            group: Some("g".to_string()),
+            pairs: Some(vec![(pairs.0.to_string(), pairs.1.to_string())]),
+            n: 2,
+            level: Some(0.95),
+            simultaneous: false,
+            n_sim: None,
+            seed: None,
+            marginalise_random,
+            group_means,
+            template: None,
+        }
+    }
+
+    fn report(
+        schema: &DataSchema,
+        ranges: &[(f64, f64)],
+        spec: &TermCollectionSpec,
+        beta: &Array1<f64>,
+        request: DifferenceSmoothRequest,
+    ) -> Vec<DifferenceSmoothRow> {
+        let covariance = Array2::<f64>::eye(beta.len()) * 0.1;
+        difference_smooth_report(
+            DifferenceSmoothInputs {
+                schema,
+                training_feature_ranges: ranges,
+                termspec: spec,
+                beta: beta.view(),
+                covariance: covariance.view(),
+                covariance_source: CovarianceSource::Conditional,
+            },
+            request,
+            engine_design(schema, spec),
+        )
+        .expect("difference report")
+    }
 
     #[test]
     fn pair_orientation_and_report_are_owned_by_core() {
@@ -367,58 +458,89 @@ mod tests {
                     kind: ColumnKindTag::Continuous,
                     levels: Vec::new(),
                 },
-                SchemaColumn {
-                    name: "g".to_string(),
-                    kind: ColumnKindTag::Categorical,
-                    levels: vec!["A".to_string(), "B".to_string()],
-                },
+                categorical("g", &["A", "B"]),
             ],
         };
-        let request = DifferenceSmoothRequest {
-            view: "x".to_string(),
-            group: Some("g".to_string()),
-            pairs: Some(vec![("B".to_string(), "A".to_string())]),
-            n: 2,
-            level: Some(0.95),
-            simultaneous: false,
-            n_sim: None,
-            seed: None,
-            marginalise_random: false,
-            group_means: true,
-            template: None,
-        };
+        // Layout: [intercept | g_A g_B].
         let termspec = TermCollectionSpec {
             linear_terms: Vec::new(),
             smooth_terms: Vec::new(),
-            random_effect_terms: Vec::new(),
-            level: Default::default(),
+            random_effect_terms: vec![random_effect("g", 1, 2)],
+            level: ModelLevel::Intercept,
         };
-        let beta = Array1::from_vec(vec![0.0, 1.5]);
-        let covariance = array![[0.1, 0.0], [0.0, 0.1]];
-        let rows = difference_smooth_report(
-            DifferenceSmoothInputs {
-                schema: &schema,
-                training_feature_ranges: &[(0.0, 1.0), (0.0, 1.0)],
-                termspec: &termspec,
-                beta: beta.view(),
-                covariance: covariance.view(),
-                covariance_source: CovarianceSource::Conditional,
-            },
-            request,
-            |_, rows| {
-                Ok(Array2::from_shape_fn((rows.len(), 2), |(row, column)| {
-                    if column == 0 {
-                        1.0
-                    } else if rows[row][1] == "B" {
-                        1.0
-                    } else {
-                        0.0
-                    }
-                }))
-            },
-        )
-        .expect("difference report");
+        let beta = Array1::from_vec(vec![0.0, 0.0, 1.5]);
+        let rows = report(
+            &schema,
+            &[(0.0, 1.0), (0.0, 1.0)],
+            &termspec,
+            &beta,
+            request(("B", "A"), false, true),
+        );
         assert_eq!(rows.len(), 2);
         assert!(rows.iter().all(|row| (row.diff - 1.5).abs() < 1.0e-12));
+    }
+
+    /// #3522: without a global intercept column the linear term owns column 0
+    /// and each random effect starts one column earlier than
+    /// `1 + linear_terms.len()`. The nuisance columns zeroed out of the
+    /// contrast must be the engine's, so the no-intercept model reports exactly
+    /// what the same model reparameterised with an intercept reports.
+    #[test]
+    fn random_effect_columns_follow_the_engine_layout_without_an_intercept() {
+        let schema = DataSchema {
+            columns: vec![
+                SchemaColumn {
+                    name: "x".to_string(),
+                    kind: ColumnKindTag::Continuous,
+                    levels: Vec::new(),
+                },
+                categorical("g", &["A", "B"]),
+                categorical("h", &["u", "v"]),
+            ],
+        };
+        let ranges = [(0.0, 1.0), (0.0, 1.0), (0.0, 1.0)];
+        let spec = |level| TermCollectionSpec {
+            linear_terms: vec![LinearTermSpec {
+                name: "x".to_string(),
+                feature_col: 0,
+                feature_cols: vec![0],
+                categorical_levels: Vec::new(),
+                double_penalty: false,
+                coefficient_geometry: Default::default(),
+                coefficient_min: None,
+                coefficient_max: None,
+                frozen_function_mass: None,
+            }],
+            smooth_terms: Vec::new(),
+            random_effect_terms: vec![random_effect("g", 1, 2), random_effect("h", 2, 2)],
+            level,
+        };
+        // No intercept: [x | g_A g_B | h_u h_v]; with one: [1 | x | g_A g_B | h_u h_v].
+        let without = spec(ModelLevel::NoIntercept);
+        let with = spec(ModelLevel::Intercept);
+        let beta_without = Array1::from_vec(vec![0.7, 0.3, -0.4, 0.2, 0.9]);
+        let beta_with = Array1::from_vec(vec![1.3, 0.7, 0.3, -0.4, 0.2, 0.9]);
+        for (marginalise_random, group_means, expected) in
+            [(false, false, 0.0), (true, true, -0.7), (false, true, -0.7)]
+        {
+            let request = || request(("B", "A"), marginalise_random, group_means);
+            let rows_without = report(&schema, &ranges, &without, &beta_without, request());
+            let rows_with = report(&schema, &ranges, &with, &beta_with, request());
+            assert_eq!(rows_without.len(), rows_with.len());
+            for (a, b) in rows_without.iter().zip(&rows_with) {
+                assert!(
+                    (a.diff - expected).abs() < 1.0e-12,
+                    "marginalise={marginalise_random} group_means={group_means}: diff {} != {expected}",
+                    a.diff
+                );
+                assert!(
+                    (a.diff - b.diff).abs() < 1.0e-12,
+                    "{} vs {}",
+                    a.diff,
+                    b.diff
+                );
+                assert!((a.se - b.se).abs() < 1.0e-12, "{} vs {}", a.se, b.se);
+            }
+        }
     }
 }
