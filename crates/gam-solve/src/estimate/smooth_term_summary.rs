@@ -297,8 +297,9 @@ impl<'a> ScoreTestFit<'a> {
         let penalized_hessian = saved(fit.saved_frame_penalized_hessian())?;
         let weighted_gram = saved(fit.saved_frame_weighted_gram())?;
         // The score is read off `b = H·β` through the stationarity identity
-        // `H·β = XᵀWz`, which holds for a penalty centred at the origin; under
-        // an affine gauge the penalty is centred at the shift (gam#3346).
+        // `H·β = XᵀWz`. Every penalty is centred at the origin, so the
+        // identity holds at every converged fit (gam#3443); under an affine
+        // gauge the origin is the shift (gam#3346).
         let beta = fit
             .beta_from_gauge_shift()
             .map_err(|_| SmoothPValueUnavailable::FitCurvatureUnavailable)?;

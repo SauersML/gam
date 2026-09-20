@@ -26,7 +26,7 @@ use crate::estimate::reml::{DirectionalHyperParam, RemlState};
 
 // Crate-level imports
 use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, state_fromspec};
-pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
+pub use crate::model_types::{Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
 use gam_linalg::matrix::DesignMatrix;
 use gam_linalg::utils::{KahanSum, row_mismatch_message};

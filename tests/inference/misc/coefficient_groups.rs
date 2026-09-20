@@ -1,4 +1,4 @@
-use gam::estimate::{CoefficientPriorMean, FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
+use gam::estimate::{FitOptions, PenaltySpec, fit_gam_with_penalty_specs};
 use gam::smooth::{
     CoefficientGroupSpec, CoefficientSelector, LinearTermSpec, TermCollectionSpec,
     build_term_collection_design, fit_term_collection_with_coefficient_groups,
@@ -99,7 +99,6 @@ fn overlapping_coefficient_groups_are_distinct_precision_coordinates() {
                         shape: 2.0,
                         rate: 1.0,
                     }),
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "score_b_only".to_string(),
@@ -109,7 +108,6 @@ fn overlapping_coefficient_groups_are_distinct_precision_coordinates() {
                         shape: 4.0,
                         rate: 1.0,
                     }),
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -139,14 +137,12 @@ fn cyclic_coefficient_group_hierarchy_is_rejected() {
                     selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
                     parent: Some("inner".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "inner".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
                     parent: Some("outer".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -171,21 +167,18 @@ fn standard_parent_group_penalty_concatenates_child_penalties() {
                     ],
                     parent: None,
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "score_a_leaf".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
                     parent: Some("publication_level".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "score_b_leaf".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("score_b".to_string())],
                     parent: Some("publication_level".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -193,7 +186,7 @@ fn standard_parent_group_penalty_concatenates_child_penalties() {
         .expect("nested standard coefficient group");
 
     match &realized.penalty_specs[0] {
-        PenaltySpec::DenseWithMean { matrix, .. } => {
+        PenaltySpec::Dense(matrix) => {
             assert_eq!(matrix[[1, 1]], 1.0);
             assert_eq!(matrix[[2, 2]], 1.0);
         }
@@ -217,14 +210,12 @@ fn nested_group_rejects_parent_coefficients_not_covered_by_children() {
                     ],
                     parent: None,
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "score_a_leaf".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
                     parent: Some("publication_level".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -250,7 +241,6 @@ fn coefficient_group_spanning_two_terms_matches_manual_merged_penalty() {
         ],
         parent: None,
         prior: Some(prior),
-        prior_mean: Default::default(),
     }];
 
     let grouped = fit_term_collection_with_coefficient_groups(
@@ -322,7 +312,6 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
                 shape: 3.0,
                 rate: 1.0,
             }),
-            prior_mean: Default::default(),
         },
         CoefficientGroupSpec {
             name: "per_score_a_level".to_string(),
@@ -332,7 +321,6 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
                 shape: 15.0,
                 rate: 1.0,
             }),
-            prior_mean: Default::default(),
         },
         CoefficientGroupSpec {
             name: "per_score_b_level".to_string(),
@@ -342,7 +330,6 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
                 shape: 15.0,
                 rate: 1.0,
             }),
-            prior_mean: Default::default(),
         },
     ];
 
@@ -370,124 +357,4 @@ fn nested_groups_with_gamma_priors_apply_per_level_shrinkage() {
     let unpenalized = array![0.0_f64, 0.15, 1.25];
     assert!(fit.fit.beta[1].abs() < unpenalized[1].abs());
     assert!(fit.fit.beta[2].abs() > fit.fit.beta[1].abs() * 3.0);
-}
-
-#[test]
-fn coefficient_group_constant_prior_mean_shrinks_toward_mean() {
-    let n = 10;
-    let mut x = Array2::<f64>::zeros((n, 2));
-    let y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        x[[i, 0]] = if i % 2 == 0 { -0.2 } else { 0.2 };
-        x[[i, 1]] = if i < n / 2 { -0.2 } else { 0.2 };
-    }
-    let weights = Array1::ones(n);
-    let offset = Array1::zeros(n);
-    let spec = two_linear_term_spec();
-    let strong_precision = Some(CoefficientGroupPrior::GammaPrecision {
-        shape: 250.0,
-        rate: 1.0,
-    });
-
-    let toward_mean = fit_term_collection_with_coefficient_groups(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        &[CoefficientGroupSpec {
-            name: "constant_mean".to_string(),
-            selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
-            parent: None,
-            prior: strong_precision.clone(),
-            prior_mean: CoefficientPriorMean::constant(array![2.0]),
-        }],
-        gaussian_identity_spec(),
-        &fit_options(RhoPrior::Flat),
-    )
-    .expect("constant-mean fit");
-
-    let toward_zero = fit_term_collection_with_coefficient_groups(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        &[CoefficientGroupSpec {
-            name: "zero_mean".to_string(),
-            selectors: vec![CoefficientSelector::LinearTerm("score_a".to_string())],
-            parent: None,
-            prior: strong_precision,
-            prior_mean: CoefficientPriorMean::Zero,
-        }],
-        gaussian_identity_spec(),
-        &fit_options(RhoPrior::Flat),
-    )
-    .expect("zero-mean fit");
-
-    assert!(toward_mean.fit.beta[1] > 1.0);
-    assert!(toward_mean.fit.beta[1].abs() > toward_zero.fit.beta[1].abs() + 0.75);
-}
-
-#[test]
-fn coefficient_group_zero_prior_mean_matches_default_bits() {
-    let (x, y, weights, offset) = synthetic_two_score_data();
-    let spec = two_linear_term_spec();
-    let group = |prior_mean: CoefficientPriorMean| CoefficientGroupSpec {
-        name: "zero_equivalence".to_string(),
-        selectors: vec![
-            CoefficientSelector::LinearTerm("score_a".to_string()),
-            CoefficientSelector::LinearTerm("score_b".to_string()),
-        ],
-        parent: None,
-        prior: Some(CoefficientGroupPrior::GammaPrecision {
-            shape: 2.0,
-            rate: 1.0,
-        }),
-        prior_mean,
-    };
-
-    let default_fit = fit_term_collection_with_coefficient_groups(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        &[group(Default::default())],
-        gaussian_identity_spec(),
-        &fit_options(RhoPrior::Flat),
-    )
-    .expect("default prior mean fit");
-    let explicit_zero_fit = fit_term_collection_with_coefficient_groups(
-        x.view(),
-        y.view(),
-        weights.view(),
-        offset.view(),
-        &spec,
-        &[group(CoefficientPriorMean::Zero)],
-        gaussian_identity_spec(),
-        &fit_options(RhoPrior::Flat),
-    )
-    .expect("explicit zero prior mean fit");
-
-    assert_eq!(
-        default_fit.fit.lambdas.len(),
-        explicit_zero_fit.fit.lambdas.len()
-    );
-    for (a, b) in default_fit
-        .fit
-        .lambdas
-        .iter()
-        .zip(explicit_zero_fit.fit.lambdas.iter())
-    {
-        assert_eq!(a.to_bits(), b.to_bits());
-    }
-    for (a, b) in default_fit
-        .fit
-        .beta
-        .iter()
-        .zip(explicit_zero_fit.fit.beta.iter())
-    {
-        assert_eq!(a.to_bits(), b.to_bits());
-    }
 }

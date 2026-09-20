@@ -117,12 +117,7 @@ where
             }
         }
         if let Some(cache) = gaussian_fixed_cache {
-            let PirlsPenalty::Dense {
-                s_transformed,
-                linear_shift,
-                constant_shift,
-                ..
-            } = penalty_active;
+            let PirlsPenalty::Dense { s_transformed, .. } = penalty_active;
             let qs_view = qs_arc.as_ref().map(|qs| qs.view());
             let qs_arc_for_design = qs_arc
                 .as_ref()
@@ -138,8 +133,6 @@ where
                 xtwx_orig: cache.xtwx_orig.view(),
                 xtwy_orig: cache.xtwy_orig.view(),
                 s_transformed: s_transformed.view(),
-                linear_shift: linear_shift.view(),
-                constant_shift: *constant_shift,
                 qs: qs_view,
                 likelihood: &config.likelihood,
                 inverse_link: &config.link_kind,
@@ -255,15 +248,8 @@ where
             };
             if gpu_admitted {
                 let qs_view = qs_arc.as_ref().map(|qs| qs.view());
-                let (s_transformed_view, linear_shift_view, constant_shift_val) =
-                    match penalty_active {
-                        PirlsPenalty::Dense {
-                            s_transformed,
-                            linear_shift,
-                            constant_shift,
-                            ..
-                        } => (s_transformed.view(), linear_shift.view(), *constant_shift),
-                    };
+                let PirlsPenalty::Dense { s_transformed, .. } = penalty_active;
+                let s_transformed_view = s_transformed.view();
                 let qs_arc_for_design = qs_arc
                     .as_ref()
                     .cloned()
@@ -289,8 +275,6 @@ where
                     inverse_link: &config.link_kind,
                     x_original: x_dense,
                     s_transformed: s_transformed_view,
-                    linear_shift: linear_shift_view,
-                    constant_shift: constant_shift_val,
                     y,
                     priorweights,
                     offset,

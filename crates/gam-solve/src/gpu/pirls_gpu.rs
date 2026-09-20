@@ -58,7 +58,7 @@ pub struct PirlsGpuInput<'a> {
     pub x: ArrayView2<'a, f64>,
     pub weights: ArrayView1<'a, f64>,
     pub penalty_hessian: ArrayView2<'a, f64>,
-    /// Full descent-direction RHS: `Xᵀ·score − S·β + linear_shift`. The
+    /// Full descent-direction RHS: `Xᵀ·score − S·β`. The
     /// returned `PirlsGpuStep::direction = H⁻¹·gradient` (no negation, #257).
     /// Callers must assemble the corrected RHS before passing it here.
     pub gradient: ArrayView1<'a, f64>,
@@ -98,7 +98,7 @@ pub(crate) struct PirlsStepStreamInput<'a> {
 /// Where the host-input form uploads `weights` + `gradient` per Newton
 /// step, this form reads them straight from the
 /// [`crate::gpu_kernels::pirls_row::RowOutputDevBuffers`] populated by the
-/// device-side row-reweight kernel. The fixed penalty and linear shift are
+/// device-side row-reweight kernel. The fixed penalty is
 /// uploaded asynchronously; the Newton RHS correction itself stays on device.
 #[cfg(target_os = "linux")]
 pub(crate) struct PirlsStepStreamDeviceInput<'a, 'b> {
@@ -116,10 +116,6 @@ pub(crate) struct PirlsStepStreamDeviceInput<'a, 'b> {
     /// Current coefficient vector β (length p), consumed in place by the
     /// device-side Newton RHS correction.
     pub beta_dev: &'b cudarc::driver::CudaSlice<f64>,
-    /// Linear shift vector (length p) in transformed coordinates. It is
-    /// uploaded to coefficient scratch without synchronizing the stream, then
-    /// added by the same kernel that applies `−Sβ`.
-    pub linear_shift: ArrayView1<'b, f64>,
 }
 
 /// Shared, batch-wide GPU state for stream-pool sigma-cubature PIRLS.
@@ -618,7 +614,7 @@ extern "C" __global__ void chol_logdet_col_major(
     ///
     /// Build `H = XᵀWX + S + λI`, Cholesky-factor it, solve `H·d = g`,
     /// return `(H, d, log|H|)`. `input.gradient` is the full descent-direction
-    /// RHS `Xᵀscore − S·β + linear_shift` — the caller is responsible for
+    /// RHS `Xᵀscore − S·β` — the caller is responsible for
     /// assembling the corrected RHS before calling this function. No negation
     /// is applied; the returned `direction = H⁻¹·g` is the descent step δ
     /// directly (#257). The difference vs the one-shot [`solve_step`] is
@@ -850,7 +846,7 @@ extern "C" __global__ void chol_logdet_col_major(
         )?;
 
         // No negation: `input.gradient` is the full descent-direction RHS
-        // `Xᵀscore − S·β + linear_shift`; solving H·δ = rhs gives δ directly.
+        // `Xᵀscore − S·β`; solving H·δ = rhs gives δ directly.
         let direction = Array1::from_vec(direction_raw);
 
         Ok(PirlsGpuStep {
@@ -860,7 +856,7 @@ extern "C" __global__ void chol_logdet_col_major(
         })
     }
 
-    /// In-place Newton step: rhs = Xᵀ·score − S·β + linear_shift (#257, #260).
+    /// In-place Newton step: rhs = Xᵀ·score − S·β (#257, #260).
     ///
     /// Solves H·δ = rhs (H = XᵀWX + S + step_lm_lambda·I). On return
     /// `ws.rhs_dev` holds the Newton descent direction δ (not negated).
@@ -902,12 +898,6 @@ extern "C" __global__ void chol_logdet_col_major(
             ));
         }
 
-        if input.linear_shift.len() != p {
-            return Err(format!(
-                "linear_shift length {} does not match p={p}",
-                input.linear_shift.len()
-            ));
-        }
         if input.beta_dev.len() != p {
             return Err(format!(
                 "beta_dev length {} does not match p={p}",
@@ -1042,7 +1032,7 @@ extern "C" __global__ void chol_logdet_col_major(
             .map_err(|e| format!("upload penalty inplace: {e}"))?;
         geam_add_inplace(&ws.blas, &ws.stream, p, &mut ws.h_dev, &ws.penalty_dev)?;
 
-        // Step 3: rhs = Qsᵀ score_p − S·β + linear_shift  (#257, #260).
+        // Step 3: rhs = Qsᵀ score_p − S·β  (#257, #260).
         // First project score_p through Qsᵀ on device (p×p gemv):
         //   beta_orig_dev = Qsᵀ · rhs_dev,  then swap back.
         {
@@ -1071,15 +1061,6 @@ extern "C" __global__ void chol_logdet_col_major(
         // CPU, and uploaded rhs again on every iteration. Those small transfers
         // still drain the entire CUDA stream and dominated the n=80k, p=44
         // device-resident loop (#2430).
-        ws.stream
-            .memcpy_htod(
-                input
-                    .linear_shift
-                    .as_slice()
-                    .ok_or("linear_shift must be contiguous")?,
-                &mut ws.dir_orig_dev,
-            )
-            .map_err(|e| format!("upload linear shift inplace: {e}"))?;
         let loop_module = PIRLS_LOOP_CACHE
             .get_or_compile(&shared.ctx, "pirls_loop", PIRLS_LOOP_PTX_SOURCE)
             .map_err(|e| format!("load rhs-correction module: {e}"))?;
@@ -1095,11 +1076,10 @@ extern "C" __global__ void chol_logdet_col_major(
         builder.arg(&mut ws.rhs_dev);
         builder.arg(&ws.penalty_dev);
         builder.arg(input.beta_dev);
-        builder.arg(&ws.dir_orig_dev);
         builder.arg(&input.step_lm_lambda);
         builder.arg(&p_i);
         builder.arg(&mut ws.beta_orig_dev);
-        // SAFETY: correct_newton_rhs receives p-sized rhs/beta/shift vectors
+        // SAFETY: correct_newton_rhs receives p-sized rhs/beta vectors
         // and a column-major p×p penalty matrix; the launch covers p threads
         // and preserves `(S + lm I)β` in coefficient scratch for the selector.
         unsafe { builder.launch(cfg) }
@@ -1128,7 +1108,7 @@ extern "C" __global__ void chol_logdet_col_major(
         check_deferred_potrf_info(&ws.stream, &ws.potrf_info_dev)?;
         check_deferred_potrs_info(&ws.stream, &ws.potrs_info_dev)?;
 
-        // ws.rhs_dev = δ = H⁻¹·(Qsᵀ score_p − Sβ + linear_shift) — descent direction.
+        // ws.rhs_dev = δ = H⁻¹·(Qsᵀ score_p − Sβ) — descent direction.
         // No negation: the corrected RHS directly gives the descent direction (#257).
         Ok(logdet)
     }
@@ -1688,14 +1668,13 @@ extern "C" __global__ void axpy_n(
 }
 
 // Correct the projected score in place:
-//   rhs = Qs^T score - S beta + linear_shift.
+//   rhs = Qs^T score - S beta.
 // `penalty_step` stores S + lm*I for the factorization, so subtracting its
 // product and adding lm*beta recovers the model penalty S exactly.
 extern "C" __global__ void correct_newton_rhs(
     double* __restrict__ rhs,
     const double* __restrict__ penalty_step,
     const double* __restrict__ beta,
-    const double* __restrict__ linear_shift,
     double lm,
     int p,
     double* __restrict__ penalty_beta
@@ -1707,7 +1686,7 @@ extern "C" __global__ void correct_newton_rhs(
         s_beta += penalty_step[i + j * p] * beta[j];
     }
     penalty_beta[i] = s_beta;
-    rhs[i] += -s_beta + lm * beta[i] + linear_shift[i];
+    rhs[i] += -s_beta + lm * beta[i];
 }
 
 extern "C" __global__ void apply_penalty(
@@ -1739,11 +1718,9 @@ extern "C" __global__ void select_alpha(
     const double* __restrict__ direction,
     const double* __restrict__ penalty_beta_step,
     const double* __restrict__ penalty_direction_step,
-    const double* __restrict__ linear_shift,
     const double* __restrict__ direction_linf,
     double previous_deviance,
     double previous_objective,
-    double constant_shift,
     double lm,
     int p,
     double* __restrict__ output
@@ -1753,14 +1730,14 @@ extern "C" __global__ void select_alpha(
         1.0, 0.5, 0.25, 0.125, 0.0625, 0.03125, 0.015625
     };
 
-    double penalty_beta = constant_shift;
+    double penalty_beta = 0.0;
     double linear_coeff_half = 0.0;
     double direction_penalty = 0.0;
     for (int i = 0; i < p; ++i) {
         double s_beta = penalty_beta_step[i] - lm * beta[i];
         double s_direction = penalty_direction_step[i] - lm * direction[i];
-        penalty_beta += beta[i] * s_beta - 2.0 * beta[i] * linear_shift[i];
-        linear_coeff_half += direction[i] * (s_beta - linear_shift[i]);
+        penalty_beta += beta[i] * s_beta;
+        linear_coeff_half += direction[i] * s_beta;
         direction_penalty += direction[i] * s_direction;
     }
 
@@ -1938,8 +1915,6 @@ extern "C" __global__ void status_first_ladder(
     /// - `row_final`: five numerical fields + status, written once at convergence.
     pub(crate) struct PirlsLoopWorkspace {
         pub beta_dev: CudaSlice<f64>,
-        /// Fixed shifted-quadratic linear term, uploaded once per loop.
-        pub linear_shift_dev: CudaSlice<f64>,
         pub eta_dev: CudaSlice<f64>,
         /// Solve-row buffers: `grad_eta`, `w_solver`, `deviance`, `status`.
         pub row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers,
@@ -1977,7 +1952,6 @@ extern "C" __global__ void status_first_ladder(
             };
             Ok(Self {
                 beta_dev: alloc_f64("beta", p)?,
-                linear_shift_dev: alloc_f64("linear shift", p)?,
                 eta_dev: alloc_f64("eta", n)?,
                 row_solve: crate::gpu_kernels::pirls_row::SolveRowBuffers::allocate(stream, n)
                     .map_err(|e| format!("pirls loop alloc row_solve: {e}"))?,
@@ -2187,7 +2161,7 @@ extern "C" __global__ void status_first_ladder(
     }
 
     /// Full device-resident PIRLS loop. Candidate deviances, refusal summaries,
-    /// direction, beta, and shifted-penalty algebra stay on device; one compact
+    /// direction, beta, and penalty algebra stay on device; one compact
     /// alpha decision record synchronizes the host per Newton iteration. Beta
     /// and the final Hessian are downloaded once at exit.
     pub(super) fn pirls_loop(
@@ -2201,14 +2175,6 @@ extern "C" __global__ void status_first_ladder(
         gamma_shape: f64,
         beta0_host: ArrayView1<'_, f64>,
         penalty_hessian: ArrayView2<'_, f64>,
-        // Linear shift `b` of the shifted-quadratic penalty
-        // `βᵀSβ − 2βᵀb + c`. Length `p`. Mirrors
-        // `PirlsPenalty::linear_shift()` in the CPU oracle. Pass a zero
-        // vector for fits with no prior-mean shift.
-        linear_shift: ArrayView1<'_, f64>,
-        // Constant shift `c` of the shifted-quadratic penalty. Pass
-        // `0.0` for fits with no prior-mean shift.
-        constant_shift: f64,
         // Temporary LM damping for the Newton solves only; never enters
         // exported Hessian / EDF / penalty term.
         lm_ridge: f64,
@@ -2228,10 +2194,6 @@ extern "C" __global__ void status_first_ladder(
         if beta0_host.len() != p {
             return Err(format!("beta0 length {} ≠ p={p}", beta0_host.len()).into());
         }
-
-        if linear_shift.len() != p {
-            return Err(format!("linear_shift length {} ≠ p={p}", linear_shift.len()).into());
-        }
         if penalty_hessian.dim() != (p, p) {
             return Err(format!(
                 "penalty_hessian shape {:?} ≠ (p={p}, p={p})",
@@ -2246,14 +2208,6 @@ extern "C" __global__ void status_first_ladder(
                 &mut loop_ws.beta_dev,
             )
             .map_err(|e| format!("upload beta0: {e}"))?;
-        ws.stream
-            .memcpy_htod(
-                linear_shift
-                    .as_slice()
-                    .ok_or("linear_shift not contiguous")?,
-                &mut loop_ws.linear_shift_dev,
-            )
-            .map_err(|e| format!("upload linear_shift: {e}"))?;
 
         let backend = crate::gpu_kernels::pirls_row::PirlsRowBackend::probe()
             .map_err(|e| format!("pirls_row backend: {e}"))?;
@@ -2349,13 +2303,11 @@ extern "C" __global__ void status_first_ladder(
         let mut last_logdet = 0.0_f64;
         let mut converged = false;
 
-        // Initial *penalized* objective = data-deviance(β₀) + shifted
-        // quadratic(β₀). This is the value the line search and
+        // Initial *penalized* objective = data-deviance(β₀) + β₀ᵀSβ₀. This is the value the line search and
         // convergence test compare candidates against — matches the CPU
         // oracle's `penalized_objective` in `CandidateScreen`.
         let s_beta0 = penalty_hessian.dot(&beta0_host);
-        let penalty_init =
-            beta0_host.dot(&s_beta0) - 2.0 * beta0_host.dot(&linear_shift) + constant_shift;
+        let penalty_init = beta0_host.dot(&s_beta0);
         let mut prev_objective = prev_deviance + penalty_init;
 
         // Diagnostic scalars surfaced on the outcome so the dispatch
@@ -2381,7 +2333,6 @@ extern "C" __global__ void status_first_ladder(
                     penalty_hessian,
                     step_lm_lambda: lm_ridge,
                     beta_dev: &loop_ws.beta_dev,
-                    linear_shift,
                 },
             )
             .map_err(|e| format!("inner step it={it}: {e}"))?;
@@ -2424,7 +2375,7 @@ extern "C" __global__ void status_first_ladder(
             // deviance into objective_dev[k] and writing exact per-row refusal
             // codes. A deterministic device reduction returns seven row/code
             // pairs to device memory; `select_alpha` combines those with the
-            // exact shifted-quadratic penalty and direction norm. Only its
+            // exact quadratic penalty and direction norm. Only its
             // compact decision record crosses to the host.
             loop_ws
                 .alpha_ladder
@@ -2478,11 +2429,9 @@ extern "C" __global__ void status_first_ladder(
             builder.arg(&loop_ws.direction_dev);
             builder.arg(&ws.beta_orig_dev);
             builder.arg(&loop_ws.penalty_direction_dev);
-            builder.arg(&loop_ws.linear_shift_dev);
             builder.arg(&loop_ws.scalar_dev);
             builder.arg(&prev_deviance);
             builder.arg(&prev_objective);
-            builder.arg(&constant_shift);
             builder.arg(&lm_ridge);
             builder.arg(&p_i);
             builder.arg(&mut loop_ws.alpha_selection_dev);
@@ -3214,7 +3163,6 @@ extern "C" __global__ void status_first_ladder(
         a_orig: ArrayView2<'_, f64>,
         b_orig: ArrayView1<'_, f64>,
         s_transformed: ArrayView2<'_, f64>,
-        linear_shift: ArrayView1<'_, f64>,
         qs: Option<ArrayView2<'_, f64>>,
     ) -> Result<GaussianPlsResult, String> {
         let p = b_orig.len();
@@ -3223,9 +3171,6 @@ extern "C" __global__ void status_first_ladder(
         }
         if s_transformed.dim() != (p, p) {
             return Err(format!("S shape {:?} != ({p},{p})", s_transformed.dim()));
-        }
-        if linear_shift.len() != p {
-            return Err(format!("linear_shift len {} != p={p}", linear_shift.len()));
         }
         if let Some(qs_v) = qs {
             if qs_v.dim() != (p, p) {
@@ -3242,8 +3187,7 @@ extern "C" __global__ void status_first_ladder(
             (a_orig.to_owned(), b_orig.to_owned())
         };
         let penalized_hessian: Array2<f64> = &h_rotated + &s_transformed;
-        let mut rhs_host = rhs_base;
-        rhs_host += &linear_shift;
+        let rhs_host = rhs_base;
         let (ctx, stream) = context_and_stream()?;
         let solver = DnHandle::new(stream.clone())
             .map_err(|e| format!("cusolver init (gaussian pls): {e}"))?;
@@ -3411,11 +3355,6 @@ pub(crate) fn pirls_loop_on_stream(
     likelihood_scale: PirlsLoopLikelihoodScale,
     beta0: ndarray::ArrayView1<'_, f64>,
     penalty_hessian: ndarray::ArrayView2<'_, f64>,
-    // Linear shift `b` for the shifted-quadratic penalty `βᵀSβ−2βᵀb+c`.
-    // Pass a zero-length or all-zero slice for fits with no prior-mean shift.
-    linear_shift: ndarray::ArrayView1<'_, f64>,
-    // Constant shift `c` for the shifted-quadratic penalty. Pass `0.0` when absent.
-    constant_shift: f64,
     step_lm_lambda: f64,
     max_iter: usize,
     tol: f64,
@@ -3433,8 +3372,6 @@ pub(crate) fn pirls_loop_on_stream(
         gamma_shape,
         beta0,
         penalty_hessian,
-        linear_shift,
-        constant_shift,
         step_lm_lambda,
         max_iter,
         tol,
@@ -3462,10 +3399,9 @@ pub(crate) fn solve_gaussian_pls_gpu(
     a_orig: ndarray::ArrayView2<'_, f64>,
     b_orig: ndarray::ArrayView1<'_, f64>,
     s_transformed: ndarray::ArrayView2<'_, f64>,
-    linear_shift: ndarray::ArrayView1<'_, f64>,
     qs: Option<ndarray::ArrayView2<'_, f64>>,
 ) -> Result<cuda::GaussianPlsResult, String> {
-    cuda::solve_gaussian_pls_on_stream(a_orig, b_orig, s_transformed, linear_shift, qs)
+    cuda::solve_gaussian_pls_on_stream(a_orig, b_orig, s_transformed, qs)
 }
 
 /// CPU fallback for the PIRLS-step GPU primitives.  When this build has no
@@ -3524,7 +3460,7 @@ mod cpu_fallback {
             .map_err(|e| format!("CPU Cholesky failed in PIRLS fallback: {e:?}"))?;
         let g = Array1::from_iter(input.gradient.iter().copied());
         // No negation: `input.gradient` is the full descent-direction RHS
-        // `Xᵀscore − S·β + linear_shift`; solving H·δ = rhs gives δ directly (#257).
+        // `Xᵀscore − S·β`; solving H·δ = rhs gives δ directly (#257).
         let direction = factor.solvevec(&g);
         // Logdet comes from H_step's Cholesky (the actual factored matrix).
         let logdet = 2.0 * factor.diag().iter().map(|v| v.ln()).sum::<f64>();
@@ -3970,7 +3906,6 @@ mod stream_device_parity_tests {
         // this gate did not, which is the THIRD way its two sides were timing
         // different work (after the 30-vs-3 iteration mismatch).
         {
-            let warm_shift = ndarray::Array1::<f64>::zeros(p);
             drop(
                 pirls_loop_on_stream(
                     &shared,
@@ -3981,8 +3916,6 @@ mod stream_device_parity_tests {
                     PirlsLoopLikelihoodScale::non_gamma(),
                     beta0.view(),
                     penalty.view(),
-                    warm_shift.view(),
-                    0.0,
                     0.0,
                     30,
                     1e-6,
@@ -3993,10 +3926,7 @@ mod stream_device_parity_tests {
         }
 
         let t0 = Instant::now();
-        // No prior-mean shift in this benchmark — penalty = ½βᵀSβ
-        // with `s_transformed = penalty`, `linear_shift = 0`,
-        // `constant_shift = 0`.
-        let linear_shift_zero = ndarray::Array1::<f64>::zeros(p);
+        // Penalty = ½βᵀSβ with `s_transformed = penalty`.
         let gpu_outcome = pirls_loop_on_stream(
             &shared,
             &mut ws,
@@ -4006,8 +3936,6 @@ mod stream_device_parity_tests {
             PirlsLoopLikelihoodScale::non_gamma(),
             beta0.view(),
             penalty.view(),
-            linear_shift_zero.view(),
-            0.0,
             0.0,
             30,
             1e-6,
@@ -4168,10 +4096,7 @@ mod stream_device_parity_tests {
         let mut ws = allocate_sigma_pirls_workspace(&shared).expect("alloc ws");
         let mut loop_ws = allocate_pirls_loop_workspace(&shared, &ws).expect("alloc loop_ws");
 
-        // No prior-mean shift in this OLS test — `linear_shift = 0`,
-        // `constant_shift = 0`. `y` / `prior_w` are now uploaded via
-        // the shared workspace (#258).
-        let linear_shift_zero = ndarray::Array1::<f64>::zeros(p);
+        // `y` / `prior_w` are uploaded via the shared workspace (#258).
         let outcome = pirls_loop_on_stream(
             &shared,
             &mut ws,
@@ -4181,8 +4106,6 @@ mod stream_device_parity_tests {
             PirlsLoopLikelihoodScale::non_gamma(),
             beta0.view(),
             penalty.view(),
-            linear_shift_zero.view(),
-            0.0,
             0.0,
             20,
             1e-9,

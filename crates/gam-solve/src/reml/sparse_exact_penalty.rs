@@ -34,7 +34,7 @@ pub(crate) fn sparse_penalty_block_count_from_canonical(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array2, array};
 
     fn canonical_penalty(
         col_range: std::ops::Range<usize>,
@@ -49,7 +49,6 @@ mod tests {
             total_dim,
             nullity: 0,
             local: local.into_shared(),
-            prior_mean: Array1::zeros(block_dim),
             positive_eigenvalues,
             op: None,
         }

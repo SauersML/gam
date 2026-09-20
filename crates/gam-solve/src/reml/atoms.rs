@@ -237,22 +237,21 @@ pub trait CriterionAtom {
 // ───────────────────────────────────────────────────────────────────────────
 
 /// Atom 4 (the simplest β-channel anchor): the penalty quadratic
-/// `½ Σ_k λ_k (β̂ − μ_k)ᵀ S_k (β̂ − μ_k)`.
+/// `½ Σ_k λ_k β̂ᵀ S_k β̂`.
 ///
 /// This is the migration's smallest non-trivial test of the β-channel
 /// discipline — the one place the calculus's envelope/noise-floor correction
 /// has a closed form, so its contract is checkable by hand:
 ///
-/// - `value`      = `½ Σ_k λ_k qᵀ S_k q` with `q = β̂ − μ_k` (the prior mean
-///   `μ_k` is zero for the usual smoothing penalties; a nonzero `μ_k` carries
-///   a Gaussian-prior shift). One quadratic form, one internal state.
+/// - `value`      = `½ Σ_k λ_k β̂ᵀ S_k β̂`. One quadratic form, one internal
+///   state.
 /// - `frozen_d1`  w.r.t. the log-smoothing coordinate `ρ_k = ln λ_k` at FIXED
-///   `β̂` is `½ λ_k qᵀ S_k q` — the per-block term itself, because
+///   `β̂` is `½ λ_k β̂ᵀ S_k β̂` — the per-block term itself, because
 ///   `∂λ_k/∂ρ_k = λ_k`. ψ-coordinates (which move `S_k`'s *entries*, not its
 ///   weight) enter through the shared drift like every other term and are not
 ///   this atom's explicit channel, so `frozen_d1` reads only the `ρ` index.
-/// - `beta_channel` = `Σ_k λ_k S_k (β̂ − μ_k) = Sλ(β̂ − μ)` — the *penalty
-///   half* of the KKT residual `g = ∂_β(NLL) + Sλ(β̂ − μ)`. The calculus
+/// - `beta_channel` = `Σ_k λ_k S_k β̂ = Sλ β̂` — the *penalty
+///   half* of the KKT residual `g = ∂_β(NLL) + Sλ β̂`. The calculus
 ///   contracts it with the shared `β̇`, so the implicit `β̂(θ)`-motion of the
 ///   penalty quadratic is charged exactly once and by the same chain rule the
 ///   logdet and sampled atoms ride. No site can forget it; none can build a
@@ -265,21 +264,21 @@ pub struct PenaltyQuadAtom {
     /// Per-block smoothing weights `λ_k` (NOT logs — the atom multiplies them
     /// in directly; the `ρ_k = ln λ_k` chain factor lives in `frozen_d1`).
     pub lambdas: Array1<f64>,
-    /// Per-block penalty quadratic forms `q_k = (β̂ − μ_k)ᵀ S_k (β̂ − μ_k) ≥ 0`,
+    /// Per-block penalty quadratic forms `q_k = β̂ᵀ S_k β̂ ≥ 0`,
     /// evaluated once at the current `β̂` (the only internal state this atom
     /// needs; value and `frozen_d1` are both projections of it).
     pub block_quadratics: Array1<f64>,
-    /// `Σ_k λ_k S_k (β̂ − μ_k)` — the penalty half of the KKT residual, the
+    /// `Σ_k λ_k S_k β̂` — the penalty half of the KKT residual, the
     /// atom's exact `∂A/∂β̂`. Built once alongside `block_quadratics`.
     pub penalty_score: Array1<f64>,
-    /// Per-block beta score emissions `λ_k S_k(β̂ − μ_k)`, aligned with
+    /// Per-block beta score emissions `λ_k S_k β̂`, aligned with
     /// `lambdas` / `block_quadratics`. Live gradient, Hessian, KKT-residual,
-    /// and EFS assembly read these instead of reassembling centered
-    /// beta-Gaussian prior matvecs at each consumer.
+    /// and EFS assembly read these instead of reassembling penalty
+    /// matvecs at each consumer.
     pub block_penalty_scores: Vec<Array1<f64>>,
     /// The penalty-quadratic VALUE in the STABLE reparameterized basis,
     /// `½ · stable_penalty_term` (the PIRLS-emitted
-    /// `penalty_active.shifted_quadratic(β̂_transformed) + ridge‖β̂_transformed‖²`,
+    /// `penalty_active.quadratic(β̂_transformed) + ridge‖β̂_transformed‖²`,
     /// halved to the criterion's `½βᵀSβ` convention). `Some` when the atom is
     /// built from the converged inner solve (the live LAML cost path);
     /// `value()` then returns THIS stable scalar rather than the original-basis
@@ -317,10 +316,10 @@ impl PenaltyQuadAtom {
     /// Build the beta-Gaussian prior / penalty-quadratic atom from the live
     /// REML penalty-coordinate representation.
     ///
-    /// Each coordinate owns its prior-mean convention (`β` vs `β − μ`) and
-    /// sparse/block/root application. This constructor is the single emission
-    /// point for the centered quadratic `q_k`, the per-block score
-    /// `λ_k S_k(β̂ − μ_k)`, and their total beta channel.
+    /// Each coordinate owns its sparse/block/root application. This
+    /// constructor is the single emission point for the quadratic `q_k`, the
+    /// per-block score
+    /// `λ_k S_k β̂`, and their total beta channel.
     pub(crate) fn from_penalty_coords(
         lambdas: &[f64],
         coords: &[PenaltyCoordinate],
@@ -342,13 +341,13 @@ impl PenaltyQuadAtom {
                     "penalty quadratic atom received non-finite lambda at coord {idx}: {lambda}"
                 ));
             }
-            let q_k = coord.shifted_quadratic(beta, 1.0);
+            let q_k = coord.quadratic(beta, 1.0);
             if !q_k.is_finite() {
                 return Err(format!(
-                    "penalty quadratic atom produced non-finite shifted quadratic at coord {idx}: {q_k}"
+                    "penalty quadratic atom produced non-finite quadratic at coord {idx}: {q_k}"
                 ));
             }
-            let score_k = coord.apply_shifted_penalty(beta, lambda);
+            let score_k = coord.apply_penalty(beta, lambda);
             if score_k.len() != beta.len() {
                 return Err(format!(
                     "penalty quadratic atom score length mismatch at coord {idx}: got {}, expected {}",
@@ -820,10 +819,10 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // satisfies the contract (one factorization → value + ρ/ψ/cross
 // derivatives) and needs only the trait impl plus the deletion of its
 // remaining call-site special-casing. The penalty quadratic
-// `½ λ_k (β−μ_k)ᵀ S_k (β−μ_k)` is realized above as `PenaltyQuadAtom` (the
+// `½ λ_k βᵀ S_k β` is realized above as `PenaltyQuadAtom` (the
 // simplest β-channel atom: frozen_d1 = the explicit ½λ_k quadratic;
-// beta_channel = Sλ(β̂−μ) = the KKT residual's penalty half). Its live
-// derivative assembly now reads the atom's centered beta-Gaussian emissions;
+// beta_channel = Sλβ̂ = the KKT residual's penalty half). Its live
+// derivative assembly now reads the atom's emissions;
 // the scalar cost still reads `pirls_result.stable_penalty_term` for the
 // stable-basis value invariant recorded below.
 //
@@ -847,13 +846,13 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 // DELIBERATELY NOT FORCED: the penalty-quadratic VALUE stays
 // `pirls_result.stable_penalty_term` (computed in the stable reparameterized
 // basis) rather than being rewritten onto the gradient's per-coordinate
-// `shifted_quadratic`. The two formulas are mathematically one atom, but the
+// `quadratic`. The two formulas are mathematically one atom, but the
 // stable-basis evaluation exists because `βᵀSλβ` cancels catastrophically in
 // the original basis at large λ — unifying the source text would trade a
 // certified value/gradient pair for worse numerics. The live derivative,
-// Hessian, KKT-residual, and EFS sites now read the centered `PenaltyQuadAtom`
+// Hessian, KKT-residual, and EFS sites now read the `PenaltyQuadAtom`
 // emissions; the remaining value-side work is a stable-basis value emission
-// from PIRLS, not a second shifted-quadratic formula in the outer assembly.
+// from PIRLS, not a second quadratic formula in the outer assembly.
 //
 // LANDED (pass 2, the ThetaDirection shared-drift pass — the β̇ kernel
 // half): `ThetaModeResponseKernel` in unified.rs is now the ONE place the
@@ -939,12 +938,12 @@ impl CriterionAtom for ThetaOnlyCorrectionAtom {
 //
 // LANDED (pass 4e, beta-Gaussian prior derivative atom): live ρ penalty
 // derivative assembly now builds `PenaltyQuadAtom` from `PenaltyCoordinate`s
-// once per evaluator path and projects the centered Gaussian-prior emissions
+// once per evaluator path and projects the penalty emissions
 // from it: `rho_frozen_d1` feeds the gradient/Hessian/EFS penalty-quadratic
 // scalar, and `block_penalty_scores` feeds mode-response RHSs plus the
 // KKT-residual correction. The old outer helper pair
 // `penalty_a_k_{beta,quadratic}` is deleted, so the outer derivative stack no
-// longer reassembles `(β̂ − μ_k)` matvecs and quadratics independently at each
+// longer reassembles `S_k β̂` matvecs and quadratics independently at each
 // consumer. The profiled cost VALUE deliberately remains the stable PIRLS
 // emission above; this pass removes the live inline derivative/Hessian beta
 // prior assembly without replacing the numerically stable scalar value path.
@@ -1041,7 +1040,7 @@ mod tests {
         assert!((channel.grad_beta.dot(&array![0.5, 0.5]) - 0.5).abs() < 1e-12);
 
         // CriterionSum fold over the ρ_0 direction: value = 13, profiled
-        // d1 = frozen_d1(ρ_0) + ⟨Sλ(β̂−μ), β̇⟩ = 3 + 0.5 = 3.5. The envelope
+        // d1 = frozen_d1(ρ_0) + ⟨Sλβ̂, β̇⟩ = 3 + 0.5 = 3.5. The envelope
         // correction appears with no per-atom chain rule — exactly the win.
         let sum = CriterionSum {
             atoms: vec![Box::new(atom)],
@@ -1049,24 +1048,19 @@ mod tests {
         assert!((sum.value() - 13.0).abs() < 1e-12);
         assert!((sum.d1(&dir0) - 3.5).abs() < 1e-12);
 
-        // Live constructor path with a nonzero Gaussian prior mean:
-        // β = (2, 3), μ = (1, 1), R = I, λ = 4.
-        // q = ||β - μ||² = 1 + 4 = 5, value = 10,
-        // score = λ(β - μ) = (4, 8).
-        let centered_coord = PenaltyCoordinate::from_dense_root_with_mean(
-            array![[1.0, 0.0], [0.0, 1.0]],
-            array![1.0, 1.0],
-        );
-        let centered_atom =
-            PenaltyQuadAtom::from_penalty_coords(&[4.0], &[centered_coord], &array![2.0, 3.0])
-                .expect("centered penalty atom");
-        assert!((centered_atom.value() - 10.0).abs() < 1e-12);
-        assert!((centered_atom.rho_frozen_d1(0) - 10.0).abs() < 1e-12);
-        let centered_channel = centered_atom
+        // Live constructor path: β = (2, 3), R = I, λ = 4.
+        // q = ||β||² = 4 + 9 = 13, value = 26, score = λβ = (8, 12).
+        let coord = PenaltyCoordinate::from_dense_root(array![[1.0, 0.0], [0.0, 1.0]]);
+        let coord_atom =
+            PenaltyQuadAtom::from_penalty_coords(&[4.0], &[coord], &array![2.0, 3.0])
+                .expect("penalty atom");
+        assert!((coord_atom.value() - 26.0).abs() < 1e-12);
+        assert!((coord_atom.rho_frozen_d1(0) - 26.0).abs() < 1e-12);
+        let coord_channel = coord_atom
             .beta_channel()
-            .expect("centered penalty atom declares beta channel");
-        assert_eq!(centered_channel.grad_beta, array![4.0, 8.0]);
-        assert_eq!(centered_atom.block_penalty_scores()[0], array![4.0, 8.0]);
+            .expect("penalty atom declares beta channel");
+        assert_eq!(coord_channel.grad_beta, array![8.0, 12.0]);
+        assert_eq!(coord_atom.block_penalty_scores()[0], array![8.0, 12.0]);
     }
 
     /// #931 production routing: the penalty-quadratic VALUE the live LAML cost
@@ -1104,19 +1098,13 @@ mod tests {
             "value-only carrier has no β-channel mass"
         );
 
-        // (2) Full atom: two blocks, β = (2, 3), μ = 0, R = I ⇒ q = (β₀², β₁²)
+        // (2) Full atom: two blocks, β = (2, 3), R = I ⇒ q = (β₀², β₁²)
         // per block selecting one coordinate. Build λ-dependent value and check
         // rho_frozen_d1 == d/dρ_k of ½ Σ λ_j q_j.
         let beta = array![2.0_f64, 3.0];
         // Block 0 penalizes coordinate 0 (root e₀ᵀ), block 1 coordinate 1.
-        let coord0 = PenaltyCoordinate::from_dense_root_with_mean(
-            array![[1.0, 0.0], [0.0, 0.0]],
-            array![0.0, 0.0],
-        );
-        let coord1 = PenaltyCoordinate::from_dense_root_with_mean(
-            array![[0.0, 0.0], [0.0, 1.0]],
-            array![0.0, 0.0],
-        );
+        let coord0 = PenaltyCoordinate::from_dense_root(array![[1.0, 0.0], [0.0, 0.0]]);
+        let coord1 = PenaltyCoordinate::from_dense_root(array![[0.0, 0.0], [0.0, 1.0]]);
         let lambdas = [0.7_f64, 1.3];
         let coords = vec![coord0.clone(), coord1.clone()];
         let build = |lams: &[f64]| {

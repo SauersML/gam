@@ -138,16 +138,8 @@ impl ProjectedKktResidual {
 }
 
 // ===========================================================================
-// CoefficientPriorMean + PenaltySpec
+// PenaltySpec
 // ===========================================================================
-
-/// Programmatic prior mean for a coefficient penalty block.
-///
-/// This type now lives in the neutral `gam-problem` crate (with its inherent
-/// `evaluate` returning `gam_problem::PriorMeanError`); re-exported here so all
-/// existing `crate::estimate::CoefficientPriorMean` references keep resolving.
-/// Solver-side callers map `PriorMeanError` into `EstimationError::InvalidInput`.
-pub use gam_problem::CoefficientPriorMean;
 
 pub use gam_terms::penalty_spec::PenaltySpec;
 

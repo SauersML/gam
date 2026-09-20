@@ -280,7 +280,6 @@ mod tests {
     fn sparse_factor_edf_matches_dense_edf() {
         use faer::sparse::{SparseColMat, Triplet};
         use gam_linalg::sparse_exact::{factorize_sparse_spd, solve_sparse_spdmulti};
-        use ndarray::Array1;
 
         let levels = 9usize;
         let smooth = 3usize;
@@ -320,8 +319,6 @@ mod tests {
         let penalty = PirlsPenalty::Dense {
             s_transformed: s,
             e_transformed: e.clone(),
-            linear_shift: Array1::zeros(p),
-            constant_shift: 0.0,
         };
         let sparse_edf = calculate_edf_from_sparse_factor(&factor, &penalty).unwrap();
         let tol = 1e-12 * p as f64;

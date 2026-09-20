@@ -397,11 +397,11 @@ impl<'a> RemlState<'a> {
     /// is justified and L(ρ) < ∞):
     ///
     ///   ∂_{ρ_k} log L(ρ)
-    ///   = -0.5 * exp(ρ_k) * E_{π(β|y,ρ)}[ (β-μ_k)ᵀ S_k (β-μ_k) ].
+    ///   = -0.5 * exp(ρ_k) * E_{π(β|y,ρ)}[ βᵀ S_k β ].
     ///
     /// Laplace bridge to implemented terms:
     /// - If π(β|y,ρ) is approximated locally by N(β̂, H^{-1}), then
-    ///     E[(β-μ_k)ᵀ S_k(β-μ_k)] ≈ (β̂-μ_k)ᵀ S_k(β̂-μ_k) + tr(H^{-1} S_k),
+    ///     E[βᵀ S_k β] ≈ β̂ᵀ S_k β̂ + tr(H^{-1} S_k),
     ///   giving the familiar quadratic + trace structure.
     /// - In this code those appear as:
     ///     0.5 * β̂ᵀ S_k^ρ β̂,
@@ -1092,7 +1092,7 @@ impl<'a> RemlState<'a> {
             let original = self.build_penalty_coords();
             let quad = |coord: &super::reml_outer_engine::PenaltyCoordinate| {
                 if coord.dim() == beta.len() {
-                    coord.shifted_quadratic(&beta, 1.0)
+                    coord.quadratic(&beta, 1.0)
                 } else {
                     f64::NAN
                 }
@@ -1156,7 +1156,7 @@ impl<'a> RemlState<'a> {
                         .map(|cp| {
                             let coord = cp.to_penalty_coordinate();
                             if coord.dim() == rotated.len() {
-                                coord.shifted_quadratic(&rotated, 1.0)
+                                coord.quadratic(&rotated, 1.0)
                             } else {
                                 f64::NAN
                             }
@@ -1167,7 +1167,7 @@ impl<'a> RemlState<'a> {
                         .map(|cp| {
                             let coord = cp.to_penalty_coordinate();
                             if coord.dim() == projected_beta.len() {
-                                coord.shifted_quadratic(&projected_beta, 1.0)
+                                coord.quadratic(&projected_beta, 1.0)
                             } else {
                                 f64::NAN
                             }
@@ -4057,14 +4057,13 @@ mod ift_warm_start_tests {
             total_dim: p,
             nullity,
             local: local.into_shared(),
-            prior_mean: Array1::zeros(p),
             positive_eigenvalues,
             op: None,
         }
     }
 
     /// Verify the IFT predictor satisfies the linearized FOC:
-    /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · (β_cur-μ_k)`.
+    /// `H_pen · (β_predict − β_cur) ≈ −Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur`.
     /// Tested in the original-basis path (`frame_was_original = true`).
     #[test]
     pub(crate) fn ift_predictor_satisfies_linearized_foc_original_basis() {
@@ -4124,7 +4123,7 @@ mod ift_warm_start_tests {
             .expect("IFT predictor should accept small Δρ");
 
         // Check the linearized FOC residual:
-        //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · (β_cur-μ_k) ≈ 0
+        //   H_pen · (β_pred − β_cur) + Σ_k Δρ_k · e^{ρ_k} · S_k · β_cur ≈ 0
         let dbeta = &predicted.0 - &beta_cur;
         let lhs = h_pen.dot(&dbeta);
         let mut rhs = Array1::<f64>::zeros(p);
@@ -4202,15 +4201,14 @@ mod ift_warm_start_tests {
             }
         }
 
-        // Precompute the per-penalty `S_k · (β_cur-μ_k)` blocks the same way
+        // Precompute the per-penalty `S_k · β_cur` blocks the same way
         // updatewarm_start_from does at cache-write time.
         let lambda_s_beta_blocks: Vec<ndarray::Array1<f64>> = canonical
             .iter()
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                let centered = &beta_block - &cp.prior_mean;
-                cp.local.dot(&centered)
+                cp.local.dot(&beta_block)
             })
             .collect();
 
@@ -4582,7 +4580,7 @@ mod ift_warm_start_tests {
         }
     }
 
-    /// Parallel `S_k · (β-μ_k)` mat-vec across penalties (the rayon par_iter
+    /// Parallel `S_k · β` mat-vec across penalties (the rayon par_iter
     /// pattern used at IFT cache-write time in updatewarm_start_from)
     /// must produce bit-equivalent output to the serial version. The
     /// parallelization is across penalties (each penalty's mat-vec is
@@ -4617,8 +4615,7 @@ mod ift_warm_start_tests {
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                let centered = &beta_block - &cp.prior_mean;
-                cp.local.dot(&centered)
+                cp.local.dot(&beta_block)
             })
             .collect();
         // Parallel (matches the writer at line ~2272).
@@ -4627,8 +4624,7 @@ mod ift_warm_start_tests {
             .map(|cp| {
                 let r = &cp.col_range;
                 let beta_block = beta_cur.slice(s![r.start..r.end]);
-                let centered = &beta_block - &cp.prior_mean;
-                cp.local.dot(&centered)
+                cp.local.dot(&beta_block)
             })
             .collect();
         assert_eq!(serial.len(), parallel.len());

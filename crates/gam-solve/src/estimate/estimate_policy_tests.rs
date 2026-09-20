@@ -538,7 +538,6 @@ fn prefit_binomial_separation_reads_through_a_scalar_ridge_but_not_a_basis_penal
         let spec = PenaltySpec::Block {
             local: Array2::<f64>::eye(col_range.len()),
             col_range,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         };
@@ -602,7 +601,6 @@ fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
             .map(|local| PenaltySpec::Block {
                 local,
                 col_range: 1..4,
-                prior_mean: gam_problem::CoefficientPriorMean::Zero,
                 structure_hint: None,
                 op: None,
             })
@@ -661,7 +659,6 @@ fn prefit_binomial_separation_reads_a_smooth_penalty_null_space_only() {
         &[PenaltySpec::Block {
             local: roughness,
             col_range: 1..4,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         }],
@@ -741,7 +738,6 @@ fn prefit_binomial_separation_reads_a_smooth_null_space_but_not_its_range() {
             .map(|local| PenaltySpec::Block {
                 local: local.clone(),
                 col_range: 1..p,
-                prior_mean: gam_problem::CoefficientPriorMean::Zero,
                 structure_hint: None,
                 op: None,
             })
@@ -2738,7 +2734,6 @@ fn wide_smooth_block_penalties(
     let mut specs = vec![PenaltySpec::Block {
         local: d.t().dot(&d),
         col_range: start..start + k,
-        prior_mean: gam_problem::CoefficientPriorMean::Zero,
         structure_hint: None,
         op: None,
     }];
@@ -2756,7 +2751,6 @@ fn wide_smooth_block_penalties(
         specs.push(PenaltySpec::Block {
             local: null_projector,
             col_range: start..start + k,
-            prior_mean: gam_problem::CoefficientPriorMean::Zero,
             structure_hint: None,
             op: None,
         });

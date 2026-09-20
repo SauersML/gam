@@ -147,7 +147,6 @@ fn canonicalize(design: &TermCollectionDesign) -> (Vec<CanonicalPenalty>, usize)
         .map(|penalty| gam::terms::PenaltySpec::Block {
             local: penalty.local.clone(),
             col_range: penalty.col_range.clone(),
-            prior_mean: penalty.prior_mean.clone(),
             structure_hint: penalty.structure_hint.clone(),
             op: penalty.op.clone(),
         })

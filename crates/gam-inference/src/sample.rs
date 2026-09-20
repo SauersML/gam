@@ -1672,8 +1672,7 @@ fn sample_survival(
         for (widx, s) in block.penalties.iter().enumerate() {
             let s = match s {
                 gam_solve::estimate::PenaltySpec::Block { local, .. } => local,
-                gam_solve::estimate::PenaltySpec::Dense(m)
-                | gam_solve::estimate::PenaltySpec::DenseWithMean { matrix: m, .. } => m,
+                gam_solve::estimate::PenaltySpec::Dense(m) => m,
             };
             if s.nrows() == exit_w.ncols() && s.ncols() == exit_w.ncols() {
                 penalty_specs.push((

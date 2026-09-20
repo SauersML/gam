@@ -297,7 +297,7 @@ impl<'a> ExternalJointHyperEvaluator<'a> {
         for (idx, (spec, &rank)) in specs.iter().zip(frozen_penalty_ranks.iter()).enumerate() {
             let block_dim = match spec {
                 PenaltySpec::Block { local, .. } => local.nrows(),
-                PenaltySpec::Dense(matrix) | PenaltySpec::DenseWithMean { matrix, .. } => {
+                PenaltySpec::Dense(matrix) => {
                     matrix.nrows()
                 }
             };

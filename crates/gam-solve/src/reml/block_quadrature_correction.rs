@@ -1178,9 +1178,7 @@ impl<'a> RemlState<'a> {
             // v_j = H⁻¹ a_j through the same eigendecomposition as Q.
             let uta = evecs.t().dot(&a_j);
             let v_j = evecs.dot(&(&uta / &evals));
-            // tr(A_j Q) = λ_j tr(S_j Q), over the penalty's own block. `S_j` acts
-            // on a direction here, so the prior mean the score is centred on
-            // does not enter.
+            // tr(A_j Q) = λ_j tr(S_j Q), over the penalty's own block.
             let penalty = &target.penalties[j];
             let range = penalty.col_range.clone();
             let tr_sq = (&penalty.local * &q_mat.slice(ndarray::s![range.clone(), range])).sum();

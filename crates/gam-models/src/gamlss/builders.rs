@@ -642,8 +642,7 @@ pub(crate) fn wiggle_block_penalty_matrices(
                 col_range: col_range.clone(),
                 total_dim: p_wiggle,
             },
-            crate::model_types::PenaltySpec::Dense(m)
-            | crate::model_types::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            crate::model_types::PenaltySpec::Dense(m) => {
                 PenaltyMatrix::Dense(m.clone())
             }
         })
@@ -2777,14 +2776,14 @@ pub(crate) fn fit_binomial_mean_wiggle(
 
 /// Densify a wiggle-block penalty spec to its full `p×p` matrix for the
 /// observation-space de-aliasing path (#1596). The link-warp block carries only
-/// `Dense`/`DenseWithMean` difference (and optional ridge) penalties.
+/// `Dense` difference (and optional ridge) penalties.
 fn penalty_spec_to_dense(
     spec: &crate::model_types::PenaltySpec,
     p: usize,
 ) -> Result<Array2<f64>, String> {
     use crate::model_types::PenaltySpec;
     match spec {
-        PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+        PenaltySpec::Dense(m) => {
             if m.nrows() != p || m.ncols() != p {
                 return Err(format!(
                     "frozen-basis warp penalty must be {p}x{p}, got {}x{}",
@@ -4563,10 +4562,7 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
                                 col_range: col_range.clone(),
                                 total_dim: p_wiggle,
                             },
-                            crate::model_types::PenaltySpec::Dense(m)
-                            | crate::model_types::PenaltySpec::DenseWithMean {
-                                matrix: m, ..
-                            } => PenaltyMatrix::Dense(m.clone()),
+                            crate::model_types::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
                         })
                         .collect()
                 },

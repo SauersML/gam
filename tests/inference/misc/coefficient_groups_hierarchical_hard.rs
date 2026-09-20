@@ -3,24 +3,22 @@
 //!
 //! These tests focus on the runtime quadratic
 //!
-//!     P_g(β) = (β − μ_p)' S_p (β − μ_p) / 2
+//!     P_g(β) = β' S_p β / 2
 //!
-//! as evaluated against `PenaltyCoordinate::DenseRootCentered`
-//! (src/solver/reml/unified.rs:4297-4378) and the corresponding `PenaltySpec::
-//! DenseWithMean { matrix, prior_mean }` produced by
-//! `design.realize_coefficient_groups` (src/terms/smooth.rs:1429).
+//! for the `PenaltySpec::Dense(S_p)` produced by
+//! `design.realize_coefficient_groups`.
 //!
-//! We exercise penalty correctness directly against the realized
-//! `(S_p, μ_p)` rather than running a full REML fit so that the assertions
-//! are bitwise-deterministic and immune to optimizer tolerance drift.
+//! We exercise penalty correctness directly against the realized `S_p`
+//! rather than running a full REML fit so that the assertions are
+//! bitwise-deterministic and immune to optimizer tolerance drift.
 
-use gam::estimate::{CoefficientPriorMean, PenaltySpec};
+use gam::estimate::PenaltySpec;
 use gam::smooth::{
     CoefficientGroupSpec, CoefficientSelector, LinearTermSpec, RandomEffectTermSpec,
     TermCollectionSpec, build_term_collection_design,
 };
 use gam::types::{CoefficientGroupPrior, RhoPrior};
-use ndarray::{Array1, Array2, array};
+use ndarray::{Array1, Array2};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -76,10 +74,9 @@ fn mixed_term_spec() -> TermCollectionSpec {
     }
 }
 
-/// Closed-form evaluation of `(β − μ)' S (β − μ) / 2` for a single penalty.
-fn penalty_quadratic(matrix: &Array2<f64>, mean: &Array1<f64>, beta: &Array1<f64>) -> f64 {
-    let delta = beta - mean;
-    0.5 * delta.dot(&matrix.dot(&delta))
+/// Closed-form evaluation of `β' S β / 2` for a single penalty.
+fn penalty_quadratic(matrix: &Array2<f64>, beta: &Array1<f64>) -> f64 {
+    0.5 * beta.dot(&matrix.dot(beta))
 }
 
 // ---------------------------------------------------------------------------
@@ -106,21 +103,20 @@ fn cross_term_group_linear_plus_random_effect_penalty_quadratic_matches_analytic
                     shape: 2.0,
                     rate: 1.0,
                 }),
-                prior_mean: CoefficientPriorMean::Zero,
             }],
             &RhoPrior::Flat,
         )
         .expect("cross-term group realizes");
 
     // The realized group penalty must be the LAST entry in penalty_specs;
-    // it must be a DenseWithMean with identity on the active columns.
+    // it must be a Dense penalty with identity on the active columns.
     let group_penalty = realized
         .penalty_specs
         .last()
         .expect("group penalty present");
-    let (matrix, _) = match group_penalty {
-        PenaltySpec::DenseWithMean { matrix, prior_mean } => (matrix.clone(), prior_mean.clone()),
-        other => panic!("expected DenseWithMean, got {other:?}"),
+    let matrix = match group_penalty {
+        PenaltySpec::Dense(matrix) => matrix.clone(),
+        other => panic!("expected Dense, got {other:?}"),
     };
 
     // The active columns are the union of lin_a's columns and the re_g block.
@@ -141,9 +137,9 @@ fn cross_term_group_linear_plus_random_effect_penalty_quadratic_matches_analytic
         *b = 0.1 + 0.07 * (i as f64);
     }
 
-    // Analytic quadratic with μ=0: sum of β_j^2 for active columns.
+    // Analytic quadratic: sum of β_j^2 for active columns.
     let analytic = 0.5 * active_cols.iter().map(|&j| beta[j] * beta[j]).sum::<f64>();
-    let matrix_quad = penalty_quadratic(&matrix, &Array1::zeros(p), &beta);
+    let matrix_quad = penalty_quadratic(&matrix, &beta);
     assert!(
         (matrix_quad - analytic).abs() < 1e-12,
         "S_p quadratic mismatch: matrix={matrix_quad} analytic={analytic}"
@@ -172,21 +168,18 @@ fn nested_two_level_hierarchy_penalty_contributions_compose_additively() {
                     ],
                     parent: None,
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "inner_a".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("lin_a".to_string())],
                     parent: Some("outer".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "inner_b".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("lin_b".to_string())],
                     parent: Some("outer".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -201,7 +194,6 @@ fn nested_two_level_hierarchy_penalty_contributions_compose_additively() {
 
     let unwrap_matrix = |spec: &PenaltySpec| -> Array2<f64> {
         match spec {
-            PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
             PenaltySpec::Dense(m) => m.clone(),
             other => panic!("unexpected spec variant: {other:?}"),
         }
@@ -228,9 +220,9 @@ fn nested_two_level_hierarchy_penalty_contributions_compose_additively() {
     for (i, b) in beta.iter_mut().enumerate() {
         *b = -0.3 + 0.11 * (i as f64);
     }
-    let q_outer = penalty_quadratic(&outer_m, &Array1::zeros(p), &beta);
-    let q_inner_a = penalty_quadratic(&inner_a_m, &Array1::zeros(p), &beta);
-    let q_inner_b = penalty_quadratic(&inner_b_m, &Array1::zeros(p), &beta);
+    let q_outer = penalty_quadratic(&outer_m, &beta);
+    let q_inner_a = penalty_quadratic(&inner_a_m, &beta);
+    let q_inner_b = penalty_quadratic(&inner_b_m, &beta);
     assert!(
         (q_outer - (q_inner_a + q_inner_b)).abs() < 1e-12,
         "additive composition broken: outer={q_outer} inner_a+inner_b={}",
@@ -239,88 +231,7 @@ fn nested_two_level_hierarchy_penalty_contributions_compose_additively() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Non-zero prior mean: quadratic is exactly zero at β=μ.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn nonzero_prior_mean_penalty_quadratic_vanishes_at_beta_equals_mean() {
-    let x = mixed_design_data(12);
-    let spec = mixed_term_spec();
-    let design = build_term_collection_design(x.view(), &spec).expect("design");
-    let p = design.design.ncols();
-
-    // Build a deterministic μ_p over both linear coefficients (group spans lin_a, lin_b).
-    let mu_local = array![1.25_f64, -0.875];
-    let realized = design
-        .realize_coefficient_groups(
-            &[CoefficientGroupSpec {
-                name: "lin_pair".to_string(),
-                selectors: vec![
-                    CoefficientSelector::LinearTerm("lin_a".to_string()),
-                    CoefficientSelector::LinearTerm("lin_b".to_string()),
-                ],
-                parent: None,
-                prior: Some(CoefficientGroupPrior::GammaPrecision {
-                    shape: 2.0,
-                    rate: 1.0,
-                }),
-                prior_mean: CoefficientPriorMean::constant(mu_local.clone()),
-            }],
-            &RhoPrior::Flat,
-        )
-        .expect("non-zero mean group");
-
-    let group_penalty = realized.penalty_specs.last().expect("group penalty");
-    let (matrix, _prior_mean_handle) = match group_penalty {
-        PenaltySpec::DenseWithMean { matrix, prior_mean } => (matrix.clone(), prior_mean.clone()),
-        other => panic!("expected DenseWithMean, got {other:?}"),
-    };
-
-    // Active columns for this group (lin_a, lin_b global indices).
-    let active_cols: Vec<usize> = realized
-        .group_column_indices
-        .iter()
-        .find(|(n, _)| n == "lin_pair")
-        .map(|(_, c)| c.clone())
-        .expect("group columns");
-    assert_eq!(active_cols.len(), mu_local.len());
-
-    // β = μ_p (embedded into the global p-vector).
-    let mut beta_at_mu = Array1::<f64>::zeros(p);
-    for (i, &col) in active_cols.iter().enumerate() {
-        beta_at_mu[col] = mu_local[i];
-    }
-
-    // Build the global μ vector that the runtime will see.
-    let mut mu_global = Array1::<f64>::zeros(p);
-    for (i, &col) in active_cols.iter().enumerate() {
-        mu_global[col] = mu_local[i];
-    }
-
-    // At β = μ, the quadratic must be exactly 0.0 (bitwise).
-    let q_at_mu = penalty_quadratic(&matrix, &mu_global, &beta_at_mu);
-    assert_eq!(
-        q_at_mu.to_bits(),
-        0.0_f64.to_bits(),
-        "quadratic at β=μ must be bitwise 0.0, got {q_at_mu}"
-    );
-
-    // At β = μ + δ with small δ, contribution ≈ δ' S δ / 2 to 1e-12.
-    let mut delta = Array1::<f64>::zeros(p);
-    for &col in &active_cols {
-        delta[col] = 1e-3 * ((col as f64) + 1.0);
-    }
-    let beta_pert = &beta_at_mu + &delta;
-    let q_pert = penalty_quadratic(&matrix, &mu_global, &beta_pert);
-    let expected = 0.5 * delta.dot(&matrix.dot(&delta));
-    assert!(
-        (q_pert - expected).abs() < 1e-12,
-        "perturbed quadratic mismatch: got {q_pert} expected {expected}"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// 4. Unknown-label rejection.
+// 3. Unknown-label rejection.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -337,7 +248,6 @@ fn unknown_label_in_selector_is_rejected_with_label_in_error_message() {
                 selectors: vec![CoefficientSelector::LinearTerm(bad_label.to_string())],
                 parent: None,
                 prior: None,
-                prior_mean: CoefficientPriorMean::Zero,
             }],
             &RhoPrior::Flat,
         )
@@ -350,7 +260,7 @@ fn unknown_label_in_selector_is_rejected_with_label_in_error_message() {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Empty-group rejection (no selectors).
+// 4. Empty-group rejection (no selectors).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -366,7 +276,6 @@ fn empty_coefficient_group_is_rejected() {
                 selectors: vec![],
                 parent: None,
                 prior: None,
-                prior_mean: CoefficientPriorMean::Zero,
             }],
             &RhoPrior::Flat,
         )
@@ -379,7 +288,7 @@ fn empty_coefficient_group_is_rejected() {
 }
 
 // ---------------------------------------------------------------------------
-// 6. Disjointness: non-nested overlap is documented to be ALLOWED.
+// 5. Disjointness: non-nested overlap is documented to be ALLOWED.
 //
 // See `overlapping_coefficient_groups_are_distinct_precision_coordinates` in
 // tests/coefficient_groups.rs — overlap without parent/child relationship is
@@ -405,7 +314,6 @@ fn overlapping_non_nested_groups_apply_penalty_twice() {
                         shape: 2.0,
                         rate: 1.0,
                     }),
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "g2".to_string(),
@@ -415,7 +323,6 @@ fn overlapping_non_nested_groups_apply_penalty_twice() {
                         shape: 5.0,
                         rate: 1.0,
                     }),
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
             ],
             &RhoPrior::Flat,
@@ -425,11 +332,11 @@ fn overlapping_non_nested_groups_apply_penalty_twice() {
     // Two coordinates appended after base.
     let base_count = realized.penalty_specs.len() - 2;
     let s1 = match &realized.penalty_specs[base_count] {
-        PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+        PenaltySpec::Dense(matrix) => matrix.clone(),
         other => panic!("{other:?}"),
     };
     let s2 = match &realized.penalty_specs[base_count + 1] {
-        PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+        PenaltySpec::Dense(matrix) => matrix.clone(),
         other => panic!("{other:?}"),
     };
 
@@ -437,8 +344,8 @@ fn overlapping_non_nested_groups_apply_penalty_twice() {
     for (i, b) in beta.iter_mut().enumerate() {
         *b = 0.2 + 0.05 * (i as f64);
     }
-    let q1 = penalty_quadratic(&s1, &Array1::zeros(p), &beta);
-    let q2 = penalty_quadratic(&s2, &Array1::zeros(p), &beta);
+    let q1 = penalty_quadratic(&s1, &beta);
+    let q2 = penalty_quadratic(&s2, &beta);
     assert!(q1 > 0.0 && q2 > 0.0, "both penalties must be active");
     // The matrices must be EQUAL (same selector → same identity-on-cols S).
     for ((i, j), &v) in s1.indexed_iter() {
@@ -457,7 +364,7 @@ fn overlapping_non_nested_groups_apply_penalty_twice() {
 }
 
 // ---------------------------------------------------------------------------
-// 7. Hierarchy spanning K=3 components (uses three linear terms in a wider spec).
+// 6. Hierarchy spanning K=3 components (uses three linear terms in a wider spec).
 // ---------------------------------------------------------------------------
 
 fn three_linear_spec() -> (TermCollectionSpec, Array2<f64>) {
@@ -529,28 +436,24 @@ fn three_way_hierarchy_per_group_penalty_decomposes_correctly() {
                     ],
                     parent: None,
                     prior: None,
-                    prior_mean: CoefficientPriorMean::Zero,
                 },
                 CoefficientGroupSpec {
                     name: "group_A".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("z1".to_string())],
                     parent: Some("outer_all".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::constant(array![0.5_f64]),
                 },
                 CoefficientGroupSpec {
                     name: "group_B".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("z2".to_string())],
                     parent: Some("outer_all".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::constant(array![-0.25_f64]),
                 },
                 CoefficientGroupSpec {
                     name: "group_C".to_string(),
                     selectors: vec![CoefficientSelector::LinearTerm("z3".to_string())],
                     parent: Some("outer_all".to_string()),
                     prior: None,
-                    prior_mean: CoefficientPriorMean::constant(array![1.0_f64]),
                 },
             ],
             &RhoPrior::Flat,
@@ -560,12 +463,12 @@ fn three_way_hierarchy_per_group_penalty_decomposes_correctly() {
     // Last 4 specs correspond to outer_all, group_A, group_B, group_C (in spec order).
     let base = realized.penalty_specs.len() - 4;
     let outer_m = match &realized.penalty_specs[base] {
-        PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+        PenaltySpec::Dense(matrix) => matrix.clone(),
         other => panic!("{other:?}"),
     };
     let leaf_ms: Vec<Array2<f64>> = (1..=3)
         .map(|k| match &realized.penalty_specs[base + k] {
-            PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+            PenaltySpec::Dense(matrix) => matrix.clone(),
             other => panic!("{other:?}"),
         })
         .collect();
@@ -586,7 +489,7 @@ fn three_way_hierarchy_per_group_penalty_decomposes_correctly() {
 }
 
 // ---------------------------------------------------------------------------
-// 8. Permutation invariance of the selector index set.
+// 7. Permutation invariance of the selector index set.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -604,7 +507,6 @@ fn selector_permutation_yields_identical_penalty_quadratic() {
             shape: 2.0,
             rate: 1.0,
         }),
-        prior_mean: CoefficientPriorMean::Zero,
     };
 
     let r_ab = design
@@ -627,11 +529,11 @@ fn selector_permutation_yields_identical_penalty_quadratic() {
         .expect("ba order");
 
     let s_ab = match r_ab.penalty_specs.last().unwrap() {
-        PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+        PenaltySpec::Dense(matrix) => matrix.clone(),
         other => panic!("{other:?}"),
     };
     let s_ba = match r_ba.penalty_specs.last().unwrap() {
-        PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
+        PenaltySpec::Dense(matrix) => matrix.clone(),
         other => panic!("{other:?}"),
     };
 
@@ -649,20 +551,11 @@ fn selector_permutation_yields_identical_penalty_quadratic() {
     for (i, b) in beta.iter_mut().enumerate() {
         *b = -0.13 + 0.21 * (i as f64);
     }
-    let q_ab = penalty_quadratic(&s_ab, &Array1::zeros(p), &beta);
-    let q_ba = penalty_quadratic(&s_ba, &Array1::zeros(p), &beta);
+    let q_ab = penalty_quadratic(&s_ab, &beta);
+    let q_ba = penalty_quadratic(&s_ba, &beta);
     assert_eq!(
         q_ab.to_bits(),
         q_ba.to_bits(),
         "quadratic must be bitwise-invariant under selector permutation"
     );
 }
-
-// ---------------------------------------------------------------------------
-// 9. Metadata-callable prior mean (Functional variant).
-//
-// The Rust public API exposes `CoefficientPriorMean::functional(metadata,
-// evaluator)`.  This test exercises it by setting μ_p = f(group_size) via the
-// metadata channel and verifies the penalty quadratic sees the resolved μ.
-// ---------------------------------------------------------------------------
-

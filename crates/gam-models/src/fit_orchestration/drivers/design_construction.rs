@@ -2690,7 +2690,7 @@ fn bounded_penalty_sum(penalties: &[PenaltySpec], lambdas: &Array1<f64>, p: usiz
                     .slice_mut(ndarray::s![col_range.clone(), col_range.clone()])
                     .scaled_add(lambda, local);
             }
-            PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            PenaltySpec::Dense(m) => {
                 s_lambda.scaled_add(lambda, m);
             }
         }
@@ -2766,7 +2766,7 @@ fn exact_bounded_edf(
                     &format!("bounded EDF block {k}"),
                 )?);
             }
-            PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            PenaltySpec::Dense(m) => {
                 s_lambda.scaled_add(lambda_k, m);
                 let penalty_rank = p.saturating_sub(estimate_penalty_nullity(m).map_err(|e| {
                     EstimationError::InvalidInput(format!("bounded EDF rank failed: {e}"))
@@ -3099,7 +3099,7 @@ fn fit_bounded_term_collection_with_design(
                     col_range: col_range.clone(),
                     total_dim: design.design.ncols(),
                 },
-                PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                PenaltySpec::Dense(m) => {
                     PenaltyMatrix::Dense(m.clone())
                 }
             })

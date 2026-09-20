@@ -138,7 +138,6 @@ pub(crate) fn joint_penalized_hessian_is_nonsingular_where_the_likelihood_alone_
     for penalty in &wiggle_block.penalties {
         let s_w = match penalty {
             gam_terms::penalty_spec::PenaltySpec::Dense(m) => m.clone(),
-            gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix, .. } => matrix.clone(),
             other => panic!("unexpected warp penalty representation: {other:?}"),
         };
         for i in 0..p_w {

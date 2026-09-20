@@ -164,37 +164,17 @@ pub fn penalty_root_gram(root: ArrayView2<'_, f64>) -> Array2<f64> {
 #[derive(Clone, Debug)]
 pub enum PenaltyCoordinate {
     DenseRoot(Array2<f64>),
-    DenseRootCentered {
-        root: Array2<f64>,
-        prior_mean: Array1<f64>,
-    },
     BlockRoot {
         root: Array2<f64>,
         start: usize,
         end: usize,
         total_dim: usize,
     },
-    BlockRootCentered {
-        root: Array2<f64>,
-        start: usize,
-        end: usize,
-        total_dim: usize,
-        prior_mean: Array1<f64>,
-    },
 }
 
 impl PenaltyCoordinate {
     pub fn from_dense_root(root: Array2<f64>) -> Self {
         Self::DenseRoot(root)
-    }
-
-    pub fn from_dense_root_with_mean(root: Array2<f64>, prior_mean: Array1<f64>) -> Self {
-        assert_eq!(root.ncols(), prior_mean.len());
-        if prior_mean.iter().all(|&value| value == 0.0) {
-            Self::DenseRoot(root)
-        } else {
-            Self::DenseRootCentered { root, prior_mean }
-        }
     }
 
     pub fn from_block_root(root: Array2<f64>, start: usize, end: usize, total_dim: usize) -> Self {
@@ -216,66 +196,21 @@ impl PenaltyCoordinate {
         }
     }
 
-    pub fn from_block_root_with_mean(
-        root: Array2<f64>,
-        start: usize,
-        end: usize,
-        total_dim: usize,
-        prior_mean: Array1<f64>,
-    ) -> Self {
-        assert_eq!(
-            root.ncols(),
-            end.saturating_sub(start),
-            "centered block prior root column count must match block width"
-        );
-        assert_eq!(
-            prior_mean.len(),
-            end.saturating_sub(start),
-            "centered block prior mean length must match block width"
-        );
-        assert!(
-            end <= total_dim,
-            "centered block prior root end exceeds total dimension: start={start}, end={end}, total_dim={total_dim}, root_dim={:?}, prior_mean_len={}",
-            root.dim(),
-            prior_mean.len()
-        );
-        if prior_mean.iter().all(|&value| value == 0.0) {
-            Self::from_block_root(root, start, end, total_dim)
-        } else {
-            Self::BlockRootCentered {
-                root,
-                start,
-                end,
-                total_dim,
-                prior_mean,
-            }
-        }
-    }
-
     pub fn rank(&self) -> usize {
         match self {
-            Self::DenseRoot(root)
-            | Self::DenseRootCentered { root, .. }
-            | Self::BlockRoot { root, .. }
-            | Self::BlockRootCentered { root, .. } => root.nrows(),
+            Self::DenseRoot(root) | Self::BlockRoot { root, .. } => root.nrows(),
         }
     }
 
     pub fn dim(&self) -> usize {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.ncols(),
-            Self::BlockRoot { total_dim, .. } | Self::BlockRootCentered { total_dim, .. } => {
-                *total_dim
-            }
+            Self::DenseRoot(root) => root.ncols(),
+            Self::BlockRoot { total_dim, .. } => *total_dim,
         }
     }
 
     pub fn uses_operator_fast_path(&self) -> bool {
-        matches!(
-            self,
-            Self::BlockRoot { .. }
-                | Self::BlockRootCentered { .. }
-        )
+        matches!(self, Self::BlockRoot { .. })
     }
 
     /// Borrow the canonical penalty root in its native block chart.
@@ -285,13 +220,8 @@ impl PenaltyCoordinate {
     /// squared Gram `RᵀR`, which can promote roundoff in a structural zero.
     pub fn block_local_root(&self) -> Option<(&Array2<f64>, usize, usize)> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                Some((root, 0, root.ncols()))
-            }
+            Self::DenseRoot(root) => Some((root, 0, root.ncols())),
             Self::BlockRoot {
-                root, start, end, ..
-            }
-            | Self::BlockRootCentered {
                 root, start, end, ..
             } => Some((root, *start, *end)),
         }
@@ -329,8 +259,7 @@ impl PenaltyCoordinate {
     /// non-overlapping reparameterization path, where the balanced penalty sum
     /// is block-diagonal and its eigenvectors therefore are too); when a null
     /// direction straddles blocks the projected root genuinely is not
-    /// block-local and a dense coordinate is returned. A centered coordinate
-    /// keeps its prior mean: the quadratic stays `‖R_kΠ(β − μ_k)‖²`.
+    /// block-local and a dense coordinate is returned.
     ///
     /// Returns `self` unchanged when `N` has no columns.
     pub fn project_out_null_directions(&self, null_basis: ArrayView2<'_, f64>) -> Self {
@@ -352,7 +281,6 @@ impl PenaltyCoordinate {
         };
         // `R Π = R − (R N) Nᵀ`, through the shared primitive so this coordinate
         // and the term layer's `CanonicalPenalty` project identically.
-        let prior_mean = self.prior_mean_block();
         match project_block_root_out_of_null_directions(
             root.view(),
             start,
@@ -361,31 +289,12 @@ impl PenaltyCoordinate {
             null_basis,
         ) {
             ProjectedBlockRoot::Unchanged => self.clone(),
-            ProjectedBlockRoot::BlockLocal { block, .. } => match prior_mean {
-                Some(mean) => {
-                    Self::from_block_root_with_mean(block, start, end, total_dim, mean.to_owned())
-                }
-                None => Self::from_block_root(block, start, end, total_dim),
-            },
+            ProjectedBlockRoot::BlockLocal { block, .. } => {
+                Self::from_block_root(block, start, end, total_dim)
+            }
             ProjectedBlockRoot::FullWidth {
                 root: projected, ..
-            } => match prior_mean {
-                Some(mean) => {
-                    let mut full_mean = Array1::<f64>::zeros(total_dim);
-                    full_mean.slice_mut(ndarray::s![start..end]).assign(&mean);
-                    Self::from_dense_root_with_mean(projected, full_mean)
-                }
-                None => Self::from_dense_root(projected),
-            },
-        }
-    }
-
-    /// The block-local prior mean, when this coordinate is centered.
-    fn prior_mean_block(&self) -> Option<ArrayView1<'_, f64>> {
-        match self {
-            Self::DenseRootCentered { prior_mean, .. }
-            | Self::BlockRootCentered { prior_mean, .. } => Some(prior_mean.view()),
-            Self::DenseRoot(_) | Self::BlockRoot { .. } => None,
+            } => Self::from_dense_root(projected),
         }
     }
 
@@ -399,9 +308,8 @@ impl PenaltyCoordinate {
     /// the reduced root is `R_k z` (shape `rank_k × m`). For a block-local root
     /// `R_k` acting on `β[start..end]` the same identity gives reduced dense root
     /// `R_k · z[start..end, :]`, so the reduced coordinate is always a
-    /// (dimension-`m`) `DenseRoot` / `DenseRootCentered` — the block structure
-    /// does not survive an arbitrary subspace rotation. A centered mean `μ_k`
-    /// maps to `zᵀ μ_k`, the representation of `μ_k` in the free subspace.
+    /// (dimension-`m`) `DenseRoot` — the block structure does not survive an
+    /// arbitrary subspace rotation.
     ///
     /// This keeps `dim()` equal to the reduced `beta.len()`, which
     /// `InnerSolutionBuilder::build` asserts.
@@ -415,31 +323,11 @@ impl PenaltyCoordinate {
         );
         match self {
             Self::DenseRoot(root) => Self::DenseRoot(root.dot(z)),
-            Self::DenseRootCentered { root, prior_mean } => {
-                Self::from_dense_root_with_mean(root.dot(z), z.t().dot(prior_mean))
-            }
             Self::BlockRoot {
                 root, start, end, ..
             } => {
                 let z_block = z.slice(ndarray::s![*start..*end, ..]);
                 Self::DenseRoot(root.dot(&z_block))
-            }
-            Self::BlockRootCentered {
-                root,
-                start,
-                end,
-                prior_mean,
-                ..
-            } => {
-                let z_block = z.slice(ndarray::s![*start..*end, ..]);
-                // Reduced mean: the block-local prior `μ_k` sits at
-                // `β[start..end]`; lift it into the full coordinate before
-                // projecting so the free-space mean is `zᵀ (E_block μ_k)`.
-                let z_block_owned = z_block.to_owned();
-                Self::from_dense_root_with_mean(
-                    root.dot(&z_block_owned),
-                    z_block_owned.t().dot(prior_mean),
-                )
             }
         }
     }
@@ -447,11 +335,8 @@ impl PenaltyCoordinate {
     pub(crate) fn apply_root(&self, beta: &Array1<f64>) -> Array1<f64> {
         assert_eq!(beta.len(), self.dim());
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => root.dot(beta),
+            Self::DenseRoot(root) => root.dot(beta),
             Self::BlockRoot {
-                root, start, end, ..
-            }
-            | Self::BlockRootCentered {
                 root, start, end, ..
             } => root.dot(&beta.slice(ndarray::s![*start..*end])),
         }
@@ -488,115 +373,36 @@ impl PenaltyCoordinate {
             return;
         }
         match self {
-            Self::DenseRoot(_)
-            | Self::DenseRootCentered { .. }
-            | Self::BlockRoot { .. }
-            | Self::BlockRootCentered { .. } => match self {
-                Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                    let mut root_beta = Array1::<f64>::zeros(root.nrows());
-                    dense::matvec_into(root, beta, root_beta.view_mut());
-                    dense::transpose_matvec_scaled_add_into(
-                        root,
-                        root_beta.view(),
-                        scale,
-                        out.view_mut(),
-                    );
-                }
-                Self::BlockRoot {
+            Self::DenseRoot(root) => {
+                let mut root_beta = Array1::<f64>::zeros(root.nrows());
+                dense::matvec_into(root, beta, root_beta.view_mut());
+                dense::transpose_matvec_scaled_add_into(
                     root,
-                    start,
-                    end,
-                    total_dim: _,
-                }
-                | Self::BlockRootCentered {
-                    root,
-                    start,
-                    end,
-                    total_dim: _,
-                    ..
-                } => {
-                    let beta_block = beta.slice(ndarray::s![*start..*end]);
-                    let mut root_beta = Array1::<f64>::zeros(root.nrows());
-                    dense::matvec_into(root, beta_block, root_beta.view_mut());
-                    let out_block = out.slice_mut(ndarray::s![*start..*end]);
-                    dense::transpose_matvec_scaled_add_into(
-                        root,
-                        root_beta.view(),
-                        scale,
-                        out_block,
-                    );
-                }
-            },
+                    root_beta.view(),
+                    scale,
+                    out.view_mut(),
+                );
+            }
+            Self::BlockRoot {
+                root, start, end, ..
+            } => {
+                let beta_block = beta.slice(ndarray::s![*start..*end]);
+                let mut root_beta = Array1::<f64>::zeros(root.nrows());
+                dense::matvec_into(root, beta_block, root_beta.view_mut());
+                let out_block = out.slice_mut(ndarray::s![*start..*end]);
+                dense::transpose_matvec_scaled_add_into(root, root_beta.view(), scale, out_block);
+            }
         }
     }
 
     pub fn quadratic(&self, beta: &Array1<f64>, scale: f64) -> f64 {
-        match self {
-            Self::DenseRoot(_)
-            | Self::DenseRootCentered { .. }
-            | Self::BlockRoot { .. }
-            | Self::BlockRootCentered { .. } => {
-                let root_beta = self.apply_root(beta);
-                scale * root_beta.dot(&root_beta)
-            }
-        }
-    }
-
-    pub fn apply_shifted_penalty(&self, beta: &Array1<f64>, scale: f64) -> Array1<f64> {
-        match self {
-            Self::DenseRootCentered { root, prior_mean } => {
-                let centered = beta - prior_mean;
-                let root_beta = root.dot(&centered);
-                let mut out = root.t().dot(&root_beta);
-                out *= scale;
-                out
-            }
-            Self::BlockRootCentered {
-                root,
-                start,
-                end,
-                total_dim,
-                prior_mean,
-            } => {
-                let mut out = Array1::<f64>::zeros(*total_dim);
-                let beta_block = beta.slice(ndarray::s![*start..*end]);
-                let centered = beta_block.to_owned() - prior_mean;
-                let root_beta = root.dot(&centered);
-                let mut block = root.t().dot(&root_beta);
-                block *= scale;
-                out.slice_mut(ndarray::s![*start..*end]).assign(&block);
-                out
-            }
-            _ => self.apply_penalty(beta, scale),
-        }
-    }
-
-    pub fn shifted_quadratic(&self, beta: &Array1<f64>, scale: f64) -> f64 {
-        match self {
-            Self::DenseRootCentered { root, prior_mean } => {
-                let centered = beta - prior_mean;
-                let root_beta = root.dot(&centered);
-                scale * root_beta.dot(&root_beta)
-            }
-            Self::BlockRootCentered {
-                root,
-                start,
-                end,
-                prior_mean,
-                ..
-            } => {
-                let beta_block = beta.slice(ndarray::s![*start..*end]);
-                let centered = beta_block.to_owned() - prior_mean;
-                let root_beta = root.dot(&centered);
-                scale * root_beta.dot(&root_beta)
-            }
-            _ => self.quadratic(beta, scale),
-        }
+        let root_beta = self.apply_root(beta);
+        scale * root_beta.dot(&root_beta)
     }
 
     pub fn scaled_dense_matrix(&self, scale: f64) -> Array2<f64> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root) => {
                 let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 out
@@ -606,13 +412,6 @@ impl PenaltyCoordinate {
                 start,
                 end,
                 total_dim,
-            }
-            | Self::BlockRootCentered {
-                root,
-                start,
-                end,
-                total_dim,
-                ..
             } => {
                 let mut out = Array2::<f64>::zeros((*total_dim, *total_dim));
                 let mut block = penalty_root_gram(root.view());
@@ -629,16 +428,13 @@ impl PenaltyCoordinate {
     /// For DenseRoot (full-rank, no block structure), returns (matrix, 0, p).
     pub fn scaled_block_local(&self, scale: f64) -> (Array2<f64>, usize, usize) {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root) => {
                 let mut out = penalty_root_gram(root.view());
                 out *= scale;
                 let p = out.nrows();
                 (out, 0, p)
             }
             Self::BlockRoot {
-                root, start, end, ..
-            }
-            | Self::BlockRootCentered {
                 root, start, end, ..
             } => {
                 let mut block = penalty_root_gram(root.view());
@@ -650,11 +446,7 @@ impl PenaltyCoordinate {
 
     /// Whether this coordinate has block structure (not full-rank dense).
     pub fn is_block_local(&self) -> bool {
-        matches!(
-            self,
-            Self::BlockRoot { .. }
-                | Self::BlockRootCentered { .. }
-        )
+        matches!(self, Self::BlockRoot { .. })
     }
 
     /// The block-local scaled penalty ROOT `√scale · R_k` (rank × p_block) with
@@ -674,13 +466,8 @@ impl PenaltyCoordinate {
         }
         let sqrt_scale = scale.sqrt();
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
-                Some((root * sqrt_scale, 0, root.ncols()))
-            }
+            Self::DenseRoot(root) => Some((root * sqrt_scale, 0, root.ncols())),
             Self::BlockRoot {
-                root, start, end, ..
-            }
-            | Self::BlockRootCentered {
                 root, start, end, ..
             } => Some((root * sqrt_scale, *start, *end)),
         }
@@ -690,16 +477,13 @@ impl PenaltyCoordinate {
     /// For BlockRoot: extracts v[start..end], multiplies by local S_k, embeds result.
     pub fn scaled_matvec(&self, v: &Array1<f64>, scale: f64) -> Array1<f64> {
         match self {
-            Self::DenseRoot(root) | Self::DenseRootCentered { root, .. } => {
+            Self::DenseRoot(root) => {
                 let root_v = root.dot(v);
                 let mut out = root.t().dot(&root_v);
                 out *= scale;
                 out
             }
             Self::BlockRoot {
-                root, start, end, ..
-            }
-            | Self::BlockRootCentered {
                 root, start, end, ..
             } => {
                 let mut out = Array1::zeros(v.len());
@@ -753,10 +537,7 @@ impl PenaltyCoordinate {
         };
 
         match self {
-            Self::DenseRoot(root)
-            | Self::DenseRootCentered { root, .. }
-            | Self::BlockRoot { root, .. }
-            | Self::BlockRootCentered { root, .. } => {
+            Self::DenseRoot(root) | Self::BlockRoot { root, .. } => {
                 // Tag the rooted family uniformly: placement (start/end/total)
                 // is deliberately excluded so a block that moves between term
                 // orders keeps its key. The spectrum of Sₖ = RₖᵀRₖ is the
@@ -804,7 +585,7 @@ impl PenaltyCoordinate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ndarray::{Array1, Array2, array};
+    use ndarray::{Array2, array};
 
     fn identity_root(n: usize) -> Array2<f64> {
         Array2::<f64>::eye(n)
@@ -817,22 +598,6 @@ mod tests {
         let root = identity_root(3);
         let pc = PenaltyCoordinate::from_dense_root(root);
         assert!(matches!(pc, PenaltyCoordinate::DenseRoot(_)));
-    }
-
-    #[test]
-    fn from_dense_root_with_zero_mean_degrades_to_dense_root() {
-        let root = identity_root(2);
-        let mean = Array1::<f64>::zeros(2);
-        let pc = PenaltyCoordinate::from_dense_root_with_mean(root, mean);
-        assert!(matches!(pc, PenaltyCoordinate::DenseRoot(_)));
-    }
-
-    #[test]
-    fn from_dense_root_with_nonzero_mean_creates_centered_variant() {
-        let root = identity_root(2);
-        let mean = array![1.0_f64, 0.0];
-        let pc = PenaltyCoordinate::from_dense_root_with_mean(root, mean);
-        assert!(matches!(pc, PenaltyCoordinate::DenseRootCentered { .. }));
     }
 
     #[test]
@@ -1126,31 +891,5 @@ mod tests {
             .iter()
             .fold(0.0_f64, |acc, value| acc.max(value.abs()));
         assert!((moved - dense_moved).abs() <= 1e-15);
-    }
-
-    /// A centered coordinate keeps its prior mean under projection: the
-    /// quadratic stays `‖RΠ(β − μ)‖²`, which is what the shifted penalty
-    /// channel and the IFT score both read.
-    #[test]
-    fn projection_carries_the_prior_mean() {
-        let coord = PenaltyCoordinate::from_dense_root_with_mean(
-            array![[1.0_f64, 0.5, -1.0], [0.0, 2.0, 0.25]],
-            array![0.1_f64, -0.2, 0.3],
-        );
-        let n = 1.0_f64 / 3.0_f64.sqrt();
-        let null_basis = array![[n], [n], [n]];
-        let projected = coord.project_out_null_directions(null_basis.view());
-        let beta = array![1.4_f64, -0.6, 0.9];
-
-        // `Π S Π` applied to the CENTERED coefficient.
-        let centered = array![beta[0] - 0.1, beta[1] + 0.2, beta[2] - 0.3];
-        let coefficient = null_basis.column(0).dot(&centered);
-        let centered_projected = &centered - &(&null_basis.column(0).to_owned() * coefficient);
-        let expected = coord.quadratic(&centered_projected, 1.0);
-        let got = projected.shifted_quadratic(&beta, 1.0);
-        assert!(
-            (got - expected).abs() <= 1e-12 * expected.abs().max(1.0),
-            "shifted quadratic after projection = {got:.12e}, expected {expected:.12e}"
-        );
     }
 }

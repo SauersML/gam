@@ -80,7 +80,6 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
                 shape: 3.0,
                 rate: 1.0,
             }),
-            prior_mean: Default::default(),
         },
         CoefficientGroupSpec {
             name: "g_x1".into(),
@@ -90,7 +89,6 @@ fn coefficient_groups_with_gamma_priors_add_distinct_penalty_coordinates() {
                 shape: 3.0,
                 rate: 1.0,
             }),
-            prior_mean: Default::default(),
         },
     ];
 

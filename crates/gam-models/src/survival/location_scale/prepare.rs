@@ -725,10 +725,7 @@ pub(crate) fn prepare_survival_location_scale_model(
                             col_range: col_range.clone(),
                             total_dim: p_wiggle,
                         },
-                        gam_terms::penalty_spec::PenaltySpec::Dense(m)
-                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean {
-                            matrix: m, ..
-                        } => PenaltyMatrix::Dense(m.clone()),
+                        gam_terms::penalty_spec::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
                     })
                     .collect()
             },
@@ -1106,8 +1103,7 @@ pub(crate) fn validatewiggle_block(
                     );
                 }
             }
-            gam_terms::penalty_spec::PenaltySpec::Dense(m)
-            | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            gam_terms::penalty_spec::PenaltySpec::Dense(m) => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     bail_dim_sls!("linkwiggle_block penalty {idx} must be {p}x{p}, got {r}x{c}");

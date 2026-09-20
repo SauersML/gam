@@ -251,7 +251,7 @@ fn displaced_row_curvature(
     })
 }
 
-/// `S v` for a block-local penalty, on a direction (no prior-mean centring).
+/// `S v` for a block-local penalty, on a direction.
 pub(super) fn penalty_local_matvec(
     penalty: &gam_terms::construction::CanonicalPenalty,
     v: ArrayView1<'_, f64>,

@@ -128,8 +128,7 @@ impl<'a> RemlState<'a> {
                     .map(|cp| {
                         let r = &cp.col_range;
                         let beta_block = beta_original.slice(s![r.start..r.end]);
-                        let centered = &beta_block - &cp.prior_mean;
-                        cp.local.dot(&centered)
+                        cp.local.dot(&beta_block)
                     })
                     .collect();
                 (!blocks.is_empty()).then_some(blocks)
@@ -2124,8 +2123,7 @@ impl<'a> RemlState<'a> {
             let cp = &tk_penalties[idx];
             let r = &cp.col_range;
             let beta_block = beta.slice(s![r.start..r.end]);
-            let centered = &beta_block - &cp.prior_mean;
-            let r_beta = cp.root.dot(&centered);
+            let r_beta = cp.root.dot(&beta_block);
             let mut s_k_beta = Array1::<f64>::zeros(p);
             for a in 0..cp.block_dim() {
                 s_k_beta[r.start + a] = (0..cp.rank())
@@ -4882,12 +4880,12 @@ impl<'a> RemlState<'a> {
                 }
                 // IFT warm-start cache: stash β / H_pen / qs from this
                 // solve so the next outer iter's predictor can apply
-                // `dβ/dρ_k = -H^{-1}(e^{ρ_k} S_k(β-μ_k))` directly. ρ is
+                // `dβ/dρ_k = -H^{-1}(e^{ρ_k} S_k β)` directly. ρ is
                 // populated by `record_warm_start_rho` immediately
                 // after this call returns; until then the slot holds
                 // an empty `rho` placeholder that the predictor
                 // detects and skips.
-                // Precompute the per-penalty `S_k · (β_cur-μ_k)` block-local
+                // Precompute the per-penalty `S_k · β_cur` block-local
                 // mat-vecs once at cache-write time so the IFT
                 // predictor's per-call rhs construction skips the
                 // `O(block²)` mat-vec on every penalty. At large-scale
@@ -4896,7 +4894,7 @@ impl<'a> RemlState<'a> {
                 // predictor's per-call work is now dominated by the
                 // back-solve plus the `O(p)` rhs accumulation.
                 let lambda_s_beta_blocks: Option<Vec<ndarray::Array1<f64>>> = {
-                    // Parallelize across penalties: each `S_k · (β_cur-μ_k)`
+                    // Parallelize across penalties: each `S_k · β_cur`
                     // mat-vec is independent of the others. At large-scale-
                     // scale CTN with p ≈ several thousand and ~10
                     // penalties, the serial precompute is ~250M flops
@@ -4913,8 +4911,7 @@ impl<'a> RemlState<'a> {
                         .map(|cp| {
                             let r = &cp.col_range;
                             let beta_block = beta_original.slice(s![r.start..r.end]);
-                            let centered = &beta_block - &cp.prior_mean;
-                            cp.local.dot(&centered)
+                            cp.local.dot(&beta_block)
                         })
                         .collect();
                     if blocks.is_empty() {
@@ -5346,7 +5343,7 @@ impl<'a> RemlState<'a> {
 
     /// Predict β at `new_rho` via the implicit-function-theorem first-order
     /// expansion
-    /// `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k(β_cur-μ_k))`,
+    /// `β_predict = β_cur − Σ_k Δρ_k · H_pen^{-1} · (e^{ρ_cur_k} S_k β_cur)`,
     /// surfacing the outcome (Predicted vs Noop) so callers can map directly
     /// onto `WarmStartPredictionSource` without re-deriving noop-ness via an
     /// O(p) array comparison against the cached β.
@@ -5832,7 +5829,7 @@ impl<'a> RemlState<'a> {
         // measured against the OLD predictor.
         //
         // Without this wipe, the IFT predictor would seed PIRLS with
-        // `β_new − H_old^{-1} · (e^{ρ_old_k} S_k · (β_new-μ_k))` — using the
+        // `β_new − H_old^{-1} · (e^{ρ_old_k} S_k · β_new)` — using the
         // new β as a substitute for the old β in a Jacobian
         // calibrated against the old β. That is mathematically wrong
         // and would produce arbitrary predictions, not just degraded
@@ -8189,7 +8186,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
 
-    // Build Σ_k Δρ_k · e^{ρ_cur_k} · S_k · (β_cur-μ_k) in the ORIGINAL basis.
+    // Build Σ_k Δρ_k · e^{ρ_cur_k} · S_k · β_cur in the ORIGINAL basis.
     // Aggregating into a single rhs lets us factor H once and back-solve
     // exactly once, instead of k times. Mathematically:
     //   Σ_k Δρ_k H^{-1} v_k = H^{-1} (Σ_k Δρ_k v_k)
@@ -8197,7 +8194,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     let beta_cur = &cache.beta_original;
     let mut rhs_original = Array1::<f64>::zeros(p);
     let mut any_active = false;
-    // Use the precomputed `S_k · (β_cur-μ_k)` blocks (cache write-time
+    // Use the precomputed `S_k · β_cur` blocks (cache write-time
     // hook) when available. Falls back to recomputing the local
     // mat-vec when the cache predates this commit's writer hook
     // (None) or the precomputation length disagrees with the
@@ -8216,7 +8213,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         }
         any_active = true;
         let r = &cp.col_range;
-        // S_k · (β_cur-μ_k) is block-local: only β_cur[r] and μ_k contribute,
+        // S_k · β_cur is block-local: only β_cur[r] contributes,
         // and the result lives in r as well.
         let scale = dr * cache.rho[idx].exp();
         let mut rhs_slice = rhs_original.slice_mut(s![r.start..r.end]);
@@ -8239,8 +8236,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             }
         }
         let beta_block = beta_cur.slice(s![r.start..r.end]);
-        let centered = &beta_block - &cp.prior_mean;
-        let sb_block = cp.local.dot(&centered);
+        let sb_block = cp.local.dot(&beta_block);
         for (target, src) in rhs_slice.iter_mut().zip(sb_block.iter()) {
             *target += scale * *src;
         }
@@ -8346,9 +8342,9 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
 
-    // β_predict = β_cur − H^{-1} · (Σ_k Δρ_k e^{ρ_k} S_k(β_cur-μ_k)).
-    // (The sign convention: dβ/dρ_k = −H^{-1}(e^{ρ_k}S_k(β-μ_k)), so
-    //  Δβ = −Σ_k Δρ_k H^{-1}(e^{ρ_k}S_k(β-μ_k)) = −solution_original.)
+    // β_predict = β_cur − H^{-1} · (Σ_k Δρ_k e^{ρ_k} S_k β_cur).
+    // (The sign convention: dβ/dρ_k = −H^{-1}(e^{ρ_k}S_k β), so
+    //  Δβ = −Σ_k Δρ_k H^{-1}(e^{ρ_k}S_k β) = −solution_original.)
     let mut predicted = beta_cur.clone();
     for (target, &correction) in predicted.iter_mut().zip(solution_original.iter()) {
         *target -= correction;

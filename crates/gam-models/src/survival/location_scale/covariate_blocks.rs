@@ -53,8 +53,7 @@ pub(crate) fn validate_cov_block(
                     );
                 }
             }
-            gam_terms::penalty_spec::PenaltySpec::Dense(m)
-            | gam_terms::penalty_spec::PenaltySpec::DenseWithMean { matrix: m, .. } => {
+            gam_terms::penalty_spec::PenaltySpec::Dense(m) => {
                 let (r, c) = m.dim();
                 if r != p || c != p {
                     bail_dim_sls!("{name} penalty {idx} must be {p}x{p}, got {r}x{c}");
@@ -454,10 +453,7 @@ pub(crate) fn prepare_cov_block_kind(
                             col_range: col_range.clone(),
                             total_dim: p,
                         },
-                        gam_terms::penalty_spec::PenaltySpec::Dense(m)
-                        | gam_terms::penalty_spec::PenaltySpec::DenseWithMean {
-                            matrix: m, ..
-                        } => PenaltyMatrix::Dense(m.clone()),
+                        gam_terms::penalty_spec::PenaltySpec::Dense(m) => PenaltyMatrix::Dense(m.clone()),
                     })
                     .collect()
             },

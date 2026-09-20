@@ -722,15 +722,6 @@ fn deterministic_gaussian_standard_fit(
                 ),
             ));
         }
-        if !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero) {
-            return Err(raised_fit_failure(
-                FailureCategory::Input,
-                format!(
-                    "deterministic Gaussian shortcut does not admit a nonzero coefficient \
-                     prior mean on penalty {penalty_index}"
-                ),
-            ));
-        }
         if penalty_faces[penalty_index] == DeterministicPenaltyFace::Infinite {
             infinite_face_penalty
                 .slice_mut(ndarray::s![r.clone(), r])
@@ -1550,10 +1541,6 @@ fn exact_gaussian_boundary(
     if design.design.ncols() == 0
         || design.coefficient_lower_bounds.is_some()
         || design.linear_constraints.is_some()
-        || design
-            .penalties
-            .iter()
-            .any(|block| !matches!(&block.prior_mean, gam_problem::CoefficientPriorMean::Zero))
     {
         return Ok(ExactGaussianVerdict::Interior(design));
     }

@@ -135,7 +135,6 @@ fn fixture(family: &ResponseFamily) -> (Array2<f64>, Array1<f64>, Vec<PenaltySpe
             specs.push(PenaltySpec::Block {
                 local,
                 col_range: start..start + BASIS,
-                prior_mean: gam_problem::CoefficientPriorMean::Zero,
                 structure_hint: None,
                 op: None,
             });

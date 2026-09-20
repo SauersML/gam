@@ -62,7 +62,7 @@ impl ParameterBlockInput {
                         ));
                     }
                 }
-                PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                PenaltySpec::Dense(m) => {
                     let (r, c) = m.dim();
                     if r != p || c != p {
                         return Err(format!(
@@ -97,7 +97,7 @@ impl ParameterBlockInput {
                             col_range,
                             total_dim: p,
                         },
-                        PenaltySpec::Dense(m) | PenaltySpec::DenseWithMean { matrix: m, .. } => {
+                        PenaltySpec::Dense(m) => {
                             PenaltyMatrix::Dense(m)
                         }
                     })

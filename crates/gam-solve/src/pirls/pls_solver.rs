@@ -278,9 +278,9 @@ pub(super) fn solve_penalized_least_squares_implicit(
                 precomputed_xtwx,
             )?)?;
 
-        // 2. RHS = X'W(z - offset) + S_λ μ. The Gaussian cache already holds
+        // 2. RHS = X'W(z - offset). The Gaussian cache already holds
         //    `XᵀW(y − offset)`, so a cached solve never walks the rows.
-        let mut rhs = if let Some(cache) = gaussian_fixed_cache {
+        let rhs = if let Some(cache) = gaussian_fixed_cache {
             cache.xtwy_orig.clone()
         } else {
             let mut wz = z.to_owned();
@@ -288,7 +288,6 @@ pub(super) fn solve_penalized_least_squares_implicit(
             wz *= &weights_owned;
             x_original.transpose_vector_multiply(&wz)
         };
-        rhs += penalty.linear_shift();
 
         // 3. Sparse Cholesky solve (factor reused from step 1)
         let betavec = solve_sparse_spd(&factor, &rhs)?;
@@ -410,7 +409,6 @@ pub(super) fn solve_penalized_least_squares_implicit(
     } else {
         workspace.vec_buf_p.assign(&xtwy_orig);
     }
-    workspace.vec_buf_p += penalty.linear_shift();
 
     {
         // The penalized Hessian is assembled from symmetric pieces (XᵀWX and

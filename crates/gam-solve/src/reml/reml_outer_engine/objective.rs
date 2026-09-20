@@ -215,7 +215,7 @@ pub(crate) fn reml_laml_evaluate(
                 let block_sum: f64 = lambdas
                     .iter()
                     .zip(solution.penalty_coords.iter())
-                    .map(|(&lambda, coord)| lambda * coord.shifted_quadratic(&solution.beta, 1.0))
+                    .map(|(&lambda, coord)| lambda * coord.quadratic(&solution.beta, 1.0))
                     .sum();
                 crate::estimate::outer_eval_capture::record_rho_penalty_energy(
                     crate::estimate::outer_eval_capture::PenaltyEnergyAudit {
@@ -300,7 +300,7 @@ pub(crate) fn reml_laml_evaluate(
                 let block_sum: f64 = lambdas
                     .iter()
                     .zip(solution.penalty_coords.iter())
-                    .map(|(&lambda, coord)| lambda * coord.shifted_quadratic(&solution.beta, 1.0))
+                    .map(|(&lambda, coord)| lambda * coord.quadratic(&solution.beta, 1.0))
                     .sum();
                 let dp_raw = -2.0 * solution.log_likelihood + 2.0 * penalty_quad_value;
                 crate::estimate::outer_eval_capture::record_rho_penalty_energy(

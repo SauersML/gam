@@ -113,11 +113,6 @@ mod linux_impl {
         /// Transformed dense penalty `S_λ` in transformed coordinates,
         /// shape `p × p`.
         pub s_transformed: ArrayView2<'a, f64>,
-        /// Linear shift `b` of the penalty `βᵀSβ − 2βᵀb + c`, length `p`.
-        /// Mirrors `PirlsPenalty::linear_shift()` in the CPU oracle.
-        pub linear_shift: ArrayView1<'a, f64>,
-        /// Constant shift `c` of the penalty `βᵀSβ − 2βᵀb + c`.
-        pub constant_shift: f64,
         /// Response vector `y`, length `n`.
         pub y: ArrayView1<'a, f64>,
         /// Prior weights, length `n`.
@@ -331,8 +326,6 @@ mod linux_impl {
             likelihood_scale,
             input.initial_beta,
             input.s_transformed,
-            input.linear_shift,
-            input.constant_shift,
             lm_ridge,
             input.max_iterations,
             input.convergence_tolerance,
@@ -509,9 +502,8 @@ mod linux_impl {
             }
             acc
         };
-        // gradient = S·β − linear_shift − Xᵀ·score_eta
+        // gradient = S·β − Xᵀ·score_eta
         let mut gradient_total = s_beta.clone();
-        gradient_total -= &input.linear_shift;
         gradient_total -= &xt_grad_eta;
         let lastgradient_norm = gradient_total.dot(&gradient_total).sqrt();
         let score_norm = xt_grad_eta.dot(&xt_grad_eta).sqrt();
@@ -679,10 +671,6 @@ mod linux_impl {
         pub xtwy_orig: ArrayView1<'a, f64>,
         /// Penalty `Σλₖ Sₖ` in transformed (post-Qs) coordinates, p×p.
         pub s_transformed: ArrayView2<'a, f64>,
-        /// Additive RHS correction in transformed coordinates, length p.
-        pub linear_shift: ArrayView1<'a, f64>,
-        /// Constant term of the shifted penalty quadratic (for penalty_term).
-        pub constant_shift: f64,
         /// Reparameterisation matrix Qs (p×p).  `None` = identity transform.
         pub qs: Option<ArrayView2<'a, f64>>,
         /// GLM likelihood spec.
@@ -765,7 +753,6 @@ mod linux_impl {
             input.xtwx_orig,
             input.xtwy_orig,
             input.s_transformed,
-            input.linear_shift,
             input.qs,
         )?;
 
@@ -844,30 +831,22 @@ mod linux_impl {
         };
         let score_norm = array1_l2_norm(&gradient_data);
 
-        // s_beta = S·β − linear_shift.
+        // s_beta = S·β.
         let mut s_beta: Array1<f64> = Array1::zeros(p);
         for i in 0..p {
             let mut acc = 0.0_f64;
             for j in 0..p {
                 acc += input.s_transformed[[i, j]] * beta[j];
             }
-            s_beta[i] = acc - input.linear_shift[i];
+            s_beta[i] = acc;
         }
         let s_beta_norm = array1_l2_norm(&s_beta);
 
         let mut gradient = gradient_data.clone();
         gradient += &s_beta;
 
-        // penalty_term = betaᵀ·S·β − 2·betaᵀ·linear_shift + constant_shift.
-        let mut penalty_term: f64 = input.constant_shift;
-        for i in 0..p {
-            let mut s_row_b = 0.0_f64;
-            for j in 0..p {
-                s_row_b += input.s_transformed[[i, j]] * beta[j];
-            }
-            penalty_term += beta[i] * s_row_b;
-            penalty_term -= 2.0 * beta[i] * input.linear_shift[i];
-        }
+        // penalty_term = betaᵀ·S·β.
+        let penalty_term = beta.dot(&s_beta);
 
         let gradient_norm = array1_l2_norm(&gradient);
 
