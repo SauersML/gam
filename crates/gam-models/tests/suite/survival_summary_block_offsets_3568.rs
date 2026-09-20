@@ -60,7 +60,7 @@ fn survival_config(likelihood: &str) -> FitConfig {
     }
 }
 
-/// `(estimate, statistic)` of the `age` row of a summary's parametric table.
+/// `(estimate, std_error)` of the `age` row of a summary's parametric table.
 fn age_row(summary: &SummaryPayload, label: &str) -> (f64, f64) {
     assert_eq!(
         summary.parametric_terms_unavailable, None,
@@ -76,10 +76,10 @@ fn age_row(summary: &SummaryPayload, label: &str) -> (f64, f64) {
         .iter()
         .find(|row| row.name == "age")
         .unwrap_or_else(|| panic!("{label}: no `age` row in {names:?}"));
-    let statistic = row
-        .statistic
-        .unwrap_or_else(|| panic!("{label}: `age` row has no Wald statistic"));
-    (row.estimate, statistic)
+    let std_error = row
+        .std_error
+        .unwrap_or_else(|| panic!("{label}: `age` row has no standard error"));
+    (row.estimate, std_error)
 }
 
 #[test]
@@ -92,8 +92,8 @@ fn royston_parmar_covariate_rows_read_past_the_time_prologue_3568() {
         &data,
         &survival_config("transformation"),
     );
-    let (weibull_estimate, weibull_statistic) = age_row(&weibull, "weibull");
-    let (transformation_estimate, transformation_statistic) =
+    let (weibull_estimate, weibull_std_error) = age_row(&weibull, "weibull");
+    let (transformation_estimate, transformation_std_error) =
         age_row(&transformation, "transformation");
     // With ~300 events over an age spread of SD ≈ 11.5 the standard error is
     // about 1/(√300 · 11.5) ≈ 0.005, so four of them is 0.02. Reading the
@@ -108,14 +108,15 @@ fn royston_parmar_covariate_rows_read_past_the_time_prologue_3568() {
         );
     }
     // Both fits are proportional-hazards models of the same data and differ
-    // only in the baseline's flexibility, so their covariate tables agree. At
-    // #3087 the Weibull Wald statistic was about five times the
-    // transformation one.
-    let ratio = weibull_statistic / transformation_statistic;
+    // only in the baseline's flexibility, so the `age` coefficient is equally
+    // well determined in both. At #3087 the Weibull `age` Wald statistic was
+    // about five times the transformation one, because each row read a
+    // different time-basis coefficient and its variance.
+    let ratio = weibull_std_error / transformation_std_error;
     assert!(
         (2.0 / 3.0..=1.5).contains(&ratio),
-        "weibull vs transformation age Wald statistic: {weibull_statistic} vs \
-         {transformation_statistic}"
+        "weibull vs transformation age standard error: {weibull_std_error} vs \
+         {transformation_std_error}"
     );
 }
 
