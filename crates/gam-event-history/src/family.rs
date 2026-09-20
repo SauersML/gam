@@ -15,8 +15,8 @@ use super::covariance::{
     empirical_bayes_ridge,
 };
 use super::marginal::{
-    LOST_POSITIVITY, SubjectInputs, expected_intensities, forward_filter, pairwise_sum,
-    subject_marginal,
+    Evaluation, LOST_POSITIVITY, SubjectInputs, expected_intensities, forward_filter,
+    pairwise_sum, subject_marginal,
 };
 use super::preserve::{ReferenceGrid, ReferenceStrata, stratum_normalisers};
 use super::scalar::{Tangent, add_real, recip};
@@ -136,6 +136,12 @@ pub struct EventHistoryFamily {
     /// with a vanishing gradient, and the fast wall is the asymptote.
     rate_band: (f64, f64),
     gh: Arc<GaussHermite>,
+    /// The relative accuracy the quadrature is certified to
+    /// ([`EventHistorySpec::quadrature_tolerance`]). The smoother refuses a
+    /// marginal whose unresolved points could hold more than this fraction
+    /// of its mass, so the derivative pass inherits the forward pass's
+    /// certificate instead of silently dropping mass.
+    quadrature_tolerance: f64,
     time_scale: f64,
     /// The reference population's grid and designs, when the baselines are
     /// the risk sets' marginal rates.
@@ -290,6 +296,7 @@ impl EventHistoryFamily {
         gauss_hermite_order: usize,
         time_scale: f64,
         held_rates: Vec<Option<f64>>,
+        quadrature_tolerance: f64,
     ) -> Result<Self, EventHistoryError> {
         if held_rates.len() != atoms
             || held_rates
@@ -329,6 +336,11 @@ impl EventHistoryFamily {
                 reason: "time scale must be finite and positive".to_string(),
             });
         }
+        if !(quadrature_tolerance.is_finite() && quadrature_tolerance > 0.0) {
+            return Err(EventHistoryError::InvalidInput {
+                reason: "quadrature tolerance must be finite and positive".to_string(),
+            });
+        }
         product_grid_size(gauss_hermite_order, atoms)?;
         let rate_band = rate_band(&nodes, time_scale)?;
         Ok(Self {
@@ -338,6 +350,7 @@ impl EventHistoryFamily {
             held_rates,
             rate_band,
             gh: Arc::new(GaussHermite::new(gauss_hermite_order)?),
+            quadrature_tolerance,
             time_scale,
             reference: None,
             cache: Arc::new(Mutex::new(None)),
@@ -425,6 +438,10 @@ impl EventHistoryFamily {
 
     pub fn gauss_hermite_order(&self) -> usize {
         self.gh.order
+    }
+
+    pub(crate) fn quadrature_tolerance(&self) -> f64 {
+        self.quadrature_tolerance
     }
 
     pub fn nodes(&self) -> &Arc<CohortNodes> {
@@ -616,6 +633,11 @@ impl EventHistoryFamily {
         let subjects = &self.nodes.subjects;
         let gh = &self.gh;
         let time_scale = self.time_scale;
+        let evaluation = if derivatives {
+            Evaluation::Derivatives { tolerance: self.quadrature_tolerance }
+        } else {
+            Evaluation::Value
+        };
         let row_direction = |dir: Option<&Array1<f64>>, d: usize, row: usize| -> f64 {
             dir.map_or(0.0, |dir| {
                 let design = &designs[d];
@@ -657,7 +679,7 @@ impl EventHistoryFamily {
                     designs: derivatives.then_some(views.as_slice()),
                     log_normaliser: None,
                 };
-                let local = subject_marginal(&inputs, derivatives).map_err(|e| e.to_string())?;
+                let local = subject_marginal(&inputs, evaluation).map_err(|e| e.to_string())?;
                 if derivatives
                     && (local.gradient.len() != local_total
                         || local.hessian.len() != local_total * local_total)
@@ -2299,6 +2321,7 @@ pub(crate) fn fit_at_rank(
             order,
             time_scale,
             start.map_or_else(Vec::new, RankStart::held_rates),
+            spec.quadrature_tolerance,
         )?;
         let family = family.with_reference(reference);
         preflight(
@@ -2764,7 +2787,7 @@ fn added_atom_probe(fit: &EventHistoryFit, log_rate: f64) -> Result<(EventHistor
     let mut rates: Vec<Option<f64>> = fit.log_rates.iter().map(|r| Some(r.exp())).collect();
     rates.push(Some(log_rate.exp()));
     let probe = EventHistoryFamily::new(fit.nodes.clone(), fit.family.designs.clone(),
-        atoms, fit.family.gh.order, fit.time_scale, rates)?
+        atoms, fit.family.gh.order, fit.time_scale, rates, fit.family.quadrature_tolerance)?
         .with_reference(fit.family.reference.clone());
     let mut states = fit.fit.block_states[..marks].to_vec();
     let mut loadings = Array1::zeros(marks * atoms);
@@ -2829,6 +2852,7 @@ fn added_atom_probe_on_mesh(
         fit.family.gh.order,
         fit.time_scale,
         rates,
+        fit.family.quadrature_tolerance,
     )?
     .with_reference(reference);
     preflight(fit.family.gh.order, atoms, nodes.max_subject_nodes(), marks, probe.total_width())?;
@@ -3229,6 +3253,7 @@ fn direction_profile(
             order,
             time_scale,
             held.clone(),
+            fit.family.quadrature_tolerance,
         ).map(|family| family.with_reference(fit.family.reference.clone()))
     };
     let probe = build(fit.family.gh.order)?;

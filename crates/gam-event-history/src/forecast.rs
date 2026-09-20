@@ -323,7 +323,7 @@ pub fn latent_state(
         continuation_gap: 0.0,
         designs: None,
         log_normaliser: normaliser.as_deref(),
-    })?;
+    }, fit.family.quadrature_tolerance())?;
     let mut mean = Array2::<f64>::zeros((subject.len(), atoms));
     let mut covariance = Vec::with_capacity(subject.len());
     for (n, (node_mean, node_covariance)) in moments.iter().enumerate() {

@@ -19,7 +19,7 @@ use super::forecast::{
     forecast, forecast_history, latent_state, pit_uniform_distance, population_forecast,
     predictive_pit,
 };
-use super::marginal::{SubjectInputs, subject_marginal};
+use super::marginal::{Evaluation, SubjectInputs, subject_marginal};
 use super::preserve::{ReferenceGrid, ReferenceStrata, killing_masks, stratum_normalisers};
 use gam_model_api::families::custom_family::BlockwiseFitOptions;
 use gam_problem::ParameterBlockState;
@@ -275,7 +275,7 @@ fn single_node_marginal_matches_numerical_integration() {
         designs: None,
         log_normaliser: None,
     };
-    let out = subject_marginal(&inputs, false).expect("marginal");
+    let out = subject_marginal(&inputs, Evaluation::Value).expect("marginal");
     // ∫ exp(y η − w e^η) N(z) dz with η = η0 − ½a² + a z, on a fine grid.
     let mut integral = 0.0;
     let steps = 200_000;
@@ -313,7 +313,7 @@ fn two_node_marginal_matches_brute_force_double_integral() {
         designs: None,
         log_normaliser: None,
     };
-    let out = subject_marginal(&inputs, false).expect("marginal");
+    let out = subject_marginal(&inputs, Evaluation::Value).expect("marginal");
     let phi = (-(1.2_f64 * 0.7)).exp();
     let q = 1.0 - phi * phi;
     let steps = 1200;
@@ -365,7 +365,7 @@ fn zero_loadings_reduce_to_the_poisson_likelihood() {
         designs: None,
         log_normaliser: None,
     };
-    let out = subject_marginal(&inputs, true).expect("marginal");
+    let out = subject_marginal(&inputs, with_derivatives()).expect("marginal");
     let mut expected = 0.0;
     for n in 0..3 {
         for d in 0..2 {
@@ -415,11 +415,16 @@ fn finite_difference_subject() -> (SubjectNodes, Vec<f64>, Vec<f64>, Vec<f64>) {
     (nodes, eta0, loadings, rates)
 }
 
+/// The derivative pass at the default quadrature tolerance, the accuracy a
+/// fit certifies its grid to.
+fn with_derivatives() -> Evaluation {
+    Evaluation::Derivatives { tolerance: EventHistorySpec::new(Vec::new()).quadrature_tolerance }
+}
+
 fn evaluate_at(
     nodes: &SubjectNodes,
     gh: &GaussHermite,
     theta: &[f64],
-    derivatives: bool,
 ) -> super::marginal::SubjectOutput<f64> {
     let n = nodes.len();
     let (marks, atoms) = (2, 2);
@@ -438,7 +443,7 @@ fn evaluate_at(
             designs: None,
             log_normaliser: None,
         },
-        derivatives,
+        with_derivatives(),
     )
     .expect("marginal")
 }
@@ -451,15 +456,15 @@ fn gradient_and_hessian_match_central_differences() {
     theta.extend(loadings.iter());
     theta.extend(rates.iter());
     let p = theta.len();
-    let base = evaluate_at(&nodes, &gh, &theta, true);
+    let base = evaluate_at(&nodes, &gh, &theta);
     let h = 1e-4;
     for i in 0..p {
         let mut plus = theta.clone();
         plus[i] += h;
         let mut minus = theta.clone();
         minus[i] -= h;
-        let fp = evaluate_at(&nodes, &gh, &plus, true);
-        let fm = evaluate_at(&nodes, &gh, &minus, true);
+        let fp = evaluate_at(&nodes, &gh, &plus);
+        let fm = evaluate_at(&nodes, &gh, &minus);
         let fd = (fp.loglik - fm.loglik) / (2.0 * h);
         assert!(
             (base.gradient[i] - fd).abs() < 1e-6 * (1.0 + fd.abs()),
@@ -518,7 +523,7 @@ fn directional_duals_match_finite_differences_of_the_hessian() {
                 designs: None,
                 log_normaliser: None,
             },
-            true,
+            with_derivatives(),
         )
         .expect("marginal")
     };
@@ -531,8 +536,8 @@ fn directional_duals_match_finite_differences_of_the_hessian() {
             .map(|(x, d)| x + s * d)
             .collect()
     };
-    let plus_u = evaluate_at(&nodes, &gh, &shifted(h, &u), true);
-    let minus_u = evaluate_at(&nodes, &gh, &shifted(-h, &u), true);
+    let plus_u = evaluate_at(&nodes, &gh, &shifted(h, &u));
+    let minus_u = evaluate_at(&nodes, &gh, &shifted(-h, &u));
     for idx in 0..p * p {
         let fd = (plus_u.hessian[idx] - minus_u.hessian[idx]) / (2.0 * h);
         let dual = two.hessian[idx].eps.value();
@@ -560,7 +565,7 @@ fn directional_duals_match_finite_differences_of_the_hessian() {
                 designs: None,
                 log_normaliser: None,
             },
-            true,
+            with_derivatives(),
         )
         .expect("marginal");
         out.hessian
@@ -1007,6 +1012,7 @@ fn family_joint_hessian_matches_finite_differences_of_its_gradient() {
         31,
         cohort.time_scale(),
         vec![None],
+        EventHistorySpec::new(Vec::new()).quadrature_tolerance,
     )
     .expect("family");
     let beta = array![-0.4, 0.3];
@@ -1972,6 +1978,7 @@ fn newton_direction_decreases_the_penalised_objective_at_the_start() {
         11,
         cohort.time_scale(),
         vec![None],
+        EventHistorySpec::new(Vec::new()).quadrature_tolerance,
     )
     .expect("family");
     let states = |beta: &Array1<f64>, latent: &Array1<f64>| {
@@ -2214,6 +2221,7 @@ fn loaded_family(
         order,
         cohort.time_scale(),
         vec![None],
+        EventHistorySpec::new(Vec::new()).quadrature_tolerance,
     )
     .expect("family");
     let states = vec![
@@ -2262,7 +2270,7 @@ fn smallest_prefix_with_non_finite_louis_output_at_order_21() {
                 designs: None,
                 log_normaliser: None,
             };
-            match subject_marginal(&inputs, true) {
+            match subject_marginal(&inputs, with_derivatives()) {
                 Ok(out) => {
                     out.loglik.is_finite()
                         && out.gradient.iter().all(|v| v.is_finite())
@@ -2314,7 +2322,7 @@ fn smallest_prefix_with_non_finite_louis_output_at_order_21() {
                 designs: None,
                 log_normaliser: None,
             };
-                subject_marginal(&inputs, true).map(|o| {
+                subject_marginal(&inputs, with_derivatives()).map(|o| {
                     (
                         o.loglik,
                         o.gradient.iter().filter(|v| !v.is_finite()).count(),
@@ -2626,7 +2634,7 @@ fn dual_loading_derivative_matches_finite_difference_at_zero_loading() {
                 designs: None,
                 log_normaliser: None,
             };
-            subject_marginal(&inputs, false).expect("value").loglik
+            subject_marginal(&inputs, Evaluation::Value).expect("value").loglik
         };
         let eta0: Vec<Tangent<1>> = (0..nodes).map(|_| Tangent::seeded(0.3, [0.0])).collect();
         let inputs = SubjectInputs {
@@ -2640,7 +2648,7 @@ fn dual_loading_derivative_matches_finite_difference_at_zero_loading() {
             designs: None,
             log_normaliser: None,
         };
-        let dual = subject_marginal(&inputs, false).expect("dual").loglik;
+        let dual = subject_marginal(&inputs, Evaluation::Value).expect("dual").loglik;
         let h = 1e-5;
         let fd = (value(h) - value(-h)) / (2.0 * h);
         emit(&format!(
@@ -2794,6 +2802,7 @@ fn traced_fixed_lambda_inner_solve_on_the_null_cohort() {
         11,
         cohort.time_scale(),
         vec![None],
+        EventHistorySpec::new(Vec::new()).quadrature_tolerance,
     )
     .expect("family");
     let specs = vec![
@@ -2842,7 +2851,7 @@ fn gradient_and_hessian_match_central_differences_at_tiny_gaps() {
     theta.extend([0.8, -0.4, 0.3, 0.6]);
     theta.extend([0.82, 1.65]);
     let p = theta.len();
-    let base = evaluate_at(&nodes, &gh, &theta, true);
+    let base = evaluate_at(&nodes, &gh, &theta);
     let h = 1e-4;
     let mut mismatches = Vec::new();
     for i in 0..p {
@@ -2850,8 +2859,8 @@ fn gradient_and_hessian_match_central_differences_at_tiny_gaps() {
         plus[i] += h;
         let mut minus = theta.clone();
         minus[i] -= h;
-        let fp = evaluate_at(&nodes, &gh, &plus, true);
-        let fm = evaluate_at(&nodes, &gh, &minus, true);
+        let fp = evaluate_at(&nodes, &gh, &plus);
+        let fm = evaluate_at(&nodes, &gh, &minus);
         let fd = (fp.loglik - fm.loglik) / (2.0 * h);
         if (base.gradient[i] - fd).abs() >= 1e-4 * (1.0 + fd.abs()) {
             mismatches.push(format!("gradient[{i}] = {} vs {fd}", base.gradient[i]));
@@ -2898,6 +2907,7 @@ fn traced_fixed_lambda_inner_solve_on_the_loaded_cohort_reports_its_cost() {
         11,
         cohort.time_scale(),
         vec![None],
+        EventHistorySpec::new(Vec::new()).quadrature_tolerance,
     )
     .expect("family");
     let total_nodes: usize = nodes.subjects.iter().map(|s| s.len()).sum();

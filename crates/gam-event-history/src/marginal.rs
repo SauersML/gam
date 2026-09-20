@@ -100,18 +100,6 @@ pub(crate) struct SubjectOutput<S> {
     pub hessian: Vec<S>,
 }
 
-/// A filtered or predicted density value below this fraction of its grid's
-/// peak is interpolation noise (the Lagrange-based operator is a signed sum,
-/// accurate to about `ε · peak` in absolute terms), and the future-likelihood
-/// ratio that multiplies it in the smoothed marginal is exponentially large
-/// exactly there. Such points carry no smoothed mass, and a smoothed
-/// conditional expectation is not formed there (its denominator is the
-/// predicted density). `1e-11` sits several orders above the noise of a
-/// product grid of a few hundred points; the mass it discards is far below
-/// the Gauss-Hermite certificate's tolerance, and the smoothed marginal is
-/// renormalised after the cut so every expectation is under a probability.
-const DENSITY_NOISE_RELATIVE: f64 = 1e-11;
-
 /// The marker a lost-positivity failure carries. The grid representation of
 /// a density is a signed interpolant, so an order too coarse for a posterior
 /// can produce negative mass where the mass is; that is a failure of the
@@ -119,10 +107,78 @@ const DENSITY_NOISE_RELATIVE: f64 = 1e-11;
 /// raising the Gauss-Hermite order rather than by passing the number on.
 pub(crate) const LOST_POSITIVITY: &str = "the density representation lost positivity";
 
-/// The noise floor of a density on a grid: `DENSITY_NOISE_RELATIVE` of its
-/// largest value.
-fn density_floor<S: JetField>(values: &[S]) -> f64 {
-    DENSITY_NOISE_RELATIVE * values.iter().map(|v| v.value()).fold(0.0, f64::max)
+/// What [`subject_marginal`] evaluates.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Evaluation {
+    /// The marginal log-likelihood alone.
+    Value,
+    /// The log-likelihood with its Fisher gradient and Louis Hessian. Their
+    /// smoother keeps only the grid points whose predicted density the
+    /// representation resolves to relative accuracy `tolerance` (the
+    /// quadrature certificate's), and refuses a cut whose mass it cannot
+    /// bound by that tolerance (see [`PredictedNoise`]).
+    Derivatives { tolerance: f64 },
+}
+
+/// The absolute roundoff of a predicted density `p̂` on a grid, and which of
+/// its points it resolves.
+///
+/// A predicted density that reached its grid through `k` Lagrange-based
+/// forward operators carries, per operator, the nodal roundoff `ε` of its
+/// source amplified by the interpolant's Lebesgue constant `Λ_G`
+/// ([`GaussHermite::lebesgue_constant`]): its absolute noise is
+/// `ε · Λ_G · k · max|p̂|`. This is the charge the fit's admissibility test
+/// (`certifiable`) and the forecast's window roundoff read, with the chain
+/// length replaced by the operators this density actually went through. A
+/// density no operator touched — the exact prior at the first node, every
+/// node of a static chain, a zero-innovation step conditioned in place — is a
+/// product of exact positive factors, accurate to relative roundoff, and has
+/// no absolute noise.
+///
+/// A point is resolved when the ratio `x / p̂` formed there has relative
+/// error at most the certificate's `tolerance`: `p̂ > noise / tolerance`.
+struct PredictedNoise {
+    /// `ε · Λ_G · k · max|p̂|`.
+    absolute: f64,
+    tolerance: f64,
+}
+
+impl PredictedNoise {
+    fn new<S: JetField>(predicted: &[S], interpolations: usize, gh: &GaussHermite, tolerance: f64) -> Self {
+        let peak = predicted.iter().map(|p| p.value().abs()).fold(0.0, f64::max);
+        Self {
+            absolute: f64::EPSILON * gh.lebesgue_constant * interpolations as f64 * peak,
+            tolerance,
+        }
+    }
+
+    /// Whether each point's predicted density is resolved.
+    fn resolved<S: JetField>(&self, predicted: &[S]) -> Vec<bool> {
+        let threshold = self.absolute / self.tolerance;
+        predicted.iter().map(|p| p.value() > threshold).collect()
+    }
+
+    /// The largest true density a cut point can hold: its representation is
+    /// at most `noise / tolerance`, and the truth is within `noise` of it.
+    fn cut_ceiling(&self) -> f64 {
+        self.absolute * (1.0 + 1.0 / self.tolerance)
+    }
+}
+
+/// Per node, how many interpolating forward operators the filtered chain
+/// applied to reach its filtered grid. An operator family with no axes is the
+/// identity (the first node, a static chain, a zero-innovation step).
+fn interpolations<S>(filtered: &[FilteredNode<S>]) -> Vec<usize> {
+    let mut count = 0usize;
+    filtered
+        .iter()
+        .map(|node| {
+            if !node.forward.per_axis.is_empty() {
+                count += 1;
+            }
+            count
+        })
+        .collect()
 }
 
 fn numerical(reason: impl Into<String>) -> EventHistoryError {
@@ -764,7 +820,7 @@ impl Layout {
 /// Fisher gradient and Louis Hessian in coefficient space.
 pub(crate) fn subject_marginal<S: JetField>(
     inputs: &SubjectInputs<'_, S>,
-    derivatives: bool,
+    evaluation: Evaluation,
 ) -> Result<SubjectOutput<S>, EventHistoryError> {
     let nodes = inputs.nodes;
     let n_nodes = nodes.len();
@@ -793,6 +849,7 @@ pub(crate) fn subject_marginal<S: JetField>(
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
 
     // ---- forward filter ------------------------------------------------
+    let derivatives = matches!(evaluation, Evaluation::Derivatives { .. });
     let filtered = filter_nodes(inputs, derivatives, &counts_rows, &exposure_rows)?;
     let node_loglik: Vec<S> = filtered
         .iter()
@@ -802,13 +859,16 @@ pub(crate) fn subject_marginal<S: JetField>(
     if !loglik.value().is_finite() {
         return Err(numerical("subject marginal log-likelihood is not finite"));
     }
-    if !derivatives {
-        return Ok(SubjectOutput {
-            loglik,
-            gradient: Vec::new(),
-            hessian: Vec::new(),
-        });
-    }
+    let tolerance = match evaluation {
+        Evaluation::Value => {
+            return Ok(SubjectOutput {
+                loglik,
+                gradient: Vec::new(),
+                hessian: Vec::new(),
+            });
+        }
+        Evaluation::Derivatives { tolerance } => tolerance,
+    };
 
     // ---- layout ------------------------------------------------------------
     // With designs, the coefficients are the per-mark blocks in mark order.
@@ -855,8 +915,15 @@ pub(crate) fn subject_marginal<S: JetField>(
     // `static_state::filter`, with no gap between nodes to score.
     let is_static = crate::static_state::is_static(inputs.rates);
     let n_gaps = n_nodes.saturating_sub(1);
-    let smoothed_chain =
-        backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, !is_static)?;
+    let smoothed_chain = backward_smoother(
+        inputs,
+        &filtered,
+        &counts_rows,
+        &exposure_rows,
+        !is_static,
+        tolerance,
+    )?;
+    let filtered_interpolations = interpolations(&filtered);
 
     // ---- forward sweep: Fisher mean and Louis second moment ---------------
     // `carried[q * size + i]` is `C_m(z_i)[q]`, the conditional expectation
@@ -1284,8 +1351,9 @@ pub(crate) fn subject_marginal<S: JetField>(
         // ---- propagate the carried vector to node m+1's grids ------------------
         // C_{m+1}(z') = F[α_m C_m](z') / p̂_{m+1}(z'), plus the gap score's own
         // forward-smoothed expectation E[t_g | z', y_{≤ m+1}] = ã / p̂ in its
-        // log-rate slot. Where the predicted density is below its noise floor
-        // no ratio is formed; the smoothed marginal has no mass there. The
+        // log-rate slot. Where the predicted density is not resolved
+        // ([`PredictedNoise`]) no ratio is formed; the smoothed marginal has
+        // no mass there. The
         // operand lives on node m's filtered grid, and `forward` evaluates it
         // on whichever grid of node m+1 it was built for.
         let alpha = &filtered[m].alpha;
@@ -1300,18 +1368,12 @@ pub(crate) fn subject_marginal<S: JetField>(
                 (0..filtered_size).map(|i| alpha[i].mul(&row[i])).collect()
             })
             .collect();
-        let propagate = |forward: &OperatorFamily<S>, predicted: &[S]| -> Vec<S> {
+        let propagate = |forward: &OperatorFamily<S>, predicted: &[S], resolved: &[bool]| -> Vec<S> {
             let target_size = predicted.len();
-            let floor = density_floor(predicted);
             let inverse_predicted: Vec<Option<S>> = predicted
                 .iter()
-                .map(|density| {
-                    if density.value() > floor {
-                        Some(recip(density))
-                    } else {
-                        None
-                    }
-                })
+                .zip(resolved.iter())
+                .map(|(density, &resolved)| resolved.then(|| recip(density)))
                 .collect();
             let mut propagated = vec![zero.clone(); p_total * target_size];
             for q in 0..p_total {
@@ -1353,12 +1415,19 @@ pub(crate) fn subject_marginal<S: JetField>(
             }
             propagated
         };
+        // The smoothed grid's ratio is formed exactly where the backward pass
+        // resolved (and certified) the smoothed marginal on it; the filtered
+        // grid's where its own predicted density is resolved to the same
+        // tolerance, which at the last node is the smoothed marginal's cut.
         carried_smoothed = smoothed_chain.grids[m + 1].as_ref().map(|target| {
             let forward = forward_operators(inputs.gh, &filtered[m].grid, target, transitions, 2);
             let predicted = forward.plain(alpha);
-            propagate(&forward, &predicted)
+            propagate(&forward, &predicted, &smoothed_chain.resolved[m + 1])
         });
-        carried = propagate(&next.forward, &next.predicted);
+        let filtered_resolved =
+            PredictedNoise::new(&next.predicted, filtered_interpolations[m + 1], inputs.gh, tolerance)
+                .resolved(&next.predicted);
+        carried = propagate(&next.forward, &next.predicted, &filtered_resolved);
     }
 
     // ---- assemble ----------------------------------------------------------
@@ -1523,6 +1592,11 @@ struct Smoothed<S> {
     /// lives on the node's filtered grid: the last node, whose smoothed
     /// marginal is its filtered one, and every node of a static chain.
     grids: Vec<Option<Grid<S>>>,
+    /// Per node with a smoothed grid of its own, which of its points the
+    /// predicted density resolves ([`PredictedNoise`]): the points the
+    /// smoothed marginal was formed and certified on. Empty where `grids`
+    /// is `None`.
+    resolved: Vec<Vec<bool>>,
     marginals: Vec<Vec<S>>,
     innovation_moments: Vec<HashMap<Vec<u8>, Vec<S>>>,
 }
@@ -1534,30 +1608,46 @@ impl<S> Smoothed<S> {
     }
 }
 
-/// A density `raw · exp(log β)` on `grid`, normalised to a probability.
+/// The smoothed marginal `p̂ · exp(ell − shift + log β)` on `grid`,
+/// normalised to a probability, over the points whose predicted density `p̂`
+/// is resolved.
 ///
 /// `β` alone overflows on a wide hull (it is a future-likelihood ratio,
-/// astronomically large where `raw` is astronomically small), so it is never
-/// exponentiated on its own: the product is formed in log space, a point
-/// whose `raw` density is below the noise floor carries no mass, and the
-/// result is renormalised so every expectation under it is under a
-/// probability.
+/// astronomically large where `p̂` is astronomically small), so it is never
+/// exponentiated on its own: the product is formed in log space. The node
+/// factor `exp(ell − shift)` and `log β` are evaluated from explicit formulas
+/// at every point, so the representation's error at a point is `p̂`'s, and a
+/// point is kept exactly where `p̂` is resolved to the certificate's
+/// tolerance.
+///
+/// A cut point's true density is at most `noise · (1 + 1/tolerance)`
+/// ([`PredictedNoise::cut_ceiling`]), so the mass the cut discards is at most
+/// `B = ceiling · Σ_cut w_i exp(ell_i − shift + log β_i)`. The marginal is
+/// renormalised over the kept mass `M`, which moves every expectation by at
+/// most `B / M`; when that exceeds the tolerance the grid does not resolve the
+/// smoothed marginal, and the failure is the representation's — the fit
+/// driver raises the Gauss-Hermite order on it.
 fn smoothed_marginal<S: JetField>(
     grid: &Grid<S>,
-    raw: &[S],
+    predicted: &[S],
+    likelihood: &NodeLikelihood<S>,
     log_beta: &[S],
+    noise: &PredictedNoise,
     label: &str,
-) -> Result<Vec<S>, EventHistoryError> {
-    let floor = density_floor(raw);
-    let mut smoothed: Vec<S> = raw
+) -> Result<(Vec<S>, Vec<bool>), EventHistoryError> {
+    let resolved = noise.resolved(predicted);
+    let log_factor: Vec<S> = likelihood
+        .ell
         .iter()
         .zip(log_beta.iter())
-        .map(|(a, log_b)| {
-            if a.value() > floor {
-                exp(&ln(a).add(log_b))
-            } else {
-                a.constant_like(0.0)
-            }
+        .map(|(e, log_b)| add_real(e, -likelihood.shift).add(log_b))
+        .collect();
+    let mut smoothed: Vec<S> = predicted
+        .iter()
+        .zip(log_factor.iter())
+        .zip(resolved.iter())
+        .map(|((p, log_f), &kept)| {
+            if kept { exp(&ln(p).add(log_f)) } else { p.constant_like(0.0) }
         })
         .collect();
     let mass = weighted_sum(&grid.weights, &smoothed);
@@ -1567,11 +1657,34 @@ fn smoothed_marginal<S: JetField>(
             mass.value()
         )));
     }
+    // A density no operator touched has no absolute noise: its cut points
+    // are exactly its non-positive (underflowed) values, and hold no mass.
+    // A cut term of exactly zero (`ln = −∞`) bounds nothing and is dropped;
+    // a NaN term survives and refuses the cut.
+    let cut_terms: Vec<f64> = (0..smoothed.len())
+        .filter(|&i| !resolved[i])
+        .map(|i| grid.weights[i].value().ln() + log_factor[i].value())
+        .filter(|term| *term != f64::NEG_INFINITY)
+        .collect();
+    if noise.absolute > 0.0 && !cut_terms.is_empty() {
+        let log_cut = noise.cut_ceiling().ln() + log_sum_exp(&cut_terms);
+        let log_kept = mass.value().ln();
+        if !(log_cut <= noise.tolerance.ln() + log_kept) {
+            return Err(EventHistoryError::LostPositivity {
+                reason: format!(
+                    "{label}: the smoothed marginal's unresolved points may hold {:.3e} of its \
+                     mass, above the tolerance {:.3e}; {LOST_POSITIVITY}",
+                    (log_cut - log_kept).exp(),
+                    noise.tolerance
+                ),
+            });
+        }
+    }
     let inverse = recip(&mass);
     for s in smoothed.iter_mut() {
         *s = s.mul(&inverse);
     }
-    Ok(smoothed)
+    Ok((smoothed, resolved))
 }
 
 /// The backward pass over a filtered chain.
@@ -1609,14 +1722,16 @@ fn backward_smoother<S: JetField>(
     counts_rows: &[Vec<f64>],
     exposure_rows: &[Vec<f64>],
     derivatives: bool,
+    tolerance: f64,
 ) -> Result<Smoothed<S>, EventHistoryError> {
     let n_nodes = filtered.len();
     let last = &filtered[n_nodes - 1];
     if crate::static_state::is_static(inputs.rates) {
         if derivatives { return Err(numerical("static frailties have no innovation scores")); }
-        return Ok(Smoothed { grids: vec![None; n_nodes],
+        return Ok(Smoothed { grids: vec![None; n_nodes], resolved: vec![Vec::new(); n_nodes],
             marginals: vec![last.alpha.clone(); n_nodes], innovation_moments: Vec::new() });
     }
+    let filtered_interpolations = interpolations(filtered);
     let marks = inputs.nodes.counts.ncols();
     let atoms = inputs.rates.len();
     let gh = inputs.gh;
@@ -1669,8 +1784,11 @@ fn backward_smoother<S: JetField>(
     let mut marginals: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
     let mut log_beta: Vec<Vec<S>> = vec![Vec::new(); n_nodes];
     log_beta[n_nodes - 1] = vec![zero.clone(); last.grid.size()];
-    marginals[n_nodes - 1] = smoothed_marginal(&last.grid, &last.alpha, &log_beta[n_nodes - 1],
-        &format!("node {}", n_nodes - 1))?;
+    let mut resolved: Vec<Vec<bool>> = vec![Vec::new(); n_nodes];
+    let last_noise =
+        PredictedNoise::new(&last.predicted, filtered_interpolations[n_nodes - 1], gh, tolerance);
+    marginals[n_nodes - 1] = smoothed_marginal(&last.grid, &last.predicted, &last.likelihood,
+        &log_beta[n_nodes - 1], &last_noise, &format!("node {}", n_nodes - 1))?.0;
     let mut innovation_moments: Vec<HashMap<Vec<u8>, Vec<S>>> = vec![HashMap::new(); n_gaps];
     for n in (0..n_gaps).rev() {
         let label = format!("node {n}");
@@ -1697,20 +1815,20 @@ fn backward_smoother<S: JetField>(
         }
         let grid = Grid::new(gh, &centres, &scales, like);
         let size = grid.size();
-        // ---- `p̂_n lik_n` on it -------------------------------------------
-        let predicted = if n == 0 {
-            prior_density(&grid, like)
+        // ---- `p̂_n` and `lik_n` on it -------------------------------------
+        // `p̂_n` is the exact prior at the first node; elsewhere it is one
+        // interpolation past the previous node's filtered density.
+        let (predicted, predicted_interpolations) = if n == 0 {
+            (prior_density(&grid, like), 0)
         } else {
-            forward_operators(gh, &filtered[n - 1].grid, &grid, &filtered[n].transitions, 0)
-                .plain(&filtered[n - 1].alpha)
+            (
+                forward_operators(gh, &filtered[n - 1].grid, &grid, &filtered[n].transitions, 0)
+                    .plain(&filtered[n - 1].alpha),
+                filtered_interpolations[n - 1] + 1,
+            )
         };
         let likelihood =
             subject_node_likelihood(inputs, counts_rows, exposure_rows, &grid, n, false);
-        let raw: Vec<S> = predicted
-            .iter()
-            .zip(likelihood.ell.iter())
-            .map(|(p, e)| p.mul(&exp(&add_real(e, -likelihood.shift))))
-            .collect();
         // ---- `log β_n` on it ----------------------------------------------
         // The node's log-likelihood is an explicit formula, so it is
         // evaluated exactly at every inner point; only the smoother residual
@@ -1791,13 +1909,18 @@ fn backward_smoother<S: JetField>(
             }
             log_beta_n.push(log_total);
         }
-        marginals[n] = smoothed_marginal(&grid, &raw, &log_beta_n, &label)?;
+        let noise = PredictedNoise::new(&predicted, predicted_interpolations, gh, tolerance);
+        let (marginal, kept) =
+            smoothed_marginal(&grid, &predicted, &likelihood, &log_beta_n, &noise, &label)?;
+        marginals[n] = marginal;
+        resolved[n] = kept;
         log_beta[n] = log_beta_n;
         innovation_moments[n] = moments;
         grids[n] = Some(grid);
     }
     Ok(Smoothed {
         grids,
+        resolved,
         marginals,
         innovation_moments,
     })
@@ -1806,9 +1929,12 @@ fn backward_smoother<S: JetField>(
 /// The posterior mean and covariance of the latent state at every node of a
 /// subject given its whole history: the moments of the smoothed marginal on
 /// each node's smoothed grid. Per node, the mean over the atoms and the row-major
-/// `atoms × atoms` covariance.
+/// `atoms × atoms` covariance. `tolerance` is the quadrature certificate's:
+/// the smoothed marginals keep the points their representation resolves to it
+/// and refuse a cut they cannot bound by it (see [`smoothed_marginal`]).
 pub(crate) fn latent_state_moments(
     inputs: &SubjectInputs<'_, f64>,
+    tolerance: f64,
 ) -> Result<Vec<(Vec<f64>, Vec<f64>)>, EventHistoryError> {
     let nodes = inputs.nodes;
     let n_nodes = nodes.len();
@@ -1827,7 +1953,8 @@ pub(crate) fn latent_state_moments(
     let counts_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.counts.row(n).to_vec()).collect();
     let exposure_rows: Vec<Vec<f64>> = (0..n_nodes).map(|n| nodes.exposure_row(n)).collect();
     let filtered = filter_nodes(inputs, false, &counts_rows, &exposure_rows)?;
-    let smoothed = backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, false)?;
+    let smoothed =
+        backward_smoother(inputs, &filtered, &counts_rows, &exposure_rows, false, tolerance)?;
     Ok(smoothed
         .marginals
         .iter()
@@ -2070,6 +2197,69 @@ pub(crate) fn expected_intensities<S: JetField>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #3998: the smoothed marginal's cut is derived from the predicted
+    /// density's own roundoff (`ε · Λ_G · k · peak`) and certified against
+    /// the quadrature tolerance, not a fixed fraction of the peak.
+    ///
+    /// On a standard-normal grid, an exact prior (`k = 0`) is kept whole. A
+    /// prior charged with enough interpolations that its resolution
+    /// threshold is `10⁻³` of its peak loses its outer points: under a flat
+    /// future likelihood they hold a bounded share of the mass far below the
+    /// tolerance, so the cut is accepted and renormalised; under a steep
+    /// future likelihood `β = exp(4 z)` the outer point `z ≈ 4.5` is where the
+    /// smoothed mass is (`N(4, 1)`), so the cut is refused with the
+    /// lost-positivity marker the fit driver raises the order on.
+    #[test]
+    fn smoothed_marginal_cut_is_certified_against_the_quadrature_tolerance_3998() {
+        let gh = GaussHermite::new(9).unwrap();
+        let grid = Grid::new(&gh, &[0.0], &[1.0], &0.0_f64);
+        let size = grid.size();
+        let prior = prior_density(&grid, &0.0_f64);
+        let likelihood = NodeLikelihood {
+            score: Vec::new(),
+            curvature: Vec::new(),
+            informative: Vec::new(),
+            ell: vec![0.0; size],
+            shift: 0.0,
+        };
+        let tolerance = crate::family::EventHistorySpec::new(Vec::new()).quadrature_tolerance;
+        let flat = vec![0.0; size];
+        let steep: Vec<f64> = (0..size).map(|i| 4.0 * *grid.coordinate(i, 0)).collect();
+
+        let exact = PredictedNoise::new(&prior, 0, &gh, tolerance);
+        assert_eq!(exact.absolute, 0.0);
+        for log_beta in [&flat, &steep] {
+            let (marginal, kept) =
+                smoothed_marginal(&grid, &prior, &likelihood, log_beta, &exact, "exact").unwrap();
+            assert!(kept.iter().all(|&k| k), "an exact density is resolved everywhere");
+            let mass: f64 = grid.weights.iter().zip(&marginal).map(|(w, m)| w * m).sum();
+            assert!((mass - 1.0).abs() < 1e-12);
+        }
+
+        let peak = prior.iter().copied().fold(0.0, f64::max);
+        let interpolations =
+            (1e-3 * tolerance / (f64::EPSILON * gh.lebesgue_constant)).ceil() as usize;
+        let noisy = PredictedNoise::new(&prior, interpolations, &gh, tolerance);
+        let threshold = noisy.absolute / tolerance;
+        assert!(threshold > 0.999e-3 * peak && threshold < 1.01e-3 * peak);
+        let (marginal, kept) =
+            smoothed_marginal(&grid, &prior, &likelihood, &flat, &noisy, "flat").unwrap();
+        let cut = kept.iter().filter(|&&k| !k).count();
+        assert_eq!(cut, 2, "only the two outer points sit below 10⁻³ of the peak");
+        for (i, &k) in kept.iter().enumerate() {
+            assert_eq!(k, prior[i] > threshold);
+            if !k {
+                assert_eq!(marginal[i], 0.0);
+            }
+        }
+        match smoothed_marginal(&grid, &prior, &likelihood, &steep, &noisy, "steep") {
+            Err(EventHistoryError::LostPositivity { reason }) => {
+                assert!(reason.contains(LOST_POSITIVITY), "{reason}");
+            }
+            other => panic!("a cut holding the smoothed mass must be refused: {other:?}"),
+        }
+    }
 
     #[test]
     fn transition_polynomials_are_exact_scores_of_the_log_density() {
@@ -2316,7 +2506,7 @@ mod tests {
                 nodes: &nodes, eta0: &eta0, loadings: &loadings, rates: &rates, time_scale: 1.0,
                 gh: &gh, continuation_gap: 0.0, designs: None, log_normaliser: None,
             };
-            let moments = latent_state_moments(&inputs).unwrap();
+            let moments = latent_state_moments(&inputs, crate::family::EventHistorySpec::new(Vec::new()).quadrature_tolerance).unwrap();
             let node_0 = (moments[0].0[0], moments[0].1[0].sqrt());
             let final_node = (moments[n_nodes - 1].0[0], moments[n_nodes - 1].1[0].sqrt());
             let filter_error = (final_node.0 - last.0).abs().max((final_node.1 - last.1).abs());
