@@ -23,12 +23,10 @@
 //! `ref_df`/`chi_sq`/`p_value` to `0`/`None` for every smooth following a `by=`
 //! factor. Five fixes, five chances to miss one.
 //!
-//! So the walk lives here, once (issue #2470). What genuinely differs between
-//! the surfaces stays a parameter: the in-process path has the real training
-//! design and can hand over the exact weighted Gram, while the persisted path
-//! replays frozen basis geometry and reconstructs an unweighted one. That is a
-//! difference in the *evidence available*, not in the accounting, and it is the
-//! only thing a caller is asked for.
+//! So the walk lives here, once (issue #2470). The surfaces differ only in the
+//! term structure they present — the real training design in process, the
+//! frozen-basis replay for a persisted model — and every fitted quantity the
+//! significance test reads comes from the fit itself.
 //!
 //! Reference-distribution inputs are read off the fit, not off the caller:
 //! `wald_residual_degrees_of_freedom` for the denominator and
@@ -49,23 +47,43 @@ use crate::estimate::summary::{
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
-use gam_terms::inference::smooth_test::{
-    SmoothTestInput, SmoothTestScale, wood_smooth_test,
+use gam_terms::inference::smooth_score_test::{
+    SmoothScoreTestInput, SmoothScoreTestRefusal, smooth_score_test,
 };
-use gam_terms::smooth::{ShapeSpec, TermCollectionDesign};
+use gam_terms::inference::smooth_test::{SmoothTestResult, SmoothTestScale};
+use gam_terms::smooth::{
+    BOUNDED_SHRINKAGE_PENALTY_SOURCE, ShapeSpec, SmoothTerm, TermCollectionDesign,
+};
 use ndarray::Array2;
+
+/// Where the presented design's predictor block sits in the fit's flat
+/// coefficient and penalty layouts.
+///
+/// A single-predictor fit is the whole layout, [`SummaryBlockOffset::default`].
+/// A multi-predictor fit (the Bernoulli marginal-slope marginal and slope
+/// surfaces, #2997) presents each predictor from its own frozen design, and
+/// that design's block-local coefficient columns and penalty blocks start after
+/// the coefficients and λ of every block the fit orders before it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SummaryBlockOffset {
+    /// Coefficients of the fit's blocks before this one.
+    pub coefficients: usize,
+    /// Penalty blocks (λ) of the fit's blocks before this one.
+    pub penalties: usize,
+}
 
 /// Build the smooth/random-effect rows of a model summary.
 ///
 /// `design` describes the term structure being presented — the real
 /// training design on the in-process path, the frozen-basis replay on the
-/// persisted one. `fit` owns every fitted quantity, including both inputs to
-/// the Wald reference distribution. `whitening_gram` is the Wood (2013)
-/// design-whitening metric `G = X'WX` in the fit's coefficient layout (the
-/// exact weighted Gram when the inference block survived, else a reconstructed
-/// unweighted `X'X`); `None` falls back to truncating the raw coefficient
-/// covariance, which is the documented behaviour for a persisted model whose
-/// Gram was not serialized.
+/// persisted one. `fit` owns every fitted quantity: the smooth test is the
+/// variance-component score test of
+/// [`gam_terms::inference::smooth_score_test`], read off the fit's exact
+/// penalized Hessian and weighted Gram, and a term the test cannot be computed
+/// for carries the typed [`SmoothPValueUnavailable`] reason instead. `offset`
+/// places `design` inside the fit's layouts: every index into `fit` (β,
+/// penalized Hessian, weighted Gram, covariance, influence matrix, λ, traces)
+/// is global, every index into `design` is block-local.
 ///
 /// Random-effect rows do not use the Wald test: their null `σ²_b = 0` is on the
 /// boundary, where a coefficient Wald `χ²` has no valid reference. They carry
@@ -75,21 +93,8 @@ use ndarray::Array2;
 pub fn smooth_term_summary_rows(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
-    whitening_gram: Option<&Array2<f64>>,
+    offset: SummaryBlockOffset,
 ) -> Vec<SmoothTermSummary> {
-    // The Wald smooth test uses the CONDITIONAL Bayesian covariance
-    // `Vb = H⁻¹·φ̂` (mgcv's `Vp`, the covariance mgcv's `testStat` whitens by
-    // default), NOT the smoothing-parameter-corrected `Vc`. `Vc` adds the λ̂
-    // uncertainty `(∂β/∂ρ)·Cov(ρ)·(∂β/∂ρ)ᵀ`, whose variance concentrates in the
-    // wiggle directions (those are the ones λ controls). For a heavily-smoothed,
-    // near-linear term that inflation can exceed the linear direction's variance
-    // and flip the whitened eigenvalue ordering, so the rank-`round(edf)`
-    // truncation keeps a wiggle mode where β̂≈0 and reports the term
-    // non-significant even though its linear effect is real (#2142). `Vc` is for
-    // prediction/credible bands and is NEVER a substitute here: silently
-    // swapping it in changes the Wald p-values (#2296). When the conditional
-    // matrix is absent the smooth test is simply not reported.
-    let cov_forwald = fit.beta_covariance();
     // Both reference-distribution inputs are fit-owned so they cannot drift
     // between presentation surfaces. The denominator is `n − edf` on the real
     // training row count; a representative/replayed design is basis geometry,
@@ -100,17 +105,22 @@ pub fn smooth_term_summary_rows(
     } else {
         SmoothTestScale::Known
     };
+    // The score test's inputs are fit-level and shared by every smooth: `H =
+    // X'WX + S(λ)` and `X'WX` from the one inference block, so both are in the
+    // saved coefficient layout and belong to the same fit. The geometry-frame
+    // Hessian is not a substitute (it may live in a reduced gauge), and neither
+    // is a Gram rebuilt without the fitted weights.
+    let score_fit = ScoreTestFit::of(fit, residual_df, scale);
 
-    let gauge_free_gram = whitening_gram.map(|gram| {
-        intercept_projected_gram(gram, design.intercept_range.clone())
-            .unwrap_or_else(|| gram.clone())
-    });
-    let whitening_gram = gauge_free_gram.as_ref();
+    let shift = |range: &std::ops::Range<usize>| {
+        (offset.coefficients + range.start)..(offset.coefficients + range.end)
+    };
 
     let mut rows = Vec::<SmoothTermSummary>::new();
 
     // The fit's GLOBAL penalty layout (and thus `penalty_block_trace`) opens with
     // ONE `LinearTermRidge` block PER linear term carrying `double_penalty=true`
+    // (or a `BoundedShrinkage` block per shrinkage-prior `bounded()` term)
     // — not one shared block (`smooth/term_design.rs:289-311`; every non-intercept
     // effect owns its own REML coordinate so an unsupported slope can be shrunk
     // independently). Random-effect and smooth penalty blocks follow them.
@@ -121,15 +131,21 @@ pub fn smooth_term_summary_rows(
     // them in the recorded global ordering rather than re-deriving it — which is
     // what the `.count()` below does, and why it must not be replaced by a
     // boolean.
-    let mut penalty_cursor = design
-        .penaltyinfo
-        .iter()
-        .filter(|info| {
-            matches!(&info.penalty.source, PenaltySource::Other(s) if s == "LinearTermRidge")
-        })
-        .count();
+    let mut penalty_cursor = offset.penalties
+        + design
+            .penaltyinfo
+            .iter()
+            .filter(|info| {
+                matches!(
+                    &info.penalty.source,
+                    PenaltySource::Other(s)
+                        if s == "LinearTermRidge" || s == BOUNDED_SHRINKAGE_PENALTY_SOURCE
+                )
+            })
+            .count();
 
-    for (name, range) in design.random_effect_ranges.iter() {
+    for (name, local_range) in design.random_effect_ranges.iter() {
+        let range = &shift(local_range);
         // Every random-effect block owns exactly one ridge in the flat
         // `lambdas`/`penalty_block_trace`/`edf_by_block` layout, placed after
         // the linear ridges and before the smooths in the design's order.
@@ -186,10 +202,11 @@ pub fn smooth_term_summary_rows(
     // global `fit.beta` / covariance / influence matrix. Omitting this offset
     // (the #1360 defect) slid each smooth's window one-per-preceding-column off,
     // folding the intercept and a neighbouring term's coefficients into the test.
-    let smooth_start = design
-        .design
-        .ncols()
-        .saturating_sub(design.smooth.total_smooth_cols());
+    let smooth_start = offset.coefficients
+        + design
+            .design
+            .ncols()
+            .saturating_sub(design.smooth.total_smooth_cols());
 
     for term in &design.smooth.terms {
         let k = term.active_penalties.len();
@@ -205,27 +222,14 @@ pub fn smooth_term_summary_rows(
         let edf = fit.per_term_edf(global_range.clone(), penalty_cursor, k);
         let edf_rank_bound = edf_rank_bound_label(fit, penalty_cursor, k);
         penalty_cursor += k;
-        let pvalue_unavailable = smooth_pvalue_unavailable(&term.shape);
-        let smooth_test = if pvalue_unavailable.is_none() {
-            cov_forwald.and_then(|cov| {
-                wood_smooth_test(SmoothTestInput {
-                    beta: fit.beta.view(),
-                    covariance: cov,
-                    influence_matrix: fit.coefficient_influence(),
-                    // Wood (2013) design-whitening Gram in the original
-                    // coefficient basis (#2142). Without it the rank-r
-                    // truncation keeps the wrong eigen-subspace and a dominant
-                    // wiggly smooth reads as non-significant.
-                    whitening_gram,
-                    coeff_range: global_range.clone(),
-                    edf,
-                    nullspace_dim: term.wald_unpenalized_dim(),
-                    residual_df,
-                    scale,
-                })
-            })
-        } else {
-            None
+        let smooth_test = match (smooth_pvalue_unavailable(&term.shape), &score_fit) {
+            (Some(reason), _) => Err(reason),
+            (None, Err(reason)) => Err(*reason),
+            (None, Ok(score_fit)) => score_fit.test_term(term, global_range.clone()),
+        };
+        let (smooth_test, pvalue_unavailable) = match smooth_test {
+            Ok(test) => (Some(test), None),
+            Err(reason) => (None, Some(reason)),
         };
         rows.push(SmoothTermSummary {
             name: term.name.clone(),
@@ -236,7 +240,13 @@ pub fn smooth_term_summary_rows(
                 .unwrap_or(edf.max(0.0)),
             chi_sq: smooth_test.as_ref().map(|test| test.statistic),
             pvalue: smooth_test.as_ref().map(|test| test.p_value),
-            continuous_order: continuous_order_for_term(design, fit, term_penalty_start, k),
+            continuous_order: continuous_order_for_term(
+                design,
+                fit,
+                term_penalty_start,
+                term_penalty_start - offset.penalties,
+                k,
+            ),
             basis_note: match &term.metadata {
                 BasisMetadata::BSpline1D {
                     auto_shrink_note, ..
@@ -251,47 +261,101 @@ pub fn smooth_term_summary_rows(
     rows
 }
 
-/// The whitening Gram with the intercept direction projected out,
-/// `G − G[:, 0]·G[0, :] / G[0, 0]`, whose term block is the Gram of the term's
-/// columns residualized on the intercept in the same metric.
-///
-/// A centered smooth is identified only up to a constant: its columns are
-/// `B·Z` with `Z` spanning the null space of a sum-to-zero constraint, and the
-/// constant it gives up lives in the intercept. Which constraint picks `Z` is a
-/// gauge choice that leaves the fitted function unchanged, and moves every block
-/// Gram `Z'B'WBZ` by a rank-one constant component. The rank-truncated statistic
-/// follows the Gram, so it depended on the gauge. The concrete case: the
-/// constraint sums over training rows without their prior weights, so a fit with
-/// integer frequency weights and the fit on the duplicated rows, which are the
-/// same model with the same fitted function, get different centerings and
-/// different p-values. Residualizing on the intercept removes the constant
-/// component from every term block, so the statistic is invariant to the
-/// centering. It is the Gram the Wood (2013) statistic whitens by whenever the
-/// constraint already holds in the Gram's metric, as it does for the unweighted
-/// Gaussian training Gram, where `G[0, j] = 1'X_j = 0` and nothing changes.
-///
-/// `None` (use `gram` as is) when the design has no single intercept column or
-/// the intercept's Gram entry is not positive.
-fn intercept_projected_gram(
-    gram: &Array2<f64>,
-    intercept: std::ops::Range<usize>,
-) -> Option<Array2<f64>> {
-    if intercept.len() != 1 || intercept.start >= gram.nrows() || gram.nrows() != gram.ncols() {
-        return None;
+/// The fit-level inputs of the smooth score test, shared by every term.
+struct ScoreTestFit<'a> {
+    beta: ndarray::ArrayView1<'a, f64>,
+    penalized_hessian: &'a Array2<f64>,
+    weighted_gram: &'a Array2<f64>,
+    covariance_scale: f64,
+    residual_df: Option<f64>,
+    scale: SmoothTestScale,
+}
+
+impl<'a> ScoreTestFit<'a> {
+    fn of(
+        fit: &'a UnifiedFitResult,
+        residual_df: Option<f64>,
+        scale: SmoothTestScale,
+    ) -> Result<Self, SmoothPValueUnavailable> {
+        let inference = fit
+            .inference
+            .as_ref()
+            .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)?;
+        let weighted_gram = inference
+            .weighted_gram
+            .as_ref()
+            .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)?;
+        let covariance_scale = fit
+            .coefficient_covariance_scale()
+            .map_err(|_| SmoothPValueUnavailable::DispersionUnavailable)?;
+        Ok(Self {
+            beta: fit.beta.view(),
+            penalized_hessian: inference.penalized_hessian.as_array(),
+            weighted_gram,
+            covariance_scale,
+            residual_df,
+            scale,
+        })
     }
-    let col = intercept.start;
-    let pivot = gram[[col, col]];
-    if !(pivot.is_finite() && pivot > 0.0) {
-        return None;
-    }
-    let cross = gram.column(col).to_owned();
-    let mut projected = gram.clone();
-    for i in 0..gram.nrows() {
-        for j in 0..gram.ncols() {
-            projected[[i, j]] -= cross[i] * cross[j] / pivot;
+
+    /// The score test of one smooth term against its active structural
+    /// penalties, one variance component per penalty.
+    ///
+    /// The penalties are passed at the scale their bases were built at; the
+    /// test puts each on its own null scale, so it is invariant to rescaling
+    /// any one of them. A penalty that is neither a dense `m × m` block nor an
+    /// operator of that dimension cannot be read, and the term is refused
+    /// rather than tested against part of its penalty.
+    fn test_term(
+        &self,
+        term: &SmoothTerm,
+        coeff_range: std::ops::Range<usize>,
+    ) -> Result<SmoothTestResult, SmoothPValueUnavailable> {
+        let m = coeff_range.len();
+        if term.active_penalties.is_empty() {
+            return Err(SmoothPValueUnavailable::UnpenalizedDirection);
         }
+        let mut structural_penalties = Vec::with_capacity(term.active_penalties.len());
+        for penalty in &term.active_penalties {
+            let matrix = if penalty.matrix.dim() == (m, m) {
+                penalty.matrix.clone()
+            } else {
+                match &penalty.op {
+                    Some(op) if op.dim() == m => op.as_dense(),
+                    _ => return Err(SmoothPValueUnavailable::FitCurvatureUnavailable),
+                }
+            };
+            if !matrix.iter().any(|v| *v != 0.0) || matrix.iter().any(|v| !v.is_finite()) {
+                return Err(SmoothPValueUnavailable::FitCurvatureUnavailable);
+            }
+            structural_penalties.push(matrix);
+        }
+        smooth_score_test(SmoothScoreTestInput {
+            beta: self.beta,
+            penalized_hessian: self.penalized_hessian,
+            weighted_gram: self.weighted_gram,
+            coeff_range,
+            structural_penalties: &structural_penalties,
+            covariance_scale: self.covariance_scale,
+            residual_df: self.residual_df,
+            scale: self.scale,
+        })
+        .map_err(|refusal| match refusal {
+            SmoothScoreTestRefusal::InconsistentFit => {
+                SmoothPValueUnavailable::FitCurvatureUnavailable
+            }
+            SmoothScoreTestRefusal::UnpenalizedDirection => {
+                SmoothPValueUnavailable::UnpenalizedDirection
+            }
+            SmoothScoreTestRefusal::NotIdentified => SmoothPValueUnavailable::NotIdentified,
+            SmoothScoreTestRefusal::IndefiniteCurvature => {
+                SmoothPValueUnavailable::IndefiniteCurvature
+            }
+            SmoothScoreTestRefusal::ResidualDfUnavailable => {
+                SmoothPValueUnavailable::ResidualDfUnavailable
+            }
+        })
     }
-    Some(projected)
 }
 
 /// The reason a smooth of this shape has no valid significance reference, if
@@ -334,20 +398,23 @@ fn edf_rank_bound_label(fit: &UnifiedFitResult, start: usize, count: usize) -> O
 /// the physical λ the diagnostic needs is `λ_k = λ̃_k / c_k`. Returns `None`
 /// unless the term owns exactly the three penalty blocks the identity is
 /// written over and every one of them reports a usable normalization scale.
+/// `term_penalty_start` indexes the fit's λ, `local_penalty_start` the same
+/// blocks in `design`'s own penalty list.
 fn continuous_order_for_term(
     design: &TermCollectionDesign,
     fit: &UnifiedFitResult,
     term_penalty_start: usize,
+    local_penalty_start: usize,
     k: usize,
 ) -> Option<crate::estimate::summary::ContinuousSmoothnessOrder> {
     if k != 3
         || term_penalty_start + 2 >= fit.lambdas.len()
-        || term_penalty_start + 2 >= design.penaltyinfo.len()
+        || local_penalty_start + 2 >= design.penaltyinfo.len()
     {
         return None;
     }
     let normalized_scale = |idx: usize| {
-        let c = design.penaltyinfo[idx].penalty.normalization_scale;
+        let c = design.penaltyinfo[local_penalty_start + idx].penalty.normalization_scale;
         (c.is_finite() && c > 0.0).then_some(c)
     };
     let lambda_tilde = [
@@ -355,144 +422,6 @@ fn continuous_order_for_term(
         fit.lambdas[term_penalty_start + 1],
         fit.lambdas[term_penalty_start + 2],
     ];
-    let scales = [
-        normalized_scale(term_penalty_start)?,
-        normalized_scale(term_penalty_start + 1)?,
-        normalized_scale(term_penalty_start + 2)?,
-    ];
+    let scales = [normalized_scale(0)?, normalized_scale(1)?, normalized_scale(2)?];
     Some(compute_continuous_smoothness_order(lambda_tilde, scales))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::intercept_projected_gram;
-    use gam_terms::inference::smooth_test::{SmoothTestInput, SmoothTestScale, wood_smooth_test};
-    use ndarray::{Array1, Array2};
-
-    fn weighted_gram(x: &Array2<f64>, w: &Array1<f64>) -> Array2<f64> {
-        let wx = x * &w.view().insert_axis(ndarray::Axis(1));
-        x.t().dot(&wx)
-    }
-
-    /// Gauss-Jordan inverse with partial pivoting, for the small SPD test matrix.
-    fn inverse(m: &Array2<f64>) -> Array2<f64> {
-        let n = m.nrows();
-        let mut a = m.clone();
-        let mut inv = Array2::<f64>::eye(n);
-        for col in 0..n {
-            let pivot = (col..n)
-                .max_by(|&i, &j| a[[i, col]].abs().total_cmp(&a[[j, col]].abs()))
-                .expect("a non-empty column");
-            for k in 0..n {
-                a.swap([col, k], [pivot, k]);
-                inv.swap([col, k], [pivot, k]);
-            }
-            let d = a[[col, col]];
-            for k in 0..n {
-                a[[col, k]] /= d;
-                inv[[col, k]] /= d;
-            }
-            for row in (0..n).filter(|&row| row != col) {
-                let f = a[[row, col]];
-                for k in 0..n {
-                    a[[row, k]] -= f * a[[col, k]];
-                    inv[[row, k]] -= f * inv[[col, k]];
-                }
-            }
-        }
-        inv
-    }
-
-    fn statistic(beta: &Array1<f64>, cov: &Array2<f64>, gram: &Array2<f64>) -> f64 {
-        wood_smooth_test(SmoothTestInput {
-            beta: beta.view(),
-            covariance: cov,
-            influence_matrix: None,
-            whitening_gram: Some(gram),
-            coeff_range: 1..5,
-            edf: 2.6,
-            nullspace_dim: 0,
-            residual_df: None,
-            scale: SmoothTestScale::Known,
-        })
-        .expect("the smooth test is defined")
-        .statistic
-    }
-
-    /// Two centerings of one smooth give the same model: the term columns
-    /// `X₂ = X₁·A + 1·cᵀ` span the same space as `X₁` once the intercept is
-    /// included, and the coefficients map as `β₁ = P·β₂` with
-    /// `P = [[1, cᵀ], [0, A]]`. This is the weighted-rows versus duplicated-rows
-    /// case, where the sum-to-zero constraint is taken over different row
-    /// multisets. The statistic whitened by the intercept-residualized Gram is the
-    /// same in both gauges; whitened by the raw block Gram it is not.
-    #[test]
-    fn the_whitened_statistic_does_not_depend_on_the_smooth_centering() {
-        let n = 40;
-        let x = Array1::from_shape_fn(n, |i| i as f64 / (n - 1) as f64);
-        let w = Array1::from_shape_fn(n, |i| 1.0 + (i % 3) as f64);
-        let raw = |i: usize, j: usize| {
-            let t = x[i];
-            match j {
-                0 => t,
-                1 => t * t,
-                2 => (3.0 * t).sin(),
-                _ => (5.0 * t).cos(),
-            }
-        };
-        // Gauge 1: term columns centered over the rows, ignoring the weights.
-        let mut x1 = Array2::<f64>::ones((n, 5));
-        for j in 0..4 {
-            let mean = (0..n).map(|i| raw(i, j)).sum::<f64>() / n as f64;
-            for i in 0..n {
-                x1[[i, j + 1]] = raw(i, j) - mean;
-            }
-        }
-        let a = Array2::from_shape_fn((4, 4), |(i, j)| {
-            if i == j { 1.5 + 0.1 * i as f64 } else { 0.2 / (1.0 + (i + 2 * j) as f64) }
-        });
-        let c = Array1::from(vec![0.3, -0.2, 0.15, 0.05]);
-        let mut p = Array2::<f64>::eye(5);
-        for j in 0..4 {
-            p[[0, j + 1]] = c[j];
-            for i in 0..4 {
-                p[[i + 1, j + 1]] = a[[i, j]];
-            }
-        }
-        // X₂ = X₁·P keeps the fitted values: X₂·β₂ = X₁·P·β₂ = X₁·β₁.
-        let x2 = x1.dot(&p);
-        let beta2 = Array1::from(vec![0.4, 0.8, -0.5, 0.3, 0.1]);
-        let beta1 = p.dot(&beta2);
-        let g2 = weighted_gram(&x2, &w);
-        let mut h2 = g2.clone();
-        for i in 1..5 {
-            h2[[i, i]] += 5.0 * (i * i) as f64;
-        }
-        let v2 = inverse(&h2);
-        let v1 = p.dot(&v2).dot(&p.t());
-        let g1 = weighted_gram(&x1, &w);
-
-        let raw_1 = statistic(&beta1, &v1, &g1);
-        let raw_2 = statistic(&beta2, &v2, &g2);
-        assert!(
-            (raw_1 - raw_2).abs() > 1e-3 * raw_1.abs(),
-            "the raw block Gram must be gauge-dependent for this check to mean anything: {raw_1} vs {raw_2}"
-        );
-        let projected_1 = statistic(&beta1, &v1, &intercept_projected_gram(&g1, 0..1).unwrap());
-        let projected_2 = statistic(&beta2, &v2, &intercept_projected_gram(&g2, 0..1).unwrap());
-        assert!(
-            (projected_1 - projected_2).abs() <= 1e-9 * projected_1.abs(),
-            "{projected_1} vs {projected_2}"
-        );
-    }
-
-    #[test]
-    fn a_design_without_a_single_intercept_column_keeps_its_gram() {
-        let gram = Array2::<f64>::eye(3);
-        assert!(intercept_projected_gram(&gram, 0..0).is_none());
-        assert!(intercept_projected_gram(&gram, 0..2).is_none());
-        let mut singular = gram.clone();
-        singular[[0, 0]] = 0.0;
-        assert!(intercept_projected_gram(&singular, 0..1).is_none());
-    }
 }

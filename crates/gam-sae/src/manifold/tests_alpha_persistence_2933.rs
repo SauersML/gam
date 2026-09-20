@@ -3,14 +3,15 @@
 //! For an ordered Beta--Bernoulli assignment, `rho.log_lambda_sparse` is the
 //! concentration offset while the concentration is effectively learnable. `into_fitted`
 //! used to rewrite a raw-learnable mode to its resolved concentration and zero that
-//! coordinate. Without an override the loss survived, but the persisted
-//! `(alpha, learnable_alpha, log_lambda_sparse)` triple then reloaded `α_base` in place of
-//! the fitted `α_base·exp(ρ)`.
+//! coordinate. The loss survived, but the persisted `(alpha, learnable_alpha,
+//! log_lambda_sparse)` triple then reloaded `α_base` in place of the fitted `α_base·exp(ρ)`.
+//! The concentration is a property of the mode alone: the per-fit override that could pin a
+//! learnable mode to another value was a second path to a fixed-concentration fit and is
+//! deleted.
 //!
-//! #2933 F45 — with the concentration fixed, by the mode or by a per-fit override, the prior
-//! is the complete Beta--Bernoulli prior at weight one plus its constant partition, the rho
-//! layout carries no sparse coordinate, and `log_lambda_sparse` is an unread placeholder. An
-//! override-pinned learnable mode and its fixed-concentration twin are one objective.
+//! #2933 F45 — with the concentration fixed, the prior is the complete Beta--Bernoulli prior
+//! at weight one plus its constant partition, the rho layout carries no sparse coordinate, and
+//! `log_lambda_sparse` is an unread placeholder.
 //!
 //! Every expected concentration here comes from the model definition, and every expected
 //! prior value from an [`OrderedBetaBernoulliPenalty`] built directly at that concentration,
@@ -27,16 +28,12 @@ use gam_terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliPenalty
 use ndarray::{Array1, Array2, array};
 
 const BASE_ALPHA: f64 = 1.7;
-const OVERRIDE_ALPHA: f64 = 0.6;
+const FIXED_ALPHA: f64 = 0.6;
 const TEMPERATURE: f64 = 1.0;
 
 /// The concentration from the model definition at `ρ_sparse = ln 3`.
-fn expected_concentration(learnable: bool, override_alpha: Option<f64>) -> f64 {
-    match (learnable, override_alpha) {
-        (_, Some(alpha)) => alpha,
-        (true, None) => BASE_ALPHA * 3.0,
-        (false, None) => BASE_ALPHA,
-    }
+fn expected_concentration(learnable: bool) -> f64 {
+    if learnable { BASE_ALPHA * 3.0 } else { BASE_ALPHA }
 }
 
 /// The complete prior `P(concentration)` at weight one, with its partition, at `logits`,
@@ -82,28 +79,17 @@ fn fixed_rho_objective(
     objective
 }
 
-/// A two-atom circle term under `mode` with the per-fit concentration override installed.
-fn configured_term(
-    z: &Array2<f64>,
-    topology: Topo,
-    mode: AssignmentMode,
-    override_alpha: Option<f64>,
-) -> SaeManifoldTerm {
-    let (mut term, _) = build_term(z.view(), 2, topology, mode);
-    let config = term.fit_config();
-    term.set_fit_config(SaeFitConfig {
-        ordered_beta_bernoulli_alpha_override: override_alpha,
-        ..config
-    });
-    term
+/// A two-atom term of `topology` under `mode`.
+fn configured_term(z: &Array2<f64>, topology: Topo, mode: AssignmentMode) -> SaeManifoldTerm {
+    build_term(z.view(), 2, topology, mode).0
 }
 
 /// Fit at a fixed `ρ_sparse = ln 3`, mint the fit, then compare the prior concentration, the
 /// full penalized loss, the criterion, assignments and reconstruction before and after
 /// finalization, and (where the payload can represent the fit) after reloading the persisted
 /// scalars.
-fn assert_finalization_preserves_the_objective(learnable: bool, override_alpha: Option<f64>) {
-    let label = format!("learnable_alpha={learnable}, override={override_alpha:?}");
+fn assert_finalization_preserves_the_objective(learnable: bool) {
+    let label = format!("learnable_alpha={learnable}");
     let started = std::time::Instant::now();
     let stage = |what: &str| eprintln!("[F06 {label}] {what} at {:.2?}", started.elapsed());
     let z = planted_circle_embedded(16, 3, 0.03);
@@ -113,15 +99,15 @@ fn assert_finalization_preserves_the_objective(learnable: bool, override_alpha: 
     // first fixed-rho root never reproduces its own collapse-prevention gates: the evidence-root
     // gate refresh alternates between two roots without end, so that fixture measures the gate
     // loop instead of finalization.
-    let term = configured_term(&z, Topo::Euclidean, mode, override_alpha);
+    let term = configured_term(&z, Topo::Euclidean, mode);
     let rho = SaeManifoldRho::new(3.0_f64.ln(), 0.0, vec![array![0.0]; k])
         .for_assignment(&term.assignment);
     stage("term built; fitting at fixed rho");
     let objective = fixed_rho_objective(&z, term, &rho);
     stage("fixed-rho fit returned");
 
-    let concentration = expected_concentration(learnable, override_alpha);
-    let learned = learnable && override_alpha.is_none();
+    let concentration = expected_concentration(learnable);
+    let learned = learnable;
     let rho_before = objective.current_rho.clone();
     assert_eq!(
         rho_before.sparse_flat_index().is_some(),
@@ -193,12 +179,8 @@ fn assert_finalization_preserves_the_objective(learnable: bool, override_alpha: 
         "{label}: the certified rho coordinates must leave finalization unchanged"
     );
     assert_eq!(
-        (
-            fitted.rho.assignment_strength_layout,
-            fitted.term.assignment.ordered_beta_bernoulli_alpha_override,
-        ),
-        (rho_before.assignment_strength_layout, override_alpha),
-        "{label}: finalization must rewrite neither the layout nor the override"
+        fitted.rho.assignment_strength_layout, rho_before.assignment_strength_layout,
+        "{label}: finalization must not rewrite the layout"
     );
     assert!(
         matches!(
@@ -279,55 +261,42 @@ fn assert_finalization_preserves_the_objective(learnable: bool, override_alpha: 
         "{label}: into_fitted must carry the certified criterion"
     );
 
-    if override_alpha.is_none() {
-        // `ManifoldSaePayload` stores the request's `alpha` and `learnable_alpha` beside the
-        // returned `log_lambda_sparse`, and frozen-decoder OOS rebuilds the mode and rho from
-        // exactly those scalars. The payload has no override field, so only the
-        // override-free fits round-trip through it.
-        let mut reloaded = fitted.term.assignment.clone();
-        reloaded.mode = AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, learnable);
-        let reloaded_rho = SaeManifoldRho::with_per_atom_smooth(
-            fitted.rho.log_lambda_sparse,
-            fitted.rho.log_lambda_smooth.clone(),
-            fitted.rho.log_ard.clone(),
-        )
-        .for_assignment(&reloaded);
-        let reloaded_prior = assignment_prior_value_weighted(&reloaded, &reloaded_rho, None)
-            .unwrap_or_else(|error| panic!("{label}: reloaded prior: {error}"));
-        eprintln!(
-            "[F06 {label}] reloaded prior={reloaded_prior:.12e} expected={prior_expected:.12e} \
-             persisted log_lambda_sparse={}",
-            fitted.rho.log_lambda_sparse
-        );
-        assert!(
-            relative_gap(reloaded_prior, prior_expected) <= 1.0e-12,
-            "{label}: the reloaded payload scores the prior as {reloaded_prior:.12e}, but the \
-             fit scored P(concentration {concentration}) = {prior_expected:.12e} (persisted \
-             log_lambda_sparse={})",
-            fitted.rho.log_lambda_sparse
-        );
-    }
+    // `ManifoldSaePayload` stores the request's `alpha` and `learnable_alpha` beside the
+    // returned `log_lambda_sparse`, and frozen-decoder OOS rebuilds the mode and rho from
+    // exactly those scalars.
+    let mut reloaded = fitted.term.assignment.clone();
+    reloaded.mode = AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, learnable);
+    let reloaded_rho = SaeManifoldRho::with_per_atom_smooth(
+        fitted.rho.log_lambda_sparse,
+        fitted.rho.log_lambda_smooth.clone(),
+        fitted.rho.log_ard.clone(),
+    )
+    .for_assignment(&reloaded);
+    let reloaded_prior = assignment_prior_value_weighted(&reloaded, &reloaded_rho, None)
+        .unwrap_or_else(|error| panic!("{label}: reloaded prior: {error}"));
+    eprintln!(
+        "[F06 {label}] reloaded prior={reloaded_prior:.12e} expected={prior_expected:.12e} \
+         persisted log_lambda_sparse={}",
+        fitted.rho.log_lambda_sparse
+    );
+    assert!(
+        relative_gap(reloaded_prior, prior_expected) <= 1.0e-12,
+        "{label}: the reloaded payload scores the prior as {reloaded_prior:.12e}, but the \
+         fit scored P(concentration {concentration}) = {prior_expected:.12e} (persisted \
+         log_lambda_sparse={})",
+        fitted.rho.log_lambda_sparse
+    );
     stage("done");
 }
 
 #[test]
 fn fixed_alpha_finalizes_without_changing_the_objective_2933() {
-    assert_finalization_preserves_the_objective(false, None);
-}
-
-#[test]
-fn overridden_fixed_alpha_finalizes_without_changing_the_objective_2933() {
-    assert_finalization_preserves_the_objective(false, Some(OVERRIDE_ALPHA));
+    assert_finalization_preserves_the_objective(false);
 }
 
 #[test]
 fn learnable_alpha_finalizes_and_reloads_its_fitted_concentration_2933() {
-    assert_finalization_preserves_the_objective(true, None);
-}
-
-#[test]
-fn overridden_learnable_alpha_finalizes_at_the_override_concentration_2933() {
-    assert_finalization_preserves_the_objective(true, Some(OVERRIDE_ALPHA));
+    assert_finalization_preserves_the_objective(true);
 }
 
 /// #2933 F45 — the outer objective owns the flat layout, and a fit whose concentration is
@@ -338,10 +307,9 @@ fn overridden_learnable_alpha_finalizes_at_the_override_concentration_2933() {
 fn fixed_concentration_fits_expose_no_sparse_coordinate_2933() {
     let z = planted_circle_embedded(24, 4, 0.03);
     let k = 2;
-    for (learnable, override_alpha) in [(true, None), (false, None), (true, Some(OVERRIDE_ALPHA))]
-    {
+    for learnable in [true, false] {
         let mode = AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, learnable);
-        let term = configured_term(&z, Topo::Circle, mode, override_alpha);
+        let term = configured_term(&z, Topo::Circle, mode);
         let objective = SaeManifoldOuterObjective::new(
             term,
             z.clone(),
@@ -352,64 +320,63 @@ fn fixed_concentration_fits_expose_no_sparse_coordinate_2933() {
             1.0e-6,
             1.0e-6,
         );
-        let learned = learnable && override_alpha.is_none();
         assert_eq!(
             objective.baseline_rho.sparse_flat_index().is_some(),
-            learned,
-            "learnable_alpha={learnable}, override={override_alpha:?}: the objective must carry \
-             a sparse coordinate exactly while the concentration is learned"
+            learnable,
+            "learnable_alpha={learnable}: the objective must carry a sparse coordinate exactly \
+             while the concentration is learned"
         );
         assert_eq!(
             objective.baseline_rho.flat_coordinates().len(),
-            usize::from(learned) + 2 * k,
-            "learnable_alpha={learnable}, override={override_alpha:?}: flat layout is \
-             sparse + K smoothness + K ARD"
+            usize::from(learnable) + 2 * k,
+            "learnable_alpha={learnable}: flat layout is sparse + K smoothness + K ARD"
         );
     }
 }
 
-/// A rho bound for one effective concentration is refused, not silently rebound, once the
-/// assignment disagrees: an override installed after binding removes the coordinate the flat
-/// layout still carries, and clearing it restores one the layout lacks. The unbound constructor
-/// tag and a correctly bound layout are admitted.
+/// A rho bound for one concentration kind is refused, not silently rebound, by an assignment of
+/// the other kind: a layout bound for a learnable concentration carries a coordinate the fixed
+/// prior lacks, and the reverse. The unbound constructor tag and a correctly bound layout are
+/// admitted.
 #[test]
-fn a_layout_contradicting_the_effective_concentration_is_refused_2933() {
-    let mut assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        Array2::<f64>::zeros((3, 2)),
-        vec![Array2::<f64>::zeros((3, 1)); 2],
-        vec![LatentManifold::Euclidean; 2],
-        AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, true),
-    )
-    .expect("zero logits and matching coordinate blocks build an assignment");
+fn a_layout_contradicting_the_concentration_is_refused_2933() {
+    let assignment_for = |mode: AssignmentMode| {
+        SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 2)),
+            vec![Array2::<f64>::zeros((3, 1)); 2],
+            vec![LatentManifold::Euclidean; 2],
+            mode,
+        )
+        .expect("zero logits and matching coordinate blocks build an assignment")
+    };
+    let learnable =
+        assignment_for(AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, true));
+    let fixed_concentration =
+        assignment_for(AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, FIXED_ALPHA, false));
     let unbound = SaeManifoldRho::new(0.0, 0.0, vec![Array1::zeros(1); 2]);
-    let learned = unbound.clone().for_assignment(&assignment);
-    assignment
+    let learned = unbound.clone().for_assignment(&learnable);
+    let fixed = unbound.clone().for_assignment(&fixed_concentration);
+    learnable
         .validate_rho_domain(&learned)
         .expect("a layout bound for the learnable concentration is admitted");
-    assignment.set_ordered_beta_bernoulli_alpha_override(Some(OVERRIDE_ALPHA));
-    let refusal = assignment
-        .validate_rho_domain(&learned)
-        .expect_err("an override installed after binding must be refused");
-    assert!(refusal.contains("#2933 F45"), "{refusal}");
-    let fixed = unbound.clone().for_assignment(&assignment);
-    assignment
+    fixed_concentration
         .validate_rho_domain(&fixed)
-        .expect("a layout bound after the override is admitted");
-    assignment
-        .validate_rho_domain(&unbound)
-        .expect("the unbound constructor layout is admitted");
-    assignment.set_ordered_beta_bernoulli_alpha_override(None);
-    assert!(
-        assignment.validate_rho_domain(&fixed).is_err(),
-        "clearing the override restores a coordinate the fixed layout lacks"
-    );
-    let softmax = SaeAssignment::from_blocks_with_mode_and_manifolds(
-        Array2::<f64>::zeros((3, 2)),
-        vec![Array2::<f64>::zeros((3, 1)); 2],
-        vec![LatentManifold::Euclidean; 2],
-        AssignmentMode::softmax(TEMPERATURE),
-    )
-    .expect("zero logits and matching coordinate blocks build an assignment");
+        .expect("a layout bound for the fixed concentration is admitted");
+    for (assignment, rho, what) in [
+        (&fixed_concentration, &learned, "a learnable layout under a fixed concentration"),
+        (&learnable, &fixed, "a fixed layout under a learnable concentration"),
+    ] {
+        let refusal = assignment
+            .validate_rho_domain(rho)
+            .expect_err(&format!("{what} must be refused"));
+        assert!(refusal.contains("#2933 F45"), "{what}: {refusal}");
+    }
+    for assignment in [&learnable, &fixed_concentration] {
+        assignment
+            .validate_rho_domain(&unbound)
+            .expect("the unbound constructor layout is admitted");
+    }
+    let softmax = assignment_for(AssignmentMode::softmax(TEMPERATURE));
     assert!(
         softmax.validate_rho_domain(&fixed).is_err(),
         "an ordered Beta--Bernoulli layout does not describe a softmax assignment"
@@ -417,14 +384,14 @@ fn a_layout_contradicting_the_effective_concentration_is_refused_2933() {
 }
 
 /// A fixed concentration puts no coordinate into the prior, so both log-strength trace routes
-/// are exactly zero for the fixed mode and for an override-pinned learnable mode. The
-/// learnable control at the same concentration (`ρ_sparse = 0`, base `OVERRIDE_ALPHA`) scores
+/// are exactly zero for the fixed mode. The learnable control at the same concentration
+/// (`ρ_sparse = 0`, base `FIXED_ALPHA`) scores
 /// the same objective on the same converged cache and must keep a live trace, so the zeros
 /// are not a trace function that returns nothing.
 #[test]
 fn fixed_concentration_log_strength_traces_are_exact_zeros_2933() {
     let (mut twin, target, mut rho) = gamma_fd_tiny_fixture();
-    twin.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, OVERRIDE_ALPHA, false);
+    twin.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, FIXED_ALPHA, false);
     rho.log_lambda_sparse = 0.0;
     let (_value, _loss, cache) = twin
         .penalized_quasi_laplace_criterion_with_cache(
@@ -437,13 +404,8 @@ fn fixed_concentration_log_strength_traces_are_exact_zeros_2933() {
             1.0e-6,
         )
         .expect("converged cache for the fixed-concentration twin");
-    let mut pinned = twin.clone();
-    pinned.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, BASE_ALPHA, true);
-    pinned
-        .assignment
-        .set_ordered_beta_bernoulli_alpha_override(Some(OVERRIDE_ALPHA));
     let mut control = twin.clone();
-    control.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, OVERRIDE_ALPHA, true);
+    control.assignment.mode = AssignmentMode::ordered_beta_bernoulli(0.7, FIXED_ALPHA, true);
 
     let solver = DeflatedArrowSolver::plain(&cache);
     let k_border = cache.k;
@@ -481,75 +443,62 @@ fn fixed_concentration_log_strength_traces_are_exact_zeros_2933() {
         "the learnable control must keep a live log-concentration trace: dense \
          {control_dense:.6e}, from probes {control_probed:.6e}"
     );
-    for (label, term) in [("fixed twin", &twin), ("override-pinned learnable", &pinned)] {
-        assert_eq!(traces(term), (0.0, 0.0), "{label}");
-    }
+    assert_eq!(traces(&twin), (0.0, 0.0), "fixed twin");
 }
 
-/// The typed resolution names, for all four configurations, the concentration the prior uses
-/// and whether `log_lambda_sparse` carries it.
+/// The typed resolution names, for both configurations, the concentration the prior uses and
+/// whether `log_lambda_sparse` carries it.
 #[test]
 fn prior_parameters_name_the_concentration_and_its_learnability_2933() {
     for learnable in [false, true] {
-        for override_alpha in [None, Some(OVERRIDE_ALPHA)] {
-            let mut assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
-                Array2::<f64>::zeros((3, 2)),
-                vec![Array2::<f64>::zeros((3, 1)); 2],
-                vec![LatentManifold::Euclidean; 2],
-                AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, learnable),
-            )
-            .expect("zero logits and matching coordinate blocks build an assignment");
-            assignment.set_ordered_beta_bernoulli_alpha_override(override_alpha);
-            let rho = SaeManifoldRho::new(3.0_f64.ln(), 0.0, vec![Array1::zeros(1); 2])
-                .for_assignment(&assignment);
-            let parameters = assignment
-                .ordered_beta_bernoulli_prior_parameters(&rho)
-                .expect("rho = ln 3 is inside every configuration's domain")
-                .expect("an ordered Beta--Bernoulli mode resolves prior parameters");
-            let concentration = expected_concentration(learnable, override_alpha);
-            let label = format!("learnable_alpha={learnable}, override={override_alpha:?}");
-            assert!(
-                relative_gap(parameters.concentration, concentration) <= 1.0e-14,
-                "{label}: concentration {} != {concentration}",
-                parameters.concentration
-            );
-            assert_eq!(
-                parameters.concentration_is_learnable,
-                learnable && override_alpha.is_none(),
-                "{label}"
-            );
-        }
+        let assignment = SaeAssignment::from_blocks_with_mode_and_manifolds(
+            Array2::<f64>::zeros((3, 2)),
+            vec![Array2::<f64>::zeros((3, 1)); 2],
+            vec![LatentManifold::Euclidean; 2],
+            AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, learnable),
+        )
+        .expect("zero logits and matching coordinate blocks build an assignment");
+        let rho = SaeManifoldRho::new(3.0_f64.ln(), 0.0, vec![Array1::zeros(1); 2])
+            .for_assignment(&assignment);
+        let parameters = assignment
+            .ordered_beta_bernoulli_prior_parameters(&rho)
+            .expect("rho = ln 3 is inside every configuration's domain")
+            .expect("an ordered Beta--Bernoulli mode resolves prior parameters");
+        let concentration = expected_concentration(learnable);
+        let label = format!("learnable_alpha={learnable}");
+        assert!(
+            relative_gap(parameters.concentration, concentration) <= 1.0e-14,
+            "{label}: concentration {} != {concentration}",
+            parameters.concentration
+        );
+        assert_eq!(parameters.concentration_is_learnable, learnable, "{label}");
     }
 }
 
 /// `(sparse target and upper face when present, whole upper face)` of the reactive entry box
 /// for one ordered Beta--Bernoulli configuration on a fixed Euclidean fixture.
-fn reactive_sparse_face(
-    mode: AssignmentMode,
-    override_alpha: Option<f64>,
-) -> (Option<(f64, f64)>, Array1<f64>) {
+fn reactive_sparse_face(mode: AssignmentMode) -> (Option<(f64, f64)>, Array1<f64>) {
     let z = planted_circle_embedded(24, 4, 0.03);
     let k = 2;
-    let term = configured_term(&z, Topo::Euclidean, mode, override_alpha);
+    let term = configured_term(&z, Topo::Euclidean, mode);
     let rho = SaeManifoldRho::new(0.01_f64.ln(), 0.0, vec![array![0.0]; k])
         .for_assignment(&term.assignment);
     let upper = super::outer_objective::reactive_rho_domain_upper(&term, &rho, TEMPERATURE)
-        .unwrap_or_else(|error| panic!("reactive box for override={override_alpha:?}: {error}"));
+        .unwrap_or_else(|error| panic!("reactive box for {mode:?}: {error}"));
     let face = rho
         .sparse_flat_index()
         .map(|index| (rho.flat_coordinates()[index], upper[index]));
     (face, upper)
 }
 
-/// The reactive entry box follows the layout. An override-pinned learnable mode and its
-/// fixed-concentration twin define one objective with no sparse coordinate, so they receive
-/// one box. The learnable mode without an override, which keeps the native-curvature cap on
-/// its concentration coordinate, shows that the cap is live on this fixture.
+/// The reactive entry box follows the layout. A fixed concentration has no sparse coordinate,
+/// so its box has no sparse face and one entry per smoothness and ARD coordinate. The learnable
+/// mode, which keeps the native-curvature cap on its concentration coordinate, shows that the
+/// cap is live on this fixture.
 #[test]
-fn overridden_learnable_alpha_reactive_box_matches_the_fixed_twin_2933() {
-    let (control_face, _) = reactive_sparse_face(
+fn fixed_alpha_reactive_box_has_no_sparse_face_2933() {
+    let (control_face, control_box) = reactive_sparse_face(
         AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, true),
-        None,
     );
     let (control_target, control_face) =
         control_face.expect("a learnable concentration owns the sparse coordinate");
@@ -558,19 +507,15 @@ fn overridden_learnable_alpha_reactive_box_matches_the_fixed_twin_2933() {
         "the native-curvature cap must be live on this fixture: sparse target \
          {control_target:.6}, capped face {control_face:.6}"
     );
-    let (twin_face, twin_box) = reactive_sparse_face(
-        AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, OVERRIDE_ALPHA, false),
-        None,
-    );
-    let (pinned_face, pinned_box) = reactive_sparse_face(
-        AssignmentMode::ordered_beta_bernoulli(TEMPERATURE, BASE_ALPHA, true),
-        Some(OVERRIDE_ALPHA),
-    );
-    assert_eq!(twin_face, None, "a fixed concentration has no sparse face");
-    assert_eq!(pinned_face, None, "an override-pinned concentration has no sparse face");
+    let (fixed_face, fixed_box) = reactive_sparse_face(AssignmentMode::ordered_beta_bernoulli(
+        TEMPERATURE,
+        FIXED_ALPHA,
+        false,
+    ));
+    assert_eq!(fixed_face, None, "a fixed concentration has no sparse face");
     assert_eq!(
-        pinned_box, twin_box,
-        "override-pinned learnable mode and its fixed twin define one objective and must \
-         receive one reactive box"
+        fixed_box.len() + 1,
+        control_box.len(),
+        "the fixed box drops exactly the sparse coordinate"
     );
 }

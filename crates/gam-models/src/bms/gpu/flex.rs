@@ -4,8 +4,8 @@ use std::sync::OnceLock;
 
 use gam_gpu::gpu_error::GpuError;
 use gam_gpu::{
-    GpuDecision, GpuDispatchPolicy, GpuKernel, RowKernelAdmission, RuntimeDeviceProbe,
-    decide_row_kernel,
+    GpuDecision, GpuDispatchPolicy, GpuKernel, RowKernelAdmission, RowKernelSize,
+    RuntimeDeviceProbe, decide_row_kernel,
 };
 
 use crate::bms::LatentIntegral;
@@ -83,9 +83,11 @@ pub(crate) fn row_primary_hessian_decision(
             kernel: GpuKernel::MarginalSlopeRows,
             missing_capability: BMS_FLEX_ROW_KERNEL_CAPABILITY.missing_for(model),
             compiled: BmsFlexGpuBackend::compiled(),
-            rows: n,
-            floor: GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N,
-            threshold: |device| device.row_kernel_min_n,
+            size: RowKernelSize::DispatchThreshold {
+                rows: n,
+                floor: GpuDispatchPolicy::MIN_CALIBRATABLE_ROW_KERNEL_N,
+                threshold: |device| device.row_kernel_min_n,
+            },
         },
         &mut RuntimeDeviceProbe,
     )

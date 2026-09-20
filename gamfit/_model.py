@@ -176,7 +176,9 @@ class Model:
             Single uncertainty knob. ``None`` returns the point prediction(s)
             only. A float in ``(0, 1)`` (e.g. ``0.95``) requests the full
             uncertainty decomposition at that pointwise coverage; the output
-            gains ``posterior_mean_standard_error``,
+            gains ``linear_predictor_standard_error`` (the posterior SD of η),
+            ``posterior_mean_standard_error`` (the posterior SD of the
+            response, from the same η integral as ``posterior_mean``),
             ``posterior_mean_lower``, and ``posterior_mean_upper`` columns
             alongside ``linear_predictor_plugin`` / ``mean_plugin`` /
             ``posterior_mean``. On survival models it
@@ -276,8 +278,10 @@ class Model:
               ``linear_predictor_plugin`` (``X·beta_hat``), ``mean_plugin``
               (its inverse-link image), and ``posterior_mean`` (the default
               response-scale point prediction). When ``interval`` is set it
-              adds ``posterior_mean_standard_error`` plus
-              ``posterior_mean_lower`` / ``posterior_mean_upper``.
+              adds ``linear_predictor_standard_error`` (``SE(η)``),
+              ``posterior_mean_standard_error`` (``√Var[link^{-1}(η)]``) plus
+              ``posterior_mean_lower`` / ``posterior_mean_upper`` (the
+              inverse link of the η credible quantiles).
               When the requested table container is ``"dict"``, the return is
               a ``PredictionResult``: it supports normal mapping access
               (``pred["posterior_mean"]``) and column attributes
@@ -448,6 +452,48 @@ class Model:
             training_kind=self._training_table_kind,
         )
 
+    def latent_conditional_residual(
+        self,
+        data: Any,
+        *,
+        return_type: str | None = None,
+        id_column: str | None = None,
+    ) -> Any:
+        """Evaluate the conditional latent residual ``(z - m(a)) / sqrt(v(a))``.
+
+        This method is defined for marginal-slope models fitted with a
+        conditional latent law (``latent_measure="conditional-location-scale"``).
+        It applies the map the fit applied to its own score, so at the
+        training rows it returns the fit's standardized score bit for bit, and
+        on new rows it returns the residual a held-out adequacy check compares
+        with the training residual law. The rows need the score column and the
+        conditioning covariates; a survival model's time columns are not read.
+
+        Returns ``None`` when the fit consumed no conditional latent law. By
+        default the residual is a one-dimensional NumPy array;
+        ``return_type=`` or ``id_column=`` requests a one-column table named
+        ``residual`` (plus the requested identifier).
+        """
+        headers, rows, table_kind = normalize_table(data)
+        row_ids = extract_row_ids(headers, rows, id_column)
+        try:
+            residual = rust_module().latent_conditional_residual_table(
+                self._prediction_model, headers, rows
+            )
+        except Exception as exc:
+            raise map_exception(exc) from exc
+        if residual is None or (return_type is None and id_column is None):
+            return residual
+        columns: dict[str, list[Any]] = {"residual": residual.tolist()}
+        if id_column is not None:
+            columns = {id_column: list(row_ids or []), **columns}
+        return restore_output_table(
+            columns,
+            requested=return_type,
+            input_kind=table_kind,
+            training_kind=self._training_table_kind,
+        )
+
     def predict_array(
         self,
         X: Any,
@@ -545,8 +591,9 @@ class Model:
 
         Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
         ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
-        binomial): ``1``. ``None`` only for a custom family that declares no
-        dispersion.
+        binomial): ``1``. ``None`` exactly when the family's scale contract
+        has no scalar dispersion: a custom family that declares none, or
+        Royston-Parmar survival.
         """
         return self.summary().scale
 
@@ -667,12 +714,11 @@ class Model:
     def smooth_significance(self, data: Any) -> list[dict[str, Any]]:
         """Per-term likelihood-ratio significance for every penalized smooth (#1063).
 
-        :meth:`summary` reports Wood's rank-truncated *Wald* statistic
-        :math:`T = \\hat\\beta'\\hat\\Sigma^- \\hat\\beta`. The exact Lawley /
-        Bartlett factor corrects the *likelihood-ratio* statistic, and under
-        penalization the Wald form is already a weighted :math:`\\chi^2` whose
-        second-order mean is not :math:`d + \\Delta\\varepsilon`, so dividing
-        :math:`T` by the LR factor would correct the wrong statistic. This method
+        :meth:`summary` reports a variance-component *score* statistic. The
+        exact Lawley / Bartlett factor corrects the *likelihood-ratio*
+        statistic, and a score statistic's second-order mean is not
+        :math:`d + \\Delta\\varepsilon`, so dividing it by the LR factor would
+        correct the wrong statistic. This method
         instead computes a genuine per-term LR statistic
         :math:`W = 2(\\ell_{\\text{full}} - \\ell_{\\text{null}})` by a
         constrained fit that fixes the smooth's coefficients at zero while
@@ -1812,8 +1858,8 @@ class MultinomialModel:
         """Wood rank-truncated Wald smooth-term significance table (#1101).
 
         One row per ``(active class, smooth term)`` with keys ``class``,
-        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` — the same
-        kernel the scalar :meth:`Model.summary` smooth-term p-values use. Empty
+        ``term``, ``edf``, ``ref_df``, ``statistic``, ``p_value`` from the Wood
+        rank-truncated Wald kernel. Empty
         when the model has no smooth terms or no stored covariance.
         """
         try:

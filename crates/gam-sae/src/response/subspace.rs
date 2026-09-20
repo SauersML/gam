@@ -97,9 +97,7 @@
 //! - the means' and the metric products' errors;
 //! - the term's own roundings.
 //!
-//! The pass adds `γ_{2h+1}` of its absolute terms, and `E = V(I) − V(P)` is their [`signed_sum`]. Every pair kernel
-//! that fell back to the certified bivariate normal route is counted: [`FrameGradient::orthant_fallbacks`] reports
-//! the count, and each pass that met one logs the count and its fraction of the pass.
+//! The pass adds `γ_{2h+1}` of its absolute terms, and `E = V(I) − V(P)` is their [`signed_sum`].
 
 use super::reader_gram::{ReaderGram, ReaderGramError, fill_upper_rows, upper_tile_rows};
 use faer::Side;
@@ -212,9 +210,6 @@ pub struct FrameGradient {
     /// `∇_Q V = 2 (I − Q Qᵀ) Wᵀ B(P) W Q`, a `d × k` horizontal tangent: the ascent direction of `V` and the descent
     /// direction of `E`.
     pub horizontal_gradient: Array2<f64>,
-    /// How many of the pass's `h (h + 1)/2` pair kernels fell back to the certified bivariate normal route
-    /// ([`PairKernel::orthant_fallback`]), the pass's cost receipt.
-    pub orthant_fallbacks: usize,
 }
 
 /// An energy together with a bound on its absolute error: the vocabulary every producer of a variance in `response/`
@@ -348,13 +343,6 @@ pub struct KnownBlock {
     total_variance: BandedEnergy,
 }
 
-/// One pair pass's result: `Σ_jk D_jk [K_σ − m_j m_k]` with its band, and the pass's orthant fallbacks.
-#[derive(Debug, Clone, Copy)]
-struct PassEnergy {
-    energy: BandedEnergy,
-    orthant_fallbacks: usize,
-}
-
 /// The per-unit data every pair term reads.
 #[derive(Debug, Clone)]
 struct BlockUnits {
@@ -477,9 +465,7 @@ impl KnownBlock {
             metric_error_scale,
             slope_bound,
         };
-        let total_variance = units
-            .pair_pass(units.readers.view(), CoordinateFormation::Copied, None)?
-            .energy;
+        let total_variance = units.pair_pass(units.readers.view(), CoordinateFormation::Copied, None)?;
         Ok(Self {
             units,
             total_variance,
@@ -586,14 +572,13 @@ impl KnownBlock {
     pub fn explained_variance(&self, frame: ArrayView2<'_, f64>) -> Result<BandedEnergy, ResponseError> {
         let defect = require_frame(self.input_dim(), frame)?;
         let coordinates = fast_ab(&self.units.readers, &frame);
-        let pass = self.units.pair_pass(
+        self.units.pair_pass(
             coordinates.view(),
             CoordinateFormation::FrameProducts {
                 frame_defect: defect,
             },
             None,
-        )?;
-        Ok(pass.energy)
+        )
     }
 
     /// R4 on a coordinate frame: `V(P_S)` for the projector onto the input coordinates `retained`, given strictly
@@ -607,10 +592,8 @@ impl KnownBlock {
             }
         }
         let coordinates = self.units.readers.select(Axis(1), retained);
-        let pass = self
-            .units
-            .pair_pass(coordinates.view(), CoordinateFormation::Copied, None)?;
-        Ok(pass.energy)
+        self.units
+            .pair_pass(coordinates.view(), CoordinateFormation::Copied, None)
     }
 
     /// R4: `E(P) = V(I) − V(P)`, the error of discarding the input outside `frame`, with its band.
@@ -638,10 +621,9 @@ impl KnownBlock {
         let in_frame = fast_atb(&frame, &ambient);
         let horizontal_gradient = (&ambient - &fast_ab(&frame, &in_frame)) * 2.0;
         Ok(FrameGradient {
-            explained_variance: pass.energy,
-            discarded_error: signed_sum(&[self.total_variance], &[pass.energy]),
+            explained_variance: pass,
+            discarded_error: signed_sum(&[self.total_variance], &[pass]),
             horizontal_gradient,
-            orthant_fallbacks: pass.orthant_fallbacks,
         })
     }
 
@@ -709,7 +691,7 @@ fn require_metric(output_dim: usize, metric: ArrayView2<'_, f64>) -> Result<(), 
 impl BlockUnits {
     /// One tiled pass over the unit pairs `j ≤ k` for reader coordinates `coordinates` (`h × c`, with covariance
     /// `r_jk = coordinates_j · coordinates_k`). It returns `Σ_jk D_jk [K_σ − m_j m_k]` with its band
-    /// ([`pair_term`](Self::pair_term)) and its orthant fallbacks, formed as
+    /// ([`pair_term`](Self::pair_term)), formed as
     /// `Σ_j (D_jj [K_jj − m_j²] + 2 Σ_{k>j} D_jk [K_jk − m_j m_k])` because `D` and the pair law are symmetric. When
     /// `weighted_coordinates` is given it writes `B R` into it (`h × c`, with `B_jk = D_jk ∂_r K_σ`, symmetric by
     /// construction): row `j` is `Σ_{k≥j} B_jk R_k + Σ_{i<j} B_ij R_i`. The tiles are the reader Gram's own
@@ -720,7 +702,7 @@ impl BlockUnits {
         coordinates: ArrayView2<'_, f64>,
         formation: CoordinateFormation,
         mut weighted_coordinates: Option<&mut Array2<f64>>,
-    ) -> Result<PassEnergy, ResponseError> {
+    ) -> Result<BandedEnergy, ResponseError> {
         let (width, terms) = coordinates.dim();
         let input_dim = self.readers.ncols();
         let coordinate_norms: Array1<f64> = coordinates
@@ -837,21 +819,10 @@ impl BlockUnits {
             }
         }
         let total = unit_sums.iter().fold(RowSum::default(), |total, row| total.plus(*row));
-        let pairs = width * (width + 1) / 2;
-        if total.orthant_fallbacks > 0 {
-            log::debug!(
-                "retained-response pair pass (#2946): {} of {pairs} pair kernels took the certified orthant route ({:.3e} of the pass)",
-                total.orthant_fallbacks,
-                total.orthant_fallbacks as f64 / pairs as f64,
-            );
-        }
         // Each term enters at most `2h + 1` additions: its row's off-diagonal sum, the diagonal, and the unit fold.
-        Ok(PassEnergy {
-            energy: BandedEnergy {
-                value: total.value,
-                band: total.band + accumulation_growth(2 * width + 1) * total.absolute,
-            },
-            orthant_fallbacks: total.orthant_fallbacks,
+        Ok(BandedEnergy {
+            value: total.value,
+            band: total.band + accumulation_growth(2 * width + 1) * total.absolute,
         })
     }
 
@@ -891,7 +862,6 @@ impl BlockUnits {
             value: term,
             absolute: term.abs(),
             band,
-            orthant_fallbacks: usize::from(moments.orthant_fallback),
         })
     }
 
@@ -917,13 +887,12 @@ impl BlockUnits {
     }
 }
 
-/// One unit row's running sum in a pair pass: the value, its absolute sum and band, and its orthant fallbacks.
+/// One unit row's running sum in a pair pass: the value, its absolute sum and band.
 #[derive(Debug, Clone, Copy, Default)]
 struct RowSum {
     value: f64,
     absolute: f64,
     band: f64,
-    orthant_fallbacks: usize,
 }
 
 impl RowSum {
@@ -932,7 +901,6 @@ impl RowSum {
             value: self.value + other.value,
             absolute: self.absolute + other.absolute,
             band: self.band + other.band,
-            orthant_fallbacks: self.orthant_fallbacks + other.orthant_fallbacks,
         }
     }
 
@@ -942,7 +910,6 @@ impl RowSum {
             value: 2.0 * self.value,
             absolute: 2.0 * self.absolute,
             band: 2.0 * self.band,
-            orthant_fallbacks: self.orthant_fallbacks,
         }
     }
 }

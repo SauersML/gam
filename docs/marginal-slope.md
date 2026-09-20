@@ -393,6 +393,19 @@ on its own axis:
    defined where contexts tie, so the law, the anchor and the prediction are
    continuous in the covariates everywhere.
 
+   Where a moment moves the law is chosen among nested arms, simplest first:
+   the Gaussian law, the location-scale law `m(a) + √v(a)·ε` with a Gaussian
+   `ε`, the same with `ε` on its estimated law, and the local laws. An arm
+   that anchors on a Gaussian residual (the score for the Gaussian arm, `ε`
+   for the location-scale Gaussian arm) is a candidate only if that residual
+   passes the standard-normal adequacy screen. The fit is solved on the
+   simplest candidate of the location-scale structure, and at the converged
+   fit the certificate takes the simplest candidate whose cross-fitted
+   excess anchoring loss is within one paired standard error of the lowest
+   candidate's, re-solving on it when it is another arm. A heavy-tailed or
+   skewed `ε` therefore anchors on its estimated law even where the
+   cross-fitted loss does not resolve the Gaussian arm from it.
+
 The conditional test comes first because a score can be exactly `N(0, 1)`
 overall while every conditional law `z | a` is shifted. One pooled law then
 puts `b(a)·E[z|a]` into `q` and the marginal coefficients are wrong, and no

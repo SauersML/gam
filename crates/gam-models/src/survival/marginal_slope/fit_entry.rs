@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::fit_orchestration::FitFailure;
+use crate::inference::predict_io::FittedLatentScoreMap;
 use std::cell::Cell;
 use crate::latent_law_compression::{CompressedLaw, DesignPoint, default_design};
 
@@ -172,6 +173,34 @@ pub(crate) struct SurvivalClosedFormFallback {
     hints: ThetaHints,
 }
 
+/// Seeds the one-step non-rigid pilot's `[time, marginal, slope]` coefficients
+/// (#808, #2627) into each of those blocks `hints` does not already carry, and
+/// returns which it seeded. A re-solve's hints carry its converged fit's mode
+/// (gam#2926), which is the nearby problem's operating point, so a carried block
+/// keeps it; the pilot seeds a block the re-solve drops and every block of a
+/// fresh fit. A seed that is not finite, or whose width is not its current
+/// design's (#374), is not installed.
+pub(crate) fn seed_uncarried_blocks(
+    hints: &mut ThetaHints,
+    pilot: [&Array1<f64>; 3],
+    widths: [usize; 3],
+) -> [bool; 3] {
+    let slots = [
+        &mut hints.time_beta,
+        &mut hints.marginal_beta,
+        &mut hints.slope_beta,
+    ];
+    let mut seeded = [false; 3];
+    for (block, slot) in slots.into_iter().enumerate() {
+        let seed = pilot[block];
+        if slot.is_none() && seed.len() == widths[block] && seed.iter().all(|v| v.is_finite()) {
+            *slot = Some(seed.clone());
+            seeded[block] = true;
+        }
+    }
+    seeded
+}
+
 /// One survival fit's outcome under its latent-law certificate.
 pub(crate) enum SurvivalCertifiedFit {
     Fitted(Box<SurvivalMarginalSlopeFitResult>),
@@ -219,12 +248,6 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         spec.age_entry
             .mapv(|entry| entry <= crate::survival::base::ENTRY_AT_ORIGIN_THRESHOLD),
     );
-    install_time_nullspace_shrinkage_penalty(
-        &mut spec.time_block,
-        spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
-        &entry_at_origin,
-    )
-    .map_err(FitFailure::invariant)?;
     let (z_standardized, z_normalization) = standardize_latent_z_matrix_with_policy(
         &spec.z,
         &spec.weights,
@@ -291,9 +314,10 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // step drops it #1082 while the certificate requires it #1449) — the
     // survival marginal-slope hang. Applied before the build so the flag is
     // frozen into `joint_specs` and honoured by every subsequent probe / frozen
-    // / kappa rebuild. Mirrors the time block's
-    // `install_time_nullspace_shrinkage_penalty`, via the ordinary builder so
-    // the layered penalty representation stays self-consistent.
+    // / kappa rebuild. Applied via the ordinary builder so the layered penalty
+    // representation stays self-consistent. The time block's affine null space
+    // is deliberately left unpenalized (gam#3003): it is the baseline's level
+    // and log-time slope, identified by `O(n_events)` curvature (gam#1076).
     for surface_spec in design_specs.iter_mut() {
         enable_surface_identifiability_double_penalty(surface_spec);
     }
@@ -534,8 +558,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                              the marginal conditioning block",
                         )
                     })?;
-                    let calibrated = cal
-                        .apply(raw_scores.column(col), a_block.view())
+                    let calibrated = FittedLatentScoreMap::conditional_only(cal)
+                        .calibrate(raw_scores.column(col), Some(a_block.view()))
                         .map_err(FitFailure::invariant)?;
                     spec.z.column_mut(col).assign(&calibrated);
                 }
@@ -992,17 +1016,30 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         }
         out
     };
+    // The time penalties act on the base columns and, with a time wiggle, on the
+    // warp's Jacobian at the baseline predictor, not on the design's zero
+    // placeholder tail. Seeds and the ρ domain are both read against that acting
+    // design (#3061).
+    let time_acting_exit = time_block_acting_exit_design(
+        &spec.time_block.design_exit,
+        spec.time_block.offset_exit.view(),
+        spec.timewiggle_block.as_ref(),
+    )
+    .map_err(FitFailure::input)?;
     let core_rho0_seed: Vec<f64> = {
         let mut seeds = Vec::with_capacity(
             time_penalties_len + marginal_design.penalties.len() + slope_design.penalties.len(),
         );
         // A seed refuses a design or penalty with no usable Gram scale, a
         // degenerate block the caller's data produced (#2937).
-        seeds.extend(block_log_lambda_seeds(
-            &spec.time_block.design_exit,
-            spec.time_block.penalties.iter(),
-        )
-        .map_err(FitFailure::input)?);
+        seeds.extend(
+            time_block_log_lambda_seeds(
+                &time_acting_exit,
+                &spec.time_block.penalties,
+                spec.timewiggle_block.as_ref().map_or(0, |wiggle| wiggle.ncols),
+            )
+            .map_err(FitFailure::input)?,
+        );
         seeds.extend(block_log_lambda_seeds(
             &marginal_design.design,
             marginal_design.penalties.iter().map(|bp| &bp.local),
@@ -1016,7 +1053,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         seeds
     };
     // The ρ domain per coordinate, in the layout the seeds above use: the time
-    // block's penalties against its exit design, the marginal and slope blocks
+    // block's penalties against its acting exit design, the marginal and slope blocks
     // against their own designs, the prepared extra blocks against theirs, and
     // the absorber's identity ridge against the residualized influence columns
     // it penalizes (#2812, #2902 item 15).
@@ -1024,7 +1061,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         let mut lower = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let mut upper = Vec::with_capacity(core_rho0_seed.len() + extra_rho0.len());
         let (lo, hi) = crate::fit_orchestration::drivers::penalized_block_rho_domain(
-            &spec.time_block.design_exit,
+            &time_acting_exit,
             spec.time_block.penalties.iter(),
         );
         lower.extend(lo);
@@ -1085,7 +1122,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         kappa_options,
     )?;
 
-    // A re-solve on the estimated law starts from the closed-form coefficients.
+    // A re-solve on another law starts from its converged fit's coefficients
+    // (gam#2926). That fit's mode is the nearby problem's operating point, so a
+    // block it carries is never reseeded: the one-step pilot below seeds only
+    // the blocks it drops, and the rigid pilot does not run.
+    let re_solve = fallback_hints.is_some();
     let hints = RefCell::new(fallback_hints.unwrap_or_default());
     // #808 operating-point warm start for the slope block. The inner
     // joint-Newton seeds each block at `spec.initial_beta` (→ `hints.slope_beta`
@@ -1099,11 +1140,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // so the converged β is the data optimum (zero bias; the slope estimand is
     // recovered, NOT dropped or pinned to zero). Width-guarded against any
     // slope design rebuild.
-    if pilot_slope_beta.len() == slope_design.design.ncols()
-        && pilot_slope_beta.iter().all(|v| v.is_finite())
-    {
-        hints.borrow_mut().slope_beta = Some(pilot_slope_beta.clone());
-    }
+    //
     // #2627 operating-point warm start for the time and marginal blocks — the
     // other half of the very same one-step joint Newton solve that produced
     // the slope seed above. Until now that half was computed, used to form
@@ -1136,20 +1173,26 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // a warm start that did not help.
     {
         let mut hints_mut = hints.borrow_mut();
-        let time_installed = pilot_time_beta.len() == spec.time_block.design_exit.ncols()
-            && pilot_time_beta.iter().all(|v| v.is_finite());
-        if time_installed {
-            hints_mut.time_beta = Some(pilot_time_beta.clone());
-        }
-        let marginal_installed = pilot_marginal_beta.len() == marginal_design.design.ncols()
-            && pilot_marginal_beta.iter().all(|v| v.is_finite());
-        if marginal_installed {
-            hints_mut.marginal_beta = Some(pilot_marginal_beta.clone());
-        }
+        let carried = [
+            hints_mut.time_beta.is_some(),
+            hints_mut.marginal_beta.is_some(),
+            hints_mut.slope_beta.is_some(),
+        ];
+        let [time_installed, marginal_installed, slope_installed] = seed_uncarried_blocks(
+            &mut hints_mut,
+            [&pilot_time_beta, &pilot_marginal_beta, &pilot_slope_beta],
+            [
+                spec.time_block.design_exit.ncols(),
+                marginal_design.design.ncols(),
+                slope_design.design.ncols(),
+            ],
+        );
         log::debug!(
             "[survival-marginal-slope/pilot] #2627 location warm start: \
              time_installed={time_installed} (len={} vs design_exit={}), \
              marginal_installed={marginal_installed} (len={} vs marginal={}), \
+             slope_installed={slope_installed}, \
+             re-solve carries [time, marginal, slope]={carried:?}, \
              |time_beta|_inf={:.6e}, |marginal_beta|_inf={:.6e}",
             pilot_time_beta.len(),
             spec.time_block.design_exit.ncols(),
@@ -1217,6 +1260,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     };
 
     let intercept_warm_starts = new_intercept_warm_start_cache(n);
+    let flex_jet_arenas = new_flex_jet_arena_pool();
     let initial_hyper_theta = setup.theta0();
     let family_coordinate_start = setup.rho_dim() + setup.log_kappa_dim();
     let baseline_axis_count = baseline_initial_theta.len();
@@ -1345,6 +1389,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             time_wiggle_degree: spec.timewiggle_block.as_ref().map(|w| w.degree),
             time_wiggle_ncols: derived_time_wiggle_ncols.unwrap_or(0),
             intercept_warm_starts: Some(Arc::clone(&intercept_warm_starts)),
+            flex_jet_arenas: Arc::clone(&flex_jet_arenas),
         };
         family.memoize_operator_backed_designs();
         Ok(family)
@@ -1607,6 +1652,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // evidence: the coupled objective remains non-concave at small n, and the
     // n=800 outer-gradient audit demonstrates that its one-step operating-point
     // hint can still lie outside every startup seed's basin.
+    //
+    // A re-solve is not a cold start either (gam#2926). It starts from its
+    // converged fit's mode, which the pilot would replace with the optimum of
+    // another problem (ρ = 0, no flex blocks), at the pilot's full cost (19.6 s
+    // at n = 10000). A block the re-solve drops (the slope, when the chosen arm
+    // reads another axis) keeps the one-step pilot's seed above, the #808
+    // device for exactly that block.
     let outer_cache_seed_available = options
         .cache_session
         .as_ref()
@@ -1655,6 +1707,11 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             log::debug!(
                 "[survival-marginal-slope/pilot] skip reason=unarmed-member-seeded n={n}: the \
                  coefficient hints hold the unarmed member's converged solve",
+            );
+        } else if re_solve {
+            log::debug!(
+                "[survival-marginal-slope/pilot] skip reason=re-solve-from-converged-fit n={n} \
+                 (gam#2926)",
             );
         } else {
             let pilot_started = std::time::Instant::now();
@@ -1821,7 +1878,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // the capability-query hooks (`outer_hyper_hessian_dense_available`, …)
         // reached from `custom_family_outer_derivatives` below, firing a bare
         // `assert!` panic that PyO3 re-raises as an opaque "panicked inside Rust
-        // boundary" GamError instead of an actionable message.
+        // boundary" GamfitError instead of an actionable message.
         crate::custom_family::validate_blockspecs(&initial_blocks).map_err(|reason| {
             FitFailure::invariant(format!(
                 "[survival-marginal-slope] assembled block specs invalid: {reason}"
@@ -1863,8 +1920,8 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
         // baseline-chart and learned log-σ axes, and between a chart and a design axis only through
         // the FLEX family program. The third derivatives have closed forms on the rigid frame for
         // design and chart axes but not for a learned log σ (gam#2765), and through the ζ
-        // composition of `timewiggle_third` for every time-wiggle frame it serves
-        // whose ψ coordinates are all design axes (gam#2893). Any other θ keeps the analytic
+        // composition of `timewiggle_third` for every time-wiggle frame it serves, on design axes
+        // (gam#2893) and baseline-chart axes (gam#3061). Any other θ keeps the analytic
         // gradient without declared curvature: declaring it would refuse every trial point that
         // asks for curvature.
         //
@@ -1907,8 +1964,7 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
                 && initial_family.psi_second_order_pairs_served(setup.log_kappa_dim())
                 && (!initial_family.joint_jeffreys_term_required()
                     || initial_family.rigid_psi_jeffreys_third_served()
-                    || (setup.auxiliary_dim() == 0
-                        && initial_family.timewiggle_zeta_available())));
+                    || initial_family.timewiggle_psi_jeffreys_third_served()));
         let analytic_joint_hessian_available = analytic_joint_derivatives_available
             && joint_hessian.is_analytic()
             && psi_curvature_exact;

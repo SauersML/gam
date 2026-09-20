@@ -17,6 +17,14 @@ const STRATUM_OFFSET: f64 = 3.0e4;
 const STRATUM_BOUNDARY: f64 = 2.0;
 const KEPT_RANK_INSIDE: usize = 56;
 const KEPT_RANK_ACROSS: usize = 55;
+// #2939's fit declared its size, as the custom-family plan does
+// (`with_problem_size(n_obs, p_total)`): 195,780 rows. Only `n` enters here, through the
+// criterion's resolution `τ_stat = 1/(2n)` that the cost-stall rule judges decreases by
+// (#3018). A plan that declares no size has no resolution, so no refused trial stalls
+// and its run ends on the solver's own terms. The coefficient count is charged only
+// against channels an evaluation publishes, and the fixture publishes none; a face
+// operator that keeps 56 eigenvalues has at least 56 coefficients.
+const STRATUM_ROWS: usize = 195_780;
 
 #[derive(Clone, Copy, Debug)]
 struct StratumFixture {
@@ -125,12 +133,14 @@ impl OuterObjective for RecordingStratum {
     }
 }
 
-/// The gradient-only plan #2939's fit ran, at production's default tolerance.
+/// The gradient-only plan #2939's fit ran, at production's default tolerance and the
+/// size it declared.
 fn stratum_problem() -> OuterProblem {
     OuterProblem::new(2)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable)
         .with_prefer_gradient_only(true)
+        .with_problem_size(STRATUM_ROWS, KEPT_RANK_INSIDE)
         .with_tolerance(OuterConfig::default().tolerance)
         .with_bounds(Array1::from_elem(2, -20.0), Array1::from_elem(2, 20.0))
         .with_initial_rho(array![0.0, 0.0])
@@ -215,15 +225,38 @@ fn a_search_pinned_at_its_rank_boundary_crosses_after_one_window_2939() {
                 && matches!(request.order, OuterEvalOrder::ValueAndGradient)
         })
         .expect("the seed crosses to rank 55");
-    let refused_before_crossing = requests[..crossing]
+    // The pinned search stops at its first run of refused trials, not escapes it: from
+    // the first refused trial to the crossing, every request is a refused rank-55
+    // trial. How many the line search spends before one of them promises no more than
+    // the incumbent's resolution is its own (#3018).
+    let first_refused = requests[..crossing]
         .iter()
-        .filter(|request| request.rank == KEPT_RANK_ACROSS)
-        .count();
-    assert_eq!(
-        refused_before_crossing, COST_STALL_WINDOW,
-        "the pinned rank-56 search must stop at its first window of refused trials, not \
-         escape it"
+        .position(|request| request.rank == KEPT_RANK_ACROSS)
+        .expect("the pinned search proposes rank-55 trials before it crosses");
+    assert!(
+        requests[first_refused..crossing]
+            .iter()
+            .all(|request| request.rank == KEPT_RANK_ACROSS
+                && matches!(request.order, OuterEvalOrder::Value)),
+        "the pinned rank-56 search must stop at its first run of refused trials, not escape \
+         it and search on: requests {first_refused}..{crossing}"
     );
+}
+
+/// The length of the last run of consecutive refused rank-55 requests: the run a
+/// rank-boundary halt stopped on.
+fn last_refused_run(requests: &[StratumRequest]) -> usize {
+    let mut current = 0usize;
+    let mut last = 0usize;
+    for request in requests {
+        if request.rank == KEPT_RANK_ACROSS {
+            current += 1;
+            last = current;
+        } else {
+            current = 0;
+        }
+    }
+    last
 }
 
 #[test]
@@ -246,11 +279,15 @@ fn a_rank_boundary_halt_publishes_typed_evidence_and_never_certifies_2939() {
     let error = outcome
         .expect_err("an incumbent pinned at its rank boundary outside the band must not certify");
     let message = error.to_string();
+    // The evidence counts the run of refused trials the halt stopped on (#3018).
+    let refused_trials = last_refused_run(&requests);
+    assert!(refused_trials > 0, "fixture premise: the search refused rank-55 trials");
     assert!(
         message.contains(&format!(
-            "rank_boundary=[kept_rank={KEPT_RANK_INSIDE}, refused_trials={COST_STALL_WINDOW}, band="
+            "rank_boundary=[kept_rank={KEPT_RANK_INSIDE}, refused_trials={refused_trials}, band="
         )),
-        "the refusal must carry the typed rank-boundary evidence: {message}"
+        "the refusal must carry the typed rank-boundary evidence of its run of \
+         {refused_trials} refused trials: {message}"
     );
     assert!(
         message.contains("claimed_converged=false"),
@@ -258,12 +295,32 @@ fn a_rank_boundary_halt_publishes_typed_evidence_and_never_certifies_2939() {
     );
 }
 
+/// The pinned search's refused trial on rank 55: its own criterion value and the
+/// resolution it carries (the value lane publishes no evidence). Asserts the premise
+/// that it lies resolvably above the incumbent, so the other rank is a wall here and
+/// not descent the seed loop could cross to.
+fn refused_wall_2939(guard: &CostStallGuard, refused: &Array1<f64>) -> (f64, f64) {
+    let fixture = StratumFixture {
+        cutoff: 0.05,
+        center0: 4.0,
+        across_shift: 3.0,
+    };
+    let value = fixture.eval(refused).cost;
+    let resolution = guard.value_resolution(value, &Default::default());
+    assert!(
+        value - guard.best_value() > guard.best_resolution() + resolution,
+        "fixture premise: the rank-55 trial at {value:.6e} lies above the incumbent at {:.6e}",
+        guard.best_value(),
+    );
+    (value, resolution)
+}
+
 /// A guard holding a non-stationary incumbent, the state a search pinned against its
 /// rank boundary reaches: its projected gradient is far outside the band.
 fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<f64>) {
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
     let config = stratum_problem().config();
-    let mut guard = CostStallGuard::new(1.0e-6, COST_STALL_WINDOW, &config, exit.clone());
+    let mut guard = CostStallGuard::new(1.0e-6, &config, exit.clone());
     let incumbent = array![1.99965, 0.4549];
     let fixture = StratumFixture {
         cutoff: 0.05,
@@ -278,7 +335,7 @@ fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<
          {:.3e}",
         guard.stationarity_band(),
     );
-    guard.observe_seed(&incumbent, eval.cost, residual);
+    guard.observe_seed(&incumbent, eval.cost, 1.0e-6, residual);
     (guard, exit, incumbent)
 }
 
@@ -286,23 +343,39 @@ fn pinned_guard() -> (CostStallGuard, Arc<Mutex<Option<CostStallExit>>>, Array1<
 fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
     let (mut guard, exit, incumbent) = pinned_guard();
     let refused = array![2.011981138, 0.457077141];
-    for trial in 1..COST_STALL_WINDOW {
+    let (refused_value, refused_resolution) = refused_wall_2939(&guard, &refused);
+    // Refusals whose step's model still promised a resolvable decrease decide nothing;
+    // the one whose model promised nothing stalls (#3018).
+    const ADAPTING_REFUSALS: usize = 5;
+    for trial in 0..ADAPTING_REFUSALS {
         assert!(
             matches!(
-                guard.observe_off_stratum(&refused, KEPT_RANK_INSIDE),
+                guard.observe_off_stratum(
+                &refused,
+                KEPT_RANK_INSIDE,
+                refused_value,
+                refused_resolution,
+                ADAPTING_DECREASE,
+            ),
                 CostStallVerdict::Continue
             ),
-            "trial {trial} of a {COST_STALL_WINDOW}-trial window must not decide the stall"
+            "adapting refusal {trial} must not decide the stall"
         );
     }
-    let verdict = guard.observe_off_stratum(&refused, KEPT_RANK_INSIDE);
+    let verdict = guard.observe_off_stratum(
+                &refused,
+                KEPT_RANK_INSIDE,
+                refused_value,
+                refused_resolution,
+                NO_MODEL_DECREASE,
+            );
     assert!(
         matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
-        "a window whose every trial left the run's kept rank must halt at the incumbent, not \
-         reopen the window: got {:?}",
+        "a run whose every trial left the run's kept rank must halt at the incumbent, not \
+         escape: got {:?}",
         std::mem::discriminant(&verdict),
     );
-    assert_eq!(guard.stuck_escapes, 0, "a rank-refusal window grants no escape");
+    assert_eq!(guard.stuck_escapes(), 0, "a run of rank refusals grants no escape");
     let published = exit
         .lock()
         .expect("exit cell")
@@ -318,8 +391,9 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
         "the evidence names the rank the search searched"
     );
     assert_eq!(
-        evidence.refused_trials, COST_STALL_WINDOW,
-        "every trial in the filled window was a rank refusal"
+        evidence.refused_trials,
+        ADAPTING_REFUSALS + 1,
+        "every trial in the run was a rank refusal"
     );
     assert!(
         published.grad_norm > evidence.band,
@@ -333,31 +407,88 @@ fn a_window_of_rank_refusals_halts_at_the_incumbent_without_an_escape_2939() {
 fn a_window_holding_an_infeasible_probe_keeps_the_1426_escape_2939() {
     let (mut guard, exit, incumbent) = pinned_guard();
     let refused = array![2.011981138, 0.457077141];
+    let (refused_value, refused_resolution) = refused_wall_2939(&guard, &refused);
     assert!(matches!(
-        guard.observe_infeasible(&refused),
+        guard.observe_infeasible(&refused, ADAPTING_DECREASE),
         CostStallVerdict::Continue
     ));
-    for trial in 2..COST_STALL_WINDOW {
+    for trial in 0..4 {
         assert!(
             matches!(
-                guard.observe_off_stratum(&refused, KEPT_RANK_INSIDE),
+                guard.observe_off_stratum(
+                &refused,
+                KEPT_RANK_INSIDE,
+                refused_value,
+                refused_resolution,
+                ADAPTING_DECREASE,
+            ),
                 CostStallVerdict::Continue
             ),
-            "trial {trial} of a {COST_STALL_WINDOW}-trial window must not decide the stall"
+            "adapting rank refusal {trial} must not decide the stall"
         );
     }
-    let verdict = guard.observe_off_stratum(&refused, KEPT_RANK_INSIDE);
+    let verdict = guard.observe_off_stratum(
+                &refused,
+                KEPT_RANK_INSIDE,
+                refused_value,
+                refused_resolution,
+                NO_MODEL_DECREASE,
+            );
     assert!(
         matches!(verdict, CostStallVerdict::StuckKeepDescending { .. }),
-        "a window that also holds a probe that failed to evaluate keeps the #1426 escape: got \
+        "a run that also holds a probe that failed to evaluate keeps the #1426 escape: got \
          {:?}",
         std::mem::discriminant(&verdict),
     );
-    assert_eq!(guard.stuck_escapes, 1, "the mixed window is granted its escape");
+    assert_eq!(guard.stuck_escapes(), 1, "the mixed run is granted its escape");
     assert!(
         exit.lock().expect("exit cell").as_ref().is_none_or(|published| published.rho
             == incumbent
             && published.rank_boundary.is_none()),
         "an escape publishes no other point and no rank-boundary evidence"
     );
+}
+
+/// A trial refused for its rank whose own criterion value is resolvably below the
+/// incumbent's (`V̂_b − V̂_x > R_b + R_x`) is descent the search cannot take on its own
+/// rank and the seed loop can, so it stops the run at once, with the rank-boundary
+/// evidence and no escape, however much the refused step's model still promised
+/// (#3018). Waiting for a refusal whose model promised nothing let the pinned search
+/// creep toward its boundary until its incumbent sat below every rank-55 trial, and
+/// then nothing was lower to cross to.
+#[test]
+fn a_rank_refusal_below_the_incumbent_stops_the_run_for_the_crossing_2939() {
+    let (mut guard, exit, incumbent) = pinned_guard();
+    let refused = array![2.011981138, 0.457077141];
+    let value = guard.best_value() - 1.0;
+    let resolution = guard.value_resolution(value, &Default::default());
+    assert!(
+        guard.best_value() - value > guard.best_resolution() + resolution,
+        "test premise: the rank-55 value is resolvably below the incumbent"
+    );
+    let verdict = guard.observe_off_stratum(
+        &refused,
+        KEPT_RANK_INSIDE,
+        value,
+        resolution,
+        ADAPTING_DECREASE,
+    );
+    assert!(
+        matches!(verdict, CostStallVerdict::FlatValleyStall { .. }),
+        "a lower rank-55 trial must stop the pinned run at once: got {:?}",
+        std::mem::discriminant(&verdict),
+    );
+    assert_eq!(guard.stuck_escapes(), 0, "the stop grants no escape");
+    let published = exit
+        .lock()
+        .expect("exit cell")
+        .clone()
+        .expect("the stop publishes the incumbent");
+    assert_eq!(published.rho, incumbent);
+    assert!(!published.converged);
+    let evidence = published
+        .rank_boundary
+        .expect("the stop publishes its rank-boundary evidence");
+    assert_eq!(evidence.kept_rank, KEPT_RANK_INSIDE);
+    assert_eq!(evidence.refused_trials, 1);
 }

@@ -113,6 +113,9 @@ pub struct GaussianLocationScaleWiggleFamily {
     pub weights: Array1<f64>,
     pub mu_design: Option<DesignMatrix>,
     pub log_sigma_design: Option<DesignMatrix>,
+    /// Lower bound b on σ in the units of `y` for σ = b + exp(η); see
+    /// `GaussianLocationScaleFamily::sigma_floor`.
+    pub sigma_floor: f64,
     pub wiggle_knots: Array1<f64>,
     pub wiggle_degree: usize,
     /// Resource policy threaded into PsiDesignMap construction (and any other
@@ -192,6 +195,7 @@ impl GaussianLocationScaleWiggleFamily {
             q,
             eta_ls,
             &self.weights,
+            self.sigma_floor,
         )?))
     }
 
@@ -207,11 +211,12 @@ impl GaussianLocationScaleWiggleFamily {
             &self.policy.material_policy(),
         )
     }
-    pub(crate) fn dense_block_designs_fromspecs<'a>(
-        &self,
-        specs: &'a [ParameterBlockSpec],
-    ) -> Result<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>), String> {
-        dense_locscale_block_designs_fromspecs(
+    pub(crate) fn exact_joint_dense_block_designs<'a>(
+        &'a self,
+        specs: Option<&'a [ParameterBlockSpec]>,
+    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
+        exact_joint_locscale_block_designs(
+            (self.mu_design.as_ref(), self.log_sigma_design.as_ref()),
             specs,
             3,
             "GaussianLocationScaleWiggleFamily",
@@ -221,19 +226,6 @@ impl GaussianLocationScaleWiggleFamily {
             "mu",
             &self.policy.material_policy(),
         )
-    }
-
-    pub(crate) fn exact_joint_dense_block_designs<'a>(
-        &'a self,
-        specs: Option<&'a [ParameterBlockSpec]>,
-    ) -> Result<Option<(Cow<'a, Array2<f64>>, Cow<'a, Array2<f64>>)>, String> {
-        if self.exact_joint_supported() {
-            return self.dense_block_designs().map(Some);
-        }
-        if let Some(specs) = specs {
-            return self.dense_block_designs_fromspecs(specs).map(Some);
-        }
-        Ok(None)
     }
 }
 
@@ -2028,6 +2020,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
                         q,
                         eta_ls[i],
                         self.weights[i],
+                        self.sigma_floor,
                         ln2pi,
                     )?,
                     z_mu,
@@ -2086,7 +2079,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
         let mut ll = 0.0;
         for i in 0..self.y.len() {
             let q = eta_mu[i] + etaw[i];
-            ll += gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+            ll += gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], self.sigma_floor, ln2pi)?
                 .log_likelihood;
             if !ll.is_finite() {
                 return Err(GamlssError::row_geometry_unrepresentable(i, "Gaussian wiggle cumulative log likelihood", eta_ls[i], ll));
@@ -2134,7 +2127,7 @@ impl CustomFamily for GaussianLocationScaleWiggleFamily {
             let i = sampled.index;
             let q = eta_mu[i] + etaw[i];
             let row_ll =
-                gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], ln2pi)?
+                gaussian_diagonal_row_kernel(i, self.y[i], q, eta_ls[i], self.weights[i], self.sigma_floor, ln2pi)?
                     .log_likelihood;
             let contribution = scaled_signed_product3(sampled.weight, row_ll, 1.0);
             ll += contribution;
@@ -2768,7 +2761,9 @@ impl CustomFamilyGenerative for GaussianLocationScaleWiggleFamily {
         let eta_log_sigma = &block_states[Self::BLOCK_LOG_SIGMA].eta;
         let n = eta_mu.len();
         let mean = gamlss_rowwise_map(n, |i| eta_mu[i] + eta_wiggle[i]);
-        let sigma = gamlss_rowwise_map(n, |i| logb_sigma_from_eta_scalar(eta_log_sigma[i]));
+        let sigma = gamlss_rowwise_map(n, |i| {
+            logb_sigma_from_eta_scalar(self.sigma_floor, eta_log_sigma[i])
+        });
         Ok(GenerativeSpec {
             mean,
             noise: NoiseModel::Gaussian { sigma },

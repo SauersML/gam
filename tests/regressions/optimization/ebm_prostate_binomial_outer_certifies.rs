@@ -24,6 +24,17 @@
 //! coordinate 2's tail `−c·e^{−ρ}` is already under the bound) and an analytic
 //! projected gradient of `9.0e-11` against a bound of `2.5e-10`.
 //!
+//! Once ARC certified its Laplace optimum early (`ρ₂ ≈ 8.3`, Newton decrement
+//! `½λ² = 4.9e-4` under `τ = 1/(2n)`), the #784 block correction's BFGS
+//! continuation had to walk `ρ₂` itself and met a jump in `Δ_b`: at
+//! `ρ₂ ≈ 18.44` the criterion's eigensystem switched from ascending `eigh` to
+//! the descending stacked-root SVD (#2644), the block's two directions swapped
+//! positions, and with them their latched Gauss-Hermite orders (16 and 9).
+//! `Δ_b` stepped 1.2e-5 across a 1e-2 move in `ρ₂` and the search stopped at
+//! `|g| = 5.7e-6` against a band of `2.9e-10`. With the axes ordered by
+//! curvature the continuation certifies at `ρ₂ = 19.66`, `|Pg| = 1.1e-10`
+//! against `2.6e-10`.
+//!
 //! The assertions are on the certificate itself, not on the route. A rail
 //! certificate for coordinate 2 is as valid as a gradient certificate, but any
 //! rail it reports must carry evidence its own well-formedness rule admits.

@@ -23,7 +23,7 @@ model.predict(
 | Argument | Default | Meaning |
 | --- | --- | --- |
 | `data` | required | Table-like input matching the training schema. |
-| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests a distribution-free conformal band: with `training_data` the exact full-conformal set for an eligible Gaussian-identity fit, or with `calibration` the split-conformal band. On standard GLMs and the location-scale families this populates `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper`; the transformation-normal and Bernoulli marginal-slope classes retain their class-specific `std_error` / `mean_lower` / `mean_upper` names. On supported single-event survival modes it populates `survival_se` and `eta_se`. On competing-risks survival it populates SE/lower/upper arrays for every cause-specific hazard, survival, cumulative hazard, CIF, overall survival, and eta surface. |
+| `interval` | `None` | Single uncertainty knob. `None` returns point predictions only; a float in `(0, 1)` (e.g. `0.95`) requests the full uncertainty decomposition at that pointwise coverage. `"conformal"` requests a distribution-free conformal band: with `training_data` the exact full-conformal set for an eligible Gaussian-identity fit, or with `calibration` the split-conformal band. On standard GLMs and the location-scale families this populates `linear_predictor_standard_error` (the posterior SD of η), `posterior_mean_standard_error` (the posterior SD of the response, `√Var[g⁻¹(η)]` from the same η integral as `posterior_mean`, never the delta method), and `posterior_mean_lower` / `posterior_mean_upper` (the inverse link of the η credible quantiles); the transformation-normal and Bernoulli marginal-slope classes retain their class-specific `std_error` / `mean_lower` / `mean_upper` names. On supported single-event survival modes it populates `survival_se` and `eta_se`. On competing-risks survival it populates SE/lower/upper arrays for every cause-specific hazard, survival, cumulative hazard, CIF, overall survival, and eta surface. |
 | `conformal_level` | `0.9` | Marginal coverage for `interval="conformal"`. Ignored for numeric Wald intervals. |
 | `calibration` | `None` | Held-out labeled calibration table for the split-conformal band; `interval="conformal"` only. It must include the response column. |
 | `training_data` | `None` | Labeled rows (normally the training table) for the exact full-conformal set; `interval="conformal"` only, exclusive with `calibration`. It must include the response column. |
@@ -47,8 +47,8 @@ For model-based intervals, a dict-shaped result also carries the scalar
 
 | Model class | Default return | Columns / fields |
 | --- | --- | --- |
-| Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale posterior means. Table form has `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`; adds `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper` when `interval` is set. |
-| Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale posterior means, on the same estimand-explicit schema as a standard fit: table form has `linear_predictor_plugin`, `mean_plugin`, `posterior_mean`, and `noise_scale` (the fitted scale channel); adds `posterior_mean_standard_error`, `posterior_mean_lower`, `posterior_mean_upper` when `interval` is set. |
+| Gaussian, binomial, Poisson, negative-binomial, Gamma, Beta, Tweedie | 1-D `numpy.ndarray` | Response-scale posterior means. Table form has `linear_predictor_plugin`, `mean_plugin`, and `posterior_mean`; adds `linear_predictor_standard_error`, `posterior_mean_standard_error`, `posterior_mean_lower`, and `posterior_mean_upper` when `interval` is set. |
+| Gaussian / binomial / dispersion location-scale | 1-D `numpy.ndarray` | Response-scale posterior means, on the same estimand-explicit schema as a standard fit: table form has `linear_predictor_plugin`, `mean_plugin`, `posterior_mean`, and `noise_scale` (the fitted scale channel); adds `linear_predictor_standard_error`, `posterior_mean_standard_error`, `posterior_mean_lower`, `posterior_mean_upper` when `interval` is set. |
 | Transformation-normal | 1-D `numpy.ndarray` | Per-row response-scale conditional mean `E[Y|x]` (issue #1612). |
 | Bernoulli marginal-slope | 1-D `numpy.ndarray` | Per-row probabilities clipped to `[0, 1]`. Table form has `mean`; with `interval=` it also includes `linear_predictor`, `std_error`, `mean_lower`, and `mean_upper`. |
 | Survival (any likelihood mode) | `SurvivalPrediction` | Per-row hazard / survival evaluators. |
@@ -86,7 +86,8 @@ model = gamfit.fit(train_df, "y ~ s(x)")
 
 preds = model.predict(test_df, interval=0.95)
 # columns: linear_predictor_plugin, mean_plugin, posterior_mean,
-#          posterior_mean_standard_error, posterior_mean_lower, posterior_mean_upper
+#          linear_predictor_standard_error, posterior_mean_standard_error,
+#          posterior_mean_lower, posterior_mean_upper
 
 pred_dict = model.predict(test_df, interval=0.95, return_type="dict")
 mu = pred_dict["posterior_mean"]       # mapping access
