@@ -142,13 +142,23 @@ model.plot(train, x="x")            # matplotlib (requires gamfit[plot])
 model.report("out.html")            # standalone HTML report
 ```
 
-`Model.summary()` returns a `Summary` carrying the formula, family
-name, model class, deviance, REML/LAML criterion (in the `reml_score`
-field), per-coefficient estimates with optional standard errors,
-smoothing parameters, covariance metadata, deployment extensions, and
-group metadata. `reml_score` is `None` on an exactly-interpolating fit,
-whose restricted likelihood is unbounded — see
-[diagnostics.md](diagnostics.md).
+`Model.summary()` returns a `Summary`. `print(model.summary())` shows the
+report rendered by the engine — the same text `gam summary model.gam`
+prints: family, link, formula and `n`; the parametric coefficient table
+(estimate, standard error, `t` or `z`, p-value); the smooth-term table
+(`edf`, reference df, `F` or `Chi.sq`, one Wald p-value, and the term's
+smoothing parameters); deviance explained `1 − D/D₀`, adjusted R² for a
+Gaussian response, the scale `φ̂`, the REML/LAML score, the
+log-likelihood, conditional and corrected AIC, and the optimizer's
+convergence certificate. Every number is also a typed field
+(`summary.deviance_explained`, `summary.parametric_terms`,
+`summary.smooth_terms`, ...), and `summary.to_dict()` returns them all. A
+quantity that does not exist for a fit is `None` with its reason beside
+it: `reml_score` is `None` on an exactly-interpolating fit, whose
+restricted likelihood is unbounded — see [diagnostics.md](diagnostics.md).
+The summary's p-value is the Wald reference computed from the saved model;
+the likelihood-ratio p-value, which refits, comes from
+`model.smooth_significance(train)`.
 
 See [diagnostics.md](diagnostics.md) for the full list.
 

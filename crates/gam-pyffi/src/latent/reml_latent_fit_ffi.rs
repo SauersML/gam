@@ -4230,7 +4230,16 @@ fn summary_estimator_text<'py>(
 
 #[pyfunction]
 fn summary_html(payload: &Bound<'_, PyDict>) -> PyResult<String> {
-    // Pure presentation layer; no math.
+    // Pure presentation layer; no math. A fitted model's summary carries the
+    // one rendered report, which the notebook shows verbatim.
+    if let Some(text) = payload.get_item("text")?
+        && !text.is_none()
+    {
+        return Ok(format!(
+            "<pre style='font-family: ui-monospace, monospace;'>{}</pre>",
+            summary_html_escape(&text.extract::<String>()?)
+        ));
+    }
     let mut rows = String::new();
     for (key, value) in payload.iter() {
         let key_text = key.str()?.extract::<String>()?;
