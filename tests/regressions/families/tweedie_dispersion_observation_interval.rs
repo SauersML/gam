@@ -17,9 +17,12 @@
 //!
 //! Three independent things are asserted, each of which the frozen-`φ` bug
 //! breaks and none of which the η-SE test covers:
-//!   1. ABSOLUTE `φ̂` RECOVERY — the fitted dispersion tracks the data's true
-//!      `φ` (≈ 0.4 and ≈ 6.0), not the frozen 1.0. (The η-SE test only checks
-//!      the *ratio* of two fits, which is invariant to a shared bias.)
+//!   1. ABSOLUTE `φ̂` RECOVERY — the fitted dispersion is within 4 derived
+//!      standard deviations of the data's true `φ` (0.4 and 6.0), not the
+//!      frozen 1.0. The SD is that of the Pearson estimator with a plug-in
+//!      `μ̂`, derived from the Tweedie cumulants (see `pearson_phi_sd`); in 2000
+//!      simulated replicates of this fixture the standardized error has SD
+//!      0.99 at both dispersions and never exceeds 4.
 //!   2. OBSERVATION-INTERVAL WIDTH scales as √φ across the two fits.
 //!   3. EMPIRICAL COVERAGE — the fitted-`φ` 95% observation interval brackets
 //!      the held-out responses far better than the counterfactual `φ=1` band a
@@ -45,6 +48,43 @@ const B0: f64 = 0.6;
 const BX: f64 = 0.7;
 const TWEEDIE_P: f64 = 1.5;
 const Z95: f64 = 1.959_963_984_540_054; // qnorm(0.975)
+
+/// Number of mean coefficients in `y ~ x` (intercept and slope).
+const N_COEF: usize = 2;
+/// Standard deviations allowed between φ̂ and the true φ.
+const PHI_Z: f64 = 4.0;
+
+/// Sampling SD of the Pearson dispersion `φ̂ = (1/n) Σ (yᵢ − μ̂ᵢ)²/μ̂ᵢ^p` at the
+/// true `(μ, φ)` of this fixture.
+///
+/// With `tᵢ = (yᵢ − μᵢ)²/μᵢ^p` and `sᵢ = (yᵢ − μᵢ)μᵢ^{1−p}`, the Tweedie
+/// cumulants give `Var tᵢ = p(2p−1)φ³μᵢ^{p−2} + 2φ²` and `Cov(tᵢ, sᵢ) = pφ²`.
+/// Under the log link `∂tᵢ/∂ηᵢ` has mean `−pφ`, and the MLE satisfies
+/// `β̂ − β ≈ H⁻¹ (1/n) Σ xᵢ sᵢ` with `H = (1/n) Σ μᵢ^{2−p} xᵢxᵢᵀ`, so
+/// `n·Var φ̂ = mean[p(2p−1)φ³μᵢ^{p−2} + 2φ²] − p²φ³·x̄ᵀH⁻¹x̄`.
+fn pearson_phi_sd(x: &[f64], phi: f64) -> f64 {
+    let p = TWEEDIE_P;
+    let n = x.len() as f64;
+    let (mut mean_var_t, mut h00, mut h01, mut h11, mut xbar1) = (0.0, 0.0, 0.0, 0.0, 0.0);
+    for &xi in x {
+        let mu = (B0 + BX * xi).exp();
+        mean_var_t += p * (2.0 * p - 1.0) * phi.powi(3) * mu.powf(p - 2.0) + 2.0 * phi * phi;
+        let w = mu.powf(2.0 - p);
+        h00 += w;
+        h01 += w * xi;
+        h11 += w * xi * xi;
+        xbar1 += xi;
+    }
+    let (mean_var_t, h00, h01, h11, xbar1) =
+        (mean_var_t / n, h00 / n, h01 / n, h11 / n, xbar1 / n);
+    // x̄ = (1, mean x); x̄ᵀH⁻¹x̄ for the 2×2 H.
+    let det = h00 * h11 - h01 * h01;
+    assert!(det > 0.0, "information matrix must be positive definite");
+    let quad = (h11 - 2.0 * h01 * xbar1 + h00 * xbar1 * xbar1) / det;
+    let var = (mean_var_t - p * p * phi.powi(3) * quad) / n;
+    assert!(var > 0.0, "derived Var(φ̂) must be positive, got {var}");
+    var.sqrt()
+}
 
 /// Exact compound Poisson–Gamma (Tweedie, `1 < p < 2`) draw with mean `mu`,
 /// dispersion `phi`: `N ~ Poisson(λ)`, `y = Σ_{i=1}^N G_i`, `G_i ~ Gamma(α, θ)`,
@@ -201,25 +241,24 @@ fn tweedie_observation_interval_reflects_estimated_dispersion() {
     let fit_hi = fit_tweedie(&x, &y_hi, &x);
 
     // ── 1. Absolute φ̂ recovery (the ratio test cannot see a shared bias) ────
-    let rel_err_lo = (fit_lo.phi_hat - phi_lo).abs() / phi_lo;
-    let rel_err_hi = (fit_hi.phi_hat - phi_hi).abs() / phi_hi;
-    eprintln!(
-        "[tweedie-obs] true φ: lo={phi_lo} hi={phi_hi}; fitted φ̂: lo={:.4} hi={:.4} \
-         (rel err lo={rel_err_lo:.3} hi={rel_err_hi:.3})",
-        fit_lo.phi_hat, fit_hi.phi_hat
-    );
-    assert!(
-        rel_err_lo < 0.20,
-        "Tweedie φ̂ does not recover the low dispersion: φ̂={:.4} vs true {phi_lo} \
-         (rel err {rel_err_lo:.3}); frozen-φ bug pins it at 1.0",
-        fit_lo.phi_hat
-    );
-    assert!(
-        rel_err_hi < 0.20,
-        "Tweedie φ̂ does not recover the high dispersion: φ̂={:.4} vs true {phi_hi} \
-         (rel err {rel_err_hi:.3}); frozen-φ bug pins it at 1.0",
-        fit_hi.phi_hat
-    );
+    for (fit, phi_true, tag) in [(&fit_lo, phi_lo, "low"), (&fit_hi, phi_hi, "high")] {
+        let sd = pearson_phi_sd(&x, phi_true);
+        // Plus the `n` vs `n − p` divisor bias of the Pearson mean.
+        let tol = PHI_Z * sd + (N_COEF as f64 / n as f64) * phi_true;
+        let z = (fit.phi_hat - phi_true) / sd;
+        eprintln!(
+            "[tweedie-obs] {tag}: true φ={phi_true} φ̂={:.5} SD(φ̂)={sd:.5} z={z:.2}",
+            fit.phi_hat
+        );
+        assert!(
+            (fit.phi_hat - phi_true).abs() <= tol,
+            "Tweedie φ̂ does not recover the {tag} dispersion: φ̂={:.5} vs true {phi_true}, \
+             |error| {:.5} > {tol:.5} ({PHI_Z} derived SDs, SD={sd:.5}, z={z:.2}); the \
+             frozen-φ bug pins it at 1.0",
+            fit.phi_hat,
+            (fit.phi_hat - phi_true).abs()
+        );
+    }
 
     // ── 2. Observation-interval width scales as √φ ──────────────────────────
     let mean_hw_lo: f64 =
