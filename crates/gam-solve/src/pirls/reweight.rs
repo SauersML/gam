@@ -983,17 +983,20 @@ where
         }
 
         // Early exit: if the current state has non-finite gradient, the
-        // model evaluation has overflowed (eta too extreme).  No Newton
-        // step can recover — accept the best state we have.
+        // model evaluation has overflowed (eta too extreme). No Newton step
+        // can recover, and a non-finite gradient carries no stationarity
+        // information, so this state can never be certified as a mode — not
+        // even a near-stationary plateau, whose every other exit requires the
+        // projected gradient inside the KKT band. The evaluation became
+        // unstable: say so (#3525). Post-loop certification skips `Unstable`,
+        // and callers surface it as a named failure rather than consuming the
+        // overflowed state as a cost point or warm start.
         let current_grad_finite = state.gradient.iter().all(|g| g.is_finite());
         if !current_grad_finite {
             lastgradient_norm = f64::INFINITY;
             max_abs_eta = inf_norm(state.eta.iter().copied());
             final_state = Some(state);
-            // Non-finite-gradient rescue is deviance-plateau based, not a KKT certificate.
-            if last_deviance_change.abs() < options.convergence_tolerance {
-                status = PirlsStatus::StalledAtValidMinimum;
-            }
+            status = PirlsStatus::Unstable;
             break 'pirls_loop;
         }
 
