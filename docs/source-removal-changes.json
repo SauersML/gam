@@ -2613,5 +2613,13 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "8a1bb26be771b07bb5a68f4651101a8a3cb57223",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_hyper_dirs.rs:fn:add_analytic_penalty_hessian_to_eval"
+    ],
+    "reason": "#4161: add_analytic_penalty_hessian_to_eval assembled a wrong latent joint REML Hessian. It used hessian_diag (the exact diagonal, even for dense-Hessian penalties such as BlockOrthogonality, SoftmaxAssignmentSparsity and sheaf) as the whole t-t block and had no t-rho or rho-rho terms for learnable penalty rho, at O((n d)^2) HVP cost per outer evaluation. Its output was always discarded. add_analytic_penalty_objective_to_eval now declares its gradient-only contribution by downgrading an analytic Hessian to Unavailable itself.",
+    "evidence": "git grep -w add_analytic_penalty_hessian_to_eval at the base finds only its definition (spatial_hyper_dirs.rs:974) and its one call (:1069) in add_analytic_penalty_objective_to_eval. That function's only caller, spatial_optimization.rs:6260, is always followed at :6268 by add_latent_id_objective_to_eval, which sets eval.2 = HessianValue::Unavailable whenever it is analytic (spatial_hyper_dirs.rs:907-909). So no Hessian value this helper wrote ever reached store_eval."
   }
 ]
