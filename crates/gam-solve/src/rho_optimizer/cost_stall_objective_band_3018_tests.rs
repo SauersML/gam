@@ -530,7 +530,6 @@ fn drive_first_order_3018(step: f64, inner_residual: Option<f64>, steps: usize) 
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::clone(&ledger),
         pending_first_order: Vec::new(),
         incumbent: Some(OuterIncumbent {

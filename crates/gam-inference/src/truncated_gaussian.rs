@@ -62,6 +62,8 @@
 //! constraints sitting ON their wall (the bounce logic launches the particle
 //! inward).
 
+use std::collections::HashSet;
+
 use ndarray::{Array1, Array2};
 use rand::SeedableRng;
 
@@ -75,11 +77,6 @@ use gam_solve::pirls::LinearInequalityConstraints;
 /// `z(π/2) = v₀`, so consecutive draws decorrelate completely.
 const TRAVEL_TIME: f64 = std::f64::consts::FRAC_PI_2;
 
-/// A reflection budget per trajectory. A pointed feasible cone resolves a
-/// vertex start in `O(#active rows)` bounces; this cap is a backstop against a
-/// pathological grazing cycle. Exhaustion is an error: stopping at a wall
-/// instead of completing the fixed travel time does not preserve the target.
-const MAX_BOUNCES_BASE: usize = 256;
 
 /// Draw `n_samples · n_chains` posterior samples of `β ~ N(center, φ·H⁻¹)`
 /// truncated to `{β : A β ≥ b}`, returned as a `(n_total, p)` matrix in the
@@ -237,7 +234,6 @@ pub(crate) fn sample_truncated_gaussian_posterior(
 
     let n_total = n_samples.saturating_mul(n_chains);
     let mut samples = Array2::<f64>::zeros((n_total, p));
-    let max_bounces = MAX_BOUNCES_BASE + 8 * m;
 
     // Scratch buffers reused across draws.
     let mut z = Array1::<f64>::zeros(p);
@@ -257,7 +253,7 @@ pub(crate) fn sample_truncated_gaussian_posterior(
             for vi in v.iter_mut() {
                 *vi = standard_normal(&mut rng);
             }
-            simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm, max_bounces)?;
+            simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm)?;
             // Back-transform: β = center + √φ · L⁻ᵀ z.
             back_substitution_lower_transpose_guarded_into(&l, &z, &mut beta);
             let row = chain * n_samples + draw;
@@ -273,17 +269,27 @@ pub(crate) fn sample_truncated_gaussian_posterior(
 /// Advance `(z, v)` along the harmonic trajectory `z(t) = z cos t + v sin t`
 /// for a total time [`TRAVEL_TIME`], reflecting specularly off every wall
 /// `fᵢᵀ z + gᵢ = 0` it reaches. On return `z` is the new (feasible) position.
+///
+/// Termination is a property of the time integration, not of a reflection
+/// count: a harmonic trajectory meets finitely many linear walls in the finite
+/// time [`TRAVEL_TIME`] almost surely, however many that is (thousands for a
+/// shape cone whose mass is pressed into its apex, gam#3112). The one way the
+/// loop can fail to finish is Zeno accumulation at a wall intersection, where
+/// the time increments between hits reach zero. While the clock `t_left` does
+/// not advance, each step is a deterministic map of the floating-point state
+/// `(z, v)`, so such a run either leaves the intersection or revisits a state
+/// exactly; the revisit is detected bit for bit and refused.
 fn simulate_constrained_trajectory(
     z: &mut Array1<f64>,
     v: &mut Array1<f64>,
     f_rows: &Array2<f64>,
     g: &Array1<f64>,
     f_sq_norm: &[f64],
-    max_bounces: usize,
 ) -> Result<(), String> {
     let m = f_rows.nrows();
     let mut t_left = TRAVEL_TIME;
-    let mut bounces = 0usize;
+    // States visited since the clock last advanced (bit patterns of `z`, `v`).
+    let mut stalled_states: HashSet<Vec<u64>> = HashSet::new();
 
     loop {
         if t_left <= 0.0 {
@@ -316,6 +322,7 @@ fn simulate_constrained_trajectory(
             }
             Some(j) => {
                 advance(z, v, hit_time);
+                let t_before = t_left;
                 t_left -= hit_time;
                 // Specular reflection of the velocity about the wall normal fⱼ:
                 //   v ← v − 2 (fⱼᵀ v / ‖fⱼ‖²) fⱼ,
@@ -328,12 +335,18 @@ fn simulate_constrained_trajectory(
                         v[k] -= coeff * fj[k];
                     }
                 }
-                bounces += 1;
-                if bounces >= max_bounces && t_left > 0.0 {
-                    return Err(format!(
-                        "truncated-Gaussian posterior: trajectory exhausted its {max_bounces} \
-                         reflection budget before completing the fixed travel time"
-                    ));
+                if t_left < t_before {
+                    stalled_states.clear();
+                } else {
+                    let state: Vec<u64> = z.iter().chain(v.iter()).map(|x| x.to_bits()).collect();
+                    if !stalled_states.insert(state) {
+                        return Err(format!(
+                            "truncated-Gaussian posterior: Zeno cycle at a wall intersection; \
+                             reflections returned to an earlier state without advancing the \
+                             travel clock ({t_left:.6} of {TRAVEL_TIME:.6} left), so the \
+                             trajectory cannot complete its fixed travel time"
+                        ));
+                    }
                 }
             }
         }
@@ -447,17 +460,50 @@ mod tests {
     }
 
     #[test]
-    fn reflection_budget_exhaustion_refuses_a_partial_trajectory() {
+    fn zeno_cycle_at_a_wall_intersection_is_refused() {
+        // `z ≥ 0` and `z ≤ 0` meet in a single point: every reflection is
+        // instantaneous and the velocity flips back and forth forever.
         let error = simulate_constrained_trajectory(
-            &mut array![0.5],
-            &mut array![2.0],
+            &mut array![0.0],
+            &mut array![-2.0],
             &array![[1.0], [-1.0]],
-            &array![0.0, 1.0],
+            &array![0.0, 0.0],
             &[1.0, 1.0],
-            1,
         )
-        .expect_err("a partial arc would place spurious probability mass on its last wall");
-        assert!(error.contains("reflection budget"));
+        .expect_err("a trajectory whose clock cannot advance never completes its travel time");
+        assert!(error.contains("Zeno cycle"));
+    }
+
+    #[test]
+    fn apex_of_a_narrow_wedge_completes_thousands_of_reflections() {
+        // gam#3112: a shape cone with its unconstrained center far outside
+        // presses the mass into the apex, where a billiard in a wedge of
+        // angle θ reflects O(π/θ) times per excursion. A fixed reflection
+        // budget refused these trajectories; the time integration completes
+        // them and every draw stays inside the wedge.
+        let theta: f64 = 1e-3;
+        let apex = 30.0;
+        // Walls through (apex, 0): z₂ ≥ 0 and z₁ sin θ − z₂ cos θ ≥ apex sin θ.
+        let a = array![[0.0, 1.0], [theta.sin(), -theta.cos()]];
+        let b = array![0.0, apex * theta.sin()];
+        let draws = sample_truncated_gaussian_posterior(
+            &array![0.0, 0.0],
+            &array![apex, 0.0],
+            &Array2::eye(2),
+            1.0,
+            &constraints(a.clone(), b.clone()),
+            50,
+            2,
+            7,
+        )
+        .expect("apex-pressed wedge draws");
+        for row in draws.rows() {
+            let slack = a.dot(&row) - &b;
+            assert!(
+                slack.iter().all(|&s| s >= -1e-9),
+                "draw {row} left the wedge (slack {slack})"
+            );
+        }
     }
 
     #[test]
