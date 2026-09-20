@@ -344,16 +344,19 @@ def as_frame(table: dict[str, Any], categorical: dict[str, list[str]]) -> Any:
 _NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?")
 
 
-def _message_head(trace: str) -> str:
+def _message_head(trace: str, head: str | None = None) -> str:
     """The exception line of a recorded traceback with numbers masked, so
-    reps that fail the same way at different values group together."""
+    reps that fail the same way at different values group together. ``head``
+    is the exception's first line as the worker recorded it; without it (older
+    records) the line is recovered from the traceback tail."""
     lines = [ln for ln in trace.strip().splitlines() if ln.strip()]
     # The engine's typed errors end with ``variant:`` / ``category:`` lines;
     # the exception line itself is the first line after the frames.
     variant = next((ln.split(":", 1)[1].strip() for ln in lines if ln.startswith("variant:")), "")
-    frames_end = max((i for i, ln in enumerate(lines) if ln.startswith("  ")), default=-1)
-    head = lines[frames_end + 1] if frames_end + 1 < len(lines) else ""
-    head = head.split(": ", 1)[1] if ": " in head else head
+    if head is None:
+        frames_end = max((i for i, ln in enumerate(lines) if ln.startswith("  ")), default=-1)
+        head = lines[frames_end + 1] if frames_end + 1 < len(lines) else ""
+        head = head.split(": ", 1)[1] if ": " in head else head
     text = f"[{variant}] {head}" if variant else head
     return _NUMBER.sub("#", text)[:110]
 
@@ -371,7 +374,8 @@ def failure_cause(rec: dict[str, Any]) -> str | None:
     if errors:
         phase = next(p for p in ("import", "fit", "pred", "interval", "info") if p in errors)
         kind = (rec.get("error_types") or {}).get(phase, "Exception")
-        return f"{phase}:{kind}: {_message_head(errors[phase])}"
+        head = (rec.get("error_heads") or {}).get(phase)
+        return f"{phase}:{kind}: {_message_head(errors[phase], head)}"
     if rec.get("certified") is not True:
         return "not_certified"
     if rec.get("pred_finite") is not True:
