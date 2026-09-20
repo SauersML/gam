@@ -4854,6 +4854,32 @@
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
   },
   {
+    "base": "d5f641efbdb2e3e5c9b1d26621a7ad3890d5eabe",
+    "removed": {
+      "crates/gam-solve/src/reml/gradient_hessian.rs::adaptive_ift_max_drho": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::adaptive_tangent_alpha_cap": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::clear_ift_quality_runtime_state": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::ift_quality_step_cap": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::record_ift_prediction_quality": 1,
+      "crates/gam-solve/src/reml/gradient_hessian.rs::take_ift_quality_flat_override": 1,
+      "crates/gam-solve/src/reml/objective.rs::adaptive_ift_max_drho_follows_quality_tiers": 1,
+      "crates/gam-solve/src/reml/objective.rs::adaptive_tangent_alpha_cap_follows_quality_tiers": 1
+    },
+    "reason": "Replace the IFT/tangent warm-start step caps (#2902) with a derived trust radius: the tiered |dρ| budget (2.0 default, 0.5..4.0 by residual tier), the tangent α tiers, and the grow/shrink step controller with its hand quality bands and flat override are hand bounds and magic constants forbidden by SPEC. The radius R = s·F/E is measured from each accepted prediction's miss E against the flat seed's miss F at step s.",
+    "evidence": "ift_predictor_rejects_large_drho: an unmeasured predictor now takes the |dρ| = 3 step the 2.0 default cap rejected; a measured radius of 2 rejects it and 4 accepts it. warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed pins R = s·F/E, R = ∞ for an exact prediction, no update for E = F = 0 or non-finite input, and reset on clear. The same-slot test now checks the radius and staged step do not leak across RemlStates."
+  },
+  {
+    "base": "88af7f36c95adcede13b6507ad702acc78ab4bd0",
+    "removed": {
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_logdet_from_col_major": 1,
+      "crates/gam-gpu/src/solver.rs::cholesky_solve_gpu": 1,
+      "crates/gam-gpu/src/solver.rs::iterative_refinement_cholesky_solve": 1
+    },
+    "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
+    },
+    {
     "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
     "removed": {
       "crates/gam-runtime/src/warm_start/session.rs::peek_load_with_source": 1,
