@@ -1,6 +1,7 @@
 use gam_linalg::faer_ndarray::fast_ata;
 
 pub(crate) use super::tests_recovery_split_780::{diagonal_latent_cache, gamma_fd_tiny_fixture, warmstart_test_objective, warmstart_test_objective_with_evaluator};
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 use approx::assert_abs_diff_eq;
 use gam_terms::analytic_penalties::ARDPenalty;
