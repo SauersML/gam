@@ -109,9 +109,9 @@ fn rmse_budget(m: usize) -> f64 {
 /// closed form `1/4π`.
 fn sobolev_formula(m: usize) -> String {
     if m == 1 {
-        "y ~ sphere(lat, lon, k=30, m=1, kernel=sobolev, lmax=200)".to_string()
+        "y ~ sphere(lat, lon, k=30, penalty_order=1, method=sobolev, lmax=200)".to_string()
     } else {
-        format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=sobolev)")
+        format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=sobolev)")
     }
 }
 
@@ -144,7 +144,7 @@ fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
     init_parallelism();
     let mut failures = Vec::new();
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=pseudo)");
+        let formula = format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=pseudo)");
         match rmse_against_truth(&formula) {
             Ok(r) => {
                 let budget = rmse_budget(m);
@@ -165,26 +165,33 @@ fn sphere_pseudo_kernel_fits_smooth_truth_for_all_m() {
 }
 
 #[test]
-fn sphere_method_aliases_route_to_correct_kernel() {
+fn sphere_methods_parse_and_removed_method_spellings_name_the_canonical_one() {
     init_parallelism();
-    // method=wahba_sobolev / wahba_pseudo / sobolev / pseudo / mgcv / sos
-    // should all parse without erroring at fit time.
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     let data = make_dataset(200);
-    for method in [
-        "wahba", // default → sobolev
-        "wahba_sobolev",
-        "wahba_pseudo",
-        "sobolev",
-        "pseudo",
-        "mgcv",
-        "sos",
-    ] {
-        let formula = format!("y ~ sphere(lat, lon, k=10, m=2, method={method})");
+    for method in ["sobolev", "pseudo"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={method})");
         fit_from_formula(&formula, &data, &cfg)
             .unwrap_or_else(|e| panic!("method=`{method}` failed: {e}"));
+    }
+    for (removed, canonical) in [
+        ("wahba", "sobolev"),
+        ("wahba_sobolev", "sobolev"),
+        ("wahba_pseudo", "pseudo"),
+        ("mgcv", "pseudo"),
+        ("sos", "pseudo"),
+    ] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={removed})");
+        let err = match fit_from_formula(&formula, &data, &cfg) {
+            Ok(_) => panic!("method=`{removed}` must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("unknown sphere method `{removed}`")) && err.contains(&format!("use `{canonical}`")),
+            "method=`{removed}` must name `{canonical}`, got: {err}"
+        );
     }
 }

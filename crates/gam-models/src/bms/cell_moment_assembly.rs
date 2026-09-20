@@ -89,8 +89,8 @@ pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJ
 /// `Arc::new`). Together with the joint-Hessian build this O(n·cells) rebuild is
 /// the bulk of biobank-fit wall-clock.
 ///
-/// This mirrors `custom_family::outer_objective::AssembledOperatorCache` one
-/// layer down: a module-level `OnceLock<Mutex<..>>`, FIFO capacity 2, keyed by a
+/// Like the custom-family `AssembledOperatorCache` one layer up, it is a
+/// module-level `OnceLock<Mutex<..>>` with FIFO capacity 2, here keyed by a
 /// content fingerprint over EXACTLY the build inputs. Reuse is gated on exact
 /// byte-equality of that fingerprint, so a hit returns an `Arc` to a cache that
 /// is bit-identical to a fresh rebuild — identical row contexts, cell moments,
@@ -3033,8 +3033,9 @@ impl BernoulliMarginalSlopeFamily {
     }
 
     /// The anchoring residual `Σ_k w_k Φ(η_k) − μ` at intercept `a` under the
-    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, and
-    /// `μ` (gam#2926: the closed-form certificate reads all three).
+    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, `μ`,
+    /// and the probabilities `Φ(η_k)` at the law's nodes (gam#2926: the closed-form
+    /// certificate reads all four).
     pub(super) fn evaluate_empirical_grid_anchoring_residual(
         &self,
         a: f64,
@@ -3043,7 +3044,7 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<(f64, f64, f64, Vec<f64>), String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let mut probabilities = Vec::with_capacity(grid.nodes.len());
         let mut mean = 0.0;
@@ -3065,7 +3066,7 @@ impl BernoulliMarginalSlopeFamily {
                  at intercept={a}"
             ));
         }
-        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu))
+        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu, probabilities))
     }
 
     pub(super) fn flex_active(&self) -> bool {
@@ -5147,6 +5148,123 @@ mod empirical_flex_jet_oracle_tests {
                     );
                 }
                 assert!(fourth_batched[2].iter().all(|value| *value == 0.0));
+            }
+        }
+    }
+
+    /// gam#2922: past `r` directions the batched third contraction reads every
+    /// direction off the `r` axis contractions, and past `r(r+1)/2` pairs the
+    /// batched fourth reads every pair off the axis-pair contractions. With `r + 1`
+    /// directions and all their pairs, both requests are past those counts, so
+    /// both are read off the axes. Every result is compared with the per-direction
+    /// and per-pair contractions the batch replaces, at widths up to the #3011
+    /// repro's pair count.
+    #[test]
+    fn contractions_read_off_the_row_axes_match_the_per_pair_contractions_2922() {
+        for is_score_warp in [true, false] {
+            for r in [4_usize, 8, 18] {
+                let fixture = make_dimension_fixture(is_score_warp, r);
+                let (q, slope, beta, _) = fixture_state(&fixture);
+                let states = fixture_block_states(q, slope, &beta);
+                let cache = fixture
+                    .family
+                    .build_exact_eval_cache(&states)
+                    .expect("empirical FLEX axis-basis oracle cache");
+                assert_eq!(cache.primary.total, r);
+                let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, 0);
+                let directions = (0..=r)
+                    .map(|lane| {
+                        Array1::from_shape_fn(r, |axis| {
+                            let magnitude = ((lane + 2) * (axis + 3) % 11 + 1) as f64 / 13.0;
+                            if (lane + axis) % 2 == 0 {
+                                magnitude
+                            } else {
+                                -0.6 * magnitude
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let pair_indices = (0..directions.len())
+                    .flat_map(|u| (u..directions.len()).map(move |v| (u, v)))
+                    .collect::<Vec<_>>();
+                assert!(
+                    directions.len() > r && pair_indices.len() > r * (r + 1) / 2,
+                    "control: the request must be past the axis counts"
+                );
+
+                let thirds = fixture
+                    .family
+                    .row_primary_third_contracted_many_with_moments(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &directions,
+                    )
+                    .expect("axis-basis empirical FLEX third contractions");
+                let mut third_scale = 0.0_f64;
+                for (lane, direction) in directions.iter().enumerate() {
+                    let single = fixture
+                        .family
+                        .row_primary_third_contracted(0, &states, &cache, row_ctx, direction)
+                        .expect("single empirical FLEX third contraction");
+                    third_scale = single
+                        .iter()
+                        .fold(third_scale, |m, value| m.max(value.abs()));
+                    assert_matrix_close(
+                        &format!("axis-basis third kind={is_score_warp} r={r} lane={lane}"),
+                        &single,
+                        &thirds[lane],
+                    );
+                }
+
+                let direction_pairs = pair_indices
+                    .iter()
+                    .map(|&(u, v)| (&directions[u], &directions[v]))
+                    .collect::<Vec<_>>();
+                let fourths = fixture
+                    .family
+                    .row_primary_fourth_contracted_many(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &direction_pairs,
+                    )
+                    .expect("axis-basis empirical FLEX fourth contractions");
+                let mut fourth_scale = 0.0_f64;
+                for (lane, &(direction_u, direction_v)) in direction_pairs.iter().enumerate() {
+                    let single = fixture
+                        .family
+                        .row_primary_fourth_contracted(
+                            0,
+                            &states,
+                            &cache,
+                            row_ctx,
+                            direction_u,
+                            direction_v,
+                        )
+                        .expect("single empirical FLEX fourth contraction");
+                    fourth_scale = single
+                        .iter()
+                        .fold(fourth_scale, |m, value| m.max(value.abs()));
+                    assert_matrix_close(
+                        &format!("axis-basis fourth kind={is_score_warp} r={r} lane={lane}"),
+                        &single,
+                        &fourths[lane],
+                    );
+                }
+                assert!(
+                    third_scale > 0.0 && fourth_scale > 0.0,
+                    "kind={is_score_warp} r={r}: the contractions carry no curvature \
+                     (third {third_scale:.3e}, fourth {fourth_scale:.3e})"
+                );
+                eprintln!(
+                    "#2922 axis basis kind={is_score_warp} r={r}: {} directions, {} pairs, \
+                     largest third {third_scale:.3e}, largest fourth {fourth_scale:.3e}",
+                    directions.len(),
+                    pair_indices.len(),
+                );
             }
         }
     }

@@ -42,7 +42,7 @@
 //! ## Identical inputs to both engines
 //!
 //! We build gam's design once — intercept + linear `x1` + cyclic cubic spline basis
-//! of `x2` (`s(x2, bs="cc")`) — via the real formula → design path, then feed that
+//! of `x2` (`s(x2, bs="cyclic")`) — via the real formula → design path, then feed that
 //! dense design (and the smooth's block penalty) to `fit_penalized_multinomial`,
 //! and hand the *same* dense design columns (including the intercept) to `MNLogit`.
 //! Both see byte-identical features and the identical integer response. gam uses a
@@ -134,7 +134,7 @@ fn gam_multinomial_recovers_true_class_simplex() {
         }
     }
 
-    // ---- build gam's design from the formula (intercept + x1 + cc(x2)) -------
+    // ---- build gam's design from the formula (intercept + x1 + cyclic(x2)) -------
     let headers = vec!["y".to_string(), "x1".to_string(), "x2".to_string()];
     let rows = (0..N)
         .map(|i| {
@@ -147,8 +147,8 @@ fn gam_multinomial_recovers_true_class_simplex() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ x1 + s(x2, bs=\"cc\")", &ds, &cfg)
-        .expect("gam builds the x1 + cc(x2) design");
+    let result = fit_from_formula("y ~ x1 + s(x2, bs=\"cyclic\")", &ds, &cfg)
+        .expect("gam builds the x1 + cyclic(x2) design");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit to expose the design");
     };
@@ -526,10 +526,10 @@ fn gam_multinomial_recovers_true_class_simplex_on_real_data() {
     // formula RHS and the covariates, never of the LHS values, so any well-posed
     // continuous response yields the identical basis. We deliberately do NOT
     // regress the integer ordinal class labels {0,1,2} here: on a short (~22-row)
-    // real split a 3-valued response can land near-constant after the every-4th
-    // hold-out, which trips gam's Gaussian near-constant guard ("response 'y' is
-    // effectively constant (sample sd ≈ 0)") and aborts the design harvest before
-    // the multinomial solver ever runs. Instead feed a strictly-varying continuous
+    // real split a 3-valued response can land constant after the every-4th
+    // hold-out, which routes the throwaway fit through the exact zero-dispersion
+    // Gaussian path instead of the ordinary design harvest before the
+    // multinomial solver ever runs. Instead feed a strictly-varying continuous
     // proxy `dy` (a smooth, monotone-in-row probe with guaranteed sample sd > 0)
     // as the design-harvest response. The ordinal labels still drive the real
     // claim via the one-hot multinomial fit further below; only the basis-builder

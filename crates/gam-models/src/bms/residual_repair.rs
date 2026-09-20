@@ -1003,14 +1003,14 @@ impl JointAnchorOnScore {
     }
 
     /// Under the candidate law `law` of the score, `(Σ_k w_k Φ(ã + B u_k) − μ, the
-    /// standard deviation of Φ(ã + B U), μ)`: the anchoring residual the
-    /// closed-form certificate reads, on the joint anchor.
+    /// standard deviation of Φ(ã + B U), μ, Φ(ã + B u_k) at the law's nodes)`: the
+    /// anchoring residual the closed-form certificate reads, on the joint anchor.
     pub(crate) fn anchoring_residual(
         &self,
         alpha: f64,
         mu: f64,
         law: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<(f64, f64, f64, Vec<f64>), String> {
         let intercept = self.score_intercept(alpha);
         let probabilities: Vec<(f64, f64)> = law
             .pairs()
@@ -1027,7 +1027,12 @@ impl JointAnchorOnScore {
                  variance={variance} at α={alpha}"
             ));
         }
-        Ok((mean - mu, variance.sqrt(), mu))
+        Ok((
+            mean - mu,
+            variance.sqrt(),
+            mu,
+            probabilities.into_iter().map(|(_, p)| p).collect(),
+        ))
     }
 }
 
@@ -1382,7 +1387,7 @@ mod residual_repair_kernel_tests {
                 let (alpha, _, _, _) =
                     residual_row_index(&marginal, g, &beta, 0.0, &[0.0, 0.0], &cov, anchored_on, s)
                         .unwrap();
-                let (residual, _, mu) = anchor.anchoring_residual(alpha, marginal.mu, scored_on).unwrap();
+                let (residual, _, mu, _) = anchor.anchoring_residual(alpha, marginal.mu, scored_on).unwrap();
                 let mut direct = 0.0;
                 for (z, w) in scored_on.pairs() {
                     for (e, we) in inner.pairs() {

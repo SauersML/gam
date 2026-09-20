@@ -10,7 +10,10 @@
 //! design surgery) must leave the fit clean and well-behaved: finite
 //! coefficients, a finite additive predictor (η at the training rows), a finite
 //! log-likelihood, a converged outer loop, and finite, sensible effective degrees
-//! of freedom.
+//! of freedom. Finiteness alone cannot show the absence of a bias, so where the
+//! simulated predictor is directly comparable (Gaussian, binomial-logit, the
+//! GAMLSS mean) the fit must also recover it within its own derived sampling
+//! error (`assert_recovers_truth`).
 //!
 //! One test per family that routes the (now unconditional) robustness machinery
 //! through a *distinct* solver path:
@@ -198,6 +201,53 @@ fn assert_zero_downside(family: &str, fit: &CleanFit) {
     );
 }
 
+/// The zero-downside claim itself: the fit is not biased. The battery above only
+/// shows the fit is finite, and a Jeffreys term that dragged every coefficient
+/// halfway to zero would still pass it (|β|, |η| < 1e3 against an O(1) truth).
+/// The data are simulated here, so the true predictor at the training rows is
+/// known, and the fit must recover it to within its own sampling error.
+///
+/// The bar is derived, not chosen. For a penalized (IRLS) fit η̂ = Xβ̂ with row
+/// Fisher weights `w_i`, the weighted trace of η̂'s sampling covariance at the
+/// training rows is at most the effective degrees of freedom, `Σ w_i Var(η̂_i) ≤
+/// edf ≤ p`, with `p` the number of coefficients in the channel. With `w_i ≥
+/// info_floor`, the row-averaged variance is at most `p / (n·info_floor)`. REML
+/// trades smoothing bias against that variance, so for a truth the basis resolves
+/// the bias² is of the same order, and three times the variance rms (nine times
+/// the MSE) cannot be reached by noise; that sum over `n` rows has about `edf`
+/// degrees of freedom. The Firth nudge the claim allows moves β by `O(p/n)`,
+/// far inside `√(p/n)`. A Jeffreys term that biases a well-identified fit breaks
+/// the bar; noise does not.
+fn assert_recovers_truth(
+    family: &str,
+    eta_hat: &[f64],
+    truth: &[f64],
+    coefs: usize,
+    info_floor: f64,
+) {
+    assert_eq!(
+        eta_hat.len(),
+        truth.len(),
+        "[{family}] fitted predictor and truth are over different rows"
+    );
+    let n = truth.len() as f64;
+    let rms = (eta_hat
+        .iter()
+        .zip(truth)
+        .map(|(a, b)| (a - b).powi(2))
+        .sum::<f64>()
+        / n)
+        .sqrt();
+    let bar = 3.0 * (coefs as f64 / (n * info_floor)).sqrt();
+    eprintln!("[clean-invariance:{family}] rms(η̂-η)={rms:.4e} bar={bar:.4e} p={coefs}");
+    assert!(
+        rms < bar,
+        "[{family}] the clean fit does not recover the simulated predictor: rms(η̂-η)={rms:.4e} \
+         exceeds the derived bar {bar:.4e} = 3·√(p/(n·w_min)) with p={coefs}, w_min={info_floor:.4e}; \
+         the always-on Jeffreys term biased a well-identified fit (zero-downside violated)"
+    );
+}
+
 // ───────────────────────── GAUSSIAN ─────────────────────────
 
 /// Clean, well-identified Gaussian additive fit. For the identity link the
@@ -206,6 +256,7 @@ fn assert_zero_downside(family: &str, fit: &CleanFit) {
 /// zero-downside.
 #[test]
 fn clean_fit_invariance_gaussian() {
+    const NOISE_SD: f64 = 0.15;
     init_parallelism();
     let n = 600usize;
     let two_pi = std::f64::consts::TAU;
@@ -213,10 +264,12 @@ fn clean_fit_invariance_gaussian() {
     let headers: Vec<String> = vec!["x".into(), "y".into()];
     let mut rows = Vec::with_capacity(n);
     let mut grid = Array2::<f64>::zeros((n, 2));
+    let mut truth_eta = Vec::with_capacity(n);
     for i in 0..n {
         let x = (i as f64 + 0.5) / n as f64;
         let truth = 0.4 + 0.8 * (two_pi * x).sin() + 0.3 * (two_pi * 2.0 * x).cos();
-        let y = truth + 0.15 * rng.normal();
+        truth_eta.push(truth);
+        let y = truth + NOISE_SD * rng.normal();
         rows.push(StringRecord::from(vec![
             format!("{x:.17e}"),
             format!("{y:.17e}"),
@@ -231,9 +284,17 @@ fn clean_fit_invariance_gaussian() {
         tg[[i, x_idx]] = (i as f64 + 0.5) / n as f64;
     }
 
-    let formula = "y ~ s(x, bs='tp', k=12)";
+    let formula = "y ~ s(x, bs='tps', k=12)";
     let fit = run_standard(formula, "gaussian", &data, &tg);
     assert_zero_downside("gaussian", &fit);
+    // Identity link: every row's Fisher weight is 1/σ².
+    assert_recovers_truth(
+        "gaussian",
+        &fit.eta_train,
+        &truth_eta,
+        fit.beta.len(),
+        1.0 / (NOISE_SD * NOISE_SD),
+    );
 }
 
 // ───────────────────────── BINOMIAL-LOGIT ─────────────────────────
@@ -252,12 +313,14 @@ fn clean_fit_invariance_binomial_logit() {
     let mut rng = Lcg(0x_B100_0002_10C1_u64);
     let headers: Vec<String> = vec!["x".into(), "y".into()];
     let mut rows = Vec::with_capacity(n);
+    let mut truth_eta = Vec::with_capacity(n);
     for i in 0..n {
         let x = (i as f64 + 0.5) / n as f64;
         // Mild logit surface kept inside [-1.8, 1.8] so p ∈ [0.14, 0.86] — no
         // region is near-separating.
         let eta = 0.3 + 1.2 * (two_pi * x).sin() - 0.4 * (two_pi * 2.0 * x).cos();
         let p = 1.0 / (1.0 + (-eta).exp());
+        truth_eta.push(eta);
         let y = if rng.unit() < p { 1.0 } else { 0.0 };
         rows.push(StringRecord::from(vec![
             format!("{x:.17e}"),
@@ -271,9 +334,25 @@ fn clean_fit_invariance_binomial_logit() {
         tg[[i, x_idx]] = (i as f64 + 0.5) / n as f64;
     }
 
-    let formula = "y ~ s(x, bs='tp', k=10)";
+    let formula = "y ~ s(x, bs='tps', k=10)";
     let fit = run_standard(formula, "binomial", &data, &tg);
     assert_zero_downside("binomial-logit", &fit);
+    // Logit link: a row's Fisher weight is p(1-p), smallest at the most extreme
+    // true predictor.
+    let info_floor = truth_eta
+        .iter()
+        .map(|&eta| {
+            let p = 1.0 / (1.0 + (-eta).exp());
+            p * (1.0 - p)
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert_recovers_truth(
+        "binomial-logit",
+        &fit.eta_train,
+        &truth_eta,
+        fit.beta.len(),
+        info_floor,
+    );
 }
 
 // ───────────────────────── GAMLSS (Gaussian location-scale) ─────────────────────────
@@ -306,13 +385,13 @@ fn clean_fit_invariance_gamlss_location_scale() {
     let data = encode_recordswith_inferred_schema(headers, rows).expect("encode gamlss");
     let x_idx = data.column_map()["x"];
 
-    let run = || -> CleanFit {
+    let run = || -> (CleanFit, usize) {
         let cfg = FitConfig {
             family: Some("gaussian".to_string()),
-            noise_formula: Some("1 + s(x, bs='tp', k=8)".to_string()),
+            noise_formula: Some("1 + s(x, bs='tps', k=8)".to_string()),
             ..FitConfig::default()
         };
-        let result = fit_from_formula("y ~ s(x, bs='tp', k=10)", &data, &cfg)
+        let result = fit_from_formula("y ~ s(x, bs='tps', k=10)", &data, &cfg)
             .unwrap_or_else(|e| panic!("clean gamlss fit returned Err: {e}"));
         let FitResult::GaussianLocationScale(ls) = result else {
             panic!("expected GaussianLocationScale");
@@ -341,18 +420,32 @@ fn clean_fit_invariance_gamlss_location_scale() {
             .clone();
         let mut eta_train = mean_d.design.apply(&beta_mean).to_vec();
         eta_train.extend(scale_d.design.apply(&beta_scale).to_vec());
-        summarize(
+        let clean = summarize(
             unified.beta.to_vec(),
             eta_train,
             unified.log_likelihood,
             unified.inference.as_ref().map(|i| i.edf_total),
             unified.log_lambdas.to_vec(),
             "gamlss",
-        )
+        );
+        (clean, beta_mean.len())
     };
 
-    let fit = run();
+    let (fit, mean_coefs) = run();
     assert_zero_downside("gamlss", &fit);
+    // The mean channel is the first `n` entries of the joint predictor. Its row
+    // Fisher weight is 1/σ_i², at least 1/max σ²; the Gaussian mean and scale are
+    // orthogonal parameters, so estimating σ adds only O(1/n) to the mean's
+    // variance.
+    let truth_mean: Vec<f64> = xs.iter().map(|&x| mu_true(x)).collect();
+    let sigma_max = xs.iter().map(|&x| sigma_true(x)).fold(0.0_f64, f64::max);
+    assert_recovers_truth(
+        "gamlss-mean",
+        &fit.eta_train[..n],
+        &truth_mean,
+        mean_coefs,
+        1.0 / (sigma_max * sigma_max),
+    );
 }
 
 // ───────────────────────── SURVIVAL (lognormal AFT location-scale) ─────────────────────────
@@ -407,7 +500,7 @@ fn clean_fit_invariance_survival_lognormal() {
         // relying on a wrong assumption that the default is location-scale.
         let mut cfg = FitConfig::default();
         cfg.survival_likelihood = Some("location-scale".to_string());
-        let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tp", k=6)"#, &data, &cfg)
+        let result = fit_from_formula(r#"Surv(t, event) ~ x + s(z, bs="tps", k=6)"#, &data, &cfg)
             .unwrap_or_else(|e| panic!("clean survival fit returned Err: {e}"));
         let variant_dbg = match &result {
             FitResult::Standard(_) => "Standard",

@@ -62,7 +62,7 @@ fn sphere_fit_predictions_stay_finite_and_close_to_truth_across_seeds() {
         let data = make_dataset(300, seed);
         // Use the pseudo-spline path (the historically fragile one) at m=4.
         let result = fit_from_formula(
-            "y ~ sphere(lat, lon, k=25, m=4, kernel=pseudo)",
+            "y ~ sphere(lat, lon, k=25, penalty_order=4, method=pseudo)",
             &data,
             &cfg,
         )

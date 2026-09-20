@@ -59,21 +59,31 @@ fn stopped_run_checkpoint(
                 last_solution.final_value,
                 best.value,
             );
-            let mut result = outer_result_with_gradient_norm(
-                best.rho,
-                best.value,
-                // The run spent its whole budget; `best.iterations` is only the index of
-                // the iterate adopted here.
-                last_solution.iterations,
-                Some(best.grad_norm),
-                false,
-                the_plan,
-            );
-            result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
-            result
+            // The run spent its whole budget; `best.iterations` is only the index of
+            // the iterate adopted here.
+            best_iterate_checkpoint(best, last_solution.iterations, the_plan)
         }
         _ => solution_into_outer_result(last_solution, false, the_plan),
     }
+}
+
+/// The cost-stall guard's best feasible accepted iterate as a non-converged
+/// checkpoint of a run that spent `iterations`.
+fn best_iterate_checkpoint(
+    best: CostStallExit,
+    iterations: usize,
+    the_plan: OuterPlan,
+) -> OuterResult {
+    let mut result = outer_result_with_gradient_norm(
+        best.rho,
+        best.value,
+        iterations,
+        Some(best.grad_norm),
+        false,
+        the_plan,
+    );
+    result.origin = OuterResultOrigin::ArcBestIterateSubstitution;
+    result
 }
 
 /// A one-shot reseed retry returns its own outcome, and that outcome knows only
@@ -1097,13 +1107,20 @@ pub(crate) fn run_outer_with_plan(
                         // decrement: on an interior step its predicted decrease
                         // IS ½gᵀH⁻¹g. Handing it the certificate's tolerance
                         // makes the stopping rule and the acceptance rule one
-                        // standard. τ_stat is absolute, so the threshold is
-                        // fixed for the run and does not depend on the units
-                        // of y or an additive constant in V. A route that
-                        // declares no size passes 0, which opt reads as "no
-                        // decrement stop"; the certificate then decides.
-                        .with_model_decrement_tolerance(super::run::outer_criterion_resolution(
-                            config,
+                        // standard. opt takes ONE number for the run, so the
+                        // stop decides at the criterion's resolution at the
+                        // seed's value (`outer_resolution` of its band, #3286):
+                        // `τ_stat` less that band, or on a route that declares
+                        // no size, which has no statistical slack, the band
+                        // itself. Passing the bare `τ_stat` handed such a route
+                        // 0, which opt reads as "no decrement stop".
+                        .with_model_decrement_tolerance(super::decrement_bands::outer_resolution(
+                            super::run::outer_criterion_resolution(config),
+                            super::decrement_bands::outer_value_band(
+                                config,
+                                seed_eval.cost,
+                                Some(&seed_evidence),
+                            ),
                         ));
                     // Installed unconditionally now that it also carries the
                     // trajectory census (#2735): a walk that ends on its budget
@@ -1301,10 +1318,19 @@ pub(crate) fn run_outer_with_plan(
                     // different critical cone than the iterates that follow it.
                     let seed_rail_bounds = rail_relaxed_bounds(&(lo.clone(), hi.clone()));
                     // Judged at the same criterion curvature resolution the
-                    // bridge's later verdicts use (#1082), so the seed is not a
-                    // strict saddle by a standard the iterates never face.
-                    let seed_curvature_resolution =
-                        super::run::criterion_curvature_resolution(cost_stall_resolution);
+                    // bridge's later verdicts use (#1082), at the seed's own
+                    // value (#3286), so the seed is not a strict saddle by a
+                    // standard the iterates never face.
+                    let seed_curvature_resolution = super::run::criterion_curvature_resolution(
+                        super::decrement_bands::outer_resolution(
+                            cost_stall_resolution,
+                            super::decrement_bands::outer_value_band(
+                                config,
+                                seed_eval.cost,
+                                Some(&seed_evidence),
+                            ),
+                        ),
+                    );
                     let seed_hessian_psd = seed_hessian.as_ref().and_then(|dense| {
                         reduced_hessian_psd_at_point(
                             &seed,
@@ -1412,7 +1438,32 @@ pub(crate) fn run_outer_with_plan(
                         optimizer = optimizer.with_fallback_policy(OptFallbackPolicy::Never);
                     }
                     match optimizer.run() {
-                        Ok(sol) => Ok(solution_into_outer_result(sol, true, *the_plan)),
+                        Ok(sol) => {
+                            // #3279 — opt's ARC ends on a trial whose projected gradient
+                            // clears its tolerance before that trial meets the ratio test,
+                            // so the point it returns can sit above the iterate the run
+                            // stood on. On the λ→∞ face of a REML criterion the gradient
+                            // vanishes at any height: the enriched Duchon fit stepped from
+                            // an accepted 7857.5 onto the face at 26383.9 and returned it
+                            // as its optimum. The claim stays a claim, but the lower
+                            // iterate the guard kept is an evaluated state of this attempt,
+                            // so it is the attempt's checkpoint, and the dominated-plateau
+                            // adjudication below declines a claim it beats (#2596, #2627)
+                            // and continues the search from it.
+                            let best_exit =
+                                cost_stall_exit.lock().ok().and_then(|slot| slot.clone());
+                            if let Some(best) = best_exit.filter(|best| {
+                                best.value.is_finite()
+                                    && (!sol.final_value.is_finite()
+                                        || best.value < sol.final_value)
+                            }) {
+                                retain_best_outer_checkpoint(
+                                    &mut best_checkpoint,
+                                    best_iterate_checkpoint(best, sol.iterations, *the_plan),
+                                );
+                            }
+                            Ok(solution_into_outer_result(sol, true, *the_plan))
+                        }
                         Err(ArcError::MaxIterationsReached { last_solution, .. }) => {
                             log::debug!(
                                 "[OUTER warning] {context}: ARC hit max_iter={} at final_value={:.6e} |g|={:.3e} | {}",
@@ -1642,7 +1693,6 @@ pub(crate) fn run_outer_with_plan(
                     // the device input below carries it as a raw `usize`, so we
                     // only need the wrapper for its bail-on-invalid behaviour.
                     outer_max_iterations(config.max_iter)?;
-                    let axis_caps_dev = bfgs_axis_step_caps(config, layout);
                     let seed_eval_dev = match eval_seed_restoring_rays(
                             obj,
                             config,
@@ -1682,14 +1732,18 @@ pub(crate) fn run_outer_with_plan(
                         // The host BFGS arm's cost-stall resolution, so the device
                         // walk ends on the same progress test instead of its
                         // iteration count (#2817).
-                        cost_stall_resolution: super::run::outer_criterion_resolution(config),
+                        // A per-step stall threshold, as the host guard charges an
+                        // unbanded value: `τ` floored at the seed value's own
+                        // representation error, never `0` (#3286).
+                        cost_stall_resolution: super::run::outer_criterion_resolution(config).max(
+                            super::decrement_bands::value_representation_band(seed_eval_dev.cost),
+                        ),
                         // opt's cost stall takes one number before the walk
                         // starts, so it gets the solver band this walk was driven
                         // to; the 1e-3 floor it used to add had no derivation, and
                         // the terminal certificate judges the point it stops at
                         // regardless (#2817).
                         cost_stall_projected_grad_tol: grad_tol_dev.abs,
-                        axis_step_caps: axis_caps_dev,
                         admission,
                         seed_objective: seed_eval_dev.cost,
                         seed_gradient: seed_eval_dev.gradient.clone(),
@@ -2073,9 +2127,6 @@ pub(crate) fn run_outer_with_plan(
                             if scale.is_finite() && scale > 0.0 {
                                 optimizer = optimizer.with_initial_metric(InitialMetric::Scalar(scale));
                             }
-                        }
-                        if let Some(caps) = bfgs_axis_step_caps(config, layout) {
-                            optimizer = optimizer.with_axis_step_caps(caps);
                         }
                         // The observer is installed UNCONDITIONALLY on this route
                         // (#2613). It used to be gated on `outer_inner_cap`, the

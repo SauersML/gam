@@ -1789,7 +1789,9 @@ fn bernoulli_contracted_psi_second_order_matches_per_pair_contraction() {
 #[test]
 fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
     use crate::custom_family::CustomFamilyBlockPsiDerivative;
-    use gam_custom_family::{build_contracted_psi_hook, build_psi_pair_callbacks};
+    use gam_custom_family::{
+        JeffreysPsiWorkspace, build_contracted_psi_hook, build_psi_pair_callbacks,
+    };
     use gam_problem::DriftDerivResult;
     use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
 
@@ -1917,6 +1919,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        JeffreysPsiWorkspace::Likelihood,
         None,
         None,
     )
@@ -1930,6 +1933,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        JeffreysPsiWorkspace::Likelihood,
         None,
         None,
     )
@@ -2050,6 +2054,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
         &penalty_counts,
         Some(&s_logdet_blocks),
         Some(std::sync::Arc::clone(&psi_workspace)),
+        JeffreysPsiWorkspace::Likelihood,
         None,
         None,
     )
@@ -2075,7 +2080,7 @@ fn bernoulli_contracted_psi_hook_matches_per_pair_with_penalty() {
 
 #[test]
 fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
-    use gam_custom_family::build_psi_hyper_coords;
+    use gam_custom_family::{JeffreysPsiWorkspace, build_psi_hyper_coords};
     use gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet;
     use gam_solve::estimate::reml::reml_outer_engine::{
         DenseSpectralOperator, HessianFactorization,
@@ -2290,6 +2295,7 @@ fn bernoulli_batched_outer_gradient_matches_hypercoord_path_for_rho_and_psi() {
         Some(&penalty_logdet_blocks),
         !family.exact_newton_joint_hessian_beta_dependent(),
         Some(workspace),
+        &JeffreysPsiWorkspace::Likelihood,
     )
     .expect("psi hyper coords");
     assert_eq!(psi_coords.len(), psi_dim);

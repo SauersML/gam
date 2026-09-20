@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::model_types::{Dispersion, EstimationError};
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::utils::stack_offsets;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use gam_problem::{
     FitStationarityEvidence, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
     LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, MixtureLinkSpec,
@@ -169,6 +170,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -281,6 +283,7 @@ mod per_term_edf_tests {
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -357,6 +360,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -561,6 +565,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -689,6 +694,13 @@ pub enum FacePositivityRoute {
     /// `f > 0` on the whole simplex, each cell's bound clearing its own
     /// rounding band.
     SimplexBound,
+    /// The ZERO-smoothing face (`λ_j → 0`, `j ∈ L`) of penalties whose ranges
+    /// the surviving penalties already cover. There the criterion is jointly
+    /// analytic in `λ_L` — no logdet rank changes as they vanish — so
+    /// `V = V(0) + Σ_{j∈L} c′_j λ_j + O(|λ|²)` on the closed orthant, exactly
+    /// linear at first order, and the face is a strict minimizer iff every
+    /// `c′_j` clears its rounding band `τ_j` (the KKT test at `λ = 0`).
+    CoveredZeroSmoothing,
 }
 
 /// What established a rail coordinate's tail law, and the standard it cleared
@@ -724,7 +736,9 @@ pub enum RailTailEvidence {
         /// [`FacePositivityRoute::PositiveForm`], the binding coordinate's
         /// analytic pencil constant `c_j` on
         /// [`FacePositivityRoute::IndependentRanges`], the binding simplex
-        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`].
+        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`],
+        /// the binding coordinate's `λ`-slope `c′_j` on
+        /// [`FacePositivityRoute::CoveredZeroSmoothing`].
         statistic: f64,
         /// The rounding band that statistic had to clear, from the measured
         /// error of forming `C` in floating point (never a tuned margin).
@@ -3011,9 +3025,6 @@ pub enum SmoothingCorrectionAbsence {
     OuterHessianUndeclared { reason: OuterHessianAbsence },
     /// The interior ρ-Hessian was formed but refused inversion on its identified subspace.
     InteriorRhoHessianRefused { refusal: String },
-    /// The outer ρ-Hessian has no analytic form for this fit: a non-canonical Firth link whose
-    /// outer search ran first-order.
-    OuterHessianNotAnalytic { detail: String },
     /// The optimum is certified on an infinite-smoothing rail, where ρ has no finite variance.
     ///
     /// No longer produced: the correction excludes railed coordinates exactly as the outer
@@ -3066,9 +3077,6 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
             }
             Self::InteriorRhoHessianRefused { refusal } => {
                 write!(f, "the interior rho-Hessian refused inversion: {refusal}")
-            }
-            Self::OuterHessianNotAnalytic { detail } => {
-                write!(f, "the outer rho-Hessian has no analytic form: {detail}")
             }
             Self::RailCertified { detail } => write!(
                 f,
@@ -3227,6 +3235,13 @@ pub struct FitInference {
     /// does not form this Hessian.
     #[serde(default)]
     pub identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    /// The working residual `‖z − Xβ̂‖²_W` over the `n⁺` rows that carry
+    /// curvature, in the metric of [`Self::weighted_gram`]. The smooth score
+    /// test's estimated scale reads the full model's unpenalized residual off
+    /// it (gam#3832). `None` where the fit publishes no working model in that
+    /// metric.
+    #[serde(default)]
+    pub working_residual: Option<WorkingResidual>,
 }
 
 /// The wire form [`FitInference`] deserializes through.
@@ -3273,6 +3288,8 @@ struct FitInferenceWire {
     weighted_gram: Option<Array2<f64>>,
     #[serde(default)]
     identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    #[serde(default)]
+    working_residual: Option<WorkingResidual>,
 }
 
 impl From<FitInferenceWire> for FitInference {
@@ -3302,6 +3319,7 @@ impl From<FitInferenceWire> for FitInference {
             coefficient_influence: wire.coefficient_influence,
             weighted_gram: wire.weighted_gram,
             identified_subspace: wire.identified_subspace,
+            working_residual: wire.working_residual,
         }
     }
 }
@@ -3870,6 +3888,7 @@ mod assembly_inner_status_gate_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -4707,9 +4726,9 @@ mod assembly_inner_status_gate_tests {
                 weighted_gram: &gram,
                 coeff_range: 0..2,
                 structural_penalties: &[Array2::eye(2)],
-                covariance_scale: 1.0,
-                residual_df: Some(50.0),
-                scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
+                scale: gam_terms::inference::smooth_score_test::ScoreTestScale::Known {
+                    covariance_scale: 1.0,
+                },
             },
         )
         .expect("the term is testable")

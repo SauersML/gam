@@ -30,11 +30,16 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Distribution, Normal, Uniform};
 
+/// Observation-noise standard deviation of the fixture.
+const NOISE_SD: f64 = 0.05;
+/// Number of fitted observations.
+const N_OBS: usize = 400;
+
 fn make_dataset(n: usize) -> gam::data::EncodedDataset {
     let mut rng = StdRng::seed_from_u64(7);
     let u_lat = Uniform::new(-80.0_f64, 80.0).expect("uniform");
     let u_lon = Uniform::new(-179.0_f64, 179.0).expect("uniform");
-    let noise = Normal::new(0.0, 0.05).expect("normal");
+    let noise = Normal::new(0.0, NOISE_SD).expect("normal");
     let headers = ["lat", "lon", "y"].into_iter().map(String::from).collect();
     let mut rows = Vec::with_capacity(n);
     for _ in 0..n {
@@ -57,8 +62,10 @@ fn truth(lat: f64, lon: f64) -> f64 {
     0.5 + 0.6 * lat.to_radians().sin() + 0.3 * lat.to_radians().cos() * lon.to_radians().cos()
 }
 
-fn fit_predict(formula: &str) -> Vec<f64> {
-    let data = make_dataset(400);
+/// Fit `formula` and return its predictions on the evaluation grid together
+/// with the number of fitted coefficients `p`.
+fn fit_predict(formula: &str) -> (Vec<f64>, usize) {
+    let data = make_dataset(N_OBS);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -82,7 +89,10 @@ fn fit_predict(formula: &str) -> Vec<f64> {
         m[[i, 1]] = *lon;
     }
     let design = build_term_collection_design(m.view(), &fit.resolvedspec).expect("rebuild design");
-    design.design.apply(&fit.fit.beta).to_vec()
+    (
+        design.design.apply(&fit.fit.beta).to_vec(),
+        fit.fit.beta.len(),
+    )
 }
 
 fn rmse(pred: &[f64]) -> f64 {
@@ -111,33 +121,51 @@ fn reml_pseudo_and_sobolev_m4_both_recover_smooth_truth() {
     // same predictions (different λ in the original kernel units, same
     // effective smoother).
     init_parallelism();
-    let pred_sob = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let pred_pse = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=pseudo)");
+    let (pred_sob, p_sob) =
+        fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
+    let (pred_pse, p_pse) =
+        fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=pseudo)");
     let rmse_sob = rmse(&pred_sob);
     let rmse_pse = rmse(&pred_pse);
-    eprintln!("[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_pse={rmse_pse:.4}");
-    assert!(
-        rmse_sob < 0.10,
-        "Sobolev m=4 collapsed: rmse={rmse_sob:.4} (historical 0.0045 expected)",
+    // Both bars come from the fixture. A linear smoother with p
+    // coefficients has design-averaged variance sigma^2 * edf / n
+    // <= sigma^2 * p / n. The truth is a constant plus degree-1 spherical
+    // harmonics, which the basis resolves, so the variance term bounds the
+    // rmse. The equispaced grid follows the data's uniform lat/lon law.
+    // Three times that ceiling leaves no room for noise-driven failure,
+    // and still catches any over-smoothing that loses more than a few
+    // sigma * sqrt(p / n).
+    let p = p_sob.max(p_pse) as f64;
+    let rmse_bar = 3.0 * NOISE_SD * (p / N_OBS as f64).sqrt();
+    eprintln!(
+        "[reml-scale] m=4: rmse_sob={rmse_sob:.4} rmse_pse={rmse_pse:.4} bar={rmse_bar:.4} (p={p})"
     );
     assert!(
-        rmse_pse < 0.10,
-        "Pseudo m=4 collapsed: rmse={rmse_pse:.4} — this is the historical mgcv-pseudo \
-         m=4 collapse; the REML pipeline needs to be scale-invariant for this case to work",
+        rmse_sob < rmse_bar,
+        "Sobolev m=4 collapsed: rmse={rmse_sob:.4} exceeds 3*sigma*sqrt(p/n)={rmse_bar:.4}",
     );
-    // Pointwise the two fits should agree within a generous tolerance,
-    // not byte-for-byte (they're different RKHS) but qualitatively
-    // (REML chooses near-equivalent smoothers).
+    assert!(
+        rmse_pse < rmse_bar,
+        "Pseudo m=4 collapsed: rmse={rmse_pse:.4} exceeds 3*sigma*sqrt(p/n)={rmse_bar:.4}; \
+         this is the historical mgcv-pseudo m=4 collapse, and the REML pipeline needs to be \
+         scale-invariant for this case to work",
+    );
+    // Pointwise agreement. The largest of N Gaussian errors whose rms is
+    // at most rmse_bar is at most sqrt(2 ln N) * rmse_bar. The triangle
+    // inequality then bounds the disagreement of the two fits by twice
+    // that.
+    let n_grid = pred_sob.len() as f64;
+    let agreement_bar = 2.0 * (2.0 * n_grid.ln()).sqrt() * rmse_bar;
     let max_abs_diff: f64 = pred_sob
         .iter()
         .zip(pred_pse.iter())
         .map(|(a, b)| (a - b).abs())
         .fold(0.0, f64::max);
-    eprintln!("[reml-scale] m=4: max |Δ pred| = {max_abs_diff:.4}");
+    eprintln!("[reml-scale] m=4: max |Δ pred| = {max_abs_diff:.4} (bar {agreement_bar:.4})");
     assert!(
-        max_abs_diff < 0.50,
+        max_abs_diff < agreement_bar,
         "Sobolev m=4 and Pseudo m=4 fits disagree by max {max_abs_diff:.4} \
-         (budget 0.50). Either the kernels are wildly different or REML \
-         picked very different effective smoothers — likely a scale-invariance issue.",
+         (bar 2*sqrt(2 ln N)*rmse_bar = {agreement_bar:.4}). REML picked different \
+         effective smoothers for kernels that differ only in scale.",
     );
 }
