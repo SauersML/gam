@@ -128,8 +128,6 @@ def test_oos_fixed_decoder_recovers_one_hot_oracle_assignments() -> None:
         alpha=1.0,
         tau=0.25,
         assignment_kind="softmax",
-        max_iter=4,
-        learning_rate=1.0,
         log_lambda_sparse=float(np.log(0.01)),
         log_lambda_smooth=[float(np.log(0.01)), float(np.log(0.01))],
         log_ard=[[], []],
