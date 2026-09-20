@@ -2232,56 +2232,6 @@ where
     )
 }
 
-/// Prediction with coefficient uncertainty propagation.
-///
-/// The linear predictor variance uses:
-/// Var(η_i) = x_i^T Var(β) x_i. With the default
-/// [`InferenceCovarianceMode::SmoothingCorrected`], `Var(β)` is
-/// the smoothing-parameter-marginalized `Vp` when the fit exposes it, i.e. the
-/// Kass--Steffey / Wood--Pya--Säfken first-order correction
-/// `Vb + (∂β/∂ρ) V_ρ (∂β/∂ρ)^T`. Therefore the analytic SE path reports
-/// `x_i^T Vb x_i + (∂f_i/∂ρ) V_ρ (∂f_i/∂ρ)^T` without recomputing or
-/// duplicating the IFT algebra at prediction time.
-///
-/// Mean-scale SEs are the posterior SD of the response over that same
-/// Gaussian η posterior, `√Var[g⁻¹(η_i)]` with `η_i ~ N(η̂_i, Var(η_i))`, from
-/// the family's `posterior_meanvariance` integral (not the delta method
-/// `|dμ/dη|·SE(η)`, which vanishes wherever the inverse link saturates).
-///
-/// Math note (logit family, Gaussian η posterior):
-///
-/// If η_i | D ≈ N(m_i, v_i), then the exact posterior predictive mean on the
-/// probability scale is the logistic-normal integral
-///
-///   E[sigmoid(η_i)] = ∫ sigmoid(x) N(x; m_i, v_i) dx.
-///
-/// This does not reduce to an elementary closed form. Two exact representations
-/// often used in the literature are:
-///
-/// 1) Theta/Appell-Lerch style representations (via Poisson summation / Mordell integrals).
-/// 2) Absolutely convergent complex-error-function (Faddeeva) series obtained from
-///    partial-fraction expansions of tanh/logistic.
-///
-/// A practical exact series form is:
-///
-///   E[sigmoid(η)] = 1/2
-///                   - (sqrt(2π)/σ) * Σ_{n>=1} Im[ w((i a_n - μ)/(sqrt(2)σ)) ],
-///   where a_n = (2n-1)π, σ = sqrt(v), and w is the Faddeeva function
-///   w(z) = exp(-z^2) erfc(-i z).
-///
-/// The formulas above define the exact logistic-normal target moments under
-/// Gaussian η uncertainty.
-///
-/// CLogLog note (exact target):
-/// If p = 1 - exp(-exp(η)) and η ~ N(μ,σ²), then
-///   E[p] = 1 - I(1),  E[p²] = 1 - 2I(1) + I(2),  Var(p) = I(2) - I(1)²
-/// where I(λ) = E[exp(-λ exp(η))] is the lognormal Laplace transform.
-/// This identity is exact, and highlights that the moments are determined by
-/// the lognormal Laplace transform values at λ=1 and λ=2.
-///
-/// Exact analytic representation (Mellin-Barnes) for I(λ):
-///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
-/// This Mellin-Barnes integral is mathematically exact.
 /// Per-row Gaussian conditional response (observation-noise) variance
 /// `Var(Y_i | μ_i) = σ̂² / w_i` (#2077).
 ///
@@ -2811,6 +2761,56 @@ pub(crate) fn family_observation_band_per_row(
     Ok(Some((lower, upper)))
 }
 
+/// Prediction with coefficient uncertainty propagation.
+///
+/// The linear predictor variance uses:
+/// Var(η_i) = x_i^T Var(β) x_i. With the default
+/// [`InferenceCovarianceMode::SmoothingCorrected`], `Var(β)` is
+/// the smoothing-parameter-marginalized `Vp` when the fit exposes it, i.e. the
+/// Kass--Steffey / Wood--Pya--Säfken first-order correction
+/// `Vb + (∂β/∂ρ) V_ρ (∂β/∂ρ)^T`. Therefore the analytic SE path reports
+/// `x_i^T Vb x_i + (∂f_i/∂ρ) V_ρ (∂f_i/∂ρ)^T` without recomputing or
+/// duplicating the IFT algebra at prediction time.
+///
+/// Mean-scale SEs are the posterior SD of the response over that same
+/// Gaussian η posterior, `√Var[g⁻¹(η_i)]` with `η_i ~ N(η̂_i, Var(η_i))`, from
+/// the family's `posterior_meanvariance` integral (not the delta method
+/// `|dμ/dη|·SE(η)`, which vanishes wherever the inverse link saturates).
+///
+/// Math note (logit family, Gaussian η posterior):
+///
+/// If η_i | D ≈ N(m_i, v_i), then the exact posterior predictive mean on the
+/// probability scale is the logistic-normal integral
+///
+///   E[sigmoid(η_i)] = ∫ sigmoid(x) N(x; m_i, v_i) dx.
+///
+/// This does not reduce to an elementary closed form. Two exact representations
+/// often used in the literature are:
+///
+/// 1) Theta/Appell-Lerch style representations (via Poisson summation / Mordell integrals).
+/// 2) Absolutely convergent complex-error-function (Faddeeva) series obtained from
+///    partial-fraction expansions of tanh/logistic.
+///
+/// A practical exact series form is:
+///
+///   E[sigmoid(η)] = 1/2
+///                   - (sqrt(2π)/σ) * Σ_{n>=1} Im[ w((i a_n - μ)/(sqrt(2)σ)) ],
+///   where a_n = (2n-1)π, σ = sqrt(v), and w is the Faddeeva function
+///   w(z) = exp(-z^2) erfc(-i z).
+///
+/// The formulas above define the exact logistic-normal target moments under
+/// Gaussian η uncertainty.
+///
+/// CLogLog note (exact target):
+/// If p = 1 - exp(-exp(η)) and η ~ N(μ,σ²), then
+///   E[p] = 1 - I(1),  E[p²] = 1 - 2I(1) + I(2),  Var(p) = I(2) - I(1)²
+/// where I(λ) = E[exp(-λ exp(η))] is the lognormal Laplace transform.
+/// This identity is exact, and highlights that the moments are determined by
+/// the lognormal Laplace transform values at λ=1 and λ=2.
+///
+/// Exact analytic representation (Mellin-Barnes) for I(λ):
+///   I(λ) = (1/(2πi)) ∫_{c-i∞}^{c+i∞} Γ(z) λ^{-z} exp(-μ z + 0.5 σ² z²) dz, c>0.
+/// This Mellin-Barnes integral is mathematically exact.
 pub fn predict_gamwith_uncertainty<X, S>(
     x: X,
     beta: ArrayView1<'_, f64>,
