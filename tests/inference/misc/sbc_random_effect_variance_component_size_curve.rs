@@ -130,7 +130,6 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
     let rows = smooth_term_summary_rows(
         &fit.design,
         &fit.fit,
-        fit.fit.weighted_gram(),
         SummaryBlockOffset::default(),
     );
     let row = rows
