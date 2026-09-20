@@ -1339,31 +1339,22 @@ impl SaeManifoldOuterObjective {
             OuterEvaluationArtifacts::ArrowOrbit(geometry) => {
                 // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
                 // log-determinant channel and the adjoint read the orbit lane's elimination.
-                let solver = DeflatedArrowSolver::plain(&evaluation.cache);
                 self.term
                     .analytic_outer_rho_gradient_components_arrow_orbit(
                     self.target.view(),
                     rho,
                     &evaluation.loss,
                     &evaluation.cache,
-                    &solver,
                     geometry,
                 )?
             }
             OuterEvaluationArtifacts::Dense(geometry) => {
-                let lambda_smooth = rho
-                    .lambda_smooth_vec()
-                    .map_err(OuterGradientError::internal)?;
-                let solver = self
-                    .term
-                    .outer_gradient_arrow_solver(&evaluation.cache, &lambda_smooth)?;
                 self.term
                     .analytic_outer_rho_gradient_components_with_bundle(
                         self.target.view(),
                         rho,
                         &evaluation.loss,
                         &evaluation.cache,
-                        &solver,
                         None,
                         None,
                         Some(geometry),
@@ -1384,14 +1375,12 @@ impl SaeManifoldOuterObjective {
         matrix_free: &MatrixFreeOuterArtifacts,
         vectors: &[Array1<f64>],
     ) -> Result<SaeOuterRhoGradientComponents, OuterGradientError> {
-        let solver = DeflatedArrowSolver::plain(&evaluation.cache);
         self.term
             .analytic_outer_rho_gradient_components_with_bundle(
                 self.target.view(),
                 rho,
                 &evaluation.loss,
                 &evaluation.cache,
-                &solver,
                 // #2515/#2668 — the ranked criterion on this lane is
                 // `½log|A| + rank_charge`, coordinate block included
                 // (`rank_adjusted_quasi_laplace_complexity` takes `½log_det`, and
