@@ -1,7 +1,7 @@
 //! Typed automatic seed construction for the minimal SAE fit surface (#2236).
 //!
 //! This module owns topology discovery, PCA seeding, atom plans, padded basis
-//! stacks, cold routing policy, deterministic jitter, and decoder LSQ init.
+//! stacks, cold routing policy, and decoder LSQ init.
 
 use ndarray::{Array2, Array3, Array4, ArrayView2, ArrayView3};
 
@@ -270,22 +270,6 @@ pub fn build_sae_minimal_seed(
             RESIDUAL_SEED_GAIN,
         )?;
     }
-    if logits_are_cold {
-        const RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
-        let mut state = request
-            .random_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        for row in 0..n_obs {
-            for atom_idx in 0..k_atoms {
-                state = state
-                    .wrapping_mul(6364136223846793005)
-                    .wrapping_add(1442695040888963407);
-                let unit = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
-                initial_logits[[row, atom_idx]] += RANDOM_STATE_LOGIT_JITTER * (2.0 * unit - 1.0);
-            }
-        }
-    }
     let decoder_coefficients = sae_decoder_lsq_init(
         basis_values.view(),
         &basis_sizes,
@@ -334,6 +318,61 @@ mod tests {
         .err()
         .expect("empty target must fail");
         assert!(error.contains("non-empty"));
+    }
+
+    /// The cold routing seed is the data's own residual preference and
+    /// nothing else (#3090): no `random_state`-keyed logit perturbation is
+    /// added on top of it. A single atom has no routing to seed, so its cold
+    /// logits stay exactly neutral; two atoms carry exactly the mean-centred
+    /// residual logits of the seed basis stack, bit for bit, for every seed.
+    #[test]
+    fn cold_routing_seed_is_the_residual_seed_without_perturbation_3090() {
+        let n = 64usize;
+        let mut target = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let theta = std::f64::consts::TAU * row as f64 / n as f64;
+            let radius = if row % 2 == 0 { 1.0 } else { 2.5 };
+            target[[row, 0]] = radius * theta.cos();
+            target[[row, 1]] = radius * theta.sin();
+        }
+        let seed = |atoms: usize, random_state: u64| {
+            build_sae_minimal_seed(SaeMinimalSeedRequest {
+                target: target.view(),
+                atom_basis: vec!["periodic".to_string(); atoms],
+                atom_dim: vec![1; atoms],
+                assignment_kind: SaeFitAssignmentKind::Softmax,
+                alpha: 1.0,
+                tau: 1.0,
+                threshold: 0.0,
+                top_k: None,
+                random_state,
+                initial_logits: None,
+                initial_coords: None,
+            })
+            .expect("a planted two-circle seed must build")
+        };
+
+        let single = seed(1, 11);
+        assert!(
+            single.initial_logits.iter().all(|&logit| logit == 0.0),
+            "a single atom's cold logits must be exactly neutral"
+        );
+
+        for random_state in [0_u64, 11, 20260920] {
+            let report = seed(2, random_state);
+            let basis_sizes: Vec<usize> = report
+                .geometry_plans
+                .iter()
+                .map(|plan| plan.basis_size().expect("seed plans carry a basis size"))
+                .collect();
+            let residual =
+                sae_residual_seed_logits(report.basis_values.view(), &basis_sizes, target.view(), 4.0)
+                    .expect("the residual seed of the report's own basis must build");
+            assert_eq!(
+                report.initial_logits, residual,
+                "random_state={random_state}: the cold logits must be the residual seed itself"
+            );
+        }
     }
 
     #[test]

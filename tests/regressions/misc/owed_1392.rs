@@ -52,7 +52,7 @@ use ndarray::Array2;
 ///
 /// `double_penalty=false` is mgcv's `bs="ps"` convention (the polynomial null
 /// space stays unpenalized, so a linear trend is recovered rather than shrunk
-/// away); `double_penalty=true` is gam's default (`s(col, type=ps)`), which adds
+/// away); `double_penalty=true` is gam's default (`s(col, bs=ps)`), which adds
 /// a null-space shrinkage ridge mgcv's `bs="ps"` does NOT have unless
 /// `select=TRUE` is set. The catastrophic-underfit path #1364/#1365 corrected is
 /// the single-penalty (`false`) path.
@@ -276,7 +276,7 @@ fn pspline_recovers_near_linear_year_scale_truth_1392() {
 }
 
 /// #1392 (c) — fairness arm: isolate the catastrophe to the COMPARISON, not the
-/// fit. The fuzz-vs-mgcv harness fits gam with `s(col, type=ps)` — which
+/// fit. The fuzz-vs-mgcv harness fits gam with `s(col, bs=ps)` — which
 /// DEFAULTS to `double_penalty=true` (a null-space shrinkage ridge) — but the
 /// mgcv comparator emits plain `s(col, bs='ps', k=...)` with NO `select=TRUE`,
 /// i.e. a SINGLE penalty with the polynomial null space left unpenalized
