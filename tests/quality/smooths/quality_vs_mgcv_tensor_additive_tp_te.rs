@@ -1,5 +1,5 @@
 //! End-to-end quality: gam's *additive* combination of two heterogeneous smooth
-//! types — an isotropic 2-D thin-plate `s(x1, x2, bs="tp")` plus a separable
+//! types — an isotropic 2-D thin-plate `s(x1, x2, bs="tps")` plus a separable
 //! anisotropic tensor `te(z, w)` — must RECOVER THE KNOWN ADDITIVE TRUTH on
 //! noise-free synthetic data.
 //!
@@ -98,7 +98,7 @@ fn gam_additive_tp_plus_te_matches_mgcv() {
         "degenerate truth signal range: {signal_range}"
     );
 
-    // ---- fit with gam: y ~ s(x1,x2,bs="tp",k=10) + te(z,w,k=6), REML --------
+    // ---- fit with gam: y ~ s(x1,x2,bs="tps",k=10) + te(z,w,k=6), REML --------
     let headers = ["x1", "x2", "z", "w", "y"]
         .into_iter()
         .map(String::from)
@@ -125,7 +125,7 @@ fn gam_additive_tp_plus_te_matches_mgcv() {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = fit_from_formula("y ~ s(x1, x2, bs=\"tp\", k=10) + te(z, w, k=6)", &ds, &cfg)
+    let result = fit_from_formula("y ~ s(x1, x2, bs=\"tps\", k=10) + te(z, w, k=6)", &ds, &cfg)
         .expect("gam additive tp+te fit");
     let FitResult::Standard(fit) = result else {
         panic!("expected a standard GAM fit for an additive gaussian tp+te model");

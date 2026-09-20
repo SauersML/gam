@@ -35,10 +35,10 @@ fn gam_binomial_location_scale_rejects_smooth_log_sigma_on_bernoulli_data() {
 
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
-        noise_formula: Some("1 + s(x, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(x, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let err = match fit_from_formula("y ~ s(x, bs='tp')", &ds, &cfg) {
+    let err = match fit_from_formula("y ~ s(x, bs='tps')", &ds, &cfg) {
         Ok(_) => panic!("Bernoulli free log_sigma smooth must be rejected"),
         Err(err) => err,
     };
@@ -74,10 +74,10 @@ fn gam_binomial_location_scale_real_data_timeout_case_rejects_before_optimizer()
 
     let cfg = FitConfig {
         family: Some("binomial".to_string()),
-        noise_formula: Some("1 + s(pc1, bs='tp') + s(pc2, bs='tp')".to_string()),
+        noise_formula: Some("1 + s(pc1, bs='tps') + s(pc2, bs='tps')".to_string()),
         ..FitConfig::default()
     };
-    let err = match fit_from_formula("y ~ s(pc1, bs='tp') + s(pc2, bs='tp')", &train_ds, &cfg) {
+    let err = match fit_from_formula("y ~ s(pc1, bs='tps') + s(pc2, bs='tps')", &train_ds, &cfg) {
         Ok(_) => panic!("real-data Bernoulli smooth log_sigma timeout case must be rejected"),
         Err(err) => err,
     };

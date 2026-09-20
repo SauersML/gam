@@ -98,10 +98,9 @@ pub(crate) fn survival_rigid_row_vgh_decision(
     let decision = gam_gpu::decide_row_kernel(
         gam_gpu::global_policy(),
         gam_gpu::RowKernelAdmission {
-            kernel: gam_gpu::GpuKernel::SurvivalMarginalSlopeRows,
             missing_capability: SURVIVAL_ROWJET_CAPABILITY.missing_for(model),
             compiled: cfg!(target_os = "linux"),
-            size: gam_gpu::RowKernelSize::Measured(gam_gpu::RowKernelShape {
+            shape: gam_gpu::RowKernelShape {
                 kernel: gam_gpu::GpuKernel::SurvivalMarginalSlopeRows,
                 rows: n_rows,
                 widths: [
@@ -111,7 +110,7 @@ pub(crate) fn survival_rigid_row_vgh_decision(
                     0,
                 ],
                 threads: rayon::current_num_threads(),
-            }),
+            },
         },
         &mut gam_gpu::RuntimeDeviceProbe,
     )

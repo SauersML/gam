@@ -734,8 +734,10 @@ pub(crate) fn dispersion_row_loglik(
 // normalizer), and the row log-likelihood comes from the plain-f64 functions
 // above. Values that multiply a jet (the negative binomial `−ln r`, the Beta mean,
 // the Tweedie deviance terms) are always supplied. The programs emit through
-// third order, whose surfaces read stack entries through the third, so every
-// fourth entry is zero.
+// fourth order: the contracted fourth surface is the observed Hessian's second
+// directional derivative, which the exact outer rho-Hessian consumes. A surface of
+// order `k` reads the stack entries through `k`, so the polygamma entries above the
+// requested order are zero and only the fourth surface reads the pentagamma ones.
 // ============================================================================
 
 // NB2: ℓ = ln Γ(θ + y) − ln Γ(θ) − ln Γ(y + 1) + θ ln r + y ln q, with
@@ -753,16 +755,18 @@ row_program! {
         digamma_total,
         trigamma_total,
         tetragamma_total,
+        pentagamma_total,
         ln_gamma_theta,
         digamma_theta,
         trigamma_theta,
         tetragamma_theta,
+        pentagamma_theta,
         neg_log_theta_share,
         neg_log_mu_share,
         mu_share,
         theta_share
     )
-    emit [order2, third];
+    emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         ln_gamma_at_total => supplied,
@@ -782,7 +786,7 @@ row_program! {
             digamma_total,
             trigamma_total,
             tetragamma_total,
-            0.0
+            pentagamma_total
         );
         let ln_gamma_theta_jet = compose(
             ln_gamma_at_theta,
@@ -791,7 +795,7 @@ row_program! {
             digamma_theta,
             trigamma_theta,
             tetragamma_theta,
-            0.0
+            pentagamma_theta
         );
         let spread = add(delta_mu, neg(delta_d));
         let theta_gap = compose(
@@ -801,7 +805,7 @@ row_program! {
             mu_share,
             mu_share * theta_share,
             mu_share * theta_share * (theta_share - mu_share),
-            0.0
+            mu_share * theta_share * (1.0 - 6.0 * mu_share * theta_share)
         );
         let reverse_spread = neg(spread);
         let mu_gap = compose(
@@ -811,7 +815,7 @@ row_program! {
             theta_share,
             mu_share * theta_share,
             mu_share * theta_share * (mu_share - theta_share),
-            0.0
+            mu_share * theta_share * (1.0 - 6.0 * mu_share * theta_share)
         );
         let ln_gamma_ratio = add(ln_gamma_total_jet, neg(ln_gamma_theta_jet));
         let log_shares = add(mul(precision, theta_gap), scale(mu_gap, count));
@@ -832,9 +836,10 @@ row_program! {
         ln_gamma_shape,
         digamma_shape,
         trigamma_shape,
-        tetragamma_shape
+        tetragamma_shape,
+        pentagamma_shape
     )
-    emit [order2, third];
+    emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         ln_gamma_at_shape => supplied,
@@ -854,7 +859,7 @@ row_program! {
             digamma_shape,
             trigamma_shape,
             tetragamma_shape,
-            0.0
+            pentagamma_shape
         );
         let scaled_response = scale(inverse_mean_ratio, response_ratio);
         let kernel = add(mul(precision, log_ratio), neg(ln_gamma_jet));
@@ -874,22 +879,26 @@ row_program! {
         mean_first,
         mean_second,
         mean_third,
+        mean_fourth,
         log_response,
         log_complement,
         ln_gamma_precision,
         digamma_precision,
         trigamma_precision,
         tetragamma_precision,
+        pentagamma_precision,
         ln_gamma_first_shape,
         digamma_first_shape,
         trigamma_first_shape,
         tetragamma_first_shape,
+        pentagamma_first_shape,
         ln_gamma_second_shape,
         digamma_second_shape,
         trigamma_second_shape,
-        tetragamma_second_shape
+        tetragamma_second_shape,
+        pentagamma_second_shape
     )
-    emit [order2, third];
+    emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         logistic => supplied,
@@ -899,7 +908,7 @@ row_program! {
     }
     witnesses [];
     {
-        let mean_jet = compose(logistic, delta_mu, mean, mean_first, mean_second, mean_third, 0.0);
+        let mean_jet = compose(logistic, delta_mu, mean, mean_first, mean_second, mean_third, mean_fourth);
         let complement = add_constant(neg(mean_jet), 1.0);
         let precision_ratio = compose(unit_exponential, delta_d, 1.0, 1.0, 1.0, 1.0, 1.0);
         let precision_jet = scale(precision_ratio, precision);
@@ -912,7 +921,7 @@ row_program! {
             digamma_precision,
             trigamma_precision,
             tetragamma_precision,
-            0.0
+            pentagamma_precision
         );
         let ln_gamma_first_jet = compose(
             ln_gamma_at_first_shape,
@@ -921,7 +930,7 @@ row_program! {
             digamma_first_shape,
             trigamma_first_shape,
             tetragamma_first_shape,
-            0.0
+            pentagamma_first_shape
         );
         let ln_gamma_second_jet = compose(
             ln_gamma_at_second_shape,
@@ -930,7 +939,7 @@ row_program! {
             digamma_second_shape,
             trigamma_second_shape,
             tetragamma_second_shape,
-            0.0
+            pentagamma_second_shape
         );
         let normalizer = add(
             ln_gamma_precision_jet,
@@ -957,14 +966,16 @@ row_program! {
         mean_first,
         mean_second,
         mean_third,
+        mean_fourth,
         response_term,
         response_first,
         response_second,
         response_third,
+        response_fourth,
         deviance_offset,
         log_normalizer
     )
-    emit [order2, third];
+    emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         mean_power => supplied,
@@ -981,7 +992,7 @@ row_program! {
             mean_first,
             mean_second,
             mean_third,
-            0.0
+            mean_fourth
         );
         let response_jet = compose(
             response_power,
@@ -990,7 +1001,7 @@ row_program! {
             response_first,
             response_second,
             response_third,
-            0.0
+            response_fourth
         );
         let half_deviance = add_constant(add(mean_jet, neg(response_jet)), deviance_offset);
         let density = add(neg(mul(precision, half_deviance)), scale(delta_d, 0.5));
@@ -1008,9 +1019,10 @@ row_program! {
         mean_term,
         mean_first,
         mean_second,
-        mean_third
+        mean_third,
+        mean_fourth
     )
-    emit [order2, third];
+    emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         mean_power => supplied,
@@ -1026,7 +1038,7 @@ row_program! {
             mean_first,
             mean_second,
             mean_third,
-            0.0
+            mean_fourth
         );
         return neg(mul(precision, mean_jet));
     }
@@ -1046,10 +1058,12 @@ enum DispersionRowStacks {
         digamma_total: f64,
         trigamma_total: f64,
         tetragamma_total: f64,
+        pentagamma_total: f64,
         ln_gamma_theta: f64,
         digamma_theta: f64,
         trigamma_theta: f64,
         tetragamma_theta: f64,
+        pentagamma_theta: f64,
         neg_log_theta_share: f64,
         neg_log_mu_share: f64,
         mu_share: f64,
@@ -1064,6 +1078,7 @@ enum DispersionRowStacks {
         digamma_shape: f64,
         trigamma_shape: f64,
         tetragamma_shape: f64,
+        pentagamma_shape: f64,
     },
     Beta {
         precision: f64,
@@ -1071,20 +1086,24 @@ enum DispersionRowStacks {
         mean_first: f64,
         mean_second: f64,
         mean_third: f64,
+        mean_fourth: f64,
         log_response: f64,
         log_complement: f64,
         ln_gamma_precision: f64,
         digamma_precision: f64,
         trigamma_precision: f64,
         tetragamma_precision: f64,
+        pentagamma_precision: f64,
         ln_gamma_first_shape: f64,
         digamma_first_shape: f64,
         trigamma_first_shape: f64,
         tetragamma_first_shape: f64,
+        pentagamma_first_shape: f64,
         ln_gamma_second_shape: f64,
         digamma_second_shape: f64,
         trigamma_second_shape: f64,
         tetragamma_second_shape: f64,
+        pentagamma_second_shape: f64,
     },
     TweediePositive {
         kappa: f64,
@@ -1092,10 +1111,12 @@ enum DispersionRowStacks {
         mean_first: f64,
         mean_second: f64,
         mean_third: f64,
+        mean_fourth: f64,
         response_term: f64,
         response_first: f64,
         response_second: f64,
         response_third: f64,
+        response_fourth: f64,
         deviance_offset: f64,
         log_normalizer: f64,
     },
@@ -1105,6 +1126,7 @@ enum DispersionRowStacks {
         mean_first: f64,
         mean_second: f64,
         mean_third: f64,
+        mean_fourth: f64,
     },
 }
 
@@ -1153,8 +1175,8 @@ impl DispersionRowStacks {
         total: [f64; 5],
         precision: [f64; 5],
     ) -> Self {
-        let [digamma_total, trigamma_total, tetragamma_total, ..] = total;
-        let [digamma_theta, trigamma_theta, tetragamma_theta, ..] = precision;
+        let [digamma_total, trigamma_total, tetragamma_total, pentagamma_total, _] = total;
+        let [digamma_theta, trigamma_theta, tetragamma_theta, pentagamma_theta, _] = precision;
         Self::NegativeBinomial {
             theta,
             count: yi,
@@ -1163,10 +1185,12 @@ impl DispersionRowStacks {
             digamma_total,
             trigamma_total,
             tetragamma_total,
+            pentagamma_total,
             ln_gamma_theta: 0.0,
             digamma_theta,
             trigamma_theta,
             tetragamma_theta,
+            pentagamma_theta,
             neg_log_theta_share: -log_positive_share(theta, mu),
             neg_log_mu_share: 0.0,
             mu_share: positive_share(mu, theta),
@@ -1177,7 +1201,7 @@ impl DispersionRowStacks {
     /// `shape` is the polygamma stack at `ν = e^{η_d}`.
     #[inline(always)]
     fn gamma(yi: f64, em: f64, ed: f64, nu: f64, shape: [f64; 5]) -> Self {
-        let [digamma_shape, trigamma_shape, tetragamma_shape, ..] = shape;
+        let [digamma_shape, trigamma_shape, tetragamma_shape, pentagamma_shape, _] = shape;
         Self::Gamma {
             shape: nu,
             log_shape_ratio: ed - em,
@@ -1187,6 +1211,7 @@ impl DispersionRowStacks {
             digamma_shape,
             trigamma_shape,
             tetragamma_shape,
+            pentagamma_shape,
         }
     }
 
@@ -1201,30 +1226,46 @@ impl DispersionRowStacks {
         first_shape: [f64; 5],
         second_shape: [f64; 5],
     ) -> Self {
-        let [digamma_precision, trigamma_precision, tetragamma_precision, ..] = precision;
-        let [digamma_first_shape, trigamma_first_shape, tetragamma_first_shape, ..] = first_shape;
-        let [digamma_second_shape, trigamma_second_shape, tetragamma_second_shape, ..] =
-            second_shape;
+        let [digamma_precision, trigamma_precision, tetragamma_precision, pentagamma_precision, _] =
+            precision;
+        let [
+            digamma_first_shape,
+            trigamma_first_shape,
+            tetragamma_first_shape,
+            pentagamma_first_shape,
+            _,
+        ] = first_shape;
+        let [
+            digamma_second_shape,
+            trigamma_second_shape,
+            tetragamma_second_shape,
+            pentagamma_second_shape,
+            _,
+        ] = second_shape;
         Self::Beta {
             precision: phi,
             mean: logit.mu,
             mean_first: logit.d1,
             mean_second: logit.d2,
             mean_third: logit.d3,
+            mean_fourth: logit.d4,
             log_response: yi.ln(),
             log_complement: (-yi).ln_1p(),
             ln_gamma_precision: 0.0,
             digamma_precision,
             trigamma_precision,
             tetragamma_precision,
+            pentagamma_precision,
             ln_gamma_first_shape: 0.0,
             digamma_first_shape,
             trigamma_first_shape,
             tetragamma_first_shape,
+            pentagamma_first_shape,
             ln_gamma_second_shape: 0.0,
             digamma_second_shape,
             trigamma_second_shape,
             tetragamma_second_shape,
+            pentagamma_second_shape,
         }
     }
 
@@ -1237,21 +1278,25 @@ impl DispersionRowStacks {
         let mean_term = mean_power_two * (1.0 / two_minus_p);
         let mean_second = mean_power_two * two_minus_p;
         let mean_third = mean_second * two_minus_p;
+        let mean_fourth = mean_third * two_minus_p;
         if yi > 0.0 {
             let one_minus_p = 1.0 - p;
             let mean_power_one = mu.powf(one_minus_p);
             let response_first = yi * mean_power_one;
             let response_second = response_first * one_minus_p;
+            let response_third = response_second * one_minus_p;
             Self::TweediePositive {
                 kappa,
                 mean_term,
                 mean_first: mean_power_two,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 response_term: mean_power_one * (yi / one_minus_p),
                 response_first,
                 response_second,
-                response_third: response_second * one_minus_p,
+                response_third,
+                response_fourth: response_third * one_minus_p,
                 deviance_offset: yi.powf(two_minus_p) / (one_minus_p * two_minus_p),
                 log_normalizer: 0.0,
             }
@@ -1262,6 +1307,7 @@ impl DispersionRowStacks {
                 mean_first: mean_power_two,
                 mean_second,
                 mean_third,
+                mean_fourth,
             }
         }
     }
@@ -1279,10 +1325,12 @@ impl DispersionRowStacks {
                 digamma_total,
                 trigamma_total,
                 tetragamma_total,
+                pentagamma_total,
                 ln_gamma_theta,
                 digamma_theta,
                 trigamma_theta,
                 tetragamma_theta,
+                pentagamma_theta,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1297,10 +1345,12 @@ impl DispersionRowStacks {
                 digamma_total,
                 trigamma_total,
                 tetragamma_total,
+                pentagamma_total,
                 ln_gamma_theta,
                 digamma_theta,
                 trigamma_theta,
                 tetragamma_theta,
+                pentagamma_theta,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1315,6 +1365,7 @@ impl DispersionRowStacks {
                 digamma_shape,
                 trigamma_shape,
                 tetragamma_shape,
+                pentagamma_shape,
             } => gamma_row_program_order2(
                 0.0,
                 0.0,
@@ -1326,6 +1377,7 @@ impl DispersionRowStacks {
                 digamma_shape,
                 trigamma_shape,
                 tetragamma_shape,
+                pentagamma_shape,
             ),
             Self::Beta {
                 precision,
@@ -1333,20 +1385,24 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 log_response,
                 log_complement,
                 ln_gamma_precision,
                 digamma_precision,
                 trigamma_precision,
                 tetragamma_precision,
+                pentagamma_precision,
                 ln_gamma_first_shape,
                 digamma_first_shape,
                 trigamma_first_shape,
                 tetragamma_first_shape,
+                pentagamma_first_shape,
                 ln_gamma_second_shape,
                 digamma_second_shape,
                 trigamma_second_shape,
                 tetragamma_second_shape,
+                pentagamma_second_shape,
             } => beta_row_program_order2(
                 0.0,
                 0.0,
@@ -1355,20 +1411,24 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 log_response,
                 log_complement,
                 ln_gamma_precision,
                 digamma_precision,
                 trigamma_precision,
                 tetragamma_precision,
+                pentagamma_precision,
                 ln_gamma_first_shape,
                 digamma_first_shape,
                 trigamma_first_shape,
                 tetragamma_first_shape,
+                pentagamma_first_shape,
                 ln_gamma_second_shape,
                 digamma_second_shape,
                 trigamma_second_shape,
                 tetragamma_second_shape,
+                pentagamma_second_shape,
             ),
             Self::TweediePositive {
                 kappa,
@@ -1376,10 +1436,12 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 response_term,
                 response_first,
                 response_second,
                 response_third,
+                response_fourth,
                 deviance_offset,
                 log_normalizer,
             } => tweedie_positive_row_program_order2(
@@ -1390,10 +1452,12 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 response_term,
                 response_first,
                 response_second,
                 response_third,
+                response_fourth,
                 deviance_offset,
                 log_normalizer,
             ),
@@ -1403,6 +1467,7 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
             } => tweedie_zero_row_program_order2(
                 0.0,
                 0.0,
@@ -1411,6 +1476,7 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
             ),
         };
         (value, gradient, hessian)
@@ -1429,10 +1495,12 @@ impl DispersionRowStacks {
                 digamma_total,
                 trigamma_total,
                 tetragamma_total,
+                pentagamma_total,
                 ln_gamma_theta,
                 digamma_theta,
                 trigamma_theta,
                 tetragamma_theta,
+                pentagamma_theta,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1447,10 +1515,12 @@ impl DispersionRowStacks {
                 digamma_total,
                 trigamma_total,
                 tetragamma_total,
+                pentagamma_total,
                 ln_gamma_theta,
                 digamma_theta,
                 trigamma_theta,
                 tetragamma_theta,
+                pentagamma_theta,
                 neg_log_theta_share,
                 neg_log_mu_share,
                 mu_share,
@@ -1466,6 +1536,7 @@ impl DispersionRowStacks {
                 digamma_shape,
                 trigamma_shape,
                 tetragamma_shape,
+                pentagamma_shape,
             } => gamma_row_program_third_contracted(
                 0.0,
                 0.0,
@@ -1477,6 +1548,7 @@ impl DispersionRowStacks {
                 digamma_shape,
                 trigamma_shape,
                 tetragamma_shape,
+                pentagamma_shape,
                 direction,
             ),
             Self::Beta {
@@ -1485,20 +1557,24 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 log_response,
                 log_complement,
                 ln_gamma_precision,
                 digamma_precision,
                 trigamma_precision,
                 tetragamma_precision,
+                pentagamma_precision,
                 ln_gamma_first_shape,
                 digamma_first_shape,
                 trigamma_first_shape,
                 tetragamma_first_shape,
+                pentagamma_first_shape,
                 ln_gamma_second_shape,
                 digamma_second_shape,
                 trigamma_second_shape,
                 tetragamma_second_shape,
+                pentagamma_second_shape,
             } => beta_row_program_third_contracted(
                 0.0,
                 0.0,
@@ -1507,20 +1583,24 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 log_response,
                 log_complement,
                 ln_gamma_precision,
                 digamma_precision,
                 trigamma_precision,
                 tetragamma_precision,
+                pentagamma_precision,
                 ln_gamma_first_shape,
                 digamma_first_shape,
                 trigamma_first_shape,
                 tetragamma_first_shape,
+                pentagamma_first_shape,
                 ln_gamma_second_shape,
                 digamma_second_shape,
                 trigamma_second_shape,
                 tetragamma_second_shape,
+                pentagamma_second_shape,
                 direction,
             ),
             Self::TweediePositive {
@@ -1529,10 +1609,12 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 response_term,
                 response_first,
                 response_second,
                 response_third,
+                response_fourth,
                 deviance_offset,
                 log_normalizer,
             } => tweedie_positive_row_program_third_contracted(
@@ -1543,10 +1625,12 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 response_term,
                 response_first,
                 response_second,
                 response_third,
+                response_fourth,
                 deviance_offset,
                 log_normalizer,
                 direction,
@@ -1557,6 +1641,7 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
             } => tweedie_zero_row_program_third_contracted(
                 0.0,
                 0.0,
@@ -1565,7 +1650,188 @@ impl DispersionRowStacks {
                 mean_first,
                 mean_second,
                 mean_third,
+                mean_fourth,
                 direction,
+            ),
+        }
+    }
+
+    /// The row log-likelihood's fourth derivative contracted along two
+    /// directions, `Σ_cd ℓ_abcd u_c v_d` in `(η_μ, η_d)`: the member's contracted
+    /// fourth surface, read from stacks built through order four.
+    #[inline(always)]
+    fn fourth_contracted(self, direction_u: &[f64; 2], direction_v: &[f64; 2]) -> [[f64; 2]; 2] {
+        match self {
+            Self::NegativeBinomial {
+                theta,
+                count,
+                ln_gamma_count,
+                ln_gamma_total,
+                digamma_total,
+                trigamma_total,
+                tetragamma_total,
+                pentagamma_total,
+                ln_gamma_theta,
+                digamma_theta,
+                trigamma_theta,
+                tetragamma_theta,
+                pentagamma_theta,
+                neg_log_theta_share,
+                neg_log_mu_share,
+                mu_share,
+                theta_share,
+            } => negative_binomial_row_program_fourth_contracted(
+                0.0,
+                0.0,
+                theta,
+                count,
+                ln_gamma_count,
+                ln_gamma_total,
+                digamma_total,
+                trigamma_total,
+                tetragamma_total,
+                pentagamma_total,
+                ln_gamma_theta,
+                digamma_theta,
+                trigamma_theta,
+                tetragamma_theta,
+                pentagamma_theta,
+                neg_log_theta_share,
+                neg_log_mu_share,
+                mu_share,
+                theta_share,
+                direction_u,
+                direction_v,
+            ),
+            Self::Gamma {
+                shape,
+                log_shape_ratio,
+                log_response,
+                response_ratio,
+                ln_gamma_shape,
+                digamma_shape,
+                trigamma_shape,
+                tetragamma_shape,
+                pentagamma_shape,
+            } => gamma_row_program_fourth_contracted(
+                0.0,
+                0.0,
+                shape,
+                log_shape_ratio,
+                log_response,
+                response_ratio,
+                ln_gamma_shape,
+                digamma_shape,
+                trigamma_shape,
+                tetragamma_shape,
+                pentagamma_shape,
+                direction_u,
+                direction_v,
+            ),
+            Self::Beta {
+                precision,
+                mean,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+                log_response,
+                log_complement,
+                ln_gamma_precision,
+                digamma_precision,
+                trigamma_precision,
+                tetragamma_precision,
+                pentagamma_precision,
+                ln_gamma_first_shape,
+                digamma_first_shape,
+                trigamma_first_shape,
+                tetragamma_first_shape,
+                pentagamma_first_shape,
+                ln_gamma_second_shape,
+                digamma_second_shape,
+                trigamma_second_shape,
+                tetragamma_second_shape,
+                pentagamma_second_shape,
+            } => beta_row_program_fourth_contracted(
+                0.0,
+                0.0,
+                precision,
+                mean,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+                log_response,
+                log_complement,
+                ln_gamma_precision,
+                digamma_precision,
+                trigamma_precision,
+                tetragamma_precision,
+                pentagamma_precision,
+                ln_gamma_first_shape,
+                digamma_first_shape,
+                trigamma_first_shape,
+                tetragamma_first_shape,
+                pentagamma_first_shape,
+                ln_gamma_second_shape,
+                digamma_second_shape,
+                trigamma_second_shape,
+                tetragamma_second_shape,
+                pentagamma_second_shape,
+                direction_u,
+                direction_v,
+            ),
+            Self::TweediePositive {
+                kappa,
+                mean_term,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+                response_term,
+                response_first,
+                response_second,
+                response_third,
+                response_fourth,
+                deviance_offset,
+                log_normalizer,
+            } => tweedie_positive_row_program_fourth_contracted(
+                0.0,
+                0.0,
+                kappa,
+                mean_term,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+                response_term,
+                response_first,
+                response_second,
+                response_third,
+                response_fourth,
+                deviance_offset,
+                log_normalizer,
+                direction_u,
+                direction_v,
+            ),
+            Self::TweedieZero {
+                kappa,
+                mean_term,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+            } => tweedie_zero_row_program_fourth_contracted(
+                0.0,
+                0.0,
+                kappa,
+                mean_term,
+                mean_first,
+                mean_second,
+                mean_third,
+                mean_fourth,
+                direction_u,
+                direction_v,
             ),
         }
     }
@@ -1631,6 +1897,31 @@ pub(crate) fn dispersion_row_observed_hessian_directional(
     }
     let drift =
         DispersionRowStacks::at(kind, yi, eta_mu, eta_d, 3).third_contracted(&[du_mu, du_d]);
+    let scale = -prior_weight;
+    (
+        scale * drift[0][0],
+        scale * drift[0][1],
+        scale * drift[1][1],
+    )
+}
+
+/// Per-row second directional derivative of the observed η-space Hessian
+/// channels `(∂²NLL/∂η_μ², ∂²NLL/∂η_μ∂η_d, ∂²NLL/∂η_d²)` along the per-row
+/// η-motions `(du_mu, du_d)` and `(dv_mu, dv_d)`: the member's contracted fourth
+/// surface, `Σ_cd (∂⁴NLL/∂η_a∂η_b∂η_c∂η_e) du_c dv_e`.
+pub(crate) fn dispersion_row_observed_hessian_second_directional(
+    kind: DispersionFamilyKind,
+    yi: f64,
+    eta_mu: f64,
+    eta_d: f64,
+    prior_weight: f64,
+    du: [f64; 2],
+    dv: [f64; 2],
+) -> (f64, f64, f64) {
+    if prior_weight <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let drift = DispersionRowStacks::at(kind, yi, eta_mu, eta_d, 4).fourth_contracted(&du, &dv);
     let scale = -prior_weight;
     (
         scale * drift[0][0],
@@ -2486,6 +2777,140 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
         Ok(Some(dh))
     }
 
+    /// Exact second β-directional derivative of the observed joint Hessian,
+    /// `D²_β H_L[u, v]`, assembled row-wise from each member's contracted fourth
+    /// row-program surface (`dispersion_row_observed_hessian_second_directional`):
+    /// with per-row η-motions `du = (X_μ u_μ, X_d u_d)` and `dv = (X_μ v_μ, X_d v_d)`,
+    /// each Hessian channel moves by `Σ_ce (∂⁴NLL/∂η_a∂η_b∂η_c∂η_e) du_c dv_e`, and
+    /// the blocks are the same `Xᵀ diag(·) X` grams the Hessian uses.
+    ///
+    /// This is the term the exact outer ρ-Hessian needs beyond `D_β H_L`:
+    /// `ddot H_{k,l} = B_{k,l} + D_β H_L[u_{k,l}] + D²_β H_L[u_l, u_k]`. The trait
+    /// default delegates to a block-diagonal-from-blocks derivative, which drops the
+    /// mean/precision cross curvature every member carries.
+    fn exact_newton_joint_hessian_second_directional_derivative_with_specs(
+        &self,
+        block_states: &[ParameterBlockState],
+        specs: &[ParameterBlockSpec],
+        d_beta_u_flat: &Array1<f64>,
+        d_betav_flat: &Array1<f64>,
+    ) -> Result<Option<Array2<f64>>, String> {
+        validate_block_count::<GamlssError>(self.kind.family_tag(), 2, block_states.len())?;
+        if specs.len() != 2 {
+            return Err(format!(
+                "{} joint Hessian second directional derivative expects 2 specs, got {}",
+                self.kind.family_tag(),
+                specs.len()
+            ));
+        }
+        let eta_mu = &block_states[Self::BLOCK_MEAN].eta;
+        let eta_d = &block_states[Self::BLOCK_DISP].eta;
+        let n = self.y.len();
+        if eta_mu.len() != n || eta_d.len() != n || self.weights.len() != n {
+            return Err(format!(
+                "{} joint Hessian second directional derivative row-count mismatch: y={n}, eta_mu={}, eta_d={}, weights={}",
+                self.kind.family_tag(),
+                eta_mu.len(),
+                eta_d.len(),
+                self.weights.len()
+            ));
+        }
+        for i in 0..n {
+            validate_dispersion_row_geometry_inputs(
+                self.kind,
+                i,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+            )?;
+        }
+        let mean_spec = &specs[Self::BLOCK_MEAN];
+        let disp_spec = &specs[Self::BLOCK_DISP];
+        if mean_spec.design.nrows() != n || disp_spec.design.nrows() != n {
+            return Err(format!(
+                "{} joint Hessian second directional derivative design row mismatch: y={n}, mean rows={}, precision rows={}",
+                self.kind.family_tag(),
+                mean_spec.design.nrows(),
+                disp_spec.design.nrows()
+            ));
+        }
+        let p_mean = mean_spec.design.ncols();
+        let p_disp = disp_spec.design.ncols();
+        let total = p_mean + p_disp;
+        if d_beta_u_flat.len() != total || d_betav_flat.len() != total {
+            return Err(format!(
+                "{} joint Hessian second directional derivative direction length mismatch: got {} and {}, expected {total}",
+                self.kind.family_tag(),
+                d_beta_u_flat.len(),
+                d_betav_flat.len()
+            ));
+        }
+        // η-motions of both directions: the offsets are β-independent, so
+        // `dη_b = X_b u_b` exactly.
+        let motion = |direction: &Array1<f64>| {
+            let mean = direction.slice(s![0..p_mean]).to_owned();
+            let disp = direction.slice(s![p_mean..total]).to_owned();
+            (mean_spec.design.apply(&mean), disp_spec.design.apply(&disp))
+        };
+        let (du_mu, du_d) = motion(d_beta_u_flat);
+        let (dv_mu, dv_d) = motion(d_betav_flat);
+        let row = |i: usize| {
+            dispersion_row_observed_hessian_second_directional(
+                self.kind,
+                self.y[i],
+                eta_mu[i],
+                eta_d[i],
+                self.weights[i],
+                [du_mu[i], du_d[i]],
+                [dv_mu[i], dv_d[i]],
+            )
+        };
+        let second: Vec<(f64, f64, f64)> =
+            if rayon::current_thread_index().is_none() && n > DISPERSION_PARALLEL_ROW_THRESHOLD {
+                use rayon::iter::{IntoParallelIterator, ParallelIterator};
+                (0..n).into_par_iter().map(row).collect()
+            } else {
+                (0..n).map(row).collect()
+            };
+        for (i, &(d_mm, d_md, d_dd)) in second.iter().enumerate() {
+            for (quantity, eta, value) in [
+                (
+                    "dispersion-family second directional mean curvature drift",
+                    eta_mu[i],
+                    d_mm,
+                ),
+                (
+                    "dispersion-family second directional cross curvature drift",
+                    eta_mu[i],
+                    d_md,
+                ),
+                (
+                    "dispersion-family second directional precision curvature drift",
+                    eta_d[i],
+                    d_dd,
+                ),
+            ] {
+                if !value.is_finite() {
+                    return Err(GamlssError::row_geometry_unrepresentable(i, quantity, eta, value));
+                }
+            }
+        }
+        let mean_drift = Array1::from_shape_fn(n, |i| second[i].0);
+        let cross_drift = Array1::from_shape_fn(n, |i| second[i].1);
+        let disp_drift = Array1::from_shape_fn(n, |i| second[i].2);
+        let d2h_mean = xt_diag_x_design(&mean_spec.design, &mean_drift)?;
+        let d2h_cross = xt_diag_y_design(&mean_spec.design, &cross_drift, &disp_spec.design)?;
+        let d2h_disp = xt_diag_x_design(&disp_spec.design, &disp_drift)?;
+        let mut d2h = Array2::<f64>::zeros((total, total));
+        d2h.slice_mut(s![0..p_mean, 0..p_mean]).assign(&d2h_mean);
+        d2h.slice_mut(s![0..p_mean, p_mean..total]).assign(&d2h_cross);
+        d2h.slice_mut(s![p_mean..total, p_mean..total])
+            .assign(&d2h_disp);
+        mirror_upper_to_lower(&mut d2h);
+        Ok(Some(d2h))
+    }
+
     /// The joint likelihood Hessian is NOT block-diagonal for any member:
     /// even the Fisher-orthogonal parameterizations — NB2 `(μ, θ)`, Gamma
     /// shape `ν`, Tweedie `log(1/φ)` — have zero EXPECTED cross information
@@ -2504,25 +2929,6 @@ impl CustomFamily for DispersionGlmLocationScaleFamily {
     /// outer-REML trust dispatch.
     fn has_explicit_joint_hessian(&self) -> bool {
         true
-    }
-
-    /// The mean and precision working weights couple across both blocks, which
-    /// the block-local diagonal drift hook cannot represent, so decline the
-    /// dense outer Hessian capability whenever the actual two-block (or
-    /// larger) geometry is in play; a degenerate single-block probe — there
-    /// is no cross-block coupling to reject — keeps the trait default's
-    /// availability verdict.
-    ///
-    /// The override still validates the block-spec slice it is handed (the
-    /// same consistency check the trait default's assertion bottoms out in)
-    /// so a malformed probe is reported here rather than downstream.
-    fn outer_hyper_hessian_dense_available(&self, specs: &[ParameterBlockSpec]) -> bool {
-        assert!(
-            crate::custom_family::validate_blockspec_consistency(specs).is_ok(),
-            "DispersionGlmLocationScale outer hyper-Hessian dense availability: \
-             inconsistent parameter block specs"
-        );
-        specs.len() < 2
     }
 }
 

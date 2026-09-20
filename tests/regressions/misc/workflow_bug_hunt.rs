@@ -29,9 +29,9 @@ fn tiny_binary_dataset() -> EncodedDataset {
 }
 
 #[test]
-fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
+fn resolve_family_refuses_underscore_binomial_logit_and_names_the_hyphen_form() {
     let y = array![0.0, 1.0, 1.0, 0.0];
-    let resolved = resolve_family(
+    let err = resolve_family(
         Some("binomial_logit"),
         None,
         None,
@@ -39,16 +39,29 @@ fn resolve_family_accepts_binomial_logit_with_underscore_alias() {
         ResponseColumnKind::Numeric,
         "y",
     )
-    .expect("binomial_logit should be recognized as a supported family alias");
+    .expect_err("binomial_logit is not a family spelling; binomial-logit is");
+    assert!(
+        err.contains("use `binomial-logit`"),
+        "the refusal must name the accepted spelling, got: {err}"
+    );
+    let resolved = resolve_family(
+        Some("binomial-logit"),
+        None,
+        None,
+        y.view(),
+        ResponseColumnKind::Numeric,
+        "y",
+    )
+    .expect("binomial-logit resolves");
     assert_eq!(
         resolved.response,
         ResponseFamily::Binomial,
-        "binomial_logit should map to the binomial response family"
+        "binomial-logit should map to the binomial response family"
     );
     assert_eq!(
         resolved.link,
         InverseLink::Standard(StandardLink::Logit),
-        "binomial_logit should map to the standard logit inverse-link"
+        "binomial-logit should map to the standard logit inverse-link"
     );
 }
 
@@ -57,7 +70,7 @@ fn resolve_family_accepts_bernoulli_aliases_for_binomial() {
     let y = array![0.0, 1.0, 1.0, 0.0];
     for (raw, expected_link) in [
         ("bernoulli", StandardLink::Logit),
-        ("bernoulli_logit", StandardLink::Logit),
+        ("bernoulli-logit", StandardLink::Logit),
         ("bernoulli-probit", StandardLink::Probit),
         ("bernoulli(cloglog)", StandardLink::CLogLog),
     ] {
@@ -113,7 +126,7 @@ fn resolve_family_accepts_tweedie() {
     // and it is carried verbatim; a bare name is a typed refusal, not "unknown
     // family" and not a silent default power (#2026).
     let y = array![0.0, 1.0, 2.0, 0.0, 3.5, 0.0];
-    for spelling in ["tweedie(p=1.5)", "tweedie(1.5)", "tw(p=1.5)"] {
+    for spelling in ["tweedie(p=1.5)", "tweedie(1.5)"] {
         let resolved = resolve_family(
             Some(spelling),
             None,
@@ -132,7 +145,7 @@ fn resolve_family_accepts_tweedie() {
         }
         assert_eq!(resolved.link, InverseLink::Standard(StandardLink::Log));
     }
-    for bare in ["tweedie", "tw"] {
+    for bare in ["tweedie"] {
         let err = resolve_family(
             Some(bare),
             None,

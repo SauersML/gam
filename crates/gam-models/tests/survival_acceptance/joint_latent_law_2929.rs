@@ -609,10 +609,11 @@ fn default_on_several_scores_certifies_its_closed_form_on_the_joint_law_2926() {
     );
 }
 
-/// The per-score configurations whose ψ derivatives the fit does not form on
-/// the per-score row program — a learned Gaussian frailty and a spatial
-/// length-scale term in the marginal formula — refuse at fit entry by name
-/// (gam#2938), before any solve.
+/// Two per-score configurations refuse at fit entry by name (gam#2938), before
+/// any solve: a learned Gaussian frailty, which the likelihood does not
+/// identify beside the surfaces' intercepts and constant offset, and a spatial
+/// length-scale term in the marginal formula, whose ψ derivatives the fit does
+/// not form on the per-score row program.
 #[test]
 fn per_score_fit_refuses_learned_frailty_and_spatial_marginal_by_name_2929() {
     install();
@@ -635,7 +636,7 @@ fn per_score_fit_refuses_learned_frailty_and_spatial_marginal_by_name_2929() {
     let error = refusal("Surv(time, event) ~ x", &frailty);
     assert!(
         error.contains(
-            "learned Gaussian frailty on a per-score slope over K=2 scores is refused"
+            "a learned Gaussian-shift frailty σ is refused: σ is not identified by the likelihood"
         ),
         "a learned frailty on a per-score slope must refuse by name; got {error}"
     );
