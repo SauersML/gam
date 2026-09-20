@@ -647,9 +647,10 @@ class Pca(Smooth):
     data. Pca makes that recurring projection a GAM basis. It also captures
     the Schur elimination benefit: when ``D >> K_pca`` (for example
     ``D=7168, K=64``), gamfit projects through the cached ``(D, K_pca)``
-    basis once and fits the smaller ``(N, K_pca)`` design with a ridge
-    penalty on PCA coefficients, rather than materializing a full ``(N, D)``
-    smooth and ``(D, D)`` penalty.
+    basis once and fits the smaller ``(N, K_pca)`` score design ``Z`` with the
+    function-mass penalty ``ZᵀZ / N`` (it prices the fitted function's mean
+    square, not the PCA coefficients), rather than materializing a full
+    ``(N, D)`` smooth and ``(D, D)`` penalty.
 
     Parameters
     ----------
@@ -657,8 +658,10 @@ class Pca(Smooth):
         basis width when ``basis`` is supplied. When both ``K`` and ``basis``
         are given, every evaluation path projects through the FIRST ``K``
         basis columns (``basis[:, :K]``) and ``basis_size`` reports ``K``.
-    basis : optional array-like of shape ``(D, K)``. A fixed precomputed
-        projection matrix, e.g. ``_pca_basis.load_pc_basis(K=64)``.
+    basis : array-like of shape ``(D, K)``. A fixed precomputed projection
+        matrix, e.g. ``_pca_basis.load_pc_basis(K=64)``. Every in-memory fit
+        and evaluation path requires it; only the Rust formula path's
+        ``lazy_path`` scores replace it.
     lazy_path : optional path to a memmap-able ``.npy`` scores matrix ``(N, K)``.
     centered : if True, subtract the training feature mean before projection.
         The mean is resolved once — from ``mean`` when supplied, otherwise
