@@ -486,8 +486,10 @@ pub(crate) fn assemble_custom_family_fit_result(
         exact_lambdas_from_log_strengths(&log_lambdas, "custom-family fitted log strength")?;
     let (block_states, covariance_conditional, geometry, precomputed_edf, smoothing_corrected) =
         if let Some(canonical) = canonical {
-            let precomputed_edf = precomputed_edf
-                .or_else(|| reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas));
+            let precomputed_edf = match precomputed_edf {
+                Some(edf) => Some(edf),
+                None => reduced_blockwise_edf(geometry.as_ref(), canonical, &lambdas)?,
+            };
             let block_states = lift_block_states_to_raw(canonical, inner.block_states);
             let (covariance_conditional, geometry) =
                 lift_fit_geometry_to_raw(canonical, covariance_conditional, geometry)?;
@@ -2665,7 +2667,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         family.outer_hyper_hessian_hvp_available(specs),
         family.outer_hyper_hessian_dense_available(specs),
     );
-    let bfgs_step_cap = Some(FIRST_ORDER_BFGS_LOGLAMBDA_STEP_CAP);
     // EFS / HybridEfs structural property (`H^{-1/2} B_k H^{-1/2} ≽ 0` plus a
     // parameter-independent nullspace, Wood-Fasiolo) fails for multi-block
     // families whose joint likelihood Hessian depends on β.
@@ -2915,7 +2916,6 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         .with_disable_fixed_point(multi_block_beta_dependent || prices_cone_normalizer)
         .with_tolerance(options.outer_tol)
         .with_max_iter(options.outer_max_iter)
-        .with_bfgs_step_cap(bfgs_step_cap)
         .with_initial_rho(rho0.clone())
         .with_problem_size(n_obs, p_total.max(1))
         // Per-coordinate ρ domain (#2812): the interval on which each term's
@@ -3007,10 +3007,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         if matches!(order, OuterEvalOrder::Value) {
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3027,8 +3024,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;
@@ -3103,10 +3102,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
         let starts = if force_cold {
-            ModeStarts {
-                incumbent: canonical_seed.as_ref(),
-                fixed: &fixed_starts,
-            }
+            outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
         } else {
             outer.mode_starts_for(rho)
         };
@@ -3147,6 +3143,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                     } =>
             {
                 let warm_start = eval.warm_start.clone();
+                // A cold evaluation's mode is served again at bitwise this θ (#3322).
+                if force_cold {
+                    outer.record_cold_mode(rho, canonical_seed.as_ref(), warm_start.clone());
+                }
                 outer.record_first_order_mode(warm_start.clone());
                 store_persistent_custom_family_warm_start(
                     persistent_warm_start_cache.as_ref(),
@@ -3266,10 +3266,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.last_criterion_rank = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
             let starts = if force_cold {
-                ModeStarts {
-                    incumbent: canonical_seed.as_ref(),
-                    fixed: &fixed_starts,
-                }
+                outer.cold_mode_starts_for(rho, canonical_seed.as_ref())
             } else {
                 outer.mode_starts_for(rho)
             };
@@ -3286,8 +3283,10 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 Ok(eval) if eval.inner_converged && eval.objective.is_finite() => {
                     crate::warm_start::publish_outer_selected_evaluation(&eval);
                     // The gradient at this θ starts from the same seed and would
-                    // re-derive this mode; it is served there instead (#979).
-                    if !force_cold {
+                    // re-derive this mode; it is served there instead (#979, #3322).
+                    if force_cold {
+                        outer.record_cold_mode(rho, canonical_seed.as_ref(), eval.warm_start.clone());
+                    } else {
                         outer.record_value_probe(rho, seed_identity, eval.warm_start.clone());
                     }
                     outer.last_criterion_rank = eval.criterion_rank;

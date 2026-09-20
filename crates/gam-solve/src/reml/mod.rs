@@ -467,29 +467,25 @@ mod tests {
         );
     }
 
-    /// The adaptive IFT step-cap controller belongs to the `RemlState` that
-    /// produced it, not to the ADDRESS that state happened to occupy.
+    /// The IFT trust radius belongs to the `RemlState` that measured it, not
+    /// to the ADDRESS that state happened to occupy.
     ///
-    /// It used to live in a process-global `HashMap` keyed by
-    /// `self as *const _ as usize`. Every constructing caller makes the state a
-    /// stack local, so two fits reached from the same call site land on the
-    /// same frame slot — and with no `Drop` to evict the entry, the second fit
-    /// read the first fit's quality history and shrunken step cap. That is a
-    /// silent cross-fit dependence: the same data fitted twice in one process
-    /// takes a different IFT step schedule the second time.
+    /// Its predecessor (a quality-history step-cap controller) lived in a
+    /// process-global `HashMap` keyed by `self as *const _ as usize`. Every
+    /// constructing caller makes the state a stack local, so two fits reached
+    /// from the same call site land on the same frame slot — and with no
+    /// `Drop` to evict the entry, the second fit read the first fit's history.
+    /// That is a silent cross-fit dependence: the same data fitted twice in
+    /// one process takes a different IFT step schedule the second time.
     ///
-    /// The probe builds a state, drives the controller off its defaults, drops
-    /// it, and builds a second state in the same slot. The second state must
-    /// see the documented defaults — the caller-supplied cap, and no flat
-    /// fallback.
+    /// The probe builds a state, measures a radius and stages a step on it,
+    /// drops it, and builds a second state in the same slot. The second state
+    /// must be unmeasured: no radius and no staged step.
     #[test]
     fn adaptive_ift_controller_does_not_survive_into_the_next_state_in_the_same_slot() {
-        // `default_cap` is deliberately a value the controller can never
-        // produce on its own, so reading it back is proof of a fresh slot
-        // rather than a coincidence.
-        const DEFAULT_CAP: f64 = 7.5;
+        use super::outer_eval::WarmStartPredictionSource;
 
-        fn probe(record: bool) -> (usize, f64, bool) {
+        fn probe(record: bool) -> (usize, Option<f64>, bool) {
             let y = array![0.2, -0.1, 0.3, 0.0];
             let w = Array1::<f64>::ones(y.len());
             let x = array![[1.0, -0.7], [1.0, -0.2], [1.0, 0.3], [1.0, 0.9]];
@@ -515,25 +511,25 @@ mod tests {
             .expect("state");
             let address = &state as *const RemlState<'_> as usize;
             if record {
-                // A prediction quality far above the flat-fallback band: the
-                // controller shrinks the cap and arms the flat fallback. This
-                // is precisely the state that used to be inherited.
-                let shrunk = state
-                    .record_ift_prediction_quality(1.0e3, 0.25)
-                    .expect("a finite quality and a positive cap must update the controller");
-                assert!(
-                    shrunk < 0.25,
-                    "a quality above the flat-fallback band must shrink the step cap; got {shrunk}"
+                // A unit step whose prediction missed by 10 against a flat
+                // miss of 1: the measured radius is 1·1/10.
+                let radius = state.record_warm_start_prediction_error(
+                    WarmStartPredictionSource::Ift,
+                    1.0,
+                    10.0,
+                    1.0,
                 );
-                return (address, shrunk, true);
+                assert_eq!(radius, Some(0.1));
+                state.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, 0.05);
+                return (address, radius, true);
             }
-            let cap = state.ift_quality_step_cap(DEFAULT_CAP);
-            let flat = state.take_ift_quality_flat_override();
-            (address, cap, flat)
+            let radius = state.warm_start_trust_radius(WarmStartPredictionSource::Ift);
+            let staged = state.take_staged_warm_start_prediction_step().is_some();
+            (address, radius, staged)
         }
 
         let (first_address, _, _) = probe(true);
-        let (second_address, cap, flat) = probe(false);
+        let (second_address, radius, staged) = probe(false);
 
         assert_eq!(
             first_address, second_address,
@@ -541,14 +537,76 @@ mod tests {
              both calls are to the same fn at the same depth, so the frame offsets must coincide"
         );
         assert_eq!(
-            cap, DEFAULT_CAP,
-            "a freshly built state must return the caller's default step cap, not the cap the \
-             previous state at this address shrank to"
+            radius, None,
+            "a freshly built state must be unmeasured, not carry the radius the previous state \
+             at this address measured"
         );
         assert!(
-            !flat,
-            "a freshly built state must not inherit the previous state's armed flat fallback"
+            !staged,
+            "a freshly built state must not inherit the previous state's staged prediction step"
         );
+    }
+
+    /// The warm-start trust radius is derived from one measurement, not
+    /// tuned: at step s the predictor's miss is E ≈ c₂s² and the flat seed's
+    /// miss is F ≈ c₁s, so the step at which they tie is R = s·F/E. A
+    /// predictor that hit exactly has no finite radius; a solve where both
+    /// seeds were exact, or where the inputs are not finite, measures
+    /// nothing; and the flat seed has no radius to measure (gam#2902).
+    #[test]
+    fn warm_start_trust_radius_is_the_step_where_the_predictor_ties_the_flat_seed() {
+        use super::outer_eval::WarmStartPredictionSource::{Flat, Ift, TangentLine};
+
+        let y = array![0.2, -0.1, 0.3, 0.0];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![[1.0, -0.7], [1.0, -0.2], [1.0, 0.3], [1.0, 0.9]];
+        let offset = Array1::<f64>::zeros(y.len());
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let p = x.ncols();
+        let canonical = vec![gam_terms::construction::CanonicalPenalty::from_dense_root(
+            array![[0.0, 1.0]],
+            p,
+        )];
+        let state = RemlState::newwith_offset(
+            y.view(),
+            x,
+            w.view(),
+            offset.view(),
+            canonical,
+            p,
+            &cfg,
+            Some(vec![1]),
+            None,
+            None,
+        )
+        .expect("state");
+
+        assert_eq!(state.warm_start_trust_radius(Ift), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 1.0, 0.5, 1.0), Some(2.0));
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(2.0));
+        // The tangent radius is its own measurement.
+        assert_eq!(state.warm_start_trust_radius(TangentLine), None);
+        assert_eq!(
+            state.record_warm_start_prediction_error(TangentLine, 3.0, 2.0, 0.5),
+            Some(0.75)
+        );
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(2.0));
+        // An exact prediction leaves no step at which the flat seed wins.
+        assert_eq!(
+            state.record_warm_start_prediction_error(Ift, 0.5, 0.0, 1.0),
+            Some(f64::INFINITY)
+        );
+        // Both seeds exact, or a non-finite input, measure nothing and keep
+        // the previous radius.
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 0.5, 0.0, 0.0), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, f64::NAN, 1.0, 1.0), None);
+        assert_eq!(state.record_warm_start_prediction_error(Ift, 1.0, -1.0, 1.0), None);
+        assert_eq!(state.warm_start_trust_radius(Ift), Some(f64::INFINITY));
+        assert_eq!(state.record_warm_start_prediction_error(Flat, 1.0, 0.5, 1.0), None);
+        assert_eq!(state.warm_start_trust_radius(Flat), None);
+        state.clear_warm_start_adaptive_signals();
+        assert_eq!(state.warm_start_trust_radius(Ift), None);
+        assert_eq!(state.warm_start_trust_radius(TangentLine), None);
     }
 
     #[test]
@@ -4695,6 +4753,17 @@ pub(crate) struct FirthDirection {
     pub(crate) b_uvec: Array1<f64>,
 }
 
+/// Shared contractions of `D H_φ[u]` against one symmetric `Π`, built by
+/// `FirthDenseOperator::hphi_direction_trace_kernel`.
+pub(crate) struct FirthHphiTraceKernel {
+    /// `ℓ = diag(X Π Xᵀ)`.
+    pub(crate) leverage: Array1<f64>,
+    /// `v = ((M⊙M)⊙(X Π Xᵀ)) w'`.
+    pub(crate) hadamard_w1: Array1<f64>,
+    /// `R = Zᵀ diag(w') (M⊙X Π Xᵀ) diag(w') Z` in reduced coordinates.
+    pub(crate) reduced: Array2<f64>,
+}
+
 #[derive(Clone)]
 pub(crate) struct FirthTauPartialKernel {
     pub(super) deta_partial: Array1<f64>,
@@ -5694,6 +5763,33 @@ impl RemlArena {
             lastgradient_used_stochastic_fallback: AtomicBool::new(false),
         }
     }
+
+    /// Run post-convergence work without charging it to the search.
+    ///
+    /// `outer_cost_evals` and `inner_pirls_solves` report the work the
+    /// smoothing-parameter search did (#1575), and work guards read them as
+    /// such. Inference run at the converged `ρ̂` afterwards (the #938 Tier-0
+    /// diagnostic and the tiers it selects) evaluates the same criterion, so
+    /// both counters are put back to their values at entry once it returns: a
+    /// fit that requests that inference reports the same search as one that
+    /// does not.
+    pub(crate) fn without_charging_the_search<T>(&self, work: impl FnOnce() -> T) -> T {
+        let cost_evals = *self
+            .cost_eval_count
+            .read()
+            .expect("cost-eval counter lock is never held across a panic");
+        let inner_solves = self
+            .inner_pirls_solve_count
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let result = work();
+        *self
+            .cost_eval_count
+            .write()
+            .expect("cost-eval counter lock is never held across a panic") = cost_evals;
+        self.inner_pirls_solve_count
+            .store(inner_solves, std::sync::atomic::Ordering::Relaxed);
+        result
+    }
 }
 
 /// The ρ at which a fit decides the #784 block-local correction's admission,
@@ -5850,7 +5946,7 @@ pub(crate) struct RemlState<'a> {
     /// see each other, and no key can alias. They sit beside
     /// `ift_warm_start_cache` / `ift_cached_factor`, which were already
     /// per-state interior-mutability fields — these were the odd ones out.
-    pub(crate) ift_quality_runtime: std::sync::Mutex<outer_eval::IftQualityRuntimeState>,
+    pub(crate) warm_start_trust: std::sync::Mutex<outer_eval::WarmStartTrustState>,
     pub(crate) ift_mode_response_slot:
         std::sync::Mutex<Option<outer_eval::IftModeResponseRuntimeCache>>,
     pub(crate) ift_joint_mode_response_slot:
@@ -5999,12 +6095,9 @@ pub(crate) struct RemlState<'a> {
     /// NaN's self-inequality makes the sentinel unambiguous: any
     /// stored finite non-negative value is genuine signal.
     ///
-    /// Read by `predict_warm_start_beta_ift_with_outcome` to drive the adaptive
-    /// |Δρ| cap (`adaptive_ift_max_drho`): a small residual loosens
-    /// the cap, a large one tightens it. Replaces the previous
-    /// hardcoded `IFT_WARM_START_MAX_DRHO = 2.0` constant with a
-    /// data-driven policy, so the predictor adapts to the empirical
-    /// faithfulness of the linearization at this surface's scale.
+    /// Read by the outer loop's inner-iteration cap schedule and narrated in
+    /// the `[IFT-QUALITY]` bench log. The predictor's step admission does not
+    /// read it: that is the derived trust radius in `warm_start_trust`.
     /// Reset on `reset_surface` and on failed solves.
     pub(crate) last_ift_prediction_residual: Arc<AtomicU64>,
 
