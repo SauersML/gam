@@ -379,7 +379,7 @@ mod tests {
 
         let q0 = -threshold * (-log_sigma).exp();
         let q = q0 + basis[0] * beta[0];
-        let probability = gam_linalg::utils::stable_logistic(q);
+        let probability = gam_math::special::logistic(q);
         let f1 = weight * (probability - y);
         let f2 = weight * probability * (1.0 - probability);
         let a = 1.0 + basis_d1[0] * beta[0];

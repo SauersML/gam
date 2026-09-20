@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::model_types::{Dispersion, EstimationError};
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::utils::stack_offsets;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use gam_problem::{
     FitStationarityEvidence, GlmLikelihoodSpec, InverseLink, LatentCLogLogState,
     LikelihoodScaleMetadata, LikelihoodSpec, LogLikelihoodNormalization, MixtureLinkSpec,
@@ -169,6 +170,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -281,6 +283,7 @@ mod per_term_edf_tests {
                 coefficient_influence: Some(influence),
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -357,6 +360,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -561,6 +565,7 @@ mod per_term_edf_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -689,6 +694,13 @@ pub enum FacePositivityRoute {
     /// `f > 0` on the whole simplex, each cell's bound clearing its own
     /// rounding band.
     SimplexBound,
+    /// The ZERO-smoothing face (`λ_j → 0`, `j ∈ L`) of penalties whose ranges
+    /// the surviving penalties already cover. There the criterion is jointly
+    /// analytic in `λ_L` — no logdet rank changes as they vanish — so
+    /// `V = V(0) + Σ_{j∈L} c′_j λ_j + O(|λ|²)` on the closed orthant, exactly
+    /// linear at first order, and the face is a strict minimizer iff every
+    /// `c′_j` clears its rounding band `τ_j` (the KKT test at `λ = 0`).
+    CoveredZeroSmoothing,
 }
 
 /// What established a rail coordinate's tail law, and the standard it cleared
@@ -724,7 +736,9 @@ pub enum RailTailEvidence {
         /// [`FacePositivityRoute::PositiveForm`], the binding coordinate's
         /// analytic pencil constant `c_j` on
         /// [`FacePositivityRoute::IndependentRanges`], the binding simplex
-        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`].
+        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`],
+        /// the binding coordinate's `λ`-slope `c′_j` on
+        /// [`FacePositivityRoute::CoveredZeroSmoothing`].
         statistic: f64,
         /// The rounding band that statistic had to clear, from the measured
         /// error of forming `C` in floating point (never a tuned margin).
@@ -2737,13 +2751,14 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
-    /// The variance-component score test of every random-effect term, computed
-    /// once on the training fit's own IRLS row state
-    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
-    /// rows read their p-value (or its typed absence) from here, so the CLI,
-    /// Rust and persisted-model surfaces report the same number. Empty on a
-    /// model with no random-effect term and on a payload written before the
-    /// test existed; a summary treats a term missing from it as not recorded.
+    /// The variance-component score test of every random-effect term and every
+    /// `LinearTermRidge`-penalized linear term, computed once on the training
+    /// fit's own IRLS row state (`gam_terms::inference::random_effect_test`).
+    /// The summary's random-effect rows and ridged parametric rows read their
+    /// p-value (or its typed absence) from here, so the CLI, Rust and
+    /// persisted-model surfaces report the same number. Empty on a model with
+    /// no such term and on a payload written before the test existed; a
+    /// summary treats a term missing from it as not recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub random_effect_tests:
         Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,
@@ -3221,6 +3236,13 @@ pub struct FitInference {
     /// does not form this Hessian.
     #[serde(default)]
     pub identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    /// The working residual `‖z − Xβ̂‖²_W` over the `n⁺` rows that carry
+    /// curvature, in the metric of [`Self::weighted_gram`]. The smooth score
+    /// test's estimated scale reads the full model's unpenalized residual off
+    /// it (gam#3832). `None` where the fit publishes no working model in that
+    /// metric.
+    #[serde(default)]
+    pub working_residual: Option<WorkingResidual>,
 }
 
 /// The wire form [`FitInference`] deserializes through.
@@ -3267,6 +3289,8 @@ struct FitInferenceWire {
     weighted_gram: Option<Array2<f64>>,
     #[serde(default)]
     identified_subspace: Option<IdentifiedCoefficientSubspace>,
+    #[serde(default)]
+    working_residual: Option<WorkingResidual>,
 }
 
 impl From<FitInferenceWire> for FitInference {
@@ -3296,6 +3320,7 @@ impl From<FitInferenceWire> for FitInference {
             coefficient_influence: wire.coefficient_influence,
             weighted_gram: wire.weighted_gram,
             identified_subspace: wire.identified_subspace,
+            working_residual: wire.working_residual,
         }
     }
 }
@@ -3864,6 +3889,7 @@ mod assembly_inner_status_gate_tests {
                 coefficient_influence: None,
                 weighted_gram: None,
                 identified_subspace: None,
+                working_residual: None,
             }),
             fitted_link: FittedLinkState::Standard(None),
             geometry: None,
@@ -4701,9 +4727,9 @@ mod assembly_inner_status_gate_tests {
                 weighted_gram: &gram,
                 coeff_range: 0..2,
                 structural_penalties: &[Array2::eye(2)],
-                covariance_scale: 1.0,
-                residual_df: Some(50.0),
-                scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
+                scale: gam_terms::inference::smooth_score_test::ScoreTestScale::Known {
+                    covariance_scale: 1.0,
+                },
             },
         )
         .expect("the term is testable")
@@ -6658,18 +6684,6 @@ impl UnifiedFitResult {
                     .as_ref()
                     .map(|geom| geom.penalized_hessian.as_array())
             })
-    }
-
-    /// Get owned row-wise diagonal working evidence if available.
-    pub(crate) fn working_geometry(&self) -> Option<&WorkingGeometry> {
-        self.geometry
-            .as_ref()
-            .and_then(|geometry| geometry.working.as_ref())
-    }
-
-    /// Get working response if single diagonal row evidence is available.
-    pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.working_geometry().map(|working| &working.response)
     }
 
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`

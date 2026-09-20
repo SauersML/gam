@@ -13,10 +13,8 @@ impl SaeManifoldTerm {
     /// atom `k`'s β-block is nonzero, so this is exactly `tr((S⁻¹)_{kk} M_k)`,
     /// matching the dense path's per-atom column trace). Reuses ONE
     /// `(probes, S⁻¹·probes)` pair across every gradient channel so the value and
-    /// the ρ-gradient never desync — the matrix-free replacement for the dense
-    /// `beta_inv` in
-    /// [`SaeManifoldTerm::decoder_smoothness_effective_dof_with_solver_per_atom`]
-    /// on the massive-`K` surrogate lane. The probe/solve vectors have length
+    /// the ρ-gradient never desync — the matrix-free replacement for a dense
+    /// `(H⁻¹)_ββ` on the massive-`K` surrogate lane. The probe/solve vectors have length
     /// `border_dim` (the reduced-Schur dimension `cache.k`).
     pub(crate) fn decoder_smoothness_effective_dof_per_atom_from_probes(
         &self,
@@ -28,23 +26,32 @@ impl SaeManifoldTerm {
         let mut per_atom = vec![0.0_f64; self.atoms.len()];
         for (atom_idx, atom) in self.atoms.iter().enumerate() {
             let s = atom.smooth_penalty();
-            let off = offsets[atom_idx];
             let r = ranks[atom_idx];
             let lambda = lambda_smooth[atom_idx];
-            // M_k·v: block-diagonal `(λ_k·½(S_k+S_kᵀ)) ⊗ I_{r_k}` restricted to
-            // atom `k`'s β-block, matching the exact path's `M[:,col]` column
-            // construction row-for-row.
+            let (block_probes, block_sinv) = Self::border_block_probe_pairs(
+                probes,
+                sinv_probes,
+                offsets[atom_idx],
+                s.nrows() * r,
+            )
+            .map_err(|err| {
+                format!(
+                    "decoder_smoothness_effective_dof_per_atom_from_probes: atom {atom_idx}: {err}"
+                )
+            })?;
+            // M_k·v: block-diagonal `(λ_k·½(S_k+S_kᵀ)) ⊗ I_{r_k}` on atom `k`'s
+            // β-block, matching the exact path's `M[:,col]` column construction
+            // row-for-row.
             let m_apply =
-                |v: ArrayView1<'_, f64>| Self::decoder_penalty_block_apply(v, off, r, lambda, s);
+                |v: ArrayView1<'_, f64>| Self::decoder_penalty_block_apply(v, r, lambda, s);
             per_atom[atom_idx] =
-                hutchinson_reduced_schur_inverse_trace(probes, sinv_probes, &m_apply).ok_or_else(
-                    || {
+                hutchinson_reduced_schur_inverse_trace(&block_probes, &block_sinv, &m_apply)
+                    .ok_or_else(|| {
                         format!(
                             "decoder_smoothness_effective_dof_per_atom_from_probes: non-finite \
                              Hutchinson trace for atom {atom_idx}"
                         )
-                    },
-                )?;
+                    })?;
         }
         Ok(per_atom)
     }
@@ -62,12 +69,40 @@ impl SaeManifoldTerm {
         }
     }
 
-    /// `(λ·½(P+Pᵀ)) ⊗ I_r` applied to the β-block of `v` at offset `off`: the
+    /// Atom `k`'s β-block `[off, off + len)` of every probe `z_j` and of its solve
+    /// `S⁻¹ z_j`. `M_k` is zero outside that block, so
+    /// `(S⁻¹ z_j)ᵀ(M_k z_j)` is exactly the block-restricted contraction; reading only
+    /// the block keeps the per-atom channel `O(m·M_k·r_k)` instead of
+    /// `O(m·border_dim)`, which summed over atoms would be quadratic in `K`.
+    fn border_block_probe_pairs(
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+        off: usize,
+        len: usize,
+    ) -> Result<(Vec<Array1<f64>>, Vec<Array1<f64>>), String> {
+        let end = off + len;
+        let restrict = |label: &str, set: &[Array1<f64>]| {
+            set.iter()
+                .enumerate()
+                .map(|(j, v)| {
+                    if v.len() < end {
+                        return Err(format!(
+                            "{label} {j} has length {} < β-block end {end}",
+                            v.len()
+                        ));
+                    }
+                    Ok(v.slice(s![off..end]).to_owned())
+                })
+                .collect::<Result<Vec<_>, String>>()
+        };
+        Ok((restrict("probe", probes)?, restrict("solve", sinv_probes)?))
+    }
+
+    /// `(λ·½(P+Pᵀ)) ⊗ I_r` applied to a β-block vector `v` (length `M·r`): the
     /// penalty-curvature operator of a coordinate that scales (`P = S_k`) or
     /// reshapes (`P = ∂S_k/∂κ`) atom `k`'s penalty Gram.
     fn decoder_penalty_block_apply(
         v: ArrayView1<'_, f64>,
-        off: usize,
         r: usize,
         lambda: f64,
         penalty: &Array2<f64>,
@@ -79,9 +114,9 @@ impl SaeManifoldTerm {
                 let mut acc = 0.0_f64;
                 for mu in 0..m {
                     let p_nu_mu = 0.5 * (penalty[[nu, mu]] + penalty[[mu, nu]]);
-                    acc += lambda * p_nu_mu * v[off + mu * r + oc];
+                    acc += lambda * p_nu_mu * v[mu * r + oc];
                 }
-                out[off + nu * r + oc] = acc;
+                out[nu * r + oc] = acc;
             }
         }
         out
@@ -144,18 +179,27 @@ impl SaeManifoldTerm {
         let (offsets, ranks) = self.decoder_border_blocks();
         let mut out = Vec::with_capacity(rho.kappa_atoms.len());
         for (flat, atom_idx, ds) in self.kappa_penalty_derivatives(rho)? {
-            let off = offsets[atom_idx];
             let r = ranks[atom_idx];
             let lambda = lambda_smooth[atom_idx];
+            let (block_probes, block_sinv) = Self::border_block_probe_pairs(
+                probes,
+                sinv_probes,
+                offsets[atom_idx],
+                ds.nrows() * r,
+            )
+            .map_err(|err| {
+                format!("decoder_kappa_penalty_trace_from_probes: curvature atom {atom_idx}: {err}")
+            })?;
             let m_apply =
-                |v: ArrayView1<'_, f64>| Self::decoder_penalty_block_apply(v, off, r, lambda, ds);
-            let trace = hutchinson_reduced_schur_inverse_trace(probes, sinv_probes, &m_apply)
-                .ok_or_else(|| {
-                    format!(
-                        "decoder_kappa_penalty_trace_from_probes: non-finite Hutchinson trace \
-                         for curvature atom {atom_idx}"
-                    )
-                })?;
+                |v: ArrayView1<'_, f64>| Self::decoder_penalty_block_apply(v, r, lambda, ds);
+            let trace =
+                hutchinson_reduced_schur_inverse_trace(&block_probes, &block_sinv, &m_apply)
+                    .ok_or_else(|| {
+                        format!(
+                            "decoder_kappa_penalty_trace_from_probes: non-finite Hutchinson trace \
+                             for curvature atom {atom_idx}"
+                        )
+                    })?;
             out.push((flat, trace));
         }
         Ok(out)

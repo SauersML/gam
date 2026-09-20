@@ -1438,18 +1438,19 @@ pub(crate) fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form(
         [0.0, 0.0],
     ];
 
-    let projected = coord.project_into_subspace(&z);
+    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
+    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
+    // projected coordinate. The face runs through the origin (`β_full` has
+    // no off-face component), so the restriction carries no offset.
+    let beta_f = array![0.7, -1.3];
+    let beta_full = z.dot(&beta_f);
+
+    let projected = coord.project_into_subspace(&z, beta_full.view());
     assert_eq!(
         projected.dim(),
         z.ncols(),
         "projected penalty coordinate dim must equal the reduced beta length"
     );
-
-    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
-    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
-    // projected coordinate.
-    let beta_f = array![0.7, -1.3];
-    let beta_full = z.dot(&beta_f);
 
     let s_beta_full = coord.apply_penalty(&beta_full, 1.0);
     let full_quadratic = beta_full.dot(&s_beta_full);
@@ -4759,7 +4760,7 @@ pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
     for (q_eff, target) in cases {
         let g_base = (q_eff - target) / 2.0;
         let universal = efs_log_step_from_grad(q_eff, g_base).unwrap();
-        let canonical = (target / q_eff).ln().clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+        let canonical = (target / q_eff).ln();
         assert!(
             (universal - canonical).abs() < 1e-12,
             "universal {universal} ≠ canonical {canonical} at q={q_eff}, t={target}"
@@ -4788,16 +4789,23 @@ pub(crate) fn efs_log_step_from_grad_recovers_canonical_form() {
     let s = efs_log_step_from_grad(0.75, 0.0).expect("zero gradient");
     assert!(s.abs() < 1e-12);
 
-    // Over-correction (2·g_full ≥ q_eff ⇒ ratio ≤ 0): clamp to max descent.
-    for &(q_eff, g) in &[(1.0_f64, 0.6), (2.0, 1.5), (0.5, 1e6)] {
-        let s = efs_log_step_from_grad(q_eff, g).expect("over-correction");
-        assert!((s - (-EFS_MAX_STEP)).abs() < 1e-12);
-    }
+    // A far root is taken whole (#2902): d − t = 1000·q_eff puts the
+    // root at log(1000) ≈ 6.91, which the removed ±5 box truncated.
+    let s = efs_log_step_from_grad(1.0, -499.5).expect("far stable root");
+    assert!((s - 1000.0_f64.ln()).abs() < 1e-12, "far root truncated: {s}");
+    let s = efs_log_step_from_grad(1.0, 0.5 - 1e-9).expect("near-singular root");
+    assert!((s - (2e-9_f64).ln()).abs() < 1e-6, "near-singular root: {s}");
 
-    // Asymptotic clamp on the lower side: ratio → 0⁺ ⇒ floor at -MAX.
-    let s = efs_log_step_from_grad(1.0, 0.5 - 1e-30).expect("near-singular");
-    assert!((s + EFS_MAX_STEP).abs() < 1e-12);
-    assert!(s <= 0.0);
+    // Over-correction (2·g_full ≥ q_eff): the multiplicative model has no
+    // root, so the step is its Newton step −2·g_full/q_eff.
+    for &(q_eff, g) in &[(1.0_f64, 0.6), (2.0, 1.5), (0.5, 1e6), (1.0, 0.5)] {
+        let s = efs_log_step_from_grad(q_eff, g).expect("over-correction");
+        let newton = -2.0 * g / q_eff;
+        assert!(
+            (s - newton).abs() <= 1e-12 * newton.abs(),
+            "over-correction step {s} ≠ Newton {newton} at q={q_eff}, g={g}"
+        );
+    }
 
     // Pathological: q_eff ≤ 0, non-finite inputs.
     assert!(efs_log_step_from_grad(0.0, 0.0).is_none());

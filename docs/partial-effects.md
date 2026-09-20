@@ -53,8 +53,13 @@ names it: `"smoothing-corrected"` or `"conditional"`.
 
 ### Pointwise intervals and simultaneous bands
 
-`lower`/`upper` are `fit ∓ z · se`, where `z` is the two-sided normal quantile
-for `level` (`effect.pointwise_critical`). They cover the true value at each
+`lower`/`upper` are `fit ∓ q · se`, where `q` is the two-sided quantile for
+`level` of the fit's pivot law (`effect.pointwise_critical`). When the fit
+estimates its dispersion (Gaussian, Gamma, and the other estimated-scale
+families), the standard error carries that estimate and the pivot is Student-t
+on `n − edf_total` degrees of freedom. When the scale is known (binomial,
+Poisson), it is standard normal. Predict intervals and the Wald tests read the
+same reference. They cover the true value at each
 grid point separately. Across the curve, about `level` of the points are
 covered, which is Nychka's across-the-function property of the Bayesian
 intervals.
@@ -62,7 +67,9 @@ intervals.
 `simultaneous_lower`/`simultaneous_upper` are `fit ∓ c · se`. They cover the
 whole curve over the grid at once with probability `level`. The critical value
 `c` (`effect.simultaneous_critical`) is the `level` quantile of the maximum
-absolute standardized error over the grid. It comes from `effect.simulations`
+absolute standardized error over the grid. With an estimated dispersion, one
+shared `φ̂` divides every grid point, so that maximum is a multivariate-t
+supremum. It comes from `effect.simulations`
 draws of the posterior curve, seeded with `effect.seed`, so a repeated call
 returns the same band.
 

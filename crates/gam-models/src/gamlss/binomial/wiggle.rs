@@ -202,11 +202,13 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
             BinomialWiggleRowOuter::ExpectedInformation => {
                 let (information, first, second) = binomial_expected_q_information_derivatives(
                     self.family.weights[row],
+                    self.core.q0[row] + self.etaw[row],
+                    &self.family.link_kind,
                     self.core.mu[row],
                     self.core.dmu_dq[row],
                     self.core.d2mu_dq2[row],
                     self.core.d3mu_dq3[row],
-                );
+                )?;
                 Ok([0.0, 0.0, information, first, second])
             }
         }
@@ -470,11 +472,13 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         for row in 0..n {
             let (f, f1, _) = binomial_expected_q_information_derivatives(
                 self.family.weights[row],
+                self.core.q0[row] + self.etaw[row],
+                &self.family.link_kind,
                 self.core.mu[row],
                 self.core.dmu_dq[row],
                 self.core.d2mu_dq2[row],
                 self.core.d3mu_dq3[row],
-            );
+            )?;
             // Row carries no expected information (weight 0 / saturated tail):
             // every coefficient below is a multiple of f or f1, so leave the
             // zero-initialized entries.
@@ -545,11 +549,13 @@ impl<'a> BinomialLocationScaleWiggleRowProgram<'a> {
         for row in 0..n {
             let (f, f1, f2) = binomial_expected_q_information_derivatives(
                 self.family.weights[row],
+                self.core.q0[row] + self.etaw[row],
+                &self.family.link_kind,
                 self.core.mu[row],
                 self.core.dmu_dq[row],
                 self.core.d2mu_dq2[row],
                 self.core.d3mu_dq3[row],
-            );
+            )?;
             if f == 0.0 && f1 == 0.0 && f2 == 0.0 {
                 continue;
             }
