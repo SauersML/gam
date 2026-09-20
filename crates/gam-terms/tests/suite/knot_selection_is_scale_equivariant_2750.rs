@@ -3,7 +3,7 @@
 //!
 //! `select_thin_plate_knots` is the shared center selector for every radial
 //! spatial smooth — `thinplate`, `duchon`, `matern` and `mjs` all reach it
-//! through `spatial_center_strategy_for_dimension` — and its maximin/centroid
+//! through `default_spatial_center_strategy` — and its maximin/centroid
 //! tie-break used a tolerance scaled by
 //!
 //! ```text

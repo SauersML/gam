@@ -11,8 +11,9 @@
 //! `fd_norm` to every digit).
 //!
 //! POST-FIX PINS (what this probe now gates):
-//!  1. the rank-test frame STILL moves with ψ — that motion is why a rank
-//!     test may not decide topology, and it is printed, not asserted;
+//!  1. the rank-test frame STILL moves with ψ — and under an orthonormal
+//!     collection chart it is empty, the ridge reading as range — which is
+//!     why a rank test may not decide topology; printed, not asserted;
 //!  2. the SHIPPED trend ridge no longer moves: its central FD across ±ε is
 //!     rebuild roundoff, orders below the pre-fix 2.3e-6;
 //!  3. the shipped ridge's range is the STRUCTURAL frame
@@ -198,11 +199,25 @@ fn zz_measure_2445_rank_test_frame_moves_with_psi() {
             structural.ncols(),
             poly_cols - 1
         );
-        let overlap = frame_sin_angle(&structural, &frames[1]);
-        eprintln!(
-            "[2445] angle(structural frame, rank-test frame at psi=0) = {overlap:.6e} \
-             (pre-fix: 4.32e-6 — the conditioning-ridge tilt)"
-        );
+        // Whether the rank test finds the structural direction at all is
+        // itself a function of the chart: the `√ε` ridge sits within a decade
+        // of the rank cutoff, so it reads as null under a data-whitened chart
+        // and as range under an orthonormal one. Either way it is printed,
+        // never asserted — that is pin 1's point.
+        if structural.ncols() == frames[1].ncols() {
+            let overlap = frame_sin_angle(&structural, &frames[1]);
+            eprintln!(
+                "[2445] angle(structural frame, rank-test frame at psi=0) = {overlap:.6e} \
+                 (pre-fix: 4.32e-6 — the conditioning-ridge tilt)"
+            );
+        } else {
+            eprintln!(
+                "[2445] rank-test null dim {} vs structural dim {}: the rank test reads \
+                 the conditioning ridge as range in this chart",
+                frames[1].ncols(),
+                structural.ncols()
+            );
+        }
         if structural.ncols() == 1 {
             let u = structural.column(0);
             let ru = ridges[1].dot(&u);

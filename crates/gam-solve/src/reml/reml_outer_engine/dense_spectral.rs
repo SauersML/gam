@@ -854,6 +854,202 @@ impl DenseSpectralOperator {
         }
         result
     }
+
+    /// Every pairwise [`Self::trace_logdet_hessian_cross_rotated`] over the
+    /// rotated drifts `R_0 … R_{m−1}`, as the symmetric `m × m` matrix whose
+    /// `(i, j)` entry (`i ≤ j`, mirrored below the diagonal) is
+    /// `Σ_{a,b} K[a,b] · R_i[a,b] · R_j[b,a]`.
+    ///
+    /// Pair by pair that is `m(m+1)/2` sweeps over `p²` entries, each reading
+    /// `R_j` down its columns. Slicing the double sum by the row index `a`
+    /// instead gives, for every pair at once,
+    ///
+    /// ```text
+    ///   T += W_a · C_aᵀ,   W_a[i, b] = K[a,b] · R_i[a,b],   C_a[j, b] = R_j[b,a],
+    /// ```
+    ///
+    /// one `m × p × m` GEMM per row: the same `m² p²` products, contracted
+    /// on contiguous operands, with `O(m p)` scratch.
+    pub(crate) fn trace_logdet_hessian_crosses_rotated(
+        &self,
+        rotated: &[Array2<f64>],
+    ) -> Array2<f64> {
+        let m = rotated.len();
+        let p = self.n_dim;
+        let mut out = Array2::<f64>::zeros((m, m));
+        if m == 0 || p == 0 {
+            return out;
+        }
+        let mut weighted = Array2::<f64>::zeros((m, p));
+        let mut columns = Array2::<f64>::zeros((m, p));
+        for (a, kernel_row) in self.logdet_hessian_kernel.rows().into_iter().enumerate() {
+            for (i, r) in rotated.iter().enumerate() {
+                ndarray::Zip::from(weighted.row_mut(i))
+                    .and(&kernel_row)
+                    .and(r.row(a))
+                    .for_each(|w, &k, &h| *w = k * h);
+                columns.row_mut(i).assign(&r.column(a));
+            }
+            ndarray::linalg::general_mat_mul(1.0, &weighted, &columns.t(), 1.0, &mut out);
+        }
+        for i in 0..m {
+            for j in 0..i {
+                out[[i, j]] = out[[j, i]];
+            }
+        }
+        out
+    }
+
+    /// `Γ = −k kᵀ` with `k_a = 1/σ_a` on the active eigenpairs (0 elsewhere)
+    /// when the spectrum is exact and positive: at `ε = 0` the divided
+    /// difference `−(σ_a + σ_b) / (σ_a σ_b (σ_a + σ_b))` is `−1/(σ_a σ_b)`, and
+    /// `W = U·diag(√k)` is [`Self::w_factor`], so `H⁺ = W Wᵀ` and every logdet
+    /// cross trace is `−tr(Wᵀ Ḣ_i W · Wᵀ Ḣ_j W)`. `None` under a smoothed or
+    /// indefinite spectrum, whose `Γ` has no such factor.
+    pub(crate) fn logdet_hessian_kernel_factor(&self) -> Option<&Array2<f64>> {
+        let exact_positive = self.epsilon == 0.0
+            && self
+                .raw_eigenvalues
+                .iter()
+                .zip(self.active_mask.iter())
+                .all(|(&sigma, &active)| !active || sigma > 0.0);
+        exact_positive.then_some(&self.w_factor)
+    }
+
+    /// `B = root · F[start..end, :]` for a block-local drift `scale · rootᵀroot`
+    /// and a coefficient-space factor `F`, so `Fᵀ Ḣ F = scale · BᵀB` costs
+    /// `rank · width · p` instead of the two `p³` products of a dense rotation.
+    fn block_root_through(factor: &Array2<f64>, drift: &BlockRootDrift<'_>) -> Array2<f64> {
+        gam_linalg::faer_ndarray::fast_ab(
+            &drift.root,
+            &factor.slice(ndarray::s![drift.start..drift.end, ..]),
+        )
+    }
+
+    /// Every pairwise logdet cross trace `Σ_{a,b} Γ[a,b] · R_i[a,b] · R_j[b,a]`
+    /// over drifts given either rotated (`R_i = Uᵀ Ḣ_i U`) or as block-local
+    /// penalty roots, as the symmetric `m × m` matrix
+    /// [`Self::trace_logdet_hessian_crosses_rotated`] returns for their rotations.
+    ///
+    /// A root drift is never rotated densely. Under the exact positive spectrum
+    /// (see [`Self::logdet_hessian_kernel_factor`]) it enters through
+    /// `B_i = root_i · W_block`, with `Wᵀ Ḣ_i W = s_i B_iᵀ B_i`:
+    ///
+    /// ```text
+    ///   root–root:     −s_i s_j ‖B_i B_jᵀ‖_F²              (one stacked Gram)
+    ///   root–rotated:  −s_i ⟨B_i M_j, B_i⟩_F,   M_j = diag(√k) R_j diag(√k)
+    /// ```
+    ///
+    /// sums of squares of an `r_i × r_j` block instead of `p²`-term kernel
+    /// sweeps. Otherwise it is rotated through its root, `R_i = s_i (root_i
+    /// U_block)ᵀ(root_i U_block)`, and every pair takes the general kernel.
+    pub(crate) fn trace_logdet_hessian_crosses(
+        &self,
+        drifts: Vec<EigenbasisDrift<'_>>,
+    ) -> Array2<f64> {
+        let m = drifts.len();
+        let p = self.n_dim;
+        let Some(w) = self.logdet_hessian_kernel_factor() else {
+            let rotated: Vec<Array2<f64>> = drifts
+                .into_iter()
+                .map(|drift| match drift {
+                    EigenbasisDrift::Rotated(rotated) => rotated,
+                    EigenbasisDrift::Root(root) => {
+                        let b = Self::block_root_through(&self.eigenvectors, &root);
+                        let mut rotated = gam_linalg::faer_ndarray::fast_ata(&b);
+                        rotated *= root.scale;
+                        rotated
+                    }
+                })
+                .collect();
+            return self.trace_logdet_hessian_crosses_rotated(&rotated);
+        };
+
+        let mut out = Array2::<f64>::zeros((m, m));
+        let mut rotated_at = Vec::new();
+        let mut rotated = Vec::new();
+        let mut root_at = Vec::new();
+        let mut root_rows = Vec::new();
+        let mut roots = Vec::new();
+        for (idx, drift) in drifts.into_iter().enumerate() {
+            match drift {
+                EigenbasisDrift::Rotated(r) => {
+                    rotated_at.push(idx);
+                    rotated.push(r);
+                }
+                EigenbasisDrift::Root(root) => {
+                    let b = Self::block_root_through(w, &root);
+                    let first = root_rows.last().map_or(0, |&(_, end)| end);
+                    root_rows.push((first, first + b.nrows()));
+                    root_at.push((idx, root.scale));
+                    roots.push(b);
+                }
+            }
+        }
+
+        if !rotated.is_empty() {
+            let crosses = self.trace_logdet_hessian_crosses_rotated(&rotated);
+            for (a, &i) in rotated_at.iter().enumerate() {
+                for (b, &j) in rotated_at.iter().enumerate() {
+                    out[[i, j]] = crosses[[a, b]];
+                }
+            }
+        }
+        if roots.is_empty() {
+            return out;
+        }
+
+        let total_rows = root_rows.last().map_or(0, |&(_, end)| end);
+        let mut stacked = Array2::<f64>::zeros((total_rows, p));
+        for (b, &(first, end)) in roots.iter().zip(root_rows.iter()) {
+            stacked.slice_mut(ndarray::s![first..end, ..]).assign(b);
+        }
+        let gram = gam_linalg::faer_ndarray::fast_abt(&stacked, &stacked);
+        for (a, (&(i, scale_i), &(first_i, end_i))) in
+            root_at.iter().zip(root_rows.iter()).enumerate()
+        {
+            for (&(j, scale_j), &(first_j, end_j)) in root_at.iter().zip(root_rows.iter()).skip(a) {
+                let squares: f64 = gram
+                    .slice(ndarray::s![first_i..end_i, first_j..end_j])
+                    .iter()
+                    .map(|&v| v * v)
+                    .sum();
+                let value = -scale_i * scale_j * squares;
+                out[[i, j]] = value;
+                out[[j, i]] = value;
+            }
+        }
+
+        let root_k: Vec<f64> = self
+            .raw_eigenvalues
+            .iter()
+            .zip(self.active_mask.iter())
+            .map(|(&sigma, &active)| if active { sigma.sqrt().recip() } else { 0.0 })
+            .collect();
+        for (&j, r_j) in rotated_at.iter().zip(rotated.iter()) {
+            let m_j = Array2::from_shape_fn((p, p), |(a, b)| root_k[a] * r_j[[a, b]] * root_k[b]);
+            let through = gam_linalg::faer_ndarray::fast_ab(&stacked, &m_j);
+            for (&(i, scale_i), &(first, end)) in root_at.iter().zip(root_rows.iter()) {
+                let inner: f64 = through
+                    .slice(ndarray::s![first..end, ..])
+                    .iter()
+                    .zip(stacked.slice(ndarray::s![first..end, ..]).iter())
+                    .map(|(&x, &y)| x * y)
+                    .sum();
+                let value = -scale_i * inner;
+                out[[i, j]] = value;
+                out[[j, i]] = value;
+            }
+        }
+        out
+    }
+}
+
+/// A Hessian drift for [`DenseSpectralOperator::trace_logdet_hessian_crosses`]:
+/// already rotated into the eigenbasis, or a block-local penalty by its root.
+pub(crate) enum EigenbasisDrift<'a> {
+    Rotated(Array2<f64>),
+    Root(BlockRootDrift<'a>),
 }
 
 /// Coalesce repeated identical `[STAGE]` log lines from `DenseSpectralOperator`
@@ -1207,6 +1403,31 @@ impl HessianFactorization for DenseSpectralOperator {
         }
         let hp_j = self.rotate_to_eigenbasis(h_j);
         self.trace_logdet_hessian_cross_rotated(&hp_i, &hp_j)
+    }
+
+    fn contracts_block_root_drifts(&self) -> bool {
+        true
+    }
+
+    fn trace_logdet_hessian_cross_block_roots(
+        &self,
+        a: BlockRootDrift<'_>,
+        b: BlockRootDrift<'_>,
+    ) -> f64 {
+        // `BlockRootDrift` is invariant in its lifetime; reborrow both roots
+        // at the common shorter one.
+        fn reborrow<'s>(d: &'s BlockRootDrift<'_>) -> BlockRootDrift<'s> {
+            BlockRootDrift {
+                root: d.root.view(),
+                start: d.start,
+                end: d.end,
+                scale: d.scale,
+            }
+        }
+        self.trace_logdet_hessian_crosses(vec![
+            EigenbasisDrift::Root(reborrow(&a)),
+            EigenbasisDrift::Root(reborrow(&b)),
+        ])[[0, 1]]
     }
 
     fn trace_logdet_hessian_cross_matrix_operator(

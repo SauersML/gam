@@ -303,8 +303,7 @@ fn try_exact_joint_spatial_length_scale_optimization(
     // whether it fires is a question about a trend, and a number a reader can
     // only see on the run that already failed cannot show a trend. Measured on
     // the #2760 ladder: `5.965e-8` relative at `n = 8 000`, i.e. the gap is
-    // itself above the `√ε ≈ 1.49e-8` forward-error scale this file's own
-    // `outer_arithmetic_gradient_floor` calls the resolution of a
+    // itself above the `√ε ≈ 1.49e-8` forward-error scale of a
     // matrix-factorization REML score — so it is not roundoff, and reading it at
     // every `n` is how the residual half of #2671 gets bisected.
     log::debug!(
@@ -1768,7 +1767,7 @@ fn run_exact_joint_spatial_optimization(
     };
     let upper = upper_effective.as_ref();
 
-    let problem = exact_joint_multistart_outer_problem(
+    let problem = exact_joint_outer_problem(
         theta0,
         lower,
         upper,
@@ -1862,7 +1861,6 @@ fn run_exact_joint_spatial_optimization(
         // n-free `ValueAndGradient` skip even when `n_params` exceeds the small-
         // BFGS threshold (aniso / multi-ψ).
         suppress_outer_hessian_for_nfree,
-        seed_risk_profile_for_likelihood_family(&family),
         kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
         // Rho-axis BFGS cap: log-λ's natural step is ≈ 5. Anything tighter
@@ -1870,27 +1868,11 @@ fn run_exact_joint_spatial_optimization(
         Some(5.0),
         // Psi-axis BFGS cap: one doubling of the kernel length scale per iteration.
         Some(SPATIAL_PSI_BFGS_STEP_CAP),
-        None,
         // Calibrate the outer to the n-scaled profiled REML/LAML objective for
         // every family — the iso-κ non-convergence cure (#1053 1-D Matérn,
         // #1066 2-D binomial geo, #1069 GP/kriging). p = baseline design column
         // count.
         Some((data.nrows(), baseline_design.design.ncols())),
-        // The scalar Matérn endpoint comparison has already selected and
-        // certified the range basin. Give its explicit theta0 the only joint
-        // start; anisotropic and non-Matérn paths keep their established seed
-        // policy.
-        kind == SpatialHyperKind::Isotropic
-            && constant_curvature_term_indices(resolvedspec).is_empty()
-            && spatial_terms.iter().any(|&term_idx| {
-                matches!(
-                    resolvedspec
-                        .smooth_terms
-                        .get(term_idx)
-                        .map(|term| &term.basis),
-                    Some(SmoothBasisSpec::Matern { .. })
-                )
-            }),
     )?;
 
     let eval_outer = |ctx: &mut &mut SpatialJointContext<'_>,
@@ -2340,7 +2322,7 @@ fn prepare_exact_joint_spatial_route<'d>(
     // `with_prefer_gradient_only(true)` is — and erasing the declaration cost
     // the mint the one terminal curvature evaluation #2359 reserves for it,
     // together with every certificate rung that reads curvature. See the
-    // `DeclaredHessianForm` argument at the `exact_joint_multistart_outer_problem`
+    // `DeclaredHessianForm` argument at the `exact_joint_outer_problem`
     // call below.
     let mut suppress_outer_hessian_for_nfree = false;
 
@@ -4270,6 +4252,11 @@ impl<'d> FrozenTermCollectionIncrementalRealizer<'d> {
                             .smooth_terms
                             .get(term_idx)
                             .and_then(gam_terms::smooth::duchon_operator_penalty_request),
+                        bspline_null_ridge: self
+                            .spec
+                            .smooth_terms
+                            .get(term_idx)
+                            .and_then(gam_terms::smooth::bspline_null_ridge_request),
                         termname: &name,
                     },
                 )
@@ -4984,73 +4971,6 @@ impl<'d> ExactJointDesignCache<'d> {
     }
 }
 
-pub(crate) fn seed_risk_profile_for_likelihood_family(
-    family: &LikelihoodSpec,
-) -> gam_problem::SeedRiskProfile {
-    match &family.response {
-        ResponseFamily::Gaussian => gam_problem::SeedRiskProfile::Gaussian,
-        ResponseFamily::RoystonParmar => gam_problem::SeedRiskProfile::Survival,
-        ResponseFamily::Binomial
-        | ResponseFamily::Poisson
-        | ResponseFamily::Tweedie { .. }
-        | ResponseFamily::NegativeBinomial { .. }
-        | ResponseFamily::Beta { .. }
-        | ResponseFamily::Gamma
-        | ResponseFamily::InverseGaussian
-        | ResponseFamily::StudentT { .. } => gam_problem::SeedRiskProfile::GeneralizedLinear,
-    }
-}
-
-fn exact_joint_seed_config(
-    risk_profile: gam_problem::SeedRiskProfile,
-    auxiliary_dim: usize,
-    initial_seed_only: bool,
-) -> gam_problem::SeedConfig {
-    let mut config = gam_problem::SeedConfig {
-        risk_profile,
-        num_auxiliary_trailing: auxiliary_dim,
-        ..Default::default()
-    };
-    match risk_profile {
-        gam_problem::SeedRiskProfile::Gaussian
-        | gam_problem::SeedRiskProfile::GaussianLocationScale => {
-            config.max_seeds = 4;
-            config.seed_budget = 2;
-        }
-        gam_problem::SeedRiskProfile::GeneralizedLinear => {
-            // Bernoulli marginal-slope Matérn fits use the exact-joint spatial
-            // driver rather than the family-local BMS outer. Mirror BMS proper:
-            // screen one principled heuristic seed deeply enough to reach the
-            // KKT basin instead of spending minutes screening equivalent starts.
-            config.max_seeds = 1;
-            config.seed_budget = 1;
-            config.screen_max_inner_iterations = 8;
-        }
-        gam_problem::SeedRiskProfile::Survival => {
-            // Survival marginal-slope has an additional time/hazard block and
-            // is the most sensitive Matérn startup regime. Keep more of the
-            // coherent SPDE candidate manifold alive through truncation and
-            // validate enough starts that one bad transient does not report
-            // "no candidate seeds" before reaching a viable basin.
-            config.max_seeds = 8;
-            config.seed_budget = 4;
-            config.screen_max_inner_iterations = 8;
-        }
-    }
-    if initial_seed_only {
-        // The isotropic Matérn path has already compared and fully profiled its
-        // two geometry-derived range basins. Its winning [rho, psi] point is an
-        // explicit certified initial point, so launching another heuristic seed
-        // would repeat basin selection inside the local joint solve. A budget of
-        // one gives that explicit initial point sole ownership of the run-plan
-        // slot (run_plan inserts it at slot zero and skips seed screening).
-        config.max_seeds = 1;
-        config.seed_budget = 1;
-        config.over_smoothing_probe_rho = None;
-    }
-    config
-}
-
 /// A term-local rebuild's penalty blocks against the realizer's cached topology
 /// (#2750, #2953).
 #[derive(Debug)]
@@ -5271,48 +5191,6 @@ mod penalty_alignment_2953_tests {
     }
 }
 
-#[cfg(test)]
-mod exact_joint_seed_config_tests {
-    use super::*;
-
-    #[test]
-    fn exact_joint_marginal_slope_profiles_get_deeper_startup_validation() {
-        let bms =
-            exact_joint_seed_config(gam_problem::SeedRiskProfile::GeneralizedLinear, 2, false);
-        assert_eq!(bms.max_seeds, 1);
-        assert_eq!(bms.seed_budget, 1);
-        assert_eq!(bms.screen_max_inner_iterations, 8);
-        assert_eq!(bms.num_auxiliary_trailing, 2);
-
-        let survival = exact_joint_seed_config(gam_problem::SeedRiskProfile::Survival, 3, false);
-        assert_eq!(survival.max_seeds, 8);
-        assert_eq!(survival.seed_budget, 4);
-        assert_eq!(survival.screen_max_inner_iterations, 8);
-        assert_eq!(survival.num_auxiliary_trailing, 3);
-    }
-
-    #[test]
-    fn exact_joint_gaussian_keeps_tight_historical_multistart_budget() {
-        let gaussian = exact_joint_seed_config(gam_problem::SeedRiskProfile::Gaussian, 1, false);
-        assert_eq!(gaussian.max_seeds, 4);
-        assert_eq!(gaussian.seed_budget, 2);
-        assert_eq!(
-            gaussian.screen_max_inner_iterations,
-            gam_problem::SeedConfig::default().screen_max_inner_iterations
-        );
-        assert_eq!(gaussian.num_auxiliary_trailing, 1);
-    }
-
-    #[test]
-    fn certified_matern_basin_owns_the_only_joint_start() {
-        let gaussian = exact_joint_seed_config(gam_problem::SeedRiskProfile::Gaussian, 1, true);
-        assert_eq!(gaussian.max_seeds, 1);
-        assert_eq!(gaussian.seed_budget, 1);
-        assert_eq!(gaussian.over_smoothing_probe_rho, None);
-        assert_eq!(gaussian.num_auxiliary_trailing, 1);
-    }
-}
-
 /// The property #2760 is about, asserted on [`joint_rho_resolvability_domain`]
 /// directly: the domain the joint search is handed must contain the incumbent
 /// it will be GRADED against strictly inside it, so no coordinate begins the
@@ -5390,7 +5268,7 @@ mod joint_rho_resolvability_domain_tests {
     }
 }
 
-pub(crate) fn exact_joint_multistart_outer_problem(
+pub(crate) fn exact_joint_outer_problem(
     theta0: &Array1<f64>,
     lower: &Array1<f64>,
     upper: &Array1<f64>,
@@ -5400,7 +5278,6 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     gradient: gam_problem::Derivative,
     hessian: gam_problem::DeclaredHessianForm,
     disable_fixed_point: bool,
-    risk_profile: gam_problem::SeedRiskProfile,
     tolerance: f64,
     max_iter: usize,
     // BFGS step caps split by parameter type. `bfgs_step_cap` (rho-axis cap)
@@ -5413,33 +5290,12 @@ pub(crate) fn exact_joint_multistart_outer_problem(
     // applied to log-λ, where |d|≈5 is the natural quasi-Newton magnitude.
     bfgs_step_cap: Option<f64>,
     bfgs_step_cap_psi: Option<f64>,
-    screening_cap: Option<Arc<AtomicUsize>>,
-    // `Some((n_obs, p_cols))` calibrates the outer solver to the n-scaled
-    // profiled REML/LAML criterion exactly as the primary REML outer
-    // (`solver/estimate.rs`) does. The profiled criterion is a sum over the n
-    // observations, so its magnitude is O(n) (|f| ~ thousands at n ~ 10³) for
-    // EVERY family — Gaussian, binomial, GP/kriging alike. A scale-blind outer
-    // takes the bare `tolerance` (≈1e-6) as the *absolute* projected-gradient
-    // floor, which is hopelessly tight against an n-scaled gradient: in-basin
-    // iterates (e.g. ‖g‖≈7e-2 at |f|≈17, or single-digit ‖g‖ at |f|≈1.3e3)
-    // never clear it and the fit bails at the iteration cap. Worse, ARC's
-    // trust-region reduction ratios and default initial regularization are
-    // referenced against the wrong curvature magnitude, so the first step can
-    // overshoot and diverge (the ‖g‖≈½|f| blow-ups in #1053/#1066). Threading
-    // the scale (→ absolute floor = max(tol, n·1e-9)) plus a warm ARC
-    // regularization (σ₀ = 0.25) and operator trust radius (4.0) makes the
-    // spatial exact-joint outer converge as robustly as the primary REML outer
-    // across 1-D Matérn (#1053), 2-D binomial geo (#1066), and GP/kriging
-    // (#1069). This is NOT a loosening of the `τ·(1+|f|)` REML acceptance gate
-    // — that relative-to-cost criterion is unchanged; only the nonsensical
-    // scale-free *absolute* floor and the solver's curvature reference are
-    // corrected. `None` preserves the prior scale-free calibration.
+    // `Some((n_obs, p_cols))` declares the profiled REML/LAML criterion's size,
+    // the formation count its certificate charges gradient and objective
+    // rounding at. The stationarity band does not grow with `n` (#2954): the
+    // ρ-gradient is a difference of rank- and penalty-energy-sized terms, not a
+    // sum over rows.
     profiled_objective_size: Option<(usize, usize)>,
-    // `true` only after the isotropic Matérn endpoint profiler has certified a
-    // winning range basin. The explicit theta0 then owns the sole joint-start
-    // budget; generic multi-block and latent-coordinate callers retain their
-    // family-specific multistart policies.
-    initial_seed_only: bool,
 ) -> Result<gam_solve::rho_optimizer::OuterProblem, EstimationError> {
     if rho_dim > theta0.len() {
         crate::bail_invalid_estim!(
@@ -5452,9 +5308,8 @@ pub(crate) fn exact_joint_multistart_outer_problem(
             "exact joint initial smoothing coordinate is outside the canonical log-strength domain: {error}"
         ))
     })?;
-    // The seed lattice reads its anchor in the outer coordinate, log λ (#1340).
-    // An exp(ρ₀) anchor clamps to the domain's upper face, and every lattice point
-    // built around it inherits that face (#2902 row 9, #2765).
+    // The start is read in the outer coordinate, log λ (#1340): an exp(ρ₀)
+    // anchor would clamp to the domain's upper face (#2902 row 9, #2765).
     let seed_heuristic = theta0.to_vec();
     let mut problem = gam_solve::rho_optimizer::OuterProblem::new(n_params)
         .with_gradient(gradient)
@@ -5519,38 +5374,9 @@ pub(crate) fn exact_joint_multistart_outer_problem(
         .with_initial_rho(theta0.clone())
         .with_bfgs_step_cap(bfgs_step_cap)
         .with_bfgs_step_cap_psi(bfgs_step_cap_psi)
-        // gam#1464: no explicit over-smoothing probe for constant-curvature terms.
-        // The probe seeds the joint [ρ, ψ] solve at the collapsed-kernel corner
-        // where the geodesic exponential exp(−d_κ/L) degenerates to a
-        // near-constant. There the criterion is flat in κ (the kernel no longer
-        // resolves curvature) and reduces to the monotone log-det Occam term, so
-        // keep-best adopts the low-Occam collapsed null regardless of the true κ
-        // sign: the bit-identical κ̂ → +chart-bound rail for both ±κ datasets (the
-        // headline #1464 sign-blindness). Curvature is instead chosen once by the
-        // sign-correct continuous likelihood-profile solve before this joint
-        // nuisance optimization, and its coordinate is pinned here. The seed
-        // lattice spans the declared domain `lower`/`upper` for every fit (#2902
-        // row 9), so legitimate over-smoothing stays reachable by the analytic
-        // gradient solve without pre-pinning a start at the collapsed corner.
-        .with_seed_config(exact_joint_seed_config(
-            risk_profile,
-            auxiliary_dim,
-            initial_seed_only,
-        ))
         .with_heuristic_log_lambdas(seed_heuristic);
     if let Some((n_obs, p_cols)) = profiled_objective_size {
-        // Calibrate to the n-scaled profiled criterion (see the param doc).
-        // This is the scale the spatial exact-joint path was missing relative
-        // to the primary REML outer; without it the iso-κ length-scale fit
-        // stalls as |f| grows with n (#1053 / #1066 / #1069).
-        problem = problem
-            .with_objective_scale(Some(n_obs as f64))
-            .with_problem_size(n_obs, p_cols);
-    }
-    if let Some(screening_cap) = screening_cap {
-        problem = problem
-            .with_screening_cap(screening_cap)
-            .with_screen_initial_rho(true);
+        problem = problem.with_problem_size(n_obs, p_cols);
     }
     Ok(problem)
 }
@@ -5571,11 +5397,9 @@ pub fn optimize_spatial_length_scale_exact_joint_typed<
     block_term_indices: &[Vec<usize>],
     kappa_options: &SpatialLengthScaleOptimizationOptions,
     joint_setup: &ExactJointHyperSetup,
-    seed_risk_profile: gam_problem::SeedRiskProfile,
     analytic_joint_gradient_available: bool,
     analytic_joint_hessian_available: bool,
     disable_fixed_point: bool,
-    screening_cap: Option<Arc<AtomicUsize>>,
     walk_signals: Option<crate::exact_mode_branch::OuterWalkSignals>,
     outer_derivative_policy: gam_model_api::families::custom_family::OuterDerivativePolicy,
     mut fit_fn: FitFn,
@@ -5835,14 +5659,14 @@ where
 
     // Joint design width across blocks → the `p` reported to the outer solver's
     // operator-vs-dense Hessian crossover. `n_total` is the load-bearing
-    // profiled-objective scale (see `exact_joint_multistart_outer_problem`).
+    // profiled-objective scale (see `exact_joint_outer_problem`).
     let joint_p_cols: usize = boot_designs
         .iter()
         .map(|d| d.design.ncols())
         .sum::<usize>()
         .max(1);
 
-    let problem = exact_joint_multistart_outer_problem(
+    let problem = exact_joint_outer_problem(
         &theta0,
         &lower,
         &upper,
@@ -5860,20 +5684,15 @@ where
             DeclaredHessianForm::Unavailable
         },
         disable_fixed_point,
-        seed_risk_profile,
         kappa_options.rel_tol,
         kappa_options.max_outer_iter.max(1),
         // Rho-axis cap: log-λ natural step ≈ 5.
         Some(5.0),
         // Psi-axis cap: one doubling of the kernel length scale per iteration.
         Some(SPATIAL_PSI_BFGS_STEP_CAP),
-        screening_cap.clone(),
         // n-scaled profiled-criterion calibration for every family (#1053 /
         // #1066 / #1069 iso-κ non-convergence cure).
         Some((n_total, joint_p_cols)),
-        // Multi-block optimization has no preceding scalar Matérn endpoint
-        // certificate, so retain its family-specific seed cascade.
-        false,
     )?;
     let problem =
         crate::exact_mode_branch::OuterWalkSignals::subscribe(walk_signals.as_ref(), problem);
@@ -6571,7 +6390,7 @@ fn try_exact_joint_latent_coord_optimization(
         }
     }
 
-    let problem = exact_joint_multistart_outer_problem(
+    let problem = exact_joint_outer_problem(
         &theta0,
         &lower,
         &upper,
@@ -6581,17 +6400,13 @@ fn try_exact_joint_latent_coord_optimization(
         Derivative::Analytic,
         DeclaredHessianForm::Unavailable,
         false,
-        seed_risk_profile_for_likelihood_family(&family),
         options.tol,
         options.max_iter.max(1),
         Some(5.0),
         Some(0.5),
-        None,
         // n-scaled profiled-criterion calibration (same absolute-gradient-floor
         // correction as the spatial paths; #1053 / #1066 / #1069).
         Some((data.nrows(), best.design.design.ncols().max(1))),
-        // Latent-coordinate optimization is not a profiled Matérn range solve.
-        false,
     )?;
 
     let eval_outer = |ctx: &mut &mut LatentJointContext<'_>,
@@ -6623,7 +6438,7 @@ fn try_exact_joint_latent_coord_optimization(
             Some(|ctx: &mut &mut LatentJointContext<'_>, theta: &Array1<f64>| ctx.eval_efs(theta)),
         );
         // #2676: same invariance hook as the iso-kappa arm — this route also
-        // runs through `exact_joint_multistart_outer_problem`, which sets
+        // runs through `exact_joint_outer_problem`, which sets
         // `require_measured_psd`, so its certificate reaches the same curvature
         // verdict on the same kind of penalty map.
         let mut obj = obj.with_criterion_invariance(
@@ -6879,6 +6694,35 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    fit_term_collectionwith_spatial_length_scale_optimization_on_design(
+        data,
+        y,
+        weights,
+        offset,
+        spec,
+        family,
+        options,
+        kappa_options,
+        None,
+    )
+}
+
+/// [`fit_term_collectionwith_spatial_length_scale_optimization`] handed the
+/// design an earlier stage already realized from this exact `spec`, `data` and
+/// `options.resource_policy`. A collection with no spatial coordinate to search
+/// fits on that design instead of building it a second time; every other route
+/// rebuilds its bases per κ and drops it.
+pub(crate) fn fit_term_collectionwith_spatial_length_scale_optimization_on_design(
+    data: ArrayView2<'_, f64>,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    spec: &TermCollectionSpec,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    realized_design: Option<TermCollectionDesign>,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     // Spatial hyperparameters change kernel geometry nonlinearly, so each
     // proposal rebuilds the spatial basis. Hybrid/isotropic terms expose a
     // scalar κ (= 1/length_scale); pure Duchon anisotropy exposes only
@@ -6903,6 +6747,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         &family,
         options,
         kappa_options,
+        realized_design,
     )? {
         SpatialKappaIncumbent::Final(fitted) => return Ok(fitted),
         SpatialKappaIncumbent::Joint {
@@ -7041,6 +6886,7 @@ fn spatial_kappa_incumbent(
     family: &LikelihoodSpec,
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<SpatialKappaIncumbent, EstimationError> {
     let mut resolvedspec = spec.clone();
     let n = data.nrows();
@@ -7061,18 +6907,32 @@ fn spatial_kappa_incumbent(
     // readability — the enrollment predicate does not read `length_scale`.
     // Skipped for pinned, frozen and already-standardized terms; see
     // `seed_measure_jet_auto_ranges`.
-    seed_measure_jet_auto_ranges(data, y.view(), weights.view(), &mut resolvedspec);
+    let seeded = seed_measure_jet_auto_ranges(data, y.view(), weights.view(), &mut resolvedspec);
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     if !kappa_options.enabled || spatial_terms.is_empty() {
-        let out = fit_term_collection_forspec(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &resolvedspec,
-            family.clone(),
-            options,
-        )?;
+        // A seeded range is a different spec from the one the handed design
+        // was realized from.
+        let out = match realized_design.filter(|_| seeded == 0) {
+            Some(design) => fit_term_collection_on_realized_design(
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                &design,
+                None,
+                family.clone(),
+                options,
+            )?,
+            None => fit_term_collection_forspec(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                family.clone(),
+                options,
+            )?,
+        };
         let resolvedspec = freeze_term_collection_from_design(&resolvedspec, &out.design)?;
         return Ok(SpatialKappaIncumbent::Final(FittedTermCollectionWithSpec {
             fit: out.fit,

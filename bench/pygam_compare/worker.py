@@ -1,14 +1,26 @@
 """One benchmark rep: one library, one (family, n, design, seed) cell, fresh process.
 
-Usage: worker.py LIB FAMILY N DESIGN SEED
+Usage: worker.py LIB FAMILY N DESIGN SEED [N_PREDICT] [--postfit]
 
-  LIB     gamfit | pygam | pygam_gs
-  FAMILY  gaussian | binomial | poisson, a binomial variant of the
-          ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), or a
-          positive-continuous family of the ``positive_*`` plans (see
-          ``POSITIVE_FAMILIES``)
-  DESIGN  p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
-          | by (see ``make_data``)
+  LIB        gamfit | pygam | pygam_gs
+  FAMILY     gaussian | binomial | poisson, a binomial variant of the
+             ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), or a
+             positive-continuous family of the ``positive_*`` plans (see
+             ``POSITIVE_FAMILIES``)
+  DESIGN     p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
+             | by (see ``make_data``) | fz<case> | ff-<regime>
+  N_PREDICT  held-out rows to predict on (default: N)
+  --postfit  also time the post-fit operations listed below
+
+A ``fz<case>`` design is a convergence-fuzz case (``fuzz_terms.py``): a seeded
+term structure — tensor, ``ti``, ``by=``, factor, random-effect, cyclic, 2-D
+isotropic, shape-constrained and concurvity terms — fitted with gamfit only
+on the gaussian, binomial and poisson families; see :func:`run_fuzz`.
+
+An ``ff-<regime>`` design is a family-convergence-fuzz cell
+(``fuzz_families.py``): FAMILY is then a fuzz family label (every family and
+link gamfit supports, e.g. ``gamma(inverse)``, ``binomial-trials(cauchit)``)
+and the data sit at an edge of the family's support; gamfit only.
 
 Prints exactly one ``RESULT {json}`` line on stdout. The driver (``run.py``)
 launches this script with a pinned thread environment and a scratch working
@@ -23,10 +35,22 @@ shared host wall time measures the neighbours as much as the library.
   fit       one cold fit (the first fit in the process)
   fit_warm  a second fit of the same data in the same process: the per-fit cost
             once imports, lazy initialisation and caches are paid
-  pred      point prediction on ``n`` fresh rows
-  interval  95% interval prediction on the same rows
+  pred      point prediction on ``n_predict`` fresh rows
+  interval  95% interval prediction on the same rows (plus the observation
+            interval for Gaussian, which the Gaussian log score needs)
 
-Held-out accuracy is computed on ``n`` fresh rows drawn with ``seed + 1000``,
+With ``--postfit`` the fitted model's other post-fit operations are timed too:
+
+  pd        a term's partial dependence with its standard error on a
+            200-point grid
+  summary   the model summary
+  save      writing the model to disk (``save_bytes`` is the file size)
+  load      reading it back
+  sample    100 coefficient draws from the posterior
+  sig       gamfit's per-term smooth significance (pyGAM has no separate
+            operation: its p-values are part of the fit)
+
+Held-out accuracy is computed on ``n_predict`` fresh rows drawn with ``seed + 1000``,
 against both the true mean (``rmse_mu``, ``coverage``) and the drawn response
 (``deviance``, ``logscore``). A phase that raises is recorded under ``errors``
 and makes the rep's status ``error``; the metrics of the phases that did run
@@ -35,8 +59,12 @@ are still reported.
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
 import json
+import os
+import pickle
 import re
 import resource
 import sys
@@ -47,6 +75,12 @@ from typing import Any, Callable
 import numpy as np
 from numpy.typing import NDArray
 from scipy import special, stats
+
+if __package__:
+    from . import fuzz_families, fuzz_terms
+else:  # run as a script by run.py: this directory is sys.path[0]
+    import fuzz_families  # type: ignore[no-redef]
+    import fuzz_terms  # type: ignore[no-redef]
 
 LIBS = ("gamfit", "pygam", "pygam_gs")
 FAMILIES = ("gaussian", "binomial", "poisson")
@@ -69,7 +103,9 @@ TRIALS_MAX = 20
 #   gamma_inverse       Gamma, shape 3, fitted on the canonical inverse link;
 #                       the truth is ``1 / mu = 1 + 0.2 eta``, which stays
 #                       positive for every design (``|eta| <= sqrt(p)``).
-#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3, log link.
+#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3; the
+#                       truth is on the log scale, the fit on the canonical
+#                       ``1 / mu^2`` link (gamfit's default for the family).
 #   lognormal_gaussian  ``log y = 0.5 + 0.7 eta + N(0, 0.5^2)`` fitted as a
 #                       Gaussian on the log scale (response and mean are logs).
 #   lognormal_gamma     the same draw of ``y`` fitted by Gamma(log) on the raw
@@ -125,6 +161,11 @@ EXTRA_DESIGNS = ("te+s", "by")
 BY_LEVELS = ("a", "b", "c")
 INTERVAL_LEVEL = 0.95
 TEST_SEED_OFFSET = 1000
+PD_POINTS = 200
+SAMPLE_DRAWS = 100
+# The fuzz interval phase checks that intervals are finite on this many
+# held-out rows; interval speed is measured by the core plans, not here.
+FUZZ_INTERVAL_ROWS = 200
 
 FloatArray = NDArray[np.float64]
 
@@ -319,6 +360,17 @@ class Adapter:
     def model_info(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    def postfit_ops(
+        self, X: FloatArray, y: FloatArray, path: str
+    ) -> dict[str, Callable[[], Any]]:
+        """The post-fit operations timed under ``--postfit``, in run order.
+
+        ``X`` / ``y`` are the training data (the posterior draws and the
+        significance refits need the response); ``path`` is a scratch file
+        for the save / load round trip, written by ``save`` before ``load``.
+        """
+        raise NotImplementedError
+
 
 WEIGHTS_COLUMN = "trials"
 
@@ -393,6 +445,21 @@ class GamfitAdapter(Adapter):
             "inner_iterations": self.model.inner_iterations,
             "certified": conv.get("certified") if isinstance(conv, dict) else None,
             "convergence": conv,
+        }
+
+    def postfit_ops(
+        self, X: FloatArray, y: FloatArray, path: str
+    ) -> dict[str, Callable[[], Any]]:
+        train = self._table(X)
+        train["y"] = y
+        term = self.formula.split("~ ", 1)[1].split(" + ", 1)[0]
+        return {
+            "pd": lambda: self.model.partial_dependence(term, n_points=PD_POINTS),
+            "summary": self.model.summary,
+            "save": lambda: self.model.save(path),
+            "load": lambda: self.gamfit.load(path),
+            "sample": lambda: self.model.sample(train, samples=SAMPLE_DRAWS, seed=0),
+            "sig": lambda: self.model.smooth_significance(train),
         }
 
 
@@ -472,13 +539,138 @@ class PygamAdapter(Adapter):
             "lam": [float(v) for v in _flatten(self.model.lam)],
         }
 
+    def postfit_ops(
+        self, X: FloatArray, y: FloatArray, path: str
+    ) -> dict[str, Callable[[], Any]]:
+        def pd() -> Any:
+            grid = self.model.generate_X_grid(term=0, n=PD_POINTS)
+            return self.model.partial_dependence(term=0, X=grid, width=INTERVAL_LEVEL)
 
-def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]:
+        def summary() -> None:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.model.summary()
+
+        def save() -> None:
+            with open(path, "wb") as fh:
+                pickle.dump(self.model, fh)
+
+        def load() -> Any:
+            with open(path, "rb") as fh:
+                return pickle.load(fh)
+
+        return {
+            "pd": pd,
+            "summary": summary,
+            "save": save,
+            "load": load,
+            # Coefficient draws from pyGAM's Gaussian posterior approximation;
+            # n_bootstraps=1 keeps it to the fitted smoothing parameters
+            # instead of refitting on bootstrap resamples.
+            "sample": lambda: self.model.sample(
+                X, y, quantity="coef", n_draws=SAMPLE_DRAWS, n_bootstraps=1
+            ),
+        }
+
+
+def run_fuzz(family: str, n: int, design: str, seed: int) -> dict[str, Any]:
+    """One convergence-fuzz rep (design ``fz<case>``, gamfit only).
+
+    Same phases as :func:`run`, plus what the fuzz triage needs: the formula,
+    the certificate verdict, whether every prediction and interval came back
+    finite, and the exception type of a phase that raised, so a typed
+    build-time refusal can be told apart from a solver failure.
+    """
+    data = fuzz_terms.draw(int(design[2:]), n, family, seed)
+    out: dict[str, Any] = {"base_rss_mb": rss_peak_mb(), "formula": data.formula}
+    errors: dict[str, str] = {}
+    error_types: dict[str, str] = {}
+
+    def phase(name: str, fn: Callable[[], Any]) -> Any:
+        t = Timer()
+        try:
+            value = fn()
+        except Exception as exc:
+            errors[name] = traceback.format_exc(limit=4)[-2000:]
+            error_types[name] = type(exc).__name__
+            return None
+        out[f"{name}_s"], out[f"{name}_cpu_s"] = t.stop()
+        return value
+
+    gamfit: Any = phase("import", lambda: importlib.import_module("gamfit"))
+    model: Any = None
+    if gamfit is not None:
+        out["lib_version"] = str(gamfit.__version__)
+        out["lib_file"] = str(gamfit.__file__)
+        train = fuzz_terms.as_frame(data.train, data.categorical)
+        model = phase("fit", lambda: gamfit.fit(train, data.formula, family=family))
+    if model is not None:
+        out["rss_after_fit_mb"] = rss_peak_mb()
+        test = fuzz_terms.as_frame(data.test, data.categorical)
+        head = fuzz_terms.as_frame(
+            {k: v[:FUZZ_INTERVAL_ROWS] for k, v in data.test.items()},
+            data.categorical,
+        )
+        pred = phase(
+            "pred", lambda: np.asarray(model.predict(test), dtype=float).reshape(-1)
+        )
+        iv = phase(
+            "interval",
+            lambda: model.predict(head, interval=INTERVAL_LEVEL, return_type="dict"),
+        )
+        summ = phase("info", model.summary)
+        if summ is not None:
+            conv = getattr(summ, "convergence", None)
+            out["convergence"] = json.loads(json.dumps(conv, default=str))
+            out["certified"] = None if conv is None else bool(conv.get("certified"))
+            out["edf"] = None if summ.edf_total is None else float(summ.edf_total)
+        if pred is not None:
+            out["pred_finite"] = bool(np.all(np.isfinite(pred)))
+            if out["pred_finite"]:
+                out["rmse_mu"] = float(np.sqrt(np.mean((pred - data.mu_test) ** 2)))
+        if iv is not None:
+            lo = np.asarray(iv["posterior_mean_lower"], dtype=float)
+            hi = np.asarray(iv["posterior_mean_upper"], dtype=float)
+            finite = np.isfinite(lo) & np.isfinite(hi)
+            out["interval_finite"] = bool(np.all(finite))
+            if out["interval_finite"]:
+                mu = data.mu_test[: lo.shape[0]]
+                out["coverage"] = float(np.mean((mu >= lo) & (mu <= hi)))
+    out["peak_rss_mb"] = rss_peak_mb()
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    out["cpu_user_s"] = usage.ru_utime
+    out["cpu_sys_s"] = usage.ru_stime
+    out["status"] = "error" if errors else "ok"
+    if errors:
+        out["errors"] = errors
+        out["error_types"] = error_types
+    return out
+
+
+def run(
+    lib: str,
+    family: str,
+    n: int,
+    design: str,
+    seed: int,
+    n_predict: int | None = None,
+    postfit: bool = False,
+) -> dict[str, Any]:
     if lib not in LIBS:
         raise ValueError(f"unknown lib {lib!r}; expected one of {LIBS}")
+    if fuzz_terms.is_fuzz_design(design):
+        if lib != "gamfit":
+            raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
+        return run_fuzz(family, n, design, seed)
+    if fuzz_families.is_fuzz_design(design):
+        if lib != "gamfit":
+            raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
+        return fuzz_families.run(family, n, design, seed)
     X, y, _, w = make_data(n, design, family, seed)
-    Xt, yt, mut, wt = make_data(n, design, family, seed + TEST_SEED_OFFSET)
+    n_test = n if n_predict is None else n_predict
+    Xt, yt, mut, wt = make_data(n_test, design, family, seed + TEST_SEED_OFFSET)
     out: dict[str, Any] = {"base_rss_mb": rss_peak_mb()}
+    if n_predict is not None:
+        out["n_predict"] = n_predict
     errors: dict[str, str] = {}
 
     def phase(name: str, fn: Callable[[], Any], timed: bool = True) -> Any:
@@ -525,6 +717,13 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
                 )
         elif pred is not None and family != "gaussian":
             out["logscore"] = mean_logscore(family, yt, pred, None, wt)
+        if postfit:
+            path = os.path.abspath(f"postfit_{lib}_{os.getpid()}.model")
+            for name, op in adapter.postfit_ops(X, y, path).items():
+                phase(name, op)
+            if os.path.exists(path):
+                out["save_bytes"] = os.path.getsize(path)
+                os.remove(path)
     out["peak_rss_mb"] = rss_peak_mb()
     usage = resource.getrusage(resource.RUSAGE_SELF)
     out["cpu_user_s"] = usage.ru_utime
@@ -536,17 +735,20 @@ def run(lib: str, family: str, n: int, design: str, seed: int) -> dict[str, Any]
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) != 5:
+    postfit = "--postfit" in argv
+    args = [a for a in argv if a != "--postfit"]
+    if len(args) not in (5, 6):
         print(__doc__, file=sys.stderr)
         return 2
     lib, family, n, design, seed = (
-        argv[0],
-        argv[1],
-        int(float(argv[2])),
-        argv[3],
-        int(argv[4]),
+        args[0],
+        args[1],
+        int(float(args[2])),
+        args[3],
+        int(args[4]),
     )
-    out = run(lib, family, n, design, seed)
+    n_predict = int(float(args[5])) if len(args) == 6 else None
+    out = run(lib, family, n, design, seed, n_predict=n_predict, postfit=postfit)
     # Non-finite floats become null: JSON has no NaN/Inf, and a report that
     # silently parses "NaN" would hide a broken metric.
     nonfinite = [

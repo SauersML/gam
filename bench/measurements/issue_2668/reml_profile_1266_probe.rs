@@ -22,7 +22,9 @@
 use csv::StringRecord;
 use gam::types::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam::{FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism};
-use gam_solve::estimate::{ExternalOptimOptions, evaluate_externalcost, smooth_term_summary_rows};
+use gam_solve::estimate::{
+    ExternalOptimOptions, SummaryBlockOffset, evaluate_externalcost, smooth_term_summary_rows,
+};
 use ndarray::Array1;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
@@ -60,7 +62,11 @@ fn reml_profile_1266_probe() {
         let FitResult::Standard(std_fit) = &fit else {
             panic!("expected a standard Gaussian fit");
         };
-        let rows = smooth_term_summary_rows(&std_fit.design, &std_fit.resolvedspec, &std_fit.fit);
+        let rows = smooth_term_summary_rows(
+            &std_fit.design,
+            &std_fit.fit,
+            SummaryBlockOffset::default(),
+        );
         let edfs: Vec<(String, f64)> = rows.iter().map(|row| (row.name.clone(), row.edf)).collect();
         let n = response.len();
         let y = Array1::from(response);

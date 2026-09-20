@@ -7,8 +7,8 @@
 // keeps the same flat namespace and the same import surface — nothing here
 // changed except which file it lives in.
 
-// The λ̂-selection replay the reference is read against lives in `gam-terms`, so
-// the summary Wald test below the fit orchestration can read against it too.
+// The λ̂-selection replay the reference is read against lives in `gam-terms`
+// (`inference::selection_replay`).
 pub use gam_terms::inference::selection_replay::{
     SmoothLrSelection, SmoothLrSelectionDecline, SmoothLrSelectionReplay,
 };

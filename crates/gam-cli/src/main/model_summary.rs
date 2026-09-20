@@ -110,6 +110,7 @@ pub(crate) fn build_model_summary(
             }) => {
                 let prior_txt = match prior {
                     BoundedCoefficientPriorSpec::None => ", no-prior".to_string(),
+                    BoundedCoefficientPriorSpec::Shrinkage => ", shrinkage(REML)".to_string(),
                     BoundedCoefficientPriorSpec::Uniform => ", Uniform(log-Jacobian)".to_string(),
                     BoundedCoefficientPriorSpec::Beta { a, b } => {
                         format!(", Beta({a:.3},{b:.3})")
@@ -147,13 +148,12 @@ pub(crate) fn build_model_summary(
 
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →
-    // global coefficient shift, the per-term influence trace, and the Wald test
-    // itself — is ONE accounting shared with the persisted-model summary the
+    // global coefficient shift, the per-term influence trace, and the smooth
+    // test itself — is ONE accounting shared with the persisted-model summary the
     // Python API reads (#2470). It was written out here and again in
     // `gam-pyffi`, which is why #1219, #1277, #1360, #1368 and #1372 each had to
-    // be landed twice. The test reads only the fit, so both surfaces hand over
-    // the same inputs.
-    let smooth_terms = smooth_term_summary_rows(design, spec, fit);
+    // be landed twice.
+    let smooth_terms = smooth_term_summary_rows(design, fit, SummaryBlockOffset::default());
 
     Ok(ModelSummary {
         family: family.pretty_name().to_string(),
@@ -282,6 +282,20 @@ pub(crate) fn covariance_from_model(
         if let Some(cov) = fit.beta_covariance_corrected() {
             return Ok(cov.clone());
         }
+        // A fit whose inference stayed factorized carries `Vp = Vb + B·Bᵀ` as the
+        // correction's factor beside its Hessian (#3283).
+        if let Some(backend) = gam_predict::smoothing_corrected_factorized_backend(
+            fit,
+            fit.beta.len(),
+            "saved-model covariance summary",
+        )
+        .map_err(|error| error.to_string())?
+        {
+            let dim = backend.nrows();
+            return backend.apply_columns(&Array2::<f64>::eye(dim)).map_err(|e| {
+                format!("failed to recover the smoothing-corrected covariance from its factors: {e}")
+            });
+        }
         // With NO smoothing coordinates the correction J·V_rho·Jᵀ is the unique
         // zero-dimensional zero matrix, so Vp = Vb EXACTLY. This is an identity
         // of the definition, not a fallback to a weaker uncertainty object, and
@@ -332,6 +346,16 @@ pub(crate) fn prediction_backend_from_model<'a>(
     if mode == InferenceCovarianceMode::SmoothingCorrected {
         if let Some(covariance) = fit.beta_covariance_corrected() {
             return Ok(PredictionCovarianceBackend::from_dense(covariance.view()));
+        }
+        // The factorized branch's `Vp = Vb + B·Bᵀ` (#3283).
+        if let Some(backend) = gam_predict::smoothing_corrected_factorized_backend(
+            fit,
+            fit.beta.len(),
+            "saved-model prediction",
+        )
+        .map_err(|error| error.to_string())?
+        {
+            return Ok(backend);
         }
         // Same zero-smoothing-coordinate identity as `covariance_from_model`
         // above: Vp = Vb when there is no rho to integrate over. Falling

@@ -238,9 +238,9 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
                          (skovgaard_rstar_corrected_pvalue_is_not_oversized_under_the_null) \
                          + bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test",
         },
-        // Summary smooth Wald test (whitened statistic read against its
-        // λ̂-selection null law) + Bartlett/Lawley LR correction (#1873). The
-        // family sweep gates U(0, 1) per response family (IRLS weights, scale
+        // Summary smooth-term p-value (the variance-component score test) +
+        // Bartlett/Lawley LR correction (#1873). The family sweep gates the
+        // null p-value's uniformity per response family (IRLS weights, scale
         // predicate and reference law all change with the family).
         CalibrationTarget {
             name: "wood_smooth_test_pvalue",
@@ -250,9 +250,9 @@ pub fn uq_surface_registry() -> Vec<CalibrationTarget> {
             audited_by: "bug_hunt_smooth_significance_ref_df_floor_and_null_fpr_test \
                          + sbc_wood_smooth_test_family_size_curve",
         },
-        // Multinomial per-class Wood smooth test (#1891 follow-up): the
-        // `wood_smooth_test` primitive the summary table used before it moved
-        // to the λ̂-selection law, reached through `gam-models::multinomial`'s own
+        // Multinomial per-class Wood smooth test (#1891 follow-up): the SAME
+        // shared `wood_smooth_test` primitive as `wood_smooth_test_pvalue`
+        // above, but reached through `gam-models::multinomial`'s own
         // block-ordered coefficient/EDF/covariance-slice plumbing — a
         // completeness sweep found `MultinomialSmoothSignificance` unregistered.
         CalibrationTarget {

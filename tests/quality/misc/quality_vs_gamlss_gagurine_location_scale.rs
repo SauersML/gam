@@ -42,8 +42,10 @@
 //!     through `FitRequest::GaussianLocationScale`.
 //!   * the response is standardized while fitting and returned coefficients are
 //!     mapped back to raw units, so prediction uses
-//!     `sigma = response_scale * LOGB_SIGMA_FLOOR + exp(eta_scale)`; the mean
-//!     block carries `BlockRole::Location`, the log-sigma block `BlockRole::Scale`.
+//!     `sigma = response_scale * sigma_floor + exp(eta_scale)`, where
+//!     `sigma_floor` is the fit's recording-grid bound δ/√12 of the
+//!     standardized response; the mean block carries `BlockRole::Location`, the
+//!     log-sigma block `BlockRole::Scale`.
 
 use gam::estimate::BlockRole;
 use gam::gamlss::GaussianLocationScaleFitResult;
@@ -55,10 +57,6 @@ use ndarray::Array2;
 use std::path::Path;
 
 const GAGURINE_CSV: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bench/datasets/gagurine.csv");
-
-/// gam's location-scale noise link floor: sigma = 0.01 + exp(eta_scale).
-/// Mirrors `families::sigma_link::LOGB_SIGMA_FLOOR` (and mgcv `gaulss(b=0.01)`).
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
 
 /// Mean Gaussian negative log-likelihood of `y` under predicted `mu`, `sigma`.
 /// A proper scoring rule for a predicted location-scale distribution: lower is a
@@ -172,6 +170,7 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
     let FitResult::GaussianLocationScale(GaussianLocationScaleFitResult {
         fit,
         response_scale,
+        sigma_floor,
         ..
     }) = result
     else {
@@ -211,7 +210,7 @@ fn gam_location_scale_predicts_gagurine_better_than_baseline() {
             .design
             .apply(&beta_scale)
             .iter()
-            .map(|&e| response_scale * LOGB_SIGMA_FLOOR + e.exp())
+            .map(|&e| response_scale * sigma_floor + e.exp())
             .collect();
         (mu, sigma)
     };

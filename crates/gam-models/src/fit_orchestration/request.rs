@@ -213,16 +213,13 @@ pub struct StandardFitResult {
     /// materialized covariate frame it needs, not by `fit_model`, which does
     /// not know which numeric columns a smooth's covariates are.
     pub basis_adequacy: Vec<crate::fit_orchestration::drivers::BasisAdequacyRow>,
-    /// Which resolved smooth positions originated from an auto-sized radial
-    /// spatial basis. Freeze replaces center strategies with explicit center
-    /// matrices, so this provenance must travel beside the result for the
-    /// adaptive resolution loop.
-    pub adaptive_spatial_terms: Vec<bool>,
-    /// Requested (pre-freeze) center counts aligned with
-    /// `adaptive_spatial_terms`. Frozen specs store realized center matrices,
-    /// whose row count can include periodic image expansion and is therefore
-    /// not the next request size.
-    pub adaptive_spatial_center_counts: Vec<Option<usize>>,
+    /// The pre-freeze basis of every smooth term whose resolution nobody
+    /// chose, aligned with `resolvedspec.smooth_terms` (`None` for a basis the
+    /// user sized). Freeze replaces center strategies and knot rules with
+    /// realized geometry, erasing the adaptive provenance, so the resolution
+    /// loop reads the fitted resolution, its data support and its next
+    /// refinement from these specs (see [`gam_terms::smooth::AdaptiveResolution`]).
+    pub adaptive_bases: Vec<Option<gam_terms::smooth::SmoothBasisSpec>>,
     pub kappa_timing: Option<SpatialLengthScaleOptimizationTiming>,
     pub saved_link_state: FittedLinkState,
     pub wiggle_knots: Option<Array1<f64>>,
@@ -242,106 +239,17 @@ pub struct StandardFitResult {
     pub wiggle_saved_index_shift: Option<Vec<f64>>,
 }
 
-pub(crate) fn adaptive_spatial_term_mask(spec: &TermCollectionSpec) -> Vec<bool> {
-    fn auto_spatial(basis: &gam_terms::smooth::SmoothBasisSpec) -> bool {
-        use gam_terms::smooth::SmoothBasisSpec as B;
-        match basis {
-            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => auto_spatial(inner),
-            B::BySmooth { smooth, .. } => auto_spatial(smooth),
-            B::ThinPlate {
-                feature_cols, spec, ..
-            } => {
-                !feature_cols.is_empty()
-                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
-            }
-            B::Duchon {
-                feature_cols, spec, ..
-            } => {
-                !feature_cols.is_empty()
-                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
-            }
-            // Matérn's learned range changes both its basin and realized kernel
-            // rank as centers move. It has no validated EDF-saturation growth
-            // theorem yet, so the generic radial grow loop must not claim it.
-            B::Matern { .. } => false,
-            B::ConstantCurvature { feature_cols, spec } => {
-                !feature_cols.is_empty()
-                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
-            }
-            B::MeasureJet {
-                feature_cols, spec, ..
-            } => {
-                !feature_cols.is_empty()
-                    && gam_terms::basis::center_strategy_is_auto(&spec.center_strategy)
-            }
-            _ => false,
-        }
-    }
-
+/// The basis of every smooth term of `spec` that carries an adaptive
+/// resolution ([`gam_terms::smooth::adaptive_resolution_of`]), aligned with
+/// `spec.smooth_terms`.
+pub(crate) fn adaptive_bases(
+    spec: &TermCollectionSpec,
+) -> Vec<Option<gam_terms::smooth::SmoothBasisSpec>> {
     spec.smooth_terms
         .iter()
-        .map(|term| auto_spatial(&term.basis) || adaptive_bspline_knots(&term.basis).is_some())
-        .collect()
-}
-
-/// Internal-knot count of an ungated formula-default `s(x)` B-spline whose
-/// resolution the standard workflow owns
-/// ([`gam_terms::basis::BSplineKnotSpec::Automatic`]`{ adaptive: true, .. }`).
-/// A row-gated smooth (`by=`, factor sum-to-zero) is supported by only its
-/// gate's rows, so the covariate's distinct values do not bound its basis; it
-/// keeps its starting resolution.
-pub(crate) fn adaptive_bspline_knots(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
-    match basis {
-        gam_terms::smooth::SmoothBasisSpec::BSpline1D {
-            spec:
-                gam_terms::basis::BSplineBasisSpec {
-                    knotspec:
-                        gam_terms::basis::BSplineKnotSpec::Automatic {
-                            num_internal_knots: Some(num_internal_knots),
-                            adaptive: true,
-                            ..
-                        },
-                    boundary: gam_terms::basis::OneDimensionalBoundary::Open,
-                    ..
-                },
-            ..
-        } => Some(*num_internal_knots),
-        _ => None,
-    }
-}
-
-pub(crate) fn adaptive_spatial_center_counts(spec: &TermCollectionSpec) -> Vec<Option<usize>> {
-    fn center_count(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
-        use gam_terms::smooth::SmoothBasisSpec as B;
-        match basis {
-            B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => center_count(inner),
-            B::BySmooth { smooth, .. } => center_count(smooth),
-            B::ThinPlate {
-                feature_cols, spec, ..
-            } if !feature_cols.is_empty() => {
-                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
-            }
-            B::Duchon {
-                feature_cols, spec, ..
-            } if !feature_cols.is_empty() => {
-                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
-            }
-            B::Matern { .. } => None,
-            B::ConstantCurvature { feature_cols, spec } if !feature_cols.is_empty() => {
-                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
-            }
-            B::MeasureJet {
-                feature_cols, spec, ..
-            } if !feature_cols.is_empty() => {
-                Some(spec.center_strategy.planned_num_centers(feature_cols.len()))
-            }
-            _ => None,
-        }
-    }
-
-    spec.smooth_terms
-        .iter()
-        .map(|term| center_count(&term.basis).or_else(|| adaptive_bspline_knots(&term.basis)))
+        .map(|term| {
+            gam_terms::smooth::adaptive_resolution_of(&term.basis).map(|_| term.basis.clone())
+        })
         .collect()
 }
 
@@ -724,14 +632,14 @@ pub struct FitConfig {
     /// so validation creates no directories and every standard, survival, and
     /// custom-family owner uses one opened store handle.
     pub persistent_warm_start_store: Option<gam_runtime::warm_start::ConfiguredWarmStartStore>,
-    /// Per-smooth spatial center requests maintained by the adaptive
-    /// fit→expand→refit loop. Outer `None` means no loop owns this request, so
+    /// Per-smooth resolution requests maintained by the adaptive
+    /// fit→refine→refit loop. Outer `None` means no loop owns this request, so
     /// raw materialization keeps the ordinary full basis. `Some` activates the
-    /// canonical formula workflow: missing inner entries select the structural
-    /// identifiable start and `Some(k)` requests the next evidence-backed
-    /// resolution for that smooth only. This is in-process orchestration state,
-    /// never a user knob or environment setting.
-    pub spatial_center_counts: Option<Vec<Option<usize>>>,
+    /// canonical formula workflow: missing inner entries select each smooth's
+    /// data-derived starting resolution and `Some(r)` requests the next
+    /// evidence-backed resolution for that smooth only. This is in-process
+    /// orchestration state, never a user knob or environment setting.
+    pub adaptive_resolution: Option<Vec<Option<gam_terms::smooth::AdaptiveResolution>>>,
     /// Whether the fit computes and publishes a coefficient covariance (and the
     /// standard errors derived from it). `None` keeps each family's own
     /// default, which for every path that reaches this field today is "yes";
@@ -815,7 +723,7 @@ impl Default for FitConfig {
             analytic_penalties: None,
             smooth_overrides: None,
             persistent_warm_start_store: None,
-            spatial_center_counts: None,
+            adaptive_resolution: None,
         }
     }
 }
@@ -894,7 +802,7 @@ mod default_workflow_policy_tests {
     #[test]
     fn raw_materialization_does_not_activate_adaptive_spatial_resolution() {
         assert!(
-            FitConfig::default().spatial_center_counts.is_none(),
+            FitConfig::default().adaptive_resolution.is_none(),
             "raw materialization must not activate a grow loop it does not own"
         );
     }

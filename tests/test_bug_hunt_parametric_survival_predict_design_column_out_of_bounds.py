@@ -4,7 +4,7 @@ predicted — ``predict`` raises a covariate-design dimension mismatch.
 Fitting ``Surv(entry, exit, event) ~ x`` succeeds, but ``model.predict(...)``
 (even on the training data) raises::
 
-    GamError: failed to build survival prediction design:
+    GamfitError: failed to build survival prediction design:
     Dimension mismatch: linear term 'x' feature column 3 out of bounds for 3 columns
 
 For a table ``[entry, exit, event, x]`` the linear term ``x`` is replayed at its

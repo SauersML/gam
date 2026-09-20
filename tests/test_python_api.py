@@ -4,6 +4,7 @@ import json
 import typing
 
 import pathlib
+import re
 import time
 
 pytest = typing.cast(typing.Any, importlib.import_module("pytest"))
@@ -103,6 +104,13 @@ def test_build_info_reports_real_extension() -> None:
     assert info["module"] == "gamfit._rust"
     assert "fit" in info["capabilities"]
     assert "validate_formula" in info["capabilities"]
+    # gam#3007: the build names its commit, so engines that share a version
+    # string can be told apart. The tests run from a gam checkout.
+    commit = info["commit"]
+    assert isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}", commit), info
+    assert isinstance(info["dirty"], bool), info
+    assert isinstance(info["model_payload_version"], int), info
+    assert info["model_payload_version"] >= 29, info
     assert info["supported_model_classes"] == [
         "standard",
         "transformation-normal",
@@ -206,6 +214,7 @@ def test_fit_predict_summary_check_report_and_roundtrip(tmp_path: pathlib.Path) 
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",

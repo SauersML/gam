@@ -411,8 +411,9 @@ mod constant_curvature_kappa_range_identification_tests {
         // What the FIT writes back: the range this criterion profiles to at one
         // κ. Taken at the box's hyperbolic end, which is where `ℓ̂` is furthest
         // from the auto rule.
-        let derived = ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
-            .expect("profile is constructible from an auto-range spec");
+        let derived =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible from an auto-range spec");
         let anchor_kappa = -0.9 * cap;
         let (eta_at_anchor, _, _) = derived
             .minimize_over_eta(anchor_kappa)
@@ -453,9 +454,9 @@ mod constant_curvature_kappa_range_identification_tests {
                     b.to_string(),
                     "κ={kappa}: the two profiles refuse for different reasons"
                 ),
-                (a, b) => panic!(
-                    "κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}"
-                ),
+                (a, b) => {
+                    panic!("κ={kappa}: one profile evaluated and the other refused: {a:?} vs {b:?}")
+                }
             }
         }
     }
@@ -617,5 +618,72 @@ mod constant_curvature_kappa_range_identification_tests {
         // fixture.
         ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
             .expect("the default single-penalty term still profiles");
+    }
+
+    /// The κ route is held to the fit's own `tol`, like every other outer route.
+    ///
+    /// It used to declare `options.tol.max(√ε)`. The canonical fit tolerance is
+    /// `1e-10`, and `√ε ≈ 1.49e-8` is larger, so the floor was always the value
+    /// used: this one route quietly loosened the stationarity band by about 150x
+    /// while every other route passed `tol` straight through. The exact
+    /// `d²V_p/dκ²` and the declared size set what this route can resolve. A floor
+    /// set by a machine constant does not.
+    #[test]
+    fn the_kappa_route_holds_the_fits_own_tolerance() {
+        let n = 120usize;
+        let centers = 6usize;
+        let seed = 0x5EED_2747_0000_0007_u64;
+        let (probe_feats, _) = dataset_in_span(n, 0.0, 0.6, 1.0, centers, 0.0, seed);
+        let (_, cap) = seed_range_and_box(&probe_feats, centers);
+        let (feats, y) = dataset_in_span(n, 0.5, 0.6, 1.0, centers, 0.05, seed);
+        let profile =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible on the fixture");
+        for tol in [1e-10_f64, 1e-6] {
+            let options = FitOptions {
+                tol,
+                ..FitOptions::default()
+            };
+            let problem = constant_curvature_kappa_problem(n, &profile, &options, -cap, cap);
+            assert_eq!(
+                problem.tolerance(),
+                tol,
+                "the κ problem must declare the fit's tol {tol:e} verbatim"
+            );
+        }
+    }
+
+    /// At the canonical `tol = 1e-10`, with the floor gone, the κ solve still
+    /// reaches a converged optimum with an interior κ̂. The floor was not what
+    /// made the route converge.
+    #[test]
+    fn the_kappa_solve_converges_at_the_canonical_tolerance() {
+        let n = 240usize;
+        let centers = 6usize;
+        let radius = 0.6_f64;
+        let seed = 0x5EED_2747_0000_0008_u64;
+        let kappa_star = 0.7_f64;
+        let (probe_feats, _) = dataset_in_span(n, 0.0, radius, 1.0, centers, 0.0, seed);
+        let (ell_ref, cap) = seed_range_and_box(&probe_feats, centers);
+        let (feats, y) = dataset_in_span(n, kappa_star, radius, ell_ref, centers, 0.03, seed);
+        let profile =
+            ConstantCurvatureProfile::new(feats.view(), y.view(), spec_at(0.0, centers, 0.0))
+                .expect("profile is constructible on the fixture");
+        let options = FitOptions {
+            tol: 1e-10,
+            ..FitOptions::default()
+        };
+        let optimum = solve_constant_curvature_kappa_profile(n, profile, &options, -cap, cap, 0)
+            .expect("the κ solve must converge at the canonical tolerance");
+        eprintln!(
+            "[κ tol] planted κ⋆ = {kappa_star}, κ̂ = {:.6}, ℓ̂ = {:.6}, box = ±{cap:.4}",
+            optimum.kappa, optimum.length_scale
+        );
+        assert!(
+            optimum.kappa > -cap && optimum.kappa < cap,
+            "κ̂ = {} must be interior to the box ±{cap}",
+            optimum.kappa
+        );
+        assert!(optimum.length_scale.is_finite() && optimum.length_scale > 0.0);
     }
 }

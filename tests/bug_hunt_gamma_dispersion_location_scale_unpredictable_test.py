@@ -61,13 +61,13 @@ def _assert_joint_covariance_and_predictable(
 
     # (1) Joint posterior covariance is assembled over the FULL coefficient
     #     vector (mean block + log-precision block), not left unset.
-    assert s.covariance_n is not None, (
+    assert s.covariance is not None, (
         f"{family} location-scale fit must expose a joint posterior covariance; "
-        f"got covariance_n=None (the orthogonal-family joint-Hessian regression)"
+        f"got covariance=None (the orthogonal-family joint-Hessian regression)"
     )
-    assert s.covariance_n == n_coef, (
+    assert s.covariance.shape == (n_coef, n_coef), (
         f"{family}: covariance must span all {n_coef} coefficients, "
-        f"got covariance_n={s.covariance_n}"
+        f"got shape {s.covariance.shape}"
     )
 
     # (2) A finite effective degrees of freedom.
@@ -180,7 +180,7 @@ def test_beta_dispersion_location_scale_still_predictable() -> None:
     m = gamfit.fit(df, "y ~ s(x)", family="beta", noise_formula="s(x)")
     s = m.summary()
     n_coef = len(s.coefficients)
-    assert s.covariance_n == n_coef
+    assert s.covariance.shape == (n_coef, n_coef)
     assert s.edf_total is not None and np.isfinite(s.edf_total)
     point = np.asarray(m.predict(pd.DataFrame({"x": np.linspace(-1.5, 1.5, 40)})))
     assert np.all(np.isfinite(point))

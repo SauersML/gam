@@ -15,25 +15,19 @@
 //     for term in design.smooth.terms { ...per_term_edf(.., penalty_cursor, k); penalty_cursor += k }
 //
 // i.e. it assumes EVERY random-effect range owns exactly ONE penalty block.
-// But the actual penalty layout built in `design_construction.rs` only emits a
-// ridge block for a random effect when `spec.random_effect_terms[i].penalized`
-// (line ~233: `if range.is_empty() || !...penalized { continue; }`).
 //
 // A factor-`by` smooth `s(x, by=g)` used to add an UNPENALIZED treatment-coded
-// random-effect main effect for `g` (`penalized: false`, `drop_first_level:
-// true`), so that `g` appeared in `random_effect_ranges` but contributed NO
-// penalty block. The summary's cursor then over-counted by one and every
-// following smooth term read a penalty-block trace shifted by +1.
+// random-effect main effect for `g`, so that `g` appeared in
+// `random_effect_ranges` but contributed NO penalty block. The summary's
+// cursor then over-counted by one and every following smooth term read a
+// penalty-block trace shifted by +1.
 //
-// Since 35c8b53864 (SPEC rules 12 and 14) the by= main effect is a penalized
-// full-level random block, so a fresh formula fit no longer produces that
-// range. Saved models fitted before it still carry the unpenalized
-// treatment-coded spec, and predict and summary must honour it. So the fixture
-// rebuilds the fitted design from the fit's own resolved spec with the `g`
-// block set back to that saved-model representation, and checks the invariant
-// on both designs.
+// The unpenalized factor block no longer exists: every random-effect range now
+// owns exactly one identity ridge, and the by= main effect is one of them. The
+// test guards that invariant on the fitted design, so an unpenalized range
+// reintroduced anywhere in the layout fails here.
 //
-// This corrupts per-term EDF / ref_df / p-value whenever the influence matrix
+// A desync corrupts per-term EDF / ref_df / p-value whenever the influence matrix
 // is unavailable so `per_term_edf` falls through to its
 // `penalty_block_trace()[cursor..cursor+k]` path — which is the common
 // production case, because column-conditioning drops the influence matrix
@@ -41,12 +35,10 @@
 //
 // This test asserts the structural invariant directly on the built design: the
 // number of leading random-effect ranges that the summary cursor SKIPS must
-// equal the number of leading penalty blocks they actually own. With an
-// unpenalized `by` factor present these disagree, so the reconstructed cursor
-// for the first smooth term points past the smooth's own penalty block.
+// equal the number of leading penalty blocks they actually own.
 
 use csv::StringRecord;
-use gam::smooth::{TermCollectionDesign, build_term_collection_design};
+use gam::smooth::TermCollectionDesign;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
@@ -176,27 +168,10 @@ fn summary_penalty_cursor_matches_actual_penalty_layout() {
     let FitResult::Standard(std_fit) = &fit else {
         panic!("expected a standard Gaussian fit");
     };
-    assert_cursor_matches_layout(&std_fit.design, "fitted design");
-
-    // The saved-model representation of the same fit: the by= main effect as the
-    // unpenalized treatment-coded block it was before 35c8b53864, unfrozen as it
-    // was at fit time, so the build derives its kept levels from the data again.
-    let mut saved_spec = std_fit.resolvedspec.clone();
-    let main_effect = saved_spec
-        .random_effect_terms
-        .iter_mut()
-        .find(|term| term.name == "g")
-        .expect("the by= factor main effect `g` must be a random-effect term");
-    main_effect.penalized = false;
-    main_effect.drop_first_level = true;
-    main_effect.frozen_levels = None;
-    let saved_design = build_term_collection_design(data.values.view(), &saved_spec)
-        .expect("rebuild the design with the saved-model unpenalized main effect");
     let (buggy_cursor_skips, leading_re_penalty_blocks) =
-        assert_cursor_matches_layout(&saved_design, "saved-model design");
-    assert_ne!(
+        assert_cursor_matches_layout(&std_fit.design, "fitted design");
+    assert_eq!(
         buggy_cursor_skips, leading_re_penalty_blocks,
-        "saved-model design: the unpenalized random-effect range must add columns but no \
-         penalty block, or the old one-slot-per-range cursor would not desync"
+        "fitted design: every random-effect range must own exactly one ridge"
     );
 }

@@ -98,26 +98,14 @@ mod adaptive_bounded_duchon_tests {
                     frozen_function_mass: None,
                 },
             ],
-            // Likewise, both random effects own non-empty coefficient ranges
-            // but only the first emits a ridge.
-            random_effect_terms: vec![
-                RandomEffectTermSpec {
-                    name: "penalized_group".to_string(),
-                    feature_col: 2,
-                    drop_first_level: false,
-                    penalized: true,
-                    frozen_levels: Some(vec![0, 1]),
-                    lenient_unseen: true,
-                },
-                RandomEffectTermSpec {
-                    name: "unpenalized_group".to_string(),
-                    feature_col: 3,
-                    drop_first_level: false,
-                    penalized: false,
-                    frozen_levels: Some(vec![0, 1, 2, 3]),
-                    lenient_unseen: true,
-                },
-            ],
+            // The random effect owns exactly one ridge between the linear
+            // ridges and the smooths. Column 3 is unused.
+            random_effect_terms: vec![RandomEffectTermSpec {
+                name: "penalized_group".to_string(),
+                feature_col: 2,
+                frozen_levels: Some(vec![0, 1]),
+                lenient_unseen: true,
+            }],
             // Distinct feature ownership is essential here. Two copies of the
             // same smooth are deliberately collapsed by global hierarchical
             // identifiability, in which case the second term correctly owns no
@@ -334,8 +322,6 @@ mod adaptive_bounded_duchon_tests {
             random_effect_terms: vec![RandomEffectTermSpec {
                 name: "grp".to_string(),
                 feature_col: 1,
-                drop_first_level: false,
-                penalized: true,
                 frozen_levels: None,
                 lenient_unseen: true,
             }],
@@ -1020,6 +1006,7 @@ mod adaptive_bounded_duchon_tests {
                 min: 0.0,
                 max: 1.0,
                 prior: BoundedCoefficientPriorSpec::Uniform,
+                latent_center: 0.0,
             }],
         };
         let state = vec![ParameterBlockState {
@@ -1115,6 +1102,7 @@ mod adaptive_bounded_duchon_tests {
                     min: -1.0,
                     max: 2.0,
                     prior,
+                    latent_center: 0.0,
                 }],
             };
             let at = |beta: Array1<f64>| {
@@ -1185,6 +1173,7 @@ mod adaptive_bounded_duchon_tests {
                         min: -1.0,
                         max: 2.0,
                         prior,
+                        latent_center: 0.0,
                     }],
                 }
             };

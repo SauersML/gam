@@ -1494,19 +1494,15 @@ fn pairwise_mean_with_roundoff(values: &[f64]) -> Result<(f64, f64), String> {
     let sum = pairwise_sum(values);
     let magnitudes: Vec<f64> = values.iter().map(|value| value.abs()).collect();
     let magnitude_sum = pairwise_sum(&magnitudes);
-    let unit_roundoff = 0.5 * f64::EPSILON;
-    let accumulated = pairwise_sum_max_depth(values.len()) as f64 * unit_roundoff;
-    let addition_bound = if accumulated < 1.0 {
-        accumulated / (1.0 - accumulated) * magnitude_sum
-    } else {
-        f64::INFINITY
-    };
+    let addition_bound =
+        gam_linalg::roundoff::accumulation_growth(pairwise_sum_max_depth(values.len()))
+            * magnitude_sum;
     let count = values.len() as f64;
     let mean = sum / count;
     // The first term bounds the deterministic pairwise additions; the second
     // bounds the final division. This tolerance is derived from the actual
     // reduction depth and magnitudes, independently of the EM stopping knob.
-    let roundoff = addition_bound / count + unit_roundoff * mean.abs();
+    let roundoff = addition_bound / count + gam_linalg::roundoff::UNIT_ROUNDOFF * mean.abs();
     if !(mean.is_finite() && roundoff.is_finite()) {
         return Err("mean mixture log likelihood or its rounding bound is non-finite".to_string());
     }

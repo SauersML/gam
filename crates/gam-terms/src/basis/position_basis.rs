@@ -11,13 +11,13 @@
 //! here unchanged, so no front door resolves a basis of its own.
 //!
 //! An omitted basis size takes the formula front door's univariate default for
-//! the same kind on the same data: the open B-spline internal-knot heuristic,
+//! the same kind on the same data: the open B-spline internal-knot pilot,
 //! the cyclic basis dimension, and the 1-D Duchon center count.
 
 use super::*;
 use crate::term_builder::{
-    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, default_cyclic_basis_dim,
-    default_duchon_center_count, heuristic_knots_for_column, univariate_spline_basis_dim,
+    DEFAULT_BSPLINE_DEGREE, DEFAULT_PENALTY_ORDER, cyclic_basis_dim_for_column,
+    default_duchon_center_count, pilot_internal_knots_for_column, univariate_spline_basis_dim,
 };
 
 /// Where a position basis's knots or centers come from.
@@ -25,8 +25,8 @@ use crate::term_builder::{
 pub enum PositionBasisLocations {
     /// The formula front door's default basis size for the kind on `t`.
     Default,
-    /// A basis size: the internal knots of an open B-spline, the functions of
-    /// a cyclic B-spline, or the centers of a Duchon basis.
+    /// A basis size: the internal knots of a B-spline, open or cyclic
+    /// (`K + degree + 1` functions), or the centers of a Duchon basis.
     Count(usize),
     /// An explicit knot vector, cyclic grid or center vector, used as given.
     Given(Array1<f64>),
@@ -123,10 +123,10 @@ pub struct ResolvedPositionBasis {
 ///   internal-knot count (the request's, or the formula default on `t`) is
 ///   placed at quantiles by [`auto_knot_vector_1d_quantile`], which may lower
 ///   the degree for a short `t`.
-/// - Cyclic B-spline: the explicit period is required. A basis size `K` (the
-///   request's, or the formula's cyclic default) becomes the `K + 1`-point
-///   uniform grid over `[min t, min t + period]`, one cyclic control per
-///   interval, and needs `K >= degree + 1`.
+/// - Cyclic B-spline: the explicit period is required. An integer `K` is the
+///   internal-knot count, as for an open basis: `K + degree + 1` functions on
+///   the uniform grid over `[min t, min t + period]`, one cyclic control per
+///   interval. The default is the formula's cyclic basis dimension.
 /// - Duchon: an explicit center vector is used as given; otherwise the center
 ///   count (the request's, at least 2, or the formula's 1-D Duchon default on
 ///   `t`) is placed by equal mass. A periodic Duchon basis without a period
@@ -166,8 +166,13 @@ pub fn resolve_position_basis(
     }
     let (locations, order, period) = match kind {
         PositionBasisKind::BSpline => {
-            let (knots, degree) = bspline_locations(t, locations, order, periodic, period)?;
-            (knots, degree, period)
+            if periodic && period.is_none() {
+                return Err(
+                    "periodic B-spline position fits require a finite positive period".to_string(),
+                );
+            }
+            let resolved = bspline_locations(t, locations, order, periodic, period)?;
+            (resolved.locations, resolved.order, period)
         }
         PositionBasisKind::Duchon => {
             let centers = duchon_centers(t, locations)?;
@@ -204,49 +209,75 @@ fn finite_nonempty(name: &str, values: ArrayView1<'_, f64>) -> Result<(), String
     Ok(())
 }
 
-/// The knots (or cyclic grid) and effective degree of a B-spline position basis.
+/// The knots (or cyclic grid) of a B-spline basis on `t`, with the degree they
+/// were built for. This is the one resolver behind both the position fit
+/// ([`resolve_position_basis`]) and the basis-evaluation helpers
+/// ([`resolve_basis_locations_1d`]), so the same request gives the same basis
+/// through either door.
+///
+/// - An explicit knot vector or cyclic grid is used as given.
+/// - An integer `K` is the internal-knot count, open or cyclic: `K + degree + 1`
+///   basis functions, the dimension `s(x)` gives the same `K`.
+/// - The default is the formula's: [`pilot_internal_knots_for_column`] internal
+///   knots for an open basis, [`cyclic_basis_dim_for_column`] functions for a
+///   cyclic one.
+/// - Open knots are placed at quantiles by [`auto_knot_vector_1d_quantile`],
+///   which may lower the degree for a short `t` (#340).
+/// - A cyclic grid is uniform from `min t` over one `period`, or over
+///   `[min t, max t]` when no period is given, one cyclic control per interval.
 fn bspline_locations(
     t: ArrayView1<'_, f64>,
     request: PositionBasisLocations,
     degree: usize,
     periodic: bool,
     period: Option<f64>,
-) -> Result<(Array1<f64>, usize), String> {
+) -> Result<ResolvedBasisLocations, String> {
     if !periodic {
         let internal_knots = match request {
-            PositionBasisLocations::Given(knots) => return Ok((knots, degree)),
+            PositionBasisLocations::Given(knots) => {
+                return Ok(ResolvedBasisLocations {
+                    locations: knots,
+                    order: degree,
+                    shrunk: false,
+                });
+            }
             PositionBasisLocations::Count(count) => count,
-            PositionBasisLocations::Default => heuristic_knots_for_column(t),
+            PositionBasisLocations::Default => pilot_internal_knots_for_column(t),
         };
         let auto = auto_knot_vector_1d_quantile(t, internal_knots, degree)
             .map_err(|err| err.to_string())?;
-        return Ok((auto.knots, auto.degree));
+        return Ok(ResolvedBasisLocations {
+            locations: auto.knots,
+            order: auto.degree,
+            shrunk: auto.shrunk,
+        });
     }
     let num_basis = match request {
         PositionBasisLocations::Given(grid) => {
-            if period.is_none() {
-                return Err(
-                    "periodic B-spline position fits require a finite positive period".to_string(),
-                );
-            }
-            return Ok((grid, degree));
+            return Ok(ResolvedBasisLocations {
+                locations: grid,
+                order: degree,
+                shrunk: false,
+            });
         }
-        PositionBasisLocations::Count(count) => count,
-        PositionBasisLocations::Default => {
-            default_cyclic_basis_dim(heuristic_knots_for_column(t), degree)
-        }
+        PositionBasisLocations::Count(count) => count + degree + 1,
+        PositionBasisLocations::Default => cyclic_basis_dim_for_column(t, degree),
     };
-    if num_basis < degree + 1 {
+    let low = t.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = match period {
+        Some(period) => low + period,
+        None => t.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    };
+    if high <= low {
         return Err(format!(
-            "periodic B-spline position basis count must be at least degree + 1 \
-             (got {num_basis} for degree {degree})"
+            "periodic auto-knots need a positive range of t, got [{low}, {high}]"
         ));
     }
-    let Some(period) = period else {
-        return Err("periodic B-spline position fits require a finite positive period".to_string());
-    };
-    let origin = t.iter().copied().fold(f64::INFINITY, f64::min);
-    Ok((cyclic_uniform_grid(origin, origin + period, num_basis), degree))
+    Ok(ResolvedBasisLocations {
+        locations: cyclic_uniform_grid(low, high, num_basis),
+        order: degree,
+        shrunk: false,
+    })
 }
 
 /// The `num_basis + 1`-point uniform cyclic grid over `[origin, end]`, one
@@ -286,13 +317,13 @@ pub struct ResolvedBasisLocations {
 /// `duchon_basis(x)` the centers of `duchon(x)`:
 ///
 /// - Open B-spline: an explicit knot vector is used as given; otherwise the
-///   internal-knot count (the request's, or [`heuristic_knots_for_column`])
+///   internal-knot count (the request's, or [`pilot_internal_knots_for_column`])
 ///   is placed at quantiles by [`auto_knot_vector_1d_quantile`].
 /// - Cyclic B-spline: an explicit grid is used as given; otherwise the uniform
 ///   grid over `[min t, max t]` with one cyclic control per interval. An
 ///   integer `K` names the same dimension it does for an open basis,
 ///   `K + degree + 1` controls; the default is the formula's cyclic basis
-///   dimension [`default_cyclic_basis_dim`].
+///   dimension [`cyclic_basis_dim_for_column`].
 /// - Duchon: an explicit center vector is used as given; otherwise the center
 ///   count (the request's, at least 2, or the formula's 1-D Duchon default) is
 ///   placed by equal mass.
@@ -318,37 +349,7 @@ pub fn resolve_basis_locations_1d(
             order,
             shrunk: false,
         }),
-        PositionBasisKind::BSpline if !periodic => {
-            let internal_knots = match request {
-                PositionBasisLocations::Count(count) => count,
-                _ => heuristic_knots_for_column(t),
-            };
-            let auto = auto_knot_vector_1d_quantile(t, internal_knots, order)
-                .map_err(|err| err.to_string())?;
-            Ok(ResolvedBasisLocations {
-                locations: auto.knots,
-                order: auto.degree,
-                shrunk: auto.shrunk,
-            })
-        }
-        PositionBasisKind::BSpline => {
-            let num_basis = match request {
-                PositionBasisLocations::Count(count) => count + order + 1,
-                _ => default_cyclic_basis_dim(heuristic_knots_for_column(t), order),
-            };
-            let low = t.iter().copied().fold(f64::INFINITY, f64::min);
-            let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if high <= low {
-                return Err(format!(
-                    "periodic auto-knots need a positive range of t, got [{low}, {high}]"
-                ));
-            }
-            Ok(ResolvedBasisLocations {
-                locations: cyclic_uniform_grid(low, high, num_basis),
-                order,
-                shrunk: false,
-            })
-        }
+        PositionBasisKind::BSpline => bspline_locations(t, request, order, periodic, None),
     }
 }
 
@@ -383,7 +384,6 @@ fn default_univariate_duchon_center_count(t: ArrayView1<'_, f64>) -> usize {
     default_duchon_center_count(
         n,
         1,
-        default_num_centers(n, 1),
         polynomial_cols,
         univariate_spline_basis_dim(t),
     )
@@ -580,7 +580,7 @@ mod tests {
             None,
         )
         .expect("default open B-spline");
-        let internal = heuristic_knots_for_column(t.view());
+        let internal = pilot_internal_knots_for_column(t.view());
         assert_eq!(open.kind, PositionBasisKind::BSpline);
         assert_eq!(open.display_kind, "bspline");
         assert_eq!(open.order, DEFAULT_BSPLINE_DEGREE);
@@ -597,7 +597,7 @@ mod tests {
             Some(1.0),
         )
         .expect("default cyclic B-spline");
-        let num_basis = default_cyclic_basis_dim(internal, DEFAULT_BSPLINE_DEGREE);
+        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         assert_eq!(cyclic.penalty.nrows(), num_basis);
         let origin = t.iter().copied().fold(f64::INFINITY, f64::min);
@@ -630,7 +630,6 @@ mod tests {
     #[test]
     fn helper_locations_take_the_formula_defaults() {
         let t = positions();
-        let internal = heuristic_knots_for_column(t.view());
         let open = resolve_basis_locations_1d(
             t.view(),
             PositionBasisKind::BSpline,
@@ -653,7 +652,7 @@ mod tests {
             true,
         )
         .expect("default cyclic grid");
-        let num_basis = default_cyclic_basis_dim(internal, DEFAULT_BSPLINE_DEGREE);
+        let num_basis = cyclic_basis_dim_for_column(t.view(), DEFAULT_BSPLINE_DEGREE);
         assert_eq!(cyclic.locations.len(), num_basis + 1);
         let low = t.iter().copied().fold(f64::INFINITY, f64::min);
         let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -692,6 +691,51 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    /// An integer size means one basis through both doors: `K` internal knots,
+    /// `K + degree + 1` functions, open or cyclic. The position fit used to read
+    /// a cyclic `K` as the function count while `bspline_basis` read it as the
+    /// internal-knot count, so `fit_positions(knots_or_centers=5, periodic=True)`
+    /// fitted 5 functions and `bspline_basis(t, 5, periodic=True)` built 9.
+    #[test]
+    fn an_integer_bspline_size_is_one_basis_through_both_doors() {
+        let t = positions();
+        let low = t.iter().copied().fold(f64::INFINITY, f64::min);
+        let high = t.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        for periodic in [false, true] {
+            for count in [0, 3, 5] {
+                let helper = resolve_basis_locations_1d(
+                    t.view(),
+                    PositionBasisKind::BSpline,
+                    PositionBasisLocations::Count(count),
+                    DEFAULT_BSPLINE_DEGREE,
+                    periodic,
+                )
+                .expect("helper locations");
+                let fit = resolve_position_basis(
+                    t.view(),
+                    None,
+                    PositionBasisLocations::Count(count),
+                    PositionPenaltyRequest::Canonical,
+                    None,
+                    periodic,
+                    periodic.then_some(high - low),
+                )
+                .expect("position fit basis");
+                let functions = count + DEFAULT_BSPLINE_DEGREE + 1;
+                assert_eq!(
+                    fit.penalty.nrows(),
+                    functions,
+                    "periodic={periodic} K={count}"
+                );
+                assert_eq!(
+                    fit.locations, helper.locations,
+                    "periodic={periodic} K={count}"
+                );
+                assert_eq!(fit.order, helper.order);
+            }
+        }
     }
 
     /// #2899 P4: the 1-D thin-plate spline is Duchon `m = 2`, and a periodic
@@ -751,16 +795,6 @@ mod tests {
                 None,
             )
             .contains("require a finite positive period")
-        );
-        assert!(
-            refusal(
-                "bspline",
-                PositionBasisLocations::Count(3),
-                PositionPenaltyRequest::Canonical,
-                true,
-                Some(1.0),
-            )
-            .contains("at least degree + 1")
         );
         assert!(
             refusal(

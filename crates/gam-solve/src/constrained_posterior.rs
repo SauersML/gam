@@ -161,6 +161,10 @@ pub use cone_normalizer::{
     ConeCoordinateMotion, ConeFirstOrder, ConeNormalizer, ConeNormalizerRefusal, ConePairMotion,
     OrthantLogMass,
 };
+mod cone_laplace;
+pub use cone_laplace::{
+    ConeLaplace, ConeLaplaceFirstOrder, ConeLaplaceMotion, ConeLaplacePairMotion, ConeLaplaceRefusal,
+};
 
 /// Relative accuracy demanded of the orthant-moment cubature, measured against
 /// the PRE-TRUNCATION scale `sd_i = sqrt(W_ii)` so the criterion is invariant
@@ -1577,7 +1581,7 @@ pub fn constrained_posterior_correction_from_covariance(
 /// `Σ Aᵀ` — column `j` is `Σ a_j`, `W_ij = a_iᵀ(Σ a_j)`, and the lift is
 /// `(Σ Aᵀ)W⁻¹` — so a factorized inference path supplies `m` solves instead of
 /// a `p × p` inverse.
-pub(crate) fn constrained_posterior_correction(
+pub fn constrained_posterior_correction(
     sigma_times_constraint_transpose: ArrayView2<'_, f64>,
     unconstrained_center: &Array1<f64>,
     constraints: &LinearInequalityConstraints,

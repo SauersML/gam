@@ -174,14 +174,16 @@ pub(crate) fn build_marginal_blockspec(
     }
 }
 
-/// The inner coefficient fit. The solver's error is returned whole, so the fit
-/// that stops on it raises its category (#2937).
+/// The inner coefficient fit of the member `family` is. The Jeffreys arming
+/// lifecycle runs once, over the whole route, in `fit_entry` (gam#2995). The
+/// solver's error is returned whole, so the fit that stops on it raises its
+/// category (#2937).
 pub(crate) fn inner_fit(
     family: &SurvivalMarginalSlopeFamily,
     blocks: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
 ) -> Result<UnifiedFitResult, crate::custom_family::CustomFamilyError> {
-    crate::custom_family::fit_custom_family_arming_on_evidence(family, blocks, options)
+    crate::custom_family::fit_custom_family(family, blocks, options)
 }
 
 pub(crate) fn inner_fit_from_certified_outer(
@@ -350,24 +352,137 @@ where
     I: IntoIterator<Item = &'a Array2<f64>>,
 {
     let unit_weights = Array1::<f64>::ones(design.nrows());
-    let likelihood_scale = mean_abs(design.diag_gram(&unit_weights)?.iter().copied());
+    let likelihood_scale = seed_likelihood_scale(design.diag_gram(&unit_weights)?.iter().copied())?;
+    penalty_locals
+        .into_iter()
+        .map(|s| seed_against_likelihood_scale(likelihood_scale, s.diag().iter().copied()))
+        .collect()
+}
+
+/// The mean Gram diagonal a block's seeds are read against, refused when it is
+/// zero or non-finite.
+fn seed_likelihood_scale(gram_diagonal: impl IntoIterator<Item = f64>) -> Result<f64, String> {
+    let likelihood_scale = mean_abs(gram_diagonal);
     if !(likelihood_scale > 0.0 && likelihood_scale.is_finite()) {
         return Err(format!(
             "survival log-lambda seed:the design's mean Gram diagonal is \
              {likelihood_scale:e}, so the block has no likelihood scale to seed against"
         ));
     }
-    penalty_locals
-        .into_iter()
-        .map(|s| {
-            let penalty_scale = mean_abs(s.diag().iter().copied());
-            if !(penalty_scale > 0.0 && penalty_scale.is_finite()) {
+    Ok(likelihood_scale)
+}
+
+/// One penalty's seed, `ln(likelihood scale / mean penalty diagonal)`, refused
+/// when the penalty's diagonal carries no curvature scale.
+fn seed_against_likelihood_scale(
+    likelihood_scale: f64,
+    penalty_diagonal: impl IntoIterator<Item = f64>,
+) -> Result<f64, String> {
+    let penalty_scale = mean_abs(penalty_diagonal);
+    if !(penalty_scale > 0.0 && penalty_scale.is_finite()) {
+        return Err(format!(
+            "survival log-lambda seed:a penalty's mean diagonal is \
+             {penalty_scale:e}, so it has no curvature scale to seed against"
+        ));
+    }
+    Ok((likelihood_scale / penalty_scale).ln())
+}
+
+/// The time block's exit design on the columns its penalties act on.
+///
+/// A time-wiggle tail in the time designs is a zero placeholder: the family
+/// evaluates the warp dynamically, so the wiggle coefficients enter the exit
+/// predictor through the warp's Jacobian at the baseline predictor,
+/// `B(h₀(t_exit))`. This is the base columns beside that Jacobian, the one
+/// design every time penalty's seed and resolvability domain is read against
+/// (gam#3061: the placeholder design has an all-zero wiggle Gram, so a seed read
+/// against it refused every timewiggle fit). Without a wiggle it is the exit
+/// design itself.
+pub(crate) fn time_block_acting_exit_design(
+    design_exit: &DesignMatrix,
+    offset_exit: ArrayView1<'_, f64>,
+    timewiggle: Option<&TimeWiggleBlockInput>,
+) -> Result<DesignMatrix, String> {
+    let Some(wiggle) = timewiggle else {
+        return Ok(design_exit.clone());
+    };
+    let (n, p) = (design_exit.nrows(), design_exit.ncols());
+    if wiggle.ncols > p {
+        return Err(format!(
+            "survival time block declares {} time-wiggle columns but its exit design has only {p}",
+            wiggle.ncols
+        ));
+    }
+    let p_base = p - wiggle.ncols;
+    let jacobian =
+        crate::wiggle::monotone_wiggle_basis_from_knots(offset_exit, &wiggle.knots, wiggle.degree)?;
+    if jacobian.dim() != (n, wiggle.ncols) {
+        return Err(format!(
+            "survival time-wiggle Jacobian is {}x{}, but the time block's wiggle tail is {n}x{}",
+            jacobian.nrows(),
+            jacobian.ncols(),
+            wiggle.ncols
+        ));
+    }
+    let mut acting = Array2::<f64>::zeros((n, p));
+    acting
+        .slice_mut(s![.., ..p_base])
+        .assign(&design_exit.to_dense().slice(s![.., ..p_base]));
+    acting.slice_mut(s![.., p_base..]).assign(&jacobian);
+    Ok(DesignMatrix::from(acting))
+}
+
+/// Each time penalty's `log λ` seed, read against the part of the acting exit
+/// design ([`time_block_acting_exit_design`]) it acts on: the base columns for a
+/// base penalty, the warp Jacobian for a wiggle penalty. The two parts are
+/// seeded separately because they are different functions of time with their
+/// own scales. A penalty that couples them has no single part to be read
+/// against, and is refused.
+pub(crate) fn time_block_log_lambda_seeds(
+    acting_exit: &DesignMatrix,
+    penalties: &[Array2<f64>],
+    timewiggle_cols: usize,
+) -> Result<Vec<f64>, String> {
+    let p = acting_exit.ncols();
+    if timewiggle_cols > p {
+        return Err(format!(
+            "survival time block declares {timewiggle_cols} time-wiggle columns but its exit design has only {p}"
+        ));
+    }
+    let p_base = p - timewiggle_cols;
+    let gram_diagonal = acting_exit.diag_gram(&Array1::<f64>::ones(acting_exit.nrows()))?;
+    penalties
+        .iter()
+        .enumerate()
+        .map(|(idx, penalty)| {
+            if penalty.dim() != (p, p) {
                 return Err(format!(
-                    "survival log-lambda seed:a penalty's mean diagonal is \
-                     {penalty_scale:e}, so it has no curvature scale to seed against"
+                    "survival log-lambda seed:time penalty {idx} is {}x{}, but the time block has {p} columns",
+                    penalty.nrows(),
+                    penalty.ncols()
                 ));
             }
-            Ok((likelihood_scale / penalty_scale).ln())
+            let mut acts_on_base = false;
+            let mut acts_on_wiggle = false;
+            for ((row, col), &value) in penalty.indexed_iter() {
+                if value != 0.0 {
+                    acts_on_base |= row < p_base || col < p_base;
+                    acts_on_wiggle |= row >= p_base || col >= p_base;
+                }
+            }
+            if acts_on_base && acts_on_wiggle {
+                return Err(format!(
+                    "survival log-lambda seed:time penalty {idx} couples the base columns with \
+                     the time-wiggle columns, so it has no single design part to seed against"
+                ));
+            }
+            let part = if acts_on_wiggle { p_base..p } else { 0..p_base };
+            let likelihood_scale =
+                seed_likelihood_scale(gram_diagonal.slice(s![part.clone()]).iter().copied())?;
+            seed_against_likelihood_scale(
+                likelihood_scale,
+                penalty.diag().slice(s![part]).iter().copied(),
+            )
         })
         .collect()
 }
@@ -497,146 +612,6 @@ pub(crate) fn joint_setup(
     }
 }
 
-pub(crate) fn install_time_nullspace_shrinkage_penalty(
-    time_block: &mut TimeBlockInput,
-    // Trailing columns of the time value designs that are zero PLACEHOLDERS for
-    // a time-wiggle block (`prepare_survival_time_stack` appends them with
-    // `append_zero_tail_columns`; the wiggle's values enter the likelihood
-    // through its own rows). They carry no function-value channel, so they are
-    // not part of the space this metric is defined on (gam#979: the empirical
-    // Gram over all `p` columns was singular there — `NonPositivePivot` — and
-    // the whole survival fit refused before its first evaluation).
-    timewiggle_cols: usize,
-    // Rows entering at the time origin. Their likelihood has no entry factor
-    // (`S(0) = 1`), so their entry evaluation is not a value channel and carries
-    // no metric mass (gnomon#2336).
-    entry_at_origin: &Array1<bool>,
-) -> Result<bool, String> {
-    let p = time_block.design_exit.ncols();
-    if p == 0 || time_block.penalties.is_empty() {
-        return Ok(false);
-    }
-    if timewiggle_cols > p {
-        return Err(format!(
-            "survival-marginal-slope time_block declares {timewiggle_cols} time-wiggle placeholder columns but has only {p} columns"
-        ));
-    }
-    let p_value = p - timewiggle_cols;
-    if p_value == 0 {
-        return Ok(false);
-    }
-    if time_block.nullspace_dims.len() != time_block.penalties.len() {
-        return Err(format!(
-            "survival-marginal-slope time_block nullspace_dims length {} does not match penalties {}",
-            time_block.nullspace_dims.len(),
-            time_block.penalties.len(),
-        ));
-    }
-
-    let mut aggregate = Array2::<f64>::zeros((p, p));
-    for (idx, penalty) in time_block.penalties.iter().enumerate() {
-        if penalty.nrows() != p || penalty.ncols() != p {
-            return Err(format!(
-                "survival-marginal-slope time_block penalty {idx} must be {p}x{p}, got {}x{}",
-                penalty.nrows(),
-                penalty.ncols(),
-            ));
-        }
-        let scale = penalty
-            .iter()
-            .try_fold(0.0_f64, |acc, &value| {
-                value.is_finite().then_some(acc.max(value.abs()))
-            })
-            .ok_or_else(|| {
-                format!(
-                    "survival-marginal-slope time_block penalty {idx} contains non-finite values"
-                )
-            })?;
-        if scale > 0.0 {
-            ndarray::Zip::from(&mut aggregate)
-                .and(penalty)
-                .for_each(|agg, &value| *agg += value / scale);
-        }
-    }
-
-    if time_block.design_entry.ncols() != p {
-        return Err(format!(
-            "survival-marginal-slope time_block entry design has {} columns, expected {p}",
-            time_block.design_entry.ncols(),
-        ));
-    }
-    // Use the average endpoint function measure, not Euclidean coefficient
-    // length. Entry and exit evaluations are the two value channels through
-    // which this time function enters the survival likelihood; averaging their
-    // Grams makes the metric invariant to whole-sample replication while
-    // treating both endpoints symmetrically. Under any coefficient chart
-    // change M, `G -> M' G M`, so the resulting null ridge transforms by the
-    // same congruence instead of changing the represented penalty.
-    //
-    // Only delayed entries are an entry channel. A landmarked cohort enters every
-    // row at the origin, where the entry design row is one shared finite
-    // stand-in; counting it put half of the metric's mass on a single point
-    // whose location moved with the time anchor.
-    if entry_at_origin.len() != time_block.design_entry.nrows() {
-        return Err(format!(
-            "survival-marginal-slope time_block origin-entry mask has {} rows, but the entry design has {}",
-            entry_at_origin.len(),
-            time_block.design_entry.nrows(),
-        ));
-    }
-    let entry_weights = entry_at_origin.mapv(|origin| if origin { 0.0 } else { 1.0 });
-    let entry_mass = entry_at_origin.iter().filter(|&&origin| !origin).count();
-    let exit_mass = time_block.design_exit.nrows();
-    let total_mass = entry_mass.saturating_add(exit_mass);
-    if total_mass == 0 {
-        return Err(
-            "survival-marginal-slope time_block cannot define a function metric from zero endpoint rows"
-                .to_string(),
-        );
-    }
-    let entry_gram = time_block
-        .design_entry
-        .diag_xtw_x(&entry_weights)
-        .map_err(|err| format!("survival-marginal-slope time_block entry function Gram: {err}"))?;
-    let exit_gram = time_block
-        .design_exit
-        .diag_xtw_x(&Array1::ones(exit_mass))
-        .map_err(|err| format!("survival-marginal-slope time_block exit function Gram: {err}"))?;
-    let function_gram = (entry_gram + exit_gram).mapv(|value| value / total_mass as f64);
-    // The metric and the aggregate live on the value block; the placeholder
-    // tail is excluded from both, and the ridge is embedded back at zero there.
-    let function_gram_value = function_gram
-        .slice(ndarray::s![..p_value, ..p_value])
-        .to_owned();
-    let aggregate_value = aggregate.slice(ndarray::s![..p_value, ..p_value]).to_owned();
-    let Some(shrinkage_value) = gam_terms::basis::function_space_nullspace_shrinkage(
-        &aggregate_value,
-        &function_gram_value,
-    )
-    .map_err(|err| format!("survival-marginal-slope time_block nullspace shrinkage: {err}"))?
-    else {
-        return Ok(false);
-    };
-    if shrinkage_value.nrows() != p_value || shrinkage_value.ncols() != p_value {
-        return Err(format!(
-            "survival-marginal-slope time_block nullspace shrinkage penalty must be {p_value}x{p_value}, got {}x{}",
-            shrinkage_value.nrows(),
-            shrinkage_value.ncols(),
-        ));
-    }
-    let mut shrinkage = Array2::<f64>::zeros((p, p));
-    shrinkage
-        .slice_mut(ndarray::s![..p_value, ..p_value])
-        .assign(&shrinkage_value);
-    time_block.penalties.push(shrinkage);
-    time_block.nullspace_dims.push(0);
-    log::debug!(
-        "[survival-marginal-slope] added time_block nullspace shrinkage penalty (p={p}, penalties={})",
-        time_block.penalties.len(),
-    );
-    Ok(true)
-}
-
 /// Enable the Marra & Wood double penalty — a null-space shrinkage ridge with
 /// its own REML-selected smoothing parameter — on every smooth in `spec` whose
 /// basis carries an unpenalized polynomial null space, so that "trend"
@@ -651,11 +626,18 @@ pub(crate) fn install_time_nullspace_shrinkage_penalty(
 /// near-null gauge direction (gam#1082) while the convergence certificate
 /// REQUIRES it be resolved (gam#1449) — so the solve can neither progress nor
 /// certify and grinds to the cycle cap on every outer ρ-evaluation (the
-/// measured n=3000 ~1976 s hang). The survival TIME block already avoids this
-/// via [`install_time_nullspace_shrinkage_penalty`]; this brings the
-/// marginal/slope surfaces to the same footing through the ordinary basis
-/// builder (which keeps the layered penalty representation self-consistent
-/// across every probe/frozen/kappa rebuild). Duchon bases are skipped because
+/// measured n=3000 ~1976 s hang). This brings the marginal/slope surfaces to
+/// that footing through the ordinary basis builder (which keeps the layered
+/// penalty representation self-consistent across every probe/frozen/kappa
+/// rebuild).
+///
+/// The survival TIME block is deliberately NOT treated this way (gam#3003). Its
+/// penalty null space is the baseline's level and its log-time slope, and the
+/// likelihood carries `O(n_events)` curvature there (gam#1076), so it is not a
+/// tiny-curvature mode. Shrinking it is also shrinking toward an improper
+/// model: zero log-time slope means a constant baseline, which the
+/// monotone survival likelihood reaches only as the level runs to infinity.
+/// That direction is intercept-like, and the intercept is not shrunk. Duchon bases are skipped because
 /// their function-norm penalty already spans the polynomial null space (and
 /// they carry no `double_penalty` field); factor/measure/tensor/PCA bases have
 /// no simple trend null space to shrink here and are left untouched.

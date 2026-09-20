@@ -774,61 +774,83 @@ impl<const P: usize, G: SlopeRowGeometry<P>> SurvivalMarginalSlopeRowKernel<P, G
         }
         let mut tensors = Vec::with_capacity(self.family.n);
         for row in 0..self.family.n {
-            let mut tensor = [[[0.0; P]; P]; P];
-            let weight = row_weights[row];
-            if weight != 0.0 {
-                let inputs = rigid_row_inputs(
-                    &self.family,
-                    &self.block_states,
-                    row,
-                    "third information derivative",
-                )?;
-                let primaries =
-                    rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
-                let fifth = fifth(&primaries, &inputs)?;
-                let (x, y, z) = directions(row)?;
-                for a in 0..P {
-                    for b in 0..P {
-                        for c in 0..P {
-                            for d in 0..P {
-                                for e in 0..P {
-                                    tensor[a][b][c] += fifth[a][b][c][d][e] * x[d] * y[e];
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(z) = z {
-                    let mut tower = G::Tower4::constant(0.0);
-                    SurvivalMarginalSlopeFamily::write_primary_tower::<P, G, _>(
-                        &primaries,
-                        &inputs,
-                        &mut tower,
-                    )?;
-                    let t4 = tower.t4();
-                    for a in 0..P {
-                        for b in 0..P {
-                            for c in 0..P {
-                                for d in 0..P {
-                                    tensor[a][b][c] += t4[a][b][c][d] * z[d];
-                                }
-                            }
-                        }
-                    }
-                }
-                if weight != 1.0 {
-                    for plane in &mut tensor {
-                        for line in plane {
-                            for entry in line {
-                                *entry *= weight;
-                            }
+            tensors.push(self.primary_third_row_tensor(
+                row,
+                row_weights[row],
+                &directions,
+                &fifth,
+            )?);
+        }
+        self.all_axes_primary_tensor_pullback(&crate::row_kernel::RowSet::All, &tensors)
+    }
+
+    /// Row `row`'s primary tensor `w_r·(T⁵[x_r, y_r] + T⁴[z_r])` for
+    /// [`Self::primary_third_information_all_axes_from`], zero where the measure leaves the
+    /// row out.
+    ///
+    /// Out of line on purpose (gam#2967). The caller then waits on the all-axes pullback's
+    /// Rayon joins, and it runs inside a parallel sweep over directions, so its frame is
+    /// stacked once per nested steal. Inlined, this row's fifth-order tensor and fourth-order
+    /// tower (a 188,416-byte frame at six primaries in gnomon's release build) sat in that
+    /// frame; here they sit in a leaf frame, live at most once per stack.
+    #[inline(never)]
+    fn primary_third_row_tensor(
+        &self,
+        row: usize,
+        weight: f64,
+        directions: &impl Fn(usize) -> Result<PrimaryThirdDirections<P>, String>,
+        fifth: &impl Fn(&[f64; P], &RigidRowInputs) -> Result<[[[[[f64; P]; P]; P]; P]; P], String>,
+    ) -> Result<[[[f64; P]; P]; P], String> {
+        let mut tensor = [[[0.0; P]; P]; P];
+        if weight == 0.0 {
+            return Ok(tensor);
+        }
+        let inputs = rigid_row_inputs(
+            &self.family,
+            &self.block_states,
+            row,
+            "third information derivative",
+        )?;
+        let primaries = rigid_row_kernel_primaries::<P, G>(&self.family, &self.block_states, row)?;
+        let fifth = fifth(&primaries, &inputs)?;
+        let (x, y, z) = directions(row)?;
+        for a in 0..P {
+            for b in 0..P {
+                for c in 0..P {
+                    for d in 0..P {
+                        for e in 0..P {
+                            tensor[a][b][c] += fifth[a][b][c][d][e] * x[d] * y[e];
                         }
                     }
                 }
             }
-            tensors.push(tensor);
         }
-        self.all_axes_primary_tensor_pullback(&tensors)
+        if let Some(z) = z {
+            let mut tower = G::Tower4::constant(0.0);
+            SurvivalMarginalSlopeFamily::write_primary_tower::<P, G, _>(
+                &primaries, &inputs, &mut tower,
+            )?;
+            let t4 = tower.t4();
+            for a in 0..P {
+                for b in 0..P {
+                    for c in 0..P {
+                        for d in 0..P {
+                            tensor[a][b][c] += t4[a][b][c][d] * z[d];
+                        }
+                    }
+                }
+            }
+        }
+        if weight != 1.0 {
+            for plane in &mut tensor {
+                for line in plane {
+                    for entry in line {
+                        *entry *= weight;
+                    }
+                }
+            }
+        }
+        Ok(tensor)
     }
 
     /// `{D_β_a D_β ∂_ψ H[v]}` along every coefficient axis `a` for a design

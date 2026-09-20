@@ -121,8 +121,9 @@ fn representative_data_from_ranges(
 /// fit's penalty layout that the in-process CLI summary also uses (#2470).
 /// Random-effect blocks get the variance-component score test the fit recorded
 /// (`FitArtifacts::random_effect_tests`, scored against its exact boundary null
-/// law, not a Wald χ²), and penalized smooth terms get the whitened Wald
-/// statistic with its λ̂-selection p-value.
+/// law, not a Wald χ²), and penalized smooth terms get the variance-component
+/// score test read off the fit's exact curvature, or the typed reason it cannot
+/// be computed.
 ///
 /// The "Mirrors `main.rs::build_model_summary`'s smooth-term loop" this
 /// sentence used to open with was accurate and was the problem: a comment
@@ -144,13 +145,6 @@ fn summary_smooth_terms(
     fit: &gam_solve::estimate::UnifiedFitResult,
 ) -> Result<Vec<SummarySmoothTermRow>, String> {
     let payload = model.payload();
-    let Some(spec) = payload.resolved_termspec.as_ref() else {
-        return Err("model was saved without `resolved_termspec`; refit to recover the \
-                    per-smooth table"
-            .to_string());
-    };
-    spec.validate_frozen("resolved_termspec")
-        .map_err(|err| format!("saved `resolved_termspec` failed validation: {err}"))?;
     let Some(ranges) = payload.training_feature_ranges.as_ref() else {
         return Err("model was saved without training feature ranges; refit to recover the \
                     per-smooth table"
@@ -168,6 +162,126 @@ fn summary_smooth_terms(
             headers.len()
         ));
     }
+    let mut rows = Vec::new();
+    for block in summary_predictor_blocks(model, fit)? {
+        rows.extend(predictor_block_smooth_terms(&block, ranges, fit)?);
+    }
+    Ok(rows)
+}
+
+/// One predictor the per-smooth table presents: its frozen spec, and where its
+/// block sits in the fit's flat coefficient and penalty layouts.
+struct SummaryPredictorBlock<'a> {
+    /// The predictor's name on each of its rows, `None` for a single-predictor
+    /// fit, whose rows need no qualifier.
+    predictor: Option<&'static str>,
+    spec: &'a TermCollectionSpec,
+    /// The payload field `spec` was read from, for the absence reasons.
+    spec_field: &'static str,
+    offset: gam_solve::estimate::SummaryBlockOffset,
+    /// The fit block whose coefficient and λ counts the replay must reproduce;
+    /// `None` when `saved_lambdas_index_rebuilt_layout` owns that check.
+    block: Option<&'a gam_solve::estimate::FittedBlock>,
+}
+
+impl SummaryPredictorBlock<'_> {
+    /// How an absence reason names this predictor.
+    fn label(&self) -> String {
+        match self.predictor {
+            Some(predictor) => format!("{predictor} predictor (`{}`)", self.spec_field),
+            None => format!("`{}`", self.spec_field),
+        }
+    }
+}
+
+/// The predictors a saved fit's per-smooth table walks, in the fit's block
+/// order.
+///
+/// A Bernoulli marginal-slope fit has two formulas, and each owns one block of
+/// the fit: the marginal surface (the Location block, built from
+/// `resolved_termspec`) and the slope surface (the Scale block, built from
+/// `resolved_slopespec`). Each is replayed from its own spec and read against
+/// its own λ slice and coefficient offset (#2997). Replaying the marginal spec
+/// alone against every block's λ is what refused the table for every such
+/// model as a stale save. Blocks with no formula of their own (a score-warp or
+/// link-deviation flex block) own λ and coefficients but no summary rows; they
+/// still advance the offsets of the blocks after them.
+///
+/// Every other fit presents its single mean (or location) predictor from
+/// `resolved_termspec` at the start of the layout.
+fn summary_predictor_blocks<'a>(
+    model: &'a FittedModel,
+    fit: &'a gam_solve::estimate::UnifiedFitResult,
+) -> Result<Vec<SummaryPredictorBlock<'a>>, String> {
+    use gam_solve::estimate::{BlockRole, SummaryBlockOffset};
+    let payload = model.payload();
+    let frozen = |spec: Option<&'a TermCollectionSpec>, field: &'static str| {
+        let spec = spec.ok_or_else(|| {
+            format!("model was saved without `{field}`; refit to recover the per-smooth table")
+        })?;
+        spec.validate_frozen(field)
+            .map_err(|err| format!("saved `{field}` failed validation: {err}"))?;
+        Ok::<_, String>(spec)
+    };
+    if !matches!(payload.family_state, FittedFamily::MarginalSlope { .. }) {
+        return Ok(vec![SummaryPredictorBlock {
+            predictor: None,
+            spec: frozen(payload.resolved_termspec.as_ref(), "resolved_termspec")?,
+            spec_field: "resolved_termspec",
+            offset: SummaryBlockOffset::default(),
+            block: None,
+        }]);
+    }
+    let mut predictors = Vec::new();
+    let mut offset = SummaryBlockOffset::default();
+    for block in &fit.blocks {
+        let formula = match block.role {
+            BlockRole::Location => Some(("marginal", payload.resolved_termspec.as_ref(), "resolved_termspec")),
+            BlockRole::Scale => Some(("slope", payload.resolved_slopespec.as_ref(), "resolved_slopespec")),
+            _ => None,
+        };
+        if let Some((predictor, spec, spec_field)) = formula {
+            predictors.push(SummaryPredictorBlock {
+                predictor: Some(predictor),
+                spec: frozen(spec, spec_field)
+                    .map_err(|reason| format!("{predictor} predictor: {reason}"))?,
+                spec_field,
+                offset,
+                block: Some(block),
+            });
+        }
+        offset.coefficients += block.beta.len();
+        offset.penalties += block.lambdas.len();
+    }
+    if offset.coefficients != fit.beta.len() || offset.penalties != fit.lambdas.len() {
+        return Err(format!(
+            "the saved fit's blocks hold {} coefficients and {} smoothing parameters but its \
+             flat layout has {} and {}, so no block's offset is known",
+            offset.coefficients,
+            offset.penalties,
+            fit.beta.len(),
+            fit.lambdas.len()
+        ));
+    }
+    for (predictor, role) in [("marginal", BlockRole::Location), ("slope", BlockRole::Scale)] {
+        if !predictors.iter().any(|block| block.predictor == Some(predictor)) {
+            return Err(format!(
+                "{predictor} predictor: the saved marginal-slope fit has no {} block",
+                role.name()
+            ));
+        }
+    }
+    Ok(predictors)
+}
+
+/// The per-smooth rows of one predictor, replayed from its frozen spec.
+fn predictor_block_smooth_terms(
+    predictor: &SummaryPredictorBlock<'_>,
+    ranges: &[(f64, f64)],
+    fit: &gam_solve::estimate::UnifiedFitResult,
+) -> Result<Vec<SummarySmoothTermRow>, String> {
+    let spec = predictor.spec;
+    let label = predictor.label();
     // Every categorical column — including a fixed main effect represented by
     // a frozen random-effect block — must carry a valid saved level or the
     // design rebuild fails. That failure was swallowed to an EMPTY table for
@@ -177,35 +291,47 @@ fn summary_smooth_terms(
     let factor_levels = spec.frozen_factor_levels_by_col();
     let data = representative_data_from_ranges(ranges, &factor_levels);
     let design = gam_terms::smooth::build_term_collection_design(data.view(), spec)
-        .map_err(|err| format!("frozen-basis design replay failed: {err}"))?;
+        .map_err(|err| format!("{label}: frozen-basis design replay failed: {err}"))?;
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
-    crate::inference::model::saved_lambdas_index_rebuilt_layout(
-        spec,
-        design.penalties.len(),
-        fit,
-        "per-smooth summary",
-    )?;
+    match predictor.block {
+        None => crate::inference::model::saved_lambdas_index_rebuilt_layout(
+            spec,
+            design.penalties.len(),
+            fit,
+            "per-smooth summary",
+        )?,
+        Some(block) => {
+            if design.design.ncols() != block.beta.len()
+                || design.penalties.len() != block.lambdas.len()
+            {
+                return Err(format!(
+                    "{label}: the rebuilt design has {} coefficients and {} penalty blocks but \
+                     the fit's {} block has {} coefficients and {} smoothing parameters",
+                    design.design.ncols(),
+                    design.penalties.len(),
+                    block.role.name(),
+                    block.beta.len(),
+                    block.lambdas.len()
+                ));
+            }
+        }
+    }
 
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →
-    // global coefficient shift, the per-term influence trace, and the Wood test
-    // with its reference distribution — is ONE accounting, shared with the
+    // global coefficient shift, the per-term influence trace, and the smooth
+    // test with its reference distribution — is ONE accounting, shared with the
     // in-process CLI summary (#2470). Both surfaces spelled it out, so #1219,
-    // #1277, #1360, #1368 and #1372 each had to be landed twice; the comment
-    // this replaces recorded its own copy of #1368 as "fixed on the in-process
-    // path but never propagated here". What genuinely differs on this persisted
-    // path is the EVIDENCE — a frozen-basis replay instead of the training
-    // design — and the Wald test reads only the fit and the replay's penalty
-    // layout, so nothing about the training rows is reconstructed. Both
-    // reference-distribution inputs (`wald_residual_degrees_of_freedom`,
-    // `wald_scale_is_estimated`) are read off the fit inside that walk, which is
-    // where `fd998d957` put them.
-    let rows = gam_solve::estimate::smooth_term_summary_rows(&design, spec, fit);
+    // #1277, #1360, #1368 and #1372 each had to be landed twice. Every fitted
+    // quantity the test reads comes from `fit`; the frozen-basis replay supplies
+    // only the term structure.
+    let rows = gam_solve::estimate::smooth_term_summary_rows(&design, fit, predictor.offset);
     Ok(rows
         .into_iter()
         .map(|row| SummarySmoothTermRow {
             name: row.name,
+            predictor: predictor.predictor,
             edf: row.edf,
             ref_df: row.ref_df,
             chi_sq: row.chi_sq,
@@ -343,6 +469,7 @@ fn scan_summary_payload(
 ) -> Result<SummaryPayload, String> {
     let smooth_terms = vec![SummarySmoothTermRow {
         name: scan_smooth_label(scan),
+        predictor: None,
         edf: scan.edf,
         ref_df: scan.edf,
         // The rank-truncated Wald smooth test needs the joint coefficient
@@ -746,11 +873,11 @@ pub struct SummaryCoefficientRow {
 /// component `σ²_b = 0` scored against its exact finite-sample null law (the
 /// boundary null is not a Wald χ²; see
 /// `gam_terms::inference::random_effect_test`), with `ref_df` its effective
-/// d.f.; penalized smooth terms carry the whitened Wald `chi_sq` and its
-/// `p_value` under the λ̂-selection null law. The shape mirrors the CLI's
-/// `SmoothTermSummary`.
+/// d.f.; penalized smooth terms carry the
+/// variance-component score test's `chi_sq` / `p_value`. The shape mirrors the
+/// CLI's `SmoothTermSummary`.
 ///
-/// This `p_value` is the *first-order* Wald reference. The summary table is
+/// This `p_value` is the score test at the fitted smoothing parameters. The summary table is
 /// built from a saved model without the training rows, so it cannot run the
 /// per-term constrained refits the second-order test needs. The
 /// **second-order-accurate, Bartlett-corrected likelihood-ratio** p-value is
@@ -760,6 +887,11 @@ pub struct SummaryCoefficientRow {
 #[derive(Serialize)]
 pub struct SummarySmoothTermRow {
     pub name: String,
+    /// The predictor the smooth belongs to on a multi-formula fit: `"marginal"`
+    /// or `"slope"` for a Bernoulli marginal-slope model, whose two formulas can
+    /// name the same smooth (#2997). Absent on a single-predictor fit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predictor: Option<&'static str>,
     pub edf: f64,
     pub ref_df: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -767,9 +899,9 @@ pub struct SummarySmoothTermRow {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value: Option<f64>,
     /// Why `p_value` is absent when the term has no valid reference law
-    /// (`"shape_constrained"`), when its λ̂-selection replay refused
-    /// (`"selection_refused"`), or why a random-effect block's variance-component
-    /// test could not be scored (`"random_effect_*"`); see
+    /// (`"shape_constrained"`, `"unpenalized_direction"`, ...), or why a
+    /// random-effect block's variance-component test could not be scored
+    /// (`"random_effect_*"`); see
     /// [`gam_solve::estimate::SmoothPValueUnavailable`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p_value_unavailable: Option<&'static str>,
@@ -1330,7 +1462,6 @@ fn smoothing_forensics_rows(
                         None
                     }
                 }),
-                seed_screening: Vec::new(),
             }
         })
         .collect()

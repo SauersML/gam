@@ -288,20 +288,12 @@ class GAM(nn.Module):
         self, points: torch.Tensor | Sequence[torch.Tensor],
     ) -> torch.Tensor:
         """Eval-mode forward: design @ frozen_coef per smooth, summed."""
-        from .fit import _build_design_penalty
+        from .fit import _build_design_penalty, _per_smooth_points
 
         frozen_coefficients = self._frozen_coefficients()
         if frozen_coefficients is None:
             raise RuntimeError("frozen_coefs is None")
-        points_list: list[torch.Tensor] = (
-            [points] * len(self.smooths) if isinstance(points, torch.Tensor)
-            else list(points)
-        )
-        if len(points_list) != len(self.smooths):
-            raise ValueError(
-                f"got {len(points_list)} points tensors for "
-                f"{len(self.smooths)} smooths"
-            )
+        points_list = _per_smooth_points(points, len(self.smooths))
         if len(frozen_coefficients) != len(self.smooths):
             raise RuntimeError(
                 f"GAM has {len(frozen_coefficients)} frozen coefficient blocks for "

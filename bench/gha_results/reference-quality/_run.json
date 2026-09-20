@@ -3,12 +3,12 @@
   "publish_job_status": "failure",
   "publish_job_status_note": "status of the job that PUBLISHED these results, not the conclusion of run_id -- this job is part of that run, so the run has not concluded here",
   "publish_job_failed_steps": "step 8: Run quality suite (resilient + streaming; full per-test capture)",
-  "run_id": "35436855891",
-  "run_number": "595",
+  "run_id": "35485928637",
+  "run_number": "599",
   "run_attempt": "1",
   "event": "schedule",
   "ref": "refs/heads/main",
-  "sha": "453ac1d421662efdf45acbd52533db03a96451f7",
-  "completed_utc": "2026-09-19T13:01:27Z",
-  "run_url": "https://github.com/SauersML/gam/actions/runs/35436855891"
+  "sha": "990d8e0b93c55f834d5b27a7aa69487c3e2096ae",
+  "completed_utc": "2026-09-20T04:47:19Z",
+  "run_url": "https://github.com/SauersML/gam/actions/runs/35485928637"
 }

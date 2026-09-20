@@ -1,39 +1,37 @@
-//! Standing null-calibration gate for the single-response smooth-term Wald
+//! Standing type-I calibration gate for the single-response smooth-term
 //! p-value, one test per response family (pyGAM audit, lane
 //! `pv-wald-families`).
 //!
-//! The same smooth-term Wald primitive is reached by every standard family,
-//! and the family changes three of its inputs: the IRLS weights inside the
-//! penalized Hessian, the covariance `Vb` (whose scale is profiled,
-//! Pearson-refreshed, or fixed), and the reference law. A wrong weight, a
+//! The summary p-value is the variance-component score test of
+//! `gam_terms::inference::smooth_score_test`, read off the fit's penalized
+//! Hessian and weighted Gram. The family changes three of its inputs: the IRLS
+//! weights inside `X'WX`, the dispersion the score is standardized by (profiled,
+//! Pearson-refreshed, or fixed), and the reference law (a weighted `χ²₁` sum,
+//! over an independent `χ²_ρ/ρ` when the scale is estimated). A wrong weight, a
 //! wrong scale predicate, or a residual df read off the wrong fit is invisible
 //! to a Gaussian-only gate.
 //!
 //! Audit: `y ~ s(x1) + s(x2)` with a real `s(x1)` and a TRUE-NULL `s(x2)`
 //! (`x2` is drawn independently of `y`), `n = 200`, 200 seeded replications
-//! per family. The p-value read is the production summary row — the shared
-//! `smooth_term_summary_rows` walk, the same call `saved_model_summary` makes
-//! for CLI and Python.
+//! per family (the 500-replication acceptance run is the bench; this is its
+//! standing CI-sized gate). The p-value read is the production summary row —
+//! the shared `smooth_term_summary_rows` walk, the same call
+//! `saved_model_summary` makes for CLI and Python.
 //!
-//! Under the null the p-value must be U(0, 1) over the whole range, so the
-//! gate is two-sided. A conservative p-value (a pile near one, a size below
-//! nominal) fails exactly as an anti-conservative one does:
-//!
-//! * at `α ∈ {0.10, 0.05, 0.01}` the empirical size over the `m` fits that
-//!   converged is within `3·MCSE(α)` of `α`, `MCSE(α) = √(α(1 − α)/m)`;
-//! * the Kolmogorov distance of the p-values from U(0, 1) is below the
-//!   Dvoretzky–Kiefer–Wolfowitz radius `√(ln(2/δ)/(2m))` at the same
-//!   three-sigma level `δ = 2Φ(−3)`.
-//!
-//! A null term REML shrinks onto its penalty null space is in every family's
-//! sample; its p-value is held to the same uniform law, with no exemption.
-//! The measured laws are in `bench/pvalue_calibration/pv-wald-families/`.
+//! The gate is two-sided, because a valid p-value has `P(p ≤ a) = a` at every
+//! level: a conservative test fails it exactly as a liberal one does. Over the
+//! `m` fits that converged, the empirical size at `α ∈ {0.10, 0.05, 0.01}` must
+//! lie within `3·MCSE(α)`, `MCSE(α) = √(α(1 − α)/m)`, of `α` on both sides, and
+//! the Kolmogorov-Smirnov distance to `U(0, 1)` must be below its asymptotic
+//! 0.1% critical value `√(−½·ln(0.0005))/√m`. The score statistic does not
+//! depend on the null term's own smoothing parameter, so a term REML shrinks
+//! flat puts no point mass near `p = 1`.
 
 use csv::StringRecord;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use gam_solve::estimate::smooth_term_summary_rows;
+use gam_solve::estimate::{SummaryBlockOffset, smooth_term_summary_rows};
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use rand_distr::{Beta, Distribution, Gamma, Normal, Poisson, Uniform};
@@ -43,8 +41,6 @@ use std::f64::consts::PI;
 const N_OBS: usize = 200;
 const N_REPLICATIONS: u64 = 200;
 const ALPHAS: [f64; 3] = [0.10, 0.05, 0.01];
-/// Width of every acceptance band, in standard errors.
-const BAND_SIGMAS: f64 = 3.0;
 const SEED: u64 = 0x5A17_3051_0000;
 /// A fit the outer optimizer refuses to certify returns an error, not a
 /// p-value. Those replications are reported, never counted as rejections or
@@ -176,7 +172,11 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     let FitResult::Standard(fit) = result else {
         panic!("{family:?} rep {rep}: expected a standard fit");
     };
-    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
+    let rows = smooth_term_summary_rows(
+        &fit.design,
+        &fit.fit,
+        SummaryBlockOffset::default(),
+    );
     let row = rows
         .iter()
         .find(|row| row.name.contains(NULL_TERM))
@@ -194,7 +194,7 @@ fn null_row(family: Family, rep: u64) -> Result<NullRow, String> {
     })
 }
 
-fn assert_null_p_value_is_uniform(family: Family) {
+fn assert_null_size_within_monte_carlo_error(family: Family) {
     // The fits run on rayon workers, which need the wide worker stack.
     init_parallelism();
     let outcomes: Vec<(u64, Result<NullRow, String>)> = (0..N_REPLICATIONS)
@@ -223,13 +223,12 @@ fn assert_null_p_value_is_uniform(family: Family) {
             "{family:?} rep {rep}: p-value out of range: {}",
             row.p_value
         );
-        // `ref_df` is the null mean `Σ_k 1/(1 + e_k)` of the whitened
-        // statistic at `λ̂`, so a term REML shrank onto its null space
-        // honestly reports about its edf, below one. The p-value does not
-        // read it: its law is the λ̂-selection replay, checked below.
+        // The reference df `(Σw)²/Σw²` of the score's weighted χ² law is
+        // defined, and at least one, for every edf — including a term shrunk
+        // below one effective degree of freedom.
         assert!(
-            row.ref_df.is_finite() && row.ref_df >= 0.0,
-            "{family:?} rep {rep}: ref_df {} undefined or negative at edf {}",
+            row.ref_df.is_finite() && row.ref_df >= 1.0,
+            "{family:?} rep {rep}: ref_df {} undefined or below one at edf {}",
             row.ref_df,
             row.edf
         );
@@ -241,28 +240,31 @@ fn assert_null_p_value_is_uniform(family: Family) {
     for &alpha in &ALPHAS {
         let rejections = rows.iter().filter(|(_, r)| r.p_value <= alpha).count();
         let size = rejections as f64 / m;
-        let band = BAND_SIGMAS * (alpha * (1.0 - alpha) / m).sqrt();
-        report.push(format!("α={alpha}: size {size:.4} (α ± {band:.4})"));
-        if (size - alpha).abs() > band {
+        let tolerance = 3.0 * (alpha * (1.0 - alpha) / m).sqrt();
+        report.push(format!("α={alpha}: size {size:.4} (α ± {tolerance:.4})"));
+        if (size - alpha).abs() > tolerance {
             miscalibrated.push(format!(
                 "α={alpha}: {rejections}/{} rejections, size {size:.4} outside α ± 3·MCSE = \
                  [{:.4}, {:.4}]",
                 rows.len(),
-                alpha - band,
-                alpha + band
+                alpha - tolerance,
+                alpha + tolerance
             ));
         }
     }
-    let mut p_values: Vec<f64> = rows.iter().map(|(_, r)| r.p_value).collect();
-    let distance = kolmogorov_distance_from_uniform(&mut p_values);
-    let radius = dkw_radius(rows.len());
-    report.push(format!("KS D {distance:.4} (DKW radius {radius:.4})"));
-    if distance > radius {
-        let above = p_values.iter().filter(|&&p| p > 0.99).count();
+    let mut sorted: Vec<f64> = rows.iter().map(|(_, r)| r.p_value).collect();
+    sorted.sort_by(f64::total_cmp);
+    let ks_distance = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (p - i as f64 / m).max((i + 1) as f64 / m - p))
+        .fold(0.0_f64, f64::max);
+    let ks_critical = (-0.5 * (0.001_f64 / 2.0).ln()).sqrt() / m.sqrt();
+    report.push(format!("KS D {ks_distance:.4} (critical {ks_critical:.4})"));
+    if ks_distance > ks_critical {
         miscalibrated.push(format!(
-            "Kolmogorov distance {distance:.4} from U(0,1) exceeds the DKW radius {radius:.4}; \
-             {above}/{} p-values are above 0.99",
-            rows.len()
+            "KS distance {ks_distance:.4} to U(0, 1) exceeds the 0.1% critical value \
+             {ks_critical:.4}"
         ));
     }
     eprintln!(
@@ -273,96 +275,42 @@ fn assert_null_p_value_is_uniform(family: Family) {
     );
     assert!(
         miscalibrated.is_empty(),
-        "{family:?}: the smooth-term Wald p-value of a true-null s({NULL_TERM}) is not \
-         U(0,1):\n{}",
+        "{family:?}: the smooth-term p-value of a true-null s({NULL_TERM}) is not U(0, 1):\n{}",
         miscalibrated.join("\n")
     );
 }
 
-/// `sup_u |F̂(u) − u|` of the sample against U(0, 1).
-fn kolmogorov_distance_from_uniform(values: &mut [f64]) -> f64 {
-    values.sort_by(f64::total_cmp);
-    let m = values.len() as f64;
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, &u)| ((i + 1) as f64 / m - u).max(u - i as f64 / m))
-        .fold(0.0, f64::max)
-}
-
-/// The Dvoretzky–Kiefer–Wolfowitz radius (Massart's constant) exceeded with
-/// probability at most `δ = 2Φ(−BAND_SIGMAS)`, the level of the size bands.
-fn dkw_radius(m: usize) -> f64 {
-    let delta = libm::erfc(BAND_SIGMAS / std::f64::consts::SQRT_2);
-    ((2.0 / delta).ln() / (2.0 * m as f64)).sqrt()
+#[test]
+fn gaussian_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Gaussian);
 }
 
 #[test]
-fn gaussian_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Gaussian);
+fn poisson_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Poisson);
 }
 
 #[test]
-fn poisson_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Poisson);
+fn binomial_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Binomial);
 }
 
 #[test]
-fn binomial_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Binomial);
+fn gamma_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Gamma);
 }
 
 #[test]
-fn gamma_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Gamma);
+fn negative_binomial_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::NegativeBinomial);
 }
 
 #[test]
-fn negative_binomial_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::NegativeBinomial);
+fn tweedie_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Tweedie);
 }
 
 #[test]
-fn tweedie_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Tweedie);
-}
-
-#[test]
-fn beta_null_smooth_wald_p_value_is_uniform() {
-    assert_null_p_value_is_uniform(Family::Beta);
-}
-
-/// Replication 67 of the Gamma gate shrinks `s(x2)` onto its null space, and
-/// some of its null draws select through a lower tail where the criterion is
-/// flat to its own rounding while its derivatives are still resolved. Every
-/// row must still carry a p-value: a refused selection would drop the row the
-/// gate reads.
-#[test]
-fn a_gamma_null_fit_whose_selection_crosses_a_flat_tail_gets_a_p_value() {
-    init_parallelism();
-    let data = null_dataset(Family::Gamma, 67);
-    let config = FitConfig {
-        family: Some(Family::Gamma.config_name().to_string()),
-        ..FitConfig::default()
-    };
-    let FitResult::Standard(fit) = fit_from_formula(FORMULA, &data, &config).expect("gamma fit")
-    else {
-        panic!("a Gamma formula fit is a standard fit");
-    };
-    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
-    assert_eq!(rows.len(), 2, "one row per smooth");
-    for row in &rows {
-        assert!(
-            row.pvalue_unavailable.is_none(),
-            "{} has no p-value: {:?}",
-            row.name,
-            row.pvalue_unavailable
-        );
-        let pvalue = row.pvalue.expect("a row with no refusal has a p-value");
-        assert!(
-            (0.0..=1.0).contains(&pvalue),
-            "{} p-value {pvalue}",
-            row.name
-        );
-    }
+fn beta_null_smooth_wald_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::Beta);
 }

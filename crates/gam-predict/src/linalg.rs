@@ -3,6 +3,7 @@ use gam_runtime::resource::prediction_chunk_rows;
 use gam_solve::constrained_posterior::ConstrainedPosteriorCorrection;
 use ndarray::{Array1, Array2, ArrayView2, s};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use std::borrow::Cow;
 use std::ops::Range;
 
 pub enum PredictionCovarianceBackend<'a> {
@@ -20,8 +21,14 @@ pub enum PredictionCovarianceBackend<'a> {
         phi_scale: f64,
         /// Factored variance removed by inequality truncation. The lift already
         /// lives on the same φ-scaled covariance metric returned by this
-        /// backend, so it is subtracted after the ambient precision solve.
-        constrained_correction: Option<&'a ConstrainedPosteriorCorrection>,
+        /// backend, so it is subtracted after the ambient precision solve. It
+        /// is the truncation of the ambient covariance this backend applies:
+        /// the conditional one's, or `Vp`'s own when `smoothing_factor` is set.
+        constrained_correction: Option<Cow<'a, ConstrainedPosteriorCorrection>>,
+        /// The smoothing correction's square-root factor `B` on the active
+        /// coordinates, when the backend applies the smoothing-corrected
+        /// `Vp = Vb + B·Bᵀ` of a fit whose inference stayed factorized (#3283).
+        smoothing_factor: Option<Array2<f64>>,
         /// The coefficient gauge's section `T` when the factorized precision
         /// lives on active coordinates `θ` of `β = T·θ + a` rather than on the
         /// saved coefficients. The backend then applies `T·Cov(θ)·Tᵀ`, the
@@ -79,9 +86,106 @@ impl<'a> PredictionCovarianceBackend<'a> {
             factor,
             dim,
             phi_scale,
-            constrained_correction,
+            constrained_correction: constrained_correction.map(Cow::Borrowed),
+            smoothing_factor: None,
             gauge_lift: None,
         })
+    }
+
+    /// Carry a conditional factorized backend (built with no truncation) to
+    /// the smoothing-corrected law `Vp = Vb + B·Bᵀ` of a fit whose inference
+    /// stayed factorized (#3283). `smoothing_factor` is `B` on the backend's
+    /// active coordinates. `truncation` builds a constrained fit's lift at
+    /// `Vp` from `Vp·Aᵀ`, which this closure receives through
+    /// [`Self::apply_ambient_active`]: the corrected law is the truncation at
+    /// `Vp`'s own lift, as the fit publishes it, never `Vb`'s lift plus `B·Bᵀ`.
+    pub fn with_smoothing_correction(
+        self,
+        smoothing_factor: Array2<f64>,
+        truncation: impl FnOnce(&Self) -> Result<Option<ConstrainedPosteriorCorrection>, String>,
+    ) -> Result<Self, String> {
+        let Self::Factorized {
+            factor,
+            dim,
+            phi_scale,
+            constrained_correction,
+            smoothing_factor: previous,
+            gauge_lift,
+        } = self
+        else {
+            return Err(
+                "a dense prediction covariance already carries its smoothing correction; only a \
+                 factorized precision takes the correction's factor"
+                    .to_string(),
+            );
+        };
+        if constrained_correction.is_some() || previous.is_some() || gauge_lift.is_some() {
+            return Err(
+                "the smoothing correction's factor joins a conditional factorized precision \
+                 before any truncation or gauge lift"
+                    .to_string(),
+            );
+        }
+        if smoothing_factor.nrows() != dim {
+            return Err(format!(
+                "the smoothing correction factor has {} rows but the factorized precision is \
+                 {dim}x{dim}",
+                smoothing_factor.nrows()
+            ));
+        }
+        let mut corrected = Self::Factorized {
+            factor,
+            dim,
+            phi_scale,
+            constrained_correction: None,
+            smoothing_factor: Some(smoothing_factor),
+            gauge_lift: None,
+        };
+        let marginal_correction = truncation(&corrected)?;
+        if let Self::Factorized {
+            constrained_correction,
+            ..
+        } = &mut corrected
+        {
+            *constrained_correction = marginal_correction.map(Cow::Owned);
+        }
+        Ok(corrected)
+    }
+
+    /// The untruncated ambient covariance this backend's law is built from,
+    /// applied on its ACTIVE coordinates: `φ·H⁻¹·rhs`, plus `B·(Bᵀ·rhs)` on a
+    /// smoothing-corrected backend. No truncation and no gauge lift: this is
+    /// the block `Σ·Aᵀ` a truncation's lift is derived from.
+    pub fn apply_ambient_active(&self, rhs: &Array2<f64>) -> Result<Array2<f64>, String> {
+        match self {
+            Self::Dense(covariance) => Err(format!(
+                "a dense {}x{} prediction covariance has no separate ambient law",
+                covariance.nrows(),
+                covariance.ncols()
+            )),
+            Self::Factorized {
+                factor,
+                dim,
+                phi_scale,
+                smoothing_factor,
+                ..
+            } => {
+                if rhs.nrows() != *dim {
+                    return Err(format!(
+                        "ambient covariance application has {} rows, expected {dim}",
+                        rhs.nrows()
+                    ));
+                }
+                let mut solved = factor.solvemulti(rhs)?;
+                if (*phi_scale - 1.0).abs() > 0.0 {
+                    solved.mapv_inplace(|v| v * *phi_scale);
+                }
+                if let Some(smoothing) = smoothing_factor {
+                    solved += &smoothing.dot(&smoothing.t().dot(rhs));
+                }
+                Ok(solved)
+            }
+        }
     }
 
     /// Carry a factorized active-coordinate precision to the saved coefficient
@@ -99,6 +203,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 dim,
                 phi_scale,
                 constrained_correction,
+                smoothing_factor,
                 ..
             } => {
                 if lift.ncols() != dim {
@@ -113,6 +218,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
                     dim,
                     phi_scale,
                     constrained_correction,
+                    smoothing_factor,
                     gauge_lift: Some(lift),
                 })
             }
@@ -149,6 +255,7 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 factor,
                 phi_scale,
                 constrained_correction,
+                smoothing_factor,
                 gauge_lift,
                 ..
             } => {
@@ -159,6 +266,9 @@ impl<'a> PredictionCovarianceBackend<'a> {
                 let mut solved = factor.solvemulti(rhs_active)?;
                 if (*phi_scale - 1.0).abs() > 0.0 {
                     solved.mapv_inplace(|v| v * *phi_scale);
+                }
+                if let Some(smoothing) = smoothing_factor {
+                    solved += &smoothing.dot(&smoothing.t().dot(rhs_active));
                 }
                 if let Some(correction) = constrained_correction {
                     let normal_rhs = correction.lift.t().dot(rhs_active);

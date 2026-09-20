@@ -30,7 +30,8 @@ use gam_linalg::faer_ndarray::{
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_problem::LinearInequalityConstraints;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
-use opt::{Bfgs, Bounds, FirstOrderSample, FusedObjective, GradientTolerance, ObjectiveEvalError};
+use crate::exact_jet_objective::{certified_newton_minimum, exact_jet};
+use opt::{Bounds, GradientTolerance, ObjectiveEvalError};
 
 /// Inputs to the single-penalty constrained Gaussian REML fit.
 ///
@@ -666,46 +667,47 @@ fn tangent_penalty_geometry(
     })
 }
 
+/// Minimise the affine-face REML score over `ρ` on its resolvable domain
+/// with `opt`'s Newton trust region on the exact slope and curvature. Only
+/// a certified stationary point, interior or projected at an endpoint, is a
+/// result; an endpoint that is itself projected-stationary with a lower
+/// score is preferred to it.
 fn optimize_affine_face(
     profile: &AffineFaceProfile,
     initial_rho: f64,
 ) -> Result<AffineFaceEvaluation, EstimationError> {
     let (lower, upper) = profile.rho_domain();
-    let seed_rho = initial_rho.clamp(lower, upper);
-    let seed = profile.evaluate(seed_rho)?;
-    let seed_point = Array1::from_vec(vec![seed_rho]);
-    let initial_sample = FirstOrderSample {
-        value: seed.score,
-        gradient: Array1::from_vec(vec![seed.rho_gradient]),
-    };
-    let objective_profile = profile.clone();
-    let objective = FusedObjective::new(move |point: &Array1<f64>| {
-        objective_profile
-            .evaluate(point[0])
-            .map(|evaluation| FirstOrderSample {
-                value: evaluation.score,
-                gradient: Array1::from_vec(vec![evaluation.rho_gradient]),
-            })
-            .map_err(|error| ObjectiveEvalError::fatal(error.to_string()))
-    });
-    let bound_resolution = f64::EPSILON.sqrt();
-    let stationarity_resolution = rho_stationarity_resolution();
     let bounds = Bounds::new(
         Array1::from_vec(vec![lower]),
         Array1::from_vec(vec![upper]),
-        bound_resolution,
+        f64::EPSILON.sqrt(),
     )
     .map_err(|error| EstimationError::InvalidInput(error.to_string()))?;
-    let mut optimizer = Bfgs::new(seed_point.clone(), objective)
-        .with_initial_sample(seed_point, initial_sample)
-        .with_bounds(bounds)
-        .with_gradient_tolerance(GradientTolerance::relative_to_cost(stationarity_resolution));
-    let solution = optimizer.run().map_err(|error| {
+    let solution = certified_newton_minimum(
+        Array1::from_vec(vec![initial_rho.clamp(lower, upper)]),
+        Some(bounds),
+        Some(GradientTolerance::relative_to_cost(
+            rho_stationarity_resolution(),
+        )),
+        |point: &Array1<f64>| {
+            profile
+                .evaluate(point[0])
+                .map(|evaluation| {
+                    exact_jet(
+                        evaluation.score,
+                        Array1::from_vec(vec![evaluation.rho_gradient]),
+                        Array2::from_elem((1, 1), evaluation.rho_curvature),
+                    )
+                })
+                .map_err(|error| ObjectiveEvalError::fatal(error.to_string()))
+        },
+    )
+    .map_err(|error| {
         EstimationError::RemlOptimizationFailed(format!(
-            "affine-face Gaussian REML optimization did not converge: {error}"
+            "affine-face Gaussian REML optimization has no certified optimum: {error}"
         ))
     })?;
-    let mut accepted = polish_affine_rho(profile, solution.final_point[0])?;
+    let mut accepted = profile.evaluate(solution.final_point[0])?;
     for (endpoint, is_lower) in [(lower, true), (upper, false)] {
         let candidate = profile.evaluate(endpoint)?;
         let projected_stationary = (is_lower && candidate.rho_gradient >= 0.0)
@@ -715,56 +717,6 @@ fn optimize_affine_face(
         }
     }
     Ok(accepted)
-}
-
-fn polish_affine_rho(
-    profile: &AffineFaceProfile,
-    initial_rho: f64,
-) -> Result<AffineFaceEvaluation, EstimationError> {
-    let (lower, upper) = profile.rho_domain();
-    let resolution = rho_stationarity_resolution();
-    let bound_resolution = f64::EPSILON.sqrt();
-    let mut rho = initial_rho.clamp(lower, upper);
-    loop {
-        let current = profile.evaluate(rho)?;
-        // The same band this box hands opt as its tolerance, so the polish and the
-        // solver agree on which endpoint a coordinate sits at (#2469).
-        let at_lower = rho <= lower + bound_resolution;
-        let at_upper = rho >= upper - bound_resolution;
-        if (at_lower && current.rho_gradient >= 0.0) || (at_upper && current.rho_gradient <= 0.0) {
-            return Ok(current);
-        }
-        let curvature_resolution = resolution * (1.0 + current.rho_gradient.abs());
-        if !current.rho_curvature.is_finite() || current.rho_curvature <= curvature_resolution {
-            return Err(EstimationError::GradientUnavailable {
-                context: "constrained Gaussian REML forward",
-                mode: "affine-face smoothing optimum has unresolved positive curvature",
-            });
-        }
-        if current.rho_gradient.abs() <= resolution * (1.0 + current.score.abs()) {
-            return Ok(current);
-        }
-        let mut candidate_rho =
-            (rho - current.rho_gradient / current.rho_curvature).clamp(lower, upper);
-        if candidate_rho.to_bits() == rho.to_bits() {
-            return Err(EstimationError::GradientUnavailable {
-                context: "constrained Gaussian REML forward",
-                mode: "affine-face smoothing root is below floating-point resolution",
-            });
-        }
-        let mut candidate = profile.evaluate(candidate_rho)?;
-        while candidate.score >= current.score {
-            candidate_rho = 0.5 * (rho + candidate_rho);
-            if candidate_rho.to_bits() == rho.to_bits() {
-                return Err(EstimationError::GradientUnavailable {
-                    context: "constrained Gaussian REML forward",
-                    mode: "affine-face smoothing polish cannot resolve a descent step",
-                });
-            }
-            candidate = profile.evaluate(candidate_rho)?;
-        }
-        rho = candidate_rho;
-    }
 }
 
 fn rho_stationarity_resolution() -> f64 {
@@ -1420,6 +1372,58 @@ mod tests {
             (center.rho_curvature - (above.rho_gradient - below.rho_gradient) / (2.0 * step)).abs()
                 < 1e-7
         );
+    }
+
+    /// The affine-face smoothing parameter is the certified minimiser of the
+    /// face's own REML score from every seed across the domain: stationary
+    /// with positive exact curvature, and the root of the exact slope that a
+    /// bisection on its sign brackets.
+    #[test]
+    fn affine_face_smoothing_is_the_certified_minimum_from_every_seed() {
+        let fixture = affine_fixture();
+        let profile = AffineFaceProfile::new(
+            fixture.x.view(),
+            fixture.y.view(),
+            fixture.penalty.view(),
+            fixture.weights.view(),
+            &fixture.constraints,
+            array![0_u64].view(),
+        )
+        .unwrap();
+        let (lower, upper) = profile.rho_domain();
+        let (mut below, mut above) = (lower, upper);
+        assert!(
+            profile.evaluate(below).unwrap().rho_gradient < 0.0
+                && profile.evaluate(above).unwrap().rho_gradient > 0.0,
+            "the fixture's score has an interior minimum on [{lower}, {upper}]"
+        );
+        while above - below > 4.0 * f64::EPSILON * (1.0 + above.abs()) {
+            let middle = 0.5 * (below + above);
+            if profile.evaluate(middle).unwrap().rho_gradient < 0.0 {
+                below = middle;
+            } else {
+                above = middle;
+            }
+        }
+        let root = 0.5 * (below + above);
+        for seed in [lower, -8.0, -1.0, 0.0, 1.0, 8.0, upper] {
+            let optimum = optimize_affine_face(&profile, seed)
+                .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
+            let tolerance = rho_stationarity_resolution() * (1.0 + optimum.score.abs());
+            assert!(
+                optimum.rho_gradient.abs() <= tolerance && optimum.rho_curvature > 0.0,
+                "seed {seed}: ρ {} slope {:e} curvature {:e}",
+                optimum.rho,
+                optimum.rho_gradient,
+                optimum.rho_curvature,
+            );
+            // The slope's own resolution bounds the distance to the root.
+            assert!(
+                (optimum.rho - root).abs() <= 2.0 * tolerance / optimum.rho_curvature,
+                "seed {seed}: ρ {} against the bisected root {root}",
+                optimum.rho,
+            );
+        }
     }
 
     fn scalar_loss(result: &ConstrainedGaussianRemlForwardResult) -> f64 {

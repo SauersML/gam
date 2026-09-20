@@ -61,11 +61,6 @@ use gam::{
 use ndarray::Array2;
 use std::path::Path;
 
-/// gam's sigma link offset (`sigma = LOGB_SIGMA_FLOOR + exp(eta_scale)`), the
-/// same offset-exponential scale link used throughout gam's Gaussian
-/// location-scale family. The mean uses the identity link.
-const LOGB_SIGMA_FLOOR: f64 = 0.01;
-
 /// Standard normal CDF via the error function (`Phi(z) = 0.5*erfc(-z/sqrt2)`),
 /// implemented with the Abramowitz & Stegun 7.1.26 rational `erf` approximation
 /// (max abs error ~1.5e-7). This is gam's PIT on its OWN predictions; the Python
@@ -226,12 +221,14 @@ fn gam_location_scale_pit_is_calibrated_on_holdout() {
         beta_scale.len()
     );
 
-    // Mean is identity link; sigma = LOGB_SIGMA_FLOOR + exp(eta_scale).
+    // Mean is identity link; sigma = response_scale*sigma_floor + exp(eta_scale),
+    // the fit's own floor (recording-grid bound of the standardized response)
+    // mapped to the raw units of the returned coefficients.
     let mu: Vec<f64> = mean_design.design.apply(&beta_mean).to_vec();
     let eta_scale = noise_design.design.apply(&beta_scale);
     let sigma: Vec<f64> = eta_scale
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| fit.response_scale * fit.sigma_floor + e.exp())
         .collect();
     assert!(
         sigma.iter().all(|&s| s > 0.0 && s.is_finite()),
@@ -459,7 +456,7 @@ fn gam_location_scale_pit_is_calibrated_on_holdout_on_real_data() {
     let eta_scale = noise_design.design.apply(&beta_scale);
     let sigma: Vec<f64> = eta_scale
         .iter()
-        .map(|&e| LOGB_SIGMA_FLOOR + e.exp())
+        .map(|&e| fit.response_scale * fit.sigma_floor + e.exp())
         .collect();
     assert!(
         sigma.iter().all(|&s| s > 0.0 && s.is_finite()),

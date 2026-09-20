@@ -50,6 +50,67 @@ fn thin_plate_augmented_center_strategy(
     }
 }
 
+/// Refuse a cold thin-plate basis that cannot bend across the bulk of its data.
+///
+/// The polyharmonic kernel `r^(2m−d)` is global: its realized columns carry
+/// the whole covariate span `D`, while structure inside the bulk of the rows
+/// varies at the bulk's own width `w`. The reparameterization keeps a bending
+/// direction only above the numerical-rank floor `K·ε` of the metric it
+/// diagonalizes, so a direction varying at scale `h` survives only when
+/// `(h/D)^p > K·ε`, with `p = 2m−d` for the knot-Gram metric and `p = 2(2m−d)`
+/// for the realized data metric `(KZ)ᵀ(KZ)`, which squares it. Losing the finest
+/// directions of a dense basis is ordinary; losing directions while an axis's
+/// interquartile width is itself at or below that resolvable scale means no
+/// retained direction can bend inside the middle half of the rows, and the
+/// "fit" is a straight line across the bulk set by a few outlying rows. That is
+/// refused, not fit. An axis whose middle half has no width has nothing there
+/// to resolve and is not a failure.
+fn ensure_thin_plate_bulk_resolvable(
+    data: ArrayView2<'_, f64>,
+    available: usize,
+    retained: usize,
+    metric_power: usize,
+) -> Result<(), BasisError> {
+    if retained >= available || data.nrows() < 2 {
+        return Ok(());
+    }
+    let diameter = data
+        .axis_iter(Axis(1))
+        .map(|column| {
+            let (lo, hi) = column
+                .iter()
+                .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), &v| {
+                    (lo.min(v), hi.max(v))
+                });
+            (hi - lo) * (hi - lo)
+        })
+        .sum::<f64>()
+        .sqrt();
+    let resolvable = diameter * ((available as f64) * f64::EPSILON).powf(1.0 / metric_power as f64);
+    for (axis, column) in data.axis_iter(Axis(1)).enumerate() {
+        let mut values = column.to_vec();
+        values.sort_by(f64::total_cmp);
+        let quantile = |p: f64| {
+            let pos = p * (values.len() - 1) as f64;
+            let (lo, hi) = (pos.floor() as usize, pos.ceil() as usize);
+            values[lo] + (pos - lo as f64) * (values[hi] - values[lo])
+        };
+        let bulk_width = quantile(0.75) - quantile(0.25);
+        if bulk_width > 0.0 && bulk_width <= resolvable {
+            return Err(BasisError::ThinPlateBulkUnresolvable {
+                term: None,
+                axis,
+                bulk_fraction: bulk_width / diameter,
+                resolvable_fraction: resolvable / diameter,
+                retained,
+                available,
+                spans: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Generic thin-plate builder returning design + penalty list.
 pub fn build_thin_plate_basis(
     data: ArrayView2<'_, f64>,
@@ -141,7 +202,7 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
         // center spacing for moderate n), kappa·r runs large at every center
         // pair, every kernel block underflows toward machine epsilon, and the
         // constrained radial Gram collapses to floating-point noise
-        // (`positive_spectral_whitener_from_gram` then rejects a rank-0 smooth —
+        // (`positive_spectral_frame_from_gram` then rejects a rank-0 smooth —
         // gam#1091). The natural operating scale of a radial kernel is the
         // typical center separation, where kappa·r ≈ O(1) keeps every block
         // O(1); promote at that scale rather than inheriting the (possibly
@@ -208,7 +269,17 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
             dense_bytes as f64 / (1024.0 * 1024.0),
         );
     }
+    let bending_order = 2 * thin_plate_penalty_order(data.ncols()) - data.ncols();
     let (design, identifiability_transform, mut candidates, radial_reparam_meta) = if use_lazy {
+        if spec.radial_reparam.is_none() {
+            // Knot-Gram metric `Zᵀ K_CC Z`.
+            ensure_thin_plate_bulk_resolvable(
+                data,
+                internal_kernel_transform.ncols(),
+                radial_reparam.ncols(),
+                bending_order,
+            )?;
+        }
         let poly_block = thin_plate_polynomial_block(data);
         let d = data.ncols();
         let length_scale_sq = spec.length_scale * spec.length_scale;
@@ -291,6 +362,15 @@ pub(crate) fn build_thin_plate_basiswithworkspace(
             spec.radial_reparam.as_ref(),
             workspace,
         )?;
+        if spec.radial_reparam.is_none() {
+            // Realized data metric `(KZ)ᵀ(KZ)`, which squares the kernel's range.
+            ensure_thin_plate_bulk_resolvable(
+                data,
+                internal_kernel_transform.ncols(),
+                tps.num_kernel_basis,
+                2 * bending_order,
+            )?;
+        }
         let identifiability_transform = thin_plate_identifiability_transform_from_design(
             tps.basis.view(),
             tps.num_kernel_basis,
@@ -2356,6 +2436,7 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
     powers: &closed_form_penalty::AnisoMetricPowers,
     r: &[f64],
     diagonal_epsilon: f64,
+    origin: closed_form_penalty::PairOrigin,
 ) -> f64 {
     assert_eq!(
         eta_raw.len(),
@@ -2371,7 +2452,7 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
         // diagonal; epsilon regularization is only the final non-convergent
         // diagonal convention.
         if let Some(bundle) =
-            closed_form_penalty::analytic_self_pair_bundle(q, m, s, kappa, eta_raw)
+            closed_form_penalty::self_pair_bundle(q, m, s, kappa, eta_raw, origin)
         {
             return bundle.value;
         }
@@ -2380,14 +2461,14 @@ pub(crate) fn closed_form_anisotropic_pair_value_with_powers(
             r_eps_buf[0] = diagonal_epsilon * eta_raw[0].exp();
         }
         return j_prefactor
-            * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-                q, m, s as f64, kappa, eta_raw, powers, &r_eps_buf,
+            * closed_form_penalty::duchon_pair_kernel_with_powers(
+                q, m, s as f64, kappa, eta_raw, powers, &r_eps_buf, origin,
             );
     }
 
     j_prefactor
-        * closed_form_penalty::anisotropic_duchon_penalty_radial_with_powers(
-            q, m, s as f64, kappa, eta_raw, powers, r,
+        * closed_form_penalty::duchon_pair_kernel_with_powers(
+            q, m, s as f64, kappa, eta_raw, powers, r, origin,
         )
 }
 
@@ -2398,6 +2479,29 @@ pub fn closed_form_anisotropic_pair_block(
     s: usize,
     kappa: f64,
     aniso_log_scales: Option<&[f64]>,
+) -> Array2<f64> {
+    closed_form_anisotropic_pair_block_with_origin(
+        centers,
+        q,
+        m,
+        s,
+        kappa,
+        aniso_log_scales,
+        closed_form_penalty::PairOrigin::Full,
+    )
+}
+
+/// [`closed_form_anisotropic_pair_block`] for a named kernel representative.
+/// [`closed_form_penalty::PairOrigin::Reduced`] subtracts the kernel's origin
+/// value from every entry, which only a kernel-constraint transform Z annihilates.
+pub(crate) fn closed_form_anisotropic_pair_block_with_origin(
+    centers: ArrayView2<'_, f64>,
+    q: usize,
+    m: usize,
+    s: usize,
+    kappa: f64,
+    aniso_log_scales: Option<&[f64]>,
+    origin: closed_form_penalty::PairOrigin,
 ) -> Array2<f64> {
     // Math team Letter A §9: G_q(η_raw, κ) ≠ G_q(η_centered, κ) in general;
     // the relation involves an exp((2d-4m-4s)μ) prefactor and a κ rescaling
@@ -2439,7 +2543,7 @@ pub fn closed_form_anisotropic_pair_block(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let value = closed_form_anisotropic_pair_value_with_powers(
-                q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps,
+                q, m, s, kappa, eta_raw, &powers, &r_buf, r_eps, origin,
             );
             // SAFETY: values has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
             // lower_triangular_offset(i)+j is in bounds. Each rayon iteration
@@ -2594,6 +2698,21 @@ pub(crate) fn pure_duchon_diagonal_epsilon(
     (median * 1e-6).max(1e-12)
 }
 
+/// The pair-kernel representative a Gram restricted by `kernel_nullspace` may use.
+///
+/// The kernel constraint makes every column of Z orthogonal to the constant. The
+/// origin-reduced kernel changes every pair entry by the same constant
+/// `J·g_q(0)`, so Z^T G Z is unchanged. Without Z the full kernel is required.
+pub(crate) fn closed_form_pair_origin(
+    kernel_nullspace: Option<&Array2<f64>>,
+) -> closed_form_penalty::PairOrigin {
+    if kernel_nullspace.is_some() {
+        closed_form_penalty::PairOrigin::Reduced
+    } else {
+        closed_form_penalty::PairOrigin::Full
+    }
+}
+
 pub(crate) fn closed_form_operator_penalty_in_total_basis(
     centers: ArrayView2<'_, f64>,
     q: usize,
@@ -2605,9 +2724,18 @@ pub(crate) fn closed_form_operator_penalty_in_total_basis(
     polynomial_block_cols: usize,
     outer_identifiability: Option<&Array2<f64>>,
 ) -> Array2<f64> {
-    // 1. Closed-form penalty in raw kernel basis (K×K).
-    let g_raw =
-        closed_form_anisotropic_pair_block(centers, q, p_order, s_order, kappa, aniso_log_scales);
+    // 1. Closed-form penalty in raw kernel basis (K×K). Z annihilates the
+    //    constant, so a constrained Gram is read on the origin-reduced kernel.
+    let origin = closed_form_pair_origin(kernel_nullspace);
+    let g_raw = closed_form_anisotropic_pair_block_with_origin(
+        centers,
+        q,
+        p_order,
+        s_order,
+        kappa,
+        aniso_log_scales,
+        origin,
+    );
     // 2. Apply kernel-constraint nullspace transform Z (K×kernel_cols).
     let g_kernel = if let Some(z) = kernel_nullspace {
         gam_problem::Gauge::from_block_transforms(&[z.clone()]).restrict_penalty(&g_raw)
@@ -2675,6 +2803,7 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
             pure_duchon_diagonal_epsilon(centers, eta_raw)
         };
     let powers = closed_form_penalty::AnisoMetricPowers::new(eta_raw);
+    let origin = closed_form_pair_origin(kernel_nullspace);
 
     let n_pairs = lower_triangular_len(k);
     let mut g_values = vec![0.0_f64; n_pairs];
@@ -2700,15 +2829,15 @@ pub(crate) fn closed_form_psi_derivatives_in_total_basis(
                 r_buf[axis] = centers[[i, axis]] - centers[[j, axis]];
             }
             let bundle = if i == j {
-                closed_form_penalty::analytic_self_pair_bundle(q, p_order, s_order, kappa, eta_raw)
+                closed_form_penalty::self_pair_bundle(q, p_order, s_order, kappa, eta_raw, origin)
                     .unwrap_or_else(|| {
                         closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                            q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf,
+                            q, p_order, s_order, kappa, eta_raw, &powers, &r_eps_buf, origin,
                         )
                     })
             } else {
                 closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
-                    q, p_order, s_order, kappa, eta_raw, &powers, &r_buf,
+                    q, p_order, s_order, kappa, eta_raw, &powers, &r_buf, origin,
                 )
             };
             // SAFETY: each output has k(k+1)/2 slots; for i in 0..k and j ∈ 0..=i,
@@ -4789,3 +4918,5 @@ mod matern_basis_size_tests {
 
 #[cfg(test)]
 mod thin_plate_workspace_equivalence_regression_tests;
+#[cfg(test)]
+mod thin_plate_outlier_span_tests;

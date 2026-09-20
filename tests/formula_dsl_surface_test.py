@@ -6,14 +6,16 @@ Pins the user-visible contract of:
   slope without the intercept is ordinary least squares through the origin,
   and a term that spans the constant (``0 + g``, ``0 + g:h``, ``0 + s(x)``)
   keeps the intercept, so only the constant is unpenalized;
-* backtick-quoted, non-identifier column names and ``C()`` as a ``factor()``
-  alias;
+* backtick-quoted, non-identifier column names (``C()`` is refused in favour
+  of ``factor()``);
 * ``domain=[a, b]`` on ``s()`` (validated against the data, linear
   extrapolation past it at predict time);
 * strict option parsing: a malformed value, an unknown option, or
   ``penalty_order`` above the spline degree raises ``gamfit.errors.FormulaError``
   naming the term and the option;
-* a scalar ``bs=`` on ``te()`` applying to every margin.
+* a scalar ``bs=`` on ``te()`` applying to every margin;
+* a formula that does not parse (unbalanced parentheses, no ``~``) raising
+  ``gamfit.errors.FormulaError``, not a configuration error.
 """
 
 from __future__ import annotations
@@ -129,13 +131,13 @@ def test_no_intercept_model_round_trips_through_save_and_load(tmp_path):
     np.testing.assert_allclose(_predict(reloaded, grid), _predict(model, grid), rtol=1e-12)
 
 
-def test_backtick_columns_and_c_alias_match_plain_names():
+def test_backtick_columns_match_plain_names():
     x, y = _linear_data()
     site = np.resize(np.array(["north", "south", "east"]), N)
     y = y + np.where(site == "south", 0.5, 0.0)
     quoted = gamfit.fit(
         {"y": y, "dose (mg)": x, "site-id": site},
-        "y ~ `dose (mg)` + C(`site-id`)",
+        "y ~ `dose (mg)` + factor(`site-id`)",
         family="gaussian",
     )
     plain = gamfit.fit(
@@ -148,6 +150,12 @@ def test_backtick_columns_and_c_alias_match_plain_names():
         _predict(plain, {"dose": x, "site": site}),
         rtol=1e-8,
     )
+    with pytest.raises(gamfit.errors.FormulaError, match=r"`C\(\)` is not a term function.*factor\(`site-id`\)"):
+        gamfit.fit(
+            {"y": y, "dose (mg)": x, "site-id": site},
+            "y ~ `dose (mg)` + C(`site-id`)",
+            family="gaussian",
+        )
 
 
 def test_domain_must_contain_the_data():
@@ -196,3 +204,13 @@ def test_scalar_bs_on_te_applies_to_every_margin():
     assert np.all(np.isfinite(_predict(model, {"x": x, "z": z})))
     with pytest.raises(gamfit.errors.FormulaError, match="not a supported penalized-spline margin"):
         gamfit.fit({"y": y, "x": x, "z": z}, "y ~ te(x, z, bs=re)", family="gaussian")
+
+
+@pytest.mark.parametrize(
+    "formula",
+    ["y ~ s(x, k=10", "y ~ s(x))", "y s(x)"],
+)
+def test_formula_syntax_error_raises_formula_error(formula):
+    x, y = _linear_data()
+    with pytest.raises(gamfit.errors.FormulaError, match="invalid formula syntax"):
+        gamfit.fit({"y": y, "x": x}, formula, family="gaussian")

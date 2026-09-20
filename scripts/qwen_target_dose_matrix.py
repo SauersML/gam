@@ -280,6 +280,7 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
     import torch
     import gamfit
     from gamfit.torch.harvest import HarvestShard, harvest_output_fisher_factors
+    from gamfit.torch.interventions import kl_and_logit_extent
 
     device = next(model.parameters()).device
     candidate_ids = CALENDAR.candidate_token_ids(tokenizer, task, " ")
@@ -373,7 +374,7 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
             return {
                 "effective_delta": list(plan["delta"]),
                 "exact_directional_nats": exact_directional_nats(_readout, _item["ids"], base_rows[_b], delta),
-                "measured_nats": CALENDAR.full_vocab_kl(base_logits[_b].cpu(), patched.cpu()),
+                "measured_nats": kl_and_logit_extent(base_logits[_b].cpu(), patched.cpu())[0],
                 "certified_attainable_upper_nats": None,
             }
 
@@ -483,7 +484,7 @@ def run_feature(args: argparse.Namespace, model: Any, tokenizer: Any, layer: Any
                         "requested_shift": k,
                         "realized_shift": shift,
                         "predicted_nats": plan["predicted_nats"],
-                        "measured_nats": CALENDAR.full_vocab_kl(base_logits[b].cpu(), patched),
+                        "measured_nats": kl_and_logit_extent(base_logits[b].cpu(), patched)[0],
                     }
                 )
         feature_report["gate4"] = {

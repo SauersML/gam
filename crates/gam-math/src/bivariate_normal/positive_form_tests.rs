@@ -1,6 +1,9 @@
 //! The positive form of `Φ₂` in the negative-correlation lower tail, with a certificate evaluated per call (#2946;
 //! derivation in comments 5721025036, 5721676253, 5721704551 and 5725339297 there).
 //!
+//! A test oracle for [`super::apex_form`]: an exact-real enclosure at about 300 times the apex tree's cost, built on a
+//! different identity, map and arithmetic, so the two share no step that could hide a common error (#3158).
+//!
 //! # Identity
 //!
 //! Shift the origin to the apex, `x = h − s` and `y = k − t`, and integrate the radial direction in closed form:
@@ -11,7 +14,7 @@
 //! - `N(z) = ∫₀^∞ w e^{−zw − w²/2} dw = 1 − z·R(z)`, with `R` Mills' ratio.
 //!
 //! When `ρ ≤ 0` and `α₁, α₂ ≥ 0` every factor is positive. So nothing cancels, and the value keeps its relative digits
-//! however small it is. That is the certified region. The core's `Φ(h)Φ(k) + T` cancels there instead.
+//! however small it is. That is the certified region. A Drezner-Wesolowsky sum `Φ(h)Φ(k) + T` cancels there instead.
 //!
 //! # Map
 //!
@@ -39,20 +42,20 @@
 //! - No other libm function enters. Sines, cosines, `expm1` and `atan` are enclosed by their series, and `log1p` by
 //!   [`certified_ln_1p`], which uses IEEE operations only.
 //! - `N` comes from [`normal_left_tail_ratios`], whose bound covers its argument's interval.
-//! - The rule's node and weight errors come from [`gauss_legendre_certified`].
+//! - The rule's node and weight errors come from [`crate::special::gauss_legendre_certified`].
 //!
 //! The result encloses `Φ₂`. The published value is the enclosure's midpoint, and the rounding its larger distance to
 //! an end.
 
-use super::{BoundedProbability, RoundingContract};
+use super::BoundedProbability;
+use super::apex_form::rule_of_order;
 use crate::probability::normal_left_tail_ratios;
 use crate::roundoff::UNIT_ROUNDOFF;
 use crate::score_opt::{ClosedInterval, certified_ln_1p};
-use crate::special::{CertifiedGaussLegendreRule, gauss_legendre_certified};
 use std::f64::consts::PI;
-use std::sync::{Arc, RwLock};
 
-/// The truncation target relative to the lower bound on `I`: `2ε`, the rounding scale the core order targets.
+/// The truncation target relative to the lower bound on `I`: `2ε`, the rounding scale of a Gauss-Legendre sum whose
+/// weights sum to 2.
 const TRUNCATION_TARGET: f64 = 2.0 * f64::EPSILON;
 
 /// A log-radius admissible for every law in the certified region, so every call can certify at it.
@@ -68,27 +71,6 @@ const ANCHOR_LOG_RADIUS: f64 = 0.2;
 /// already carries at least `u` of its value, so a smaller term is not resolved. The term or tail is added to the
 /// enclosure either way.
 const SERIES_FLOOR: f64 = UNIT_ROUNDOFF * UNIT_ROUNDOFF;
-
-/// The certified rules computed so far, indexed by order. A rule is computed once per order and shared.
-static CERTIFIED_RULES: RwLock<Vec<Option<Arc<CertifiedGaussLegendreRule>>>> = RwLock::new(Vec::new());
-
-fn rule_of_order(order: usize) -> Arc<CertifiedGaussLegendreRule> {
-    let cached = CERTIFIED_RULES
-        .read()
-        .ok()
-        .and_then(|rules| rules.get(order).cloned().flatten());
-    if let Some(rule) = cached {
-        return rule;
-    }
-    let rule = Arc::new(gauss_legendre_certified(order));
-    if let Ok(mut rules) = CERTIFIED_RULES.write() {
-        if rules.len() <= order {
-            rules.resize(order + 1, None);
-        }
-        rules[order] = Some(Arc::clone(&rule));
-    }
-    rule
-}
 
 fn point(value: f64) -> ClosedInterval {
     ClosedInterval::point(value)
@@ -806,20 +788,14 @@ fn bounded(enclosure: ClosedInterval) -> Option<BoundedProbability> {
         .sub(point(value))
         .hi
         .max(point(value).sub(point(enclosure.lo)).hi);
-    Some(BoundedProbability {
-        value,
-        rounding,
-        contract: RoundingContract::Relative,
-    })
+    Some(BoundedProbability { value, rounding })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bivariate_normal::{
-        BIVARIATE_NORMAL_CDF_ERROR_BOUND, bivariate_normal_cdf_with_complement,
-        bivariate_normal_cdf_with_complement_bounded,
-    };
+    use crate::bivariate_normal::bivariate_normal_cdf_with_complement;
+    use crate::probability::{NORMAL_CDF_RELATIVE_ERROR, NORMAL_CDF_UNDERFLOW_FLOOR, normal_cdf_and_pdf};
 
     /// `(h, k, ρ, c, Φ₂)` at exact binary64 laws inside the certified region: fr-kernel's 14 cells with their
     /// `c = (1 − ρ)(1 + ρ)` as formed in binary64, a sweep over `φ₀ ∈ {π/4, 0.2, 0.02}`, `|α| ∈ {0.1, 1, 10, 40}` and
@@ -914,39 +890,42 @@ mod tests {
         (-0.03, -0.03, -0.9999990463256836, 1.9073477233177982e-06),
     ];
 
+    /// The apex tree's bound relative to its value at the references, whose laws reach `ρ = −(1 − 2⁻²⁰)`.
+    const APEX_RELATIVE_BOUND: f64 = 1.0e-12;
+
     fn bounded_at(h: f64, k: f64, rho: f64, complement: f64) -> BoundedProbability {
-        bivariate_normal_cdf_with_complement_bounded(h, k, rho, complement).unwrap()
+        bivariate_normal_cdf_with_complement(h, k, rho, complement).unwrap()
     }
 
     #[test]
-    fn certified_bound_covers_the_references() {
-        let mut absolute_certifies_nothing = false;
+    fn certified_bound_and_apex_tree_cover_the_references() {
+        let mut below_absolute_resolution = false;
         for &(h, k, rho, complement, reference) in REFERENCES {
-            let result = bounded_at(h, k, rho, complement);
-            let error = (result.value - reference).abs();
-            assert!(
-                error <= result.rounding,
-                "({h}, {k}, {rho}, {complement}) value={:e} reference={reference:e} error={error:e} rounding={:e}",
-                result.value,
-                result.rounding
-            );
-            // Where the absolute contract certifies no digit, the entry must deliver the relative one.
-            if reference <= BIVARIATE_NORMAL_CDF_ERROR_BOUND {
-                absolute_certifies_nothing = true;
-                assert_eq!(
-                    result.contract,
-                    RoundingContract::Relative,
-                    "({h}, {k}, {rho}, {complement}) reference={reference:e}"
+            let certified = relative_orthant(h, k, rho, complement).unwrap();
+            let apex = bounded_at(h, k, rho, complement);
+            for (route, result) in [("certified", certified), ("apex", apex)] {
+                let error = (result.value - reference).abs();
+                assert!(
+                    error <= result.rounding,
+                    "{route} ({h}, {k}, {rho}, {complement}) value={:e} reference={reference:e} error={error:e} \
+                     rounding={:e}",
+                    result.value,
+                    result.rounding
                 );
             }
-            if result.contract == RoundingContract::Relative {
-                assert!(result.rounding < BIVARIATE_NORMAL_CDF_ERROR_BOUND);
-                assert!(result.rounding < result.value, "({h}, {k}, {rho}) certifies no digit");
-            }
+            assert!(certified.rounding < certified.value, "({h}, {k}, {rho}) certifies no digit");
+            assert!(
+                apex.rounding <= APEX_RELATIVE_BOUND * apex.value,
+                "({h}, {k}, {rho}) apex rounding={:e} value={:e}",
+                apex.rounding,
+                apex.value
+            );
+            below_absolute_resolution |= reference <= UNIT_ROUNDOFF;
         }
+        // An absolute bound on a probability is at least the unit roundoff, the rounding of a value near one.
         assert!(
-            absolute_certifies_nothing,
-            "some reference must lie below the absolute bound, where only the relative contract resolves it"
+            below_absolute_resolution,
+            "some reference must lie below the unit roundoff, where only a relative bound resolves it"
         );
     }
 
@@ -1004,7 +983,7 @@ mod tests {
     }
 
     #[test]
-    fn outside_the_certified_region_the_value_is_the_core_bit_for_bit() {
+    fn outside_the_certified_region_the_oracle_declines_and_the_apex_tree_keeps_the_complementary_identity() {
         let mut cells: Vec<(f64, f64, f64, f64)> = SUBNORMAL_DENSITY.to_vec();
         cells.extend([
             // ρ > 0.
@@ -1021,19 +1000,34 @@ mod tests {
             (-1.0, f64::INFINITY, -0.5, 0.75),
         ]);
         for &(h, k, rho, complement) in &cells {
-            let result = bounded_at(h, k, rho, complement);
-            let plain = bivariate_normal_cdf_with_complement(h, k, rho, complement).unwrap();
-            assert_eq!(result.contract, RoundingContract::Absolute, "({h}, {k}, {rho}, {complement})");
-            assert_eq!(result.rounding, BIVARIATE_NORMAL_CDF_ERROR_BOUND);
-            assert_eq!(result.value.to_bits(), plain.to_bits(), "({h}, {k}, {rho}, {complement})");
+            assert!(relative_orthant(h, k, rho, complement).is_none(), "({h}, {k}, {rho}, {complement})");
+            // `Φ₂(h, k; ρ) + Φ₂(h, −k; −ρ) = Φ(h)`. A constraint active in one orthant is inactive in the other, so the
+            // two take different branches of the tree. The sum adds its rounding, and `Φ(h)` its own.
+            let apex = bounded_at(h, k, rho, complement);
+            let mirror = bounded_at(h, -k, -rho, complement);
+            let total = apex.value + mirror.value;
+            let marginal = normal_cdf_and_pdf(h).0;
+            let allowance = apex.rounding
+                + mirror.rounding
+                + UNIT_ROUNDOFF * total
+                + NORMAL_CDF_RELATIVE_ERROR * marginal
+                + NORMAL_CDF_UNDERFLOW_FLOOR;
+            assert!(
+                (total - marginal).abs() <= allowance,
+                "({h}, {k}, {rho}, {complement}) apex={:e}±{:e} mirror={:e}±{:e} Φ(h)={marginal:e}",
+                apex.value,
+                apex.rounding,
+                mirror.value,
+                mirror.rounding
+            );
         }
-        assert!(bivariate_normal_cdf_with_complement_bounded(0.0, 0.0, -0.5, -1.0e-3).is_err());
-        assert!(bivariate_normal_cdf_with_complement_bounded(f64::NAN, 0.0, -0.5, 0.75).is_err());
+        assert!(bivariate_normal_cdf_with_complement(0.0, 0.0, -0.5, -1.0e-3).is_err());
+        assert!(bivariate_normal_cdf_with_complement(f64::NAN, 0.0, -0.5, 0.75).is_err());
     }
 
     #[test]
     fn the_cited_libm_is_the_locked_one() {
-        // `exp_enclosure` rests on the error analysis of this libm release.
+        // `exp_enclosure` and the apex tree's `exp` rest on the error analysis of this libm release.
         let lock = include_str!("../../../../Cargo.lock");
         assert!(lock.contains("name = \"libm\"\nversion = \"0.2.16\"\n"), "Cargo.lock no longer pins libm 0.2.16");
     }
