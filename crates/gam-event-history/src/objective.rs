@@ -3,6 +3,16 @@ use super::*;
 use crate::scalar::{Rows, TANGENT_WIDTH};
 use gam_model_api::families::custom_family::ExactNewtonJointHessianWorkspace;
 use gam_problem::EvalMode;
+use std::ops::Range;
+
+/// One block pair of [`EventHistoryFamily::coordinate_hessian`]: the value,
+/// the gradient along the column block and the row-major second-derivative
+/// block between the row and column blocks.
+struct BlockPair<S> {
+    value: S,
+    gradient: Vec<S>,
+    block: Vec<S>,
+}
 
 impl EventHistoryFamily {
     fn reference_values<S: JetField>(
@@ -135,62 +145,92 @@ impl EventHistoryFamily {
     pub(super) fn coordinate_hessian<S: JetField + Send + Sync>(
         &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
     ) -> Result<(S, Vec<S>, Vec<S>), EventHistoryError> {
-        // Fewer coordinates than a full block run on the narrowest width that
-        // holds them in one: a channel seeded with no coordinate is identically
-        // zero, and each level of `Rows<Rows<S, W>, W>` costs `1 + W` channels.
-        // Any width gives the same entries bit for bit ([`TANGENT_WIDTH`]).
-        match coordinates.len() {
-            0 => Ok((self.path_value(states, beta)?, Vec::new(), Vec::new())),
-            1 => self.coordinate_hessian_at::<S, 1>(states, beta, coordinates),
-            2 => self.coordinate_hessian_at::<S, 2>(states, beta, coordinates),
-            3 | 4 => self.coordinate_hessian_at::<S, 4>(states, beta, coordinates),
-            _ => self.coordinate_hessian_at::<S, TANGENT_WIDTH>(states, beta, coordinates),
-        }
-    }
-
-    /// [`Self::coordinate_hessian`] over blocks of `W` coordinates.
-    fn coordinate_hessian_at<S: JetField + Send + Sync, const W: usize>(
-        &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
-    ) -> Result<(S, Vec<S>, Vec<S>), EventHistoryError> {
         let width = coordinates.len();
+        if width == 0 {
+            return Ok((self.path_value(states, beta)?, Vec::new(), Vec::new()));
+        }
         let zero = beta[0].constant_like(0.0);
         let mut value = zero.clone();
         let mut gradient = vec![zero.clone(); width];
         let mut hessian = vec![zero; width * width];
-        let tangents = |q: usize, start: usize| -> [f64; W] {
-            std::array::from_fn(|k| f64::from(coordinates.get(start + k) == Some(&q)))
-        };
+        let blocks: Vec<Range<usize>> = (0..width).step_by(TANGENT_WIDTH)
+            .map(|start| start..(start + TANGENT_WIDTH).min(width))
+            .collect();
         // The block pairs are independent path evaluations, run together so
         // one pair's serial reference evolution overlaps the others' work.
-        let pairs: Vec<(usize, usize)> = (0..width.div_ceil(W))
-            .flat_map(|a| (0..=a).map(move |b| (a * W, b * W)))
+        let pairs: Vec<(Range<usize>, Range<usize>)> = blocks.iter().enumerate()
+            .flat_map(|(a, rows)| blocks[..=a].iter().map(move |columns| (rows.clone(), columns.clone())))
             .collect();
-        let results: Vec<Result<Rows<Rows<S, W>, W>, EventHistoryError>> =
-            pairs.par_iter().map(|&(rows, columns)| {
-                let seeded: Vec<Rows<Rows<S, W>, W>> = beta.iter().enumerate()
-                    .map(|(q, coefficient)| Rows::seed(
-                        Rows::seed(coefficient.clone(), tangents(q, columns)), tangents(q, rows)))
-                    .collect();
-                self.path_value(states, &seeded)
-            }).collect();
-        for (&(rows, columns), result) in pairs.iter().zip(results) {
+        let results: Vec<Result<BlockPair<S>, EventHistoryError>> = pairs.par_iter()
+            .map(|(rows, columns)| self.block_pair(states, beta, coordinates, rows.clone(), columns.clone()))
+            .collect();
+        for ((rows, columns), result) in pairs.iter().zip(results) {
             let result = result?;
-            for l in 0..W.min(width - columns) {
-                gradient[columns + l] = result.base.rows[l].clone();
+            for (l, j) in columns.clone().enumerate() {
+                gradient[j] = result.gradient[l].clone();
             }
-            for k in 0..W.min(width - rows) {
-                let i = rows + k;
+            for (k, i) in rows.clone().enumerate() {
                 // Within a diagonal block only `j ≤ i` is read, so each
                 // mirrored pair comes from one channel.
-                for l in 0..W.min(width - columns).min(i + 1 - columns) {
-                    let j = columns + l;
-                    hessian[i * width + j] = result.rows[k].rows[l].clone();
-                    hessian[j * width + i] = result.rows[k].rows[l].clone();
+                for (l, j) in columns.clone().take_while(|&j| j <= i).enumerate() {
+                    let entry = &result.block[k * columns.len() + l];
+                    hessian[i * width + j] = entry.clone();
+                    hessian[j * width + i] = entry.clone();
                 }
             }
-            value = result.base.base;
+            value = result.value;
         }
         Ok((value, gradient, hessian))
+    }
+
+    /// One block pair of [`Self::coordinate_hessian`] on the narrowest jet
+    /// widths holding it. Only the last block is shorter than
+    /// `TANGENT_WIDTH`, so a pair is (full, full), (short, full) or
+    /// (short, short); a short block runs on the narrowest of 1, 2 and 4 that
+    /// holds it. A channel seeded with no coordinate is identically zero, each
+    /// level of `Rows<Rows<S, C>, R>` costs `1 + W` channels, and any width
+    /// gives the same entries bit for bit ([`TANGENT_WIDTH`]).
+    fn block_pair<S: JetField + Send + Sync>(
+        &self, states: &[ParameterBlockState], beta: &[S], coordinates: &[usize],
+        rows: Range<usize>, columns: Range<usize>,
+    ) -> Result<BlockPair<S>, EventHistoryError> {
+        const FULL: usize = TANGENT_WIDTH;
+        let args = (states, beta, coordinates, rows.clone(), columns.clone());
+        match (rows.len(), columns.len() == FULL) {
+            (1, true) => self.block_pair_at::<S, 1, FULL>(args),
+            (2, true) => self.block_pair_at::<S, 2, FULL>(args),
+            (3 | 4, true) => self.block_pair_at::<S, 4, FULL>(args),
+            (_, true) => self.block_pair_at::<S, FULL, FULL>(args),
+            (1, false) => self.block_pair_at::<S, 1, 1>(args),
+            (2, false) => self.block_pair_at::<S, 2, 2>(args),
+            (3 | 4, false) => self.block_pair_at::<S, 4, 4>(args),
+            (_, false) => self.block_pair_at::<S, FULL, FULL>(args),
+        }
+    }
+
+    /// [`Self::block_pair`] over `Rows<Rows<S, C>, R>`: the outer level
+    /// carries the `rows` coordinates, the inner level the `columns`.
+    fn block_pair_at<S: JetField + Send + Sync, const R: usize, const C: usize>(
+        &self,
+        (states, beta, coordinates, rows, columns): (
+            &[ParameterBlockState], &[S], &[usize], Range<usize>, Range<usize>),
+    ) -> Result<BlockPair<S>, EventHistoryError> {
+        fn tangents<const W: usize>(coordinates: &[usize], block: &Range<usize>, q: usize) -> [f64; W] {
+            std::array::from_fn(|k| f64::from(coordinates[block.clone()].get(k) == Some(&q)))
+        }
+        let seeded: Vec<Rows<Rows<S, C>, R>> = beta.iter().enumerate()
+            .map(|(q, coefficient)| Rows::seed(
+                Rows::seed(coefficient.clone(), tangents::<C>(coordinates, &columns, q)),
+                tangents::<R>(coordinates, &rows, q)))
+            .collect();
+        let result = self.path_value(states, &seeded)?;
+        Ok(BlockPair {
+            gradient: result.base.rows[..columns.len()].to_vec(),
+            block: result.rows[..rows.len()].iter()
+                .flat_map(|row| row.rows[..columns.len()].iter().cloned())
+                .collect(),
+            value: result.base.base,
+        })
     }
 
     /// The value, the gradient and `H v` of the computed log-likelihood along
