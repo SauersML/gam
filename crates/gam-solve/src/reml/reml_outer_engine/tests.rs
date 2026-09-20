@@ -1405,15 +1405,17 @@ pub(crate) fn batched_penalty_subspace_traces_match_exact_kernel_on_ill_conditio
 //
 // When a linear-inequality active set (from a `monotone_decreasing` /
 // `convex` / `concave` shape constraint binding on the data) reduces the
-// inner solve onto a free subspace `β = z β_f`, the penalty coordinates
-// must be projected onto the SAME subspace. Otherwise `InnerSolutionBuilder::
+// inner solve onto an active face `β = z β_f + c`, the penalty coordinates
+// must be restricted to the SAME face. Otherwise `InnerSolutionBuilder::
 // build` trips its `assert_eq!(coord.dim(), beta.len())` — the panic the
 // released gamfit surfaced as `fit_table panicked inside Rust boundary`.
 //
-// This locks the core invariant directly: projecting a full-dimension
-// penalty coordinate onto an orthonormal free basis `z` (p × m, m < p)
-// yields a coordinate of dimension `m` (matching the reduced `β`), and the
-// quadratic form is preserved exactly: `βᵀ S β = β_fᵀ (zᵀ S z) β_f`.
+// This locks the dimension invariant directly: restricting a full-dimension
+// penalty coordinate to a face with orthonormal basis `z` (p × m, m < p)
+// yields a coordinate of dimension `m` (matching the reduced `β`). On a face
+// through the origin (`c = 0`) the quadratic form is preserved exactly:
+// `βᵀ S β = β_fᵀ (zᵀ S z) β_f`. The offset face `c ≠ 0` is covered by the
+// #4170 tests in `gam-problem`'s `penalty_coordinate`.
 #[test]
 pub(crate) fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form() {
     // Full-space penalty root R (rank-deficient, like a smoothing penalty):
@@ -1438,18 +1440,18 @@ pub(crate) fn penalty_coord_projection_reduces_dim_and_preserves_quadratic_form(
         [0.0, 0.0],
     ];
 
-    let projected = coord.project_into_subspace(&z);
+    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
+    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
+    // restricted coordinate.
+    let beta_f = array![0.7, -1.3];
+    let beta_full = z.dot(&beta_f);
+
+    let projected = coord.restrict_to_face(&z, beta_full.view());
     assert_eq!(
         projected.dim(),
         z.ncols(),
-        "projected penalty coordinate dim must equal the reduced beta length"
+        "restricted penalty coordinate dim must equal the reduced beta length"
     );
-
-    // Quadratic-form preservation: with β = z·β_f, the full-space penalty
-    // βᵀSβ must equal the reduced β_fᵀ (zᵀSz) β_f computed by the
-    // projected coordinate.
-    let beta_f = array![0.7, -1.3];
-    let beta_full = z.dot(&beta_f);
 
     let s_beta_full = coord.apply_penalty(&beta_full, 1.0);
     let full_quadratic = beta_full.dot(&s_beta_full);
