@@ -109,7 +109,7 @@ impl PyFittedModel {
         if let Some(summary) = self.summary.get() {
             return Ok(summary);
         }
-        let summary = summary_payload_value(&self.model).map_err(PyValueError::new_err)?;
+        let summary = summary_payload_value(&self.model)?;
         Ok(self.summary.get_or_init(|| summary))
     }
 }
@@ -4455,7 +4455,7 @@ fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
         let model =
             load_model_impl(&model_bytes).map_err(|err| saved_model_error_to_pyerr(fit.py(), err))?;
-        let summary = summary_payload_value(&model).map_err(PyValueError::new_err)?;
+        let summary = summary_payload_value(&model)?;
         return Ok(RemlFitView::SavedSummary(summary));
     }
     if fit.hasattr("_prediction_model")? {

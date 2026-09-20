@@ -158,21 +158,10 @@ use std::path::Path;
 // whose decision is now the null tail against its design rate instead of the sign of
 // `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
 // recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
-// v35 carries the constant variance stage in the latent-Z calibration's first-stage
-// covariance (`theta1_cov`, gam#3030): a fit whose variance stage does not fire now
-// records the `(p+2)²` joint covariance, with the variance row and column, where v34
-// recorded `(p+1)²`. A v34 payload still loads and predicts; its generated-regressor
-// correction refuses the narrower covariance by name, so no interval is published
-// without the stage.
-pub const MODEL_PAYLOAD_VERSION: u32 = 35;
-
-/// The schema before the constant variance stage in the first-stage covariance
-/// (gam#3030), whose only difference is that covariance's width.
-const CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION: u32 = 34;
+pub const MODEL_PAYLOAD_VERSION: u32 = 34;
 
 /// The schema before the closed-form certificate's null law (gam#2926), whose only
-/// difference from [`CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION`] is those fields'
-/// absence.
+/// difference is those fields' absence.
 const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
 
 /// The schema before the full-conformal penalty count (gam#3296), whose only difference
@@ -249,9 +238,8 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
     MODEL_PAYLOAD_VERSION,
-    CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
     CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -7955,7 +7943,6 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -7978,11 +7965,7 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
-        assert_eq!(
-            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
-            CONSTANT_VARIANCE_STAGE_ABSENT_PAYLOAD_VERSION - 1
-        );
+        assert_eq!(CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
         assert_eq!(
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
@@ -8661,6 +8644,44 @@ mod tests {
                 .is_none_or(|reason| !reason.contains("smoothing parameters")),
             "a fit whose λ index the rebuilt layout must pass the check: {:?}",
             current.smooth_terms_unavailable
+        );
+    }
+
+    /// A summary refusal keeps the category of the step that refused
+    /// (gam#4471). A saved model without its canonical fit result is a saved
+    /// payload the binary cannot summarize — a data refusal the caller fixes by
+    /// refitting — and it must reach the front ends as that, not as the
+    /// untyped string every front end then had to classify on its own (the
+    /// Python layer re-raised it as a `FormulaError`).
+    #[test]
+    fn a_summary_refusal_keeps_its_engine_category_4471() {
+        let payload = FittedModelPayload::new(
+            MODEL_PAYLOAD_VERSION,
+            "y ~ x".to_string(),
+            ModelKind::Standard,
+            FittedFamily::Standard {
+                likelihood: LikelihoodSpec::binomial_probit(),
+                link: Some(StandardLink::Probit),
+                latent_cloglog_state: None,
+                mixture_state: None,
+                sas_state: None,
+            },
+            "binomial".to_string(),
+        );
+        assert!(payload.fit_result.is_none());
+        let err = crate::inference::saved_summary::saved_model_summary(&FittedModel::from_payload(
+            payload,
+        ))
+        .expect_err("a model without its fit result has no summary");
+        assert_eq!(
+            err.error_category(),
+            gam_problem::ErrorCategory::Data,
+            "a missing saved fit result is a data refusal, not a formula error: {err}"
+        );
+        assert!(
+            matches!(err, gam_solve::model_types::EstimationError::InvalidInput(ref reason)
+                if reason.contains("fit_result")),
+            "the refusal must name the missing payload field: {err:?}"
         );
     }
 }

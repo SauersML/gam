@@ -4063,7 +4063,8 @@ fn resolve_average_derivative_column(
 #[pyfunction]
 fn summary_payload_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -> PyResult<PyObject> {
     let serde_json::Value::Object(items) = model.summary_value()? else {
-        return Err(py_value_error(
+        return Err(category_error(
+            gam::ErrorCategory::Internal,
             "model summary payload must be a JSON object".to_string(),
         ));
     };
@@ -4086,7 +4087,8 @@ fn summary_payload_from_model(py: Python<'_>, model: PyRef<'_, PyFittedModel>) -
 
 /// `covariance_flat` reshaped to its `covariance_n` side. JSON has no
 /// non-finite numbers, so serde writes a non-finite entry as `null`; it reads
-/// back as NaN.
+/// back as NaN. The pair is the one this binding serialized from the typed
+/// summary a moment earlier, so a malformed pair is an internal error.
 fn summary_covariance_matrix(
     side: Option<&serde_json::Value>,
     flat: &serde_json::Value,
@@ -4098,7 +4100,10 @@ fn summary_covariance_matrix(
         .and_then(serde_json::Value::as_u64)
         .and_then(|side| usize::try_from(side).ok())
         .ok_or_else(|| {
-            py_value_error("summary covariance_flat is present without covariance_n".to_string())
+            category_error(
+                gam::ErrorCategory::Internal,
+                "summary covariance_flat is present without covariance_n".to_string(),
+            )
         })?;
     let entries = flat
         .iter()
@@ -4106,16 +4111,20 @@ fn summary_covariance_matrix(
         .map(|(idx, value)| match value {
             serde_json::Value::Null => Ok(f64::NAN),
             _ => value.as_f64().ok_or_else(|| {
-                py_value_error(format!("summary covariance_flat[{idx}] must be a JSON number"))
+                category_error(
+                    gam::ErrorCategory::Internal,
+                    format!("summary covariance_flat[{idx}] must be a JSON number"),
+                )
             }),
         })
         .collect::<PyResult<Vec<f64>>>()?;
     Array2::from_shape_vec((side, side), entries)
         .map(Some)
         .map_err(|err| {
-            py_value_error(format!(
-                "summary covariance_flat does not fill a {side}x{side} matrix: {err}"
-            ))
+            category_error(
+                gam::ErrorCategory::Internal,
+                format!("summary covariance_flat does not fill a {side}x{side} matrix: {err}"),
+            )
         })
 }
 
@@ -4165,13 +4174,26 @@ fn model_deployment_extensions(py: Python<'_>, model: PyRef<'_, PyFittedModel>) 
 /// The saved-model summary as a JSON value, built from the typed model, with its
 /// rendered text under `"text"`: the one Rust renderer `gam summary` prints, so
 /// `str(model.summary())` is that same string.
-fn summary_payload_value(model: &FittedModel) -> Result<serde_json::Value, String> {
-    let summary = saved_model_summary(model)?;
+///
+/// A refusal from the engine keeps its typed category across the boundary
+/// (gam#4471): the summary's `EstimationError` goes through
+/// [`estimation_error_to_pyerr`], never a bare `ValueError` that the Python
+/// layer would have to guess a class for. The payload is a struct the binding
+/// serializes itself, so a serialization failure is an internal error.
+fn summary_payload_value(model: &FittedModel) -> PyResult<serde_json::Value> {
+    let summary = saved_model_summary(model).map_err(estimation_error_to_pyerr)?;
     let text = render_summary_text(&summary);
-    let mut value = serde_json::to_value(&summary)
-        .map_err(|err| format!("failed to serialize summary: {err}"))?;
+    let mut value = serde_json::to_value(&summary).map_err(|err| {
+        category_error(
+            gam::ErrorCategory::Internal,
+            format!("failed to serialize summary: {err}"),
+        )
+    })?;
     let serde_json::Value::Object(fields) = &mut value else {
-        return Err("model summary payload must be a JSON object".to_string());
+        return Err(category_error(
+            gam::ErrorCategory::Internal,
+            "model summary payload must be a JSON object".to_string(),
+        ));
     };
     fields.insert("text".to_string(), serde_json::Value::String(text));
     Ok(value)
