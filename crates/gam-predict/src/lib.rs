@@ -545,11 +545,11 @@ pub trait UncertaintyCovarianceSource {
         family: &LikelihoodSpec,
     ) -> Result<Option<FittedLinkState>, EstimationError>;
     /// Gaussian residual standard deviation used to widen observation
-    /// intervals for `ResponseFamily::Gaussian`. Raw-covariance sources
-    /// report `0.0`, which collapses the observation interval to the mean
-    /// interval (the only safe default when no dispersion is available).
-    fn observation_standard_deviation(&self) -> f64 {
-        0.0
+    /// intervals for `ResponseFamily::Gaussian`. Raw covariance carries no
+    /// residual scale and returns `None`; its Gaussian observation band is
+    /// omitted rather than mislabeled as a mean interval.
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        None
     }
     /// Fitted dispersion/precision hint used to widen observation intervals for
     /// dispersion-bearing families (Tweedie, Gamma, Beta). Raw covariance alone
@@ -595,8 +595,8 @@ impl UncertaintyCovarianceSource for UnifiedFitResult {
     ) -> Result<Option<FittedLinkState>, EstimationError> {
         UnifiedFitResult::fitted_link_state(self, family).map(Some)
     }
-    fn observation_standard_deviation(&self) -> f64 {
-        self.standard_deviation
+    fn observation_standard_deviation(&self) -> Option<f64> {
+        Some(self.standard_deviation)
     }
     fn observation_phi(&self) -> Option<f64> {
         self.likelihood_scale.fixed_phi()
@@ -2344,11 +2344,10 @@ where
     // The only fallible input: a Gaussian prior weight with no finite
     // observation variance is refused before any family law is evaluated.
     let gaussian_noise = match response {
-        ResponseFamily::Gaussian => Some(gaussian_observation_variance_per_row(
-            source.observation_standard_deviation().powi(2),
-            n,
-            prior_weights,
-        )?),
+        ResponseFamily::Gaussian => source
+            .observation_standard_deviation()
+            .map(|sd| gaussian_observation_variance_per_row(sd.powi(2), n, prior_weights))
+            .transpose()?,
         _ => None,
     };
     let variance = || match response {
@@ -3498,6 +3497,12 @@ mod tests {
             nb_raw.observation_lower.is_none() && nb_raw.observation_upper.is_none(),
             "bare Vb must not build an estimated-NB observation interval from the seed theta"
         );
+    
+        let gaussian = gam_spec::LikelihoodSpec::gaussian_identity();
+        let output = predict_gamwith_uncertainty(x.view(), beta.view(), offset.view(), gaussian.clone(), &covariance, &options).unwrap();
+        assert!(output.observation_lower.is_none() && output.observation_upper.is_none());
+        let error = predictive_standard_error(&gaussian, &array![0.0], &array![0.1], &covariance).expect_err("raw covariance has no Gaussian residual scale");
+        assert!(error.to_string().contains("requires fitted observation-scale dispersion"), "{error}");
     }
 
     #[test]
