@@ -19,7 +19,7 @@ use gam_linalg::matrix::DesignMatrix;
 use gam_problem::laplace_sampler_contract::{
     AxisBreakpoint, BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments,
     BlockQuadratureOrderRefusal, BlockQuadratureOrderStep, BlockQuadratureRefusal,
-    CompositeAxisMarginal, LaplaceMarginalCorrector, set_laplace_marginal_corrector,
+    CompositeAxisMarginal, CompositeNode, LaplaceMarginalCorrector, set_laplace_marginal_corrector,
 };
 use gam_problem::{InverseLink, LikelihoodSpec, ResponseFamily, StandardLink};
 use gam_solve::estimate::{ExternalOptimOptions, evaluate_externalgradient};
@@ -129,6 +129,11 @@ impl LaplaceMarginalCorrector for RuleRecorder {
             .map(|marginal| CompositeAxisMarginal {
                 marginal,
                 breakpoints: Vec::new(),
+                // The mode, where the excess is zero: the rule a zero splice integrates.
+                nodes: vec![CompositeNode {
+                    z: 0.0,
+                    ln_weight: 0.0,
+                }],
             })
             .map_err(|cause| BlockQuadratureOrderRefusal {
                 axis: 0,

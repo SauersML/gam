@@ -117,8 +117,12 @@ pub(crate) fn outer_decrement_bands(
         tau_stat,
         band_f: objective_band.total(),
     };
+    // Two quantities, two fields (#3012): the verdict's bar is the tolerance,
+    // and `objective` is the rounding band, which opt echoes as the evidence's
+    // `band_f` for every reader that asks whether a change in `V` is real.
     let bands = opt::DecrementBands {
-        objective: tolerance.value(),
+        objective: objective_band.total(),
+        tolerance: tolerance.value(),
         gradient: gradient_band,
         hessian: growth * frobenius,
     };
@@ -350,7 +354,7 @@ pub(crate) struct OuterDecrementDecision {
 /// A certificate records a gradient bound beside `|Pg|`, so the verdict is
 /// rendered as the gradient norm along the measured direction at which the
 /// decrement reaches the verdict's tolerance with the measured rounding held
-/// fixed: `|Pg|·√((tol − band_λ²)/λ̂²)`, where `tol` is the evidence's `band_f`
+/// fixed: `|Pg|·√((tol − band_λ²)/λ̂²)`, where `tol` is the evidence's `tolerance`
 /// field, the tolerance [`DecrementTolerance::value`] handed to the verdict. It clears `|Pg|` exactly when the verdict
 /// certifies and falls strictly below it on `DecrementAboveTolerance`. A verdict
 /// that cannot decide publishes `0`, so the point refuses unless large-step
@@ -363,7 +367,7 @@ pub(crate) fn decrement_stationarity_bound(
     verdict: &opt::DecrementVerdict,
 ) -> Option<(f64, StationarityBoundSource)> {
     let along_direction = |evidence: &opt::DecrementEvidence| {
-        let headroom = evidence.band_f - evidence.band_lambda_sq;
+        let headroom = evidence.tolerance - evidence.band_lambda_sq;
         if !(headroom > 0.0) {
             0.0
         } else if evidence.lambda_sq > 0.0 {

@@ -369,6 +369,15 @@ pub struct QuadratureMarginalAudit {
     /// block membership is differencing two different functions and its
     /// quotient is not a derivative of either.
     pub block_cols: Vec<usize>,
+    /// Per separately integrated piece, whether it was integrated on a feasible
+    /// interval with at least one finite end
+    /// (`BlockExcessTarget::axis_truncation`), so its ends, transported nodes
+    /// and mass `ln Z` move with ρ.
+    pub truncated_pieces: Vec<bool>,
+    /// Per separately integrated piece, whether its latched rule is the composite
+    /// Gauss–Kronrod partition (`LatchedPieceRule::Composite`) rather than a
+    /// Gauss–Hermite rule.
+    pub composite_pieces: Vec<bool>,
     /// Channel (a), `∂Δ_b/∂ρ_j` — the corrector's explicit penalty-score channel,
     /// raw.
     pub explicit_a: Vec<f64>,
@@ -630,8 +639,11 @@ pub(crate) fn record_certificate_inner_factor(factor: InnerFactorCondition) {
 }
 
 /// Publish the inner-mode error an evaluation's value carries to an armed
-/// capture (no-op when disarmed).
-pub(crate) fn record_certificate_inner_residual(charge: InnerResidualCharge) {
+/// capture (no-op when disarmed). Public for the reason
+/// [`record_certificate_parts`] is: without it an outer objective outside this
+/// crate forms no objective band, and every comparison of its values falls back
+/// to the criterion's statistical resolution (#3340).
+pub fn record_certificate_inner_residual(charge: InnerResidualCharge) {
     CERTIFICATE_EVIDENCE.with(|slot| {
         if let Some(state) = slot.borrow_mut().as_mut() {
             state.inner_residual = Some(charge);

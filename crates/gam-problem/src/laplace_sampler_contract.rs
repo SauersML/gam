@@ -272,6 +272,20 @@ pub struct CompositeAxisMarginal {
     pub marginal: BlockQuadratureMarginal,
     /// The partition's interior breakpoints, increasing.
     pub breakpoints: Vec<AxisBreakpoint>,
+    /// The rule's nodes, cell by cell, so a second-order pass differentiates the
+    /// very rule whose value and gradient this is.
+    pub nodes: Vec<CompositeNode>,
+}
+
+/// One node of a composite axis rule (#784): its position `z = √λ·t` on the
+/// oriented standardized axis and `ln(w_K ψ)`, its Kronrod weight times the
+/// standard-normal mass `h·φ(z)·dz/dv` it carries on its cell. The value is
+/// `ln Σ w_K ψ e^{−ΔF(z/√λ)} − ln Σ w_K ψ`. A latched partition fixes every `z`
+/// and weight, so they do not move with ρ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CompositeNode {
+    pub z: f64,
+    pub ln_weight: f64,
 }
 
 // ───────────────────────── pure threshold math (moved down) ──────────────────

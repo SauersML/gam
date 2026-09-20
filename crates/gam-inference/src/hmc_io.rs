@@ -6998,7 +6998,7 @@ fn cubic_power_iteration_refinement(
 // constructs these types under their original names via this re-export.
 pub use gam_problem::laplace_sampler_contract::{
     AxisBreakpoint, BlockExcessTarget, BlockQuadratureMarginal, BlockQuadratureMoments,
-    BlockQuadratureOrderRefusal, BlockQuadratureRefusal, CompositeAxisMarginal,
+    BlockQuadratureOrderRefusal, BlockQuadratureRefusal, CompositeAxisMarginal, CompositeNode,
     LaplaceTrustworthiness, laplace_skewness_threshold,
     laplace_trustworthiness_from_skewness,
 };
@@ -8586,6 +8586,15 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
         ));
     }
     let breakpoints = cells.iter().skip(1).map(|cell| cell.lower).collect();
+    let nodes = cells
+        .iter()
+        .flat_map(|cell| {
+            (0..rule.len()).map(|i| CompositeNode {
+                z: cell.z[i],
+                ln_weight: rule.ln_kronrod_weights[i] + cell.ln_psi[i],
+            })
+        })
+        .collect();
     log::debug!(
         "[#784] composite Gauss–Kronrod axis: Δ={:.6e}, error {:.4e} over {} cells ({node_count} \
          nodes)",
@@ -8606,6 +8615,7 @@ fn composite_axis_marginal_correction_in_chunks<T: BlockExcessTarget + ?Sized>(
             moments: Some(moments),
         },
         breakpoints,
+        nodes,
     })
 }
 
