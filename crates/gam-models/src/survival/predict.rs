@@ -2082,54 +2082,125 @@ impl CompetingRisksPredictResult {
 
 /// Harrell's concordance index (C-index) of a survival risk score against
 /// held-out outcomes. A larger `risk[i]` must predict a SHORTER survival time
-/// (higher hazard). Over every orderable pair — pairs whose earlier observed
-/// time is a genuine event, so the failure ordering is observed — a pair is
-/// concordant when the earlier-failing subject carries the larger risk; equal
-/// risks score half credit. `C = (concordant + 0.5·tied) / comparable`.
-/// `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
+/// (higher hazard). A pair is comparable exactly when its failure ordering is
+/// observed: subject `a` had an event (`event[a] > 0.5`) and subject `b` was
+/// still at risk afterwards — either `time[b] > time[a]`, or `time[b] ==
+/// time[a]` with `b` censored (a censoring recorded at a death time happened
+/// after the death). Two events at the same time are NOT comparable: neither
+/// failed first, so the pair carries no ordering information. A comparable pair
+/// is concordant when the earlier-failing subject carries the larger risk;
+/// equal risks score half credit. `C = (concordant + 0.5·tied_risk) /
+/// comparable`. `C = 0.5` is random ranking, `C = 1.0` a perfect ordering.
 ///
-/// This is the standard discrimination metric (`survival::concordance`,
-/// `lifelines.utils.concordance_index`, scikit-survival `concordance_index_censored`).
+/// These are the pair rules of `survival::concordance`,
+/// `lifelines.utils.concordance_index` and scikit-survival
+/// `concordance_index_censored`.
+///
+/// Evaluated in `O(n log n)`: subjects are swept in descending time order one
+/// tie block at a time against a Fenwick tree of the risk ranks of every subject
+/// observed strictly later. A block's censored subjects enter the tree before
+/// its events are queried (they are comparable partners of those events) and
+/// its events enter after (tied events are not partners of each other). Counts
+/// are exact integers, so the value equals the pair-loop definition exactly.
+///
 /// `time`, `event` (1 = event, 0 = censored), and `risk` must share length `n`.
-/// Returns `None` if there are no comparable pairs (e.g. all rows censored).
+/// Returns `None` on a length mismatch, on any non-finite `time`, `event` or
+/// `risk` (the ordering of such a row is undefined), or when there are no
+/// comparable pairs
+/// (e.g. all rows censored).
 pub fn harrell_concordance(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
     let n = time.len();
     if n != event.len() || n != risk.len() {
         return None;
     }
-    let mut comparable = 0.0_f64;
-    let mut concordant = 0.0_f64;
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let (early, late) = if time[i] < time[j] {
-                (i, j)
-            } else if time[j] < time[i] {
-                (j, i)
-            } else {
-                // Tied times are comparable only if both failed; such a pair is a
-                // pure tie (no strict outcome ordering).
-                if event[i] > 0.5 && event[j] > 0.5 {
-                    comparable += 1.0;
-                    concordant += 0.5;
-                }
-                continue;
-            };
-            if event[early] < 0.5 {
-                // The earlier subject was censored: the true ordering is unknown.
-                continue;
-            }
-            comparable += 1.0;
-            if risk[early] > risk[late] {
-                concordant += 1.0;
-            } else if risk[early] == risk[late] {
-                concordant += 0.5;
-            }
-        }
-    }
-    if comparable == 0.0 {
+    if time
+        .iter()
+        .chain(event)
+        .chain(risk)
+        .any(|value| !value.is_finite())
+    {
         return None;
     }
-    Some(concordant / comparable)
+    let mut levels = risk.to_vec();
+    levels.sort_by(f64::total_cmp);
+    levels.dedup();
+    let rank_of = |value: f64| levels.partition_point(|&level| level < value);
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by(|&a, &b| time[a].total_cmp(&time[b]));
+
+    let mut later = RiskRankCounts::new(levels.len());
+    let mut comparable: u64 = 0;
+    // Twice the concordance numerator: 2 per concordant pair, 1 per risk tie.
+    let mut concordant_halves: u64 = 0;
+    let mut block_end = n;
+    while block_end > 0 {
+        let block_time = time[order[block_end - 1]];
+        let mut block_start = block_end - 1;
+        while block_start > 0 && time[order[block_start - 1]] == block_time {
+            block_start -= 1;
+        }
+        let block = &order[block_start..block_end];
+        for &row in block {
+            if event[row] <= 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                let rank = rank_of(risk[row]);
+                let below = later.count_below(rank);
+                let tied = later.count_below(rank + 1) - below;
+                comparable += later.total;
+                concordant_halves += 2 * below + tied;
+            }
+        }
+        for &row in block {
+            if event[row] > 0.5 {
+                later.insert(rank_of(risk[row]));
+            }
+        }
+        block_end = block_start;
+    }
+    if comparable == 0 {
+        return None;
+    }
+    Some(concordant_halves as f64 / (2.0 * comparable as f64))
+}
+
+/// Fenwick (binary indexed) tree counting inserted risk ranks, for
+/// [`harrell_concordance`].
+struct RiskRankCounts {
+    tree: Vec<u64>,
+    total: u64,
+}
+
+impl RiskRankCounts {
+    fn new(levels: usize) -> Self {
+        Self {
+            tree: vec![0; levels + 1],
+            total: 0,
+        }
+    }
+
+    fn insert(&mut self, rank: usize) {
+        self.total += 1;
+        let mut node = rank + 1;
+        while node < self.tree.len() {
+            self.tree[node] += 1;
+            node += node & node.wrapping_neg();
+        }
+    }
+
+    /// Number of inserted entries whose rank is strictly below `rank`.
+    fn count_below(&self, rank: usize) -> u64 {
+        let mut node = rank;
+        let mut sum = 0;
+        while node > 0 {
+            sum += self.tree[node];
+            node &= node - 1;
+        }
+        sum
+    }
 }
 
 /// IPCW (inverse-probability-of-censoring-weighted) Brier score of a predicted
@@ -7477,6 +7548,91 @@ mod tests {
         assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
         // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
         assert!(g.at(8.0).abs() <= 1e-15);
+    }
+
+    /// The pair-loop definition of Harrell's C, written independently of the
+    /// Fenwick sweep: a pair is comparable when one subject had an event and the
+    /// other was observed strictly later, or at the same time but censored.
+    fn harrell_concordance_by_pairs(time: &[f64], event: &[f64], risk: &[f64]) -> Option<f64> {
+        let mut comparable = 0.0_f64;
+        let mut concordant = 0.0_f64;
+        for i in 0..time.len() {
+            for j in 0..time.len() {
+                let i_fails_first = event[i] > 0.5
+                    && (time[j] > time[i] || (time[j] == time[i] && event[j] <= 0.5));
+                if !i_fails_first {
+                    continue;
+                }
+                comparable += 1.0;
+                if risk[i] > risk[j] {
+                    concordant += 1.0;
+                } else if risk[i] == risk[j] {
+                    concordant += 0.5;
+                }
+            }
+        }
+        if comparable > 0.0 {
+            Some(concordant / comparable)
+        } else {
+            None
+        }
+    }
+
+    #[test]
+    fn harrell_concordance_tie_rules_match_hand_count() {
+        // Tied block at t=2: two events (rows 1, 2) and one censoring (row 3).
+        // Comparable pairs (early, late): row 0 with all four later rows
+        // (risk 5 beats 4, 1, 3, 2: 4 concordant); rows 1 and 2 with the tied
+        // censoring row 3 (4>3 concordant, 1<3 discordant) and with row 4
+        // (4>2 concordant, 1<2 discordant). The tied event pair (1, 2) is not
+        // comparable, and row 3 (censored) orders nothing after it.
+        // C = (4 + 1 + 1) / (4 + 2 + 2) = 0.75.
+        let time = [1.0, 2.0, 2.0, 2.0, 3.0];
+        let event = [1.0, 1.0, 1.0, 0.0, 0.0];
+        let risk = [5.0, 4.0, 1.0, 3.0, 2.0];
+        assert_eq!(harrell_concordance(&time, &event, &risk), Some(0.75));
+
+        // Two events at the same time are not comparable: nothing is orderable.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[1.0, 1.0], &[1.0, 0.0]), None);
+        // An event tied with a censoring is comparable; the censored subject
+        // outlived the death, so the larger risk on the event is concordant.
+        assert_eq!(harrell_concordance(&[2.0, 2.0], &[0.0, 1.0], &[1.0, 3.0]), Some(1.0));
+        // Equal risks score half credit.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[7.0, 7.0]), Some(0.5));
+        // All censored: no comparable pair.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[0.0, 0.0], &[1.0, 2.0]), None);
+        // Non-finite inputs have no defined ordering.
+        assert_eq!(harrell_concordance(&[1.0, f64::NAN], &[1.0, 1.0], &[1.0, 2.0]), None);
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0, 1.0], &[f64::NAN, 2.0]), None);
+        // Length mismatch.
+        assert_eq!(harrell_concordance(&[1.0, 2.0], &[1.0], &[1.0, 2.0]), None);
+    }
+
+    #[test]
+    fn harrell_concordance_sweep_equals_pair_definition_under_heavy_ties() {
+        // Coarse integer times and risks force many tied time blocks and tied
+        // risks; the O(n log n) sweep must reproduce the pair loop exactly.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = |modulus: u64| {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) % modulus
+        };
+        for trial in 0..200 {
+            let n = (next(40) + 1) as usize;
+            let time: Vec<f64> = (0..n).map(|_| (next(6) + 1) as f64).collect();
+            let event: Vec<f64> = (0..n)
+                .map(|_| if next(5) < 3 { 1.0 } else { 0.0 })
+                .collect();
+            let risk: Vec<f64> = (0..n).map(|_| next(5) as f64 - 2.0).collect();
+            let sweep = harrell_concordance(&time, &event, &risk);
+            let pairs = harrell_concordance_by_pairs(&time, &event, &risk);
+            // Both are one correctly rounded division of the same exact rational
+            // (the numerators are integer and half-integer counts), so they are
+            // bitwise equal, not merely close.
+            assert_eq!(sweep, pairs, "trial {trial}");
+        }
     }
 
     #[test]
