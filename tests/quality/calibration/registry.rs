@@ -334,6 +334,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         mean_upper,
         observation_lower,
         observation_upper,
+        observation_content,
         covariance_source,
     } = payload;
     // Consume the bound references so the exhaustive pattern is not flagged
@@ -349,6 +350,7 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         mean_upper,
         observation_lower,
         observation_upper,
+        observation_content,
         covariance_source,
     ));
     vec![
@@ -362,6 +364,10 @@ fn predict_payload_field_audits(payload: &PredictUncertaintyResult) -> Vec<Field
         FieldAudit::audited("mean_upper", "mean_credible_band_conditional"),
         FieldAudit::audited("observation_lower", "predictive_interval_gaussian"),
         FieldAudit::audited("observation_upper", "predictive_interval_gaussian"),
+        // The band's predictive probability is the coverage target the family
+        // SBC gates each band against; the Bernoulli set, all atom, is where it
+        // departs furthest from the nominal level.
+        FieldAudit::audited("observation_content", "predictive_interval_binomial"),
         // Provenance metadata, not a coverage-bearing value.
         FieldAudit::point("covariance_source"),
     ]
@@ -586,6 +592,7 @@ fn payload_probe() -> PredictUncertaintyResult {
         mean_upper: one.clone(),
         observation_lower: None,
         observation_upper: None,
+        observation_content: None,
         covariance_source: InferenceCovarianceMode::SmoothingCorrected,
     }
 }

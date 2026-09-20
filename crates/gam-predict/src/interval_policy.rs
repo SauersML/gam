@@ -236,10 +236,13 @@ pub(crate) enum ObservationInterval<'a> {
         bounds: ResponseBounds,
     },
     /// Precomputed family-aware predictive endpoints (for example a skewed
-    /// equal-tailed interval or the discrete Bernoulli set on `{0, 1}`).
+    /// equal-tailed interval or the discrete Bernoulli set on `{0, 1}`), with
+    /// the per-row predictive probability of the band where the law it was read
+    /// from provides it.
     Override {
         lower: Array1<f64>,
         upper: Array1<f64>,
+        content: Option<Array1<f64>>,
     },
 }
 
@@ -314,16 +317,22 @@ pub(crate) fn assemble_uncertainty_result(
     let z = reference.central_multiplier(confidence_level)?;
     let (eta_lower, eta_upper) = eta_interval.endpoints(&eta, &eta_standard_error, z);
     let (mean_lower, mean_upper) = mean_bounds(&eta_lower, &eta_upper, &mean, z, method)?;
-    let (observation_lower, observation_upper) = match observation {
+    let (observation_lower, observation_upper, observation_content) = match observation {
         // A skew-aware predictor (dispersion location-scale) supplies its
         // equal-tailed band directly; use it verbatim (already support-clamped).
-        Some(ObservationInterval::Override { lower, upper }) => (Some(lower), Some(upper)),
+        Some(ObservationInterval::Override {
+            lower,
+            upper,
+            content,
+        }) => (Some(lower), Some(upper), content),
+        // A clamped symmetric band is no quantile set of a stated law, so it
+        // reports no content.
         Some(ObservationInterval::Symmetric { noise_sd, bounds }) => {
             let (lower, upper) =
                 symmetric_predictive_band(&mean, &mean_standard_error, noise_sd, z, &bounds);
-            (Some(lower), Some(upper))
+            (Some(lower), Some(upper), None)
         }
-        None => (None, None),
+        None => (None, None, None),
     };
     Ok(PredictUncertaintyResult {
         eta,
@@ -336,6 +345,7 @@ pub(crate) fn assemble_uncertainty_result(
         mean_upper,
         observation_lower,
         observation_upper,
+        observation_content,
         covariance_source: provenance.covariance_source,
     })
 }
@@ -696,7 +706,9 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
     let mut override_band = if options.includeobservation_interval {
         let z = reference.central_multiplier(options.confidence_level)?;
         let z_row = Array1::from_elem(state.mean.len(), z);
-        transform.observation_band(input, &state.eta, &eta_se, &z_row, &z_row)?
+        transform
+            .observation_band(input, &state.eta, &eta_se, &z_row, &z_row)?
+            .map(|(lower, upper)| (lower, upper, None))
     } else {
         None
     };
@@ -712,7 +724,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
         // No transform reaching this driver has a Beta response (a link wiggle is
         // binomial-only, and the dispersion location-scale Beta builds its own band
         // above), so none needs the carried complement.
-        let (lower, upper) = family_observation_band(
+        override_band = family_observation_band(
             &response_family,
             &state.mean,
             None,
@@ -722,19 +734,15 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
             reference,
             fit,
             None,
-        )?;
-        override_band = match (lower, upper) {
-            (Some(lower), Some(upper)) => Some((lower, upper)),
-            (None, None) => None,
-            _ => {
-                return Err(EstimationError::InvalidInput(
-                    "family observation band returned only one endpoint".to_string(),
-                ));
-            }
-        };
+        )?
+        .map(|band| (band.lower, band.upper, Some(band.content)));
     }
     let observation_interval = match override_band {
-        Some((lower, upper)) => Some(ObservationInterval::Override { lower, upper }),
+        Some((lower, upper, content)) => Some(ObservationInterval::Override {
+            lower,
+            upper,
+            content,
+        }),
         None => observation
             .as_ref()
             .map(|noise_sd| ObservationInterval::Symmetric {
@@ -934,7 +942,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
             // and `family_observation_band` additionally applies the skew-aware
             // Gamma predictive arm for the right-skewed positive families.
             (None, None) => {
-                let (obs_lower, obs_upper) = family_observation_band(
+                let band = family_observation_band(
                     &transform.response_family(),
                     &result.mean,
                     // No transform on this driver has a Beta response (see the
@@ -951,8 +959,10 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
                     // unchanged for the families reaching here).
                     None,
                 )?;
-                result.observation_lower = obs_lower;
-                result.observation_upper = obs_upper;
+                if let Some(band) = band {
+                    result.observation_lower = Some(band.lower);
+                    result.observation_upper = Some(band.upper);
+                }
             }
         }
     }

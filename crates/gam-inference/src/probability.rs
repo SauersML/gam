@@ -113,6 +113,14 @@ fn zero_point_mass(mu: f64, total_var: f64) -> Option<(f64, f64)> {
     (mu == 0.0 && total_var == 0.0).then_some((0.0, 0.0))
 }
 
+/// Mass the point mass at zero of [`zero_point_mass`] puts on `[lower, upper]`:
+/// one when the set holds zero, else none. `None` when the moments are not that
+/// law's.
+fn zero_point_mass_content(mu: f64, total_var: f64, lower: f64, upper: f64) -> Option<f64> {
+    zero_point_mass(mu, total_var)
+        .map(|_| if lower <= 0.0 && 0.0 <= upper { 1.0 } else { 0.0 })
+}
+
 /// Equal-tailed predictive interval for a strictly-positive, right-skewed
 /// response modelled as a Gamma whose first two moments match a point
 /// prediction: mean `mu` and total predictive variance `total_var`
@@ -446,29 +454,140 @@ pub fn negative_binomial_moment_matched_interval(
     if let Some(band) = zero_point_mass(mu, total_var) {
         return Some(band);
     }
-    if !(mu.is_finite()
-        && mu > 0.0
-        && theta.is_finite()
-        && theta > 0.0
-        && total_var.is_finite()
-        && total_var > 0.0)
-    {
-        return None;
+    CountPredictive::negative_binomial(mu, theta, total_var)?.band(p_lo, p_hi)
+}
+
+/// Mass the Negative-Binomial predictive of
+/// [`negative_binomial_moment_matched_interval`] — the same law, with the same
+/// effective dispersion — puts on the integer set `{lower, …, upper}`.
+///
+/// A discrete law's quantile set cannot carry an arbitrary mass: the band read at
+/// tail masses `p_lo < p_hi` carries `F(upper) − F(lower − 1) ≥ p_hi − p_lo`, the
+/// excess being the atoms at its edges. That excess is the coverage the band
+/// promises, so a coverage audit targets this content rather than `p_hi − p_lo`.
+/// `None` for the moments the interval also refuses.
+pub fn negative_binomial_moment_matched_content(
+    mu: f64,
+    theta: f64,
+    total_var: f64,
+    lower: f64,
+    upper: f64,
+) -> Option<f64> {
+    if let Some(content) = zero_point_mass_content(mu, total_var, lower, upper) {
+        return Some(content);
     }
-    // `total_var = SE(μ̂)² + (μ + μ²/θ) > μ` always, so the excess is positive;
-    // fall back to the nominal dispersion only if a degenerate caller breaks it.
-    let excess = total_var - mu;
-    let theta_eff = if excess > 0.0 {
-        mu * mu / excess
-    } else {
-        theta
-    };
-    let q_lo = negative_binomial_quantile(p_lo, mu, theta_eff);
-    let q_hi = negative_binomial_quantile(p_hi, mu, theta_eff);
-    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
-        Some((q_lo, q_hi))
-    } else {
-        None
+    Some(CountPredictive::negative_binomial(mu, theta, total_var)?.content(lower, upper))
+}
+
+/// The moment-matched count predictive a count band and its content are both read
+/// from: the exact conditional Poisson, or the Gamma–Poisson Negative-Binomial
+/// whose dispersion carries the estimation variance. One constructor per family
+/// fixes the law, so the edges and the mass reported for them cannot come from
+/// two different laws.
+#[derive(Clone, Copy, Debug)]
+enum CountPredictive {
+    Poisson { mu: f64 },
+    NegativeBinomial { mu: f64, theta: f64 },
+}
+
+impl CountPredictive {
+    /// Negative-Binomial predictive with mean `mu` and total variance `total_var`:
+    /// the effective dispersion `θ_eff = μ²/(total_var − μ)` matches the inflated
+    /// variance (see [`negative_binomial_moment_matched_interval`]).
+    fn negative_binomial(mu: f64, theta: f64, total_var: f64) -> Option<Self> {
+        if !(mu.is_finite()
+            && mu > 0.0
+            && theta.is_finite()
+            && theta > 0.0
+            && total_var.is_finite()
+            && total_var > 0.0)
+        {
+            return None;
+        }
+        // `total_var = SE(μ̂)² + (μ + μ²/θ) > μ` always, so the excess is positive;
+        // fall back to the nominal dispersion only if a degenerate caller breaks it.
+        let excess = total_var - mu;
+        let theta_eff = if excess > 0.0 {
+            mu * mu / excess
+        } else {
+            theta
+        };
+        Some(Self::NegativeBinomial {
+            mu,
+            theta: theta_eff,
+        })
+    }
+
+    /// Poisson-response predictive with mean `mu` and total variance
+    /// `total_var ≥ μ`: the Gamma–Poisson NB carrying the excess, or the exact
+    /// Poisson once that excess is below what the NB can resolve (see
+    /// [`poisson_moment_matched_interval`]).
+    fn poisson(mu: f64, total_var: f64) -> Option<Self> {
+        if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
+            return None;
+        }
+        // Estimation uncertainty inflates the count variance beyond the Poisson
+        // floor `Var(Y|μ) = μ`; the excess is the (approximate) sampling variance
+        // of `μ̂`. A `total_var` below `μ` is degenerate (a caller broke the
+        // contract).
+        let excess = total_var - mu;
+        if excess < 0.0 {
+            return None;
+        }
+        // The NB surrogate reaches the conditional Poisson only through
+        // `prob = θ/(θ+μ)`, and the incomplete beta `I_prob(θ, k+1)` behind
+        // `negative_binomial_quantile` forms its complement `μ/(θ+μ)` by rounding,
+        // so the NB CDF carries relative error ~`u·θ/μ` while the widening it adds
+        // is ~`μ/θ`. The two cross at `θ = μ/√u`: past it the exact Poisson
+        // quantile is the more accurate one, below it the NB widening is genuine
+        // (#2469).
+        let poisson_limit = mu / gam_linalg::roundoff::UNIT_ROUNDOFF.sqrt();
+        let theta_eff = if excess > 0.0 {
+            mu * mu / excess
+        } else {
+            f64::INFINITY
+        };
+        Some(if theta_eff > poisson_limit {
+            Self::Poisson { mu }
+        } else {
+            Self::NegativeBinomial {
+                mu,
+                theta: theta_eff,
+            }
+        })
+    }
+
+    fn quantile(self, p: f64) -> f64 {
+        match self {
+            Self::Poisson { mu } => poisson_quantile(p, mu),
+            Self::NegativeBinomial { mu, theta } => negative_binomial_quantile(p, mu, theta),
+        }
+    }
+
+    /// `P(Y ≤ k)` at an integer `k`; zero below the support.
+    fn cdf(self, k: f64) -> f64 {
+        if k < 0.0 {
+            return 0.0;
+        }
+        match self {
+            Self::Poisson { mu } => poisson_cdf_at(k, mu),
+            Self::NegativeBinomial { mu, theta } => {
+                negative_binomial_cdf_at(k, theta, theta / (theta + mu))
+            }
+        }
+    }
+
+    /// Equal-tailed band `[F⁻¹(p_lo), F⁻¹(p_hi)]`, or `None` when the quantiles
+    /// come out non-finite or mis-ordered.
+    fn band(self, p_lo: f64, p_hi: f64) -> Option<(f64, f64)> {
+        let q_lo = self.quantile(p_lo);
+        let q_hi = self.quantile(p_hi);
+        (q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo).then_some((q_lo, q_hi))
+    }
+
+    /// Mass on the integer set `{lower, …, upper}`: `F(upper) − F(lower − 1)`.
+    fn content(self, lower: f64, upper: f64) -> f64 {
+        self.cdf(upper) - self.cdf(lower - 1.0)
     }
 }
 
@@ -567,41 +686,24 @@ pub fn poisson_moment_matched_interval(
     if let Some(band) = zero_point_mass(mu, total_var) {
         return Some(band);
     }
-    if !(mu.is_finite() && mu > 0.0 && total_var.is_finite() && total_var > 0.0) {
-        return None;
+    CountPredictive::poisson(mu, total_var)?.band(p_lo, p_hi)
+}
+
+/// Mass the count predictive of [`poisson_moment_matched_interval`] — the same
+/// law, in the same regime — puts on the integer set `{lower, …, upper}`: at
+/// least the `p_hi − p_lo` the band was read at, by the atoms at its edges (see
+/// [`negative_binomial_moment_matched_content`]). `None` for the moments the
+/// interval also refuses.
+pub fn poisson_moment_matched_content(
+    mu: f64,
+    total_var: f64,
+    lower: f64,
+    upper: f64,
+) -> Option<f64> {
+    if let Some(content) = zero_point_mass_content(mu, total_var, lower, upper) {
+        return Some(content);
     }
-    // Estimation uncertainty inflates the count variance beyond the Poisson
-    // floor `Var(Y|μ) = μ`; the excess is the (approximate) sampling variance of
-    // `μ̂`. A `total_var` below `μ` is degenerate (a caller broke the contract).
-    let excess = total_var - mu;
-    if excess < 0.0 {
-        return None;
-    }
-    // The NB surrogate reaches the conditional Poisson only through
-    // `prob = θ/(θ+μ)`, and the incomplete beta `I_prob(θ, k+1)` behind
-    // `negative_binomial_quantile` forms its complement `μ/(θ+μ)` by rounding, so
-    // the NB CDF carries relative error ~`u·θ/μ` while the widening it adds is
-    // ~`μ/θ`. The two cross at `θ = μ/√u`: past it the exact Poisson quantile is
-    // the more accurate one, below it the NB widening is genuine (#2469).
-    let poisson_limit = mu / gam_linalg::roundoff::UNIT_ROUNDOFF.sqrt();
-    let theta_eff = if excess > 0.0 {
-        mu * mu / excess
-    } else {
-        f64::INFINITY
-    };
-    let (q_lo, q_hi) = if theta_eff > poisson_limit {
-        (poisson_quantile(p_lo, mu), poisson_quantile(p_hi, mu))
-    } else {
-        (
-            negative_binomial_quantile(p_lo, mu, theta_eff),
-            negative_binomial_quantile(p_hi, mu, theta_eff),
-        )
-    };
-    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
-        Some((q_lo, q_hi))
-    } else {
-        None
-    }
+    Some(CountPredictive::poisson(mu, total_var)?.content(lower, upper))
 }
 
 /// CDF of a Tweedie compound Poisson–Gamma response (power `1 < p < 2`) with
@@ -761,6 +863,21 @@ pub fn tweedie_moment_matched_interval(
     if let Some(band) = zero_point_mass(mu, total_var) {
         return Some(band);
     }
+    let phi_eff = tweedie_effective_dispersion(mu, phi, power, total_var)?;
+    let q_lo = tweedie_quantile(p_lo, mu, phi_eff, power);
+    let q_hi = tweedie_quantile(p_hi, mu, phi_eff, power);
+    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
+        Some((q_lo, q_hi))
+    } else {
+        None
+    }
+}
+
+/// Effective dispersion `φ_eff = total_var / μ^p` of the Tweedie predictive with
+/// mean `mu` and total variance `total_var`, the one law both
+/// [`tweedie_moment_matched_interval`] and [`tweedie_moment_matched_content`]
+/// read. `None` for degenerate inputs.
+fn tweedie_effective_dispersion(mu: f64, phi: f64, power: f64, total_var: f64) -> Option<f64> {
     if !(mu.is_finite()
         && mu > 0.0
         && phi.is_finite()
@@ -774,16 +891,36 @@ pub fn tweedie_moment_matched_interval(
         return None;
     }
     let phi_eff = total_var / mu.powf(power);
-    if !(phi_eff.is_finite() && phi_eff > 0.0) {
+    (phi_eff.is_finite() && phi_eff > 0.0).then_some(phi_eff)
+}
+
+/// Mass the Tweedie predictive of [`tweedie_moment_matched_interval`] puts on
+/// `[lower, upper]`: `F(upper) − P(Y < lower)`. Above zero the law is continuous,
+/// so `P(Y < lower) = F(lower)`; a band whose lower edge is the support floor
+/// holds the zero atom whole. The content is `p_hi − p_lo` wherever both edges sit
+/// on the continuous part and exceeds it by the atom's surplus when the band
+/// starts at zero. `None` for the moments the interval also refuses.
+pub fn tweedie_moment_matched_content(
+    mu: f64,
+    phi: f64,
+    power: f64,
+    total_var: f64,
+    lower: f64,
+    upper: f64,
+) -> Option<f64> {
+    if let Some(content) = zero_point_mass_content(mu, total_var, lower, upper) {
+        return Some(content);
+    }
+    let phi_eff = tweedie_effective_dispersion(mu, phi, power, total_var)?;
+    if !(upper.is_finite() && upper >= 0.0) {
         return None;
     }
-    let q_lo = tweedie_quantile(p_lo, mu, phi_eff, power);
-    let q_hi = tweedie_quantile(p_hi, mu, phi_eff, power);
-    if q_lo.is_finite() && q_hi.is_finite() && q_hi >= q_lo {
-        Some((q_lo, q_hi))
+    let below = if lower > 0.0 {
+        tweedie_cdf_at(lower, mu, phi_eff, power)
     } else {
-        None
-    }
+        0.0
+    };
+    Some(tweedie_cdf_at(upper, mu, phi_eff, power) - below)
 }
 
 /// Regularized lower incomplete gamma `P(a, x)` alone — see
@@ -1913,6 +2050,149 @@ mod tests {
         assert!(tweedie_moment_matched_interval(2.0, 1.0, 1.5, 0.0, 0.025, 0.975).is_none());
         assert!(tweedie_moment_matched_interval(f64::NAN, 1.0, 1.5, 1.0, 0.025, 0.975).is_none());
         assert!(tweedie_moment_matched_interval(2.0, 1.0, 1.5, 6.0, 0.025, 0.975).is_some());
+    }
+
+    /// Relative error bound on `statrs`'s `beta_reg(a, b, x)`, read off its
+    /// construction: the prefactor `exp(lnΓ(a+b) − lnΓ(a) − lnΓ(b) + a·ln x +
+    /// b·ln(1−x))` carries an absolute exponent error of one rounding per term
+    /// (`lnΓ` is accurate to 16 digits) plus one per addition, so at most
+    /// `2·ε·Σ|terms|`; the Lentz continued fraction after it stops within `ε` of
+    /// its limit and runs at most 140 steps of eight roundings each.
+    fn beta_reg_relative_error(a: f64, b: f64, x: f64) -> f64 {
+        use statrs::function::gamma::ln_gamma;
+        let terms = ln_gamma(a + b).abs()
+            + ln_gamma(a).abs()
+            + ln_gamma(b).abs()
+            + (a * x.ln()).abs()
+            + (b * (1.0 - x).ln()).abs();
+        f64::EPSILON * (2.0 * terms + 8.0 * 140.0 + 1.0)
+    }
+
+    /// Sum of `pmf(k)` over `k = lower..=upper`, the pmf given by its value at zero
+    /// and the ratio `pmf(k)/pmf(k−1)`.
+    fn count_set_mass(p0: f64, ratio: impl Fn(f64) -> f64, lower: f64, upper: f64) -> f64 {
+        let mut pmf = p0;
+        let mut mass = if lower <= 0.0 { p0 } else { 0.0 };
+        let mut k = 1.0;
+        while k <= upper {
+            pmf *= ratio(k);
+            if k >= lower {
+                mass += pmf;
+            }
+            k += 1.0;
+        }
+        mass
+    }
+
+    #[test]
+    fn count_band_content_is_the_mass_of_its_quantile_set_and_exceeds_its_level() {
+        // A count band `[F⁻¹(p_lo), F⁻¹(p_hi)]` carries `F(hi) − F(lo − 1)`, and
+        // `F(hi) ≥ p_hi`, `F(lo − 1) < p_lo` make that strictly more than
+        // `p_hi − p_lo`: the atoms at the edges are the band's surplus, the
+        // coverage it promises (#3534). The reference mass sums the pmf by its
+        // one-rounding-per-step recurrence; the CDFs behind the content carry
+        // relative error `8·ε·μ` each (see
+        // `poisson_cdf_below_the_mean_is_a_number_rather_than_zero`), so
+        // the two agree to `ε·(16·μ + hi + 1)`, doubled for the pmf's own error.
+        let (p_lo, p_hi) = (0.05, 0.95);
+        for mu in [0.4_f64, 3.0, 7.5, 40.0] {
+            // No estimation excess: the exact conditional Poisson.
+            let (lo, hi) = poisson_moment_matched_interval(mu, mu, p_lo, p_hi).unwrap();
+            let content = poisson_moment_matched_content(mu, mu, lo, hi).unwrap();
+            let want = count_set_mass((-mu).exp(), |k| mu / k, lo, hi);
+            let tol = 2.0 * f64::EPSILON * (16.0 * mu + hi + 1.0);
+            assert!(
+                (content - want).abs() <= tol,
+                "Poisson(mu={mu}) band [{lo},{hi}] content {content} vs pmf mass {want}"
+            );
+            assert!(content > p_hi - p_lo, "Poisson(mu={mu}) content {content}");
+
+            // An estimation excess: the Gamma–Poisson NB with θ_eff = μ²/excess.
+            let excess = 0.5 * mu;
+            let total_var = mu + excess;
+            let theta_eff = mu * mu / excess;
+            let prob = theta_eff / (theta_eff + mu);
+            let (lo, hi) = poisson_moment_matched_interval(mu, total_var, p_lo, p_hi).unwrap();
+            let content = poisson_moment_matched_content(mu, total_var, lo, hi).unwrap();
+            let want = count_set_mass(
+                prob.powf(theta_eff),
+                |k| (k - 1.0 + theta_eff) / k * (1.0 - prob),
+                lo,
+                hi,
+            );
+            // `F(hi)` and `F(lo − 1)` are two `beta_reg` calls; the reference's
+            // `prob^θ` start carries `ε·(1 + θ·|ln prob|)` and each recurrence step
+            // four roundings (one in `1 − prob`, relative `ε/(1 − prob)`).
+            let upper_cdf = beta_reg(theta_eff, hi + 1.0, prob);
+            let below_cdf = if lo >= 1.0 { beta_reg(theta_eff, lo, prob) } else { 0.0 };
+            let nb_tol = upper_cdf * beta_reg_relative_error(theta_eff, hi + 1.0, prob)
+                + below_cdf * beta_reg_relative_error(theta_eff, lo.max(1.0), prob)
+                + want
+                    * f64::EPSILON
+                    * (1.0 + theta_eff * prob.ln().abs() + (hi + 1.0) * (4.0 + 1.0 / (1.0 - prob)));
+            assert!(
+                (content - want).abs() <= nb_tol,
+                "NB(mu={mu}, theta={theta_eff}) band [{lo},{hi}] content {content} vs {want}, tol {nb_tol}"
+            );
+            assert!(content > p_hi - p_lo, "NB(mu={mu}) content {content}");
+
+            // The Negative-Binomial family reads the same law.
+            let theta = 4.0;
+            let total_var = mu + mu * mu / theta + excess;
+            let (lo, hi) =
+                negative_binomial_moment_matched_interval(mu, theta, total_var, p_lo, p_hi).unwrap();
+            let content =
+                negative_binomial_moment_matched_content(mu, theta, total_var, lo, hi).unwrap();
+            assert_eq!(
+                content,
+                CountPredictive::negative_binomial(mu, theta, total_var)
+                    .unwrap()
+                    .content(lo, hi)
+            );
+            assert!(content > p_hi - p_lo, "NB family (mu={mu}) content {content}");
+        }
+        // The point mass at zero carries its whole mass on the band `[0, 0]`.
+        assert_eq!(poisson_moment_matched_content(0.0, 0.0, 0.0, 0.0), Some(1.0));
+        assert_eq!(
+            negative_binomial_moment_matched_content(0.0, 1.5, 0.0, 0.0, 0.0),
+            Some(1.0)
+        );
+        assert!(poisson_moment_matched_content(2.0, 1.0, 0.0, 4.0).is_none());
+    }
+
+    #[test]
+    fn tweedie_band_content_holds_the_zero_atom_when_the_band_starts_at_zero() {
+        // μ = 0.3, φ = 1, p = 1.5: λ = √0.3 / 0.5 ≈ 1.10, zero atom e^{−λ} ≈ 0.33,
+        // above the 0.05 lower tail mass, so the band starts at zero and holds the
+        // whole atom: its content is `F(hi) = p_hi`, a surplus of `p_lo` over the
+        // level.
+        let (mu, phi, power) = (0.3, 1.0, 1.5);
+        let (p_lo, p_hi) = (0.05, 0.95);
+        let total_var = phi * mu.powf(power);
+        let (lo, hi) =
+            tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi).unwrap();
+        assert_eq!(lo, 0.0);
+        let content =
+            tweedie_moment_matched_content(mu, phi, power, total_var, lo, hi).unwrap();
+        assert_eq!(content, tweedie_cdf_at(hi, mu, phi, power));
+        assert!(content > p_hi - p_lo, "content {content}");
+        // A mean whose atom is below the lower tail mass: both edges on the
+        // continuous part, content `F(hi) − F(lo)`.
+        let mu = 6.0;
+        let total_var = phi * mu.powf(power);
+        let (lo, hi) =
+            tweedie_moment_matched_interval(mu, phi, power, total_var, p_lo, p_hi).unwrap();
+        assert!(lo > 0.0);
+        let content =
+            tweedie_moment_matched_content(mu, phi, power, total_var, lo, hi).unwrap();
+        assert_eq!(
+            content,
+            tweedie_cdf_at(hi, mu, phi, power) - tweedie_cdf_at(lo, mu, phi, power)
+        );
+        assert_eq!(
+            tweedie_moment_matched_content(0.0, phi, power, 0.0, 0.0, 0.0),
+            Some(1.0)
+        );
     }
 }
 

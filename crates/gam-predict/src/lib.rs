@@ -42,7 +42,9 @@ use crate::survival::SurvivalPredictor;
 use crate::transformation_normal::TransformationNormalPredictor;
 use gam_inference::probability::{
     beta_moment_matched_interval, gamma_moment_matched_interval,
-    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_interval, poisson_moment_matched_interval,
+    inverse_gaussian_moment_matched_interval, negative_binomial_moment_matched_content,
+    negative_binomial_moment_matched_interval, poisson_moment_matched_content,
+    poisson_moment_matched_interval, tweedie_moment_matched_content,
     tweedie_moment_matched_interval,
 };
 use faer::Side;
@@ -1861,6 +1863,14 @@ pub struct PredictUncertaintyResult {
     /// Optional observation interval bounds.
     pub observation_lower: Option<Array1<f64>>,
     pub observation_upper: Option<Array1<f64>>,
+    /// Per-row predictive probability of the observation band,
+    /// `P(lower ≤ Y_new ≤ upper)` under the predictive law the edges were read
+    /// from. A continuous family's band holds exactly its level `p_hi − p_lo`;
+    /// a discrete one's edges are atoms, so `F(upper) − F(lower⁻)` exceeds the
+    /// level by the edge atoms' surplus, and that content, not the level, is the
+    /// coverage a calibrated band attains (#3534). `None` wherever the band has
+    /// no family predictive behind it.
+    pub observation_content: Option<Array1<f64>>,
     /// Exact covariance definition used for the reported uncertainty.
     pub covariance_source: InferenceCovarianceMode,
 }
@@ -2388,6 +2398,17 @@ fn bernoulli_predictive_quantile(success_probability: f64, cumulative_probabilit
     }
 }
 
+/// A family's observation band: per-row edges and the predictive probability
+/// each row's band holds.
+#[derive(Debug)]
+pub(crate) struct ObservationBand {
+    pub(crate) lower: Array1<f64>,
+    pub(crate) upper: Array1<f64>,
+    /// Per-row predictive probability of `[lower, upper]`; see
+    /// [`PredictUncertaintyResult::observation_content`].
+    pub(crate) content: Array1<f64>,
+}
+
 /// Per-row observation (prediction) band for a single-distribution family, from
 /// the posterior moments of the response mean: `mean` = `E[μ]`,
 /// `mean_standard_error` = `√Var(μ)`, and for a probability-valued mean
@@ -2400,7 +2421,7 @@ fn bernoulli_predictive_quantile(success_probability: f64, cumulative_probabilit
 /// Every arm reads its edges from a law on the response's own support, so the band
 /// lies in that support by construction and is never clamped to it. A
 /// moment-matched predictive that cannot be formed for a row is a typed error naming
-/// the row, never a substituted symmetric band. `(None, None)` means the family has
+/// the row, never a substituted symmetric band. `None` means the family has
 /// no band here: no fitted dispersion to build it from, or Student-t, whose
 /// predictive has no closed-form quantile.
 pub(crate) fn family_observation_band<S>(
@@ -2413,7 +2434,7 @@ pub(crate) fn family_observation_band<S>(
     reference: IntervalReference,
     source: &S,
     prior_weights: Option<&Array1<f64>>,
-) -> Result<(Option<Array1<f64>>, Option<Array1<f64>>), EstimationError>
+) -> Result<Option<ObservationBand>, EstimationError>
 where
     S: UncertaintyCovarianceSource + ?Sized,
 {
@@ -2448,22 +2469,23 @@ where
     // (`SE(μ̂) → 0`) the moment-matched predictive collapses to the exact
     // conditional law, so the band is exact; with nonzero `SE(μ̂)` it is the
     // minimal skew-correct widening. `predictive(row, V, p_lo, p_hi)` returns the
-    // `(lower, upper)` quantile pair, or `None` when no law in the family carries
-    // those moments.
+    // `(lower, upper)` quantile pair with the predictive probability of the band
+    // between them, or `None` when no law in the family carries those moments.
     let skew_predictive_bounds =
         |total_var: Array1<f64>,
-         predictive: &dyn Fn(usize, f64, f64, f64) -> Option<(f64, f64)>|
-         -> Result<(Option<Array1<f64>>, Option<Array1<f64>>), EstimationError> {
+         predictive: &dyn Fn(usize, f64, f64, f64) -> Option<(f64, f64, f64)>|
+         -> Result<Option<ObservationBand>, EstimationError> {
             let n = mean.len();
             let mut lower = Array1::<f64>::zeros(n);
             let mut upper = Array1::<f64>::zeros(n);
+            let mut content = Array1::<f64>::zeros(n);
             for i in 0..n {
                 // Lower-tail probability of the lower edge and cumulative
                 // probability of the upper edge — identical tail mass to the
                 // symmetric band, routed through the correct distribution.
                 let p_lower = reference.cdf(-z_lower_per_row[i]);
                 let p_upper = reference.cdf(z_upper_per_row[i]);
-                let (q_lo, q_hi) =
+                let (q_lo, q_hi, mass) =
                     predictive(i, total_var[i], p_lower, p_upper).ok_or_else(|| {
                         EstimationError::InvalidInput(format!(
                             "{} observation band at row {i}: no {} predictive has mean {:e} and \
@@ -2477,9 +2499,23 @@ where
                     })?;
                 lower[i] = q_lo;
                 upper[i] = q_hi;
+                content[i] = mass;
             }
-            Ok((Some(lower), Some(upper)))
+            Ok(Some(ObservationBand {
+                lower,
+                upper,
+                content,
+            }))
         };
+    // A continuous predictive holds exactly the tail masses' difference between
+    // its quantiles; with no variance it is a point mass on the mean, which the
+    // degenerate band `[μ, μ]` holds whole.
+    let continuous_content = |total_var: f64, p_lo: f64, p_hi: f64| {
+        if total_var == 0.0 { 1.0 } else { p_hi - p_lo }
+    };
+    let continuous = |band: Option<(f64, f64)>, total_var: f64, p_lo: f64, p_hi: f64| {
+        band.map(|(lo, hi)| (lo, hi, continuous_content(total_var, p_lo, p_hi)))
+    };
 
     match response {
         ResponseFamily::Gaussian => {
@@ -2489,7 +2525,7 @@ where
             // is on the response scale under any link (identity: μ = η), whose
             // support is the whole line.
             let Some(total_var) = predictive_variance() else {
-                return Ok((None, None));
+                return Ok(None);
             };
             let obs_se = total_var.mapv(f64::sqrt);
             let lower = Array1::from_iter(
@@ -2504,7 +2540,18 @@ where
                     .zip(z_upper_per_row.iter())
                     .map(|((&e, &s), &zu)| e + zu * s),
             );
-            Ok((Some(lower), Some(upper)))
+            let content = Array1::from_iter((0..mean.len()).map(|i| {
+                continuous_content(
+                    total_var[i],
+                    reference.cdf(-z_lower_per_row[i]),
+                    reference.cdf(z_upper_per_row[i]),
+                )
+            }));
+            Ok(Some(ObservationBand {
+                lower,
+                upper,
+                content,
+            }))
         }
         ResponseFamily::Poisson => {
             // The Poisson is discrete with a real atom at zero, so a symmetric
@@ -2518,7 +2565,8 @@ where
             let total_var =
                 predictive_variance().expect("Poisson has a closed-form conditional variance");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                poisson_moment_matched_interval(mean[i], total_var, p_lo, p_hi)
+                let (lo, hi) = poisson_moment_matched_interval(mean[i], total_var, p_lo, p_hi)?;
+                Some((lo, hi, poisson_moment_matched_content(mean[i], total_var, lo, hi)?))
             })
         }
         ResponseFamily::NegativeBinomial { theta, theta_fixed } => {
@@ -2533,7 +2581,7 @@ where
             } else {
                 source.observation_theta()
             }) else {
-                return Ok((None, None));
+                return Ok(None);
             };
             // The NB is discrete with a real atom at zero, so a symmetric band
             // sits below the true upper quantile on right-skewed counts and
@@ -2544,12 +2592,16 @@ where
             // tail at low means.
             let total_var = predictive_variance().expect("theta availability was checked above");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                negative_binomial_moment_matched_interval(mean[i], theta, total_var, p_lo, p_hi)
+                let (lo, hi) =
+                    negative_binomial_moment_matched_interval(mean[i], theta, total_var, p_lo, p_hi)?;
+                let content =
+                    negative_binomial_moment_matched_content(mean[i], theta, total_var, lo, hi)?;
+                Some((lo, hi, content))
             })
         }
         ResponseFamily::Tweedie { p } => {
             let Some(phi) = source.observation_phi() else {
-                return Ok((None, None));
+                return Ok(None);
             };
             // Tweedie (1 < p < 2) is a compound Poisson–Gamma: a point mass at
             // zero plus a continuous right-skewed positive part. Its symmetric
@@ -2562,7 +2614,11 @@ where
             let total_var = predictive_variance().expect("phi availability was checked above");
             let power = *p;
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                tweedie_moment_matched_interval(mean[i], phi, power, total_var, p_lo, p_hi)
+                let (lo, hi) =
+                    tweedie_moment_matched_interval(mean[i], phi, power, total_var, p_lo, p_hi)?;
+                let content =
+                    tweedie_moment_matched_content(mean[i], phi, power, total_var, lo, hi)?;
+                Some((lo, hi, content))
             })
         }
         ResponseFamily::Gamma => {
@@ -2571,10 +2627,15 @@ where
             // Gamma quantiles (moment-matched predictive), not a symmetric
             // `μ ± z·σ` band that mis-covers each tail (#817).
             let Some(total_var) = predictive_variance() else {
-                return Ok((None, None));
+                return Ok(None);
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                gamma_moment_matched_interval(mean[i], total_var, p_lo, p_hi)
+                continuous(
+                    gamma_moment_matched_interval(mean[i], total_var, p_lo, p_hi),
+                    total_var,
+                    p_lo,
+                    p_hi,
+                )
             })
         }
         ResponseFamily::InverseGaussian => {
@@ -2582,10 +2643,15 @@ where
             // is built from equal-tailed moment-matched inverse-Gaussian
             // quantiles.
             let Some(total_var) = predictive_variance() else {
-                return Ok((None, None));
+                return Ok(None);
             };
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                inverse_gaussian_moment_matched_interval(mean[i], total_var, p_lo, p_hi)
+                continuous(
+                    inverse_gaussian_moment_matched_interval(mean[i], total_var, p_lo, p_hi),
+                    total_var,
+                    p_lo,
+                    p_hi,
+                )
             })
         }
         ResponseFamily::Beta { .. } => {
@@ -2597,7 +2663,7 @@ where
             // precision hint has no valid observation interval; using the seed
             // made the response-noise term `μ(1−μ)/2` for high-precision data.
             if source.observation_phi().is_none() {
-                return Ok((None, None));
+                return Ok(None);
             }
             // Beta is continuous on (0,1) and skewed toward whichever edge its
             // mean is near, so a symmetric band mis-covers BOTH tails (#1194).
@@ -2613,14 +2679,19 @@ where
             })?;
             let total_var = predictive_variance().expect("phi and the complement are present");
             skew_predictive_bounds(total_var, &|i, total_var, p_lo, p_hi| {
-                beta_moment_matched_interval(mean[i], complement[i], total_var, p_lo, p_hi)
+                continuous(
+                    beta_moment_matched_interval(mean[i], complement[i], total_var, p_lo, p_hi),
+                    total_var,
+                    p_lo,
+                    p_hi,
+                )
             })
         }
         // The predictive law of a fresh Student-t observation is a Gaussian
         // (posterior of η) convolved with a scaled t, which has no closed-form
         // quantile; no observation band is reported rather than a Gaussian
         // surrogate that would under-cover the heavy tails.
-        ResponseFamily::StudentT { .. } => Ok((None, None)),
+        ResponseFamily::StudentT { .. } => Ok(None),
         ResponseFamily::Binomial | ResponseFamily::RoystonParmar => {
             // Royston–Parmar reports the survival probability S(t) at the
             // requested horizon, so its fresh observation is the Bernoulli
@@ -2639,16 +2710,29 @@ where
             // edges are support points whatever `m` is, and a tail mass
             // `q ∈ (0, 1)` is compared with `1 − m` at a resolution the complement
             // never reaches, so the mean enters as it is.
+            //
+            // The band's content is the mass of the support points it holds:
+            // `P(Y = 0) = E[1 − μ]` when it starts at 0 (the carried complement,
+            // exact where `1 − m` would cancel) and `P(Y = 1) = m` when it ends
+            // at 1.
             let n = mean.len();
             let mut lower = Array1::<f64>::zeros(n);
             let mut upper = Array1::<f64>::zeros(n);
+            let mut content = Array1::<f64>::zeros(n);
             for i in 0..n {
                 let p_lo = reference.cdf(-z_lower_per_row[i]);
                 let p_hi = reference.cdf(z_upper_per_row[i]);
                 lower[i] = bernoulli_predictive_quantile(mean[i], p_lo);
                 upper[i] = bernoulli_predictive_quantile(mean[i], p_hi);
+                let zero_mass = mean_complement.map_or(1.0 - mean[i], |c| c[i]);
+                content[i] = if lower[i] == 0.0 { zero_mass } else { 0.0 }
+                    + if upper[i] == 1.0 { mean[i] } else { 0.0 };
             }
-            Ok((Some(lower), Some(upper)))
+            Ok(Some(ObservationBand {
+                lower,
+                upper,
+                content,
+            }))
         }
     }
 }
@@ -3140,7 +3224,7 @@ where
     response_bounds.clamp_in_place(&mut mean_lower);
     response_bounds.clamp_in_place(&mut mean_upper);
 
-    let (observation_lower, observation_upper) = if options.includeobservation_interval {
+    let observation_band = if options.includeobservation_interval {
         // A probability-valued mean carries its complement from the same η posterior.
         let posterior_complement = match &spec.response {
             ResponseFamily::Binomial
@@ -3171,7 +3255,11 @@ where
             options.observation_prior_weights.as_ref(),
         )?
     } else {
-        (None, None)
+        None
+    };
+    let (observation_lower, observation_upper, observation_content) = match observation_band {
+        Some(band) => (Some(band.lower), Some(band.upper), Some(band.content)),
+        None => (None, None, None),
     };
 
     Ok(PredictUncertaintyResult {
@@ -3185,6 +3273,7 @@ where
         mean_upper,
         observation_lower,
         observation_upper,
+        observation_content,
         covariance_source,
     })
 }
@@ -5544,7 +5633,7 @@ mod tests {
         );
         let z = standard_normal_quantile(0.975).unwrap();
         let z_row = array![z];
-        let (lower, upper) = family_observation_band(
+        let band = family_observation_band(
             &ResponseFamily::Beta { phi: 1.0 },
             &array![mean],
             Some(&array![complement]),
@@ -5555,8 +5644,9 @@ mod tests {
             &fit,
             None,
         )
-        .expect("the carried complement admits the moment-matched Beta");
-        let (lower, upper) = (lower.expect("lower edge")[0], upper.expect("upper edge")[0]);
+        .expect("the carried complement admits the moment-matched Beta")
+        .expect("a fitted Beta has a band");
+        let (lower, upper) = (band.lower[0], band.upper[0]);
         assert!(
             (0.0..=1.0).contains(&lower) && (0.0..=1.0).contains(&upper) && lower <= upper,
             "the band [{lower}, {upper}] lies in the support without a clamp"
@@ -5616,7 +5706,7 @@ mod tests {
             predictive[0]
         );
         let z_row = array![standard_normal_quantile(0.975).unwrap()];
-        let (lower, upper) = family_observation_band(
+        let band = family_observation_band(
             &ResponseFamily::Binomial,
             &array![mean],
             Some(&array![complement]),
@@ -5627,8 +5717,10 @@ mod tests {
             &fit,
             None,
         )
-        .unwrap();
-        assert_eq!((lower.unwrap()[0], upper.unwrap()[0]), (1.0, 1.0));
+        .unwrap()
+        .expect("the Bernoulli band always exists");
+        assert_eq!((band.lower[0], band.upper[0]), (1.0, 1.0));
+        assert_eq!(band.content[0], mean, "the set {{1}} holds P(Y = 1) = m");
     }
 
     /// #3140: a moment pair no law in the family carries is a typed error naming the
@@ -5739,7 +5831,7 @@ mod tests {
         let mean = array![0.5, 0.999, 0.001];
         let z = standard_normal_quantile(0.975).unwrap();
         let z_per_row = Array1::from_elem(n, z);
-        let (lower, upper) = family_observation_band(
+        let band = family_observation_band(
             &ResponseFamily::RoystonParmar,
             &mean,
             None,
@@ -5750,9 +5842,15 @@ mod tests {
             &fit,
             None,
         )
-        .expect("the Bernoulli predictive set exists for every survival probability");
-        let lower = lower.expect("RoystonParmar must produce an observation band");
-        let upper = upper.expect("RoystonParmar must produce an observation band");
+        .expect("the Bernoulli predictive set exists for every survival probability")
+        .expect("RoystonParmar must produce an observation band");
+        let (lower, upper) = (&band.lower, &band.upper);
+        // The content is the predictive mass of the support points held: both
+        // (`(1 − m) + m = 1`), or the single point's own mass, 0.999 either way,
+        // above the 0.95 level by the atom's surplus (#3534).
+        assert_eq!(band.content[0], 1.0);
+        assert_eq!(band.content[1], mean[1]);
+        assert_eq!(band.content[2], 1.0 - mean[2]);
         assert_eq!(
             (lower[0], upper[0]),
             (0.0, 1.0),
