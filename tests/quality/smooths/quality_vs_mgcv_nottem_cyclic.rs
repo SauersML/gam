@@ -1,4 +1,4 @@
-//! End-to-end quality: gam's cyclic cubic smooth (`cc()` / `bs="cc"`) must
+//! End-to-end quality: gam's cyclic cubic smooth (`cyclic()`) must
 //! PREDICT a real seasonal cycle on held-out data — and enforce the periodic
 //! wrap — at least as well as **mgcv**, the mature, standard GAM implementation.
 //!
@@ -38,7 +38,7 @@
 //!   3. STRUCTURE — periodic seam continuity: gam genuinely enforces the wrap, so
 //!      its fitted cyclic smooth agrees at the period endpoints
 //!      `fit(month=1) == fit(month=13)` to 1e-6. This is a split-invariant property
-//!      of a cyclic basis (`bs="cc"`), asserted on one representative fit.
+//!      of a cyclic basis (`bs="cyclic"`), asserted on one representative fit.
 
 use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
@@ -57,7 +57,7 @@ const NOTTEM_CSV: &str = concat!(
 
 /// Month-of-year cyclic period: months 1..=12, with the seam (knots) at 1 and
 /// 13, so December (12) wraps continuously back to January (1). Both gam's
-/// `cc(..., period_start, period_end)` and mgcv's `knots=c(1,13)` use these.
+/// `cyclic(..., period_start, period_end)` and mgcv's `knots=c(1,13)` use these.
 const PERIOD_START: f64 = 1.0;
 const PERIOD_END: f64 = 13.0;
 /// Cyclic-basis dimension. With only 12 distinct months, k=8 is comfortably
@@ -66,7 +66,7 @@ const K: usize = 8;
 
 /// #2395: K random train/test partitions, averaged. n=240 (20 rows/month), so a
 /// ~25% hold-out keeps every month heavily represented in every partition's train
-/// set; the cc(month) fit is sub-millisecond, so 2*K=20 fits are trivially inside
+/// set; the cyclic(month) fit is sub-millisecond, so 2*K=20 fits are trivially inside
 /// the fast envelope while cutting the held-out metric's standard error ~3.2x.
 const K_SPLITS: usize = 10;
 /// Held-out fraction per partition (~75/25, matching the former i%4 split scale).
@@ -92,7 +92,7 @@ fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
         ..FitConfig::default()
     };
     let formula =
-        format!("temp ~ cc(month, k={K}, period_start={PERIOD_START}, period_end={PERIOD_END})");
+        format!("temp ~ cyclic(month, k={K}, period_start={PERIOD_START}, period_end={PERIOD_END})");
 
     let mut gam_rmses = Vec::with_capacity(K_SPLITS);
     let mut gam_r2s = Vec::with_capacity(K_SPLITS);
@@ -188,7 +188,7 @@ fn gam_cyclic_predicts_nottem_seasonal_cycle_vs_mgcv() {
     let gam_r2_avg = gam_r2s.iter().sum::<f64>() / gam_r2s.len() as f64;
 
     eprintln!(
-        "nottem cc(month) #2395 K={K_SPLITS}-split paired: gam_edf(split0)={gam_edf_repr:.3} \
+        "nottem cyclic(month) #2395 K={K_SPLITS}-split paired: gam_edf(split0)={gam_edf_repr:.3} \
          gam_test_R2_avg={gam_r2_avg:.4} wrap_gap(split0)={wrap_gap_repr:.3e}"
     );
     eprintln!("{}", panel.report("nottem_cyclic"));

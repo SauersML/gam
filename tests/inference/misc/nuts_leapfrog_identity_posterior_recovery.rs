@@ -1,4 +1,4 @@
-use gam::inference::hmc::{NUTSMassMatrixConfig, NutsConfig};
+use gam::inference::hmc::NUTSMassMatrixConfig;
 use general_mcmc::generic_hmc::HamiltonianTarget;
 use general_mcmc::generic_nuts::GenericNUTS;
 use ndarray::{Array1, Array2, Axis, arr1, arr2};
@@ -115,7 +115,7 @@ fn nuts_leapfrog_identity_and_gaussian_posterior_recovery() {
     let mut sampler = GenericNUTS::new_with_mass_matrix(
         target,
         initial,
-        NutsConfig::default().target_accept,
+        0.9,
         NUTSMassMatrixConfig::disabled(),
     )
     .set_seed(123);

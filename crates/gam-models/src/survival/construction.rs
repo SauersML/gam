@@ -183,14 +183,9 @@ pub enum SurvivalTimeBasisConfig {
     ///   B-spline, carried to the I-spline increments by the value-space
     ///   congruence and filtered through `keep_cols` for identifiability.
     ///
-    /// `TimeBlockInput::time_monotonicity` declares to the consuming
-    /// family how monotonicity is enforced. The marginal-slope
-    /// construction site sets it to
-    /// [`crate::survival::location_scale::TimeBlockMonotonicity::StructuralISpline`]
-    /// so the family skips row-wise `D β + o ≥ guard` constraint
-    /// generation and treats `γ ≥ 0` as the sole derivative-guard
-    /// mechanism. The universal `validate_time_qd1_feasible` safety net
-    /// runs regardless.
+    /// Every consuming family treats `γ ≥ 0` as the sole derivative-guard
+    /// mechanism: no row-wise `D β + o ≥ guard` constraints are generated.
+    /// The universal `validate_time_qd1_feasible` check runs regardless.
     ///
     /// An earlier iteration proposed a separate C-spline antiderivative
     /// parameterization that put `q'(t)` in the I-spline space and `q(t)`

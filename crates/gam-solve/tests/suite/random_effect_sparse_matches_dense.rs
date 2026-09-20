@@ -10,9 +10,11 @@
 //! penalty ranges as well as on the diagonal random-effect penalty.
 
 use faer::sparse::{SparseColMat, Triplet};
+use gam_linalg::matrix::DesignMatrix;
 use gam_problem::LikelihoodSpec;
 use gam_solve::estimate::{
-    ExternalOptimOptions, ExternalOptimResult, optimize_external_designwith_heuristic_log_lambdas,
+    ExternalOptimOptions, ExternalOptimResult, evaluate_externalcost,
+    optimize_external_designwith_heuristic_log_lambdas,
 };
 use gam_terms::smooth::BlockwisePenalty;
 use ndarray::{Array1, Array2};
@@ -87,10 +89,8 @@ fn problem() -> Problem {
     }
 }
 
-fn fit(problem: &Problem, sparse: bool) -> ExternalOptimResult {
-    let weights = Array1::<f64>::ones(ROWS);
-    let offset = Array1::<f64>::zeros(ROWS);
-    let options = ExternalOptimOptions {
+fn options() -> ExternalOptimOptions {
+    ExternalOptimOptions {
         family: LikelihoodSpec::gaussian_identity(),
         latent_cloglog: None,
         mixture_link: None,
@@ -106,7 +106,13 @@ fn fit(problem: &Problem, sparse: bool) -> ExternalOptimResult {
         firth_bias_reduction: None,
         rho_prior: Default::default(),
         persistent_warm_start_store: None,
-    };
+    }
+}
+
+fn fit(problem: &Problem, sparse: bool) -> ExternalOptimResult {
+    let weights = Array1::<f64>::ones(ROWS);
+    let offset = Array1::<f64>::zeros(ROWS);
+    let options = options();
     let result = if sparse {
         optimize_external_designwith_heuristic_log_lambdas(
             problem.y.view(),
@@ -144,6 +150,31 @@ fn many_level_random_effect_sparse_fit_matches_the_dense_fit() {
     let sparse_score = sparse
         .reml_score
         .expect("the sparse fit has a finite REML score");
+    // The criterion itself, before any search: at one ρ the two designs must
+    // evaluate the same REML value.
+    let weights = Array1::<f64>::ones(ROWS);
+    let offset = Array1::<f64>::zeros(ROWS);
+    let criterion = |design: DesignMatrix| {
+        evaluate_externalcost(
+            problem.y.view(),
+            weights.view(),
+            design,
+            offset.view(),
+            &problem.penalties,
+            &options(),
+            &dense.log_lambdas,
+        )
+        .expect("the REML criterion evaluates at the dense optimum")
+    };
+    let dense_value = criterion(problem.dense.clone().into());
+    let sparse_value = criterion(problem.sparse.clone().into());
+    assert!(
+        (sparse_value - dense_value).abs() <= 1e-9 * dense_value.abs().max(1.0),
+        "REML criterion at one rho: sparse {sparse_value:.15e} vs dense {dense_value:.15e}"
+    );
+
+    // The searches: the sparse exact path publishes the same certificate
+    // evidence as the dense one, so both stop on the same rung (#3294).
     let score_gap = (sparse_score - dense_score).abs() / dense_score.abs().max(1.0);
     assert!(
         score_gap <= 1e-9,

@@ -48,7 +48,10 @@
 use std::collections::BTreeMap;
 
 use gam_problem::{DeclaredHessianForm, Derivative, EstimationError, HessianValue, OuterEval};
-use gam_solve::estimate::outer_eval_capture::{RhoGradientParts, record_certificate_parts};
+use gam_solve::estimate::outer_eval_capture::{
+    InnerResidualCharge, InnerResidualSource, RhoGradientParts, record_certificate_inner_residual,
+    record_certificate_parts,
+};
 use gam_solve::rho_optimizer::{
     OuterCapability, OuterCriterionCertificate, OuterEvalOrder, OuterObjective, OuterProblem,
     SeedOutcome,
@@ -271,6 +274,10 @@ struct SupportOuterEvaluation {
     /// to the outer certificate so it charges each component its own rounding
     /// and resolution (#2954).
     gradient_parts: Vec<RhoGradientParts>,
+    /// The error `cost` carries because its inner fixed point stops short of the
+    /// exact mode, published with every order so the outer search compares two
+    /// values at their own resolution (#3340).
+    inner_residual: InnerResidualCharge,
 }
 
 #[derive(Clone)]
@@ -836,7 +843,7 @@ impl SaeSupportOuterObjective {
         // one per group), which both cost the whole evaluation's wall-clock and
         // left the value and gradient free to describe different functions.
         let energy = self.penalty_energy_by_group(&lambda_smooth);
-        let profile_adjoint = self
+        let (logdet_theta_derivative, profile_adjoint) = self
             .term
             .support_reduced_logdet_profile_adjoint(
                 self.target.view(),
@@ -845,6 +852,42 @@ impl SaeSupportOuterObjective {
                 &logdet_derivative,
             )
             .map_err(outer_error)?;
+        // The error `cost` carries because the fixed point stops at a residual
+        // rather than at the exact inner mode `θ* ≈ θ̂ − Δ` (#3340). To first order
+        // `V(θ̂) − V(θ*) = ½·gᵀA⁻¹g + ½·⟨Γ, Δ⟩`: the penalized objective's Newton
+        // decrement, and the log determinant's move along the same displacement.
+        // Each is charged at its magnitude, so the charge bounds the error rather
+        // than correcting it. Without it the outer search compares two of this
+        // surrogate's values only at the criterion's statistical resolution
+        // `1/(2n)`, and on a small target it reads every accepted BFGS step as no
+        // resolved descent.
+        let displacement = &fixed_point.newton_displacement;
+        if logdet_theta_derivative.t.len() != displacement.coordinates.len()
+            || logdet_theta_derivative.beta.len() != displacement.decoder.len()
+        {
+            return Err(outer_error(format!(
+                "support LAML log-determinant derivative ({} coordinates, {} decoder) does not \
+                 match the fixed point's Newton displacement ({} coordinates, {} decoder)",
+                logdet_theta_derivative.t.len(),
+                logdet_theta_derivative.beta.len(),
+                displacement.coordinates.len(),
+                displacement.decoder.len(),
+            )));
+        }
+        let logdet_move = logdet_theta_derivative.t.dot(&displacement.coordinates)
+            + logdet_theta_derivative.beta.dot(&displacement.decoder);
+        let inner_residual = InnerResidualCharge {
+            energy: 0.5 * (displacement.decrement_sq.abs() + logdet_move.abs()),
+            source: InnerResidualSource::InnerGradient,
+        };
+        log::debug!(
+            "support LAML inner residual charge {:.3e} (Newton decrement² {:.3e}, log-determinant \
+             move {:.3e}) at value {:.6e}",
+            inner_residual.energy,
+            displacement.decrement_sq,
+            logdet_move,
+            components.value(),
+        );
         let mut gradient = Array1::<f64>::zeros(self.layout.group_keys.len());
         let mut gradient_parts = Vec::with_capacity(gradient.len());
         for group in 0..gradient.len() {
@@ -941,6 +984,7 @@ impl SaeSupportOuterObjective {
             logdet_std_err: logdet_derivative.value_std_err(),
             probe_gradient_samples,
             gradient_parts,
+            inner_residual,
         })
     }
 
@@ -1042,12 +1086,16 @@ impl OuterObjective for SaeSupportOuterObjective {
 
     fn eval_cost(&mut self, rho: &Array1<f64>) -> Result<f64, EstimationError> {
         self.evaluate_for_order(rho, OuterEvalOrder::Value)
-            .map(|evaluation| evaluation.cost)
+            .map(|evaluation| {
+                record_certificate_inner_residual(evaluation.inner_residual);
+                evaluation.cost
+            })
     }
 
     fn eval(&mut self, rho: &Array1<f64>) -> Result<OuterEval, EstimationError> {
         let evaluation = self.evaluate_for_order(rho, OuterEvalOrder::ValueAndGradient)?;
         record_certificate_parts(&evaluation.gradient_parts);
+        record_certificate_inner_residual(evaluation.inner_residual);
         Ok(OuterEval {
             cost: evaluation.cost,
             gradient: evaluation.gradient,
@@ -1062,6 +1110,7 @@ impl OuterObjective for SaeSupportOuterObjective {
         order: OuterEvalOrder,
     ) -> Result<OuterEval, EstimationError> {
         let evaluation = self.evaluate_for_order(rho, order)?;
+        record_certificate_inner_residual(evaluation.inner_residual);
         match order {
             OuterEvalOrder::Value => Ok(OuterEval::value_only(evaluation.cost, rho.len(), None)),
             OuterEvalOrder::ValueAndGradient | OuterEvalOrder::ValueGradientHessian => {
