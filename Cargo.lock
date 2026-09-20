@@ -4080,6 +4080,7 @@ dependencies = [
  "faer",
  "gam-linalg",
  "gam-linalg-test-support",
+ "gam-math",
  "gam-models",
  "gam-problem",
  "gam-runtime",

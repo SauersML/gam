@@ -519,6 +519,128 @@ pub fn rmse(a: &[f64], b: &[f64]) -> f64 {
     (s / a.len().max(1) as f64).sqrt()
 }
 
+/// Across-the-function coverage of a fit's Bayesian band against a known
+/// in-span target (Nychka 1988; Marra & Wood 2012), with its derived bound.
+#[derive(Debug, Clone, Copy)]
+pub struct AcrossFunctionCoverage {
+    /// `Q = (1/P) Σ e_i² / s_i²`. Under the model behind the band `E[Q] = 1`.
+    pub statistic: f64,
+    /// Upper `1 − α` quantile of the moment-matched scaled `χ²` law of `Q`.
+    pub bound: f64,
+    /// Satterthwaite degrees of freedom `h = P² / tr(R²)` of that law.
+    pub dof: f64,
+}
+
+impl AcrossFunctionCoverage {
+    /// Whether the band covers the error at the requested level.
+    pub fn covers(&self) -> bool {
+        self.statistic <= self.bound
+    }
+}
+
+/// Across-the-function coverage statistic of a Bayesian band.
+///
+/// `x_probe` is the probe design (`P × p`), `cov` the fit's Bayesian
+/// coefficient covariance `Vb` (`p × p`) and `err` the errors
+/// `e_i = f̂(x_i) − f(x_i)` of the fitted function against the target it
+/// estimates. With `C = X_p Vb X_pᵀ`, `s_i = √C_ii` and the probe correlation
+/// `R = D⁻¹ C D⁻¹` (`D = diag(s)`), the statistic is `Q = (1/P) Σ e_i²/s_i²`.
+///
+/// Under the model the band asserts, `e ~ N(0, C)`, so `z = D⁻¹e ~ N(0, R)`,
+/// `Q = zᵀz / P`, `E[Q] = tr(R)/P = 1` and `Var[Q] = 2·tr(R²)/P²`. Smoothing
+/// bias adds to `e` while over-smoothing shrinks `s`, so a fit that loses
+/// signal drives `Q ≫ 1`, and a band far wider than its error shows as
+/// `Q ≪ 1`. The bound is the `1 − alpha` quantile of the scaled `χ²` matched
+/// to those two moments (Satterthwaite): `Q ≈ g·χ²_h` with `g·h = 1` and
+/// `2g²h = 2·tr(R²)/P²`, i.e. `g = tr(R²)/P²`, `h = 1/g`.
+pub fn across_function_coverage(
+    x_probe: &ndarray::Array2<f64>,
+    cov: &ndarray::Array2<f64>,
+    err: &[f64],
+    alpha: f64,
+) -> Result<AcrossFunctionCoverage, String> {
+    let p = err.len();
+    if x_probe.nrows() != p || x_probe.ncols() != cov.nrows() || cov.nrows() != cov.ncols() {
+        return Err(format!(
+            "across_function_coverage shape mismatch: probe design {:?}, covariance {:?}, {p} errors",
+            x_probe.dim(),
+            cov.dim()
+        ));
+    }
+    if p == 0 || !(alpha > 0.0 && alpha < 1.0) {
+        return Err(format!(
+            "across_function_coverage needs P > 0 probes and alpha in (0, 1); got P = {p}, alpha = {alpha}"
+        ));
+    }
+    let c = x_probe.dot(cov).dot(&x_probe.t());
+    let s: Vec<f64> = (0..p).map(|i| c[[i, i]].sqrt()).collect();
+    if let Some(i) = s.iter().position(|v| !(v.is_finite() && *v > 0.0)) {
+        return Err(format!("posterior SE at probe {i} is {}", s[i]));
+    }
+    if let Some(i) = err.iter().position(|e| !e.is_finite()) {
+        return Err(format!("error at probe {i} is {}", err[i]));
+    }
+    let statistic = err
+        .iter()
+        .zip(&s)
+        .map(|(e, si)| (e / si).powi(2))
+        .sum::<f64>()
+        / p as f64;
+    let mut tr_r2 = 0.0;
+    for i in 0..p {
+        for j in 0..p {
+            let r = c[[i, j]] / (s[i] * s[j]);
+            tr_r2 += r * r;
+        }
+    }
+    let g = tr_r2 / (p * p) as f64;
+    let dof = 1.0 / g;
+    let bound = g * gam_math::probability::chi_square_quantile(1.0 - alpha, dof);
+    Ok(AcrossFunctionCoverage {
+        statistic,
+        bound,
+        dof,
+    })
+}
+
+/// Minimum-norm least-squares coefficients `β* = X⁺ f`: the unpenalized
+/// projection of a known target onto a design's column space.
+///
+/// For a Gaussian working model this is the pseudo-true (KL-closest) in-basis
+/// function of the design's rows (White 1982), so it is the in-span target a
+/// penalized fit on those rows estimates. The pseudo-inverse drops singular
+/// directions at or below the SVD's own rounding level `max(n, p)·ε·σ_max`, so
+/// an unidentified direction contributes nothing instead of amplified rounding.
+pub fn least_squares_projection(
+    design: &ndarray::Array2<f64>,
+    target: &[f64],
+) -> Result<ndarray::Array1<f64>, String> {
+    use gam_linalg::faer_ndarray::FaerSvd;
+    if design.nrows() != target.len() {
+        return Err(format!(
+            "least_squares_projection: design has {} rows but the target has {}",
+            design.nrows(),
+            target.len()
+        ));
+    }
+    let (u, s, vt) = design.svd(true, true).map_err(|e| e.to_string())?;
+    let (u, vt) = match (u, vt) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => return Err("least_squares_projection: SVD returned no singular vectors".into()),
+    };
+    let sigma_max = s.iter().copied().fold(0.0, f64::max);
+    let tol = (design.nrows().max(design.ncols()) as f64) * f64::EPSILON * sigma_max;
+    let f = ndarray::ArrayView1::from(target);
+    let mut beta = ndarray::Array1::<f64>::zeros(design.ncols());
+    for (j, &sj) in s.iter().enumerate() {
+        if sj > tol {
+            let coef = u.column(j).dot(&f) / sj;
+            beta.scaled_add(coef, &vt.row(j));
+        }
+    }
+    Ok(beta)
+}
+
 /// Lowest held-out AUC that is `z` standard errors above the no-skill value
 /// (0.5) for a split with `n_pos`/`n_neg` classes.
 ///

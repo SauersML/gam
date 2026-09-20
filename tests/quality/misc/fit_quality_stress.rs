@@ -1,28 +1,37 @@
 //! Adversarial fit-quality stress probes across the geometric smooth families.
 //!
-//! These tests do NOT enforce tight numerical tolerances: their job is to
-//! generate honest, structured quality data by stressing each smooth with
-//! known-hard signals (high frequency, sharp bumps, discontinuities,
-//! heteroscedastic noise, outliers, etc.), fit it via `gam::fit_from_formula`,
-//! and categorize the result as PASS / DEGRADED / COLLAPSED based on the
-//! prediction RMSE relative to the noise scale and the recovered span
-//! relative to the truth span.
+//! Each probe stresses one smooth with a known-hard signal (high frequency,
+//! sharp bumps, discontinuities, heteroscedastic noise, outliers, ...), fits it
+//! via `gam::fit_from_formula`, and asserts, in this order:
 //!
-//! Each probe `eprintln!`s a single `[fit-quality]` line so the user can grep
-//! the output. The only hard assertion is non-finiteness — a smooth that
-//! produces NaN/Inf is an actual bug and fails the test.
+//! 1. the fit and the prediction-design rebuild succeed (an error panics);
+//! 2. every prediction and coefficient is finite;
+//! 3. the fit's own Bayesian band covers its error across the function
+//!    (`assess`): with `f*` the in-span target (the unpenalized least-squares
+//!    projection of the truth onto the fit's own training design) and `Vb` the
+//!    fit's Bayesian coefficient covariance, the coverage statistic
+//!    `Q = (1/P) Σ (f̂_i − f*_i)² / s_i²` must lie below its Satterthwaite
+//!    `χ²` bound at the per-probe level `FAMILY_ALPHA / GATED_PROBES`.
+//!
+//! When the truth is in the basis, `f* = f` and gate 3 is exactly the
+//! across-the-function coverage test. When it is not (a step, a truth that
+//! breaks an anchored endpoint pin, a frequency the basis only approximates),
+//! `f*` is the best function this basis can express on these rows, so the gate
+//! charges the fit only for what it could have recovered. Each probe prints one
+//! `[fit-quality]` line with `Q`, its bound and the RMSE split into the
+//! approximation floor `‖f* − f‖` and the in-span error `‖f̂ − f*‖`.
 //!
 //! Deterministic LCG seeding is used throughout (no rand crate dependency on
 //! the noise streams) so reruns and CI are bit-identical.
 
 use csv::StringRecord;
-use gam::matrix::LinearOperator;
 use gam::smooth::build_term_collection_design;
-use gam::test_support::reference::rmse;
+use gam::test_support::reference::{across_function_coverage, least_squares_projection, rmse};
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
 };
-use ndarray::Array2;
+use ndarray::{Array2, s};
+use std::ops::Range;
 
 const TAU: f64 = std::f64::consts::TAU;
 const PI: f64 = std::f64::consts::PI;
@@ -64,60 +73,35 @@ impl Lcg {
     }
 }
 
-// ---------- categorization ----------
+// ---------- the derived gate ----------
 
-#[derive(Debug, Clone, Copy)]
-enum Category {
-    Pass,
-    Degraded,
-    Collapsed,
-}
+/// Family-wise false-alarm rate of this file's coverage gates: with every smooth
+/// correct, the chance that any gated probe fails is at most this.
+const FAMILY_ALPHA: f64 = 0.01;
 
-impl Category {
-    fn label(&self) -> &'static str {
-        match self {
-            Category::Pass => "PASS",
-            Category::Degraded => "DEGRADED",
-            Category::Collapsed => "COLLAPSED",
-        }
-    }
-}
+/// Number of `#[test]` probes gated by [`assess`]: cyclic k4-k10 (4), anchored
+/// k4-k10 (4), sphere l4-l8 (3), tensor k4-k10 (4), and the nine single probes.
+/// Bonferroni splits [`FAMILY_ALPHA`] evenly across them.
+const GATED_PROBES: f64 = 24.0;
 
-/// Classify based on rmse vs noise sd and recovered-span vs truth-span ratio.
-///
-/// Categories (in order of precedence):
-///   COLLAPSED if span_ratio < 0.30
-///   PASS      if rmse < 2 σ AND span_ratio >= 0.70
-///   DEGRADED  if rmse < 5 σ
-///   COLLAPSED otherwise
-fn categorize(rmse: f64, sigma: f64, span_ratio: f64) -> Category {
-    let sigma_eff = sigma.max(1e-9);
-    if span_ratio < 0.30 {
-        Category::Collapsed
-    } else if rmse < 2.0 * sigma_eff && span_ratio >= 0.70 {
-        Category::Pass
-    } else if rmse < 5.0 * sigma_eff {
-        Category::Degraded
-    } else {
-        Category::Collapsed
-    }
+/// A converged fit together with everything [`assess`] needs: its predictions
+/// on the probe rows, its coefficients, the dense training and probe designs
+/// (rebuilt from the frozen spec, so they are exactly the design the fit used)
+/// with their fixed affine offsets, and the Bayesian covariance `Vb`.
+struct ProbeFit {
+    yhat: Vec<f64>,
+    beta: Vec<f64>,
+    x_train: Array2<f64>,
+    offset_train: Vec<f64>,
+    x_probe: Array2<f64>,
+    offset_probe: Vec<f64>,
+    cov: Array2<f64>,
 }
 
 fn span(v: &[f64]) -> f64 {
     let max = v.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let min = v.iter().cloned().fold(f64::INFINITY, f64::min);
     max - min
-}
-
-fn truth_residual(yhat: &[f64], truth: &[f64]) -> f64 {
-    // L1 mean residual at truth — a complementary metric to rmse.
-    let n = yhat.len() as f64;
-    let s: f64 = yhat
-        .iter()
-        .zip(truth.iter())
-        .map(|(a, b)| (a - b).abs())
-        .sum();
-    s / n
 }
 
 fn check_finite(name: &str, formula: &str, yhat: &[f64], beta: &[f64]) {
@@ -130,50 +114,79 @@ fn check_finite(name: &str, formula: &str, yhat: &[f64], beta: &[f64]) {
     );
 }
 
-/// Emit a structured error category when fit-or-predict fails. The task
-/// asked us to hard-assert only on non-finite outputs — a fit that errors
-/// before producing any prediction is reported (not panicked) so the
-/// downstream probes still run and the suite produces an honest table.
-fn report_fit_error(probe: &str, formula: &str, err: &str) {
-    let cat = if err.contains("frozen identifiability transform mismatch") {
-        // Specific known ticket: see tests/bc_clamped_predict_shape_bug.rs.
-        "PREDICT_DESIGN_BUG"
-    } else if err.contains("rebuild design failed") {
-        "PREDICT_FAILED"
-    } else {
-        "FIT_FAILED"
-    };
-    eprintln!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`",);
-    panic!("[fit-quality] probe={probe} category={cat} formula=`{formula}` err=`{err}`");
+/// A fit or its prediction-design rebuild failed. Every probe here is a
+/// well-defined penalized regression, so a refusal is a failure of the probe.
+fn fit_error(probe: &str, formula: &str, err: &str) -> ! {
+    panic!("[fit-quality] probe={probe} verdict=FIT_FAILED formula=`{formula}` err=`{err}`");
 }
 
-fn report(
+/// Gate one probe on the rows `gated` of its probe design.
+///
+/// `truth` is the true function on those rows and `truth_train` the true
+/// function on the training rows. The in-span target is `f* = X_p β*` with
+/// `β* = X_train⁺ (f_train − o_train)` (plus the probe rows' fixed offset): the
+/// unpenalized least-squares projection of the truth onto the fit's own design,
+/// which is what the penalized fit estimates when the truth is not exactly in
+/// the basis. The fit passes iff its Bayesian band covers `f̂ − f*` across the
+/// function at level `FAMILY_ALPHA / GATED_PROBES`
+/// (`gam::test_support::reference::across_function_coverage`).
+fn assess(
     probe: &str,
     formula: &str,
-    rmse_val: f64,
-    sigma: f64,
-    span_fit: f64,
-    span_truth: f64,
+    fit: &ProbeFit,
+    gated: Range<usize>,
+    truth: &[f64],
+    truth_train: &[f64],
     extra: &str,
-) -> Category {
-    let ratio = if span_truth.abs() < 1e-12 {
-        1.0
+) {
+    check_finite(probe, formula, &fit.yhat, &fit.beta);
+    assert_eq!(truth.len(), gated.len(), "{probe}: truth rows vs gated rows");
+    let target_train: Vec<f64> = truth_train
+        .iter()
+        .zip(&fit.offset_train)
+        .map(|(f, o)| f - o)
+        .collect();
+    let beta_star = least_squares_projection(&fit.x_train, &target_train)
+        .unwrap_or_else(|e| panic!("{probe}: in-span projection failed: {e}"));
+    let x_gate = fit.x_probe.slice(s![gated.clone(), ..]).to_owned();
+    let f_star: Vec<f64> = x_gate
+        .dot(&beta_star)
+        .iter()
+        .zip(&fit.offset_probe[gated.clone()])
+        .map(|(v, o)| v + o)
+        .collect();
+    let yhat = &fit.yhat[gated];
+    let err: Vec<f64> = yhat.iter().zip(&f_star).map(|(a, b)| a - b).collect();
+    let alpha = FAMILY_ALPHA / GATED_PROBES;
+    let cov = across_function_coverage(&x_gate, &fit.cov, &err, alpha)
+        .unwrap_or_else(|e| panic!("{probe}: coverage statistic failed: {e}"));
+    let rmse_truth = rmse(yhat, truth);
+    let floor = rmse(&f_star, truth);
+    let in_span = rmse(yhat, &f_star);
+    let span_truth = span(truth);
+    let span_ratio = if span_truth > 0.0 {
+        span(yhat) / span_truth
     } else {
-        span_fit / span_truth
+        f64::NAN
     };
-    let cat = categorize(rmse_val, sigma, ratio);
+    let verdict = if cov.covers() { "PASS" } else { "FAIL" };
     eprintln!(
-        "[fit-quality] probe={probe} category={cat} rmse={rmse_val:.4} \
-         sigma_noise={sigma:.4} span_fit={span_fit:.3} span_truth={span_truth:.3} \
-         span_ratio={ratio:.3}{ws}{extra} formula=`{formula}`",
-        cat = cat.label(),
+        "[fit-quality] probe={probe} verdict={verdict} Q={q:.4} bound={bound:.4} dof={dof:.2} \
+         alpha={alpha:.2e} rmse={rmse_truth:.4} floor={floor:.4} in_span_rmse={in_span:.4} \
+         span_ratio={span_ratio:.3}{ws}{extra} formula=`{formula}`",
+        q = cov.statistic,
+        bound = cov.bound,
+        dof = cov.dof,
         ws = if extra.is_empty() { "" } else { " " },
     );
     assert!(
-        !matches!(cat, Category::Collapsed),
-        "probe {probe} collapsed"
+        cov.covers(),
+        "[fit-quality] probe {probe}: the fit's Bayesian band does not cover its in-span error \
+         (Q = {q:.4} > bound {bound:.4} at alpha {alpha:.2e}; in-span rmse {in_span:.4}, \
+         approximation floor {floor:.4})",
+        q = cov.statistic,
+        bound = cov.bound,
     );
-    cat
 }
 
 // ---------- dataset & predict helpers ----------
@@ -221,11 +234,26 @@ fn make_dataset_2d_named(
     encode_recordswith_inferred_schema(headers, rows).expect("encode 2d")
 }
 
-fn fit_predict_1d(
+/// Covariate matrix for `build_term_collection_design`: the given covariate
+/// columns in dataset order, then the response column (unused by any term).
+fn covariate_matrix(cols: &[&[f64]]) -> Array2<f64> {
+    let n = cols[0].len();
+    let mut m = Array2::<f64>::zeros((n, cols.len() + 1));
+    for (j, col) in cols.iter().enumerate() {
+        assert_eq!(col.len(), n, "covariate column {j} length");
+        for (i, &v) in col.iter().enumerate() {
+            m[[i, j]] = v;
+        }
+    }
+    m
+}
+
+fn fit_probe(
     formula: &str,
     data: &gam::data::EncodedDataset,
-    x_grid: &[f64],
-) -> Result<(Vec<f64>, Vec<f64>), String> {
+    train_cols: &[&[f64]],
+    probe_cols: &[&[f64]],
+) -> Result<ProbeFit, String> {
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
@@ -234,50 +262,59 @@ fn fit_predict_1d(
     let FitResult::Standard(fit) = result else {
         return Err("expected standard fit".to_string());
     };
-    let n = x_grid.len();
-    let mut m = Array2::<f64>::zeros((n, 2));
-    for i in 0..n {
-        m[[i, 0]] = x_grid[i];
-        m[[i, 1]] = 0.0;
-    }
-    let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .map_err(|e| format!("rebuild design failed: {e:?}"))?;
-    let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    Ok((pred, fit.fit.beta.to_vec()))
+    let rebuild = |cols: &[&[f64]]| {
+        build_term_collection_design(covariate_matrix(cols).view(), &fit.resolvedspec)
+            .map_err(|e| format!("rebuild design failed: {e:?}"))
+    };
+    let train = rebuild(train_cols)?;
+    let probe = rebuild(probe_cols)?;
+    let x_train = train.design.to_dense();
+    let x_probe = probe.design.to_dense();
+    let yhat: Vec<f64> = x_probe
+        .dot(&fit.fit.beta)
+        .iter()
+        .zip(probe.affine_offset.iter())
+        .map(|(v, o)| v + o)
+        .collect();
+    let cov = fit
+        .fit
+        .beta_covariance()
+        .ok_or_else(|| "fit reports no Bayesian coefficient covariance".to_string())?
+        .clone();
+    Ok(ProbeFit {
+        yhat,
+        beta: fit.fit.beta.to_vec(),
+        x_train,
+        offset_train: train.affine_offset.to_vec(),
+        x_probe,
+        offset_probe: probe.affine_offset.to_vec(),
+        cov,
+    })
+}
+
+fn fit_predict_1d(
+    formula: &str,
+    data: &gam::data::EncodedDataset,
+    x_train: &[f64],
+    x_grid: &[f64],
+) -> Result<ProbeFit, String> {
+    fit_probe(formula, data, &[x_train], &[x_grid])
 }
 
 fn fit_predict_2d(
     formula: &str,
     data: &gam::data::EncodedDataset,
-    a_grid: &[f64],
-    b_grid: &[f64],
-) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let result = fit_from_formula(formula, data, &cfg)?;
-    let FitResult::Standard(fit) = result else {
-        return Err("expected standard fit".to_string());
-    };
-    let n = a_grid.len();
-    let mut m = Array2::<f64>::zeros((n, 3));
-    for i in 0..n {
-        m[[i, 0]] = a_grid[i];
-        m[[i, 1]] = b_grid[i];
-        m[[i, 2]] = 0.0;
-    }
-    let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-        .map_err(|e| format!("rebuild design failed: {e:?}"))?;
-    let pred = test_design.design.apply(&fit.fit.beta).to_vec();
-    Ok((pred, fit.fit.beta.to_vec()))
+    (a_train, b_train): (&[f64], &[f64]),
+    (a_grid, b_grid): (&[f64], &[f64]),
+) -> Result<ProbeFit, String> {
+    fit_probe(formula, data, &[a_train, b_train], &[a_grid, b_grid])
 }
 
 // =====================================================================
 // Probe 1: high-frequency truths sin(2π k x), k in {4, 6, 8, 10}
 // =====================================================================
 
-fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
+fn hifreq_cyclic_probe(k: usize) {
     init_parallelism();
     let n: usize = 400;
     let sigma = 0.10;
@@ -297,44 +334,30 @@ fn hifreq_cyclic_probe(k: usize) -> Result<(), String> {
     let truth: Vec<f64> = theta_grid.iter().map(|t| (k as f64 * t).sin()).collect();
 
     let probe = format!("hifreq_cyclic_k{k}");
-    let (yhat, beta) = match fit_predict_1d(&formula, &data, &theta_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let fit = fit_predict_1d(&formula, &data, &theta, &theta_grid)
+        .unwrap_or_else(|e| fit_error(&probe, &formula, &e));
+    let extra = format!("k={k} sigma_noise={sigma:.3}");
+    assess(&probe, &formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 #[test]
-fn hifreq_cyclic_k4() -> Result<(), String> {
+fn hifreq_cyclic_k4() {
     hifreq_cyclic_probe(4)
 }
 #[test]
-fn hifreq_cyclic_k6() -> Result<(), String> {
+fn hifreq_cyclic_k6() {
     hifreq_cyclic_probe(6)
 }
 #[test]
-fn hifreq_cyclic_k8() -> Result<(), String> {
+fn hifreq_cyclic_k8() {
     hifreq_cyclic_probe(8)
 }
 #[test]
-fn hifreq_cyclic_k10() -> Result<(), String> {
+fn hifreq_cyclic_k10() {
     hifreq_cyclic_probe(10)
 }
 
-fn hifreq_bc_probe(k: usize) -> Result<(), String> {
+fn hifreq_bc_probe(k: usize) {
     init_parallelism();
     let n: usize = 400;
     let sigma = 0.10;
@@ -352,41 +375,30 @@ fn hifreq_bc_probe(k: usize) -> Result<(), String> {
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|t| (TAU * k as f64 * t).sin()).collect();
 
+    // `bc=anchored` pins f = 0 and f' = 0 at both ends, while sin(2πkx) has
+    // f'(0) = 2πk: the truth is not in the basis, and `assess` gates against
+    // its in-span projection rather than against the unrepresentable slope.
     let probe = format!("hifreq_bc_k{k}");
-    let (yhat, beta) = match fit_predict_1d(&formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let fit = fit_predict_1d(&formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(&probe, &formula, &e));
+    let extra = format!("k={k} sigma_noise={sigma:.3}");
+    assess(&probe, &formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 #[test]
-fn hifreq_bc_k4() -> Result<(), String> {
+fn hifreq_bc_k4() {
     hifreq_bc_probe(4)
 }
 #[test]
-fn hifreq_bc_k6() -> Result<(), String> {
+fn hifreq_bc_k6() {
     hifreq_bc_probe(6)
 }
 #[test]
-fn hifreq_bc_k8() -> Result<(), String> {
+fn hifreq_bc_k8() {
     hifreq_bc_probe(8)
 }
 #[test]
-fn hifreq_bc_k10() -> Result<(), String> {
+fn hifreq_bc_k10() {
     hifreq_bc_probe(10)
 }
 
@@ -412,7 +424,7 @@ fn legendre_p(l: usize, x: f64) -> f64 {
     p_curr
 }
 
-fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
+fn hifreq_sphere_probe(l: usize) {
     init_parallelism();
     // Quasi-uniform sphere sampling via Fibonacci spiral so we cover all
     // latitudes including near-pole bands.
@@ -448,50 +460,50 @@ fn hifreq_sphere_probe(l: usize) -> Result<(), String> {
         .collect();
 
     let probe = format!("hifreq_sphere_l{l}");
-    let (yhat, beta) = match fit_predict_2d(&formula, &data, &lat_test, &lon_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("l={l} l1_at_truth={l1:.4}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let fit = fit_predict_2d(
+        &formula,
+        &data,
+        (&lat_deg, &lon_deg),
+        (&lat_test, &lon_test),
+    )
+    .unwrap_or_else(|e| fit_error(&probe, &formula, &e));
+    let extra = format!("l={l} sigma_noise={sigma:.3}");
+    let rows = 0..lat_test.len();
+    assess(&probe, &formula, &fit, rows, &truth, &y_truth, &extra);
 }
 
 #[test]
-fn hifreq_sphere_l4() -> Result<(), String> {
+fn hifreq_sphere_l4() {
     hifreq_sphere_probe(4)
 }
 #[test]
-fn hifreq_sphere_l6() -> Result<(), String> {
+fn hifreq_sphere_l6() {
     hifreq_sphere_probe(6)
 }
 #[test]
-fn hifreq_sphere_l8() -> Result<(), String> {
+fn hifreq_sphere_l8() {
     hifreq_sphere_probe(8)
 }
 
 /// Deterministic 2-D high-frequency tensor fixture shared by the k-arms and the
 /// zz_measure λ-readout sibling: y = sin(k·θ)·cos(π·h) on a 24×24 grid, σ=0.10,
 /// fit with te(theta[periodic], h[natural]), kb=(2k+4).max(10) per margin.
-/// Returns (data, formula, n_train, sigma).
+struct TensorFixture {
+    data: gam::data::EncodedDataset,
+    formula: String,
+    theta: Vec<f64>,
+    h: Vec<f64>,
+    y_truth: Vec<f64>,
+    sigma: f64,
+}
+
 /// Tensor-margin basis size for the `hifreq_tensor` family. Hoisted so the grid
 /// can size itself against the basis (#2607) instead of the two drifting apart.
 fn kb_for(k: usize) -> usize {
     (2 * k + 4).max(10)
 }
 
-fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize, f64) {
+fn hifreq_tensor_dataset(k: usize) -> TensorFixture {
     // #2607: the grid must stay ahead of the basis, or the design SATURATES and
     // the arm stops measuring what its siblings measure.
     //
@@ -526,6 +538,7 @@ fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize,
     let mut rng = Lcg::new(0xD7 * (k as u64) + 41);
     let mut theta = Vec::with_capacity(n_theta * n_h);
     let mut h = Vec::with_capacity(n_theta * n_h);
+    let mut y_truth = Vec::with_capacity(n_theta * n_h);
     let mut y_noisy = Vec::with_capacity(n_theta * n_h);
     for i in 0..n_theta {
         let t = TAU * (i as f64) / (n_theta as f64);
@@ -534,6 +547,7 @@ fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize,
             let yt = (k as f64 * t).sin() * (PI * hv).cos();
             theta.push(t);
             h.push(hv);
+            y_truth.push(yt);
             y_noisy.push(yt + sigma * rng.normal());
         }
     }
@@ -541,12 +555,20 @@ fn hifreq_tensor_dataset(k: usize) -> (gam::data::EncodedDataset, String, usize,
     let kb = kb_for(k);
     let formula =
         format!("y ~ te(theta, h, bc=['periodic', 'natural'], period=[2*pi, None], k={kb})");
-    (data, formula, n_theta * n_h, sigma)
+    TensorFixture {
+        data,
+        formula,
+        theta,
+        h,
+        y_truth,
+        sigma,
+    }
 }
 
-fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
+fn hifreq_tensor_probe(k: usize) {
     init_parallelism();
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(k);
+    let fx = hifreq_tensor_dataset(k);
+    let formula = &fx.formula;
 
     // Test grid
     let g: Vec<f64> = (0..25).map(|i| 0.02 + 0.96 * i as f64 / 24.0).collect();
@@ -564,32 +586,23 @@ fn hifreq_tensor_probe(k: usize) -> Result<(), String> {
     }
 
     let probe = format!("hifreq_tensor_k{k}");
-    let (yhat, beta) = match fit_predict_2d(&formula, &data, &t_test, &h_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error(&probe, &formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite(&probe, &formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let extra = format!("k={k} l1_at_truth={l1:.4} n_train={n_train}");
-    let cat = report(&probe, &formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let fit = fit_predict_2d(formula, &fx.data, (&fx.theta, &fx.h), (&t_test, &h_test))
+        .unwrap_or_else(|e| fit_error(&probe, formula, &e));
+    let extra = format!(
+        "k={k} sigma_noise={:.3} n_train={}",
+        fx.sigma,
+        fx.theta.len()
+    );
+    let rows = 0..t_test.len();
+    assess(&probe, formula, &fit, rows, &truth, &fx.y_truth, &extra);
 }
 
 #[test]
-fn hifreq_tensor_k4() -> Result<(), String> {
+fn hifreq_tensor_k4() {
     hifreq_tensor_probe(4)
 }
 #[test]
-fn hifreq_tensor_k6() -> Result<(), String> {
+fn hifreq_tensor_k6() {
     hifreq_tensor_probe(6)
 }
 // gam#1082/#2585: hifreq_tensor_k8/k10 run LONGER than the default per-test
@@ -670,11 +683,11 @@ fn hifreq_tensor_k6() -> Result<(), String> {
 // the grid, not capping the basis, is what keeps `p/n` bounded — which is what
 // the fixture now does.
 #[test]
-fn hifreq_tensor_k8() -> Result<(), String> {
+fn hifreq_tensor_k8() {
     hifreq_tensor_probe(8)
 }
 #[test]
-fn hifreq_tensor_k10() -> Result<(), String> {
+fn hifreq_tensor_k10() {
     hifreq_tensor_probe(10)
 }
 
@@ -700,12 +713,13 @@ fn hifreq_tensor_k10() -> Result<(), String> {
 #[test]
 fn zz_measure_hifreq_tensor_k8_lambda_readout() {
     init_parallelism();
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(8);
+    let fx = hifreq_tensor_dataset(8);
+    let (n_train, sigma) = (fx.theta.len(), fx.sigma);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
-    let result = match fit_from_formula(&formula, &data, &cfg) {
+    let result = match fit_from_formula(&fx.formula, &fx.data, &cfg) {
         Ok(r) => r,
         Err(e) => panic!("[zz:hifreq_k8] fit refused (no minted optimum): {e}"),
     };
@@ -834,13 +848,14 @@ fn zz_measure_hifreq_tensor_k10_seed_costs() {
     }
     log::set_max_level(log::LevelFilter::Debug);
 
-    let (data, formula, n_train, sigma) = hifreq_tensor_dataset(10);
+    let fx = hifreq_tensor_dataset(10);
+    let (n_train, sigma) = (fx.theta.len(), fx.sigma);
     let cfg = FitConfig {
         family: Some("gaussian".to_string()),
         ..FitConfig::default()
     };
     eprintln!("[zz:2607] fitting hifreq_tensor k=10 (n_train={n_train} sigma={sigma:.3})");
-    let result = match fit_from_formula(&formula, &data, &cfg) {
+    let result = match fit_from_formula(&fx.formula, &fx.data, &cfg) {
         Ok(r) => r,
         Err(e) => panic!("[zz:2607] fit refused (no minted optimum): {e}"),
     };
@@ -874,7 +889,7 @@ fn bump_pair(x: f64) -> f64 {
 }
 
 #[test]
-fn bimodal_sharp_bumps_bc() -> Result<(), String> {
+fn bimodal_sharp_bumps_bc() {
     init_parallelism();
     let n = 500;
     let sigma = 0.05;
@@ -890,31 +905,11 @@ fn bimodal_sharp_bumps_bc() -> Result<(), String> {
         .map(|i| 0.001 + 0.998 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| bump_pair(t)).collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("bimodal_sharp_bumps", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("bimodal_sharp_bumps", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
-        "bimodal_sharp_bumps",
-        formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let probe = "bimodal_sharp_bumps";
+    let fit = fit_predict_1d(formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let extra = format!("sigma_noise={sigma:.3}");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -922,7 +917,7 @@ fn bimodal_sharp_bumps_bc() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn near_flat_signal() -> Result<(), String> {
+fn near_flat_signal() {
     init_parallelism();
     let n = 300;
     let sigma = 0.02;
@@ -963,25 +958,12 @@ fn near_flat_signal() -> Result<(), String> {
         .iter()
         .map(|&t| signal_amp * (2.0 * PI * t).sin())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("near_flat_signal", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("near_flat_signal", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let extra = format!("max_abs_fit={:.4}", {
-        yhat.iter().map(|v| v.abs()).fold(0.0_f64, f64::max)
-    });
-    let cat = report("near_flat_signal", formula, r, sigma, sf, st, &extra);
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let probe = "near_flat_signal";
+    let fit = fit_predict_1d(formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let max_abs_fit = fit.yhat.iter().map(|v| v.abs()).fold(0.0_f64, f64::max);
+    let extra = format!("sigma_noise={sigma:.3} max_abs_fit={max_abs_fit:.4}");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -989,7 +971,7 @@ fn near_flat_signal() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
+fn heteroscedastic_noise_mean_recovery() {
     init_parallelism();
     let n = 600;
     let mut rng = Lcg::new(303);
@@ -1019,31 +1001,13 @@ fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (2.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("heteroscedastic", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("heteroscedastic", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
-        "heteroscedastic",
-        formula,
-        r,
-        avg_sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4} sigma_range=[0.05,0.30]"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    // The truth has f(0) = 0.5 against the anchored pin f(0) = 0, so it is not
+    // in the basis; `assess` gates against its in-span projection.
+    let probe = "heteroscedastic";
+    let fit = fit_predict_1d(formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let extra = format!("sigma_noise_mean={avg_sigma:.3} sigma_range=[0.05,0.30]");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1051,7 +1015,7 @@ fn heteroscedastic_noise_mean_recovery() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn outlier_contamination() -> Result<(), String> {
+fn outlier_contamination() {
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -1080,31 +1044,13 @@ fn outlier_contamination() -> Result<(), String> {
         .iter()
         .map(|&t| (PI * t).sin() + 0.5 * (3.0 * PI * t).cos())
         .collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("outlier_contamination", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("outlier_contamination", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    let l1 = truth_residual(&yhat, &truth);
-    let cat = report(
-        "outlier_contamination",
-        formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("l1_at_truth={l1:.4} n_outliers={n_out}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    // The truth has f(0) = 0.5 and f(1) = -0.5 against the anchored pins, so it
+    // is not in the basis; `assess` gates against its in-span projection.
+    let probe = "outlier_contamination";
+    let fit = fit_predict_1d(formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let extra = format!("sigma_noise={sigma:.3} n_outliers={n_out}");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1112,7 +1058,7 @@ fn outlier_contamination() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn sparse_dense_imbalance() -> Result<(), String> {
+fn sparse_dense_imbalance() {
     init_parallelism();
     let sigma = 0.05;
     let n_sparse = 20;
@@ -1139,41 +1085,25 @@ fn sparse_dense_imbalance() -> Result<(), String> {
     let truth_dense: Vec<f64> = xg_dense.iter().map(|&t| f(t)).collect();
 
     let all_x: Vec<f64> = xg_sparse.iter().chain(xg_dense.iter()).copied().collect();
-    let (yhat_all, beta) = match fit_predict_1d(formula, &data, &all_x) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("sparse_dense_imbalance", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("sparse_dense_imbalance", formula, &yhat_all, &beta);
-    let (yhat_sparse, yhat_dense) = yhat_all.split_at(100);
+    let probe = "sparse_dense_imbalance";
+    let fit = fit_predict_1d(formula, &data, &x, &all_x)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let (yhat_sparse, yhat_dense) = fit.yhat.split_at(xg_sparse.len());
     let r_sparse = rmse(yhat_sparse, &truth_sparse);
     let r_dense = rmse(yhat_dense, &truth_dense);
-    let r_worst = r_sparse.max(r_dense);
-    let sf = span(&yhat_all);
     let truth_all: Vec<f64> = truth_sparse
         .iter()
         .chain(truth_dense.iter())
         .copied()
         .collect();
-    let st = span(&truth_all);
     let extra = format!(
-        "rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} rmse_worst={r_worst:.4} n_sparse={n_sparse} n_dense={n_dense}"
+        "sigma_noise={sigma:.3} rmse_sparse={r_sparse:.4} rmse_dense={r_dense:.4} \
+         n_sparse={n_sparse} n_dense={n_dense}"
     );
-    let cat = report(
-        "sparse_dense_imbalance",
-        formula,
-        r_worst,
-        sigma,
-        sf,
-        st,
-        &extra,
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    // One gate over both halves: the band is wide where the data are sparse and
+    // narrow where they are dense, and Q weighs each probe row by its own s_i.
+    let rows = 0..all_x.len();
+    assess(probe, formula, &fit, rows, &truth_all, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1181,7 +1111,7 @@ fn sparse_dense_imbalance() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn boundary_discontinuity_step() -> Result<(), String> {
+fn boundary_discontinuity_step() {
     init_parallelism();
     let n = 400;
     let sigma = 0.05;
@@ -1198,35 +1128,20 @@ fn boundary_discontinuity_step() -> Result<(), String> {
         .map(|i| 0.002 + 0.996 * i as f64 / (mgrid as f64 - 1.0))
         .collect();
     let truth: Vec<f64> = x_grid.iter().map(|&t| f(t)).collect();
-    let (yhat, beta) = match fit_predict_1d(formula, &data, &x_grid) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("step_discontinuity", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("step_discontinuity", formula, &yhat, &beta);
-    let r = rmse(&yhat, &truth);
-    let sf = span(&yhat);
-    let st = span(&truth);
-    // Estimate Gibbs overshoot: max prediction above 1 or below 0.
-    let over = yhat
+    // A step is not in any spline basis (and f(1) = 1 breaks the anchored pin):
+    // the in-span projection carries the Gibbs ringing, and `assess` charges
+    // the fit only for its error against that projection.
+    let probe = "step_discontinuity";
+    let fit = fit_predict_1d(formula, &data, &x, &x_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    // Gibbs overshoot: max prediction above 1 or below 0.
+    let over = fit
+        .yhat
         .iter()
         .map(|&v| (v - 1.0).max(0.0).max((-v).max(0.0)))
         .fold(0.0_f64, f64::max);
-    let cat = report(
-        "step_discontinuity",
-        formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("gibbs_overshoot={over:.3}"),
-    );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
+    let extra = format!("sigma_noise={sigma:.3} gibbs_overshoot={over:.3}");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1234,7 +1149,7 @@ fn boundary_discontinuity_step() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn tensor_multicollinear_inputs() -> Result<(), String> {
+fn tensor_multicollinear_inputs() {
     init_parallelism();
     let n = 500;
     let sigma = 0.10;
@@ -1264,38 +1179,17 @@ fn tensor_multicollinear_inputs() -> Result<(), String> {
         .map(|(&x, &y)| f(x, y))
         .collect();
 
-    let res = fit_predict_2d(formula, &data, &a_test, &b_test);
-    match res {
-        Ok((yhat, beta)) => {
-            check_finite("multicollinear_tensor", formula, &yhat, &beta);
-            let r = rmse(&yhat, &truth);
-            let sf = span(&yhat);
-            let st = span(&truth);
-            let l1 = truth_residual(&yhat, &truth);
-            let cat = report(
-                "multicollinear_tensor",
-                formula,
-                r,
-                sigma,
-                sf,
-                st,
-                &format!("l1_at_truth={l1:.4} corr_ab~0.95"),
-            );
-            if let Category::Collapsed = cat {
-                return Err(format!("probe collapsed"));
-            }
-            Ok(())
-        }
-        Err(e) => {
-            // Some smooths refuse to build on near-singular tensor inputs.
-            // That's an honest "fail-fast" outcome; record it.
-            eprintln!(
-                "[fit-quality] probe=multicollinear_tensor category=BUILD_REFUSED \
-                 formula=`{formula}` err=`{e}`",
-            );
-            Ok(())
-        }
-    }
+    // Near-collinear inputs leave directions of the tensor design weakly
+    // identified by the data, but the penalty identifies them, so the penalized
+    // fit is well defined and a refusal is a failure. The in-span projection
+    // uses the pseudo-inverse, which carries no weight on directions the data
+    // cannot resolve at rounding level.
+    let probe = "multicollinear_tensor";
+    let fit = fit_predict_2d(formula, &data, (&a, &b), (&a_test, &b_test))
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let extra = format!("sigma_noise={sigma:.3} corr_ab~0.95");
+    let rows = 0..a_test.len();
+    assess(probe, formula, &fit, rows, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1303,7 +1197,7 @@ fn tensor_multicollinear_inputs() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn cyclic_wrong_period() -> Result<(), String> {
+fn cyclic_wrong_period() {
     init_parallelism();
     let n = 300;
     let sigma = 0.05;
@@ -1313,7 +1207,10 @@ fn cyclic_wrong_period() -> Result<(), String> {
     let y_truth: Vec<f64> = theta.iter().map(|t| (2.0 * t).sin()).collect();
     let y_noisy: Vec<f64> = y_truth.iter().map(|&v| v + sigma * rng.normal()).collect();
     let data = make_dataset_named_1d("theta", &theta, &y_noisy);
-    // Misconfiguration: declare period = π even though data spans [0, 2π].
+    // Declared period π while the data span [0, 2π]. The cyclic basis wraps its
+    // argument modulo the period, and π is a period of sin 2θ, so the wrapped
+    // regression is well posed: the fit must recover the truth, and a refusal
+    // is a failure.
     let formula = "y ~ cyclic(theta, k=10, period_start=0, period_end=3.141592653589793)";
 
     let mgrid = 400;
@@ -1322,56 +1219,11 @@ fn cyclic_wrong_period() -> Result<(), String> {
         .collect();
     let truth: Vec<f64> = theta_grid.iter().map(|t| (2.0 * t).sin()).collect();
 
-    // The fit is allowed to either error out (preferred) or to succeed
-    // with a degraded recovery (which we then record).
-    let cfg = FitConfig {
-        family: Some("gaussian".to_string()),
-        ..FitConfig::default()
-    };
-    let res = fit_from_formula(formula, &data, &cfg);
-    match res {
-        Err(e) => {
-            eprintln!(
-                "[fit-quality] probe=cyclic_wrong_period category=ERROR_RAISED \
-                 formula=`{formula}` err=`{e}`",
-            );
-            Ok(())
-        }
-        Ok(result) => {
-            let FitResult::Standard(fit) = result else {
-                panic!("expected standard fit for cyclic wrong-period probe");
-            };
-            let mut m = Array2::<f64>::zeros((theta_grid.len(), 2));
-            for i in 0..theta_grid.len() {
-                m[[i, 0]] = theta_grid[i];
-                m[[i, 1]] = 0.0;
-            }
-            let test_design = build_term_collection_design(m.view(), &fit.resolvedspec)
-                .expect("rebuild design (wrong period)");
-            let yhat = test_design.design.apply(&fit.fit.beta).to_vec();
-            let beta = fit.fit.beta.to_vec();
-            check_finite("cyclic_wrong_period", formula, &yhat, &beta);
-            let r = rmse(&yhat, &truth);
-            let sf = span(&yhat);
-            let st = span(&truth);
-            // Headline category here is what the fit did despite the
-            // wrong period — usually a forced wraparound that ruins
-            // the recovery.
-            let cat = report(
-                "cyclic_wrong_period",
-                formula,
-                r,
-                sigma,
-                sf,
-                st,
-                "note=fit_accepted_wrong_period",
-            );
-            if let Category::Collapsed = cat {
-                return Err(format!("probe collapsed"));
-            }
-            Ok(())
-        }
-    }
+    let probe = "cyclic_wrong_period";
+    let fit = fit_predict_1d(formula, &data, &theta, &theta_grid)
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let extra = format!("sigma_noise={sigma:.3}");
+    assess(probe, formula, &fit, 0..mgrid, &truth, &y_truth, &extra);
 }
 
 // =====================================================================
@@ -1379,7 +1231,7 @@ fn cyclic_wrong_period() -> Result<(), String> {
 // =====================================================================
 
 #[test]
-fn sphere_antipodal_only() -> Result<(), String> {
+fn sphere_antipodal_only() {
     init_parallelism();
     let n_per_pole = 80;
     let sigma = 0.05;
@@ -1433,34 +1285,25 @@ fn sphere_antipodal_only() -> Result<(), String> {
     for j in 0..36 {
         lat_test.push(0.0);
         lon_test.push(-180.0 + 10.0 * j as f64);
-        truth_test.push(0.0); // sentinel — unused for rmse calc
     }
 
-    let (yhat, beta) = match fit_predict_2d(formula, &data, &lat_test, &lon_test) {
-        Ok(v) => v,
-        Err(e) => {
-            report_fit_error("antipodal_sphere", formula, &e);
-            return Err("Fit collapsed".to_string());
-        }
-    };
-    check_finite("antipodal_sphere", formula, &yhat, &beta);
-    let (yhat_polar, yhat_equator) = yhat.split_at(n_polar);
-    let truth_polar = &truth_test[..n_polar];
-    let r = rmse(yhat_polar, truth_polar);
-    let sf = span(yhat_polar);
-    let st = span(truth_polar);
-    let eq_max = yhat_equator.iter().fold(0.0_f64, |m, &v| m.max(v.abs()));
-    let cat = report(
-        "antipodal_sphere",
+    // Only the polar rows have a truth; the equator rows are checked for
+    // finiteness (by `assess`) and their magnitude is reported.
+    let probe = "antipodal_sphere";
+    let fit = fit_predict_2d(formula, &data, (&lat, &lon), (&lat_test, &lon_test))
+        .unwrap_or_else(|e| fit_error(probe, formula, &e));
+    let eq_max = fit.yhat[n_polar..]
+        .iter()
+        .fold(0.0_f64, |m, &v| m.max(v.abs()));
+    let extra =
+        format!("sigma_noise={sigma:.3} equator_max_abs={eq_max:.4} n_polar={n_polar}");
+    assess(
+        probe,
         formula,
-        r,
-        sigma,
-        sf,
-        st,
-        &format!("equator_max_abs={eq_max:.4} n_polar={n_polar}"),
+        &fit,
+        0..n_polar,
+        &truth_test[..n_polar],
+        &y_truth,
+        &extra,
     );
-    if let Category::Collapsed = cat {
-        return Err(format!("probe collapsed"));
-    }
-    Ok(())
 }
