@@ -572,6 +572,9 @@ enum ExactGaussianVerdict {
     Ineligible,
     /// The realized design does not reproduce the response exactly.
     Interior(TermCollectionDesign),
+    /// The resource policy refused the dense certificate on the realized
+    /// design, so exactness is not decided.
+    Undecided(TermCollectionDesign),
     Boundary(ExactGaussianBoundary),
 }
 
@@ -695,7 +698,13 @@ fn deterministic_gaussian_standard_fit(
     // for `y ~ 1`. We assemble that bundle here at a fully-smoothed λ. Because the
     // residual is exactly zero the estimated dispersion φ̂ = 0, so every
     // coefficient covariance is exactly zero (no ill-conditioned inverse needed).
-    let x_dense = design.design.to_dense();
+    let x_dense = design
+        .design
+        .try_to_dense_arc_with_policy(
+            "deterministic Gaussian inference bundle",
+            &request.options.resource_policy,
+        )
+        .map_err(|reason| raised_fit_failure(FailureCategory::Input, reason))?;
     let weights = request.weights.as_ref().clone();
     let xtwx = gam_linalg::faer_ndarray::fast_xt_diag_x(&x_dense, &weights);
     let mut infinite_face_penalty = Array2::<f64>::zeros((p, p));
@@ -1149,7 +1158,10 @@ fn deterministic_gaussian_standard_fit(
         smoothing_correction_factorized: None,
         beta_covariance_frequentist: None,
         coefficient_influence,
-        weighted_gram: Some(xtwx),
+        // `X'WX` is stored beside `H` in the gauge's active frame (gam#3346).
+        // Every penalty vanishes on the tangent face, so there the Gram
+        // `Z'X'WX Z` is the penalized Hessian itself.
+        weighted_gram: Some(penalized_hessian.clone()),
         identified_subspace: None,
     };
     let geometry = Some(gam_solve::estimate::FitGeometry {
@@ -1389,15 +1401,20 @@ fn exact_gaussian_coefficients(
         if positive_rows.len() < reduced_p {
             return None;
         }
-        let positive_weight_reduced_x = Array2::from_shape_fn(
-            (positive_rows.len(), reduced_p),
-            |(weighted_row, column)| {
-                let row = positive_rows[weighted_row];
-                reduced_x[[row, column]]
-            },
-        );
+        // Every row already on the support needs no copy of the design.
+        let positive_weight_reduced_x = if positive_rows.len() == reduced_x.nrows() {
+            std::borrow::Cow::Borrowed(reduced_x)
+        } else {
+            std::borrow::Cow::Owned(Array2::from_shape_fn(
+                (positive_rows.len(), reduced_p),
+                |(weighted_row, column)| {
+                    let row = positive_rows[weighted_row];
+                    reduced_x[[row, column]]
+                },
+            ))
+        };
         let rank = gam_linalg::faer_ndarray::rrqr_with_permutation(
-            &positive_weight_reduced_x,
+            &*positive_weight_reduced_x,
             gam_linalg::faer_ndarray::default_rrqr_rank_alpha(),
         )
         .ok()?
@@ -1565,9 +1582,19 @@ fn exact_gaussian_boundary(
     {
         return Ok(ExactGaussianVerdict::Interior(design));
     }
-    let x = design.design.to_dense();
+    // The certificate factors the dense design, so it is admitted through the
+    // fit's own resource policy. A refusal leaves the question undecided; it
+    // is not evidence either way, and the iterative solver owns the fit.
+    let x = match design.design.try_to_dense_arc_with_policy(
+        "deterministic Gaussian boundary",
+        &request.options.resource_policy,
+    ) {
+        Ok(x) => x,
+        Err(_) => return Ok(ExactGaussianVerdict::Undecided(design)),
+    };
+    let x: &Array2<f64> = &x;
     let Some(beta) =
-        exact_gaussian_coefficients(&x, &adjusted_response, request.weights.as_ref(), None)
+        exact_gaussian_coefficients(x, &adjusted_response, request.weights.as_ref(), None)
     else {
         return Ok(ExactGaussianVerdict::Interior(design));
     };
@@ -1640,7 +1667,7 @@ fn exact_gaussian_boundary(
                     )
                 })?;
             exact_gaussian_coefficients(
-                &x,
+                x,
                 &adjusted_response,
                 request.weights.as_ref(),
                 Some((&null_basis, rotation_radius)),
@@ -1673,7 +1700,7 @@ fn exact_gaussian_boundary(
                 )
             })?;
         let Some(tangent_beta) = exact_gaussian_coefficients(
-            &x,
+            x,
             &adjusted_response,
             request.weights.as_ref(),
             Some((&joint_null_basis, joint_rotation_radius)),
@@ -1760,7 +1787,9 @@ fn try_deterministic_gaussian_standard_fit(
     }
     match exact_gaussian_boundary(request)? {
         ExactGaussianVerdict::Ineligible => Ok(GaussianStandardRoute::Iterative(None)),
-        ExactGaussianVerdict::Interior(design) => Ok(GaussianStandardRoute::Iterative(Some(design))),
+        ExactGaussianVerdict::Interior(design) | ExactGaussianVerdict::Undecided(design) => {
+            Ok(GaussianStandardRoute::Iterative(Some(design)))
+        }
         ExactGaussianVerdict::Boundary(boundary) => {
             deterministic_gaussian_standard_fit(request, Some(boundary))
         }
@@ -2548,16 +2577,26 @@ fn fit_materialized_once_with_notes(
     // from this same `SplineScanFit`.
     let mut realized_design = None;
     if let FitRequest::Standard(request) = &mat.request {
-        match try_deterministic_gaussian_standard_fit(request)? {
-            GaussianStandardRoute::Exact(result) => {
-                return Ok(attach_basis_adequacy(
-                    FitResult::Standard(result),
-                    standard_covariate_frame,
-                    inference_notes,
-                    unidentified_scalar_terms,
-                ));
+        // Route selection comes before the exact Gaussian boundary. The
+        // residual cascade below is a different estimator from the dense
+        // model, so whether the DENSE model reproduces `y` exactly is not its
+        // question, and asking it would build and factor the n×p dense design
+        // the cascade exists to avoid (#3472). Only a constant response, whose
+        // exactness is read off `y - offset` with no certificate, still takes
+        // the deterministic route ahead of the cascade.
+        let cascade_inputs = residual_cascade_fast_path(request);
+        if cascade_inputs.is_none() || gaussian_response_is_constant(request) {
+            match try_deterministic_gaussian_standard_fit(request)? {
+                GaussianStandardRoute::Exact(result) => {
+                    return Ok(attach_basis_adequacy(
+                        FitResult::Standard(result),
+                        standard_covariate_frame,
+                        inference_notes,
+                        unidentified_scalar_terms,
+                    ));
+                }
+                GaussianStandardRoute::Iterative(design) => realized_design = design,
             }
-            GaussianStandardRoute::Iterative(design) => realized_design = design,
         }
         if let Some(inputs) = spline_scan_fast_path(request) {
             let scan = gam_solve::spline_scan::fit_spline_scan(
@@ -2584,7 +2623,7 @@ fn fit_materialized_once_with_notes(
         // the typed reason automatic REML was unavailable. The save paths
         // build the persistence payload from this `ResidualCascadeFit`'s
         // `to_state` snapshot.
-        if let Some(inputs) = residual_cascade_fast_path(request) {
+        if let Some(inputs) = cascade_inputs {
             let coord_refs: Vec<&[f64]> = inputs.coords.iter().map(Vec::as_slice).collect();
             let fit = gam_solve::residual_cascade::fit_residual_cascade(
                 &coord_refs,
@@ -3378,7 +3417,7 @@ fn publish_expectile_sandwich_covariance(
 ///   through the scan would silently drop that penalty and select λ from the
 ///   bending penalty alone, which is exactly the EDF inflation #1266 reports.
 ///   Those fits fall through to the dense two-rho path, which owns both penalties
-///   jointly. Natural cubic regression (`bs="cr"`/`"cs"`) terms also fall
+///   jointly. Natural cubic regression (`bs="cr"`) terms also fall
 ///   through: their knot-value parameterization is a finite-rank regression
 ///   spline, not the scan's full smoothing-spline state-space posterior;
 /// - the offset is identically zero and every weight is finite and positive;
@@ -3476,7 +3515,7 @@ pub fn spline_scan_fast_path(request: &StandardFitRequest<'_>) -> Option<SplineS
             gam_terms::basis::BSplineKnotSpec::PeriodicUniform { .. }
                 | gam_terms::basis::BSplineKnotSpec::NaturalCubicRegression { .. }
         )
-        // mgcv `bs="cr"`/`"cs"` materialise a `NaturalCubicRegression` value-knot
+        // `bs="cr"` materialises a `NaturalCubicRegression` value-knot
         // spec: a Lancaster–Salkauskas cubic-regression basis whose columns
         // index `f(x*_i)` at `k` quantile knots — a genuinely DIFFERENT finite
         // basis (and hence a different penalized posterior) from the free

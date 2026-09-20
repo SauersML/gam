@@ -1,7 +1,7 @@
 """Bug hunt (#1541, #1542): the *binary-covariate* arm of the cubic-regression
 data-support cap.
 
-The cr/cs/sz data-support cap (``capped_cr_marginal_knotspec``,
+The cr/sz data-support cap (``capped_cr_marginal_knotspec``,
 ``src/terms/term_builder.rs``) has two regimes:
 
 * ``n_distinct >= 3`` — build the cr basis with ``k = min(k_requested,
@@ -19,23 +19,19 @@ basis is **not** a cr basis — nothing asserted that the degraded fit still
 or constant basis (or re-introduced the original hard error for the ``< 3``
 case) would pass the spec test while silently destroying the fit. This test
 closes that gap from the behavioural angle: on binary ``x in {0,1}`` the
-degraded cr/cs/sz fits must succeed AND recover the linear effect / per-group
+degraded cr/sz fits must succeed AND recover the linear effect / per-group
 contrast, matching what an explicit linear basis recovers on the same data.
 
 A binary covariate carries exactly two distinct values, i.e. one slope's worth
 of information; the degraded linear marginal is the correct, fully-identified
-basis for that — so requiring recovery here is both well-posed and the mgcv
-behaviour (mgcv silently reduces ``k`` to the data support rather than erroring).
+basis for that, so requiring recovery here is well-posed.
 """
 
 from __future__ import annotations
 
-import importlib
 from typing import Any
 
-pytest: Any = importlib.import_module("pytest")
-np = pytest.importorskip("numpy")
-pytest.importorskip("gamfit._rust")
+import numpy as np
 
 import gamfit
 
@@ -62,16 +58,15 @@ def _binary_linear_data(seed: int, slope: float = 2.0) -> dict:
     return {"x": x.tolist(), "y": y.tolist()}
 
 
-@pytest.mark.parametrize("bs", ["cr", "cs"])
-def test_univariate_cr_cs_binary_covariate_degrades_and_recovers_slope(bs: str) -> None:
+def test_univariate_cr_binary_covariate_degrades_and_recovers_slope() -> None:
     # Before #1541 this raised InvalidConfigurationError ("cubic regression
     # spline with k=10 requires at least 10 distinct values, got 2"). After the
     # cap, n_distinct=2 < CR_MIN_KNOTS degrades to the linear B-spline marginal,
     # which must still recover the slope of 2 on a binary covariate.
     d = _binary_linear_data(seed=1541, slope=2.0)
-    model = gamfit.fit(d, f"y ~ s(x, bs='{bs}', k=10)")
+    model = gamfit.fit(d, "y ~ s(x, bs='cr', k=10)")
     s = _slope(model)
-    assert 1.7 < s < 2.3, f"bs={bs!r} binary slope not recovered: {s}"
+    assert 1.7 < s < 2.3, f"bs='cr' binary slope not recovered: {s}"
 
     # And it must agree with what an honest linear basis recovers on the SAME
     # data: the degradation is a no-op on the recoverable signal, not a loss.

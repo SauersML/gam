@@ -85,9 +85,12 @@ pub(crate) fn marginal_formula_context_columns(
 }
 
 /// Robust Rao score tests of whether the conditional law of `z` moves on the
-/// marginal-index span `a(C)`: the conditional mean `z − z̄`, the conditional
-/// variance `(z − z̄)² − σ̂²`, and the third standardised moment
-/// `((z − z̄)/σ̂)³ − μ̂₃`, each against the weighted-centred span.
+/// marginal-index span `a(C)`: the conditional mean `z − z̄`, and on the
+/// conditional-mean residual `û = z − m̂(C)` the conditional variance
+/// `û² − σ̂²_û` and the third standardised moment `(û/σ̂_û)³ − μ̂₃`, each
+/// against the weighted-centred span. The higher moments are tested on `û`,
+/// not on `z − z̄`: a moving mean puts `(m(a) − m̄)²` into `(z − z̄)²`, which
+/// masks or fakes a moving variance (gam#3335).
 ///
 /// Centring the columns makes each test about structure beyond the global
 /// level; a constant column collapses and is dropped by the pseudo-inverse rank.
@@ -145,7 +148,6 @@ pub(crate) fn conditional_law_evidence(
         // refuses it for what it is.
         return Ok(untestable);
     }
-    let sd = var.sqrt();
     let mut a_centered = a_block.to_owned();
     for j in 0..a_block.ncols() {
         let col_mean = a_block
@@ -158,31 +160,122 @@ pub(crate) fn conditional_law_evidence(
         a_centered.column_mut(j).mapv_inplace(|v| v - col_mean);
     }
     let centred: Vec<f64> = z.iter().map(|&zi| zi - mean).collect();
-    let squared: Vec<f64> = centred.iter().map(|&e| e * e - var).collect();
-    let third_moment = centred
+    let mean_p_value =
+        robust_conditional_score_pvalue(a_centered.view(), &centred, weights.view())?;
+    let mean_stage = fit_conditional_mean_stage(z, weights, a_block)?;
+    let residuals = &mean_stage.residuals;
+    let residual_var = residuals
+        .iter()
+        .zip(weights.iter())
+        .map(|(&e, &w)| w * e * e)
+        .sum::<f64>()
+        / total_weight;
+    if !(residual_var.is_finite() && residual_var > 0.0) {
+        // `z` lies exactly on the span: there is no residual law whose scale or
+        // shape could move.
+        return Ok(ConditionalLawEvidence {
+            mean_p_value,
+            ..untestable
+        });
+    }
+    let sd = residual_var.sqrt();
+    let squared: Vec<f64> = residuals.iter().map(|&e| e * e - residual_var).collect();
+    let squared_slope: Vec<f64> = residuals.iter().map(|&e| 2.0 * e).collect();
+    let third_moment = residuals
         .iter()
         .zip(weights.iter())
         .map(|(&e, &w)| w * (e / sd).powi(3))
         .sum::<f64>()
         / total_weight;
-    let cubed: Vec<f64> = centred
+    let cubed: Vec<f64> = residuals
         .iter()
         .map(|&e| (e / sd).powi(3) - third_moment)
         .collect();
+    let cubed_slope: Vec<f64> = residuals
+        .iter()
+        .map(|&e| 3.0 * (e / sd).powi(2) / sd)
+        .collect();
     Ok(ConditionalLawEvidence {
-        mean_p_value: robust_conditional_score_pvalue(a_centered.view(), &centred, weights.view())?,
-        variance_p_value: robust_conditional_score_pvalue(
+        mean_p_value,
+        variance_p_value: residual_moment_score_pvalue(
             a_centered.view(),
+            weights.view(),
+            &mean_stage,
             &squared,
-            weights.view(),
+            &squared_slope,
         )?,
-        skewness_p_value: robust_conditional_score_pvalue(
+        skewness_p_value: residual_moment_score_pvalue(
             a_centered.view(),
-            &cubed,
             weights.view(),
+            &mean_stage,
+            &cubed,
+            &cubed_slope,
         )?,
         alpha: AUTO_Z_CONDITIONAL_RAO_ALPHA,
     })
+}
+
+/// Robust score test of a residual moment `g(û_i) − ḡ` against the centred span
+/// `ã`, with the conditional-mean stage `β̂` ESTIMATED.
+///
+/// The score `S(β̂) = Σ_i w_i (g(û_i) − ḡ) ã_i` moves with the mean stage at
+/// first order, `∂S/∂β = −G` with `G = Σ_i w_i g'(û_i) ã_i A_iᵀ`, and the ridge
+/// solve gives `β̂ − β = M⁻¹ Σ_i w_i A_i û_i`. `G` is not small: a curved mean
+/// (`E[û | a] ≠ 0`) makes it `O(n)` for the variance moment, and
+/// `E[ã·aᵀ·û²] = Var(a)·σ²` makes it `O(n)` for the third moment on any mean.
+/// The naive meat is then the variance of a score whose nuisance is known,
+/// which this one's is not, so the contributions carry the propagated stage,
+///
+/// ```text
+/// ψ_i = w_i (g(û_i) − ḡ) ã_i − G M⁺ (w_i û_i A_i),
+/// ```
+///
+/// the cross-stage channel of the stacked first-stage bread
+/// ([`stacked_first_stage_inverse_bread`]). The estimated `ḡ` and the weighted
+/// centring of `ã` need no term: `Σ_i w_i ã_i = 0` and
+/// `Σ_i w_i (g(û_i) − ḡ) = 0` exactly. `moment` holds `g(û_i) − ḡ` and
+/// `moment_slope` holds `g'(û_i)`.
+fn residual_moment_score_pvalue(
+    a_centered: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    mean_stage: &ConditionalMeanStage,
+    moment: &[f64],
+    moment_slope: &[f64],
+) -> Result<Option<f64>, String> {
+    let n = a_centered.nrows();
+    let p = mean_stage.basis.ncols();
+    // `diag(w g') A` for `G = ãᵀ diag(w g') A` (r × p), and the mean-stage
+    // influence rows `w_i û_i A_iᵀ` (n × p). A non-positive weight is a row the
+    // ridge did not see.
+    let mut weighted_slope_basis = mean_stage.basis.to_owned();
+    let mut mean_influence = mean_stage.basis.to_owned();
+    let mut contributions = a_centered.to_owned();
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        let slope_scale = wi * moment_slope[i];
+        let influence_scale = wi * mean_stage.residuals[i];
+        let moment_scale = wi * moment[i];
+        weighted_slope_basis
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= slope_scale);
+        mean_influence
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= influence_scale);
+        contributions
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= moment_scale);
+    }
+    let g = a_centered.t().dot(&weighted_slope_basis);
+    let m_pinv = preconditioned_normal_pseudoinverse(&mean_stage.normal, n)?;
+    // Row `i` of `mean_influence · (G M⁺)ᵀ` is the propagated stage `G M⁺ (w_i û_i A_i)`.
+    let propagation = g.dot(&m_pinv).reversed_axes();
+    contributions -= &mean_influence.dot(&propagation);
+    // `w_i·(g_i − ḡ)·ã_ij` takes three roundings, the length-`p` correction
+    // `p + 2`, and the subtraction one.
+    robust_score_contributions_pvalue(&contributions, p + 6)
 }
 
 /// Equal-mass compression of `(z, weights)` into an at-most-`grid_size`-node
@@ -230,20 +323,23 @@ pub(crate) fn build_empirical_law_on_own_axis(
 /// The Gaussian closed form's anchoring residual at one survival anchor under a
 /// finite law (gam#2926): `r = Σ_k w_k Φ(−(α_cf + b·u_k)) − Φ(−q)` at
 /// `α_cf = q·√(1+b²)`, the standard deviation of `Φ(−(α_cf + b·U))` under the
-/// law, and `π(1−π)` with `π = Φ(−q)`. The sums run on the smaller tail, so a
-/// survival probability near one keeps its precision.
+/// law, `π(1−π)` with `π = Φ(−q)`, and the smaller-tail probabilities at the law's
+/// nodes. The sums run on the smaller tail, so a survival probability near one keeps
+/// its precision.
 pub(crate) fn closed_form_survival_anchoring_residual(
     q: f64,
     observed_slope: f64,
     law: &EmpiricalZGrid,
-) -> (f64, f64, f64) {
+) -> (f64, f64, f64, Vec<f64>) {
     let alpha = q * (1.0 + observed_slope * observed_slope).sqrt();
     let probabilities: Vec<f64> = law
         .nodes
         .iter()
         .map(|&u| survival_tail_probability(q, alpha + observed_slope * u))
         .collect();
-    anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities)
+    let (residual, law_sd, scale) =
+        anchoring_residual_from_tail_probabilities(q, &law.weights, &probabilities);
+    (residual, law_sd, scale, probabilities)
 }
 
 /// The moving-law certificate's `(ln S, ln(1 − S))` of one rigid survival anchor

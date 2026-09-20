@@ -2,7 +2,7 @@
 //! carve instruments RUNNABLE on real fits.
 //!
 //! #993: the functional-ANOVA carve (decoder-coefficient covariance via
-//! `fit_tensor_surface`, the gauge-projected binding Wald test in `carve`) was
+//! `fit_tensor_surface`, the sample-space binding test it carries into `carve`) was
 //! fully built and unit-tested on synthetic pair surfaces, but never wired to a
 //! fitted SAE atom — the harvest path recorded `fission_carve_skipped` instead
 //! of running it. The producer `carve_input_from_fitted_atom` closes that gap:
@@ -22,8 +22,8 @@
 //!    is proven and the fission is blocked.
 //! 3. The producer's decoder-coefficient covariance (`fit_tensor_surface`'s
 //!    `coeff_covariance`) equals an INDEPENDENT dense function-mass posterior
-//!    `σ̂²·((1 + λ)·XᵀX)⁻¹` at the same λ — so the covariance the binding test
-//!    consumes is a real, verifiable posterior, not a placeholder.
+//!    `σ̂²·((1 + λ)·XᵀX)⁻¹` at the same λ — so the covariance the carve's
+//!    resolution bound consumes is a real, verifiable posterior, not a placeholder.
 //!
 //! No CUDA, no optimizer dependence: the decoder coefficients ARE what the
 //! carve reads, so planting them directly exercises the exact instrument the
@@ -131,7 +131,7 @@ fn separable_torus_atom_carves_to_additive_split() {
     assert!(
         report.fission.is_some(),
         "the carve must permit a fission on a separable atom (edge_p={:?}, fraction={:e})",
-        report.edge_p_value,
+        report.edge_p_value(),
         report.interaction_fraction
     );
     assert_eq!(
@@ -163,7 +163,7 @@ fn bound_torus_atom_carves_to_keep() {
     assert!(
         report.fission.is_none(),
         "a bound atom must not split (edge_p={:?}, fraction={:e})",
-        report.edge_p_value,
+        report.edge_p_value(),
         report.interaction_fraction
     );
     assert_eq!(
