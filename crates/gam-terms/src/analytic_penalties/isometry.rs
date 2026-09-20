@@ -141,7 +141,7 @@ pub struct IsometryPenalty {
     /// `(n_obs, p*d)`. The owning driver refreshes this each IFT outer step
     /// before invoking `value` / `grad_target`; in operator-only call sites
     /// (Hessian-vector products) the cache must be live. Access through
-    /// [`Self::jacobian_cache`] / `Self::set_jacobian_cache`.
+    /// [`Self::jacobian_cache`] / [`Self::refresh_caches`].
     pub jacobian_cache_slot: RwLock<Option<Arc<Array2<f64>>>>,
     /// Optional cached per-row Jacobian *second derivative*
     /// `H_n ∈ ℝ^{p × d × d}`, flattened row-major as `(n_obs, p*d*d)`.
@@ -430,15 +430,6 @@ impl IsometryPenalty {
             .expect("IsometryPenalty::jacobian_second_cache_slot poisoned") = jac2;
     }
 
-    /// In-place writer for just the Jacobian cache (used by callers that
-    /// already own the radial Duchon source and only want to refresh `J`).
-    pub(crate) fn set_jacobian_cache(&self, jac: Option<Arc<Array2<f64>>>) {
-        *self
-            .jacobian_cache_slot
-            .write()
-            .expect("IsometryPenalty::jacobian_cache_slot poisoned") = jac;
-    }
-
     /// In-place writer for just the Jacobian second-derivative cache.
     pub fn set_jacobian_second_cache(&self, jac2: Option<Arc<Array2<f64>>>) {
         *self
@@ -485,18 +476,6 @@ impl Clone for IsometryPenalty {
 }
 
 impl IsometryPenalty {
-
-    #[must_use]
-    pub fn with_jacobian_cache(self, j: Arc<Array2<f64>>) -> Self {
-        self.set_jacobian_cache(Some(j));
-        self
-    }
-
-    #[must_use]
-    pub fn with_jacobian_second_cache(self, h: Arc<Array2<f64>>) -> Self {
-        self.set_jacobian_second_cache(Some(h));
-        self
-    }
 
     impl_with_weight_schedule!(scalar_weight);
 

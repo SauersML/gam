@@ -27,9 +27,9 @@ fn isometry_value_is_decoder_scale_invariant() {
     }
     let rho = array![0.0_f64];
     let t = Array1::<f64>::zeros(n_obs * d);
-    pen.set_jacobian_cache(Some(Arc::new(j)));
+    pen.refresh_caches(Some(Arc::new(j)), None);
     let value = pen.value(t.view(), rho.view());
-    pen.set_jacobian_cache(Some(Arc::new(j_scaled)));
+    pen.refresh_caches(Some(Arc::new(j_scaled)), None);
     let scaled_value = pen.value(t.view(), rho.view());
     assert_abs_diff_eq!(value, scaled_value, epsilon = 1e-10);
 }

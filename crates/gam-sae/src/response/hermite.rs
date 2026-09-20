@@ -799,15 +799,6 @@ pub struct CoefficientVisit<'a> {
     pub energy: BandedEnergy,
 }
 
-/// The energy of the proposal terms with one support: the Hoeffding energy `‖f_S‖²_M` restricted
-/// to `|α| ≤ N`.
-#[derive(Clone, Debug)]
-pub struct SupportEnergy {
-    /// The retained coordinates `S`, ascending.
-    pub support: Vec<usize>,
-    pub energy: BandedEnergy,
-}
-
 /// How the coefficient walk treats one retained coordinate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Presence {
@@ -1201,33 +1192,6 @@ impl<'a> HermiteResponse<'a> {
             }
         }
         walk.alpha[coordinate] = 0;
-    }
-
-    /// The proposal's energy grouped by support, largest first. Each band adds `γ_{n−1}` of the
-    /// absolute sum of the support's `n` coefficient energies.
-    pub fn support_energies(&self) -> Vec<SupportEnergy> {
-        let mut grouped: BTreeMap<Vec<usize>, (f64, f64, f64, usize)> = BTreeMap::new();
-        self.for_each_coefficient(|visit| {
-            let slot = grouped
-                .entry(support_of(visit.alpha))
-                .or_insert((0.0, 0.0, 0.0, 0));
-            slot.0 += visit.energy.value;
-            slot.1 += visit.energy.band;
-            slot.2 += visit.energy.value.abs();
-            slot.3 += 1;
-        });
-        let mut terms = grouped
-            .into_iter()
-            .map(|(support, (value, band, absolute, count))| SupportEnergy {
-                support,
-                energy: BandedEnergy {
-                    value,
-                    band: band + accumulation_growth(count.saturating_sub(1)) * absolute,
-                },
-            })
-            .collect::<Vec<_>>();
-        terms.sort_by(|left, right| right.energy.value.total_cmp(&left.energy.value));
-        terms
     }
 
     /// The live footprint of `count` stored coefficients, each two `p`-vectors and one `k`-index,

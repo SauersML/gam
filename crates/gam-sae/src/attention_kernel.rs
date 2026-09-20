@@ -249,24 +249,6 @@ pub fn fit_attention_kernel(
     })
 }
 
-pub fn fit_stationary_kernel(
-    query_t: &[f64],
-    key_t: &[f64],
-    scores: ArrayView2<'_, f64>,
-    max_harmonic: usize,
-) -> Result<StationaryKernelFit, String> {
-    HarmonicSurface::new(query_t, key_t, scores, max_harmonic)?.fit_stationary()
-}
-
-pub fn fit_separable_kernel(
-    query_t: &[f64],
-    key_t: &[f64],
-    scores: ArrayView2<'_, f64>,
-    max_harmonic: usize,
-) -> Result<SeparableKernelFit, String> {
-    HarmonicSurface::new(query_t, key_t, scores, max_harmonic)?.fit_separable()
-}
-
 pub fn fit_ov_coordinate_map(
     key_t: &[f64],
     delta_t: &[f64],

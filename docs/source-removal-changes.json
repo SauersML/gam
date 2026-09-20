@@ -2613,5 +2613,29 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "8a1bb26be771b07bb5a68f4651101a8a3cb57223",
+    "items": [
+      "crates/gam-problem/src/lib.rs:fn:has_operator",
+      "crates/gam-sae/src/attention_kernel.rs:fn:fit_separable_kernel",
+      "crates/gam-sae/src/attention_kernel.rs:fn:fit_stationary_kernel",
+      "crates/gam-sae/src/parameter_decomposition/field.rs:fn:instance_moments",
+      "crates/gam-sae/src/parameter_decomposition/program.rs:fn:controls_reached",
+      "crates/gam-sae/src/parameter_decomposition/program.rs:fn:mask_group_of",
+      "crates/gam-sae/src/response/hermite.rs:fn:support_energies",
+      "crates/gam-sae/src/response/hermite.rs:struct:SupportEnergy",
+      "crates/gam-solve/src/rho_optimizer/objective.rs:fn:encode_outer_warm_start",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:set_jacobian_cache",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:with_jacobian_cache",
+      "crates/gam-terms/src/analytic_penalties/isometry.rs:fn:with_jacobian_second_cache",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:formula_rhs_text",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:likelihood_spec_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:linkchoice_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:require_likelihood_spec_supports_joint_wiggle",
+      "crates/gam-terms/src/inference/formula_dsl.rs:fn:require_linkchoice_supports_joint_wiggle"
+    ],
+    "reason": "#4165: dead code with no caller anywhere in the repo. Each name occurs on exactly one line at the base (its own declaration). encode_outer_warm_start's doc claimed warm_start_from used it; warm_start_from goes through FitArtifacts::outer_warm_start and OuterProblem::with_warm_start. set_jacobian_cache, linkchoice_supports_joint_wiggle and likelihood_spec_supports_joint_wiggle were pub(crate) helpers whose only non-test caller was a deleted fn; the two isometry tests call the pub refresh_caches instead.",
+    "evidence": "https://github.com/SauersML/gam/issues/4165"
   }
 ]

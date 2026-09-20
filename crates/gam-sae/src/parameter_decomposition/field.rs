@@ -429,15 +429,6 @@ impl ParameterFamily {
         self.weights.view()
     }
 
-    /// The `C x J` moments `v_c = w_c phi(z_c)`, so that `P_c = B v_c`.
-    pub fn instance_moments(&self) -> Array2<f64> {
-        let mut moments = self.basis_values.clone();
-        for (mut row, &w) in moments.rows_mut().into_iter().zip(self.weights.iter()) {
-            row.mapv_inplace(|v| v * w);
-        }
-        moments
-    }
-
     /// `s_j = sum_c (m_c - m_Delta) w_c phi_j(z_c)`, so that the family's part of
     /// the anchored tensor is `sum_j s_j B_j`.
     pub fn anchor_basis_weights(
