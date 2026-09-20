@@ -768,8 +768,9 @@ pub(crate) fn scale_jacobian_by_sqrt_h_with(
     Ok(out)
 }
 
-/// Symmetric matrix square root via eigendecomposition with negative
-/// eigenvalues clamped to zero (PSD projection guard).
+/// Symmetric square root of a finite positive-semidefinite row metric.
+/// Only negative eigenvalues within their eigenpair backward-error band are
+/// projected to zero; resolved negative curvature is an error.
 ///
 /// A failed eigendecomposition is an error. The diagonal of `m` is not a
 /// substitute: for a coupled row metric it drops every cross-channel term, so
@@ -785,7 +786,10 @@ pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) -> Res
         ));
     }
     if k == 1 {
-        out[[0, 0]] = m[[0, 0]].max(0.0).sqrt();
+        if m[[0, 0]] < 0.0 {
+            return Err("symmetric square root: negative scalar row metric".to_string());
+        }
+        out[[0, 0]] = m[[0, 0]].sqrt();
         return Ok(());
     }
     let (evals, evecs) = m.eigh(Side::Lower).map_err(|e| {
@@ -799,6 +803,41 @@ pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) -> Res
         return Err(format!(
             "symmetric square root of a {k}x{k} row metric: non-finite eigendecomposition"
         ));
+    }
+    // An eigenpair residual bounds the distance to the symmetric matrix's
+    // spectrum. Include the rounding error of each k-term matrix/vector dot
+    // product and the lambda*u subtraction; scale by the eigenvector norm.
+    // Only an unresolved negative within that backward-error band may be
+    // projected to zero. A resolved negative is an invalid PSD row metric.
+    let growth = gam_math::roundoff::accumulation_growth(k + 2);
+    for column in 0..k {
+        let lambda = evals[column];
+        if lambda >= 0.0 {
+            continue;
+        }
+        let mut vector_norm = 0.0_f64;
+        let mut residual_norm = 0.0_f64;
+        let mut rounding_norm = 0.0_f64;
+        for i in 0..k {
+            let u = evecs[[i, column]];
+            vector_norm = vector_norm.hypot(u);
+            let mut product = 0.0;
+            let mut magnitude = (lambda * u).abs();
+            for j in 0..k {
+                // eigh consumes the lower triangle of the row metric.
+                let value = m[[i.max(j), i.min(j)]] * evecs[[j, column]];
+                product += value;
+                magnitude += value.abs();
+            }
+            residual_norm = residual_norm.hypot(product - lambda * u);
+            rounding_norm = rounding_norm.hypot(growth * magnitude);
+        }
+        let band = (residual_norm + rounding_norm) / vector_norm;
+        if !band.is_finite() || vector_norm == 0.0 || lambda < -band {
+            return Err(format!(
+                "symmetric square root: negative row-metric eigenvalue {lambda} exceeds its backward-error band {band}"
+            ));
+        }
     }
     // Form one triangle of U diag(sqrt(max(0, λ))) Uᵀ and mirror it.
     // Independent triangle sums can round differently despite exact symmetry.
@@ -2270,5 +2309,24 @@ mod tests {
                 assert!(error.to_string().contains("row 1"), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn row_metric_square_root_refuses_negative_curvature_but_keeps_psd_nullspace() {
+        for scalar in [-1.0, -f64::MIN_POSITIVE, -f64::from_bits(1)] {
+            let mut root = Array2::zeros((1, 1));
+            assert!(symmetric_sqrt_into(&ndarray::array![[scalar]], &mut root).is_err());
+        }
+        let mut root = Array2::zeros((2, 2));
+        let indefinite = ndarray::array![[1.0, 2.0], [2.0, 1.0]];
+        assert!(symmetric_sqrt_into(&indefinite, &mut root).is_err());
+        let singular = ndarray::array![[1.0, 1.0], [1.0, 1.0]];
+        symmetric_sqrt_into(&singular, &mut root).expect("the PSD null direction is valid");
+        let square = root.dot(&root);
+        for value in square {
+            assert!((value - 1.0).abs() <= gam_math::roundoff::accumulation_growth(8));
+        }
+        symmetric_sqrt_into(&Array2::zeros((2, 2)), &mut root).unwrap();
+        assert!(root.iter().all(|value| *value == 0.0));
     }
 }
