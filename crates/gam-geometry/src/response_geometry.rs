@@ -205,6 +205,31 @@ impl ResponseManifold {
             }
             Ok(None)
         };
+        // Every parameter must be one the geometry reads, and appear once: a
+        // misspelt or foreign key (`poincare(kappa=-0.5)`) would otherwise be
+        // dropped and the default fitted in its place.
+        let accepted: Option<&[&str]> = match head.as_str() {
+            "spd" => Some(&["n"][..]),
+            "grassmann" | "stiefel" => Some(&["k", "n"][..]),
+            "poincare" => Some(&["dim", "curvature"][..]),
+            "constant_curvature" => Some(&["dim", "kappa", "curvature"][..]),
+            _ => None,
+        };
+        if let Some(accepted) = accepted {
+            for (i, (key, _)) in params.iter().enumerate() {
+                if !accepted.contains(&key.as_str()) {
+                    return Err(format!(
+                        "response_geometry {label:?}: '{head}' takes no parameter {key:?}; it takes {}",
+                        accepted.join(", ")
+                    ));
+                }
+                if params[..i].iter().any(|(earlier, _)| earlier == key) {
+                    return Err(format!(
+                        "response_geometry {label:?}: {key} is given more than once"
+                    ));
+                }
+            }
+        }
 
         match head.as_str() {
             "spd" => {
@@ -249,9 +274,15 @@ impl ResponseManifold {
             "constant_curvature" => {
                 let dim = get_usize("dim")?.unwrap_or(cols);
                 // κ defaults to 0 (flat initial point for the REML optimizer).
-                let kappa = get_f64("kappa")?
-                    .or_else(|| get_f64("curvature").ok().flatten())
-                    .unwrap_or(0.0);
+                let kappa = match (get_f64("kappa")?, get_f64("curvature")?) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "response_geometry {label:?}: kappa and curvature name the same \
+                             parameter; give one"
+                        ));
+                    }
+                    (kappa, curvature) => kappa.or(curvature).unwrap_or(0.0),
+                };
                 Self::resolve("constant_curvature", None, None, Some(dim), Some(kappa))
             }
             other => Err(format!(
@@ -2561,6 +2592,39 @@ mod tests {
             }
         );
         assert!(ResponseManifold::parse("hyperbolic", 3).is_err());
+    }
+
+    /// A parameter the geometry does not read, a repeated one, or a curvature
+    /// that does not parse is refused rather than dropped for the default.
+    #[test]
+    fn parse_refuses_foreign_repeated_and_unparsable_parameters() {
+        for label in [
+            "poincare(kappa=-0.5)",
+            "spd(m=3)",
+            "grassmann(k=1,m=3)",
+            "stiefel(k=1,k=2)",
+            "constant_curvature(curvature=flat)",
+            "constant_curvature(kappa=0.5,curvature=0.5)",
+        ] {
+            assert!(
+                ResponseManifold::parse(label, 3).is_err(),
+                "{label} must be refused"
+            );
+        }
+        assert_eq!(
+            ResponseManifold::parse("constant_curvature(curvature=0.5)", 3).unwrap(),
+            ResponseManifold::ConstantCurvature {
+                dim: 3,
+                kappa: 0.5
+            }
+        );
+        assert_eq!(
+            ResponseManifold::parse("constant_curvature(dim=3,kappa=-0.25)", 3).unwrap(),
+            ResponseManifold::ConstantCurvature {
+                dim: 3,
+                kappa: -0.25
+            }
+        );
     }
 
     #[test]
