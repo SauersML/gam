@@ -2099,15 +2099,30 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
     }
 
     /// The structural monotonicity rows of the score-warp or link-deviation
-    /// block; no other block is constrained. They are a function of the block's
-    /// deviation runtime alone, never of the current state or spec, so this
-    /// answer cannot fail.
+    /// block; no other block is constrained. The rows come from the block's
+    /// deviation runtime, so they constrain the block only if `spec` describes
+    /// the block the solver carries and the rows have that block's width.
     fn block_linear_constraints(
         &self,
-        _block_states: &[ParameterBlockState],
+        block_states: &[ParameterBlockState],
         block_idx: usize,
-        _spec: &ParameterBlockSpec,
+        spec: &ParameterBlockSpec,
     ) -> Result<Option<ConstraintSet>, String> {
+        let state = block_states.get(block_idx).ok_or_else(|| {
+            format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} is out of range \
+                 for {} blocks",
+                block_states.len()
+            )
+        })?;
+        let width = spec.design.ncols();
+        if state.beta.len() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx} carries {} \
+                 coefficients but its design has {width} columns",
+                state.beta.len()
+            ));
+        }
         let runtime = if self.score_block_index() == Some(block_idx) {
             self.score_warp.as_ref()
         } else if self.link_block_index() == Some(block_idx) {
@@ -2115,8 +2130,18 @@ impl CustomFamily for BernoulliMarginalSlopeFamily {
         } else {
             None
         };
-        Ok(runtime
-            .map(|runtime| ConstraintSet::Dense(runtime.structural_monotonicity_constraints())))
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let constraints = runtime.structural_monotonicity_constraints();
+        if constraints.a.ncols() != width {
+            return Err(format!(
+                "bernoulli marginal-slope block constraints: block {block_idx}'s monotonicity \
+                 rows have {} columns but its design has {width}",
+                constraints.a.ncols()
+            ));
+        }
+        Ok(Some(ConstraintSet::Dense(constraints)))
     }
 
     fn post_update_block_beta(
