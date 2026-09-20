@@ -7054,10 +7054,22 @@ impl SaeSupportSparseTerm {
                 prior_cursor += 1;
             }
         }
-        let raw_gradient_max = rhs_vector
-            .iter()
-            .map(|value| value.abs())
-            .fold(0.0_f64, f64::max);
+        // The certified measure is each slot's feasible-direction gradient `P g`, the
+        // same one the solve-level certificate reads (#4006); `rhs = -g`.
+        let mut raw_gradient_max = 0.0_f64;
+        for (slot, &atom) in support.iter().enumerate() {
+            let gradient = rhs_vector
+                .slice(ndarray::s![offsets[slot].clone()])
+                .mapv(|value| -value);
+            let (_, projected) = self.slot_feasible_gradient(
+                atom as usize,
+                &coords_row[offsets[slot].clone()],
+                &gradient,
+            )?;
+            raw_gradient_max = projected
+                .iter()
+                .fold(raw_gradient_max, |max, value| max.max(value.abs()));
+        }
         // A row already satisfying the caller's KKT request is a certified
         // fixed point of this coordinate block. The row gradient scales
         // with the row's own residual energy, so the skip threshold is
@@ -7085,52 +7097,55 @@ impl SaeSupportSparseTerm {
             Some(hessian) if Self::row_hessian_is_positive_definite(&hessian)? => hessian,
             _ => gram,
         };
+        // `retract_row_coords` moves the point with the manifold exponential map,
+        // which travels only the TANGENT component of a step -- anything radial is
+        // discarded. So a step certified in the full ambient chart space is not the
+        // step taken. MEASURED on a failing row: one axis asked to move 7.12e-1 --
+        // the largest component of the whole step -- realized exactly 0.0, while
+        // every other axis realized its request to rel ~1e-9. That is why intrinsic
+        // dimension >= 2 had never fitted, while every 1-D chart was fine: on a flat
+        // chart the tangent space is everything and the projector is the identity.
+        //
+        // The trust-region model is therefore posed ON the row's linearized feasible
+        // update space `range(P)` (#3746): curvature `P H P`, right-hand side
+        // `P rhs`. `(PHP + λI)` maps `range(P)` to itself, so the exact PSD
+        // trust-region solution lies in `range(P)` and has norm `<= trust_radius`
+        // in the metric the retraction travels. Its certificate
+        // `rhsᵀ delta = (P rhs)ᵀ delta` is positive by the PSD construction, so no
+        // ascent-direction repair is needed. The projector is linearized at `rhs`
+        // (the descent direction) only for interval endpoints, which hold a
+        // coordinate exactly when descent points outward; the gradient itself is
+        // never passed through the sign-reversed gradient projection, which
+        // zeroed genuine inward components (-6.08 at a coordinate pinned at pi/2).
+        let tangent_projector = self.assignment.row_tangent_projector(
+            row,
+            coords_row,
+            rhs_vector
+                .as_slice()
+                .expect("row right-hand side is contiguous"),
+        )?;
+        let tangent_curvature = tangent_projector.dot(&curvature).dot(&tangent_projector);
+        let tangent_rhs = tangent_projector.dot(&rhs_vector);
         // SPEC-22: the exact PSD trust-region subproblem is general outer
         // optimizer machinery and lives in `opt`. gam kept a private copy
         // until #2574.
-        let delta = opt::solve_psd_trust_region(curvature.view(), rhs_vector.view(), trust_radius)
+        let mut delta = opt::solve_psd_trust_region(
+            tangent_curvature.view(),
+            tangent_rhs.view(),
+            trust_radius,
+        )
         .map_err(|error| format!("SaeSupportSparseTerm::coordinate_sweep: {error}"))?;
-        // `retract_row_coords` moves the point with the manifold exponential map,
-        // which travels only the TANGENT component of the step -- anything radial is
-        // discarded. So a step certified in the full ambient chart space is not the
-        // step taken. MEASURED on a failing row: one axis asked to move 7.12e-1 --
-        // `delta_max`, the largest component of the whole step -- realized exactly
-        // 0.0, while every other axis realized its request to rel ~1e-9. Backtracking
-        // then rescales only the components that do move and never revives the one
-        // that does not, so no step size can satisfy Armijo and the row aborts at the
-        // resolution floor. That is why intrinsic dimension >= 2 has never fitted,
-        // while every 1-D chart was fine: on a flat chart the tangent space is
-        // everything, `project_to_tangent` is the identity, and this is inert.
-        //
-        // Project the STEP, and only the step. The gradient must NOT be projected:
-        // measured, doing so zeros entries that are genuinely large (-6.08 at a
-        // coordinate pinned at pi/2), which corrupts both the trust-region right-hand
-        // side and the descent certificate computed from it.
-        let mut delta = delta;
+        // `range(P)` membership is exact in real arithmetic; the velocity
+        // projection removes the rounding-level normal component (and, at an
+        // interval endpoint, an outward component the Hessian coupling can put on a
+        // coordinate whose own descent is inward, which only raises `rhsᵀ delta`),
+        // so the certified step and the travelled step are the same vector.
         self.assignment.project_row_tangent(
             row,
             coords_row,
             delta.as_slice_mut().expect("trust-region step is contiguous"),
         )?;
-        let mut directional = rhs_vector.dot(&delta);
-        if !(directional > 0.0) {
-            // Projection and the Gram solve do not commute, so the projected step is
-            // not guaranteed to remain an ascent direction for the right-hand side.
-            // Steepest descent within the tangent space is one by construction, and
-            // is a real step rather than a failed row.
-            let mut fallback = rhs_vector.to_owned();
-            self.assignment.project_row_tangent(
-                row,
-                coords_row,
-                fallback.as_slice_mut().expect("fallback step is contiguous"),
-            )?;
-            let norm = fallback.dot(&fallback).sqrt();
-            if !(norm > 0.0) {
-                return Ok(0.0);
-            }
-            delta = fallback * (trust_radius / norm);
-            directional = rhs_vector.dot(&delta);
-        }
+        let directional = rhs_vector.dot(&delta);
 
         let delta_max = delta
             .iter()
@@ -7240,6 +7255,7 @@ impl SaeSupportSparseTerm {
             for (slot, &atom) in support.iter().enumerate() {
                 let atom = atom as usize;
                 let periods = self.atom_ard_axis_periods(atom);
+                let mut slot_gradient = Array1::<f64>::zeros(dims[slot].1);
                 for axis in 0..dims[slot].1 {
                     let jacobian_row = trial[slot].jacobian.row(axis);
                     let prior_gradient = ArdAxisPrior::eval(
@@ -7248,8 +7264,7 @@ impl SaeSupportSparseTerm {
                         periods[axis],
                     )
                     .grad;
-                    let gradient = -jacobian_row.dot(&*trial_residual) + prior_gradient;
-                    trial_gradient_max = trial_gradient_max.max(gradient.abs());
+                    slot_gradient[axis] = -jacobian_row.dot(&*trial_residual) + prior_gradient;
                     let terms = jacobian_row
                         .iter()
                         .zip(trial_residual.iter())
@@ -7258,6 +7273,15 @@ impl SaeSupportSparseTerm {
                         + prior_gradient.abs();
                     trial_gradient_band = trial_gradient_band.max(gradient_gamma * terms);
                 }
+                // Compared with `raw_gradient_max`, so measured the same way (#4006).
+                let (_, projected) = self.slot_feasible_gradient(
+                    atom,
+                    &coords_row[offsets[slot].clone()],
+                    &slot_gradient,
+                )?;
+                trial_gradient_max = projected
+                    .iter()
+                    .fold(trial_gradient_max, |max, value| max.max(value.abs()));
             }
             // A step is taken only on a resolved change: the row objective falls by more than
             // its rounding band, or it ties inside that band while the gradient falls by more
@@ -7306,6 +7330,28 @@ impl SaeSupportSparseTerm {
             }
         }
         Ok(max_change)
+    }
+
+    /// One support slot's coordinate first-order optimality measure `P g` and its
+    /// projector `P`: the ambient coordinate gradient `gradient` of an `atom` block
+    /// at `point`, restricted to the block's linearized feasible update space.
+    ///
+    /// On a sphere or at an interval endpoint the ambient gradient keeps the
+    /// constraint's normal (multiplier) component, which stays non-zero at a
+    /// constrained stationary point whose residual does not vanish. Certifying it
+    /// refused a Riemannian stationary sphere row forever (#4006: ambient
+    /// `|g| = 1.40e-3`, tangent `6.0e-16`). A flat chart has `P = I`.
+    fn slot_feasible_gradient(
+        &self,
+        atom: usize,
+        point: &[f64],
+        gradient: &Array1<f64>,
+    ) -> Result<(Array2<f64>, Array1<f64>), String> {
+        let projector =
+            self.assignment
+                .atom_gradient_tangent_projector(atom, point, gradient.view())?;
+        let projected = projector.dot(gradient);
+        Ok((projector, projected))
     }
 
     /// Raw (undamped) KKT residual of the exact objective.
@@ -7410,25 +7456,44 @@ impl SaeSupportSparseTerm {
                     self.fill_active(row, slot, scratch)
                         .map_err(SaeSupportStationarityError::Evaluation)?;
                     let periods = self.atom_ard_axis_periods(atom);
-                    for axis in 0..scratch.jacobian.nrows() {
+                    let point = self.assignment.coords_for_slot(row, slot);
+                    let dim = scratch.jacobian.nrows();
+                    let mut ambient_gradient = Array1::<f64>::zeros(dim);
+                    let mut prior_curvature = Array1::<f64>::zeros(dim);
+                    for axis in 0..dim {
                         let mut gradient = 0.0;
-                        // #2517 — the Gauss-Newton curvature of this coordinate,
-                        // in the same pass: `Σ_out J²` plus the ARD prior's own
-                        // curvature. Same discipline as the decoder block, so
-                        // both are certified in parameter space.
-                        let mut curvature = 0.0;
                         for output in 0..self.output_dim {
-                            let jacobian = scratch.jacobian[[axis, output]];
-                            gradient -= jacobian * residual[[row, output]];
-                            curvature += jacobian * jacobian;
+                            gradient -= scratch.jacobian[[axis, output]] * residual[[row, output]];
                         }
                         let prior = ArdAxisPrior::eval(
                             ard_precisions[atom][axis],
-                            self.assignment.coords_for_slot(row, slot)[axis],
+                            point[axis],
                             periods[axis],
                         );
-                        gradient += prior.grad;
-                        curvature += prior.psd_majorizer_hess();
+                        ambient_gradient[axis] = gradient + prior.grad;
+                        prior_curvature[axis] = prior.psd_majorizer_hess();
+                    }
+                    let (projector, projected_gradient) = self
+                        .slot_feasible_gradient(atom, point, &ambient_gradient)
+                        .map_err(SaeSupportStationarityError::Evaluation)?;
+                    let projected_jacobian = projector.dot(&scratch.jacobian);
+                    for axis in 0..dim {
+                        let gradient = projected_gradient[axis];
+                        // #2517 — the Gauss-Newton curvature of this coordinate,
+                        // in the same pass: `Σ_out J²` plus the ARD prior's own
+                        // curvature. Same discipline as the decoder block, so
+                        // both are certified in parameter space. Measured along
+                        // the feasible direction (#4006), it is the diagonal of
+                        // `P (J Jᵀ + H_prior) P`; a flat chart has `P = I`.
+                        let mut curvature = 0.0;
+                        for output in 0..self.output_dim {
+                            let jacobian = projected_jacobian[[axis, output]];
+                            curvature += jacobian * jacobian;
+                        }
+                        for other in 0..dim {
+                            let weight = projector[[axis, other]];
+                            curvature += weight * weight * prior_curvature[other];
+                        }
                         sq += gradient * gradient;
                         max = max.max(gradient.abs());
                         accumulate_parameter_scaled_gradient(
@@ -7494,6 +7559,8 @@ impl SaeSupportSparseTerm {
                     let atom = self.assignment.support_indices(row)[slot] as usize;
                     self.fill_active(row, slot, scratch)?;
                     let periods = self.atom_ard_axis_periods(atom);
+                    let point = self.assignment.coords_for_slot(row, slot);
+                    let mut ambient_gradient = Array1::<f64>::zeros(scratch.jacobian.nrows());
                     for axis in 0..scratch.jacobian.nrows() {
                         let likelihood_gradient = scratch
                             .jacobian
@@ -7502,13 +7569,17 @@ impl SaeSupportSparseTerm {
                             .zip(residual.row(row).iter())
                             .map(|(jet, error)| -jet * error)
                             .sum::<f64>();
-                        let gradient = likelihood_gradient
+                        ambient_gradient[axis] = likelihood_gradient
                             + ArdAxisPrior::eval(
                                 ard_precisions[atom][axis],
-                                self.assignment.coords_for_slot(row, slot)[axis],
+                                point[axis],
                                 periods[axis],
                             )
                             .grad;
+                    }
+                    let (_, projected_gradient) =
+                        self.slot_feasible_gradient(atom, point, &ambient_gradient)?;
+                    for &gradient in projected_gradient.iter() {
                         sq += gradient * gradient;
                         max = max.max(gradient.abs());
                     }

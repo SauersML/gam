@@ -8,7 +8,7 @@
 use crate::{CachedInnerMode, ConstrainedWarmStart, normalize_active_sets};
 use gam_linalg::matrix::DesignMatrix;
 use gam_model_api::families::custom_family::{BlockwiseFitOptions, CustomFamily};
-use gam_problem::{ParameterBlockSpec, PenaltyMatrix};
+use gam_problem::{CustomFamilyError, ParameterBlockSpec, PenaltyMatrix};
 use gam_runtime::warm_start::Fingerprinter;
 use gam_solve::persistent_warm_start::{
     PersistentBlockInnerSummary, PersistentBlockWarmStartRecord, load_block_record,
@@ -323,7 +323,12 @@ pub(crate) fn hash_cf_array2(hasher: &mut Fingerprinter, values: &Array2<f64>) {
     }
 }
 
-pub(crate) fn hash_cf_design_matrix(
+/// Absorb a design matrix as `(nrows, ncols)` then every entry, read one row
+/// chunk at a time so the key never densifies a lazy design. Public so a
+/// family's `CustomFamily::persistent_warm_start_fingerprint` hashes the
+/// designs its likelihood reads with the same byte stream the block specs are
+/// keyed with, not a second copy of this rule (gam#3002).
+pub fn hash_cf_design_matrix(
     hasher: &mut Fingerprinter,
     design: &DesignMatrix,
 ) -> Result<(), String> {
@@ -387,16 +392,40 @@ pub(crate) fn hash_cf_penalty(hasher: &mut Fingerprinter, penalty: &PenaltyMatri
     }
 }
 
+/// The key a configured persistent store files this fit's block record under.
+///
+/// A configured store is a request, so a fit that cannot be keyed REFUSES it
+/// (gam#3002) instead of quietly running cold: a record keyed without the
+/// data behind the likelihood could hand one dataset's mode to another, and
+/// a store that is accepted but never read or written is an option that does
+/// nothing. Two things can make the key unbuildable, and each has its own
+/// typed error:
+/// - the family supplies no likelihood-data fingerprint
+///   ([`CustomFamily::persistent_warm_start_fingerprint`] returned `None`),
+///   which is a configuration the family does not support;
+/// - a block design cannot be read row-chunk by row-chunk for hashing, which
+///   is an input the fit cannot fingerprint.
 pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     family: &F,
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
-) -> Option<String> {
+) -> Result<String, CustomFamilyError> {
+    let Some(family_fingerprint) = family.persistent_warm_start_fingerprint(specs, options) else {
+        return Err(CustomFamilyError::UnsupportedConfiguration {
+            reason: format!(
+                "a persistent warm-start store is configured, but custom family `{}` does not \
+                 fingerprint the data behind its likelihood for this fit, so its warm-start \
+                 records cannot be keyed safely; remove the persistent warm-start root or \
+                 warm-start this fit explicitly with `warm_start_from`",
+                type_name::<F>()
+            ),
+        });
+    };
     let mut hasher = Fingerprinter::new();
     hasher.write_str("gamfit-persistent-block-warm-start");
     hasher.write_str(&gam_solve::persistent_warm_start::cache_schema_tag());
     hasher.write_str(type_name::<F>());
-    hasher.write_str(&family.persistent_warm_start_fingerprint(specs, options)?);
+    hasher.write_str(&family_fingerprint);
     // #2612: the coefficient objective a persisted mode minimises is
     // `−ℓ + ½βᵀS_λβ − τ·Φ`, so two families that differ ONLY in the
     // Jeffreys/Firth augmentation strength `τ` define different modes at the
@@ -411,7 +440,12 @@ pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     hasher.write_usize(specs.len());
     for spec in specs {
         hasher.write_str(&spec.name);
-        hash_cf_design_matrix(&mut hasher, &spec.design).ok()?;
+        hash_cf_design_matrix(&mut hasher, &spec.design).map_err(|reason| {
+            CustomFamilyError::InvalidInput {
+                context: "persistent warm-start key",
+                reason: format!("block `{}`: {reason}", spec.name),
+            }
+        })?;
         hash_cf_array_view(&mut hasher, spec.offset.view());
         hasher.write_usize(spec.penalties.len());
         for penalty in &spec.penalties {
@@ -441,7 +475,7 @@ pub(crate) fn persistent_custom_family_key<F: CustomFamily + ?Sized>(
     }
     hasher.write_bool(options.outer_score_subsample.is_some());
     hasher.write_bool(options.auto_outer_subsample);
-    Some(format!("cf-{}", hasher.finish_hex()))
+    Ok(format!("cf-{}", hasher.finish_hex()))
 }
 
 pub(crate) fn custom_family_cache_shape(
@@ -458,26 +492,27 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
     specs: &[ParameterBlockSpec],
     options: &BlockwiseFitOptions,
     rho_len: usize,
-) -> (
-    Option<PersistentCustomFamilyCache>,
-    Option<ConstrainedWarmStart>,
-) {
+) -> Result<
+    (
+        Option<PersistentCustomFamilyCache>,
+        Option<ConstrainedWarmStart>,
+    ),
+    CustomFamilyError,
+> {
     let Some(store) = options.persistent_warm_start_store.clone() else {
-        return (None, None);
+        return Ok((None, None));
     };
-    let Some(key) = persistent_custom_family_key::<F>(family, specs, options) else {
-        return (None, None);
-    };
+    let key = persistent_custom_family_key::<F>(family, specs, options)?;
     let cache = PersistentCustomFamilyCache {
         store,
         key: key.clone(),
     };
     let (n_rows, block_names, block_dims) = custom_family_cache_shape(specs);
     let Some(record) = load_block_record(&cache.store, &key) else {
-        return (Some(cache), None);
+        return Ok((Some(cache), None));
     };
     if !record.is_compatible(&key, n_rows, &block_names, &block_dims, rho_len) {
-        return (Some(cache), None);
+        return Ok((Some(cache), None));
     }
     let active_sets = normalize_active_sets(record.active_sets);
     let cached_inner = record.inner.map(|inner| CachedInnerMode {
@@ -520,7 +555,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
     log::debug!(
         "[warm-start-cache] restored custom-family persistent warm start key={key} inner={inner_status}"
     );
-    (
+    Ok((
         Some(cache),
         Some(ConstrainedWarmStart {
             rho: Array1::from_vec(record.rho),
@@ -532,7 +567,7 @@ pub(crate) fn load_persistent_custom_family_warm_start<F: CustomFamily + ?Sized>
             active_sets,
             cached_inner,
         }),
-    )
+    ))
 }
 
 pub(crate) fn persistent_block_inner_summary(

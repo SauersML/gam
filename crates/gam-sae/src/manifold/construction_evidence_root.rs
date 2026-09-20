@@ -769,8 +769,8 @@ impl SaeManifoldTerm {
             .filter(|&index| block.eigenvalues[index] > pencil_floor.max(block.resolution[index]))
             .map(|index| coefficients[index] * coefficients[index] / block.eigenvalues[index])
             .sum::<f64>();
-        let scale = self.penalized_objective_total(target, rho, registry, 1.0)?.abs() + 1.0;
-        let relative = 0.5 * lambda_sq / scale;
+        let objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
+        let relative = Self::inner_relative_decrement(lambda_sq, objective);
         Ok(if Self::inner_decrement_certifies(relative) {
             RefinedRootVerdict::Certified {
                 lambda_sq,

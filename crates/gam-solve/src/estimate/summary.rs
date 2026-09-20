@@ -3,9 +3,14 @@ pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
     pub std_error: Option<f64>,
-    /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
-    /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
-    /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    /// For an unpenalized coefficient, `estimate / std_error`, referred to
+    /// Student-t on the fit's Wald residual degrees of freedom when the fit's
+    /// scale is estimated and to N(0, 1) when it is known
+    /// (`LikelihoodScaleMetadata::wald_scale_is_estimated`). For a linear term
+    /// under the REML-selected ridge, the signed square root of its recorded
+    /// variance-component score statistic — the partial `t` (estimated scale)
+    /// or `z` (known scale) of the unpenalized slope — since the shrunk
+    /// estimate has no valid Wald reference (gam#3573).
     pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
 }
@@ -87,8 +92,9 @@ pub enum SmoothPValueUnavailable {
     /// positive semidefinite at a penalized mode; the score then has no
     /// covariance to refer it to.
     IndefiniteCurvature,
-    /// The scale is estimated, but the fit has no positive residual degrees of
-    /// freedom for the denominator of the reference law.
+    /// The scale is estimated, but the fit records no working residual, or the
+    /// full model fit unpenalized leaves no residual (`n⁺ ≤ rank(X'WX)`) for
+    /// the denominator `D′/ν` of the reference law (gam#3832).
     ResidualDfUnavailable,
     /// A random-effect term whose variance-component score test
     /// (`gam_terms::inference::random_effect_test`) could not be computed, with
@@ -145,8 +151,9 @@ impl SmoothPValueUnavailable {
                  indefinite covariance, so the score has no variance law; no p-value is reported"
             }
             Self::ResidualDfUnavailable => {
-                "residual df unavailable: the scale is estimated but the fit has no positive \
-                 residual degrees of freedom; no p-value is reported"
+                "residual df unavailable: the scale is estimated but the full model fit \
+                 unpenalized leaves no residual to estimate it from (or the fit recorded no \
+                 working residual); no p-value is reported"
             }
             Self::RandomEffect(reason) => reason.explanation(),
             Self::RandomEffectTestNotRecorded => {

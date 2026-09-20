@@ -301,6 +301,20 @@ pub fn normalize_survival_time_pair(
         }
         .into());
     }
+    // An exit before its own entry is not a survival interval. Each consumer's
+    // `age_exit < age_entry` refusal reads the normalized pair, so the raw
+    // ordering has to be checked here. Otherwise the floor below would rewrite
+    // the row to `(entry, entry + SURVIVAL_TIME_FLOOR)`, a near-zero-length
+    // interval the data never contained, and the model would fit on it.
+    if exit_raw < entry_raw {
+        return Err(SurvivalConstructionError::DataValidationFailed {
+            reason: format!(
+                "exit time {exit_raw} precedes entry time {entry_raw} at row {}",
+                row_index + 1
+            ),
+        }
+        .into());
+    }
 
     let entry = entry_raw.max(SURVIVAL_TIME_FLOOR);
     let exit = exit_raw.max(entry + SURVIVAL_TIME_FLOOR);
@@ -7849,5 +7863,29 @@ mod tests {
             interior.iter().any(|value| *value > 1.0e-9),
             "an interior anchor must still evaluate the basis, got {interior:?}"
         );
+    }
+
+    #[test]
+    fn normalize_survival_time_pair_refuses_exit_before_entry() {
+        // Before the refusal, (5.0, 3.0) came back as (5.0, 5.0 + 1e-9): a row
+        // exited before it entered and the fit saw a near-zero-length interval
+        // at the entry time instead. Every downstream `age_exit < age_entry`
+        // check reads the normalized pair, so none of them could see it.
+        let err = super::normalize_survival_time_pair(5.0, 3.0, 6)
+            .expect_err("an exit before its own entry must be refused");
+        assert!(
+            err.contains("exit time 3 precedes entry time 5 at row 7"),
+            "unexpected refusal text: {err}"
+        );
+
+        // An ordered pair, and a zero-length interval, still normalize: the floor
+        // only keeps log-time finite and the interval non-empty.
+        let (entry, exit) =
+            super::normalize_survival_time_pair(1.0, 2.5, 0).expect("ordered pair normalizes");
+        assert_eq!((entry, exit), (1.0, 2.5));
+        let (entry, exit) = super::normalize_survival_time_pair(0.0, 0.0, 0)
+            .expect("a zero-length interval at the origin normalizes");
+        assert_eq!(entry, SURVIVAL_TIME_FLOOR);
+        assert_eq!(exit, entry + SURVIVAL_TIME_FLOOR);
     }
 }
