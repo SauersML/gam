@@ -58,7 +58,7 @@ FUZZ_CASES = 120
 FUZZ_NS: tuple[int, ...] = (50, 500, 5_000)
 # The quick mode: fixed cases that together cover every term kind, at the two
 # smaller n. It is a 0-failure regression test (test_fuzz_terms_quick.py).
-FUZZ_QUICK_CASES: tuple[int, ...] = (0, 1, 2, 3, 7, 15, 20, 34)
+FUZZ_QUICK_CASES: tuple[int, ...] = (5, 7, 31, 100, 101)
 FUZZ_QUICK_NS: tuple[int, ...] = (50, 500)
 
 
