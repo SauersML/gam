@@ -2667,7 +2667,85 @@
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
   },
   {
-    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "items": [
+      "crates/gam-solve/src/gaussian_reml.rs:fn:fnv1a_mix",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:matrix_fingerprint"
+    ],
+    "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
+    "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "95504620470839de04fc1647d8b79f456a45b5ce",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:assembled_operator_fingerprint",
+      "crates/gam-custom-family/src/assembly.rs:fn:hash_f64"
+    ],
+    "reason": "#3641: the assembled-operator cache keyed an Operator-source joint Hessian on a 64-bit hash of its diagonal plus (rho, beta-hat, penalties, knobs) and folded the pseudo-logdet mode to mode == Smooth, so fits sharing the process-global cache could be handed another matrix's operator. The key is now the assembled symmetrized J itself plus the PseudoLogdetMode, compared by exact element equality; the fingerprint and its f64 hashing helper have no remaining caller.",
+    "evidence": "assembly::assembled_operator_cache_tests::same_diagonal_different_curvature_never_shares_an_operator_3641: [[2,0],[0,2]] and [[2,1],[1,2]] (same diagonal) are priced ln 4 and ln 3 under Smooth, HardPseudo and PositiveDefinite; the_cache_key_is_the_exact_matrix_and_mode_3641: a different mode or a one-ulp entry change misses, -0.0 hits +0.0."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "items": [
+      "crates/gam-models/src/bms/block_specs.rs:fn:learned_frailty_scale_is_identified"
+    ],
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
+    "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "b4b0ef17614582d86b30c8ad89e094bc3bca6a7c",
+    "items": [
+      "crates/gam-models/src/vector_response.rs:fn:grad_eta",
+      "crates/gam-models/src/vector_response.rs:fn:hess_block",
+      "crates/gam-models/src/vector_response.rs:fn:hess_diag",
+      "crates/gam-models/src/vector_response.rs:fn:log_lik",
+      "crates/gam-models/src/vector_response.rs:fn:row_weight",
+      "crates/gam-models/src/vector_response.rs:struct:GaussianVectorLikelihood"
+    ],
+    "reason": "#4070: GaussianVectorLikelihood (identity-link Gaussian vector likelihood with diagonal plus low-rank precision) was re-exported from gam-models but never constructed outside one validation test. Its struct, its private row_weight helper and its VectorLikelihood impl (log_lik, grad_eta, hess_diag, hess_block) are deleted with the re-export. The trait's other implementation, MultinomialLogitLikelihood, keeps its own log_lik/grad_eta/hess_diag/hess_block, and the #932 non-finite-state contract stays under test on it.",
+    "evidence": "At the base, git grep -w GaussianVectorLikelihood finds only its declaration and impls in crates/gam-models/src/vector_response.rs, the pub use in crates/gam-models/src/mod.rs, and the vector_response test that constructed it; no crate, binding or Python module names it. The guard's remaining declarations of log_lik, grad_eta, hess_diag and hess_block are the VectorLikelihood trait's and MultinomialLogitLikelihood's; the other row_weight is unrelated."
+  },
+  {
+    "base": "900d061dfc69e80e09eb163b488f12aabfc496a3",
+    "items": [
+      "crates/gam-inference/src/hmc_io.rs:const:HIGH_DIM_THRESHOLD",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_HIGH_DIM",
+      "crates/gam-inference/src/hmc_io.rs:const:SURVIVAL_MASS_REGULARIZE_LOW_DIM",
+      "crates/gam-inference/src/hmc_io.rs:fn:mass_matrix_configs_floor_by_regularization_not_jitter_3090",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_mass_matrix_config",
+      "crates/gam-inference/src/hmc_io.rs:fn:robust_survival_mass_matrix_config"
+    ],
+    "reason": "#3263, the metric half (the target-acceptance half landed with #3370): the NUTS mass-matrix shrinkage toward the identity was a fixed weight, MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.14/0.10 for the mean families and SURVIVAL_MASS_REGULARIZE_{HIGH,LOW}_DIM = 0.18/0.12 for survival, switched at HIGH_DIM_THRESHOLD = 50 and chosen by robust_mass_matrix_config and robust_survival_mass_matrix_config. The pinned general-mcmc c6e415d shrinks each warmup window's log variances toward the identity by that window's own James-Stein intensity, priced by the Monte Carlo error of the squared deviations, and its open warmup no longer reads the fixed weight regularize, so the four weights, the switch and both configs are dead. One nuts_mass_matrix_config with every fixed field zero replaces both configs at their two call sites. The #3090 test mass_matrix_configs_floor_by_regularization_not_jitter_3090 asserted the removed regularize floor; mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263 replaces it.",
+    "evidence": "At this base, source_removal_guard.py with the landing commit as head reports exactly these identities. git grep -w finds none of the eight names under crates, src or tests in the head tree. Gate direct-dy4-w2evhb-3263-g1f.log (acn112): cargo check --workspace --all-targets and gam-pyffi, plus the gam-inference hmc_io, rho_posterior and sample tests, among them mass_matrix_config_leaves_shrinkage_to_each_warmup_window_3263."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "items": [
+      "crates/gam-predict/src/posterior_bands.rs:enum:LinkSelector",
+      "crates/gam-predict/src/posterior_bands.rs:fn:apply",
+      "crates/gam-predict/src/posterior_bands.rs:fn:eta_bands_from_matrix_link",
+      "crates/gam-predict/src/posterior_bands.rs:fn:posterior_quantile_from_sorted",
+      "crates/gam-pyffi/src/latent/reml_latent_fit_ffi.rs:fn:posterior_eta_bands",
+      "crates/gam-pyffi/src/manifold/manifold_and_posterior_ffi.rs:fn:posterior_eta_bands_impl"
+    ],
+    "reason": "#3604: posterior_eta_bands had no Python caller (retired in docs/public-api-2829-disposition.tsv); its hand-copied band reducer never validated draws. draw_bands_from_matrices is the single reducer; matrix_bands calls quantile_from_sorted directly.",
+    "evidence": "git grep finds no caller of posterior_eta_bands, posterior_eta_bands_impl, eta_bands_from_matrix_link, LinkSelector or posterior_quantile_from_sorted after the deletion."
+  },
+  {
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
+    "items": [
+      "crates/gam-inference/src/rho_posterior.rs:fn:normal",
+      "crates/gam-models/src/bms/mod.rs:fn:signed_weighted_gram",
+      "crates/gam-models/src/bms/mod.rs:fn:weighted_ridge_sandwich_cov",
+      "tests/src_modules/misc/families_bms_identifiability_rigid_tests.rs:fn:weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix"
+    ],
+    "reason": "#3047/#3030/#3010 (PR #3222, pr-land comment 5748106176). The stacked first-stage variance now inverts the block-triangular bread J = [[M,0],[M_vm,N]] as J^-1 = [[M+,0],[K,N+]] with K = N+ M_vm M+ in stacked_first_stage_inverse_bread, and carries the constant variance stage in theta1 (dzeta/dv = -zeta/(2v)). That replaces weighted_ridge_sandwich_cov (the mean-only sandwich that omitted the variance stage, #3030) and signed_weighted_gram (whose -2 M_vm cross block gave the wrong sign, #3047); the rank-deficient finiteness test exercised only the deleted sandwich. In rho_posterior.rs the Tier-0 proposal is now the exact GHK truncated Laplace proposal on CriterionContinuation::posterior_support() (#3010), drawn by inverse-CDF truncated_standard_normal from the uniform stream, so the Box-Muller normal() draw has no caller.",
+    "evidence": "At base b3832b92 each name has exactly one definition (rho_posterior.rs:136 SplitMix64::normal, bms/mod.rs:1938 signed_weighted_gram, bms/mod.rs:2039 weighted_ridge_sandwich_cov, families_bms_identifiability_rigid_tests.rs:7072 the test); at the head git grep -w 'fn <name>' finds none of them in those files, and the other fn normal hits are unrelated local RNGs in other files. cargo check --workspace --tests is clean; first_stage_variance_stage (4), murphy_topel (1), gam-inference lib, rho_domain and perf rho_posterior_tier0 pass on the head."
+  },
+  {
+    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
     "items": [
       "crates/gam-problem/src/lib.rs:fn:has_operator",
       "crates/gam-sae/src/attention_kernel.rs:fn:fit_separable_kernel",

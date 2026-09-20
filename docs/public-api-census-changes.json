@@ -4880,7 +4880,31 @@
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
   },
   {
-    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "removed": {
+      "crates/gam-models/src/bms/block_specs.rs::learned_frailty_scale_is_identified": 1
+    },
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit asks the shared identification rule crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867) instead of its own pub(crate) copy learned_frailty_scale_is_identified, which is deleted. The same entry is in docs/source-removal-changes.json.",
+    "evidence": "public_api_census.py with base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate refuses exactly this identity (13820 -> 13819 public function declarations). In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences."
+  },
+  {
+    "base": "f978f1d043baca9753bc81e60ef5a8ac0de02060",
+    "removed": {
+      "crates/gam-predict/src/posterior_bands.rs::eta_bands_from_matrix_link": 1
+    },
+    "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
+    "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "db8172c18d77f3cf412550268a6ce520be42b002",
+    "removed": {
+      "crates/gam-models/src/bms/mod.rs::weighted_ridge_sandwich_cov": 1
+    },
+    "reason": "#3047/#3030/#3010 (PR #3222, pr-land comment 5748106176). The stacked first-stage variance now inverts the block-triangular bread J = [[M,0],[M_vm,N]] as J^-1 = [[M+,0],[K,N+]] with K = N+ M_vm M+ in stacked_first_stage_inverse_bread, and carries the constant variance stage in theta1 (dzeta/dv = -zeta/(2v)). That replaces weighted_ridge_sandwich_cov (the mean-only sandwich that omitted the variance stage, #3030) and signed_weighted_gram (whose -2 M_vm cross block gave the wrong sign, #3047); the rank-deficient finiteness test exercised only the deleted sandwich.",
+    "evidence": "At base b3832b92 weighted_ridge_sandwich_cov is pub(crate) at bms/mod.rs:2039 with its callers in bms/mod.rs and one rigid test; at the head it is gone and stacked_first_stage_sandwich_cov (built on stacked_first_stage_inverse_bread) is the only first-stage covariance. cargo check --workspace --tests is clean."
+  },
+  {
+    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
     "removed": {
       "crates/gam-problem/src/lib.rs::has_operator": 1,
       "crates/gam-sae/src/attention_kernel.rs::fit_separable_kernel": 1,

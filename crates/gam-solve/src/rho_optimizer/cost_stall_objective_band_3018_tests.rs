@@ -665,3 +665,71 @@ fn the_guard_verdicts_are_invariant_to_an_additive_shift_of_the_criterion_3018()
         "steps of τ/4 are refused at |V| = 1e9 as at |V| = 1e5"
     );
 }
+
+/// A STEP'S DECREASE IS NOT THE DECREASE LEFT (#3286). On `V = V0 − ρ` the search
+/// buys `¼·τ` per step with its descent unbounded. Every step is below the
+/// resolution the certificate's verdict and the online stops judge the decrease
+/// LEFT at ([`outer_resolution`](crate::rho_optimizer::decrement_bands::outer_resolution)),
+/// and not one of them is a stall: the guard judges each step's decrease against
+/// the two values' own bands. Judging a step by the decrease-left resolution
+/// would halt this search at `|g| = 1`.
+#[test]
+fn a_step_below_the_decrease_left_resolution_is_still_progress_3286() {
+    let (step, inner_residual) = resolvable_3018();
+    let pair = 2.0 * resolution_3018(V0_3018, Some(inner_residual));
+    let decrease_left = crate::rho_optimizer::decrement_bands::outer_resolution(tau_3018(), pair);
+    assert!(
+        step < decrease_left,
+        "fixture premise: each {step:.3e} step buys less than the decrease-left resolution \
+         {decrease_left:.3e}"
+    );
+    let verdicts = drive_guard_3018(step, Some(inner_residual), 18);
+    assert!(
+        verdicts
+            .iter()
+            .all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
+        "steps the bands resolve are progress whatever the decrease-left resolution is: \
+         {verdicts:?}"
+    );
+}
+
+/// An unbanded value on a route that declares no size carries its own rounding, not
+/// zero (#3286). With no observation count `τ = 0`, so a value whose evaluation forms
+/// no band used to carry a resolution of `0`: every difference then read as resolved
+/// progress, and a flat criterion never stalled. It now carries `γ₁·|V|`, so a step
+/// buying less than the pair of those, with a model that promised nothing, stalls.
+#[test]
+fn an_unbanded_value_with_no_declared_size_carries_its_own_rounding_3286() {
+    let config = claim_band_config(CLAIM_BAND_3018);
+    let tau = crate::rho_optimizer::outer_criterion_resolution(&config);
+    assert_eq!(tau, 0.0, "fixture premise: the route declares no size");
+    let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
+    let mut guard = CostStallGuard::new(tau, &config, exit);
+    let own = guard.value_resolution(V0_3018, &CertificateEvidence::default());
+    assert_eq!(
+        own,
+        crate::rho_optimizer::decrement_bands::value_representation_band(V0_3018),
+        "an unbanded value's resolution is its own representation error"
+    );
+    guard.observe_seed(&array![0.0], V0_3018, own, 1.0);
+    let rho = array![1.0e-3];
+    // One unit in the last place below `V0`: a decrease the arithmetic represents,
+    // `1.46e-11`, inside the pair of representation errors `2.2e-11`.
+    let value = V0_3018.next_down();
+    let verdict = guard.observe(
+        StallSample {
+            point: &rho,
+            value,
+            resolution: guard.value_resolution(value, &CertificateEvidence::default()),
+            grad_norm: 1.0,
+            trusted: true,
+            curvature_psd: None,
+        },
+        0.0,
+    );
+    assert!(
+        !matches!(verdict, CostStallVerdict::Continue),
+        "a decrease of {:.3e} inside the two values' rounding is not progress: {verdict:?}",
+        V0_3018 - value,
+    );
+}

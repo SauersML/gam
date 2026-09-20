@@ -3570,9 +3570,11 @@ pub(crate) fn single_block_simplified_newton_corrections<
 /// `dβ̂/dρ_k = −(H + S_λ)⁻¹ λ_k S_k β̂`.
 ///
 /// `curvature` is the exact-Newton working set the mode's own solve ended on, so `H` is the
-/// curvature that solve certified at `β̂`, and `S_λ` is the penalty at `from`. The step is the
-/// block's update step ([`ExactNewtonBlockUpdater::step_for_rhs`]) with right-hand side
-/// `−Σ_k Δρ_k λ_k S_k β̂`: the stabilized solve and the linear constraints are the ones the
+/// curvature that solve certified at `β̂`, and `S_λ` is the penalty at `from`, formed from the
+/// structural roots `S_k = R_kᵀR_k` the solve reads
+/// ([`crate::blockwise_solve::block_penalty_roots`]). The step is the block's update step
+/// ([`ExactNewtonBlockUpdater::step_for_rhs`]) with right-hand side
+/// `−Σ_k Δρ_k λ_k R_kᵀ(R_k β̂)`: the stabilized solve and the linear constraints are the ones the
 /// Newton-region test that judges the predictor uses, and on an active face the step is the
 /// face's one-sided tangent. Forming it needs no evaluation of the family and no outer pricing.
 pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync + 'static>(
@@ -3614,17 +3616,9 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
             reason: "the IFT predictor needs the mode's exact-Newton curvature".to_string(),
         });
     };
-    let p = spec.design.ncols();
-    let lambdas = exact_lambdas_from_log_strengths(from, "IFT predictor log strength")?;
-    let mut s_lambda = Array2::<f64>::zeros((p, p));
-    let mut tangent_direction = Array2::<f64>::zeros((p, p));
-    for (k, s) in spec.penalties.iter().enumerate() {
-        s.add_scaled_to(lambdas[k], &mut s_lambda);
-        let delta = to[k] - from[k];
-        if delta != 0.0 {
-            s.add_scaled_to(delta * lambdas[k], &mut tangent_direction);
-        }
-    }
+    // The solver's own penalty: the structural roots at `from` (#2954), so `S_λ` is the curvature
+    // the mode's solve ended on and each `S_k β̂` is `R_kᵀ(R_k β̂)` of the same roots.
+    let (s_lambda, terms) = crate::blockwise_solve::block_penalty_roots(0, spec, from)?;
     let mut states = buildblock_states(family, specs)?;
     if mode_beta.len() != states[0].beta.len() {
         return Err(CustomFamilyError::DimensionMismatch {
@@ -3634,6 +3628,19 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
                 states[0].beta.len()
             ),
         });
+    }
+    let mut tangent_rhs = Array1::<f64>::zeros(mode_beta.len());
+    for (term, (&to_k, &from_k)) in terms.iter().zip(to.iter().zip(from.iter())) {
+        let delta = to_k - from_k;
+        if delta != 0.0 {
+            let root = term.root.as_ref();
+            let pulled = root
+                .t()
+                .dot(&root.dot(&mode_beta.slice(ndarray::s![term.columns.clone()])));
+            tangent_rhs
+                .slice_mut(ndarray::s![term.columns.clone()])
+                .scaled_add(-delta * term.lambda, &pulled);
+        }
     }
     states[0].beta.assign(mode_beta);
     refresh_all_block_etas(family, specs, &mut states)?;
@@ -3649,7 +3656,7 @@ pub(crate) fn single_block_ift_predictor<F: CustomFamily + Clone + Send + Sync +
             linear_constraints: constraints.as_ref(),
             cached_active_set: active_set,
         },
-        -tangent_direction.dot(mode_beta),
+        tangent_rhs,
     )?;
     Ok(vec![family.post_update_block_beta(&states, 0, spec, step.beta_new_raw)?])
 }
