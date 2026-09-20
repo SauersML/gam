@@ -161,10 +161,11 @@ fn squared_distance_rows(z: ArrayView2<'_, f64>, a: usize, b: usize) -> f64 {
 /// The issue asks for persistent-cohomology harmonic coordinates.  In the core
 /// build we avoid a heavyweight dependency and compute the same object needed by
 /// the optimizer seed: low-energy harmonic coordinates on a symmetric kNN graph
-/// built from a bounded deterministic subsample.  The first non-constant graph
-/// Laplacian eigenfunctions are the discrete harmonic representatives; reading
-/// their phases gives circle/torus coordinates, while normalizing the first
-/// three gives a sphere chart.  If the graph is too small/degenerate this returns
+/// built from a bounded deterministic subsample.  The non-constant graph
+/// Laplacian eigenfunctions are the discrete harmonic representatives, taken in
+/// order of the target energy they carry; reading their phases gives
+/// circle/torus coordinates, while normalizing the leading three gives a sphere
+/// chart.  If the graph is too small/degenerate this returns
 /// `Ok(None)`: the cold-start seed then reads principal components, and the
 /// co-collapse reseed reads data rows ([`sae_data_row_anchored_coords`]).
 pub(crate) fn topology_curved_seed_initial_coords(
@@ -333,7 +334,36 @@ pub(crate) fn topology_curved_seed_initial_coords(
     };
     // Harmonic chart functions: graph-Laplacian eigenvectors, excluding the
     // constant Fiedler-0 column. Each is a function over the `m` subsample rows.
-    let harmonic: Vec<ArrayView1<'_, f64>> = (1..evecs.ncols()).map(|c| evecs.column(c)).collect();
+    //
+    // #3459 — they are handed to atoms in order of the target energy they carry,
+    // `‖(Z_sub − 1μᵀ)ᵀ v‖²`, not in eigenvalue order. The eigenvalue ranks a
+    // function by its smoothness on the graph, and one closed curve carries a whole
+    // ladder of smooth functions: the harmonics `cos jθ, sin jθ` of its own phase.
+    // A window on the `j = 2` pair reads the chart `2θ`, which no planted structure
+    // varies along linearly; the fit then relaxes that atom onto the strong circle
+    // and splits it across two atoms. An atom's seed decoder is the least-squares
+    // projection of the target onto its chart's basis, whose first harmonics are
+    // these functions, so the target energy on a function is the reconstruction it
+    // contributes to the seed, and this order hands each atom the most
+    // data-supported functions left. Ties keep eigenvalue order.
+    let sub_mean: Array1<f64> = (0..z.ncols())
+        .map(|col| rows.iter().map(|&r| z[[r, col]]).sum::<f64>() / m as f64)
+        .collect();
+    let mut z_sub = Array2::<f64>::zeros((m, z.ncols()));
+    for (pos, &r) in rows.iter().enumerate() {
+        for col in 0..z.ncols() {
+            z_sub[[pos, col]] = z[[r, col]] - sub_mean[col];
+        }
+    }
+    let energy: Vec<f64> = (1..evecs.ncols())
+        .map(|c| {
+            let proj = z_sub.t().dot(&evecs.column(c));
+            proj.dot(&proj)
+        })
+        .collect();
+    let mut order: Vec<usize> = (0..energy.len()).collect();
+    order.sort_by(|&a, &b| energy[b].total_cmp(&energy[a]).then_with(|| a.cmp(&b)));
+    let harmonic: Vec<ArrayView1<'_, f64>> = order.iter().map(|&c| evecs.column(c + 1)).collect();
     let n_harm = harmonic.len();
     let starts = topology_seed_harmonic_starts(basis_kinds, atom_dim);
     for atom_idx in 0..basis_kinds.len() {
@@ -351,7 +381,7 @@ pub(crate) fn topology_curved_seed_initial_coords(
         // is requested; otherwise it gets a DISTINCT atom-keyed generic combination
         // of ALL harmonics, so K ≫ p atoms never share a chart and a co-collapse
         // reseed (retry > 0) lands every atom on a different basin. Atom 0 at
-        // retry 0 keeps its original leading-harmonic window bit-for-bit.
+        // retry 0 keeps the leading window of the energy-ordered harmonics.
         let start = starts[atom_idx];
         let canonical = pc_pair_offset == 0 && start + need <= n_harm;
         let fns: Vec<Array1<f64>> = if canonical {
