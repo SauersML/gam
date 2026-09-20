@@ -418,6 +418,62 @@ mod tests {
     }
 
     #[test]
+    fn lc22_probe4_3474() {
+        use gam_solve::rho_optimizer::OuterObjective;
+        let _ = log::set_boxed_logger(Box::new(Lc22CriterionLogger));
+        log::set_max_level(log::LevelFilter::Debug);
+        let (target, term, rho, _pin, _provenance) = seeded_external_fixture();
+        eprintln!("[probe4] seed beta_dim={}", term.beta_dim());
+        let rho_flat = rho.to_flat(&term.assignment).unwrap();
+        let mut objective = SaeManifoldOuterObjective::new(
+            term, target.clone(), Some(AnalyticPenaltyRegistry::new()), rho, 40, 1.0, 1.0e-6, 1.0e-6,
+        );
+        let result: OuterResult = OuterProblem::new(rho_flat.len())
+            .with_initial_rho(rho_flat)
+            .run(&mut objective, "probe4")
+            .expect("run");
+        eprintln!(
+            "[probe4] run converged={} rho={:?} value={:.10e} grad={:?}",
+            result.converged(),
+            result.rho.to_vec(),
+            result.final_value,
+            result.final_measurement.as_ref().map(|m| m.gradient().to_vec())
+        );
+        if let Some(c) = result.criterion_certificate.as_ref() {
+            eprintln!("[probe4] run certificate: {}", c.summary());
+        }
+        objective.certify_outer_result(&result).expect("certify");
+        let fitted = objective.into_fitted().expect("fitted");
+        let flat = fitted.rho.flat_coordinates();
+        for prepare in [false, true] {
+            let mut t = fitted.term.clone();
+            let before = t.beta_dim();
+            if prepare {
+                t.prepare_entry_stages().expect("prepare");
+            }
+            eprintln!("[probe4] audit prepare={prepare} beta_dim {before} -> {}", t.beta_dim());
+            let mut o = SaeManifoldOuterObjective::new(
+                t, target.clone(), Some(AnalyticPenaltyRegistry::new()), fitted.rho.clone(), 0, 1.0, 1.0e-6, 1.0e-6,
+            )
+            .for_installed_state_audit();
+            match o.eval(&flat) {
+                Ok(ev) => eprintln!("[probe4] audit prepare={prepare} cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe4] audit prepare={prepare} err {e}"),
+            }
+        }
+        {
+            let t = fitted.term.clone();
+            let mut o = SaeManifoldOuterObjective::new(
+                t, target.clone(), Some(AnalyticPenaltyRegistry::new()), fitted.rho.clone(), 40, 1.0, 1.0e-6, 1.0e-6,
+            );
+            match o.eval(&flat) {
+                Ok(ev) => eprintln!("[probe4] live-from-fitted cost={:.10e} g={:?}", ev.cost, ev.gradient.to_vec()),
+                Err(e) => eprintln!("[probe4] live-from-fitted err {e}"),
+            }
+        }
+    }
+
+    #[test]
     fn lc22_probe2_3474() {
         use gam_solve::rho_optimizer::OuterObjective;
         let fresh = || {
