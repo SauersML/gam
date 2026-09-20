@@ -353,7 +353,6 @@ struct SampleConfigPayload {
     n_samples: usize,
     n_warmup: usize,
     n_chains: usize,
-    target_accept: f64,
     seed: u64,
 }
 
@@ -2292,7 +2291,6 @@ fn sample_table(
     config.set_item("n_samples", payload.config.n_samples)?;
     config.set_item("n_warmup", payload.config.n_warmup)?;
     config.set_item("n_chains", payload.config.n_chains)?;
-    config.set_item("target_accept", payload.config.target_accept)?;
     config.set_item("seed", payload.config.seed)?;
     let out = PyDict::new(py);
     out.set_item("samples", payload.samples.into_pyarray(py))?;
@@ -2969,16 +2967,23 @@ fn basis_with_jet<'py>(
                             degree + 1
                         )));
                     }
-                    let interior = n_basis.saturating_sub(degree + 1);
-                    let total = interior + 2 * (degree + 1);
-                    let mut knots = Array1::<f64>::zeros(total);
-                    let inner = interior as f64 + 1.0;
-                    for i in 0..total {
-                        let raw = (i as f64) - (degree as f64);
-                        let clamped = raw.max(0.0).min(inner);
-                        knots[i] = clamped / inner;
+                    // `n_basis` means the same thing in both branches: the
+                    // number of design columns on the unit parameter domain.
+                    // A periodic basis takes its knots as the uniform lattice
+                    // `linspace(0, 1, n_basis + 1)` (one cyclic control per
+                    // interval, see `periodic_knot_domain`); an open basis
+                    // takes the canonical clamped uniform vector with
+                    // `n_basis - (degree + 1)` internal knots.
+                    if periodic {
+                        Array1::linspace(0.0, 1.0, n_basis + 1)
+                    } else {
+                        gam::terms::basis::generate_full_knot_vector(
+                            (0.0, 1.0),
+                            n_basis - (degree + 1),
+                            degree,
+                        )
+                        .map_err(basis_error_to_pyerr)?
                     }
-                    knots
                 }
             };
             let t_1d = coords.column(0).to_owned();
@@ -4637,45 +4642,37 @@ fn gaussian_reml_fit<'py>(
     let x_values = x.as_array().to_owned();
     let y_values = y.as_array().to_owned();
     let penalty_values = penalty.as_array().to_owned();
-    let n_rows = x_values.nrows();
-    let n_outputs = y_values.ncols();
-    let n_coefficients = penalty_values.nrows();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let result = detach_py_result(py, "gaussian_reml_fit", move || {
+    let fit = detach_pyresult(py, "gaussian_reml_fit", move || {
         let gated_x = gate_design_for_forward(
             x_values.view(),
             by_values.as_ref().map(|b| b.view()),
             by_start_col,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let fit_x = gated_x.as_ref().map_or(x_values.view(), |g| g.view());
         let gated_weights = gate_weights_for_forward(
             weight_values.as_ref().map(|w| w.view()),
             by_values.as_ref().map(|b| b.view()),
             x_values.nrows(),
-        )?;
-        match gaussian_reml_multi_closed_form_with_cache(
+        )
+        .map_err(py_value_error)?;
+        // A singular XᵀWX (p > n, or rank-deficient) is fit through the penalty
+        // pencil when the penalty identifies null(W½X) (gam#3366) and refused
+        // with the engine's typed error otherwise (gam#3310).
+        gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             penalty_values.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
-        ) {
-            Ok(fit) => Ok(Some(fit)),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => Ok(None),
-            Err(err) => Err(err.to_string()),
-        }
+        )
+        .map_err(estimation_error_to_pyerr)
     })?;
     let out = PyDict::new(py);
-    match result {
-        Some(fit) => {
-            set_ok_gaussian_reml_items(py, &out, fit)?;
-        }
-        None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, n_coefficients)?;
-        }
-    }
+    set_ok_gaussian_reml_items(py, &out, fit)?;
     Ok(out.unbind())
 }
 
@@ -5767,6 +5764,10 @@ fn set_batched_gaussian_reml_dict_items<'py>(
         result.cache_coefficient_basis.into_pyarray(py),
     )?;
     out.set_item(
+        "cache_data_null_basis",
+        result.cache_data_null_basis.into_pyarray(py),
+    )?;
+    out.set_item(
         "cache_xtwx_fingerprints",
         result.cache_xtwx_fingerprints.into_pyarray(py),
     )?;
@@ -5990,9 +5991,7 @@ fn gaussian_reml_fit_positions<'py>(
     let y_values = y.as_array().to_owned();
     let weight_values = weights.as_ref().map(|w| w.as_array().to_owned());
     let by_values = by.as_ref().map(|b| b.as_array().to_owned());
-    let n_rows = t_values.len();
-    let n_outputs = y_values.ncols();
-    let (result, basis) = detach_py_result(py, "gaussian_reml_fit_positions", move || {
+    let (fit, basis) = detach_pyresult(py, "gaussian_reml_fit_positions", move || {
         let basis = resolve_position_basis(
             t_values.view(),
             basis_kind.as_deref(),
@@ -6001,7 +6000,8 @@ fn gaussian_reml_fit_positions<'py>(
             basis_order,
             periodic,
             period,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let x = position_basis_design(
             t_values.view(),
             basis.locations.view(),
@@ -6009,36 +6009,33 @@ fn gaussian_reml_fit_positions<'py>(
             basis.order,
             periodic,
             basis.period,
-        )?;
+        )
+        .map_err(py_value_error)?;
         let gated_x =
-            gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)?;
+            gate_design_for_forward(x.view(), by_values.as_ref().map(|b| b.view()), by_start_col)
+                .map_err(py_value_error)?;
         let fit_x = gated_x.as_ref().map_or(x.view(), |g| g.view());
         let gated_weights = gate_weights_for_forward(
             weight_values.as_ref().map(|w| w.view()),
             by_values.as_ref().map(|b| b.view()),
             x.nrows(),
-        )?;
-        let fit = match gaussian_reml_multi_closed_form_with_cache(
+        )
+        .map_err(py_value_error)?;
+        // A singular XᵀWX is fit through the penalty pencil when the penalty
+        // identifies null(W½X) (gam#3366) and refused otherwise (gam#3310).
+        let fit = gaussian_reml_multi_closed_form_with_cache(
             fit_x,
             y_values.view(),
             basis.penalty.view(),
             gated_weights.as_ref().map(|w| w.view()),
             init_lambda,
             None,
-        ) {
-            Ok(fit) => Some(fit),
-            Err(EstimationError::ModelIsIllConditioned { .. }) => None,
-            Err(err) => return Err(err.to_string()),
-        };
+        )
+        .map_err(estimation_error_to_pyerr)?;
         Ok((fit, basis))
     })?;
     let out = PyDict::new(py);
-    match result {
-        Some(fit) => set_ok_gaussian_reml_items(py, &out, fit)?,
-        None => {
-            set_degenerate_gaussian_reml_items(py, &out, n_rows, n_outputs, basis.penalty.nrows())?;
-        }
-    }
+    set_ok_gaussian_reml_items(py, &out, fit)?;
     set_position_basis_items(py, &out, basis, periodic)?;
     Ok(out.unbind())
 }
