@@ -2365,11 +2365,34 @@ pub struct TermCollectionPredictionDesign {
     pub affine_offset: Array1<f64>,
     /// Each linear term's name and global coefficient range, in spec order.
     pub linear_ranges: Vec<(String, Range<usize>)>,
+    /// Each random-effect term's name and global coefficient range, in spec order.
+    pub random_effect_ranges: Vec<(String, Range<usize>)>,
     /// Each smooth term's name and global coefficient range, in spec order.
     pub smooth_ranges: Vec<(String, Range<usize>)>,
 }
 
 impl TermCollectionPredictionDesign {
+    /// The global coefficient range of the linear, random-effect or smooth term
+    /// named `term`.
+    pub fn term_range(&self, term: &str) -> Option<Range<usize>> {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .find(|(name, _)| name == term)
+            .map(|(_, range)| range.clone())
+    }
+
+    /// Every non-intercept term's name, in design order.
+    pub fn term_names(&self) -> Vec<&str> {
+        self.linear_ranges
+            .iter()
+            .chain(&self.random_effect_ranges)
+            .chain(&self.smooth_ranges)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
     /// See [`TermCollectionDesign::compose_offset`].
     pub fn compose_offset(
         &self,
