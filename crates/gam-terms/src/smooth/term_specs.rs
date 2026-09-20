@@ -8086,7 +8086,7 @@ fn build_factor_level_slopes(
             .row_mut(i)
             .assign(&(&contrasts.row(level_idx) * dx));
     }
-    let (penalty, scale) = normalize_penalty_in_constrained_space(&Array2::<f64>::eye(q));
+    let (penalty, scale) = normalize_penalty_in_constrained_space(&Array2::<f64>::eye(q))?;
     let filtered = crate::basis::filter_penalty_candidates(vec![PenaltyCandidate {
         matrix: ConstructiveQuadratic::try_from_dense_psd(penalty, "level-slope contrast penalty")?,
         source: PenaltySource::Primary,
