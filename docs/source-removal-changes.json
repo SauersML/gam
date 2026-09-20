@@ -2665,5 +2665,14 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-runtime/src/resource.rs:fn:for_problem_dimension_overflow_defers_to_typed_reservation",
+      "crates/gam-runtime/src/resource.rs:fn:for_problem_has_no_row_or_column_cliff"
+    ],
+    "reason": "#4400: for_problem_has_no_row_or_column_cliff and for_problem_dimension_overflow_defers_to_typed_reservation each called ResourcePolicy::for_problem(ProblemHints::default()) and asserted MaterializeIfSmall, exactly what for_problem_small_data_uses_materialize_if_small already asserts. for_problem takes no shape argument, so neither test could exercise the row/column cliff or dimension overflow its name claims; they were copies, not coverage.",
+    "evidence": "scripts/source_removal_guard.py with --base 3d306728d71b4e24433564e05043d5e68056f47a and head the change's commit lists exactly these removals. for_problem_small_data_uses_materialize_if_small and for_problem_marginal_slope_hint_is_strict stay and cover both branches of ResourcePolicy::for_problem."
   }
 ]

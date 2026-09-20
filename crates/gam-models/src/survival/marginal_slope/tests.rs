@@ -429,8 +429,6 @@ impl gam_linalg::matrix::DenseDesignOperator for StreamedOnlyDesignOperator {
     fn materialization_policy(&self) -> Option<gam_runtime::resource::MaterializationPolicy> {
         Some(gam_runtime::resource::MaterializationPolicy {
             max_single_dense_bytes: 0,
-            max_cached_dense_bytes: 0,
-            row_chunk_target_bytes: 1024,
             allow_operator_materialization: false,
             allow_diagnostic_materialization: false,
         })
