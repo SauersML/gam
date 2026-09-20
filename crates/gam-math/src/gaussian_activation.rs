@@ -129,9 +129,7 @@
 //! constant mean, `K = σ(b) T_w σ(c)` and `∂_r K = σ'(b) T_w σ'(c)`.
 
 use crate::bivariate_normal::{
-    BIVARIATE_NORMAL_CDF_ERROR_BOUND, BivariateNormalError,
-    bivariate_normal_cdf_partials_with_complement, bivariate_normal_cdf_with_complement,
-    bivariate_normal_cdf_with_complement_bounded,
+    BivariateNormalError, bivariate_normal_cdf_partials_with_complement, bivariate_normal_cdf_with_complement,
 };
 use crate::double_double::BoundedDoubleDouble;
 use crate::probability::{
@@ -398,11 +396,9 @@ pub struct PreactivationPair {
 /// module's standard model. For biased pairs they add the bivariate normal
 /// owner's bounds on `Φ₂` and its partials, and propagate the rounding of the
 /// standardized arguments `(h, k, ρ, 1 − ρ²)` through the partials of `Φ₂`. They
-/// are absolute. `Φ₂` comes from the owner's plain entry, whose absolute contract
-/// is cheap. Where that route's bounds certify no digit of `K` or `∂_r K` (the
-/// anticorrelated lower tails, #2946), the kernel is evaluated again with the
-/// owner's certified entry. Its rounding scales with `Φ₂`, and
-/// [`PairKernel::orthant_fallback`] records that it ran.
+/// are absolute. `Φ₂`'s own bound is the owner's per-call bound, which scales with
+/// `Φ₂`, so the anticorrelated lower tails keep their certified digits (#2946,
+/// #3253).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PairKernel {
     /// `K = E[σ(X) σ(Y)]`.
@@ -413,17 +409,6 @@ pub struct PairKernel {
     pub value_rounding: f64,
     /// A bound on the absolute rounding of `covariance_derivative`.
     pub covariance_derivative_rounding: f64,
-    /// `true` when the plain route certified no digit, so `Φ₂` was re-evaluated by the bivariate normal owner's
-    /// certified entry, at a few hundred times the plain cost. Callers count it to measure that cost.
-    pub orthant_fallback: bool,
-}
-
-impl PairKernel {
-    /// Whether both bounds leave a certified digit, the invariant the plain route must meet before its values stand.
-    fn certifies_a_digit(&self) -> bool {
-        self.value_rounding < self.value.abs()
-            && self.covariance_derivative_rounding < self.covariance_derivative.abs()
-    }
 }
 
 /// The pair kernel `K_σ(b, c; v, w, r) = E[σ(X) σ(Y)]` with `∂_r K_σ`.
@@ -1389,7 +1374,6 @@ fn pair_kernel_from(value: Bounded, derivative: Bounded) -> PairKernel {
         covariance_derivative: derivative.value,
         value_rounding: value.bound,
         covariance_derivative_rounding: derivative.bound,
-        orthant_fallback: false,
     }
 }
 
@@ -1648,15 +1632,6 @@ fn limiting_step(x: f64) -> f64 {
     }
 }
 
-/// Which of the bivariate normal owner's entries gives `Φ₂`'s value and rounding.
-#[derive(Clone, Copy)]
-enum OrthantEntry {
-    /// `bivariate_normal_cdf_with_complement` under its absolute contract.
-    Plain,
-    /// `bivariate_normal_cdf_with_complement_bounded`: rounding that scales with the value.
-    Certified,
-}
-
 /// `H`, `∂_hΦ₂`, `∂_kΦ₂` and `φ₂` at a standardized law, each with its bound.
 struct StandardizedOrthant {
     orthant: Bounded,
@@ -1681,9 +1656,8 @@ fn capped_complement(ratio: Bounded) -> Bounded {
 
 /// `Φ₂(h, k; ρ)` and its partials from the bivariate normal owner, with its own
 /// rounding bounds plus the standardized arguments' rounding propagated through
-/// the partials of `Φ₂`. `Φ₂`'s own rounding is the chosen entry's: the plain
-/// entry's absolute contract, or the certified entry's per-evaluation bound, which
-/// scales with the value.
+/// the partials of `Φ₂`. `Φ₂`'s own rounding is the owner's per-evaluation bound,
+/// which scales with the value.
 /// - A rounded `1 − ρ²` moves the owner's `1 ∓ |ρ|`, and so the effective
 ///   correlation, by at most its bound over `1 + |ρ|`.
 /// - With `c = 1 − ρ²`, `r_h = (h − ρk)/c` and `r_k = (k − ρh)/c`, the partials
@@ -1697,25 +1671,10 @@ fn standardized_orthant(
     k: Bounded,
     correlation: Bounded,
     complement: Bounded,
-    entry: OrthantEntry,
 ) -> Result<StandardizedOrthant, GaussianActivationError> {
-    let (value, rounding) = match entry {
-        OrthantEntry::Plain => (
-            bivariate_normal_cdf_with_complement(h.value, k.value, correlation.value, complement.value)
-                .map_err(bivariate_normal_refusal)?,
-            BIVARIATE_NORMAL_CDF_ERROR_BOUND,
-        ),
-        OrthantEntry::Certified => {
-            let bounded = bivariate_normal_cdf_with_complement_bounded(
-                h.value,
-                k.value,
-                correlation.value,
-                complement.value,
-            )
-            .map_err(bivariate_normal_refusal)?;
-            (bounded.value, bounded.rounding)
-        }
-    };
+    let orthant = bivariate_normal_cdf_with_complement(h.value, k.value, correlation.value, complement.value)
+        .map_err(bivariate_normal_refusal)?;
+    let (value, rounding) = (orthant.value, orthant.rounding);
     let rho = correlation.value;
     let correlation_bound = correlation.bound + complement.bound / (1.0 + rho.abs());
     if complement.value > 0.0 {
@@ -1817,40 +1776,20 @@ fn relu_biased_pair_kernel(
     let complement = capped_complement(
         bounded_residual(law).div(Bounded::exact(variance_x).mul(Bounded::exact(variance_y))),
     );
-    let evaluate = |entry: OrthantEntry| -> Result<PairKernel, GaussianActivationError> {
-        let standardized = standardized_orthant(
-            location_x.div(root_x),
-            location_y.div(root_y),
-            clamped_correlation(covariance.div(scale)),
-            complement,
-            entry,
-        )?;
-        let value = location_x
-            .mul(location_y)
-            .add(covariance)
-            .mul(standardized.orthant)
-            .add(location_y.mul(root_x).mul(standardized.partial_h))
-            .add(location_x.mul(root_y).mul(standardized.partial_k))
-            .add(scale.mul(complement).mul(standardized.density));
-        Ok(pair_kernel_from(value, standardized.orthant))
-    };
-    with_orthant_fallback(evaluate)
-}
-
-/// The plain route, and the certified one only where the plain bounds certify no digit (see [`PairKernel`]). The
-/// trigger is the kernel's own invariant, so the certified entry's cost falls only on the pairs that need it.
-fn with_orthant_fallback(
-    evaluate: impl Fn(OrthantEntry) -> Result<PairKernel, GaussianActivationError>,
-) -> Result<PairKernel, GaussianActivationError> {
-    let plain = evaluate(OrthantEntry::Plain)?;
-    if plain.certifies_a_digit() {
-        return Ok(plain);
-    }
-    let certified = evaluate(OrthantEntry::Certified)?;
-    Ok(PairKernel {
-        orthant_fallback: true,
-        ..certified
-    })
+    let standardized = standardized_orthant(
+        location_x.div(root_x),
+        location_y.div(root_y),
+        clamped_correlation(covariance.div(scale)),
+        complement,
+    )?;
+    let value = location_x
+        .mul(location_y)
+        .add(covariance)
+        .mul(standardized.orthant)
+        .add(location_y.mul(root_x).mul(standardized.partial_h))
+        .add(location_x.mul(root_y).mul(standardized.partial_k))
+        .add(scale.mul(complement).mul(standardized.density));
+    Ok(pair_kernel_from(value, standardized.orthant))
 }
 
 /// The exact GELU with means (the module's biased forms), with `A = 1 + v`, `B = 1 + w`,
@@ -1873,57 +1812,53 @@ fn exact_gelu_biased_pair_kernel(
     let discriminant = one.add(spread_x).add(spread_y).add(residual);
     let location_x = Bounded::exact(mean_x);
     let location_y = Bounded::exact(mean_y);
-    let evaluate = |entry: OrthantEntry| -> Result<PairKernel, GaussianActivationError> {
-        let standardized = standardized_orthant(
-            location_x.div(root_total_x),
-            location_y.div(root_total_y),
-            clamped_correlation(covariance.div(root_product)),
-            capped_complement(discriminant.div(total_x.mul(total_y))),
-            entry,
-        )?;
-        let partial_x = standardized.partial_h.div(root_total_x);
-        let partial_y = standardized.partial_k.div(root_total_y);
-        let density = standardized.density.div(root_product);
-        let reduced_x = total_y
-            .mul(location_x)
-            .sub(covariance.mul(location_y))
-            .div(discriminant);
-        let reduced_y = total_x
-            .mul(location_y)
-            .sub(covariance.mul(location_x))
-            .div(discriminant);
-        let coupling =
-            residual.add(covariance.mul(covariance).mul(one.div(total_x).add(one.div(total_y))));
-        let value = location_x
-            .mul(location_y)
-            .add(covariance)
-            .mul(standardized.orthant)
-            .add(
-                location_y
-                    .mul(spread_x)
-                    .add(location_x.mul(covariance).div(total_x))
-                    .mul(partial_x),
-            )
-            .add(
-                location_x
-                    .mul(spread_y)
-                    .add(location_y.mul(covariance).div(total_y))
-                    .mul(partial_y),
-            )
-            .add(coupling.mul(density));
-        let derivative = standardized
-            .orthant
-            .add(location_x.mul(partial_x).add(covariance.mul(density)).div(total_x))
-            .add(location_y.mul(partial_y).add(covariance.mul(density)).div(total_y))
-            .add(
-                covariance
-                    .div(discriminant)
-                    .add(reduced_x.mul(reduced_y))
-                    .mul(density),
-            );
-        Ok(pair_kernel_from(value, derivative))
-    };
-    with_orthant_fallback(evaluate)
+    let standardized = standardized_orthant(
+        location_x.div(root_total_x),
+        location_y.div(root_total_y),
+        clamped_correlation(covariance.div(root_product)),
+        capped_complement(discriminant.div(total_x.mul(total_y))),
+    )?;
+    let partial_x = standardized.partial_h.div(root_total_x);
+    let partial_y = standardized.partial_k.div(root_total_y);
+    let density = standardized.density.div(root_product);
+    let reduced_x = total_y
+        .mul(location_x)
+        .sub(covariance.mul(location_y))
+        .div(discriminant);
+    let reduced_y = total_x
+        .mul(location_y)
+        .sub(covariance.mul(location_x))
+        .div(discriminant);
+    let coupling =
+        residual.add(covariance.mul(covariance).mul(one.div(total_x).add(one.div(total_y))));
+    let value = location_x
+        .mul(location_y)
+        .add(covariance)
+        .mul(standardized.orthant)
+        .add(
+            location_y
+                .mul(spread_x)
+                .add(location_x.mul(covariance).div(total_x))
+                .mul(partial_x),
+        )
+        .add(
+            location_x
+                .mul(spread_y)
+                .add(location_y.mul(covariance).div(total_y))
+                .mul(partial_y),
+        )
+        .add(coupling.mul(density));
+    let derivative = standardized
+        .orthant
+        .add(location_x.mul(partial_x).add(covariance.mul(density)).div(total_x))
+        .add(location_y.mul(partial_y).add(covariance.mul(density)).div(total_y))
+        .add(
+            covariance
+                .div(discriminant)
+                .add(reduced_x.mul(reduced_y))
+                .mul(density),
+        );
+    Ok(pair_kernel_from(value, derivative))
 }
 
 #[cfg(test)]
@@ -2321,14 +2256,12 @@ mod tests {
         DoubleDouble::from(1.0).div(tail)
     }
 
-    /// The bivariate normal owner's published absolute bound per value of `Φ₂`.
-    const BIVARIATE_NORMAL_CONTRACT: f64 = BIVARIATE_NORMAL_CDF_ERROR_BOUND;
-
     /// `(H, ∂_hΦ₂, ∂_kΦ₂, φ₂)` at a standardized pair law, as the biased kernels
     /// form them, with the degenerate law's partials bounded by `φ(h)`, `φ(k)`.
     fn standardized_orthant(h: f64, k: f64, correlation: f64, complement: f64) -> (f64, f64, f64, f64) {
         let orthant = bivariate_normal_cdf_with_complement(h, k, correlation, complement)
-            .expect("standardized orthant");
+            .expect("standardized orthant")
+            .value;
         if complement > 0.0 {
             let partials = bivariate_normal_cdf_partials_with_complement(h, k, correlation, complement)
                 .expect("standardized partials");
@@ -2401,6 +2334,43 @@ mod tests {
             }
             GaussianActivation::Silu => unreachable!("SiLU has no closed form here"),
         }
+    }
+
+    /// The bivariate normal owner's own per-call bound on `Φ₂` at the standardized law the biased closed form of
+    /// `activation` reads, formed as `biased_magnitudes` forms it.
+    fn biased_orthant_contract(
+        activation: GaussianActivation,
+        mean_x: f64,
+        mean_y: f64,
+        variance_x: f64,
+        variance_y: f64,
+        covariance: f64,
+    ) -> f64 {
+        let residual = (variance_x * variance_y - covariance * covariance).max(0.0);
+        let (h, k, correlation, complement) = match activation {
+            GaussianActivation::Relu => {
+                let (root_x, root_y) = (variance_x.sqrt(), variance_y.sqrt());
+                (
+                    mean_x / root_x,
+                    mean_y / root_y,
+                    (covariance / (root_x * root_y)).clamp(-1.0, 1.0),
+                    (residual / (variance_x * variance_y)).min(1.0),
+                )
+            }
+            GaussianActivation::ExactGelu => {
+                let (total_x, total_y) = (1.0 + variance_x, 1.0 + variance_y);
+                (
+                    mean_x / total_x.sqrt(),
+                    mean_y / total_y.sqrt(),
+                    (covariance / (total_x * total_y).sqrt()).clamp(-1.0, 1.0),
+                    ((1.0 + variance_x + variance_y + residual) / (total_x * total_y)).min(1.0),
+                )
+            }
+            GaussianActivation::Silu => unreachable!("SiLU has no closed form here"),
+        };
+        bivariate_normal_cdf_with_complement(h, k, correlation, complement)
+            .expect("standardized orthant")
+            .rounding
     }
 
     /// `E[X₊ Y₊]` on the degenerate law `Y = c + κ (X − b)`, `κ = ±√(w/v)`, by
@@ -3734,12 +3704,20 @@ mod tests {
                 variance_y,
                 covariance,
             );
+            let contract = biased_orthant_contract(
+                GaussianActivation::ExactGelu,
+                mean_x,
+                mean_y,
+                variance_x,
+                variance_y,
+                covariance,
+            );
             let kernel_tolerance = kernel.bound
                 + closed_form_rounding(kernel_magnitude)
-                + (mean_x * mean_y + covariance).abs() * BIVARIATE_NORMAL_CONTRACT;
+                + (mean_x * mean_y + covariance).abs() * contract;
             let derivative_tolerance = derivative.bound
                 + closed_form_rounding(derivative_magnitude)
-                + BIVARIATE_NORMAL_CONTRACT;
+                + contract;
             let kernel_discrepancy = (closed.value - kernel.value).abs();
             let derivative_discrepancy = (closed.covariance_derivative - derivative.value).abs();
             assert!(
@@ -3870,11 +3848,13 @@ mod tests {
                 .expect("biased pair kernel");
                 let magnitude =
                     biased_magnitudes(activation, mean_x, mean_y, variance_x, variance_y, covariance).0;
+                let contract =
+                    biased_orthant_contract(activation, mean_x, mean_y, variance_x, variance_y, covariance);
                 let tolerance = tail
                     + propagated
                     + (TERMS as f64 + EVALUATION_OPERATIONS) * f64::EPSILON * absolute
                     + closed_form_rounding(magnitude)
-                    + (mean_x * mean_y + covariance).abs() * BIVARIATE_NORMAL_CONTRACT;
+                    + (mean_x * mean_y + covariance).abs() * contract;
                 let discrepancy = (closed.value - series).abs();
                 assert!(
                     discrepancy <= tolerance,
@@ -3923,7 +3903,15 @@ mod tests {
                 sign * scale,
             )
             .0;
-            let contract = (mean_x * mean_y + sign * scale).abs() * BIVARIATE_NORMAL_CONTRACT;
+            let orthant_contract = biased_orthant_contract(
+                GaussianActivation::Relu,
+                mean_x,
+                mean_y,
+                variance_x,
+                variance_y,
+                sign * scale,
+            );
+            let contract = (mean_x * mean_y + sign * scale).abs() * orthant_contract;
             let tolerance = reference.bound + closed_form_rounding(magnitude) + contract;
             let discrepancy = (closed.value - reference.value).abs();
             assert!(
@@ -3944,7 +3932,7 @@ mod tests {
             };
             assert!(
                 (closed.covariance_derivative - expected).abs()
-                    <= closed_form_rounding(1.0) + BIVARIATE_NORMAL_CONTRACT,
+                    <= closed_form_rounding(1.0) + orthant_contract,
                 "ReLU ∂_r K on the degenerate law: {} against P(X > 0, Y > 0) = {expected}",
                 closed.covariance_derivative
             );
@@ -4000,8 +3988,12 @@ mod tests {
                 let reach = covariance.abs() + step;
                 let magnitude =
                     biased_magnitudes(activation, mean_x, mean_y, variance_x, variance_y, covariance).0;
-                let evaluation = closed_form_rounding(magnitude)
-                    + ((mean_x * mean_y).abs() + reach) * BIVARIATE_NORMAL_CONTRACT;
+                // Each kernel in the difference carries `Φ₂`'s bound at its own law.
+                let contract = [covariance - step, covariance - half_step, covariance + half_step, covariance + step]
+                    .into_iter()
+                    .map(|value| biased_orthant_contract(activation, mean_x, mean_y, variance_x, variance_y, value))
+                    .fold(0.0, f64::max);
+                let evaluation = closed_form_rounding(magnitude) + ((mean_x * mean_y).abs() + reach) * contract;
                 let tolerance = (coarse - fine).abs()
                     + evaluation / half_step
                     + fine.abs() * f64::EPSILON * reach / half_step;
@@ -4091,15 +4083,16 @@ mod tests {
             let slope = normal_cdf(constant) + constant * normal_pdf(constant);
             let (magnitude, derivative_magnitude) =
                 biased_magnitudes(GaussianActivation::ExactGelu, constant, 0.4, 0.0, 2.0, 0.0);
+            let contract = biased_orthant_contract(GaussianActivation::ExactGelu, constant, 0.4, 0.0, 2.0, 0.0);
             let kernel_tolerance = closed_form_rounding(
                 magnitude
                     + activation.abs()
                         * smoothing_magnitude(GaussianActivation::ExactGelu, 0.4, 2.0, 0),
-            ) + (0.4 * constant).abs() * BIVARIATE_NORMAL_CONTRACT;
+            ) + (0.4 * constant).abs() * contract;
             let derivative_tolerance = closed_form_rounding(
                 derivative_magnitude
                     + slope.abs() * smoothing_magnitude(GaussianActivation::ExactGelu, 0.4, 2.0, 1),
-            ) + BIVARIATE_NORMAL_CONTRACT;
+            ) + contract;
             assert!(
                 (closed.value - activation * gelu_moments[0]).abs() <= kernel_tolerance,
                 "exact GELU K with X = {constant}: {} against σ(b) T_w σ(c) = {}",
@@ -4406,8 +4399,8 @@ mod tests {
     #[test]
     fn biased_pair_kernels_keep_relative_accuracy_in_anticorrelated_lower_tails() {
         // (b, c, v, w, r) in the anticorrelated lower tails for both activations: ρ ≤ 0, with both
-        // reduced apex coordinates −(h − ρk)/(1 − ρ²) and −(k − ρh)/(1 − ρ²) nonnegative. Here the absolute contract
-        // alone left K and ∂_r K with no certified digit (#2946).
+        // reduced apex coordinates −(h − ρk)/(1 − ρ²) and −(k − ρh)/(1 − ρ²) nonnegative. Here an absolute bound on Φ₂
+        // leaves K and ∂_r K with no certified digit (#2946).
         let laws: [(f64, f64, f64, f64, f64); 7] = [
             (-3.0, -3.0, 1.0, 1.0, -0.9),
             (-3.0, -3.0, 1.0, 1.0, -0.5),
@@ -4421,8 +4414,8 @@ mod tests {
             gauss_hermite_rule(1024).expect("1024-node Gauss-Hermite rule"),
             gauss_hermite_rule(2048).expect("2048-node Gauss-Hermite rule"),
         );
-        // Laws where the absolute contract alone certifies no digit of K, per activation. The fix is only evidenced
-        // there; the other laws are regression cells.
+        // Laws where an absolute bound on Φ₂ certifies no digit of K, per activation. The relative bound is only
+        // evidenced there; the other laws are regression cells.
         let mut relu_controlled = 0_usize;
         let mut gelu_controlled = 0_usize;
         for (mean_x, mean_y, variance_x, variance_y, covariance) in laws {
@@ -4451,7 +4444,7 @@ mod tests {
                     (total_x * total_y - covariance * covariance) / (total_x * total_y),
                 ),
             ] {
-                let orthant = bivariate_normal_cdf_with_complement_bounded(h, k, correlation, complement)
+                let orthant = bivariate_normal_cdf_with_complement(h, k, correlation, complement)
                     .expect("bounded standardized orthant");
                 assert!(
                     orthant.rounding <= 1.0e-12 * orthant.value,
@@ -4498,13 +4491,10 @@ mod tests {
                     // E[X₊ Y₊] ≥ 0 and P(X > 0, Y > 0) > 0 on every nondegenerate law.
                     assert!(closed.value > 0.0 && closed.covariance_derivative > 0.0);
                 }
-                // Positive control, per law: where the absolute contract alone, (bc + r)·BIVARIATE_NORMAL_CONTRACT,
-                // exceeds K, the plain route certified no digit, so the digit certified above is the fallback's.
-                if (mean_x * mean_y + covariance).abs() * BIVARIATE_NORMAL_CONTRACT > kernel.value.abs() {
-                    assert!(
-                        closed.orthant_fallback,
-                        "{activation:?} at b = {mean_x}, c = {mean_y}, r = {covariance}: the plain contract certifies no digit of K, yet the certified entry did not run"
-                    );
+                // Positive control, per law: an absolute bound on Φ₂ is at least the unit roundoff, the rounding of a
+                // value near one. Where (bc + r)·u exceeds K, such a bound certifies no digit, so the digit certified
+                // above is the relative bound's.
+                if (mean_x * mean_y + covariance).abs() * UNIT_ROUNDOFF > kernel.value.abs() {
                     if activation == GaussianActivation::Relu {
                         relu_controlled += 1;
                     } else {
@@ -4515,30 +4505,11 @@ mod tests {
         }
         assert!(
             relu_controlled > 0 && gelu_controlled > 0,
-            "no law escapes the absolute contract: ReLU {relu_controlled}, exact GELU {gelu_controlled}"
+            "no law escapes an absolute bound: ReLU {relu_controlled}, exact GELU {gelu_controlled}"
         );
-        // The fallback is selective: a law the plain contract resolves keeps the plain route, and its cost.
-        for activation in [GaussianActivation::Relu, GaussianActivation::ExactGelu] {
-            let plain = pair_kernel(
-                activation,
-                PreactivationPair {
-                    mean_x: 0.5,
-                    mean_y: 0.3,
-                    variance_x: 1.0,
-                    variance_y: 1.0,
-                    covariance: 0.2,
-                    covariance_rounding: 0.0,
-                },
-            )
-            .expect("biased pair kernel at a central law");
-            assert!(
-                !plain.orthant_fallback && plain.value_rounding < plain.value.abs(),
-                "{activation:?} at a central law took the certified entry: {plain:?}"
-            );
-        }
         // The positively correlated standardized cell (−3, −3, 0.5) splits into two leaves, and its bound still scales
         // with the value.
-        let positive = bivariate_normal_cdf_with_complement_bounded(-3.0, -3.0, 0.5, 0.75)
+        let positive = bivariate_normal_cdf_with_complement(-3.0, -3.0, 0.5, 0.75)
             .expect("bounded orthant at a positive correlation");
         assert!(
             positive.rounding <= 1.0e-12 * positive.value,

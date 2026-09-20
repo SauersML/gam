@@ -4,9 +4,10 @@ Usage: worker.py LIB FAMILY N DESIGN SEED [N_PREDICT] [--postfit]
 
   LIB        gamfit | pygam | pygam_gs
   FAMILY     gaussian | binomial | poisson, a binomial variant of the
-             ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), or a
+             ``binomial_*`` plans (see ``BINOMIAL_FAMILIES``), a
              positive-continuous family of the ``positive_*`` plans (see
-             ``POSITIVE_FAMILIES``)
+             ``POSITIVE_FAMILIES``), or a count family of the ``count_*``
+             plans (see ``COUNT_FAMILIES``)
   DESIGN     p<k> (additive in k covariates, e.g. p1, p3, p5, p20) | te | te+s
              | by (see ``make_data``) | fz<case> | ff-<regime>
   N_PREDICT  held-out rows to predict on (default: N)
@@ -103,7 +104,9 @@ TRIALS_MAX = 20
 #   gamma_inverse       Gamma, shape 3, fitted on the canonical inverse link;
 #                       the truth is ``1 / mu = 1 + 0.2 eta``, which stays
 #                       positive for every design (``|eta| <= sqrt(p)``).
-#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3, log link.
+#   inverse_gaussian    inverse Gaussian, ``V = phi mu^3`` with phi = 0.3; the
+#                       truth is on the log scale, the fit on the canonical
+#                       ``1 / mu^2`` link (gamfit's default for the family).
 #   lognormal_gaussian  ``log y = 0.5 + 0.7 eta + N(0, 0.5^2)`` fitted as a
 #                       Gaussian on the log scale (response and mean are logs).
 #   lognormal_gamma     the same draw of ``y`` fitted by Gamma(log) on the raw
@@ -119,17 +122,40 @@ POSITIVE_FAMILIES = (
     "lognormal_gamma",
     "student_t",
 )
-ALL_FAMILIES = FAMILIES + BINOMIAL_FAMILIES + POSITIVE_FAMILIES
+# Count families of the ``count_*`` plans (audit lane sweep-count).
+# ``poisson_*`` put the mean count at 0.3, 5 and 500 (``mu = level *
+# exp(0.7 eta)``); ``poisson_exposure`` is the 0.3 rate times a log-uniform
+# exposure in [0.5, 50], fitted with the log exposure as an offset; ``negbin`` is
+# NB2 at ``theta = 2`` around mean 5, fitted with theta estimated; ``tweedie`` is
+# the compound Poisson-gamma at ``p = 1.5``, ``phi = 1`` around mean 5, fitted
+# with phi estimated (gamfit does not estimate the power: profiling it is a
+# derivative-free search SPEC.md forbids).
+COUNT_FAMILIES = (
+    "poisson_lo",
+    "poisson_mid",
+    "poisson_hi",
+    "poisson_exposure",
+    "negbin",
+    "tweedie",
+)
+POISSON_LEVELS = {"poisson_lo": 0.3, "poisson_mid": 5.0, "poisson_hi": 500.0}
+COUNT_SLOPE = 0.7
+EXPOSURE_RATE = 0.3
+EXPOSURE_RANGE = (0.5, 50.0)
+NEGBIN_MEAN, NEGBIN_THETA = 5.0, 2.0
+TWEEDIE_MEAN, TWEEDIE_P, TWEEDIE_PHI = 5.0, 1.5, 1.0
+ALL_FAMILIES = FAMILIES + BINOMIAL_FAMILIES + POSITIVE_FAMILIES + COUNT_FAMILIES
 GAMMA_SHAPE, GAMMA_SKEW_SHAPE, GAMMA_SKEW_LEVEL = 3.0, 0.5, -2.0
 GAMMA_INVERSE_SLOPE = 0.2
 INVERSE_GAUSSIAN_PHI = 0.3
 LOGNORMAL_SD = 0.5
 STUDENT_T_DF, STUDENT_T_SCALE = 3.0, 0.5
 # pyGAM fits every binomial variant, the Gamma families (log and inverse
-# links) and both log-normal fits. It has no scaled-t family, and its InvGaussGAM stores sqrt(phi) as its
-# scale (see inverse_gaussian_scale.py), so it is not a like-for-like
-# comparator: those two run gamfit alone and report absolute times and the
-# certification rate.
+# links), both log-normal fits and the Poisson count families. It has no
+# scaled-t, negative-binomial or Tweedie family, and its InvGaussGAM stores
+# sqrt(phi) as its scale (see inverse_gaussian_scale.py), so it is not a
+# like-for-like comparator: those run gamfit alone and report absolute times
+# and the certification rate.
 PYGAM_FAMILIES = frozenset(
     {
         *FAMILIES,
@@ -139,6 +165,8 @@ PYGAM_FAMILIES = frozenset(
         "gamma_inverse",
         "lognormal_gaussian",
         "lognormal_gamma",
+        *POISSON_LEVELS,
+        "poisson_exposure",
     }
 )
 # gamfit (family, link) of each family whose name is not a gamfit family.
@@ -151,6 +179,9 @@ GAMFIT_FAMILY: dict[str, tuple[str, str | None]] = {
     "lognormal_gaussian": ("gaussian", None),
     "lognormal_gamma": ("gamma", None),
     "student_t": ("student-t", None),
+    **{family: ("poisson", None) for family in (*POISSON_LEVELS, "poisson_exposure")},
+    "negbin": ("negative-binomial", None),
+    "tweedie": (f"tweedie(p={TWEEDIE_P})", None),
 }
 DESIGNS = ("p1", "p5", "p20", "te")
 # Designs beyond the core grid, run by the Gaussian sweep plans: a tensor plus
@@ -182,11 +213,30 @@ def is_binomial(family: str) -> bool:
     return family == "binomial" or family in BINOMIAL_FAMILIES
 
 
+def is_poisson(family: str) -> bool:
+    return family == "poisson" or family in POISSON_LEVELS or family == "poisson_exposure"
+
+
+def _tweedie_draw(
+    rng: np.random.Generator, mu: FloatArray, p: float, phi: float
+) -> FloatArray:
+    """Compound Poisson-gamma draw with mean ``mu`` and variance ``phi mu^p``."""
+    rate = mu ** (2 - p) / (phi * (2 - p))
+    shape = (2 - p) / (p - 1)
+    scale = phi * (p - 1) * mu ** (p - 1)
+    counts = rng.poisson(rate)
+    y = np.zeros_like(mu)
+    hit = counts > 0
+    y[hit] = rng.gamma(shape * counts[hit], scale[hit])
+    return y
+
+
 def make_data(
     n: int, design: str, family: str, seed: int
-) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray | None]:
-    """Draw ``(X, y, mu, weights)``: covariates, response, true response-scale
-    mean, and the per-row trial counts (``None`` for families without them).
+) -> tuple[FloatArray, FloatArray, FloatArray, FloatArray | None, FloatArray | None]:
+    """Draw ``(X, y, mu, weights, offset)``: covariates, response, true
+    response-scale mean, the per-row trial counts, and the log-exposure offset
+    (each ``None`` for families without one).
 
     Same generators as the pyGAM audit (bench/pygam_audit/speed/worker.py) so
     numbers stay comparable with the audit's speed.md tables. The extra designs:
@@ -234,7 +284,7 @@ def make_data(
         mu = special.expit(BINOMIAL_SLOPE * eta)
         trials = rng.integers(1, TRIALS_MAX + 1, n).astype(float)
         y = rng.binomial(trials.astype(np.int64), mu) / trials
-        return X, y, mu, trials
+        return X, y, mu, trials, None
     elif family == "poisson":
         mu = np.exp(0.5 + 0.7 * eta)
         y = rng.poisson(mu).astype(float)
@@ -260,9 +310,25 @@ def make_data(
     elif family == "student_t":
         mu = eta
         y = eta + STUDENT_T_SCALE * rng.standard_t(STUDENT_T_DF, n)
+    elif family in POISSON_LEVELS:
+        mu = POISSON_LEVELS[family] * np.exp(COUNT_SLOPE * eta)
+        y = rng.poisson(mu).astype(float)
+    elif family == "poisson_exposure":
+        lo, hi = EXPOSURE_RANGE
+        offset = rng.uniform(np.log(lo), np.log(hi), n)
+        mu = EXPOSURE_RATE * np.exp(offset + COUNT_SLOPE * eta)
+        y = rng.poisson(mu).astype(float)
+        return X, y, mu, None, offset
+    elif family == "negbin":
+        mu = NEGBIN_MEAN * np.exp(COUNT_SLOPE * eta)
+        y = rng.negative_binomial(NEGBIN_THETA, NEGBIN_THETA / (NEGBIN_THETA + mu))
+        y = y.astype(float)
+    elif family == "tweedie":
+        mu = TWEEDIE_MEAN * np.exp(COUNT_SLOPE * eta)
+        y = _tweedie_draw(rng, mu, TWEEDIE_P, TWEEDIE_PHI)
     else:
         raise ValueError(f"unknown family {family!r}; expected one of {ALL_FAMILIES}")
-    return X, y, mu, None
+    return X, y, mu, None, None
 
 
 def mean_deviance(
@@ -271,7 +337,9 @@ def mean_deviance(
     """Mean unit deviance of held-out ``y`` at predicted mean ``mu``.
 
     A grouped binomial is the per-trial deviance: the rows are weighted by
-    their trial counts.
+    their trial counts. Negative binomial and Tweedie are scored at the
+    generating ``theta`` / ``p``, so the score ranks predicted means only, the
+    same way for every library.
     """
     if family in ("gaussian", "lognormal_gaussian", "student_t"):
         return float(np.mean((y - mu) ** 2))
@@ -282,6 +350,18 @@ def mean_deviance(
     if is_binomial(family):
         unit = special.xlogy(y, y / mu) + special.xlogy(1 - y, (1 - y) / (1 - mu))
         return float(np.average(2 * unit, weights=trials))
+    if family == "negbin":
+        t = NEGBIN_THETA
+        unit = special.xlogy(y, y / mu) - special.xlogy(y + t, (y + t) / (mu + t))
+        return float(np.mean(2 * unit))
+    if family == "tweedie":
+        p = TWEEDIE_P
+        unit = (
+            y ** (2 - p) / ((1 - p) * (2 - p))
+            - y * mu ** (1 - p) / (1 - p)
+            + mu ** (2 - p) / (2 - p)
+        )
+        return float(np.mean(2 * unit))
     unit = special.xlogy(y, y / mu) - (y - mu)
     return float(np.mean(2 * unit))
 
@@ -295,23 +375,28 @@ def mean_logscore(
 ) -> float | None:
     """Mean negative log predictive density of held-out ``y`` (lower is better).
 
-    Binomial and Poisson are scored at the predicted mean; a grouped binomial
-    scores the observed count out of its trials, per trial. Gaussian needs a
+    Binomial and the Poisson families are scored at the predicted mean, the
+    negative binomial at the predicted mean and the generating theta; a grouped
+    binomial scores the observed count out of its trials, per trial. The
+    Tweedie density has no closed form, so it reports no log score. Gaussian needs a
     predictive scale: the library's own 95% prediction interval gives it as
     ``(upper - lower) / (2 z_0.975)``, which prices both the fitted scale and
     the posterior variance of the mean. The positive families need their fitted
     shape / dispersion, which the libraries do not expose alike, so they report
     no log score.
     """
-    if family in POSITIVE_FAMILIES:
+    if family in POSITIVE_FAMILIES or family == "tweedie":
         return None
     if trials is not None:
         counts = np.rint(y * trials)
         return float(-np.sum(stats.binom.logpmf(counts, trials, mu)) / np.sum(trials))
     if is_binomial(family):
         return float(-np.mean(special.xlogy(y, mu) + special.xlogy(1 - y, 1 - mu)))
-    if family == "poisson":
+    if is_poisson(family):
         return float(-np.mean(stats.poisson.logpmf(y, mu)))
+    if family == "negbin":
+        t = NEGBIN_THETA
+        return float(-np.mean(stats.nbinom.logpmf(y, t, t / (t + mu))))
     if predictive_sd is None:
         raise ValueError("gaussian logscore needs a predictive sd")
     return float(-np.mean(stats.norm.logpdf(y, loc=mu, scale=predictive_sd)))
@@ -341,36 +426,52 @@ class Adapter:
 
     version: str
 
-    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
-        """Fit ``y`` on ``X``; ``weights`` are binomial trial counts or ``None``."""
+    def fit(
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+    ) -> None:
+        """Fit ``y`` on ``X``; ``weights`` are binomial trial counts and
+        ``offset`` the log exposure of the rows, each or ``None``."""
         raise NotImplementedError
 
-    def predict(self, X: FloatArray) -> FloatArray:
+    def predict(self, X: FloatArray, offset: FloatArray | None) -> FloatArray:
         raise NotImplementedError
 
     def interval(
-        self, X: FloatArray
+        self, X: FloatArray, offset: FloatArray | None
     ) -> tuple[FloatArray, FloatArray, FloatArray | None]:
         """Return (lower, upper) of the 95% interval for the mean, and the
-        Gaussian predictive sd (``None`` for other families)."""
+        Gaussian predictive sd (``None`` for other families). ``offset`` is the
+        log exposure of the rows, or ``None``."""
         raise NotImplementedError
 
     def model_info(self) -> dict[str, Any]:
         raise NotImplementedError
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
         """The post-fit operations timed under ``--postfit``, in run order.
 
-        ``X`` / ``y`` are the training data (the posterior draws and the
-        significance refits need the response); ``path`` is a scratch file
+        ``X`` / ``y`` / ``weights`` / ``offset`` are the training data, as
+        passed to ``fit`` (the posterior draws and the significance refits need
+        the response, a grouped binomial its trials and an exposure family its
+        offset); ``path`` is a scratch file
         for the save / load round trip, written by ``save`` before ``load``.
         """
         raise NotImplementedError
 
 
 WEIGHTS_COLUMN = "trials"
+OFFSET_COLUMN = "log_exposure"
 
 
 class GamfitAdapter(Adapter):
@@ -392,14 +493,22 @@ class GamfitAdapter(Adapter):
             self.formula = "y ~ " + " + ".join(f"s({nm})" for nm in self.names)
         self.model: Any = None
 
-    def _table(self, X: FloatArray) -> dict[str, Any]:
+    def _table(self, X: FloatArray, offset: FloatArray | None) -> dict[str, Any]:
         table: dict[str, Any] = {nm: X[:, j] for j, nm in enumerate(self.names)}
         if self.factor:
             table["g"] = np.asarray(BY_LEVELS)[X[:, 1].astype(int)]
+        if offset is not None:
+            table[OFFSET_COLUMN] = offset
         return table
 
-    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
-        data = self._table(X)
+    def fit(
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+    ) -> None:
+        data = self._table(X, offset)
         data["y"] = y
         if weights is not None:
             data[WEIGHTS_COLUMN] = weights
@@ -409,17 +518,19 @@ class GamfitAdapter(Adapter):
             family=self.gamfit_family,
             link=self.link,
             weights=None if weights is None else WEIGHTS_COLUMN,
+            offset=None if offset is None else OFFSET_COLUMN,
         )
 
-    def predict(self, X: FloatArray) -> FloatArray:
-        return np.asarray(self.model.predict(self._table(X)), dtype=float).reshape(-1)
+    def predict(self, X: FloatArray, offset: FloatArray | None) -> FloatArray:
+        pred = self.model.predict(self._table(X, offset))
+        return np.asarray(pred, dtype=float).reshape(-1)
 
     def interval(
-        self, X: FloatArray
+        self, X: FloatArray, offset: FloatArray | None
     ) -> tuple[FloatArray, FloatArray, FloatArray | None]:
         gaussian = self.family == "gaussian"
         res = self.model.predict(
-            self._table(X),
+            self._table(X, offset),
             interval=INTERVAL_LEVEL,
             observation_interval=gaussian,
             return_type="dict",
@@ -446,10 +557,17 @@ class GamfitAdapter(Adapter):
         }
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
-        train = self._table(X)
+        train = self._table(X, offset)
         train["y"] = y
+        if weights is not None:
+            train[WEIGHTS_COLUMN] = weights
         term = self.formula.split("~ ", 1)[1].split(" + ", 1)[0]
         return {
             "pd": lambda: self.model.partial_dependence(term, n_points=PD_POINTS),
@@ -492,11 +610,17 @@ class PygamAdapter(Adapter):
             "gamma_inverse": ("gamma", "inverse"),
             "lognormal_gaussian": ("normal", "identity"),
             "lognormal_gamma": ("gamma", "log"),
-        }["binomial" if is_binomial(family) else family]
+        }["binomial" if is_binomial(family) else "poisson" if is_poisson(family) else family]
         self.gridsearch = gridsearch
         self.model: Any = None
 
-    def fit(self, X: FloatArray, y: FloatArray, weights: FloatArray | None) -> None:
+    def fit(
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+    ) -> None:
         if self.family == "gaussian":
             # LinearGAM is GAM(normal, identity) plus prediction_intervals,
             # which the Gaussian log score needs.
@@ -507,21 +631,33 @@ class PygamAdapter(Adapter):
         # weights: pyGAM's binomial IRLS weight is then ``m_i mu (1 - mu)``,
         # the grouped-binomial Fisher information.
         extra = {} if weights is None else {"weights": weights}
+        if offset is not None:
+            # pyGAM has no offset. PoissonGAM's ``exposure`` is the rate
+            # ``y / E`` fitted with weights ``E``, which is the Poisson
+            # likelihood with offset ``log E``; it is spelled out here because
+            # ``PoissonGAM.gridsearch`` passes the weights on positionally as
+            # the exposure and fits ``y / E^2`` (pyGAM 0.12.0).
+            exposure = np.exp(offset)
+            y = y / exposure
+            extra = {"weights": exposure}
         if self.gridsearch:
             g.gridsearch(X, y, progress=False, **extra)
         else:
             g.fit(X, y, **extra)
         self.model = g
 
-    def predict(self, X: FloatArray) -> FloatArray:
-        return np.asarray(self.model.predict(X), dtype=float).reshape(-1)
+    def predict(self, X: FloatArray, offset: FloatArray | None) -> FloatArray:
+        pred = np.asarray(self.model.predict(X), dtype=float).reshape(-1)
+        return pred if offset is None else pred * np.exp(offset)
 
     def interval(
-        self, X: FloatArray
+        self, X: FloatArray, offset: FloatArray | None
     ) -> tuple[FloatArray, FloatArray, FloatArray | None]:
         ci = np.asarray(
             self.model.confidence_intervals(X, width=INTERVAL_LEVEL), dtype=float
         )
+        if offset is not None:
+            ci = ci * np.exp(offset)[:, None]
         sd = None
         if self.family == "gaussian":
             pi = np.asarray(
@@ -538,8 +674,21 @@ class PygamAdapter(Adapter):
         }
 
     def postfit_ops(
-        self, X: FloatArray, y: FloatArray, path: str
+        self,
+        X: FloatArray,
+        y: FloatArray,
+        weights: FloatArray | None,
+        offset: FloatArray | None,
+        path: str,
     ) -> dict[str, Callable[[], Any]]:
+        # The response and prior weights the model was fitted on (see ``fit``).
+        extra: dict[str, Any] = {} if weights is None else {"weights": weights}
+        y_fit = y
+        if offset is not None:
+            exposure = np.exp(offset)
+            y_fit = y / exposure
+            extra = {"weights": exposure}
+
         def pd() -> Any:
             grid = self.model.generate_X_grid(term=0, n=PD_POINTS)
             return self.model.partial_dependence(term=0, X=grid, width=INTERVAL_LEVEL)
@@ -565,7 +714,7 @@ class PygamAdapter(Adapter):
             # n_bootstraps=1 keeps it to the fitted smoothing parameters
             # instead of refitting on bootstrap resamples.
             "sample": lambda: self.model.sample(
-                X, y, quantity="coef", n_draws=SAMPLE_DRAWS, n_bootstraps=1
+                X, y_fit, quantity="coef", n_draws=SAMPLE_DRAWS, n_bootstraps=1, **extra
             ),
         }
 
@@ -663,9 +812,9 @@ def run(
         if lib != "gamfit":
             raise ValueError(f"fuzz design {design!r} is gamfit-only, got lib {lib!r}")
         return fuzz_families.run(family, n, design, seed)
-    X, y, _, w = make_data(n, design, family, seed)
+    X, y, _, w, off = make_data(n, design, family, seed)
     n_test = n if n_predict is None else n_predict
-    Xt, yt, mut, wt = make_data(n_test, design, family, seed + TEST_SEED_OFFSET)
+    Xt, yt, mut, wt, offt = make_data(n_test, design, family, seed + TEST_SEED_OFFSET)
     out: dict[str, Any] = {"base_rss_mb": rss_peak_mb()}
     if n_predict is not None:
         out["n_predict"] = n_predict
@@ -691,13 +840,13 @@ def run(
     if adapter is not None:
         out["lib_version"] = adapter.version
         out["after_import_rss_mb"] = rss_peak_mb()
-        phase("fit", lambda: adapter.fit(X, y, w))
+        phase("fit", lambda: adapter.fit(X, y, w, off))
     if adapter is not None and "fit" not in errors:
-        phase("fit_warm", lambda: adapter.fit(X, y, w))
+        phase("fit_warm", lambda: adapter.fit(X, y, w, off))
     if adapter is not None and not {"fit", "fit_warm"} & errors.keys():
         out["rss_after_fit_mb"] = rss_peak_mb()
-        pred: FloatArray | None = phase("pred", lambda: adapter.predict(Xt))
-        iv = phase("interval", lambda: adapter.interval(Xt))
+        pred: FloatArray | None = phase("pred", lambda: adapter.predict(Xt, offt))
+        iv = phase("interval", lambda: adapter.interval(Xt, offt))
         info = phase("info", adapter.model_info, timed=False)
         if info is not None:
             out.update(info)
@@ -717,7 +866,7 @@ def run(
             out["logscore"] = mean_logscore(family, yt, pred, None, wt)
         if postfit:
             path = os.path.abspath(f"postfit_{lib}_{os.getpid()}.model")
-            for name, op in adapter.postfit_ops(X, y, path).items():
+            for name, op in adapter.postfit_ops(X, y, w, off, path).items():
                 phase(name, op)
             if os.path.exists(path):
                 out["save_bytes"] = os.path.getsize(path)

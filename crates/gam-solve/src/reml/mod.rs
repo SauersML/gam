@@ -1161,6 +1161,101 @@ mod tests {
         );
     }
 
+    fn gaussian_reset_fixture() -> (Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>) {
+        let y = array![0.3, -0.2, 0.9, 0.4, -0.7, 1.1, 0.2, -0.4];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+            [1.0, -0.8, 0.5],
+            [1.0, 0.6, 0.9],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        (y, w, x, s0)
+    }
+
+    #[test]
+    pub(crate) fn gaussian_reset_keeps_the_seed_independent_inner_solve() {
+        // A Gaussian-identity inner mode is one direct solve, so the solve an
+        // outer reset used to discard is the one the next evaluation rebuilt.
+        // The reset keeps it: re-evaluating the same ρ runs no new solve, and
+        // returns exactly what a state that never saw another ρ returns.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let order = crate::rho_optimizer::OuterEvalOrder::ValueAndGradient;
+        let (rho_seed, rho) = (array![-1.5], array![0.7]);
+        let solves = |state: &RemlState<'_>| {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state
+            .compute_outer_eval_with_order(&rho_seed, order)
+            .expect("seed eval");
+        state.compute_outer_eval_with_order(&rho, order).expect("eval");
+        let before_reset = solves(&state);
+        state.reset_outer_seed_state();
+        let reused = state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("eval after reset");
+        assert_eq!(
+            solves(&state),
+            before_reset,
+            "the reset must keep the Gaussian inner solve at ρ, not rebuild it"
+        );
+
+        let fresh_state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let fresh = fresh_state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("fresh eval");
+        assert_eq!(reused.cost.to_bits(), fresh.cost.to_bits());
+        assert_eq!(
+            reused.gradient.mapv(f64::to_bits),
+            fresh.gradient.mapv(f64::to_bits)
+        );
+    }
+
+    #[test]
+    pub(crate) fn gaussian_block_correction_decision_needs_no_evaluation() {
+        // Laplace is exact for the Gaussian-identity model, so the #784
+        // admission deferred to the certified optimum declines there without
+        // an evaluation, and the optimum's inner solve is left in place.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let rho = array![0.7];
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state.defer_block_correction_admission();
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        let solves = || {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = solves();
+        assert!(
+            !state
+                .decide_block_correction_admission(&rho)
+                .expect("decision"),
+            "the correction never applies to a Gaussian-identity fit"
+        );
+        assert_eq!(solves(), before, "the decision must not run an inner solve");
+        assert!(!state.block_correction_admission_deferred());
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        assert_eq!(
+            solves(),
+            before,
+            "the optimum's inner solve must survive the decision"
+        );
+    }
+
     #[test]
     pub(crate) fn reset_outer_seed_state_preserves_frozen_negbin_theta_1448() {
         // #1448 regression: the NB outer θ↔λ alternation loop
@@ -5431,14 +5526,20 @@ impl EvalCacheManager {
             .write()
             .expect("current eval bundle lock is poisoned: a writer panicked while holding it")
             .take();
-        self.current_outer_eval
-            .write()
-            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
-            .take();
+        self.forget_previous_outer_eval();
         self.outer_eval_lru
             .write()
             .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
             .clear();
+    }
+
+    /// Drop the single-slot mirror of the previous outer evaluation, which a
+    /// new trajectory must not inherit, and keep every keyed cache.
+    pub(crate) fn forget_previous_outer_eval(&self) {
+        self.current_outer_eval
+            .write()
+            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
+            .take();
     }
 
     pub(crate) fn clear_eval_and_factor_caches(&self) {
