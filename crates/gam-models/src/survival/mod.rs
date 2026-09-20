@@ -9,7 +9,6 @@
 //! - [`location_scale`]    — location-scale survival family.
 //! - [`marginal_slope`]    — survival marginal-slope family.
 //! - [`predict`]           — library-side survival prediction.
-//! - [`risk_calibration`]  — risk score -> absolute survival surface.
 //! - [`latent`]            — latent survival and binary deployment families.
 //! - [`royston_parmar`]    — Royston-Parmar survival helpers.
 
@@ -20,7 +19,6 @@ pub mod location_scale;
 pub mod lognormal_kernel;
 pub mod marginal_slope;
 pub mod predict;
-pub mod risk_calibration;
 pub mod royston_parmar;
 pub mod surface;
 pub(crate) mod time_constraints;
@@ -33,6 +31,5 @@ pub use location_scale::*;
 pub use lognormal_kernel::*;
 pub use marginal_slope::*;
 pub use predict::*;
-pub use risk_calibration::*;
 pub use royston_parmar::*;
 pub use surface::*;
