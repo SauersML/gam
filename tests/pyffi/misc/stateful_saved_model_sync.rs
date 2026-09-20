@@ -72,7 +72,7 @@ const EXPECTED_SAVED_MODEL_ROOT_FIELD_COUNT: usize = 3;
 // fit consumed and its certificate (gam#2926, `#[serde(default)]` only, so it always
 // serializes); it is a fit record, not a fitted link state, so no stateful-link slot
 // changes.
-// Schema 34 (gam#3350) stores the fit once: the `unified` copy of `fit_result` is
+// Schema 35 (gam#3350) stores the fit once: the `unified` copy of `fit_result` is
 // gone, and the version moves out of the payload into the saved-model envelope
 // `{kind, version, model}`, so the payload carries 100 - 2 = 98 keys and the root 3.
 const EXPECTED_MODEL_PAYLOAD_FIELD_COUNT: usize = 98;
