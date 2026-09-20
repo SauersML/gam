@@ -4824,5 +4824,14 @@
     },
     "reason": "#2946 census T1/C1: curved_dictionary_global_optimality_verdict was the decision rule of GlobalOptimalityVerdict::CertifiedGlobal, which published 'unique global optimum' from the underived sufficient condition mu_hat <= c0*a^2*(1-1/SNR)*(1-C_kappa*kappa)/K with the chosen constants c0 = 1.0 and C_kappa = 0.125; margin and is_certified were that verdict's accessors. SPEC: 'Hard-coded knobs and magic constants, especially if arbitrary, should be avoided when possible in production code.' The verdict is deleted; its measured inputs survive as DictionaryIncoherenceReport (mu_hat, per_atom_kappa_hat, peak_activity_floor, snr_proxy).",
     "evidence": "At base 81623168aa public_api_census.py reports exactly these 3 identities. At head git grep -w finds no occurrence of curved_dictionary_global_optimality_verdict or GlobalOptimalityVerdict outside CHANGELOG.md and the ledgers; the remaining is_certified/margin names belong to other types (Verdict::is_certified and others) and are untouched. The Python dict keys global_optimality, global_optimality_certified and global_optimality_margin had no Python reader. cargo check --workspace --tests rc 0."
+  },
+  {
+    "base": "a5c3a5b6e7df11b78179fc274d6843687abe66a3",
+    "removed": {
+      "crates/gam-terms/src/term_builder.rs::canonicalize_smooth_type": 1,
+      "crates/gam-terms/src/term_builder.rs::parse_penalty_order_alias": 1
+    },
+    "reason": "One canonical spelling per behavior (SPEC: unnecessary choices and options are deleted). Alias spellings in the formula DSL and the family and link parsers now raise an error that names the canonical spelling, from one removed-spellings table per layer. The alias machinery goes: canonicalize_smooth_type, parse_penalty_order_alias, parse_optional_f64_option_alias, LinkFunction::aliases, and the tests that pinned alias spellings as accepted.",
+    "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
   }
 ]
