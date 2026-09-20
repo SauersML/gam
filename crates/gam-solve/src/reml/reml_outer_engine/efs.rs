@@ -1,9 +1,5 @@
 use super::*;
 
-/// Maximum absolute step size in log-λ for the EFS update (prevents
-/// overshooting). Each iteration changes `λ` by at most `exp(EFS_MAX_STEP)`.
-pub(crate) const EFS_MAX_STEP: f64 = 5.0;
-
 /// Fill the penalty-like (ρ and extended-τ) entries of the EFS step vector with
 /// the universal-form multiplicative update `Δ = log(1 − 2·g_full/q_eff)`.
 ///
@@ -125,12 +121,13 @@ fn efs_penalty_like_steps(
 ///
 /// At any stationary point of `V_total`, `g_full = 0`, so `Δρ = 0`.
 /// In the over-correction regime (`2·g_full ≥ q_eff`) the multiplicative
-/// form is undefined and the helper `efs_log_step_from_grad` returns
-/// `−EFS_MAX_STEP`; the outer cost line-search trims it and the
-/// canonical formula resumes once the iterate re-enters the stable
-/// regime. In the pathological regime (`q_eff ≤ 0`, e.g. when the
-/// inner solver placed `β̂` exactly on `null(S)`) the step is zero and
-/// the iteration relies on the outer fallback.
+/// form has no root and the helper `efs_log_step_from_grad` returns the
+/// multiplicative model's Newton step `−2·g_full/q_eff`; the outer cost
+/// line-search sizes it and the canonical formula resumes once the
+/// iterate re-enters the stable regime. In the pathological regime
+/// (`q_eff ≤ 0`, e.g. when the inner solver placed `β̂` exactly on
+/// `null(S)`) the step is zero and the iteration relies on the outer
+/// fallback.
 ///
 /// ## EFS does not generalize to ψ coordinates
 ///
@@ -169,8 +166,8 @@ fn efs_penalty_like_steps(
 /// (`is_penalty_like == false`) are always 0; the hybrid update handles
 /// them.
 ///
-/// Steps are clamped to `[-EFS_MAX_STEP, EFS_MAX_STEP]` so a single
-/// iteration cannot move λ by more than `exp(EFS_MAX_STEP)`.
+/// Steps are returned whole: the outer fixed-point bridge clips them to the
+/// outer domain and sizes them by its cost line search (#2902).
 pub fn compute_efs_update(
     solution: &InnerSolution<'_>,
     rho: &[f64],
@@ -185,13 +182,6 @@ pub fn compute_efs_update(
     // block, so the two steppers agree bit-for-bit off the ψ coordinates.
     efs_penalty_like_steps(solution, rho, gradient)
 }
-
-/// Initial step-size damping factor for the preconditioned gradient on ψ.
-///
-/// The raw step `Δψ_raw = -G⁺ g_ψ` is scaled by α ∈ (0, 1] before
-/// applying. This conservative initial value prevents overshooting in
-/// early iterations when the quadratic model may be inaccurate.
-pub(crate) const PSI_INITIAL_ALPHA: f64 = 1.0;
 
 /// Minimum number of scalar ρ/τ EFS candidates before `compute_hybrid_efs_update`
 /// fans out with rayon.  Smaller blocks are common (1-4 smoothing parameters),
@@ -230,7 +220,7 @@ pub struct HybridEfsResult {
 ///   using the trace Gram matrix as preconditioner:
 ///
 ///   ```text
-///   Δψ = -α G⁺ g_ψ
+///   Δψ = -G⁺ g_ψ
 ///   ```
 ///
 ///   where:
@@ -238,7 +228,6 @@ pub struct HybridEfsResult {
 ///   - `G_{de} = tr(H⁻¹ B_d H⁻¹ B_e)` is the trace Gram matrix for ψ-ψ pairs
 ///   - `G⁺` is the Moore-Penrose pseudoinverse, truncated at the eigensolver's
 ///     rounding band `n·ε·λ_max`
-///   - `α ∈ (0, 1]` is the damping factor
 ///
 /// ## Why this works (reference: response.md Section 2)
 ///
@@ -263,14 +252,11 @@ pub struct HybridEfsResult {
 /// 1. Compute G for the ψ-ψ block from H⁻¹ B_d products (already available).
 /// 2. Pseudoinverse: G⁺ via eigendecomposition, dropping the eigenvalues inside
 ///    the eigensolver's rounding band `n·ε·λ_max`, which it cannot tell from zero.
-/// 3. Raw step: `Δψ_raw = -G⁺ g_ψ`.
-/// 4. Damping: `Δψ = α × Δψ_raw` with initial `α = PSI_INITIAL_ALPHA`.
-/// 5. Capping: `||Δψ||_∞ ≤ EFS_MAX_STEP` (same cap as ρ coordinates).
-/// 6. Backtracking (handled by caller): the outer fixed-point bridge wraps
-///    the *whole* combined step in a cost line search, halving α over the
-///    full vector. If full-vector backtracking exhausts, it retries with
-///    the ψ block zeroed (ρ/τ-only fallback) before surfacing the
-///    first-order fallback marker.
+/// 3. Step: `Δψ = -G⁺ g_ψ`, taken whole.
+/// 4. Backtracking (handled by caller): the outer fixed-point bridge clips
+///    the *whole* combined step to the outer domain and wraps it in a cost
+///    line search, halving the step length over the full vector. If no resolvable
+///    contraction is accepted it surfaces the first-order fallback request.
 ///
 /// # Arguments
 /// - `solution`: Converged inner state (β̂, H, penalties, HessianFactorization).
@@ -326,7 +312,7 @@ pub fn compute_hybrid_efs_update(
     //
     // The preconditioned gradient step for ψ (design-moving) coordinates:
     //
-    //   Δψ = -α G⁺ g_ψ
+    //   Δψ = -G⁺ g_ψ
     //
     // where G_{de} = tr(H⁻¹ B_d H⁻¹ B_e) is the trace Gram matrix and
     // g_ψ is the REML/LAML gradient restricted to the ψ block.
@@ -360,11 +346,10 @@ pub fn compute_hybrid_efs_update(
                 )
             };
             // `G = tr(H⁻¹BH⁻¹B)` is a squared norm: any positive value is a metric
-            // for the step, which is clamped and line-searched like the rest.
+            // for the step, which is line-searched like the rest.
             if gram > 0.0 {
                 let global_idx = psi_global_indices[0];
-                let raw_step = -PSI_INITIAL_ALPHA * psi_gradient[0] / gram;
-                steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+                steps[global_idx] = -psi_gradient[0] / gram;
             }
             return Ok(HybridEfsResult {
                 steps,
@@ -529,14 +514,11 @@ pub fn compute_hybrid_efs_update(
         // for the submanifold view of the step).
         let delta_psi = pseudoinverse_times_vec(&gram, &psi_gradient)?;
 
-        // Step 3: Apply damping and capping.
-        //
-        // Δψ = -α × G⁺ g_ψ, capped to ||Δψ||_∞ ≤ EFS_MAX_STEP.
-        // The negative sign is because we are descending on V(θ) (minimizing).
-        let alpha = PSI_INITIAL_ALPHA;
+        // Step 3: Δψ = -G⁺ g_ψ, taken whole: the outer bridge's line search
+        // sizes it together with the ρ/τ block. The negative sign is because
+        // we are descending on V(θ) (minimizing).
         for (psi_idx, &global_idx) in psi_global_indices.iter().enumerate() {
-            let raw_step = -alpha * delta_psi[psi_idx];
-            steps[global_idx] = raw_step.clamp(-EFS_MAX_STEP, EFS_MAX_STEP);
+            steps[global_idx] = -delta_psi[psi_idx];
         }
     }
 
