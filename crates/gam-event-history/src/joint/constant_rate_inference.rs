@@ -22,6 +22,7 @@
 use super::law::{JointHistory, invalid, numerical};
 use super::model::JointForecast;
 use crate::{EventHistoryError, MarkKind};
+use gam_math::sparse_grid::CompensatedSum;
 use gam_math::special::{gauss_legendre, logistic, softplus};
 use ndarray::Array2;
 use serde::{Deserialize, Serialize};
@@ -39,30 +40,6 @@ struct GammaRate {
 pub(super) struct ConstantRatePosterior {
     /// `None` is the exact zero-rate law of an event-free cohort.
     rates: Option<Vec<GammaRate>>,
-}
-
-/// Neumaier summation, so a cohort total keeps the digits a plain running sum
-/// over many subjects loses.
-#[derive(Clone, Copy, Default)]
-struct CompensatedSum {
-    sum: f64,
-    correction: f64,
-}
-
-impl CompensatedSum {
-    fn add(&mut self, value: f64) {
-        let next = self.sum + value;
-        self.correction += if self.sum.abs() >= value.abs() {
-            (self.sum - next) + value
-        } else {
-            (value - next) + self.sum
-        };
-        self.sum = next;
-    }
-
-    fn value(self) -> f64 {
-        self.sum + self.correction
-    }
 }
 
 fn log_add(a: f64, b: f64) -> f64 {
