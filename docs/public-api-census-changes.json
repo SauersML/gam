@@ -4773,5 +4773,23 @@
     },
     "reason": "#2973 (comment 5745385706): polish_joint_newton_step was unreachable. Its only call sat under `if use_joint_newton && !converged` after the blockwise loop of inner_blockwise_fit_for_product, and use_joint_newton is an immutable let that, when true, has already returned through fit_exact_joint. The guard was always false, so the function, its POLISH_MAX_ITER iteration bound and its call block are deleted instead of flooring its stationarity test like the two live copies (718f9b6bc2).",
     "evidence": "At the base both names occur only in inner_blockwise_fit.rs (the call, the fn, and the const inside it); at the head git grep -w finds neither under crates, src or tests. inner_blockwise_fit.rs at this base is byte-identical to the polishdel gate parent 148435843c (blob 210f50eece), where gam-custom-family check --all-targets, the lib suite (365/366, the one red is the main red a_refusal_with_evidence_refits_armed_once_and_publishes_it_2995), laml_inner_accuracy_2668, cargo check --workspace --all-targets and cargo build --workspace --lib all passed. Every helper the deleted body called keeps another caller."
+  },
+  {
+    "base": "5834fb219dc1bd35dd82a4fd874d8f6fd3e95e46",
+    "removed": {
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_factor_slab_to_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::arrow_rhs": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::cholesky_solve_lower_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::mixed_precision_kappa_gate_failure": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::solve_arrow_system_f32": 1,
+      "crates/gam-solve/src/arrow_schur/newton_step.rs::try_mixed_precision_arrow_solve": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::matrix_inf_norm": 1,
+      "crates/gam-solve/src/arrow_schur/reduced_solve.rs::mixed_precision_reduced_beta": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::certified_mixed": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::is_enabled": 1,
+      "crates/gam-solve/src/arrow_schur/solve_options.rs::with_streaming_solve_precision_default": 1
+    },
+    "reason": "#2946 census T10: these functions implemented or gated the arrow-Schur CertifiedMixed solve, which copied already-computed f64 Cholesky factors to f32 and refined f32 solves with f64 residuals. That work was strictly additional to the one f64 triangular solve the same factor answers, and it was gated by chosen constants. SPEC: 'Unnecessary choices and options should be deleted, not included.' arrow_rhs and matrix_inf_norm had no other caller.",
+    "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
   }
 ]
