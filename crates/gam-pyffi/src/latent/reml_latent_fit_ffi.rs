@@ -1453,37 +1453,6 @@ fn batched_gaussian_reml_fits_from_pydict(
     Ok(fits)
 }
 
-fn set_degenerate_gaussian_reml_items<'py>(
-    py: Python<'py>,
-    out: &Bound<'py, PyDict>,
-    n_rows: usize,
-    n_outputs: usize,
-    n_coefficients: usize,
-) -> PyResult<()> {
-    out.set_item("status", "degenerate")?;
-    out.set_item("lambda", f64::NAN)?;
-    out.set_item("rho", f64::NAN)?;
-    out.set_item("reml_score", f64::NAN)?;
-    out.set_item("reml_grad_lambda", f64::NAN)?;
-    out.set_item("reml_hess_lambda", f64::NAN)?;
-    out.set_item("reml_grad_rho", f64::NAN)?;
-    out.set_item("reml_hess_rho", f64::NAN)?;
-    out.set_item("edf", 0.0)?;
-    out.set_item(
-        "coefficients",
-        Array2::<f64>::zeros((n_coefficients, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "fitted",
-        Array2::<f64>::zeros((n_rows, n_outputs)).into_pyarray(py),
-    )?;
-    out.set_item(
-        "sigma2",
-        Array1::<f64>::from_elem(n_outputs, f64::NAN).into_pyarray(py),
-    )?;
-    Ok(())
-}
-
 struct BatchedGaussianRemlResult {
     statuses: Vec<String>,
     lambdas: Array1<f64>,

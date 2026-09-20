@@ -6,16 +6,18 @@ use std::sync::atomic::Ordering;
 
 /// Structured outcome of [`RemlState::compute_smoothing_correction_outcome`].
 ///
-/// `FirstOrder` carries the analytic correction `J V_ρ Jᵀ` (absent only when
-/// there is nothing to correct: no smoothing parameters, or no identified ρ
-/// direction). `Unavailable` is the one branch where the exact first-order
+/// `FirstOrder` carries the analytic correction `J V_ρ Jᵀ` as its square-root
+/// factor `B`, `J V_ρ Jᵀ = B Bᵀ` (absent only when there is nothing to
+/// correct: no smoothing parameters). A route that publishes a dense
+/// covariance forms the matrix from it; the factorized route keeps `B`
+/// (#3283). `Unavailable` is the one branch where the exact first-order
 /// geometry could not be formed; its typed reason is preserved instead of
 /// presenting a missing matrix as a routine skip.
 #[derive(Clone, Debug)]
 pub enum SmoothingCorrectionOutcome {
     /// The analytic first-order correction.
     FirstOrder {
-        correction: Option<Array2<f64>>,
+        factor: Option<Array2<f64>>,
         rho_covariance: Option<Array2<f64>>,
         method: Option<SmoothingCorrectionMethod>,
     },
@@ -28,14 +30,12 @@ pub enum SmoothingCorrectionOutcome {
 
 impl SmoothingCorrectionOutcome {
     /// Consume the outcome without discarding how the matrix was made:
-    /// `(correction, method)`.
+    /// `(factor, method)`, the correction's square-root factor `B`.
     pub(crate) fn into_correction_with_method(
         self,
     ) -> (Option<Array2<f64>>, Option<SmoothingCorrectionMethod>) {
         match self {
-            SmoothingCorrectionOutcome::FirstOrder {
-                correction, method, ..
-            } => (correction, method),
+            SmoothingCorrectionOutcome::FirstOrder { factor, method, .. } => (factor, method),
             SmoothingCorrectionOutcome::Unavailable { .. } => (None, None),
         }
     }
@@ -204,19 +204,22 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        if self.block_correction_latched() {
-            crate::bail_invalid_estim!(
-                "{}",
-                crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
-            );
-        }
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(&bundle);
-        match decision.strategy {
+        let hessian = match decision.strategy {
             super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
                 self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
             }
+        };
+        // Read after the evaluation: a first evaluation is what latches the
+        // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
+        if let Some(reason) = self.block_correction_hessian_refusal() {
+            crate::bail_invalid_estim!(
+                "the latched #784 block-local correction's outer rho-Hessian does not exist \
+                 here: {reason}"
+            );
         }
+        hessian
     }
 
     /// Tier-0 of the marginal-smoothing inference stack (#938): the PSIS
@@ -433,14 +436,14 @@ impl<'a> RemlState<'a> {
                 rho_covariance: first_order.rho_covariance,
             },
             _ => {
-                let method = first_order.correction.as_ref().map(|_| {
+                let method = first_order.factor.as_ref().map(|_| {
                     SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
                         active_rank: first_order.active_rank.unwrap_or(0),
                         rho_dimension: final_rho.len(),
                     }
                 });
                 SmoothingCorrectionOutcome::FirstOrder {
-                    correction: first_order.correction,
+                    factor: first_order.factor,
                     rho_covariance: first_order.rho_covariance,
                     method,
                 }
@@ -484,7 +487,7 @@ mod smoothing_correction_outcome_tests {
 
     fn make_first_order(with_matrix: bool) -> SmoothingCorrectionOutcome {
         SmoothingCorrectionOutcome::FirstOrder {
-            correction: with_matrix.then(|| array![[1.0, 0.0], [0.0, 1.0]]),
+            factor: with_matrix.then(|| array![[1.0, 0.0], [0.0, 1.0]]),
             rho_covariance: None,
             method: with_matrix.then_some(
                 SmoothingCorrectionMethod::FirstOrderIdentifiedSubspace {
@@ -666,7 +669,7 @@ mod smoothing_correction_outcome_tests {
                 &[],
             );
             let outcome_description = format!("{outcome:?}");
-            let (correction, method) = outcome.into_correction_with_method();
+            let (factor, method) = outcome.into_correction_with_method();
             assert!(
                 matches!(
                     method,
@@ -678,9 +681,9 @@ mod smoothing_correction_outcome_tests {
                 "an identified stationary ρ̂ must yield the analytic first-order \
                  correction; got {outcome_description}"
             );
-            correction.unwrap_or_else(|| {
-                panic!("first-order outcome carries no matrix: {outcome_description}")
-            })
+            crate::estimate::smoothing_correction::smoothing_correction_gram(&factor.unwrap_or_else(
+                || panic!("first-order outcome carries no matrix: {outcome_description}"),
+            ))
         };
 
         let c = 1000.0_f64;

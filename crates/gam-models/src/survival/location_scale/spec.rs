@@ -33,62 +33,11 @@ pub struct SurvivalCovariateReplayDesign {
     pub offset: Array1<f64>,
 }
 
-/// How a time block's parameterization enforces the derivative-guard
-/// monotonicity `q'(t) ≥ guard`.
-///
-/// The constraint set fed to the inner active-set / KKT machinery depends on
-/// the variant; consuming families dispatch on this to choose the right
-/// constraint shape and to refuse a mismatched parameterization (e.g.
-/// `survival_marginal_slope` cannot ride a coordinate-cone-only basis
-/// without re-introducing the phantom-multiplier bug it solved with the
-/// row-wise representation; `survival_location_scale` cannot ride a
-/// row-wise representation without making its reduced KKT system
-/// rank-deficient on the cone basis).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TimeBlockMonotonicity {
-    /// The time block's coefficients are constrained by a per-coordinate
-    /// cone `β_j ≥ 0` (with appropriate offsets handled by the family).
-    /// Used by location-scale / latent paths whose bases produce a
-    /// non-negative derivative whenever the cone holds.
-    EnforcedByCoordinateCone,
-    /// The time block's coefficients are constrained by row-wise
-    /// `D β + o ≥ guard` over every observation row; needed when the
-    /// basis admits negative-derivative directions that no coordinate
-    /// cone can encode without leaving phantom KKT multipliers when a
-    /// row binds. Used by `survival_marginal_slope` under the additive
-    /// base.
-    EnforcedByRowConstraint,
-    /// The base is a structurally-monotone parameterization (e.g.
-    /// `q'(t) = guard + I(t)·γ` with `γ ≥ 0`). Monotonicity holds
-    /// pointwise from the cone; the family treats this exactly as a
-    /// coordinate cone for constraint generation but the geometric
-    /// claim is stronger and is recorded here for diagnostics and for
-    /// future fast paths (e.g. skipping per-row validation).
-    StructuralISpline,
-}
-
-impl TimeBlockMonotonicity {
-    /// True when the variant can be enforced by a coordinate cone alone
-    /// (no row-wise constraints required). Both `EnforcedByCoordinateCone`
-    /// and `StructuralISpline` satisfy this; only `EnforcedByRowConstraint`
-    /// requires the row-wise `D β ≥ b` constraint matrix.
-    #[inline]
-    pub(crate) fn is_coordinate_cone(self) -> bool {
-        matches!(
-            self,
-            Self::EnforcedByCoordinateCone | Self::StructuralISpline
-        )
-    }
-
-    /// True when row-wise `D β + o ≥ guard` constraints must be emitted
-    /// for the inner active-set/KKT machinery to capture binding
-    /// multipliers correctly.
-    #[inline]
-    pub(crate) fn requires_row_constraints(self) -> bool {
-        matches!(self, Self::EnforcedByRowConstraint)
-    }
-}
-
+/// A survival time block. Every consuming family (location-scale, latent,
+/// marginal-slope) enforces `q'(t) ≥ guard` by the coordinate cone `β ≥ 0`:
+/// the structural I-spline basis has a nonnegative derivative design and the
+/// guard is carried by `derivative_offset_exit ≥ guard`, so the cone implies
+/// the guard at every row.
 #[derive(Clone)]
 pub struct TimeBlockInput {
     pub design_entry: DesignMatrix,
@@ -97,10 +46,6 @@ pub struct TimeBlockInput {
     pub offset_entry: Array1<f64>,
     pub offset_exit: Array1<f64>,
     pub derivative_offset_exit: Array1<f64>,
-    /// How the time block enforces `q'(t) ≥ guard`. The consuming family
-    /// dispatches the constraint shape on this and refuses a mismatch
-    /// rather than silently producing a degenerate KKT system.
-    pub time_monotonicity: TimeBlockMonotonicity,
     pub penalties: Vec<Array2<f64>>,
     /// Structural nullspace dimension of each penalty matrix.
     pub nullspace_dims: Vec<usize>,
@@ -845,6 +790,7 @@ pub fn survival_fit_from_parts(
             reparam_qs: None,
             dispersion: gam_solve::estimate::Dispersion::UNIT,
             factorized_standard_errors: None,
+            smoothing_correction_factorized: None,
             beta_covariance_frequentist: None,
             coefficient_influence: None,
             weighted_gram: None,

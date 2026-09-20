@@ -17,9 +17,15 @@ under one version string, across a removed public function (``set_log_level``) a
     follows it. Its public part ``...devD`` differs from every release, so a ``gamfit==R`` pin never
     matches it.
 
-maturin reads the version statically and has no override (maturin#1283, maturin#2163). Nothing here
-edits a tracked file, which would also flip the dirty state the engine records. Instead, the derived
-version is written into what the build produced:
+An unpacked sdist has no git history, so the version is derived when the sdist is built and recorded
+in its PKG-INFO. A build from the sdist reads it back, after checking that it is ``R`` or a development
+version of ``R``. A shallow clone cannot see the commit that set ``R``, and a tree that is neither a gam
+checkout nor a gamfit sdist records no version. Both are refused rather than given a guessed version.
+
+maturin gives the unstamped version (gam-pyffi's Cargo.toml version, which build.rs holds to ``R``) and
+has no override (maturin#1283, maturin#2163). Nothing here edits a tracked file, which would also flip
+the dirty state the engine records. Instead, the derived version is written into what the build
+produced:
 
 ``derive``
     print the version of the tree at ``--root``.
@@ -32,8 +38,11 @@ version is written into what the build produced:
     rewrite the gamfit that ``maturin develop`` installed into the running interpreter, after checking
     that the installed engine recorded the tree's commit and dirty state.
 
-A shallow clone cannot see the commit that set ``R``, and a tree outside a gam checkout has no commit.
-Both are refused rather than given a guessed version.
+The module is also the project's PEP 517 build backend (pyproject.toml ``[build-system]``, with
+``backend-path = ["scripts"]``), so ``pip install .``, ``pip install git+…``, ``python -m build`` and
+editable installs are stamped too. Every hook delegates to maturin's, then writes the derived version
+into the wheel, the sdist (its name, top directory and PKG-INFO) or the prepared dist-info. A build
+whose tree changes between the derivation and the end of maturin's work is refused.
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ import os
 import pathlib
 import re
 import subprocess
+import tarfile
 import tempfile
 import zipfile
 
@@ -138,15 +148,62 @@ def release_commits(root: pathlib.Path, release: str) -> list[str]:
     return setters
 
 
-def derive(root: pathlib.Path) -> tuple[str, str, bool]:
-    """The gamfit version of the tree at ``root`` (see the module docstring), its commit and dirty state."""
-    try:
-        _git(root, "ls-files", "--error-unmatch", PYPROJECT)
-    except VersionError as error:
+def _next_development(release: str) -> str:
+    major, minor, patch = (int(part) for part in _RELEASE.fullmatch(release).groups())
+    return f"{major}.{minor}.{patch + 1}"
+
+
+def _metadata_fields(text: str) -> tuple[list[str], dict[str, list[int]]]:
+    """A METADATA or PKG-INFO header's lines and, per field name, the indexes of its lines."""
+    lines = text.partition("\n\n")[0].split("\n")
+    fields: dict[str, list[int]] = {}
+    for index, line in enumerate(lines):
+        name, colon, _ = line.partition(": ")
+        if colon and not line.startswith((" ", "\t")):
+            fields.setdefault(name, []).append(index)
+    return lines, fields
+
+
+def recorded_version(root: pathlib.Path) -> str:
+    """The version an unpacked gamfit sdist at ``root`` recorded in PKG-INFO when it was built.
+
+    It must be the sdist's own release line or a development version of it, so a PKG-INFO this module
+    did not write cannot name the engine.
+    """
+    pkg_info = root / "PKG-INFO"
+    if not pkg_info.is_file():
         raise VersionError(
-            f"{root} is not a gam git checkout that tracks {PYPROJECT}, so it has no commit to derive "
-            "the gamfit version from"
-        ) from error
+            f"{root} is neither a gam git checkout that tracks {PYPROJECT} nor an unpacked {DISTRIBUTION} "
+            "sdist with a PKG-INFO, so nothing records the gamfit version of its engine"
+        )
+    lines, fields = _metadata_fields(pkg_info.read_text(encoding="utf-8"))
+    names = [lines[index] for index in fields.get("Name", [])]
+    if names != [f"Name: {DISTRIBUTION}"] or len(fields.get("Version", [])) != 1:
+        raise VersionError(f"{pkg_info} does not name exactly one {DISTRIBUTION} version")
+    version = lines[fields["Version"][0]][len("Version: "):]
+    release = declared_version((root / PYPROJECT).read_bytes()) if (root / PYPROJECT).is_file() else None
+    if release is None or not _RELEASE.fullmatch(release):
+        raise VersionError(f"{root / PYPROJECT} declares no MAJOR.MINOR.PATCH release line")
+    development = rf"{re.escape(_next_development(release))}\.dev(0|[1-9][0-9]*)\+g[0-9a-f]{{40}}(\.dirty)?"
+    if version != release and not re.fullmatch(development, version):
+        raise VersionError(
+            f"{pkg_info} records {version!r}, which is neither the release line {release!r} nor a development "
+            "version of it"
+        )
+    return version
+
+
+def derive(root: pathlib.Path) -> tuple[str, str | None, bool | None]:
+    """The gamfit version of the tree at ``root`` (see the module docstring), its commit and dirty state.
+
+    For an unpacked sdist the commit and dirty state are None, as gam-build-identity records them there.
+    """
+    tracked = subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(root), "ls-files", "--error-unmatch", PYPROJECT],
+        capture_output=True,
+    )
+    if tracked.returncode != 0:
+        return recorded_version(root), None, None
     if _git(root, "rev-parse", "--is-shallow-repository").strip() == "true":
         raise VersionError(
             f"{root} is a shallow clone, which can cut off the commit that set the release line; fetch "
@@ -157,8 +214,7 @@ def derive(root: pathlib.Path) -> tuple[str, str, bool]:
     release = _version_at(root, commit)
     if release is None:
         raise VersionError(f"{PYPROJECT} at {commit} declares no release line")
-    parts = _RELEASE.fullmatch(release)
-    if parts is None:
+    if not _RELEASE.fullmatch(release):
         raise VersionError(
             f"{PYPROJECT} at {commit} declares version {release!r}, not a MAJOR.MINOR.PATCH release line"
         )
@@ -166,8 +222,7 @@ def derive(root: pathlib.Path) -> tuple[str, str, bool]:
     if setters == [commit] and not dirty:
         return release, commit, dirty
     distance = int(_git(root, "rev-list", "--count", commit, "--not", *setters))
-    major, minor, patch = (int(part) for part in parts.groups())
-    version = f"{major}.{minor}.{patch + 1}.dev{distance}+g{commit}" + (".dirty" if dirty else "")
+    version = f"{_next_development(release)}.dev{distance}+g{commit}" + (".dirty" if dirty else "")
     return version, commit, dirty
 
 
@@ -176,8 +231,8 @@ def release(root: pathlib.Path) -> str:
     version, commit, dirty = derive(root)
     if not _RELEASE.fullmatch(version):
         raise VersionError(
-            f"{commit}{' with uncommitted changes' if dirty else ''} is not the commit that set the release "
-            f"line, so it builds as {version}; publish the commit that sets the new version instead"
+            f"{commit or root}{' with uncommitted changes' if dirty else ''} is not the commit that set the "
+            f"release line, so it builds as {version}; publish the commit that sets the new version instead"
         )
     return version
 
@@ -189,12 +244,13 @@ def _record_hash(data: bytes) -> str:
 
 
 def _restamp_metadata(text: str, old: str, new: str) -> str:
-    header, blank, body = text.partition("\n\n")
-    lines = header.split("\n")
-    names = [line for line in lines if line.startswith("Name: ")]
-    versions = [index for index, line in enumerate(lines) if line.startswith("Version: ")]
+    """A METADATA or PKG-INFO text with its one ``Version: old`` header line set to ``new``."""
+    _, blank, body = text.partition("\n\n")
+    lines, fields = _metadata_fields(text)
+    names = [lines[index] for index in fields.get("Name", [])]
+    versions = fields.get("Version", [])
     if names != [f"Name: {DISTRIBUTION}"] or len(versions) != 1 or lines[versions[0]] != f"Version: {old}":
-        raise VersionError(f"METADATA does not name exactly {DISTRIBUTION} {old}")
+        raise VersionError(f"the metadata does not name exactly {DISTRIBUTION} {old}")
     lines[versions[0]] = f"Version: {new}"
     return "\n".join(lines) + blank + body
 
@@ -279,21 +335,33 @@ def stamp_installed(root: pathlib.Path) -> pathlib.Path:
             f"{commit} dirty={dirty}: the tree changed during the build, so rebuild"
         )
     dist = metadata.distribution(DISTRIBUTION)
-    old = dist.version
     listed = [path for path in dist.files or [] if len(path.parts) == 2 and path.parts[1] == "METADATA"]
     if len(listed) != 1 or not listed[0].parts[0].endswith(".dist-info"):
         raise VersionError(f"the installed {DISTRIBUTION} has no single dist-info METADATA in its RECORD")
     old_dir = pathlib.Path(dist.locate_file(listed[0].parts[0]))
+    return old_dir.parent / restamp_dist_info(old_dir.parent, old_dir.name, dist.version, version)
+
+
+def restamp_dist_info(base: pathlib.Path, name: str, old: str, version: str) -> str:
+    """Rename the dist-info directory ``base/name`` to ``version`` and return its new name.
+
+    Its METADATA gets the new version. A RECORD, which an installed dist-info carries and a prepared one
+    does not, gets every row under the directory renamed and rehashed, with paths relative to ``base``.
+    """
     if old == version:
-        return old_dir
-    site = old_dir.parent
-    new_dir = site / f"{DISTRIBUTION}-{version}.dist-info"
+        return name
+    new_name = f"{DISTRIBUTION}-{version}.dist-info"
+    old_dir, new_dir = base / name, base / new_name
     restamped = _restamp_metadata((old_dir / "METADATA").read_text(encoding="utf-8"), old, version)
-    with (old_dir / "RECORD").open(newline="", encoding="utf-8") as handle:
-        rows = list(csv.reader(handle))
+    rows = None
+    if (old_dir / "RECORD").is_file():
+        with (old_dir / "RECORD").open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.reader(handle))
     os.rename(old_dir, new_dir)
     (new_dir / "METADATA").write_text(restamped, encoding="utf-8")
-    old_prefix, new_prefix = f"{old_dir.name}/", f"{new_dir.name}/"
+    if rows is None:
+        return new_name
+    old_prefix, new_prefix = f"{name}/", f"{new_name}/"
     record_path = f"{new_prefix}RECORD"
     buffer = io.StringIO()
     writer = csv.writer(buffer, lineterminator="\n")
@@ -304,11 +372,137 @@ def stamp_installed(root: pathlib.Path) -> pathlib.Path:
         path = new_prefix + row[0][len(old_prefix):]
         if path == record_path:
             continue
-        data = (site / path).read_bytes()
+        data = (base / path).read_bytes()
         writer.writerow([path, _record_hash(data), len(data)])
     writer.writerow([record_path, "", ""])
     (new_dir / "RECORD").write_text(buffer.getvalue(), encoding="utf-8")
-    return new_dir
+    return new_name
+
+
+def stamp_sdist(sdist: pathlib.Path, version: str) -> pathlib.Path:
+    """Rewrite a gamfit sdist to ``version`` and return its new path, which replaces ``sdist``.
+
+    The file name, the one top-level directory and PKG-INFO carry the version, so a build from the
+    unpacked sdist reads it back with ``recorded_version``.
+    """
+    prefix, suffix = f"{DISTRIBUTION}-", ".tar.gz"
+    if not (sdist.name.startswith(prefix) and sdist.name.endswith(suffix)):
+        raise VersionError(f"{sdist} is not a {DISTRIBUTION} sdist file name")
+    old = sdist.name[len(prefix):-len(suffix)]
+    if old == version:
+        return sdist
+    old_root, new_root = f"{DISTRIBUTION}-{old}", f"{DISTRIBUTION}-{version}"
+    target = sdist.with_name(new_root + suffix)
+    handle, scratch = tempfile.mkstemp(dir=sdist.parent, prefix=".stamp-", suffix=suffix)
+    os.close(handle)
+    try:
+        stamped = False
+        with tarfile.open(sdist, "r:gz") as source, tarfile.open(scratch, "w:gz") as out:
+            for member in source.getmembers():
+                if member.name != old_root and not member.name.startswith(old_root + "/"):
+                    raise VersionError(f"{sdist} holds {member.name}, outside its top-level directory {old_root}")
+                data = source.extractfile(member).read() if member.isfile() else None
+                if member.name == f"{old_root}/PKG-INFO":
+                    data = _restamp_metadata(data.decode("utf-8"), old, version).encode("utf-8")
+                    stamped = True
+                member.name = new_root + member.name[len(old_root):]
+                if member.islnk() and member.linkname.startswith(old_root + "/"):
+                    member.linkname = new_root + member.linkname[len(old_root):]
+                if data is None:
+                    out.addfile(member)
+                else:
+                    member.size = len(data)
+                    out.addfile(member, io.BytesIO(data))
+        if not stamped:
+            raise VersionError(f"{sdist} has no {old_root}/PKG-INFO")
+        os.replace(scratch, target)
+    except BaseException:
+        os.unlink(scratch)
+        raise
+    sdist.unlink()
+    return target
+
+
+# ------------------------------------------------------------- PEP 517 backend
+# The hooks run with the source tree as the working directory (PEP 517).
+def _maturin():
+    import maturin
+
+    return maturin
+
+
+def _unchanged(root: pathlib.Path, identity: tuple[str, str | None, bool | None]) -> None:
+    now = derive(root)
+    if now != identity:
+        raise VersionError(
+            f"{root} derived {identity[0]} when the build started and {now[0]} after it: the tree changed "
+            "during the build, so rebuild"
+        )
+
+
+def get_requires_for_build_wheel(config_settings=None):
+    return _maturin().get_requires_for_build_wheel(config_settings)
+
+
+def get_requires_for_build_editable(config_settings=None):
+    return _maturin().get_requires_for_build_editable(config_settings)
+
+
+def get_requires_for_build_sdist(config_settings=None):
+    return _maturin().get_requires_for_build_sdist(config_settings)
+
+
+def _prepare(hook, metadata_directory, config_settings) -> str:
+    root = pathlib.Path.cwd()
+    identity = derive(root)
+    name = hook(metadata_directory, config_settings)
+    _unchanged(root, identity)
+    prefix, suffix = f"{DISTRIBUTION}-", ".dist-info"
+    if not (name.startswith(prefix) and name.endswith(suffix)):
+        raise VersionError(f"maturin prepared {name}, not a {DISTRIBUTION} dist-info directory")
+    return restamp_dist_info(pathlib.Path(metadata_directory), name, name[len(prefix):-len(suffix)], identity[0])
+
+
+def prepare_metadata_for_build_wheel(metadata_directory, config_settings=None):
+    return _prepare(_maturin().prepare_metadata_for_build_wheel, metadata_directory, config_settings)
+
+
+def prepare_metadata_for_build_editable(metadata_directory, config_settings=None):
+    return _prepare(_maturin().prepare_metadata_for_build_editable, metadata_directory, config_settings)
+
+
+def _build(hook, wheel_directory, config_settings, metadata_directory) -> str:
+    root = pathlib.Path.cwd()
+    identity = derive(root)
+    # PEP 517 hands build_wheel the prepared .dist-info directory itself, not the directory holding it.
+    if metadata_directory is not None:
+        expected = f"{DISTRIBUTION}-{identity[0]}.dist-info"
+        if pathlib.Path(metadata_directory).name != expected:
+            raise VersionError(
+                f"the metadata prepared as {metadata_directory} is not {expected}, the version {root} derives "
+                "now: the tree changed between preparing the metadata and building the wheel, so rebuild"
+            )
+    # maturin is not handed the prepared directory: it would look in it for the dist-info under the
+    # unstamped version it wrote there.
+    name = hook(wheel_directory, config_settings, None)
+    _unchanged(root, identity)
+    return stamp_wheel(pathlib.Path(wheel_directory) / name, identity[0]).name
+
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    return _build(_maturin().build_wheel, wheel_directory, config_settings, metadata_directory)
+
+
+def build_editable(wheel_directory, config_settings=None, metadata_directory=None):
+    return _build(_maturin().build_editable, wheel_directory, config_settings, metadata_directory)
+
+
+def build_sdist(sdist_directory, config_settings=None):
+    root = pathlib.Path.cwd()
+    identity = derive(root)
+    name = _maturin().build_sdist(sdist_directory, config_settings)
+    _unchanged(root, identity)
+    return stamp_sdist(pathlib.Path(sdist_directory) / name, identity[0]).name
 
 
 # ------------------------------------------------------------------------ cli

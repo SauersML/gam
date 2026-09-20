@@ -24,7 +24,7 @@
 //! gam#3003 measured: nothing in the prior resists the boundary, and on few
 //! events the likelihood can prefer it.
 //!
-//! Two coefficient paths reach the boundary on every law the family anchors on.
+//! Three coefficient paths reach the boundary on every law the family anchors on.
 //!
 //! * **Marginal level.** The marginal intercept goes to `+∞` with every other
 //!   coefficient at zero. On a finite law the anchoring equation
@@ -32,6 +32,15 @@
 //!   `∂α/∂q → 1` and every relative risk `r_i → 1`. On the Gaussian closed form
 //!   `α = q·c_i`, so `r_i = c_i² = 1 + b_i²` at the slope's offset `b_i`. Every
 //!   penalty is zero there.
+//! * **Marginal level with a proportional slope.** The marginal intercept `s`
+//!   goes to `+∞` while the slope intercept follows at `b = κ·s`. On a finite law
+//!   the anchor then selects the node `u_far` on the far side of the slope's
+//!   sign, `α = s·(1 − κ·u_far) + o(1)`, still with `∂α/∂q → 1`, so the index is
+//!   `η_i = s·(1 + κ·(z_i − u_far))` and `r_i = (1 + κ·(z_i − u_far))₊`: a
+//!   proportional-hazards limit linear in the score, with zero penalty and no
+//!   dependence on the smoothing parameters. `κ = 0` is the marginal level. On
+//!   the Gaussian closed form `c ≈ |b|` makes the index quadratic in `s`, and the
+//!   relative risk returns to one.
 //! * **Slope hinge.** The slope intercept goes to `±∞` with `q` frozen at the
 //!   fitted marginal index `m̂_i`. The anchoring equation then selects the node
 //!   `u_k` whose cumulative weight straddles `Φ(−q)`, with
@@ -54,7 +63,7 @@
 //! module does not construct, so it is [`FrozenTimeUndetermined::NoLimitBelowFit`],
 //! never "identified".
 //!
-//! The derivative guard literal truncates both paths at `q̇ ≥ guard`. The limit
+//! The derivative guard literal truncates every path at `q̇ ≥ guard`. The limit
 //! is the model's own; the literal only stops a solver short of it.
 
 use super::*;
@@ -76,6 +85,10 @@ pub enum FrozenTimePath {
     /// The marginal intercept goes to `+∞`: relative risk `1` (finite law) or
     /// `1 + b_i²` (Gaussian closed form) on every row.
     MarginalLevel,
+    /// The marginal intercept `s` goes to `+∞` with the slope intercept at
+    /// `κ·s`: on a finite law, relative risk `(1 + κ·(z_i − u_far))₊`, where
+    /// `u_far` is the row's node on the far side of the slope's sign.
+    MarginalLevelWithSlope(SlopeHingeSide),
     /// The slope intercept goes to `±∞` with `q` frozen at the fitted marginal
     /// index.
     SlopeHinge(SlopeHingeSide),
@@ -85,6 +98,12 @@ impl std::fmt::Display for FrozenTimePath {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::MarginalLevel => f.write_str("the marginal intercept going to +inf"),
+            Self::MarginalLevelWithSlope(SlopeHingeSide::Upper) => f.write_str(
+                "the marginal intercept going to +inf with a proportional positive slope intercept",
+            ),
+            Self::MarginalLevelWithSlope(SlopeHingeSide::Lower) => f.write_str(
+                "the marginal intercept going to +inf with a proportional negative slope intercept",
+            ),
             Self::SlopeHinge(SlopeHingeSide::Upper) => {
                 f.write_str("the slope intercept going to +inf at the fitted marginal index")
             }
@@ -312,8 +331,142 @@ impl FrozenTimeGeometry {
             }
             event_log_risk += self.event_weight[at] * r.ln();
         }
-        Ok(cone_minimiser(&exposure, &self.event_design, &self.event_weight)?
+        Ok(cone_minimiser(&exposure, &self.event_design, &self.event_weight, None)?
             .map(|minimum| minimum.value - event_log_risk))
+    }
+
+    /// The limit of `Σ_i ℓ_i` along the marginal level with a proportional
+    /// slope: relative risks `r_i = (1 + κ·d_i)₊` with `d_i = direction(row)`,
+    /// minimised over `κ ≥ 0` and the baseline shape.
+    ///
+    /// The cone Newton profiles the shape out, which leaves
+    /// `V(κ) = min_γ F(γ, κ)`. By the envelope theorem its derivative is the
+    /// partial derivative of `F` in `κ` at the profiled shape `γ*(κ)`,
+    ///
+    /// ```text
+    ///     V′(κ) = Σ_i w_i d_i 1{1 + κ d_i > 0} γ*ᵀ(I(t₁) − I(t₀)) − Σ_e w_e d_e / (1 + κ d_e),
+    /// ```
+    ///
+    /// so a minimiser is a root of `V′` on `[0, κ_max)`, where `κ_max` keeps
+    /// every event row in the tail. `V′(0) ≥ 0` leaves the marginal level,
+    /// `κ = 0`. Otherwise a sign change is bracketed by doubling `κ` (or halving
+    /// its gap to `κ_max`), and the root is refined by false position with the
+    /// Illinois correction, each profile warm-started from the previous shape.
+    /// Every evaluated `κ` is attained, so the lowest value seen bounds the
+    /// path's infimum from above wherever the search stops. `None` when the path
+    /// is unreachable: a row entering at the time origin sits in the tail at
+    /// `κ = 0`.
+    fn linear_risk_limit(&self, direction: impl Fn(usize) -> f64) -> Result<Option<f64>, String> {
+        if !self.origin_rows.is_empty() {
+            return Ok(None);
+        }
+        let exposure_d: Vec<f64> = self.delayed_rows.iter().map(|&row| direction(row)).collect();
+        let event_d: Vec<f64> = self.event_rows.iter().map(|&row| direction(row)).collect();
+        let kappa_max = event_d
+            .iter()
+            .filter(|&&d| d < 0.0)
+            .map(|&d| -1.0 / d)
+            .fold(f64::INFINITY, f64::min);
+        // One profile: the shape's minimiser at slope `kappa`, its value, and V′.
+        let profile = |kappa: f64,
+                       start: Option<&Array1<f64>>|
+         -> Result<Option<(ConeMinimum, f64)>, String> {
+            let mut exposure = Array1::<f64>::zeros(self.exposure.ncols());
+            for (at, &d) in exposure_d.iter().enumerate() {
+                let r = 1.0 + kappa * d;
+                if r > 0.0 {
+                    exposure.scaled_add(self.delayed_weight[at] * r, &self.exposure.row(at));
+                }
+            }
+            let mut event_log_risk = 0.0;
+            let mut event_slope = 0.0;
+            for (at, &d) in event_d.iter().enumerate() {
+                let r = 1.0 + kappa * d;
+                if !(r > 0.0) {
+                    return Ok(None);
+                }
+                event_log_risk += self.event_weight[at] * r.ln();
+                event_slope += self.event_weight[at] * d / r;
+            }
+            let Some(minimum) =
+                cone_minimiser(&exposure, &self.event_design, &self.event_weight, start)?
+            else {
+                return Ok(None);
+            };
+            let mut exposure_slope = 0.0;
+            for (at, &d) in exposure_d.iter().enumerate() {
+                if 1.0 + kappa * d > 0.0 {
+                    exposure_slope +=
+                        self.delayed_weight[at] * d * self.exposure.row(at).dot(&minimum.gamma);
+                }
+            }
+            Ok(Some((
+                ConeMinimum {
+                    value: minimum.value - event_log_risk,
+                    gamma: minimum.gamma,
+                },
+                exposure_slope - event_slope,
+            )))
+        };
+        let Some((level, level_slope)) = profile(0.0, None)? else {
+            return Ok(None);
+        };
+        let mut best = level.value;
+        if level_slope >= 0.0 {
+            return Ok(Some(best));
+        }
+        let (mut lo, mut lo_slope) = (0.0_f64, level_slope);
+        let mut last_gamma = level.gamma;
+        let mut hi = if kappa_max.is_finite() { 0.5 * kappa_max } else { 1.0 };
+        let mut hi_slope = loop {
+            let Some((point, slope)) = profile(hi, Some(&last_gamma))? else {
+                return Ok(Some(best));
+            };
+            best = best.min(point.value);
+            last_gamma = point.gamma;
+            if slope >= 0.0 {
+                break slope;
+            }
+            lo = hi;
+            lo_slope = slope;
+            let next = if kappa_max.is_finite() { 0.5 * (hi + kappa_max) } else { 2.0 * hi };
+            if !next.is_finite() || next <= hi {
+                return Ok(Some(best));
+            }
+            hi = next;
+        };
+        // False position on V′ with the Illinois correction: when the same end
+        // is kept twice running, its derivative is halved, which restores
+        // superlinear convergence. The bracket shrinks at every step.
+        let mut kept = 0_i8;
+        while hi - lo > 4.0 * f64::EPSILON * hi {
+            let secant = hi - hi_slope * (hi - lo) / (hi_slope - lo_slope);
+            let kappa = if secant > lo && secant < hi { secant } else { 0.5 * (lo + hi) };
+            let Some((point, slope)) = profile(kappa, Some(&last_gamma))? else {
+                break;
+            };
+            best = best.min(point.value);
+            last_gamma = point.gamma;
+            if slope < 0.0 {
+                lo = kappa;
+                lo_slope = slope;
+                if kept == 1 {
+                    hi_slope *= 0.5;
+                }
+                kept = 1;
+            } else {
+                hi = kappa;
+                hi_slope = slope;
+                if kept == -1 {
+                    lo_slope *= 0.5;
+                }
+                kept = -1;
+            }
+            if slope == 0.0 {
+                break;
+            }
+        }
+        Ok(Some(best))
     }
 }
 
@@ -330,11 +483,15 @@ fn cone_minimiser(
     b: &Array1<f64>,
     m: &Array2<f64>,
     v: &Array1<f64>,
+    start: Option<&Array1<f64>>,
 ) -> Result<Option<ConeMinimum>, String> {
     const ARMIJO: f64 = 1e-4;
     let p = b.len();
     if m.nrows() == 0 {
-        return Ok(Some(ConeMinimum { value: 0.0 }));
+        return Ok(Some(ConeMinimum {
+            value: 0.0,
+            gamma: Array1::zeros(p),
+        }));
     }
     let event_mass = m.t().dot(v);
     let live: Vec<usize> = (0..p).filter(|&k| event_mass[k] > 0.0).collect();
@@ -352,13 +509,25 @@ fn cone_minimiser(
         }
         Some(b.dot(gamma) - log_term)
     };
+    // A caller's start (a neighbouring problem's minimiser) is used when it is
+    // feasible here; otherwise the scale-optimal uniform shape on the live
+    // columns.
     let live_exposure: f64 = live.iter().map(|&k| b[k]).sum();
-    let mut gamma = Array1::<f64>::zeros(p);
+    let mut uniform = Array1::<f64>::zeros(p);
     for &k in &live {
-        gamma[k] = v.sum() / live_exposure;
+        uniform[k] = v.sum() / live_exposure;
     }
-    let Some(mut value) = value_at(&gamma) else {
-        return Ok(None);
+    let warm = start
+        .filter(|gamma| gamma.len() == p)
+        .and_then(|gamma| value_at(gamma).map(|value| (gamma.clone(), value)));
+    let (mut gamma, mut value) = match warm {
+        Some(point) => point,
+        None => {
+            let Some(value) = value_at(&uniform) else {
+                return Ok(None);
+            };
+            (uniform, value)
+        }
     };
     loop {
         let hazard = m.dot(&gamma);
@@ -420,12 +589,13 @@ fn cone_minimiser(
             break;
         }
     }
-    Ok(Some(ConeMinimum { value }))
+    Ok(Some(ConeMinimum { value, gamma }))
 }
 
-/// The value [`cone_minimiser`] attains.
+/// The point [`cone_minimiser`] attains and its value.
 struct ConeMinimum {
     value: f64,
+    gamma: Array1<f64>,
 }
 
 /// The relative risk row `z` keeps in the slope-hinge limit on a finite law,
@@ -534,7 +704,27 @@ pub(crate) fn frozen_time_identification(
     let fit_objective = -fit_log_likelihood + fit_penalty;
     let mut limits = Vec::new();
     let law = family.latent_law.as_deref();
-    if unpenalized_constant_column(&blocks[1], &s_lambdas[1]).is_some() {
+    let marginal_intercept = unpenalized_constant_column(&blocks[1], &s_lambdas[1]).is_some();
+    let slope_intercept = unpenalized_constant_column(&blocks[2], &s_lambdas[2]).is_some();
+    if let (Some(law), true, true) = (law, marginal_intercept, slope_intercept) {
+        for side in [SlopeHingeSide::Upper, SlopeHingeSide::Lower] {
+            let direction = |row: usize| {
+                let nodes = law.row(row).nodes;
+                let z = family.z[[row, 0]];
+                match side {
+                    SlopeHingeSide::Upper => z - nodes[0],
+                    SlopeHingeSide::Lower => nodes[nodes.len() - 1] - z,
+                }
+            };
+            if let Some(objective) = geometry.linear_risk_limit(direction)? {
+                limits.push(FrozenTimeLimit {
+                    path: FrozenTimePath::MarginalLevelWithSlope(side),
+                    objective,
+                });
+            }
+        }
+    }
+    if marginal_intercept {
         let probit_scale = family.probit_frailty_scale();
         let zero_slope = Array1::<f64>::zeros(blocks[2].design.ncols());
         let level_risk = |row: usize| -> Result<Option<f64>, String> {
@@ -555,7 +745,7 @@ pub(crate) fn frozen_time_identification(
             });
         }
     }
-    if unpenalized_constant_column(&blocks[2], &s_lambdas[2]).is_some() {
+    if slope_intercept {
         let marginal_index = &states[1].eta;
         for side in [SlopeHingeSide::Upper, SlopeHingeSide::Lower] {
             let hinge_risk = |row: usize| -> Result<Option<f64>, String> {
@@ -705,6 +895,7 @@ mod tests {
             time_wiggle_degree: None,
             time_wiggle_ncols: 0,
             intercept_warm_starts: None,
+            flex_jet_arenas: new_flex_jet_arena_pool(),
         }
     }
 
@@ -818,6 +1009,74 @@ mod tests {
         );
     }
 
+    /// The slope-to-level ratio of the proportional-slope path the tests walk.
+    const KAPPA: f64 = 0.6;
+
+    /// Relative risk one on every row: the marginal level.
+    fn unit_risk(row: usize) -> Result<Option<f64>, String> {
+        Ok(Some(if row < ROWS { 1.0 } else { 0.0 }))
+    }
+
+    #[test]
+    fn marginal_level_with_slope_limit_on_a_finite_law_is_the_objectives_own_limit_3003() {
+        let law = skewed_law();
+        let family = family(Some(Arc::clone(&law)));
+        // The slope is positive, so the far node is the law's smallest.
+        let far = law.row(0).nodes[0];
+        let limit = limit_at_shape(&Array1::from_shape_fn(ROWS, |row| {
+            (1.0 + KAPPA * (score(row) - far)).max(0.0)
+        }));
+        // ∂α/∂q → 1 up to O(s⁻²), so the gap is second order.
+        assert_path_converges(
+            &family,
+            |s| states(&family, shape_over(s), ndarray::array![s, 0.0], KAPPA * s),
+            limit,
+            2,
+            "marginal level with a proportional slope, finite law",
+        );
+    }
+
+    #[test]
+    fn the_proportional_slope_search_improves_on_the_marginal_level_3003() {
+        let law = skewed_law();
+        let family = family(Some(Arc::clone(&law)));
+        let geometry = FrozenTimeGeometry::new(&family).expect("geometry");
+        let searched = geometry
+            .linear_risk_limit(|row| score(row) - law.row(row).nodes[0])
+            .expect("the search evaluates")
+            .expect("the path is reachable");
+        let level = geometry
+            .limit_negative_log_likelihood(unit_risk)
+            .expect("the level evaluates")
+            .expect("the level is reachable");
+        // Events sit high on the score, so a risk rising in the score must beat
+        // the flat one the search starts from.
+        assert!(searched < level, "searched {searched} is not below the level {level}");
+    }
+
+    #[test]
+    fn a_point_on_the_proportional_slope_path_is_refused_3003() {
+        let family = family(Some(skewed_law()));
+        let geometry = FrozenTimeGeometry::new(&family).expect("geometry");
+        let specs = blocks(&family);
+        let at = states(&family, shape_over(1e3), ndarray::array![1e3, 0.0], KAPPA * 1e3);
+        let log_likelihood = family.log_likelihood_only(&at).expect("evaluate");
+        let verdict = frozen_time_identification(
+            &family,
+            &geometry,
+            &specs,
+            &at,
+            &s_lambdas(),
+            log_likelihood,
+            penalty(&at),
+        )
+        .expect("the certificate evaluates");
+        assert!(
+            matches!(verdict, FrozenTimeIdentification::NotIdentified { .. }),
+            "a point on the proportional-slope path must be refused, got {verdict:?}"
+        );
+    }
+
     #[test]
     fn slope_hinge_limit_on_a_finite_law_is_the_objectives_own_limit_3003() {
         let law = skewed_law();
@@ -861,7 +1120,7 @@ mod tests {
         let family = family(None);
         let geometry = FrozenTimeGeometry::new(&family).expect("geometry");
         let exposure = geometry.exposure.t().dot(&geometry.delayed_weight);
-        let minimum = cone_minimiser(&exposure, &geometry.event_design, &geometry.event_weight)
+        let minimum = cone_minimiser(&exposure, &geometry.event_design, &geometry.event_weight, None)
             .expect("the shape Newton step")
             .expect("a finite minimum");
         // EM for a Poisson mixture on the cone: monotone, and every iterate is

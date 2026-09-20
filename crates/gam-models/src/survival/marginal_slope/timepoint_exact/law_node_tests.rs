@@ -86,6 +86,7 @@ fn gaussian_flex_family() -> SurvivalMarginalSlopeFamily {
         time_wiggle_degree: None,
         time_wiggle_ncols: 0,
         intercept_warm_starts: None,
+        flex_jet_arenas: new_flex_jet_arena_pool(),
     }
 }
 

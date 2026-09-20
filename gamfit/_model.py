@@ -591,8 +591,9 @@ class Model:
 
         Gaussian: ``sigma_hat^2 = RSS_w / (n - edf_total)`` (mgcv's
         ``gam.scale``); Gamma: ``1 / shape``; fixed-scale families (Poisson,
-        binomial): ``1``. ``None`` only for a custom family that declares no
-        dispersion.
+        binomial): ``1``. ``None`` exactly when the family's scale contract
+        has no scalar dispersion: a custom family that declares none, or
+        Royston-Parmar survival.
         """
         return self.summary().scale
 

@@ -16,6 +16,7 @@ pub mod atoms;
 pub(crate) mod continuation;
 pub(crate) mod eval;
 mod firth;
+mod gaussian_sufficient_statistics_tests;
 mod glm_outer_hessian_fd_tests;
 pub(super) mod hyper;
 mod inner_strategy;
@@ -1158,6 +1159,101 @@ mod tests {
         assert_eq!(
             cleared_len, 0,
             "reset_outer_seed_state must clear the cross-call PIRLS LRU; got {cleared_len} entries"
+        );
+    }
+
+    fn gaussian_reset_fixture() -> (Array1<f64>, Array1<f64>, Array2<f64>, Array2<f64>) {
+        let y = array![0.3, -0.2, 0.9, 0.4, -0.7, 1.1, 0.2, -0.4];
+        let w = Array1::<f64>::ones(y.len());
+        let x = array![
+            [1.0, -1.0, 0.2],
+            [1.0, -0.5, -0.4],
+            [1.0, 0.0, 0.7],
+            [1.0, 0.4, -0.3],
+            [1.0, 0.9, 0.1],
+            [1.0, 1.3, -0.6],
+            [1.0, -0.8, 0.5],
+            [1.0, 0.6, 0.9],
+        ];
+        let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.1, 0.15], [0.0, 0.15, 0.8],];
+        (y, w, x, s0)
+    }
+
+    #[test]
+    pub(crate) fn gaussian_reset_keeps_the_seed_independent_inner_solve() {
+        // A Gaussian-identity inner mode is one direct solve, so the solve an
+        // outer reset used to discard is the one the next evaluation rebuilt.
+        // The reset keeps it: re-evaluating the same ρ runs no new solve, and
+        // returns exactly what a state that never saw another ρ returns.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let order = crate::rho_optimizer::OuterEvalOrder::ValueAndGradient;
+        let (rho_seed, rho) = (array![-1.5], array![0.7]);
+        let solves = |state: &RemlState<'_>| {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state
+            .compute_outer_eval_with_order(&rho_seed, order)
+            .expect("seed eval");
+        state.compute_outer_eval_with_order(&rho, order).expect("eval");
+        let before_reset = solves(&state);
+        state.reset_outer_seed_state();
+        let reused = state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("eval after reset");
+        assert_eq!(
+            solves(&state),
+            before_reset,
+            "the reset must keep the Gaussian inner solve at ρ, not rebuild it"
+        );
+
+        let fresh_state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        let fresh = fresh_state
+            .compute_outer_eval_with_order(&rho, order)
+            .expect("fresh eval");
+        assert_eq!(reused.cost.to_bits(), fresh.cost.to_bits());
+        assert_eq!(
+            reused.gradient.mapv(f64::to_bits),
+            fresh.gradient.mapv(f64::to_bits)
+        );
+    }
+
+    #[test]
+    pub(crate) fn gaussian_block_correction_decision_needs_no_evaluation() {
+        // Laplace is exact for the Gaussian-identity model, so the #784
+        // admission deferred to the certified optimum declines there without
+        // an evaluation, and the optimum's inner solve is left in place.
+        let (y, w, x, s0) = gaussian_reset_fixture();
+        let cfg = RemlConfig::external(gaussian_identity_glm_spec(), 1e-10, false);
+        let rho = array![0.7];
+        let state = build_logit_state(&y, &w, &x, &s0, &cfg);
+        state.defer_block_correction_admission();
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        let solves = || {
+            state
+                .arena
+                .inner_pirls_solve_count
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let before = solves();
+        assert!(
+            !state
+                .decide_block_correction_admission(&rho)
+                .expect("decision"),
+            "the correction never applies to a Gaussian-identity fit"
+        );
+        assert_eq!(solves(), before, "the decision must not run an inner solve");
+        assert!(!state.block_correction_admission_deferred());
+        state.compute_cost_and_gradient(&rho).expect("eval");
+        assert_eq!(
+            solves(),
+            before,
+            "the optimum's inner solve must survive the decision"
         );
     }
 
@@ -4706,6 +4802,23 @@ impl CriterionRankDecision {
     }
 }
 
+/// What the observation-row fields of a bundle's `pirls_result` describe.
+///
+/// Every coefficient-space quantity (β̂, `H`, deviance, score, the REML value
+/// and its ρ-derivatives) is exact under both variants. The variants differ
+/// only in whether `final_eta`, `finalmu` and the working response are this
+/// mode's fitted rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BundleRows {
+    /// The rows were realised from the design at this bundle's mode.
+    Observed,
+    /// Fixed-design Gaussian identity: the fit was solved from the
+    /// `XᵀWX`, `XᵀW(y−offset)`, `(y−offset)ᵀW(y−offset)` sufficient
+    /// statistics, and the row fields are the ρ-invariant carrier shared by
+    /// every such solve. Only pure-ρ criterion evaluations may consume it.
+    SufficientStatistics,
+}
+
 /// Holds the state for the outer REML optimization and supplies cost and
 /// gradient evaluations to the `opt` optimizer.
 ///
@@ -4720,6 +4833,10 @@ impl CriterionRankDecision {
 pub(crate) struct EvalShared {
     pub(crate) key: Option<Vec<u64>>,
     pub(crate) pirls_result: Arc<PirlsResult>,
+    /// Whether `pirls_result`'s rows are fitted rows or the sufficient-statistic
+    /// carrier. `obtain_eval_bundle` serves only `Observed` bundles; the pure-ρ
+    /// outer criterion accepts either.
+    pub(crate) rows: BundleRows,
     /// The routing verdict this bundle was built under, carried WITH the
     /// quantities it was decided from (#2465 instance 4). The bundle used to
     /// hold the bare `RemlGeometry` label, so every consumer that reported
@@ -4802,34 +4919,86 @@ pub(crate) struct EvalShared {
     /// `get_or_init`+`into_par_iter` deadlock trap does not apply).
     pub(crate) penalty_scores_at_mode: std::sync::OnceLock<Arc<Vec<Array1<f64>>>>,
     /// Per-evaluation-point cache of the #784 block-local Laplace-to-sampling
-    /// correction `TkCorrectionTerms { value, gradient }`. The correction is a
-    /// deterministic function of ONLY this bundle's converged inner state
-    /// (`pirls_result`, `h_total`), the `RemlState`'s fixed
-    /// `canonical_penalties`, and the bundle's ρ — never of the eval `mode`:
-    /// the diagnostic eigendecomposition, the fixed-seed importance sampler,
-    /// and the (b)–(d) gradient channels all read mode-invariant fields, and
-    /// the term carries no Hessian, so the value+gradient are identical for the
-    /// value-only, value+gradient, and value+gradient+Hessian assemble calls
-    /// that share this bundle at a single ρ. The expensive path (eigendecomp +
-    /// O(draws·n·m) sampler) previously reran on every one of those 2–3 calls
-    /// per outer iteration; hoisting it onto the bundle computes it exactly
-    /// once per inner solution (exact hoist, identical values — #784, #1082).
-    /// Keyed only on the external-coordinate count `n_ext`: with no ψ
-    /// coordinates (`n_ext == 0`) the correction engages; with ψ present the
-    /// seam declines (returns the cheap zero), and n_ext is fixed for a fit, so
-    /// a single cell suffices.
-    /// The third slot carries the #2623 ρ-block audit record for the SAME
-    /// computation, so a later assemble call at this ρ that reads the cache can
-    /// re-publish it. Without that, the audit window — which is cleared at the
-    /// start of every assemble call — would report the second and third calls at
-    /// an engaged ρ as DECLINED, and an FD row asserting engagement would fail
-    /// on a fit where the splice ran. `None` when the splice declined or when
-    /// the audit was disarmed (the production case, which allocates nothing).
-    pub(crate) block_local_correction: std::sync::OnceLock<(
-        usize,
-        Arc<outer_eval::TkCorrectionTerms>,
-        Option<crate::estimate::outer_eval_capture::QuadratureMarginalAudit>,
-    )>,
+    /// correction. The correction is a deterministic function of ONLY this
+    /// bundle's converged inner state (`pirls_result`, `h_total`), the
+    /// `RemlState`'s fixed `canonical_penalties`, and the bundle's ρ, so its
+    /// value and gradient are identical for the value-only, value+gradient,
+    /// and value+gradient+Hessian assemble calls that share this bundle at a
+    /// single ρ, and are computed once per inner solution (exact hoist — #784,
+    /// #1082). Its ρ-Hessian is a second pass over the quadrature nodes, paid
+    /// only by an evaluation that asks for the Hessian; an entry computed
+    /// without it serves every call that does not.
+    pub(crate) block_local_correction: BlockLocalCorrectionCell,
+}
+
+/// The [`EvalShared::block_local_correction`] slot. Unlike the bundle's
+/// `OnceLock` caches it can be upgraded once, from an entry computed without
+/// the ρ-Hessian to one with it; a clone copies the entry, as a cloned
+/// `OnceLock` does.
+#[derive(Default)]
+pub(crate) struct BlockLocalCorrectionCell(std::sync::Mutex<Option<BlockLocalCorrectionCache>>);
+
+impl BlockLocalCorrectionCell {
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<BlockLocalCorrectionCache>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The cached entry for `n_ext`, when it serves an evaluation that does or
+    /// does not (`want_hessian`) ask for the ρ-Hessian.
+    pub(crate) fn get(
+        &self,
+        n_ext: usize,
+        want_hessian: bool,
+    ) -> Option<BlockLocalCorrectionCache> {
+        self.slot()
+            .as_ref()
+            .filter(|entry| entry.n_ext == n_ext && (entry.carries_hessian || !want_hessian))
+            .cloned()
+    }
+
+    /// Store `entry` unless the slot already holds one that serves at least
+    /// as much. Racing writers built from identical inputs, so either is
+    /// correct.
+    pub(crate) fn store(&self, entry: BlockLocalCorrectionCache) {
+        let mut slot = self.slot();
+        let keep = slot.as_ref().is_some_and(|held| {
+            held.n_ext == entry.n_ext && (held.carries_hessian || !entry.carries_hessian)
+        });
+        if !keep {
+            *slot = Some(entry);
+        }
+    }
+}
+
+impl Clone for BlockLocalCorrectionCell {
+    fn clone(&self) -> Self {
+        Self(std::sync::Mutex::new(self.slot().clone()))
+    }
+}
+
+/// One bundle's #784 block-local correction, as
+/// [`EvalShared::block_local_correction`] holds it.
+#[derive(Clone)]
+pub(crate) struct BlockLocalCorrectionCache {
+    /// The external-coordinate count the terms were laid out for. With ψ
+    /// coordinates present the seam declines (the cheap zero), and `n_ext` is
+    /// fixed for a fit, so one entry suffices.
+    pub(crate) n_ext: usize,
+    pub(crate) terms: Arc<outer_eval::TkCorrectionTerms>,
+    /// Whether `terms` was computed for an evaluation that asked for the
+    /// ρ-Hessian. Its `hessian` is then the correction's exact ρ-Hessian, or
+    /// `None` because the correction declined or has none on this fit.
+    pub(crate) carries_hessian: bool,
+    /// The #2623 ρ-block audit record for the SAME computation, so a later
+    /// assemble call at this ρ that reads the cache can re-publish it. Without
+    /// that, the audit window — which is cleared at the start of every
+    /// assemble call — would report the second and third calls at an engaged ρ
+    /// as DECLINED, and an FD row asserting engagement would fail on a fit
+    /// where the splice ran. `None` when the splice declined or when the audit
+    /// was disarmed (the production case, which allocates nothing).
+    pub(crate) audit: Option<crate::estimate::outer_eval_capture::QuadratureMarginalAudit>,
 }
 
 /// The penalty components the criterion APPLIES, `S̃_k = Π S_k Π`, for an inner
@@ -5380,6 +5549,8 @@ impl EvalCacheManager {
         Ok(value)
     }
 
+    /// The cached bundle at `key`, whichever rows it carries; callers that
+    /// read rows check [`EvalShared::rows`].
     pub(crate) fn cached_eval_bundle(&self, key: &Option<Vec<u64>>) -> Option<EvalShared> {
         let guard = self
             .current_eval_bundle
@@ -5431,14 +5602,20 @@ impl EvalCacheManager {
             .write()
             .expect("current eval bundle lock is poisoned: a writer panicked while holding it")
             .take();
-        self.current_outer_eval
-            .write()
-            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
-            .take();
+        self.forget_previous_outer_eval();
         self.outer_eval_lru
             .write()
             .expect("outer-eval LRU lock is poisoned: a writer panicked while holding it")
             .clear();
+    }
+
+    /// Drop the single-slot mirror of the previous outer evaluation, which a
+    /// new trajectory must not inherit, and keep every keyed cache.
+    pub(crate) fn forget_previous_outer_eval(&self) {
+        self.current_outer_eval
+            .write()
+            .expect("current outer eval lock is poisoned: a writer panicked while holding it")
+            .take();
     }
 
     pub(crate) fn clear_eval_and_factor_caches(&self) {
@@ -5516,12 +5693,15 @@ pub(crate) enum BlockCorrectionDecision {
 /// rule over the whole block. Beside them sit the paired-rule errors measured
 /// at that admission: the certificate every later evaluation at those orders
 /// carries, since the paired error no longer switches anything once the
-/// orders are latched (#2748).
+/// orders are latched (#2748). `hessian_refusal` is the mathematical reason
+/// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
+/// correction carries its exact ρ-Hessian into the criterion.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
+    pub(crate) hessian_refusal: Option<String>,
 }
 
 pub(crate) struct RemlState<'a> {

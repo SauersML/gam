@@ -6694,6 +6694,35 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
 ) -> Result<FittedTermCollectionWithSpec, EstimationError> {
+    fit_term_collectionwith_spatial_length_scale_optimization_on_design(
+        data,
+        y,
+        weights,
+        offset,
+        spec,
+        family,
+        options,
+        kappa_options,
+        None,
+    )
+}
+
+/// [`fit_term_collectionwith_spatial_length_scale_optimization`] handed the
+/// design an earlier stage already realized from this exact `spec`, `data` and
+/// `options.resource_policy`. A collection with no spatial coordinate to search
+/// fits on that design instead of building it a second time; every other route
+/// rebuilds its bases per κ and drops it.
+pub(crate) fn fit_term_collectionwith_spatial_length_scale_optimization_on_design(
+    data: ArrayView2<'_, f64>,
+    y: Array1<f64>,
+    weights: Array1<f64>,
+    offset: Array1<f64>,
+    spec: &TermCollectionSpec,
+    family: LikelihoodSpec,
+    options: &FitOptions,
+    kappa_options: &SpatialLengthScaleOptimizationOptions,
+    realized_design: Option<TermCollectionDesign>,
+) -> Result<FittedTermCollectionWithSpec, EstimationError> {
     // Spatial hyperparameters change kernel geometry nonlinearly, so each
     // proposal rebuilds the spatial basis. Hybrid/isotropic terms expose a
     // scalar κ (= 1/length_scale); pure Duchon anisotropy exposes only
@@ -6718,6 +6747,7 @@ pub fn fit_term_collectionwith_spatial_length_scale_optimization(
         &family,
         options,
         kappa_options,
+        realized_design,
     )? {
         SpatialKappaIncumbent::Final(fitted) => return Ok(fitted),
         SpatialKappaIncumbent::Joint {
@@ -6856,6 +6886,7 @@ fn spatial_kappa_incumbent(
     family: &LikelihoodSpec,
     options: &FitOptions,
     kappa_options: &SpatialLengthScaleOptimizationOptions,
+    realized_design: Option<TermCollectionDesign>,
 ) -> Result<SpatialKappaIncumbent, EstimationError> {
     let mut resolvedspec = spec.clone();
     let n = data.nrows();
@@ -6876,18 +6907,32 @@ fn spatial_kappa_incumbent(
     // readability — the enrollment predicate does not read `length_scale`.
     // Skipped for pinned, frozen and already-standardized terms; see
     // `seed_measure_jet_auto_ranges`.
-    seed_measure_jet_auto_ranges(data, y.view(), weights.view(), &mut resolvedspec);
+    let seeded = seed_measure_jet_auto_ranges(data, y.view(), weights.view(), &mut resolvedspec);
     let spatial_terms = spatial_length_scale_term_indices(&resolvedspec);
     if !kappa_options.enabled || spatial_terms.is_empty() {
-        let out = fit_term_collection_forspec(
-            data,
-            y.view(),
-            weights.view(),
-            offset.view(),
-            &resolvedspec,
-            family.clone(),
-            options,
-        )?;
+        // A seeded range is a different spec from the one the handed design
+        // was realized from.
+        let out = match realized_design.filter(|_| seeded == 0) {
+            Some(design) => fit_term_collection_on_realized_design(
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                &design,
+                None,
+                family.clone(),
+                options,
+            )?,
+            None => fit_term_collection_forspec(
+                data,
+                y.view(),
+                weights.view(),
+                offset.view(),
+                &resolvedspec,
+                family.clone(),
+                options,
+            )?,
+        };
         let resolvedspec = freeze_term_collection_from_design(&resolvedspec, &out.design)?;
         return Ok(SpatialKappaIncumbent::Final(FittedTermCollectionWithSpec {
             fit: out.fit,
