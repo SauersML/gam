@@ -1169,33 +1169,25 @@ fn sample_standard_truncated(
     let sqrt_cov_scale =
         sampling_sqrt_covariance_scale(&fit, "standard constrained-coefficient posterior")?;
 
-    let active_samples = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
+    let draws = crate::truncated_gaussian::sample_truncated_gaussian_posterior(
         &center,
         &mode,
         &penalized_hessian,
         sqrt_cov_scale,
         &constrained.constraints,
         cfg.n_samples,
-        NUTS_CHAINS,
         chain_stream_seed(cfg.seed, 0, 0x7290_C047_5D6E_B14Du64),
     )?;
     // Reflective HMC draws are iid only while no wall is hit; an active
     // constraint at the mode makes every trajectory reflect, correlating
-    // consecutive draws. Measure the diagnostics instead of asserting the
-    // iid triple (the sampler stacks rows chain-major: chain*n_samples+draw).
-    // Diagnose the active Markov state before lifting: a rectangular gauge can
-    // add deterministic raw coordinates whose zero variance has no R-hat.
-    let mut chains = ndarray::Array3::<f64>::zeros((NUTS_CHAINS, cfg.n_samples, p));
-    for chain in 0..NUTS_CHAINS {
-        for draw in 0..cfg.n_samples {
-            let row = chain * cfg.n_samples + draw;
-            for j in 0..p {
-                chains[(chain, draw, j)] = active_samples[(row, j)];
-            }
-        }
-    }
-    let (rhat, ess) = super::hmc_io::compute_split_rhat_and_ess(&chains);
-    let converged = rhat < 1.1 && ess > 100.0;
+    // consecutive draws. Measure the diagnostics on the kept draws instead of
+    // asserting the iid triple. Diagnose the active Markov state before
+    // lifting: a rectangular gauge can add deterministic raw coordinates whose
+    // zero variance has no R-hat.
+    let (rhat, ess) = super::hmc_io::compute_split_rhat_and_ess(&draws.chains);
+    let converged = super::hmc_io::mixing_converged(rhat, ess);
+    let warmup_transitions = draws.warmup_transitions;
+    let active_samples = draws.into_stacked();
 
     // Public draws use the saved/raw coefficient order. The persisted
     // inequalities and precision live in the gauge's active frame, so sample
@@ -1222,7 +1214,7 @@ fn sample_standard_truncated(
         rhat,
         ess,
         converged,
-        warmup_transitions: 0,
+        warmup_transitions,
         sampler: PosteriorSampler::TruncatedLaplaceHmc,
         covariance: InferenceCovarianceMode::Conditional,
     })
