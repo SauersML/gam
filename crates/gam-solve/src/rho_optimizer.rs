@@ -49,6 +49,9 @@ mod decrement_bands;
 #[cfg(test)]
 #[path = "rho_optimizer/efs_fallback_routing_tests.rs"]
 mod efs_fallback_routing_tests;
+#[cfg(test)]
+#[path = "rho_optimizer/efs_step_domain_2902_tests.rs"]
+mod efs_step_domain_2902_tests;
 mod hessian_operator;
 #[cfg(test)]
 #[path = "rho_optimizer/ladder_incumbent_resume_3306_tests.rs"]
