@@ -210,12 +210,15 @@ fn build_oos_atom(
     .with_geometry_plan(geometry.clone())?)
 }
 
+/// The trained terminal ρ of `term`, validated by the criterion's own rules: every
+/// coordinate atom carries a full `log_ard` block
+/// ([`SaeManifoldTerm::validated_ard_precisions`], #2822), and every strength lies in
+/// its closed domain.
 fn build_rho(
     regularization: SaeOosRegularization,
-    latent_dims: &[usize],
-    assignment: &SaeAssignment,
+    term: &SaeManifoldTerm,
 ) -> Result<SaeManifoldRho, String> {
-    let k_atoms = latent_dims.len();
+    let k_atoms = term.k_atoms();
     let SaeOosRegularization {
         log_lambda_sparse,
         log_lambda_smooth,
@@ -234,20 +237,11 @@ fn build_rho(
             log_ard.len()
         ));
     }
-    let mut ard = Vec::with_capacity(k_atoms);
-    for (atom_index, (values, &dim)) in log_ard.iter().zip(latent_dims).enumerate() {
-        // Every coordinate atom carries a full ARD block (#2822): the coordinate
-        // prior is what makes the frozen-decoder row posterior proper.
-        if values.len() != dim || !values.iter().all(|value| value.is_finite()) {
-            return Err(format!(
-                "run_sae_manifold_oos: trained log_ard[{atom_index}] must contain {dim} finite values; got {}",
-                values.len()
-            ));
-        }
-        ard.push(Array1::from(values.clone()));
-    }
+    let ard = log_ard.into_iter().map(Array1::from).collect();
     let rho = SaeManifoldRho::with_per_atom_smooth(log_lambda_sparse, log_lambda_smooth, ard)
-        .for_assignment(assignment);
+        .for_assignment(&term.assignment);
+    term.validated_ard_precisions(&rho)
+        .map_err(|error| format!("run_sae_manifold_oos: trained {error}"))?;
     rho.validate_log_strength_domain()
         .map_err(|error| format!("run_sae_manifold_oos: {error}"))?;
     Ok(rho)
@@ -405,7 +399,7 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     if !hybrid_linear_images.is_empty() {
         term.set_hybrid_linear_images(hybrid_linear_images.clone())?;
     }
-    let mut rho = build_rho(regularization, &latent_dims, &term.assignment)?;
+    let mut rho = build_rho(regularization, &term)?;
     if cold_coords {
         term.seed_coords_by_decoder_projection(target.view())?;
     }
@@ -990,7 +984,6 @@ pub fn run_sae_manifold_certify_external(
         }
     };
 
-    let latent_dims: Vec<usize> = atom_specs.iter().map(SaeOosAtomSpec::latent_dim).collect();
     let mut coord_blocks = Vec::with_capacity(k_atoms);
     let mut atoms = Vec::with_capacity(k_atoms);
     for (atom_index, spec) in atom_specs.iter().enumerate() {
@@ -1024,7 +1017,7 @@ pub fn run_sae_manifold_certify_external(
     }
     base_term.install_tier0_frame(tier0_frame)?;
 
-    let initial_rho = build_rho(regularization, &latent_dims, &base_term.assignment)?;
+    let initial_rho = build_rho(regularization, &base_term)?;
 
     run_sae_manifold_certify(SaeCertifyRequest {
         base_term,
@@ -1310,7 +1303,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let mut rho = build_rho(request.regularization, &[1], &term.assignment).unwrap();
+        let mut rho = build_rho(request.regularization, &term).unwrap();
         let error = term
             .run_fixed_decoder_arrow_schur(request.target.view(), &mut rho, None, 1.0e-6)
             .unwrap_err();
@@ -1356,13 +1349,15 @@ mod tests {
             "{error}"
         );
 
-        // #2822 — an empty per-atom ARD block is refused at the entry, not
-        // accepted and then rejected by the rho domain check.
+        // #2822 — an empty per-atom ARD block is refused at the entry, by the
+        // criterion's own rule (`validated_ard_precisions`), not accepted and then
+        // rejected by the rho domain check.
         let mut request = periodic_request();
         request.regularization.log_ard = vec![Vec::new()];
         let error = run_sae_manifold_oos(request).err().unwrap();
         assert!(
-            error.contains("trained log_ard[0] must contain 1 finite values; got 0"),
+            error.starts_with("run_sae_manifold_oos: trained ARD rho atom 0 has 0 axes")
+                && error.contains("full log_ard block"),
             "{error}"
         );
     }
