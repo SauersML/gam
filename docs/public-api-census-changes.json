@@ -4688,5 +4688,15 @@
     },
     "reason": "#2902: the per-atom EFS primary boxed each coordinate's log-lambda step to +-5 (PER_ATOM_MAX_STEP), stopped halving after a fixed 8 (PER_ATOM_MAX_BACKTRACK), accepted cost increases up to 1e-12 relative (PER_ATOM_COST_DESCENT_TOL), and zeroed non-finite step components (sanitize_step) so the infinity-norm test could certify an unresolved coordinate (SPEC 18-22). The step is now taken as eval_efs produced it; halving runs while 2^-k*|step|_inf >= tolerance; acceptance uses the two costs' rounding bands gamma_1*(|f|+|f'|); finite_step refuses a non-finite component.",
     "evidence": "git grep finds no remaining use of the three constants or sanitize_step. New tests in crates/gam-solve/src/reml/per_atom_efs.rs: decoupled_step_is_realised_without_a_per_coordinate_box (2 iterations; main 5), backtracking_halves_until_the_step_is_unresolvable (alpha 2^-9; main stalls), backtracking_refuses_a_resolvable_cost_increase (main accepts +5e-13), non_finite_decoupled_step_is_refused_not_zeroed (main reports converged) -- all four fail on main and pass on the branch. cargo test -p gam-solve --lib -- rho_optimizer reml: 968 passed, 0 failed."
+  },
+  {
+    "base": "da88d1a69574d571d8439ccc1c978bf483b0b225",
+    "removed": {
+      "crates/gam-solve/src/rho_optimizer/run.rs::bfgs_axis_step_caps": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap": 1,
+      "crates/gam-solve/src/rho_optimizer/run.rs::with_bfgs_step_cap_psi": 1
+    },
+    "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
+    "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
   }
 ]
