@@ -843,11 +843,19 @@ impl SaeManifoldTerm {
                         limit_factor.delta_t.view(),
                         limit_factor.delta_beta.view(),
                     );
-                    let limit_scale = self
+                    // An objective that fails to evaluate propagates; it is never
+                    // priced as an infinite scale, which would drive the ratio to 0
+                    // and certify the iterate.
+                    let limit_objective = self
                         .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                        .map(|obj| obj.abs() + 1.0)
-                        .unwrap_or(f64::INFINITY);
-                    let predicted_relative_decrease = 0.5 * decrement_sq / limit_scale;
+                        .map_err(|err| {
+                            format!(
+                                "SaeManifoldTerm::converge_inner_for_undamped_logdet_gate_frozen: \
+                                 limit-boundary certificate objective: {err}"
+                            )
+                        })?;
+                    let predicted_relative_decrease =
+                        Self::inner_relative_decrement(decrement_sq, limit_objective);
                     if Self::inner_decrement_certifies(predicted_relative_decrease) {
                         log::debug!(
                             "[SAE-ACCEPT] limit-boundary decrement certificate: ‖g‖={grad_norm:.6e} \
@@ -1096,16 +1104,21 @@ impl SaeManifoldTerm {
                         &lambda_smooth,
                         options,
                     ) {
-                        let final_objective_scale = self
+                        let final_objective = self
                             .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                            .map(|obj| obj.abs() + 1.0)
-                            .unwrap_or(f64::INFINITY);
+                            .map_err(|err| {
+                                format!(
+                                    "SaeManifoldTerm::converge_inner_for_undamped_logdet_gate_frozen: \
+                                     final-gate certificate objective: {err}"
+                                )
+                            })?;
                         let newton_decrement_sq = Self::inner_certificate_decrement_sq(
                             &sys,
                             final_dt.view(),
                             final_db.view(),
                         );
-                        let excursion_cert = 0.5 * newton_decrement_sq / final_objective_scale;
+                        let excursion_cert =
+                            Self::inner_relative_decrement(newton_decrement_sq, final_objective);
                         // #2228 — the acceptance verdict keys on the BEST-SEEN
                         // certificate, not the excursion the polish left. The
                         // band is UNCHANGED; a best-seen plateau ABOVE it is a
