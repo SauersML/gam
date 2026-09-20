@@ -2073,23 +2073,6 @@ fn validate_aux_conditional_prior_lambda(
             "AuxConditionalPriorPenalty.lambda_per_row must be finite",
         ));
     }
-
-    let mut max_asym = 0.0_f64;
-    for obs in 0..n_obs {
-        for row in 0..rows {
-            for col in 0..cols {
-                let asym = (view[IxDyn(&[obs, row, col])] - view[IxDyn(&[obs, col, row])]).abs();
-                if asym > max_asym {
-                    max_asym = asym;
-                }
-            }
-        }
-    }
-    if max_asym >= 1.0e-10 {
-        return Err(PyValueError::new_err(format!(
-            "AuxConditionalPriorPenalty.lambda_per_row matrices must be symmetric within 1e-10; max asymmetry is {max_asym:.3e}"
-        )));
-    }
     Ok(())
 }
 
@@ -4620,6 +4603,7 @@ fn rust_extension(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(log_evidence_ratio, module)?)?;
     module.add_function(wrap_pyfunction!(student_t_parameters_from_model, module)?)?;
     module.add_function(wrap_pyfunction!(saved_model_kind, module)?)?;
+    module.add_function(wrap_pyfunction!(write_saved_model_file, module)?)?;
     module.add_function(wrap_pyfunction!(is_multinomial_family_name, module)?)?;
     module.add("RESPONSE_GEOMETRY_SCHEMA", RESPONSE_GEOMETRY_SCHEMA)?;
     module.add_function(wrap_pyfunction!(saved_model_class_traits, module)?)?;
