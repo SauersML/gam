@@ -2665,5 +2665,13 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "55de1eaed1e659b23702bafc520ed8361b25be88",
+    "items": [
+      "crates/gam-models/src/bms/gradient_paths.rs:fn:pilot_eta_for_link_dev_orthogonalisation"
+    ],
+    "reason": "gam#3320: the flex audit judges candidates on the calibrated pilot's total eta-Jacobian; the rigid-pilot eta helper is superseded",
+    "evidence": "crates/gam-models/src/bms/pilot_total_jacobian.rs BmsCalibratedPilot::build replaces pilot_eta_for_link_dev_orthogonalisation at its only call site in block_specs.rs"
   }
 ]
