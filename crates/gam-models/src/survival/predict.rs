@@ -2376,8 +2376,9 @@ pub struct HazardPathScores {
 /// differently-repaired matrix would make the two metrics disagree about which
 /// prediction they scored.
 ///
-/// `grid` must be strictly increasing with at least two points, `observed[i]`
-/// is `δ_i`, and every `event_times[i]` must be finite and positive — callers
+/// `grid` must start at the time origin `0` (the only time where `S = 1`, which
+/// the pinned first column asserts) and be strictly increasing with at least two
+/// points, `observed[i]` is `δ_i`, and every `event_times[i]` must be finite and positive — callers
 /// validate that, since what to do about a malformed input is theirs to decide.
 pub fn monotone_survival_and_hazard_scores(
     raw: ArrayView2<f64>,
@@ -2588,9 +2589,12 @@ pub struct SurvivalPredictionScores {
 /// scored on the same fold gets the same IPCW weights, and integration stops at
 /// the largest observed time, before the tail where those weights blow up.
 ///
-/// Every field is `None` when the shapes disagree, the grid is not strictly
-/// increasing with at least two points, or an event time is not finite and
-/// positive. What a malformed input means is decided here, once, for every front
+/// Every field is `None` when the shapes disagree, the grid does not start at
+/// the time origin `0` or is not strictly increasing with at least two points,
+/// or an event time is not finite and positive. The hazard-path scores integrate
+/// from `t = 0`, where `S = 1`: a grid starting later has no column for the
+/// hazard accumulated before its first point, and no interval containing an
+/// event before it. What a malformed input means is decided here, once, for every front
 /// door.
 pub fn survival_prediction_scores(
     event_times: &[f64],
@@ -2606,6 +2610,7 @@ pub fn survival_prediction_scores(
         || survival.nrows() != event_times.len()
         || survival.ncols() != grid.len()
         || grid.len() < 2
+        || grid[0] != 0.0
         || grid.windows(2).any(|pair| pair[1] <= pair[0])
         || event_times.iter().any(|time| !time.is_finite() || *time <= 0.0)
     {
@@ -2716,31 +2721,19 @@ impl KaplanMeier {
         Self::fit(time, &flipped)
     }
 
-    /// [`Self::at`] evaluated across a whole grid. `steps` is sorted by
-    /// construction, so each lookup is a binary search rather than the linear
-    /// scan `at` does — the difference matters when a caller evaluates a dense
-    /// grid against a step function with one step per event time.
+    /// [`Self::at`] evaluated across a whole grid.
     pub fn on_grid(&self, grid: &[f64]) -> Vec<f64> {
-        grid.iter()
-            .map(|&t| {
-                let idx = self.steps.partition_point(|&(time, _)| time <= t);
-                if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
-            })
-            .collect()
+        grid.iter().map(|&t| self.at(t)).collect()
     }
 
     /// Right-continuous step lookup: `Ŝ(t)` = survival at the last event time
-    /// `≤ t` (and `1.0` before the first event).
+    /// `≤ t` (and `1.0` before the first event). `steps` is sorted by
+    /// construction, so the lookup is a binary search: IPCW scoring evaluates
+    /// the censoring curve once per subject per grid point against one step per
+    /// distinct censoring time. A NaN `t` precedes no step and reads `1.0`.
     pub fn at(&self, t: f64) -> f64 {
-        let mut s = 1.0_f64;
-        for &(time, surv) in &self.steps {
-            if time <= t {
-                s = surv;
-            } else {
-                break;
-            }
-        }
-        s
+        let idx = self.steps.partition_point(|&(time, _)| time <= t);
+        if idx == 0 { 1.0 } else { self.steps[idx - 1].1 }
     }
 }
 
@@ -7638,6 +7631,29 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_scoring_grid_that_does_not_start_at_the_origin_is_refused_3609() {
+        // S = 1 holds only at t = 0. On a grid starting at 1.0 the repair would
+        // pin the model's S(1.0) < 1 to 1, dropping −ln S(1.0) from every H(T_i),
+        // and the event at T = 0.5 would sit before the first interval and read a
+        // negative cumulative hazard.
+        let time = [0.5, 2.0, 8.0, 3.0];
+        let event = [1.0, 1.0, 0.0, 1.0];
+        let origin = [0.0, 1.0, 2.0, 3.0, 5.0];
+        let model = Array2::from_shape_fn((4, 5), |(row, col)| {
+            1.0 - col as f64 * (0.05 + 0.02 * row as f64)
+        });
+        let scored = survival_prediction_scores(&time, &event, &origin, model.view(), None);
+        assert!(scored.brier.is_some() && scored.logloss.is_some());
+        for late in [[1.0, 2.0, 3.0, 5.0, 7.0], [-1.0, 1.0, 2.0, 3.0, 5.0]] {
+            assert_eq!(
+                survival_prediction_scores(&time, &event, &late, model.view(), None),
+                SurvivalPredictionScores::default(),
+                "grid {late:?}"
+            );
+        }
+    }
+
     // ---- IPCW Brier score (Graf et al. 1999) -------------------------------
 
     #[test]
@@ -7657,6 +7673,12 @@ mod tests {
         assert!((g.at(6.0) - 2.0 / 3.0).abs() <= 1e-12);
         // At t=8 the last (sole) at-risk subject is censored: G collapses to 0.
         assert!(g.at(8.0).abs() <= 1e-15);
+        // `on_grid` is `at` mapped over the grid, NaN included (it precedes no step).
+        let probe = [f64::NAN, -1.0, 0.0, 3.999, 4.0, 7.5, 8.0, 9.0, f64::INFINITY];
+        let mapped: Vec<f64> = probe.iter().map(|&t| g.at(t)).collect();
+        assert_eq!(g.on_grid(&probe), mapped);
+        assert_eq!(g.at(f64::NAN), 1.0);
+        assert_eq!(g.at(f64::INFINITY), 0.0);
     }
 
     /// The pair-loop definition of Harrell's C, written independently of the
