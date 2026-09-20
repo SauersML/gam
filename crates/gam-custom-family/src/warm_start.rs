@@ -1153,6 +1153,7 @@ pub fn blockwise_fit_from_parts(
         coefficient_influence: None,
         weighted_gram,
         identified_subspace: None,
+        working_residual: None,
     });
 
     gam_solve::model_types::UnifiedFitResult::try_from_parts(UnifiedFitResultParts {

@@ -947,8 +947,9 @@ mod tests {
     /// At small `n` with the other terms penalized, the penalized residual
     /// `‖z − Xβ̂‖²_W/(n − edf)` is not independent of the score, and its
     /// `χ²_{n−edf}` reference over-states the denominator's precision: the
-    /// test rejected 6.3% at 0.05 here (gam#3832). The unpenalized residual is
-    /// independent of the score exactly, so the size holds at any `n`.
+    /// test rejected 11.7% at 0.10 and 5.8% at 0.05 here (gam#3832). The
+    /// unpenalized residual is independent of the score exactly, so the size
+    /// holds at any `n`: 10.1%, 5.0% and 0.95% at 0.10, 0.05 and 0.01.
     #[test]
     fn the_estimated_scale_is_calibrated_at_small_n() {
         let mut design = design(32);
