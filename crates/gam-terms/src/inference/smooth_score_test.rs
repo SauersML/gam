@@ -33,6 +33,14 @@
 //! ([`WorkingResidual`]); the ratio `Q` does not depend on the units of `W`, so
 //! the same construction serves a family whose `W` already carries `1/φ̂`.
 //!
+//! Beyond the Gaussian the row norm is the Pearson term `u_i²/W_F,i` in the
+//! expected (Fisher) weight, whose null mean is `φ` per row whatever the
+//! link, and not `u_i²/W_H,i` in the observed curvature of `G`: for a
+//! non-canonical link the two differ, and the observed form is biased (a Gamma
+//! log link has `W_H = y/μ`, so `E[(y/μ − 1)²·μ/y] = φ/(1 − φ)`), which
+//! overstates `φ̂` and makes the test conservative. For a canonical link the
+//! two weights coincide.
+//!
 //! Everything is read off the one full fit. `b = Hβ̂` equals `XᵀWz` at
 //! convergence (the penalized score vanishes, so `XᵀW(z − Xβ̂) = S(λ)β̂`), so
 //! `s = b_j − G_jo·H_oo⁻¹·b_o` with `G = XᵀWX` and `H = G + S(λ)`, and
@@ -139,12 +147,13 @@ pub enum ScoreTestScale {
     Estimated { residual: Option<WorkingResidual> },
 }
 
-/// The penalized fit's working residual in the metric of its weighted Gram.
+/// The penalized fit's working residual in its Pearson form.
 ///
-/// `weighted_norm = ‖z − Xβ̂‖²_W = Σ_i u_i²/W_i`, where `W` is the curvature
-/// weight of `G = XᵀWX`, `u_i` the row's score in `η` (so `XᵀW(z − Xβ̂) = Xᵀu`
-/// and `z = η̂ + u/W` is the working response for which `Hβ̂ = XᵀWz`), and `rows`
-/// is `n⁺`, the rows with `W_i > 0`.
+/// `weighted_norm = Σ_i u_i²/W_i`, where `u_i` is the row's score in `η` (so
+/// `XᵀW(z − Xβ̂) = Xᵀu` and `Hβ̂ = XᵀWz`) and `W` its expected (Fisher) weight,
+/// so each term has null mean `φ` in the units of `G`; `rows` is `n⁺`, the rows
+/// with `W_i > 0`. See the module docs for why the weight is not the observed
+/// curvature of `G`.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WorkingResidual {
     pub weighted_norm: f64,
