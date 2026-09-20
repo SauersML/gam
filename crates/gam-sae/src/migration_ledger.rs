@@ -15,8 +15,9 @@
 //! refused, and the move pays evidence. [`SaeMigrationLedger`] is that one
 //! currency. A move is a [`SaeMove`] — `Birth` (residual → linear → curved),
 //! `Death` (the reverse fall back to the residual-factor pool), `Refuse` (a
-//! proposed move the evidence did not buy), or `Admit` (a proposed move the
-//! evidence bought that the fit reports without installing) — and every move carries the single
+//! proposed move the evidence did not buy), `Admit` (a proposed move the
+//! evidence bought that the fit reports without installing), or `Restructure` (an
+//! installed move that adds and removes no atom) — and every move carries the single
 //! [`MoveEvidence`] currency: a REML/LAML criterion delta, the rank/complexity
 //! charge it spends, and the net description-length change in **bits** (`dl_bits`)
 //! that unifies the tiered `curved_charge` and the e-process `log_e` (a log-e
@@ -30,7 +31,7 @@
 
 use std::collections::HashMap;
 
-use gam_solve::structure_search::{MoveVerdict, SearchLedger, StructureMove};
+use gam_solve::structure_search::{ChartGlueOutcome, MoveVerdict, SearchLedger, StructureMove};
 
 /// Natural-log base, the nats → bits conversion constant (`ln 2`).
 const LN_2: f64 = std::f64::consts::LN_2;
@@ -187,6 +188,9 @@ pub enum SaeMove {
     /// community's curved replacement in bits and mutates nothing, so its accepted
     /// proposals are admitted moves: no atom joined the model, and nothing was refused.
     Admit { stage: MoveStage, seed: BirthSeed },
+    /// An installed move on `stage` that adds and removes no atom: an atlas
+    /// registration keeps both charts and records the transition between them.
+    Restructure { stage: MoveStage },
 }
 
 impl SaeMove {
@@ -197,7 +201,8 @@ impl SaeMove {
             SaeMove::Birth { stage, .. }
             | SaeMove::Death { stage, .. }
             | SaeMove::Refuse { stage, .. }
-            | SaeMove::Admit { stage, .. } => *stage,
+            | SaeMove::Admit { stage, .. }
+            | SaeMove::Restructure { stage } => *stage,
         }
     }
 }
@@ -210,6 +215,9 @@ pub enum MoveReason {
     /// A linear block / atom ended dead — no row selected it — and fell back to
     /// the residual-factor pool.
     DeadRouting,
+    /// An accepted fusion or chart glue folded this atom's routing mass into the
+    /// surviving atom of the pair.
+    Fused,
     /// A curved candidate's evidence did not beat the linear/flat alternative;
     /// the simpler atom is kept (the co-fit's `Θ→0` verdict).
     EvidenceInsufficient,
@@ -271,6 +279,8 @@ pub struct SaeMigrationLedger {
     pub n_refusals: usize,
     /// Total admitted moves (the evidence bought them; the fit did not install them).
     pub n_admitted: usize,
+    /// Total installed moves that added and removed no atom (atlas registrations).
+    pub n_restructures: usize,
 }
 
 impl SaeMigrationLedger {
@@ -293,6 +303,7 @@ impl SaeMigrationLedger {
             SaeMove::Death { .. } => self.n_deaths += mv.count,
             SaeMove::Refuse { .. } => self.n_refusals += mv.count,
             SaeMove::Admit { .. } => self.n_admitted += mv.count,
+            SaeMove::Restructure { .. } => self.n_restructures += mv.count,
         }
         self.moves.push(mv);
     }
@@ -378,6 +389,25 @@ impl SaeMigrationLedger {
         });
     }
 
+    /// Record an installed move on `stage` that adds and removes no atom.
+    pub fn restructure(
+        &mut self,
+        stage: MoveStage,
+        count: usize,
+        round: Option<usize>,
+        evidence: MoveEvidence,
+        objective: f64,
+    ) {
+        self.record(MigrationMove {
+            kind: SaeMove::Restructure { stage },
+            round,
+            count,
+            evidence,
+            objective,
+            predicted_dl_bits: None,
+        });
+    }
+
     /// The ledger as a JSON record for a fitted model's payload: the tallies, the
     /// `pc_reseed_events` invariant, and every move with its stage and seed or
     /// reason, count, round and evidence. Unscored evidence (`NaN`) is `null`.
@@ -392,6 +422,7 @@ impl SaeMigrationLedger {
                     SaeMove::Death { stage, reason } => ("death", stage, None, Some(reason)),
                     SaeMove::Refuse { stage, reason } => ("refuse", stage, None, Some(reason)),
                     SaeMove::Admit { stage, seed } => ("admitted", stage, Some(*seed), None),
+                    SaeMove::Restructure { stage } => ("restructure", stage, None, None),
                 };
                 serde_json::json!({
                     "kind": kind,
@@ -413,6 +444,7 @@ impl SaeMigrationLedger {
             "n_deaths": self.n_deaths,
             "n_refusals": self.n_refusals,
             "n_admitted": self.n_admitted,
+            "n_restructures": self.n_restructures,
             "pc_reseed_events": self.pc_reseed_events,
             "moves": moves,
         })
@@ -420,7 +452,14 @@ impl SaeMigrationLedger {
 
     /// Fold one structure-search round's [`SearchLedger`] into the unified
     /// currency, mapping each adjudicated move + verdict onto a birth / death /
-    /// refusal priced by the banked e-process evidence (`bits_from_nats(log_e)`).
+    /// refusal / restructure priced by the banked e-process evidence
+    /// (`bits_from_nats(log_e)`). An accepted move is booked by what
+    /// `apply_structure_move` does to the dictionary, so across the accepted
+    /// moves `births − deaths` is the change in atom count: a residual-factor
+    /// birth adds an atom seeded from the residual pool; a fission adds a child
+    /// cloned from an existing curved chart; a fusion and a destructive glue
+    /// fold one atom into the other (a death); an atlas registration keeps both
+    /// charts (a restructure).
     /// Keeps the e-process gating untouched — this is the read-out of its
     /// verdicts into the one move currency, not a second gate.
     ///
@@ -447,27 +486,53 @@ impl SaeMigrationLedger {
                 _ => None,
             };
             match &record.verdict {
-                // An accepted birth / fission / fusion / glue is a birth from the
-                // residual-factor pool (structure search never PC-reseeds); an
-                // accepted death is a demotion recorded below.
-                MoveVerdict::Accepted { log_e } => match &record.mv {
-                    StructureMove::Death { .. } => self.death(
-                        stage,
-                        MoveReason::DeadRouting,
-                        1,
-                        Some(round),
-                        MoveEvidence::from_log_e(*log_e),
-                        f64::NAN,
-                    ),
-                    _ => self.birth(
-                        stage,
-                        BirthSeed::ResidualFactor,
-                        1,
-                        Some(round),
-                        MoveEvidence::from_log_e(*log_e),
-                        f64::NAN,
-                    ),
-                },
+                // Structure search never PC-reseeds: a birth seeds from the
+                // residual-factor pool and a fission from the chart it splits.
+                MoveVerdict::Accepted { log_e } => {
+                    let evidence = MoveEvidence::from_log_e(*log_e);
+                    match &record.mv {
+                        StructureMove::Birth { .. } => self.birth(
+                            stage,
+                            BirthSeed::ResidualFactor,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Fission { .. } => self.birth(
+                            stage,
+                            BirthSeed::CurvedChart,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Death { .. } => self.death(
+                            stage,
+                            MoveReason::DeadRouting,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Fusion { .. }
+                        | StructureMove::Glue {
+                            outcome: ChartGlueOutcome::Fuse,
+                            ..
+                        } => self.death(
+                            stage,
+                            MoveReason::Fused,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Glue {
+                            outcome: ChartGlueOutcome::RegisterAtlas,
+                            ..
+                        } => self.restructure(stage, 1, Some(round), evidence, f64::NAN),
+                    }
+                }
                 // A never-certified atom demoted to ~0 routing: a death.
                 MoveVerdict::Demoted { log_e } => self.death(
                     stage,
@@ -643,6 +708,90 @@ mod ledger_tests {
             record["moves"][0]["seed"].as_u64(),
             Some(BirthSeed::LinearAtom.code())
         );
+    }
+
+    /// #3771: an accepted structure move is booked by what it does to the
+    /// dictionary, so `births − deaths` over the accepted moves is the change in
+    /// atom count (+1 birth, +1 fission, −1 fusion, −1 fuse glue, 0 atlas
+    /// registration, −1 death = −1), and no merge is reported as a birth.
+    #[test]
+    fn accepted_structure_moves_are_booked_by_their_atom_count_change_3771() {
+        use gam_solve::structure_search::MoveRecord;
+        use gam_terms::inference::structure_evidence::ClaimKind;
+        let accepted = |mv: StructureMove| MoveRecord {
+            mv,
+            trigger: 0.0,
+            structure_hash: 0,
+            claim: ClaimKind::Custom {
+                label: String::new(),
+            },
+            verdict: MoveVerdict::Accepted { log_e: LN_2 },
+        };
+        let search = SearchLedger {
+            alpha: 0.05,
+            moves: vec![
+                accepted(StructureMove::Birth { candidate: 0 }),
+                accepted(StructureMove::Fission { atom: 0 }),
+                accepted(StructureMove::Fusion { a: 0, b: 1 }),
+                accepted(StructureMove::Glue {
+                    a: 0,
+                    b: 2,
+                    outcome: ChartGlueOutcome::Fuse,
+                }),
+                accepted(StructureMove::Glue {
+                    a: 0,
+                    b: 3,
+                    outcome: ChartGlueOutcome::RegisterAtlas,
+                }),
+                accepted(StructureMove::Death { atom: 4 }),
+            ],
+            collapse_events: Vec::new(),
+        };
+        let mut ledger = SaeMigrationLedger::new();
+        ledger.record_search_round(0, &search, &HashMap::new());
+
+        assert_eq!(ledger.moves.len(), 6, "every verdict records exactly one move");
+        assert_eq!(
+            (ledger.n_births, ledger.n_deaths, ledger.n_restructures, ledger.n_refusals),
+            (2, 3, 1, 0)
+        );
+        assert_eq!(ledger.n_births as isize - ledger.n_deaths as isize, -1);
+        assert_eq!(ledger.pc_reseed_events, 0);
+        let kinds: Vec<SaeMove> = ledger.moves.iter().map(|mv| mv.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SaeMove::Birth {
+                    stage: MoveStage::Curved,
+                    seed: BirthSeed::ResidualFactor,
+                },
+                SaeMove::Birth {
+                    stage: MoveStage::Curved,
+                    seed: BirthSeed::CurvedChart,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::Fused,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::Fused,
+                },
+                SaeMove::Restructure {
+                    stage: MoveStage::Curved,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::DeadRouting,
+                },
+            ]
+        );
+        for mv in &ledger.moves {
+            assert_eq!(mv.evidence.dl_bits, 1.0, "ln 2 nats of banked evidence is one bit");
+        }
+        let record = ledger.to_json();
+        assert_eq!(record["n_restructures"].as_u64(), Some(1));
+        assert_eq!(record["moves"][4]["kind"].as_str(), Some("restructure"));
     }
 
 }
