@@ -2691,5 +2691,17 @@
     ],
     "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
     "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
+  },
+  {
+    "base": "08628afb310729629275eb487e7714732662d59e",
+    "items": [
+      "crates/gam-math/src/categorical.rs:fn:positive_log_sum_exp",
+      "crates/gam-models/src/latent_law_compression.rs:fn:log_sum_exp",
+      "crates/gam-sae/src/sparse_dict/split_lr_fdr.rs:fn:logsumexp",
+      "crates/gam-solve/src/evidence.rs:fn:log_sum_exp",
+      "crates/gam-solve/src/reml/block_correction_hessian.rs:fn:log_sum_exp"
+    ],
+    "reason": "Single source of truth for log-sum-exp: five private copies (categorical positive_log_sum_exp, latent_law_compression log_sum_exp, split_lr_fdr logsumexp, evidence log_sum_exp, block_correction_hessian log_sum_exp) plus three inline copies duplicated gam_math::probability::signed_log_sum_exp with all signs +1. They are replaced by one pub gam_math::probability::positive_log_sum_exp that shares signed_log_sum_exp's body. The evidence.rs copy returned -inf for a +inf term; the canonical routine silently dropped NaN terms, which consolidation would have turned into a NaN-swallowing regression, so it now propagates an undefined term as NaN.",
+    "evidence": "gam-math probability tests slse_undefined_term_makes_the_sum_undefined and positive_log_sum_exp_edge_cases pin NaN propagation, +inf, -inf, empty input and the 1000+ln2 overflow case; at the head git grep -w finds no definition of the five removed names in the edited files, and every former caller now calls positive_log_sum_exp."
   }
 ]

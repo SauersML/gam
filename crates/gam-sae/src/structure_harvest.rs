@@ -2452,18 +2452,9 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
         let la = term.assignment.logits[[row, a]];
         let lb = term.assignment.logits[[row, b]];
         term.assignment.logits[[row, a]] = if softmax_routing {
-            // Numerically stable logsumexp. When BOTH logits are -∞ (two rows of
-            // zero softmax mass — a hard-masked/dead pair), `m = -∞` makes
-            // `la - m = -∞ - (-∞) = NaN`, and the NaN poisons the whole logits
-            // row (every subsequent softmax over it is NaN). The combined mass of
-            // two zero-mass atoms is exactly zero, i.e. logit -∞ — return that
-            // directly instead of computing NaN.
-            let m = la.max(lb);
-            if m == f64::NEG_INFINITY {
-                f64::NEG_INFINITY
-            } else {
-                m + ((la - m).exp() + (lb - m).exp()).ln()
-            }
+            // Two zero-mass atoms (both logits -∞, a hard-masked/dead pair) fuse
+            // to zero mass, logit -∞, not the NaN of `-∞ - (-∞)`.
+            gam_math::special::logaddexp(la, lb)
         } else {
             la.max(lb)
         };
