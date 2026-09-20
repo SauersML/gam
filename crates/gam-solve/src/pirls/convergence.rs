@@ -1,5 +1,3 @@
-use super::WorkingModelPirlsOptions;
-
 /// The rounding band of a penalized objective `½·(s·D + βᵀSβ)` of magnitude
 /// `magnitude`, evaluated over `n` rows and `p` coefficients.
 ///
@@ -21,6 +19,4 @@ pub(super) fn objective_rounding_band(n: usize, p: usize, magnitude: f64) -> f64
     // past its ceiling and the shape-constrained and warm-started P-IRLS
     // fixtures exited with unpolished KKT residuals (#2668).
     gam_linalg::roundoff::accumulation_growth(n + p * p) * magnitude.abs()
-}
-
 }
