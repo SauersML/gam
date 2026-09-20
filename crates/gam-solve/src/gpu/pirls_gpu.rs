@@ -7,15 +7,20 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 /// an explicit discriminant instead of manufacturing a unit Gamma shape; the
 /// final ABI conversion writes a NaN poison value so any future accidental
 /// non-Gamma read fails loudly rather than silently becoming unit scale.
+///
+/// Only the Linux device loop consumes it, so it exists only in Linux builds.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PirlsLoopLikelihoodScale(PirlsLoopLikelihoodScaleKind);
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PirlsLoopLikelihoodScaleKind {
     NonGamma,
     GammaShape(f64),
 }
 
+#[cfg(target_os = "linux")]
 impl PirlsLoopLikelihoodScale {
     #[inline]
     pub(crate) const fn non_gamma() -> Self {
@@ -32,7 +37,6 @@ impl PirlsLoopLikelihoodScale {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn kernel_argument(
         self,
         family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
