@@ -30,6 +30,7 @@
 
 use csv::StringRecord;
 use gam::families::bms::LatentMeasureKind;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use gam::utils::splitmix64;
 use gam::{
     FitConfig, FitResult, encode_recordswith_inferred_schema, fit_from_formula, init_parallelism,
@@ -51,7 +52,7 @@ fn normal_cdf(x: f64) -> f64 {
 
 const N: usize = 2_000;
 const SLOPE: f64 = 1.880;
-const REPLICATES: usize = 6;
+const REPLICATES: usize = 400;
 
 /// `(weight, variance)` of each normal component of `e`, a unit-variance law.
 #[derive(Clone, Copy, Debug)]
@@ -175,45 +176,52 @@ fn upper_normal_quantile(tail: f64) -> f64 {
 fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
     init_parallelism();
     let design = design(law);
-    let mut state = seed;
-    let mut betas: Vec<Vec<f64>> = Vec::with_capacity(REPLICATES);
-    let mut reported: Vec<Vec<f64>> = Vec::with_capacity(REPLICATES);
-    let mut empirical_fits = 0usize;
-    for r in 0..REPLICATES {
-        let data = replicate(law, &design, &mut state);
-        let result = fit_from_formula("y ~ x1 + x2", &data, &config())
-            .unwrap_or_else(|e| panic!("gam#3452 ({law:?}) replicate {r}: fit failed: {e}"));
-        let FitResult::BernoulliMarginalSlope(fit) = result else {
-            panic!("expected a BernoulliMarginalSlope fit");
-        };
-        assert!(
-            fit.latent_z_conditional_calibration.is_some(),
-            "gam#3452 ({law:?}) replicate {r}: the score's mean moves with x, so the fit must \
-             calibrate it and correct its covariance for that first stage; law consumed: {}",
-            fit.latent_law_consumed.label()
-        );
-        let on_grid = matches!(
-            fit.latent_measure,
-            LatentMeasureKind::GlobalEmpirical { .. }
-        );
-        empirical_fits += usize::from(on_grid);
-        if matches!(law, Law::ScaleMixture) {
+    // Each replicate draws from its own stream, so the replicates are
+    // independent of the order the pool runs them in.
+    let fits: Vec<(Vec<f64>, Vec<f64>, bool)> = (0..REPLICATES)
+        .into_par_iter()
+        .map(|r| {
+            let mut state = seed ^ (r as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let data = replicate(law, &design, &mut state);
+            let result = fit_from_formula("y ~ x1 + x2", &data, &config())
+                .unwrap_or_else(|e| panic!("gam#3452 ({law:?}) replicate {r}: fit failed: {e}"));
+            let FitResult::BernoulliMarginalSlope(fit) = result else {
+                panic!("expected a BernoulliMarginalSlope fit");
+            };
             assert!(
-                on_grid,
-                "gam#3452 heavy-tailed replicate {r}: the fit must anchor on the empirical grid \
-                 (the route under test); law consumed: {}",
+                fit.latent_z_conditional_calibration.is_some(),
+                "gam#3452 ({law:?}) replicate {r}: the score's mean moves with x, so the fit must \
+                 calibrate it and correct its covariance for that first stage; law consumed: {}",
                 fit.latent_law_consumed.label()
             );
-        }
-        let covariance = fit
-            .fit
-            .beta_covariance()
-            .unwrap_or_else(|| panic!("gam#3452 ({law:?}) replicate {r}: no covariance"));
-        let p = fit.fit.beta.len();
-        assert_eq!(covariance.dim(), (p, p));
-        betas.push(fit.fit.beta.to_vec());
-        reported.push((0..p).map(|j| covariance[[j, j]]).collect());
-    }
+            let on_grid = matches!(
+                fit.latent_measure,
+                LatentMeasureKind::GlobalEmpirical { .. }
+            );
+            if matches!(law, Law::ScaleMixture) {
+                assert!(
+                    on_grid,
+                    "gam#3452 heavy-tailed replicate {r}: the fit must anchor on the empirical \
+                     grid (the route under test); law consumed: {}",
+                    fit.latent_law_consumed.label()
+                );
+            }
+            let covariance = fit
+                .fit
+                .beta_covariance()
+                .unwrap_or_else(|| panic!("gam#3452 ({law:?}) replicate {r}: no covariance"));
+            let p = fit.fit.beta.len();
+            assert_eq!(covariance.dim(), (p, p));
+            (
+                fit.fit.beta.to_vec(),
+                (0..p).map(|j| covariance[[j, j]]).collect(),
+                on_grid,
+            )
+        })
+        .collect();
+    let empirical_fits = fits.iter().filter(|(_, _, on_grid)| *on_grid).count();
+    let (betas, reported): (Vec<Vec<f64>>, Vec<Vec<f64>>) =
+        fits.into_iter().map(|(beta, variance, _)| (beta, variance)).unzip();
     let p = betas[0].len();
     assert!(betas.iter().all(|b| b.len() == p));
     // Two-sided, Bonferroni over the coefficients at α = 10⁻³.
