@@ -2656,5 +2656,40 @@
     ],
     "reason": "#3547/#3548: fp32 + fp64-residual refinement now returns a solution only once its residual reaches the attainable band, and GpuDispatchPolicy keeps only fields a dispatch reads. cholesky_solve_gpu returned (solution, logdet) through iterative_refinement_cholesky_solve's need_logdet branch, whose extra fp64 POTRF was cuda::cholesky_logdet; no production code called it (its only callers were three arrow_gpu tests, now on cholesky_solve_only_gpu), so cholesky_solve_only_gpu is the single entry point and folds iterative_refinement_cholesky_solve in. The fp64 device solve no longer downloads its factor for a logdet nobody reads, so cholesky_logdet_from_col_major has no caller. GpuMixedPrecisionPolicy's Off and Never variants were unreachable (no code built a policy with them) and Refinement was the only live value, so the enum and the mixed_precision field go, with the two unit tests that pinned the unreachable variants (off_policy_never_attempts_refinement, never_policy_never_attempts_refinement); iterative_refinement_should_attempt is now an associated fn of p.",
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
+  },
+  {
+    "base": "e695ec5d3137372f183f8c7e625f9dd992bb1ebc",
+    "items": [
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:EFS_MAX_STEP",
+      "crates/gam-solve/src/reml/reml_outer_engine/efs.rs:const:PSI_INITIAL_ALPHA"
+    ],
+    "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
+    "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "items": [
+      "crates/gam-solve/src/gaussian_reml.rs:fn:fnv1a_mix",
+      "crates/gam-solve/src/gaussian_reml.rs:fn:matrix_fingerprint"
+    ],
+    "reason": "#3819: gaussian_reml's private matrix_fingerprint folded each f64's bits into one word with fnv1a_mix, a word-level fold under which X and X with a negated column (whose Grams X'X differ only by a sign conjugation) could collide, so the eigen cache accepted a design it was not built for. Every fingerprint in the file now goes through gam_linalg::matrix::array2_bits_fingerprint, the canonical byte-wise FNV-1a over (nrows, ncols, each value's bits), and the block canonical key hashes the (design, penalty) fingerprint pair with DefaultHasher (it only orders rho blocks in-process). Neither helper has a caller left.",
+    "evidence": "scripts/source_removal_guard.py --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 lists exactly these two private removals. Read-proof: before the change git grep -w -c on 74c2b1d788902aa74c5a7306ae4014e37749e4e3 finds matrix_fingerprint/fnv1a_mix only in crates/gam-solve/src/gaussian_reml.rs (20 occurrences, all the two definitions and their in-file callers); at the head git grep -w finds 0 occurrences in crates/ tests/ examples/. New test eigen_cache_refuses_the_design_with_a_negated_column pins the refusal."
+  },
+  {
+    "base": "95504620470839de04fc1647d8b79f456a45b5ce",
+    "items": [
+      "crates/gam-custom-family/src/assembly.rs:fn:assembled_operator_fingerprint",
+      "crates/gam-custom-family/src/assembly.rs:fn:hash_f64"
+    ],
+    "reason": "#3641: the assembled-operator cache keyed an Operator-source joint Hessian on a 64-bit hash of its diagonal plus (rho, beta-hat, penalties, knobs) and folded the pseudo-logdet mode to mode == Smooth, so fits sharing the process-global cache could be handed another matrix's operator. The key is now the assembled symmetrized J itself plus the PseudoLogdetMode, compared by exact element equality; the fingerprint and its f64 hashing helper have no remaining caller.",
+    "evidence": "assembly::assembled_operator_cache_tests::same_diagonal_different_curvature_never_shares_an_operator_3641: [[2,0],[0,2]] and [[2,1],[1,2]] (same diagonal) are priced ln 4 and ln 3 under Smooth, HardPseudo and PositiveDefinite; the_cache_key_is_the_exact_matrix_and_mode_3641: a different mode or a one-ulp entry change misses, -0.0 hits +0.0."
+  },
+  {
+    "base": "9e4544cb8f0785925cdca5cc448efcb22afd9fb8",
+    "items": [
+      "crates/gam-models/src/bms/block_specs.rs:fn:learned_frailty_scale_is_identified"
+    ],
+    "reason": "gam#2938 commit 2 (gam#3059): the Bernoulli marginal-slope fit now asks the one identification rule both marginal-slope families share, crate::survival::lognormal_kernel::frailty_identification (landed in dc80110867), instead of its own copy. learned_frailty_scale_is_identified was that copy: the same span test (is the slope's fixed part o = baseline + slope_offset in the slope design's span?), decided against a band max(n, p + 1)·ε with no rank decision. The shared rule reads the rank from factor_singular_band, compares the distance with the projector error bar at the rank gap plus the rounding of forming it, and reports an unseparated rank boundary as Undecided instead of guessing. The one caller in fit_bernoulli_marginal_slope_terms_under moves onto it: NotIdentified keeps the #3059 refusal text word for word, IdentifiedByOffset continues, and Undecided is a new named refusal. The three #3059 pins keep their names and call frailty_identification through a local identified() helper.",
+    "evidence": "With base 9e4544cb8f0785925cdca5cc448efcb22afd9fb8 and head the candidate, source_removal_guard.py and public_api_census.py refuse exactly this identity: public true, production_occurrences 0, 13820 -> 13819 public function declarations. In the head tree, git grep -w learned_frailty_scale_is_identified finds 0 occurrences. The three pins intercept_slope_with_constant_fixed_part_is_unidentified_3059, covariate_only_slope_with_constant_fixed_part_is_identified_3059 and slope_offset_inside_the_span_is_unidentified_3059 run on the replacement. test_census.py: 12708 -> 12708 tests."
   }
 ]

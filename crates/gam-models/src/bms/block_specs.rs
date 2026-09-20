@@ -566,68 +566,43 @@ fn build_reduced_slope_reparam(
     }
 }
 
-/// Whether a learned Gaussian-shift frailty scale is identified (gam#3059).
-///
-/// The probit row likelihood reads the frailty only through the observed slope
-/// `s(σ)·g(x)`, `s = 1/√(1+σ²)`, on every route: the anchor solves
-/// `Σ_m w_m Φ(a + s·g·u_m) = Φ(q)` and the row evaluates `Φ(a + s·g·z)`. The
-/// slope is `g = o + G·β` with the fixed part `o_i = baseline + slope_offset_i`,
-/// so a move of σ is matched exactly by rescaling `β` whenever `s·o` stays in
-/// `span(G)` — that is, whenever `o ∈ span(G)`. The likelihood is then flat in
-/// σ, and the only σ-dependence left in the criterion is the Laplace Jacobian of
-/// the unpenalized slope directions, `p₀·ln s`, which has no stationary point.
-/// `o` is in the span when the sine of its angle to `span(G)` is inside the
-/// rounding band of the orthonormalization, `max(n, p + 1)·ε` (the same
-/// backward-error band as [`reduced_slope_transform_effective`]).
-pub(crate) fn learned_frailty_scale_is_identified(
-    slope: ArrayView2<'_, f64>,
-    slope_offset: &Array1<f64>,
-    baseline_slope: f64,
-) -> Result<bool, String> {
-    let n = slope.nrows();
-    if slope_offset.len() != n {
-        return Err(format!(
-            "learned frailty identifiability: slope design has {n} rows, slope offset {}",
-            slope_offset.len()
-        ));
-    }
-    let fixed = slope_offset.mapv(|offset| offset + baseline_slope);
-    if fixed.iter().any(|v| !v.is_finite()) {
-        return Err("learned frailty identifiability: the fixed slope part is non-finite".to_string());
-    }
-    let norm = fixed.dot(&fixed).sqrt();
-    if norm == 0.0 {
-        return Ok(false);
-    }
-    let direction = fixed / norm;
-    let p = slope.ncols();
-    let band = (n.max(p + 1) as f64) * f64::EPSILON;
-    let (basis, _) = equilibrated_range_basis(&slope.to_owned(), band)?;
-    let residual = &direction - &basis.dot(&basis.t().dot(&direction));
-    Ok(residual.dot(&residual).sqrt() > band)
-}
-
+/// gam#3059: the Bernoulli marginal-slope fit asks the shared identification rule
+/// ([`crate::survival::lognormal_kernel::frailty_identification`]) about the slope's
+/// fixed part `o = baseline + slope_offset`: a learned frailty is identified only
+/// where `o` leaves the slope design's span.
 #[cfg(test)]
 mod learned_frailty_identifiability_tests {
-    use super::learned_frailty_scale_is_identified;
+    use crate::survival::lognormal_kernel::{FrailtyIdentification, frailty_identification};
     use ndarray::{Array1, Array2};
 
     fn covariate(n: usize) -> Array1<f64> {
         Array1::from_iter((0..n).map(|i| ((i as f64) * 0.37).sin() + 0.1 * i as f64))
     }
 
+    /// Whether the fixed part `baseline + slope_offset` identifies σ on `slope`.
+    fn identified(slope: &Array2<f64>, slope_offset: &Array1<f64>, baseline: f64) -> bool {
+        let fixed = slope_offset.mapv(|offset| offset + baseline);
+        match frailty_identification(&[slope.view()], fixed.view()).expect("a decision") {
+            FrailtyIdentification::IdentifiedByOffset { .. } => true,
+            FrailtyIdentification::NotIdentified { .. } => false,
+            FrailtyIdentification::Undecided { surface } => {
+                panic!("the span of slope surface {surface} is resolved on this fixture")
+            }
+        }
+    }
+
     #[test]
     fn intercept_slope_with_constant_fixed_part_is_unidentified_3059() {
         let n = 50;
         let slope = Array2::from_elem((n, 1), 1.0);
-        assert!(!learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+        assert!(!identified(&slope, &Array1::zeros(n), 0.8));
     }
 
     #[test]
     fn covariate_only_slope_with_constant_fixed_part_is_identified_3059() {
         let n = 50;
         let slope = covariate(n).insert_axis(ndarray::Axis(1));
-        assert!(learned_frailty_scale_is_identified(slope.view(), &Array1::zeros(n), 0.8).unwrap());
+        assert!(identified(&slope, &Array1::zeros(n), 0.8));
     }
 
     #[test]
@@ -637,9 +612,9 @@ mod learned_frailty_identifiability_tests {
         let mut slope = Array2::from_elem((n, 2), 1.0);
         slope.column_mut(1).assign(&x);
         let offset = x.mapv(|v| 2.5 * v - 0.3);
-        assert!(!learned_frailty_scale_is_identified(slope.view(), &offset, 0.8).unwrap());
+        assert!(!identified(&slope, &offset, 0.8));
         let outside = x.mapv(|v| v * v);
-        assert!(learned_frailty_scale_is_identified(slope.view(), &outside, 0.8).unwrap());
+        assert!(identified(&slope, &outside, 0.8));
     }
 }
 
@@ -2997,22 +2972,39 @@ fn fit_bernoulli_marginal_slope_terms_under(
             .design
             .try_to_dense_arc("bernoulli marginal-slope learned frailty identifiability")
             .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        let identified = learned_frailty_scale_is_identified(
-            slope_dense.view(),
-            &spec.slope_offset,
-            baseline.1,
+        // The slope's fixed part, pilot baseline plus slope offset, decides it
+        // through the one identification rule both marginal-slope families share
+        // (gam#2938, gam#3059).
+        let fixed_part = spec.slope_offset.mapv(|offset| offset + baseline.1);
+        match crate::survival::lognormal_kernel::frailty_identification(
+            &[slope_dense.view()],
+            fixed_part.view(),
         )
-        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?;
-        if !identified {
-            return Err(FitFailure::raised(
-                FailureCategory::Input,
-                "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
-                 identified: the probit likelihood reads σ only through the observed slope \
-                 s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
-                 offset) lies in the slope design's span, so any σ is matched exactly by \
-                 rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
-                 { sigma }) or give the slope a fixed part outside its span (gam#3059)",
-            ));
+        .map_err(|reason| FitFailure::raised(FailureCategory::Input, reason))?
+        {
+            crate::survival::lognormal_kernel::FrailtyIdentification::IdentifiedByOffset {
+                ..
+            } => {}
+            crate::survival::lognormal_kernel::FrailtyIdentification::NotIdentified { .. } => {
+                return Err(FitFailure::raised(
+                    FailureCategory::Input,
+                    "bernoulli marginal-slope: a learned GaussianShift frailty scale is not \
+                     identified: the probit likelihood reads σ only through the observed slope \
+                     s(σ)·g(x), s = 1/√(1+σ²), and the fixed part of g (pilot baseline + slope \
+                     offset) lies in the slope design's span, so any σ is matched exactly by \
+                     rescaling the slope coefficients; fix σ (frailty_sd / FrailtyScale::Fixed \
+                     { sigma }) or give the slope a fixed part outside its span (gam#3059)",
+                ));
+            }
+            crate::survival::lognormal_kernel::FrailtyIdentification::Undecided { .. } => {
+                return Err(FitFailure::raised(
+                    FailureCategory::Input,
+                    "bernoulli marginal-slope: a learned GaussianShift frailty scale is refused: \
+                     the slope design's column space is not separated from rounding at its rank \
+                     boundary, so whether the fixed part of the slope identifies σ cannot be \
+                     decided (gam#3059)",
+                ));
+            }
         }
     }
 

@@ -463,6 +463,106 @@ fn replay_predictor<'a>(
     Ok(ReplayedPredictor { predictor, design })
 }
 
+/// Refuse a replayed design whose penalty blocks do not line up with the fit's
+/// flat λ layout, and place them in it: every reader indexes the fit's λ by the
+/// replay's block-local penalty positions shifted by the returned offset, so a
+/// rebuild with another block count would misread them. The coefficient columns
+/// were already checked and placed by [`replay_predictor`].
+fn replayed_penalty_offset(
+    replayed: &ReplayedPredictor<'_>,
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<gam_solve::estimate::SummaryBlockOffset, String> {
+    let predictor = &replayed.predictor;
+    let design = &replayed.design;
+    let mut offset = predictor.offset;
+    match predictor.placement {
+        SummaryBlockPlacement::Leading => {
+            crate::inference::model::saved_lambdas_index_rebuilt_layout(
+                predictor.spec,
+                design.penalties.len(),
+                fit,
+                context,
+            )?
+        }
+        SummaryBlockPlacement::Whole(block) => {
+            if design.penalties.len() != block.lambdas.len() {
+                return Err(format!(
+                    "{}: the rebuilt design has {} penalty blocks but the fit's {} block has \
+                     {} smoothing parameters",
+                    predictor.label(),
+                    design.penalties.len(),
+                    block.role.name(),
+                    block.lambdas.len()
+                ));
+            }
+        }
+        SummaryBlockPlacement::CovariateTail { block, .. } => {
+            // The block's λ are the time penalties followed by the covariate
+            // blocks the fit admitted (`covariate_penalty_blocks`, in design
+            // order), so the design's penalties are the block's last λ exactly
+            // when the fit admitted every one of them.
+            let admitted = crate::survival::covariate_penalty_blocks(
+                &design.penalties,
+                &design.nullspace_dims,
+                design.design.ncols(),
+                0,
+            )
+            .len();
+            if admitted != design.penalties.len() || admitted > block.lambdas.len() {
+                return Err(format!(
+                    "{}: the fit's {} block has {} smoothing parameters and the rebuilt \
+                     covariate design has {} penalty blocks, of which the survival fit admits \
+                     {admitted}, so the covariate λ are not the block's trailing ones",
+                    predictor.label(),
+                    block.role.name(),
+                    block.lambdas.len(),
+                    design.penalties.len()
+                ));
+            }
+            offset.penalties += block.lambdas.len() - admitted;
+        }
+    }
+    Ok(offset)
+}
+
+/// One predictor of a saved fit with its frozen basis replayed: the penalty
+/// blocks (`design.penalties`, parallel to `design.penaltyinfo`) and the
+/// coefficient columns they cover, placed in the fit's flat layouts by
+/// `offset`. Block-local column `j` is global coefficient
+/// `offset.coefficients + j`; penalty block `i` owns `fit.lambdas[offset.penalties + i]`.
+pub struct SavedPredictorDesign {
+    /// The predictor's name in a multi-predictor fit, `None` for a
+    /// single-predictor fit.
+    pub predictor: Option<&'static str>,
+    pub design: gam_terms::smooth::TermCollectionDesign,
+    pub offset: gam_solve::estimate::SummaryBlockOffset,
+}
+
+/// Replay every predictor of a saved fit from its frozen spec, checked against
+/// the fit's coefficient and penalty layout, so readers of the fitted penalty
+/// structure (`S_b`, its rank, its prior mean, its λ) share the one replay the
+/// summary tables use.
+pub fn saved_predictor_designs(
+    model: &FittedModel,
+    fit: &UnifiedFitResult,
+    context: &str,
+) -> Result<Vec<SavedPredictorDesign>, String> {
+    let ranges = summary_training_ranges(model)?;
+    summary_predictor_blocks(model, fit)?
+        .into_iter()
+        .map(|predictor| {
+            let replayed = replay_predictor(predictor, ranges)?;
+            let offset = replayed_penalty_offset(&replayed, fit, context)?;
+            Ok(SavedPredictorDesign {
+                predictor: replayed.predictor.predictor,
+                design: replayed.design,
+                offset,
+            })
+        })
+        .collect()
+}
+
 fn parametric_rows(
     replayed: &ReplayedPredictor<'_>,
     fit: &UnifiedFitResult,
@@ -492,57 +592,10 @@ fn predictor_block_smooth_terms(
     fit: &UnifiedFitResult,
 ) -> Result<Vec<SummarySmoothTermRow>, String> {
     let predictor = &replayed.predictor;
-    let spec = predictor.spec;
     let design = &replayed.design;
-    let label = predictor.label();
     // The walk below reads the fit's per-penalty record by the rebuilt layout's
     // global index, so a rebuild with another block count would misread it.
-    let mut offset = predictor.offset;
-    match predictor.placement {
-        SummaryBlockPlacement::Leading => {
-            crate::inference::model::saved_lambdas_index_rebuilt_layout(
-                spec,
-                design.penalties.len(),
-                fit,
-                "per-smooth summary",
-            )?
-        }
-        SummaryBlockPlacement::Whole(block) => {
-            if design.penalties.len() != block.lambdas.len() {
-                return Err(format!(
-                    "{label}: the rebuilt design has {} penalty blocks but the fit's {} block has \
-                     {} smoothing parameters",
-                    design.penalties.len(),
-                    block.role.name(),
-                    block.lambdas.len()
-                ));
-            }
-        }
-        SummaryBlockPlacement::CovariateTail { block, .. } => {
-            // The block's λ are the time penalties followed by the covariate
-            // blocks the fit admitted (`covariate_penalty_blocks`, in design
-            // order), so the design's penalties are the block's last λ exactly
-            // when the fit admitted every one of them.
-            let admitted = crate::survival::covariate_penalty_blocks(
-                &design.penalties,
-                &design.nullspace_dims,
-                design.design.ncols(),
-                0,
-            )
-            .len();
-            if admitted != design.penalties.len() || admitted > block.lambdas.len() {
-                return Err(format!(
-                    "{label}: the fit's {} block has {} smoothing parameters and the rebuilt \
-                     covariate design has {} penalty blocks, of which the survival fit admits \
-                     {admitted}, so the covariate λ are not the block's trailing ones",
-                    block.role.name(),
-                    block.lambdas.len(),
-                    design.penalties.len()
-                ));
-            }
-            offset.penalties += block.lambdas.len() - admitted;
-        }
-    }
+    let offset = replayed_penalty_offset(replayed, fit, "per-smooth summary")?;
 
     // The walk over the fit's flat penalty layout — the `LinearTermRidge`
     // prologue, the random-effect blocks that own no entry, the block-local →

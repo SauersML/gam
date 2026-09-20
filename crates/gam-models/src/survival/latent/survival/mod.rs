@@ -7305,9 +7305,13 @@ type LatentBinaryHessianWorkspace = LatentHessianWorkspace<LatentBinaryFamily>;
 /// when this file hit the 10,000-line ceiling; see `survival/custom_family.rs`.
 mod baseline_chart_pairs;
 mod custom_family;
+mod jeffreys_rotated;
 
 #[cfg(test)]
 mod tests_rho_domain_2902;
+
+#[cfg(test)]
+mod tests_jeffreys_rotated_2992;
 
 #[cfg(test)]
 mod tests;
