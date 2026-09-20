@@ -19,14 +19,21 @@ miscalibrated.
 | `model.summary().smooth_terms[i]["p_value"]` | the smooth is identically zero | Wood (2013) rank-truncated Wald statistic `chi_sq` | `χ²_{ref_df}` when the scale is known (binomial, Poisson, negative binomial); `F_{ref_df, n − edf}` on `chi_sq / ref_df` when the fit estimates it (Gaussian, Gamma) |
 | `model.smooth_significance(data)[i]["p_value_corrected"]` | the smooth is identically zero | likelihood ratio `statistic_lr` from a constrained refit without the smooth | the statistic's exact null law `Σ w_j χ²₁`, Bartlett-corrected |
 | `model.summary().basis_checks[i]["p_value"]` | the basis of the smooth is rich enough | penalized score (Rao) lack-of-fit statistic | `χ²_{enrichment_rank}` |
+| `model.summary().parametric_terms[i]["p_value"]`, unpenalized coefficient | the coefficient is zero | Wald ratio `estimate / std_error` | `t` on the residual degrees of freedom when the fit estimates the scale, `N(0, 1)` when it is known |
+| `model.summary().parametric_terms[i]["p_value"]`, ridged linear term (the default) | the slope is zero | variance-component score statistic of the slope's ridge, reported as its signed square root | `χ²₁` (known scale) or `F_{1, ν}` on the unpenalized residual (estimated scale); for a Gaussian fit it is exactly the partial `t` of the unpenalized slope |
+| `model.summary().smooth_terms[i]["p_value"]`, random effect (`group(g)`) | the between-group variance is zero | variance-component score statistic | its exact weighted-`χ²` null law |
 
-Some terms have no p-value on any surface:
+A linear term is ridged by default, and REML picks the ridge from the same
+data, so its estimate is shrunk toward zero and shrinks furthest exactly when
+the slope is null. The Wald ratio of that shrunk estimate is far below its
+nominal law under the null: its p-values pile up near one. The ridged row
+therefore reports the score test of the ridge's variance component, which
+never reads the shrunk estimate (gam#3573). A ridged row on a fit that records
+no such test (the location-scale, GAMLSS and expectile families) has no
+statistic and no p-value, rather than the invalid Wald ratio.
 
-- Parametric coefficients carry an estimate and a standard error
-  (`summary().coefficients`), not a p-value. `model.term_blocks` gives the
-  coefficient columns of each term.
-- A random effect (`group(g)`) or a factor (`g`) has a `smooth_terms` row with
-  `edf` only, and no row in `smooth_significance`.
+A factor (`g`) has a `smooth_terms` row with `edf` only. Neither a factor nor
+a random effect has a row in `smooth_significance`.
 
 ### The Wald test in `summary()`
 
@@ -130,10 +137,10 @@ sample sizes. The pyGAM columns fit pyGAM 0.12 to the same data wherever pyGAM
 has a counterpart. pyGAM has no `ti`, random effect or negative binomial, and
 no LR test.
 
-For the linear null, gamfit has no coefficient p-value, so the table's
-"coefficient" row is the two-sided normal tail of `estimate / std_error`.
-That row tests the reported standard error, which is what such a p-value
-would be built from.
+For the linear null, the table's "coefficient" row is the linear term's
+`parametric_terms` p-value. The baseline below was recorded before gam#3573,
+when that row was the Wald tail of the ridge-shrunk estimate; its null
+p-values pile up near one (KS D near 0.7, size far below nominal).
 
 How to read the table:
 

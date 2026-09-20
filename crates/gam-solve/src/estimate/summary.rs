@@ -3,9 +3,14 @@ pub struct ParametricTermSummary {
     pub name: String,
     pub estimate: f64,
     pub std_error: Option<f64>,
-    /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
-    /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
-    /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    /// For an unpenalized coefficient, `estimate / std_error`, referred to
+    /// Student-t on the fit's Wald residual degrees of freedom when the fit's
+    /// scale is estimated and to N(0, 1) when it is known
+    /// (`LikelihoodScaleMetadata::wald_scale_is_estimated`). For a linear term
+    /// under the REML-selected ridge, the signed square root of its recorded
+    /// variance-component score statistic — the partial `t` (estimated scale)
+    /// or `z` (known scale) of the unpenalized slope — since the shrunk
+    /// estimate has no valid Wald reference (gam#3573).
     pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
 }
