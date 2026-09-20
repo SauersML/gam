@@ -294,7 +294,9 @@ pub fn build_periodic_bspline_basis_1d(
 ///
 /// The I-spline of degree `degree` uses internal B-splines of degree `degree+1`.
 /// The k-th derivative of I-spline j is the right-cumulative sum of the k-th
-/// derivatives of those B-splines, starting from column j+1 down to j.
+/// derivatives of those B-splines, starting from column j+1 down to j. The
+/// first derivative is that sum in closed form, the M-spline it telescopes to
+/// ([`create_ispline_first_derivative_dense`]), so it is non-negative exactly.
 ///
 /// This produces `num_bspline_basis - 1` columns (same as the I-spline value
 /// basis), where `num_bspline_basis = len(knot_vector) - degree - 2`.
@@ -314,6 +316,9 @@ pub fn create_ispline_derivative_dense(
         )?;
         return Ok(basis_arc.as_ref().clone());
     }
+    if derivative_order == 1 {
+        return create_ispline_first_derivative_dense(data, knot_vector.view(), degree);
+    }
     let bs_degree = degree
         .checked_add(1)
         .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
@@ -325,15 +330,6 @@ pub fn create_ispline_derivative_dense(
     }
     let num_bspline_cols = knot_vector.len().saturating_sub(bs_degree + 1);
     let db = match derivative_order {
-        1 => {
-            let (db_arc, _) = create_basis::<Dense>(
-                data,
-                KnotSource::Provided(knot_vector.view()),
-                bs_degree,
-                BasisOptions::first_derivative(),
-            )?;
-            db_arc.as_ref().clone()
-        }
         2 => {
             let (db_arc, _) = create_basis::<Dense>(
                 data,
@@ -434,6 +430,78 @@ pub fn create_ispline_derivative_dense(
                 running += term;
             }
             out[[i, j - 1]] = running;
+        }
+    }
+    Ok(out)
+}
+
+/// `I_j′`, evaluated as the M-spline the right-cumulative sum telescopes to.
+///
+/// With `k = degree + 1`, `N` degree-`k` B-splines on `t`, and
+/// `I_j = Σ_{m>j} B_{m,k}`, the derivative recurrence
+/// `B′_{m,k} = k·(B_{m,k−1}/(t_{m+k} − t_m) − B_{m+1,k−1}/(t_{m+k+1} − t_{m+1}))`
+/// collapses the suffix sum to
+///
+///   `I_j′ = k·B_{j+1,k−1}/(t_{j+k+1} − t_{j+1}) − k·B_{N,k−1}/(t_{N+k} − t_N)`.
+///
+/// The second term is supported on `[t_N, t_{N+k}]`, at and to the right of
+/// `right = t_N`, so it vanishes on the modelling interval `[left, right)` and in
+/// the left limit at `right`. What remains is column `j` of the degree-`degree`
+/// M-spline basis on `t′_i = t_{i+1}` (one knot trimmed from each end), whose
+/// own evaluation domain `[t′_degree, t′_{N−1}] = [t_{k}, t_N]` is exactly
+/// `[left, right]`; its last-span convention supplies the one-sided slope at
+/// `right` that the linear-tail continuation anchors on.
+///
+/// Evaluated this way every entry is a Cox–de Boor value — sums and products of
+/// non-negative factors inside the span — times a positive scale, so `M_j ≥ 0`
+/// holds exactly. The suffix sum of mixed-sign B-spline derivatives only holds
+/// it up to rounding, which is what forced consumers to clamp small negatives to
+/// zero behind an absolute cut-off (#3288). Outside `[left, right]` (and at a
+/// NaN point) the I-spline value saturates, so the row is zero (gam#2695).
+fn create_ispline_first_derivative_dense(
+    data: ArrayView1<'_, f64>,
+    knot_vector: ArrayView1<'_, f64>,
+    degree: usize,
+) -> Result<Array2<f64>, BasisError> {
+    let bs_degree = degree
+        .checked_add(1)
+        .ok_or_else(|| BasisError::InvalidInput("I-spline degree overflow".to_string()))?;
+    validate_knots_for_degree(knot_vector, bs_degree)?;
+    let num_bspline_cols = knot_vector.len() - bs_degree - 1;
+    let num_ispline_cols = num_bspline_cols.saturating_sub(1);
+    let mut out = Array2::<f64>::zeros((data.len(), num_ispline_cols));
+    if num_ispline_cols == 0 {
+        return Ok(out);
+    }
+    let trimmed = knot_vector.slice(s![1..knot_vector.len() - 1]);
+    let left = trimmed[degree];
+    let right = trimmed[num_ispline_cols];
+    if !(left.is_finite() && right.is_finite() && left < right) {
+        // No modelling interval: the value is constant everywhere.
+        return Ok(out);
+    }
+    // A zero-width support carries an identically-zero B-spline, so its column
+    // is zero whatever the scale; 0 keeps that from reading `0·∞`.
+    let order = (degree + 1) as f64;
+    let scales: Vec<f64> = (0..num_ispline_cols)
+        .map(|j| {
+            let span = trimmed[j + degree + 1] - trimmed[j];
+            if span > 0.0 { order / span } else { 0.0 }
+        })
+        .collect();
+    let mut scratch = internal::BsplineScratch::new(degree);
+    let mut local = vec![0.0_f64; degree + 1];
+    for (row, &x) in data.iter().enumerate() {
+        if !(x >= left && x <= right) {
+            continue;
+        }
+        let start =
+            internal::evaluate_splines_sparse_into(x, degree, trimmed, &mut local, &mut scratch);
+        for (offset, &b) in local.iter().enumerate() {
+            let j = start + offset;
+            if j < num_ispline_cols {
+                out[[row, j]] = b * scales[j];
+            }
         }
     }
     Ok(out)
@@ -1093,6 +1161,57 @@ mod ispline_exterior_derivative_2695_tests {
                 }
             }
         }
+    }
+
+    /// #3288: the first derivative is the M-spline the suffix sum telescopes
+    /// to. It must agree with that sum of mixed-sign B-spline derivatives up to
+    /// the sum's own rounding, and — unlike the sum — be non-negative exactly,
+    /// on a non-uniform knot vector and at both ends of the interval.
+    #[test]
+    fn the_ispline_first_derivative_is_the_telescoped_mspline_3288() {
+        let knots = Array1::from_vec(vec![
+            -3.0, -3.0, -3.0, -3.0, -2.6, -0.9, 0.05, 2.2, 3.0, 3.0, 3.0, 3.0,
+        ]);
+        let bs_degree = DEGREE + 1;
+        let grid = Array1::from_iter((0..=600).map(|i| -3.0 + 6.0 * (i as f64) / 600.0));
+        let mspline = create_ispline_derivative_dense(grid.view(), &knots, DEGREE, 1)
+            .expect("i-spline first derivative");
+        let (db_arc, _) = create_basis::<Dense>(
+            grid.view(),
+            KnotSource::Provided(knots.view()),
+            bs_degree,
+            BasisOptions::first_derivative(),
+        )
+        .expect("b-spline first derivative");
+        let db = db_arc.as_ref();
+        let growth = gam_linalg::roundoff::accumulation_growth(6 * bs_degree + db.ncols() + 1);
+        let mut any_positive = false;
+        for (row, &x) in grid.iter().enumerate() {
+            let magnitude: f64 = db.row(row).iter().map(|v| v.abs()).sum();
+            let mut running = 0.0_f64;
+            for j in (1..db.ncols()).rev() {
+                running += db[[row, j]];
+                let direct = mspline[[row, j - 1]];
+                assert!(
+                    direct >= 0.0,
+                    "M_{}({x}) = {direct:.3e} is negative; a Cox–de Boor value times a \
+                     positive scale cannot be",
+                    j - 1
+                );
+                assert!(
+                    (direct - running).abs() <= growth * magnitude,
+                    "M_{}({x}): telescoped {direct:.17e} vs suffix sum {running:.17e} \
+                     exceeds the sum's rounding bound {:.3e}",
+                    j - 1,
+                    growth * magnitude
+                );
+                any_positive |= direct > 0.0;
+            }
+        }
+        assert!(
+            any_positive,
+            "the fixture must exercise a non-zero derivative"
+        );
     }
 
     /// The warp factor #2695 is about, stated in its own terms: with
