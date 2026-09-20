@@ -202,7 +202,7 @@ fn production_objective_forced_streaming_matches_dense_with_circle_phase_margina
         base.assignment.logits.clone(),
         vec![base.assignment.coords[0].as_matrix()],
         vec![LatentManifold::Circle { period: 2.0 }],
-        base.assignment.mode.clone(),
+        base.assignment.mode,
     )
     .expect("the seed's logits and coordinates describe one circle block");
     let mut term = SaeManifoldTerm::new(base.atoms.clone(), assignment)
