@@ -4654,6 +4654,10 @@ pub(crate) fn fit_binomial_mean_wiggle_terms_with_selected_basis(
             y.len(),
             baseline_design.design.ncols() + frozen_warp_basis.ncols(),
         )
+        // Binomial prior weights are replication weights: a row of weight c
+        // is c Bernoulli rows and the criterion is identical under both
+        // encodings, so the statistical resolution counts Σw, not rows (#3192).
+        .with_information_count(weights.sum())
         .with_gradient(Derivative::Analytic)
         .with_hessian(if analytic_outer_hessian_available {
             DeclaredHessianForm::Either
