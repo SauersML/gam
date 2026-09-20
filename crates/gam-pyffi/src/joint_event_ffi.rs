@@ -141,9 +141,25 @@ fn load_joint_event_model(path: &str) -> PyResult<PyJointEventModel> {
     })
 }
 
+/// A joint event model from a saved document's bytes, as `gamfit.loads`
+/// reads a document whose header names the kind `joint` (gam#3053).
+#[pyfunction]
+fn loads_joint_event_model(model_bytes: Vec<u8>) -> PyResult<PyJointEventModel> {
+    let text = std::str::from_utf8(&model_bytes).map_err(|error| {
+        saved_document_error_to_pyerr(gam_model_api::saved_model::SavedModelError::Malformed {
+            reason: error.to_string(),
+        })
+    })?;
+    let model = JointEventModel::from_saved_text(text).map_err(saved_document_error_to_pyerr)?;
+    Ok(PyJointEventModel {
+        model: Arc::new(model),
+    })
+}
+
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyJointEventModel>()?;
     module.add_function(wrap_pyfunction!(fit_joint_event_model, module)?)?;
     module.add_function(wrap_pyfunction!(load_joint_event_model, module)?)?;
+    module.add_function(wrap_pyfunction!(loads_joint_event_model, module)?)?;
     Ok(())
 }

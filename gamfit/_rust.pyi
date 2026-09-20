@@ -245,6 +245,7 @@ __all__ = [
     "linear_dictionary_fit",
     "linear_dictionary_transform_ffi",
     "load_joint_event_model",
+    "loads_joint_event_model",
     "log_e_from_p_value",
     "log_evidence_ratio",
     "log_loss_from_predictions",
@@ -1882,6 +1883,8 @@ def linear_dictionary_fit(x: NDArray[np.float64], k: int, max_iter: int = ..., t
 def linear_dictionary_transform_ffi(x: NDArray[np.float64], atoms: NDArray[np.float64], top_k: int, code_ridge: float = ...) -> NDArray[np.float64]: ...
 
 def load_joint_event_model(path: str) -> _JointEventModel: ...
+
+def loads_joint_event_model(model_bytes: Sequence[int]) -> _JointEventModel: ...
 
 def log_e_from_p_value(p_value: float) -> float: ...
 
