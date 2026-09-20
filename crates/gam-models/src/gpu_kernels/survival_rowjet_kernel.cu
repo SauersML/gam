@@ -8,9 +8,6 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#ifndef M_SQRT2
-#define M_SQRT2 1.41421356237309504880
-#endif
 #ifndef INFINITY
 #define INFINITY (__longlong_as_double(0x7ff0000000000000LL))
 #endif
@@ -18,56 +15,10 @@
 #define NAN (__longlong_as_double(0x7ff8000000000000LL))
 #endif
 
-// Full-precision probability leaves matching the CPU primitive contract.
-__device__ __forceinline__ double erfcx_nn(double x) {
-    if (!isfinite(x)) return x > 0.0 ? 0.0 : INFINITY;
-    if (x <= 0.0) return 1.0;
-    if (x < 26.0) return exp(fmin(x * x, 700.0)) * erfc(x);
-    double inv = 1.0 / x;
-    double inv2 = inv * inv;
-    double poly = 1.0 - 0.5 * inv2 + 0.75 * inv2 * inv2
-        - 1.875 * inv2 * inv2 * inv2
-        + 6.5625 * inv2 * inv2 * inv2 * inv2;
-    return inv * poly / sqrt(M_PI);
-}
-
-__device__ __forceinline__ double normal_pdf(double x) {
-    const double INV_SQRT_2PI = 0.3989422804014327;
-    return INV_SQRT_2PI * exp(-0.5 * x * x);
-}
-
-__device__ __forceinline__ double normal_cdf(double x) {
-    return 0.5 * erfc(-x / M_SQRT2);
-}
-
-__device__ __forceinline__ void sp_logcdf_mills(
-        double x, double* log_cdf, double* mills) {
-    if (x == INFINITY) {
-        *log_cdf = 0.0;
-        *mills = 0.0;
-        return;
-    }
-    if (x == -INFINITY) {
-        *log_cdf = -INFINITY;
-        *mills = INFINITY;
-        return;
-    }
-    if (isnan(x)) {
-        *log_cdf = NAN;
-        *mills = NAN;
-        return;
-    }
-    if (x < 0.0) {
-        double u = -x / M_SQRT2;
-        double scaled = fmax(erfcx_nn(u), 1e-300);
-        *log_cdf = -u * u + log(0.5 * scaled);
-        *mills = sqrt(2.0 / M_PI) / scaled;
-    } else {
-        double cdf = fmin(fmax(normal_cdf(x), 1e-300), 1.0);
-        *log_cdf = log(cdf);
-        *mills = normal_pdf(x) / cdf;
-    }
-}
+// The probability leaves are `gam_gpu::numerics_device::PROBIT_NUMERICS_CU`,
+// which `survival_rowjet_source` prepends: the shared device copy of the CPU
+// `normal_logcdf_derivatives` contract (exact-square erfcx, log1p right tail,
+// and the Laplace continued fraction for the deep-left-tail curvature).
 
 // Order-2 unary stacks: [f, f', f''].
 __device__ __forceinline__ void neglog_phi_stack(
@@ -88,31 +39,31 @@ __device__ __forceinline__ void neglog_phi_stack(
     }
     double log_cdf;
     double mills;
-    sp_logcdf_mills(margin, &log_cdf, &mills);
-    double k1 = -mills;
-    double k2 = mills * (margin + mills);
+    double curvature;
+    log_ndtr_mills_curvature(margin, &log_cdf, &mills, &curvature);
     out[0] = -weight * log_cdf;
-    out[1] = weight * k1;
-    out[2] = weight * k2;
+    out[1] = -weight * mills;
+    out[2] = weight * curvature;
 }
 
+// No floor on the radicand, as on the host (`unary_derivatives_sqrt`,
+// `unary_derivatives_inverse_sqrt`): a corrupted argument surfaces as a
+// non-finite channel instead of a fabricated finite derivative.
 __device__ __forceinline__ void d_sqrt(double x, double out[3]) {
-    double admitted = fmax(x, 1e-300);
-    double root = sqrt(admitted);
+    double root = sqrt(x);
     out[0] = root;
     out[1] = 0.5 / root;
-    out[2] = -0.25 / (admitted * root);
+    out[2] = -0.25 / (x * root);
 }
 
 __device__ __forceinline__ void d_inverse_sqrt(double x, double out[3]) {
-    double admitted = fmax(x, 1e-300);
     // `1.0 / sqrt(x)` and NOT the `rsqrt` intrinsic: the host leaf
     // (`unary_derivatives_inverse_sqrt`) is an IEEE divide of an IEEE square
     // root, and the device/host parity test compares these bit for bit.
-    double reciprocal_root = 1.0 / sqrt(admitted);
+    double reciprocal_root = 1.0 / sqrt(x);
     out[0] = reciprocal_root;
-    out[1] = -0.5 * reciprocal_root / admitted;
-    out[2] = 0.75 * reciprocal_root / (admitted * admitted);
+    out[1] = -0.5 * reciprocal_root / x;
+    out[2] = 0.75 * reciprocal_root / (x * x);
 }
 
 __device__ __forceinline__ void d_log(double x, double out[3]) {

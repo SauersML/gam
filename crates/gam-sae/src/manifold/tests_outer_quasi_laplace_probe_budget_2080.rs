@@ -3493,3 +3493,34 @@ fn k1_checkpoint_evaluations_price_exact_certified_states_3327() {
         "the #3327 checkpoint reaches a majorizer-decrement acceptance the exact information refuses"
     );
 }
+
+#[test]
+fn inner_relative_decrement_refuses_a_non_finite_objective() {
+    // An objective with no finite value has no scale to measure a decrease
+    // against. Pricing it as an infinite scale gave `½λ²/∞ = 0`, which
+    // certified any finite decrement.
+    for objective in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+        for decrement_sq in [0.0, 1.0e-12, 1.0, 1.0e12] {
+            let relative = SaeManifoldTerm::inner_relative_decrement(decrement_sq, objective);
+            assert!(
+                relative.is_nan(),
+                "objective {objective}: ratio {relative} must be NaN"
+            );
+            assert!(
+                !SaeManifoldTerm::inner_decrement_certifies(relative),
+                "objective {objective}, λ² {decrement_sq}: a non-finite objective certified"
+            );
+        }
+    }
+    // A finite objective keeps the `½λ²/(|F| + 1)` scale the certificate reads.
+    assert_eq!(
+        SaeManifoldTerm::inner_relative_decrement(2.0e-9, -3.0),
+        0.5 * 2.0e-9 / 4.0
+    );
+    assert!(SaeManifoldTerm::inner_decrement_certifies(
+        SaeManifoldTerm::inner_relative_decrement(0.0, 1.0e3)
+    ));
+    assert!(!SaeManifoldTerm::inner_decrement_certifies(
+        SaeManifoldTerm::inner_relative_decrement(1.0, 1.0e3)
+    ));
+}

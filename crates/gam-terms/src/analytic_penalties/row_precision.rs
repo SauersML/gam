@@ -301,9 +301,6 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(t) = self.target_matrix(target) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -366,8 +363,15 @@ impl AnalyticPenalty for RowPrecisionPriorPenalty {
 /// Khemakhem et al. (2020) identify nonlinear ICA/iVAE latent factors from
 /// auxiliary-variable variation up to an affine transform under sufficient
 /// variation in `u`. This penalty implements the conditional-mean side of that
-/// signal as `0.5 * μ * ||t - U(UᵀU + εI)⁻¹Uᵀt||²`, penalizing only the
-/// component of each latent axis not explained by a ridge linear fit to `u`.
+/// signal. Per latent axis `t` it is `0.5 * μ * tᵀ(I - P)t` with ridge hat
+/// matrix `P = U(UᵀU + εI)⁻¹Uᵀ`. This equals the minimized ridge objective
+/// `0.5 * μ * min_B (||t - UB||² + ε||B||²)`, so it penalizes the component of
+/// each axis not explained by a ridge linear fit to `u`. It is not the squared
+/// residual `||t - Pt||² = tᵀ(I - P)²t`: `P` is not idempotent when `ε > 0`.
+/// By Woodbury, `I - P = (I + UUᵀ/ε)⁻¹`. So `μ(I - P)` is the precision of the
+/// Gaussian marginal of `t = UB + e` with `B ~ N(0, I/(με))` and
+/// `e ~ N(0, I/μ)`. That is why the learnable-weight normalizer is
+/// `-0.5 * len * ln μ`.
 #[derive(Debug, Clone)]
 pub struct IvaeRidgeMeanGauge {
     pub aux: Array2<f64>,
@@ -676,9 +680,6 @@ impl AnalyticPenalty for IvaeRidgeMeanGauge {
         v: ArrayView1<'_, f64>,
     ) -> Array1<f64> {
         assert_eq!(target.len(), v.len(), "hvp dimension mismatch");
-        if target.len() != v.len() {
-            return Array1::<f64>::zeros(target.len());
-        }
         let Some(v_mat) = self.target_matrix(v) else {
             return Array1::<f64>::zeros(target.len());
         };
@@ -849,7 +850,7 @@ impl ParametricRowPrecisionPriorPenalty {
                     "ParametricRowPrecisionPriorPenalty::new raw_beta[{k}] must be finite"
                 ));
             }
-            let beta_k = gam_linalg::utils::stable_softplus(raw_beta_k);
+            let beta_k = gam_math::special::softplus(raw_beta_k);
             if !(beta_k.is_finite() && beta_k >= 0.0) {
                 return Err(format!(
                     "ParametricRowPrecisionPriorPenalty::new softplus(raw_beta[{k}]) must be finite and >= 0"
@@ -947,7 +948,7 @@ impl ParametricRowPrecisionPriorPenalty {
         // `α = exp(ρ)` on the log-strength domain is positive and `β·r² ≥ 0`, so
         // the conditional precision is positive with nothing added to it.
         let alpha = validated_exp_log_strength(self.active_log_alpha(k, rho));
-        let beta = gam_linalg::utils::stable_softplus(self.active_raw_beta(k, rho));
+        let beta = gam_math::special::softplus(self.active_raw_beta(k, rho));
         alpha + beta * self.dist2(n, k, rho)
     }
 
@@ -1123,8 +1124,8 @@ impl AnalyticPenalty for ParametricRowPrecisionPriorPenalty {
             let log_alpha = self.active_log_alpha(k, rho);
             let alpha = validated_exp_log_strength(log_alpha);
             let raw_beta = self.active_raw_beta(k, rho);
-            let beta = gam_linalg::utils::stable_softplus(raw_beta);
-            let beta_jac = gam_linalg::utils::stable_logistic(raw_beta);
+            let beta = gam_math::special::softplus(raw_beta);
+            let beta_jac = gam_math::special::logistic(raw_beta);
             let mut grad_alpha_direct = 0.0;
             let mut grad_beta_direct = 0.0;
             let mut grad_mu_direct = vec![0.0_f64; du];
