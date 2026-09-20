@@ -2577,9 +2577,14 @@ fn test_pair_block_psd_in_convergent_regime() {
     ];
 
     let mut seed = 0xDEAD_BEEF_u64;
-    let k = 6_usize;
+    // The linear side condition has d + 1 columns, so k centers leave a
+    // constrained space of dimension k - (d + 1). A fixed k = 6 left that space
+    // empty for d = 5 and d = 7 (a 0x0 block is trivially "PSD"), so three of
+    // the four cases checked nothing. Give every case the same nullity.
+    let constrained_dim = 4_usize;
 
     for &(q, d, m, s, kappa) in cases {
+        let k = d + 1 + constrained_dim;
         for _trial in 0..3 {
             let mut centers = Array2::<f64>::zeros((k, d));
             for i in 0..k {
@@ -2593,10 +2598,16 @@ fn test_pair_block_psd_in_convergent_regime() {
 
             let order = DuchonNullspaceOrder::Linear;
             let p_block = polynomial_block_from_order(centers.view(), order);
-            let z = match kernel_constraint_nullspace_from_matrix(p_block.view()) {
-                Ok(z) => z,
-                Err(_) => continue,
-            };
+            let z = kernel_constraint_nullspace_from_matrix(p_block.view()).unwrap_or_else(|e| {
+                panic!("kernel constraint null space failed: q={q} d={d} k={k}: {e:?}")
+            });
+            // Centers are iid uniform, so the (k, d + 1) side-condition block
+            // has full column rank and the null space has exactly this width.
+            assert_eq!(
+                z.ncols(),
+                constrained_dim,
+                "constrained space must be k - (d + 1): q={q} d={d} k={k}"
+            );
 
             let gz = g.dot(&z);
             let zgz = z.t().dot(&gz);
