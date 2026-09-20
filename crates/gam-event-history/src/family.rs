@@ -214,13 +214,19 @@ impl ReferenceTables {
         marks: usize,
         total_nodes: usize,
     ) -> Result<Vec<S>, EventHistoryError> {
+        self.check_carry(held.len(), marks, total_nodes)?;
+        Ok(self.carry_rows(held, marks, 0..total_nodes))
+    }
+
+    /// Whether a held normaliser of `held` entries is conformable with these
+    /// tables and a node set of `total_nodes` nodes.
+    pub(crate) fn check_carry(&self, held: usize, marks: usize, total_nodes: usize) -> Result<(), EventHistoryError> {
         let nodes = self.grid.len();
         let expected = self.strata * nodes * marks;
-        if held.len() != expected {
+        if held != expected {
             return Err(EventHistoryError::InvalidInput {
                 reason: format!(
-                    "a held normaliser of {} entries for {} strata × {nodes} reference nodes × {marks} marks",
-                    held.len(),
+                    "a held normaliser of {held} entries for {} strata × {nodes} reference nodes × {marks} marks",
                     self.strata
                 ),
             });
@@ -233,18 +239,26 @@ impl ReferenceTables {
                 ),
             });
         }
-        let mut out = vec![held[0].constant_like(0.0); total_nodes * marks];
-        for row in 0..total_nodes {
+        Ok(())
+    }
+
+    /// [`Self::carry_to_nodes`] for the node rows `rows` alone, on tables
+    /// [`Self::check_carry`] accepted: a subject reads its own rows where it
+    /// is evaluated instead of every subject's being formed up front.
+    pub(crate) fn carry_rows<S: JetField>(&self, held: &[S], marks: usize, rows: std::ops::Range<usize>) -> Vec<S> {
+        let nodes = self.grid.len();
+        let mut out = Vec::with_capacity(rows.len() * marks);
+        for row in rows {
             let base = self.node_stratum[row] * nodes;
             let lower = (base + self.node_lower[row]) * marks;
             let upper = (base + self.node_lower[row] + 1) * marks;
             let weight = self.node_weight[row];
             for d in 0..marks {
                 let low = &held[lower + d];
-                out[row * marks + d] = low.add(&held[upper + d].sub(low).scale(weight));
+                out.push(low.add(&held[upper + d].sub(low).scale(weight)));
             }
         }
-        Ok(out)
+        out
     }
 }
 

@@ -87,16 +87,24 @@ impl EventHistoryFamily {
         }).collect();
         let normalisers = if let (Some(tables), true) = (self.reference.as_ref(), self.atoms > 0) {
             let values = self.reference_values(beta, loadings, &rates)?;
-            Some(tables.carry_to_nodes(&values.log_normaliser, marks, self.nodes.total_nodes)?)
+            tables.check_carry(values.log_normaliser.len(), marks, self.nodes.total_nodes)?;
+            Some((tables, values.log_normaliser))
         } else { None };
         let results: Result<Vec<S>, EventHistoryError> = self.nodes.subjects.par_iter().map(|subject| {
             let first = subject.first_row;
+            let held = normalisers.as_ref().map(|(tables, held)|
+                tables.carry_rows(held, marks, first..first + subject.len()));
             let mut eta0 = Vec::with_capacity(subject.len() * marks);
             for row in first..first + subject.len() {
                 for d in 0..marks {
+                    // Every channel of the running sum is nonzero or +0 (a sum
+                    // is −0 only when both addends are), so the signed zero a
+                    // zero design entry adds is the identity: skipping it is exact.
                     let mut eta = beta[0].constant_like(0.0);
                     for (j, x) in self.designs[d].row(row).iter().enumerate() {
-                        eta = eta.add(&beta[offsets[d] + j].scale(*x));
+                        if *x != 0.0 {
+                            eta = eta.add(&beta[offsets[d] + j].scale(*x));
+                        }
                     }
                     eta0.push(eta.with_value(states[d].eta[row]));
                 }
@@ -105,8 +113,7 @@ impl EventHistoryFamily {
                 nodes: subject, eta0: &eta0, loadings, rates: &rates,
                 time_scale: self.time_scale, gh: &self.gh, continuation_gap: 0.0,
                 designs: None,
-                log_normaliser: normalisers.as_ref().map(|values|
-                    &values[first * marks..(first + subject.len()) * marks]),
+                log_normaliser: held.as_deref(),
             };
             subject_marginal(&inputs, false).map(|result| result.loglik)
         }).collect();
