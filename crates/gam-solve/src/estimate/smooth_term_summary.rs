@@ -106,10 +106,11 @@ pub fn smooth_term_summary_rows(
         SmoothTestScale::Known
     };
     // The score test's inputs are fit-level and shared by every smooth: `H =
-    // X'WX + S(λ)` and `X'WX` from the one inference block, so both are in the
-    // saved coefficient layout and belong to the same fit. The geometry-frame
-    // Hessian is not a substitute (it may live in a reduced gauge), and neither
-    // is a Gram rebuilt without the fitted weights.
+    // X'WX + S(λ)` and `X'WX` from the one inference block, stored in the
+    // coefficient gauge's active frame and pushed forward to the saved frame
+    // of `beta` and the terms' coefficient ranges, so they belong to the same
+    // fit and the same layout (gam#3346). A Gram rebuilt without the fitted
+    // weights is not a substitute.
     let score_fit = ScoreTestFit::of(fit, residual_df, scale);
 
     let shift = |range: &std::ops::Range<usize>| {
@@ -264,8 +265,8 @@ pub fn smooth_term_summary_rows(
 /// The fit-level inputs of the smooth score test, shared by every term.
 struct ScoreTestFit<'a> {
     beta: ndarray::ArrayView1<'a, f64>,
-    penalized_hessian: &'a Array2<f64>,
-    weighted_gram: &'a Array2<f64>,
+    penalized_hessian: std::borrow::Cow<'a, Array2<f64>>,
+    weighted_gram: std::borrow::Cow<'a, Array2<f64>>,
     covariance_scale: f64,
     residual_df: Option<f64>,
     scale: SmoothTestScale,
@@ -277,20 +278,25 @@ impl<'a> ScoreTestFit<'a> {
         residual_df: Option<f64>,
         scale: SmoothTestScale,
     ) -> Result<Self, SmoothPValueUnavailable> {
-        let inference = fit
-            .inference
-            .as_ref()
-            .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)?;
-        let weighted_gram = inference
-            .weighted_gram
-            .as_ref()
-            .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)?;
+        // Both curvatures are read in the saved frame, the frame of `beta` and
+        // of every term's coefficient range; a fit whose gauge leaves them no
+        // unique saved-frame form has no score test (gam#3346).
+        if fit.inference.is_none() {
+            return Err(SmoothPValueUnavailable::FitCurvatureUnavailable);
+        }
+        let saved = |form: Result<Option<std::borrow::Cow<'a, Array2<f64>>>, String>| {
+            form.ok()
+                .flatten()
+                .ok_or(SmoothPValueUnavailable::FitCurvatureUnavailable)
+        };
+        let penalized_hessian = saved(fit.saved_frame_penalized_hessian())?;
+        let weighted_gram = saved(fit.saved_frame_weighted_gram())?;
         let covariance_scale = fit
             .coefficient_covariance_scale()
             .map_err(|_| SmoothPValueUnavailable::DispersionUnavailable)?;
         Ok(Self {
             beta: fit.beta.view(),
-            penalized_hessian: inference.penalized_hessian.as_array(),
+            penalized_hessian,
             weighted_gram,
             covariance_scale,
             residual_df,
@@ -332,8 +338,8 @@ impl<'a> ScoreTestFit<'a> {
         }
         smooth_score_test(SmoothScoreTestInput {
             beta: self.beta,
-            penalized_hessian: self.penalized_hessian,
-            weighted_gram: self.weighted_gram,
+            penalized_hessian: &self.penalized_hessian,
+            weighted_gram: &self.weighted_gram,
             coeff_range,
             structural_penalties: &structural_penalties,
             covariance_scale: self.covariance_scale,
