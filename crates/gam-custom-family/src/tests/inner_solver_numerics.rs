@@ -2427,6 +2427,59 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
     );
 }
 
+/// gam#3660. The stabilizing shift is the minimal PD shift `δ* = −λ_min` to the
+/// Cholesky certificate's own resolution `floor`, not to a fixed fraction of the
+/// Gershgorin bracket. The fixture is barely indefinite (`λ_min = −1e-6`) with
+/// dense O(1) coupling: `A = Q·diag(1, 1, −1e-6)·Qᵀ` with the Householder
+/// reflector `Q = I − (2/3)·11ᵀ`. Its Gershgorin bound is `−0.111`, so a fixed 12
+/// halvings of that bracket return about `2.7e-5`, 27 times `δ*`.
+#[test]
+pub(crate) fn stabilizing_shift_resolves_barely_indefinite_hessian_to_the_pivot_floor_3660() {
+    let lambda_min = -1.0e-6_f64;
+    let q = Array2::<f64>::eye(3) - Array2::<f64>::from_elem((3, 3), 2.0 / 3.0);
+    let d = Array2::from_diag(&array![1.0_f64, 1.0, lambda_min]);
+    let a = q.dot(&d).dot(&q.t());
+    let gershgorin_min = (0..3)
+        .map(|i| {
+            let radius: f64 = (0..3).filter(|&j| j != i).map(|j| a[[i, j]].abs()).sum();
+            a[[i, i]] - radius
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        gershgorin_min < -0.1,
+        "the fixture's Gershgorin bracket must be O(1) loose; got {gershgorin_min:.3e}"
+    );
+    let ridge_floor = 1.0e-12_f64;
+    let max_diagonal = (0..3).fold(0.0_f64, |m, i| m.max(a[[i, i]].abs()));
+    let floor = ridge_floor.max(gam_linalg::roundoff::accumulation_growth(4) * max_diagonal);
+
+    let shift = exact_newton_stabilizing_shift_psd_penalized(&a, &a, ridge_floor)
+        .expect("an indefinite Hessian must get a stabilizing shift");
+
+    let delta_star = -lambda_min;
+    // The eigenvalues of the assembled `a` differ from `diag` by rounding of
+    // order `ε·‖a‖`, far below `floor`.
+    let rounding = 16.0 * f64::EPSILON;
+    assert!(
+        shift >= delta_star + floor - 2.0 * floor - rounding,
+        "the shift must lift λ_min = {lambda_min:.1e}; got {shift:.6e}"
+    );
+    assert!(
+        shift <= delta_star + 3.0 * floor + rounding,
+        "the shift must be the minimal PD shift {delta_star:.1e} to within 3·floor = {:.1e}; got {shift:.6e} ({:.1}×δ*)",
+        3.0 * floor,
+        shift / delta_star
+    );
+    let mut shifted = a.clone();
+    for i in 0..3 {
+        shifted[[i, i]] += shift;
+    }
+    assert!(
+        shifted.cholesky(Side::Lower).is_ok(),
+        "the shifted Hessian must be Cholesky-factorable"
+    );
+}
+
 #[test]
 pub(crate) fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
     let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
@@ -3833,35 +3886,32 @@ pub(crate) fn exact_newton_dh_closure_rejects_non_finite_directional_derivative(
     assert!(err.to_string().contains("non-finite"), "unexpected error: {err}");
 }
 
+/// The inner solvers take the smallest eigenvalue of a block Hessian with
+/// `fold(f64::INFINITY, f64::min)` (`blockwise_solve.rs`, `fit.rs`,
+/// `inner_blockwise_fit.rs`). `f64::min` silently DROPS a NaN operand, so that
+/// fold is only sound because `FaerEigh::eigh` refuses a non-finite matrix
+/// before any eigenvalue exists. This pins that upstream refusal from the
+/// consumer's side: if `eigh` ever started returning eigenvalues for NaN input,
+/// every one of those folds would report a finite minimum for a poisoned
+/// Hessian.
 #[test]
-pub(crate) fn nan_propagating_min_detects_nan_eigenvalues() {
-    // Verify the fix: our NaN-propagating min correctly detects
-    // NaN eigenvalues, unlike f64::min which silently ignored them.
-    let mut mat = Array2::<f64>::eye(3);
-    mat[[1, 0]] = f64::NAN;
-    mat[[0, 1]] = f64::NAN;
-
-    use gam_linalg::faer_ndarray::FaerEigh;
-    match FaerEigh::eigh(&mat, faer::Side::Lower) {
-        Err(_) => {
-            // eigh failed — the fallback chain in compute_update_step
-            // now catches this and applies a conservative ridge.
-        }
-        Ok((evals, _)) => {
-            // NaN-propagating fold (matches the production code):
-            let new_min = evals.iter().copied().fold(f64::INFINITY, |a, b| {
-                if a.is_nan() || b.is_nan() {
-                    f64::NAN
-                } else {
-                    a.min(b)
-                }
-            });
-            assert!(
-                !new_min.is_finite(),
-                "NaN-propagating min should detect NaN eigenvalues, got {new_min}"
-            );
+pub(crate) fn eigh_refuses_nonfinite_hessian_before_min_eigenvalue_folds() {
+    use gam_linalg::faer_ndarray::{FaerEigh, FaerLinalgError};
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for (row,col) in [(0,0), (0,1), (1,0)] {
+            let mut matrix = Array2::<f64>::eye(3);
+            matrix[[row,col]] = bad;
+            for side in [faer::Side::Lower, faer::Side::Upper] {
+                let error = FaerEigh::eigh(&matrix, side)
+                    .expect_err("the eigenvalue consumer must never see nonfinite input eigenvalues");
+                assert!(matches!(error, FaerLinalgError::SelfAdjointEigenNonFiniteInput { .. }),
+                    "bad={bad}, position=({row},{col}): {error}");
+            }
         }
     }
+    let (values, _) = FaerEigh::eigh(&Array2::<f64>::eye(3), faer::Side::Lower)
+        .expect("the same finite control must remain accepted");
+    assert!(values.iter().all(|&value| value == 1.0));
 }
 
 #[test]

@@ -4,8 +4,7 @@
 //! currencies:
 //!
 //!   * the tiered driver's `MigrationLedger` (`tiered/fit.rs`) — promotions /
-//!     demotions / deaths priced in a `dl_bits` description-length charge, plus
-//!     the `pc_reseed_events == 0` invariant; and
+//!     demotions / deaths priced in a `dl_bits` description-length charge; and
 //!   * the structure-search stream (`structure_harvest.rs` →
 //!     `gam_solve::structure_search::SearchLedger`) — births / deaths / fusions /
 //!     fissions / glues adjudicated by an e-process and priced in a banked
@@ -15,22 +14,17 @@
 //! refused, and the move pays evidence. [`SaeMigrationLedger`] is that one
 //! currency. A move is a [`SaeMove`] — `Birth` (residual → linear → curved),
 //! `Death` (the reverse fall back to the residual-factor pool), `Refuse` (a
-//! proposed move the evidence did not buy), or `Admit` (a proposed move the
-//! evidence bought that the fit reports without installing) — and every move carries the single
+//! proposed move the evidence did not buy), `Admit` (a proposed move the
+//! evidence bought that the fit reports without installing), or `Restructure` (an
+//! installed move that adds and removes no atom) — and every move carries the single
 //! [`MoveEvidence`] currency: a REML/LAML criterion delta, the rank/complexity
 //! charge it spends, and the net description-length change in **bits** (`dl_bits`)
 //! that unifies the tiered `curved_charge` and the e-process `log_e` (a log-e
 //! value in nats is a description-length saving; [`bits_from_nats`] converts it).
 //!
-//! The ledger carries the architecture's global invariant as a counter:
-//! `pc_reseed_events` MUST be `0` — every birth seeds from the residual-factor
-//! pool, never from a principal component. A stray PC seed is not silently
-//! dropped; it is recorded as [`BirthSeed::PrincipalComponent`] and increments
-//! [`SaeMigrationLedger::pc_reseed_events`].
-
 use std::collections::HashMap;
 
-use gam_solve::structure_search::{MoveVerdict, SearchLedger, StructureMove};
+use gam_solve::structure_search::{ChartGlueOutcome, MoveVerdict, SearchLedger, StructureMove};
 
 /// Natural-log base, the nats → bits conversion constant (`ln 2`).
 const LN_2: f64 = std::f64::consts::LN_2;
@@ -70,30 +64,21 @@ impl MoveStage {
 }
 
 /// Where a [`SaeMove::Birth`] seeded from. The residual-factor pool is the ONLY
-/// admissible source; every other variant is an accounting record of a seed that
-/// must NOT occur, kept so it is loud rather than silent.
+/// admissible source of new structure; the atom-derived variants record a birth
+/// that copies or promotes an atom already in the dictionary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BirthSeed {
     /// The residual-factor subspace (worst-reconstructed residual directions /
-    /// rows). The architecture's only sanctioned birth seed.
+    /// rows). The architecture's only sanctioned seed of new structure.
     ResidualFactor,
     /// Promoted from an existing linear atom (linear → curved co-fit promotion).
     LinearAtom,
-    /// Promoted / refined from an existing curved chart.
+    /// Promoted / refined from an existing curved chart, or a fission child
+    /// cloned from the chart it splits.
     CurvedChart,
-    /// A principal-component reseed — FORBIDDEN. Present only so a stray PC seed
-    /// is recorded and trips [`SaeMigrationLedger::pc_reseed_events`]; the tiered
-    /// and structure-search paths never emit it.
-    PrincipalComponent,
 }
 
 impl BirthSeed {
-    /// `true` for the one forbidden seed (a principal-component reseed).
-    #[must_use]
-    pub(crate) fn is_pc_reseed(self) -> bool {
-        matches!(self, BirthSeed::PrincipalComponent)
-    }
-
     /// Stable integer legend for FFI marshalling.
     #[must_use]
     pub fn code(self) -> u64 {
@@ -101,7 +86,6 @@ impl BirthSeed {
             BirthSeed::ResidualFactor => 0,
             BirthSeed::LinearAtom => 1,
             BirthSeed::CurvedChart => 2,
-            BirthSeed::PrincipalComponent => 3,
         }
     }
 }
@@ -167,8 +151,7 @@ impl MoveEvidence {
 #[derive(Clone, Debug, PartialEq)]
 pub enum SaeMove {
     /// An atom was born onto `stage` from `seed`. On the sanctioned path `seed`
-    /// is [`BirthSeed::ResidualFactor`] (or a linear/curved promotion); a PC
-    /// reseed here trips the invariant.
+    /// is [`BirthSeed::ResidualFactor`] (or a linear/curved promotion).
     Birth { stage: MoveStage, seed: BirthSeed },
     /// An atom on `stage` died and fell back toward the residual-factor pool,
     /// for `reason`.
@@ -187,6 +170,9 @@ pub enum SaeMove {
     /// community's curved replacement in bits and mutates nothing, so its accepted
     /// proposals are admitted moves: no atom joined the model, and nothing was refused.
     Admit { stage: MoveStage, seed: BirthSeed },
+    /// An installed move on `stage` that adds and removes no atom: an atlas
+    /// registration keeps both charts and records the transition between them.
+    Restructure { stage: MoveStage },
 }
 
 impl SaeMove {
@@ -197,7 +183,8 @@ impl SaeMove {
             SaeMove::Birth { stage, .. }
             | SaeMove::Death { stage, .. }
             | SaeMove::Refuse { stage, .. }
-            | SaeMove::Admit { stage, .. } => *stage,
+            | SaeMove::Admit { stage, .. }
+            | SaeMove::Restructure { stage } => *stage,
         }
     }
 }
@@ -210,6 +197,9 @@ pub enum MoveReason {
     /// A linear block / atom ended dead — no row selected it — and fell back to
     /// the residual-factor pool.
     DeadRouting,
+    /// An accepted fusion or chart glue folded this atom's routing mass into the
+    /// surviving atom of the pair.
+    Fused,
     /// A curved candidate's evidence did not beat the linear/flat alternative;
     /// the simpler atom is kept (the co-fit's `Θ→0` verdict).
     EvidenceInsufficient,
@@ -251,18 +241,13 @@ pub struct MigrationMove {
 }
 
 /// The unified migration ledger: every birth / death / refusal, in order, plus
-/// the running tallies and the `pc_reseed_events == 0` global invariant. Replaces
+/// the running tallies. Replaces
 /// the tiered `MigrationLedger` and subsumes the structure-search move stream and
 /// the sparse-dict dead-atom revival into one accounting currency.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SaeMigrationLedger {
     /// The adjudicated moves in order.
     pub moves: Vec<MigrationMove>,
-    /// Principal-component reseed events. **Must be `0`** — births only draw from
-    /// the residual-factor pool. Incremented whenever a birth records
-    /// [`BirthSeed::PrincipalComponent`] so callers can assert the "no PC reseed
-    /// in the log" acceptance bar.
-    pub pc_reseed_events: usize,
     /// Total births (residual → linear → curved).
     pub n_births: usize,
     /// Total deaths (fell back toward the residual-factor pool).
@@ -271,6 +256,8 @@ pub struct SaeMigrationLedger {
     pub n_refusals: usize,
     /// Total admitted moves (the evidence bought them; the fit did not install them).
     pub n_admitted: usize,
+    /// Total installed moves that added and removed no atom (atlas registrations).
+    pub n_restructures: usize,
 }
 
 impl SaeMigrationLedger {
@@ -280,19 +267,14 @@ impl SaeMigrationLedger {
         Self::default()
     }
 
-    /// Record one move, updating the tallies and tripping `pc_reseed_events` if it
-    /// is a forbidden principal-component birth.
+    /// Record one move, updating the tallies.
     pub fn record(&mut self, mv: MigrationMove) {
         match &mv.kind {
-            SaeMove::Birth { seed, .. } => {
-                self.n_births += mv.count;
-                if seed.is_pc_reseed() {
-                    self.pc_reseed_events += mv.count;
-                }
-            }
+            SaeMove::Birth { .. } => self.n_births += mv.count,
             SaeMove::Death { .. } => self.n_deaths += mv.count,
             SaeMove::Refuse { .. } => self.n_refusals += mv.count,
             SaeMove::Admit { .. } => self.n_admitted += mv.count,
+            SaeMove::Restructure { .. } => self.n_restructures += mv.count,
         }
         self.moves.push(mv);
     }
@@ -378,9 +360,27 @@ impl SaeMigrationLedger {
         });
     }
 
-    /// The ledger as a JSON record for a fitted model's payload: the tallies, the
-    /// `pc_reseed_events` invariant, and every move with its stage and seed or
-    /// reason, count, round and evidence. Unscored evidence (`NaN`) is `null`.
+    /// Record an installed move on `stage` that adds and removes no atom.
+    pub fn restructure(
+        &mut self,
+        stage: MoveStage,
+        count: usize,
+        round: Option<usize>,
+        evidence: MoveEvidence,
+        objective: f64,
+    ) {
+        self.record(MigrationMove {
+            kind: SaeMove::Restructure { stage },
+            round,
+            count,
+            evidence,
+            objective,
+            predicted_dl_bits: None,
+        });
+    }
+
+    /// The ledger as a JSON record for a fitted model's payload: the tallies and
+    /// every move with its stage, seed or reason, count, round and evidence. Unscored evidence (`NaN`) is `null`.
     #[must_use]
     pub fn to_json(&self) -> serde_json::Value {
         let moves = self
@@ -392,6 +392,7 @@ impl SaeMigrationLedger {
                     SaeMove::Death { stage, reason } => ("death", stage, None, Some(reason)),
                     SaeMove::Refuse { stage, reason } => ("refuse", stage, None, Some(reason)),
                     SaeMove::Admit { stage, seed } => ("admitted", stage, Some(*seed), None),
+                    SaeMove::Restructure { stage } => ("restructure", stage, None, None),
                 };
                 serde_json::json!({
                     "kind": kind,
@@ -413,14 +414,22 @@ impl SaeMigrationLedger {
             "n_deaths": self.n_deaths,
             "n_refusals": self.n_refusals,
             "n_admitted": self.n_admitted,
-            "pc_reseed_events": self.pc_reseed_events,
+            "n_restructures": self.n_restructures,
             "moves": moves,
         })
     }
 
     /// Fold one structure-search round's [`SearchLedger`] into the unified
     /// currency, mapping each adjudicated move + verdict onto a birth / death /
-    /// refusal priced by the banked e-process evidence (`bits_from_nats(log_e)`).
+    /// refusal / restructure priced by the banked e-process evidence
+    /// (`bits_from_nats(log_e)`). An accepted move is booked by what
+    /// `apply_structure_move` does to the dictionary, so across the accepted
+    /// moves `births − deaths` tracks additions less demotions: a residual-factor
+    /// birth adds an atom seeded from the residual pool; a fission adds a child
+    /// cloned from an existing curved chart; a fusion and a destructive glue
+    /// fold one atom into the other (a death); an atlas registration keeps both
+    /// charts (a restructure). Demotions retain index-stable slots within the
+    /// round; this is not the immediate change in the atom vector length.
     /// Keeps the e-process gating untouched — this is the read-out of its
     /// verdicts into the one move currency, not a second gate.
     ///
@@ -447,27 +456,53 @@ impl SaeMigrationLedger {
                 _ => None,
             };
             match &record.verdict {
-                // An accepted birth / fission / fusion / glue is a birth from the
-                // residual-factor pool (structure search never PC-reseeds); an
-                // accepted death is a demotion recorded below.
-                MoveVerdict::Accepted { log_e } => match &record.mv {
-                    StructureMove::Death { .. } => self.death(
-                        stage,
-                        MoveReason::DeadRouting,
-                        1,
-                        Some(round),
-                        MoveEvidence::from_log_e(*log_e),
-                        f64::NAN,
-                    ),
-                    _ => self.birth(
-                        stage,
-                        BirthSeed::ResidualFactor,
-                        1,
-                        Some(round),
-                        MoveEvidence::from_log_e(*log_e),
-                        f64::NAN,
-                    ),
-                },
+                // Structure search never PC-reseeds: a birth seeds from the
+                // residual-factor pool and a fission from the chart it splits.
+                MoveVerdict::Accepted { log_e } => {
+                    let evidence = MoveEvidence::from_log_e(*log_e);
+                    match &record.mv {
+                        StructureMove::Birth { .. } => self.birth(
+                            stage,
+                            BirthSeed::ResidualFactor,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Fission { .. } => self.birth(
+                            stage,
+                            BirthSeed::CurvedChart,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Death { .. } => self.death(
+                            stage,
+                            MoveReason::DeadRouting,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Fusion { .. }
+                        | StructureMove::Glue {
+                            outcome: ChartGlueOutcome::Fuse,
+                            ..
+                        } => self.death(
+                            stage,
+                            MoveReason::Fused,
+                            1,
+                            Some(round),
+                            evidence,
+                            f64::NAN,
+                        ),
+                        StructureMove::Glue {
+                            outcome: ChartGlueOutcome::RegisterAtlas,
+                            ..
+                        } => self.restructure(stage, 1, Some(round), evidence, f64::NAN),
+                    }
+                }
                 // A never-certified atom demoted to ~0 routing: a death.
                 MoveVerdict::Demoted { log_e } => self.death(
                     stage,
@@ -548,75 +583,6 @@ mod ledger_tests {
         assert!((bits_from_nats(2.0 * LN_2) - 2.0).abs() < 1e-12);
     }
 
-    /// #2023 — the `pc_reseed_events == 0` bar, with the POSITIVE control it has
-    /// never had.
-    ///
-    /// `BirthSeed::PrincipalComponent` is constructed nowhere in the tree: every
-    /// occurrence at `origin/main` is this enum's own definition, its own
-    /// `matches!`, its own `code()` arm, and doc comments. So every existing
-    /// assertion that `pc_reseed_events == 0` is satisfied by a counter that no
-    /// code path can increment — a guard nobody has watched fail, which is
-    /// indistinguishable from a guard that cannot fail.
-    ///
-    /// This test makes the guard real from both sides: it FORCES the forbidden
-    /// seed and requires the counter to fire, then runs the sanctioned seed
-    /// through the identical call and requires the counter to stay at zero. A
-    /// counter wired to a constant fails the first arm; a counter incremented by
-    /// every birth fails the second.
-    #[test]
-    fn pc_reseed_bar_fires_on_the_forbidden_seed_and_passes_the_sanctioned_one_2023() {
-        // NEGATIVE control: the architecture's only sanctioned birth seed.
-        let mut sanctioned = SaeMigrationLedger::new();
-        sanctioned.birth(
-            MoveStage::Curved,
-            BirthSeed::ResidualFactor,
-            3,
-            Some(0),
-            MoveEvidence::none(),
-            f64::NAN,
-        );
-        assert_eq!(
-            sanctioned.n_births, 3,
-            "#2023: a residual-factor birth must still be counted as a birth"
-        );
-        assert_eq!(
-            sanctioned.pc_reseed_events, 0,
-            "#2023: the sanctioned seed must not trip the PC-reseed counter"
-        );
-
-        // POSITIVE control: the seed the architecture forbids. Without this arm
-        // the assertions above are vacuous.
-        let mut forbidden = SaeMigrationLedger::new();
-        forbidden.birth(
-            MoveStage::Curved,
-            BirthSeed::PrincipalComponent,
-            2,
-            Some(0),
-            MoveEvidence::none(),
-            f64::NAN,
-        );
-        assert_eq!(
-            forbidden.pc_reseed_events, 2,
-            "#2023: the counter must count the MULTIPLICITY of a forbidden birth, \
-             not merely that one occurred"
-        );
-
-        // A forbidden birth must not be laundered by a later sanctioned one: the
-        // bar is over the whole history, not the last move.
-        forbidden.birth(
-            MoveStage::Curved,
-            BirthSeed::ResidualFactor,
-            1,
-            Some(1),
-            MoveEvidence::none(),
-            f64::NAN,
-        );
-        assert_eq!(
-            forbidden.pc_reseed_events, 2,
-            "#2023: a later sanctioned birth cannot clear an earlier forbidden one"
-        );
-    }
-
     /// #2023 criterion 3: an admitted move (a census verdict the fit does not install)
     /// is counted apart from births and refusals, and the payload record names it.
     #[test]
@@ -632,8 +598,8 @@ mod ledger_tests {
         );
         assert_eq!(ledger.n_admitted, 2);
         assert_eq!(
-            (ledger.n_births, ledger.n_deaths, ledger.n_refusals, ledger.pc_reseed_events),
-            (0, 0, 0, 0),
+            (ledger.n_births, ledger.n_deaths, ledger.n_refusals),
+            (0, 0, 0),
             "an admitted move adds no atom and refuses nothing"
         );
         let record = ledger.to_json();
@@ -645,4 +611,98 @@ mod ledger_tests {
         );
     }
 
+    /// #3771: an accepted structure move is booked by what it does to the
+    /// dictionary, so `births − deaths` over the accepted moves counts additions
+    /// less demotions (+1 birth, +1 fission, −1 fusion, −1 fuse glue, 0 atlas
+    /// registration, −1 death = −1), and no merge is reported as a birth.
+    #[test]
+    fn accepted_structure_moves_are_booked_by_their_atom_count_change_3771() {
+        use gam_solve::structure_search::MoveRecord;
+        use gam_terms::inference::structure_evidence::ClaimKind;
+        let accepted = |mv: StructureMove| MoveRecord {
+            mv,
+            trigger: 0.0,
+            structure_hash: 0,
+            claim: ClaimKind::Custom {
+                label: String::new(),
+            },
+            verdict: MoveVerdict::Accepted { log_e: LN_2 },
+        };
+        let search = SearchLedger {
+            alpha: 0.05,
+            moves: vec![
+                accepted(StructureMove::Birth { candidate: 0 }),
+                accepted(StructureMove::Fission { atom: 0 }),
+                accepted(StructureMove::Fusion { a: 0, b: 1 }),
+                accepted(StructureMove::Glue {
+                    a: 0,
+                    b: 2,
+                    outcome: ChartGlueOutcome::Fuse,
+                }),
+                accepted(StructureMove::Glue {
+                    a: 0,
+                    b: 3,
+                    outcome: ChartGlueOutcome::RegisterAtlas,
+                }),
+                accepted(StructureMove::Death { atom: 4 }),
+            ],
+            collapse_events: Vec::new(),
+        };
+        let mut ledger = SaeMigrationLedger::new();
+        ledger.record_search_round(0, &search, &HashMap::new());
+
+        assert_eq!(
+            ledger.moves.len(),
+            6,
+            "every verdict records exactly one move"
+        );
+        assert_eq!(
+            (
+                ledger.n_births,
+                ledger.n_deaths,
+                ledger.n_restructures,
+                ledger.n_refusals
+            ),
+            (2, 3, 1, 0)
+        );
+        assert_eq!(ledger.n_births as isize - ledger.n_deaths as isize, -1);
+        let kinds: Vec<SaeMove> = ledger.moves.iter().map(|mv| mv.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SaeMove::Birth {
+                    stage: MoveStage::Curved,
+                    seed: BirthSeed::ResidualFactor,
+                },
+                SaeMove::Birth {
+                    stage: MoveStage::Curved,
+                    seed: BirthSeed::CurvedChart,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::Fused,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::Fused,
+                },
+                SaeMove::Restructure {
+                    stage: MoveStage::Curved,
+                },
+                SaeMove::Death {
+                    stage: MoveStage::Curved,
+                    reason: MoveReason::DeadRouting,
+                },
+            ]
+        );
+        for mv in &ledger.moves {
+            assert_eq!(
+                mv.evidence.dl_bits, 1.0,
+                "ln 2 nats of banked evidence is one bit"
+            );
+        }
+        let record = ledger.to_json();
+        assert_eq!(record["n_restructures"].as_u64(), Some(1));
+        assert_eq!(record["moves"][4]["kind"].as_str(), Some("restructure"));
+    }
 }

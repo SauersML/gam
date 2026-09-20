@@ -292,14 +292,17 @@ impl SphereTangentEmbedding {
 
 /// Build an orthonormal basis `E` (`V × (V-1)`) of the hyperplane orthogonal to
 /// the unit vector `axis`, via a single Householder reflector that maps a pivot
-/// standard basis vector onto `axis`.
+/// standard basis vector onto `±axis`.
 ///
-/// The reflector `H = I − 2vvᵀ` with `v = (e_p − axis)/‖e_p − axis‖` maps
-/// `e_p ↦ axis` and is orthogonal, so `{H e_j : j ≠ p}` are orthonormal and each
-/// orthogonal to `H e_p = axis`. The pivot `p = argmax_j |axis_j|` maximizes
-/// `‖e_p − axis‖` (it is `≥ √(1 − 1/V) > 0` for a unit vector), so the reflector
-/// is always well-conditioned — no near-zero denominator even when `axis` nearly
-/// coincides with a coordinate direction.
+/// The reflector `H = I − 2wwᵀ` with `w = (axis + s·e_p)/‖axis + s·e_p‖`,
+/// `s = sign(axis_p)`, maps `e_p ↦ −s·axis` and is orthogonal, so
+/// `{H e_j : j ≠ p}` are orthonormal and each orthogonal to `axis`. The sign is
+/// the one that ADDS magnitudes in the pivot entry, `axis_p + s = s(|axis_p| + 1)`,
+/// so `‖axis + s·e_p‖² = 2(1 + |axis_p|) ≥ 2` and no entry of `w` is formed by
+/// cancellation. The opposite sign, `e_p − axis`, subtracts `1 − |axis_p|`, which
+/// cancels exactly when `axis` nearly coincides with a coordinate direction — the
+/// pivot `p = argmax_j |axis_j|` makes `|axis_p|` as large as possible, so that
+/// choice would sit on the cancelling side for every basepoint.
 fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>, String> {
     let v = axis.len();
     if v < 2 {
@@ -315,18 +318,17 @@ fn tangent_basis_orthogonal_to(axis: ArrayView1<'_, f64>) -> Result<Array2<f64>,
             pivot = j;
         }
     }
-    // w = e_pivot − axis; normalize to the Householder unit vector.
+    // w = axis + sign(axis_pivot)·e_pivot, normalized: the pivot entry adds
+    // magnitudes, so ‖w‖ ≥ √2 for a unit axis and w carries no cancellation.
     let mut w = axis.to_owned();
-    w.mapv_inplace(|value| -value);
-    w[pivot] += 1.0;
+    w[pivot] += 1.0_f64.copysign(axis[pivot]);
     let w_norm = f64::sqrt(w.dot(&w));
-    if !(w_norm > 0.0) {
-        // Only possible if axis == e_pivot exactly; then the tangent basis is
-        // just the other coordinate axes, so use a zero reflector (H = I).
-        w.fill(0.0);
-    } else {
-        w.mapv_inplace(|value| value / w_norm);
+    if !(w_norm.is_finite() && w_norm > 0.0) {
+        return Err(format!(
+            "tangent_basis_orthogonal_to: axis is not a finite unit vector (‖axis + s·e_p‖ = {w_norm})"
+        ));
     }
+    w.mapv_inplace(|value| value / w_norm);
     // Columns H e_j = e_j − 2 w w_j for j ≠ pivot.
     let mut basis = Array2::<f64>::zeros((v, v - 1));
     let mut col = 0usize;
@@ -662,6 +664,33 @@ mod tests {
                     "EᵀE[{i},{j}] = {} != {expected}",
                     gram[[i, j]]
                 );
+            }
+        }
+    }
+
+    /// A basepoint that nearly coincides with a coordinate direction (every row
+    /// concentrated on one token) keeps the tangent basis orthogonal to it at
+    /// round-off relative to the axis's small entries, not at `√ε` absolute.
+    #[test]
+    fn tangent_basis_stays_orthogonal_to_a_near_coordinate_axis() {
+        for &small in &[1e-3_f64, 1e-6, 1e-8, 1e-10] {
+            let mut axis = Array1::<f64>::from(vec![small, 1.0, 0.5 * small, 0.3 * small]);
+            let norm = axis.dot(&axis).sqrt();
+            axis.mapv_inplace(|v| v / norm);
+            let e = tangent_basis_orthogonal_to(axis.view()).unwrap();
+            for col in 0..e.ncols() {
+                let dot = e.column(col).dot(&axis);
+                assert!(
+                    dot.abs() <= 1e-14 * small,
+                    "axis minority scale {small}: column {col} has axis component {dot}"
+                );
+            }
+            let gram = e.t().dot(&e);
+            for i in 0..e.ncols() {
+                for j in 0..e.ncols() {
+                    let expected = if i == j { 1.0 } else { 0.0 };
+                    assert!((gram[[i, j]] - expected).abs() < 1e-14);
+                }
             }
         }
     }

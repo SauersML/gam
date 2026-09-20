@@ -12,8 +12,10 @@
 //! projected factor columns `f_c = J_i·F·e_c`; every pair is then
 //! `t_i·u_i + d_a,iᵀ·N_i·d_b,i`. That is one fourth contraction per row and
 //! factor column, each at a repeated direction and so needing no symmetrizing
-//! second orientation. Forming the drifts instead takes two fourth contractions
-//! and one third per row and pair.
+//! second orientation. `N_i` depends on `F` only through `G_i`, so a factor
+//! wider than the row's `r` primaries is replaced by the `r` columns
+//! `√λ_k·v_k` of `G_i`'s eigenpairs. Forming the drifts instead takes two fourth
+//! contractions and one third per row and pair.
 //!
 //! An empirical flex row with fewer directions than primaries skips `N_i`: its
 //! jets take the directions themselves as free axes, so each factor column's
@@ -113,12 +115,16 @@ impl BernoulliMarginalSlopeFamily {
         let project_onto_directions =
             self.effective_flex_active(block_states)? && m < primary.total;
         let started = std::time::Instant::now();
-        // A row costs one fourth contraction per factor column, so the fold
-        // declares that work and its leaves fan across the pool even at a few
-        // hundred rows. The tree is a function of the row count and rank alone.
+        // `N_i` is linear in the row's gram `G_i`, so its seeds may be the
+        // columns of any root of `G_i`. Past `r` factor columns they are the
+        // gram's own eigendirections, `r` of them (gam#2922).
+        let seed_rank = rank.min(primary.total);
+        // A row costs one fourth contraction per seed, so the fold declares that
+        // work and its leaves fan across the pool even at a few hundred rows.
+        // The tree is a function of the row count and seed count alone.
         let traces = gam_linalg::pairwise_reduce::par_deterministic_try_block_fold_by_work(
             weighted_rows.len(),
-            rank,
+            seed_rank,
             |index_range| -> Result<Vec<f64>, String> {
                 // Each block runs on a Rayon worker: keep the row kernels' own
                 // parallelism sequential so they do not re-fan the pool.
@@ -126,6 +132,7 @@ impl BernoulliMarginalSlopeFamily {
                     let r = primary.total;
                     let mut acc = vec![0.0; pairs.len()];
                     let mut projection = vec![0.0; r * rank];
+                    let mut gram_root = vec![0.0; r * r];
                     let mut seed = Array1::<f64>::zeros(r);
                     for weighted_row in &weighted_rows[index_range] {
                         let row = weighted_row.index;
@@ -138,6 +145,12 @@ impl BernoulliMarginalSlopeFamily {
                             &mut projection,
                         )?;
                         let gram = Self::row_primary_gram_from_projection(r, rank, &projection);
+                        let seeds: &[f64] = if rank > r {
+                            Self::row_primary_gram_root(r, &gram, &mut gram_root)?;
+                            &gram_root
+                        } else {
+                            &projection
+                        };
                         let trace_gradient = self.row_primary_third_trace_gradient_with_moments(
                             row,
                             block_states,
@@ -165,15 +178,15 @@ impl BernoulliMarginalSlopeFamily {
                                 primary,
                                 row_ctx,
                                 &grid,
-                                &projection,
-                                rank,
+                                seeds,
+                                seed_rank,
                                 &row_directions,
                             )?,
                             None => {
                                 let mut contracted = Array2::<f64>::zeros((r, r));
-                                for column in 0..rank {
+                                for column in 0..seed_rank {
                                     for (axis, value) in seed.iter_mut().enumerate() {
-                                        *value = projection[axis * rank + column];
+                                        *value = seeds[axis * seed_rank + column];
                                     }
                                     if seed.iter().all(|value| *value == 0.0) {
                                         continue;
@@ -226,6 +239,30 @@ impl BernoulliMarginalSlopeFamily {
             started.elapsed().as_secs_f64(),
         );
         Ok(Array1::from_vec(traces))
+    }
+
+    /// A root `R` of the row gram, `R·Rᵀ = G`, written row-major `r × r` into
+    /// `root`: column `k` is `√λ_k·v_k` over the gram's eigenpairs. The gram is
+    /// PSD by construction, so a negative eigenvalue is eigensolver rounding and
+    /// its root is taken at zero, as in `penalty_subspace_trace_factor`.
+    fn row_primary_gram_root(r: usize, gram: &[f64], root: &mut [f64]) -> Result<(), String> {
+        let symmetric = Array2::from_shape_fn((r, r), |(a, b)| gram[a * r + b]);
+        let (values, vectors) =
+            gam_linalg::faer_ndarray::FaerEigh::eigh(&symmetric, faer::Side::Lower).map_err(
+                |error| {
+                    format!(
+                        "bernoulli marginal-slope second correction traces: row gram \
+                         eigendecomposition failed: {error}"
+                    )
+                },
+            )?;
+        for (column, &value) in values.iter().enumerate() {
+            let scale = value.max(0.0).sqrt();
+            for axis in 0..r {
+                root[axis * r + column] = vectors[[axis, column]] * scale;
+            }
+        }
+        Ok(())
     }
 
     /// `Σ_c T4_i[f_c, f_c, d_a, d_b]` over one empirical flex row's projected

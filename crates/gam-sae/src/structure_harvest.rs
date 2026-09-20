@@ -256,7 +256,7 @@ fn per_atom_max_mass(term: &SaeManifoldTerm) -> Array1<f64> {
 /// number of significant directions (the #2233 span estimate `ŝ` when the spectrum
 /// is the residual factor-energy set). `1.0` for a single direction (or an
 /// all-but-one-zero spectrum); `0.0` for an empty / all-zero spectrum.
-fn participation_ratio(spectrum: &[f64]) -> f64 {
+pub(crate) fn participation_ratio(spectrum: &[f64]) -> f64 {
     let sum: f64 = spectrum.iter().map(|&e| e.max(0.0)).sum();
     let sum_sq: f64 = spectrum.iter().map(|&e| e.max(0.0) * e.max(0.0)).sum();
     if sum_sq > 0.0 {
@@ -285,7 +285,11 @@ fn participation_ratio(spectrum: &[f64]) -> f64 {
 /// plan is what makes that unrepeatable — `SaeAtomGeometryPlan::new` refuses the
 /// chart form `(Sphere, latent_dim = 2, ..)` outright, so a price on an
 /// unbuildable atom is now a hard error here instead of a silent literal.
-fn curved_topology_for_span(span: f64) -> Result<(usize, usize), String> {
+///
+/// This and [`participation_ratio`] are the ONE span estimate and span→topology
+/// map of the #2233 pre-screen; the compression-promotion producer
+/// ([`crate::manifold::curve_promotion`]) reads both from here.
+pub(crate) fn curved_topology_for_span(span: f64) -> Result<(usize, usize), String> {
     let plan = SaeAtomGeometryPlan::curved_prescreen_atom_for_span(span)?;
     Ok((plan.intrinsic_dim(), plan.basis_size()?))
 }
@@ -2452,18 +2456,9 @@ fn fold_atom_into(term: &mut SaeManifoldTerm, a: usize, b: usize) -> Result<(), 
         let la = term.assignment.logits[[row, a]];
         let lb = term.assignment.logits[[row, b]];
         term.assignment.logits[[row, a]] = if softmax_routing {
-            // Numerically stable logsumexp. When BOTH logits are -∞ (two rows of
-            // zero softmax mass — a hard-masked/dead pair), `m = -∞` makes
-            // `la - m = -∞ - (-∞) = NaN`, and the NaN poisons the whole logits
-            // row (every subsequent softmax over it is NaN). The combined mass of
-            // two zero-mass atoms is exactly zero, i.e. logit -∞ — return that
-            // directly instead of computing NaN.
-            let m = la.max(lb);
-            if m == f64::NEG_INFINITY {
-                f64::NEG_INFINITY
-            } else {
-                m + ((la - m).exp() + (lb - m).exp()).ln()
-            }
+            // Two zero-mass atoms (both logits -∞, a hard-masked/dead pair) fuse
+            // to zero mass, logit -∞, not the NaN of `-∞ - (-∞)`.
+            gam_math::special::logaddexp(la, lb)
         } else {
             la.max(lb)
         };
@@ -4626,7 +4621,13 @@ fn race_birth_topology(
         Some(SaeAtomBasisKind::EuclideanPatch)
     );
     let intrinsic_winner = if template_is_sheet {
-        challenger_race(race_intrinsic_coords(target, weights, d_k, atlas.as_ref()))?
+        challenger_race(race_intrinsic_coords(
+            target,
+            weights,
+            d_k,
+            local_atlas.as_ref(),
+            atlas.as_ref(),
+        ))?
     } else {
         None
     };
@@ -4815,10 +4816,16 @@ fn race_template_coords(
 /// with the template race), and race the SAME topology candidate set on those
 /// unfolded coordinates. Returns the winning fit and its TK evidence, or `None`
 /// when the embedding is degenerate or no candidate is realizable.
+///
+/// `local_atlas` is the birth atlas `race_birth_topology` built on this same
+/// `target`; when its chart rank is `d_k`, `LocalAtlas::build` already computed
+/// this exact embedding (same kNN graph, same geodesic MDS) to audit its cover,
+/// so it is read back rather than recomputed.
 fn race_intrinsic_coords(
     target: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
     d_k: usize,
+    local_atlas: Option<&crate::manifold::LocalAtlas>,
     atlas: Option<&AtlasTopologyReadout>,
 ) -> Result<Option<TopologyRaceOutcome>, TopologyRaceError> {
     // Folds are a d ≥ 2 story: a 1-D manifold has no ambient fold a geodesic
@@ -4828,7 +4835,16 @@ fn race_intrinsic_coords(
     if d_k < 2 || target.nrows() < 3 {
         return Ok(None);
     }
-    let embed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
+    let computed;
+    let embed = match local_atlas {
+        Some(local_atlas) if local_atlas.intrinsic_dim() == d_k => {
+            local_atlas.intrinsic_coordinates()
+        }
+        _ => {
+            computed = crate::manifold::intrinsic_geodesic_embedding(target, d_k)?;
+            &computed
+        }
+    };
     let n = embed.nrows();
     let d = embed.ncols();
     if n == 0 || d == 0 {
@@ -7121,8 +7137,7 @@ pub struct StructureSearchResult {
     /// birth / death / refusal priced in the shared `dl_bits` description-length
     /// unit (the e-process `log_e` banked as bits). This is a read-out of the
     /// e-process verdicts in [`Self::rounds`] — the e-BH gating is untouched and
-    /// still owns acceptance — and carries the `pc_reseed_events == 0` invariant
-    /// (structure births seed from the residual-factor pool, never a PC).
+    /// still owns acceptance. Structure births seed from the residual-factor pool.
     pub migration: SaeMigrationLedger,
 }
 
@@ -7373,7 +7388,7 @@ pub fn run_structure_search_rounds(
                 ));
             }
             if cfg.flatten {
-                for atom in flatten_candidates(&term) {
+                for atom in flatten_candidates(&term, residuals.view())? {
                     if cooldown.blocked(&[atom]) {
                         continue;
                     }
@@ -7918,63 +7933,238 @@ fn curl_candidates(
     Ok(out)
 }
 
-/// Audit fitted circle atoms for degeneration (INTEGRATION_PLAN Phase 4.5). A
-/// circle whose radial law has relaxed to Gaussian fill (κ ≈ 2) or collapsed to
-/// a diameter (second resultant ≈ 1) is no longer carrying rotational structure;
-/// return those atoms for the existing death/demotion path to retire. The
-/// e-gate still owns the decision.
-fn flatten_candidates(term: &SaeManifoldTerm) -> Vec<usize> {
+/// The principal plane of an atom's centered image on its active rows (#3506):
+/// the image's own coordinates in that plane and the plane's unit ambient
+/// directions, onto which the parsed rows are projected.
+struct ImagePlane {
+    alpha: Array1<f64>,
+    beta: Array1<f64>,
+    e1: Array1<f64>,
+    e2: Array1<f64>,
+}
+
+/// Principal image plane of one atom on its active rows, computed exactly in the
+/// `m`-dimensional basis space (`m = basis_size`, never `p²`).
+///
+/// With `Φ̃` the active basis rows centered by their mean and `B` the `m×p`
+/// decoder, the centered image is `Ĩ = Φ̃B`. Factor `K = BBᵀ = UΛUᵀ` and set
+/// `L = U·Λ^{1/2}`, `F = Φ̃L`: then `FFᵀ = Φ̃KΦ̃ᵀ = ĨĨᵀ`, so `F` has the same
+/// row Gram — the same left singular vectors and singular values — as `Ĩ`. The
+/// top two eigenpairs `(μ_k, w_k)` of `S = FᵀF` give the principal coordinates
+/// `a_k = F w_k` (`= σ_k u_k` of `Ĩ`), and the ambient principal directions are
+/// `e_k = Ĩᵀa_k / μ_k = Bᵀ(Φ̃ᵀ a_k)/μ_k`, returned unit-normalized.
+///
+/// Returns `None` when the image is constant on the active rows (`μ₁ = 0`).
+fn principal_image_plane(
+    atom: &SaeManifoldAtom,
+    active_idx: &[usize],
+) -> Result<Option<ImagePlane>, String> {
+    use gam_linalg::faer_ndarray::strict_symmetric_eigh;
+    let decoder = atom.decoder_coefficients();
+    let (m, p) = decoder.dim();
+    let n_act = active_idx.len();
+    if atom.basis_values.ncols() != m {
+        return Err(format!(
+            "flatten: atom basis has {} columns but its decoder has {m} rows",
+            atom.basis_values.ncols()
+        ));
+    }
+    // Φ̃: active basis rows centered by their active-row mean.
+    let mut phi = Array2::<f64>::zeros((n_act, m));
+    for (i, &r) in active_idx.iter().enumerate() {
+        for c in 0..m {
+            phi[[i, c]] = atom.basis_values[[r, c]];
+        }
+    }
+    let phi_mean = phi.mean_axis(Axis(0)).ok_or("flatten: no active rows")?;
+    for mut row in phi.rows_mut() {
+        row -= &phi_mean;
+    }
+    // K = BBᵀ, assembled bit-symmetric (the strict EVD refuses asymmetry).
+    let mut k_mat = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..=i {
+            let v = decoder.row(i).dot(&decoder.row(j));
+            k_mat[[i, j]] = v;
+            k_mat[[j, i]] = v;
+        }
+    }
+    let (lambda, u) = strict_symmetric_eigh(&k_mat, faer::Side::Lower)
+        .map_err(|e| format!("flatten: decoder Gram spectrum failed: {e}"))?;
+    // L = U·Λ^{1/2}. K is PSD by construction; `max(0)` only removes the
+    // EVD's roundoff below zero, it never changes a resolved eigenvalue.
+    let mut l_mat = u;
+    for c in 0..m {
+        let s = lambda[c].max(0.0).sqrt();
+        l_mat.column_mut(c).mapv_inplace(|x| x * s);
+    }
+    let f = phi.dot(&l_mat);
+    let mut s_mat = Array2::<f64>::zeros((m, m));
+    for i in 0..m {
+        for j in 0..=i {
+            let v = f.column(i).dot(&f.column(j));
+            s_mat[[i, j]] = v;
+            s_mat[[j, i]] = v;
+        }
+    }
+    let (mu, w) = strict_symmetric_eigh(&s_mat, faer::Side::Lower)
+        .map_err(|e| format!("flatten: image Gram spectrum failed: {e}"))?;
+    let mut order: Vec<usize> = (0..m).collect();
+    order.sort_by(|&x, &y| mu[y].total_cmp(&mu[x]));
+    if !(mu[order[0]] > 0.0) {
+        return Ok(None);
+    }
+    let alpha = f.dot(&w.column(order[0]));
+    let beta = if m > 1 {
+        f.dot(&w.column(order[1]))
+    } else {
+        Array1::<f64>::zeros(n_act)
+    };
+    let ambient = |a: &Array1<f64>| -> Array1<f64> { decoder.t().dot(&phi.t().dot(a)) };
+    let mut e1 = ambient(&alpha);
+    let n1 = e1.dot(&e1).sqrt();
+    if !(n1 > 0.0) {
+        return Ok(None);
+    }
+    e1.mapv_inplace(|x| x / n1);
+    let mut e2 = ambient(&beta);
+    let proj = e2.dot(&e1);
+    e2.scaled_add(-proj, &e1);
+    let n2 = e2.dot(&e2).sqrt();
+    if n2 > 0.0 {
+        e2.mapv_inplace(|x| x / n2);
+    } else {
+        e2 = Array1::<f64>::zeros(p);
+    }
+    Ok(Some(ImagePlane {
+        alpha,
+        beta,
+        e1,
+        e2,
+    }))
+}
+
+/// Why a fitted circle atom was flagged (or not) by the flatten audit.
+#[derive(Debug)]
+enum FlattenAudit {
+    /// The atom's image is constant on its active rows: it carries no
+    /// rotational structure at all.
+    ConstantImage,
+    /// The rows the atom parses carry no energy in the atom's image plane.
+    EmptyParse,
+    /// Both planes carry energy; the curl/flatten complement decides.
+    Judged(crate::manifold::FlattenVerdict),
+}
+
+impl FlattenAudit {
+    fn recommend_flatten(&self) -> bool {
+        match self {
+            FlattenAudit::ConstantImage | FlattenAudit::EmptyParse => true,
+            FlattenAudit::Judged(v) => v.recommend_flatten,
+        }
+    }
+}
+
+/// Per-atom flatten audit of every fitted `d = 1` periodic atom (#3506).
+///
+/// The geometry is the atom's own image `Φ·B` in the principal plane of that
+/// image — the angle is the geometric angle of the image point, never the
+/// latent phase, so a decoder that traces a segment reads as a diameter no
+/// matter how its phases are spread. The data are the rows the atom parses:
+/// with residuals `R = target − fitted` and `fitted = μ + σ ⊙ Σ_j a_j g_j`
+/// (the Tier-0 lift), the leave-this-atom-out target in the fit frame is
+/// `y_r = R_r ⊘ σ + a_{r,k}·g_{r,k}`, centered on the active rows and projected
+/// on the image plane. [`crate::manifold::flatten_verdict`] reads both with
+/// the same ring recognition `curl` promotes on.
+///
+/// Slots the #1026 hybrid-split verdict already decodes by their straight
+/// sub-model are not circles in the reconstruction and are not audited.
+fn flatten_audit(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+) -> Result<Vec<(usize, FlattenAudit)>, String> {
     let assignments = term.assignment.assignments();
     let n = assignments.nrows();
     let k = assignments.ncols();
+    let p = term.output_dim();
+    if residuals.dim() != (n, p) {
+        return Err(format!(
+            "flatten: residuals {:?} != ({n}, {p})",
+            residuals.dim()
+        ));
+    }
     let floor = if k == 0 {
         0.0
     } else {
         ACTIVE_SUPPORT_REL_FLOOR / k as f64
     };
+    let linear_images = term.hybrid_linear_image_map();
+    let scale = term.tier0_scale();
     let mut out = Vec::new();
     for (a, atom) in term.atoms.iter().enumerate() {
-        if !matches!(atom.basis_kind(), SaeAtomBasisKind::Periodic) || atom.latent_dim() != 1 {
+        if !matches!(atom.basis_kind(), SaeAtomBasisKind::Periodic)
+            || atom.latent_dim() != 1
+            || linear_images.contains_key(&a)
+        {
             continue;
         }
         let active_idx: Vec<usize> = (0..n).filter(|&r| assignments[[r, a]] > floor).collect();
-        if active_idx.len() < 8 {
+        // The radius law is a moment ratio; it is undefined below two rows.
+        if active_idx.len() < 2 {
             continue;
         }
-        // Per-row polar law: angle from the atom's phase coordinate, radius from
-        // the centered ambient image norm in the atom's own image plane.
-        let img = atom_ambient_image(atom);
-        let p = img.ncols();
-        let mut center = Array1::<f64>::zeros(p);
-        for &r in &active_idx {
-            for j in 0..p {
-                center[j] += img[[r, j]];
-            }
-        }
-        center.mapv_inplace(|x| x / active_idx.len() as f64);
-        let coords = term.assignment.coords[a].as_matrix();
-        if coords.ncols() == 0 {
+        let Some(plane) = principal_image_plane(atom, &active_idx)? else {
+            out.push((a, FlattenAudit::ConstantImage));
             continue;
-        }
-        let mut radii = Array1::<f64>::zeros(active_idx.len());
-        let mut angles = Array1::<f64>::zeros(active_idx.len());
+        };
+        let n_act = active_idx.len();
+        let mut y = Array2::<f64>::zeros((n_act, p));
+        let mut g = vec![0.0_f64; p];
         for (i, &r) in active_idx.iter().enumerate() {
-            let mut rr = 0.0_f64;
+            atom.fill_decoded_row(r, &mut g);
+            let gate = assignments[[r, a]];
             for j in 0..p {
-                let d = img[[r, j]] - center[j];
-                rr += d * d;
-            }
-            radii[i] = rr.sqrt();
-            // Phase coordinate is in turns; angle in radians.
-            angles[i] = std::f64::consts::TAU * coords[[r, 0]];
-        }
-        if let Ok(v) = crate::manifold::flatten_verdict(radii.view(), angles.view()) {
-            if v.recommend_flatten {
-                out.push(a);
+                let resid = match scale {
+                    Some(s) => residuals[[r, j]] / s[j],
+                    None => residuals[[r, j]],
+                };
+                y[[i, j]] = resid + gate * g[j];
             }
         }
+        let y_mean = y.mean_axis(Axis(0)).ok_or("flatten: no active rows")?;
+        for mut row in y.rows_mut() {
+            row -= &y_mean;
+        }
+        let parse_alpha = y.dot(&plane.e1);
+        let parse_beta = y.dot(&plane.e2);
+        let parse_energy = parse_alpha.dot(&parse_alpha) + parse_beta.dot(&parse_beta);
+        if !(parse_energy > 0.0) {
+            out.push((a, FlattenAudit::EmptyParse));
+            continue;
+        }
+        let verdict = crate::manifold::flatten_verdict(
+            plane.alpha.view(),
+            plane.beta.view(),
+            parse_alpha.view(),
+            parse_beta.view(),
+        )?;
+        out.push((a, FlattenAudit::Judged(verdict)));
     }
-    out
+    Ok(out)
+}
+
+/// Audit fitted circle atoms for degeneration (INTEGRATION_PLAN Phase 4.5) and
+/// return the ones that no longer carry rotational structure, for the existing
+/// death/demotion path to retire. The e-gate still owns the decision.
+fn flatten_candidates(
+    term: &SaeManifoldTerm,
+    residuals: ArrayView2<'_, f64>,
+) -> Result<Vec<usize>, String> {
+    Ok(flatten_audit(term, residuals)?
+        .into_iter()
+        .filter(|(_, audit)| audit.recommend_flatten())
+        .map(|(a, _)| a)
+        .collect())
 }
 
 /// Per-row Gaussian reconstruction log-likelihood of a shard under the current
@@ -8255,8 +8445,8 @@ pub fn run_production_structure_search(
 /// honesty surface the python boundary attaches under an additive
 /// `structure_search` key. The object carries the per-round ledgers (`rounds`)
 /// and the unified migration ledger folded from them (`migration`), so a fit that
-/// ran the search reports every birth, death and refusal in one currency, with
-/// its `pc_reseed_events` invariant (#2023). Byte-deterministic for identical
+/// ran the search reports every birth, death and refusal in one currency.
+/// Byte-deterministic for identical
 /// inputs.
 pub(crate) fn rounds_to_json(
     rounds: &[SearchLedger],

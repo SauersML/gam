@@ -102,7 +102,8 @@ impl From<String> for FullConformalError {
 ///   conservative.
 ///
 /// The `conformal_certificate` column says what each row carries: `0`
-/// exact_frozen (no strength to re-select), `1` honest_refit, and a negative
+/// exact_frozen (Gaussian, no strength to re-select), `1` honest_refit,
+/// `2` conservative_frozen (GLM numerical enclosure), and a negative
 /// code for a typed refusal (`-1` multi_penalty, `-2`
 /// unknown_penalty_structure, `-3` augmented_gram_singular, `-4`
 /// reml_undefined, `-5` refit_outside_tube, `-6` refit_failed, `-7`
@@ -282,7 +283,7 @@ pub fn full_conformal_prediction_columns(
     )?;
     let predictor = model
         .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let point = resolve_prediction_request(
         predictor.as_ref(),
         &predict_input,
@@ -364,7 +365,7 @@ pub fn split_conformal_prediction_columns(
     )?;
     let predictor = model
         .predictor()
-        .ok_or_else(|| "saved model could not construct a predictor".to_string())?;
+        .map_err(|reason| format!("saved model could not construct a predictor: {reason}"))?;
     let fit = fit_result_from_saved_model_for_prediction(model)?;
     let family = model.likelihood();
 
