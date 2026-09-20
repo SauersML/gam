@@ -54,6 +54,24 @@ impl SaeFitAssignmentKind {
         }
     }
 
+    /// Whether a cold multi-atom start seeds its routing from the data
+    /// (#629, #3984): per-cluster periodic phases, the residual-preference
+    /// logits of `sae_residual_seed_logits`, and the alternating
+    /// decoder-projection refinement of `sae_refine_routing_seed`.
+    ///
+    /// Hard TopK belongs here because its support is `topk_row` of fixed
+    /// logits, i.e. the ranking of the cold logits *is* the routing for the
+    /// whole fit. Neutral (all-zero) cold logits tie every row, the tie breaks
+    /// to the lowest atom indices, and the remaining atoms start with empty
+    /// support and a zero decoder: identical atom plans stay exchangeable and
+    /// the fit can never route. The residual seed's mean-centring is a per-row
+    /// translation, so for TopK only its ranking matters and it is exactly the
+    /// data's own per-row atom preference. The smooth threshold gate keeps its
+    /// threshold-centred seed.
+    pub(crate) const fn seeds_cold_routing_from_data(self) -> bool {
+        matches!(self, Self::Softmax | Self::OrderedBetaBernoulli | Self::TopK)
+    }
+
     fn mode(
         self,
         tau: f64,
@@ -420,10 +438,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
 
     if request.seed_refine_routing
         && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
+        && request.assignment_kind.seeds_cold_routing_from_data()
     {
         sae_refine_routing_seed(
             &mut base_term,
@@ -433,6 +448,7 @@ pub fn build_sae_fit_seed(request: SaeFitSeedRequest<'_, '_>) -> Result<SaeFitSe
             request.alpha,
             request.tau,
             request.threshold,
+            request.top_k,
         )?;
     }
 

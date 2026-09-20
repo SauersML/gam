@@ -33,10 +33,11 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// at the seed geometry, so none is invented for them. Rows with a clear best
 /// atom get a decisive — but bounded, hence escapable by the Newton refinement
 /// — head start. The mean-centring is translation-identity
-/// for softmax and keeps the ordered Beta--Bernoulli `sigmoid(logit/τ)` gate neutral (0.5) on
-/// ties instead of slamming both gates shut, so the seed is safe for both
-/// assignment maps. The result is a proper routing seed rather than a
-/// saddle.
+/// for softmax, keeps the ordered Beta--Bernoulli `sigmoid(logit/τ)` gate neutral (0.5) on
+/// ties instead of slamming both gates shut, and leaves each row's atom
+/// ranking — the whole of a hard TopK support (#3984) — unchanged, so the seed
+/// is safe for all three assignment maps. The result is a proper routing seed
+/// rather than a saddle.
 pub fn sae_residual_seed_logits(
     basis_values: ArrayView3<'_, f64>,
     basis_sizes: &[usize],
@@ -892,9 +893,12 @@ pub fn sae_decoder_lsq_init(
 /// carry the interval extension needed to enumerate their complete stationary
 /// sets.
 ///
-/// Only invoked for cold-start multi-atom softmax / ordered Beta--Bernoulli
-/// fits; the smooth threshold gate keeps its threshold-centered seed and warm
-/// starts are respected verbatim.
+/// Only invoked for cold-start multi-atom softmax, ordered Beta--Bernoulli and
+/// hard TopK fits (`SaeFitAssignmentKind::seeds_cold_routing_from_data`); the
+/// smooth threshold gate keeps its threshold-centered seed and warm starts are
+/// respected verbatim. Under TopK the decoder refit in step 2 weights each row
+/// by the exact `topk_row` support of the current logits, so `top_k` must be
+/// the fit's own support size.
 pub(crate) fn sae_refine_routing_seed(
     term: &mut SaeManifoldTerm,
     z: ArrayView2<'_, f64>,
@@ -903,6 +907,7 @@ pub(crate) fn sae_refine_routing_seed(
     alpha: f64,
     tau: f64,
     threshold_gate_threshold: f64,
+    top_k: Option<usize>,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
@@ -947,7 +952,7 @@ pub(crate) fn sae_refine_routing_seed(
             alpha,
             tau,
             threshold_gate_threshold,
-            None,
+            top_k,
         )?;
         for atom_idx in 0..k_atoms {
             let m_k = basis_sizes[atom_idx];

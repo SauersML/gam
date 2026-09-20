@@ -196,13 +196,7 @@ pub fn build_sae_minimal_seed(
         }
         None => seed_coords,
     };
-    if coords_are_cold
-        && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+    if coords_are_cold && k_atoms > 1 && request.assignment_kind.seeds_cold_routing_from_data() {
         let labels = sae_output_energy_cluster_labels(request.target, k_atoms);
         let plan_kinds: Vec<SaeAtomBasisKind> =
             plans.iter().map(|plan| plan.kind().clone()).collect();
@@ -255,13 +249,7 @@ pub fn build_sae_minimal_seed(
         }
         None => Array2::<f64>::zeros((n_obs, k_atoms)),
     };
-    if logits_are_cold
-        && k_atoms > 1
-        && matches!(
-            request.assignment_kind,
-            SaeFitAssignmentKind::Softmax | SaeFitAssignmentKind::OrderedBetaBernoulli
-        )
-    {
+    if logits_are_cold && k_atoms > 1 && request.assignment_kind.seeds_cold_routing_from_data() {
         const RESIDUAL_SEED_GAIN: f64 = 4.0;
         initial_logits = sae_residual_seed_logits(
             basis_values.view(),
@@ -371,6 +359,89 @@ mod tests {
             assert_eq!(
                 report.initial_logits, residual,
                 "random_state={random_state}: the cold logits must be the residual seed itself"
+            );
+        }
+    }
+
+    /// A cold hard-TopK start with identical atom plans must seed its fixed
+    /// support from the data, not from neutral logits (#3984). All-zero
+    /// logits tie every row, `topk_row` breaks the tie to atom 0, and atom 1
+    /// starts with empty support and a zero decoder, so the two exchangeable
+    /// atoms can never separate. The seed must instead be the residual
+    /// preference of the report's own basis stack, route rows to both atoms,
+    /// give both atoms a live decoder, and not depend on `random_state`.
+    #[test]
+    fn cold_topk_routing_seed_splits_identical_plans_by_the_data_3984() {
+        // Two circles of radius 2 in orthogonal planes (outputs 0-1 and 2-3),
+        // alternating by row.
+        let n = 48usize;
+        let mut target = Array2::<f64>::zeros((n, 4));
+        for row in 0..n {
+            let theta =
+                std::f64::consts::TAU * ((row / 2) as f64 + 0.25 * (row % 2) as f64) / 24.0;
+            let plane = 2 * (row % 2);
+            target[[row, plane]] = 2.0 * theta.cos();
+            target[[row, plane + 1]] = 2.0 * theta.sin();
+        }
+        let seed = |random_state: u64| {
+            build_sae_minimal_seed(SaeMinimalSeedRequest {
+                target: target.view(),
+                atom_basis: vec!["periodic".to_string(); 2],
+                atom_dim: vec![1; 2],
+                assignment_kind: SaeFitAssignmentKind::TopK,
+                alpha: 1.0,
+                tau: 1.0,
+                threshold: 0.0,
+                top_k: Some(1),
+                random_state,
+                initial_logits: None,
+                initial_coords: None,
+            })
+            .expect("a planted two-plane TopK seed must build")
+        };
+
+        let report = seed(45);
+        assert!(report.refine_routing, "a fully cold start must request routing refinement");
+        let basis_sizes: Vec<usize> = report
+            .geometry_plans
+            .iter()
+            .map(|plan| plan.basis_size().expect("seed plans carry a basis size"))
+            .collect();
+        let residual =
+            sae_residual_seed_logits(report.basis_values.view(), &basis_sizes, target.view(), 4.0)
+                .expect("the residual seed of the report's own basis must build");
+        assert_eq!(
+            report.initial_logits, residual,
+            "cold TopK logits must be the residual seed of the report's basis stack"
+        );
+
+        // `topk_row` with top_k = 1 keeps the larger logit, ties to atom 0.
+        let routed_to_one = (0..n)
+            .filter(|&row| report.initial_logits[[row, 1]] > report.initial_logits[[row, 0]])
+            .count();
+        assert!(
+            routed_to_one > 0 && routed_to_one < n,
+            "both atoms must own a nonempty TopK support; atom 1 owns {routed_to_one} of {n} rows"
+        );
+        for atom_idx in 0..2 {
+            let block = report
+                .decoder_coefficients
+                .index_axis(ndarray::Axis(0), atom_idx);
+            assert!(
+                block.iter().any(|&value| value != 0.0),
+                "atom {atom_idx} must start with a live decoder"
+            );
+        }
+
+        for random_state in [0_u64, 11, 20260920] {
+            let other = seed(random_state);
+            assert_eq!(
+                other.initial_logits, report.initial_logits,
+                "random_state={random_state}: the cold TopK routing seed must be data-determined"
+            );
+            assert_eq!(
+                other.decoder_coefficients, report.decoder_coefficients,
+                "random_state={random_state}: the cold TopK decoder seed must be data-determined"
             );
         }
     }
