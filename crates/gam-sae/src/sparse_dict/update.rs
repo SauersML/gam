@@ -23,6 +23,7 @@
 //! estimate reported with the epoch diagnostics.
 
 use super::codes::{SparseCode, solve_row_codes};
+use super::decoder_newton::decoder_newton_step;
 use super::scoring::{ScoreRoutePath, ScoreRouteStats, TileScorer};
 use super::{SparseDictConfig, SparseDictConvergence, SparseDictFit};
 use gam_linalg::pcg::{
@@ -566,103 +567,6 @@ fn penalized_objective(
     (loss, band + accumulation)
 }
 
-/// Displacement between two decoders' live rows, compared as lines. The second row takes
-/// the sign that agrees with the first before the difference is formed, because
-/// [`unit_norm_rows`] orients each row on its own. Rows marked `frozen`, and rows that are
-/// zero in either decoder, contribute nothing. Per-atom squares are summed in atom order,
-/// so the norm does not depend on the thread count.
-fn aligned_displacement_norm(
-    certified: ArrayView2<'_, f32>,
-    refreshed: ArrayView2<'_, f32>,
-    frozen: &[bool],
-) -> f64 {
-    let squares: Vec<f64> = certified
-        .axis_iter(Axis(0))
-        .into_par_iter()
-        .zip(refreshed.axis_iter(Axis(0)).into_par_iter())
-        .zip(frozen.par_iter())
-        .map(|((old, new), &skip)| {
-            if skip
-                || old.iter().all(|&value| value == 0.0)
-                || new.iter().all(|&value| value == 0.0)
-            {
-                return 0.0;
-            }
-            let dot = old
-                .iter()
-                .zip(new.iter())
-                .map(|(&left, &right)| f64::from(left) * f64::from(right))
-                .sum::<f64>();
-            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
-            old.iter()
-                .zip(new.iter())
-                .map(|(&left, &right)| {
-                    let difference = sign * f64::from(right) - f64::from(left);
-                    difference * difference
-                })
-                .sum::<f64>()
-        })
-        .collect();
-    squares.iter().sum::<f64>().sqrt()
-}
-
-/// The decoder one Aitken step reaches from an epoch of a linearly contracting map
-/// (#2283). When the map's error contracts by `r` per epoch, `x_{e+1} − x* ≈ r·(x_e − x*)`,
-/// so the limit sits at `x_{e+1} + r/(1 − r)·(x_{e+1} − x_e)`, and `step` is that
-/// `r/(1 − r)`. Rows are aligned as in [`aligned_displacement_norm`], frozen and zero rows
-/// are copied unchanged, and the caller re-norms the result.
-fn aitken_decoder_candidate(
-    certified: ArrayView2<'_, f32>,
-    refreshed: ArrayView2<'_, f32>,
-    frozen: &[bool],
-    step: f64,
-) -> Array2<f32> {
-    let mut candidate = refreshed.to_owned();
-    candidate
-        .axis_iter_mut(Axis(0))
-        .into_par_iter()
-        .zip(certified.axis_iter(Axis(0)).into_par_iter())
-        .zip(frozen.par_iter())
-        .for_each(|((mut row, old), &skip)| {
-            if skip
-                || old.iter().all(|&value| value == 0.0)
-                || row.iter().all(|&value| value == 0.0)
-            {
-                return;
-            }
-            let dot = old
-                .iter()
-                .zip(row.iter())
-                .map(|(&left, &right)| f64::from(left) * f64::from(right))
-                .sum::<f64>();
-            let sign = if dot < 0.0 { -1.0 } else { 1.0 };
-            for (slot, &left) in row.iter_mut().zip(old.iter()) {
-                let aligned = sign * f64::from(*slot);
-                *slot = (aligned + step * (aligned - f64::from(left))) as f32;
-            }
-        });
-    candidate
-}
-
-/// Null every revival proposal in `decoder` that no code in `codes` fires. A rejected
-/// proposal is dormant capacity, not a trained direction, and the plain epoch image nulls
-/// its own rejected proposals the same way.
-fn null_unfired_revivals(decoder: &mut Array2<f32>, revived_atoms: &[usize], codes: &[SparseCode]) {
-    let mut fired = vec![false; decoder.nrows()];
-    for code in codes {
-        for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
-            if value != 0.0 {
-                fired[atom as usize] = true;
-            }
-        }
-    }
-    for &atom in revived_atoms {
-        if !fired[atom] {
-            decoder.row_mut(atom).fill(0.0);
-        }
-    }
-}
-
 /// The loss `‖X − C D‖² − ‖X‖²` of two decoders at the codes that assembled `eq`,
 /// each paired with the band its f32 rows resolve. Per atom the loss is
 /// `A_aa‖d_a‖² − d_a·b_a − d_a·g_a`, with `g_a = b_a − Σ_{b≠a} A_ab d_b`, and its
@@ -888,9 +792,12 @@ fn run_from_decoder(
     // tightest achievable fixed point, which in floating point is the rounding
     // floor of the residual reductions, not literal zero.
     let fixed_point_tol = fixed_point_tolerance(config.tolerance, n, k, p);
-    // Norm of the preceding epoch's decoder displacement: the contraction rate the
-    // Aitken step reads is the ratio of successive displacements (#2283).
-    let mut previous_displacement_norm: Option<f64> = None;
+    // The explained variance is `1 − RSS/TSS`, so a loss decrease `δ` is an EV change
+    // of `δ/TSS`, and the tolerance in loss units is `fixed_point_tol · TSS` (#3193).
+    let loss_tolerance = {
+        let (means, _) = column_means_and_energy(x);
+        fixed_point_tol * reconstruction_rss_tss_chunks(x, &codes, decoder.view(), Some(&means)).1
+    };
 
     for epoch in 0..config.max_epochs {
         epochs_run = epoch + 1;
@@ -915,8 +822,9 @@ fn run_from_decoder(
         let accumulate_secs = epoch_start.elapsed().as_secs_f64();
         let sigma = residual_scale(x, &codes, decoder.view());
         let sigma_secs = epoch_start.elapsed().as_secs_f64() - accumulate_secs;
-        let stats = if s == 1 {
+        let (stats, movable) = if s == 1 {
             let gate = routability_gate_decisions(&normal_eq, sigma);
+            let movable: Vec<bool> = gate.iter().map(|decision| decision.refresh).collect();
             let mut members = vec![Vec::new(); k];
             for (row, code) in certified_codes.iter().enumerate() {
                 members[code.indices[0] as usize].push(row);
@@ -934,13 +842,14 @@ fn run_from_decoder(
                     }
                     Ok(())
                 })?;
-            DecoderSolveStats {
+            let stats = DecoderSolveStats {
                 component_count: k,
                 max_component_size: 1,
                 cg_residual_stop: decoder_solve_relative_tolerance(),
                 cg_recycling_admitted: false,
                 ..DecoderSolveStats::default()
-            }
+            };
+            (stats, movable)
         } else {
             let (solve_stats, gate) = solve_decoder_with_routability_gate_recycled(
                 &mut decoder,
@@ -968,7 +877,7 @@ fn run_from_decoder(
                 decoder.assign(&certified_decoder);
                 polish_unit_rows_against_normal_eq(&mut decoder, &normal_eq, &refresh)?;
             }
-            solve_stats
+            (solve_stats, refresh)
         };
         decoder_solve_stats = stats;
         let refresh_secs = epoch_start.elapsed().as_secs_f64();
@@ -990,39 +899,27 @@ fn run_from_decoder(
             unit_norm_rows(&mut decoder)?;
         }
 
-        // (f) Aitken step along the epoch displacement (#2283). Where coherent atoms
-        // relax a tiling or rotate within a span, the epoch map converges linearly: its
-        // error contracts by `r` per epoch, and a budget can run out a few epochs short
-        // of a fixed point the map would reach (job 640872: the torus K=8 decoder
-        // residual falls at ~0.7 per epoch and is refused at 30 epochs). The measured rate
-        // `r = ‖Δ_e‖/‖Δ_{e−1}‖` gives the candidate `D + r/(1 − r)·Δ`. The candidate is
-        // routed after the certificate check below, and adopted only for a state its plain
-        // image did not certify and only on a lower penalized loss. So the step can neither
-        // hold a certificate open nor raise the loss. Revival proposals have no trajectory
-        // and stay put.
-        let mut frozen = vec![false; k];
-        for &atom in &revived_atoms {
-            frozen[atom] = true;
-        }
-        let displacement_norm =
-            aligned_displacement_norm(certified_decoder.view(), decoder.view(), &frozen);
-        let extrapolated = match previous_displacement_norm
-            .filter(|&previous| displacement_norm > 0.0 && displacement_norm < previous)
-        {
-            Some(previous) => {
-                let rate = displacement_norm / previous;
-                let mut candidate = aitken_decoder_candidate(
-                    certified_decoder.view(),
-                    decoder.view(),
-                    &frozen,
-                    rate / (1.0 - rate),
-                );
-                unit_norm_rows(&mut candidate)?;
-                Some(candidate)
-            }
-            None => None,
-        };
-        previous_displacement_norm = Some(displacement_norm);
+        // (f) Newton step on the profiled decoder objective at the certified state
+        // (#3193). Where coherent atoms rotate inside their span, only the ridge picks
+        // the rotation, and the map above contracts at a rate near one: 0.9975 per epoch
+        // on the `returned_ev_is_fresh_code_ev` fixture, so a per-epoch displacement can
+        // sit inside the tolerance while the state is still `step/(1 − r)` from the fixed
+        // point. The Newton decrement is that distance in loss units, and the step
+        // reaches it. The atoms the refresh held are held here too.
+        let newton = decoder_newton_step(
+            x,
+            certified_decoder.view(),
+            &certified_codes,
+            config.code_ridge,
+            &movable,
+            decoder_solve_relative_tolerance(),
+        );
+        let (_, certified_band) = penalized_objective(
+            x,
+            certified_decoder.view(),
+            &certified_codes,
+            config.code_ridge,
+        );
 
         // (a)+(b) FRESH codes against the just-refreshed, unit-normed decoder.
         // These are the codes that define the post-epoch model, so they (i) feed
@@ -1170,8 +1067,13 @@ fn run_from_decoder(
         let numerically_sound = decoder_solve_stats.cg_nonconverged_columns == 0
             && decoder_solve_stats.cg_relative_residual <= decoder_solve_stats.cg_residual_stop;
         let structure_settled = accepted_births == 0;
+        // The residuals bound one epoch's step. The decrement bounds what the profiled
+        // objective still gives up at these supports: inside the tolerance in loss units,
+        // or inside the loss's own rounding, where no arithmetic resolves it (#3193).
+        let stationary = newton.resolved && newton.decrement <= loss_tolerance.max(certified_band);
         let certified_fixed_point = structure_settled
             && numerically_sound
+            && stationary
             && ev_residual <= fixed_point_tol
             && decoder_residual <= fixed_point_tol
             && routing_residual <= fixed_point_tol;
@@ -1195,11 +1097,21 @@ fn run_from_decoder(
                 accepted_births,
             });
         }
-        // The Aitken candidate is considered only for a state its plain image did not
-        // certify, so an accelerator can never hold a certificate open. It is adopted only
-        // when its routed state has the lower penalized loss beyond both states' rounding,
-        // so the step never raises the loss the plain map lowers (#2283).
-        if let Some(mut candidate) = extrapolated {
+        // The Newton candidate is considered only for a state its plain image did not
+        // certify, so it can never hold a certificate open, and it is carried forward in
+        // place of the plain image only when its routed state has a penalized loss lower
+        // by more than both losses' rounding bands. A decrease inside the bands is not
+        // resolved, and adopting it would let rounding pick the state and churn routing.
+        // At a crawl the plain image gains `(1 − r)` of what the Newton point gains, so
+        // the margin is `r` times the decrement, and it falls inside the bands only where
+        // the decrement already certifies.
+        // Revival proposals have no profiled trajectory, so the candidate carries the
+        // plain image's proposals and nulls any its own routing leaves unfired.
+        if let Some(mut candidate) = newton.candidate {
+            for &atom in &revived_atoms {
+                candidate.row_mut(atom).assign(&decoder.row(atom));
+            }
+            unit_norm_rows(&mut candidate)?;
             let candidate_codes = route_and_code_retaining_descent(
                 x,
                 candidate.view(),
@@ -1211,16 +1123,29 @@ fn run_from_decoder(
                 Some(&mut score_route_stats),
                 &certified_codes,
             )?;
+            let mut fired = vec![false; k];
+            for code in &candidate_codes {
+                for (&atom, &value) in code.indices.iter().zip(code.codes.iter()) {
+                    fired[atom as usize] |= value != 0.0;
+                }
+            }
+            for &atom in &revived_atoms {
+                if !fired[atom] {
+                    candidate.row_mut(atom).fill(0.0);
+                }
+            }
             let (plain_loss, plain_band) =
                 penalized_objective(x, decoder.view(), &next_codes, config.code_ridge);
             let (candidate_loss, candidate_band) =
                 penalized_objective(x, candidate.view(), &candidate_codes, config.code_ridge);
+            log::debug!(
+                "[SAE epoch {epochs_run}] decoder Newton: decrement={:.3e} resolved={} \
+                 hessian_products={} plain_loss={plain_loss:.9e} newton_loss={candidate_loss:.9e}",
+                newton.decrement,
+                newton.resolved,
+                newton.hessian_products,
+            );
             if candidate_loss + candidate_band < plain_loss - plain_band {
-                log::debug!(
-                    "[SAE epoch {epochs_run}] Aitken step adopted: penalized loss \
-                     {plain_loss:.9e} -> {candidate_loss:.9e}"
-                );
-                null_unfired_revivals(&mut candidate, &revived_atoms, &candidate_codes);
                 decoder = candidate;
                 next_codes = candidate_codes;
                 next_ev = explained_variance(x, &next_codes, decoder.view());
@@ -4274,10 +4199,20 @@ fn explained_variance(
     codes: &[SparseCode],
     decoder: ArrayView2<'_, f32>,
 ) -> f64 {
+    let (means, energy) = column_means_and_energy(x);
+    let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
+    crate::k_selection::explained_variance_within_band(
+        rss,
+        tss,
+        crate::k_selection::centered_tss_rounding_band(x.nrows(), energy),
+    )
+}
+
+/// Column means and raw energy `Σ x²` of `x`, from per-chunk partials combined in
+/// ascending chunk order (deterministic, thread-count-independent).
+fn column_means_and_energy(x: ArrayView2<'_, f32>) -> (Vec<f64>, f64) {
     let n = x.nrows();
     let p = x.ncols();
-    // Column means for TSS: per-chunk column partials, combined in ascending
-    // chunk order (deterministic, thread-count-independent).
     let mean_partials: Vec<(Vec<f64>, f64)> = (0..n)
         .collect::<Vec<_>>()
         .par_chunks(RECONSTRUCTION_ROW_CHUNK)
@@ -4306,13 +4241,7 @@ fn explained_variance(
     for c in 0..p {
         means[c] /= n as f64;
     }
-
-    let (rss, tss) = reconstruction_rss_tss_chunks(x, codes, decoder, Some(&means));
-    crate::k_selection::explained_variance_within_band(
-        rss,
-        tss,
-        crate::k_selection::centered_tss_rounding_band(n, energy),
-    )
+    (means, energy)
 }
 
 fn residual_scale(

@@ -36,6 +36,7 @@ mod codes;
 mod coordinate;
 #[cfg(target_os = "linux")]
 mod decoder_gpu;
+mod decoder_newton;
 mod residual_reservoir;
 #[cfg(target_os = "linux")]
 mod score_router_backend;
