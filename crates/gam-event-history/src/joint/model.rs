@@ -251,7 +251,7 @@ impl JointEventModel {
 
     /// Save the model to `path`, atomically.
     pub fn save(&self, path: &Path) -> Result<(), SavedModelError> {
-        write_saved_model(path, &self.saved_text()?)
+        write_saved_model(path, self.saved_text()?.as_bytes())
     }
 
     /// Load a saved model, refusing another kind or version, or a state its

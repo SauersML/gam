@@ -15,7 +15,7 @@
 //! read a residualized smooth as the whole effect.
 //!
 //! This lived in `gam-cli` and had no counterpart anywhere else, so a user
-//! fitting `s(x1, type=tps) + s(x2, type=tps)` from Python got two unrelated 1-D
+//! fitting `s(x1, bs=tps) + s(x2, bs=tps)` from Python got two unrelated 1-D
 //! smooths and no word about it, while the identical CLI invocation said to
 //! write `thinplate(x1, x2)`. SPEC line 10 requires the CLI, the Python library
 //! and the Rust library to be unified with a single source of truth; an
@@ -123,22 +123,22 @@ pub(crate) fn collect_spatial_smooth_usage_warnings(
             let bad_example = match family {
                 "thinplate/tps" => cols
                     .iter()
-                    .map(|col| format!("s({col}, type=tps)"))
+                    .map(|col| format!("s({col}, bs=tps)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
                 "matern" => cols
                     .iter()
-                    .map(|col| format!("s({col}, type=matern)"))
+                    .map(|col| format!("s({col}, bs=matern)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
                 "duchon" => cols
                     .iter()
-                    .map(|col| format!("s({col}, type=duchon)"))
+                    .map(|col| format!("s({col}, bs=duchon)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
                 "sphere/sos" => cols
                     .iter()
-                    .map(|col| format!("s({col}, type=sphere)"))
+                    .map(|col| format!("s({col}, bs=sphere)"))
                     .collect::<Vec<_>>()
                     .join(" + "),
                 _ => return None,

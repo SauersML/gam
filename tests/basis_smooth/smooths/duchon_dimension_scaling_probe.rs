@@ -103,6 +103,6 @@ fn duchon_dimension_scaling_probe() {
     for &d in &[12usize, 16, 18, 19, 20, 21, 22, 25] {
         let ds = build_dataset(N_TRAIN, d, TRAIN_SEED);
         probe_one("duchon", d, &ds);
-        probe_one("measurejet", d, &ds);
+        probe_one("mjs", d, &ds);
     }
 }

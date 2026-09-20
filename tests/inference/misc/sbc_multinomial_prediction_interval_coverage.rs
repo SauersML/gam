@@ -106,7 +106,7 @@ fn multinomial_mean_prediction_interval_covers_true_probability_at_nominal() {
             init_lambda: 1.0,
             max_iter: 60,
             tol: 1e-8,
-            ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tp', k=8)", &config)
+            ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
         })
         .unwrap_or_else(|e| panic!("multinomial smooth fit failed: {e:?}"));
         let hi_col = model
@@ -209,7 +209,7 @@ fn multinomial_conditional_band_is_narrower_than_the_corrected_band() {
         init_lambda: 1.0,
         max_iter: 60,
         tol: 1e-8,
-        ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tp', k=8)", &config)
+        ..MultinomialFitRequest::new(&data, "y ~ s(x, bs='tps', k=8)", &config)
     })
     .unwrap_or_else(|e| panic!("multinomial smooth fit failed: {e:?}"));
 
