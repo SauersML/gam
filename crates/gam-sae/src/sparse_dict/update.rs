@@ -3051,11 +3051,18 @@ pub(super) fn routability_gate_decisions(
             }
             let r = partial.row(atom);
             let radial: f64 = row.iter().zip(r.iter()).map(|(&d, &v)| d as f64 * v).sum();
-            // ‖(I − d dᵀ/‖d‖²) r‖² = ‖r‖² − (dᵀr)²/‖d‖², clamped at the
-            // rounding floor of the subtraction.
-            let tangent_sq = (r.iter().map(|&v| v * v).sum::<f64>()
-                - radial * radial / row_norm_sq)
-                .max(0.0);
+            // ‖(I − d dᵀ/‖d‖²) r‖², summed over the projected components
+            // themselves: non-negative by construction, with none of the
+            // cancellation of `‖r‖² − (dᵀr)²/‖d‖²` when `r` is nearly radial.
+            let along = radial / row_norm_sq;
+            let tangent_sq: f64 = row
+                .iter()
+                .zip(r.iter())
+                .map(|(&d, &v)| {
+                    let t = v - along * d as f64;
+                    t * t
+                })
+                .sum();
             // `σ = 0` is an exact reconstruction: any tangent pull is certain
             // (`T = +∞`), none leaves the row where it is.
             let statistic = if residual_scale > 0.0 {
