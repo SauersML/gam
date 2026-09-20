@@ -22,6 +22,7 @@ pub mod effects;
 pub mod fisher_rao;
 pub use gam_terms::inference::higher_order;
 pub mod hmc_io;
+pub mod interval_reference;
 // `hmc_io` is the post-rename home of the NUTS/HMC engine that integration
 // tests and downstream callers still reach as `inference::hmc`. Keep that path
 // resolvable alongside the crate-root `gam::hmc` alias.
