@@ -1495,47 +1495,6 @@ impl SaeManifoldOuterObjective {
         Ok(samples)
     }
 
-    /// Test access to the probe count of the installed rational log|S| plan; `None`
-    /// before the streaming lane has built one.
-    #[cfg(test)]
-    pub(crate) fn surrogate_probe_count(&self) -> Option<usize> {
-        self.surrogate_lane
-            .as_ref()
-            .and_then(SurrogateLaneState::plan)
-            .map(|plan| plan.probes.len())
-    }
-
-    /// Test access to the streaming gradient's dependence on its derivative bundle:
-    /// the gradient on the whole bundle, and the gradient on each single bundle vector
-    /// taken as a one-vector bundle. `None` off the streaming lane.
-    #[cfg(test)]
-    pub(crate) fn streaming_gradient_per_bundle_vector(
-        &self,
-        rho: &SaeManifoldRho,
-        evaluation: &OuterCriterionEvaluation,
-    ) -> Result<Option<(Array1<f64>, Vec<Array1<f64>>)>, OuterGradientError> {
-        let OuterEvaluationArtifacts::MatrixFree(matrix_free) = &evaluation.artifacts else {
-            return Ok(None);
-        };
-        let vectors = &matrix_free.logdet_derivative_bundle.vectors;
-        let full = self
-            .matrix_free_gradient_components(rho, evaluation, matrix_free, vectors)?
-            .gradient();
-        let rows = vectors
-            .iter()
-            .map(|vector| {
-                self.matrix_free_gradient_components(
-                    rho,
-                    evaluation,
-                    matrix_free,
-                    std::slice::from_ref(vector),
-                )
-                .map(|components| components.gradient())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Some((full, rows)))
-    }
-
     /// #2231 Inc-B (stage 1) — enable crosscoder block-relevance PRICING.
     ///
     /// `p_x` is the anchor width (leading `[0, p_x)` target columns, never
@@ -5842,6 +5801,52 @@ mod crosscoder_reset_baseline_2627_tests {
                 .with_global_dispersion(0)
                 .expect("the global dispersion installs on the stacked fixture");
             (obj, vec![p], 0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod test_support {
+    use super::*;
+
+    impl SaeManifoldOuterObjective {
+        /// Test access to the probe count of the installed rational log|S| plan; `None`
+        /// before the streaming lane has built one.
+        pub(crate) fn surrogate_probe_count(&self) -> Option<usize> {
+            self.surrogate_lane
+                .as_ref()
+                .and_then(SurrogateLaneState::plan)
+                .map(|plan| plan.probes.len())
+        }
+
+        /// Test access to the streaming gradient's dependence on its derivative bundle:
+        /// the gradient on the whole bundle, and the gradient on each single bundle vector
+        /// taken as a one-vector bundle. `None` off the streaming lane.
+        pub(crate) fn streaming_gradient_per_bundle_vector(
+            &self,
+            rho: &SaeManifoldRho,
+            evaluation: &OuterCriterionEvaluation,
+        ) -> Result<Option<(Array1<f64>, Vec<Array1<f64>>)>, OuterGradientError> {
+            let OuterEvaluationArtifacts::MatrixFree(matrix_free) = &evaluation.artifacts else {
+                return Ok(None);
+            };
+            let vectors = &matrix_free.logdet_derivative_bundle.vectors;
+            let full = self
+                .matrix_free_gradient_components(rho, evaluation, matrix_free, vectors)?
+                .gradient();
+            let rows = vectors
+                .iter()
+                .map(|vector| {
+                    self.matrix_free_gradient_components(
+                        rho,
+                        evaluation,
+                        matrix_free,
+                        std::slice::from_ref(vector),
+                    )
+                    .map(|components| components.gradient())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some((full, rows)))
         }
     }
 }
