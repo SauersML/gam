@@ -22,7 +22,6 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// assignment forward map: every atom carries an identical routing weight, the
 /// LSQ decoder init projects the same target onto every atom, and the
 /// assignment update has no gradient to break the tie, so the fit never routes.
-/// The tiny `random_state` jitter is too weak to escape on conditioned data.
 ///
 /// This helper runs one decoder-then-routing initialization step on the seed geometry: it fits
 /// each atom's decoder independently against the *full* response (each atom's
@@ -30,9 +29,10 @@ use super::{SaeAtomBasisKind, SaeManifoldTerm};
 /// per-row reconstruction residual under that fit, and emits mean-centred logits
 /// that prefer the atom which best explains each row. Rows that every atom
 /// explains equally well land at exactly zero logits (the residual ties centre
-/// to the neutral state), so the existing jitter still breaks those rare ties;
-/// rows with a clear best atom get a decisive — but bounded, hence escapable by
-/// the Newton refinement — head start. The mean-centring is translation-identity
+/// to the neutral state): the data carry no routing preference for those rows
+/// at the seed geometry, so none is invented for them. Rows with a clear best
+/// atom get a decisive — but bounded, hence escapable by the Newton refinement
+/// — head start. The mean-centring is translation-identity
 /// for softmax and keeps the ordered Beta--Bernoulli `sigmoid(logit/τ)` gate neutral (0.5) on
 /// ties instead of slamming both gates shut, so the seed is safe for both
 /// assignment maps. The result is a proper routing seed rather than a
@@ -794,49 +794,8 @@ pub fn sae_decoder_lsq_init(
             }
         }
     }
-    // Symmetric normal-equations matrix and rhs.
-    let mut xtx = fast_ata(&x);
-    // Diagonal Tikhonov ridge for the seed projection (issue #671 multi-atom
-    // conditioning). The cold multi-atom seed places near-identical coordinates
-    // on every atom (the periodic seed shares the leading principal component
-    // across atoms), so the joint design's per-atom column blocks are nearly
-    // collinear and `X^T X` is severely ill-conditioned. A tiny mean-relative
-    // ridge (the historical `mean_diag * 1e-8`) leaves the near-null directions
-    // unregularized, producing decoder coefficients of order 1e5; the
-    // DecoderIncoherence penalty's gradient is cubic in `B`, so those seeds blow
-    // the joint solver up by ~1e15. We instead anchor the ridge to the SPECTRAL
-    // scale (the maximum diagonal, an upper bound on the largest eigenvalue)
-    // with a larger relative floor. This bounds the seed solution norm by
-    // roughly `||X^T Z|| / ridge` while leaving well-conditioned designs
-    // essentially unchanged (the ridge stays negligible against the signal
-    // eigenvalues there). Conditioning the seed is correct here: the inner
-    // data-fit Newton step refines `B` from a sane, bounded starting point
-    // rather than a pathological one.
-    let mut trace = 0.0_f64;
-    let mut max_diag = 0.0_f64;
-    for i in 0..m_total {
-        let d = xtx[[i, i]];
-        trace += d;
-        if d > max_diag {
-            max_diag = d;
-        }
-    }
-    let mean_diag = (trace / m_total as f64).max(0.0);
-    // Spectral-scale ridge: tie the floor to the largest diagonal so collinear
-    // column blocks (small eigenvalues) are damped relative to the design's
-    // dominant scale, not its average. `1e-4` is large enough to keep the seed
-    // coefficient norm bounded under near-duplicate atoms yet small enough that
-    // a well-conditioned design recovers essentially the unregularized LSQ fit.
-    let spectral_scale = max_diag.max(mean_diag).max(1.0e-12);
-    let jitter = spectral_scale * 1.0e-4;
-    for i in 0..m_total {
-        xtx[[i, i]] += jitter;
-    }
-    let xtz = fast_atb(&x, &z.to_owned());
-    let factor = xtx
-        .cholesky(Side::Lower)
-        .map_err(|err| format!("sae_decoder_lsq_init: Cholesky failed: {err:?}"))?;
-    let b_joint = factor.solve_mat(&xtz);
+    // EXPERIMENT #3260: min-norm LSQ seed, no ridge.
+    let b_joint = crate::manifold::solve_design_least_squares(x.view(), z)?;
     if !b_joint.iter().all(|v| v.is_finite()) {
         return Err("sae_decoder_lsq_init: non-finite LSQ solution".to_string());
     }
@@ -860,8 +819,7 @@ pub fn sae_decoder_lsq_init(
 /// are *shared* across atoms (the seed places the same leading component on
 /// every atom), so each atom's independent LSQ fit against the full response is
 /// equally mediocre on every row: the per-row residual barely separates the
-/// atoms and the logit seed stays near the symmetric saddle the random jitter
-/// cannot escape. The joint solver then never routes (the planted disjoint
+/// atoms and the logit seed stays near the symmetric saddle. The joint solver then never routes (the planted disjoint
 /// atoms collapse to a near-uniform additive blend with negative R²).
 ///
 /// This is the exact dual of the frozen-decoder OOS fix (#628): there, each row
@@ -904,17 +862,9 @@ pub(crate) fn sae_refine_routing_seed(
     alpha: f64,
     tau: f64,
     threshold_gate_threshold: f64,
-    random_state: u64,
 ) -> Result<(), String> {
     const SAE_SEED_REFINE_ROUNDS: usize = 4;
     const SAE_RESIDUAL_SEED_GAIN: f64 = 4.0;
-    // Same tiny seed-keyed logit jitter the cold-start path applies (issue
-    // #178): the refined residual logits are decisive (O(gain)), so this 1e-3
-    // perturbation does not change which atom wins, but it keeps distinct
-    // `random_state` values on distinct inner Newton trajectories and fixed
-    // seeds bit-identical. Without it, the deterministic alternating seed would erase
-    // the seed-dependence the cold-start jitter installed upstream.
-    const SAE_RANDOM_STATE_LOGIT_JITTER: f64 = 1.0e-3;
     let k_atoms = basis_sizes.len();
     let n_obs = z.nrows();
     if k_atoms <= 1 || n_obs == 0 {
@@ -972,22 +922,6 @@ pub(crate) fn sae_refine_routing_seed(
         let logits =
             sae_residual_seed_logits(basis3.view(), basis_sizes, z, SAE_RESIDUAL_SEED_GAIN)?;
         term.assignment.logits.assign(&logits);
-    }
-    // Re-apply the seed-keyed jitter the deterministic refinement above erased,
-    // so `random_state` keeps perturbing the inner Newton trajectory (#178).
-    let mut state = random_state
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    for row in 0..n_obs {
-        for atom_idx in 0..k_atoms {
-            state = state
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            // Map top 53 bits to a double in [0, 1), then to [-1, 1).
-            let u = ((state >> 11) as f64) * f64::from_bits(0x3CA0000000000000);
-            let signed = 2.0 * u - 1.0;
-            term.assignment.logits[[row, atom_idx]] += SAE_RANDOM_STATE_LOGIT_JITTER * signed;
-        }
     }
     Ok(())
 }
