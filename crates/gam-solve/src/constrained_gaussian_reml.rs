@@ -29,7 +29,7 @@ use gam_linalg::faer_ndarray::{
 };
 use gam_linalg::matrix::symmetrize_in_place;
 use gam_problem::LinearInequalityConstraints;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, s};
 use crate::exact_jet_objective::{certified_newton_minimum, exact_jet};
 use opt::{Bounds, GradientTolerance, ObjectiveEvalError};
 
@@ -220,6 +220,7 @@ pub fn constrained_gaussian_reml_forward(
         let (qp_beta, qp_active) = solve_spectral_constrained_quadratic(
             &unconstrained.cache,
             &gram,
+            &penalty,
             &rhs,
             lambda,
             &beta_start,
@@ -256,6 +257,7 @@ pub fn constrained_gaussian_reml_forward(
         let (qp_check, next_hint) = solve_spectral_constrained_quadratic(
             &unconstrained.cache,
             &gram,
+            &penalty,
             &rhs,
             accepted.lambda,
             &accepted_beta,
@@ -298,13 +300,15 @@ pub fn constrained_gaussian_reml_forward(
 }
 
 /// Solve the KKT problem in the same data-whitened penalty modes as REML.
-/// With `BᵀGB = I` and `BᵀSB = diag(δ)`, the map
-/// `β = B diag((1 + λδ)^(-1/2)) u` gives an identity Hessian. This keeps the
-/// active-face search and its terminal audit resolved even when the penalty
-/// dominates the data by more than the natural coordinates can represent.
+/// With `M = [B, B₀]`, `MᵀGM = diag(I, 0)` and `MᵀSM = diag(δ, I)`, the map
+/// `β = M diag((1 + λδ)^(-1/2), λ^(-1/2)) u` gives an identity Hessian. This keeps
+/// the active-face search and its terminal audit resolved even when the penalty
+/// dominates the data by more than the natural coordinates can represent. The
+/// data-null block `B₀` is empty unless `G` is singular (#3366).
 fn solve_spectral_constrained_quadratic(
     cache: &GaussianRemlEigenCache,
     gram: &Array2<f64>,
+    penalty: &Array2<f64>,
     rhs: &Array1<f64>,
     lambda: f64,
     beta_start: &Array1<f64>,
@@ -312,11 +316,29 @@ fn solve_spectral_constrained_quadratic(
     warm_active_set: Option<&[usize]>,
 ) -> Result<(Array1<f64>, Vec<usize>), EstimationError> {
     let p = rhs.len();
-    let mut coefficient_map = cache.coefficient_basis.clone();
-    // B⁻¹ = BᵀG: no inverse of the ill-conditioned penalized Hessian is formed.
-    let mut transformed_start = cache.coefficient_basis.t().dot(&gram.dot(beta_start));
+    let data_rank = cache.coefficient_basis.ncols();
+    let mut coefficient_map = Array2::<f64>::zeros((p, p));
+    coefficient_map
+        .slice_mut(s![.., ..data_rank])
+        .assign(&cache.coefficient_basis);
+    coefficient_map
+        .slice_mut(s![.., data_rank..])
+        .assign(&cache.data_null_basis);
+    // M⁻¹β = [BᵀGβ; B₀ᵀSβ]: no inverse of the ill-conditioned penalized Hessian is formed.
+    let mut transformed_start = Array1::<f64>::zeros(p);
+    transformed_start
+        .slice_mut(s![..data_rank])
+        .assign(&cache.coefficient_basis.t().dot(&gram.dot(beta_start)));
+    transformed_start
+        .slice_mut(s![data_rank..])
+        .assign(&cache.data_null_basis.t().dot(&penalty.dot(beta_start)));
     for index in 0..p {
-        let scale = (1.0 + lambda * cache.classified_penalty_eigenvalue(index)).sqrt();
+        let curvature = if index < data_rank {
+            1.0 + lambda * cache.classified_penalty_eigenvalue(index)
+        } else {
+            lambda
+        };
+        let scale = curvature.sqrt();
         coefficient_map
             .column_mut(index)
             .mapv_inplace(|value| value / scale);
@@ -1470,6 +1492,7 @@ mod tests {
             let (beta, active) = solve_spectral_constrained_quadratic(
                 &cache,
                 &gram,
+                &penalty,
                 &array![0.0, 0.0, -1.0],
                 lambda,
                 &array![0.0, 0.0, 0.1],
