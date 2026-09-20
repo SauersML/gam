@@ -2779,12 +2779,12 @@
     "base": "9a85f74852b47d8cfe85d9673f6940c96494a3aa",
     "items": [
       "crates/gam-report/src/lib.rs:fn:fmt_num",
-      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_positive",
-      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_negative",
-      "crates/gam-report/src/lib.rs:fn:fmt_num_just_below_1e4",
       "crates/gam-report/src/lib.rs:fn:fmt_num_at_1e4_uses_scientific",
-      "crates/gam-report/src/lib.rs:fn:fmt_num_just_above_0_01_threshold",
       "crates/gam-report/src/lib.rs:fn:fmt_num_exactly_0_01_uses_scientific",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_above_0_01_threshold",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_just_below_1e4",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_negative",
+      "crates/gam-report/src/lib.rs:fn:fmt_num_normal_range_positive",
       "crates/gam-report/src/lib.rs:fn:fmt_num_zero_uses_scientific"
     ],
     "reason": "#2469: fmt_num was a second number format with hand-picked switch points (1e-2, 1e4) beside format_significant, the documented format of every printed model summary. Every caller now uses format_significant (C %g at precision 6), and the fmt_num_* tests are replaced by format_significant_* tests.",
