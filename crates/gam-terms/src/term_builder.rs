@@ -5434,13 +5434,13 @@ fn parse_tensor_per_axis_usize(
 /// The polynomial degree of the natural cubic regression margin. It is not a
 /// parameter of that basis — a "cubic regression spline" IS cubic — so a margin
 /// that asks for any other degree cannot be realized as one.
-const CR_MARGIN_DEGREE: usize = 3;
+pub(crate) const CR_MARGIN_DEGREE: usize = 3;
 
 /// The derivative order the natural cubic regression penalty integrates. Like
 /// [`CR_MARGIN_DEGREE`], this is definitional rather than adjustable: the cr
 /// penalty is the exact integrated squared SECOND derivative of the
 /// interpolating cubic.
-const CR_MARGIN_PENALTY_ORDER: usize = 2;
+pub(crate) const CR_MARGIN_PENALTY_ORDER: usize = 2;
 
 /// The declared `knot_placement=`, distinguishing "unset" from an explicit
 /// `knot_placement=uniform`.
