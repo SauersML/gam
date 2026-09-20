@@ -2940,5 +2940,28 @@
     ],
     "reason": "#3745: residual derivatives now use the shared inverse-link jets, including Gaussian tail-safe products. The redundant fourth-derivative dispatcher is removed and its sole row-kernel caller directly uses the shared dispatcher. Residual-to-standard-link mapping derives from the same component owner.",
     "evidence": "Complete production gam-models source compiled and ran three focused regressions on MSI with coherent current-main dependencies: independent Hermite references, infinite/NaN limits across all residual laws, and nonzero Gaussian subnormal derivatives after density underflow. Complete unit metadata passes with warnings denied. Reference audit finds no remaining use of the removed dispatcher; row_kernel calls inverse_link_pdffourth_derivative_for_inverse_link directly."
+  },
+  {
+    "base": "ae1efe8d3f718ab9f7678a81f9d2d8bc4713ebfe",
+    "items": [
+      "crates/gam-predict/src/bernoulli_marginal_slope.rs:fn:block_roles",
+      "crates/gam-predict/src/bernoulli_marginal_slope.rs:fn:n_blocks",
+      "crates/gam-predict/src/binomial_location_scale.rs:fn:block_roles",
+      "crates/gam-predict/src/binomial_location_scale.rs:fn:n_blocks",
+      "crates/gam-predict/src/dispersion_location_scale.rs:fn:block_roles",
+      "crates/gam-predict/src/dispersion_location_scale.rs:fn:n_blocks",
+      "crates/gam-predict/src/gaussian_location_scale.rs:fn:block_roles",
+      "crates/gam-predict/src/gaussian_location_scale.rs:fn:n_blocks",
+      "crates/gam-predict/src/lib.rs:fn:block_roles",
+      "crates/gam-predict/src/lib.rs:fn:n_blocks",
+      "crates/gam-predict/src/standard.rs:fn:block_roles",
+      "crates/gam-predict/src/standard.rs:fn:n_blocks",
+      "crates/gam-predict/src/survival.rs:fn:block_roles",
+      "crates/gam-predict/src/survival.rs:fn:n_blocks",
+      "crates/gam-predict/src/transformation_normal.rs:fn:block_roles",
+      "crates/gam-predict/src/transformation_normal.rs:fn:n_blocks"
+    ],
+    "reason": "Remove the unused PredictableModel block_roles/n_blocks API and the FittedModelPredictExt block_roles error-erasing wrapper. Predictor construction now has one Result contract; no production caller consumes either removed introspection method.",
+    "evidence": "Full workspace caller census found only the removed wrapper and one assertion for block_roles; all n_blocks callers target UnifiedFitResult or gauges, not PredictableModel. Removed all seven family implementation copies and the dead assertion. Complete predict/CLI unit source plus predict/root/CLI/PyFFI production metadata pass warnings-denied checks; runtime tests cover retained prediction behavior and contextual refusal reasons."
   }
 ]

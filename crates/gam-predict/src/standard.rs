@@ -512,17 +512,6 @@ impl PredictableModel for StandardPredictor {
         predict_posterior_mean_generic(self, input, fit, options)
     }
 
-    fn n_blocks(&self) -> usize {
-        if self.link_wiggle.is_some() { 2 } else { 1 }
-    }
-
-    fn block_roles(&self) -> Vec<BlockRole> {
-        if self.link_wiggle.is_some() {
-            vec![BlockRole::Mean, BlockRole::LinkWiggle]
-        } else {
-            vec![BlockRole::Mean]
-        }
-    }
 }
 
 #[cfg(test)]

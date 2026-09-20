@@ -1,6 +1,6 @@
 use gam::families::survival::location_scale::ResidualDistribution;
 use gam::families::survival::lognormal_kernel::FrailtySpec;
-// `predictor()` / `block_roles()` are provided by the predict extension trait,
+// `predictor()` is provided by the predict extension trait,
 // which moved into `gam-predict` when the prediction engine was peeled out.
 use gam::inference::model::{
     FittedEstimator, FittedFamily, FittedModel, FittedModelPayload, MODEL_PAYLOAD_VERSION,
@@ -642,11 +642,7 @@ fn survival_marginal_slope_saved_models_require_special_predict_handling() {
 
     assert_eq!(model.predict_model_class(), PredictModelClass::Survival);
     assert!(
-        model.predictor().is_none(),
+        model.predictor().is_err(),
         "saved survival marginal-slope models should bypass the generic predictor path"
-    );
-    assert!(
-        model.block_roles().is_none(),
-        "saved survival marginal-slope models should not advertise incorrect generic block roles"
     );
 }

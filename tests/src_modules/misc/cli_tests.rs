@@ -8347,7 +8347,7 @@ fn binomial_location_scale_wiggle_uses_unified_generate_path() {
         Some(vec![-3.0, -3.0, -3.0, -3.0, 0.0, 3.0, 3.0, 3.0, 3.0]),
         Some(3),
     );
-    assert!(model.predictor().is_some());
+    assert!(model.predictor().is_ok());
     let data = ndarray::Array2::<f64>::zeros((2, 0));
     let headers = vec![];
     let col_map = HashMap::new();
