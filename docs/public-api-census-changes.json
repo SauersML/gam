@@ -4835,11 +4835,11 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3144 (pygam-spec-aliases) merged as c663ba6dbaaaab008f9ec054a7ea349637fb649a with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from c663ba6dbaaaab008f9ec054a7ea349637fb649a's own tree with --base a5c3a5b6e7df11b78179fc274d6843687abe66a3 --head c663ba6dbaaaab008f9ec054a7ea349637fb649a (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The census lists exactly this removal. Read-proof: git grep -w -c <name> c663ba6dbaaaab008f9ec054a7ea349637fb649a -- <its path> gives 0 for every item."
   },
   {
-    "base": "5d939758edacc4ef62609fd1008b46f082821f1c",
+    "base": "b3832b9299c77b4f036b06d88d10e5a988126257",
     "removed": {
       "crates/gam-models/src/bms/mod.rs::weighted_ridge_sandwich_cov": 1
     },
     "reason": "#3047/#3030/#3010 (PR #3222, pr-land comment 5748106176). The stacked first-stage variance now inverts the block-triangular bread J = [[M,0],[M_vm,N]] as J^-1 = [[M+,0],[K,N+]] with K = N+ M_vm M+ in stacked_first_stage_inverse_bread, and carries the constant variance stage in theta1 (dzeta/dv = -zeta/(2v)). That replaces weighted_ridge_sandwich_cov (the mean-only sandwich that omitted the variance stage, #3030) and signed_weighted_gram (whose -2 M_vm cross block gave the wrong sign, #3047); the rank-deficient finiteness test exercised only the deleted sandwich.",
-    "evidence": "At base 5d939758 weighted_ridge_sandwich_cov is pub(crate) at bms/mod.rs:2039 with its callers in bms/mod.rs and one rigid test; at the head it is gone and stacked_first_stage_sandwich_cov (built on stacked_first_stage_inverse_bread) is the only first-stage covariance. cargo check --workspace --tests is clean."
+    "evidence": "At base b3832b92 weighted_ridge_sandwich_cov is pub(crate) at bms/mod.rs:2039 with its callers in bms/mod.rs and one rigid test; at the head it is gone and stacked_first_stage_sandwich_cov (built on stacked_first_stage_inverse_bread) is the only first-stage covariance. cargo check --workspace --tests is clean."
   }
 ]
