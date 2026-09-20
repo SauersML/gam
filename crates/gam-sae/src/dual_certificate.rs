@@ -265,6 +265,7 @@ pub fn sparse_route_dual_certificate(
     if k == 0 {
         return Err("sparse_route_dual_certificate: dictionary has no atoms".to_string());
     }
+    crate::sparse_dict::require_unit_norm_atoms(decoder, "sparse_route_dual_certificate")?;
     if data.ncols() != p {
         return Err(format!(
             "sparse_route_dual_certificate: data has P={} columns but the decoder has P={p}",
@@ -502,3 +503,43 @@ fn block_route_dual_certificate_scaled(
     Ok(assemble_report(rows, max_candidates))
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    /// The certificate compares the off-support gate with the weakest active code, which is
+    /// only meaningful for unit atoms. Storing the off-support atom at norm 4 leaves the
+    /// dictionary's geometry unchanged but would multiply its gate by 4 and flip the verdict,
+    /// so the row is refused instead of certified in the checkpoint's own scale.
+    #[test]
+    fn a_non_unit_decoder_row_is_refused() {
+        // r = x − 1·e₀ = 0.5·e₁: off-support gate 0.5 below active mass 1, certified.
+        let data = array![[1.0_f32, 0.5, 0.0]];
+        let indices = array![[0_u32]];
+        let codes = array![[1.0_f32]];
+        let unit = array![[1.0_f32, 0.0, 0.0], [0.0, 1.0, 0.0]];
+        let report = sparse_route_dual_certificate(
+            data.view(),
+            unit.view(),
+            indices.view(),
+            codes.view(),
+            4,
+        )
+        .expect("unit decoder");
+        assert_eq!(report.frac_certified, 1.0);
+        assert!(report.birth_candidates.is_empty());
+
+        let scaled = array![[1.0_f32, 0.0, 0.0], [0.0, 4.0, 0.0]];
+        let err = sparse_route_dual_certificate(
+            data.view(),
+            scaled.view(),
+            indices.view(),
+            codes.view(),
+            4,
+        )
+        .expect_err("a norm-4 atom must be refused");
+        assert!(err.contains("decoder atom 1"), "{err}");
+    }
+}
