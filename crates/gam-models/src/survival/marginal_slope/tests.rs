@@ -4625,11 +4625,14 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline first callback")
         .expect("FLEX baseline first terms are present");
     assert_eq!(first.score_psi.len(), dimension);
-    let first_hessian = first
-        .hessian_psi_operator
-        .as_ref()
-        .expect("FLEX baseline first Hessian operator")
-        .to_dense();
+    // gam#3061: the ζ composition serves this frame's chart terms with a dense θ Hessian.
+    assert!(family.timewiggle_zeta_available());
+    assert!(
+        first.hessian_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline θ Hessian"
+    );
+    let first_hessian = first.hessian_psi.clone();
+    assert!(first_hessian.iter().any(|value| *value != 0.0));
     assert_eq!(first_hessian.dim(), (dimension, dimension));
     assert!(first.score_psi.iter().all(|value| value.is_finite()));
     assert!(first_hessian.iter().all(|value| value.is_finite()));
@@ -8511,6 +8514,106 @@ fn rigid_row_primary_mixed_in_z_matches_finite_difference() {
         checked, 360,
         "the grid must be exercised in full; a silently skipped cell is not a passing gate"
     );
+}
+
+/// A time block's exit design with `p_base` base columns and a zero placeholder
+/// wiggle tail, the baseline predictor it carries, and the wiggle it declares.
+fn placeholder_time_exit_with_wiggle(
+    p_base: usize,
+) -> (DesignMatrix, Array1<f64>, TimeWiggleBlockInput, Array2<f64>) {
+    let n = 40;
+    let offset_exit = Array1::from_shape_fn(n, |i| -1.5 + 3.0 * i as f64 / (n - 1) as f64);
+    let degree = 3;
+    let knots = gam_terms::basis::initializewiggle_knots_from_seed(offset_exit.view(), degree, 2)
+        .expect("wiggle knots from the baseline predictor");
+    let jacobian = crate::wiggle::monotone_wiggle_basis_from_knots(offset_exit.view(), &knots, degree)
+        .expect("warp Jacobian at the baseline predictor");
+    let ncols = jacobian.ncols();
+    let mut placeholder = Array2::<f64>::zeros((n, p_base + ncols));
+    for i in 0..n {
+        for j in 0..p_base {
+            placeholder[[i, j]] = offset_exit[i].powi(j as i32);
+        }
+    }
+    (
+        DesignMatrix::from(placeholder),
+        offset_exit,
+        TimeWiggleBlockInput { knots, degree, ncols },
+        jacobian,
+    )
+}
+
+fn embedded_penalty(p: usize, range: std::ops::Range<usize>, local: &Array2<f64>) -> Array2<f64> {
+    let mut embedded = Array2::<f64>::zeros((p, p));
+    embedded.slice_mut(s![range.clone(), range]).assign(local);
+    embedded
+}
+
+/// gam#3061: a timewiggle-only time block (no base columns) is exactly the
+/// production refusal when seeded against its placeholder design; seeded against
+/// the acting design, its wiggle penalty reads the warp Jacobian's scale.
+#[test]
+fn timewiggle_penalties_are_seeded_against_the_warp_jacobian_3061() {
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(0);
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![embedded_penalty(wiggle.ncols, 0..wiggle.ncols, &wiggle_local)];
+
+    let refused = block_log_lambda_seeds(&placeholder, penalties.iter())
+        .expect_err("the control must refuse: the placeholder tail has an all-zero Gram");
+    assert!(refused.contains("mean Gram diagonal is 0e0"), "{refused}");
+
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    assert_eq!(acting.to_dense(), jacobian, "the wiggle tail must be the warp Jacobian");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("a wiggle penalty seeds against the Jacobian");
+    let expected = block_log_lambda_seeds(&DesignMatrix::from(jacobian.clone()), [&wiggle_local])
+        .expect("seed against the Jacobian itself");
+    assert_eq!(seeds, expected);
+
+    // The ρ domain is read against the same design, and the placeholder's all-zero
+    // Gram carried no resolvability information for it.
+    let (lo, hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&acting, penalties.iter());
+    let (placeholder_lo, placeholder_hi) =
+        crate::fit_orchestration::drivers::penalized_block_rho_domain(&placeholder, penalties.iter());
+    assert!(lo[0].is_finite() && hi[0].is_finite() && lo[0] < hi[0], "[{}, {}]", lo[0], hi[0]);
+    assert_ne!(
+        (lo[0], hi[0]),
+        (placeholder_lo[0], placeholder_hi[0]),
+        "the acting design must resolve the wiggle penalty's own domain"
+    );
+}
+
+/// gam#3061: with base columns beside the wiggle, each time penalty is seeded
+/// against the part it acts on, and a penalty coupling the two parts is refused.
+#[test]
+fn time_penalties_are_seeded_against_the_part_they_act_on_3061() {
+    let p_base = 2;
+    let (placeholder, offset_exit, wiggle, jacobian) = placeholder_time_exit_with_wiggle(p_base);
+    let p = p_base + wiggle.ncols;
+    let base_local = array![[0.0, 0.0], [0.0, 1.0]];
+    let wiggle_local = Array2::<f64>::eye(wiggle.ncols);
+    let penalties = vec![
+        embedded_penalty(p, 0..p_base, &base_local),
+        embedded_penalty(p, p_base..p, &wiggle_local),
+    ];
+    let acting = time_block_acting_exit_design(&placeholder, offset_exit.view(), Some(&wiggle))
+        .expect("acting exit design");
+    let seeds = time_block_log_lambda_seeds(&acting, &penalties, wiggle.ncols)
+        .expect("time seeds on the acting design");
+
+    let base_design = DesignMatrix::from(placeholder.to_dense().slice(s![.., ..p_base]).to_owned());
+    let base_seed = block_log_lambda_seeds(&base_design, [&base_local]).expect("base seed");
+    let wiggle_seed = block_log_lambda_seeds(&DesignMatrix::from(jacobian), [&wiggle_local])
+        .expect("wiggle seed");
+    assert_relative_eq!(seeds[0], base_seed[0], max_relative = 1e-12);
+    assert_relative_eq!(seeds[1], wiggle_seed[0], max_relative = 1e-12);
+
+    let coupled = &penalties[0] + &penalties[1];
+    let refused = time_block_log_lambda_seeds(&acting, &[coupled], wiggle.ncols)
+        .expect_err("a penalty on both parts has no single scale");
+    assert!(refused.contains("couples the base columns"), "{refused}");
 }
 
 /// #932 single-source pin, restored (#2818): the SPECIALIZED rigid-row

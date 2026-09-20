@@ -1329,6 +1329,7 @@ mod tests {
                 reparam_qs: None,
                 dispersion: gam_solve::estimate::Dispersion::UNIT,
                 factorized_standard_errors: None,
+                smoothing_correction_factorized: None,
                 beta_covariance_frequentist: None,
                 coefficient_influence: None,
                 weighted_gram: None,

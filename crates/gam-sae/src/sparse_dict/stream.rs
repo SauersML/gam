@@ -858,16 +858,32 @@ mod stream_tests {
 
     #[test]
     fn epoch_report_carries_percolation_and_cg_kappa() {
+        // A ring of K = 12 unit atoms on the Clifford torus in P = 4, so the
+        // co-firing graph is one component of m = K atoms with m² > K·P: the
+        // #3124 cost route cannot pick dense Cholesky, and the component is
+        // solved by block CG, which is what reports κ̂. Neighbouring atoms have
+        // cosine (cos 30° + cos 60°)/2 ≈ 0.68 and atoms two apart are
+        // orthogonal, so each row dᵢ + 0.8·dᵢ₊₁ fires exactly atoms i, i+1.
         let k = 12usize;
-        let p = 12usize;
+        let p = 4usize;
+        let atom = |i: usize| {
+            let theta = std::f32::consts::TAU * i as f32 / k as f32;
+            let s = std::f32::consts::FRAC_1_SQRT_2;
+            [
+                s * theta.cos(),
+                s * theta.sin(),
+                s * (2.0 * theta).cos(),
+                s * (2.0 * theta).sin(),
+            ]
+        };
         let mut seed = Array2::<f32>::zeros((k, p));
-        for i in 0..k {
-            seed[[i, i]] = 1.0;
-        }
         let mut shard = Array2::<f32>::zeros((k, p));
         for i in 0..k {
-            shard[[i, i]] = 1.0;
-            shard[[i, (i + 1) % k]] = 0.8;
+            let (a, b) = (atom(i), atom((i + 1) % k));
+            for c in 0..p {
+                seed[[i, c]] = a[c];
+                shard[[i, c]] = a[c] + 0.8 * b[c];
+            }
         }
         let config = SparseDictConfig {
             n_atoms: k,

@@ -8065,21 +8065,30 @@ pub(crate) fn run_outer_uncertified(
                 // not collapse that checkpoint back into success below;
                 // continue it with the analytic-gradient fallback that the
                 // capability ladder already declared.
+                //
+                // #2822 — the same holds for a walk that stopped without a claim: the
+                // unprogressing-walk guard and the iteration cap both hand back the best
+                // iterate the walk evaluated. The declared BFGS attempt runs either way,
+                // and it resumes from that checkpoint rather than restarting at the seed.
+                // Restarting discarded the walk: planted-circle SAE fits stopped their EFS
+                // walk at |Pg| ≈ 1e-3 on the guard (each step's decrease ~g²/h sits far
+                // under the 1/(2n) resolution), BFGS re-ran from the seed, and the
+                // terminal certificate refused the EFS checkpoint it could not beat.
                 let has_bfgs_fallback = attempts
                     .get(attempt_idx + 1)
                     .is_some_and(|next| matches!(plan(next).solver, Solver::Bfgs));
-                if result.solver_claimed_convergence()
-                    && matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
+                if matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
                     && has_bfgs_fallback
                 {
                     log::debug!(
-                        "[OUTER] {context}: {:?} stopped at a fixed point, but no \
+                        "[OUTER] {context}: {:?} stopped (solver claim: {}), but no \
                          candidate passed analytic screening; continuing the best finite \
                          checkpoint with analytic-gradient BFGS",
                         the_plan.solver,
+                        result.solver_claimed_convergence(),
                     );
                     last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                        "{:?} fixed point was refuted by analytic screening",
+                        "{:?} checkpoint was refuted by analytic screening",
                         the_plan.solver,
                     )));
                     spent_iterations = spent_iterations.saturating_add(result.iterations);
@@ -8958,6 +8967,58 @@ where
     }
 }
 
+/// Judge a fixed-point stop that is not itself a stationarity claim (a
+/// step-norm stop, or a walk that stopped buying criterion improvement) by the
+/// screening certificate the plan applies to every claim. A certified point is
+/// returned as the walk's answer. A refused one is handed, as `continuation`,
+/// to the analytic-gradient plan that `automatic_fallback_attempts` declares
+/// for this capability; without that plan it is a resumable checkpoint, not a
+/// candidate.
+fn judge_fixed_point_stop(
+    obj: &mut dyn OuterObjective,
+    config: &OuterConfig,
+    context: &str,
+    label: &str,
+    stop: &str,
+    mut result: OuterResult,
+    continuation: FixedPointContinuationCheckpoint,
+) -> Result<OuterResult, FixedPointOuterRunError> {
+    match certify_outer_optimality_with_fidelity(
+        obj,
+        config,
+        context,
+        &mut result,
+        CertificationFidelity::Screening,
+    ) {
+        Ok(certificate) => {
+            result.criterion_certificate = Some(certificate);
+            Ok(result)
+        }
+        Err(refusal)
+            if config.fallback_policy == FallbackPolicy::Automatic
+                && obj.capability().gradient == Derivative::Analytic =>
+        {
+            log::debug!(
+                "[OUTER] {context}: {label} {stop} stop after {} iteration(s) at \
+                 cost={:.6e} is not stationary; continuing it with the \
+                 analytic-gradient plan: {refusal}",
+                result.iterations,
+                result.final_value,
+            );
+            Err(FixedPointOuterRunError::IterationRejected(
+                FixedPointContinuationRequest {
+                    checkpoint: continuation,
+                    refusal: ObjectiveEvalError::recoverable_from(refusal),
+                },
+            ))
+        }
+        Err(_) => {
+            result.termination = OuterTermination::Exhausted;
+            Ok(result)
+        }
+    }
+}
+
 pub(crate) fn run_fixed_point_outer_solver(
     obj: &mut dyn OuterObjective,
     layout: OuterThetaLayout,
@@ -9109,30 +9170,48 @@ pub(crate) fn run_fixed_point_outer_solver(
             }
             // The bridge stopped a walk that bought nothing since its previous
             // window (#2817). That is no convergence claim: the best iterate the
-            // walk evaluated is a checkpoint for the terminal certificate, as an
-            // exhausted walk's is.
+            // walk evaluated is the point it leaves behind. It is judged below
+            // exactly as a step-norm stop is, because an unprogressing EFS walk
+            // is the same failure one window later: the ratio-of-traces map has
+            // stopped moving the criterion, which says nothing about the
+            // gradient. On the K=1 generated-seed circle (#2153) the walk
+            // stalled 32 iterations in at |g| = 7.3e-3, and publishing that
+            // stall as the plan's terminal checkpoint skipped the analytic-
+            // gradient continuation the capability declares.
             if let Some(evaluations) = unprogressing_exit.lock().ok().and_then(|slot| *slot) {
                 let best = best_iterate
                     .lock()
                     .expect("fixed-point best-iterate publication lock poisoned")
                     .clone();
-                let mut checkpoint = if best.sample.value.is_finite()
+                let (mut checkpoint, continuation) = if best.sample.value.is_finite()
                     && (!result.final_value.is_finite() || best.sample.value < result.final_value)
                 {
                     let mut substituted = OuterResult::new(
-                        best.point,
+                        best.point.clone(),
                         best.sample.value,
                         result.iterations.max(evaluations),
                         false,
                         the_plan,
                     );
                     substituted.origin = OuterResultOrigin::FixedPointBestIterateSubstitution;
-                    substituted
+                    (substituted, best)
                 } else {
-                    result
+                    let last = incumbent
+                        .lock()
+                        .expect("fixed-point incumbent publication lock poisoned")
+                        .clone();
+                    (result, last)
                 };
                 checkpoint.termination = OuterTermination::Exhausted;
-                return Ok(checkpoint);
+                return judge_fixed_point_stop(
+                    obj,
+                    config,
+                    context,
+                    label,
+                    "unprogressing-walk",
+                    checkpoint,
+                    continuation,
+                );
             }
             // Every other stop is a step-norm test: the map proposed a step below
             // `config.tolerance`, through the bridge's per-coordinate test or opt's
@@ -9147,49 +9226,11 @@ pub(crate) fn run_fixed_point_outer_solver(
             //
             // So the stop is judged here, by the screening certificate the plan
             // applies to every claim, while this incumbent can still be continued.
-            match certify_outer_optimality_with_fidelity(
-                obj,
-                config,
-                context,
-                &mut result,
-                CertificationFidelity::Screening,
-            ) {
-                Ok(certificate) => {
-                    result.criterion_certificate = Some(certificate);
-                    Ok(result)
-                }
-                // The analytic-gradient BFGS plan that `automatic_fallback_attempts`
-                // declares for this capability continues the exact incumbent, which
-                // is the point the refused stop left in place.
-                Err(refusal)
-                    if config.fallback_policy == FallbackPolicy::Automatic
-                        && obj.capability().gradient == Derivative::Analytic =>
-                {
-                    log::debug!(
-                        "[OUTER] {context}: {label} step-norm stop after {} iteration(s) at \
-                         cost={:.6e} is not stationary; continuing the incumbent with the \
-                         analytic-gradient plan: {refusal}",
-                        result.iterations,
-                        result.final_value,
-                    );
-                    let checkpoint = incumbent
-                        .lock()
-                        .expect("fixed-point incumbent publication lock poisoned")
-                        .clone();
-                    Err(FixedPointOuterRunError::IterationRejected(
-                        FixedPointContinuationRequest {
-                            checkpoint,
-                            refusal: ObjectiveEvalError::recoverable_from(refusal),
-                        },
-                    ))
-                }
-                // No declared continuation: the refused point is a resumable
-                // checkpoint, not a candidate.
-                Err(_) => {
-                    result.termination = OuterTermination::Exhausted;
-                    Ok(result)
-                }
-            }
+            let continuation = incumbent
+                .lock()
+                .expect("fixed-point incumbent publication lock poisoned")
+                .clone();
+            judge_fixed_point_stop(obj, config, context, label, "step-norm", result, continuation)
         }
         Err(FixedPointError::MaxIterationsReached { last_solution }) => {
             let step_norm = last_solution.final_step_norm.expect(

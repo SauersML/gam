@@ -156,5 +156,14 @@ fn pair_block_radial_with_j_second_derivatives(
     r: &[f64],
 ) -> super::closed_form_penalty::PairBlockBundle {
     let powers = super::closed_form_penalty::AnisoMetricPowers::new(eta);
-    super::closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(q, m, s, kappa, eta, &powers, r)
+    super::closed_form_penalty::pair_block_radial_with_j_second_derivatives_with_powers(
+        q,
+        m,
+        s,
+        kappa,
+        eta,
+        &powers,
+        r,
+        super::closed_form_penalty::PairOrigin::Full,
+    )
 }
