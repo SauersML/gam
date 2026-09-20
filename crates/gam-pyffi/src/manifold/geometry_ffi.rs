@@ -7703,11 +7703,13 @@ fn predict_encoded_table_full_conformal_impl(
         )
     } else {
         format!(
-            "full-conformal at frozen smoothing parameters by certified augmented refits \
+            "full-conformal by certified augmented refits and per-label LAML re-selection \
+             for one-strength Bernoulli models \
              (conservative numerical enclosure at nominal {:.0}% marginal coverage under \
              exchangeable supplied rows and a fixed symmetric fitting map; independent tie \
-             randomization; conformal_certificate 2 when no strength was selected, \
-             -7 glm_frozen_penalty otherwise; endpoint membership is reported by \
+             randomization; conformal_certificate 1 for Bernoulli re-selection, 2 for a \
+             frozen map with no selected strength, and a negative code for a refused \
+             guarantee; endpoint membership is reported by \
              conformal_lower_closed/conformal_upper_closed)",
             conformal_level * 100.0
         )
@@ -7738,7 +7740,9 @@ fn predict_encoded_table_full_conformal_impl(
 /// without an offset. A Gaussian row's set is that of the fit that re-selects
 /// the smoothing strength by REML on the augmented rows, which carries the
 /// distribution-free finite-sample ≥`conformal_level` marginal-coverage
-/// theorem; a GLM row's set is the certified augmented refit at the frozen
+/// theorem under the symmetry assumptions below. A one-strength Bernoulli row
+/// re-selects that strength by augmented LAML for each label, propagating a
+/// failed selection. Other GLM rows use the certified augmented refit at the frozen
 /// penalty. The returned `conformal_certificate` column is `0` (exact_frozen:
 /// representable-f64 membership for the stored affine coefficients), `1`
 /// (honest_refit enclosure), or `2` (conservative_frozen enclosure), with

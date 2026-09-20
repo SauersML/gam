@@ -1084,7 +1084,7 @@ pub(crate) fn glm_full_conformal<'py>(
         None => Array1::<f64>::zeros(n),
     };
 
-    let set = GlmFullConformalSubstrate::new(family, x, y, offset, sl, Array1::zeros(p))
+    let set = GlmFullConformalSubstrate::new(family, x, y, offset, sl, Some(0), Array1::zeros(p))
         .and_then(|substrate| substrate.prediction_set(&star, offset_star, alpha))
         .map_err(py_value_error)?;
 

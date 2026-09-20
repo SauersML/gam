@@ -127,7 +127,8 @@ pub enum ConformalRefusal {
     RefitOutsideTube,
     /// The outer engine could not complete a local refit.
     RefitFailed,
-    /// A non-Gaussian likelihood whose fit selected a smoothing strength (or a
+    /// A likelihood without an implemented re-selecting map whose fit selected a
+    /// smoothing strength (or a
     /// negative-binomial θ) on the training rows: the set is that of the
     /// frozen-penalty certified refit, and no REML re-selecting map is built
     /// for these families.
@@ -171,7 +172,8 @@ pub enum ConformalCertificate {
     /// is at least nominal under exchangeability and a fixed symmetric map;
     /// unresolved comparisons can make the enclosure conservative.
     ConservativeFrozen,
-    /// The set of the REML re-selecting map, from the bound plus local refits.
+    /// Conservative numerical enclosure for a re-selecting fitting map:
+    /// Gaussian REML bounds/local refits, or Bernoulli LAML selection per label.
     HonestRefit,
     /// The frozen-ρ set, carrying no finite-sample guarantee, and why.
     Refused(ConformalRefusal),

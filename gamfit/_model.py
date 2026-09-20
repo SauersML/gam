@@ -198,7 +198,10 @@ class Model:
             smoothing strength by REML on the augmented rows (#942 Layer 3), so
             the finite-sample ``conformal_level`` coverage theorem holds; it
             costs one Cholesky per test point plus a cold REML refit at each
-            finite endpoint. Bernoulli-logit (the set is a subset of
+            finite endpoint. A Bernoulli-logit model with one selected strength
+            re-selects it by augmented LAML once per label, using a canonical
+            start and the augmented design's resolvability domain. A failed
+            selection raises an error. Other Bernoulli-logit models (a subset of
             ``{0, 1}``), Poisson-log and negative-binomial-log (candidates
             enumerated up to a data-derived tail beyond which none can conform;
             NB theta frozen at its fitted value) and Gamma-log (Pearson score,
@@ -219,7 +222,7 @@ class Model:
             frozen-penalty set with no finite-sample guarantee for the
             selection step (several smoothing parameters, a payload without the
             count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
-            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            count/Gamma fit that selected a smoothing parameter or NB theta).
             Coverage is marginal under exchangeability of the supplied rows
             and a fixed symmetric design/penalty construction, not conditional
             on features. A training-only learned basis need not satisfy this.
