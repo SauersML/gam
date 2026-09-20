@@ -45,7 +45,10 @@ impl LinearInequalityConstraints {
     ///   the origin and every absolute slack / violation / rank tolerance
     ///   applied later is automatically scale-relative: `1e-20·β ≥ 1e-20` and
     ///   `β ≥ 1` canonicalize to the same row, as they are the same
-    ///   half-space.
+    ///   half-space. The norm is taken after dividing the row by its largest
+    ///   magnitude, so squaring cannot underflow a finite nonzero row to a
+    ///   vacuous zero row or overflow it to a zero unit normal; a bound whose
+    ///   unit-scale value `b_i/‖a_i‖` leaves the finite range is rejected.
     pub fn canonicalized(&self) -> Result<Self, String> {
         let m = self.a.nrows();
         if self.b.len() != m {
@@ -60,10 +63,19 @@ impl LinearInequalityConstraints {
         let mut a = self.a.clone();
         let mut b = self.b.clone();
         for i in 0..m {
-            let norm = a.row(i).dot(&a.row(i)).sqrt();
-            if norm > 0.0 {
+            let row_scale = a.row(i).iter().fold(0.0_f64, |s, &v| s.max(v.abs()));
+            if row_scale > 0.0 {
+                a.row_mut(i).mapv_inplace(|v| v / row_scale);
+                let norm = a.row(i).dot(&a.row(i)).sqrt();
                 a.row_mut(i).mapv_inplace(|v| v / norm);
-                b[i] /= norm;
+                b[i] = b[i] / row_scale / norm;
+                if !b[i].is_finite() {
+                    return Err(format!(
+                        "LinearInequalityConstraints: row {i} has bound {:.3e} against row \
+                         magnitude {row_scale:.3e}; its unit-normal offset is not finite",
+                        self.b[i],
+                    ));
+                }
             } else if b[i] > 0.0 {
                 return Err(format!(
                     "LinearInequalityConstraints: row {i} is zero with positive bound \
@@ -179,6 +191,24 @@ mod tests {
         .unwrap();
         assert!((tiny.a[[0, 0]] - 1.0).abs() < 1e-15);
         assert!((tiny.b[0] - 1.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn canonicalized_keeps_rows_whose_squares_leave_the_float_range() {
+        // `1e-200²` underflows to 0 and `1e200²` overflows to ∞; either way a
+        // norm taken on the raw row would drop `β ≥ 1` from the system.
+        for scale in [1e-200_f64, 1e200] {
+            let c = LinearInequalityConstraints {
+                a: array![[scale, -scale]],
+                b: array![scale],
+            }
+            .canonicalized()
+            .unwrap();
+            let unit = std::f64::consts::FRAC_1_SQRT_2;
+            assert!((c.a[[0, 0]] - unit).abs() < 1e-15, "scale {scale}: {}", c.a);
+            assert!((c.a[[0, 1]] + unit).abs() < 1e-15, "scale {scale}: {}", c.a);
+            assert!((c.b[0] - unit).abs() < 1e-15, "scale {scale}: {}", c.b);
+        }
     }
 
     #[test]

@@ -5,12 +5,22 @@ use gam_math::jet_scalar::SymmetricQuadraticCoefficients;
 use gam_math::probability::normal_logcdf_derivatives;
 use gam_row_macros::row_program;
 
-pub(crate) fn standardize_latent_z_with_policy(
+/// The weighted location and scale of a latent score, with its effective sample
+/// size `(Σw)²/Σw²`.
+pub(crate) struct WeightedLocationScale {
+    pub(crate) mean: f64,
+    pub(crate) sd: f64,
+    pub(crate) effective_n: f64,
+}
+
+/// The weighted mean and standard deviation of `z`, refused where the weights
+/// carry fewer than two effective observations or the spread is inside the
+/// weighted mean's rounding band.
+pub(crate) fn weighted_location_scale(
     z: &Array1<f64>,
     weights: &Array1<f64>,
     context: &str,
-    policy: &LatentZPolicy,
-) -> Result<(Array1<f64>, LatentZNormalization), String> {
+) -> Result<WeightedLocationScale, String> {
     if z.len() != weights.len() {
         return Err(format!(
             "{context} latent-score normalization length mismatch: z={}, weights={}",
@@ -56,6 +66,25 @@ pub(crate) fn standardize_latent_z_with_policy(
             "{context} requires z with positive finite weighted standard deviation"
         ));
     }
+    Ok(WeightedLocationScale {
+        mean,
+        sd,
+        effective_n,
+    })
+}
+
+pub(crate) fn standardize_latent_z_with_policy(
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+    context: &str,
+    policy: &LatentZPolicy,
+) -> Result<(Array1<f64>, LatentZNormalization), String> {
+    let WeightedLocationScale {
+        mean,
+        sd,
+        effective_n,
+    } = weighted_location_scale(z, weights, context)?;
+    let weight_sum = weights.iter().copied().sum::<f64>();
     let target_norm = match policy.normalization {
         LatentZNormalizationMode::None => LatentZNormalization { mean: 0.0, sd: 1.0 },
         LatentZNormalizationMode::FitWeighted => LatentZNormalization { mean, sd },
@@ -162,34 +191,140 @@ pub fn padded_deviation_seed(seed: &Array1<f64>, min_iqr: f64, pad_fraction: f64
     Array1::from_vec(out)
 }
 
-/// Pooled 2-parameter (intercept, slope) probit pilot, by Newton on the convex
-/// negative log-likelihood.
+/// A threshold on the latent score that separates the binary outcomes: every
+/// weighted success lies on one side of it and every weighted failure on the
+/// other, ties at the threshold allowed (quasi-complete separation).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct PooledScoreSeparation {
+    pub(super) threshold: f64,
+    pub(super) positive_above_threshold: bool,
+}
+
+/// Why the pooled probit pilot has no pair to return.
+#[derive(Clone, Debug)]
+pub(super) enum PooledPilotRefusal {
+    /// `z` separates the outcomes, so the unpenalized pooled likelihood has no
+    /// finite mode (#3217).
+    Separated(PooledScoreSeparation),
+    /// The data or the solve refused, in the text of its contract.
+    Refused(String),
+}
+
+impl std::fmt::Display for PooledPilotRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Separated(PooledScoreSeparation {
+                threshold,
+                positive_above_threshold,
+            }) => {
+                let side = if *positive_above_threshold { "above" } else { "below" };
+                write!(
+                    f,
+                    "pooled bernoulli-marginal-slope pilot: the latent score z separates the \
+                     outcomes, every success lying {side} {threshold:e}, so the pooled probit \
+                     likelihood has no finite mode"
+                )
+            }
+            Self::Refused(reason) => f.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for PooledPilotRefusal {
+    fn from(reason: String) -> Self {
+        Self::Refused(reason)
+    }
+}
+
+/// The threshold on `z` that separates the weighted outcomes, if one does.
+///
+/// The pooled probit likelihood `Σ −wᵢ log Φ(sᵢ(a + b·zᵢ))`, `sᵢ = 2yᵢ − 1`,
+/// has no finite mode exactly when some `(a, b) ≠ 0` has `sᵢ(a + b·zᵢ) ≥ 0` on
+/// every weighted row and `> 0` on one: the objective then falls strictly along
+/// that ray and never turns. With both outcomes weighted, `b = 0` admits no such
+/// direction, and `b = ±1` does exactly when the failures' largest `z` is at most
+/// the successes' smallest (or the reverse), with some row off the threshold,
+/// i.e. `z` is not constant. The comparison is exact, so the certificate carries
+/// no tolerance.
+fn pooled_score_separation(
+    y: &Array1<f64>,
+    z: &Array1<f64>,
+    weights: &Array1<f64>,
+) -> Option<PooledScoreSeparation> {
+    let mut success = (f64::INFINITY, f64::NEG_INFINITY);
+    let mut failure = (f64::INFINITY, f64::NEG_INFINITY);
+    for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
+        if wi == 0.0 {
+            continue;
+        }
+        // The side the objective's sign `s = 2y − 1` puts the row on.
+        let range = if 2.0 * yi - 1.0 > 0.0 {
+            &mut success
+        } else {
+            &mut failure
+        };
+        range.0 = range.0.min(zi);
+        range.1 = range.1.max(zi);
+    }
+    if success.0.min(failure.0) == success.1.max(failure.1) {
+        return None;
+    }
+    let between = |low: f64, high: f64| low + 0.5 * (high - low);
+    if failure.1 <= success.0 {
+        Some(PooledScoreSeparation {
+            threshold: between(failure.1, success.0),
+            positive_above_threshold: true,
+        })
+    } else if success.1 <= failure.0 {
+        Some(PooledScoreSeparation {
+            threshold: between(success.1, failure.0),
+            positive_above_threshold: false,
+        })
+    } else {
+        None
+    }
+}
+
+/// Pooled 2-parameter (intercept, slope) probit pilot, by descent on the
+/// negative log-likelihood, or, on a Jeffreys-armed fit, on the negative log
+/// posterior under the Jeffreys prior `|I(a, b)|^½` of the same pooled model.
+///
+/// The armed fit solves the Jeffreys-penalized objective, so its pilot is that
+/// objective's pooled mode: the prior's density vanishes along every ray (the
+/// expected information decays with the margins' probit densities), so the
+/// mode is finite even where `z` separates the outcomes. The unarmed pilot
+/// refuses such a `z` up front with its separating threshold, which is the
+/// evidence that arms the fit (#3217).
 ///
 /// Every exit is a statement of the arithmetic rather than a budget: the iterate
 /// is stationary to its gradient's rounding band, or no representable step along
-/// the Newton direction lowers the objective by more than the rounding bands of
-/// the two evaluations. A likelihood that reaches its supremum is a direction
-/// `z` separates, refused because it has no finite mode; an information whose
-/// determinant sits inside its rounding band is rank one, and the step is its
-/// Moore–Penrose solve rather than a ridged one.
+/// the descent direction lowers the objective by more than the rounding bands of
+/// the two evaluations. The unarmed direction is Newton's on the convex
+/// likelihood, whose information may be rank one (a Moore–Penrose step then
+/// moves only along the direction the data inform); the armed direction is the
+/// expected information's scoring step, a descent direction because that
+/// information is positive definite wherever the prior is proper.
 pub(super) fn pooled_probit_baseline(
     y: &Array1<f64>,
     z: &Array1<f64>,
     weights: &Array1<f64>,
-) -> Result<(f64, f64), String> {
+    jeffreys_armed: bool,
+) -> Result<(f64, f64), PooledPilotRefusal> {
     if y.len() != z.len() || y.len() != weights.len() {
         return Err(format!(
             "pooled bernoulli-marginal-slope pilot length mismatch: y={}, z={}, weights={}",
             y.len(),
             z.len(),
             weights.len()
-        ));
+        )
+        .into());
     }
     let weight_sum = weights.iter().copied().sum::<f64>();
     if !weight_sum.is_finite() || weight_sum <= 0.0 {
         return Err(
             "pooled bernoulli-marginal-slope pilot requires positive finite total weight"
-                .to_string(),
+                .to_string()
+                .into(),
         );
     }
     let prevalence = y
@@ -205,7 +340,11 @@ pub(super) fn pooled_probit_baseline(
         return Err(format!(
             "pooled bernoulli-marginal-slope pilot requires both outcomes to carry weight; \
              the weighted prevalence is {prevalence}"
-        ));
+        )
+        .into());
+    }
+    if !jeffreys_armed && let Some(separation) = pooled_score_separation(y, z, weights) {
+        return Err(PooledPilotRefusal::Separated(separation));
     }
     let z_mean = z
         .iter()
@@ -240,104 +379,185 @@ pub(super) fn pooled_probit_baseline(
         0.0
     };
 
-    // The pooled NLL, its gradient and its information, each gradient entry carried
-    // with the absolute sum of its terms so its rounding band can be stated. The
-    // objective's and the information's terms are non-negative (`−log Φ ≥ 0`, and
-    // `−∂² log Φ ≥ 0` by log-concavity), so their absolute sums are their values,
-    // except the mixed entry, whose sign follows `z`.
-    #[derive(Default)]
-    struct PooledProbitEval {
-        obj: f64,
-        g0: f64,
-        g0_abs: f64,
-        g1: f64,
-        g1_abs: f64,
-        h00: f64,
-        h01: f64,
-        h01_abs: f64,
-        h11: f64,
-    }
-    let objective_grad_hess = |intercept: f64, slope: f64| -> PooledProbitEval {
-        let mut e = PooledProbitEval::default();
-        for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
-            if wi == 0.0 {
-                continue;
-            }
-            let eta = intercept + slope * zi;
-            let s = 2.0 * yi - 1.0;
-            let probit = normal_logcdf_derivatives(s * eta);
-            let g_eta = -wi * s * probit[1];
-            let h_eta = -wi * probit[2];
-            e.obj -= wi * probit[0];
-            e.g0 += g_eta;
-            e.g0_abs += g_eta.abs();
-            e.g1 += g_eta * zi;
-            e.g1_abs += (g_eta * zi).abs();
-            e.h00 += h_eta;
-            e.h01 += h_eta * zi;
-            e.h01_abs += (h_eta * zi).abs();
-            e.h11 += h_eta * zi * zi;
-        }
-        e
-    };
     // `γ_{n+k}` for a sum over the `n` rows of terms formed by `k` rounded
     // operations after the log-CDF jet.
     let growth = |formation: usize| gam_linalg::roundoff::accumulation_growth(y.len() + formation);
 
-    loop {
-        let e = objective_grad_hess(beta0, beta1);
-        if !(e.obj.is_finite() && e.g0.is_finite() && e.g1.is_finite()) {
-            return Err(
-                "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
-                    .to_string(),
-            );
+    // The objective, its gradient and the descent metric at one iterate, each
+    // carried with the rounding band its exits compare against. The metric is
+    // divided by its largest diagonal `scale`: the step is invariant to that
+    // common scale, and along a separating direction the raw entries decay like
+    // the margins' probit densities until their products are not representable.
+    // PSD bounds `|m01|` by the largest diagonal, so every scaled entry is in [-1, 1].
+    struct PooledProbitEval {
+        obj: f64,
+        obj_band: f64,
+        g0: f64,
+        g0_band: f64,
+        g1: f64,
+        g1_band: f64,
+        scale: f64,
+        m00: f64,
+        m01: f64,
+        m01_abs: f64,
+        m11: f64,
+    }
+    // The determinant of a scaled PSD 2×2 metric and its rounding band: what the
+    // entries' accumulations and their division propagate into its two products,
+    // plus their own rounding and the subtraction's.
+    let determinant = |m00: f64, m01: f64, m01_abs: f64, m11: f64| {
+        let det = m00 * m11 - m01 * m01;
+        let band = growth(4) * 2.0 * (m00 * m11 + m01.abs() * m01_abs)
+            + gam_linalg::roundoff::accumulation_growth(3) * (m00 * m11 + m01 * m01);
+        (det, band)
+    };
+    // The unarmed evaluation: the negative log-likelihood, whose terms and whose
+    // information's terms are non-negative (`−log Φ ≥ 0`, and `−∂² log Φ ≥ 0` by
+    // log-concavity), so their absolute sums are their values, except the mixed
+    // entry, whose sign follows `z`.
+    let likelihood_eval = |intercept: f64, slope: f64| -> Option<PooledProbitEval> {
+        let (mut obj, mut g0, mut g0_abs, mut g1, mut g1_abs) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut h00, mut h01, mut h01_abs, mut h11) = (0.0, 0.0, 0.0, 0.0);
+        for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
+            if wi == 0.0 {
+                continue;
+            }
+            let s = 2.0 * yi - 1.0;
+            let probit = normal_logcdf_derivatives(s * (intercept + slope * zi));
+            let g_eta = -wi * s * probit[1];
+            let h_eta = -wi * probit[2];
+            obj -= wi * probit[0];
+            g0 += g_eta;
+            g0_abs += g_eta.abs();
+            g1 += g_eta * zi;
+            g1_abs += (g_eta * zi).abs();
+            h00 += h_eta;
+            h01 += h_eta * zi;
+            h01_abs += (h_eta * zi).abs();
+            h11 += h_eta * zi * zi;
         }
-        // `−log Φ(margin)` vanishes only where the margin's tail probability rounds
-        // away: the pooled likelihood is at its supremum, which a finite intercept and
-        // slope reach only when `z` separates the outcomes.
-        if e.obj == 0.0 {
-            return Err(format!(
-                "pooled bernoulli-marginal-slope pilot: z separates the outcomes, so the pooled \
-                 probit likelihood reaches its supremum with no finite mode (intercept \
-                 {beta0:e}, slope {beta1:e})"
-            ));
+        let scale = f64::max(h00, h11);
+        Some(PooledProbitEval {
+            obj,
+            obj_band: growth(1) * obj,
+            g0,
+            g0_band: growth(2) * g0_abs,
+            g1,
+            g1_band: growth(3) * g1_abs,
+            scale,
+            m00: h00 / scale,
+            m01: h01 / scale,
+            m01_abs: h01_abs / scale,
+            m11: h11 / scale,
+        })
+    };
+    // The armed evaluation: the negative log-likelihood less `½ log|I|`, with
+    // `I = Σ wᵢ ω(ηᵢ) xᵢxᵢᵀ`, `xᵢ = (1, zᵢ)`, the pooled expected information.
+    // `ω = φ²/(Φ(1−Φ)) = λ(η)·λ(−η)` with `λ = (log Φ)'`, formed from the log-CDF
+    // jet at `±η` so no tail probability is formed, and `∂_k ½ log|I| =
+    // ½ Σ wᵢ ω'(ηᵢ) x_ik hᵢ`, `hᵢ = xᵢᵀ I⁻¹ xᵢ`. `None` where `I` is singular
+    // to its rounding band: the prior's density vanishes there, so the objective
+    // is `+∞`, not a point the descent can stand on.
+    let jeffreys_eval = |intercept: f64, slope: f64| -> Option<PooledProbitEval> {
+        let (mut nll, mut g0, mut g0_abs, mut g1, mut g1_abs) = (0.0, 0.0, 0.0, 0.0, 0.0);
+        let (mut i00, mut i01, mut i01_abs, mut i11) = (0.0, 0.0, 0.0, 0.0);
+        for ((&yi, &zi), &wi) in y.iter().zip(z.iter()).zip(weights.iter()) {
+            if wi == 0.0 {
+                continue;
+            }
+            let s = 2.0 * yi - 1.0;
+            let eta = intercept + slope * zi;
+            let probit = normal_logcdf_derivatives(s * eta);
+            let g_eta = -wi * s * probit[1];
+            nll -= wi * probit[0];
+            g0 += g_eta;
+            g0_abs += g_eta.abs();
+            g1 += g_eta * zi;
+            g1_abs += (g_eta * zi).abs();
+            let omega = wi
+                * normal_logcdf_derivatives(eta)[1]
+                * normal_logcdf_derivatives(-eta)[1];
+            i00 += omega;
+            i01 += omega * zi;
+            i01_abs += (omega * zi).abs();
+            i11 += omega * zi * zi;
         }
-        if e.g0.abs() <= growth(2) * e.g0_abs && e.g1.abs() <= growth(3) * e.g1_abs {
-            break;
+        let scale = f64::max(i00, i11);
+        if !(scale > 0.0) {
+            return None;
         }
-        // Newton step on the PSD 2×2 information, solved on the information and the
-        // gradient divided by the information's largest diagonal. The step is invariant
-        // to that common scale; the raw products are not representable. Along a
-        // separating direction every entry decays like the margins' probit density, and
-        // once the densities fall below ~1e-162 the products `h·g` underflow, the step
-        // rounds to zero, and the halving loop below reads the zero step as a minimum.
-        // PSD bounds `|h01|` by the largest diagonal, so every scaled entry is in [-1, 1].
-        let scale = e.h00.max(e.h11);
-        if scale == 0.0 {
+        let (m00, m01, m01_abs, m11) = (i00 / scale, i01 / scale, i01_abs / scale, i11 / scale);
+        let (det, det_band) = determinant(m00, m01, m01_abs, m11);
+        if !(det > det_band) {
+            return None;
+        }
+        // `½ ∂_k log|I|`, each term's `hᵢ` carrying the determinant's relative
+        // band on top of its own formation.
+        let (mut a0, mut a0_abs, mut a1, mut a1_abs) = (0.0, 0.0, 0.0, 0.0);
+        for (&zi, &wi) in z.iter().zip(weights.iter()) {
+            if wi == 0.0 {
+                continue;
+            }
+            let eta = intercept + slope * zi;
+            let plus = normal_logcdf_derivatives(eta);
+            let minus = normal_logcdf_derivatives(-eta);
+            let omega_prime = plus[2] * minus[1] - plus[1] * minus[2];
+            let leverage = (m11 - 2.0 * m01 * zi + m00 * zi * zi) / (det * scale);
+            let term = 0.5 * wi * omega_prime * leverage;
+            a0 += term;
+            a0_abs += term.abs();
+            a1 += term * zi;
+            a1_abs += (term * zi).abs();
+        }
+        let prior_band = det_band / det;
+        let half_log_det = 0.5 * (det.ln() + 2.0 * scale.ln());
+        Some(PooledProbitEval {
+            obj: nll - half_log_det,
+            obj_band: growth(1) * nll
+                + 0.5 * prior_band
+                + gam_linalg::roundoff::accumulation_growth(3) * half_log_det.abs(),
+            g0: g0 - a0,
+            g0_band: growth(2) * g0_abs + (growth(12) + prior_band) * a0_abs,
+            g1: g1 - a1,
+            g1_band: growth(3) * g1_abs + (growth(13) + prior_band) * a1_abs,
+            scale,
+            m00,
+            m01,
+            m01_abs,
+            m11,
+        })
+    };
+    let evaluate = |intercept: f64, slope: f64| {
+        if jeffreys_armed {
+            jeffreys_eval(intercept, slope)
+        } else {
+            likelihood_eval(intercept, slope)
+        }
+    };
+
+    // The descent step `M⁻¹g` on the metric and its decrement `gᵀM⁻¹g ≥ 0`,
+    // solved on the metric and the gradient divided by the metric's largest
+    // diagonal (the step is invariant to that common scale; the raw products
+    // are not representable). A metric whose determinant sits inside its
+    // rounding band is rank one, `trace·vvᵀ` with `v` its dominant column
+    // normalised, and the step is its Moore–Penrose solve rather than a ridged
+    // one. The armed metric is never rank one here: its evaluation refused a
+    // singular information.
+    let descent_step = |e: &PooledProbitEval| -> Result<(f64, f64, f64), PooledPilotRefusal> {
+        if e.scale == 0.0 {
             return Err(
                 "pooled bernoulli-marginal-slope pilot: every row's probit density underflows, \
                  so the pooled information is zero and no Newton direction exists"
-                    .to_string(),
+                    .to_string()
+                    .into(),
             );
         }
-        let (h00, h01, h01_abs, h11) = (
-            e.h00 / scale,
-            e.h01 / scale,
-            e.h01_abs / scale,
-            e.h11 / scale,
-        );
-        let (g0, g1) = (e.g0 / scale, e.g1 / scale);
-        // The determinant's band is what the entries' accumulations and their division
-        // propagate into its two products, plus their own rounding and the subtraction's;
-        // a determinant inside it is a rank-one information, whose Moore–Penrose step
-        // moves only along the direction the data inform.
-        let det = h00 * h11 - h01 * h01;
-        let det_band = growth(4) * 2.0 * (h00 * h11 + h01.abs() * h01_abs)
-            + gam_linalg::roundoff::accumulation_growth(3) * (h00 * h11 + h01 * h01);
+        let (h00, h01, h11) = (e.m00, e.m01, e.m11);
+        let (g0, g1) = (e.g0 / e.scale, e.g1 / e.scale);
+        let (det, det_band) = determinant(h00, h01, e.m01_abs, h11);
         let (step0, step1) = if det > det_band {
             ((h11 * g0 - h01 * g1) / det, (h00 * g1 - h01 * g0) / det)
         } else {
-            // A rank-one information is `trace·vvᵀ`, `v` its dominant column normalised.
             let trace = h00 + h11;
             let (c0, c1) = if h00 >= h11 { (h00, h01) } else { (h01, h11) };
             let norm = c0.hypot(c1);
@@ -346,13 +566,41 @@ pub(super) fn pooled_probit_baseline(
             (along * v0, along * v1)
         };
         if !(step0.is_finite() && step1.is_finite()) {
-            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite".to_string());
+            return Err("pooled bernoulli-marginal-slope pilot Newton step is not finite"
+                .to_string()
+                .into());
         }
+        Ok((step0, step1, e.g0 * step0 + e.g1 * step1))
+    };
+
+    loop {
+        let Some(e) = evaluate(beta0, beta1) else {
+            return Err(format!(
+                "pooled bernoulli-marginal-slope Jeffreys pilot: the pooled expected \
+                 information is singular at (intercept {beta0:e}, slope {beta1:e}), so the \
+                 Jeffreys prior is improper there"
+            )
+            .into());
+        };
+        if !(e.obj.is_finite() && e.g0.is_finite() && e.g1.is_finite()) {
+            return Err(
+                "pooled bernoulli-marginal-slope pilot produced non-finite objective or gradient"
+                    .to_string()
+                    .into(),
+            );
+        }
+        if e.g0.abs() <= e.g0_band && e.g1.abs() <= e.g1_band {
+            break;
+        }
+        let (step0, step1, decrement) = descent_step(&e)?;
         // Halve until a trial lowers the objective by more than the two evaluations'
-        // rounding bands, or no longer moves the iterate in floating point. A convex
-        // objective whose Newton direction admits no such decrease at any representable
-        // length is at its minimum to working precision.
-        let obj_band = growth(1) * e.obj;
+        // rounding bands, or, not raising it, lowers the decrement `gᵀM⁻¹g`: near
+        // the mode the objective's change is below its resolution while the
+        // gradient's is not, so the gradient decides there. The objective never
+        // rises, so no sequence of accepted steps returns to an iterate: one that
+        // kept it level throughout would have lowered the decrement at every step.
+        // An iterate no representable length improves by either is at its minimum
+        // to working precision.
         let mut length = 1.0_f64;
         let accepted = loop {
             let cand0 = beta0 - length * step0;
@@ -360,9 +608,21 @@ pub(super) fn pooled_probit_baseline(
             if cand0.to_bits() == beta0.to_bits() && cand1.to_bits() == beta1.to_bits() {
                 break None;
             }
-            let cand_obj = objective_grad_hess(cand0, cand1).obj;
-            if cand_obj.is_finite() && e.obj - cand_obj > obj_band + growth(1) * cand_obj {
-                break Some((cand0, cand1));
+            if let Some(cand) = evaluate(cand0, cand1)
+                && cand.obj.is_finite()
+                && cand.g0.is_finite()
+                && cand.g1.is_finite()
+            {
+                let band = e.obj_band + cand.obj_band;
+                if e.obj - cand.obj > band {
+                    break Some((cand0, cand1));
+                }
+                if cand.obj <= e.obj
+                    && let Ok((_, _, cand_decrement)) = descent_step(&cand)
+                    && cand_decrement < decrement
+                {
+                    break Some((cand0, cand1));
+                }
             }
             length *= 0.5;
         };
@@ -376,7 +636,7 @@ pub(super) fn pooled_probit_baseline(
 
 #[cfg(test)]
 mod pooled_probit_prevalence_tests {
-    use super::pooled_probit_baseline;
+    use super::{PooledPilotRefusal, PooledScoreSeparation, pooled_probit_baseline};
     use ndarray::{Array1, array};
 
     #[test]
@@ -385,31 +645,125 @@ mod pooled_probit_prevalence_tests {
         let weights = Array1::<f64>::ones(4);
         for outcome in [0.0, 1.0] {
             let y = Array1::from_elem(4, outcome);
-            let error = pooled_probit_baseline(&y, &z, &weights)
-                .expect_err("a response with one outcome has no finite probit intercept");
-            assert!(error.contains("both outcomes"), "{error}");
+            for armed in [false, true] {
+                let error = pooled_probit_baseline(&y, &z, &weights, armed)
+                    .expect_err("a response with one outcome has no finite probit intercept")
+                    .to_string();
+                assert!(error.contains("both outcomes"), "{error}");
+            }
         }
         // Both outcomes present, but the failures carry no weight.
         let y = array![0.0, 1.0, 0.0, 1.0];
         let failures_unweighted = array![0.0, 1.0, 0.0, 1.0];
-        assert!(pooled_probit_baseline(&y, &z, &failures_unweighted).is_err());
+        assert!(pooled_probit_baseline(&y, &z, &failures_unweighted, false).is_err());
         // Non-vacuity: with both outcomes weighted and no separation the pilot
         // returns a finite pair.
-        let (intercept, slope) = pooled_probit_baseline(&y, &z, &weights).expect("pilot");
+        let (intercept, slope) = pooled_probit_baseline(&y, &z, &weights, false).expect("pilot");
         assert!(intercept.is_finite() && slope.is_finite());
     }
 
-    /// Where `z` separates the outcomes the pooled likelihood has no finite mode:
-    /// Newton walks the slope out until every margin's tail probability rounds away,
-    /// and the pilot refuses there instead of returning the last iterate.
+    /// Where `z` separates the outcomes the pooled likelihood has no finite
+    /// mode, and the unarmed pilot refuses with the separating threshold, on
+    /// either side and with a tie at the threshold (quasi-complete separation).
+    /// A row the weights drop does not break a separation.
     #[test]
     fn a_separating_z_has_no_pooled_probit_mode() {
-        let y = array![0.0, 0.0, 1.0, 1.0];
-        let z = array![-2.0, -1.0, 1.0, 2.0];
-        let weights = Array1::<f64>::ones(4);
-        let error = pooled_probit_baseline(&y, &z, &weights)
+        let z = array![-2.0, -1.0, 1.0, 2.0, 5.0];
+        let weights = array![1.0, 1.0, 1.0, 1.0, 0.0];
+        let cases = [
+            (array![0.0, 0.0, 1.0, 1.0, 0.0], 0.0, true),
+            (array![1.0, 1.0, 0.0, 0.0, 1.0], 0.0, false),
+            (array![0.0, 0.0, 0.0, 1.0, 0.0], 1.5, true),
+        ];
+        for (y, threshold, positive_above_threshold) in cases {
+            let refusal = pooled_probit_baseline(&y, &z, &weights, false)
+                .expect_err("a separated pooled probit has no finite mode");
+            assert!(
+                matches!(
+                    refusal,
+                    PooledPilotRefusal::Separated(separation)
+                        if separation == PooledScoreSeparation {
+                            threshold,
+                            positive_above_threshold,
+                        }
+                ),
+                "{refusal}"
+            );
+        }
+        let tied = array![0.0, 0.0, 1.0, 1.0, 1.0];
+        let z_tied = array![-1.0, 0.0, 0.0, 1.0, 2.0];
+        let refusal = pooled_probit_baseline(&tied, &z_tied, &Array1::ones(5), false)
+            .expect_err("a quasi-completely separated pooled probit has no finite mode");
+        assert!(
+            matches!(
+                refusal,
+                PooledPilotRefusal::Separated(PooledScoreSeparation { threshold, .. })
+                    if threshold == 0.0
+            ),
+            "{refusal}"
+        );
+    }
+
+    /// #3217: `y = 1[z > 0]` over a standard-normal `z`. Its smallest margins
+    /// are so small that Newton on the unpenalized likelihood walks the slope
+    /// out to thousands before the objective sinks into the subnormals and no
+    /// step is representable; the old pilot returned that iterate as a mode.
+    /// The certificate refuses it up front, and the Jeffreys-armed pilot, whose
+    /// prior vanishes along the separating ray, returns a finite mode.
+    #[test]
+    fn a_separated_score_refuses_unarmed_and_has_a_finite_jeffreys_mode_3217() {
+        let mut state = 0x3217_u64;
+        let mut next_unit = || {
+            (gam_linalg::utils::splitmix64(&mut state) >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let z = Array1::from_iter((0..400).map(|_| {
+            let u1 = next_unit().max(f64::MIN_POSITIVE);
+            let u2 = next_unit();
+            (-2.0 * u1.ln()).sqrt() * (std::f64::consts::TAU * u2).cos()
+        }));
+        let y = z.mapv(|zi| f64::from(u8::from(zi > 0.0)));
+        let weights = Array1::<f64>::ones(z.len());
+        let refusal = pooled_probit_baseline(&y, &z, &weights, false)
             .expect_err("a separated pooled probit has no finite mode");
-        assert!(error.contains("separates"), "{error}");
+        assert!(
+            matches!(
+                refusal,
+                PooledPilotRefusal::Separated(PooledScoreSeparation {
+                    positive_above_threshold: true,
+                    ..
+                })
+            ),
+            "{refusal}"
+        );
+        let (intercept, slope) =
+            pooled_probit_baseline(&y, &z, &weights, true).expect("Jeffreys pilot");
+        assert!(intercept.is_finite() && slope.is_finite() && slope > 0.0);
+        // The Jeffreys mode keeps the pooled information resolvable, which the
+        // confound audit's row metric is built from, and it is a minimum of
+        // `F = NLL − ½ log|I|`, formed here independently from the CDF: no
+        // relative move of either coordinate lowers it.
+        let beta0 = intercept * (1.0 + slope * slope).sqrt();
+        let objective = |b0: f64, b1: f64| {
+            let (mut nll, mut i00, mut i01, mut i11) = (0.0, 0.0, 0.0, 0.0);
+            for (&yi, &zi) in y.iter().zip(z.iter()) {
+                let eta = b0 + b1 * zi;
+                let p = gam_math::probability::normal_cdf(eta);
+                let q = gam_math::probability::normal_cdf(-eta);
+                nll -= if yi > 0.5 { p.ln() } else { q.ln() };
+                let density = (-0.5 * eta * eta).exp() / (std::f64::consts::TAU).sqrt();
+                let omega = if density > 0.0 { density * density / (p * q) } else { 0.0 };
+                i00 += omega;
+                i01 += omega * zi;
+                i11 += omega * zi * zi;
+            }
+            (nll - 0.5 * (i00 * i11 - i01 * i01).ln(), i00)
+        };
+        let (at_mode, information) = objective(beta0, slope);
+        assert!(information > 0.0, "slope {slope}, intercept {intercept}");
+        for (d0, d1) in [(1e-3, 0.0), (-1e-3, 0.0), (0.0, 1e-3), (0.0, -1e-3)] {
+            let moved = objective(beta0 + d0, slope * (1.0 + d1)).0;
+            assert!(moved > at_mode, "F({d0}, {d1}) = {moved} <= F(mode) = {at_mode}");
+        }
     }
 }
 

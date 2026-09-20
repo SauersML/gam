@@ -1,5 +1,6 @@
 use super::*;
-use statrs::function::gamma::{digamma, ln_gamma};
+use gam_math::special::digamma;
+use statrs::function::gamma::ln_gamma;
 
 /// Ordered independent Beta--Bernoulli prior over relaxed assignment logits.
 ///
@@ -638,6 +639,26 @@ impl AnalyticPenalty for OrderedBetaBernoulliPenalty {
             }
         }
         Some(out)
+    }
+
+    /// The declared PSD Loewner majorizer (see
+    /// [`Self::psd_majorizer_logit_third_channels`]). The exact Hessian is
+    /// `Σ_k s'_k u_k u_kᵀ + diag(weight·score·w_i·z_i'')` with every
+    /// `s'_k = −ψ₁(M_k+a_k) − ψ₁(N−M_k+1) < 0`, so the mass-coupled rank-one
+    /// blocks are negative semidefinite and `diag(max(diagonal_term, 0))`
+    /// dominates it and is PSD. The trait default would return the exact
+    /// Hessian diagonal instead, which carries the negative rank-one diagonal
+    /// and the negative part of the row-local term.
+    fn psd_majorizer_diag(
+        &self,
+        target: ArrayView1<'_, f64>,
+        rho: ArrayView1<'_, f64>,
+    ) -> Option<Array1<f64>> {
+        Some(
+            self.psd_majorizer_logit_third_channels(target, rho)
+                .diagonal_term
+                .mapv(|value| value.max(0.0)),
+        )
     }
 
     fn hvp(

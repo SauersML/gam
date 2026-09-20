@@ -7223,8 +7223,6 @@ impl BernoulliMarginalSlopeFamily {
         row_ctx: &BernoulliMarginalSlopeRowExactContext,
         direction_pairs: &[(&Array1<f64>, &Array1<f64>)],
     ) -> Result<Vec<Array2<f64>>, String> {
-        const PAIRS_PER_EMPIRICAL_BATCH: usize = 4;
-
         if direction_pairs.is_empty() {
             return Ok(Vec::new());
         }
@@ -7243,6 +7241,71 @@ impl BernoulliMarginalSlopeFamily {
                 direction_u.len(),
                 direction_v.len()
             ));
+        }
+        // The contraction is bilinear in its two directions. Past the row's
+        // `r(r+1)/2` axis pairs `(e_a, e_b)`, `a ≤ b`, contract those once and
+        // read every requested pair off them, `T4[u, v] = Σ_{a≤b} (u_a·v_b +
+        // u_b·v_a)·T4[e_a, e_b]` with the diagonal counted once, the way the rigid
+        // path reads its pairs off `rigid_fourth_full` (gam#2922). The lanes are
+        // then the smaller of the two sets. The weights are symmetric in `u` and
+        // `v`, so each axis pair takes one orientation: the averaged second one
+        // only symmetrizes a pair's own rounding.
+        let axis_pairs = expected * (expected + 1) / 2;
+        if flex_active && direction_pairs.len() > axis_pairs {
+            let axes = (0..expected)
+                .map(|axis| {
+                    let mut unit = Array1::<f64>::zeros(expected);
+                    unit[axis] = 1.0;
+                    unit
+                })
+                .collect::<Vec<_>>();
+            let pair_axes = (0..expected)
+                .flat_map(|a| (a..expected).map(move |b| (a, b)))
+                .collect::<Vec<_>>();
+            let ordered_axes = pair_axes
+                .iter()
+                .map(|&(a, b)| (&axes[a], &axes[b]))
+                .collect::<Vec<_>>();
+            let axis_fourths = match self.training_row_grid(row)? {
+                Some(grid) => self.empirical_fourth_ordered_lanes(
+                    row,
+                    block_states,
+                    cache,
+                    row_ctx,
+                    &grid,
+                    &ordered_axes,
+                )?,
+                None => ordered_axes
+                    .iter()
+                    .map(|&(direction_u, direction_v)| {
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            direction_u,
+                            direction_v,
+                        )
+                    })
+                    .collect::<Result<Vec<_>, String>>()?,
+            };
+            return Ok(direction_pairs
+                .iter()
+                .map(|(direction_u, direction_v)| {
+                    let mut out = Array2::<f64>::zeros((expected, expected));
+                    for (&(a, b), fourth) in pair_axes.iter().zip(&axis_fourths) {
+                        let weight = if a == b {
+                            direction_u[a] * direction_v[a]
+                        } else {
+                            direction_u[a] * direction_v[b] + direction_u[b] * direction_v[a]
+                        };
+                        if weight != 0.0 {
+                            out.scaled_add(weight, fourth);
+                        }
+                    }
+                    out
+                })
+                .collect());
         }
         let Some(grid) = self.training_row_grid(row)? else {
             return direction_pairs
@@ -7292,7 +7355,69 @@ impl BernoulliMarginalSlopeFamily {
                 .collect();
         }
 
+        let mut ordered_pairs = Vec::with_capacity(2 * direction_pairs.len());
+        for &(direction_u, direction_v) in direction_pairs {
+            ordered_pairs.push((direction_u, direction_v));
+            ordered_pairs.push((direction_v, direction_u));
+        }
+        let ordered = self.empirical_fourth_ordered_lanes(
+            row,
+            block_states,
+            cache,
+            row_ctx,
+            &grid,
+            &ordered_pairs,
+        )?;
+        let mut contractions = Vec::with_capacity(direction_pairs.len());
+        let mut orientations = ordered.into_iter();
+        while let Some(mut ordered) = orientations.next() {
+            let swapped = orientations
+                .next()
+                .expect("each empirical BMS pair has two ordered orientations");
+            ordered.zip_mut_with(&swapped, |ordered, &swapped| {
+                *ordered = 0.5 * (*ordered + swapped);
+            });
+            contractions.push(ordered);
+        }
+        Ok(contractions)
+    }
+
+    /// The ordered fourth contractions `T4[u, v, ·, ·]` of one empirical FLEX
+    /// row, one per ordered pair and not symmetrized. The row plan is compiled
+    /// once and the lanes run in two-seed batches of
+    /// `2·PAIRS_PER_EMPIRICAL_BATCH`, so a caller that asks for both
+    /// orientations of each pair gets each pair's two in one batch.
+    fn empirical_fourth_ordered_lanes(
+        &self,
+        row: usize,
+        block_states: &[ParameterBlockState],
+        cache: &BernoulliMarginalSlopeExactEvalCache,
+        row_ctx: &BernoulliMarginalSlopeRowExactContext,
+        grid: &crate::bms::EmpiricalZGrid,
+        ordered_pairs: &[(&Array1<f64>, &Array1<f64>)],
+    ) -> Result<Vec<Array2<f64>>, String> {
+        const PAIRS_PER_EMPIRICAL_BATCH: usize = 4;
+
         let primary = &cache.primary;
+        let batch_lanes = match empirical_bms_fourth_jet_schedule(primary.total) {
+            EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => {
+                return ordered_pairs
+                    .iter()
+                    .map(|&(direction_u, direction_v)| {
+                        self.row_primary_fourth_contracted_ordered(
+                            row,
+                            block_states,
+                            cache,
+                            row_ctx,
+                            direction_u,
+                            direction_v,
+                        )
+                    })
+                    .collect();
+            }
+            EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => None,
+            EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => Some(lanes),
+        };
         let point = self.primary_point_from_block_states(row, block_states, primary)?;
         let (q, b, beta_h_owned, beta_w_owned) = self.primary_point_components(&point, primary);
         let plan = self.compile_empirical_bms_row_program(
@@ -7303,61 +7428,28 @@ impl BernoulliMarginalSlopeFamily {
             beta_h_owned.as_ref(),
             beta_w_owned.as_ref(),
             row_ctx.intercept,
-            &grid,
+            grid,
         )?;
         let primary_point =
             Self::intercept_primary_point(q, b, beta_h_owned.as_ref(), beta_w_owned.as_ref());
-        let mut contractions = Vec::with_capacity(direction_pairs.len());
-        for pair_chunk in direction_pairs.chunks(PAIRS_PER_EMPIRICAL_BATCH) {
-            let mut ordered_pairs = Vec::with_capacity(2 * pair_chunk.len());
-            for &(direction_u, direction_v) in pair_chunk {
-                ordered_pairs.push((direction_u, direction_v));
-                ordered_pairs.push((direction_v, direction_u));
-            }
-            let ordered = match fourth_schedule {
-                EmpiricalBmsFourthJetSchedule::FixedWidthFromPlan => {
-                    Self::empirical_fixed_fourth_many_from_plan::<4>(
-                        &plan,
-                        &primary_point,
-                        &ordered_pairs,
-                    )
+        let mut lanes_out = Vec::with_capacity(ordered_pairs.len());
+        for chunk in ordered_pairs.chunks(2 * PAIRS_PER_EMPIRICAL_BATCH) {
+            let ordered = match batch_lanes {
+                None => {
+                    Self::empirical_fixed_fourth_many_from_plan::<4>(&plan, &primary_point, chunk)
                 }
-                EmpiricalBmsFourthJetSchedule::RepeatedFixedWidth => ordered_pairs
-                    .iter()
-                    .map(|&(direction_u, direction_v)| {
-                        self.row_primary_fourth_contracted(
-                            row,
-                            block_states,
-                            cache,
-                            row_ctx,
-                            direction_u,
-                            direction_v,
-                        )
-                    })
-                    .collect(),
-                EmpiricalBmsFourthJetSchedule::DynamicBatch { lanes } => {
-                    Self::empirical_dynamic_fourth_batch_from_plan(
-                        &plan,
-                        &primary_point,
-                        &ordered_pairs,
-                        primary,
-                        lanes,
-                        &self.jet_scratch.batch,
-                    )
-                }
+                Some(lanes) => Self::empirical_dynamic_fourth_batch_from_plan(
+                    &plan,
+                    &primary_point,
+                    chunk,
+                    primary,
+                    lanes,
+                    &self.jet_scratch.batch,
+                ),
             }?;
-            let mut orientations = ordered.into_iter();
-            while let Some(mut ordered) = orientations.next() {
-                let swapped = orientations
-                    .next()
-                    .expect("each empirical BMS pair has two ordered orientations");
-                ordered.zip_mut_with(&swapped, |ordered, &swapped| {
-                    *ordered = 0.5 * (*ordered + swapped);
-                });
-                contractions.push(ordered);
-            }
+            lanes_out.extend(ordered);
         }
-        Ok(contractions)
+        Ok(lanes_out)
     }
 
     pub(super) fn row_primary_fourth_contracted(
