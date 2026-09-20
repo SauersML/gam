@@ -203,7 +203,19 @@ pub(crate) fn binomial_location_scale_log_likelihood(
                 gam_math::probability::log1mexp_positive(z)
             };
             let log_survival = -z;
-            let ll = weight * (y * log_p + (1.0_f64 - y) * log_survival);
+            // A term whose Bernoulli coefficient is exactly zero contributes
+            // exactly zero (the xlogy convention): a success row saturated at
+            // `z = +inf` has `log_p = 0` and must score 0, not `0 * -inf = NaN`
+            // from the absent failure term (#3527). A term with a non-zero
+            // coefficient still carries its value, so a genuinely impossible
+            // row (a failure at `z = +inf`) stays non-finite and is refused.
+            let success_term = if y == 0.0 { 0.0 } else { y * log_p };
+            let failure_term = if y == 1.0 {
+                0.0
+            } else {
+                (1.0_f64 - y) * log_survival
+            };
+            let ll = weight * (success_term + failure_term);
             if ll.is_finite() {
                 Ok(ll)
             } else {
@@ -1313,5 +1325,42 @@ mod expected_information_tail_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod cloglog_saturation_tests {
+    use super::*;
+    use gam_problem::{InverseLink, StandardLink};
+
+    /// #3527: past `q ≈ 709.78`, `exp(q)` overflows, so a success row has
+    /// `P(y = 1) = 1` in floating point and its exact log-likelihood is 0. The
+    /// absent failure term must not turn that into `0 * -inf = NaN`, while a
+    /// failure row at the same `q` has probability 0 and stays refused.
+    #[test]
+    fn saturated_cloglog_success_row_scores_zero_and_failure_row_is_refused() {
+        let cloglog = InverseLink::Standard(StandardLink::CLogLog);
+        let weight = 1.7;
+        for q in [710.0, 1.0e4, f64::MAX] {
+            let ll = binomial_location_scale_log_likelihood(1.0, weight, q, &cloglog, 1.0)
+                .expect("a saturated success row has a finite log-likelihood");
+            assert_eq!(ll, 0.0, "q={q}");
+            binomial_location_scale_log_likelihood(0.0, weight, q, &cloglog, 1.0)
+                .expect_err("a failure row with zero probability is non-finite");
+        }
+        // Non-vacuity: just below the overflow the success row still carries
+        // its exact (tiny, negative) value `log(1 - exp(-exp(q)))`, and the
+        // lower tail is untouched.
+        let q = 3.0;
+        let ll = binomial_location_scale_log_likelihood(1.0, weight, q, &cloglog, 0.0)
+            .expect("interior success row");
+        let expected = weight * (-(-q.exp()).exp()).ln_1p();
+        assert!(
+            (ll - expected).abs() <= 4.0 * f64::EPSILON * expected.abs(),
+            "{ll} vs {expected}"
+        );
+        let ll_fail = binomial_location_scale_log_likelihood(0.0, weight, -800.0, &cloglog, 0.0)
+            .expect("an underflowed failure row has log-survival 0");
+        assert_eq!(ll_fail, 0.0);
     }
 }
