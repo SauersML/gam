@@ -664,8 +664,8 @@ fn truncate_marginal_slope_influence_absorber(
         constraint_kkt,
         artifacts,
         inner_cycles,
-        outer_cost_evals: _,
-        inner_pirls_solves: _,
+        outer_cost_evals,
+        inner_pirls_solves,
         ..
     } = fit_result;
 
@@ -729,6 +729,13 @@ fn truncate_marginal_slope_influence_absorber(
         constraint_kkt,
         artifacts,
         inner_cycles,
+    })
+    // The truncation does not change how much outer work the fit did, so
+    // carry the whole-fit counters over from the widened solve.
+    .map(|mut narrowed| {
+        narrowed.outer_cost_evals = outer_cost_evals;
+        narrowed.inner_pirls_solves = inner_pirls_solves;
+        narrowed
     })
     .map_err(|e| {
         format!("marginal-slope influence-absorber truncation produced an invalid fit result: {e}")

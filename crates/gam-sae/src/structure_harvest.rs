@@ -7232,12 +7232,12 @@ pub struct CurlConfig {
     /// Rounds an atom-set is silenced after a curl or flatten fires on it, so
     /// `curl → flatten → curl` cannot oscillate (risk #5 hysteresis guard).
     pub cooldown_rounds: usize,
-    /// Permutation surrogates per candidate plane for the exact κ e-value. The
-    /// e-BH ledger over the round's `m` screened pairs can only reject at rank
-    /// `k` when `replicates + 1 ≥ m/(α·k)`, so this is set by the size of the
-    /// search, not by taste.
-    pub null_replicates: usize,
-    /// Target false discovery rate for that ledger.
+    /// Target false discovery rate for the e-BH ledger over the round's screened
+    /// pairs. The permutation budget per plane is not configured: the census
+    /// derives it from the size of the search (`B + 1 = m/α`, see
+    /// [`crate::manifold::CurlCensusConfig::null_replicates`]), the one budget at
+    /// which every e-BH rank is reachable without a larger `B` eroding the
+    /// indicator e-value of a real ring.
     pub fdr_alpha: f64,
 }
 
@@ -7252,7 +7252,6 @@ impl Default for CurlConfig {
             max_curls: 4,
             flatten: true,
             cooldown_rounds: 2,
-            null_replicates: 4096,
             fdr_alpha: 0.05,
         }
     }
@@ -7832,7 +7831,8 @@ fn curl_candidates(
         coalesce_max_overlap: cfg.coalesce_max_overlap,
         min_cooccurrence: cfg.min_cooccurrence,
         subsample_rows: cfg.subsample_rows,
-        null_replicates: cfg.null_replicates,
+        // `0` derives the budget from the round's candidate family.
+        null_replicates: 0,
         fdr_alpha: cfg.fdr_alpha,
     };
     let census = crate::manifold::census_shattered_circles(&census_frames, n, p, sigma, &census_cfg)?;

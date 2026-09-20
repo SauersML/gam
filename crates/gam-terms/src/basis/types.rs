@@ -1720,8 +1720,13 @@ pub enum PenaltySource {
     OperatorRelevance {
         axis: usize,
     },
+    /// One functional-ANOVA part of te margin `dim`'s roughness
+    /// `∫ (∂ᵐ_dim f)²`: the other margins in `range_margins` enter through the
+    /// mass of their functions' complement to their penalty null functions, the
+    /// rest through the mass of their null-function component (#3951).
     TensorMarginal {
         dim: usize,
+        range_margins: Vec<usize>,
     },
     TensorSeparable {
         penalized_margins: Vec<usize>,

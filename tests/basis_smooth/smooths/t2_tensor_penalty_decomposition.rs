@@ -66,7 +66,7 @@ fn t2_uses_separable_penalty_decomposition_not_te_marginal_alias() {
         let mut global_ridge = 0usize;
         for penalty in penalties {
             match &penalty.info.source {
-                PenaltySource::TensorMarginal { dim } => marginal.push(*dim),
+                PenaltySource::TensorMarginal { dim, .. } => marginal.push(*dim),
                 PenaltySource::TensorSeparable { penalized_margins } => {
                     separable.push(penalized_margins.clone())
                 }
@@ -82,9 +82,14 @@ fn t2_uses_separable_penalty_decomposition_not_te_marginal_alias() {
     let (te_marginal, te_separable, te_ridge) = classify(&te_term.active_penalties);
     let (t2_marginal, t2_separable, t2_ridge) = classify(&t2_term.active_penalties);
 
-    // `te`: one overlapping Kronecker-sum penalty per margin, and no separable
-    // block at all.
-    assert_eq!(te_marginal, vec![0, 1], "te has one penalty per margin");
+    // `te`: each margin's overlapping Kronecker-sum roughness, resolved into its
+    // part through the other margin's null functions and its part through their
+    // complement (#3951), and no separable block at all.
+    assert_eq!(
+        te_marginal,
+        vec![0, 0, 1, 1],
+        "te has two functional-ANOVA parts of each margin's roughness"
+    );
     assert!(
         te_separable.is_empty(),
         "te must not emit separable tensor-subspace penalties: {te_separable:?}"
