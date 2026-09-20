@@ -146,30 +146,35 @@ impl EventHistoryFamily {
         let tangents = |q: usize, start: usize| -> [f64; TANGENT_WIDTH] {
             std::array::from_fn(|k| f64::from(coordinates.get(start + k) == Some(&q)))
         };
-        for a in 0..width.div_ceil(TANGENT_WIDTH) {
-            let rows = a * TANGENT_WIDTH;
-            for b in 0..=a {
-                let columns = b * TANGENT_WIDTH;
+        // The block pairs are independent path evaluations, run together so
+        // one pair's serial reference evolution overlaps the others' work.
+        let pairs: Vec<(usize, usize)> = (0..width.div_ceil(TANGENT_WIDTH))
+            .flat_map(|a| (0..=a).map(move |b| (a * TANGENT_WIDTH, b * TANGENT_WIDTH)))
+            .collect();
+        let results: Vec<Result<Rows<Rows<S, TANGENT_WIDTH>, TANGENT_WIDTH>, EventHistoryError>> =
+            pairs.par_iter().map(|&(rows, columns)| {
                 let seeded: Vec<Rows<Rows<S, TANGENT_WIDTH>, TANGENT_WIDTH>> = beta.iter().enumerate()
                     .map(|(q, coefficient)| Rows::seed(
                         Rows::seed(coefficient.clone(), tangents(q, columns)), tangents(q, rows)))
                     .collect();
-                let result = self.path_value(states, &seeded)?;
-                for l in 0..TANGENT_WIDTH.min(width - columns) {
-                    gradient[columns + l] = result.base.rows[l].clone();
-                }
-                for k in 0..TANGENT_WIDTH.min(width - rows) {
-                    let i = rows + k;
-                    // Within a diagonal block only `j ≤ i` is read, so each
-                    // mirrored pair comes from one channel.
-                    for l in 0..TANGENT_WIDTH.min(width - columns).min(i + 1 - columns) {
-                        let j = columns + l;
-                        hessian[i * width + j] = result.rows[k].rows[l].clone();
-                        hessian[j * width + i] = result.rows[k].rows[l].clone();
-                    }
-                }
-                value = result.base.base;
+                self.path_value(states, &seeded)
+            }).collect();
+        for (&(rows, columns), result) in pairs.iter().zip(results) {
+            let result = result?;
+            for l in 0..TANGENT_WIDTH.min(width - columns) {
+                gradient[columns + l] = result.base.rows[l].clone();
             }
+            for k in 0..TANGENT_WIDTH.min(width - rows) {
+                let i = rows + k;
+                // Within a diagonal block only `j ≤ i` is read, so each
+                // mirrored pair comes from one channel.
+                for l in 0..TANGENT_WIDTH.min(width - columns).min(i + 1 - columns) {
+                    let j = columns + l;
+                    hessian[i * width + j] = result.rows[k].rows[l].clone();
+                    hessian[j * width + i] = result.rows[k].rows[l].clone();
+                }
+            }
+            value = result.base.base;
         }
         Ok((value, gradient, hessian))
     }
@@ -194,13 +199,20 @@ impl EventHistoryFamily {
         let mut value = 0.0;
         let mut gradient = vec![0.0; total];
         let mut product = vec![0.0; total];
-        for start in (0..total).step_by(TANGENT_WIDTH) {
-            let seeded: Vec<Rows<Rows<f64, 1>, TANGENT_WIDTH>> = values.iter().zip(v).enumerate()
-                .map(|(q, (coefficient, along))| Rows::seed(
-                    Rows::seed(*coefficient, [*along]),
-                    std::array::from_fn(|k| f64::from(q == start + k))))
-                .collect();
-            let result = self.path_value(states, &seeded)?;
+        // Independent block evaluations, run together as in
+        // [`Self::coordinate_hessian`].
+        let starts: Vec<usize> = (0..total).step_by(TANGENT_WIDTH).collect();
+        let results: Vec<Result<Rows<Rows<f64, 1>, TANGENT_WIDTH>, EventHistoryError>> =
+            starts.par_iter().map(|&start| {
+                let seeded: Vec<Rows<Rows<f64, 1>, TANGENT_WIDTH>> = values.iter().zip(v).enumerate()
+                    .map(|(q, (coefficient, along))| Rows::seed(
+                        Rows::seed(*coefficient, [*along]),
+                        std::array::from_fn(|k| f64::from(q == start + k))))
+                    .collect();
+                self.path_value(states, &seeded)
+            }).collect();
+        for (&start, result) in starts.iter().zip(results) {
+            let result = result?;
             for k in 0..TANGENT_WIDTH.min(total - start) {
                 gradient[start + k] = result.rows[k].base;
                 product[start + k] = result.rows[k].rows[0];

@@ -764,13 +764,19 @@ impl EventHistoryFamily {
         gradient: &mut [f64],
     ) -> Result<(), String> {
         let values: Vec<f64> = states.iter().flat_map(|s| s.beta.iter().copied()).collect();
-        for start in (0..values.len()).step_by(W) {
+        // Independent sweeps, run together so one sweep's serial reference
+        // evolution overlaps the others' work.
+        let starts: Vec<usize> = (0..values.len()).step_by(W).collect();
+        let results: Vec<Result<Tangent<W>, EventHistoryError>> = starts.par_iter().map(|&start| {
             let beta: Vec<Tangent<W>> = values.iter().enumerate().map(|(q, value)| {
                 let mut grad = [0.0; W];
                 if q >= start && q < start + W { grad[q - start] = 1.0; }
                 Tangent::seeded(*value, grad)
             }).collect();
-            let result = self.path_value(states, &beta)?;
+            self.path_value(states, &beta)
+        }).collect();
+        for (&start, result) in starts.iter().zip(results) {
+            let result = result?;
             for (slot, value) in result.grad.iter().enumerate().take((values.len() - start).min(W)) {
                 gradient[start + slot] = *value;
             }
