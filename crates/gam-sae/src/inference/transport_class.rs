@@ -162,8 +162,15 @@ fn log_add_exp(log_a: f64, log_b: f64) -> f64 {
 ///
 /// `R = 1` with `n ≥ 3` makes the integral diverge: the pairs fix the map
 /// exactly, so `+∞` is returned and the class takes all the probability.
+///
+/// `r` must be a resultant length from [`mean_resultant_length`], which is in
+/// `[0, 1]` by construction. Any other value is refused.
 fn log_rigid_bayes_factor(n: usize, r: f64) -> Result<f64, String> {
-    let r = r.clamp(0.0, 1.0);
+    if !(0.0..=1.0).contains(&r) {
+        return Err(format!(
+            "circle transport class probability: resultant length must lie in [0, 1], got {r}"
+        ));
+    }
     if r == 1.0 && n >= 3 {
         return Ok(f64::INFINITY);
     }
@@ -242,6 +249,30 @@ fn log_rigid_bayes_factor(n: usize, r: f64) -> Result<f64, String> {
     }
 }
 
+/// Mean resultant length `R = |Σ (c_i, s_i)| / n` of `n` unit vectors whose
+/// summed components are `c` and `s`.
+///
+/// By the triangle inequality `R ≤ 1` in exact arithmetic. In floating point,
+/// each of the `n` computed `(cos, sin)` pairs has modulus within `1 + ε` of
+/// one (libm is accurate to one ulp). The `n − 1` additions, the two squares,
+/// their sum, the square root and the division add one rounding each. So the
+/// computed value is at most `1 + γ_{n+4}`, with `γ_k = kε/(1 − kε)`. A
+/// value in `(1, 1 + γ_{n+4}]` is an exactly rigid sample seen through
+/// rounding, and is returned as `1`. Anything larger cannot come from unit
+/// vectors and is refused, as is a non-finite sum.
+fn mean_resultant_length(c: f64, s: f64, n: usize) -> Result<f64, String> {
+    let r = (c * c + s * s).sqrt() / n as f64;
+    let k = (n + 4) as f64 * f64::EPSILON;
+    let rounding = k / (1.0 - k);
+    if !(r.is_finite() && r <= 1.0 + rounding) {
+        return Err(format!(
+            "circle transport: resultant length {r} of {n} unit vectors exceeds 1 by more than \
+             its rounding bound {rounding:e}"
+        ));
+    }
+    Ok(r.min(1.0))
+}
+
 /// Posterior class probabilities for `n` pairs with resultant lengths
 /// `r_shift` and `r_reflect`, with the three classes equally probable a priori.
 fn posterior_class_probabilities(
@@ -303,8 +334,8 @@ pub(crate) fn classify_circle_transport(
         cm += s.cos();
         sm += s.sin();
     }
-    let r_shift = (cp * cp + sp * sp).sqrt() / nf;
-    let r_reflect = (cm * cm + sm * sm).sqrt() / nf;
+    let r_shift = mean_resultant_length(cp, sp, n)?;
+    let r_reflect = mean_resultant_length(cm, sm, n)?;
     let (winding, phase, best) = if r_shift >= r_reflect {
         (1i8, sp.atan2(cp), r_shift)
     } else {
@@ -541,5 +572,34 @@ mod tests {
         assert!((p.mixing - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
         assert!((p.shift - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
         assert!((p.reflect - 1.0 / 3.0).abs() < 1e-12, "{p:?}");
+    }
+
+    /// An exactly rigid sample can round its resultant length just above one.
+    /// It is read as one, so the defect is never negative and the rigid class
+    /// takes all the probability.
+    #[test]
+    fn rigid_sample_resultant_rounds_to_one_not_past_it() {
+        let n = 1000;
+        let theta_in: Vec<f64> = (0..n).map(|i| 0.001 * i as f64).collect();
+        let theta_out: Vec<f64> = theta_in.iter().map(|a| a + 0.7).collect();
+        let report = classify_circle_transport(&theta_in, &theta_out, 0, 1).unwrap();
+        assert!(report.resultant_shift <= 1.0, "{}", report.resultant_shift);
+        assert!(report.defect >= 0.0, "{}", report.defect);
+        let k = (n + 4) as f64 * f64::EPSILON;
+        assert_eq!(mean_resultant_length(n as f64 * (1.0 + 0.5 * k), 0.0, n).unwrap(), 1.0);
+    }
+
+    /// A resultant longer than any rounding of `n` unit vectors allows, or a
+    /// non-finite one, is refused rather than clamped into range.
+    #[test]
+    fn impossible_resultant_lengths_are_refused() {
+        assert!(mean_resultant_length(4.0, 0.0, 3).is_err());
+        assert!(mean_resultant_length(f64::NAN, 0.0, 3).is_err());
+        assert!(log_rigid_bayes_factor(3, 1.5).is_err());
+        assert!(log_rigid_bayes_factor(3, -0.1).is_err());
+        assert!(log_rigid_bayes_factor(3, f64::NAN).is_err());
+        let theta_in = [0.0, f64::NAN, 1.0];
+        let theta_out = [0.0, 0.5, 1.0];
+        assert!(classify_circle_transport(&theta_in, &theta_out, 0, 1).is_err());
     }
 }
