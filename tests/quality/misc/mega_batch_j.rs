@@ -262,7 +262,7 @@ fn sphere_with_explicit_m_equals_1_is_refused_with_both_remedies() {
     // than an opaque one, and that property is the thing worth regressing.
     //
     // NOTE (product question, deliberately NOT decided here, see #2549): this
-    // means `y~sphere(lat,lon,m=1)` is no longer reachable through the formula
+    // means `y~sphere(lat,lon,penalty_order=1)` is no longer reachable through the formula
     // interface. If m = 1 should stay reachable, the route is to map it onto
     // SobolevTruncated with a stated lmax — not to restore a floor. This test
     // pins current behaviour and will need updating if that decision is made.
@@ -275,7 +275,7 @@ fn sphere_with_explicit_m_equals_1_is_refused_with_both_remedies() {
     // `match`, not `expect_err`: `FitResult` is not `Debug`, and the Ok arm is
     // the interesting failure here anyway — it means the fabricated diagonal came
     // back.
-    let text = match fit_from_formula("y~sphere(lat,lon,k=20,m=1)", &d, &cfg) {
+    let text = match fit_from_formula("y~sphere(lat,lon,k=20,penalty_order=1)", &d, &cfg) {
         Ok(_) => panic!(
             "the untruncated m = 1 sphere kernel has no Gram diagonal, so this fit must be \
              refused rather than answered"
@@ -298,7 +298,7 @@ fn sphere_with_explicit_m_equals_1_is_refused_with_both_remedies() {
     // Non-vacuity: the same fixture at m = 2 fits and predicts finitely, so this
     // cannot pass by the sphere path refusing everything.
     let d2 = mk_sphere(300, |lat, _| 0.5 + 0.3 * lat.to_radians().sin(), 0.05, 7);
-    let p = fit_sphere("y~sphere(lat,lon,k=20,m=2)", d2, &[(45.0, 0.0)]);
+    let p = fit_sphere("y~sphere(lat,lon,k=20,penalty_order=2)", d2, &[(45.0, 0.0)]);
     assert!(
         p[0].is_finite(),
         "m = 2 has a finite closed-form diagonal and must still fit"
@@ -309,7 +309,7 @@ fn sphere_harmonic_with_m_equals_3() {
     init_parallelism();
     let d = mk_sphere(300, |lat, _| 0.5 + 0.3 * lat.to_radians().sin(), 0.05, 7);
     let p = fit_sphere(
-        "y~sphere(lat,lon,method=harmonic,max_degree=4,m=3)",
+        "y~sphere(lat,lon,method=harmonic,max_degree=4,penalty_order=3)",
         d,
         &[(45.0, 0.0)],
     );

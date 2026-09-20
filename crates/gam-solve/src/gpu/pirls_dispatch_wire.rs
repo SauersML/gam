@@ -86,7 +86,7 @@ mod linux_impl {
         ExportedLaplaceCurvature, FirthDiagnostics, GaussianFrozenRows, HessianCurvatureKind,
         PirlsCoordinateFrame, PirlsResult, PirlsStatus, WorkingModelPirlsResult, WorkingState,
         compute_observed_hessian_curvature_arrays, computeworkingweight_derivatives_from_eta,
-        pirls_data_log_kernel_from_eta,
+        penalized_gradient_natural_scale, pirls_data_log_kernel_from_eta,
     };
     use gam_gpu::device_runtime::GpuRuntime;
     use gam_gpu::gpu_error::GpuError;
@@ -514,9 +514,23 @@ mod linux_impl {
         gradient_total -= &input.linear_shift;
         gradient_total -= &xt_grad_eta;
         let lastgradient_norm = gradient_total.dot(&gradient_total).sqrt();
-        let score_norm = xt_grad_eta.dot(&xt_grad_eta).sqrt();
-        let s_beta_norm = s_beta.dot(&s_beta).sqrt();
-        let gradient_natural_scale = score_norm + s_beta_norm;
+        // The η-space score is `w_solver ⊙ (z − η)`, so `−Xᵀ·score_eta` is the
+        // difference of `XᵀWη` and `XᵀWz`; the natural scale is built from
+        // those operands, which do not cancel at the optimum (#3339).
+        let to_transformed = |row_vector: Array1<f64>| {
+            let xo_row = input.x_original.t().dot(&row_vector);
+            if let Some(qs) = input.qs {
+                qs.t().dot(&xo_row)
+            } else {
+                xo_row
+            }
+        };
+        let xt_w_eta = to_transformed(&final_w_solver * &final_eta);
+        let xt_w_z = to_transformed(&final_w_solver * &finalz);
+        let mut shifted_s_beta = s_beta.clone();
+        shifted_s_beta -= &input.linear_shift;
+        let gradient_natural_scale =
+            penalized_gradient_natural_scale(&xt_w_eta, &xt_w_z, &shifted_s_beta);
 
         // Penalty term = βᵀSβ.
         let penalty_term = beta.dot(&s_beta);
@@ -795,20 +809,28 @@ mod linux_impl {
         // cached Gram statistics and every row array is an O(1) `ArcArray1`
         // clone. One optimisation, both routes.
         let frozen = input.frozen_rows.clone();
-        let (gradient_data, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
+        // Original-basis coefficient vectors to the transformed basis.
+        let to_transformed = |v: Array1<f64>| -> Array1<f64> {
+            if let Some(qs_v) = input.qs {
+                qs_v.t().dot(&v)
+            } else {
+                v
+            }
+        };
+        let (gradient_data, score_operands, rows_eta, rows_mu, rows_z, rows_weights) = if let Some(bundle) =
             frozen.as_ref()
         {
             // grad = Qsᵀ(XᵀWX·Qsβ − XᵀWy), identical to the row form by the
             // normal equations, evaluated entirely in coefficient space.
-            let mut grad_orig = input.xtwx_orig.dot(&qbeta);
+            let gram_qbeta = input.xtwx_orig.dot(&qbeta);
+            let mut grad_orig = gram_qbeta.clone();
             grad_orig -= &input.xtwy_orig;
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&grad_orig)
-            } else {
-                grad_orig
-            };
             (
-                grad,
+                to_transformed(grad_orig),
+                [
+                    to_transformed(gram_qbeta),
+                    to_transformed(input.xtwy_orig.to_owned()),
+                ],
                 bundle.eta.clone(),
                 bundle.eta.clone(),
                 bundle.z.clone(),
@@ -828,22 +850,29 @@ mod linux_impl {
             let xt_wr_orig = input
                 .x_original
                 .transpose_vector_multiply(&weighted_residual);
-            // Rotate to transformed coords: QsᵀXᵀWr.
-            let grad: Array1<f64> = if let Some(qs_v) = input.qs {
-                qs_v.t().dot(&xt_wr_orig)
-            } else {
-                xt_wr_orig
-            };
+            // The score's operands XᵀWμ and XᵀWy, whose difference is XᵀWr.
+            let score_operands = [
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalmu * &input.priorweights)),
+                ),
+                to_transformed(
+                    input
+                        .x_original
+                        .transpose_vector_multiply(&(&finalz * &input.priorweights)),
+                ),
+            ];
             (
-                grad,
+                // Rotate to transformed coords: QsᵀXᵀWr.
+                to_transformed(xt_wr_orig),
+                score_operands,
                 eta.into_shared(),
                 finalmu.into_shared(),
                 finalz.into_shared(),
                 input.priorweights.to_owned().into_shared(),
             )
         };
-        let score_norm = array1_l2_norm(&gradient_data);
-
         // s_beta = S·β − linear_shift.
         let mut s_beta: Array1<f64> = Array1::zeros(p);
         for i in 0..p {
@@ -853,7 +882,8 @@ mod linux_impl {
             }
             s_beta[i] = acc - input.linear_shift[i];
         }
-        let s_beta_norm = array1_l2_norm(&s_beta);
+        let [xt_w_eta, xt_w_z] = &score_operands;
+        let gradient_natural_scale = penalized_gradient_natural_scale(xt_w_eta, xt_w_z, &s_beta);
 
         let mut gradient = gradient_data.clone();
         gradient += &s_beta;
@@ -932,14 +962,14 @@ mod linux_impl {
             penalty_term,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
         };
 
         let constraint_kkt_val = if let Some(lin) = input.linear_constraints.as_ref() {
             Some(compute_constraint_kkt_diagnostics(
                 &beta,
                 &gradient,
-                score_norm + s_beta_norm,
+                gradient_natural_scale,
                 lin,
             ))
         } else {
@@ -1033,7 +1063,7 @@ mod linux_impl {
             iteration: 1,
             max_abs_eta,
             lastgradient_norm: gradient_norm,
-            gradient_natural_scale: score_norm + s_beta_norm,
+            gradient_natural_scale,
             penalized_gradient_transformed: working_summary.state.gradient.clone(),
             last_deviance_change: 0.0,
             last_step_halving: 0,

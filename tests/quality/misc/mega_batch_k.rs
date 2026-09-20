@@ -419,7 +419,7 @@ fn sphere_wahba_default_method_is_sobolev() {
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
     let p_def = fit2d("y~sphere(lat,lon,k=15)", d.clone(), &[(45.0, 0.0)]);
-    let p_sob = fit2d("y~sphere(lat,lon,k=15,kernel=sobolev)", d, &[(45.0, 0.0)]);
+    let p_sob = fit2d("y~sphere(lat,lon,k=15,method=sobolev)", d, &[(45.0, 0.0)]);
     assert!((p_def[0] - p_sob[0]).abs() < 1e-9);
 }
 #[test]
@@ -441,7 +441,7 @@ fn sphere_wahba_pseudo_smoke_test() {
         ]));
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=15,kernel=pseudo)", d, &[(45.0, 0.0)]);
+    let p = fit2d("y~sphere(lat,lon,k=15,method=pseudo)", d, &[(45.0, 0.0)]);
     assert!(p[0].is_finite());
 }
 #[test]
@@ -638,7 +638,7 @@ fn smooth_handles_one_outlier_low() {
     assert!(p[0].is_finite());
 }
 #[test]
-fn sphere_with_method_sos_alias() {
+fn sphere_with_method_pseudo() {
     init_parallelism();
     let mut rng = StdRng::seed_from_u64(7);
     let ul = Uniform::new(-70.0_f64, 70.0).expect("latitude range -70..70 is non-empty and finite");
@@ -656,29 +656,7 @@ fn sphere_with_method_sos_alias() {
         ]));
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=10,method=sos)", d, &[(0.0, 0.0)]);
-    assert!(p[0].is_finite());
-}
-#[test]
-fn sphere_with_method_mgcv_alias() {
-    init_parallelism();
-    let mut rng = StdRng::seed_from_u64(7);
-    let ul = Uniform::new(-70.0_f64, 70.0).expect("latitude range -70..70 is non-empty and finite");
-    let un = Uniform::new(-179.0_f64, 179.0).expect("longitude range -179..179 is non-empty and finite");
-    let no = Normal::new(0.0, 0.05).expect("noise sigma 0.05 is finite and non-negative");
-    let h = ["lat", "lon", "y"].into_iter().map(String::from).collect();
-    let mut r = Vec::with_capacity(200);
-    for _ in 0..200 {
-        let lat = ul.sample(&mut rng);
-        let lon = un.sample(&mut rng);
-        r.push(StringRecord::from(vec![
-            lat.to_string(),
-            lon.to_string(),
-            (0.3 * lat.to_radians().sin() + no.sample(&mut rng)).to_string(),
-        ]));
-    }
-    let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=10,method=mgcv)", d, &[(0.0, 0.0)]);
+    let p = fit2d("y~sphere(lat,lon,k=10,method=pseudo)", d, &[(0.0, 0.0)]);
     assert!(p[0].is_finite());
 }
 #[test]
