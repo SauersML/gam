@@ -72,27 +72,38 @@
 //!
 //! # Full-family e-BH
 //!
-//! The screened candidate family (energy top-k blocks, score-thresholded pairs)
-//! must FEED the e-BH family, not gate it after the evidence is seen: gating on
-//! the same statistic post hoc redefines the family and voids the guarantee.
-//! Every screened candidate contributes one `log_e`, and the whole vector is
-//! handed to [`gam_terms::inference::structure_evidence::e_benjamini_hochberg`]
+//! The e-BH family is the UNIVERSE of candidates a screen can choose from
+//! (every block, and every block pair when pairs are screened), fixed before the
+//! data are seen. The screen (energy top-k blocks, ring-score-thresholded pairs)
+//! runs on the same rows the e-values are computed on, so it is a compute budget,
+//! never the family: running e-BH at `m = |screened|` would redefine the family
+//! after looking at the data and void the guarantee. A candidate the screen
+//! drops banks the exact zero e-value. For any data-dependent screen `S_i`,
+//! `E_i·1{S_i}` is still an e-value (`E[E_i·1{S_i}] ≤ E[E_i] ≤ 1`), so the
+//! screened `log_e` vector plus the universe size is handed to
+//! [`gam_terms::inference::structure_evidence::e_benjamini_hochberg_in_family`]
 //! (Wang–Ramdas e-BH, FDR ≤ α under ARBITRARY dependence — the co-firing charts
 //! share rows, so the PRDS assumption p-value BH needs is violated and only e-BH
-//! is legal). There is no permutation-style budget cap `B ≥ m/α`: the UI
-//! construction yields unbounded e-values, so a single strong candidate can clear
-//! the `ln(m/(α·k))` bar on its own.
+//! is legal). The price of the universe is `ln m` nats of evidence per
+//! discovery, while split-LR evidence grows linearly in the rows. There is no
+//! permutation-style budget cap `B ≥ m/α`: the UI construction yields unbounded
+//! e-values, so a single strong candidate can clear the `ln(m/(α·k))` bar on its
+//! own.
 
-use gam_terms::inference::structure_evidence::e_benjamini_hochberg;
+use gam_terms::inference::structure_evidence::e_benjamini_hochberg_in_family;
 use ndarray::Array2;
 
 use super::block_chart::symmetric_eigh;
 
-/// The FDR-controlled discovery certificate for one screened candidate family.
+/// The FDR-controlled discovery certificate for one candidate universe.
 #[derive(Clone, Debug)]
 pub struct FdrCertificate {
     /// The declared target FDR level the certificate controls at.
     pub alpha: f64,
+    /// Size `m` of the declared e-BH family: every candidate the screen could
+    /// have chosen, fixed before the data were seen. The members without an
+    /// entry in `log_e` banked the exact zero e-value.
+    pub family_size: usize,
     /// Per-candidate universal-inference split-LR log-e-value, one entry per
     /// screened candidate in the family's order. `−∞` marks a candidate that
     /// could not support a curved claim (too few rows, or fewer than two
@@ -103,18 +114,23 @@ pub struct FdrCertificate {
     pub rejected: Vec<usize>,
 }
 
-/// Run full-family e-BH over a screened candidate family's log-e-values.
+/// Run full-family e-BH over a candidate universe of `family_size` members, of
+/// which the screen scored the ones in `log_e`.
 ///
 /// The caller is responsible for having computed EVERY screened candidate's
 /// `log_e` (via [`crossfit_ui_log_evalue`] / [`shell_vs_ring_log_evalue`]) and
-/// passing them ALL — the screening feeds this family, it must not gate it.
+/// passing them ALL, and for passing as `family_size` the size of the universe
+/// the screen chose from, not the number it kept (see the module doc: a
+/// data-dependent screen is valid only over a fixed family).
 pub fn family_fdr_certificate(
     log_e: Vec<f64>,
+    family_size: usize,
     alpha: f64,
 ) -> Result<FdrCertificate, gam_terms::inference::structure_evidence::EBhError> {
-    let rejected = e_benjamini_hochberg(&log_e, alpha)?;
+    let rejected = e_benjamini_hochberg_in_family(&log_e, family_size, alpha)?;
     Ok(FdrCertificate {
         alpha,
+        family_size,
         log_e,
         rejected,
     })
@@ -577,7 +593,7 @@ mod tests {
                     shell_vs_ring_log_evalue(&coords, 2, 1.0e-6).unwrap()
                 })
                 .collect();
-            let cert = family_fdr_certificate(log_e, alpha).unwrap();
+            let cert = family_fdr_certificate(log_e, family_size, alpha).unwrap();
             if !cert.rejected.is_empty() {
                 false_discovery_sims += 1;
             }
@@ -607,7 +623,8 @@ mod tests {
                 let line = draw_line(&mut rng, 240, 3, 2.0, 0.3);
                 log_e.push(shell_vs_ring_log_evalue(&line, 2, 1.0e-6).unwrap());
             }
-            let cert = family_fdr_certificate(log_e, alpha).unwrap();
+            let family_size = log_e.len();
+            let cert = family_fdr_certificate(log_e, family_size, alpha).unwrap();
             if cert.rejected.contains(&0) {
                 discovered += 1;
             }
@@ -630,7 +647,7 @@ mod tests {
             log_e.is_infinite() && log_e < 0.0,
             "q<2 must give -inf log_e"
         );
-        let cert = family_fdr_certificate(vec![log_e], 0.1).unwrap();
+        let cert = family_fdr_certificate(vec![log_e], 1, 0.1).unwrap();
         assert!(cert.rejected.is_empty());
     }
 
