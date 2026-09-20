@@ -363,12 +363,6 @@ fn threshold_gate_gradient_refuses_every_pairing_that_is_not_an_exact_a_route_29
     let system = term
         .assemble_arrow_schur(target.view(), &rho, None)
         .expect("#2933 F03: the converged state assembles its majorizer system");
-    let lambda_smooth = rho
-        .lambda_smooth_vec()
-        .expect("#2933 F03: the fixture's smoothing strengths are finite");
-    let solver = term
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("#2933 F03: the converged state's outer solver factors");
     let geometry = term
         .materialize_dense_exact_a_geometry(&rho, target.view(), &cache)
         .expect("#2267: the converged state's exact-A spectral block");
@@ -386,7 +380,6 @@ fn threshold_gate_gradient_refuses_every_pairing_that_is_not_an_exact_a_route_29
             &rho,
             &loss,
             &cache,
-            &solver,
             evidence,
             matrix_free_system,
             dense_geometry,

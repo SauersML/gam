@@ -22,6 +22,7 @@
 use super::tests::planted_circle_embedded;
 use super::tests_recovery_split_780::gamma_fd_tiny_fixture;
 use super::tests_startup_validation_1782::{Topo, build_term};
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use super::*;
 use crate::assignment::{assignment_prior_value_weighted, gate_logit_jacobian_value_weighted};
 use gam_terms::analytic_penalties::{AnalyticPenalty, OrderedBetaBernoulliPenalty};

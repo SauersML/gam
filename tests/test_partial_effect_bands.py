@@ -23,6 +23,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import pytest
+import scipy.stats
 
 import gamfit
 
@@ -115,8 +116,16 @@ def test_band_draw_count_and_seed_are_fixed_by_the_level():
     assert (at_95.simulations, at_95.seed, at_95.level) == (7600, 12345, 0.95)
     assert at_99.simulations == 39600
     np.testing.assert_array_equal(at_95.simultaneous_lower, again.simultaneous_lower)
-    assert at_95.pointwise_critical == pytest.approx(1.959963984540054, rel=1e-12)
-    assert at_99.pointwise_critical == pytest.approx(2.5758293035489004, rel=1e-12)
+    # A Gaussian fit estimates its dispersion, so the pointwise pivot is
+    # Student-t on the fit's residual degrees of freedom n - edf.
+    residual_df = 150 - model.edf_total
+    assert at_95.pointwise_critical == pytest.approx(
+        scipy.stats.t.ppf(0.975, residual_df), rel=1e-9
+    )
+    assert at_99.pointwise_critical == pytest.approx(
+        scipy.stats.t.ppf(0.995, residual_df), rel=1e-9
+    )
+    assert at_95.pointwise_critical > 1.959963984540054
     assert at_99.simultaneous_critical > at_95.simultaneous_critical
     assert at_95.covariance_source in ("smoothing-corrected", "conditional")
     _assert_band_ordering(at_95)

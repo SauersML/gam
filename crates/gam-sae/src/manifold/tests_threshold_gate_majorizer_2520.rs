@@ -14,13 +14,14 @@
 //! `cos κt` are both dimensionless factors on `[−1, 1]`.
 
 use crate::assignment::ThresholdGateLogitCurvature;
-use gam_linalg::utils::{SPECTRAL_DEFLATION_REL_FLOOR, stable_logistic};
+use gam_linalg::utils::SPECTRAL_DEFLATION_REL_FLOOR;
+use gam_math::special::logistic;
 use std::f64::consts::LN_2;
 
 /// The exact prior curvature, written out independently of the seam under test:
 /// `strength · a(1−a) · (1 − 2a) / τ²`.
 fn exact_curvature(strength: f64, logit: f64, threshold: f64, inv_tau: f64) -> f64 {
-    let a = stable_logistic((logit - threshold) * inv_tau);
+    let a = logistic((logit - threshold) * inv_tau);
     strength * a * (1.0 - a) * (1.0 - 2.0 * a) * inv_tau * inv_tau
 }
 
@@ -155,7 +156,7 @@ fn the_smoothing_deviation_stays_under_the_deflation_floor() {
                 // dividing `exact` by `1 − 2a` is 0/0 at the seam (`logit == 0`,
                 // where `a = ½`) — exactly the point this test most wants to
                 // cover.
-                let a = stable_logistic(logit * inv_tau);
+                let a = logistic(logit * inv_tau);
                 let magnitude = strength * a * (1.0 - a) * inv_tau * inv_tau;
                 let hard = if exact > 0.0 { exact } else { 0.0 };
                 let deviation = (curvature.psd_majorizer_hess() - hard).abs();

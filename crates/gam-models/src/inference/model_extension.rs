@@ -12,7 +12,6 @@ use crate::inference::model::{
     SchemaColumn,
 };
 use gam_solve::estimate::{BlockRole, UnifiedFitResult};
-use gam_terms::smooth::TermCollectionSpec;
 use ndarray::{Array1, Array2};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -155,9 +154,30 @@ fn extend_model_with_random_effect_level(
         (
             term_idx,
             spec.random_effect_terms[term_idx].feature_col,
-            random_effect_penalty_index(spec, term_idx),
+            spec.random_effect_penalty_index(term_idx),
         )
     };
+    let coefficient_index = payload
+        .fit_result
+        .as_ref()
+        .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?
+        .beta
+        .len();
+    let (coefficient_mean, supplied_variance) = extension_prior_parameters(prior.as_ref())?;
+    let coefficient_variance = match supplied_variance {
+        Some(variance) => variance,
+        None => default_unseen_level_prior_variance(
+            payload
+                .fit_result
+                .as_ref()
+                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?,
+            penalty_index,
+            term_name,
+        )?,
+    };
+    for fit in [payload.fit_result.as_ref(), payload.unified.as_ref()].into_iter().flatten() {
+        unscaled_prior_precision(fit, coefficient_variance)?;
+    }
     let schema = payload
         .data_schema
         .as_mut()
@@ -197,24 +217,6 @@ fn extend_model_with_random_effect_level(
             compact_json(&level)
         ));
     }
-    let coefficient_index = payload
-        .fit_result
-        .as_ref()
-        .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?
-        .beta
-        .len();
-    let (coefficient_mean, supplied_variance) = extension_prior_parameters(prior.as_ref())?;
-    let coefficient_variance = match supplied_variance {
-        Some(variance) => variance,
-        None => default_unseen_level_prior_variance(
-            payload
-                .fit_result
-                .as_ref()
-                .ok_or_else(|| "extend_with_group requires saved fit_result; refit".to_string())?,
-            penalty_index,
-            term_name,
-        )?,
-    };
     extend_training_feature_range(
         payload.training_feature_ranges.as_mut(),
         feature_col,
@@ -311,10 +313,6 @@ fn compact_json(value: &serde_json::Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|error| format!("<unserializable: {error}>"))
 }
 
-fn random_effect_penalty_index(spec: &TermCollectionSpec, term_idx: usize) -> usize {
-    usize::from(spec.linear_terms.iter().any(|term| term.double_penalty)) + term_idx
-}
-
 fn extension_prior_parameters(
     prior: Option<&serde_json::Value>,
 ) -> Result<(f64, Option<f64>), String> {
@@ -380,7 +378,11 @@ fn default_unseen_level_prior_variance(
         .ok_or_else(|| {
             format!("extend_with_group term '{term_name}' has no finite positive prior lambda")
         })?;
-    Ok(extension_covariance_scale(fit)? / lambda)
+    let variance = extension_covariance_scale(fit)? / lambda;
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(format!("extend_with_group term '{term_name}' prior variance is not finite and positive ({variance})"));
+    }
+    Ok(variance)
 }
 
 /// `scale` in `Vb = scale · H⁻¹` for a saved fit, required finite and
@@ -403,7 +405,14 @@ fn extension_covariance_scale(fit: &UnifiedFitResult) -> Result<f64, String> {
 /// (`UnscaledPrecision`, `Vb = scale · H⁻¹`) for a prior variance stated in
 /// `Vb` units. For the default prior this is exactly the ridge's `λ`.
 fn unscaled_prior_precision(fit: &UnifiedFitResult, variance: f64) -> Result<f64, String> {
-    Ok(extension_covariance_scale(fit)? / variance)
+    if !(variance.is_finite() && variance > 0.0) {
+        return Err(format!("extend_with_group prior variance must be finite and positive; got {variance}"));
+    }
+    let precision = extension_covariance_scale(fit)? / variance;
+    if !(precision.is_finite() && precision > 0.0) {
+        return Err(format!("extend_with_group unscaled prior precision is not finite and positive ({precision})"));
+    }
+    Ok(precision)
 }
 
 fn extend_training_feature_range(
@@ -647,6 +656,8 @@ mod unseen_level_prior_scale_tests {
         standard_deviation: f64,
         lambda: f64,
     ) -> UnifiedFitResult {
+        let log_lambda = lambda.ln();
+        let lambda = gam_problem::checked_exp_log_strength(log_lambda).expect("finite fixture strength");
         let blocks = vec![FittedBlock {
             beta: array![0.25, -0.5],
             role: BlockRole::Mean,
@@ -657,7 +668,7 @@ mod unseen_level_prior_scale_tests {
         UnifiedFitResult::try_from_parts(gam_solve::estimate::UnifiedFitResultParts {
             blocks,
             training_sample_size: 16,
-            log_lambdas: lambdas.mapv(f64::ln),
+            log_lambdas: array![log_lambda],
             lambdas,
             likelihood_family: Some(likelihood_family),
             likelihood_scale,
@@ -743,4 +754,65 @@ mod unseen_level_prior_scale_tests {
             );
         }
     }
+    #[test]
+    fn unseen_level_prior_refuses_unrepresentable_variance_and_precision() {
+        let gamma = saved_fit(
+            LikelihoodSpec::gamma_log(),
+            LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.0 },
+            1.0,
+            2.0,
+        );
+        let overflow = saved_fit(
+            LikelihoodSpec::gaussian_identity(),
+            LikelihoodScaleMetadata::ProfiledGaussian,
+            1e100,
+            1e-200,
+        );
+        assert!(default_unseen_level_prior_variance(&overflow, 0, "g").is_err());
+        for variance in [0.0, -1.0, f64::NAN, f64::INFINITY, f64::from_bits(1)] {
+            assert!(unscaled_prior_precision(&gamma, variance).is_err(), "variance={variance}");
+        }
+        let gaussian = saved_fit(
+            LikelihoodSpec::gaussian_identity(),
+            LikelihoodScaleMetadata::ProfiledGaussian,
+            1e-100,
+            1e200,
+        );
+        assert!(default_unseen_level_prior_variance(&gaussian, 0, "g").is_err());
+        assert!(unscaled_prior_precision(&gaussian, f64::MAX).is_err());
+    }
+
+    #[test]
+    fn unseen_level_insertion_preserves_covariance_precision_scale() {
+        for (family, scale, standard_deviation, variance) in [
+            (LikelihoodSpec::gamma_log(), LikelihoodScaleMetadata::EstimatedGammaShape { shape: 4.0 }, 1.0, 0.5),
+            (LikelihoodSpec::gaussian_identity(), LikelihoodScaleMetadata::ProfiledGaussian, 2.0, 2.0),
+        ] {
+            let mut fit = saved_fit(family, scale, standard_deviation, 2.0);
+            let covariance_scale = fit.coefficient_covariance_scale().unwrap();
+            fit.covariance_conditional = Some(Array2::eye(2) * covariance_scale);
+            fit.covariance_corrected = Some(Array2::eye(2) * covariance_scale);
+            fit.geometry = Some(gam_solve::model_types::FitGeometry {
+                coefficient_gauge: gam_problem::gauge::Gauge::identity(&[2]),
+                penalized_hessian: Array2::eye(2).into(),
+                constrained_posterior: None,
+                working: None,
+            });
+            insert_coefficient_into_saved_fit(Some(&mut fit), 2, 0.75, variance).unwrap();
+            assert_eq!(fit.beta.to_vec(), vec![0.25, -0.5, 0.75]);
+            for covariance in [&fit.covariance_conditional, &fit.covariance_corrected] {
+                let covariance = covariance.as_ref().unwrap();
+                assert_eq!(covariance.dim(), (3, 3));
+                assert_eq!(covariance[[0, 0]], covariance_scale);
+                assert_eq!(covariance[[2, 2]], variance);
+                assert_eq!(covariance[[0, 2]], 0.0);
+            }
+            let geometry = fit.geometry.as_ref().unwrap();
+            assert_eq!(geometry.coefficient_gauge.raw_total(), 3);
+            assert_eq!(geometry.coefficient_gauge.reduced_total(), 3);
+            assert_eq!(geometry.penalized_hessian.as_array()[[2, 2]], 2.0);
+            assert_eq!(geometry.penalized_hessian.as_array()[[0, 0]], 1.0);
+        }
+    }
+
 }
