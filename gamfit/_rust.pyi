@@ -264,7 +264,7 @@ __all__ = [
     "model_debiased_functional_json",
     "model_deployment_extensions",
     "model_group_metadata",
-    "model_partial_dependence",
+    "model_partial_effect",
     "model_variance_share",
     "multinomial_model_metadata_pyfunc",
     "multinomial_smooth_significance_pyfunc",
@@ -1920,7 +1920,7 @@ def model_deployment_extensions(model: _FittedModel) -> Any: ...
 
 def model_group_metadata(model: _FittedModel) -> Any: ...
 
-def model_partial_dependence(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int) -> dict[Any, Any]: ...
+def model_partial_effect(model: _FittedModel, term: str, grid: NDArray[np.float64] | None, n_points: int, level: float) -> dict[Any, Any]: ...
 
 def model_variance_share(model: _FittedModel, headers: Sequence[str], rows: _EncodedTable, term: str | None = ...) -> list[tuple[str, float]]: ...
 
