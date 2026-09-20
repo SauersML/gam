@@ -103,6 +103,58 @@ pub(crate) fn reject_survival_only_config_for_nonsurvival(
             ),
         });
     }
+    // The baseline, follow-up time basis and time-varying block settings are
+    // read only by `materialize_survival`. On a non-survival response they would
+    // be dropped and an ordinary GAM fitted. The CLI refused them, but a
+    // `gamfit.fit` call or a Rust caller did not, so the refusal lives here,
+    // where every front end arrives.
+    let defaults = FitConfig::default();
+    let survival_only_settings: Vec<&str> = [
+        ("baseline_scale", config.baseline_scale.is_some()),
+        ("baseline_shape", config.baseline_shape.is_some()),
+        ("baseline_rate", config.baseline_rate.is_some()),
+        ("baseline_makeham", config.baseline_makeham.is_some()),
+        (
+            "baseline_target",
+            !config
+                .baseline_target
+                .trim()
+                .eq_ignore_ascii_case(&defaults.baseline_target),
+        ),
+        (
+            "time_basis",
+            !config.time_basis.trim().eq_ignore_ascii_case(&defaults.time_basis),
+        ),
+        ("time_degree", config.time_degree != defaults.time_degree),
+        (
+            "time_num_internal_knots",
+            config.time_num_internal_knots != defaults.time_num_internal_knots,
+        ),
+        (
+            "survival_distribution",
+            !config
+                .survival_distribution
+                .trim()
+                .eq_ignore_ascii_case(&defaults.survival_distribution),
+        ),
+        ("threshold_time_k", config.threshold_time_k.is_some()),
+        ("sigma_time_k", config.sigma_time_k.is_some()),
+        ("slope_time_k", config.slope_time_k.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(name, set)| set.then_some(name))
+    .collect();
+    if !survival_only_settings.is_empty() {
+        return Err(WorkflowError::InvalidConfig {
+            reason: format!(
+                "{} {} read only by the survival fit path and require a Surv(...) response; for a \
+                 non-survival response they would otherwise be silently ignored. Wrap the \
+                 response in Surv(...) or drop them.",
+                survival_only_settings.join(", "),
+                if survival_only_settings.len() == 1 { "is" } else { "are" },
+            ),
+        });
+    }
     // `survival_likelihood` is `None` by default across every entrance (#2301):
     // the sole canonical default is resolved to `"transformation"` at the
     // `Surv(...)` seam, not stored here. So `None` is genuinely "unset" and must
