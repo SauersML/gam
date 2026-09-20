@@ -369,12 +369,21 @@ impl ConditionalLawEvidence {
 /// D̂ = Σ_i w_i (r_i² − 2·se_i²) / (π_i(1−π_i))
 /// ```
 ///
-/// The closed form is kept when `D̂ ≤ 0`, and the fit is re-solved on the estimated
-/// law otherwise. Nothing is tuned: as `n` grows the closed form survives only on
-/// Gaussian scores, and at small `n` it wins exactly when the estimated law is too
-/// noisy to beat it. On an exactly Gaussian score the anchors' noise is close to one
-/// shared mode, so about `P(Z² > 2) ≈ 16%` of fits re-solve: slower, and no less
-/// accurate in expectation.
+/// `D̂` is recorded, but the decision is not its sign. On an exactly Gaussian score
+/// `bias = 0`, so the residuals are `Ĝ`'s sampling error alone, `r ~ N(0, Σ)`, and
+/// `T = Σ_i c_i r_i²` (`c_i = w_i/(π_i(1−π_i))`, `T` the residual energy) is the
+/// weighted chi-square `Σ_k λ_k χ²_1` over the eigenvalues `λ_k` of `C^{1/2} Σ C^{1/2}`.
+/// Anchors that share `Ĝ` share its error, and on one law of `M` atoms
+/// `Σ_ij = Σ_m w_m (p_im − p̄_i)(p_jm − p̄_j)/n_eff`, so the `λ_k` are those of the
+/// `M × M` Gram `Σ_i c_i a_i a_iᵀ`, `a_im = √(w_m/n_eff)·(p_im − p̄_i)`
+/// ([`AnchorNoiseGram`]). Their sum is the noise energy. One mode carries most of
+/// it, so the sign of `D̂ = T − 2 Σ_k λ_k` fired on about `P(χ²_1 > 2) ≈ 16%` of exact
+/// Gaussian fits. The closed form is now kept unless `T` exceeds the null law's
+/// upper [`CLOSED_FORM_CERTIFICATE_ALPHA`] quantile, read from the null tail and its
+/// derived error bound ([`crate::probability::signed_weighted_chi_square_sf`]), that
+/// is unless its anchoring error is resolved above the estimated law's own sampling
+/// error at this `n`. The design false-fire rate is that level at every `n`, and the
+/// fire is where the data show the closed form's error.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClosedFormAnchorResidual {
     /// `D̂`.
@@ -389,16 +398,150 @@ pub struct ClosedFormAnchorResidual {
     pub anchors: usize,
     /// Nodes of the estimated law.
     pub nodes: usize,
-    /// The decision, `excess_kl ≤ 0`: the closed form was kept.
+    /// `P(Σ_k λ_k χ²_1 > residual_energy)`: the residual energy's upper tail under
+    /// an exactly Gaussian score, `0` below the subnormal range. `None` in a payload
+    /// written before it was recorded, whose decision was the sign of `excess_kl`.
+    #[serde(default)]
+    pub null_p_value: Option<f64>,
+    /// The relative error bound on `null_p_value`
+    /// ([`crate::probability::TailProbability::relative_error`]); `1` or more where
+    /// the tail is not resolved, as below the subnormal range.
+    #[serde(default)]
+    pub null_p_value_relative_error: Option<f64>,
+    /// `(Σλ)²/Σλ²`, the null law's effective number of modes.
+    #[serde(default)]
+    pub null_modes: Option<f64>,
+    /// The decision, [`closed_form_kept_by_null_tail`]: the closed form was kept.
     pub closed_form_chosen: bool,
 }
 
+/// The closed-form certificate's design false-fire rate (gam#2926): the probability
+/// that the certificate prefers the estimated law on an exactly Gaussian score. A
+/// stated policy, not a tuning knob, at the adequacy screen's level
+/// [`AUTO_Z_NORMAL_SCREEN_ALPHA`].
+pub const CLOSED_FORM_CERTIFICATE_ALPHA: f64 = AUTO_Z_NORMAL_SCREEN_ALPHA;
+
+/// Whether the closed-form certificate keeps the closed form (gam#2926), from the
+/// null tail `tail = P(Q > statistic)` of `Q = Σ_k λ_k χ²_1`, whose mean is
+/// `mean = Σλ` and variance `variance = 2Σλ²`, or `None` where no bound decides it.
+///
+/// A resolved tail (`relative_error = ε < 1`) puts `P` in `[p/(1 + ε), p/(1 − ε)]`.
+/// The closed form is kept when all of it is at least
+/// [`CLOSED_FORM_CERTIFICATE_ALPHA`], and the certificate fires when all of it is
+/// below. An unresolved tail says only `0 ≤ P ≤ 1`. That happens below the
+/// subnormal range, far beyond the rate, and there Cantelli's inequality
+/// `P(Q − μ ≥ s) ≤ σ²/(σ² + s²)` decides it when its bound is below the rate.
+/// Everything else, a bound that straddles the rate or a tail that is not a number,
+/// is undecided.
+pub(crate) fn closed_form_kept_by_null_tail(
+    tail: crate::probability::TailProbability,
+    statistic: f64,
+    mean: f64,
+    variance: f64,
+) -> Option<bool> {
+    let alpha = CLOSED_FORM_CERTIFICATE_ALPHA;
+    if tail.probability.is_nan() || tail.relative_error.is_nan() {
+        return None;
+    }
+    if tail.relative_error < 1.0 {
+        if tail.probability / (1.0 + tail.relative_error) >= alpha {
+            return Some(true);
+        }
+        return (tail.probability / (1.0 - tail.relative_error) < alpha).then_some(false);
+    }
+    let excess = statistic - mean;
+    (excess > 0.0 && variance / (variance + excess * excess) < alpha).then_some(false)
+}
+
+/// The Gram `Σ_i c_i a_i a_iᵀ` of the closed-form certificate's anchors on the `M`
+/// atoms of one estimated law (gam#2926): `c_i = w_i/(π_i(1−π_i))` and
+/// `a_im = √(w_m/n_eff)·(p_im − Σ_k w_k p_ik)`, where `p_im` is the anchor's
+/// probability at atom `m`. Its eigenvalues are the weights of the certificate's
+/// null law ([`ClosedFormAnchorResidual`]). Only the lower triangle is accumulated.
+#[derive(Clone, Debug)]
+pub(crate) struct AnchorNoiseGram {
+    gram: Array2<f64>,
+}
+
+impl AnchorNoiseGram {
+    pub(crate) fn new(atoms: usize) -> Self {
+        Self {
+            gram: Array2::zeros((atoms, atoms)),
+        }
+    }
+
+    /// Add the anchor with certificate coefficient `c = w/(π(1−π))` whose
+    /// probabilities at the law's atoms are `probabilities`.
+    pub(crate) fn add_anchor(
+        &mut self,
+        coefficient: f64,
+        law_weights: &[f64],
+        probabilities: &[f64],
+        effective_n: f64,
+    ) -> Result<(), String> {
+        let atoms = self.gram.nrows();
+        if law_weights.len() != atoms || probabilities.len() != atoms {
+            return Err(format!(
+                "closed-form certificate noise Gram of {atoms} atoms read an anchor over {} \
+                 weights and {} probabilities",
+                law_weights.len(),
+                probabilities.len()
+            ));
+        }
+        let mean: f64 = law_weights
+            .iter()
+            .zip(probabilities)
+            .map(|(w, p)| w * p)
+            .sum();
+        let centered: Vec<f64> = law_weights
+            .iter()
+            .zip(probabilities)
+            .map(|(w, p)| (w / effective_n).sqrt() * (p - mean))
+            .collect();
+        for i in 0..atoms {
+            let scaled = coefficient * centered[i];
+            for j in 0..=i {
+                self.gram[[i, j]] += scaled * centered[j];
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(&mut self, other: &Self) {
+        self.gram += &other.gram;
+    }
+
+    /// The null law's weights: the Gram's eigenvalues, the round-off below zero of
+    /// a positive semidefinite Gram dropped.
+    fn null_weights(&self) -> Result<Vec<f64>, String> {
+        let atoms = self.gram.nrows();
+        let mut full = self.gram.clone();
+        for i in 0..atoms {
+            for j in 0..i {
+                full[[j, i]] = full[[i, j]];
+            }
+        }
+        let (eigenvalues, _) = gam_linalg::faer_ndarray::FaerEigh::eigh(&full, faer::Side::Lower)
+            .map_err(|error| {
+                format!("closed-form certificate noise Gram eigendecomposition failed: {error:?}")
+            })?;
+        if let Some(eigenvalue) = eigenvalues.iter().find(|l| !l.is_finite()) {
+            return Err(format!(
+                "closed-form certificate noise Gram has a non-finite eigenvalue {eigenvalue}"
+            ));
+        }
+        Ok(eigenvalues.iter().copied().filter(|&l| l > 0.0).collect())
+    }
+}
+
 impl ClosedFormAnchorResidual {
-    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`.
-    /// Anchors whose `π(1−π)` is zero carry no probability to anchor and are not
-    /// measured.
+    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`
+    /// beside the anchors' noise Gram on the law's atoms. Anchors whose `π(1−π)` is
+    /// zero carry no probability to anchor and are not measured, and the caller adds
+    /// none of them to `noise`.
     pub(crate) fn from_rows(
         rows: &[(f64, f64, f64, f64)],
+        noise: &AnchorNoiseGram,
         nodes: usize,
         effective_n: f64,
     ) -> Result<Self, String> {
@@ -426,6 +569,38 @@ impl ClosedFormAnchorResidual {
             );
         }
         let excess_kl = residual_energy - 2.0 * noise_energy;
+        let weights = noise.null_weights()?;
+        let (sum, sum_sq) = weights
+            .iter()
+            .fold((0.0, 0.0), |(s, q), &l| (s + l, q + l * l));
+        let terms: Vec<crate::probability::WeightedChiSquareTerm> = weights
+            .iter()
+            .map(|&weight| crate::probability::WeightedChiSquareTerm {
+                weight,
+                degrees_of_freedom: 1.0,
+            })
+            .collect();
+        // No positive weight means no anchor's probability varies over the law's
+        // atoms, so every anchor is the same under any law of the score and there is
+        // nothing to prefer.
+        let (null_p_value, relative_error, closed_form_chosen) = if terms.is_empty() {
+            (1.0, 0.0, true)
+        } else {
+            let tail = crate::probability::signed_weighted_chi_square_sf(&terms, residual_energy);
+            let decided = closed_form_kept_by_null_tail(tail, residual_energy, sum, 2.0 * sum_sq);
+            let kept = decided.ok_or_else(|| {
+                format!(
+                    "closed-form certificate null tail does not decide against the design rate \
+                     {CLOSED_FORM_CERTIFICATE_ALPHA}: P = {} with relative error bound {}, \
+                     residual energy = {residual_energy}, {} null weights summing to {sum} \
+                     (squares {sum_sq})",
+                    tail.probability,
+                    tail.relative_error,
+                    weights.len()
+                )
+            })?;
+            (tail.probability, tail.relative_error, kept)
+        };
         Ok(Self {
             excess_kl,
             residual_energy,
@@ -433,20 +608,32 @@ impl ClosedFormAnchorResidual {
             effective_n,
             anchors,
             nodes,
-            closed_form_chosen: excess_kl <= 0.0,
+            null_p_value: Some(null_p_value),
+            null_p_value_relative_error: Some(relative_error),
+            null_modes: Some(if sum_sq > 0.0 { sum * sum / sum_sq } else { 0.0 }),
+            closed_form_chosen,
         })
     }
 
     pub(crate) fn summary(&self) -> String {
         format!(
             "D̂ = Σ w (r² − 2·se²)/π(1−π) = {:.4e} (Σ w r²/π(1−π) = {:.4e}, Σ w se²/π(1−π) = \
-             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes: {}",
+             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes; P(Σ w r²/π(1−π) \
+             beyond an exactly Gaussian score's) = {} (relative error {}) over {} null modes, \
+             against {}: {}",
             self.excess_kl,
             self.residual_energy,
             self.noise_energy,
             self.anchors,
             self.effective_n,
             self.nodes,
+            self.null_p_value
+                .map_or_else(|| "not recorded".to_string(), |p| format!("{p:.3e}")),
+            self.null_p_value_relative_error
+                .map_or_else(|| "not recorded".to_string(), |e| format!("{e:.1e}")),
+            self.null_modes
+                .map_or_else(|| "unrecorded".to_string(), |m| format!("{m:.2}")),
+            CLOSED_FORM_CERTIFICATE_ALPHA,
             if self.closed_form_chosen {
                 "the closed form is kept"
             } else {
@@ -454,6 +641,56 @@ impl ClosedFormAnchorResidual {
             }
         )
     }
+}
+
+/// Rows per chunk of the closed-form certificate's pass. A fixed size, so the
+/// order the noise Gram sums in, and with it every recorded bit, is the same at
+/// any thread count.
+const CERTIFICATE_ROW_CHUNK: usize = 256;
+
+/// The closed-form certificate's pass over `rows` training rows (gam#2926):
+/// `measure(workspace, row)` gives the row's `K` anchors as `(residual, law sd,
+/// π(1−π), probabilities at the law's atoms)`. Each becomes a
+/// [`ClosedFormAnchorResidual::from_rows`] row `(residual, law sd/√n_eff, π(1−π),
+/// weight)`, and each measured one (positive weight and `π(1−π)`) a term of the
+/// anchors' [`AnchorNoiseGram`]. `init` builds one workspace per chunk.
+pub(crate) fn closed_form_certificate_pass<const K: usize, W>(
+    rows: usize,
+    row_weights: &[f64],
+    law_weights: &[f64],
+    effective_n: f64,
+    init: impl Fn() -> Result<W, String> + Sync,
+    measure: impl Fn(&mut W, usize) -> Result<[(f64, f64, f64, Vec<f64>); K], String> + Sync,
+) -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
+    let root_n = effective_n.sqrt();
+    let atoms = law_weights.len();
+    let partials = (0..rows.div_ceil(CERTIFICATE_ROW_CHUNK))
+        .into_par_iter()
+        .map(|chunk| -> Result<(Vec<(f64, f64, f64, f64)>, AnchorNoiseGram), String> {
+            let mut workspace = init()?;
+            let mut noise = AnchorNoiseGram::new(atoms);
+            let start = chunk * CERTIFICATE_ROW_CHUNK;
+            let end = (start + CERTIFICATE_ROW_CHUNK).min(rows);
+            let mut measured = Vec::with_capacity((end - start) * K);
+            for row in start..end {
+                let weight = row_weights[row];
+                for (residual, law_sd, scale, probabilities) in measure(&mut workspace, row)? {
+                    if weight > 0.0 && scale > 0.0 {
+                        noise.add_anchor(weight / scale, law_weights, &probabilities, effective_n)?;
+                    }
+                    measured.push((residual, law_sd / root_n, scale, weight));
+                }
+            }
+            Ok((measured, noise))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let mut measured = Vec::with_capacity(rows * K);
+    let mut noise = AnchorNoiseGram::new(atoms);
+    for (chunk, gram) in partials {
+        measured.extend(chunk);
+        noise.merge(&gram);
+    }
+    Ok((measured, noise))
 }
 
 /// The law of the latent score a marginal-slope fit consumed, and how it came
@@ -806,11 +1043,13 @@ pub enum LocalLawMixture {
     /// Kernel weights `K(d) = exp(−d²/2h²)` of the `top_k` nearest centres less
     /// the `(top_k + 1)`-th centre's value, so a centre's weight reaches zero
     /// exactly where it leaves the top `top_k`, plus the pooled law — the grid
-    /// after the context grids — at the fixed weight `floor` in units of
-    /// `K(0) = 1`, renormalised. The floor keeps the normaliser positive where
-    /// the `top_k + 1` nearest centres tie, so the law is continuous in the
-    /// covariates everywhere. New fits mint it with `top_k = 4`, `bandwidth = 1`
-    /// in the scaled covariates, and `floor = 1e-3`.
+    /// after the context grids — at the weight `floor` in units of `K(0) = 1`,
+    /// renormalised. The floor keeps the normaliser positive where the
+    /// `top_k + 1` nearest centres tie, so the law is continuous in the
+    /// covariates everywhere. New fits mint it with `top_k = 4`, and with the
+    /// bandwidth in the scaled covariates and the floor that minimise the
+    /// cross-fitted CRPS of the score
+    /// ([`local_law_resolution::select_local_law_resolution`], gam#3610).
     VanishingAtTruncation { floor: f64 },
 }
 
@@ -3431,6 +3670,7 @@ pub(super) const BERNOULLI_MARGSLOPE_LINE_SEARCH_EARLY_EXIT_CHUNK_ROWS: usize = 
 pub(crate) mod block_specs;
 pub mod conditional_score_covariance;
 pub(crate) mod estimated_latent_law;
+pub(crate) mod local_law_resolution;
 pub(crate) mod moving_law_rule;
 pub(crate) mod exact_eval_cache;
 mod expected_information;
@@ -3638,6 +3878,8 @@ mod empirical_measure_2484_tests;
 mod anchor_law_2926_tests;
 #[cfg(test)]
 mod normal_screen_2926_tests;
+#[cfg(test)]
+mod closed_form_certificate_2926_tests;
 mod standard_normal_flex_fifth;
 pub(crate) mod empirical_measure_sensitivity;
 // #932 BMS flex single-source jet substrate (runtime-dimension `Jet2` + IFT

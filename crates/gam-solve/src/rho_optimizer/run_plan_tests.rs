@@ -1628,37 +1628,23 @@ fn plan_no_gradient_with_declared_hessian_stays_bfgs() {
 }
 
 #[test]
-fn plan_boundary_8_params_uses_bfgs() {
+fn plan_efs_selected_single_param_when_penalty_like() {
+    // No coordinate count gates the fixed-point lane: even a one-coordinate,
+    // analytic-gradient, penalty-like objective with a fixed-point hook plans
+    // EFS rather than BFGS.
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
-        n_params: SMALL_OUTER_BFGS_MAX_PARAMS,
+        n_params: 1,
         psi_dim: 0,
-        fixed_point_available: false,
+        fixed_point_available: true,
         barrier_config: None,
         prefer_gradient_only: false,
         disable_fixed_point: false,
     };
     let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
-}
-
-#[test]
-fn plan_boundary_9_params_uses_bfgs() {
-    let cap = OuterCapability {
-        gradient: Derivative::Analytic,
-        hessian: DeclaredHessianForm::Unavailable,
-        n_params: SMALL_OUTER_BFGS_MAX_PARAMS + 1,
-        psi_dim: 0,
-        fixed_point_available: false,
-        barrier_config: None,
-        prefer_gradient_only: false,
-        disable_fixed_point: false,
-    };
-    let p = plan(&cap);
-    assert_eq!(p.solver, Solver::Bfgs);
-    assert_eq!(p.hessian_source, HessianSource::BfgsApprox);
+    assert_eq!(p.solver, Solver::Efs);
+    assert_eq!(p.hessian_source, HessianSource::EfsFixedPoint);
 }
 
 #[test]
@@ -1701,7 +1687,7 @@ fn plan_efs_selected_few_params_when_penalty_like() {
     // small fits (2–7 ρ coords) into the fragile Wolfe/probe lane while large
     // fits got the robust trace-based fixed point. A fixed-point-capable,
     // all-penalty-like objective now routes to EFS at every dimension (see
-    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
+    // `OuterCapability::efs_plan_eligible`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -2226,10 +2212,9 @@ fn hybrid_efs_backtracking_uses_half_step_after_first_rejection() {
         barrier_config: None,
         config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2306,10 +2291,9 @@ fn hybrid_efs_backtracking_propagates_fatal_cost_failure() {
         barrier_config: None,
         config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2397,10 +2381,9 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
         barrier_config: None,
         config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2412,6 +2395,156 @@ fn hybrid_efs_backtracking_halves_past_a_refused_trial_2735() {
     assert_eq!(obj.state, 1, "the full step must have been refused exactly once");
     assert_eq!(sample.status, FixedPointStatus::Continue);
     assert_eq!(sample.step[11], 0.5);
+}
+
+/// A pure-ρ EFS bridge whose map always proposes `step` and whose cost is
+/// `cost_at(ρ)`, for the #3539 step-control tests.
+fn efs_step_control_bridge_sample(
+    config: &OuterConfig,
+    step: f64,
+    current_cost: f64,
+    cost_at: fn(f64) -> f64,
+) -> (Result<FixedPointSample, ObjectiveEvalError>, usize) {
+    let cap = OuterCapability {
+        gradient: Derivative::Analytic,
+        hessian: DeclaredHessianForm::Unavailable,
+        n_params: 1,
+        psi_dim: 0,
+        fixed_point_available: true,
+        barrier_config: None,
+        prefer_gradient_only: false,
+        disable_fixed_point: false,
+    };
+    let mut obj = ClosureObjective {
+        state: (0usize, cost_at),
+        cap: cap.clone(),
+        cost_fn: |state: &mut (usize, fn(f64) -> f64), theta: &Array1<f64>| {
+            state.0 += 1;
+            Ok((state.1)(theta[0]))
+        },
+        eval_fn: |state: &mut (usize, fn(f64) -> f64), theta: &Array1<f64>| {
+            Ok(OuterEval {
+                cost: (state.1)(theta[0]),
+                gradient: Array1::zeros(theta.len()),
+                hessian: HessianValue::Unavailable,
+                inner_beta_hint: None,
+            })
+        },
+        eval_order_fn: None::<
+            fn(
+                &mut (usize, fn(f64) -> f64),
+                &Array1<f64>,
+                OuterEvalOrder,
+            ) -> Result<OuterEval, EstimationError>,
+        >,
+        reset_fn: None::<fn(&mut (usize, fn(f64) -> f64))>,
+        efs_fn: Some(move |_: &mut (usize, fn(f64) -> f64), _: &Array1<f64>| {
+            Ok(EfsEval {
+                cost: current_cost,
+                steps: vec![step],
+                beta: None,
+                psi_gradient: None,
+                psi_indices: None,
+                inner_hessian_scale: None,
+                consecutive_restored_incumbents: None,
+            })
+        }),
+        fixed_point_certificate_fn: None,
+        exact_polish_fn: None,
+        rail_face_limit_fn: None,
+        criterion_invariance_fn: None,
+        criterion_rank_fn: None,
+        seed_fn: None::<
+            fn(&mut (usize, fn(f64) -> f64), &Array1<f64>) -> Result<SeedOutcome, EstimationError>,
+        >,
+        terminal_eval_order: None,
+    };
+    let mut bridge = OuterFixedPointBridge {
+        obj: &mut obj,
+        layout: cap.theta_layout(),
+        barrier_config: None,
+        config,
+        evaluated_inner_seed: Arc::new(Mutex::new(None)),
+        last_restored_incumbent_streak: None,
+        recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
+        progress: FixedPointProgress::new(),
+        unprogressing_exit: Arc::new(Mutex::new(None)),
+    };
+    let sample = bridge.eval_step(&array![0.0]);
+    drop(bridge);
+    (sample, obj.state.0)
+}
+
+/// #3539: a small EFS step (‖Δθ‖∞ = 0.25, inside the old 0.5 log-λ exemption)
+/// that increases the cost is shortened, not applied untested.
+#[test]
+fn efs_small_uphill_step_is_contracted_3539() {
+    let (sample, probes) = efs_step_control_bridge_sample(
+        &OuterConfig::default(),
+        0.25,
+        1.0,
+        |rho| {
+            if rho == 0.25 {
+                1.5
+            } else if rho == 0.125 {
+                0.9
+            } else {
+                2.0
+            }
+        },
+    );
+    let sample = sample.expect("the half step descends and must be accepted");
+    assert_eq!(probes, 2, "the full step must be probed, then halved once");
+    assert_eq!(sample.status, FixedPointStatus::Continue);
+    assert_eq!(sample.step[0], 0.125);
+}
+
+/// #3539: a trial whose cost exceeds the current value by less than the
+/// criterion resolution `τ = 1/(2n)` is not resolvably uphill and is accepted.
+/// The old relative `1e-12·|c|` floor rejected it (and every halving here).
+#[test]
+fn efs_trial_within_criterion_resolution_is_accepted_3539() {
+    let config = OuterConfig {
+        problem_size: crate::rho_optimizer::OuterProblemSize {
+            n_obs: Some(5_000),
+            p_coefficients: Some(1),
+        },
+        ..OuterConfig::default()
+    };
+    let tau = crate::rho_optimizer::run::outer_criterion_resolution(&config);
+    assert_eq!(tau, 1.0e-4);
+    let (sample, probes) = efs_step_control_bridge_sample(&config, 1.0, 1_000.0, |rho| {
+        if rho == 1.0 { 1_000.0 + 5.0e-5 } else { 2_000.0 }
+    });
+    let sample = sample.expect("a trial within τ of the current cost must be accepted");
+    assert_eq!(probes, 1);
+    assert_eq!(sample.step[0], 1.0);
+}
+
+/// #3539: an EFS direction no resolvable contraction of which descends ends the
+/// line search at the map's arithmetic resolution — `√ε·(1 + |x|)` per
+/// coordinate — not after a fixed count of halvings, and routes to the joint
+/// gradient solver.
+#[test]
+fn efs_uphill_direction_backtracks_to_step_resolution_then_falls_back_3539() {
+    let (sample, probes) =
+        efs_step_control_bridge_sample(&OuterConfig::default(), 1.0, 1.0, |rho| {
+            if rho == 0.0 { 1.0 } else { 2.0 }
+        });
+    let error = sample.expect_err("an uphill EFS direction must not be accepted");
+    assert!(
+        first_order_fallback_request(&error).is_some(),
+        "exhausted EFS backtracking must request the joint gradient solver: {}",
+        error.message()
+    );
+    // Trials 2⁻ᵏ for k = 0, 1, … while 2⁻ᵏ > √ε = 2⁻²⁶ at x = 0: the 26 trials
+    // k = 0..=25; the contraction 2⁻²⁶ is at the map's resolution.
+    let sqrt_eps = f64::EPSILON.sqrt();
+    let expected = (0..)
+        .take_while(|&k: &i32| 0.5_f64.powi(k) > sqrt_eps)
+        .count();
+    assert_eq!(probes, expected);
+    assert!(probes > 8, "the old fixed budget stopped after 9 trials");
 }
 
 #[test]
@@ -2475,10 +2608,9 @@ fn fixed_point_stops_on_second_consecutive_restored_incumbent_2241() {
         barrier_config: None,
         config: &config,
         evaluated_inner_seed: Arc::new(Mutex::new(None)),
-        consecutive_psi_zero_iters: 0,
         last_restored_incumbent_streak: None,
         recurrent_incumbent_exit: Arc::new(Mutex::new(None)),
-        progress: FixedPointProgress::new(outer_criterion_resolution(&config), COST_STALL_WINDOW),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::new(Mutex::new(None)),
     };
 
@@ -2737,14 +2869,6 @@ fn certify_four_spends_order_four_once_and_prices_the_curvature_against_the_crit
          {fourth_order_calls}"
     );
 }
-
-// The historical bridge-side `rejects_oversized_bfgs_cost_probe_before_objective`
-// test exercised a mechanism (returning `BFGS_LINE_SEARCH_REJECT_COST`
-// from `eval_cost` on overreach) that has been retired in favor of
-// `opt::Bfgs::with_axis_step_caps` — the line-search direction is now
-// shortened up front by opt itself, so the bridge never sees an
-// oversized probe in the first place. The equivalent invariant now
-// lives in opt's `with_axis_step_caps` test surface.
 
 #[test]
 fn first_order_bridge_keeps_true_gradient_on_repeated_flat_cost() {
@@ -4826,7 +4950,7 @@ fn plan_hybrid_efs_selected_few_params() {
     // ψ-carrying fixed-point objectives route to HybridEfs at every
     // dimension: the former ≤8-coordinate BFGS crossover sent exactly the
     // failing small fits into the fragile Wolfe/probe lane (see
-    // `SMALL_OUTER_BFGS_MAX_PARAMS`).
+    // `OuterCapability::hybrid_efs_plan_eligible`).
     let cap = OuterCapability {
         gradient: Derivative::Analytic,
         hessian: DeclaredHessianForm::Unavailable,
@@ -6358,8 +6482,8 @@ mod run_plan_saddle_escape_tests;
 #[path = "stratum_boundary_2939_tests.rs"]
 mod stratum_boundary_2939_tests;
 
-// #2953: an outer result's gradient is a measurement at a point, and the
-// reproducibility floor reads it only at the point being certified.
+// #2953: an outer result's gradient is a measurement at a point; #3531: a
+// second same-ρ measurement never widens the stationarity bound.
 #[path = "run_plan_measurement_point_2953_tests.rs"]
 mod run_plan_measurement_point_2953_tests;
 

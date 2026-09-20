@@ -135,7 +135,8 @@ struct Arm {
     law: &'static str,
     calibrated: bool,
     /// `D̂` of the closed-form certificate, when the adequacy screen passed.
-    excess_kl: Option<f64>,
+    /// The closed-form certificate's `(D̂, null tail)`, when one was taken.
+    certificate: Option<(f64, Option<f64>)>,
 }
 
 fn slope_on(values: &[f64], x: &[f64]) -> f64 {
@@ -184,7 +185,7 @@ fn fit_arm(fixture: &Fixture, z_column: &str, latent_measure: Option<&str>) -> A
         mean_slope,
         law: fit.latent_law_consumed.label(),
         calibrated: fit.latent_z_conditional_calibration.is_some(),
-        excess_kl: match &fit.latent_law_consumed {
+        certificate: match &fit.latent_law_consumed {
             gam::families::bms::LatentLawConsumed::EstimatedGaussianAdequate {
                 residual: Some(certificate),
                 ..
@@ -192,7 +193,7 @@ fn fit_arm(fixture: &Fixture, z_column: &str, latent_measure: Option<&str>) -> A
             | gam::families::bms::LatentLawConsumed::EstimatedGlobalByResidual {
                 residual: certificate,
                 ..
-            } => Some(certificate.excess_kl),
+            } => Some((certificate.excess_kl, certificate.null_p_value)),
             _ => None,
         },
     }
@@ -255,7 +256,7 @@ fn conditional_latent_gate_returns_the_marginal_index() {
     // The law of an already conditionally standard score does not move on the span
     // and passes the adequacy screen, so the closed form's certificate decides: a
     // trigger-happy span test would make every clean fit local instead.
-    let Some(clean_excess_kl) = clean.excess_kl else {
+    let Some((clean_excess_kl, clean_null_p_value)) = clean.certificate else {
         panic!(
             "a conditionally standard score must pass the adequacy screen and carry the closed-form \
              certificate; got law={}",
@@ -264,12 +265,13 @@ fn conditional_latent_gate_returns_the_marginal_index() {
     };
     assert_eq!(
         clean.law,
-        if clean_excess_kl <= 0.0 {
+        if clean_null_p_value.is_some_and(|p| p >= gam::families::bms::CLOSED_FORM_CERTIFICATE_ALPHA) {
             "estimated-gaussian-adequate"
         } else {
             "estimated-global-by-residual"
         },
-        "the clean arm's law must follow the sign of its recorded D̂ = {clean_excess_kl:.4e}"
+        "the clean arm's law must follow its recorded null tail {clean_null_p_value:?} \
+         against the design rate (D̂ = {clean_excess_kl:.4e})"
     );
     assert_eq!(location_scale.law, "conditional-location-scale");
     assert!(

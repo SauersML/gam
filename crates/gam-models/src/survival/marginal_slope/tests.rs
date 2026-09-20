@@ -4744,11 +4744,12 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         .expect("FLEX baseline-pair callback")
         .expect("FLEX baseline-pair terms are present");
     assert_eq!(baseline_pair.score_psi_psi.len(), dimension);
-    let baseline_pair_hessian = baseline_pair
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-pair Hessian operator")
-        .to_dense();
+    // gam#3304: the ζ composition serves chart pairs with a dense θθ Hessian too.
+    assert!(
+        baseline_pair.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-pair Hessian"
+    );
+    let baseline_pair_hessian = baseline_pair.hessian_psi_psi.clone();
     assert_eq!(baseline_pair_hessian.dim(), (dimension, dimension));
     assert!(
         baseline_pair
@@ -4785,11 +4786,11 @@ fn flex_timewiggle_baseline_public_workspace_owns_family_and_design_pairs_withou
         mixed.score_psi_psi.iter().any(|value| value.abs() > 1e-12),
         "active FLEX/timewiggle baseline-by-design score must not collapse to zero"
     );
-    let mixed_hessian = mixed
-        .hessian_psi_psi_operator
-        .as_ref()
-        .expect("FLEX baseline-by-design Hessian operator")
-        .to_dense();
+    assert!(
+        mixed.hessian_psi_psi_operator.is_none(),
+        "the ζ composition publishes a dense baseline-by-design Hessian"
+    );
+    let mixed_hessian = mixed.hessian_psi_psi.clone();
     assert_eq!(mixed_hessian.dim(), (dimension, dimension));
     assert!(mixed_hessian.iter().all(|value| value.is_finite()));
     assert!(mixed_hessian.iter().any(|value| *value != 0.0));
@@ -9260,7 +9261,7 @@ fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2
     );
     let law = normal_quantile_law(4001);
     for &(q, slope) in &[(-1.5, 0.4), (0.3, 0.8), (2.0, -0.6)] {
-        let (flex_residual, _, _) = family
+        let (flex_residual, _, _, _) = family
             .flex_survival_anchoring_residual(q, slope, beta_h, None, &law)
             .expect("flex anchoring residual");
         assert!(
@@ -9268,10 +9269,10 @@ fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2
             "under the program's own N(0, 1) the flex residual must vanish: q={q} slope={slope} \
              residual={flex_residual:e}"
         );
-        let (through_flex, sd_through_flex, scale_through_flex) = family
+        let (through_flex, sd_through_flex, scale_through_flex, _) = family
             .flex_survival_anchoring_residual(q, slope, None, None, &law)
             .expect("rigid anchoring residual through the flex program");
-        let (rigid, sd_rigid, scale_rigid) =
+        let (rigid, sd_rigid, scale_rigid, _) =
             crate::bms::estimated_latent_law::closed_form_survival_anchoring_residual(
                 q,
                 family.probit_frailty_scale() * slope,
