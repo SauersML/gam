@@ -2325,5 +2325,18 @@
     ],
     "reason": "The terminal 384-point cubic-cell Gauss-Legendre rule is built once per process from gauss_legendre_certified(TERMINAL_GL_ORDER): the hand-transcribed GL_NODES/GL_WEIGHTS tables carried weights 3.05e-12 relative off the true rule, so they are deleted, and the GPU emitter reads the certified rule through gl_nodes_for_gpu_kernel()/gl_weights_for_gpu_kernel() in place of the GL_*_FOR_GPU_KERNEL re-exports.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3361 (fix-3315-certified-gl-rule, Fixes #3315) merged as b3fbbbab2e0eae7c217bc986ddf46c6e36754731 with no source-removal entry. scripts/source_removal_guard.py from b3fbbbab2e0eae7c217bc986ddf46c6e36754731's own tree, run with --base 3f1da8e8f0b878d9fd40f44a615880cde1f85ff4 --head b3fbbbab2e0eae7c217bc986ddf46c6e36754731, lists exactly these 4 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> b3fbbbab2e0eae7c217bc986ddf46c6e36754731 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "265ec7bd81604ded27787776e4b0ddf6c60b216e",
+    "items": [
+      "crates/gam-custom-family/src/tests.rs:fn:custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898",
+      "crates/gam-custom-family/src/tests.rs:fn:evaluate",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_hessian_second_directional_derivative",
+      "crates/gam-custom-family/src/tests.rs:fn:exact_newton_joint_hessian_beta_dependent",
+      "crates/gam-custom-family/src/tests.rs:struct:D2hCountingQuarticFamily"
+    ],
+    "reason": "The #2898 mint-once pin custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 counted d2H calls across an unarmed custom-family quartic fit on the gradient-only BFGS plan. #3306 makes custom families search gradient-only only when joint_jeffreys_term_required() (the order-five Jeffreys curvature exists only when armed), so the unarmed quartic now runs exact-curvature ARC and legitimately assembles the outer Hessian per step; the pin therefore no longer described the plan it runs. The pin moved to the gam-solve gradient-only lifecycle test a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939, which asserts exactly one Hessian-order request, at the mint. D2hCountingQuarticFamily and its CustomFamily impl methods (evaluate, exact_newton_hessian_directional_derivative, exact_newton_hessian_second_directional_derivative, exact_newton_joint_hessian_beta_dependent) existed only for the removed pin.",
+    "evidence": "Backfill: PR #3405 (claude/fix-3306-fallback-incumbent, Fixes #3306) merged as eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 with no source-removal entry; the removal is in its commit 2c69566f, whose message records the pin move. scripts/source_removal_guard.py run with --base 265ec7bd81604ded27787776e4b0ddf6c60b216e --head eaf16b04947ee0c6cc9e7f735a16c141416cf5e7 lists exactly these 6 guarded removals and fails without this entry. Read-proof: git grep -w -c for custom_family_fit_assembles_the_outer_hessian_once_at_the_mint_2898 and D2hCountingQuarticFamily finds 1 file at the base and 0 at the merge; the other four names are trait methods still declared elsewhere (declaration count dropped by one each). The replacement pin lives at crates/gam-solve/src/rho_optimizer/run_plan_saddle_escape_tests.rs (#2898 assert in a_search_that_certifies_no_saddle_keeps_the_gradient_only_plan_2939)."
   }
 ]
