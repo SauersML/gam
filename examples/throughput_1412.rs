@@ -201,7 +201,7 @@ fn main() {
             }
             let start = Instant::now();
             match gam::gpu::linalg_dispatch::try_cholesky_batched_lower_inplace(&mut blocks) {
-                Some(()) => {
+                Some(_) => {
                     black_box(&blocks);
                 }
                 None => chol_decl += 1,

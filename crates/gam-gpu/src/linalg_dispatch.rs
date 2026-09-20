@@ -85,6 +85,22 @@ impl gam_linalg::gpu_hook::GpuGemmDispatch for CudaGemmDispatch {
     }
 }
 
+/// Mathematical verdict of an admitted GPU Cholesky factorization.
+///
+/// POTRF reporting a non-positive leading minor (`info > 0`) is a property of
+/// the input matrix, not an execution fault: callers use this to decide
+/// definiteness exactly as they would with a CPU factorization. Execution
+/// faults (driver errors, illegal arguments `info < 0`) remain post-admission
+/// panics through [`complete_gpu_attempt`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CholeskyVerdict {
+    /// Every matrix was factored; inputs now hold their lower Cholesky factors.
+    Factored,
+    /// At least one matrix is not positive definite. A single-matrix input is
+    /// left unchanged; batched contents are unspecified and must be discarded.
+    NotPositiveDefinite,
+}
+
 /// Discriminator used by [`route_through_gpu`] to apply the right
 /// size threshold from [`super::policy::GpuDispatchPolicy`].
 #[derive(Clone, Copy, Debug)]
@@ -181,8 +197,6 @@ fn decline_gpu_with_policy<T>(
     }
     None
 }
-
- /// A malformed device result is an execution fault, never an Auto decline.
 
 /// A malformed device result is an execution fault, never an Auto decline.
 #[cfg(target_os = "linux")]
@@ -412,11 +426,7 @@ pub fn try_fast_ab_broadcast_b_batched(
     {
         let runtime = route_through_gpu(DispatchOp::BatchedGemm { batch, m, n, k })?;
         if should_split_batch(batch) {
-            if let Some(out) = scatter_broadcast_b_batched(runtime, a, b, m, n) {
-                return Some(out);
-            }
-            // A multi-GPU tile failed; fall through to the single-device path so
-            // the whole batch is still produced on the primary device.
+            return Some(scatter_broadcast_b_batched(runtime, a, b, m, n));
         }
         Some(complete_gpu_attempt(
             "batched A·B",
@@ -428,8 +438,8 @@ pub fn try_fast_ab_broadcast_b_batched(
 /// Multi-GPU broadcast-B batched GEMM: split the batch dimension across all
 /// devices via [`scatter_batched`], running one cuBLAS strided-batched GEMM per
 /// device tile (each on its own bound ordinal). `b` is shared (broadcast) across
-/// every tile. Returns `None` if any tile fails so the caller falls back to the
-/// single-device path.
+/// every tile. The split runs after admission, so a tile failure is an
+/// execution fault and panics like every other post-admission failure.
 #[cfg(target_os = "linux")]
 fn scatter_broadcast_b_batched(
     runtime: &GpuRuntime,
@@ -437,14 +447,14 @@ fn scatter_broadcast_b_batched(
     b: ArrayView2<'_, f64>,
     m: usize,
     n: usize,
-) -> Option<Array3<f64>> {
+) -> Array3<f64> {
     let batch = a.dim().0;
     // One slot per batch item; the slot carries its own input matrix so the
     // per-tile closure is range-agnostic and owns disjoint memory.
     let mut items: Vec<(Array2<f64>, Option<Array2<f64>>)> = (0..batch)
         .map(|i| (a.index_axis(ndarray::Axis(0), i).to_owned(), None))
         .collect();
-    super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
+    let scattered = super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
         let tile_batch = tile.len();
         if tile_batch == 0 {
             return Some(());
@@ -459,8 +469,9 @@ fn scatter_broadcast_b_batched(
             *slot = Some(out.index_axis(ndarray::Axis(0), idx).to_owned());
         }
         Some(())
-    })?;
-    stitch_batched(items, m, n)
+    });
+    complete_gpu_attempt("batched A·B scatter", scattered);
+    stitch_batched("batched A·B scatter", items, m, n)
 }
 
 #[inline]
@@ -503,9 +514,7 @@ pub fn try_fast_abt_strided_batched_with_policy(
         let runtime =
             route_through_gpu_with_policy(DispatchOp::BatchedGemm { batch, m, n, k }, gpu_policy)?;
         if should_split_batch(batch) {
-            if let Some(out) = scatter_abt_strided_batched(runtime, a, b, m, n) {
-                return Some(out);
-            }
+            return Some(scatter_abt_strided_batched(runtime, a, b, m, n));
         }
         Some(complete_gpu_attempt(
             "batched A·Bᵀ",
@@ -517,7 +526,8 @@ pub fn try_fast_abt_strided_batched_with_policy(
 /// Multi-GPU A·Bᵀ strided-batched GEMM: split the batch dimension across all
 /// devices, running one strided-batched GEMM per device tile. Both `a` and `b`
 /// are batched (one matrix per batch item), so each slot carries its own
-/// `(a_i, b_i)` pair. Returns `None` on any tile failure.
+/// `(a_i, b_i)` pair. A tile failure is a post-admission execution fault and
+/// panics.
 #[cfg(target_os = "linux")]
 fn scatter_abt_strided_batched(
     runtime: &GpuRuntime,
@@ -525,7 +535,7 @@ fn scatter_abt_strided_batched(
     b: ArrayView3<'_, f64>,
     m: usize,
     n: usize,
-) -> Option<Array3<f64>> {
+) -> Array3<f64> {
     let batch = a.dim().0;
     let mut items: Vec<(Array2<f64>, Array2<f64>, Option<Array2<f64>>)> = (0..batch)
         .map(|i| {
@@ -536,7 +546,7 @@ fn scatter_abt_strided_batched(
             )
         })
         .collect();
-    super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
+    let scattered = super::pool::scatter_batched(runtime, &mut items, |ordinal, tile| {
         let tile_batch = tile.len();
         if tile_batch == 0 {
             return Some(());
@@ -553,31 +563,35 @@ fn scatter_abt_strided_batched(
             *slot = Some(out.index_axis(ndarray::Axis(0), idx).to_owned());
         }
         Some(())
-    })?;
+    });
+    complete_gpu_attempt("batched A·Bᵀ scatter", scattered);
     let slots: Vec<((), Option<Array2<f64>>)> =
         items.into_iter().map(|(_, _, slot)| ((), slot)).collect();
-    stitch_batched(slots, m, n)
+    stitch_batched("batched A·Bᵀ scatter", slots, m, n)
 }
 
 /// Reassemble per-batch output slots (filled by the device tiles) into a single
-/// `batch × m × n` array. Returns `None` if any slot is still empty (a tile
-/// silently skipped its item), which forces the single-device fallback.
+/// `batch × m × n` array. An empty slot (a tile skipped its item) or a
+/// wrong-shaped block is malformed device output and panics.
 #[cfg(target_os = "linux")]
 fn stitch_batched<L>(
+    operation: &'static str,
     items: Vec<(L, Option<Array2<f64>>)>,
     m: usize,
     n: usize,
-) -> Option<Array3<f64>> {
+) -> Array3<f64> {
     let batch = items.len();
     let mut out = Array3::<f64>::zeros((batch, m, n));
     for (idx, (_, slot)) in items.into_iter().enumerate() {
-        let block = slot?;
+        let Some(block) = slot else {
+            invalid_gpu_result(operation, "a device tile left a batch item unfilled");
+        };
         if block.dim() != (m, n) {
-            return None;
+            invalid_gpu_result(operation, "a device tile produced a block of the wrong shape");
         }
         out.index_axis_mut(ndarray::Axis(0), idx).assign(&block);
     }
-    Some(out)
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,7 +1072,7 @@ pub fn try_fast_joint_hessian_2x2(
 
 #[inline]
 #[must_use]
-pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
+pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<CholeskyVerdict> {
     let p = a.nrows();
     if p != a.ncols() {
         invalid_gpu_request("Cholesky factorization", "the input matrix is non-square");
@@ -1076,18 +1090,16 @@ pub fn try_cholesky_lower_inplace(a: &mut Array2<f64>) -> Option<()> {
     #[cfg(target_os = "linux")]
     {
         let runtime = route_through_gpu(DispatchOp::Potrf { p, batch: 1 })?;
-        let lower = complete_gpu_attempt(
+        Some(complete_gpu_attempt(
             "Cholesky factorization",
-            cuda_backend::cholesky_lower(runtime, a.view()),
-        );
-        *a = lower;
-        Some(())
+            cuda_backend::cholesky_lower(runtime, a),
+        ))
     }
 }
 
 #[inline]
 #[must_use]
-pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Option<()> {
+pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Option<CholeskyVerdict> {
     try_cholesky_batched_lower_inplace_with_policy(matrices, super::global_policy())
 }
 
@@ -1096,7 +1108,7 @@ pub fn try_cholesky_batched_lower_inplace(matrices: &mut [Array2<f64>]) -> Optio
 pub fn try_cholesky_batched_lower_inplace_with_policy(
     matrices: &mut [Array2<f64>],
     gpu_policy: GpuPolicy,
-) -> Option<()> {
+) -> Option<CholeskyVerdict> {
     let first = match matrices.first() {
         Some(first) => first,
         None => return decline_gpu("batched Cholesky factorization", "the batch is empty"),
@@ -1133,15 +1145,26 @@ pub fn try_cholesky_batched_lower_inplace_with_policy(
         if should_split_batch(batch) {
             // `matrices` is already the per-item slice, so the batch dimension
             // tiles directly onto `scatter_batched`: each device factors its own
-            // contiguous block of matrices in place. On any tile failure the
-            // whole batch is re-run on the primary device for determinism (the
-            // factored tiles are overwritten by the single-device pass).
-            let split = super::pool::scatter_batched(runtime, matrices, |ordinal, tile| {
-                cuda_backend::cholesky_batched_lower(ordinal, tile)
+            // contiguous block of matrices in place. A tile that meets a
+            // non-positive-definite matrix records that verdict and still
+            // succeeds; any other tile failure is a post-admission execution
+            // fault. There is no single-device re-run: successful tiles have
+            // already overwritten their inputs with factors.
+            let not_positive_definite = std::sync::atomic::AtomicBool::new(false);
+            let scattered = super::pool::scatter_batched(runtime, matrices, |ordinal, tile| {
+                if cuda_backend::cholesky_batched_lower(ordinal, tile)?
+                    == CholeskyVerdict::NotPositiveDefinite
+                {
+                    not_positive_definite.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+                Some(())
             });
-            if split.is_some() {
-                return Some(());
-            }
+            complete_gpu_attempt("batched Cholesky factorization scatter", scattered);
+            return Some(if not_positive_definite.into_inner() {
+                CholeskyVerdict::NotPositiveDefinite
+            } else {
+                CholeskyVerdict::Factored
+            });
         }
         Some(complete_gpu_attempt(
             "batched Cholesky factorization",
@@ -1558,6 +1581,117 @@ mod tests {
             }
         }
     }
+
+    /// An admitted GPU Cholesky must report an indefinite input as the
+    /// `NotPositiveDefinite` verdict, not as a post-admission execution fault
+    /// (which panics), and must factor SPD input to the CPU factor. The batch
+    /// clears `MULTI_GPU_BATCH_FLOOR`, so a multi-device pool exercises the
+    /// split path with the indefinite block in the last tile. Without CUDA both
+    /// entry points decline before admission and leave their inputs untouched.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gpu_cholesky_reports_indefinite_input_as_verdict_not_fault() {
+        use super::{
+            CholeskyVerdict, MULTI_GPU_BATCH_FLOOR, try_cholesky_batched_lower_inplace_with_policy,
+            try_cholesky_lower_inplace,
+        };
+        use ndarray::Array2;
+
+        // `4·I + (J − I)` has eigenvalues 3 (×(d−1)) and d + 3, so it is SPD
+        // with ‖A‖₂ = d + 3; flipping A[0,0] to −1 makes the order-1 leading
+        // minor negative (POTRF info = 1).
+        let d = 4usize;
+        let batch = MULTI_GPU_BATCH_FLOOR;
+        let spd = Array2::<f64>::from_shape_fn((d, d), |(i, j)| if i == j { 4.0 } else { 1.0 });
+        let mut indefinite = spd.clone();
+        indefinite[[0, 0]] = -1.0;
+
+        // CPU oracle: plain Cholesky–Banachiewicz, independent of faer/cuSOLVER.
+        let mut cpu = Array2::<f64>::zeros((d, d));
+        for i in 0..d {
+            for j in 0..=i {
+                let mut acc = spd[[i, j]];
+                for k in 0..j {
+                    acc -= cpu[[i, k]] * cpu[[j, k]];
+                }
+                cpu[[i, j]] = if i == j {
+                    acc.sqrt()
+                } else {
+                    acc / cpu[[j, j]]
+                };
+            }
+        }
+        // Each implementation has backward error |ΔA| ≤ γ_{d+1}|L||Lᵀ|, so
+        // ‖ΔA‖₂ ≤ d(d+1)u‖A‖₂, and the Cholesky perturbation bound turns that
+        // into ‖ΔL‖ ≲ κ₂(A)·d(d+1)u·‖L‖₂ with κ₂ = (d+3)/3 and ‖L‖₂ = √(d+3).
+        // The two implementations' errors add.
+        let dim = d as f64;
+        let tolerance =
+            2.0 * ((dim + 3.0) / 3.0) * dim * (dim + 1.0) * f64::EPSILON * (dim + 3.0).sqrt();
+
+        let Some(runtime) = available_runtime("GPU Cholesky verdict") else {
+            let mut blocks = vec![spd.clone(); batch];
+            assert_eq!(
+                try_cholesky_batched_lower_inplace_with_policy(&mut blocks, GpuPolicy::Auto),
+                None,
+                "no CUDA runtime is available, yet the batched POTRF was admitted"
+            );
+            assert!(
+                blocks.iter().all(|block| *block == spd),
+                "a declined batch was modified"
+            );
+            return;
+        };
+        assert!(
+            route_through_gpu(DispatchOp::SmallDenseBatchedPotrf { p: d, batch }).is_some(),
+            "a uniform {d}×{d} batch of {batch} must reach the small-dense batched POTRF gate"
+        );
+
+        let mut blocks = vec![spd.clone(); batch];
+        assert_eq!(
+            try_cholesky_batched_lower_inplace_with_policy(&mut blocks, GpuPolicy::Auto),
+            Some(CholeskyVerdict::Factored)
+        );
+        for (idx, factor) in blocks.iter().enumerate() {
+            let max_abs = factor
+                .iter()
+                .zip(cpu.iter())
+                .map(|(g, c)| (g - c).abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                max_abs <= tolerance,
+                "block {idx}: device factor disagrees with the CPU oracle: \
+                 max|Δ| = {max_abs:e} > {tolerance:e}"
+            );
+        }
+
+        let mut blocks = vec![spd.clone(); batch];
+        blocks[batch - 1] = indefinite.clone();
+        assert_eq!(
+            try_cholesky_batched_lower_inplace_with_policy(&mut blocks, GpuPolicy::Auto),
+            Some(CholeskyVerdict::NotPositiveDefinite),
+            "an indefinite block must be a definiteness verdict, not an execution fault"
+        );
+
+        // Single-matrix POTRF at the runtime's admission floor.
+        let p = runtime.policy.potrf_min_p;
+        let mut single = Array2::<f64>::eye(p);
+        single[[0, 0]] = -1.0;
+        let original = single.clone();
+        assert!(
+            route_through_gpu(DispatchOp::Potrf { p, batch: 1 }).is_some(),
+            "a {p}×{p} POTRF at the policy floor must route to the device"
+        );
+        assert_eq!(
+            try_cholesky_lower_inplace(&mut single),
+            Some(CholeskyVerdict::NotPositiveDefinite),
+            "an indefinite matrix must be a definiteness verdict, not an execution fault"
+        );
+        assert_eq!(
+            single, original,
+            "a NotPositiveDefinite verdict must leave the input unchanged"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1580,6 +1714,7 @@ mod cuda_backend {
     use ndarray::{Array1, Array2, Array3, ArrayView1, ArrayView2, ArrayView3};
 
     use super::super::device_runtime::GpuRuntime;
+    use super::CholeskyVerdict;
     use crate::driver::{from_col_major, to_col_major, to_i32};
     use cudarc::cusolver::{DnHandle, sys as cusolver_sys};
     use cudarc::driver::{DevicePtrMut, sys as driver_sys};
@@ -1675,11 +1810,15 @@ mod cuda_backend {
         super::super::blas::trsm_cuda(runtime, triangular, rhs, upper)
     }
 
+    /// Lower Cholesky of `a` on the runtime's device. On
+    /// [`CholeskyVerdict::Factored`] `a` holds its lower factor (upper triangle
+    /// zeroed); on [`CholeskyVerdict::NotPositiveDefinite`] it is unchanged.
+    /// `None` is an execution fault.
     #[inline]
     pub(super) fn cholesky_lower(
         runtime: &GpuRuntime,
-        a: ArrayView2<'_, f64>,
-    ) -> Option<Array2<f64>> {
+        a: &mut Array2<f64>,
+    ) -> Option<CholeskyVerdict> {
         let (p, p2) = a.dim();
         if p == 0 || p != p2 {
             return None;
@@ -1688,9 +1827,12 @@ mod cuda_backend {
             .new_stream()
             .ok()?;
         let solver = DnHandle::new(stream.clone()).ok()?;
-        let a_col = to_col_major(&a);
-        let mut a_dev = stream.clone_htod(&*a_col).ok()?;
-        potrf_lower_in_place(&solver, &stream, p, &mut a_dev)?;
+        let mut a_dev = stream.clone_htod(&*to_col_major(&*a)).ok()?;
+        if potrf_lower_in_place(&solver, &stream, p, &mut a_dev)?
+            == CholeskyVerdict::NotPositiveDefinite
+        {
+            return Some(CholeskyVerdict::NotPositiveDefinite);
+        }
         let factor_col = stream.clone_dtoh(&a_dev).ok()?;
         let mut lower = from_col_major(&factor_col, p, p)?;
         for row in 0..p {
@@ -1698,17 +1840,21 @@ mod cuda_backend {
                 lower[[row, col]] = 0.0;
             }
         }
-        Some(lower)
+        *a = lower;
+        Some(CholeskyVerdict::Factored)
     }
 
     /// Batched lower-Cholesky on a specific device ordinal. The ordinal's
     /// context is expected to be bound on the calling thread (multi-GPU
-    /// `scatter_batched` worker or the single-device dispatcher).
+    /// `scatter_batched` worker or the single-device dispatcher). Factors are
+    /// written back only on [`CholeskyVerdict::Factored`]; a positive POTRF
+    /// `info` is the [`CholeskyVerdict::NotPositiveDefinite`] verdict, and a
+    /// negative one (a rejected argument) is an execution fault (`None`).
     #[inline]
     pub(super) fn cholesky_batched_lower(
         ordinal: usize,
         matrices: &mut [Array2<f64>],
-    ) -> Option<()> {
+    ) -> Option<CholeskyVerdict> {
         let first = matrices.first()?;
         let p = first.nrows();
         if p == 0 || first.ncols() != p || matrices.iter().any(|matrix| matrix.dim() != (p, p)) {
@@ -1762,8 +1908,11 @@ mod cuda_backend {
             check_cusolver(status)?;
         }
         let info_host = stream.clone_dtoh(&info_dev).ok()?;
-        if info_host.iter().any(|info| *info != 0) {
+        if info_host.iter().any(|info| *info < 0) {
             return None;
+        }
+        if info_host.iter().any(|info| *info > 0) {
+            return Some(CholeskyVerdict::NotPositiveDefinite);
         }
         let factored_col = stream.clone_dtoh(&matrices_dev).ok()?;
         for (idx, matrix) in matrices.iter_mut().enumerate() {
@@ -1777,21 +1926,27 @@ mod cuda_backend {
             }
             *matrix = lower;
         }
-        Some(())
+        Some(CholeskyVerdict::Factored)
     }
 
-    /// Single-matrix lower Cholesky POTRF. Thin `Result → Option` adapter over
-    /// the shared precision-generic core in `solver.rs`
-    /// ([`crate::solver::potrf_in_place_generic`]) so the cuSOLVER
-    /// bufferSize/POTRF/info scaffold lives in exactly one place. The batched
-    /// variant (`cusolverDnDpotrfBatched`) above is kept separate by design.
+    /// Single-matrix lower Cholesky POTRF. Thin adapter over the shared
+    /// precision-generic core in `solver.rs`
+    /// ([`crate::solver::potrf_info_in_place_generic`]) so the cuSOLVER
+    /// bufferSize/POTRF/info scaffold lives in exactly one place: `info == 0`
+    /// is [`CholeskyVerdict::Factored`], `info > 0` is
+    /// [`CholeskyVerdict::NotPositiveDefinite`], and an execution fault is
+    /// `None`. The batched variant (`cusolverDnDpotrfBatched`) above is kept
+    /// separate by design.
     fn potrf_lower_in_place(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
         a: &mut cudarc::driver::CudaSlice<f64>,
-    ) -> Option<()> {
-        crate::solver::potrf_in_place_generic::<f64>(solver, stream, p, a).ok()
+    ) -> Option<CholeskyVerdict> {
+        match crate::solver::potrf_info_in_place_generic::<f64>(solver, stream, p, a).ok()? {
+            0 => Some(CholeskyVerdict::Factored),
+            _ => Some(CholeskyVerdict::NotPositiveDefinite),
+        }
     }
 
     #[inline]

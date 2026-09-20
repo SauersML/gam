@@ -304,17 +304,43 @@ mod cuda {
     /// precision `T`, querying and allocating its own workspace. Returns `Err`
     /// if the matrix is singular/indefinite at precision `T`.
     ///
-    /// This is the single-matrix POTRF core shared across the GPU layer:
-    /// `solver.rs`'s `potrf_in_place`/`spotrf_in_place` and `linalg.rs`'s
-    /// `potrf_lower_in_place` all route through it (the latter mapping the
-    /// `Result` to its `Option` contract at the boundary). The batched POTRF
-    /// (`cusolverDnDpotrfBatched`) in `linalg.rs` is intentionally separate.
-    pub(crate) fn potrf_in_place_generic<T: CholScalar>(
+    /// Callers that need to tell "not positive definite" apart from a device
+    /// fault use [`potrf_info_in_place_generic`], which this wraps.
+    fn potrf_in_place_generic<T: CholScalar>(
         solver: &DnHandle,
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         p: usize,
         a: &mut CudaSlice<T>,
     ) -> Result<(), String> {
+        match potrf_info_in_place_generic::<T>(solver, stream, p, a)? {
+            0 => Ok(()),
+            info => Err(format!(
+                "cusolverDn{} returned info={info}{}",
+                T::POTRF_NAME,
+                T::POTRF_FAIL_SUFFIX
+            )),
+        }
+    }
+
+    /// Single-matrix POTRF core shared across the GPU layer: `solver.rs`'s
+    /// `potrf_in_place`/`spotrf_in_place` (through [`potrf_in_place_generic`])
+    /// and `linalg_dispatch.rs`'s `potrf_lower_in_place` all route through it.
+    /// The batched POTRF (`cusolverDnDpotrfBatched`) in `linalg_dispatch.rs` is
+    /// intentionally separate.
+    ///
+    /// Returns cuSOLVER's `info`: `Ok(0)` when `a` now holds its lower
+    /// Cholesky factor, `Ok(k)` with `k > 0` when the leading minor of order
+    /// `k` is not positive definite at precision `T`. That is a verdict about
+    /// the matrix, not a device failure, so it is not an `Err`. `Err` is kept
+    /// for execution faults: an allocation, launch or transfer failure, a
+    /// non-success cuSOLVER status, or a negative `info` (an argument the
+    /// library rejected).
+    pub(crate) fn potrf_info_in_place_generic<T: CholScalar>(
+        solver: &DnHandle,
+        stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+        p: usize,
+        a: &mut CudaSlice<T>,
+    ) -> Result<i32, String> {
         let p_i = to_i32(p)?;
         let lwork = potrf_bufsize_generic::<T>(solver, stream, p)?;
         let lwork_i = i32::try_from(lwork).map_err(|_| "negative potrf workspace".to_string())?;
@@ -347,15 +373,13 @@ mod cuda {
         let info_host = stream
             .clone_dtoh(&info)
             .map_err(|e| format!("download potrf info: {e}"))?;
-        if info_host[0] == 0 {
-            Ok(())
-        } else {
-            Err(format!(
-                "cusolverDn{} returned info={}{}",
+        match info_host[0] {
+            info if info >= 0 => Ok(info),
+            info => Err(format!(
+                "cusolverDn{} rejected argument {} (info={info})",
                 T::POTRF_NAME,
-                info_host[0],
-                T::POTRF_FAIL_SUFFIX
-            ))
+                info.unsigned_abs()
+            )),
         }
     }
 
@@ -984,11 +1008,11 @@ mod cuda {
 
 // These solver entry points are consumed by sibling crates (`gam-solve`'s
 // pirls/reml GPU paths, `gam-models`, ...) via `gam_gpu::solver::*`, so they
-// are part of gam-gpu's public surface. `potrf_in_place_generic` is the
+// are part of gam-gpu's public surface. `potrf_info_in_place_generic` is the
 // only one with no cross-crate consumer; it stays crate-private and is
-// reached internally through `crate::solver::potrf_in_place_generic`.
+// reached internally through `crate::solver::potrf_info_in_place_generic`.
 #[cfg(target_os = "linux")]
-pub(crate) use cuda::potrf_in_place_generic;
+pub(crate) use cuda::potrf_info_in_place_generic;
 #[cfg(target_os = "linux")]
 pub use cuda::{
     check_deferred_potrf_info, check_deferred_potrs_info, cholesky_logdet_from_col_major,

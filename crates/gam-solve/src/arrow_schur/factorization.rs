@@ -46,7 +46,8 @@ pub(crate) struct ArrowRowFactorResult {
 ///   * every row really is the uniform `(d, d)` shape with a length-`d` `g_t`
 ///     (heterogeneous systems keep the per-row CPU loop), and
 ///   * a device is available and EVERY block is positive-definite at the base
-///     ridge (a non-PD block makes the batched POTRF return `None`), and
+///     ridge (a non-PD block makes the batched POTRF report
+///     `Some(CholeskyVerdict::NotPositiveDefinite)`), and
 ///   * unless this is an evidence factorization, every resulting factor passes the
 ///     same diagonal-ratio κ ceiling `factor_one_row` enforces.
 ///
@@ -109,13 +110,15 @@ pub(crate) fn try_factor_blocks_batched(
         blocks.push(block);
     }
 
-    // Batched lower Cholesky over ALL usable GPUs. `None` ⇒ either no device
-    // accepted the workload or some block was not PD at the base ridge; either
-    // way the per-row CPU path must own escalation.
-    let Some(()) = gam_gpu::try_cholesky_batched_lower_inplace_with_policy(&mut blocks, gpu_policy)
-    else {
+    // Batched lower Cholesky over ALL usable GPUs. `None` ⇒ no device accepted
+    // the workload; `NotPositiveDefinite` ⇒ some block was not PD at the base
+    // ridge (the batch contents are then discarded). Either way the per-row
+    // CPU path must own escalation.
+    if gam_gpu::try_cholesky_batched_lower_inplace_with_policy(&mut blocks, gpu_policy)
+        != Some(gam_gpu::CholeskyVerdict::Factored)
+    {
         return Ok(None);
-    };
+    }
 
     // Re-apply the κ-conditioning rejection so a barely-PD block forces the
     // whole batch back to the per-row path (where its ridge lifts), matching

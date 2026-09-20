@@ -3511,7 +3511,12 @@ pub fn build_gaussian_reml_eigen_cache_batched(
     let uniform_square = p > 0 && xtwx_matrices.iter().all(|matrix| matrix.dim() == (p, p));
     if uniform_square && k > 1 {
         let mut lower_matrices = xtwx_matrices.clone();
-        if gam_gpu::try_cholesky_batched_lower_inplace(&mut lower_matrices).is_some() {
+        // A `NotPositiveDefinite` batch verdict falls to the per-block path so
+        // each block gets its own definiteness verdict instead of one block
+        // failing every other block.
+        if gam_gpu::try_cholesky_batched_lower_inplace(&mut lower_matrices)
+            == Some(gam_gpu::CholeskyVerdict::Factored)
+        {
             // The batched penalty transform is an optional accelerator. On
             // failure we must NOT fabricate an empty Vec (indexing it per-block
             // would silently drop the transform for every block and could index
@@ -4041,8 +4046,14 @@ fn gaussian_reml_cholesky_lower(xtwx: Array2<f64>) -> Result<Array2<f64>, Estima
     // ridge here would build the cache of `X'WX + δI`, a different model whose
     // `logdet_xtwx` is the log of δ (#3090), so the failure is reported.
     let mut gpu_candidate = xtwx.clone();
-    if gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate).is_some() {
-        return Ok(gpu_candidate);
+    match gam_gpu::try_cholesky_lower_inplace(&mut gpu_candidate) {
+        Some(gam_gpu::CholeskyVerdict::Factored) => return Ok(gpu_candidate),
+        Some(gam_gpu::CholeskyVerdict::NotPositiveDefinite) => {
+            return Err(EstimationError::ModelIsIllConditioned {
+                condition_number: f64::INFINITY,
+            });
+        }
+        None => {}
     }
     xtwx.cholesky(Side::Lower)
         .map(|chol| chol.lower_triangular())
