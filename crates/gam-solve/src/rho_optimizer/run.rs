@@ -7563,7 +7563,6 @@ pub(crate) fn run_per_atom_efs_if_frontier(
         config.max_iter,
         lower,
         upper,
-        outer_criterion_resolution(config),
     );
     let topology = crate::estimate::reml::per_atom_efs::SharedBorderTopology::disjoint(rho_dim);
 
@@ -8396,7 +8395,7 @@ pub(crate) fn run_fixed_point_outer_solver(
         recurrent_incumbent_exit: Arc::clone(&recurrent_incumbent_exit),
         // The same criterion resolution the gradient routes' cost-stall guard
         // uses, and its first-order window.
-        progress: FixedPointProgress::new(outer_criterion_resolution(config)),
+        progress: FixedPointProgress::new(),
         unprogressing_exit: Arc::clone(&unprogressing_exit),
     };
     let seed_sample = match objective.eval_step(seed) {

@@ -207,28 +207,16 @@ pub struct PerAtomEfsConfig {
     /// Per-coordinate lower/upper bounds on ρ.
     pub lower: Array1<f64>,
     pub upper: Array1<f64>,
-    /// Absolute resolution of the criterion, `τ_stat = 1/(2n)`, or 0 when the
-    /// route declares no size: an improvement no larger than this is not
-    /// progress.
-    pub criterion_resolution: f64,
 }
 
 impl PerAtomEfsConfig {
-    /// Build from the bounds, budget and criterion resolution the generic
-    /// outer config supplies.
-    pub fn new(
-        tolerance: f64,
-        max_iter: usize,
-        lower: Array1<f64>,
-        upper: Array1<f64>,
-        criterion_resolution: f64,
-    ) -> Self {
+    /// Build from the bounds and budget the generic outer config supplies.
+    pub fn new(tolerance: f64, max_iter: usize, lower: Array1<f64>, upper: Array1<f64>) -> Self {
         Self {
             tolerance,
             max_iter,
             lower,
             upper,
-            criterion_resolution,
         }
     }
 }
@@ -508,8 +496,7 @@ pub fn run_per_atom_efs(
     // The progress certificate the dense fixed-point walk carries (#2817,
     // #3176): an evaluation that bought no resolved improvement and no smaller
     // step ends the walk as a stall, instead of the iteration count.
-    let mut progress =
-        crate::rho_optimizer::FixedPointProgress::new(cfg.criterion_resolution);
+    let mut progress = crate::rho_optimizer::FixedPointProgress::new();
 
     for _ in 0..cfg.max_iter.max(1) {
         iterations += 1;
@@ -749,7 +736,6 @@ mod tests {
             200,
             Array1::from_elem(dim, -50.0),
             Array1::from_elem(dim, 50.0),
-            0.0,
         )
     }
 
@@ -900,7 +886,6 @@ mod tests {
             200,
             Array1::from_elem(1, -1e4),
             Array1::from_elem(1, 1e4),
-            0.0,
         );
         let (rho_new, cost_new, alpha) =
             backtrack_cost(&mut obj, &array![0.0], &array![768.0], 0.5, &cfg)

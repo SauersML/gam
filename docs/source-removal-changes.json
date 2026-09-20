@@ -2327,12 +2327,11 @@
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3361 (fix-3315-certified-gl-rule, Fixes #3315) merged as b3fbbbab2e0eae7c217bc986ddf46c6e36754731 with no source-removal entry. scripts/source_removal_guard.py from b3fbbbab2e0eae7c217bc986ddf46c6e36754731's own tree, run with --base 3f1da8e8f0b878d9fd40f44a615880cde1f85ff4 --head b3fbbbab2e0eae7c217bc986ddf46c6e36754731, lists exactly these 4 guarded removals and fails without this entry (audit run 2026-09-20, /scratch.global/sauer354/w2slb/audit2). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. Read-proof: git grep -w -c <name> b3fbbbab2e0eae7c217bc986ddf46c6e36754731 -- <its path> gives 0 for every item."
   },
   {
-    "base": "b3fbbbab2e0eae7c217bc986ddf46c6e36754731",
+    "base": "d4f20811be4720be65138012e033abcb05a91e42",
     "items": [
-      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817",
-      "crates/gam-solve/src/rho_optimizer/bridges.rs:const:COST_STALL_WINDOW"
+      "crates/gam-solve/src/rho_optimizer/arc_curvature_stationary_2817_tests.rs:fn:a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817"
     ],
-    "reason": "#3176: FixedPointProgress judges each evaluation on its own. It stops the walk iff the evaluation neither improves the incumbent resolvably (resolvably_below at tau each side) nor proposes a step shorter than the previous one, so its 6-evaluation window is deleted. The device BFGS walk, the only other reader of COST_STALL_WINDOW, keeps the count opt's CostStallConfig requires as the private OPT_COST_STALL_WINDOW in gpu/reml_outer.rs until opt's stall rule is window-free (#3018). The limit-cycle pin a_limit_cycling_fixed_point_walk_stops_at_its_second_window_2817 asserted a stop at the second window, which no longer exists; it is restated as a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
-    "evidence": "At base b3fbbbab2e source_removal_guard.py reports exactly these two guarded removals (production_occurrences 0 for both). At the head tree git grep -w finds neither name in crates/. The three restated FixedPointProgress pins pass in cargo test -p gam-solve --lib fixed_point_walk."
+    "reason": "#3176: FixedPointProgress judges each evaluation on its own (a resolved improvement of the incumbent, charged each value's own rounding gamma_1*|V|, or a contraction of the step) instead of filling COST_STALL_WINDOW-evaluation windows, so a limit-cycling walk stops at its first unprogressing evaluation, not its second window. The pin restating the second-window stop is replaced by a_limit_cycling_fixed_point_walk_stops_at_its_first_unprogressing_evaluation_2817.",
+    "evidence": "At base d4f20811be source_removal_guard.py reports exactly this one guarded removal. The replacement pin and the restated contraction, improvement and below-tau-above-rounding pins pass in cargo test -p gam-solve --lib fixed_point_walk."
   }
 ]

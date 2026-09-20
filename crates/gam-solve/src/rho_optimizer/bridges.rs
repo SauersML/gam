@@ -246,6 +246,13 @@ pub(crate) enum CostStallVerdict {
     },
 }
 
+/// The accepted-step window `opt`'s BFGS cost stall takes on the GPU walk.
+/// `CostStallConfig` at the pinned `opt` has no window-free form; the host
+/// routes judge each step on its own resolution (#3018) and the fixed-point
+/// walks each evaluation on its own (#3176), so this is its last consumer, and
+/// it goes with the `opt` bump that brings the window-free stall rule (#3018).
+pub(crate) const COST_STALL_WINDOW: usize = 6;
+
 /// One sample the cost-stall guard judges (#3018).
 ///
 /// `resolution` bounds the evaluation error of `value`, `|V̂ − V| ≤ resolution`:
@@ -4718,9 +4725,13 @@ pub(crate) fn build_bridge_hessian_for_source(
 ///
 /// - a resolved improvement of the incumbent: a value [`resolvably_below`] the
 ///   best one so far. An EFS evaluation publishes no certificate evidence, so
-///   each value's resolution is the criterion's `τ`
-///   ([`super::run::outer_criterion_resolution`]), the resolution
-///   [`sample_resolution`] charges such an evaluation on the gradient routes.
+///   each value is charged only its own rounding `γ₁·|V|`
+///   ([`gam_math::roundoff::accumulation_growth`]`(1)`): the improvement is
+///   judged against `γ₁|V_best| + γ₁|V|`. The criterion's statistical
+///   resolution `τ` is a decrease-*left* quantity, the certificate's decrement
+///   tolerance, not the arithmetic error of one value; charging it here would
+///   stop a walk still improving by less than `τ` but by far more than its
+///   values' rounding.
 /// - contraction of the map: a proposed step shorter than the previous one.
 ///   A fixed-point iteration converges only where its map contracts, so a
 ///   step that shrinks is the walk's evidence it is closing on a fixed point.
@@ -4731,21 +4742,19 @@ pub(crate) fn build_bridge_hessian_for_source(
 /// best iterate and continues on the analytic gradient where one is declared.
 ///
 /// Termination needs no count. The criterion is bounded below on the declared
-/// domain, so resolved improvements are finite, and between two of them every
-/// continuing evaluation strictly lowers a floating-point step norm bounded
-/// below by zero.
+/// domain and each resolved improvement strictly lowers the floating-point
+/// incumbent, so resolved improvements are finite, and between two of them
+/// every continuing evaluation strictly lowers a floating-point step norm
+/// bounded below by zero.
 pub(crate) struct FixedPointProgress {
-    /// The criterion's absolute resolution `τ`.
-    resolution: f64,
     best_value: f64,
     previous_step_norm: f64,
     evaluations: usize,
 }
 
 impl FixedPointProgress {
-    pub(crate) fn new(resolution: f64) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            resolution,
             best_value: f64::INFINITY,
             previous_step_norm: f64::INFINITY,
             evaluations: 0,
@@ -4760,7 +4769,13 @@ impl FixedPointProgress {
         if !value.is_finite() || !step_norm.is_finite() {
             return false;
         }
-        let improved = resolvably_below(self.best_value, self.resolution, value, self.resolution);
+        let rounding = |v: f64| gam_math::roundoff::accumulation_growth(1) * v.abs();
+        let improved = resolvably_below(
+            self.best_value,
+            rounding(self.best_value),
+            value,
+            rounding(value),
+        );
         let contracted = step_norm < self.previous_step_norm;
         self.best_value = self.best_value.min(value);
         self.previous_step_norm = step_norm;
