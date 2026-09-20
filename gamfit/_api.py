@@ -213,9 +213,12 @@ def build_info() -> dict[str, Any]:
     """Return build/runtime metadata for the Rust extension.
 
     Reports whether ``gamfit._rust`` was importable and, when available, the
-    build-time information the extension exposes. The package ``version`` is
-    shared by every commit between releases, so ``commit``, ``dirty`` and
-    ``model_payload_version`` are what tell two engines apart.
+    build-time information the extension exposes. ``commit``, ``dirty`` and
+    ``model_payload_version`` tell two engines apart. The crate ``version``
+    below is the static release line, which every commit between releases
+    shares. ``gamfit.__version__`` also names the commit when the build was
+    stamped by ``scripts/gamfit_version.py``, as ``./build.sh maturin`` does
+    (gam#3157).
 
     Returns
     -------
@@ -223,7 +226,8 @@ def build_info() -> dict[str, Any]:
         Always contains ``available`` (bool) and ``module`` (str). When the
         extension loaded it also contains:
 
-        - ``version`` (str): the engine's package version.
+        - ``version`` (str): the gam-pyffi crate version, the release line in
+          ``pyproject.toml``.
         - ``commit`` (str or None): the full hash of the gam commit the
           extension was built from; None when the build had no gam git tree
           to read, as for a build from an unpacked sdist.

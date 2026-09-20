@@ -769,6 +769,29 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     let anchor_design = DesignMatrix::Dense(DenseDesignMatrix::from(anchor_dense.clone()));
     use super::deviation_runtime::ParametricAnchorBlock;
     let p_before = link_prepared.runtime.basis_dim();
+    // effective_rank(C): the same compile against the extra column alone, which
+    // lies outside span(C) and so aliases nothing. A simple-ended link basis's
+    // outermost ramps are nearly flat over the training rows, so this can sit
+    // below p_c (gam#3011).
+    let mut reference = link_prepared.clone();
+    let extra_design = DesignMatrix::Dense(DenseDesignMatrix::from(
+        extra_orth.clone().insert_axis(ndarray::Axis(1)),
+    ));
+    install_compiled_flex_block_into_runtime(
+        &mut reference,
+        &q0_seed,
+        &link_cfg,
+        &[(&extra_design, ParametricAnchorBlock::Marginal)],
+        &[],
+        &weights,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "effective rank of the candidate", e));
+    let effective_rank = reference.runtime.basis_dim();
+    assert!(
+        effective_rank > k_alias && effective_rank <= p_before,
+        "partial-alias test needs effective_rank(C) > k_alias, got effective_rank={effective_rank}, \
+         k_alias={k_alias}, p_c={p_before}",
+    );
     install_compiled_flex_block_into_runtime(
         &mut link_prepared,
         &q0_seed,
@@ -786,11 +809,13 @@ fn cross_block_identifiability_partial_alias_keeps_residual_rank() {
     let p_after = link_prepared.runtime.basis_dim();
     assert_eq!(
         p_after,
-        p_before - k_alias,
-        "partial alias should drop exactly the {} aliased directions; got {} -> {}",
+        effective_rank - k_alias,
+        "partial alias should drop exactly the {} aliased directions; got {} -> {} \
+         (effective rank {})",
         k_alias,
         p_before,
         p_after,
+        effective_rank,
     );
     let new_design = link_prepared
         .runtime
@@ -3329,8 +3354,11 @@ fn observed_denested_partials_include_third_a_derivative_for_piecewise_cubic_lin
         },
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "link block", e));
+    // Not linear in the column index: on uniform simple-ended ramps a linear
+    // coefficient sequence reproduces a quadratic `w`, whose `w'''` is zero.
     let beta_w = Array1::from_iter(
-        (0..link_prepared.block.design.ncols()).map(|idx| 0.01 * (idx as f64 + 1.0)),
+        (0..link_prepared.block.design.ncols())
+            .map(|idx| 0.01 * (1.5 + (1.7 * idx as f64).sin())),
     );
     let family =
         BernoulliMarginalSlopeFamily {
@@ -7203,8 +7231,10 @@ fn conditional_latent_gate_silent_without_conditional_structure() {
 
 /// #905/gam#2926: a conditional shift on the span makes the default a moving law —
 /// refused by name when no context covariates are supplied — fitted first on the
-/// location-scale Gaussian arm and certified against the Gaussian, location-scale
-/// empirical and local arms, whose local law tracks the shift by context; and the
+/// simplest admissible location-scale arm and certified against the Gaussian,
+/// location-scale Gaussian and local arms. The residual `ζ = ±0.35/σ` is two-point, so
+/// it fails the adequacy screen and the location-scale Gaussian arm is not a
+/// candidate: the fit starts on the location-scale empirical arm, whose local law tracks the shift by context; and the
 /// declared conditional location-scale law routes the same score to the
 /// conditional correction with an empirical residual law.
 #[test]
@@ -7229,9 +7259,9 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         ),
     }
 
-    // With the covariate as context the default fits the location-scale Gaussian
-    // arm first, carrying the certificate's candidates, and its local arm tracks
-    // the conditional mean `0.8·c` across the span.
+    // With the covariate as context the default fits the simplest admissible
+    // location-scale arm first, carrying the certificate's candidates, and its local
+    // arm tracks the conditional mean `0.8·c` across the span.
     let policy = LatentZPolicy {
         check_mode: LatentZCheckMode::Off,
         normalization: LatentZNormalizationMode::None,
@@ -7252,18 +7282,18 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         "rigid latent-law test",
     )
     .unwrap_or_else(|e| panic!("moving latent law failed: {e}"));
-    assert!(matches!(provisional.kind, LatentMeasureKind::StandardNormal));
+    assert!(matches!(provisional.kind, LatentMeasureKind::GlobalEmpirical { .. }));
     assert!(
         matches!(
             provisional.calibration,
             LatentMeasureCalibration::ConditionalLocationScale(_)
         ),
-        "a moving conditional mean must be fitted first on the location-scale Gaussian arm"
+        "a moving conditional mean must be fitted first on a location-scale arm"
     );
     assert!(matches!(
         provisional.consumed,
         LatentLawConsumed::EstimatedMovingLaw {
-            arm: MovingLawArm::LocationScaleGaussian,
+            arm: MovingLawArm::LocationScaleEmpirical,
             certificate: None,
             ..
         }
@@ -7272,6 +7302,15 @@ fn a_conditional_shift_is_a_moving_law_by_default_and_location_scale_by_declarat
         .moving_law
         .as_ref()
         .unwrap_or_else(|| panic!("a provisional moving law must carry its certificate's candidates"));
+    let location_scale_screen = candidates
+        .screen_of(MovingLawArm::LocationScaleGaussian)
+        .expect("the location-scale Gaussian arm is screened on ζ");
+    assert!(
+        !location_scale_screen.passes(),
+        "a two-point residual must fail the adequacy screen: {}",
+        location_scale_screen.ledger()
+    );
+    assert_eq!(candidates.fitted_arm(), MovingLawArm::LocationScaleEmpirical);
     assert_eq!(
         candidates.arms(),
         &[

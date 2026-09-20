@@ -3245,6 +3245,45 @@ impl DenseDesignOperator for BlockDesignOperator {
         Ok(out)
     }
 
+    fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+        // Each requested column lives in exactly one block, so read it from that
+        // block's own storage instead of one full matvec per unit vector.
+        for &j in cols {
+            assert!(
+                j < self.total_cols,
+                "BlockDesignOperator::apply_columns: column index {j} out of bounds (ncols={})",
+                self.total_cols
+            );
+        }
+        let mut out = Array2::<f64>::zeros((self.n, cols.len()));
+        for (idx, block) in self.blocks.iter().enumerate() {
+            let cs = self.col_offsets[idx];
+            let ce = self.col_offsets[idx + 1];
+            let (targets, local): (Vec<usize>, Vec<usize>) = cols
+                .iter()
+                .enumerate()
+                .filter(|&(_, &j)| cs <= j && j < ce)
+                .map(|(k, &j)| (k, j - cs))
+                .unzip();
+            if local.is_empty() {
+                continue;
+            }
+            let block_cols = match block {
+                DesignBlock::Dense(DenseDesignMatrix::Materialized(mat)) => {
+                    mat.select(Axis(1), &local)
+                }
+                DesignBlock::Dense(DenseDesignMatrix::Lazy(op)) => op.apply_columns(&local),
+                DesignBlock::Sparse(s) => DesignMatrix::Sparse(s.clone()).extract_columns(&local),
+                DesignBlock::RandomEffect(op) => op.apply_columns(&local),
+                DesignBlock::Intercept(n) => Array2::ones((*n, local.len())),
+            };
+            for (src, &k) in targets.iter().enumerate() {
+                out.column_mut(k).assign(&block_cols.column(src));
+            }
+        }
+        out
+    }
+
     fn row_chunk_into(
         &self,
         rows: Range<usize>,
@@ -6508,6 +6547,94 @@ mod tests {
             max_diff < 1e-12,
             "streamed sparse weighted Gram mismatch: max_diff={max_diff}"
         );
+    }
+
+    struct ColumnReadOperator {
+        values: Array2<f64>,
+        apply_calls: AtomicUsize,
+    }
+
+    impl LinearOperator for ColumnReadOperator {
+        fn nrows(&self) -> usize {
+            self.values.nrows()
+        }
+
+        fn ncols(&self) -> usize {
+            self.values.ncols()
+        }
+
+        fn apply(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.apply_calls.fetch_add(1, Ordering::SeqCst);
+            self.values.dot(vector)
+        }
+
+        fn apply_transpose(&self, vector: &Array1<f64>) -> Array1<f64> {
+            self.values.t().dot(vector)
+        }
+
+        fn diag_xtw_x(&self, weights: &Array1<f64>) -> Result<Array2<f64>, String> {
+            let weighted = &self.values * &weights.view().insert_axis(Axis(1));
+            Ok(self.values.t().dot(&weighted))
+        }
+    }
+
+    impl DenseDesignOperator for ColumnReadOperator {
+        fn row_chunk_into(
+            &self,
+            rows: Range<usize>,
+            mut out: ArrayViewMut2<'_, f64>,
+        ) -> Result<(), MatrixMaterializationError> {
+            out.assign(&self.values.slice(s![rows, ..]));
+            Ok(())
+        }
+
+        fn apply_columns(&self, cols: &[usize]) -> Array2<f64> {
+            self.values.select(Axis(1), cols)
+        }
+
+        fn to_dense(&self) -> Array2<f64> {
+            self.values.clone()
+        }
+    }
+
+    #[test]
+    fn block_design_apply_columns_reads_owning_blocks_without_matvecs() {
+        let eager = array![[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [7.0, 8.0]];
+        let lazy = Arc::new(ColumnReadOperator {
+            values: array![[10.0, 11.0], [12.0, 13.0], [14.0, 15.0], [16.0, 17.0]],
+            apply_calls: AtomicUsize::new(0),
+        });
+        let sparse = SparseColMat::<usize, f64>::try_new_from_triplets(
+            4,
+            3,
+            &[
+                Triplet::new(0, 0, 20.0),
+                Triplet::new(1, 1, 21.0),
+                Triplet::new(2, 2, 22.0),
+                Triplet::new(3, 0, 23.0),
+            ],
+        )
+        .expect("sparse block");
+        let random_effect = Arc::new(RandomEffectOperator::new(
+            vec![Some(0), None, Some(1), Some(0)],
+            2,
+        ));
+        let op = BlockDesignOperator::new(vec![
+            DesignBlock::Intercept(4),
+            DesignBlock::Dense(DenseDesignMatrix::from(eager)),
+            DesignBlock::Dense(DenseDesignMatrix::from(Arc::clone(&lazy))),
+            DesignBlock::Sparse(SparseDesignMatrix::new(sparse)),
+            DesignBlock::RandomEffect(random_effect),
+        ])
+        .expect("mixed block design");
+        let dense = DenseDesignOperator::to_dense(&op);
+        lazy.apply_calls.store(0, Ordering::SeqCst);
+
+        let cols = [9, 3, 0, 4, 2, 7, 5, 3];
+        let got = op.apply_columns(&cols);
+
+        assert_eq!(got, dense.select(Axis(1), &cols));
+        assert_eq!(lazy.apply_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

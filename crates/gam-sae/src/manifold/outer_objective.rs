@@ -688,6 +688,12 @@ struct CrosscoderBlockPricing {
     /// the as-handed target), so `apply_block_scaling` rewrites a block only when
     /// its ρ `log λ` moves off the currently materialized value.
     last_log_lambda: Vec<f64>,
+    /// Per-block count of integrated coordinates the block scale does NOT reach
+    /// (#2822): an unpenalized decoder direction carries a flat prior, so the
+    /// change of variables `β ↦ √λ·β` that makes the scaled criterion exact leaves
+    /// `½·null_ℓ·log λ_ℓ` behind. Zero for crosscoder relevance blocks, whose
+    /// decoder prior does not scale with the block.
+    null_dims: Vec<f64>,
 }
 
 /// Full transactional checkpoint for one reactive coupled waypoint. The value
@@ -1316,7 +1322,8 @@ impl SaeManifoldOuterObjective {
                 // #2234 — `cache` is the `B` geometry the implicit right-hand sides ride; every
                 // log-determinant channel and the adjoint read the orbit lane's elimination.
                 let solver = DeflatedArrowSolver::plain(&evaluation.cache);
-                self.term.analytic_outer_rho_gradient_components_arrow_orbit(
+                self.term
+                    .analytic_outer_rho_gradient_components_arrow_orbit(
                     self.target.view(),
                     rho,
                     &evaluation.loss,
@@ -1453,8 +1460,73 @@ impl SaeManifoldOuterObjective {
         self.crosscoder_blocks = Some(CrosscoderBlockPricing {
             p_x,
             last_log_lambda: vec![0.0; block_dims.len()],
+            null_dims: vec![0.0; block_dims.len()],
             block_dims,
             pristine_blocks,
+        });
+        Ok(self)
+    }
+
+    /// #2822 — price the observation-noise precision `λ = 1/φ` as an outer coordinate.
+    ///
+    /// The criterion's data term is `½‖y − f‖²` at unit dispersion. Left at `φ = 1` on a
+    /// standardized target, it fixes the noise at the target's total variance, and at that noise the
+    /// prior mass a collapsed latent recovers outweighs the fit a curved atom earns: every planted
+    /// circle fit left the manifold basin (#2822). The dispersion is a model parameter, so it is
+    /// estimated with the rest of ρ.
+    ///
+    /// Parametrization: the fit runs on `y' = √λ·y` at unit dispersion, with the decoder prior
+    /// scaling with the noise (the smoothing parameters are signal-to-noise ratios) and the latent
+    /// priors fixed. Under `y' = √λ·y`, `β' = √λ·β` the exact marginal satisfies
+    ///
+    /// ```text
+    /// V_φ(y) = V₁(√λ·y) − ((n·p − M_null)/2)·log λ,
+    /// ```
+    ///
+    /// with `M_null = Σ_k r_k·(M_k − rank S_k)` the flat-prior decoder directions the change of
+    /// variables does not normalize (the same `r_k` channels `reml_occam_term` prices). The Laplace
+    /// criterion is equivariant under that linear map, so the identity holds for it too. The
+    /// coordinate is the single trailing `log_lambda_block` entry of the ρ template, applied over
+    /// every output column (`p_x = 0`), and it rides the same scaling, Jacobian, gradient, IFT and
+    /// Fellner–Schall machinery as a crosscoder relevance block.
+    ///
+    /// `extra_null_dims` adds integrated coordinates that the scale does not reach and the term does
+    /// not own, such as a peeled per-column mean. The as-handed target is `λ = 1`; the seed's
+    /// `log_lambda_block[0]` is applied on the first evaluation.
+    pub fn with_global_dispersion(mut self, extra_null_dims: usize) -> Result<Self, String> {
+        if self.crosscoder_blocks.is_some() || self.term.crosscoder_pricing_spans.is_some() {
+            return Err(
+                "with_global_dispersion: crosscoder block pricing is installed; the global \
+                 dispersion and per-block relevance weights are one coordinate family"
+                    .to_string(),
+            );
+        }
+        if self.baseline_rho.log_lambda_block.len() != 1 {
+            return Err(format!(
+                "with_global_dispersion: the ρ template must carry exactly one log_lambda_block \
+                 coordinate (the log noise precision); got {}",
+                self.baseline_rho.log_lambda_block.len()
+            ));
+        }
+        let p = self.target.ncols();
+        if p == 0 {
+            return Err("with_global_dispersion: target has no columns".to_string());
+        }
+        let mut null_dims = extra_null_dims as f64;
+        for atom in &self.term.atoms {
+            let rank_s = SaeManifoldTerm::symmetric_rank(atom.smooth_penalty())?;
+            let m_k = atom.smooth_penalty().nrows();
+            null_dims += (atom.border_frame_rank() * m_k.saturating_sub(rank_s)) as f64;
+        }
+        let pristine_blocks = self.target.clone();
+        self.term.crosscoder_pricing_spans = Some((0, vec![p]));
+        self.baseline_term.crosscoder_pricing_spans = Some((0, vec![p]));
+        self.crosscoder_blocks = Some(CrosscoderBlockPricing {
+            p_x: 0,
+            block_dims: vec![p],
+            pristine_blocks,
+            last_log_lambda: vec![0.0],
+            null_dims: vec![null_dims],
         });
         Ok(self)
     }
@@ -1563,64 +1635,28 @@ impl SaeManifoldOuterObjective {
         blocks
             .block_dims
             .iter()
+            .zip(&blocks.null_dims)
             .zip(rho.log_lambda_block.iter())
-            .map(|(&p_l, &log_lambda)| -(n * p_l as f64 / 2.0) * log_lambda)
+            .map(|((&p_l, &null_l), &log_lambda)| -((n * p_l as f64 - null_l) / 2.0) * log_lambda)
             .sum()
     }
 
-    /// #2231 Inc-B (stage 2) — the per-output-block SCALED residual sum of
-    /// squares `R̃_ℓ = ‖r̃_ℓ‖²` at the current fitted state, over each block's
-    /// stacked-column span `[p_x + Σ_{m<ℓ} p_m, …)`: the energy the block's
-    /// fixed-point step is scaled by.
+    /// #2231 Inc-B / #2822 — the explicit data channel of each block coordinate,
+    /// `D_ℓ = ∂(data)/∂log λ_ℓ` at the converged state, or `None` when no block
+    /// pricing is installed.
     ///
-    /// `r̃ = fitted − self.target` is the residual against the ALREADY block-scaled
-    /// target (every eval lane calls `apply_block_scaling` before the inner solve).
-    /// In UNSCALED form `R̃_ℓ = λ_ℓ·R_ℓ` where `R_ℓ = ‖r̃_ℓ‖²/λ_ℓ` is the block's
-    /// honest-units residual; the two coincide at `λ_ℓ = 1`. Returns `None` when
-    /// crosscoder pricing is off (plain SAE). The reconstruction is read from the
-    /// CONVERGED fitted state, so callers must invoke this only after the lane's
-    /// inner solve.
-    fn block_scaled_rss(&self, rho: &SaeManifoldRho) -> Result<Option<Vec<f64>>, String> {
+    /// `log λ_ℓ` moves the ALREADY block-scaled target `ỹ` (every eval lane calls
+    /// `apply_block_scaling` before the inner solve) along `½·P_ℓ ỹ` on block `ℓ`'s
+    /// columns while the fitted state `f` stays put, so the half-SSE data term moves
+    /// by `D_ℓ = ½·⟨ỹ − f, P_ℓ ỹ⟩_w` with the loss's row weights and whitening metric
+    /// ([`SaeManifoldTerm::data_fit_target_derivative`]). This is the envelope
+    /// derivative of the minimized penalized loss. It is not `½‖P_ℓ r̃‖²`, which
+    /// would drop `½⟨P_ℓ f, r̃⟩` — nonzero at a penalized optimum. Callers must
+    /// invoke this only after the lane's inner solve.
+    fn block_data_derivatives(&self) -> Result<Option<Vec<f64>>, String> {
         let Some(blocks) = self.crosscoder_blocks.as_ref() else {
             return Ok(None);
         };
-        let residual = self.term.reconstruction_residual(self.target.view(), rho)?;
-        let mut out = Vec::with_capacity(blocks.block_dims.len());
-        let mut off = blocks.p_x;
-        for &p_l in &blocks.block_dims {
-            let mut rss = 0.0_f64;
-            for row in residual.rows() {
-                for j in off..off + p_l {
-                    let r = row[j];
-                    rss += r * r;
-                }
-            }
-            out.push(rss);
-            off += p_l;
-        }
-        Ok(Some(out))
-    }
-
-    /// #2231 Inc-B (stage 2) — the fixed-state block-coordinate gradient channels that
-    /// are not a log-determinant trace, one entry per output block, or `None` for a
-    /// plain SAE: the data derivative plus the Jacobian `−n·p_ℓ/2`.
-    ///
-    /// Derivation (UNIT-dispersion `#F1`). `log λ_ℓ` moves the scaled target along
-    /// `D_ℓ = ½·Z̃_ℓ` on block `ℓ`'s columns and nowhere else, while the fitted state
-    /// `f` stays put, so the half-SSE data term moves by
-    /// `∂(½‖t − f‖²_w)/∂log λ_ℓ = Σ_i w_i⟨U_iᵀ(t_i − f_i), U_iᵀD_{ℓ,i}⟩ = −½⟨r̃_ℓ, Z̃_ℓ⟩_w`
-    /// with `r̃ = f − t` ([`SaeManifoldTerm::data_fit_target_derivative`]) — not `½‖r̃_ℓ‖²`,
-    /// which would scale the reconstruction along with the target. The Jacobian adds
-    /// `−n·p_ℓ/2` ([`Self::block_jacobian`]). The other two channels come from the
-    /// components assembler: `½tr(A⁺ ∂A/∂log λ_ℓ)` — the residual-curvature legs of
-    /// the exact Hessian are affine in the target — and the implicit `−½·Γᵀθ̂_ρ`
-    /// adjoint through [`SaeManifoldTerm::crosscoder_block_ift_rhs`]. The gradient
-    /// lane ADDS this to the assembler's tail (never overwrites; #2087).
-    fn block_log_lambda_gradient(&self) -> Result<Option<Vec<f64>>, String> {
-        let Some(blocks) = self.crosscoder_blocks.as_ref() else {
-            return Ok(None);
-        };
-        let n = self.target.nrows() as f64;
         let mut direction = Array2::<f64>::zeros(self.target.raw_dim());
         let mut out = Vec::with_capacity(blocks.block_dims.len());
         let mut off = blocks.p_x;
@@ -1630,13 +1666,46 @@ impl SaeManifoldOuterObjective {
                 .slice_mut(s![.., off..off + p_l])
                 .assign(&self.target.slice(s![.., off..off + p_l]));
             direction.mapv_inplace(|value| 0.5 * value);
-            let data = self
-                .term
-                .data_fit_target_derivative(self.target.view(), direction.view())?;
-            out.push(data - 0.5 * n * p_l as f64);
+            out.push(
+                self.term
+                    .data_fit_target_derivative(self.target.view(), direction.view())?,
+            );
             off += p_l;
         }
         Ok(Some(out))
+    }
+
+    /// #2231 Inc-B / #2822 — the EXPLICIT block-coordinate gradient channels
+    /// `D_ℓ − (n·p_ℓ − null_ℓ)/2`, one entry per block, or `None` when no block
+    /// pricing is installed. NOT the complete `∂C/∂log λ_ℓ` on its own.
+    ///
+    /// Scaling block `ℓ`'s target columns by `√λ_ℓ` enters the criterion in four
+    /// places: the penalized loss (its envelope derivative is the data channel
+    /// [`Self::block_data_derivatives`]), the change-of-variables Jacobian
+    /// ([`Self::block_jacobian`]), the `½tr(A⁺ ∂A/∂log λ_ℓ)` trace (the
+    /// residual-curvature legs of the exact Hessian are affine in the target), and
+    /// the implicit `−½·Γᵀθ̂_ρ` adjoint through
+    /// [`SaeManifoldTerm::crosscoder_block_ift_rhs`]. The last two come from the
+    /// components assembler; this function returns the first two, which the
+    /// gradient lane ADDS to the assembler's tail (never overwrites; #2087).
+    fn block_log_lambda_gradient(&self) -> Result<Option<Vec<f64>>, String> {
+        let Some(data) = self.block_data_derivatives()? else {
+            return Ok(None);
+        };
+        let blocks = self
+            .crosscoder_blocks
+            .as_ref()
+            .expect("block_data_derivatives returned Some ⇒ block pricing is installed");
+        let n = self.target.nrows() as f64;
+        Ok(Some(
+            blocks
+                .block_dims
+                .iter()
+                .zip(&blocks.null_dims)
+                .zip(data.iter())
+                .map(|((&p_l, &null_l), &d_l)| d_l - 0.5 * (n * p_l as f64 - null_l))
+                .collect(),
+        ))
     }
 
     /// #2138 — install a cooperative cancellation flag shared with the pyffi fit
@@ -1828,10 +1897,9 @@ impl SaeManifoldOuterObjective {
         } = self;
         let fitted_rho = current_rho;
         let mut fitted = term;
-        // #2933 F05 — the declared gates belong to this objective's hyperparameter
-        // solve. The minted fit re-derives them at its next assembly, as every term
-        // outside an objective does.
-        fitted.streaming_gates_frozen = false;
+        // #2933 F05 — the minted fit keeps the gates its certified value was priced
+        // under, so re-pricing it (the shape-uncertainty recompute) prices the same
+        // objective. A clone or an atom compaction drops them.
         if last_loss.is_none() {
             return Err(
                 "SaeManifoldOuterObjective::into_fitted: certified state has no converged inner loss"
@@ -1978,7 +2046,8 @@ impl SaeManifoldOuterObjective {
         let information = self
             .term
             .shape_information(&route, &rho, self.target.view(), &cache)?;
-        self.term.assemble_shape_uncertainty(&information, dispersion)
+        self.term
+            .assemble_shape_uncertainty(&information, dispersion)
     }
 
     /// Record the discrete fitted-data collapse verdict without changing the
@@ -2133,7 +2202,9 @@ impl SaeManifoldOuterObjective {
             self.record_warm_start(warm_start_outcome)?;
         }
         self.declare_collapse_prevention_gates_on_term();
-        let criterion = self.term.penalized_quasi_laplace_criterion_priced_with_lane(
+        let criterion = self
+            .term
+            .penalized_quasi_laplace_criterion_priced_with_lane(
             self.target.view(),
             &rho,
             self.registry.as_ref(),
@@ -2504,8 +2575,7 @@ impl SaeManifoldOuterObjective {
         rho_flat: ArrayView1<'_, f64>,
     ) -> Result<InstalledEnvelopeBasin, String> {
         if let Some((converged, priced)) = self.take_priced_probe_handoff(rho_flat) {
-            self.term = converged;
-            self.seeded_beta = None;
+            self.install_envelope_argmin(converged);
             return Ok(InstalledEnvelopeBasin::Installed { priced });
         }
 
@@ -2519,9 +2589,18 @@ impl SaeManifoldOuterObjective {
                 "SAE basin-envelope protocol violated: a finite probe at the requested rho did not install its exact-rho converged-state handoff"
                     .to_string()
             })?;
+        self.install_envelope_argmin(converged);
+        Ok(InstalledEnvelopeBasin::Installed { priced })
+    }
+
+    /// Install an envelope argmin's converged state. The envelope hands a basin
+    /// member's clone, and `Clone` drops the collapse-prevention gates, so the
+    /// installed state re-declares the objective's gates: its priced value and the
+    /// gradient that differentiates it read exactly those (#2933 F05).
+    fn install_envelope_argmin(&mut self, converged: SaeManifoldTerm) {
         self.term = converged;
         self.seeded_beta = None;
-        Ok(InstalledEnvelopeBasin::Installed { priced })
+        self.declare_collapse_prevention_gates_on_term();
     }
 
     /// Re-converge one saved basin `member` at `rho_flat` through the
@@ -2622,7 +2701,9 @@ impl SaeManifoldOuterObjective {
     pub(crate) fn efs_step(&mut self, rho_flat: ArrayView1<'_, f64>) -> Result<EfsEval, String> {
         let (evaluation, certificates) = self.efs_step_with_certificate(rho_flat)?;
         if evaluation.cost.is_infinite()
-            && let Some(reason) = certificates.iter().find_map(|certificate| match certificate {
+            && let Some(reason) = certificates
+                .iter()
+                .find_map(|certificate| match certificate {
                 FixedPointCoordinateCertificate::Uncovered { reason } => Some(reason.as_str()),
                 FixedPointCoordinateCertificate::Covered { .. } => None,
             })
@@ -2989,19 +3070,17 @@ impl SaeManifoldOuterObjective {
             }
         }
 
-        // Block weights: the crosscoder block-relevance step (#2231 Inc-B stage 2),
-        // `ln(1 − 2·g_ℓ/R̃_ℓ)` scaled by the block's residual energy `R̃_ℓ = λ_ℓ·R_ℓ`.
-        // `g_ℓ` is the complete gradient — the data derivative and Jacobian
-        // (`block_log_lambda_gradient`), the `½tr(A⁺∂A)` trace and the `−½·Γᵀθ̂_ρ`
-        // adjoint — so the step's zero is the criterion's. No-op for a plain SAE.
-        if let Some(scaled_rss) = self.block_scaled_rss(&rho)? {
-            let blocks = self
-                .crosscoder_blocks
-                .as_ref()
-                .expect("block_scaled_rss returned Some ⇒ crosscoder pricing is installed");
-            let tail = n_params - rho.kappa.len() - blocks.block_dims.len();
-            for (l, &r_tilde) in scaled_rss.iter().enumerate().take(blocks.block_dims.len()) {
-                record_precision_step(tail + l, r_tilde, format!("crosscoder block {l}"));
+        // Block coordinates (crosscoder relevance weights, or the global noise
+        // precision, #2822): the explicit channels are `D_ℓ − (n·p_ℓ − null_ℓ)/2`
+        // (`block_log_lambda_gradient`), so the step's energy is `2·D_ℓ`:
+        // `ln(1 − g_ℓ/D_ℓ)`, the fixed point `λ_ℓ ← λ_ℓ·(n·p_ℓ − null_ℓ)/(2·D_ℓ)` when
+        // `g` is the explicit part alone. The complete gradient adds the
+        // `−½·Γᵀθ̂_ρ` Laplace adjoint (`crosscoder_block_ift_rhs`); a proposal
+        // without it has a different zero. No-op for a plain SAE.
+        if let Some(data) = self.block_data_derivatives()? {
+            let tail = rho.block_flat_range().start;
+            for (l, &d_l) in data.iter().enumerate() {
+                record_precision_step(tail + l, 2.0 * d_l, format!("output block {l}"));
             }
         }
 
@@ -3325,7 +3404,9 @@ fn resolvability_domain_faces(
         for axis in 0..rho.log_ard[atom_idx].len() {
             let (smallest, largest) =
                 observed_ard_curvature_range(term, assignments, atom_idx, axis)?;
-            let values = gammas.entry(rho.ard_flat_index(atom_idx, axis)).or_default();
+            let values = gammas
+                .entry(rho.ard_flat_index(atom_idx, axis))
+                .or_default();
             if largest > 0.0 {
                 values.push(smallest);
                 values.push(largest);
@@ -3724,13 +3805,10 @@ impl OuterObjective for SaeManifoldOuterObjective {
             Some(evaluation) => Ok(evaluation),
             None => self.evaluate_outer_criterion_route(&rho_state, direct_logdet_admitted, false),
         };
-        let evaluation =
-            match criterion {
+        let evaluation = match criterion {
                 Ok(evaluated) => evaluated,
                 Err(SaeCriterionError::VanishedAtoms(atoms)) => {
-                    log::trace!(
-                        "SAE analytic evaluation reached fixed-K structural boundary: {atoms}"
-                    );
+                log::trace!("SAE analytic evaluation reached fixed-K structural boundary: {atoms}");
                     self.probe_telemetry.infeasible_criterion_evals += 1;
                     return Ok(OuterEval::infeasible(rho.len()));
                 }
@@ -4111,6 +4189,15 @@ impl OuterObjective for SaeManifoldOuterObjective {
         if let Some(log_strength_upper) = log_strength_upper {
             for index in 0..reactive_upper.len() {
                 reactive_upper[index] = reactive_upper[index].min(log_strength_upper[index]);
+            }
+            // #2822 — an output-scale coordinate (global dispersion, crosscoder block
+            // relevance) is not a prior strength: the reactive entry has no heavy-entry
+            // value for it and hands back its literal target, which is not a claim about
+            // the domain. Left there, the noise precision was boxed at its seed and every
+            // planted-circle fit railed on it. It keeps the objective-domain face.
+            let block_start = self.baseline_rho.block_flat_range().start;
+            for index in block_start..block_start + self.baseline_rho.log_lambda_block.len() {
+                reactive_upper[index] = log_strength_upper[index];
             }
         }
         // #2691 — the same chart-resolution face on the reactive exit. The
@@ -4742,58 +4829,6 @@ pub struct CurvatureWalkReport {
     pub reseeds: usize,
 }
 
-pub(crate) fn sae_cholesky_solve_neg_gradient(
-    h: ArrayView2<'_, f64>,
-    g: ArrayView1<'_, f64>,
-) -> Result<Array1<f64>, String> {
-    let n = h.nrows();
-    if h.ncols() != n || g.len() != n {
-        return Err(format!(
-            "sae_cholesky_solve_neg_gradient: shape mismatch H={:?}, g={}",
-            h.dim(),
-            g.len()
-        ));
-    }
-    let mut l = Array2::<f64>::zeros((n, n));
-    for i in 0..n {
-        for j in 0..=i {
-            let mut sum = h[[i, j]];
-            for k in 0..j {
-                sum -= l[[i, k]] * l[[j, k]];
-            }
-            if i == j {
-                if !(sum.is_finite() && sum > 0.0) {
-                    return Err(format!("non-positive Cholesky pivot at {i}: {sum}"));
-                }
-                l[[i, j]] = sum.sqrt();
-            } else {
-                l[[i, j]] = sum / l[[j, j]];
-            }
-        }
-    }
-    let mut y = Array1::<f64>::zeros(n);
-    for i in 0..n {
-        let mut sum = -g[i];
-        for k in 0..i {
-            sum -= l[[i, k]] * y[k];
-        }
-        y[i] = sum / l[[i, i]];
-    }
-    let mut x = Array1::<f64>::zeros(n);
-    for ii in 0..n {
-        let i = n - 1 - ii;
-        let mut sum = y[i];
-        for k in i + 1..n {
-            sum -= l[[k, i]] * x[k];
-        }
-        x[i] = sum / l[[i, i]];
-    }
-    if !x.iter().all(|v| v.is_finite()) {
-        return Err("sae_cholesky_solve_neg_gradient: non-finite solution".into());
-    }
-    Ok(x)
-}
-
 pub(crate) fn solve_basis_transport(
     new_phi: ArrayView2<'_, f64>,
     old_phi: ArrayView2<'_, f64>,
@@ -5135,7 +5170,9 @@ mod decoder_smoothness_dispatch_2393_tests {
 /// #2593 — the coverage the two independent substring ladders did not have.
 #[cfg(test)]
 mod probe_refusal_classification_2593_tests {
-    use super::{ArrowSchurError, OuterProbeTelemetry, ProbeRefusalKind, SaeManifoldOuterObjective};
+    use super::{
+        ArrowSchurError, OuterProbeTelemetry, ProbeRefusalKind, SaeManifoldOuterObjective,
+    };
 
     /// One representative rendered message per kind, taken from the producer
     /// that emits it.
@@ -5223,9 +5260,7 @@ mod probe_refusal_classification_2593_tests {
                       ArrowFactorCache::arrow_log_det returned None (undamped joint Hessian \
                       log-det unavailable for the Laplace normaliser)";
         assert_eq!(ProbeRefusalKind::classify(defect), None);
-        assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            defect
-        ));
+        assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(defect));
         let mut telemetry = OuterProbeTelemetry::default();
         telemetry.record_refusal_kind(defect);
         assert_eq!(telemetry.infeasible_total(), 0);
@@ -5289,9 +5324,7 @@ mod probe_refusal_classification_2593_tests {
     fn a_schur_failure_that_is_not_a_non_pd_pivot_stays_fatal() {
         let defect = "arrow-Schur: Schur complement Cholesky failed: non-finite entry";
         assert_eq!(ProbeRefusalKind::classify(defect), None);
-        assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(
-            defect
-        ));
+        assert!(!SaeManifoldOuterObjective::is_recoverable_value_probe_refusal(defect));
     }
 }
 
@@ -5308,6 +5341,67 @@ mod crosscoder_reset_baseline_2627_tests {
     /// block coordinate from the restored term.
     #[test]
     fn crosscoder_pricing_spans_survive_reset_2627() {
+        let (mut obj, block_dims, p_x) = stacked_line_objective(true);
+        let spans = Some((p_x, block_dims.clone()));
+        assert_eq!(obj.term.crosscoder_pricing_spans, spans);
+        obj.reset();
+        assert_eq!(
+            obj.term.crosscoder_pricing_spans, spans,
+            "reset must reinstall a term that still carries the crosscoder pricing spans"
+        );
+        let rho_flat = obj.baseline_rho.flat_coordinates();
+        let evaluation = obj
+            .eval_with_order(&rho_flat, OuterEvalOrder::ValueGradientHessian)
+            .expect("value+gradient eval at the reset seed prices the block coordinate");
+        assert_eq!(evaluation.gradient.len(), rho_flat.len());
+        assert!(
+            evaluation.gradient.iter().all(|value| value.is_finite()),
+            "every analytic outer gradient coordinate, the block one included, must be \
+             finite: {:?}",
+            evaluation.gradient
+        );
+    }
+
+    /// #2822 — the analytic gradient of an output-scale coordinate is the total derivative
+    /// of the criterion the value lane prices: the explicit data channel, the
+    /// change-of-variables Jacobian, `½tr(A⁻¹∂A/∂log λ)` through the target, and the IFT
+    /// response. Checked by a central difference of the re-solved criterion, for a
+    /// crosscoder relevance block and for the global dispersion.
+    #[test]
+    fn output_scale_gradient_matches_the_resolved_criterion_2822() {
+        for crosscoder in [true, false] {
+            let (mut obj, _, _) = stacked_line_objective(crosscoder);
+            let rho_flat = obj.baseline_rho.flat_coordinates();
+            let coord = obj.baseline_rho.block_flat_range().start;
+            let analytic = obj
+                .eval_with_order(&rho_flat, OuterEvalOrder::ValueAndGradient)
+                .expect("the seed's value and gradient")
+                .gradient[coord];
+            let h = 1.0e-4;
+            let mut cost_at = |shift: f64| -> f64 {
+                let mut shifted = rho_flat.clone();
+                shifted[coord] += shift;
+                obj.eval_with_order(&shifted, OuterEvalOrder::Value)
+                    .expect("the shifted criterion re-solves")
+                    .cost
+            };
+            let plus = cost_at(h);
+            let minus = cost_at(-h);
+            let fd = (plus - minus) / (2.0 * h);
+            let err = (analytic - fd).abs();
+            let tol = 1.0e-4 * (1.0 + fd.abs());
+            assert!(
+                err <= tol,
+                "#2822 (crosscoder={crosscoder}): the output-scale gradient must differentiate \
+                 the priced criterion; analytic={analytic:.9e} fd={fd:.9e} err={err:.3e} \
+                 tol={tol:.3e}"
+            );
+        }
+    }
+
+    /// The stacked planted line, priced either as a crosscoder (a 3-column anchor and one
+    /// 3-column relevance block) or with the global dispersion over all 6 columns.
+    fn stacked_line_objective(crosscoder: bool) -> (SaeManifoldOuterObjective, Vec<usize>, usize) {
         let n = 40usize;
         let p_x = 3usize;
         let block_dims = vec![3usize];
@@ -5352,27 +5446,17 @@ mod crosscoder_reset_baseline_2627_tests {
         term.refit_decoder_least_squares_at_current_state(target.view(), Some(&init_rho))
             .expect("the planted line spans a nonzero least-squares decoder");
         init_rho.log_lambda_block = vec![0.0; block_dims.len()];
-        let mut obj =
-            SaeManifoldOuterObjective::new(term, target, None, init_rho, 60, 0.5, 1e-4, 1e-4)
+        let obj = SaeManifoldOuterObjective::new(term, target, None, init_rho, 60, 0.5, 1e-4, 1e-4);
+        if crosscoder {
+            let obj = obj
                 .with_crosscoder_blocks(p_x, block_dims.clone())
                 .expect("crosscoder pricing installs on the stacked fixture");
-        let spans = Some((p_x, block_dims.clone()));
-        assert_eq!(obj.term.crosscoder_pricing_spans, spans);
-        obj.reset();
-        assert_eq!(
-            obj.term.crosscoder_pricing_spans, spans,
-            "reset must reinstall a term that still carries the crosscoder pricing spans"
-        );
-        let rho_flat = obj.baseline_rho.flat_coordinates();
-        let evaluation = obj
-            .eval_with_order(&rho_flat, OuterEvalOrder::ValueGradientHessian)
-            .expect("value+gradient eval at the reset seed prices the block coordinate");
-        assert_eq!(evaluation.gradient.len(), rho_flat.len());
-        assert!(
-            evaluation.gradient.iter().all(|value| value.is_finite()),
-            "every analytic outer gradient coordinate, the block one included, must be \
-             finite: {:?}",
-            evaluation.gradient
-        );
+            (obj, block_dims, p_x)
+        } else {
+            let obj = obj
+                .with_global_dispersion(0)
+                .expect("the global dispersion installs on the stacked fixture");
+            (obj, vec![p], 0)
+        }
     }
 }

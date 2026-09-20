@@ -5,6 +5,7 @@
 mod average_derivative_design;
 mod duchon_lazy_anisotropic_reparam_1818;
 mod duchon_single_design_build_1718;
+mod factor_by_level_null_ridge_replays_the_fit;
 mod knot_selection_is_scale_equivariant_2750;
 mod latent_collision_design_gradient;
 mod latent_coord_design_jacobian_frame_fd_2643;

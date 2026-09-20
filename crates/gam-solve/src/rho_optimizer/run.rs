@@ -8036,21 +8036,30 @@ pub(crate) fn run_outer_uncertified(
                 // not collapse that checkpoint back into success below;
                 // continue it with the analytic-gradient fallback that the
                 // capability ladder already declared.
+                //
+                // #2822 — the same holds for a walk that stopped without a claim: the
+                // unprogressing-walk guard and the iteration cap both hand back the best
+                // iterate the walk evaluated. The declared BFGS attempt runs either way,
+                // and it resumes from that checkpoint rather than restarting at the seed.
+                // Restarting discarded the walk: planted-circle SAE fits stopped their EFS
+                // walk at |Pg| ≈ 1e-3 on the guard (each step's decrease ~g²/h sits far
+                // under the 1/(2n) resolution), BFGS re-ran from the seed, and the
+                // terminal certificate refused the EFS checkpoint it could not beat.
                 let has_bfgs_fallback = attempts
                     .get(attempt_idx + 1)
                     .is_some_and(|next| matches!(plan(next).solver, Solver::Bfgs));
-                if result.solver_claimed_convergence()
-                    && matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
+                if matches!(the_plan.solver, Solver::Efs | Solver::HybridEfs)
                     && has_bfgs_fallback
                 {
                     log::debug!(
-                        "[OUTER] {context}: {:?} stopped at a fixed point, but no \
+                        "[OUTER] {context}: {:?} stopped (solver claim: {}), but no \
                          candidate passed analytic screening; continuing the best finite \
                          checkpoint with analytic-gradient BFGS",
                         the_plan.solver,
+                        result.solver_claimed_convergence(),
                     );
                     last_error = Some(EstimationError::RemlOptimizationFailed(format!(
-                        "{:?} fixed point was refuted by analytic screening",
+                        "{:?} checkpoint was refuted by analytic screening",
                         the_plan.solver,
                     )));
                     spent_iterations = spent_iterations.saturating_add(result.iterations);

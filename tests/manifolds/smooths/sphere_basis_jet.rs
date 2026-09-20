@@ -115,6 +115,7 @@ fn wahba_spec(kernel: SphereWahbaKernel, penalty_order: usize) -> SphericalSplin
         max_degree: None,
         wahba_kernel: kernel,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     }
 }
 
@@ -128,6 +129,7 @@ fn harmonic_spec(max_degree: usize, penalty_order: usize) -> SphericalSplineBasi
         max_degree: Some(max_degree),
         wahba_kernel: SphereWahbaKernel::Sobolev,
         identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+        adaptive_degree: false,
     }
 }
 

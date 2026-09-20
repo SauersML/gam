@@ -46,6 +46,7 @@ def test_predict_table_returns_ordered_float64_array_columns() -> None:
         "linear_predictor_plugin",
         "mean_plugin",
         "posterior_mean",
+        "linear_predictor_standard_error",
         "posterior_mean_standard_error",
         "posterior_mean_lower",
         "posterior_mean_upper",

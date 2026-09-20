@@ -162,6 +162,9 @@ pub(crate) use self::block_spec::custom_family_block_role;
 pub use self::block_spec::validate_blockspecs;
 pub use assembly::*;
 pub(crate) use blockwise_solve::*;
+// The one penalty evaluator on structural roots (#2954), public so every
+// consumer, and #2977's trust-region acceptance, reads the same function.
+pub use blockwise_solve::{BlockPenaltyRoots, PenaltyIncrement, PenaltyRootTerm, PenaltyValue};
 pub(crate) use branch_continuation::*;
 pub(crate) use covariance::*;
 // Covariance helpers that are part of the public flat-namespace API: one consumed

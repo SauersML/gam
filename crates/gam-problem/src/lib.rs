@@ -162,7 +162,10 @@ pub use identifiability_audit::{
     MapUniquenessError,
 };
 pub use indexed_response::{IndexedResponseError, SeparableCellMeasure};
-pub use joint_penalty::{JointPenaltyBundle, JointPenaltyError, JointPenaltySpec};
+pub use joint_penalty::{
+    JointPenaltyBundle, JointPenaltyError, JointPenaltySpec, PenaltyRootError,
+    structural_penalty_root,
+};
 pub use linear_constraints::LinearInequalityConstraints;
 pub use log_strength::{
     log_gradient_resolution,
