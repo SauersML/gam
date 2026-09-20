@@ -206,12 +206,8 @@ fn policy_from_timings(timings: &GridTimings) -> GpuDispatchPolicy {
     if let Some(flops) = crossover_flops(&measurements, "xtwx", policy.xtwx_flops_min) {
         policy.xtwx_flops_min = flops;
     }
-    if let Some(rows) = crossover_rows(&measurements, "xtwx", policy.xtwx_n_min) {
-        policy.xtwx_n_min = rows;
-    }
     if let Some(p) = crossover_rows(&measurements, "potrf", policy.potrf_min_p) {
         policy.potrf_min_p = p;
-        policy.prefer_gpu_factorization_min_p = p;
     }
     policy
 }
@@ -495,19 +491,15 @@ mod tests {
             policy.potrf_min_p,
             GpuDispatchPolicy::MIN_CALIBRATABLE_POTRF_P
         );
-        assert_eq!(policy.prefer_gpu_factorization_min_p, POTRF_DIMS[0]);
-        assert_eq!(policy.xtwx_n_min, XTWX_DIMS[0].0);
         assert_eq!(
             policy.xtwx_flops_min,
             2 * XTWX_DIMS[0].0 * XTWX_DIMS[0].1 * XTWX_DIMS[0].1
         );
         assert_eq!(
             GpuDispatchPolicy {
-                xtwx_n_min: seed.xtwx_n_min,
                 xtwx_flops_min: seed.xtwx_flops_min,
                 gemm_min_flops: seed.gemm_min_flops,
                 potrf_min_p: seed.potrf_min_p,
-                prefer_gpu_factorization_min_p: seed.prefer_gpu_factorization_min_p,
                 ..policy
             },
             seed

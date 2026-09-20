@@ -1,13 +1,21 @@
 ## Unreleased
 
+- **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
+  (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
+  point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
+  deleted, and so is `cholesky_logdet_from_col_major`. `GpuMixedPrecisionPolicy` is deleted,
+  since only its `Refinement` variant was ever reachable. `GpuDispatchPolicy` loses seven
+  fields that no dispatch decision read: `xtwx_n_min`, `xtwx_use_fused_below_p`,
+  `syevd_min_p`, `sparse_min_nnz`, `keep_design_resident_min_bytes`,
+  `prefer_gpu_factorization_min_p` and `mixed_precision`.
 - **GPU calibration cache stores timings, not a policy** (#4082). The cache under
   `$TMPDIR/gam/gpu/policy/v1/` held a whole `GpuDispatchPolicy`, so a file written by an
   older build pinned that build's defaults for every never-calibrated field and could
   carry calibrated floors below the current measurement grid. It now holds the CPU/GPU
   timings at each grid point, and every load rebuilds the policy from them and the
   current defaults, exactly as a fresh calibration does. Old cache files are ignored
-  (schema version 2), and `GpuDispatchPolicy` / `GpuMixedPrecisionPolicy` no longer
-  implement `Serialize`/`Deserialize`.
+  (schema version 2), and `GpuDispatchPolicy` no longer implements
+  `Serialize`/`Deserialize`.
 
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
