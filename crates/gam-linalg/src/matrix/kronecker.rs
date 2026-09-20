@@ -430,10 +430,10 @@ impl DenseDesignOperator for TensorProductDesignOperator {
             let chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let chunk_m = fast_ab(&chunk, middle);
             for local in 0..(end - start) {
-                out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
+                out[start + local] = chunk.row(local).dot(&chunk_m.row(local));
             }
         }
-        Ok(out)
+        certified_quadratic_form_diag("TensorProductDesignOperator", out)
     }
 
     fn row_chunk_into(
@@ -719,10 +719,10 @@ impl DenseDesignOperator for RowwiseKroneckerOperator {
             let chunk = self.try_row_chunk(start..end).map_err(|e| e.to_string())?;
             let chunk_m = fast_ab(&chunk, middle);
             for local in 0..(end - start) {
-                out[start + local] = chunk.row(local).dot(&chunk_m.row(local)).max(0.0);
+                out[start + local] = chunk.row(local).dot(&chunk_m.row(local));
             }
         }
-        Ok(out)
+        certified_quadratic_form_diag("RowwiseKroneckerOperator", out)
     }
 
     fn row_chunk_into(

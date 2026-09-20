@@ -193,7 +193,8 @@ impl SaeManifoldTerm {
                 gradient[total_t + index] = value;
             }
             drop(system);
-            let base_objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
+            let base = self.penalized_objective_banded(target, rho, registry, 1.0)?;
+            let base_objective = base.value;
             if !base_objective.is_finite() {
                 break;
             }
@@ -210,7 +211,7 @@ impl SaeManifoldTerm {
                 registry,
                 direction.view(),
                 total_t,
-                base_objective,
+                base,
                 slope,
                 -*curvature,
                 material_floor,

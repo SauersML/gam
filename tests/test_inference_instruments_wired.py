@@ -505,6 +505,20 @@ def test_kl_optimal_probe_design_reaches_python():
     )
     assert blind is None
 
+    # A malformed level is a ValueError, not the None that means "steering
+    # cannot distinguish the hypotheses".
+    with pytest.raises(ValueError):
+        gamfit.sae.plan_probe_for_contested_claim(
+            delta, predicted_null, predicted_alt, fisher, 1.5
+        )
+    with pytest.raises(ValueError):
+        gamfit.sae.plan_probe_for_contested_claim(
+            delta, predicted_null, predicted_alt, fisher, 0.05, current_log_e=math.nan
+        )
+    with pytest.raises(ValueError):
+        gamfit.sae.expected_resolution_budget(0.0, 1.01)
+    assert gamfit.sae.expected_resolution_budget(0.05, 0.0) is None
+
 
 def test_lawley_bartlett_factor_exponential_fixture():
     # Exponential (Gamma-log, phi=1), intercept-only: ε_0 = 0 so the factor is
