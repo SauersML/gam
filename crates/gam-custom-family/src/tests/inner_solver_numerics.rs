@@ -2427,6 +2427,59 @@ pub(crate) fn per_block_penalized_shift_stays_data_scaled_under_oversmoothed_pen
     );
 }
 
+/// gam#3660. The stabilizing shift is the minimal PD shift `δ* = −λ_min` to the
+/// Cholesky certificate's own resolution `floor`, not to a fixed fraction of the
+/// Gershgorin bracket. The fixture is barely indefinite (`λ_min = −1e-6`) with
+/// dense O(1) coupling: `A = Q·diag(1, 1, −1e-6)·Qᵀ` with the Householder
+/// reflector `Q = I − (2/3)·11ᵀ`. Its Gershgorin bound is `−0.111`, so a fixed 12
+/// halvings of that bracket return about `2.7e-5`, 27 times `δ*`.
+#[test]
+pub(crate) fn stabilizing_shift_resolves_barely_indefinite_hessian_to_the_pivot_floor_3660() {
+    let lambda_min = -1.0e-6_f64;
+    let q = Array2::<f64>::eye(3) - Array2::<f64>::from_elem((3, 3), 2.0 / 3.0);
+    let d = Array2::from_diag(&array![1.0_f64, 1.0, lambda_min]);
+    let a = q.dot(&d).dot(&q.t());
+    let gershgorin_min = (0..3)
+        .map(|i| {
+            let radius: f64 = (0..3).filter(|&j| j != i).map(|j| a[[i, j]].abs()).sum();
+            a[[i, i]] - radius
+        })
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        gershgorin_min < -0.1,
+        "the fixture's Gershgorin bracket must be O(1) loose; got {gershgorin_min:.3e}"
+    );
+    let ridge_floor = 1.0e-12_f64;
+    let max_diagonal = (0..3).fold(0.0_f64, |m, i| m.max(a[[i, i]].abs()));
+    let floor = ridge_floor.max(gam_linalg::roundoff::accumulation_growth(4) * max_diagonal);
+
+    let shift = exact_newton_stabilizing_shift_psd_penalized(&a, &a, ridge_floor)
+        .expect("an indefinite Hessian must get a stabilizing shift");
+
+    let delta_star = -lambda_min;
+    // The eigenvalues of the assembled `a` differ from `diag` by rounding of
+    // order `ε·‖a‖`, far below `floor`.
+    let rounding = 16.0 * f64::EPSILON;
+    assert!(
+        shift >= delta_star + floor - 2.0 * floor - rounding,
+        "the shift must lift λ_min = {lambda_min:.1e}; got {shift:.6e}"
+    );
+    assert!(
+        shift <= delta_star + 3.0 * floor + rounding,
+        "the shift must be the minimal PD shift {delta_star:.1e} to within 3·floor = {:.1e}; got {shift:.6e} ({:.1}×δ*)",
+        3.0 * floor,
+        shift / delta_star
+    );
+    let mut shifted = a.clone();
+    for i in 0..3 {
+        shifted[[i, i]] += shift;
+    }
+    assert!(
+        shifted.cholesky(Side::Lower).is_ok(),
+        "the shifted Hessian must be Cholesky-factorable"
+    );
+}
+
 #[test]
 pub(crate) fn joint_solver_ridge_stabilizes_dense_indefinite_coupled_hessian() {
     let family = TwoBlockJointConstrainedFamily { coupling: 2.0 };
@@ -7384,10 +7437,9 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
     );
 }
 
-/// gam#1854 / gam#1395: the multinomial Firth/Jeffreys separation fallback assembles
-/// the outer joint Hessian `H_unpen + S_λ + scale·H_Φ` and, for small systems
-/// (`total <= JOINT_LOGDET_GUARD_MAX_DIM`), realizes its `0.5·log|H|` Laplace term
-/// through `BlockCoupledOperator::from_joint_hessian_with_mode` →
+/// gam#1854: the multinomial Firth/Jeffreys separation fallback assembles the outer
+/// joint Hessian `H_unpen + S_λ + scale·H_Φ` and realizes its `0.5·log|H|` Laplace
+/// term through `BlockCoupledOperator::from_joint_hessian_with_mode` →
 /// `DenseSpectralOperator::from_symmetric_with_mode` → `eigh(Side::Lower)`. That
 /// eigensolver reads ONLY the lower triangle and ASSUMES the input is symmetric.
 ///
@@ -7395,20 +7447,14 @@ fn the_domain_edges_are_where_the_term_is_unpenalized_or_switched_off_2812() {
 /// second-order completion) carries an `O(1e10)` curvature scale, so reduction-order
 /// floating-point noise desyncs the assembled matrix's mirror entries by an amount
 /// that is *large in absolute terms*. Reading the raw lower triangle then yields a
-/// materially different spectrum — and logdet — than the symmetrized matrix. The
-/// gam#1395 ground-truth guard in `joint_outer_evaluate` reconstructs the SAME matrix
-/// but symmetrizes it first, so an unsymmetrized assembly makes the assembled-vs-
-/// reference logdet diverge and the guard `assert!` fires (caught by the fallback's
-/// `catch_unwind` and degraded to the clean separation error — the #1854 symptom).
+/// materially different spectrum — and logdet — than the symmetrized matrix, which
+/// is why `joint_outer_evaluate` symmetrizes the assembled joint Hessian in place
+/// before constructing the `BlockCoupledOperator`.
 ///
-/// The fix symmetrizes the assembled joint Hessian in place before constructing the
-/// `BlockCoupledOperator`, mirroring the guard's ground truth and the matrix-free
-/// dense-assemble path. This test pins that invariant at the operator boundary that
-/// the guard compares across: on a symmetric input the `BlockCoupledOperator` and the
-/// guard's `DenseSpectralOperator` realize the identical logdet (the guard's apples-to-
-/// apples assumption), while the RAW asymmetric matrix — the pre-symmetrization state —
-/// diverges by FAR more than the guard tolerance. That divergence is exactly why the
-/// symmetrization is load-bearing; removing it re-opens the #1854 guard trip.
+/// This test pins both halves at the operator boundary: on the symmetrized input the
+/// `BlockCoupledOperator` route IS the dense spectral operator (bit-identical logdet),
+/// while the raw asymmetric matrix shifts the logdet by the closed-form `ln 4` of the
+/// fixture below.
 #[test]
 fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     let mode = PseudoLogdetMode::Smooth;
@@ -7423,7 +7469,6 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
     raw[[0, 1]] = 0.0; // upper mirror entry
     raw[[1, 0]] = 2.0e5; // lower mirror entry — desynced from the upper one
 
-    // Guard ground truth: symmetrize first, then the dense spectral operator.
     let mut symmetric = raw.clone();
     symmetrize_dense_in_place(&mut symmetric);
     let reference = DenseSpectralOperator::from_symmetric_with_mode(&symmetric, mode)
@@ -7434,38 +7479,30 @@ fn multinomial_firth_joint_hessian_logdet_needs_symmetrization_1854() {
         "reference logdet must be finite: {reference_logdet}"
     );
 
-    // Post-fix assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
+    // Assembly route: `BlockCoupledOperator` on the SAME symmetrized matrix.
     let assembled = BlockCoupledOperator::from_joint_hessian_with_mode(&symmetric, mode)
         .expect("assembled BlockCoupledOperator on the symmetrized joint Hessian");
-    let assembled_logdet = assembled.logdet();
-
-    // Guard tolerance, verbatim from `joint_outer_evaluate`'s gam#1395 check.
-    let total = 3usize;
-    let tol = 1e-7 * (total as f64) * (1.0 + reference_logdet.abs());
-
-    // Apples-to-apples: on a symmetric input the two operator routes realize the
-    // identical logdet, so the guard passes. This is the property the symmetrization
-    // restores.
-    assert!(
-        (assembled_logdet - reference_logdet).abs() <= tol,
-        "symmetrized assembly must match the gam#1395 reference logdet within guard \
-         tolerance: assembled={assembled_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+    assert_eq!(
+        assembled.logdet().to_bits(),
+        reference_logdet.to_bits(),
+        "on a symmetric input the assembly route must realize the dense spectral \
+         operator's logdet exactly: assembled={:.9e} reference={reference_logdet:.9e}",
+        assembled.logdet()
     );
 
-    // Load-bearing check: feeding the RAW asymmetric matrix (the pre-symmetrization
-    // state) to the same operator route makes `eigh(Side::Lower)` read the desynced
-    // lower triangle, diverging from the guard's reference by FAR more than the guard
-    // tolerance — i.e. skipping the symmetrization trips the gam#1395 guard exactly as
-    // reported in #1854.
+    // Load-bearing check: the symmetrized off-diagonal pair is 1e5, so the leading
+    // 2×2 determinant is `5e10 − 1e10`; the lower triangle alone reads 2e5 and gives
+    // `5e10 − 4e10`. Skipping the symmetrization therefore moves the logdet by
+    // `ln 4`, an O(1) shift that factorization roundoff cannot produce.
     let unsymmetrized = BlockCoupledOperator::from_joint_hessian_with_mode(&raw, mode)
         .expect("BlockCoupledOperator on the raw asymmetric joint Hessian");
     let unsymmetrized_logdet = unsymmetrized.logdet();
+    let shift = reference_logdet - unsymmetrized_logdet;
     assert!(
-        (unsymmetrized_logdet - reference_logdet).abs() > 1.0e3 * tol,
-        "raw asymmetric assembly must diverge from the reference (symmetrization is \
+        shift > 0.5 * 4.0_f64.ln(),
+        "raw asymmetric assembly must shift the logdet by ln 4 (symmetrization is \
          load-bearing): raw={unsymmetrized_logdet:.9e} reference={reference_logdet:.9e} \
-         tol={tol:.3e}"
+         shift={shift:.3e}"
     );
 }
 

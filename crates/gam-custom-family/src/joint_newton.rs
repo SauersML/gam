@@ -5682,40 +5682,120 @@ mod kkt_refusal_spectrum_format_tests {
     }
 }
 
-pub(crate) const JOINT_PCG_REL_TOL: f64 = 1e-8;
-
 pub(crate) const PCG_ETA_MAX: f64 = 1.0e-1;
-
-pub(crate) const PCG_ETA_MIN: f64 = 1.0e-8;
 
 pub(crate) const PCG_GAMMA: f64 = 0.9;
 
 pub(crate) const PCG_ALPHA: f64 = 1.618_033_988_749_895;
 
+/// The smallest relative residual worth asking of the inner joint-Newton CG
+/// solve `(H + S)δ = rhs`, with `rhs = ∇L − Sβ` (gam#3285).
+///
+/// `rounding_band` is the `∞`-norm rounding band of `rhs` itself (the
+/// `joint_stationarity_rounding_band` the KKT certificate reads): the
+/// right-hand side is only known to that band, so a linear residual below it
+/// buys no accuracy in the step. CG stops at `‖r‖₂ ≤ η‖rhs‖₂`. When the floor
+/// `η = band/‖rhs‖₂` binds, the stop gives `‖r‖∞ ≤ ‖r‖₂ ≤ band`: the residual
+/// the floor accepts is inside the band in the norm the certificate measures,
+/// so the floor is conservative and never accepts a residual the band would
+/// resolve. It is capped at `PCG_ETA_MAX`, the loosest forcing
+/// Eisenstat–Walker admits, so an iterate already stationary to within its
+/// band (`‖rhs‖₂ ≤ band`) still gets a contracting step `η < 1`. Below both
+/// sits `γ_rows`, the relative residual the recurrence can resolve on `rows`
+/// unknowns at all (the band `pcg_core` raises every target to).
+///
+/// This replaces the literal `1e-8` floor the forcing used to clamp to: near
+/// the mode Eisenstat–Walker drives `η` toward zero, and the literal floor
+/// then asked CG for digits the right-hand side does not have.
+pub(crate) fn joint_pcg_forcing_floor(rounding_band: f64, rhs_norm_2: f64, rows: usize) -> f64 {
+    let arithmetic = gam_linalg::roundoff::accumulation_growth(rows.max(1));
+    let band_ratio = rounding_band / rhs_norm_2;
+    // `rhs = 0` gives `band/0 = ∞`, capped to `PCG_ETA_MAX` (CG returns the
+    // zero step at once). A NaN ratio carries no resolution information, so
+    // only the arithmetic floor remains.
+    let resolution = if band_ratio.is_nan() {
+        0.0
+    } else {
+        band_ratio.min(PCG_ETA_MAX)
+    };
+    resolution.max(arithmetic)
+}
+
 /// Eisenstat–Walker adaptive forcing term for the inner PCG tolerance:
 /// when the previous outer KKT residual is known, scale the next inner
-/// solve's relative tolerance by `γ·(‖r_cur‖/‖r_prev‖)^α`, clamped to
-/// `[PCG_ETA_MIN, PCG_ETA_MAX]`. On the first cycle (no previous
+/// solve's relative tolerance by `γ·(‖r_cur‖/‖r_prev‖)^α`, capped at
+/// `PCG_ETA_MAX` and floored at `resolution_floor`
+/// ([`joint_pcg_forcing_floor`]). On the first cycle (no previous
 /// residual) we use the loose `PCG_ETA_MAX` to avoid over-solving when
-/// the iterate is far from the optimum.
+/// the iterate is far from the optimum. A residual pair that gives no finite
+/// ratio carries no forcing information, so the step is solved to the
+/// resolution floor: as tight as the right-hand side can be resolved.
 pub(crate) fn joint_pcg_eisenstat_walker_forcing(
     prev_kkt_norm: Option<f64>,
     current_kkt_norm: f64,
+    resolution_floor: f64,
 ) -> f64 {
-    if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
-        return JOINT_PCG_REL_TOL;
-    }
-    let Some(prev_kkt_norm) = prev_kkt_norm else {
-        return PCG_ETA_MAX;
+    let eisenstat_walker = if !current_kkt_norm.is_finite() || current_kkt_norm < 0.0 {
+        resolution_floor
+    } else {
+        match prev_kkt_norm {
+            None => PCG_ETA_MAX,
+            Some(prev_kkt_norm) => {
+                let ratio = current_kkt_norm / prev_kkt_norm;
+                if !prev_kkt_norm.is_finite() || prev_kkt_norm <= 0.0 || !ratio.is_finite() {
+                    resolution_floor
+                } else {
+                    (PCG_GAMMA * ratio.powf(PCG_ALPHA)).min(PCG_ETA_MAX)
+                }
+            }
+        }
     };
-    if !prev_kkt_norm.is_finite() || prev_kkt_norm <= 0.0 {
-        return JOINT_PCG_REL_TOL;
+    eisenstat_walker.max(resolution_floor)
+}
+
+#[cfg(test)]
+mod joint_pcg_forcing_tests {
+    use super::{
+        PCG_ALPHA, PCG_ETA_MAX, PCG_GAMMA, joint_pcg_eisenstat_walker_forcing,
+        joint_pcg_forcing_floor,
+    };
+
+    #[test]
+    fn forcing_floor_is_the_rhs_resolution_capped_below_one_3285() {
+        let rows = 50;
+        let arithmetic = gam_linalg::roundoff::accumulation_growth(rows);
+        // Between the arithmetic's resolution and the cap, the band binds.
+        let floor = joint_pcg_forcing_floor(1.0e-9, 1.0e-3, rows);
+        assert!((floor - 1.0e-6).abs() <= 1.0e-18, "floor {floor:e}");
+        // An iterate already stationary within its band keeps a contracting
+        // forcing `η < 1`, and a zero right-hand side does too.
+        assert_eq!(joint_pcg_forcing_floor(1.0, 1.0e-3, rows), PCG_ETA_MAX);
+        assert_eq!(joint_pcg_forcing_floor(1.0, 0.0, rows), PCG_ETA_MAX);
+        // Below the arithmetic's resolution only `γ_rows` remains.
+        assert_eq!(joint_pcg_forcing_floor(0.0, 1.0, rows), arithmetic);
+        assert_eq!(joint_pcg_forcing_floor(f64::NAN, 1.0, rows), arithmetic);
     }
-    let ratio = current_kkt_norm / prev_kkt_norm;
-    if !ratio.is_finite() || ratio < 0.0 {
-        return JOINT_PCG_REL_TOL;
+
+    #[test]
+    fn eisenstat_walker_forcing_never_asks_below_the_resolution_floor_3285() {
+        let floor = 1.0e-6;
+        // Near the mode Eisenstat–Walker asks for about `1e-11`, digits the
+        // right-hand side does not have; the floor holds the forcing there.
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(Some(1.0), 1.0e-7, floor), floor);
+        // Far from the mode the forcing is looser than the floor and unchanged.
+        let ratio = 0.1_f64;
+        assert_eq!(
+            joint_pcg_eisenstat_walker_forcing(Some(1.0), ratio, floor),
+            PCG_GAMMA * ratio.powf(PCG_ALPHA)
+        );
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(Some(1.0), 10.0, floor), PCG_ETA_MAX);
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(None, 1.0, floor), PCG_ETA_MAX);
+        // A residual pair with no finite ratio solves to the resolution floor.
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(Some(0.0), 1.0, floor), floor);
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(Some(f64::INFINITY), 1.0, floor), floor);
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(Some(1.0), f64::NAN, floor), floor);
+        assert_eq!(joint_pcg_eisenstat_walker_forcing(None, f64::NAN, floor), floor);
     }
-    (PCG_GAMMA * ratio.powf(PCG_ALPHA)).clamp(PCG_ETA_MIN, PCG_ETA_MAX)
 }
 
 /// The penalized Hessian spectrum a dense joint-Newton step measured, kept to

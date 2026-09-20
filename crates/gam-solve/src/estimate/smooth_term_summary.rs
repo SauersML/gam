@@ -47,8 +47,10 @@ use crate::estimate::summary::{
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_terms::basis::{BasisMetadata, PenaltySource};
 use gam_terms::inference::random_effect_test::RandomEffectTestOutcome;
-use gam_terms::inference::smooth_score_test::{SmoothScoreTestInput, smooth_score_test};
-use gam_terms::inference::smooth_test::{SmoothTestResult, SmoothTestScale};
+use gam_terms::inference::smooth_score_test::{
+    ScoreTestScale, SmoothScoreTestInput, smooth_score_test,
+};
+use gam_terms::inference::smooth_test::SmoothTestResult;
 use gam_terms::smooth::{
     BOUNDED_SHRINKAGE_PENALTY_SOURCE, ShapeSpec, SmoothTerm, TermCollectionDesign,
 };
@@ -93,23 +95,13 @@ pub fn smooth_term_summary_rows(
     fit: &UnifiedFitResult,
     offset: SummaryBlockOffset,
 ) -> Vec<SmoothTermSummary> {
-    // Both reference-distribution inputs are fit-owned so they cannot drift
-    // between presentation surfaces. The denominator is `n − edf` on the real
-    // training row count; a representative/replayed design is basis geometry,
-    // never a sample-size source.
-    let residual_df = fit.wald_residual_degrees_of_freedom();
-    let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
-        SmoothTestScale::Estimated
-    } else {
-        SmoothTestScale::Known
-    };
     // The score test's inputs are fit-level and shared by every smooth: `H =
     // X'WX + S(λ)` and `X'WX` from the one inference block, stored in the
     // coefficient gauge's active frame and pushed forward to the saved frame
     // of `beta` and the terms' coefficient ranges, so they belong to the same
     // fit and the same layout (gam#3346). A Gram rebuilt without the fitted
     // weights is not a substitute.
-    let score_fit = ScoreTestFit::of(fit, residual_df, scale);
+    let score_fit = ScoreTestFit::of(fit);
 
     let shift = |range: &std::ops::Range<usize>| {
         (offset.coefficients + range.start)..(offset.coefficients + range.end)
@@ -270,17 +262,11 @@ struct ScoreTestFit<'a> {
     beta: std::borrow::Cow<'a, ndarray::Array1<f64>>,
     penalized_hessian: std::borrow::Cow<'a, Array2<f64>>,
     weighted_gram: std::borrow::Cow<'a, Array2<f64>>,
-    covariance_scale: f64,
-    residual_df: Option<f64>,
-    scale: SmoothTestScale,
+    scale: ScoreTestScale,
 }
 
 impl<'a> ScoreTestFit<'a> {
-    fn of(
-        fit: &'a UnifiedFitResult,
-        residual_df: Option<f64>,
-        scale: SmoothTestScale,
-    ) -> Result<Self, SmoothPValueUnavailable> {
+    fn of(fit: &'a UnifiedFitResult) -> Result<Self, SmoothPValueUnavailable> {
         // Both curvatures are read in the saved frame, the frame of `beta` and
         // of every term's coefficient range; a fit whose gauge leaves them no
         // unique saved-frame form has no score test (gam#3346).
@@ -300,17 +286,22 @@ impl<'a> ScoreTestFit<'a> {
         let beta = fit
             .beta_from_gauge_shift()
             .map_err(|_| SmoothPValueUnavailable::FitCurvatureUnavailable)?;
-        let covariance_scale = fit
-            .coefficient_covariance_scale()
-            .map_err(|_| SmoothPValueUnavailable::DispersionUnavailable)?;
-        Ok(Self {
-            beta,
-            penalized_hessian,
-            weighted_gram,
-            covariance_scale,
-            residual_df,
-            scale,
-        })
+        // A known scale is the fit's; an estimated one is re-estimated from the
+        // full model's unpenalized residual, which the fit's working residual
+        // carries (gam#3832). Both are fit-owned, so no presentation surface
+        // chooses them.
+        let scale = if fit.likelihood_scale.wald_scale_is_estimated() {
+            ScoreTestScale::Estimated {
+                residual: fit.inference.as_ref().and_then(|inference| inference.working_residual),
+            }
+        } else {
+            ScoreTestScale::Known {
+                covariance_scale: fit
+                    .coefficient_covariance_scale()
+                    .map_err(|_| SmoothPValueUnavailable::DispersionUnavailable)?,
+            }
+        };
+        Ok(Self { beta, penalized_hessian, weighted_gram, scale })
     }
 
     /// The score test of one smooth term against its active structural
@@ -351,8 +342,6 @@ impl<'a> ScoreTestFit<'a> {
             weighted_gram: &self.weighted_gram,
             coeff_range,
             structural_penalties: &structural_penalties,
-            covariance_scale: self.covariance_scale,
-            residual_df: self.residual_df,
             scale: self.scale,
         })
         .map_err(SmoothPValueUnavailable::from)
