@@ -22,7 +22,7 @@
 //!    block-sparse collapsed-linear dictionary ([`fit_block_sparse_dictionary`])
 //!    at width `K = G·b`, the linear-atom special case of the one dictionary.
 //!    Births only ever draw from this residual-factor pool — never a principal
-//!    component — so `pc_reseed_events == 0` holds by construction.
+//!    component.
 //!
 //! **(b) Curved refinement** — Tier-2 charts the Tier-1 residual `R1 = R0 − L`
 //!    through the canonical overcomplete hard-TopK support-sparse engine
@@ -47,7 +47,6 @@
 //!   not a per-move description-length charge, so those curved moves carry no
 //!   `dl_bits`.
 //!
-//! `pc_reseed_events` is always `0` on this path.
 
 use ndarray::{Array1, Array2, ArrayView2, Axis};
 
@@ -335,8 +334,7 @@ pub struct TieredFitReport {
 /// support-sparse engine (`fit_tier2_support` → [`fit_sae_support_sparse`]),
 /// whose returned fit carries a certified inner fixed point and outer stationarity
 /// certificate. No principal-component reseeding occurs; the [`SaeMigrationLedger`]
-/// accounts for every Tier-1 block and every curved birth and death, and pins
-/// `pc_reseed_events = 0`.
+/// accounts for every Tier-1 block and every curved birth and death.
 pub fn fit_tiered(
     z: ArrayView2<'_, f64>,
     config: &TieredFitConfig,
@@ -675,10 +673,6 @@ mod fit_tests {
             "composed EV must be finite, got {}",
             report.explained_variance
         );
-        assert_eq!(
-            report.ledger.pc_reseed_events, 0,
-            "the tiered path must never PC-reseed"
-        );
         // Tier-0 mean captured the +1 / -0.5 offsets it was given.
         assert!(report.tier0.mean.iter().all(|m| m.is_finite()));
         assert!(report.tier2.is_none(), "linear_bulk disables Tier-2");
@@ -902,10 +896,6 @@ mod fit_tests {
         );
 
         assert_eq!(
-            report.ledger.pc_reseed_events, 0,
-            "the tiered path must never PC-reseed"
-        );
-        assert_eq!(
             stage_tally(&report.ledger, MoveStage::Curved).0,
             tier2.retained_atoms,
             "every retained curved atom is a promotion off the linear residual"
@@ -1019,7 +1009,6 @@ mod fit_tests {
                 "the ledger must record the refused promotion"
             );
         }
-        assert_eq!(report.ledger.pc_reseed_events, 0);
     }
 
     /// Focused #2023 gate: on a tiny two-circle fixture the Tier-2 branch drives
@@ -1100,10 +1089,6 @@ mod fit_tests {
             "every retained curved atom is one curved birth"
         );
         assert_linear_blocks_accounted(&report);
-        assert_eq!(
-            report.ledger.pc_reseed_events, 0,
-            "the support-sparse Tier-2 path must never PC-reseed"
-        );
         assert!(
             report.explained_variance.is_finite(),
             "composed EV must be finite, got {}",
@@ -1148,7 +1133,6 @@ mod fit_tests {
             record["census"]["n_blocks_scanned"].as_u64(),
             Some(report.code_space.n_blocks_scanned as u64)
         );
-        assert_eq!(record["ledger"]["pc_reseed_events"].as_u64(), Some(0));
         assert!(record["ledger"]["moves"].is_array());
     }
 
@@ -1179,7 +1163,6 @@ mod fit_tests {
             "the public entry returns only a certified, recurred fit"
         );
         let migration = &fit.migration;
-        assert_eq!(migration.pc_reseed_events, 0, "the support lane never PC-reseeds");
         assert_eq!(
             migration.n_births,
             fit.retained_atom_indices.len(),

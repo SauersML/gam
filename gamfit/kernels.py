@@ -101,7 +101,6 @@ def sinkhorn_barycenter(
     weights: Optional[np.ndarray] = None,
     cost: Optional[np.ndarray] = None,
     eps: float = 0.01,
-    n_iter: int = 20,
 ) -> np.ndarray:
     r"""Log-domain entropic Sinkhorn Wasserstein barycenter.
 
@@ -124,8 +123,6 @@ def sinkhorn_barycenter(
         Entropic regularization strength. Must be positive, with
         ``max(cost) / eps`` below ``1 / u`` (``u`` the unit roundoff): past
         that the largest Gibbs exponent rounds by a nat.
-    n_iter : int, default 20
-        Number of outer Sinkhorn iterations.
 
     Returns
     -------
@@ -139,12 +136,15 @@ def sinkhorn_barycenter(
     kernel does not produce NaN for any accepted ``eps`` even with input
     rows that have zero mass on some support points.
 
+    There is no iteration count: the projections run until their fixed
+    point is certified to working precision, measured against the rounding
+    each sweep commits. A solve whose arithmetic stops making progress
+    before that raises instead of returning an unconverged barycenter.
+
     Differentiability is provided by the companion VJP
     :func:`sinkhorn_barycenter_vjp` (used by the torch / JAX adapters
-    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``). The VJP
-    differentiates the same finite-iteration map computed here, so it
-    remains correct even when ``n_iter`` has not reached the fixed
-    point.
+    in ``gamfit.kernels_torch`` / ``gamfit.kernels_jax``), the
+    implicit-function-theorem adjoint of that fixed point.
 
     References
     ----------
@@ -163,7 +163,7 @@ def sinkhorn_barycenter(
     else:
         cost_arr = _as_f64_2d("cost", cost)
     return rust_module().sinkhorn_barycenter_forward(
-        atoms_arr, weights_arr, cost_arr, float(eps), int(n_iter)
+        atoms_arr, weights_arr, cost_arr, float(eps)
     )
 
 
@@ -172,14 +172,13 @@ def sinkhorn_barycenter_vjp(
     weights: Optional[np.ndarray],
     cost: np.ndarray,
     eps: float,
-    n_iter: int,
     cotangent: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Vector-Jacobian product for :func:`sinkhorn_barycenter`.
 
     Returns ``(d_atoms, d_weights)`` of shapes ``(K, M)`` and ``(K,)``
-    respectively, for the same finite ``n_iter`` computation used by
-    :func:`sinkhorn_barycenter`.
+    respectively, of the certified fixed point :func:`sinkhorn_barycenter`
+    returns, by the implicit function theorem.
     """
     atoms_arr = _as_f64_2d("atoms", atoms)
     k, m = atoms_arr.shape
@@ -194,6 +193,5 @@ def sinkhorn_barycenter_vjp(
         weights_arr,
         cost_arr,
         float(eps),
-        int(n_iter),
         cot_arr,
     )

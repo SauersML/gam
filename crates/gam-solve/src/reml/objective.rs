@@ -775,7 +775,6 @@ impl<'a> RemlState<'a> {
     pub(crate) fn build_sparse_derivative_context(
         &self,
         pirls_result: &PirlsResult,
-        bundle: &EvalShared,
     ) -> Result<DerivativeContext, EstimationError> {
         use super::reml_outer_engine::{
             DispersionHandling, FirthAwareGlmDerivatives, GaussianDerivatives,
@@ -787,24 +786,20 @@ impl<'a> RemlState<'a> {
         // Sparse exact still uses the same dense Jeffreys operator; only the
         // H^{-1} applications move to the sparse Cholesky operator.
         let firth_op = if let Some(jeffreys_link) = reml_robust_jeffreys_link(&self.config) {
-            if let Some(cached) = bundle.firth_dense_operator_original.clone() {
-                Some(cached)
-            } else {
-                let x_dense = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact REML runtime requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(std::sync::Arc::new(
-                    Self::build_firth_dense_operator_for_link(
-                        &jeffreys_link,
-                        x_dense.as_ref(),
-                        &pirls_result.final_eta.to_owned(),
-                        self.weights,
-                    )?,
-                ))
-            }
+            let x_dense = self
+                .x()
+                .try_to_dense_arc(
+                    "sparse exact REML runtime requires dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            Some(std::sync::Arc::new(
+                Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?,
+            ))
         } else {
             None
         };
@@ -1020,7 +1015,14 @@ impl<'a> RemlState<'a> {
         // onto the same subspace so each `coord.dim()` matches the reduced
         // `beta.len()` that `InnerSolutionBuilder::build` asserts. The Hessian
         // operator and `e_for_logdet` are already projected by the caller; this
-        // moves the penalty roots in lockstep (`R_k → R_k z`).
+        // moves the penalty roots in lockstep (`R_k → R_k z`). The face is
+        // affine — every point on it is `z β_f + (I − z zᵀ) β̂`, and the
+        // off-face part is non-zero whenever an active constraint has a
+        // non-zero right-hand side — so each restricted coordinate also carries
+        // the root-space offset `R_k(μ_k − (I − z zᵀ) β̂)`, read at the converged
+        // face point `β̂_transformed`. Without it the reduced shifted score is
+        // `zᵀS_k z (β_f − zᵀμ_k)` instead of `zᵀS_k(β̂ − μ_k)` and the outer
+        // ρ-gradient disagrees with the value (gam#4170).
         //
         // Frame consistency (#509 second face): the free basis `z`, the
         // projected Hessian `ZᵀHZ`, the projected design `XZ`, and the reduced
@@ -1056,6 +1058,7 @@ impl<'a> RemlState<'a> {
         let null_split = pirls_result.reparam_result.null_split();
         let penalty_coords = match free_basis {
             Some(z) => {
+                let face_point = pirls_result.beta_transformed.as_ref().view();
                 let original_coords = self.build_penalty_coords();
                 if pirls_result.reparam_result.canonical_transformed.len() == original_coords.len() {
                     pirls_result
@@ -1068,7 +1071,10 @@ impl<'a> RemlState<'a> {
                             ))
                         })?
                         .iter()
-                        .map(|cp| cp.to_penalty_coordinate().project_into_subspace(z))
+                        .map(|cp| {
+                            cp.to_penalty_coordinate()
+                                .project_into_subspace(z, face_point)
+                        })
                         .collect()
                 } else {
                     original_coords
@@ -1076,7 +1082,7 @@ impl<'a> RemlState<'a> {
                         .map(|coord| {
                             null_split
                                 .project_coordinate(coord, PenaltyFrame::Original)
-                                .project_into_subspace(z)
+                                .project_into_subspace(z, face_point)
                         })
                         .collect()
                 }
@@ -1535,7 +1541,7 @@ impl<'a> RemlState<'a> {
             second: det2,
         };
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Sparse-exact `log|H|` is the ordinary Cholesky log determinant of
         //
         //     H(ρ) = X'W(ρ)X + S_λ(ρ),
@@ -1558,8 +1564,7 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some()
-                    || bundle.firth_dense_operator_original.is_some(),
+                bundle.firth_dense_operator.is_some(),
             )
         } else {
             None
@@ -1689,13 +1694,7 @@ impl<'a> RemlState<'a> {
 
         // Match the transformed assembly's structural-rank Firth operator.
         // A strong penalty changes curvature, never coefficient identifiability.
-        let structural_rank = if let Some(firth) = bundle.firth_dense_operator_original.as_ref() {
-            let root_original = pirls_result
-                .reparam_result
-                .e_transformed
-                .dot(&pirls_result.reparam_result.qs.t());
-            Some(firth_penalized_structural_rank(&firth.q_basis, &root_original)?)
-        } else if let Some(firth) = bundle.firth_dense_operator.as_ref() {
+        let structural_rank = if let Some(firth) = bundle.firth_dense_operator.as_ref() {
             let qs = &pirls_result.reparam_result.qs;
             let root_original = pirls_result.reparam_result.e_transformed.dot(&qs.t());
             Some(firth_penalized_structural_rank(&qs.dot(&firth.q_basis), &root_original)?)
@@ -1931,7 +1930,7 @@ impl<'a> RemlState<'a> {
             );
         }
 
-        let ctx = self.build_sparse_derivative_context(pirls_result, bundle)?;
+        let ctx = self.build_sparse_derivative_context(pirls_result)?;
         // Original-basis envelope residual: `β` and `H` here are rotated into
         // the original basis, and `build_dense_original_assembly` is only ever
         // reached on the unconstrained QS frame, so the transformed residual
@@ -1941,8 +1940,7 @@ impl<'a> RemlState<'a> {
         let inner_kkt_residual = if presented {
             self.inner_kkt_residual_original_basis(
                 pirls_result,
-                bundle.firth_dense_operator.is_some()
-                    || bundle.firth_dense_operator_original.is_some(),
+                bundle.firth_dense_operator.is_some(),
             )
         } else {
             None
@@ -2540,6 +2538,17 @@ impl<'a> RemlState<'a> {
         } else {
             (Vec::new(), None, None, None)
         };
+        // gam#2987: θ carries one ψ coordinate per direction, so a builder that
+        // returned a different number would give the outer plan a gradient of
+        // the wrong length.
+        if ext_coords.len() != hyper_dirs.len() {
+            return Err(EstimationError::LayoutError(format!(
+                "the τ-coordinate builder returned {} coordinates for {} ψ directions \
+                 ({mode:?} evaluation)",
+                ext_coords.len(),
+                hyper_dirs.len()
+            )));
+        }
         let tau_build_ms = t1.elapsed().as_secs_f64() * 1000.0;
         let t2 = std::time::Instant::now();
         // #1376: when this evaluation carries a design-moving ψ coordinate
@@ -3975,15 +3984,14 @@ mod ift_warm_start_tests {
         canonical_penalties: &[CanonicalPenalty],
         new_rho: &Array1<f64>,
         p: usize,
-        last_ift_residual: Option<f64>,
+        trust_radius: Option<f64>,
     ) -> Option<Coefficients> {
         super::predict_warm_start_beta_ift_inner_with_outcome(
             cache,
             canonical_penalties,
             new_rho,
             p,
-            last_ift_residual,
-            None,
+            trust_radius,
             None,
         )
         .map(|(coef, _outcome)| coef)
@@ -3998,7 +4006,7 @@ mod ift_warm_start_tests {
         canonical_penalties: &[CanonicalPenalty],
         new_rho: &Array1<f64>,
         p: usize,
-        last_ift_residual: Option<f64>,
+        trust_radius: Option<f64>,
         factor_override: &dyn gam_linalg::matrix::FactorizedSystem,
     ) -> Option<Coefficients> {
         super::predict_warm_start_beta_ift_inner_with_outcome(
@@ -4006,8 +4014,7 @@ mod ift_warm_start_tests {
             canonical_penalties,
             new_rho,
             p,
-            last_ift_residual,
-            None,
+            trust_radius,
             Some(factor_override),
         )
         .map(|(coef, _outcome)| coef)
@@ -4424,8 +4431,11 @@ mod ift_warm_start_tests {
         }
     }
 
-    /// Δρ above the safety cap must reject (return None), so the caller
-    /// falls through to the tangent-line / flat warm-start.
+    /// The IFT predictor's step admission is its measured trust radius, not
+    /// a fixed |Δρ| budget: an unmeasured predictor takes the step, and a
+    /// measured radius rejects exactly the steps at or beyond it. A hand-set
+    /// 2.0 cap used to reject this |Δρ| = 3 step with no measurement behind
+    /// it (gam#2902).
     #[test]
     pub(crate) fn ift_predictor_rejects_large_drho() {
         let p = 3usize;
@@ -4444,31 +4454,21 @@ mod ift_warm_start_tests {
             frame_was_original: true,
             lambda_s_beta_blocks: None,
         };
-        // |Δρ| = 3 > IFT_WARM_START_DEFAULT_MAX_DRHO = 2.0 → reject under
-        // default cap (no quality history).
         let new_rho = ndarray::array![3.0_f64];
-        let predicted = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None);
+        let unmeasured = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, None);
         assert!(
-            predicted.is_none(),
-            "predictor should reject Δρ above default cap, got {:?}",
-            predicted
+            unmeasured.is_some(),
+            "an unmeasured predictor must take the |Δρ| = 3 step, not a hand-set budget's refusal"
         );
-        // With excellent prior quality (residual=0.005) the adaptive cap
-        // expands to 4.0, so |Δρ|=3 is now ACCEPTED.
-        let predicted_good_history =
-            predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, Some(0.005));
+        let inside = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, Some(4.0));
         assert!(
-            predicted_good_history.is_some(),
-            "predictor should accept Δρ=3 under expanded cap (good prior quality)",
+            inside.is_some(),
+            "|Δρ| = 3 inside a measured radius of 4 must be accepted"
         );
-        // With poor prior quality (residual=0.6) the adaptive cap
-        // tightens to 0.5, so even modest |Δρ|=1 is REJECTED.
-        let modest_rho = ndarray::array![1.0_f64];
-        let predicted_bad_history =
-            predict_warm_start_beta_ift_inner(&cache, &canonical, &modest_rho, p, Some(0.6));
+        let beyond = predict_warm_start_beta_ift_inner(&cache, &canonical, &new_rho, p, Some(2.0));
         assert!(
-            predicted_bad_history.is_none(),
-            "predictor should reject Δρ=1 under tightened cap (poor prior quality)",
+            beyond.is_none(),
+            "|Δρ| = 3 beyond a measured radius of 2 must be rejected, got {beyond:?}"
         );
     }
 
@@ -4532,52 +4532,6 @@ mod ift_warm_start_tests {
         assert!(predicted.is_none());
     }
 
-    /// `adaptive_ift_max_drho` must follow the documented piecewise
-    /// policy: small residual → looser cap; large residual → tighter
-    /// cap; non-finite or missing residual → default 2.0.
-    #[test]
-    pub(crate) fn adaptive_ift_max_drho_follows_quality_tiers() {
-        use super::adaptive_ift_max_drho;
-        // No history (first solve at this surface) → default 2.0.
-        assert_eq!(adaptive_ift_max_drho(None), 2.0);
-        // Pathological residuals (NaN, negative) → default 2.0.
-        assert_eq!(adaptive_ift_max_drho(Some(f64::NAN)), 2.0);
-        assert_eq!(adaptive_ift_max_drho(Some(-1.0)), 2.0);
-        assert_eq!(adaptive_ift_max_drho(Some(f64::INFINITY)), 0.5);
-        // Tier boundaries.
-        assert_eq!(adaptive_ift_max_drho(Some(0.0)), 4.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.005)), 4.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.01)), 3.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.04)), 3.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.05)), 2.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.10)), 2.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.20)), 1.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.30)), 1.0);
-        assert_eq!(adaptive_ift_max_drho(Some(0.50)), 0.5);
-        assert_eq!(adaptive_ift_max_drho(Some(1.5)), 0.5);
-        // Policy is monotone non-increasing in residual.
-        let residuals = [0.001, 0.02, 0.10, 0.30, 0.80];
-        let caps: Vec<f64> = residuals
-            .iter()
-            .map(|&r| adaptive_ift_max_drho(Some(r)))
-            .collect();
-        for w in caps.windows(2) {
-            assert!(
-                w[0] >= w[1],
-                "adaptive cap is not monotone non-increasing in residual: {caps:?}"
-            );
-        }
-    }
-
-    /// Parallel `S_k · (β-μ_k)` mat-vec across penalties (the rayon par_iter
-    /// pattern used at IFT cache-write time in updatewarm_start_from)
-    /// must produce bit-equivalent output to the serial version. The
-    /// parallelization is across penalties (each penalty's mat-vec is
-    /// independent and writes to its own Vec slot — no shared state),
-    /// so reordering doesn't change the floating-point result. This
-    /// test pins that invariant down: 8 penalties × 50-coefficient
-    /// blocks, par_iter vs serial iter, must agree to bit-equality
-    /// (not just within-tolerance).
     #[test]
     pub(crate) fn parallel_lambda_s_beta_blocks_matches_serial() {
         use rayon::prelude::*;
@@ -4713,47 +4667,6 @@ mod ift_warm_start_tests {
         );
     }
 
-    /// `adaptive_tangent_alpha_cap` follows the same quality-tier
-    /// pattern as `adaptive_ift_max_drho`, but with values calibrated
-    /// to the tangent-line predictor's α scale (multiples of the
-    /// previous ρ-step). Pin down each tier transition + defensive
-    /// handling.
-    #[test]
-    pub(crate) fn adaptive_tangent_alpha_cap_follows_quality_tiers() {
-        use super::adaptive_tangent_alpha_cap;
-        // No history → default 1.5 (the original hardcoded constant).
-        assert_eq!(adaptive_tangent_alpha_cap(None), 1.5);
-        // NaN / negative → default (defensive against torn atomics).
-        assert_eq!(adaptive_tangent_alpha_cap(Some(f64::NAN)), 1.5);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(-1.0)), 1.5);
-        // INFINITY → tightest tier (catastrophic prediction).
-        assert_eq!(adaptive_tangent_alpha_cap(Some(f64::INFINITY)), 0.5);
-        // Tier boundaries.
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.0)), 2.0);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.005)), 2.0);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.01)), 1.75);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.04)), 1.75);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.05)), 1.5);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.10)), 1.5);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.20)), 1.0);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.49)), 1.0);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(0.50)), 0.5);
-        assert_eq!(adaptive_tangent_alpha_cap(Some(2.0)), 0.5);
-        // Monotone non-increasing in residual: same shape as
-        // adaptive_ift_max_drho. The two predictors share the
-        // residual signal so their caps move together.
-        let residuals = [0.001, 0.02, 0.10, 0.30, 0.80];
-        let caps: Vec<f64> = residuals
-            .iter()
-            .map(|&r| adaptive_tangent_alpha_cap(Some(r)))
-            .collect();
-        for w in caps.windows(2) {
-            assert!(
-                w[0] >= w[1],
-                "tangent α cap is not monotone non-increasing in residual: {caps:?}"
-            );
-        }
-    }
 }
 
 #[cfg(test)]

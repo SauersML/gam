@@ -5380,7 +5380,10 @@ impl SurvivalLocationScaleFamily {
                     .map_err(|e| {
                         format!("inverse link third-derivative evaluation failed at eta={eta}: {e}")
                     })?;
-                let fpppp = inverse_link_pdffourth_derivative(inverse_link, eta)?;
+                let fpppp = inverse_link_pdffourth_derivative_for_inverse_link(inverse_link, eta)
+                    .map_err(|e| {
+                        format!("inverse link fourth-derivative evaluation failed at eta={eta}: {e}")
+                    })?;
                 // `ln f` composed on the pdf jet; the hand Bell-polynomial
                 // expansion this replaces was the same tower spelled out.
                 Ok(Self::log_stack_from_jet(f, fp, fpp, fppp, fpppp))

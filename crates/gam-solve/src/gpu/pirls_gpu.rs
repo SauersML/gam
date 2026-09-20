@@ -7,15 +7,20 @@ use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 /// an explicit discriminant instead of manufacturing a unit Gamma shape; the
 /// final ABI conversion writes a NaN poison value so any future accidental
 /// non-Gamma read fails loudly rather than silently becoming unit scale.
+///
+/// Only the Linux device loop consumes it, so it exists only in Linux builds.
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct PirlsLoopLikelihoodScale(PirlsLoopLikelihoodScaleKind);
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum PirlsLoopLikelihoodScaleKind {
     NonGamma,
     GammaShape(f64),
 }
 
+#[cfg(target_os = "linux")]
 impl PirlsLoopLikelihoodScale {
     #[inline]
     pub(crate) const fn non_gamma() -> Self {
@@ -32,7 +37,6 @@ impl PirlsLoopLikelihoodScale {
         }
     }
 
-    #[cfg(target_os = "linux")]
     fn kernel_argument(
         self,
         family: crate::gpu_kernels::pirls_row::PirlsRowFamily,
@@ -1610,9 +1614,8 @@ extern "C" __global__ void chol_logdet_col_major(
     }
 
     /// Launch the device-side Cholesky-factor logdet kernel and download
-    /// the single scalar result. Replaces the per-step p² host download of
-    /// the Cholesky factor that the host-side `cholesky_logdet_from_col_major`
-    /// required.
+    /// the single scalar result, so the p² Cholesky factor never has to be
+    /// downloaded to the host for its log-determinant.
     fn cholesky_logdet_device(
         stream: &std::sync::Arc<cudarc::driver::CudaStream>,
         ctx: &std::sync::Arc<cudarc::driver::CudaContext>,
@@ -2008,20 +2011,22 @@ extern "C" __global__ void status_first_ladder(
     /// When supplied, the postpass at loop exit runs the same host-side
     /// helpers the CPU oracle uses
     /// (`computeworkingweight_derivatives_from_eta`,
-    /// `compute_observed_hessian_curvature_arrays`,
-    /// `compute_constraint_kkt_diagnostics`) so the dispatch wirer can
+    /// `compute_observed_hessian_curvature_arrays`) so the dispatch wirer can
     /// plumb every field of `PirlsResult` without doing math.
     ///
     /// When `None`, the derived fields on `PirlsLoopOutcome`
     /// (`finalweights`, `solveweights`, `solve_dmu_deta`,
     /// `solve_d2mu_deta2`, `solve_d3mu_deta3`, `solve_c_array`,
-    /// `solve_d_array`, `status`, `constraint_kkt`, `firth`, `edf`,
+    /// `solve_d_array`, `status`, `firth`,
     /// `beta_transformed`, `derivatives_unsupported`)
     /// take safe defaults: empty arrays, `PirlsStatus::Converged` or
-    /// `MaxIterationsReached` reflecting `converged`, no KKT
-    /// diagnostics,
-    /// `FirthDiagnostics::Inactive`, `edf = NaN`,
+    /// `MaxIterationsReached` reflecting `converged`,
+    /// `FirthDiagnostics::Inactive`,
     /// `beta_transformed = beta`, `derivatives_unsupported = true`.
+    ///
+    /// The loop carries no constraint or EDF surface: the host admission
+    /// gate routes only unconstrained problems here, and the EDF is
+    /// recomputed by the outer REML layer from the returned Hessian.
     /// Existing callers that do not need the CPU oracle surface can
     /// pass `None` and ignore the derived fields.
     pub struct PirlsLoopExtra<'a> {
@@ -2043,13 +2048,6 @@ extern "C" __global__ void status_first_ladder(
         /// outcome's `final_offset` so the dispatch wirer can populate
         /// `PirlsResult::final_offset` without re-allocating.
         pub offset: ndarray::ArrayView1<'a, f64>,
-        /// Linear inequality constraints `A·β ≥ b` in the same
-        /// coordinate frame as the GPU loop's β. When `Some`, the
-        /// postpass calls `compute_constraint_kkt_diagnostics` on the
-        /// converged β + reconstructed penalised gradient and emits
-        /// the result on `PirlsLoopOutcome::constraint_kkt`. When
-        /// `None`, no diagnostics are produced.
-        pub linear_constraints: Option<&'a gam_problem::LinearInequalityConstraints>,
         /// Curvature surface the *outer* REML / LAML caller expects on
         /// the returned Hessian. The GPU loop runs under whatever
         /// `curvature: CurvatureMode` it was invoked with; if this
@@ -2066,15 +2064,6 @@ extern "C" __global__ void status_first_ladder(
         /// device-side Firth path would populate this with the active
         /// Jeffreys-logdet + hat-diagonal vector.
         pub firth: Option<crate::pirls::FirthDiagnostics>,
-        /// Effective degrees of freedom at the converged mode, when
-        /// the dispatch wirer has it precomputed (typical case: the
-        /// outer REML caller passes its own `e_transformed` /
-        /// diagonal-penalty pre-image and computes EDF host-side).
-        /// When `None`, the postpass emits `f64::NAN` and sets
-        /// `derivatives_unsupported = true` — the dispatch wirer can
-        /// then compute EDF itself from `penalized_hessian` and the
-        /// caller-side penalty root.
-        pub edf: Option<f64>,
     }
 
     #[derive(Clone, Debug)]
@@ -2146,13 +2135,6 @@ extern "C" __global__ void status_first_ladder(
         /// Firth diagnostics. `Inactive` unless the caller passes an
         /// `Active` value through `extra.firth`.
         pub firth: crate::pirls::FirthDiagnostics,
-        /// KKT diagnostics for `extra.linear_constraints`. `None`
-        /// either when no constraints are supplied or when the
-        /// constraint system is empty.
-        pub constraint_kkt: Option<crate::active_set::ConstraintKktDiagnostics>,
-        /// Effective degrees of freedom. Echoed from `extra.edf`;
-        /// `f64::NAN` when not supplied.
-        pub edf: f64,
         /// `prev_deviance − accepted_deviance` at the accepted step
         /// that terminated the loop. Matches the CPU oracle's
         /// `WorkingModelPirlsResult::last_deviance_change`.
@@ -2763,10 +2745,8 @@ extern "C" __global__ void status_first_ladder(
     /// `computeworkingweight_derivatives_from_eta` and (optionally)
     /// `compute_observed_hessian_curvature_arrays` produce the
     /// solve-side aux jets and the curvature-promoted Hessian-side
-    /// weights; `compute_constraint_kkt_diagnostics` runs over the
-    /// converged β and reconstructed penalised gradient. All of this
-    /// is bit-identical to the corresponding CPU oracle code paths in
-    /// `fit_model_for_fixed_rho_with_adaptive_kkt`.
+    /// weights. All of this is bit-identical to the corresponding CPU
+    /// oracle code paths in `fit_model_for_fixed_rho_with_adaptive_kkt`.
     fn build_loop_outcome(
         ws: &mut SigmaPirlsGpuWorkspace,
         loop_ws: &mut PirlsLoopWorkspace,
@@ -2851,29 +2831,10 @@ extern "C" __global__ void status_first_ladder(
                 // reparam_result.qs per the PirlsResult contract).
                 let beta_transformed = beta.clone();
 
-                let constraint_kkt = ext.linear_constraints.and_then(|lin| {
-                    if lin.a.nrows() == 0 {
-                        return None;
-                    }
-                    // Reconstruct the penalised gradient at the
-                    // converged β: g = Xᵀ(grad_eta) + S β.
-                    // `penalized_hessian` is already XᵀWX + S
-                    // (step_lm_lambda was stripped from the export), so
-                    // H_pen·β ≈ Xᵀ·grad_eta at a KKT-feasible solution.
-                    let grad = penalized_hessian.dot(&beta);
-                    // One product, no cancellation of operands: the
-                    // gradient's natural scale is its own magnitude.
-                    let grad_scale = grad.dot(&grad).sqrt();
-                    Some(crate::active_set::compute_constraint_kkt_diagnostics(
-                        &beta, &grad, grad_scale, lin,
-                    ))
-                });
-
                 let firth = ext
                     .firth
                     .clone()
                     .unwrap_or(crate::pirls::FirthDiagnostics::Inactive);
-                let edf = ext.edf.unwrap_or(f64::NAN);
                 // Mirrors CPU oracle's invariant: when
                 // `computeworkingweight_derivatives_from_eta` returns
                 // Ok, all five jets are real (not placeholders), so
@@ -2905,8 +2866,6 @@ extern "C" __global__ void status_first_ladder(
                     derivatives_unsupported,
                     status,
                     firth,
-                    constraint_kkt,
-                    edf,
                     last_deviance_change: diagnostics.last_deviance_change,
                     last_step_halving: diagnostics.last_step_halving,
                     last_step_size: diagnostics.last_step_size,
@@ -2947,8 +2906,6 @@ extern "C" __global__ void status_first_ladder(
                     derivatives_unsupported: true,
                     status,
                     firth: crate::pirls::FirthDiagnostics::Inactive,
-                    constraint_kkt: None,
-                    edf: f64::NAN,
                     last_deviance_change: diagnostics.last_deviance_change,
                     last_step_halving: diagnostics.last_step_halving,
                     last_step_size: diagnostics.last_step_size,

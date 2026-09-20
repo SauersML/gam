@@ -5,60 +5,92 @@ use std::sync::RwLock;
 impl<'a> RemlState<'a> {
     pub(crate) const POLISH_NORM_RATIO: f64 = 0.25;
 
-    pub(crate) fn ift_quality_step_cap(&self, default_cap: f64) -> f64 {
-        self.ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned")
-            .next_step_cap
-            .filter(|cap| cap.is_finite() && *cap > 0.0)
-            .unwrap_or(default_cap)
-    }
-
-    pub(crate) fn take_ift_quality_flat_override(&self) -> bool {
-        let mut state = self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned");
-        let fallback = state.fallback_next_flat;
-        state.fallback_next_flat = false;
-        fallback
-    }
-
-    pub(crate) fn clear_ift_quality_runtime_state(&self) {
-        *self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned") = Default::default();
-    }
-
-    pub(crate) fn record_ift_prediction_quality(
+    /// The measured trust radius of `source` (see [`WarmStartTrustState`]);
+    /// `None` until that predictor has had an error measured, in which case
+    /// nothing yet says it loses to the flat seed.
+    pub(crate) fn warm_start_trust_radius(
         &self,
-        quality: f64,
-        current_cap: f64,
+        source: WarmStartPredictionSource,
     ) -> Option<f64> {
-        if !quality.is_finite() || quality < 0.0 || !current_cap.is_finite() || current_cap <= 0.0 {
+        let state = self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned");
+        match source {
+            WarmStartPredictionSource::Ift => state.ift_radius,
+            WarmStartPredictionSource::TangentLine => state.tangent_radius,
+            WarmStartPredictionSource::Flat => None,
+        }
+    }
+
+    /// Remember the step metric of the prediction about to seed the inner
+    /// solve, so the converged β can measure that predictor's trust radius.
+    pub(crate) fn stage_warm_start_prediction_step(
+        &self,
+        source: WarmStartPredictionSource,
+        step: f64,
+    ) {
+        self.warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned")
+            .pending = Some((source, step));
+    }
+
+    pub(crate) fn take_staged_warm_start_prediction_step(
+        &self,
+    ) -> Option<(WarmStartPredictionSource, f64)> {
+        self.warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned")
+            .pending
+            .take()
+    }
+
+    pub(crate) fn clear_warm_start_trust_state(&self) {
+        *self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned") = Default::default();
+    }
+
+    /// Measure `source`'s trust radius from one converged solve: the
+    /// prediction at step metric `step` missed the converged β by
+    /// `predicted_error`, the flat seed by `flat_error`. The prediction's
+    /// error grows one order faster in the step than the flat seed's, so the
+    /// step at which the two cross is `step · flat_error / predicted_error`
+    /// (unbounded when the prediction was exact). Returns the new radius, or
+    /// `None` when the solve carries no information (both errors zero, or a
+    /// non-finite input).
+    pub(crate) fn record_warm_start_prediction_error(
+        &self,
+        source: WarmStartPredictionSource,
+        step: f64,
+        predicted_error: f64,
+        flat_error: f64,
+    ) -> Option<f64> {
+        if !(step.is_finite() && predicted_error.is_finite() && flat_error.is_finite())
+            || step < 0.0
+            || predicted_error < 0.0
+            || flat_error < 0.0
+            || (predicted_error == 0.0 && flat_error == 0.0)
+        {
             return None;
         }
-        let mut state = self
-            .ift_quality_runtime
-            .lock()
-            .expect("IFT quality runtime mutex poisoned");
-        state.quality_history.push(quality);
-        while state.quality_history.len() > IFT_QUALITY_HISTORY_CAP {
-            state.quality_history.remove(0);
-        }
-        let rolling_quality =
-            state.quality_history.iter().sum::<f64>() / state.quality_history.len() as f64;
-        let next_step_cap = if rolling_quality < IFT_QUALITY_GROW_BAND {
-            current_cap * IFT_STEP_CAP_GROW_FACTOR
-        } else if rolling_quality < IFT_QUALITY_SHRINK_BAND {
-            current_cap
+        let radius = if predicted_error == 0.0 {
+            f64::INFINITY
         } else {
-            current_cap * IFT_STEP_CAP_SHRINK_FACTOR
+            step * flat_error / predicted_error
         };
-        state.next_step_cap = Some(next_step_cap);
-        state.fallback_next_flat = rolling_quality >= IFT_QUALITY_FLAT_FALLBACK_BAND;
-        Some(next_step_cap)
+        let mut state = self
+            .warm_start_trust
+            .lock()
+            .expect("warm-start trust mutex poisoned");
+        match source {
+            WarmStartPredictionSource::Ift => state.ift_radius = Some(radius),
+            WarmStartPredictionSource::TangentLine => state.tangent_radius = Some(radius),
+            WarmStartPredictionSource::Flat => return None,
+        }
+        Some(radius)
     }
 
     pub(crate) fn apply_inner_polish_step_to_warm_start(
@@ -683,8 +715,9 @@ impl<'a> RemlState<'a> {
     /// The ρ-Hessian block of `¹⁄₁₂ Σ_ij c_i c_j K_ij³` through design tensors.
     ///
     /// `c_v`, `c_g` (n×k) and `c_h` (n×k×k) are the value, ρ-gradient and
-    /// ρ-Hessian parts of the per-row `c` jets. `kmat_x[i] = z_i = H⁻¹x_i`,
-    /// `ki_x[a][i] = K_a x_i` and `k_ij[a][b] = K_ab`. Define
+    /// ρ-Hessian parts of the per-row `c` jets. Row `i` of `xk0 = XH⁻¹` is
+    /// `z_i = H⁻¹x_i`, row `i` of `xka[a] = XK_a` is `K_a x_i`, and
+    /// `k_ij[a][b] = K_ab`. Define
     /// `T_w = Σ_j w_j x_j⊗x_j⊗x_j`, `r_i = T_c[z_i, z_i, ·]`, `s_i = r_iᵀz_i`
     /// and `s⁽ᵇ⁾_i = T_{c_g[·,b]}[z_i, z_i, z_i]`. Relabelling `i ↔ j` under the
     /// symmetry of `H⁻¹`, `K_a` and `K_ab` turns every row-pair sum of the jet
@@ -696,13 +729,14 @@ impl<'a> RemlState<'a> {
     ///             + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i.
     /// ```
     ///
-    /// That costs `O(n·((2 + 3k)·p³ + k²·p²))` against `O(n²·(1 + k + k²)·p)` for
-    /// the row-pair jets. Returns `None` when the memory ledger cannot admit the
-    /// `(1 + k)·p³` tensors, in which case the row-pair route runs.
+    /// That costs `O(n·((2 + 3k)·p³ + k²·p²))` against
+    /// `O(n²·((2 + k)·p + k²))` for [`Self::tk_rho_hessian_pair_blocks`]. Returns
+    /// `None` when the memory ledger cannot admit the `(1 + k)·p³` tensors, in
+    /// which case the row-block route runs.
     fn tk_rho_hessian_pair_tensor(
         x_dense: &Array2<f64>,
-        kmat_x: &[Array1<f64>],
-        ki_x: &[Vec<Array1<f64>>],
+        xk0: &Array2<f64>,
+        xka: &[Array2<f64>],
         k_ij: &[Vec<Array2<f64>>],
         c_v: &Array1<f64>,
         c_g: &Array2<f64>,
@@ -730,16 +764,16 @@ impl<'a> RemlState<'a> {
             |range: core::ops::Range<usize>| {
                 let mut local = Array2::<f64>::zeros((k, k));
                 for row in range {
-                    let z = &kmat_x[row];
+                    let z = xk0.row(row);
                     let x_row = x_dense.row(row);
                     let zz = Array1::from_shape_fn(p * p, |index| z[index / p] * z[index % p]);
                     let r = t_c.t().dot(&zz);
-                    let s = r.dot(z);
-                    let s_g: Vec<f64> = t_g.iter().map(|t| t.t().dot(&zz).dot(z)).collect();
-                    let r_w: Vec<f64> = (0..k).map(|a| r.dot(&ki_x[a][row])).collect();
-                    let tw: Vec<Array1<f64>> = (0..k).map(|b| t_c.dot(&ki_x[b][row])).collect();
+                    let s = r.dot(&z);
+                    let s_g: Vec<f64> = t_g.iter().map(|t| t.t().dot(&zz).dot(&z)).collect();
+                    let r_w: Vec<f64> = (0..k).map(|a| r.dot(&xka[a].row(row))).collect();
+                    let tw: Vec<Array1<f64>> = (0..k).map(|b| t_c.dot(&xka[b].row(row))).collect();
                     for a in 0..k {
-                        let w_a = &ki_x[a][row];
+                        let w_a = xka[a].row(row);
                         let zw_a =
                             Array1::from_shape_fn(p * p, |index| z[index / p] * w_a[index % p]);
                         for b in 0..k {
@@ -771,6 +805,131 @@ impl<'a> RemlState<'a> {
             crate::bail_invalid_estim!("{context} produced a non-finite entry");
         }
         Ok(Some(total))
+    }
+
+    /// The ρ-Hessian block of `¹⁄₁₂ Σ_ij c_i c_j K_ij³` by row blocks.
+    ///
+    /// The inputs are those of [`Self::tk_rho_hessian_pair_tensor`], so the
+    /// row-pair entries are `K_ij = z_i·x_j` and `(K_a)_ij = (K_a x_i)·x_j`. With
+    /// `r_i = Σ_j c_j K_ij² x_j`, `s_i = Σ_j c_j K_ij³` and
+    /// `s⁽ᵇ⁾_i = Σ_j c_g[j,b] K_ij³`, the same relabelling gives
+    ///
+    /// ```text
+    ///   12·H[a,b] = 2 Σ_i c_h[i,a,b] s_i + Σ_i (c_g[i,a] s⁽ᵇ⁾_i + c_g[i,b] s⁽ᵃ⁾_i)
+    ///             + 3 ⟨K_ab, Σ_i c_v[i] x_i r_iᵀ⟩
+    ///             + 6 Σ_i c_g[i,a] r_iᵀK_b x_i + 6 Σ_i c_g[i,b] r_iᵀK_a x_i
+    ///             + 6 Σ_ij c_v[i] c_v[j] K_ij (K_a)_ij (K_b)_ij.
+    /// ```
+    ///
+    /// Each row block `I` walks the column tiles `J`, forming `K_IJ` and every
+    /// `(K_a)_IJ` with one GEMM each, so the last sum is a `k×k` Gram of the
+    /// tiles `(K_a)_IJ` under the weights `c_i c_j K_ij`. That costs
+    /// `O(n²·((2 + k)·p + k²))` products in `O(k·BASE_CHUNK²)` working memory,
+    /// against the `O(n²·k²·p)` of evaluating the jet product row pair by row pair.
+    fn tk_rho_hessian_pair_blocks(
+        x_dense: &Array2<f64>,
+        xk0: &Array2<f64>,
+        xka: &[Array2<f64>],
+        k_ij: &[Vec<Array2<f64>>],
+        c_v: &Array1<f64>,
+        c_g: &Array2<f64>,
+        c_h: &ndarray::Array3<f64>,
+    ) -> Result<Array2<f64>, EstimationError> {
+        use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
+        let n = x_dense.nrows();
+        let p = x_dense.ncols();
+        let k = c_g.ncols();
+        let tile = gam_linalg::pairwise_reduce::BASE_CHUNK;
+        // Right-hand sides shared by every block: `[c_v | c_g]` for `s` and
+        // `s⁽ᵇ⁾`, and the `c_v`-weighted design for `r`.
+        let mut weights = Array2::<f64>::zeros((n, k + 1));
+        weights.column_mut(0).assign(c_v);
+        weights.slice_mut(s![.., 1..]).assign(c_g);
+        let cx = x_dense * &c_v.view().insert_axis(Axis(1));
+        let folded = gam_linalg::pairwise_reduce::par_deterministic_block_fold(
+            n,
+            |range: core::ops::Range<usize>| {
+                gam_problem::with_nested_parallel(|| {
+                    let lo = range.start;
+                    let m = range.len();
+                    let xk0_rows = xk0.slice(s![range.clone(), ..]);
+                    // Block `a` of `stacked` holds the rows `K_a x_i`, i ∈ I, so one
+                    // GEMM against a column tile gives every `(K_a)_IJ`.
+                    let mut stacked = Array2::<f64>::zeros((k * m, p));
+                    for (a, xk) in xka.iter().enumerate() {
+                        stacked
+                            .slice_mut(s![a * m..(a + 1) * m, ..])
+                            .assign(&xk.slice(s![range.clone(), ..]));
+                    }
+                    let mut r = Array2::<f64>::zeros((m, p));
+                    let mut cubes = Array2::<f64>::zeros((m, k + 1));
+                    let mut triple = Array2::<f64>::zeros((k, k));
+                    let mut start = 0;
+                    while start < n {
+                        let end = (start + tile).min(n);
+                        let t = end - start;
+                        let x_tile = x_dense.slice(s![start..end, ..]);
+                        let k0 = fast_abt(&xk0_rows, &x_tile);
+                        let squares = &k0 * &k0;
+                        r += &fast_ab(&squares, &cx.slice(s![start..end, ..]));
+                        let cubes_tile = &squares * &k0;
+                        cubes += &fast_ab(&cubes_tile, &weights.slice(s![start..end, ..]));
+                        let ka = fast_abt(&stacked, &x_tile)
+                            .into_shape_with_order((k, m * t))
+                            .expect("a standard-layout (k·m)×t product reshapes to k×(m·t)");
+                        let pair_weight = Array1::from_shape_fn(m * t, |index| {
+                            let (i, j) = (index / t, index % t);
+                            c_v[lo + i] * c_v[start + j] * k0[[i, j]]
+                        });
+                        triple += &fast_abt(&ka, &(&ka * &pair_weight));
+                        start = end;
+                    }
+                    let c_g_rows = c_g.slice(s![range.clone(), ..]);
+                    let mut local = Array2::<f64>::zeros((k, k));
+                    for i in 0..m {
+                        let s_i = cubes[[i, 0]];
+                        for a in 0..k {
+                            for b in 0..k {
+                                local[[a, b]] += 2.0 * c_h[[lo + i, a, b]] * s_i;
+                            }
+                        }
+                    }
+                    let cubes_g = fast_atb(&c_g_rows, &cubes.slice(s![.., 1..]));
+                    local += &cubes_g;
+                    local += &cubes_g.t();
+                    // `q[i, b] = r_iᵀ K_b x_i`.
+                    let q = Array2::from_shape_fn((m, k), |(i, b)| {
+                        stacked.row(b * m + i).dot(&r.row(i))
+                    });
+                    let cq = fast_atb(&c_g_rows, &q);
+                    local += &(&cq * 6.0);
+                    local += &(&cq.t() * 6.0);
+                    local += &(&triple * 6.0);
+                    let w = fast_atb(&cx.slice(s![range.clone(), ..]), &r);
+                    (local, w)
+                })
+            },
+            |(mut left, mut left_w), (right, right_w)| {
+                left += &right;
+                left_w += &right_w;
+                (left, left_w)
+            },
+        );
+        let Some((mut total, w)) = folded else {
+            return Ok(Array2::zeros((k, k)));
+        };
+        for a in 0..k {
+            for b in 0..k {
+                total[[a, b]] += 3.0 * (&k_ij[a][b] * &w).sum();
+            }
+        }
+        total.mapv_inplace(|value| value / 12.0);
+        if total.iter().any(|value| !value.is_finite()) {
+            crate::bail_invalid_estim!(
+                "Tierney-Kadane rho-Hessian row blocks produced a non-finite entry"
+            );
+        }
+        Ok(total)
     }
 
     pub(crate) fn tk_scalar_from_shared(
@@ -1051,6 +1210,14 @@ impl<'a> RemlState<'a> {
             .and(x_dense.rows())
             .par_for_each(|o, xp_row, x_row| *o = xp_row.dot(&x_row));
 
+        let firth_trace_kernel = match firth_op {
+            Some(op) => Some(op.hphi_direction_trace_kernel(&p_total)?),
+            None => None,
+        };
+        let firth_trace = |beta_dir: &Array1<f64>| {
+            Self::tk_firth_beta_hessian_trace(firth_op, firth_trace_kernel.as_ref(), beta_dir, p)
+        };
+
         let mut gradient = Array1::<f64>::zeros(total_k);
         // The dominant `O(n²·p)` direct term for all `k` canonical directions
         // shares one gram assembly (the row-pair block is direction-independent):
@@ -1070,8 +1237,7 @@ impl<'a> RemlState<'a> {
                     .sum::<f64>();
             let correction_trace =
                 Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[idx], &lev_p);
-            let firth_trace =
-                Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[idx], &p_total)?;
+            let firth_trace = firth_trace(&beta_dirs[idx])?;
             let direct = canonical_direct[idx];
             gradient[idx] = trace_ak_p - correction_trace + firth_trace + direct;
         }
@@ -1097,8 +1263,7 @@ impl<'a> RemlState<'a> {
                 let x_vk_idx = k + extra_idx;
                 let correction_trace =
                     Self::tk_active_weighted_trace(&shared.active_blocks, &x_vks[x_vk_idx], &lev_p);
-                let firth_trace =
-                    Self::tk_firth_beta_hessian_trace(firth_op, &beta_dirs[x_vk_idx], &p_total)?;
+                let firth_trace = firth_trace(&beta_dirs[x_vk_idx])?;
                 let mut eta_total = x_vks[x_vk_idx].mapv(|value| -value);
                 if let Some(eta_fixed) = ext_eta_fixed
                     .get(extra_idx)
@@ -1154,41 +1319,28 @@ impl<'a> RemlState<'a> {
         Ok(gradient)
     }
 
+    /// `-tr(D H_φ[u] Π)` for the β-direction `u = beta_dir`, through the
+    /// shared contractions of `Π` in `kernel`
+    /// (`FirthDenseOperator::hphi_direction_trace_kernel`).
     pub(crate) fn tk_firth_beta_hessian_trace(
         firth_op: Option<&super::FirthDenseOperator>,
+        kernel: Option<&super::FirthHphiTraceKernel>,
         beta_dir: &Array1<f64>,
-        p_total: &Array2<f64>,
+        p: usize,
     ) -> Result<f64, EstimationError> {
-        let Some(firth_op) = firth_op else {
+        let (Some(firth_op), Some(kernel)) = (firth_op, kernel) else {
             return Ok(0.0);
         };
-        if beta_dir.len() != p_total.nrows() {
+        if beta_dir.len() != p {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane Firth beta-direction length mismatch: expected {}, got {}",
-                p_total.nrows(),
+                p,
                 beta_dir.len()
             );
         }
         let deta = gam_linalg::faer_ndarray::fast_av(&firth_op.x_dense, beta_dir);
         let dir = firth_op.direction_from_deta(deta);
-        let hphi = firth_op.hphi_direction(&dir);
-        if hphi.raw_dim() != p_total.raw_dim() {
-            crate::bail_invalid_estim!(
-                "Tierney-Kadane Firth Hessian derivative shape mismatch: expected {}x{}, got {}x{}",
-                p_total.nrows(),
-                p_total.ncols(),
-                hphi.nrows(),
-                hphi.ncols()
-            );
-        }
-
-        let mut trace = 0.0;
-        for row in 0..hphi.nrows() {
-            for col in 0..hphi.ncols() {
-                trace -= hphi[[row, col]] * p_total[[col, row]];
-            }
-        }
-        Ok(trace)
+        Ok(-firth_op.hphi_direction_trace(kernel, &dir))
     }
 
     /// Direct analytic derivative of the TK scalar through the per-row
@@ -1809,21 +1961,56 @@ impl<'a> RemlState<'a> {
             h_ij[j][i] = h;
         }
 
-        let mut k_i = Vec::with_capacity(k);
-        for i in 0..k {
-            k_i.push(-k_mat.dot(&h_i[i]).dot(&k_mat));
-        }
-        let mut k_ij: Vec<Vec<Array2<f64>>> = (0..k)
-            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((p, p))).collect())
+        // `K_i = -K H_i K` and `K_ij = K H_j K H_i K + K H_i K H_j K - K H_ij K`.
+        // With `M_i = K H_i` and `P_i = K H_i K` computed once, each pair costs
+        // four GEMMs: `K_ij = M_j P_i + M_i P_j - K H_ij K`. Both are symmetric in
+        // exact arithmetic and are symmetrized so the contractions below may use
+        // either index order.
+        use gam_linalg::faer_ndarray::fast_ab;
+        let compute_m_p = |idx: usize| -> (Array2<f64>, Array2<f64>) {
+            let m = fast_ab(&k_mat, &h_i[idx]);
+            let p_mat = fast_ab(&m, &k_mat);
+            (m, p_mat)
+        };
+        let m_p: Vec<(Array2<f64>, Array2<f64>)> = if fan_units {
+            use rayon::prelude::*;
+            (0..k)
+                .into_par_iter()
+                .map(|idx| gam_problem::with_nested_parallel(|| compute_m_p(idx)))
+                .collect()
+        } else {
+            (0..k).map(compute_m_p).collect()
+        };
+        let k_i: Vec<Array2<f64>> = m_p
+            .iter()
+            .map(|(_, p_mat)| {
+                let mut ki = p_mat.mapv(|value| -value);
+                gam_linalg::matrix::symmetrize_in_place(&mut ki);
+                ki
+            })
             .collect();
-        for i in 0..k {
-            for j in 0..=i {
-                let kij = k_mat.dot(&h_i[j]).dot(&k_mat).dot(&h_i[i]).dot(&k_mat)
-                    + k_mat.dot(&h_i[i]).dot(&k_mat).dot(&h_i[j]).dot(&k_mat)
-                    - k_mat.dot(&h_ij[i][j]).dot(&k_mat);
-                k_ij[i][j] = kij.clone();
-                k_ij[j][i] = kij;
-            }
+        let compute_k_pair = |&(i, j): &(usize, usize)| -> Array2<f64> {
+            let mut kij = fast_ab(&m_p[j].0, &m_p[i].1);
+            kij += &fast_ab(&m_p[i].0, &m_p[j].1);
+            kij -= &fast_ab(&fast_ab(&k_mat, &h_ij[i][j]), &k_mat);
+            gam_linalg::matrix::symmetrize_in_place(&mut kij);
+            kij
+        };
+        let k_blocks: Vec<Array2<f64>> = if fan_pairs {
+            use rayon::prelude::*;
+            h_pairs
+                .par_iter()
+                .map(|pair| gam_problem::with_nested_parallel(|| compute_k_pair(pair)))
+                .collect()
+        } else {
+            h_pairs.iter().map(compute_k_pair).collect()
+        };
+        let mut k_ij: Vec<Vec<Array2<f64>>> = (0..k)
+            .map(|_| (0..k).map(|_| Array2::<f64>::zeros((0, 0))).collect())
+            .collect();
+        for (&(i, j), kij) in h_pairs.iter().zip(k_blocks.into_iter()) {
+            k_ij[i][j] = kij.clone();
+            k_ij[j][i] = kij;
         }
 
         #[derive(Clone)]
@@ -1871,76 +2058,45 @@ impl<'a> RemlState<'a> {
             pub(crate) fn square(&self) -> Self {
                 self.mul(self)
             }
-            pub(crate) fn cube(&self) -> Self {
-                self.mul(self).mul(self)
-            }
         }
 
-        // K xⱼ, Kᵢ xⱼ and Kᵢⱼ xⱼ depend only on the row j, yet the O(n²)
-        // skewness double loop below recomputed each of them afresh for every
-        // outer row i (and the per-row `hdiag` jet computes the very same
-        // matvecs). On the row-pair route that inner O(p²) matvec, repeated n²
-        // times, dominates the whole evaluation.
-        //
-        // Hoist the row-local matvecs once here (n gemvs each), so the diagonal
-        // jet and every (i,j) inner iteration reduce to an O(p) `xᵢ · (K xⱼ)`
-        // dot — turning the dominant term from O(n²·(1+k+k²)·p²) into
-        // O(n²·(1+k+k²)·p) plus an O(n·(1+k+k²)·p²) precompute. This is exact:
-        // each cached vector is the identical `Matrix::dot` matvec the inline
-        // code performed, and the irow-outer / jrow-inner accumulation order is
-        // preserved verbatim, so `total` is assembled bit-for-bit unchanged
-        // (the k=4 determinism oracle covers it) (#1575).
-        let rows: Vec<Array1<f64>> = (0..n).map(|r| x_dense.row(r).to_owned()).collect();
-        let kmat_x: Vec<Array1<f64>> = rows.iter().map(|xr| k_mat.dot(xr)).collect();
-        let ki_x: Vec<Vec<Array1<f64>>> = (0..k)
-            .map(|a| rows.iter().map(|xr| k_i[a].dot(xr)).collect())
-            .collect();
-        // `kmat_x` (n·p) and `ki_x` (k·n·p) are the size of the design itself,
-        // but the mixed cache `kij_x` is k²·n·p and nothing bounds k (the smooth
-        // count), so a many-smooth
-        // model could blow memory the original inline loop never allocated.
-        // Materialize it only when it fits a fixed budget; otherwise fall back
-        // to recomputing `k_ij[a][b]·xⱼ` inline (the original arithmetic, so
-        // still bit-identical — just without the O(n²)→O(n) reuse on the mixed
-        // blocks). 64M f64 ≈ 512 MB ceiling.
-        const TK_KIJ_CACHE_MAX_ELEMS: usize = 64 * 1024 * 1024;
-        let kij_x: Option<Vec<Vec<Vec<Array1<f64>>>>> =
-            if k.saturating_mul(k).saturating_mul(n).saturating_mul(p) <= TK_KIJ_CACHE_MAX_ELEMS {
-                Some(
-                    (0..k)
-                        .map(|a| {
-                            (0..k)
-                                .map(|b| rows.iter().map(|xr| k_ij[a][b].dot(xr)).collect())
-                                .collect()
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            };
-        // xᵢ · (Kᵢⱼ xⱼ): read the cached row-local matvec when present, else
-        // recompute it inline. Both forms call the identical `Matrix::dot`, so
-        // the scalar is bit-for-bit the same either way (#1575).
-        let kij_bilinear = |a: usize, b: usize, xi: &Array1<f64>, jrow: usize| -> f64 {
-            match &kij_x {
-                Some(cache) => xi.dot(&cache[a][b][jrow]),
-                None => xi.dot(&k_ij[a][b].dot(&rows[jrow])),
-            }
+        // Row `i` of `XK`, `XK_a` and `XK_ab` is `Kx_i`, `K_a x_i` and `K_ab x_i`
+        // (every one symmetric), so the diagonal jet `x_iᵀ(K, K_a, K_ab)x_i` is
+        // a row-wise dot of each product with `X`, and the row-pair sums below
+        // read `XK` and `XK_a` as GEMM operands.
+        let row_dots = |product: &Array2<f64>| -> Array1<f64> {
+            (product * x_dense).sum_axis(Axis(1))
         };
-
-        let mut hdiag = Vec::with_capacity(n);
-        for row in 0..n {
-            let x = &rows[row];
-            let mut jet = Jet::constant(x.dot(&kmat_x[row]), k);
-            for a in 0..k {
-                jet.g[a] = x.dot(&ki_x[a][row]);
-            }
-            for a in 0..k {
-                for b in 0..k {
-                    jet.h[[a, b]] = kij_bilinear(a, b, x, row);
+        let xk0 = fast_ab(x_dense, &k_mat);
+        let xka: Vec<Array2<f64>> = k_i.iter().map(|ki| fast_ab(x_dense, ki)).collect();
+        let hdiag_v = row_dots(&xk0);
+        let hdiag_g: Vec<Array1<f64>> = xka.iter().map(|xk| row_dots(xk)).collect();
+        let compute_hdiag_pair = |&(i, j): &(usize, usize)| -> Array1<f64> {
+            row_dots(&fast_ab(x_dense, &k_ij[i][j]))
+        };
+        let hdiag_pairs: Vec<Array1<f64>> = if fan_pairs {
+            use rayon::prelude::*;
+            h_pairs
+                .par_iter()
+                .map(|pair| gam_problem::with_nested_parallel(|| compute_hdiag_pair(pair)))
+                .collect()
+        } else {
+            h_pairs.iter().map(compute_hdiag_pair).collect()
+        };
+        let mut hdiag: Vec<Jet> = (0..n)
+            .map(|row| {
+                let mut jet = Jet::constant(hdiag_v[row], k);
+                for a in 0..k {
+                    jet.g[a] = hdiag_g[a][row];
                 }
+                jet
+            })
+            .collect();
+        for (&(i, j), diag) in h_pairs.iter().zip(hdiag_pairs.iter()) {
+            for (row, jet) in hdiag.iter_mut().enumerate() {
+                jet.h[[i, j]] = diag[row];
+                jet.h[[j, i]] = diag[row];
             }
-            hdiag.push(jet);
         }
         let mut cjet = Vec::with_capacity(n);
         let mut djet = Vec::with_capacity(n);
@@ -1972,19 +2128,15 @@ impl<'a> RemlState<'a> {
         }
         // `¹⁄₁₂ Σ_ij c_i c_j K_ij³` in second-order ρ-jets: through the design
         // tensor when that route was chosen and the ledger admits it, else by row
-        // pairs. Only `total.h` is returned, so the tensor route supplies the
+        // blocks. Only `total.h` is returned, so either route supplies the
         // ρ-Hessian block alone.
+        let c_v = Array1::from_shape_fn(n, |row| cjet[row].v);
+        let c_g = Array2::from_shape_fn((n, k), |(row, a)| cjet[row].g[a]);
+        let c_h = ndarray::Array3::from_shape_fn((n, k, k), |(row, a, b)| cjet[row].h[[a, b]]);
         let tensor_pairs = match route {
             TkRowPairRoute::RowPairs => None,
             TkRowPairRoute::Tensor => {
-                let c_v = Array1::from_shape_fn(n, |row| cjet[row].v);
-                let c_g = Array2::from_shape_fn((n, k), |(row, a)| cjet[row].g[a]);
-                let c_h = ndarray::Array3::from_shape_fn((n, k, k), |(row, a, b)| {
-                    cjet[row].h[[a, b]]
-                });
-                Self::tk_rho_hessian_pair_tensor(
-                    x_dense, &kmat_x, &ki_x, &k_ij, &c_v, &c_g, &c_h,
-                )?
+                Self::tk_rho_hessian_pair_tensor(x_dense, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)?
             }
         };
         let used_route = match tensor_pairs {
@@ -1993,52 +2145,53 @@ impl<'a> RemlState<'a> {
                 TkRowPairRoute::Tensor
             }
             None => {
-                for irow in 0..n {
-                    let xi = &rows[irow];
-                    for jrow in 0..n {
-                        // K xⱼ, Kᵢ xⱼ, Kᵢⱼ xⱼ are the hoisted row-local matvecs; the
-                        // remaining work is the O(p) dot xᵢ · (· xⱼ), evaluated in the
-                        // identical irow-outer/jrow-inner order as before (#1575).
-                        let mut kg = Jet::constant(xi.dot(&kmat_x[jrow]), k);
-                        for a in 0..k {
-                            kg.g[a] = xi.dot(&ki_x[a][jrow]);
-                        }
-                        for a in 0..k {
-                            for b in 0..k {
-                                kg.h[[a, b]] = kij_bilinear(a, b, xi, jrow);
-                            }
-                        }
-                        let term = cjet[irow]
-                            .mul(&cjet[jrow])
-                            .mul(&kg.cube())
-                            .scale(1.0 / 12.0);
-                        total = total.add(&term);
-                    }
-                }
+                total.h += &Self::tk_rho_hessian_pair_blocks(
+                    x_dense, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h,
+                )?;
                 TkRowPairRoute::RowPairs
             }
         };
-        let mut qjets: Vec<Jet> = (0..p).map(|_| Jet::constant(0.0, k)).collect();
+        // `⅛ qᵀ K q` for the jet vector `q = Xᵀ(c ∘ h)` and the jet matrix
+        // `(K, K_a, K_ab)`. With `q = (q_v, q_g, q_h)`, `u = K q_v` and
+        // `V[:, b] = K_b q_v`, the ρ-Hessian part of the product is
+        //
+        //   Σ_a q_h[a]·2u_a + q_vᵀ K_ab q_v + 2(q_gᵀV + Vᵀq_g) + 2 q_gᵀ K q_g,
+        //
+        // so it is a handful of GEMMs and `k²` quadratic forms rather than `p²`
+        // jet products.
+        let mut wh_v = Array1::<f64>::zeros(n);
+        let mut wh_g = Array2::<f64>::zeros((n, k));
+        let mut wh_h = Array2::<f64>::zeros((n, k * k));
         for row in 0..n {
             let wh = cjet[row].mul(&hdiag[row]);
-            for col in 0..p {
-                qjets[col] = qjets[col].add(&wh.scale(x_dense[[row, col]]));
+            wh_v[row] = wh.v;
+            wh_g.row_mut(row).assign(&wh.g);
+            wh_h.row_mut(row).assign(
+                &wh.h
+                    .into_shape_with_order(k * k)
+                    .expect("a standard-layout k×k jet Hessian flattens"),
+            );
+        }
+        let q_v = x_dense.t().dot(&wh_v);
+        let q_g = gam_linalg::faer_ndarray::fast_atb(x_dense, &wh_g);
+        let u = k_mat.dot(&q_v);
+        let v_mat = Array2::from_shape_fn((p, k), |(row, b)| k_i[b].row(row).dot(&q_v));
+        let qh_u = wh_h
+            .t()
+            .dot(&x_dense.dot(&u))
+            .into_shape_with_order((k, k))
+            .expect("a length-k² vector reshapes to k×k");
+        let qg_v = gam_linalg::faer_ndarray::fast_atb(&q_g, &v_mat);
+        let qg_k_qg = gam_linalg::faer_ndarray::fast_atb(&q_g, &fast_ab(&k_mat, &q_g));
+        let mut quadratic = &qh_u * 2.0 + &(&qg_v * 2.0) + &(&qg_v.t() * 2.0) + &(&qg_k_qg * 2.0);
+        for &(i, j) in &h_pairs {
+            let form = q_v.dot(&k_ij[i][j].dot(&q_v));
+            quadratic[[i, j]] += form;
+            if i != j {
+                quadratic[[j, i]] += form;
             }
         }
-        for a in 0..p {
-            for b in 0..p {
-                let mut kj = Jet::constant(k_mat[[a, b]], k);
-                for i in 0..k {
-                    kj.g[i] = k_i[i][[a, b]];
-                }
-                for i in 0..k {
-                    for j in 0..k {
-                        kj.h[[i, j]] = k_ij[i][j][[a, b]];
-                    }
-                }
-                total = total.add(&qjets[a].mul(&kj).mul(&qjets[b]).scale(0.125));
-            }
-        }
+        total.h += &(&quadratic * 0.125);
         if total.h.iter().any(|v| !v.is_finite()) {
             crate::bail_invalid_estim!(
                 "Tierney-Kadane analytic Hessian produced a non-finite entry"
@@ -2273,18 +2426,14 @@ impl<'a> RemlState<'a> {
             let beta = self.sparse_exact_beta_original(pirls_result);
             let firth_op = if reml_robust_jeffreys_link(&self.config).is_some() {
                 let jeffreys_link = self.runtime_inverse_link();
-                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                    Some(cached.clone())
-                } else {
-                    Some(std::sync::Arc::new(
-                        Self::build_firth_dense_operator_for_link(
-                            &jeffreys_link,
-                            x_dense.as_ref(),
-                            &pirls_result.final_eta.to_owned(),
-                            self.weights,
-                        )?,
-                    ))
-                }
+                Some(std::sync::Arc::new(
+                    Self::build_firth_dense_operator_for_link(
+                        &jeffreys_link,
+                        x_dense.as_ref(),
+                        &pirls_result.final_eta.to_owned(),
+                        self.weights,
+                    )?,
+                ))
             } else {
                 None
             };
@@ -2844,7 +2993,7 @@ impl<'a> RemlState<'a> {
     pub(crate) fn predict_warm_start_beta_joint_ift_with_outcome(
         &self,
         new_rho: &Array1<f64>,
-        max_dtheta_cap: f64,
+        trust_radius: Option<f64>,
     ) -> Option<(Coefficients, IftPredictionOutcome)> {
         let theta = self.pending_joint_ift_theta()?;
         let cache = {
@@ -2884,16 +3033,7 @@ impl<'a> RemlState<'a> {
                 d
             })
             .collect();
-        if !max_abs_dtheta.is_finite() || max_abs_dtheta > max_dtheta_cap {
-            log::debug!(
-                "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
-                max_abs_dtheta,
-                max_dtheta_cap,
-                cache.theta.len(),
-            );
-            return None;
-        }
-        if dtheta.iter().all(|d| *d == 0.0) {
+        if max_abs_dtheta.is_finite() && dtheta.iter().all(|d| *d == 0.0) {
             log::debug!(
                 "[IFT-NOOP] reason=all_dtheta_zero max_dtheta={:.3e} joint_dim={}",
                 max_abs_dtheta,
@@ -2903,6 +3043,17 @@ impl<'a> RemlState<'a> {
                 Coefficients::new(cache.beta_original),
                 IftPredictionOutcome::Noop,
             ));
+        }
+        // Beyond the measured trust radius the flat seed is the better one
+        // (see `WarmStartTrustState`).
+        if !max_abs_dtheta.is_finite() || trust_radius.is_some_and(|r| max_abs_dtheta >= r) {
+            log::debug!(
+                "[IFT-REJECTED] reason=large_dtheta max_dtheta={:.3e} cap={:.3e} joint_dim={}",
+                max_abs_dtheta,
+                trust_radius.unwrap_or(f64::INFINITY),
+                cache.theta.len(),
+            );
+            return None;
         }
 
         let solution_original = cache.mode_response_cols.dot(&dtheta);
@@ -2938,6 +3089,7 @@ impl<'a> RemlState<'a> {
             max_abs_dtheta,
             solution_original.dot(&solution_original).sqrt(),
         );
+        self.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, max_abs_dtheta);
         Some((
             Coefficients::new(predicted),
             IftPredictionOutcome::Predicted,
@@ -2985,7 +3137,7 @@ impl<'a> RemlState<'a> {
         // for noise-floor steps) must not collide with "no signal yet".
         self.last_pirls_accept_rho
             .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-        self.clear_ift_quality_runtime_state();
+        self.clear_warm_start_trust_state();
     }
 
     pub(crate) fn set_link_states(
@@ -4075,7 +4227,7 @@ impl<'a> RemlState<'a> {
                 BlockCorrectionDecision::AtFirstEngagedEvaluation,
             ),
             block_correction_axis_orders: std::sync::Mutex::new(None),
-            ift_quality_runtime: std::sync::Mutex::new(Default::default()),
+            warm_start_trust: std::sync::Mutex::new(Default::default()),
             ift_mode_response_slot: std::sync::Mutex::new(None),
             ift_joint_mode_response_slot: std::sync::Mutex::new(None),
             warm_start_enabled: AtomicBool::new(true),
@@ -4389,7 +4541,7 @@ impl<'a> RemlState<'a> {
         // routed dense logged nothing, so `penalized_hessian_too_dense` (a
         // density genuinely measured above the threshold) could not be told from
         // `design_not_sparse`, `constraints_present`,
-        // `firth_bias_reduction_active` or `sparse_stats_failed` — none of
+        // `firth_bias_reduction_active` — none of
         // which measures a density at all.
         // "Which side of SPARSE_HESSIAN_MAX_DENSITY does this design land on"
         // was therefore unanswerable from a log for exactly the shapes where it
@@ -4410,28 +4562,29 @@ impl<'a> RemlState<'a> {
                     key.clone(),
                     rows,
                     decision.clone(),
-                ) {
-                    Ok(bundle) => Ok(bundle),
-                    Err(err) => {
-                        log::debug!(
-                            "[reml-geometry] sparse_exact_spd failed ({}); falling back to dense spectral",
-                            err
-                        );
+                )? {
+                    Some(bundle) => Ok(bundle),
+                    None => {
+                        // P-IRLS routes its own linear solve and returned its
+                        // mode outside the sparse-native frame, so the sparse
+                        // exact system has no coordinates to be assembled in.
+                        // This is the only way the sparse builder declines. Every
+                        // error it raises (an inner-solve retreat, a non-SPD
+                        // factorization) propagates, so the outer loop sees it
+                        // instead of a second solve on another surface (#3636).
+                        //
                         // The bundle records the geometry it was BUILT with,
                         // and here that is not the routing verdict: the
                         // structural quantities still say sparse was the right
                         // route, so the label must carry the reason it was not
-                        // taken (#2465). A bundle stamped `sparse_exact_spd`
-                        // while holding a dense factorization, or stamped
-                        // `penalized_hessian_too_dense` when the density is
-                        // below the threshold, would both be labels that
-                        // contradict their own basis.
-                        let fallback = SparseRemlDecision {
+                        // taken (#2465).
+                        let rerouted = SparseRemlDecision {
                             geometry: RemlGeometry::DenseSpectral,
-                            reason: "sparse_exact_spd_assembly_failed",
+                            reason: "pirls_frame_not_sparse_native",
                             ..decision
                         };
-                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, fallback)
+                        log::debug!("[reml-geometry] dense_spectral {}", rerouted.basis());
+                        self.prepare_dense_eval_bundlewithkey(rho, key, rows, rerouted)
                     }
                 }
             }
@@ -5489,10 +5642,10 @@ impl<'a> RemlState<'a> {
     /// Returns `None` (caller falls back to tangent-line / flat warm-start) when:
     /// * the IFT cache is empty (no prior converged solve, or one was invalidated),
     /// * ρ has been stamped yet (length 0 — see `record_warm_start_rho`),
-    /// * Δρ is too aggressive for the linearized predictor to trust
-    ///   (max |Δρ_k| > 2.0 — i.e. a single penalty has moved by more than e²
-    ///   in λ-space, well outside the regime where the local linear Jacobian
-    ///   is descriptive),
+    /// * max |Δρ_k| reaches the IFT trust radius measured from this
+    ///   predictor's last error (`WarmStartTrustState`): past it the
+    ///   second-order error of the linearization exceeds the first-order
+    ///   error of the flat seed,
     /// * factorization or back-solve fails / produces non-finite output.
     ///
     /// The factor is cached at `self.ift_cached_factor` and reused across
@@ -5509,22 +5662,9 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        // The NaN sentinel + the is_finite() check together cover three
-        // cases in one expression: "no signal yet" (sentinel decodes to
-        // NaN, which fails is_finite), "corrupted state" (any non-finite
-        // or negative residual stored by mistake), and "real signal"
-        // (finite non-negative residual → Some).
-        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 {
-            Some(r)
-        } else {
-            None
-        };
-        let current_ift_step_cap = self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
+        let trust_radius = self.warm_start_trust_radius(WarmStartPredictionSource::Ift);
         if self.joint_ift_cache_matches_pending_theta(new_rho) {
-            return self
-                .predict_warm_start_beta_joint_ift_with_outcome(new_rho, current_ift_step_cap);
+            return self.predict_warm_start_beta_joint_ift_with_outcome(new_rho, trust_radius);
         }
         let cache_guard = self
             .ift_warm_start_cache
@@ -5533,8 +5673,8 @@ impl<'a> RemlState<'a> {
         let cache = cache_guard.as_ref()?;
         // Early short-circuit: detect both the no-op case (every
         // |Δρ_k| below the numerical-noise floor → predictor reduces
-        // to identity) AND the large-Δρ rejection case (|Δρ| exceeds
-        // the adaptive cap → predictor would reject) BEFORE acquiring
+        // to identity) AND the large-Δρ rejection case (|Δρ| reaches
+        // the measured trust radius → predictor would reject) BEFORE acquiring
         // the H_pen factor. The inner function detects both cases and
         // returns the same outcome, but only AFTER the factor cache
         // lookup — which on a miss pays a fresh O(p³)/3 Cholesky
@@ -5545,6 +5685,7 @@ impl<'a> RemlState<'a> {
         // ambiguous case (rho-not-stamped, dim mismatch) falls through
         // and lets the inner function emit its precise rejection
         // marker, preserving the single-source-of-truth contract.
+        let mut step = None;
         if !cache.rho.is_empty() && cache.rho.len() == new_rho.len() {
             let mut max_abs_drho = 0.0_f64;
             let mut any_non_finite = false;
@@ -5574,30 +5715,33 @@ impl<'a> RemlState<'a> {
                     IftPredictionOutcome::Noop,
                 ));
             }
-            // Large-Δρ rejection: |Δρ| exceeds the adaptive cap.
-            // `adaptive_ift_max_drho` reads the same `last_residual`
-            // signal we already loaded above. Same marker as the inner
-            // function emits so the rejection-rate aggregator
-            // (`_IFT_REJECTED_PATTERN` in runner.py) is preserved
-            // across both paths.
-            let max_drho_cap = current_ift_step_cap;
-            if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+            // Large-Δρ rejection: |Δρ| reaches the measured trust
+            // radius. Same marker as the inner function emits so the
+            // rejection-rate aggregator (`_IFT_REJECTED_PATTERN` in
+            // runner.py) is preserved across both paths.
+            if !max_abs_drho.is_finite() || trust_radius.is_some_and(|r| max_abs_drho >= r) {
                 log::debug!(
                     "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
                     max_abs_drho,
-                    max_drho_cap,
+                    trust_radius.unwrap_or(f64::INFINITY),
                     cache.rho.len(),
                 );
                 return None;
             }
+            step = Some(max_abs_drho);
         }
+        let stage = |prediction: Option<(Coefficients, IftPredictionOutcome)>| {
+            if let (Some((_, IftPredictionOutcome::Predicted)), Some(step)) = (&prediction, step) {
+                self.stage_warm_start_prediction_step(WarmStartPredictionSource::Ift, step);
+            }
+            prediction
+        };
         if let Some(rho_mode_response_cols) = self.cached_ift_rho_mode_response_cols(cache) {
             if let Some(prediction) = predict_warm_start_beta_ift_from_mode_response_cols(
                 cache,
                 new_rho,
                 self.p,
-                last_residual,
-                Some(current_ift_step_cap),
+                trust_radius,
                 &rho_mode_response_cols,
             ) {
                 log::debug!(
@@ -5605,7 +5749,7 @@ impl<'a> RemlState<'a> {
                     new_rho.len(),
                     self.p,
                 );
-                return Some(prediction);
+                return stage(Some(prediction));
             }
             log::trace!(
                 "[IFT-CACHE] outcome=mode_response_fallback drho_dim={} p={}",
@@ -5677,15 +5821,14 @@ impl<'a> RemlState<'a> {
                 }
             }
         };
-        predict_warm_start_beta_ift_inner_with_outcome(
+        stage(predict_warm_start_beta_ift_inner_with_outcome(
             cache,
             self.canonical_penalties.as_ref(),
             new_rho,
             self.p,
-            last_residual,
-            Some(current_ift_step_cap),
+            trust_radius,
             Some(factor_arc.as_ref()),
-        )
+        ))
     }
 
     /// Predict β at `new_rho` together with a tag identifying which
@@ -5693,12 +5836,9 @@ impl<'a> RemlState<'a> {
     /// extrapolation across the last two (ρ, β) pairs). Returns `None`
     /// when no predictor can be applied — the warm-start machinery is
     /// disabled, neither cache is populated, the ρ-step direction is
-    /// degenerate, or the extrapolation step `α` exceeds the adaptive
-    /// safety cap (default 1.5 — see `adaptive_tangent_alpha_cap` for
-    /// the residual-driven policy that loosens to 2.0 when prior IFT
-    /// predictions were excellent and tightens to 0.5 when the local
-    /// linear approximation has been shown to collapse toward flat
-    /// warm-start).
+    /// degenerate, or the secant position `|α + 1|` reaches the tangent
+    /// trust radius measured from that predictor's last error
+    /// (`WarmStartTrustState`).
     ///
     /// Callers fall back to the stored `warm_start_beta` (`β(ρ_k)` —
     /// the standard "use last β as-is" warm start) on `None`. So this
@@ -5715,15 +5855,10 @@ impl<'a> RemlState<'a> {
         if !self.warm_start_enabled.load(Ordering::Relaxed) {
             return None;
         }
-        if self.take_ift_quality_flat_override()
-            && let Some(cur_beta) = self
-                .warm_start_beta
-                .read()
-                .expect("warm-start beta lock poisoned")
-                .clone()
-        {
-            return Some((cur_beta, WarmStartPredictionSource::Flat));
-        }
+        // A step staged by an earlier call belongs to a prediction that
+        // never reached a converged solve; it must not be attributed to
+        // this one.
+        self.take_staged_warm_start_prediction_step();
         // #1082 / #1033: fixed-design non-Gaussian outer trials can reuse the
         // previous converged data-fit Gram for the next first Fisher step only
         // when the seed is exactly the previous beta. Prefer that flat seed once
@@ -5858,49 +5993,23 @@ impl<'a> RemlState<'a> {
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
-        // Don't extrapolate against the previous step direction (α<0).
-        // The upper cap is adaptive: the same IFT residual signal that
-        // drives `adaptive_ift_max_drho` (commit 06888a1e) and the cap-
-        // schedule margin (commit 4eb3686a) is the most direct proxy
-        // for "how trustworthy is the local linear approximation" —
-        // and the tangent-line predictor IS a local linear
-        // approximation (just along the previous ρ-step direction
-        // rather than the IFT Jacobian's full direction). When the
-        // most recent IFT prediction was excellent, the tangent
-        // approximation can be trusted for slightly larger α; when
-        // it was poor, tighten.
-        // Same NaN-sentinel discipline as the IFT predictor's reader
-        // — see the comment there for the encoding rationale.
-        let last_residual_bits = self.last_ift_prediction_residual.load(Ordering::Relaxed);
-        let r = f64::from_bits(last_residual_bits);
-        let last_residual = if r.is_finite() && r >= 0.0 {
-            Some(r)
-        } else {
-            None
-        };
-        let alpha_cap = adaptive_tangent_alpha_cap(last_residual);
-        if alpha <= 0.0 || alpha > alpha_cap {
+        // The secant through (ρ_prev, β_prev) and (ρ_cur, β_cur) is read at
+        // position 1 + α; it is the better seed while |α + 1| stays inside
+        // the measured tangent trust radius (see `WarmStartTrustState`).
+        // Interpolation (−1 < α < 0) and extrapolation are the same rule.
+        let secant_position = (alpha + 1.0).abs();
+        let trust_radius = self.warm_start_trust_radius(WarmStartPredictionSource::TangentLine);
+        if trust_radius.is_some_and(|r| secant_position >= r) {
             // Emit a structured reject marker so the bench runner can
             // count tangent-line rejections alongside IFT ones.
-            // Tangent-line only fires when IFT returned None for
-            // non-cache reasons (large Δρ, factor failed, etc.), so
-            // this represents the "linear predictor stack failed
-            // entirely → fall back to flat warm-start" case. Counting
-            // the rate at large scale tells us how often the warm-
-            // start is degenerating to flat after IFT rejects.
-            let reason = if alpha <= 0.0 {
-                "alpha_negative"
-            } else {
-                "alpha_above_cap"
-            };
             log::debug!(
-                "[TANGENT-REJECTED] reason={} alpha={:.3e} cap={:.3e}",
-                reason,
+                "[TANGENT-REJECTED] reason=alpha_beyond_trust_radius alpha={:.3e} cap={:.3e}",
                 alpha,
-                alpha_cap,
+                trust_radius.unwrap_or(f64::INFINITY),
             );
             return Some((cur_beta, WarmStartPredictionSource::Flat));
         }
+        let alpha_cap = trust_radius.unwrap_or(f64::INFINITY);
         // Tangent noop short-circuit: when α is below the
         // numerical-noise floor, `c + α · (c − pp) ≈ c` to machine
         // precision and the per-coefficient mat-add is wasted work.
@@ -5944,6 +6053,10 @@ impl<'a> RemlState<'a> {
             alpha_cap,
             step_dot_d.abs(),
             d_rho_norm_sq,
+        );
+        self.stage_warm_start_prediction_step(
+            WarmStartPredictionSource::TangentLine,
+            secant_position,
         );
         Some((
             Coefficients::new(predicted),
@@ -6546,7 +6659,6 @@ impl<'a> RemlState<'a> {
             h_total: Arc::new(h_total),
             sparse_exact: None,
             firth_dense_operator,
-            firth_dense_operator_original: None,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
@@ -6556,21 +6668,29 @@ impl<'a> RemlState<'a> {
         })
     }
 
+    /// The sparse exact-SPD bundle at `rho`, or `None` when the inner solve
+    /// returned its mode outside the sparse-native frame. P-IRLS routes its own
+    /// linear solve, so such a mode has no sparse exact system to assemble.
+    /// Every other failure is an error of this evaluation and is returned as one
+    /// (#3636).
     pub(super) fn prepare_sparse_eval_bundlewithkey(
         &self,
         rho: &Array1<f64>,
         key: Option<Vec<u64>>,
         rows: BundleRows,
         decision: SparseRemlDecision,
-    ) -> Result<EvalShared, EstimationError> {
+    ) -> Result<Option<EvalShared>, EstimationError> {
+        // Routing excludes constraints before choosing this backend. Refuse
+        // misuse here too: its Hessian contains no constraint curvature.
+        if self.linear_constraints.is_some() || self.coefficient_lower_bounds.is_some() {
+            crate::bail_invalid_estim!("sparse exact geometry does not support coefficient constraints");
+        }
         let (pirls_result, rows) = self.execute_pirls_if_needed(rho, rows)?;
         if !matches!(
             pirls_result.coordinate_frame,
             pirls::PirlsCoordinateFrame::OriginalSparseNative
         ) {
-            crate::bail_invalid_estim!(
-                "sparse exact geometry requires sparse-native PIRLS coordinates"
-            );
+            return Ok(None);
         }
         let x_sparse = self.x().as_sparse().ok_or_else(|| {
             EstimationError::InvalidInput(
@@ -6596,17 +6716,6 @@ impl<'a> RemlState<'a> {
                 cp.accumulate_weighted(&mut s_lambda, lambdas[k]);
             }
         }
-        // Add log-barrier Hessian diagonal for monotonicity-constrained
-        // coefficients (sparse path uses original coordinates).
-        if let Some(ref lin) = self.linear_constraints
-            && let Some(barrier_cfg) = Self::barrier_config_from_constraints(lin)
-        {
-            let beta_orig = self.sparse_exact_beta_original(pirls_result.as_ref());
-            if let Err(e) = barrier_cfg.add_barrier_hessian_diagonal(&mut s_lambda, &beta_orig) {
-                log::debug!("Sparse barrier Hessian diagonal skipped: {e}");
-            }
-        }
-
         let mut workspace = PirlsWorkspace::new(self.y.len(), self.p);
         // Gaussian-Identity fast path: reuse the per-RemlState `XᵀWX` cache
         // built once from constant weights. The outer REML loop never
@@ -6648,26 +6757,7 @@ impl<'a> RemlState<'a> {
         let logdet_s_pos = penalty_logdet.value();
         let (det1_values, _) =
             penalty_logdet.rho_derivatives_from_penalties(&applied_penalties, lambdas_slice);
-        // Built at every problem scale, for the same reason as the dense bundle:
-        // the inner solve carries Φ whenever Firth is requested (#825, #2900).
-        let firth_dense_operator_original = if let Some(jeffreys_link) =
-            reml_robust_jeffreys_link(&self.config)
-        {
-            let x_dense = self
-                .x()
-                .try_to_dense_arc("sparse exact REML runtime requires dense design for Firth operator")
-                .map_err(EstimationError::InvalidInput)?;
-            Some(Arc::new(Self::build_firth_dense_operator_for_link(
-                &jeffreys_link,
-                x_dense.as_ref(),
-                &pirls_result.final_eta.to_owned(),
-                self.weights,
-            )?))
-        } else {
-            None
-        };
-
-        Ok(EvalShared {
+        Ok(Some(EvalShared {
             key,
             pirls_result,
             rows,
@@ -6692,7 +6782,6 @@ impl<'a> RemlState<'a> {
                 }
             })),
             firth_dense_operator: None,
-            firth_dense_operator_original,
             penalty_pseudologdet: std::sync::OnceLock::new(),
             root_scale_hessian_operator: std::sync::OnceLock::new(),
             criterion_rank_decision: Arc::new(std::sync::OnceLock::new()),
@@ -6711,7 +6800,7 @@ impl<'a> RemlState<'a> {
             },
             penalty_scores_at_mode: std::sync::OnceLock::new(),
             block_local_correction: Default::default(),
-        })
+        }))
     }
 
     /// The inner P-IRLS iteration budget in force for one solve: the configured
@@ -6805,6 +6894,19 @@ impl<'a> RemlState<'a> {
             .as_ref()
             .map(|(c, _)| c.clone());
         let prediction_source = predicted_warm_start_with_source.as_ref().map(|(_, s)| *s);
+        // The flat seed the prediction competed with, kept so the converged
+        // β can measure which of the two was closer (the predictor's trust
+        // radius, `record_warm_start_prediction_error`).
+        let flat_seed_for_trust = match prediction_source {
+            Some(WarmStartPredictionSource::Ift) | Some(WarmStartPredictionSource::TangentLine) => {
+                self.warm_start_beta
+                    .read()
+                    .expect("warm-start beta lock poisoned")
+                    .clone()
+            }
+            Some(WarmStartPredictionSource::Flat) | None => None,
+        };
+        let trust_radius_before = self.warm_start_trust_radius(WarmStartPredictionSource::Ift);
         let cost_only_gaussian_rows = if rows == BundleRows::SufficientStatistics {
             self.gaussian_cost_only_frozen_rows_if_eligible()?
         } else {
@@ -7361,37 +7463,47 @@ impl<'a> RemlState<'a> {
                         let conv_norm = conv_sq.sqrt();
                         let pred_residual = diff_sq.sqrt();
                         let quality = pred_residual / (1.0 + conv_norm);
+                        // The same solve measures the predictor's trust
+                        // radius: its miss against the flat seed's miss, at
+                        // the step it was asked to take.
+                        let staged = self.take_staged_warm_start_prediction_step();
+                        let flat_residual = flat_seed_for_trust
+                            .as_ref()
+                            .filter(|flat| flat.0.len() == converged_original.len())
+                            .map(|flat| {
+                                flat.0
+                                    .iter()
+                                    .zip(converged_original.iter())
+                                    .map(|(f_val, c_val)| (c_val - f_val) * (c_val - f_val))
+                                    .sum::<f64>()
+                                    .sqrt()
+                            });
+                        let trust_radius = match (quality_source, staged, flat_residual) {
+                            (Some(source), Some((staged_source, step)), Some(flat_residual))
+                                if staged_source == source =>
+                            {
+                                self.record_warm_start_prediction_error(
+                                    source,
+                                    step,
+                                    pred_residual,
+                                    flat_residual,
+                                )
+                            }
+                            _ => None,
+                        };
                         if quality.is_finite() && quality >= 0.0 {
-                            // The adaptive |Δρ| cap is the IFT
-                            // predictor's own feedback loop, so only an
-                            // IFT accept reads and rewrites it. A
-                            // tangent-line accept is narrated but does
-                            // not touch the cap state: routing it here
-                            // would move solver trajectories, which is
-                            // a separate decision from restoring the
-                            // measurement. Its line therefore carries
-                            // no cap fields rather than reporting a cap
-                            // that does not govern that branch.
                             if matches!(quality_source, Some(WarmStartPredictionSource::Ift)) {
-                                let last_residual_bits =
-                                    self.last_ift_prediction_residual.load(Ordering::Relaxed);
-                                let r = f64::from_bits(last_residual_bits);
-                                let last_residual = if r.is_finite() && r >= 0.0 {
-                                    Some(r)
-                                } else {
-                                    None
-                                };
-                                let current_cap =
-                                    self.ift_quality_step_cap(adaptive_ift_max_drho(last_residual));
-                                let cap_predicted = self
-                                    .record_ift_prediction_quality(quality, current_cap)
-                                    .unwrap_or(current_cap);
+                                // `ift` is the radius this prediction was
+                                // admitted under, `cap_predicted` the radius
+                                // it measured for the next one.
+                                let admitted_under = trust_radius_before
+                                    .unwrap_or(f64::INFINITY);
                                 log::debug!(
                                     "[IFT-QUALITY] quality={:.3e} ift={:.3e} pred_residual={:.3e} cap_predicted={:.3e} iters={}",
                                     quality,
-                                    current_cap,
+                                    admitted_under,
                                     pred_residual,
-                                    cap_predicted,
+                                    trust_radius.unwrap_or(admitted_under),
                                     pirls_result.iteration,
                                 );
                                 self.last_ift_prediction_residual
@@ -7522,13 +7634,14 @@ impl<'a> RemlState<'a> {
                 self.last_pirls_lm_lambda.store(0, Ordering::Relaxed);
                 // A failed solve also invalidates the IFT residual
                 // signal — there's no meaningful "predicted vs
-                // converged" datum to feed back. Reset so the next
-                // predict call uses the default 2.0 cap. NaN
-                // sentinel rather than literal 0 — see
-                // `IFT_RESIDUAL_NO_SIGNAL_BITS`.
+                // converged" datum to feed back. NaN sentinel rather
+                // than literal 0 — see `IFT_RESIDUAL_NO_SIGNAL_BITS`.
+                // The staged prediction step is dropped for the same
+                // reason; the trust radii measured by earlier converged
+                // solves still describe this surface and are kept.
                 self.last_ift_prediction_residual
                     .store(IFT_RESIDUAL_NO_SIGNAL_BITS, Ordering::Relaxed);
-                self.clear_ift_quality_runtime_state();
+                self.take_staged_warm_start_prediction_step();
                 Err(EstimationError::PirlsDidNotConverge {
                     iterations: pirls_result.iteration,
                     budget: Self::effective_inner_iteration_budget(
@@ -7819,122 +7932,6 @@ mod scheduled_inner_cap_exhaustion_tests {
     }
 }
 
-/// Default cap on |Δρ_k| beyond which the IFT linear predictor rejects.
-/// Δρ = log(λ_new / λ_old); 2.0 corresponds to a 7.4× change in λ along
-/// any single penalty direction — well outside the regime where the local
-/// first-order Jacobian dβ/dρ is faithful. The cap is now ADAPTIVE: see
-/// `adaptive_ift_max_drho` for the empirical-quality-driven loosening /
-/// tightening policy. This default is used when no IFT-quality history
-/// is available yet (the first PIRLS solve at a fresh surface).
-pub(crate) const IFT_WARM_START_DEFAULT_MAX_DRHO: f64 = 2.0;
-
-/// Shared relative-residual tier breakpoints for the warm-start linear
-/// predictors. `r = ‖β_converged − β_predicted‖ / ‖β_converged‖` from the
-/// previous IFT prediction classifies the local linearization quality into
-/// five bands; both `adaptive_ift_max_drho` and `adaptive_tangent_alpha_cap`
-/// key off the SAME breakpoints so their caps move in lockstep (the two
-/// predictors share one quality signal). One step per decade of residual keeps
-/// the policy stable under noise.
-pub(crate) const IFT_RESIDUAL_TIER_EXCELLENT: f64 = 0.01;
-
-pub(crate) const IFT_RESIDUAL_TIER_VERY_GOOD: f64 = 0.05;
-
-pub(crate) const IFT_RESIDUAL_TIER_OK: f64 = 0.20;
-
-pub(crate) const IFT_RESIDUAL_TIER_MARGINAL: f64 = 0.50;
-
-/// Adaptive |Δρ| cap for the IFT predictor, driven by the residual of
-/// the previous IFT prediction (see `last_ift_prediction_residual`).
-///
-/// `last_residual = ‖β_converged − β_predicted‖ / ‖β_converged‖`:
-/// - `r < 0.01` → linearization was excellent; allow Δρ up to **4.0**
-///   (54× λ-step). At this regime the local Jacobian is faithful and
-///   tightening to 2.0 leaves performance on the table at large-scale Δρ
-///   magnitudes (where outer optimizers commonly take ρ-jumps of ~1).
-/// - `0.01 ≤ r < 0.05` → very good; modest expansion to **3.0**.
-/// - `0.05 ≤ r < 0.20` → ok; default **2.0** (the original constant).
-/// - `0.20 ≤ r < 0.50` → marginal; tighten to **1.0** (2.7× λ-step).
-/// - `r ≥ 0.50` → poor; tighten to **0.5** (1.6× λ-step). The IFT
-///   prediction is not paying off at large-scale Δρ; fall back to flat
-///   warm-start (β_cur) for any non-trivial outer step.
-/// - `None` → no signal yet (first PIRLS solve at this surface) → default 2.0.
-///
-/// The thresholds are deliberately one-step-per-decade-of-residual so
-/// the policy remains stable under noise; small fluctuations in
-/// `last_residual` don't whipsaw the cap.
-pub(crate) fn adaptive_ift_max_drho(last_residual: Option<f64>) -> f64 {
-    let Some(r) = last_residual else {
-        return IFT_WARM_START_DEFAULT_MAX_DRHO;
-    };
-    // Defensive: NaN or negative residuals indicate corrupted state
-    // (bit-pattern unpacking from the atomic encountered an unwritten
-    // slot, or norm-ratio division produced a non-physical value).
-    // Fall back to the documented default rather than committing to
-    // a tier based on garbage. Note: INFINITY is not rejected here —
-    // it represents a catastrophic prediction (predicted_norm finite
-    // but ‖Δβ‖ overflowed), so falling through to the catch-all 0.5
-    // (tightest cap) is the right policy.
-    if r.is_nan() || r < 0.0 {
-        return IFT_WARM_START_DEFAULT_MAX_DRHO;
-    }
-    match r {
-        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 4.0,
-        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 3.0,
-        r if r < IFT_RESIDUAL_TIER_OK => 2.0,
-        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
-        _ => 0.5,
-    }
-}
-
-/// Default upper cap on the tangent-line predictor's α (extrapolation
-/// fraction beyond the previous ρ-step). 1.5 means "we permit at most
-/// 50% extrapolation past the last step length"; the original hardcoded
-/// constant from commit dcacf9ee. Used when no IFT-quality history is
-/// available (typically right after the first successful PIRLS solve
-/// at a fresh surface — IFT cache exists but tangent-line history
-/// pair is being assembled). Adaptive policy in
-/// `adaptive_tangent_alpha_cap` adjusts this based on the IFT
-/// residual signal when present.
-pub(crate) const TANGENT_ALPHA_DEFAULT_CAP: f64 = 1.5;
-
-/// Adaptive α-cap for the tangent-line predictor, sharing the IFT
-/// residual signal as a proxy for "how trustworthy is the local linear
-/// approximation". The tangent line IS a local linear approximation
-/// (just along the previous ρ-step direction rather than the IFT
-/// Jacobian's full direction), so the same residual that gates
-/// `adaptive_ift_max_drho` informs the right cap here too:
-///
-/// - `r < 0.01`  → linearization excellent → α_cap = 2.0 (1.5×
-///                  the default; permits a full step beyond the
-///                  previous one)
-/// - `r < 0.05`  → very good → α_cap = 1.75
-/// - `r < 0.20`  → ok → α_cap = 1.5 (the original constant)
-/// - `r < 0.50`  → marginal → α_cap = 1.0 (no extrapolation past
-///                  the previous step length)
-/// - `r ≥ 0.50`  → poor → α_cap = 0.5 (only HALF the previous step;
-///                  the linear approximation has been shown to
-///                  collapse toward flat warm-start at this surface)
-/// - `None` (no signal yet) → default 1.5
-///
-/// Same tier-stable, monotone-non-increasing-in-residual shape as
-/// `adaptive_ift_max_drho`; the two predictors share a single quality
-/// signal so their caps move together.
-pub(crate) fn adaptive_tangent_alpha_cap(last_residual: Option<f64>) -> f64 {
-    let Some(r) = last_residual else {
-        return TANGENT_ALPHA_DEFAULT_CAP;
-    };
-    if r.is_nan() || r < 0.0 {
-        return TANGENT_ALPHA_DEFAULT_CAP;
-    }
-    match r {
-        r if r < IFT_RESIDUAL_TIER_EXCELLENT => 2.0,
-        r if r < IFT_RESIDUAL_TIER_VERY_GOOD => 1.75,
-        r if r < IFT_RESIDUAL_TIER_OK => 1.5,
-        r if r < IFT_RESIDUAL_TIER_MARGINAL => 1.0,
-        _ => 0.5,
-    }
-}
-
 /// What the IFT predictor's inner computation actually did with the
 /// β it returned. Surfaced by the inner predictor so callers don't
 /// need to re-derive noop-ness via O(p) array comparison against
@@ -7963,7 +7960,7 @@ pub(crate) enum IftPredictionOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WarmStartPredictionSource {
     /// The IFT predictor produced a non-identity β (the cache was
-    /// populated and Δρ stayed within the adaptive |Δρ| cap).
+    /// populated and the step stayed inside its measured trust radius).
     Ift,
     /// The tangent-line predictor produced a non-identity β (the IFT
     /// predictor returned None for non-cache reasons, so the
@@ -8025,8 +8022,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
     canonical_penalties: &[gam_terms::construction::CanonicalPenalty],
     new_rho: &Array1<f64>,
     p: usize,
-    last_ift_residual: Option<f64>,
-    max_drho_cap_override: Option<f64>,
+    trust_radius: Option<f64>,
     factor_override: Option<&dyn gam_linalg::matrix::FactorizedSystem>,
 ) -> Option<(Coefficients, IftPredictionOutcome)> {
     // Cache populated but ρ not yet stamped (happens between
@@ -8070,10 +8066,10 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         return None;
     }
 
-    // Δρ guard: reject in toto if any single component exceeds the cap.
-    // We do not partially clip: the directions we drop matter just as much
-    // as the directions we keep, and a clipped predictor is harder to
-    // reason about than a clean fallback.
+    // Trust-radius guard: beyond the measured radius (see
+    // `WarmStartTrustState`) the flat seed is the better one, so the
+    // prediction is rejected in toto. It is never partially clipped: a
+    // clipped step is not the first-order prediction the radius measures.
     let mut max_abs_drho = 0.0_f64;
     let model_upper_bounds = current_outer_rho_model_upper_bounds_for_ift();
     let upper_active = |idx: usize| -> bool {
@@ -8090,6 +8086,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
+                max_abs_drho = f64::INFINITY;
                 return f64::INFINITY;
             }
             if d.abs() > max_abs_drho {
@@ -8098,10 +8095,9 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
             d
         })
         .collect();
-    let max_drho_cap = max_drho_cap_override
-        .filter(|cap| cap.is_finite() && *cap > 0.0)
-        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
-    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+    if !max_abs_drho.is_finite()
+        || (max_abs_drho > 0.0 && trust_radius.is_some_and(|r| max_abs_drho >= r))
+    {
         // Emit a structured reject marker so the bench runner can
         // count predictor rejections alongside accepts (the
         // `[IFT-QUALITY]` markers count only the accepts). The
@@ -8112,7 +8108,7 @@ pub(crate) fn predict_warm_start_beta_ift_inner_with_outcome(
         log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
-            max_drho_cap,
+            trust_radius.unwrap_or(f64::INFINITY),
             k,
         );
         return None;
@@ -8306,8 +8302,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
     cache: &super::IftWarmStartCache,
     new_rho: &Array1<f64>,
     p: usize,
-    last_ift_residual: Option<f64>,
-    max_drho_cap_override: Option<f64>,
+    trust_radius: Option<f64>,
     rho_mode_response_cols: &Array2<f64>,
 ) -> Option<(Coefficients, IftPredictionOutcome)> {
     if cache.rho.is_empty() {
@@ -8350,6 +8345,7 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
             }
             let d = new_rho[i] - cache.rho[i];
             if !d.is_finite() {
+                max_abs_drho = f64::INFINITY;
                 return f64::INFINITY;
             }
             if d.abs() > max_abs_drho {
@@ -8358,14 +8354,13 @@ pub(crate) fn predict_warm_start_beta_ift_from_mode_response_cols(
             d
         })
         .collect();
-    let max_drho_cap = max_drho_cap_override
-        .filter(|cap| cap.is_finite() && *cap > 0.0)
-        .unwrap_or_else(|| adaptive_ift_max_drho(last_ift_residual));
-    if !max_abs_drho.is_finite() || max_abs_drho > max_drho_cap {
+    if !max_abs_drho.is_finite()
+        || (max_abs_drho > 0.0 && trust_radius.is_some_and(|r| max_abs_drho >= r))
+    {
         log::debug!(
             "[IFT-REJECTED] reason=large_drho max_drho={:.3e} cap={:.3e} drho_dim={}",
             max_abs_drho,
-            max_drho_cap,
+            trust_radius.unwrap_or(f64::INFINITY),
             k,
         );
         return None;
@@ -8662,14 +8657,22 @@ mod firth_hessian_direction_reuse_tests {
         .expect("tk hessian")
     }
 
-    // #2900: `tk_rho_hessian_pair_tensor` must reproduce the row-pair jet sum it
-    // replaces, `¹⁄₁₂ Σ_ij (c_i c_j K_ij³).h`, expanded here term for term with the
+    // #2900: `tk_rho_hessian_pair_tensor` and `tk_rho_hessian_pair_blocks` must
+    // both reproduce the row-pair jet sum they replace,
+    // `¹⁄₁₂ Σ_ij (c_i c_j K_ij³).h`, expanded here term for term with the
     // `Jet::mul` rule. The fixture is synthetic, and the reference is that block
     // alone, so agreement cannot be carried by other Hessian terms. The magnitude
     // floor keeps it from passing on zeros.
     #[test]
     fn tk_rho_hessian_pair_tensor_matches_the_row_pair_jet_sum_2900() {
-        let n = 30usize;
+        // 30 rows fit one `BASE_CHUNK` block; 300 rows span several row blocks
+        // and column tiles, including a ragged last tile.
+        for n in [30usize, 300] {
+            tk_rho_hessian_pair_routes_match_the_row_pair_jet_sum(n);
+        }
+    }
+
+    fn tk_rho_hessian_pair_routes_match_the_row_pair_jet_sum(n: usize) {
         let p = 4usize;
         let k = 2usize;
         let x = Array2::from_shape_fn((n, p), |(i, j)| {
@@ -8685,10 +8688,8 @@ mod firth_hessian_direction_reuse_tests {
         let k_ij: Vec<Vec<Array2<f64>>> = (0..k)
             .map(|a| (0..k).map(|b| sym(2.3 + (a + b) as f64, 0.1)).collect())
             .collect();
-        let kmat_x: Vec<Array1<f64>> = (0..n).map(|i| k_mat.dot(&x.row(i))).collect();
-        let ki_x: Vec<Vec<Array1<f64>>> = (0..k)
-            .map(|a| (0..n).map(|i| k_i[a].dot(&x.row(i))).collect())
-            .collect();
+        let xk0 = x.dot(&k_mat);
+        let xka: Vec<Array2<f64>> = k_i.iter().map(|ki| x.dot(ki)).collect();
         let c_v = Array1::from_shape_fn(n, |i| 0.2 + 0.1 * ((i as f64) * 0.61).sin());
         let c_g = Array2::from_shape_fn((n, k), |(i, a)| 0.05 * ((i as f64) * (a as f64 + 0.9)).cos());
         let c_h = ndarray::Array3::from_shape_fn((n, k, k), |(i, a, b)| {
@@ -8698,8 +8699,8 @@ mod firth_hessian_direction_reuse_tests {
         let mut reference = Array2::<f64>::zeros((k, k));
         for i in 0..n {
             for j in 0..n {
-                let kv = x.row(i).dot(&kmat_x[j]);
-                let ka: Vec<f64> = (0..k).map(|a| x.row(i).dot(&ki_x[a][j])).collect();
+                let kv = x.row(i).dot(&xk0.row(j));
+                let ka: Vec<f64> = (0..k).map(|a| x.row(i).dot(&xka[a].row(j))).collect();
                 let cc_v = c_v[i] * c_v[j];
                 let cc_g: Vec<f64> = (0..k).map(|a| c_g[[i, a]] * c_v[j] + c_v[i] * c_g[[j, a]]).collect();
                 for a in 0..k {
@@ -8722,19 +8723,23 @@ mod firth_hessian_direction_reuse_tests {
             }
         }
 
-        let tensor = RemlState::tk_rho_hessian_pair_tensor(&x, &kmat_x, &ki_x, &k_ij, &c_v, &c_g, &c_h)
+        let tensor = RemlState::tk_rho_hessian_pair_tensor(&x, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)
             .expect("tensor pair block")
             .expect("the ledger admits a 4-column design tensor");
-        for a in 0..k {
-            for b in 0..k {
-                let left = reference[[a, b]];
-                let right = tensor[[a, b]];
-                assert!(left.abs() > 1e-6, "reference[{a},{b}] = {left:e} is too small to compare");
-                let rel = (left - right).abs() / left.abs();
-                assert!(
-                    rel < 1e-10,
-                    "pair block[{a},{b}]: row-pair jets {left:.15e}, tensor {right:.15e}, rel {rel:e}"
-                );
+        let blocks = RemlState::tk_rho_hessian_pair_blocks(&x, &xk0, &xka, &k_ij, &c_v, &c_g, &c_h)
+            .expect("row-block pair block");
+        for (route, block) in [("tensor", &tensor), ("row blocks", &blocks)] {
+            for a in 0..k {
+                for b in 0..k {
+                    let left = reference[[a, b]];
+                    let right = block[[a, b]];
+                    assert!(left.abs() > 1e-6, "reference[{a},{b}] = {left:e} is too small to compare");
+                    let rel = (left - right).abs() / left.abs();
+                    assert!(
+                        rel < 1e-10,
+                        "n={n} pair block[{a},{b}]: row-pair jets {left:.15e}, {route} {right:.15e}, rel {rel:e}"
+                    );
+                }
             }
         }
     }
@@ -9277,3 +9282,7 @@ mod capped_request_cache_tests {
         assert_ne!(state.last_inner_iters.load(Ordering::Relaxed), untouched);
     }
 }
+
+#[cfg(test)]
+#[path = "sparse_refusal_tests.rs"]
+mod sparse_refusal_tests;

@@ -95,6 +95,7 @@ use faer::Side;
 use ndarray::{Array1, Array2};
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
+use gam_math::special::softplus;
 
 use super::{
     ConformalInterval, ExactGaussianFullConformal, FullConformalSet, required_dominating_count,
@@ -160,6 +161,10 @@ pub enum ConformalCertificate {
     /// The fitting map has no smoothing parameter to re-select, so the exact
     /// Layer-1 set at the stored penalty IS the honest set.
     ExactFrozen,
+    /// A numerical enclosure of the frozen-map rank set. Marginal coverage
+    /// is at least nominal under exchangeability and a fixed symmetric map;
+    /// unresolved comparisons can make the enclosure conservative.
+    ConservativeFrozen,
     /// The set of the REML re-selecting map, from the bound plus local refits.
     HonestRefit,
     /// The frozen-ρ set, carrying no finite-sample guarantee, and why.
@@ -167,22 +172,25 @@ pub enum ConformalCertificate {
 }
 
 impl ConformalCertificate {
-    /// `exact_frozen`, `honest_refit`, or `refused:<reason>`.
+    /// `exact_frozen`, `conservative_frozen`, `honest_refit`, or `refused:<reason>`.
     pub fn label(self) -> &'static str {
         match self {
             ConformalCertificate::ExactFrozen => "exact_frozen",
+            ConformalCertificate::ConservativeFrozen => "conservative_frozen",
             ConformalCertificate::HonestRefit => "honest_refit",
             ConformalCertificate::Refused(reason) => reason.label(),
         }
     }
 
     /// Numeric code for column output: `0` exact_frozen, `1` honest_refit,
+    /// `2` conservative_frozen,
     /// negative for a refusal (`-1` multi_penalty, `-2` unknown_penalty_structure,
     /// `-3` augmented_gram_singular, `-4` reml_undefined, `-5` refit_outside_tube, `-6` refit_failed,
     /// `-7` glm_frozen_penalty).
     pub fn code(self) -> i32 {
         match self {
             ConformalCertificate::ExactFrozen => 0,
+            ConformalCertificate::ConservativeFrozen => 2,
             ConformalCertificate::HonestRefit => 1,
             ConformalCertificate::Refused(reason) => reason.code(),
         }
@@ -336,15 +344,6 @@ fn logistic_pair(x: f64) -> (f64, f64) {
     if x >= 0.0 { (large, small) } else { (small, large) }
 }
 
-/// `ln(1 + eˣ)` without overflow or cancellation.
-fn softplus(x: f64) -> f64 {
-    if x > 0.0 {
-        x + (-x).exp().ln_1p()
-    } else {
-        x.exp().ln_1p()
-    }
-}
-
 impl Affine {
     /// `a·η + b·ζ` for the `z`-affine `a + b·z` on a chart where `η` and `ζ = zη`
     /// are affine in the chart variable.
@@ -352,7 +351,10 @@ impl Affine {
         let [a, b] = self.c;
         let [ma, mb] = self.m;
         Affine {
-            c: [a * chart.e[0] + b * chart.f[0], a * chart.e[1] + b * chart.f[1]],
+            c: [
+                a * chart.e[0] + b * chart.f[0],
+                a * chart.e[1] + b * chart.f[1],
+            ],
             m: [
                 ma * chart.e[0].abs() + mb * chart.f[0].abs(),
                 ma * chart.e[1].abs() + mb * chart.f[1].abs(),
@@ -421,9 +423,9 @@ impl Basis {
                 gram[[i, j]] += x_star[i] * x_star[j];
             }
         }
-        let chol = (&gram + s_lambda)
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("honest full conformal: augmented normal matrix not SPD: {e:?}"))?;
+        let chol = (&gram + s_lambda).cholesky(Side::Lower).map_err(|e| {
+            format!("honest full conformal: augmented normal matrix not SPD: {e:?}")
+        })?;
         let lower = chol.lower_triangular();
         let w = solve_lower_triangular(&lower, s_lambda);
         let congruence = symmetrized(&solve_lower_triangular(&lower, &w.t().to_owned()));
@@ -772,7 +774,12 @@ fn best_candidate(
     let candidates = boxes
         .iter()
         .flat_map(|&(a, b)| [a, 0.5 * (a + b), b])
-        .chain(seeds.iter().copied().filter(|&r| r >= lo_dom && r <= hi_dom));
+        .chain(
+            seeds
+                .iter()
+                .copied()
+                .filter(|&r| r >= lo_dom && r <= hi_dom),
+        );
     for rho in candidates {
         if let Some((value, ..)) = criterion_at(basis, data, rho, s) {
             if best.is_none_or(|(_, v)| value < v) {
@@ -853,7 +860,15 @@ fn prune(
 
 /// Whether the candidate `rho_best` beats every `ρ ∈ [r1, r2]` at every `z` of
 /// the cell by more than the rounding band: `V ≥ c·ln D(r1) + L(r2)` on the box.
-fn dominated(basis: &Basis, data: &ChartData, s1: f64, s2: f64, rho_best: f64, r1: f64, r2: f64) -> bool {
+fn dominated(
+    basis: &Basis,
+    data: &ChartData,
+    s1: f64,
+    s2: f64,
+    rho_best: f64,
+    r1: f64,
+    r2: f64,
+) -> bool {
     let (growth, c) = (basis.growth, basis.c);
     let log_det_best = basis.log_det_part(rho_best);
     let log_det2 = basis.log_det_part(r2);
@@ -899,19 +914,27 @@ enum Verdict {
     NonMember,
     /// Neither, with whether the rounding band alone kept it undecided (a
     /// breakpoint at the arithmetic's resolution, or an exact tie).
-    Undecided { band_limited: bool },
+    Undecided {
+        band_limited: bool,
+    },
 }
 
 /// One box's membership verdict over the cell: with the rounding band,
-/// without it, and at the box's centre alone (no `δ` radius, no band), and
-/// whether only comparisons blurred at the arithmetic's resolution keep it
-/// undecided.
+/// without it, and at the box's centre alone (no `δ` radius, no band), whether
+/// only comparisons blurred at the arithmetic's resolution keep it undecided,
+/// and whether some comparison it leaves open is held open by the box's own
+/// `δ`-width more than by the cell.
 #[derive(Clone, Copy, Debug)]
 struct BoxVerdict {
     banded: Option<bool>,
     exact: Option<bool>,
     centre: Option<bool>,
     resolution_limited: bool,
+    /// A resolvable open comparison whose enclosure's `δ`-width part exceeds
+    /// the range `m·p` covers over the cell. Halving the cell shrinks that
+    /// range but leaves the width part, so no `z`-split alone can close the
+    /// comparison; halving the box shrinks the width part.
+    width_dominated: bool,
 }
 
 impl BoxVerdict {
@@ -925,6 +948,15 @@ impl BoxVerdict {
     /// Undecided by a comparison that a narrower cell or box can resolve.
     fn width_limited(&self) -> bool {
         self.exact.is_none() && !self.resolution_limited
+    }
+
+    /// Undecided short of resolution with an open comparison that its
+    /// `ρ`-width dominates: bisecting the box, not only the cell, is what
+    /// narrows it. Near a breakpoint the centre is undecided too, so
+    /// `rho_limited` alone never narrows the tube there, and every `z`-half
+    /// inherits the same wide boxes (gam#3338).
+    fn width_dominated(&self) -> bool {
+        self.width_limited() && self.width_dominated
     }
 }
 
@@ -1014,6 +1046,7 @@ fn box_verdicts(
         let mut dominating = [0usize; 3];
         let mut uncertain = [0usize; 3];
         let mut resolvable = 0usize;
+        let mut width_dominated = false;
         for i in 0..n {
             let mut row = data.rows[i];
             let (mut width_m, mut width_p) = (0.0, 0.0);
@@ -1052,6 +1085,7 @@ fn box_verdicts(
             let blurred = lo.abs().max(hi.abs()) + width_part <= band + (remainder - width_part);
             if !blurred && matches!(compare(lo - remainder, hi + remainder, 0.0), Comparison::Uncertain) {
                 resolvable += 1;
+                width_dominated |= width_part > hi - lo;
             }
         }
         let decide = |slot: usize| {
@@ -1069,6 +1103,7 @@ fn box_verdicts(
             exact,
             centre: decide(2),
             resolution_limited: exact.is_none() && resolvable == 0,
+            width_dominated,
         });
     }
     out
@@ -1087,13 +1122,27 @@ fn compare(lo: f64, hi: f64, band: f64) -> Comparison {
 /// A bound on `|∂V/∂ρ|` over the box and the cell, or `None` where `D` is not
 /// bounded away from zero. `∂V/∂ρ = c·Σ_k γ_kδ_k τ_k² / D − Σ_k δ_k`, with `D`
 /// rising and `δ` falling in `ρ` and `γδ` unimodal.
-fn gradient_bound(basis: &Basis, data: &ChartData, s1: f64, s2: f64, r1: f64, r2: f64) -> Option<f64> {
+fn gradient_bound(
+    basis: &Basis,
+    data: &ChartData,
+    s1: f64,
+    s2: f64,
+    r1: f64,
+    r2: f64,
+) -> Option<f64> {
     gradient_range(basis, data, s1, s2, r1, r2).map(|(lo, hi)| lo.abs().max(hi.abs()))
 }
 
 /// An enclosure of `∂V/∂ρ` over the box and the cell, or `None` where `D` is
 /// not bounded away from zero.
-fn gradient_range(basis: &Basis, data: &ChartData, s1: f64, s2: f64, r1: f64, r2: f64) -> Option<(f64, f64)> {
+fn gradient_range(
+    basis: &Basis,
+    data: &ChartData,
+    s1: f64,
+    s2: f64,
+    r1: f64,
+    r2: f64,
+) -> Option<(f64, f64)> {
     let growth = basis.growth;
     let (sh1, sh2) = (basis.shrinkage(r1), basis.shrinkage(r2));
     let d_lo = quad_lower(&data.rss(&sh1), s1, s2, growth);
@@ -1106,8 +1155,19 @@ fn gradient_range(basis: &Basis, data: &ChartData, s1: f64, s2: f64, r1: f64, r2
         .iter()
         .map(|&l| curvature_range(r1 + l, r2 + l))
         .collect();
-    let f_lo = quad_lower(&data.weighted_tau_sq(ranges.iter().map(|&(lo, _)| lo)), s1, s2, growth).max(0.0);
-    let f_hi = quad_upper(&data.weighted_tau_sq(ranges.iter().map(|&(_, hi)| hi)), s1, s2, growth);
+    let f_lo = quad_lower(
+        &data.weighted_tau_sq(ranges.iter().map(|&(lo, _)| lo)),
+        s1,
+        s2,
+        growth,
+    )
+    .max(0.0);
+    let f_hi = quad_upper(
+        &data.weighted_tau_sq(ranges.iter().map(|&(_, hi)| hi)),
+        s1,
+        s2,
+        growth,
+    );
     let delta_sum = |sh: &[(f64, f64)]| sh.iter().map(|&(_, d)| d).sum::<f64>();
     let (fit_lo, shrink_hi) = (basis.c * f_lo / d_hi, delta_sum(&sh1));
     let (fit_hi, shrink_lo) = (basis.c * f_hi / d_lo, delta_sum(&sh2));
@@ -1123,7 +1183,14 @@ fn gradient_range(basis: &Basis, data: &ChartData, s1: f64, s2: f64, r1: f64, r2
 /// tied box's candidates from the best — the dominance test needs a gap wider
 /// than the same band — so which of them is the global minimizer is not
 /// determined in `f64`.
-fn ties(basis: &Basis, data: &ChartData, s1: f64, s2: f64, tube: &[RhoBox], rho_best: Option<f64>) -> Vec<bool> {
+fn ties(
+    basis: &Basis,
+    data: &ChartData,
+    s1: f64,
+    s2: f64,
+    tube: &[RhoBox],
+    rho_best: Option<f64>,
+) -> Vec<bool> {
     let Some(rho_best) = rho_best else {
         return vec![false; tube.len()];
     };
@@ -1161,9 +1228,11 @@ fn ties(basis: &Basis, data: &ChartData, s1: f64, s2: f64, tube: &[RhoBox], rho_
 
 /// The tube, its boxes' verdicts, and which boxes are tied at resolution, once
 /// refining `ρ` can no longer help: every untied box whose own `ρ`-width keeps
-/// it undecided is bisected and the tube pruned again. On a cell too narrow to
-/// bisect, every untied box undecided short of resolution is bisected, and so
-/// are untied boxes that disagree, so a candidate that is not a minimizer is
+/// it undecided — its centre is decided, or an open comparison's enclosure is
+/// wider through the box's `δ`-width than `m·p` varies over the cell — is
+/// bisected and the tube pruned again. On a cell too narrow to bisect, every
+/// untied box undecided short of resolution is bisected, and so are untied
+/// boxes that disagree, so a candidate that is not a minimizer is
 /// pruned away. A tied box is never split: no split can separate its
 /// candidates from the best. Every intermediate tube is valid, so the rule
 /// only decides the work.
@@ -1205,6 +1274,7 @@ fn settle(
                         dominated(basis, data, s1, s2, best, m, m)
                     });
                 !tie && (v.rho_limited()
+                    || v.width_dominated()
                     || (floor && v.width_limited())
                     || (disagree && v.exact.is_some())
                     || dominance_limited)
@@ -1251,7 +1321,11 @@ struct Retained {
 }
 
 /// The honest set as maximal intervals, and the number of cells examined.
-fn branch_and_bound(basis: &Basis, charts: &[ChartData], required: usize) -> (Vec<Retained>, usize) {
+fn branch_and_bound(
+    basis: &Basis,
+    charts: &[ChartData],
+    required: usize,
+) -> (Vec<Retained>, usize) {
     let mut stack = Vec::new();
     for (index, data) in charts.iter().enumerate() {
         for &(s1, s2) in Chart::root_cells(index) {
@@ -1505,7 +1579,11 @@ pub fn honest_full_conformal(
     };
     let frozen = basis.frozen_engine();
     if basis.ln_s.is_empty() {
-        return Ok(frozen_answer(frozen, ConformalCertificate::ExactFrozen, cost));
+        return Ok(frozen_answer(
+            frozen,
+            ConformalCertificate::ExactFrozen,
+            cost,
+        ));
     }
     let n = basis.n;
     let required = required_dominating_count(n, alpha);

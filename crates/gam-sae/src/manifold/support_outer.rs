@@ -935,12 +935,25 @@ impl SaeSupportOuterObjective {
                 }
             }
             let rank = self.spectrum.rank_by_group[group];
-            gradient[group] = 0.5
-                * (logdet_group_derivative - rank as f64 + energy[group] - profile_response);
-            // The same channels the REML engine publishes: the envelope penalty
-            // energy, the fixed-state `log|H|` derivative, the penalty
-            // pseudo-determinant's `rank`, and the profile response as the
-            // implicit correction folded in after them.
+            // The same channels the REML engine publishes, with the same
+            // meaning. `log|H|`'s total ρ-derivative is `tr(H⁻¹ dH/dρ_g)` with
+            // `dH/dρ_g = ∂H/∂ρ_g + D_θH[θ̂_ρ]`: the fixed-state half
+            // `logdet_group_derivative` is the FROZEN part, and the profile
+            // response `−<a, g_ρ>` is the MODE-RESPONSE part, the log
+            // determinant's move through the inner mode. Both belong to
+            // `logdet_h`. Nothing is folded in after the envelope (this lane
+            // charges its inexact inner mode through `inner_residual`, not
+            // through a gradient correction), so `total` is exactly
+            // `fixed_beta + logdet_h + logdet_s` and the certificate's `kkt`
+            // residual `total − envelope` is zero. Filing the profile response
+            // there instead made the decrement band charge a genuine gradient
+            // term as rounding error.
+            let frozen_logdet_h = 0.5 * logdet_group_derivative;
+            let mode_response_logdet_h = -0.5 * profile_response;
+            let logdet_h = frozen_logdet_h + mode_response_logdet_h;
+            let fixed_beta = 0.5 * energy[group];
+            let logdet_s = -0.5 * rank as f64;
+            gradient[group] = fixed_beta + logdet_h + logdet_s;
             let lambda = rho[group].exp();
             gradient_parts.push(RhoGradientParts {
                 index: group,
@@ -948,11 +961,11 @@ impl SaeSupportOuterObjective {
                 block_quadratic: energy[group] / lambda,
                 rank,
                 dim: beta_dim,
-                fixed_beta: 0.5 * energy[group],
-                logdet_h: 0.5 * logdet_group_derivative,
-                frozen_logdet_h: 0.5 * logdet_group_derivative,
-                mode_response_logdet_h: 0.0,
-                logdet_s: -0.5 * rank as f64,
+                fixed_beta,
+                logdet_h,
+                frozen_logdet_h,
+                mode_response_logdet_h,
+                logdet_s,
                 total: gradient[group],
             });
         }
@@ -1554,7 +1567,7 @@ pub struct SaeSupportSparseFit {
     /// support move re-routes rows among the retained atoms and can leave one with
     /// no row; that atom stays in the term, reconstructs nothing, and is recorded
     /// as a death at the end. So births are the retained atoms, deaths are every
-    /// requested atom not live at the end, and `pc_reseed_events` is `0`.
+    /// requested atom not live at the end.
     pub migration: SaeMigrationLedger,
 }
 
@@ -1687,12 +1700,10 @@ pub fn fit_sae_support_sparse(
         );
     }
     log::debug!(
-        "support-sparse migration ledger: {} births, {} deaths, {} refusals, {} \
-         principal-component reseeds",
+        "support-sparse migration ledger: {} births, {} deaths, {} refusals",
         migration.n_births,
         migration.n_deaths,
         migration.n_refusals,
-        migration.pc_reseed_events,
     );
     Ok(SaeSupportSparseFit {
         outer,
@@ -2160,6 +2171,64 @@ mod tests {
                 again.gradient[group]
             );
         }
+    }
+
+    /// The certificate reads `total − (fixed_beta + logdet_h + logdet_s)` as
+    /// the IFT/KKT correction folded in after the envelope and charges its
+    /// magnitude to the decrement band as error. This lane folds none in: its
+    /// inexact inner mode is charged through `inner_residual`. The profile
+    /// response is the log determinant's implicit move through the inner mode,
+    /// `½ tr(H⁻¹ D_θH[θ̂_ρ])`, the mode-response half of `logdet_h`, so it must
+    /// be published there. Filed in the `kkt` slot it widened every group's
+    /// gradient band by a genuine gradient term, and on a railed group a real
+    /// inward gradient read as within its band.
+    ///
+    /// The `total` is pinned against the refitted-value FD by #2634's oracle
+    /// and the frozen half against the frozen-state FD by #2576's, so the
+    /// partition asserted here makes the mode-response channel exactly their
+    /// difference.
+    #[test]
+    fn support_outer_gradient_parts_carry_the_profile_response_in_logdet_h() {
+        let mut objective = build_objective();
+        let rho = array![0.4_f64.ln(), 2.2_f64.ln()];
+        let evaluation = objective.evaluate(&rho).expect("support LAML evaluation");
+        assert_eq!(
+            evaluation.gradient_parts.len(),
+            evaluation.gradient.len(),
+            "every smoothing group publishes its parts"
+        );
+        let mut any_mode_response = false;
+        for part in &evaluation.gradient_parts {
+            let envelope = part.fixed_beta + part.logdet_h + part.logdet_s;
+            assert_eq!(
+                (part.total - envelope).to_bits(),
+                0.0_f64.to_bits(),
+                "group {}: no correction is folded in after the envelope, so the kkt \
+                 residual must be exactly zero (total {}, envelope {})",
+                part.index,
+                part.total,
+                envelope
+            );
+            assert_eq!(
+                part.total.to_bits(),
+                evaluation.gradient[part.index].to_bits(),
+                "group {}: the published total is the gradient the search descends",
+                part.index
+            );
+            assert_eq!(
+                (part.frozen_logdet_h + part.mode_response_logdet_h).to_bits(),
+                part.logdet_h.to_bits(),
+                "group {}: logdet_h is its frozen and mode-response halves",
+                part.index
+            );
+            any_mode_response |= part.mode_response_logdet_h != 0.0;
+        }
+        assert!(
+            any_mode_response,
+            "the fixture's inner mode moves with ρ, so some group's log determinant \
+             must carry a mode response: {:?}",
+            evaluation.gradient_parts
+        );
     }
 
     /// #2576's decisive oracle for the channel that REPLACED the Hutchinson

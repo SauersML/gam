@@ -35,10 +35,6 @@ cudarc.workspace = true
 
 [dev-dependencies]
 approx = "0.5.1"
-# Diagnostic-only: the `zz_measure` outer-trajectory probes read `opt`'s own
-# `log::` stream (line-search verdicts, trust-radius moves, stall exits), which
-# is otherwise dropped on the floor because the test harness installs no logger.
-env_logger = "0.11.11"
 gam-linalg-test-support = { path = "../gam-linalg-test-support" }
 # Test-only utilities used by the in-crate `#[cfg(test)]` suites carved out of
 # the root `gam` crate (#1521): `num-dual` for the autodiff jet cross-checks in

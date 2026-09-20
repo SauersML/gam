@@ -49,7 +49,7 @@ pub fn fit_input_fingerprint(
 
 /// The warm start a new fit of `formula` on `dataset` under `config` takes from
 /// the saved `model`. Refused by name when the model was fitted with another
-/// formula, was saved before points were recorded (refit it with this version), or
+/// formula, was saved at another payload version (refit it with this version), or
 /// comes from a route that records none.
 pub fn resolve_warm_start(
     model: &FittedModelPayload,
@@ -76,9 +76,7 @@ pub fn resolve_warm_start(
         .as_ref()
         .and_then(|fit| fit.artifacts.outer_warm_start.as_ref())
         .ok_or(WorkflowError::WarmStartRefused {
-            refusal: if model.version
-                <= crate::inference::model::OUTER_WARM_START_ABSENT_PAYLOAD_VERSION
-            {
+            refusal: if model.version != crate::inference::model::MODEL_PAYLOAD_VERSION {
                 WarmStartRefusal::RefitRequired {
                     payload_version: model.version,
                 }
