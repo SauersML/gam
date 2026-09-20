@@ -86,10 +86,6 @@ pub struct StandardFitRequest<'a> {
     pub offset: Arc<Array1<f64>>,
     pub spec: TermCollectionSpec,
     pub family: LikelihoodSpec,
-    /// Legacy request bit retained for source compatibility. Production
-    /// materialization always sets this to `false`; automatic Tweedie power
-    /// profiling is forbidden and bare Tweedie families are rejected.
-    pub estimate_tweedie_p: bool,
     pub options: FitOptions,
     pub kappa_options: SpatialLengthScaleOptimizationOptions,
     pub wiggle: Option<StandardBinomialWiggleConfig>,

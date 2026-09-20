@@ -905,3 +905,92 @@ fn at_an_inner_fixed_point_the_chart_orbit_slope_is_within_the_kkt_tolerance_272
         );
     }
 }
+
+/// Ledger classifications follow actual fission/fusion/death installation.
+/// Demotion preserves slots during a search round, so vector length alone is
+/// not an atom-death oracle.
+#[test]
+fn migration_ledger_tracks_installed_structure_moves() {
+    use crate::migration_ledger::{BirthSeed, MoveReason, SaeMigrationLedger, SaeMove};
+    use crate::structure_harvest::apply_structure_move;
+    use gam_solve::structure_search::{MoveRecord, MoveVerdict, SearchLedger, StructureMove};
+    use gam_terms::inference::structure_evidence::ClaimKind;
+    use std::collections::HashMap;
+
+    let target = planted_circle_cloud();
+    let term = seeded_term_of_kind(target.view(), "periodic", 1);
+    assert_eq!(term.k_atoms(), 1);
+    let rho = SaeManifoldRho::new(0.0, 0.0, vec![Array1::zeros(1)]);
+    let fission = StructureMove::Fission { atom: 0 };
+    let (split, split_rho) = apply_structure_move(&term, &rho, &fission, &[]).unwrap();
+    assert_eq!(split.k_atoms(), 2);
+    for row in 0..term.assignment.logits.nrows() {
+        // Assignment construction recenters the softmax gauge, so compare
+        // normalized relative mass rather than unnormalized exponentials.
+        assert!(
+            (split.assignment.logits[[row, 0]] - split.assignment.logits[[row, 1]]).abs() < 1e-14
+        );
+    }
+    let fusion = StructureMove::Fusion { a: 0, b: 1 };
+    let (fused, fused_rho) = apply_structure_move(&split, &split_rho, &fusion, &[]).unwrap();
+    assert_eq!(fused.k_atoms(), 2, "demotion preserves round-local indices");
+    for row in 0..term.assignment.logits.nrows() {
+        let combined = split.assignment.logits[[row, 0]] + std::f64::consts::LN_2;
+        assert!((fused.assignment.logits[[row, 0]] - combined).abs() < 1e-14);
+        assert!(fused.assignment.logits[[row, 1]] < split.assignment.logits[[row, 1]] - 20.0);
+    }
+    let death = StructureMove::Death { atom: 0 };
+    let (dead, _) = apply_structure_move(&fused, &fused_rho, &death, &[]).unwrap();
+    assert_eq!(dead.k_atoms(), 2);
+    for row in 0..term.assignment.logits.nrows() {
+        assert!(dead.assignment.logits[[row, 0]] < fused.assignment.logits[[row, 0]] - 20.0);
+    }
+    let mut ledger = SaeMigrationLedger::new();
+    for (round, mv) in [fission, fusion, death].into_iter().enumerate() {
+        let search = SearchLedger {
+            alpha: 0.05,
+            moves: vec![MoveRecord {
+                mv,
+                trigger: 0.0,
+                structure_hash: 0,
+                claim: ClaimKind::Custom {
+                    label: "installed move".into(),
+                },
+                verdict: MoveVerdict::Accepted {
+                    log_e: std::f64::consts::LN_2,
+                },
+            }],
+            collapse_events: Vec::new(),
+        };
+        ledger.record_search_round(round, &search, &HashMap::new());
+        assert_eq!(ledger.moves[round].round, Some(round));
+    }
+    assert_eq!(
+        (ledger.n_births, ledger.n_deaths, ledger.n_restructures),
+        (1, 2, 0)
+    );
+    assert!(matches!(
+        ledger.moves[0].kind,
+        SaeMove::Birth {
+            seed: BirthSeed::CurvedChart,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ledger.moves[1].kind,
+        SaeMove::Death {
+            reason: MoveReason::Fused,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ledger.moves[2].kind,
+        SaeMove::Death {
+            reason: MoveReason::DeadRouting,
+            ..
+        }
+    ));
+    let json = ledger.to_json();
+    assert_eq!(json["n_births"], 1);
+    assert_eq!(json["n_deaths"], 2);
+}

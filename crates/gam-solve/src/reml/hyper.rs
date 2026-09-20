@@ -1316,30 +1316,13 @@ impl<'a> RemlState<'a> {
         EstimationError,
     > {
         let t_tau = std::time::Instant::now();
-        // Guard: non-sparse tau coordinate construction requires dense design.
-        // Skip for large models that would blow memory.
+        // gam#2987: every builder below yields one coordinate per ψ direction.
+        // A design the process cannot densify is refused by the memory
+        // governor inside the builder, by name; the coordinates are never
+        // dropped, since that would hand the outer plan a ρ-only gradient for
+        // a [ρ, ψ] θ.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
-        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
-            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
-        {
-            log::debug!(
-                "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large; falling back to rho-only REML"
-            );
-            let identity_pair: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            let identity_pair2: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            return Ok((Vec::new(), identity_pair, identity_pair2, None));
-        }
         let backend_label;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             backend_label = "sparse_exact";
@@ -2283,22 +2266,16 @@ impl<'a> RemlState<'a> {
         let is_gaussian_identity = self.config.likelihood.spec.is_gaussian_identity();
         let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
         let firth_op_original = if let Some(jeffreys_link) = firth_jeffreys_link {
-            if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                Some(cached.as_ref().clone())
-            } else {
-                let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "sparse exact tau coords require dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                Some(Self::build_firth_dense_operator_for_link(
-                    &jeffreys_link,
-                    x_dense_arc.as_ref(),
-                    &pirls_result.final_eta.to_owned(),
-                    self.weights,
-                )?)
-            }
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc("sparse exact tau coords require dense design for Firth operator")
+                .map_err(EstimationError::InvalidInput)?;
+            Some(Self::build_firth_dense_operator_for_link(
+                &jeffreys_link,
+                x_dense_arc.as_ref(),
+                &pirls_result.final_eta.to_owned(),
+                self.weights,
+            )?)
         } else {
             None
         };
@@ -2497,23 +2474,20 @@ impl<'a> RemlState<'a> {
 
         let firth_jeffreys_link = super::outer_eval::reml_robust_jeffreys_link(&self.config);
         let firth_op = if let Some(jeffreys_link) = firth_jeffreys_link {
-            let op = if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                cached.as_ref().clone()
-            } else {
-                let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc(
+                    "build_tau_fixed_drift_deriv_original_basis requires dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            Some(std::sync::Arc::new(
                 Self::build_firth_dense_operator_for_link(
                     &jeffreys_link,
                     x_dense_arc.as_ref(),
                     &pirls_result.final_eta.to_owned(),
                     self.weights,
-                )?
-            };
-            Some(std::sync::Arc::new(op))
+                )?,
+            ))
         } else {
             None
         };
@@ -2662,25 +2636,20 @@ impl<'a> RemlState<'a> {
         let (firth_op_arc, x_tau_dense_list, x_tau_tau_dense) = if let Some(jeffreys_link) =
             firth_jeffreys_link
         {
-            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> =
-                if let Some(cached) = bundle.firth_dense_operator_original.as_ref() {
-                    Some(std::sync::Arc::new(cached.as_ref().clone()))
-                } else {
-                    let x_dense_arc = self
-                    .x()
-                    .try_to_dense_arc(
-                        "original-basis tau pair callbacks require dense design for Firth operator",
-                    )
-                    .map_err(EstimationError::InvalidInput)?;
-                    Some(std::sync::Arc::new(
-                        Self::build_firth_dense_operator_for_link(
-                            &jeffreys_link,
-                            x_dense_arc.as_ref(),
-                            &pirls_result.final_eta.to_owned(),
-                            self.weights,
-                        )?,
-                    ))
-                };
+            let x_dense_arc = self
+                .x()
+                .try_to_dense_arc(
+                    "original-basis tau pair callbacks require dense design for Firth operator",
+                )
+                .map_err(EstimationError::InvalidInput)?;
+            let op_opt: Option<std::sync::Arc<super::FirthDenseOperator>> = Some(
+                std::sync::Arc::new(Self::build_firth_dense_operator_for_link(
+                    &jeffreys_link,
+                    x_dense_arc.as_ref(),
+                    &pirls_result.final_eta.to_owned(),
+                    self.weights,
+                )?),
+            );
             let dense_list: Vec<Option<Array2<f64>>> = x_tau_terms
                 .iter()
                 .map(|t| match t {
@@ -3039,18 +3008,6 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
 
-        // Guard: SAS link ext coords require dense design materialization.
-        let n_x = pirls_result.x_transformed.nrows();
-        let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::debug!(
-                "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
-        }
-
         // Transformed design matrix (dense required for link-param B construction).
         let x_dense_arc = pirls_result
             .x_transformed
@@ -3240,18 +3197,6 @@ impl<'a> RemlState<'a> {
 
         let pirls_result = bundle.pirls_result.as_ref();
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-
-        // Guard: mixture link ext coords require dense design materialization.
-        let n_x = pirls_result.x_transformed.nrows();
-        let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::debug!(
-                "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
-        }
 
         let x_dense_arc = pirls_result
             .x_transformed

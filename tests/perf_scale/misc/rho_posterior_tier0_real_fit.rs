@@ -9,7 +9,8 @@
 //! that consume it (1-2) have a real entry point. It asserts the diagnostic is
 //! present and structurally sound, and that it is deterministic across identical
 //! fits. The diagnostic is not needed to build the returned fit, so a fit that
-//! does not request it (the formula and Python default) does not pay for it.
+//! does not request it (the formula and Python default) does not pay for it,
+//! and requesting it leaves the fitted model unchanged (#3010).
 
 use csv::StringRecord;
 use gam::estimate::FitOptions;
@@ -83,7 +84,7 @@ fn smooth_spec() -> TermCollectionSpec {
     }
 }
 
-fn fit_options() -> FitOptions {
+fn fit_options(request_rho_posterior: bool) -> FitOptions {
     FitOptions {
         resource_policy: gam_runtime::resource::ResourcePolicy::default_library(),
         latent_cloglog: None,
@@ -92,7 +93,7 @@ fn fit_options() -> FitOptions {
         sas_link: None,
         optimize_sas: false,
         compute_inference: true,
-        skip_rho_posterior_inference: false,
+        skip_rho_posterior_inference: !request_rho_posterior,
         max_iter: 30,
         tol: 1e-8,
         nullspace_dims: vec![],
@@ -103,9 +104,8 @@ fn fit_options() -> FitOptions {
     }
 }
 
-fn fit_and_take_adequacy(
-    seed: u64,
-) -> (f64, gam::inference::rho_posterior::RhoPosteriorAdequacy) {
+/// Fit `y ~ s(x)`, with rho-posterior inference requested or not.
+fn fit(seed: u64, request_rho_posterior: bool) -> gam::estimate::UnifiedFitResult {
     let (x, y) = build_data(seed);
     let weights = Array1::<f64>::ones(N);
     let offset = Array1::<f64>::zeros(N);
@@ -119,10 +119,16 @@ fn fit_and_take_adequacy(
             ResponseFamily::Gaussian,
             InverseLink::Standard(StandardLink::Identity),
         ),
-        &fit_options(),
+        &fit_options(request_rho_posterior),
     )
     .expect("gam fit");
-    let fit = fitted.fit;
+    fitted.fit
+}
+
+fn fit_and_take_adequacy(
+    seed: u64,
+) -> (f64, gam::inference::rho_posterior::RhoPosteriorAdequacy) {
+    let fit = fit(seed, true);
     let reml_score = fit
         .reml_score()
         .expect("the fit reports a REML/LAML criterion");
@@ -135,6 +141,38 @@ fn fit_and_take_adequacy(
         ),
     };
     (reml_score, adequacy)
+}
+
+/// #3010: requesting the seam changes nothing about the fitted model. The
+/// diagnostic runs outside the search's work accounting, so with the
+/// rho-posterior fields cleared the two fits serialize to the same bytes
+/// (`float_roundtrip` JSON writes each float's exact value).
+#[test]
+fn requesting_the_seam_leaves_the_fitted_model_unchanged_3010() {
+    init_parallelism();
+    let default_fit = fit(938_004, false);
+    let requested = fit(938_004, true);
+    assert_eq!(
+        default_fit.artifacts.rho_posterior,
+        RhoPosteriorOutcome::NotComputed(RhoPosteriorNotComputed::InferenceNotRequested),
+        "a fit that does not request the diagnostic does not run it"
+    );
+    assert!(default_fit.artifacts.rho_posterior_escalation.is_none());
+    assert!(
+        matches!(requested.artifacts.rho_posterior, RhoPosteriorOutcome::Assessed(_)),
+        "the requested seam grades the fit, got {:?}",
+        requested.artifacts.rho_posterior
+    );
+    let model_bytes = |fit: &gam::estimate::UnifiedFitResult| {
+        let mut model = fit.clone();
+        model.artifacts.rho_posterior = RhoPosteriorOutcome::default();
+        model.artifacts.rho_posterior_escalation = None;
+        serde_json::to_string(&model).expect("serialize the fitted model")
+    };
+    assert!(
+        model_bytes(&default_fit) == model_bytes(&requested),
+        "requesting the rho-posterior seam changed the fitted model"
+    );
 }
 
 /// The seam delivers: a real fit carries an Assessed Tier-0 outcome with a finite

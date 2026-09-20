@@ -89,8 +89,8 @@ pub(super) fn empirical_bms_fourth_jet_schedule(r: usize) -> EmpiricalBmsFourthJ
 /// `Arc::new`). Together with the joint-Hessian build this O(n·cells) rebuild is
 /// the bulk of biobank-fit wall-clock.
 ///
-/// This mirrors `custom_family::outer_objective::AssembledOperatorCache` one
-/// layer down: a module-level `OnceLock<Mutex<..>>`, FIFO capacity 2, keyed by a
+/// Like the custom-family `AssembledOperatorCache` one layer up, it is a
+/// module-level `OnceLock<Mutex<..>>` with FIFO capacity 2, here keyed by a
 /// content fingerprint over EXACTLY the build inputs. Reuse is gated on exact
 /// byte-equality of that fingerprint, so a hit returns an `Arc` to a cache that
 /// is bit-identical to a fresh rebuild — identical row contexts, cell moments,
@@ -2912,6 +2912,7 @@ impl BernoulliMarginalSlopeFamily {
         let mut tail = 0.0;
         let mut density = 0.0;
         let summands = cells.len() * exact_kernel::TERMINAL_GL_ORDER;
+        let mut tail_rounding = 0.0;
         for partition_cell in cells {
             let cell = partition_cell.cell;
             let state = self.evaluate_cell_moments_lru(
@@ -2923,6 +2924,7 @@ impl BernoulliMarginalSlopeFamily {
                 4,
             )?;
             tail += state.value;
+            tail_rounding += state.value_rounding;
             let (dc_da_raw, _) = exact_kernel::denested_cell_coefficient_partials(
                 partition_cell.score_span,
                 partition_cell.link_span,
@@ -2937,6 +2939,7 @@ impl BernoulliMarginalSlopeFamily {
             density,
             density_slope: None,
             summands,
+            tail_rounding,
         })
     }
 
@@ -3008,6 +3011,7 @@ impl BernoulliMarginalSlopeFamily {
             density,
             density_slope: Some(density_slope),
             summands: grid.nodes.len(),
+            tail_rounding: 0.0,
         })
     }
 
@@ -3448,7 +3452,7 @@ impl BernoulliInterceptSolveStats {
             self.seed_residual_le_1e10.fetch_add(1, Ordering::Relaxed);
         } else if abs <= SEED_RESIDUAL_BIN_EDGES[2] {
             self.seed_residual_le_1e8.fetch_add(1, Ordering::Relaxed);
-        } else if abs <= resolution {
+        } else if abs.is_finite() && abs <= resolution {
             self.seed_residual_le_resolution
                 .fetch_add(1, Ordering::Relaxed);
         } else {
@@ -5152,6 +5156,123 @@ mod empirical_flex_jet_oracle_tests {
         }
     }
 
+    /// gam#2922: past `r` directions the batched third contraction reads every
+    /// direction off the `r` axis contractions, and past `r(r+1)/2` pairs the
+    /// batched fourth reads every pair off the axis-pair contractions. With `r + 1`
+    /// directions and all their pairs, both requests are past those counts, so
+    /// both are read off the axes. Every result is compared with the per-direction
+    /// and per-pair contractions the batch replaces, at widths up to the #3011
+    /// repro's pair count.
+    #[test]
+    fn contractions_read_off_the_row_axes_match_the_per_pair_contractions_2922() {
+        for is_score_warp in [true, false] {
+            for r in [4_usize, 8, 18] {
+                let fixture = make_dimension_fixture(is_score_warp, r);
+                let (q, slope, beta, _) = fixture_state(&fixture);
+                let states = fixture_block_states(q, slope, &beta);
+                let cache = fixture
+                    .family
+                    .build_exact_eval_cache(&states)
+                    .expect("empirical FLEX axis-basis oracle cache");
+                assert_eq!(cache.primary.total, r);
+                let row_ctx = BernoulliMarginalSlopeFamily::row_ctx(&cache, 0);
+                let directions = (0..=r)
+                    .map(|lane| {
+                        Array1::from_shape_fn(r, |axis| {
+                            let magnitude = ((lane + 2) * (axis + 3) % 11 + 1) as f64 / 13.0;
+                            if (lane + axis) % 2 == 0 {
+                                magnitude
+                            } else {
+                                -0.6 * magnitude
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let pair_indices = (0..directions.len())
+                    .flat_map(|u| (u..directions.len()).map(move |v| (u, v)))
+                    .collect::<Vec<_>>();
+                assert!(
+                    directions.len() > r && pair_indices.len() > r * (r + 1) / 2,
+                    "control: the request must be past the axis counts"
+                );
+
+                let thirds = fixture
+                    .family
+                    .row_primary_third_contracted_many_with_moments(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &directions,
+                    )
+                    .expect("axis-basis empirical FLEX third contractions");
+                let mut third_scale = 0.0_f64;
+                for (lane, direction) in directions.iter().enumerate() {
+                    let single = fixture
+                        .family
+                        .row_primary_third_contracted(0, &states, &cache, row_ctx, direction)
+                        .expect("single empirical FLEX third contraction");
+                    third_scale = single
+                        .iter()
+                        .fold(third_scale, |m, value| m.max(value.abs()));
+                    assert_matrix_close(
+                        &format!("axis-basis third kind={is_score_warp} r={r} lane={lane}"),
+                        &single,
+                        &thirds[lane],
+                    );
+                }
+
+                let direction_pairs = pair_indices
+                    .iter()
+                    .map(|&(u, v)| (&directions[u], &directions[v]))
+                    .collect::<Vec<_>>();
+                let fourths = fixture
+                    .family
+                    .row_primary_fourth_contracted_many(
+                        0,
+                        &states,
+                        &cache,
+                        row_ctx,
+                        &direction_pairs,
+                    )
+                    .expect("axis-basis empirical FLEX fourth contractions");
+                let mut fourth_scale = 0.0_f64;
+                for (lane, &(direction_u, direction_v)) in direction_pairs.iter().enumerate() {
+                    let single = fixture
+                        .family
+                        .row_primary_fourth_contracted(
+                            0,
+                            &states,
+                            &cache,
+                            row_ctx,
+                            direction_u,
+                            direction_v,
+                        )
+                        .expect("single empirical FLEX fourth contraction");
+                    fourth_scale = single
+                        .iter()
+                        .fold(fourth_scale, |m, value| m.max(value.abs()));
+                    assert_matrix_close(
+                        &format!("axis-basis fourth kind={is_score_warp} r={r} lane={lane}"),
+                        &single,
+                        &fourths[lane],
+                    );
+                }
+                assert!(
+                    third_scale > 0.0 && fourth_scale > 0.0,
+                    "kind={is_score_warp} r={r}: the contractions carry no curvature \
+                     (third {third_scale:.3e}, fourth {fourth_scale:.3e})"
+                );
+                eprintln!(
+                    "#2922 axis basis kind={is_score_warp} r={r}: {} directions, {} pairs, \
+                     largest third {third_scale:.3e}, largest fourth {fourth_scale:.3e}",
+                    directions.len(),
+                    pair_indices.len(),
+                );
+            }
+        }
+    }
+
     /// gnomon#2337: the empirical calibration tail evaluator builds only the three
     /// observed channels it sums, and the row plan reads the root's node index `η`
     /// recorded by that evaluator instead of re-evaluating both spans of every node there.
@@ -5206,6 +5327,7 @@ mod empirical_flex_jet_oracle_tests {
                     density,
                     density_slope: Some(density_slope),
                     summands: fx.grid.nodes.len(),
+                    tail_rounding: 0.0,
                 }
             };
             let bits = |t: CalibrationTail| {
@@ -5348,6 +5470,72 @@ mod empirical_flex_jet_oracle_tests {
                 order_two_bits(&reference),
                 "kind={is_score_warp}: order-two row jet"
             );
+        }
+    }
+
+    /// gam#3216 (a), from PR #3374: the de-nested calibration tail charges its
+    /// cell integrators' own error bounds (the bivariate-normal bound of an
+    /// affine cell, Wilkinson's γ over the terminal rule for a curved one),
+    /// and a finite law, whose terms are each a positive probability to its own
+    /// relative accuracy, charges none. The kernel's bounds are pinned on one
+    /// affine and one curved cell.
+    #[test]
+    fn denested_tail_charges_its_cell_integrators_bounds_3216() {
+        use crate::cubic_cell_kernel::{
+            DenestedCubicCell, NON_AFFINE_VALUE_TERM_OPERATIONS, TERMINAL_GL_ORDER,
+            evaluate_cell_moments,
+        };
+        use gam_math::bivariate_normal::bivariate_normal_interval_probability;
+        use gam_math::roundoff::accumulation_growth;
+
+        let affine = DenestedCubicCell { left: -0.9, right: 0.8, c0: -6.5, c1: -0.35, c2: 0.0, c3: 0.0 };
+        let state = evaluate_cell_moments(affine, 2).expect("affine cell");
+        let s = affine.c1.hypot(1.0);
+        let expected = bivariate_normal_interval_probability(affine.c0 / s, affine.left, affine.right, -affine.c1 / s)
+            .expect("bivariate-normal interval");
+        assert_eq!(state.value.to_bits(), expected.value.to_bits());
+        assert!(state.value_rounding > 0.0 && state.value_rounding == expected.rounding);
+
+        let curved = DenestedCubicCell { left: -0.9, right: 0.8, c0: -2.5, c1: -0.35, c2: 0.2, c3: -0.05 };
+        let state = evaluate_cell_moments(curved, 2).expect("curved cell");
+        assert!(state.value > 0.0);
+        assert_eq!(
+            state.value_rounding,
+            accumulation_growth(TERMINAL_GL_ORDER + NON_AFFINE_VALUE_TERM_OPERATIONS) * state.value
+        );
+
+        for is_score_warp in [true, false] {
+            let fx = make_fixture(is_score_warp);
+            let dev_range = if is_score_warp {
+                fx.primary.h.clone().unwrap()
+            } else {
+                fx.primary.w.clone().unwrap()
+            };
+            let beta: Array1<f64> = Array1::from_iter(dev_range.enumerate().map(|(k, _)| fx.beta_dev[k]));
+            let (beta_h, beta_w) = if is_score_warp {
+                (Some(&beta), None)
+            } else {
+                (None, Some(&beta))
+            };
+            for a in [-1.3, 0.0, 0.8] {
+                for side in [true, false] {
+                    let cells = fx
+                        .family
+                        .evaluate_denested_calibration_tail(a, 0.35, beta_h, beta_w, side)
+                        .expect("denested calibration tail");
+                    assert!(
+                        cells.tail > 0.0 && cells.tail_rounding > 0.0 && cells.tail_rounding < cells.tail,
+                        "kind={is_score_warp} a={a} side={side}: tail {:e}, charged bound {:e}",
+                        cells.tail,
+                        cells.tail_rounding
+                    );
+                    let grid = fx
+                        .family
+                        .evaluate_empirical_grid_calibration_tail(a, 0.35, beta_h, beta_w, &fx.grid, side)
+                        .expect("grid calibration tail");
+                    assert_eq!(grid.tail_rounding, 0.0);
+                }
+            }
         }
     }
 

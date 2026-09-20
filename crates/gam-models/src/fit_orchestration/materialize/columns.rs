@@ -31,8 +31,9 @@ pub fn formula_columns(parsed: &ParsedFormula) -> Result<BTreeSet<String>, Workf
 
 /// Every column a formula fit reads: [`formula_columns`] of the main, noise and
 /// slope formulas and of a CTN stage-1 recipe, the z, weight, offset and
-/// noise-offset columns, the recipe's weight and offset columns, and the
-/// variables and `by=` columns of smooth overrides.
+/// noise-offset columns, the recipe's weight, offset, fold and group columns,
+/// a frozen CTN's inputs and response, and the variables and `by=` columns of
+/// smooth overrides.
 ///
 /// This is the fit's input contract. `gam fit` loads exactly these columns and
 /// the fit boundary validates exactly these, so a column the model never reads
@@ -66,6 +67,20 @@ pub fn fit_required_columns(
         required.extend(formula_columns(&parsed_stage1)?);
         required.extend(stage1.weight_column.iter().cloned());
         required.extend(stage1.offset_column.iter().cloned());
+        // The cross-fitting folds are read from these labels.
+        required.extend(stage1.fold_column.iter().cloned());
+        required.extend(stage1.group_column.iter().cloned());
+    }
+    // A frozen CTN's score is evaluated from its own inputs: its covariates,
+    // offset and the stage-1 response it transforms.
+    if let Some(frozen) = config.frozen_ctn.as_ref() {
+        let transform = crate::inference::model::FittedModel::from_payload((*frozen.0).clone());
+        required.extend(
+            transform
+                .prediction_required_columns()
+                .map_err(|reason| WorkflowError::InvalidConfig { reason })?,
+        );
+        required.insert(parse_formula(&transform.formula)?.response);
     }
     if let Some(descriptors) = config
         .smooth_overrides
@@ -132,10 +147,9 @@ pub(crate) fn resolve_continuous_column(
             // Row index is reported 1-based to match the rest of gam's data
             // validators (gam-data ingestion, gamfit `_tables.py`).
             let row = row_idx + 1;
-            return Err(WorkflowError::SchemaMismatch {
-                reason: format!(
-                    "{role} column '{column_name}' contains non-finite value at row {row}: {value}"
-                ),
+            return Err(WorkflowError::InvalidData {
+                column: column_name.to_string(),
+                problem: format!("is the {role} column and has non-finite value {value} at row {row}"),
             });
         }
     }
@@ -193,12 +207,12 @@ mod weight_row_index_tests {
         let nan = weight_dataset(&[1.0, 1.0, f64::NAN, 1.0, 1.0]);
 
         let neg_msg = match resolve_weight_column(&neg, &neg.column_map(), Some("w")) {
-            Err(WorkflowError::SchemaMismatch { reason }) => reason,
-            other => panic!("expected SchemaMismatch for negative weight, got {other:?}"),
+            Err(WorkflowError::InvalidData { column, problem }) if column == "w" => problem,
+            other => panic!("expected InvalidData for negative weight, got {other:?}"),
         };
         let nan_msg = match resolve_weight_column(&nan, &nan.column_map(), Some("w")) {
-            Err(WorkflowError::SchemaMismatch { reason }) => reason,
-            other => panic!("expected SchemaMismatch for non-finite weight, got {other:?}"),
+            Err(WorkflowError::InvalidData { column, problem }) if column == "w" => problem,
+            other => panic!("expected InvalidData for non-finite weight, got {other:?}"),
         };
 
         let neg_row = parsed_row(&neg_msg);
@@ -221,25 +235,98 @@ mod weight_row_index_tests {
         );
     }
 
-    /// An all-zero weight vector leaves the likelihood without a data term, so
-    /// it is rejected at the column boundary; a single positive weight is a
-    /// valid (if tiny) fit and passes.
+    /// Every row carrying zero weight leaves nothing in the likelihood; that
+    /// is a data error at the weight column, not a deep solver failure. A
+    /// single positive weight is a valid (if tiny) fit and passes.
     #[test]
-    fn all_zero_weights_are_rejected_at_the_column_boundary() {
+    fn all_zero_weights_are_rejected_as_invalid_data() {
         let zeros = weight_dataset(&[0.0, 0.0, 0.0, 0.0]);
-        let reason = match resolve_fit_weight_column(&zeros, &zeros.column_map(), Some("w")) {
-            Err(WorkflowError::SchemaMismatch { reason }) => reason,
-            other => panic!("expected SchemaMismatch for all-zero weights, got {other:?}"),
-        };
-        assert!(
-            reason.contains("at least one non-zero weight"),
-            "all-zero rejection must say what is required: {reason}"
-        );
+        match resolve_fit_weight_column(&zeros, &zeros.column_map(), Some("w")) {
+            Err(WorkflowError::InvalidData { column, problem }) => {
+                assert_eq!(column, "w");
+                assert!(problem.contains("no positive weight"), "{problem}");
+            }
+            other => panic!("expected InvalidData for all-zero weights, got {other:?}"),
+        }
 
         let one_positive = weight_dataset(&[0.0, 0.0, 2.5, 0.0]);
         let weights = resolve_fit_weight_column(&one_positive, &one_positive.column_map(), Some("w"))
-            .expect("a single positive weight is a valid weight column");
+            .expect("zero weights alongside a positive weight are valid exclusions");
         assert_eq!(weights.to_vec(), vec![0.0, 0.0, 2.5, 0.0]);
+    }
+}
+
+#[cfg(test)]
+mod ctn_reserved_columns_tests {
+    use super::*;
+    use crate::fit_orchestration::CtnStage1Recipe;
+    use crate::transformation_normal::TransformationNormalConfig;
+    use gam_data::{ColumnKindTag, DataSchema, SchemaColumn};
+    use ndarray::Array2;
+
+    fn ctn_config() -> FitConfig {
+        let mut recipe =
+            CtnStage1Recipe::new("pgs", "x", TransformationNormalConfig::default(), None, None)
+                .expect("valid stage-1 recipe");
+        recipe.fold_column = Some("fold".to_string());
+        recipe.group_column = Some("site".to_string());
+        FitConfig {
+            family: Some("bernoulli-marginal-slope".to_string()),
+            ctn_stage1: Some(recipe),
+            ..FitConfig::default()
+        }
+    }
+
+    /// The cross-fitting fold and group labels are inputs of a CTN chain: the
+    /// fit reads them to assign its folds.
+    #[test]
+    fn ctn_fold_and_group_columns_are_fit_inputs() {
+        let parsed = gam_terms::inference::formula_dsl::parse_formula("event ~ age")
+            .expect("formula parses");
+        let required = fit_required_columns(&parsed, &ctn_config()).expect("required columns");
+        for name in ["event", "age", "pgs", "x", "fold", "site"] {
+            assert!(required.contains(name), "'{name}' missing from {required:?}");
+        }
+    }
+
+    /// `.` stands for the columns no other part of the fit reads, so it must
+    /// not turn the CTN's fold or group labels into outcome covariates.
+    #[test]
+    fn automatic_term_leaves_ctn_fold_and_group_columns_out() {
+        let headers: Vec<String> = ["event", "age", "pgs", "x", "fold", "site"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let n = 40;
+        let values = Array2::from_shape_fn((n, headers.len()), |(row, column)| match column {
+            0 => (row % 2) as f64,
+            1 => 20.0 + row as f64 * 1.37,
+            2 => (row as f64 * 0.61).sin(),
+            3 => row as f64 / n as f64,
+            4 => (row % 5) as f64,
+            _ => (row % 8) as f64 * 1.5,
+        });
+        let data = Dataset {
+            headers: headers.clone(),
+            values,
+            schema: DataSchema {
+                columns: headers
+                    .iter()
+                    .map(|name| SchemaColumn {
+                        name: name.clone(),
+                        kind: ColumnKindTag::Continuous,
+                        levels: vec![],
+                    })
+                    .collect(),
+            },
+            column_kinds: vec![ColumnKindTag::Continuous; headers.len()],
+        };
+        let expanded = expand_automatic_fit_formula("event ~ .", &data, &ctn_config())
+            .expect("automatic formula expands")
+            .formula;
+        assert!(expanded.contains("age"), "{expanded}");
+        assert!(!expanded.contains("fold"), "fold labels became a covariate: {expanded}");
+        assert!(!expanded.contains("site"), "group labels became a covariate: {expanded}");
     }
 }
 
@@ -263,17 +350,18 @@ pub fn resolve_weight_column(
         return Ok(Array1::ones(data.values.nrows()));
     };
     let values = resolve_continuous_column(data, col_map, column_name, "weights")?;
-    for (row_idx, value) in values.iter().enumerate() {
-        if *value < 0.0 {
-            // Row index is reported 1-based to match the rest of gam's data
-            // validators (gam-data ingestion, gamfit `_tables.py`).
-            let row = row_idx + 1;
-            return Err(WorkflowError::SchemaMismatch {
-                reason: format!(
-                    "weights column '{column_name}' must be non-negative; found {value} at row {row}"
-                ),
-            });
-        }
+    // A prior weight scales its row's log-likelihood contribution, so it must
+    // be non-negative; a zero weight excludes the row. Non-finite weights are
+    // rejected by `resolve_continuous_column` / the gam-data fit boundary.
+    // Row indices are 1-based to match the rest of gam's data validators.
+    if let Some((row_idx, value)) = values.iter().enumerate().find(|(_, v)| **v < 0.0) {
+        return Err(WorkflowError::InvalidData {
+            column: column_name.to_string(),
+            problem: format!(
+                "is a prior-weight column and must be non-negative; found {value} at row {}",
+                row_idx + 1
+            ),
+        });
     }
     Ok(values)
 }
@@ -294,13 +382,20 @@ pub fn resolve_fit_weight_column(
     // prior alone. Reject it here rather than let the REML outer search fail
     // on an objective with no data in it.
     if !values.iter().any(|value| *value > 0.0) {
-        return Err(WorkflowError::SchemaMismatch {
-            reason: format!(
-                "weights column '{column_name}' must contain at least one non-zero weight; \
-                 all {} weights are zero",
-                values.len()
-            ),
-        });
+        return Err(no_positive_weight_error(column_name, values.len()));
     }
     Ok(values)
+}
+
+/// The data error for a prior-weight column that excludes every one of its
+/// `nrows` rows; shared by the fit-time weight resolver and the zero-weight
+/// row seam so both report the same typed error.
+pub(crate) fn no_positive_weight_error(column_name: &str, nrows: usize) -> WorkflowError {
+    WorkflowError::InvalidData {
+        column: column_name.to_string(),
+        problem: format!(
+            "is a prior-weight column with no positive weight; a zero weight \
+             excludes its row, so all {nrows} rows would be excluded from the likelihood"
+        ),
+    }
 }
