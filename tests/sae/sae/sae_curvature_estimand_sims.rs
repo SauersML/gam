@@ -337,9 +337,18 @@ fn response_curvature_profile_ci_covers_at_nominal_rate() {
 ///
 /// SIZE: at κ⋆ = 0 the interior χ²₁ LR test must reject flatness at ≈ α = 0.05.
 /// Across `R` flat clouds we count rejections (lr > χ²_{1,.95}) and assert the
-/// empirical size ≤ 0.25 — generous for the replicate count but far below the
-/// ≈ 1.0 a broken/degenerate test would show; this is the "not wildly mis-sized"
-/// guarantee the issue asks for.
+/// empirical size ≤ 0.175, which catches an anticonservative test.
+///
+/// CALIBRATION of the null statistic itself, which catches a CONSERVATIVE test. A
+/// size bound alone cannot see one: a statistic shrunk toward zero (a criterion
+/// that flattens in κ, an LR built from the wrong evidence, a κ̂ stuck at 0)
+/// rejects less often than α and passes `size ≤ 0.175` all the way down to
+/// size 0. Under H₀ with κ = 0 interior, Wilks gives `lr ~ χ²₁`, so
+/// `E[lr] = 1` and `Var[lr] = 2`. The mean of `R` independent null statistics
+/// therefore has standard deviation `√(2/R)`, and the gate is
+/// `|mean(lr) − 1| ≤ 4·√(2/R)`. The bar is derived from the reference
+/// distribution, not tuned; its two-sided false-alarm rate is about 6·10⁻⁵.
+/// It uses the same `R` fits the size count already pays for.
 ///
 /// POWER: at |κ⋆| = 4 the test must REJECT flatness; we assert empirical power
 /// ≥ 0.60, the complementary statement that curvature is detected when present.
@@ -357,24 +366,38 @@ fn response_curvature_flatness_test_holds_size_and_has_power() {
 
     // ── SIZE at the flat null κ⋆ = 0 ──────────────────────────────────────────
     let mut rejections = 0usize;
+    let mut null_lr_sum = 0.0_f64;
     for r in 0..replicates {
         let seed = 0x512E_0000_0000_0000 ^ ((r as u64).wrapping_mul(0x9E37_79B9) + 1);
         let values = synth_cloud(DIM, 0.0, n, SIGMA, seed);
         let fit = fit_response_curvature(values.view(), DIM, LEVEL)
             .expect("response curvature fit (flat)");
+        null_lr_sum += fit.flatness.lr_stat;
         if fit.flatness.lr_stat > CHI2_1_95 {
             rejections += 1;
         }
     }
     let size = rejections as f64 / replicates as f64;
+    let null_lr_mean = null_lr_sum / replicates as f64;
+    let null_lr_mean_sd = (2.0 / replicates as f64).sqrt();
     println!(
         "\n#944 flatness test SIZE @ κ⋆=0 (dim={DIM}, n={n}, σ={SIGMA}, R={replicates}): \
-         {rejections}/{replicates} = {size:.3} (nominal α=0.05)"
+         {rejections}/{replicates} = {size:.3} (nominal α=0.05); mean null lr = \
+         {null_lr_mean:.3} (χ²₁ mean 1, sd of the R-mean {null_lr_mean_sd:.3})"
     );
     assert!(
         size <= 0.175,
         "flatness test mis-sized at κ⋆=0: empirical size {size:.3} ≫ α=0.05 (>0.175, ~5 MC-se \
          above nominal) — spurious rejection of flat data"
+    );
+    assert!(
+        (null_lr_mean - 1.0).abs() <= 4.0 * null_lr_mean_sd,
+        "flatness LR statistic is not χ²₁ under the flat null: mean lr over {replicates} flat \
+         clouds is {null_lr_mean:.4}, but E[χ²₁] = 1 with the R-mean's sd √(2/R) = \
+         {null_lr_mean_sd:.4}, so |mean − 1| must be ≤ 4·sd = {:.4}. A mean below that band \
+         is a CONSERVATIVE test (p-values too large), which the one-sided size bound cannot \
+         see; a mean above it is an anticonservative one.",
+        4.0 * null_lr_mean_sd
     );
 
     // ── POWER at the strongly-curved alternatives |κ⋆| = 4 ────────────────────
