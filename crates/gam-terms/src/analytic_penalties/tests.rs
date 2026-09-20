@@ -2881,3 +2881,163 @@ fn row_precision_prior_reads_the_symmetric_part_of_its_precision_2469() {
     let refused = RowPrecisionPriorPenalty::new(target, singular_part, 1.3, 2, true);
     assert!(refused.unwrap_err().contains("must be positive definite"));
 }
+
+// ----- IvaeRidgeMeanGauge tests -----
+
+/// The iVAE ridge gauge had no Rust test of `hvp`, `grad_rho`, `as_dense`,
+/// `diag_target` or its frozen operator. The only check was a Python
+/// value -> grad test with a fixed weight and `ε = 1e-6`. At that ε the ridge
+/// hat matrix `P = U(UᵀU + εI)⁻¹Uᵀ` is almost idempotent, so it could not tell
+/// `tᵀ(I - P)t` from `||t - Pt||²`. Here `ε = 0.5` separates the two by about
+/// 15%. The value is pinned against the minimized ridge objective
+/// `0.5 μ (||T - UB̂||² + ε||B̂||²)`, with `B̂` solved by an explicit 2 × 2
+/// inverse that is independent of the penalty's eigendecomposition. The test
+/// then checks value -> `grad_target`, `grad_target` -> `hvp`, value ->
+/// `grad_rho` (learnable log-weight), the `as_dense` columns against `hvp`, and
+/// `diag_target` and the frozen operator against the dense matrix. It also
+/// checks that the curvature `μ(I - P) ⊗ I_d` is symmetric positive definite.
+///
+/// Tolerances. The value is quadratic in `t`, so the central stencil has no
+/// truncation error in `t`. Only rounding remains, about
+/// `ε_mach |f| / h ≈ 2.2e-16 · 2 / 1e-5 ≈ 4e-11`. In ρ the value is
+/// `0.5 w₀ e^ρ A - 0.5 N ln(w₀ e^ρ)`. Its third ρ-derivative is
+/// `0.5 w₀ e^ρ A ≲ 1`, so the truncation error is `h²/6 ≈ 2e-11`. A `1e-8`
+/// tolerance leaves more than 100× margin. The dense, diagonal and `hvp`
+/// channels all apply the same `P` entries, so they agree to rounding (`1e-12`
+/// relative). The ridge-objective check is a reassociation of the same sums,
+/// hence `1e-12` relative. The curvature eigenvalues lie in
+/// `[μ ε / (σ_max² + ε), μ] ≈ [0.059, 0.86]`. With `λ = 0.3`, each `log` in
+/// `log det` carries about `ε_mach · 1.2 / 0.3`, so `1e-10 · max(|log det|, 1)`
+/// leaves several orders of margin.
+#[test]
+fn ivae_ridge_mean_gauge_is_the_ridge_objective_and_its_derivatives_match_central_differences() {
+    let (n_eff, d, q) = (6usize, 2usize, 2usize);
+    let n = n_eff * d;
+    let ridge_eps = 0.5;
+    let w0 = 0.7;
+    let h = 1e-5;
+    let tol = 1e-8;
+    let lambda = 0.3;
+    let aux = Array2::from_shape_fn((n_eff, q), |(row, col)| {
+        if col == 0 {
+            1.0
+        } else {
+            0.8 * (0.7 * row as f64 + 0.2).sin()
+        }
+    });
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.45 * (1.1 * x + 0.3).cos() + 0.07 * x
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.5 * (0.8 * i as f64 + 1.0).sin());
+
+    let fixed = IvaeRidgeMeanGauge::new(
+        PsiSlice::full(n, Some(d)),
+        aux.clone(),
+        ridge_eps,
+        w0,
+        n_eff,
+        false,
+    )
+    .expect("fixed-weight iVAE gauge");
+    let gram = aux.t().dot(&aux) + ridge_eps * Array2::<f64>::eye(q);
+    let det = gram[[0, 0]] * gram[[1, 1]] - gram[[0, 1]] * gram[[1, 0]];
+    let gram_inv = array![
+        [gram[[1, 1]] / det, -gram[[0, 1]] / det],
+        [-gram[[1, 0]] / det, gram[[0, 0]] / det]
+    ];
+    let t_mat = t
+        .clone()
+        .into_shape_with_order((n_eff, d))
+        .expect("row-major latent");
+    let b_hat = gram_inv.dot(&aux.t().dot(&t_mat));
+    let fit_residual = &t_mat - &aux.dot(&b_hat);
+    let ridge_objective = 0.5
+        * w0
+        * (fit_residual.iter().map(|x| x * x).sum::<f64>()
+            + ridge_eps * b_hat.iter().map(|x| x * x).sum::<f64>());
+    let empty_rho = Array1::<f64>::zeros(0);
+    let fixed_value = fixed.value(t.view(), empty_rho.view());
+    assert_abs_diff_eq!(
+        fixed_value,
+        ridge_objective,
+        epsilon = 1e-12 * ridge_objective.abs()
+    );
+    assert_eq!(fixed.grad_rho(t.view(), empty_rho.view()).len(), 0);
+
+    let pen = IvaeRidgeMeanGauge::new(PsiSlice::full(n, Some(d)), aux, ridge_eps, w0, n_eff, true)
+        .expect("learnable iVAE gauge");
+    let rho = array![0.2_f64];
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1, "one learnable log-weight");
+    let fd_rho = (pen.value(t.view(), array![0.2 + h].view())
+        - pen.value(t.view(), array![0.2 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let dense = pen.as_dense(t.view(), rho.view());
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "the gauge curvature must be nonzero");
+    let diag = pen.diag_target(t.view(), rho.view());
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(
+                dense[[row, col]],
+                dense[[col, row]],
+                epsilon = 1e-12 * scale
+            );
+        }
+        assert_abs_diff_eq!(diag[col], dense[[col, col]], epsilon = 1e-12 * scale);
+    }
+    let (evals, _) = dense.eigh(Side::Lower).expect("iVAE gauge curvature eigh");
+    let min_eval = evals.iter().fold(f64::INFINITY, |acc, &x| acc.min(x));
+    assert!(
+        min_eval > 0.0,
+        "μ(I - P) is positive definite for ε > 0; min eigenvalue {min_eval:.3e}"
+    );
+
+    let expected = <Array2<f64> as PenaltyOp>::log_det_plus_lambda_i(&dense, lambda)
+        .expect("dense iVAE gauge log det");
+    let op = FrozenAnalyticPenaltyOp::new(
+        AnalyticPenaltyKind::IvaeRidgeMeanGauge(Arc::new(pen)),
+        t.clone(),
+        rho.clone(),
+    )
+    .expect("frozen iVAE gauge operator");
+    let frozen_diag = op.diag();
+    for i in 0..n {
+        assert_abs_diff_eq!(frozen_diag[i], dense[[i, i]], epsilon = 1e-12 * scale);
+    }
+    let frozen_log_det = op
+        .log_det_plus_lambda_i(lambda)
+        .expect("frozen iVAE gauge log det");
+    assert_abs_diff_eq!(
+        frozen_log_det,
+        expected,
+        epsilon = 1e-10 * expected.abs().max(1.0)
+    );
+}
