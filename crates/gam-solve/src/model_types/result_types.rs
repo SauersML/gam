@@ -3011,9 +3011,6 @@ pub enum SmoothingCorrectionAbsence {
     OuterHessianUndeclared { reason: OuterHessianAbsence },
     /// The interior ρ-Hessian was formed but refused inversion on its identified subspace.
     InteriorRhoHessianRefused { refusal: String },
-    /// The outer ρ-Hessian has no analytic form for this fit: a non-canonical Firth link whose
-    /// outer search ran first-order.
-    OuterHessianNotAnalytic { detail: String },
     /// The optimum is certified on an infinite-smoothing rail, where ρ has no finite variance.
     ///
     /// No longer produced: the correction excludes railed coordinates exactly as the outer
@@ -3066,9 +3063,6 @@ impl std::fmt::Display for SmoothingCorrectionAbsence {
             }
             Self::InteriorRhoHessianRefused { refusal } => {
                 write!(f, "the interior rho-Hessian refused inversion: {refusal}")
-            }
-            Self::OuterHessianNotAnalytic { detail } => {
-                write!(f, "the outer rho-Hessian has no analytic form: {detail}")
             }
             Self::RailCertified { detail } => write!(
                 f,
