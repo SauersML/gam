@@ -2920,6 +2920,7 @@ fn link_flex_family_supports_second_order_exact_outer_path() {
 
 mod time_wiggle_and_psi_derivatives;
 mod anchor_history_2983;
+mod resolve_start_2926;
 
 #[test]
 fn sigma_exact_joint_psi_terms_returns_analytic_terms() {
@@ -9000,33 +9001,26 @@ fn survival_intercept_root_does_not_follow_its_warm_seed_2971() {
     );
 }
 
-/// #2900 row 6.11: the rigid survival row jet reaches the device through the
-/// dispatch policy's fused-kernel crossover, and the device returns the per-row
-/// CPU program. On a CUDA host the fixture is sized at the probed runtime's
-/// `fused_kernel_min_n`, so the production cache build selects the device, and
-/// every channel of every row is compared with `row_kernel(row)` at the
-/// `RowKernel::batched_value_grad_hess_all` contract (≤ 1e-9). Two rows in
-/// seven are shifted 5 units into either probability tail. On a host without a
-/// device, nothing is admitted: the check reduces to admission, and the report
-/// says `device_selected=false`.
+/// #2900 row 6.11 and gam#3024: the rigid survival row jet is weighed by its
+/// own two executors, and the device returns the per-row CPU program. On a
+/// host without a device nothing is admitted or raced, and the cache is the
+/// per-row loop. On a CUDA host the first `auto` build of an untimed shape
+/// races the per-row loop against the device pass and returns the per-row
+/// result bit for bit; the shape is then decided from its timing without
+/// another race, and the device pass is compared with `row_kernel(row)` on
+/// every channel of every row at the `RowKernel::batched_value_grad_hess_all`
+/// contract (≤ 1e-9). Two rows in seven are shifted 5 units into either
+/// probability tail.
 #[test]
 fn rigid_row_jet_device_admission_and_parity_2900() {
     use crate::row_kernel::{RowKernel, RowSet, build_row_kernel_cache};
-    use gam_gpu::policy::GpuDispatchPolicy;
-    let admitted = |n: usize| {
+    let n = 2_048;
+    let decide = || {
         rigid_row_jet_decision::<STATIC_SLOPE_PRIMARIES, StaticSlopeGeometry>(n)
             .expect("survival row-jet admission must not fault")
-            .use_gpu
     };
-
-    let floor = GpuDispatchPolicy::MIN_CALIBRATABLE_FUSED_KERNEL_N;
-    assert!(
-        !admitted(floor - 1),
-        "no reachable policy admits a fused batch below {floor} rows"
-    );
     let runtime = gam_gpu::device_runtime::GpuRuntime::resolve(gam_gpu::global_policy())
         .expect("CUDA runtime resolution must not fault");
-    let n = runtime.map_or(64, |runtime| runtime.policy().fused_kernel_min_n.max(floor));
 
     let mut family = make_closed_form_test_family(n);
     let into_tails = |values: &Array1<f64>| {
@@ -9043,45 +9037,87 @@ fn rigid_row_jet_device_admission_and_parity_2900() {
         family,
         block_states,
     );
-
-    let selected = admitted(n);
-    assert_eq!(
-        selected,
-        runtime.is_some(),
-        "a {n}-row batch at the probed runtime's fused-kernel crossover must reach the device \
-         exactly when a device resolves"
-    );
-    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
-    let mut worst_gap = 0.0_f64;
-    let mut worst_row = 0;
-    for row in 0..n {
-        let (value, grad, hess) = RowKernel::row_kernel(&kernel, row).expect("per-row CPU program");
-        let channels = std::iter::once((cache.nll[row], value))
-            .chain(cache.gradients[row].iter().copied().zip(grad))
-            .chain(
-                cache.hessians[row]
-                    .iter()
-                    .flatten()
-                    .copied()
-                    .zip(hess.iter().flatten().copied()),
-            );
-        for (batched, per_row) in channels {
-            let gap = (batched - per_row).abs() / 1.0_f64.max(batched.abs()).max(per_row.abs());
-            if !(gap <= worst_gap) {
-                worst_gap = gap;
-                worst_row = row;
+    let per_row: Vec<_> = (0..n)
+        .map(|row| RowKernel::row_kernel(&kernel, row).expect("per-row CPU program"))
+        .collect();
+    let worst_gap =
+        |nll: &[f64],
+         gradients: &[[f64; STATIC_SLOPE_PRIMARIES]],
+         hessians: &[[[f64; STATIC_SLOPE_PRIMARIES]; STATIC_SLOPE_PRIMARIES]]| {
+            let mut worst = (0.0_f64, 0);
+            for (row, (value, grad, hess)) in per_row.iter().enumerate() {
+                let channels = std::iter::once((nll[row], *value))
+                    .chain(gradients[row].iter().copied().zip(grad.iter().copied()))
+                    .chain(
+                        hessians[row]
+                            .iter()
+                            .flatten()
+                            .copied()
+                            .zip(hess.iter().flatten().copied()),
+                    );
+                for (batched, cpu) in channels {
+                    let gap = (batched - cpu).abs() / 1.0_f64.max(batched.abs()).max(cpu.abs());
+                    if !(gap <= worst.0) {
+                        worst = (gap, row);
+                    }
+                }
             }
+            worst
+        };
+
+    let first = decide();
+    if runtime.is_none() {
+        assert_eq!(
+            (first.use_gpu, first.race),
+            (false, None),
+            "a host without a device admits and races nothing: {}",
+            first.reason
+        );
+    } else {
+        assert!(
+            first.race.is_some() || first.reason == "cpu-device-measured-slower" || first.use_gpu,
+            "an untimed shape on a CUDA host is raced: {}",
+            first.reason
+        );
+    }
+    let raced = first.race.is_some();
+    let cache = build_row_kernel_cache(&kernel, &RowSet::All).expect("rigid row-kernel cache");
+    let (cache_gap, cache_row) = worst_gap(&cache.nll, &cache.gradients, &cache.hessians);
+    if raced || !first.use_gpu {
+        assert_eq!(
+            cache_gap, 0.0,
+            "a raced or CPU-decided build returns the per-row loop bit for bit; row {cache_row}"
+        );
+        if raced {
+            assert!(decide().race.is_none(), "a raced shape is decided from its timing");
         }
     }
+    #[cfg(target_os = "linux")]
+    let device_gap = runtime.map(|_| {
+        let (nll, gradients, hessians) = kernel
+            .rigid_row_jet_on_device()
+            .expect("the device row jet runs on a CUDA host");
+        worst_gap(&nll, &gradients, &hessians)
+    });
+    #[cfg(not(target_os = "linux"))]
+    let device_gap: Option<(f64, usize)> = None;
     eprintln!(
-        "#2900 survival row jet: n={n} device_selected={selected} \
-         worst_relative_gap={worst_gap:.3e} at row {worst_row}"
+        "#2900/#3024 survival row jet: n={n} raced={raced} decision={} cache_gap={cache_gap:.3e} \
+         device_gap={device_gap:?}",
+        first.reason
     );
     assert!(
-        worst_gap <= 1e-9,
-        "survival row jet: batched channel differs from the per-row program by {worst_gap:e} \
-         (relative) at row {worst_row}, device_selected={selected}"
+        cache_gap <= 1e-9,
+        "survival row jet: the cache differs from the per-row program by {cache_gap:e} \
+         (relative) at row {cache_row}"
     );
+    if let Some((gap, row)) = device_gap {
+        assert!(
+            gap <= 1e-9,
+            "survival row jet: the device pass differs from the per-row program by {gap:e} \
+             (relative) at row {row}"
+        );
+    }
 }
 
 /// gam#3000 slice 2: the device row jet declares the four-primary Gaussian

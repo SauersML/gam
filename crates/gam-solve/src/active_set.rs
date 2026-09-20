@@ -495,6 +495,15 @@ pub(crate) fn null_space_of_rows(rows: &Array2<f64>) -> Option<(usize, Array2<f6
     Some((rank, null_space_complement(&vt, rank)?))
 }
 
+/// Whether a row whose unit-normalized slack is `scaled_slack` is active: the
+/// ONE activity rule of the inequality system, at the resolution the solver
+/// publishes for feasibility ([`ACTIVE_SET_PRIMAL_FEASIBILITY_TOL`]). A
+/// per-coordinate lower bound is the unit row `β_i ≥ lb_i`, so the P-IRLS box
+/// path reads this same rule for its bounds (#3180).
+pub(crate) fn row_is_active(scaled_slack: f64) -> bool {
+    scaled_slack <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL
+}
+
 pub(crate) fn active_face(
     beta: &Array1<f64>,
     constraints: &LinearInequalityConstraints,
@@ -524,9 +533,7 @@ pub(crate) fn active_face(
         slack[i] = s_i;
         primal_feasibility = primal_feasibility.max((-s_i).max(0.0));
     }
-    let active_idx: Vec<usize> = (0..m)
-        .filter(|&i| slack[i] <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL)
-        .collect();
+    let active_idx: Vec<usize> = (0..m).filter(|&i| row_is_active(slack[i])).collect();
     let mut a_active = Array2::<f64>::zeros((active_idx.len(), p));
     for (r, &idx) in active_idx.iter().enumerate() {
         a_active.row_mut(r).assign(&a_scaled.row(idx));
@@ -2394,7 +2401,7 @@ impl<'a> ConstraintSetOps<'a> {
                 ops.bounds[row] = 0.0;
                 continue;
             }
-            let is_tight = ops.scaled_slack(&values, row) <= ACTIVE_SET_PRIMAL_FEASIBILITY_TOL;
+            let is_tight = row_is_active(ops.scaled_slack(&values, row));
             // Tangent directions are homogeneous even when the original
             // feasible set is affine: a_i^T d >= 0 on a tight row.
             ops.bounds[row] = 0.0;
