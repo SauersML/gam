@@ -212,8 +212,23 @@ fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
                 .unwrap_or_else(|| panic!("gam#3452 ({law:?}) replicate {r}: no covariance"));
             let p = fit.fit.beta.len();
             assert_eq!(covariance.dim(), (p, p));
+            // The fit solves for `β` around the pooled-probit pilot, which enters
+            // each index as a constant offset: the marginal index is
+            // `baseline_marginal + M·β_m` and the slope `baseline_slope + S·β_s`.
+            // The pilot is itself a statistic of the replicate, so the estimated
+            // intercepts are `baseline + β` at the intercept columns; `β` alone
+            // varies only by the fit's departure from its own pilot. The
+            // covariance holds the pilot fixed, which is exact: the offset shifts
+            // where the solve starts, not the mode, so `Cov(β)` is the covariance
+            // of the intercepts themselves.
+            let p_marginal = fit.marginal_design.design.ncols();
+            assert_eq!(p, p_marginal + fit.slope_design.design.ncols());
+            let mut coefficients = fit.fit.beta.to_vec();
+            coefficients[fit.marginal_design.intercept_range.start] += fit.baseline_marginal;
+            coefficients[p_marginal + fit.slope_design.intercept_range.start] +=
+                fit.baseline_slope;
             (
-                fit.fit.beta.to_vec(),
+                coefficients,
                 (0..p).map(|j| covariance[[j, j]]).collect(),
                 on_grid,
             )
@@ -238,7 +253,7 @@ fn assert_covariance_matches_sampling_variance(law: Law, seed: u64) {
         let low = predicted * chi2_over_df(k, -z_tail);
         let high = predicted * chi2_over_df(k, z_tail);
         eprintln!(
-            "[3452 {law:?}] coefficient {j}: sampling var {sampling:.4e}, mean reported \
+            "[3452 {law:?}] coefficient {j}: mean {mean:.4}, sampling var {sampling:.4e}, mean reported \
              {predicted:.4e} (ratio reported/sampling {:.4}), band on sampling var \
              [{low:.4e}, {high:.4e}]",
             predicted / sampling
