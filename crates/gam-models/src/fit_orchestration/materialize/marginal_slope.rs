@@ -156,6 +156,7 @@ pub(crate) fn materialize_bernoulli_marginal_slope<'a>(
     col_map: &HashMap<String, usize>,
     config: &FitConfig,
 ) -> Result<MaterializedModel<'a>, WorkflowError> {
+    reject_unrealized_precision_priors(config, "Bernoulli marginal-slope models", false)?;
     let y = resolve_continuous_column(data, col_map, &parsed.response, "response")?;
 
     if !is_binary_response(y.view()) {

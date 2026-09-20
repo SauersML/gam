@@ -6191,6 +6191,20 @@ fn try_exact_joint_latent_coord_optimization(
 
     let mut lower = Array1::<f64>::from_elem(theta0.len(), -12.0);
     let mut upper = Array1::<f64>::from_elem(theta0.len(), 12.0);
+    // The smoothing coordinates search the resolvability domain of the
+    // incumbent's own design and penalties (#2812), the domain every other
+    // exact-joint route derives, and the incumbent's seed is projected into it
+    // (#4265).
+    let (rho_lower, rho_upper) =
+        joint_rho_resolvability_domain(&best.design.design, &best.design.penalties, rho_dim);
+    let rho_seed = ExactJointHyperSetup::project_rho_seed(
+        theta0.slice(s![..rho_dim]).to_owned(),
+        &rho_lower,
+        &rho_upper,
+    );
+    theta0.slice_mut(s![..rho_dim]).assign(&rho_seed);
+    lower.slice_mut(s![..rho_dim]).assign(&rho_lower);
+    upper.slice_mut(s![..rho_dim]).assign(&rho_upper);
     let latent_bound = latent
         .values
         .as_flat()

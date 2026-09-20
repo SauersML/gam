@@ -102,17 +102,23 @@ pub(crate) fn materialize_survival<'a>(
     // adds `linkwiggle(...)` to a `Surv(...)` formula without overriding the
     // (default) `survival_likelihood='transformation'`, the formula itself
     // selects the location-scale AFT model whose link the wiggle flexes — so
-    // promote rather than reject. An EXPLICIT incompatible likelihood
-    // (weibull/latent/latent-binary) is still a hard error below.
-    if parsed.linkwiggle.is_some() && survival_mode == SurvivalLikelihoodMode::Transformation {
+    // promote rather than reject. Only an UNSET likelihood is promoted: an
+    // explicit incompatible likelihood, `transformation` included, is still a
+    // hard error below rather than a silently swapped model.
+    let likelihood_is_default = config.survival_likelihood.is_none();
+    if likelihood_is_default
+        && parsed.linkwiggle.is_some()
+        && survival_mode == SurvivalLikelihoodMode::Transformation
+    {
         survival_mode = SurvivalLikelihoodMode::LocationScale;
     }
     // A noise formula is the log-sigma predictor, which only the location-scale
     // likelihood has. Under the default `transformation` likelihood it selects
     // that model, as `linkwiggle(...)` does. An explicit likelihood with no sigma
-    // block is refused rather than fitted with the noise formula dropped.
+    // block, `transformation` included, is refused rather than fitted with the
+    // noise formula dropped or with the likelihood swapped.
     if config.noise_formula.is_some() {
-        if survival_mode == SurvivalLikelihoodMode::Transformation {
+        if likelihood_is_default && survival_mode == SurvivalLikelihoodMode::Transformation {
             survival_mode = SurvivalLikelihoodMode::LocationScale;
         }
         if survival_mode != SurvivalLikelihoodMode::LocationScale {
@@ -154,6 +160,19 @@ pub(crate) fn materialize_survival<'a>(
             ),
         });
     }
+    // Only the transformation/Weibull request carries penalty-block priors;
+    // no survival request carries coefficient groups.
+    reject_unrealized_precision_priors(
+        config,
+        &format!(
+            "survival_likelihood='{}'",
+            crate::survival::construction::survival_likelihood_modename(survival_mode)
+        ),
+        matches!(
+            survival_mode,
+            SurvivalLikelihoodMode::Transformation | SurvivalLikelihoodMode::Weibull
+        ),
+    )?;
     // Fail fast on zero effective event mass (all-censored, OR every event-coded
     // row carries zero weight) for every survival likelihood (#789B /
     // construction-time fittability split; #2276). With no row contributing a
