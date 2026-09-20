@@ -23,10 +23,10 @@
 //! harness's fixed 1% false-positive rate.
 //!
 //! The truths are low-frequency (well inside the span of a penalized smooth) so
-//! smoother bias is small and a correctly-calibrated band sits at or above
-//! nominal — a healthy library keeps this gate quiet. Following the issue, only
-//! anti-conservative under-coverage (the #1870/#1871 collapse) gates the build;
-//! over-coverage is reported but never gates. This audits *average* coverage
+//! smoother bias is small and a correctly-calibrated band covers at nominal —
+//! a healthy library keeps this gate quiet. Both tails gate (#3534): the
+//! #1870/#1871 under-coverage collapse and an over-wide band are each a
+//! miscalibration. This audits *average* coverage
 //! over the domain (the evaluation point is drawn fresh each replication), which
 //! is the Nychka sense in which a Bayesian smooth band is calibrated.
 
@@ -37,7 +37,7 @@ use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 /// Training rows per replication.
@@ -49,8 +49,8 @@ const NOISE_SD: f64 = 0.30;
 
 /// Coverage replications (one independent trial each). Wilson half-width at the
 /// tightest level (0.95) is ≈ z·√(0.95·0.05/R) ≈ 0.051 — resolves the historical
-/// 0.157 / 0.731 collapses with wide margin without spuriously gating a
-/// calibrated band.
+/// 0.157 / 0.731 collapses with wide margin; a calibrated band trips either
+/// tail with probability at most the harness's 1% false-positive rate.
 const N_REPLICATIONS: usize = 120;
 
 /// The three nominal levels audited (issue's 80/90/95 sweep).
@@ -217,22 +217,13 @@ fn gaussian_smooth_confidence_band_covers_truth_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative (the #1870/#1871 signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "gaussian smooth confidence band under-covers the truth:\n{}",
+        "gaussian smooth confidence band is miscalibrated:\n{}",
         failures.join("\n")
     );
 }

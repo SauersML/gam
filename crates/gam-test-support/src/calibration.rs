@@ -342,6 +342,29 @@ impl CoverageVerdict {
             CoverageClass::Calibrated => 0.0,
         }
     }
+
+    /// One-line account of the verdict for a gate's failure message: the
+    /// empirical rate, the Wilson CI, and which side of it the nominal level
+    /// falls on (by how much). For a size curve audited as non-rejection
+    /// coverage, "under-covers" reads as an oversized test and "over-covers" as
+    /// an undersized one.
+    pub fn describe(&self) -> String {
+        let placement = match self.class {
+            CoverageClass::Calibrated => "inside the CI (calibrated)".to_string(),
+            CoverageClass::AntiConservative => format!(
+                "ABOVE the CI by {:.4} (anti-conservative: under-covers)",
+                -self.slack()
+            ),
+            CoverageClass::Conservative => format!(
+                "BELOW the CI by {:.4} (conservative: over-covers)",
+                self.slack()
+            ),
+        };
+        format!(
+            "empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], nominal {} {placement}",
+            self.empirical, self.hits, self.replications, self.ci_lo, self.ci_hi, self.nominal
+        )
+    }
 }
 
 /// Classify an observed hit count against its nominal level using the Wilson

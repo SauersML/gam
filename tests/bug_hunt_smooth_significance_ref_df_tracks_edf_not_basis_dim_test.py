@@ -32,6 +32,7 @@ Both fail loudly the instant ``ref_df`` is pinned to the basis dimension.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -147,7 +148,10 @@ def test_moderate_signal_is_not_judged_over_conservatively() -> None:
     )
 
 
-def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
+def test_nonconverged_flat_fit_is_not_flagged_significant(
+    coverage_audit: Callable[[int, int, float], Any],
+    coverage_replications: Callable[[float], int],
+) -> None:
     # The flat-valley REML stall (#1762) on an unidentified smooth over pure
     # noise leaves a NON-CONVERGED fit whose smoothing parameters rail out and
     # whose influence-based edf reads ~0 even though the term still carries a
@@ -156,8 +160,11 @@ def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
     # dominant driver of the null-FPR blow-up in #1766. smooth_significance now
     # references a non-converged term against its full basis dimension, so those
     # stalls are no longer spuriously flagged. Verify the null false-positive
-    # rate stays near alpha ACROSS the seeds where the stall actually happens.
-    n_seeds = 60
+    # rate is calibrated at alpha ACROSS the seeds where the stall actually
+    # happens, with the shared two-sided Wilson verdict over the smallest seed
+    # count at which a test that never rejects can fail it.
+    alpha = 0.05
+    n_seeds = coverage_replications(1.0 - alpha)
     rej = 0
     stalls = 0
     worst = None
@@ -173,23 +180,15 @@ def test_nonconverged_flat_fit_is_not_flagged_significant() -> None:
             stalls += 1
             if worst is None or p < worst[1]:
                 worst = (seed, p, float(rec["statistic_lr"]), float(rec["ref_df"]))
-        if p < 0.05:
+        if p < alpha:
             rej += 1
-    fpr = rej / n_seeds
     assert stalls > 0, (
         "setup: expected some fits to hit the flat-valley stall; none did — "
         "the guard is untested by this sample"
     )
-    assert fpr <= 0.15, (
-        f"null false-positive rate {fpr:.3f} ({rej}/{n_seeds}) on pure noise "
-        f"exceeds the tolerance; the non-converged over-rejection is back. "
-        f"({stalls} fits stalled; worst stalled p={worst})"
+    verdict = coverage_audit(n_seeds - rej, n_seeds, 1.0 - alpha)
+    assert verdict.passed, (
+        f"null false-positive rate {rej / n_seeds:.3f} ({rej}/{n_seeds}) at "
+        f"alpha={alpha} on pure noise is miscalibrated; non-rejection "
+        f"{verdict.describe()} ({stalls} fits stalled; worst stalled p={worst})"
     )
-
-
-if __name__ == "__main__":  # pragma: no cover - manual smoke run
-    test_ref_df_stays_in_edf1_band_not_basis_dimension()
-    test_ref_df_varies_with_fitted_complexity()
-    test_moderate_signal_is_not_judged_over_conservatively()
-    test_nonconverged_flat_fit_is_not_flagged_significant()
-    print("ok")

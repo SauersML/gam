@@ -25,13 +25,13 @@
 //! by the shared Wilson-interval verdict [`audit_coverage`] at the harness's
 //! fixed 1% false-positive rate.
 //!
-//! Honest gate, not a tuned one: only *anti-conservative* (under-coverage
-//! beyond the whole Wilson CI) fails the build — the #1870/#1871 signature.
-//! Over-coverage is reported (via the verdict) but never gates, exactly as the
-//! issue prescribes. The truths are deliberately low-frequency (representable
-//! by the penalized basis) so smoother bias is small and a *correctly*
-//! calibrated band sits at or above nominal; a catastrophic collapse of the
-//! kind the cluster documents trips the gate with a wide margin.
+//! Honest gate, not a tuned one: nominal outside the whole Wilson CI on either
+//! side fails the build (#3534) — under-coverage is the #1870/#1871 signature,
+//! over-coverage is an over-wide band, and both misreport uncertainty. The
+//! truths are deliberately low-frequency (representable by the penalized
+//! basis) so smoother bias is small and a *correctly* calibrated band covers at
+//! nominal; a catastrophic collapse of the kind the cluster documents trips
+//! the gate with a wide margin.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -40,7 +40,7 @@ use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 /// Training rows per replication. Large enough that a well-specified GLM smooth
@@ -51,8 +51,8 @@ const N_TRAIN: usize = 250;
 /// Coverage replications. One independent Bernoulli coverage trial per
 /// replication, so the Wilson half-width at the tightest nominal level (0.95)
 /// is ≈ z·√(0.95·0.05/R) ≈ 0.046 — narrow enough to resolve the historical
-/// 0.157 / 0.731 collapses with enormous margin, wide enough that a merely
-/// mildly-conservative-or-calibrated band never spuriously gates.
+/// 0.157 / 0.731 collapses with enormous margin, while a calibrated band trips
+/// either tail with probability at most the harness's 1% false-positive rate.
 const N_REPLICATIONS: usize = 150;
 
 /// The three nominal levels audited, matching the issue's 80/90/95 sweep.
@@ -210,27 +210,17 @@ fn binomial_glm_response_band_covers_truth_at_nominal() {
          producing a real band"
     );
 
-    // Audit each nominal level with the shared Wilson verdict. Only
-    // anti-conservative under-coverage gates; report the full verdict either way.
+    // Audit each nominal level with the shared Wilson verdict; both tails gate.
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative (the #1870/#1871 signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "binomial GLM response-scale credible band under-covers the truth:\n{}",
+        "binomial GLM response-scale credible band is miscalibrated:\n{}",
         failures.join("\n")
     );
 }

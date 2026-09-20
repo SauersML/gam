@@ -14,16 +14,26 @@
 //!
 //! Audit: type-I size under a TRUE NULL (the smooth term has NO effect on the
 //! class log-odds — `y` is generated independently of `x`). At
-//! `α ∈ {0.01, 0.05, 0.10}` the empirical rejection rate must not exceed `α`
-//! beyond Monte-Carlo error, audited as coverage of the non-rejection event at
-//! nominal `1 − α`: an oversized test
-//! under-covers non-rejection and gates; an undersized (conservative) test
-//! over-covers and only reports.
+//! `α ∈ {0.01, 0.05, 0.10}` the empirical rejection rate must match `α` to
+//! within Monte-Carlo error, audited as coverage of the non-rejection event at
+//! nominal `1 − α`. Both tails gate (#3534): an oversized test under-covers
+//! non-rejection, an undersized (conservative) test over-covers it, and each
+//! is a miscalibrated p-value. A replication whose smooth block has no
+//! estimable covariance direction reports no row (`wood_smooth_test` declines:
+//! the term carries no testable signal); the test did not reject, so it is
+//! counted as a non-rejection at every `α` and every replication enters the
+//! denominator — dropping it would condition the size on the fit's outcome.
+//!
+//! Resolution: a never-rejecting test is detectable at nominal `1 − α` only
+//! once `R > z²(1 − α)/α` (the smallest `R` whose all-hits Wilson lower bound
+//! clears nominal), i.e. `R ≥ 127` at `α = 0.05` and `R ≥ 60` at `α = 0.10`;
+//! `N_REPLICATIONS = 200` resolves both. At `α = 0.01` the bound is 657, so
+//! that level gates only the oversized tail at this replication count.
 
 use csv::StringRecord;
 use gam::families::multinomial::{MultinomialFitRequest, fit_penalized_multinomial_formula};
 use gam::{FitConfig, encode_recordswith_inferred_schema};
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 
 const N_TRAIN: usize = 150;
 const N_REPLICATIONS: usize = 200;
@@ -38,13 +48,12 @@ fn training_grid(n: usize) -> Vec<f64> {
 }
 
 #[test]
-fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
+fn multinomial_smooth_significance_pvalue_is_calibrated_under_the_null() {
     let x = training_grid(N_TRAIN);
     let mut rng = CalibrationRng::new(SEED);
     // Per-alpha count of NON-rejections (p_value > alpha) — the covered event
     // the shared Wilson verdict audits at nominal `1 - alpha`.
     let mut non_rejections = [0usize; ALPHAS.len()];
-    let mut replications_used = 0usize;
 
     for rep in 0..N_REPLICATIONS {
         // TRUE NULL: y is Categorical(0.5, 0.5), independent of x.
@@ -74,9 +83,11 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
 
         let significance = model.smooth_significance();
         let Some(row) = significance.first() else {
-            // A degenerate replication (e.g. the smooth term collapsed to the
-            // nullspace) declines to report a p-value rather than fabricate
-            // one; skip it rather than treat "no row" as either a hit or miss.
+            // No estimable direction in the smooth block: the test declines,
+            // which is a non-rejection at every level.
+            for count in &mut non_rejections {
+                *count += 1;
+            }
             continue;
         };
         assert!(
@@ -84,7 +95,6 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
             "rep {rep}: multinomial smooth-significance p-value out of range: {}",
             row.p_value
         );
-        replications_used += 1;
 
         for (alpha_idx, &alpha) in ALPHAS.iter().enumerate() {
             if row.p_value > alpha {
@@ -93,38 +103,24 @@ fn multinomial_smooth_significance_pvalue_is_not_oversized_under_the_null() {
         }
     }
 
-    assert!(
-        replications_used >= N_REPLICATIONS / 2,
-        "too many degenerate replications ({replications_used}/{N_REPLICATIONS} usable) — \
-         the null-FPR audit needs a real sample to resolve"
-    );
-
     let mut failures = Vec::new();
     for (alpha_idx, &alpha) in ALPHAS.iter().enumerate() {
         let nominal_non_reject = 1.0 - alpha;
         let verdict = audit_coverage(
             non_rejections[alpha_idx],
-            replications_used,
+            N_REPLICATIONS,
             nominal_non_reject,
         );
-        if verdict.class == CoverageClass::AntiConservative {
+        if !verdict.passed {
             failures.push(format!(
-                "alpha={alpha}: empirical non-reject rate={:.4} (non-rejections {}/{}), \
-                 Wilson CI=[{:.4},{:.4}], nominal {nominal_non_reject} ABOVE the CI by {:.4} — \
-                 the multinomial smooth-significance test rejects the true null too often \
-                 (anti-conservative, the #1872/#1873 genus)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
+                "alpha={alpha}: non-rejection {}",
+                verdict.describe()
             ));
         }
     }
     assert!(
         failures.is_empty(),
-        "multinomial smooth-significance p-value is oversized under the null:\n{}",
+        "multinomial smooth-significance p-value is miscalibrated under the null:\n{}",
         failures.join("\n")
     );
 }

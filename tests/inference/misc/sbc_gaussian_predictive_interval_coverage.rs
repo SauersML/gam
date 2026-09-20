@@ -19,8 +19,8 @@
 //! inside the interval, audited by the shared Wilson verdict over the 80/90/95
 //! sweep.
 //!
-//! Honest gate: only anti-conservative under-coverage fails; over-coverage is
-//! reported but never gates.
+//! Both tails gate (#3534): under-coverage and over-coverage are each a
+//! miscalibration of the reported interval.
 
 use csv::StringRecord;
 use gam_data::{EncodedDataset, encode_recordswith_inferred_schema};
@@ -29,7 +29,7 @@ use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 const N_TRAIN: usize = 160;
@@ -189,23 +189,13 @@ fn gaussian_predictive_interval_covers_new_observation_at_nominal() {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative (recycled/mis-scaled \
-                 predictive SE, the #1875/#1878 signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "gaussian predictive interval under-covers a new observation:\n{}",
+        "gaussian predictive interval is miscalibrated for a new observation:\n{}",
         failures.join("\n")
     );
 }

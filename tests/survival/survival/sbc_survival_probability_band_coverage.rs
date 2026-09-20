@@ -20,8 +20,10 @@
 //! a prior, simulate right-censored survival times with a KNOWN true survival
 //! function S(t | x) = exp(-(t/λ(x))^k), fit, and at one independent interior
 //! covariate value check whether the true S(t⋆ | x⋆) at a fixed query time lies
-//! inside the reported band. Audited by the shared Wilson verdict; only
-//! anti-conservative under-coverage gates.
+//! inside the reported band. Audited by the shared Wilson verdict; both tails
+//! gate (#3534). At `N_REPLICATIONS = 30` the over-coverage tail cannot trip at
+//! nominal 0.95 (a never-missing band is detectable only once
+//! `R > z²·0.95/0.05 ≈ 126`), so this smoke-sized gate resolves under-coverage.
 //!
 //! Runtime: small n/R, one fit + one predict per replication, fixed seeds. This
 //! gate audits the tightest 95% level (the most sensitive); it extends to the
@@ -30,7 +32,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 
 /// Weibull shape (fixed); the smooth covariate effect enters through the scale.
 const WEIBULL_SHAPE: f64 = 1.3;
@@ -249,15 +251,8 @@ fn survival_probability_band_covers_truth_at_nominal() {
 
     let verdict = audit_coverage(hits, N_REPLICATIONS, NOMINAL_LEVEL);
     assert!(
-        verdict.class != CoverageClass::AntiConservative,
-        "survival probability band under-covers the truth at level {NOMINAL_LEVEL}: \
-         empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], nominal ABOVE the CI by {:.4} \
-         — anti-conservative",
-        verdict.empirical,
-        verdict.hits,
-        verdict.replications,
-        verdict.ci_lo,
-        verdict.ci_hi,
-        -verdict.slack(),
+        verdict.passed,
+        "survival probability band is miscalibrated at level {NOMINAL_LEVEL}: {}",
+        verdict.describe()
     );
 }

@@ -18,8 +18,8 @@
 //! draw a genuinely NEW response y_new ~ family(μ_true(x⋆)) at one independent
 //! interior point and check it lands inside the requested predictive interval.
 //! Empirical coverage over the 80/90/95 sweep is adjudicated by the shared
-//! Wilson verdict: only anti-conservative under-coverage gates; discreteness /
-//! skew over-coverage is reported but never gates.
+//! Wilson verdict. Both tails gate (#3534): under-coverage and over-coverage
+//! are each a miscalibration of the reported interval.
 //!
 //! Determinism: a fixed per-family seed threads truth draw, simulation, fit, and
 //! the new-observation draw, so each gate reproduces bit-for-bit (the harness is
@@ -32,7 +32,7 @@ use gam_predict::{
     InferenceCovarianceMode, MeanIntervalMethod, PredictUncertaintyOptions,
     predict_gamwith_uncertainty,
 };
-use gam_test_support::calibration::{CalibrationRng, CoverageClass, audit_coverage};
+use gam_test_support::calibration::{CalibrationRng, audit_coverage};
 use ndarray::Array1;
 
 const N_TRAIN: usize = 240;
@@ -42,7 +42,7 @@ const NOMINAL_LEVELS: [f64; 3] = [0.80, 0.90, 0.95];
 /// A low-frequency smooth linear-predictor truth η(x) drawn from the prior. The
 /// same shape family the mean-band gates use: comfortably inside the span of a
 /// penalized 1-D smooth so smoother bias stays small and a calibrated interval
-/// sits at or above nominal.
+/// covers at nominal.
 struct SmoothEta {
     center: f64,
     amplitude: f64,
@@ -292,23 +292,13 @@ fn run_family_predictive_gate(case: &FamilyCase) {
     let mut failures = Vec::new();
     for (level_idx, &level) in NOMINAL_LEVELS.iter().enumerate() {
         let verdict = audit_coverage(hits[level_idx], N_REPLICATIONS, level);
-        if verdict.class == CoverageClass::AntiConservative {
-            failures.push(format!(
-                "level {level}: empirical={:.4} (hits {}/{}), Wilson CI=[{:.4},{:.4}], \
-                 nominal ABOVE the CI by {:.4} — anti-conservative predictive interval \
-                 (the #1875/#1878 recycled/mis-scaled or #817/#1193/#1194 dropped-skew signature)",
-                verdict.empirical,
-                verdict.hits,
-                verdict.replications,
-                verdict.ci_lo,
-                verdict.ci_hi,
-                -verdict.slack(),
-            ));
+        if !verdict.passed {
+            failures.push(format!("level {level}: {}", verdict.describe()));
         }
     }
     assert!(
         failures.is_empty(),
-        "{} predictive interval under-covers a new observation:\n{}",
+        "{} predictive interval is miscalibrated for a new observation:\n{}",
         case.family,
         failures.join("\n")
     );

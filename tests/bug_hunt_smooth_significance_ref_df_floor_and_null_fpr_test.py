@@ -12,9 +12,11 @@ not directly exercise:
    independent of the magnitude of ``W``.
 
 2. The *calibration rate*. Under the null (pure noise, no signal) a calibrated
-   test rejects at ~alpha. The collapse drove the false-positive rate to
+   test rejects at exactly alpha. The collapse drove the false-positive rate to
    ~0.23-0.35 at alpha=0.05 because every ``edf==1.0`` fit produced p~1e-12.
-   We sweep many independent pure-noise fits and bound the empirical FPR.
+   We sweep independent pure-noise fits and audit the non-rejection rate with
+   the shared two-sided Wilson verdict (``tests/conftest.py``), so an undersized
+   test fails just like an oversized one (#3534).
 
 A power control (a genuinely wiggly signal must still be flagged) guards
 against a fix that simply inflates every p-value.
@@ -23,6 +25,7 @@ against a fix that simply inflates every p-value.
 from __future__ import annotations
 
 import importlib
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -83,12 +86,15 @@ def test_ref_df_never_below_term_edf_invariant() -> None:
     )
 
 
-def test_null_false_positive_rate_is_calibrated() -> None:
+def test_null_false_positive_rate_is_calibrated(
+    coverage_audit: Callable[[int, int, float], Any],
+    coverage_replications: Callable[[float], int],
+) -> None:
     # Pure-noise responses: there is no smooth effect, so a calibrated test
-    # should reject at roughly ALPHA. The collapse pushed the FPR to 0.23-0.35;
-    # we require it well below that. The bound (0.15) is generous for the modest
-    # seed count yet far under the buggy regime.
-    n_seeds = 40
+    # rejects at exactly ALPHA. The non-rejection rate is audited at nominal
+    # 1 - ALPHA with the shared two-sided Wilson verdict, over the smallest seed
+    # count at which a test that never rejects can fail it.
+    n_seeds = coverage_replications(1.0 - ALPHA)
     rejections = 0
     for seed in range(n_seeds):
         rng = np.random.default_rng(1000 + seed)
@@ -97,10 +103,10 @@ def test_null_false_positive_rate_is_calibrated() -> None:
         rec = _record(x, y)
         if rec["p_corrected"] < ALPHA:
             rejections += 1
-    fpr = rejections / n_seeds
-    assert fpr <= 0.15, (
-        f"null false-positive rate {fpr:.3f} ({rejections}/{n_seeds}) far exceeds "
-        f"alpha={ALPHA}; the ref_df collapse is over-rejecting flat smooths"
+    verdict = coverage_audit(n_seeds - rejections, n_seeds, 1.0 - ALPHA)
+    assert verdict.passed, (
+        f"null false-positive rate {rejections / n_seeds:.3f} ({rejections}/{n_seeds}) "
+        f"at alpha={ALPHA} is miscalibrated; non-rejection {verdict.describe()}"
     )
 
 
@@ -114,10 +120,3 @@ def test_strong_signal_still_flagged() -> None:
         f"(W={rec['W']:.3g}, edf={rec['edf']:.3f}, ref_df={rec['ref_df']:.3g}, "
         f"p={rec['p_corrected']:.3g})"
     )
-
-
-if __name__ == "__main__":  # pragma: no cover - manual smoke run
-    test_ref_df_never_below_term_edf_invariant()
-    test_null_false_positive_rate_is_calibrated()
-    test_strong_signal_still_flagged()
-    print("ok")
