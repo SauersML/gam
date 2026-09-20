@@ -1279,7 +1279,7 @@ impl BernoulliMarginalSlopePredictor {
             link_dev_correction_for_row,
         )?;
         let scale = self.probit_frailty_scale();
-        let summands = cells.len() * crate::cubic_cell_kernel::GL_NODES_FOR_GPU_KERNEL.len();
+        let summands = cells.len() * crate::cubic_cell_kernel::TERMINAL_GL_ORDER;
         let mut tail = 0.0;
         let mut density = 0.0;
         let mut density_slope = 0.0;
