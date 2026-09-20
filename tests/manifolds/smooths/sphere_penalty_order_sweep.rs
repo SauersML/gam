@@ -188,10 +188,14 @@ fn sphere_invalid_penalty_order_rejected_cleanly() {
         match r {
             Ok(_) => panic!("m={bad_m} must be rejected (valid range is 1..=4)"),
             Err(e) => {
-                let lower = e.to_string().to_lowercase();
+                // The refusal must name the option and the offending value:
+                // "... penalty_order must be one of 1, 2, 3, 4; got {bad_m}".
+                // Any weaker disjunct (e.g. a bare letter) is satisfied by
+                // an unrelated error and cannot fail.
+                let msg = e.to_string();
                 assert!(
-                    lower.contains("penalty") || lower.contains("order") || lower.contains("m"),
-                    "m={bad_m} reject must name penalty order; got: {e}",
+                    msg.contains("penalty_order") && msg.contains(&format!("got {bad_m}")),
+                    "m={bad_m} reject must name penalty_order and the value {bad_m}; got: {e}",
                 );
                 eprintln!("[m-sweep] m={bad_m}: clean error: {e}");
             }
