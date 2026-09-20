@@ -148,7 +148,8 @@
 
 use super::{
     AUTO_Z_CONDITIONAL_RAO_ALPHA, AUTO_Z_CONDITIONAL_RIDGE_REL, MarginalSlopeCovariance,
-    build_intercept_basis, robust_conditional_score_pvalue,
+    build_intercept_basis, preconditioned_normal_pseudoinverse, robust_conditional_score_pvalue,
+    robust_score_contributions_pvalue,
 };
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use serde::{Deserialize, Serialize};
@@ -644,17 +645,15 @@ fn fit_autoregression(
         .collect();
 
     // Stage 2 — per-coupling interaction tests on that residual.
-    let mut varying = vec![false; j];
-    for k_index in 0..j {
-        let interaction: Vec<f64> = (0..n)
-            .map(|row| constant_residual[row] * centered[[row, k_index]])
-            .collect();
-        if let Some(p_value) =
-            robust_conditional_score_pvalue(a_centered, &interaction, weights)?
-        {
-            varying[k_index] = p_value < AUTO_Z_CONDITIONAL_RAO_ALPHA;
-        }
-    }
+    let varying: Vec<bool> = coupling_interaction_pvalues(
+        constant_design.view(),
+        &constant_residual,
+        a_centered,
+        weights,
+    )?
+    .into_iter()
+    .map(|p_value| p_value.is_some_and(|p_value| p_value < AUTO_Z_CONDITIONAL_RAO_ALPHA))
+    .collect();
     if varying.iter().all(|fires| !fires) {
         let coeffs: Vec<Vec<f64>> = (0..j).map(|k| vec![constant_coeffs[k]]).collect();
         let ranges: Vec<[f64; 2]> = (0..j)
@@ -702,6 +701,83 @@ fn fit_autoregression(
         offset += width;
     }
     Ok((blocks, ranges, residual))
+}
+
+/// The robust Rao p-value of "coupling `φ_k` is constant" for every column `k`
+/// of the constant-coupling design `X = ζ_{<j}`, with the constant couplings
+/// `φ̂` ESTIMATED (gam#3448).
+///
+/// The score `S_k(φ̂) = Σ_i w_i r_i ζ_ik ã_i` of the stage-1 residual
+/// `r = ζ_j − Xφ̂` moves with `φ̂` at first order, `∂S_k/∂φ = −G_k` with
+/// `G_k = Σ_i w_i ζ_ik ã_i X_iᵀ`, and the ridge solve gives
+/// `φ̂ − φ = M⁻¹ Σ_i w_i r_i X_i` for `M = XᵀWX + λR`. `E[G_k]/n` is
+/// `Cov(a, Σ_{<j,k}(a))`, which is not zero in exactly the regime this stage
+/// runs in: the pair gate fired because some `Σ(a)` moves, and the null
+/// "`φ_k` is constant" still lets `Σ_{<j}(a)` move. The contributions therefore
+/// carry the propagated stage,
+///
+/// ```text
+/// ψ_i = w_i r_i ζ_ik ã_i − G_k M⁺ (w_i r_i X_i),
+/// ```
+///
+/// so the meat is the variance of the score as it is computed, not as if `φ`
+/// were known. The estimated score means and the weighted centring of `ã` need
+/// no term: their derivatives `Σ w ζ_k ã`, `Σ w r ã` and `Σ w r ζ_k` are
+/// zero-mean under the null (calibrated scores, and the stage-1 normal
+/// equations).
+fn coupling_interaction_pvalues(
+    design: ArrayView2<'_, f64>,
+    residual: &[f64],
+    a_centered: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> Result<Vec<Option<f64>>, String> {
+    let n = design.nrows();
+    let j = design.ncols();
+    let mut weighted_design = design.to_owned();
+    let mut stage_influence = design.to_owned();
+    for i in 0..n {
+        let wi = weights[i].max(0.0);
+        let influence_scale = wi * residual[i];
+        weighted_design
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= wi);
+        stage_influence
+            .row_mut(i)
+            .iter_mut()
+            .for_each(|value| *value *= influence_scale);
+    }
+    // The normal matrix `weighted_ridge_columns` solved in stage 1.
+    let mut normal = design.t().dot(&weighted_design);
+    normal += &(ridge_penalty(design, weights) * AUTO_Z_CONDITIONAL_RIDGE_REL);
+    let m_pinv = preconditioned_normal_pseudoinverse(&normal, n)?;
+    let mut p_values = Vec::with_capacity(j);
+    for k_index in 0..j {
+        // `diag(w ζ_k) X` for `G_k = ãᵀ diag(w ζ_k) X` (r × j), and the naive
+        // contributions `w_i r_i ζ_ik ã_i` (n × r).
+        let mut coupling_design = weighted_design.clone();
+        let mut contributions = a_centered.to_owned();
+        for i in 0..n {
+            let score = design[[i, k_index]];
+            coupling_design
+                .row_mut(i)
+                .iter_mut()
+                .for_each(|value| *value *= score);
+            let naive_scale = weights[i].max(0.0) * residual[i] * score;
+            contributions
+                .row_mut(i)
+                .iter_mut()
+                .for_each(|value| *value *= naive_scale);
+        }
+        let g = a_centered.t().dot(&coupling_design);
+        // Row `i` of `stage_influence · (G_k M⁺)ᵀ` is `G_k M⁺ (w_i r_i X_i)`.
+        let propagation = g.dot(&m_pinv).reversed_axes();
+        contributions -= &stage_influence.dot(&propagation);
+        // `w_i·r_i·ζ_ik·ã_ij` takes three roundings, the length-`j` correction
+        // `j + 2`, and the subtraction one.
+        p_values.push(robust_score_contributions_pvalue(&contributions, j + 6)?);
+    }
+    Ok(p_values)
 }
 
 /// Fit `log d(a) = γᵀ[1 | a]` for the innovation `ε` by exact Fisher scoring of
@@ -939,18 +1015,7 @@ fn weighted_ridge_columns(
     response: &[f64],
     weights: ArrayView1<'_, f64>,
 ) -> Result<(Vec<f64>, Vec<f64>), String> {
-    let width = design.ncols();
-    let mut penalty = Array2::<f64>::zeros((width, width));
-    for column in 0..width {
-        let diagonal = design
-            .column(column)
-            .iter()
-            .zip(weights.iter())
-            .map(|(&value, &weight)| weight * value * value)
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        penalty[[column, column]] = diagonal;
-    }
+    let penalty = ridge_penalty(design, weights);
     let response_array = Array1::from_vec(response.to_vec());
     let response_column = response_array.view().insert_axis(ndarray::Axis(1));
     let (coeffs, fitted) = gam_linalg::utils::gaussian_weighted_ridge(
@@ -964,6 +1029,25 @@ fn weighted_ridge_columns(
         coeffs.column(0).to_vec(),
         fitted.column(0).to_vec(),
     ))
+}
+
+/// The relative, column-scaled Tikhonov penalty `R = diag(Σ_i w_i x_ij²)` of
+/// [`weighted_ridge_columns`], floored positive so an all-zero column still
+/// receives a finite ridge.
+fn ridge_penalty(design: ArrayView2<'_, f64>, weights: ArrayView1<'_, f64>) -> Array2<f64> {
+    let width = design.ncols();
+    let mut penalty = Array2::<f64>::zeros((width, width));
+    for column in 0..width {
+        let diagonal = design
+            .column(column)
+            .iter()
+            .zip(weights.iter())
+            .map(|(&value, &weight)| weight * value * value)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        penalty[[column, column]] = diagonal;
+    }
+    penalty
 }
 
 #[cfg(test)]
@@ -1143,5 +1227,79 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Null draw for the stage-2 coupling test: `Var(ζ₀ | x) = e^{0.8x}` moves
+    /// and the coupling `φ₁₀ = 0.4` is constant. Returns the stage-1 design, its
+    /// residual, the centred span and the weights, exactly as
+    /// [`fit_autoregression`] hands them to [`coupling_interaction_pvalues`].
+    fn moving_variance_constant_coupling(
+        n: usize,
+        replicate: u64,
+    ) -> (Array2<f64>, Vec<f64>, Array2<f64>, Array1<f64>) {
+        let base = 0x3448_0000_u64 + replicate * 3;
+        let x = standardized(gaussians(n, base));
+        let e0 = gaussians(n, base + 1);
+        let e1 = gaussians(n, base + 2);
+        let weights = Array1::<f64>::ones(n);
+        let mut scores = Array2::<f64>::zeros((n, 2));
+        for row in 0..n {
+            let z0 = (0.4 * x[row]).exp() * e0[row];
+            scores[[row, 0]] = z0;
+            scores[[row, 1]] = 0.4 * z0 + e1[row];
+        }
+        for mut column in scores.columns_mut() {
+            let mean = column.sum() / n as f64;
+            column.mapv_inplace(|value| value - mean);
+        }
+        let a_centered = Array2::from_shape_vec((n, 1), x).expect("span");
+        let design = scores.slice(ndarray::s![.., 0..1]).to_owned();
+        let response = scores.column(1).to_vec();
+        let (_, fitted) =
+            weighted_ridge_columns(design.view(), &response, weights.view()).expect("stage 1");
+        let residual = (0..n).map(|row| response[row] - fitted[row]).collect();
+        (design, residual, a_centered, weights)
+    }
+
+    /// gam#3448: the per-coupling Rao test must be U(0, 1) under "`φ₁₀` is
+    /// constant" while `Σ₀₀(a)` moves. There `G = Σ w ζ₀² ã` is `O(n)`
+    /// (`E[G]/n = Cov(x, e^{0.8x}) = 0.8·e^{0.32}`), and the known-`φ` meat
+    /// `Σ (r ζ₀)² ã²` is the variance of `ζ₀ e₁ ã`, not of the score as
+    /// computed, `ζ₀ e₁ (ã − G/M)`: under the `e^{0.8x}` tilt of `x` those are
+    /// `1 + 0.8²` against `1`, so the uncorrected statistic is shrunk by `1.64`
+    /// and its p-values pile up at one.
+    #[test]
+    fn coupling_interaction_test_is_calibrated_under_a_moving_variance_3448() {
+        const REPLICATES: usize = 1000;
+        const ALPHA: f64 = 1.0e-3;
+        let n = 2_000;
+        let mut p_values = Vec::with_capacity(REPLICATES);
+        for replicate in 0..REPLICATES {
+            let (design, residual, a_centered, weights) =
+                moving_variance_constant_coupling(n, replicate as u64);
+            let tested = coupling_interaction_pvalues(
+                design.view(),
+                &residual,
+                a_centered.view(),
+                weights.view(),
+            )
+            .expect("coupling test");
+            p_values.push(tested[0].expect("the coupling test is testable"));
+        }
+        p_values.sort_by(f64::total_cmp);
+        let m = REPLICATES as f64;
+        let ks = p_values
+            .iter()
+            .enumerate()
+            .map(|(i, &u)| (u - i as f64 / m).max((i + 1) as f64 / m - u))
+            .fold(0.0, f64::max);
+        let root_m = m.sqrt();
+        let ks_crit =
+            super::super::kolmogorov_upper_quantile(ALPHA) / (root_m + 0.12 + 0.11 / root_m);
+        assert!(
+            ks <= ks_crit,
+            "gam#3448: with Σ₀₀(a) moving and φ₁₀ constant the coupling test's p-values must be \
+             U(0, 1); KS distance {ks:.4} exceeds the level-{ALPHA} critical value {ks_crit:.4}"
+        );
     }
 }

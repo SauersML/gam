@@ -612,3 +612,77 @@ fn survival_marginal_slope_posterior_mean_against_monte_carlo() {
         );
     }
 }
+
+/// The published point is the conditional-posterior mean whatever the band's
+/// covariance definition (gam#3421, gam#398): requesting a smoothing-corrected
+/// interval must not move it, while the band itself reads the corrected law.
+/// The corrected covariance is planted as `4·Vb`, so the band's posterior
+/// standard deviations must widen at every cell the conditional band resolves.
+#[test]
+fn an_interval_never_moves_the_posterior_mean_survival_3421() {
+    init_parallelism();
+    let mut model = fit_survival_marginal_slope_model(400, 20260920);
+    {
+        let fit = model.fit_result.as_mut().expect("fit result");
+        let corrected = fit
+            .covariance_conditional
+            .as_ref()
+            .expect("conditional covariance")
+            .mapv(|v| 4.0 * v);
+        fit.covariance_corrected = Some(corrected);
+    }
+    let (data, col_map, _) = survival_prediction_frame();
+    let times = [0.75, 1.5, 3.0];
+    let zero = Array1::<f64>::zeros(data.nrows());
+    let predict = |with_uncertainty: bool, mode: SurvivalPredictionCovarianceMode| {
+        predict_survival(
+            SurvivalPredictRequest {
+                model: &model,
+                data: data.view(),
+                col_map: &col_map,
+                training_headers: model.training_headers.as_ref(),
+                primary_offset: &zero,
+                noise_offset: &zero,
+                time_grid: Some(&times),
+                with_uncertainty,
+                estimand: SurvivalPredictEstimand::PosteriorMean,
+            },
+            mode,
+        )
+        .unwrap_or_else(|e| panic!("posterior-mean survival ({mode:?}, {with_uncertainty}): {e}"))
+    };
+    let point = predict(false, SurvivalPredictionCovarianceMode::Conditional);
+    let point_corrected = predict(false, SurvivalPredictionCovarianceMode::SmoothingCorrected);
+    let conditional = predict(true, SurvivalPredictionCovarianceMode::Conditional);
+    let corrected = predict(true, SurvivalPredictionCovarianceMode::SmoothingCorrected);
+    for (label, other) in [
+        ("point-only, corrected mode", &point_corrected),
+        ("conditional interval", &conditional),
+        ("corrected interval", &corrected),
+    ] {
+        assert_eq!(other.survival, point.survival, "[{label}] moved the survival point");
+        assert_eq!(other.hazard, point.hazard, "[{label}] moved the hazard point");
+        assert_eq!(
+            other.linear_predictor, point.linear_predictor,
+            "[{label}] moved the linear predictor"
+        );
+    }
+    assert!(point.survival_se.is_none() && point.covariance_source.is_none());
+    assert_eq!(
+        conditional.covariance_source,
+        Some(SurvivalPredictionCovarianceMode::Conditional)
+    );
+    assert_eq!(
+        corrected.covariance_source,
+        Some(SurvivalPredictionCovarianceMode::SmoothingCorrected)
+    );
+    let conditional_se = conditional.survival_se.expect("conditional survival SE");
+    let corrected_se = corrected.survival_se.expect("corrected survival SE");
+    for ((cell, &narrow), &wide) in conditional_se.indexed_iter().zip(corrected_se.iter()) {
+        assert!(
+            narrow > 0.0 && wide > narrow,
+            "cell {cell:?}: the corrected band (sd {wide:.3e}) must be wider than the \
+             conditional one (sd {narrow:.3e}) under a 4× covariance"
+        );
+    }
+}
