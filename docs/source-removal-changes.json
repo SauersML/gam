@@ -2810,5 +2810,13 @@
     ],
     "reason": "#3877: paired_timing quantiles route through the shared gam_math::quantile::quantile_from_sorted; the private duplicate is deleted.",
     "evidence": "PR #3887; quantile_from_sorted returns NaN on empty input exactly like the removed helper."
+  },
+  {
+    "base": "e3fbe9373038ccaee479c0aa87d85febd623cc56",
+    "items": [
+      "crates/gam-models/src/fit_orchestration/drivers/spatial_hyper_dirs.rs:fn:add_analytic_penalty_hessian_to_eval"
+    ],
+    "reason": "#4161: add_analytic_penalty_hessian_to_eval assembled a wrong latent joint REML Hessian. It used hessian_diag (the exact diagonal, even for dense-Hessian penalties such as BlockOrthogonality, SoftmaxAssignmentSparsity and sheaf) as the whole t-t block and had no t-rho or rho-rho terms for learnable penalty rho, at O((n d)^2) HVP cost per outer evaluation. Its output was always discarded. add_analytic_penalty_objective_to_eval now declares its gradient-only contribution by downgrading an analytic Hessian to Unavailable itself.",
+    "evidence": "git grep -w add_analytic_penalty_hessian_to_eval at the base finds only its definition (spatial_hyper_dirs.rs:974) and its one call (:1069) in add_analytic_penalty_objective_to_eval. That function's only caller, spatial_optimization.rs:6260, is always followed at :6268 by add_latent_id_objective_to_eval, which sets eval.2 = HessianValue::Unavailable whenever it is analytic (spatial_hyper_dirs.rs:907-909). So no Hessian value this helper wrote ever reached store_eval."
   }
 ]
