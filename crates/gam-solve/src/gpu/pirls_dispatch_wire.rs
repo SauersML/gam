@@ -14,13 +14,13 @@
 //! "linux"`, and so is the entire wire surface. Non-Linux builds expose a
 //! no-op stub.
 
-// The admission helpers below feed only the Linux dispatch wire and the
-// unit tests, so they (and their imports) exist only in those builds.
-#[cfg(any(target_os = "linux", test))]
+// These admission helpers serve only the Linux dispatch wire. Their
+// tests have the same platform boundary as the production consumer.
+#[cfg(target_os = "linux")]
 use gam_gpu::policy::{PirlsLoopAdmission, PirlsLoopCurvatureKind, PirlsLoopFamilyKind};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use crate::gpu_kernels::pirls_row::{PirlsRowFamily, PirlsRowRoute};
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 use gam_problem::LikelihoodSpec;
 
 /// Result of mapping the engine-level `(ResponseFamily, InverseLink)` pair
@@ -32,7 +32,7 @@ use gam_problem::LikelihoodSpec;
 /// the CPU by the exact EDM row kernel), or a custom / blended likelihood
 /// (Sas, Mixture, LatentCLogLog, BetaLogistic, Tweedie, NegativeBinomial,
 /// Beta, RoystonParmar) with no built-in device row kernel.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFamilyKind> {
     Some(match PirlsRowRoute::for_spec(spec).device_family()? {
         PirlsRowFamily::BernoulliLogit => PirlsLoopFamilyKind::BernoulliLogit,
@@ -46,7 +46,7 @@ pub(crate) fn pirls_loop_family_for(spec: &LikelihoodSpec) -> Option<PirlsLoopFa
 
 /// Curvature surface the GPU loop should use given the family mapping and the
 /// CPU PIRLS loop's preferred curvature.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn pirls_loop_curvature_for(family: PirlsLoopFamilyKind) -> PirlsLoopCurvatureKind {
     match family {
         PirlsLoopFamilyKind::BernoulliProbit | PirlsLoopFamilyKind::BernoulliCLogLog => {
@@ -63,7 +63,7 @@ pub(crate) fn pirls_loop_curvature_for(family: PirlsLoopFamilyKind) -> PirlsLoop
 /// `(response, link)` spec and the active design shape `(n, p)`. Returns
 /// `None` when the family / link is not in the JIT-cached set so the caller
 /// skips both the GPU dispatch and the runtime probe.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 pub(crate) fn admission_for(
     spec: &LikelihoodSpec,
     n: usize,
@@ -1037,7 +1037,7 @@ pub(crate) use linux_impl::{
     try_gpu_pirls_loop_dispatch,
 };
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use gam_problem::{InverseLink, LikelihoodSpec, MixtureLinkState, ResponseFamily, StandardLink};

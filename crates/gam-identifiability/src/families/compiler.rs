@@ -76,8 +76,11 @@ pub trait RowJacobianOperator: Send + Sync {
     /// remain correct unchanged. (#738: a capability is not a representation —
     /// the compiler asks for the scaled design it needs, not the dense tensor.)
     ///
+    /// Fails when a row's `sqrt(H_i)` cannot be formed (see
+    /// [`symmetric_sqrt_into`]).
+    ///
     /// [`evaluate_full`]: RowJacobianOperator::evaluate_full
-    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Array2<f64> {
+    fn scaled_design_by_sqrt_h(&self, h_full: &Array3<f64>) -> Result<Array2<f64>, CompilerError> {
         scale_block_by_sqrt_h(&self.evaluate_full(), h_full)
     }
 
@@ -455,11 +458,11 @@ pub(crate) fn compile_with_dual_metric_protected(
     let scaled_h: Vec<Array2<f64>> = operators
         .iter()
         .map(|op| op.scaled_design_by_sqrt_h(&h_full))
-        .collect();
+        .collect::<Result<_, _>>()?;
     let scaled_s: Vec<Array2<f64>> = operators
         .iter()
         .map(|op| op.scaled_design_by_sqrt_h(&s_full))
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     let mut compiled: Vec<CompiledBlock> = Vec::with_capacity(operators.len());
     // Demotions that happen *inside* the per-block walk (a structurally-kept
@@ -704,7 +707,10 @@ pub(crate) fn compile_with_dual_metric_protected(
 /// Build `W_b = stack_i sqrt(H_i) · J_b,i` flattened to `(n*K, ncols)` from a
 /// materialised `(n, p, K)` tensor. Thin wrapper over
 /// `scale_jacobian_by_sqrt_h_with` that reads the tensor element-wise.
-fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> {
+fn scale_block_by_sqrt_h(
+    jb: &Array3<f64>,
+    h_full: &Array3<f64>,
+) -> Result<Array2<f64>, CompilerError> {
     let n = jb.shape()[0];
     let p = jb.shape()[1];
     let k = jb.shape()[2];
@@ -723,14 +729,14 @@ fn scale_block_by_sqrt_h(jb: &Array3<f64>, h_full: &Array3<f64>) -> Array2<f64> 
 /// it needs, not the dense per-row tensor.)
 ///
 /// `K` is tiny (1 or 4), so the per-row symmetric sqrt is negligible relative
-/// to the overall compile.
+/// to the overall compile. Fails when a row's `sqrt(H_i)` cannot be formed.
 pub(crate) fn scale_jacobian_by_sqrt_h_with(
     n: usize,
     p: usize,
     k: usize,
     h_full: &Array3<f64>,
     jac: impl Fn(usize, usize, usize) -> f64,
-) -> Array2<f64> {
+) -> Result<Array2<f64>, CompilerError> {
     assert_eq!(h_full.shape(), &[n, k, k]);
     let mut out = Array2::<f64>::zeros((n * k, p));
     let mut sqrt_h = Array2::<f64>::zeros((k, k));
@@ -739,7 +745,8 @@ pub(crate) fn scale_jacobian_by_sqrt_h_with(
         // Symmetric square root of H_i via eigendecomposition.
         let h_i = h_full.index_axis(Axis(0), i).to_owned();
         sqrt_h.fill(0.0);
-        symmetric_sqrt_into(&h_i, &mut sqrt_h);
+        symmetric_sqrt_into(&h_i, &mut sqrt_h)
+            .map_err(|reason| CompilerError::LinalgFailure(format!("row {i}: {reason}")))?;
         // scratch_jrow[a, c] = J_b,i[a, c] (transpose-friendly layout for
         // the GEMV below: we want (p × k) · (k,) = (p,) for each column of
         // sqrt_h, but we batch by writing out[(i*k+c), a] = (sqrt_h · J_b,iᵀ)[c, a].
@@ -758,53 +765,93 @@ pub(crate) fn scale_jacobian_by_sqrt_h_with(
             }
         }
     }
-    out
+    Ok(out)
 }
 
-/// Symmetric matrix square root via eigendecomposition with negative
-/// eigenvalues clamped to zero (PSD projection guard).
-pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) {
+/// Symmetric square root of a finite positive-semidefinite row metric.
+/// Only negative eigenvalues within their eigenpair backward-error band are
+/// projected to zero; resolved negative curvature is an error.
+///
+/// A failed eigendecomposition is an error. The diagonal of `m` is not a
+/// substitute: for a coupled row metric it drops every cross-channel term, so
+/// the scaled design would describe a different metric than the one the
+/// compile was asked to rank.
+pub(crate) fn symmetric_sqrt_into(m: &Array2<f64>, out: &mut Array2<f64>) -> Result<(), String> {
     let k = m.nrows();
     assert_eq!(m.ncols(), k);
     assert_eq!(out.shape(), &[k, k]);
+    if m.iter().any(|value| !value.is_finite()) {
+        return Err(format!(
+            "symmetric square root of a {k}x{k} row metric: non-finite entry"
+        ));
+    }
     if k == 1 {
-        out[[0, 0]] = m[[0, 0]].max(0.0).sqrt();
-        return;
-    }
-    let (evals, evecs) = match m.eigh(Side::Lower) {
-        Ok(pair) => pair,
-        Err(_) => {
-            // Fall back to clipped diagonal — extremely defensive for the
-            // K=4 row Hessian which is already PSD-clamped by the caller.
-            out.fill(0.0);
-            for i in 0..k {
-                out[[i, i]] = m[[i, i]].max(0.0).sqrt();
-            }
-            return;
+        if m[[0, 0]] < 0.0 {
+            return Err("symmetric square root: negative scalar row metric".to_string());
         }
-    };
-    // out = U · diag(sqrt(max(0, λ))) · Uᵀ
-    let mut scaled = evecs.clone();
-    for j in 0..k {
-        let s = evals[j].max(0.0).sqrt();
+        out[[0, 0]] = m[[0, 0]].sqrt();
+        return Ok(());
+    }
+    let (evals, evecs) = m.eigh(Side::Lower).map_err(|e| {
+        format!("symmetric square root of a {k}x{k} row metric: eigendecomposition failed ({e:?})")
+    })?;
+    if evals
+        .iter()
+        .chain(evecs.iter())
+        .any(|value| !value.is_finite())
+    {
+        return Err(format!(
+            "symmetric square root of a {k}x{k} row metric: non-finite eigendecomposition"
+        ));
+    }
+    // An eigenpair residual bounds the distance to the symmetric matrix's
+    // spectrum. Include the rounding error of each k-term matrix/vector dot
+    // product and the lambda*u subtraction; scale by the eigenvector norm.
+    // Only an unresolved negative within that backward-error band may be
+    // projected to zero. A resolved negative is an invalid PSD row metric.
+    let growth = gam_math::roundoff::accumulation_growth(k + 2);
+    for column in 0..k {
+        let lambda = evals[column];
+        if lambda >= 0.0 {
+            continue;
+        }
+        let mut vector_norm = 0.0_f64;
+        let mut residual_norm = 0.0_f64;
+        let mut rounding_norm = 0.0_f64;
         for i in 0..k {
-            scaled[[i, j]] *= s;
+            let u = evecs[[i, column]];
+            vector_norm = vector_norm.hypot(u);
+            let mut product = 0.0;
+            let mut magnitude = (lambda * u).abs();
+            for j in 0..k {
+                // eigh consumes the lower triangle of the row metric.
+                let value = m[[i.max(j), i.min(j)]] * evecs[[j, column]];
+                product += value;
+                magnitude += value.abs();
+            }
+            residual_norm = residual_norm.hypot(product - lambda * u);
+            rounding_norm = rounding_norm.hypot(growth * magnitude);
+        }
+        let band = (residual_norm + rounding_norm) / vector_norm;
+        if !band.is_finite() || vector_norm == 0.0 || lambda < -band {
+            return Err(format!(
+                "symmetric square root: negative row-metric eigenvalue {lambda} exceeds its backward-error band {band}"
+            ));
         }
     }
-    out.assign(&fast_atb(&evecs.t().to_owned(), &scaled.t().to_owned()));
-    // The above fast_atb computed (Uᵀ)ᵀ · (Uᵀ·diag(s)) = U · diag(s) · Uᵀ
-    // when the inputs are owned. To be safe and avoid layout surprises,
-    // re-do the small multiplication explicitly for K ≤ 4.
-    out.fill(0.0);
+    // Form one triangle of U diag(sqrt(max(0, λ))) Uᵀ and mirror it.
+    // Independent triangle sums can round differently despite exact symmetry.
     for i in 0..k {
-        for j in 0..k {
+        for j in 0..=i {
             let mut acc = 0.0;
             for l in 0..k {
                 acc += evecs[[i, l]] * evals[l].max(0.0).sqrt() * evecs[[j, l]];
             }
             out[[i, j]] = acc;
+            out[[j, i]] = acc;
         }
     }
+    Ok(())
 }
 
 /// Solve `Aᵀ A · M = Aᵀ B` and return `(B − A·M, Some(M))`. With `A`
@@ -1728,11 +1775,7 @@ mod tests {
         let compiled = compile(
             &ops,
             &hess,
-            &[
-                BlockOrder::Marginal,
-                BlockOrder::Slope,
-                BlockOrder::LinkDev,
-            ],
+            &[BlockOrder::Marginal, BlockOrder::Slope, BlockOrder::LinkDev],
         )
         .expect("compile should succeed");
         let total: usize = compiled.blocks.iter().map(|b| b.t_lw.ncols()).sum();
@@ -2214,4 +2257,76 @@ mod tests {
         }
     }
 
+    /// `sqrt(H)` of a coupled row metric keeps the cross-channel terms: it squares
+    /// back to `H`, which the clipped-diagonal substitute this replaced did not.
+    #[test]
+    fn symmetric_sqrt_of_a_coupled_metric_squares_back() {
+        let h = ndarray::array![[2.0, 0.9, 0.1], [0.9, 1.5, -0.4], [0.1, -0.4, 1.0]];
+        let mut root = Array2::<f64>::zeros((3, 3));
+        symmetric_sqrt_into(&h, &mut root).expect("an SPD metric has a square root");
+        let square = root.dot(&root);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (square[[i, j]] - h[[i, j]]).abs() <= 1e-12,
+                    "sqrt(H)^2 must reproduce H at ({i}, {j}): {} vs {}",
+                    square[[i, j]],
+                    h[[i, j]]
+                );
+                assert_eq!(root[[i, j]], root[[j, i]], "sqrt(H) must be symmetric");
+            }
+        }
+    }
+
+    /// A metric outside the finite domain is refused before the eigensolver or
+    /// scalar PSD projection can erase the invalid entry.
+    #[test]
+    fn symmetric_sqrt_of_a_non_finite_metric_is_not_a_finite_substitute() {
+        let h = ndarray::array![[1.0, f64::NAN], [f64::NAN, 1.0]];
+        let mut root = Array2::<f64>::zeros((2, 2));
+        let result = symmetric_sqrt_into(&h, &mut root);
+        assert!(
+            result.is_err(),
+            "a non-finite metric must not produce a finite square root: {root:?}"
+        );
+    }
+
+    #[test]
+    fn nonfinite_scalar_metric_is_refused_through_both_compiler_operators() {
+        use crate::families::bernoulli::BernoulliDenseDesignOperator;
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let hessian = DiagonalScalarRowHessian::new(ndarray::array![1.0, invalid]);
+            let design = ndarray::array![[1.0], [2.0]];
+            let operators: [Arc<dyn RowJacobianOperator>; 2] = [
+                op(design.clone()),
+                Arc::new(BernoulliDenseDesignOperator::new(design)),
+            ];
+            for operator in operators {
+                let error = compile(&[operator], &hessian, &[BlockOrder::Marginal])
+                    .err()
+                    .expect("a non-finite row metric must fail the public compiler");
+                assert!(matches!(error, CompilerError::LinalgFailure(_)), "{error}");
+                assert!(error.to_string().contains("row 1"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn row_metric_square_root_refuses_negative_curvature_but_keeps_psd_nullspace() {
+        for scalar in [-1.0, -f64::MIN_POSITIVE, -f64::from_bits(1)] {
+            let mut root = Array2::zeros((1, 1));
+            assert!(symmetric_sqrt_into(&ndarray::array![[scalar]], &mut root).is_err());
+        }
+        let mut root = Array2::zeros((2, 2));
+        let indefinite = ndarray::array![[1.0, 2.0], [2.0, 1.0]];
+        assert!(symmetric_sqrt_into(&indefinite, &mut root).is_err());
+        let singular = ndarray::array![[1.0, 1.0], [1.0, 1.0]];
+        symmetric_sqrt_into(&singular, &mut root).expect("the PSD null direction is valid");
+        let square = root.dot(&root);
+        for value in square {
+            assert!((value - 1.0).abs() <= gam_math::roundoff::accumulation_growth(8));
+        }
+        symmetric_sqrt_into(&Array2::zeros((2, 2)), &mut root).unwrap();
+        assert!(root.iter().all(|value| *value == 0.0));
+    }
 }

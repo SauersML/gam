@@ -75,6 +75,16 @@
 //! one-way ANOVA `F` on a balanced design. `D'` is the unpenalized residual and
 //! not the fit's `φ̂` because `φ̂` is computed from a residual the penalty shrank,
 //! whose law under `H₀` depends on the smoothing parameters REML chose.
+//!
+//! # Ridged slopes
+//!
+//! A linear term under the REML-selected `LinearTermRidge` is the same
+//! question with a one-column `X_R`: its penalty makes the slope a variance
+//! component, and "no effect" is that component on the boundary. With one
+//! column `V = μ` is a scalar, `T/(φμ)` is `χ²₁`, and with an estimated scale
+//! the ratio is `F(1, ν)`: for a Gaussian model exactly the classical partial
+//! `t²` of the UNPENALIZED slope, read without the shrunk `β̂` the Wald ratio
+//! would need.
 
 
 use std::ops::Range;
@@ -275,7 +285,7 @@ impl<'a> RandomEffectTestBasis<'a> {
         if let RandomEffectTestScale::Known { dispersion } = input.scale
             && !(dispersion.is_finite() && dispersion > 0.0)
         {
-            return Err(RandomEffectTestUnavailable::DesignUnavailable);
+            return Err(RandomEffectTestUnavailable::KnownScaleUnavailable);
         }
 
         let mut hessian_gram = Array2::<f64>::zeros((p, p));
@@ -554,9 +564,9 @@ fn weighted_cross(block: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f
     block.t().dot(&weighted)
 }
 
-struct PseudoInverse {
-    inverse: Array2<f64>,
-    rank: usize,
+pub(crate) struct PseudoInverse {
+    pub(crate) inverse: Array2<f64>,
+    pub(crate) rank: usize,
 }
 
 /// Moore-Penrose inverse of a symmetric positive semi-definite Gram, taken on
@@ -570,8 +580,9 @@ struct PseudoInverse {
 ///
 /// `D^{-1/2} C⁺ D^{-1/2}` is a generalized inverse of `G` (not its Moore-Penrose
 /// inverse when `G` is singular), which is all a projection and a residual sum
-/// of squares require: `G G⁻ G = G` makes both invariant to the choice.
-fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
+/// of squares require: `G G⁻ G = G` makes both invariant to the choice. The
+/// smooth score test's unpenalized residual reads the same inverse.
+pub(crate) fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
     let dim = gram.nrows();
     if dim == 0 || gram.ncols() != dim || gram.iter().any(|v| !v.is_finite()) {
         return None;
@@ -751,6 +762,80 @@ mod tests {
         );
     }
 
+    /// A ridged linear term is a one-column block. Its score test must be the
+    /// classical partial test of the UNPENALIZED slope — `t²` on `n − p`
+    /// residual degrees of freedom with an estimated scale, `z²` with a known
+    /// one — whatever shrunk slope the fit reported (gam#3573).
+    #[test]
+    fn a_single_column_term_is_the_partial_test_of_the_unpenalized_slope() {
+        use gam_math::probability::{normal_two_sided_probability, student_t_two_sided_probability};
+        let n = 80;
+        let mut rng = Lcg(41);
+        let x: Vec<f64> = (0..n).map(|_| rng.next_uniform()).collect();
+        // Correlated with `x`, so the partial test differs from the marginal one.
+        let z: Vec<f64> = (0..n).map(|i| x[i] * x[i] + 0.5 * rng.next_uniform()).collect();
+        let mut design = Array2::<f64>::zeros((n, 3));
+        for i in 0..n {
+            design[[i, 0]] = 1.0;
+            design[[i, 1]] = x[i];
+            design[[i, 2]] = z[i];
+        }
+        let y: Array1<f64> = (0..n)
+            .map(|i| 0.5 + x[i] + 0.4 * z[i] + rng.next_normal())
+            .collect();
+
+        // Ordinary least squares on the full design.
+        let gram_inverse = equilibrated_pseudo_inverse(&design.t().dot(&design))
+            .expect("full-rank Gram")
+            .inverse;
+        let ols = gram_inverse.dot(&design.t().dot(&y));
+        let residual = &y - &design.dot(&ols);
+        let residual_df = (n - 3) as f64;
+        let sigma2 = residual.dot(&residual) / residual_df;
+        let t = ols[2] / (sigma2 * gram_inverse[[2, 2]]).sqrt();
+        let z_known = ols[2] / gram_inverse[[2, 2]].sqrt();
+
+        // The fit's slope is shrunk; the test must not read it.
+        let shrunk = Array1::from(vec![0.9, 0.7, 0.05]);
+        let estimated =
+            gaussian_test(&design, &y, &shrunk, 2..3, RandomEffectTestScale::Estimated)
+                .expect("test runs");
+        assert_eq!(estimated.rank, 1);
+        assert!((estimated.reference_df - 1.0).abs() < 1e-12, "{estimated:?}");
+        assert_eq!(estimated.residual_df, Some(residual_df));
+        assert!(
+            (estimated.statistic - t * t).abs() <= 1e-8 * t * t,
+            "{estimated:?} vs t²={}",
+            t * t
+        );
+        let expected = student_t_two_sided_probability(t, residual_df);
+        assert!(
+            (estimated.p_value - expected).abs() <= 1e-8 * expected + 1e-14,
+            "{} vs {expected}",
+            estimated.p_value
+        );
+
+        let known = gaussian_test(
+            &design,
+            &y,
+            &shrunk,
+            2..3,
+            RandomEffectTestScale::Known { dispersion: 1.0 },
+        )
+        .expect("test runs");
+        assert!(
+            (known.statistic - z_known * z_known).abs() <= 1e-8 * z_known * z_known,
+            "{known:?} vs z²={}",
+            z_known * z_known
+        );
+        let expected = normal_two_sided_probability(z_known);
+        assert!(
+            (known.p_value - expected).abs() <= 1e-8 * expected + 1e-14,
+            "{} vs {expected}",
+            known.p_value
+        );
+    }
+
     #[test]
     fn statistic_does_not_depend_on_where_the_fit_left_beta() {
         let levels = 8;
@@ -880,6 +965,26 @@ mod tests {
         )
         .expect_err("no residual d.f.");
         assert_eq!(reason, RandomEffectTestUnavailable::NoResidualDegreesOfFreedom);
+    }
+
+    #[test]
+    fn unresolvable_known_dispersion_is_a_typed_known_scale_absence() {
+        let levels = 3;
+        let groups: Vec<usize> = (0..30).map(|i| i % levels).collect();
+        let design = intercept_and_groups(&groups, levels);
+        let y: Array1<f64> = groups.iter().map(|&g| g as f64).collect();
+        let beta = Array1::<f64>::zeros(design.ncols());
+        for dispersion in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let reason = gaussian_test(
+                &design,
+                &y,
+                &beta,
+                1..1 + levels,
+                RandomEffectTestScale::Known { dispersion },
+            )
+            .expect_err("no usable dispersion");
+            assert_eq!(reason, RandomEffectTestUnavailable::KnownScaleUnavailable);
+        }
     }
 
     #[test]

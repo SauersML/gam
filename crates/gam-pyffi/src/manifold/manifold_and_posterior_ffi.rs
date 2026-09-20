@@ -85,54 +85,6 @@ fn posterior_trace_selection_json_impl(request_json: &str) -> Result<String, Str
         .map_err(|err| format!("posterior_trace_selection_json: serialise payload: {err}"))
 }
 
-fn posterior_eta_bands_impl(
-    eta: Array2<f64>,
-    family_kind: &str,
-    level: f64,
-    link_spec: Option<&str>,
-) -> Result<PosteriorPredictBandsPayload, String> {
-    // Prefer the typed link spec when supplied so the parameterized links
-    // (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`) push their per-fit
-    // state through to the response-scale bands; otherwise fall back to the
-    // bare string tag (issue #1133).
-    let parsed_link: Option<InverseLink> = match link_spec {
-        Some(spec_json) => Some(
-            serde_json::from_str(spec_json)
-                .map_err(|err| format!("failed to parse link_spec for posterior bands: {err}"))?,
-        ),
-        None => None,
-    };
-    let selector = match parsed_link.as_ref() {
-        Some(link) => posterior_bands::LinkSelector::Spec(link),
-        None => posterior_bands::LinkSelector::Tag(family_kind),
-    };
-    let (n_draws, n_rows) = eta.dim();
-    let family_kind = match selector {
-        posterior_bands::LinkSelector::Tag(tag) => tag.to_string(),
-        posterior_bands::LinkSelector::Spec(spec) => spec.link_function().name().to_string(),
-    };
-    let (
-        linear_predictor,
-        linear_predictor_lower,
-        linear_predictor_upper,
-        mean,
-        mean_lower,
-        mean_upper,
-    ) = posterior_bands::eta_bands_from_matrix_link(eta.view(), selector, level)?;
-    Ok(PosteriorPredictBandsPayload {
-        linear_predictor,
-        linear_predictor_lower,
-        linear_predictor_upper,
-        mean,
-        mean_lower,
-        mean_upper,
-        n_rows,
-        n_draws,
-        model_class: String::new(),
-        family_kind,
-    })
-}
-
 fn posterior_draw_bands_impl(
     eta: Array2<f64>,
     mean: Array2<f64>,
@@ -268,7 +220,7 @@ fn family_link_kind(family: &LikelihoodSpec) -> &'static str {
 
 /// Serialize the fully parameterized [`InverseLink`] of a model's likelihood to
 /// JSON so the Python wrapper can carry it back into the response-scale
-/// transforms (`apply_inverse_link_array`, `posterior_eta_bands`) as a typed
+/// transform (`apply_inverse_link_array`) as a typed
 /// `link_spec` rather than a lossy `family_kind` tag. The parameterized links
 /// (`Sas`, `Mixture`, `LatentCLogLog`, `BetaLogistic`) carry per-fit state that
 /// the bare string tag cannot represent; this is the seam that wires their

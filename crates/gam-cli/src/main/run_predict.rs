@@ -1195,9 +1195,9 @@ pub(crate) fn run_predict_model(
         return run_predict_residual_cascade(args, model, data, col_map);
     }
 
-    let predictor = model.predictor().ok_or_else(|| {
+    let predictor = model.predictor().map_err(|reason| {
         format!(
-            "{} prediction requires a predictor, but the saved model could not construct one",
+            "{} prediction requires a predictor, but the saved model could not construct one: {reason}",
             pretty_predict_model_class(model.predict_model_class())
         )
     })?;

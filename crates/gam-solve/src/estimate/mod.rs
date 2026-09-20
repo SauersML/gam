@@ -29,7 +29,8 @@ use crate::mixture_link::{state_from_beta_logisticspec, state_from_sasspec, stat
 pub use crate::model_types::{CoefficientPriorMean, Dispersion, EstimationError, PenaltySpec};
 use crate::pirls::{self, PirlsResult};
 use gam_linalg::matrix::DesignMatrix;
-use gam_linalg::utils::{KahanSum, row_mismatch_message};
+use gam_linalg::utils::row_mismatch_message;
+use gam_math::sparse_grid::CompensatedSum;
 use gam_problem::{
     Coefficients, GlmLikelihoodSpec, InverseLink, LatentCLogLogState, LikelihoodScaleMetadata,
     LikelihoodSpec, LinkFunction, LogLikelihoodNormalization, LogSmoothingParamsView,
@@ -68,22 +69,20 @@ mod joint_hyper;
 mod null_space_normalizer;
 mod optimizer;
 pub mod outer_eval_capture;
-pub mod rho_domain;
+mod parametric_term_summary;
 mod penalty;
 mod prefit;
-pub(crate) mod smoothing_correction;
-mod parametric_term_summary;
+pub mod rho_domain;
 mod smooth_term_summary;
+pub(crate) mod smoothing_correction;
 mod summary;
 
 pub use crate::model_types::result_types::dispersion_from_likelihood;
 pub use crate::model_types::{
-    BlockRole, CovarianceDeclined, FitArtifacts, FitGeometry,
-    FitInference, FitOptions,
+    BlockRole, CovarianceDeclined, FitArtifacts, FitGeometry, FitInference, FitOptions,
     FittedBlock, FittedLinkState, NO_COMPARABLE_CRITERION_WITHOUT_NULL_SPACE,
-    NO_CRITERION_AT_EXACT_FIT, OuterCriterionCertificate,
-    OuterStationarityCertificate, UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry,
-    is_zero_dispersion_boundary,
+    NO_CRITERION_AT_EXACT_FIT, OuterCriterionCertificate, OuterStationarityCertificate,
+    UnifiedFitResult, UnifiedFitResultParts, WorkingGeometry, is_zero_dispersion_boundary,
     saved_latent_cloglog_state_from_fit, saved_mixture_state_from_fit, saved_sas_state_from_fit,
     validate_dense_hessian_export, validate_explicit_dense_hessian_for_whitening,
 };
@@ -102,60 +101,59 @@ pub use fixed_lambda_fit::{
     fit_nested_at_fitted_log_lambdas,
 };
 pub use gam_problem::{ensure_finite_scalar, validate_all_finite};
-pub use joint_hyper::{
-    ExternalJointHyperEvaluator, gaussian_identity_outer_response_conditioning,
-};
+pub use joint_hyper::{ExternalJointHyperEvaluator, gaussian_identity_outer_response_conditioning};
 pub use null_space_normalizer::null_space_normalizer_metadata;
-pub(crate) use optimizer::optimize_external_designwith_heuristic_log_lambdas_andwarm_start;
 pub use optimizer::optimize_external_designwith_heuristic_log_lambdas;
+pub(crate) use optimizer::optimize_external_designwith_heuristic_log_lambdas_andwarm_start;
 pub(crate) use penalty::{
     ParametricColumnConditioning, faer_frob_inner, kahan_sum, map_hessian_to_original_basis,
 };
 pub(crate) use prefit::validate_penalty_specs;
 pub(crate) use smoothing_correction::{
-    RemlConfig,
-    SmoothingCorrectionStatus, SmoothingCorrectionUnavailable, compute_smoothing_correction,
-    smooth_floor_dp,
+    RemlConfig, SmoothingCorrectionStatus, SmoothingCorrectionUnavailable,
+    compute_smoothing_correction, smooth_floor_dp,
 };
 // The identified ρ-Hessian inverse is the one owner of the first-order
 // smoothing correction's `V_ρ`, including on the custom-family and single-cause
 // survival lanes (#2346, #2912).
-pub use smoothing_correction::{
-    EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
-    invert_identified_rho_hessian_off_railed,
-};
 pub use parametric_term_summary::parametric_term_summary_rows;
 pub use smooth_term_summary::{
     SummaryBlockOffset, smooth_pvalue_unavailable, smooth_term_summary_rows,
 };
+pub use smoothing_correction::{
+    EigenClassification, InvertedRhoHessian, invert_identified_rho_hessian,
+    invert_identified_rho_hessian_off_railed,
+};
 pub use summary::{
-    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus,
-    ParametricTermSummary, SmoothPValueUnavailable, SmoothTermSummary,
+    ContinuousSmoothnessOrder, ContinuousSmoothnessOrderStatus, ParametricTermSummary,
+    SmoothPValueUnavailable, SmoothTermSummary,
 };
 
 #[cfg(test)]
 mod binomial_reml_outer_cost_1575_tests;
 #[cfg(test)]
-mod inner_residual_charge_2954_tests;
-#[cfg(test)]
-mod ridge_continuity_tests;
-#[cfg(test)]
-mod wide_design_reml_derivatives_tests;
+mod constrained_marginal_truncation_2705_tests;
 #[cfg(test)]
 mod continuous_order_tests;
 #[cfg(test)]
 mod estimate_policy_tests;
 #[cfg(test)]
-mod link_ext_hessian_2665_tests;
-#[cfg(test)]
-mod student_t_laml_tests;
-#[cfg(test)]
 mod gaussian_high_edf_scale_tests;
 #[cfg(test)]
 mod gaussian_observation_interval_calibration_tests;
 #[cfg(test)]
+mod inner_residual_charge_2954_tests;
+#[cfg(test)]
 mod invert_regularized_rho_hessian_tests;
+#[cfg(test)]
+mod link_ext_hessian_2665_tests;
 #[cfg(test)]
 mod many_smoothing_parameter_correction_tests;
 #[cfg(test)]
-mod constrained_marginal_truncation_2705_tests;
+mod ridge_continuity_tests;
+#[cfg(test)]
+mod score_test_working_residual_3832_tests;
+#[cfg(test)]
+mod student_t_laml_tests;
+#[cfg(test)]
+mod wide_design_reml_derivatives_tests;
