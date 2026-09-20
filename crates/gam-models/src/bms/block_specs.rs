@@ -4038,13 +4038,18 @@ fn fit_bernoulli_marginal_slope_terms_under(
     // gam#2943: the decision is logged from the classification itself, so the
     // log cannot claim a refusal the classifier did not make. A withheld
     // covariance says why through `CovarianceDeclined::explain` below.
-    // gam#2985: a residual repair block has no channel under any measure, so it
-    // is withheld before the measure's own channel is consulted.
+    // gam#2985: a residual repair block under the conditional Σ(a) has no
+    // channel under any measure, so it is withheld before the measure's own
+    // channel is consulted; under the pooled law the block's own channel joins
+    // the measure's below.
     let declined = if !(solved_fit.covariance_conditional.is_some()
         && latent_z_conditional_calibration.is_some())
     {
         None
-    } else if residual_runtime.is_some() {
+    } else if residual_runtime
+        .as_ref()
+        .is_some_and(|runtime| runtime.field.is_conditional())
+    {
         Some(
             gam_solve::estimate::CovarianceDeclined::
                 BmsGeneratedRegressorResidualRepairChannelUnavailable {
@@ -4117,6 +4122,36 @@ fn fit_bernoulli_marginal_slope_terms_under(
             correction_family
                 .flex_score_zeta_sensitivity(&solved_fit.block_states, options, p_beta)
                 .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?
+        } else if residual_runtime.is_some() {
+            let build = match &empirical_channel {
+                EmpiricalGeneratedRegressorChannel::ClosedForm => None,
+                EmpiricalGeneratedRegressorChannel::Empirical(build) => Some(*build),
+                EmpiricalGeneratedRegressorChannel::Unavailable { .. } => {
+                    return Err(FitFailure::raised(
+                        gam_problem::FailureCategory::Invariant,
+                        "bms generated-regressor: a residual repair correction on a measure \
+                         without a generated-regressor channel"
+                            .to_string(),
+                    ));
+                }
+            };
+            let s = super::residual_repair_kernel::ResidualDriveKernel::new(
+                correction_family,
+                solved_fit.block_states.clone(),
+            )
+            .and_then(|kernel| kernel.score_zeta_sensitivity(build))
+            .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            if s.ncols() != p_beta {
+                return Err(FitFailure::raised(
+                    gam_problem::FailureCategory::Invariant,
+                    format!(
+                        "bms generated-regressor: the residual score sensitivity has {} columns \
+                         against Vb's {p_beta}",
+                        s.ncols()
+                    ),
+                ));
+            }
+            s
         } else {
             // Use the FAMILY designs here, not the raw reporting designs: they
             // are exactly the widened-marginal/reduced-slope coefficient
