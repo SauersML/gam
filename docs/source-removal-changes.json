@@ -2665,5 +2665,13 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "3d306728d71b4e24433564e05043d5e68056f47a",
+    "items": [
+      "crates/gam-custom-family/src/tests/inner_solver_numerics.rs:fn:projected_stationarity_uses_the_qp_face_without_expanding_tight_rows"
+    ],
+    "reason": "Renamed to projected_stationarity_uses_the_tangent_face_without_expanding_tight_rows: the QP-face seed argument is removed (#3513), so the test now pins the single tangent-face rule.",
+    "evidence": "crates/gam-custom-family/src/tests/inner_solver_numerics.rs keeps the same 4,096-duplicate-row assertions under the new name."
   }
 ]
