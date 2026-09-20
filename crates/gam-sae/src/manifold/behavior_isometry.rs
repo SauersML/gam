@@ -279,16 +279,20 @@ fn behavior_curve_speeds(
 }
 
 /// Construct the behavior-pinned arc-length representative on a dense audit
-/// grid, then interpolate the fitted rows into that coordinate.  The grid size
-/// is the same public arc-length integration resolution used by the activation
-/// chart canonicalizer, so the two quotient reads have one numerical contract.
+/// grid, then interpolate the fitted rows into that coordinate.  The grid, the
+/// quadrature and the interpolant are the activation chart canonicalizer's:
+/// `ARC_LENGTH_GRID_CELLS` composite-Simpson cells (node, midpoint, node), with
+/// fitted rows read through the exact integral of each cell's quadratic speed
+/// interpolant. The two quotient reads therefore share one numerical contract.
 fn behavior_pinned_chart(
     evaluator: &dyn SaeBasisEvaluator,
     behavior_decoder: ArrayView2<'_, f64>,
     row_coords: ArrayView1<'_, f64>,
     topology: &crate::chart_canonicalization::CanonicalChartTopology,
 ) -> Result<Option<BehaviorPinnedChart>, String> {
-    use crate::chart_canonicalization::{ARC_LENGTH_GRID_CELLS, CanonicalChartTopology};
+    use crate::chart_canonicalization::{
+        ARC_LENGTH_GRID_CELLS, CanonicalChartTopology, arc_length_grid_resolves, partial_cell_arc,
+    };
 
     if row_coords.is_empty() {
         return Ok(None);
@@ -303,22 +307,27 @@ fn behavior_pinned_chart(
         CanonicalChartTopology::Interval => {
             let lo = row_coords.iter().copied().fold(f64::INFINITY, f64::min);
             let hi = row_coords.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            if !(lo.is_finite() && hi.is_finite() && hi > lo) {
+            if !(lo.is_finite() && hi.is_finite() && arc_length_grid_resolves(lo, hi)) {
                 return Ok(None);
             }
             (lo, hi, false)
         }
     };
+    // Speed field on the composite-Simpson grid: node `j` sits at sample `2j`,
+    // the midpoint of cell `j` at sample `2j + 1`.
     let cells = ARC_LENGTH_GRID_CELLS;
     let step = (hi - lo) / cells as f64;
-    let mut grid = Array2::<f64>::zeros((cells + 1, 1));
-    for i in 0..=cells {
-        grid[[i, 0]] = lo + step * i as f64;
+    let mut grid = Array2::<f64>::zeros((2 * cells + 1, 1));
+    for j in 0..=cells {
+        grid[[2 * j, 0]] = lo + j as f64 * step;
+        if j < cells {
+            grid[[2 * j + 1, 0]] = lo + (j as f64 + 0.5) * step;
+        }
     }
     let (phi, jet) = evaluator.evaluate(grid.view())?;
     let behavior_points = phi.dot(&behavior_decoder);
     let speeds = behavior_curve_speeds(&jet, behavior_decoder, behavior_points.view())?;
-    if speeds.len() != cells + 1
+    if speeds.len() != 2 * cells + 1
         || speeds
             .iter()
             .any(|speed| !speed.is_finite() || *speed < 0.0)
@@ -326,8 +335,9 @@ fn behavior_pinned_chart(
         return Ok(None);
     }
     let mut cumulative = Array1::<f64>::zeros(cells + 1);
-    for i in 1..=cells {
-        cumulative[i] = cumulative[i - 1] + 0.5 * step * (speeds[i - 1] + speeds[i]);
+    for j in 0..cells {
+        cumulative[j + 1] = cumulative[j]
+            + step * (speeds[2 * j] + 4.0 * speeds[2 * j + 1] + speeds[2 * j + 2]) / 6.0;
     }
     let behavior_length = cumulative[cells];
     if !(behavior_length.is_finite() && behavior_length > 0.0) {
@@ -339,7 +349,7 @@ fn behavior_pinned_chart(
     let mut anchor_grid = 0usize;
     let mut anchor_norm_sq = f64::INFINITY;
     for i in 0..=cells {
-        let norm_sq = behavior_points.row(i).dot(&behavior_points.row(i));
+        let norm_sq = behavior_points.row(2 * i).dot(&behavior_points.row(2 * i));
         if norm_sq < anchor_norm_sq {
             anchor_norm_sq = norm_sq;
             anchor_grid = i;
@@ -359,14 +369,14 @@ fn behavior_pinned_chart(
             anchor_grid.saturating_sub(radius),
             (anchor_grid + radius).min(cells),
         ] {
-            if speeds[idx] == 0.0 {
+            if speeds[2 * idx] == 0.0 {
                 continue;
             }
             for out in 0..behavior_decoder.ncols() {
                 let mut derivative = 0.0_f64;
                 let mut absolute = 0.0_f64;
                 for basis in 0..behavior_decoder.nrows() {
-                    let term = jet[[idx, basis, 0]] * behavior_decoder[[basis, out]];
+                    let term = jet[[2 * idx, basis, 0]] * behavior_decoder[[basis, out]];
                     derivative += term;
                     absolute += term.abs();
                 }
@@ -395,10 +405,17 @@ fn behavior_pinned_chart(
         } else {
             coord.clamp(lo, hi)
         };
-        let pos = ((coord - lo) / step).clamp(0.0, cells as f64);
-        let left = (pos.floor() as usize).min(cells - 1);
-        let frac = pos - left as f64;
-        cumulative[left] + frac * (cumulative[left + 1] - cumulative[left])
+        let local = coord - lo;
+        let cell = ((local / step).floor() as usize).min(cells - 1);
+        let x = (local - cell as f64 * step).clamp(0.0, step);
+        cumulative[cell]
+            + partial_cell_arc(
+                speeds[2 * cell],
+                speeds[2 * cell + 1],
+                speeds[2 * cell + 2],
+                step,
+                x,
+            )
     };
     let coordinate_period = behavior_length * std::f64::consts::FRAC_1_SQRT_2;
     let mut canonical = Array1::<f64>::zeros(row_coords.len());
@@ -665,6 +682,74 @@ mod tests {
             cert.defect_cv
         );
         assert!(cert.defect_cv > 0.2);
+    }
+
+    /// Composite Simpson on `[lo, t]` with `cells` cells, read through the same
+    /// behavior speed field the pinned chart integrates.
+    fn reference_behavior_arc(
+        evaluator: &dyn SaeBasisEvaluator,
+        decoder: ArrayView2<'_, f64>,
+        lo: f64,
+        t: f64,
+        cells: usize,
+    ) -> f64 {
+        if t <= lo {
+            return 0.0;
+        }
+        let h = (t - lo) / cells as f64;
+        let mut grid = Array2::<f64>::zeros((2 * cells + 1, 1));
+        for j in 0..=(2 * cells) {
+            grid[[j, 0]] = lo + 0.5 * h * j as f64;
+        }
+        let (phi, jet) = evaluator.evaluate(grid.view()).unwrap();
+        let points = phi.dot(&decoder);
+        let speeds = behavior_curve_speeds(&jet, decoder, points.view()).unwrap();
+        (0..cells)
+            .map(|j| h * (speeds[2 * j] + 4.0 * speeds[2 * j + 1] + speeds[2 * j + 2]) / 6.0)
+            .sum()
+    }
+
+    /// The pinned behavior chart integrates behavior arc length on the shared
+    /// composite-Simpson contract (`ARC_LENGTH_GRID_CELLS` cells, quadratic
+    /// in-cell interpolant). A low-order quadrature/interpolant on the same grid
+    /// misplaces rows by ~1e-7 of the behavior length on this smooth curve; the
+    /// Simpson reading is exact to round-off.
+    #[test]
+    fn behavior_pinned_chart_arc_length_matches_the_simpson_contract() {
+        use crate::chart_canonicalization::CanonicalChartTopology;
+        use crate::manifold::PeriodicHarmonicEvaluator;
+
+        let evaluator = PeriodicHarmonicEvaluator::new(5).unwrap();
+        // Rows: [1, sin 2πt, cos 2πt, sin 4πt, cos 4πt]; ‖y‖² < 2 everywhere.
+        let decoder = ndarray::array![[0.05, 0.0], [0.0, 0.3], [0.3, 0.0], [0.1, 0.0], [0.0, 0.08]];
+        let rows = Array1::from(vec![0.1, 0.123_456_7, 0.2718, 0.3333, 0.4]);
+        let pinned = behavior_pinned_chart(
+            &evaluator,
+            decoder.view(),
+            rows.view(),
+            &CanonicalChartTopology::Interval,
+        )
+        .unwrap()
+        .expect("a smooth engaged behavior arc must have a pinned chart");
+
+        let fine = 8 * crate::chart_canonicalization::ARC_LENGTH_GRID_CELLS;
+        let lo = rows[0];
+        let total = reference_behavior_arc(&evaluator, decoder.view(), lo, rows[4], fine);
+        let tol = 1e-11 * total;
+        assert!(
+            (pinned.behavior_length - total).abs() <= tol,
+            "behavior length {} vs reference {total}",
+            pinned.behavior_length
+        );
+        for (row, &t) in rows.iter().enumerate() {
+            let want = reference_behavior_arc(&evaluator, decoder.view(), lo, t, fine);
+            let got = (pinned.coords[row] - pinned.coords[0]).abs() * std::f64::consts::SQRT_2;
+            assert!(
+                (got - want).abs() <= tol,
+                "row {row} (t = {t}): pinned arc {got} vs reference {want}, error {:e}",
+                got - want
+            );
+        }
     }
 
     /// An inert behavior block (all behavior speeds zero) is reported as not
