@@ -12,7 +12,7 @@ fn interval_fixture() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let p = 2usize;
     let evaluator = Arc::new(EuclideanPatchEvaluator::new(1, 2).expect("patch basis"));
     // Generating latent: several rows sit beyond the interval's upper end.
-    let truth = [-0.7, -0.3, 0.1, 0.4, 1.6, 1.8, 2.0, 0.8];
+    let truth: [f64; 8] = [-0.7, -0.3, 0.1, 0.4, 1.6, 1.8, 2.0, 0.8];
     let coords = Array2::<f64>::from_shape_fn((n, 1), |(row, _)| 0.8 * truth[row].clamp(-0.9, 0.9));
     let (phi, jet) = evaluator.evaluate(coords.view()).expect("coords evaluate");
     let width = phi.ncols();
@@ -63,7 +63,7 @@ fn probe_interval_active_bound_3438() {
         1.0e-8,
     );
     eprintln!("[3438] criterion result: {:?}", result.as_ref().map(|r| r.0));
-    eprintln!("[3438] coords {:?}", term.assignment.coords[0].column(0).to_vec());
+    eprintln!("[3438] coords {:?}", term.assignment.coords[0].as_matrix().column(0).to_vec());
     let system = term.assemble_arrow_schur(target.view(), &rho, None).expect("assemble");
     for (i, row) in system.rows.iter().enumerate() {
         eprintln!("[3438] row {i} gt={:?} htt={:?}", row.gt.to_vec(), row.htt.iter().copied().collect::<Vec<_>>());
