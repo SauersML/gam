@@ -4880,7 +4880,7 @@
     "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 88af7f36c95adcede13b6507ad702acc78ab4bd0 (main after the #3547 certificate landed) and head the change's commit list exactly these removals. Read-proof at the head: git grep -w -c finds 0 occurrences of GpuMixedPrecisionPolicy, cholesky_solve_gpu, iterative_refinement_cholesky_solve and the two test names anywhere in crates/ tests/ examples/; cholesky_logdet survives only as gam-terms grid_spline_2d::cholesky_logdet (a different function) and its users; cholesky_logdet_from_col_major only in a historical doc sentence in gam-solve pirls_gpu.rs. Before the change git grep -n cholesky_solve_gpu on main found callers only in tests/arrow_gpu (gpu_solver_dimension_mismatch_returns_error.rs, gpu_solver_matches_cpu_on_small_spd_system.rs, misc/owed_1412.rs)."
   },
   {
-    "base": "920eb8df60126933f8607d7c76022515e531347b",
+    "base": "f5930beca8e6b774e426c13bf165f822a5e8e920",
     "removed": {
       "crates/gam-models/src/survival/risk_calibration.rs::cox_calibrated_survival_matrix": 1,
       "crates/gam-models/src/survival/risk_calibration.rs::km_curve_on_grid": 1
