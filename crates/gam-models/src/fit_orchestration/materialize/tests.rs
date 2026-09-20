@@ -1480,7 +1480,7 @@ fn planned_radial_centers(basis: &SmoothBasisSpec) -> (usize, bool) {
 }
 
 #[test]
-fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1867() {
+fn adaptive_univariate_duchon_start_keeps_the_provisioned_default_it_cannot_grow_1867_3331() {
     let data = univariate_radial_workflow_dataset();
 
     let label = "Duchon";
@@ -1512,9 +1512,24 @@ fn adaptive_univariate_duchon_start_preserves_formula_floor_and_applies_growth_1
     };
     let (initial_centers, initial_is_auto) =
         planned_radial_centers(&initial_request.spec.smooth_terms[0].basis);
+    // #3149 starts at the pilot only a basis the loop grows. The 1-D Duchon
+    // default places its centers on a uniform grid, and a refined uniform grid
+    // re-places every center rather than nesting the coarse one. So the loop
+    // never grows it (#3331, `adaptive_refinement_can_nest`), and the
+    // orchestrated request keeps the provisioned default, the same as the raw
+    // request.
+    let basis = &initial_request.spec.smooth_terms[0].basis;
+    assert!(
+        !gam_terms::smooth::adaptive_refinement_can_nest(basis),
+        "the 1-D {label} uniform-grid default must not be a nesting refinement"
+    );
     assert_eq!(
         initial_centers, raw_centers,
-        "an absent adaptive proposal must preserve the canonical 1-D {label} formula resolution"
+        "a 1-D {label} the loop cannot grow must keep its provisioned default, not the pilot"
+    );
+    assert!(
+        raw_centers > starting_num_centers(data.values.nrows(), 1, 2),
+        "the provisioned 1-D {label} default ({raw_centers}) sits above the pilot"
     );
     assert!(
         initial_is_auto,
@@ -1627,19 +1642,19 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
         adaptive_centers,
         starting_num_centers(data.values.nrows(), 2, 3)
     );
-    // #1757 made the IMPLICIT 2-D Duchon default low-rank; that rank is the
-    // rate-derived pilot `starting_num_centers(n, d, nullspace)` — the affine
-    // null space plus the penalized resolution rank at `n` rows — which is
-    // also where the adaptive pilot starts. The raw default and the pilot
-    // start therefore COINCIDE at every n.
-    // What separates them is the grow CEILING, not the start: only the
-    // orchestrated request has an owner that may escalate toward
-    // `default_num_centers`, and the raw request stays pinned at the low-rank
-    // default forever. Asserted below as two equalities and a headroom fact,
-    // which is strictly more than the single inequality it replaces.
+    // #3149: only the orchestrated request, whose loop grows the basis,
+    // starts at the rate-derived pilot `starting_num_centers(n, d, nullspace)`.
+    // The raw request has no loop, so it keeps the provisioned low-rank
+    // default (#1757): the generic spatial count held to `10 · 3^(d - 1)` =
+    // 30 centers in 2-D.
     assert_eq!(
-        raw_centers, adaptive_centers,
-        "the raw 2-D Duchon default and the adaptive pilot start are the same low-rank rule"
+        raw_centers,
+        default_num_centers(data.values.nrows(), 2).min(30),
+        "the raw 2-D Duchon default is the provisioned low-rank default"
+    );
+    assert!(
+        raw_centers > adaptive_centers,
+        "the pilot start ({adaptive_centers}) sits below the provisioned default ({raw_centers})"
     );
     assert!(
         adaptive_centers <= default_num_centers(data.values.nrows(), 2),
@@ -1663,9 +1678,9 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     assert!(!center_strategy_is_auto(&explicit_spec.center_strategy));
 
     // Second arm, at an n where the `n / COND_N_DIVISOR` conditioning cap in
-    // `default_num_centers` no longer binds: the rate pilot is then STRICTLY
-    // below the production ceiling, so the orchestrator's grow loop has
-    // something to escalate.
+    // `default_num_centers` no longer binds: the raw request is at the 30-center
+    // provisioned cap, and the rate pilot is STRICTLY below the production
+    // ceiling, so the orchestrator's grow loop has something to escalate.
     let wide = duchon_workflow_dataset_with_rows(200);
     let wide_rows = wide.values.nrows();
     let low_rank_representer_rank = starting_num_centers(wide_rows, 2, 3);
@@ -1683,14 +1698,100 @@ fn adaptive_spatial_start_is_activated_only_by_its_orchestrator() {
     };
     assert_eq!(
         wide_raw_spec.center_strategy.planned_num_centers(2),
-        low_rank_representer_rank,
-        "the implicit 2-D Duchon default is the rate-derived low-rank pilot (#1757)"
+        30,
+        "the raw 2-D Duchon default is the provisioned low-rank cap (#1757)"
     );
     assert!(
         default_num_centers(wide_rows, 2) > low_rank_representer_rank,
         "the grow-loop ceiling must strictly exceed the low-rank start at {wide_rows} rows,          or an orchestrated 2-D Duchon has nothing to escalate: ceiling={}, start={}",
         default_num_centers(wide_rows, 2),
         low_rank_representer_rank
+    );
+}
+
+/// Two continuous coordinates and an unbalanced two-level factor: `a` on
+/// `n_a` rows, `b` on `n_b`.
+fn by_level_radial_workflow_dataset(n_a: usize, n_b: usize) -> Dataset {
+    let n = n_a + n_b;
+    let mut values = Array2::<f64>::zeros((n, 4));
+    for i in 0..n {
+        let x = i as f64 / (n - 1) as f64;
+        let z = ((i * 37) % n) as f64 / (n - 1) as f64;
+        values[[i, 0]] = (3.0 * x).sin() + z;
+        values[[i, 1]] = x;
+        values[[i, 2]] = z;
+        values[[i, 3]] = if i < n_a { 0.0 } else { 1.0 };
+    }
+    let continuous = |name: &str| SchemaColumn {
+        name: name.to_string(),
+        kind: ColumnKindTag::Continuous,
+        levels: vec![],
+    };
+    Dataset {
+        headers: vec!["y".to_string(), "x".to_string(), "z".to_string(), "g".to_string()],
+        values,
+        schema: DataSchema {
+            columns: vec![
+                continuous("y"),
+                continuous("x"),
+                continuous("z"),
+                SchemaColumn {
+                    name: "g".to_string(),
+                    kind: ColumnKindTag::Categorical,
+                    levels: vec!["a".to_string(), "b".to_string()],
+                },
+            ],
+        },
+        column_kinds: vec![
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Continuous,
+            ColumnKindTag::Categorical,
+        ],
+    }
+}
+
+/// #3149/#2993: a factor-by level's block is identified on its own level's
+/// rows, so the orchestrated start of an auto-sized radial smooth in each
+/// level is the rate pilot at that level's row count, not at the pooled rows
+/// the other levels contribute.
+#[test]
+fn adaptive_spatial_start_of_a_by_level_smooth_counts_its_own_level_rows() {
+    let (n_a, n_b) = (120, 60);
+    let data = by_level_radial_workflow_dataset(n_a, n_b);
+    let config = FitConfig {
+        adaptive_resolution: Some(Vec::new()),
+        ..FitConfig::default()
+    };
+    let mat = materialize("y ~ s(x, z, by=g)", &data, &config)
+        .expect("adaptive by-level thin-plate materialization");
+    let FitRequest::Standard(request) = mat.request else {
+        panic!("expected standard request");
+    };
+    let mut starts = Vec::new();
+    for term in &request.spec.smooth_terms {
+        let SmoothBasisSpec::ByVariable { inner, .. } = &term.basis else {
+            continue;
+        };
+        let SmoothBasisSpec::ThinPlate { spec, .. } = inner.as_ref() else {
+            panic!("expected a thin-plate level block, got {inner:?}");
+        };
+        assert!(center_strategy_is_auto(&spec.center_strategy));
+        starts.push(spec.center_strategy.planned_num_centers(2));
+    }
+    assert_eq!(
+        starts,
+        vec![
+            starting_num_centers(n_a, 2, 3),
+            starting_num_centers(n_b, 2, 3)
+        ],
+        "each level starts from its own {n_a} / {n_b} rows, not the pooled {}",
+        n_a + n_b
+    );
+    assert_ne!(
+        starting_num_centers(n_b, 2, 3),
+        starting_num_centers(n_a + n_b, 2, 3),
+        "the fixture must separate a level's rows from the pooled rows"
     );
 }
 

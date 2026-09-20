@@ -78,7 +78,8 @@ mod adaptive_resolution;
 pub use adaptive_resolution::{
     AdaptiveResolution, adaptive_refinement_can_nest, adaptive_resolution_of,
     adaptive_resolution_support, adaptive_resolution_width, apply_adaptive_resolution,
-    realized_basis_nests, refined_adaptive_resolution,
+    realized_basis_nests, refined_adaptive_resolution, smooth_identification_rows,
+    starting_resolution,
 };
 
 mod design_freezing;

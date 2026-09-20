@@ -22,12 +22,13 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
     if scale_dimensions {
         enable_scale_dimensions(&mut spec);
     }
-    // The standard formula path starts every formula-default smooth at its
-    // data-derived pilot resolution; auto-sized multivariate radial smooths
-    // start at their penalized-resolution count. Per-term evidence-backed
-    // refinements return through this same materializer. Explicit sizes carry
-    // no adaptive provenance, and Python overrides apply afterward, so both
-    // remain authoritative.
+    // The one place a formula default becomes its pilot: only a route whose
+    // resolution loop grows the fit carries a plan, and it starts every basis
+    // that loop grows at `gam_terms::smooth::starting_resolution`. Every other
+    // route keeps the provisioned formula default, adequate without growth
+    // (#3149). Per-term evidence-backed refinements return through this same
+    // materializer. Explicit sizes carry no adaptive provenance, and Python
+    // overrides apply afterward, so both remain authoritative.
     if let Some(plan) = adaptive_resolution {
         apply_adaptive_resolution_plan(&mut spec, data, plan)?;
     }
@@ -47,10 +48,13 @@ pub(crate) fn build_termspec_with_geometry_and_overrides(
 ///
 /// Only a smooth whose size nobody chose carries an adaptive resolution
 /// ([`gam_terms::smooth::adaptive_resolution_of`]); every explicit
-/// formula/programmatic size is left alone. A missing plan entry keeps the
-/// formula pilot, except that an auto-sized multivariate radial smooth starts
-/// at [`gam_terms::basis::starting_num_centers`]. Center counts are held
-/// between the term's structural minimum and one center per row. Python
+/// formula/programmatic size is left alone. A plan entry is the loop's
+/// evidence-backed refinement of that smooth. A missing entry starts it at its
+/// pilot ([`gam_terms::smooth::starting_resolution`]), but only when the loop
+/// can grow it, meaning its refinement nests
+/// ([`gam_terms::smooth::adaptive_refinement_can_nest`], #3331). A basis whose
+/// refinement does not nest is never grown, so it keeps its provisioned
+/// default; started at the pilot, it would stay there (#3149). Python
 /// `smooths={...}` overrides are applied by the caller AFTER this, so they
 /// override the refined value unconditionally.
 fn apply_adaptive_resolution_plan(
@@ -58,31 +62,30 @@ fn apply_adaptive_resolution_plan(
     data: &Dataset,
     plan: &[Option<gam_terms::smooth::AdaptiveResolution>],
 ) -> Result<(), WorkflowError> {
-    use gam_terms::basis::starting_num_centers;
-    use gam_terms::smooth::{AdaptiveResolution, adaptive_resolution_of, apply_adaptive_resolution};
-    let n = data.values.nrows();
-    if n == 0 {
+    use gam_terms::smooth::{
+        adaptive_refinement_can_nest, adaptive_resolution_of, apply_adaptive_resolution,
+        starting_resolution,
+    };
+    if data.values.nrows() == 0 {
         return Ok(());
     }
     for (term_index, term) in spec.smooth_terms.iter_mut().enumerate() {
         let Some(current) = adaptive_resolution_of(&term.basis) else {
             continue;
         };
-        let proposed = plan.get(term_index).cloned().flatten();
-        let target = if let AdaptiveResolution::Centers(planned) = current {
-            let nullspace_dim = gam_terms::smooth::spatial_term_min_center_count(term);
-            let structural_minimum = nullspace_dim.saturating_add(1).min(n);
-            let radial_dim = spatial_center_strategy_mut(&mut term.basis).map(|(_, cols)| cols.len());
-            let count = match (&proposed, radial_dim) {
-                (Some(AdaptiveResolution::Centers(requested)), _) => *requested,
-                (_, Some(d)) if d > 1 => starting_num_centers(n, d, nullspace_dim),
-                _ => planned,
-            };
-            AdaptiveResolution::Centers(count.max(structural_minimum).min(n))
-        } else {
-            proposed.unwrap_or_else(|| current.clone())
+        let target = match plan.get(term_index).cloned().flatten() {
+            Some(requested) => requested,
+            None if !adaptive_refinement_can_nest(&term.basis) => continue,
+            None => starting_resolution(&term.basis, data.values.view()).ok_or_else(|| {
+                WorkflowError::InvalidConfig {
+                    reason: format!(
+                        "adaptive smooth term '{}' has no starting resolution on these data",
+                        term.name
+                    ),
+                }
+            })?,
         };
-        if adaptive_resolution_of(&term.basis).as_ref() == Some(&target) {
+        if current == target {
             continue;
         }
         apply_adaptive_resolution(&mut term.basis, &target).map_err(
@@ -95,50 +98,6 @@ fn apply_adaptive_resolution_plan(
         )?;
     }
     Ok(())
-}
-
-/// Mutable `(center_strategy, feature_cols)` for a spatial radial smooth, peeling
-/// the `ByVariable`/`FactorSumToZero` row-gating envelopes; `None` for any
-/// non-spatial or non-radial basis (B-spline, tensor, sphere, PCA, …).
-fn spatial_center_strategy_mut(
-    basis: &mut gam_terms::smooth::SmoothBasisSpec,
-) -> Option<(&mut gam_terms::basis::CenterStrategy, Vec<usize>)> {
-    use gam_terms::smooth::SmoothBasisSpec as B;
-    match basis {
-        B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => {
-            spatial_center_strategy_mut(inner)
-        }
-        B::BySmooth { smooth, .. } => spatial_center_strategy_mut(smooth),
-        B::ThinPlate {
-            feature_cols,
-            spec,
-            input_scale: _,
-        } => {
-            let cols = feature_cols.clone();
-            Some((&mut spec.center_strategy, cols))
-        }
-        B::Duchon {
-            feature_cols,
-            spec,
-            input_scale: _,
-        } => {
-            let cols = feature_cols.clone();
-            Some((&mut spec.center_strategy, cols))
-        }
-        B::ConstantCurvature { feature_cols, spec } => {
-            let cols = feature_cols.clone();
-            Some((&mut spec.center_strategy, cols))
-        }
-        B::MeasureJet {
-            feature_cols,
-            spec,
-            input_scale: _,
-        } => {
-            let cols = feature_cols.clone();
-            Some((&mut spec.center_strategy, cols))
-        }
-        _ => None,
-    }
 }
 
 fn linear_term_training_column(

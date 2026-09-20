@@ -12,6 +12,7 @@ mod bms_per_smooth_summary_2997;
 mod bms_route_arming_3164;
 mod bms_pooled_pilot_separation_3217;
 mod bspline_nonzero_anchor_affine_2297;
+mod default_basis_by_route_3149;
 mod duchon_grid_fit_and_rotation_2319;
 mod exact_gaussian_boundary_2663;
 mod multinomial_contracted_jeffreys_2612;

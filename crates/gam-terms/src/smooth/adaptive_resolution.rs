@@ -1,23 +1,33 @@
 //! The resolution of a formula-default smooth basis that nobody chose.
 //!
 //! A formula default (`s(x)`, `s(x, bs="cyclic")`, `fs(x, g)`, an auto-sized
-//! radial or sphere smooth) starts at the penalized-resolution
-//! pilot and is refined by the standard formula workflow from the converged
-//! fit's own evidence (#1689, #3078). This module is the one place that knows,
-//! per basis family, what that resolution is, how one level of nested
-//! refinement changes it, how far the data can identify it, how many raw
-//! coefficients it realizes, and how to write it back into the spec. An
-//! explicit user size carries no adaptive provenance and is never touched.
+//! radial or sphere smooth) is built at its provisioned size, adequate without
+//! growth, because most routes never refine it. The standard formula workflow
+//! does: it starts every basis it grows at the penalized-resolution pilot
+//! ([`starting_resolution`]) and refines it from the converged fit's own
+//! evidence (#1689, #3078, #3149). This module is the one place that knows,
+//! per basis family, what that resolution is, where the loop starts it, how
+//! one level of nested refinement changes it, how far the data can identify
+//! it, how many raw coefficients it realizes, and how to write it back into
+//! the spec. An explicit user size carries no adaptive provenance and is never
+//! touched.
 
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis};
 use serde::{Deserialize, Serialize};
 
-use super::{FactorSmoothFlavour, SmoothBasisSpec};
+use super::{ByVarKind, ByVariableSpec, FactorSmoothFlavour, SmoothBasisSpec};
 use crate::basis::{
-    BSplineKnotSpec, CenterStrategy, OneDimensionalBoundary, SPHERICAL_HARMONIC_MAX_DEGREE,
-    SphereMethod, center_strategy_is_auto, center_strategy_spectral_basis,
-    center_strategy_with_num_centers, count_unique_coordinate_rows, realized_center_strategy,
-    refined_harmonic_degree, refined_internal_knots, refined_num_centers, refined_periodic_basis,
+    BSplineKnotSpec, CenterStrategy, DuchonNullspaceOrder, OneDimensionalBoundary,
+    SPHERICAL_HARMONIC_MAX_DEGREE, SphereMethod, center_strategy_is_auto,
+    center_strategy_spectral_basis, center_strategy_with_num_centers,
+    count_unique_coordinate_rows, default_spherical_harmonic_degree, duchon_nullspace_dimension,
+    penalized_resolution_rank, realized_center_strategy, refined_harmonic_degree,
+    refined_internal_knots, refined_num_centers, refined_periodic_basis, starting_num_centers,
+    thin_plate_polynomial_basis_dimension,
+};
+use crate::term_builder::{
+    factor_smooth_pilot_internal_knots, pilot_cyclic_basis_dim, pilot_duchon_center_count,
+    pilot_internal_knots, pilot_univariate_spline_basis_dim,
 };
 
 /// The resolution coordinate of one adaptive smooth basis.
@@ -370,6 +380,161 @@ pub fn adaptive_resolution_of(basis: &SmoothBasisSpec) -> Option<AdaptiveResolut
         }
         _ => None,
     }
+}
+
+/// The rows of `data` the basis of `basis` is identified on: a factor-by
+/// level's block sees only the rows of its level, a factor-by smooth that
+/// shares one spec across its levels is identified on its smallest level, and
+/// every other smooth sees every row. This is the `n` a loop's starting
+/// resolution is sized from, so a level of a `by=` factor is not handed a
+/// basis its own rows cannot support (#1561: sized from the pooled rows,
+/// `s(x, bs='tp', by=group)` at 100 rows a level got an ill-conditioned block
+/// no λ could recover; #3179).
+pub fn smooth_identification_rows(basis: &SmoothBasisSpec, data: ArrayView2<'_, f64>) -> usize {
+    let level_rows = |by_col: usize| -> Vec<(u64, usize)> {
+        let mut counts: Vec<(u64, usize)> = Vec::new();
+        if let Some(values) = column(data, by_col) {
+            for &value in values.iter().filter(|value| value.is_finite()) {
+                let bits = gam_data::canonical_level_bits(value);
+                match counts.iter_mut().find(|(level, _)| *level == bits) {
+                    Some((_, count)) => *count += 1,
+                    None => counts.push((bits, 1)),
+                }
+            }
+        }
+        counts
+    };
+    match basis {
+        SmoothBasisSpec::ByVariable {
+            by_col,
+            by: ByVariableSpec::Level { value_bits, .. },
+            ..
+        } => {
+            let level = gam_data::canonical_level_bits(f64::from_bits(*value_bits));
+            level_rows(*by_col)
+                .into_iter()
+                .find(|(bits, _)| *bits == level)
+                .map_or(0, |(_, count)| count)
+        }
+        SmoothBasisSpec::BySmooth {
+            by_kind: ByVarKind::Factor { feature_col, .. },
+            ..
+        } => level_rows(*feature_col)
+            .into_iter()
+            .map(|(_, count)| count)
+            .min()
+            .unwrap_or(0),
+        _ => data.nrows(),
+    }
+}
+
+/// The radial basis inside the row-gating wrappers (`by=`, factor
+/// sum-to-zero), which do not change what its centers resolve.
+fn radial_inner(basis: &SmoothBasisSpec) -> &SmoothBasisSpec {
+    use SmoothBasisSpec as B;
+    match basis {
+        B::ByVariable { inner, .. } | B::FactorSumToZero { inner, .. } => radial_inner(inner),
+        B::BySmooth { smooth, .. } => radial_inner(smooth),
+        other => other,
+    }
+}
+
+/// The resolution the standard formula workflow starts a basis it grows at:
+/// the penalized-resolution pilot, the smallest basis whose penalized span
+/// holds every direction an optimally smoothed fit on the basis's rows keeps
+/// ([`smooth_identification_rows`]), held to what the data can identify
+/// ([`adaptive_resolution_support`]). `None` for a basis the loop does not
+/// grow ([`adaptive_resolution_of`]), which keeps its provisioned formula
+/// default: the pilot is a start the loop refines, not a final basis (#3149).
+///
+/// * open B-spline: the order-`m` null space plus `⌈n^{1/(2m+1)}⌉` directions;
+/// * cyclic basis: the constant plus the same rank, at least `degree + 1`;
+/// * factor-smooth marginal: the least-populated group's pilot, held below the
+///   smallest group's covariate resolution;
+/// * radial centers: the polynomial null space plus the penalized resolution
+///   rank of the minimal embedding order (a 1-D Duchon also at least the pilot
+///   `s(x)`, #1867); a 1-D thin-plate, curvature or measure-jet smooth starts
+///   at its formula default;
+/// * Wahba sphere centers: the constant plus the order-`m` rank on the 2-D
+///   sphere;
+/// * harmonic degree: the least degree whose span holds the order-`m` rank.
+pub fn starting_resolution(
+    basis: &SmoothBasisSpec,
+    data: ArrayView2<'_, f64>,
+) -> Option<AdaptiveResolution> {
+    use SmoothBasisSpec as B;
+    let current = adaptive_resolution_of(basis)?;
+    let n = smooth_identification_rows(basis, data);
+    let start = match (&current, basis) {
+        (AdaptiveResolution::Centers(planned), _) => {
+            let centers = match radial_inner(basis) {
+                B::Duchon {
+                    feature_cols, spec, ..
+                } => {
+                    let d = feature_cols.len();
+                    let polynomial_cols = match spec.nullspace_order {
+                        DuchonNullspaceOrder::Zero => 1,
+                        DuchonNullspaceOrder::Linear => d + 1,
+                        DuchonNullspaceOrder::Degree(degree) => {
+                            duchon_nullspace_dimension(d, degree)
+                        }
+                    };
+                    let univariate_floor = match feature_cols.as_slice() {
+                        [col] => pilot_univariate_spline_basis_dim(column(data, *col)?, n),
+                        _ => 0,
+                    };
+                    pilot_duchon_center_count(n, d, polynomial_cols, univariate_floor)
+                }
+                B::ThinPlate { feature_cols, .. } if feature_cols.len() > 1 => {
+                    let d = feature_cols.len();
+                    starting_num_centers(n, d, thin_plate_polynomial_basis_dimension(d))
+                }
+                B::ConstantCurvature { feature_cols, .. } if feature_cols.len() > 1 => {
+                    starting_num_centers(n, feature_cols.len(), 1)
+                }
+                B::MeasureJet { feature_cols, .. } if feature_cols.len() > 1 => {
+                    starting_num_centers(n, feature_cols.len(), 1)
+                }
+                B::Sphere { spec, .. } => 1usize
+                    .saturating_add(penalized_resolution_rank(n, 2, spec.penalty_order.max(1)))
+                    .min(n)
+                    .max(1),
+                _ => *planned,
+            };
+            AdaptiveResolution::Centers(centers)
+        }
+        (AdaptiveResolution::InternalKnots(_), B::BSpline1D { spec, .. }) => {
+            AdaptiveResolution::InternalKnots(pilot_internal_knots(
+                n,
+                spec.degree,
+                spec.penalty_order.min(spec.degree).max(1),
+            ))
+        }
+        (AdaptiveResolution::InternalKnots(_), B::FactorSmooth { spec }) => {
+            AdaptiveResolution::InternalKnots(factor_smooth_pilot_internal_knots(
+                column(data, spec.continuous_cols[0])?,
+                column(data, spec.group_col)?,
+                spec.marginal.degree,
+                spec.marginal.penalty_order,
+            ))
+        }
+        (AdaptiveResolution::PeriodicBasis(_), B::BSpline1D { spec, .. }) => {
+            AdaptiveResolution::PeriodicBasis(pilot_cyclic_basis_dim(
+                n,
+                spec.degree,
+                spec.penalty_order.min(spec.degree).max(1),
+            ))
+        }
+        (AdaptiveResolution::HarmonicDegree(_), B::Sphere { spec, .. }) => {
+            AdaptiveResolution::HarmonicDegree(default_spherical_harmonic_degree(
+                n,
+                spec.penalty_order,
+            ))
+        }
+        _ => return None,
+    };
+    let support = adaptive_resolution_support(basis, data)?;
+    Some(start.with_value(start.value().min(support.value())))
 }
 
 /// One level of uniform nested refinement of `current` for `basis`: every

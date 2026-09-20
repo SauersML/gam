@@ -1618,10 +1618,6 @@ pub(crate) fn outer_result_to_native(mut result: OuterResult, perm: &[usize]) ->
         OuterFirstOrderMeasurement::new(to_native(rho), value, to_native(gradient))
     };
     result.final_measurement = result.final_measurement.take().map(measurement_to_native);
-    result.displaced_measurement = result
-        .displaced_measurement
-        .take()
-        .map(measurement_to_native);
     if let Some(h) = result.final_hessian.as_ref()
         && h.nrows() == perm.len()
         && h.ncols() == perm.len()
