@@ -6932,10 +6932,11 @@ pub(crate) fn owned_mode_outer_finalizer_rejects_certified_objective_mismatch() 
 }
 
 /// A certified owned-mode fit carries the first-order hyperparameter
-/// correction `Vp = V + (V U) V_θ (V U)ᵀ` (#2677). One block, one penalty
-/// `S = [1]` at `ρ = 0` (`λ = 1`), so `U = λ S β̂ = β̂`; the certificate
-/// fixture's outer Hessian is `2`, so `V_θ = 1/2` and the correction is
-/// `(V β̂)² / 2`. Before #2677 this entry published no correction at all.
+/// correction `Vp = V + (V U) V_θ (V U)ᵀ` (#2677). One Gaussian row `y = 1`
+/// under one penalty `S = [1]` at `ρ = 0` (`λ = 1`), so the mode is
+/// `β̂ = y / (1 + λ) = 1/2` and `U = λ S β̂ = β̂`; the certificate fixture's
+/// outer Hessian is `2`, so `V_θ = 1/2` and the correction is `(V β̂)² / 2`.
+/// Before #2677 this entry published no correction at all.
 #[test]
 pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
     let specs = vec![ParameterBlockSpec {
@@ -6951,6 +6952,7 @@ pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
         stacked_design: None,
         stacked_offset: None,
     }];
+    let family = OneBlockGaussianFamily { y: array![1.0] };
     let options = BlockwiseFitOptions {
         use_remlobjective: false,
         compute_covariance: true,
@@ -6959,7 +6961,7 @@ pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
     let selected_theta = array![0.0];
     let hyper_layout = test_design_hyper_layout(vec![vec![]]);
     let owned = evaluate_custom_family_joint_hyper_owned(
-        &OneBlockIdentityFamily,
+        &family,
         &specs,
         &options,
         &selected_theta,
@@ -6976,7 +6978,7 @@ pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
     );
 
     let fit = fit_custom_family_fixed_log_lambdas_from_owned_mode(
-        &OneBlockIdentityFamily,
+        &family,
         &specs,
         &options,
         owned.mode,
@@ -6992,7 +6994,12 @@ pub(crate) fn owned_mode_certified_fit_mints_the_smoothing_correction_2677() {
     );
     let conditional = fit.beta_covariance().expect("requested covariance")[[0, 0]];
     let beta = fit.beta[0];
-    assert!(beta.abs() > 0.0, "the fixture's mode must move with rho");
+    // The inner certificate bounds the stationarity residual `|(1 + λ)β − y|`
+    // by `inner_tol`, and the curvature is `1 + λ = 2`.
+    assert!(
+        (beta - 0.5).abs() <= 0.5 * options.inner_tol,
+        "the fixture's mode is y / (1 + lambda) = 1/2, got {beta:.17e}"
+    );
     let expected = conditional + 0.5 * (conditional * beta).powi(2);
     let corrected = fit
         .beta_covariance_corrected()
