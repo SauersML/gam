@@ -2562,12 +2562,9 @@
       "crates/gam-linalg/src/utils.rs:fn:softplus_positive_large_approximates_x",
       "crates/gam-linalg/src/utils.rs:fn:stable_logistic",
       "crates/gam-linalg/src/utils.rs:fn:stable_softplus",
-      "crates/gam-models/src/inference/full_conformal/honest.rs:fn:softplus",
-      "crates/gam-pyffi/src/latent/latent_basis_and_sae_ffi.rs:fn:sigmoid_stable",
-      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:numerics_inverse_softplus",
-      "crates/gam-pyffi/src/manifold/geometry_ffi.rs:fn:numerics_sigmoid_stable"
+      "crates/gam-models/src/inference/full_conformal/honest.rs:fn:softplus"
     ],
-    "reason": "#3735: the stable softplus/logistic kernels had five implementations. gam_math::special::{softplus, logistic} is canonical; gam_linalg::utils::{stable_softplus, stable_logistic}, the private honest.rs softplus and the private pyffi sigmoid_stable re-derived the identical expressions (max(x,0)+ln1p(exp(-|x|)) and the sign-split logistic). SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. The 10 removed tests re-tested the same kernel through the aliases; their tail and symmetry assertions move into gam-math's softplus_and_logistic_agree_with_their_definitions_away_from_the_tails. numerics_sigmoid_stable/numerics_inverse_softplus were pyfunctions with no Python caller (SPEC: 'Unnecessary choices and options should be deleted').",
-    "evidence": "At head git grep -w finds no stable_softplus, stable_logistic, numerics_sigmoid_stable or numerics_inverse_softplus anywhere; every former caller imports gam_math::special::{softplus, logistic}. The remaining softplus/sigmoid_stable name occurrences are other, untouched items. gamfit/_rust.pyi and gamfit/_rust_module.pyi were regenerated with scripts/gen_rust_stub.py (--check rc 0). inverse_softplus_scalar keeps its two remaining geometry_ffi callers."
+    "reason": "#3735: the stable softplus/logistic kernels were implemented more than once in the Rust core. gam_math::special::{softplus, logistic} is canonical; gam_linalg::utils::{stable_softplus, stable_logistic} and the private honest.rs softplus re-derived the identical expressions (max(x,0)+ln1p(exp(-|x|)) and the sign-split logistic). SPEC: 'It's required that the CLI, Python library, and Rust library are unified, have a single source of truth'. The 10 removed tests re-tested the same kernel through the aliases; their tail and symmetry assertions move into gam-math's softplus_and_logistic_agree_with_their_definitions_away_from_the_tails. The gam-pyffi copy and its numerics_* pyfunctions stay for now, because open PR #3076 edits geometry_ffi.rs and the stubs.",
+    "evidence": "At head git grep -w finds no stable_softplus or stable_logistic anywhere; every former caller imports gam_math::special::{softplus, logistic}. The remaining softplus/sigmoid_stable name occurrences are other, untouched items."
   }
 ]

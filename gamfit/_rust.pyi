@@ -272,6 +272,8 @@ __all__ = [
     "nagelkerke_r2_from_predictions",
     "numeric_matrix_f64",
     "numeric_matrix_validate",
+    "numerics_inverse_softplus",
+    "numerics_sigmoid_stable",
     "parameter_decomposition_run",
     "partial_supervision_solve",
     "periodic_basis_with_jet",
@@ -1934,6 +1936,10 @@ def nagelkerke_r2_from_predictions(observed: Sequence[float], predicted_mean: Se
 def numeric_matrix_f64(values: object, label: str) -> NDArray[np.float64]: ...
 
 def numeric_matrix_validate(values: object, label: str) -> NDArray[np.float64]: ...
+
+def numerics_inverse_softplus(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
+
+def numerics_sigmoid_stable(x: NDArray[np.float64]) -> NDArray[np.float64]: ...
 
 def parameter_decomposition_run(request_json: str, tensors: dict[Any, Any]) -> tuple[str, dict[Any, Any]]: ...
 
