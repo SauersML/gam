@@ -225,6 +225,8 @@
 use std::hint::black_box;
 use std::time::Instant;
 
+use crate::quantile::quantile_from_sorted;
+
 /// Paired per-repetition timings for two implementations of one computation.
 ///
 /// `a_ns[i]` and `b_ns[i]` were measured adjacent in time within repetition `i`,
@@ -285,8 +287,8 @@ impl PairedTiming {
         }
         let mut sorted = self.ratios.clone();
         sorted.sort_by(f64::total_cmp);
-        let lo = quantile_sorted(&sorted, 0.05);
-        let hi = quantile_sorted(&sorted, 0.95);
+        let lo = quantile_from_sorted(&sorted, 0.05);
+        let hi = quantile_from_sorted(&sorted, 0.95);
         let med = median(&self.ratios);
         if !med.is_finite() || med == 0.0 {
             return f64::NAN;
@@ -677,17 +679,9 @@ fn time_arm<F: FnMut(f64) -> f64>(iterations: usize, arm: &mut F) -> f64 {
 }
 
 fn median(values: &[f64]) -> f64 {
-    if values.is_empty() {
-        return f64::NAN;
-    }
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[mid]
-    } else {
-        0.5 * (sorted[mid - 1] + sorted[mid])
-    }
+    quantile_from_sorted(&sorted, 0.5)
 }
 
 /// The fewest self-races a between-copy band is read from
@@ -717,21 +711,6 @@ fn self_race_band(self_races: &[PairedTiming]) -> f64 {
         highest = highest.max(ratio.ln());
     }
     (highest - lowest).exp() - 1.0
-}
-
-/// Linear-interpolated quantile of an already-sorted slice.
-fn quantile_sorted(sorted: &[f64], q: f64) -> f64 {
-    if sorted.is_empty() {
-        return f64::NAN;
-    }
-    if sorted.len() == 1 {
-        return sorted[0];
-    }
-    let pos = q.clamp(0.0, 1.0) * (sorted.len() - 1) as f64;
-    let lo = pos.floor() as usize;
-    let hi = pos.ceil() as usize;
-    let frac = pos - lo as f64;
-    sorted[lo] * (1.0 - frac) + sorted[hi] * frac
 }
 
 /// SplitMix64 — a deterministic order sequence, so the interleave is randomised

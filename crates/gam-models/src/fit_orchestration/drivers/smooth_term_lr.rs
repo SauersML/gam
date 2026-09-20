@@ -2551,22 +2551,28 @@ fn consumed_coordinates(dimension: usize, profiled: bool) -> usize {
 /// them. That is the control variate, and this is its own sample variance
 /// rather than the `√(p(1−p)/N)` of either term alone. Empty is `(0, 0)`: no
 /// replay, no shift.
+///
+/// The spread is accumulated in two passes about the sample's own mean:
+/// `M₂ = Σ (dᵢ − d̄)²` is a sum of squares, so it is `≥ 0` in floating point
+/// with no clamp. The mean is read pivoted on the first draw,
+/// `d̄ = d₁ + Σ (dᵢ − d₁)/N`, so a constant sample has every pivoted
+/// difference exactly zero and reports `d̄ = d₁` and `M₂ = 0` exactly. Any
+/// rounding left in `d̄` enters `M₂` only at second order, since
+/// `Σ (dᵢ − m)² = Σ (dᵢ − d̄)² + N (d̄ − m)²`. The one-pass `Σd²/N − d̄²`
+/// it replaces differences two quantities of size `d̄²`, so it resolves the
+/// variance only in steps of `ulp(d̄²)` and reports a positive error on a
+/// draw set that is constant (#4086). A running (Welford) mean does not
+/// fix this either: on an ordered sample it drifts by `ulp(d̄)` per step,
+/// which is not small beside a spread far below `|d̄|`.
 fn paired_mean_with_error(differences: impl Iterator<Item = f64>) -> (f64, f64) {
-    let mut count = 0usize;
-    let mut sum = 0.0_f64;
-    let mut sum_squares = 0.0_f64;
-    for difference in differences {
-        count += 1;
-        sum += difference;
-        sum_squares += difference * difference;
-    }
-    if count == 0 {
+    let sample: Vec<f64> = differences.collect();
+    let Some(&pivot) = sample.first() else {
         return (0.0, 0.0);
-    }
-    let count = count as f64;
-    let shift = sum / count;
-    let variance = (sum_squares / count - shift * shift).max(0.0);
-    (shift, (variance / count).sqrt())
+    };
+    let count = sample.len() as f64;
+    let shift = pivot + sample.iter().map(|d| d - pivot).sum::<f64>() / count;
+    let centred_squares: f64 = sample.iter().map(|d| (d - shift) * (d - shift)).sum();
+    (shift, (centred_squares / count / count).sqrt())
 }
 
 /// Deterministic `χ²_1` draws for the selection replay.
@@ -3735,8 +3741,8 @@ pub fn smooth_term_lr_inference_forspec(
         // either edge. A term whose geometry cannot be projected keeps the
         // precision box around unit strength.
         let block_gram = {
-            let dense = full.design.design.to_dense();
-            let block = dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
+            let block =
+                full_design_dense.slice(ndarray::s![.., coeff_range.start..coeff_range.end]);
             block.t().dot(&block)
         };
         let log_scale_windows: Vec<(f64, f64)> = term_penalties
@@ -4853,9 +4859,69 @@ mod selection_replay_tests {
         AxisSlice, DiagonalCriterion, ObservedDraw, SMOOTH_LR_SELECTION_DRAWS,
         SelectionDrawStream, SelectionFactor, SelectionGeometry, SmoothLrSelection,
         SmoothLrSelectionDecline, SmoothLrReferenceDf, SmoothLrReferenceSource,
-        SmoothLrSelectionProfile, SmoothLrSelectionReplay, split_mix64, stratified_chi_square,
+        SmoothLrSelectionProfile, SmoothLrSelectionReplay, paired_mean_with_error, split_mix64,
+        stratified_chi_square,
     };
     use ndarray::Array2;
+
+    /// #4086 sibling: the paired-difference spread is two-pass centred, so it
+    /// cannot cancel. Half the draws at `c + s`, half at `c − s` (`c = 0.75`, `s` a
+    /// power of two) have mean exactly `c` and population variance exactly
+    /// `s²`, so the reference is exact with no second implementation. The
+    /// retired one-pass `Σd²/N − d̄²` is evaluated alongside to show this is
+    /// the regime where it loses the variance (it resolves only `ulp(c²)`),
+    /// and a constant sample must report an error of exactly zero.
+    ///
+    /// The fixture is chosen so that every floating-point step of the two-pass
+    /// reading is exact, which is why the assertions are equalities rather than
+    /// an ε band:
+    /// - `c ± s` with `c = 3·2⁻²` and `s = 2⁻ᵏ`, `k ≤ 31`, spans bits `2⁻¹…2⁻³¹`,
+    ///   well inside a 53-bit significand, so both values are exact.
+    /// - The pivoted differences are `0` or `−2s`, exact by Sterbenz because
+    ///   `c − s` and `c + s` are within a factor of two of each other.
+    /// - Every partial sum is a multiple of `2s` no larger than `2⁹·s`, so it is
+    ///   exact. Dividing by `N = 2⁸` is exact, and so is `(c + s) − s = c`.
+    /// - The centred values `±s` and their squares `2⁻²ᵏ` (normal for `k ≤ 31`)
+    ///   are exact, and so is the sum `N·s²`.
+    /// - `M₂/N/N = 2⁻²ᵏ⁻⁸` and its square root `2⁻ᵏ⁻⁴` are exact, and that root
+    ///   is exactly the reference `√(s²/N)`.
+    ///
+    /// A constant sample has every pivoted difference exactly `0`, so its mean is
+    /// the pivot and its `M₂` is `0`, both exactly.
+    #[test]
+    fn paired_standard_error_is_centred_and_exact_under_a_large_mean_4086() {
+        let c = 0.75_f64;
+        let mut one_pass_lost = 0usize;
+        for k in 20..32_i32 {
+            let s = 2.0_f64.powi(-k);
+            let mut sample = vec![c + s; 128];
+            sample.extend(std::iter::repeat_n(c - s, 128));
+            let n = sample.len() as f64;
+            let exact_error = (s * s / n).sqrt();
+            let (shift, error) = paired_mean_with_error(sample.iter().copied());
+            assert_eq!(shift, c, "the construction gives the mean exactly");
+            assert_eq!(
+                error, exact_error,
+                "s = 2^-{k}: every step of the centred reading is exact on this fixture"
+            );
+            let sum: f64 = sample.iter().sum();
+            let sum_squares: f64 = sample.iter().map(|d| d * d).sum();
+            let one_pass = sum_squares / n - (sum / n) * (sum / n);
+            if (one_pass - s * s).abs() > 0.5 * s * s {
+                one_pass_lost += 1;
+            }
+        }
+        assert!(
+            one_pass_lost > 0,
+            "the retired one-pass form must be seen to lose the variance, or this \
+             test is not exercising the cancelling regime"
+        );
+        for value in [0.1_f64, 1.0 / 3.0, -0.7, 1.0] {
+            let (shift, error) = paired_mean_with_error(std::iter::repeat_n(value, 10));
+            assert_eq!(error, 0.0, "a constant sample of {value} has no spread");
+            assert_eq!(shift, value, "a constant sample of {value} is its own mean");
+        }
+    }
 
     /// A shrunk-smooth generalized spectrum: one direction the data can still
     /// see and a geometric tail the penalty has taken.

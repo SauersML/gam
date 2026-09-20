@@ -295,7 +295,8 @@ difference-penalized P-spline of the same dimension.
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `k` | from data | Total basis dimension. |
-| `knots` | from data | Number of interior knots. Cannot combine with `k`. |
+| `knots` | from data | Number of interior knots, or explicit interior positions `[a, b, ...]` (the value knots on `bs=cr`; refused on a periodic axis). Cannot combine with `k`. |
+| `knot_placement` | `uniform` | `uniform` or `quantile` placement of generated interior knots. Refused with explicit `knots=[...]`, on `bs=cr` (value knots sit at data quantiles) and on a periodic axis (uniform cyclic grid). |
 | `degree` | 3 | Polynomial degree of the B-spline. |
 | `penalty_order` | 2 | Derivative order penalised (1 = slope, 2 = curvature). |
 | `bs` | `ps` (1-D), `tps` (2+D) | `ps`, `tps`, `matern`, `duchon`, `sphere`. |
@@ -310,6 +311,11 @@ Boundary conditions are available for 1-D P-spline smooths. They are useful for 
 
 The 1-D B-spline path accepts these options plus `periodic`, `period`,
 `periods`, `period_start`, `period_end`, `origin`, `identifiability`.
+
+`bs=cr` is a natural cubic regression spline: its basis is the values at
+its knots, it is cubic, and its penalty is `∫ (f''(x))² dx`. `knots=[a, b, ...]`
+gives its interior value knots. `degree=` other than 3, `penalty_order=` other
+than 2 and `knot_placement=` are refused on it; use `bs=ps` for those.
 
 ### Fixing the spline's interval (`domain=`) {#spline-domain}
 

@@ -38,6 +38,7 @@ impl DoubleDouble {
     }
 
     /// Knuth's `2Sum`: `high + low = a + b` exactly, whatever the magnitudes.
+    #[inline(always)]
     pub(crate) fn two_sum(a: f64, b: f64) -> Self {
         let sum = a + b;
         let virtual_b = sum - a;
@@ -49,6 +50,7 @@ impl DoubleDouble {
 }
 
 /// `p = fl(ab)` and the remainder `e = fma(a, b, −p)`: `|p + e − ab| ≤ η/2`.
+#[inline(always)]
 pub(crate) fn two_product(a: f64, b: f64) -> DoubleDouble {
     let product = a * b;
     DoubleDouble {
