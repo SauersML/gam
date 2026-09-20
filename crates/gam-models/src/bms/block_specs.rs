@@ -4113,10 +4113,13 @@ fn fit_bernoulli_marginal_slope_terms_under(
         }
         let correction_family =
             make_family(&marginal_design, &slope_design, final_sigma_cell.get());
-        let s = if flex_active {
-            correction_family
+        // `grid_influence` is the empirical grid's own sampling error pushed to
+        // the outcome score (gam#3452); only an empirical measure has one.
+        let (s, grid_influence) = if flex_active {
+            let s = correction_family
                 .flex_score_zeta_sensitivity(&solved_fit.block_states, options, p_beta)
-                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?
+                .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+            (s, None)
         } else {
             // Use the FAMILY designs here, not the raw reporting designs: they
             // are exactly the widened-marginal/reduced-slope coefficient
@@ -4200,10 +4203,17 @@ fn fit_bernoulli_marginal_slope_terms_under(
                             .fold(0.0_f64, |acc, v| acc.max(v.abs())),
                         cross_row.iter().fold(0.0_f64, |acc, v| acc.max(v.abs())),
                     );
-                    channels.direct + cross_row
+                    // gam#3452: at the true θ₁ the grid is still built from n
+                    // draws, and its nodes' sampling error is a function of the
+                    // same ζ_i the first stage's influence is. `U_Q` pulls it to
+                    // the outcome score exactly as it pulls `D`.
+                    let grid_influence = build
+                        .node_sampling_influence(channels.node.view())
+                        .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+                    (channels.direct + cross_row, Some(grid_influence))
                 }
                 EmpiricalGeneratedRegressorChannel::ClosedForm => {
-                    rigid_standard_normal_score_zeta_sensitivity(
+                    let s = rigid_standard_normal_score_zeta_sensitivity(
                         &spec.base_link,
                         marginal_eta,
                         slope_eta,
@@ -4215,7 +4225,8 @@ fn fit_bernoulli_marginal_slope_terms_under(
                         score_slope_dense.view(),
                         p_beta,
                     )
-                    .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?
+                    .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
+                    (s, None)
                 }
                 // Unreachable: the withholding block above cleared
                 // `covariance_conditional`, so this `if let` did not fire.
@@ -4236,12 +4247,22 @@ fn fit_bernoulli_marginal_slope_terms_under(
         // The first-stage Jacobian expects the RAW normalized score and the
         // raw calibration design, whereas `s` above is evaluated at the
         // calibrated score consumed by the second-stage kernel.
-        let correction = cal.generated_regressor_correction(
-            s.view(),
-            spec.z.view(),
-            calibration_marginal_dense.view(),
-            vb.view(),
-        )
+        let correction = match grid_influence.as_ref() {
+            Some(grid_influence) => cal.generated_regressor_correction_with_measure_influence(
+                s.view(),
+                spec.z.view(),
+                calibration_marginal_dense.view(),
+                spec.weights.view(),
+                vb.view(),
+                grid_influence.view(),
+            ),
+            None => cal.generated_regressor_correction(
+                s.view(),
+                spec.z.view(),
+                calibration_marginal_dense.view(),
+                vb.view(),
+            ),
+        }
         .map_err(|reason| FitFailure::raised(FailureCategory::Numerical, reason))?;
         // gam#2943/#2955: the correction forms both corrected matrices of the
         // one covariance store, judges them, and only then assigns them.

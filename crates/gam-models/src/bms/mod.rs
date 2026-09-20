@@ -1754,6 +1754,162 @@ impl LatentZConditionalCalibration {
         a_block: ArrayView2<'_, f64>,
         vb: ArrayView2<'_, f64>,
     ) -> Result<Array2<f64>, String> {
+        self.check_generated_regressor_inputs(score_zeta_sensitivity, z, a_block, vb)?;
+        // G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)  (p_β × dim θ₁). Each row contributes the
+        // rank-1 outer product `s_i ⊗ J_zeta_i`, so summed over the n rows this
+        // is exactly the cross product `G = Sᵀ·J` of the score-sensitivity
+        // matrix `S` (`n × p_β`, supplied) and the per-row ζ-Jacobian matrix
+        // `J` (`n × dim θ₁`). Forming `J` row-by-row is O(n·dim θ₁); the cross
+        // product is then a single BLAS-3 GEMM rather than the O(n·p_β·dim θ₁)
+        // scalar triple loop (≈1.5e9 FMA at biobank scale, n≈194k, the dominant
+        // ~13s/disease cost of the SE correction). Floored rows yield an exact
+        // all-zero `J` row, so they contribute zero to the GEMM — bit-identical
+        // to skipping them, no approximation.
+        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
+        let vb_g = self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)?;
+        Ok(self.generated_regressor_term(vb_g.view()))
+    }
+
+    /// The generated-regressor correction when the second-stage latent measure
+    /// is ITSELF estimated from the calibrated score, as the global-empirical
+    /// grid is (gam#3452).
+    ///
+    /// [`Self::generated_regressor_correction`] propagates `δθ₁` alone: the rows
+    /// move with `θ₁`, and the grid moves with them through `D` (which
+    /// `score_zeta_sensitivity` already carries). The grid has a sampling error
+    /// of its own, though. At the true `θ₁` it is the equal-mass compression of
+    /// the EMPIRICAL law of `ζ`, not of its population law, and the second-stage
+    /// estimand is defined at the population grid. That error is a function of
+    /// the same rows as `δθ₁`, so the two cannot be added as independent
+    /// covariances; they are summed row by row and the Gram is taken once:
+    ///
+    /// ```text
+    /// φ_i = G·ψ_i + g_i ,   Cov(β̂) ⊇ Vb·(Σ_i φ_i φ_iᵀ)·Vb
+    /// ```
+    ///
+    /// with `ψ_i` the stacked first-stage row influence
+    /// ([`Self::theta1_row_influence`]), `G = Sᵀ·J` as in the closed form, and
+    /// `g_i` (`measure_influence`, `n × p_β`) the score's response to row `i`'s
+    /// influence on the grid, from
+    /// [`empirical_measure_sensitivity::EmpiricalZGridBuild::node_sampling_influence`].
+    /// With `g = 0` this is exactly `(Vb·G)·V₁·(Vb·G)ᵀ`. The cross term with
+    /// the second-stage score is zero: that score has conditional mean zero
+    /// given the rows' covariates and scores at the true parameters.
+    ///
+    /// `weights` are the prior weights the calibration was fitted with.
+    pub(crate) fn generated_regressor_correction_with_measure_influence(
+        &self,
+        score_zeta_sensitivity: ArrayView2<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+        vb: ArrayView2<'_, f64>,
+        measure_influence: ArrayView2<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        self.check_generated_regressor_inputs(score_zeta_sensitivity, z, a_block, vb)?;
+        if measure_influence.dim() != score_zeta_sensitivity.dim() {
+            return Err(format!(
+                "generated_regressor_correction: the measure influence is {:?}, the score \
+                 sensitivity {:?}",
+                measure_influence.dim(),
+                score_zeta_sensitivity.dim()
+            ));
+        }
+        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
+        let g = gam_linalg::faer_ndarray::fast_atb(&score_zeta_sensitivity, &j_mat);
+        let psi = self.theta1_row_influence(z, a_block, weights)?;
+        let mut phi = psi.dot(&g.t());
+        phi += &measure_influence;
+        let meat = gam_linalg::faer_ndarray::fast_ata(&phi);
+        let mut correction = vb.dot(&meat).dot(&vb.t());
+        gam_linalg::matrix::symmetrize_in_place(&mut correction);
+        if correction.iter().any(|value| !value.is_finite()) {
+            return Err("generated_regressor_correction is non-finite".to_string());
+        }
+        Ok(correction)
+    }
+
+    /// Per-row first-stage influence `Ψ` (`n × dim θ₁`) of this calibration on
+    /// the rows it was fitted to: [`stacked_first_stage_row_influence`] at the
+    /// stored coefficients, so `ΨᵀΨ` is `theta1_cov`. Recomputed rather than
+    /// stored because it is `O(n)` and fit-time only.
+    ///
+    /// The residuals are those of the stored map: `û = z − Aᵀβ_m`, and
+    /// `r = û² − Bᵀβ_v` fired or `û² − Σwû²/Σw` (the raw, unfloored constant
+    /// stage) not.
+    pub(crate) fn theta1_row_influence(
+        &self,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+        weights: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let n = z.len();
+        if a_block.nrows() != n || weights.len() != n || a_block.ncols() != self.basis_ncols {
+            return Err(format!(
+                "first-stage row influence shape mismatch: z={n}, weights={}, basis {}x{} \
+                 (expected {} columns)",
+                weights.len(),
+                a_block.nrows(),
+                a_block.ncols(),
+                self.basis_ncols
+            ));
+        }
+        let basis = build_intercept_basis(a_block);
+        let (_, normal) = conditional_calibration_ridge_system(basis.view(), weights.view());
+        let mean_residuals: Vec<f64> = (0..n)
+            .map(|i| z[i] - self.conditional_mean(a_block.row(i)))
+            .collect();
+        let total_weight = weights.sum();
+        let constant_var_basis;
+        let constant_var_normal;
+        let (var_basis, var_normal, var_residuals): (_, &Array2<f64>, Vec<f64>) =
+            if self.var_coeffs.is_empty() {
+                // gam#3030: the constant `v̂ = Σwû²/Σw` is the same regression
+                // on the column of ones, normal matrix `Σw`, and it is no less
+                // estimated: `∂ζ/∂v̂ = −ζ/(2v̂)` is O(1).
+                let raw_var = mean_residuals
+                    .iter()
+                    .zip(weights.iter())
+                    .map(|(&u, &w)| w * u * u)
+                    .sum::<f64>()
+                    / total_weight;
+                constant_var_basis = Array2::<f64>::ones((n, 1));
+                constant_var_normal = Array2::<f64>::from_elem((1, 1), total_weight);
+                (
+                    constant_var_basis.view(),
+                    &constant_var_normal,
+                    mean_residuals.iter().map(|&u| u * u - raw_var).collect(),
+                )
+            } else {
+                // The Breusch-Pagan stage on the mean basis, same normal matrix.
+                let residuals = (0..n)
+                    .map(|i| {
+                        mean_residuals[i] * mean_residuals[i]
+                            - Self::affine(&self.var_coeffs, a_block.row(i))
+                    })
+                    .collect();
+                (basis.view(), &normal, residuals)
+            };
+        stacked_first_stage_row_influence(
+            basis.view(),
+            var_basis,
+            weights,
+            &mean_residuals,
+            &var_residuals,
+            &normal,
+            var_normal,
+        )
+    }
+
+    /// Shape checks shared by both generated-regressor corrections, including
+    /// the refusal of an absent or pre-gam#3030 first-stage covariance.
+    fn check_generated_regressor_inputs(
+        &self,
+        score_zeta_sensitivity: ArrayView2<'_, f64>,
+        z: ArrayView1<'_, f64>,
+        a_block: ArrayView2<'_, f64>,
+        vb: ArrayView2<'_, f64>,
+    ) -> Result<(), String> {
         let n = score_zeta_sensitivity.nrows();
         let p_beta = score_zeta_sensitivity.ncols();
         if z.len() != n || a_block.nrows() != n {
@@ -1778,16 +1934,6 @@ impl LatentZConditionalCalibration {
                 vb.ncols()
             ));
         }
-        // G = Σ_i s_i ⊗ (∂ζ_i/∂θ₁)  (p_β × dim θ₁). Each row contributes the
-        // rank-1 outer product `s_i ⊗ J_zeta_i`, so summed over the n rows this
-        // is exactly the cross product `G = Sᵀ·J` of the score-sensitivity
-        // matrix `S` (`n × p_β`, supplied) and the per-row ζ-Jacobian matrix
-        // `J` (`n × dim θ₁`). Forming `J` row-by-row is O(n·dim θ₁); the cross
-        // product is then a single BLAS-3 GEMM rather than the O(n·p_β·dim θ₁)
-        // scalar triple loop (≈1.5e9 FMA at biobank scale, n≈194k, the dominant
-        // ~13s/disease cost of the SE correction). Floored rows yield an exact
-        // all-zero `J` row, so they contribute zero to the GEMM — bit-identical
-        // to skipping them, no approximation.
         // gam#2484: refuse an absent or ill-shaped first-stage covariance rather
         // than multiplying by it. This fires for a payload written before the
         // joint covariance existed (`theta1_cov` defaults to `0×0` there); such
@@ -1806,9 +1952,7 @@ impl LatentZConditionalCalibration {
                 self.theta1_cov.ncols()
             ));
         }
-        let j_mat = self.build_zeta_theta1_jacobian(z, a_block);
-        let vb_g = self.beta_theta1_sensitivity(score_zeta_sensitivity, j_mat.view(), vb)?;
-        Ok(self.generated_regressor_term(vb_g.view()))
+        Ok(())
     }
 
     /// Per-row ζ-Jacobian matrix `J` (`n × dim θ₁`, row `i` = `∂ζ_i/∂θ₁`) built
@@ -2048,7 +2192,55 @@ pub(crate) fn stacked_first_stage_inverse_bread(
 /// `M⁺ Ω_mm M⁺` exactly, because `J⁻¹` is block lower-triangular. `V₁` is a
 /// congruence of the PSD Gram `Ω`, so it is PSD, and so is the
 /// generated-regressor term built from it. `var_residuals` are the `r_i`.
+///
+/// Formed as `ΨᵀΨ` from the row influence
+/// [`stacked_first_stage_row_influence`], which is `J⁻¹ Ω J⁻ᵀ` exactly. The fit
+/// builds `θ₁`'s covariance from that influence directly
+/// ([`LatentZConditionalCalibration::theta1_row_influence`]); this closed form of
+/// the same number is what the tests pin the formula against.
+#[cfg(test)]
 pub(crate) fn stacked_first_stage_sandwich_cov(
+    mean_basis: ArrayView2<'_, f64>,
+    var_basis: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+    mean_residuals: &[f64],
+    var_residuals: &[f64],
+    mean_normal: &Array2<f64>,
+    var_normal: &Array2<f64>,
+) -> Result<Array2<f64>, String> {
+    let psi = stacked_first_stage_row_influence(
+        mean_basis,
+        var_basis,
+        weights,
+        mean_residuals,
+        var_residuals,
+        mean_normal,
+        var_normal,
+    )?;
+    first_stage_covariance_from_row_influence(&psi)
+}
+
+/// `V₁ = ΨᵀΨ` for a first-stage row influence `Ψ`, refused when non-finite.
+fn first_stage_covariance_from_row_influence(psi: &Array2<f64>) -> Result<Array2<f64>, String> {
+    let mut v1 = gam_linalg::faer_ndarray::fast_ata(psi);
+    gam_linalg::matrix::symmetrize_in_place(&mut v1);
+    if v1.iter().any(|value| !value.is_finite()) {
+        return Err("stacked first-stage sandwich covariance is non-finite".to_string());
+    }
+    Ok(v1)
+}
+
+/// Per-row influence `Ψ` (`n × (p+q)`) of the stacked first stage
+/// [`stacked_first_stage_inverse_bread`] documents: row `i` is
+/// `ψ_i = J⁻¹ S_i` with `S_i = [w_i û_i A_iᵀ | w_i r_i B_iᵀ]`, so that
+/// `θ̂₁ − θ₁ = Σ_i ψ_i + o_p(n^{-1/2})` and `V₁ = ΨᵀΨ = J⁻¹ Ω J⁻ᵀ`.
+///
+/// The covariance alone cannot combine the first stage with a second
+/// influence that is a function of the same rows -- the sampling error of the
+/// global-empirical latent measure built from `ζ` (gam#3452). The row influence
+/// can: the total per-row influence is summed before the Gram is taken, so
+/// every cross-covariance between the two channels is carried exactly.
+pub(crate) fn stacked_first_stage_row_influence(
     mean_basis: ArrayView2<'_, f64>,
     var_basis: ArrayView2<'_, f64>,
     weights: ArrayView1<'_, f64>,
@@ -2085,13 +2277,53 @@ pub(crate) fn stacked_first_stage_sandwich_cov(
             scores[[i, p + j]] = var_scale * var_basis[[i, j]];
         }
     }
-    let omega = gam_linalg::faer_ndarray::fast_ata(&scores);
-    let mut v1 = j_inv.dot(&omega).dot(&j_inv.t());
-    gam_linalg::matrix::symmetrize_in_place(&mut v1);
-    if v1.iter().any(|value| !value.is_finite()) {
-        return Err("stacked first-stage sandwich covariance is non-finite".to_string());
+    let psi = scores.dot(&j_inv.t());
+    if psi.iter().any(|value| !value.is_finite()) {
+        return Err("stacked first-stage row influence is non-finite".to_string());
     }
-    Ok(v1)
+    Ok(psi)
+}
+
+/// The weighted-ridge system of the conditional calibration's mean stage on the
+/// basis `A = [1 | a(C)]`: the per-column penalty `R = diag(Σ_i w_i A_ij²)` and
+/// the normal matrix `M = AᵀWA + λR`, `λ = AUTO_Z_CONDITIONAL_RIDGE_REL`.
+///
+/// One definition, read by the fit and by the row influence the correction
+/// recomputes at the seam, so the two cannot drift apart.
+fn conditional_calibration_ridge_system(
+    basis: ArrayView2<'_, f64>,
+    weights: ArrayView1<'_, f64>,
+) -> (Array2<f64>, Array2<f64>) {
+    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
+    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
+    // be negligible against an O(n) Gram and would not stabilize a
+    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
+    // floored positive so the all-zero (already-dropped) directions still
+    // receive a finite ridge and the factorization cannot fail.
+    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
+    for j in 0..basis.ncols() {
+        let diag_jj = basis
+            .column(j)
+            .iter()
+            .zip(weights.iter())
+            .map(|(&x, &w)| w * x * x)
+            .sum::<f64>()
+            .max(f64::MIN_POSITIVE);
+        penalty[[j, j]] = diag_jj;
+    }
+    // First-stage (generated-regressor) normal matrix `M = AᵀWA + λR`, the same
+    // weighted-ridge system `gaussian_weighted_ridge` factorizes internally;
+    // rebuilt here so its inverse can form the closed-form coefficient sandwich
+    // `V₁` that the second-stage Murphy–Topel correction consumes. `p` is the
+    // marginal-index width (small), so this is a cheap dense `(p+1)²` form.
+    let mut wa = basis.to_owned();
+    for i in 0..wa.nrows() {
+        let wi = weights[i];
+        wa.row_mut(i).iter_mut().for_each(|value| *value *= wi);
+    }
+    let mut normal = basis.t().dot(&wa);
+    normal += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
+    (penalty, normal)
 }
 
 /// Weighted mean of a slice of values.
@@ -2331,23 +2563,7 @@ pub(crate) fn fit_conditional_latent_calibration(
     // whenever the gate fires (a pure-variance trigger leaves the C-slopes of
     // m(C) ≈ 0, so it reduces to harmless global centering).
     let basis = build_intercept_basis(a_block);
-    // Per-column Tikhonov penalty scaled by the weighted Gram diagonal, so the
-    // ridge is *relative* to each column's scale (a 1e-8 absolute ridge would
-    // be negligible against an O(n) Gram and would not stabilize a
-    // rank-deficient penalized-spline marginal index). `diag_jj = Σ_i w_i a_ij²`;
-    // floored positive so the all-zero (already-dropped) directions still
-    // receive a finite ridge and the factorization cannot fail.
-    let mut penalty = Array2::<f64>::zeros((basis.ncols(), basis.ncols()));
-    for j in 0..basis.ncols() {
-        let diag_jj = basis
-            .column(j)
-            .iter()
-            .zip(weights.iter())
-            .map(|(&x, &w)| w * x * x)
-            .sum::<f64>()
-            .max(f64::MIN_POSITIVE);
-        penalty[[j, j]] = diag_jj;
-    }
+    let (penalty, _) = conditional_calibration_ridge_system(basis.view(), weights.view());
     let z_col = z.view().insert_axis(ndarray::Axis(1));
     let (mean_coeffs_mat, mean_fitted) = gam_linalg::utils::gaussian_weighted_ridge(
         basis.view(),
@@ -2357,22 +2573,6 @@ pub(crate) fn fit_conditional_latent_calibration(
         AUTO_Z_CONDITIONAL_RIDGE_REL,
     )?;
     let mean_coeffs: Vec<f64> = mean_coeffs_mat.column(0).to_vec();
-
-    // First-stage (generated-regressor) normal matrix `M = AᵀWA + λR`, the same
-    // weighted-ridge system `gaussian_weighted_ridge` factorizes internally;
-    // rebuilt here so its inverse can form the closed-form coefficient sandwich
-    // `V₁` that the second-stage Murphy–Topel correction consumes. `p` is the
-    // marginal-index width (small), so this is a cheap dense `(p+1)²` form.
-    let normal_matrix = {
-        let mut wa = basis.to_owned();
-        for i in 0..wa.nrows() {
-            let wi = weights[i];
-            wa.row_mut(i).iter_mut().for_each(|value| *value *= wi);
-        }
-        let mut m = basis.t().dot(&wa);
-        m += &(penalty.to_owned() * AUTO_Z_CONDITIONAL_RIDGE_REL);
-        m
-    };
     let mean_residuals: Vec<f64> = z
         .iter()
         .zip(mean_fitted.column(0).iter())
@@ -2389,65 +2589,29 @@ pub(crate) fn fit_conditional_latent_calibration(
         .map(|(&e2, &w)| w * e2)
         .sum::<f64>()
         / total_weight;
-    let var_residuals: Vec<f64>;
     let var_coeffs: Vec<f64> = if var_fires {
         // Conditional-variance correction: regress the squared mean-residual on
         // the same basis. Fitted values are floored at `var_floor` when applied.
         let resid_col = resid_sq.view().insert_axis(ndarray::Axis(1));
-        let (var_coeffs_mat, var_fitted) = gam_linalg::utils::gaussian_weighted_ridge(
+        let (var_coeffs_mat, _) = gam_linalg::utils::gaussian_weighted_ridge(
             basis.view(),
             resid_col,
             penalty.view(),
             weights.view(),
             AUTO_Z_CONDITIONAL_RIDGE_REL,
         )?;
-        // `r_i = (z−m̂)²_i − v̂_i`, the Breusch-Pagan residual of stage B.
-        var_residuals = resid_sq
-            .iter()
-            .zip(var_fitted.column(0).iter())
-            .map(|(&si, &vi)| si - vi)
-            .collect();
         var_coeffs_mat.column(0).to_vec()
     } else {
-        var_residuals = resid_sq
-            .iter()
-            .map(|&si| si - raw_homoskedastic_var)
-            .collect();
         Vec::new()
     };
 
-    // gam#2484 / gam#3030: `θ₁` always carries a variance stage. Fired, it is
-    // the Breusch-Pagan ridge on the mean basis with the same normal matrix.
-    // Not fired, it is the constant `v̂ = Σwû²/Σw` -- the same regression on
-    // the column of ones, normal matrix `Σw` -- and it is no less estimated:
-    // `∂ζ/∂v̂ = −ζ/(2v̂)` is O(1), and `Var(v̂) = v²(κ₄−1)/n`, so dropping it
-    // (κ₄ the residual kurtosis) understates the slope variance by a term of the SAME order as the mean
-    // stage's, `s²(κ₄−1)/(4n)` for a slope `s` on `ζ`.
-    let constant_var_basis;
-    let constant_var_normal;
-    let (var_basis, var_normal) = if var_fires {
-        (basis.view(), &normal_matrix)
-    } else {
-        constant_var_basis = Array2::<f64>::ones((n, 1));
-        constant_var_normal = Array2::<f64>::from_elem((1, 1), total_weight);
-        (constant_var_basis.view(), &constant_var_normal)
-    };
-    let theta1_cov = stacked_first_stage_sandwich_cov(
-        basis.view(),
-        var_basis,
-        weights.view(),
-        &mean_residuals,
-        &var_residuals,
-        &normal_matrix,
-        var_normal,
-    )?;
     // gam#2768: the homoskedastic branch's `v(C)` is the RESIDUAL variance of
     // the conditional-mean regression, not the marginal variance of z. See the
     // field doc for why the difference is the correction rather than a detail:
     // with z standardised, `1 = Var(m(C)) + E[Var(z|C)]`, so the marginal
     // variance overstates `Var(z|C)` by exactly the structure the gate just
     // detected, and dividing by it leaves `ζ` at `sd = √(1−R²)`.
-    // Its estimation uncertainty is the variance stage of `theta1_cov` above.
+    // Its estimation uncertainty is the variance stage of `theta1_cov` below.
     let homoskedastic_var = raw_homoskedastic_var.max(var_floor);
     let mut calibration = LatentZConditionalCalibration {
         mean_coeffs,
@@ -2457,8 +2621,13 @@ pub(crate) fn fit_conditional_latent_calibration(
         homoskedastic_var,
         post_mean: 0.0,
         post_sd: 1.0,
-        theta1_cov,
+        theta1_cov: Array2::<f64>::zeros((0, 0)),
     };
+    // The joint first-stage covariance is the Gram of the SAME row influence
+    // the seam recomputes when the second-stage measure is estimated too
+    // (gam#3452), so the two cannot come from different formulas.
+    let psi = calibration.theta1_row_influence(z.view(), a_block, weights.view())?;
+    calibration.theta1_cov = first_stage_covariance_from_row_influence(&psi)?;
 
     // Sanity-check post-correction moments on the training sample, whose
     // calibrated score is the fitted score map's (gam#3016).
@@ -3591,6 +3760,8 @@ mod first_stage_variance_stage_tests;
 mod empirical_intercept_solve_tests;
 #[cfg(test)]
 mod empirical_measure_2484_tests;
+#[cfg(test)]
+mod empirical_grid_sampling_3452_tests;
 #[cfg(test)]
 mod anchor_law_2926_tests;
 #[cfg(test)]
