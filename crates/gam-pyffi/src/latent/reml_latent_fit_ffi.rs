@@ -3684,6 +3684,31 @@ fn debiased_query_design_full_schema(
     })
 }
 
+/// The optional per-row importance weights of an average functional. An
+/// absent `"weights"` means unweighted. A present value must be an
+/// array of numbers: a malformed entry is refused rather than replaced, which
+/// would report a different estimand than the one asked for (#4277).
+fn debiased_functional_weights(
+    spec_val: &serde_json::Value,
+) -> Result<Option<ndarray::Array1<f64>>, String> {
+    let entries = match spec_val.get("weights") {
+        None => return Ok(None),
+        Some(value) => value.as_array().ok_or_else(|| {
+            format!("debiased_functional: \"weights\" must be an array of numbers, got {value}")
+        })?,
+    };
+    entries
+        .iter()
+        .enumerate()
+        .map(|(row, value)| {
+            value.as_f64().ok_or_else(|| {
+                format!("debiased_functional: weights[{row}] must be a number, got {value}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|weights| Some(ndarray::Array1::from(weights)))
+}
+
 fn weighted_affine_mean(
     values: ndarray::ArrayView1<'_, f64>,
     weights: Option<ndarray::ArrayView1<'_, f64>>,
@@ -3942,29 +3967,7 @@ fn model_debiased_functional_dataset_json_impl(
         }
         "average_derivative" | "average_value" => {
             // Uses the full training design; optional per-row weights from spec.
-            // A present `"weights"` key must be an array of numbers: a non-array
-            // value or a non-numeric entry is refused rather than read as
-            // "unweighted" or as weight 1.0.
-            let weights: Option<ndarray::Array1<f64>> = match spec_val.get("weights") {
-                None => None,
-                Some(value) => {
-                    let entries = value.as_array().ok_or_else(|| {
-                        "debiased_functional: \"weights\" must be a list of numbers".to_string()
-                    })?;
-                    let parsed = entries
-                        .iter()
-                        .enumerate()
-                        .map(|(i, entry)| {
-                            entry.as_f64().ok_or_else(|| {
-                                format!(
-                                    "debiased_functional: \"weights\"[{i}] is not a number: {entry}"
-                                )
-                            })
-                        })
-                        .collect::<Result<Vec<f64>, String>>()?;
-                    Some(ndarray::Array1::from(parsed))
-                }
-            };
+            let weights = debiased_functional_weights(&spec_val)?;
             let x_ref = x.as_ref();
             if target == "average_value" {
                 let gradient = SmoothFunctional::AverageValue {
@@ -4065,7 +4068,16 @@ fn resolve_average_derivative_column(
     dataset: &EncodedDataset,
     spec_val: &serde_json::Value,
 ) -> Result<usize, String> {
-    if let Some(name) = spec_val.get("deriv_var").and_then(|v| v.as_str()) {
+    let deriv_var = match spec_val.get("deriv_var") {
+        None => None,
+        Some(value) => Some(value.as_str().ok_or_else(|| {
+            format!(
+                "debiased_functional: average_derivative \"deriv_var\" must be a column \
+                 name string, got {value}"
+            )
+        })?),
+    };
+    if let Some(name) = deriv_var {
         return dataset.column_map().get(name).copied().ok_or_else(|| {
             format!(
                 "debiased_functional: average_derivative \"deriv_var\" '{name}' \
@@ -5753,5 +5765,125 @@ where
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
             return Err(err);
         }
+    }
+}
+
+/// #4277: the average functionals' weights are the caller's values or an error.
+#[cfg(test)]
+mod debiased_functional_spec_tests {
+    use super::debiased_functional_weights;
+
+    #[test]
+    fn absent_weights_are_unweighted() {
+        assert_eq!(
+            debiased_functional_weights(&serde_json::json!({"target": "average_value"})),
+            Ok(None)
+        );
+        assert!(debiased_functional_weights(&serde_json::json!({"weights": null})).is_err());
+    }
+
+    #[test]
+    fn numeric_weights_are_kept_exactly() {
+        let weights = debiased_functional_weights(&serde_json::json!({"weights": [0.5, 2, 3.25]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(weights.to_vec(), vec![0.5, 2.0, 3.25]);
+    }
+
+    #[test]
+    fn a_non_numeric_weight_is_refused_not_replaced_by_one() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": [1.0, null, 2.0]}))
+            .unwrap_err();
+        assert!(
+            err.contains("weights[1]"),
+            "the error must name the entry: {err}"
+        );
+    }
+
+    #[test]
+    fn a_weights_value_that_is_not_an_array_is_refused_not_dropped() {
+        let err = debiased_functional_weights(&serde_json::json!({"weights": 2.0})).unwrap_err();
+        assert!(err.contains("must be an array"), "{err}");
+    }
+
+    #[test]
+    fn malformed_optional_values_cannot_change_the_requested_estimand() {
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!({}),
+            serde_json::json!("1"),
+        ] {
+            assert!(debiased_functional_weights(&serde_json::json!({"weights": value})).is_err());
+            let error = debiased_functional_weights(&serde_json::json!({"weights": [1, value]}))
+                .unwrap_err();
+            assert!(error.contains("weights[1]"));
+        }
+        let values = ndarray::array![2.0, 10.0];
+        let parsed = debiased_functional_weights(&serde_json::json!({"weights": [1, 3]}))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            super::weighted_affine_mean(values.view(), Some(parsed.view()), "test").unwrap(),
+            8.0
+        );
+        assert_eq!(
+            super::weighted_affine_mean(values.view(), None, "test").unwrap(),
+            6.0
+        );
+    }
+
+    #[test]
+    fn explicit_derivative_selector_is_resolved_or_refused() {
+        let dataset = gam::data::encode_recordswith_inferred_schema(
+            vec!["x".into(), "z".into()],
+            vec![
+                csv::StringRecord::from(vec!["1", "2"]),
+                csv::StringRecord::from(vec!["3", "4"]),
+            ],
+        )
+        .unwrap();
+        let spec: super::TermCollectionSpec = serde_json::from_value(serde_json::json!({
+            "linear_terms": [], "random_effect_terms": [], "smooth_terms": []
+        }))
+        .unwrap();
+        for value in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(3),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ] {
+            let error = super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": value}),
+            )
+            .unwrap_err();
+            assert!(error.contains("must be a column"), "{error}");
+        }
+        assert_eq!(
+            super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": "z"})
+            )
+            .unwrap(),
+            1
+        );
+        assert!(
+            super::resolve_average_derivative_column(
+                &spec,
+                &dataset,
+                &serde_json::json!({"deriv_var": "missing"})
+            )
+            .unwrap_err()
+            .contains("not a column")
+        );
+        assert!(
+            super::resolve_average_derivative_column(&spec, &dataset, &serde_json::json!({}))
+                .unwrap_err()
+                .contains("requires at least one smooth")
+        );
     }
 }
