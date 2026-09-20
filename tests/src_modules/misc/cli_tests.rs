@@ -3549,7 +3549,6 @@ fn intercept_only_gaussian_location_scale_model(
     );
     payload.fit_result = Some(fit_result);
     payload.formula_noise = Some("1".to_string());
-    payload.beta_noise = Some(vec![beta_log_sigma]);
     payload.gaussian_response_scale = Some(response_scale);
     payload.gaussian_sigma_floor = Some(INTERCEPT_ONLY_GAUSSIAN_SIGMA_FLOOR);
     payload.set_training_feature_metadata(vec![], vec![]);
@@ -3612,7 +3611,6 @@ fn intercept_only_binomial_location_scale_model(
     payload.fit_result = Some(fit_result);
     payload.link = Some(InverseLink::Standard(StandardLink::Probit));
     payload.formula_noise = Some("1".to_string());
-    payload.beta_noise = Some(vec![beta_ls]);
     payload.linkwiggle_knots = wiggle_knots;
     payload.linkwiggle_degree = wiggle_degree;
     payload.beta_link_wiggle = beta_link_wiggle;
@@ -4885,14 +4883,9 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     // The semantic mirror fields the marginal-slope contract depends on must
     // match exactly between the two routes — this is what used to drift.
     assert_eq!(cli_payload.slope_formula, ffi_payload.slope_formula);
-    assert_eq!(cli_payload.slope_formulas, ffi_payload.slope_formulas);
     assert_eq!(cli_payload.z_column, ffi_payload.z_column);
     assert_eq!(cli_payload.z_columns, ffi_payload.z_columns);
     assert_eq!(cli_payload.baseline_slope, ffi_payload.baseline_slope);
-    assert_eq!(
-        cli_payload.baseline_slopes,
-        ffi_payload.baseline_slopes
-    );
     assert_eq!(cli_payload.marginal_baseline, ffi_payload.marginal_baseline);
     // `TermCollectionSpec` is not `PartialEq`; the resolved-termspec
     // singular/vector mirrors are covered by the full serialized snapshot
@@ -4903,19 +4896,11 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     );
     assert_eq!(cli_payload.latent_measure, ffi_payload.latent_measure);
 
-    // The vector mirror fields must be the singletons of their scalar peers
+    // The vector mirror field must be the singleton of its scalar peer
     // — the core assembler is the single place that guarantees this.
-    assert_eq!(
-        cli_payload.slope_formulas.as_deref(),
-        Some([cli_payload.slope_formula.clone().unwrap()].as_slice())
-    );
     assert_eq!(
         cli_payload.z_columns.as_deref(),
         Some([cli_payload.z_column.clone().unwrap()].as_slice())
-    );
-    assert_eq!(
-        cli_payload.baseline_slopes.as_deref(),
-        Some([cli_payload.baseline_slope.unwrap()].as_slice())
     );
 
     // Full snapshot parity: serialize both, normalize away the

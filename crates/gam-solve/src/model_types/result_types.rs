@@ -6685,18 +6685,6 @@ impl UnifiedFitResult {
             })
     }
 
-    /// Get owned row-wise diagonal working evidence if available.
-    pub(crate) fn working_geometry(&self) -> Option<&WorkingGeometry> {
-        self.geometry
-            .as_ref()
-            .and_then(|geometry| geometry.working.as_ref())
-    }
-
-    /// Get working response if single diagonal row evidence is available.
-    pub fn working_response(&self) -> Option<&Array1<f64>> {
-        self.working_geometry().map(|working| &working.response)
-    }
-
     /// Smoothing-parameter uncertainty covariance contribution `J·Var(ρ)·Jᵀ`
     /// in coefficient space, on the same dispersion scale as the conditional
     /// covariance `Vb = φ·H⁻¹`. This is the exact ρ-uncertainty term assembled

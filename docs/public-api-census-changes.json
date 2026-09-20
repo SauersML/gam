@@ -4894,5 +4894,14 @@
     },
     "reason": "#3604: dead posterior_eta_bands path deleted; draw_bands_from_matrices is the single posterior-band reducer.",
     "evidence": "No caller of eta_bands_from_matrix_link remains in the workspace."
+  },
+  {
+    "base": "00b33efd500f54529a61bab8ba3dcc5da54a8745",
+    "removed": {
+      "crates/gam-solve/src/model_types/result_types.rs::working_geometry": 1,
+      "crates/gam-solve/src/model_types/result_types.rs::working_response": 1
+    },
+    "reason": "#4466: the saved-model payload carried write-only mirrors (sas_param_covariance, mixture_link_param_covariance, beta_noise, slope_formulas, baseline_slopes, latent_score_contract). Predict reads the link covariance from fit_result.fitted_link, the noise coefficients from the fit's Scale block and the marginal-slope contract from slope_formula/baseline_slope/z_columns, so the mirrors could be edited or drift with no effect on any reloaded prediction. They are deleted with SavedLatentScoreContract, the struct only latent_score_contract held, and the FitResult::working_response/working_geometry accessors, which had no caller outside each other.",
+    "evidence": "At 00b33efd50, git grep finds no reader of the six payload keys (beta_noise only behind a dead fallback after the fit's Scale block) outside their writers in model_payload_builders.rs, the new()/validate_numeric_finiteness boilerplate in model.rs and tests; SavedLatentScoreContract is named only in model.rs; '.working_response()' has no call site and '.working_geometry()' is called only by working_response, both in result_types.rs. stateful_saved_model_sync now asserts the SAS covariance round-trips through fit_result.fitted_link and pins 96 payload keys (the pin had also missed gaussian_sigma_floor and informational_notes)."
   }
 ]
