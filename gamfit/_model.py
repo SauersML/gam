@@ -218,7 +218,9 @@ class Model:
             frozen-penalty set with no finite-sample guarantee for the
             selection step (several smoothing parameters, a payload without the
             count, a degenerate criterion, or ``-7`` glm_frozen_penalty for a
-            non-Gaussian fit that selected a smoothing parameter or NB theta).
+            Poisson, negative-binomial or Gamma fit that selected a smoothing
+            parameter or NB theta; a binomial fit of one smoothing parameter
+            re-selects it on the augmented rows and reports 1).
             The set is a union of ``conformal_set_components`` intervals and
             the bounds report its outer envelope (NaN for an empty randomized
             set). With ``calibration`` it is the

@@ -94,11 +94,14 @@ impl From<String> for FullConformalError {
 ///   smoothing strength by REML on the augmented rows, so the finite-sample
 ///   coverage theorem holds for it, or the frozen-ρ set with a typed refusal.
 /// * Bernoulli logit, Poisson log, negative binomial log (θ frozen at its
-///   fitted value, like λ) and Gamma log: the certified augmented-refit set of
-///   [`gam_models::inference::full_conformal_glm`] at the frozen penalty, with
-///   the score `|∂ℓ/∂η|` (the Pearson residual for Gamma). Discrete candidates
-///   are enumerated up to a data-derived tail beyond which no candidate can
-///   enter; ties are broken by a seeded uniform so the set is exact rather than
+///   fitted value) and Gamma log: the certified augmented-refit set of
+///   [`gam_models::inference::full_conformal_glm`], with the score `|∂ℓ/∂η|`
+///   (the Pearson residual for Gamma). A Bernoulli fit of one smoothing
+///   parameter re-selects its strength on every augmented data set by the
+///   Laplace marginal likelihood, so the coverage theorem holds for it; every
+///   other fit is scored at the frozen penalty. Discrete candidates are
+///   enumerated up to a data-derived tail beyond which no candidate can enter;
+///   ties are broken by a seeded uniform so the set is exact rather than
 ///   conservative.
 ///
 /// The `conformal_certificate` column says what each row carries: `0`
@@ -239,7 +242,6 @@ pub fn full_conformal_prediction_columns(
             }
         }
         Some(family) => {
-            let glm_certificate = f64::from(family.certificate(penalty.penalty_count()).code());
             let substrate = GlmFullConformalSubstrate::new(
                 family,
                 x_labeled,
@@ -247,6 +249,7 @@ pub fn full_conformal_prediction_columns(
                 offset_labeled,
                 penalty.s_lambda().clone(),
                 fit.beta.clone(),
+                penalty.penalty_count(),
             )?;
             for i in 0..n_test {
                 let x_star = x_test.row(i).to_owned();
@@ -263,7 +266,7 @@ pub fn full_conformal_prediction_columns(
                 lower_vec.push(lo);
                 upper_vec.push(hi);
                 components_vec.push(set.intervals.len() as f64);
-                certificate_vec.push(glm_certificate);
+                certificate_vec.push(f64::from(set.certificate.code()));
             }
         }
     }

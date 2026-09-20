@@ -15,9 +15,11 @@ the fitted smoothing parameters (``gam_models::inference::full_conformal_glm``):
 Discrete ties are randomized with a seed drawn from the data, so the set is
 exact (coverage ``1 - alpha`` on average) rather than conservative. A
 prior-weighted fit has no exchangeable augmented problem, so it refuses with a
-typed error that names split conformal. GLM rows of a smooth fit report
-``conformal_certificate`` -7 (glm_frozen_penalty) because only the Gaussian
-route re-selects the smoothing parameters on the augmented rows.
+typed error that names split conformal. Rows of a smooth binomial fit with a
+single smoothing parameter re-select it on the augmented rows
+(``conformal_certificate`` 1); ``s(x)`` carries a null-space penalty beside its
+bending penalty, so a default smooth binomial fit reports -1 (multi_penalty)
+and the other smooth GLM fits -7 (glm_frozen_penalty).
 """
 
 from __future__ import annotations
@@ -84,7 +86,9 @@ def test_glm_full_conformal_set_is_a_set_in_the_support(family: str) -> None:
     hi = np.asarray(out["posterior_mean_upper"], dtype=float)
     comps = np.asarray(out["conformal_set_components"], dtype=float)
     certificate = np.asarray(out["conformal_certificate"], dtype=float)
-    assert np.all(certificate == -7.0), "a smooth GLM fit is refused as glm_frozen_penalty"
+    # ``s(x)`` is double-penalized: a binomial fit selects two strengths.
+    refusal = -1.0 if family == "binomial" else -7.0
+    assert np.all(certificate == refusal), f"{family}: certificate {certificate}"
     assert np.all(comps >= 1), f"{family}: empty set at alpha={ALPHA}"
     assert np.all(lo <= hi)
     if family == "gamma":
@@ -127,8 +131,9 @@ def test_glm_full_conformal_covers_at_the_nominal_level(family: str) -> None:
     augmented rows are exchangeable: coverage is then exactly 1 - alpha, which
     tests the set construction itself. With the penalty selected on the labeled
     rows (the usual call) the smoothing step sees the labeled rows but not the
-    candidate, which costs O(1/n) coverage; ``conformal_certificate`` is -7
-    (glm_frozen_penalty) for every smooth GLM row for that reason, and bench/pygam_audit/conformal_coverage.md
+    candidate, which costs O(1/n) coverage; ``conformal_certificate`` is
+    negative (-1 multi_penalty for the double-penalized binomial ``s(x)``, -7
+    glm_frozen_penalty for the others) for that reason, and bench/pygam_audit/conformal_coverage.md
     reports that route's coverage.
     """
 
