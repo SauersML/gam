@@ -2478,7 +2478,7 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
     // ρ-dependent Occam reward). `Strict` / `PositiveDefinite` keep the plain SPD
     // estimator — they never form an undamped evidence with nulls.
     match evidence_policy {
-        ArrowEvidencePolicy::UnitDeflation { relative_floor } => Ok(slq_logdet_unit_deflated(
+        ArrowEvidencePolicy::UnitDeflation { relative_floor } => slq_logdet_unit_deflated(
             k,
             |v| op.apply(v),
             num_probes,
@@ -2486,7 +2486,8 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
             seed,
             relative_floor,
         )
-        .as_logdet()),
+        .map(|deflated| deflated.as_logdet())
+        .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason }),
         // #2515 — a negative Ritz value is a Rayleigh quotient of raw A, not a
         // saddle verdict. Lift each Ritz direction and ask the same typed
         // B-metric/clamp-basin classifier as the dense and direct-arrow routes.
@@ -2519,7 +2520,8 @@ pub(crate) fn slq_reduced_schur_log_det<B: BatchedBlockSolver + Sync>(
             .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })
         }
         ArrowEvidencePolicy::Strict | ArrowEvidencePolicy::PositiveDefinite => {
-            Ok(slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed))
+            slq_logdet(k, |v| op.apply(v), num_probes, lanczos_steps, seed)
+                .map_err(|reason| ArrowSchurError::SchurFactorFailed { reason })
         }
     }
 }
