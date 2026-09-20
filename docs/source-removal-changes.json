@@ -2745,7 +2745,7 @@
     "evidence": "At base b3832b92 each name has exactly one definition (rho_posterior.rs:136 SplitMix64::normal, bms/mod.rs:1938 signed_weighted_gram, bms/mod.rs:2039 weighted_ridge_sandwich_cov, families_bms_identifiability_rigid_tests.rs:7072 the test); at the head git grep -w 'fn <name>' finds none of them in those files, and the other fn normal hits are unrelated local RNGs in other files. cargo check --workspace --tests is clean; first_stage_variance_stage (4), murphy_topel (1), gam-inference lib, rho_domain and perf rho_posterior_tier0 pass on the head."
   },
   {
-    "base": "63dc278284ba6535d9c14a257ff64aa04dff6e0a",
+    "base": "81994b4a582ee6a9b9b2a6ebe0e05e7ac0e9209d",
     "items": [
       "crates/gam-gpu/src/calibration.rs:fn:into_record",
       "crates/gam-gpu/src/calibration.rs:fn:measure_gemm",
