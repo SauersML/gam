@@ -1316,30 +1316,13 @@ impl<'a> RemlState<'a> {
         EstimationError,
     > {
         let t_tau = std::time::Instant::now();
-        // Guard: non-sparse tau coordinate construction requires dense design.
-        // Skip for large models that would blow memory.
+        // Every requested τ direction gets its coordinate (#3572). The
+        // dense-versus-implicit design choice is made inside the same builders
+        // the value+gradient lane calls, so the Hessian lane never evaluates a
+        // different coordinate set (or a different `log|H|` surface) than the
+        // gradient lane at the same θ.
         let n_x = self.x().nrows();
         let p_x = self.x().ncols();
-        const HYPER_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > HYPER_MAX_DENSE_WORK
-            && bundle.backend_kind() != GeometryBackendKind::SparseExactSpd
-        {
-            log::debug!(
-                "skipping tau hyper-coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large; falling back to rho-only REML"
-            );
-            let identity_pair: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            let identity_pair2: Box<
-                dyn Fn(usize, usize) -> super::reml_outer_engine::HyperCoordPairResult
-                    + Send
-                    + Sync,
-            > = Box::new(|_, _| Ok(super::reml_outer_engine::HyperCoordPair::zero()));
-            return Ok((Vec::new(), identity_pair, identity_pair2, None));
-        }
         let backend_label;
         let result = if bundle.backend_kind() == GeometryBackendKind::SparseExactSpd {
             backend_label = "sparse_exact";
@@ -3039,18 +3022,6 @@ impl<'a> RemlState<'a> {
         let pirls_result = bundle.pirls_result.as_ref();
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
 
-        // Guard: SAS link ext coords require dense design materialization.
-        let n_x = pirls_result.x_transformed.nrows();
-        let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::debug!(
-                "skipping SAS link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
-        }
-
         // Transformed design matrix (dense required for link-param B construction).
         let x_dense_arc = pirls_result
             .x_transformed
@@ -3240,18 +3211,6 @@ impl<'a> RemlState<'a> {
 
         let pirls_result = bundle.pirls_result.as_ref();
         let free_basis_opt = self.active_constraint_free_basis(pirls_result);
-
-        // Guard: mixture link ext coords require dense design materialization.
-        let n_x = pirls_result.x_transformed.nrows();
-        let p_x = pirls_result.x_transformed.ncols();
-        const LINK_EXT_MAX_DENSE_WORK: usize = 50_000_000;
-        if n_x.saturating_mul(p_x) > LINK_EXT_MAX_DENSE_WORK {
-            log::debug!(
-                "skipping mixture link ext coordinate construction (n={n_x}, p={p_x}): \
-                 dense design materialization too large"
-            );
-            return Ok(Vec::new());
-        }
 
         let x_dense_arc = pirls_result
             .x_transformed
