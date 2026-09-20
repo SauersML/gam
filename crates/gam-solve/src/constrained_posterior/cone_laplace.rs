@@ -73,6 +73,29 @@
 //! - **What [`ConeLaplace::second_order`] returns** is everything in `d²L` except the fixed-site
 //!   log-determinant Hessian `½tr(Λ⁻¹M̈) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)`. That includes the sites' motion
 //!   through the trace term.
+//!
+//! # Rows that move (gam#3171)
+//!
+//! A family's inequality rows can depend on an outer coordinate: the transformation-normal
+//! monotonicity rows are built on the covariate design, which moves with its length scale. Along
+//! such a coordinate `A` and `b` move too, so `Λ̇ = Ṁ + ȦᵀT̃A + AᵀT̃Ȧ` and the slack moves by
+//! `ḋ = Aβ̂̇ + Ȧβ̂ − ḃ`. The fixed-site derivative becomes
+//!
+//! ```text
+//! dL/dθ = ½tr(Λ⁻¹Ṁ) + tr(T̃ȦR) + δ̄ᵀġ + ½δ̄ᵀṀδ̄ − (ν̃ − T̃ū)ᵀe,    e = Aβ̂̇ + Ȧ(β̂ + δ̄) − ḃ,
+//! ```
+//!
+//! still with no site term, because each `ln c_i` is stationary in its own cavity at the fixed
+//! point. `tr(T̃ȦR) = ½tr(Λ⁻¹(ȦᵀT̃A + AᵀT̃Ȧ))` is the share of the log-determinant trace that a
+//! criterion taking `½tr(Λ⁻¹Ṁ)` on its own precision drift does not see, so the first order
+//! returns it. The second order returns every term of `½tr(Λ⁻¹Λ̈) − ½tr(Λ⁻¹Λ̇_lΛ⁻¹Λ̇_k)` that is not
+//! the criterion's `Ṁ` part, and the sites move under the row motion of `Σ_u = AΛ⁻¹Aᵀ`,
+//! `Σ̇_u = ȦR + RᵀȦᵀ − RᵀΛ̇R`.
+//!
+//! `L` depends on each row only through its half-space, so it is unchanged by a positive
+//! rescaling of any row with its bound, at every `θ`. The term holds its rows at unit scale at the
+//! mode it was evaluated on. It therefore takes the caller's row rates `(ȧ_i, ḃ_i)` at the caller's
+//! scale and divides them by that row's norm there, a constant rescaling that leaves `L` unchanged.
 
 use faer::Side;
 use gam_linalg::faer_ndarray::FaerCholesky;
@@ -357,34 +380,61 @@ fn share_and_magnitude(
     Ok((total, magnitude))
 }
 
+/// The motion of the constraint system `rows · β ≥ bounds` along one coordinate (or, in a
+/// [`ConeLaplacePairMotion`], its second derivative along a pair), over the rows exactly as the
+/// caller passed them to [`ConeLaplace::evaluate`]: row `i` of `rows` is `ȧ_i` and `bounds[i]` is
+/// `ḃ_i`, at the caller's row scale.
+#[derive(Clone, Debug)]
+pub struct ConeRowMotion {
+    pub rows: Array2<f64>,
+    pub bounds: Array1<f64>,
+}
+
 /// One outer coordinate's first-order motion of the state the term reads: the mode response
-/// `β̂̇`, the KKT gradient's total derivative `ġ`, and the precision's motion `Ṁ` applied to
+/// `β̂̇`, the KKT gradient's total derivative `ġ`, the precision's motion `Ṁ` applied to
 /// `δ̄` ([`ConeLaplace::mean_offset`]) and to each column of `R = Λ⁻¹Aᵀ`
-/// ([`ConeLaplace::normal_solves`]).
+/// ([`ConeLaplace::normal_solves`]), and the constraint system's motion where the coordinate
+/// moves it (`None` where the rows and bounds do not depend on it).
 #[derive(Clone, Debug)]
 pub struct ConeLaplaceMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_mean: Array1<f64>,
     pub precision_rate_on_normals: Array2<f64>,
+    pub constraint_rate: Option<ConeRowMotion>,
 }
 
-/// One coordinate pair's second-order motion: `β̈_kl`, `g̈_kl`, and `M̈_kl δ̄`.
+/// One coordinate pair's second-order motion: `β̈_kl`, `g̈_kl`, `M̈_kl δ̄`, and `(Ä_kl, b̈_kl)` where
+/// the pair moves the constraint system.
 #[derive(Clone, Debug)]
 pub struct ConeLaplacePairMotion {
     pub mode_response: Array1<f64>,
     pub gradient_rate: Array1<f64>,
     pub precision_rate_on_mean: Array1<f64>,
+    pub constraint_rate: Option<ConeRowMotion>,
 }
 
-/// A coordinate's first derivative of the share `L − ½ln|Λ|`, with the rates its pairs reuse.
+/// A coordinate's row motion on the retained rows at unit scale: `Ȧ`, with the solves the first
+/// and second orders contract it through, `Q = Λ⁻¹Ȧᵀ` (`p × q`) and `C = ȦR` (`q × q`).
+#[derive(Clone, Debug)]
+struct RetainedRowRate {
+    rows: Array2<f64>,
+    solved: Array2<f64>,
+    coupling: Array2<f64>,
+}
+
+/// A coordinate's first derivative of `L` less the criterion's own trace `½tr(Λ⁻¹Ṁ)`, with the
+/// rates its pairs reuse.
 #[derive(Clone, Debug)]
 pub struct ConeLaplaceFirstOrder {
-    /// `δ̄ᵀġ + ½δ̄ᵀṀδ̄ − (ν̃ − T̃ū)ᵀAβ̂̇`.
+    /// `tr(T̃ȦR) + δ̄ᵀġ + ½δ̄ᵀṀδ̄ − (ν̃ − T̃ū)ᵀe`.
     pub derivative: f64,
+    mode_response: Array1<f64>,
     gradient_rate: Array1<f64>,
     precision_rate_on_mean: Array1<f64>,
-    /// `ḋ = Aβ̂̇`.
+    precision_rate_on_normals: Array2<f64>,
+    row_rate: Option<RetainedRowRate>,
+    /// `e = Aβ̂̇ + Ȧ(β̂ + δ̄) − ḃ`, the slack's motion with the posterior's offset carried by the rows.
     slack_rate: Array1<f64>,
     /// `δ̄̇` and `ū̇` at fixed sites.
     mean_offset_rate: Array1<f64>,
@@ -414,6 +464,12 @@ pub struct ConeLaplace {
     band: f64,
     /// Unit-scaled rows inside the horizon, `q × p`.
     rows: Array2<f64>,
+    /// The caller's row each was read from, its norm there, and how many rows the caller passed.
+    sources: Vec<usize>,
+    norms: Vec<f64>,
+    caller_rows: usize,
+    /// `β̂`.
+    mode: Array1<f64>,
     tau: Array1<f64>,
     nu: Array1<f64>,
     precision: Array2<f64>,
@@ -427,15 +483,23 @@ pub struct ConeLaplace {
     site_motion_system: std::sync::OnceLock<Result<SiteMotionSystem, ConeLaplaceRefusal>>,
 }
 
-/// The distinct unit rows of `rows · β ≥ bounds` with their slack at `β`.
-fn distinct_unit_rows(
-    rows: &Array2<f64>,
-    bounds: &Array1<f64>,
-    beta: &Array1<f64>,
-) -> (Vec<Array1<f64>>, Vec<f64>, Vec<f64>) {
+/// The distinct unit rows of `rows · β ≥ bounds`, one per half-space.
+struct DistinctRows {
+    units: Vec<Array1<f64>>,
+    /// The slack of each at `β`, with its rounding band.
+    slacks: Vec<f64>,
+    slack_bands: Vec<f64>,
+    /// The caller's row each was first read from, and that row's norm.
+    sources: Vec<usize>,
+    norms: Vec<f64>,
+}
+
+fn distinct_unit_rows(rows: &Array2<f64>, bounds: &Array1<f64>, beta: &Array1<f64>) -> DistinctRows {
     let mut units = Vec::new();
     let mut slacks = Vec::new();
     let mut slack_bands = Vec::new();
+    let mut sources = Vec::new();
+    let mut norms = Vec::new();
     let mut half_spaces = std::collections::HashSet::<Vec<u64>>::new();
     let p = beta.len();
     for row in 0..rows.nrows() {
@@ -455,8 +519,20 @@ fn distinct_unit_rows(
         slacks.push(unit.dot(beta) - bound);
         slack_bands.push(accumulation_growth(p + 1) * (evaluated + bound.abs()));
         units.push(unit);
+        sources.push(row);
+        norms.push(norm);
     }
-    (units, slacks, slack_bands)
+    DistinctRows { units, slacks, slack_bands, sources, norms }
+}
+
+/// What EP reads at one mode, over every distinct row.
+#[derive(Clone, Copy)]
+struct ModeInputs<'a> {
+    precision: &'a Array2<f64>,
+    gradient: &'a Array1<f64>,
+    beta: &'a Array1<f64>,
+    distinct: &'a DistinctRows,
+    caller_rows: usize,
 }
 
 fn stack_rows(units: &[Array1<f64>], chosen: &[usize], p: usize) -> Array2<f64> {
@@ -523,11 +599,12 @@ impl ConeLaplace {
             return Err(ConeLaplaceRefusal::NonFinite { what: "precision" });
         }
         let horizon = slack_horizon()?;
-        let (units, slacks, slack_bands) = distinct_unit_rows(rows, bounds, beta);
+        let distinct = distinct_unit_rows(rows, bounds, beta);
+        let (units, slacks, slack_bands) = (&distinct.units, &distinct.slacks, &distinct.slack_bands);
         let total = units.len();
         // The boundary start: rows at zero slack with a positive multiplier.
         let zero: Vec<usize> = (0..total).filter(|&i| slacks[i] <= slack_bands[i]).collect();
-        let multipliers = zero_slack_multipliers(&stack_rows(&units, &zero, p), gradient)?;
+        let multipliers = zero_slack_multipliers(&stack_rows(units, &zero, p), gradient)?;
         let mut start_tau = vec![0.0_f64; total];
         let mut start_nu = vec![0.0_f64; total];
         for (k, &i) in zero.iter().enumerate() {
@@ -536,7 +613,7 @@ impl ConeLaplace {
                 start_nu[i] = 2.0 * multipliers[k];
             }
         }
-        let all_rows = stack_rows(&units, &(0..total).collect::<Vec<_>>(), p);
+        let all_rows = stack_rows(units, &(0..total).collect::<Vec<_>>(), p);
         let all_slack = Array1::from(slacks.clone());
         let (_, start_inverse, _, _, start_offset) = site_precision(
             precision,
@@ -552,13 +629,14 @@ impl ConeLaplace {
             let row = all_rows.row(i);
             (row.dot(offset) + slacks[i]) / row.dot(&inverse.dot(&row)).sqrt()
         };
+        let mode = ModeInputs { precision, gradient, beta, distinct: &distinct, caller_rows: rows.nrows() };
         let mut chosen: Vec<usize> = (0..total)
             .filter(|&i| start_tau[i] > 0.0 || standardized(&start_inverse, &start_offset, i) < horizon)
             .collect();
         let mut tau: Vec<f64> = chosen.iter().map(|&i| start_tau[i]).collect();
         let mut nu: Vec<f64> = chosen.iter().map(|&i| start_nu[i]).collect();
         loop {
-            let term = Self::converge(precision, gradient, &units, &slacks, &chosen, &tau, &nu)?;
+            let term = Self::converge(&mode, &chosen, &tau, &nu)?;
             let mut added = false;
             for i in 0..total {
                 if !chosen.contains(&i) && standardized(&term.inverse, &term.mean_offset, i) < horizon {
@@ -576,20 +654,13 @@ impl ConeLaplace {
         }
     }
 
-    /// EP on the rows `chosen` from the sites `(tau, nu)`.
-    fn converge(
-        precision_m: &Array2<f64>,
-        gradient: &Array1<f64>,
-        units: &[Array1<f64>],
-        slacks: &[f64],
-        chosen: &[usize],
-        tau: &[f64],
-        nu: &[f64],
-    ) -> Result<Self, ConeLaplaceRefusal> {
+    /// EP on the rows `chosen` of the mode's distinct rows from the sites `(tau, nu)`.
+    fn converge(mode: &ModeInputs<'_>, chosen: &[usize], tau: &[f64], nu: &[f64]) -> Result<Self, ConeLaplaceRefusal> {
+        let ModeInputs { precision: precision_m, gradient, beta, distinct, caller_rows } = *mode;
         let p = gradient.len();
         let q = chosen.len();
-        let rows = stack_rows(units, chosen, p);
-        let slack = Array1::from_shape_fn(q, |i| slacks[chosen[i]]);
+        let rows = stack_rows(&distinct.units, chosen, p);
+        let slack = Array1::from_shape_fn(q, |i| distinct.slacks[chosen[i]]);
         let mut tau = Array1::from(tau.to_vec());
         let mut nu = Array1::from(nu.to_vec());
         // Every term of `L`, and every site's cavity, is formed in at most `p² + 4q² + 8q` rounded
@@ -668,6 +739,10 @@ impl ConeLaplace {
                     log_det_half: 0.5 * part.log_det,
                     band,
                     rows,
+                    sources: chosen.iter().map(|&i| distinct.sources[i]).collect(),
+                    norms: chosen.iter().map(|&i| distinct.norms[i]).collect(),
+                    caller_rows,
+                    mode: beta.clone(),
                     tau,
                     nu,
                     precision: part.precision,
@@ -755,35 +830,90 @@ impl ConeLaplace {
         self.fraction
     }
 
-    /// First derivative of the share along one coordinate, with the rates its pairs reuse.
+    /// `Ȧ` and `ḃ` on the retained rows at unit scale, from the caller's rates at its own row scale.
+    fn retained_rate(&self, motion: &ConeRowMotion) -> Result<(Array2<f64>, Array1<f64>), ConeLaplaceRefusal> {
+        let p = self.mode.len();
+        if motion.rows.dim() != (self.caller_rows, p) || motion.bounds.len() != self.caller_rows {
+            return Err(ConeLaplaceRefusal::Dimension {
+                reason: format!(
+                    "row motion {:?} and bound motion {} against {} rows over {p} coefficients",
+                    motion.rows.dim(),
+                    motion.bounds.len(),
+                    self.caller_rows
+                ),
+            });
+        }
+        if motion.rows.iter().chain(motion.bounds.iter()).any(|value| !value.is_finite()) {
+            return Err(ConeLaplaceRefusal::NonFinite { what: "constraint row or bound motion" });
+        }
+        let q = self.rows.nrows();
+        let rows = Array2::from_shape_fn((q, p), |(i, a)| motion.rows[[self.sources[i], a]] / self.norms[i]);
+        let bounds = Array1::from_shape_fn(q, |i| motion.bounds[self.sources[i]] / self.norms[i]);
+        Ok((rows, bounds))
+    }
+
+    /// `Σ_i τ̃_i x_iᵀy_i` over the columns of two `p × q` matrices.
+    fn site_weighted_column_dot(&self, x: &Array2<f64>, y: &Array2<f64>) -> f64 {
+        (0..self.rows.nrows()).map(|i| self.tau[i] * x.column(i).dot(&y.column(i))).sum()
+    }
+
+    /// First derivative of `L` less the criterion's trace `½tr(Λ⁻¹Ṁ)` along one coordinate, with
+    /// the rates its pairs reuse.
     pub fn first_order(&self, motion: &ConeLaplaceMotion) -> Result<ConeLaplaceFirstOrder, ConeLaplaceRefusal> {
         let q = self.rows.nrows();
-        let slack_rate = self.rows.dot(&motion.mode_response);
+        let site_residual = &self.nu - &(&self.tau * &self.posterior_mean);
+        let mut slack_rate = self.rows.dot(&motion.mode_response);
+        let row_rate = match &motion.constraint_rate {
+            None => None,
+            Some(constraint_rate) => {
+                let (rows, bounds) = self.retained_rate(constraint_rate)?;
+                slack_rate += &(rows.dot(&(&self.mode + &self.mean_offset)) - &bounds);
+                let solved = self.inverse.dot(&rows.t());
+                let coupling = rows.dot(&self.normal_solves);
+                Some(RetainedRowRate { rows, solved, coupling })
+            }
+        };
         let tau_slack_rate = &self.tau * &slack_rate;
-        let rhs = -&motion.gradient_rate - &self.rows.t().dot(&tau_slack_rate) - &motion.precision_rate_on_mean;
+        // `δ̄̇ = Λ⁻¹(ḣ − Λ̇δ̄) = Λ⁻¹(−ġ − Ṁδ̄ − AᵀT̃e + Ȧᵀ(ν̃ − T̃ū))` at fixed sites.
+        let mut rhs = -&motion.gradient_rate - &self.rows.t().dot(&tau_slack_rate) - &motion.precision_rate_on_mean;
+        if let Some(rate) = &row_rate {
+            rhs += &rate.rows.t().dot(&site_residual);
+        }
         let mean_offset_rate = self.inverse.dot(&rhs);
         let posterior_mean_rate = self.rows.dot(&mean_offset_rate) + &slack_rate;
-        let site_residual = &self.nu - &(&self.tau * &self.posterior_mean);
-        let derivative = self.mean_offset.dot(&motion.gradient_rate)
+        let mut derivative = self.mean_offset.dot(&motion.gradient_rate)
             + 0.5 * self.mean_offset.dot(&motion.precision_rate_on_mean)
             - site_residual.dot(&slack_rate);
-        // `r_jᵀṀr_j`, the trace term's rate in `τ̃_j`, and the diagonal of `dΣ_u = −RᵀṀR`.
-        let trace_rates = Array1::from_shape_fn(q, |j| {
-            self.normal_solves.column(j).dot(&motion.precision_rate_on_normals.column(j))
+        // The diagonal of the fixed-site `dΣ_u = ȦR + RᵀȦᵀ − RᵀΛ̇R`: `−r_jᵀṀr_j`, and where the rows
+        // move `2C_jj − 2Σ_i τ̃_iΣ_ijC_ij`. Half of it is the trace term's rate in `τ̃_j`.
+        let mut sigma_rate = Array1::from_shape_fn(q, |j| {
+            -self.normal_solves.column(j).dot(&motion.precision_rate_on_normals.column(j))
         });
-        let nu_partial = self.normal_solves.t().dot(&motion.gradient_rate)
+        let mut nu_partial = self.normal_solves.t().dot(&motion.gradient_rate)
             + self.normal_solves.t().dot(&motion.precision_rate_on_mean)
             - &slack_rate
             + self.sigma.dot(&tau_slack_rate);
-        let tau_partial = -0.5 * &trace_rates - &(&self.posterior_mean * &nu_partial);
-        let (tau_rate, nu_rate) = self.site_motion(&(-&trace_rates), &posterior_mean_rate)?;
+        if let Some(rate) = &row_rate {
+            let coupling = &rate.coupling;
+            derivative += (0..q).map(|i| self.tau[i] * coupling[[i, i]]).sum::<f64>();
+            for j in 0..q {
+                let weighted: f64 = (0..q).map(|i| self.tau[i] * self.sigma[[i, j]] * coupling[[i, j]]).sum();
+                sigma_rate[j] += 2.0 * (coupling[[j, j]] - weighted);
+            }
+            nu_partial -= &coupling.t().dot(&site_residual);
+        }
+        let tau_partial = 0.5 * &sigma_rate - &(&self.posterior_mean * &nu_partial);
+        let (tau_rate, nu_rate) = self.site_motion(&sigma_rate, &posterior_mean_rate)?;
         if !derivative.is_finite() {
             return Err(ConeLaplaceRefusal::NonFinite { what: "first-order share" });
         }
         Ok(ConeLaplaceFirstOrder {
             derivative,
+            mode_response: motion.mode_response.clone(),
             gradient_rate: motion.gradient_rate.clone(),
             precision_rate_on_mean: motion.precision_rate_on_mean.clone(),
+            precision_rate_on_normals: motion.precision_rate_on_normals.clone(),
+            row_rate,
             slack_rate,
             mean_offset_rate,
             posterior_mean_rate,
@@ -794,22 +924,57 @@ impl ConeLaplace {
         })
     }
 
-    /// Everything in `d²L/dθ_kdθ_l` except the fixed-site log-determinant Hessian
-    /// `½tr(Λ⁻¹M̈_kl) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)`: the share's fixed-site second derivative and the sites'
-    /// motion through the whole first derivative, the trace term included.
+    /// Everything in `d²L/dθ_kdθ_l` except the criterion's fixed-site log-determinant Hessian
+    /// `½tr(Λ⁻¹M̈_kl) − ½tr(Λ⁻¹Ṁ_lΛ⁻¹Ṁ_k)`: the rest of the fixed-site second derivative, the row
+    /// motion's share of `½tr(Λ⁻¹Λ̈) − ½tr(Λ⁻¹Λ̇_lΛ⁻¹Λ̇_k)` included, and the sites' motion through
+    /// the whole first derivative, the trace term included.
     pub fn second_order(
         &self,
         first_k: &ConeLaplaceFirstOrder,
         first_l: &ConeLaplaceFirstOrder,
         pair: &ConeLaplacePairMotion,
     ) -> Result<f64, ConeLaplaceRefusal> {
+        let q = self.rows.nrows();
         let site_residual = &self.nu - &(&self.tau * &self.posterior_mean);
-        let fixed_sites = first_l.mean_offset_rate.dot(&first_k.gradient_rate)
+        // `ė_kl = Aβ̈ + Ä(β̂ + δ̄) − b̈ + Ȧ_lβ̂̇_k + Ȧ_k(β̂̇_l + δ̄̇_l)`.
+        let mut slack_pair_rate = self.rows.dot(&pair.mode_response);
+        let mut trace = 0.0;
+        if let Some(constraint_rate) = &pair.constraint_rate {
+            let (rows, bounds) = self.retained_rate(constraint_rate)?;
+            slack_pair_rate += &(rows.dot(&(&self.mode + &self.mean_offset)) - &bounds);
+            // `½tr(Λ⁻¹(ÄᵀT̃A + AᵀT̃Ä)) = Σ_i τ̃_i ä_iᵀr_i`.
+            trace += (0..q).map(|i| self.tau[i] * rows.row(i).dot(&self.normal_solves.column(i))).sum::<f64>();
+        }
+        if let Some(rate_l) = &first_l.row_rate {
+            slack_pair_rate += &rate_l.rows.dot(&first_k.mode_response);
+            // `−½tr(Λ⁻¹(Ȧ_lᵀT̃A + AᵀT̃Ȧ_l)Λ⁻¹Ṁ_k) = −Σ_i τ̃_i (Ṁ_kr_i)ᵀΛ⁻¹ȧ_{l,i}`.
+            trace -= self.site_weighted_column_dot(&first_k.precision_rate_on_normals, &rate_l.solved);
+        }
+        if let Some(rate_k) = &first_k.row_rate {
+            slack_pair_rate += &rate_k.rows.dot(&(&first_l.mode_response + &first_l.mean_offset_rate));
+            // The rate of `tr(T̃Ȧ_kR)` through `Ṙ = −Λ⁻¹Ṁ_lR` along `l`'s precision drift.
+            trace -= self.site_weighted_column_dot(&rate_k.solved, &first_l.precision_rate_on_normals);
+        }
+        if let (Some(rate_k), Some(rate_l)) = (&first_k.row_rate, &first_l.row_rate) {
+            // The rest of the rate of `tr(T̃Ȧ_kR)`, `Ṙ = Λ⁻¹Ȧ_lᵀ − Λ⁻¹(Ȧ_lᵀT̃A + AᵀT̃Ȧ_l)R`:
+            // `Σ_i τ̃_i (B − BT̃Σ_u − C_kT̃C_l)_ii` with `B = Ȧ_kΛ⁻¹Ȧ_lᵀ`.
+            let cross = rate_k.rows.dot(&rate_l.solved);
+            for i in 0..q {
+                let (mut through_sigma, mut through_coupling) = (0.0, 0.0);
+                for m in 0..q {
+                    through_sigma += cross[[i, m]] * self.tau[m] * self.sigma[[m, i]];
+                    through_coupling += rate_k.coupling[[i, m]] * self.tau[m] * rate_l.coupling[[m, i]];
+                }
+                trace += self.tau[i] * (cross[[i, i]] - through_sigma - through_coupling);
+            }
+        }
+        let fixed_sites = trace
+            + first_l.mean_offset_rate.dot(&first_k.gradient_rate)
             + self.mean_offset.dot(&pair.gradient_rate)
             + first_l.mean_offset_rate.dot(&first_k.precision_rate_on_mean)
             + 0.5 * self.mean_offset.dot(&pair.precision_rate_on_mean)
             + (&self.tau * &first_l.posterior_mean_rate).dot(&first_k.slack_rate)
-            - site_residual.dot(&self.rows.dot(&pair.mode_response));
+            - site_residual.dot(&slack_pair_rate);
         let sites = first_k.tau_partial.dot(&first_l.tau_rate) + first_k.nu_partial.dot(&first_l.nu_rate);
         let second = fixed_sites + sites;
         if !second.is_finite() {
@@ -999,10 +1164,13 @@ mod tests {
     }
 
     /// A planted two-coordinate family: `M(θ)`, `g(θ)` and `β̂(θ)` bilinear in `θ`, the mode moving
-    /// along the active face.
+    /// along the active face. Where the rows move, `A(θ)` is bilinear too and the bounds follow it,
+    /// `b(θ) = A(θ)β̂(θ) − s`, so every row keeps its slack `s` at the caller's scale.
     struct Family {
-        rows: Array2<f64>,
+        a: [Array2<f64>; 4],
         bounds: Array1<f64>,
+        slack: Array1<f64>,
+        moving: bool,
         m: [Array2<f64>; 4],
         g: [Array1<f64>; 4],
         v: [Array1<f64>; 4],
@@ -1014,19 +1182,38 @@ mod tests {
         fn new(corner: f64) -> Self {
             let rows = array![[1.0, 0.0, 0.0], [0.6, 0.8, 0.0], [0.0, 0.2, 1.0]];
             let beta = array![0.4, -0.3, 0.2];
-            let bounds = rows.dot(&beta) - array![0.0, 0.0, 0.3];
+            let slack = array![0.0, 0.0, 0.3];
+            let bounds = rows.dot(&beta) - &slack;
             let m0 = array![[corner, 0.0, 0.2], [0.0, 1.0, 0.1], [0.2, 0.1, 2.0]];
             let m1 = array![[0.3, 0.05, 0.0], [0.05, -0.2, 0.1], [0.0, 0.1, 0.4]];
             let m2 = array![[-0.1, 0.0, 0.05], [0.0, 0.3, -0.05], [0.05, -0.05, 0.2]];
             let m12 = array![[0.05, 0.02, 0.0], [0.02, 0.1, 0.0], [0.0, 0.0, -0.1]];
             let g0 = rows.t().dot(&array![2.5, 1.5, 0.0]);
+            let zero = Array2::<f64>::zeros((3, 3));
             Self {
-                rows,
+                a: [rows, zero.clone(), zero.clone(), zero],
                 bounds,
+                slack,
+                moving: false,
                 m: [m0, m1, m2, m12],
                 g: [g0, array![0.2, -0.1, 0.05], array![-0.1, 0.3, 0.0], array![0.05, 0.05, -0.02]],
                 v: [beta, array![0.0, 0.0, 0.3], array![0.0, 0.0, -0.2], array![0.0, 0.0, 0.1]],
             }
+        }
+
+        /// The same family with rows that move in every entry, held at scales `2`, `½` and `3`.
+        fn moving(corner: f64) -> Self {
+            let mut family = Self::new(corner);
+            let scale = array![[2.0], [0.5], [3.0]];
+            family.a = [
+                &family.a[0] * &scale,
+                array![[0.1, 0.2, -0.3], [0.05, 0.0, 0.2], [0.1, -0.2, 0.3]],
+                array![[-0.2, 0.1, 0.1], [0.1, 0.1, -0.1], [0.2, 0.0, -0.1]],
+                array![[0.05, -0.05, 0.1], [0.0, 0.05, 0.05], [-0.1, 0.05, 0.0]],
+            ];
+            family.slack = &family.slack * &scale.column(0);
+            family.moving = true;
+            family
         }
 
         fn at<T: Clone + std::ops::Add<Output = T> + std::ops::Mul<f64, Output = T>>(
@@ -1037,10 +1224,32 @@ mod tests {
                 + parts[3].clone() * (theta[0] * theta[1])
         }
 
+        /// `∂X/∂θ_k` of a bilinear `X` at `θ`.
+        fn rate<T: Clone + std::ops::Add<Output = T> + std::ops::Mul<f64, Output = T>>(
+            parts: &[T; 4],
+            theta: [f64; 2],
+            k: usize,
+        ) -> T {
+            parts[k + 1].clone() + parts[3].clone() * theta[1 - k]
+        }
+
+        /// `∂²X/∂θ_k∂θ_l` of a bilinear `X`.
+        fn pair_rate<T: Clone + std::ops::Mul<f64, Output = T>>(parts: &[T; 4], k: usize, l: usize) -> T {
+            parts[3].clone() * if k == l { 0.0 } else { 1.0 }
+        }
+
+        fn bounds_at(&self, theta: [f64; 2]) -> Array1<f64> {
+            if self.moving {
+                Self::at(&self.a, theta).dot(&Self::at(&self.v, theta)) - &self.slack
+            } else {
+                self.bounds.clone()
+            }
+        }
+
         fn term(&self, theta: [f64; 2]) -> ConeLaplace {
             ConeLaplace::evaluate(
-                &self.rows,
-                &self.bounds,
+                &Self::at(&self.a, theta),
+                &self.bounds_at(theta),
                 &Self::at(&self.v, theta),
                 &Self::at(&self.g, theta),
                 &Self::at(&self.m, theta),
@@ -1048,23 +1257,37 @@ mod tests {
             .unwrap_or_else(|refusal| panic!("θ = {theta:?}: {refusal}"))
         }
 
-        /// `(Ṁ_k, ġ_k, β̂̇_k)` at `θ`.
-        fn rates(&self, theta: [f64; 2], k: usize) -> (Array2<f64>, Array1<f64>, Array1<f64>) {
-            let other = theta[1 - k];
-            (
-                &self.m[k + 1] + &(&self.m[3] * other),
-                &self.g[k + 1] + &(&self.g[3] * other),
-                &self.v[k + 1] + &(&self.v[3] * other),
-            )
+        /// `(Ȧ_k, ḃ_k)` at `θ`, `ḃ_k = Ȧ_kβ̂ + Aβ̂̇_k`, where the rows move.
+        fn row_motion(&self, theta: [f64; 2], k: usize) -> Option<ConeRowMotion> {
+            self.moving.then(|| {
+                let rows = Self::rate(&self.a, theta, k);
+                let bounds = rows.dot(&Self::at(&self.v, theta))
+                    + Self::at(&self.a, theta).dot(&Self::rate(&self.v, theta, k));
+                ConeRowMotion { rows, bounds }
+            })
+        }
+
+        /// `(Ä_kl, b̈_kl)` at `θ = 0`, `b̈ = Äβ̂ + Ȧ_kβ̂̇_l + Ȧ_lβ̂̇_k + Aβ̂̈`, where the rows move.
+        fn row_pair_motion(&self, k: usize, l: usize) -> Option<ConeRowMotion> {
+            let theta = [0.0, 0.0];
+            self.moving.then(|| {
+                let rows = Self::pair_rate(&self.a, k, l);
+                let bounds = rows.dot(&self.v[0])
+                    + Self::rate(&self.a, theta, k).dot(&Self::rate(&self.v, theta, l))
+                    + Self::rate(&self.a, theta, l).dot(&Self::rate(&self.v, theta, k))
+                    + self.a[0].dot(&Self::pair_rate(&self.v, k, l));
+                ConeRowMotion { rows, bounds }
+            })
         }
 
         fn motion(&self, term: &ConeLaplace, theta: [f64; 2], k: usize) -> (ConeLaplaceMotion, Array2<f64>) {
-            let (m_rate, g_rate, v_rate) = self.rates(theta, k);
+            let m_rate = Self::rate(&self.m, theta, k);
             let motion = ConeLaplaceMotion {
-                mode_response: v_rate,
-                gradient_rate: g_rate,
+                mode_response: Self::rate(&self.v, theta, k),
+                gradient_rate: Self::rate(&self.g, theta, k),
                 precision_rate_on_mean: m_rate.dot(term.mean_offset()),
                 precision_rate_on_normals: m_rate.dot(term.normal_solves()),
+                constraint_rate: self.row_motion(theta, k),
             };
             (motion, m_rate)
         }
@@ -1087,15 +1310,12 @@ mod tests {
             let (motion_l, m_l) = self.motion(&term, theta, l);
             let first_k = term.first_order(&motion_k).unwrap_or_else(|refusal| panic!("first order: {refusal}"));
             let first_l = term.first_order(&motion_l).unwrap_or_else(|refusal| panic!("first order: {refusal}"));
-            let (m_pair, g_pair, v_pair) = if k == l {
-                (Array2::zeros((3, 3)), Array1::zeros(3), Array1::zeros(3))
-            } else {
-                (self.m[3].clone(), self.g[3].clone(), self.v[3].clone())
-            };
+            let m_pair = Self::pair_rate(&self.m, k, l);
             let pair = ConeLaplacePairMotion {
-                mode_response: v_pair,
-                gradient_rate: g_pair,
+                mode_response: Self::pair_rate(&self.v, k, l),
+                gradient_rate: Self::pair_rate(&self.g, k, l),
                 precision_rate_on_mean: m_pair.dot(term.mean_offset()),
+                constraint_rate: self.row_pair_motion(k, l),
             };
             let inverse = term.laplace_precision_inverse();
             let solved_l = inverse.dot(&m_l);
@@ -1103,6 +1323,45 @@ mod tests {
             let log_det_hessian = 0.5 * (inverse * &m_pair).sum() - 0.5 * (&solved_l * &solved_k.t()).sum();
             log_det_hessian
                 + term.second_order(&first_k, &first_l, &pair).unwrap_or_else(|refusal| panic!("second order: {refusal}"))
+        }
+
+        /// The first derivative against Richardson differences of `L`.
+        fn check_first_order(&self, label: &str) {
+            for k in 0..2 {
+                let (analytic, _) = self.first_derivative([0.0, 0.0], k);
+                let along = |h: f64| {
+                    let mut theta = [0.0, 0.0];
+                    theta[k] = h;
+                    let term = self.term(theta);
+                    (term.value(), term.value_band())
+                };
+                let (estimate, bar) = richardson(&along, 1e-3);
+                eprintln!("[CL] {label} θ{k}: analytic {analytic:.12e} FD {estimate:.12e} bar {bar:e}");
+                assert!(
+                    (analytic - estimate).abs() <= bar,
+                    "{label}, θ{k}: analytic {analytic} against FD {estimate}, gap {:e} above {bar:e}",
+                    (analytic - estimate).abs()
+                );
+            }
+        }
+
+        /// The second derivative against Richardson differences of the analytic first derivative.
+        fn check_second_order(&self, label: &str) {
+            for (k, l) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let analytic = self.second_derivative(k, l);
+                let along = |h: f64| {
+                    let mut theta = [0.0, 0.0];
+                    theta[l] = h;
+                    self.first_derivative(theta, k)
+                };
+                let (estimate, bar) = richardson(&along, 1e-3);
+                eprintln!("[CL] {label} θ{k}θ{l}: analytic {analytic:.12e} FD {estimate:.12e} bar {bar:e}");
+                assert!(
+                    (analytic - estimate).abs() <= bar,
+                    "{label}, θ{k}θ{l}: analytic {analytic} against FD {estimate}, gap {:e} above {bar:e}",
+                    (analytic - estimate).abs()
+                );
+            }
         }
     }
 
@@ -1112,23 +1371,7 @@ mod tests {
     #[test]
     fn first_order_is_the_derivative_of_the_value_2765() {
         for corner in [0.3, 0.0201, -0.02] {
-            let family = Family::new(corner);
-            for k in 0..2 {
-                let (analytic, _) = family.first_derivative([0.0, 0.0], k);
-                let along = |h: f64| {
-                    let mut theta = [0.0, 0.0];
-                    theta[k] = h;
-                    let term = family.term(theta);
-                    (term.value(), term.value_band())
-                };
-                let (estimate, bar) = richardson(&along, 1e-3);
-                eprintln!("[2765-CL] M11 {corner} θ{k}: analytic {analytic:.12e} FD {estimate:.12e} bar {bar:e}");
-                assert!(
-                    (analytic - estimate).abs() <= bar,
-                    "M11 = {corner}, θ{k}: analytic {analytic} against FD {estimate}, gap {:e} above {bar:e}",
-                    (analytic - estimate).abs()
-                );
-            }
+            Family::new(corner).check_first_order(&format!("M11 {corner}"));
         }
     }
 
@@ -1137,22 +1380,26 @@ mod tests {
     #[test]
     fn second_order_is_the_derivative_of_the_first_order_2765() {
         for corner in [0.3, -0.02] {
-            let family = Family::new(corner);
-            for (k, l) in [(0, 0), (0, 1), (1, 1)] {
-                let analytic = family.second_derivative(k, l);
-                let along = |h: f64| {
-                    let mut theta = [0.0, 0.0];
-                    theta[l] = h;
-                    family.first_derivative(theta, k)
-                };
-                let (estimate, bar) = richardson(&along, 1e-3);
-                eprintln!("[2765-CL] M11 {corner} θ{k}θ{l}: analytic {analytic:.12e} FD {estimate:.12e} bar {bar:e}");
-                assert!(
-                    (analytic - estimate).abs() <= bar,
-                    "M11 = {corner}, θ{k}θ{l}: analytic {analytic} against FD {estimate}, gap {:e} above {bar:e}",
-                    (analytic - estimate).abs()
-                );
-            }
+            Family::new(corner).check_second_order(&format!("M11 {corner}"));
+        }
+    }
+
+    /// Rows and bounds that move with the coordinates, at scales other than one: the first
+    /// derivative carries `tr(T̃ȦR)` and the slack's motion through the rows, on both sides of the
+    /// indefinite crossing.
+    #[test]
+    fn first_order_carries_the_rows_motion_3171() {
+        for corner in [0.3, -0.02] {
+            Family::moving(corner).check_first_order(&format!("moving rows, M11 {corner}"));
+        }
+    }
+
+    /// The second derivative with moving rows: the row motion's share of the log-determinant
+    /// Hessian on `Λ`, the sites' motion under `Σ̇_u = ȦR + RᵀȦᵀ − RᵀΛ̇R`, and the pair's `Ä`, `b̈`.
+    #[test]
+    fn second_order_carries_the_rows_motion_3171() {
+        for corner in [0.3, -0.02] {
+            Family::moving(corner).check_second_order(&format!("moving rows, M11 {corner}"));
         }
     }
 
