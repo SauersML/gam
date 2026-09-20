@@ -903,15 +903,21 @@ enum Verdict {
 }
 
 /// One box's membership verdict over the cell: with the rounding band,
-/// without it, and at the box's centre alone (no `δ` radius, no band), and
-/// whether only comparisons blurred at the arithmetic's resolution keep it
-/// undecided.
+/// without it, and at the box's centre alone (no `δ` radius, no band), whether
+/// only comparisons blurred at the arithmetic's resolution keep it undecided,
+/// and whether some comparison it leaves open is held open by the box's own
+/// `δ`-width more than by the cell.
 #[derive(Clone, Copy, Debug)]
 struct BoxVerdict {
     banded: Option<bool>,
     exact: Option<bool>,
     centre: Option<bool>,
     resolution_limited: bool,
+    /// A resolvable open comparison whose enclosure's `δ`-width part exceeds
+    /// the range `m·p` covers over the cell. Halving the cell shrinks that
+    /// range but leaves the width part, so no `z`-split alone can close the
+    /// comparison; halving the box shrinks the width part.
+    width_dominated: bool,
 }
 
 impl BoxVerdict {
@@ -925,6 +931,15 @@ impl BoxVerdict {
     /// Undecided by a comparison that a narrower cell or box can resolve.
     fn width_limited(&self) -> bool {
         self.exact.is_none() && !self.resolution_limited
+    }
+
+    /// Undecided short of resolution with an open comparison that its
+    /// `ρ`-width dominates: bisecting the box, not only the cell, is what
+    /// narrows it. Near a breakpoint the centre is undecided too, so
+    /// `rho_limited` alone never narrows the tube there, and every `z`-half
+    /// inherits the same wide boxes (gam#3338).
+    fn width_dominated(&self) -> bool {
+        self.width_limited() && self.width_dominated
     }
 }
 
@@ -1014,6 +1029,7 @@ fn box_verdicts(
         let mut dominating = [0usize; 3];
         let mut uncertain = [0usize; 3];
         let mut resolvable = 0usize;
+        let mut width_dominated = false;
         for i in 0..n {
             let mut row = data.rows[i];
             let (mut width_m, mut width_p) = (0.0, 0.0);
@@ -1052,6 +1068,7 @@ fn box_verdicts(
             let blurred = lo.abs().max(hi.abs()) + width_part <= band + (remainder - width_part);
             if !blurred && matches!(compare(lo - remainder, hi + remainder, 0.0), Comparison::Uncertain) {
                 resolvable += 1;
+                width_dominated |= width_part > hi - lo;
             }
         }
         let decide = |slot: usize| {
@@ -1069,6 +1086,7 @@ fn box_verdicts(
             exact,
             centre: decide(2),
             resolution_limited: exact.is_none() && resolvable == 0,
+            width_dominated,
         });
     }
     out
@@ -1161,9 +1179,11 @@ fn ties(basis: &Basis, data: &ChartData, s1: f64, s2: f64, tube: &[RhoBox], rho_
 
 /// The tube, its boxes' verdicts, and which boxes are tied at resolution, once
 /// refining `ρ` can no longer help: every untied box whose own `ρ`-width keeps
-/// it undecided is bisected and the tube pruned again. On a cell too narrow to
-/// bisect, every untied box undecided short of resolution is bisected, and so
-/// are untied boxes that disagree, so a candidate that is not a minimizer is
+/// it undecided — its centre is decided, or an open comparison's enclosure is
+/// wider through the box's `δ`-width than `m·p` varies over the cell — is
+/// bisected and the tube pruned again. On a cell too narrow to bisect, every
+/// untied box undecided short of resolution is bisected, and so are untied
+/// boxes that disagree, so a candidate that is not a minimizer is
 /// pruned away. A tied box is never split: no split can separate its
 /// candidates from the best. Every intermediate tube is valid, so the rule
 /// only decides the work.
@@ -1205,6 +1225,7 @@ fn settle(
                         dominated(basis, data, s1, s2, best, m, m)
                     });
                 !tie && (v.rho_limited()
+                    || v.width_dominated()
                     || (floor && v.width_limited())
                     || (disagree && v.exact.is_some())
                     || dominance_limited)

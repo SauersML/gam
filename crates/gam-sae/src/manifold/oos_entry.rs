@@ -392,7 +392,17 @@ pub fn run_sae_manifold_oos(request: SaeOosRequest) -> Result<SaeOosReport, Stri
     if cold_coords {
         term.seed_coords_by_decoder_projection(target.view())?;
     }
-    if cold_logits && assignment == SaeOosAssignmentKind::Softmax {
+    // TopK routing logits are fixed parameters (`logits_are_fixed`): the support
+    // they select is never revisited by the fixed-decoder solve. A cold TopK
+    // encode must therefore seed them from the data exactly as softmax does; the
+    // all-zero start ties every row and `topk_row` breaks the tie to atoms
+    // `0..k`, which made the held-out support independent of the input.
+    if cold_logits
+        && matches!(
+            assignment,
+            SaeOosAssignmentKind::Softmax | SaeOosAssignmentKind::TopK
+        )
+    {
         term.seed_oos_softmax_logits_from_projection_residuals(target.view(), tau);
     } else if cold_logits
         && matches!(
@@ -1349,6 +1359,81 @@ mod tests {
                 && error.contains("full log_ard block"),
             "{error}"
         );
+    }
+
+    /// A cold TopK encode must route each held-out row to the atom that
+    /// reconstructs it. TopK logits are fixed parameters, so an all-zero start
+    /// used to tie every row and hand the support to atom 0 whatever the input.
+    #[test]
+    fn cold_topk_encode_routes_rows_by_reconstruction_not_atom_index() {
+        let periodic_atom = |decoder: Vec<f64>| {
+            SaeOosAtomSpec::new(
+                SaeAtomGeometryPlan::new(
+                    SaeAtomBasisKind::Periodic,
+                    1,
+                    crate::manifold::SaeBasisResolution::PeriodicHarmonics { order: 1 },
+                    crate::manifold::SaeReferenceMetricPlan::UnitCircle,
+                )
+                .unwrap(),
+                Array2::from_shape_vec((3, 4), decoder).unwrap(),
+            )
+            .unwrap()
+        };
+        // Atom 0 draws its circle in output channels 0-1, atom 1 in channels 2-3.
+        let atoms = vec![
+            periodic_atom(vec![
+                0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+            ]),
+            periodic_atom(vec![
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
+            ]),
+        ];
+        // Rows 0-1 lie on atom 1's circle, rows 2-3 on atom 0's.
+        let target = Array2::from_shape_vec(
+            (4, 4),
+            vec![
+                0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0,
+            ],
+        )
+        .unwrap();
+        let report = run_sae_manifold_oos(SaeOosRequest {
+            target,
+            atoms,
+            assignment: SaeOosAssignmentKind::TopK,
+            alpha: 1.0,
+            tau: 0.5,
+            regularization: SaeOosRegularization {
+                log_lambda_sparse: 0.01_f64.ln(),
+                log_lambda_smooth: vec![0.01_f64.ln(); 2],
+                log_ard: vec![vec![0.01_f64.ln()]; 2],
+            },
+            ridge_ext_coord: 1.0e-6,
+            initial_logits: None,
+            // Cold coordinates too, exactly as the FFI encode path sends them:
+            // the exact decoder projection seeds each atom's chart, so the
+            // on-circle atom reconstructs its row with zero residual and the
+            // other atom leaves residual 2.
+            initial_coords: None,
+            top_k: Some(1),
+            hybrid_linear_images: Vec::new(),
+        })
+        .unwrap();
+        let expected_atom = [1usize, 1, 0, 0];
+        for (row, &atom) in expected_atom.iter().enumerate() {
+            assert_eq!(
+                report.assignments[[row, atom]],
+                1.0,
+                "row {row} must be routed to atom {atom}; assignments={:?}",
+                report.assignments
+            );
+            assert_eq!(
+                report.assignments[[row, 1 - atom]],
+                0.0,
+                "row {row} must not select atom {}; assignments={:?}",
+                1 - atom,
+                report.assignments
+            );
+        }
     }
 
     #[test]

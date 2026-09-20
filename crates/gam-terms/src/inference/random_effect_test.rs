@@ -554,9 +554,9 @@ fn weighted_cross(block: &Array2<f64>, weights: ArrayView1<'_, f64>) -> Array2<f
     block.t().dot(&weighted)
 }
 
-struct PseudoInverse {
-    inverse: Array2<f64>,
-    rank: usize,
+pub(crate) struct PseudoInverse {
+    pub(crate) inverse: Array2<f64>,
+    pub(crate) rank: usize,
 }
 
 /// Moore-Penrose inverse of a symmetric positive semi-definite Gram, taken on
@@ -570,8 +570,9 @@ struct PseudoInverse {
 ///
 /// `D^{-1/2} C⁺ D^{-1/2}` is a generalized inverse of `G` (not its Moore-Penrose
 /// inverse when `G` is singular), which is all a projection and a residual sum
-/// of squares require: `G G⁻ G = G` makes both invariant to the choice.
-fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
+/// of squares require: `G G⁻ G = G` makes both invariant to the choice. The
+/// smooth score test's unpenalized residual reads the same inverse.
+pub(crate) fn equilibrated_pseudo_inverse(gram: &Array2<f64>) -> Option<PseudoInverse> {
     let dim = gram.nrows();
     if dim == 0 || gram.ncols() != dim || gram.iter().any(|v| !v.is_finite()) {
         return None;
