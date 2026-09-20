@@ -162,3 +162,50 @@ fn zz_e4_zoo_circle_contrib_theta_steer_matches_planted_moved() {
          (best R²={r2:.4}; +={r2_plus:.4}, −={r2_minus:.4})"
     );
 }
+
+/// gam#4332 — on a Tier-0 standardized term the steering outputs are in RAW
+/// activation units, lifted by the same `σ⊙·` that [`SaeManifoldTerm::try_fitted`]
+/// applies. Both surfaces are compared bit-for-bit against `σ⊙` their
+/// fitted-frame values on the same fit: installing σ changes no coefficient, so
+/// any other relation is a frame mismatch. The mean is never added — a delta is
+/// a chord and a per-atom contribution does not own the shared `μ`.
+#[test]
+fn steer_outputs_lift_through_the_tier0_scale() {
+    let n = 120usize;
+    let p = 6usize;
+    let contrib = zoo_circle_contrib(n, p);
+    let z = &contrib.m;
+    let (mut term, _disp) = build_term(z.view(), 1, Topo::Circle, AssignmentMode::softmax(1.0));
+    let mut rho = SaeManifoldRho::new(
+        1.0e-3_f64.ln(),
+        1.0e-3_f64.ln(),
+        vec![array![1.0e-3_f64.ln()]; 1],
+    );
+    term.run_joint_fit_arrow_schur(z.view(), &mut rho, None, 40, 1.0, 1.0e-6, 1.0e-6)
+        .expect("K=1 circle joint fit must run e2e");
+    assert!(term.tier0_scale().is_none(), "fixture must start in the fit frame");
+
+    let rows: Vec<usize> = (0..n).collect();
+    let delta = array![0.2];
+    let fitted_int = term.try_fitted().expect("fit-frame reconstruction");
+    let rows_int = term.steer_rows(0, &rows, delta.view()).expect("fit-frame steer_rows");
+    let decode_int = term
+        .steer_decode(0, &rows, delta.view())
+        .expect("fit-frame steer_decode");
+    let max_delta = rows_int.iter().fold(0.0_f64, |m, &x| m.max(x.abs()));
+    assert!(max_delta > 0.0, "a nonzero step must move the decode");
+
+    let scale = Array1::from_shape_fn(p, |j| 0.25 + 1.5 * j as f64);
+    term.set_tier0_scale(scale.clone()).expect("install σ");
+    let fitted_raw = term.try_fitted().expect("raw reconstruction");
+    let rows_raw = term.steer_rows(0, &rows, delta.view()).expect("raw steer_rows");
+    let decode_raw = term.steer_decode(0, &rows, delta.view()).expect("raw steer_decode");
+
+    for i in 0..n {
+        for j in 0..p {
+            assert_eq!(fitted_raw[[i, j]], scale[j] * fitted_int[[i, j]], "try_fitted lift");
+            assert_eq!(rows_raw[[i, j]], scale[j] * rows_int[[i, j]], "steer_rows lift");
+            assert_eq!(decode_raw[[i, j]], scale[j] * decode_int[[i, j]], "steer_decode lift");
+        }
+    }
+}

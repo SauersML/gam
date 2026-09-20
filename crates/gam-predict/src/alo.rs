@@ -2814,35 +2814,19 @@ fn compute_saved_marginal_slope_survival_alo(
         ));
     }
 
-    let normalized_z = payload
-        .latent_z_normalization
-        .ok_or_else(|| {
-            invalid("saved survival marginal-slope ALO is missing latent-z normalization")
-        })?
-        .apply(&input.latent_z, "saved survival marginal-slope ALO")
-        .map_err(|error| invalid(error.to_string()))?;
     // gam#2768: the fitted coefficients are defined on the CALIBRATED latent
     // axis, so an ALO replay that stopped at the normalization would replay a
-    // different model than the one that was fitted. The conditioning span is the
-    // ALO input's own marginal design — the same block the fit regressed z on,
-    // and the same one the predictor slices out of its q-design.
-    let normalized_z = match payload.latent_z_rank_int_calibration.as_ref() {
-        Some(calibration) => Array1::from_iter(
-            normalized_z
-                .iter()
-                .map(|&value| calibration.apply_at_predict(value)),
-        ),
-        None => normalized_z,
-    };
-    let normalized_z = match payload.latent_z_conditional_calibration.as_ref() {
-        Some(calibration) => {
-            let a_block = input.marginal_design.to_dense();
-            calibration
-                .apply(normalized_z.view(), a_block.view())
-                .map_err(invalid)?
-        }
-        None => normalized_z,
-    };
+    // different model than the one that was fitted. The replay reads each row's
+    // score through the saved model's own map (gam#3016), with the conditioning
+    // span the ALO input's own marginal design — the same block the fit regressed
+    // z on, and the same one the predictor slices out of its q-design.
+    let normalized_z = model
+        .fitted_latent_score(
+            &input.latent_z,
+            &input.marginal_design,
+            "saved survival marginal-slope ALO",
+        )
+        .map_err(|error| invalid(error.to_string()))?;
     let time_wiggle_knots = payload
         .baseline_timewiggle_knots
         .as_ref()
