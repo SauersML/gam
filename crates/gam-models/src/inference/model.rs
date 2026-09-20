@@ -158,10 +158,22 @@ use std::path::Path;
 // whose decision is now the null tail against its design rate instead of the sign of
 // `D̂`. All three carry serde defaults, so a v33 or older payload loads with none
 // recorded, its decision as it was made; a v33 binary refuses a v34 payload by version.
-pub const MODEL_PAYLOAD_VERSION: u32 = 34;
+// v35 changes no field. It marks the Duchon kernel chart becoming unconditional (gam#3556):
+// the shipped kernel block is `α·K` with `α = 1/max|K(c_i, c_j)|` at every ψ, where through
+// v34 `α` was applied only when that maximum fell below 1e-10 and was 1 otherwise. A saved
+// Duchon term replays its design from its frozen centers and ψ, so its coefficients describe
+// the chart it was fitted in; an older payload carrying one is refused by name, and every
+// other older payload reads through unchanged.
+pub const MODEL_PAYLOAD_VERSION: u32 = 35;
+
+/// The schema whose Duchon kernel chart rescaled only below the 1e-10 cut-off (gam#3556).
+/// It has every field of [`MODEL_PAYLOAD_VERSION`]; a payload without a Duchon term reads
+/// through, and one with a Duchon term is refused by
+/// [`FittedModelPayload::validate_payload_version`].
+const DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION: u32 = 34;
 
 /// The schema before the closed-form certificate's null law (gam#2926), whose only
-/// difference is those fields' absence.
+/// difference from [`DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION`] is those fields' absence.
 const CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION: u32 = 33;
 
 /// The schema before the full-conformal penalty count (gam#3296), whose only difference
@@ -238,8 +250,9 @@ const COVARIANCE_COPIES_PAYLOAD_VERSION: u32 = 18;
 /// refused or an accepted version read it from here rather than offsetting
 /// [`MODEL_PAYLOAD_VERSION`], because a bump that keeps its predecessor
 /// readable changes which offsets are refused.
-pub const READABLE_PAYLOAD_VERSIONS: [u32; 17] = [
+pub const READABLE_PAYLOAD_VERSIONS: [u32; 18] = [
     MODEL_PAYLOAD_VERSION,
+    DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION,
     CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
     CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
     MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -1331,7 +1344,32 @@ impl FittedModelPayload {
                 Some(&self.family_state.likelihood()),
             ));
         }
+        if self.version <= DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION && self.has_duchon_term() {
+            return Err(FittedModelError::SchemaMismatch {
+                reason: format!(
+                    "saved model payload version {} carries a Duchon smooth fitted under the \
+                     thresholded kernel chart (the kernel block was rescaled by 1/max|K_CC| \
+                     only when that maximum fell below 1e-10). This binary always rescales \
+                     it (gam#3556), so the saved coefficients describe a different design \
+                     and would predict wrongly. Refit.",
+                    self.version
+                ),
+            });
+        }
         Ok(())
+    }
+
+    /// Whether any saved term collection holds a Duchon smooth, bare or under a
+    /// `by`/factor wrapper: the terms whose design is built through the Duchon
+    /// kernel chart.
+    fn has_duchon_term(&self) -> bool {
+        self.resolved_termspec
+            .iter()
+            .chain(self.resolved_termspec_noise.iter())
+            .chain(self.resolved_slopespec.iter())
+            .chain(self.resolved_slopespecs.iter().flatten())
+            .flat_map(|spec| spec.smooth_terms.iter())
+            .any(|term| basis_uses_duchon_kernel_chart(&term.basis))
     }
 }
 
@@ -3146,6 +3184,27 @@ impl FittedFamily {
 /// held-out-group contract — `fs`/`sz` estimate a per-level deviation
 /// function, so an unseen level has no zero-deviation population fallback and
 /// stays strict, exactly like a fixed categorical factor (#2102/#2137).
+/// Whether `basis` is a Duchon smooth, directly or as the inner basis of a
+/// `by`-variable, sum-to-zero factor or by-smooth wrapper.
+fn basis_uses_duchon_kernel_chart(basis: &gam_terms::smooth::SmoothBasisSpec) -> bool {
+    use gam_terms::smooth::SmoothBasisSpec;
+    match basis {
+        SmoothBasisSpec::Duchon { .. } => true,
+        SmoothBasisSpec::ByVariable { inner, .. }
+        | SmoothBasisSpec::FactorSumToZero { inner, .. } => basis_uses_duchon_kernel_chart(inner),
+        SmoothBasisSpec::BySmooth { smooth, .. } => basis_uses_duchon_kernel_chart(smooth),
+        SmoothBasisSpec::BSpline1D { .. }
+        | SmoothBasisSpec::FactorSmooth { .. }
+        | SmoothBasisSpec::ThinPlate { .. }
+        | SmoothBasisSpec::Sphere { .. }
+        | SmoothBasisSpec::ConstantCurvature { .. }
+        | SmoothBasisSpec::Matern { .. }
+        | SmoothBasisSpec::MeasureJet { .. }
+        | SmoothBasisSpec::Pca { .. }
+        | SmoothBasisSpec::TensorBSpline { .. } => false,
+    }
+}
+
 fn re_factor_smooth_group_col(basis: &gam_terms::smooth::SmoothBasisSpec) -> Option<usize> {
     use gam_terms::smooth::{FactorSmoothFlavour, SmoothBasisSpec};
     match basis {
@@ -7943,6 +8002,7 @@ mod tests {
         };
         for version in [
             MODEL_PAYLOAD_VERSION,
+            DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             MOVING_LAW_SCREEN_ABSENT_PAYLOAD_VERSION,
@@ -7965,7 +8025,11 @@ mod tests {
                 .validate_payload_version()
                 .unwrap_or_else(|error| panic!("payload version {version} is readable: {error}"));
         }
-        assert_eq!(CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION, MODEL_PAYLOAD_VERSION - 1);
+        assert_eq!(
+            CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION,
+            DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION - 1
+        );
         assert_eq!(
             CONFORMAL_PENALTY_COUNT_ABSENT_PAYLOAD_VERSION,
             CERTIFICATE_NULL_LAW_ABSENT_PAYLOAD_VERSION - 1
@@ -8018,6 +8082,85 @@ mod tests {
         assert_eq!(RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION, NEWTON_POLISH_ABSENT_PAYLOAD_VERSION - 1);
         assert_eq!(EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION, RHO_CERTIFICATE_TOKENS_PAYLOAD_VERSION - 1);
         assert_eq!(COVARIANCE_COPIES_PAYLOAD_VERSION, EDF_RANK_BOUND_ABSENT_PAYLOAD_VERSION - 1);
+    }
+
+    /// gam#3556: a payload written while the Duchon kernel chart still rescaled only below
+    /// the 1e-10 cut-off is refused when it carries a Duchon smooth, bare or under a `by`
+    /// wrapper, because its coefficients describe the unrescaled design; the same payload
+    /// without one, or written at the current version, reads.
+    #[test]
+    fn a_duchon_payload_from_the_thresholded_chart_is_refused_3556() {
+        use gam_terms::basis::{
+            CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+            OneDimensionalBoundary, SpatialIdentifiability,
+        };
+        use gam_terms::smooth::{
+            ByVarKind, ShapeConstraint, SmoothBasisSpec, SmoothTermSpec, TermCollectionSpec,
+        };
+        let duchon = SmoothBasisSpec::Duchon {
+            feature_cols: vec![0, 1],
+            spec: DuchonBasisSpec {
+                radial_reparam: None,
+                periodic: None,
+                center_strategy: CenterStrategy::FarthestPoint { num_centers: 6 },
+                length_scale: Some(1.0),
+                power: 5.0,
+                nullspace_order: DuchonNullspaceOrder::Linear,
+                identifiability: SpatialIdentifiability::default(),
+                aniso_log_scales: None,
+                operator_penalties: DuchonOperatorPenaltySpec::default(),
+                boundary: OneDimensionalBoundary::Open,
+            },
+            input_scale: None,
+        };
+        let spec_with = |basis: SmoothBasisSpec| TermCollectionSpec {
+            linear_terms: vec![],
+            random_effect_terms: vec![],
+            smooth_terms: vec![SmoothTermSpec {
+                frozen_parametric_residualization: None,
+                name: "s".to_string(),
+                basis,
+                shape: ShapeConstraint::None.into(),
+                joint_null_rotation: None,
+            }],
+            level: Default::default(),
+        };
+        let payload_at = |version: u32, spec: Option<TermCollectionSpec>| {
+            let mut payload = marginal_slope_payload(
+                version,
+                saved_fit(vec![FittedBlock {
+                    beta: array![0.1],
+                    role: BlockRole::Mean,
+                    edf: 1.0,
+                    lambdas: Array1::zeros(0),
+                }]),
+            );
+            payload.resolved_termspec = spec;
+            FittedModel::from_payload(payload)
+        };
+        let wrapped = SmoothBasisSpec::BySmooth {
+            smooth: Box::new(duchon.clone()),
+            by_kind: ByVarKind::Numeric { feature_col: 2 },
+        };
+        for basis in [duchon.clone(), wrapped] {
+            let refused = payload_at(DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION, Some(spec_with(basis.clone())))
+                .payload()
+                .validate_payload_version();
+            match refused {
+                Err(FittedModelError::SchemaMismatch { reason }) => {
+                    assert!(reason.contains("gam#3556"), "refusal names the chart change: {reason}")
+                }
+                other => panic!("a thresholded-chart Duchon payload must be refused, got {:?}", other.err()),
+            }
+            payload_at(MODEL_PAYLOAD_VERSION, Some(spec_with(basis)))
+                .payload()
+                .validate_payload_version()
+                .expect("a current Duchon payload reads");
+        }
+        payload_at(DUCHON_THRESHOLD_CHART_PAYLOAD_VERSION, Some(empty_termspec()))
+            .payload()
+            .validate_payload_version()
+            .expect("a thresholded-chart payload without a Duchon term reads");
     }
 
     /// gam#3002: a certified point saved before v28 reads with its `rho` as `theta` and with
