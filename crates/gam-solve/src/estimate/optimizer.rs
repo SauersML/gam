@@ -3658,11 +3658,11 @@ where
         // bit-for-bit.
         //
         // The returned fit does not need it: the covariance above is complete
-        // without it, and the diagnostic costs dozens of inner solves plus a
+        // without it, and the diagnostic costs 100 to 2155 inner solves plus a
         // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
         // inference (`skip_rho_posterior_inference = false`), together with the
-        // escalation tiers it grades for (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond). Every other fit keeps the typed
+        // escalation tier it grades for (quadrature or NUTS over ρ, whichever
+        // needs fewer criterion evaluations). Every other fit keeps the typed
         // `NotComputed(InferenceNotRequested)` set above.
         if !opts.skip_rho_posterior_inference {
             (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
@@ -3672,7 +3672,6 @@ where
                 // the criterion's exact affine limit from that face, so no
                 // posterior mass is dropped when the box edge moves.
                 &rho_continuation,
-                None,
             );
         }
 
