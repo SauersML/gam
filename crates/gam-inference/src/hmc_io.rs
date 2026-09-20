@@ -4554,8 +4554,9 @@ const MIN_NUTS_SAMPLES: usize = 4;
 pub const NUTS_CHAINS: usize = 2;
 
 /// Validate the draw count of a NUTS configuration up front, so that an
-/// out-of-range value surfaces as a typed `HmcError::InvalidConfig` *before* the sampling engine is constructed
-/// rather than as a panic caught at the FFI boundary.
+/// out-of-range value surfaces as a typed `HmcError::InvalidConfig` *before*
+/// the sampling engine is constructed rather than as a panic caught at the FFI
+/// boundary.
 fn validate_nuts_draws(config: &NutsConfig) -> Result<(), HmcError> {
     if config.n_samples < MIN_NUTS_SAMPLES {
         return Err(HmcError::InvalidConfig {
@@ -5405,7 +5406,8 @@ pub(crate) fn run_nuts_sampling(
     let chol = target.chol().clone();
     let mode_arr = target.mode().clone();
 
-    let initial_positions = jittered_initial_positions(config.seed, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
+    let initial_positions =
+        jittered_initial_positions(config.seed, dim, 0.1, 0x0F65_83B2_BC71_4D9E);
     let mass_cfg = robust_mass_matrix_config(dim);
     let (result, run_stats) = run_whitened_nuts_result(
         target,
@@ -5714,18 +5716,13 @@ where
         warmup_run.map_err(|e| format!("rho-posterior NUTS sampling failed: {e}"))?;
     // Continue each chain from its last collected draw at the adapted step size:
     // `run` returns that draw as its first row, then one row per transition.
-    let continuation = sampler.run(
-        warmup.transitions.saturating_sub(MIN_NUTS_SAMPLES) + 1,
-        0,
-    );
+    let continuation = sampler.run(warmup.transitions.saturating_sub(MIN_NUTS_SAMPLES) + 1, 0);
     if let Some(failure) = take_failure() {
         return Err(format!("rho-posterior NUTS: {failure}"));
     }
-    let samples_array = ndarray::concatenate(
-        Axis(1),
-        &[head.view(), continuation.slice(s![.., 1.., ..])],
-    )
-    .map_err(|e| format!("rho-posterior NUTS: joining the collected draws failed: {e}"))?;
+    let samples_array =
+        ndarray::concatenate(Axis(1), &[head.view(), continuation.slice(s![.., 1.., ..])])
+            .map_err(|e| format!("rho-posterior NUTS: joining the collected draws failed: {e}"))?;
     let samples = unwhiten_samples(&samples_array, &mode, &chol, dim, 0);
     let result =
         summarize_unwhitened_nuts_samples(samples, &samples_array, mode, warmup.transitions);
@@ -7589,7 +7586,8 @@ mod survival_hmc {
         let mode_arr = target.mode().clone();
         let dim = mode_arr.len();
 
-        let initial_positions = jittered_initial_positions(config.seed, dim, 0.1, 0xEC2D_7A9B_4051_F638);
+        let initial_positions =
+            jittered_initial_positions(config.seed, dim, 0.1, 0xEC2D_7A9B_4051_F638);
 
         let mass_cfg = robust_survival_mass_matrix_config(dim);
         let (result, run_stats) = run_whitened_nuts_result(

@@ -160,7 +160,6 @@ fn nuts_recovers_gaussian_quadratic_moments_with_fixed_seed() {
     }
 }
 
-
 /// (c) #3187: the seam routes by cost, not by a dimension cap. The `3^4 = 81`
 /// node grid is cheaper than any converged NUTS run, so `K = 4` runs quadrature;
 /// the `3^5 = 243` node grid is not, so `K = 5` runs NUTS; and `K = 17`, past the
@@ -188,7 +187,12 @@ fn escalation_routes_to_the_tier_with_fewer_criterion_evaluations() {
             }
             RhoPosteriorEscalation::Nuts(samples) => {
                 assert!(!quadrature, "K = {k} must not run NUTS");
-                assert!(samples.converged, "K = {k}: rhat = {}, ess = {}", samples.rhat, samples.ess);
+                assert!(
+                    samples.converged,
+                    "K = {k}: rhat = {}, ess = {}",
+                    samples.rhat,
+                    samples.ess
+                );
                 assert_eq!(samples.mean.len(), k);
             }
             RhoPosteriorEscalation::Unavailable { reason, .. } => {

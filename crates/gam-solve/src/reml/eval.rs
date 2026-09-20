@@ -244,8 +244,8 @@ impl<'a> RemlState<'a> {
     /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, `M` the 2155 draws at
     /// which PSIS is reliable for a tail shape at the escalation cutoff; the
     /// returned fit does not need it, so the caller runs it only when
-    /// ρ-posterior inference was requested. When the diagnostic grades the plug-in [`Escalate`], the
-    /// tiers (#938) run HERE, against the same live objective — Tier 1
+    /// ρ-posterior inference was requested. When the diagnostic grades the
+    /// plug-in [`Escalate`], the tiers (#938) run HERE, against the same live objective — Tier 1
     /// quadrature or Tier 2 NUTS with the exact LAML `ρ`-gradient
     /// (`Self::compute_gradient`), whichever needs fewer criterion evaluations,
     /// with an honest `Unavailable` when the chosen tier fails.

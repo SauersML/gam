@@ -46,8 +46,7 @@
 //! `(n·k + 10·0.5)/(n + 10)`, NOT around `k`:
 //! at `M = 100` the tail sample is `10` and the standard error at the `0.7`
 //! boundary is `≈ 0.27`; at the diagnostic's `M = 2155` it is `47` and `≈ 0.20`.
-//! Reaching a
-//! standard error of `0.05` takes a tail of `≈ 10³`, i.e. `M ≈ 10⁶`. A single
+//! Reaching a standard error of `0.05` takes a tail of `≈ 10³`, i.e. `M ≈ 10⁶`. A single
 //! `k̂` near a cutoff is therefore not evidence about which side of the cutoff
 //! the truth lies on: separating a true shape from the `0.7` boundary needs
 //! `⌈√M⌉` large enough that several standard errors fit in the gap. Anything
@@ -777,9 +776,9 @@ mod tests {
         let b = rho_posterior_adequacy(&rho_hat, &h, crit)
             .expect("b formed")
             .expect("b present");
-        // Kish's (Σw)²/Σw² of self-normalized weights lies in [1, M]: Σw = 1 and
-        // Cauchy–Schwarz give 1/M ≤ Σw² ≤ 1. Both edges carry the M-term
-        // summations' relative rounding M·ε (the normalizing total and Σw²).
+        // Kish's (Σw)²/Σw² lies in [1, M]: Cauchy–Schwarz gives (Σw)² ≤ M Σw²,
+        // and (Σw)² ≥ Σw² for non-negative weights. Both edges carry the
+        // M-term summations' relative rounding M·ε (Σw and Σw²).
         let ess = a.effective_sample_size;
         let m = a.n_samples as f64;
         let rounding = 1.0 + m * f64::EPSILON;

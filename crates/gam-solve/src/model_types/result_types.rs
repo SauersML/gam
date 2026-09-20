@@ -2551,8 +2551,8 @@ pub struct FitArtifacts {
     pub rho_posterior: gam_problem::rho_posterior::RhoPosteriorOutcome,
     /// Escalation outcome (#938) when the Tier-0 grade read `Escalate`:
     /// the Tier-1 quadrature mixture or the Tier-2 NUTS draws (whichever tier
-    /// needs fewer criterion evaluations), or an honest `Unavailable` report. `None` whenever the
-    /// grade did not escalate (or was not formed). Computed at the same
+    /// needs fewer criterion evaluations), or an honest `Unavailable` report.
+    /// `None` whenever the grade did not escalate (or was not formed). Computed at the same
     /// live-objective seam as the grade; re-derivable, not serialized.
     #[serde(default, skip_serializing, skip_deserializing)]
     pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
