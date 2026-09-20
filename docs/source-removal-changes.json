@@ -2665,5 +2665,14 @@
     ],
     "reason": "#2902: EFS_MAX_STEP boxed every EFS log-lambda step to +-5, a hand bound SPEC forbids; the step is now the multiplicative model's root (or its Newton step in the over-correction regime), clipped only to the outer domain and sized by the bridge's cost line search. PSI_INITIAL_ALPHA was a 1.0 multiplier with no effect.",
     "evidence": "rho_optimizer::efs_step_domain_2902_tests::efs_takes_the_whole_multiplicative_step_toward_a_far_root_2902: on the orthogonal Gaussian REML fixture the boxed walk evaluated EFS at 0,-5,-10,-15 before the root (7 evaluations); the whole step evaluates 0,-14.88 then the root (5)."
+  },
+  {
+    "base": "74c2b1d788902aa74c5a7306ae4014e37749e4e3",
+    "items": [
+      "crates/gam-models/src/bms/deviation_runtime.rs:fn:span_index_for",
+      "crates/gam-runtime/src/span.rs:fn:internal_breakpoints_use_right_hand_span"
+    ],
+    "reason": "#4376: span_index_for_breakpoints returned the right-hand span at an interior breakpoint, and both of its callers (DeviationRuntime::left_biased_span_index_for and the saved anchored deviation runtime's left_biased_span_index_for) immediately stepped back to the left-hand span with duplicated code. The helper now returns the left-hand span, so DeviationRuntime::span_index_for (whose only caller was that adjustment) has no role, and the helper test pinning the right-hand convention is replaced by internal_breakpoints_use_left_hand_span.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base 74c2b1d788902aa74c5a7306ae4014e37749e4e3 and head the change's commit list exactly these removals. Read-proof at the head: git grep finds no call of .span_index_for( in crates/ tests/ examples/ python/; before the change its only call was inside left_biased_span_index_for in crates/gam-models/src/bms/deviation_runtime.rs."
   }
 ]

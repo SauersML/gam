@@ -2784,19 +2784,15 @@ impl SavedCompiledFlexBlock {
         Ok(self.breakpoints.clone())
     }
 
+    /// The span holding `value`; an interior breakpoint belongs to the span on
+    /// its left, as in `DeviationRuntime` (`span_index_for_breakpoints`).
     fn left_biased_span_index_for(&self, value: f64) -> Result<usize, FittedModelError> {
-        let mut span_idx = span_index_for_breakpoints(
+        span_index_for_breakpoints(
             &self.breakpoints,
             value,
             "saved anchored deviation span lookup",
         )
-        .map_err(|reason| FittedModelError::PayloadCorrupt { reason })?;
-        // LEFT-bias at interior breakpoints mirrors DeviationRuntime. The
-        // saved cubic basis is C2, but d3 remains span-local.
-        if span_idx > 0 && value == self.breakpoints[span_idx] {
-            span_idx -= 1;
-        }
-        Ok(span_idx)
+        .map_err(|reason| FittedModelError::PayloadCorrupt { reason })
     }
 
     fn local_cubic_on_span_validated(

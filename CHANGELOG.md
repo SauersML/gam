@@ -1,5 +1,11 @@
 ## Unreleased
 
+- **`gam_runtime::span::span_index_for_breakpoints` assigns an interior breakpoint to the span on its
+  left** (#4376). Both anchored deviation runtimes already wanted that span and each corrected the
+  helper's right-hand answer with its own copy of the same adjustment. The adjustments are gone and
+  the helper states the one convention. `DeviationRuntime::span_index_for`, which had no caller outside
+  that adjustment, is removed.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is
