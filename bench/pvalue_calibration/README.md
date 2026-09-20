@@ -109,7 +109,7 @@ These are the surfaces a rep reads:
 |---------|--------|
 | `gamfit.wald` | `summary().smooth_terms[...]["p_value"]`: the variance-component score test for a smooth or a random effect (the key predates the score tests and names the `summary()` table) |
 | `gamfit.lr` | `smooth_significance(data)[...]["p_value_corrected"]` |
-| `gamfit.coef` | `summary().parametric_terms[...]["p_value"]`: the Wald test of the linear coefficient, `t` or `z` as `summary().parametric_statistic` reports |
+| `gamfit.coef` | `summary().parametric_terms[...]["p_value"]`: the reported linear-term test. A ridged slope (the default) uses its variance-component score test; an unpenalized coefficient uses its Wald test. |
 | `pygam.wald` | pyGAM's `statistics_["p_values"]` at its default fixed lambda |
 | `pygam_gs.wald` | the same, after `gridsearch` |
 

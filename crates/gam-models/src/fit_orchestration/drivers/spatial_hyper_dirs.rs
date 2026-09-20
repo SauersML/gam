@@ -557,35 +557,56 @@ pub(crate) fn try_build_latent_coord_hyper_dirs(
     Ok(Some(hyper_dirs))
 }
 
+/// What one direct latent hyper slot parameterizes (#4266). The slot order is
+/// the order [`latent_coord_initial_direct_hypers`] seeds them in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LatentDirectHyperSlot {
+    /// A log-precision: the REML-selected `ln μ` of an `AuxPrior` /
+    /// `IsometryToReference` anchor, or one per-axis ARD `ln α_j`.
+    LogPrecision,
+    /// A behavioral-head regression coefficient (an intercept or a loading on
+    /// one latent axis). It is a coefficient, not a log-strength.
+    HeadCoefficient,
+}
+
+fn latent_coord_direct_hyper_slots(
+    id_mode: &gam_terms::latent::LatentIdMode,
+    latent_dim: usize,
+) -> Vec<LatentDirectHyperSlot> {
+    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
+    let anchor_log_mu = |strength: &AuxPriorStrength| match strength {
+        AuxPriorStrength::Auto => 1,
+        AuxPriorStrength::Fixed(_) => 0,
+    };
+    let (log_mu, head_coeffs, ard) = match id_mode {
+        LatentIdMode::AuxPrior { strength, .. } => (anchor_log_mu(strength), 0, 0),
+        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
+            (anchor_log_mu(strength), 0, latent_dim)
+        }
+        LatentIdMode::DimSelection { .. } => (0, 0, latent_dim),
+        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
+        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
+        LatentIdMode::IsometryToReference { strength, .. } => (anchor_log_mu(strength), 0, 0),
+        // The behavioral head appends one (1 + d) coefficient block per
+        // η-channel, plus the composed per-axis ARD log-precisions.
+        LatentIdMode::AuxOutcome { head, .. } => (0, head.n_coeffs(latent_dim), latent_dim),
+        LatentIdMode::None => (0, 0, 0),
+    };
+    let mut slots = Vec::with_capacity(log_mu + head_coeffs + ard);
+    slots.extend(std::iter::repeat_n(LatentDirectHyperSlot::LogPrecision, log_mu));
+    slots.extend(std::iter::repeat_n(
+        LatentDirectHyperSlot::HeadCoefficient,
+        head_coeffs,
+    ));
+    slots.extend(std::iter::repeat_n(LatentDirectHyperSlot::LogPrecision, ard));
+    slots
+}
+
 fn latent_coord_direct_hyper_count(
     id_mode: &gam_terms::latent::LatentIdMode,
     latent_dim: usize,
 ) -> usize {
-    use gam_terms::latent::{AuxPriorStrength, LatentIdMode};
-    match id_mode {
-        LatentIdMode::AuxPrior { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        LatentIdMode::AuxPriorDimSelection { strength, .. } => {
-            latent_dim
-                + match strength {
-                    AuxPriorStrength::Auto => 1,
-                    AuxPriorStrength::Fixed(_) => 0,
-                }
-        }
-        LatentIdMode::DimSelection { .. } => latent_dim,
-        // A fixed-reference anchor carries at most the REML-selectable log-`μ`
-        // (one direct hyper when `Auto`, none when `Fixed`), like `AuxPrior`.
-        LatentIdMode::IsometryToReference { strength, .. } => match strength {
-            AuxPriorStrength::Auto => 1,
-            AuxPriorStrength::Fixed(_) => 0,
-        },
-        // The behavioral head appends one (1 + d) coefficient block per
-        // η-channel, plus the composed per-axis ARD log-precisions.
-        LatentIdMode::AuxOutcome { head, .. } => head.n_coeffs(latent_dim) + latent_dim,
-        LatentIdMode::None => 0,
-    }
+    latent_coord_direct_hyper_slots(id_mode, latent_dim).len()
 }
 
 fn latent_coord_initial_direct_hypers(
@@ -971,84 +992,6 @@ fn analytic_penalty_objective_contribution(
     Ok(LatentIdObjectiveContribution { cost, gradient })
 }
 
-fn add_analytic_penalty_hessian_to_eval(
-    theta: &Array1<f64>,
-    rho_dim: usize,
-    latent: &gam_terms::latent::LatentCoordValues,
-    registry: &gam_terms::AnalyticPenaltyRegistry,
-    eval: &mut (f64, Array1<f64>, gam_problem::HessianValue),
-) -> Result<(), EstimationError> {
-    let flat_len = latent.len();
-    let t_start = rho_dim;
-    let t_end = t_start + flat_len;
-    let rho_start = t_end;
-    let rho_end = rho_start + registry.total_rho_count();
-    if theta.len() < rho_end {
-        crate::bail_invalid_estim!(
-            "latent-coordinate theta too short for analytic penalty Hessian: got {}, need at least {}",
-            theta.len(),
-            rho_end
-        );
-    }
-    let gam_problem::HessianValue::Dense(hessian) = &mut eval.2 else {
-        if eval.2.is_analytic() {
-            eval.2 = gam_problem::HessianValue::Unavailable;
-        }
-        return Ok(());
-    };
-    if hessian.dim() != (theta.len(), theta.len()) {
-        crate::bail_invalid_estim!(
-            "analytic penalty Hessian target shape mismatch: got {}x{}, expected {}x{}",
-            hessian.nrows(),
-            hessian.ncols(),
-            theta.len(),
-            theta.len()
-        );
-    }
-    let target_t = theta.slice(s![t_start..t_end]);
-    let rho = theta.slice(s![rho_start..rho_end]);
-    registry
-        .validate_rho(rho)
-        .map_err(EstimationError::InvalidInput)?;
-    for (penalty, (rho_slice, tier, _name)) in registry.penalties.iter().zip(registry.rho_layout())
-    {
-        let rho_local = rho.slice(s![rho_slice]);
-        if !matches!(tier, gam_terms::PenaltyTier::Psi) {
-            continue;
-        }
-        if let Some(diag) = penalty.hessian_diag(target_t.view(), rho_local) {
-            if diag.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian diagonal length mismatch: got {}, expected {}",
-                    diag.len(),
-                    flat_len
-                );
-            }
-            for i in 0..flat_len {
-                hessian[[t_start + i, t_start + i]] += diag[i];
-            }
-            continue;
-        }
-        let mut probe = Array1::<f64>::zeros(flat_len);
-        for col in 0..flat_len {
-            probe[col] = 1.0;
-            let hv = penalty.hvp(target_t.view(), rho_local, probe.view());
-            if hv.len() != flat_len {
-                crate::bail_invalid_estim!(
-                    "analytic penalty Hessian-vector length mismatch: got {}, expected {}",
-                    hv.len(),
-                    flat_len
-                );
-            }
-            for row in 0..flat_len {
-                hessian[[t_start + row, t_start + col]] += hv[row];
-            }
-            probe[col] = 0.0;
-        }
-    }
-    Ok(())
-}
-
 fn add_analytic_penalty_objective_to_eval(
     theta: &Array1<f64>,
     rho_dim: usize,
@@ -1066,7 +1009,14 @@ fn add_analytic_penalty_objective_to_eval(
         );
     }
     eval.1 += &contribution.gradient;
-    add_analytic_penalty_hessian_to_eval(theta, rho_dim, latent, registry, eval)?;
+    // The penalty's second derivative is not assembled here: `hessian_diag` is
+    // the exact diagonal even for penalties whose Hessian is dense, and the
+    // t-rho / rho-rho blocks of learnable penalty rho have no trait API. The
+    // latent joint problem is declared gradient-only, so an analytic Hessian
+    // from the REML core no longer describes this objective.
+    if eval.2.is_analytic() {
+        eval.2 = gam_problem::HessianValue::Unavailable;
+    }
     Ok(())
 }
 

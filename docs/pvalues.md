@@ -18,12 +18,16 @@ miscalibrated.
 |---|---|---|---|
 | `model.summary().smooth_terms[i]["p_value"]`, penalized smooth | the smooth is identically zero | variance-component score statistic `chi_sq` (Lin 1997; Zhang & Lin 2003) | its exact null law `Σ w_i χ²₁` when the scale is known (binomial, Poisson, negative binomial); `P(Σ w_i χ²₁ − (q/ρ)·χ²_ρ > 0)` when the fit estimates it (Gaussian, Gamma) |
 | `model.summary().smooth_terms[i]["p_value"]`, random effect `group(g)` | the variance component is zero | variance-component score statistic `‖X̃_Rᵀv‖²` (Lin 1997) | its exact spectral law `Σ μ_j χ²₁` (Wood 2013), against the residual `χ²_ν` when the scale is estimated |
-| `model.summary().parametric_terms[i]["p_value"]` | the coefficient is zero | Wald `estimate / std_error` | Student-t on the residual degrees of freedom when the scale is estimated, N(0, 1) when it is known; `summary().parametric_statistic` says which |
+| `model.summary().parametric_terms[i]["p_value"]`, unpenalized coefficient | the coefficient is zero | Wald ratio `estimate / std_error` | `t` on the residual degrees of freedom when the fit estimates the scale, `N(0, 1)` when it is known |
+| `model.summary().parametric_terms[i]["p_value"]`, ridged linear term (the default) | the slope is zero | variance-component score statistic of the slope's ridge, reported as its signed square root | `χ²₁` (known scale) or `F_{1, ν}` on the unpenalized residual (estimated scale); for a Gaussian fit it is exactly the partial `t` of the unpenalized slope |
 | `model.smooth_significance(data)[i]["p_value_corrected"]` | the smooth is identically zero | likelihood ratio `statistic_lr` from a constrained refit without the smooth | the statistic's exact null law `Σ w_j χ²₁`, Bartlett-corrected |
 | `model.summary().basis_checks[i]["p_value"]` | the basis of the smooth is rich enough | penalized score (Rao) lack-of-fit statistic | `χ²_{enrichment_rank}` |
 
-A factor (`g`) has no single-degree-of-freedom row and no `smooth_terms` or
-`smooth_significance` row, so it has no p-value on any surface.
+A bare categorical factor (`g`) is lowered to a penalized random-effect
+block. Like `group(g)`, its `smooth_terms` row carries the recorded
+variance-component score test, or a typed reason why that test is unavailable.
+It has no single-coefficient `parametric_terms` row and no
+`smooth_significance` row.
 
 ### The score tests in `summary()`
 
@@ -60,12 +64,23 @@ referred to the unpenalized residual, `P(Σ μ_j χ²₁ − t·χ²_ν > 0)`.
 A row that cannot be scored has no `p_value` and carries a
 `p_value_unavailable` reason instead.
 
-### The Wald test in `parametric_terms`
+### Linear coefficient tests in `parametric_terms`
 
-The intercept and each linear coefficient carry `estimate`, `std_error`,
-`statistic = estimate / std_error` and `p_value`. The reference is Student-t
-on the residual degrees of freedom when the scale is estimated and N(0, 1)
-when it is known.
+An unpenalized coefficient carries its Wald statistic `estimate / std_error`
+and its p-value. The reference is Student-t on the residual degrees of freedom
+when the scale is estimated and N(0, 1) when it is known.
+
+A linear term is ridged by default, and REML picks the ridge from the same
+data, so its estimate is shrunk toward zero and shrinks furthest exactly when
+the slope is null. The Wald ratio of that shrunk estimate is far below its
+nominal law under the null: its p-values pile up near one. The ridged row
+therefore reports the score test of the ridge's variance component, which
+never reads the shrunk estimate (gam#3573). A ridged row on a fit that records
+no such test (the location-scale, GAMLSS and expectile families) has no
+statistic and no p-value, rather than the invalid Wald ratio.
+
+A ridged row reports the signed square root of its score statistic, with
+the sign of the fitted slope, and the score test's p-value.
 
 ### The likelihood-ratio test in `smooth_significance(data)`
 

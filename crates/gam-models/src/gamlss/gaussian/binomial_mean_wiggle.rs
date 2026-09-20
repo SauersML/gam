@@ -781,8 +781,15 @@ impl CustomFamily for BinomialMeanWiggleFamily {
                 jet.d3,
                 &self.link_kind,
             );
-            let (fisher, _, _) =
-                binomial_expected_q_information_derivatives(wi, jet.mu, jet.d1, jet.d2, jet.d3);
+            let (fisher, _, _) = binomial_expected_q_information_derivatives(
+                wi,
+                q,
+                &self.link_kind,
+                jet.mu,
+                jet.d1,
+                jet.d2,
+                jet.d3,
+            )?;
             for (quantity, value, nonnegative) in [
                 ("binomial mean-wiggle row log likelihood", row_ll, false),
                 ("binomial mean-wiggle q score", m1, false),

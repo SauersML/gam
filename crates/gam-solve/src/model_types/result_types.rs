@@ -694,6 +694,13 @@ pub enum FacePositivityRoute {
     /// `f > 0` on the whole simplex, each cell's bound clearing its own
     /// rounding band.
     SimplexBound,
+    /// The ZERO-smoothing face (`λ_j → 0`, `j ∈ L`) of penalties whose ranges
+    /// the surviving penalties already cover. There the criterion is jointly
+    /// analytic in `λ_L` — no logdet rank changes as they vanish — so
+    /// `V = V(0) + Σ_{j∈L} c′_j λ_j + O(|λ|²)` on the closed orthant, exactly
+    /// linear at first order, and the face is a strict minimizer iff every
+    /// `c′_j` clears its rounding band `τ_j` (the KKT test at `λ = 0`).
+    CoveredZeroSmoothing,
 }
 
 /// What established a rail coordinate's tail law, and the standard it cleared
@@ -729,7 +736,9 @@ pub enum RailTailEvidence {
         /// [`FacePositivityRoute::PositiveForm`], the binding coordinate's
         /// analytic pencil constant `c_j` on
         /// [`FacePositivityRoute::IndependentRanges`], the binding simplex
-        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`].
+        /// cell's lower bound on `f` on [`FacePositivityRoute::SimplexBound`],
+        /// the binding coordinate's `λ`-slope `c′_j` on
+        /// [`FacePositivityRoute::CoveredZeroSmoothing`].
         statistic: f64,
         /// The rounding band that statistic had to clear, from the measured
         /// error of forming `C` in floating point (never a tuned margin).
@@ -2742,13 +2751,14 @@ pub struct FitArtifacts {
     /// [`CoefficientModeSelection::NotRecorded`], which claims nothing.
     #[serde(default)]
     pub coefficient_mode_selection: CoefficientModeSelection,
-    /// The variance-component score test of every random-effect term, computed
-    /// once on the training fit's own IRLS row state
-    /// (`gam_terms::inference::random_effect_test`). The summary's random-effect
-    /// rows read their p-value (or its typed absence) from here, so the CLI,
-    /// Rust and persisted-model surfaces report the same number. Empty on a
-    /// model with no random-effect term and on a payload written before the
-    /// test existed; a summary treats a term missing from it as not recorded.
+    /// The variance-component score test of every random-effect term and every
+    /// `LinearTermRidge`-penalized linear term, computed once on the training
+    /// fit's own IRLS row state (`gam_terms::inference::random_effect_test`).
+    /// The summary's random-effect rows and ridged parametric rows read their
+    /// p-value (or its typed absence) from here, so the CLI, Rust and
+    /// persisted-model surfaces report the same number. Empty on a model with
+    /// no such term and on a payload written before the test existed; a
+    /// summary treats a term missing from it as not recorded.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub random_effect_tests:
         Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord>,

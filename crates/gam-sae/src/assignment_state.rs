@@ -39,7 +39,7 @@
 
 use gam_problem::LatentRetractionRegistry;
 use gam_terms::latent::LatentManifold;
-use ndarray::Array1;
+use ndarray::{Array1, Array2, ArrayView1};
 
 use crate::assignment::AssignmentMode;
 
@@ -266,6 +266,43 @@ impl SaeAssignmentState {
         self.atom_coord_meta[atom].latent_dim
     }
 
+    /// The linearized feasible update space of one `atom` coordinate block at
+    /// `point` for the objective gradient `gradient`, as the symmetric projector
+    /// matrix `P` of [`LatentManifold::project_matrix_columns_to_gradient_tangent`]:
+    /// `I - uuᵀ` on a sphere, the identity on flat and periodic charts, and on an
+    /// interval endpoint a zero exactly where descent `-gradient` leaves the
+    /// interval.
+    ///
+    /// `P·gradient` is the block's first-order optimality measure. The ambient
+    /// gradient keeps the constraint's normal (multiplier) component, which does not
+    /// vanish at a constrained stationary point whose residual is non-zero (#4006).
+    pub fn atom_gradient_tangent_projector(
+        &self,
+        atom: usize,
+        point: &[f64],
+        gradient: ArrayView1<'_, f64>,
+    ) -> Result<Array2<f64>, String> {
+        let meta = self.atom_coord_meta.get(atom).ok_or_else(|| {
+            format!(
+                "SaeAssignmentState::atom_gradient_tangent_projector: atom {atom} out of range K={}",
+                self.k_atoms
+            )
+        })?;
+        if point.len() != meta.latent_dim || gradient.len() != meta.latent_dim {
+            return Err(format!(
+                "SaeAssignmentState::atom_gradient_tangent_projector: atom {atom} point width {} and gradient width {} != latent dim {}",
+                point.len(),
+                gradient.len(),
+                meta.latent_dim
+            ));
+        }
+        Ok(meta.manifold.project_matrix_columns_to_gradient_tangent(
+            ArrayView1::from(point),
+            gradient,
+            Array2::<f64>::eye(meta.latent_dim).view(),
+        ))
+    }
+
     /// Whether [`Self::retract_row_coords`] moves this atom's coordinates by the step
     /// itself, up to wrapping a period or clamping an interval, so that a Newton step in
     /// coordinates is the motion the retraction takes. A sphere normalizes the moved
@@ -417,6 +454,77 @@ impl SaeAssignmentState {
             cursor = end;
         }
         Ok(())
+    }
+
+    /// The row's linearized feasible update space for the descent direction
+    /// `descent`, as a symmetric block-diagonal projector matrix `P` over the
+    /// compact coordinate block.
+    ///
+    /// Each atom block is the linear map `v ↦ project_to_tangent(t, v)` of the
+    /// velocity space its retraction travels: `I − ttᵀ` on a sphere, the identity
+    /// on flat and periodic charts. An interval endpoint is the one non-linear
+    /// case: its velocity projection holds the coordinate exactly when the update
+    /// leaves the interval, so it is linearized at `descent`, the direction the
+    /// step is built to follow. The coordinate is held (`P_ii = 0`) when `descent`
+    /// points outward and free (`P_ii = 1`) otherwise. Applying the velocity
+    /// projection to `sign(descent_j)·e_j` and undoing the sign reads exactly
+    /// that, and leaves every linear block unchanged.
+    ///
+    /// A trust-region model restricted to `range(P)`, `(PHP, P·descent)`, has its
+    /// solution in `range(P)`, so the step certified against it is the step
+    /// [`Self::retract_row_coords`] travels.
+    pub fn row_tangent_projector(
+        &self,
+        row: usize,
+        coords: &[f64],
+        descent: &[f64],
+    ) -> Result<ndarray::Array2<f64>, String> {
+        if row >= self.n_obs {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} out of range N={}",
+                self.n_obs
+            ));
+        }
+        if descent.len() != coords.len() {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} descent width {} != compact coordinate width {}",
+                descent.len(),
+                coords.len()
+            ));
+        }
+        let width = coords.len();
+        let mut projector = ndarray::Array2::<f64>::zeros((width, width));
+        let mut cursor = 0usize;
+        for &atom in &self.indices[row] {
+            let meta = &self.atom_coord_meta[atom as usize];
+            let end = cursor + meta.latent_dim;
+            if end > width {
+                return Err(format!(
+                    "SaeAssignmentState::row_tangent_projector: row {row} atom {atom} block {cursor}..{end} exceeds compact coordinate width {width}"
+                ));
+            }
+            let point = Array1::from_vec(coords[cursor..end].to_vec());
+            for column in 0..meta.latent_dim {
+                let sign = if descent[cursor + column] < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let mut basis = Array1::<f64>::zeros(meta.latent_dim);
+                basis[column] = sign;
+                let projected = meta.manifold.project_to_tangent(point.view(), basis.view());
+                for (offset, value) in projected.iter().enumerate() {
+                    projector[[cursor + offset, cursor + column]] = sign * value;
+                }
+            }
+            cursor = end;
+        }
+        if cursor != width {
+            return Err(format!(
+                "SaeAssignmentState::row_tangent_projector: row {row} atom blocks cover {cursor} of {width} compact coordinates"
+            ));
+        }
+        Ok(projector)
     }
 
     pub fn retract_row_coords(

@@ -27,10 +27,10 @@ surface it has:
   gamfit.lr    ``smooth_significance(data)[...]["p_value_corrected"]``: the
                per-term likelihood-ratio test from a constrained null refit,
                the value that method documents as its headline.
-  gamfit.coef  ``summary().parametric_terms[...]["p_value"]``: the Wald test
-               of the linear coefficient, Student-t on the residual degrees of
-               freedom when the scale is estimated and normal when it is known
-               (``parametric_statistic`` is recorded as ``coef_statistic``).
+  gamfit.coef  ``summary().parametric_terms[...]["p_value"]``: the linear
+               term's reported test. A ridged slope (the default) reports the
+               variance-component score test of its ridge, not the shrunk
+               estimate's Wald ratio (gam#3573).
   pygam.wald   pyGAM's ``statistics_["p_values"]`` for the tested term, with
   pygam_gs.*   the default fixed lambda and with ``gridsearch`` respectively.
 
@@ -275,7 +275,7 @@ def gamfit_pvalues(
                 extra["lr_provenance"] = row.get("correction_provenance")
             else:
                 row = _row(list(summary.parametric_terms), target)
-                extra["coef_statistic"] = summary.parametric_statistic
+                extra["coef_statistic"] = row.get("statistic")
                 p = row.get("p_value")
         except Exception as exc:  # recorded, never dropped
             missing[surface] = f"{type(exc).__name__}: {exc}"[:500]

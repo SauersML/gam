@@ -226,19 +226,14 @@ fn measure_jet_auto_range_is_the_same_through_every_family_entry_point_2754() {
     );
 
     // Arm 3 (the transformation-normal entry) does NOT live here. It takes the
-    // same bypass and the same fix, but it cannot be gated by an end-to-end
-    // range comparison today: CTN declines this fixture's Gaussian response by
-    // railing its outer search at the box floor (legitimately — a
-    // `p_resp x p_cov` tensor interpolates a smooth surface at low noise) and
-    // declines a right-skewed one inside the inner solve with `physical
-    // reduced-face first-order KKT failed`, which is the gam#2600 refusal class.
-    // A range-resolver gate must not be red for an open defect in another
-    // subsystem, so the CTN claim is pinned where it cannot be blocked — at the
-    // moment the resolver is REACHED, in
-    // `tests/measure_jet_ctn_range_screen_2754.rs`, which asserts the screen's
-    // own record is emitted before the design is built and says nothing about
-    // the fit that follows. When gam#2600 lifts, the exact-equality assertion
-    // above is the stronger statement to move there.
+    // same bypass and the same fix, but this fixture's near-noiseless Gaussian
+    // response is not a CTN fixture: the outer search legitimately rails at the
+    // box floor (a `p_resp x p_cov` tensor interpolates a smooth surface at low
+    // noise). The CTN arm is gated on a log-normal response, the shape CTN
+    // exists for, in `tests/measure_jet_ctn_range_screen_2754.rs`, which asserts
+    // both that the screen's record is emitted before the design is built and
+    // that the fit converges to a transformation-normal model (gam#2600 closed
+    // the inner-solve refusal that once blocked it).
 
     // The slope block is screened against its OWN target (the first-order
     // score surrogate), so it is not required to equal the marginal's range, and
