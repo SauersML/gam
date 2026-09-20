@@ -1153,7 +1153,7 @@ impl GlobalIdentifiabilityPlan {
 ///
 /// This is `z_local` — the term-local half. After
 /// `realize_smooth_collection_gauge` runs, the metadata carries the
-/// COMPOSITION `z_local · T`, so this must be read BEFORE the gauge composes,
+/// COMPOSITION `z_local · Q · T`, so this must be read BEFORE the gauge composes,
 /// which is exactly where [`SmoothCollectionGauge::local_identifiability_transform`]
 /// is filled from (gam#2760).
 ///
@@ -1198,9 +1198,11 @@ fn basis_local_identifiability_transform(metadata: &BasisMetadata) -> Option<Arr
             constraint_transform,
             ..
         } => constraint_transform.clone(),
+        // A `by=` wrapper keeps its inner basis's chart, in the slot
+        // `with_identifiability_transform` composes into.
+        BasisMetadata::BySmooth { inner, .. } => basis_local_identifiability_transform(inner),
         BasisMetadata::Pca { .. }
         | BasisMetadata::SphereHarmonics { .. }
-        | BasisMetadata::BySmooth { .. }
         | BasisMetadata::FactorSmooth { .. } => None,
     }
 }
@@ -1311,7 +1313,11 @@ pub(crate) fn realize_smooth_collection_gauge(
         termname,
     )?;
     let projector = crate::basis::FixedRowSpaceProjector::from_constraint_block(block)?;
-    let (design, row_space_correction) = projector.project_design(design, termname)?;
+    let row_space_correction = projector.row_space_correction(&design, termname)?;
+    // `X_local T0 − C R` through the function the saved model's replay forms it
+    // with, so the fit's design and its rebuild are one computation (#3001).
+    let design =
+        subtract_row_space_correction(design, block, row_space_correction.view(), termname)?;
     let residualization = crate::basis::ParametricResidualization {
         coefficient_transform: coefficient_transform.clone(),
         row_space_correction,
@@ -1421,6 +1427,7 @@ pub fn place_term_in_collection_gauge(
     let parametric_residualization = Some(ParametricResidualizationChart {
         owner_terms: gauge.owner_terms.clone(),
         has_parametric_block: gauge.has_parametric_block,
+        coefficient_transform: realized.coefficient_transform.clone(),
         correction: realized.residualization.row_space_correction.clone(),
     });
     Ok(CollectionGaugedTerm {
@@ -1900,8 +1907,8 @@ fn apply_global_smooth_identifiability(
             .collect::<Vec<_>>();
         // A frozen span-preserving residualization (#2747) says this term's
         // realized block is `X·T − C·R`, so `C` must be rebuilt at these rows
-        // whatever the transform gates say — the metadata already carried `T`
-        // through, and the correction is the half it could not absorb.
+        // whatever the transform gates say. The chart carries `T` and `R`
+        // both, and the replay applies them in the fit's order (#3001).
         let replay_correction = frozen_parametric_residualization(termspec);
         let needs_parametric_block = match replay_correction {
             Some(chart) => chart.has_parametric_block,
@@ -2062,7 +2069,7 @@ fn apply_global_smooth_identifiability(
             (realized.design, Some(realized.coefficient_transform))
         } else {
             // No gauge: either there is nothing to be orthogonal to, or this is
-            // a REPLAY, where the fit already decided both halves and only `C`
+            // a REPLAY, where the fit already decided `T` and `R` and only `C`
             // is rebuilt at the new rows.
             let z_opt = if let Some(z) = replay_z {
                 if design_local.ncols() != z.nrows() {
@@ -2074,6 +2081,19 @@ fn apply_global_smooth_identifiability(
                     );
                 }
                 Some(z.clone())
+            } else if let Some(chart) = replay_correction {
+                // The collection chart `T0` the fit applied to `X_local · Q`,
+                // applied here to the same product, so the replay forms
+                // `(X_local · Q) · T0` exactly as the fit did (#3001).
+                if design_local.ncols() != chart.coefficient_transform.nrows() {
+                    gam_problem::bail_dim_basis!(
+                        "frozen collection chart mismatch for term '{}': rebuilt design has {} columns but the persisted fit-time chart has {} rows",
+                        term.name,
+                        design_local.ncols(),
+                        chart.coefficient_transform.nrows()
+                    );
+                }
+                Some(chart.coefficient_transform.clone())
             } else if skip_global_transform {
                 None
             } else {
@@ -2174,6 +2194,7 @@ fn apply_global_smooth_identifiability(
             .map(|plan| ParametricResidualizationChart {
                 owner_terms: owner_indices.clone(),
                 has_parametric_block: parametric_block.is_some(),
+                coefficient_transform: plan.coefficient_transform.clone(),
                 correction: plan.row_space_correction.clone(),
             })
             .or_else(|| replay_correction.cloned());
@@ -2945,9 +2966,35 @@ fn compose_identifiability_transforms(
     }
 }
 
+/// `metadata` with `transform` composed onto the identifiability chart it
+/// already carries.
 fn with_identifiability_transform(
     metadata: &BasisMetadata,
     transform: Option<&Array2<f64>>,
+) -> Result<BasisMetadata, BasisError> {
+    map_identifiability_transform(metadata, &|existing| {
+        compose_identifiability_transforms(existing, transform)
+    })
+}
+
+/// `metadata` with its identifiability chart REPLACED by `transform`.
+///
+/// The freeze of a collection-gauged term writes the TERM-LOCAL chart the
+/// gauge was derived on, not the composition its metadata records, because a
+/// replay applies the local chart, the joint-null rotation and the collection
+/// chart as three products, as the fit does (#3001).
+pub(crate) fn with_replaced_identifiability_transform(
+    metadata: &BasisMetadata,
+    transform: Option<&Array2<f64>>,
+) -> Result<BasisMetadata, BasisError> {
+    map_identifiability_transform(metadata, &|_| Ok(transform.cloned()))
+}
+
+/// `metadata` with `chart` applied to its identifiability-transform slot: the
+/// one place that knows which slot each basis kind keeps its chart in.
+fn map_identifiability_transform(
+    metadata: &BasisMetadata,
+    chart: &dyn Fn(Option<&Array2<f64>>) -> Result<Option<Array2<f64>>, BasisError>,
 ) -> Result<BasisMetadata, BasisError> {
     match metadata {
         BasisMetadata::BSpline1D {
@@ -2960,10 +3007,7 @@ fn with_identifiability_transform(
         } => Ok(BasisMetadata::BSpline1D {
             knots: knots.clone(),
             periodic: *periodic,
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
             degree: *degree,
             auto_shrink_note: auto_shrink_note.clone(),
             // The offset coefficients live in the raw-basis chart and are
@@ -2976,10 +3020,7 @@ fn with_identifiability_transform(
             identifiability_transform,
         } => Ok(BasisMetadata::CubicRegression1D {
             knots: knots.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::ThinPlate {
             centers,
@@ -2992,10 +3033,7 @@ fn with_identifiability_transform(
             centers: centers.clone(),
             length_scale: *length_scale,
             periodic: periodic.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
             input_scale: *input_scale,
             radial_reparam: radial_reparam.clone(),
         }),
@@ -3012,10 +3050,7 @@ fn with_identifiability_transform(
             method: *method,
             max_degree: *max_degree,
             wahba_kernel: *wahba_kernel,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
         }),
         BasisMetadata::ConstantCurvature {
             centers,
@@ -3026,10 +3061,7 @@ fn with_identifiability_transform(
             centers: centers.clone(),
             kappa: *kappa,
             length_scale: *length_scale,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
         }),
         BasisMetadata::MeasureJet {
             centers,
@@ -3057,10 +3089,7 @@ fn with_identifiability_transform(
             penalty_normalization_scales: penalty_normalization_scales.clone(),
             raw_penalty_normalization_scales: raw_penalty_normalization_scales.clone(),
             fused_penalty_normalization_scale: *fused_penalty_normalization_scale,
-            constraint_transform: compose_identifiability_transforms(
-                constraint_transform.as_ref(),
-                transform,
-            )?,
+            constraint_transform: chart(constraint_transform.as_ref())?,
             sigma_coord: *sigma_coord,
         }),
         BasisMetadata::Matern {
@@ -3078,10 +3107,7 @@ fn with_identifiability_transform(
             periodic: periodic.clone(),
             nu: *nu,
             include_intercept: *include_intercept,
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
             input_scale: *input_scale,
             aniso_log_scales: aniso_log_scales.clone(),
         }),
@@ -3108,10 +3134,7 @@ fn with_identifiability_transform(
             operator_collocation_points: operator_collocation_points.clone(),
             radial_reparam: radial_reparam.clone(),
             spectral_basis: spectral_basis.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::SphereHarmonics {
             max_degree,
@@ -3133,10 +3156,7 @@ fn with_identifiability_transform(
             degrees: degrees.clone(),
             periods: periods.clone(),
             is_cr: is_cr.clone(),
-            identifiability_transform: compose_identifiability_transforms(
-                identifiability_transform.as_ref(),
-                transform,
-            )?,
+            identifiability_transform: chart(identifiability_transform.as_ref())?,
         }),
         BasisMetadata::BySmooth {
             inner,
@@ -3144,7 +3164,7 @@ fn with_identifiability_transform(
             levels,
             ordered,
         } => Ok(BasisMetadata::BySmooth {
-            inner: Box::new(with_identifiability_transform(inner, transform)?),
+            inner: Box::new(map_identifiability_transform(inner, chart)?),
             by_col: *by_col,
             levels: levels.clone(),
             ordered: *ordered,
@@ -3165,7 +3185,7 @@ fn with_identifiability_transform(
             // `s(x) + fs(x, g)` unpredictable — reject loudly so any future
             // caller that reaches this arm with a transform fails at fit time
             // rather than corrupting the saved coefficient chart.
-            if transform.is_some() {
+            if chart(None)?.is_some() {
                 gam_problem::bail_invalid_basis!(
                     "FactorSmooth metadata cannot absorb an identifiability transform; \
                      route it through the term-level frozen_global_orthogonality carrier"
@@ -3195,7 +3215,7 @@ fn with_identifiability_transform(
             // (the constraint, if any, lives inside the PCA loadings
             // themselves), so the caller cannot meaningfully attach a
             // post-hoc Z transform here.
-            if transform.is_some() {
+            if chart(None)?.is_some() {
                 gam_problem::bail_invalid_basis!(
                     "PCA bases do not expose a composable identifiability transform"
                 );
