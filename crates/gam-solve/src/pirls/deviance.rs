@@ -4,8 +4,9 @@
 
 use super::*;
 use gam_math::special::{
-    bd0, bernoulli_kl_from_logits, expm1_minus_x, log_abs_one_minus_exp, log_exprel,
-    log1p_minus_x, logaddexp, softplus, xlogy,
+    bd0, bernoulli_kl_from_logits, expm1_minus_x, ln_gamma_binet_remainder,
+    log_abs_one_minus_exp, log_exprel, log1p_minus_x, logaddexp, softplus, stirling_gap,
+    xlogy,
 };
 
 #[inline]
@@ -560,9 +561,9 @@ pub(crate) fn beta_half_unit_deviance_from_shape_differences(
     let ratio_terms = delta * ((log_mu_s - y.ln()) - (log_one_minus_mu_s - (-y).ln_1p()));
     let quadratic_terms = a_s * log1p_minus_x(u) + b_s * log1p_minus_x(v);
     let half_terms = (delta - 0.5) * u.ln_1p() + (-delta - 0.5) * v.ln_1p();
-    let stirling_tail = log_gamma_stirling_correction(a) - log_gamma_stirling_correction(a_s)
-        + log_gamma_stirling_correction(b)
-        - log_gamma_stirling_correction(b_s);
+    let stirling_tail = ln_gamma_binet_remainder(a) - ln_gamma_binet_remainder(a_s)
+        + ln_gamma_binet_remainder(b)
+        - ln_gamma_binet_remainder(b_s);
     let half_unit = ratio_terms + quadratic_terms + half_terms + stirling_tail;
     half_unit.is_finite().then_some(half_unit)
 }
@@ -2376,26 +2377,6 @@ pub(crate) fn unit_measure_deviance_and_log_kernel_from_eta(
 }
 
 #[inline]
-pub(crate) fn log_gamma_stirling_correction(x: f64) -> f64 {
-    let inv = 1.0 / x;
-    let inv2 = inv * inv;
-    inv * (1.0 / 12.0
-        + inv2
-            * (-1.0 / 360.0
-                + inv2
-                    * (1.0 / 1260.0
-                        + inv2
-                            * (-1.0 / 1680.0
-                                + inv2
-                                    * (1.0 / 1188.0
-                                        + inv2
-                                            * (-691.0 / 360_360.0
-                                                + inv2
-                                                    * (1.0 / 156.0
-                                                        - inv2 * 3617.0 / 122_400.0)))))))
-}
-
-#[inline]
 pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
     let shifted = base + delta;
     if base < 8.0 || shifted < 8.0 {
@@ -2409,8 +2390,8 @@ pub(crate) fn log_gamma_large_ratio(base: f64, delta: f64) -> f64 {
         return delta * base.ln();
     }
     delta * base.ln() + (base + delta - 0.5) * ratio.ln_1p() - delta
-        + log_gamma_stirling_correction(shifted)
-        - log_gamma_stirling_correction(base)
+        + ln_gamma_binet_remainder(shifted)
+        - ln_gamma_binet_remainder(base)
 }
 
 #[inline]
@@ -2422,9 +2403,9 @@ pub(crate) fn beta_log_normalizer(a: f64, b: f64, sum: f64) -> f64 {
     }
     -xlogy(a, a / sum) - xlogy(b, b / sum)
         + 0.5 * (a.ln() + b.ln() - sum.ln() - (2.0 * std::f64::consts::PI).ln())
-        + log_gamma_stirling_correction(sum)
-        - log_gamma_stirling_correction(a)
-        - log_gamma_stirling_correction(b)
+        + ln_gamma_binet_remainder(sum)
+        - ln_gamma_binet_remainder(a)
+        - ln_gamma_binet_remainder(b)
 }
 
 /// `ln(2π)` — the per-observation Gaussian / saddlepoint normalizer constant.
@@ -2481,9 +2462,9 @@ fn binomial_log_coefficient_from_proportion(w: f64, y: f64) -> f64 {
     }
     let leading = -xlogy(k, y) - xlogy(other, 1.0 - y);
     let logarithmic = 0.5 * (w.ln() - k.ln() - other.ln()) - HALF_LOG_2PI;
-    leading + logarithmic + log_gamma_stirling_correction(w)
-        - log_gamma_stirling_correction(k)
-        - log_gamma_stirling_correction(other)
+    leading + logarithmic + ln_gamma_binet_remainder(w)
+        - ln_gamma_binet_remainder(k)
+        - ln_gamma_binet_remainder(other)
 }
 
 /// Saturated NB2 log mass, combined before evaluation. In the all-large branch
@@ -2500,9 +2481,9 @@ fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
     if y >= 8.0 && theta >= 8.0 {
         let total = y + theta;
         return 0.5 * (log_theta - log_total - log_y) - HALF_LOG_2PI
-            + log_gamma_stirling_correction(total)
-            - log_gamma_stirling_correction(theta)
-            - log_gamma_stirling_correction(y);
+            + ln_gamma_binet_remainder(total)
+            - ln_gamma_binet_remainder(theta)
+            - ln_gamma_binet_remainder(y);
     }
     if y >= theta {
         let gamma_ratio = log_gamma_large_ratio(y + 1.0, theta - 1.0);
@@ -2517,20 +2498,10 @@ fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
 #[inline]
 fn gamma_saturated_log_normalizer(log_shape: f64, weight: f64, y: f64) -> f64 {
     let log_a = weight.ln() + log_shape;
-    let core = if log_a >= 8.0_f64.ln() {
-        let inv = (-log_a).exp();
-        let inv2 = inv * inv;
-        let correction = inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0;
-        0.5 * log_a - HALF_LOG_2PI - correction
-    } else {
-        let a = log_a.exp();
-        if a == 0.0 {
-            // a ln a - a - ln Gamma(a) -> ln a as a -> 0+.
-            log_a
-        } else {
-            a * log_a - a - ln_gamma(a)
-        }
-    };
+    let a = log_a.exp();
+    // The Stirling gap a ln a - a - ln Gamma(a), without cancellation at any a;
+    // it tends to ln a as a -> 0+, the limit read where exp(log_a) underflows.
+    let core = if a > 0.0 { stirling_gap(a) } else { log_a };
     core - y.ln()
 }
 
@@ -2539,7 +2510,7 @@ fn poisson_saturated_log_likelihood(y: f64) -> f64 {
     if y == 0.0 {
         0.0
     } else if y >= 8.0 {
-        -0.5 * (LN_2PI + y.ln()) - log_gamma_stirling_correction(y)
+        -0.5 * (LN_2PI + y.ln()) - ln_gamma_binet_remainder(y)
     } else {
         y * (y.ln() - 1.0) - ln_gamma(y + 1.0)
     }
@@ -2807,7 +2778,7 @@ pub(crate) fn tweedie_exact_series_loglik_from_eta(
         let poisson_log_mass = if k >= 8.0 {
             -bd0(k, lambda)
                 - 0.5 * (LN_2PI + k.ln())
-                - log_gamma_stirling_correction(k)
+                - ln_gamma_binet_remainder(k)
         } else {
             stable_finite_signed_sum(
                 &[-lambda, k * log_lambda, -ln_gamma(k + 1.0)],
@@ -2818,7 +2789,7 @@ pub(crate) fn tweedie_exact_series_loglik_from_eta(
         let gamma_log_density = if gamma_shape >= 8.0 {
             -bd0(gamma_shape, y_over_scale)
                 + 0.5 * (gamma_shape.ln() - LN_2PI)
-                - log_gamma_stirling_correction(gamma_shape)
+                - ln_gamma_binet_remainder(gamma_shape)
                 - log_y
         } else {
             stable_finite_signed_sum(

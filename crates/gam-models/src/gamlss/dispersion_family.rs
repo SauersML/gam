@@ -23,6 +23,7 @@ use gam_terms::smooth::{
     get_spatial_length_scale, spatial_term_uses_per_axis_psi,
 };
 use gam_row_macros::row_program;
+use gam_math::special::{log1p_minus_x, stirling_gap};
 use ndarray::{Array1, Array2, s};
 use statrs::function::gamma::ln_gamma;
 
@@ -323,7 +324,9 @@ fn validate_dispersion_row_kernel_output(
 #[cfg(test)]
 mod test_support {
     use super::*;
-    use crate::gamlss::test_support::order2_ln_gamma;
+    use crate::gamlss::test_support::{
+        log1p_minus_x_jet_stack, order2_ln_gamma, stirling_gap_jet_stack,
+    };
     use gam_math::jet_scalar::JetScalar;
     use gam_math::nested_dual::JetField;
 
@@ -358,19 +361,18 @@ mod test_support {
     #[inline]
     pub(super) fn dispersion_gamma_nll_generic<S: gam_math::jet_scalar::JetScalar<2>>(
         yi: f64,
-        y_pos: f64,
         mu_value: f64,
         nu_value: f64,
         wi: f64,
     ) -> S {
         let mu = S::variable(mu_value, 0);
         let nu = S::variable(nu_value, 1);
-        // nu*nu.ln() - nu*mu.ln() - nu.ln_gamma() + (nu-1)*y_pos.ln() - nu*(mu.recip()*yi)
+        // nu*nu.ln() - nu*mu.ln() - nu.ln_gamma() + (nu-1)*yi.ln() - nu*(mu.recip()*yi)
         let loglik = nu
             .mul(&nu.ln())
             .sub(&nu.mul(&mu.ln()))
             .sub(&nu.ln_gamma())
-            .add(&nu.sub(&S::constant(1.0)).scale(y_pos.ln()))
+            .add(&nu.sub(&S::constant(1.0)).scale(yi.ln()))
             .sub(&nu.mul(&mu.recip().scale(yi)));
         loglik.scale(-wi)
     }
@@ -429,13 +431,15 @@ mod test_support {
         loglik.scale(-wi)
     }
 
-    /// #1591 jet-prune oracle: full `Order2<2>` Gamma row NLL. As with NB, the
-    /// row kernel reads the Gamma scores from its row program, so this form is
-    /// kept only as the dense-tower oracle pin.
+    /// #1591 jet-prune oracle: full `Order2<2>` Gamma row NLL in the
+    /// Stirling-gap form `ℓ = g(ν) + ν·L₁((y − μ)/μ) − ln y` (#4252), with
+    /// `g(ν) = ν ln ν − ν − ln Γ(ν)` and `L₁(x) = ln(1 + x) − x`. Its value
+    /// channel is evaluated in the same operation order as
+    /// [`dispersion_gamma_loglik`], so the two agree bit for bit; the lnΓ-form
+    /// [`dispersion_gamma_nll_generic`] is the independent algebraic oracle.
     #[inline]
     pub(super) fn dispersion_gamma_nll_order2(
         yi: f64,
-        y_pos: f64,
         mu_value: f64,
         nu_value: f64,
         wi: f64,
@@ -444,17 +448,23 @@ mod test_support {
 
         let mu = O2::variable(mu_value, 0);
         let nu = O2::variable(nu_value, 1);
+        let fit = O2::constant(yi)
+            .sub(&mu)
+            .mul(&mu.recip())
+            .compose_unary(log1p_minus_x_jet_stack((yi - mu_value) * (1.0 / mu_value)));
         let loglik = nu
-            .mul(&nu.ln())
-            .sub(&nu.mul(&mu.ln()))
-            .sub(&order2_ln_gamma(&nu))
-            .add(&nu.sub(&O2::constant(1.0)).scale(y_pos.ln()))
-            .sub(&nu.mul(&mu.recip().scale(yi)));
+            .compose_unary(stirling_gap_jet_stack(nu_value))
+            .add(&nu.mul(&fit))
+            .sub(&O2::constant(yi.ln()));
         loglik.scale(-wi)
     }
 
-    /// Full `Order2<2>` Beta row NLL seeded on `(μ, φ)`. The row kernel reads
-    /// the Beta score from its row program; this tower is its oracle
+    /// Full `Order2<2>` Beta row NLL seeded on `(μ, φ)`, in the Stirling-gap
+    /// form `ℓ = g(a) + g(b) − g(φ) − φ·K − ln y − ln(1 − y)` (#4252), with
+    /// `a = μφ`, `b = (1 − μ)φ` and the mean divergence
+    /// `K = −μ·L₁((y − μ)/μ) − (1 − μ)·L₁((μ − y)/(1 − μ))`. Its value channel
+    /// follows [`dispersion_beta_loglik`]'s operation order. The row kernel
+    /// reads the Beta score from its row program; this tower is its oracle
     /// (`row_kernel_closed_form_dispersion_channels_match_the_towers`) and the
     /// dense-tower pin's subject.
     #[inline]
@@ -468,15 +478,26 @@ mod test_support {
 
         let mu = O2::variable(mu_value, 0);
         let phi = O2::variable(phi_value, 1);
+        let one_minus_mu_value = 1.0 - mu_value;
         let one_minus_mu = O2::constant(1.0).sub(&mu);
-        let yc = yi;
+        let (t_value, s_value) = beta_divergence_ratios(yi, mu_value, one_minus_mu_value);
+        let t = O2::constant(yi)
+            .sub(&mu)
+            .mul(&mu.recip())
+            .compose_unary(log1p_minus_x_jet_stack(t_value));
+        let s = mu
+            .sub(&O2::constant(yi))
+            .mul(&one_minus_mu.recip())
+            .compose_unary(log1p_minus_x_jet_stack(s_value));
+        let divergence = mu.mul(&t).neg().sub(&one_minus_mu.mul(&s));
         let a = mu.mul(&phi);
         let b = one_minus_mu.mul(&phi);
-        let loglik = order2_ln_gamma(&phi)
-            .sub(&order2_ln_gamma(&a))
-            .sub(&order2_ln_gamma(&b))
-            .add(&a.sub(&O2::constant(1.0)).scale(yc.ln()))
-            .add(&b.sub(&O2::constant(1.0)).scale((-yc).ln_1p()));
+        let loglik = a
+            .compose_unary(stirling_gap_jet_stack(mu_value * phi_value))
+            .add(&b.compose_unary(stirling_gap_jet_stack(one_minus_mu_value * phi_value)))
+            .sub(&phi.compose_unary(stirling_gap_jet_stack(phi_value)))
+            .sub(&phi.mul(&divergence))
+            .sub(&O2::constant(yi.ln() + (-yi).ln_1p()));
         loglik.scale(-wi)
     }
 
@@ -487,21 +508,18 @@ mod test_support {
     #[inline]
     pub(super) fn dispersion_gamma_disp_order2(
         yi: f64,
-        y_pos: f64,
         mu_value: f64,
         nu_value: f64,
         wi: f64,
     ) -> gam_math::jet_scalar::Order2<1> {
         type O1 = gam_math::jet_scalar::Order2<1>;
 
-        let mu = O1::constant(mu_value);
+        let (_, excess) = gamma_response_ratio(yi, mu_value);
         let nu = O1::variable(nu_value, 0);
         let loglik = nu
-            .mul(&nu.ln())
-            .sub(&nu.mul(&mu.ln()))
-            .sub(&order2_ln_gamma(&nu))
-            .add(&nu.sub(&O1::constant(1.0)).scale(y_pos.ln()))
-            .sub(&nu.mul(&mu.recip().scale(yi)));
+            .compose_unary(stirling_gap_jet_stack(nu_value))
+            .add(&nu.scale(log1p_minus_x(excess)))
+            .sub(&O1::constant(yi.ln()));
         loglik.scale(-wi)
     }
 
@@ -621,28 +639,69 @@ fn nb_log_precision_fisher_jensen(mu: f64, theta: f64, trigamma_theta: f64) -> f
         + (inv * inv2 * inv2 / 42.0) * one_minus_r7
 }
 
-/// Gamma row log-likelihood, plain `f64`, bit-identical to
-/// `-dispersion_gamma_disp_order2(..).value()`.
+/// `(z, z − 1)` for the Gamma response ratio `z = y/μ`. The excess is formed as
+/// `(y − μ)·(1/μ)`, which keeps it correct to a few ulps relative where `z → 1`;
+/// the jet oracles form it the same way.
 #[inline]
-fn dispersion_gamma_loglik(yi: f64, y_pos: f64, mu: f64, nu: f64, wi: f64) -> f64 {
-    // NB: the jet forms `μ.recip().scale(yi)` = `(1/μ)·yᵢ` (reciprocal then
-    // multiply), NOT `yᵢ/μ` (single divide) — these differ in the last bit, so
-    // the value path must reproduce the reciprocal-then-multiply exactly.
-    let s = nu * nu.ln() - nu * mu.ln() - ln_gamma(nu) + (nu - 1.0) * y_pos.ln()
-        - nu * ((1.0 / mu) * yi);
+fn gamma_response_ratio(yi: f64, mu: f64) -> (f64, f64) {
+    let inverse_mean = 1.0 / mu;
+    (inverse_mean * yi, (yi - mu) * inverse_mean)
+}
+
+/// Gamma row log-likelihood `g(ν) + ν L(y/μ) − ln y` (see `gamma_row_program`),
+/// plain `f64`, bit-identical to `-dispersion_gamma_disp_order2(..).value()`.
+#[inline]
+fn dispersion_gamma_loglik(yi: f64, mu: f64, nu: f64, wi: f64) -> f64 {
+    let (_, excess) = gamma_response_ratio(yi, mu);
+    let s = stirling_gap(nu) + nu * log1p_minus_x(excess) - yi.ln();
     -(s * -wi)
 }
 
-/// Beta row log-likelihood, plain `f64`, bit-identical to
+/// `(t, s) = ((y − μ)/μ, (μ − y)/(1 − μ))`, so `y/μ = 1 + t` and
+/// `(1 − y)/(1 − μ) = 1 + s`.
+#[inline]
+fn beta_divergence_ratios(yi: f64, mu: f64, one_minus_mu: f64) -> (f64, f64) {
+    ((yi - mu) * (1.0 / mu), (mu - yi) * (1.0 / one_minus_mu))
+}
+
+/// The Bernoulli divergence `K(μ) = μ ln(μ/y) + (1 − μ) ln((1 − μ)/(1 − y))` of
+/// the Beta row (see `beta_row_program`), as `−μ L₁(t) − (1 − μ) L₁(s)` with
+/// `L₁(x) = ln(1 + x) − x` and `(t, s)` from [`beta_divergence_ratios`]: the
+/// linear parts `μ t + (1 − μ) s = 0` cancel analytically, so both terms are
+/// non-negative and `K` carries no cancellation.
+#[inline]
+fn beta_divergence(yi: f64, mu: f64, one_minus_mu: f64) -> f64 {
+    let (t, s) = beta_divergence_ratios(yi, mu, one_minus_mu);
+    -mu * log1p_minus_x(t) - one_minus_mu * log1p_minus_x(s)
+}
+
+/// `[K, K′, K″, K‴, K⁗]` in `μ` of [`beta_divergence`].
+#[inline]
+fn beta_divergence_stack(yi: f64, mu: f64, one_minus_mu: f64) -> [f64; 5] {
+    let (t, s) = beta_divergence_ratios(yi, mu, one_minus_mu);
+    let inverse_mean = 1.0 / mu;
+    let inverse_complement = 1.0 / one_minus_mu;
+    [
+        beta_divergence(yi, mu, one_minus_mu),
+        s.ln_1p() - t.ln_1p(),
+        inverse_mean * inverse_complement,
+        inverse_complement * inverse_complement - inverse_mean * inverse_mean,
+        2.0 * (inverse_mean * inverse_mean * inverse_mean
+            + inverse_complement * inverse_complement * inverse_complement),
+    ]
+}
+
+/// Beta row log-likelihood `g(a) + g(b) − g(φ) − φ K(μ) − ln y − ln(1 − y)` (see
+/// `beta_row_program`), plain `f64`, bit-identical to
 /// `-dispersion_beta_nll_order2(..).value()`.
 #[inline]
 fn dispersion_beta_loglik(yi: f64, mu: f64, phi: f64, wi: f64) -> f64 {
     let one_minus_mu = 1.0 - mu;
-    let yc = yi;
     let a = mu * phi;
     let b = one_minus_mu * phi;
-    let s =
-        ln_gamma(phi) - ln_gamma(a) - ln_gamma(b) + (a - 1.0) * yc.ln() + (b - 1.0) * (-yc).ln_1p();
+    let s = stirling_gap(a) + stirling_gap(b) - stirling_gap(phi)
+        - phi * beta_divergence(yi, mu, one_minus_mu)
+        - (yi.ln() + (-yi).ln_1p());
     -(s * -wi)
 }
 
@@ -700,8 +759,7 @@ pub(crate) fn dispersion_row_loglik(
         DispersionFamilyKind::Gamma => {
             let mu = em.exp();
             let nu = ed.exp();
-            let y_pos = yi;
-            dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)
+            dispersion_gamma_loglik(yi, mu, nu, wi)
         }
         DispersionFamilyKind::Beta => {
             let mu = gam_linalg::utils::stable_logistic(em);
@@ -721,23 +779,27 @@ pub(crate) fn dispersion_row_loglik(
 // third surface is that Hessian's directional derivative, so the link chains,
 // the mean/precision cross curvature and every product-rule term are generated
 // from the declaration. The caller supplies only one-variable derivative stacks
-// at the row: `ln Γ` through tetragamma, softplus for the negative binomial log
-// shares, the logistic mean link, the Tweedie mean's power terms `e^{(2−p)t}` and
-// `e^{(1−p)t}` with their coefficients, and `e^t` at `t = 0`. Each argument's
-// polygamma entries come from one walk of the recurrence
-// (`gam_math::special::polygamma_stack`), which divides once per step for every
-// order where the per-order scalars divide once each.
+// at the row: `ln Γ` through tetragamma for the negative binomial, the Stirling
+// gap `x ln x − x − ln Γ(x)` for the Gamma shape and the Beta precision and
+// shapes, the Gamma response fit and Beta divergence, softplus for the negative
+// binomial log shares, the logistic mean link, the Tweedie mean's power terms
+// `e^{(2−p)t}` and `e^{(1−p)t}` with their coefficients, and `e^t` at `t = 0`.
+// Each argument's polygamma (or Stirling-gap) entries come from one walk of the
+// recurrence (`gam_math::special::polygamma_stack`,
+// `gam_math::special::stirling_gap_derivative_stack`), which divides once per step
+// for every order where the per-order scalars divide once each.
 //
 // A supplied value that enters the result only through `add` or `scale` reaches
 // the value channel and nothing else. The production stacks supply zero for those
-// values (every `ln Γ` value, the negative binomial `−ln q`, the Tweedie density
-// normalizer), and the row log-likelihood comes from the plain-f64 functions
-// above. Values that multiply a jet (the negative binomial `−ln r`, the Beta mean,
+// values (every `ln Γ` and Stirling-gap value, the log responses, the negative
+// binomial `−ln q`, the Tweedie density normalizer), and the row log-likelihood
+// comes from the plain-f64 functions above. Values that multiply a jet (the
+// negative binomial `−ln r`, the Gamma response fit, the Beta mean and divergence,
 // the Tweedie deviance terms) are always supplied. The programs emit through
 // fourth order: the contracted fourth surface is the observed Hessian's second
 // directional derivative, which the exact outer rho-Hessian consumes. A surface of
-// order `k` reads the stack entries through `k`, so the polygamma entries above the
-// requested order are zero and only the fourth surface reads the pentagamma ones.
+// order `k` reads the stack entries through `k`, so the entries above the
+// requested order are zero and only the fourth surface reads the fifth-order ones.
 // ============================================================================
 
 // NB2: ℓ = ln Γ(θ + y) − ln Γ(θ) − ln Γ(y + 1) + θ ln r + y ln q, with
@@ -823,53 +885,72 @@ row_program! {
     }
 }
 
-// Gamma: ℓ = ν (η_d − η_μ) − ln Γ(ν) + (ν − 1) ln y − ν y e^{−η_μ}, with
-// ν = e^{η_d}; `response_ratio` is `y/μ` at the row.
+// Gamma: ℓ = ν ln ν − ν ln μ − ln Γ(ν) + (ν − 1) ln y − ν y/μ
+//          = g(ν) + ν L(z) − ln y,
+// with ν = e^{η_d}, the Stirling gap g(ν) = ν ln ν − ν − ln Γ(ν), z = y/μ and
+// L(z) = ln z − z + 1 = log1p_minus_x(z − 1) ≤ 0 (#4252). About the row
+// z = z₀ e^{−δ_μ}, so L's δ_μ-stack is [L(z₀), z₀ − 1, −z₀, z₀, −z₀]:
+// `response_fit` is L(z₀), `response_excess` z₀ − 1 and `response_ratio` z₀. The
+// lnΓ form cancels O(ν ln ν) magnitudes (and ψ(ν) against ln ν in the score) down
+// to the O(ln ν) value and O(1/ν) score, so every bit of the shape channel is lost
+// once ν passes 1/ε; the gap form carries no such cancellation.
 row_program! {
     fn gamma_row_program(
         delta_mu,
         delta_d;
         shape,
-        log_shape_ratio,
-        log_response,
+        response_fit,
+        response_excess,
         response_ratio,
-        ln_gamma_shape,
-        digamma_shape,
-        trigamma_shape,
-        tetragamma_shape,
-        pentagamma_shape
+        log_response,
+        shape_gap,
+        shape_gap_first,
+        shape_gap_second,
+        shape_gap_third,
+        shape_gap_fourth
     )
     emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
-        ln_gamma_at_shape => supplied,
+        stirling_gap_at_shape => supplied,
+        response_fit_at_mean => supplied,
     }
     witnesses [];
     {
         let shape_ratio = compose(unit_exponential, delta_d, 1.0, 1.0, 1.0, 1.0, 1.0);
         let precision = scale(shape_ratio, shape);
-        let log_ratio = add_constant(add(delta_d, neg(delta_mu)), log_shape_ratio);
-        let reverse_delta_mu = neg(delta_mu);
-        let inverse_mean_ratio =
-            compose(unit_exponential, reverse_delta_mu, 1.0, 1.0, 1.0, 1.0, 1.0);
-        let ln_gamma_jet = compose(
-            ln_gamma_at_shape,
+        let gap = compose(
+            stirling_gap_at_shape,
             precision,
-            ln_gamma_shape,
-            digamma_shape,
-            trigamma_shape,
-            tetragamma_shape,
-            pentagamma_shape
+            shape_gap,
+            shape_gap_first,
+            shape_gap_second,
+            shape_gap_third,
+            shape_gap_fourth
         );
-        let scaled_response = scale(inverse_mean_ratio, response_ratio);
-        let kernel = add(mul(precision, log_ratio), neg(ln_gamma_jet));
-        let response = add(scale(precision, log_response), neg(mul(precision, scaled_response)));
-        return add_constant(add(kernel, response), -log_response);
+        let fit = compose(
+            response_fit_at_mean,
+            delta_mu,
+            response_fit,
+            response_excess,
+            -response_ratio,
+            response_ratio,
+            -response_ratio
+        );
+        return add_constant(add(gap, mul(precision, fit)), -log_response);
     }
 }
 
 // Beta(μφ, (1 − μ)φ): ℓ = ln Γ(φ) − ln Γ(a) − ln Γ(b) + (a − 1) ln y
 // + (b − 1) ln(1 − y), with a = μφ, b = (1 − μ)φ, μ = logistic(η_μ), φ = e^{η_d}.
+// With the Stirling gap g(x) = x ln x − x − ln Γ(x) and a + b = φ,
+//   ℓ = g(a) + g(b) − g(φ) − φ K(μ) − ln y − ln(1 − y),
+// where K(μ) = μ ln(μ/y) + (1 − μ) ln((1 − μ)/(1 − y)) ≥ 0 is the Bernoulli
+// divergence of μ from y (#4252). Its μ-stack is
+//   K′ = ln(μ/y) − ln((1 − μ)/(1 − y)),  K″ = 1/(μ(1 − μ)),
+//   K‴ = −1/μ² + 1/(1 − μ)²,  K⁗ = 2/μ³ + 2/(1 − μ)³,
+// composed on the logistic mean jet. As for the Gamma shape, the lnΓ form cancels
+// O(φ ln φ) magnitudes down to the O(ln φ) gaps and the O(φ (y − μ)²) divergence.
 row_program! {
     fn beta_row_program(
         delta_mu,
@@ -882,29 +963,35 @@ row_program! {
         mean_fourth,
         log_response,
         log_complement,
-        ln_gamma_precision,
-        digamma_precision,
-        trigamma_precision,
-        tetragamma_precision,
-        pentagamma_precision,
-        ln_gamma_first_shape,
-        digamma_first_shape,
-        trigamma_first_shape,
-        tetragamma_first_shape,
-        pentagamma_first_shape,
-        ln_gamma_second_shape,
-        digamma_second_shape,
-        trigamma_second_shape,
-        tetragamma_second_shape,
-        pentagamma_second_shape
+        divergence,
+        divergence_first,
+        divergence_second,
+        divergence_third,
+        divergence_fourth,
+        precision_gap,
+        precision_gap_first,
+        precision_gap_second,
+        precision_gap_third,
+        precision_gap_fourth,
+        first_shape_gap,
+        first_shape_gap_first,
+        first_shape_gap_second,
+        first_shape_gap_third,
+        first_shape_gap_fourth,
+        second_shape_gap,
+        second_shape_gap_first,
+        second_shape_gap_second,
+        second_shape_gap_third,
+        second_shape_gap_fourth
     )
     emit [order2, third, fourth];
     leaves {
         unit_exponential => supplied,
         logistic => supplied,
-        ln_gamma_at_precision => supplied,
-        ln_gamma_at_first_shape => supplied,
-        ln_gamma_at_second_shape => supplied,
+        divergence_at_mean => supplied,
+        stirling_gap_at_precision => supplied,
+        stirling_gap_at_first_shape => supplied,
+        stirling_gap_at_second_shape => supplied,
     }
     witnesses [];
     {
@@ -914,39 +1001,45 @@ row_program! {
         let precision_jet = scale(precision_ratio, precision);
         let first_shape = mul(mean_jet, precision_jet);
         let second_shape = mul(complement, precision_jet);
-        let ln_gamma_precision_jet = compose(
-            ln_gamma_at_precision,
+        let precision_gap_jet = compose(
+            stirling_gap_at_precision,
             precision_jet,
-            ln_gamma_precision,
-            digamma_precision,
-            trigamma_precision,
-            tetragamma_precision,
-            pentagamma_precision
+            precision_gap,
+            precision_gap_first,
+            precision_gap_second,
+            precision_gap_third,
+            precision_gap_fourth
         );
-        let ln_gamma_first_jet = compose(
-            ln_gamma_at_first_shape,
+        let first_gap_jet = compose(
+            stirling_gap_at_first_shape,
             first_shape,
-            ln_gamma_first_shape,
-            digamma_first_shape,
-            trigamma_first_shape,
-            tetragamma_first_shape,
-            pentagamma_first_shape
+            first_shape_gap,
+            first_shape_gap_first,
+            first_shape_gap_second,
+            first_shape_gap_third,
+            first_shape_gap_fourth
         );
-        let ln_gamma_second_jet = compose(
-            ln_gamma_at_second_shape,
+        let second_gap_jet = compose(
+            stirling_gap_at_second_shape,
             second_shape,
-            ln_gamma_second_shape,
-            digamma_second_shape,
-            trigamma_second_shape,
-            tetragamma_second_shape,
-            pentagamma_second_shape
+            second_shape_gap,
+            second_shape_gap_first,
+            second_shape_gap_second,
+            second_shape_gap_third,
+            second_shape_gap_fourth
         );
-        let normalizer = add(
-            ln_gamma_precision_jet,
-            neg(add(ln_gamma_first_jet, ln_gamma_second_jet))
+        let divergence_jet = compose(
+            divergence_at_mean,
+            mean_jet,
+            divergence,
+            divergence_first,
+            divergence_second,
+            divergence_third,
+            divergence_fourth
         );
-        let response = add(scale(first_shape, log_response), scale(second_shape, log_complement));
-        return add_constant(add(normalizer, response), -(log_response + log_complement));
+        let gaps = add(add(first_gap_jet, second_gap_jet), neg(precision_gap_jet));
+        let density = add(gaps, neg(mul(precision_jet, divergence_jet)));
+        return add_constant(density, -(log_response + log_complement));
     }
 }
 
@@ -1071,14 +1164,15 @@ enum DispersionRowStacks {
     },
     Gamma {
         shape: f64,
-        log_shape_ratio: f64,
-        log_response: f64,
+        response_fit: f64,
+        response_excess: f64,
         response_ratio: f64,
-        ln_gamma_shape: f64,
-        digamma_shape: f64,
-        trigamma_shape: f64,
-        tetragamma_shape: f64,
-        pentagamma_shape: f64,
+        log_response: f64,
+        shape_gap: f64,
+        shape_gap_first: f64,
+        shape_gap_second: f64,
+        shape_gap_third: f64,
+        shape_gap_fourth: f64,
     },
     Beta {
         precision: f64,
@@ -1089,21 +1183,26 @@ enum DispersionRowStacks {
         mean_fourth: f64,
         log_response: f64,
         log_complement: f64,
-        ln_gamma_precision: f64,
-        digamma_precision: f64,
-        trigamma_precision: f64,
-        tetragamma_precision: f64,
-        pentagamma_precision: f64,
-        ln_gamma_first_shape: f64,
-        digamma_first_shape: f64,
-        trigamma_first_shape: f64,
-        tetragamma_first_shape: f64,
-        pentagamma_first_shape: f64,
-        ln_gamma_second_shape: f64,
-        digamma_second_shape: f64,
-        trigamma_second_shape: f64,
-        tetragamma_second_shape: f64,
-        pentagamma_second_shape: f64,
+        divergence: f64,
+        divergence_first: f64,
+        divergence_second: f64,
+        divergence_third: f64,
+        divergence_fourth: f64,
+        precision_gap: f64,
+        precision_gap_first: f64,
+        precision_gap_second: f64,
+        precision_gap_third: f64,
+        precision_gap_fourth: f64,
+        first_shape_gap: f64,
+        first_shape_gap_first: f64,
+        first_shape_gap_second: f64,
+        first_shape_gap_third: f64,
+        first_shape_gap_fourth: f64,
+        second_shape_gap: f64,
+        second_shape_gap_first: f64,
+        second_shape_gap_second: f64,
+        second_shape_gap_third: f64,
+        second_shape_gap_fourth: f64,
     },
     TweediePositive {
         kappa: f64,
@@ -1133,7 +1232,7 @@ enum DispersionRowStacks {
 impl DispersionRowStacks {
     #[inline(always)]
     fn at(kind: DispersionFamilyKind, yi: f64, em: f64, ed: f64, order: usize) -> Self {
-        use gam_math::special::polygamma_stack;
+        use gam_math::special::{polygamma_stack, stirling_gap_derivative_stack};
         match kind {
             DispersionFamilyKind::NegativeBinomial => {
                 let mu = em.exp();
@@ -1148,7 +1247,7 @@ impl DispersionRowStacks {
             }
             DispersionFamilyKind::Gamma => {
                 let nu = ed.exp();
-                Self::gamma(yi, em, ed, nu, polygamma_stack(nu, order))
+                Self::gamma(yi, em.exp(), nu, stirling_gap_derivative_stack(nu, order))
             }
             DispersionFamilyKind::Beta => {
                 let logit = gam_solve::mixture_link::logit_inverse_link_jet5(em);
@@ -1157,9 +1256,9 @@ impl DispersionRowStacks {
                     yi,
                     &logit,
                     phi,
-                    polygamma_stack(phi, order),
-                    polygamma_stack(logit.mu * phi, order),
-                    polygamma_stack((1.0 - logit.mu) * phi, order),
+                    stirling_gap_derivative_stack(phi, order),
+                    stirling_gap_derivative_stack(logit.mu * phi, order),
+                    stirling_gap_derivative_stack((1.0 - logit.mu) * phi, order),
                 )
             }
             DispersionFamilyKind::Tweedie { p } => Self::tweedie(yi, p, em.exp(), ed.exp()),
@@ -1198,25 +1297,27 @@ impl DispersionRowStacks {
         }
     }
 
-    /// `shape` is the polygamma stack at `ν = e^{η_d}`.
+    /// `shape` is the Stirling-gap derivative stack at `ν = e^{η_d}`.
     #[inline(always)]
-    fn gamma(yi: f64, em: f64, ed: f64, nu: f64, shape: [f64; 5]) -> Self {
-        let [digamma_shape, trigamma_shape, tetragamma_shape, pentagamma_shape, _] = shape;
+    fn gamma(yi: f64, mu: f64, nu: f64, shape: [f64; 5]) -> Self {
+        let [shape_gap_first, shape_gap_second, shape_gap_third, shape_gap_fourth, _] = shape;
+        let (ratio, excess) = gamma_response_ratio(yi, mu);
         Self::Gamma {
             shape: nu,
-            log_shape_ratio: ed - em,
-            log_response: yi.ln(),
-            response_ratio: (1.0 / em.exp()) * yi,
-            ln_gamma_shape: 0.0,
-            digamma_shape,
-            trigamma_shape,
-            tetragamma_shape,
-            pentagamma_shape,
+            response_fit: log1p_minus_x(excess),
+            response_excess: excess,
+            response_ratio: ratio,
+            log_response: 0.0,
+            shape_gap: 0.0,
+            shape_gap_first,
+            shape_gap_second,
+            shape_gap_third,
+            shape_gap_fourth,
         }
     }
 
-    /// `precision`, `first_shape` and `second_shape` are the polygamma stacks at
-    /// `φ`, `μφ` and `(1 − μ)φ`.
+    /// `precision`, `first_shape` and `second_shape` are the Stirling-gap
+    /// derivative stacks at `φ`, `μφ` and `(1 − μ)φ`.
     #[inline(always)]
     fn beta(
         yi: f64,
@@ -1226,22 +1327,29 @@ impl DispersionRowStacks {
         first_shape: [f64; 5],
         second_shape: [f64; 5],
     ) -> Self {
-        let [digamma_precision, trigamma_precision, tetragamma_precision, pentagamma_precision, _] =
+        let [precision_gap_first, precision_gap_second, precision_gap_third, precision_gap_fourth, _] =
             precision;
         let [
-            digamma_first_shape,
-            trigamma_first_shape,
-            tetragamma_first_shape,
-            pentagamma_first_shape,
+            first_shape_gap_first,
+            first_shape_gap_second,
+            first_shape_gap_third,
+            first_shape_gap_fourth,
             _,
         ] = first_shape;
         let [
-            digamma_second_shape,
-            trigamma_second_shape,
-            tetragamma_second_shape,
-            pentagamma_second_shape,
+            second_shape_gap_first,
+            second_shape_gap_second,
+            second_shape_gap_third,
+            second_shape_gap_fourth,
             _,
         ] = second_shape;
+        let [
+            divergence,
+            divergence_first,
+            divergence_second,
+            divergence_third,
+            divergence_fourth,
+        ] = beta_divergence_stack(yi, logit.mu, 1.0 - logit.mu);
         Self::Beta {
             precision: phi,
             mean: logit.mu,
@@ -1249,23 +1357,28 @@ impl DispersionRowStacks {
             mean_second: logit.d2,
             mean_third: logit.d3,
             mean_fourth: logit.d4,
-            log_response: yi.ln(),
-            log_complement: (-yi).ln_1p(),
-            ln_gamma_precision: 0.0,
-            digamma_precision,
-            trigamma_precision,
-            tetragamma_precision,
-            pentagamma_precision,
-            ln_gamma_first_shape: 0.0,
-            digamma_first_shape,
-            trigamma_first_shape,
-            tetragamma_first_shape,
-            pentagamma_first_shape,
-            ln_gamma_second_shape: 0.0,
-            digamma_second_shape,
-            trigamma_second_shape,
-            tetragamma_second_shape,
-            pentagamma_second_shape,
+            log_response: 0.0,
+            log_complement: 0.0,
+            divergence,
+            divergence_first,
+            divergence_second,
+            divergence_third,
+            divergence_fourth,
+            precision_gap: 0.0,
+            precision_gap_first,
+            precision_gap_second,
+            precision_gap_third,
+            precision_gap_fourth,
+            first_shape_gap: 0.0,
+            first_shape_gap_first,
+            first_shape_gap_second,
+            first_shape_gap_third,
+            first_shape_gap_fourth,
+            second_shape_gap: 0.0,
+            second_shape_gap_first,
+            second_shape_gap_second,
+            second_shape_gap_third,
+            second_shape_gap_fourth,
         }
     }
 
@@ -1358,26 +1471,28 @@ impl DispersionRowStacks {
             ),
             Self::Gamma {
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
             } => gamma_row_program_order2(
                 0.0,
                 0.0,
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
             ),
             Self::Beta {
                 precision,
@@ -1388,21 +1503,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
             } => beta_row_program_order2(
                 0.0,
                 0.0,
@@ -1414,21 +1534,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
             ),
             Self::TweediePositive {
                 kappa,
@@ -1529,26 +1654,28 @@ impl DispersionRowStacks {
             ),
             Self::Gamma {
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
             } => gamma_row_program_third_contracted(
                 0.0,
                 0.0,
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
                 direction,
             ),
             Self::Beta {
@@ -1560,21 +1687,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
             } => beta_row_program_third_contracted(
                 0.0,
                 0.0,
@@ -1586,21 +1718,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
                 direction,
             ),
             Self::TweediePositive {
@@ -1705,26 +1842,28 @@ impl DispersionRowStacks {
             ),
             Self::Gamma {
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
             } => gamma_row_program_fourth_contracted(
                 0.0,
                 0.0,
                 shape,
-                log_shape_ratio,
-                log_response,
+                response_fit,
+                response_excess,
                 response_ratio,
-                ln_gamma_shape,
-                digamma_shape,
-                trigamma_shape,
-                tetragamma_shape,
-                pentagamma_shape,
+                log_response,
+                shape_gap,
+                shape_gap_first,
+                shape_gap_second,
+                shape_gap_third,
+                shape_gap_fourth,
                 direction_u,
                 direction_v,
             ),
@@ -1737,21 +1876,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
             } => beta_row_program_fourth_contracted(
                 0.0,
                 0.0,
@@ -1763,21 +1907,26 @@ impl DispersionRowStacks {
                 mean_fourth,
                 log_response,
                 log_complement,
-                ln_gamma_precision,
-                digamma_precision,
-                trigamma_precision,
-                tetragamma_precision,
-                pentagamma_precision,
-                ln_gamma_first_shape,
-                digamma_first_shape,
-                trigamma_first_shape,
-                tetragamma_first_shape,
-                pentagamma_first_shape,
-                ln_gamma_second_shape,
-                digamma_second_shape,
-                trigamma_second_shape,
-                tetragamma_second_shape,
-                pentagamma_second_shape,
+                divergence,
+                divergence_first,
+                divergence_second,
+                divergence_third,
+                divergence_fourth,
+                precision_gap,
+                precision_gap_first,
+                precision_gap_second,
+                precision_gap_third,
+                precision_gap_fourth,
+                first_shape_gap,
+                first_shape_gap_first,
+                first_shape_gap_second,
+                first_shape_gap_third,
+                first_shape_gap_fourth,
+                second_shape_gap,
+                second_shape_gap_first,
+                second_shape_gap_second,
+                second_shape_gap_third,
+                second_shape_gap_fourth,
                 direction_u,
                 direction_v,
             ),
@@ -2083,15 +2232,17 @@ pub(super) fn dispersion_row_kernel(
         DispersionFamilyKind::Gamma => {
             let mu = em.exp();
             let nu = ed.exp(); // precision = shape ν
-            let loglik = dispersion_gamma_loglik(yi, yi, mu, nu, wi);
-            // The shape information −ℓ_νν = ψ′(ν) − 1/ν is positive for ν > 0 and
-            // free of y, so it is the Fisher information too; the mean channel's
-            // is ν. The scores are the row program's gradient in (η_μ, η_d).
-            // One stack at ν carries the score's ψ and the information's ψ′.
-            let nu_stack = gam_math::special::polygamma_stack(nu, 2);
+            let loglik = dispersion_gamma_loglik(yi, mu, nu, wi);
+            // The shape information −ℓ_νν = ψ′(ν) − 1/ν = −g″(ν) is positive for
+            // ν > 0 and free of y, so it is the Fisher information too; the mean
+            // channel's is ν. The scores are the row program's gradient in
+            // (η_μ, η_d). One Stirling-gap stack at ν carries the score's g′ and
+            // the information's g″, each correct to a few ulps relative where
+            // ψ′(ν) − 1/ν would cancel to nothing at large ν (#4252).
+            let nu_stack = gam_math::special::stirling_gap_derivative_stack(nu, 2);
             let [score_mu, score_eta] =
-                DispersionRowStacks::gamma(yi, em, ed, nu, nu_stack).order2().1;
-            let info_nu = nu_stack[1] - nu.recip();
+                DispersionRowStacks::gamma(yi, mu, nu, nu_stack).order2().1;
+            let info_nu = -nu_stack[1];
             let mean_weight = wi * nu;
             let mean_response = em + score_mu / nu;
             let disp_weight = wi * nu * nu * info_nu;
@@ -2116,22 +2267,29 @@ pub(super) fn dispersion_row_kernel(
             let b = one_minus_mu * phi;
             // Fisher information of Beta(a, b) with a = μφ and b = (1 − μ)φ:
             //   I_μμ = φ² (ψ′(a) + ψ′(b)),  I_φφ = μ² ψ′(a) + (1 − μ)² ψ′(b) − ψ′(φ),
-            // carried into (η_μ, η_d) by dμ/dη_μ = q and dφ/dη_d = φ. The scores
-            // are the row program's gradient in (η_μ, η_d).
-            // One stack at each of φ, a and b carries the score's ψ and the
-            // information's ψ′.
-            let phi_stack = gam_math::special::polygamma_stack(phi, 2);
-            let a_stack = gam_math::special::polygamma_stack(a, 2);
-            let b_stack = gam_math::special::polygamma_stack(b, 2);
+            // carried into (η_μ, η_d) by dμ/dη_μ = q and dφ/dη_d = φ. With
+            // ψ′(x) = 1/x − g″(x) for the Stirling gap g, and μ²/a + (1 − μ)²/b
+            // = 1/φ,
+            //   I_μμ = φ² (1/a + 1/b − g″(a) − g″(b)),
+            //   I_φφ = −(μ² g″(a) + (1 − μ)² g″(b) − g″(φ)),
+            // so the O(1/φ) parts of I_φφ cancel analytically rather than in
+            // floating point, leaving its O(1/φ²) value to a few ulps (#4252).
+            // The scores are the row program's gradient in (η_μ, η_d). One stack
+            // at each of φ, a and b carries the score's g′ and the information's
+            // g″.
+            let phi_stack = gam_math::special::stirling_gap_derivative_stack(phi, 2);
+            let a_stack = gam_math::special::stirling_gap_derivative_stack(a, 2);
+            let b_stack = gam_math::special::stirling_gap_derivative_stack(b, 2);
             let [score_mu, score_eta] =
                 DispersionRowStacks::beta(yi, &logit, phi, phi_stack, a_stack, b_stack)
                     .order2()
                     .1;
-            let tri_a = a_stack[1];
-            let tri_b = b_stack[1];
-            let tri_phi = phi_stack[1];
-            let info_mu = phi * phi * (tri_a + tri_b);
-            let info_phi = mu * mu * tri_a + one_minus_mu * one_minus_mu * tri_b - tri_phi;
+            let curvature_a = a_stack[1];
+            let curvature_b = b_stack[1];
+            let curvature_phi = phi_stack[1];
+            let info_mu = phi * phi * (a.recip() + b.recip() - curvature_a - curvature_b);
+            let info_phi = -(mu * mu * curvature_a + one_minus_mu * one_minus_mu * curvature_b
+                - curvature_phi);
             let mean_weight = wi * q * q * info_mu;
             let mean_response = em + score_mu / (q * q * info_mu);
             let disp_weight = wi * phi * phi * info_phi;
@@ -3738,11 +3896,10 @@ mod tests {
             (3.0, 4.0, 0.9),
             (1.0, 0.3, 6.0),
         ] {
-            let y_pos = yi.max(1e-300);
             check_o2_vs_tower4(
                 "gamma",
-                dispersion_gamma_nll_order2(yi, y_pos, mu, nu, wi),
-                test_support::dispersion_gamma_nll_generic::<Tower4<2>>(yi, y_pos, mu, nu, wi),
+                dispersion_gamma_nll_order2(yi, mu, nu, wi),
+                test_support::dispersion_gamma_nll_generic::<Tower4<2>>(yi, mu, nu, wi),
             );
         }
         // Beta: (μ, φ).
@@ -3814,14 +3971,13 @@ mod tests {
                 let mu = (0.05 + 4.0 * next()).max(1e-300);
                 let nu = (0.05 + 6.0 * next()).max(1e-12);
                 let yi = 0.01 + 8.0 * next();
-                let y_pos = yi.max(1e-300);
-                let full = dispersion_gamma_nll_order2(yi, y_pos, mu, nu, wi);
-                let prn = dispersion_gamma_disp_order2(yi, y_pos, mu, nu, wi);
+                let full = dispersion_gamma_nll_order2(yi, mu, nu, wi);
+                let prn = dispersion_gamma_disp_order2(yi, mu, nu, wi);
                 assert_eq!(bits(full.value()), bits(prn.value()), "gamma value");
                 assert_eq!(bits(full.g()[1]), bits(prn.g()[0]), "gamma grad");
                 assert_eq!(bits(full.h()[1][1]), bits(prn.h()[0][0]), "gamma hess");
                 assert_eq!(
-                    bits(dispersion_gamma_loglik(yi, y_pos, mu, nu, wi)),
+                    bits(dispersion_gamma_loglik(yi, mu, nu, wi)),
                     bits(-prn.value()),
                     "gamma value-only"
                 );
@@ -4096,7 +4252,7 @@ mod tests {
             let yi = 0.01 + 8.0 * next();
             let row = dispersion_row_kernel(DispersionFamilyKind::Gamma, yi, em, ed, wi);
             let (mu, nu) = (em.exp(), ed.exp());
-            let tower = dispersion_gamma_disp_order2(yi, yi, mu, nu, wi);
+            let tower = dispersion_gamma_disp_order2(yi, mu, nu, wi);
             let s_nu = -tower.g()[0] / wi;
             let info_nu = tower.h()[0][0] / wi;
             close("gamma loglik", row.loglik, -tower.value());
