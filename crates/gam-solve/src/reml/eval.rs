@@ -204,19 +204,22 @@ impl<'a> RemlState<'a> {
         &self,
         rho: &Array1<f64>,
     ) -> Result<Array2<f64>, EstimationError> {
-        if self.block_correction_latched() {
-            crate::bail_invalid_estim!(
-                "{}",
-                crate::estimate::smoothing_correction::BLOCK_CORRECTION_OUTER_HESSIAN_NOT_ANALYTIC
-            );
-        }
         let bundle = self.obtain_eval_bundle(rho)?;
         let decision = self.selecthessian_strategy_policy(&bundle);
-        match decision.strategy {
+        let hessian = match decision.strategy {
             super::inner_strategy::HessianEvalStrategyKind::SpectralExact => {
                 self.compute_lamlhessian_exact_from_bundle(rho, &bundle)
             }
+        };
+        // Read after the evaluation: a first evaluation is what latches the
+        // #784 block, and with it whether `Δ_b` has a closed-form ρ-Hessian.
+        if let Some(reason) = self.block_correction_hessian_refusal() {
+            crate::bail_invalid_estim!(
+                "the latched #784 block-local correction's outer rho-Hessian does not exist \
+                 here: {reason}"
+            );
         }
+        hessian
     }
 
     /// Tier-0 of the marginal-smoothing inference stack (#938): the PSIS
