@@ -31,8 +31,9 @@ pub struct BlockChartComposeConfig {
 
 /// Declared target FDR level `α` for the genuine universal-inference split-LR
 /// e-value + full-family e-BH discovery certificate (#2246). Distinct from the
-/// descriptive `selected_by_bic` gate: the screened family FEEDS e-BH at this
-/// level, and [`BlockChartComposeResult::fdr_selected_chart_blocks`] /
+/// descriptive `selected_by_bic` gate: the screened candidates' e-values enter
+/// e-BH over the whole candidate universe at this level (#3510), and
+/// [`BlockChartComposeResult::fdr_selected_chart_blocks`] /
 /// `fdr_selected_chart_pairs` are the candidates confirmed at FDR ≤ `α`. A
 /// module constant (not a `BlockChartComposeConfig` field) so the honest
 /// discovery certificate is always emitted without churning every caller's
@@ -95,8 +96,9 @@ pub struct ChartEvidence {
     /// for a candidate too degenerate to support a curved claim. See
     /// [`super::shell_vs_ring_log_evalue`].
     pub log_e: f64,
-    /// Whether the full-family e-BH over every screened candidate's `log_e`
-    /// confirmed THIS candidate as genuine curved structure at the configured
+    /// Whether the full-family e-BH over the candidate universe (the screened
+    /// candidates' `log_e`, every unscreened candidate banking zero) confirmed
+    /// THIS candidate as genuine curved structure at the configured
     /// `fdr_alpha`. Set by [`compose_block_coordinate_charts`] after the family
     /// is assembled; `false` in a standalone [`ChartEvidence`].
     pub fdr_selected: bool,
@@ -120,6 +122,11 @@ pub struct BlockChartComposeResult {
     pub selected_chart_pairs: Vec<(usize, usize)>,
     /// Declared FDR level `α` the discovery certificate below controls at.
     pub fdr_alpha: f64,
+    /// Size `m` of the e-BH family the certificate controls over: every block
+    /// plus, when the pair screen is on, every block pair. The screens choose
+    /// from this universe on the same rows the e-values use, so the family is
+    /// the universe, never the screened subset (#3510).
+    pub fdr_family_size: usize,
     /// Single blocks whose curved chart the full-family e-BH confirms as genuine
     /// structure at FDR ≤ `fdr_alpha` (#2246). This is the honest discovery list;
     /// `selected_chart_blocks` above is the descriptive BIC gate for comparison.
@@ -335,17 +342,26 @@ pub fn compose_block_coordinate_charts(
         }
     }
 
-    // Genuine FDR-controlled discovery (#2246): the screened family — EVERY
-    // single and pair the energy/score screen surfaced — feeds one full-family
-    // e-BH over the universal-inference split-LR log-e-values. The screen feeds
-    // the family, it does NOT gate it: running e-BH over only the BIC-selected
-    // subset would redefine the family post hoc and void the guarantee. Order is
-    // singles first, then pairs, so a rejected index < singles.len() is a single.
+    // Genuine FDR-controlled discovery (#2246): EVERY single and pair the
+    // energy/score screen surfaced contributes its universal-inference split-LR
+    // log-e-value to one e-BH over the candidate UNIVERSE (#3510). The screens
+    // pick candidates by energy and ring shape on the same rows the e-values are
+    // computed on, so the screened set is chosen by the data; e-BH at
+    // m = |screened| would have no FDR guarantee. Every candidate the screens
+    // drop banks the exact zero e-value (`E_i·1{S_i}` is still an e-value), so
+    // the family is fixed before the data are seen. Order is singles first, then
+    // pairs, so a rejected index < singles.len() is a single.
+    let fdr_family_size =
+        chart_fdr_family_size(decoder.nrows() / config.block_size, config.pair_screen)?;
     let mut family_log_e: Vec<f64> = Vec::with_capacity(singles.len() + pairs.len());
     family_log_e.extend(singles.iter().map(|c| c.evidence.log_e));
     family_log_e.extend(pairs.iter().map(|c| c.evidence.log_e));
-    let fdr = super::split_lr_fdr::family_fdr_certificate(family_log_e, CHART_FDR_ALPHA)
-        .map_err(|error| format!("block chart e-BH certificate: {error}"))?;
+    let fdr = super::split_lr_fdr::family_fdr_certificate(
+        family_log_e,
+        fdr_family_size,
+        CHART_FDR_ALPHA,
+    )
+    .map_err(|error| format!("block chart e-BH certificate: {error}"))?;
     for &idx in &fdr.rejected {
         if idx < singles.len() {
             singles[idx].evidence.fdr_selected = true;
@@ -400,6 +416,7 @@ pub fn compose_block_coordinate_charts(
         selected_chart_blocks,
         selected_chart_pairs,
         fdr_alpha: CHART_FDR_ALPHA,
+        fdr_family_size,
         fdr_selected_chart_blocks,
         fdr_selected_chart_pairs,
     })
@@ -657,6 +674,27 @@ fn matched_dl_for_block(
         ev,
     );
     (flat, chart)
+}
+
+/// Size of the e-BH family [`compose_block_coordinate_charts`] certifies over:
+/// the universe its screens choose from, `n_blocks` single blocks plus
+/// `n_blocks·(n_blocks−1)/2` block pairs when the pair screen is on. It depends
+/// only on the dictionary shape and the config, never on the rows, which is what
+/// keeps the data-dependent screens from voiding the FDR guarantee (#3510).
+fn chart_fdr_family_size(n_blocks: usize, pair_screen: bool) -> Result<usize, String> {
+    if !pair_screen {
+        return Ok(n_blocks);
+    }
+    n_blocks
+        .checked_mul(n_blocks.saturating_sub(1))
+        .map(|twice_pairs| twice_pairs / 2)
+        .and_then(|pairs| pairs.checked_add(n_blocks))
+        .ok_or_else(|| {
+            format!(
+                "block chart compose: the e-BH family of {n_blocks} blocks and their pairs \
+                 does not fit in usize"
+            )
+        })
 }
 
 fn validate_inputs(
@@ -1291,6 +1329,81 @@ mod tests {
             z[[i, 1]] = (r * theta.sin()) as f32;
         }
         z
+    }
+
+    #[test]
+    fn chart_fdr_family_size_counts_the_screen_universe() {
+        assert_eq!(chart_fdr_family_size(5, false).unwrap(), 5);
+        assert_eq!(chart_fdr_family_size(5, true).unwrap(), 5 + 10);
+        assert_eq!(chart_fdr_family_size(1, true).unwrap(), 1);
+        assert!(chart_fdr_family_size(usize::MAX, true).is_err());
+    }
+
+    /// The certificate is over the universe, not the screened subset (#3510).
+    /// Four blocks exist but only blocks 0 and 1 fire, so the screens keep two
+    /// singles and one pair (m = 3 if the family were the screened set). The
+    /// family must be all 4 blocks plus all 6 pairs, and every discovery must
+    /// clear the e-BH bar at that m.
+    #[test]
+    fn chart_fdr_family_is_the_universe_not_the_screened_set() {
+        let n = 96usize;
+        let mut x = Array2::<f32>::zeros((n, 2));
+        let mut blocks = Array2::<u32>::zeros((n, 2));
+        let mut codes = ndarray::Array3::<f32>::zeros((n, 2, 1));
+        for i in 0..n {
+            let theta = i as f32 * std::f32::consts::TAU / n as f32;
+            x[[i, 0]] = theta.cos();
+            x[[i, 1]] = theta.sin();
+            blocks[[i, 0]] = 0;
+            blocks[[i, 1]] = 1;
+            codes[[i, 0, 0]] = x[[i, 0]];
+            codes[[i, 1, 0]] = x[[i, 1]];
+        }
+        let decoder = ndarray::arr2(&[[1.0f32, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]]);
+        let config = BlockChartComposeConfig {
+            block_size: 1,
+            block_topk: 2,
+            gamma: 1.0,
+            residual_target: false,
+            min_firings: 8,
+            max_blocks: 4,
+            crossfit_folds: 4,
+            min_effect: 0.0,
+            whitening_ridge: 1.0e-8,
+            pair_screen: true,
+            pair_top_blocks: 4,
+            max_pairs: 6,
+            pair_min_cofirings: 8,
+            pair_min_score: 0.0,
+            block_tile: 2,
+        };
+        let result = compose_block_coordinate_charts(
+            x.view(),
+            decoder.view(),
+            blocks.view(),
+            codes.view(),
+            &config,
+        )
+        .expect("compose charts");
+        assert_eq!(result.block_records.len(), 2, "only the firing blocks are screened in");
+        assert_eq!(result.pair_records.len(), 1, "only the co-firing pair is screened in");
+        assert_eq!(result.fdr_family_size, 4 + 6);
+        let discoveries: Vec<&BlockChartRecord> = result
+            .block_records
+            .iter()
+            .chain(result.pair_records.iter())
+            .filter(|r| r.evidence.fdr_selected)
+            .collect();
+        let m = result.fdr_family_size as f64;
+        for record in &discoveries {
+            // Every rejection has e ≥ e_(R) ≥ m / (α·R), R = number of rejections.
+            let bar = (m / (result.fdr_alpha * discoveries.len() as f64)).ln();
+            assert!(
+                record.evidence.log_e >= bar,
+                "discovery log_e {} is below the universe e-BH bar {bar}",
+                record.evidence.log_e
+            );
+        }
     }
 
     #[test]
