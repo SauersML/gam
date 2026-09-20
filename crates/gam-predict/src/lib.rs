@@ -3884,12 +3884,12 @@ mod tests {
     }
 
     /// V∞ §5 fusion point: a supplied per-row `extrapolation_variance` is
-    /// ADDED to Var(η_i) after the multiplicative inflations, so
-    /// `eta_standard_error` (and the mean-scale SE, which reads the same
-    /// fused `etavar`) widens exactly by the additive term — and a
-    /// batch-length mismatch is a hard error, never a silent truncation.
+    /// ADDED to Var(η_i), so `eta_standard_error` (and the mean-scale SE,
+    /// which reads the same fused `etavar`) widens exactly by the additive
+    /// term — and a batch-length mismatch is a hard error, never a silent
+    /// truncation.
     #[test]
-    fn extrapolation_variance_adds_to_eta_variance_after_inflations() {
+    fn extrapolation_variance_adds_to_eta_variance() {
         let x = array![[1.0], [1.0]];
         let beta = array![0.5];
         let offset = array![0.0, 0.0];
