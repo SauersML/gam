@@ -7021,13 +7021,10 @@ fn spatial_kappa_incumbent(
     //
     // So: κ free ⇒ both coordinates from the profile. κ pinned, range free ⇒ the
     // range alone, at that κ, from the SAME inner solve. Range pinned ⇒ neither.
-    // The pinned-κ arm is skipped rather than refused when the profile's
-    // preconditions do not hold (Gaussian identity, unit weights, and — since
-    // the profile's design is `[1 | curv block]` alone — a model that is
-    // exactly `y ~ curv(...)`, gam#3763): the range is a
-    // nuisance coordinate there and the auto `ℓ_ref` is a valid fallback, while
-    // for a free κ the profile IS the estimand and there is nothing to fall back
-    // to.
+    // A free range is also a requested profile coordinate. If the profile's
+    // criterion cannot represent this model, refuse it for pinned κ as well;
+    // retaining an automatic range would silently replace the requested fit.
+    // Pin both kappa= and length_scale= to use fixed geometry in such a model.
     let free_curvature_terms: Vec<usize> = constant_curvature_term_indices(&resolvedspec)
         .into_iter()
         .filter(|&term_idx| !constant_curvature_kappa_is_fixed(&resolvedspec, term_idx))
@@ -7049,19 +7046,15 @@ fn spatial_kappa_incumbent(
             &family,
         )?;
     }
-    let pinned_kappa_free_range_terms: Vec<usize> = pinned_kappa_free_range_terms
-        .into_iter()
-        .filter(|&term_idx| {
-            validate_constant_curvature_profile_inputs(
-                &resolvedspec,
-                term_idx,
-                weights.view(),
-                offset.view(),
-                &family,
-            )
-            .is_ok()
-        })
-        .collect();
+    for &term_idx in &pinned_kappa_free_range_terms {
+        validate_constant_curvature_profile_inputs(
+            &resolvedspec,
+            term_idx,
+            weights.view(),
+            offset.view(),
+            &family,
+        )?;
+    }
     for term_idx in pinned_kappa_free_range_terms {
         let length_scale_hat =
             constant_curvature_range_only_optimum(data, y.view(), &resolvedspec, term_idx)?;

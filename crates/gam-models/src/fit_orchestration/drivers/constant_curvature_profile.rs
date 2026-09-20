@@ -1016,3 +1016,31 @@ fn solve_constant_curvature_kappa_profile(
         length_scale: length_scale_hat,
     })
 }
+
+#[cfg(test)]
+mod profile_model_contract_tests {
+    use super::*;
+    use crate::fit_orchestration::{FitConfig,FitRequest,materialize};
+
+    #[test]
+    fn curvature_and_range_profiles_require_the_actual_model() {
+        let headers=["x","z","y"].into_iter().map(String::from).collect();
+        let rows=(0..80).map(|i| {
+            let x=0.25*(i as f64*0.71).sin();
+            let z=0.25*(i as f64*0.53).cos();
+            csv::StringRecord::from(vec![x.to_string(),z.to_string(),(x*z+0.1*z).to_string()])
+        }).collect();
+        let data=gam_data::encode_recordswith_inferred_schema(headers,rows).unwrap();
+        let config=FitConfig {family:Some("gaussian".into()),..FitConfig::default()};
+        for (formula,accepted) in [
+            ("y ~ curv(x, z, centers=20)",true),
+            ("y ~ x + curv(x, z, centers=20)",false),
+            ("y ~ x + curv(x, z, kappa=1, centers=20)",false),
+            ("y ~ 0 + curv(x, z, kappa=1, centers=20)",false),
+        ] {
+            let FitRequest::Standard(request)=materialize(formula,&data,&config).unwrap().request else {panic!("standard request")};
+            let verdict=validate_constant_curvature_profile_inputs(&request.spec,0,request.weights.view(),request.offset.view(),&request.family);
+            if accepted {verdict.unwrap();} else {assert!(verdict.unwrap_err().to_string().contains("exactly `y ~ curv(...)`"),"{formula}");}
+        }
+    }
+}
