@@ -3384,7 +3384,8 @@ impl SaeManifoldTerm {
             )?;
             let step_coord_len = arrow_row_offsets[n];
 
-            let base_objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
+            let base = self.penalized_objective_banded(target, rho, registry, 1.0)?;
+            let base_objective = base.value;
             if outcome.entry_objective.is_none() {
                 outcome.entry_objective = Some(base_objective);
             }
@@ -3404,7 +3405,7 @@ impl SaeManifoldTerm {
                 registry,
                 step_direction.view(),
                 step_coord_len,
-                base_objective,
+                base,
                 slope,
                 0.0,
                 material_floor,
