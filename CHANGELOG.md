@@ -1,5 +1,18 @@
 ## Unreleased
 
+- **The binomial location-scale log-σ has no level; `noise_formula="1"` is refused for
+  binomial** (#3879). The likelihood reads the threshold and log-σ only through
+  `q = −η_t·e^{−η_σ}`, so `(β_t, b_0) ↦ (c·β_t, b_0 + ln c)` changes nothing: the log-σ
+  level is not a parameter. It was closed by an identity ridge on every log-σ
+  coefficient, whose strength depends on each covariate's units, so a fit with `x` and
+  with `1000·x` disagreed. The log-σ design is now built without an intercept (σ = 1
+  where every log-σ covariate is zero, the heteroskedastic probit/logit normalization)
+  and carries only its formula penalties, so rescaling a scale covariate is an exact
+  reparametrization. The saved model stores this, and prediction rebuilds the same
+  design. An intercept-only binomial `noise_formula` has nothing left to fit and is
+  refused; fit the plain binomial model instead. Shifting a scale covariate moves the
+  σ = 1 reference, so it is a different model.
+
 - **The curved-dictionary "global optimality" verdict is removed** (#2946 census T1).
   `GlobalOptimalityVerdict::CertifiedGlobal` claimed a unique global optimum from
   `μ̂ ≤ c₀·a²·(1−1/SNR)·(1−C_κκ)/K`, with the chosen constants `c₀ = 1` and
