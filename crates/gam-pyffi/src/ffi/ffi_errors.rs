@@ -494,6 +494,9 @@ fn estimation_error_to_pyerr_with_message(err: &EstimationError, message: String
         EstimationError::PrefitLinearSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
+        EstimationError::PrefitLatentScoreSeparationDetected { .. } => {
+            PerfectSeparationError::new_err(message)
+        }
         EstimationError::MultinomialSeparationDetected { .. } => {
             PerfectSeparationError::new_err(message)
         }
@@ -786,16 +789,19 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, PredictError> + Send + 'static,
 {
-    match detach_catching(py, f) {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(PredictError::SchemaMismatch(message))) => {
-            Err(SchemaMismatchError::new_err(message))
+    detach_typed_py_result(py, context, f, |_, err| predict_error_to_pyerr(err))
+}
+
+/// The typed Python exception for a [`PredictError`]: `SchemaMismatch` →
+/// `SchemaMismatchError`, `Input` → `PredictInputError`, everything else →
+/// `PredictionError`.
+pub(crate) fn predict_error_to_pyerr(err: PredictError) -> PyErr {
+    match err {
+        PredictError::SchemaMismatch(message) => SchemaMismatchError::new_err(message),
+        PredictError::Input(error) => {
+            PredictInputError::new_err(message_with_advice(&error, error.advice()))
         }
-        Ok(Err(PredictError::Input(error))) => Err(PredictInputError::new_err(
-            message_with_advice(&error, error.advice()),
-        )),
-        Ok(Err(PredictError::Other(message))) => Err(PredictionError::new_err(message)),
-        Err(payload) => Err(py_panic_error(context, payload)),
+        PredictError::Other(message) => PredictionError::new_err(message),
     }
 }
 
