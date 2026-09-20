@@ -654,10 +654,14 @@ pub fn channel_aware_audit_at_operating_scalars(
 /// The bare data Gram is recovered when no block is penalised (or the block
 /// layout does not tile the columns), so unpenalised channel-aware fits are
 /// unaffected.
-fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlock]) -> usize {
+fn audit_convention_rank(
+    j: &Array2<f64>,
+    nk_scale: usize,
+    blocks: &[FlatRankBlock],
+) -> Result<usize, CustomFamilyError> {
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
-        return 0;
+        return Ok(0);
     }
     // G = JᵀJ (p × p), symmetric PSD — same Gram the audit eigendecomposes.
     let mut gram = fast_ata(j);
@@ -694,10 +698,18 @@ fn audit_convention_rank(j: &Array2<f64>, nk_scale: usize, blocks: &[FlatRankBlo
     // eigenvalue cutoff `λ > scale·64·n·ε` was ~ε larger than `count_rank`'s
     // σ-space `rank_alpha·ε·n·σ_max` floor and demoted penalty-covered modes whose
     // `λ` sits between `ε²λ_max` and `ε·λ_max` (Gaussian survival location-scale:
-    // 16 vs p_red 18). On eigendecomposition failure fall back to the structural
-    // column count (no demotion), so a numerical hiccup never becomes a spurious
-    // violation.
-    rank_of_gram(&gram, nk_scale.saturating_add(n_penalty_rows)).unwrap_or(p)
+    // 16 vs p_red 18). A failed eigendecomposition is refused, not read as full
+    // rank: substituting the column count would certify the invariant unverified
+    // when both sides fail, and report a spurious T-construction violation when
+    // only one side does.
+    rank_of_gram(&gram, nk_scale.saturating_add(n_penalty_rows)).map_err(|error| {
+        CustomFamilyError::NumericalFailure {
+            reason: format!(
+                "canonicalize_for_identifiability: the post-T rank certificate could not rank \
+                 the penalty-augmented joint Gram ({p} columns): {error}"
+            ),
+        }
+    })
 }
 
 /// Per-block descriptor for the penalty-augmented priority-tiered rank: the
@@ -739,19 +751,27 @@ struct FlatRankBlock {
 /// column-selection `T` (which removes exactly the audit-demoted columns) leaves
 /// the kept columns independent under this metric, while a defective `T` that
 /// drops a column the audit kept makes `J_can` rank-deficient and is caught.
-fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usize {
+fn flat_audit_convention_rank(
+    j: &Array2<f64>,
+    blocks: &[FlatRankBlock],
+) -> Result<usize, CustomFamilyError> {
     let p = j.ncols();
     if p == 0 || j.nrows() == 0 {
-        return 0;
+        return Ok(0);
     }
     // Sum of declared block widths must cover the design columns; if the layout
-    // is inconsistent, fall back to the bare RRQR rank (no spurious demotion).
+    // is inconsistent, fall back to the bare RRQR rank (no spurious demotion). A
+    // failed factorization is refused, never read as full rank.
     let declared: usize = blocks.iter().map(|b| b.width).sum();
     if declared != p {
-        return match rrqr_with_permutation(j, default_rrqr_rank_alpha()) {
-            Ok(rrqr) => rrqr.rank,
-            Err(_) => p,
-        };
+        return rrqr_with_permutation(j, default_rrqr_rank_alpha())
+            .map(|rrqr| rrqr.rank)
+            .map_err(|error| CustomFamilyError::NumericalFailure {
+                reason: format!(
+                    "canonicalize_for_identifiability: the post-T rank certificate could not \
+                     rank the joint design ({p} columns): {error}"
+                ),
+            });
     }
 
     // Gram G = JᵀJ (p × p), the same column inner products the audit's
@@ -785,7 +805,7 @@ fn flat_audit_convention_rank(j: &Array2<f64>, blocks: &[FlatRankBlock]) -> usiz
     let m_rows = j.nrows() + n_penalty_rows;
     let tiered =
         priority_tiered_rank_from_gram(&gram, &col_priority, m_rows, default_rrqr_rank_alpha());
-    tiered.rank
+    Ok(tiered.rank)
 }
 
 fn canonicalize_for_identifiability_inner(
@@ -1577,9 +1597,9 @@ fn canonicalize_for_identifiability_inner(
                 })
                 .collect();
             let rank_j_can = if use_channel_aware {
-                audit_convention_rank(&j_can, nk_scale, &flat_blocks_can)
+                audit_convention_rank(&j_can, nk_scale, &flat_blocks_can)?
             } else {
-                flat_audit_convention_rank(&j_can, &flat_blocks_can)
+                flat_audit_convention_rank(&j_can, &flat_blocks_can)?
             };
 
             // Same convention applied to the FULL pre-reduction design `J_pre`,
@@ -1608,9 +1628,9 @@ fn canonicalize_for_identifiability_inner(
                 })
                 .collect();
             let rank_j_pre = if use_channel_aware {
-                audit_convention_rank(&j_pre, nk_scale, &flat_blocks_pre)
+                audit_convention_rank(&j_pre, nk_scale, &flat_blocks_pre)?
             } else {
-                flat_audit_convention_rank(&j_pre, &flat_blocks_pre)
+                flat_audit_convention_rank(&j_pre, &flat_blocks_pre)?
             };
             // The achievable target: a faithful `T` leaves `J_can` at the FULL
             // design's rank when the design is over-determined (`rank_j_pre ==
@@ -2234,7 +2254,7 @@ mod tests {
 
         // The single joint eigendecomposition counts the near-separable column:
         // J_pre is full rank under `audit_convention_rank`.
-        let rank_pre = audit_convention_rank(&j_pre, nk_scale, &[]);
+        let rank_pre = audit_convention_rank(&j_pre, nk_scale, &[]).expect("rank certificate");
         assert_eq!(
             rank_pre, p_total,
             "fixture must make the joint eigendecomposition count the near-separable \
@@ -2252,7 +2272,7 @@ mod tests {
             }
         }
 
-        let rank_can = audit_convention_rank(&j_can, nk_scale, &[]);
+        let rank_can = audit_convention_rank(&j_can, nk_scale, &[]).expect("rank certificate");
 
         // OLD compare (full J_pre vs reduced J_can) WOULD have tripped: the joint
         // eigendecomposition over-counts J_pre relative to the reduced design.
@@ -2344,7 +2364,7 @@ mod tests {
             },
         ];
 
-        let rank_can = flat_audit_convention_rank(&j_can, &blocks_can);
+        let rank_can = flat_audit_convention_rank(&j_can, &blocks_can).expect("rank certificate");
         assert_eq!(
             rank_can, p_red,
             "reduced J_can must be full rank ({rank_can} != p_red {p_red}) under the \
@@ -2412,7 +2432,7 @@ mod tests {
                 priority: 100,
             },
         ];
-        let rank_j_pre = flat_audit_convention_rank(&j_pre, &blocks_pre);
+        let rank_j_pre = flat_audit_convention_rank(&j_pre, &blocks_pre).expect("rank certificate");
         assert!(
             rank_j_pre < p_total_raw,
             "fixture must be under-determined: rank(J_pre)={rank_j_pre} must be < \
@@ -2434,7 +2454,7 @@ mod tests {
             structural_penalty: None,
             priority: 100,
         }];
-        let rank_j_can = flat_audit_convention_rank(&j_can, &blocks_can);
+        let rank_j_can = flat_audit_convention_rank(&j_can, &blocks_can).expect("rank certificate");
 
         // (a) The OLD strict invariant `rank(J_can) == p_total_red` WOULD have
         // tripped: the reduced design is row-capped below its column count.
