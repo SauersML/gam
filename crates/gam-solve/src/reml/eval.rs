@@ -242,7 +242,9 @@ impl<'a> RemlState<'a> {
     /// inner solve) near `ρ̂` plus a fresh ρ-Hessian, `M` the 2155 draws at
     /// which PSIS is reliable for a tail shape at the escalation cutoff; the
     /// returned fit does not need it, so the caller runs it only when
-    /// ρ-posterior inference was requested. When the diagnostic grades the
+    /// ρ-posterior inference was requested (`skip_rho_posterior_inference =
+    /// false`, #3010); a default fit publishes `NotComputed(InferenceNotRequested)`
+    /// and never evaluates the criterion here. When the diagnostic grades the
     /// plug-in [`Escalate`], the tiers (#938) run HERE, against the same live objective — Tier 1
     /// quadrature or Tier 2 NUTS with the exact LAML `ρ`-gradient
     /// (`Self::compute_gradient`), whichever needs fewer criterion evaluations,
@@ -254,12 +256,24 @@ impl<'a> RemlState<'a> {
     ///
     /// `continuation` carries the box the outer arm searched and certified
     /// against (the #2812 resolvability domain). That box is a numerical device,
-    /// not the support of `π(ρ|y)`: a draw outside it is still a model, the one
-    /// its saturated terms' limit fits give, and carries its mass. Such a draw
-    /// is valued by the criterion's affine continuation from the face
-    /// ([`CriterionContinuation`]), so the inner solve is only ever asked for
-    /// `ρ` inside the box, where P-IRLS has a resolvable minimum to report. A
-    /// draw past a literal face, or one the criterion cannot value, refuses the
+    /// not the support of `π(ρ|y)`: a draw past a saturated face is still a
+    /// model, the one its saturated terms' limit fits give, and carries its
+    /// mass. Such a draw is valued by the criterion's affine continuation from
+    /// the face ([`CriterionContinuation`]), so the inner solve is only ever
+    /// asked for `ρ` inside the box, where P-IRLS has a resolvable minimum to
+    /// report. Past a literal face the criterion has no value (past the
+    /// representable log-strength cut `ρ` is not a model; past the precision
+    /// box of a term without penalty geometry it is not computed), so the
+    /// Tier-0 proposal is truncated there, its target is `π(ρ|y)` restricted
+    /// to that support, and no draw reaches one.
+    ///
+    /// `railed_rho` names the coordinates the certificate railed. The Tier-0
+    /// proposal holds them, and every coordinate with `ρ̂` on a face of the box,
+    /// at `ρ̂`: that is the face-reduced model, and a railed coordinate's
+    /// Laplace proposal is near-flat, so drawing it would spread the proposal
+    /// hundreds of log-units along a direction the criterion no longer
+    /// resolves. The rest are drawn from the Laplace approximation conditioned
+    /// on them (#3010). A draw the criterion cannot value refuses the
     /// diagnostic (or fails the escalation tier) with its reason; no draw is
     /// dropped.
     ///
@@ -268,6 +282,7 @@ impl<'a> RemlState<'a> {
         &self,
         final_rho: &Array1<f64>,
         continuation: &crate::estimate::rho_domain::CriterionContinuation,
+        railed_rho: &[usize],
     ) -> (
         gam_problem::rho_posterior::RhoPosteriorOutcome,
         Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
@@ -320,6 +335,8 @@ impl<'a> RemlState<'a> {
         let outcome = match escalator.rho_posterior_adequacy(
             final_rho,
             &outer_hessian,
+            &continuation.posterior_support(),
+            &continuation.held_at(final_rho, railed_rho),
             &|rho| continuation.value(rho, cost, cost_and_gradient),
         ) {
             Ok(Some(adequacy)) => RhoPosteriorOutcome::Assessed(adequacy),
