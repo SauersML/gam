@@ -337,14 +337,20 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4, "{text}");
-        assert_eq!(lines[0], "prob_a,prob_b,prob_se_a,prob_se_b,prob_se_decline");
+        assert_eq!(
+            lines[0],
+            "prob_a,prob_b,prob_se_a,prob_se_b,prob_se_decline"
+        );
         assert_eq!(
             lines[1],
             "0.300000000000,0.700000000000,0.100000000000,0.100000000000,"
         );
         let declined: Vec<&str> = lines[2].split(',').collect();
         assert_eq!(declined.len(), 5, "{}", lines[2]);
-        assert_eq!(&declined[..4], &["0.500000000000", "0.500000000000", "", ""]);
+        assert_eq!(
+            &declined[..4],
+            &["0.500000000000", "0.500000000000", "", ""]
+        );
         assert!(
             declined[4].contains("negative probability variance"),
             "{}",

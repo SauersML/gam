@@ -87,7 +87,10 @@ fn fit(args: JointEventsFitArgs) -> Result<(), String> {
             let (name, kind) = spec
                 .split_once(':')
                 .ok_or_else(|| format!("--marks entry {spec:?} is not name:kind"))?;
-            pairs.push((name.trim().to_string(), MarkKind::parse(kind).map_err(|e| e.to_string())?));
+            pairs.push((
+                name.trim().to_string(),
+                MarkKind::parse(kind).map_err(|e| e.to_string())?,
+            ));
         }
         Some(pairs)
     };

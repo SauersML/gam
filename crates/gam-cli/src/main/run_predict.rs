@@ -168,8 +168,8 @@ fn build_saved_cause_specific_survival_alo_input(
         .compose_offset(primary_offset.view(), "saved survival ALO covariate block")
         .map_err(|error| error.to_string())?;
 
-    let weibull_baseline_in_beta = likelihood_mode == SurvivalLikelihoodMode::Weibull
-        && !model.has_baseline_time_wiggle();
+    let weibull_baseline_in_beta =
+        likelihood_mode == SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle();
     let time_config = load_survival_time_basis_config_from_model(model)?;
     let mut time_build =
         build_survival_time_basis(&age_entry, &age_exit, time_config.clone(), None)?;
@@ -196,8 +196,7 @@ fn build_saved_cause_specific_survival_alo_input(
             &anchor_row,
         )?;
     }
-    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
-    {
+    if likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle() {
         require_structural_survival_time_basis(
             &time_build.basisname,
             "saved transformation survival ALO",
@@ -443,10 +442,8 @@ fn build_saved_marginal_slope_survival_alo_input(
         col_map,
         "resolved_slopespec",
     )?;
-    let slope_build =
-        build_term_collection_design(design_input, &slopespec).map_err(|error| {
-            format!("failed to build saved marginal-slope slope design: {error}")
-        })?;
+    let slope_build = build_term_collection_design(design_input, &slopespec)
+        .map_err(|error| format!("failed to build saved marginal-slope slope design: {error}"))?;
     let mut slope_offset = slope_build
         .compose_offset(
             noise_offset.view(),
@@ -454,8 +451,7 @@ fn build_saved_marginal_slope_survival_alo_input(
         )
         .map_err(|error| error.to_string())?;
     slope_offset += model.baseline_slope.ok_or_else(|| {
-        "saved survival marginal-slope ALO model is missing its fitted slope baseline"
-            .to_string()
+        "saved survival marginal-slope ALO model is missing its fitted slope baseline".to_string()
     })?;
     // gam#2765 / gam#2767: the leave-one-out replay re-evaluates the row
     // program, which reads the slope at entry, at exit, and as an exit-time
@@ -463,20 +459,17 @@ fn build_saved_marginal_slope_survival_alo_input(
     // time-CONSTANT slope, so all three are rebuilt from the saved margin.
     let slope_replay = match model.slope_time_basis.as_ref() {
         None => None,
-        Some(time_basis) => Some(
-            gam::families::survival::replay_slope_follow_up_designs(
-                &age_entry,
-                &age_exit,
-                time_basis,
-                &slope_build.design,
-            )?,
-        ),
+        Some(time_basis) => Some(gam::families::survival::replay_slope_follow_up_designs(
+            &age_entry,
+            &age_exit,
+            time_basis,
+            &slope_build.design,
+        )?),
     };
     let slope_exit_design = slope_replay
         .as_ref()
         .map_or_else(|| slope_build.design.clone(), |replay| replay.exit.clone());
-    let slope_follow_up = slope_replay
-        .map(|replay| (replay.entry, replay.derivative_exit));
+    let slope_follow_up = slope_replay.map(|replay| (replay.entry, replay.derivative_exit));
 
     let time_config = load_survival_time_basis_config_from_model(model)?;
     let mut time_build = build_survival_time_basis(&age_entry, &age_exit, time_config, None)?;
@@ -1221,7 +1214,13 @@ pub(crate) fn run_predict_model(
     } else {
         None
     };
-    run_predict_unified(args, model, &pred_input, &*predictor, extrapolation_variance)
+    run_predict_unified(
+        args,
+        model,
+        &pred_input,
+        &*predictor,
+        extrapolation_variance,
+    )
 }
 
 pub(crate) fn validate_level(level: f64) -> Result<(), String> {
@@ -1421,7 +1420,11 @@ fn run_predict_conformal(
         (Some(training_path), None) => {
             let extras = vec![response_column("--training-data")?];
             let training = load_datasetwith_model_schema_extra(training_path, model, &extras)?;
-            require_dataset_rows("predict --training-data", training_path, training.values.nrows())?;
+            require_dataset_rows(
+                "predict --training-data",
+                training_path,
+                training.values.nrows(),
+            )?;
             let training_col_map = training.column_map();
             gam_predict::conformal_routes::full_conformal_prediction_columns(
                 model,
@@ -1445,8 +1448,13 @@ fn run_predict_conformal(
                     .flatten()
                     .map(str::to_string),
             );
-            let calibration = load_datasetwith_model_schema_extra(calibration_path, model, &extras)?;
-            require_dataset_rows("predict --calibration", calibration_path, calibration.values.nrows())?;
+            let calibration =
+                load_datasetwith_model_schema_extra(calibration_path, model, &extras)?;
+            require_dataset_rows(
+                "predict --calibration",
+                calibration_path,
+                calibration.values.nrows(),
+            )?;
             let calibration_col_map = calibration.column_map();
             let (calibration_offset, calibration_noise_offset) = resolve_predict_offsets(
                 model,
@@ -1504,7 +1512,9 @@ pub(crate) fn run_predict(args: PredictArgs) -> CliResult<()> {
     // standard load so `SavedModel::load_from_path` is never handed one.
     if is_multinomial_model_file(&args.model) {
         if args.conformal {
-            return Err("--conformal supports standard models only".to_string().into());
+            return Err("--conformal supports standard models only"
+                .to_string()
+                .into());
         }
         return run_predict_multinomial(&args).map_err(CliError::from);
     }
@@ -2264,6 +2274,113 @@ pub(crate) fn run_predict_saved_latent_binary(
     )
 }
 
+/// Survival marginal-slope prediction publishes exactly what the library's
+/// [`predict_survival`] computes (gam#3316): the posterior-mean survival at each
+/// row's own exit time from the same integration rule, the plug-in beside it by
+/// name, and the same refusal of a surface whose survival rises (gam#3026). The
+/// CLI formerly rebuilt the predictor here and published the probit-normal
+/// integral of a delta-method Gaussian for eta, a different quantity wherever
+/// the anchored index is nonlinear in the coefficients.
+fn run_predict_saved_survival_marginal_slope(
+    args: &PredictArgs,
+    model: &SavedModel,
+    data: ndarray::ArrayView2<'_, f64>,
+    col_map: &HashMap<String, usize>,
+    training_headers: Option<&Vec<String>>,
+    primary_offset: &Array1<f64>,
+    noise_offset: &Array1<f64>,
+    covariance_mode: InferenceCovarianceMode,
+) -> Result<(), String> {
+    use gam::families::survival::predict::{
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_survival,
+    };
+    if args.uncertainty {
+        validate_level(args.level)?;
+    }
+    let survival_covariance_mode = match covariance_mode {
+        InferenceCovarianceMode::Conditional => SurvivalPredictionCovarianceMode::Conditional,
+        InferenceCovarianceMode::SmoothingCorrected => {
+            SurvivalPredictionCovarianceMode::SmoothingCorrected
+        }
+    };
+    let result = predict_survival(
+        SurvivalPredictRequest {
+            model,
+            data,
+            col_map,
+            training_headers,
+            primary_offset,
+            noise_offset,
+            time_grid: None,
+            with_uncertainty: args.uncertainty,
+            estimand: SurvivalPredictEstimand::PosteriorMean,
+        },
+        survival_covariance_mode,
+    )
+    .map_err(|e| format!("survival marginal-slope predict failed: {e}"))?;
+    // Without a time grid every row is evaluated at its own exit time, so each
+    // surface has exactly one column.
+    let own_exit = |surface: &Array2<f64>, name: &str| -> Result<Array1<f64>, String> {
+        if surface.ncols() != 1 {
+            return Err(format!(
+                "internal error: survival marginal-slope {name} has {} time columns at the rows' own exit times",
+                surface.ncols()
+            ));
+        }
+        Ok(surface.column(0).to_owned())
+    };
+    let mean = own_exit(&result.survival, "posterior-mean survival")?;
+    let survival_plugin = own_exit(
+        result.survival_plugin.as_ref().ok_or_else(|| {
+            "internal error: posterior-mean survival prediction carries no plug-in surface"
+                .to_string()
+        })?,
+        "plug-in survival",
+    )?;
+    let (eta_se, mean_lo, mean_hi) = if args.uncertainty {
+        let eta_se = result.eta_se.clone().ok_or_else(|| {
+            "internal error: survival marginal-slope eta_se missing under --uncertainty".to_string()
+        })?;
+        let survival_sd = own_exit(
+            result.survival_se.as_ref().ok_or_else(|| {
+                "internal error: survival marginal-slope survival_se missing under --uncertainty"
+                    .to_string()
+            })?,
+            "survival posterior standard deviation",
+        )?;
+        let z = standard_normal_quantile(0.5 + args.level * 0.5)?;
+        let (lo, hi) = response_interval_from_mean_sd(mean.view(), survival_sd.view(), z, 0.0, 1.0);
+        (Some(eta_se), Some(lo), Some(hi))
+    } else {
+        (None, None, None)
+    };
+    write_survival_prediction_csv(
+        &args.out,
+        result.linear_predictor.view(),
+        survival_plugin.view(),
+        mean.view(),
+        eta_se.as_ref().map(|values| values.view()),
+        mean_lo.as_ref().map(|values| values.view()),
+        mean_hi.as_ref().map(|values| values.view()),
+    )?;
+    // Result-owned provenance (#2296): the point integral ran under the
+    // requested covariance; the bands report what the engine says it used.
+    let uncertainty_source = result.covariance_source.map(|source| match source {
+        SurvivalPredictionCovarianceMode::Conditional => InferenceCovarianceMode::Conditional,
+        SurvivalPredictionCovarianceMode::SmoothingCorrected => {
+            InferenceCovarianceMode::SmoothingCorrected
+        }
+    });
+    cli_out!(
+        "wrote predictions: {} (rows={}){}",
+        args.out.display(),
+        mean.len(),
+        covariance_provenance_note(Some(covariance_mode), uncertainty_source)
+    );
+    Ok(())
+}
+
 pub(crate) fn run_predict_survival(
     args: &PredictArgs,
     model: &SavedModel,
@@ -2282,6 +2399,18 @@ pub(crate) fn run_predict_survival(
     let time_cols = resolve_saved_survival_time_columns(model, col_map)?;
     let exit_col = time_cols.exit_col;
     let covariance_mode = resolved_covariance_mode(args, model);
+    if require_saved_survival_likelihood_mode(model)? == SurvivalLikelihoodMode::MarginalSlope {
+        return run_predict_saved_survival_marginal_slope(
+            args,
+            model,
+            data,
+            col_map,
+            training_headers,
+            primary_offset,
+            noise_offset,
+            covariance_mode,
+        );
+    }
     let termspec = resolve_termspec_for_prediction(
         &model.resolved_termspec,
         training_headers,
@@ -2360,8 +2489,7 @@ pub(crate) fn run_predict_survival(
             &time_anchor_row,
         )?;
     }
-    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull
-        && !model.has_baseline_time_wiggle()
+    if saved_likelihood_mode != SurvivalLikelihoodMode::Weibull && !model.has_baseline_time_wiggle()
     {
         require_structural_survival_time_basis(&time_build.basisname, "saved survival sampling")?;
     }
@@ -2441,10 +2569,7 @@ pub(crate) fn run_predict_survival(
             saved_likelihood_mode,
             saved_location_scale_inverse_link.as_ref(),
         )?;
-    if matches!(
-        saved_likelihood_mode,
-        SurvivalLikelihoodMode::LocationScale | SurvivalLikelihoodMode::MarginalSlope
-    ) {
+    if saved_likelihood_mode == SurvivalLikelihoodMode::LocationScale {
         let time_anchor = model
             .survival_time_anchor
             .ok_or_else(|| "saved survival model missing survival_time_anchor".to_string())?;
@@ -2662,126 +2787,6 @@ pub(crate) fn run_predict_survival(
                 Some(covariance_mode),
                 args.uncertainty.then_some(covariance_mode),
             )
-        );
-        return Ok(());
-    }
-
-    if saved_likelihood_mode == SurvivalLikelihoodMode::MarginalSlope {
-        let z_name = model
-            .z_column
-            .as_ref()
-            .ok_or_else(|| "saved survival marginal-slope model missing z_column".to_string())?;
-        let z_col = resolve_role_col(col_map, z_name, "z")?;
-        let z = data.column(z_col).to_owned();
-        let slopespec = resolve_termspec_for_prediction(
-            &model.resolved_slopespec.as_ref().cloned(),
-            training_headers,
-            col_map,
-            "resolved_slopespec",
-        )?;
-        let slope_clipped = model.axis_clip_to_training_ranges(data, col_map);
-        let slope_input = slope_clipped.as_ref().map_or(data, |arr| arr.view());
-        let slope_design = build_term_collection_design(slope_input, &slopespec)
-            .map_err(|e| format!("failed to build survival marginal-slope slope design: {e}"))?;
-        let effective_noise_offset = slope_design
-            .compose_offset(
-                noise_offset.view(),
-                "survival CLI marginal-slope slope block",
-            )
-            .map_err(|error| error.to_string())?;
-        // gam#2765 / gam#2767. The term spec names the covariate factor; when
-        // the fit gave the slope a follow-up margin the coefficients live
-        // against `X_cov ⊗ᵣ B(log t)` at each row's exit time, so the design has
-        // to be rebuilt as that product against the fit's OWN knots. The offset
-        // is composed before this deliberately: an external slope offset is
-        // a contribution to `g` itself, not to a coefficient, so it is
-        // time-constant and does not ride the margin.
-        let slope_design_matrix = match model.slope_time_basis.as_ref() {
-            None => slope_design.design.clone(),
-            Some(time_basis) => {
-                gam::families::survival::replay_slope_time_margin_value_tangent_design(
-                    age_exit.view(),
-                    time_basis,
-                    &slope_design.design,
-                )?
-                .value
-            }
-        };
-        let fit_saved = fit_result_from_saved_model_for_prediction(model)?;
-        let (predictor, pred_input, predictor_fit) = build_saved_survival_marginal_slope_predictor(
-            model,
-            &fit_saved,
-            z_name,
-            &z,
-            &cov_design.design,
-            &slope_design_matrix,
-            &time_build,
-            &eta_offset_entry,
-            &eta_offset_exit,
-            &derivative_offset_exit,
-            &effective_primary_offset,
-            &effective_noise_offset,
-            gam::predict::input::build_marginal_slope_local_auxiliary_matrix(
-                model, data, col_map,
-            )
-            .map_err(|error| error.to_string())?,
-        )?;
-
-        let (eta, mean, eta_se_opt, mean_lo, mean_hi): (
-            Array1<f64>,
-            Array1<f64>,
-            Option<Array1<f64>>,
-            Option<Array1<f64>>,
-            Option<Array1<f64>>,
-        ) = {
-            let pm_options = PosteriorMeanOptions {
-                confidence_level: if args.uncertainty {
-                    Some(args.level)
-                } else {
-                    None
-                },
-                covariance_mode,
-                include_observation_interval: false,
-                extrapolation_variance: None,
-            };
-            let pred = predictor
-                .predict_posterior_mean(&pred_input, &predictor_fit, &pm_options)
-                .map_err(|e| format!("predict_posterior_mean failed: {e}"))?;
-            let eta = pred.eta;
-            let eta_se = pred.eta_standard_error;
-            let mean = Array1::from_iter(
-                eta.iter()
-                    .zip(eta_se.iter())
-                    .map(|(&mu, &se)| normal_cdf(-mu / (1.0 + se * se).sqrt())),
-            );
-            if args.uncertainty {
-                validate_level(args.level)?;
-                let z_alpha = standard_normal_quantile(0.5 + args.level * 0.5)?;
-                let eta_lo = &eta - &(eta_se.mapv(|value| z_alpha * value));
-                let eta_hi = &eta + &(eta_se.mapv(|value| z_alpha * value));
-                let mean_lo = Some(eta_hi.mapv(|value| normal_cdf(-value)));
-                let mean_hi = Some(eta_lo.mapv(|value| normal_cdf(-value)));
-                (eta, mean, Some(eta_se), mean_lo, mean_hi)
-            } else {
-                (eta, mean, None, None, None)
-            }
-        };
-        let survival_plugin = eta.mapv(|value| normal_cdf(-value));
-
-        write_survival_prediction_csv(
-            &args.out,
-            eta.view(),
-            survival_plugin.view(),
-            mean.view(),
-            eta_se_opt.as_ref().map(|values| values.view()),
-            mean_lo.as_ref().map(|values| values.view()),
-            mean_hi.as_ref().map(|values| values.view()),
-        )?;
-        cli_out!(
-            "wrote predictions: {} (rows={}){}",
-            args.out.display(),
-            mean.len(),
-            covariance_provenance_note(Some(covariance_mode), Some(covariance_mode))
         );
         return Ok(());
     }

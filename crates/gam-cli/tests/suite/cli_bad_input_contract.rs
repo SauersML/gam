@@ -31,7 +31,12 @@ fn cli_fit_bad_inputs_exit_with_their_category_and_name_the_offending_input() {
         "--out",
         model.to_str().expect("UTF-8 path"),
     ]);
-    assert_eq!(output.status.code(), exit_code(gam::ErrorCategory::Data), "{}", stderr(&output));
+    assert_eq!(
+        output.status.code(),
+        exit_code(gam::ErrorCategory::Data),
+        "{}",
+        stderr(&output)
+    );
     let error = stderr(&output);
     assert!(error.contains("nonfinite.csv"), "{error}");
     assert!(error.contains("column 'x'"), "{error}");
@@ -84,7 +89,12 @@ fn cli_fit_bad_inputs_exit_with_their_category_and_name_the_offending_input() {
         "--out",
         model.to_str().expect("UTF-8 path"),
     ]);
-    assert_eq!(wrong.status.code(), exit_code(gam::ErrorCategory::Data), "{}", stderr(&wrong));
+    assert_eq!(
+        wrong.status.code(),
+        exit_code(gam::ErrorCategory::Data),
+        "{}",
+        stderr(&wrong)
+    );
     assert!(
         stderr(&wrong).contains("training.json"),
         "{}",
@@ -150,13 +160,22 @@ fn a_smooth_of_a_string_column_is_a_formula_error_naming_the_column() {
     let mut csv = String::from("y,x,grp\n");
     for i in 0..60 {
         let level = ["north", "south", "east"][i % 3];
-        csv.push_str(&format!("{},{},{level}\n", (i as f64 * 0.37).sin(), i as f64 / 60.0));
+        csv.push_str(&format!(
+            "{},{},{level}\n",
+            (i as f64 * 0.37).sin(),
+            i as f64 / 60.0
+        ));
     }
     std::fs::write(&data, csv).expect("write fixture");
     let data = data.to_str().expect("UTF-8 path");
     let model = model.to_str().expect("UTF-8 path");
 
-    for formula in ["y ~ s(grp)", "y ~ s(x) + s(grp)", "y ~ te(x, grp)", "y ~ linear(grp)"] {
+    for formula in [
+        "y ~ s(grp)",
+        "y ~ s(x) + s(grp)",
+        "y ~ te(x, grp)",
+        "y ~ linear(grp)",
+    ] {
         let output = gam(&["fit", data, formula, "--out", model]);
         let error = stderr(&output);
         assert_eq!(
@@ -185,10 +204,8 @@ fn cli_predict_names_the_refused_cell_and_prints_its_remedy() {
         let x = f64::from(i) / 90.0;
         let level = i % 3;
         let code = (i / 3) % 3;
-        let y = (6.0 * x).sin()
-            + f64::from(level)
-            + 0.5 * f64::from(code)
-            + 0.05 * f64::from(i % 7);
+        let y =
+            (6.0 * x).sin() + f64::from(level) + 0.5 * f64::from(code) + 0.05 * f64::from(i % 7);
         rows.push_str(&format!("{y},{x},L{level},{code}\n"));
     }
     std::fs::write(&training, rows).expect("write training fixture");

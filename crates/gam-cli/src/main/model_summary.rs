@@ -195,7 +195,9 @@ pub(crate) fn build_model_summary(
 /// engine-level family (custom / GAMLSS) has no scalar coefficient-covariance
 /// scale and is now refused here, exactly as the library path already refuses
 /// it, instead of silently returning an unscaled `H⁻¹` labelled `Vb`.
-fn factorized_covariance_fallback(fit: &UnifiedFitResult) -> Option<Result<PredictionCovarianceBackend<'_>, String>> {
+fn factorized_covariance_fallback(
+    fit: &UnifiedFitResult,
+) -> Option<Result<PredictionCovarianceBackend<'_>, String>> {
     if let Err(error) = fit.require_posterior_mean("coefficient covariance summary") {
         return Some(Err(error.to_string()));
     }
@@ -292,9 +294,13 @@ pub(crate) fn covariance_from_model(
         .map_err(|error| error.to_string())?
         {
             let dim = backend.nrows();
-            return backend.apply_columns(&Array2::<f64>::eye(dim)).map_err(|e| {
-                format!("failed to recover the smoothing-corrected covariance from its factors: {e}")
-            });
+            return backend
+                .apply_columns(&Array2::<f64>::eye(dim))
+                .map_err(|e| {
+                    format!(
+                        "failed to recover the smoothing-corrected covariance from its factors: {e}"
+                    )
+                });
         }
         // With NO smoothing coordinates the correction J·V_rho·Jᵀ is the unique
         // zero-dimensional zero matrix, so Vp = Vb EXACTLY. This is an identity
@@ -310,7 +316,9 @@ pub(crate) fn covariance_from_model(
         // refusal: there the correction is a real, absent term.
         if fit.has_smoothing_coordinate() {
             return Err(match fit.smoothing_correction_absence() {
-                Some(absence) => format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}"),
+                Some(absence) => {
+                    format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}")
+                }
                 None => SMOOTHING_CORRECTED_ABSENT.to_string(),
             });
         }
@@ -363,7 +371,9 @@ pub(crate) fn prediction_backend_from_model<'a>(
         // a substitution of a narrower band.
         if fit.has_smoothing_coordinate() {
             return Err(match fit.smoothing_correction_absence() {
-                Some(absence) => format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}"),
+                Some(absence) => {
+                    format!("{SMOOTHING_CORRECTED_ABSENT}; the fit recorded why: {absence}")
+                }
                 None => SMOOTHING_CORRECTED_ABSENT.to_string(),
             });
         }
@@ -384,7 +394,6 @@ pub(crate) fn prediction_backend_from_model<'a>(
             .to_string(),
     )
 }
-
 
 /// Render the covariance-provenance suffix for `gam predict` from
 /// RESULT-OWNED sources (#2296): what the evaluator actually consumed for the

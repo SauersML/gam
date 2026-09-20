@@ -23,4 +23,3 @@ pub(crate) fn family_arg_canonical_name(arg: FamilyArg) -> Option<&'static str> 
         FamilyArg::Multinomial => Some("multinomial"),
     }
 }
-

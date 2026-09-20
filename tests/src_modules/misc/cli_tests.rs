@@ -1,29 +1,25 @@
 use super::{
-    BlockRole, BoundedCoefficientPriorSpec, CliError, CliFirthValidation,
-    FamilyArg, FittedFamily, LikelihoodSpec, LinkChoice, LinkMode,
-    ResponseFamily, SavedModel, SurvivalBaselineTarget,
-    SurvivalLikelihoodMode, build_survival_time_basis,
-    compact_fit_result_for_batch,
-    covariance_from_model, family_arg_canonical_name,
-    fit_required_columns, formula_columns, load_dataset_projected, parse_formula,
-    parse_surv_response, parse_survival_time_basis_config, predict_gam,
-    prepend_id_column_to_prediction_csv,
-    validate_cli_firth_configuration, validate_fit_args_preflight,
-    write_estimand_explicit_prediction_csv, write_prediction_csv,
+    BlockRole, BoundedCoefficientPriorSpec, CliError, CliFirthValidation, FamilyArg, FittedFamily,
+    LikelihoodSpec, LinkChoice, LinkMode, ResponseFamily, SavedModel, SurvivalBaselineTarget,
+    SurvivalLikelihoodMode, build_survival_time_basis, compact_fit_result_for_batch,
+    covariance_from_model, family_arg_canonical_name, fit_required_columns, formula_columns,
+    load_dataset_projected, parse_formula, parse_surv_response, parse_survival_time_basis_config,
+    predict_gam, prepend_id_column_to_prediction_csv, validate_cli_firth_configuration,
+    validate_fit_args_preflight, write_estimand_explicit_prediction_csv, write_prediction_csv,
     write_survival_binary_prediction_csv, write_survival_prediction_csv,
 };
 use super::{
-    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs, log_level_for_verbosity,
-    run_fit, run_predict, run_sample, write_model_json,
+    Cli, Command, FitArgs, InferenceCovarianceMode, PredictArgs, SampleArgs,
+    log_level_for_verbosity, run_fit, run_predict, run_sample, write_model_json,
 };
 use crate::config_resolve::{
     SurvivalInverseLinkInput, parse_survival_inverse_link as parse_config_survival_inverse_link,
 };
 use clap::Parser;
-use gam::inference::formula_dsl::parse_matching_auxiliary_formula;
-use gam::term_builder::build_termspec;
 use gam::families::fit_orchestration::route_marginal_slope_deviation_blocks;
+use gam::inference::formula_dsl::parse_matching_auxiliary_formula;
 use gam::smooth::collect_smooth_structure_warnings;
+use gam::term_builder::build_termspec;
 use gam_data::DataSchema;
 
 /// Delete a test's temporary output file, reporting rather than swallowing a
@@ -40,17 +36,21 @@ fn remove_temp_file(path: &std::path::Path) {
 }
 use csv::StringRecord;
 use gam::MatrixMaterializationError;
-use gam::basis::{BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec, BasisOptions, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec, MaternBasisSpec, MaternNu, OneDimensionalBoundary, SpatialIdentifiability, ThinPlateBasisSpec};
+use gam::basis::{
+    BSplineBasisSpec, BSplineBoundaryConditions, BSplineIdentifiability, BSplineKnotSpec,
+    BasisOptions, CenterStrategy, DuchonBasisSpec, DuchonNullspaceOrder, DuchonOperatorPenaltySpec,
+    MaternBasisSpec, MaternNu, OneDimensionalBoundary, SpatialIdentifiability, ThinPlateBasisSpec,
+};
 use gam::estimate::{
     FitGeometry, FitInference, FittedBlock, FittedLinkState, UnifiedFitResultParts,
 };
 use gam::families::bms::LatentMeasureKind;
 use gam::families::cubic_cell_kernel as exact_kernel;
+use gam::families::survival::construction::SurvivalTimeBasisConfig;
 use gam::families::survival::construction::build_survival_baseline_offsets;
 use gam::families::survival::construction::build_survival_timewiggle_from_baseline;
 use gam::families::survival::construction::parse_survival_baseline_config;
 use gam::families::survival::construction::{SurvivalBaselineConfig, evaluate_survival_baseline};
-use gam::families::survival::construction::SurvivalTimeBasisConfig;
 use gam::families::survival::location_scale::{
     ResidualDistribution, SurvivalLocationScaleTimeParameterization,
     project_onto_linear_constraints,
@@ -103,462 +103,469 @@ use tempfile::tempdir;
 /// way a saved model's `fit_result` is laid out. Only tests build fits this way now
 /// that every fit route saves through the library's payload service.
 mod saved_fit_fixtures {
-use crate::*;
-use gam::estimate::FittedLinkState;
-use gam::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
+    use crate::*;
+    use gam::estimate::FittedLinkState;
+    use gam::types::{LikelihoodScaleMetadata, LogLikelihoodNormalization};
 
-pub(crate) fn core_saved_fit_result(
-    beta: Array1<f64>,
-    lambdas: Array1<f64>,
-    standard_deviation: f64,
-    beta_covariance: Option<Array2<f64>>,
-    beta_covariance_corrected: Option<Array2<f64>>,
-    summary: SavedFitSummary,
-) -> Result<UnifiedFitResult, String> {
-    // Saved models are part of the stable inference contract. Reject non-finite
-    // values at construction time so JSON cannot silently encode them as null.
-    let summary = summary
-        .validated()
-        .map_err(|error| format!("saved fit summary metrics are invalid: {error}"))?;
-    validate_all_finite("fit_result.beta", beta.iter().copied())
-        .expect("core_saved_fit_result called with non-finite beta");
-    validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
-        .expect("core_saved_fit_result called with non-finite lambdas");
-    // Saved-model contract: fit_result.standard_deviation is residual
-    // standard deviation sigma for Gaussian identity models and the
-    // response-scale summary paired with explicit likelihood-scale metadata
-    // for non-Gaussian models.
-    ensure_finite_scalar("fit_result.standard_deviation", standard_deviation)
-        .expect("core_saved_fit_result called with non-finite standard_deviation");
-    if let Some(cov) = beta_covariance.as_ref() {
-        validate_all_finite("fit_result.beta_covariance", cov.iter().copied())
-            .expect("core_saved_fit_result called with non-finite beta_covariance");
-    }
-    if let Some(cov) = beta_covariance_corrected.as_ref() {
-        validate_all_finite("fit_result.beta_covariance_corrected", cov.iter().copied())
-            .expect("core_saved_fit_result called with non-finite beta_covariance_corrected");
-    }
-    {
-        // rho IS the canonical coordinate; lambda is derived from it, not the
-        // other way round.
-        //
-        // `UnifiedFitResult` validates `lambda == exp(rho)` BIT-FOR-BIT
-        // (`log_lambdas_match_lambdas` compares `to_bits()`), which encodes the
-        // REML convention: the outer optimizer moves rho and lambda follows.
-        // Deriving `rho = ln(lambda)` and then handing back the ORIGINAL lambda
-        // violates that for almost every value, because `exp(ln(x)) != x` in
-        // floating point -- `ln(1e-3)` round-trips to `0.0009999999999999998`,
-        // one ulp off. Every saved fit built through here therefore failed with
-        //
-        //   UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise
-        //
-        // Canonicalising through rho makes the invariant hold by construction
-        // instead of by luck. The cost is at most one ulp on a lambda that was
-        // itself read back from a serialized decimal, and the alternative --
-        // loosening the validator to a tolerance -- would drop the exactness
-        // the rest of the pipeline relies on to round-trip rho.
-        if let Some(bad) = lambdas.iter().copied().find(|v| !(v.is_finite() && *v > 0.0)) {
-            return Err(format!(
-                "saved fit carries a smoothing strength {bad} that is not finite and positive; a \
+    pub(crate) fn core_saved_fit_result(
+        beta: Array1<f64>,
+        lambdas: Array1<f64>,
+        standard_deviation: f64,
+        beta_covariance: Option<Array2<f64>>,
+        beta_covariance_corrected: Option<Array2<f64>>,
+        summary: SavedFitSummary,
+    ) -> Result<UnifiedFitResult, String> {
+        // Saved models are part of the stable inference contract. Reject non-finite
+        // values at construction time so JSON cannot silently encode them as null.
+        let summary = summary
+            .validated()
+            .map_err(|error| format!("saved fit summary metrics are invalid: {error}"))?;
+        validate_all_finite("fit_result.beta", beta.iter().copied())
+            .expect("core_saved_fit_result called with non-finite beta");
+        validate_all_finite("fit_result.lambdas", lambdas.iter().copied())
+            .expect("core_saved_fit_result called with non-finite lambdas");
+        // Saved-model contract: fit_result.standard_deviation is residual
+        // standard deviation sigma for Gaussian identity models and the
+        // response-scale summary paired with explicit likelihood-scale metadata
+        // for non-Gaussian models.
+        ensure_finite_scalar("fit_result.standard_deviation", standard_deviation)
+            .expect("core_saved_fit_result called with non-finite standard_deviation");
+        if let Some(cov) = beta_covariance.as_ref() {
+            validate_all_finite("fit_result.beta_covariance", cov.iter().copied())
+                .expect("core_saved_fit_result called with non-finite beta_covariance");
+        }
+        if let Some(cov) = beta_covariance_corrected.as_ref() {
+            validate_all_finite("fit_result.beta_covariance_corrected", cov.iter().copied())
+                .expect("core_saved_fit_result called with non-finite beta_covariance_corrected");
+        }
+        {
+            // rho IS the canonical coordinate; lambda is derived from it, not the
+            // other way round.
+            //
+            // `UnifiedFitResult` validates `lambda == exp(rho)` BIT-FOR-BIT
+            // (`log_lambdas_match_lambdas` compares `to_bits()`), which encodes the
+            // REML convention: the outer optimizer moves rho and lambda follows.
+            // Deriving `rho = ln(lambda)` and then handing back the ORIGINAL lambda
+            // violates that for almost every value, because `exp(ln(x)) != x` in
+            // floating point -- `ln(1e-3)` round-trips to `0.0009999999999999998`,
+            // one ulp off. Every saved fit built through here therefore failed with
+            //
+            //   UnifiedFitResult log_lambdas must equal ln(lambdas) elementwise
+            //
+            // Canonicalising through rho makes the invariant hold by construction
+            // instead of by luck. The cost is at most one ulp on a lambda that was
+            // itself read back from a serialized decimal, and the alternative --
+            // loosening the validator to a tolerance -- would drop the exactness
+            // the rest of the pipeline relies on to round-trip rho.
+            if let Some(bad) = lambdas
+                .iter()
+                .copied()
+                .find(|v| !(v.is_finite() && *v > 0.0))
+            {
+                return Err(format!(
+                    "saved fit carries a smoothing strength {bad} that is not finite and positive; a \
                  strength is exp(rho), so no rho reproduces it — refusing to floor it"
-            ));
-        }
-        let log_lambdas = lambdas.mapv(f64::ln);
-        // `checked_exp_log_strength` is a domain check followed by plain
-        // `rho.exp()`, so this is bit-identical to what the validator computes
-        // -- and `gam-problem` is not a dependency of this crate.
-        let lambdas = log_lambdas.mapv(f64::exp);
-        // Do not export a synthetic/placeholder Hessian here. Saved fits built
-        // from externally supplied summary/covariance data may provide covariance
-        // for prediction, but HMC/NUTS whitening requires an explicit upstream
-        // penalized Hessian from the fitter itself.
-        let covariance_conditional = beta_covariance;
-        let covariance_corrected = beta_covariance_corrected;
-        // A payload written before the criterion could be absent carries `0.0`
-        // here when the reconstruction lands on the exact-fit boundary. That is
-        // the placeholder, not a criterion — drop it rather than hand it to a
-        // constructor that (rightly) refuses one, which is exactly the
-        // normalization `UnifiedFitResult::reml_score` performs at read time
-        // for the same legacy state (#2595).
-        let reml_score = summary.reml_score.filter(|_| {
-            !gam::estimate::is_zero_dispersion_boundary(
-                summary.likelihood_family.as_ref(),
-                summary.likelihood_scale,
+                ));
+            }
+            let log_lambdas = lambdas.mapv(f64::ln);
+            // `checked_exp_log_strength` is a domain check followed by plain
+            // `rho.exp()`, so this is bit-identical to what the validator computes
+            // -- and `gam-problem` is not a dependency of this crate.
+            let lambdas = log_lambdas.mapv(f64::exp);
+            // Do not export a synthetic/placeholder Hessian here. Saved fits built
+            // from externally supplied summary/covariance data may provide covariance
+            // for prediction, but HMC/NUTS whitening requires an explicit upstream
+            // penalized Hessian from the fitter itself.
+            let covariance_conditional = beta_covariance;
+            let covariance_corrected = beta_covariance_corrected;
+            // A payload written before the criterion could be absent carries `0.0`
+            // here when the reconstruction lands on the exact-fit boundary. That is
+            // the placeholder, not a criterion — drop it rather than hand it to a
+            // constructor that (rightly) refuses one, which is exactly the
+            // normalization `UnifiedFitResult::reml_score` performs at read time
+            // for the same legacy state (#2595).
+            let reml_score = summary.reml_score.filter(|_| {
+                !gam::estimate::is_zero_dispersion_boundary(
+                    summary.likelihood_family.as_ref(),
+                    summary.likelihood_scale,
+                    standard_deviation,
+                )
+            });
+            let penalized_objective = reml_score;
+            UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+                blocks: vec![gam::estimate::FittedBlock {
+                    beta: beta.clone(),
+                    role: gam::estimate::BlockRole::Mean,
+                    edf: 0.0,
+                    lambdas: lambdas.clone(),
+                }],
+                training_sample_size: summary.training_sample_size,
+                log_lambdas,
+                lambdas,
+                likelihood_family: summary.likelihood_family,
+                likelihood_scale: summary.likelihood_scale,
+                log_likelihood_normalization: summary.log_likelihood_normalization,
+                log_likelihood: summary.log_likelihood,
+                deviance: summary.deviance,
+                reml_score,
+                stable_penalty_term: summary.stable_penalty_term,
+                penalized_objective,
+                // A fit reconstructed from a saved-model summary performed no device
+                // (GPU) execution in this process — it was deserialized from disk —
+                // so the device-use flag is false. `SavedFitSummary` does not persist
+                // this field; it is a property of the original fit run, not the saved
+                // artifact.
+                used_device: false,
+                outer_iterations: summary.iterations,
+                // Saved reconstruction obeys the same strict inner convergence
+                // authority as live assembly. A stalled/exhausted status remains a
+                // checkpoint and cannot be reinterpreted as a model while loading.
+                outer_converged: summary.pirls_status.is_converged(),
+                outer_gradient_norm: Some(summary.finalgrad_norm),
                 standard_deviation,
-            )
-        });
-        let penalized_objective = reml_score;
-        UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
-            blocks: vec![gam::estimate::FittedBlock {
-                beta: beta.clone(),
-                role: gam::estimate::BlockRole::Mean,
-                edf: 0.0,
-                lambdas: lambdas.clone(),
-            }],
-            training_sample_size: summary.training_sample_size,
-            log_lambdas,
+                covariance_conditional,
+                covariance_corrected,
+                inference: None,
+                fitted_link: FittedLinkState::Standard(None),
+                geometry: None,
+                block_states: Vec::new(),
+                pirls_status: summary.pirls_status,
+                max_abs_eta: summary.max_abs_eta,
+                constraint_kkt: None,
+                artifacts: gam::estimate::FitArtifacts {
+                    pirls: None,
+                    // Restore the outer-stationarity certificate the live fit carried
+                    // so `UnifiedFitResult::try_from_parts` reconstructs the same
+                    // `Analytic` convergence evidence. Dropping it here made the gate
+                    // reject every location-scale fit that ran outer iterations.
+                    criterion_certificate: summary.criterion_certificate,
+                    ..Default::default()
+                },
+                inner_cycles: 0,
+            })
+            .map_err(|error| format!("saved fit metrics are invalid: {error}"))
+        }
+    }
+
+    // The generative dispersion picker `family_noise_parameter` lived here as a
+    // third divergent copy; it now lives once in `gam::generative` and the live
+    // `gam generate` path (`run_sample_generate_report`) calls it directly. See the
+    // doc comment there for the per-family rationale (#1124).
+
+    #[derive(Clone)]
+    pub(crate) struct SavedFitSummary {
+        /// Original training rows, carried through compact saved-fit
+        /// materialization without consulting optional working geometry.
+        pub(crate) training_sample_size: usize,
+        pub(crate) likelihood_family: Option<LikelihoodSpec>,
+        pub(crate) likelihood_scale: LikelihoodScaleMetadata,
+        pub(crate) log_likelihood_normalization: LogLikelihoodNormalization,
+        pub(crate) log_likelihood: f64,
+        pub(crate) iterations: usize,
+        pub(crate) finalgrad_norm: f64,
+        pub(crate) pirls_status: gam::pirls::PirlsStatus,
+        pub(crate) deviance: f64,
+        pub(crate) stable_penalty_term: f64,
+        pub(crate) max_abs_eta: f64,
+        /// The fit's REML/LAML criterion, or `None` when the fit has none at all
+        /// (an exactly-interpolating Gaussian fit; see
+        /// `UnifiedFitResult::reml_score`). Serialized as `null` in that case, and
+        /// the reconstructed fit carries the same absence rather than a zero
+        /// (#2595).
+        pub(crate) reml_score: Option<f64>,
+        /// Analytic outer-stationarity certificate proving the smoothing coordinate
+        /// converged. `None` only when the fit ran no outer iterations (fixed-λ);
+        /// whenever the fit optimized ρ this must carry the live certificate so the
+        /// reconstructed `UnifiedFitResult` clears the assembly gate in
+        /// `result_types.rs` instead of being rejected as non-stationary.
+        pub(crate) criterion_certificate: Option<gam::estimate::OuterCriterionCertificate>,
+    }
+
+    impl SavedFitSummary {
+        fn validated(self) -> Result<Self, String> {
+            if self.training_sample_size == 0 {
+                return Err("fit_result.training_sample_size must be positive".to_string());
+            }
+            ensure_finite_scalar("fit_result.log_likelihood", self.log_likelihood)?;
+            ensure_finite_scalar("fit_result.finalgrad_norm", self.finalgrad_norm)?;
+            ensure_finite_scalar("fit_result.deviance", self.deviance)?;
+            ensure_finite_scalar("fit_result.stable_penalty_term", self.stable_penalty_term)?;
+            ensure_finite_scalar("fit_result.max_abs_eta", self.max_abs_eta)?;
+            if let Some(reml_score) = self.reml_score {
+                ensure_finite_scalar("fit_result.reml_score", reml_score)?;
+            }
+            Ok(self)
+        }
+
+        pub(crate) fn from_blockwise_fit(
+            fit: &gam::estimate::UnifiedFitResult,
+        ) -> Result<Self, String> {
+            let stable_penalty_term = fit.stable_penalty_term;
+            let max_abs_eta = fit
+                .block_states
+                .iter()
+                .flat_map(|b| b.eta.iter())
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            Self {
+                training_sample_size: fit.training_sample_size(),
+                likelihood_family: fit.likelihood_family.clone(),
+                likelihood_scale: fit.likelihood_scale,
+                log_likelihood_normalization: fit.log_likelihood_normalization,
+                log_likelihood: fit.log_likelihood,
+                iterations: fit.outer_iterations,
+                // FitInfo.finalgrad_norm is a hard f64 (its own validator
+                // ensure_finite_scalar fires below); when the outer skipped
+                // gradient measurement (cache hit / gradient-free), persist 0.0
+                // and rely on `pirls_status` for convergence quality.
+                finalgrad_norm: fit.outer_gradient_norm.unwrap_or(0.0),
+                // Persist the *real* status the fit carries (set at construction,
+                // see `UnifiedFitResultParts::pirls_status`). Deriving it from the
+                // `outer_converged` bool here would collapse the five-way taxonomy
+                // (MaxIterationsReached / LmStepSearchExhausted / Unstable / …) into
+                // a single stalled bucket, silently relabeling broken checkpoints
+                // as healthy for downstream consumers. Persist the authoritative
+                // inner status; live and reconstructed fits can only carry
+                // `Converged`, while diagnostic/checkpoint payloads retain the
+                // other variants outside this model constructor.
+                pirls_status: fit.convergence_evidence().inner_status(),
+                deviance: fit.deviance,
+                stable_penalty_term,
+                max_abs_eta,
+                reml_score: fit.reml_score(),
+                // Carry the live analytic certificate forward. Deriving it from the
+                // sealed convergence evidence keeps the reconstructed fit's outer
+                // stationarity proof identical to the one the optimizer minted; a
+                // fixed-λ fit (no outer iterations) legitimately yields `None`.
+                criterion_certificate: fit.convergence_evidence().outer_certificate().cloned(),
+            }
+            .validated()
+        }
+    }
+
+    use gam::estimate::{ensure_finite_scalar, validate_all_finite};
+
+    pub(crate) fn compact_saved_multiblock_fit_result(
+        blocks: Vec<gam::estimate::FittedBlock>,
+        lambdas: Array1<f64>,
+        standard_deviation: f64,
+        beta_covariance: Option<Array2<f64>>,
+        beta_covariance_corrected: Option<Array2<f64>>,
+        geometry: Option<gam::estimate::FitGeometry>,
+        summary: SavedFitSummary,
+    ) -> Result<UnifiedFitResult, String> {
+        let total: usize = blocks.iter().map(|block| block.beta.len()).sum();
+        let mut beta = Array1::zeros(total);
+        let mut offset = 0;
+        for block in &blocks {
+            let width = block.beta.len();
+            beta.slice_mut(s![offset..offset + width])
+                .assign(&block.beta);
+            offset += width;
+        }
+        let mut fit_result = core_saved_fit_result(
+            beta,
             lambdas,
-            likelihood_family: summary.likelihood_family,
-            likelihood_scale: summary.likelihood_scale,
-            log_likelihood_normalization: summary.log_likelihood_normalization,
-            log_likelihood: summary.log_likelihood,
-            deviance: summary.deviance,
-            reml_score,
-            stable_penalty_term: summary.stable_penalty_term,
-            penalized_objective,
-            // A fit reconstructed from a saved-model summary performed no device
-            // (GPU) execution in this process — it was deserialized from disk —
-            // so the device-use flag is false. `SavedFitSummary` does not persist
-            // this field; it is a property of the original fit run, not the saved
-            // artifact.
-            used_device: false,
-            outer_iterations: summary.iterations,
-            // Saved reconstruction obeys the same strict inner convergence
-            // authority as live assembly. A stalled/exhausted status remains a
-            // checkpoint and cannot be reinterpreted as a model while loading.
-            outer_converged: summary.pirls_status.is_converged(),
-            outer_gradient_norm: Some(summary.finalgrad_norm),
             standard_deviation,
-            covariance_conditional,
-            covariance_corrected,
-            inference: None,
-            fitted_link: FittedLinkState::Standard(None),
-            geometry: None,
-            block_states: Vec::new(),
-            pirls_status: summary.pirls_status,
-            max_abs_eta: summary.max_abs_eta,
-            constraint_kkt: None,
-            artifacts: gam::estimate::FitArtifacts {
-                pirls: None,
-                // Restore the outer-stationarity certificate the live fit carried
-                // so `UnifiedFitResult::try_from_parts` reconstructs the same
-                // `Analytic` convergence evidence. Dropping it here made the gate
-                // reject every location-scale fit that ran outer iterations.
-                criterion_certificate: summary.criterion_certificate,
-                ..Default::default()
-            },
-            inner_cycles: 0,
-        })
-        .map_err(|error| format!("saved fit metrics are invalid: {error}"))
-    }
-}
-
-// The generative dispersion picker `family_noise_parameter` lived here as a
-// third divergent copy; it now lives once in `gam::generative` and the live
-// `gam generate` path (`run_sample_generate_report`) calls it directly. See the
-// doc comment there for the per-family rationale (#1124).
-
-#[derive(Clone)]
-pub(crate) struct SavedFitSummary {
-    /// Original training rows, carried through compact saved-fit
-    /// materialization without consulting optional working geometry.
-    pub(crate) training_sample_size: usize,
-    pub(crate) likelihood_family: Option<LikelihoodSpec>,
-    pub(crate) likelihood_scale: LikelihoodScaleMetadata,
-    pub(crate) log_likelihood_normalization: LogLikelihoodNormalization,
-    pub(crate) log_likelihood: f64,
-    pub(crate) iterations: usize,
-    pub(crate) finalgrad_norm: f64,
-    pub(crate) pirls_status: gam::pirls::PirlsStatus,
-    pub(crate) deviance: f64,
-    pub(crate) stable_penalty_term: f64,
-    pub(crate) max_abs_eta: f64,
-    /// The fit's REML/LAML criterion, or `None` when the fit has none at all
-    /// (an exactly-interpolating Gaussian fit; see
-    /// `UnifiedFitResult::reml_score`). Serialized as `null` in that case, and
-    /// the reconstructed fit carries the same absence rather than a zero
-    /// (#2595).
-    pub(crate) reml_score: Option<f64>,
-    /// Analytic outer-stationarity certificate proving the smoothing coordinate
-    /// converged. `None` only when the fit ran no outer iterations (fixed-λ);
-    /// whenever the fit optimized ρ this must carry the live certificate so the
-    /// reconstructed `UnifiedFitResult` clears the assembly gate in
-    /// `result_types.rs` instead of being rejected as non-stationary.
-    pub(crate) criterion_certificate: Option<gam::estimate::OuterCriterionCertificate>,
-}
-
-impl SavedFitSummary {
-    fn validated(self) -> Result<Self, String> {
-        if self.training_sample_size == 0 {
-            return Err("fit_result.training_sample_size must be positive".to_string());
-        }
-        ensure_finite_scalar("fit_result.log_likelihood", self.log_likelihood)?;
-        ensure_finite_scalar("fit_result.finalgrad_norm", self.finalgrad_norm)?;
-        ensure_finite_scalar("fit_result.deviance", self.deviance)?;
-        ensure_finite_scalar("fit_result.stable_penalty_term", self.stable_penalty_term)?;
-        ensure_finite_scalar("fit_result.max_abs_eta", self.max_abs_eta)?;
-        if let Some(reml_score) = self.reml_score {
-            ensure_finite_scalar("fit_result.reml_score", reml_score)?;
-        }
-        Ok(self)
-    }
-
-    pub(crate) fn from_blockwise_fit(
-        fit: &gam::estimate::UnifiedFitResult,
-    ) -> Result<Self, String> {
-        let stable_penalty_term = fit.stable_penalty_term;
-        let max_abs_eta = fit
-            .block_states
-            .iter()
-            .flat_map(|b| b.eta.iter())
-            .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-        Self {
-            training_sample_size: fit.training_sample_size(),
-            likelihood_family: fit.likelihood_family.clone(),
-            likelihood_scale: fit.likelihood_scale,
-            log_likelihood_normalization: fit.log_likelihood_normalization,
-            log_likelihood: fit.log_likelihood,
-            iterations: fit.outer_iterations,
-            // FitInfo.finalgrad_norm is a hard f64 (its own validator
-            // ensure_finite_scalar fires below); when the outer skipped
-            // gradient measurement (cache hit / gradient-free), persist 0.0
-            // and rely on `pirls_status` for convergence quality.
-            finalgrad_norm: fit.outer_gradient_norm.unwrap_or(0.0),
-            // Persist the *real* status the fit carries (set at construction,
-            // see `UnifiedFitResultParts::pirls_status`). Deriving it from the
-            // `outer_converged` bool here would collapse the five-way taxonomy
-            // (MaxIterationsReached / LmStepSearchExhausted / Unstable / …) into
-            // a single stalled bucket, silently relabeling broken checkpoints
-            // as healthy for downstream consumers. Persist the authoritative
-            // inner status; live and reconstructed fits can only carry
-            // `Converged`, while diagnostic/checkpoint payloads retain the
-            // other variants outside this model constructor.
-            pirls_status: fit.convergence_evidence().inner_status(),
-            deviance: fit.deviance,
-            stable_penalty_term,
-            max_abs_eta,
-            reml_score: fit.reml_score(),
-            // Carry the live analytic certificate forward. Deriving it from the
-            // sealed convergence evidence keeps the reconstructed fit's outer
-            // stationarity proof identical to the one the optimizer minted; a
-            // fixed-λ fit (no outer iterations) legitimately yields `None`.
-            criterion_certificate: fit.convergence_evidence().outer_certificate().cloned(),
-        }
-        .validated()
-    }
-}
-
-use gam::estimate::{ensure_finite_scalar, validate_all_finite};
-
-pub(crate) fn compact_saved_multiblock_fit_result(
-    blocks: Vec<gam::estimate::FittedBlock>,
-    lambdas: Array1<f64>,
-    standard_deviation: f64,
-    beta_covariance: Option<Array2<f64>>,
-    beta_covariance_corrected: Option<Array2<f64>>,
-    geometry: Option<gam::estimate::FitGeometry>,
-    summary: SavedFitSummary,
-) -> Result<UnifiedFitResult, String> {
-    let total: usize = blocks.iter().map(|block| block.beta.len()).sum();
-    let mut beta = Array1::zeros(total);
-    let mut offset = 0;
-    for block in &blocks {
-        let width = block.beta.len();
-        beta.slice_mut(s![offset..offset + width])
-            .assign(&block.beta);
-        offset += width;
-    }
-    let mut fit_result = core_saved_fit_result(
-        beta,
-        lambdas,
-        standard_deviation,
-        beta_covariance,
-        beta_covariance_corrected,
-        summary,
-    )?;
-    fit_result.blocks = blocks;
-    if let Some(geom) = geometry {
-        if let Some(inf) = fit_result.inference.as_mut() {
-            inf.penalized_hessian = geom.penalized_hessian.clone();
-        }
-        fit_result.geometry = Some(geom);
-    }
-    fit_result
-        .validate_numeric_finiteness()
-        .expect("compact saved fit materialization violated fitted-result invariants");
-    Ok(fit_result)
-}
-
-mod tests {
-    use super::*;
-
-    /// A live location-scale fit that optimized its smoothing coordinate: it ran
-    /// one outer iteration and carries the analytic outer-stationarity
-    /// certificate the optimizer minted. This is the state that reaches the CLI
-    /// save path for `gam fit --predict-noise --out ...`.
-    fn location_scale_fit_with_outer_certificate() -> UnifiedFitResult {
-        let certificate = gam::estimate::OuterCriterionCertificate {
-            stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
-                grad_norm: 1e-8,
-                projected_grad_norm: 1e-8,
-                bound: 1e-4,
-                rung: gam::model_types::CertifiedRung {
-                    label: "solver-band".to_string(),
-                    derived_standard: false,
-                },
-            },
-            curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
-            lambdas_railed: Vec::new(),
-            railed_facts: Vec::new(),
-            newton_polish: None,
-            curvature_floor: None,
-        };
-        UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
-            blocks: vec![gam::estimate::FittedBlock {
-                beta: Array1::from_vec(vec![0.5, -0.25]),
-                role: gam::estimate::BlockRole::Mean,
-                edf: 2.0,
-                lambdas: Array1::from_vec(vec![1.0]),
-            }],
-            training_sample_size: 32,
-            log_lambdas: Array1::zeros(1),
-            lambdas: Array1::from_vec(vec![1.0]),
-            likelihood_family: None,
-            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: LogLikelihoodNormalization::Full,
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            reml_score: Some(0.0),
-            stable_penalty_term: 0.0,
-            penalized_objective: Some(0.0),
-            used_device: false,
-            outer_iterations: 1,
-            outer_converged: true,
-            outer_gradient_norm: Some(1e-8),
-            standard_deviation: 1.0,
-            covariance_conditional: None,
-            covariance_corrected: None,
-            inference: None,
-            fitted_link: FittedLinkState::Standard(None),
-            geometry: None,
-            block_states: Vec::new(),
-            pirls_status: gam::pirls::PirlsStatus::Converged,
-            max_abs_eta: 0.0,
-            constraint_kkt: None,
-            artifacts: gam::estimate::FitArtifacts {
-                criterion_certificate: Some(certificate),
-                ..Default::default()
-            },
-            inner_cycles: 0,
-        })
-        .expect("fixture certificate certifies outer stationarity")
-    }
-
-    #[test]
-    fn compact_saved_fit_retains_outer_certificate_and_training_sample_size() {
-        let fit = location_scale_fit_with_outer_certificate();
-        // Precondition: the live fit optimized ρ and holds an analytic proof.
-        assert_eq!(fit.outer_iterations, 1);
-        assert!(fit.convergence_evidence().outer_certificate().is_some());
-
-        // The intermediate summary must carry the certificate forward — dropping
-        // it here is exactly what made the compact reconstruction reject the fit.
-        let summary =
-            SavedFitSummary::from_blockwise_fit(&fit).expect("saved summary builds from live fit");
-        assert!(
-            summary.criterion_certificate.is_some(),
-            "SavedFitSummary dropped the live outer certificate"
-        );
-        assert_eq!(
-            summary.training_sample_size,
-            fit.training_sample_size(),
-            "SavedFitSummary must carry the authoritative training-row count"
-        );
-
-        // Reconstructing the compact saved fit must not panic and must preserve
-        // the Analytic outer convergence evidence (before the fix this rebuilt
-        // `FitArtifacts` with `criterion_certificate: None` and the assembly gate
-        // rejected the 1-outer-iteration fit as non-stationary).
-        let reconstructed = compact_saved_multiblock_fit_result(
-            fit.blocks.clone(),
-            fit.lambdas.clone(),
-            1.0,
-            fit.covariance_conditional.clone(),
-            fit.covariance_corrected.clone(),
-            fit.geometry.clone(),
+            beta_covariance,
+            beta_covariance_corrected,
             summary,
-        ).expect("saved fit reconstruction");
-        assert_eq!(reconstructed.outer_iterations, 1);
-        assert_eq!(
-            reconstructed.training_sample_size(),
-            fit.training_sample_size(),
-            "compact materialization changed the authoritative training-row count"
-        );
-        assert!(
-            reconstructed
-                .convergence_evidence()
-                .outer_certificate()
-                .is_some(),
-            "compacted saved fit dropped the outer stationarity certificate"
-        );
+        )?;
+        fit_result.blocks = blocks;
+        if let Some(geom) = geometry {
+            if let Some(inf) = fit_result.inference.as_mut() {
+                inf.penalized_hessian = geom.penalized_hessian.clone();
+            }
+            fit_result.geometry = Some(geom);
+        }
+        fit_result
+            .validate_numeric_finiteness()
+            .expect("compact saved fit materialization violated fitted-result invariants");
+        Ok(fit_result)
     }
 
-    /// A valid outer certificate cannot bypass the sealed constructor's strict
-    /// inner convergence gate. `MaxIterationsReached` remains a checkpoint.
-    #[test]
-    fn max_iterations_reached_status_is_still_rejected() {
-        let certificate = gam::estimate::OuterCriterionCertificate {
-            stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
-                grad_norm: 1e-8,
-                projected_grad_norm: 1e-8,
-                bound: 1e-4,
-                rung: gam::model_types::CertifiedRung {
-                    label: "solver-band".to_string(),
-                    derived_standard: false,
+    mod tests {
+        use super::*;
+
+        /// A live location-scale fit that optimized its smoothing coordinate: it ran
+        /// one outer iteration and carries the analytic outer-stationarity
+        /// certificate the optimizer minted. This is the state that reaches the CLI
+        /// save path for `gam fit --predict-noise --out ...`.
+        fn location_scale_fit_with_outer_certificate() -> UnifiedFitResult {
+            let certificate = gam::estimate::OuterCriterionCertificate {
+                stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 1e-8,
+                    projected_grad_norm: 1e-8,
+                    bound: 1e-4,
+                    rung: gam::model_types::CertifiedRung {
+                        label: "solver-band".to_string(),
+                        derived_standard: false,
+                    },
                 },
-            },
-            curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
-            lambdas_railed: Vec::new(),
-            railed_facts: Vec::new(),
-            newton_polish: None,
-            curvature_floor: None,
-        };
-        let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
-            blocks: vec![gam::estimate::FittedBlock {
-                beta: Array1::from_vec(vec![0.5, -0.25]),
-                role: gam::estimate::BlockRole::Mean,
-                edf: 2.0,
+                curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                newton_polish: None,
+                curvature_floor: None,
+            };
+            UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+                blocks: vec![gam::estimate::FittedBlock {
+                    beta: Array1::from_vec(vec![0.5, -0.25]),
+                    role: gam::estimate::BlockRole::Mean,
+                    edf: 2.0,
+                    lambdas: Array1::from_vec(vec![1.0]),
+                }],
+                training_sample_size: 32,
+                log_lambdas: Array1::zeros(1),
                 lambdas: Array1::from_vec(vec![1.0]),
-            }],
-            training_sample_size: 32,
-            log_lambdas: Array1::zeros(1),
-            lambdas: Array1::from_vec(vec![1.0]),
-            likelihood_family: None,
-            likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
-            log_likelihood_normalization: LogLikelihoodNormalization::Full,
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            reml_score: Some(0.0),
-            stable_penalty_term: 0.0,
-            penalized_objective: Some(0.0),
-            used_device: false,
-            outer_iterations: 1,
-            outer_converged: true,
-            outer_gradient_norm: Some(1e-8),
-            standard_deviation: 1.0,
-            covariance_conditional: None,
-            covariance_corrected: None,
-            inference: None,
-            fitted_link: FittedLinkState::Standard(None),
-            geometry: None,
-            block_states: Vec::new(),
-            pirls_status: gam::pirls::PirlsStatus::MaxIterationsReached,
-            max_abs_eta: 0.0,
-            constraint_kkt: None,
-            artifacts: gam::estimate::FitArtifacts {
-                criterion_certificate: Some(certificate),
-                ..Default::default()
-            },
-            inner_cycles: 0,
-        });
-        assert!(
-            result.is_err(),
-            "a non-converged inner status (MaxIterationsReached) must be rejected"
-        );
+                likelihood_family: None,
+                likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+                log_likelihood_normalization: LogLikelihoodNormalization::Full,
+                log_likelihood: 0.0,
+                deviance: 0.0,
+                reml_score: Some(0.0),
+                stable_penalty_term: 0.0,
+                penalized_objective: Some(0.0),
+                used_device: false,
+                outer_iterations: 1,
+                outer_converged: true,
+                outer_gradient_norm: Some(1e-8),
+                standard_deviation: 1.0,
+                covariance_conditional: None,
+                covariance_corrected: None,
+                inference: None,
+                fitted_link: FittedLinkState::Standard(None),
+                geometry: None,
+                block_states: Vec::new(),
+                pirls_status: gam::pirls::PirlsStatus::Converged,
+                max_abs_eta: 0.0,
+                constraint_kkt: None,
+                artifacts: gam::estimate::FitArtifacts {
+                    criterion_certificate: Some(certificate),
+                    ..Default::default()
+                },
+                inner_cycles: 0,
+            })
+            .expect("fixture certificate certifies outer stationarity")
+        }
+
+        #[test]
+        fn compact_saved_fit_retains_outer_certificate_and_training_sample_size() {
+            let fit = location_scale_fit_with_outer_certificate();
+            // Precondition: the live fit optimized ρ and holds an analytic proof.
+            assert_eq!(fit.outer_iterations, 1);
+            assert!(fit.convergence_evidence().outer_certificate().is_some());
+
+            // The intermediate summary must carry the certificate forward — dropping
+            // it here is exactly what made the compact reconstruction reject the fit.
+            let summary = SavedFitSummary::from_blockwise_fit(&fit)
+                .expect("saved summary builds from live fit");
+            assert!(
+                summary.criterion_certificate.is_some(),
+                "SavedFitSummary dropped the live outer certificate"
+            );
+            assert_eq!(
+                summary.training_sample_size,
+                fit.training_sample_size(),
+                "SavedFitSummary must carry the authoritative training-row count"
+            );
+
+            // Reconstructing the compact saved fit must not panic and must preserve
+            // the Analytic outer convergence evidence (before the fix this rebuilt
+            // `FitArtifacts` with `criterion_certificate: None` and the assembly gate
+            // rejected the 1-outer-iteration fit as non-stationary).
+            let reconstructed = compact_saved_multiblock_fit_result(
+                fit.blocks.clone(),
+                fit.lambdas.clone(),
+                1.0,
+                fit.covariance_conditional.clone(),
+                fit.covariance_corrected.clone(),
+                fit.geometry.clone(),
+                summary,
+            )
+            .expect("saved fit reconstruction");
+            assert_eq!(reconstructed.outer_iterations, 1);
+            assert_eq!(
+                reconstructed.training_sample_size(),
+                fit.training_sample_size(),
+                "compact materialization changed the authoritative training-row count"
+            );
+            assert!(
+                reconstructed
+                    .convergence_evidence()
+                    .outer_certificate()
+                    .is_some(),
+                "compacted saved fit dropped the outer stationarity certificate"
+            );
+        }
+
+        /// A valid outer certificate cannot bypass the sealed constructor's strict
+        /// inner convergence gate. `MaxIterationsReached` remains a checkpoint.
+        #[test]
+        fn max_iterations_reached_status_is_still_rejected() {
+            let certificate = gam::estimate::OuterCriterionCertificate {
+                stationarity: gam::estimate::OuterStationarityCertificate::AnalyticGradient {
+                    grad_norm: 1e-8,
+                    projected_grad_norm: 1e-8,
+                    bound: 1e-4,
+                    rung: gam::model_types::CertifiedRung {
+                        label: "solver-band".to_string(),
+                        derived_standard: false,
+                    },
+                },
+                curvature: gam::model_types::CurvatureEvidence::Measured { psd: true },
+                lambdas_railed: Vec::new(),
+                railed_facts: Vec::new(),
+                newton_polish: None,
+                curvature_floor: None,
+            };
+            let result = UnifiedFitResult::try_from_parts(gam::estimate::UnifiedFitResultParts {
+                blocks: vec![gam::estimate::FittedBlock {
+                    beta: Array1::from_vec(vec![0.5, -0.25]),
+                    role: gam::estimate::BlockRole::Mean,
+                    edf: 2.0,
+                    lambdas: Array1::from_vec(vec![1.0]),
+                }],
+                training_sample_size: 32,
+                log_lambdas: Array1::zeros(1),
+                lambdas: Array1::from_vec(vec![1.0]),
+                likelihood_family: None,
+                likelihood_scale: LikelihoodScaleMetadata::ProfiledGaussian,
+                log_likelihood_normalization: LogLikelihoodNormalization::Full,
+                log_likelihood: 0.0,
+                deviance: 0.0,
+                reml_score: Some(0.0),
+                stable_penalty_term: 0.0,
+                penalized_objective: Some(0.0),
+                used_device: false,
+                outer_iterations: 1,
+                outer_converged: true,
+                outer_gradient_norm: Some(1e-8),
+                standard_deviation: 1.0,
+                covariance_conditional: None,
+                covariance_corrected: None,
+                inference: None,
+                fitted_link: FittedLinkState::Standard(None),
+                geometry: None,
+                block_states: Vec::new(),
+                pirls_status: gam::pirls::PirlsStatus::MaxIterationsReached,
+                max_abs_eta: 0.0,
+                constraint_kkt: None,
+                artifacts: gam::estimate::FitArtifacts {
+                    criterion_certificate: Some(certificate),
+                    ..Default::default()
+                },
+                inner_cycles: 0,
+            });
+            assert!(
+                result.is_err(),
+                "a non-converged inner status (MaxIterationsReached) must be rejected"
+            );
+        }
     }
 }
-}
-use saved_fit_fixtures::{SavedFitSummary, compact_saved_multiblock_fit_result, core_saved_fit_result};
+use saved_fit_fixtures::{
+    SavedFitSummary, compact_saved_multiblock_fit_result, core_saved_fit_result,
+};
 
 fn resolve_family(
     arg: FamilyArg,
@@ -656,13 +663,8 @@ fn bounded_cli_termspec() -> TermCollectionSpec {
     let ds = bounded_cli_dataset();
     let col_map = HashMap::from([("x".to_string(), 0usize), ("y".to_string(), 1usize)]);
     let mut inference_notes = Vec::<String>::new();
-    build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut inference_notes,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "bounded term spec", e))
+    build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "bounded term spec", e))
 }
 
 fn saved_fit_summary_fixture() -> SavedFitSummary {
@@ -734,7 +736,8 @@ fn core_saved_fit_result_preserves_summary_metrics() {
     // survives `Array1::zeros(0)` asked the constructor to contradict itself,
     // and it cannot exercise "metrics survive the round-trip" on a path where
     // the metric is definitionally absent.
-    let fit = core_saved_fit_result(array![1.0], array![1.0], 1.0, None, None, summary).expect("saved fit reconstruction");
+    let fit = core_saved_fit_result(array![1.0], array![1.0], 1.0, None, None, summary)
+        .expect("saved fit reconstruction");
 
     assert_eq!(fit.outer_iterations, 60);
     assert_eq!(fit.outer_gradient_norm, Some(42.0));
@@ -1162,12 +1165,25 @@ fn cli_verbose_flag_counts_up_from_silent_diagnostics() {
     // `-v` shows the debug trace and `-vv` adds trace records.
     for (argv, expected) in [
         (vec!["gam", "report", "model.json"], log::LevelFilter::Warn),
-        (vec!["gam", "-v", "report", "model.json"], log::LevelFilter::Debug),
-        (vec!["gam", "report", "model.json", "--verbose"], log::LevelFilter::Debug),
-        (vec!["gam", "-vv", "report", "model.json"], log::LevelFilter::Trace),
+        (
+            vec!["gam", "-v", "report", "model.json"],
+            log::LevelFilter::Debug,
+        ),
+        (
+            vec!["gam", "report", "model.json", "--verbose"],
+            log::LevelFilter::Debug,
+        ),
+        (
+            vec!["gam", "-vv", "report", "model.json"],
+            log::LevelFilter::Trace,
+        ),
     ] {
         let parsed = Cli::try_parse_from(argv.iter().copied()).expect("verbosity flags must parse");
-        assert_eq!(log_level_for_verbosity(parsed.verbose), expected, "{argv:?}");
+        assert_eq!(
+            log_level_for_verbosity(parsed.verbose),
+            expected,
+            "{argv:?}"
+        );
     }
     let error = Cli::try_parse_from(["gam", "--log-level", "debug", "report", "model.json"])
         .expect_err("the retired --log-level flag must not parse");
@@ -1310,7 +1326,8 @@ fn cli_sample_bounded_model_reaches_sampler_config_validation() {
             summary.training_sample_size = 3;
             summary
         },
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     payload.fit_result = Some(fit_result);
     payload.data_schema = Some(bounded_cli_schema());
     payload.resolved_termspec = Some(bounded_cli_termspec());
@@ -1851,8 +1868,12 @@ fn cli_request_document_latent_measure_reaches_the_marginal_slope_fit_2926() {
         ("global-empirical", "requested-global-empirical"),
         ("conditional-location-scale", "conditional-location-scale"),
     ] {
-        let request_path = td.path().join(format!("request_{latent_measure}.request.json"));
-        let model_path = td.path().join(format!("request_{latent_measure}.model.json"));
+        let request_path = td
+            .path()
+            .join(format!("request_{latent_measure}.request.json"));
+        let model_path = td
+            .path()
+            .join(format!("request_{latent_measure}.model.json"));
         fs::write(
             &request_path,
             format!(
@@ -1940,7 +1961,9 @@ fn cli_request_document_frailty_reaches_the_latent_survival_route() {
         args.survival_likelihood = None;
         args.family = FamilyArg::Auto;
         run_fit(args)
-            .expect_err("the latent survival route must refuse a frailty other than HazardMultiplier")
+            .expect_err(
+                "the latent survival route must refuse a frailty other than HazardMultiplier",
+            )
             .to_string()
     };
 
@@ -1973,12 +1996,8 @@ fn cli_request_document_marginal_slope_settings_reach_the_route() {
     write_bernoulli_marginal_slope_train_csv(&train_path);
 
     let base = || {
-        let mut args = location_scale_fit_args(
-            train_path.clone(),
-            model_path.clone(),
-            "y ~ x + z",
-            "1",
-        );
+        let mut args =
+            location_scale_fit_args(train_path.clone(), model_path.clone(), "y ~ x + z", "1");
         args.predict_noise = None;
         args.survival_likelihood = None;
         args
@@ -2032,12 +2051,8 @@ fn cli_request_document_firth_is_refused_for_multinomial() {
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "write multinomial csv", e));
 
     let base = || {
-        let mut args = location_scale_fit_args(
-            train_path.clone(),
-            model_path.clone(),
-            "class ~ x",
-            "1",
-        );
+        let mut args =
+            location_scale_fit_args(train_path.clone(), model_path.clone(), "class ~ x", "1");
         args.predict_noise = None;
         args.survival_likelihood = None;
         args
@@ -2120,7 +2135,9 @@ fn cli_request_document_survival_only_settings_need_a_surv_response() {
     request_args.request = Some(request_path.clone());
     request_args.formula_positional = None;
     let from_request = run_fit(request_args)
-        .expect_err("a request document's survival baseline on an ordinary response must be refused")
+        .expect_err(
+            "a request document's survival baseline on an ordinary response must be refused",
+        )
         .to_string();
     assert!(
         from_request.contains("survival-only options require a Surv(entry, exit, event) response"),
@@ -2354,7 +2371,8 @@ fn saved_prediction_runtime_rejects_location_scale_survival_payload_drift() {
         None,
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
@@ -2708,7 +2726,8 @@ fn saved_bernoulli_marginal_slope_replays_main_and_slope_deviation_runtimes() {
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             ..saved_fit_summary_fixture()
         },
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = FittedModelPayload::new(
         MODEL_PAYLOAD_VERSION,
         "y ~ x + link(type=probit) + linkwiggle(degree=3, internal_knots=4, penalty_order=\"1\")"
@@ -3533,7 +3552,8 @@ fn intercept_only_gaussian_location_scale_model(
         None,
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = test_payload(
         "y ~ 1",
         ModelKind::LocationScale,
@@ -3595,7 +3615,8 @@ fn intercept_only_binomial_location_scale_model(
         Some(covariance),
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = test_payload(
         "y ~ 1",
         ModelKind::LocationScale,
@@ -3715,9 +3736,6 @@ fn mcwiggle_posterior_mean(
     acc / draws.max(1) as f64
 }
 
-
-
-
 #[test]
 fn cli_error_carries_the_typed_advice_of_a_duchon_smoothness_refusal() {
     // The Duchon admissibility message mentions "dimension=N" literally; the
@@ -3731,7 +3749,9 @@ fn cli_error_carries_the_typed_advice_of_a_duchon_smoothness_refusal() {
             8.0,
         ),
     ));
-    let advice = err.advice().expect("a Duchon smoothness refusal carries advice");
+    let advice = err
+        .advice()
+        .expect("a Duchon smoothness refusal carries advice");
     assert!(advice.contains("power"), "{advice}");
     assert!(advice.contains("at least 9"), "{advice}");
     assert!(err.to_string().contains("2*(p+s)=18"), "{err}");
@@ -3748,7 +3768,9 @@ fn cli_error_carries_the_typed_advice_of_a_conditioning_refusal_and_none_for_bar
             column_indices: vec![2],
         },
     );
-    let advice = err.advice().expect("a rank-deficiency refusal carries advice");
+    let advice = err
+        .advice()
+        .expect("a rank-deficiency refusal carries advice");
     assert!(advice.contains("conditioning"), "{advice}");
     assert!(advice.contains("[2]"), "{advice}");
     // A message with no typed identity is printed as it is, with no guessed
@@ -3936,7 +3958,8 @@ fn core_saved_fit_result_json_roundtripswith_finite_summary() {
                 curvature_floor: None,
             }),
         },
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let payload = serde_json::to_string(&fit)
         .unwrap_or_else(|e| panic!("{} failed: {:?}", "serialize fit result", e));
     let parsed: gam::estimate::UnifiedFitResult = serde_json::from_str(&payload)
@@ -4408,13 +4431,8 @@ fn build_termspec_gives_parametric_linear_terms_the_null_recovery_ridge_by_defau
         ("w".to_string(), 2usize),
     ]);
     let mut inference_notes = Vec::<String>::new();
-    let spec = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut inference_notes,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "term spec", e));
+    let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "term spec", e));
 
     assert_eq!(spec.linear_terms.len(), 3);
     // SPEC rules 12 and 14: a bare `x`, `linear(z)` and `nonnegative(w)` each own
@@ -4504,13 +4522,8 @@ fn build_termspec_accepts_joint_thinplate_above_three_dimensions() {
         ("pc4".to_string(), 3usize),
     ]);
     let mut inference_notes = Vec::<String>::new();
-    let spec = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut inference_notes,
-    )
-    .unwrap_or_else(|e| panic!("{} failed: {:?}", "4-d TPS should be accepted", e));
+    let spec = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "4-d TPS should be accepted", e));
     assert_eq!(spec.smooth_terms.len(), 1, "should have one smooth term");
 }
 
@@ -4643,9 +4656,8 @@ fn marginal_slope_routing_rejects_non_cubic_in_either_slot() {
         "--slope-formula",
     )
     .unwrap_or_else(|e| panic!("{} failed: {:?}", "slope formula parses", e));
-    let err =
-        route_marginal_slope_deviation_blocks(None, parsed_slope.linkwiggle.as_ref())
-            .expect_err("non-cubic slope linkwiggle must be rejected at routing");
+    let err = route_marginal_slope_deviation_blocks(None, parsed_slope.linkwiggle.as_ref())
+        .expect_err("non-cubic slope linkwiggle must be rejected at routing");
     assert!(err.contains("degree must be 3"), "got: {err}");
 }
 
@@ -4746,7 +4758,8 @@ fn bernoulli_marginal_slope_saved_model_persists_exact_kernel_metadata_only() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ).expect("saved fit reconstruction"),
+        )
+        .expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber → truncation
         // is a no-op (p_marginal == block-0 width).
         1,
@@ -4829,7 +4842,8 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ).expect("saved fit reconstruction"),
+        )
+        .expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber ⇒ truncation
         // is a no-op (p_marginal == block-0 width).
         p_marginal: 1,
@@ -4887,10 +4901,7 @@ fn cli_and_ffi_bernoulli_marginal_slope_payloads_have_one_contract() {
     assert_eq!(cli_payload.z_column, ffi_payload.z_column);
     assert_eq!(cli_payload.z_columns, ffi_payload.z_columns);
     assert_eq!(cli_payload.baseline_slope, ffi_payload.baseline_slope);
-    assert_eq!(
-        cli_payload.baseline_slopes,
-        ffi_payload.baseline_slopes
-    );
+    assert_eq!(cli_payload.baseline_slopes, ffi_payload.baseline_slopes);
     assert_eq!(cli_payload.marginal_baseline, ffi_payload.marginal_baseline);
     // `TermCollectionSpec` is not `PartialEq`; the resolved-termspec
     // singular/vector mirrors are covered by the full serialized snapshot
@@ -4975,7 +4986,8 @@ fn saved_bernoulli_marginal_slope_prediction_replays_latent_z_normalization() {
             log_likelihood_normalization: LogLikelihoodNormalization::UserProvided,
             ..saved_fit_summary_fixture()
         },
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let model = bernoulli_marginal_slope_saved_model_fixture(
         "y ~ 1".to_string(),
         DataSchema {
@@ -5088,7 +5100,8 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
             None,
             None,
             saved_fit_summary_fixture(),
-        ).expect("saved fit reconstruction"),
+        )
+        .expect("saved fit reconstruction"),
         // Single marginal coefficient, no influence absorber → truncation
         // is a no-op (p_marginal == block-0 width).
         1,
@@ -5141,14 +5154,17 @@ fn saved_marginal_slope_models_require_latent_z_normalization() {
         },
         "survival",
     );
-    survival.fit_result = Some(core_saved_fit_result(
-        array![0.0],
-        Array1::zeros(0),
-        1.0,
-        None,
-        None,
-        saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction"));
+    survival.fit_result = Some(
+        core_saved_fit_result(
+            array![0.0],
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_fixture(),
+        )
+        .expect("saved fit reconstruction"),
+    );
     survival.data_schema = Some(DataSchema { columns: vec![] });
     survival.set_training_feature_metadata(vec![], vec![]);
     survival.resolved_termspec = Some(empty_termspec());
@@ -5251,13 +5267,8 @@ fn build_termspec_rejects_duchon_double_penalty_option() {
     };
     let col_map = HashMap::from([("pc1".to_string(), 0usize), ("pc2".to_string(), 1usize)]);
     let mut inference_notes = Vec::<String>::new();
-    let err = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut inference_notes,
-    )
-    .expect_err("Duchon double_penalty should be rejected");
+    let err = build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes)
+        .expect_err("Duchon double_penalty should be rejected");
     assert!(err.to_string().contains("does not support double_penalty"));
     assert!(inference_notes.is_empty());
 }
@@ -5348,18 +5359,13 @@ fn build_termspec_honors_explicit_duchon_power_and_builds_well_posed() {
         ("pc4".to_string(), 3usize),
     ]);
     let mut inference_notes = Vec::<String>::new();
-    let spec = build_termspec(
-        &parsed.terms,
-        &ds,
-        &col_map,
-        &mut inference_notes,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "explicit power=1 must be honored, not rejected", e
-        )
-    });
+    let spec =
+        build_termspec(&parsed.terms, &ds, &col_map, &mut inference_notes).unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "explicit power=1 must be honored, not rejected", e
+            )
+        });
     assert_eq!(spec.smooth_terms.len(), 1);
     match &spec.smooth_terms[0].basis {
         gam::smooth::SmoothBasisSpec::Duchon { spec: duchon, .. } => {
@@ -5414,7 +5420,7 @@ fn survival_prediction_csv_includes_explicit_semantics_columns() {
         None,
         None,
     )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv", e));
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival prediction csv", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
@@ -5447,7 +5453,7 @@ fn survival_binary_prediction_csv_includes_explicit_semantics_columns() {
         None,
         None,
     )
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival binary prediction csv", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
@@ -5498,7 +5504,8 @@ fn survival_prediction_csv_emits_bounds_without_std_error() {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
     let header = text.lines().next().unwrap_or("");
     assert_eq!(
-        header, "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
+        header,
+        "eta,survival_prob_plugin,survival_prob,failure_prob,risk_score,mean_lower,mean_upper",
         "survival output must include bounds when supplied without std_error",
     );
 
@@ -5702,12 +5709,7 @@ fn location_scale_prediction_csv_uses_estimand_explicit_schema() {
         None,
         None,
     )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "write location-scale prediction csv", e
-        )
-    });
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "write location-scale prediction csv", e));
 
     let text =
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{} failed: {:?}", "read csv", e));
@@ -5972,7 +5974,7 @@ fn saved_survival_flex_exit_helper_matches_rigid_when_deviations_absent() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!(
             (eta[i] - expected_eta).abs() <= 1e-10,
             "row {i}: eta mismatch: got {}, expected {}",
@@ -6059,7 +6061,7 @@ fn saved_survival_flex_exit_helper_with_zero_scorewarp_matches_rigid() {
     for i in 0..q_exit.len() {
         let c = (1.0 + slope[i] * slope[i]).sqrt();
         let expected_eta = q_exit[i] * c + slope[i] * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6090,7 +6092,7 @@ fn saved_survival_flex_exit_helper_matches_gaussian_frailty_rigid_formula() {
         let sb = scale * slope[i];
         let c = (1.0 + sb * sb).sqrt();
         let expected_eta = q_exit[i] * c + sb * z[i];
-        let expected_mean = super::normal_cdf(expected_eta);
+        let expected_mean = normal_cdf(expected_eta);
         assert!((eta[i] - expected_eta).abs() <= 1e-10);
         assert!((mean[i] - expected_mean).abs() <= 1e-10);
     }
@@ -6207,7 +6209,8 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
         None,
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
 
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ x1 + x2",
@@ -6261,27 +6264,28 @@ fn saved_survival_marginal_slope_predictor_keeps_operator_backed_designs_lazy() 
     let primary_offset = array![0.2, -0.15];
     let noise_offset = array![0.04, -0.01];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
-        &model,
-        &fit_saved,
-        "z",
-        &z,
-        &cov_design,
-        &slope_design,
-        &time_build,
-        &eta_offset_entry,
-        &eta_offset_exit,
-        &derivative_offset_exit,
-        &primary_offset,
-        &noise_offset,
-        None,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "operator-backed saved survival predictor should build without densifying", e
+    let (predictor, pred_input, _) =
+        gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
+            &model,
+            &fit_saved,
+            "z",
+            &z,
+            &cov_design,
+            &slope_design,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &primary_offset,
+            &noise_offset,
+            None,
         )
-    });
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "operator-backed saved survival predictor should build without densifying", e
+            )
+        });
 
     assert!(
         pred_input.design.as_dense_ref().is_none(),
@@ -6372,7 +6376,8 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
         None,
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
 
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
@@ -6480,27 +6485,28 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
     let primary_offset = array![0.0];
     let noise_offset = array![0.0];
 
-    let (predictor, pred_input, _) = super::build_saved_survival_marginal_slope_predictor(
-        &model,
-        &fit_saved,
-        "z",
-        &z_raw,
-        &cov_design,
-        &slope_design,
-        &time_build,
-        &eta_offset_entry,
-        &eta_offset_exit,
-        &derivative_offset_exit,
-        &primary_offset,
-        &noise_offset,
-        None,
-    )
-    .unwrap_or_else(|e| {
-        panic!(
-            "{} failed: {:?}",
-            "saved survival marginal-slope predictor should build", e
+    let (predictor, pred_input, _) =
+        gam::families::survival::predict::build_saved_survival_marginal_slope_predictor(
+            &model,
+            &fit_saved,
+            "z",
+            &z_raw,
+            &cov_design,
+            &slope_design,
+            &time_build,
+            &eta_offset_entry,
+            &eta_offset_exit,
+            &derivative_offset_exit,
+            &primary_offset,
+            &noise_offset,
+            None,
         )
-    });
+        .unwrap_or_else(|e| {
+            panic!(
+                "{} failed: {:?}",
+                "saved survival marginal-slope predictor should build", e
+            )
+        });
     let prediction = predictor
         .predict_plugin_response(&pred_input)
         .unwrap_or_else(|e| {
@@ -6525,6 +6531,152 @@ fn saved_survival_marginal_slope_prediction_replays_latent_z_normalization() {
             .unwrap_or_else(|e| panic!("{} failed: {:?}", "saved survival helper should evaluate", e));
     assert!((prediction.eta[0] - expected_eta[0]).abs() <= 1e-12);
     assert!((prediction.mean[0] - expected_mean[0]).abs() <= 1e-12);
+}
+
+/// gam#3316: `gam predict` on a survival marginal-slope model publishes the
+/// library's `predict_survival` posterior mean, not a probit-normal integral of
+/// a delta-method Gaussian for eta. The CLI columns must be the library's
+/// surfaces at each row's own exit time, band included.
+#[test]
+fn cli_survival_marginal_slope_predict_publishes_library_posterior_mean_3316() {
+    use gam::families::survival::predict::{
+        SurvivalPredictEstimand, SurvivalPredictRequest, SurvivalPredictionCovarianceMode,
+        predict_survival,
+    };
+    let td = tempdir().unwrap_or_else(|e| panic!("{} failed: {:?}", "tempdir", e));
+    let train_path = td.path().join("train.csv");
+    let model_path = td.path().join("model.json");
+    let pred_path = td.path().join("pred.csv");
+    let n = 80usize;
+    let mut csv = String::from("t0,t1,event,x,z\n");
+    let mut state: u64 = 0x3316;
+    let mut uniform = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    };
+    for i in 0..n {
+        let x = -1.0 + 2.0 * (i as f64 + 0.5) / n as f64;
+        let z = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        // Probit survival S(t) = Phi(-(log t - 0.4 x - 0.5 z)): draw t from it.
+        let e = gam::probability::standard_normal_quantile(uniform())
+            .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+        let t = (0.4 * x + 0.5 * z + e).exp();
+        let censor = (1.5 * uniform()).exp();
+        let (time, event) = if t <= censor { (t, 1) } else { (censor, 0) };
+        csv.push_str(&format!("0,{time},{event},{x},{z}\n"));
+    }
+    fs::write(&train_path, csv)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "write survival marginal-slope csv", e));
+
+    let mut args = location_scale_fit_args(
+        train_path.clone(),
+        model_path.clone(),
+        "Surv(t0, t1, event) ~ x",
+        "unused",
+    );
+    args.predict_noise = None;
+    args.slope_formula = Some("1".to_string());
+    args.z_column = Some("z".to_string());
+    args.survival_likelihood = Some("marginal-slope".to_string());
+    run_fit(args).unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope fit should succeed", e
+        )
+    });
+
+    run_predict(PredictArgs {
+        model: model_path.clone(),
+        new_data: train_path.clone(),
+        out: pred_path.clone(),
+        offset_column: None,
+        noise_offset_column: None,
+        id_column: None,
+        uncertainty: true,
+        level: 0.9,
+        covariance_mode: Some(InferenceCovarianceMode::Conditional),
+        conformal: false,
+        calibration: None,
+        training_data: None,
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "survival marginal-slope predict should succeed", e
+        )
+    });
+
+    let model = SavedModel::load_from_path(&model_path)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "load fitted model", e));
+    let dataset = load_dataset_projected(
+        &train_path,
+        &[
+            "t0".to_string(),
+            "t1".to_string(),
+            "event".to_string(),
+            "x".to_string(),
+            "z".to_string(),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "load survival dataset", e));
+    let col_map = dataset.column_map();
+    let zeros = Array1::<f64>::zeros(n);
+    let library = predict_survival(
+        SurvivalPredictRequest {
+            model: &model,
+            data: dataset.values.view(),
+            col_map: &col_map,
+            training_headers: model.payload().training_headers.as_ref(),
+            primary_offset: &zeros,
+            noise_offset: &zeros,
+            time_grid: None,
+            with_uncertainty: true,
+            estimand: SurvivalPredictEstimand::PosteriorMean,
+        },
+        SurvivalPredictionCovarianceMode::Conditional,
+    )
+    .unwrap_or_else(|e| panic!("{} failed: {:?}", "library survival predict", e));
+    let plugin = library
+        .survival_plugin
+        .as_ref()
+        .expect("the posterior-mean prediction keeps its plug-in by name");
+    let survival_se = library
+        .survival_se
+        .as_ref()
+        .expect("uncertainty was requested");
+    let eta_se = library.eta_se.as_ref().expect("uncertainty was requested");
+    let z = gam::probability::standard_normal_quantile(0.95)
+        .unwrap_or_else(|e| panic!("{} failed: {:?}", "normal quantile", e));
+    // The CSV writes every value with `{:.12}` fixed decimals, so a published
+    // cell differs from the library value by at most half a unit in the 12th
+    // decimal plus the parse's own rounding (one ulp of the value).
+    let assert_published = |column: &str, row: usize, expected: f64| {
+        let published = csv_value_at(&pred_path, row, column);
+        let bound = 0.5e-12 + f64::EPSILON * expected.abs().max(1.0);
+        assert!(
+            (published - expected).abs() <= bound,
+            "row {row} `{column}`: CSV published {published}, library {expected}"
+        );
+    };
+    let mut max_gap_to_delta = 0.0f64;
+    for i in 0..n {
+        let mean = library.survival[[i, 0]];
+        let sd = survival_se[[i, 0]];
+        assert_published("survival_prob", i, mean);
+        assert_published("survival_prob_plugin", i, plugin[[i, 0]]);
+        assert_published("eta", i, library.linear_predictor[i]);
+        assert_published("std_error", i, eta_se[i]);
+        assert_published("mean_lower", i, (mean - z * sd).clamp(0.0, 1.0));
+        assert_published("mean_upper", i, (mean + z * sd).clamp(0.0, 1.0));
+        let delta = normal_cdf(-library.linear_predictor[i] / (1.0 + eta_se[i] * eta_se[i]).sqrt());
+        max_gap_to_delta = max_gap_to_delta.max((mean - delta).abs());
+    }
+    eprintln!(
+        "[gam#3316] max |library posterior mean - delta-method Phi(-eta/sqrt(1+se^2))| = {max_gap_to_delta:.3e}"
+    );
 }
 
 #[test]
@@ -6605,7 +6757,8 @@ fn run_predict_survival_supports_saved_baseline_timewiggle_model() {
         Some(Array2::<f64>::eye(p)),
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ timewiggle(degree=3, internal_knots=4)",
         ModelKind::Survival,
@@ -6786,7 +6939,8 @@ fn run_predict_survival_supports_saved_latent_survival_model() {
         None,
         None,
         saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction");
+    )
+    .expect("saved fit reconstruction");
     let mut payload = test_payload(
         "Surv(entry, exit, event) ~ 1",
         ModelKind::Survival,
@@ -7001,14 +7155,17 @@ fn saved_baseline_timewiggle_reconstruction_keeps_requested_order_one_penalty() 
         },
         "survival",
     );
-    payload.fit_result = Some(core_saved_fit_result(
-        Array1::ones(1),
-        Array1::zeros(0),
-        1.0,
-        None,
-        None,
-        saved_fit_summary_fixture(),
-    ).expect("saved fit reconstruction"));
+    payload.fit_result = Some(
+        core_saved_fit_result(
+            Array1::ones(1),
+            Array1::zeros(0),
+            1.0,
+            None,
+            None,
+            saved_fit_summary_fixture(),
+        )
+        .expect("saved fit reconstruction"),
+    );
     payload.baseline_timewiggle_knots = Some(built.knots.to_vec());
     payload.baseline_timewiggle_degree = Some(built.degree);
     payload.baseline_timewiggle_penalty_orders = Some(vec![1, 2, 3]);
@@ -7366,13 +7523,9 @@ fn parse_survival_inverse_link_accepts_flexible_standard_links() {
 
 #[test]
 fn parse_survival_inverse_link_rejects_flexible_blended_links() {
-    let err = parse_survival_inverse_link(
-        "flexible(blended(logit,probit))",
-        Some("0.2"),
-        None,
-        None,
-    )
-    .expect_err("flexible blended survival link should be rejected");
+    let err =
+        parse_survival_inverse_link("flexible(blended(logit,probit))", Some("0.2"), None, None)
+            .expect_err("flexible blended survival link should be rejected");
     assert!(err.contains("does not support blended(...)/mixture(...)"));
 }
 
@@ -7391,8 +7544,8 @@ fn parse_survival_inverse_link_reports_survival_specific_supported_links() {
 fn parse_survival_inverse_link_accepts_loglog_and_cauchit() {
     // `--link loglog` parses to a single-component LogLog mixture (weight 1.0), which
     // evaluates as the exact loglog inverse link mu = exp(-exp(-eta)).
-    let loglog =
-        parse_survival_inverse_link("loglog", None, None, None).expect("loglog survival link parses");
+    let loglog = parse_survival_inverse_link("loglog", None, None, None)
+        .expect("loglog survival link parses");
     let loglog_state = match &loglog {
         InverseLink::Mixture(state) => state,
         other => panic!("expected loglog to route through a mixture, got {other:?}"),
@@ -8305,7 +8458,10 @@ fn fit_survival_location_scale_live_warp_2695(degree: usize, internal_knots: usi
     if degree == 0 {
         assert_eq!(warp_width, 0, "a fit without linkwiggle saved a warp block");
     } else {
-        assert!(warp_width > 0, "degree={degree} linkwiggle fit saved no warp coefficients");
+        assert!(
+            warp_width > 0,
+            "degree={degree} linkwiggle fit saved no warp coefficients"
+        );
     }
 }
 

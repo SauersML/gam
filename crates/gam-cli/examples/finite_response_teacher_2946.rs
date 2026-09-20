@@ -207,7 +207,9 @@ fn declare(harvest: &Path, rank: usize, out: &Path) -> Result<(), String> {
         .map_err(|err| format!("thin SVD of the centred post-norm rows: {err}"))?;
     let svd_seconds = started.elapsed().as_secs_f64();
     let singular = factors.1;
-    let vt = factors.2.ok_or("the SVD returned no right singular vectors")?;
+    let vt = factors
+        .2
+        .ok_or("the SVD returned no right singular vectors")?;
     let mut order: Vec<usize> = (0..singular.len()).collect();
     order.sort_by(|a, b| singular[*b].total_cmp(&singular[*a]));
     if rank == 0 || rank > order.len() {
@@ -364,7 +366,8 @@ fn draw(
 
     let blocks = 2 + named.len();
     let h_path = out.join("h.npy");
-    let file = File::create(&h_path).map_err(|err| format!("create {}: {err}", h_path.display()))?;
+    let file =
+        File::create(&h_path).map_err(|err| format!("create {}: {err}", h_path.display()))?;
     let mut writer = npyz::WriteOptions::<f64>::new()
         .default_dtype()
         .shape(&[(rows * blocks) as u64, d as u64])
@@ -736,10 +739,14 @@ fn analytic(
     let rank = factor.ncols();
     // The torch layout and the absorption of the declared law `h = h0 + L z` (gate and up readers `W L`, `A L`,
     // biases `W h0`, `A h0`) have one owner in gam-sae.
-    let block = UnabsorbedGatedBlock::from_torch_parameters(parameters, hidden_act, Array2::<f64>::eye(output_dim))
-        .map_err(|err| format!("torch block: {err}"))?
-        .absorb(h0.view(), factor.view())
-        .map_err(|err| format!("absorbed block: {err}"))?;
+    let block = UnabsorbedGatedBlock::from_torch_parameters(
+        parameters,
+        hidden_act,
+        Array2::<f64>::eye(output_dim),
+    )
+    .map_err(|err| format!("torch block: {err}"))?
+    .absorb(h0.view(), factor.view())
+    .map_err(|err| format!("absorbed block: {err}"))?;
     let absorb_seconds = started.elapsed().as_secs_f64();
 
     let layout = read_json(&draw_dir.join("draw.json"))?;
@@ -785,7 +792,8 @@ fn analytic(
         let retained = entry["frame"]
             .get("retained")
             .and_then(Value::as_u64)
-            .ok_or_else(|| format!("frame {name} names no retained count"))? as usize;
+            .ok_or_else(|| format!("frame {name} names no retained count"))?
+            as usize;
         let mc = mc_frames
             .iter()
             .find(|frame| frame.get("name").and_then(Value::as_str) == Some(name))
@@ -821,7 +829,10 @@ fn analytic(
             .map(|row| row.dot(&row))
             .sum::<f64>()
             / rows as f64;
-        let largest_band = response.quadrature_band.iter().fold(0.0_f64, |largest, &band| largest.max(band));
+        let largest_band = response
+            .quadrature_band
+            .iter()
+            .fold(0.0_f64, |largest, &band| largest.max(band));
         let frame_seconds = frame_started.elapsed().as_secs_f64();
         println!(
             "[analytic] frame={name} retained={retained} E|F-bar - g|^2: Stein gated mean {gap:.3e} +- {gap_se:.3e} (z={:.2}, quadrature bias <= {quadrature_bias:.3e}), unsmoothed F(Pz) {control:.3e} +- {control_se:.3e} (z={:.2}); executed E(P)={mc_discarded:.6e} +- {mc_discarded_se:.3e}; {frame_seconds:.1}s",
@@ -871,7 +882,9 @@ fn torch_parameters(harvest: &Path, meta: &Value) -> Result<BTreeMap<String, Arr
         let shape = npy
             .shape()
             .iter()
-            .map(|&extent| usize::try_from(extent).map_err(|err| format!("{}: {err}", path.display())))
+            .map(|&extent| {
+                usize::try_from(extent).map_err(|err| format!("{}: {err}", path.display()))
+            })
             .collect::<Result<Vec<usize>, String>>()?;
         let values = npy
             .try_data::<f64>()
@@ -956,7 +969,11 @@ fn read_rows<T: npyz::Deserialize + Into<f64>>(
     let npy = open_npy(path)?;
     let shape = npy.shape().to_vec();
     let [rows, cols] = shape.as_slice() else {
-        return Err(format!("{} must be 2-D; it has {} axes", path.display(), shape.len()));
+        return Err(format!(
+            "{} must be 2-D; it has {} axes",
+            path.display(),
+            shape.len()
+        ));
     };
     let rows = usize::try_from(*rows).map_err(|err| format!("{}: {err}", path.display()))?;
     let cols = usize::try_from(*cols).map_err(|err| format!("{}: {err}", path.display()))?;

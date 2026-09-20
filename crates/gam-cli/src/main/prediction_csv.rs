@@ -1,16 +1,11 @@
 use super::*;
 
-pub(crate) const STANDARD_PREDICTION_BASE_COLUMNS: [&str; 3] = [
-    "linear_predictor_plugin",
-    "mean_plugin",
-    "posterior_mean",
-];
+pub(crate) const STANDARD_PREDICTION_BASE_COLUMNS: [&str; 3] =
+    ["linear_predictor_plugin", "mean_plugin", "posterior_mean"];
 pub(crate) const STANDARD_PREDICTION_INTERVAL_COLUMNS: [&str; 2] =
     ["posterior_mean_lower", "posterior_mean_upper"];
-pub(crate) const STANDARD_PREDICTION_STD_ERROR_COLUMN: &str =
-    "posterior_mean_standard_error";
-pub(crate) const STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN: &str =
-    "linear_predictor_standard_error";
+pub(crate) const STANDARD_PREDICTION_STD_ERROR_COLUMN: &str = "posterior_mean_standard_error";
+pub(crate) const STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN: &str = "linear_predictor_standard_error";
 pub(crate) const PREDICTION_NOISE_SCALE_COLUMN: &str = "noise_scale";
 pub(crate) const SPECIALIZED_PREDICTION_BASE_COLUMNS: [&str; 2] = ["eta", "mean"];
 /// Survival prediction columns. `survival_prob_plugin` is the plug-in
@@ -355,10 +350,7 @@ pub(crate) fn write_estimand_explicit_prediction_csv(
                 });
             }
             columns.push((STANDARD_PREDICTION_ETA_STD_ERROR_COLUMN, eta_standard_error));
-            columns.push((
-                STANDARD_PREDICTION_STD_ERROR_COLUMN,
-                standard_error,
-            ));
+            columns.push((STANDARD_PREDICTION_STD_ERROR_COLUMN, standard_error));
             columns.push((STANDARD_PREDICTION_INTERVAL_COLUMNS[0], lower));
             columns.push((STANDARD_PREDICTION_INTERVAL_COLUMNS[1], upper));
         }
