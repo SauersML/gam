@@ -9,9 +9,7 @@ use gam_math::special::stable_polynomial_times_exp_neg;
 use ndarray::{Array2, ArrayView2, s};
 use rayon::prelude::*;
 
-use crate::basis::duchon_kernel_math::{
-    centered_aniso_log_scale_mean, centered_aniso_metric_weights,
-};
+use crate::basis::duchon_kernel_math::centered_aniso_metric_weights;
 use crate::basis::{BasisError, MaternNu};
 
 /// Default row-chunk size for streaming the `(data × centers)` distance scan.
@@ -22,9 +20,10 @@ const DEFAULT_ROW_CHUNK: usize = 2048;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaternBasisGradientTarget {
     LogKappa,
-    /// Derivative through the centered, clamped metric coordinates. At an
-    /// exact centered contrast of ±50 the metric is nondifferentiable; use
-    /// its saturated-side derivative (zero for that metric coordinate).
+    /// Derivative through the centered metric coordinates
+    /// `psi_a = eta_a - mean(eta)` (axis scale `exp(psi_a)`), exactly as the
+    /// shared `centered_aniso_metric_weights` builds them. The metric is
+    /// unclamped, so this is smooth in every `eta`.
     AnisoLogScale(usize),
 }
 
@@ -34,7 +33,6 @@ pub struct StreamingMaternBasisGradientEvaluator {
     length_scale: f64,
     nu: MaternNu,
     metric_axis_scales: Vec<f64>,
-    metric_axis_derivatives: Vec<bool>,
     chunk_size: usize,
 }
 
@@ -62,7 +60,7 @@ impl StreamingMaternBasisGradientEvaluator {
                 "StreamingMaternBasisGradientEvaluator length_scale must be finite and positive; got {length_scale}"
             );
         }
-        let (metric_weights, metric_axis_derivatives) = match aniso_log_scales {
+        let metric_weights = match aniso_log_scales {
             Some(eta) => {
                 if eta.len() != centers.ncols() {
                     crate::bail_dim_basis!(
@@ -78,25 +76,15 @@ impl StreamingMaternBasisGradientEvaluator {
                         )));
                     }
                 }
-                let mean = centered_aniso_log_scale_mean(eta);
-                (
-                    centered_aniso_metric_weights(eta),
-                    eta.iter()
-                        .map(|&value| {
-                            let centered = value - mean;
-                            centered > -50.0 && centered < 50.0
-                        })
-                        .collect(),
-                )
+                centered_aniso_metric_weights(eta)
             }
-            None => (vec![1.0; centers.ncols()], vec![true; centers.ncols()]),
+            None => vec![1.0; centers.ncols()],
         };
         Ok(Self {
             centers: centers.as_standard_layout().to_owned(),
             length_scale,
             nu,
             metric_axis_scales: metric_weights.into_iter().map(f64::sqrt).collect(),
-            metric_axis_derivatives,
             chunk_size: chunk_size.unwrap_or(DEFAULT_ROW_CHUNK).max(1),
         })
     }
@@ -135,7 +123,6 @@ impl StreamingMaternBasisGradientEvaluator {
         let chunk_n = end - start;
         let k = self.n_centers();
         let dim = self.dimension();
-        let all_axes_active = self.metric_axis_derivatives.iter().all(|&active| active);
         // The shared metric deliberately leaves a one-axis eta uncentered.
         let mean_derivative = if dim > 1 { 1.0 / dim as f64 } else { 0.0 };
         if chunk_n == 0 || k == 0 {
@@ -154,7 +141,6 @@ impl StreamingMaternBasisGradientEvaluator {
                 for center_idx in 0..k {
                     let c = &centers[center_idx * dim..(center_idx + 1) * dim];
                     let mut distance = 0.0_f64;
-                    let mut active_distance = 0.0_f64;
                     let mut axis_component = 0.0;
                     for axis in 0..dim {
                         let component = dimensionless_metric_displacement(
@@ -164,9 +150,6 @@ impl StreamingMaternBasisGradientEvaluator {
                             self.metric_axis_scales[axis],
                         );
                         distance = distance.hypot(component);
-                        if !all_axes_active && self.metric_axis_derivatives[axis] {
-                            active_distance = active_distance.hypot(component);
-                        }
                         if target == MaternBasisGradientTarget::AnisoLogScale(axis) {
                             axis_component = component;
                         }
@@ -174,21 +157,14 @@ impl StreamingMaternBasisGradientEvaluator {
                     let d_log_kappa = matern_log_kappa_derivative(distance, self.nu);
                     row[center_idx] = match target {
                         MaternBasisGradientTarget::LogKappa => d_log_kappa,
-                        MaternBasisGradientTarget::AnisoLogScale(axis) => {
+                        MaternBasisGradientTarget::AnisoLogScale(_) => {
+                            // dr/deta_b = r * ((u_b / r)^2 - 1/d): every axis
+                            // scale exp(psi_a) moves with eta_b through the mean.
                             if d_log_kappa == 0.0 {
                                 0.0
                             } else {
-                                let axis_fraction = if self.metric_axis_derivatives[axis] {
-                                    (axis_component / distance).powi(2)
-                                } else {
-                                    0.0
-                                };
-                                let active_fraction = if all_axes_active {
-                                    1.0
-                                } else {
-                                    (active_distance / distance).powi(2)
-                                };
-                                d_log_kappa * (axis_fraction - mean_derivative * active_fraction)
+                                d_log_kappa
+                                    * ((axis_component / distance).powi(2) - mean_derivative)
                             }
                         }
                     };
@@ -431,9 +407,16 @@ mod tests {
     }
 
     #[test]
-    fn anisotropic_gradient_differentiates_the_clamped_metric() {
-        let eta = [80.0_f64, 0.0, 0.0];
-        let data = array![[(-50.0_f64).exp(), (80.0_f64 / 3.0).exp(), 0.0]];
+    fn anisotropic_gradient_differentiates_the_unclamped_metric_beyond_fifty() {
+        // Centered contrasts [80, -40, -40]: far outside the old ±50 window.
+        // The data are chosen so every metric-scaled component is O(1), so
+        // the kernel and its gradient are O(1) and the check is not vacuous.
+        let eta = [120.0_f64, 0.0, 0.0];
+        let data = array![[
+            0.8 * (-80.0_f64).exp(),
+            0.5 * 40.0_f64.exp(),
+            0.2 * 40.0_f64.exp()
+        ]];
         let centers = array![[0.0, 0.0, 0.0]];
         let evaluator = StreamingMaternBasisGradientEvaluator::new(
             centers.view(), 1.0, MaternNu::ThreeHalves, Some(&eta), None,
@@ -455,6 +438,7 @@ mod tests {
             let actual = evaluator
                 .evaluate(data.view(), MaternBasisGradientTarget::AnisoLogScale(axis))
                 .unwrap()[[0, 0]];
+            assert!(fd.abs() > 1e-2, "axis {axis}: vacuous finite difference {fd}");
             assert!((actual - fd).abs() < 1e-8, "axis {axis}: {actual} vs {fd}");
         }
     }
