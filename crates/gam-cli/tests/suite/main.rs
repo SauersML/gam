@@ -22,4 +22,5 @@ mod regression_bspline_nonzero_anchor_pin_2297;
 mod regression_predict_cli_surfaces_covariance_provenance;
 mod regression_predict_uncertainty_point_mean_linear_link;
 mod regression_separated_binomial_predict_round_trips_2273;
+mod royston_parmar_survival_band_3560;
 mod spline_scan_persistence_acceptance_2302;
