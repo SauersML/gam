@@ -418,7 +418,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 // `B = I_n ⊗ M`: the diagonal is `diag(M)` tiled over the rows.
                 let m = p
                     .psd_majorizer_row_block(self.target.view(), self.rho.view())
-                    .unwrap_or_else(|message| panic!("{message}"));
+                    .expect("BlockOrthogonality PSD row-block majorizer");
                 let d = m.nrows();
                 Array1::from_shape_fn(self.target.len(), |i| m[[i % d, i % d]])
             }
@@ -554,7 +554,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                 // `B = I_n ⊗ M`, the row-block PSD majorizer.
                 let m = p
                     .psd_majorizer_row_block(self.target.view(), self.rho.view())
-                    .unwrap_or_else(|message| panic!("{message}"));
+                    .expect("BlockOrthogonality PSD row-block majorizer");
                 let d = m.nrows();
                 let n = self.target.len();
                 let mut dense = Array2::<f64>::zeros((n, n));
@@ -580,7 +580,7 @@ impl PenaltyOp for FrozenAnalyticPenaltyOp {
                     return Array2::<f64>::zeros((n, n));
                 };
                 let envelope = OrthogonalityPenalty::psd_majorizer_gram(t.view())
-                    .unwrap_or_else(|message| panic!("{message}"));
+                    .expect("Orthogonality PSD Gram envelope");
                 return p.as_dense_with_precomputed_m(
                     t.view(),
                     envelope.view(),
@@ -656,7 +656,7 @@ impl FrozenAnalyticPenaltyOp {
                 // Diagonal of the PSD majorizer: `G = TᵀT − I` replaced by its
                 // certified PSD envelope, as in `psd_majorizer_hvp`.
                 let gram = OrthogonalityPenalty::psd_majorizer_gram(t.view())
-                    .unwrap_or_else(|message| panic!("{message}"));
+                    .expect("Orthogonality PSD Gram envelope");
                 let scale = p.scale(self.rho.view());
                 let factor = 2.0 * scale;
                 let mut diag = Array1::<f64>::zeros(n);

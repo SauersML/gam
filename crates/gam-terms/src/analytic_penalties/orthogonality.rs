@@ -585,7 +585,7 @@ impl AnalyticPenalty for BlockOrthogonalityPenalty {
         );
         let m = self
             .psd_majorizer_row_block(target, rho)
-            .unwrap_or_else(|message| panic!("{message}"));
+            .expect("BlockOrthogonality PSD row-block majorizer");
         let v_mat = self
             .target_matrix(v)
             .expect("direction has the target's shape");
@@ -1851,7 +1851,7 @@ impl AnalyticPenalty for OrthogonalityPenalty {
             .target_matrix(v)
             .expect("direction has the target's shape");
         let envelope =
-            Self::psd_majorizer_gram(t.view()).unwrap_or_else(|message| panic!("{message}"));
+            Self::psd_majorizer_gram(t.view()).expect("Orthogonality PSD Gram envelope");
         let bv =
             self.hvp_with_precomputed_m(t.view(), envelope.view(), v_mat.view(), self.scale(rho));
         Self::flatten_matrix(&bv)
