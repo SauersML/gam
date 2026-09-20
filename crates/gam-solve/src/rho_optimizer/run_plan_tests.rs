@@ -6493,3 +6493,8 @@ mod arc_rejected_trials_3017_tests;
 // two evaluations it compares, not a relative floor (#3018).
 #[path = "cost_stall_objective_band_3018_tests.rs"]
 mod cost_stall_objective_band_3018_tests;
+
+// An ARC claim on a trial above the iterate it left is declined as a
+// dominated plateau (#3279).
+#[path = "arc_uphill_trial_claim_3279_tests.rs"]
+mod arc_uphill_trial_claim_3279_tests;
