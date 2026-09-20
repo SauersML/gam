@@ -14,6 +14,7 @@ use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
 use gam_problem::OrderedRhoBounds;
+use gam_terms::inference::smooth_score_test::WorkingResidual;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
@@ -1749,6 +1750,14 @@ where
                  rho: &Array1<f64>,
                  face: &[usize]| { state.rail_face_limit(rho, face) },
             );
+            // The λ→0 end: a covered zero-smoothing face is analytic in λ, so
+            // its first-order law is exact and the face is proven from the
+            // signs of the slopes.
+            let obj = obj.with_zero_smoothing_face(
+                |state: &mut &mut crate::estimate::reml::RemlState<'_>,
+                 rho: &Array1<f64>,
+                 face: &[usize]| { state.zero_smoothing_face(rho, face) },
+            );
             // #2676: publish the criterion's EXACT invariance — the directions
             // of rho along which the penalty map, and therefore the criterion,
             // does not move at all. The outer certificate deflates them instead
@@ -2693,8 +2702,9 @@ where
     // Factorization of stabilized Hessian in transformed basis, reused for
     // SE computation via solve-on-demand after dispersion is determined.
     let mut edf_factor: Option<InferenceHessianFactor> = None;
-    // The Tier-0 seam runs only inside the inference pass below; a fit run without
-    // inference keeps this typed reason instead of an unexplained absence (#2627).
+    // The Tier-0 seam runs only inside the inference pass below, and only when the
+    // caller requested rho-posterior inference (#3010); any other fit keeps this
+    // typed reason instead of an unexplained absence (#2627).
     let mut rho_posterior = gam_problem::rho_posterior::RhoPosteriorOutcome::NotComputed(
         gam_problem::rho_posterior::RhoPosteriorNotComputed::InferenceNotRequested,
     );
@@ -3163,14 +3173,10 @@ where
     //
     // The identity check is BITWISE on ρ, not a re-judged gradient norm: the
     // retained certificate is the analytic stationarity authority minted at
-    // `outer_result.rho` by the full certification machinery (noise-floor
-    // widenings, flatness probes, asymptote rails). In the deep-smoothing
-    // regime the analytic gradient is a noise instrument (|Pg| redraws across
-    // evaluations of the SAME point — the reproducibility floor exists because
-    // of it), so re-drawing it once here and comparing against the certified
-    // band refuses honest noise-band certificates with coin-flip probability
-    // while adding nothing to point-identity (which bit equality decides
-    // exactly). The evaluation itself is kept: it installs the inner state at
+    // `outer_result.rho` by the full certification machinery (derived bands,
+    // flatness probes, asymptote rails). Re-judging a second gradient here
+    // would add nothing to point-identity, which bit equality decides exactly.
+    // The evaluation itself is kept: it installs the inner state at
     // the shipped point and supplies the shipped value/gradient fields.
     let (final_value, finalgrad, finalgrad_norm) = if final_rho.is_empty() {
         (outer_result.final_value, Array1::zeros(0), 0.0)
@@ -3675,6 +3681,24 @@ where
         // errors beside the conditional ones below, because a `p × p` matrix is
         // what its governor refused (#3283); it charges the correction's
         // workspace here, where the dense bundle already holds it.
+        //
+        // The ρ-block rails, not the theta-wide `railed_facts`: the Hessians
+        // judged and sampled below (this correction and the Tier-0 proposal)
+        // are ρ-Hessians, and a railed link-shape coordinate is not one of
+        // their axes.
+        let certified_railed_rho: Vec<usize> = outer_result
+            .criterion_certificate
+            .as_ref()
+            .map(|certificate| {
+                certificate
+                    .lambdas_railed
+                    .iter()
+                    .copied()
+                    .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
+                    .filter(|&index| index < final_rho.len())
+                    .collect()
+            })
+            .unwrap_or_default();
         let smoothing_workspace = if beta_covariance_unscaled.is_some() {
             Ok(None)
         } else {
@@ -3775,22 +3799,6 @@ where
                 )
             }))
             .collect();
-            // The ρ-block rails, not the theta-wide `railed_facts`: the Hessian
-            // judged below is the ρ-Hessian, and a railed link-shape
-            // coordinate is not one of its axes.
-            let certified_railed_rho: Vec<usize> = outer_result
-                .criterion_certificate
-                .as_ref()
-                .map(|certificate| {
-                    certificate
-                        .lambdas_railed
-                        .iter()
-                        .copied()
-                        .chain(certificate.stationarity.rails().iter().map(|rail| rail.index))
-                        .filter(|&index| index < final_rho.len())
-                        .collect()
-                })
-                .unwrap_or_default();
             let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
                 &lambdas,
@@ -3829,36 +3837,14 @@ where
             );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // The only typed absence is an outer Hessian with no
-                    // analytic form for this fit at all (a non-canonical Firth
-                    // link, routed to BFGS): nothing about the optimum is
-                    // suspect, the correction simply cannot be formed, and the
-                    // fit was accepted with that link on purpose (#2158).
+                    // Every Firth link carries its analytic outer ρ-Hessian
+                    // (#3203), so an unavailable correction is a real defect.
                     // Railed coordinates are not a reason: the correction
                     // excludes them exactly as the certificate did, so a
                     // refusal on a railed fit is a real defect like any other.
-                    if !matches!(
-                        reason,
-                        crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    ) {
-                        return Err(EstimationError::InvalidInput(format!(
-                            "exact smoothing-corrected covariance unavailable: {reason:?}"
-                        )));
-                    }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
-                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
-                    );
-                    smoothing_correction_absence = Some(
-                        crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail: format!("{reason:?}"),
-                        },
-                    );
-                    rho_covariance = None;
-                    smoothing_correction = None;
-                    smoothing_correction_method = None;
-                    smoothing_correction_first_order = None;
-                    smoothing_correction_method_first_order = None;
+                    return Err(EstimationError::InvalidInput(format!(
+                        "exact smoothing-corrected covariance unavailable: {reason:?}"
+                    )));
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
@@ -3893,16 +3879,23 @@ where
         // inference (`skip_rho_posterior_inference = false`), together with the
         // escalation tier it grades for (quadrature or NUTS over ρ, whichever
         // needs fewer criterion evaluations). Every other fit keeps the typed
-        // `NotComputed(InferenceNotRequested)` set above.
+        // `NotComputed(InferenceNotRequested)` set above. A requested run is not
+        // charged to the search (#3010), so the fitted model, its search-work
+        // counters included, is the same either way.
         if !opts.skip_rho_posterior_inference {
-            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-                &final_rho,
-                // The box is where λ is numerically resolvable, not the
-                // posterior's support: a draw past a saturated face is valued by
-                // the criterion's exact affine limit from that face, so no
-                // posterior mass is dropped when the box edge moves.
-                &rho_continuation,
-            );
+            (rho_posterior, rho_posterior_escalation) =
+                reml_state.arena.without_charging_the_search(|| {
+                    reml_state.rho_posterior_inference(
+                        &final_rho,
+                        // The box is where λ is numerically resolvable, not the
+                        // posterior's support: a draw past a saturated face is
+                        // valued by the criterion's exact affine limit from that
+                        // face, so no posterior mass is dropped when the box
+                        // edge moves.
+                        &rho_continuation,
+                        &certified_railed_rho,
+                    )
+                });
         }
 
         // Standard errors: prefer the diagonal of the full inverse when
@@ -4221,6 +4214,19 @@ where
                 ))
             })?;
     }
+    // The working residual in its Pearson form: at the accepted step the score
+    // is `u = W_F(z − η)` with `W_F` the score-side Fisher weight, and the norm
+    // is `Σ u²/W_F`, each row of null mean `φ` (not `Σ u²/W_H` in the observed
+    // curvature `finalweights`, which is biased for a non-canonical link;
+    // gam#3832). The identity-link weighted RSS is that sum, formed from the
+    // response directly and snapped with the dispersion it sets.
+    let working_residual = if cfg.likelihood.spec.is_gaussian_identity() {
+        Some(WorkingResidual { weighted_norm: weighted_rss, rows: n as usize })
+    } else {
+        let scores = &pirls_res.solveweights
+            * &(&pirls_res.solveworking_response - &pirls_res.final_eta);
+        WorkingResidual::of(pirls_res.solveweights.view(), scores.view())
+    };
     let inference = opts.compute_inference.then(|| FitInference {
         edf_by_block,
         penalty_block_trace,
@@ -4240,6 +4246,7 @@ where
         coefficient_influence,
         weighted_gram,
         identified_subspace,
+        working_residual,
     });
 
     let pirls_status = pirls_res.status;

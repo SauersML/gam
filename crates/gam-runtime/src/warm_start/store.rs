@@ -280,32 +280,38 @@ impl WarmStartStore {
         mode: LookupMode,
     ) -> Result<Option<WarmStartEntry>, StoreError> {
         let dir = self.key_dir(key);
+        let cache_key = LookupCacheKey {
+            dir: dir.clone(),
+            mode,
+        };
         if !dir.exists() {
             // A stale in-memory cache entry could outlive its directory if
             // another process evicted us. Drop it so we don't return data
             // for a key whose backing files are gone.
-            lookup_cache_invalidate(&LookupCacheKey { fp: *key, mode });
+            lookup_cache_invalidate(&cache_key);
             self.metadata_index_remove_key(key);
             return Ok(None);
         }
-        // Fast path: if the same (key, mode) was looked up before and the
-        // chosen meta file's mtime is unchanged, return the cached entry
-        // without re-reading any JSON or re-checksumming the .bin payload.
-        // A separate writer (this process or another) bumps mtime on
-        // rename → mismatch → we fall through to the slow path. The TTL
-        // cutoff is also re-checked here against `nanos_now()` so a hot
-        // poll loop cannot keep returning an expired entry between eviction
-        // sweeps (eviction is throttled via `EVICT_EVERY_N_SAVES`).
-        let cache_key = LookupCacheKey { fp: *key, mode };
+        // Fast path: if this key directory was looked up in this mode before
+        // and neither the directory nor the chosen meta file has changed
+        // since, return the cached entry without scanning the directory or
+        // re-checksumming the .bin payload. Any writer — this process or a
+        // sibling — that adds, replaces or removes an entry here renames into
+        // the directory and moves its mtime, so the slow path re-ranks every
+        // candidate. The TTL cutoff is also re-checked here against
+        // `nanos_now()` so a hot poll loop cannot keep returning an expired
+        // entry between eviction sweeps (eviction is throttled via
+        // `EVICT_EVERY_N_SAVES`).
         let now_nanos = self.nanos_now();
         if let Some(hit) = lookup_cache_get(&cache_key) {
-            if let Ok(md) = fs::metadata(&hit.meta_path)
-                && md.modified().ok() == Some(hit.meta_mtime)
-            {
-                let expired = self.opts.ttl.as_nanos() > 0
-                    && now_nanos.saturating_sub(hit.write_nanos) >= self.opts.ttl.as_nanos();
-                if !expired {
-                    let entry = self.touch_lookup_hit(&hit.meta_path, hit.entry)?;
+            if hit.is_current(&dir) {
+                if !meta_expired(hit.write_nanos, self.opts.ttl, now_nanos) {
+                    let meta = read_meta(&hit.meta_path)?;
+                    let (meta, entry) = self.touch_lookup_meta(&hit.meta_path, meta, hit.entry)?;
+                    // The touch rewrote the meta file, so the row is refreshed
+                    // to the post-touch stamps; the next lookup is served here
+                    // too instead of mistaking this access for a new write.
+                    remember_lookup(cache_key, &dir, hit.meta_path, &meta, &entry);
                     return Ok(Some(entry));
                 }
                 lookup_cache_invalidate(&cache_key);
@@ -373,25 +379,7 @@ impl WarmStartStore {
             kind: meta.kind,
         };
         let (meta, entry) = self.touch_lookup_meta(&meta_path, meta, entry)?;
-        // Record (meta_path, mtime) → entry so subsequent identical lookups
-        // short-circuit until the meta file's mtime changes. The effective
-        // activity stamp (post-touch, so it reflects this very access) is
-        // cached alongside so the fast path can re-apply the TTL cutoff without
-        // re-reading the JSON.
-        if let Ok(md) = fs::metadata(&meta_path)
-            && let Ok(mtime) = md.modified()
-        {
-            let write_nanos = meta_activity_nanos(&meta);
-            lookup_cache_insert(
-                cache_key,
-                CachedLookup {
-                    meta_path: meta_path.clone(),
-                    meta_mtime: mtime,
-                    write_nanos,
-                    entry: entry.clone(),
-                },
-            );
-        }
+        remember_lookup(cache_key, &dir, meta_path, &meta, &entry);
         Ok(Some(entry))
     }
 
@@ -425,17 +413,17 @@ impl WarmStartStore {
         // `LookupMode::Best` and `LookupMode::Latest`, so drop both cached
         // rows before touching disk. A pure save_overwrite of the same
         // run_id would also bump mtime and self-invalidate, but a save()
-        // with a fresh run_id leaves the old meta file unchanged — only
-        // explicit invalidation catches that.
-        lookup_cache_invalidate(&LookupCacheKey {
-            fp: *key,
-            mode: LookupMode::Best,
-        });
-        lookup_cache_invalidate(&LookupCacheKey {
-            fp: *key,
-            mode: LookupMode::Latest,
-        });
+        // with a fresh run_id leaves the old meta file unchanged, and on a
+        // coarse-timestamp filesystem its directory stamp can land in the same
+        // tick the cached row recorded — only explicit invalidation catches
+        // that.
         let dir = self.key_dir(key);
+        for mode in [LookupMode::Best, LookupMode::Latest] {
+            lookup_cache_invalidate(&LookupCacheKey {
+                dir: dir.clone(),
+                mode,
+            });
+        }
         let pid = std::process::id();
         // 1. Compute checksum from payload.
         let checksum = checksum_hex(payload);
@@ -455,8 +443,8 @@ impl WarmStartStore {
         // elapse between the stamp and the entry becoming visible.
 
         // 3. Write both temp files and atomically rename them into place. The
-        //    whole "ensure dir → write temps → rename" sequence is retried once
-        //    as a unit on `ErrorKind::NotFound`, because a concurrent process'
+        //    whole "ensure dir → write temps → rename" sequence is retried as
+        //    a unit on `ErrorKind::NotFound`, because a concurrent process'
         //    `evict_overflow` can `remove_dir` this key dir the instant it
         //    observes it empty (store.rs `evict_overflow`, "Sweep now-empty key
         //    dirs"). That removal races every write step here: it can vanish the
@@ -467,9 +455,9 @@ impl WarmStartStore {
         //    sequence (not an individual step) is the only correct response: a
         //    bare rename retry can't recover once the source temp was swept with
         //    the dir, so we recreate the dir and rewrite the temps from the
-        //    in-memory `payload` / `meta_json` we still hold. A single retry is
-        //    sufficient — the eviction window is one `remove_dir` syscall wide —
-        //    and a second genuine `NotFound` is propagated as before.
+        //    in-memory `payload` / `meta_json` we still hold. The sequence is
+        //    retried up to `SAVE_KEY_DIR_RACE_RETRIES` times; a `NotFound` past
+        //    that bound is propagated.
         let nonce = self.nanos_now();
         let bin_final = dir.join(format!("{run_id}.bin"));
         let meta_final = dir.join(format!("{run_id}.json"));
@@ -831,9 +819,12 @@ impl LookupMode {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+/// A lookup-cache row is owned by one key directory — the store root joined
+/// with the fingerprint — so two stores holding the same fingerprint under
+/// different roots never serve (or touch) each other's entries.
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct LookupCacheKey {
-    fp: Fingerprint,
+    dir: PathBuf,
     mode: LookupMode,
 }
 
@@ -841,11 +832,59 @@ struct LookupCacheKey {
 struct CachedLookup {
     meta_path: PathBuf,
     meta_mtime: SystemTime,
+    /// The key directory's mtime when the row was recorded. Every entry
+    /// added, replaced or removed in the directory — by this process or a
+    /// sibling — renames into it and moves this stamp, which is what makes a
+    /// better candidate than the cached one visible to the next lookup.
+    dir_mtime: SystemTime,
     /// Full-precision nanosecond write timestamp from the on-disk meta,
     /// kept alongside `entry.written_unix_secs` so the fast path can apply
     /// the same TTL cutoff as `evict_overflow` without re-reading the JSON.
     write_nanos: u128,
     entry: WarmStartEntry,
+}
+
+impl CachedLookup {
+    /// True while neither the chosen meta file nor its key directory has
+    /// changed since the row was recorded.
+    fn is_current(&self, dir: &Path) -> bool {
+        modified_time(&self.meta_path) == Some(self.meta_mtime)
+            && modified_time(dir) == Some(self.dir_mtime)
+    }
+}
+
+fn modified_time(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).and_then(|md| md.modified()).ok()
+}
+
+/// Record the entry a lookup just resolved and touched. The stamps are read
+/// after the touch — which rewrote the meta file and so moved both the file's
+/// and the directory's mtime — so the next lookup is served from the row
+/// until some other write lands in the directory. The effective activity
+/// stamp (post-touch, so it reflects this very access) is kept alongside so
+/// the fast path can re-apply the TTL cutoff without re-reading the JSON.
+fn remember_lookup(
+    cache_key: LookupCacheKey,
+    dir: &Path,
+    meta_path: PathBuf,
+    meta: &OnDiskMeta,
+    entry: &WarmStartEntry,
+) {
+    let (Some(meta_mtime), Some(dir_mtime)) = (modified_time(&meta_path), modified_time(dir))
+    else {
+        lookup_cache_invalidate(&cache_key);
+        return;
+    };
+    lookup_cache_insert(
+        cache_key,
+        CachedLookup {
+            meta_path,
+            meta_mtime,
+            dir_mtime,
+            write_nanos: meta_activity_nanos(meta),
+            entry: entry.clone(),
+        },
+    );
 }
 
 #[derive(Debug, Default)]
@@ -926,12 +965,13 @@ const fn meta_expired(activity_nanos: u128, ttl: Duration, now_nanos: u128) -> b
     now_nanos.saturating_sub(activity_nanos) >= ttl_nanos
 }
 
-/// Process-wide in-memory cache for [`WarmStartStore::lookup_with`]. Hot poll
-/// loops hit the same (key, mode) repeatedly between writes, so caching the
-/// resolved entry behind an mtime check eliminates the per-call directory
-/// walk, JSON parse, and SHA-256 recomputation. Mtime mismatch — including
-/// writes from a sibling process — invalidates the row and falls back to
-/// the full slow path.
+/// Process-wide in-memory cache for [`WarmStartStore::lookup_with`], keyed by
+/// (key directory, mode). Hot poll loops hit the same key repeatedly between
+/// writes, so caching the resolved entry behind an mtime check eliminates the
+/// per-call directory walk, JSON parse, and SHA-256 recomputation. A change to
+/// the chosen meta file or to its directory — including a sibling process
+/// adding a new entry — invalidates the row and falls back to the full slow
+/// path, which re-ranks every candidate.
 fn lookup_cache() -> &'static Mutex<HashMap<LookupCacheKey, CachedLookup>> {
     static CACHE: OnceLock<Mutex<HashMap<LookupCacheKey, CachedLookup>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
@@ -965,7 +1005,7 @@ fn lookup_cache_insert(key: LookupCacheKey, val: CachedLookup) {
             let oldest = guard
                 .iter()
                 .min_by_key(|(_, cached)| cached.write_nanos)
-                .map(|(old_key, _)| *old_key);
+                .map(|(old_key, _)| old_key.clone());
             let Some(oldest) = oldest else {
                 break;
             };
@@ -1202,16 +1242,6 @@ fn checksum_hex(payload: &[u8]) -> String {
 }
 
 impl WarmStartStore {
-    fn touch_lookup_hit(
-        &self,
-        meta_path: &Path,
-        entry: WarmStartEntry,
-    ) -> Result<WarmStartEntry, StoreError> {
-        let meta = read_meta(meta_path)?;
-        let (_meta, entry) = self.touch_lookup_meta(meta_path, meta, entry)?;
-        Ok(entry)
-    }
-
     fn touch_lookup_meta(
         &self,
         meta_path: &Path,
@@ -1645,6 +1675,70 @@ mod tests {
         let latest = store.lookup_latest(&key).unwrap().unwrap();
         assert_eq!(latest.payload, b"newer-higher-objective");
         assert_eq!(latest.iteration, Some(2));
+    }
+
+    /// The lookup cache is process-wide, so a row must belong to one store
+    /// root: a store opened on another root that holds the same fingerprint
+    /// reads (and touches) its own entry, never the first store's.
+    #[test]
+    fn lookup_cache_rows_belong_to_one_store_root() {
+        let (_da, a) = temp_store();
+        let (_db, b) = temp_store();
+        let key = key_for("two-roots-one-fingerprint");
+        a.save(&key, b"root-a", Some(1.0), Some(1), EntryKind::Final)
+            .unwrap();
+        b.save(&key, b"root-b", Some(2.0), Some(1), EntryKind::Final)
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(a.lookup(&key).unwrap().unwrap().payload, b"root-a");
+            assert_eq!(b.lookup(&key).unwrap().unwrap().payload, b"root-b");
+            assert_eq!(a.lookup_latest(&key).unwrap().unwrap().payload, b"root-a");
+            assert_eq!(b.lookup_latest(&key).unwrap().unwrap().payload, b"root-b");
+        }
+    }
+
+    /// A sibling process that writes a better entry under the same key
+    /// renames it into the key directory without touching this process's
+    /// cache, so the next lookup must re-rank the directory and return it
+    /// rather than the row a previous hit recorded.
+    #[test]
+    fn lookup_sees_a_better_entry_another_process_wrote_after_a_cached_hit() {
+        let (_d, store) = temp_store();
+        let key = key_for("sibling-writes-a-better-entry");
+        store
+            .save(&key, b"mine", Some(5.0), Some(1), EntryKind::Checkpoint)
+            .unwrap();
+        assert_eq!(store.lookup(&key).unwrap().unwrap().payload, b"mine");
+        assert_eq!(store.lookup(&key).unwrap().unwrap().payload, b"mine");
+        let dir = store.key_dir(&key);
+        let cached_dir_mtime = modified_time(&dir).unwrap();
+
+        // The sibling's entry, written under its own root and then landed in
+        // this store's key directory the way the sibling's rename would.
+        let (sibling_root, sibling) = temp_store();
+        sibling
+            .save(&key, b"sibling", Some(1.0), Some(2), EntryKind::Checkpoint)
+            .unwrap();
+        // Wait out the filesystem's timestamp resolution so the landing
+        // write is stamped after the cached hit, as any later write is once
+        // the clock ticks.
+        let probe = sibling_root.path().join("clock-probe");
+        loop {
+            fs::write(&probe, b"tick").unwrap();
+            if modified_time(&probe).unwrap() > cached_dir_mtime {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        for staged in fs::read_dir(sibling.key_dir(&key)).unwrap() {
+            let staged = staged.unwrap().path();
+            fs::copy(&staged, dir.join(staged.file_name().unwrap())).unwrap();
+        }
+
+        let got = store.lookup(&key).unwrap().unwrap();
+        assert_eq!(got.payload, b"sibling");
+        assert_eq!(got.objective, Some(1.0));
+        assert_eq!(got.iteration, Some(2));
     }
 
     #[test]

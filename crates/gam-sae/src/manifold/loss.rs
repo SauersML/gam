@@ -46,6 +46,49 @@ impl SaeManifoldLoss {
     }
 }
 
+/// The penalized objective `penalized_objective_total` with the first-order
+/// rounding band of its evaluation (#3243), from
+/// `SaeManifoldTerm::penalized_objective_banded`.
+///
+/// The objective is the loss components plus the extra penalty energies. Its
+/// longest accumulation is the data fit over the `n·p` residual cells, and the
+/// eight summands are then added in turn, so the computed value lies within
+/// `band = γ_(n·p+7)·Σ|summandᵢ|` of the exactly accumulated one and resolves no
+/// change below it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct BandedPenalizedObjective {
+    pub(crate) value: f64,
+    pub(crate) band: f64,
+}
+
+impl BandedPenalizedObjective {
+    /// A trial that failed to apply or to evaluate: no finite value, so no
+    /// comparison accepts it.
+    pub(crate) const UNUSABLE: Self = Self {
+        value: f64::INFINITY,
+        band: 0.0,
+    };
+
+    /// Whether `trial`, from this value, is an Armijo decrease the two
+    /// evaluations can resolve (#3243).
+    ///
+    /// The comparison `V̂ − V̂'` of two evaluations carries the error of both,
+    /// `B + B'`. The trial must be resolvably below this value, `V̂ − V̂' > B + B'`,
+    /// so a committed step lowered the exact objective and not only its rounding.
+    /// It must also pass the Armijo test `V̂ − V̂' ≥ sufficient` relaxed by the same
+    /// `B + B'` (Berahas, Byrd & Nocedal 2019), so a step whose only shortfall is
+    /// rounding is never refused for it. With both bands zero this is the exact
+    /// strict Armijo test.
+    pub(crate) fn armijo_accepts(&self, trial: &Self, sufficient: f64) -> bool {
+        let bands = self.band + trial.band;
+        let decrease = self.value - trial.value;
+        self.value.is_finite()
+            && trial.value.is_finite()
+            && decrease > bands
+            && decrease >= sufficient - bands
+    }
+}
+
 /// Honest, fully-itemized view of [`SaeManifoldLoss`] for the model output. It
 /// reports the penalized-loss components that the score is actually built from,
 /// and is deliberately NOT named or shaped like a REML / evidence breakdown:
@@ -138,5 +181,53 @@ mod tests {
         let summed = b.data_fit + b.assignment_sparsity + b.smoothness + b.ard;
         assert!((summed - b.total_penalized_loss).abs() < 1e-12);
         assert_eq!(b.criterion_gauge_deflated_directions, 3);
+    }
+
+    /// #3243 — the acceptance at its edges, with bands `B = B' = 1e-9` around
+    /// `V̂ = 1e3`, where opt's former cushion `8ε(1 + |V̂|)` is `1.8e-12`:
+    /// - a trial `1.5e-9` lower passes that cushion's Armijo test at a
+    ///   sufficient decrease of `1e-9`, but lies inside `B + B'`, resolves
+    ///   nothing, and is refused;
+    /// - a trial `3e-9` lower is resolved, and is refused at a sufficient
+    ///   decrease of `1e-8`, far past it plus the bands;
+    /// - the same trial is accepted at a sufficient decrease of `4e-9`, which
+    ///   it misses by less than `B + B'`: the exact test refuses it, the relaxed
+    ///   one does not;
+    /// - an unusable trial, or a non-finite base, is never accepted.
+    #[test]
+    fn armijo_accepts_only_resolved_decrease_and_relaxes_armijo_by_the_bands_3243() {
+        let band = 1.0e-9;
+        let base = BandedPenalizedObjective { value: 1.0e3, band };
+        let at = |decrease: f64| BandedPenalizedObjective {
+            value: base.value - decrease,
+            band,
+        };
+        let former_cushion = 8.0 * f64::EPSILON * (1.0 + base.value);
+        let unresolved = at(1.5e-9);
+        assert!(
+            base.value - unresolved.value >= 1.0e-9 - former_cushion,
+            "the former cushion's test accepted this rounding-sized trial"
+        );
+        assert!(!base.armijo_accepts(&unresolved, 1.0e-9));
+        let resolved = at(3.0e-9);
+        assert!(!base.armijo_accepts(&resolved, 1.0e-8));
+        assert!(base.value - resolved.value < 4.0e-9);
+        assert!(base.armijo_accepts(&resolved, 4.0e-9));
+        assert!(!base.armijo_accepts(&BandedPenalizedObjective::UNUSABLE, 0.0));
+        let non_finite = BandedPenalizedObjective {
+            value: f64::NAN,
+            band,
+        };
+        assert!(!non_finite.armijo_accepts(&resolved, 0.0));
+        let exact = BandedPenalizedObjective {
+            value: 1.0,
+            band: 0.0,
+        };
+        let below = BandedPenalizedObjective {
+            value: 1.0 - 1.0e-12,
+            band: 0.0,
+        };
+        assert!(exact.armijo_accepts(&below, 1.0e-12 * 0.5));
+        assert!(!exact.armijo_accepts(&exact, 0.0));
     }
 }

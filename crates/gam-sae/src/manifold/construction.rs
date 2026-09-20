@@ -4866,10 +4866,13 @@ impl SaeManifoldTerm {
 
         // Reject the seed on any row that got worse, reverting ALL of that row's atom
         // coords to the snapshot. Reconstruction couples atoms within a row, so the
-        // accept/reject decision is per row, not per (row, atom).
+        // accept/reject decision is per row, not per (row, atom). The comparison is
+        // exact: the reconstruction and the basis refresh are row-local, so a seed
+        // that leaves a row's coords bitwise unchanged reproduces its SSE bitwise and
+        // is kept, while any worsening is reverted to the snapshot (always safe).
         let post_fitted = self.try_fitted_for_rho(rho)?;
         let accepted: Vec<bool> = (0..n)
-            .map(|row| candidate_rows[row] && row_sse(&post_fitted, row) <= pre_sse[row] + 1.0e-12)
+            .map(|row| candidate_rows[row] && row_sse(&post_fitted, row) <= pre_sse[row])
             .collect();
         let mut reverted_any = false;
         for atom_idx in 0..k_atoms {
@@ -5380,23 +5383,55 @@ impl SaeManifoldTerm {
         registry: Option<&AnalyticPenaltyRegistry>,
         penalty_scale: f64,
     ) -> Result<f64, String> {
-        let mut total = self.loss_scaled(target, rho, penalty_scale)?.total();
+        Ok(self
+            .penalized_objective_banded(target, rho, registry, penalty_scale)?
+            .value)
+    }
+
+    /// [`Self::penalized_objective_total`], bit for bit, with the first-order
+    /// rounding band of its evaluation (#3243, [`BandedPenalizedObjective`]).
+    ///
+    /// The value is accumulated as before: the four loss components, then the
+    /// registry, repulsion, amplitude-barrier and separation-barrier energies in
+    /// turn. Its longest accumulation is the data fit over the `target.len()`
+    /// residual cells, and the eight summands are added after it, so the band is
+    /// `γ_(target.len()+7)·Σ|summandᵢ|`.
+    pub(crate) fn penalized_objective_banded(
+        &self,
+        target: ArrayView2<'_, f64>,
+        rho: &SaeManifoldRho,
+        registry: Option<&AnalyticPenaltyRegistry>,
+        penalty_scale: f64,
+    ) -> Result<BandedPenalizedObjective, String> {
+        let loss = self.loss_scaled(target, rho, penalty_scale)?;
+        let mut total = loss.total();
+        let mut summand_scale = loss.data_fit.abs()
+            + loss.assignment_sparsity.abs()
+            + loss.smoothness.abs()
+            + loss.ard.abs();
+        let mut add = |energy: f64| {
+            total += energy;
+            summand_scale += energy.abs();
+        };
         if let Some(analytic_registry) = registry {
-            total += self
+            add(self
                 .analytic_penalty_value_total(analytic_registry, penalty_scale)
-                .map_err(|err| format!("SaeManifoldTerm::penalized_objective_total: {err}"))?;
+                .map_err(|err| format!("SaeManifoldTerm::penalized_objective_total: {err}"))?);
         }
         // #1026 — decoder-repulsion value, on the SAME frozen gate the assembly
         // used, so the line search sees the term the Newton step optimizes. 0
         // unless two atoms are near-collinear (the no-op case).
-        total += self.decoder_repulsion_value(penalty_scale);
+        add(self.decoder_repulsion_value(penalty_scale));
         // #1026/#1522/#2343 — interior-point collapse-prevention barriers, on the
         // SAME decoders (and SAME frozen gates) the assembly's gradient/curvature
         // used, so the line search sees exactly the term the inner Newton step
         // optimises (no value/grad desync).
-        total += self.amplitude_barrier_value(penalty_scale);
-        total += self.separation_barrier_value(penalty_scale);
-        Ok(total)
+        add(self.amplitude_barrier_value(penalty_scale));
+        add(self.separation_barrier_value(penalty_scale));
+        Ok(BandedPenalizedObjective {
+            value: total,
+            band: gam_linalg::roundoff::accumulation_band(target.len() + 7, summand_scale),
+        })
     }
 
     pub(crate) fn decoder_smoothness_value(&self, lambda_smooth: &[f64]) -> Result<f64, String> {

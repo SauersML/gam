@@ -1119,10 +1119,11 @@ impl SaeManifoldTerm {
         for value in descent.iter_mut() {
             *value /= descent_norm;
         }
-        let base_objective = match self.penalized_objective_total(target, rho, registry, 1.0) {
+        let base = match self.penalized_objective_banded(target, rho, registry, 1.0) {
             Ok(value) => value,
             Err(reason) => return format!("orbit=unresolved(objective: {reason})"),
         };
+        let base_objective = base.value;
         // Both probes run the mover's own line minimization, with its endpoints and
         // commit floor, so a zero drop here means what it means there.
         let material_floor =
@@ -1146,7 +1147,7 @@ impl SaeManifoldTerm {
             registry,
             descent_step.view(),
             step_coord_len,
-            base_objective,
+            base,
             descent_norm,
             0.0,
             material_floor,
@@ -1199,7 +1200,7 @@ impl SaeManifoldTerm {
                 registry,
                 steepest_step.view(),
                 step_coord_len,
-                base_objective,
+                base,
                 steepest_norm,
                 0.0,
                 material_floor,
@@ -1759,17 +1760,19 @@ impl SaeManifoldTerm {
                 quotient: 0.5 * quotient_grad_norm * quotient_grad_norm,
                 ambient: 0.5 * grad_norm_sq,
             };
-            // The smallest predicted reduction the acceptance test below can verify.
-            // That test admits `pre − trial ≥ c1·pred − cushion`, with the round-off
-            // cushion `opt::armijo_roundoff_cushion(pre)`. At or under
-            // `pred = cushion / c1` its right-hand side is not positive, so a trial
-            // that did not lower the objective, or raised it within round-off, would
-            // commit and report progress. Above this floor every committed step is a
-            // strict Armijo decrease (#2861), and a ladder whose prediction falls
-            // under it has no verifiable decrease left to buy.
-            let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
-            let predicted_floor =
-                opt::armijo_roundoff_cushion(pre_objective) / SAE_MANIFOLD_ARMIJO_C1;
+            // The smallest predicted reduction the acceptance test below can verify
+            // (#3243). That test (`BandedPenalizedObjective::armijo_accepts`) commits
+            // a trial only when its objective is resolvably below `pre`, by more than
+            // the two evaluations' bands `B + B' ≥ B`, and relaxes Armijo by the same
+            // bands, so every committed step is a strict decrease of the exact
+            // objective (#2861). The prediction is the step's first-order decrease,
+            // and it falls monotonically along the ladder as the steps shorten and
+            // the model tightens. At or under `pred = B`, the band of `pre` itself,
+            // the step promises a change `pre` cannot resolve, so the ladder has no
+            // verifiable decrease left to buy.
+            let pre = self.penalized_objective_banded(target, rho_fixed, registry, 1.0)?;
+            let pre_objective = pre.value;
+            let predicted_floor = pre.band;
             let snapshot = self.snapshot_mutable_state();
             let backtrack_started = std::time::Instant::now();
             let mut trials = 0usize;
@@ -1797,7 +1800,7 @@ impl SaeManifoldTerm {
                     log::trace!(
                         "terminal Newton: damping ladder exhausted at ν={nu:.6e} — predicted \
                          objective decrease {predicted_objective_decrease:.6e} is under the \
-                         round-off floor {predicted_floor:.6e}",
+                         objective's rounding band {predicted_floor:.6e}",
                     );
                     break;
                 }
@@ -1839,17 +1842,15 @@ impl SaeManifoldTerm {
                         None,
                     )
                 };
-                let trial_objective = self
-                    .penalized_objective_total(target, rho_fixed, registry, 1.0)
-                    .unwrap_or(f64::INFINITY);
+                let trial = self
+                    .penalized_objective_banded(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(BandedPenalizedObjective::UNUSABLE);
                 let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
-                // Acceptance is Armijo descent in the scalar objective. The residual is
-                // deliberately not constrained here: at negative curvature, genuine
-                // objective descent can and generally does increase its norm.
-                if trial_objective.is_finite()
-                    && pre_objective - trial_objective
-                        >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
-                {
+                // Acceptance is resolved, band-relaxed Armijo descent in the scalar
+                // objective. The residual is deliberately not constrained here: at
+                // negative curvature, genuine objective descent can and generally
+                // does increase its norm.
+                if pre.armijo_accepts(&trial, sufficient) {
                     accepted = Some(AcceptedTerminalResidualStep {
                         damping: nu,
                         trial_merits,
@@ -2059,8 +2060,9 @@ impl SaeManifoldTerm {
     /// the ladder for a stated reason. The first rung above `σ = 0` is the shifted
     /// operator's own curvature along the rejected step, `Δᵀ(A + σI)Δ/‖Δ‖² =
     /// −gᵀΔ/‖Δ‖²`; later rungs grow by `RIDGE_GROWTH`. Acceptance, and the floor under
-    /// the prediction, are the dense ladder's own, so a committed step is a strict
-    /// Armijo decrease of the penalized objective (#2861), and a rejected trial
+    /// the prediction, are the dense ladder's own, so a committed step is a
+    /// resolved, band-relaxed Armijo decrease of the penalized objective (#2861,
+    /// #3243), and a rejected trial
     /// restores the snapshot. `None` means no rung bought that decrease, or a solve
     /// failed.
     fn shifted_exact_newton_polish_trials(
@@ -2085,11 +2087,13 @@ impl SaeManifoldTerm {
         let mut exact_options = options.clone();
         exact_options.sae_resident_frame = None;
         let total_t: usize = exact.rows.iter().map(|row| row.gt.len()).sum();
-        let pre_objective = self.penalized_objective_total(target, rho_fixed, registry, 1.0)?;
-        // The dense ladder's floor: the smallest prediction whose Armijo threshold
-        // `c1·pred − cushion` is positive, so every trial the test below admits
-        // lowered the objective.
-        let predicted_floor = opt::armijo_roundoff_cushion(pre_objective) / SAE_MANIFOLD_ARMIJO_C1;
+        // The dense ladder's floor and acceptance (#3243): a prediction at or under
+        // the band of `pre` promises a change `pre` cannot resolve, and a committed
+        // trial is resolvably below `pre` and passes Armijo relaxed by the two
+        // evaluations' bands, so it lowered the exact objective.
+        let pre = self.penalized_objective_banded(target, rho_fixed, registry, 1.0)?;
+        let pre_objective = pre.value;
+        let predicted_floor = pre.band;
         let snapshot = self.snapshot_mutable_state();
         let mut shift = carried_shift;
         let mut trials = 0usize;
@@ -2156,22 +2160,19 @@ impl SaeManifoldTerm {
                         None
                     }
                 };
-            let trial_objective = if trial_system.is_some() {
-                self.penalized_objective_total(target, rho_fixed, registry, 1.0)
-                    .unwrap_or(f64::INFINITY)
+            let trial = if trial_system.is_some() {
+                self.penalized_objective_banded(target, rho_fixed, registry, 1.0)
+                    .unwrap_or(BandedPenalizedObjective::UNUSABLE)
             } else {
-                f64::INFINITY
+                BandedPenalizedObjective::UNUSABLE
             };
             let sufficient = SAE_MANIFOLD_ARMIJO_C1 * predicted_objective_decrease;
-            if trial_objective.is_finite()
-                && pre_objective - trial_objective
-                    >= sufficient - opt::armijo_roundoff_cushion(pre_objective)
-            {
+            if pre.armijo_accepts(&trial, sufficient) {
                 return Ok(Some(ShiftedTerminalStep {
                     shift,
                     ridge_escalations: diagnostics.ridge_escalations,
                     pre_objective,
-                    committed_objective: trial_objective,
+                    committed_objective: trial.value,
                     predicted_objective_decrease,
                     curvature_along_step: predicted_objective_decrease / step_norm_sq,
                     step_norm_sq,
@@ -2194,351 +2195,6 @@ impl SaeManifoldTerm {
             }
             shift = next;
         }
-    }
-
-    pub(crate) fn outer_gradient_arrow_solver<'a>(
-        &'a self,
-        cache: &'a ArrowFactorCache,
-        penalized_gram_scale: &[f64],
-    ) -> Result<DeflatedArrowSolver<'a>, OuterGradientError> {
-        let Err(conditioning_err) = Self::outer_gradient_conditioning_error(cache) else {
-            return Ok(DeflatedArrowSolver::plain(cache));
-        };
-        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
-            return Err(conditioning_err);
-        };
-        if !(max_pivot.is_finite() && max_pivot > 0.0) {
-            return Err(conditioning_err);
-        }
-
-        // The conditioning gate has already flagged a near-singular joint Hessian
-        // (`conditioning_err`). Below we attempt to attribute that flatness to the
-        // closed-form gauge orbit (chart step gauges) plus the penalty-aware
-        // decoder-null directions and deflate it. When NO such deflatable
-        // direction can be recovered, the flat subspace is genuinely
-        // non-identifiable -- a degenerate direction OUTSIDE the gauge orbit -- a
-        // diagnosis distinct from the raw pivot-ratio conditioning trip.
-        // Surfacing the gauge-degenerate case as its own
-        // [`OuterGradientError::NonIdentifiable`] preserves that typed evidence
-        // when the derivative is refused.
-        let non_identifiable_err = OuterGradientError::NonIdentifiable {
-            reason: format!(
-                "near-singular joint Hessian with no deflatable gauge/decoder-null \
-                 direction (max pivot {max_pivot:.3e})"
-            ),
-        };
-
-        let full_len = cache.delta_t_len() + cache.k;
-        let mut raw_gauges = self
-            .joint_chart_gauge_basis_for_arrow_layout(
-                &cache.row_offsets,
-                cache.k,
-                "outer_gradient_arrow_solver chart gauges",
-            )
-            .map_err(OuterGradientError::internal)?;
-        // #2253: everything pushed above comes from `dense_step_gauge_vectors`
-        // — the closed-form CHART gauge orbit (circle/torus phase, and the
-        // translation/scale orbits of the linear/euclidean/duchon/poincaré
-        // patches).
-        //
-        // #2720 — READ THE SCOPE OF "EXACT" HERE CAREFULLY. This comment used
-        // to call them "EXACT criterion symmetries … flat by construction",
-        // and that sentence is what put the same orbit into the inner
-        // CONVERGENCE quotient, where it certified non-stationary points at up
-        // to 76 170x the KKT tolerance. They are exact symmetries of the
-        // RECONSTRUCTION (measured `1e-16` relative) and NOT of the criterion:
-        // the ARD prior on `t` and the smoothness prior on `β` are written on
-        // the chart coordinates and move along the orbit — the dilation field
-        // by `−7.82` on an objective of `165`
-        // (`tests_gauge_posterior_flatness_2720`).
-        //
-        // What justifies deflating them HERE is a different property and a
-        // weaker one: this block runs only after the conditioning gate has
-        // already flagged a near-singular joint Hessian, and the orbit carries
-        // NO data-fit CURVATURE (only the priors'), so it is a genuine
-        // near-null direction OF THE OPERATOR BEING INVERTED. Deflation is then
-        // a pseudo-inverse choice on an ill-conditioned solve, not a claim that
-        // the criterion is flat. That distinction is the whole of #2720, and it
-        // is written here because this is the other site the claim reached.
-        //
-        // Remember the boundary so the exact-gauge subspace can be deflated
-        // UNCONDITIONALLY, keeping the deflation COUNT stable across the ρ-walk
-        // (a borderline eigenvalue flickering across the Rayleigh floor
-        // re-anchors ½log|H| and desyncs the fixed-ρ criterion gradient from
-        // its value).
-        let n_exact_raw = raw_gauges.len();
-        // #1051/#1273: admit the penalty-aware decoder-β null directions as
-        // additional deflation candidates. A rank-deficient decoder design
-        // (e.g. a euclidean-1D line in a p=2 ambient: decoder column rank 1 of
-        // 3) puts a genuine near-null direction of the joint Hessian in the β
-        // block, OUTSIDE the closed-form chart gauge orbit. #1273: probing the
-        // RAW unit-β basis `e_j` produced an INCOMPLETE candidate set — the
-        // true flat direction is the penalised null of `G_k + λ_smooth·S_k`,
-        // not an axis-aligned coordinate, so the outer gate rejected trial ρ
-        // with a pivot ratio (5.3e-16 < 1e-12) that the inner gate (which
-        // already uses `joint_decoder_beta_null_directions(λ_smooth)`) accepts. Use
-        // the SAME penalty-aware null directions here, evaluated at the smooth
-        // scale the Schur factor used, so the outer and inner gates agree.
-        // These full (n·q + beta_dim)-length vectors drop into the same
-        // Gram-Schmidt + Rayleigh + Faddeev-Popov path below; the Rayleigh
-        // floor still keeps only genuinely flat (sub-floor) directions, so a
-        // well-conditioned decoder is unaffected.
-        for dir in self
-            .joint_decoder_beta_null_directions(penalized_gram_scale)
-            .map_err(OuterGradientError::internal)?
-        {
-            let mapped = self
-                .dense_joint_vector_in_arrow_layout(
-                    dir.view(),
-                    &cache.row_offsets,
-                    cache.k,
-                    "outer_gradient_arrow_solver decoder-beta null",
-                )
-                .map_err(OuterGradientError::internal)?;
-            raw_gauges.push(mapped);
-        }
-        // #1051/#1273: also admit the decoder COLUMN-SPAN null (an unrealised
-        // ambient output channel of a rank-deficient decoder), which the
-        // channel-free basis-null above structurally cannot represent. The
-        // rank-1-decoder-line geometry (e.g. a 1-D euclidean line in p=2
-        // ambient: decoder column rank 1 of 2) puts the joint Hessian's
-        // sub-floor pivot entirely in one output channel; without this
-        // candidate the outer gate had nothing to deflate it with and rejected
-        // the trial ρ. The Rayleigh floor below still prunes any candidate that
-        // is not genuinely flat against the cached Hessian.
-        for dir in self
-            .decoder_channel_null_directions()
-            .map_err(OuterGradientError::internal)?
-        {
-            let mapped = self
-                .dense_joint_vector_in_arrow_layout(
-                    dir.view(),
-                    &cache.row_offsets,
-                    cache.k,
-                    "outer_gradient_arrow_solver decoder-channel null",
-                )
-                .map_err(OuterGradientError::internal)?;
-            raw_gauges.push(mapped);
-        }
-        if raw_gauges.is_empty() {
-            return Err(non_identifiable_err);
-        }
-
-        let mut gauge_span: Vec<Array1<f64>> = Vec::new();
-        // Exact chart gauges (raw indices `< n_exact_raw`) are processed first,
-        // so their Gram-Schmidt survivors occupy the FRONT of `gauge_span`;
-        // `exact_basis_count` records that contiguous prefix.
-        let mut exact_basis_count = 0usize;
-        // A candidate that lies in the span of the stored bases must come out of
-        // modified Gram–Schmidt as rounding, and nothing more. Each projection forms
-        // one length-`full_len` inner product and updates every entry with a product
-        // and a subtraction, leaking at most `γ_{full_len+4}·‖g₀‖`; it also leaks what
-        // the stored bases' own loss of orthogonality leaves behind, at most
-        // `Σ_j ω_j·‖g₀‖`. After `k` projections a dependent residual therefore stays
-        // inside `k·(γ_{full_len+4} + Σ_j ω_j)·‖g₀‖`, and a basis stored from a
-        // residual `r` of a candidate `g₀` carries `ω = band·‖g₀‖/‖r‖`.
-        let projection_growth = gam_linalg::roundoff::accumulation_growth(full_len + 4);
-        let mut orthogonality_defect = 0.0_f64;
-        for (raw_idx, mut gauge) in raw_gauges.into_iter().enumerate() {
-            let initial_norm_sq = gauge.iter().map(|v| v * v).sum::<f64>();
-            for basis in &gauge_span {
-                let coeff = gauge.dot(basis);
-                for i in 0..gauge.len() {
-                    gauge[i] -= coeff * basis[i];
-                }
-            }
-            let norm_sq = gauge.iter().map(|v| v * v).sum::<f64>();
-            let band = gauge_span.len() as f64 * (projection_growth + orthogonality_defect);
-            if !(norm_sq.is_finite() && norm_sq > band * band * initial_norm_sq) {
-                continue;
-            }
-            orthogonality_defect += band * (initial_norm_sq / norm_sq).sqrt();
-            let inv_norm = norm_sq.sqrt().recip();
-            for value in gauge.iter_mut() {
-                *value *= inv_norm;
-            }
-            if raw_idx < n_exact_raw {
-                exact_basis_count += 1;
-            }
-            gauge_span.push(gauge);
-        }
-        if gauge_span.is_empty() {
-            return Err(non_identifiable_err);
-        }
-
-        let span_rank = gauge_span.len();
-        let mut h_span = Array2::<f64>::zeros((span_rank, span_rank));
-        for col in 0..span_rank {
-            let h_gauge = match apply_cached_arrow_hessian(
-                cache,
-                gauge_span[col].slice(s![..cache.delta_t_len()]),
-                gauge_span[col].slice(s![cache.delta_t_len()..]),
-            ) {
-                Ok(value) => value,
-                // #1451: a shape/dimension mismatch or non-finite intermediate
-                // from the Hessian apply is an internal-invariant defect and MUST
-                // propagate; a genuine numeric failure on a finite,
-                // correctly-shaped input keeps the typed conditioning class.
-                Err(err) => {
-                    return Err(OuterGradientError::classify_arrow_solver_error(
-                        &err,
-                        conditioning_err.clone(),
-                    ));
-                }
-            };
-            let h_flat = flatten_arrow_parts(h_gauge.t.view(), h_gauge.beta.view());
-            for row in 0..span_rank {
-                h_span[[row, col]] = gauge_span[row].dot(&h_flat);
-            }
-        }
-        for row in 0..span_rank {
-            for col in 0..row {
-                let sym = 0.5 * (h_span[[row, col]] + h_span[[col, row]]);
-                h_span[[row, col]] = sym;
-                h_span[[col, row]] = sym;
-            }
-        }
-        // #1451: a non-finite entry in the projected gauge Hessian is an
-        // internal-invariant defect (a NaN/Inf intermediate leaked into the
-        // span), not a conditioning failure — it MUST propagate rather than be
-        // masked behind a degraded descent. Guard finiteness BEFORE the eigh so a
-        // genuine decomposition failure on a finite, correctly-shaped matrix keeps
-        // the typed conditioning class.
-        if !h_span.iter().all(|v| v.is_finite()) {
-            return Err(OuterGradientError::internal(format!(
-                "outer_gradient_arrow_solver: non-finite entry in projected gauge \
-                 Hessian (h_span is {span_rank}x{span_rank})"
-            )));
-        }
-        let (evals, evecs) = h_span
-            .eigh(Side::Lower)
-            .map_err(|_| conditioning_err.clone())?;
-        let strict_gauge_floor = SAE_OUTER_GRADIENT_GAUGE_RAYLEIGH_FACTOR * max_pivot;
-        let mut orthonormal: Vec<Array1<f64>> = Vec::new();
-        for eig_idx in 0..evals.len() {
-            let rayleigh = evals[eig_idx];
-            if !(rayleigh.is_finite() && rayleigh <= strict_gauge_floor) {
-                continue;
-            }
-            let mut direction = Array1::<f64>::zeros(full_len);
-            for basis_idx in 0..span_rank {
-                let coeff = evecs[[basis_idx, eig_idx]];
-                for row in 0..full_len {
-                    direction[row] += coeff * gauge_span[basis_idx][row];
-                }
-            }
-            // An orthonormal combination with a unit eigenvector column has unit norm,
-            // so only an exactly zero or non-finite direction is refused.
-            let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
-            if !(norm_sq.is_finite() && norm_sq > 0.0) {
-                continue;
-            }
-            let inv_norm = norm_sq.sqrt().recip();
-            for value in direction.iter_mut() {
-                *value *= inv_norm;
-            }
-            orthonormal.push(direction);
-        }
-        // #2253: deflate the EXACT chart-gauge subspace unconditionally. A
-        // borderline gauge eigenvalue can flicker across `strict_gauge_floor`
-        // as ρ moves; for the empirical decoder-null candidates that screen is
-        // the point, but for the exact chart gauges (circle/torus phase orbit,
-        // patch translation/scale) it changes the deflation COUNT by ±1 and
-        // re-anchors ½log|H|, desyncing the fixed-ρ criterion gradient from the
-        // value (the K=1 circle non-stationary stall). The exact-gauge subspace
-        // is `gauge_span[0..exact_basis_count]` (reconstruction-flat by
-        // construction, hence data-fit-curvature-free — NOT criterion-flat, see
-        // the scope note at the candidate site above); add any
-        // of its directions the floor loop dropped, orthogonalized against what
-        // was already kept, so the deflation dimension is ρ-stable. When the
-        // floor already kept a gauge, its residual here lies inside the band below
-        // and it is not double-counted.
-        //
-        // The band is the span construction's modified Gram–Schmidt band, taken
-        // against the kept directions. Each kept direction is a normalized
-        // combination `G·v` of the span bases with a computed eigenvector column `v`,
-        // so against another kept direction it is off orthogonality by at most
-        // `‖GᵀG − I‖₂ ≤ span_rank·Σ_j ω_j` (the span's own defect), plus the
-        // eigenvector columns' orthogonality (`O(span_rank·u)` for a Householder-based
-        // symmetric eigensolver, counted as `γ_{span_rank}`), plus the combination's
-        // formation, `γ_{span_rank}·√span_rank` per vector.
-        let kept_defect = span_rank as f64 * orthogonality_defect
-            + gam_linalg::roundoff::accumulation_growth(span_rank)
-                * (1.0 + 2.0 * (span_rank as f64).sqrt());
-        let mut kept_orthogonality_defect = orthonormal.len() as f64 * kept_defect;
-        for exact_idx in 0..exact_basis_count {
-            let mut direction = gauge_span[exact_idx].clone();
-            let initial_norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
-            let band = orthonormal.len() as f64 * (projection_growth + kept_orthogonality_defect);
-            for kept in &orthonormal {
-                let coeff = direction.dot(kept);
-                for row in 0..direction.len() {
-                    direction[row] -= coeff * kept[row];
-                }
-            }
-            let norm_sq = direction.iter().map(|v| v * v).sum::<f64>();
-            if !(norm_sq.is_finite() && norm_sq > band * band * initial_norm_sq) {
-                continue;
-            }
-            kept_orthogonality_defect += band * (initial_norm_sq / norm_sq).sqrt();
-            let inv_norm = norm_sq.sqrt().recip();
-            for value in direction.iter_mut() {
-                *value *= inv_norm;
-            }
-            orthonormal.push(direction);
-        }
-        if orthonormal.is_empty() {
-            // The joint factor is ill-conditioned, but no direction in the
-            // analytically known gauge/decoder-null span is actually flat at the
-            // rank-revealing Rayleigh threshold. The unreliable direction lies
-            // outside the quotient we can justify, so refuse the derivative
-            // instead of projecting an arbitrary least-curvature candidate.
-            return Err(non_identifiable_err);
-        }
-
-        // Quotient-geometry gauge fixing: add stiffness only along the closed-form
-        // gauge orbit (Faddeev-Popov style). Components orthogonal to that orbit
-        // are identical to the original inverse solve, while gauge components are
-        // bounded at the Hessian scale `max_pivot`.
-        // #1451: a shape/length mismatch or non-finite stiffness/intermediate in
-        // the deflated-solver assembly is an internal-invariant defect and MUST
-        // propagate; a genuine near-singular gauge Woodbury/back-solve keeps the
-        // typed conditioning class.
-        DeflatedArrowSolver::from_orthonormal_gauges(cache, orthonormal, max_pivot)
-            .map_err(|err| OuterGradientError::classify_arrow_solver_error(&err, conditioning_err))
-    }
-
-    pub(crate) fn outer_gradient_conditioning_error(
-        cache: &ArrowFactorCache,
-    ) -> Result<(), OuterGradientError> {
-        let pivot = arrow_factor_min_pivot(cache);
-        let Some(min_pivot) = pivot.min_pivot else {
-            return Err(OuterGradientError::IllConditioned {
-                reason: "joint Hessian numerically singular (no cached Cholesky pivots)"
-                    .to_string(),
-            });
-        };
-        let Some(max_pivot) = arrow_factor_max_pivot(cache) else {
-            return Err(OuterGradientError::IllConditioned {
-                reason: "joint Hessian numerically singular (no cached Cholesky pivot scale)"
-                    .to_string(),
-            });
-        };
-        let ratio = min_pivot / max_pivot;
-        if min_pivot.is_finite()
-            && max_pivot.is_finite()
-            && max_pivot > 0.0
-            && ratio.is_finite()
-            && ratio >= SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR
-        {
-            return Ok(());
-        }
-        Err(OuterGradientError::IllConditioned {
-            reason: format!(
-                "joint Hessian numerically singular (min/max pivot ratio {ratio:.3e} < floor {floor:.3e}; min pivot {min_pivot:.3e}, max pivot {max_pivot:.3e})",
-                floor = SAE_OUTER_GRADIENT_PIVOT_RATIO_FLOOR,
-            ),
-        })
     }
 
     /// Smoothing-prior normalizer
@@ -3884,267 +3540,6 @@ impl SaeManifoldTerm {
             per_atom[atom_idx] = (atom.decoder_coefficients() * sb).sum();
         }
         Ok(per_atom)
-    }
-
-    /// Per-atom effective penalized dof via the deflated solver (#1556): entry
-    /// `k` is `tr((H⁻¹)_ββ · M_k)` for `M_k = (λ_smooth[k]·S_k) ⊗ I`, each atom
-    /// scaled by its OWN `lambda_smooth[atom_idx]`. The total is the sum.
-    pub(crate) fn decoder_smoothness_effective_dof_with_solver_per_atom(
-        &self,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-        lambda_smooth: &[f64],
-    ) -> Result<Vec<f64>, String> {
-        let p = self.output_dim();
-        // #972 / #977 T1: the cache's β block is the FACTORED border when frames
-        // are active (`cache.k == factored_border_dim`), so the smoothness edf
-        // trace `tr((H⁻¹)_ββ · M)` is taken over the same factored layout, with
-        // `M = ⊕_k (λ_k S_k) ⊗ I_{r_k}` at the factored offsets (the `U_kᵀU_k = I`
-        // collapse means the per-coordinate-channel penalty is `λ_k S_k`, exactly
-        // as in the full-`B` `⊗ I_p` case but with `r_k` channels). On the
-        // full-`B` path `frames_active` is false: `out_dim_k = p`, the offsets
-        // are `beta_offsets`, and this is bit-for-bit the historical trace.
-        let frames_active = self.frames_active();
-        let (offsets, out_dim): (Vec<usize>, Box<dyn Fn(usize) -> usize>) = if frames_active {
-            let ranks: Vec<usize> = self.atoms.iter().map(|a| a.border_frame_rank()).collect();
-            (
-                self.factored_beta_offsets(),
-                Box::new(move |k: usize| ranks[k]),
-            )
-        } else {
-            (self.beta_offsets(), Box::new(move |_: usize| p))
-        };
-        let k = cache.k;
-        // The t-RHS is identically zero for every β-only smoothness solve; build
-        // it once instead of re-zeroing a delta_t_len()-sized buffer per column.
-        let zero_t = Array1::<f64>::zeros(cache.delta_t_len());
-        // #2253/#2228 λ→0 boundary: route the β-only columns through the ONE
-        // deflated spectral pseudo-inverse (see
-        // `decoder_smoothness_effective_dof_per_atom`) so a doubly-null decoder
-        // direction contributes 0 dof instead of `Inf`/`NaN`. With a zero
-        // t-RHS the full arrow solve's β component IS the β-Schur selected
-        // inverse (`solve(0, m).beta = S_β⁻¹ m`), so the deflated applier is
-        // the exact drop-in — but ONLY on the plain bordered arrow. When a
-        // gauge Woodbury deflation is installed (`!plain_selected_inverse_
-        // available`) the solve carries a rank-R gauge correction the β-Schur
-        // applier omits; there the known nulls are already stiffened by
-        // `κQQᵀ`, so the plain per-column solve stays (finite by
-        // construction of the gauge stiffness).
-        let mut per_atom = vec![0.0_f64; self.atoms.len()];
-        let mut m_col = Array1::<f64>::zeros(k);
-        let deflated_apply = if solver.plain_selected_inverse_available() {
-            Some(cache.schur_deflated_applier().map_err(|e| {
-                format!("decoder_smoothness_effective_dof_with_solver_per_atom: {e:?}")
-            })?)
-        } else {
-            None
-        };
-        for (atom_idx, atom) in self.atoms.iter().enumerate() {
-            let s = atom.smooth_penalty();
-            let m = atom.basis_size();
-            let off = offsets[atom_idx];
-            let r = out_dim(atom_idx);
-            let lambda = lambda_smooth[atom_idx];
-            let mut trace = 0.0_f64;
-            for mu in 0..m {
-                for oc in 0..r {
-                    let col = off + mu * r + oc;
-                    // M[:,col] = λ_k · S_k[:,mu] ⊗ e_oc (nonzero at off+ν·r+oc).
-                    m_col.fill(0.0);
-                    for nu in 0..m {
-                        let s_nu_mu = 0.5 * (s[[nu, mu]] + s[[mu, nu]]);
-                        m_col[off + nu * r + oc] = lambda * s_nu_mu;
-                    }
-                    let z = match deflated_apply.as_ref() {
-                        Some(apply) => apply(m_col.view()),
-                        None => solver.solve(zero_t.view(), m_col.view())?.beta,
-                    };
-                    trace += z[col];
-                }
-            }
-            per_atom[atom_idx] = trace;
-        }
-        Ok(per_atom)
-    }
-
-    pub(crate) fn assignment_log_strength_hessian_trace(
-        &self,
-        rho: &SaeManifoldRho,
-        cache: &ArrowFactorCache,
-        solver: &DeflatedArrowSolver<'_>,
-    ) -> Result<f64, String> {
-        self.assignment.validate_rho_domain(rho)?;
-        let k_atoms = self.k_atoms();
-        // #1038/#1419 softmax: the assembled majorizer is the DIAGONAL
-        // `scale·D`, `D = diag(Σ_j|H_kj|)` of the entropy block, carrying the row's
-        // design weight (#991). It scales linearly with `λ_sparse = exp(ρ)`, so
-        // `∂B/∂ρ = scale·D` on the free logit slots of the reduced K−1 chart, and
-        // it takes the one Daleckii–Krein deflation correction below, like every
-        // other family (#2916). The kept-subspace diagonal it used to contract
-        // equals that correction only when no deflated direction couples to the
-        // border, since `vᵢᵀ (H⁻¹)_tt vᵢ = 1 + (H_βt vᵢ)ᵀ S⁻¹ (H_βt vᵢ)`.
-        let mut hdiag = match self.assignment.mode {
-            AssignmentMode::Softmax {
-                temperature,
-                sparsity,
-            } => {
-                if k_atoms <= 1 {
-                    return Ok(0.0);
-                }
-                let inv_tau = 1.0 / temperature;
-                let scale = rho.lambda_sparse()? * sparsity * inv_tau * inv_tau;
-                let penalty = gam_terms::analytic_penalties::SoftmaxAssignmentSparsityPenalty::new(
-                    k_atoms,
-                    temperature,
-                );
-                let row_loss_w = self.row_loss_weights.as_deref();
-                let mut weighted = Array1::<f64>::zeros(self.n_obs() * k_atoms);
-                for row in 0..self.n_obs() {
-                    let w_row = row_loss_w.map_or(1.0, |w| w[row]);
-                    let row_logits: Vec<f64> = (0..k_atoms)
-                        .map(|k| self.assignment.logits[[row, k]])
-                        .collect();
-                    let d = penalty.psd_majorizer_abs_row_sums(&row_logits, scale);
-                    for atom in 0..k_atoms.min(d.len()) {
-                        weighted[row * k_atoms + atom] = w_row * d[atom];
-                    }
-                }
-                weighted
-            }
-            _ => crate::assignment::assignment_prior_log_strength_hdiag_weighted(
-                &self.assignment,
-                rho,
-                self.row_loss_weights.as_deref(),
-            )?,
-        };
-        if hdiag.is_empty() {
-            return Ok(0.0);
-        }
-        // RAW selected-inverse diagonal: the per-row diagonal contraction uses the
-        // DEFLATED inverse; the full kept-subspace + β-Schur/rotation deflation
-        // correction `tr(inv_vv·(D − DΦ[D]))` is subtracted per row afterwards
-        // (`deflation_block_correction`), exactly as the data trace does. The
-        let inv_diag = solver
-            .latent_inverse_diagonal()
-            .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?;
-        let assignment_dim = self.assignment.assignment_coord_dim();
-        let total_t = cache.delta_t_len();
-        // #932 FRONT C: row-local Takahashi selected inverse on the plain arrow
-        // for the per-row deflation correction below (the diagonal trace already
-        // uses the cheap `latent_inverse_diagonal`); gauge-deflated systems fall
-        // back to the per-row full-system `solve` loop.
-        let fast_selected = solver.plain_selected_inverse_available();
-        let selected_beta_inv = if fast_selected && cache.k > 0 {
-            solver
-                .beta_inv()
-                .map_err(|err| format!("assignment_log_strength_hessian_trace: {err}"))?
-        } else {
-            Array2::<f64>::zeros((0, 0))
-        };
-        // `hdiag` differentiates the prior along whatever `log_lambda_sparse` carries:
-        // the concentration when it is effectively learnable. A fixed concentration puts
-        // no coordinate into the prior (#2933 F45), so `hdiag` is zero and there is nothing
-        // to majorize.
-        let ordered_channels = ordered_beta_bernoulli_psd_majorizer_third_channels_weighted(
-            &self.assignment,
-            rho,
-            self.row_loss_weights.as_deref(),
-        )?;
-        // The integrated marginal's mass-Hessian coefficient is strictly
-        // negative, so its cross-row rank-one block has the zero PSD Loewner
-        // majorizer. Retain only the positive part of the row-local
-        // concrete-Jacobian term, matching assembly exactly.
-        if let Some(ch) = ordered_channels.as_ref()
-            && self.assignment.effective_alpha_is_learnable()
-        {
-            for row in 0..self.n_obs() {
-                for atom in 0..k_atoms {
-                    let slot = row * k_atoms + atom;
-                    hdiag[slot] =
-                        super::construction_arrow_schur_assembly::ordered_beta_bernoulli_psd_majorized_log_alpha_hdiag(
-                            ch, row, k_atoms, atom, hdiag[slot],
-                        );
-                }
-            }
-        }
-        let mut trace = 0.0_f64;
-        // Hoisted RHS scratch for the gauge-deflated per-row solve fallback:
-        // single-entry set/clear instead of a per-column total_t-sized zeroing.
-        let mut rhs_t_scratch = Array1::<f64>::zeros(total_t);
-        let rhs_beta_zero = Array1::<f64>::zeros(cache.k);
-        for row in 0..self.n_obs() {
-            let row_base = cache.row_offsets[row];
-            let assignment_base = row * k_atoms;
-            let q = cache.row_dims[row];
-            // Per-row diagonal `(∂H/∂ρ)_tt` for the deflation correction: the
-            // assignment prior curves only the logit/assignment slots (coordinate
-            // slots are zero; ARD handles those).
-            let mut d_diag = Array1::<f64>::zeros(q);
-            match self.last_row_layout {
-                Some(ref layout) => {
-                    for (pos, &atom) in layout.active_atoms[row].iter().enumerate() {
-                        let d_slot = hdiag[assignment_base + atom];
-                        trace += inv_diag[row_base + pos] * d_slot;
-                        if pos < q {
-                            d_diag[pos] = d_slot;
-                        }
-                    }
-                }
-                None => {
-                    for free_idx in 0..assignment_dim {
-                        let d_slot = hdiag[assignment_base + free_idx];
-                        trace += inv_diag[row_base + free_idx] * d_slot;
-                        if free_idx < q {
-                            d_diag[free_idx] = d_slot;
-                        }
-                    }
-                }
-            }
-            let dirs = cache
-                .deflated_row_directions
-                .get(row)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let spectrum = cache
-                .deflation_row_spectra
-                .get(row)
-                .and_then(Option::as_ref);
-            if Self::row_deflation_is_live(dirs, spectrum) {
-                let inv_vv = if fast_selected {
-                    let (inv_vv, _inv_vbeta) = solver
-                        .selected_inverse_row_blocks(row, &selected_beta_inv)
-                        .map_err(|err| {
-                            format!(
-                                "assignment_log_strength_hessian_trace: selected inverse: {err}"
-                            )
-                        })?;
-                    inv_vv
-                } else {
-                    let mut inv_vv = Array2::<f64>::zeros((q, q));
-                    for col in 0..q {
-                        rhs_t_scratch[row_base + col] = 1.0;
-                        let solved = solver
-                            .solve(rhs_t_scratch.view(), rhs_beta_zero.view())
-                            .map_err(|err| {
-                                format!(
-                                    "assignment_log_strength_hessian_trace: selected inverse: {err}"
-                                )
-                            })?;
-                        rhs_t_scratch[row_base + col] = 0.0;
-                        for r in 0..q {
-                            inv_vv[[r, col]] = solved.t[row_base + r];
-                        }
-                    }
-                    inv_vv
-                };
-                let mut d_mat = Array2::<f64>::zeros((q, q));
-                for s in 0..q {
-                    d_mat[[s, s]] = d_diag[s];
-                }
-                trace -= Self::deflation_block_correction(&inv_vv, &d_mat, dirs, spectrum);
-            }
-        }
-        Ok(0.5 * trace)
     }
 
     /// Matrix-free sibling of [`Self::assignment_log_strength_hessian_trace`]

@@ -3398,23 +3398,31 @@ fn pooled_probit_baseline_matches_expanded_integer_weight_fit() {
     let y = array![0.0, 1.0, 0.0, 1.0];
     let z = array![-1.5, -0.2, 0.4, 1.4];
     let weights = array![25.0, 2.0, 1.0, 20.0];
-    let weighted = pooled_probit_baseline(&y, &z, &weights)
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "weighted baseline", e));
-    let unweighted = pooled_probit_baseline(&y, &z, &Array1::ones(y.len()))
-        .unwrap_or_else(|e| panic!("{} failed: {:?}", "unweighted baseline", e));
     let (y_expanded, z_expanded) = expand_integer_weight_rows(&y, &z, &weights);
-    let expanded =
-        pooled_probit_baseline(&y_expanded, &z_expanded, &Array1::ones(y_expanded.len()))
-            .unwrap_or_else(|e| panic!("{} failed: {:?}", "expanded baseline", e));
+    // The Jeffreys prior's information `Σ wᵢ ω(ηᵢ) xᵢxᵢᵀ` is weighted like the
+    // likelihood, so the armed pilot is weight-consistent too.
+    for armed in [false, true] {
+        let weighted = pooled_probit_baseline(&y, &z, &weights, armed)
+            .unwrap_or_else(|e| panic!("weighted baseline (armed={armed}) failed: {e:?}"));
+        let unweighted = pooled_probit_baseline(&y, &z, &Array1::ones(y.len()), armed)
+            .unwrap_or_else(|e| panic!("unweighted baseline (armed={armed}) failed: {e:?}"));
+        let expanded = pooled_probit_baseline(
+            &y_expanded,
+            &z_expanded,
+            &Array1::ones(y_expanded.len()),
+            armed,
+        )
+        .unwrap_or_else(|e| panic!("expanded baseline (armed={armed}) failed: {e:?}"));
 
-    assert!(
-        pair_distance(expanded, unweighted) > 1e-2,
-        "test data should distinguish weighted from unweighted seeding"
-    );
-    assert!(
-        pair_distance(weighted, expanded) < 1e-8,
-        "weighted pilot baseline should match the expanded integer-weight fit"
-    );
+        assert!(
+            pair_distance(expanded, unweighted) > 1e-2,
+            "test data should distinguish weighted from unweighted seeding (armed={armed})"
+        );
+        assert!(
+            pair_distance(weighted, expanded) < 1e-8,
+            "weighted pilot baseline should match the expanded integer-weight fit (armed={armed})"
+        );
+    }
 }
 
 #[test]
@@ -7060,7 +7068,7 @@ fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
     assert!(cal.post_mean.abs() < 1.0e-6, "post_mean={}", cal.post_mean);
 }
 
-/// Regression test on `weighted_ridge_sandwich_cov` directly: the HC0 sandwich
+/// Regression test on the first-stage sandwich directly: its HC0 mean block
 /// must be FINITE on a numerically rank-deficient normal matrix, the smallest
 /// failure mode behind the "conditional latent calibration sandwich covariance
 /// is non-finite" production error. Two identical informative columns make
@@ -7069,7 +7077,7 @@ fn conditional_latent_gate_detects_and_removes_conditional_mean_shift() {
 /// pseudo-inverse path projects out the non-identified direction and the
 /// returned covariance is finite and PSD on the identifiable span.
 #[test]
-fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
+fn first_stage_sandwich_is_finite_on_rank_deficient_normal_matrix() {
     let n = 1_024usize;
     // Two perfectly collinear basis columns: `AᵀA` is rank 1 in a 2-D system.
     let mut basis = Array2::<f64>::zeros((n, 2));
@@ -7092,13 +7100,32 @@ fn weighted_ridge_sandwich_cov_is_finite_on_rank_deficient_normal_matrix() {
     normal_matrix[[0, 0]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
     normal_matrix[[1, 1]] *= 1.0 + AUTO_Z_CONDITIONAL_RIDGE_REL;
 
-    let cov = weighted_ridge_sandwich_cov(basis.view(), &residuals, weights.view(), &normal_matrix)
-        .unwrap_or_else(|e| {
-            panic!(
-                "{} failed: {:?}",
-                "rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse", e
-            )
-        });
+    // The constant variance stage (`B = 1`, `N = Σw`) rides along; the mean
+    // block of the stacked sandwich is the standalone HC0 sandwich.
+    let var_basis = Array2::<f64>::ones((n, 1));
+    let var_normal = Array2::<f64>::from_elem((1, 1), n as f64);
+    let var_residuals: Vec<f64> = residuals.iter().map(|&e| e * e - 0.25).collect();
+    let joint = stacked_first_stage_sandwich_cov(
+        basis.view(),
+        var_basis.view(),
+        weights.view(),
+        &residuals,
+        &var_residuals,
+        &normal_matrix,
+        &var_normal,
+    )
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} failed: {:?}",
+            "rank-deficient normal matrix must yield a finite sandwich via pseudo-inverse", e
+        )
+    });
+    assert!(
+        joint.iter().all(|v| v.is_finite()),
+        "joint sandwich covariance must be finite; got {:?}",
+        joint
+    );
+    let cov = joint.slice(ndarray::s![..2, ..2]).to_owned();
 
     assert_eq!(cov.dim(), (2, 2));
     assert!(

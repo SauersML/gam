@@ -53,8 +53,9 @@ struct FrameLiftedVerdict {
     coefficients: Array1<f64>,
     /// The refused basin directions with their basin curvature `κ`.
     refused: Vec<(Array1<f64>, f64)>,
-    /// The gate-frozen penalized objective at the root.
-    objective: f64,
+    /// The gate-frozen penalized objective at the root, with its rounding band
+    /// (#3243).
+    objective: BandedPenalizedObjective,
 }
 
 /// One atom's velocity along the lifted chart.
@@ -244,8 +245,8 @@ impl SaeManifoldTerm {
             .filter(|&index| joint.eigenvalues[index] > pencil_floor.max(joint.resolution[index]))
             .map(|index| coefficients[index] * coefficients[index] / joint.eigenvalues[index])
             .sum::<f64>();
-        let objective = self.penalized_objective_total(target, rho, registry, 1.0)?;
-        let relative = 0.5 * lambda_sq / (objective.abs() + 1.0);
+        let objective = self.penalized_objective_banded(target, rho, registry, 1.0)?;
+        let relative = 0.5 * lambda_sq / (objective.value.abs() + 1.0);
         let certified = (resolved_negative.is_none() || clamp_explained)
             && Self::inner_decrement_certifies(relative);
         Ok(FrameLiftedVerdict {
@@ -357,7 +358,7 @@ impl SaeManifoldTerm {
             "frame-lifted root: ½λ²/scale = {:.6e} (λ² = {:.6e}) exceeds the decrement \
              tolerance in the lifted chart, and no lifted step lowers the objective \
              {:.10e} by more than its material floor",
-            certificate.relative, certificate.lambda_sq, verdict.objective,
+            certificate.relative, certificate.lambda_sq, verdict.objective.value,
         ))
     }
 
@@ -373,8 +374,9 @@ impl SaeManifoldTerm {
         information: &FrameMarginalInformation,
         direction: ArrayView1<'_, f64>,
         curvature: f64,
-        base_objective: f64,
+        base: BandedPenalizedObjective,
     ) -> Result<bool, String> {
+        let base_objective = base.value;
         if !base_objective.is_finite() {
             return Ok(false);
         }
@@ -401,7 +403,7 @@ impl SaeManifoldTerm {
             rho,
             registry,
             &|term: &mut Self, alpha: f64| term.advance_along_learned_frame_chart(&step, alpha),
-            base_objective,
+            base,
             slope,
             negative_curvature,
             material_floor,
