@@ -3386,7 +3386,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     .with_exact_polish(CustomOuterState::begin_exact_polish)
     // #2765: the projected criterion prices `½·log|ZᵀMZ|₊` over a kept rank that moves
     // with the inner mode's face, so the outer search keeps each run on one rank.
-    .with_criterion_rank(|outer: &CustomOuterState| outer.last_criterion_rank)
+    .with_criterion_rank(|outer: &CustomOuterState| {
+        outer
+            .last_criterion_rank
+            .map(gam_solve::rho_optimizer::CriterionRank::single)
+    })
     // EFS may discover the optimum, but only the labeled analytic evaluator
     // owns the exact objective/gradient/coefficient-mode identity consumed by
     // fit assembly. Force the runner's final full-fidelity installation

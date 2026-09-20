@@ -1707,10 +1707,11 @@ pub struct OuterResult {
 /// filled cost-stall window in which every trial was refused for keeping a different rank
 /// than the one the search started on (#2765). The incumbent it halted at is published
 /// non-converged, and the terminal certificate judges it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RankBoundaryStall {
-    /// Kept rank of the face log-determinant this search searched.
-    pub kept_rank: usize,
+    /// Kept rank of the criterion this search searched: one component for a face
+    /// log-determinant, one per rank decision for a criterion with several (#3436).
+    pub kept_rank: CriterionRank,
     /// Consecutive trials the filled window refused for leaving that rank.
     pub refused_trials: usize,
     /// The certificate's stationarity band at the incumbent's value, which the incumbent's
@@ -3344,7 +3345,7 @@ pub(super) fn outer_nonconvergence_error(
     };
     // A halt where the search's kept rank ends names the rank, the refused trials that
     // filled the window, and the band the incumbent missed (#2939).
-    let reason = match result.rank_boundary_stall {
+    let reason = match &result.rank_boundary_stall {
         Some(stall) => format!(
             "{reason}, rank_boundary=[kept_rank={}, refused_trials={}, band={:.6e}: every \
              trial in the filled window kept a different rank, so the search stopped where its \

@@ -57,6 +57,71 @@ pub enum SeedOutcome {
     Incompatible,
 }
 
+/// Kept rank of the criterion an evaluation priced (#2765, #3436): the discrete
+/// branch its value lives on.
+///
+/// A criterion whose value depends on integer rank decisions is piecewise smooth.
+/// On one fixed assignment `r` of those ranks it is one smooth function `V_r(θ)`;
+/// where a rank flips, the value jumps to another function `V_{r'}`. Comparing two
+/// values certifies descent only when both were priced on the same assignment.
+///
+/// A criterion with one rank decision (one pseudo-log-determinant) publishes one
+/// component. A criterion that sums independent rank decisions (one per atom of a
+/// sparse-autoencoder dictionary, #3436) publishes one component per decision, in
+/// an order the objective fixes. Equality compares component by component. Two
+/// assignments with the same total but a different split price two different
+/// functions and are two strata: atom 0 gains a direction where atom 1 loses one,
+/// and the total does not move. Folding the components into their sum would hide
+/// exactly that crossing.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CriterionRank {
+    components: Box<[usize]>,
+}
+
+impl CriterionRank {
+    /// One rank decision.
+    pub fn single(rank: usize) -> Self {
+        Self {
+            components: Box::new([rank]),
+        }
+    }
+
+    /// One rank decision per component, in the order the objective fixes.
+    pub fn per_component(components: Vec<usize>) -> Self {
+        Self {
+            components: components.into_boxed_slice(),
+        }
+    }
+
+    /// The rank each component keeps.
+    pub fn components(&self) -> &[usize] {
+        &self.components
+    }
+
+    /// Total rank kept across components.
+    pub fn total(&self) -> usize {
+        self.components.iter().sum()
+    }
+}
+
+impl std::fmt::Display for CriterionRank {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.components.as_ref() {
+            [rank] => write!(f, "{rank}"),
+            components => {
+                write!(f, "{} (per component [", self.total())?;
+                for (index, rank) in components.iter().enumerate() {
+                    if index > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{rank}")?;
+                }
+                write!(f, "])")
+            }
+        }
+    }
+}
+
 /// Common interface for outer smoothing-parameter objectives.
 ///
 /// Every model path that optimizes smoothing parameters implements this trait.
@@ -239,7 +304,9 @@ pub trait OuterObjective {
     /// functions, so a line search comparing them compares nothing. The first-order
     /// bridge reads this after each evaluation and refuses a trial whose rank differs
     /// from its run's start. `None` means one criterion everywhere: no rank to keep.
-    fn criterion_rank(&self) -> Option<usize> {
+    /// A criterion with several rank decisions publishes all of them (#3436); see
+    /// [`CriterionRank`].
+    fn criterion_rank(&self) -> Option<CriterionRank> {
         None
     }
 
@@ -943,7 +1010,7 @@ impl<'a> OuterObjective for CheckpointingObjective<'a> {
         self.inner.criterion_invariant_directions(theta)
     }
 
-    fn criterion_rank(&self) -> Option<usize> {
+    fn criterion_rank(&self) -> Option<CriterionRank> {
         self.inner.criterion_rank()
     }
 
@@ -1073,7 +1140,7 @@ pub struct ClosureObjective<
     /// Optional kept-rank hook (#2765). Installed by objectives whose criterion is a
     /// pseudo-log-determinant over a rank that moves with the inner mode; `None` means
     /// one criterion everywhere.
-    pub(crate) criterion_rank_fn: Option<Box<dyn Fn(&S) -> Option<usize>>>,
+    pub(crate) criterion_rank_fn: Option<Box<dyn Fn(&S) -> Option<CriterionRank>>>,
     /// Optional inner-state seeding closure. Objectives with PIRLS / Newton
     /// inner state install cached β here before the first outer eval.
     pub(crate) seed_fn: Option<Fseed>,
@@ -1216,7 +1283,7 @@ where
         Some(published)
     }
 
-    fn criterion_rank(&self) -> Option<usize> {
+    fn criterion_rank(&self) -> Option<CriterionRank> {
         self.criterion_rank_fn.as_ref()?(&self.state)
     }
 
@@ -1322,7 +1389,7 @@ impl<S, Fc, Fe, Fr, Fefs, Feo, Fseed> ClosureObjective<S, Fc, Fe, Fr, Fefs, Feo,
     /// whose criterion is one function at every point must not install this hook.
     pub fn with_criterion_rank<Frank>(mut self, rank: Frank) -> Self
     where
-        Frank: Fn(&S) -> Option<usize> + 'static,
+        Frank: Fn(&S) -> Option<CriterionRank> + 'static,
     {
         self.criterion_rank_fn = Some(Box::new(rank));
         self
@@ -2038,7 +2105,7 @@ impl<'a> OuterObjective for CanonicalizedObjective<'a> {
         Ok(RailFaceLimitOutcome::Available(limit))
     }
 
-    fn criterion_rank(&self) -> Option<usize> {
+    fn criterion_rank(&self) -> Option<CriterionRank> {
         // A rank is a property of the criterion, not of its coordinate order.
         self.inner.criterion_rank()
     }

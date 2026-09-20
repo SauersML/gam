@@ -1974,7 +1974,7 @@ pub(crate) fn run_outer_with_plan(
                                     cost: stratum_eval.cost,
                                     gradient: stratum_eval.gradient.clone(),
                                 }),
-                                stratum_rank,
+                                stratum_rank: stratum_rank.clone(),
                                 stratum_probe: Some(Arc::clone(&stratum_probe)),
                             },
                             Arc::clone(&last_objective_error),
