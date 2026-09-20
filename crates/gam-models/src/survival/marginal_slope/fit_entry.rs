@@ -832,11 +832,13 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
     // hosted as a dedicated additive absorber block whose coefficient `γ` shifts
     // the de-nested observed index `η₁` by `+Z̃_infl·γ`. β̂₀(x_i) is the
     // rigid-pilot slope `baseline_slope + slope_offset[i]`; `s_f =
-    // probit_scale`. The math (residualize-vs-marginal/retain-slope +
-    // fixed-ridge absorber) is the single source of truth shared with the BMS
-    // family via `marginal_slope_orthogonal`; survival differs only in the host
-    // structure — a dedicated `η₁` channel rather than BMS's widened marginal
-    // index, because the survival marginal block feeds the time-quantile
+    // probit_scale`. The math (residualize against the protected span +
+    // REML-learned ridge absorber) is the single source of truth shared with the
+    // BMS family via `marginal_slope_orthogonal`; survival differs in the
+    // protected span (marginal only, retaining slope, where BMS protects
+    // marginal + slope) and in the host structure — a dedicated `η₁` channel
+    // rather than BMS's widened marginal index, because the survival marginal
+    // block feeds the time-quantile
     // location `q·c(g)` (scaled), not a flat additive index. `None` ⇒ raw `z`,
     // and the free `score_warp` spline below is the x-free-column fallback.
     let influence_absorber_residualized: Option<Array2<f64>> = if let Some(jac) = spec
@@ -850,18 +852,16 @@ pub(crate) fn fit_survival_marginal_slope_terms_impl(
             .design
             .try_to_dense_by_chunks("survival marginal-slope influence-absorber marginal span")
             .map_err(FitFailure::input)?;
-        // `β̂₀(x_i)` is the rigid-pilot slope; `s_f = probit_scale`; `z_primary`
-        // is the OOF latent z on these rows.
+        // `β̂₀(x_i)` is the rigid-pilot slope; `s_f = probit_scale`.
         let rigid_slope_at_rows = &spec.slope_offset + baseline_slope;
         // Z̃_infl = residualize(diag(s_f·β̂₀)·J, marginal, W) — the combined core
         // builder (single source of truth shared with the BMS absorber site). It
-        // takes the raw n×p₁ J + OOF z and encapsulates the full §3 sequence: build
-        // Z_infl, derive the weighted marginal-Gram ridge internally (max diag·1e-10,
-        // floored 1e-12), residualize, and finite-check (Err on non-finite), so this
-        // caller passes no ε and propagates the error.
+        // takes the raw n×p₁ J and encapsulates the full §3 sequence: build
+        // Z_infl, project out the marginal span through the rank-certified
+        // pseudo-inverse of the weighted marginal Gram, and finite-check (Err on
+        // non-finite), so this caller passes no tolerance and propagates the error.
         let residualized = residualized_influence_block(
             jac,
-            &z_primary,
             &rigid_slope_at_rows,
             probit_scale,
             marginal_dense.view(),

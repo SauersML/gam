@@ -359,9 +359,11 @@ fn validate_symmetric_psd_core(matrix: &Array2<f64>, what: &str) -> Result<(), S
         }
         max_abs = max_abs.max(value.abs());
     }
-    // Symmetry: relative to the matrix scale so a legitimately large penalty
-    // is not rejected for round-off and a small one cannot hide genuine skew.
-    let sym_tol = 1e-10 * max_abs.max(1.0);
+    // Symmetry: purely relative to the matrix scale so a legitimately large
+    // penalty is not rejected for round-off and a small one cannot hide genuine
+    // skew. No absolute floor: validity must be invariant under `S -> c*S`. The
+    // zero penalty has tolerance 0 and asymmetry exactly 0, so it still passes.
+    let sym_tol = 1e-10 * max_abs;
     for row in 0..nrows {
         for col in (row + 1)..ncols {
             let asymmetry = (matrix[[row, col]] - matrix[[col, row]]).abs();
@@ -662,6 +664,31 @@ mod tests {
                 .unwrap_err()
                 .contains("must be finite and in")
         );
+    }
+
+    #[test]
+    fn validate_symmetry_is_scale_invariant() {
+        // A fully skew off-diagonal must be rejected at every scale, including
+        // penalties whose entries are far below 1 in absolute terms.
+        for scale in [1e-14, 1e-12, 1e-6, 1.0, 1e6, 1e12] {
+            let skew = PenaltyMatrix::Dense(array![[1.0, 1.0], [0.0, 1.0]] * scale);
+            assert!(
+                skew.validate(2).unwrap_err().contains("not symmetric"),
+                "scale {scale}"
+            );
+            let kron = PenaltyMatrix::KroneckerFactored {
+                left: array![[1.0, 1.0], [0.0, 1.0]] * scale,
+                right: ndarray::Array2::<f64>::eye(2),
+            };
+            assert!(
+                kron.validate(4).unwrap_err().contains("not symmetric"),
+                "scale {scale}"
+            );
+            let symmetric = PenaltyMatrix::Dense(array![[2.0, -1.0], [-1.0, 2.0]] * scale);
+            assert_eq!(symmetric.validate(2), Ok(()), "scale {scale}");
+        }
+        let zero = PenaltyMatrix::Dense(ndarray::Array2::<f64>::zeros((2, 2)));
+        assert_eq!(zero.validate(2), Ok(()));
     }
 
     #[test]
