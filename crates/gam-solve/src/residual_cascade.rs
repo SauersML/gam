@@ -5646,6 +5646,76 @@ pub fn fit_residual_cascade(
 
 #[cfg(test)]
 mod refinement_decision_tests {
+    #[test]
+    fn canonical_ql_reaches_the_live_residual_gauss_rule_at_extreme_scales() {
+        let (x1, x2, y) = dense_fixture(6);
+        let design = cascade_core((&x1, &x2, &y), 2);
+        for scale in [1e-280, 1.0, 1e308] {
+            let run = SchurLanczos {
+                alpha: vec![scale, scale],
+                beta: vec![0.2 * scale],
+                tail: 0.0,
+                spectral_scale: scale,
+                start_norm_sq: 1.0,
+                invariant: true,
+            };
+            let rule = design.core.residual_gauss_rule(&run, 2, 1.0, 1.0).unwrap();
+            let mut modes: Vec<_> = rule
+                .spectrum
+                .eigenvalue
+                .iter()
+                .copied()
+                .zip(rule.spectrum.projected_square.iter().copied())
+                .collect();
+            modes.sort_by(|a, b| a.0.total_cmp(&b.0));
+            assert_eq!(modes.len(), 2);
+            for ((eigenvalue, mass), expected) in modes.into_iter().zip([0.8, 1.2]) {
+                assert!((eigenvalue / scale - expected).abs() < 8.0 * f64::EPSILON);
+                assert!((mass - 0.5).abs() < 8.0 * f64::EPSILON);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_ql_preserves_real_lanczos_shape_mass_and_residual_moments() {
+        let (x1, x2, y) = dense_fixture(6);
+        let design = cascade_core((&x1, &x2, &y), 2);
+        let core = &design.core;
+        let (null_chol, _) = core.null_gram_factor().unwrap();
+        let (_, dense) = core.dense_cascade_spectrum(&null_chol).unwrap();
+        let (start, anchor) = core.whitened_residual_rhs(&null_chol);
+        let mass: f64 = start.iter().map(|value| value * value).sum();
+        let ceiling = core.residual_krylov_ceiling();
+        let run = core
+            .schur_lanczos(&null_chol, &start, ceiling, ceiling)
+            .unwrap();
+        assert!(!run.alpha.is_empty());
+        assert_eq!(run.beta.len(), run.alpha.len() - 1);
+        assert!(run.invariant);
+        for steps in 1..=run.alpha.len() {
+            let rule = core.residual_gauss_rule(&run, steps, anchor, mass).unwrap();
+            assert!(rule.mass_defect <= 8.0 * f64::EPSILON * steps as f64);
+        }
+        let rule = core
+            .residual_gauss_rule(&run, run.alpha.len(), anchor, mass)
+            .unwrap();
+        for lambda in [0.25, 1.0, 4.0] {
+            let actual = rule.spectrum.moments(lambda);
+            let expected = dense.moments(lambda);
+            for (got, truth) in [
+                (actual.0, expected.0),
+                (actual.1, expected.1),
+                (actual.2, expected.2),
+                (actual.3, expected.3),
+            ] {
+                assert!(
+                    (got - truth).abs() <= f64::EPSILON.sqrt() * truth.abs().max(1.0),
+                    "lambda={lambda}: {got} versus {truth}"
+                );
+            }
+        }
+    }
+
     use super::*;
 
     // Probe instruments for the #2628/#2546/#2503 pins below. 272905c19 retired them from

@@ -78,7 +78,7 @@ impl Scenario {
 }
 
 fn contains(set: &FullConformalSet, z: f64) -> bool {
-    set.intervals.iter().any(|itv| itv.lo <= z && z <= itv.hi)
+    set.intervals.iter().any(|itv| itv.contains(z))
 }
 
 fn unit_weights(n: usize) -> Array1<f64> {
@@ -143,7 +143,7 @@ fn oracle_member(
     s_lambda: &Array2<f64>,
     x_star: &Array1<f64>,
     z: f64,
-    required: usize,
+    alpha: f64,
 ) -> bool {
     let lambda = brute_force_rho(response, Some(z)).exp();
     let mut normal = x.t().dot(x) + s_lambda * lambda;
@@ -158,13 +158,15 @@ fn oracle_member(
         .expect("augmented normal matrix is SPD")
         .solvevec(&rhs);
     let test_score = (z - x_star.dot(&beta)).abs();
-    let dominating = x
+    let scores: Vec<f64> = x
         .rows()
         .into_iter()
         .zip(y.iter())
-        .filter(|(row, yi)| (*yi - row.dot(&beta)).abs() >= test_score)
-        .count();
-    dominating >= required
+        .map(|(row, yi)| (*yi - row.dot(&beta)).abs())
+        .collect();
+    let greater = scores.iter().filter(|&&v| v > test_score).count();
+    let tied = scores.iter().filter(|&&v| v == test_score).count();
+    greater as f64 + 0.5 * (1 + tied) as f64 > alpha * (x.nrows() + 1) as f64
 }
 
 struct OracleReport {
@@ -185,18 +187,28 @@ fn oracle_compare(
     alpha: f64,
 ) -> OracleReport {
     let n = x.nrows();
-    let honest = honest_full_conformal(x, y, &unit_weights(n), s_lambda, Some(1), x_star, alpha)
-        .expect("honest set");
+    let honest = honest_full_conformal_with_uniform(
+        x,
+        y,
+        &unit_weights(n),
+        s_lambda,
+        Some(1),
+        x_star,
+        alpha,
+        0.5,
+    )
+    .expect("honest set");
     assert_eq!(
         honest.certificate,
         ConformalCertificate::HonestRefit,
         "single-penalty Gaussian row must carry the honest certificate"
     );
-    let frozen = ExactGaussianFullConformal::new(x, y, &unit_weights(n), s_lambda, x_star)
-        .expect("frozen engine")
-        .prediction_set(alpha);
+    let frozen =
+        ExactGaussianFullConformal::new_with_uniform(x, y, &unit_weights(n), s_lambda, x_star, 0.5)
+            .expect("frozen engine")
+            .prediction_set(alpha)
+            .expect("prediction set");
     let response = GaussianRemlRhoResponse::new(x, y, s_lambda, x_star).expect("response");
-    let required = required_dominating_count(n, alpha);
 
     let center = honest.plug_in_mean;
     let endpoints: Vec<f64> = honest
@@ -222,7 +234,7 @@ fn oracle_compare(
         .into_iter()
         .flat_map(|scale| [center - scale * half_width, center + scale * half_width]);
     for z in grid.chain(tails) {
-        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, required);
+        let truth = oracle_member(&response, x, y, s_lambda, x_star, z, alpha);
         let near_breakpoint = endpoints.iter().any(|e| (z - e).abs() <= spacing);
         if contains(&honest.set, z) != truth && !near_breakpoint {
             honest_mismatches.push(z);
@@ -247,9 +259,14 @@ fn honest_set_matches_brute_force_reml_refits() {
     let cases: Vec<(Scenario, usize, u64, f64)> = Scenario::ALL
         .into_iter()
         .flat_map(|scenario| {
-            [(12usize, 11u64, 0.2), (20, 23, 0.1), (30, 37, 0.1), (40, 41, 0.2)]
-                .into_iter()
-                .map(move |(n, seed, alpha)| (scenario, n, seed, alpha))
+            [
+                (12usize, 11u64, 0.2),
+                (20, 23, 0.1),
+                (30, 37, 0.1),
+                (40, 41, 0.2),
+            ]
+            .into_iter()
+            .map(move |(n, seed, alpha)| (scenario, n, seed, alpha))
         })
         .collect();
     let reports: Vec<_> = cases
@@ -297,8 +314,17 @@ fn honest_set_does_not_depend_on_the_stored_strength() {
     let (x, y, x_star, _) = Scenario::Heteroscedastic.sample(25, 5);
     let s = curvature_penalty();
     let set_at = |scale: f64| {
-        honest_full_conformal(&x, &y, &unit_weights(25), &(&s * scale), Some(1), &x_star, 0.1)
-            .expect("honest set")
+        honest_full_conformal_with_uniform(
+            &x,
+            &y,
+            &unit_weights(25),
+            &(&s * scale),
+            Some(1),
+            &x_star,
+            0.1,
+            0.5,
+        )
+        .expect("honest set")
     };
     let base = set_at(1.0);
     assert_eq!(base.certificate, ConformalCertificate::HonestRefit);
@@ -322,16 +348,33 @@ fn honest_set_does_not_depend_on_the_stored_strength() {
 fn unsupported_penalty_structures_are_refused_loudly() {
     let (x, y, x_star, _) = Scenario::HeavyTails.sample(20, 9);
     let s = curvature_penalty();
-    let frozen = ExactGaussianFullConformal::new(&x, &y, &unit_weights(20), &s, &x_star)
-        .expect("frozen")
-        .prediction_set(0.1);
+    let frozen =
+        ExactGaussianFullConformal::new_with_uniform(&x, &y, &unit_weights(20), &s, &x_star, 0.5)
+            .expect("frozen")
+            .prediction_set(0.1)
+            .expect("prediction set");
     for (count, expected) in [
-        (None, ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)),
-        (Some(2), ConformalCertificate::Refused(ConformalRefusal::MultiPenalty)),
+        (
+            None,
+            ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure),
+        ),
+        (
+            Some(2),
+            ConformalCertificate::Refused(ConformalRefusal::MultiPenalty),
+        ),
         (Some(0), ConformalCertificate::ExactFrozen),
     ] {
-        let row = honest_full_conformal(&x, &y, &unit_weights(20), &s, count, &x_star, 0.1)
-            .expect("row");
+        let row = honest_full_conformal_with_uniform(
+            &x,
+            &y,
+            &unit_weights(20),
+            &s,
+            count,
+            &x_star,
+            0.1,
+            0.5,
+        )
+        .expect("row");
         assert_eq!(row.certificate, expected, "penalty count {count:?}");
         assert_eq!(row.certificate.is_guaranteed(), count == Some(0));
         assert_eq!(row.set.intervals, frozen.intervals, "penalty count {count:?}");

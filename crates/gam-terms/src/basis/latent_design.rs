@@ -655,13 +655,21 @@ pub fn build_latent_forward_design(
                 ));
             }
             let t_mat = t_matrix_from_flat(t_flat, n_obs, latent_dim)?;
+            // Pin the supplied center frame. A cold Matérn build rank-reduces
+            // its centers over the data, and here the data is the moving latent
+            // `t`: the surviving centers (and the column count) would change
+            // with the batch, while the jet below and the caller's penalty use
+            // all K centers. A frozen identity transform keeps the centers
+            // verbatim, exactly as the Duchon arm freezes its frame (#2833).
             let spec = MaternBasisSpec {
                 center_strategy: CenterStrategy::UserProvided(centers.to_owned()),
                 length_scale: MaternLengthScale::fixed(1.0),
                 nu: MaternNu::ThreeHalves,
                 include_intercept: false,
                 double_penalty: false,
-                identifiability: MaternIdentifiability::None,
+                identifiability: MaternIdentifiability::FrozenTransform {
+                    transform: Array2::eye(centers.nrows()),
+                },
                 aniso_log_scales: None,
                 periodic: None,
             };
@@ -773,4 +781,44 @@ pub fn build_latent_forward_design(
         ));
     }
     Ok((design, t_mat, jet))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn matern_latent_design_keeps_its_center_frame_and_jet_when_n_is_below_k() {
+        // n_obs = 3 < K = 5: the realized kernel block has rank <= 3, so a
+        // data-dependent center reduction would drop columns the jet keeps.
+        let centers = array![[0.0], [0.25], [0.5], [0.75], [1.0]];
+        let t = array![0.1_f64, 0.45, 0.8];
+        let evaluate = |point: ArrayView1<'_, f64>| {
+            build_latent_forward_design(
+                "matern", point, 3, 1, centers.view(), 2, None, None, None, None,
+            )
+            .expect("latent Matérn forward design")
+        };
+        let (design, _, jet) = evaluate(t.view());
+        assert_eq!(design.ncols(), centers.nrows());
+        assert_eq!(jet.shape(), &[3, centers.nrows(), 1]);
+        let h = 1e-6;
+        for row in 0..t.len() {
+            let mut plus = t.clone();
+            let mut minus = t.clone();
+            plus[row] += h;
+            minus[row] -= h;
+            let (xp, _, _) = evaluate(plus.view());
+            let (xm, _, _) = evaluate(minus.view());
+            for col in 0..design.ncols() {
+                let fd = (xp[[row, col]] - xm[[row, col]]) / (2.0 * h);
+                let analytic = jet[[row, col, 0]];
+                assert!(
+                    (fd - analytic).abs() < 1e-6 * (1.0 + analytic.abs()),
+                    "row {row}, col {col}: jet {analytic} vs finite difference {fd}"
+                );
+            }
+        }
+    }
 }

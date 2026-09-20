@@ -445,8 +445,10 @@ fn log_tweedie_half_deviance(log_weight: f64, log_y: f64, eta: f64, p: f64) -> f
     }
 }
 
+/// `(μ, 1 − μ)` of the logistic inverse link, each formed from its own tail so
+/// the smaller member keeps full relative precision on both sides of `η = 0`.
 #[inline]
-fn logit_probability_pair(eta: f64) -> (f64, f64) {
+pub(crate) fn logit_probability_pair(eta: f64) -> (f64, f64) {
     if eta >= 0.0 {
         let tail = (-eta).exp();
         let one_minus_mu = tail / (1.0 + tail);
@@ -1783,7 +1785,13 @@ pub(crate) fn beta_eta_for_logit_target(target: f64, phi: f64) -> Result<f64, Es
             "Beta score root could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
         )));
     }
-    for _ in 0..256 {
+    if lower_score == 0.0 {
+        return Ok(lower);
+    }
+    if upper_score == 0.0 {
+        return Ok(upper);
+    }
+    loop {
         let midpoint = lower + 0.5 * (upper - lower);
         if midpoint == lower || midpoint == upper {
             return Ok(if lower_score.abs() <= upper_score.abs() {
@@ -1809,9 +1817,6 @@ pub(crate) fn beta_eta_for_logit_target(target: f64, phi: f64) -> Result<f64, Es
             upper_score = score;
         }
     }
-    Err(EstimationError::InvalidInput(
-        "Beta score root did not reach an adjacent-float bracket".into(),
-    ))
 }
 
 /// Solve the fixed-precision Beta intercept score in its unbounded logit
@@ -1841,59 +1846,7 @@ fn beta_null_eta(
         },
     )?;
 
-    let mut lower = -1.0_f64;
-    let mut upper = 1.0_f64;
-    let mut lower_score = beta_null_score(lower, phi, target);
-    let mut upper_score = beta_null_score(upper, phi, target);
-    while lower_score > 0.0 && lower > -1024.0 {
-        lower *= 2.0;
-        lower_score = beta_null_score(lower, phi, target);
-    }
-    while upper_score < 0.0 && upper < 1024.0 {
-        upper *= 2.0;
-        upper_score = beta_null_score(upper, phi, target);
-    }
-    if lower_score.is_nan() || upper_score.is_nan() || lower_score > 0.0 || upper_score < 0.0 {
-        return Err(EstimationError::InvalidInput(format!(
-            "Beta null score could not be bracketed: lower=({lower},{lower_score}), upper=({upper},{upper_score}), target={target}"
-        )));
-    }
-    if lower_score == 0.0 {
-        return Ok(lower);
-    }
-    if upper_score == 0.0 {
-        return Ok(upper);
-    }
-
-    for _ in 0..256 {
-        let midpoint = lower + 0.5 * (upper - lower);
-        if midpoint == lower || midpoint == upper {
-            return Ok(if lower_score.abs() <= upper_score.abs() {
-                lower
-            } else {
-                upper
-            });
-        }
-        let score = beta_null_score(midpoint, phi, target);
-        if score.is_nan() {
-            return Err(EstimationError::InvalidInput(format!(
-                "Beta null score is NaN at eta={midpoint}, precision={phi}, target={target}"
-            )));
-        }
-        if score == 0.0 {
-            return Ok(midpoint);
-        }
-        if score < 0.0 {
-            lower = midpoint;
-            lower_score = score;
-        } else {
-            upper = midpoint;
-            upper_score = score;
-        }
-    }
-    Err(EstimationError::InvalidInput(format!(
-        "Beta null score did not reach an adjacent-float bracket: lower=({lower},{lower_score}), upper=({upper},{upper_score})"
-    )))
+    beta_eta_for_logit_target(target, phi)
 }
 
 /// Exact intercept-only deviance for reporting and deviance-explained metrics.
@@ -2567,10 +2520,11 @@ fn negative_binomial_saturated_log_likelihood(y: f64, theta: f64) -> f64 {
 fn gamma_saturated_log_normalizer(log_shape: f64, weight: f64, y: f64) -> f64 {
     let log_a = weight.ln() + log_shape;
     let core = if log_a >= 8.0_f64.ln() {
-        let inv = (-log_a).exp();
-        let inv2 = inv * inv;
-        let correction = inv / 12.0 - inv * inv2 / 360.0 + inv * inv2 * inv2 / 1260.0;
-        0.5 * log_a - HALF_LOG_2PI - correction
+        // Stirling: ln Gamma(a) = (a - 1/2) ln a - a + ln sqrt(2 pi) + c(a), so
+        // a ln a - a - ln Gamma(a) = (1/2) ln a - ln sqrt(2 pi) - c(a). The
+        // correction is the shared eight-term series (accurate to f64 for
+        // a >= 8); `exp` saturating to +inf gives c(inf) = 0, the exact limit.
+        0.5 * log_a - HALF_LOG_2PI - log_gamma_stirling_correction(log_a.exp())
     } else {
         let a = log_a.exp();
         if a == 0.0 {
@@ -3067,5 +3021,31 @@ mod tail_geometry_tests {
         let expected = (-eta - rate).exp();
         assert!(score > 0.0);
         assert!((score / expected - 1.0).abs() < 1e-12);
+    }
+}
+
+#[cfg(test)]
+mod gamma_saturated_normalizer_tests {
+    use super::gamma_saturated_log_normalizer;
+
+    #[test]
+    fn stirling_branch_matches_exact_factorial_normalizer() {
+        // For integer shape a, ln Gamma(a) = ln((a - 1)!) is exact to one
+        // rounding, so a ln a - a - ln Gamma(a) is a reference independent of
+        // any Stirling truncation. The a >= 8 branch must match it to f64
+        // accuracy; a three-term correction leaves an O(a^-7) residual
+        // (about 3e-10 at a = 8).
+        for (a, factorial) in [
+            (8.0_f64, 5_040.0_f64),
+            (9.0, 40_320.0),
+            (12.0, 39_916_800.0),
+        ] {
+            let exact = a * a.ln() - a - factorial.ln();
+            let got = gamma_saturated_log_normalizer(a.ln(), 1.0, 1.0);
+            assert!(
+                (got - exact).abs() < 1e-13,
+                "a = {a}: saturated Gamma normalizer {got} vs exact {exact}"
+            );
+        }
     }
 }
