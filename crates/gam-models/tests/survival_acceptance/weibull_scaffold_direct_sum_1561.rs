@@ -69,6 +69,9 @@ fn cohort() -> (Vec<f64>, Vec<f64>, gam_data::EncodedDataset) {
 /// carries `log t` on the value rows and `1/t` on the derivative rows.
 #[test]
 fn weibull_offset_lies_in_the_ispline_block_null_space_1561() {
+    // The basis build runs on rayon; the shared pool must exist before any
+    // test in this binary touches rayon, or its implicit default pool wins.
+    super::initialize_cpu_fitting();
     let (exit, _, _) = cohort();
     let age_exit = Array1::from_vec(exit);
     let age_entry = Array1::<f64>::zeros(N);
