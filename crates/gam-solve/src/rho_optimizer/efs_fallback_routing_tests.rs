@@ -932,12 +932,21 @@ fn an_unprogressing_walk_at_a_non_stationary_point_continues_its_best_iterate_21
 }
 
 /// Positive control for the pin above: the same unprogressing walk over a
-/// criterion whose analytic gradient is zero everywhere is stationary, and
-/// screening certifies its best iterate in the runner.
+/// criterion whose analytic gradient vanishes once the walk leaves its seed
+/// (so the seed screen does not certify the seed itself). Screening certifies
+/// the best iterate in the runner.
 #[test]
 fn an_unprogressing_walk_at_a_stationary_point_is_certified_2153() {
-    let (outcome, best_point, _) =
-        unprogressing_efs_walk_2153(|theta| Array1::zeros(theta.len()), "stationary unprogressing EFS walk");
+    let (outcome, best_point, _) = unprogressing_efs_walk_2153(
+        |theta| {
+            if theta[0] < 1.0 {
+                Array1::zeros(theta.len())
+            } else {
+                theta.clone()
+            }
+        },
+        "stationary unprogressing EFS walk",
+    );
     let result = match outcome {
         Ok(result) => result,
         Err(FixedPointOuterRunError::IterationRejected(request)) => {
