@@ -59,7 +59,11 @@
 //! Both tests are exact sign statements about quadratics in the chart variable
 //! (monotonicity of `γ`, `δ`, `L` in `ρ`), decided with their rounding band.
 //! On the same cell every rank comparison `e_i ≥ e_*` is enclosed over the tube
-//! (a centered form in `δ`), so the cell is a member, a non-member, or
+//! (a centered form in `δ`). The threshold uses the same independent U as
+//! Layer 1. Counting uncertain or tied rows as possible strict dominators
+//! gives an upper bound on the smoothed rank, including for atomic response
+//! laws. Retained unresolved cells make this a conservative enclosure, not
+//! an exact-coverage claim. Each cell is a member, a non-member, or
 //! undecided. A box whose own `ρ`-width keeps it undecided is bisected in `ρ`;
 //! an undecided cell is bisected in `z`. Three undecided states are final and
 //! the cell is kept, so the returned set is a superset of the honest set, equal
@@ -93,6 +97,7 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2};
+use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh};
 use gam_math::special::softplus;
@@ -100,7 +105,7 @@ use gam_math::special::softplus;
 use super::{
     ConformalInterval, ExactGaussianFullConformal, FullConformalSet, required_dominating_count,
     response_solve_growth, solve_lower_triangular, solve_lower_triangular_transposed,
-    validate_inputs,
+    validate_inputs, validate_tie_uniform,
 };
 
 /// Why a row's set is the frozen-ρ set rather than the honest one.
@@ -158,8 +163,9 @@ impl ConformalRefusal {
 /// What a row's full-conformal set guarantees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConformalCertificate {
-    /// The fitting map has no smoothing parameter to re-select, so the exact
-    /// Layer-1 set at the stored penalty IS the honest set.
+    /// No smoothing parameter needs re-selection. Layer 1 certifies membership
+    /// for representable f64 candidates and its stored affine coefficients.
+    /// The interval coordinates are not exact real-valued score roots.
     ExactFrozen,
     /// A numerical enclosure of the frozen-map rank set. Marginal coverage
     /// is at least nominal under exchangeability and a fixed symmetric map;
@@ -569,7 +575,7 @@ impl Basis {
 
     /// The frozen (`ρ = 0`) Layer-1 engine in this basis — no second
     /// factorization.
-    fn frozen_engine(&self) -> ExactGaussianFullConformal {
+    fn frozen_engine(&self, tie_uniform: f64) -> ExactGaussianFullConformal {
         let n = self.n;
         let delta: Vec<f64> = self.shrinkage(0.0).iter().map(|&(_, d)| d).collect();
         let mut u = Array1::<f64>::zeros(n + 1);
@@ -585,7 +591,12 @@ impl Basis {
             u[i] = value[0];
             w[i] = value[1];
         }
-        ExactGaussianFullConformal { u, w, n }
+        ExactGaussianFullConformal {
+            u,
+            w,
+            n,
+            tie_uniform,
+        }
     }
 }
 
@@ -1525,14 +1536,46 @@ pub fn honest_full_conformal(
     x_star: &Array1<f64>,
     alpha: f64,
 ) -> Result<HonestFullConformal, String> {
+    honest_full_conformal_with_uniform(
+        x,
+        y,
+        prior_weights,
+        s_lambda,
+        penalty_count,
+        x_star,
+        alpha,
+        rand::rng().random(),
+    )
+}
+
+/// The same numerical enclosure with an explicitly supplied independent U.
+pub fn honest_full_conformal_with_uniform(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    prior_weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    penalty_count: Option<usize>,
+    x_star: &Array1<f64>,
+    alpha: f64,
+    tie_uniform: f64,
+) -> Result<HonestFullConformal, String> {
+    validate_tie_uniform(tie_uniform)?;
+    if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+        return Err(format!(
+            "full conformal: alpha must be in (0, 1), got {alpha}"
+        ));
+    }
     validate_inputs(x, y, prior_weights, s_lambda, x_star)?;
     let frozen_answer = |engine: ExactGaussianFullConformal,
                          certificate: ConformalCertificate,
-                         cost: HonestConformalCost| HonestFullConformal {
-        set: engine.prediction_set(alpha),
-        certificate,
-        cost,
-        plug_in_mean: engine.plug_in_mean(),
+                         cost: HonestConformalCost|
+     -> Result<HonestFullConformal, String> {
+        Ok(HonestFullConformal {
+            set: engine.prediction_set(alpha)?,
+            certificate,
+            cost,
+            plug_in_mean: engine.plug_in_mean(),
+        })
     };
     let one_factorization = HonestConformalCost {
         factorizations: 1,
@@ -1544,20 +1587,30 @@ pub fn honest_full_conformal(
         _ => None,
     };
     if let Some(reason) = reason {
-        let engine = ExactGaussianFullConformal::new(x, y, prior_weights, s_lambda, x_star)?;
-        return Ok(frozen_answer(
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            x,
+            y,
+            prior_weights,
+            s_lambda,
+            x_star,
+            tie_uniform,
+        )?;
+        return frozen_answer(
             engine,
             ConformalCertificate::Refused(reason),
             one_factorization,
-        ));
+        );
     }
     if penalty_count == Some(0) {
-        let engine = ExactGaussianFullConformal::new(x, y, prior_weights, s_lambda, x_star)?;
-        return Ok(frozen_answer(
-            engine,
-            ConformalCertificate::ExactFrozen,
-            one_factorization,
-        ));
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            x,
+            y,
+            prior_weights,
+            s_lambda,
+            x_star,
+            tie_uniform,
+        )?;
+        return frozen_answer(engine, ConformalCertificate::ExactFrozen, one_factorization);
     }
 
     let mut cost = HonestConformalCost {
@@ -1568,25 +1621,24 @@ pub fn honest_full_conformal(
     let basis = match Basis::build(x, y, s_lambda, x_star)? {
         Ok(basis) => basis,
         Err(reason) => {
-            let engine = ExactGaussianFullConformal::new(x, y, prior_weights, s_lambda, x_star)?;
+            let engine = ExactGaussianFullConformal::new_with_uniform(
+                x,
+                y,
+                prior_weights,
+                s_lambda,
+                x_star,
+                tie_uniform,
+            )?;
             cost.factorizations += 1;
-            return Ok(frozen_answer(
-                engine,
-                ConformalCertificate::Refused(reason),
-                cost,
-            ));
+            return frozen_answer(engine, ConformalCertificate::Refused(reason), cost);
         }
     };
-    let frozen = basis.frozen_engine();
+    let frozen = basis.frozen_engine(tie_uniform);
     if basis.ln_s.is_empty() {
-        return Ok(frozen_answer(
-            frozen,
-            ConformalCertificate::ExactFrozen,
-            cost,
-        ));
+        return frozen_answer(frozen, ConformalCertificate::ExactFrozen, cost);
     }
     let n = basis.n;
-    let required = required_dominating_count(n, alpha);
+    let required = required_dominating_count(n, alpha, tie_uniform);
     let plug_in_mean = frozen.plug_in_mean();
     let honest = |intervals: Vec<ConformalInterval>, cost: HonestConformalCost| HonestFullConformal {
         set: FullConformalSet {
@@ -1601,10 +1653,7 @@ pub fn honest_full_conformal(
     // Membership needs no comparison at all: the same for every fitting map.
     if required == 0 {
         return Ok(honest(
-            vec![ConformalInterval {
-                lo: f64::NEG_INFINITY,
-                hi: f64::INFINITY,
-            }],
+            vec![ConformalInterval::closed(f64::NEG_INFINITY, f64::INFINITY)],
             cost,
         ));
     }
@@ -1627,13 +1676,13 @@ pub fn honest_full_conformal(
         )
         .sum();
     if !(rss_at_center > 0.0) {
-        return Ok(frozen_answer(
+        return frozen_answer(
             frozen,
             ConformalCertificate::Refused(ConformalRefusal::RemlUndefined),
             cost,
-        ));
+        );
     }
-    let frozen_set = frozen.prediction_set(alpha);
+    let frozen_set = frozen.prediction_set(alpha)?;
     let reach = frozen_set
         .intervals
         .iter()
@@ -1672,7 +1721,7 @@ pub fn honest_full_conformal(
         let (lo, hi) = (widen(piece.lo, -1.0), widen(piece.hi, 1.0));
         match intervals.last_mut() {
             Some(ConformalInterval { hi: last_hi, .. }) if lo <= *last_hi => *last_hi = hi,
-            _ => intervals.push(ConformalInterval { lo, hi }),
+            _ => intervals.push(ConformalInterval::closed(lo, hi)),
         }
     }
     Ok(honest(intervals, cost))

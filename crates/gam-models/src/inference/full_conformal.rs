@@ -1,4 +1,4 @@
-//! Exact full-conformal prediction for penalized GAMs — including the
+//! Full-conformal prediction for penalized GAMs — including the
 //! smoothing-parameter response (#942).
 //!
 //! # What this is
@@ -13,12 +13,17 @@
 //!
 //! ```text
 //!   e_i(z) = |y_i − μ̂^z(x_i)| ,  e_*(z) = |z − μ̂^z(x_*)|
-//!   C_α = { z :  1 + #{ i : e_i(z) ≥ e_*(z) }  >  α (n+1) }
+//!   C_α = { z : #{i : e_i(z) > e_*(z)} + U (1 + #{i : e_i(z) = e_*(z)}) > α (n+1) }
 //! ```
 //!
 //! Validity needs ONLY exchangeability of the n+1 points and SYMMETRY of
 //! the fitting map (it must treat the augmented row like any other row).
-//! No model correctness, no asymptotics, no held-out fold.
+//! No model correctness, no asymptotics, no held-out fold. One independent
+//! `U ~ Uniform[0,1)` is shared across the entire inversion. For a symmetric
+//! fitting map on exchangeable supplied rows, ideal smoothed ranks give exact
+//! marginal coverage. This is not conditional-on-features coverage. Numerical
+//! enclosures in Layers 2 and 3 can over-cover, and learned training-only
+//! bases/penalties do not automatically satisfy augmented-row symmetry.
 //!
 //! The field treats this as computationally infeasible because it seems to
 //! require refitting at a continuum of `z` — solved exactly only for ridge
@@ -29,11 +34,12 @@
 //! looking at y but not at z — the augmented row is treated differently)
 //! with unquantified effect on coverage. This module closes both gaps:
 //!
-//! - **Layer 1 (implemented below, exact):** Gaussian identity at fixed ρ.
-//!   The augmented fit is affine in `z`, so every score is piecewise
-//!   linear in `z` and the EXACT set is computable from one factorization
-//!   and ≤ 2n linear breakpoints — the ridge result generalized to
-//!   arbitrary penalized smooths (any Sλ, any basis).
+//! - **Layer 1 (implemented below):** Gaussian identity at fixed ρ.
+//!   The augmented fit is affine in `z`; one factorization gives the stored
+//!   affine coefficients. The event sweep certifies membership for finite
+//!   representable f64 candidates using exact dyadic comparisons of those
+//!   coefficients. Returned coordinates encode that discrete candidate set;
+//!   they are not exact real-valued roots or an exact-real fitting guarantee.
 //! - **Layer 2 — GLM families (implemented in
 //!   [`super::full_conformal_glm`], certified):** Binomial, Poisson,
 //!   negative binomial and Gamma at the frozen penalty. Discrete supports
@@ -43,8 +49,7 @@
 //!   retained as a conservative numerical enclosure: its coverage need not
 //!   equal `1 − α`. Marginal coverage assumes exchangeable supplied rows and
 //!   a fixed symmetric basis/penalty construction, not arbitrary learned bases.
-//! - **Layer 3 (implemented in [`honest`], exact up to breakpoint
-//!   resolution):** the Gaussian-identity map that RE-SELECTS the smoothing
+//! - **Layer 3 (implemented in [`honest`], conservative numerical enclosure):** the Gaussian-identity map that RE-SELECTS the smoothing
 //!   strength by REML on every augmented data set — the first
 //!   full-conformal procedure whose fitting map treats the test row like a
 //!   training row all the way up to ρ̂. A proven bound on where the global
@@ -73,21 +78,22 @@
 //! ```
 //!
 //! with `1 − x_*ᵀb = 1/(1 + h_*) > 0` for `h_* = x_*ᵀ(XᵀX+Sλ)⁻¹x_*` by
-//! Sherman–Morrison — the test residual's slope never vanishes, so e_*(z)
+//! Sherman–Morrison when the training normal is SPD — the test residual's
+//! slope is positive, so e_*(z)
 //! is genuinely V-shaped and the rank function is well-defined everywhere.
 //!
 //! The comparison `e_i(z) ≥ e_*(z)` ⟺ `(r_i−r_*)(r_i+r_*) ≥ 0` flips only
 //! at roots of two LINEAR equations per i. Collect ≤ 2n roots, sort, and
 //! the rank of e_* is constant on each open interval between consecutive
-//! roots: evaluate the rank at interval midpoints (and at the roots
-//! themselves, closed-set convention — coverage uses `≥`, so boundary
-//! points belong to the set when their rank qualifies) and assemble the
-//! set as a union of intervals. EXACT — no grid, no tolerance, no refits.
+//! roots: a root-event sweep tracks strict and tied comparisons on each open
+//! gap and at each root. Endpoint-inclusion flags preserve excluded roots and
+//! isolated member points; taking the closure would change the randomized set
+//! for atomic response laws. The sweep costs O(n log n), without refits.
 //!
 //! Unboundedness is honest, not an error: if `|slope(r_*)| ≤ |slope(r_i)|`
 //! for enough i, far-out candidates are never extreme and the set is a
 //! half-line or ℝ (low-information / high-leverage regimes). We return the
-//! interval list as-is, ±∞ endpoints included — same honesty convention as
+//! interval list as-is, with ±∞ as open bounds — same honesty convention as
 //! the split module's `+∞` multiplier.
 //!
 //! # Layer 2: GLM families (see [`super::full_conformal_glm`])
@@ -131,6 +137,7 @@
 
 use faer::Side;
 use ndarray::{Array1, Array2};
+use rand::RngExt;
 
 use gam_linalg::faer_ndarray::{FaerCholesky, fast_av};
 
@@ -143,17 +150,39 @@ pub use honest::{
 #[cfg(test)]
 mod test_support;
 
-/// One maximal interval of candidate values retained in the prediction set.
+/// One maximal interval encoding candidate values retained in the prediction set.
+/// For Layer 1, membership is certified only for finite representable f64
+/// candidates and the stored affine coefficients, not exact real-valued roots.
 /// Endpoints may be infinite (honest unboundedness in low-information /
 /// high-leverage regimes).
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConformalInterval {
     pub lo: f64,
     pub hi: f64,
+    pub lo_closed: bool,
+    pub hi_closed: bool,
+}
+
+impl ConformalInterval {
+    /// Closed finite endpoints; infinities are bounds, never members.
+    pub fn closed(lo: f64, hi: f64) -> Self {
+        Self {
+            lo,
+            hi,
+            lo_closed: lo.is_finite(),
+            hi_closed: hi.is_finite(),
+        }
+    }
+
+    pub fn contains(&self, value: f64) -> bool {
+        value.is_finite()
+            && (value > self.lo || (self.lo_closed && value == self.lo))
+            && (value < self.hi || (self.hi_closed && value == self.hi))
+    }
 }
 
 /// The rank threshold `τ = α(n + 1)` a conformal p-value is compared with
-/// (member iff `(1 + #dominating) > τ`).
+/// (membership compares strict-plus-randomized-tie rank mass with τ).
 ///
 /// `α` arrives as `1 − level` from a decimal level, and neither the level nor
 /// the subtraction is exact in binary: at the nominal `level = 0.9` the product
@@ -172,7 +201,9 @@ pub fn conformal_rank_threshold(alpha: f64, n_augmented: usize) -> f64 {
     }
 }
 
-/// A full-conformal prediction set: a finite union of closed intervals.
+/// A full-conformal prediction set with explicit finite-endpoint membership.
+/// Layer-1 coordinates encode the representable-f64 candidate set; other
+/// certificates can denote conservative numerical enclosures.
 #[derive(Clone, Debug)]
 pub struct FullConformalSet {
     /// Maximal intervals, sorted, disjoint.
@@ -211,25 +242,39 @@ fn validate_inputs(
     Ok(())
 }
 
-/// The smallest dominating count `k` with `1 + k > α(n + 1)` — membership's
-/// threshold — or `n + 1` when no count of `n` training rows reaches it.
-fn required_dominating_count(n: usize, alpha: f64) -> usize {
+pub(crate) fn validate_tie_uniform(value: f64) -> Result<(), String> {
+    if value.is_finite() && (0.0..1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(format!(
+            "full conformal: tie uniform must be in [0, 1), got {value}"
+        ))
+    }
+}
+
+/// The smallest strict-dominating count k with k+U > α(n+1), or n+1.
+/// Counting uncertain ties as possible strict dominators gives a conservative
+/// upper bound for the honest numerical enclosure.
+fn required_dominating_count(n: usize, alpha: f64, tie_uniform: f64) -> usize {
     let threshold = conformal_rank_threshold(alpha, n + 1);
     (0..=n)
-        .find(|&count| 1.0 + count as f64 > threshold)
+        .find(|&count| tie_uniform + count as f64 > threshold)
         .unwrap_or(n + 1)
 }
 
-/// Exact Gaussian-identity full-conformal engine at fixed Sλ (Layer 1).
+/// Gaussian-identity full-conformal engine at fixed Sλ (Layer 1).
 ///
-/// One factorization of `M = XᵀX + x_*x_*ᵀ + Sλ`; every candidate-z
-/// quantity is affine in z thereafter. See the module doc for the math.
+/// One factorization of the SPD training normal `A = XᵀX + Sλ`; every
+/// candidate-z quantity is affine thereafter. Exact inversion refers to
+/// representable f64 candidates and the stored dyadic affine coefficients.
+/// Rounded interval coordinates do not claim exact real-valued boundaries.
 pub struct ExactGaussianFullConformal {
     /// Affine residual coefficients: `r_i(z) = u[i] + w[i]·z` for the n
     /// training rows, and the test residual in the LAST slot.
     u: Array1<f64>,
     w: Array1<f64>,
     n: usize,
+    tie_uniform: f64,
 }
 
 impl ExactGaussianFullConformal {
@@ -251,59 +296,59 @@ impl ExactGaussianFullConformal {
         s_lambda: &Array2<f64>,
         x_star: &Array1<f64>,
     ) -> Result<Self, String> {
+        Self::new_with_uniform(x, y, prior_weights, s_lambda, x_star, rand::rng().random())
+    }
+
+    /// Construct one inversion with an externally supplied independent U.
+    pub fn new_with_uniform(
+        x: &Array2<f64>,
+        y: &Array1<f64>,
+        prior_weights: &Array1<f64>,
+        s_lambda: &Array2<f64>,
+        x_star: &Array1<f64>,
+        tie_uniform: f64,
+    ) -> Result<Self, String> {
+        validate_tie_uniform(tie_uniform)?;
         validate_inputs(x, y, prior_weights, s_lambda, x_star)?;
         let n = x.nrows();
-        let p = x.ncols();
 
-        // M = XᵀX + x_*x_*ᵀ + Sλ — the augmented penalized normal matrix.
-        let mut m = x.t().dot(x) + s_lambda;
-        for i in 0..p {
-            for j in 0..p {
-                m[[i, j]] += x_star[i] * x_star[j];
-            }
-        }
-        let chol = m
+        // Positive exact test-residual slope requires the training normal A
+        // to be SPD (augmented SPD alone is insufficient). Sherman–Morrison
+        // avoids subtracting nearly equal leverage values in 1-x'M_aug^-1 x.
+        let normal = x.t().dot(x) + s_lambda;
+        let chol = normal
             .cholesky(Side::Lower)
-            .map_err(|e| format!("full conformal: augmented normal matrix not SPD: {e:?}"))?;
-        let xty = x.t().dot(y);
-        let a = chol.solvevec(&xty);
-        let b = chol.solvevec(&x_star.to_owned());
-
-        // Affine residuals r_i(z) = u_i + w_i z; test residual last.
+            .map_err(|e| format!("full conformal: training normal matrix not SPD: {e:?}"))?;
+        let beta = chol.solvevec(&x.t().dot(y));
+        let direction = chol.solvevec(x_star);
+        let leverage = x_star.dot(&direction);
+        let denominator = 1.0 + leverage;
+        if !(leverage.is_finite() && leverage >= 0.0 && denominator.is_finite()) {
+            return Err("full conformal: test leverage or 1+leverage is not representable".into());
+        }
         let mut u = Array1::<f64>::zeros(n + 1);
         let mut w = Array1::<f64>::zeros(n + 1);
-        let xa = fast_av(x, &a);
-        let xb = fast_av(x, &b);
+        u[n] = -x_star.dot(&beta) / denominator;
+        w[n] = denominator.recip();
+        let fitted = fast_av(x, &beta);
+        let influence = fast_av(x, &direction);
         for i in 0..n {
-            u[i] = y[i] - xa[i];
-            w[i] = -xb[i];
+            u[i] = y[i] - fitted[i] - influence[i] * u[n];
+            w[i] = -influence[i] / denominator;
         }
-        let mu_a_star = x_star.dot(&a);
-        let h_frac = x_star.dot(&b); // = h/(1+h) ∈ [0, 1)
-        u[n] = -mu_a_star;
-        w[n] = 1.0 - h_frac; // strictly positive by Sherman–Morrison
-        if w[n] <= 0.0 {
+        if w[n] <= 0.0 || u.iter().chain(w.iter()).any(|v| !v.is_finite()) {
             return Err(
-                "full conformal: test-residual slope 1 − x_*ᵀM⁻¹x_* must be positive; \
-                 non-SPD or numerically broken augmented system"
+                "full conformal: reciprocal 1/(1+training leverage) must be positive; \
+                 residual coefficients and reciprocal must be representable"
                     .to_string(),
             );
         }
-        Ok(Self { u, w, n })
-    }
-
-    /// Number of training rows whose score weakly dominates the test score
-    /// at candidate z: `#{ i ≤ n : e_i(z) ≥ e_*(z) }`.
-    fn dominating_count(&self, z: f64) -> usize {
-        let e_star = (self.u[self.n] + self.w[self.n] * z).abs();
-        (0..self.n)
-            .filter(|&i| (self.u[i] + self.w[i] * z).abs() >= e_star)
-            .count()
-    }
-
-    /// Membership at candidate z: conformal p-value `(1 + count)/(n+1) > α`.
-    fn member(&self, z: f64, alpha: f64) -> bool {
-        (1.0 + self.dominating_count(z) as f64) > conformal_rank_threshold(alpha, self.n + 1)
+        Ok(Self {
+            u,
+            w,
+            n,
+            tie_uniform,
+        })
     }
 
     /// The frozen plug-in mean `x_*ᵀ(XᵀX + Sλ)⁻¹Xᵀy`: the candidate at which
@@ -312,105 +357,265 @@ impl ExactGaussianFullConformal {
         -self.u[self.n] / self.w[self.n]
     }
 
-    fn push_finite_root(points: &mut Vec<f64>, numerator: f64, denominator: f64) {
-        if denominator.abs() > 0.0 {
-            let z = numerator / denominator;
-            if z.is_finite() {
-                points.push(z);
-            }
+    /// Error-free product of two finite dyadic values. A product requiring
+    /// bits below the subnormal quantum cannot be represented by an expansion
+    /// of f64 values, so the endpoint certificate refuses it explicitly.
+    fn endpoint_product(a: f64, b: f64) -> Result<(f64, f64), String> {
+        if a == 0.0 || b == 0.0 {
+            return Ok((0.0, 0.0));
         }
+        let lowest_exponent = |value: f64| {
+            let bits = value.to_bits() & 0x7fff_ffff_ffff_ffff;
+            let encoded = (bits >> 52) as i32;
+            let significand =
+                (bits & 0x000f_ffff_ffff_ffff) | if encoded == 0 { 0 } else { 1u64 << 52 };
+            let exponent = if encoded == 0 {
+                -1074
+            } else {
+                encoded - 1023 - 52
+            };
+            exponent + significand.trailing_zeros() as i32
+        };
+        if lowest_exponent(a) + lowest_exponent(b) < -1074 {
+            return Err("full conformal: endpoint product underflow cannot be certified".into());
+        }
+        let high = a * b;
+        if !high.is_finite() {
+            return Err("full conformal: endpoint product overflow cannot be certified".into());
+        }
+        Ok((a.mul_add(b, -high), high))
     }
 
-    /// The exact prediction set at miscoverage α.
-    ///
-    /// Breakpoints: for each i, roots of `r_*(z) = ±r_i(z)` — two linear
-    /// equations. Between consecutive roots the comparison pattern (hence
-    /// the rank of e_*) is constant; evaluate membership on midpoints and
-    /// at every root (closed-set convention), then merge runs into maximal
-    /// intervals. Cost O(n log n) after the single factorization.
-    pub fn prediction_set(&self, alpha: f64) -> FullConformalSet {
-        let n = self.n;
-        let (us, ws) = (self.u[n], self.w[n]);
-        let mut roots: Vec<f64> = Vec::with_capacity(2 * n);
-        for i in 0..n {
-            // r_* − r_i = (us − u_i) + (ws − w_i) z = 0
-            let d = ws - self.w[i];
-            Self::push_finite_root(&mut roots, self.u[i] - us, d);
-            // r_* + r_i = (us + u_i) + (ws + w_i) z = 0
-            let s = ws + self.w[i];
-            Self::push_finite_root(&mut roots, -(us + self.u[i]), s);
-        }
-        roots.sort_by(|p, q| p.partial_cmp(q).expect("finite breakpoints"));
-        roots.dedup_by(|p, q| *p == *q);
-
-        // Witness points: each root, each gap midpoint, and the two open
-        // tails. Membership is constant strictly between consecutive
-        // roots, so one witness per piece decides the set exactly.
-        let mut witnesses: Vec<f64> = Vec::with_capacity(2 * roots.len() + 3);
-        if roots.is_empty() {
-            witnesses.push(0.0);
-        } else {
-            let span = (roots[roots.len() - 1] - roots[0]).max(1.0);
-            witnesses.push(roots[0] - span);
-            for k in 0..roots.len() {
-                witnesses.push(roots[k]);
-                if k + 1 < roots.len() {
-                    witnesses.push(0.5 * (roots[k] + roots[k + 1]));
+    /// Exact sign of r_i(z)−r_*(z), or r_i(z)+r_*(z), for the stored dyadic
+    /// coefficients. Six-term error-free expansion avoids calling a rounded
+    /// rational coordinate an exact score tie.
+    fn endpoint_factor_leading(&self, i: usize, z: f64, subtract: bool) -> Result<f64, String> {
+        let (il, ih) = Self::endpoint_product(self.w[i], z)?;
+        let (sl, sh) = Self::endpoint_product(self.w[self.n], z)?;
+        let direction = if subtract { -1.0 } else { 1.0 };
+        let mut expansion = [0.0; 6];
+        let mut length = 0;
+        for scalar in [
+            il,
+            ih,
+            direction * sl,
+            direction * sh,
+            self.u[i],
+            direction * self.u[self.n],
+        ] {
+            let mut q = scalar;
+            let mut next = 0;
+            for j in 0..length {
+                let term = expansion[j];
+                let sum = q + term;
+                if !sum.is_finite() {
+                    return Err(
+                        "full conformal: endpoint expansion overflow cannot be certified".into(),
+                    );
                 }
+                let virtual_term = sum - q;
+                let error = (q - (sum - virtual_term)) + (term - virtual_term);
+                if error != 0.0 {
+                    expansion[next] = error;
+                    next += 1;
+                }
+                q = sum;
             }
-            witnesses.push(roots[roots.len() - 1] + span);
+            if q != 0.0 || next == 0 {
+                expansion[next] = q;
+                next += 1;
+            }
+            length = next;
         }
+        Ok(expansion[length - 1])
+    }
 
-        // Scan witnesses into maximal intervals. A member midpoint/tail claims
-        // its whole open gap; member roots close the endpoints.
-        let mut intervals: Vec<ConformalInterval> = Vec::new();
-        let mut open_lo: Option<f64> = None;
-        let gap_bounds = |idx: usize| -> (f64, f64) {
-            // bounds of the gap a witness at sorted position idx represents
-            if roots.is_empty() {
-                return (f64::NEG_INFINITY, f64::INFINITY);
+    fn endpoint_factor_sign(&self, i: usize, z: f64, subtract: bool) -> Result<i8, String> {
+        let leading = self.endpoint_factor_leading(i, z, subtract)?;
+        Ok(if leading > 0.0 {
+            1
+        } else if leading < 0.0 {
+            -1
+        } else {
+            0
+        })
+    }
+
+    /// Isolate the true linear root between adjacent representable candidates.
+    /// A rounded endpoint itself is ranked separately; it is not presumed tied.
+    fn isolated_score_root(&self, i: usize, subtract: bool, a: f64, b: f64) -> Result<f64, String> {
+        let mut root = -b / a;
+        if !root.is_finite() || (root == 0.0 && b != 0.0) {
+            return Err("full conformal: score breakpoint is not representable".into());
+        }
+        // Rounded coefficient subtraction can displace -b/a by several ulps.
+        // Correct it with the exact expansion residual before certifying the
+        // adjacent representable candidates. Every accepted root is still
+        // checked below; this bounded refinement grants no tolerance band.
+        for _ in 0..4 {
+            let residual = self.endpoint_factor_leading(i, root, subtract)?;
+            if residual == 0.0 {
+                return Ok(root);
             }
-            if idx == 0 {
-                return (f64::NEG_INFINITY, roots[0]);
+            let corrected = root - residual / a;
+            if !corrected.is_finite() {
+                return Err("full conformal: root correction overflow".into());
             }
-            if idx == witnesses.len() - 1 {
-                return (roots[roots.len() - 1], f64::INFINITY);
+            if corrected == root {
+                break;
             }
-            // witnesses alternate root, mid, root, mid, ... after the first
-            let k = (idx - 1) / 2; // gap index for midpoints, root index for roots
-            if idx % 2 == 1 {
-                // a root: zero-width "gap" at the root itself
-                (roots[k], roots[k])
+            root = corrected;
+        }
+        if self.endpoint_factor_sign(i, root, subtract)? == 0 {
+            return Ok(root);
+        }
+        let lower = root.next_down();
+        let upper = root.next_up();
+        if !lower.is_finite() || !upper.is_finite() {
+            return Err("full conformal: score breakpoint neighbors are not representable".into());
+        }
+        let left = self.endpoint_factor_sign(i, lower, subtract)?;
+        let right = self.endpoint_factor_sign(i, upper, subtract)?;
+        if left == 0 {
+            return Ok(lower);
+        }
+        if right == 0 {
+            return Ok(upper);
+        }
+        let slope = if a > 0.0 { 1 } else { -1 };
+        if left != -slope || right != slope {
+            return Err("full conformal: score breakpoint isolation cannot be certified".into());
+        }
+        Ok(root)
+    }
+
+    /// Invert the affine score comparisons for representable f64 candidates.
+    /// Endpoint membership uses exact dyadic signs, including at rounded roots.
+    /// Uncertifiable arithmetic is refused. One U is shared by all candidates.
+    pub fn prediction_set(&self, alpha: f64) -> Result<FullConformalSet, String> {
+        if !(alpha.is_finite() && alpha > 0.0 && alpha < 1.0) {
+            return Err(format!(
+                "full conformal: alpha must be in (0, 1), got {alpha}"
+            ));
+        }
+        let n = self.n;
+        let mut relations = Vec::<i8>::with_capacity(n);
+        let mut events = Vec::<(f64, usize)>::with_capacity(2 * n);
+        let sign = |v: f64| {
+            if v > 0.0 {
+                1i8
+            } else if v < 0.0 {
+                -1
             } else {
-                (roots[k], roots[k + 1])
+                0
             }
         };
-        for (idx, &z) in witnesses.iter().enumerate() {
-            let inside = self.member(z, alpha);
-            let (lo, hi) = gap_bounds(idx);
-            if inside {
-                if open_lo.is_none() {
-                    open_lo = Some(lo);
-                }
-                if idx == witnesses.len() - 1 {
-                    intervals.push(ConformalInterval {
-                        lo: open_lo.take().expect("open interval"),
-                        hi,
-                    });
-                }
-            } else if let Some(lo_open) = open_lo.take() {
-                intervals.push(ConformalInterval {
-                    lo: lo_open,
-                    hi: lo,
-                });
+        for i in 0..n {
+            // e_i²-e_*² is the product of these two linear factors.
+            let factors = [
+                (self.w[i] - self.w[n], self.u[i] - self.u[n]),
+                (self.w[i] + self.w[n], self.u[i] + self.u[n]),
+            ];
+            if factors
+                .iter()
+                .any(|&(a, b)| !a.is_finite() || !b.is_finite())
+            {
+                return Err("full conformal: affine score comparison overflow".into());
             }
+            if factors.iter().any(|&(a, b)| a == 0.0 && b == 0.0) {
+                relations.push(0); // identical absolute scores, for every z
+                continue;
+            }
+            let mut relation = 1;
+            for (factor, (a, b)) in factors.into_iter().enumerate() {
+                relation *= if a != 0.0 { -sign(a) } else { sign(b) };
+                if a != 0.0 {
+                    let z = self.isolated_score_root(i, factor == 0, a, b)?;
+                    events.push((z, i));
+                }
+            }
+            relations.push(relation);
         }
-
-        FullConformalSet {
+        events.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let threshold = conformal_rank_threshold(alpha, n + 1);
+        let member = |greater: usize, tied: usize| {
+            greater as f64 + self.tie_uniform * (1 + tied) as f64 > threshold
+        };
+        let mut greater = relations.iter().filter(|&&r| r > 0).count();
+        let tied = relations.iter().filter(|&&r| r == 0).count();
+        let mut last_root = vec![usize::MAX; n];
+        let mut intervals = Vec::<ConformalInterval>::new();
+        let append = |intervals: &mut Vec<ConformalInterval>, piece: ConformalInterval| {
+            if let Some(last) = intervals.last_mut()
+                && last.hi == piece.lo
+                && (last.hi_closed || piece.lo_closed)
+            {
+                last.hi = piece.hi;
+                last.hi_closed = piece.hi_closed;
+            } else {
+                intervals.push(piece);
+            }
+        };
+        let mut left = f64::NEG_INFINITY;
+        let mut cursor = 0;
+        while cursor < events.len() {
+            let z = events[cursor].0;
+            if left < z && member(greater, tied) {
+                append(
+                    &mut intervals,
+                    ConformalInterval {
+                        lo: left,
+                        hi: z,
+                        lo_closed: false,
+                        hi_closed: false,
+                    },
+                );
+            }
+            let mut end = cursor + 1;
+            while end < events.len() && events[end].0 == z {
+                end += 1;
+            }
+            let (mut root_greater, mut root_tied) = (greater, tied);
+            for &(_, i) in &events[cursor..end] {
+                if last_root[i] != cursor {
+                    root_greater -= usize::from(relations[i] > 0);
+                    let relation = self.endpoint_factor_sign(i, z, true)?
+                        * self.endpoint_factor_sign(i, z, false)?;
+                    root_greater += usize::from(relation > 0);
+                    root_tied += usize::from(relation == 0);
+                    last_root[i] = cursor;
+                }
+            }
+            if member(root_greater, root_tied) {
+                append(&mut intervals, ConformalInterval::closed(z, z));
+            }
+            for &(_, i) in &events[cursor..end] {
+                if relations[i] > 0 {
+                    greater -= 1;
+                } else {
+                    greater += 1;
+                }
+                relations[i] = -relations[i];
+            }
+            left = z;
+            cursor = end;
+        }
+        if member(greater, tied) {
+            append(
+                &mut intervals,
+                ConformalInterval {
+                    lo: left,
+                    hi: f64::INFINITY,
+                    lo_closed: false,
+                    hi_closed: false,
+                },
+            );
+        }
+        Ok(FullConformalSet {
             intervals,
             alpha,
             n_augmented: n + 1,
-        }
+        })
     }
 }
 
@@ -538,13 +743,15 @@ impl ExactFullConformalPenalty {
     }
 
     /// Join the frozen penalty to labeled rows `(X, y)` for the per-test-row
-    /// exact set. Every row carries unit weight: only models trained without
+    /// rank set or its certified numerical enclosure. Every row carries unit
+    /// weight: only models trained without
     /// prior weights persist this penalty.
     ///
-    /// The rows need not be the training rows. The set is exact for whatever
-    /// labeled rows are supplied; with the training rows it is the frozen-λ
-    /// full-conformal set of the fit, and with rows the penalty was not
-    /// selected on the augmented scores are exchangeable under either map.
+    /// The rows need not be the training rows. Marginal coverage requires
+    /// exchangeable supplied rows and a fitting map symmetric in all augmented
+    /// rows, including the basis and penalty construction. A basis or penalty
+    /// learned on independent data can be held fixed; a training-only learned
+    /// construction does not automatically satisfy that assumption.
     pub fn with_labeled_rows(
         &self,
         x: Array2<f64>,
@@ -664,6 +871,16 @@ impl ExactFullConformalSubstrate {
         x_star: &Array1<f64>,
         alpha: f64,
     ) -> Result<ExactFullConformalInterval, String> {
+        self.interval_with_uniform(x_star, alpha, rand::rng().random())
+    }
+
+    /// The same outer envelope with an explicitly supplied independent U.
+    pub fn interval_with_uniform(
+        &self,
+        x_star: &Array1<f64>,
+        alpha: f64,
+        tie_uniform: f64,
+    ) -> Result<ExactFullConformalInterval, String> {
         if x_star.len() != self.p() {
             return Err(format!(
                 "exact full conformal: x_* has {} entries but the fit has {} coefficients",
@@ -672,7 +889,7 @@ impl ExactFullConformalSubstrate {
             ));
         }
         let weights = Array1::<f64>::ones(self.n());
-        let row = honest_full_conformal(
+        let row = honest::honest_full_conformal_with_uniform(
             &self.x,
             &self.y,
             &weights,
@@ -680,12 +897,13 @@ impl ExactFullConformalSubstrate {
             self.penalty_count,
             x_star,
             alpha,
+            tie_uniform,
         )?;
         let (lo, hi) = match (row.set.intervals.first(), row.set.intervals.last()) {
             (Some(first), Some(last)) => (first.lo, last.hi),
-            // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
-            // plug-in mean — the only honest scalar answer.
-            _ => (row.plug_in_mean, row.plug_in_mean),
+            // An empty randomized set has no envelope. Never substitute a
+            // point that the rank rule excluded.
+            _ => (f64::NAN, f64::NAN),
         };
         Ok(ExactFullConformalInterval {
             lo,
@@ -729,9 +947,10 @@ mod tests {
         }
 
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
         let alpha = 0.2;
-        let set = engine.prediction_set(alpha);
+        let set = engine.prediction_set(alpha).expect("prediction set");
         assert!(!set.intervals.is_empty(), "set should be non-empty");
 
         // Independent oracle: explicit augmented refit per grid z.
@@ -750,13 +969,13 @@ mod tests {
             }
             let beta = chol.solvevec(&rhs);
             let e_star = (z - x_star.dot(&beta)).abs();
-            let count = (0..n)
+            let greater = (0..n)
                 .filter(|&i| {
                     let mu_i: f64 = x.row(i).dot(&beta);
-                    (y[i] - mu_i).abs() >= e_star
+                    (y[i] - mu_i).abs() > e_star
                 })
                 .count();
-            (1.0 + count as f64) > alpha * (n as f64 + 1.0)
+            (0.5 + greater as f64) > alpha * (n as f64 + 1.0)
         };
 
         let z_lo = set.intervals.first().map(|i| i.lo).unwrap_or(-5.0) - 2.0;
@@ -766,7 +985,7 @@ mod tests {
         let grid = 4001usize;
         for g in 0..grid {
             let z = z_lo + (z_hi - z_lo) * g as f64 / (grid as f64 - 1.0);
-            let in_set = set.intervals.iter().any(|itv| z >= itv.lo && z <= itv.hi);
+            let in_set = set.intervals.iter().any(|itv| itv.contains(z));
             assert_eq!(
                 in_set,
                 oracle(z),
@@ -780,9 +999,7 @@ mod tests {
         let beta_unaug = chol.solvevec(&x.t().dot(&y));
         let mu_star = x_star.dot(&beta_unaug);
         assert!(
-            set.intervals
-                .iter()
-                .any(|itv| mu_star >= itv.lo && mu_star <= itv.hi),
+            set.intervals.iter().any(|itv| itv.contains(mu_star)),
             "point prediction should be inside its own conformal set"
         );
     }
@@ -795,9 +1012,10 @@ mod tests {
         let s_lambda = Array2::from_shape_vec((1, 1), vec![1.0]).expect("s");
         let x_star = Array1::from_vec(vec![1.0]);
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
 
-        let set = engine.prediction_set(0.5);
+        let set = engine.prediction_set(0.25).expect("prediction set");
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, 0.0);
         assert_eq!(set.intervals[0].hi, 0.0);
@@ -811,9 +1029,10 @@ mod tests {
         let s_lambda = Array2::from_shape_vec((1, 1), vec![0.0]).expect("s");
         let x_star = Array1::from_vec(vec![1.0]);
         let engine =
-            ExactGaussianFullConformal::new(&x, &y, &weights, &s_lambda, &x_star).expect("engine");
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s_lambda, &x_star, 0.5)
+                .expect("engine");
 
-        let set = engine.prediction_set(0.5);
+        let set = engine.prediction_set(0.25).expect("prediction set");
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
         assert_eq!(set.intervals[0].hi, f64::INFINITY);
@@ -825,9 +1044,10 @@ mod tests {
             u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
             w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
             n: 2,
+            tie_uniform: 0.5,
         };
 
-        let set = engine.prediction_set(0.5);
+        let set = engine.prediction_set(0.25).expect("prediction set");
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
         assert_eq!(set.intervals[0].hi, f64::INFINITY);
@@ -1016,14 +1236,18 @@ mod tests {
         for not_one in [1.0 + 1.0e-13, f64::NAN] {
             let mut weights = Array1::<f64>::ones(n);
             weights[2] = not_one;
-            let error = ExactGaussianFullConformal::new(&x, &y, &weights, &s, &x_star)
-                .err()
-                .expect("a prior weight that is not exactly one must be refused");
+            let error =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s, &x_star, 0.5)
+                    .err()
+                    .expect("a prior weight that is not exactly one must be refused");
             assert!(error.contains("unit prior weights"), "{error}");
         }
         // Non-vacuity: exact unit weights are admitted.
         let weights = Array1::<f64>::ones(n);
-        assert!(ExactGaussianFullConformal::new(&x, &y, &weights, &s, &x_star).is_ok());
+        assert!(
+            ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &s, &x_star, 0.5)
+                .is_ok()
+        );
     }
 
     /// A v28 or older payload persisted the training `x` and `y` beside `s_lambda` in the
@@ -1079,5 +1303,333 @@ mod tests {
                 .with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y)
                 .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod smoothed_tests {
+    use super::*;
+    use ndarray::array;
+
+    #[test]
+    fn ridge_set_keeps_both_boundary_points_excluded() {
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            &array![[1.0]],
+            &array![1.0],
+            &array![1.0],
+            &array![[1.0]],
+            &array![1.0],
+            0.5,
+        )
+        .unwrap();
+        let set = engine.prediction_set(0.6).unwrap();
+        assert_eq!(set.intervals.len(), 1);
+        let interval = &set.intervals[0];
+        assert_eq!((interval.lo, interval.hi), (-1.0, 1.0));
+        assert!(!interval.lo_closed && !interval.hi_closed);
+        assert!(interval.contains(0.0));
+        assert!(!interval.contains(-1.0) && !interval.contains(1.0));
+    }
+
+    #[test]
+    fn persistent_ties_and_singletons_follow_the_same_uniform() {
+        for u in [0.0, 0.25, 0.5, 0.75, 1.0 - f64::EPSILON] {
+            let engine = ExactGaussianFullConformal::new_with_uniform(
+                &array![[1.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1.0],
+                u,
+            )
+            .unwrap();
+            let set = engine.prediction_set(0.5).unwrap();
+            assert_eq!(set.intervals.is_empty(), u <= 0.5);
+            if u > 0.5 {
+                assert_eq!(set.intervals.len(), 1);
+                assert_eq!(
+                    (set.intervals[0].lo, set.intervals[0].hi),
+                    (f64::NEG_INFINITY, f64::INFINITY)
+                );
+                assert!(set.intervals[0].contains(0.0));
+                assert!(!set.intervals[0].contains(f64::INFINITY));
+            }
+            let singleton = ExactGaussianFullConformal::new_with_uniform(
+                &array![[0.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[1.0]],
+                &array![1.0],
+                u,
+            )
+            .unwrap()
+            .prediction_set(0.5)
+            .unwrap();
+            assert_eq!(singleton.intervals.is_empty(), u <= 0.5);
+            if u > 0.5 {
+                assert_eq!(
+                    singleton.intervals,
+                    vec![ConformalInterval::closed(0.0, 0.0)]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_uniform_alpha_and_overflow_are_refused() {
+        // Rounding a nonzero root to zero would misclassify an atom at zero.
+        let underflow = ExactGaussianFullConformal {
+            u: array![1e-200, 0.0],
+            w: array![1e200, 1.0],
+            n: 1,
+            tie_uniform: 0.5,
+        };
+        assert!(
+            underflow
+                .prediction_set(0.6)
+                .unwrap_err()
+                .contains("breakpoint")
+        );
+
+        for u in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1, 1.0] {
+            assert!(
+                ExactGaussianFullConformal::new_with_uniform(
+                    &array![[1.0]],
+                    &array![0.0],
+                    &array![1.0],
+                    &array![[1.0]],
+                    &array![1.0],
+                    u,
+                )
+                .is_err()
+            );
+        }
+        let engine = ExactGaussianFullConformal::new_with_uniform(
+            &array![[1.0]],
+            &array![0.0],
+            &array![1.0],
+            &array![[0.0]],
+            &array![1e100],
+            0.5,
+        )
+        .unwrap();
+        assert!(engine.w[1] > 0.0);
+        let set = engine.prediction_set(0.6).unwrap();
+        assert_eq!(set.intervals.len(), 2);
+        assert!(set.intervals[0].contains(-1.0) && set.intervals[1].contains(1.0));
+        assert!(!set.intervals.iter().any(|piece| piece.contains(0.0)));
+        for alpha in [0.0, 1.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(engine.prediction_set(alpha).is_err());
+        }
+        assert!(
+            ExactGaussianFullConformal::new_with_uniform(
+                &array![[1.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1e200],
+                0.5,
+            )
+            .err()
+            .unwrap()
+            .contains("leverage")
+        );
+        // An augmented SPD normal is insufficient when training is singular.
+        assert!(
+            ExactGaussianFullConformal::new_with_uniform(
+                &array![[0.0]],
+                &array![0.0],
+                &array![1.0],
+                &array![[0.0]],
+                &array![1.0],
+                0.5,
+            )
+            .err()
+            .unwrap()
+            .contains("training normal")
+        );
+    }
+
+    #[test]
+    fn affine_inversion_matches_augmented_refits_and_permutations() {
+        let x = array![[1.0, -1.0], [1.0, -0.4], [1.0, 0.1], [1.0, 0.6], [1.0, 1.2]];
+        let y = array![-1.0, 0.5, -0.3, 1.2, 0.7];
+        let penalty = array![[0.4, 0.0], [0.0, 0.8]];
+        let star = array![1.0, 0.35];
+        let weights = Array1::ones(5);
+        let order = [2, 4, 0, 3, 1];
+        let mut normal = x.t().dot(&x) + &penalty;
+        for i in 0..2 {
+            for j in 0..2 {
+                normal[[i, j]] += star[i] * star[j];
+            }
+        }
+        let chol = normal.cholesky(Side::Lower).unwrap();
+        for u in [0.1, 0.5, 0.9] {
+            let engine =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &penalty, &star, u)
+                    .unwrap();
+            let permuted = ExactGaussianFullConformal::new_with_uniform(
+                &x.select(ndarray::Axis(0), &order),
+                &y.select(ndarray::Axis(0), &order),
+                &weights,
+                &penalty,
+                &star,
+                u,
+            )
+            .unwrap();
+            for alpha in [0.15, 0.4, 0.8] {
+                let set = engine.prediction_set(alpha).unwrap();
+                let reordered = permuted.prediction_set(alpha).unwrap();
+                for k in -32..=32 {
+                    let z = k as f64 / 8.0;
+                    let beta = chol.solvevec(&(x.t().dot(&y) + &star * z));
+                    let test = (z - star.dot(&beta)).abs();
+                    let scores: Vec<_> = x
+                        .rows()
+                        .into_iter()
+                        .zip(y.iter())
+                        .map(|(r, &v)| (v - r.dot(&beta)).abs())
+                        .collect();
+                    let greater = scores.iter().filter(|&&e| e > test).count();
+                    let tied = scores.iter().filter(|&&e| e == test).count();
+                    let expected = greater as f64 + u * (1 + tied) as f64 > alpha * 6.0;
+                    let member = set.intervals.iter().any(|piece| piece.contains(z));
+                    assert_eq!(member, expected, "z={z}, U={u}, alpha={alpha}");
+                    assert_eq!(
+                        member,
+                        reordered.intervals.iter().any(|piece| piece.contains(z))
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn honest_frozen_path_preserves_uniform_and_empty_set() {
+        use super::honest::honest_full_conformal_with_uniform;
+        let x = array![[1.0]];
+        let y = array![0.0];
+        let weights = array![1.0];
+        let penalty = array![[0.0]];
+        let star = array![1.0];
+        for u in [0.0, 0.2, 0.8] {
+            let result = honest_full_conformal_with_uniform(
+                &x,
+                &y,
+                &weights,
+                &penalty,
+                Some(0),
+                &star,
+                0.5,
+                u,
+            )
+            .unwrap();
+            let direct =
+                ExactGaussianFullConformal::new_with_uniform(&x, &y, &weights, &penalty, &star, u)
+                    .unwrap()
+                    .prediction_set(0.5)
+                    .unwrap();
+            assert_eq!(result.set.intervals, direct.intervals);
+        }
+        assert!(
+            honest_full_conformal_with_uniform(
+                &x,
+                &y,
+                &weights,
+                &penalty,
+                Some(0),
+                &star,
+                0.5,
+                1.0
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn empty_randomized_set_has_no_point_envelope() {
+        let substrate = ExactFullConformalSubstrate {
+            x: array![[1.0]],
+            y: array![0.0],
+            s_lambda: array![[0.0]],
+            penalty_count: Some(0),
+        };
+        let empty = substrate
+            .interval_with_uniform(&array![1.0], 0.5, 0.25)
+            .unwrap();
+        assert!(empty.set.intervals.is_empty());
+        assert!(empty.lo.is_nan() && empty.hi.is_nan());
+        let whole = substrate
+            .interval_with_uniform(&array![1.0], 0.5, 0.75)
+            .unwrap();
+        assert_eq!((whole.lo, whole.hi), (f64::NEG_INFINITY, f64::INFINITY));
+        assert!(whole.set.intervals[0].contains(0.0));
+    }
+    #[test]
+    fn rounded_rational_roots_use_actual_endpoint_rank() {
+        // For these exact coefficients, FMA computes each comparison sign
+        // without the false zero produced by separate multiplication/addition.
+        let controls = [(3.0, 0.4, 0.6), (10.0, 0.8, 0.6)];
+        for (slope, uniform, alpha) in controls {
+            let engine = ExactGaussianFullConformal {
+                u: array![1.0, 0.0],
+                w: array![0.0, slope],
+                n: 1,
+                tie_uniform: uniform,
+            };
+            let root = 1.0 / slope;
+            assert_ne!((-slope).mul_add(root, 1.0), 0.0);
+            let set = engine.prediction_set(alpha).unwrap();
+            for z in [root.next_down(), root, root.next_up()] {
+                let difference = (-slope).mul_add(z, 1.0);
+                let sum = slope.mul_add(z, 1.0);
+                let greater = usize::from(difference.signum() == sum.signum());
+                let tied = usize::from(difference == 0.0 || sum == 0.0);
+                let expected = greater as f64 + uniform * (1 + tied) as f64 > alpha * 2.0;
+                assert_eq!(
+                    set.intervals.iter().any(|piece| piece.contains(z)),
+                    expected,
+                    "slope={slope}, z={z:.18e}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn colliding_rounded_roots_do_not_create_false_ties() {
+        let root = 1.0f64 / 3.0;
+        let second_intercept = 1.0f64.next_up();
+        let second_denominator = 3.0f64.next_up().next_up();
+        assert_eq!(second_intercept / second_denominator, root);
+        let second_slope = 4.0 - second_denominator;
+        assert!((-3.0f64).mul_add(root, 1.0) > 0.0);
+        assert!((-second_denominator).mul_add(root, second_intercept) < 0.0);
+        for (uniform, alpha) in [(0.2, 0.3), (0.8, 0.7)] {
+            let engine = ExactGaussianFullConformal {
+                u: array![1.0, second_intercept, 0.0],
+                w: array![1.0, second_slope, 4.0],
+                n: 2,
+                tie_uniform: uniform,
+            };
+            let set = engine.prediction_set(alpha).unwrap();
+            for z in [root.next_down(), root, root.next_up()] {
+                let mut greater = 0usize;
+                let mut tied = 0usize;
+                for (intercept, slope) in [(1.0, 1.0), (second_intercept, second_slope)] {
+                    let difference = (slope - 4.0).mul_add(z, intercept);
+                    let sum = (slope + 4.0).mul_add(z, intercept);
+                    tied += usize::from(difference == 0.0 || sum == 0.0);
+                    greater += usize::from(
+                        difference != 0.0 && sum != 0.0 && difference.signum() == sum.signum(),
+                    );
+                }
+                let expected = greater as f64 + uniform * (1 + tied) as f64 > alpha * 3.0;
+                assert_eq!(
+                    set.intervals.iter().any(|piece| piece.contains(z)),
+                    expected,
+                    "U={uniform}, alpha={alpha}, z={z:.18e}"
+                );
+            }
+        }
     }
 }

@@ -90,16 +90,16 @@
 //!   mapped by its own certified solve at that `s`, so the set's edges are
 //!   exact boundaries to solver accuracy.
 //!
-//! # Ties in the discrete families
+//! # Independent randomization and numerical ties
 //!
-//! The discrete families use an independent `U ~ Uniform[0, 1)` drawn once per
+//! All families use an independent `U ~ Uniform[0, 1)` drawn once per
 //! inversion and shared by all candidate labels. Exact smoothed ranks have
 //! marginal coverage `1 − α` for exchangeable supplied rows and a fitting map
 //! symmetric in all augmented rows. This is not a conditional-on-features
 //! guarantee; a training-only learned basis or penalty need not be symmetric.
 //! Numerical uncertainty is retained as a conservative enclosure, so this
-//! implementation does not claim exact coverage. Gamma currently uses the
-//! conservative unsmoothed rank. Fixed-U entry points support reproducible
+//! implementation does not claim exact coverage. Gamma uses the same independent-U
+//! threshold with conservative tie bounds. Fixed-U entry points support reproducible
 //! tests without deriving randomization from the observations.
 
 use std::ops::Range;
@@ -116,6 +116,7 @@ use opt::{BacktrackConfig, backtracking_line_search};
 
 use super::full_conformal::{
     ConformalCertificate, ConformalInterval, ConformalRefusal, conformal_rank_threshold,
+    validate_tie_uniform,
 };
 
 /// Maximum damped-Newton iterations for a cold augmented GLM fit.
@@ -320,7 +321,7 @@ impl ConformalGlmFamily {
             Self::BernoulliLogit => 1.0,
             _ => f64::INFINITY,
         };
-        vec![ConformalInterval { lo: 0.0, hi }]
+        vec![ConformalInterval::closed(0.0, hi)]
     }
 }
 
@@ -552,11 +553,7 @@ impl GlmFullConformalSubstrate {
         alpha: f64,
         tie_uniform: f64,
     ) -> Result<GlmFullConformalSet, String> {
-        if !(tie_uniform.is_finite() && (0.0..1.0).contains(&tie_uniform)) {
-            return Err(format!(
-                "full conformal: tie uniform must be in [0, 1), got {tie_uniform}"
-            ));
-        }
+        validate_tie_uniform(tie_uniform)?;
         if !(alpha > 0.0 && alpha < 1.0) {
             return Err(format!(
                 "full conformal: alpha must be in (0, 1), got {alpha}"
@@ -580,7 +577,7 @@ impl GlmFullConformalSubstrate {
         let intervals = if self.family.is_discrete() {
             self.discrete_set(&row, tau, tie_uniform)
         } else {
-            self.continuous_set(&row, tau)
+            self.continuous_set(&row, tau, tie_uniform)
         };
         Ok(GlmFullConformalSet {
             intervals,
@@ -848,7 +845,7 @@ impl GlmFullConformalSubstrate {
         for z in kept {
             match runs.last_mut() {
                 Some(last) if last.hi + 1.0 == z => last.hi = z,
-                _ => runs.push(ConformalInterval { lo: z, hi: z }),
+                _ => runs.push(ConformalInterval::closed(z, z)),
             }
         }
         runs
@@ -1055,7 +1052,7 @@ impl GlmFullConformalSubstrate {
                 Kind::NonMember => {}
                 Kind::Unknown => {
                     let (lo, hi) = counts(first.z_lo, last.z_hi);
-                    ranges.push(ConformalInterval { lo, hi });
+                    ranges.push(ConformalInterval::closed(lo, hi));
                 }
                 Kind::Undecided => push_exact(first.z_lo, last.z_hi, &mut exact),
                 Kind::Member => {
@@ -1077,10 +1074,7 @@ impl GlmFullConformalSubstrate {
                         }
                         None => last.z_hi.floor(),
                     };
-                    ranges.push(ConformalInterval {
-                        lo: lo.max(0.0),
-                        hi,
-                    });
+                    ranges.push(ConformalInterval::closed(lo.max(0.0), hi));
                 }
             }
             i = j + 1;
@@ -1095,7 +1089,7 @@ impl GlmFullConformalSubstrate {
         let (kept, dropped): (Vec<f64>, Vec<f64>) = exact
             .into_iter()
             .partition(|&z| self.count_member(row, z, u_tie, twin, tau));
-        ranges.extend(kept.into_iter().map(|z| ConformalInterval { lo: z, hi: z }));
+        ranges.extend(kept.into_iter().map(|z| ConformalInterval::closed(z, z)));
         ranges.retain(|r| r.lo <= r.hi);
         ranges.sort_by(|p, q| p.lo.total_cmp(&q.lo));
         let mut merged = Vec::<ConformalInterval>::new();
@@ -1112,14 +1106,8 @@ impl GlmFullConformalSubstrate {
                 .flat_map(|r| {
                     if r.lo <= z && z <= r.hi {
                         [
-                            ConformalInterval {
-                                lo: r.lo,
-                                hi: z - 1.0,
-                            },
-                            ConformalInterval {
-                                lo: z + 1.0,
-                                hi: r.hi,
-                            },
+                            ConformalInterval::closed(r.lo, z - 1.0),
+                            ConformalInterval::closed(z + 1.0, r.hi),
                         ]
                         .into_iter()
                         .filter(|p| p.lo <= p.hi)
@@ -1135,13 +1123,18 @@ impl GlmFullConformalSubstrate {
 
     /// Certified walk over the test-score coordinate for the continuous
     /// (Gamma) family.
-    fn continuous_set(&self, row: &TestRow<'_>, tau: f64) -> Vec<ConformalInterval> {
+    fn continuous_set(
+        &self,
+        row: &TestRow<'_>,
+        tau: f64,
+        tie_uniform: f64,
+    ) -> Vec<ConformalInterval> {
         let whole = self.family.whole_support();
-        if tau < 1.0 {
+        if tau < tie_uniform {
             return whole;
         }
         // r: the fewest dominating training rows that keep a candidate in.
-        let r = (tau - 1.0).floor() + 1.0;
+        let r = (tau - tie_uniform).floor() + 1.0;
         let Some(c) = self.intercept else {
             return whole;
         };
@@ -1204,7 +1197,7 @@ impl GlmFullConformalSubstrate {
             } else {
                 (a.abs().min(b.abs()), a.abs().max(b.abs()))
             };
-            let included = match self.verdict(&node, e, t_lo, t_hi, 1.0, tau, None) {
+            let included = match self.verdict(&node, e, t_lo, t_hi, tie_uniform, tau, None) {
                 Verdict::Member => true,
                 Verdict::NonMember => false,
                 Verdict::Undecided => {
@@ -1250,10 +1243,7 @@ impl GlmFullConformalSubstrate {
                     _ => runs.push(Run {
                         s_lo: leaf.s_lo,
                         s_hi: leaf.s_hi,
-                        piece: ConformalInterval {
-                            lo: leaf.z_lo,
-                            hi: leaf.z_hi,
-                        },
+                        piece: ConformalInterval::closed(leaf.z_lo, leaf.z_hi),
                         warm_lo: leaf.warm.clone(),
                         warm_hi: leaf.warm,
                     }),
@@ -1526,14 +1516,9 @@ mod tests {
         let n = sub.n();
         let tau = conformal_rank_threshold(alpha, n + 1);
         let s_star = node.score_star.abs();
-        if sub.family.is_discrete() {
-            let u = 0.5;
-            let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
-            greater as f64 + u > tau
-        } else {
-            let geq = (0..n).filter(|&i| node.score[i].abs() >= s_star).count();
-            geq as f64 + 1.0 > tau
-        }
+        let greater = (0..n).filter(|&i| node.score[i].abs() > s_star).count();
+        let tied = (0..n).filter(|&i| node.score[i].abs() == s_star).count();
+        greater as f64 + 0.5 * (1 + tied) as f64 > tau
     }
 
     #[test]

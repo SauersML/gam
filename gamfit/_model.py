@@ -225,7 +225,9 @@ class Model:
             on features. A training-only learned basis need not satisfy this.
             The set is a union of ``conformal_set_components`` intervals and
             the bounds report its outer envelope (NaN for an empty randomized
-            set). With ``calibration`` it is the
+            set). ``conformal_lower_closed`` and ``conformal_upper_closed`` are
+            1 when the corresponding finite endpoint is included and 0 otherwise;
+            both are 0 for an empty set. With ``calibration`` it is the
             split-conformal band ``mu_hat(x) +/- q_hat * s(x)`` calibrated on
             that held-out fold, with finite-sample marginal coverage
             ``>= conformal_level`` regardless of model misspecification, for

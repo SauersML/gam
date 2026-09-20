@@ -221,6 +221,8 @@ pub fn full_conformal_prediction_columns(
 
     let mut lower_vec = Vec::with_capacity(n_test);
     let mut upper_vec = Vec::with_capacity(n_test);
+    let mut lower_closed = Vec::with_capacity(n_test);
+    let mut upper_closed = Vec::with_capacity(n_test);
     let mut components_vec = Vec::with_capacity(n_test);
     let mut certificate_vec = Vec::with_capacity(n_test);
     match glm {
@@ -235,6 +237,15 @@ pub fn full_conformal_prediction_columns(
                     .map_err(|e| format!("full conformal at row {i}: {e}"))?;
                 lower_vec.push(iv.lo + offset_test[i]);
                 upper_vec.push(iv.hi + offset_test[i]);
+                lower_closed.push(f64::from(
+                    iv.set
+                        .intervals
+                        .first()
+                        .is_some_and(|piece| piece.lo_closed),
+                ));
+                upper_closed.push(f64::from(
+                    iv.set.intervals.last().is_some_and(|piece| piece.hi_closed),
+                ));
                 components_vec.push(iv.set.intervals.len() as f64);
                 certificate_vec.push(f64::from(iv.certificate.code()));
             }
@@ -263,6 +274,12 @@ pub fn full_conformal_prediction_columns(
                 };
                 lower_vec.push(lo);
                 upper_vec.push(hi);
+                lower_closed.push(f64::from(
+                    set.intervals.first().is_some_and(|piece| piece.lo_closed),
+                ));
+                upper_closed.push(f64::from(
+                    set.intervals.last().is_some_and(|piece| piece.hi_closed),
+                ));
                 components_vec.push(set.intervals.len() as f64);
                 certificate_vec.push(glm_certificate);
             }
@@ -313,6 +330,8 @@ pub fn full_conformal_prediction_columns(
     columns.insert("posterior_mean_upper".to_string(), upper_vec);
     columns.insert("conformal_set_components".to_string(), components_vec);
     columns.insert("conformal_certificate".to_string(), certificate_vec);
+    columns.insert("conformal_lower_closed".to_string(), lower_closed);
+    columns.insert("conformal_upper_closed".to_string(), upper_closed);
     Ok(columns)
 }
 
