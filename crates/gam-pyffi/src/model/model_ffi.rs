@@ -92,9 +92,12 @@ struct PyFittedModel {
 
 impl PyFittedModel {
     fn compile(py: Python<'_>, model_bytes: Vec<u8>) -> PyResult<Self> {
-        let (model, source) = detach_py_result(py, "compile_model", move || {
-            load_model_impl(&model_bytes).map(|model| (model, model_bytes))
-        })?;
+        let (model, source) = detach_typed_py_result(
+            py,
+            "compile_model",
+            move || load_model_impl(&model_bytes).map(|model| (model, model_bytes)),
+            saved_model_error_to_pyerr,
+        )?;
         Ok(Self {
             model: Arc::new(model),
             source: source.into(),
@@ -4381,11 +4384,18 @@ fn compare_models(
             )))
         })
         .collect::<PyResult<Vec<_>>>()?;
+    let models = detach_typed_py_result(
+        py,
+        "compare_models",
+        move || {
+            model_bytes
+                .iter()
+                .map(|bytes| load_model_impl(bytes))
+                .collect::<Result<Vec<_>, _>>()
+        },
+        saved_model_error_to_pyerr,
+    )?;
     let comparison = detach_py_result(py, "compare_models", move || {
-        let models = model_bytes
-            .iter()
-            .map(|bytes| load_model_impl(bytes))
-            .collect::<Result<Vec<_>, String>>()?;
         let named = labels
             .into_iter()
             .zip(models.iter())
@@ -4448,7 +4458,8 @@ fn json_lookup_str(payload: &serde_json::Value, keys: &[&str]) -> Option<String>
 
 fn reml_fit_view<'py>(fit: &Bound<'py, PyAny>) -> PyResult<RemlFitView<'py>> {
     if let Ok(model_bytes) = fit.extract::<Vec<u8>>() {
-        let model = load_model_impl(&model_bytes).map_err(PyValueError::new_err)?;
+        let model =
+            load_model_impl(&model_bytes).map_err(|err| saved_model_error_to_pyerr(fit.py(), err))?;
         let summary = summary_payload_value(&model).map_err(PyValueError::new_err)?;
         return Ok(RemlFitView::SavedSummary(summary));
     }
