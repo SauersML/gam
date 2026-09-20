@@ -147,47 +147,18 @@ impl<'a> RemlState<'a> {
     }
 
     pub(crate) fn analytic_outer_hessian_enabled(&self) -> bool {
-        // The Tierney-Kadane fallback gate is no longer needed: the analytic
-        // TK value, first ρ-derivative, AND second ρ-derivative paths are
-        // implemented in `tierney_kadane_terms`, which now populates the
-        // `hessian` field whenever the caller requests `ValueGradientHessian`.
-        // The earlier gate (Firth + non-identity link → return false) was
-        // kept during the manual conflict merge that landed the TK Hessian
-        // implementation; it is now stale and was suppressing the analytic
-        // path that was actually in place.
-        // Canonical-logit Firth fits keep their exact Tierney-Kadane outer Hessian
-        // at every problem scale: its row-pair jets run by blocked row pairs or
-        // through design tensors, whichever predicted work is smaller
-        // (`TkRowPairRoute::predicted_rho_hessian`, #2900), so no row count sends
-        // their curvature to BFGS.
+        // The Tierney-Kadane outer ρ-Hessian is analytic for every Firth link:
+        // its fourth η-derivative of the observed-information surface comes
+        // from the six-order Bernoulli log jet
+        // (`pirls::bernoulli_observed_information_jet`), and canonical-logit
+        // row-pair jets run by blocked row pairs or through design tensors,
+        // whichever predicted work is smaller
+        // (`TkRowPairRoute::predicted_rho_hessian`, #2900).
         //
-        // The corrected objective and its exact analytic gradient are
-        // link-general, but an exact TK outer Hessian additionally needs the
-        // fourth eta derivative of the observed-information surface. That
-        // carrier is currently available only for canonical Binomial Logit.
-        // Other Firth links therefore optimize the same TK-corrected objective
-        // with BFGS curvature rather than silently dropping the correction.
-        if reml_robust_jeffreys_link(&self.config).is_some()
-            && !self.tk_exact_hessian_is_canonical_logit()
-        {
-            return false;
-        }
         // A latched #784 block correction splices `Δ_b` with its exact
         // gradient and ρ-Hessian, unless `Δ_b` has no closed-form Hessian on
         // this fit, when the criterion it defines has none.
         self.block_correction_hessian_refusal().is_none()
-    }
-
-    /// Whether the exact analytic outer Hessian of the Tierney-Kadane
-    /// correction is available. TK value and gradient are link-general; only
-    /// this optimizer-curvature capability remains canonical-logit-specific.
-    pub(crate) fn tk_exact_hessian_is_canonical_logit(&self) -> bool {
-        let spec = reml_spec(&self.config.likelihood);
-        matches!(spec.response, ResponseFamily::Binomial)
-            && matches!(
-                self.runtime_inverse_link(),
-                InverseLink::Standard(StandardLink::Logit)
-            )
     }
 
     pub(crate) fn sparse_exact_beta_original(&self, pirls_result: &PirlsResult) -> Array1<f64> {
@@ -2260,13 +2231,10 @@ impl<'a> RemlState<'a> {
         // ρ-Hessian changes at a size window.
         let pirls_result = bundle.pirls_result.as_ref();
         let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian. The exact
-        // non-canonical observed-information carrier needs a sixth inverse-link
-        // derivative, which is not exposed by the current jet tower, so those
-        // links are deliberately routed to BFGS above. Value and gradient use
-        // only c/d/e and remain exact for every supported Firth link.
+        // `f = d⁴W_obs/dη⁴` enters only the analytic outer Hessian; value and
+        // gradient use c/d/e alone.
         let f_array = if mode == super::reml_outer_engine::EvalMode::ValueGradientHessian {
-            self.hessian_cdef_arrays(pirls_result)?.3
+            self.hessian_f_array(pirls_result)?
         } else {
             Array1::zeros(e_array.len())
         };
@@ -3316,46 +3284,77 @@ impl<'a> RemlState<'a> {
         Ok((c_array, d_array, e_array))
     }
 
-    pub(crate) fn hessian_cdef_arrays(
+    /// `fᵢ = ∂⁴W_obs/∂η⁴` per row, the carrier the analytic Tierney-Kadane
+    /// outer ρ-Hessian adds to c/d/e. Canonical Logit reads it from the
+    /// closed-form 5-jet (`W = h'(η)`, so `f = h⁽⁵⁾`). Every other Bernoulli
+    /// link takes it from `pirls::bernoulli_observed_information_jet`, linear
+    /// in the sixth η-derivatives of log μ and log(1−μ), so no division by
+    /// V = μ(1−μ) occurs where μ' and 1−μ underflow together (#3317, #3203).
+    pub(crate) fn hessian_f_array(
         &self,
         pirls_result: &PirlsResult,
-    ) -> Result<(Array1<f64>, Array1<f64>, Array1<f64>, Array1<f64>), EstimationError> {
-        let (c_array, d_array, e_array) = self.hessian_cde_arrays(pirls_result)?;
-        let canonical_logit = matches!(
+    ) -> Result<Array1<f64>, EstimationError> {
+        use rayon::prelude::*;
+        if !matches!(
             reml_spec(&pirls_result.likelihood).response,
             ResponseFamily::Binomial
-        ) && matches!(
-            self.runtime_inverse_link(),
-            InverseLink::Standard(StandardLink::Logit)
-        );
-        if !canonical_logit {
-            // Not a defect of this fit: a non-canonical Firth link is routed
-            // to BFGS for the outer search, so no analytic ρ-Hessian exists at
-            // its end. The smoothing correction recognises this exact text as
-            // a typed structural absence (`FIRTH_OUTER_HESSIAN_NOT_ANALYTIC`).
+        ) {
             crate::bail_invalid_estim!(
-                "{}",
-                crate::estimate::smoothing_correction::FIRTH_OUTER_HESSIAN_NOT_ANALYTIC
+                "Tierney-Kadane d4W/deta4 is defined only for the Bernoulli Firth likelihood"
             );
         }
-        let mut f_array = Array1::<f64>::zeros(e_array.len());
-        use rayon::prelude::*;
+        let inverse_link = self.runtime_inverse_link();
         let final_eta = &pirls_result.final_eta;
         let weights = &self.weights;
-        let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
-        f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
-            let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
-            *f_o = weights[i] * jet.d5;
-        });
-        if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
-            return Err(EstimationError::PirlsRowGeometryUnrepresentable {
-                row: i,
-                quantity: "observed Hessian d4W/deta4",
-                eta: final_eta[i],
-                value,
+        let n = final_eta.len();
+        if matches!(&inverse_link, InverseLink::Standard(StandardLink::Logit)) {
+            let mut f_array = Array1::<f64>::zeros(n);
+            let f_s = f_array.as_slice_mut().expect("f_array must be contiguous");
+            f_s.par_iter_mut().enumerate().for_each(|(i, f_o)| {
+                let jet = crate::mixture_link::logit_inverse_link_jet5(final_eta[i]);
+                *f_o = weights[i] * jet.d5;
             });
+            if let Some((i, &value)) = f_array.iter().enumerate().find(|(_, v)| !v.is_finite()) {
+                return Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                    row: i,
+                    quantity: "observed Hessian d4W/deta4",
+                    eta: final_eta[i],
+                    value,
+                });
+            }
+            return Ok(f_array);
         }
-        Ok((c_array, d_array, e_array, f_array))
+        let phi = reml_fixed_glm_dispersion(&pirls_result.likelihood)?;
+        let y_view = &self.y;
+        let inverse_link_ref = &inverse_link;
+        // Per-row certificates, scanned in row order so the reported failing
+        // row is deterministic.
+        let certified: Vec<Result<f64, EstimationError>> = (0..n)
+            .into_par_iter()
+            .map(|i| -> Result<f64, EstimationError> {
+                let eta_raw = final_eta[i];
+                let f_i = pirls::bernoulli_observed_information_jet(
+                    inverse_link_ref,
+                    eta_raw,
+                    y_view[i],
+                    phi,
+                    weights[i],
+                )?[4];
+                if f_i.is_finite() {
+                    Ok(f_i)
+                } else {
+                    Err(EstimationError::PirlsRowGeometryUnrepresentable {
+                        row: i,
+                        quantity: "observed Hessian d4W/deta4",
+                        eta: eta_raw,
+                        value: f_i,
+                    })
+                }
+            })
+            .collect();
+        Ok(Array1::from_vec(
+            certified.into_iter().collect::<Result<_, _>>()?,
+        ))
     }
 
     /// The directions of `rho` along which this criterion is EXACTLY constant

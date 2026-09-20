@@ -2546,5 +2546,21 @@
     ],
     "reason": "The cold SAE routing seed added a fixed 1e-3, random_state-keyed logit perturbation on top of the data-driven residual seed. Its own comment said it does not change which atom wins, so its only effect was to make the start depend on random_state. Both jitter constants are deleted: RANDOM_STATE_LOGIT_JITTER in minimal_seed.rs and SAE_RANDOM_STATE_LOGIT_JITTER in seed_routing.rs.",
     "evidence": "Backfill by the main-tip watcher (w2-surv-ls-b): PR #3352 (fix-3090-seed-logit-jitter, part of #3090) merged as 93285a585bf63554ef43831f1a7f4a4758115f98 with no entry. The ledger audit runs scripts/source_removal_guard.py and scripts/public_api_census.py from 93285a585bf63554ef43831f1a7f4a4758115f98's own tree with --base d058855331e8384f91083846d36df994f5187d9b --head 93285a585bf63554ef43831f1a7f4a4758115f98 (audit 2026-09-20, /scratch.global/sauer354/w2slb/audit4). The reason is the PR's own description; the entry keeps the merge's first parent as its base, as a backfill for an already-landed removal. The guard lists exactly these 2 items. Read-proof: git grep -w -c <name> 93285a585bf63554ef43831f1a7f4a4758115f98 -- <its path> gives 0 for every item."
+  },
+  {
+    "base": "5994ad54c4c39f086905591da98990d8a21a87dd",
+    "items": [
+      "crates/gam-predict/src/large_scale_reml_stress_tests.rs:const:NORMAL_95_TWO_SIDED_Z"
+    ],
+    "reason": "large_scale_reml_stress_coverage read the published interval's standard error as width / (2 * NORMAL_95_TWO_SIDED_Z). Since 698df1148d predict() builds an estimated-scale Gaussian interval on the Student-t reference on n - edf (IntervalReference::of_fit), so that read-back overstated the published variance by (t/z)^2 and the FirstOrderIdentifiedSubspace positive control refused a correct Vp. The test now takes one multiplier per replicate from IntervalReference::of_fit(&fit).central_multiplier(NOMINAL_COVERAGE), the one predict() uses, for the read-back and for the intervals it builds itself. The fixed normal quantile has no use left and is deleted.",
+    "evidence": "direct gate dy3 w2thb-g9pred (direct-dy3-w2thb-g9pred.log): TIPCHECK at 32560e9b3d, check --workspace --all-targets, pyffi, source-removal guard and census RC 0, large_scale_reml_stress_coverage PASS; mutant dy4 w2thb-m8pred arm mcov FIRED"
+  },
+  {
+    "base": "d91ee7df76138dce9bb5e0e1cade3b39ac1a2bea",
+    "items": [
+      "crates/gam-terms/src/smooth/term_specs_tests.rs:fn:non_materialized_penalty_falls_back_conservatively"
+    ],
+    "reason": "The te() joint-unpenalized-dimension guess is retired: joint_unpenalized_dim no longer reports 0 (or a single penalty's own null dim) for a penalty whose stored block is a Kronecker factor, it reads the materialized p_local x p_local block of every penalty. The removed test pinned that fallback, including a shape (a 1x1 factor for p_local = 2) the builder never produces now.",
+    "evidence": "tensor_product_penalties_read_the_materialized_kronecker_blocks replaces it in the same module: te(x, z) with 3x2 margins (S_x kron I and I kron S_z) has a 1-dimensional joint null space, null(S_x) kron null(S_z), which the retired fallback reported as 0. git grep -w finds no remaining reference to the removed name."
   }
 ]
