@@ -331,3 +331,38 @@ fn tweedie_null_smooth_wald_p_value_is_uniform() {
 fn beta_null_smooth_wald_p_value_is_uniform() {
     assert_null_p_value_is_uniform(Family::Beta);
 }
+
+/// Replication 67 of the Gamma gate shrinks `s(x2)` onto its null space, and
+/// some of its null draws select through a lower tail where the criterion is
+/// flat to its own rounding while its derivatives are still resolved. Every
+/// row must still carry a p-value: a refused selection would drop the row the
+/// gate reads.
+#[test]
+fn a_gamma_null_fit_whose_selection_crosses_a_flat_tail_gets_a_p_value() {
+    init_parallelism();
+    let data = null_dataset(Family::Gamma, 67);
+    let config = FitConfig {
+        family: Some(Family::Gamma.config_name().to_string()),
+        ..FitConfig::default()
+    };
+    let FitResult::Standard(fit) = fit_from_formula(FORMULA, &data, &config).expect("gamma fit")
+    else {
+        panic!("a Gamma formula fit is a standard fit");
+    };
+    let rows = smooth_term_summary_rows(&fit.design, &fit.resolvedspec, &fit.fit);
+    assert_eq!(rows.len(), 2, "one row per smooth");
+    for row in &rows {
+        assert!(
+            row.pvalue_unavailable.is_none(),
+            "{} has no p-value: {:?}",
+            row.name,
+            row.pvalue_unavailable
+        );
+        let pvalue = row.pvalue.expect("a row with no refusal has a p-value");
+        assert!(
+            (0.0..=1.0).contains(&pvalue),
+            "{} p-value {pvalue}",
+            row.name
+        );
+    }
+}

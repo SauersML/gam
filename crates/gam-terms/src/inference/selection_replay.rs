@@ -300,7 +300,7 @@ struct SelectionGeometry {
 ///
 /// ```text
 /// C(t) = Uᵀ T(t) U = RᵀR,     R = qr(M(t)),   M(t) = [√(t_iλ̂_i)·R_iU ; …]
-/// I + C = R̃ᵀR̃,               R̃ = qr([M(t); I])
+/// I + C = R̃ᵀR̃,               R̃ = qr([R; I])
 /// D    = (I + C)⁻¹ C,         v = Uᵀu
 /// criterion = vᵀDv + log|I + C| − log|C|
 /// statistic = ‖u‖² − ‖Dv‖²
@@ -320,16 +320,30 @@ struct SelectionGeometry {
 /// * `log|C|` is taken from the TRIANGULAR FACTOR of the scaled roots. `κ(C)`
 ///   reaches `e^{60}` on a null-true double-penalty smooth, where an assembled
 ///   Cholesky has no small pivots left to speak of.
-/// * `log|I + C|` and `D` are taken from the triangular factor of the roots
-///   bordered by `I`. An assembled `I + C` carries an ABSOLUTE error of `ε‖C‖`
-///   into every mode, and `‖C‖` follows the largest scale: on a dense pair at a
+/// * `log|I + C|` and `D` are taken from the triangular factor of `R` bordered
+///   by `I`. An assembled `I + C` carries an ABSOLUTE error of `ε‖C‖` into
+///   every mode, and `‖C‖` follows the largest scale: on a dense pair at a
 ///   scale separation of 40 it moved the criterion by `4.2e-6` against an exact
 ///   axis slice, where the bordered factor agrees to `1e-14`.
 ///
-/// Both reductions stack their blocks in decreasing scale. A Householder
-/// reduction of rows graded by `e^{30}` keeps each small row accurate to its own
-/// scale only when every row it is eliminated against precedes it; stacked the
-/// other way, the same bordered factor misses by `4.7e-5` on that pair.
+/// `M` is stacked in decreasing scale, and `[R; I]` in decreasing row norm. A
+/// Householder reduction of rows graded by `e^{30}` keeps each small row
+/// accurate to its own scale only when every row it is eliminated against
+/// precedes it; stacked the other way, the bordered factor misses by `4.7e-5`
+/// on that pair.
+///
+/// # Why `I` borders `R` and not `M`
+///
+/// The criterion reads `log|I + C| − log|C|`, and on the upper-tail plateau
+/// both carry `r·ln λ`, so the difference is what the descent and its
+/// certificate see. Bordering `M` itself runs a second reduction whose pivot
+/// errors are independent of the first's, and the difference keeps their sum:
+/// on a Gamma null fit (rep 67 of the family gate) it wandered by `1e-11`
+/// between points `1e-6` apart, ten times the band the certificate charges it,
+/// and the descent stalled on a valley whose decreases were smaller than that.
+/// `[R; I]` has the same `R̃` in exact arithmetic (`[M; I] = diag(Q, I)[R; I]`),
+/// and its reduction starts from the very pivots `log|C|` is read from, so the
+/// two share their rounding and the difference moves by `3e-14` there.
 struct SelectionFactor {
     /// `r`, the structural rank.
     rank: usize,
@@ -338,13 +352,20 @@ struct SelectionFactor {
     stacked: Array2<f64>,
     /// `R`'s diagonal, which the reduction overwrites in `stacked`.
     diagonal: Vec<f64>,
-    /// `[M(t); I]`, overwritten in place by its Householder reduction.
+    /// `[R; I]` in decreasing row norm, `2r × r`, overwritten in place by its
+    /// Householder reduction.
     bordered: Array2<f64>,
     /// `R̃`'s diagonal, which the reduction overwrites in `bordered`.
     bordered_diagonal: Vec<f64>,
+    /// The source of each row of `bordered`: `i < r` is row `i` of `R`, and
+    /// `r + i` is row `i` of `I`.
+    bordered_rows: Vec<usize>,
+    /// The Euclidean norms of `R`'s rows, then of `I`'s, that `bordered_rows`
+    /// is sorted by.
+    row_norms: Vec<f64>,
     /// `R̃ᵀ`, the lower factor of `I + C`.
     factor: Array2<f64>,
-    /// The blocks in decreasing scale, the identity as the last index.
+    /// The blocks of `M` in decreasing scale.
     order: Vec<usize>,
     /// `log|I + T| − log|T|₊`, the criterion's `t`-dependent Occam term.
     offset: f64,
@@ -532,10 +553,12 @@ impl SelectionFactor {
             rank,
             stacked: Array2::zeros((rows.max(rank), rank)),
             diagonal: vec![0.0; rank],
-            bordered: Array2::zeros((rows + rank, rank)),
+            bordered: Array2::zeros((2 * rank, rank)),
             bordered_diagonal: vec![0.0; rank],
+            bordered_rows: Vec::with_capacity(2 * rank),
+            row_norms: vec![0.0; 2 * rank],
             factor: Array2::zeros((rank, rank)),
-            order: Vec::with_capacity(geometry.range_roots.len() + 1),
+            order: Vec::with_capacity(geometry.range_roots.len()),
             offset: 0.0,
         }
     }
@@ -547,14 +570,7 @@ impl SelectionFactor {
         if log_t.len() != components {
             return false;
         }
-        // Block `components` is the identity of `[M; I]`, at scale one.
-        let log_scale = |block: usize| {
-            if block == components {
-                0.0
-            } else {
-                0.5 * (geometry.log_lambda[block] + log_t[block])
-            }
-        };
+        let log_scale = |block: usize| 0.5 * (geometry.log_lambda[block] + log_t[block]);
         for block in 0..components {
             // `exp(s/2)` rather than `sqrt(exp(s))`, so a `λ̂` at the box wall
             // never round-trips through an intermediate that overflows.
@@ -565,35 +581,59 @@ impl SelectionFactor {
         // Rows in decreasing scale (see the type's doc): each block goes in
         // before every block it outweighs.
         self.order.clear();
-        self.order.extend(0..=components);
+        self.order.extend(0..components);
         self.order
             .sort_by(|&left, &right| log_scale(right).total_cmp(&log_scale(left)));
         self.stacked.fill(0.0);
-        self.bordered.fill(0.0);
-        let (mut stacked_row, mut bordered_row) = (0usize, 0usize);
+        let mut stacked_row = 0usize;
         for &block in &self.order {
-            if block == components {
-                for index in 0..self.rank {
-                    self.bordered[[bordered_row + index, index]] = 1.0;
-                }
-                bordered_row += self.rank;
-                continue;
-            }
             let root = &geometry.range_roots[block];
             let scale = log_scale(block).exp();
             for row in 0..root.nrows() {
                 for column in 0..self.rank {
-                    let value = scale * root[[row, column]];
-                    self.stacked[[stacked_row + row, column]] = value;
-                    self.bordered[[bordered_row + row, column]] = value;
+                    self.stacked[[stacked_row + row, column]] = scale * root[[row, column]];
                 }
             }
             stacked_row += root.nrows();
-            bordered_row += root.nrows();
         }
-        if householder_triangularize(&mut self.stacked, &mut self.diagonal).is_none()
-            || householder_triangularize(&mut self.bordered, &mut self.bordered_diagonal).is_none()
+        if householder_triangularize(&mut self.stacked, &mut self.diagonal).is_none() {
+            return false;
+        }
+        // `R` read back out of the reduction: its diagonal from `diagonal`,
+        // its strictly-upper triangle in place (see the type's doc for why `I`
+        // borders this and not `M`).
+        let upper = |row: usize, column: usize, stacked: &Array2<f64>, diagonal: &[f64]| match row
+            .cmp(&column)
         {
+            std::cmp::Ordering::Equal => diagonal[row],
+            std::cmp::Ordering::Less => stacked[[row, column]],
+            std::cmp::Ordering::Greater => 0.0,
+        };
+        for row in 0..self.rank {
+            self.row_norms[row] = (row..self.rank)
+                .map(|column| upper(row, column, &self.stacked, &self.diagonal).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            self.row_norms[self.rank + row] = 1.0;
+        }
+        // Rows in decreasing norm, for the same reason as `M`'s blocks.
+        self.bordered_rows.clear();
+        self.bordered_rows.extend(0..2 * self.rank);
+        let norms = &self.row_norms;
+        self.bordered_rows
+            .sort_by(|&left, &right| norms[right].total_cmp(&norms[left]));
+        self.bordered.fill(0.0);
+        for (position, &source) in self.bordered_rows.iter().enumerate() {
+            if source < self.rank {
+                for column in source..self.rank {
+                    self.bordered[[position, column]] =
+                        upper(source, column, &self.stacked, &self.diagonal);
+                }
+            } else {
+                self.bordered[[position, source - self.rank]] = 1.0;
+            }
+        }
+        if householder_triangularize(&mut self.bordered, &mut self.bordered_diagonal).is_none() {
             return false;
         }
         // `R̃ᵀR̃ = [M; I]ᵀ[M; I] = I + C`, kept as the lower factor `R̃ᵀ`.
@@ -611,7 +651,8 @@ impl SelectionFactor {
         // Cholesky pivot of `I + C` is at least its partner in `C` and every
         // term is `≥ 0`: the sum has nothing to cancel. The difference of the
         // two log-determinants cancels instead, and on the upper-tail plateau,
-        // where both carry `r·ln λ`, what it leaves is rounding of that size.
+        // where both carry `r·ln λ`, what it leaves is the rounding the second
+        // reduction adds to pivots it starts from, not two reductions' worth.
         self.offset = 2.0
             * self
                 .diagonal
@@ -668,11 +709,13 @@ impl SelectionFactor {
     ///
     /// With `C_j = e^{ρ̂_j + ρ_j} Uᵀ S̃_j U` the part of `C` scale `j` owns,
     /// `∂C/∂ρ_j = C_j` and `∂C_j/∂ρ_k = δ_jk C_j`. Write `M = QR` and
-    /// `[M; I] = Q̃R̃` for the two reductions, `Q_j` and `Q̃_j` for the rows of each
-    /// thin factor that block `j` occupies, and
+    /// `[R; I] = Q̂R̃` for the two reductions, `Q_j` for the rows of `Q` that
+    /// block `j` occupies and `Q̂_R` for the rows of `Q̂` that `R` does. Then
+    /// `[M; I] = Q̃R̃` with `Q̃ = [Q Q̂_R; Q̂_I]` orthonormal, block `j`'s rows of it
+    /// are `Q̃_j = Q_j Q̂_R`, and
     ///
     /// ```text
-    /// G_j = Q_jᵀQ_j,   G̃_j = Q̃_jᵀQ̃_j,   w = R̃⁻ᵀv,   y_j = G̃_j w.
+    /// G_j = Q_jᵀQ_j,   G̃_j = Q̃_jᵀQ̃_j = Q̂_Rᵀ G_j Q̂_R,   w = R̃⁻ᵀv,   y_j = G̃_j w.
     /// ```
     ///
     /// Then `C_j = RᵀG_jR = R̃ᵀG̃_jR̃`, so `C⁻¹C_j = R⁻¹G_jR` and
@@ -694,7 +737,7 @@ impl SelectionFactor {
     ///
     /// # Bands
     ///
-    /// Each entry is an accumulation over the reductions' `rows · r` rounded
+    /// Each entry is an accumulation over the two reductions' `rows · r` rounded
     /// operations (the Householder backward-error bound, Higham Thm 19.4), so its
     /// band is [`gam_linalg::roundoff::accumulation_band`] at that depth over the
     /// absolute sum of the entry's own summands.
@@ -710,33 +753,32 @@ impl SelectionFactor {
         }
         let stacked_q = householder_thin_q(&self.stacked);
         let bordered_q = householder_thin_q(&self.bordered);
+        // `Q̂_R`: row `i` is the row of `Q̂` that row `i` of `R` was put in.
+        let mut upper_q = Array2::<f64>::zeros((rank, rank));
+        for (position, &source) in self.bordered_rows.iter().enumerate() {
+            if source < rank {
+                upper_q.row_mut(source).assign(&bordered_q.row(position));
+            }
+        }
         let whitened =
             gam_linalg::triangular::forward_substitution_lower_vector(&self.factor, projected);
         // Each block's rows sit where `refactor` put them.
         let mut stacked_start = vec![0usize; components];
-        let mut bordered_start = vec![0usize; components];
-        let (mut stacked_row, mut bordered_row) = (0usize, 0usize);
+        let mut stacked_row = 0usize;
         for &block in &self.order {
-            if block == components {
-                bordered_row += rank;
-                continue;
-            }
             stacked_start[block] = stacked_row;
-            bordered_start[block] = bordered_row;
             stacked_row += geometry.range_roots[block].nrows();
-            bordered_row += geometry.range_roots[block].nrows();
         }
-        let gram = |orthonormal: &Array2<f64>, start: usize, rows: usize| {
-            let block = orthonormal.slice(ndarray::s![start..start + rows, ..]);
-            block.t().dot(&block)
-        };
         let mut plain = Vec::with_capacity(components);
         let mut bordered = Vec::with_capacity(components);
         let mut mapped = Vec::with_capacity(components);
         for component in 0..components {
+            let start = stacked_start[component];
             let rows = geometry.range_roots[component].nrows();
-            plain.push(gram(&stacked_q, stacked_start[component], rows));
-            let own = gram(&bordered_q, bordered_start[component], rows);
+            let block = stacked_q.slice(ndarray::s![start..start + rows, ..]);
+            plain.push(block.t().dot(&block));
+            let mixed = block.dot(&upper_q);
+            let own = mixed.t().dot(&mixed);
             mapped.push(own.dot(&whitened));
             bordered.push(own);
         }
@@ -801,7 +843,7 @@ impl SelectionFactor {
             hessian,
             curvature,
             curvature_summands,
-            depth: self.bordered.nrows() * rank,
+            depth: (self.stacked.nrows() + self.bordered.nrows()) * rank,
         })
     }
 }
@@ -862,6 +904,58 @@ impl SelectionDerivatives {
         }
     }
 
+    /// The decrease `f(ρ) − f(ρ + s)` from these derivatives at `ρ` to `end`'s
+    /// at `ρ + s`, measured to the criterion's rounding: `None` when it is not
+    /// resolved.
+    ///
+    /// The computed values are differenced first. When their difference is
+    /// inside the two values' rounding bands, the decrease is read instead from
+    /// the derivatives at the two ends, which are resolved far below the value
+    /// when the criterion is flat. Along `φ(τ) = f(ρ + τs)`, the corrected
+    /// trapezoid rule (Euler–Maclaurin) gives
+    ///
+    /// ```text
+    /// φ(1) − φ(0) = ½ (φ'(0) + φ'(1)) − (φ''(1) − φ''(0))/12 + φ⁽⁵⁾(ξ)/720,
+    /// ```
+    ///
+    /// with `φ' = gᵀs` and `φ'' = sᵀHs` at each end: exact through quartic `φ`,
+    /// with a remainder fifth order in the step. Its band carries every
+    /// gradient's and Hessian entry's own band, weighted by `|s|`, and that
+    /// reading is kept only when it exceeds its band.
+    fn decrease_to(&self, end: &Self, step: &[f64]) -> Option<f64> {
+        let band = |depth: usize, sum: f64| gam_linalg::roundoff::accumulation_band(depth, sum);
+        let computed = self.value - end.value;
+        if computed.abs() > band(self.depth, self.value_sum) + band(end.depth, end.value_sum) {
+            return Some(computed);
+        }
+        let (mut slope, mut slope_band) = (0.0_f64, 0.0_f64);
+        let (mut bend, mut bend_band) = (0.0_f64, 0.0_f64);
+        for (row, &along) in step.iter().enumerate() {
+            slope += 0.5 * (self.gradient[row] + end.gradient[row]) * along;
+            slope_band += 0.5
+                * (band(self.depth, self.gradient_sums[row])
+                    + band(end.depth, end.gradient_sums[row]))
+                * along.abs();
+            for (column, &across) in step.iter().enumerate() {
+                let own = |ends: &Self| {
+                    let diagonal = if row == column {
+                        ends.gradient_sums[row]
+                    } else {
+                        0.0
+                    };
+                    band(
+                        ends.depth,
+                        ends.curvature_summands[[row, column]] + diagonal,
+                    )
+                };
+                bend += (end.hessian[[row, column]] - self.hessian[[row, column]]) * along * across;
+                bend_band += (own(self) + own(end)) * (along * across).abs();
+            }
+        }
+        let decrease = bend / 12.0 - slope;
+        (decrease.abs() > slope_band + bend_band / 12.0).then_some(decrease)
+    }
+
     /// The box-constrained stationarity verdict of the quadratic model in
     /// `coordinates`; see [`Self::stationarity_verdict`].
     ///
@@ -913,8 +1007,27 @@ impl SelectionDerivatives {
     /// A negative curvature the box can feel keeps the point from certifying,
     /// and is reported as such.
     ///
-    /// The certificate takes the smallest `λ² = 2·bound` over the `2^m` splits.
-    /// It passes when `λ² + band_λ² ≤ band_f`, the bar of
+    /// The box charge prices negative curvature at the farthest corner even when
+    /// it is only a coupling: a scale deep in its tail, curved to its own tiny
+    /// summands, coupled to a well-curved scale reads as a saddle of `K` the
+    /// stretched window can feel, though the well-curved scale's own curvature
+    /// absorbs it. So a second family of bounds relaxes a subset `P` of the
+    /// scales exactly, over all of `ℝ^P`, and keeps the rest `N` in the box.
+    /// Minimizing over `δ_P` leaves the Schur-reduced model on `N`,
+    ///
+    /// ```text
+    /// −min_box q  ≤  ½ g_Pᵀ K_PP⁻¹ g_P  −  min_{box_N} [ (g_N − K_NP K_PP⁻¹ g_P)ᵀδ_N
+    ///                                           + ½ δ_Nᵀ (K_NN − K_NP K_PP⁻¹ K_PN) δ_N ],
+    /// ```
+    ///
+    /// bounded on `N` by its slopes to the walls and the reduced spectrum's box
+    /// charge as above. It is finite only when `K_PP` has no resolved negative
+    /// curvature, and no flat direction of it carries a resolved slope or
+    /// coupling to `N`. The bands of the reduced slope and curvature carry the
+    /// eliminated directions' bands.
+    ///
+    /// The certificate takes the smallest `λ² = 2·bound` over the `2^m` splits
+    /// and the `2^m` reductions. It passes when `λ² + band_λ² ≤ band_f`, the bar of
     /// [`opt::newton_decrement_verdict`]. Its bands propagate the same way.
     ///
     /// # Why the curvature is scaled first
@@ -1093,6 +1206,173 @@ impl SelectionDerivatives {
                 });
             }
         }
+        // The reductions: `P` relaxed exactly, the rest kept in the box.
+        let entry_band = Array2::from_shape_fn((dimension, dimension), |(row, column)| {
+            band(summand(free[row], free[column])) / (scaling[row] * scaling[column])
+        });
+        // Each scale's reach in `Dδ` below and above the point.
+        let sides: Vec<(f64, f64)> = free
+            .iter()
+            .zip(&scaling)
+            .map(|(&axis, scale)| {
+                let (low, high) = windows[axis];
+                (
+                    -coordinates.step(low - point[axis]) * scale,
+                    coordinates.step(high - point[axis]) * scale,
+                )
+            })
+            .collect();
+        'reductions: for relaxed in 0..(1_usize << dimension) {
+            let (inner, outer): (Vec<usize>, Vec<usize>) =
+                (0..dimension).partition(|&slot| relaxed & (1 << slot) != 0);
+            let mut lambda_sq = 0.0_f64;
+            let mut band_lambda_sq = 0.0_f64;
+            let (mut retained, mut flat) = (0usize, 0usize);
+            let mut slope: Vec<f64> = outer.iter().map(|&slot| gradient[slot]).collect();
+            let mut slope_band: Vec<f64> = outer.iter().map(|&slot| gradient_band[slot]).collect();
+            let mut reduced = Array2::from_shape_fn((outer.len(), outer.len()), |(row, column)| {
+                curvature[[outer[row], outer[column]]]
+            });
+            let mut reduced_band =
+                Array2::from_shape_fn((outer.len(), outer.len()), |(row, column)| {
+                    entry_band[[outer[row], outer[column]]]
+                });
+            let mut inner_resolution = 0.0_f64;
+            if !inner.is_empty() {
+                let block = Array2::from_shape_fn((inner.len(), inner.len()), |(row, column)| {
+                    curvature[[inner[row], inner[column]]]
+                });
+                let Ok((values, vectors)) =
+                    gam_linalg::faer_ndarray::strict_symmetric_eigh(&block, faer::Side::Lower)
+                else {
+                    continue;
+                };
+                let mut block_sums = 0.0_f64;
+                for &row in &inner {
+                    for &column in &inner {
+                        let sum =
+                            summand(free[row], free[column]) / (scaling[row] * scaling[column]);
+                        block_sums += sum * sum;
+                    }
+                }
+                inner_resolution =
+                    gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values.to_vec())
+                        + band(block_sums.sqrt());
+                for direction in 0..inner.len() {
+                    let (mut coordinate, mut propagated, mut magnitude) =
+                        (0.0_f64, 0.0_f64, 0.0_f64);
+                    for (position, &slot) in inner.iter().enumerate() {
+                        let weight = vectors[[position, direction]];
+                        coordinate += weight * gradient[slot];
+                        propagated += weight.abs() * gradient_band[slot];
+                        magnitude += (weight * gradient[slot]).abs();
+                    }
+                    let coordinate_band = propagated + projection_growth * magnitude;
+                    // `w = K_{NP} v`, the direction's coupling to the kept scales.
+                    let couplings: Vec<(f64, f64)> = outer
+                        .iter()
+                        .map(|&kept| {
+                            let (mut coupling, mut propagated, mut magnitude) =
+                                (0.0_f64, 0.0_f64, 0.0_f64);
+                            for (position, &slot) in inner.iter().enumerate() {
+                                let weight = vectors[[position, direction]];
+                                coupling += weight * curvature[[kept, slot]];
+                                propagated += weight.abs() * entry_band[[kept, slot]];
+                                magnitude += (weight * curvature[[kept, slot]]).abs();
+                            }
+                            (coupling, propagated + projection_growth * magnitude)
+                        })
+                        .collect();
+                    let value = values[direction];
+                    if value < -inner_resolution {
+                        // A relaxed scale along negative curvature is unbounded below.
+                        continue 'reductions;
+                    }
+                    if value <= inner_resolution {
+                        // So is a flat direction with a resolved slope or coupling.
+                        if coordinate.abs() > coordinate_band
+                            || couplings
+                                .iter()
+                                .any(|&(coupling, coupling_band)| coupling.abs() > coupling_band)
+                        {
+                            continue 'reductions;
+                        }
+                        flat += 1;
+                        continue;
+                    }
+                    retained += 1;
+                    lambda_sq += coordinate * coordinate / value;
+                    band_lambda_sq += 2.0 * coordinate.abs() * coordinate_band / value
+                        + coordinate * coordinate * inner_resolution / (value * value);
+                    for (row, &(left, left_band)) in couplings.iter().enumerate() {
+                        let shift = left * coordinate / value;
+                        slope[row] -= shift;
+                        slope_band[row] +=
+                            (left_band * coordinate.abs() + left.abs() * coordinate_band) / value
+                                + shift.abs() * (inner_resolution / value + projection_growth);
+                        for (column, &(right, right_band)) in couplings.iter().enumerate() {
+                            let shift = left * right / value;
+                            reduced[[row, column]] -= shift;
+                            reduced_band[[row, column]] +=
+                                (left_band * right.abs() + left.abs() * right_band) / value
+                                    + shift.abs() * (inner_resolution / value + projection_growth);
+                        }
+                    }
+                }
+            }
+            for (row, &slot) in outer.iter().enumerate() {
+                let (below, above) = sides[slot];
+                let reach = if slope[row] < 0.0 {
+                    above
+                } else if slope[row] > 0.0 {
+                    below
+                } else {
+                    0.0
+                };
+                lambda_sq += 2.0 * slope[row].abs() * reach;
+                band_lambda_sq += 2.0 * slope_band[row] * below.max(above);
+            }
+            let mut reduced_resolution = inner_resolution;
+            if !outer.is_empty() {
+                let Ok((values, _)) =
+                    gam_linalg::faer_ndarray::strict_symmetric_eigh(&reduced, faer::Side::Lower)
+                else {
+                    continue;
+                };
+                reduced_resolution =
+                    gam_linalg::roundoff::symmetric_spectrum_rounding_band(&values.to_vec())
+                        + reduced_band
+                            .iter()
+                            .map(|entry| entry * entry)
+                            .sum::<f64>()
+                            .sqrt();
+                let least = values.iter().copied().fold(f64::INFINITY, f64::min);
+                if least < -reduced_resolution {
+                    let extent = outer
+                        .iter()
+                        .map(|&slot| {
+                            let (below, above) = sides[slot];
+                            below.max(above) * below.max(above)
+                        })
+                        .sum::<f64>();
+                    lambda_sq += -least * extent;
+                    band_lambda_sq += reduced_resolution * extent;
+                }
+            }
+            band_lambda_sq += quotient_growth * lambda_sq;
+            if best.is_none_or(|kept| {
+                lambda_sq + band_lambda_sq < kept.lambda_sq + kept.band_lambda_sq
+            }) {
+                best = Some(DecrementEvidence {
+                    lambda_sq,
+                    band_lambda_sq,
+                    band_f: objective,
+                    retained,
+                    flat,
+                    curvature_resolution: reduced_resolution,
+                });
+            }
+        }
         // The split that walls every scale has `t_F = 0` and is always bounded.
         let evidence = best?;
         Some(
@@ -1133,6 +1413,14 @@ impl ModelCoordinates {
         match self {
             Self::LogScales => distance,
             Self::Scales => distance.exp_m1(),
+        }
+    }
+
+    /// The move in `ρ` for a model step, the inverse of [`Self::step`].
+    fn distance(self, step: f64) -> f64 {
+        match self {
+            Self::LogScales => step,
+            Self::Scales => step.ln_1p(),
         }
     }
 }
@@ -2605,26 +2893,53 @@ impl SmoothLrSelectionReplay {
     ///
     /// The draw starts at the fitted point, clamped into each open window, and
     /// descends the criterion over the open scales jointly, inside their windows,
-    /// by trust-region Newton on its exact gradient and Hessian in `ρ`. Each
-    /// iterate is first put to [`SelectionDerivatives::stationarity_verdict`],
-    /// and the certificate is the only way the descent succeeds: the decrease the
-    /// quadratic model can still reach inside the windows is below the
-    /// criterion's own rounding band, so the point is a stationary point of the
-    /// box-constrained criterion to working precision.
+    /// by trust-region Newton on its exact derivatives. Each iterate is first put
+    /// to [`SelectionDerivatives::stationarity_verdict`], and the certificate is
+    /// the only way the descent succeeds: the decrease the quadratic model can
+    /// still reach inside the windows is below the criterion's own rounding band,
+    /// so the point is a stationary point of the box-constrained criterion to
+    /// working precision.
     ///
-    /// Otherwise the scales a wall does not hold take the exact minimizer of the
-    /// Newton model inside the radius ([`trust_region_step`]), projected onto
-    /// the windows. The model's predicted decrease is priced on that projected
-    /// step, and [`opt::TrustRegionPolicy::classic`] accepts a trial that lowers
-    /// the criterion by a fraction of it and sizes the next radius. The radius
-    /// starts at, and never exceeds, the windows' diameter.
+    /// # The step
     ///
-    /// There is no iteration budget and no radius floor. An accepted step lowers
-    /// the criterion, which is bounded below on the box, so the descent cannot
-    /// cycle. A rejected step shrinks the radius, and a radius too small to move
-    /// the point in floating point ends the draw as `SelectionUnresolved`, as
-    /// does a point the factorizations cannot price. Neither is ever replaced by
-    /// the best point reached.
+    /// The step is taken in the same two coordinates the certificate reads, `ρ`
+    /// with the Hessian `H` and the relative step in `λ = e^ρ` with the
+    /// curvature `K`, each with its own radius. In each, the scales a wall does
+    /// not hold take the exact minimizer of that model inside its radius
+    /// ([`trust_region_step`]), clamped into the windows in that model's
+    /// coordinates and mapped back to `ρ`. The two differ where it matters. Up
+    /// the upper-tail plateau `f ≈ a + b e^{−ρ}` the model in `ρ` moves a scale
+    /// by one each step; the model in `λ` sees a flat line. Down the lower tail
+    /// the criterion is quadratic in `λ` and flattens as `e^ρ` in `ρ`, so the
+    /// model in `λ` reaches its minimum in one step where the model in `ρ` needs
+    /// many. Each model's predicted decrease is priced on its own projected step,
+    /// and the trial is the step with the larger one (the step in `ρ` on a tie).
+    ///
+    /// [`opt::TrustRegionPolicy::classic`] accepts the trial when it lowers the
+    /// criterion by a fraction of that prediction, and sizes the radius of the
+    /// model that proposed it. A radius starts at, and never exceeds, the
+    /// windows' diameter in its coordinates, seen from the current point.
+    ///
+    /// # What a step lowers
+    ///
+    /// The decrease is measured by [`SelectionDerivatives::decrease_to`]. Near a
+    /// flat minimum the criterion's value is resolved only to its rounding band
+    /// while its gradient and Hessian still resolve the slope, so a difference of
+    /// computed values inside that band reads noise, and trusting it rejects a
+    /// true descent as often as it accepts a false one. There the decrease is
+    /// read from the exact derivatives at the step's two ends by the corrected
+    /// trapezoid rule, and a decrease that neither reading resolves is no
+    /// decrease, so the trial is rejected.
+    ///
+    /// There is no iteration budget and no radius floor. Every accepted step
+    /// lowers the criterion by a resolved amount: a resolved difference of its
+    /// values, or a resolved integral of its derivatives along the step, whose
+    /// remainder is fifth order in the step. The criterion is bounded below on
+    /// the box, so the descent does not cycle. A rejected trial shrinks the
+    /// radius of the model that proposed it, and once neither model's radius
+    /// moves the point in floating point the draw ends as `SelectionUnresolved`,
+    /// as does a point the factorizations cannot price. Neither is ever replaced
+    /// by the best point reached.
     ///
     /// # Why the descent is not `opt`'s
     ///
@@ -2635,7 +2950,8 @@ impl SmoothLrSelectionReplay {
     /// there, and [`opt::NewtonTrustRegion`] takes the unshifted Newton step of an
     /// indefinite Hessian. Both stop short of a certifiable point on the fixtures
     /// below. This subproblem is solved exactly on the Hessian's own spectrum,
-    /// with no absolute scale anywhere.
+    /// with no absolute scale anywhere. `opt`'s policies also price a step only
+    /// by the difference of computed values, which is noise at a flat minimum.
     ///
     /// The selection is a deterministic function of the draw, and the observation
     /// goes through the same function, so the replay's law is the law of the
@@ -2666,20 +2982,25 @@ impl SmoothLrSelectionReplay {
         if open.is_empty() {
             return Ok(());
         }
-        let diameter = open
-            .iter()
-            .map(|&axis| {
-                let (low, high) = log_scale_windows[axis];
-                (high - low) * (high - low)
-            })
-            .sum::<f64>()
-            .sqrt();
-        let policy = opt::TrustRegionPolicy::classic(diameter);
-        let mut radius = diameter;
+        let models = [ModelCoordinates::LogScales, ModelCoordinates::Scales];
+        // The windows' diameter in a model's coordinates, seen from `point`.
+        let diameter = |model: ModelCoordinates, point: &[f64]| {
+            open.iter()
+                .map(|&axis| {
+                    let (low, high) = log_scale_windows[axis];
+                    let reach = model.step(high - point[axis]) - model.step(low - point[axis]);
+                    reach * reach
+                })
+                .sum::<f64>()
+                .sqrt()
+        };
+        let mut radii = models.map(|model| diameter(model, selected));
         let mut current = factor
             .derivatives(geometry, coordinates)
             .ok_or(SelectionUnresolved)?;
         let mut trial = selected.to_vec();
+        let mut best_trial = selected.to_vec();
+        let mut segment = vec![0.0_f64; selected.len()];
         loop {
             // `factor` is at `selected` whenever the verdict is read.
             match current.stationarity_verdict(selected, log_scale_windows, &open) {
@@ -2702,51 +3023,90 @@ impl SmoothLrSelectionReplay {
                 })
                 .collect();
             let gradient = Array1::from_iter(free.iter().map(|&axis| current.gradient[axis]));
-            let hessian = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
-                current.hessian[[free[row], free[column]]]
-            });
-            let (eigenvalues, eigenvectors) =
-                gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
-                    .map_err(|_| SelectionUnresolved)?;
+            let mut spectra = Vec::with_capacity(models.len());
+            for (&model, radius) in models.iter().zip(&mut radii) {
+                let full = match model {
+                    ModelCoordinates::LogScales => &current.hessian,
+                    ModelCoordinates::Scales => &current.curvature,
+                };
+                let curvature = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
+                    full[[free[row], free[column]]]
+                });
+                let (eigenvalues, eigenvectors) =
+                    gam_linalg::faer_ndarray::strict_symmetric_eigh(&curvature, faer::Side::Lower)
+                        .map_err(|_| SelectionUnresolved)?;
+                let reach = diameter(model, selected);
+                *radius = radius.min(reach);
+                spectra.push((
+                    curvature,
+                    eigenvalues,
+                    eigenvectors,
+                    opt::TrustRegionPolicy::classic(reach),
+                ));
+            }
             loop {
-                let (step, on_boundary) =
-                    trust_region_step(&eigenvalues, &eigenvectors, &gradient, radius);
-                for (slot, &axis) in free.iter().enumerate() {
-                    let (low, high) = log_scale_windows[axis];
-                    trial[axis] = (selected[axis] + step[slot]).clamp(low, high);
+                // The trial of the model that predicts the larger decrease.
+                let mut best: Option<(usize, f64, f64, bool)> = None;
+                for (slot, &model) in models.iter().enumerate() {
+                    let (curvature, eigenvalues, eigenvectors, _) = &spectra[slot];
+                    let (step, on_boundary) =
+                        trust_region_step(eigenvalues, eigenvectors, &gradient, radii[slot]);
+                    trial.copy_from_slice(selected);
+                    for (index, &axis) in free.iter().enumerate() {
+                        let (low, high) = log_scale_windows[axis];
+                        let inside = step[index].clamp(
+                            model.step(low - selected[axis]),
+                            model.step(high - selected[axis]),
+                        );
+                        trial[axis] = (selected[axis] + model.distance(inside)).clamp(low, high);
+                    }
+                    if trial == selected {
+                        continue;
+                    }
+                    let projected = Array1::from_iter(
+                        free.iter()
+                            .map(|&axis| model.step(trial[axis] - selected[axis])),
+                    );
+                    let predicted = -(gradient.dot(&projected)
+                        + 0.5 * projected.dot(&curvature.dot(&projected)));
+                    if best.is_none_or(|(_, leading, _, _)| predicted > leading) {
+                        best = Some((slot, predicted, step.dot(&step).sqrt(), on_boundary));
+                        best_trial.copy_from_slice(&trial);
+                    }
                 }
-                if trial == selected {
+                let Some((slot, predicted, step_norm, on_boundary)) = best else {
                     return Err(SelectionUnresolved);
-                }
-                let projected =
-                    Array1::from_iter(free.iter().map(|&axis| trial[axis] - selected[axis]));
-                let predicted =
-                    -(gradient.dot(&projected) + 0.5 * projected.dot(&hessian.dot(&projected)));
-                let candidate = if factor.refactor(geometry, &trial) {
+                };
+                let candidate = if factor.refactor(geometry, &best_trial) {
                     factor.derivatives(geometry, coordinates)
                 } else {
                     None
                 };
+                for (moved, (&to, &from)) in
+                    segment.iter_mut().zip(best_trial.iter().zip(&*selected))
+                {
+                    *moved = to - from;
+                }
+                // An unresolved decrease is no evidence of one, and is rejected.
                 let actual = candidate.as_ref().map_or(f64::NEG_INFINITY, |candidate| {
-                    current.value - candidate.value
+                    current.decrease_to(candidate, &segment).unwrap_or(0.0)
                 });
-                let decision = policy.update(
-                    radius,
-                    step.dot(&step).sqrt(),
+                let decision = spectra[slot].3.update(
+                    radii[slot],
+                    step_norm,
                     on_boundary,
                     actual,
                     predicted,
                     current.value,
                 );
-                radius = decision.new_radius;
+                radii[slot] = decision.new_radius;
                 if decision.accepted
                     && let Some(candidate) = candidate
                 {
-                    selected.copy_from_slice(&trial);
+                    selected.copy_from_slice(&best_trial);
                     current = candidate;
                     break;
                 }
-                trial.copy_from_slice(selected);
             }
         }
     }
@@ -3297,11 +3657,11 @@ fn split_mix64(state: u64) -> u64 {
 #[cfg(test)]
 mod selection_replay_tests {
     use super::{
-        DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDrawStream, SelectionFactor,
-        SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline, SmoothLrSelectionReplay,
-        split_mix64, wald_conditional_tail,
+        DiagonalCriterion, SMOOTH_LR_SELECTION_DRAWS, SelectionDerivatives, SelectionDrawStream,
+        SelectionFactor, SelectionGeometry, SmoothLrSelection, SmoothLrSelectionDecline,
+        SmoothLrSelectionReplay, split_mix64, wald_conditional_tail,
     };
-    use ndarray::Array2;
+    use ndarray::{Array1, Array2};
 
     /// A shrunk-smooth generalized spectrum: one direction the data can still
     /// see and a geometric tail the penalty has taken.
@@ -3375,6 +3735,65 @@ mod selection_replay_tests {
                 );
             }
         }
+    }
+
+    /// Down a lower tail the criterion is `V + ½k(λ − λ*)²`, the shape of a Gamma
+    /// null draw's shrunk scale near `ρ = −28`: between two nearby `ρ` its value
+    /// moves by a few ulps of `V`, while its derivatives are resolved to their own
+    /// tiny summands. The difference of the computed values is off by an eighth
+    /// there, and trusting it rejected every step toward the minimum. The decrease
+    /// must be read from the derivatives, to the corrected trapezoid rule's
+    /// fifth-order remainder, in both senses; a resolved difference is kept as is.
+    #[test]
+    fn a_decrease_inside_the_value_band_is_read_from_the_derivatives() {
+        let (offset, scale, target) = (8.39_f64, 1.17e11_f64, (-28.0_f64).exp());
+        let at = |rho: f64| {
+            let lambda = rho.exp();
+            let gradient = scale * (lambda - target) * lambda;
+            let curvature = scale * lambda * lambda;
+            SelectionDerivatives {
+                value: offset + 0.5 * scale * (lambda - target).powi(2),
+                value_sum: offset,
+                gradient: Array1::from_elem(1, gradient),
+                gradient_sums: Array1::from_elem(1, 2.0 * gradient.abs()),
+                hessian: Array2::from_elem((1, 1), curvature + gradient),
+                curvature: Array2::from_elem((1, 1), curvature),
+                curvature_summands: Array2::from_elem((1, 1), 2.0 * curvature),
+                depth: 1000,
+            }
+        };
+        let exact = |from: f64, to: f64| {
+            0.5 * scale * ((from.exp() - target).powi(2) - (to.exp() - target).powi(2))
+        };
+        let (start, end) = (-29.4_f64, -29.0_f64);
+        let (here, there) = (at(start), at(end));
+        let truth = exact(start, end);
+        let computed = here.value - there.value;
+        assert!(
+            (computed - truth).abs() > 0.1 * truth,
+            "the fixture's value difference {computed:e} resolves the decrease {truth:e}"
+        );
+        let forward = here
+            .decrease_to(&there, &[end - start])
+            .expect("the derivatives resolve the decrease");
+        assert!(
+            (forward - truth).abs() <= 1.0e-3 * truth,
+            "decrease {forward:e} against the exact {truth:e}"
+        );
+        let backward = there
+            .decrease_to(&here, &[start - end])
+            .expect("the derivatives resolve the increase");
+        assert!(
+            (backward + truth).abs() <= 1.0e-3 * truth,
+            "increase {backward:e} against the exact {:e}",
+            -truth
+        );
+        let far = at(-20.0);
+        assert_eq!(
+            here.decrease_to(&far, &[-20.0 - start]),
+            Some(here.value - far.value),
+            "a resolved difference of values is the decrease"
+        );
     }
 
     /// #2902: on a tail plateau the two log-determinant spectra come in near-equal
