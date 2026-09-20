@@ -293,7 +293,7 @@ impl PredictionTransform for DispersionLocationScalePredictor {
         self.strategy().inverse_link_array(eta.view())
     }
 
-    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
         // Both passes transform the mean-block η endpoints through the
         // inverse link, so the band lies in the family's support.
         Ok(ResponseInterval::TransformEta(EtaDomain::of_spec(

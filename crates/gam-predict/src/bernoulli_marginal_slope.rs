@@ -262,19 +262,10 @@ impl PredictionTransform for BernoulliMarginalSlopePredictor {
         self.mean_from_eta(eta)
     }
 
-    fn response_jacobian_rows(
-        &self,
-        pass: PredictPass,
-    ) -> Result<ResponseInterval, EstimationError> {
-        match pass {
-            // Both passes push the η endpoints through the marginal-slope
-            // response map `Φ(η)`, defined on the whole line. Spelled out per
-            // pass so a new one has to state its policy here rather than
-            // inherit this one silently.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                Ok(ResponseInterval::TransformEta(EtaDomain::Unrestricted))
-            }
-        }
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+        // The η endpoints go through the marginal-slope response map `Φ(η)`,
+        // defined on the whole line.
+        Ok(ResponseInterval::TransformEta(EtaDomain::Unrestricted))
     }
 
     fn bounds(&self) -> ResponseBounds {

@@ -258,7 +258,7 @@ impl PredictionTransform for StandardPredictor {
         strategy.inverse_link_array(eta.view())
     }
 
-    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
         // Both passes report the image of the wiggled-η interval
         // `η ± z·SE(η)` under the monotone inverse link. The wiggle is already
         // inside η and its SE carries the warp chain rule exactly, so the band

@@ -502,7 +502,7 @@ impl PredictionTransform for BinomialLocationScalePredictor {
             .map(Array1::from_vec)
     }
 
-    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
         // The probability is a monotone inverse-link image of the link
         // argument `eta = wiggle(-eta_t·e^{-eta_s})` on both passes, so the
         // band is the image of `eta ± z·SE(eta)` and lies in `[0, 1]`.

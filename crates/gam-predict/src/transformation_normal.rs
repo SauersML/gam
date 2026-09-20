@@ -156,19 +156,11 @@ impl PredictionTransform for TransformationNormalPredictor {
         ResponseFamily::Gaussian
     }
 
-    fn response_jacobian_rows(
-        &self,
-        pass: PredictPass,
-    ) -> Result<ResponseInterval, EstimationError> {
-        match pass {
-            // `response` is the identity here (the offset already carries the
-            // response-scale conditional mean), so there is no link to
-            // transform through in either pass: an η
-            // interval already IS the response interval.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                Ok(ResponseInterval::IdentityEta)
-            }
-        }
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+        // `response` is the identity here (the offset already carries the
+        // response-scale conditional mean), so there is no link to transform
+        // through: an η interval already IS the response interval.
+        Ok(ResponseInterval::IdentityEta)
     }
     fn point_state(&self, input: &PredictInput) -> Result<LinearState, EstimationError> {
         // This is the explicit plug-in state: the offset carries the precomputed

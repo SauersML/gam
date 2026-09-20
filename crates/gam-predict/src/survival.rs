@@ -389,7 +389,7 @@ impl PredictionTransform for SurvivalPredictor {
             .map(Array1::from_vec)
     }
 
-    fn response_jacobian_rows(&self, _: PredictPass) -> Result<ResponseInterval, EstimationError> {
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
         // The survival probability is a map of the two-block index `q0`, not
         // of the threshold predictor alone, so both passes band `q0` and map
         // its interval through the tail.

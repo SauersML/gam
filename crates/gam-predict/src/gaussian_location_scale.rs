@@ -309,20 +309,11 @@ impl PredictionTransform for GaussianLocationScalePredictor {
         Ok(eta.clone())
     }
 
-    fn response_jacobian_rows(
-        &self,
-        pass: PredictPass,
-    ) -> Result<ResponseInterval, EstimationError> {
-        match pass {
-            // The response IS the linear predictor (identity link), so the
-            // response interval is exactly the η interval on both passes —
-            // there is no transform to apply either way. Spelled
-            // out per pass so a new one has to state its policy here rather
-            // than inherit this one silently.
-            PredictPass::FullUncertainty | PredictPass::PosteriorMean => {
-                Ok(ResponseInterval::IdentityEta)
-            }
-        }
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError> {
+        // The response IS the linear predictor (identity link), so the
+        // response interval is exactly the η interval: there is no transform
+        // to apply.
+        Ok(ResponseInterval::IdentityEta)
     }
 
     fn bounds(&self) -> ResponseBounds {

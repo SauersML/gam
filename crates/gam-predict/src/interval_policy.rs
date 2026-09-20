@@ -556,9 +556,11 @@ pub(crate) fn assemble_posterior_mean_bounds(
 /// in the two passes (notably the threshold-scale probability families, whose
 /// posterior mean is a bivariate Gauss–Hermite integral rather than the plug-in
 /// delta evaluation used for full uncertainty). The pass is threaded into
-/// [`PredictionTransform::linear_state`] and
-/// [`PredictionTransform::response_jacobian_rows`] so the family can branch its
-/// numerics and its interval policy while the assembly stays unified.
+/// [`PredictionTransform::linear_state`] so the family can branch its numerics
+/// while the assembly stays unified. The interval policy does not depend on the
+/// pass: every mean band is the image of an index interval under the family's
+/// monotone response map (#3140), so
+/// [`PredictionTransform::response_jacobian_rows`] takes no pass.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PredictPass {
     /// `predict_full_uncertainty`: η/μ point + η- and mean-scale SEs, with the
@@ -692,12 +694,11 @@ pub trait PredictionTransform {
     fn response(&self, argument: &Array1<f64>) -> Result<Array1<f64>, EstimationError>;
 
     /// Which [`ResponseInterval`] policy maps the index interval onto the
-    /// response scale for `pass`. An error when the transform's link has no
-    /// recorded feasible argument set.
-    fn response_jacobian_rows(
-        &self,
-        pass: PredictPass,
-    ) -> Result<ResponseInterval, EstimationError>;
+    /// response scale. It is the same on both passes: the band is the image of
+    /// an index interval under [`response`](PredictionTransform::response).
+    /// An error when the transform's link has no recorded feasible argument
+    /// set.
+    fn response_jacobian_rows(&self) -> Result<ResponseInterval, EstimationError>;
 
     /// Response-scale support `[lo, hi]` the symmetric observation band is
     /// clamped to. The mean band never consults it: it is an image of the
@@ -864,7 +865,7 @@ pub(crate) fn predict_full_uncertainty_generic<T: PredictionTransform>(
             "full uncertainty requires covariance (mean_se unavailable)".to_string(),
         )
     })?;
-    let policy = transform.response_jacobian_rows(PredictPass::FullUncertainty)?;
+    let policy = transform.response_jacobian_rows()?;
     let response_index = state.response_index;
     let response_map = move |argument: &Array1<f64>| transform.response(argument);
     let reference = IntervalReference::of_fit(fit)?;
@@ -961,7 +962,7 @@ pub(crate) fn predict_posterior_mean_generic<T: PredictionTransform>(
         PredictPass::PosteriorMean,
         InferenceCovarianceMode::Conditional,
     )?;
-    let policy = transform.response_jacobian_rows(PredictPass::PosteriorMean)?;
+    let policy = transform.response_jacobian_rows()?;
     let has_covariance = state.eta_se.is_some();
     let cond_eta_se = state
         .eta_se
