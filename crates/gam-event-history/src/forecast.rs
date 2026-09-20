@@ -410,7 +410,7 @@ fn observed_state(
     )?;
     let last = observed.subjects[0].len() - 1;
     Ok(LatentState {
-        grid: pass.grids.pop().expect("at least one node"),
+        grid: std::sync::Arc::unwrap_or_clone(pass.grids.pop().expect("at least one node")),
         alpha: pass.alpha.pop().expect("at least one node"),
         time: observed.subjects[0].times[last],
     })
@@ -660,7 +660,7 @@ impl WindowIntegrand<'_> {
                 log_decrement: pass.log_normalisers.iter().sum(),
                 sub_densities,
                 state: Some(LatentState {
-                    grid: pass.grids.pop().expect("cell has nodes"),
+                    grid: std::sync::Arc::unwrap_or_clone(pass.grids.pop().expect("cell has nodes")),
                     alpha: pass.alpha.pop().expect("cell has nodes"),
                     time: outer_times[q - 1],
                 }),
@@ -1094,10 +1094,14 @@ pub fn predictive_pit(
         },
         &vec![true; marks],
     )?;
-    let spell_pit = |log_survival: f64, t: f64| -> Result<f64, EventHistoryError> {
+    // The survival carries its log's roundoff scaled by the survival, and
+    // `expm1` adds `ε` of its own result; a PIT below zero by more than that
+    // is a survival above one that the arithmetic cannot account for. `−expm1`
+    // never exceeds one.
+    let spell_pit = |log_survival: f64, log_survival_roundoff: f64, t: f64| -> Result<f64, EventHistoryError> {
         let pit = -log_survival.exp_m1();
-        let slack = 64.0 * f64::EPSILON;
-        if !pit.is_finite() || pit < -slack || pit > 1.0 + slack {
+        let roundoff = log_survival.exp() * log_survival_roundoff + f64::EPSILON * pit.abs();
+        if !pit.is_finite() || roundoff.is_nan() || pit < -roundoff || pit > 1.0 {
             return Err(EventHistoryError::NumericalFailure {
                 reason: format!(
                     "subject {:?}: predictive survival to {t} is {}, outside [0, 1]",
@@ -1119,7 +1123,7 @@ pub fn predictive_pit(
             pits.push(SpellPit {
                 time: history.exit,
                 observed: false,
-                pit: spell_pit(spell.log_survival, history.exit)?,
+                pit: spell_pit(spell.log_survival, spell.log_survival_roundoff, history.exit)?,
                 marks: Vec::new(),
                 mark_probabilities: vec![0.0; marks],
             });
@@ -1127,7 +1131,7 @@ pub fn predictive_pit(
         };
         let n = spell.node;
         let t = subject.times[n];
-        let pit = spell_pit(spell.log_survival, t)?;
+        let pit = spell_pit(spell.log_survival, spell.log_survival_roundoff, t)?;
         let at_risk: Vec<f64> = (0..marks)
             .map(|d| {
                 if history.at_risk(d, t, kinds) {
