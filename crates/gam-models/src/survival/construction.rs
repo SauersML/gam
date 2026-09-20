@@ -32,7 +32,7 @@ use gam_terms::basis::{
     BasisMetadata, BasisOptions, Dense, ISplineBoundary, KnotSource, OneDimensionalBoundary,
     bspline_derivative_penalty_matrix, build_bspline_basis_1d, create_basis,
     evaluate_bspline_derivative_scalar, ispline_modelling_interval, ispline_value,
-    ispline_value_and_first_derivative,
+    ispline_value_and_first_derivative, quantile_knot_support,
 };
 use gam_terms::inference::formula_dsl::{LinkWiggleFormulaSpec, parse_link_choice};
 use ndarray::{Array1, Array2, Array3, array, s};
@@ -1344,57 +1344,22 @@ pub fn build_survival_time_basis(
         degree: usize,
         requested_internal_knots: usize,
     ) -> usize {
-        if requested_internal_knots == 0 {
-            return 0;
-        }
         let mut sorted: Vec<f64> = combined.iter().copied().collect();
         sorted.sort_by(f64::total_cmp);
-        let minval = sorted.first().copied().unwrap_or(0.0);
-        let maxval = sorted.last().copied().unwrap_or(minval);
-        if minval == maxval {
-            // Degenerate (single distinct time): no interior structure to fit.
-            return 1.min(requested_internal_knots);
-        }
-        let scale = (maxval - minval).abs().max(1.0);
-        let tol = 1e-12 * scale;
-        // Count distinct strictly-interior points (knots can only live strictly
-        // between the data extremes).
-        let mut distinct_interior = 0usize;
-        let mut last: Option<f64> = None;
-        for &x in &sorted {
-            if x <= minval + tol || x >= maxval - tol {
-                continue;
-            }
-            if last.is_some_and(|prev| (x - prev).abs() <= tol) {
-                continue;
-            }
-            distinct_interior += 1;
-            last = Some(x);
-        }
-        // Distinct-point ceiling: cannot place more interior knots than there
-        // are distinct interior values.
-        let mut cap = requested_internal_knots.min(distinct_interior.max(1));
+        // Knots can only live on the distinct strictly-interior points, the same
+        // support `generate_full_knot_vector_quantile` places them on, so a count
+        // within it always yields strictly increasing quantile knots. With no
+        // interior support the baseline gets no interior knot.
+        let support = quantile_knot_support(&sorted);
         // Dimension-vs-resolution ceiling: keep the total baseline column count
         // `cap + degree` below ~1/4 of the distinct sample points so the
         // smoothing-parameter profile retains curvature (the data must be able
-        // to identify the baseline shape, not just interpolate it). `n_distinct`
-        // counts all distinct points (interior + the two extremes).
-        let n_distinct = {
-            let mut count = 0usize;
-            let mut last: Option<f64> = None;
-            for &x in &sorted {
-                if last.is_some_and(|prev| (x - prev).abs() <= tol) {
-                    continue;
-                }
-                count += 1;
-                last = Some(x);
-            }
-            count
-        };
-        let dim_budget = n_distinct / 4;
-        let dim_cap = dim_budget.saturating_sub(degree);
-        cap = cap.min(dim_cap.max(1));
-        cap.max(1)
+        // to identify the baseline shape, not just interpolate it). The distinct
+        // points are the interior support plus the two extremes.
+        let dim_cap = ((support.len() + 2) / 4).saturating_sub(degree);
+        requested_internal_knots
+            .min(support.len())
+            .min(dim_cap.max(1))
     }
 
     /// Infer a survival time knot vector, reporting the PUBLIC basis degree
@@ -1421,124 +1386,57 @@ pub fn build_survival_time_basis(
         let num_internal_knots =
             data_capped_internal_knots(combined, validation_degree, num_internal_knots);
 
-        fn quantile_knot_inference_needs_uniform_fallback(
-            combined: &Array1<f64>,
-            num_internal_knots: usize,
-        ) -> bool {
-            if num_internal_knots == 0 || combined.is_empty() {
-                return false;
+        let built = build_bspline_basis_1d(
+            combined.view(),
+            &BSplineBasisSpec {
+                degree: knot_degree,
+                penalty_order: 2,
+                knotspec: BSplineKnotSpec::Automatic {
+                    num_internal_knots,
+                    placement: gam_terms::basis::BSplineKnotPlacement::Quantile,
+                    adaptive: false,
+                },
+                double_penalty: false,
+                identifiability: BSplineIdentifiability::None,
+                boundary: OneDimensionalBoundary::Open,
+                boundary_conditions: BSplineBoundaryConditions::default(),
+            },
+        )
+        .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
+        let (knots, built_degree) = match built.metadata {
+            BasisMetadata::BSpline1D { knots, degree, .. } => {
+                (knots, degree.unwrap_or(knot_degree))
             }
-
-            let mut sorted: Vec<f64> = combined.iter().copied().collect();
-            sorted.sort_by(f64::total_cmp);
-            let minval = sorted[0];
-            let maxval = *sorted.last().unwrap_or(&minval);
-            if minval == maxval {
-                return false;
+            _ => {
+                return Err(
+                    "internal error: expected BSpline1D metadata for survival time basis"
+                        .to_string(),
+                );
             }
-
-            let scale = (maxval - minval).abs().max(1.0);
-            let tol = 1e-12 * scale;
-            let mut support = Vec::with_capacity(sorted.len());
-            let mut last: Option<f64> = None;
-            for &x in &sorted {
-                if x <= minval + tol || x >= maxval - tol {
-                    continue;
-                }
-                if last.map(|prev| (x - prev).abs() <= tol).unwrap_or(false) {
-                    continue;
-                }
-                support.push(x);
-                last = Some(x);
-            }
-            if support.is_empty() {
-                return true;
-            }
-
-            let n = support.len();
-            let mut prev_q = minval;
-            for j in 1..=num_internal_knots {
-                let p = j as f64 / (num_internal_knots + 1) as f64;
-                let pos = p * (n.saturating_sub(1) as f64);
-                let lo = pos.floor() as usize;
-                let hi = pos.ceil() as usize;
-                let frac = pos - lo as f64;
-                let q = if lo == hi {
-                    support[lo]
-                } else {
-                    support[lo] * (1.0 - frac) + support[hi] * frac
-                }
-                .clamp(minval, maxval);
-                if q <= prev_q + tol || q >= maxval - tol {
-                    return true;
-                }
-                prev_q = q;
-            }
-
-            false
-        }
-
-        let inferwith =
-            |placement: gam_terms::basis::BSplineKnotPlacement|
-             -> Result<(Array1<f64>, usize), String> {
-                let built = build_bspline_basis_1d(
-                    combined.view(),
-                    &BSplineBasisSpec {
-                        degree: knot_degree,
-                        penalty_order: 2,
-                        knotspec: BSplineKnotSpec::Automatic {
-                            num_internal_knots,
-                            placement,
-                            adaptive: false,
-                        },
-                        double_penalty: false,
-                        identifiability: BSplineIdentifiability::None,
-                        boundary: OneDimensionalBoundary::Open,
-                        boundary_conditions: BSplineBoundaryConditions::default(),
-                    },
-                )
-                .map_err(|e| format!("failed to infer survival time knots: {e}"))?;
-                let (knots, built_degree) = match built.metadata {
-                    BasisMetadata::BSpline1D { knots, degree, .. } => {
-                        (knots, degree.unwrap_or(knot_degree))
-                    }
-                    _ => {
-                        return Err(
-                            "internal error: expected BSpline1D metadata for survival time basis"
-                                .to_string(),
-                        );
-                    }
-                };
-                // `knot_degree` is the clamped B-spline degree used to size
-                // the knot vector. `validation_degree` is the public basis
-                // degree passed to the final evaluator. They differ for
-                // I-splines because `create_basis(..., BasisOptions::i_spline())`
-                // internally raises the public degree by one to its working
-                // B-spline antiderivative degree. Validating with
-                // `knot_degree` here would raise a second time and reject the
-                // coherent knot vector we just inferred.
-                // The caller's two degrees differ by a fixed raise: `i_spline()`
-                // lifts the public degree to its working B-spline antiderivative
-                // degree, so `knot_degree == validation_degree + raise`. When the
-                // builder shrinks the vector, the public degree has to come down
-                // by the same raise or the two stop describing one geometry.
-                let raise = knot_degree.saturating_sub(validation_degree);
-                let effective_validation_degree = built_degree.saturating_sub(raise);
-                create_basis::<Dense>(
-                    combined.view(),
-                    KnotSource::Provided(knots.view()),
-                    effective_validation_degree,
-                    basis_options,
-                )
-                .map_err(|e| e.to_string())?;
-                Ok((knots, effective_validation_degree))
-            };
-
-        if quantile_knot_inference_needs_uniform_fallback(combined, num_internal_knots) {
-            inferwith(gam_terms::basis::BSplineKnotPlacement::Uniform)
-        } else {
-            inferwith(gam_terms::basis::BSplineKnotPlacement::Quantile)
-        }
+        };
+        // `knot_degree` is the clamped B-spline degree used to size
+        // the knot vector. `validation_degree` is the public basis
+        // degree passed to the final evaluator. They differ for
+        // I-splines because `create_basis(..., BasisOptions::i_spline())`
+        // internally raises the public degree by one to its working
+        // B-spline antiderivative degree. Validating with
+        // `knot_degree` here would raise a second time and reject the
+        // coherent knot vector we just inferred.
+        // The caller's two degrees differ by a fixed raise: `i_spline()`
+        // lifts the public degree to its working B-spline antiderivative
+        // degree, so `knot_degree == validation_degree + raise`. When the
+        // builder shrinks the vector, the public degree has to come down
+        // by the same raise or the two stop describing one geometry.
+        let raise = knot_degree.saturating_sub(validation_degree);
+        let effective_validation_degree = built_degree.saturating_sub(raise);
+        create_basis::<Dense>(
+            combined.view(),
+            KnotSource::Provided(knots.view()),
+            effective_validation_degree,
+            basis_options,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok((knots, effective_validation_degree))
     }
 
     /// Knot vector only, for the callers whose consumer degree is the one they
@@ -7849,5 +7747,96 @@ mod tests {
             interior.iter().any(|value| *value > 1.0e-9),
             "an interior anchor must still evaluate the basis, got {interior:?}"
         );
+    }
+
+    /// #3179 item 7: survival places its inferred time knots with the shared
+    /// quantile builder on the shared exact support, so tied event times give
+    /// the same knot vector `gam_terms::basis::auto_knot_vector_1d_quantile`
+    /// gives, with no interior knot count beyond the distinct interior times.
+    #[test]
+    fn survival_time_knots_are_the_shared_quantile_placement_on_tied_times_3179() {
+        use gam_terms::basis::{auto_knot_vector_1d_quantile, quantile_knot_support};
+        // 40 distinct exit times, each observed three times; every entry is at
+        // the origin, so the knot input is the log exit times alone.
+        let distinct: Vec<f64> = (1..=40)
+            .map(|i| 0.5 + 0.37 * (i as f64).powf(1.3))
+            .collect();
+        let age_exit: Array1<f64> = distinct
+            .iter()
+            .flat_map(|&t| std::iter::repeat(t).take(3))
+            .collect();
+        let age_entry = Array1::<f64>::zeros(age_exit.len());
+        let build = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
+            },
+            Some(8),
+        )
+        .expect("ispline time basis builds on tied exit times");
+        let knots = build
+            .knots
+            .expect("an inferred ispline basis reports its knots");
+
+        // The i-spline's working B-spline degree is the public degree plus one.
+        let knot_degree = 4;
+        let interior_count = knots.len() - 2 * (knot_degree + 1);
+        let log_exit = age_exit.mapv(f64::ln);
+        let mut sorted = log_exit.to_vec();
+        sorted.sort_by(f64::total_cmp);
+        let support = quantile_knot_support(&sorted);
+        assert_eq!(support.len(), 38, "38 distinct strictly interior log times");
+        assert!(interior_count >= 1 && interior_count <= support.len());
+        let interior = &knots[knot_degree + 1..knot_degree + 1 + interior_count];
+        assert!(
+            interior.windows(2).all(|w| w[0] < w[1]),
+            "interior knots must increase strictly, got {interior:?}"
+        );
+
+        let shared = auto_knot_vector_1d_quantile(log_exit.view(), interior_count, knot_degree)
+            .expect("shared quantile placement");
+        assert!(!shared.shrunk);
+        assert_eq!(
+            knots,
+            shared.knots.to_vec(),
+            "survival must place its time knots with the shared quantile builder"
+        );
+    }
+
+    /// #3179 item 7: with only two distinct times there is no interior time to
+    /// place a knot on, so the inferred baseline gets no interior knot. The
+    /// deleted Uniform fallback placed one at the midpoint, where no data lie.
+    #[test]
+    fn survival_time_knots_without_interior_support_have_no_interior_knot_3179() {
+        let age_exit: Array1<f64> = (0..12)
+            .map(|i| if i % 2 == 0 { 1.0 } else { 2.0 })
+            .collect();
+        let age_entry = Array1::<f64>::zeros(age_exit.len());
+        let build = build_survival_time_basis(
+            &age_entry,
+            &age_exit,
+            SurvivalTimeBasisConfig::ISpline {
+                degree: 3,
+                knots: Array1::zeros(0),
+                keep_cols: Vec::new(),
+            },
+            Some(4),
+        )
+        .expect("ispline time basis builds on two distinct exit times");
+        let knots = build
+            .knots
+            .expect("an inferred ispline basis reports its knots");
+        let knot_degree = 4;
+        assert_eq!(
+            knots.len(),
+            2 * (knot_degree + 1),
+            "no interior knot without interior support, got {knots:?}"
+        );
+        let (lo, hi) = (1.0_f64.ln(), 2.0_f64.ln());
+        assert!(knots[..=knot_degree].iter().all(|&k| k == lo));
+        assert!(knots[knot_degree + 1..].iter().all(|&k| k == hi));
     }
 }
