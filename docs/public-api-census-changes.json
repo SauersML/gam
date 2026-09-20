@@ -4980,5 +4980,13 @@
     },
     "reason": "#4376: the canonical breakpoint search owns the left-span convention already required by both cubic deviation runtimes. Remove the unused right-span wrapper and duplicated post-adjustments. The retired right-span-only test is replaced by left-span and independent interval-membership tests.",
     "evidence": "MSI complete runtime unit binary compiles with warnings denied in3.38sec. Nine span tests, eight cgroup tests and26 downstream resource-policy tests pass, including adjacent-float interval membership and216 wide-integer counter combinations. All27 production crates compile coherently on main6f9de4f plus revised4378/4382; complete model unit-source metadata is checked separately. Source census finds no remaining calls to the retired constructor, refusal variant or span wrapper."
+  },
+  {
+    "base": "41dddc29be5a862289c6c8b6179fb0555b1c303f",
+    "removed": {
+      "crates/gam-sae/src/migration_ledger.rs::is_pc_reseed": 1
+    },
+    "reason": "Remove a crate-visible predicate for an enum variant no production path constructs, together with its unreachable counter and artificial-only self-test.",
+    "evidence": "The only caller was SaeMigrationLedger::record; that branch and the PrincipalComponent variant are deleted. All live migration accounting is covered by exact ledger tests and an actual seeded SAE fission/fusion/death integration test on MSI; complete SAE unit metadata passes with warnings denied."
   }
 ]

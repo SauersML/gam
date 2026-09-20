@@ -260,7 +260,7 @@ pub struct SaeFitReport {
     /// absent when no genuine structure search ran.
     pub structure_certificate_json: Option<String>,
     /// #2023 criterion 3: the dictionary moves this fit adjudicated, in one account,
-    /// with the `pc_reseed_events` invariant. It holds the residual-factor nursery's
+    /// including the residual-factor nursery's
     /// promotions (one curved birth each, round = the structured-residual pass that
     /// made it) and, when the structure search ran, its births, deaths and refusals.
     /// The joint fit's collapse-guard events are reported beside it

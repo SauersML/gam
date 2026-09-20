@@ -7137,8 +7137,7 @@ pub struct StructureSearchResult {
     /// birth / death / refusal priced in the shared `dl_bits` description-length
     /// unit (the e-process `log_e` banked as bits). This is a read-out of the
     /// e-process verdicts in [`Self::rounds`] — the e-BH gating is untouched and
-    /// still owns acceptance — and carries the `pc_reseed_events == 0` invariant
-    /// (structure births seed from the residual-factor pool, never a PC).
+    /// still owns acceptance. Structure births seed from the residual-factor pool.
     pub migration: SaeMigrationLedger,
 }
 
@@ -8446,8 +8445,8 @@ pub fn run_production_structure_search(
 /// honesty surface the python boundary attaches under an additive
 /// `structure_search` key. The object carries the per-round ledgers (`rounds`)
 /// and the unified migration ledger folded from them (`migration`), so a fit that
-/// ran the search reports every birth, death and refusal in one currency, with
-/// its `pc_reseed_events` invariant (#2023). Byte-deterministic for identical
+/// ran the search reports every birth, death and refusal in one currency.
+/// Byte-deterministic for identical
 /// inputs.
 pub(crate) fn rounds_to_json(
     rounds: &[SearchLedger],

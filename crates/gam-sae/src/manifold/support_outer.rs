@@ -1567,7 +1567,7 @@ pub struct SaeSupportSparseFit {
     /// support move re-routes rows among the retained atoms and can leave one with
     /// no row; that atom stays in the term, reconstructs nothing, and is recorded
     /// as a death at the end. So births are the retained atoms, deaths are every
-    /// requested atom not live at the end, and `pc_reseed_events` is `0`.
+    /// requested atom not live at the end.
     pub migration: SaeMigrationLedger,
 }
 
@@ -1700,12 +1700,10 @@ pub fn fit_sae_support_sparse(
         );
     }
     log::debug!(
-        "support-sparse migration ledger: {} births, {} deaths, {} refusals, {} \
-         principal-component reseeds",
+        "support-sparse migration ledger: {} births, {} deaths, {} refusals",
         migration.n_births,
         migration.n_deaths,
         migration.n_refusals,
-        migration.pc_reseed_events,
     );
     Ok(SaeSupportSparseFit {
         outer,
