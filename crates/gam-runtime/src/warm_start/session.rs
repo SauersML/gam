@@ -15,17 +15,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 /// failure mode this whole module exists to prevent.
 const MIN_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(2);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LoadSource {
-    Exact,
-}
-
-#[derive(Debug, Clone)]
-pub struct LoadedEntry {
-    pub entry: WarmStartEntry,
-    pub source: LoadSource,
-}
-
 #[derive(Debug)]
 pub struct Session {
     store: WarmStartStore,
@@ -87,39 +76,18 @@ impl Session {
         &self.key
     }
 
-    /// Read the best entry currently on disk for this session's key, with its
-    /// source. Lookup is read-only against the store and may return entries
-    /// from other runs (the whole point of cross-run resume).
-    pub fn try_load_with_source(&self) -> Option<LoadedEntry> {
+    /// Read the best entry currently on disk for this session's key. Lookup is
+    /// read-only against the store and may return entries from other runs
+    /// (the whole point of cross-run resume), so a caller that only asks
+    /// whether a seed exists leaves it for the optimizer's own load.
+    pub fn load(&self) -> Option<WarmStartEntry> {
         if !self.configured_store_is_available() {
             return None;
         }
         match self.store.lookup(&self.key) {
-            Ok(Some(entry)) => Some(LoadedEntry {
-                entry,
-                source: LoadSource::Exact,
-            }),
-            Ok(None) => None,
+            Ok(entry) => entry,
             Err(error) => {
                 self.record_store_error("load outer-iterate session", &error);
-                None
-            }
-        }
-    }
-
-    /// Read the currently available warm-start entry with source metadata.
-    pub fn peek_load_with_source(&self) -> Option<LoadedEntry> {
-        if !self.configured_store_is_available() {
-            return None;
-        }
-        match self.store.lookup(&self.key) {
-            Ok(Some(entry)) => Some(LoadedEntry {
-                entry,
-                source: LoadSource::Exact,
-            }),
-            Ok(None) => None,
-            Err(error) => {
-                self.record_store_error("peek outer-iterate session", &error);
                 None
             }
         }

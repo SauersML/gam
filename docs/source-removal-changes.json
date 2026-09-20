@@ -2613,5 +2613,18 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "d027be231ca8fdf6f8104690ae68869486db51ab",
+    "items": [
+      "crates/gam-runtime/src/warm_start/key.rs:fn:write_f64_slice_payload_slow",
+      "crates/gam-runtime/src/warm_start/key.rs:fn:write_f64_slice_payload_slow_iter",
+      "crates/gam-runtime/src/warm_start/session.rs:enum:LoadSource",
+      "crates/gam-runtime/src/warm_start/session.rs:fn:peek_load_with_source",
+      "crates/gam-runtime/src/warm_start/session.rs:fn:try_load_with_source",
+      "crates/gam-runtime/src/warm_start/session.rs:struct:LoadedEntry"
+    ],
+    "reason": "#4080: warm_start::Session kept two loaders, try_load_with_source and peek_load_with_source, with identical bodies (store lookup, record the error, wrap in LoadedEntry with source LoadSource::Exact). LoadSource had the single variant Exact, so the only test of it (objective.rs classify_cache_entry_for_outer, loaded.source == LoadSource::Exact) was always true, and LoadedEntry only paired an entry with that constant. Both loaders, the enum and the wrapper are replaced by one Session::load returning Option<WarmStartEntry>. #4081: Fingerprinter::write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter were two copies of the element-wise write_f64 loop; both are replaced by one write_f64_elements.",
+    "evidence": "scripts/source_removal_guard.py and scripts/public_api_census.py with --base d027be231ca8fdf6f8104690ae68869486db51ab and head the change's commit list exactly these removals. Read-proof at the head: git grep -w finds 0 occurrences of LoadSource, LoadedEntry, try_load_with_source, peek_load_with_source, write_f64_slice_payload_slow and write_f64_slice_payload_slow_iter in crates/ tests/ examples/ python/. Before the change the callers were run.rs (try_load_with_source), marginal_slope fit_entry.rs (peek_load_with_source) and run_plan_warm_start_cache_tests.rs (LoadedEntry literals), all moved to Session::load / WarmStartEntry."
   }
 ]

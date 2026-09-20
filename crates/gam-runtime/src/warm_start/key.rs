@@ -201,7 +201,8 @@ impl Fingerprinter {
     /// hashing that previously lived as module-local `hash_f64_slice` /
     /// `hash_vector` copies in `solver/latent_cache`. Uses a bulk byte path
     /// only when it can emit exactly the same bytes as the element-wise
-    /// normalizing protocol.
+    /// normalizing protocol, i.e. when no element is `-0.0` (a NaN hashes its
+    /// own bits on both paths).
     pub fn write_f64_slice(&mut self, values: &[f64]) {
         self.write_usize(values.len());
         self.write_f64_slice_payload(values);
@@ -212,7 +213,7 @@ impl Fingerprinter {
         {
             let needs_normalization = values
                 .iter()
-                .any(|&value| value.is_nan() || (value == 0.0 && value.is_sign_negative()));
+                .any(|&value| value == 0.0 && value.is_sign_negative());
             if !needs_normalization {
                 // SAFETY: values.as_ptr() is valid for values.len() contiguous
                 // f64s, f64 has no padding, and reborrowing as bytes is confined
@@ -228,13 +229,7 @@ impl Fingerprinter {
                 return;
             }
         }
-        self.write_f64_slice_payload_slow(values);
-    }
-
-    fn write_f64_slice_payload_slow(&mut self, values: &[f64]) {
-        for &value in values {
-            self.write_f64(value);
-        }
+        self.write_f64_elements(values.iter().copied());
     }
 
     /// Absorb a 1D `f64` array as `len` followed by every element via
@@ -245,7 +240,7 @@ impl Fingerprinter {
         if let Some(slice) = values.as_slice() {
             self.write_f64_slice_payload(slice);
         } else {
-            self.write_f64_slice_payload_slow_iter(values.iter().copied());
+            self.write_f64_elements(values.iter().copied());
         }
     }
 
@@ -260,14 +255,13 @@ impl Fingerprinter {
         if let Some(slice) = values.as_slice() {
             self.write_f64_slice_payload(slice);
         } else {
-            self.write_f64_slice_payload_slow_iter(values.iter().copied());
+            self.write_f64_elements(values.iter().copied());
         }
     }
 
-    fn write_f64_slice_payload_slow_iter<I>(&mut self, values: I)
-    where
-        I: IntoIterator<Item = f64>,
-    {
+    /// The element-wise protocol every `f64` payload writer reduces to: each
+    /// value through [`Fingerprinter::write_f64`], with no length prefix.
+    fn write_f64_elements(&mut self, values: impl IntoIterator<Item = f64>) {
         for value in values {
             self.write_f64(value);
         }
@@ -330,12 +324,18 @@ mod tests {
             let mut fp = Fingerprinter::new();
             fp.write_str("write_f64_slice_bulk_matches_element_protocol");
             fp.write_usize(values.len());
-            fp.write_f64_slice_payload_slow(values);
+            fp.write_f64_elements(values.iter().copied());
             fp.finalize()
         }
 
         let clean = pseudo_random_values(257);
         assert_eq!(fast_key(&clean), slow_key(&clean));
+
+        // A NaN alone keeps the bulk path: its bits are what write_f64 hashes.
+        let mut nan_only = clean.clone();
+        nan_only[113] = f64::from_bits(0x7ff8_0000_0000_0042);
+        assert_eq!(fast_key(&nan_only), slow_key(&nan_only));
+        assert_ne!(fast_key(&nan_only), fast_key(&clean));
 
         let mut normalized = clean.clone();
         normalized[7] = -0.0;
@@ -372,7 +372,7 @@ mod tests {
         slow.write_str("write_f64_arrays_match_element_protocol");
         slow.write_usize(values.nrows());
         slow.write_usize(values.ncols());
-        slow.write_f64_slice_payload_slow_iter(values.iter().copied());
+        slow.write_f64_elements(values.iter().copied());
 
         assert_eq!(fast.finalize(), slow.finalize());
     }
