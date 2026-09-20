@@ -14,7 +14,7 @@ use gam_sae::basis::{PeriodicHarmonicEvaluator, SaeBasisSecondJet};
 use gam_sae::identifiability::thin_svd_scores;
 use gam_sae::manifold::{
     LatentManifold, SaeAtomBasisKind, SaeManifoldAtom, SaeManifoldOuterObjective, SaeManifoldRho,
-    SaeManifoldTerm,
+    SaeManifoldTerm, SaeOuterRun,
 };
 use gam_solve::rho_optimizer::{OuterCriterionCertificate, OuterProblem};
 use ndarray::{Array1, Array2, ArrayView2, s};
@@ -365,15 +365,25 @@ fn fit_ceiling_region(
         1.0e-6,
         1.0e-6,
     );
-    let result = OuterProblem::new(n_params)
+    let problem = OuterProblem::new(n_params)
         .with_problem_size(target.len(), p_beta)
         .with_initial_rho(seed)
-        .with_max_iter(outer_iters)
-        .run(&mut objective, "Qwen3-8B L18 K=1 ceiling")
-        .map_err(|err| format!("outer fit failed: {err}"))?;
-    objective
-        .certify_outer_result(&result)
-        .map_err(|err| format!("outer fit certificate rejected: {err}"))?;
+        .with_max_iter(outer_iters);
+    let result = match objective
+        .run_to_certificate(&problem, "Qwen3-8B L18 K=1 ceiling")
+        .map_err(|err| format!("outer fit failed: {err}"))?
+    {
+        SaeOuterRun::Certified(result) => result,
+        SaeOuterRun::Unconverged(result) => {
+            return Err(format!(
+                "outer fit did not converge in {} iterations",
+                result.iterations
+            ));
+        }
+        SaeOuterRun::Refused { reason, .. } => {
+            return Err(format!("outer fit certificate rejected: {reason}"));
+        }
+    };
     let fit_elapsed = fit_started.elapsed();
     let telemetry = objective.probe_telemetry();
     let fitted = objective.into_fitted().expect("outer fit was evaluated");

@@ -795,6 +795,7 @@ pub fn survival_fit_from_parts(
             coefficient_influence: None,
             weighted_gram: None,
             identified_subspace: None,
+            working_residual: None,
         });
 
     let deviance = -2.0 * log_likelihood;

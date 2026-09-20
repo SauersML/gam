@@ -3,8 +3,7 @@
 //! Across the program a dozen independent analyses each emit a "certificate":
 //! the outer-optimum first-order self-audit (`OuterCriterionCertificate`), the
 //! sensitivity-coreset error budget (`CoresetCertificate`), the exact-orbit
-//! residual-gauge report, the dictionary
-//! incoherence / global-optimality report, the structure-search collapse
+//! residual-gauge report, the structure-search collapse
 //! events, and the topology evidence certification. Each grew its own struct,
 //! its own verdict enum, and its own scattered payload key.
 //!
@@ -17,11 +16,13 @@
 //! 2. **the EVIDENCE** quantities behind the claim ([`Certificate::evidence`]),
 //!    as named scalars/flags/text;
 //! 3. **a conservative VERDICT** ([`Certificate::verdict`]) drawn from
-//!    [`Verdict`], in which *certified-but-wrong is structurally impossible*:
-//!    the verdict can only STRENGTHEN as evidence accrues, the weakest state is
-//!    the default, and there are explicit [`Verdict::Insufficient`] /
-//!    [`Verdict::Unavailable`] states so a missing or below-margin certificate
-//!    never silently reads as "certified".
+//!    [`Verdict`]: the verdict can only STRENGTHEN as evidence accrues, the
+//!    weakest state is the default, and there are explicit
+//!    [`Verdict::Insufficient`] / [`Verdict::Unavailable`] states so a missing
+//!    or below-margin certificate never silently reads as "certified". The
+//!    ladder cannot make a verdict sounder than its owner's decision rule: a
+//!    `Certified` verdict is exactly as strong as the theorem or derived bound
+//!    that rule evaluates, so only a rule that rests on one may return it.
 //!
 //! Migration rule (task #16): the existing certificate types KEEP their math
 //! unchanged; they merely implement [`Certificate`]. Their bespoke methods
@@ -38,10 +39,9 @@ use std::collections::BTreeMap;
 /// ladder as evidence accrues; it can never claim more than the evidence
 /// supports. The weakest state ([`Verdict::Unavailable`]) is the default, so a
 /// certificate that was never computed, or whose inputs were degenerate, reads
-/// as "no claim" — never as a silent pass. This is what makes
-/// "certified-but-wrong" structurally impossible: `Certified` is reachable only
-/// when the owning certificate's own (unchanged) decision rule says the
-/// evidence strictly clears its required margin.
+/// as "no claim" — never as a silent pass. `Certified` is reachable only when
+/// the owning certificate's own decision rule says the evidence strictly clears
+/// its required margin, so it is exactly as sound as that rule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Verdict {
     /// The certificate could not be evaluated: inputs were missing, degenerate,
@@ -53,9 +53,10 @@ pub enum Verdict {
     /// escalate (refine, gather more evidence, or fall back to the exact path);
     /// it must NOT treat this as a pass.
     Insufficient,
-    /// The evidence strictly clears the claim's required margin. The claim holds
-    /// — and, by construction of each owning decision rule, the conservative
-    /// (worst-case) bound was used, so this verdict cannot be falsely positive.
+    /// The evidence strictly clears the claim's required margin under the owning
+    /// decision rule. The claim holds to the extent that rule is a theorem or a
+    /// derived bound; an owner whose rule rests on chosen constants must not
+    /// return this state.
     Certified,
 }
 
