@@ -434,9 +434,21 @@ fn obb_torus_and_circle_fitted() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRh
     //   0.95 at circle log α −4, 0 and 0.5, under the premise's 1. At four it is 1.86.
     // - The premises are asserted where they are used: the re-solve's root ceiling, and the
     //   material-response check.
+    // - The fit runs to its own convergence certificate, with no iteration window. An
+    //   80-iteration window ended uncertified at ‖g‖ = 2.1e-2 once the joint fit stopped
+    //   exiting on a stalled objective (#3250), and from there the exact-A re-solve does
+    //   not reach its root in 40 steps. The certified fit ends at ‖g‖ = 5.6e-4.
     let mut rho = SaeManifoldRho::new(0.0, -1.0, vec![array![1.0, 1.0], array![1.0]]);
-    term.run_joint_fit_arrow_schur(target.view(), &mut rho, None, 80, 1.0, 1.0e-7, 1.0e-7)
-        .expect("the torus and circle fixture fits");
+    term.run_joint_fit_arrow_schur_to_convergence(
+        target.view(),
+        &mut rho,
+        None,
+        usize::MAX,
+        1.0,
+        1.0e-7,
+        1.0e-7,
+    )
+    .expect("the torus and circle fixture fits to convergence");
     let gates = term.collapse_prevention_gates();
     term.declare_collapse_prevention_gates(&gates);
     (term, target, rho)

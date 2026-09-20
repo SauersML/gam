@@ -89,7 +89,7 @@ fn binomial_logit_sphere_harmonic_m4_does_not_collapse() {
     // A falsely truncated penalty rank would zero the smooth. The smooth
     // should retain its signal: pred std across a 10×20 grid > 0.1 (truth
     // has eta peak-to-peak ≈ 4).
-    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=harmonic)");
+    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=harmonic)");
     assert!(
         std > 0.1,
         "binomial harmonic m=4 collapsed: pred std={std:.3} (range={range:.3}). \
@@ -105,7 +105,7 @@ fn binomial_logit_sphere_harmonic_m4_does_not_collapse() {
 #[test]
 fn binomial_logit_sphere_sobolev_m4_does_not_collapse() {
     init_parallelism();
-    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
+    let (_, std, range) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
     assert!(
         std > 0.1,
         "binomial sobolev m=4 collapsed: pred std={std:.3}"
@@ -118,8 +118,8 @@ fn binomial_logit_sphere_both_kernels_agree_under_reml() {
     // If REML is truly scale-invariant, both constructions should produce
     // similar logit predictions (different λ, but identical smoother).
     init_parallelism();
-    let (mean_sob, std_sob, _) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=sobolev)");
-    let (mean_har, std_har, _) = fit_predict("y ~ sphere(lat, lon, k=30, m=4, kernel=harmonic)");
+    let (mean_sob, std_sob, _) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=sobolev)");
+    let (mean_har, std_har, _) = fit_predict("y ~ sphere(lat, lon, k=30, penalty_order=4, method=harmonic)");
     // Means should match to a couple decimals; stds within ~30% of each
     // other (allow some divergence because Bernoulli REML adds PIRLS
     // inner-loop nonlinearity on top).

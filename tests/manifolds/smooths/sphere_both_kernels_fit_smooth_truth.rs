@@ -107,9 +107,9 @@ fn rmse_budget(m: usize) -> f64 {
 /// resolution, so the choice belongs in the formula rather than in a float.
 fn sobolev_formula(m: usize) -> String {
     if m == 1 {
-        "y ~ sphere(lat, lon, k=30, m=1, kernel=sobolev, lmax=200)".to_string()
+        "y ~ sphere(lat, lon, k=30, penalty_order=1, method=sobolev, lmax=200)".to_string()
     } else {
-        format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=sobolev)")
+        format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=sobolev)")
     }
 }
 
@@ -142,7 +142,7 @@ fn sphere_harmonic_kernel_fits_smooth_truth_for_all_m() {
     init_parallelism();
     let mut failures = Vec::new();
     for m in [1usize, 2, 3, 4] {
-        let formula = format!("y ~ sphere(lat, lon, k=30, m={m}, kernel=harmonic)");
+        let formula = format!("y ~ sphere(lat, lon, k=30, penalty_order={m}, method=harmonic)");
         match rmse_against_truth(&formula) {
             Ok(r) => {
                 let budget = rmse_budget(m);
@@ -161,10 +161,11 @@ fn sphere_harmonic_kernel_fits_smooth_truth_for_all_m() {
     );
 }
 
-/// `kernel=` and `method=` each accept exactly one spelling per construction.
+/// `method=` accepts exactly one spelling per construction.
 /// The pseudo-spline spellings (`pseudo`, `mgcv`, `sos`, `wahba_pseudo`) are
 /// refused with a removal error: they once parsed and then silently fit the
-/// harmonic basis instead of the kernel they named.
+/// harmonic basis instead of the kernel they named. The alias spellings of a
+/// surviving construction are refused with an error naming the canonical one.
 #[test]
 fn sphere_kernel_spellings_are_one_per_construction() {
     init_parallelism();
@@ -173,19 +174,31 @@ fn sphere_kernel_spellings_are_one_per_construction() {
         ..FitConfig::default()
     };
     let data = make_dataset(200);
-    for key in ["kernel", "method"] {
-        for kept in ["sobolev", "harmonic"] {
-            let formula = format!("y ~ sphere(lat, lon, k=10, m=2, {key}={kept})");
-            fit_from_formula(&formula, &data, &cfg)
-                .unwrap_or_else(|e| panic!("{formula} failed: {e}"));
-        }
-        for removed in ["pseudo", "mgcv", "sos", "wahba_pseudo"] {
-            let formula = format!("y ~ sphere(lat, lon, k=10, m=2, {key}={removed})");
-            let err = match fit_from_formula(&formula, &data, &cfg) {
-                Ok(_) => panic!("{formula} must be refused"),
-                Err(e) => e.to_string(),
-            };
-            assert!(err.contains("has been removed"), "{formula}: {err}");
-        }
+    for kept in ["sobolev", "harmonic"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={kept})");
+        fit_from_formula(&formula, &data, &cfg)
+            .unwrap_or_else(|e| panic!("{formula} failed: {e}"));
+    }
+    for removed in ["pseudo", "mgcv", "sos", "wahba_pseudo"] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={removed})");
+        let err = match fit_from_formula(&formula, &data, &cfg) {
+            Ok(_) => panic!("{formula} must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("has been removed"), "{formula}: {err}");
+    }
+    for (removed, canonical) in [
+        ("wahba", "sobolev"),
+        ("wahba_sobolev", "sobolev"),
+    ] {
+        let formula = format!("y ~ sphere(lat, lon, k=10, penalty_order=2, method={removed})");
+        let err = match fit_from_formula(&formula, &data, &cfg) {
+            Ok(_) => panic!("method=`{removed}` must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            err.contains(&format!("unknown sphere method `{removed}`")) && err.contains(&format!("use `{canonical}`")),
+            "method=`{removed}` must name `{canonical}`, got: {err}"
+        );
     }
 }

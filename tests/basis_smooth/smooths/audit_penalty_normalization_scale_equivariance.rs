@@ -12,7 +12,7 @@
 //! basis like `bs="cr"`.
 //!
 //! This test certifies the invariant directly at construction time for the
-//! single-penalty 1-D B-spline paths (open `bs="ps"` and cyclic `bs="cc"`),
+//! single-penalty 1-D B-spline paths (open `bs="ps"` and cyclic `bs="cyclic"`),
 //! across penalty orders, without needing a fitted model:
 //!   1. the active penalty block is Frobenius-normalized (‖S‖_F ≈ 1), and
 //!   2. the design columns are invariant under a pure rescaling of the abscissa

@@ -419,7 +419,7 @@ fn sphere_wahba_default_method_is_sobolev() {
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
     let p_def = fit2d("y~sphere(lat,lon,k=15)", d.clone(), &[(45.0, 0.0)]);
-    let p_sob = fit2d("y~sphere(lat,lon,k=15,kernel=sobolev)", d, &[(45.0, 0.0)]);
+    let p_sob = fit2d("y~sphere(lat,lon,k=15,method=sobolev)", d, &[(45.0, 0.0)]);
     assert!((p_def[0] - p_sob[0]).abs() < 1e-9);
 }
 #[test]
@@ -441,7 +441,7 @@ fn sphere_harmonic_smoke_test() {
         ]));
     }
     let d = encode_recordswith_inferred_schema(h, r).expect("each fixture record carries one field per header column");
-    let p = fit2d("y~sphere(lat,lon,k=15,kernel=harmonic)", d, &[(45.0, 0.0)]);
+    let p = fit2d("y~sphere(lat,lon,k=15,method=harmonic)", d, &[(45.0, 0.0)]);
     assert!(p[0].is_finite());
 }
 #[test]
