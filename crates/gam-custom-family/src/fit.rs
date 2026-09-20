@@ -430,6 +430,10 @@ pub(crate) struct BlockwiseFitAssembly<'a> {
     pub(crate) smoothing_correction_absence: Option<gam_solve::model_types::SmoothingCorrectionAbsence>,
     /// Which rule selected the coefficient mode the fit reports (#2366, #2661).
     pub(crate) coefficient_mode_selection: gam_solve::model_types::CoefficientModeSelection,
+    /// The terminal posterior assembly's improper-posterior evidence (#3164),
+    /// published on `FitArtifacts::improper_penalty_null_posterior`.
+    pub(crate) improper_penalty_null_posterior:
+        Option<gam_problem::jeffreys_arming::JeffreysArmingEvidence>,
 }
 
 /// The family's classical deviance at the converged mode, as a typed
@@ -465,6 +469,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         smoothing_corrected,
         smoothing_correction_absence,
         coefficient_mode_selection,
+        improper_penalty_null_posterior,
     } = assembly;
     let log_lambdas = rho_physical;
     let lambdas =
@@ -521,6 +526,7 @@ pub(crate) fn assemble_custom_family_fit_result(
         result_specs,
     )?;
     fit.artifacts.coefficient_mode_selection = coefficient_mode_selection;
+    fit.artifacts.improper_penalty_null_posterior = improper_penalty_null_posterior;
     Ok(fit)
 }
 
@@ -2517,6 +2523,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             covariance_conditional,
             mut geometry,
             reported_beta,
+            improper_penalty_null_posterior,
         } = posterior;
         let reml_term = if options.use_remlobjective {
             let logdet_h = inner
@@ -2606,6 +2613,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 } else {
                     gam_solve::model_types::CoefficientModeSelection::UniqueMode
                 },
+                improper_penalty_null_posterior,
             },
         );
     }
@@ -2777,9 +2785,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 steps: certified.certificate.steps,
             },
         )
-    } else if family.exact_newton_joint_hessian_beta_dependent()
-        && !family.inner_coefficient_objective_is_globally_convex()
-    {
+    } else if inner_objective_may_have_several_modes(family) {
         match anchored_continuation_seed(
             family,
             specs,
@@ -2831,6 +2837,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
     // re-solve on a surface that does not depend on the path taken, so the
     // fallback is the anchored mode: cold means CANONICAL, not arbitrary.
     let canonical_seed = initial_warm_cache.clone();
+    // gam#3173: the fit's fixed starts, the anchored mode and the caller's seed. Every evaluation
+    // also solves a mode from each and publishes the certified one with the lowest penalized
+    // objective (`evaluate_on_branch`). A family whose inner objective has one mode needs none.
+    let fixed_starts = fixed_mode_starts(
+        family,
+        [canonical_seed.clone(), persistent_warm_start.clone()],
+    );
     let problem = OuterProblem::new(n_rho)
         .with_stuck_stall_cold_reeval_signal(
             Arc::clone(&outer_force_cold),
@@ -2976,10 +2989,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // A value probe seeds nothing: only an accepted iterate's mode does (#2668).
         if matches!(order, OuterEvalOrder::Value) {
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
-            let warm_ref = if force_cold {
-                canonical_seed.as_ref()
+            let starts = if force_cold {
+                ModeStarts {
+                    incumbent: canonical_seed.as_ref(),
+                    fixed: &fixed_starts,
+                }
             } else {
-                outer.warm_start_for(rho)
+                outer.mode_starts_for(rho)
             };
             return match evaluate_on_branch(
                 family,
@@ -2987,7 +3003,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 &outer_options,
                 &label_layout,
                 rho,
-                warm_ref,
+                starts,
                 &rho_prior,
                 EvalMode::ValueOnly,
             ) {
@@ -3069,10 +3085,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         // consumed by certified fit assembly. A failed analytic probe must not
         // leave an older mode available for accidental substitution.
         outer.begin_terminal_evaluation();
-        let warm_ref = if force_cold {
-            canonical_seed.as_ref()
+        let starts = if force_cold {
+            ModeStarts {
+                incumbent: canonical_seed.as_ref(),
+                fixed: &fixed_starts,
+            }
         } else {
-            outer.warm_start_for(rho)
+            outer.mode_starts_for(rho)
         };
         let eval_result = match evaluate_on_branch(
             family,
@@ -3080,7 +3099,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             &outer_options,
             &label_layout,
             rho,
-            warm_ref,
+            starts,
             &rho_prior,
             if request_hessian {
                 EvalMode::ValueGradientHessian
@@ -3211,7 +3230,8 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             force_cold,
             accepted_steps,
         )
-        .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule()),
+        .with_outer_derivative_pilot(family.outer_derivative_pilot_schedule())
+        .with_fixed_starts(fixed_starts.clone()),
         |outer: &mut CustomOuterState, rho: &Array1<f64>| {
             // Start from the incumbent's inner mode when there is one — a converged
             // inner solution gives a much better starting point. This was previously
@@ -3228,10 +3248,13 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             outer.adopt_accepted_steps();
             outer.last_criterion_rank = None;
             let seed_identity = crate::warm_start::SeedIdentity::of(outer.seed_for(rho));
-            let warm_ref = if force_cold {
-                canonical_seed.as_ref()
+            let starts = if force_cold {
+                ModeStarts {
+                    incumbent: canonical_seed.as_ref(),
+                    fixed: &fixed_starts,
+                }
             } else {
-                outer.warm_start_for(rho)
+                outer.mode_starts_for(rho)
             };
             match evaluate_on_branch(
                 family,
@@ -3239,7 +3262,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
                 &outer_options,
                 &label_layout,
                 rho,
-                warm_ref,
+                starts,
                 &rho_prior,
                 EvalMode::ValueOnly,
             ) {
@@ -3409,14 +3432,11 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         );
         match multistart {
             Ok(mut outcome) => match outcome.winner {
-                Some(winner) => outcome.runs.swap_remove(winner),
+                Some(winner) => (outcome.outcomes.swap_remove(winner), outcome.payload),
                 // No seed certified: refuse with every seed's outcome. The
                 // first seed (the fit's own initial rho) lends its state for
                 // the refusal's last-evaluation evidence.
-                None => {
-                    let refusal = outcome.refusal("custom family");
-                    (Err(refusal), outcome.runs.swap_remove(0).1)
-                }
+                None => (Err(outcome.refusal("custom family")), outcome.payload),
             },
             Err(error) => (
                 Err(error),
@@ -3604,6 +3624,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     // Cross-fit FitArtifact capture (Phase 0/1) for the converged smoothing
     // fit: persist the descriptor-indexed raw-β + ρ so a later fold transfers
@@ -3776,6 +3797,7 @@ pub fn fit_custom_family_with_rho_prior<F: CustomFamily + Clone + Send + Sync + 
             smoothing_corrected,
             smoothing_correction_absence,
             coefficient_mode_selection,
+            improper_penalty_null_posterior,
         },
     )?;
     fit.artifacts.outer_warm_start = Some(outer_warm_start);
@@ -3996,6 +4018,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     install_reported_posterior_mean(
         family,
@@ -4036,6 +4059,7 @@ fn fit_custom_family_user_fixed_log_lambdas_impl<
             // which does not yet carry the rule it applied (#2661).
             coefficient_mode_selection:
                 gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+            improper_penalty_null_posterior,
         },
     )
 }
@@ -4253,6 +4277,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
         covariance_conditional,
         mut geometry,
         reported_beta,
+        improper_penalty_null_posterior,
     } = posterior;
     install_reported_posterior_mean(
         family,
@@ -4294,6 +4319,7 @@ fn fit_custom_family_fixed_log_lambdas_from_owned_mode_with_provenance<
             // which does not yet carry the rule it applied (#2661).
             coefficient_mode_selection:
                 gam_solve::model_types::CoefficientModeSelection::NotRecorded,
+            improper_penalty_null_posterior,
         },
     )
 }

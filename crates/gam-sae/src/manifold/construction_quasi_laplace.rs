@@ -616,115 +616,133 @@ impl SaeManifoldTerm {
                 Err(err) => break Err(err),
             }
         };
-        self.streaming_gates_frozen = gates_were_frozen;
-        let (cache, log_det, mut geometry) = evidence_root?;
+        // #2933 F05 — a priced root leaves its gates declared, so re-pricing this
+        // state (the shape-uncertainty recompute, a fitted term's next evaluation)
+        // prices the objective this value belongs to rather than one re-frozen at
+        // the re-pricing's own entry state. A refused evaluation hands back the
+        // gate state it was given.
+        let priced = (|| -> Result<
+            (
+                f64,
+                SaeManifoldLoss,
+                ArrowFactorCache,
+                Option<DenseExactAGeometry>,
+            ),
+            SaeCriterionError,
+        > {
+            let (cache, log_det, mut geometry) = evidence_root?;
 
-        // 3. Smoothing-prior normalizer `−½·Σ_k log|λ_k S_k ⊗ I_{r_k}|_+`
-        //    (issue #972, #2933 F26): the `r_k·rank(S_k)·log λ_smooth` Occam term plus
-        //    the base pseudo-determinant `r_k·log|S_k|_+`, so equivalent splits of one
-        //    precision `λ_k S_k` price one value. The single seam is `reml_occam_term`,
-        //    shared with the streaming path so both rank the identical normalizer.
-        let occam = self.reml_occam_term(rho)?;
+            // 3. Smoothing-prior normalizer `−½·Σ_k log|λ_k S_k ⊗ I_{r_k}|_+`
+            //    (issue #972, #2933 F26): the `r_k·rank(S_k)·log λ_smooth` Occam term plus
+            //    the base pseudo-determinant `r_k·log|S_k|_+`, so equivalent splits of one
+            //    precision `λ_k S_k` price one value. The single seam is `reml_occam_term`,
+            //    shared with the streaming path so both rank the identical normalizer.
+            let occam = self.reml_occam_term(rho)?;
 
-        // Extra penalized-objective energy with no native `loss.*` twin
-        // (#671/#737, and the full-objective completion): all registry analytic
-        // penalties (Isometry, SCAD/MCP, BlockOrthogonality, decoder-block
-        // set), the decoder repulsion conditioner, and the Jeffreys separation
-        // barrier. The inner solve descends all of them (they enter the KKT
-        // gradient), so the Laplace criterion must add them to rank the SAME
-        // penalized deviance — the envelope theorem the analytic outer gradient
-        // relies on holds only then. See `reml_extra_penalty_value_total`.
-        let extra_penalty_energy = self
-            .reml_extra_penalty_value_total(registry)
-            .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
+            // Extra penalized-objective energy with no native `loss.*` twin
+            // (#671/#737, and the full-objective completion): all registry analytic
+            // penalties (Isometry, SCAD/MCP, BlockOrthogonality, decoder-block
+            // set), the decoder repulsion conditioner, and the Jeffreys separation
+            // barrier. The inner solve descends all of them (they enter the KKT
+            // gradient), so the Laplace criterion must add them to rank the SAME
+            // penalized deviance — the envelope theorem the analytic outer gradient
+            // relies on holds only then. See `reml_extra_penalty_value_total`.
+            let extra_penalty_energy = self
+                .reml_extra_penalty_value_total(registry)
+                .map_err(|err| format!("SaeManifoldTerm::penalized_quasi_laplace_criterion: {err}"))?;
 
-        let v = {
-            // #5/(B): the Laplace complexity is ½log|A| plus the honest BIC
-            // ½·d_eff·log n on each atom's realised decoder rank. The coordinate
-            // block stays inside log|A| (#2668): every row of `A_tt` carries the ARD
-            // precision α that balances the `−½·n·log α` normalizer in `loss.ard`,
-            // and subtracting the block, as this seam once did to remove the
-            // decoder-scale term (`H_tt ∝ ‖B‖²`), left V falling linearly in log α
-            // on a collapsing axis. `d_eff` is rotation-invariant, so it accepts a
-            // real rank-2 circle but does not distinguish clean-vs-blend (producer's
-            // job). A certified vanished atom is a typed boundary before rank
-            // pricing.
-            // Decoder disappearance is certified first from the raw output-frame
-            // residual and gated decoder Grams. It has no tuned noise multiple:
-            // the boundary is derived from the residual reduction's floating-point
-            // backward error, and proof-unavailable is surfaced loudly.
-            let residual = self.reconstruction_residual(target, rho)?;
-            let mut grams = self.empty_decoder_gram_accumulator();
-            self.accumulate_decoder_gram(&mut grams)?;
-            let n_eff = self.per_atom_effective_sample_size();
-            let residual_energy = self.residual_energy_for_vanishing(residual.view())?;
-            match self.vanished_atoms_from_signal_upper_bound(
-                &grams,
-                &n_eff,
-                residual_energy.mean_square(),
-            )? {
-                VanishedAtomsProof::Certified {
-                    atoms: Some(atoms), ..
-                } => return Err(SaeCriterionError::VanishedAtoms(atoms)),
-                VanishedAtomsProof::Certified { atoms: None, .. } => {}
-                VanishedAtomsProof::Unavailable { reason } => {
-                    return Err(SaeCriterionError::Numerical(format!(
-                        "decoder-vanishing proof unavailable: {reason}"
-                    )));
+            let v = {
+                // #5/(B): the Laplace complexity is ½log|A| plus the honest BIC
+                // ½·d_eff·log n on each atom's realised decoder rank. The coordinate
+                // block stays inside log|A| (#2668): every row of `A_tt` carries the ARD
+                // precision α that balances the `−½·n·log α` normalizer in `loss.ard`,
+                // and subtracting the block, as this seam once did to remove the
+                // decoder-scale term (`H_tt ∝ ‖B‖²`), left V falling linearly in log α
+                // on a collapsing axis. `d_eff` is rotation-invariant, so it accepts a
+                // real rank-2 circle but does not distinguish clean-vs-blend (producer's
+                // job). A certified vanished atom is a typed boundary before rank
+                // pricing.
+                // Decoder disappearance is certified first from the raw output-frame
+                // residual and gated decoder Grams. It has no tuned noise multiple:
+                // the boundary is derived from the residual reduction's floating-point
+                // backward error, and proof-unavailable is surfaced loudly.
+                let residual = self.reconstruction_residual(target, rho)?;
+                let mut grams = self.empty_decoder_gram_accumulator();
+                self.accumulate_decoder_gram(&mut grams)?;
+                let n_eff = self.per_atom_effective_sample_size();
+                let residual_energy = self.residual_energy_for_vanishing(residual.view())?;
+                match self.vanished_atoms_from_signal_upper_bound(
+                    &grams,
+                    &n_eff,
+                    residual_energy.mean_square(),
+                )? {
+                    VanishedAtomsProof::Certified {
+                        atoms: Some(atoms), ..
+                    } => return Err(SaeCriterionError::VanishedAtoms(atoms)),
+                    VanishedAtomsProof::Certified { atoms: None, .. } => {}
+                    VanishedAtomsProof::Unavailable { reason } => {
+                        return Err(SaeCriterionError::Numerical(format!(
+                            "decoder-vanishing proof unavailable: {reason}"
+                        )));
+                    }
                 }
-            }
-            // #2933 F36 — the divergence reads the eigensystem ½log|A| was priced on:
-            // the same materialization at the same cache and target, so the dense
-            // criterion decomposes `A` once per evaluation, not twice.
-            let dispersion = self
-                .reconstruction_dispersion_with_geometry(
-                    &loss,
-                    &cache,
-                    rho,
-                    residual.view(),
-                    Some(HeldResponseGeometry::FixedFrame(&geometry.block)),
-                )
-                .map_err(|e| {
-                    format!(
-                        "SaeManifoldTerm::penalized_quasi_laplace_criterion: rank-charge dispersion is required: {e}"
+                // #2933 F36 — the divergence reads the eigensystem ½log|A| was priced on:
+                // the same materialization at the same cache and target, so the dense
+                // criterion decomposes `A` once per evaluation, not twice.
+                let dispersion = self
+                    .reconstruction_dispersion_with_geometry(
+                        &loss,
+                        &cache,
+                        rho,
+                        residual.view(),
+                        Some(HeldResponseGeometry::FixedFrame(&geometry.block)),
                     )
-                })?;
-            // #2933 F39 — the gradient's rank-charge derivative at this state reads the
-            // dispersion off the geometry it is handed, so the fitted-response divergence
-            // is formed once per evaluated state, not once for the value and again for the
-            // gradient.
-            geometry.rank_charge_dispersion = Some(dispersion);
-            let disp = dispersion.raw_output_noise_variance;
-            let d_eff = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
-            // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
-            // per-atom BIC log-scale (same quantity `rank_dof_from_grams` uses
-            // internally for the MP edge; recomputed here — a cheap Σa² — to price the
-            // charge in the same currency).
-            // #5/#2498 — the same-state gated-signal certificate above owns the
-            // categorical Laplace-validity boundary. Do not manufacture a second
-            // disappearance verdict from `d_eff == 0`: DOF also contains the
-            // smooth-basis charge and is not a physical reconstruction signal.
-            // #2a — occupancy-aware BIC/Laplace scale. The shared scalar helper
-            // owns `0.5 log|A| + rank_charge`; dense, streaming, and
-            // criterion-as-atoms assembly therefore cannot drift apart.
-            // log_det (= log|A|, coordinate block included) comes from the exact
-            // observed information above (#2668).
-            let quasi_laplace_complexity =
-                rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &n_eff)?;
-            let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
-            // #2228 — the criterion's terms at the cache the `[SAE-ACCEPT]` line named, so
-            // a split between two lanes at one ρ says which term moved.
-            log::debug!(
-                "[SAE-CRITERION] V={value:.10e}: loss={:.10e} \
-                 extra_penalty={extra_penalty_energy:.6e} ½log|A|={:.6e} rank_charge={:.6e} \
-                 occam={occam:.6e}",
-                loss.total(),
-                0.5 * log_det,
-                quasi_laplace_complexity - 0.5 * log_det,
-            );
-            value
-        };
-        Ok((v, loss, cache, Some(geometry)))
+                    .map_err(|e| {
+                        format!(
+                            "SaeManifoldTerm::penalized_quasi_laplace_criterion: rank-charge dispersion is required: {e}"
+                        )
+                    })?;
+                // #2933 F39 — the gradient's rank-charge derivative at this state reads the
+                // dispersion off the geometry it is handed, so the fitted-response divergence
+                // is formed once per evaluated state, not once for the value and again for the
+                // gradient.
+                geometry.rank_charge_dispersion = Some(dispersion);
+                let disp = dispersion.raw_output_noise_variance;
+                let d_eff = self.rank_dof_from_grams(&grams, &n_eff, rho, disp)?;
+                // Occupancy-aware effective sample size N_eff,k = Σ_i a_{ik}², the #2a
+                // per-atom BIC log-scale (same quantity `rank_dof_from_grams` uses
+                // internally for the MP edge; recomputed here — a cheap Σa² — to price the
+                // charge in the same currency).
+                // #5/#2498 — the same-state gated-signal certificate above owns the
+                // categorical Laplace-validity boundary. Do not manufacture a second
+                // disappearance verdict from `d_eff == 0`: DOF also contains the
+                // smooth-basis charge and is not a physical reconstruction signal.
+                // #2a — occupancy-aware BIC/Laplace scale. The shared scalar helper
+                // owns `0.5 log|A| + rank_charge`; dense, streaming, and
+                // criterion-as-atoms assembly therefore cannot drift apart.
+                // log_det (= log|A|, coordinate block included) comes from the exact
+                // observed information above (#2668).
+                let quasi_laplace_complexity =
+                    rank_adjusted_quasi_laplace_complexity(log_det, &d_eff, &n_eff)?;
+                let value = loss.total() + extra_penalty_energy + quasi_laplace_complexity - occam;
+                // #2228 — the criterion's terms at the cache the `[SAE-ACCEPT]` line named, so
+                // a split between two lanes at one ρ says which term moved.
+                log::debug!(
+                    "[SAE-CRITERION] V={value:.10e}: loss={:.10e} \
+                     extra_penalty={extra_penalty_energy:.6e} ½log|A|={:.6e} rank_charge={:.6e} \
+                     occam={occam:.6e}",
+                    loss.total(),
+                    0.5 * log_det,
+                    quasi_laplace_complexity - 0.5 * log_det,
+                );
+                value
+            };
+            Ok((v, loss, cache, Some(geometry)))
+        })();
+        if priced.is_err() {
+            self.streaming_gates_frozen = gates_were_frozen;
+        }
+        priced
     }
 
     /// Run the likelihood-flat-block mover on the LIVE state at the refine loop's
@@ -1259,11 +1277,18 @@ impl SaeManifoldTerm {
         }
     }
 
-    /// `½λ²/(|f| + 1)` at the installed state, priced exactly as the budget-limit
-    /// and final-gate acceptances price it: assemble at `(term, rho)`, take the
-    /// deflated evidence factor with [`Self::evidence_factor_options`], and read
-    /// the Newton decrement off that factor's discarded step. The state is not
-    /// moved.
+    /// `½λ²/(|f| + 1)` at the installed state, priced exactly as the decrement
+    /// acceptances price it: assemble at `(term, rho)`, take the deflated evidence
+    /// factor with [`Self::evidence_factor_options`], and read the majorizer Newton
+    /// decrement off that factor's discarded step. Where that decrement admits, the
+    /// exact verdict decides, as it does for every native decrement acceptance
+    /// (#2933 F08, [`Self::certified_decrement_acceptance`]):
+    ///
+    /// - A classified state reports its exact `½λ²/scale`.
+    /// - A clamp basin, or a state above the dense admission, reports the majorizer's.
+    /// - A saddle, or dense geometry that cannot be formed, is `Err`.
+    ///
+    /// The state is not moved.
     pub(crate) fn installed_newton_decrement_relative(
         &mut self,
         target: ArrayView2<'_, f64>,
@@ -1293,7 +1318,24 @@ impl SaeManifoldTerm {
                 "installed-state Newton decrement is not a certificate: λ²={decrement_sq:e}"
             ));
         }
-        Ok(0.5 * decrement_sq / scale)
+        let majorizer_relative = 0.5 * decrement_sq / scale;
+        if !Self::inner_decrement_certifies(majorizer_relative) {
+            return Ok(majorizer_relative);
+        }
+        match self.refined_root_verdict(target, rho, registry, &mut sys, &factor.cache)? {
+            RefinedRootVerdict::Certified { relative, .. }
+            | RefinedRootVerdict::Refused(RefinedRootRefusal::DecrementAboveTolerance {
+                relative,
+                ..
+            }) => Ok(relative),
+            RefinedRootVerdict::ClampBasin { .. } | RefinedRootVerdict::Unclassified => {
+                Ok(majorizer_relative)
+            }
+            refused @ RefinedRootVerdict::Refused(_) => Err(format!(
+                "the exact information refuses the installed state [{}]: {refused}",
+                refused.tag()
+            )),
+        }
     }
 
     /// Install the per-row spectral deflation on an ACCEPTANCE system, take its
@@ -2880,7 +2922,10 @@ impl SaeManifoldTerm {
             initial_fit,
             lane,
         );
-        self.streaming_gates_frozen = gates_were_frozen;
+        // #2933 F05 — as on the dense route: a priced root leaves its gates declared.
+        if out.is_err() {
+            self.streaming_gates_frozen = gates_were_frozen;
+        }
         out
     }
 
@@ -6886,7 +6931,7 @@ mod shape_covariance_observed_information_2933_f33_tests {
     ///
     /// The collapse-prevention gates are the ones `term` declared at its root: `A`
     /// is the Hessian of `V(ρ; w₀)` with the routing weights `w₀` held fixed
-    /// (#2933 F05). `SaeManifoldTerm::clone` resets every gate to `None`, and a
+    /// (#2933 F05). A clone of a term whose gates are not declared carries none, and a
     /// clone without a gate reads the separation barrier's coactivation from its
     /// live assignments. Its logit columns would then differentiate a routing
     /// refresh the observed information does not carry, so every perturbed clone

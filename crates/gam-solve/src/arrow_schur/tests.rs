@@ -6716,6 +6716,44 @@ fn shared_block_diagonal_survives_dense_workspace_reclamation_2548() {
     assert_eq!(system.shared_block_diagonal(), expected);
 }
 
+/// #2822 — the reduced-Schur prologue `(P + ridge·I) x` shifts the whole border
+/// when the penalty lives in `penalty_op` and `hbb` is empty. Sizing the shift by
+/// `hbb`'s rows dropped `ridge·I` there, so every proximal ridge re-solved the same
+/// undamped Δβ and the SAE evidence correction exhausted its ladder.
+#[test]
+fn penalty_op_prologue_carries_the_ridge_over_an_empty_hbb_2822() {
+    use crate::arrow_schur::prelude::SharedBetaMatvec;
+    use std::sync::Arc;
+
+    let mut system =
+        ArrowSchurSystem::new_with_per_row_dims_empty_hbb_and_htbeta_cols(Vec::new(), 3, 0);
+    let diagonal = array![2.0, 5.0, 11.0];
+    let applied = diagonal.clone();
+    let matvec: SharedBetaMatvec = Arc::new(
+        move |input: ArrayView1<'_, f64>, output: &mut Array1<f64>| {
+            for component in 0..output.len() {
+                output[component] = applied[component] * input[component];
+            }
+        },
+    );
+    system.set_penalty_op(Arc::new(MatvecDiagPenaltyOp::new(3, matvec, diagonal.clone())));
+    assert_eq!(system.hbb.dim(), (0, 0));
+
+    let x = [0.5, -1.25, 2.0];
+    let ridge = 3.0;
+    for parallel in [false, true] {
+        let mut y = vec![0.0_f64; 3];
+        system.penalty_ridge_prologue_into(&x, ridge, &mut y, parallel);
+        for a in 0..3 {
+            assert_eq!(
+                y[a],
+                (diagonal[a] + ridge) * x[a],
+                "prologue must apply (P + ridge·I) at index {a} (parallel={parallel})"
+            );
+        }
+    }
+}
+
 /// #2731/#2900 — the dense reduced-Schur route is priced by its six `k × k` blocks and by
 /// its flops against the matrix-free route. No `k × k` buffer is allocated here.
 #[test]

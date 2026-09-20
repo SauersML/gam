@@ -1,4 +1,5 @@
 use csv::{ReaderBuilder, StringRecord};
+use gam_spec::ErrorCategory;
 use ndarray::{Array2, ArrayViewMut1, Axis, s};
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -491,11 +492,45 @@ impl DataError {
         }
     }
 
+    /// The `Enum::Variant` name a front end prints beside the message.
+    #[must_use]
+    pub fn variant_name(&self) -> &'static str {
+        match self {
+            Self::SchemaMismatch { .. } => "DataError::SchemaMismatch",
+            Self::ParseError { .. } => "DataError::ParseError",
+            Self::EncodingFailure { .. } => "DataError::EncodingFailure",
+            Self::EmptyInput { .. } => "DataError::EmptyInput",
+            Self::InvalidValue { .. } => "DataError::InvalidValue",
+            Self::InvalidCell { .. } => "DataError::InvalidCell",
+            Self::DegenerateColumn { .. } => "DataError::DegenerateColumn",
+            Self::ColumnNotFound { .. } => "DataError::ColumnNotFound",
+        }
+    }
+
+    /// The user-facing category every front end classifies this failure by.
+    ///
+    /// A missing column is a defect of the request (the formula names a
+    /// column the table does not have); encoding bookkeeping is an engine
+    /// invariant; every other ingest failure is a property of the data.
+    #[must_use]
+    pub fn error_category(&self) -> ErrorCategory {
+        match self {
+            Self::ColumnNotFound { .. } => ErrorCategory::Formula,
+            Self::EncodingFailure { .. } => ErrorCategory::Internal,
+            Self::SchemaMismatch { .. }
+            | Self::ParseError { .. }
+            | Self::EmptyInput { .. }
+            | Self::InvalidValue { .. }
+            | Self::InvalidCell { .. }
+            | Self::DegenerateColumn { .. } => ErrorCategory::Data,
+        }
+    }
+
     /// Build a typed `ColumnNotFound` from the column map of the resolved
     /// dataset. Centralises the similarity / TSV-hint heuristics that the
     /// legacy `missing_column_message` helper used to perform inline so all
-    /// callers — leaf `resolve_col*` shims and the multi-column requested-
-    /// columns aggregator — produce identical payloads.
+    /// callers — leaf `resolve_col*` shims and the requested-columns
+    /// projection — produce identical payloads.
     pub fn column_not_found(
         col_map: &HashMap<String, usize>,
         name: &str,
@@ -1044,22 +1079,24 @@ fn resolve_requested_columns(
         }
     }
 
-    if selected.len() != requested_set.len() {
-        let available_map: HashMap<String, usize> = all_headers
-            .iter()
-            .enumerate()
-            .map(|(index, header)| (header.clone(), index))
-            .collect();
-        let missing = requested_columns
-            .iter()
-            .filter(|name| !available_map.contains_key(name.as_str()))
-            .map(|name| {
-                DataError::column_not_found(&available_map, name, Some("requested")).to_string()
-            })
-            .collect::<Vec<_>>();
-        return Err(DataError::SchemaMismatch {
-            reason: missing.join("; "),
-        });
+    // With duplicates refused above, a short selection means a requested name
+    // the file does not have. The first one in request order is reported,
+    // typed, exactly as formula resolution reports a missing column: the
+    // request named a column the table lacks, the request's defect.
+    let available_map: HashMap<String, usize> = all_headers
+        .iter()
+        .enumerate()
+        .map(|(index, header)| (header.clone(), index))
+        .collect();
+    if let Some(missing) = requested_columns
+        .iter()
+        .find(|name| !available_map.contains_key(name.as_str()))
+    {
+        return Err(DataError::column_not_found(
+            &available_map,
+            missing,
+            Some("requested"),
+        ));
     }
 
     Ok(selected)
@@ -1433,7 +1470,7 @@ fn parse_inferred_numeric_cell(raw: &str, row: usize, header: &str) -> Result<f6
     }
     let value = raw
         .parse::<f64>()
-        .map_err(|error| DataError::EncodingFailure {
+        .map_err(|error| DataError::ParseError {
             reason: format!(
                 "failed to parse numeric value '{raw}' at row {row}, column '{header}': {error}"
             ),
@@ -3293,6 +3330,24 @@ mod tests {
             &mut reader,
             vec!["normalized".to_string()],
         )
+    }
+
+    #[test]
+    fn a_requested_column_the_file_lacks_is_a_typed_formula_error() {
+        // A projected load (the CLI's `gam fit data.csv "y ~ absent"`) folded
+        // a missing name into `SchemaMismatch`, a data failure, while the same
+        // name missing from a Python frame raised `ColumnNotFoundError`.
+        let headers = vec!["y".to_string(), "x".to_string()];
+        let requested = vec!["y".to_string(), "absent".to_string(), "gone".to_string()];
+        let error = resolve_requested_columns(&headers, &requested).expect_err("missing column");
+        match &error {
+            DataError::ColumnNotFound { name, available, .. } => {
+                assert_eq!(name, "absent");
+                assert_eq!(available, &["x".to_string(), "y".to_string()]);
+            }
+            other => panic!("expected ColumnNotFound, got {other:?}"),
+        }
+        assert_eq!(error.error_category(), ErrorCategory::Formula);
     }
 
     #[test]

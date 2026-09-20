@@ -1,10 +1,16 @@
 [build-system]
 requires = ["maturin>=1.7,<2"]
-build-backend = "maturin"
+# maturin's hooks, followed by writing the version this tree derives into what
+# they built (scripts/gamfit_version.py, gam#3157). A fixed string would give
+# every commit between two releases one version.
+build-backend = "gamfit_version"
+backend-path = ["scripts"]
 
 [project]
 name = "gamfit"
-version = "0.1.268"
+# Derived by the build backend from the commit being built, starting from the
+# release line [tool.gamfit] version.
+dynamic = ["version"]
 description = "Formula-first generalized additive models with a high-performance Rust core"
 readme = { file = "README_PYPI.md", content-type = "text/markdown" }
 # The floor and every classifier version below are installed from the built
@@ -116,12 +122,24 @@ type = [
   "vulture>=2.16",
 ]
 
+# The release line. A `release:` commit sets it, and the commit that sets it
+# builds as exactly this version; every other commit builds as a development
+# version naming its commit (scripts/gamfit_version.py). build.rs holds
+# crates/gam-pyffi/Cargo.toml's version, which maturin reads, and uv.lock's
+# gamfit version to this first `version = ` line of the file.
+[tool.gamfit]
+version = "0.1.268"
+
 [tool.maturin]
 manifest-path = "crates/gam-pyffi/Cargo.toml"
 module-name = "gamfit._rust"
 # One authoritative Cargo-resolution policy for wheels, sdists, PEP 517, and
 # direct maturin use. Subcommand-specific CLI placement cannot drift.
 locked = true
+# The build backend ([build-system] backend-path): an sdist carries it, so a
+# build from the unpacked sdist runs it too and reads the version the sdist
+# recorded.
+include = [{ path = "scripts/gamfit_version.py", format = "sdist" }]
 
 [tool.pytest.ini_options]
 # Use importlib mode so pytest does not prepend each test file's parent

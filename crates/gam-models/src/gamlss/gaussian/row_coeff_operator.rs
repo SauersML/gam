@@ -787,6 +787,82 @@ impl ExactNewtonJointHessianWorkspace for GaussianLocationScaleHessianWorkspace 
         }
     }
 
+    /// `Σᵢ |Xᵢⱼ·scoreᵢ|` for the gradient `g = [Xμᵀ(−scoreμ); X_lsᵀ(−score_ls)]`
+    /// ([`GaussianLocationScaleFamily::exact_newton_joint_gradient_from_designs`]).
+    ///
+    /// At a mode the assembled gradient is near zero while each row's term is of
+    /// order `|y − μ|/σ²`, which grows without bound as σ shrinks against the
+    /// response. A noise SD at 1e-4 of the spread gives terms near 1e4 in the
+    /// standardized fit, so the sum rounds at about 1e-10, and a band built on the
+    /// assembled gradient asked the inner solve for a residual of 1e-11 that its
+    /// arithmetic cannot represent.
+    fn joint_gradient_accumulation(
+        &self,
+    ) -> Result<Option<gam_linalg::roundoff::GradientAccumulation>, String> {
+        let etamu = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU].eta;
+        let eta_ls = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA].eta;
+        let rows = self.family.get_or_compute_row_scalars(etamu, eta_ls)?;
+        let n = etamu.len();
+        let zero = Array1::<f64>::zeros(n);
+        let weights = gaussian_joint_psi_firstweights(&rows, &zero, &zero);
+        let absolute_design_sums = |design: &Array2<f64>, score: &Array1<f64>| {
+            design.t().mapv(f64::abs).dot(&score.mapv(f64::abs))
+        };
+        let mu_sums = absolute_design_sums(self.xmu.as_ref(), &weights.scoremu);
+        let ls_sums = absolute_design_sums(self.x_ls.as_ref(), &weights.score_ls);
+        Ok(Some(gam_linalg::roundoff::GradientAccumulation {
+            accumulation_depth: n,
+            absolute_sums: gaussian_pack_joint_score(&mu_sums, &ls_sums),
+        }))
+    }
+
+    /// The error each row's score inherits from its predictors: `η_k = X_k β_k`
+    /// is formed to within `δη_k = γ_{p_k+1}·Σ_l |X_k,il β_k,l|`, and the score
+    /// `(s_μ, s_ls)` moves by the row Hessian times that, so row `i` contributes
+    /// `|X_k,ij|·(|H_k,μ|·δη_μ + |H_k,ls|·δη_ls)` to coordinate `j` of block `k`.
+    ///
+    /// At high signal-to-noise this is the gradient's leading rounding term, not the
+    /// row sum's: `s_μ = (y − μ)/σ²` resolves `μ` only to its own ulp, which at a
+    /// noise SD below 1e-3 of the spread is about 1e-12 of σ, and the Newton iterate
+    /// then alternates between two coefficient vectors whose computed residuals
+    /// differ by that much (1.4e-7 and 8.8e-8 against a target of 1e-11). The
+    /// offset's term is omitted from `δη`, so the band can only be too narrow.
+    fn joint_gradient_formation_bands(&self) -> Result<Option<Array1<f64>>, String> {
+        let mu_state = &self.block_states[GaussianLocationScaleFamily::BLOCK_MU];
+        let ls_state = &self.block_states[GaussianLocationScaleFamily::BLOCK_LOG_SIGMA];
+        let rows = self
+            .family
+            .get_or_compute_row_scalars(&mu_state.eta, &ls_state.eta)?;
+        let n = mu_state.eta.len();
+        let zero = Array1::<f64>::zeros(n);
+        let weights = gaussian_joint_psi_firstweights(&rows, &zero, &zero);
+        let predictor_formation = |design: &Array2<f64>, beta: &Array1<f64>, block: &str| {
+            if design.ncols() != beta.len() || design.nrows() != n {
+                return Err(format!(
+                    "Gaussian location-scale {block} design is {}x{} for {} coefficients and {n} rows",
+                    design.nrows(),
+                    design.ncols(),
+                    beta.len()
+                ));
+            }
+            let growth = gam_linalg::roundoff::accumulation_growth(beta.len() + 1);
+            Ok(design.mapv(f64::abs).dot(&beta.mapv(f64::abs)) * growth)
+        };
+        let mu_formation = predictor_formation(self.xmu.as_ref(), &mu_state.beta, "mean")?;
+        let ls_formation = predictor_formation(self.x_ls.as_ref(), &ls_state.beta, "log-sigma")?;
+        let mut mu_term = Array1::<f64>::zeros(n);
+        let mut ls_term = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            mu_term[i] = weights.hmumu[i].abs() * mu_formation[i]
+                + weights.hmu_ls[i].abs() * ls_formation[i];
+            ls_term[i] = weights.hmu_ls[i].abs() * mu_formation[i]
+                + weights.h_ls_ls[i].abs() * ls_formation[i];
+        }
+        let mu_bands = self.xmu.t().mapv(f64::abs).dot(&mu_term);
+        let ls_bands = self.x_ls.t().mapv(f64::abs).dot(&ls_term);
+        Ok(Some(gaussian_pack_joint_score(&mu_bands, &ls_bands)))
+    }
+
     fn hessian_dense(&self) -> Result<Option<Array2<f64>>, String> {
         // Same Hv structure as `hessian_matvec`, but built once via 3 GEMMs
         // (`Xᵀ diag(W) X` per block) instead of letting

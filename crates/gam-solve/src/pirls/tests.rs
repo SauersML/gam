@@ -2642,10 +2642,10 @@ mod tests {
         );
     }
 
-    #[test]
-    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
-        let x = array![[1.0], [1.0], [1.0], [1.0], [1.0], [1.0]];
-        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+    /// Intercept-only Gamma PIRLS fit under `link`: returns the fitted shape,
+    /// the shape re-profiled at the converged η, and the fitted mean.
+    fn intercept_only_gamma_fit(link: StandardLink, y: &Array1<f64>) -> (f64, f64, f64) {
+        let x = Array2::<f64>::ones((y.len(), 1));
         let w = Array1::ones(y.len());
         let offset = Array1::zeros(y.len());
         let rho = array![0.0];
@@ -2669,9 +2669,9 @@ mod tests {
         let config = PirlsConfig {
             likelihood: GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
                 ResponseFamily::Gamma,
-                InverseLink::Standard(StandardLink::Log),
+                InverseLink::Standard(link),
             )),
-            link_kind: InverseLink::Standard(StandardLink::Log),
+            link_kind: InverseLink::Standard(link),
             max_iterations: 100,
             convergence_tolerance: 1e-8,
             firth_bias_reduction: false,
@@ -2706,15 +2706,26 @@ mod tests {
             .likelihood
             .gamma_shape()
             .expect("gamma fit should expose fitted shape");
-        let profiled_shape =
-            super::estimate_gamma_shape_from_eta(
-                &result.likelihood.spec.link,
-                y.view(),
-                &result.final_eta.to_owned(),
-                w.view(),
-            )
-                .expect("converged Gamma shape must be representable");
+        let profiled_shape = super::estimate_gamma_shape_from_eta(
+            &result.likelihood.spec.link,
+            y.view(),
+            &result.final_eta.to_owned(),
+            w.view(),
+        )
+        .expect("converged Gamma shape must be representable");
+        let eta = result.final_eta[0];
+        let mean = match link {
+            StandardLink::Log => eta.exp(),
+            StandardLink::Inverse => eta.recip(),
+            other => panic!("not a Gamma link: {other:?}"),
+        };
+        (fitted_shape, profiled_shape, mean)
+    }
 
+    #[test]
+    pub(crate) fn gamma_log_fit_profiles_shape_instead_of_fixing_one() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let (fitted_shape, profiled_shape, _) = intercept_only_gamma_fit(StandardLink::Log, &y);
         assert!(fitted_shape > 1.0, "shape should not stay fixed at one");
         assert_relative_eq!(
             fitted_shape,
@@ -2722,6 +2733,24 @@ mod tests {
             epsilon = 1e-10,
             max_relative = 1e-10
         );
+    }
+
+    /// The shape MLE reads μ through the fit's own link. An intercept-only fit
+    /// has μ̂ = ȳ under every link, so the inverse-link shape must equal the
+    /// log-link one; reading μ = exp(η) at the inverse-link η = 1/ȳ instead
+    /// profiled the shape against the wrong mean (the fuzzer's gamma(inverse)
+    /// cells reported φ ≈ 1.5 on data drawn at φ = 1/3).
+    #[test]
+    pub(crate) fn gamma_inverse_fit_profiles_shape_on_its_own_link() {
+        let y = array![0.8, 1.1, 1.7, 2.0, 2.6, 3.1];
+        let ybar = y.mean().expect("nonempty response");
+        let (log_shape, _, log_mean) = intercept_only_gamma_fit(StandardLink::Log, &y);
+        let (inv_shape, inv_profiled, inv_mean) =
+            intercept_only_gamma_fit(StandardLink::Inverse, &y);
+        assert_relative_eq!(log_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_mean, ybar, max_relative = 1e-8);
+        assert_relative_eq!(inv_shape, inv_profiled, epsilon = 1e-10, max_relative = 1e-10);
+        assert_relative_eq!(inv_shape, log_shape, max_relative = 1e-6);
     }
 
     /// Identity-Poisson with a group whose counts are all zero: the likelihood
@@ -3614,23 +3643,102 @@ mod root_cause_tests {
         }
     }
 
-    /// Hypothesis 1: `projected_gradient_norm` uses `bound_tol = 1e-10` which
-    /// is too tight.  A coefficient at 1e-6 above its lower bound with a
-    /// positive gradient (KKT multiplier) should be recognized as "at the
-    /// bound" and excluded from the projected gradient.
+    /// A coordinate is at its lower bound exactly when the bound's unit row is
+    /// active by the inequality system's one activity rule, at the solver's
+    /// published feasibility resolution (#3180). Then a positive gradient is a
+    /// KKT multiplier and drops out. A coordinate 1e-6 above its bound is 100
+    /// times outside that resolution: it is interior, a step of 1e-6 toward the
+    /// bound still lowers the objective by about `0.5 · 1e-6`, and its gradient
+    /// is a stationarity defect. The band this used to pass under
+    /// (`1e-6·max(|β|, |lb|, 1) + 1e-10`) called that point stationary.
     #[test]
     pub(crate) fn projected_gradient_excludes_near_bound_kkt_forces() {
         let gradient = array![0.5, 1e-4];
-        let beta = array![1e-6, 2.0];
         let lower_bounds = array![0.0, f64::NEG_INFINITY];
+        for at_bound in [0.0, 0.5 * gam_problem::PRIMAL_FEASIBILITY_TOL] {
+            let beta = array![at_bound, 2.0];
+            let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
+            assert_eq!(
+                norm, 1e-4,
+                "the multiplier of a bound at slack {at_bound:e} must drop out"
+            );
+        }
+        let beta = array![1e-6, 2.0];
         let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
-        // Correct: only beta[1]'s gradient counts -> norm ~ 1e-4.
-        // BUG: bound_tol=1e-10 misses beta[0] at 1e-6 -> norm ~ 0.5.
-        assert!(
-            norm < 0.01,
-            "projected gradient should exclude near-bound KKT force (beta=1e-6, lb=0), got {:.6e}",
-            norm
+        assert_eq!(
+            norm,
+            (0.5_f64 * 0.5 + 1e-4 * 1e-4).sqrt(),
+            "an interior coordinate's gradient is a stationarity defect"
         );
+    }
+
+    /// The issue's repro (#3180): `f(β) = ½(β − c)²`, `lb = 0`, `c = −3e-7`, at
+    /// `β = 5e-7`. The constrained minimizer is `β* = 0`, so this point is not
+    /// stationary, and `g = β − c = 8e-7` is the defect the norm must report.
+    #[test]
+    pub(crate) fn projected_gradient_reports_an_interior_point_short_of_its_bound_3180() {
+        let c = -3e-7;
+        let beta = array![5e-7];
+        let gradient = array![beta[0] - c];
+        let norm = projected_gradient_norm(&gradient, &beta, Some(&array![0.0]));
+        assert_eq!(norm, gradient[0]);
+        assert!(norm > 0.0);
+    }
+
+    /// One activity rule (#3180): on every instance, the bounds the P-IRLS box
+    /// path treats as binding are exactly the rows `active_face` marks active on
+    /// the same bounds written as unit rows, among those the gradient presses
+    /// into. Slacks straddle the feasibility resolution from both sides.
+    #[test]
+    pub(crate) fn box_bounds_bind_exactly_where_the_active_face_is_active_3180() {
+        let tol = gam_problem::PRIMAL_FEASIBILITY_TOL;
+        let slacks = [
+            0.0,
+            0.25 * tol,
+            tol,
+            1.5 * tol,
+            1e-7,
+            5e-7,
+            1e-6,
+            0.3,
+            -0.5 * tol,
+        ];
+        let bounds = [0.0, -2.0, 1.0, 1e3];
+        let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _instance in 0..64 {
+            let p = 7;
+            let mut beta = Array1::<f64>::zeros(p);
+            let mut lower_bounds = Array1::<f64>::zeros(p);
+            let mut gradient = Array1::<f64>::zeros(p);
+            for i in 0..p {
+                let lb = bounds[(next() % bounds.len() as u64) as usize];
+                lower_bounds[i] = lb;
+                beta[i] = lb + slacks[(next() % slacks.len() as u64) as usize];
+                gradient[i] = ((next() % 2001) as f64 - 1000.0) / 250.0;
+            }
+            let constraints = LinearInequalityConstraints {
+                a: Array2::<f64>::eye(p),
+                b: lower_bounds.clone(),
+            };
+            let face = crate::active_set::active_face(&beta, &constraints)
+                .expect("unit rows match the coefficient width");
+            let expected = (0..p)
+                .filter(|&i| !(face.active_idx.contains(&i) && gradient[i] > 0.0))
+                .map(|i| gradient[i] * gradient[i])
+                .sum::<f64>()
+                .sqrt();
+            let norm = projected_gradient_norm(&gradient, &beta, Some(&lower_bounds));
+            assert_eq!(
+                norm, expected,
+                "beta={beta:?} lb={lower_bounds:?} g={gradient:?}"
+            );
+        }
     }
 
     /// Hypothesis 2: with loosened active_tol, the solver identifies near-bound
@@ -3709,19 +3817,8 @@ mod root_cause_tests {
         assert!(kkt.stationarity <= 1e-12);
     }
 
-    /// The user's large-scale pathological case: a fit with `n=320000`,
-    /// `p=20`, projected stationarity residual `‖g‖ = 1.465e-5`. The old
-    /// absolute test `‖g‖ < 1e-6` rejects this as non-converged, even
-    /// though the normalized residual is ~2.6e-8. After the fix, the
-    /// scale-invariant certificate accepts it under EITHER bound.
-    #[test]
-    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
-        let n = 320_000usize;
-        let p = 20usize;
-        let g_norm = 1.465e-5;
-        let tol = 1e-6;
-
-        let state = WorkingState {
+    fn certificate_state(n: usize, p: usize, natural_scale: f64) -> WorkingState {
+        WorkingState {
             eta: LinearPredictor::new(Array1::zeros(n)),
             gradient: Array1::zeros(p),
             hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
@@ -3731,19 +3828,20 @@ mod root_cause_tests {
             penalty_term: 0.0,
             firth: FirthDiagnostics::Inactive,
             hessian_curvature: HessianCurvatureKind::Fisher,
-            // At convergence the score and penalty gradient nearly cancel;
-            // both are O(√n) for standardized columns. Use a representative
-            // magnitude so the natural-scale bound has something to chew on.
-            gradient_natural_scale: 1.0e3,
-        };
+            gradient_natural_scale: natural_scale,
+        }
+    }
 
-        // Dimension-based bound: tol * sqrt(n) * sqrt(p) ≈ 1e-6 * 565.7 * 4.47 ≈ 2.5e-3
-        // Natural-scale bound: 1.465e-5 / (1 + 1e3) ≈ 1.5e-8
-        // Both pass; old absolute test 1.465e-5 < 1e-6 fails.
-        assert!(
-            state.certifies_kkt(g_norm, tol),
-            "scale-invariant certificate should accept large-scale pathological case"
-        );
+    /// The large-scale case: `n=320000`, `p=20`, projected stationarity
+    /// residual `‖g‖ = 1.465e-5` on a natural scale of `1e3`. An absolute
+    /// test `‖g‖ < 1e-6` rejects it, though its dimensionless residual is
+    /// `1.5e-8`; the certificate accepts it.
+    #[test]
+    pub(crate) fn certifies_kkt_accepts_large_scale_pathological_case() {
+        let g_norm = 1.465e-5;
+        let tol = 1e-6;
+        let state = certificate_state(320_000, 20, 1.0e3);
+        assert!(state.certifies_kkt(g_norm, tol));
         assert!(
             !(g_norm < tol),
             "this test must witness the failure of the old absolute test; \
@@ -3751,113 +3849,67 @@ mod root_cause_tests {
         );
     }
 
-    /// The strict KKT certificate must be invariant under uniform rescaling
-    /// of the objective `F → c·F` (which scales `‖g‖`, `‖score‖`, and
-    /// `‖S·β‖` all by the same `c`). The additive `1` floor in the
-    /// natural-scale denominator makes the test approximately invariant
-    /// at small natural scale and exactly invariant in the limit.
+    /// The certificate is exactly invariant under a uniform rescaling of the
+    /// gradient (`F → c·F`, or `β → β/c`), which scales `‖g‖`, `‖score‖` and
+    /// `‖S·β‖` together, at EVERY natural scale — not only once the natural
+    /// scale dominates an additive floor.
     #[test]
     pub(crate) fn certifies_kkt_is_scale_invariant() {
-        let n = 1000usize;
-        let p = 10usize;
-        let tol = 1e-6;
-        let g_norm = 1.0;
-        let natural_scale = 5.0e6; // dominates the +1 floor
-
-        let mk_state = |g: Array1<f64>, ns: f64| WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: g,
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: ns,
-        };
-
-        let base = mk_state(Array1::zeros(p), natural_scale);
-        let scaled = mk_state(Array1::zeros(p), natural_scale * 1000.0);
-
-        // Numerator scales by c; denominator scales by c when the natural
-        // scale dominates. So r_g is invariant.
-        assert_eq!(
-            base.certifies_kkt(g_norm, tol),
-            scaled.certifies_kkt(g_norm * 1000.0, tol),
-            "KKT classification must be invariant under uniform F → c·F"
-        );
+        let tol = 1e-8;
+        for natural_scale in [1.0e-5, 1.0, 5.0e6] {
+            for residual in [1.0e-10, 1.0e-6] {
+                let g_norm = residual * natural_scale;
+                let verdict = certificate_state(1000, 10, natural_scale).certifies_kkt(g_norm, tol);
+                assert_eq!(verdict, residual < tol);
+                for c in [1.0e-6, 1.0e6] {
+                    assert_eq!(
+                        certificate_state(1000, 10, natural_scale * c).certifies_kkt(g_norm * c, tol),
+                        verdict,
+                        "KKT classification must be invariant under g → c·g (scale {natural_scale:e}, c {c:e})"
+                    );
+                }
+            }
+        }
     }
 
-    /// The two scale-invariant certificates must each be sufficient on its
-    /// own (acceptance under EITHER suffices). One is data-driven (natural
-    /// scale), the other purely structural (sqrt(n)·sqrt(p)). Both should
-    /// accept obviously-converged states; failures of one should not block
-    /// the other.
+    /// The canonical inverse-Gaussian inner solve at a small-unit response:
+    /// P-IRLS stopped at `‖g‖ = 4.72e-12` on a natural scale of order `1e-5`,
+    /// two steps into a solve whose mode (the same data at ten times the
+    /// units) sits nine steps away. The dimension bound `τ·√n·√p` and the
+    /// additive `1 +` floor both read that residual in the gradient's own
+    /// units and certified it; its dimensionless residual `4.7e-7` is far
+    /// above `τ` and must not certify.
     #[test]
-    pub(crate) fn certifies_kkt_accepts_under_either_bound() {
-        let n = 100usize;
-        let p = 5usize;
-        let tol = 1e-6;
-
-        let state_well_scaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 1.0e6,
-        };
-        // Natural-scale bound: 1.0 / (1+1e6) ≈ 1e-6 → at threshold; pass.
-        // Dimension bound: 1.0 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.2e-5 → fail.
-        // Acceptance under EITHER: pass (via natural-scale).
-        assert!(state_well_scaled.certifies_kkt(0.99e-6 * (1.0 + 1.0e6), tol));
-
-        let state_unscaled = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 0.0,
-        };
-        // Natural-scale bound: 2e-6 / 1 = 2e-6 → fail (above tol=1e-6).
-        // Dimension bound: 2e-6 < 1e-6 * sqrt(100) * sqrt(5) ≈ 2.236e-5 → pass.
-        // Acceptance under EITHER: pass (via dimension).
-        assert!(state_unscaled.certifies_kkt(2.0e-6, tol));
+    pub(crate) fn certifies_kkt_refuses_small_unit_residual_far_from_mode() {
+        let tol = 1e-10;
+        let state = certificate_state(500, 23, 1.0e-5);
+        assert!(!state.certifies_kkt(4.72e-12, tol));
+        assert!(!state.near_stationary_kkt(4.72e-12, tol));
+        assert!(state.certifies_kkt(4.72e-12 * 1.0e-4, tol));
     }
 
-    /// The near-stationary band is exactly 10× the strict KKT tolerance,
-    /// applied under either bound. It classifies a usable but non-strictly
+    /// An exactly zero residual is stationary on any natural scale, zero
+    /// included; a nonzero residual on a zero natural scale is not resolved by
+    /// the ratio and is left to the exact Newton decrement.
+    #[test]
+    pub(crate) fn certifies_kkt_on_zero_natural_scale() {
+        let tol = 1e-6;
+        let state = certificate_state(100, 5, 0.0);
+        assert!(state.certifies_kkt(0.0, tol));
+        assert!(state.near_stationary_kkt(0.0, tol));
+        assert!(!state.certifies_kkt(2.0e-6, tol));
+        assert!(!state.near_stationary_kkt(2.0e-6, tol));
+    }
+
+    /// The near-stationary band is exactly 10× the strict KKT tolerance on the
+    /// same dimensionless residual. It classifies a usable but non-strictly
     /// converged minimum as `StalledAtValidMinimum` rather than as a hard
     /// non-convergence.
     #[test]
     pub(crate) fn near_stationary_kkt_uses_ten_times_band() {
-        let n = 100usize;
-        let p = 4usize;
         let tol = 1e-6;
-        let state = WorkingState {
-            eta: LinearPredictor::new(Array1::zeros(n)),
-            gradient: Array1::zeros(p),
-            hessian: gam_linalg::matrix::SymmetricMatrix::Dense(Array2::zeros((p, p))),
-            log_likelihood: 0.0,
-            deviance: 0.0,
-            deviance_magnitude: 0.0,
-            penalty_term: 0.0,
-            firth: FirthDiagnostics::Inactive,
-            hessian_curvature: HessianCurvatureKind::Fisher,
-            gradient_natural_scale: 99.0,
-        };
-        // Natural-scale band: relative ‖g‖ = g/(1+99) = g/100 ≤ 10·tol = 1e-5
-        // ⇒ accept when g ≤ 1e-3.
+        let state = certificate_state(100, 4, 100.0);
+        // Relative ‖g‖ = g/100 ≤ 10·tol = 1e-5 ⇒ accept when g ≤ 1e-3.
         assert!(state.near_stationary_kkt(9.9e-4, tol));
         assert!(!state.near_stationary_kkt(2.0e-3, tol));
         // Strict KKT at the same point should be ~10× tighter.

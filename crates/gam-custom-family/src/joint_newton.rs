@@ -1580,14 +1580,10 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
         let spec = &specs[b];
         let (start, end) = ranges[b];
         let p = end - start;
-        let lambdas = exact_lambdas_from_log_strengths(
-            &block_log_lambdas[b],
-            &format!("joint logdet block {b} log strength"),
-        )?;
-        let mut s_lambda = Array2::<f64>::zeros((p, p));
-        for (k, s) in spec.penalties.iter().enumerate() {
-            s.add_scaled_to(lambdas[k], &mut s_lambda);
-        }
+        // The block curvature and components every other consumer reads, on the
+        // roots (#2954).
+        let (s_lambda, block_terms) =
+            crate::blockwise_solve::block_penalty_roots(b, spec, &block_log_lambdas[b])?;
         let block_logdet = if include_logdet_s {
             // Pseudo-logdet of S_λ on the positive eigenspace.
             //
@@ -1606,10 +1602,13 @@ pub(crate) fn blockwise_logdet_terms_with_workspace<
             // magnitude rule). To guarantee value↔gradient agree by
             // construction, compute the value from the SAME canonical
             // `PenaltyPseudologdet` the gradient differentiates, with the same
-            // dense penalty components and the same λ.
-            let penalties_dense: Vec<Array2<f64>> =
-                spec.penalties.iter().map(|pen| pen.to_dense()).collect();
-            let lambdas_vec: Vec<f64> = lambdas.to_vec();
+            // penalty components (each `RᵀR` on its structural root, #2954) and the
+            // same λ.
+            let penalties_dense: Vec<Array2<f64>> = block_terms
+                .iter()
+                .map(|term| term.embedded_penalty(p))
+                .collect();
+            let lambdas_vec: Vec<f64> = block_terms.iter().map(|term| term.lambda).collect();
             match gam_solve::estimate::reml::penalty_logdet::PenaltyPseudologdet::from_components(
                 &penalties_dense,
                 &lambdas_vec,
@@ -2027,6 +2026,7 @@ pub(crate) fn update_joint_trust_region_radius(
     objective_scale: f64,
     objective_tol: f64,
     measured_resolution: f64,
+    evaluation_roundoff_ceiling: f64,
     residual_above_tolerance: bool,
 ) -> JointTrustRegionUpdate {
     // Round-off-aware trust-region radius control, delegated to the shared
@@ -2228,11 +2228,35 @@ pub(crate) fn update_joint_trust_region_radius(
     // to be interior, `step_reached_boundary` is false and this stops. The
     // factor and the cap are the SHARED controller's own (`policy`), not a
     // second opinion about how fast a trust region should grow.
+    //
+    // "RESOLVABLE" MEANS ABOVE WHAT THE ARITHMETIC CAN CARRY, NOT ABOVE WHAT
+    // HAS BEEN SEEN (gam#2977 S2). This branch overrides a rejection, so its
+    // premise — the realized change is a fact about `β` — must hold for every
+    // rounding the evaluation could carry, and the only number that bounds
+    // that from above is the evaluation's own arithmetic ceiling
+    // `γ_m·Σ|terms| + logdet_roundoff` ([`ObjectiveAccumulation`]). `noise_floor`
+    // is a LOWER bound: before any ladder has measured, it is the `|F|·1e-14`
+    // fallback, which is exactly what a cancelling evaluation exceeds. Measured
+    // on gnomon#2370's 48-row location-scale fixture: floor `2.4e-14`, the
+    // evaluation's rounding `2.64e-11` (the witness measured it one ladder
+    // later), and a realized `+2.330e-11` accepted here as a decrease. That
+    // accept ended the ladder the witness needed, the noise-decided shrinks
+    // stood at `r = 1.160e-10`, the next cycle's exact face was declined as
+    // touching the ball, and the solve refused on a fully-rejected stall.
+    // Requiring the change to clear the ceiling keeps that attempt a
+    // rejection, so the ladder continues and the witness undoes its shrinks.
+    //
+    // The asymmetry is deliberate: the controller's own "indistinguishable ⇒
+    // `rho = 1`" test above stays on the lower bound, because treating a
+    // resolvable change as noise is the error in THAT direction. A
+    // non-finite ceiling (an evaluation this module cannot size) cannot
+    // certify any change, so the override does not fire.
     if !step.accepted
         && step.predicted_nonpositive
         && predicted_reduction.is_finite()
         && predicted_reduction >= 0.0
         && actual_reduction > noise_floor
+        && actual_reduction > evaluation_roundoff_ceiling
     {
         let region_is_the_binding_constraint = step_reached_boundary && residual_above_tolerance;
         let radius = if region_is_the_binding_constraint {
@@ -2434,10 +2458,11 @@ pub(crate) fn joint_objective_roundoff_slack(
 /// to show.
 ///
 /// The accumulation is NOT `|F|`, which is the whole content of gam#2612: the
-/// penalty `½βᵀS_λβ` is evaluated as `β·(S_λβ)` with signed `S_ij`, so it sums
-/// `½Σ|β_i S_ij β_j|` while returning `O(10)`. That term is carried explicitly
-/// here, as each endpoint's own sum from one pass over the entries (gam#2959),
-/// which is what keeps the ceiling far above the resolutions gam#2612 was
+/// penalty's rounding is its own accumulation, carried explicitly here as each
+/// endpoint's. It was the dense `β·(S_λβ)` pass over signed `S_ij`, summing
+/// `½Σ|β_i S_ij β_j|` while returning `O(10)` (gam#2959); it is now the root
+/// form's (#2954, [`crate::blockwise_solve::BlockPenaltyRoots::value`]), whose
+/// terms `λ‖R_kβ‖²` do not cancel. That charge is what kept the ceiling far above the resolutions gam#2612 was
 /// opened to measure (its banded witness measures `6.1e-11` against a ceiling
 /// of `1.2e-6`) while refusing this one by nine orders. The cruder
 /// `max|S_λ|·‖β‖₁²` it replaced sat four decades higher on the survival
@@ -2492,10 +2517,10 @@ impl ObjectiveAccumulation {
     /// What comparing one evaluation of `F = −ℓ + ½βᵀS_λβ − Φ` at each of two
     /// coefficient vectors accumulates (gam#2748, gam#2959).
     ///
-    /// The summands are the likelihood's rows and every penalty entry. The
-    /// magnitude is both objective values plus what each endpoint's `½βᵀS_λβ`
-    /// summed, `½Σ|β_i S_ij β_j|` from one explicit pass
-    /// ([`crate::blockwise_solve::total_quadratic_penalty_with_accumulation`]).
+    /// The summands are the likelihood's rows and the penalty's accumulation
+    /// depth. The magnitude is both objective values plus each endpoint's penalty
+    /// accumulation, `(depth, magnitude)` of the root form
+    /// ([`crate::blockwise_solve::BlockPenaltyRoots::value`], #2954).
     /// The log-determinant rounding is both endpoints' certified bound.
     pub(crate) fn between_endpoints(
         likelihood_rows: usize,
@@ -5220,6 +5245,7 @@ pub(crate) fn compute_kkt_refusal_report(
     let mut hpen_eigenvalues_sorted_desc: Vec<f64> = Vec::new();
     let mut hpen_condition_number = f64::NAN;
     let mut hpen_nullity_at_rank_tol = 0usize;
+    let mut hpen_rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, total_p);
     let mut hpen_null_direction = None;
     let mut hlik_max_abs_eigenvalue = None;
     let mut hpen_spectrum_unavailable = false;
@@ -5229,10 +5255,10 @@ pub(crate) fn compute_kkt_refusal_report(
             materialize_joint_hessian_source(source, total_p, "KKT refusal diagnostic spectrum")
     {
         // Capture the likelihood-only spectrum BEFORE the penalty is folded in.
-        // If the relative rank cutoff (`KKT_REFUSAL_RANK_TOL·λ_max`) that flags a
-        // direction "null" was inflated by a likelihood-side curvature blow-up
-        // rather than the penalty, `λ_max(H_lik) ≈ λ_max(H_pen)`; a penalty-driven
-        // inflation leaves `λ_max(H_lik)` small. Runs only on the refusal path.
+        // A flagged direction's likelihood part is what tells a gauge null from a
+        // penalty-only identification, and `λ_max(H_lik) ≈ λ_max(H_pen)` says the
+        // curvature scale is set by the likelihood rather than the penalty. Runs
+        // only on the refusal path.
         let mut h_likelihood = h_joint.clone();
         symmetrize_dense_in_place(&mut h_likelihood);
         if let Ok((lik_evals, _)) = FaerEigh::eigh(&h_likelihood, Side::Lower) {
@@ -5254,7 +5280,17 @@ pub(crate) fn compute_kkt_refusal_report(
                     .iter()
                     .map(|x: &f64| x.abs())
                     .fold(f64::INFINITY, f64::min);
-                let cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+                // "Rank deficient" is a statement about RANK, so a direction
+                // counts as null only when its curvature is below H_pen's own
+                // eigensolver resolution (#2977 S6). The conditioning ratio
+                // `KKT_REFUSAL_RANK_TOL·λ_max` labelled full-rank stiff Hessians
+                // rank deficient: one −log q̇ guard row at 1/guard² = 1e12 put 48
+                // of 59 identified directions "null" (#3003), and that label is
+                // Jeffreys-arming evidence.
+                let cutoff = joint_hessian_numerical_eigenvalue_floor(max_abs, total_p);
+                if max_abs > 0.0 {
+                    hpen_rank_tol = cutoff / max_abs;
+                }
                 hpen_nullity_at_rank_tol = sorted.iter().filter(|x| x.abs() < cutoff).count();
                 hpen_condition_number = if min_abs > 0.0 && min_abs.is_finite() {
                     max_abs / min_abs
@@ -5356,7 +5392,7 @@ pub(crate) fn compute_kkt_refusal_report(
         hpen_eigenvalues_sorted_desc,
         hpen_condition_number,
         hpen_nullity_at_rank_tol,
-        hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+        hpen_rank_tol,
         hpen_null_direction,
         active_set_rows_total,
         accepted_step_inf,
@@ -5575,8 +5611,8 @@ mod kkt_refusal_spectrum_format_tests {
     fn indefinite_hpen_render_keeps_signed_extremes_and_magnitude_diagnostics_2659() {
         // The negative eigenvalue has the greatest magnitude. Algebraic
         // extrema are therefore (+5, -9), while the condition and rank cutoff
-        // must still use max|λ|=9 and min|λ|=1e-12.
-        let spectrum = vec![5.0_f64, 1.0e-12, -9.0];
+        // must still use max|λ|=9 and min|λ|=1e-16, below the √3·ε·9 resolution.
+        let spectrum = vec![5.0_f64, 1.0e-16, -9.0];
         let max_abs = spectrum
             .iter()
             .map(|value| value.abs())
@@ -5585,7 +5621,8 @@ mod kkt_refusal_spectrum_format_tests {
             .iter()
             .map(|value| value.abs())
             .fold(f64::INFINITY, f64::min);
-        let rank_cutoff = KKT_REFUSAL_RANK_TOL * max_abs;
+        let rank_tol = joint_hessian_numerical_eigenvalue_floor(1.0, spectrum.len());
+        let rank_cutoff = rank_tol * max_abs;
         let nullity = spectrum
             .iter()
             .filter(|value| value.abs() < rank_cutoff)
@@ -5602,13 +5639,13 @@ mod kkt_refusal_spectrum_format_tests {
             hpen_eigenvalues_sorted_desc: spectrum,
             hpen_condition_number: max_abs / min_abs,
             hpen_nullity_at_rank_tol: nullity,
-            hpen_rank_tol: KKT_REFUSAL_RANK_TOL,
+            hpen_rank_tol: rank_tol,
             hpen_null_direction: Some(KktNullDirectionDiagnostic {
                 projected_gradient_component_inf: 0.0,
                 vector_block_inf: vec![0.0],
                 carrying_block: Some(0),
-                penalized_curvature: 1.0e-12,
-                likelihood_curvature: 1.0e-12,
+                penalized_curvature: 1.0e-16,
+                likelihood_curvature: 1.0e-16,
                 likelihood_max_abs_eigenvalue: Some(5.0),
             }),
             active_set_rows_total: 0,
@@ -5626,7 +5663,7 @@ mod kkt_refusal_spectrum_format_tests {
             diagnosis: KktRefusalDiagnosis::RankDeficientHPen,
             constrained_fixed_point_verdict: None,
         };
-        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e12, nullity@1e-10=1 \
+        let expected = "λ_max=5.000e0, λ_min=-9.000e0, cond=9.000e16, nullity@4e-16=1 \
              (of 3 eigenvalues)";
 
         assert_eq!(max_abs, 9.0);

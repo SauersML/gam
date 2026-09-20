@@ -20,6 +20,9 @@
 //
 // Each computed value sits within its own `band_f` of the exact criterion, so
 // a decrease is resolved exactly when it exceeds `band_f(V_k) + band_f(V_{k+1})`.
+// An accepted step stalls when neither its measured nor
+// its model's predicted decrease is resolved, and one stalled step reaches the
+// verdict (#3018): there is no window.
 
 use super::*;
 use crate::estimate::outer_eval_capture::{
@@ -34,8 +37,8 @@ use ndarray::array;
 const V0_3018: f64 = 1.0e5;
 
 /// `V(ρ) = V0 − ρ`: a constant gradient `−1`, a thousand times the claim band,
-/// so no iterate is stationary and every filled window is a stall the guard
-/// declared on cost alone.
+/// so no iterate is stationary and every stall is one the guard declared on
+/// cost alone.
 fn value_3018(rho: f64) -> f64 {
     V0_3018 - rho
 }
@@ -62,23 +65,32 @@ fn fallback_3018(config: &OuterConfig) -> f64 {
     crate::rho_optimizer::outer_criterion_resolution(config)
 }
 
-/// The fallback at the seed, `τ_stat = 1e-2`, whatever `|V0|` is.
+/// The resolution a value carries when its evaluation publishes no evidence:
+/// the criterion's statistical resolution `τ_stat = 1/(2n) = 1e-2`, whatever `|V0|` is.
 fn tau_3018() -> f64 {
     fallback_3018(&config_3018())
 }
 
-/// Resolvable progress the fallback resolution refuses: each step buys a quarter of
-/// the fallback, and an inner residual of `1e-9` puts the band sum at `2e-9`.
+/// Resolvable progress the fallback resolution refuses: each step buys a quarter
+/// of `τ`, and an inner residual of `1e-9` puts the band sum at `2e-9`. Without
+/// evidence the pair of fallbacks is `2e-2`, eight steps' worth.
 fn resolvable_3018() -> (f64, f64) {
     (0.25 * tau_3018(), 1.0e-9)
 }
 
 /// Progress inside the band the fallback resolution admits: each step buys 2.5x
-/// the fallback, and an inner residual of twice the step puts the band sum above four
-/// steps, so even a whole ARC window of them is not resolved.
+/// `τ`, and an inner residual of twice the step puts the band sum above four
+/// steps. Without evidence the step clears the pair of fallbacks, `2e-2`.
 fn unresolvable_3018() -> (f64, f64) {
     let step = 2.5 * tau_3018();
     (step, 2.0 * step)
+}
+
+/// The resolution of a value `V` whose evaluation published `inner_residual`
+/// (`None`: nothing), as every bridge charges it.
+fn resolution_3018(value: f64, inner_residual: Option<f64>) -> f64 {
+    let evidence = inner_residual.map_or_else(CertificateEvidence::default, evidence_3018);
+    sample_resolution(&config_3018(), tau_3018(), value, &evidence)
 }
 
 fn evidence_3018(inner_residual: f64) -> CertificateEvidence {
@@ -184,70 +196,70 @@ fn objective_band_is_formed_from_the_evaluations_own_evidence_3018() {
 }
 
 /// Drive the guard alone over `steps` accepted iterates of `V0 − k·step`, each
-/// staged with the band its evidence forms (`None`: no evidence). Returns every
-/// verdict.
+/// carrying the resolution its evidence gives (`None`: no evidence, so `τ`).
+/// Each step's linear model predicts exactly its decrease, `−gᵀs = step`, as a
+/// line search on `V0 − ρ` does. Returns every verdict.
 fn drive_guard_3018(step: f64, inner_residual: Option<f64>, steps: usize) -> Vec<CostStallVerdict> {
     let config = config_3018();
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(fallback_3018(&config), COST_STALL_WINDOW, &config, exit);
-    let band_at = |guard: &CostStallGuard, value: f64| {
-        inner_residual.and_then(|energy| guard.objective_band(value, &evidence_3018(energy)))
-    };
-    let seed_band = band_at(&guard, V0_3018);
-    guard.stage_objective_band(seed_band);
-    guard.observe_seed(&array![0.0], V0_3018, 1.0);
+    let mut guard = CostStallGuard::new(tau_3018(), &config, exit);
+    guard.observe_seed(&array![0.0], V0_3018, resolution_3018(V0_3018, inner_residual), 1.0);
     (1..=steps)
         .map(|k| {
-            let rho = k as f64 * step;
-            let value = value_3018(rho);
-            let band = band_at(&guard, value);
-            guard.stage_objective_band(band);
-            guard.observe(&array![rho], value, 1.0, true)
+            let rho = array![k as f64 * step];
+            let value = value_3018(rho[0]);
+            guard.observe(
+                StallSample {
+                    point: &rho,
+                    value,
+                    resolution: resolution_3018(value, inner_residual),
+                    grad_norm: 1.0,
+                    trusted: true,
+                    curvature_psd: None,
+                },
+                step,
+            )
         })
         .collect()
 }
 
-/// The guard's decision is the band sum where both values carry one, and the
-/// fallback resolution where either does not, in both directions.
+/// The guard's decision is the pair of resolutions the two values carry: their
+/// bands where the evaluations publish evidence, `τ` where they do not,
+/// in both directions. A step that is not resolved, and whose model promised no
+/// more, stalls at once.
 #[test]
 fn the_guard_resolves_a_decrease_against_the_band_sum_3018() {
     let config = config_3018();
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let guard = CostStallGuard::new(fallback_3018(&config), COST_STALL_WINDOW, &config, exit);
+    let guard = CostStallGuard::new(tau_3018(), &config, exit);
     assert!(
         guard.stationarity_band() < 1.0,
         "the fixture's |g| = 1 must be outside the claim band, or every step is a stall"
     );
-    let steps = 3 * COST_STALL_WINDOW;
+    let steps = 18;
 
     let (step, inner_residual) = resolvable_3018();
     let banded = drive_guard_3018(step, Some(inner_residual), steps);
     assert!(
         banded.iter().all(|verdict| matches!(verdict, CostStallVerdict::Continue)),
         "steps of {step:.3e} against a band sum of {:.3e} are resolved progress and never \
-         fill a window: {banded:?}",
+         stall: {banded:?}",
         2.0 * inner_residual,
     );
     let floored = drive_guard_3018(step, None, steps);
     assert!(
-        matches!(
-            floored[COST_STALL_WINDOW - 1],
-            CostStallVerdict::StuckKeepDescending { .. }
-        ),
-        "the control: with no evidence the fallback {:.3e} refuses every {step:.3e} step and \
-         the window fills at step {COST_STALL_WINDOW}: {floored:?}",
+        matches!(floored[0], CostStallVerdict::StuckKeepDescending { .. }),
+        "the control: with no evidence each value carries τ = {:.3e}, so a {step:.3e} \
+         step, predicted as {step:.3e}, is not resolved and the first one stalls: {floored:?}",
         tau_3018(),
     );
 
     let (step, inner_residual) = unresolvable_3018();
     let banded = drive_guard_3018(step, Some(inner_residual), steps);
     assert!(
-        matches!(
-            banded[COST_STALL_WINDOW - 1],
-            CostStallVerdict::StuckKeepDescending { .. }
-        ),
-        "steps of {step:.3e} inside a band sum of {:.3e} are not resolved, and the window \
-         fills at step {COST_STALL_WINDOW}: {banded:?}",
+        matches!(banded[0], CostStallVerdict::StuckKeepDescending { .. }),
+        "steps of {step:.3e} inside a band sum of {:.3e} are not resolved, and the first \
+         one stalls: {banded:?}",
         4.0 * step,
     );
     let floored = drive_guard_3018(step, None, steps);
@@ -260,8 +272,10 @@ fn the_guard_resolves_a_decrease_against_the_band_sum_3018() {
 
 /// Drive the dense ARC bridge from the seed `ρ = 0` over `steps` accepted
 /// iterates `ρ_k = k·step`, each evaluation publishing `inner_residual` to the
-/// capture the bridge arms. The seed carries no band, as the run's seed does.
-/// Returns every outcome up to the first stop and the guard's escape count.
+/// capture the bridge arms. The seed carries the resolution its own evidence
+/// gives, as the run's seed does. Each step is reported accepted by a model that
+/// predicted no decrease, so its measured decrease alone decides it. Returns
+/// every outcome up to the first stop and the guard's escape count.
 fn drive_arc_3018(
     step: f64,
     inner_residual: Option<f64>,
@@ -295,11 +309,17 @@ fn drive_arc_3018(
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(fallback_3018(&config), ARC_COST_STALL_WINDOW, &config, exit);
-    guard.observe_second_order_seed(&array![0.0], V0_3018, 1.0, Some(true));
+    let mut guard = CostStallGuard::new(tau_3018(), &config, exit);
+    guard.observe_second_order_seed(
+        &array![0.0],
+        V0_3018,
+        resolution_3018(V0_3018, inner_residual),
+        1.0,
+        Some(true),
+    );
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     // No decrement verdict and no curvature stop: the guard's cost test alone
-    // decides whether a window fills. The capture is armed for the guard.
+    // decides whether a step stalls. The capture is armed for the guard.
     let mut bridge = OuterSecondOrderBridge {
         obj: &mut obj,
         layout: OuterThetaLayout::new(1, 0),
@@ -330,7 +350,7 @@ fn drive_arc_3018(
     let escapes = bridge
         .cost_stall
         .as_ref()
-        .map_or(0, |guard| guard.stuck_escapes);
+        .map_or(0, CostStallGuard::stuck_escapes);
     (outcomes, escapes)
 }
 
@@ -338,7 +358,7 @@ fn drive_arc_3018(
 /// at `|g| = 1`, and descent inside the band no longer reads as progress.
 #[test]
 fn arc_stops_on_the_band_sum_not_the_relative_floor_3018() {
-    let steps = 4 * ARC_COST_STALL_WINDOW;
+    let steps = 12;
 
     let (step, inner_residual) = resolvable_3018();
     let (banded, escapes) = drive_arc_3018(step, Some(inner_residual), steps);
@@ -346,26 +366,30 @@ fn arc_stops_on_the_band_sum_not_the_relative_floor_3018() {
     assert!(banded.iter().all(Result::is_ok), "{banded:?}");
     assert_eq!(
         escapes, 0,
-        "steps of {step:.3e} its evaluations resolve to {:.3e} never fill a window",
+        "steps of {step:.3e} its evaluations resolve to {:.3e} never stall",
         2.0 * inner_residual,
     );
+    // With no evidence each value carries `τ`, so each step's decrease is
+    // unresolved against the pair (eight steps' worth), and the model
+    // predicted none: every step stalls. The first stall escapes at |g| = 1; the
+    // second finds no resolved descent since the first, and stops the run (#2817).
     let (floored, _) = drive_arc_3018(step, None, steps);
     assert_eq!(
         floored.last(),
         Some(&Err(ARC_UNPROGRESSING_STALL_SENTINEL.to_string())),
-        "the control: with no evidence the fallback {:.3e} reads two windows of {step:.3e} \
-         steps as bought nothing and stops the run at |g| = 1: {floored:?}",
+        "the control: with no evidence τ = {:.3e} reads {step:.3e} steps as bought \
+         nothing and stops the run at |g| = 1: {floored:?}",
         tau_3018(),
     );
-    assert_eq!(floored.len(), 2 * ARC_COST_STALL_WINDOW, "{floored:?}");
+    assert_eq!(floored.len(), 2, "the second stall stops the run: {floored:?}");
 
     let (step, inner_residual) = unresolvable_3018();
     let (banded, _) = drive_arc_3018(step, Some(inner_residual), steps);
     assert_eq!(
         banded.last(),
         Some(&Err(ARC_UNPROGRESSING_STALL_SENTINEL.to_string())),
-        "windows of {step:.3e} steps inside a band sum of {:.3e} buy nothing the criterion \
-         resolves, so the second one stops the run: {banded:?}",
+        "{step:.3e} steps inside a band sum of {:.3e} buy nothing the criterion resolves, \
+         so the second stall stops the run: {banded:?}",
         4.0 * step,
     );
     let (floored, escapes) = drive_arc_3018(step, None, steps);
@@ -405,12 +429,7 @@ fn drive_operator_3018(
         None::<fn(&mut ())>,
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
-    let guard = CostStallGuard::new(
-        fallback_3018(&config),
-        ARC_COST_STALL_WINDOW,
-        &config,
-        Arc::new(Mutex::new(None)),
-    );
+    let guard = CostStallGuard::new(tau_3018(), &config, Arc::new(Mutex::new(None)));
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterOperatorBridge {
         obj: &mut obj,
@@ -446,7 +465,7 @@ fn drive_operator_3018(
 /// The matrix-free trust-region route decides on the same band sum.
 #[test]
 fn the_operator_route_stops_on_the_band_sum_not_the_relative_floor_3018() {
-    let steps = 4 * ARC_COST_STALL_WINDOW;
+    let steps = 12;
 
     let (step, inner_residual) = resolvable_3018();
     let banded = drive_operator_3018(step, Some(inner_residual), steps);
@@ -471,9 +490,12 @@ fn the_operator_route_stops_on_the_band_sum_not_the_relative_floor_3018() {
 }
 
 /// Drive the first-order bridge from the seed `ρ = 0` over accepted iterates
-/// `ρ_k = k·step`, each accepted by the ledger after its evaluation. Returns the
-/// guard's escape count: the windows it filled at the non-stationary `|g| = 1`.
-fn drive_first_order_3018(step: f64, inner_residual: Option<f64>, steps: usize) -> usize {
+/// `ρ_k = k·step`, each accepted by the ledger after its evaluation with the
+/// decrease its linear model predicted, `−gᵀs = step`. The seed carries the
+/// resolution its own evidence gives. Returns the guard's escape count (the
+/// stalls it let continue at the non-stationary `|g| = 1`) and whether the run
+/// stopped.
+fn drive_first_order_3018(step: f64, inner_residual: Option<f64>, steps: usize) -> (usize, bool) {
     let problem = OuterProblem::new(1)
         .with_gradient(Derivative::Analytic)
         .with_hessian(DeclaredHessianForm::Unavailable);
@@ -494,8 +516,8 @@ fn drive_first_order_3018(step: f64, inner_residual: Option<f64>, steps: usize) 
         None::<fn(&mut (), &Array1<f64>) -> Result<EfsEval, EstimationError>>,
     );
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(fallback_3018(&config), COST_STALL_WINDOW, &config, exit);
-    guard.observe_seed(&array![0.0], V0_3018, 1.0);
+    let mut guard = CostStallGuard::new(tau_3018(), &config, exit);
+    guard.observe_seed(&array![0.0], V0_3018, resolution_3018(V0_3018, inner_residual), 1.0);
     let ledger: Arc<AcceptedStepLedger> = Arc::default();
     let mut bridge = OuterFirstOrderBridge {
         obj: &mut obj,
@@ -508,77 +530,101 @@ fn drive_first_order_3018(step: f64, inner_residual: Option<f64>, steps: usize) 
         value_probe_cache: Vec::new(),
         cost_stall: Some(guard),
         cost_stall_bounds: Some((array![-30.0], array![30.0])),
-        consecutive_probe_refusals: 0,
         accepted_steps: Arc::clone(&ledger),
         pending_first_order: Vec::new(),
-        incumbent: Some((array![0.0], V0_3018)),
+        incumbent: Some(OuterIncumbent {
+            rho: array![0.0],
+            cost: V0_3018,
+            gradient: array![-1.0],
+        }),
         stratum_rank: None,
         stratum_probe: None,
     };
     // One evaluation past the last accept, so its fold is drained.
+    let mut stopped = false;
     for iter in 0..=steps {
         let rho = (iter + 1) as f64 * step;
-        let evaluated = FirstOrderObjective::eval_grad(&mut bridge, &array![rho])
-            .map(|_| ())
-            .map_err(|err| err.into_message());
-        assert_eq!(evaluated, Ok(()), "a non-stationary run must not halt");
+        if FirstOrderObjective::eval_grad(&mut bridge, &array![rho]).is_err() {
+            stopped = true;
+            break;
+        }
         ledger.push(AcceptedOuterStep {
             iter,
             step_norm: step,
             actual_decrease: step,
+            predicted_decrease: step,
         });
     }
-    bridge
+    let escapes = bridge
         .cost_stall
         .as_ref()
-        .map_or(0, |guard| guard.stuck_escapes)
+        .map_or(0, CostStallGuard::stuck_escapes);
+    (escapes, stopped)
 }
 
-/// The first-order route decides on the same band sum.
+/// The first-order route decides on the same pair of resolutions. A run whose
+/// every step stalls is granted an escape at each stall at `|g| = 1`, and the
+/// licence stops it at the second, since it bought no resolved descent in
+/// between (#2817).
 #[test]
 fn the_first_order_route_resolves_a_decrease_against_the_band_sum_3018() {
-    let steps = 3 * COST_STALL_WINDOW;
+    let steps = 18;
 
     let (step, inner_residual) = resolvable_3018();
     assert_eq!(
         drive_first_order_3018(step, Some(inner_residual), steps),
-        0,
-        "steps of {step:.3e} its evaluations resolve never fill a window"
+        (0, false),
+        "steps of {step:.3e} its evaluations resolve never stall"
     );
-    assert!(
-        drive_first_order_3018(step, None, steps) > 0,
-        "the control: the fallback {:.3e} refuses every {step:.3e} step",
+    assert_eq!(
+        drive_first_order_3018(step, None, steps),
+        (2, true),
+        "the control: each value carries τ = {:.3e}, so every {step:.3e} step, \
+         predicted as {step:.3e}, stalls",
         tau_3018(),
     );
 
     let (step, inner_residual) = unresolvable_3018();
-    assert!(
-        drive_first_order_3018(step, Some(inner_residual), steps) > 0,
-        "steps of {step:.3e} inside a band sum of {:.3e} fill windows",
+    assert_eq!(
+        drive_first_order_3018(step, Some(inner_residual), steps),
+        (2, true),
+        "steps of {step:.3e} inside a band sum of {:.3e} stall",
         4.0 * step,
     );
     assert_eq!(
         drive_first_order_3018(step, None, steps),
-        0,
-        "the control: the fallback admits every {step:.3e} step"
+        (0, false),
+        "the control: the pair of fallbacks admits every {step:.3e} step"
     );
 }
 
 /// Drive the guard with no evidence over `steps` accepted iterates of
-/// `V0 + shift − k·step`, returning each verdict's kind.
+/// `V0 + shift − k·step`, each predicted by its linear model as `step`, returning
+/// each verdict's kind.
 fn drive_shifted_guard_3018(
     shift: f64,
     step: f64,
     steps: usize,
 ) -> Vec<std::mem::Discriminant<CostStallVerdict>> {
     let config = config_3018();
+    let tau = fallback_3018(&config);
     let exit: Arc<Mutex<Option<CostStallExit>>> = Arc::new(Mutex::new(None));
-    let mut guard = CostStallGuard::new(fallback_3018(&config), COST_STALL_WINDOW, &config, exit);
-    guard.observe_seed(&array![0.0], V0_3018 + shift, 1.0);
+    let mut guard = CostStallGuard::new(tau, &config, exit);
+    guard.observe_seed(&array![0.0], V0_3018 + shift, tau, 1.0);
     (1..=steps)
         .map(|k| {
-            let rho = k as f64 * step;
-            std::mem::discriminant(&guard.observe(&array![rho], value_3018(rho) + shift, 1.0, true))
+            let rho = array![k as f64 * step];
+            std::mem::discriminant(&guard.observe(
+                StallSample {
+                    point: &rho,
+                    value: value_3018(rho[0]) + shift,
+                    resolution: tau,
+                    grad_norm: 1.0,
+                    trusted: true,
+                    curvature_psd: None,
+                },
+                step,
+            ))
         })
         .collect()
 }
@@ -587,10 +633,10 @@ fn drive_shifted_guard_3018(
 /// better, so a decrease is resolved or not whatever `|V|` is: shifting every
 /// value by `C` leaves every verdict unchanged. Under the old resolution
 /// `rel·(1 + |V|)` a shift of `10⁷` moved the floor from `10⁻²` to `1`, so a
-/// step of `4τ` that the unshifted run resolved filled a window once shifted.
+/// step of `4τ` that the unshifted run resolved was refused once shifted.
 #[test]
 fn the_guard_verdicts_are_invariant_to_an_additive_shift_of_the_criterion_3018() {
-    let steps = 3 * COST_STALL_WINDOW;
+    let steps = 18;
     let tau = tau_3018();
     for &step in &[4.0 * tau, 0.25 * tau] {
         let reference = drive_shifted_guard_3018(0.0, step, steps);
@@ -607,11 +653,14 @@ fn the_guard_verdicts_are_invariant_to_an_additive_shift_of_the_criterion_3018()
         resolved
             .iter()
             .all(|kind| *kind == std::mem::discriminant(&CostStallVerdict::Continue)),
-        "steps of 4τ are resolved at |V| = 1e9 and never fill a window"
+        "steps of 4τ are resolved at |V| = 1e9 and never stall"
     );
+    // A step of τ/4, predicted as τ/4, is resolved neither measured nor predicted
+    // against the pair `2τ`, so the first one stalls (#3018), at |V| = 1e9 as at
+    // |V| = 1e5.
     let unresolved = drive_shifted_guard_3018(1.0e9, 0.25 * tau, steps);
     assert_ne!(
-        unresolved[COST_STALL_WINDOW - 1],
+        unresolved[0],
         std::mem::discriminant(&CostStallVerdict::Continue),
         "steps of τ/4 are refused at |V| = 1e9 as at |V| = 1e5"
     );

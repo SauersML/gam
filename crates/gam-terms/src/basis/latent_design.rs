@@ -690,6 +690,7 @@ pub fn build_latent_forward_design(
                 max_degree: None,
                 wahba_kernel: SphereWahbaKernel::Sobolev,
                 identifiability: SphericalSplineIdentifiability::CenterSumToZero,
+                adaptive_degree: false,
             };
             let built = build_spherical_spline_basis(t_mat.view(), &spec)
                 .map_err(|err| format!("failed to evaluate sphere latent basis: {err}"))?;

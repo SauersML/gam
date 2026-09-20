@@ -4,6 +4,31 @@
 use super::*;
 use ndarray::array;
 
+/// What each seed's run reported, by seed index. A multistart publishes one
+/// payload (#3238), so a test that inspects every run records it here.
+struct SeedRecords<T>(std::sync::Mutex<Vec<Option<T>>>);
+
+impl<T> SeedRecords<T> {
+    fn new(seeds: usize) -> Self {
+        Self(std::sync::Mutex::new((0..seeds).map(|_| None).collect()))
+    }
+
+    fn record(&self, index: usize, value: T) {
+        self.0.lock().expect("records")[index] = Some(value);
+    }
+
+    /// Every seed's record, in seed order.
+    fn all(self) -> Vec<T> {
+        self.0
+            .into_inner()
+            .expect("records")
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| value.unwrap_or_else(|| panic!("seed {index} ran")))
+            .collect()
+    }
+}
+
 /// A one-coordinate criterion on `[−8, 8]` with a railed basin and an interior
 /// well. `V = 1 + ½(1 + s·tanh(ρ + 2s)) − 2·exp(−(ρ − c)²/2)` falls towards the
 /// rail on the side `−s` points to, where it certifies at `V ≈ 1` with its
@@ -39,7 +64,9 @@ fn run_fixture_seed(
 ) -> (Result<CertifiedOuterResult, EstimationError>, Vec<f64>) {
     let mut obj = problem.build_objective(
         Vec::<f64>::new(),
-        move |_: &mut Vec<f64>, theta: &Array1<f64>| Ok(railed_and_well(theta[0], side, centre).cost),
+        move |_: &mut Vec<f64>, theta: &Array1<f64>| {
+            Ok(railed_and_well(theta[0], side, centre).cost)
+        },
         move |seen: &mut Vec<f64>, theta: &Array1<f64>| {
             seen.push(theta[0]);
             Ok(railed_and_well(theta[0], side, centre))
@@ -67,23 +94,36 @@ fn multistart_publishes_the_basin_only_a_stiff_seed_reaches_2359() {
         seeds.iter().any(|seed| seed[0] == 0.0) && seeds.iter().any(|seed| seed[0] == 4.0),
         "fixture precondition: both the neutral and the stiff seed are generated, got {seeds:?}"
     );
+    let searched = SeedRecords::new(seeds.len());
     let outcome = problem
-        .run_certified_multistart(&levels, "stiff control", 0, 1, |_, seed_problem, _| {
-            run_fixture_seed(&seed_problem, 1.0, 6.0, std::time::Duration::ZERO)
+        .run_certified_multistart(&levels, "stiff control", 0, 1, |index, seed_problem, _| {
+            let (outcome, seen) =
+                run_fixture_seed(&seed_problem, 1.0, 6.0, std::time::Duration::ZERO);
+            searched.record(index, seen.len());
+            (outcome, ())
         })
         .expect("multistart runs");
     let winner = outcome.winner.expect("a seed certifies");
-    let published = outcome.runs[winner].0.as_ref().expect("the winner certified");
+    let published = outcome.outcomes[winner]
+        .as_ref()
+        .expect("the winner certified");
     assert!(
         (published.rho()[0] - 6.0).abs() < 0.1 && published.final_value() < 1.0e-3,
         "published rho={} value={}: the well at rho = 6 must win",
         published.rho()[0],
         published.final_value(),
     );
-    assert_eq!(outcome.seeds[winner][0], 4.0, "the stiff seed reaches the well");
-    for (index, (run, searched)) in outcome.runs.iter().enumerate() {
-        assert!(run.is_ok(), "seed {index} certifies: {:?}", run.as_ref().err());
-        assert!(!searched.is_empty(), "seed {index} ran its own search");
+    assert_eq!(
+        outcome.seeds[winner][0], 4.0,
+        "the stiff seed reaches the well"
+    );
+    for (index, (run, evaluations)) in outcome.outcomes.iter().zip(searched.all()).enumerate() {
+        assert!(
+            run.is_ok(),
+            "seed {index} certifies: {:?}",
+            run.as_ref().err()
+        );
+        assert!(evaluations > 0, "seed {index} ran its own search");
     }
 }
 
@@ -99,7 +139,9 @@ fn multistart_publishes_the_basin_only_a_flexible_seed_reaches_2359() {
         })
         .expect("multistart runs");
     let winner = outcome.winner.expect("a seed certifies");
-    let published = outcome.runs[winner].0.as_ref().expect("the winner certified");
+    let published = outcome.outcomes[winner]
+        .as_ref()
+        .expect("the winner certified");
     assert!(
         (published.rho()[0] + 5.0).abs() < 0.1 && published.final_value() < 1.0e-3,
         "published rho={} value={}: the well at rho = -5 must win",
@@ -125,22 +167,26 @@ fn each_multistart_run_searches_its_own_seed_alone_2359() {
         vec![array![0.0], array![4.0], array![8.0]],
         "the own start first, the duplicate dropped, +inf on the upper face"
     );
+    let sole = SeedRecords::new(every.len());
     let outcome = problem
-        .run_certified_multistart(&levels, "sole seeds", 0, 1, |_, seed_problem, _| {
-            let seeds = seed_problem.multistart_seeds(None, &[]).expect("seeds");
+        .run_certified_multistart(&levels, "sole seeds", 0, 1, |index, seed_problem, _| {
+            sole.record(
+                index,
+                seed_problem.multistart_seeds(None, &[]).expect("seeds"),
+            );
             (
                 Err(EstimationError::RemlOptimizationFailed(
                     "not run".to_string(),
                 )),
-                seeds,
+                (),
             )
         })
         .expect("multistart runs");
     assert_eq!(outcome.seeds, every);
-    for (index, (_, seeds)) in outcome.runs.iter().enumerate() {
+    for (index, seeds) in sole.all().into_iter().enumerate() {
         assert_eq!(
             seeds,
-            &vec![every[index].clone()],
+            vec![every[index].clone()],
             "run {index} searches its own seed alone"
         );
     }
@@ -160,29 +206,41 @@ fn a_multistart_winner_does_not_depend_on_which_run_finishes_first_2359() {
     let mut published = Vec::new();
     for reverse in [false, true] {
         let outcome = problem
-            .run_certified_multistart(&levels, "finishing order", 0, 1, |index, seed_problem, _| {
-                let rank = if reverse { seeds.len() - index } else { index };
-                run_fixture_seed(
-                    &seed_problem,
-                    1.0,
-                    6.0,
-                    std::time::Duration::from_millis(40 * rank as u64),
-                )
-            })
+            .run_certified_multistart(
+                &levels,
+                "finishing order",
+                0,
+                1,
+                |index, seed_problem, _| {
+                    let rank = if reverse { seeds.len() - index } else { index };
+                    run_fixture_seed(
+                        &seed_problem,
+                        1.0,
+                        6.0,
+                        std::time::Duration::from_millis(40 * rank as u64),
+                    )
+                },
+            )
             .expect("multistart runs");
         let winner = outcome.winner.expect("a seed certifies");
-        let result = outcome.runs[winner].0.as_ref().expect("the winner certified");
+        let result = outcome.outcomes[winner]
+            .as_ref()
+            .expect("the winner certified");
         let lowest = outcome
-            .runs
+            .outcomes
             .iter()
-            .filter_map(|(run, _)| run.as_ref().ok().map(CertifiedOuterResult::final_value))
+            .filter_map(|run| run.as_ref().ok().map(CertifiedOuterResult::final_value))
             .fold(f64::INFINITY, f64::min);
         assert!(
             result.final_value() - lowest
                 <= outer_value_agreement_bound(result.final_value(), lowest),
             "keep-best publishes the lowest certified value, to its rounding envelope"
         );
-        published.push((winner, result.rho()[0].to_bits(), result.final_value().to_bits()));
+        published.push((
+            winner,
+            result.rho()[0].to_bits(),
+            result.final_value().to_bits(),
+        ));
     }
     assert_eq!(
         published[0], published[1],
@@ -236,17 +294,26 @@ fn a_multistart_tie_goes_to_the_lower_seed_index_2359() {
         let outcome = problem
             .run_certified_multistart(&levels, "tie", 0, 1, |index, seed_problem, _| {
                 let rank = if reverse { seeds.len() - index } else { index };
-                run_flat_well_seed(&seed_problem, std::time::Duration::from_millis(40 * rank as u64))
+                run_flat_well_seed(
+                    &seed_problem,
+                    std::time::Duration::from_millis(40 * rank as u64),
+                )
             })
             .expect("multistart runs");
         let on_floor: Vec<usize> = outcome
-            .runs
+            .outcomes
             .iter()
             .enumerate()
-            .filter(|(_, (run, _))| run.as_ref().is_ok_and(|certified| certified.final_value() == 0.0))
+            .filter(|(_, run)| {
+                run.as_ref()
+                    .is_ok_and(|certified| certified.final_value() == 0.0)
+            })
             .map(|(index, _)| index)
             .collect();
-        assert!(on_floor.len() >= 2, "fixture precondition: at least two exact ties, got {on_floor:?}");
+        assert!(
+            on_floor.len() >= 2,
+            "fixture precondition: at least two exact ties, got {on_floor:?}"
+        );
         assert_eq!(
             outcome.winner,
             Some(first_on_floor),
@@ -283,8 +350,14 @@ fn only_certified_runs_compete_and_none_certified_is_a_refusal_2359() {
         .expect("multistart runs");
     let winner = outcome.winner.expect("the other seeds certify on the rail");
     assert_ne!(winner, stiff, "an uncertified run never wins");
-    let published = outcome.runs[winner].0.as_ref().expect("the winner certified");
-    assert!(published.final_value() > 0.99, "the certified rail wins: {}", published.final_value());
+    let published = outcome.outcomes[winner]
+        .as_ref()
+        .expect("the winner certified");
+    assert!(
+        published.final_value() > 0.99,
+        "the certified rail wins: {}",
+        published.final_value()
+    );
 
     let refused = problem
         .run_certified_multistart(&levels, "none certified", 0, 1, |index, _, _| {
@@ -300,11 +373,17 @@ fn only_certified_runs_compete_and_none_certified_is_a_refusal_2359() {
     let message = refused.refusal("none certified").to_string();
     let mut previous = 0;
     for index in 0..seeds.len() {
-        let entry = format!("seed {index} rho={:?}: not certified [", seeds[index].to_vec());
-        let at = message
-            .find(&entry)
-            .unwrap_or_else(|| panic!("the refusal carries seed {index}'s start and verdict: {message}"));
-        assert!(at >= previous, "the refusal lists seeds in seed order: {message}");
+        let entry = format!(
+            "seed {index} rho={:?}: not certified [",
+            seeds[index].to_vec()
+        );
+        let at = message.find(&entry).unwrap_or_else(|| {
+            panic!("the refusal carries seed {index}'s start and verdict: {message}")
+        });
+        assert!(
+            at >= previous,
+            "the refusal lists seeds in seed order: {message}"
+        );
         previous = at;
         assert!(
             message.contains(&format!("planted: seed {index} did not certify")),
@@ -312,7 +391,9 @@ fn only_certified_runs_compete_and_none_certified_is_a_refusal_2359() {
         );
     }
     assert_eq!(
-        message.matches("[EstimationError::RemlOptimizationFailed]").count(),
+        message
+            .matches("[EstimationError::RemlOptimizationFailed]")
+            .count(),
         seeds.len(),
         "every seed's verdict is named by its variant: {message}"
     );
@@ -336,43 +417,76 @@ fn admitted_fixture_run(
         .num_threads(width)
         .build()
         .expect("a test pool");
+    let lanes = SeedRecords::new(3);
     let outcome = pool.install(|| {
         problem
-            .run_certified_multistart_on(governor, &levels, "admission", PRE_LAUNCH_AVAILABLE, working_set_bytes, |_, seed_problem, lane| {
-                let (outcome, _) = run_fixture_seed(&seed_problem, 1.0, 6.0, hold);
-                (outcome, (lane.serial_available_bytes(), lane.granted_bytes()))
-            })
+            .run_certified_multistart_on(
+                governor,
+                &levels,
+                "admission",
+                PRE_LAUNCH_AVAILABLE,
+                working_set_bytes,
+                |index, seed_problem, lane| {
+                    lanes.record(index, (lane.serial_available_bytes(), lane.granted_bytes()));
+                    let (outcome, _) = run_fixture_seed(&seed_problem, 1.0, 6.0, hold);
+                    (outcome, ())
+                },
+            )
             .expect("multistart runs")
     });
     let winner = outcome.winner.expect("a seed certifies");
-    let result = outcome.runs[winner].0.as_ref().expect("the winner certified");
+    let result = outcome.outcomes[winner]
+        .as_ref()
+        .expect("the winner certified");
     (
-        (winner, result.rho()[0].to_bits(), result.final_value().to_bits()),
+        (
+            winner,
+            result.rho()[0].to_bits(),
+            result.final_value().to_bits(),
+        ),
         outcome.most_live,
-        outcome.runs.iter().map(|(_, lane)| *lane).collect(),
+        lanes.all(),
     )
 }
 
 /// Memory pressure: a budget that admits one search's working set but not two
 /// makes the searches queue, one live at a time, instead of taking a smaller
-/// path. Each search still gets its full working set and the same pre-launch
+/// path. A search is granted its full working set, or none: beside a finished
+/// run whose payload can still be published, and so still holds its grant
+/// (#3238), the budget has no room for a second working set, and the search
+/// runs as the serial search. Every search reads the same pre-launch
 /// availability, and the winner is bitwise the one a budget admitting all three
 /// at once publishes.
 #[test]
 fn a_budget_for_one_search_queues_the_rest_and_keeps_the_winner_2359() {
     let working_set = 1_000usize;
     let hold = std::time::Duration::from_millis(60);
-    let tight = gam_runtime::resource::MemoryGovernor::with_budget_bytes(working_set + working_set / 2);
-    let (queued_winner, queued_live, queued_lanes) = admitted_fixture_run(&tight, working_set, 3, hold);
+    let tight =
+        gam_runtime::resource::MemoryGovernor::with_budget_bytes(working_set + working_set / 2);
+    let (queued_winner, queued_live, queued_lanes) =
+        admitted_fixture_run(&tight, working_set, 3, hold);
     assert_eq!(queued_live, 1, "a budget for one search runs one at a time");
     assert!(
-        queued_lanes.iter().all(|&(_, granted)| granted == working_set),
-        "every queued search is granted its full working set: {queued_lanes:?}"
+        queued_lanes
+            .iter()
+            .all(|&(_, granted)| granted == working_set || granted == 0)
+            && queued_lanes
+                .iter()
+                .any(|&(_, granted)| granted == working_set),
+        "a queued search is granted its full working set or none, never a smaller one, \
+         and the first is granted: {queued_lanes:?}"
     );
     let ample = gam_runtime::resource::MemoryGovernor::with_budget_bytes(working_set * 16);
-    let (parallel_winner, parallel_live, parallel_lanes) = admitted_fixture_run(&ample, working_set, 3, hold);
-    assert!(parallel_live > 1, "an ample budget runs searches at once (most live {parallel_live})");
-    assert_eq!(queued_winner, parallel_winner, "queueing does not move the winner or its bits");
+    let (parallel_winner, parallel_live, parallel_lanes) =
+        admitted_fixture_run(&ample, working_set, 3, hold);
+    assert!(
+        parallel_live > 1,
+        "an ample budget runs searches at once (most live {parallel_live})"
+    );
+    assert_eq!(
+        queued_winner, parallel_winner,
+        "queueing does not move the winner or its bits"
+    );
     assert!(
         queued_lanes
             .iter()
@@ -390,7 +504,10 @@ fn a_working_set_over_the_budget_runs_the_searches_serially_2359() {
     let (serial_winner, most_live, lanes) =
         admitted_fixture_run(&tiny, 1_000, 3, std::time::Duration::from_millis(20));
     assert_eq!(most_live, 1);
-    assert!(lanes.iter().all(|&(_, granted)| granted == 0), "no grant: {lanes:?}");
+    assert!(
+        lanes.iter().all(|&(_, granted)| granted == 0),
+        "no grant: {lanes:?}"
+    );
     let ample = gam_runtime::resource::MemoryGovernor::with_budget_bytes(1_000_000);
     let (winner, _, _) = admitted_fixture_run(&ample, 1_000, 3, std::time::Duration::ZERO);
     assert_eq!(serial_winner, winner);
@@ -411,10 +528,16 @@ fn the_winner_is_the_same_on_every_pool_width_and_pool_2359() {
             })
             .expect("multistart runs");
         let winner = outcome.winner.expect("a seed certifies");
-        let result = outcome.runs[winner].0.as_ref().expect("the winner certified");
+        let result = outcome.outcomes[winner]
+            .as_ref()
+            .expect("the winner certified");
         (
             outcome.lanes,
-            (winner, result.rho()[0].to_bits(), result.final_value().to_bits()),
+            (
+                winner,
+                result.rho()[0].to_bits(),
+                result.final_value().to_bits(),
+            ),
         )
     };
     let (_, outside) = run(&problem);
@@ -425,7 +548,10 @@ fn the_winner_is_the_same_on_every_pool_width_and_pool_2359() {
             .expect("a test pool");
         let (lanes, inside) = pool.install(|| run(&problem));
         assert!(lanes <= width, "{lanes} lanes on a pool of {width}");
-        assert_eq!(inside, outside, "pool width {width}: same winner and bits as on the process pool");
+        assert_eq!(
+            inside, outside,
+            "pool width {width}: same winner and bits as on the process pool"
+        );
     }
 }
 
@@ -451,8 +577,7 @@ fn published_two_basin(
         })
         .expect("multistart runs");
     let winner = outcome.winner.expect("a seed certifies");
-    let result = outcome.runs[winner]
-        .0
+    let result = outcome.outcomes[winner]
         .as_ref()
         .expect("the winner certified");
     (
@@ -626,4 +751,190 @@ fn a_single_search_does_not_use_a_warm_start_from_other_inputs_3002() {
         other.recorded(),
         Some(gam_model_api::WarmStartOutcome::NotUsed(_))
     ));
+}
+
+/// A payload that counts how many of its kind are alive, and names its seed.
+struct CountedPayload {
+    seed: usize,
+    alive: std::sync::Arc<AtomicUsize>,
+}
+
+impl CountedPayload {
+    fn new(seed: usize, alive: &std::sync::Arc<AtomicUsize>) -> Self {
+        alive.fetch_add(1, Ordering::SeqCst);
+        Self {
+            seed,
+            alive: std::sync::Arc::clone(alive),
+        }
+    }
+}
+
+impl Drop for CountedPayload {
+    fn drop(&mut self) {
+        self.alive.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// #3238: a serial multistart holds one finished run's payload at a time, and the
+/// ledger carries it. The four seeds run in seed order on one lane: the neutral
+/// start certifies on the rail, the ρ = 3.5 start reaches the well and displaces
+/// it, and the ρ = 4 and ρ = −2 starts tie with or lose to that incumbent. Holding
+/// every payload until the last seed finished, the k-th search started beside k
+/// payloads, none of them on the ledger. Keeping only a payload that can still be
+/// published, each search starts beside the incumbent's alone, whose grant is still
+/// reserved; the published payload is the winner's, and no grant outlives the
+/// multistart.
+#[test]
+fn a_serial_multistart_holds_one_finished_payload_and_charges_it_3238() {
+    let (problem, levels) = problem_with_starts(0.0, &[3.5, 4.0, -2.0]);
+    let seeds = problem.multistart_seeds(None, &levels).expect("seeds");
+    assert_eq!(
+        seeds.len(),
+        4,
+        "fixture precondition: four distinct seeds, got {seeds:?}"
+    );
+    let working_set = 1_000usize;
+    let budget = working_set * 16;
+    let governor = gam_runtime::resource::MemoryGovernor::with_budget_bytes(budget);
+    let alive = std::sync::Arc::new(AtomicUsize::new(0));
+    // (payloads alive, bytes reserved) as each search starts.
+    let at_start = SeedRecords::new(seeds.len());
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a test pool");
+    let outcome = pool.install(|| {
+        problem
+            .run_certified_multistart_on(
+                &governor,
+                &levels,
+                "held payloads",
+                PRE_LAUNCH_AVAILABLE,
+                working_set,
+                |index, seed_problem, _| {
+                    at_start.record(
+                        index,
+                        (
+                            alive.load(Ordering::SeqCst),
+                            budget - governor.remaining_bytes(),
+                        ),
+                    );
+                    let (outcome, _) =
+                        run_fixture_seed(&seed_problem, 1.0, 6.0, std::time::Duration::ZERO);
+                    (outcome, CountedPayload::new(index, &alive))
+                },
+            )
+            .expect("multistart runs")
+    });
+    let winner = outcome.winner.expect("a seed certifies");
+    assert_eq!(
+        outcome.lanes, 1,
+        "fixture precondition: one lane runs the seeds in order"
+    );
+    let at_start = at_start.all();
+    for (index, &(held, reserved)) in at_start.iter().enumerate().skip(1) {
+        assert_eq!(
+            held, 1,
+            "search {index} started beside {held} finished payloads; only the incumbent's can \
+             still be published: {at_start:?}"
+        );
+        assert_eq!(
+            reserved,
+            working_set * (1 + held),
+            "search {index}: the ledger carries its own grant and the held payload's: {at_start:?}"
+        );
+    }
+    assert_eq!(
+        outcome.payload.seed, winner,
+        "the published payload is the winner's"
+    );
+    assert_eq!(
+        alive.load(Ordering::SeqCst),
+        1,
+        "only the published payload outlives the multistart"
+    );
+    assert_eq!(
+        governor.remaining_bytes(),
+        budget,
+        "no grant outlives the multistart"
+    );
+}
+
+/// Every assignment of `values` to `seeds` runs, one value per run (`None`: the
+/// run did not certify).
+fn every_state(seeds: usize, values: &[Option<f64>]) -> Vec<Vec<Option<f64>>> {
+    let mut states = vec![Vec::new()];
+    for _ in 0..seeds {
+        states = states
+            .into_iter()
+            .flat_map(|state| {
+                values.iter().map(move |&value| {
+                    let mut next = state.clone();
+                    next.push(value);
+                    next
+                })
+            })
+            .collect();
+    }
+    states
+}
+
+/// Every order in which `seeds` runs can finish.
+fn finishing_orders(seeds: usize) -> Vec<Vec<usize>> {
+    if seeds == 0 {
+        return vec![Vec::new()];
+    }
+    let mut orders = Vec::new();
+    for order in finishing_orders(seeds - 1) {
+        for at in 0..=order.len() {
+            let mut next = order.clone();
+            next.insert(at, seeds - 1);
+            orders.push(next);
+        }
+    }
+    orders
+}
+
+/// #3238: dropping a finished run's payload is safe, and in seed order it is
+/// complete. Over every outcome of four seeds (not certified, or certified at 0,
+/// at a value tying 1 within its rounding envelope, at 1, or at 2) and every order
+/// the runs can finish in, the payload a multistart publishes (the winner's, or
+/// the first seed's when none certifies) is publishable in every intermediate
+/// state; and when the runs finish in seed order, at most one finished payload is
+/// ever held.
+#[test]
+fn only_a_payload_that_cannot_be_published_is_dropped_3238() {
+    let tie = 1.0 + outer_value_agreement_bound(1.0, 1.0) / 2.0;
+    let values = [None, Some(0.0), Some(1.0), Some(tie), Some(2.0)];
+    assert!(
+        !displaces(1.0, tie) && !displaces(tie, 1.0) && displaces(1.0, 0.0),
+        "fixture precondition: 1 and {tie} tie, 0 displaces 1"
+    );
+    let orders = finishing_orders(4);
+    for outcome in every_state(4, &values) {
+        let published = keep_best(outcome.iter().copied()).unwrap_or(0);
+        for order in &orders {
+            let mut state: Vec<Option<Option<f64>>> = vec![None; outcome.len()];
+            for &finished in order {
+                state[finished] = Some(outcome[finished]);
+                let publishable = publishable_payloads(&state);
+                assert!(
+                    publishable[published],
+                    "outcomes {outcome:?} finishing in order {order:?}: the published seed \
+                     {published} was ruled out at {state:?}"
+                );
+                if order.iter().zip(0..).all(|(&seed, index)| seed == index) {
+                    let held = state
+                        .iter()
+                        .zip(&publishable)
+                        .filter(|(value, keep)| value.is_some() && **keep)
+                        .count();
+                    assert!(
+                        held <= 1,
+                        "outcomes {outcome:?} in seed order hold {held} payloads at {state:?}"
+                    );
+                }
+            }
+        }
+    }
 }

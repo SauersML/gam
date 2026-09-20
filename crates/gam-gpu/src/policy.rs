@@ -27,7 +27,6 @@ pub struct GpuDispatchPolicy {
     pub small_dense_batched_potrf_min_batch: usize,
     pub syevd_min_p: usize,
     pub sparse_min_nnz: usize,
-    pub fused_kernel_min_n: usize,
     pub keep_design_resident_min_bytes: usize,
     pub prefer_gpu_factorization_min_p: usize,
     pub row_kernel_min_n: usize,
@@ -54,7 +53,6 @@ impl Default for GpuDispatchPolicy {
             small_dense_batched_potrf_min_batch: 8,
             syevd_min_p: 256,
             sparse_min_nnz: 1_000_000,
-            fused_kernel_min_n: 100_000,
             keep_design_resident_min_bytes: 32 * 1024 * 1024,
             prefer_gpu_factorization_min_p: 512,
             row_kernel_min_n: 50_000,
@@ -93,17 +91,6 @@ impl GpuDispatchPolicy {
     /// reachable policy, so per-fit GPU-eligibility deciders may refuse it
     /// BEFORE probing the device.
     pub const MIN_CALIBRATABLE_ROW_KERNEL_N: usize = 2_048;
-
-    /// The smallest `fused_kernel_min_n` ANY production dispatch policy can
-    /// carry.
-    ///
-    /// Device calibration derives the fused-kernel crossover as twice its
-    /// measured row-kernel crossover. The calibration grid pins that row floor
-    /// to [`Self::MIN_CALIBRATABLE_ROW_KERNEL_N`], so a smaller fused batch is
-    /// inadmissible under every reachable policy and can remain on the CPU
-    /// without probing CUDA merely to discover the device-specific threshold.
-    pub const MIN_CALIBRATABLE_FUSED_KERNEL_N: usize =
-        2 * Self::MIN_CALIBRATABLE_ROW_KERNEL_N;
 
     /// Minimum problem dimension for the fp32+refinement path.
     ///
@@ -159,23 +146,6 @@ impl GpuDispatchPolicy {
             && px > 0
             && q > 0
             && self.xtwy_flops(n, px, q) >= self.dense_reduction_flops_min()
-    }
-
-    /// Whether a batched Pólya-Gamma draw of `n` rows is worth dispatching to
-    /// the device.
-    ///
-    /// A PG batch is a fused elementwise kernel: one independent rejection
-    /// sampler per row, no reduction and no cross-row reuse. So the row count
-    /// *is* the work, and what the device has to overcome is launch latency
-    /// plus the `n·(4 + 8)` bytes staged in and `n·8` staged back out — a
-    /// transfer/launch amortisation question rather than an arithmetic-intensity
-    /// one. That is exactly what `fused_kernel_min_n` carries: calibration sets
-    /// it to twice the device's *measured* XtWX crossover row count, so the
-    /// crossover is a per-device measurement rather than a tuned literal, and a
-    /// faster host CPU moves it up on that host instead of failing the kernel.
-    #[inline]
-    pub const fn polya_gamma_batch_target_is_gpu(&self, n: usize) -> bool {
-        n >= self.fused_kernel_min_n
     }
 
     pub const fn dense_hessian_work_target_is_gpu(&self, n: usize, p: usize) -> bool {
@@ -446,27 +416,6 @@ mod refinement_policy_tests {
         };
         assert!(!pol.iterative_refinement_should_attempt(1024));
     }
-}
-
-#[cfg(test)]
-mod fused_batch_dispatch_tests {
-    use super::*;
-
-    /// The dominant large-scale PG draw shape — one variate per data row per
-    /// Gibbs iteration — is admitted, and a batch small enough that launch and
-    /// staging dominate is refused. The refusal is the load-bearing half: a
-    /// predicate that admitted everything would let a dispatch-worthiness test
-    /// pass without saying anything about the shape it ran.
-    #[test]
-    fn polya_gamma_admits_large_batch_and_refuses_small() {
-        let pol = GpuDispatchPolicy::default();
-        assert!(pol.polya_gamma_batch_target_is_gpu(200_000));
-        assert!(pol.polya_gamma_batch_target_is_gpu(pol.fused_kernel_min_n));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(pol.fused_kernel_min_n - 1));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(16));
-        assert!(!pol.polya_gamma_batch_target_is_gpu(0));
-    }
-
 }
 
 #[cfg(test)]

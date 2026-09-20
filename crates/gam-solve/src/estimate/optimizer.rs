@@ -10,7 +10,6 @@ use crate::estimate::prefit::{
     reject_prefit_binomial_separation, reject_prefit_unidentifiable_unpenalized_space,
     reject_prefit_unpenalized_rank_deficiency,
 };
-use crate::estimate::smoothing_correction::AUTO_CUBATURE_MAX_EIGENVECTORS;
 use gam_linalg::matrix::FactorizedSystem;
 use gam_linalg::utils::KahanSum;
 use gam_problem::dispersion_cov::se_from_covariance;
@@ -347,23 +346,22 @@ struct NegbinJointCheckpoint {
     theta_bound: f64,
 }
 
+/// The square matrices the first-order smoothing correction's assembly holds
+/// live: the dense bundle charges them inside its atomic peak, and a fit whose
+/// inference stayed factorized charges the same owner on its own
+/// ([`reserve_smoothing_correction_workspace`], #3283).
+const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
+
 /// Reserve the complete peak live set of the optional dense inference path.
 ///
 /// The count is assembled from named algorithmic owners rather than a
 /// dimension cliff: ten square matrices can survive into/alongside the fit
 /// payload, six are base factorization/GEMM workspaces, and eight belong to the
-/// first-order smoothing correction. Cubature can retain one inverse Hessian
-/// for each positive/negative sigma point while every concurrently evaluated
-/// point holds its Hessian and inverse workspace. Charging the whole set
-/// atomically prevents several individually acceptable p×p allocations from
+/// first-order smoothing correction. Charging the whole set atomically prevents several individually acceptable p×p allocations from
 /// jointly exceeding the process-wide memory ledger.
 fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::MemoryReservation> {
     const STORED_SQUARE_MATRICES: usize = 10;
     const BASE_FACTORIZATION_AND_GEMM_WORKSPACES: usize = 6;
-    const FIRST_ORDER_SMOOTHING_WORKSPACES: usize = 8;
-    const CUBATURE_SIGMA_POINTS: usize = 2 * AUTO_CUBATURE_MAX_EIGENVECTORS;
-    const RETAINED_CUBATURE_INVERSES: usize = CUBATURE_SIGMA_POINTS;
-    const IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE: usize = 2 * CUBATURE_SIGMA_POINTS;
     /// A constrained fit assembles its truncated covariance as a sum of Grams
     /// (`ConstrainedPosteriorCorrection::truncated_covariance_psd`, #2705 group
     /// A), which holds three `p × p` blocks live at once: the Cholesky factor of
@@ -379,9 +377,7 @@ fn reserve_dense_covariance_bundle(p: usize) -> Option<gam_runtime::resource::Me
     const PEAK_SQUARE_MATRIX_EQUIVALENTS: usize = STORED_SQUARE_MATRICES
         + BASE_FACTORIZATION_AND_GEMM_WORKSPACES
         + FIRST_ORDER_SMOOTHING_WORKSPACES
-        + CONSTRAINED_TRUNCATION_WORKSPACES
-        + RETAINED_CUBATURE_INVERSES
-        + IN_FLIGHT_CUBATURE_HESSIAN_AND_INVERSE;
+        + CONSTRAINED_TRUNCATION_WORKSPACES;
 
     let policy = gam_runtime::resource::ResourcePolicy::for_problem(
         gam_runtime::resource::ProblemHints::default(),
@@ -472,6 +468,77 @@ pub(crate) fn apply_marginal_constraint_truncation(
         }
     }
     Ok(Ok(()))
+}
+
+/// Reserve the first-order smoothing correction's workspace on a fit whose
+/// inference stayed factorized (#3283).
+///
+/// The correction is assembled exactly as on the dense branch, whose bundle
+/// charges this owner inside its atomic peak; only its result differs, the
+/// `p × r` factor instead of the `p × p` Gram. A refusal is the typed absence
+/// [`crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused`].
+fn reserve_smoothing_correction_workspace(
+    p: usize,
+) -> Result<gam_runtime::resource::MemoryReservation, String> {
+    gam_runtime::resource::MemoryGovernor::global()
+        .try_reserve_dense_f64_copies(
+            p,
+            p,
+            FIRST_ORDER_SMOOTHING_WORKSPACES,
+            "factorized-branch first-order smoothing correction workspace",
+        )
+        .map_err(|error| error.to_string())
+}
+
+/// The truncation of the ρ-marginal `Vp = Vb + B·Bᵀ` to the fit's feasible set
+/// on the factorized branch (#3283), where neither covariance is formed.
+///
+/// It is [`apply_marginal_constraint_truncation`]'s construction: `Vp`'s own
+/// lift and orthant moments at `W_p = A·Vp·Aᵀ`, built from the only block the
+/// decomposition reads, `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`, with
+/// `conditional_times_constraints = Vb·Aᵀ` solved through the Hessian factor.
+/// `Ok(Ok(None))` means no retained face moves the answer; a MOMENT failure is
+/// `Ok(Err(reason))`, which the caller publishes as the typed absence, and a
+/// STRUCTURAL mismatch is fatal, both exactly as on the dense branch. A declined
+/// geometry never truncated the conditional law, and the caller does not call
+/// this for one.
+fn factorized_marginal_constraint_truncation(
+    geometry: &crate::constrained_posterior::ConstrainedPosteriorGeometry,
+    conditional_times_constraints: &Array2<f64>,
+    factor: &Array2<f64>,
+) -> Result<Result<Option<crate::constrained_posterior::ConstrainedPosteriorCorrection>, String>, EstimationError>
+{
+    let constraints = &geometry.constraints;
+    let p = factor.nrows();
+    if constraints.a.ncols() != p
+        || conditional_times_constraints.dim() != (p, constraints.a.nrows())
+    {
+        return Err(EstimationError::RemlOptimizationFailed(format!(
+            "constrained posterior geometry has {}x{} constraints against a {p}-row smoothing \
+             correction factor and a {:?} conditional normal block",
+            constraints.a.nrows(),
+            constraints.a.ncols(),
+            conditional_times_constraints.dim(),
+        )));
+    }
+    let center = match geometry.unconstrained_center() {
+        Ok(center) if center.len() == p => center,
+        Ok(center) => {
+            return Err(EstimationError::RemlOptimizationFailed(format!(
+                "constrained posterior geometry carries a length-{} centre against a {p}-row \
+                 smoothing correction factor",
+                center.len(),
+            )));
+        }
+        Err(reason) => return Ok(Err(reason)),
+    };
+    let marginal_times_constraints =
+        conditional_times_constraints + &factor.dot(&factor.t().dot(&constraints.a.t()));
+    Ok(crate::constrained_posterior::constrained_posterior_correction(
+        marginal_times_constraints.view(),
+        center,
+        constraints,
+    ))
 }
 
 /// Reserve the square matrices that remain live even when inference stays
@@ -938,6 +1005,8 @@ pub(crate) fn freeze_lambda_search_nuisance_at_canonical_anchor_with_ext_count(
 
     // The anchors are clamped into the envelope of the design's own #2812
     // resolvability domain, the domain the λ search then runs on (#2902 row 9).
+    // Past the ρ = 0 anchor they are tried only when its inner solve refused,
+    // and the search domain is then read at these same prior weights.
     let (domain_lower, domain_upper) =
         crate::estimate::rho_domain::resolvability_domain_from_design(
             reml_state.weights,
@@ -1140,27 +1209,6 @@ where
         .as_ref()
         .map_or_else(|| y_o.view(), |conditioned| conditioned.view());
 
-    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
-    // from the conditioned design's Gram on that penalty's columns and the
-    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20).
-    let rho_resolvability =
-        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
-            w_o.view(),
-            &x_fit,
-            canonical_shared.as_slice(),
-        )
-        .map_err(EstimationError::LayoutError)?;
-    // The domain is a numerical device, not the prior: the ρ-posterior
-    // integrates over all of ℝ^K and continues the criterion past each
-    // saturated face (#2812).
-    let rho_continuation = rho_resolvability.continuation();
-    let crate::estimate::rho_domain::ResolvabilityDomain {
-        lower: rho_domain_lower,
-        upper: rho_domain_upper,
-        lower_is_limit: rho_lower_is_limit,
-        upper_is_limit: rho_upper_is_limit,
-        ..
-    } = rho_resolvability;
     let mut reml_state = RemlState::newwith_offset_shared(
         reml_y_view,
         x_fit,
@@ -1219,6 +1267,51 @@ where
         k,
         heuristic_log_lambdas,
     )?;
+    // #2812 / #2902 row 8: the λ-selection domain of each coordinate is derived
+    // from the conditioned design's Gram on that penalty's columns and the
+    // penalty's spectrum, not the picked ±RHO_BOUND box (SPEC rule 20). The
+    // Gram is the data curvature `XᵀWX` of the penalized Hessian, so `W` is the
+    // Fisher working weight of the canonical anchor's inner solve at ρ = 0 (the
+    // solve the nuisance freeze above ran, before any warm start): its scale
+    // follows the response's units (`μ³/4` for the inverse-Gaussian `1/μ²`
+    // link), and a prior-weight Gram leaves the domain fixed while `λ̂` moves
+    // with those units, off the domain's lower face in small units. When that
+    // solve returns a typed per-rho refusal (`is_trial_point_infeasible`) there
+    // is no fitted working weight at ρ = 0, and the Gram is read at the prior
+    // weights. Every other failure is not about ρ = 0 and is propagated.
+    let domain_weights = if k == 0 {
+        w_o.to_owned()
+    } else {
+        match reml_state.data_curvature_weights(&Array1::zeros(k)) {
+            Ok(weights) => weights,
+            Err(error) if !error.is_trial_point_infeasible() => return Err(error),
+            Err(error) => {
+                log::debug!(
+                    "[OUTER] ρ-domain Gram read at the prior weights: the canonical anchor's \
+                     inner solve at ρ = 0 refused ({error})"
+                );
+                w_o.to_owned()
+            }
+        }
+    };
+    let rho_resolvability =
+        crate::estimate::rho_domain::resolvability_domain_and_limit_faces_from_design(
+            domain_weights.view(),
+            &reml_state.x,
+            canonical_shared.as_slice(),
+        )
+        .map_err(EstimationError::LayoutError)?;
+    // The domain is a numerical device, not the prior: the ρ-posterior
+    // integrates over all of ℝ^K and continues the criterion past each
+    // saturated face (#2812).
+    let rho_continuation = rho_resolvability.continuation();
+    let crate::estimate::rho_domain::ResolvabilityDomain {
+        lower: rho_domain_lower,
+        upper: rho_domain_upper,
+        lower_is_limit: rho_lower_is_limit,
+        upper_is_limit: rho_upper_is_limit,
+        ..
+    } = rho_resolvability;
     if let Some(store) = opts.persistent_warm_start_store.clone() {
         // Attach only after the canonical nuisance anchor so cache history
         // cannot influence the criterion frame.
@@ -1427,9 +1520,18 @@ where
                 Array1::from_iter(h.iter().map(|&v| start_bounds.clamp(v)))
             } else {
                 let anchor = Array1::from_elem(k, start_bounds.clamp(weight_log_geom_mean));
-                reml_state
-                    .analytic_initial_sp_rho(&anchor, start_bounds)
-                    .unwrap_or(anchor)
+                // The pilot P-IRLS solve behind the `initial.sp` point runs at
+                // `anchor`. A typed per-rho refusal there
+                // (`is_trial_point_infeasible`) leaves no working weight to
+                // balance against, so the search enters at `anchor` and steps
+                // past it exactly as it steps past any infeasible trial point.
+                // Every other failure is not about `anchor` and is propagated.
+                match reml_state.analytic_initial_sp_rho(&anchor, start_bounds) {
+                    Ok(Some(start)) => start,
+                    Ok(None) => anchor,
+                    Err(error) if error.is_trial_point_infeasible() => anchor,
+                    Err(error) => return Err(error),
+                }
             };
             log::debug!(
                 "[OUTER] standard REML single start: {:?} (bounds {:.3}..{:.3})",
@@ -2327,10 +2429,9 @@ where
     let mut edf_total = 0.0;
     let mut smoothing_correction = None;
     let mut smoothing_correction_method = None;
-    // The exact first-order IFT correction, RETAINED even when the primary
-    // pair above escalates to a cubature upgrade (#946): the corrected-EDF/AIC
-    // channel reads these instead of the primary pair so it does not go dark
-    // exactly when smoothing-parameter uncertainty is large enough to matter.
+    // The exact first-order IFT correction the corrected-EDF/AIC channel reads
+    // (#946). The primary pair above IS the first-order correction, so the two
+    // pairs carry the same matrix.
     let mut smoothing_correction_first_order = None;
     let mut smoothing_correction_method_first_order = None;
     let mut smoothing_correction_absence = None;
@@ -2338,6 +2439,10 @@ where
     let mut penalized_hessian = Array2::<f64>::zeros((0, 0));
     let mut beta_covariance = None;
     let mut factorized_standard_errors = None;
+    // #3283: the factorized branch's smoothing correction, as its square-root
+    // factor, and the corrected standard errors solved beside the conditional
+    // ones.
+    let mut smoothing_correction_factorized = None;
     let mut beta_covariance_corrected = None;
     // #2705 group A: carried from where the constrained-posterior correction is
     // APPLIED to where the corrected covariance is READ, so the refusal below
@@ -3160,7 +3265,7 @@ where
             (beta_covariance_unscaled.as_ref(), posterior_factor.as_ref())
         {
             // Full inverse available: wrap as phi-scaled covariance, compute
-            // frequentist quantities, and pass to smoothing-correction cubature.
+            // frequentist quantities, and form the smoothing correction.
             let mut posterior_covariance = scaled_covariance(h_inv.clone(), cov_scale);
             let constrained_correction = constrained_posterior
                 .as_ref()
@@ -3332,21 +3437,34 @@ where
             beta_covariance_frequentist = Some(ve);
         }
 
-        // Smoothing-parameter correction (first-order delta + optional cubature).
-        // The dense branch can return the complete matrix and optionally
-        // upgrade it by cubature. On governor refusal the factorized branch
-        // computes only diag(J V_rho J') from cached p×k mode responses; calling
-        // `compute_smoothing_correction_auto(..., None, ...)` is not sufficient
-        // because that routine constructs the full p×p first-order product
-        // before it notices that the base covariance is absent.
-        // `cov_scale` is the coefficient-covariance multiplier at the optimum
-        // (σ̂² for profiled Gaussian, 1 for every weight-carries-dispersion
-        // family). The cubature path multiplies its dispersion-free curvature
-        // block `E_ρ[H(ρ)⁻¹] − H_opt⁻¹` by this scale so the FULL cubature
-        // correction lands on the same c² variance scale as `Vb = cov_scale·H_opt⁻¹`
-        // (#582); the var_beta = Cov_ρ[β̂] block is already on that scale and
-        // stays unscaled.
-        if beta_covariance_unscaled.is_some() {
+        // Smoothing-parameter correction `J·V_ρ·Jᵀ` (Wood, Pya & Säfken 2016,
+        // mgcv's Vc1), analytic for any number of smoothing parameters, on BOTH
+        // inference branches. It is assembled as its square-root factor `B`
+        // (`p × r`, `C = B·Bᵀ`). The dense branch forms `C` for `Vp = Vb + C`.
+        // The factorized branch keeps `B` and solves the corrected standard
+        // errors beside the conditional ones below, because a `p × p` matrix is
+        // what its governor refused (#3283); it charges the correction's
+        // workspace here, where the dense bundle already holds it.
+        let smoothing_workspace = if beta_covariance_unscaled.is_some() {
+            Ok(None)
+        } else {
+            reserve_smoothing_correction_workspace(qs.nrows()).map(Some)
+        };
+        let mut smoothing_correction_factor: Option<Array2<f64>> = None;
+        if let Err(detail) = smoothing_workspace.as_ref() {
+            if !final_rho.is_empty() {
+                log::debug!(
+                    "[SMOOTHING-CORRECTION] factorized branch could not reserve the correction's \
+                     workspace ({detail}); publishing the typed absence"
+                );
+                smoothing_correction_absence = Some(
+                    crate::model_types::SmoothingCorrectionAbsence::CorrectionWorkspaceRefused {
+                        detail: detail.clone(),
+                    },
+                );
+            }
+        }
+        if let Ok(smoothing_workspace_reservation) = smoothing_workspace {
             let no_outer_gradient = Array1::<f64>::zeros(0);
             // #2748 -- THE RESOLUTION THE CERTIFICATE'S VERDICT WAS TAKEN AT.
             //
@@ -3443,17 +3561,10 @@ where
                         .collect()
                 })
                 .unwrap_or_default();
-            let smoothing_outcome = reml_state.compute_smoothing_correction_auto(
+            let smoothing_outcome = reml_state.compute_smoothing_correction_outcome(
                 &final_rho,
-                // The box the outer arm searched and the shipped-point
-                // certificate above judged rails against, so it contains the
-                // certified mode by construction.
-                &rho_model_domain,
                 &lambdas,
                 &pirls_res,
-                beta_covariance_unscaled.as_ref(),
-                cov_scale,
-                finalgrad_norm,
                 // #2428: the residual gradient the outer certificate itself
                 // used to accept this ρ̂ is the resolution floor the ρ-Hessian's
                 // definiteness must be judged against. Without it the
@@ -3479,70 +3590,40 @@ where
                 // error, refusing fits this certificate accepted (#2428). Empty
                 // when the certificate cleared nothing.
                 &measured_hessian_error,
-                // The coordinates the certificate judged railed on a face of
-                // that same box, and judged the ρ-Hessian OFF. They are
-                // boundary estimates with `∂β̂/∂ρ_k = 0`: the first-order
-                // inverse gives their axes zero variance instead of judging a
-                // curvature the certificate never looked at (a roundoff-negative
-                // `H_kk` there refused the correction for every direction), and
-                // the cubature conditions on them at the face instead of
-                // stepping off it.
+                // The coordinates the certificate held at a rail and excluded
+                // from its own PSD test. They are boundary estimates with
+                // `∂β̂/∂ρ_k = 0`, so the correction gives their axes zero
+                // variance instead of re-judging a curvature the certificate
+                // never looked at.
                 &certified_railed_rho,
-            )?;
+            );
             match smoothing_outcome {
                 super::reml::eval::SmoothingCorrectionOutcome::Unavailable { reason, .. } => {
-                    // A fit certified at an infinite-smoothing rail (typed
-                    // AsymptoteRail, or box-railed coordinates) has NO finite
-                    // ρ-variance along the rail direction — the outer Hessian
-                    // is legitimately non-PD there, so the first-order
-                    // smoothing correction is TYPED-unavailable rather than a
-                    // defect. Ship the certified fit with the plug-in
-                    // covariance and no correction; the downstream corrected
-                    // EDF/AIC channels report the typed absence (#946/#1027)
-                    // instead of the whole fit dying over an enhancement. The
-                    // railed axes themselves no longer land here — they are
-                    // excluded above with zero variance — so this is reached
-                    // only when an interior direction of such a fit is refused.
-                    // A fit WITHOUT rail evidence keeps the fail-loud error: an
-                    // unexpectedly uninvertible outer Hessian on a
-                    // well-conditioned interior optimum is a real defect.
-                    let rail_certified =
-                        outer_result
-                            .criterion_certificate
-                            .as_ref()
-                            .is_some_and(|certificate| {
-                                matches!(
-                            certificate.stationarity,
-                            crate::model_types::OuterStationarityCertificate::AsymptoteRail { .. }
-                        ) || !certificate.lambdas_railed.is_empty()
-                            });
-                    // The same typed absence applies when the outer Hessian has
-                    // no analytic form for this fit at all (a non-canonical
-                    // Firth link, routed to BFGS): nothing about the optimum is
+                    // The only typed absence is an outer Hessian with no
+                    // analytic form for this fit at all (a non-canonical Firth
+                    // link, routed to BFGS): nothing about the optimum is
                     // suspect, the correction simply cannot be formed, and the
                     // fit was accepted with that link on purpose (#2158).
-                    let structurally_not_analytic = matches!(
+                    // Railed coordinates are not a reason: the correction
+                    // excludes them exactly as the certificate did, so a
+                    // refusal on a railed fit is a real defect like any other.
+                    if !matches!(
                         reason,
                         crate::estimate::smoothing_correction::SmoothingCorrectionUnavailable::OuterHessianNotAnalytic { .. }
-                    );
-                    if !rail_certified && !structurally_not_analytic {
+                    ) {
                         return Err(EstimationError::InvalidInput(format!(
                             "exact smoothing-corrected covariance unavailable: {reason:?}"
                         )));
                     }
-                    log::debug!(
-                        "[SMOOTHING-CORRECTION] typed-unavailable on a {} fit ({reason:?}); \
-                         shipping the plug-in covariance without a smoothing correction",
-                        if rail_certified { "rail-certified" } else { "non-analytic-outer-Hessian" }
+                    log::info!(
+                        "[SMOOTHING-CORRECTION] typed-unavailable on a non-analytic-outer-Hessian \
+                         fit ({reason:?}); shipping the plug-in covariance without a smoothing correction"
                     );
-                    let detail = format!("{reason:?}");
-                    smoothing_correction_absence = Some(if rail_certified {
-                        crate::model_types::SmoothingCorrectionAbsence::RailCertified { detail }
-                    } else {
+                    smoothing_correction_absence = Some(
                         crate::model_types::SmoothingCorrectionAbsence::OuterHessianNotAnalytic {
-                            detail,
-                        }
-                    });
+                            detail: format!("{reason:?}"),
+                        },
+                    );
                     rho_covariance = None;
                     smoothing_correction = None;
                     smoothing_correction_method = None;
@@ -3551,45 +3632,49 @@ where
                 }
                 outcome => {
                     rho_covariance = outcome.rho_covariance().cloned();
-                    (
-                        smoothing_correction,
-                        smoothing_correction_method,
-                        smoothing_correction_first_order,
-                        smoothing_correction_method_first_order,
-                    ) = outcome.into_correction_with_method();
+                    let (factor, method) = outcome.into_correction_with_method();
+                    smoothing_correction_method = method;
+                    if beta_covariance_unscaled.is_some() {
+                        smoothing_correction = factor
+                            .as_ref()
+                            .map(crate::estimate::smoothing_correction::smoothing_correction_gram);
+                        smoothing_correction_first_order = smoothing_correction.clone();
+                        smoothing_correction_method_first_order = smoothing_correction_method;
+                    } else {
+                        smoothing_correction_factor = factor;
+                    }
                 }
             }
+            // The correction's assembly transients are gone; its `p × r` factor
+            // is all that stays live on the factorized branch.
+            drop(smoothing_workspace_reservation);
         }
 
-        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML objective
-        // is still live, sample the outer criterion around the converged ρ̂ to
-        // read the PSIS k̂ that says whether the plug-in + first-order V_ρ
-        // correction is adequate. This is the objective-lifecycle seam — the
-        // diagnostic runs against the SAME objective the fit converged on, so
-        // its criterion is the fit's own bit-for-bit (no retain/rebuild). Absent
-        // when there are no smoothing parameters or the outer Hessian is
-        // unavailable; never fatal.
+        // Tier-0 marginal-smoothing adequacy diagnostic (#938): while the REML
+        // objective is still live, sample the outer criterion around the
+        // converged ρ̂ to read the PSIS k̂ that says whether the plug-in +
+        // first-order V_ρ correction is adequate. It runs against the SAME
+        // objective the fit converged on, so its criterion is the fit's own
+        // bit-for-bit.
         //
-        // The Tier-0 diagnostic is CHEAP (a handful of outer-criterion
-        // evaluations) so it is emitted regardless of `skip_rho_posterior_inference`
-        // whenever it is available (#1810) — the standard formula/CLI fit surfaces
-        // its ρ-posterior adequacy grade by default. Only the EXPENSIVE escalation
-        // tiers (Tier-1 quadrature / Tier-2 NUTS over ρ) are gated by the flag:
-        // interactive formula/CLI fits keep `skip_rho_posterior_inference = true`
-        // so a fit whose plug-in grades `Escalate` never turns into a sampler
-        // benchmark, while lower-level callers that opt in (`skip = false`) get
-        // the auto-selected escalation tier (quadrature for K≤4, NUTS over ρ for
-        // K≤16, honest Unavailable beyond) at this same live seam.
-        (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
-            &final_rho,
-            // The box is where λ is numerically resolvable, not the
-            // posterior's support: a draw past a saturated face is valued by
-            // the criterion's exact affine limit from that face, so no
-            // posterior mass is dropped when the box edge moves.
-            &rho_continuation,
-            !opts.skip_rho_posterior_inference,
-            None,
-        );
+        // The returned fit does not need it: the covariance above is complete
+        // without it, and the diagnostic costs dozens of inner solves plus a
+        // fresh ρ-Hessian. So it runs only when the caller requests ρ-posterior
+        // inference (`skip_rho_posterior_inference = false`), together with the
+        // escalation tiers it grades for (quadrature for K≤4, NUTS over ρ for
+        // K≤16, honest Unavailable beyond). Every other fit keeps the typed
+        // `NotComputed(InferenceNotRequested)` set above.
+        if !opts.skip_rho_posterior_inference {
+            (rho_posterior, rho_posterior_escalation) = reml_state.rho_posterior_inference(
+                &final_rho,
+                // The box is where λ is numerically resolvable, not the
+                // posterior's support: a draw past a saturated face is valued by
+                // the criterion's exact affine limit from that face, so no
+                // posterior mass is dropped when the box edge moves.
+                &rho_continuation,
+                None,
+            );
+        }
 
         // Standard errors: prefer the diagonal of the full inverse when
         // available; otherwise use the factorised Hessian from the EDF pass
@@ -3667,12 +3752,9 @@ where
                     ))
                 })?
                 .flatten();
-            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+            let inverse_diagonal = crate::estimate::penalty::factorized_published_inverse_diagonal(
                 &conditioning,
                 qs,
-                cov_scale,
-                correction,
-                zero_covariance_boundary,
                 se_chunk_cols,
                 |rhs, rows| {
                     factor_t.certified_solve(
@@ -3684,7 +3766,71 @@ where
                         ),
                     )
                 },
+            )?;
+            factorized_standard_errors = Some(crate::estimate::penalty::factorized_standard_errors(
+                &conditioning,
+                &inverse_diagonal,
+                cov_scale,
+                None,
+                correction,
+                zero_covariance_boundary,
             )?);
+            // #3283: the corrected standard errors of `Vp = Vb + B·Bᵀ` from the
+            // same solved diagonal. A constrained fit truncates `Vp` at its own
+            // lift, as the dense branch does, from `Vp·Aᵀ = Vb·Aᵀ + B·(Bᵀ·Aᵀ)`:
+            // `m` solves against the factor instead of a `p × p` product.
+            if let Some(factor) = smoothing_correction_factor.take() {
+                let truncation = match constrained_posterior
+                    .as_ref()
+                    .filter(|geometry| geometry.decline().is_none())
+                {
+                    Some(geometry) => {
+                        let constraints_transpose = geometry.constraints.a.t().to_owned();
+                        let solved = factor_t.certified_solve(
+                            &pirls_res.stabilizedhessian_transformed,
+                            &qs.t().dot(&constraints_transpose),
+                            "smoothing-corrected constrained posterior normal geometry",
+                        )?;
+                        let conditional_times_constraints = qs.dot(&solved) * cov_scale;
+                        factorized_marginal_constraint_truncation(
+                            geometry,
+                            &conditional_times_constraints,
+                            &factor,
+                        )?
+                    }
+                    None => Ok(None),
+                };
+                match truncation {
+                    Ok(marginal_correction) => {
+                        let standard_errors = crate::estimate::penalty::factorized_standard_errors(
+                            &conditioning,
+                            &inverse_diagonal,
+                            cov_scale,
+                            Some(&factor),
+                            marginal_correction.as_ref(),
+                            false,
+                        )?;
+                        smoothing_correction_factorized = Some(
+                            crate::model_types::FactorizedSmoothingCorrection {
+                                factor,
+                                standard_errors,
+                            },
+                        );
+                    }
+                    Err(reason) => {
+                        log::debug!(
+                            "[CONSTRAINED-Vp] the factorized smoothing-corrected law could not be \
+                             truncated to the feasible set ({reason}); publishing the typed absence"
+                        );
+                        smoothing_correction_absence = Some(
+                            crate::model_types::SmoothingCorrectionAbsence::ConstrainedTruncationRefused {
+                                detail: reason,
+                            },
+                        );
+                        smoothing_correction_method = None;
+                    }
+                }
+            }
         } else {
             // `edf_factor` is set on every `compute_inference` fit, so one of
             // the two branches above runs. Reaching here would publish an
@@ -3725,9 +3871,9 @@ where
         // with `G` and `Δ` derived from `Σ`, not from `Vp`. Along a coordinate
         // the constraint pins, `(GΔGᵀ)_ii` cancels `Σ_ii` to eleven digits, so
         // whatever `(Vp − Σ)_ii` happens to be becomes the WHOLE reported
-        // variance — and `Vp − Σ` is a legitimately sign-indefinite second-order
-        // increment (the cubature branch is `φ̂·E_ρ[H(ρ)⁻¹] + Cov_ρ[β̂] − φ̂·H_opt⁻¹`,
-        // a difference of two averages, PSD only as a SUM with `Vb`). On
+        // variance — and `Vp − Σ` need not be resolvable against that
+        // cancellation (any increment is PSD only as a SUM with `Vb` once the
+        // truncation has removed most of `Σ_ii`). On
         // `y ~ s(x, shape=convex)` that left `Σ_ii = 2.30e-2` truncated to
         // `6.23e-13` with a `−3.03e-9` smoothing increment on top, i.e. a
         // materially negative published variance, and `se_from_covariance`
@@ -3860,6 +4006,7 @@ where
         reparam_qs: Some(pirls_res.reparam_result.qs.clone()),
         dispersion,
         factorized_standard_errors,
+        smoothing_correction_factorized,
         beta_covariance_frequentist,
         coefficient_influence,
         weighted_gram,

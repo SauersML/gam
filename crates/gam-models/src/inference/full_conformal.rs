@@ -40,12 +40,14 @@
 //!   the SAME symmetric KKT system a cold fit would solve, with the step
 //!   size CERTIFIED by a computed third-derivative contraction bound and a
 //!   cold-refit fallback whenever the certificate refuses.
-//! - **Layer 3 (the research core, contract below):** the smoothing
-//!   response dρ̂/dz through the exact outer IFT — the first full-conformal
-//!   procedure that re-selects smoothing per candidate — plus the
-//!   **frozen-ρ certificate**: an exact per-dataset bound that accepts or
-//!   refuses freezing ρ̂ — the ρ-excursion is bounded on the REML branch
-//!   through the augmented optimum by a closed-form wall test, not sampled.
+//! - **Layer 3 (implemented in [`honest`], exact up to breakpoint
+//!   resolution):** the Gaussian-identity map that RE-SELECTS the smoothing
+//!   strength by REML on every augmented data set — the first
+//!   full-conformal procedure whose fitting map treats the test row like a
+//!   training row all the way up to ρ̂. A proven bound on where the global
+//!   REML minimizer can lie, plus cold local refits at the set's endpoints.
+//!   Every row carries a [`ConformalCertificate`]: `exact_frozen`,
+//!   `honest_refit`, or `refused:<reason>` with the frozen set.
 //!
 //! # Layer 1 math (what the code below implements)
 //!
@@ -105,88 +107,31 @@
 //! exact by enumerating the response support — no homotopy subtlety at all —
 //! and this module carries no enumeration arm.
 //!
-//! # Layer 3 contract: the ρ-response and the frozen-ρ certificate
+//! # Layer 3: the honest map (see [`honest`])
 //!
-//! The honest fitting map re-selects ρ̂ on the augmented data. Joint
-//! stationarity in (β, ρ):
+//! Freezing ρ̂ at the training-data optimum breaks symmetry: ρ̂ saw `y` but
+//! not `z`. The honest map fits the augmented rows at the global minimizer
+//! `ρ̂(z)` of the profiled Gaussian REML criterion. With one penalty and one
+//! Cholesky of the augmented normal matrix, the criterion, its
+//! ρ-derivative and every residual are closed-form in `(ρ, z)`: quadratics
+//! in `z` whose coefficients are monotone or unimodal in ρ. A branch and
+//! bound over the extended `z` line keeps, per cell, a tube of ρ-boxes
+//! that provably holds `ρ̂(z)` and decides membership over the whole tube;
+//! the cells it splits are exactly the ones the data leave undecided. Cold
+//! REML refits through the shared outer engine run at the set's finite
+//! endpoints and are checked against the bound.
 //!
-//! ```text
-//!   F(β, ρ; z) = 0                       (inner KKT, as above)
-//!   G(ρ; z)    = ∇_ρ V(ρ; z) = 0          (outer REML/LAML stationarity)
-//! ```
+//! Several penalties are refused (their ratios were selected without the
+//! test row), as is a payload that does not record its penalty count: the
+//! row gets the frozen-ρ set and a typed refusal, never a silent one.
 //!
-//! One outer IFT step gives the smoothing response to the candidate:
-//!
-//! ```text
-//!   dρ̂/dz = − [∇²_ρρ V]⁻¹ · ∂G/∂z ,
-//!   ∂G_k/∂z = ∂²V/∂ρ_k∂z |_{β̂}  +  ⟨ ∂²V/∂ρ_k∂β , β̇_z ⟩ ,   β̇_z = H⁻¹x_*
-//! ```
-//!
-//! Every ingredient already exists in this engine and (today) nowhere
-//! else: the exact outer Hessian `∇²_ρρV` (#740 machinery), the mixed
-//! ρ×β blocks (the drift/correction vectors of the gradient assembly —
-//! after #931 these are the shared `ThetaDirection` channels), and the
-//! factored `H⁻¹` (the #935 sensitivity operator). The full-path
-//! derivative of the fit is then
-//!
-//! ```text
-//!   dμ̂/dz = Xᵀ-row · ( β̇_z + (dβ̂/dρ) · dρ̂/dz )
-//! ```
-//!
-//! and the homotopy of Layer 2 extends one level up, with EVENTS now of
-//! three kinds: score crossings (set boundary candidates), ρ box-bound
-//! activation (active-set strata — freeze the bound coordinate, continue),
-//! and REML basin jumps (corrector lands on a different local optimum).
-//! Basin jumps are where naive path-tracking would silently break the
-//! symmetry requirement; the discipline is: the DEFINED fitting map is the
-//! deterministic seed-path optimizer (#969), the homotopy is only an
-//! acceleration of it, and whenever the corrector cannot certify it is in
-//! the cold map's basin (objective-value cross-check after correction),
-//! the implementation falls back to a cold deterministic fit at that z.
-//! Validity is therefore inherited from the cold map's symmetry — the
-//! homotopy can be wrong only about SPEED, never about the answer.
-//!
-//! ## The frozen-ρ certificate (the deliverable that matters for everyone)
-//!
-//! For the cheap procedure that freezes ρ̂ at the original-data optimum,
-//! the per-dataset certificate bounds the score perturbation along the
-//! candidate range Z:
-//!
-//! ```text
-//!   |e_i(z; ρ̂(z)) − e_i(z; ρ̂_frozen)| ≤  L_i · sup_{z∈Z} ‖ρ̂(z) − ρ̂_frozen‖
-//! ```
-//!
-//! with `L_i = sup ‖∂e_i/∂ρ‖` from the SAME sensitivity operator
-//! (`∂μ̂/∂ρ = X dβ̂/dρ`, one batched solve). The current implementation
-//! checks the ρ-excursion on a fixed probe grid: acceptance is conditional
-//! on the true `sup |dρ̂/dz|` over the reported range not exceeding the
-//! observed probe maximum by more than the stated mean-value allowance. If
-//! that conditional bound is smaller than the MARGIN of every rank
-//! comparison that decides the set's boundary intervals — `min over
-//! deciding pairs |e_i(z) − e_*(z)|` at the Layer-1 breakpoints, with
-//! critical ties contributing zero — then the frozen-ρ set equals the
-//! honest set on the REML branch through the augmented optimum. When the check
-//! fails, the procedure says so and runs Layer 3 instead of silently
-//! returning an unchecked set.
-//!
-//! # Wiring (magic-by-default, certificate-first)
+//! # Wiring
 //!
 //! No flags. The predict path requests full conformal exactly like split
-//! conformal (`conformal_level`), and the dispatcher picks: exact Layer 1
-//! for Gaussian-identity fits, homotopy beyond. PRIORITY ORDER MATTERS and
-//! is a design decision, not an
-//! optimization: the cheap frozen-ρ exact set runs FIRST, the certificate
-//! is computed, and only on certificate REFUSAL does the engine touch the
-//! expensive honest path — and even then the preferred realization is
-//! cold deterministic refits at the few z-regions whose membership the
-//! certificate could not pin (the breakpoint structure localizes them),
-//! with the dρ̂/dz IFT used to BOUND the excursion, not to continuously
-//! track it. Continuous ρ-path-tracking is the last resort, not the
-//! default — the certificate makes it almost always unnecessary, and a
-//! bound-plus-local-refit design has no basin-tracking failure mode at
-//! all. Unit-weight violation and unsupported regimes fall back to the
-//! split/ALO calibrator LOUDLY (logged), never silently — an invalid
-//! guarantee is worse than a wider valid one.
+//! conformal (`conformal_level`); Gaussian-identity fits get Layer 3 with its
+//! certificate per row, GLMs the Layer-2 homotopy. Unit-weight violation and
+//! unsupported regimes fall back to the split/ALO calibrator LOUDLY (logged),
+//! never silently — an invalid guarantee is worse than a wider valid one.
 
 use faer::Side;
 use ndarray::{Array1, Array2};
@@ -194,6 +139,15 @@ use ndarray::{Array1, Array2};
 use gam_linalg::faer_ndarray::{FaerCholesky, FaerEigh, fast_av};
 
 use opt::{BacktrackConfig, backtracking_line_search};
+
+pub mod honest;
+pub use honest::{
+    ConformalCertificate, ConformalRefusal, HonestConformalCost, HonestFullConformal,
+    honest_full_conformal,
+};
+
+#[cfg(test)]
+mod test_support;
 
 /// One maximal interval of candidate values retained in the prediction set.
 /// Endpoints may be infinite (honest unboundedness in low-information /
@@ -204,8 +158,7 @@ pub struct ConformalInterval {
     pub hi: f64,
 }
 
-/// The exact full-conformal prediction set: a finite union of closed
-/// intervals, plus the diagnostics the Layer-3 certificate consumes.
+/// A full-conformal prediction set: a finite union of closed intervals.
 #[derive(Clone, Debug)]
 pub struct FullConformalSet {
     /// Maximal intervals, sorted, disjoint.
@@ -214,13 +167,43 @@ pub struct FullConformalSet {
     pub alpha: f64,
     /// `n + 1` (augmented count) — the denominator of the conformal rank.
     pub n_augmented: usize,
-    /// The decision margin: the smallest |e_i − e_*| gap over rank
-    /// comparisons whose flip can change membership. Critical ties
-    /// contribute zero. When the set has no finite boundary (all of ℝ or
-    /// empty), the margin is the analytic infimum of the local rank-decision
-    /// margin over the whole candidate line; `+∞` is reserved for the case
-    /// where membership needs no score comparison at all.
-    pub boundary_margin: f64,
+}
+
+/// Shapes and unit prior weights, shared by every Gaussian full-conformal
+/// constructor.
+fn validate_inputs(
+    x: &Array2<f64>,
+    y: &Array1<f64>,
+    prior_weights: &Array1<f64>,
+    s_lambda: &Array2<f64>,
+    x_star: &Array1<f64>,
+) -> Result<(), String> {
+    let n = x.nrows();
+    let p = x.ncols();
+    if y.len() != n || prior_weights.len() != n {
+        return Err("full conformal: row-count mismatch".to_string());
+    }
+    if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
+        return Err("full conformal: column-count mismatch".to_string());
+    }
+    if prior_weights.iter().any(|&w| w != 1.0) {
+        return Err(
+            "full conformal requires unit prior weights: a reweighted training row is \
+             not exchangeable with the test row, so the finite-sample coverage proof \
+             does not apply; use the split/ALO conformal calibrator instead"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// The smallest dominating count `k` with `1 + k > α(n + 1)` — membership's
+/// threshold — or `n + 1` when no count of `n` training rows reaches it.
+fn required_dominating_count(n: usize, alpha: f64) -> usize {
+    let threshold = alpha * (n + 1) as f64;
+    (0..=n)
+        .find(|&count| 1.0 + count as f64 > threshold)
+        .unwrap_or(n + 1)
 }
 
 /// Exact Gaussian-identity full-conformal engine at fixed Sλ (Layer 1).
@@ -254,22 +237,9 @@ impl ExactGaussianFullConformal {
         s_lambda: &Array2<f64>,
         x_star: &Array1<f64>,
     ) -> Result<Self, String> {
+        validate_inputs(x, y, prior_weights, s_lambda, x_star)?;
         let n = x.nrows();
         let p = x.ncols();
-        if y.len() != n || prior_weights.len() != n {
-            return Err("full conformal: row-count mismatch".to_string());
-        }
-        if s_lambda.nrows() != p || s_lambda.ncols() != p || x_star.len() != p {
-            return Err("full conformal: column-count mismatch".to_string());
-        }
-        if prior_weights.iter().any(|&w| w != 1.0) {
-            return Err(
-                "full conformal requires unit prior weights: a reweighted training row is \
-                 not exchangeable with the test row, so the finite-sample coverage proof \
-                 does not apply; use the split/ALO conformal calibrator instead"
-                    .to_string(),
-            );
-        }
 
         // M = XᵀX + x_*x_*ᵀ + Sλ — the augmented penalized normal matrix.
         let mut m = x.t().dot(x) + s_lambda;
@@ -323,41 +293,10 @@ impl ExactGaussianFullConformal {
         (1.0 + self.dominating_count(z) as f64) > alpha * n1
     }
 
-    fn required_dominating_count(&self, alpha: f64) -> usize {
-        let threshold = alpha * (self.n + 1) as f64;
-        for count in 0..=self.n {
-            if 1.0 + count as f64 > threshold {
-                return count;
-            }
-        }
-        self.n + 1
-    }
-
-    fn local_decision_margin(&self, z: f64, alpha: f64) -> f64 {
-        let required = self.required_dominating_count(alpha);
-        if required == 0 {
-            return f64::INFINITY;
-        }
-        let e_star = (self.u[self.n] + self.w[self.n] * z).abs();
-        let mut true_gaps = Vec::new();
-        let mut false_gaps = Vec::new();
-        for i in 0..self.n {
-            let e_i = (self.u[i] + self.w[i] * z).abs();
-            let gap = (e_i - e_star).abs();
-            if e_i >= e_star {
-                true_gaps.push(gap);
-            } else {
-                false_gaps.push(gap);
-            }
-        }
-        if true_gaps.len() >= required {
-            true_gaps.sort_by(|a, b| a.partial_cmp(b).expect("finite score gaps"));
-            true_gaps[true_gaps.len() - required]
-        } else {
-            let needed = required - true_gaps.len();
-            false_gaps.sort_by(|a, b| a.partial_cmp(b).expect("finite score gaps"));
-            false_gaps.get(needed - 1).copied().unwrap_or(f64::INFINITY)
-        }
+    /// The frozen plug-in mean `x_*ᵀ(XᵀX + Sλ)⁻¹Xᵀy`: the candidate at which
+    /// the test residual vanishes.
+    pub fn plug_in_mean(&self) -> f64 {
+        -self.u[self.n] / self.w[self.n]
     }
 
     fn push_finite_root(points: &mut Vec<f64>, numerator: f64, denominator: f64) {
@@ -367,159 +306,6 @@ impl ExactGaussianFullConformal {
                 points.push(z);
             }
         }
-    }
-
-    fn abs_residual_affine_at(&self, row: usize, z: f64) -> (f64, f64) {
-        let value = self.u[row] + self.w[row] * z;
-        let sign = if value >= 0.0 { 1.0 } else { -1.0 };
-        (sign * self.w[row], sign * self.u[row])
-    }
-
-    fn gap_affines_on_cell(&self, z: f64) -> Vec<(bool, f64, f64)> {
-        let (star_slope, star_intercept) = self.abs_residual_affine_at(self.n, z);
-        let mut gaps = Vec::with_capacity(self.n);
-        for i in 0..self.n {
-            let (row_slope, row_intercept) = self.abs_residual_affine_at(i, z);
-            let diff_slope = row_slope - star_slope;
-            let diff_intercept = row_intercept - star_intercept;
-            let diff = diff_slope * z + diff_intercept;
-            if diff >= 0.0 {
-                gaps.push((true, diff_slope, diff_intercept));
-            } else {
-                gaps.push((false, -diff_slope, -diff_intercept));
-            }
-        }
-        gaps
-    }
-
-    fn asymptotic_abs_residual_affine(&self, row: usize, direction: f64) -> (f64, f64) {
-        let slope_in_t = direction * self.w[row];
-        let sign = if slope_in_t > 0.0 {
-            1.0
-        } else if slope_in_t < 0.0 {
-            -1.0
-        } else if self.u[row] >= 0.0 {
-            1.0
-        } else {
-            -1.0
-        };
-        (sign * slope_in_t, sign * self.u[row])
-    }
-
-    fn asymptotic_decision_margin(&self, direction: f64, alpha: f64) -> f64 {
-        let required = self.required_dominating_count(alpha);
-        if required == 0 {
-            return f64::INFINITY;
-        }
-        let (star_slope, star_intercept) = self.asymptotic_abs_residual_affine(self.n, direction);
-        let mut true_gaps = Vec::new();
-        let mut false_gaps = Vec::new();
-        for i in 0..self.n {
-            let (row_slope, row_intercept) = self.asymptotic_abs_residual_affine(i, direction);
-            let diff_slope = row_slope - star_slope;
-            let diff_intercept = row_intercept - star_intercept;
-            let truth = diff_slope > 0.0 || (diff_slope == 0.0 && diff_intercept >= 0.0);
-            let gap = if truth {
-                (diff_slope, diff_intercept)
-            } else {
-                (-diff_slope, -diff_intercept)
-            };
-            if truth {
-                true_gaps.push(gap);
-            } else {
-                false_gaps.push(gap);
-            }
-        }
-        let critical = if true_gaps.len() >= required {
-            true_gaps.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0)
-                    .expect("finite asymptotic slopes")
-                    .then_with(|| a.1.partial_cmp(&b.1).expect("finite asymptotic intercepts"))
-            });
-            true_gaps.get(true_gaps.len() - required).copied()
-        } else {
-            let needed = required - true_gaps.len();
-            false_gaps.sort_by(|a, b| {
-                a.0.partial_cmp(&b.0)
-                    .expect("finite asymptotic slopes")
-                    .then_with(|| a.1.partial_cmp(&b.1).expect("finite asymptotic intercepts"))
-            });
-            false_gaps.get(needed - 1).copied()
-        };
-        match critical {
-            Some((slope, intercept)) if slope == 0.0 => intercept.max(0.0),
-            Some(_) => f64::INFINITY,
-            None => f64::INFINITY,
-        }
-    }
-
-    fn margin_without_finite_boundaries(&self, alpha: f64, roots: &[f64]) -> f64 {
-        let mut points = roots.to_vec();
-        for row in 0..=self.n {
-            Self::push_finite_root(&mut points, -self.u[row], self.w[row]);
-        }
-        points.sort_by(|a, b| a.partial_cmp(b).expect("finite breakpoints"));
-        points.dedup_by(|a, b| *a == *b);
-
-        let mut eval_points = points.clone();
-        for cell in 0..=points.len() {
-            let lo = if cell == 0 {
-                f64::NEG_INFINITY
-            } else {
-                points[cell - 1]
-            };
-            let hi = if cell == points.len() {
-                f64::INFINITY
-            } else {
-                points[cell]
-            };
-            let z = if lo.is_finite() && hi.is_finite() {
-                0.5 * (lo + hi)
-            } else if lo.is_finite() {
-                lo + 1.0
-            } else if hi.is_finite() {
-                hi - 1.0
-            } else {
-                0.0
-            };
-            let gaps = self.gap_affines_on_cell(z);
-            let required = self.required_dominating_count(alpha);
-            if required == 0 {
-                continue;
-            }
-            let true_count = gaps.iter().filter(|g| g.0).count();
-            let need_truth = true_count >= required;
-            let relevant: Vec<(f64, f64)> = gaps
-                .iter()
-                .filter(|g| g.0 == need_truth)
-                .map(|g| (g.1, g.2))
-                .collect();
-            for a in 0..relevant.len() {
-                for b in (a + 1)..relevant.len() {
-                    let denominator = relevant[a].0 - relevant[b].0;
-                    if denominator.abs() > 0.0 {
-                        let cross = (relevant[b].1 - relevant[a].1) / denominator;
-                        if cross.is_finite() && cross > lo && cross < hi {
-                            eval_points.push(cross);
-                        }
-                    }
-                }
-            }
-        }
-        eval_points.sort_by(|a, b| a.partial_cmp(b).expect("finite margin points"));
-        eval_points.dedup_by(|a, b| *a == *b);
-
-        let mut margin = f64::INFINITY;
-        if eval_points.is_empty() {
-            margin = margin.min(self.local_decision_margin(0.0, alpha));
-        } else {
-            for z in eval_points {
-                margin = margin.min(self.local_decision_margin(z, alpha));
-            }
-        }
-        margin = margin.min(self.asymptotic_decision_margin(1.0, alpha));
-        margin = margin.min(self.asymptotic_decision_margin(-1.0, alpha));
-        margin
     }
 
     /// The exact prediction set at miscoverage α.
@@ -544,40 +330,40 @@ impl ExactGaussianFullConformal {
         roots.sort_by(|p, q| p.partial_cmp(q).expect("finite breakpoints"));
         roots.dedup_by(|p, q| *p == *q);
 
-        // Probe points: each root, each gap midpoint, and the two open
+        // Witness points: each root, each gap midpoint, and the two open
         // tails. Membership is constant strictly between consecutive
-        // roots, so this probe set decides the set exactly.
-        let mut probes: Vec<f64> = Vec::with_capacity(2 * roots.len() + 3);
+        // roots, so one witness per piece decides the set exactly.
+        let mut witnesses: Vec<f64> = Vec::with_capacity(2 * roots.len() + 3);
         if roots.is_empty() {
-            probes.push(0.0);
+            witnesses.push(0.0);
         } else {
             let span = (roots[roots.len() - 1] - roots[0]).max(1.0);
-            probes.push(roots[0] - span);
+            witnesses.push(roots[0] - span);
             for k in 0..roots.len() {
-                probes.push(roots[k]);
+                witnesses.push(roots[k]);
                 if k + 1 < roots.len() {
-                    probes.push(0.5 * (roots[k] + roots[k + 1]));
+                    witnesses.push(0.5 * (roots[k] + roots[k + 1]));
                 }
             }
-            probes.push(roots[roots.len() - 1] + span);
+            witnesses.push(roots[roots.len() - 1] + span);
         }
 
-        // Scan probes into maximal intervals. A member midpoint/tail claims
+        // Scan witnesses into maximal intervals. A member midpoint/tail claims
         // its whole open gap; member roots close the endpoints.
         let mut intervals: Vec<ConformalInterval> = Vec::new();
         let mut open_lo: Option<f64> = None;
         let gap_bounds = |idx: usize| -> (f64, f64) {
-            // bounds of the gap a probe at sorted position idx represents
+            // bounds of the gap a witness at sorted position idx represents
             if roots.is_empty() {
                 return (f64::NEG_INFINITY, f64::INFINITY);
             }
             if idx == 0 {
                 return (f64::NEG_INFINITY, roots[0]);
             }
-            if idx == probes.len() - 1 {
+            if idx == witnesses.len() - 1 {
                 return (roots[roots.len() - 1], f64::INFINITY);
             }
-            // probes alternate root, mid, root, mid, ... after the first
+            // witnesses alternate root, mid, root, mid, ... after the first
             let k = (idx - 1) / 2; // gap index for midpoints, root index for roots
             if idx % 2 == 1 {
                 // a root: zero-width "gap" at the root itself
@@ -586,14 +372,14 @@ impl ExactGaussianFullConformal {
                 (roots[k], roots[k + 1])
             }
         };
-        for (idx, &z) in probes.iter().enumerate() {
+        for (idx, &z) in witnesses.iter().enumerate() {
             let inside = self.member(z, alpha);
             let (lo, hi) = gap_bounds(idx);
             if inside {
                 if open_lo.is_none() {
                     open_lo = Some(lo);
                 }
-                if idx == probes.len() - 1 {
+                if idx == witnesses.len() - 1 {
                     intervals.push(ConformalInterval {
                         lo: open_lo.take().expect("open interval"),
                         hi,
@@ -607,78 +393,16 @@ impl ExactGaussianFullConformal {
             }
         }
 
-        // Decision margin for the frozen-ρ check (Layer 3): at a finite
-        // boundary, evaluate the exact local rank-decision margin. Critical
-        // ties contribute zero. If there is no finite boundary (all-R or
-        // empty), compute the analytic infimum of the same local quantity
-        // over the whole piecewise-linear candidate line.
-        let mut finite_endpoints = Vec::new();
-        for itv in &intervals {
-            for endpoint in [itv.lo, itv.hi] {
-                if endpoint.is_finite() {
-                    finite_endpoints.push(endpoint);
-                }
-            }
-        }
-        let boundary_margin = if finite_endpoints.is_empty() {
-            self.margin_without_finite_boundaries(alpha, &roots)
-        } else {
-            finite_endpoints
-                .into_iter()
-                .map(|endpoint| self.local_decision_margin(endpoint, alpha))
-                .fold(f64::INFINITY, f64::min)
-        };
-
         FullConformalSet {
             intervals,
             alpha,
             n_augmented: n + 1,
-            boundary_margin,
         }
     }
 }
 
-/// Layer-3 verdict for the frozen-ρ shortcut. Produced by comparing the
-/// exact ρ-excursion bound (`L · E`, see
-/// [`GaussianRemlRhoResponse::certified_full_conformal`]) against the exact
-/// engine's `boundary_margin` (see module doc). `Certified` is conditional on
-/// the REML branch through the anchor being the branch the fit follows;
-/// `Refused` carries the two numbers so the caller can show exactly how far
-/// from acceptable the shortcut was.
-#[derive(Clone, Debug)]
-pub enum FrozenRhoCertificate {
-    Certified {
-        score_perturbation_bound: f64,
-        boundary_margin: f64,
-    },
-    Refused {
-        score_perturbation_bound: f64,
-        boundary_margin: f64,
-    },
-}
-
-impl FrozenRhoCertificate {
-    /// Decide from the two computed constants. Strict inequality: a bound
-    /// equal to the margin cannot certify, and a zero margin can never
-    /// certify because no positive perturbation bound is strictly below it.
-    pub fn decide(score_perturbation_bound: f64, boundary_margin: f64) -> Self {
-        if boundary_margin > 0.0 && score_perturbation_bound < boundary_margin {
-            FrozenRhoCertificate::Certified {
-                score_perturbation_bound,
-                boundary_margin,
-            }
-        } else {
-            FrozenRhoCertificate::Refused {
-                score_perturbation_bound,
-                boundary_margin,
-            }
-        }
-    }
-}
-
-/// Wilkinson growth for the response's arithmetic — the operation count `eval`
-/// charges its gradient band at, shared with the stationarity quadratic so both
-/// bands are the same statement about the same arithmetic.
+/// Wilkinson growth for the Gaussian REML response's arithmetic: the factor
+/// [`honest`] charges against every magnitude sum.
 ///
 /// The `p`-terms count the Cholesky of `A(λ)`, its solves and its traces. The
 /// `n`-terms count the residual sums the penalized RSS is formed from (#2280):
@@ -687,29 +411,6 @@ fn response_solve_growth(n: usize, p: usize) -> f64 {
     gam_linalg::roundoff::accumulation_growth(
         2 * p * p * p + 8 * p * p + 8 * p + 4 * n * p + 8 * n,
     )
-}
-
-/// `(Σ_i r_i², Σ_i r_i² + 2·|r_i|·s_i)` over the residuals `r_i = y_i − x_iᵀβ`,
-/// with `s_i = |y_i| + Σ_j |x_ij·β_j|`.
-///
-/// A residual is a difference, so it rounds against the magnitudes it cancelled,
-/// `u·s_i`, not against itself, and its square carries `2·|r_i|` times that. The
-/// second value is the scale that rounding is charged against (#2280).
-fn residual_sum_of_squares(x: &Array2<f64>, y: &Array1<f64>, beta: &Array1<f64>) -> (f64, f64) {
-    let mut total = 0.0;
-    let mut scale = 0.0;
-    for (row, &response) in x.rows().into_iter().zip(y.iter()) {
-        let mut fitted = 0.0;
-        let mut cancelled = response.abs();
-        for (&entry, &coefficient) in row.iter().zip(beta.iter()) {
-            fitted += entry * coefficient;
-            cancelled += (entry * coefficient).abs();
-        }
-        let residual = response - fitted;
-        total += residual * residual;
-        scale += residual * residual + 2.0 * residual.abs() * cancelled;
-    }
-    (total, scale)
 }
 
 /// `L⁻¹·B` for a lower-triangular `L`, by forward substitution.
@@ -742,773 +443,6 @@ fn solve_lower_triangular_transposed(lower: &Array2<f64>, b: &Array2<f64>) -> Ar
         }
     }
     out
-}
-
-/// `Q(z) = q₀ + q₁z + q₂z²`, the stationarity condition of the augmented REML
-/// criterion at one `ρ` (see
-/// [`GaussianRemlRhoResponse::stationarity_quadratic_in_z`]), with the
-/// rounding band its coefficients carry.
-#[derive(Clone, Debug)]
-struct StationarityQuadratic {
-    q: [f64; 3],
-    /// Absolute-summand magnitudes of each coefficient: the scale the rounding
-    /// band is charged against.
-    magnitude: [f64; 3],
-    growth: f64,
-}
-
-impl StationarityQuadratic {
-    fn value(&self, z: f64) -> f64 {
-        self.q[0] + self.q[1] * z + self.q[2] * z * z
-    }
-
-    /// The rounding band of `value(z)`: `γ·Σ_k |m_k·z^k|`.
-    ///
-    /// `γ` is Wilkinson's `γ_n = n·u/(1 − n·u)`, which already carries the unit
-    /// roundoff. This band once multiplied it by `u` a second time, which put it
-    /// about `1/u ≈ 9e15` times below the rounding it bounds (#2280).
-    fn band(&self, z: f64) -> f64 {
-        self.growth
-            * (self.magnitude[0] + self.magnitude[1] * z.abs() + self.magnitude[2] * z * z)
-    }
-
-    /// Whether `Q` has no root on `[lo, hi]`, decided with clearance: `Some(true)`
-    /// when `Q` keeps one sign at both endpoints and at its interior vertex (if
-    /// any) by more than its rounding band, `Some(false)` when it provably
-    /// changes sign, `None` when a value sits inside its own band and the
-    /// question cannot be decided on this arithmetic.
-    fn has_no_root_in(&self, lo: f64, hi: f64) -> Option<bool> {
-        let mut points = vec![lo, hi];
-        if self.q[2] != 0.0 {
-            let vertex = -0.5 * self.q[1] / self.q[2];
-            if vertex.is_finite() && vertex > lo && vertex < hi {
-                points.push(vertex);
-            }
-        }
-        let mut sign = 0.0_f64;
-        for z in points {
-            let value = self.value(z);
-            if !value.is_finite() || value.abs() <= self.band(z) {
-                return None;
-            }
-            let this_sign = value.signum();
-            if sign == 0.0 {
-                sign = this_sign;
-            } else if this_sign != sign {
-                return Some(false);
-            }
-        }
-        Some(true)
-    }
-}
-
-/// Closed-form Gaussian-REML smoothing-parameter response and the frozen-ρ
-/// certificate it powers — the #942 Layer-3 research core, realized exactly
-/// for the single-penalty model `Sλ = λ S` (`ρ = log λ`).
-///
-/// # Why this object exists
-///
-/// Layer 1 ([`ExactGaussianFullConformal`]) is honest only if ρ is held fixed
-/// — but the DEFINED Gaussian fitting map re-selects ρ̂ by REML on whatever
-/// data it sees, including the augmented row `(x_*, z)`. Every "efficient
-/// full conformal" method in the literature silently freezes ρ̂ at its
-/// original-data value and never quantifies the resulting symmetry break.
-/// This object closes that gap WITHOUT a homotopy: it computes the honest
-/// re-selecting map exactly (it is a 1-D REML problem per candidate) and a
-/// per-dataset conditional check that accepts (or refuses) freezing ρ̂. On
-/// acceptance the cheap frozen-ρ set is returned with the rho-grid
-/// assumption that makes equality to the honest set valid; on refusal the
-/// caller is told, with the two deciding constants, exactly how far short
-/// the shortcut fell.
-///
-/// # The closed forms (single penalty `Sλ = λ S`)
-///
-/// Augmented penalized least squares with the test row included:
-///
-/// ```text
-///   A(λ)   = XᵀX + x_* x_*ᵀ + λ S         (independent of z)
-///   c(z)   = Xᵀy + x_* z ,  β̂ = A(λ)⁻¹ c(z) = a + b z   (affine in z)
-///   D(ρ,z) = ‖y_aug‖² − c(z)ᵀ A(λ)⁻¹ c(z)              (penalized RSS)
-/// ```
-///
-/// The Gaussian REML criterion to MINIMIZE over ρ (σ² profiled out, additive
-/// constants dropped; `M₀ = nullity(S)`, `r = rank(S)`, `n_eff = n (+1` if the
-/// test row is present`)`):
-///
-/// ```text
-///   Ṽ(ρ,z) = (n_eff − M₀) · log D(ρ,z) + log|A(λ)| − r ρ
-/// ```
-///
-/// Its z- and ρ-derivatives are all closed form (`pen = λ β̂ᵀSβ̂`):
-///
-/// ```text
-///   ∂D/∂ρ = pen ,                ∂D/∂z = 2(z − x_*ᵀβ̂) = 2 r_*
-///   G    = ∂Ṽ/∂ρ      = (n_eff−M₀)·pen/D + λ tr(A⁻¹S) − r
-///   ∂²Ṽ/∂ρ²           = (n_eff−M₀)·(pen'·D − pen²)/D² + λ tr(A⁻¹S) − λ² tr((A⁻¹S)²)
-/// ```
-///
-/// with `pen' = pen − 2λ²·β̂ᵀS A⁻¹ S β̂`.
-///
-/// The score–ρ sensitivity (which the certificate's Lipschitz constant uses)
-/// is `∂μ̂_i/∂ρ = x_iᵀ (dβ̂/dρ)` with `dβ̂/dρ = −λ A⁻¹ S β̂`, so
-/// `|∂e_i/∂ρ| = |∂μ̂_i/∂ρ|` (the absolute-residual score's only ρ-dependence
-/// is through μ̂). Everything is assembled from ONE Cholesky of `A(λ)` plus a
-/// handful of solves.
-pub struct GaussianRemlRhoResponse<'a> {
-    x: &'a Array2<f64>,
-    y: &'a Array1<f64>,
-    s: &'a Array2<f64>,
-    x_star: &'a Array1<f64>,
-    n: usize,
-    p: usize,
-    rank_s: usize,
-    xtx: Array2<f64>,
-    xty: Array1<f64>,
-    rho_domain: (f64, f64),
-    augmented_rho_domain: (f64, f64),
-}
-
-/// One closed-form evaluation of the (possibly augmented) Gaussian REML
-/// criterion at `ρ = log λ`, carrying every derivative the certificate
-/// consumes.
-#[derive(Clone, Debug)]
-struct RemlEval {
-    /// `Ṽ(ρ,z)` (additive constants dropped — only differences in ρ matter).
-    value: f64,
-    /// `G = ∂Ṽ/∂ρ`.
-    grad: f64,
-    /// Rounding band of `grad`: Wilkinson's growth factor for the operations
-    /// the gradient accumulates (a `p×p` Cholesky, two solves, two traces and the
-    /// residual sums `D` is formed from) times the magnitude sum of its three
-    /// terms, plus `D`'s own rounding carried through `pen/D`. A gradient inside
-    /// this band is zero to the arithmetic; that is what "stationary" means here.
-    grad_band: f64,
-    /// `∂²Ṽ/∂ρ²`.
-    hess: f64,
-    /// The penalized RSS `D` the criterion's `log D` term is taken of.
-    penalized_rss: f64,
-}
-
-/// The frozen-ρ full-conformal set with its Layer-3 certificate and the
-/// constants the certificate decided on.
-#[derive(Clone, Debug)]
-pub struct CertifiedFullConformal {
-    /// The cheap exact set built at the frozen `ρ̂₀` (original-data optimum).
-    pub frozen_set: FullConformalSet,
-    /// Whether freezing ρ̂ is accepted on the REML branch through the anchor
-    /// (see [`GaussianRemlRhoResponse::certified_full_conformal`]).
-    pub certificate: FrozenRhoCertificate,
-    /// `ρ̂₀ = log λ̂₀` selected by REML on the original (un-augmented) data.
-    pub rho_frozen: f64,
-    /// The wall distance `E = margin / L`: when certified, an EXCLUSIVE upper
-    /// bound on `sup_z |ρ̂(z) − ρ̂₀|` over the finite deciding range; when refused,
-    /// the excursion the margin would have tolerated. Zero when no finite
-    /// deciding range exists; `+∞` when the fitted mean does not move with ρ.
-    pub rho_excursion: f64,
-    /// `L ≥ sup_ρ max_i (|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|)` on the deciding range — the
-    /// score-gap Lipschitz constant in ρ, bounded for every ρ at once.
-    pub score_rho_lipschitz: f64,
-    /// `ρ̂(z_mid)`, the re-selected strength at the deciding range's midpoint
-    /// that anchors the certified branch.
-    pub branch_anchor_rho: f64,
-}
-
-impl<'a> GaussianRemlRhoResponse<'a> {
-    /// Build the response object. Computes `rank(S)` once by symmetric
-    /// eigendecomposition, counting the eigenvalues above the REML engine's
-    /// `positive_eigenvalue_threshold`: the positive-eigenspace decision the
-    /// fit's own penalty pseudo-logdet makes.
-    pub fn new(
-        x: &'a Array2<f64>,
-        y: &'a Array1<f64>,
-        s: &'a Array2<f64>,
-        x_star: &'a Array1<f64>,
-    ) -> Result<Self, String> {
-        let n = x.nrows();
-        let p = x.ncols();
-        if y.len() != n {
-            return Err("gaussian reml response: row-count mismatch".to_string());
-        }
-        if s.nrows() != p || s.ncols() != p || x_star.len() != p {
-            return Err("gaussian reml response: column-count mismatch".to_string());
-        }
-        let (evals, _) = s.eigh(Side::Lower).map_err(|e| {
-            format!("gaussian reml response: penalty eigendecomposition failed: {e:?}")
-        })?;
-        let threshold = gam_solve::estimate::reml::reml_outer_engine::positive_eigenvalue_threshold(
-            evals.as_slice().ok_or_else(|| {
-                "gaussian reml response: penalty eigenvalues are not contiguous".to_string()
-            })?,
-        );
-        let rank_s = evals.iter().filter(|&&e| e > threshold).count();
-        let xtx = x.t().dot(x);
-        let xty = x.t().dot(y);
-        // #2902 row 8: ρ is searched in the #2812 resolvability domain of the Gram
-        // against S. The test row adds `x_* x_*ᵀ` to the Gram whatever z is, so
-        // every ρ̂(z) shares one augmented domain.
-        let domain_of = |gram: &Array2<f64>| {
-            gam_solve::estimate::rho_domain::coordinate_domain(
-                gam_solve::estimate::rho_domain::penalty_range_gammas_from_gram(gram, s)
-                    .as_deref()
-                    .and_then(gam_solve::estimate::rho_domain::resolvability_interval),
-                None,
-            )
-        };
-        let rho_domain = domain_of(&xtx);
-        let mut augmented_xtx = xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                augmented_xtx[[i, j]] += x_star[i] * x_star[j];
-            }
-        }
-        let augmented_rho_domain = domain_of(&augmented_xtx);
-        Ok(Self {
-            x,
-            y,
-            s,
-            x_star,
-            n,
-            p,
-            rank_s,
-            xtx,
-            xty,
-            rho_domain,
-            augmented_rho_domain,
-        })
-    }
-
-    /// Closed-form REML evaluation at `ρ`. `z = Some(_)` augments with the
-    /// test row; `z = None` is the original-data criterion (used for ρ̂₀).
-    fn eval(&self, rho: f64, z: Option<f64>) -> Result<RemlEval, String> {
-        let p = self.p;
-        let n_eff = self.n + usize::from(z.is_some());
-        let m0 = p - self.rank_s;
-        if n_eff <= m0 {
-            return Err(format!(
-                "gaussian reml response: degrees of freedom n_eff−M₀ = {n_eff}−{m0} ≤ 0; \
-                 REML criterion undefined"
-            ));
-        }
-        let coef = (n_eff - m0) as f64;
-        let r = self.rank_s as f64;
-        let lambda = gam_problem::checked_exp_log_strength(rho)
-            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-
-        // A(λ) = XᵀX + λ S [+ x_* x_*ᵀ].
-        let mut a = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] += lambda * self.s[[i, j]];
-            }
-        }
-        if z.is_some() {
-            for i in 0..p {
-                for j in 0..p {
-                    a[[i, j]] += self.x_star[i] * self.x_star[j];
-                }
-            }
-        }
-        let chol = a
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
-
-        // c(z) = Xᵀy [+ x_* z].
-        let mut c = self.xty.clone();
-        if let Some(zv) = z {
-            for j in 0..p {
-                c[j] += self.x_star[j] * zv;
-            }
-        }
-        let beta = chol.solvevec(&c);
-        let sbeta = self.s.dot(&beta);
-        let pen = lambda * beta.dot(&sbeta);
-
-        // #2280: `D` is the penalized sum of squares at β̂, formed as one:
-        // `‖y − Xβ̂‖² [+ (z − x_*ᵀβ̂)²] + pen`. The closed form it equals at the exact
-        // solve, `yᵀy [+ z²] − cᵀβ̂`, is a difference that rounds at `u·yᵀy` and takes
-        // the solve's backward error `E` at first order, as `β̂ᵀEβ̂`, so a `D` below
-        // that scale came back as roundoff, or as a non-positive "degenerate fit".
-        // Formed from residuals, the solve's error enters `D` only at second order,
-        // and the rounding is charged against the residuals rather than against `yᵀy`.
-        let (training_rss, training_scale) = residual_sum_of_squares(self.x, self.y, &beta);
-        let (test_rss, test_scale) = match z {
-            Some(zv) => {
-                let mut fitted = 0.0;
-                let mut cancelled = zv.abs();
-                for (&entry, &coefficient) in self.x_star.iter().zip(beta.iter()) {
-                    fitted += entry * coefficient;
-                    cancelled += (entry * coefficient).abs();
-                }
-                let residual = zv - fitted;
-                (
-                    residual * residual,
-                    residual * residual + 2.0 * residual.abs() * cancelled,
-                )
-            }
-            None => (0.0, 0.0),
-        };
-        let d = training_rss + test_rss + pen;
-        if !(d > 0.0) {
-            return Err(format!(
-                "gaussian reml response: non-positive penalized RSS D = {d}; degenerate fit"
-            ));
-        }
-        let growth = response_solve_growth(n_eff, p);
-        let d_band = growth * (training_scale + test_scale + pen.abs());
-
-        // Z = A⁻¹ S for the trace terms tr(A⁻¹S), tr((A⁻¹S)²).
-        let z_mat = chol.solve_mat(self.s);
-        let mut tr_ainv_s = 0.0;
-        let mut tr_ainv_s_sq = 0.0;
-        for i in 0..p {
-            tr_ainv_s += z_mat[[i, i]];
-            for j in 0..p {
-                tr_ainv_s_sq += z_mat[[i, j]] * z_mat[[j, i]];
-            }
-        }
-
-        // v_s = A⁻¹ Sβ̂ (so dβ̂/dρ = −λ v_s); quad = β̂ᵀS A⁻¹ S β̂.
-        let v_s = chol.solvevec(&sbeta);
-        let quad = sbeta.dot(&v_s);
-
-        let logdet: f64 = 2.0 * chol.diag().iter().map(|d| d.ln()).sum::<f64>();
-        let value = coef * d.ln() + logdet - r * rho;
-        let grad = coef * pen / d + lambda * tr_ainv_s - r;
-        // `D`'s own rounding reaches the gradient through `pen/D`.
-        let grad_band = growth * ((coef * pen / d).abs() + (lambda * tr_ainv_s).abs() + r.abs())
-            + (coef * pen / d).abs() * d_band / d;
-        let pen_prime = pen - 2.0 * lambda * lambda * quad;
-        let hess = coef * (pen_prime * d - pen * pen) / (d * d) + lambda * tr_ainv_s
-            - lambda * lambda * tr_ainv_s_sq;
-
-        Ok(RemlEval {
-            value,
-            grad,
-            grad_band,
-            hess,
-            penalized_rss: d,
-        })
-    }
-
-    /// The stationarity condition `∂V/∂ρ = 0` at a fixed `ρ`, written as the
-    /// exact quadratic in the candidate response `z` whose roots it shares.
-    ///
-    /// With `A = XᵀX + x_*x_*ᵀ + λS` the augmented penalized coefficients are
-    /// affine in `z`, `β̂(z) = a + b·z`, so the penalty `pen(z) = λ·β̂ᵀSβ̂` and
-    /// the penalized RSS `D(z) = yᵀy + z² − c(z)ᵀβ̂(z)` are quadratics in `z`, and
-    /// `∂V/∂ρ = (n+1−M₀)·pen(z)/D(z) + λ·tr(A⁻¹S) − rank(S)` vanishes exactly
-    /// where `Q(z) = (n+1−M₀)·pen(z) + (λ·tr(A⁻¹S) − rank(S))·D(z)` does
-    /// (`D > 0` on a non-degenerate fit). The level set `{z : ρ̂(z) = ρ}` is
-    /// therefore the root set of a quadratic: whether the REML branch ever
-    /// reaches a given `ρ` on a `z`-interval is a closed-form question, not one
-    /// to sample.
-    fn stationarity_quadratic_in_z(&self, rho: f64) -> Result<StationarityQuadratic, String> {
-        let p = self.p;
-        let m0 = p - self.rank_s;
-        let n_eff = self.n + 1;
-        if n_eff <= m0 {
-            return Err(format!(
-                "gaussian reml response: degrees of freedom n_eff−M₀ = {n_eff}−{m0} ≤ 0; \
-                 REML criterion undefined"
-            ));
-        }
-        let coef = (n_eff - m0) as f64;
-        let lambda = gam_problem::checked_exp_log_strength(rho)
-            .map_err(|error| format!("gaussian REML conformal response: {error}"))?;
-        let mut a_mat = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a_mat[[i, j]] += lambda * self.s[[i, j]] + self.x_star[i] * self.x_star[j];
-            }
-        }
-        let chol = a_mat
-            .cholesky(Side::Lower)
-            .map_err(|e| format!("gaussian reml response: A(λ) not SPD: {e:?}"))?;
-        // β̂(z) = a + b·z.
-        let a = chol.solvevec(&self.xty);
-        let b = chol.solvevec(self.x_star);
-        let sa = self.s.dot(&a);
-        let sb = self.s.dot(&b);
-        // pen(z) = λ·(aᵀSa + 2·aᵀSb·z + bᵀSb·z²).
-        let pen = [lambda * a.dot(&sa), 2.0 * lambda * a.dot(&sb), lambda * b.dot(&sb)];
-        // #2280: D(z) is the penalized sum of squares at β̂(z), and its coefficients
-        // are formed from residuals. The training rows' residuals are `e − f·z`, with
-        // `e = y − Xa` and `f = Xb`, and the test row's is `(1 − x_*ᵀb)·z − x_*ᵀa`, so
-        //   D(z) = (‖e‖² + (x_*ᵀa)² + pen₀) + (pen₁ − 2·(eᵀf + (x_*ᵀa)(1 − x_*ᵀb)))·z
-        //        + (‖f‖² + (1 − x_*ᵀb)² + pen₂)·z².
-        // At the exact solve these are `yᵀy − c₀ᵀa`, `−(c₀ᵀb + x_*ᵀa)` and `1 − x_*ᵀb`,
-        // differences that round against `yᵀy` and the leverage rather than against
-        // the coefficient, so a coefficient below that scale was roundoff returned as
-        // a number. Each scale below is what its coefficient's rounding is charged
-        // against: a residual rounds against the magnitudes it cancelled.
-        let mut sums = [0.0_f64; 3];
-        let mut sum_scales = [0.0_f64; 3];
-        for (row, &response) in self.x.rows().into_iter().zip(self.y.iter()) {
-            let mut fitted_a = 0.0;
-            let mut cancelled_a = response.abs();
-            let mut image_b = 0.0;
-            let mut cancelled_b = 0.0;
-            for ((&entry, &coefficient_a), &coefficient_b) in
-                row.iter().zip(a.iter()).zip(b.iter())
-            {
-                fitted_a += entry * coefficient_a;
-                cancelled_a += (entry * coefficient_a).abs();
-                image_b += entry * coefficient_b;
-                cancelled_b += (entry * coefficient_b).abs();
-            }
-            let e = response - fitted_a;
-            sums[0] += e * e;
-            sum_scales[0] += e * e + 2.0 * e.abs() * cancelled_a;
-            sums[1] += e * image_b;
-            sum_scales[1] +=
-                (e * image_b).abs() + e.abs() * cancelled_b + image_b.abs() * cancelled_a;
-            sums[2] += image_b * image_b;
-            sum_scales[2] += image_b * image_b + 2.0 * image_b.abs() * cancelled_b;
-        }
-        let test_image_a = self.x_star.dot(&a);
-        let test_cancelled_a: f64 = self
-            .x_star
-            .iter()
-            .zip(a.iter())
-            .map(|(&entry, &coefficient)| (entry * coefficient).abs())
-            .sum();
-        let test_image_b = self.x_star.dot(&b);
-        let test_cancelled_b: f64 = self
-            .x_star
-            .iter()
-            .zip(b.iter())
-            .map(|(&entry, &coefficient)| (entry * coefficient).abs())
-            .sum();
-        let complement = 1.0 - test_image_b;
-        let complement_scale = 1.0 + test_cancelled_b;
-        let rss = [
-            sums[0] + test_image_a * test_image_a + pen[0],
-            pen[1] - 2.0 * (sums[1] + test_image_a * complement),
-            sums[2] + complement * complement + pen[2],
-        ];
-        let rss_scale = [
-            sum_scales[0]
-                + test_image_a * test_image_a
-                + 2.0 * test_image_a.abs() * test_cancelled_a
-                + pen[0].abs(),
-            pen[1].abs()
-                + 2.0
-                    * (sum_scales[1]
-                        + (test_image_a * complement).abs()
-                        + complement.abs() * test_cancelled_a
-                        + test_image_a.abs() * complement_scale),
-            sum_scales[2]
-                + complement * complement
-                + 2.0 * complement.abs() * complement_scale
-                + pen[2].abs(),
-        ];
-        let z_mat = chol.solve_mat(self.s);
-        let tr_ainv_s: f64 = (0..p).map(|i| z_mat[[i, i]]).sum();
-        let g = lambda * tr_ainv_s - self.rank_s as f64;
-        // `g` is itself a difference, so its rounding is charged against its terms.
-        let g_scale = (lambda * tr_ainv_s).abs() + self.rank_s as f64;
-        let mut q = [0.0_f64; 3];
-        let mut magnitude = [0.0_f64; 3];
-        for k in 0..3 {
-            q[k] = coef * pen[k] + g * rss[k];
-            magnitude[k] = (coef * pen[k]).abs() + g_scale * rss_scale[k];
-        }
-        Ok(StationarityQuadratic {
-            q,
-            magnitude,
-            growth: response_solve_growth(n_eff, p),
-        })
-    }
-
-    /// A `ρ`-independent bound on the score-gap Lipschitz constant in `ρ` over
-    /// `z ∈ [z_lo, z_hi]`: `sup |∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|` for every training row
-    /// `i`, taken over EVERY `ρ` at once.
-    ///
-    /// In the basis `V` that diagonalises the penalty against the augmented
-    /// Gram matrix (`VᵀMV = I`, `VᵀSV = diag(s)`, `M = XᵀX + x_*x_*ᵀ`),
-    /// `∂μ̂/∂ρ = −X_aug·V·diag(λs_k/(1+λs_k)²)·Vᵀ(c₀ + x_*·z)`. Each diagonal
-    /// entry is at most `¼` for every `λ` (its maximum, at `λs_k = 1`), and
-    /// `Vᵀ(c₀ + x_*·z)` is affine in `z`, so its magnitude on an interval is
-    /// attained at an endpoint. The triangle inequality over `k` then gives a
-    /// bound that holds on the whole `ρ` line — the previous sampled maximum of
-    /// `|∂μ̂/∂ρ|` at 65 probes was neither a supremum nor a bound.
-    fn score_rho_lipschitz_sup(&self, z_lo: f64, z_hi: f64) -> Result<f64, String> {
-        let p = self.p;
-        let mut m = self.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                m[[i, j]] += self.x_star[i] * self.x_star[j];
-            }
-        }
-        let chol = m.cholesky(Side::Lower).map_err(|e| {
-            format!("gaussian reml response: augmented Gram matrix not SPD: {e:?}")
-        })?;
-        let lower = chol.lower_triangular();
-        // C = L⁻¹ S L⁻ᵀ, symmetric in exact arithmetic; the average of C and Cᵀ
-        // removes the rounding asymmetry the two triangular solves leave.
-        let w = solve_lower_triangular(&lower, self.s);
-        let c_raw = solve_lower_triangular(&lower, &w.t().to_owned());
-        let mut c = Array2::<f64>::zeros((p, p));
-        for i in 0..p {
-            for j in 0..p {
-                c[[i, j]] = 0.5 * (c_raw[[i, j]] + c_raw[[j, i]]);
-            }
-        }
-        let (_, u) = c.eigh(Side::Lower).map_err(|e| {
-            format!("gaussian reml response: generalized penalty eigenproblem failed: {e:?}")
-        })?;
-        let v = solve_lower_triangular_transposed(&lower, &u);
-        let xv = self.x.dot(&v);
-        let xsv = v.t().dot(self.x_star);
-        let t0 = v.t().dot(&self.xty);
-        let t1 = &xsv;
-        let envelope: Vec<f64> = (0..p)
-            .map(|k| (t0[k] + t1[k] * z_lo).abs().max((t0[k] + t1[k] * z_hi).abs()))
-            .collect();
-        let mut worst_row = 0.0_f64;
-        for i in 0..self.n {
-            let row: f64 = (0..p).map(|k| xv[[i, k]].abs() * envelope[k]).sum();
-            worst_row = worst_row.max(row);
-        }
-        let test_row: f64 = (0..p).map(|k| xsv[k].abs() * envelope[k]).sum();
-        Ok(0.25 * (worst_row + test_row))
-    }
-
-    /// The penalized RSS `D(ρ, z)` of the augmented criterion (or the training
-    /// criterion for `z = None`): the quantity whose `log` the REML criterion
-    /// takes and the denominator the stationarity quadratic clears.
-    pub fn penalized_rss(&self, rho: f64, z: Option<f64>) -> Result<f64, String> {
-        Ok(self.eval(rho, z)?.penalized_rss)
-    }
-
-    /// The REML-selected log smoothing strength for the training response
-    /// with the test response set to `z` (or the training-only criterion for
-    /// `None`), found by the workspace's outer engine: one ρ coordinate with
-    /// the analytic gradient and Hessian `eval` already provides, searched in
-    /// the #2812 resolvability domain of its Gram against `S` (#2902 row 8),
-    /// with the engine's seed cascade and stationarity certificate. This replaced a
-    /// 61-point grid over a hand box `[−25, 25]` followed by an uncertified
-    /// Newton with a `±5` widening, a `1e-12` curvature floor and a `1e-13`
-    /// step tolerance that returned its last iterate after 100 steps (#2469,
-    /// #2670; SPEC forbids grid search and hand-supplied boxes outright).
-    pub fn select_rho(&self, z: Option<f64>) -> Result<f64, String> {
-        use gam_problem::{Derivative, HessianValue, OuterEval};
-        use gam_solve::estimate::EstimationError;
-        use gam_solve::rho_optimizer::OuterProblem;
-        let context = match z {
-            Some(z) => format!("full conformal REML strength at z={z}"),
-            None => "full conformal REML strength".to_string(),
-        };
-        // A criterion that cannot be evaluated at a trial ρ (a Cholesky that
-        // fails at an extreme strength) is a property of that trial point, so
-        // the search retreats from it rather than abandoning the problem.
-        let refuse = |error: String| EstimationError::TrialPointRefused { reason: error };
-        let (lower, upper) = if z.is_some() {
-            self.augmented_rho_domain
-        } else {
-            self.rho_domain
-        };
-        // The augmented criterion carries the test point as one more row.
-        let problem = OuterProblem::new(1)
-            .with_problem_size(self.n + usize::from(z.is_some()), self.p)
-            .with_gradient(Derivative::Analytic)
-            .with_hessian(gam_problem::DeclaredHessianForm::Dense)
-            .with_bounds(Array1::from_elem(1, lower), Array1::from_elem(1, upper));
-        let mut objective = problem.build_objective(
-            (),
-            |_: &mut (), rho: &Array1<f64>| self.eval(rho[0], z).map(|ev| ev.value).map_err(refuse),
-            |_: &mut (), rho: &Array1<f64>| {
-                let ev = self.eval(rho[0], z).map_err(refuse)?;
-                Ok(OuterEval {
-                    cost: ev.value,
-                    gradient: Array1::from_vec(vec![ev.grad]),
-                    hessian: HessianValue::Dense(Array2::from_elem((1, 1), ev.hess)),
-                    inner_beta_hint: None,
-                })
-            },
-            None::<fn(&mut ())>,
-            None::<fn(&mut (), &Array1<f64>) -> Result<gam_problem::EfsEval, EstimationError>>,
-        );
-        let result = problem
-            .run(&mut objective, &context)
-            .map_err(|error| format!("{context}: {error}"))?;
-        // The engine certifies the basin; from there the criterion is smooth
-        // with a positive analytic Hessian, so Newton converges quadratically
-        // to the arithmetic's own stationarity — a gradient inside its own
-        // rounding band. The response ρ̂(z) is differentiated downstream,
-        // which needs exactly that resolution. (A step below ρ's representation
-        // is not reachable: the gradient's rounding floor is what bounds the
-        // step, so the band, not the step, is the statement.) Quadratic
-        // convergence makes each step's contraction ratio `|G_{k+1}|/|G_k|`
-        // smaller than the last. A ratio that stops shrinking is refused with
-        // both ratios named. While the ratios keep shrinking below one, `|G|`
-        // falls at least geometrically and reaches the band in finitely many
-        // steps, so no step budget is needed. A zero band means a zero gradient,
-        // which returns at once.
-        let mut rho = result.rho[0];
-        let mut ev = self.eval(rho, z)?;
-        let mut previous_ratio = 1.0_f64;
-        loop {
-            if ev.grad.abs() <= ev.grad_band {
-                return Ok(rho);
-            }
-            if !(ev.hess.is_finite() && ev.hess > 0.0) {
-                return Err(format!(
-                    "{context}: the REML criterion's curvature is {} at ρ={rho}; the certified \
-                     point is not a minimum",
-                    ev.hess
-                ));
-            }
-            let candidate = rho - ev.grad / ev.hess;
-            let ev_candidate = self.eval(candidate, z)?;
-            // A step that lands inside its own rounding band is done, whatever its
-            // ratio: overshooting into the noise is the end of quadratic convergence,
-            // not a failure of it.
-            if ev_candidate.grad.abs() <= ev_candidate.grad_band {
-                return Ok(candidate);
-            }
-            let ratio = ev_candidate.grad.abs() / ev.grad.abs();
-            if !(ratio < previous_ratio) {
-                // The step does not contract the gradient faster than the one
-                // before it: the iteration sits on the gradient's noise floor,
-                // above the band the terms predict, or is not in Newton's
-                // quadratic regime — refused, with the numbers named.
-                return Err(format!(
-                    "{context}: Newton polish stopped contracting at ρ={rho} with gradient {} \
-                     above its rounding band {} (next step gave {}, contraction ratio {ratio} \
-                     not below the previous {previous_ratio})",
-                    ev.grad, ev.grad_band, ev_candidate.grad
-                ));
-            }
-            previous_ratio = ratio;
-            rho = candidate;
-            ev = ev_candidate;
-        }
-    }
-
-    /// Run the certificate-first procedure: build the frozen-ρ exact set, then
-    /// compute the conditional score perturbation a ρ re-selection could
-    /// induce and decide whether the frozen set is accepted under the
-    /// rho-grid Lipschitz assumption.
-    ///
-    /// The score-perturbation bound is `max_i(|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|) ·
-    /// sup_z|ρ̂(z) − ρ̂₀|`, where the ρ-excursion is bounded over the set's
-    /// finite deciding range by the worst probed `|ρ̂(z) − ρ̂₀|` plus a
-    /// mean-value remainder from the observed probe-grid maximum of
-    /// `|dρ̂/dz|`. This is a conditional check, not a continuous supremum
-    /// proof: the returned diagnostics expose the probe count and observed
-    /// derivative maximum.
-    pub fn certified_full_conformal(&self, alpha: f64) -> Result<CertifiedFullConformal, String> {
-        let rho0 = self.select_rho(None)?;
-        let lambda0 = gam_problem::checked_exp_log_strength(rho0)
-            .map_err(|error| format!("full conformal selected an invalid log strength: {error}"))?;
-        let mut s_lambda = Array2::<f64>::zeros((self.p, self.p));
-        for i in 0..self.p {
-            for j in 0..self.p {
-                s_lambda[[i, j]] = lambda0 * self.s[[i, j]];
-            }
-        }
-        let weights = Array1::<f64>::ones(self.n);
-        let engine =
-            ExactGaussianFullConformal::new(self.x, self.y, &weights, &s_lambda, self.x_star)?;
-        let frozen_set = engine.prediction_set(alpha);
-
-        // Collect the finite deciding endpoints. If there are none (set is ℝ
-        // or empty), the margin has already been computed analytically. With
-        // no finite range for the ρ response, accept only the score-independent
-        // case where no comparison is needed; otherwise refuse instead of
-        // pretending the unbounded ρ excursion was checked.
-        let mut endpoints: Vec<f64> = Vec::new();
-        for itv in &frozen_set.intervals {
-            for ep in [itv.lo, itv.hi] {
-                if ep.is_finite() {
-                    endpoints.push(ep);
-                }
-            }
-        }
-        if endpoints.is_empty() {
-            let score_perturbation_bound = if frozen_set.boundary_margin == f64::INFINITY {
-                0.0
-            } else {
-                f64::INFINITY
-            };
-            return Ok(CertifiedFullConformal {
-                certificate: FrozenRhoCertificate::decide(
-                    score_perturbation_bound,
-                    frozen_set.boundary_margin,
-                ),
-                frozen_set,
-                rho_frozen: rho0,
-                rho_excursion: 0.0,
-                score_rho_lipschitz: 0.0,
-                branch_anchor_rho: rho0,
-            });
-        }
-        endpoints.sort_by(|a, b| a.partial_cmp(b).expect("finite endpoints"));
-        let z_lo = *endpoints.first().expect("non-empty");
-        let z_hi = *endpoints.last().expect("non-empty");
-
-        // The certificate, exactly (#2469, #2670; it replaced a 65-probe grid
-        // whose sampled maximum of |dρ̂/dz| was reported as a supremum):
-        //
-        //  1. `L` bounds `|∂μ̂_i/∂ρ| + |∂μ̂_*/∂ρ|` for every row and EVERY ρ on
-        //     `z ∈ [z_lo, z_hi]` (`score_rho_lipschitz_sup`). A deciding score
-        //     gap therefore moves by less than the margin as long as the
-        //     re-selected strength stays within `E = margin / L` of `ρ̂₀`.
-        //  2. The set `{z : ρ̂(z) = ρ}` is the root set of a quadratic
-        //     (`stationarity_quadratic_in_z`). If that quadratic has no root on
-        //     `[z_lo, z_hi]` at `ρ̂₀ + E` and at `ρ̂₀ − E`, the REML branch never
-        //     reaches either wall on the deciding range.
-        //  3. The branch is anchored inside the walls at one `z` (its midpoint;
-        //     any point serves): a continuous branch that starts strictly inside
-        //     and never touches a wall stays strictly inside, so
-        //     `sup_z |ρ̂(z) − ρ̂₀| < E` and `L · sup < margin`.
-        //
-        // `select_rho` confines every ρ̂(z) to the augmented resolvability domain,
-        // so a wall beyond either face of it cannot be reached and needs no
-        // quadratic. What
-        // the certificate is conditional on is stated by its name: the branch of
-        // REML stationary points through the anchor. A second, disconnected REML
-        // minimum is outside every frozen-ρ argument, sampled or exact.
-        let margin = frozen_set.boundary_margin;
-        let lipschitz = self.score_rho_lipschitz_sup(z_lo, z_hi)?;
-        let excursion = if lipschitz > 0.0 { margin / lipschitz } else { f64::INFINITY };
-        let z_mid = 0.5 * (z_lo + z_hi);
-        let branch_anchor_rho = self.select_rho(Some(z_mid))?;
-        let anchor_inside = (branch_anchor_rho - rho0).abs() < excursion;
-        let wall_unreached = |wall: f64| -> Result<bool, String> {
-            let (lower, upper) = self.augmented_rho_domain;
-            if wall < lower || wall > upper {
-                return Ok(true);
-            }
-            Ok(self.stationarity_quadratic_in_z(wall)?.has_no_root_in(z_lo, z_hi) == Some(true))
-        };
-        let walls_unreached = excursion.is_finite()
-            && wall_unreached(rho0 + excursion)?
-            && wall_unreached(rho0 - excursion)?;
-        let branch_stays_inside = anchor_inside && (excursion == f64::INFINITY || walls_unreached);
-        let score_perturbation_bound = if excursion.is_finite() { lipschitz * excursion } else { 0.0 };
-        let certificate = if margin > 0.0 && branch_stays_inside {
-            FrozenRhoCertificate::Certified {
-                score_perturbation_bound,
-                boundary_margin: margin,
-            }
-        } else {
-            FrozenRhoCertificate::Refused {
-                score_perturbation_bound,
-                boundary_margin: margin,
-            }
-        };
-
-        Ok(CertifiedFullConformal {
-            frozen_set,
-            certificate,
-            rho_frozen: rho0,
-            rho_excursion: excursion,
-            score_rho_lipschitz: lipschitz,
-            branch_anchor_rho,
-        })
-    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1948,29 +882,18 @@ impl<'a> GlmHomotopyFullConformal<'a> {
         vec_norm(&score) + vec_norm(&self.s_lambda.dot(beta)) + self.star_norm * r_star.abs()
     }
 
-    /// Dimension-based scale `√(n+1) · √p` for the structural KKT bound, with
-    /// `n+1` counting the appended test row. Matches `kkt_dimension_scale` in
-    /// the main P-IRLS state: under standardized columns the augmented score
-    /// `Xᵀ(μ − y)` has components of order O(√(n+1)), so an absolute
-    /// `‖g‖ < τ` test becomes systematically too tight as `n` grows. This
-    /// scaling restores the advertised per-observation meaning of `τ`.
-    fn kkt_dimension_scale(&self) -> f64 {
-        (((self.n + 1) as f64).sqrt()) * ((self.p as f64).max(1.0).sqrt())
-    }
-
     /// Scale-invariant KKT acceptance on the RAW penalized gradient, exactly
     /// the `WorkingState::certifies_kkt` certificate the engine's main solver
-    /// uses: the iterate certifies stationarity at tolerance `tol` under
-    /// EITHER the dimension-scaled absolute bound OR the data-driven
-    /// natural-scale relative bound. The earlier predicate compared the
-    /// PRECONDITIONED Newton step `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose
-    /// floating-point floor is `~ε·(n+1)/λ_min(H)` — n-dependent and not
-    /// compensated by `(1 + ‖β‖)`, so genuinely-converged fits (e.g. raw
-    /// gradient floor `3.6e-8` at moderate n) were rejected as non-converged.
+    /// uses: the dimensionless residual `‖g‖ / (‖score‖ + ‖S·β‖)` is below
+    /// `tol`. The earlier predicate compared the PRECONDITIONED Newton step
+    /// `‖H⁻¹g‖` against `tol·(1 + ‖β‖)`, whose floating-point floor is
+    /// `~ε·(n+1)/λ_min(H)` — n-dependent and not compensated by `(1 + ‖β‖)`,
+    /// so genuinely-converged fits (e.g. raw gradient floor `3.6e-8` at
+    /// moderate n) were rejected as non-converged.
     fn kkt_converged(&self, beta: &Array1<f64>, z: f64, tol: f64) -> bool {
         let g_norm = vec_norm(&self.penalized_score(beta, z));
-        g_norm < tol * self.kkt_dimension_scale()
-            || g_norm / (1.0 + self.gradient_natural_scale(beta, z)) < tol
+        gam_solve::pirls::relative_gradient_residual(g_norm, self.gradient_natural_scale(beta, z))
+            < tol
     }
 
     /// Augmented penalized NLL (line-search merit function).
@@ -2417,8 +1340,8 @@ impl<'a> GlmHomotopyFullConformal<'a> {
     }
 }
 
-/// Persisted frozen penalty for the EXACT Gaussian-identity full-conformal set
-/// (#942 Layer 1 + the Layer-3 frozen-ρ self-diagnostic).
+/// Persisted frozen penalty for the Gaussian-identity full-conformal set
+/// (#942 Layers 1 and 3).
 ///
 /// The exact full-conformal set has no test-point-independent
 /// factorization: every test covariate `x_*` enters the augmented normal matrix
@@ -2435,19 +1358,29 @@ impl<'a> GlmHomotopyFullConformal<'a> {
 /// re-derivation is needed.
 ///
 /// Older payloads persisted the training `x` and `y` beside `s_lambda` under
-/// the same field; deserialization reads `s_lambda` and ignores them.
+/// the same field; deserialization reads `s_lambda` and ignores them. Payloads
+/// written before `penalty_count` existed (v32 and older) read it as `None`, and
+/// their rows are refused with [`ConformalRefusal::UnknownPenaltyStructure`]. A
+/// v32 binary refuses a payload carrying the count by version (v33), so no binary
+/// publishes a frozen-λ set for a fit whose smoothing selection it cannot see.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ExactFullConformalPenalty {
     /// Frozen penalty `Sλ = M₀ − XᵀX` at the fitted smoothing parameters (p × p).
     s_lambda: Array2<f64>,
+    /// Number of smoothing parameters the fit selected, which decides whether
+    /// the REML re-selecting map is computable ([`honest_full_conformal`]).
+    #[serde(default)]
+    penalty_count: Option<usize>,
 }
 
 impl ExactFullConformalPenalty {
     /// Recover the frozen penalty `Sλ = M₀ − XᵀX` from the unit-weight training
-    /// Gram matrix `XᵀX` and the converged penalized normal matrix `M₀`.
+    /// Gram matrix `XᵀX` and the converged penalized normal matrix `M₀`, with the
+    /// fit's smoothing-parameter count.
     pub fn from_gram_and_normal_matrix(
         gram: &Array2<f64>,
         m: &Array2<f64>,
+        penalty_count: usize,
     ) -> Result<Self, String> {
         let p = gram.nrows();
         if gram.ncols() != p || m.nrows() != p || m.ncols() != p {
@@ -2455,6 +1388,7 @@ impl ExactFullConformalPenalty {
         }
         Ok(Self {
             s_lambda: m - gram,
+            penalty_count: Some(penalty_count),
         })
     }
 
@@ -2470,8 +1404,7 @@ impl ExactFullConformalPenalty {
     /// The rows need not be the training rows. The set is exact for whatever
     /// labeled rows are supplied; with the training rows it is the frozen-λ
     /// full-conformal set of the fit, and with rows the penalty was not
-    /// selected on the augmented scores are exchangeable, so the finite-sample
-    /// coverage theorem holds without the frozen-ρ certificate.
+    /// selected on the augmented scores are exchangeable under either map.
     pub fn with_labeled_rows(
         &self,
         x: Array2<f64>,
@@ -2492,25 +1425,17 @@ impl ExactFullConformalPenalty {
             x,
             y,
             s_lambda: self.s_lambda.clone(),
+            penalty_count: self.penalty_count,
         })
     }
 }
 
-/// Runtime substrate for the EXACT Gaussian-identity full-conformal set: the
-/// labeled design `X`, response `y`, and the frozen penalty `Sλ`. It rebuilds
-/// [`ExactGaussianFullConformal`] per test row — one Cholesky per test point,
-/// zero refits. Valid for any penalized smooth with an arbitrary `Sλ` and basis.
-/// It is never persisted (see [`ExactFullConformalPenalty`]).
-///
-/// The frozen-ρ self-diagnostic treats the entire frozen penalty as carrying a
-/// single global log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ` and runs the
-/// closed-form [`GaussianRemlRhoResponse::certified_full_conformal`]: it
-/// re-selects the global ρ̂(z) on the augmented data, bounds the score
-/// perturbation freezing ρ̂ could induce, and reports whether freezing is
-/// accepted under the stated rho-grid Lipschitz assumption. This is a sound,
-/// conservative global-scale check that applies to any penalized smooth (it does
-/// not require the model to be single-penalty); per-penalty re-selection is the
-/// research-core Layer 3 and is not asserted here.
+/// Runtime substrate for the Gaussian-identity full-conformal set: the labeled
+/// design `X`, response `y`, the frozen penalty `Sλ` and the fit's
+/// smoothing-parameter count. Each test row gets [`honest_full_conformal`]: the
+/// set of the map that re-selects the smoothing strength by REML on the
+/// augmented rows, or the frozen-ρ set with a typed refusal. It is never
+/// persisted (see [`ExactFullConformalPenalty`]).
 ///
 /// Unit prior weights are required, as everywhere in this module: a reweighted
 /// training row is not exchangeable with the test row.
@@ -2522,37 +1447,40 @@ pub struct ExactFullConformalSubstrate {
     y: Array1<f64>,
     /// Frozen penalty `Sλ` at the fitted smoothing parameters (p × p).
     s_lambda: Array2<f64>,
+    /// Smoothing parameters the fit selected (`None`: not recorded).
+    penalty_count: Option<usize>,
 }
 
-/// One test row's exact full-conformal verdict: the outer `[lower, upper]`
-/// envelope of the exact set, plus the frozen-ρ self-diagnostics flag.
+/// One test row's full-conformal verdict: the outer `[lower, upper]` envelope
+/// of the set, the set itself, what it guarantees and what it cost.
 #[derive(Clone, Debug)]
 pub struct ExactFullConformalInterval {
-    /// Outer envelope `[min lo, max hi]` of the exact (possibly multi-interval)
-    /// set, inheriting its coverage (it is a superset). Endpoints may be
-    /// infinite (honest unboundedness in low-information / high-leverage regimes).
+    /// Outer envelope `[min lo, max hi]` of the (possibly multi-interval) set,
+    /// inheriting its coverage (it is a superset). Endpoints may be infinite
+    /// (honest unboundedness in low-information / high-leverage regimes).
     pub lo: f64,
     pub hi: f64,
-    /// The exact set itself (a union of intervals).
+    /// The set itself (a union of intervals).
     pub set: FullConformalSet,
-    /// `true` when freezing the global smoothing parameter is ACCEPTED under the
-    /// rho-grid Lipschitz assumption (the frozen exact set equals the honest
-    /// ρ-re-selecting set); `false` when the certificate REFUSED (the frozen set
-    /// may differ from the honest set and the caller should treat the envelope
-    /// as the frozen-ρ approximation, not the certified honest set).
-    pub frozen_rho_certified: bool,
+    /// `exact_frozen`, `honest_refit`, or `refused:<reason>` (the frozen-ρ set,
+    /// with no finite-sample guarantee).
+    pub certificate: ConformalCertificate,
+    /// Factorizations, eigendecompositions, cold refits and cells the row cost.
+    pub cost: HonestConformalCost,
 }
 
 impl ExactFullConformalSubstrate {
     /// Build the substrate from the training design, response, prior weights,
-    /// and the converged penalized normal matrix `M₀ = XᵀX + Sλ`. Recovers the
-    /// frozen penalty `Sλ = M₀ − XᵀX` once. Rejects non-unit prior weights and
-    /// shape mismatches, identically to the rest of this module.
+    /// the converged penalized normal matrix `M₀ = XᵀX + Sλ` and the fit's
+    /// smoothing-parameter count. Recovers the frozen penalty `Sλ = M₀ − XᵀX`
+    /// once. Rejects non-unit prior weights and shape mismatches, identically to
+    /// the rest of this module.
     pub fn from_design_unit_weight_normal_matrix(
         x: &Array2<f64>,
         y: &Array1<f64>,
         prior_weights: &Array1<f64>,
         m: &Array2<f64>,
+        penalty_count: usize,
     ) -> Result<Self, String> {
         let n = x.nrows();
         let p = x.ncols();
@@ -2576,6 +1504,7 @@ impl ExactFullConformalSubstrate {
             x: x.clone(),
             y: y.clone(),
             s_lambda,
+            penalty_count: Some(penalty_count),
         })
     }
 
@@ -2589,9 +1518,7 @@ impl ExactFullConformalSubstrate {
         self.x.nrows()
     }
 
-    /// The exact full-conformal verdict at one test row `x_*` and miscoverage
-    /// `alpha`: the exact set, its outer envelope, and the frozen-ρ
-    /// self-diagnostics flag. One Cholesky per call, zero refits.
+    /// The full-conformal verdict at one test row `x_*` and miscoverage `alpha`.
     pub fn interval(
         &self,
         x_star: &Array1<f64>,
@@ -2604,66 +1531,35 @@ impl ExactFullConformalSubstrate {
                 self.p()
             ));
         }
-        // The AUTHORITATIVE exact set is built at the user's fitted penalty `Sλ`
-        // (ρ frozen exactly at the fit), so the reported set reflects the model
-        // the user trained — not a re-optimized global scale.
         let weights = Array1::<f64>::ones(self.n());
-        let engine =
-            ExactGaussianFullConformal::new(&self.x, &self.y, &weights, &self.s_lambda, x_star)?;
-        let set = engine.prediction_set(alpha);
-
-        // Frozen-ρ self-diagnostic: treat the whole frozen penalty as carrying a
-        // single global log-smoothing parameter `ρ` with `S(ρ) = eᵖ·Sλ` and run
-        // the closed-form certificate. It re-selects the global ρ̂(z) on the
-        // augmented data and decides whether freezing the global scale is safe.
-        // This is a sound conservative check around the global REML optimum (a
-        // properly fitted model already sits at ρ̂₀ ≈ 0, where this set coincides
-        // with the authoritative set above); per-penalty re-selection is the
-        // research-core Layer 3 and is not asserted here. A degenerate certificate
-        // computation must NOT void the exact set, so its failure maps to "not
-        // certified" rather than an error.
-        let frozen_rho_certified =
-            GaussianRemlRhoResponse::new(&self.x, &self.y, &self.s_lambda, x_star)
-                .and_then(|response| response.certified_full_conformal(alpha))
-                .map(|certified| {
-                    matches!(
-                        certified.certificate,
-                        FrozenRhoCertificate::Certified { .. }
-                    )
-                })
-                .unwrap_or(false);
-
-        let (lo, hi) = if set.intervals.is_empty() {
+        let row = honest_full_conformal(
+            &self.x,
+            &self.y,
+            &weights,
+            &self.s_lambda,
+            self.penalty_count,
+            x_star,
+            alpha,
+        )?;
+        let (lo, hi) = match (row.set.intervals.first(), row.set.intervals.last()) {
+            (Some(first), Some(last)) => (first.lo, last.hi),
             // No candidate qualifies (pathological tiny α·(n+1)); collapse to the
-            // frozen plug-in mean μ̂_* = x_*ᵀβ̂, β̂ = (XᵀX+Sλ)⁻¹Xᵀy — the only
-            // honest scalar answer.
-            let m = &self.x.t().dot(&self.x) + &self.s_lambda;
-            let chol = m.cholesky(Side::Lower).map_err(|e| {
-                format!("exact full conformal: frozen normal matrix not SPD: {e:?}")
-            })?;
-            let beta = chol.solvevec(&self.x.t().dot(&self.y));
-            let mu_point = x_star.dot(&beta);
-            (mu_point, mu_point)
-        } else {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for itv in &set.intervals {
-                lo = lo.min(itv.lo);
-                hi = hi.max(itv.hi);
-            }
-            (lo, hi)
+            // plug-in mean — the only honest scalar answer.
+            _ => (row.plug_in_mean, row.plug_in_mean),
         };
         Ok(ExactFullConformalInterval {
             lo,
             hi,
-            set,
-            frozen_rho_certified,
+            set: row.set,
+            certificate: row.certificate,
+            cost: row.cost,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::test_support::GaussianRemlRhoResponse;
     use super::*;
     use ndarray::{Array1, Array2};
 
@@ -2749,14 +1645,10 @@ mod tests {
                 .any(|itv| mu_star >= itv.lo && mu_star <= itv.hi),
             "point prediction should be inside its own conformal set"
         );
-
-        // Margin is non-negative; critical boundary ties are reported as
-        // zero rather than skipped.
-        assert!(set.boundary_margin >= 0.0);
     }
 
     #[test]
-    fn boundary_tie_has_zero_margin_and_refuses() {
+    fn boundary_tie_is_a_closed_point_set() {
         let x = Array2::from_shape_vec((1, 1), vec![0.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
@@ -2769,15 +1661,10 @@ mod tests {
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, 0.0);
         assert_eq!(set.intervals[0].hi, 0.0);
-        assert_eq!(set.boundary_margin, 0.0);
-        assert!(matches!(
-            FrozenRhoCertificate::decide(0.0, set.boundary_margin),
-            FrozenRhoCertificate::Refused { .. }
-        ));
     }
 
     #[test]
-    fn identically_tied_all_real_set_has_zero_margin_and_refuses() {
+    fn identically_tied_rows_give_the_whole_line() {
         let x = Array2::from_shape_vec((1, 1), vec![1.0]).expect("x");
         let y = Array1::from_vec(vec![0.0]);
         let weights = Array1::ones(1);
@@ -2790,15 +1677,10 @@ mod tests {
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
         assert_eq!(set.intervals[0].hi, f64::INFINITY);
-        assert_eq!(set.boundary_margin, 0.0);
-        assert!(matches!(
-            FrozenRhoCertificate::decide(0.0, set.boundary_margin),
-            FrozenRhoCertificate::Refused { .. }
-        ));
     }
 
     #[test]
-    fn strictly_separated_all_real_margin_can_accept() {
+    fn strictly_separated_slopes_give_the_whole_line() {
         let engine = ExactGaussianFullConformal {
             u: Array1::from_vec(vec![1.0, 1.0, 0.0]),
             w: Array1::from_vec(vec![1.0, -1.0, 0.1]),
@@ -2809,11 +1691,6 @@ mod tests {
         assert_eq!(set.intervals.len(), 1);
         assert_eq!(set.intervals[0].lo, f64::NEG_INFINITY);
         assert_eq!(set.intervals[0].hi, f64::INFINITY);
-        assert!(set.boundary_margin > 0.5, "margin={}", set.boundary_margin);
-        assert!(matches!(
-            FrozenRhoCertificate::decide(0.5, set.boundary_margin),
-            FrozenRhoCertificate::Certified { .. }
-        ));
     }
 
     /// A smooth Gaussian fixture: cosine basis design (column 0 constant,
@@ -2847,13 +1724,13 @@ mod tests {
         r
     }
 
-    /// #2902 row 8: `select_rho` searches the #2812 resolvability domain of its
-    /// Gram against the penalty. Orthogonal columns make the generalized
+    /// #2902 row 8: the REML oracle's ρ domain is the #2812 resolvability domain
+    /// of its Gram against the penalty. Orthogonal columns make the generalized
     /// eigenvalue closed form, `γ = ‖x₁‖²/s₁₁`, so the domain is
     /// `[ln(√ε·γ), ln(γ/√ε)]`; the test row adds `x_*x_*ᵀ` to the Gram and moves
     /// γ from 2 to 5/2.
     #[test]
-    fn select_rho_domain_is_the_resolvability_interval_of_its_gram_2902() {
+    fn oracle_rho_domain_is_the_resolvability_interval_of_its_gram_2902() {
         let x = Array2::from_shape_vec((4, 2), vec![1.0, 1.0, 1.0, -1.0, 1.0, 1.0, 1.0, -1.0])
             .expect("design");
         let y = Array1::from_vec(vec![1.0, 2.0, 3.0, 5.0]);
@@ -2873,58 +1750,15 @@ mod tests {
         }
     }
 
-    /// `select_rho(Some(z))` lands on a genuine stationary point of the
-    /// augmented criterion at every candidate: the gradient `eval` reports
-    /// there is below `1e-6`.
-    #[test]
-    fn gaussian_reml_reselection_is_stationary_on_the_augmented_criterion() {
-        let (x, y, s) = gauss_reml_fixture(45, 8);
-        let x_star = cosine_row(8, 0.42);
-        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-
-        for &z in &[0.15_f64, 0.4, 0.75] {
-            let rho_z = resp.select_rho(Some(z)).expect("select");
-            let g = resp.eval(rho_z, Some(z)).expect("eval").grad;
-            assert!(g.abs() < 1e-6, "select_rho not stationary: G={g} at z={z}");
-        }
-    }
-
-    /// The stationarity quadratic is `∂V/∂ρ · D` exactly: at any `(ρ, z)`,
-    /// `Q(z)` from the closed-form coefficients equals the gradient `eval`
-    /// reports times the penalized RSS it reports, to their shared rounding
-    /// band. The certificate's wall test rests on this identity.
-    #[test]
-    fn stationarity_quadratic_is_the_gradient_times_the_penalized_rss() {
-        let (x, y, s) = gauss_reml_fixture(45, 8);
-        let x_star = cosine_row(8, 0.42);
-        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-        for &rho in &[-3.0_f64, 0.0, 2.5] {
-            let q = resp.stationarity_quadratic_in_z(rho).expect("quadratic");
-            for &z in &[-1.2_f64, 0.15, 0.4, 0.75, 3.0] {
-                let ev = resp.eval(rho, Some(z)).expect("eval");
-                let rss = resp.penalized_rss(rho, Some(z)).expect("rss");
-                let from_eval = ev.grad * rss;
-                let allowance = q.band(z) + ev.grad_band * rss;
-                assert!(
-                    (q.value(z) - from_eval).abs() <= allowance,
-                    "Q(z) ≠ ∂V/∂ρ·D at rho={rho} z={z}: {} vs {} (band {allowance:.3e})",
-                    q.value(z),
-                    from_eval
-                );
-            }
-        }
-    }
-
-    /// #2280: the penalized RSS and the stationarity quadratic survive a planted
-    /// residual below the rounding of `yᵀy`.
+    /// #2280: the penalized RSS survives a planted residual below the rounding of
+    /// `yᵀy`.
     ///
     /// The response is `X·β₀ + ρ·e`, with `β₀` on the penalty's null space (the
     /// `cos πt` column) and `e` a unit vector orthogonal to the design's column space.
     /// The test row sits at `t = ½`, where `x_*ᵀβ₀ = cos(π/2)` vanishes to rounding. At
     /// `z = 0` the augmented penalized objective is minimized by `β₀` at the value
     /// `ρ² + (x_*ᵀβ₀)²`, and `ρ² = 1e-16` sits below one ulp of `yᵀy ≈ 22`. So the
-    /// closed form `yᵀy − cᵀβ̂`, which at `z = 0` is also the quadratic's old constant
-    /// coefficient `yᵀy − c₀ᵀa`, cannot represent it. That miss is asserted first, as
+    /// closed form `yᵀy − cᵀβ̂` cannot represent it. That miss is asserted first, as
     /// the positive control that the fixture reaches the regime. Because the closed
     /// form's result is quantized at that ulp, it is held to half the residual.
     ///
@@ -2933,8 +1767,7 @@ mod tests {
     /// sum of squares exceeds the minimum by `δᵀAδ ≤ (γ·κ·scale)²`, with
     /// `scale = ‖t‖ + σ_max·‖β₀‖`, and its rounding moves it by `γ·scale` along the
     /// residual. The SVD residual carries the same band, so the difference is allowed
-    /// it twice. The quadratic is checked through `Q(0) = ∂V/∂ρ·D(ρ, 0)`, the identity
-    /// the certificate's wall test rests on.
+    /// it twice.
     #[test]
     fn the_penalized_rss_survives_a_residual_below_the_rounding_of_yty_2280() {
         use gam_linalg::faer_ndarray::FaerSvd;
@@ -2999,19 +1832,11 @@ mod tests {
                 .expect("A(λ) is SPD")
                 .solvevec(&resp.xty);
             let closed_form = y.dot(&y) - resp.xty.dot(&closed_beta);
-            let production = resp.penalized_rss(rho, Some(0.0)).expect("penalized RSS");
-            let quadratic = resp.stationarity_quadratic_in_z(rho).expect("quadratic");
-            let evaluation = resp.eval(rho, Some(0.0)).expect("eval");
-            let from_reference = evaluation.grad * svd_rss;
-            let allowance = quadratic.band(0.0)
-                + evaluation.grad_band * svd_rss
-                + evaluation.grad.abs() * band;
+            let oracle = resp.penalized_rss(rho, Some(0.0)).expect("penalized RSS");
             println!(
                 "[2280-conformal] rho={rho} condition={condition:.3e} \
-                 planted={expected_minimum:.6e} svd={svd_rss:.6e} production={production:.6e} \
-                 closed_form={closed_form:.6e} band={band:.3e} q0={:.6e} \
-                 grad_times_svd={from_reference:.6e} allowance={allowance:.3e}",
-                quadratic.value(0.0)
+                 planted={expected_minimum:.6e} svd={svd_rss:.6e} oracle={oracle:.6e} \
+                 closed_form={closed_form:.6e} band={band:.3e}"
             );
 
             assert!(
@@ -3025,90 +1850,11 @@ mod tests {
                  by more than half of it, or this fixture does not reach the defect"
             );
             assert!(
-                (production - svd_rss).abs() <= band,
-                "the penalized RSS {production:.6e} must match the SVD residual {svd_rss:.6e} \
+                (oracle - svd_rss).abs() <= band,
+                "the penalized RSS {oracle:.6e} must match the SVD residual {svd_rss:.6e} \
                  within {band:.3e} at rho={rho}"
             );
-            assert!(
-                (quadratic.value(0.0) - from_reference).abs() <= allowance,
-                "Q(0) = {:.6e} must equal ∂V/∂ρ·D = {from_reference:.6e} on the SVD residual \
-                 within {allowance:.3e} at rho={rho}",
-                quadratic.value(0.0)
-            );
         }
-    }
-
-    /// `(∂μ̂_i/∂ρ)_i` at the training rows and `∂μ̂_*/∂ρ` at the test row, at one
-    /// `(ρ, z)`: `∂μ̂/∂ρ = −λ·X·A⁻¹Sβ̂` from one Cholesky of the augmented `A(λ)`,
-    /// computed here independently of the bound it is scored against.
-    fn sampled_mean_sensitivity(
-        resp: &GaussianRemlRhoResponse<'_>,
-        rho: f64,
-        z: f64,
-    ) -> (Array1<f64>, f64) {
-        let lambda = rho.exp();
-        let p = resp.p;
-        let mut a = resp.xtx.clone();
-        for i in 0..p {
-            for j in 0..p {
-                a[[i, j]] += lambda * resp.s[[i, j]] + resp.x_star[i] * resp.x_star[j];
-            }
-        }
-        let chol = a.cholesky(Side::Lower).expect("augmented A(λ) must be SPD");
-        let mut c = resp.xty.clone();
-        for j in 0..p {
-            c[j] += resp.x_star[j] * z;
-        }
-        let beta = chol.solvevec(&c);
-        let v_s = chol.solvevec(&resp.s.dot(&beta));
-        (resp.x.dot(&v_s).mapv(|t| -lambda * t), -lambda * resp.x_star.dot(&v_s))
-    }
-
-    /// The analytic Lipschitz bound dominates every sampled `|∂μ̂_i/∂ρ| +
-    /// |∂μ̂_*/∂ρ|` on the deciding range, at strengths far from the optimum in
-    /// both directions — the positive control that it is a bound, not another
-    /// sample.
-    #[test]
-    fn score_rho_lipschitz_sup_dominates_sampled_sensitivities() {
-        let (x, y, s) = gauss_reml_fixture(45, 8);
-        let x_star = cosine_row(8, 0.42);
-        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-        let (z_lo, z_hi) = (-2.0_f64, 3.0_f64);
-        let bound = resp.score_rho_lipschitz_sup(z_lo, z_hi).expect("lipschitz");
-        assert!(bound.is_finite() && bound > 0.0, "bound {bound}");
-        for &rho in &[-8.0_f64, -3.0, 0.0, 2.5, 8.0] {
-            for &z in &[z_lo, 0.5 * (z_lo + z_hi), z_hi] {
-                let (mu_rho_train, mu_rho_test) = sampled_mean_sensitivity(&resp, rho, z);
-                let sampled =
-                    mu_rho_train.iter().map(|v| v.abs()).fold(0.0_f64, f64::max) + mu_rho_test.abs();
-                assert!(
-                    sampled <= bound,
-                    "sampled sensitivity {sampled} exceeds the analytic bound {bound} at rho={rho} z={z}"
-                );
-            }
-        }
-    }
-
-    /// The conditional check must REFUSE to accept when the smoothing
-    /// response is genuinely large: a high-leverage extrapolated test point at
-    /// small n makes ρ̂(z) swing with z, so the excursion bound exceeds the
-    /// boundary margin. The machinery must not vacuously always-accept, and
-    /// must still return a usable frozen set on refusal.
-    #[test]
-    fn frozen_rho_certificate_refuses_under_large_smoothing_response() {
-        let (x, y, s) = gauss_reml_fixture(12, 6);
-        let x_star = cosine_row(6, 1.9); // far extrapolation ⇒ high leverage
-        let resp = GaussianRemlRhoResponse::new(&x, &y, &s, &x_star).expect("response");
-        let cert = resp.certified_full_conformal(0.2).expect("cert");
-        assert!(
-            matches!(cert.certificate, FrozenRhoCertificate::Refused { .. }),
-            "high-leverage small-n problem should refuse; got {:?} (excursion={}, margin via set)",
-            cert.certificate,
-            cert.rho_excursion
-        );
-        // A refusal still hands back the cheap frozen set for the caller to
-        // either widen with local refits or fall back from — never nothing.
-        assert!(cert.rho_excursion >= 0.0);
     }
 
     // ── Layer 2 (continuous GLM homotopy) tests ──────────────────────────
@@ -3586,18 +2332,33 @@ mod tests {
         assert_eq!(penalty.p(), p);
 
         let reencoded = serde_json::to_value(&penalty).expect("serialize penalty");
-        let keys: Vec<&str> = reencoded
+        let mut keys: Vec<&str> = reencoded
             .as_object()
             .expect("penalty JSON object")
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, vec!["s_lambda"], "only the p x p penalty is persisted");
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["penalty_count", "s_lambda"],
+            "only the p x p penalty and its count are persisted"
+        );
+        assert_eq!(penalty.penalty_count, None, "a legacy payload records no count");
 
         let substrate = penalty
             .with_labeled_rows(x.clone(), y.clone())
             .expect("labeled rows of width p join the penalty");
         assert_eq!(substrate.n(), n);
+        // Without the count the re-selecting map is unknown: the row is refused
+        // loudly and gets the frozen set, never a silent guarantee.
+        let row = substrate
+            .interval(&Array1::from_vec(vec![0.3, 0.1, 0.2]), 0.2)
+            .expect("legacy row");
+        assert_eq!(
+            row.certificate,
+            ConformalCertificate::Refused(ConformalRefusal::UnknownPenaltyStructure)
+        );
         assert!(penalty.with_labeled_rows(x.slice(ndarray::s![.., ..2]).to_owned(), y).is_err());
     }
 }

@@ -719,6 +719,16 @@ if [[ "${1:-}" == "maturin" ]]; then
   REQ="maturin develop --release $*"
   CMD=(maturin develop --release "$@")
   run_under_global_lock
+  # maturin installs gamfit under pyproject.toml's static version, which every commit between releases
+  # shares (gam#3157). Rewrite the installed distribution to the version this tree derives. The stamp
+  # refuses when the installed engine recorded a different commit or dirty state from the tree's, i.e.
+  # the tree moved during the build. It runs in the interpreter maturin installed into (VIRTUAL_ENV,
+  # then CONDA_PREFIX, then .venv).
+  if [[ "$code" == "0" ]]; then
+    _env="${VIRTUAL_ENV:-${CONDA_PREFIX:-$REPO/.venv}}"
+    "$_env/bin/python" "$REPO/scripts/gamfit_version.py" stamp-installed --root "$REPO" >>"$LOG" 2>&1
+    code=$?
+  fi
   record "$REQ" "n/a" "$code" "$DUR"
   finish "$code" "n/a"
 fi

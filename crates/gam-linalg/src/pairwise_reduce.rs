@@ -224,13 +224,7 @@ where
         return identity;
     }
     if len <= BASE_CHUNK {
-        // Sequential base block, seeded from the first element — the same
-        // identity-free seeding as `reduce_range`.
-        let mut acc = map(lo);
-        for i in (lo + 1)..hi {
-            acc = combine(acc, map(i));
-        }
-        return acc;
+        return reduce_index_block(lo, hi, map, combine);
     }
     let mid = lo + left_split(len);
     // The subtrees are nested work, whoever runs them.
@@ -240,6 +234,48 @@ where
             move || par_reduce_index_range(mid, hi, map, combine, identity),
         )
     });
+    combine_pair(combine, left, right)
+}
+
+/// Sequential base block of [`par_reduce_index_range`], seeded from the first
+/// element: the same identity-free seeding as `reduce_range`. Out of line for the
+/// reason [`fold_leaf`] gives.
+#[inline(never)]
+fn reduce_index_block<T, M, F>(lo: usize, hi: usize, map: &M, combine: &F) -> T
+where
+    M: Fn(usize) -> T,
+    F: Fn(T, T) -> T,
+{
+    let mut acc = map(lo);
+    for i in (lo + 1)..hi {
+        acc = combine(acc, map(i));
+    }
+    acc
+}
+
+/// A block-fold leaf, `base(range)`, evaluated out of line (gam#2967).
+///
+/// Every recursion level of the parallel folds here waits at a `rayon::join`, and a
+/// worker that steals while it waits stacks one recursion frame per nesting level. A
+/// leaf body inlined into the recursion puts its whole frame (32 KiB for one caller's
+/// base closure in gnomon's release build) into every level. Called through this
+/// owner, the leaf's frame is live at most once per stack, and a recursion frame
+/// holds the range, the references and the two subtree results.
+#[inline(never)]
+fn fold_leaf<R, B>(base: &B, range: core::ops::Range<usize>) -> R
+where
+    B: Fn(core::ops::Range<usize>) -> R,
+{
+    base(range)
+}
+
+/// An internal node's merge of its two subtree results, out of line for the reason
+/// [`fold_leaf`] gives: it runs in the recursion frame that the join keeps live.
+#[inline(never)]
+fn combine_pair<T, R, F>(combine: &F, left: T, right: T) -> R
+where
+    F: Fn(T, T) -> R,
+{
     combine(left, right)
 }
 
@@ -368,7 +404,7 @@ where
 {
     let len = hi - lo;
     if len <= leaf {
-        return base(lo..hi);
+        return fold_leaf(base, lo..hi);
     }
     let mid = lo + left_split_over_leaves(len, leaf);
     let (left, right) = gam_runtime::parallel::fan_out(|| {
@@ -377,7 +413,7 @@ where
             || par_try_block_fold_range(mid, hi, leaf, base, combine),
         )
     });
-    combine(left?, right?)
+    combine_pair(combine, left?, right?)
 }
 
 fn par_block_fold_range<T, B, F>(lo: usize, hi: usize, leaf: usize, base: &B, combine: &F) -> T
@@ -388,7 +424,7 @@ where
 {
     let len = hi - lo;
     if len <= leaf {
-        return base(lo..hi);
+        return fold_leaf(base, lo..hi);
     }
     let mid = lo + left_split_over_leaves(len, leaf);
     let (left, right) = gam_runtime::parallel::fan_out(|| {
@@ -397,7 +433,7 @@ where
             || par_block_fold_range(mid, hi, leaf, base, combine),
         )
     });
-    combine(left, right)
+    combine_pair(combine, left, right)
 }
 
 #[cfg(test)]

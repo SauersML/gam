@@ -579,7 +579,7 @@ fn the_frozen_basis_replays_the_fit_time_design_at_the_training_draws() {
     let (nullspace_order, power) = duchon_cubic_default(2);
     let spec = DuchonBasisSpec {
         center_strategy: CenterStrategy::EqualMass {
-            num_centers: starting_num_centers(TRAINING_DRAWS, 2),
+            num_centers: starting_num_centers(TRAINING_DRAWS, 2, 3),
         },
         periodic: None,
         length_scale: None,

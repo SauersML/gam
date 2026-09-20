@@ -4,13 +4,13 @@
 //! `SaeCriterionError::IndefiniteObservedInformation` variant that #2330 Phase-2a
 //! introduced when it made `½log|A|` the ranked value.
 
+#![cfg(test)]
 use super::tests::*;
 use super::*;
 use gam_solve::rho_optimizer::OuterObjective;
-use ndarray::{Array1, Array2, s};
+use ndarray::{Array1, Array2, ArrayView2, s};
 
-/// Reproduce the off-manifold, fixed-stratum state whose `B`-converged mode is an
-/// exact-`A` SADDLE. This is the excitation the #2253/#2330 shared fixture uses:
+/// The off-manifold, fixed-stratum excitation the #2253/#2330 shared fixture uses:
 /// the residual, entropy, and curvature-delta channels are all genuinely live, and
 /// at this ρ some latent coordinates sit in the ARD periodic prior's CONCAVE half.
 ///
@@ -19,7 +19,13 @@ use ndarray::{Array1, Array2, s};
 /// α·softplus_{τ₀}(cos κt)` — the #2339 smooth envelope of `max(hess, 0)`), so
 /// `A = B − E` with `E ⪰ 0` diagonal in the coordinate block, carrying
 /// `≈|α·cos κt_ik|` with `α = e^{ρ_ard}`. `B ≻ 0` by construction, so the inner
-/// Newton converges, while the exact `A` it does NOT see stays indefinite.
+/// Newton converges.
+///
+/// Its priced mode was once an exact-`A` saddle. It no longer is: the evidence root
+/// now lands where the exact `A` is positive definite (#2822; see
+/// `a_softmax_two_atom_root_ends_at_its_rounding_floor_2822`). The measurement
+/// probes below still read it; a test whose premise is a switched negative direction
+/// takes [`switched_saddle_state`] instead.
 fn ard_saddle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     let (term, mut target, mut rho) = gamma_fd_tiny_fixture();
     let (n, p) = (target.nrows(), target.ncols());
@@ -42,46 +48,205 @@ fn ard_saddle_state() -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
     (term, target, rho)
 }
 
+/// One declared member of the switched-saddle ladder: the harmonic excitation
+/// `amplitude·sin(frequency·θ + ½·col)`, `θ = 2π(row + phase_shift)/n`, added to the
+/// tiny two-atom fixture's target, and the ρ its criterion is priced at.
+struct SwitchedSaddleMember {
+    amplitude: f64,
+    frequency: f64,
+    phase_shift: f64,
+    log_ard: [f64; 2],
+    log_smooth: f64,
+    log_sparse: f64,
+}
+
+/// #2434 — the ladder's members. A seeded scan of 400 draws over the excitation and ρ
+/// (amplitude in `[0, 2.5)`, frequency in `1..=4`, shift in `[0, 1)`, per-atom log ARD in
+/// `[−2, 4)`, log smooth in `[−3, 2)`, log sparse in `[−3, 1)`) priced every draw finite, and
+/// these are the draws whose priced mode carries a negative pencil direction the ARD
+/// clamp switches (`μ + wᵀE_ARD w ≥ −floor`), deepest `μ` first: μ = −1.14e-3, −2.64e-4,
+/// −2.00e-4, −1.63e-4, −1.10e-4, each against a floor of 1.5e-8. No draw carried a
+/// negative direction the clamp could not switch.
+const SWITCHED_SADDLE_LADDER: [SwitchedSaddleMember; 5] = [
+    SwitchedSaddleMember {
+        amplitude: 0.5986,
+        frequency: 2.0,
+        phase_shift: 0.8474,
+        log_ard: [2.4845, -1.9301],
+        log_smooth: -0.9271,
+        log_sparse: -1.0199,
+    },
+    SwitchedSaddleMember {
+        amplitude: 1.0205,
+        frequency: 4.0,
+        phase_shift: 0.0346,
+        log_ard: [-0.6563, 3.1002],
+        log_smooth: -0.4574,
+        log_sparse: -2.0758,
+    },
+    SwitchedSaddleMember {
+        amplitude: 1.9897,
+        frequency: 3.0,
+        phase_shift: 0.2970,
+        log_ard: [-1.5310, 3.6478],
+        log_smooth: -2.0551,
+        log_sparse: -1.5286,
+    },
+    SwitchedSaddleMember {
+        amplitude: 1.6181,
+        frequency: 4.0,
+        phase_shift: 0.1837,
+        log_ard: [-0.6506, 3.4718],
+        log_smooth: -0.2903,
+        log_sparse: -0.2767,
+    },
+    SwitchedSaddleMember {
+        amplitude: 2.2838,
+        frequency: 2.0,
+        phase_shift: 0.2819,
+        log_ard: [2.9402, -1.7813],
+        log_smooth: -1.4320,
+        log_sparse: -1.2313,
+    },
+];
+
+fn switched_saddle_member_state(
+    member: &SwitchedSaddleMember,
+) -> (SaeManifoldTerm, Array2<f64>, SaeManifoldRho) {
+    let (term, mut target, mut rho) = gamma_fd_tiny_fixture();
+    let (n, p) = (target.nrows(), target.ncols());
+    for row in 0..n {
+        for col in 0..p {
+            let theta = std::f64::consts::TAU * (row as f64 + member.phase_shift) / n as f64;
+            target[[row, col]] +=
+                member.amplitude * (member.frequency * theta + 0.5 * col as f64).sin();
+        }
+    }
+    rho.log_lambda_sparse = member.log_sparse;
+    rho.log_lambda_smooth.fill(member.log_smooth);
+    assert_eq!(
+        rho.log_ard.len(),
+        member.log_ard.len(),
+        "the ladder declares one log ARD per atom of the tiny fixture"
+    );
+    for (axis, &value) in rho.log_ard.iter_mut().zip(member.log_ard.iter()) {
+        axis.fill(value);
+    }
+    (term, target, rho)
+}
+
+/// The count of negative pencil directions of the priced exact `A` that the ARD clamp
+/// switches, with every negative direction's `(μ, wᵀE_ARD w, floor)` for the refusal.
+/// The ARD diagonal is the whole coordinate-block `E`; leaving out the decoder-prior
+/// border `E_ββ ⪰ 0` can only miss a switched direction, never claim one.
+fn switched_directions(
+    term: &SaeManifoldTerm,
+    target: ArrayView2<'_, f64>,
+    rho: &SaeManifoldRho,
+    cache: &ArrowFactorCache,
+) -> Result<(usize, Vec<(f64, f64, f64)>), String> {
+    let total_t = cache.delta_t_len();
+    let a = term.materialize_exact_hessian_dense(rho, target, cache)?;
+    let e_diag = term.materialize_ard_concave_clamp_diagonal(rho, cache)?;
+    let oracle = PencilOracle::new(&a, cache);
+    let mut switched = 0usize;
+    let mut negatives = Vec::new();
+    for idx in oracle.negative() {
+        let w = oracle.vectors.column(idx);
+        let e_w = (0..total_t)
+            .map(|row| e_diag[row] * w[row] * w[row])
+            .sum::<f64>();
+        if oracle.values[idx] + e_w >= -oracle.floors[idx] {
+            switched += 1;
+        }
+        negatives.push((oracle.values[idx], e_w, oracle.floors[idx]));
+    }
+    Ok((switched, negatives))
+}
+
+/// #2434, #2336 — the first ladder member whose priced mode carries a switched negative
+/// direction, with its priced loss and cache. The priced mode moves whenever the inner
+/// solve does, so the specimen is a declared ladder rather than one state: a member
+/// that stops carrying a switched direction is passed over, and a ladder with no
+/// member left refuses naming every member's verdict.
+struct SwitchedSaddle {
+    member: &'static SwitchedSaddleMember,
+    term: SaeManifoldTerm,
+    target: Array2<f64>,
+    rho: SaeManifoldRho,
+    value: f64,
+    loss: SaeManifoldLoss,
+    cache: ArrowFactorCache,
+}
+
+fn switched_saddle_state() -> SwitchedSaddle {
+    let mut rejections = Vec::new();
+    for (index, member) in SWITCHED_SADDLE_LADDER.iter().enumerate() {
+        let (mut term, target, rho) = switched_saddle_member_state(member);
+        let priced = term.penalized_quasi_laplace_criterion_with_cache(
+            target.view(),
+            &rho,
+            None,
+            40,
+            0.4,
+            1.0e-6,
+            1.0e-6,
+        );
+        let (value, loss, cache) = match priced {
+            Ok(priced) => priced,
+            Err(err) => {
+                rejections.push(format!("member {index}: criterion refused: {err:?}"));
+                continue;
+            }
+        };
+        match switched_directions(&term, target.view(), &rho, &cache) {
+            Ok((switched, _)) if switched > 0 => {
+                return SwitchedSaddle {
+                    member,
+                    term,
+                    target,
+                    rho,
+                    value,
+                    loss,
+                    cache,
+                };
+            }
+            Ok((_, negatives)) => rejections.push(format!(
+                "member {index}: no switched direction; negatives (μ, wᵀEw, floor) = {negatives:?}"
+            )),
+            Err(err) => rejections.push(format!("member {index}: spectrum refused: {err}")),
+        }
+    }
+    panic!(
+        "no switched-saddle ladder member carries a clamp-switched negative direction: {}",
+        rejections.join("; ")
+    );
+}
+
 /// #2336 GATE — after the value-side E-attributability fix, a B-converged mode
 /// whose exact-A indefiniteness is FULLY attributable to the bounded ARD periodic
 /// concave-clamp wrinkle `E` prices a FINITE criterion (basin curvature `λ+e_v ≥ 0`
-/// on the switched directions) instead of refusing. `ard_saddle_state`'s two
-/// negatives (≈ −0.015) are E-attributable (`e_v ≥ |λ|`, verified in
-/// `zz_measure_e_attributability_2336`), so both the criterion and the outer eval
-/// return finite. RED before the fix (the criterion returned
-/// `Err(IndefiniteObservedInformation{{joint}})` and `eval` priced `+inf`), GREEN
-/// STABLE across #2339: E = α·softplus_τ₀(−cos κt) ≥ α·max(−cos,0) (the hard clamp)
-/// pointwise, so the smooth clamp only GROWS e_v — the attributability test loosens
-/// by at most α·τ₀·ln2 = α·(deflation floor), within #2339's τ₀ budget — hence
-/// a_saddle prices under both the hard and the smooth clamp.
-/// This is the canonical E-attributable wrinkle-saddle specimen (same state
-/// fix-2253 anchored as `converged_state_with_residual_a_saddle_2336`, now
-/// documented as the PRICING specimen: its `λ+e_v(ARD)=+0.026` shows the clamp
-/// alone lifts it, so it prices — it is NOT a genuine deep saddle). No specimen
-/// pins the genuine refusal path: the criterion descends a refused exact-A saddle
-/// before it refuses (#2080).
+/// on the switched directions) instead of refusing. The specimen is the first
+/// [`switched_saddle_state`] member, whose priced mode carries such a direction, so
+/// both the criterion and the outer eval return finite. RED before the fix (the
+/// criterion returned `Err(IndefiniteObservedInformation{{joint}})` and `eval` priced
+/// `+inf`), GREEN STABLE across #2339: E = α·softplus_τ₀(−cos κt) ≥ α·max(−cos,0) (the
+/// hard clamp) pointwise, so the smooth clamp only GROWS e_v — the attributability test
+/// loosens by at most α·τ₀·ln2 = α·(deflation floor), within #2339's τ₀ budget — hence
+/// the switched saddle prices under both the hard and the smooth clamp. It is NOT a
+/// genuine deep saddle. No specimen pins the genuine refusal path: the criterion
+/// descends a refused exact-A saddle before it refuses (#2080), and the ladder's scan
+/// found no draw the clamp could not switch.
 #[test]
 pub(crate) fn e_attributable_ard_saddle_prices_finite_2336() {
-    let (mut term, target, rho) = ard_saddle_state();
-    let priced = term.penalized_quasi_laplace_criterion_with_cache(
-        target.view(),
-        &rho,
-        None,
-        40,
-        0.4,
-        1.0e-6,
-        1.0e-6,
-    );
+    let saddle = switched_saddle_state();
     assert!(
-        matches!(&priced, Ok((value, _, _)) if value.is_finite()),
-        "post E-attributability fix the ARD-wrinkle saddle must PRICE FINITE, not refuse; got: {:?}",
-        priced
-            .as_ref()
-            .map(|(value, _, _)| *value)
-            .map_err(|e| format!("{e:?}"))
+        saddle.value.is_finite(),
+        "post E-attributability fix the ARD-wrinkle saddle must PRICE FINITE, not refuse; got {}",
+        saddle.value
     );
 
-    let (term, target, rho) = ard_saddle_state();
+    let (term, target, rho) = switched_saddle_member_state(saddle.member);
     let rho_flat = rho.flat_coordinates();
     let mut objective =
         SaeManifoldOuterObjective::new(term, target, None, rho, 40, 0.4, 1.0e-6, 1.0e-6);
@@ -103,7 +268,7 @@ pub(crate) fn e_attributable_ard_saddle_prices_finite_2336() {
 /// look absent. Pin the production direct-ρ channel against the value it actually
 /// differentiates so neither comments nor implementation can drift again.
 ///
-/// Hold θ̂ fixed at the canonical E-attributable saddle, rebuild the cache at each
+/// Hold θ̂ fixed at the switched-saddle ladder member, rebuild the cache at each
 /// perturbed ρ, and centrally difference
 /// `½(log|A_priced| − log|A_tt,priced|)`. The analytic side is the direct trace from
 /// `dense_exact_a_logdet_channels`, including:
@@ -113,50 +278,23 @@ pub(crate) fn e_attributable_ard_saddle_prices_finite_2336() {
 /// 3. the explicit `dE/dρ_ard = E` term.
 ///
 /// This deliberately probes only ARD coordinates: they are the coordinates on
-/// which the allegedly missing B-channel is live. The spectral assertion first
-/// proves the fixture really contains a switched negative direction; otherwise an
-/// ordinary positive-definite state could false-green the derivative comparison.
+/// which the allegedly missing B-channel is live. `switched_saddle_state` admits
+/// only a ladder member whose priced mode carries a clamp-switched negative
+/// direction, so an ordinary positive-definite state cannot false-green the
+/// derivative comparison.
 #[test]
 fn priced_ard_direct_gradient_matches_fixed_state_value_2434() {
-    let (mut term, target, rho) = ard_saddle_state();
-    let (_value, loss, cache) = term
-        .penalized_quasi_laplace_criterion_with_cache(
-            target.view(),
-            &rho,
-            None,
-            40,
-            0.4,
-            1.0e-6,
-            1.0e-6,
-        )
-        .expect("canonical E-attributable saddle must produce a priced cache");
-
-    let total_t = cache.delta_t_len();
-    let a = term
-        .materialize_exact_hessian_dense(&rho, target.view(), &cache)
-        .expect("materialize exact A at the priced state");
-    let e_diag = term
-        .materialize_ard_concave_clamp_diagonal(&rho, &cache)
-        .expect("materialize the clamp-attribution diagonal");
-    // #2673, #2933 F07 — the band is per direction of the pencil `(A, Φ)`, in the metric
-    // both the value and the gradient classify in. This probe supplies its own pencil
-    // eigenvectors and its own metric applies and shares only the scalar rule.
-    let oracle = PencilOracle::new(&a, &cache);
-    let switched = oracle
-        .negative()
-        .into_iter()
-        .filter(|&idx| {
-            let w = oracle.vectors.column(idx);
-            let e_w = (0..total_t)
-                .map(|row| e_diag[row] * w[row] * w[row])
-                .sum::<f64>();
-            oracle.values[idx] + e_w >= -oracle.floors[idx]
-        })
-        .count();
-    assert!(
-        switched > 0,
-        "#2434 gate is invalid: the fixture contains no clamp-attributable switched direction"
-    );
+    // The ladder admits only a member whose priced mode carries a switched negative
+    // direction, so an ordinary positive-definite state cannot false-green the
+    // derivative comparison.
+    let SwitchedSaddle {
+        term,
+        target,
+        rho,
+        loss,
+        cache,
+        ..
+    } = switched_saddle_state();
 
     let geometry = term
         .materialize_dense_exact_a_geometry(&rho, target.view(), &cache)

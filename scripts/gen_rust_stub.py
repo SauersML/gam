@@ -230,7 +230,7 @@ class Registration:
 @dataclasses.dataclass
 class Exception_:
     name: str
-    base: str
+    bases: tuple[str, ...]
 
 
 @dataclasses.dataclass
@@ -540,7 +540,15 @@ def scan_registrations(tokens: Sequence[Token], crate: Crate) -> None:
             close = matching(tokens, index + 2)
             args = split_top_level(tokens[index + 3 : close])
             base = [t for t in args[2] if t.kind == "ident"][-1].text
-            crate.exceptions[args[1][0].text] = Exception_(args[1][0].text, base)
+            crate.exceptions[args[1][0].text] = Exception_(args[1][0].text, (base,))
+        elif token.text == "create_category_exception" and tokens[index + 1].text == "!":
+            # `create_category_exception!(Name, [Base, ...], doc)`: a class with
+            # several bases (`ffi/ffi_errors.rs`).
+            close = matching(tokens, index + 2)
+            args = split_top_level(tokens[index + 3 : close])
+            listed = split_top_level(args[1][1:-1])
+            bases = tuple([t for t in base if t.kind == "ident"][-1].text for base in listed if base)
+            crate.exceptions[args[0][0].text] = Exception_(args[0][0].text, bases)
 
 
 def parse_file(path: Path, crate: Crate) -> None:
@@ -1081,8 +1089,8 @@ def generate(crate: Crate) -> str:
         (cls.python_name, emit_class(cls, mapper)) for cls in found.classes
     ]
     for exception in found.exceptions:
-        base = exception.base[2:] if exception.base.startswith("Py") else exception.base
-        sections.append((exception.name, [f"class {exception.name}({base}): ..."]))
+        bases = ", ".join(base[2:] if base.startswith("Py") else base for base in exception.bases)
+        sections.append((exception.name, [f"class {exception.name}({bases}): ..."]))
     for function in found.functions:
         sections.append((function.name, emit_function(function, mapper)))
     out = [HEADER]
@@ -1129,8 +1137,8 @@ def _order_exceptions(
     done: set[str] = set()
     while remaining:
         for index, (name, lines) in enumerate(remaining):
-            base = crate.exceptions[name].base if name in crate.exceptions else None
-            if base is None or base not in crate.exceptions or base in done:
+            bases = crate.exceptions[name].bases if name in crate.exceptions else ()
+            if all(base not in crate.exceptions or base in done for base in bases):
                 done.add(name)
                 yield remaining.pop(index)
                 break

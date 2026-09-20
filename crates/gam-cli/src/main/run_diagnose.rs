@@ -182,7 +182,10 @@ pub(crate) fn run_diagnose(args: DiagnoseArgs) -> Result<(), String> {
             ]));
             let k_hat = loo
                 .k_hat_max
-                .map(|value| format!("{value:.3}"))
+                .map(|shape| match shape {
+                    gam::psis::WeightTailShape::Pareto(value) => format!("{value:.3}"),
+                    gam::psis::WeightTailShape::Flat => "flat tail".to_string(),
+                })
                 .unwrap_or_else(|| "n/a".to_string());
             summary.add_row(Row::from(vec![
                 Cell::new("PSIS k_hat (max)"),

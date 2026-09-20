@@ -1375,23 +1375,28 @@ pub(super) fn project_coefficients_to_lower_bounds(
     }
 }
 
+/// Whether the lower bound `lb` binds at `beta` with gradient `gradient`: the
+/// bound's row is active and the gradient presses into it.
+///
+/// A lower bound is the unit row `β_i ≥ lb_i` of the fit's inequality system
+/// (`polish_inequality_system` states it that way), whose scaled slack is
+/// `β_i − lb_i`. Whether a row is active has ONE definition,
+/// [`crate::active_set::row_is_active`], which the exact face decrement and the
+/// geometric KKT channels already apply to these same rows through
+/// `active_face`. The projected-gradient norm and the bound QP's working set
+/// read it here, so every half of the certificate agrees on the face (#3180).
+fn lower_bound_binds(gradient: f64, beta: f64, lb: f64) -> bool {
+    lb.is_finite() && gradient > 0.0 && crate::active_set::row_is_active(beta - lb)
+}
+
 /// Compute the projected gradient norm for bound-constrained optimization.
 ///
 /// At a constrained optimum, gradient components for variables at their lower
 /// bound that point into the infeasible direction (gradient > 0 for minimization)
 /// are KKT multipliers, not convergence defects.  Zeroing them gives the
-/// standard "projected gradient" used to test stationarity.
-/// Relative and absolute tolerances for deciding when a coefficient sits "at"
-/// its lower bound (an active box constraint). A coefficient is active when its
-/// slack is below `ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL`; the
-/// absolute term keeps genuinely-near-zero bounded coefficients (e.g. I-spline
-/// time coefficients pinned around 1e-6) from being treated as interior. Both
-/// the projected-gradient norm and the active-set classifier must use the same
-/// band so KKT diagnostics and the working set agree.
-pub(crate) const ACTIVE_BOUND_REL_TOL: f64 = 1e-6;
-
-pub(crate) const ACTIVE_BOUND_ABS_TOL: f64 = 1e-10;
-
+/// standard "projected gradient" used to test stationarity. A coordinate is
+/// at its bound exactly when [`lower_bound_binds`] says so; any other
+/// coordinate's gradient is a stationarity defect.
 pub(super) fn projected_gradient_norm(
     gradient: &Array1<f64>,
     beta: &Array1<f64>,
@@ -1403,17 +1408,8 @@ pub(super) fn projected_gradient_norm(
     let mut sum_sq = 0.0;
     for i in 0..gradient.len() {
         let g = gradient[i];
-        if lb[i].is_finite() && g > 0.0 {
-            // Use a relative+absolute tolerance so near-bound coefficients
-            // (e.g. I-spline time coefficients at 1e-6) are recognized as
-            // active.  At a KKT point the gradient into the infeasible region
-            // is a multiplier, not a convergence defect.
-            let slack = beta[i] - lb[i];
-            let scale = beta[i].abs().max(lb[i].abs()).max(1.0);
-            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
-            if slack < tol {
-                continue;
-            }
+        if lower_bound_binds(g, beta[i], lb[i]) {
+            continue;
         }
         sum_sq += g * g;
     }
@@ -1558,7 +1554,7 @@ pub(super) fn pirls_soft_acceptance(
 /// It used to be
 /// `max(primal_feasibility, dual_feasibility, complementarity, stationarity)`,
 /// and that scalar was handed to [`WorkingState::certifies_kkt`], whose two
-/// bounds — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — are both derived FOR A
+/// bounds at the time — `τ·√n·√p` and `τ·(1 + ‖score‖ + ‖Sβ‖)` — were both derived FOR A
 /// GRADIENT: the first from "score components are `O(√n)`", the second from the
 /// penalized gradient's own natural magnitude. Only two of the four channels are
 /// gradient-space quantities:
@@ -1993,16 +1989,12 @@ pub fn solve_newton_directionwith_lower_bounds(
         }
     }
     for i in 0..p {
-        let lb = lower_bounds[i];
-        if lb.is_finite() && gradient[i] > 0.0 {
-            // Use a relative+absolute tolerance matching projected_gradient_norm
-            // so coefficients near the bound (e.g. I-spline at 1e-6) with positive
-            // gradient (KKT multiplier) are correctly identified as active.
-            let scale = beta[i].abs().max(lb.abs()).max(1.0);
-            let tol = ACTIVE_BOUND_REL_TOL * scale + ACTIVE_BOUND_ABS_TOL;
-            if beta[i] <= lb + tol {
-                active[i] = true;
-            }
+        // The working set starts from the bounds that bind by the same rule the
+        // projected-gradient norm reads. It is a warm start only: the primal
+        // active-set loop below adds every bound a free step reaches and
+        // releases every negative multiplier.
+        if lower_bound_binds(gradient[i], beta[i], lower_bounds[i]) {
+            active[i] = true;
         }
     }
 

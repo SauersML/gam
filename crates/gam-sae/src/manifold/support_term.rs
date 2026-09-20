@@ -8220,6 +8220,33 @@ impl SaeSupportSparseTerm {
         displacement: &SaeSupportNewtonDisplacement,
         bound: f64,
     ) -> Result<SupportKantorovichVerdict, String> {
+        let (beta_offsets, beta_dim) = self.beta_layout()?;
+        let generators =
+            self.support_exact_symmetry_generators(ard_precisions, &beta_offsets, beta_dim)?;
+        self.support_kantorovich_certificate_on_slice(
+            target,
+            lambda_smooth,
+            ard_precisions,
+            displacement,
+            bound,
+            &generators,
+        )
+    }
+
+    /// [`Self::support_kantorovich_certificate`] on the slice transverse to `generators`,
+    /// the exact symmetry directions it projects off (#2576). A symmetry of the objective
+    /// missing from `generators` leaves `A` singular on that slice, so no
+    /// `A − μ·I ≻ 0` is certified there and the verdict is a refusal: a symmetry this
+    /// certificate is not given is never certified over.
+    fn support_kantorovich_certificate_on_slice(
+        &self,
+        target: ArrayView2<'_, f64>,
+        lambda_smooth: &[f64],
+        ard_precisions: &[Vec<f64>],
+        displacement: &SaeSupportNewtonDisplacement,
+        bound: f64,
+        generators: &[Array1<f64>],
+    ) -> Result<SupportKantorovichVerdict, String> {
         if !(bound.is_finite() && bound > 0.0) {
             return Err(format!(
                 "support Newton-Kantorovich certificate: the bound must be finite and positive, \
@@ -8243,11 +8270,9 @@ impl SaeSupportSparseTerm {
         let mut step = Array1::<f64>::zeros(full_dim);
         step.slice_mut(ndarray::s![..t_len]).assign(&displacement.coordinates);
         step.slice_mut(ndarray::s![t_len..]).assign(&displacement.decoder);
-        let generators =
-            self.support_exact_symmetry_generators(ard_precisions, &beta_offsets, beta_dim)?;
         // `‖Δ‖ < bound` on the slice, read before any dense work. No generator carries
         // weight on a coordinate the pencil drops, so this is the norm checked below.
-        let screen = support_orthonormal_span(full_dim, &generators)?;
+        let screen = support_orthonormal_span(full_dim, generators)?;
         let screened = support_project_off(&screen, step.view());
         let projected_norm = screened.dot(&screened).sqrt();
         // Each shift formula below rounds at most eight times and the radius formula as
@@ -8299,7 +8324,7 @@ impl SaeSupportSparseTerm {
             )));
         }
         let (mut exact, gradient, step, generators) = if kept.len() == full_dim {
-            (exact, gradient, step, generators)
+            (exact, gradient, step, generators.to_vec())
         } else {
             (
                 exact.select(ndarray::Axis(0), &kept).select(ndarray::Axis(1), &kept),

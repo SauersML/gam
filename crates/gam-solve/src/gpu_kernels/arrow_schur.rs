@@ -85,17 +85,28 @@ fn resolve_runtime_for_device_path(
     })
 }
 
-/// Relative rounding margin (multiplier on `diag_scale · √ε`) added on top of
-/// the deficit-clearing shift in [`ridge_bump_to_make_pd`].
+/// Eigenvalue margin a Gershgorin-shifted block must clear so that its f64
+/// Cholesky, retried at `ridge_t + bump`, is guaranteed to complete.
 ///
-/// The exact shift `-(λ_min)` makes a block PD in exact arithmetic, but a
-/// single retry at precisely that magnitude is routinely re-rejected by the
-/// next POTRF because the rounding error of forming `D + ridge·I` and
-/// re-factoring is itself O(√ε). The 1024× headroom (≈ 2¹⁰, ten extra bits
-/// below the f64 mantissa's 52) clears the pivot on the first retry without
-/// materially perturbing the curvature the Newton step sees. Shared by every
-/// per-row / batched / fused producer so they suggest a consistent bump.
-const RIDGE_BUMP_EPS_MARGIN: f64 = 1024.0;
+/// After the shift by [`gershgorin_retry_bump`]'s deficit plus this margin,
+/// `λ_min(A + (ridge_t + bump)·I) ≥ margin`, and the factored matrix has diagonal
+/// entries at most `unshifted + margin`, where `unshifted` is
+/// `scale + |ridge_t| + deficit`. Demmel's theorem
+/// ([`gam_math::roundoff::cholesky_completion_band`]) guarantees completion once
+/// `λ_min` exceeds `c·(max diagonal)`, with `c` the per-unit band for dimension `d`.
+///
+/// Forming the retry diagonal takes two rounded operations: `ridge_t + bump`,
+/// then `aᵢᵢ + ridge`. That moves every eigenvalue by at most
+/// `γ₂·(unshifted + margin)`, and the same `1 + γ₂` inflates the diagonal bound
+/// fed to the theorem. With `rel = c·(1 + γ₂) + γ₂`, the smallest self-consistent
+/// margin solves `margin = rel·(unshifted + margin)`, which gives
+/// `rel·unshifted/(1 − rel)`. Shared by every per-row, batched and fused producer
+/// so they suggest one bump.
+fn cholesky_retry_margin(d: usize, unshifted_diagonal: f64) -> f64 {
+    let formation = gam_math::roundoff::accumulation_growth(2);
+    let rel = gam_math::roundoff::cholesky_completion_band(d, 1.0) * (1.0 + formation) + formation;
+    rel * unshifted_diagonal / (1.0 - rel)
+}
 
 /// Diagonal ridge bump that is GUARANTEED to make `H_tt + (ridge_t + bump)·I`
 /// positive definite for a *symmetric* per-row block, sized from the block's
@@ -123,11 +134,11 @@ const RIDGE_BUMP_EPS_MARGIN: f64 = 1024.0;
 /// so `λ_min(A) ≥ min_i ( A[i,i] − Σ_{j≠i} |A[i,j]| ) =: g` (the most negative
 /// Gershgorin left edge). Adding `t·I` shifts every eigenvalue up by `t`, so
 /// `A + t·I` is PD as soon as `t > -g`. We are already sitting at `ridge_t`, so
-/// the ADDITIONAL bump needed is `-(g + ridge_t)` when that is positive. We add
-/// a relative safety margin (`√ε · scale · 1024`, the same headroom the legacy
-/// estimate used) so the re-factored, rounding-perturbed block clears the pivot
-/// on the first retry, and a `max(1)`-scaled floor so a marginally-indefinite
-/// block still gets a strictly positive, non-vanishing bump.
+/// the ADDITIONAL bump needed is `-(g + ridge_t)` when that is positive. On top
+/// of it we add [`cholesky_retry_margin`], the smallest `λ_min` at which the f64
+/// re-factorization of the rounding-perturbed block is guaranteed to complete.
+/// The `max(1)`-scaled diagonal floor keeps the bump strictly positive for a
+/// block that carries no scale of its own.
 ///
 /// The returned value is the bump to ADD to the current `ridge_t`. It is always
 /// strictly positive (the caller only constructs `RidgeBumpRequired` on an
@@ -139,6 +150,7 @@ fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
     // Gershgorin left edge `g = min_i (A_ii − Σ_{j≠i} |A_ij|)`.
     let mut scale = 1.0_f64;
     let mut min_gershgorin_edge = f64::INFINITY;
+    let mut max_row_abs_sum = 0.0_f64;
     for i in 0..d {
         let diag = htt[[i, i]];
         scale = scale.max(diag.abs());
@@ -149,19 +161,37 @@ fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
             }
         }
         min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+        max_row_abs_sum = max_row_abs_sum.max(diag.abs() + off_sum);
     }
     if !min_gershgorin_edge.is_finite() {
         // d == 0 (no rows) or non-finite entries: fall back to the scale-only
-        // floor so the caller still gets a strictly positive bump.
-        return scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+        // margin so the caller still gets a strictly positive bump.
+        return cholesky_retry_margin(d, scale + ridge_t.abs());
     }
-    // Additional shift needed so `λ_min(A) + ridge_t + bump > 0`, i.e.
-    // `bump > -(min_gershgorin_edge + ridge_t)`.
-    let deficit = -(min_gershgorin_edge + ridge_t);
-    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
-    // Lift past the deficit (when positive) plus a rounding margin; never below
-    // the scale-relative floor so a marginal block still moves.
-    deficit.max(0.0) + margin
+    gershgorin_retry_bump(d, scale, min_gershgorin_edge, max_row_abs_sum, ridge_t)
+}
+
+/// Bump for a `d × d` block sitting at `ridge_t`, from its computed most-negative
+/// Gershgorin edge, its largest computed absolute row sum `|aᵢᵢ| + Σ_{j≠i}|aᵢⱼ|`,
+/// and its diagonal scale.
+///
+/// The deficit is the shift that makes `λ_min(A) + ridge_t + bump > 0`, that is
+/// `−(edge + ridge_t)` when positive. The computed edge sums `d` terms and the
+/// deficit takes one more rounding, so the exact edge can sit below the computed
+/// one by `γ_{d+1}·(row_abs_sum + |ridge_t|)`, and the deficit carries that band.
+/// On top of it goes [`cholesky_retry_margin`], which the re-factored block needs
+/// to clear its own rounding.
+fn gershgorin_retry_bump(
+    d: usize,
+    scale: f64,
+    min_gershgorin_edge: f64,
+    max_row_abs_sum: f64,
+    ridge_t: f64,
+) -> f64 {
+    let edge_band = gam_math::roundoff::accumulation_growth(d.saturating_add(1))
+        * (max_row_abs_sum + ridge_t.abs());
+    let deficit = (-(min_gershgorin_edge + ridge_t)).max(0.0) + edge_band;
+    deficit + cholesky_retry_margin(d, scale + ridge_t.abs() + deficit)
 }
 
 /// [`ridge_bump_to_make_pd`] for a `d × d` symmetric block stored column-major
@@ -180,12 +210,13 @@ fn ridge_bump_to_make_pd(htt: ArrayView2<'_, f64>, ridge_t: f64) -> f64 {
 #[must_use]
 fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
     if d == 0 || block.len() < d * d {
-        return f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
+        return cholesky_retry_margin(d, 1.0);
     }
     // Column-major: element (row r, col c) at block[c*d + r]. The matrix is
     // symmetric, so reading by column gives the same Gershgorin edges as by row.
     let mut scale = 1.0_f64;
     let mut min_gershgorin_edge = f64::INFINITY;
+    let mut max_row_abs_sum = 0.0_f64;
     for i in 0..d {
         let diag = block[i * d + i];
         scale = scale.max(diag.abs());
@@ -196,12 +227,12 @@ fn ridge_bump_to_make_pd_colmajor(block: &[f64], d: usize) -> f64 {
             }
         }
         min_gershgorin_edge = min_gershgorin_edge.min(diag - off_sum);
+        max_row_abs_sum = max_row_abs_sum.max(diag.abs() + off_sum);
     }
-    let margin = scale * f64::EPSILON.sqrt() * RIDGE_BUMP_EPS_MARGIN;
     if !min_gershgorin_edge.is_finite() {
-        return margin;
+        return cholesky_retry_margin(d, scale);
     }
-    (-min_gershgorin_edge).max(0.0) + margin
+    gershgorin_retry_bump(d, scale, min_gershgorin_edge, max_row_abs_sum, 0.0)
 }
 
 /// Canonically condition and factor a device Direct solve's small reduced
@@ -7468,6 +7499,59 @@ mod tests {
             sys.gb[r] = sample();
         }
         sys
+    }
+
+    /// A Gershgorin-TIGHT singular block has `g + ridge_t = 0` exactly, so the
+    /// shift past the edge is zero and the retry rests entirely on the derived
+    /// rounding bands: the edge-evaluation band and the Cholesky retry margin.
+    /// Complete-graph Laplacians `L = d·I − 11ᵀ` (null vector `1`, every
+    /// Gershgorin edge exactly `0`) across dimensions and scales must factor at
+    /// `ridge_t + bump`, both with the shift in the ridge and with it in the
+    /// block. The margin must also stay at rounding level (far below the old
+    /// `√ε·scale` headroom), so the Newton curvature is not perturbed by it.
+    #[test]
+    fn ridge_bump_margin_clears_gershgorin_tight_singular_blocks_2469() {
+        for d in [2_usize, 3, 5, 8, 12] {
+            for unit in [1e-3_f64, 1.0, 7.3e5] {
+                let mut lap = Array2::<f64>::from_elem((d, d), -unit);
+                for i in 0..d {
+                    lap[[i, i]] = (d as f64 - 1.0) * unit;
+                }
+                for ridge_t in [0.0_f64, 0.5 * unit] {
+                    let mut htt = lap.clone();
+                    for i in 0..d {
+                        htt[[i, i]] -= ridge_t;
+                    }
+                    let bump = ridge_bump_to_make_pd(htt.view(), ridge_t);
+                    let scale = (d as f64 - 1.0) * unit;
+                    assert!(
+                        bump > 0.0 && bump < f64::EPSILON.sqrt() * scale.max(1.0),
+                        "d={d} unit={unit:e} ridge_t={ridge_t:e}: bump {bump:e} must be a \
+                         positive rounding-level margin"
+                    );
+                    let shift = ridge_t + bump;
+                    let mut retry = htt.clone();
+                    for i in 0..d {
+                        retry[[i, i]] += shift;
+                    }
+                    assert!(
+                        cholesky_factor_in_place(retry.view(), CholeskyGuard::NonnegativePivot)
+                            .is_some(),
+                        "d={d} unit={unit:e} ridge_t={ridge_t:e}: retry at bump {bump:e} \
+                         must factor"
+                    );
+                }
+            }
+        }
+        // Negative control: without the margin, the exactly singular 2×2 block
+        // meets a zero pivot (`1 − 1·1 = 0` exactly) and the factorization refuses,
+        // so the margin is what makes the retry succeed.
+        let mut singular = Array2::<f64>::from_elem((2, 2), -1.0);
+        singular[[0, 0]] = 1.0;
+        singular[[1, 1]] = 1.0;
+        assert!(
+            cholesky_factor_in_place(singular.view(), CholeskyGuard::NonnegativePivot).is_none()
+        );
     }
 
     /// The Gershgorin ridge bump must actually make a known-indefinite block PD

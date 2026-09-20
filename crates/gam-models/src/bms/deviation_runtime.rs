@@ -2,7 +2,7 @@ use crate::cubic_cell_kernel as exact_kernel;
 use crate::util::span::span_index_for_breakpoints;
 use gam_linalg::faer_ndarray::{FaerEigh, fast_ab};
 use gam_solve::pirls::LinearInequalityConstraints;
-use gam_terms::basis::create_ispline_derivative_dense;
+use gam_terms::basis::ispline_ramp_basis_dense;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 
 /// Require a breakpoint sequence suitable for BMS span lookup: finite,
@@ -131,15 +131,21 @@ pub(crate) fn integrate_polynomial_product(left: &[f64], right: &[f64], width: f
 /// Precomputed per-span polynomial coefficient matrices for a structurally
 /// monotone anchored deviation basis.
 ///
-/// Raw coefficients are monotone I-spline coefficients. The deviation
-/// derivative `w'(x)` is a nonnegative quadratic B-spline combination, so
-/// `w(x)` is a cubic I-spline combination with `C2` continuity at interior
-/// knots and constant tails. The knot vector is clamped, and at a support
-/// endpoint `w'` keeps its one-sided interior value while the tail is flat, so
-/// `w` is only `C0` there: `w'`, `w''` and `w'''` all jump at the two support
-/// endpoints. Zero coefficients still mean the identity map. The fitted
-/// coefficients live in the configured moment-anchor nullspace and are mapped
-/// back to these raw coefficients for monotonicity.
+/// Raw coefficients are monotone I-spline ramp coefficients
+/// ([`ispline_ramp_basis_dense`]). The deviation derivative `w'(x)` is a
+/// quadratic B-spline combination, so `w(x)` is a cubic I-spline combination,
+/// constant outside the union of the ramps' supports and `C2` at every simple
+/// knot. On a warp (simple-ended) knot vector that makes `w` one `C2` function
+/// on all of `ℝ`, the two support ends included: `w'` and `w''` fall to zero
+/// there as they do on the flat tail. A clamped vector's end knots have
+/// multiplicity four, where `w'`, `w''` and `w'''` all jump, so a clamped
+/// deviation is only `C0` at its support ends. That is admissible only for a
+/// deviation evaluated at fixed arguments (the score warp, at the data's `z`);
+/// a deviation whose argument moves with β (the link deviation, at `a + b·z`)
+/// is built on simple ends (gam#2695, gam#3011). Zero coefficients still mean
+/// the identity map. The fitted coefficients live in the configured
+/// moment-anchor nullspace and are mapped back to these raw coefficients for
+/// monotonicity.
 ///
 /// Monotonicity of the full transform `x + w(x)` is enforced by lower bounds
 /// on each span's quadratic Bernstein controls for `w'(x)`.
@@ -281,6 +287,12 @@ pub(crate) fn raw_span_derivative_polynomial_coefficients(
 /// of degree < `derivative_order` — that direction is structurally absent
 /// from the parameterization. This is the β-independent identifiability
 /// constraint that replaces the data-distribution-dependent moment anchor.
+///
+/// A null space can be empty. A ramp basis on simple ends is flat to second
+/// order at both support ends, so it represents no polynomial at all: a
+/// quadratic with `w = w' = w'' = 0` at one end is zero. Every direction is
+/// then penalized, nothing is dropped, and `Z` is the identity, which keeps
+/// each coefficient a local ramp and each monotonicity row sparse.
 pub(crate) fn smoothness_nullspace_orthogonal_complement(
     raw_penalty: &Array2<f64>,
 ) -> Result<Array2<f64>, String> {
@@ -309,12 +321,7 @@ pub(crate) fn smoothness_nullspace_orthogonal_complement(
         );
     }
     if kept.len() == n {
-        return Err(
-            "smoothness penalty has no null directions; nothing to drop. The link-deviation \
-             basis was expected to carry a non-trivial null space (constants/linears) for \
-             absorption by the location block — check the configured penalty derivative order"
-                .to_string(),
-        );
+        return Ok(Array2::eye(n));
     }
     let mut z = Array2::<f64>::zeros((n, kept.len()));
     for (col_out, &col_in) in kept.iter().enumerate() {
@@ -566,12 +573,26 @@ impl DeviationRuntime {
             .into());
         }
 
+        // The spans are the union of the ramps' supports, `[t₁, t_{len−2}]`: ramp
+        // `c` rises on `[t_{c+1}, t_{c+4}]`, so outside that hull every column is
+        // exactly flat and the constant tails below represent it. On a clamped
+        // vector the hull is the whole knot range.
+        let knot_slice = knots.as_slice().ok_or_else(|| {
+            String::from(DeviationRuntimeError::InvalidInput {
+                reason: "DeviationRuntime knots are not contiguous".to_string(),
+            })
+        })?;
+        if knot_slice.len() < 3 {
+            return Err(DeviationRuntimeError::InvalidInput {
+                reason: format!(
+                    "DeviationRuntime needs at least three knots, got {}",
+                    knot_slice.len()
+                ),
+            }
+            .into());
+        }
         let bkpts = breakpoints_from_knots(
-            knots.as_slice().ok_or_else(|| {
-                String::from(DeviationRuntimeError::InvalidInput {
-                    reason: "DeviationRuntime knots are not contiguous".to_string(),
-                })
-            })?,
+            &knot_slice[1..knot_slice.len() - 1],
             "DeviationRuntime breakpoints",
         )?;
         let endpoint_points = Array1::from_vec(bkpts);
@@ -603,15 +624,18 @@ impl DeviationRuntime {
         );
         let right_endpoint = Array1::from_vec(vec![endpoint_points[n_spans]]);
         let internal_degree = 2usize;
+        // The ramp evaluator reads each column as the one function it is on all
+        // of ℝ for any knot vector, and reproduces the clamped convention there,
+        // so a clamped runtime's tables are unchanged.
         let raw_span_c0 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 0)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 0)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!("DeviationRuntime cubic I-spline values failed: {e}"),
                     })
                 })?;
         let raw_span_c1 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 1)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 1)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -620,7 +644,7 @@ impl DeviationRuntime {
                     })
                 })?;
         let raw_span_c2 =
-            create_ispline_derivative_dense(span_lefts.view(), &knots, internal_degree, 2)
+            ispline_ramp_basis_dense(span_lefts.view(), knots.view(), internal_degree, 2)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -630,7 +654,7 @@ impl DeviationRuntime {
                 })?
                 .mapv(|value| 0.5 * value);
         let raw_span_c3 =
-            create_ispline_derivative_dense(span_midpoints.view(), &knots, internal_degree, 3)
+            ispline_ramp_basis_dense(span_midpoints.view(), knots.view(), internal_degree, 3)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(
@@ -640,7 +664,7 @@ impl DeviationRuntime {
                 })?
                 .mapv(|value| value / 6.0);
         let raw_right_boundary_values =
-            create_ispline_derivative_dense(right_endpoint.view(), &knots, internal_degree, 0)
+            ispline_ramp_basis_dense(right_endpoint.view(), knots.view(), internal_degree, 0)
                 .map_err(|e| {
                     String::from(DeviationRuntimeError::NumericalFailure {
                         reason: format!(

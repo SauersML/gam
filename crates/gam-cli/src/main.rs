@@ -11,7 +11,7 @@ pub(crate) use csv::WriterBuilder;
 
 pub(crate) use gam::estimate::{
     BlockRole, ContinuousSmoothnessOrderStatus, ModelSummary,
-    ParametricTermSummary, UnifiedFitResult, smooth_term_summary_rows,
+    ParametricTermSummary, SummaryBlockOffset, UnifiedFitResult, smooth_term_summary_rows,
 };
 
 pub(crate) use gam::families::survival::latent::fixed_latent_hazard_frailty;
@@ -52,7 +52,7 @@ pub(crate) use gam_predict::linalg::{PredictionCovarianceBackend, rowwise_local_
 pub(crate) use gam::matrix::{DesignMatrix, SymmetricMatrix};
 
 pub(crate) use gam_predict::{
-    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod, PosteriorMeanOptions,
+    FittedModelPredictExt, InferenceCovarianceMode, MeanIntervalMethod,
     PredictInput, PredictUncertaintyOptions, PredictableModel, predict_gam,
     predict_gam_posterior_meanwith_backend, predict_gamwith_uncertainty,
 };
@@ -60,7 +60,7 @@ pub(crate) use gam_predict::{
 pub(crate) use gam::report;
 
 pub(crate) use gam::probability::{
-    inverse_gaussian_cdf, normal_cdf, normal_two_sided_probability, standard_normal_quantile,
+    inverse_gaussian_cdf, normal_two_sided_probability, standard_normal_quantile,
     student_t_two_sided_probability,
 };
 
@@ -91,7 +91,6 @@ pub(crate) use gam::families::survival::location_scale::{
 };
 
 pub(crate) use gam::families::survival::predict::{
-    build_saved_survival_marginal_slope_predictor,
     fit_result_from_saved_model_for_prediction, require_saved_survival_likelihood_mode,
     resolve_saved_survival_time_columns, resolve_survival_inverse_link_from_saved,
     resolve_termspec_for_prediction, saved_baseline_timewiggle_components,
@@ -222,7 +221,7 @@ fn main() {
         Err(_) => {
             drop(std::io::Write::flush(&mut std::io::stdout()));
             drop(std::io::Write::flush(&mut std::io::stderr()));
-            HARD_EXIT(1);
+            HARD_EXIT(gam::ErrorCategory::Internal.exit_code());
         }
     };
     if let Err(e) = result {
@@ -232,7 +231,7 @@ fn main() {
         }
         drop(std::io::Write::flush(&mut std::io::stdout()));
         drop(std::io::Write::flush(&mut std::io::stderr()));
-        HARD_EXIT(1);
+        HARD_EXIT(e.error_category().exit_code());
     }
     // Every output artifact has been written and flushed by `run()`. Skip the
     // natural drop chain and exit explicitly: on Linux the cudarc + cuBLAS +
@@ -290,6 +289,7 @@ fn run() -> CliResult<()> {
         Command::TransformationScore(args) => {
             run_transformation_score(args).map_err(CliError::from)
         }
+        Command::LatentResidual(args) => run_latent_residual(args),
         Command::Diagnose(args) => run_diagnose(args).map_err(CliError::from),
         Command::Residuals(args) => run_residuals(args).map_err(CliError::from),
         Command::Compare(args) => run_compare(args).map_err(CliError::from),
