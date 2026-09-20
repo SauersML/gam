@@ -102,7 +102,7 @@ fn shift_raw_psi(spec: &DuchonBasisSpec, axis: usize, h: f64) -> DuchonBasisSpec
     let inv_d = 1.0 / dim as f64;
     let psi_bar = -spec.length_scale.and_then(|scale| scale.resolved()).expect("hybrid fixture").ln();
     let mut out = spec.clone();
-    out.length_scale = Some((-(psi_bar + h * inv_d)).exp());
+    out.length_scale = Some(crate::basis::MaternLengthScale::fixed((-(psi_bar + h * inv_d)).exp()));
     out.aniso_log_scales = Some(
         eta.iter()
             .enumerate()
@@ -372,7 +372,7 @@ fn duchon_native_penalty_axis_psi_matches_a_central_difference_of_the_value_2735
     let value_blocks = |local: &DuchonBasisSpec| -> Vec<Array2<f64>> {
         let candidates = duchon_native_penalty_candidates(
             centers.view(),
-            local.length_scale,
+            local.hybrid_length_scale().expect("resolved hybrid scale"),
             local.power,
             order,
             local.aniso_log_scales.as_deref(),
@@ -613,7 +613,7 @@ fn duchon_operator_penalty_psi_matches_a_central_difference_of_the_value_2735() 
             collocation.view(),
             centers.view(),
             &local.operator_penalties,
-            local.length_scale,
+            local.hybrid_length_scale().expect("resolved hybrid scale"),
             local.power,
             order,
             local.aniso_log_scales.is_some(),
@@ -653,9 +653,9 @@ fn duchon_operator_penalty_psi_matches_a_central_difference_of_the_value_2735() 
     // Global: ψ = log κ, so ℓ ↦ ℓ·e^{∓h}.
     {
         let mut plus = spec.clone();
-        plus.length_scale = Some(spec.length_scale.unwrap() * (-eps).exp());
+        plus.length_scale = Some(crate::basis::MaternLengthScale::fixed(spec.hybrid_length_scale().unwrap().unwrap() * (-eps).exp()));
         let mut minus = spec.clone();
-        minus.length_scale = Some(spec.length_scale.unwrap() * eps.exp());
+        minus.length_scale = Some(crate::basis::MaternLengthScale::fixed(spec.hybrid_length_scale().unwrap().unwrap() * eps.exp()));
         let (_, blocks_plus) = value_blocks(&plus);
         let (_, blocks_minus) = value_blocks(&minus);
         for (block, first) in analytic[0].1.iter().enumerate() {
