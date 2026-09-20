@@ -5464,6 +5464,8 @@ fn linear_dictionary_fit<'py>(
     out.set_item("atoms", fit.atoms.into_pyarray(py))?;
     out.set_item("assignments", fit.assignments.into_pyarray(py))?;
     out.set_item("fitted", fit.fitted.into_pyarray(py))?;
+    // Origin of the affine model (the centered K=1 lane); `None` for a linear fit.
+    out.set_item("mean", fit.mean.map(|mean| mean.into_pyarray(py)))?;
     out.set_item("lambdas", fit.lambdas.into_pyarray(py))?;
     out.set_item("reml_scores", fit.reml_scores.into_pyarray(py))?;
     out.set_item("explained_variance", fit.explained_variance)?;
@@ -5513,12 +5515,14 @@ fn linear_dictionary_error_to_pyerr(py: Python<'_>, error: LinearDictionaryError
 
 /// Out-of-sample encode: route held-out rows `x` (`M x P`) through a fitted
 /// linear dictionary `atoms` (`K x P`) with the fitted model's assignment rule
-/// (`"top_k"` ridge solve or `"softmax"` at `temperature`), returning the
-/// `(M, K)` code matrix.
+/// (`"top_k"` ridge solve or `"softmax"` at `temperature`) against the fitted
+/// origin `mean` (the fit's `"mean"`, `None` for a linear model), returning the
+/// `(M, K)` code matrix. The input contract is checked in Rust.
 #[pyfunction(signature = (
     x,
     atoms,
     top_k,
+    mean = None,
     code_ridge = 1.0e-8,
     assignment = "top_k",
     temperature = 0.25
@@ -5528,17 +5532,20 @@ fn linear_dictionary_transform_ffi<'py>(
     x: PyReadonlyArray2<'py, f64>,
     atoms: PyReadonlyArray2<'py, f64>,
     top_k: usize,
+    mean: Option<PyReadonlyArray1<'py, f64>>,
     code_ridge: f64,
     assignment: &str,
     temperature: f64,
 ) -> PyResult<Py<PyArray2<f64>>> {
     let x_values = x.as_array().to_owned();
     let atoms_values = atoms.as_array().to_owned();
+    let mean_values = mean.map(|mean| mean.as_array().to_owned());
     let assignment_kind = LinearDictionaryAssignment::parse(assignment).map_err(py_value_error)?;
     let codes = detach_py_result(py, "linear_dictionary_transform", move || {
         linear_dictionary_transform(
             x_values.view(),
             atoms_values.view(),
+            mean_values.as_ref().map(|mean| mean.view()),
             top_k,
             assignment_kind,
             temperature,
