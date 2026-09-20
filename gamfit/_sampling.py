@@ -11,7 +11,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Iterator, Mapping
 
-from ._paired import CumulativeIncidenceDraws, PairedPosteriorSamples
 from ._summary import Summary, _ColumnarCoefficientRecords
 
 
@@ -402,5 +401,4 @@ class PosteriorSamples:
         return self.summary()._repr_html_()
 
 
-__all__ = ["CumulativeIncidenceDraws", "PairedPosteriorSamples", "PosteriorPredictive",
-           "PosteriorSamples", "SamplingConfig"]
+__all__ = ["PosteriorPredictive", "PosteriorSamples", "SamplingConfig"]
