@@ -2036,7 +2036,7 @@
     "evidence": "git grep finds no remaining use of SAE_ASSIGNMENT_LOGIT_STEP_CAP_TAUS or logit_step_cap. On main the old test clamps a 1e6 raw logit delta to exactly 4 tau; the new test's 500 tau expected move is realised only as 4 tau on main (fails before) and exactly on the branch (passes after). Full gam-sae lib run, 2059 tests one process each with a 240s timeout: 41 non-zero results on the branch, all 41 identical (same return code) on main f4db2a2b, no new failures."
   },
   {
-    "base": "165dd1804536a2c3cae4e699c6e583c83ed3822d",
+    "base": "847f0eb73d1e6e757b73d771b3d6d9be14072deb",
     "items": [
       "crates/gam-solve/src/reml/per_atom_efs.rs:const:PER_ATOM_COST_DESCENT_TOL",
       "crates/gam-solve/src/reml/per_atom_efs.rs:const:PER_ATOM_MAX_BACKTRACK",
