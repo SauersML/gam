@@ -48,6 +48,7 @@
 
 use std::f64::consts::TAU;
 
+use gam_math::probability::normal_cdf;
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
 use rayon::prelude::*;
 
@@ -212,8 +213,10 @@ pub struct RingRecognition {
     pub resultant2: f64,
     /// `√E[r²]`, the RMS in-plane radius, measured with no noise model.
     pub rms_radius: f64,
-    /// The angle is covered (`R₁` small) and the plane is not a diameter (`R₂`
-    /// small).
+    /// Neither resultant resolves a departure from the uniform-angle null: the
+    /// angle is covered (`n·R₁²` below the Rayleigh cut) and the plane is not a
+    /// diameter (`n·R₂²` below it), the pair calibrated to refuse a uniform ring
+    /// with probability `Φ(−CURL_Z)`, the κ gate's level.
     pub covered: bool,
     /// κ resolvably below the Gaussian-fill value 2 (2σ) and `covered`.
     pub recognized: bool,
@@ -228,12 +231,27 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
     } else {
         0.0
     };
-    // Coverage / degeneracy screens: a full ring has R₁ ≈ 0 and R₂ ≈ 0; a
-    // diameter (line through the origin) has R₂ ≈ 1. Screen R₁, R₂ at the same
-    // 2σ level using the uniform-null SE 1/√n for each resultant.
-    let res_se = 1.0 / (law.n as f64).sqrt();
-    let coverage_ok = resultant1 < CURL_Z * res_se + 0.15; // lenient absolute floor
-    let not_diameter = resultant2 < 0.5;
+    // Coverage / degeneracy screens against the uniform-angle null (#3827). A full
+    // ring with uniform phase has E[e^{ikθ}] = 0 for k = 1, 2; an arc of width
+    // w < 2π has R₁ → sin(w/2)/(w/2) > 0, and a diameter (a line through the
+    // origin) has R₂ → 1. Under the null the four Fourier components cos kθ, sin kθ
+    // (k = 1, 2) are mutually uncorrelated with variance ½ each, so by the CLT
+    // n·R₁² and n·R₂² are asymptotically independent Exp(1) (the Rayleigh law).
+    // The pair of screens accepts iff both n·R_k² < t, whose null acceptance
+    // probability is (1 − e^{−t})². Setting that to 1 − α with α = Φ(−CURL_Z), the
+    // κ gate's level, gives
+    //     t = −ln(1 − √(1 − α)) = ln((1 + √(1 − α)) / α),
+    // evaluated in the second form so a small α loses no digits. A uniform ring is
+    // then refused by the geometry screens with probability α at every n, while any
+    // fixed arc or diameter is refused with probability → 1 as n grows. There is no
+    // absolute floor: the uniform-phase law is also the law the circle phase code
+    // prices (a uniform codebook over the turn), so a phase departure this test
+    // resolves is one the ring's code does not describe.
+    let n = law.n as f64;
+    let level = normal_cdf(-CURL_Z);
+    let rayleigh_t = ((1.0 + (1.0 - level).sqrt()) / level).ln();
+    let coverage_ok = n * resultant1 * resultant1 < rayleigh_t;
+    let not_diameter = n * resultant2 * resultant2 < rayleigh_t;
     let covered = coverage_ok && not_diameter;
     RingRecognition {
         kappa: law.kappa,
@@ -248,8 +266,9 @@ fn recognize(law: &RadiusLaw, alpha: ArrayView1<f64>, beta: ArrayView1<f64>) -> 
 }
 
 /// Recognize a candidate plane `(α, β)` as a ring: κ resolvably below the
-/// Gaussian-fill value 2 (2σ), full angular coverage (`R₁` small), and no diameter
-/// degeneracy (`R₂` not saturated). No noise scale enters and nothing is priced; a
+/// Gaussian-fill value 2 (2σ), and neither circular resultant resolvable from the
+/// uniform-angle null (full coverage `R₁`, no diameter degeneracy `R₂`; see
+/// [`RingRecognition::covered`]). No noise scale enters and nothing is priced; a
 /// caller that prices the replacement in bits decides acceptance on this and its
 /// own ledger, not on the small-cell screen of [`curl_verdict`] (#2933 F23).
 pub fn ring_recognition(
@@ -1028,6 +1047,74 @@ mod tests {
             v.kappa
         );
         assert!(!v.recommend_curl, "Gaussian fill must be rejected");
+    }
+
+    /// #3827: a 330° arc is not a ring. Its radius law is a perfect shell (κ = 1),
+    /// so only the coverage screen can refuse it, and at n = 4000 its first
+    /// resultant `R₁ = sin(w/2)/(w/2) ≈ 0.090` puts `n·R₁² ≈ 32` far past the
+    /// Rayleigh cut `≈ 4.47`. The former `R₁ < 2/√n + 0.15` gate read `0.090 <
+    /// 0.182` and certified this arc as a full ring at every n.
+    #[test]
+    fn a_330_degree_arc_is_not_covered_3827() {
+        let n = 4000usize;
+        let width = 330.0_f64.to_radians();
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
+        for i in 0..n {
+            let th = width * (i as f64 + 0.5) / n as f64;
+            alpha[i] = 3.0 * th.cos();
+            beta[i] = 3.0 * th.sin();
+        }
+        let rec = ring_recognition(alpha.view(), beta.view()).unwrap();
+        let expected_r1 = (0.5 * width).sin() / (0.5 * width);
+        assert!(
+            (rec.resultant1 - expected_r1).abs() < 1e-6,
+            "arc R₁ = sin(w/2)/(w/2) = {expected_r1}, got {}",
+            rec.resultant1
+        );
+        assert!(
+            rec.z_below_gaussian > CURL_Z,
+            "the arc's radius law is a shell; κ = {}",
+            rec.kappa
+        );
+        assert!(
+            !rec.covered && !rec.recognized,
+            "a 330° arc must not be certified as a covered ring (R₁ = {}, n·R₁² = {})",
+            rec.resultant1,
+            n as f64 * rec.resultant1 * rec.resultant1
+        );
+    }
+
+    /// #3827: the geometry screens are a calibrated test of the uniform-angle
+    /// null. Over `B` independent uniform rings the refusal rate of `covered` is
+    /// Binomial(B, α)/B with `α = Φ(−CURL_Z)`, so it must land within four
+    /// binomial standard errors `4·√(α(1−α)/B)` of α. The former gate, with its
+    /// absolute `+0.15` floor and fixed `R₂ < 0.5` cut, refused essentially no
+    /// uniform ring at this n: a rate of 0, miscalibrated conservative.
+    #[test]
+    fn uniform_ring_refusal_rate_is_the_kappa_gate_level_3827() {
+        let (b, n) = (4000usize, 100usize);
+        let mut s = 0x3827_u64;
+        let mut refused = 0usize;
+        let mut alpha = Array1::<f64>::zeros(n);
+        let mut beta = Array1::<f64>::zeros(n);
+        for _ in 0..b {
+            for i in 0..n {
+                let th = TAU * lcg(&mut s);
+                alpha[i] = th.cos();
+                beta[i] = th.sin();
+            }
+            if !ring_recognition(alpha.view(), beta.view()).unwrap().covered {
+                refused += 1;
+            }
+        }
+        let level = normal_cdf(-CURL_Z);
+        let rate = refused as f64 / b as f64;
+        let band = 4.0 * (level * (1.0 - level) / b as f64).sqrt();
+        assert!(
+            (rate - level).abs() < band,
+            "uniform-ring refusal rate {rate} must match α = {level} within {band}"
+        );
     }
 
     #[test]
