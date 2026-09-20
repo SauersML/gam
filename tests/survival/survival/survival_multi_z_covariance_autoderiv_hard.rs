@@ -354,11 +354,17 @@ fn t06a_n_less_than_k_retains_nonzero_coupling_as_full() {
     let mut state = 0x1357_9BDFu64;
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
-    let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    if let Ok(covariance) = result {
-        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
-        assert_eq!(covariance.dim(), k);
-    }
+    // Centred sample scores span at most n - 1 < k directions, so this
+    // covariance is PSD with exact zeros in its spectrum. That is a valid
+    // covariance (`MarginalSlopeCovariance::full` decides definiteness against
+    // the eigensolver's roundoff band for exactly this input), so a refusal
+    // here is the regression this test exists to catch, not an allowed outcome.
+    let covariance =
+        marginal_slope_covariance_from_scores(scores.view(), &w).unwrap_or_else(|error| {
+            panic!("rank-deficient PSD scores (n={n}, k={k}) must give a covariance: {error}")
+        });
+    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+    assert_eq!(covariance.dim(), k);
 }
 
 #[test]
@@ -368,11 +374,17 @@ fn t06b_n_equal_k_retains_nonzero_coupling_as_full() {
     let mut state = 0x2468_ACE0u64;
     let scores = make_iid_normal_scores(n, k, &mut state);
     let w = ones_weights(n);
-    let result = marginal_slope_covariance_from_scores(scores.view(), &w);
-    if let Ok(covariance) = result {
-        assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
-        assert_eq!(covariance.dim(), k);
-    }
+    // Centred sample scores span at most n - 1 < k directions, so this
+    // covariance is PSD with exact zeros in its spectrum. That is a valid
+    // covariance (`MarginalSlopeCovariance::full` decides definiteness against
+    // the eigensolver's roundoff band for exactly this input), so a refusal
+    // here is the regression this test exists to catch, not an allowed outcome.
+    let covariance =
+        marginal_slope_covariance_from_scores(scores.view(), &w).unwrap_or_else(|error| {
+            panic!("rank-deficient PSD scores (n={n}, k={k}) must give a covariance: {error}")
+        });
+    assert_eq!(covariance.shape(), MarginalSlopeCovarianceShape::Full);
+    assert_eq!(covariance.dim(), k);
 }
 
 // ====================================================================
