@@ -133,7 +133,7 @@ pub use state::{
 // merge_linear_constraints, sparse_from_denseview.
 use loop_driver::assert_symmetric_tol;
 
-pub(crate) use loop_driver::fit_model_for_fixed_rho_with_adaptive_kkt;
+pub(crate) use loop_driver::{fit_model_for_fixed_rho_with_adaptive_kkt, start_working_weights};
 
 pub use loop_driver::{
     PenaltyConfig, PirlsConfig, PirlsProblem, fit_model_for_fixed_rho,

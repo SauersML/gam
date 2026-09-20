@@ -56,30 +56,60 @@
 //! is not the boundary KKT mode (#2245 finding 20: centring `N(0,1)·1{β≥0}`
 //! at a boundary mode of a `N(−1,1)` quadratic reports the half-normal mean
 //! `0.798` where the true truncated mean is `0.525`). The center may be
-//! infeasible (`g` can be negative); each chain instead starts from the
-//! caller-supplied feasible point (the constrained mode), whose whitened
-//! image `z₀ = (1/√φ)·Lᵀ·(start − center)` satisfies every wall, with active
-//! constraints sitting ON their wall (the bounce logic launches the particle
-//! inward).
+//! infeasible (`g` can be negative), so chains start from feasible points.
+//!
+//! # Chain starts and burn-in
+//!
+//! Chains that share one start give split R-hat no between-chain spread by
+//! which to see that start's transient, and draws kept from the start carry
+//! the transient into every reported moment (#3380). Each chain therefore starts from its own
+//! independent unconstrained draw `N(center, φ·H⁻¹)` projected onto the
+//! polytope in the posterior's own `H` metric — the constrained quadratic solve
+//! the fit itself uses. A draw already inside the polytope is its own start, an
+//! exact draw from the target. The chains then burn in by the engine's doubling
+//! windows ([`crate::hmc_io::burn_in_until_mixed`]) until their draws meet the
+//! convergence targets, and only the draws after burn-in are returned.
 
 use std::collections::HashSet;
 
-use ndarray::{Array1, Array2};
+use ndarray::{Array1, Array2, Array3, ArrayViewMut1};
 use rand::SeedableRng;
 
 use gam_linalg::faer_ndarray::FaerCholesky;
 use gam_linalg::triangular::{
     back_substitution_lower_transpose_guarded_into, forward_substitution_lower_matrix,
 };
+use gam_solve::active_set::solve_quadratic_with_linear_constraints;
 use gam_solve::pirls::LinearInequalityConstraints;
+
+use crate::hmc_io::{NUTS_CHAINS, burn_in_until_mixed};
 
 /// Quarter-period travel time between velocity refreshes. With no active wall,
 /// `z(π/2) = v₀`, so consecutive draws decorrelate completely.
 const TRAVEL_TIME: f64 = std::f64::consts::FRAC_PI_2;
 
+/// Posterior draws of the truncated Gaussian after burn-in.
+#[derive(Debug)]
+pub(crate) struct TruncatedGaussianDraws {
+    /// `(NUTS_CHAINS, n_samples, p)` draws kept after burn-in.
+    pub(crate) chains: Array3<f64>,
+    /// Transitions each chain ran before its first kept draw.
+    pub(crate) warmup_transitions: usize,
+}
 
-/// Draw `n_samples · n_chains` posterior samples of `β ~ N(center, φ·H⁻¹)`
-/// truncated to `{β : A β ≥ b}`, returned as a `(n_total, p)` matrix in the
+impl TruncatedGaussianDraws {
+    /// The kept draws stacked chain-major as a `(NUTS_CHAINS·n_samples, p)`
+    /// matrix, row `chain·n_samples + draw`.
+    pub(crate) fn into_stacked(self) -> Array2<f64> {
+        let (chains, n_samples, p) = self.chains.dim();
+        self.chains
+            .into_shape_with_order((chains * n_samples, p))
+            .expect("a standard-layout (chain, draw, coefficient) array stacks chain-major")
+    }
+}
+
+/// Draw `n_samples` posterior samples per chain of `β ~ N(center, φ·H⁻¹)`
+/// truncated to `{β : A β ≥ b}` from [`NUTS_CHAINS`] burned-in chains, in the
 /// same coefficient coordinate system as `center` / `penalized_hessian` / `A`.
 ///
 /// * `center` — the UNCONSTRAINED Gaussian center of the local quadratic
@@ -89,8 +119,8 @@ const TRAVEL_TIME: f64 = std::f64::consts::FRAC_PI_2;
 ///   (half-normal instead of the correct boundary-truncated Gaussian — #2245
 ///   finding 20). May be infeasible; only the start point must be feasible.
 /// * `feasible_start` — a feasible point (`A·start ≥ b`, up to numeric
-///   slack), normally the constrained fit's KKT mode. Used only to seed each
-///   reflective chain.
+///   slack), normally the constrained fit's KKT mode. It warm-starts the
+///   projections that place each chain's start.
 /// * `penalized_hessian` — the *unscaled* penalised Hessian `H` (no φ).
 /// * `sqrt_phi` — `√φ` (dispersion square root); `1.0` for fixed-scale
 ///   families (Binomial / Poisson). Scales the posterior covariance to
@@ -103,9 +133,8 @@ pub(crate) fn sample_truncated_gaussian_posterior(
     sqrt_phi: f64,
     constraints: &LinearInequalityConstraints,
     n_samples: usize,
-    n_chains: usize,
     seed: u64,
-) -> Result<Array2<f64>, String> {
+) -> Result<TruncatedGaussianDraws, String> {
     let p = center.len();
     if feasible_start.len() != p {
         return Err(format!(
@@ -190,19 +219,104 @@ pub(crate) fn sample_truncated_gaussian_posterior(
         (f, g, f_sq_norm)
     };
 
-    // Whitened start `z₀ = (1/√φ)·Lᵀ·(start − center)`, validated feasible up
-    // to reflective slack: the constrained KKT mode sits ON its active walls,
-    // so tiny negative numeric slack is snapped by the wall logic, but a
-    // genuinely infeasible start would corrupt every trajectory.
-    let start_diff = feasible_start - center;
-    let z0 = l.t().dot(&start_diff) / sqrt_phi;
     // The start is the persisted feasible optimizer mode, which the constrained
     // solver certifies to a scaled violation `(aᵢᵀx − bᵢ)/‖aᵢ‖` of at most
     // `PRIMAL_FEASIBILITY_TOL`, a zero row being infeasible iff `bᵢ > 0`. Refuse
     // exactly what that contract refuses: a tighter or differently scaled test
-    // rejects valid boundary modes (gam#2719, #2469).
+    // rejects valid boundary modes (gam#2719, #2469). The projected chain
+    // starts come from the same solver under the same contract, so tiny
+    // negative slack is snapped by the wall logic, while a genuinely infeasible
+    // point would corrupt every trajectory.
+    check_feasible(feasible_start, constraints, "start point")?;
+
+    // Each chain starts from its own unconstrained draw `z ~ N(0, I)`, i.e.
+    // `β = center + √φ·L⁻ᵀ z`, moved to the nearest feasible point in the
+    // posterior metric `H`: the minimizer of `½ xᵀHx − (Hβ)ᵀx` over the
+    // polytope. Its whitened image `(1/√φ)·Lᵀ·(x − center)` is the chain's
+    // position, with the projected start ON its active walls (the bounce logic
+    // launches the particle inward).
+    let mut rngs: Vec<rand::rngs::StdRng> = (0..NUTS_CHAINS)
+        .map(|chain| {
+            rand::rngs::StdRng::seed_from_u64(
+                seed ^ ((chain as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            )
+        })
+        .collect();
+    let mut positions = Vec::with_capacity(NUTS_CHAINS);
+    let mut beta = Array1::<f64>::zeros(p);
+    for rng in &mut rngs {
+        let draw = Array1::from_shape_fn(p, |_| standard_normal(rng));
+        back_substitution_lower_transpose_guarded_into(&l, &draw, &mut beta);
+        let unconstrained = center + &(sqrt_phi * &beta);
+        let start = if m == 0 {
+            unconstrained
+        } else {
+            let (projected, _active) = solve_quadratic_with_linear_constraints(
+                penalized_hessian,
+                &penalized_hessian.dot(&unconstrained),
+                feasible_start,
+                constraints,
+                None,
+            )
+            .map_err(|err| {
+                format!(
+                    "truncated-Gaussian posterior: projecting a chain start onto the \
+                     constraints failed: {err}"
+                )
+            })?;
+            check_feasible(&projected, constraints, "projected chain start")?;
+            projected
+        };
+        positions.push(l.t().dot(&(&start - center)) / sqrt_phi);
+    }
+
+    // One transition of a chain: refresh the velocity from N(0, I), travel the
+    // reflected harmonic arc, and back-transform β = center + √φ · L⁻ᵀ z.
+    let mut v = Array1::<f64>::zeros(p);
+    let mut transition = |chain: usize, mut draw: ArrayViewMut1<'_, f64>| -> Result<(), String> {
+        let z = &mut positions[chain];
+        for vi in v.iter_mut() {
+            *vi = standard_normal(&mut rngs[chain]);
+        }
+        simulate_constrained_trajectory(z, &mut v, &f_rows, &g, &f_sq_norm)?;
+        back_substitution_lower_transpose_guarded_into(&l, z, &mut beta);
+        for j in 0..p {
+            draw[j] = center[j] + sqrt_phi * beta[j];
+        }
+        Ok(())
+    };
+
+    let warmup_transitions = burn_in_until_mixed(
+        NUTS_CHAINS,
+        p,
+        "truncated-Gaussian reflective HMC",
+        "transitions",
+        &mut transition,
+    )?;
+    let mut chains = Array3::<f64>::zeros((NUTS_CHAINS, n_samples, p));
+    for chain in 0..NUTS_CHAINS {
+        for t in 0..n_samples {
+            transition(chain, chains.slice_mut(ndarray::s![chain, t, ..]))?;
+        }
+    }
+
+    Ok(TruncatedGaussianDraws {
+        chains,
+        warmup_transitions,
+    })
+}
+
+/// Refuse a point outside `A x ≥ b` beyond the solver's feasibility contract: a
+/// scaled violation `(aᵢᵀx − bᵢ)/‖aᵢ‖` above `PRIMAL_FEASIBILITY_TOL`, a zero
+/// row being infeasible iff `bᵢ > 0`.
+fn check_feasible(
+    point: &Array1<f64>,
+    constraints: &LinearInequalityConstraints,
+    what: &str,
+) -> Result<(), String> {
+    let (a, b) = (&constraints.a, &constraints.b);
     let feasibility_tol = gam_problem::PRIMAL_FEASIBILITY_TOL;
-    for i in 0..m {
+    for i in 0..a.nrows() {
         let row_scale = a.row(i).iter().fold(0.0_f64, |s, &v| s.max(v.abs()));
         let scaled_slack = if row_scale > 0.0 {
             let unit_norm = a
@@ -214,7 +328,7 @@ pub(crate) fn sample_truncated_gaussian_posterior(
             let unit_dot = a
                 .row(i)
                 .iter()
-                .zip(feasible_start.iter())
+                .zip(point.iter())
                 .map(|(&v, &x)| (v / row_scale) * x)
                 .sum::<f64>();
             (unit_dot - b[i] / row_scale) / unit_norm
@@ -225,45 +339,12 @@ pub(crate) fn sample_truncated_gaussian_posterior(
         };
         if !(scaled_slack >= -feasibility_tol) {
             return Err(format!(
-                "truncated-Gaussian posterior: start point violates constraint row {i} \
-                 (scaled slack {scaled_slack:.3e}, contract tolerance {feasibility_tol:.3e}); \
-                 the constrained mode must be feasible"
+                "truncated-Gaussian posterior: {what} violates constraint row {i} \
+                 (scaled slack {scaled_slack:.3e}, contract tolerance {feasibility_tol:.3e})"
             ));
         }
     }
-
-    let n_total = n_samples.saturating_mul(n_chains);
-    let mut samples = Array2::<f64>::zeros((n_total, p));
-
-    // Scratch buffers reused across draws.
-    let mut z = Array1::<f64>::zeros(p);
-    let mut v = Array1::<f64>::zeros(p);
-    let mut beta = Array1::<f64>::zeros(p);
-
-    for chain in 0..n_chains {
-        let mut rng = rand::rngs::StdRng::seed_from_u64(
-            seed ^ ((chain as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
-        );
-        // Each chain starts at the feasible start point (the constrained
-        // mode), which in whitened coordinates is `z₀` — NOT the origin: the
-        // origin is the unconstrained center, which may be infeasible.
-        z.assign(&z0);
-        for draw in 0..n_samples {
-            // Refresh the velocity from N(0, I).
-            for vi in v.iter_mut() {
-                *vi = standard_normal(&mut rng);
-            }
-            simulate_constrained_trajectory(&mut z, &mut v, &f_rows, &g, &f_sq_norm)?;
-            // Back-transform: β = center + √φ · L⁻ᵀ z.
-            back_substitution_lower_transpose_guarded_into(&l, &z, &mut beta);
-            let row = chain * n_samples + draw;
-            for j in 0..p {
-                samples[(row, j)] = center[j] + sqrt_phi * beta[j];
-            }
-        }
-    }
-
-    Ok(samples)
+    Ok(())
 }
 
 /// Advance `(z, v)` along the harmonic trajectory `z(t) = z cos t + v sin t`
@@ -493,10 +574,10 @@ mod tests {
             1.0,
             &constraints(a.clone(), b.clone()),
             50,
-            2,
             7,
         )
-        .expect("apex-pressed wedge draws");
+        .expect("apex-pressed wedge draws")
+        .into_stacked();
         for row in draws.rows() {
             let slack = a.dot(&row) - &b;
             assert!(
@@ -516,10 +597,10 @@ mod tests {
                 1.0,
                 &constraints(array![[scale]], array![0.0]),
                 16,
-                1,
                 734,
             )
             .expect("rescaled half-normal sampler")
+            .into_stacked()
         };
         let expected = draw(1.0);
         for scale in [1e-200, 1e200] {
@@ -553,9 +634,10 @@ mod tests {
         let mode = array![0.5, -0.3];
         // β₀ ≥ −1000: utterly non-binding at this mode/scale.
         let c = constraints(array![[1.0, 0.0]], array![-1000.0]);
-        let n = 60_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 20240613)
-            .expect("sampler");
+        let n = 30_000;
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 20240613)
+            .expect("sampler")
+            .into_stacked();
         assert_all_feasible(&s, &c);
 
         let mean = s.mean_axis(ndarray::Axis(0)).unwrap();
@@ -565,15 +647,16 @@ mod tests {
         // Sample covariance vs Σ = H⁻¹.
         let det = 4.0 * 3.0 - 1.0;
         let sigma = array![[3.0 / det, -1.0 / det], [-1.0 / det, 4.0 / det]];
+        let rows = s.nrows();
         let mut cov = Array2::<f64>::zeros((2, 2));
-        for k in 0..n {
+        for k in 0..rows {
             let d0 = s[(k, 0)] - mean[0];
             let d1 = s[(k, 1)] - mean[1];
             cov[(0, 0)] += d0 * d0;
             cov[(0, 1)] += d0 * d1;
             cov[(1, 1)] += d1 * d1;
         }
-        cov.mapv_inplace(|v| v / (n as f64 - 1.0));
+        cov.mapv_inplace(|v| v / (rows as f64 - 1.0));
         cov[(1, 0)] = cov[(0, 1)];
         for i in 0..2 {
             for j in 0..2 {
@@ -597,14 +680,15 @@ mod tests {
         let h = array![[1.0 / (sigma * sigma)]];
         let mode = array![0.0]; // pinned on the boundary (active constraint)
         let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
-        let n = 200_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 7)
-            .expect("sampler");
+        let n = 100_000;
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 7)
+            .expect("sampler")
+            .into_stacked();
         assert_all_feasible(&s, &c);
 
         let col = s.column(0);
         let mean = col.mean().unwrap();
-        let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0);
+        let var = col.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (col.len() as f64 - 1.0);
         let two_over_pi = 2.0 / std::f64::consts::PI;
         let expect_mean = sigma * two_over_pi.sqrt();
         let expect_var = sigma * sigma * (1.0 - two_over_pi);
@@ -629,9 +713,10 @@ mod tests {
         let center = array![-1.0];
         let start = array![0.0];
         let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
-        let n = 200_000;
-        let s = sample_truncated_gaussian_posterior(&center, &start, &h, 1.0, &c, n, 1, 424242)
-            .expect("sampler");
+        let n = 100_000;
+        let s = sample_truncated_gaussian_posterior(&center, &start, &h, 1.0, &c, n, 424242)
+            .expect("sampler")
+            .into_stacked();
         assert_all_feasible(&s, &c);
         let mean = s.column(0).mean().unwrap();
         let expect = 0.525_135_7; // −1 + φ(1)/(1−Φ(1))
@@ -653,10 +738,11 @@ mod tests {
         let h = array![[1.0]];
         let mode = array![0.0];
         let c = constraints(array![[1.0]], array![0.0]);
-        let n = 200_000;
+        let n = 100_000;
         let sqrt_phi = 2.0; // φ = 4 → σ = sqrt(φ/h) = 2.
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, sqrt_phi, &c, n, 1, 99)
-            .expect("sampler");
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, sqrt_phi, &c, n, 99)
+            .expect("sampler")
+            .into_stacked();
         let mean = s.column(0).mean().unwrap();
         let expect = 2.0 * (2.0 / std::f64::consts::PI).sqrt();
         assert!(
@@ -690,10 +776,10 @@ mod tests {
         }
         let c = constraints(a, Array1::zeros(p - 1));
         let n = 40_000;
-        let chains = 2;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, chains, 31337)
-            .expect("sampler");
-        assert_eq!(s.dim(), (n * chains, p));
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 31337)
+            .expect("sampler")
+            .into_stacked();
+        assert_eq!(s.dim(), (n * NUTS_CHAINS, p));
         assert_all_feasible(&s, &c);
         // The free coordinate is unconstrained → its sample mean tracks the mode.
         assert!((s.column(0).mean().unwrap() - 1.0).abs() < 0.05);
@@ -709,12 +795,57 @@ mod tests {
         let mode = array![0.5];
         // β ≥ 0 and −β ≥ −1  ⟺  0 ≤ β ≤ 1.
         let c = constraints(array![[1.0], [-1.0]], array![0.0, -1.0]);
-        let n = 80_000;
-        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 1, 5)
-            .expect("sampler");
+        let n = 40_000;
+        let s = sample_truncated_gaussian_posterior(&mode, &mode, &h, 1.0, &c, n, 5)
+            .expect("sampler")
+            .into_stacked();
         assert_all_feasible(&s, &c);
         assert!(s.column(0).iter().all(|&v| v > 0.0 && v < 1.0));
         // Symmetric truncation around the centred mode ⇒ mean ≈ 0.5.
         assert!((s.column(0).mean().unwrap() - 0.5).abs() < 0.01);
+    }
+
+    /// #3380: neither the chain starts nor the burn-in may leak into the kept
+    /// draws. With the mode ON the bound of a 1-D truncated normal `N(−1, 1)`,
+    /// `β ≥ 0`, and the fewest kept draws, the replicate draw means over
+    /// independent seeds must average to the closed-form truncated mean
+    /// `−1 + φ(1)/(1−Φ(1))`. Replicates are independent, so their own spread
+    /// gives the standard error with no assumed autocorrelation time, and the
+    /// two-sided z level is the one a correct sampler exceeds with probability
+    /// `1/R` over `R` replicates. Chains kept from the boundary mode average
+    /// about `0.35` here, some 17 standard errors low.
+    #[test]
+    fn boundary_mode_does_not_bias_the_mean_of_few_draws() {
+        use statrs::distribution::{Continuous, ContinuousCDF, Normal};
+        let normal = Normal::new(0.0, 1.0).expect("standard normal");
+        let expect = -1.0 + normal.pdf(1.0) / (1.0 - normal.cdf(1.0));
+        let c = constraints(array![[1.0]], array![0.0]); // β ≥ 0
+        let replicates = 400_u64;
+        let means: Vec<f64> = (0..replicates)
+            .map(|seed| {
+                let draws = sample_truncated_gaussian_posterior(
+                    &array![-1.0],
+                    &array![0.0],
+                    &array![[1.0]],
+                    1.0,
+                    &c,
+                    4,
+                    seed,
+                )
+                .expect("sampler");
+                assert!(draws.warmup_transitions > 0, "the chains ran no burn-in");
+                draws.chains.mean().expect("draws")
+            })
+            .collect();
+        let r = replicates as f64;
+        let grand = means.iter().sum::<f64>() / r;
+        let spread = (means.iter().map(|m| (m - grand).powi(2)).sum::<f64>() / (r - 1.0)).sqrt();
+        let z = (grand - expect) / (spread / r.sqrt());
+        let level = normal.inverse_cdf(1.0 - 0.5 / r);
+        assert!(
+            z.abs() < level,
+            "mean of {replicates} four-draw replicates {grand} vs truncated mean {expect}: \
+             z = {z} beyond the {level} level"
+        );
     }
 }

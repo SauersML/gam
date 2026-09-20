@@ -634,8 +634,8 @@ mod tests {
             let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
             let state = build_logit_state(&y, &w, &x, &s, &cfg);
             assert!(
-                !state.analytic_outer_hessian_enabled(),
-                "{link:?} should use BFGS curvature until exact f_obs is available"
+                state.analytic_outer_hessian_enabled(),
+                "{link:?} Firth must carry its analytic TK outer Hessian (#3203)"
             );
 
             let bundle = state
@@ -1640,6 +1640,41 @@ mod tests {
 
     #[test]
     pub(crate) fn firth_outer_hessian_matches_gradient_finite_difference_with_tk_terms() {
+        assert_firth_outer_hessian_matches_gradient_finite_difference(
+            binomial_logit_glm_spec(),
+            2.0e-3,
+        );
+    }
+
+    /// #3203: non-canonical Firth links take `f = d⁴W_obs/dη⁴` from the
+    /// six-order Bernoulli log jet; the analytic TK outer ρ-Hessian must match
+    /// the central difference of the analytic gradient. The central-difference
+    /// truncation `δ²|∇³V|/6` is ~1e-10 at δ = 2e-5 and the inner-solve residual
+    /// at tol 1e-9 keeps every entry within 4e-8 of the difference, while
+    /// dropping the `f` term moves at least one entry per link by ≥ 1e-4, so the
+    /// 1e-6 band certifies the `f` carrier itself rather than only c/d/e.
+    #[test]
+    fn noncanonical_firth_outer_hessian_matches_gradient_finite_difference_3203() {
+        for link in [
+            StandardLink::Probit,
+            StandardLink::CLogLog,
+            StandardLink::LogLog,
+            StandardLink::Cauchit,
+        ] {
+            assert_firth_outer_hessian_matches_gradient_finite_difference(
+                GlmLikelihoodSpec::canonical(LikelihoodSpec::new(
+                    ResponseFamily::Binomial,
+                    InverseLink::Standard(link),
+                )),
+                1.0e-6,
+            );
+        }
+    }
+
+    fn assert_firth_outer_hessian_matches_gradient_finite_difference(
+        likelihood: GlmLikelihoodSpec,
+        rel_tol: f64,
+    ) {
         let y = array![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
         let w = Array1::<f64>::ones(y.len());
         let x = array![
@@ -1654,8 +1689,8 @@ mod tests {
         ];
         let s0 = array![[0.0, 0.0, 0.0], [0.0, 1.2, 0.1], [0.0, 0.1, 0.7],];
         let s1 = array![[0.0, 0.0, 0.0], [0.0, 0.4, -0.05], [0.0, -0.05, 0.9],];
-        let cfg =
-            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
+        let link_label = format!("{:?}", likelihood);
+        let cfg = RemlConfig::external(likelihood, 1e-9, true).with_max_iterations(500);
         let p_dim = x.ncols();
         use crate::estimate::PenaltySpec;
         let specs = vec![PenaltySpec::Dense(s0), PenaltySpec::Dense(s1)];
@@ -1677,6 +1712,10 @@ mod tests {
             None,
         )
         .expect("state");
+        assert!(
+            state.analytic_outer_hessian_enabled(),
+            "{link_label}: Firth must carry its analytic outer Hessian"
+        );
         let rho = array![0.15, -0.25];
         let eval = state
             .compute_outer_eval_with_order(
@@ -1715,8 +1754,8 @@ mod tests {
                 let an = h[[row, col]];
                 let rel = (fd - an).abs() / fd.abs().max(an.abs()).max(1e-6);
                 assert!(
-                    rel < 2.0e-3,
-                    "Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
+                    rel < rel_tol,
+                    "{link_label}: Hessian mismatch ({row},{col}): analytic={an:.9e}, fd={fd:.9e}, rel={rel:.3e}"
                 );
             }
         }
@@ -1876,6 +1915,157 @@ mod tests {
                  The inner P-IRLS likely converged off the Firth-KKT mode (gam#1821)."
             );
         }
+    }
+
+    /// Clamped B-spline design matrix by the Cox–de Boor recursion. A point
+    /// equal to the last knot belongs to the last non-degenerate span, so each
+    /// row sums to one on the closed interval.
+    fn clamped_bspline_design(x: &Array1<f64>, knots: &[f64], degree: usize) -> Array2<f64> {
+        let k = knots.len() - degree - 1;
+        let last_span = knots.len() - degree - 2;
+        let mut design = Array2::<f64>::zeros((x.len(), k));
+        for (row, &xv) in x.iter().enumerate() {
+            let span = (degree..=last_span)
+                .find(|&j| knots[j] <= xv && xv < knots[j + 1])
+                .unwrap_or(last_span);
+            let mut basis = vec![0.0_f64; knots.len() - 1];
+            basis[span] = 1.0;
+            for order in 1..=degree {
+                for i in 0..knots.len() - 1 - order {
+                    let left_den = knots[i + order] - knots[i];
+                    let right_den = knots[i + order + 1] - knots[i + 1];
+                    let left = if left_den > 0.0 {
+                        (xv - knots[i]) / left_den * basis[i]
+                    } else {
+                        0.0
+                    };
+                    let right = if right_den > 0.0 {
+                        (knots[i + order + 1] - xv) / right_den * basis[i + 1]
+                    } else {
+                        0.0
+                    };
+                    basis[i] = left + right;
+                }
+            }
+            for col in 0..k {
+                design[[row, col]] = basis[col];
+            }
+        }
+        design
+    }
+
+    /// #3507: the Firth LAML outer criterion is bounded in ρ, including through
+    /// the pitchfork of the Firth mode.
+    ///
+    /// Fixture: a perfectly separated step `y = 1{x > ½}` on a design that is
+    /// symmetric under `x ↦ 1 − x`, fitted by five clamped cubic B-splines with
+    /// a second-difference penalty (rank r = 3, unpenalized linear null space).
+    /// The symmetric stationary point of `F = −ℓ + ½βᵀS_λβ − ½log|XᵀWX|` has
+    /// `λ_min(H_F) < 0` for ρ ≲ −9.3, so the inner mode is the asymmetric
+    /// branch and `λ_min(H_F) → 0` at the bifurcation.
+    ///
+    /// The derived criterion is
+    /// `V = F(β̂) + ½log|H_0| − ½tr(H_0⁻¹HΦ) − TK(H_0) − ½log|S_λ|₊`, with
+    /// `H_0 = XᵀWX + S_λ ≻ 0` everywhere. So:
+    /// * V is finite at every ρ, including across the pitchfork. The former
+    ///   criterion (`½log|H_F| + TK(H_F)`) blows up there: 5.3e3 at ρ = −9.25
+    ///   on this fixture, against 34.9 at ρ = −20.
+    /// * Lower edge (λ → 0): β̂ tends to the unpenalized Firth fit, which is
+    ///   finite for full-rank X. Every term except `−½log|S_λ|₊ = −½rρ + c` is
+    ///   `O(λ)`. So `dV/dρ → −r/2` and V → +∞, the largest value on the scan.
+    /// * Upper edge (λ → ∞): `½log|H_0|` grows as `½rρ` and cancels the
+    ///   pseudo-determinant. β̂ tends to the Firth fit in the null space, so V
+    ///   reaches a plateau, with `dV/dρ = O(1/λ)`.
+    ///
+    /// Tolerances:
+    /// * At ρ = −20 the `O(λ)` corrections are `λ·tr(H_0⁻¹S)`-sized, about
+    ///   2e-5·r/2 here. The 1e-2·r/2 band leaves room for the inner-solve
+    ///   residual at tol 1e-9.
+    /// * At ρ = 20 the slope is `O(1/λ) ≈ 2e-9`, so the same band bounds both
+    ///   the gradient and the last cost step, `ΔV ≤ band·Δρ`.
+    #[test]
+    fn firth_laml_outer_criterion_bounded_across_rho_edges_through_pitchfork_3507() {
+        let n = 64usize;
+        let x_pts = Array1::from_shape_fn(n, |i| i as f64 / (n - 1) as f64);
+        let y = x_pts.mapv(|v| if v > 0.5 { 1.0 } else { 0.0 });
+        let w = Array1::<f64>::ones(n);
+        let degree = 3usize;
+        let knots = [0.0, 0.0, 0.0, 0.0, 0.5, 1.0, 1.0, 1.0, 1.0];
+        let x = clamped_bspline_design(&x_pts, &knots, degree);
+        let k = x.ncols();
+        let mut d2 = Array2::<f64>::zeros((k - 2, k));
+        for row in 0..k - 2 {
+            d2[[row, row]] = 1.0;
+            d2[[row, row + 1]] = -2.0;
+            d2[[row, row + 2]] = 1.0;
+        }
+        let s = d2.t().dot(&d2);
+        let half_rank = (k - 2) as f64 / 2.0;
+        let cfg =
+            RemlConfig::external(binomial_logit_glm_spec(), 1e-9, true).with_max_iterations(500);
+        let state = build_logit_state(&y, &w, &x, &s, &cfg);
+
+        // Both edges, plus a quarter-step walk through the pitchfork near −9.3.
+        let grid = [
+            -20.0, -16.0, -12.0, -10.0, -9.75, -9.5, -9.25, -9.0, -8.75, -8.5, -8.0, -6.0, -4.0,
+            -2.0, 0.0, 4.0, 8.0, 12.0, 16.0, 20.0,
+        ];
+        let mut costs = Vec::with_capacity(grid.len());
+        let mut grads = Vec::with_capacity(grid.len());
+        for &rho in &grid {
+            let r = array![rho];
+            let cost = state
+                .compute_cost(&r)
+                .unwrap_or_else(|e| panic!("Firth LAML cost at rho={rho:+.2} failed: {e:?}"));
+            let grad = state
+                .compute_gradient(&r)
+                .unwrap_or_else(|e| panic!("Firth LAML gradient at rho={rho:+.2} failed: {e:?}"))
+                [0];
+            assert!(
+                cost.is_finite() && grad.is_finite(),
+                "Firth LAML must be finite at rho={rho:+.2}: cost={cost:?}, grad={grad:?}"
+            );
+            costs.push(cost);
+            grads.push(grad);
+        }
+        let table: Vec<String> = grid
+            .iter()
+            .zip(costs.iter().zip(grads.iter()))
+            .map(|(rho, (c, g))| format!("rho={rho:+6.2} V={c:+.6} dV={g:+.6e}"))
+            .collect();
+        let table = table.join("\n");
+        let band = 1e-2 * half_rank;
+
+        // Lower edge: coercive at the pseudo-determinant rate.
+        assert!(
+            (grads[0] + half_rank).abs() <= band,
+            "lower-edge slope must be −r/2 = {:+.3}, got {:+.6e}\n{table}",
+            -half_rank,
+            grads[0]
+        );
+        let (argmax, _) = costs
+            .iter()
+            .enumerate()
+            .fold((0usize, f64::NEG_INFINITY), |best, (i, &c)| {
+                if c > best.1 { (i, c) } else { best }
+            });
+        assert_eq!(
+            argmax, 0,
+            "the lower edge must carry the largest criterion value (V → +∞ as ρ → −∞); \
+             an interior maximum is the unbounded-curvature failure of #3507\n{table}"
+        );
+
+        // Upper edge: plateau.
+        let last = grid.len() - 1;
+        assert!(
+            grads[last].abs() <= band,
+            "upper-edge slope must vanish, got {:+.6e}\n{table}",
+            grads[last]
+        );
+        assert!(
+            (costs[last] - costs[last - 1]).abs() <= band * (grid[last] - grid[last - 1]),
+            "upper-edge criterion must plateau\n{table}"
+        );
     }
 
     #[test]
@@ -5696,8 +5886,18 @@ pub(crate) enum BlockCorrectionDecision {
 /// orders are latched (#2748). `hessian_refusal` is the mathematical reason
 /// `Δ_b` has no closed-form ρ-Hessian on this fit, or `None` when the
 /// correction carries its exact ρ-Hessian into the criterion.
+///
+/// The block itself is latched as its SPECTRAL POSITIONS: the ranks, in the
+/// ascending eigenvalue order of the penalized Hessian, of the directions the
+/// admission integrated (a rank, so it does not depend on which order the
+/// criterion's eigensolver returns its pairs in). Each later ρ takes the eigenvectors at those
+/// positions, so axis `r`'s order stays attached to the direction it was
+/// certified on, and the block moves with ρ as continuously as the
+/// eigenvectors at those positions do (continuously away from an eigenvalue
+/// coincidence with a neighbouring position, steeply near an avoided one).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BlockQuadratureLatch {
+    pub(crate) block_positions: Vec<usize>,
     pub(crate) axis_orders: Vec<usize>,
     pub(crate) axis_quadrature_errors: Vec<f64>,
     pub(crate) axis_split: bool,
