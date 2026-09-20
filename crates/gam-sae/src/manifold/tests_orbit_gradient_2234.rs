@@ -164,17 +164,12 @@ fn orbit_priced_dense_gradient_factors_are_derivatives_of_the_criterion_2234() {
         !geometry.orbit_generators.is_empty() && geometry.block.orbit.is_some(),
         "the periodic ARD atom must be priced through its circle orbit"
     );
-    let lambda_smooth = anchor.lambda_smooth_vec().expect("smoothing strengths");
-    let solver = state
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("dense outer gradient solver");
     let components = state
         .analytic_outer_rho_gradient_components_with_bundle(
             target.view(),
             &anchor,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
@@ -262,7 +257,6 @@ fn orbit_priced_dense_gradient_factors_are_derivatives_of_the_criterion_2234() {
             &anchor,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
@@ -504,17 +498,12 @@ fn two_compact_topk_orbits_are_integrated_and_differentiated_2234() {
     assert_eq!(orbit_rows, selecting, "each orbit's prior covers exactly the rows selecting its atom");
     assert!(geometry.block.orbit.is_some(), "the block must carry the eliminated orbits");
 
-    let lambda_smooth = anchor.lambda_smooth_vec().expect("smoothing strengths");
-    let solver = state
-        .outer_gradient_arrow_solver(&cache, &lambda_smooth)
-        .expect("dense outer gradient solver");
     let components = state
         .analytic_outer_rho_gradient_components_with_bundle(
             target.view(),
             &anchor,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
@@ -599,7 +588,6 @@ fn two_compact_topk_orbits_are_integrated_and_differentiated_2234() {
             &anchor,
             &loss,
             &cache,
-            &solver,
             None,
             None,
             Some(&geometry),
