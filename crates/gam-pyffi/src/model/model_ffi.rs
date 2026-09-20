@@ -503,7 +503,6 @@ fn build_info(py: Python<'_>) -> PyResult<Py<PyDict>> {
             "survival_should_chunk",
             "survival_chunk_iter_collect",
             "write_survival_csv",
-            "default_survival_time_grid",
             "competing_risks_cif",
             "competing_risks_cif_from_predictions",
             "survival_prediction_payload_from_json",
@@ -1452,44 +1451,6 @@ fn extract_row_ids(
         });
     }
     Ok(Some(row_ids))
-}
-
-#[pyfunction(signature = (model_class, formula, headers, rows, model_bytes = None))]
-fn default_survival_time_grid(
-    model_class: &str,
-    formula: &str,
-    headers: Vec<String>,
-    rows: PyRef<'_, PyEncodedTable>,
-    model_bytes: Option<Vec<u8>>,
-) -> PyResult<Option<Vec<f64>>> {
-    rows.require_headers(&headers).map_err(py_value_error)?;
-    default_survival_time_grid_impl(model_class, formula, &rows.dataset, model_bytes.as_deref())
-}
-
-fn default_survival_time_grid_impl(
-    model_class: &str,
-    formula: &str,
-    dataset: &EncodedDataset,
-    model_bytes: Option<&[u8]>,
-) -> PyResult<Option<Vec<f64>>> {
-    match model_class {
-        "survival"
-        | "competing risks survival"
-        | "survival marginal-slope"
-        | "survival location-scale" => {}
-        _ => return Ok(None),
-    }
-    // Training-time anchor from the saved payload, read through the TYPED
-    // model rather than ad-hoc JSON field sniffing (#2470). A byte payload
-    // that fails to parse contributes no anchor, preserving the historical
-    // prediction-frame-only fallback for legacy models.
-    let training_hi = model_bytes
-        .and_then(|bytes| serde_json::from_slice::<FittedModel>(bytes).ok())
-        .and_then(|model| {
-            gam::families::survival::predict::survival_training_time_upper_bound(model.payload())
-        });
-    gam::families::survival::predict::default_survival_time_grid(formula, dataset, training_hi)
-        .map_err(py_value_error)
 }
 
 fn default_survival_time_grid_from_model(
