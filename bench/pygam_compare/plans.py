@@ -58,12 +58,8 @@ FUZZ_CASES = 120
 FUZZ_NS: tuple[int, ...] = (50, 500, 5_000)
 # The quick mode: fixed cases that together cover every term kind, at the two
 # smaller n. It is a 0-failure regression test (test_fuzz_terms_quick.py).
-# Every by_factor case currently fails some cell, so fz0042 runs without its
-# binomial n=50 cell until #3262 (the outer stall that cell reproduces) lands;
-# the cell rejoins the plan with that fix.
-FUZZ_QUICK_CASES: tuple[int, ...] = (5, 7, 31, 42, 100)
+FUZZ_QUICK_CASES: tuple[int, ...] = (5, 7, 31, 100, 101)
 FUZZ_QUICK_NS: tuple[int, ...] = (50, 500)
-FUZZ_QUICK_HELD_OUT: tuple[tuple[str, int, int], ...] = (("binomial", 50, 42),)
 
 
 @dataclass(frozen=True)
@@ -175,18 +171,10 @@ def _oversubscription_grid() -> tuple[Cell, ...]:
     )
 
 
-def _fuzz_grid(
-    ns: tuple[int, ...],
-    cases: tuple[int, ...],
-    held_out: tuple[tuple[str, int, int], ...] = (),
-) -> tuple[Cell, ...]:
+def _fuzz_grid(ns: tuple[int, ...], cases: tuple[int, ...]) -> tuple[Cell, ...]:
     # Ordered by n ascending for the same not-run-after-timeout rule as _grid.
     return tuple(
-        Cell(f, n, term_fuzz_design(c))
-        for n in ns
-        for f in FAMILIES
-        for c in cases
-        if (f, n, c) not in held_out
+        Cell(f, n, term_fuzz_design(c)) for n in ns for f in FAMILIES for c in cases
     )
 
 
@@ -432,7 +420,7 @@ PLANS: dict[str, Plan] = {
         Plan(
             name="fuzz_terms_quick",
             description="fuzz quick mode: fixed cases covering every term kind, n in {50, 500}",
-            cells=_fuzz_grid(FUZZ_QUICK_NS, FUZZ_QUICK_CASES, FUZZ_QUICK_HELD_OUT),
+            cells=_fuzz_grid(FUZZ_QUICK_NS, FUZZ_QUICK_CASES),
             reps=1,
             timeout_s=600.0,
             libs=("gamfit",),
