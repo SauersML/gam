@@ -7565,18 +7565,30 @@ impl SaeManifoldTerm {
                 // oscillating — the fixed-floor version un-damped on every clean
                 // step and re-overshot, so it only reduced the crawl. Predicted
                 // decrease along the accepted step α·Δ is α·d − ½α²·ΔᵀHΔ, with
-                // d = directional_decrease (= −gᵀΔ > 0) and, for the LM step
-                // (H+λI)Δ = −g, ΔᵀHΔ = d − λ‖Δ‖² (λ the β-block ridge). Standard
-                // 0.25/0.75 trust-region thresholds; factor 4 the standard
-                // aggressive LM step (Marquardt / Nocedal–Wright Alg. 4.1, inverted
-                // for the ridge↔radius reciprocal). Floored at the caller's ridges.
+                // d = directional_decrease (= −gᵀΔ > 0) and ΔᵀHΔ the assembled
+                // arrow curvature applied to the step actually taken. It is
+                // measured, not recovered from the LM identity
+                // ΔᵀHΔ = d − λ‖Δ‖²: that identity holds only for the raw solve
+                // (H+λI)Δ = −g, and the Δ here has had its per-row sub-floor null
+                // directions projected out and may have been clipped to the trust
+                // radius (a clip by s turns ΔᵀHΔ into s²·ΔᵀHΔ, not s·d − λs²‖Δ‖²);
+                // the solve also carries separate coordinate/decoder ridges plus
+                // any proximal ridge its escalation added. Standard 0.25/0.75
+                // trust-region thresholds; factor 4 the standard aggressive LM
+                // step (Marquardt / Nocedal–Wright Alg. 4.1, inverted for the
+                // ridge↔radius reciprocal). Floored at the caller's ridges.
                 let alpha = step.step;
                 let actual = pre_step_total - step.value;
-                let d_th_d = (directional_decrease
-                    - globalization.lm_ridge_b * step_norm_sq)
-                    .max(0.0);
-                let predicted =
-                    (alpha * directional_decrease - 0.5 * alpha * alpha * d_th_d).max(0.0);
+                let (h_delta_t, h_delta_beta) = gam_solve::arrow_schur::arrow_operator_apply(
+                    &sys,
+                    0.0,
+                    0.0,
+                    delta_ext_coord.view(),
+                    delta_beta.view(),
+                );
+                let step_curvature =
+                    delta_ext_coord.dot(&h_delta_t) + delta_beta.dot(&h_delta_beta);
+                let predicted = alpha * directional_decrease - 0.5 * alpha * alpha * step_curvature;
                 let gain_ratio = if predicted > 0.0 {
                     actual / predicted
                 } else {
