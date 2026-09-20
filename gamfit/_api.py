@@ -3089,7 +3089,10 @@ def glm_reml_fit_latent(
     leaving one ``None`` means "not supplied", which is what lets Rust seed and
     estimate a negative-binomial ``theta`` rather than pinning it. An explicit
     ``negbin_theta`` pins it, exactly as ``--negative-binomial-theta`` does on
-    the CLI. An unset ``tweedie_p`` resolves to ``1.5``.
+    the CLI. A Tweedie family needs its power, either as ``tweedie_p`` or in
+    the name (``"tweedie(1.5)"``); it is never profiled. Each nuisance
+    parameter belongs to one family, and passing it with any other family
+    raises.
 
     ``fisher_w`` is an advanced research hook: a per-row Fisher-block override
     that replaces the analytic curvature in the inner penalised Newton/PIRLS
