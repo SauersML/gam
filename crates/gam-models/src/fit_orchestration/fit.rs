@@ -1520,6 +1520,10 @@ pub(crate) fn fit_gaussian_location_scale_model(
         ));
     }
     let raw_offsets = GaussianLocationScaleRawOffsets::of(&request.spec);
+    // The random-effect score test reads the raw response against the raw
+    // fitted mean and σ the remap below publishes.
+    let raw_y = request.spec.y.clone();
+    let prior_weights = request.spec.weights.clone();
     if response_scale != 1.0 {
         request.spec.y.mapv_inplace(|v| v / response_scale);
         // The mean (identity-link) offset rides in the same units as y; the
@@ -1538,7 +1542,106 @@ pub(crate) fn fit_gaussian_location_scale_model(
     // refusals are shape disagreements inside that result (#2937).
     rescale_gaussian_location_scale_to_raw(&mut result, response_scale, &raw_offsets)
         .map_err(crate::gamlss::assembly_failure)?;
+    result.fit.fit.artifacts.random_effect_tests =
+        gaussian_location_scale_random_effect_tests(&result, raw_y.view(), prior_weights.view());
     Ok(result)
+}
+
+/// Where the block with one of `roles` starts in the fit's flat coefficient
+/// layout, and its index; `None` when the fit has no such block.
+fn predictor_block_start(
+    fit: &UnifiedFitResult,
+    roles: &[gam_problem::BlockRole],
+) -> Option<(usize, usize)> {
+    let index = fit
+        .blocks
+        .iter()
+        .position(|block| roles.contains(&block.role))?;
+    Some((
+        index,
+        fit.blocks[..index].iter().map(|block| block.beta.len()).sum(),
+    ))
+}
+
+/// The mean predictor's random-effect tests of a Gaussian location-scale fit,
+/// read in raw response units after the raw remap: `μ̂` is the published
+/// location predictor and `σ̂ = s·b + exp(η̂_σ)` rebuilds σ with the fit's own
+/// floor `b` in raw units (`s` the response standardization).
+///
+/// A mean composed with a link wiggle, `μ = η + w(η)`, is not linear in the
+/// mean block's coefficients, so the linear score test has no row state for it
+/// and every `group()` row carries that reason.
+fn gaussian_location_scale_random_effect_tests(
+    result: &GaussianLocationScaleFitResult,
+    y: ArrayView1<'_, f64>,
+    prior_weights: ArrayView1<'_, f64>,
+) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
+    use crate::fit_orchestration::drivers::{
+        GaussianLocationScaleMeanFit, gaussian_location_scale_random_effect_test_records,
+    };
+    use gam_problem::BlockRole;
+    use gam_terms::inference::random_effect_test::RandomEffectTestUnavailable;
+
+    let fit = &result.fit;
+    let location = predictor_block_start(&fit.fit, &[BlockRole::Location, BlockRole::Mean]);
+    let offset = location.map_or(0, |(_, start)| start);
+    let states = &fit.fit.block_states;
+    let scale_index = fit
+        .fit
+        .blocks
+        .iter()
+        .position(|block| block.role == BlockRole::Scale);
+    let sigma_floor = result.response_scale * result.sigma_floor;
+    let evaluated = match (location, scale_index) {
+        _ if result.beta_link_wiggle.is_some() => {
+            Err(RandomEffectTestUnavailable::MeanNotLinearInTerm)
+        }
+        (Some((location, _)), Some(scale))
+            if states.len() == fit.fit.blocks.len() =>
+        {
+            Ok((
+                location,
+                states[scale]
+                    .eta
+                    .mapv(|eta| crate::sigma_link::logb_sigma_from_eta_scalar(sigma_floor, eta)),
+            ))
+        }
+        _ => Err(RandomEffectTestUnavailable::NoIrlsRowState),
+    };
+    gaussian_location_scale_random_effect_test_records(
+        &fit.mean_design,
+        offset,
+        evaluated
+            .as_ref()
+            .map(|(location, sigma)| GaussianLocationScaleMeanFit {
+                beta_mu: fit.fit.blocks[*location].beta.view(),
+                y,
+                prior_weights,
+                mu: states[*location].eta.view(),
+                sigma: sigma.view(),
+            })
+            .map_err(|reason| *reason),
+    )
+}
+
+/// One `NoIrlsRowState` record per random-effect block of a location-scale
+/// fit's location predictor whose family has no mean-block row state for the
+/// score test yet, so every `group()` row says why it has no p-value instead
+/// of reporting that no test was recorded.
+fn location_scale_random_effect_tests_without_row_state(
+    fit: &BlockwiseTermFitResult,
+) -> Vec<gam_terms::inference::random_effect_test::RandomEffectTestRecord> {
+    use gam_problem::BlockRole;
+    let offset = predictor_block_start(
+        &fit.fit,
+        &[BlockRole::Location, BlockRole::Mean, BlockRole::Threshold],
+    )
+    .map_or(0, |(_, start)| start);
+    crate::fit_orchestration::drivers::random_effect_unavailable_records(
+        &fit.mean_design,
+        offset,
+        gam_terms::inference::random_effect_test::RandomEffectTestUnavailable::NoIrlsRowState,
+    )
 }
 
 pub(crate) fn fit_dispersion_location_scale_model(
@@ -1549,19 +1652,31 @@ pub(crate) fn fit_dispersion_location_scale_model(
     // unconditionally inside `fit_dispersion_glm_location_scale_terms`, which is
     // the shared entry for all four genuine-dispersion mean families (gam#1119),
     // so no per-request override is needed here.
-    let fit = fit_dispersion_glm_location_scale_terms(
+    let mut fit = fit_dispersion_glm_location_scale_terms(
         request.data,
         request.spec,
         &request.options,
         &request.kappa_options,
     )?;
+    // The mean and dispersion blocks of a Beta fit are not Fisher-orthogonal,
+    // so the mean block's own score is not its efficient score there; no
+    // dispersion family scores its mean block yet.
+    fit.fit.artifacts.random_effect_tests =
+        location_scale_random_effect_tests_without_row_state(&fit);
     Ok(DispersionLocationScaleFitResult { fit, kind })
 }
 
 pub(crate) fn fit_binomial_location_scale_model(
     request: BinomialLocationScaleFitRequest<'_>,
 ) -> Result<BinomialLocationScaleFitResult, FitFailure> {
-    fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)
+    let mut result =
+        fit_location_scale_with_optional_wiggle::<BinomialLocationScaleWorkflow>(request)?;
+    // The threshold and log-σ blocks enter the success probability through
+    // `(t − η)/σ`, so they are not Fisher-orthogonal and the threshold block's
+    // own score is not its efficient score; it has no row state for the test.
+    result.fit.fit.artifacts.random_effect_tests =
+        location_scale_random_effect_tests_without_row_state(&result.fit);
+    Ok(result)
 }
 
 /// Penalized effective degrees of freedom for a survival transformation fit.

@@ -24,6 +24,11 @@
 //! acceptance run over 5/20/200 levels, balanced and unbalanced, is the bench
 //! in `bench/pvalue_calibration/pv-random-effects/`; this is its CI-sized gate.
 //!
+//! The Gaussian location-scale cells fit the same mean formula with a
+//! heteroscedastic noise `σ(x1) = 0.3·e^{x1}` and a log-σ predictor `s(x1)`:
+//! the mean block's group row is scored in the fitted `wᵢ/σ̂ᵢ²` metric, so the
+//! same size and uniformity bands apply to it.
+//!
 //! A power control fits the same design with a real group effect and requires
 //! the test to find it.
 
@@ -53,14 +58,24 @@ enum Family {
     Gaussian,
     Binomial,
     Poisson,
+    GaussianLocationScale,
 }
 
 impl Family {
     fn config_name(self) -> &'static str {
         match self {
-            Self::Gaussian => "gaussian",
+            Self::Gaussian | Self::GaussianLocationScale => "gaussian",
             Self::Binomial => "binomial",
             Self::Poisson => "poisson",
+        }
+    }
+
+    /// The log-σ formula of a location-scale family, `None` for a one-predictor
+    /// family.
+    fn noise_formula(self) -> Option<&'static str> {
+        match self {
+            Self::GaussianLocationScale => Some("s(x1)"),
+            Self::Gaussian | Self::Binomial | Self::Poisson => None,
         }
     }
 
@@ -68,9 +83,12 @@ impl Family {
         self as u64
     }
 
-    fn draw(self, eta: f64, rng: &mut StdRng) -> f64 {
+    fn draw(self, eta: f64, x1: f64, rng: &mut StdRng) -> f64 {
         match self {
             Self::Gaussian => eta + Normal::new(0.0, 0.5).expect("normal").sample(rng),
+            Self::GaussianLocationScale => {
+                eta + Normal::new(0.0, 0.3 * x1.exp()).expect("normal").sample(rng)
+            }
             Self::Binomial => {
                 let p = 1.0 / (1.0 + (-eta).exp());
                 if Uniform::new(0.0, 1.0).expect("uniform").sample(rng) < p {
@@ -104,7 +122,7 @@ fn dataset(family: Family, rep: u64, group_sd: f64) -> gam::data::EncodedDataset
             } else {
                 ((share * share * N_LEVELS as f64) as usize).min(N_LEVELS - 1)
             };
-            let y = family.draw((2.0 * PI * x1).sin() + effects[g], &mut rng);
+            let y = family.draw((2.0 * PI * x1).sin() + effects[g], x1, &mut rng);
             StringRecord::from(vec![format!("{x1:.17e}"), format!("{g}"), format!("{y:.17e}")])
         })
         .collect();
@@ -120,18 +138,24 @@ fn group_p_value(family: Family, rep: u64, group_sd: f64) -> f64 {
     let data = dataset(family, rep, group_sd);
     let config = FitConfig {
         family: Some(family.config_name().to_string()),
+        noise_formula: family.noise_formula().map(str::to_string),
         ..FitConfig::default()
     };
     let result = fit_from_formula(FORMULA, &data, &config)
         .unwrap_or_else(|e| panic!("{family:?} rep {rep}: fit failed: {e:?}"));
-    let FitResult::Standard(fit) = result else {
-        panic!("{family:?} rep {rep}: expected a standard fit");
+    let rows = match (family, result) {
+        (Family::GaussianLocationScale, FitResult::GaussianLocationScale(ls)) => {
+            smooth_term_summary_rows(
+                &ls.fit.mean_design,
+                &ls.fit.fit,
+                SummaryBlockOffset::default(),
+            )
+        }
+        (Family::Gaussian | Family::Binomial | Family::Poisson, FitResult::Standard(fit)) => {
+            smooth_term_summary_rows(&fit.design, &fit.fit, SummaryBlockOffset::default())
+        }
+        _ => panic!("{family:?} rep {rep}: the fit took an unexpected route"),
     };
-    let rows = smooth_term_summary_rows(
-        &fit.design,
-        &fit.fit,
-        SummaryBlockOffset::default(),
-    );
     let row = rows
         .iter()
         .find(|row| row.name == GROUP_TERM)
@@ -236,6 +260,11 @@ fn poisson_null_random_effect_size_is_within_monte_carlo_error() {
     assert_null_size_within_monte_carlo_error(Family::Poisson);
 }
 
+#[test]
+fn gaussian_location_scale_null_random_effect_size_is_within_monte_carlo_error() {
+    assert_null_size_within_monte_carlo_error(Family::GaussianLocationScale);
+}
+
 /// Under a real group effect (sd 1) the rejection rate at `α = 0.05` over
 /// `N_POWER_REPLICATIONS` seeded fits must clear the null band `α + 2·MCSE(α)`:
 /// the test has power beyond its size.
@@ -246,7 +275,12 @@ fn a_real_group_effect_is_detected() {
     init_parallelism();
     let m = N_POWER_REPLICATIONS as f64;
     let null_band = ALPHA + 2.0 * (ALPHA * (1.0 - ALPHA) / m).sqrt();
-    for family in [Family::Gaussian, Family::Binomial, Family::Poisson] {
+    for family in [
+        Family::Gaussian,
+        Family::Binomial,
+        Family::Poisson,
+        Family::GaussianLocationScale,
+    ] {
         let rejections = (0..N_POWER_REPLICATIONS)
             .into_par_iter()
             .filter(|&rep| group_p_value(family, rep, 1.0) <= ALPHA)

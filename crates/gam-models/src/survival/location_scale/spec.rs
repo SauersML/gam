@@ -854,7 +854,8 @@ pub fn survival_fit_from_parts(
             // point `warm_start_from` could resume.
             outer_warm_start: None,
             coefficient_mode_selection,
-            // Survival location-scale designs carry no random-effect block.
+            // Parts carry no designs; the term fit records the threshold
+            // predictor's random-effect rows once its designs are assembled.
             random_effect_tests: Vec::new(),
         },
         inner_cycles: 0,

@@ -1155,14 +1155,37 @@ pub(crate) fn fit_survival_location_scale_terms(
                 "survival location-scale exact-joint driver returned a fit its fit closure did not produce",
             )
         })?;
+    let threshold_design = designs.remove(0);
+    let mut fit = solved.fit;
+    // The threshold and log-σ blocks enter the survival likelihood through
+    // `(g(t) − η_t)/σ`, so they are not Fisher-orthogonal and the threshold
+    // block's own score is not its efficient score: every `group()` row of the
+    // threshold predictor says the test has no row state, rather than
+    // reporting that none was recorded.
+    let threshold_start = fit
+        .blocks
+        .iter()
+        .position(|block| block.role == gam_problem::BlockRole::Threshold)
+        .map_or(0, |index| {
+            fit.blocks[..index]
+                .iter()
+                .map(|block| block.beta.len())
+                .sum()
+        });
+    fit.artifacts.random_effect_tests =
+        crate::fit_orchestration::drivers::random_effect_unavailable_records(
+            &threshold_design,
+            threshold_start,
+            gam_terms::inference::random_effect_test::RandomEffectTestUnavailable::NoIrlsRowState,
+        );
     Ok(SurvivalLocationScaleTermFitResult {
-        fit: solved.fit,
+        fit,
         time_parameterization,
         threshold_time_basis: spec.threshold_template.resolved_time_basis().cloned(),
         log_sigma_time_basis: spec.log_sigma_template.resolved_time_basis().cloned(),
         resolved_thresholdspec: resolved_specs.remove(0),
         resolved_log_sigmaspec: resolved_specs.remove(0),
-        threshold_design: designs.remove(0),
+        threshold_design,
         log_sigma_design: designs.remove(0),
         baseline_offset_residuals,
         baseline_offset_curvatures,
