@@ -375,6 +375,26 @@ impl ConditionalLawEvidence {
 /// noisy to beat it. On an exactly Gaussian score the anchors' noise is close to one
 /// shared mode, so about `P(Z² > 2) ≈ 16%` of fits re-solve: slower, and no less
 /// accurate in expectation.
+///
+/// # Its sampling error (gam#2968)
+///
+/// A declared Gaussian law is refused when `D̂` is beyond its own noise, so the
+/// declared branch also carries `SE(D̂)`. Every anchor shares the one estimated
+/// law, and `Ĝ`'s sampling unit is the score: resampling the scores moves every
+/// `r_i` at once through `δr_i = Σ_k δω_k f̃_ik`, with `f̃_ik = s_i(p_ik − E_Ĝ p_i)` the
+/// anchor's signed, centred probability at node `k` (the score's reading of that
+/// node) and `c_i = w_i/(π_i(1−π_i))`. With
+///
+/// ```text
+/// A_k = Σ_i c_i r_i f̃_ik,     B_k = Σ_i c_i f̃_ik²,     M_km = Σ_i c_i f̃_ik f̃_im,
+/// ```
+///
+/// `D̂ − E D̂ = 2·Σ_i c_i r_i δr_i + Σ_i c_i (δr_i² − E δr_i²)`, whose variance is the
+/// linear term's `4·Σ_k ω_k A_k² / n_eff`, the quadratic term's
+/// `2·tr(CΣCΣ) = 2·Σ_{k,m} ω_k ω_m M_km² / n_eff²`, and twice their covariance,
+/// `2·2·κ₃·Σ_k ω_k A_k B_k`, where `ω_k` are the law's weights and `κ₃ = Σ_j ω̃_j³`
+/// over the scores' normalised weights is the third moment's sampling scale
+/// (`1/n²` for equal weights).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClosedFormAnchorResidual {
     /// `D̂`.
@@ -383,6 +403,9 @@ pub struct ClosedFormAnchorResidual {
     pub residual_energy: f64,
     /// `Σ_i w_i se_i² / (π_i(1−π_i))`.
     pub noise_energy: f64,
+    /// `SE(D̂)` over the estimated law's score sample, measured where a
+    /// declaration is judged by it (gam#2968).
+    pub standard_error: Option<f64>,
     /// Kish effective size of the scores the estimated law was compressed from.
     pub effective_n: f64,
     /// Anchors measured: positive prior weight and `π(1−π) > 0`.
@@ -393,54 +416,243 @@ pub struct ClosedFormAnchorResidual {
     pub closed_form_chosen: bool,
 }
 
-impl ClosedFormAnchorResidual {
-    /// Aggregate per-anchor `(residual, standard error, π(1−π), prior weight)`.
-    /// Anchors whose `π(1−π)` is zero carry no probability to anchor and are not
-    /// measured.
-    pub(crate) fn from_rows(
-        rows: &[(f64, f64, f64, f64)],
-        nodes: usize,
-        effective_n: f64,
+/// One anchor of the closed-form certificate under a finite law (gam#2926): its
+/// residual `r = s·(Σ_k w_k p_k − t)` for node probabilities `p_k` and target `t`,
+/// with `s = ±1` the orientation the anchor is read in, the law variance of `p`,
+/// `π(1−π)`, and the signed, centred node probabilities `f̃_k = s·(p_k − Σ_m w_m p_m)`
+/// its sampling error is read from (gam#2968).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CertificateAnchor {
+    pub(crate) residual: f64,
+    pub(crate) law_variance: f64,
+    pub(crate) scale: f64,
+    pub(crate) deviations: Vec<f64>,
+}
+
+impl CertificateAnchor {
+    pub(crate) fn on_law(
+        law_weights: &[f64],
+        probabilities: &[f64],
+        target: f64,
+        sign: f64,
+        scale: f64,
     ) -> Result<Self, String> {
-        let mut residual_energy = 0.0;
-        let mut noise_energy = 0.0;
-        let mut anchors = 0usize;
-        for &(residual, standard_error, scale, weight) in rows {
-            if !(weight > 0.0 && scale > 0.0) {
-                continue;
-            }
-            if !(residual.is_finite() && standard_error.is_finite() && scale.is_finite()) {
-                return Err(format!(
-                    "closed-form anchoring residual is not measurable at an anchor: \
-                     residual={residual}, standard error={standard_error}, π(1−π)={scale}"
-                ));
-            }
-            residual_energy += weight * residual * residual / scale;
-            noise_energy += weight * standard_error * standard_error / scale;
-            anchors += 1;
+        let mean = law_weights
+            .iter()
+            .zip(probabilities.iter())
+            .map(|(&weight, &probability)| weight * probability)
+            .sum::<f64>();
+        let deviations: Vec<f64> = probabilities
+            .iter()
+            .map(|&probability| sign * (probability - mean))
+            .collect();
+        let law_variance = law_weights
+            .iter()
+            .zip(deviations.iter())
+            .map(|(&weight, &deviation)| weight * deviation * deviation)
+            .sum::<f64>();
+        let residual = sign * (mean - target);
+        if !(residual.is_finite() && law_variance.is_finite() && scale.is_finite()) {
+            return Err(format!(
+                "closed-form anchoring residual is not measurable at an anchor: \
+                 residual={residual}, law variance={law_variance}, π(1−π)={scale}"
+            ));
         }
-        if anchors == 0 {
+        Ok(Self {
+            residual,
+            law_variance,
+            scale,
+            deviations,
+        })
+    }
+}
+
+/// The sampling scales of the scores an estimated law was compressed from: their
+/// Kish effective size `n_eff = (Σw)²/Σw²` and `κ₃ = Σ_j (w_j/Σw)³`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ScoreSampling {
+    pub(crate) effective_n: f64,
+    pub(crate) cubic_weight: f64,
+}
+
+impl ScoreSampling {
+    pub(crate) fn from_weights(weights: ArrayView1<'_, f64>) -> Result<Self, String> {
+        let total = weights.sum();
+        if !(total.is_finite() && total > 0.0) {
+            return Err(format!(
+                "closed-form certificate: the score weights sum to {total}, so the estimated law \
+                 has no sampling size"
+            ));
+        }
+        let (square, cube) = weights.iter().fold((0.0, 0.0), |(square, cube), &weight| {
+            let share = weight / total;
+            (square + share * share, cube + share * share * share)
+        });
+        Ok(Self {
+            effective_n: 1.0 / square,
+            cubic_weight: cube,
+        })
+    }
+}
+
+/// One fold over the anchors of a closed-form certificate: the energies `D̂` reads
+/// and, when `second_order`, the node sums `A`, `B`, `M` its standard error reads.
+/// Folds of disjoint anchor sets [`merge`](Self::merge).
+pub(crate) struct ClosedFormAnchorAccumulator<'a> {
+    law_weights: &'a [f64],
+    second_order: bool,
+    residual_energy: f64,
+    law_noise_energy: f64,
+    anchors: usize,
+    influence: Vec<f64>,
+    curvature: Vec<f64>,
+    /// `M` in row-major `K × K`, upper triangle only.
+    cross: Vec<f64>,
+}
+
+impl<'a> ClosedFormAnchorAccumulator<'a> {
+    pub(crate) fn new(law_weights: &'a [f64], second_order: bool) -> Self {
+        let nodes = law_weights.len();
+        let (vector, matrix) = if second_order { (nodes, nodes * nodes) } else { (0, 0) };
+        Self {
+            law_weights,
+            second_order,
+            residual_energy: 0.0,
+            law_noise_energy: 0.0,
+            anchors: 0,
+            influence: vec![0.0; vector],
+            curvature: vec![0.0; vector],
+            cross: vec![0.0; matrix],
+        }
+    }
+
+    /// Add one anchor at prior weight `weight`. An anchor whose `π(1−π)` is zero
+    /// carries no probability to anchor and is not measured.
+    pub(crate) fn add(&mut self, anchor: &CertificateAnchor, weight: f64) -> Result<(), String> {
+        if !(weight > 0.0 && anchor.scale > 0.0) {
+            return Ok(());
+        }
+        let nodes = self.law_weights.len();
+        if anchor.deviations.len() != nodes {
+            return Err(format!(
+                "closed-form certificate: an anchor read {} node probabilities on a law of {nodes} \
+                 nodes",
+                anchor.deviations.len()
+            ));
+        }
+        let c = weight / anchor.scale;
+        self.residual_energy += c * anchor.residual * anchor.residual;
+        self.law_noise_energy += c * anchor.law_variance;
+        self.anchors += 1;
+        if self.second_order {
+            let linear = c * anchor.residual;
+            for (k, &deviation) in anchor.deviations.iter().enumerate() {
+                self.influence[k] += linear * deviation;
+                let row = c * deviation;
+                self.curvature[k] += row * deviation;
+                let cross = &mut self.cross[k * nodes..(k + 1) * nodes];
+                for (entry, &other) in cross[k..].iter_mut().zip(anchor.deviations[k..].iter()) {
+                    *entry += row * other;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn merge(mut self, other: Self) -> Self {
+        self.residual_energy += other.residual_energy;
+        self.law_noise_energy += other.law_noise_energy;
+        self.anchors += other.anchors;
+        for (left, right) in [
+            (&mut self.influence, &other.influence),
+            (&mut self.curvature, &other.curvature),
+            (&mut self.cross, &other.cross),
+        ] {
+            for (entry, &value) in left.iter_mut().zip(right.iter()) {
+                *entry += value;
+            }
+        }
+        self
+    }
+
+    pub(crate) fn finish(self, sampling: ScoreSampling) -> Result<ClosedFormAnchorResidual, String> {
+        if self.anchors == 0 {
             return Err(
                 "closed-form anchoring residual pass saw no measurable positive-weight anchor"
                     .to_string(),
             );
         }
-        let excess_kl = residual_energy - 2.0 * noise_energy;
-        Ok(Self {
+        let n_eff = sampling.effective_n;
+        let noise_energy = self.law_noise_energy / n_eff;
+        let excess_kl = self.residual_energy - 2.0 * noise_energy;
+        let standard_error = if self.second_order {
+            let w = self.law_weights;
+            let nodes = w.len();
+            let mut linear = 0.0;
+            let mut covariance = 0.0;
+            let mut quadratic = 0.0;
+            for k in 0..nodes {
+                linear += w[k] * self.influence[k] * self.influence[k];
+                covariance += w[k] * self.influence[k] * self.curvature[k];
+                let row = &self.cross[k * nodes..(k + 1) * nodes];
+                quadratic += w[k] * w[k] * row[k] * row[k];
+                for m in (k + 1)..nodes {
+                    quadratic += 2.0 * w[k] * w[m] * row[m] * row[m];
+                }
+            }
+            let variance = 4.0 * linear / n_eff
+                + 2.0 * quadratic / (n_eff * n_eff)
+                + 4.0 * sampling.cubic_weight * covariance;
+            if !(variance.is_finite() && variance >= 0.0) {
+                return Err(format!(
+                    "closed-form certificate: the sampling variance of D̂ is not measurable \
+                     ({variance}: linear {linear:.4e}, quadratic {quadratic:.4e}, covariance \
+                     {covariance:.4e} at n_eff = {n_eff:.1})"
+                ));
+            }
+            Some(variance.sqrt())
+        } else {
+            None
+        };
+        if !(excess_kl.is_finite()) {
+            return Err(format!("closed-form certificate: D̂ = {excess_kl} is not finite"));
+        }
+        Ok(ClosedFormAnchorResidual {
             excess_kl,
-            residual_energy,
+            residual_energy: self.residual_energy,
             noise_energy,
-            effective_n,
-            anchors,
-            nodes,
+            standard_error,
+            effective_n: n_eff,
+            anchors: self.anchors,
+            nodes: self.law_weights.len(),
             closed_form_chosen: excess_kl <= 0.0,
         })
     }
+}
+
+impl ClosedFormAnchorResidual {
+    /// A declared Gaussian law whose score failed the adequacy screen is refused when
+    /// its estimated excess anchoring loss is beyond its own sampling noise at the
+    /// screen's level: `D̂ > z_{1−α}·SE(D̂)` with `α` = [`AUTO_Z_CONDITIONAL_RAO_ALPHA`]
+    /// (gam#2968). Returns the one-sided critical value when the declaration is
+    /// refused.
+    pub(crate) fn refuses_declaration(&self) -> Result<Option<f64>, String> {
+        let standard_error = self.standard_error.ok_or_else(|| {
+            "closed-form certificate: a declared Gaussian law is judged by SE(D̂), and this \
+             certificate did not measure it"
+                .to_string()
+        })?;
+        let critical = standard_normal_quantile(1.0 - AUTO_Z_CONDITIONAL_RAO_ALPHA)?;
+        Ok((self.excess_kl > critical * standard_error).then_some(critical))
+    }
 
     pub(crate) fn summary(&self) -> String {
+        let standard_error = self
+            .standard_error
+            .map_or_else(String::new, |se| format!(", SE(D̂) = {se:.4e}"));
         format!(
-            "D̂ = Σ w (r² − 2·se²)/π(1−π) = {:.4e} (Σ w r²/π(1−π) = {:.4e}, Σ w se²/π(1−π) = \
-             {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes: {}",
+            "D̂ = Σ w (r² − 2·se²)/π(1−π) = {:.4e}{standard_error} (Σ w r²/π(1−π) = {:.4e}, \
+             Σ w se²/π(1−π) = {:.4e}) over {} anchors, n_eff = {:.1}, estimated law of {} nodes: {}",
             self.excess_kl,
             self.residual_energy,
             self.noise_energy,
@@ -538,8 +750,11 @@ pub enum LatentLawConsumed {
     /// closed-form `N(0, 1)` lowering, admitted because the score's conditional
     /// moments do not move on the span. When the pooled score fails the adequacy
     /// screen, `adequacy` is the failing ledger and `residual` the declaration's
-    /// estimated excess anchoring loss at the converged fit, both warned about;
-    /// neither refuses the declaration.
+    /// estimated excess anchoring loss at the converged fit, both warned about.
+    /// A failed screen alone does not refuse the declaration; a loss beyond its
+    /// own sampling noise does
+    /// ([`LatentLawRefusal::DeclaredGaussianAnchoringLoss`], gam#2968), so a
+    /// persisted declaration's `residual` is within it.
     DeclaredGaussian {
         evidence: ConditionalLawEvidence,
         adequacy: Option<LatentNormalAdequacy>,
@@ -678,6 +893,17 @@ pub enum LatentLawRefusal {
         arm: MovingLawArm,
         reason: String,
     },
+    /// A Gaussian law was declared on a score that fails the standard-normal
+    /// adequacy screen, and at the converged declared fit the closed form's
+    /// estimated excess anchoring loss is beyond its own sampling noise:
+    /// `D̂ > z_{1−α}·SE(D̂)` (gam#2968). `critical` is `z_{1−α}`, `adequacy` the
+    /// failing screen's ledger.
+    DeclaredGaussianAnchoringLoss {
+        context: String,
+        certificate: ClosedFormAnchorResidual,
+        critical: f64,
+        adequacy: String,
+    },
 }
 
 impl std::fmt::Display for LatentLawRefusal {
@@ -728,6 +954,26 @@ impl std::fmt::Display for LatentLawRefusal {
                  Declare latent_measure=\"conditional-location-scale\" or \
                  latent_measure=\"global-empirical\"",
                 arm.label()
+            ),
+            Self::DeclaredGaussianAnchoringLoss {
+                context,
+                certificate,
+                critical,
+                adequacy,
+            } => write!(
+                f,
+                "{context}: the Gaussian latent law was declared (latent_measure=\"gaussian\", \
+                 frozen_score, or the CTN chain) on a score that fails the standard-normal \
+                 adequacy screen (ledger, x = statistic / bound, x<=1 passed: {adequacy}), and at \
+                 the converged declared fit the closed form's estimated excess anchoring loss \
+                 is beyond its sampling noise: D-hat = {:.4e} > z = {:.4} x SE(D-hat) = {:.4e} \
+                 ({}). The declared anchor misstates the probabilities it anchors. Refused. Drop \
+                 the declaration to anchor on the estimated law (the default), or supply a \
+                 score that is standard normal",
+                certificate.excess_kl,
+                critical,
+                certificate.standard_error.unwrap_or(f64::NAN),
+                certificate.summary()
             ),
         }
     }
@@ -2825,9 +3071,10 @@ pub(crate) fn build_latent_measure_decision(
             // The shape screen's bounds are fixed tolerances, not tests of the
             // declaration's consequence: at small n they reject exact Gaussian
             // scores, at large n harmless departures. So a failed screen does not
-            // refuse a declaration. The family measures what the declaration costs
-            // at the converged fit instead, the excess anchoring loss `D̂` under the
-            // estimated law, and warns with both.
+            // refuse a declaration by itself. The family measures what the
+            // declaration costs at the converged fit instead, the excess anchoring
+            // loss `D̂` under the estimated law, and refuses it when `D̂` is beyond
+            // its own sampling noise (gam#2968); otherwise it warns with both.
             let certificate_law = estimated_latent_law::build_empirical_law_on_own_axis(
                 z.view(),
                 weights.view(),
@@ -2838,7 +3085,8 @@ pub(crate) fn build_latent_measure_decision(
                 "[{context} latent-z] the Gaussian latent law was declared, and the score fails \
                  the standard-normal adequacy screen (adequacy ledger, x = statistic / bound, \
                  x<=1 passed: {}); fitting the declared closed form, whose estimated excess \
-                 anchoring loss is measured at the converged fit (gam#2926)",
+                 anchoring loss is measured at the converged fit and refused beyond its \
+                 sampling noise (gam#2926, gam#2968)",
                 adequacy.ledger(),
             );
             Ok(LatentMeasureDecision {

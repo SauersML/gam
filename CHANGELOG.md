@@ -1,5 +1,17 @@
 ## Unreleased
 
+- **A Gaussian latent declaration that misstates its anchor is refused** (gam#2968).
+  `latent_measure="gaussian"`, `frozen_score=True` and the CTN chain on a Bernoulli or
+  survival marginal-slope fit whose score fails the standard-normal adequacy screen
+  used to be fitted with a warning whatever the departure cost. The certificate now
+  also carries the standard error of its excess anchoring loss `D̂` over the score
+  sample the estimated law was built from (the node-level linear, quadratic and
+  third-moment terms of resampling the scores; within 2% of a score bootstrap), and
+  the declaration is refused when `D̂ > z₁₋α·SE(D̂)` at the conditional-law gate's
+  one-sided `α = 10⁻³`. The message gives `D̂`, `SE(D̂)`, the critical value and the
+  failed ledger. Exact-Gaussian scores are never refused at that level; a skewed
+  score at large `n` is. **Behavior change:** such declarations now raise instead of
+  returning a fitted model; drop the declaration to anchor on the estimated law.
 - **One exception hierarchy, chosen by the engine's error category.** Every engine
   error now reports one Rust `ErrorCategory` (formula, data, convergence, not fitted,
   internal). Python raises a class under that category's base, and the CLI exits

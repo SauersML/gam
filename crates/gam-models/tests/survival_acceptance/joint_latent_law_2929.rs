@@ -351,19 +351,31 @@ fn anchored_joint_law_is_calibrated_where_the_pooled_closed_form_is_not_2929() {
     }
 }
 
-/// The record of a Gaussian declaration on K = 2 scores whose first score's
-/// innovation is planted through `plant`: the failing ledger and the declaration's
-/// excess anchoring loss on the joint law, which the screen's failure makes the
-/// fit measure (gam#2926).
+/// A Gaussian declaration on K = 2 scores whose first score's innovation is
+/// planted through `plant`: the failing ledger and the declaration's excess
+/// anchoring loss on the joint law, which the screen's failure makes the fit
+/// measure (gam#2926), or, when that loss is beyond its sampling noise, the
+/// refusal (gam#2968).
 fn declared_on_planted_scores(
     seed: u64,
     plant: impl Fn(f64) -> f64,
-) -> (
-    gam_models::bms::LatentNormalAdequacy,
-    gam_models::bms::ClosedFormAnchorResidual,
-) {
+) -> Result<
+    (
+        gam_models::bms::LatentNormalAdequacy,
+        gam_models::bms::ClosedFormAnchorResidual,
+    ),
+    String,
+> {
     let fixture = build_fixture_with(seed, plant);
-    let declared = fit(&fixture.data, "Surv(time, event) ~ 1", &config("standard-normal"));
+    let result = fit_from_formula(
+        "Surv(time, event) ~ 1",
+        &fixture.data,
+        &config("standard-normal"),
+    )
+    .map_err(|error| error.to_string())?;
+    let FitResult::SurvivalMarginalSlope(declared) = result else {
+        panic!("expected a SurvivalMarginalSlope fit result");
+    };
     let gam_models::bms::LatentLawConsumed::DeclaredGaussian {
         adequacy: Some(adequacy),
         residual: Some(certificate),
@@ -382,15 +394,19 @@ fn declared_on_planted_scores(
         "the declaration's certificate reads every row's exit and entry anchor on the joint law: \
          {certificate:?}"
     );
-    (adequacy.clone(), certificate.clone())
+    assert!(
+        certificate.standard_error.is_some(),
+        "a kept declaration's certificate must carry the SE(D̂) it was judged by: {certificate:?}"
+    );
+    Ok((adequacy.clone(), certificate.clone()))
 }
 
 /// gam#2926: lighter tails beyond 1.8σ on the first of K = 2 scores, the bulk
 /// untouched, fail the adequacy screen on the score's own kurtosis at n = 3 000,
 /// and the declaration's certificate is measured on the joint law. The departure
 /// is symmetric, so it moves each anchor only at second order: its anchoring error
-/// stays below the estimated law's own sampling error, and the certificate keeps
-/// the closed form. The screen rejects a departure the anchor does not pay for.
+/// stays below the estimated law's own sampling error, and the declaration is
+/// kept (gam#2968). The screen rejects a departure the anchor does not pay for.
 #[test]
 fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_certificate_2926() {
     install();
@@ -401,7 +417,10 @@ fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_cer
             e
         }
     };
-    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0005, lighter_tails);
+    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0005, lighter_tails)
+        .unwrap_or_else(|refusal| {
+            panic!("a symmetric tail departure must not refuse the declaration: {refusal}")
+        });
     eprintln!("[2926 declared K=2 lighter tails] {adequacy:?} | {certificate:?}");
     assert!(
         adequacy.excess_kurtosis.abs() > adequacy.excess_kurtosis_tol,
@@ -414,25 +433,30 @@ fn a_gaussian_declaration_on_lighter_k2_tails_fails_the_screen_and_keeps_its_cer
     );
 }
 
-/// gam#2926: the first of K = 2 scores stretched above +1σ, a skew that moves each
-/// anchor at first order, fails the adequacy screen at n = 3 000, and the
-/// declaration's recorded excess anchoring loss on the joint law is positive: the
-/// certificate prefers the estimated law.
+/// gam#2926/gam#2968: the first of K = 2 scores stretched above +1σ, a skew that
+/// moves each anchor at first order, fails the adequacy screen at n = 3 000, and
+/// the declaration's excess anchoring loss on the joint law is beyond its sampling
+/// noise: the declaration is refused.
 #[test]
-fn a_gaussian_declaration_on_a_skewed_k2_score_records_a_certificate_beyond_noise_2926() {
+fn a_gaussian_declaration_on_a_skewed_k2_score_is_refused_beyond_noise_2968() {
     install();
     let upper_stretch = |e: f64| if e > 1.0 { 1.0 + 1.5 * (e - 1.0) } else { e };
-    let (adequacy, certificate) = declared_on_planted_scores(0x2929_0000_0006, upper_stretch);
-    eprintln!("[2926 declared K=2 skewed] {adequacy:?} | {certificate:?}");
-    assert!(
-        adequacy.skew.abs() > adequacy.skew_tol,
-        "the stretched upper tail must fail the screen on the score's own skewness: {adequacy:?}"
-    );
-    assert!(
-        certificate.excess_kl > 0.0 && !certificate.closed_form_chosen,
-        "a skewed score must cost the declaration's anchor beyond the estimated law's own \
-         sampling error: {certificate:?}"
-    );
+    match declared_on_planted_scores(0x2929_0000_0006, upper_stretch) {
+        Ok((adequacy, certificate)) => panic!(
+            "a skewed K=2 score must refuse the Gaussian declaration; it was kept with \
+             {adequacy:?} | {certificate:?}"
+        ),
+        Err(refusal) => {
+            eprintln!("[2968 declared K=2 skewed] refused: {refusal}");
+            assert!(
+                refusal.contains("excess anchoring loss is beyond its sampling noise")
+                    && refusal.contains("Refused")
+                    && refusal.contains("skew"),
+                "the declaration must be refused by its anchoring-loss test, naming the failed \
+                 ledger: {refusal}"
+            );
+        }
+    }
 }
 
 #[test]

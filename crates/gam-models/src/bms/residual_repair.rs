@@ -906,32 +906,23 @@ impl JointAnchorOnScore {
         alpha / self.scale
     }
 
-    /// Under the candidate law `law` of the score, `(Σ_k w_k Φ(ã + B u_k) − μ, the
-    /// standard deviation of Φ(ã + B U), μ)`: the anchoring residual the
-    /// closed-form certificate reads, on the joint anchor.
-    pub(crate) fn anchoring_residual(
+    /// Under the candidate law `law` of the score, the closed-form certificate's
+    /// anchor on the joint anchor: the residual `Σ_k w_k Φ(ã + B u_k) − μ`, read
+    /// from the node probabilities `Φ(ã + B u_k)`, with `π(1−π) = μ(1−μ)`.
+    pub(crate) fn certificate_anchor(
         &self,
         alpha: f64,
         mu: f64,
         law: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<super::CertificateAnchor, String> {
         let intercept = self.score_intercept(alpha);
-        let probabilities: Vec<(f64, f64)> = law
-            .pairs()
-            .map(|(node, weight)| (weight, normal_cdf(intercept + self.slope * node)))
-            .collect();
-        let mean: f64 = probabilities.iter().map(|&(w, p)| w * p).sum();
-        let variance: f64 = probabilities
+        let probabilities: Vec<f64> = law
+            .nodes
             .iter()
-            .map(|&(w, p)| w * (p - mean) * (p - mean))
-            .sum();
-        if !(mean.is_finite() && variance.is_finite()) {
-            return Err(format!(
-                "joint anchor on the score: the anchoring residual is not finite: mean={mean}, \
-                 variance={variance} at α={alpha}"
-            ));
-        }
-        Ok((mean - mu, variance.sqrt(), mu))
+            .map(|&node| normal_cdf(intercept + self.slope * node))
+            .collect();
+        super::CertificateAnchor::on_law(&law.weights, &probabilities, mu, 1.0, mu * (1.0 - mu))
+            .map_err(|reason| format!("joint anchor on the score at α={alpha}: {reason}"))
     }
 }
 
@@ -1286,7 +1277,8 @@ mod residual_repair_kernel_tests {
                 let (alpha, _, _, _) =
                     residual_row_index(&marginal, g, &beta, 0.0, &[0.0, 0.0], &cov, anchored_on, s)
                         .unwrap();
-                let (residual, _, mu) = anchor.anchoring_residual(alpha, marginal.mu, scored_on).unwrap();
+                let mu = marginal.mu;
+                let residual = anchor.certificate_anchor(alpha, mu, scored_on).unwrap().residual;
                 let mut direct = 0.0;
                 for (z, w) in scored_on.pairs() {
                     for (e, we) in inner.pairs() {

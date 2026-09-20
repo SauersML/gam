@@ -60,20 +60,20 @@ impl SurvivalMarginalSlopeFamily {
         Ok(cells)
     }
 
-    /// The closed-form flex program's anchoring residual at one survival anchor
-    /// under a finite law (gam#2926's certificate). The row's intercept `a` at
-    /// marginal index `q` is the program's own, solved under `N(0, 1)`; at each node
-    /// `u_k` of `law` the program's de-nested index `η(u_k)` gives the survival
-    /// probability `Φ(−η(u_k))`. Returns `r = Σ_k w_k Φ(−η(u_k)) − Φ(−q)`, the standard
-    /// deviation of `Φ(−η(U))` under the law, and `Φ(q)Φ(−q)`.
-    pub(crate) fn flex_survival_anchoring_residual(
+    /// The closed-form flex program's certificate anchor at one survival anchor
+    /// under a finite law (gam#2926). The row's intercept `a` at marginal index `q`
+    /// is the program's own, solved under `N(0, 1)`; at each node `u_k` of `law` the
+    /// program's de-nested index `η(u_k)` gives the survival probability
+    /// `Φ(−η(u_k))`, and the anchor reads `r = Σ_k w_k Φ(−η(u_k)) − Φ(−q)` through
+    /// [`crate::bms::estimated_latent_law::survival_certificate_anchor`].
+    pub(crate) fn flex_survival_certificate_anchor(
         &self,
         q: f64,
         slope: f64,
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         law: &crate::bms::EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<crate::bms::CertificateAnchor, String> {
         if self.score_dim() != 1 {
             return Err(
                 "the flex survival anchoring residual is defined for one latent score".to_string(),
@@ -85,19 +85,12 @@ impl SurvivalMarginalSlopeFamily {
             let eta = self.flex_survival_denested_index(u, a, slope, beta_h, beta_w)?;
             probabilities.push(crate::bms::estimated_latent_law::survival_tail_probability(q, eta));
         }
-        let (residual, law_sd, scale) =
-            crate::bms::estimated_latent_law::anchoring_residual_from_tail_probabilities(
-                q,
-                &law.weights,
-                &probabilities,
-            );
-        if !(residual.is_finite() && law_sd.is_finite()) {
-            return Err(format!(
-                "flex survival anchoring residual is not finite at q={q}, slope={slope}: \
-                 residual={residual}, sd={law_sd}"
-            ));
-        }
-        Ok((residual, law_sd, scale))
+        crate::bms::estimated_latent_law::survival_certificate_anchor(
+            q,
+            &law.weights,
+            &probabilities,
+        )
+        .map_err(|reason| format!("flex survival anchor at slope={slope}: {reason}"))
     }
 
     /// The flex program's de-nested index `η(u)` at node `u` and intercept `a`.
@@ -204,7 +197,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// The closed-form certificate's two anchors of one row (gam#2926): the exit and
-    /// entry anchoring residuals `(r, sd, π(1−π))` under `law`, at the row's own
+    /// entry anchors under `law`, at the row's own
     /// marginal indices and on each anchor's own slope channel, through the flex
     /// program when a flex block is installed and the rigid closed form otherwise.
     ///
@@ -220,7 +213,7 @@ impl SurvivalMarginalSlopeFamily {
         row: usize,
         block_states: &[ParameterBlockState],
         law: &crate::bms::EmpiricalZGrid,
-    ) -> Result<[(f64, f64, f64); 2], String> {
+    ) -> Result<[crate::bms::CertificateAnchor; 2], String> {
         let values = self.row_dynamic_q_values(row, block_states)?;
         // A time-constant slope is the degenerate case entry = exit.
         let slopes = self.row_slope_channels(row, block_states)?;
@@ -228,16 +221,14 @@ impl SurvivalMarginalSlopeFamily {
         let beta_w = self.flex_link_beta(block_states)?;
         // A flex block runs the row through its own de-nested program; without one
         // the anchor is the rigid closed form, the same number in O(nodes).
-        let anchor = |q: f64, slope: f64| -> Result<(f64, f64, f64), String> {
+        let anchor = |q: f64, slope: f64| -> Result<crate::bms::CertificateAnchor, String> {
             if beta_h.is_some() || beta_w.is_some() {
-                self.flex_survival_anchoring_residual(q, slope, beta_h, beta_w, law)
+                self.flex_survival_certificate_anchor(q, slope, beta_h, beta_w, law)
             } else {
-                Ok(
-                    crate::bms::estimated_latent_law::closed_form_survival_anchoring_residual(
-                        q,
-                        self.probit_frailty_scale() * slope,
-                        law,
-                    ),
+                crate::bms::estimated_latent_law::closed_form_survival_certificate_anchor(
+                    q,
+                    self.probit_frailty_scale() * slope,
+                    law,
                 )
             }
         };
@@ -245,8 +236,7 @@ impl SurvivalMarginalSlopeFamily {
     }
 
     /// The closed-form certificate's two anchors of one row of a `K ≥ 2` fit
-    /// (gam#2926): the exit and entry anchoring residuals `(r, sd, π(1−π))` of the
-    /// closed form `q·√(1 + s²·rᵀΣ(a)r) + s·rᵀz` under the joint latent law the fit
+    /// (gam#2926): the exit and entry anchors of the closed form `q·√(1 + s²·rᵀΣ(a)r) + s·rᵀz` under the joint latent law the fit
     /// would re-solve on, transported to the row's context (gam#2929). `r` is the
     /// row's per-score slope vector, or the shared slope on every score, read at
     /// each anchor's own follow-up time. Like the scalar certificate it reads no
@@ -257,7 +247,7 @@ impl SurvivalMarginalSlopeFamily {
         block_states: &[ParameterBlockState],
         law: &JointLatentLawRuntime,
         workspace: &mut JointCertificateWorkspace,
-    ) -> Result<[(f64, f64, f64); 2], String> {
+    ) -> Result<[crate::bms::CertificateAnchor; 2], String> {
         let k = law.score_dim();
         if k != self.score_dim() {
             return Err(format!(
@@ -278,7 +268,7 @@ impl SurvivalMarginalSlopeFamily {
         law.row_nodes_into(row, &mut workspace.nodes)?;
         let scale = self.probit_frailty_scale();
         let covariance = self.score_covariance.at_row(row);
-        let mut anchor = |q: f64, slopes: &[f64]| -> Result<(f64, f64, f64), String> {
+        let mut anchor = |q: f64, slopes: &[f64]| -> Result<crate::bms::CertificateAnchor, String> {
             let variance = scale * scale * covariance.quadratic_form_unchecked(slopes);
             let alpha = q * (1.0 + variance).sqrt();
             workspace.probabilities.clear();
@@ -293,19 +283,12 @@ impl SurvivalMarginalSlopeFamily {
                     crate::bms::estimated_latent_law::survival_tail_probability(q, alpha + drive),
                 );
             }
-            let (residual, law_sd, pi_scale) =
-                crate::bms::estimated_latent_law::anchoring_residual_from_tail_probabilities(
-                    q,
-                    law.weights(),
-                    &workspace.probabilities,
-                );
-            if !(residual.is_finite() && law_sd.is_finite()) {
-                return Err(format!(
-                    "survival marginal-slope joint anchoring residual is not finite at row {row}, \
-                     q={q}: residual={residual}, sd={law_sd}"
-                ));
-            }
-            Ok((residual, law_sd, pi_scale))
+            crate::bms::estimated_latent_law::survival_certificate_anchor(
+                q,
+                law.weights(),
+                &workspace.probabilities,
+            )
+            .map_err(|reason| format!("survival marginal-slope joint anchor at row {row}: {reason}"))
         };
         Ok([anchor(values.q1, &exit_slopes)?, anchor(values.q0, &entry_slopes)?])
     }

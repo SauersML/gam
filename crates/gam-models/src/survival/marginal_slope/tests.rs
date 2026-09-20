@@ -9170,7 +9170,7 @@ fn normal_quantile_law(m: usize) -> crate::bms::EmpiricalZGrid {
 /// `N(0, 1)` vanishes, because the row's intercept anchors exactly that integral,
 /// and without flex coefficients the program's residual is the rigid closed form's.
 #[test]
-fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2926() {
+fn flex_survival_certificate_anchor_matches_its_calibration_and_the_rigid_form_2926() {
     let family = make_flex_no_wiggle_test_family(8);
     let block_states = flex_no_wiggle_test_block_states(&family);
     let beta_h = family
@@ -9182,30 +9182,42 @@ fn flex_survival_anchoring_residual_matches_its_calibration_and_the_rigid_form_2
     );
     let law = normal_quantile_law(4001);
     for &(q, slope) in &[(-1.5, 0.4), (0.3, 0.8), (2.0, -0.6)] {
-        let (flex_residual, _, _) = family
-            .flex_survival_anchoring_residual(q, slope, beta_h, None, &law)
-            .expect("flex anchoring residual");
+        let flex_residual = family
+            .flex_survival_certificate_anchor(q, slope, beta_h, None, &law)
+            .expect("flex anchoring residual")
+            .residual;
         assert!(
             flex_residual.abs() < 1e-5,
             "under the program's own N(0, 1) the flex residual must vanish: q={q} slope={slope} \
              residual={flex_residual:e}"
         );
-        let (through_flex, sd_through_flex, scale_through_flex) = family
-            .flex_survival_anchoring_residual(q, slope, None, None, &law)
+        let through_flex = family
+            .flex_survival_certificate_anchor(q, slope, None, None, &law)
             .expect("rigid anchoring residual through the flex program");
-        let (rigid, sd_rigid, scale_rigid) =
-            crate::bms::estimated_latent_law::closed_form_survival_anchoring_residual(
-                q,
-                family.probit_frailty_scale() * slope,
-                &law,
-            );
+        let rigid = crate::bms::estimated_latent_law::closed_form_survival_certificate_anchor(
+            q,
+            family.probit_frailty_scale() * slope,
+            &law,
+        )
+        .expect("rigid anchoring residual");
+        let largest_node_gap = through_flex
+            .deviations
+            .iter()
+            .zip(rigid.deviations.iter())
+            .map(|(flex, closed)| (flex - closed).abs())
+            .fold(0.0_f64, f64::max);
         assert!(
-            (through_flex - rigid).abs() <= 1e-10
-                && (sd_through_flex - sd_rigid).abs() <= 1e-10
-                && scale_through_flex == scale_rigid,
-            "without flex coefficients the program's residual must be the rigid form's: q={q} \
-             slope={slope} flex=({through_flex:e}, {sd_through_flex:e}) rigid=({rigid:e}, \
-             {sd_rigid:e})"
+            (through_flex.residual - rigid.residual).abs() <= 1e-10
+                && (through_flex.law_variance.sqrt() - rigid.law_variance.sqrt()).abs() <= 1e-10
+                && largest_node_gap <= 1e-10
+                && through_flex.scale == rigid.scale,
+            "without flex coefficients the program's anchor must be the rigid form's: q={q} \
+             slope={slope} flex=({:e}, {:e}) rigid=({:e}, {:e}), largest node gap \
+             {largest_node_gap:e}",
+            through_flex.residual,
+            through_flex.law_variance.sqrt(),
+            rigid.residual,
+            rigid.law_variance.sqrt()
         );
     }
 }

@@ -3027,10 +3027,10 @@ impl BernoulliMarginalSlopeFamily {
         })
     }
 
-    /// The anchoring residual `Σ_k w_k Φ(η_k) − μ` at intercept `a` under the
-    /// finite law `grid`, the standard deviation of `Φ(η(U))` under that law, and
-    /// `μ` (gam#2926: the closed-form certificate reads all three).
-    pub(super) fn evaluate_empirical_grid_anchoring_residual(
+    /// The closed-form certificate's anchor at intercept `a` under the finite law
+    /// `grid` (gam#2926): the anchoring residual `Σ_k w_k Φ(η_k) − μ`, read from the
+    /// node probabilities `Φ(η(u_k))`, with `π(1−π) = μ(1−μ)`.
+    pub(super) fn empirical_grid_certificate_anchor(
         &self,
         a: f64,
         marginal_eta: f64,
@@ -3038,29 +3038,21 @@ impl BernoulliMarginalSlopeFamily {
         beta_h: Option<&Array1<f64>>,
         beta_w: Option<&Array1<f64>>,
         grid: &EmpiricalZGrid,
-    ) -> Result<(f64, f64, f64), String> {
+    ) -> Result<super::CertificateAnchor, String> {
         let marginal = self.marginal_link_map(marginal_eta)?;
         let mut probabilities = Vec::with_capacity(grid.nodes.len());
-        let mut mean = 0.0;
-        for (node, weight) in grid.pairs() {
+        for &node in &grid.nodes {
             let obs = self.observed_denested_cell_partials_at_z(node, a, slope, beta_h, beta_w)?;
-            let probability = normal_cdf(eval_coeff4_at(&obs.coeff, node));
-            mean += weight * probability;
-            probabilities.push(probability);
+            probabilities.push(normal_cdf(eval_coeff4_at(&obs.coeff, node)));
         }
-        let variance = grid
-            .weights
-            .iter()
-            .zip(probabilities.iter())
-            .map(|(&weight, &probability)| weight * (probability - mean) * (probability - mean))
-            .sum::<f64>();
-        if !(mean.is_finite() && variance.is_finite()) {
-            return Err(format!(
-                "empirical latent anchoring residual is not finite: mean={mean}, variance={variance} \
-                 at intercept={a}"
-            ));
-        }
-        Ok((mean - marginal.mu, variance.sqrt(), marginal.mu))
+        super::CertificateAnchor::on_law(
+            &grid.weights,
+            &probabilities,
+            marginal.mu,
+            1.0,
+            marginal.mu * (1.0 - marginal.mu),
+        )
+        .map_err(|reason| format!("empirical latent anchor at intercept={a}: {reason}"))
     }
 
     pub(super) fn evaluate_calibration_newton(

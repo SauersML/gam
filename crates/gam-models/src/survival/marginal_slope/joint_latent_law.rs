@@ -3397,7 +3397,8 @@ mod joint_latent_law_tests {
             let anchors = family
                 .closed_form_joint_certificate_anchors(row, &states, &gaussian, &mut workspace)
                 .expect("Gaussian certificate anchors");
-            for (residual, sd, scale) in anchors {
+            for anchor in anchors {
+                let (residual, sd, scale) = (anchor.residual, anchor.law_variance.sqrt(), anchor.scale);
                 assert!(
                     residual.abs() <= 1e-9,
                     "row {row}: the closed form solves the anchoring equation on a Gaussian law; \
@@ -3443,14 +3444,14 @@ mod joint_latent_law_tests {
                     .sum::<f64>()
                     - normal_cdf(-q);
                 assert!(
-                    (anchor.0 - direct).abs() <= 1e-12,
+                    (anchor.residual - direct).abs() <= 1e-12,
                     "row {row}, q={q}: certificate residual {} vs direct {direct}",
-                    anchor.0
+                    anchor.residual
                 );
                 assert!(
-                    (anchor.2 - normal_cdf(q) * normal_cdf(-q)).abs() <= 1e-15,
+                    (anchor.scale - normal_cdf(q) * normal_cdf(-q)).abs() <= 1e-15,
                     "row {row}: π(1−π) {}",
-                    anchor.2
+                    anchor.scale
                 );
                 largest = largest.max(direct.abs());
             }

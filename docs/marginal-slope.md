@@ -417,7 +417,7 @@ Every other law is a declaration, set with `config={"latent_measure": ...}`:
 | `latent_measure` | Law anchored on | When the score contradicts it |
 |---|---|---|
 | `"auto"` (default) | the closed form when the estimated law passes the adequacy check, else the estimated law, global or local by context | — |
-| `"gaussian"` | the closed form, `N(0, 1)` | refused when the conditional law moves; otherwise fitted with a warning and its `D̂` |
+| `"gaussian"` | the closed form, `N(0, 1)` | refused when the conditional law moves, or when the score fails the screen and `D̂ > z₀.₉₉₉·SE(D̂)`; otherwise fitted, with a warning and its `D̂` when the screen failed |
 | `"global-empirical"` | the pooled estimated law, whatever the span shows | — |
 | `"conditional-location-scale"` | `z = m(a) + √v(a)·ε` with `ε` on its estimated law; the slope lives on `ε`'s axis | — |
 
@@ -429,12 +429,16 @@ A Gaussian declaration is checked, never assumed. When `E[z|a]` or
 `Var(z|a)` moves on the span, no single declared law can be right, and the
 fit is refused with the p-values. When the pooled score fails the
 standard-normal adequacy screen (mean, SD, skewness, kurtosis, KS distance,
-tail mass, largest `|z|`), the declaration is fitted and the fit warns with
-the adequacy ledger and the declaration's estimated excess anchoring loss
-`D̂` at the converged fit, both recorded with the model. The screen is a
-level-0.05 test of the standard normal, and a failed test is not grounds to
-refuse a declaration: at large `n` it detects departures that cost no
-anchoring accuracy, and `D̂` measures what the departure costs. To fit the closed form
+tail mass, largest `|z|`), the declaration is judged by what the departure
+costs: the declaration's estimated excess anchoring loss `D̂` at the converged
+fit, and its standard error `SE(D̂)` over the score sample the estimated law
+was built from. When `D̂ > z₁₋α·SE(D̂)` at `α = 10⁻³`, one-sided, the declared
+anchor misstates the probabilities it anchors and the fit is refused, with
+`D̂`, `SE(D̂)` and the ledger in the message. Otherwise the declaration is
+fitted and the fit warns with the ledger and `D̂`, both recorded with the
+model. A failed screen alone is not grounds to refuse a declaration: at large
+`n` it detects departures that cost no anchoring accuracy, and `D̂` measures
+what the departure costs. To fit the closed form
 on purpose on a score that is not normal without the warning, declare a
 Gauss–Hermite law: it is the Gaussian case to quadrature tolerance.
 
