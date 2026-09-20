@@ -591,16 +591,11 @@ impl SelectionFactor {
             stacked_row += root.nrows();
             bordered_row += root.nrows();
         }
-        let Some(log_determinant) =
-            householder_triangularize(&mut self.stacked, &mut self.diagonal)
-        else {
+        if householder_triangularize(&mut self.stacked, &mut self.diagonal).is_none()
+            || householder_triangularize(&mut self.bordered, &mut self.bordered_diagonal).is_none()
+        {
             return false;
-        };
-        let Some(log_hessian) =
-            householder_triangularize(&mut self.bordered, &mut self.bordered_diagonal)
-        else {
-            return false;
-        };
+        }
         // `R̃ᵀR̃ = [M; I]ᵀ[M; I] = I + C`, kept as the lower factor `R̃ᵀ`.
         for row in 0..self.rank {
             for column in 0..self.rank {
@@ -611,7 +606,19 @@ impl SelectionFactor {
                 };
             }
         }
-        self.offset = 2.0 * (log_hessian - log_determinant);
+        // `2 Σ_j ln(|R̃_jj| / |R_jj|)`, one pivot pair at a time. `C ⪯ I + C`
+        // makes every leading block of `I + C` dominate that of `C`, so each
+        // Cholesky pivot of `I + C` is at least its partner in `C` and every
+        // term is `≥ 0`: the sum has nothing to cancel. The difference of the
+        // two log-determinants cancels instead, and on the upper-tail plateau,
+        // where both carry `r·ln λ`, what it leaves is rounding of that size.
+        self.offset = 2.0
+            * self
+                .diagonal
+                .iter()
+                .zip(&self.bordered_diagonal)
+                .map(|(plain, bordered)| (bordered.abs() / plain.abs()).ln())
+                .sum::<f64>();
         self.offset.is_finite()
     }
 
@@ -653,8 +660,9 @@ impl SelectionFactor {
     }
 
     /// The draw's criterion at the point last [`Self::refactor`]ed, with its exact
-    /// gradient and Hessian in `ρ = ln t` over EVERY scale, and the rounding bands
-    /// a Newton-decrement certificate is decided against.
+    /// gradient and Hessian in `ρ = ln t` over EVERY scale, and the absolute
+    /// summand sums their rounding is charged to. `None` when an entry is not
+    /// finite.
     ///
     /// # The derivatives are read off the two factorizations already formed
     ///
@@ -676,6 +684,10 @@ impl SelectionFactor {
     /// H_jk = δ_jk g_j − ⟨G̃_j, G̃_k⟩ + ⟨G_j, G_k⟩ − 2 y_j·y_k.
     /// ```
     ///
+    /// `H` without its `δ_jk g_j` term is the curvature `K` in `λ = e^ρ` that
+    /// [`SelectionDerivatives::stationarity_verdict`] reads, and it is kept
+    /// apart.
+    ///
     /// Every quantity is an inner product of rows of an orthonormal factor, so it
     /// inherits the row-graded accuracy the reductions were ordered for (see the
     /// type's doc) and never touches an assembled `C` or an inverse of `R`.
@@ -683,16 +695,14 @@ impl SelectionFactor {
     /// # Bands
     ///
     /// Each entry is an accumulation over the reductions' `rows · r` rounded
-    /// operations (the Householder backward-error bound, Higham Thm 19.4), so every
+    /// operations (the Householder backward-error bound, Higham Thm 19.4), so its
     /// band is [`gam_linalg::roundoff::accumulation_band`] at that depth over the
-    /// absolute sum of the entry's own summands. The Hessian's band is charged to
-    /// the Frobenius norm of the matrix of those sums, which bounds its spectral
-    /// norm.
-    fn jet(
+    /// absolute sum of the entry's own summands.
+    fn derivatives(
         &self,
         geometry: &SelectionGeometry,
         projected: &[f64],
-    ) -> Option<opt::SecondOrderSample> {
+    ) -> Option<SelectionDerivatives> {
         let rank = self.rank;
         let components = geometry.range_roots.len();
         if projected.len() != rank {
@@ -732,27 +742,27 @@ impl SelectionFactor {
         }
 
         let mut value = self.offset;
-        let mut magnitude = 0.0_f64;
+        let mut value_sum = 0.0_f64;
         for index in 0..rank {
             value += projected[index] * projected[index] - whitened[index] * whitened[index];
-            magnitude += 2.0
-                * (self.diagonal[index].abs().ln().abs()
-                    + self.bordered_diagonal[index].abs().ln().abs())
+            // A pivot pair's log-ratio carries its own size and each pivot's
+            // relative error, which is `O(1)` in the band's unit.
+            value_sum += 2.0
+                * ((self.bordered_diagonal[index].abs() / self.diagonal[index].abs())
+                    .ln()
+                    .abs()
+                    + 2.0)
                 + projected[index] * projected[index]
                 + whitened[index] * whitened[index];
         }
-        let depth = self.bordered.nrows() * rank;
         let mut gradient = Array1::<f64>::zeros(components);
-        let mut gradient_band = Array1::<f64>::zeros(components);
-        let mut diagonal_sum = vec![0.0_f64; components];
+        let mut gradient_sums = Array1::<f64>::zeros(components);
         for component in 0..components {
             let own_trace = bordered[component].diag().sum();
             let plain_trace = plain[component].diag().sum();
             let quadratic = whitened.dot(&mapped[component]);
             gradient[component] = own_trace - plain_trace + quadratic;
-            diagonal_sum[component] = own_trace + plain_trace + quadratic.abs();
-            gradient_band[component] =
-                gam_linalg::roundoff::accumulation_band(depth, diagonal_sum[component]);
+            gradient_sums[component] = own_trace + plain_trace + quadratic.abs();
         }
         let frobenius = |left: &Array2<f64>, right: &Array2<f64>| {
             left.iter()
@@ -760,126 +770,484 @@ impl SelectionFactor {
                 .map(|(a, b)| a * b)
                 .sum::<f64>()
         };
-        let mut hessian = Array2::<f64>::zeros((components, components));
-        let mut hessian_sums = 0.0_f64;
+        let mut curvature = Array2::<f64>::zeros((components, components));
+        let mut curvature_summands = Array2::<f64>::zeros((components, components));
         for row in 0..components {
             for column in row..components {
                 let own = frobenius(&bordered[row], &bordered[column]);
                 let base = frobenius(&plain[row], &plain[column]);
                 let coupling = mapped[row].dot(&mapped[column]);
-                let mut entry = -own + base - 2.0 * coupling;
-                let mut sum = own.abs() + base.abs() + 2.0 * coupling.abs();
-                if row == column {
-                    entry += gradient[row];
-                    sum += diagonal_sum[row];
-                }
-                hessian[[row, column]] = entry;
-                hessian[[column, row]] = entry;
-                let copies = if row == column { 1.0 } else { 2.0 };
-                hessian_sums += copies * sum * sum;
+                let entry = -own + base - 2.0 * coupling;
+                let sum = own.abs() + base.abs() + 2.0 * coupling.abs();
+                curvature[[row, column]] = entry;
+                curvature[[column, row]] = entry;
+                curvature_summands[[row, column]] = sum;
+                curvature_summands[[column, row]] = sum;
             }
+        }
+        let mut hessian = curvature.clone();
+        for component in 0..components {
+            hessian[[component, component]] += gradient[component];
         }
         let finite = value.is_finite()
             && gradient.iter().all(|entry| entry.is_finite())
-            && hessian.iter().all(|entry| entry.is_finite());
-        finite.then(|| opt::SecondOrderSample {
+            && hessian.iter().all(|entry| entry.is_finite())
+            && curvature.iter().all(|entry| entry.is_finite());
+        finite.then(|| SelectionDerivatives {
             value,
+            value_sum,
             gradient,
-            hessian: Some(hessian),
-            decrement_bands: Some(opt::DecrementBands {
-                objective: gam_linalg::roundoff::accumulation_band(depth, magnitude),
-                gradient: gradient_band,
-                hessian: gam_linalg::roundoff::accumulation_band(depth, hessian_sums.sqrt()),
-            }),
-        })
-    }
-}
-
-/// One draw's multi-scale criterion as a function of its OPEN scales, for
-/// [`opt::NewtonTrustRegion`]. A scale whose window is empty stays at the fitted
-/// point, `ln t = 0`.
-struct MultiscaleCriterion<'a> {
-    geometry: &'a SelectionGeometry,
-    factor: &'a mut SelectionFactor,
-    coordinates: &'a [f64],
-    open: &'a [usize],
-    point: Vec<f64>,
-}
-
-impl MultiscaleCriterion<'_> {
-    /// Factor the geometry at the full point `x` names. A point the reductions
-    /// refuse — a scale that overflows, a column that collapses — is outside the
-    /// criterion's domain, which the trust region answers by shrinking.
-    fn factor_at(&mut self, x: &Array1<f64>) -> Result<(), opt::ObjectiveEvalError> {
-        for (slot, &axis) in self.open.iter().enumerate() {
-            self.point[axis] = x[slot];
-        }
-        if self.factor.refactor(self.geometry, &self.point) {
-            Ok(())
-        } else {
-            Err(opt::ObjectiveEvalError::recoverable(
-                "the selection criterion cannot be factored at this point",
-            ))
-        }
-    }
-}
-
-impl opt::ZerothOrderObjective for MultiscaleCriterion<'_> {
-    fn eval_cost(&mut self, x: &Array1<f64>) -> Result<f64, opt::ObjectiveEvalError> {
-        self.factor_at(x)?;
-        let norm_squared = self.coordinates.iter().map(|value| value * value).sum();
-        Ok(self.factor.score(self.coordinates, norm_squared).0)
-    }
-}
-
-impl opt::FirstOrderObjective for MultiscaleCriterion<'_> {
-    fn eval_grad(
-        &mut self,
-        x: &Array1<f64>,
-    ) -> Result<opt::FirstOrderSample, opt::ObjectiveEvalError> {
-        let sample = opt::SecondOrderObjective::eval_hessian(self, x)?;
-        Ok(opt::FirstOrderSample {
-            value: sample.value,
-            gradient: sample.gradient,
-        })
-    }
-}
-
-impl opt::SecondOrderObjective for MultiscaleCriterion<'_> {
-    fn eval_hessian(
-        &mut self,
-        x: &Array1<f64>,
-    ) -> Result<opt::SecondOrderSample, opt::ObjectiveEvalError> {
-        self.factor_at(x)?;
-        let full = self
-            .factor
-            .jet(self.geometry, self.coordinates)
-            .ok_or_else(|| {
-                opt::ObjectiveEvalError::recoverable(
-                    "the selection criterion's derivatives are not finite at this point",
-                )
-            })?;
-        let open = self.open;
-        let restrict = |full: &Array1<f64>| Array1::from_iter(open.iter().map(|&axis| full[axis]));
-        let hessian = full.hessian.as_ref().map(|hessian| {
-            Array2::from_shape_fn((open.len(), open.len()), |(row, column)| {
-                hessian[[open[row], open[column]]]
-            })
-        });
-        let bands = full
-            .decrement_bands
-            .as_ref()
-            .map(|bands| opt::DecrementBands {
-                objective: bands.objective,
-                gradient: restrict(&bands.gradient),
-                hessian: bands.hessian,
-            });
-        Ok(opt::SecondOrderSample {
-            value: full.value,
-            gradient: restrict(&full.gradient),
+            gradient_sums,
             hessian,
-            decrement_bands: bands,
+            curvature,
+            curvature_summands,
+            depth: self.bordered.nrows() * rank,
         })
+    }
+}
+
+/// [`SelectionFactor::derivatives`]: the criterion's exact derivatives over
+/// every scale, and the absolute sums of each quantity's summands.
+struct SelectionDerivatives {
+    value: f64,
+    value_sum: f64,
+    gradient: Array1<f64>,
+    gradient_sums: Array1<f64>,
+    hessian: Array2<f64>,
+    /// `K = H − diag(g)`, the curvature in the scales themselves; see
+    /// [`Self::stationarity_verdict`].
+    curvature: Array2<f64>,
+    /// The absolute sum of `K_jk`'s summands.
+    curvature_summands: Array2<f64>,
+    /// The reductions' `rows · r` rounded operations every sum accumulates over.
+    depth: usize,
+}
+
+impl SelectionDerivatives {
+    /// The box-constrained stationarity verdict over the `open` scales at
+    /// `point`, the point these derivatives were read at, inside `windows`.
+    ///
+    /// The point certifies when the quadratic model of the criterion in either
+    /// of two coordinates, `ρ` itself or the relative step in `λ = e^ρ`, can
+    /// reach no decrease inside the windows above the criterion's rounding band
+    /// ([`Self::model_verdict`]). Both are its exact second-order Taylor model at
+    /// the point, and each certificate says the point is box-stationary to
+    /// working precision. They differ only by `diag(g)`, and each is blind where
+    /// the other sees:
+    ///
+    /// - A split penalty is flat in `λ` and curved in `ρ`, where `diag(g)`
+    ///   carries rounding-sized slopes of either sign that read as a saddle.
+    /// - A scale deep in its lower tail, `λ_j → 0`, is resolved in `ρ`, where the
+    ///   criterion flattens as `e^{ρ_j}`. In `λ` its window stretches to
+    ///   `e^{hi_j − ρ_j}` times its scale, and any coupling to another scale
+    ///   reads as a saddle the whole stretched window can feel.
+    ///
+    /// When neither certifies, the verdict in `λ` is the one reported.
+    fn stationarity_verdict(
+        &self,
+        point: &[f64],
+        windows: &[(f64, f64)],
+        open: &[usize],
+    ) -> Option<opt::DecrementVerdict> {
+        let scales = self.model_verdict(ModelCoordinates::Scales, point, windows, open);
+        if scales
+            .as_ref()
+            .is_some_and(opt::DecrementVerdict::is_certified)
+        {
+            return scales;
+        }
+        match self.model_verdict(ModelCoordinates::LogScales, point, windows, open) {
+            Some(verdict) if verdict.is_certified() => Some(verdict),
+            _ => scales,
+        }
+    }
+
+    /// The box-constrained stationarity verdict of the quadratic model in
+    /// `coordinates`; see [`Self::stationarity_verdict`].
+    ///
+    /// # The two models
+    ///
+    /// With `f(ρ) = F(e^ρ)` and `Λ = diag(e^ρ)`, the Hessian in `ρ` is
+    /// `H = K + diag(g)`, where `K = Λ F_λλ Λ` is the curvature in `λ = e^ρ`,
+    /// measured relative to the point. The criterion is a function of
+    /// `C = Σ_j λ_j C_j`, affine in `λ`, so a combination of scales `C` does not
+    /// see is a straight flat line in `λ` and a curve in `ρ`. Stepping
+    /// `ρ_j → ρ_j + s_j` or `λ_j → λ_j(1 + δ_j)`, the two models are
+    ///
+    /// ```text
+    /// q(s) = gᵀs + ½ sᵀHs,   lo_j − ρ_j ≤ s_j ≤ hi_j − ρ_j,
+    /// q(δ) = gᵀδ + ½ δᵀKδ,   e^{lo_j − ρ_j} − 1 ≤ δ_j ≤ e^{hi_j − ρ_j} − 1,
+    /// ```
+    ///
+    /// and in either the window stays an axis-aligned box. What follows reads
+    /// `K` and `δ` for the model's curvature and step in either.
+    ///
+    /// # What certifies
+    ///
+    /// A scale at a wall whose descent direction `−g_j` leaves the window is
+    /// KKT-active: its optimality is the sign of `g_j`, and it is fixed. On the
+    /// others split `K = K₊ + K₋` by the sign of its spectrum, with every
+    /// eigenvalue within `r`, its resolution, read as flat. The decrease the
+    /// model can still reach inside the box is then bounded for every split of
+    /// the free scales into `A` and `F`:
+    ///
+    /// ```text
+    /// −min_box q  ≤  Σ_{j∈A} |g_j| d_j  +  ½ t_Fᵀ K₊⁺ t_F  +  ½ |μ_min| max_box ‖δ‖².
+    /// ```
+    ///
+    /// `d_j` is the distance from `δ_j = 0` to the wall that the descent direction
+    /// meets, and `t_F` is `g` with its `A` entries zeroed. On the box,
+    /// `g_j δ_j ≥ −|g_j| d_j`. Over all of `ℝ^m`, `t_Fᵀδ + ½ δᵀK₊δ` is bounded
+    /// below by the decrement, which is finite only when `t_F` has no resolved
+    /// part in `K₊`'s flat directions. `A = ∅` gives the plain Newton decrement.
+    /// Putting a scale that sits a hair from its wall into `A` charges it the
+    /// small step to that wall, not a Newton step that overshoots it. Once every
+    /// scale is in `A`, the gradient's own slopes bound the decrease, so some
+    /// split always gives a finite bound.
+    ///
+    /// The last term is the most the resolved negative curvature can take off
+    /// anywhere in the box, at its farthest corner, and is zero when `K` has
+    /// none. It is what lets a plateau pass: there the curvature is resolved to
+    /// its own tiny summands, so a negative eigenvalue can be resolved and still
+    /// move the criterion by far less than its rounding over the whole window.
+    /// A negative curvature the box can feel keeps the point from certifying,
+    /// and is reported as such.
+    ///
+    /// The certificate takes the smallest `λ² = 2·bound` over the `2^m` splits.
+    /// It passes when `λ² + band_λ² ≤ band_f`, the bar of
+    /// [`opt::newton_decrement_verdict`]. Its bands propagate the same way.
+    ///
+    /// # Why the curvature is scaled first
+    ///
+    /// The entries' rounding is not one size. A scale near its wall owns
+    /// summands many orders of magnitude below those of a scale in the bulk, and
+    /// its curvature is resolved to that smaller size. A single spectral band has
+    /// to cover the largest entry's error. It then swamps the small scale's
+    /// curvature and reads a resolved direction as flat.
+    ///
+    /// Let `S_jk` be the absolute sum of the curvature's summands, with `H_jj`'s
+    /// also carrying `g_j`'s, and `D = diag(√S_jj)`. The spectrum is read on
+    /// `D⁻¹KD⁻¹` with the gradient `D⁻¹g`. The bound is unchanged by the
+    /// scaling, so the certificate's bar and the objective band are the same
+    /// ones; only the resolution moves. The scaled entries' errors are bounded by
+    /// `S_jk/√(S_jj S_kk)`, and their Frobenius norm over the free block is the
+    /// scaled curvature's band. Each gradient band is divided by its own `√S_jj`.
+    /// A scale whose summands all vanish has an exactly zero row and is left
+    /// unscaled.
+    fn model_verdict(
+        &self,
+        coordinates: ModelCoordinates,
+        point: &[f64],
+        windows: &[(f64, f64)],
+        open: &[usize],
+    ) -> Option<opt::DecrementVerdict> {
+        use opt::{DecrementEvidence, DecrementVerdict};
+        let derivatives = self;
+        let band = |sum: f64| gam_linalg::roundoff::accumulation_band(derivatives.depth, sum);
+        let objective = band(derivatives.value_sum);
+        let free: Vec<usize> = open
+            .iter()
+            .copied()
+            .filter(|&axis| !held_by_window(point, windows, open, axis, derivatives.gradient[axis]))
+            .collect();
+        let dimension = free.len();
+        let entry = |row: usize, column: usize| match coordinates {
+            ModelCoordinates::LogScales => derivatives.hessian[[row, column]],
+            ModelCoordinates::Scales => derivatives.curvature[[row, column]],
+        };
+        let summand = |row: usize, column: usize| {
+            let own = match coordinates {
+                ModelCoordinates::LogScales if row == column => derivatives.gradient_sums[row],
+                _ => 0.0,
+            };
+            derivatives.curvature_summands[[row, column]] + own
+        };
+        if dimension == 0 {
+            return Some(DecrementVerdict::Certified(DecrementEvidence {
+                lambda_sq: 0.0,
+                band_lambda_sq: 0.0,
+                band_f: objective,
+                retained: 0,
+                flat: 0,
+                curvature_resolution: 0.0,
+            }));
+        }
+        let scaling: Vec<f64> = free
+            .iter()
+            .map(|&axis| {
+                let root = summand(axis, axis).sqrt();
+                if root > 0.0 { root } else { 1.0 }
+            })
+            .collect();
+        let curvature = Array2::from_shape_fn((dimension, dimension), |(row, column)| {
+            entry(free[row], free[column]) / (scaling[row] * scaling[column])
+        });
+        let mut curvature_sums = 0.0_f64;
+        for row in 0..dimension {
+            for column in 0..dimension {
+                let sum = summand(free[row], free[column]) / (scaling[row] * scaling[column]);
+                curvature_sums += sum * sum;
+            }
+        }
+        let Ok((eigenvalues, eigenvectors)) =
+            gam_linalg::faer_ndarray::strict_symmetric_eigh(&curvature, faer::Side::Lower)
+        else {
+            return Some(DecrementVerdict::DecompositionFailed);
+        };
+        let resolution =
+            gam_linalg::roundoff::symmetric_spectrum_rounding_band(&eigenvalues.to_vec())
+                + band(curvature_sums.sqrt());
+        let minimum = eigenvalues.iter().copied().fold(f64::INFINITY, f64::min);
+        // `2 · ½|μ_min| ‖Dδ‖²` at the box's farthest corner, with its band.
+        let (negative, negative_band) = if minimum < -resolution {
+            let extent = free
+                .iter()
+                .zip(&scaling)
+                .map(|(&axis, scale)| {
+                    let (low, high) = windows[axis];
+                    let side = coordinates
+                        .step(high - point[axis])
+                        .max(-coordinates.step(low - point[axis]))
+                        * scale;
+                    side * side
+                })
+                .sum::<f64>();
+            (-minimum * extent, resolution * extent)
+        } else {
+            (0.0, 0.0)
+        };
+        let gradient: Vec<f64> = free
+            .iter()
+            .zip(&scaling)
+            .map(|(&axis, scale)| derivatives.gradient[axis] / scale)
+            .collect();
+        let gradient_band: Vec<f64> = free
+            .iter()
+            .zip(&scaling)
+            .map(|(&axis, scale)| band(derivatives.gradient_sums[axis]) / scale)
+            .collect();
+        // `d_j`, the distance in `δ_j` to the wall the descent direction meets.
+        let reach: Vec<f64> = free
+            .iter()
+            .map(|&axis| {
+                let (low, high) = windows[axis];
+                let slope = derivatives.gradient[axis];
+                if slope < 0.0 {
+                    coordinates.step(high - point[axis])
+                } else if slope > 0.0 {
+                    -coordinates.step(low - point[axis])
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        // `c_i = Σ_j W_ji t_j` is a `m`-term accumulation; `λ²` sums `2m` quotients.
+        let projection_growth = gam_linalg::roundoff::accumulation_growth(dimension);
+        let quotient_growth = gam_linalg::roundoff::accumulation_growth(2 * dimension);
+        let mut best: Option<DecrementEvidence> = None;
+        'splits: for split in 0..(1_usize << dimension) {
+            let walled = |slot: usize| split & (1 << slot) != 0;
+            let mut lambda_sq = negative;
+            let mut band_lambda_sq = negative_band;
+            for slot in (0..dimension).filter(|&slot| walled(slot)) {
+                let axis = free[slot];
+                lambda_sq += 2.0 * derivatives.gradient[axis].abs() * reach[slot];
+                band_lambda_sq += 2.0 * band(derivatives.gradient_sums[axis]) * reach[slot];
+            }
+            let (mut retained, mut flat) = (0usize, 0usize);
+            for direction in 0..dimension {
+                let (mut coordinate, mut propagated, mut magnitude) = (0.0_f64, 0.0_f64, 0.0_f64);
+                for slot in (0..dimension).filter(|&slot| !walled(slot)) {
+                    let weight = eigenvectors[[slot, direction]];
+                    coordinate += weight * gradient[slot];
+                    propagated += weight.abs() * gradient_band[slot];
+                    magnitude += (weight * gradient[slot]).abs();
+                }
+                let coordinate_band = propagated + projection_growth * magnitude;
+                let value = eigenvalues[direction];
+                if value <= resolution {
+                    // A resolved slope along a flat direction: this split's
+                    // relaxation is unbounded below.
+                    if coordinate.abs() > coordinate_band {
+                        continue 'splits;
+                    }
+                    flat += 1;
+                    continue;
+                }
+                retained += 1;
+                lambda_sq += coordinate * coordinate / value;
+                band_lambda_sq += 2.0 * coordinate.abs() * coordinate_band / value
+                    + coordinate * coordinate * resolution / (value * value);
+            }
+            band_lambda_sq += quotient_growth * lambda_sq;
+            if best.is_none_or(|kept| {
+                lambda_sq + band_lambda_sq < kept.lambda_sq + kept.band_lambda_sq
+            }) {
+                best = Some(DecrementEvidence {
+                    lambda_sq,
+                    band_lambda_sq,
+                    band_f: objective,
+                    retained,
+                    flat,
+                    curvature_resolution: resolution,
+                });
+            }
+        }
+        // The split that walls every scale has `t_F = 0` and is always bounded.
+        let evidence = best?;
+        Some(
+            if !(evidence.lambda_sq.is_finite()
+                && evidence.band_lambda_sq.is_finite()
+                && objective.is_finite())
+            {
+                DecrementVerdict::DecrementUnresolved(evidence)
+            } else if evidence.lambda_sq + evidence.band_lambda_sq <= objective {
+                DecrementVerdict::Certified(evidence)
+            } else if minimum < -resolution {
+                DecrementVerdict::NotPositiveDefinite {
+                    min_curvature: minimum,
+                    curvature_resolution: resolution,
+                }
+            } else if evidence.band_lambda_sq >= objective {
+                DecrementVerdict::DecrementUnresolved(evidence)
+            } else {
+                DecrementVerdict::DecrementAboveTolerance(evidence)
+            },
+        )
+    }
+}
+
+/// The coordinates [`SelectionDerivatives::model_verdict`] reads the
+/// criterion's quadratic model in.
+#[derive(Clone, Copy)]
+enum ModelCoordinates {
+    /// `ρ`, the log-scales the windows are drawn in; the curvature is `H`.
+    LogScales,
+    /// The relative step `δ` in `λ = e^ρ`; the curvature is `K`.
+    Scales,
+}
+
+impl ModelCoordinates {
+    /// The model's step for a move by `distance` in `ρ`.
+    fn step(self, distance: f64) -> f64 {
+        match self {
+            Self::LogScales => distance,
+            Self::Scales => distance.exp_m1(),
+        }
+    }
+}
+
+/// Whether `scale` is held at `point`: its window is closed, or it sits on a
+/// wall with the descent direction `−slope` leaving the window there.
+fn held_by_window(
+    point: &[f64],
+    windows: &[(f64, f64)],
+    open: &[usize],
+    scale: usize,
+    slope: f64,
+) -> bool {
+    let (low, high) = windows[scale];
+    !open.contains(&scale)
+        || (point[scale] <= low && slope > 0.0)
+        || (point[scale] >= high && slope < 0.0)
+}
+
+/// The minimizer of the model `gᵀs + ½ sᵀHs` over `‖s‖ ≤ radius`, from the
+/// spectrum `H = V diag(μ) Vᵀ`, with whether it lies on the boundary.
+///
+/// It is the Moré–Sorensen characterization solved on the spectrum itself. The
+/// minimizer is `s(σ) = −Σ_i c_i/(μ_i + σ) v_i` with `c_i = v_iᵀg`, for the
+/// smallest shift `σ ≥ max(0, −μ_min)` that puts it inside the radius. When
+/// `H` is positive definite and the Newton step `s(0)` fits, that is the step.
+/// Otherwise `‖s(σ)‖` falls strictly on `(max(0, −μ_min), ∞)` and is at most
+/// the radius at `max(0, −μ_min) + ‖g‖/radius`, where every `μ_i + σ` is at
+/// least `‖g‖/radius`, so the shift is bisected between the two until the
+/// midpoint is one of them in floating point, keeping the side inside the
+/// radius. A direction with `c_i = 0` exactly carries none of the step.
+///
+/// When `H` is not positive definite and the step at the shift `−μ_min` is
+/// still short of the radius, which happens only when `g` has no part along
+/// the lowest eigenvector (the hard case), the step is carried to the boundary
+/// along that eigenvector, in whichever sense gives the lower model (the
+/// positive root on a tie).
+fn trust_region_step(
+    eigenvalues: &Array1<f64>,
+    eigenvectors: &Array2<f64>,
+    gradient: &Array1<f64>,
+    radius: f64,
+) -> (Array1<f64>, bool) {
+    let dimension = gradient.len();
+    let coefficients: Vec<f64> = (0..dimension)
+        .map(|direction| eigenvectors.column(direction).dot(gradient))
+        .collect();
+    let step_at = |shift: f64| {
+        let mut step = Array1::<f64>::zeros(dimension);
+        for direction in 0..dimension {
+            if coefficients[direction] != 0.0 {
+                step.scaled_add(
+                    -coefficients[direction] / (eigenvalues[direction] + shift),
+                    &eigenvectors.column(direction),
+                );
+            }
+        }
+        step
+    };
+    let norm = |step: &Array1<f64>| step.dot(step).sqrt();
+    let (lowest, smallest) = eigenvalues.iter().copied().enumerate().fold(
+        (0usize, f64::INFINITY),
+        |(kept, least), (direction, value)| {
+            if value < least {
+                (direction, value)
+            } else {
+                (kept, least)
+            }
+        },
+    );
+    if smallest > 0.0 {
+        let newton = step_at(0.0);
+        if norm(&newton) <= radius {
+            return (newton, false);
+        }
+    }
+    let floor = (-smallest).max(0.0);
+    let (mut low, mut high) = (floor, floor + norm(gradient) / radius);
+    loop {
+        let middle = 0.5 * (low + high);
+        if middle <= low || middle >= high {
+            break;
+        }
+        if norm(&step_at(middle)) > radius {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    let step = step_at(high);
+    let length = norm(&step);
+    if smallest > 0.0 || length >= radius {
+        return (step, true);
+    }
+    // `‖s + τv‖ = radius` with `‖v‖ = 1`: `τ² + 2τ sᵀv + ‖s‖² − radius² = 0`.
+    let direction = eigenvectors.column(lowest);
+    let along = step.dot(&direction);
+    let reach = (along * along + (radius * radius - length * length)).sqrt();
+    let model = |step: &Array1<f64>| {
+        (0..dimension)
+            .map(|index| {
+                let coordinate = eigenvectors.column(index).dot(step);
+                coefficients[index] * coordinate
+                    + 0.5 * eigenvalues[index] * coordinate * coordinate
+            })
+            .sum::<f64>()
+    };
+    let mut forward = step.clone();
+    forward.scaled_add(reach - along, &direction);
+    let mut backward = step;
+    backward.scaled_add(-reach - along, &direction);
+    if model(&backward) < model(&forward) {
+        (backward, true)
+    } else {
+        (forward, true)
     }
 }
 
@@ -2127,10 +2495,10 @@ impl SmoothLrSelectionReplay {
     ///
     /// The criterion is smooth in `ρ = ln t` and its gradient and Hessian are
     /// exact inner products of the two factorizations that already price it
-    /// ([`SelectionFactor::jet`]). Each draw's selection is therefore the
-    /// box-constrained trust-region Newton descent of [`opt::NewtonTrustRegion`]
-    /// over the open scales jointly, stopped by the Newton-decrement certificate
-    /// on those derivatives' rounding bands. See [`Self::select_draw`].
+    /// ([`SelectionFactor::derivatives`]). Each draw's selection is therefore a
+    /// box-constrained trust-region Newton descent over the open scales jointly,
+    /// stopped only by a stationarity certificate on those derivatives' rounding
+    /// bands. See [`Self::select_draw`].
     ///
     /// This replaces, first, a `441`-point bracket grid followed by a compass
     /// descent capped at `96` criterion evaluations per draw (#2902: SPEC rules
@@ -2236,18 +2604,38 @@ impl SmoothLrSelectionReplay {
     /// left factored there.
     ///
     /// The draw starts at the fitted point, clamped into each open window, and
-    /// [`opt::NewtonTrustRegion`] descends the criterion over the open scales
-    /// jointly, inside their windows, on its exact gradient and Hessian. It stops
-    /// only when the Newton decrement over the free scales is certified below the
-    /// criterion's own rounding band: the point is then a stationary point of the
-    /// box-constrained criterion to working precision, a scale at its wall counted
-    /// free only while the gradient points back into the window. There is no
-    /// iteration budget. The trust region accepts only steps that lower the
-    /// criterion, which is bounded below on the box, so it cannot cycle.
+    /// descends the criterion over the open scales jointly, inside their windows,
+    /// by trust-region Newton on its exact gradient and Hessian in `ρ`. Each
+    /// iterate is first put to [`SelectionDerivatives::stationarity_verdict`],
+    /// and the certificate is the only way the descent succeeds: the decrease the
+    /// quadratic model can still reach inside the windows is below the
+    /// criterion's own rounding band, so the point is a stationary point of the
+    /// box-constrained criterion to working precision.
     ///
-    /// Every other end of the descent — a radius that collapses without a
-    /// certificate, a point the factorizations cannot price — is
-    /// `SelectionUnresolved`, never the best point reached.
+    /// Otherwise the scales a wall does not hold take the exact minimizer of the
+    /// Newton model inside the radius ([`trust_region_step`]), projected onto
+    /// the windows. The model's predicted decrease is priced on that projected
+    /// step, and [`opt::TrustRegionPolicy::classic`] accepts a trial that lowers
+    /// the criterion by a fraction of it and sizes the next radius. The radius
+    /// starts at, and never exceeds, the windows' diameter.
+    ///
+    /// There is no iteration budget and no radius floor. An accepted step lowers
+    /// the criterion, which is bounded below on the box, so the descent cannot
+    /// cycle. A rejected step shrinks the radius, and a radius too small to move
+    /// the point in floating point ends the draw as `SelectionUnresolved`, as
+    /// does a point the factorizations cannot price. Neither is ever replaced by
+    /// the best point reached.
+    ///
+    /// # Why the descent is not `opt`'s
+    ///
+    /// Along the upper-tail plateau `f ≈ a + b e^{−ρ}`, where `H ≈ −g` and a
+    /// Newton step moves `ρ` by one, the curvature the certificate has to resolve
+    /// is that of the criterion's own rounding, far below any absolute constant.
+    /// [`opt::Arc`] floors its model shift at `1e-8` and so steps by `g/1e-8`
+    /// there, and [`opt::NewtonTrustRegion`] takes the unshifted Newton step of an
+    /// indefinite Hessian. Both stop short of a certifiable point on the fixtures
+    /// below. This subproblem is solved exactly on the Hessian's own spectrum,
+    /// with no absolute scale anywhere.
     ///
     /// The selection is a deterministic function of the draw, and the observation
     /// goes through the same function, so the replay's law is the law of the
@@ -2272,34 +2660,94 @@ impl SmoothLrSelectionReplay {
                 0.0
             };
         }
-        if !open.is_empty() {
-            let lower = Array1::from_iter(open.iter().map(|&axis| log_scale_windows[axis].0));
-            let upper = Array1::from_iter(open.iter().map(|&axis| log_scale_windows[axis].1));
-            let start = Array1::from_iter(open.iter().map(|&axis| selected[axis]));
-            let bounds = opt::Bounds::new(lower, upper, 0.0).map_err(|_| SelectionUnresolved)?;
-            let unbounded = opt::MaxIterations::new(usize::MAX).map_err(|_| SelectionUnresolved)?;
-            let criterion = MultiscaleCriterion {
-                geometry,
-                factor: &mut *factor,
-                coordinates,
-                open: &open,
-                point: selected.to_vec(),
-            };
-            let solution = opt::NewtonTrustRegion::new(start, criterion)
-                .with_bounds(bounds)
-                .with_profile(opt::Profile::Deterministic)
-                .with_max_iterations(unbounded)
-                .run()
-                .map_err(|_| SelectionUnresolved)?;
-            for (slot, &axis) in open.iter().enumerate() {
-                selected[axis] = solution.final_point[slot];
-            }
+        if !factor.refactor(geometry, selected) {
+            return Err(SelectionUnresolved);
         }
-        // The descent's last evaluation may have been a rejected trial.
-        if factor.refactor(geometry, selected) {
-            Ok(())
-        } else {
-            Err(SelectionUnresolved)
+        if open.is_empty() {
+            return Ok(());
+        }
+        let diameter = open
+            .iter()
+            .map(|&axis| {
+                let (low, high) = log_scale_windows[axis];
+                (high - low) * (high - low)
+            })
+            .sum::<f64>()
+            .sqrt();
+        let policy = opt::TrustRegionPolicy::classic(diameter);
+        let mut radius = diameter;
+        let mut current = factor
+            .derivatives(geometry, coordinates)
+            .ok_or(SelectionUnresolved)?;
+        let mut trial = selected.to_vec();
+        loop {
+            // `factor` is at `selected` whenever the verdict is read.
+            match current.stationarity_verdict(selected, log_scale_windows, &open) {
+                Some(verdict) if verdict.is_certified() => return Ok(()),
+                Some(_) => {}
+                None => return Err(SelectionUnresolved),
+            }
+            // Not empty: a point with every scale held certifies.
+            let free: Vec<usize> = open
+                .iter()
+                .copied()
+                .filter(|&axis| {
+                    !held_by_window(
+                        selected,
+                        log_scale_windows,
+                        &open,
+                        axis,
+                        current.gradient[axis],
+                    )
+                })
+                .collect();
+            let gradient = Array1::from_iter(free.iter().map(|&axis| current.gradient[axis]));
+            let hessian = Array2::from_shape_fn((free.len(), free.len()), |(row, column)| {
+                current.hessian[[free[row], free[column]]]
+            });
+            let (eigenvalues, eigenvectors) =
+                gam_linalg::faer_ndarray::strict_symmetric_eigh(&hessian, faer::Side::Lower)
+                    .map_err(|_| SelectionUnresolved)?;
+            loop {
+                let (step, on_boundary) =
+                    trust_region_step(&eigenvalues, &eigenvectors, &gradient, radius);
+                for (slot, &axis) in free.iter().enumerate() {
+                    let (low, high) = log_scale_windows[axis];
+                    trial[axis] = (selected[axis] + step[slot]).clamp(low, high);
+                }
+                if trial == selected {
+                    return Err(SelectionUnresolved);
+                }
+                let projected =
+                    Array1::from_iter(free.iter().map(|&axis| trial[axis] - selected[axis]));
+                let predicted =
+                    -(gradient.dot(&projected) + 0.5 * projected.dot(&hessian.dot(&projected)));
+                let candidate = if factor.refactor(geometry, &trial) {
+                    factor.derivatives(geometry, coordinates)
+                } else {
+                    None
+                };
+                let actual = candidate.as_ref().map_or(f64::NEG_INFINITY, |candidate| {
+                    current.value - candidate.value
+                });
+                let decision = policy.update(
+                    radius,
+                    step.dot(&step).sqrt(),
+                    on_boundary,
+                    actual,
+                    predicted,
+                    current.value,
+                );
+                radius = decision.new_radius;
+                if decision.accepted
+                    && let Some(candidate) = candidate
+                {
+                    selected.copy_from_slice(&trial);
+                    current = candidate;
+                    break;
+                }
+                trial.copy_from_slice(selected);
+            }
         }
     }
 
@@ -3782,8 +4230,10 @@ mod selection_replay_tests {
                     factor.refactor(geometry, &log_t),
                     "{label} {log_t:?}: refused"
                 );
-                let jet = factor.jet(geometry, &coordinates).expect("finite jet");
-                let hessian = jet.hessian.clone().expect("a Hessian");
+                let jet = factor
+                    .derivatives(geometry, &coordinates)
+                    .expect("finite derivatives");
+                let hessian = jet.hessian.clone();
                 let evaluated = geometry.at(&log_t).expect("eigen route");
                 // Per scale (index 0, 1) and over both (index 2):
                 // `(Σ c²g + Σ s, Σ c²g(1 − 2s) + Σ g, owned rank)`.
@@ -3860,11 +4310,10 @@ mod selection_replay_tests {
     /// of the box-constrained criterion, and a local minimum of it.
     ///
     /// This is the claim [`SmoothLrSelectionReplay::select_draw`] makes, checked
-    /// at the point it returns through the jet and the canonical evaluator. With a
-    /// scale at its wall held only while its gradient points out of the window,
-    /// the Newton decrement over the free scales must certify against the
-    /// criterion's rounding bands, and no probe in a small box around the
-    /// selection may undercut it.
+    /// at the point it returns through the derivatives and the canonical
+    /// evaluator. The decrease the model can still reach inside the windows must
+    /// certify against the criterion's rounding bands, and no probe in a small
+    /// box around the selection may undercut it.
     #[test]
     fn multiscale_selection_is_a_certified_box_stationary_point_2902() {
         let (separable, coupled) = separable_and_coupled();
@@ -3888,25 +4337,15 @@ mod selection_replay_tests {
                 .unwrap_or_else(|decline| {
                     panic!("{label} draw {index}: no certified selection ({decline:?})")
                 });
-                let jet = factor.jet(geometry, &coordinates).expect("finite jet");
-                let hessian = jet.hessian.clone().expect("a Hessian");
-                let bands = jet.decrement_bands.clone().expect("bands");
-                // A scale is held by its wall exactly when the descent direction
-                // `−g` leaves the window there.
-                let active: Vec<bool> = (0..2)
-                    .map(|axis| {
-                        let (low, high) = windows[axis];
-                        let slope = jet.gradient[axis];
-                        (selected[axis] == low && slope > 0.0)
-                            || (selected[axis] == high && slope < 0.0)
-                    })
-                    .collect();
-                let verdict =
-                    opt::newton_decrement_verdict(&hessian, &jet.gradient, Some(&active), &bands);
+                let verdict = factor
+                    .derivatives(geometry, &coordinates)
+                    .expect("finite derivatives")
+                    .stationarity_verdict(&selected, &windows, &[0, 1])
+                    .expect("a bounded split");
                 assert!(
                     verdict.is_certified(),
-                    "{label} draw {index}: the selection {selected:?} (held {active:?}) is not a \
-                     certified box-stationary point: {verdict:?}"
+                    "{label} draw {index}: the selection {selected:?} is not a certified \
+                     box-stationary point: {verdict:?}"
                 );
                 let at_selected = factor.score(&coordinates, norm_squared).0;
                 let tolerance = 1e-10 * (1.0 + at_selected.abs());
