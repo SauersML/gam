@@ -702,76 +702,114 @@ pub(crate) fn lawley_bartlett_factor_estimated_lambda<'py>(
 // #939 deliverable 3 — Skovgaard modified directed root r* for a scalar functional
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Skovgaard-style modified directed likelihood root `r*` for a **scalar**
-/// interest parameter `ψ = cᵀβ` (issue #939, deliverable 3), assembled from the
-/// fitted-model matrices. Two approximations beyond the exact theory apply —
-/// see the `gam::inference::skovgaard` module accuracy contract: (1) the
-/// leading-Taylor surrogate `q̃ ≈ (θ̂−θ₀)·var[U]` (exact for canonical
-/// exponential families, an extra `O(n⁻¹)` otherwise, so second-order rather
-/// than third-order in general), and (2) the penalized Hessian supplies MAP
-/// curvature, not pure likelihood information, so with a non-negligible
-/// penalty on the interest direction the p-values describe the penalized
-/// surrogate.
+/// Skovgaard's modified directed likelihood root `r*` for a **scalar** interest
+/// parameter `ψ = cᵀβ` with the remaining coefficients as nuisance (issue #939,
+/// deliverable 3; #3535). This exposes
+/// [`gam::inference::skovgaard::skovgaard_r_star_with_nuisance`] on the clean
+/// `gamfit` surface; the formula and its accuracy contract are in the
+/// `gam::inference::skovgaard` module documentation.
 ///
-/// This exposes [`gam::inference::skovgaard::scalar_skovgaard_from_matrices`] on
-/// the clean `gamfit` surface (the in-tree implementation was certified against
-/// the Exponential / logistic-location closed forms but was previously
-/// unreachable). Ingredients, all from the fitted penalized GLM:
-/// * `contrast` (`c`) — the functional gradient `∂ψ/∂β` (a prediction row for a
-///   point-on-curve, a row difference for a contrast, or any linear gradient).
-/// * `beta` (`β̂`) — fitted coefficients; `ψ̂ = cᵀβ̂`.
-/// * `penalized_hessian` (`Ĥ = X'WX + S_λ`) — the curvature used as observed
-///   information (MAP curvature when `S_λ ≠ 0`; see the accuracy note above).
-/// * `fisher_information` (`Iₑ = X'WX`, optional) — the **expected** (Fisher)
-///   information; omit for a canonical link, where `î = ĵ` and the curvature
-///   factor is `1`.
-/// * `row_scores` (`sᵢ = ∂ℓᵢ/∂β`, `n × p`) — per-row scores for the empirical
-///   (sandwich) covariance companion.
-/// * `lr_statistic` (`W = 2[ℓ(β̂) − ℓ(β̂₀)] ≥ 0`) — the profile LR from the
-///   constrained refit at `cᵀβ = θ₀`.
-/// * `theta_null` (`θ₀`) — the tested value (default `0`).
+/// Every ingredient is a likelihood quantity of the caller's model, taken from
+/// the full fit `β̂` and the constrained refit `β̃` (`cᵀβ̃ = ψ₀`, the tested
+/// value); every covariance is under the full fit:
+/// * `contrast` (`c`, length `p`) — the functional gradient `∂ψ/∂β`.
+/// * `beta_hat` (`β̂`), `beta_null` (`β̃`) — the two fits.
+/// * `observed_info_hat` (`ĵ`), `observed_info_null` (`j̃`) — observed
+///   information at the two fits (`p × p`, positive definite; the penalized
+///   Hessian for a penalized fit).
+/// * `expected_info` (`î = var[U(β̂)]`, `p × p`, positive definite).
+/// * `score_covariance` (`Ŝ = cov[U(β̂), U(β̃)ᵀ]`, `p × p`, general).
+/// * `loglik_covariance` (`q̂ = cov[U(β̂), ℓ(β̂) − ℓ(β̃)]`, length `p`).
+/// * `row_scores_hat`, `row_scores_null` (`n × p`) — per-row scores at the two
+///   fits, and `row_loglik_diff` (length `n`) — per-row `ℓᵢ(β̂) − ℓᵢ(β̃)`; these
+///   feed the empirical (Severini) companion.
+/// * `lr_statistic` (`W = 2[ℓ(β̂) − ℓ(β̃)] ≥ 0`).
+///
+/// For a canonical-link GLM, `Ŝ = î` and `q̂ = î(β̂ − β̃)` exactly.
 ///
 /// Returns `{"r", "u", "r_star", "p_value_first_order", "p_value_corrected",
 /// "u_empirical", "r_star_empirical", "p_value_corrected_empirical", "material"}`.
 #[pyfunction]
 #[pyo3(signature = (
-    contrast, beta, penalized_hessian, row_scores, lr_statistic,
-    fisher_information = None, theta_null = 0.0
+    contrast, beta_hat, beta_null, observed_info_hat, observed_info_null,
+    expected_info, score_covariance, loglik_covariance, row_scores_hat,
+    row_scores_null, row_loglik_diff, lr_statistic
 ))]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn skovgaard_r_star<'py>(
     py: Python<'py>,
     contrast: numpy::PyReadonlyArray1<'py, f64>,
-    beta: numpy::PyReadonlyArray1<'py, f64>,
-    penalized_hessian: numpy::PyReadonlyArray2<'py, f64>,
-    row_scores: numpy::PyReadonlyArray2<'py, f64>,
+    beta_hat: numpy::PyReadonlyArray1<'py, f64>,
+    beta_null: numpy::PyReadonlyArray1<'py, f64>,
+    observed_info_hat: numpy::PyReadonlyArray2<'py, f64>,
+    observed_info_null: numpy::PyReadonlyArray2<'py, f64>,
+    expected_info: numpy::PyReadonlyArray2<'py, f64>,
+    score_covariance: numpy::PyReadonlyArray2<'py, f64>,
+    loglik_covariance: numpy::PyReadonlyArray1<'py, f64>,
+    row_scores_hat: numpy::PyReadonlyArray2<'py, f64>,
+    row_scores_null: numpy::PyReadonlyArray2<'py, f64>,
+    row_loglik_diff: numpy::PyReadonlyArray1<'py, f64>,
     lr_statistic: f64,
-    fisher_information: Option<numpy::PyReadonlyArray2<'py, f64>>,
-    theta_null: f64,
 ) -> PyResult<Bound<'py, PyDict>> {
-    use gam::inference::skovgaard::scalar_skovgaard_from_matrices;
+    use gam::inference::skovgaard::{SkovgaardNuisanceInput, skovgaard_r_star_with_nuisance};
 
-    let c = contrast.as_array();
-    let b = beta.as_array();
-    let h = penalized_hessian.as_array();
-    let s = row_scores.as_array();
-    let p = b.len();
-    if c.len() != p {
-        return Err(py_value_error(format!(
-            "skovgaard_r_star: contrast has {} entries for {p} coefficients",
-            c.len()
-        )));
+    let input = SkovgaardNuisanceInput {
+        contrast: contrast.as_array(),
+        beta_hat: beta_hat.as_array(),
+        beta_null: beta_null.as_array(),
+        lr_statistic,
+        observed_info_hat: observed_info_hat.as_array(),
+        observed_info_null: observed_info_null.as_array(),
+        expected_info: expected_info.as_array(),
+        score_covariance: score_covariance.as_array(),
+        loglik_covariance: loglik_covariance.as_array(),
+        row_scores_hat: row_scores_hat.as_array(),
+        row_scores_null: row_scores_null.as_array(),
+        row_loglik_diff: row_loglik_diff.as_array(),
+    };
+    let p = input.beta_hat.len();
+    let n = input.row_scores_hat.nrows();
+    for (name, len) in [
+        ("contrast", input.contrast.len()),
+        ("beta_null", input.beta_null.len()),
+        ("loglik_covariance", input.loglik_covariance.len()),
+    ] {
+        if len != p {
+            return Err(py_value_error(format!(
+                "skovgaard_r_star: {name} has {len} entries for {p} coefficients"
+            )));
+        }
     }
-    if h.nrows() != p || h.ncols() != p {
-        return Err(py_value_error(format!(
-            "skovgaard_r_star: penalized_hessian is {}×{}, expected {p}×{p}",
-            h.nrows(),
-            h.ncols()
-        )));
+    for (name, m) in [
+        ("observed_info_hat", input.observed_info_hat),
+        ("observed_info_null", input.observed_info_null),
+        ("expected_info", input.expected_info),
+        ("score_covariance", input.score_covariance),
+    ] {
+        if m.nrows() != p || m.ncols() != p {
+            return Err(py_value_error(format!(
+                "skovgaard_r_star: {name} is {}×{}, expected {p}×{p}",
+                m.nrows(),
+                m.ncols()
+            )));
+        }
     }
-    if s.ncols() != p {
+    for (name, m) in [
+        ("row_scores_hat", input.row_scores_hat),
+        ("row_scores_null", input.row_scores_null),
+    ] {
+        if m.nrows() != n || m.ncols() != p {
+            return Err(py_value_error(format!(
+                "skovgaard_r_star: {name} is {}×{}, expected {n}×{p}",
+                m.nrows(),
+                m.ncols()
+            )));
+        }
+    }
+    if input.row_loglik_diff.len() != n {
         return Err(py_value_error(format!(
-            "skovgaard_r_star: row_scores has {} columns, expected {p}",
-            s.ncols()
+            "skovgaard_r_star: row_loglik_diff has {} entries for {n} rows",
+            input.row_loglik_diff.len()
         )));
     }
     if !(lr_statistic.is_finite() && lr_statistic >= 0.0) {
@@ -779,35 +817,12 @@ pub(crate) fn skovgaard_r_star<'py>(
             "skovgaard_r_star: lr_statistic must be finite and non-negative; got {lr_statistic}"
         )));
     }
-    // Own the optional Fisher matrix so its view outlives the call.
-    let fisher_owned: Option<Array2<f64>> = match fisher_information {
-        Some(f) => {
-            let fv = f.as_array();
-            if fv.nrows() != p || fv.ncols() != p {
-                return Err(py_value_error(format!(
-                    "skovgaard_r_star: fisher_information is {}×{}, expected {p}×{p}",
-                    fv.nrows(),
-                    fv.ncols()
-                )));
-            }
-            Some(fv.to_owned())
-        }
-        None => None,
-    };
 
-    let res = scalar_skovgaard_from_matrices(
-        c,
-        b,
-        h,
-        fisher_owned.as_ref().map(|f| f.view()),
-        s,
-        lr_statistic,
-        theta_null,
-    )
-    .ok_or_else(|| {
+    let res = skovgaard_r_star_with_nuisance(&input).ok_or_else(|| {
         py_value_error(
-            "skovgaard_r_star: degenerate inputs (non-positive LR/information, \
-             singular Hessian, or undefined r*); the first-order root stands"
+            "skovgaard_r_star: degenerate inputs (zero LR, non-finite entries, an \
+             information matrix that is not positive definite, or a singular score \
+             covariance); the first-order root stands"
                 .to_string(),
         )
     })?;
@@ -1317,17 +1332,19 @@ mod tests {
         }
     }
 
-    /// ORACLE FIXTURE (#939 deliverable 3): the FFI Skovgaard assembly reproduces
-    /// the certified scalar Exponential-rate closed form. `yᵢ ~ Exp(θ)` is a
-    /// single-coefficient (intercept-only) canonical model with `ℓ(θ)=n lnθ−θΣy`,
-    /// `θ̂=n/Σy`, and `ĵ = î = Î = n/θ̂²` at the MLE. With `c=[1]`, the matrix
-    /// assembler must yield exactly the in-tree `scalar_skovgaard_r_star` result:
-    /// `r=sign(θ̂−θ₀)√W`, `u=(θ̂−θ₀)√ĵ`, and the Wald-root sandwich `q<r*<r` that
-    /// pulls the right-skewed first-order root back. This proves the FFI passes
-    /// the ingredients through exactly — no approximation layer.
+    /// ORACLE FIXTURE (#939 deliverable 3, #3535): the ingredient layout the FFI
+    /// passes reproduces the Exponential-rate closed form. `yᵢ ~ Exp(θ)` is a
+    /// single-coefficient canonical model, `ℓ(θ) = n ln θ − θΣy`, `θ̂ = n/Σy`.
+    /// For `p = 1` the determinant form cancels `|Ŝ|` against `cᵀŜ⁻¹` and `|j̃|^{1/2}` against `(cᵀj̃⁻¹c)^{1/2}`, so
+    /// `u = √ĵ·q̂/î`. Canonical ⇒ `Ŝ = î = ĵ = n/θ̂²` and `q̂ = (θ̂−θ₀)·î`, so `u`
+    /// is the Wald root `(θ̂−θ₀)√ĵ`. One row with `s = √ĵ` at both fits and
+    /// `Δℓ = (θ̂−θ₀)√ĵ` makes the empirical form equal the model form. The
+    /// right-skewed exponential LR puts `r*` strictly between the Wald root and
+    /// `r`.
     #[test]
     fn skovgaard_ffi_assembler_recovers_exponential_closed_form() {
-        use gam::inference::skovgaard::scalar_skovgaard_from_matrices;
+        use gam::inference::skovgaard::{SkovgaardNuisanceInput, skovgaard_r_star_with_nuisance};
+        use gam::linalg::roundoff::accumulation_growth;
         use ndarray::array;
 
         let n = 25.0_f64;
@@ -1335,47 +1352,43 @@ mod tests {
         let theta_hat = n / sum_y; // 1.25
         let theta0 = 1.0_f64;
         let ll = |t: f64| n * t.ln() - t * sum_y;
-        let lr = (2.0 * (ll(theta_hat) - ll(theta0))).max(0.0);
-        // Observed info ĵ = n/θ̂²: a 1×1 penalized Hessian. cᵀĤ⁻¹c = 1/ĵ.
-        let obs = n / (theta_hat * theta_hat);
-        let beta = array![theta_hat];
-        let contrast = array![1.0_f64];
-        let h = Array2::from_shape_vec((1, 1), vec![obs]).unwrap();
-        // Canonical family: pass Fisher = Ĥ (î = ĵ). Score covariance Î = n/θ̂²
-        // is realised by rows whose Σ sᵢ² = Î·ĵ² so the sandwich (cᵀĤ⁻¹·ΣssᵀĤ⁻¹c)
-        // = Σsᵢ²/ĵ² = Î/ĵ² · ĵ² ... we instead set Σsᵢ² = ĵ² · ... :
-        // sandwich = Σ(sᵢ·a)² with a = 1/ĵ ⇒ score_cov = ĵ² / Σsᵢ². For Î = ĵ we
-        // need Σsᵢ² = ĵ, so a single row sᵢ = √ĵ.
-        let row_scores = Array2::from_shape_vec((1, 1), vec![obs.sqrt()]).unwrap();
-        let fisher = Array2::from_shape_vec((1, 1), vec![obs]).unwrap();
-
-        let res = scalar_skovgaard_from_matrices(
-            contrast.view(),
-            beta.view(),
-            h.view(),
-            Some(fisher.view()),
-            row_scores.view(),
-            lr,
-            theta0,
-        )
+        let lr = 2.0 * (ll(theta_hat) - ll(theta0));
+        let info = n / (theta_hat * theta_hat);
+        let dtheta = theta_hat - theta0;
+        let info_matrix = array![[info]];
+        // The constrained fit's curvature n/θ₀² enters only through
+        // |j̃|^{1/2}/(cᵀj̃⁻¹c)^{1/2}, which is 1 for p = 1.
+        let info_null = array![[n / (theta0 * theta0)]];
+        let row_score = array![[info.sqrt()]];
+        let res = skovgaard_r_star_with_nuisance(&SkovgaardNuisanceInput {
+            contrast: array![1.0_f64].view(),
+            beta_hat: array![theta_hat].view(),
+            beta_null: array![theta0].view(),
+            lr_statistic: lr,
+            observed_info_hat: info_matrix.view(),
+            observed_info_null: info_null.view(),
+            expected_info: info_matrix.view(),
+            score_covariance: info_matrix.view(),
+            loglik_covariance: array![dtheta * info].view(),
+            row_scores_hat: row_score.view(),
+            row_scores_null: row_score.view(),
+            row_loglik_diff: array![dtheta * info.sqrt()].view(),
+        })
         .expect("ffi-shape skovgaard");
 
-        let r_expected = (theta_hat - theta0).signum() * lr.sqrt();
-        assert!((res.r - r_expected).abs() < 1e-12, "r = {}", res.r);
-        // Canonical: u = (θ̂−θ₀)·î/√ĵ = (θ̂−θ₀)√ĵ, and Î = ĵ ⇒ u_emp = u.
-        let u_expected = (theta_hat - theta0) * obs.sqrt();
-        assert!((res.u - u_expected).abs() < 1e-12, "u = {}", res.u);
+        let tol = |x: f64| accumulation_growth(16) * x.abs();
+        let r_expected = dtheta.signum() * lr.sqrt();
+        assert!((res.r - r_expected).abs() <= tol(r_expected), "r = {}", res.r);
+        let wald = dtheta * info.sqrt();
+        assert!((res.u - wald).abs() <= tol(wald), "u = {} vs Wald {wald}", res.u);
         assert!(
-            (res.u_empirical - res.u).abs() < 1e-12,
+            (res.u_empirical - res.u).abs() <= tol(res.u),
             "u_emp = {}",
             res.u_empirical
         );
-        // The refinement ordering q < r* < r (Wald root < modified root < directed
-        // root) for the right-skewed exponential LR.
-        let q = (theta_hat - theta0) * obs.sqrt();
         assert!(
-            q < res.r_star && res.r_star < r_expected,
-            "need q < r* < r: q={q} r*={} r={r_expected}",
+            wald < res.r_star && res.r_star < r_expected,
+            "need Wald < r* < r: Wald={wald} r*={} r={r_expected}",
             res.r_star
         );
         assert!((0.0..=1.0).contains(&res.p_value_corrected));
