@@ -1649,10 +1649,10 @@ impl SaeManifoldTerm {
         }
         let metric = ArrowMetric::Joint(cache).prepare()?;
         let mut differential = Self::arrow_orbit_differential(geometry, &metric)?;
-        // #3439 — the periodic phases the orbit does not integrate keep their circle volume,
-        // priced off this cache as the value priced it. Its weight is on `dB_raw`, which on
-        // this unpinned factor is the weight on `dΦ`, so it joins the metric weight.
-        if let Some((_, phase)) = self.periodic_phase_marginal(cache, &geometry.orbit_generators)? {
+        // #3439 — the periodic phases keep their circle volume beside the orbit's, priced
+        // off this cache as the value priced it. Its weight is on `dB_raw`, which on this
+        // unpinned factor is the weight on `dΦ`, so it joins the metric weight.
+        if let Some((_, phase)) = self.periodic_phase_marginal(cache)? {
             differential.metric_weight.accumulate(&phase)?;
         }
         let mut logdet_trace = Array1::<f64>::zeros(rho.flat_coordinates().len());

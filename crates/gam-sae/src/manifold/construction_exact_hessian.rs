@@ -4678,7 +4678,7 @@ impl SaeManifoldTerm {
                 // priced off the caller's `B` cache as the dense lane prices it; its
                 // weight is on `dB_raw` of that cache.
                 if let Some((_, phase)) = self
-                    .periodic_phase_marginal(cache, &[])
+                    .periodic_phase_marginal(cache)
                     .map_err(OuterGradientError::internal)?
                 {
                     let (phase_trace, phase_gamma) = self
@@ -5009,11 +5009,10 @@ impl SaeManifoldTerm {
             }
             values.log_det_correction
         };
-        // #2933 F07 — the periodic phases integrated on their circles. An orbit-stiffened
-        // block integrates its orbit atoms' collective shift exactly already, so only the
-        // phases outside every orbit are priced here (#3439).
+        // #2933 F07 — the periodic phases integrated on their circles, each relative to the
+        // decoder; an orbit's collective shift is the orbit correction's above (#3439).
         let phase_correction = match self
-            .periodic_phase_marginal(cache, &geometry.orbit_generators)
+            .periodic_phase_marginal(cache)
             .map_err(SaeCriterionError::Numerical)?
         {
             Some((correction, _)) => {
@@ -6397,7 +6396,7 @@ impl SaeManifoldTerm {
         // The periodic phases' circle volume moves with `B_raw` alone; see
         // `periodic_phase_marginal`, which the value priced off the same cache.
         let phase_weight = self
-            .periodic_phase_marginal(cache, &geometry.orbit_generators)?
+            .periodic_phase_marginal(cache)?
             .map(|(_, weight)| weight);
         let (metric_trace, metric_gamma) = self.evidence_metric_derivative_channels(
             rho,
@@ -6722,21 +6721,22 @@ impl SaeManifoldTerm {
     /// the `T` weight through its recorded spectrum and the `B` weight through the same
     /// spectrum with its unit pins read raw.
     ///
-    /// #3439 — every exact-`A` lane prices this correction off its own `B` cache, so the
-    /// orbit and streaming lanes carry it as the dense lane does. An atom in
-    /// `orbit_generators` (#2234) already has its collective shift integrated on its
-    /// circle by the orbit integral, so its phase coordinates are not priced here: they
-    /// stay among the conditioned coordinates `v` of every other phase in their row, and
-    /// their `n − 1` relative phases keep the Gaussian pricing of `A_s`. Every other
-    /// periodic coordinate is priced as above.
+    /// #3439 — every exact-`A` lane prices this correction off its own `B` cache, the
+    /// closure-certified orbit lane (#2234) included, and for every periodic coordinate.
+    /// The row blocks condition each phase on the border `β`, so what they price is the
+    /// phase *relative to the decoder*; the orbit integral prices the one collective
+    /// direction the rows do not see, the shift `τ` that moves every phase together with
+    /// the decoder rotation, which lives in the border's Schur complement. On the torus of
+    /// the `n` phases and the rotation angle `φ`, with the likelihood reading only
+    /// `tᵢ − φ`, the volume factors as `∫dφ · Π ∫dtᵢ` given `φ`: the orbit's circle times
+    /// the rows' circles, so the two corrections compose and neither counts the other.
     ///
     /// The weight is returned on the arrow's row blocks, the only positions it occupies.
     ///
-    /// `None` when no row carries a periodic coordinate outside the orbits.
+    /// `None` when no row carries a periodic coordinate.
     pub(crate) fn periodic_phase_marginal(
         &self,
         cache: &ArrowFactorCache,
-        orbit_generators: &[CircleOrbitGenerator],
     ) -> Result<Option<(f64, ArrowJointBlocks)>, String> {
         use gam_linalg::faer_ndarray::FaerCholesky;
         let periods = self.all_ard_axis_periods();
@@ -6746,8 +6746,6 @@ impl SaeManifoldTerm {
         {
             return Ok(None);
         }
-        let integrated_by_orbit =
-            |atom: usize| orbit_generators.iter().any(|generator| generator.atom == atom);
         let mut correction = 0.0_f64;
         let mut raw_weight = ArrowJointBlocks::zeros(&cache.row_offsets, cache.k);
         let mut priced_any = false;
@@ -6757,7 +6755,6 @@ impl SaeManifoldTerm {
             let mut phase: Vec<(usize, f64)> = Vec::new();
             for (local, variable) in vars.iter().enumerate() {
                 if let SaeLocalRowVar::Coord { atom, axis } = *variable
-                    && !integrated_by_orbit(atom)
                     && let Some(period) = periods
                         .get(atom)
                         .and_then(|axes| axes.get(axis))
@@ -8080,7 +8077,7 @@ mod test_support {
                 cache, pricing.clamp_border_derivative.view(),
             )?;
             let phase_weight = self
-                .periodic_phase_marginal(cache, &geometry.orbit_generators)?
+                .periodic_phase_marginal(cache)?
                 .map(|(_, weight)| weight);
             let (_, metric_gamma) = self.evidence_metric_derivative_channels(
                 rho,

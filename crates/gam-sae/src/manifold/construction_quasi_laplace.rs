@@ -3058,14 +3058,10 @@ impl SaeManifoldTerm {
         converged_cache.joint_hessian_log_det = Some(log_det);
         converged_cache.schur_factor_is_undamped = true;
         // #3439 — the periodic phases' circle volume, priced off this `B` cache as the dense
-        // lane prices it off its own (`periodic_phase_marginal`). The orbit lane integrates its
-        // atoms' collective shift already, so only the phases outside its orbits are priced.
-        // The stamp above stays the operator's `log|A|`: the correction is not a determinant.
-        let orbit_atoms: &[CircleOrbitGenerator] = match evidence_artifacts.as_ref() {
-            Some(StreamingEvidence::ArrowOrbit(geometry)) => &geometry.orbit_generators,
-            _ => &[],
-        };
-        let phase_correction = match self.periodic_phase_marginal(&converged_cache, orbit_atoms)? {
+        // lane prices it off its own (`periodic_phase_marginal`), beside the orbit lane's
+        // collective-shift integral. The stamp above stays the operator's `log|A|`: the
+        // correction is not a determinant.
+        let phase_correction = match self.periodic_phase_marginal(&converged_cache)? {
             Some((correction, _)) => {
                 log::debug!(
                     "[SAE-CRITERION streaming] periodic phase circle volume: ½Δlog|A|={:.6e}",
