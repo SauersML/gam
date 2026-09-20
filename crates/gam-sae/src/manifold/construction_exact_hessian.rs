@@ -1696,7 +1696,6 @@ impl SaeManifoldTerm {
                 sphere_tangents: self.sphere_tangent_blocks(&cache.row_dims)?,
             });
         }
-        let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let second_jets = self.atom_second_jets()?;
@@ -1733,37 +1732,16 @@ impl SaeManifoldTerm {
                 let jets = jet_window.pop_front().ok_or_else(|| {
                     format!("prepare_residual_curvature_rows: the jet refill built no row {row}")
                 })?;
-                let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
 
                 // √w-scaled metric-applied per-row residual `error_metric = √w·M_n r_n`
                 // (the SAME object the assembly's β-tier gradient contracts). The
                 // data-fit `½ r_nᵀ M_n r_n` has residual curvature `Σ (M_n r_n)·∂²f`,
                 // so this is exactly the residual contracted against the raw `∂²f`
                 // jets. `M_n = I` on the isotropic path ⇒ `error_metric = √w·r`.
-                let mut decoded = vec![0.0_f64; p];
-                let mut fitted = Array1::<f64>::zeros(p);
-                let mut error = Array1::<f64>::zeros(p);
-                let active_atoms = self
-                    .last_row_layout
-                    .as_ref()
-                    .map(|layout| layout.active_atoms[row].as_slice());
-                for k in 0..k_atoms {
-                    if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                        continue;
-                    }
-                    self.atoms[k].fill_decoded_row(row, &mut decoded);
-                    let a_k = assignments[k];
-                    for out_col in 0..p {
-                        fitted[out_col] += a_k * decoded[out_col];
-                    }
-                }
-                for out_col in 0..p {
-                    error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-                }
-                let error_metric: Vec<f64> = match self.row_metric.as_ref() {
-                    Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                    _ => error.to_vec(),
-                };
+                // Built by the one residual producer every exact-A route shares.
+                let w_row = row_loss_w.map_or(1.0, |w| w[row]);
+                let error_metric =
+                    self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
 
                 let mut residual_tt = vec![0.0_f64; q * q];
                 for a in 0..q {
@@ -3109,7 +3087,10 @@ impl SaeManifoldTerm {
     /// coordinate-block leg all build it ONCE rather than three times. A route
     /// that reconstructed the residual with a different weighting would produce a
     /// Patch-D leg that silently disagreed with the operator it is supposed to
-    /// differentiate, which is the failure this whole front is about.
+    /// differentiate, which is the failure this whole front is about. The
+    /// residual-curvature row plan, the dense `A − B` row assembly and the
+    /// softmax row-jet plan's HVP probe read this producer too, so every
+    /// exact-A leg contracts one residual.
     pub(crate) fn patchd_row_error_metric(
         &self,
         row: usize,
@@ -7119,7 +7100,6 @@ impl SaeManifoldTerm {
                     .to_string(),
             );
         }
-        let p = self.output_dim();
         let n = self.n_obs();
         let k_atoms = self.k_atoms();
         let second_jets = self.atom_second_jets()?;
@@ -7156,9 +7136,6 @@ impl SaeManifoldTerm {
             .row_metric
             .as_ref()
             .is_some_and(|metric| metric.whitens_likelihood());
-        let mut decoded = vec![0.0_f64; p];
-        let mut fitted = Array1::<f64>::zeros(p);
-        let mut error = Array1::<f64>::zeros(p);
         let mut assignments = Array1::<f64>::zeros(k_atoms);
 
         let sphere_tangents = self.sphere_tangent_blocks(row_dims)?;
@@ -7186,32 +7163,11 @@ impl SaeManifoldTerm {
             let jets = jet_window
                 .pop_front()
                 .expect("jet window must be non-empty");
-            let sqrt_row_w = row_loss_w.map_or(1.0, |w| w[row].sqrt());
             let w_row = row_loss_w.map_or(1.0, |w| w[row]);
 
             // The same sqrt(w)-scaled metric-applied residual the applier contracts.
-            fitted.fill(0.0);
-            let active_atoms = self
-                .last_row_layout
-                .as_ref()
-                .map(|layout| layout.active_atoms[row].as_slice());
-            for k in 0..k_atoms {
-                if active_atoms.is_some_and(|active| active.binary_search(&k).is_err()) {
-                    continue;
-                }
-                self.atoms[k].fill_decoded_row(row, &mut decoded);
-                let a_k = assignments[k];
-                for out_col in 0..p {
-                    fitted[out_col] += a_k * decoded[out_col];
-                }
-            }
-            for out_col in 0..p {
-                error[out_col] = sqrt_row_w * (fitted[out_col] - target[[row, out_col]]);
-            }
-            let error_metric: Vec<f64> = match self.row_metric.as_ref() {
-                Some(metric) if whitens => metric.apply_metric_row(row, error.view()),
-                _ => error.to_vec(),
-            };
+            let error_metric =
+                self.patchd_row_error_metric(row, w_row, target, &assignments, whitens);
 
             let mut tt = Array2::<f64>::zeros((q, q));
             let mut tbeta = Array2::<f64>::zeros((q, border.len()));
