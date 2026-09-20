@@ -1012,6 +1012,12 @@ fn build_collapse_rescue_linear_image(
     if !(rho0 > 0.0 && rho0.is_finite()) {
         return None;
     }
+    // One scaled matvec commits `p` roundings in `yᵢ·x`, `n` in the row
+    // accumulation, and three in `aᵢ²` and `/ρ₀`, against the magnitude
+    // `‖Σᵢ wᵢ|yᵢ||yᵢ|ᵀ‖/ρ₀ ≤ tr M/ρ₀`. That is the resolution of `M v / ρ₀` at
+    // working precision: a Krylov residual `β` inside it is an exhausted space,
+    // and a Ritz residual inside it (relative to `λ₁/ρ₀ ≥ 1`) is certified.
+    let matvec_band = gam_linalg::roundoff::accumulation_growth(p + n + 3) * trace / rho0;
     let pairs = gam_linalg::lanczos::symmetric_extreme_lanczos_eigenpairs(
         p,
         &seed,
@@ -1019,8 +1025,8 @@ fn build_collapse_rescue_linear_image(
             target_rank: 1,
             max_steps: p.min(n),
             check_every: 10usize.min((p / 10).max(1)),
-            relative_residual_tol: f64::EPSILON.sqrt(),
-            breakdown_tol: f64::EPSILON * trace / rho0,
+            relative_residual_tol: matvec_band,
+            breakdown_tol: matvec_band,
         },
         |x, out| {
             apply_m(x, out);
