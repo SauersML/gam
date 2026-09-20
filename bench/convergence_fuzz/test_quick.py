@@ -117,10 +117,13 @@ def test_triage_labels() -> None:
 
 
 def test_log_link_posterior_mean_overflow_is_exact() -> None:
-    """case12/poisson/n30 draws a held-out x1 13 training ranges below the
-    data, so the posterior mean exp(eta + Var(eta)/2) there is ~exp(2600):
-    +inf is its correctly rounded value, and every finite row of the same
-    prediction matches the exact formula."""
+    """On case12/poisson/n30, probe x1 at 10^0 .. 10^4 training ranges below
+    the data with every other covariate at its median. Past the data the
+    smooth extrapolates in its unpenalized linear null space, so eta grows
+    linearly and Var(eta) quadratically, and the posterior mean
+    exp(eta + Var(eta)/2) crosses DBL_MAX inside the probe: +inf is the
+    correctly rounded value of every row past it, and every finite row of the
+    same prediction matches the exact formula."""
     import numpy as np
 
     import gamfit
@@ -129,11 +132,15 @@ def test_log_link_posterior_mean_overflow_is_exact() -> None:
 
     data = draw(12, "poisson", 30)
     model = gamfit.fit(data.train, data.spec.formula, family="poisson")
-    pred = np.asarray(model.predict(data.test), dtype=float).reshape(-1)
+    x1 = data.train["x1"]
+    reach = 10.0 ** np.arange(5)
+    probe = {k: np.full(reach.size, np.median(v)) for k, v in data.train.items()}
+    probe["x1"] = x1.min() - reach * (x1.max() - x1.min())
+    pred = np.asarray(model.predict(probe), dtype=float).reshape(-1)
     bad = ~np.isfinite(pred)
-    assert bad.sum() == 1
-    assert _overflows_exactly(model, data.test, pred)
-    ok = {k: v[~bad] for k, v in data.test.items()}
+    assert 0 < bad.sum() < reach.size
+    assert _overflows_exactly(model, probe, pred)
+    ok = {k: v[~bad] for k, v in probe.items()}
     design = model.design_matrix(ok)
     eta = design.offset + design.matrix @ design.coefficients
     var = np.einsum(
