@@ -2554,12 +2554,6 @@ pub(crate) fn build_psi_drift_deriv_callback<F: CustomFamily + Clone + Send + Sy
         return Ok(None);
     }
 
-    if hyper_layout.family_axis_count() != 0 && psi_workspace.is_none() {
-        return Err(CustomFamilyError::trial_point(
-            "family-owned hyper axes require one owned exact-psi workspace for directional Hessian drift",
-        ));
-    }
-
     let synced_arc = Arc::new(synced_states.to_vec());
     let specs_arc = Arc::new(specs.to_vec());
     let family_arc = Arc::new(family.clone());

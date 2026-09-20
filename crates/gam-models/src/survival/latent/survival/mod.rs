@@ -1103,12 +1103,14 @@ fn fit_latent_baseline_axes<F: LatentBaselineChartFamily + crate::custom_family:
         }
     };
     let outer_policy = seed_family.outer_derivative_policy(seed_blocks, options);
-    // The chart axes are family-owned hyper axes. The evaluator's exact outer
-    // Hessian reads their coefficient drift through an owned exact-ψ workspace
-    // (`build_psi_drift_deriv_callback`), which neither latent family serves, so a
-    // Hessian request refuses every trial point. The route searches first-order
-    // until the chart axes have that workspace (#2677).
-    let analytic_outer_hessian_available = false;
+    // The chart axes are family-owned hyper axes whose exact fixed-β first- and
+    // second-order terms and coefficient drift `D_β H_θ[u]` the latent families
+    // serve through their per-index ψ hooks, so the exact outer Hessian is
+    // available; the realized outer-derivative policy decides whether it is used.
+    // A first-order-only route certifies only against the caller's raw tolerance,
+    // with no Newton-decrement standard, and stalled short of it on the #2714
+    // loaded/unloaded fixture (#3321).
+    let analytic_outer_hessian_available = true;
     let kappa_options = gam_terms::smooth::SpatialLengthScaleOptimizationOptions {
         enabled: false,
         ..Default::default()
