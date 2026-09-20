@@ -1364,6 +1364,88 @@ fn block_orthogonality_rejects_groups_missing_an_axis() {
     );
 }
 
+/// `OrthogonalityPenalty`, `½ (w e^ρ / n_eff) ‖TᵀT − I‖²_F`, had no Rust test.
+/// On a target with `TᵀT ≺ I` (Gram eigenvalues about 0.13 and 0.93), where the
+/// exact Hessian is indefinite, this pins
+/// value -> `grad_target`, `grad_target` -> `hvp` (directional),
+/// value -> `grad_rho` (learnable log-weight), and the closed-form dense Hessian
+/// `as_dense_with_precomputed_m` against `hvp` of the unit vectors. It also
+/// checks that the dense Hessian is symmetric.
+///
+/// Tolerances. The stencil error is `h²/6 |f'''| + ε_mach |f| / h` with
+/// `h = 1e-5` and `s = 0.9 e^{0.25} / 4 ≈ 0.29`.
+/// - The value is quartic in `T`. Along a coordinate `|f'''| ≲ 1.8` on this
+///   target and `|f| ≈ 0.11`, which gives about `3e-11`.
+/// - The gradient `2 s T (TᵀT − I)` is cubic. Its third derivative along `V` is
+///   bounded by `12 s ‖V‖³_F ≈ 6` (`‖V‖²_F ≈ 1.4`), and `|g| ≲ 1`, which gives
+///   about `1e-10 + 2e-11`.
+/// - The value is `e^ρ` times a constant, so its third ρ-derivative is the
+///   value itself, and the error is about `2e-12`.
+/// A `1e-8` tolerance leaves at least 80× margin. The dense form and `hvp`
+/// evaluate the same bilinear terms in a different order, so they agree to
+/// rounding (`1e-12` relative).
+#[test]
+fn orthogonality_derivatives_and_dense_hessian_match_central_differences() {
+    let (n_obs, d) = (4usize, 2usize);
+    let n = n_obs * d;
+    let pen = OrthogonalityPenalty::new(PsiSlice::full(n, Some(d)), d, 0.9, n_obs, true)
+        .expect("orthogonality penalty");
+    assert_eq!(pen.rho_count(), 1);
+    let rho = array![0.25_f64];
+    let t = Array1::from_shape_fn(n, |i| {
+        let x = i as f64;
+        0.5 * (0.7 * x + 0.2).sin() + 0.15 * (1.9 * x).cos()
+    });
+    let v = Array1::from_shape_fn(n, |i| 0.6 * (0.9 * i as f64 + 0.4).cos());
+    let h = 1e-5;
+    let tol = 1e-8;
+
+    let g = pen.grad_target(t.view(), rho.view());
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let fd = (pen.value(tp.view(), rho.view()) - pen.value(tm.view(), rho.view())) / (2.0 * h);
+        assert_abs_diff_eq!(g[i], fd, epsilon = tol);
+    }
+
+    let hv = pen.hvp(t.view(), rho.view(), v.view());
+    let tp = &t + &(h * &v);
+    let tm = &t - &(h * &v);
+    let gp = pen.grad_target(tp.view(), rho.view());
+    let gm = pen.grad_target(tm.view(), rho.view());
+    for i in 0..n {
+        assert_abs_diff_eq!(hv[i], (gp[i] - gm[i]) / (2.0 * h), epsilon = tol);
+    }
+
+    let gr = pen.grad_rho(t.view(), rho.view());
+    assert_eq!(gr.len(), 1);
+    let fd_rho = (pen.value(t.view(), array![0.25 + h].view())
+        - pen.value(t.view(), array![0.25 - h].view()))
+        / (2.0 * h);
+    assert_abs_diff_eq!(gr[0], fd_rho, epsilon = tol);
+
+    let t_mat = pen.target_matrix(t.view()).expect("n_obs x d target");
+    let gram = OrthogonalityPenalty::gram_minus_identity(t_mat.view());
+    let dense = pen.as_dense_with_precomputed_m(t_mat.view(), gram.view(), pen.scale(rho.view()));
+    let scale = dense.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs()));
+    assert!(scale > 0.0, "curvature must be nonzero on this target");
+    for col in 0..n {
+        let mut e = Array1::<f64>::zeros(n);
+        e[col] = 1.0;
+        let column = pen.hvp(t.view(), rho.view(), e.view());
+        for row in 0..n {
+            assert_abs_diff_eq!(dense[[row, col]], column[row], epsilon = 1e-12 * scale);
+            assert_abs_diff_eq!(
+                dense[[row, col]],
+                dense[[col, row]],
+                epsilon = 1e-12 * scale
+            );
+        }
+    }
+}
+
 // ----- MechanismSparsityPenalty tests -----
 
 fn mech_sparsity_test_target() -> Array1<f64> {
@@ -1613,6 +1695,47 @@ fn nested_prefix_grad_rho_matches_finite_difference() {
         rm[k] -= eps;
         let fd = (pen.value(t.view(), rp.view()) - pen.value(t.view(), rm.view())) / (2.0 * eps);
         assert_abs_diff_eq!(dr[k], fd, epsilon = 1e-5);
+    }
+}
+
+/// The nested-prefix Hessian diagonal had only a sign check. This pins the full
+/// FD Jacobian of `grad_target` against `diag(hessian_diag)`, so it also checks
+/// that the Hessian is exactly diagonal. The fixture has three shells, so the
+/// per-axis weights `W_i` take three distinct values, and it includes a zero entry.
+///
+/// Tolerance. The per-entry gradient is `W x / sqrt(x² + ε²)`. Its third
+/// derivative is `−3 W ε² (r² − 5x²) / r⁷`, bounded by `3 W / ε³` (at `x = 0`).
+/// With `ε = 0.3` and `W ≤ 0.7 e^{0.1} + 0.5 e^{−0.2} + 0.3 e^{0.3} ≈ 1.59`,
+/// that is `≈ 176`, so the `h = 1e-5` stencil error is at most about `3e-9`.
+/// The roundoff is `ε_mach · 1.6 / h ≈ 4e-11`. A `1e-7` tolerance leaves 30× margin.
+#[test]
+fn nested_prefix_hessian_diag_matches_finite_difference_of_gradient() {
+    let (t, _n, f) = nested_prefix_test_target();
+    let n = t.len();
+    let pen = NestedPrefixPenalty::new(
+        PsiSlice::full(n, Some(f)),
+        PenaltyTier::Psi,
+        vec![1_usize, 2, 4],
+        vec![0.7, 0.5, 0.3],
+        0.3,
+    )
+    .expect("valid nested-prefix penalty");
+    let rho = array![0.1_f64, -0.2, 0.3];
+    let diag = pen
+        .hessian_diag(t.view(), rho.view())
+        .expect("nested-prefix Hessian is diagonal");
+    let h = 1e-5;
+    for i in 0..n {
+        let mut tp = t.clone();
+        let mut tm = t.clone();
+        tp[i] += h;
+        tm[i] -= h;
+        let gp = pen.grad_target(tp.view(), rho.view());
+        let gm = pen.grad_target(tm.view(), rho.view());
+        for j in 0..n {
+            let expected = if i == j { diag[i] } else { 0.0 };
+            assert_abs_diff_eq!((gp[j] - gm[j]) / (2.0 * h), expected, epsilon = 1e-7);
+        }
     }
 }
 
