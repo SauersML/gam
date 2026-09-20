@@ -2197,5 +2197,14 @@
     ],
     "reason": "#3024 slice A: the survival row jet and the Polya-Gamma batch are admitted under gpu=auto on their own two executors measured on their own workload (gam_gpu::row_kernel_race), not at fused_kernel_min_n, which calibration set to twice the xtwx Gram's crossover. GpuDispatchPolicy::fused_kernel_min_n is deleted with every reader: its pre-probe floor MIN_CALIBRATABLE_FUSED_KERNEL_N and the compile-time assert (const _) that pinned that floor to 2 * XTWX_DIMS[0]; GpuRuntime::resolve_if_fused_batch_exceeds_floor, the size-gated resolve built on the floor; and GpuDispatchPolicy::polya_gamma_batch_target_is_gpu, the PG predicate on it, with its pin polya_gamma_admits_large_batch_and_refuses_small. The PG seam test sub_crossover_batch_routes_to_cpu_bitwise_on_every_host is renamed an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024: there is no crossover left to be under, and the same bitwise-CPU property now holds for any batch size the process has not timed.",
     "evidence": "In the landing tree git grep -w finds none of fused_kernel_min_n, MIN_CALIBRATABLE_FUSED_KERNEL_N, resolve_if_fused_batch_exceeds_floor or polya_gamma_batch_target_is_gpu under crates, src or tests. an_untimed_batch_returns_the_cpu_draws_bitwise_on_every_host_3024 and rigid_row_jet_device_admission_and_parity_2900 pass. The race logic is pinned by a_measured_law_decides_every_row_count_3024, an_unfixed_law_is_raced_3024, a_race_returns_the_cpu_value_and_records_the_shape_3024 and a_measured_row_kernel_races_an_untimed_shape_and_then_reads_its_timing_3024."
+  },
+  {
+    "base": "ce53546019d9a566866ae8b17b123bda7cef298e",
+    "items": [
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_ABS_TOL",
+      "crates/gam-solve/src/pirls/newton_solve.rs:const:ACTIVE_BOUND_REL_TOL"
+    ],
+    "reason": "#3180: the P-IRLS box path's second activity rule for lower bounds (1e-6 relative + 1e-10 absolute) is deleted with the duplicate path it guarded. A lower bound is the unit row beta_i >= lb_i of the inequality system, whose one activity rule is active_set::row_is_active (scaled slack <= PRIMAL_FEASIBILITY_TOL), already applied to the same rows by active_face for the exact face decrement and the geometric KKT channels. projected_gradient_norm and the bound QP's warm-start seed now read it through newton_solve.rs lower_bound_binds.",
+    "evidence": "In the landing tree ACTIVE_BOUND_REL_TOL and ACTIVE_BOUND_ABS_TOL occur 0 times (git grep -c); both were pub(crate) and read only at newton_solve.rs projected_gradient_norm and solve_newton_directionwith_lower_bounds. gam-solve all targets at the candidate: the new pins projected_gradient_reports_an_interior_point_short_of_its_bound_3180 and box_bounds_bind_exactly_where_the_active_face_is_active_3180 pass, and the only reds are the four also red at base."
   }
 ]
