@@ -359,7 +359,8 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
         predicted_mean_alt.as_array(),
         fisher.as_array(),
     )?;
-    let Some((idx, expected_log_growth)) = core_select_probe_by_expected_evidence(&probes, &fisher)
+    let Some((idx, expected_log_growth)) =
+        core_select_probe_by_expected_evidence(&probes, &fisher).map_err(py_value_error)?
     else {
         return Ok(None);
     };
@@ -377,9 +378,14 @@ pub(crate) fn select_probe_by_expected_evidence<'py>(
 
 /// Expected observations needed for a probe with per-observation expected
 /// evidence growth `growth_nats_per_obs` to cross the Ville threshold `1/alpha`.
+/// Raises `ValueError` for a level outside (0, 1) or a NaN growth rate;
+/// returns `None` for non-positive growth.
 #[pyfunction]
-pub(crate) fn expected_resolution_budget(alpha: f64, growth_nats_per_obs: f64) -> Option<f64> {
-    core_expected_resolution_budget(alpha, growth_nats_per_obs)
+pub(crate) fn expected_resolution_budget(
+    alpha: f64,
+    growth_nats_per_obs: f64,
+) -> PyResult<Option<f64>> {
+    core_expected_resolution_budget(alpha, growth_nats_per_obs).map_err(py_value_error)
 }
 
 /// Plan the next steering probe for a contested structural claim (issue #1109):
@@ -412,6 +418,7 @@ pub(crate) fn plan_probe_for_contested_claim<'py>(
         fisher.as_array(),
     )?;
     let Some(plan) = core_plan_probe_for_contested_claim(&probes, &fisher, alpha, current_log_e)
+        .map_err(py_value_error)?
     else {
         return Ok(None);
     };
