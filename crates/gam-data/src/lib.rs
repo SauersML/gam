@@ -715,6 +715,11 @@ impl EncodedDataset {
     /// no term, response, weight or offset reads cannot refuse, change or block
     /// a fit, just as `gam fit` never loads it.
     ///
+    /// Missing values are rejected, not dropped: a NaN or infinite cell in a
+    /// consumed column is an error naming the column and its 1-based row, the
+    /// same policy scikit-learn applies. Silently dropping rows would change
+    /// which observations the fit describes without the caller saying so.
+    ///
     /// Constancy is NOT a boundary rule: a constant column is legitimate input
     /// for many designs (an all-zero left-truncation entry time, an event
     /// indicator, a scalar term the model prunes) and the layers that judge it
@@ -772,6 +777,13 @@ impl EncodedDataset {
             }
             let column = self.values.column(index);
             let finite_count = column.iter().filter(|value| value.is_finite()).count();
+            if finite_count == 0 {
+                return Err(DataError::DegenerateColumn {
+                    column: name.clone(),
+                    problem: "has no finite values (every value is NaN or infinite)"
+                        .to_string(),
+                });
+            }
             if finite_count == 1 && column.len() > 1 {
                 return Err(DataError::DegenerateColumn {
                     column: name.clone(),
@@ -2010,10 +2022,17 @@ fn write_arrow_numeric_values(
         }
         None => {
             for (batch_row, value) in values.into_iter().enumerate() {
-                let Some(value) = value.filter(|value| value.is_finite()) else {
+                // A null is missing (NaN); a non-finite value is kept as is, so
+                // the fit boundary names `inf` exactly as the CSV and NumPy
+                // ingestion paths do.
+                let Some(value) = value else {
                     output[batch_row] = f64::NAN;
                     continue;
                 };
+                if !value.is_finite() {
+                    output[batch_row] = value;
+                    continue;
+                }
                 *saw_numeric = true;
                 if !is_binary_value(value) {
                     *all_binary = false;
@@ -3694,7 +3713,10 @@ mod tests {
             f64::NEG_INFINITY,
         ])))
         .expect("non-finite values should remain representable until model projection");
-        assert!(nonfinite.values.column(0).iter().all(|value| value.is_nan()));
+        let nonfinite_column = nonfinite.values.column(0);
+        assert!(nonfinite_column[0].is_nan());
+        assert_eq!(nonfinite_column[1], f64::INFINITY);
+        assert_eq!(nonfinite_column[2], f64::NEG_INFINITY);
         assert_eq!(
             nonfinite.column_kinds,
             vec![ColumnKindTag::Continuous],
@@ -4614,6 +4636,10 @@ mod tests {
             (
                 vec![f64::NAN, 2.0, f64::NAN],
                 "has only one non-missing value",
+            ),
+            (
+                vec![f64::NAN, f64::INFINITY, f64::NAN],
+                "has no finite values (every value is NaN or infinite)",
             ),
         ];
         for (values, expected) in cases {
