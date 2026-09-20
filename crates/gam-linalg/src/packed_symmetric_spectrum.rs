@@ -57,16 +57,6 @@ pub const fn packed_upper_len(n: usize) -> usize {
     n * (n + 1) / 2
 }
 
-/// Iterations the implicit-shift QL sweep may spend on ONE eigenvalue before
-/// the routine reports non-convergence rather than returning an unconverged
-/// diagonal.
-///
-/// The shifted QL iteration converges cubically on a symmetric tridiagonal and
-/// the classical implementations (EISPACK `tql2`, LAPACK `dsteqr`) allow 30
-/// sweeps per eigenvalue; 30 is therefore the number this shares with them, and
-/// exceeding it is a failure to report, never a tolerance to widen.
-const QL_MAX_SWEEPS_PER_EIGENVALUE: usize = 30;
-
 /// Rows of the trailing block below which the symmetric matrix-vector product
 /// and rank-2 update stay serial. Rayon's fork/join and the per-task `O(m)`
 /// reduction buffer cost more than the `O(m²)` kernel below this size.
@@ -91,7 +81,8 @@ const PARALLEL_MIN_ROWS: usize = 256;
 /// * a length mismatch between `n`, `packed` and `probe`;
 /// * a non-finite entry in `packed` or `probe`;
 /// * an eigenvalue or projected probe component outside the finite `f64` range;
-/// * QL non-convergence within `QL_MAX_SWEEPS_PER_EIGENVALUE` per eigenvalue.
+/// * QL non-convergence within the `30·n` sweeps
+///   [`gam_math::quadrature::symmetric_tridiagonal_eigen_with_probe`] allows.
 pub fn packed_symmetric_spectrum_with_probe(
     n: usize,
     packed: &mut [f64],
@@ -149,9 +140,10 @@ pub fn packed_symmetric_spectrum_with_probe(
         }
     }
 
-    let (mut diagonal, mut offdiagonal) = tridiagonalize_packed_with_probe(n, packed, probe);
-    // Refuse a broken reduction before a NaN reaches the QL sweep, where
-    // `NaN <= floor` is false forever. Costs O(n) against O(n³) above.
+    let (diagonal, offdiagonal) = tridiagonalize_packed_with_probe(n, packed, probe);
+    // Refuse a broken reduction here, where the input is known finite and the
+    // fault is the Householder step's; the QL solver would refuse it too, but
+    // only as an anonymous non-finite tridiagonal. Costs O(n) against O(n³).
     let broken = diagonal
         .iter()
         .chain(offdiagonal.iter())
@@ -163,7 +155,14 @@ pub fn packed_symmetric_spectrum_with_probe(
              produced a non-finite tridiagonal entry (flat index {index} over d, e, probe)"
         ));
     }
-    implicit_ql_with_probe(&mut diagonal, &mut offdiagonal, probe)?;
+    // `Wᵀ(Qᵀw)` by the workspace's single implicit-QL solver, which carries
+    // the probe through its rotations and deflates at `ε‖T‖_∞`.
+    let mut diagonal = gam_math::quadrature::symmetric_tridiagonal_eigen_with_probe(
+        &diagonal,
+        &offdiagonal[..n - 1],
+        probe,
+    )
+    .map_err(|error| format!("packed symmetric spectrum: {error}"))?;
     sort_spectrum_ascending(&mut diagonal, probe);
     for value in diagonal.iter_mut() {
         *value *= matrix_scale;
@@ -183,7 +182,7 @@ pub fn packed_symmetric_spectrum_with_probe(
 /// applying every reflector to `probe` so it leaves holding `Qᵀw`.
 ///
 /// Returns `(d, e)`: the diagonal (length `n`) and the sub/super-diagonal
-/// (length `n`, with `e[n-1] = 0` so the QL sweep can index it uniformly).
+/// (length `n`, with `e[n-1] = 0`; the QL solver takes the leading `n - 1`).
 fn tridiagonalize_packed_with_probe(
     n: usize,
     packed: &mut [f64],
@@ -396,133 +395,13 @@ fn serial_packed_symmetric_rank2_downdate(
     }
 }
 
-/// Implicit-shift QL on a symmetric tridiagonal, accumulating every rotation
-/// into `probe` (a single row of the eigenvector matrix's transpose) instead of
-/// into an `n × n` accumulator.
-///
-/// On entry `probe` holds `Qᵀw`; on return it holds `Wᵀ(Qᵀw) = Vᵀw` in the
-/// order the (unsorted) `diagonal` ends in.
-fn implicit_ql_with_probe(
-    diagonal: &mut [f64],
-    offdiagonal: &mut [f64],
-    probe: &mut [f64],
-) -> Result<(), String> {
-    let n = diagonal.len();
-    if n <= 1 {
-        return Ok(());
-    }
-    offdiagonal[n - 1] = 0.0;
-    // Absolute deflation floor: `eps · ‖T‖_∞`.
-    //
-    // THE RELATIVE TEST ALONE DOES NOT TERMINATE, and the failure is not
-    // exotic — it is what a rank-deficient Gram produces every time. On
-    // `F Fᵀ` with `F` of `296 × 148` standard normals, `‖T‖ ≈ 9·10²` while the
-    // 148 null directions arrive as `d ≈ 10⁻¹³`, `e ≈ 10⁻¹³`. The classical
-    // criterion asks `|e_i| ⩽ ε(|d_i| + |d_{i+1}|) ≈ 4·10⁻²⁹` there, which the
-    // plane rotations cannot reach: every sweep re-injects rounding of order
-    // `ε‖T‖ ≈ 2·10⁻¹³`. The sweep count then runs out on an eigenvalue that was
-    // already correct to every digit the arithmetic holds.
-    //
-    // Deflating at `ε‖T‖` perturbs `T` by exactly the amount its own
-    // factorization already carries, so the eigenvalues move by no more than
-    // the accuracy any backward-stable dense method delivers. What it forfeits
-    // is RELATIVE accuracy on eigenvalues below that floor — which is not a
-    // quantity this routine ever promised, and its certified consumer discards
-    // every mode inside its own `ε·rank·θ_max` floor as a null direction, a
-    // floor `rank` times WIDER than this one.
-    //
-    // The relative test is kept as well, and taken first: where it does apply
-    // (a graded matrix whose small eigenvalues are determined to high relative
-    // accuracy) it deflates earlier and gives up nothing.
-    let mut norm = 0.0_f64;
-    for i in 0..n {
-        let row = diagonal[i].abs()
-            + if i > 0 { offdiagonal[i - 1].abs() } else { 0.0 }
-            + offdiagonal[i].abs();
-        norm = norm.max(row);
-    }
-    let deflation_floor = f64::EPSILON * norm;
-    for l in 0..n {
-        let mut sweeps = 0usize;
-        loop {
-            // Split at the first negligible off-diagonal at or after `l`: the
-            // classical "adding it to the neighbouring diagonal magnitudes does
-            // not change them", or the absolute floor derived above.
-            let mut split = l;
-            while split + 1 < n {
-                let scale = diagonal[split].abs() + diagonal[split + 1].abs();
-                if offdiagonal[split].abs() + scale == scale
-                    || offdiagonal[split].abs() <= deflation_floor
-                {
-                    break;
-                }
-                split += 1;
-            }
-            if split == l {
-                break;
-            }
-            if sweeps == QL_MAX_SWEEPS_PER_EIGENVALUE {
-                return Err(format!(
-                    "packed symmetric spectrum: implicit QL did not deflate eigenvalue {l} in \
-                     {QL_MAX_SWEEPS_PER_EIGENVALUE} sweeps (block {l}..={split})"
-                ));
-            }
-            sweeps += 1;
-
-            // Wilkinson shift, formed from the leading 2x2 of the active block.
-            let mut g = (diagonal[l + 1] - diagonal[l]) / (2.0 * offdiagonal[l]);
-            let mut r = g.hypot(1.0);
-            g = diagonal[split] - diagonal[l]
-                + offdiagonal[l] / (g + if g >= 0.0 { r.abs() } else { -r.abs() });
-            let mut s = 1.0_f64;
-            let mut c = 1.0_f64;
-            let mut p = 0.0_f64;
-            let mut deflated_early = false;
-            for i in (l..split).rev() {
-                let mut f = s * offdiagonal[i];
-                let b = c * offdiagonal[i];
-                r = f.hypot(g);
-                offdiagonal[i + 1] = r;
-                if r == 0.0 {
-                    // An exactly-zero rotation radius splits the block here;
-                    // recover the shift and restart the sweep.
-                    diagonal[i + 1] -= p;
-                    offdiagonal[split] = 0.0;
-                    deflated_early = true;
-                    break;
-                }
-                s = f / r;
-                c = g / r;
-                g = diagonal[i + 1] - p;
-                r = (diagonal[i] - g) * s + 2.0 * c * b;
-                p = s * r;
-                diagonal[i + 1] = g + p;
-                g = c * r - b;
-                f = probe[i + 1];
-                probe[i + 1] = s * probe[i] + c * f;
-                probe[i] = c * probe[i] - s * f;
-            }
-            if deflated_early {
-                continue;
-            }
-            diagonal[l] -= p;
-            offdiagonal[l] = g;
-            offdiagonal[split] = 0.0;
-        }
-    }
-    Ok(())
-}
-
 /// Sort `(eigenvalue, probe)` pairs ascending by eigenvalue, keeping the
 /// pairing exact.
 fn sort_spectrum_ascending(diagonal: &mut [f64], probe: &mut [f64]) {
     let n = diagonal.len();
     let mut order: Vec<usize> = (0..n).collect();
     order.sort_by(|&a, &b| {
-        diagonal[a]
-            .partial_cmp(&diagonal[b])
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then(a.cmp(&b))
+        diagonal[a].total_cmp(&diagonal[b]).then(a.cmp(&b))
     });
     let sorted_diagonal: Vec<f64> = order.iter().map(|&i| diagonal[i]).collect();
     let sorted_probe: Vec<f64> = order.iter().map(|&i| probe[i]).collect();
@@ -612,6 +491,57 @@ mod tests {
         let error = packed_symmetric_spectrum_with_probe(2, &mut packed, &mut probe)
             .expect_err("a non-finite probe must refuse");
         assert!(error.contains("probe entry"), "unexpected error: {error}");
+    }
+
+    /// A rank-deficient Gram `F Fᵀ` delivers its null directions as a block
+    /// of `d, e ≈ ε‖T‖` that the classical relative split test can never
+    /// deflate; the shared QL solver's `ε‖T‖_∞` floor must, and the spectrum it
+    /// returns must still be the Gram's: `rank` modes above the null floor,
+    /// the trace, and the probe's mass.
+    #[test]
+    fn a_rank_deficient_gram_deflates_its_null_block() {
+        let (n, rank) = (200usize, 100usize);
+        let mut state = 0x5EED_u64;
+        let mut factor = vec![0.0_f64; n * rank];
+        for value in factor.iter_mut() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *value = (state >> 11) as f64 / (1_u64 << 53) as f64 - 0.5;
+        }
+        let mut packed = Vec::with_capacity(packed_upper_len(n));
+        let mut trace = 0.0_f64;
+        for i in 0..n {
+            for j in i..n {
+                let entry = dot(
+                    &factor[i * rank..(i + 1) * rank],
+                    &factor[j * rank..(j + 1) * rank],
+                );
+                if i == j {
+                    trace += entry;
+                }
+                packed.push(entry);
+            }
+        }
+        let mut probe: Vec<f64> = (0..n).map(|i| (0.29 * i as f64).cos()).collect();
+        let mass = dot(&probe, &probe);
+        let eigenvalues = packed_symmetric_spectrum_with_probe(n, &mut packed, &mut probe)
+            .expect("a rank-deficient Gram must decompose");
+        let largest = eigenvalues[n - 1];
+        // The exact zeros come back at `O(ε‖A‖)` and the smallest genuine mode
+        // of this `200 × 100` factor sits near `‖A‖/30`; `√ε·θ_max` lies
+        // geometrically between the two, so it separates them with room on
+        // both sides.
+        let null_floor = f64::EPSILON.sqrt() * largest;
+        let above = eigenvalues.iter().filter(|&&value| value > null_floor).count();
+        assert_eq!(above, rank, "the Gram has exactly {rank} non-null modes");
+        let spectral_trace = eigenvalues.iter().sum::<f64>();
+        let trace_tolerance = f64::EPSILON * (n * n) as f64 * largest;
+        assert!(
+            (spectral_trace - trace).abs() <= trace_tolerance,
+            "{spectral_trace} vs {trace}"
+        );
+        assert!((dot(&probe, &probe) - mass).abs() <= f64::EPSILON * (n * n) as f64 * mass);
     }
 
     /// The packed matvec above `PARALLEL_MIN_ROWS` splits its rows into

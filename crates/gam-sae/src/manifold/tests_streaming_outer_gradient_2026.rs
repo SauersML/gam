@@ -27,6 +27,7 @@
 //!     criterion on the whitened term.
 
 use super::*;
+use crate::manifold::tests_dense_solver_oracles::DeflatedArrowSolver;
 use crate::assignment::{AssignmentMode, SaeAssignment};
 use approx::assert_abs_diff_eq;
 use gam_solve::rho_optimizer::{FixedPointCoordinateCertificate, OuterObjective};
