@@ -169,12 +169,7 @@ fn slice_spectrum_3258(matrix: &Array2<f64>, q: &Array2<f64>, count: usize) -> V
 fn noisy_ring_weak_direction_is_the_periodic_phase_3258() {
     let (seed, target) = noisy_ring_seed_3258();
     let k = seed.k_atoms();
-    for (log_lambda, alpha) in [
-        (0.0_f64, 1.0_f64),
-        (0.0, 1.0e-2),
-        (2.0, 1.0e-3),
-        (4.0, 1.0e-4),
-    ] {
+    for (log_lambda, alpha) in [(0.0_f64, 1.0_f64), (0.0, 1.0e-2), (2.0, 1.0e-3)] {
         let lambda = vec![log_lambda.exp(); k];
         let ard = vec![vec![alpha]; k];
         let mut term = seed.clone();
@@ -338,15 +333,11 @@ fn noisy_ring_weak_direction_is_the_periodic_phase_3258() {
 /// phase out must decide the verdict instead: the phase-profiled certificate is certified
 /// or names the unresolved phases, and withholding the phase orbits refuses at the same
 /// state. Where the prior is strong the phase is resolved directly and nothing is profiled.
-#[test]
-fn noisy_ring_certificate_profiles_the_weak_periodic_phase_3258() {
+/// Each prior strength is its own test so one state's outcome never masks another's.
+fn phase_pin_3258(log_lambda: f64, alpha: f64, weak: bool) {
     let (seed, target) = noisy_ring_seed_3258();
     let k = seed.k_atoms();
-    for (log_lambda, alpha, weak) in [
-        (0.0_f64, 1.0_f64, false),
-        (2.0, 1.0e-3, true),
-        (4.0, 1.0e-4, true),
-    ] {
+    {
         let lambda = vec![log_lambda.exp(); k];
         let ard = vec![vec![alpha]; k];
         let mut term = seed.clone();
@@ -426,4 +417,19 @@ fn noisy_ring_certificate_profiles_the_weak_periodic_phase_3258() {
             assert!(report.phase_unresolved_atoms.is_empty());
         }
     }
+}
+
+#[test]
+fn phase_pin_3258_strong_prior() {
+    phase_pin_3258(0.0, 1.0, false);
+}
+
+#[test]
+fn phase_pin_3258_alpha_1e3() {
+    phase_pin_3258(2.0, 1.0e-3, true);
+}
+
+#[test]
+fn phase_pin_3258_alpha_1e4() {
+    phase_pin_3258(4.0, 1.0e-4, true);
 }

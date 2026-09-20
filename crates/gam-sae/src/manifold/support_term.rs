@@ -234,6 +234,14 @@ struct SupportPhaseOrbit {
     generator_reach: f64,
 }
 
+/// The phase-profiled certificate's outcome for one profiled set (#3258): its verdict, or
+/// the candidate orbits (by index) whose Rayleigh quotient on the profiled slice is at or
+/// below the shift that set needs, so the certificate at that set cannot hold.
+enum SupportPhaseProfile {
+    Verdict(SupportKantorovichVerdict),
+    Widen(Vec<usize>),
+}
+
 /// The exact Hessian's Lipschitz constant on a ball
 /// ([`SaeSupportSparseTerm::support_hessian_lipschitz_bound`], #2576), or why a basis ball
 /// bound it is built from does not exist there.
@@ -1264,6 +1272,20 @@ fn support_add_orbit_stiffness(exact: &mut Array2<f64>, symmetry: &Array2<f64>, 
     }
     let stiffness = shift + exact.diag().iter().copied().fold(0.0_f64, f64::max);
     ndarray::linalg::general_mat_mul(stiffness, symmetry, &symmetry.t(), 1.0, exact);
+}
+
+/// Whether `generator`'s component `v` off the span of `symmetry` has
+/// `vᵀ·sliced·v ≤ shift·‖v‖²` (#3258): then `sliced − shift·I ≻ 0` on that slice is false,
+/// whatever stiffness is added on the span, so no certificate at `shift` can hold there.
+fn support_rayleigh_at_or_below(
+    sliced: &Array2<f64>,
+    symmetry: &Array2<f64>,
+    generator: &Array1<f64>,
+    shift: f64,
+) -> bool {
+    let direction = support_project_off(symmetry, generator.view());
+    let norm_squared = direction.dot(&direction);
+    norm_squared > 0.0 && sliced.dot(&direction).dot(&direction) <= shift * norm_squared
 }
 
 /// The factorization [`certify_shifted_pd`] documents, on an already formed `A − τ·B`.
@@ -8696,15 +8718,11 @@ impl SaeSupportSparseTerm {
         // `v̂ᵀ(I − P)A(I − P)v̂ ≤ μ` makes `A − μ·I ≻ 0` on the slice false, so the
         // certificate above cannot hold at this iterate; those orbits, and only those, are
         // profiled out.
-        let profiled: Vec<SupportPhaseOrbit> = candidates
-            .into_iter()
-            .filter(|orbit| {
-                let direction = support_project_off(&symmetry, orbit.generator.view());
-                let norm_squared = direction.dot(&direction);
-                norm_squared > 0.0 && sliced.dot(&direction).dot(&direction) <= shift * norm_squared
-            })
+        let mut chosen: Vec<bool> = candidates
+            .iter()
+            .map(|orbit| support_rayleigh_at_or_below(&sliced, &symmetry, &orbit.generator, shift))
             .collect();
-        if profiled.is_empty() {
+        if !chosen.contains(&true) {
             let mut stiffened = sliced;
             support_add_orbit_stiffness(&mut stiffened, &symmetry, shift);
             return match certify_shifted_identity_pd(stiffened, shift) {
@@ -8741,17 +8759,44 @@ impl SaeSupportSparseTerm {
                     .to_string(),
             );
         };
-        self.support_phase_profiled_certificate(
-            exact,
-            gradient,
-            step,
-            generators,
-            &profiled,
-            gradient_band,
-            lipschitz,
-            aim,
-            bound,
-        )
+        // Profiling raises the shift the certificate needs (`L_Φ ≥ L`, and the stronger
+        // claim aims inside `bound`), so an orbit the direct shift passed can fall at or
+        // below the profiled one, where it defeats `A_Φ − μ·I ≻ 0` just as the first ones
+        // defeated `A − μ·I ≻ 0`. The profiled set is therefore closed under that test: it
+        // only grows, each widening is read off the Rayleigh quotients before any
+        // factorization, and it stops within the candidates' count.
+        loop {
+            let profiled: Vec<SupportPhaseOrbit> = candidates
+                .iter()
+                .zip(&chosen)
+                .filter(|(_, chosen)| **chosen)
+                .map(|(orbit, _)| orbit.clone())
+                .collect();
+            let remaining: Vec<(usize, &SupportPhaseOrbit)> = candidates
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !chosen[*index])
+                .collect();
+            match self.support_phase_profiled_certificate(
+                exact.clone(),
+                gradient.clone(),
+                step.clone(),
+                generators.clone(),
+                &profiled,
+                &remaining,
+                gradient_band,
+                lipschitz,
+                aim,
+                bound,
+            )? {
+                SupportPhaseProfile::Verdict(verdict) => return Ok(verdict),
+                SupportPhaseProfile::Widen(indices) => {
+                    for index in indices {
+                        chosen[index] = true;
+                    }
+                }
+            }
+        }
     }
 
     /// The certificate on the phase-profiled objective (#3258), for the orbits `profiled`
@@ -8792,6 +8837,12 @@ impl SaeSupportSparseTerm {
     /// outputs; without it the verdict is a refusal. The minimum itself is certified when
     /// `A_Φ − μ·I ≻ 0` also holds at the `μ` aimed at `(bound − D)/(1 + G)`, so that
     /// `t* + D + t*·G ≤ bound`. Otherwise the phases are reported unresolved.
+    ///
+    /// Closure. `remaining` are the candidate orbits (with their indices) not profiled. Its
+    /// atom's block of `A_Φ` is `A`'s, so one whose direction off this slice has Rayleigh
+    /// quotient at or below `μ + ε_A` makes `A_Φ − μ·I ≻ 0` false; those indices are
+    /// returned as [`SupportPhaseProfile::Widen`] before anything is factored, and the
+    /// caller profiles them too.
     #[allow(clippy::too_many_arguments)]
     fn support_phase_profiled_certificate(
         &self,
@@ -8800,11 +8851,12 @@ impl SaeSupportSparseTerm {
         step: Array1<f64>,
         mut generators: Vec<Array1<f64>>,
         profiled: &[SupportPhaseOrbit],
+        remaining: &[(usize, &SupportPhaseOrbit)],
         gradient_band: f64,
         lipschitz: f64,
         aim: f64,
         bound: f64,
-    ) -> Result<SupportKantorovichVerdict, String> {
+    ) -> Result<SupportPhaseProfile, String> {
         let formula = gam_linalg::roundoff::accumulation_growth(8);
         let mut profile_band_squared = 0.0_f64;
         let mut hessian_band = 0.0_f64;
@@ -8876,14 +8928,35 @@ impl SaeSupportSparseTerm {
             gradient_band + profile_band_squared.sqrt(),
         )?;
         let lipschitz = (lipschitz + lipschitz_extra) * (1.0 + formula);
+        let refuse = |reason: String| -> Result<SupportPhaseProfile, String> {
+            Ok(SupportPhaseProfile::Verdict(SupportKantorovichVerdict::NotCertified(reason)))
+        };
         if !(step_norm < aim) {
-            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+            return refuse(format!(
                 "Newton displacement off {} exact symmetry and phase directions ‖Δ‖₂ = \
                  {step_norm:.6e} is not below the bound {bound:.6e}",
                 symmetry.ncols()
-            )));
+            ));
         }
         let orbit_shift = support_kantorovich_shift(lipschitz, step_norm, error, aim);
+        // An unprofiled phase orbit at or below the orbit shift on this slice defeats
+        // `A_Φ − μ·I ≻ 0` there (its atom's block of `A_Φ` is `A`'s, the slot blocks being
+        // disjoint), so the set is widened before anything is factored.
+        let widen: Vec<usize> = remaining
+            .iter()
+            .filter(|(_, orbit)| {
+                support_rayleigh_at_or_below(
+                    &sliced,
+                    &symmetry,
+                    &orbit.generator,
+                    orbit_shift + hessian_band,
+                )
+            })
+            .map(|(index, _)| *index)
+            .collect();
+        if !widen.is_empty() {
+            return Ok(SupportPhaseProfile::Widen(widen));
+        }
         let full_aim = (aim - phase_offset) / (1.0 + phase_growth) * (1.0 - formula);
         let full_shift = (full_aim > step_norm)
             .then(|| support_kantorovich_shift(lipschitz, step_norm, error, full_aim));
@@ -8905,39 +8978,39 @@ impl SaeSupportSparseTerm {
         if !full_certified {
             if let Err(refusal) = certify_shifted_identity_pd(stiffened, orbit_shift + hessian_band)
             {
-                return Ok(SupportKantorovichVerdict::NotCertified(format!(
+                return refuse(format!(
                     "A_Φ − μ·I ≻ 0 not certified at μ = {orbit_shift:.6e} (+ {hessian_band:.3e}) \
                      off {} exact symmetry and phase directions of atoms {phase_atoms:?} (L_Φ = \
                      {lipschitz:.6e}, ‖Δ‖₂ = {step_norm:.6e}, solve and rounding error \
                      {error:.6e}, bound {bound:.6e}): {refusal:?}",
                     symmetry.ncols()
-                )));
+                ));
             }
         }
         let (orbit_eta, orbit_radius) =
             support_kantorovich_radius(lipschitz, orbit_shift, step_norm, error);
         if !(orbit_radius <= bound) {
-            return Ok(SupportKantorovichVerdict::NotCertified(format!(
+            return refuse(format!(
                 "the certified phase-profiled radius {orbit_radius:.17e} exceeds the bound \
                  {bound:.17e}"
-            )));
+            ));
         }
         // The minimum itself: the stronger claim, at the shift aimed at `(bound − D)/(1 + G)`.
         if let (true, Some(full)) = (full_certified, full_shift) {
             let (eta, radius) = support_kantorovich_radius(lipschitz, full, step_norm, error);
             let radius = (radius + phase_offset + radius * phase_growth) * norm_rounding;
             if radius <= bound {
-                return Ok(SupportKantorovichVerdict::Certified {
+                return Ok(SupportPhaseProfile::Verdict(SupportKantorovichVerdict::Certified {
                     radius,
                     shift: full,
                     lipschitz,
                     eta,
                     symmetry_directions: symmetry.ncols(),
                     profiled_phases: profiled.len(),
-                });
+                }));
             }
         }
-        Ok(SupportKantorovichVerdict::PhaseUnresolved {
+        Ok(SupportPhaseProfile::Verdict(SupportKantorovichVerdict::PhaseUnresolved {
             radius: orbit_radius,
             shift: orbit_shift,
             lipschitz,
@@ -8945,7 +9018,7 @@ impl SaeSupportSparseTerm {
             symmetry_directions: symmetry.ncols(),
             phase_atoms,
             phase_bound: (phase_offset + orbit_radius * phase_growth) * norm_rounding,
-        })
+        }))
     }
 
     /// Every row's discrete support, flattened with its length, so a carried
@@ -8995,47 +9068,23 @@ impl SaeSupportSparseTerm {
         let mut options = ArrowSolveOptions::inexact_pcg();
         options.pcg.relative_tolerance = stationarity_tolerance;
         options.trust_region.steihaug_relative_tolerance = stationarity_tolerance;
-        // Levenberg ladder seeded from the system's OWN curvature scale, so the
-        // first trial is a true Newton step and any damping that follows is
-        // measured in the units the block diagonal is already in -- never an
-        // absolute number. `sqrt(EPSILON)` is the smallest relative shift that
-        // survives the f64 assembly of that diagonal.
-        let curvature_scale = system
-            .hbb_diag
-            .as_ref()
-            .map(|diag| diag.iter().copied().fold(0.0_f64, |a, b| a.max(b.abs())))
-            .unwrap_or(0.0)
-            .max(
-                system
-                    .rows
-                    .iter()
-                    .map(|row| {
-                        (0..row.htt.nrows())
-                            .map(|i| row.htt[[i, i]].abs())
-                            .fold(0.0_f64, f64::max)
-                    })
-                    .fold(0.0_f64, f64::max),
-            );
-        let seed_ridge = f64::EPSILON.sqrt() * curvature_scale;
-        let mut step_pair = None;
-        let mut ridge = 0.0_f64;
-        let mut solve_attempts = 0usize;
-        let mut solve_iterations = 0usize;
-        let mut solve_refusal = String::new();
-        for attempt in 0..4 {
-            solve_attempts += 1;
-            match system.solve_with_options(ridge, ridge, &options) {
+        // #3676: one undamped solve. `B` is the PSD majorizer of the coupled step, so
+        // the solve is the true Newton step on it; the trust radius is infinite, so
+        // an `Ok` stops either converged or at its resolved product budget. A refusal
+        // (negative curvature, a PCG breakdown, a factor failure) is a defect of this
+        // state's system, reported as "no coupled step this cycle" for the caller's
+        // block sweeps and stall certificate -- never retried under a growing ridge
+        // until the solver stops refusing.
+        let (step_pair, solve_iterations, solve_refusal) =
+            match system.solve_with_options(0.0, 0.0, &options) {
                 Ok((delta_t, delta_beta, diagnostics)) => {
-                    solve_iterations += diagnostics.iterations;
                     // #2576: every CG iterate from zero lowers the majorizer's reduced
                     // quadratic model, and eliminating Δt exactly only adds
                     // −½·g_tᵀH_tt⁻¹g_t, so the full model is negative and gᵀd < 0.
                     // An iterate that spent its product budget is therefore a
-                    // descent direction the line search below already guards.
-                    // Refusing it discarded the direction and re-ran the whole
-                    // preconditioner ladder at three more ridges. The derived
-                    // tolerance stays the CG's target and the certificate's bar. A
-                    // gauge-pinned solve that spends its budget returns `Err`,
+                    // descent direction the line search below already guards. The
+                    // derived tolerance stays the CG's target and the certificate's
+                    // bar. A gauge-pinned solve that spends its budget returns `Err`,
                     // and stays refused.
                     let admissible = matches!(
                         diagnostics.stopping_reason,
@@ -9043,40 +9092,26 @@ impl SaeSupportSparseTerm {
                             | gam_solve::arrow_schur::PcgStopReason::BudgetExhausted
                     ) && diagnostics.final_relative_residual.is_finite();
                     if admissible {
-                        step_pair = Some((delta_t, delta_beta));
-                        break;
+                        (Some((delta_t, delta_beta)), diagnostics.iterations, String::new())
+                    } else {
+                        let refusal = format!(
+                            "stop={:?}, relative residual {:.3e}, requested {:.3e}",
+                            diagnostics.stopping_reason,
+                            diagnostics.final_relative_residual,
+                            stationarity_tolerance,
+                        );
+                        (None, diagnostics.iterations, refusal)
                     }
-                    solve_refusal = format!(
-                        "stop={:?}, relative residual {:.3e}, requested {:.3e}",
-                        diagnostics.stopping_reason,
-                        diagnostics.final_relative_residual,
-                        stationarity_tolerance,
-                    );
-                    log::trace!(
-                        "support joint Newton linear solve refused at ridge {ridge:.3e} \
-                         (attempt {attempt}): {solve_refusal}"
-                    );
                 }
-                Err(error) => {
-                    solve_refusal = error.to_string();
-                    log::trace!(
-                        "support joint Newton refused at ridge {ridge:.3e} (attempt {attempt}): {error}"
-                    );
-                }
-            }
-            if !(seed_ridge > 0.0) {
-                break;
-            }
-            ridge = if ridge > 0.0 { ridge * 16.0 } else { seed_ridge };
-        }
+                Err(error) => (None, 0, error.to_string()),
+            };
         let solved = step_start.elapsed();
         let (delta_t, delta_beta) = match step_pair {
             Some(pair) => pair,
             None => {
                 log::debug!(
-                    "support joint Newton: linear solve refused after {solve_attempts} attempt(s) \
-                     and {solve_iterations} PCG iterations ({solve_refusal}); assemble {:.2}s, \
-                     solve {:.2}s",
+                    "support joint Newton: linear solve refused after {solve_iterations} PCG \
+                     iterations ({solve_refusal}); assemble {:.2}s, solve {:.2}s",
                     assembled.as_secs_f64(),
                     (solved - assembled).as_secs_f64(),
                 );
@@ -9310,8 +9345,8 @@ impl SaeSupportSparseTerm {
                     "support joint Newton: accepted scale={scale:.6e} (2^-{halving} of \
                      {first_scale:.6e}, {model} model) predicted={predicted:+.3e} \
                      actual={:+.3e} ratio={:.3} objective={objective:.9e} -> {trial:.9e}; \
-                     assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG iterations over \
-                     {solve_attempts} attempt(s)), exact curvature {:.2}s, line search {:.2}s \
+                     assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG iterations), \
+                     exact curvature {:.2}s, line search {:.2}s \
                      over {} objective evaluation(s)",
                     objective - trial,
                     if predicted != 0.0 { (objective - trial) / predicted } else { f64::NAN },
@@ -9340,7 +9375,7 @@ impl SaeSupportSparseTerm {
         log::debug!(
             "support joint Newton: no measurable decrease along the {model} step after {} \
              objective evaluation(s); assemble {:.2}s, solve {:.2}s ({solve_iterations} PCG \
-             iterations over {solve_attempts} attempt(s)), exact curvature {:.2}s, line search \
+             iterations), exact curvature {:.2}s, line search \
              {:.2}s",
             halving + 1,
             assembled.as_secs_f64(),
