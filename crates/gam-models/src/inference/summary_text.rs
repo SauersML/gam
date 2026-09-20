@@ -72,9 +72,13 @@ pub fn render_summary_text(summary: &SummaryPayload) -> String {
     if let Some(adjusted) = summary.adjusted_r_squared {
         line("Adjusted R-squared", format_significant(adjusted));
     }
-    if let Some(scale) = summary.scale {
-        line("Scale estimate", format_significant(scale));
-    }
+    line(
+        "Scale estimate",
+        summary.scale.map_or_else(
+            || "none (the family's scale contract has no scalar dispersion)".to_string(),
+            format_significant,
+        ),
+    );
     line(
         "REML score",
         criterion_row(summary.reml_score, summary.raw_reml_score, format_significant),
@@ -583,5 +587,18 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
         assert!(!text.contains("Adjusted R-squared"), "{text}");
         assert!(text.contains("Corrected AIC: unavailable (no smoothing-parameter covariance)\n"), "{text}");
         assert!(text.contains("Smooth terms: unavailable (no frozen term spec)\n"), "{text}");
+    }
+
+    /// A family whose scale contract has no scalar dispersion (Royston-Parmar,
+    /// #3297) says so on the scale line instead of dropping it.
+    #[test]
+    fn a_fit_with_no_scalar_dispersion_says_so_3297() {
+        let mut summary = fixed_small_model();
+        summary.scale = None;
+        let text = render_summary_text(&summary);
+        assert!(
+            text.contains("Scale estimate: none (the family's scale contract has no scalar dispersion)\n"),
+            "{text}"
+        );
     }
 }

@@ -4793,7 +4793,7 @@
     "evidence": "At base 5834fb219d public_api_census.py reports exactly these 11 identities. At head none of the names occurs outside CHANGELOG.md and the ledgers (is_enabled here is ArrowSolvePrecisionPolicy::is_enabled; other is_enabled methods are untouched). cargo check --workspace --tests rc 0."
   },
   {
-    "base": "1c84d2a44acd352c766a2d6b80e1b2d9a864c06b",
+    "base": "1d02ffcb1218e325f5030aa3c767a7967264c05f",
     "removed": {
       "crates/gam-cli/src/main/model_summary.rs::build_model_summary": 1
     },

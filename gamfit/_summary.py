@@ -301,7 +301,7 @@ class Summary:
         its fixed structural penalties, one variance component per penalty on
         its own null scale, so it never reads the term's own fitted
         smoothing parameter, and its reference law (a weighted
-        :math:`\chi^2_1` sum, over :math:`\chi^2_\rho/\rho` when the scale is
+        :math:`\\chi^2_1` sum, over :math:`\\chi^2_\\rho/\\rho` when the scale is
         estimated) is the null law at the fitted smoothing parameters of the
         other terms; ``chi_sq`` is scaled so its null mean is ``ref_df``.
         Random-effect blocks carry the score test of their variance component
