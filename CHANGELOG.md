@@ -1,5 +1,12 @@
 ## Unreleased
 
+- **The CUDA device probe reports a failed attribute or name query instead of recording 0, `false` or a
+  positional name** (#4384). The shared-memory limit the SAE scoring kernels size against, the L2 size, ECC
+  and integrated flags and the device name now fail the probe with `DriverCallFailed` like every other
+  attribute. `GpuDeviceInfo::mig_mode`, which the probe never measured, is removed along with its
+  calibration fingerprint term, so existing GPU calibration caches are re-measured once. The unread
+  `GpuCapability` flags `has_tensor_cores`, `has_cluster_launch`, `has_tma` and `min_warp_size` are removed.
+
 - **The GPU device solve has one entry point and `GpuDispatchPolicy` keeps only live fields**
   (gam#3548). `gam::gpu::solver::cholesky_solve_only_gpu` is the one device solve entry
   point. `cholesky_solve_gpu`, which also returned a log-determinant that no caller read, is

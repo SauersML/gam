@@ -578,12 +578,9 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
     let minor = attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)?;
     Ok(GpuDeviceInfo {
         ordinal,
-        name: result::device::get_name(device).unwrap_or_else(|err| {
-            log::trace!(
-                "CUDA device {ordinal}: name query failed ({err}); using a positional label"
-            );
-            format!("CUDA device {ordinal}")
-        }),
+        name: result::device::get_name(device).map_err(|err| GpuError::DriverCallFailed {
+            reason: err.to_string(),
+        })?,
         capability: super::device::GpuCapability::from_compute_capability(major, minor),
         sm_count: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)?,
         max_threads_per_sm: attr(
@@ -591,18 +588,13 @@ fn cuda_device_info(ordinal: usize, ctx: &CudaContext) -> Result<GpuDeviceInfo, 
         )?,
         max_shared_mem_per_block: attr(
             sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-        )
-        .unwrap_or(0) as usize,
-        l2_cache_bytes: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)
-            .unwrap_or(0) as usize,
+        )? as usize,
+        l2_cache_bytes: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)?
+            as usize,
         total_mem_bytes,
         free_mem_bytes,
-        ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)
-            .unwrap_or(0)
-            != 0,
-        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED).unwrap_or(0)
-            != 0,
-        mig_mode: false,
+        ecc_enabled: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_ECC_ENABLED)? != 0,
+        integrated: attr(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_INTEGRATED)? != 0,
     })
 }
 
@@ -754,7 +746,6 @@ mod policy_resolution_contract_tests {
             free_mem_bytes: 0,
             ecc_enabled: false,
             integrated: false,
-            mig_mode: false,
         };
         let runtime = GpuRuntime {
             memory_budget_bytes: device.memory_budget_bytes(),
