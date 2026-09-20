@@ -10,12 +10,14 @@
 //! truncation, with the same kind of positive control. Every pin prints its numbers whether it passes or fails, so a
 //! green run is a receipt.
 
-use super::{BandedEnergy, KnownBlock, KnownGatedBlock, ResponseError, signed_sum};
+use super::{BandedEnergy, KnownBlock, KnownGatedBlock, ResponseError, pair_covariance, signed_sum};
+use gam_linalg::roundoff::accumulation_growth;
 use gam_math::gaussian_activation::{
     GaussianActivation, PreactivationPair, gaussian_smoothing_derivatives, pair_kernel,
 };
 use gam_math::gaussian_gated::silu_derivatives;
 use gam_math::probability::{normal_cdf, normal_pdf, standard_normal_quantile};
+use gam_math::roundoff::{UNIT_ROUNDOFF, inflated};
 use ndarray::{Array1, Array2, ArrayView1, ArrayView2, Axis, array, s};
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
@@ -597,7 +599,6 @@ fn a_rounding_scale_frame_defect_is_projected_and_a_stretched_frame_is_refused()
 
 #[test]
 fn a_signed_sum_carries_its_operand_bands_and_the_rounding_of_its_additions() {
-    use gam_linalg::roundoff::accumulation_growth;
     // Dyadic operands, so the value is exact and the expected band is rebuilt in the implementation's own order.
     let added = [
         BandedEnergy {
@@ -1109,5 +1110,202 @@ fn every_discarded_error_is_nonnegative_the_empty_frame_discards_the_total_and_t
             (turned.value - explained.value).abs() > turned.band + explained.band,
             "{activation:?}: a frame turned by 2^-20 must move V beyond the bands: {explained:?} vs {turned:?}",
         );
+    }
+}
+
+/// An exact law: variances `variance_x`, `variance_y` and covariance `covariance`, stated with no rounding.
+fn exact_pair(mean_x: f64, mean_y: f64, variance_x: f64, variance_y: f64, covariance: f64) -> PreactivationPair {
+    PreactivationPair {
+        mean_x,
+        mean_y,
+        variance_x,
+        variance_y,
+        covariance,
+        covariance_rounding: 0.0,
+    }
+}
+
+/// `K − m_x m_y` and `K`: the subtraction the compose step formed before #4351.
+fn raw_pair_covariance(activation: GaussianActivation, pair: PreactivationPair) -> (f64, f64) {
+    let kernel = pair_kernel(activation, pair).expect("the pair kernel");
+    let mean = |location: f64, variance: f64| {
+        let mut value = [0.0];
+        gaussian_smoothing_derivatives(activation, location, variance, &mut value).expect("the unit mean");
+        value[0]
+    };
+    (
+        kernel.value - mean(pair.mean_x, pair.variance_x) * mean(pair.mean_y, pair.variance_y),
+        kernel.value,
+    )
+}
+
+/// Checks `pair_covariance` against a reference. The value must lie within its band plus the rounding of the
+/// reference literal. The band must fall below one rounding of `K`, which the subtraction `K − m_x m_y` can never
+/// beat.
+fn assert_centred_covariance(
+    label: &str,
+    activation: GaussianActivation,
+    pair: PreactivationPair,
+    reference: f64,
+) -> (BandedEnergy, f64) {
+    let covariance = pair_covariance(activation, pair).expect("the centred pair covariance");
+    let (raw, kernel) = raw_pair_covariance(activation, pair);
+    let error = (covariance.value - reference).abs();
+    let allowed = covariance.band + accumulation_growth(1) * reference.abs();
+    eprintln!(
+        "#4351 {label} {activation:?}: centred {covariance:?}, reference {reference:e}, error {error:e} (allowed \
+         {allowed:e}); raw K − m m = {raw:e}, error {:e}, K = {kernel:e}",
+        (raw - reference).abs(),
+    );
+    assert!(
+        error <= allowed,
+        "{label}: {covariance:?} misses the reference {reference:e} by {error:e}"
+    );
+    assert!(
+        covariance.value.abs() > covariance.band,
+        "{label}: {covariance:?} must resolve the covariance from zero"
+    );
+    assert!(
+        covariance.band < UNIT_ROUNDOFF * kernel.abs(),
+        "{label}: the centred band {:e} must fall below one rounding of K = {kernel:e}",
+        covariance.band,
+    );
+    (covariance, raw)
+}
+
+#[test]
+fn pair_covariance_matches_the_delta_method_at_a_discarded_variance_of_1e_16() {
+    // ReLU at `b = 1`, `c = 2` with `s = 1e-8`. Both units sit `10⁸` standard deviations inside their linear piece,
+    // so `σ(X) = X` on all but `Φ(−10⁸)` of the mass. The covariance is therefore `r` itself, which is the delta
+    // method's `σ'(b) σ'(c) r` with both slopes `1`.
+    let variance = 1.0e-16;
+    let covariance = 0.3e-16;
+    let (_, raw) = assert_centred_covariance(
+        "ReLU delta",
+        GaussianActivation::Relu,
+        exact_pair(1.0, 2.0, variance, variance, covariance),
+        covariance,
+    );
+    // `K ≈ 2` and `m_x m_y ≈ 2` lie in `[1, 4)`, so their computed difference is a multiple of `2⁻⁵² ≈ 2.2e-16`. No
+    // such multiple comes within half of `3e-17`, so the subtraction keeps no digit.
+    assert!(
+        (raw - covariance).abs() > 0.5 * covariance,
+        "the raw ReLU subtraction {raw:e} unexpectedly resolved {covariance:e}",
+    );
+
+    // Exact GELU at `b = 0.7`, `c = −0.4`, with the same law. The reference is the exact covariance at these f64
+    // inputs, to 30 digits. It is `E σ(X) σ(Y)` less the closed-form means, where `E σ(X) σ(Y)` is adaptive quadrature
+    // over `E₁` of the closed-form smoothing of `σ` in `E₂`. It was computed at 60 and at 90 digits and agrees to 30
+    // digits with the Mehler series `Σ ρⁿ a_n b_n`.
+    let exact = 5.779_705_838_062_695_190_220_885e-18;
+    let (gelu, raw) = assert_centred_covariance(
+        "GELU delta",
+        GaussianActivation::ExactGelu,
+        exact_pair(0.7, -0.4, variance, variance, covariance),
+        exact,
+    );
+    // `σ'(0.7) σ'(−0.4) r` with `σ' = Φ + t φ`, at 40 digits.
+    let delta = 5.779_705_838_062_694_444_815_729e-18;
+    // The delta method's remainder has two parts.
+    // - The first chaos term. `a_1 = s E σ'(b + sE)`, and `|E σ'(b + sE) − σ'(b)| ≤ s² M₃/2`. Here
+    //   `M₃ = sup|σ⁽³⁾| = sup|(t³ − 4t) φ(t)| = 0.778 77…`, attained at `t² = (7 − √33)/2`. So the first term moves by at
+    //   most `|ρ| s_x s_y (L (v + w) M₃/2 + v w M₃²/4)`, with `L = sup|σ'|`.
+    // - The rest. It is at most `ρ² √(Σ_{n≥2} a_n²) √(Σ_{n≥2} b_n²)`, and
+    //   `Σ_{n≥2} a_n² ≤ ½ Σ n(n−1) a_n² = ½ s⁴ E σ''(b + sE)² ≤ ½ s⁴ M₂²`, with `M₂ = sup|(2 − t²) φ(t)| = 2 φ(0)`.
+    let slope = GaussianActivation::ExactGelu
+        .slope_bound_squared()
+        .expect("the GELU slope bound")
+        .sqrt();
+    let third = 0.7788;
+    let second = 0.798;
+    let correlation = covariance / variance;
+    let remainder = correlation.abs() * variance * (slope * variance * third + variance * variance * third * third / 4.0)
+        + correlation * correlation * variance * variance * second * second / 2.0;
+    // Forming the remainder takes seventeen roundings.
+    let delta_error = (gelu.value - delta).abs();
+    let delta_allowed = gelu.band + inflated(remainder, 17) + accumulation_growth(1) * delta;
+    eprintln!("#4351 GELU delta method {delta:e}: error {delta_error:e}, allowed {delta_allowed:e}");
+    assert!(
+        delta_error <= delta_allowed,
+        "GELU: {gelu:?} is {delta_error:e} from the delta method {delta:e}"
+    );
+    // `K ≈ σ(0.7) σ(−0.4) ≈ −0.073` and `m_x m_y` both have magnitude in `[2⁻⁴, 2⁻³)`, so their difference is a
+    // multiple of `2⁻⁵⁶ ≈ 1.4e-17`. None comes within half of `5.8e-18`.
+    assert!(
+        (raw - exact).abs() > 0.5 * exact,
+        "the raw GELU subtraction {raw:e} unexpectedly resolved {exact:e}",
+    );
+}
+
+#[test]
+fn pair_covariance_keeps_its_digits_at_small_correlation() {
+    // ReLU at zero means, `v = w = 1`, `ρ = 10⁻⁶`. Here `K = (√(1 − ρ²) + ρ(π − acos ρ))/(2π)` is compared with
+    // `m² = 1/(2π)`, so the subtraction keeps about ten digits. The reference is that closed form at 50 digits, at
+    // the f64 `ρ`.
+    assert_centred_covariance(
+        "ReLU zero means",
+        GaussianActivation::Relu,
+        exact_pair(0.0, 0.0, 1.0, 1.0, 1.0e-6),
+        2.500_000_795_774_715_346_413_201e-7,
+    );
+    // ReLU at `b = 0.5`, `c = −0.3`, `ρ = 10⁻⁸`. The reference is quadrature of `E σ(X) σ(Y)` less the means, at 60
+    // and at 90 digits. It agrees with the Mehler series of the exact coefficients `a_n = Φ^{(n−1)}(b)/√(n!)`.
+    assert_centred_covariance(
+        "ReLU biased",
+        GaussianActivation::Relu,
+        exact_pair(0.5, -0.3, 1.0, 1.0, 1.0e-8),
+        2.641_999_091_092_812_169_561_513e-9,
+    );
+}
+
+#[test]
+fn pair_covariance_keeps_its_digits_at_large_means() {
+    // `b = c = 10⁶` with unit variances. Both units are linear on all but `Φ(−10⁶)` of the mass, so the covariance is
+    // exactly `r`. Meanwhile `K ≈ 10¹²` leaves the subtraction an error near `10⁻⁴`.
+    for activation in [GaussianActivation::Relu, GaussianActivation::ExactGelu] {
+        for covariance in [0.3, -0.3] {
+            let pair = exact_pair(1.0e6, 1.0e6, 1.0, 1.0, covariance);
+            let centred = pair_covariance(activation, pair).expect("the centred pair covariance");
+            let (raw, kernel) = raw_pair_covariance(activation, pair);
+            let error = (centred.value - covariance).abs();
+            eprintln!(
+                "#4351 large means {activation:?} r = {covariance}: centred {centred:?}, error {error:e}; raw {raw:e}, \
+                 error {:e}, K = {kernel:e}",
+                (raw - covariance).abs(),
+            );
+            assert!(
+                error <= centred.band,
+                "{activation:?}: {centred:?} misses r = {covariance}"
+            );
+            assert!(centred.value.abs() > centred.band);
+            assert!(centred.band < UNIT_ROUNDOFF * kernel.abs());
+        }
+    }
+}
+
+#[test]
+fn pair_covariance_keeps_the_closed_form_on_the_diagonal() {
+    // `ρ = 1` at zero means. The ReLU tail decays only like `1/N`, so the series cannot beat the closed form. The value
+    // is `1/2 − 1/(2π)` within the closed form's band.
+    let exact = 0.340_845_056_908_104_664_231_116_2;
+    let covariance = pair_covariance(GaussianActivation::Relu, exact_pair(0.0, 0.0, 1.0, 1.0, 1.0))
+        .expect("the diagonal pair covariance");
+    eprintln!("#4351 diagonal: {covariance:?} against {exact:e}");
+    assert!((covariance.value - exact).abs() <= covariance.band + accumulation_growth(1) * exact);
+    assert!(covariance.resolved_positive());
+}
+
+#[test]
+fn pair_covariance_is_exactly_zero_for_independent_units() {
+    for activation in [GaussianActivation::Relu, GaussianActivation::ExactGelu] {
+        for pair in [
+            exact_pair(0.4, -0.2, 0.0, 1.0, 0.0),
+            exact_pair(0.4, -0.2, 1.0, 0.5, 0.0),
+        ] {
+            assert_eq!(
+                pair_covariance(activation, pair).expect("an independent pair"),
+                BandedEnergy::ZERO
+            );
+        }
     }
 }

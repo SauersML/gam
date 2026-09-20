@@ -15,7 +15,8 @@
 //! ```
 //!
 //! with `K_σ` the biased pair kernel at the DISCARDED covariance. `Y | PZ` is the pushforward of that Gaussian by `U σ`:
-//! known, and not Gaussian.
+//! known, and not Gaussian. `C_jl` vanishes with the discarded variances while `K_σ` and `τ_j τ_l` do not, so it is
+//! formed centred, by the Mehler series where that is the tighter route ([`pair_covariance`]).
 //!
 //! # Exact compositions
 //!
@@ -113,8 +114,8 @@
 //! so no `h₁ × h₁` matrix is resident.
 
 use super::subspace::{
-    CovarianceFormation, KnownBlock, ResponseError, covariance_rounding_band, frame_defect, pair_moments, require_finite,
-    require_length, smoothing,
+    CovarianceFormation, KnownBlock, ResponseError, covariance_rounding_band, frame_defect, pair_covariance,
+    require_finite, require_length, smoothing,
 };
 use gam_linalg::faer_ndarray::{fast_ab, fast_abt, fast_atb};
 use gam_linalg::roundoff::accumulation_growth;
@@ -796,7 +797,9 @@ impl DiscardedLaw {
                                 self.discarded_variances[unit],
                                 self.discarded_variances[other],
                             );
-                            let second_moment = pair_moments(
+                            // Centred: `K − m_j m_l` would keep only `u (|K| + |m_j m_l|)` of a covariance that
+                            // vanishes with the discarded variances (#4351).
+                            covariance_row[other] = pair_covariance(
                                 activation,
                                 PreactivationPair {
                                     mean_x: self.means[[point, unit]],
@@ -808,8 +811,6 @@ impl DiscardedLaw {
                                 },
                             )?
                             .value;
-                            covariance_row[other] =
-                                second_moment - self.unit_means[[point, unit]] * self.unit_means[[point, other]];
                         }
                         contribution += &(&left.row(unit) * &right.t().dot(&covariance_row));
                     }

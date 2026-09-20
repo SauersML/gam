@@ -83,7 +83,7 @@ use std::fmt;
 /// the correlation, per order the coefficient product and Horner's product and sum, and the closing product by the
 /// correlation. The slope's Horner step takes the same product and sum. The coefficients' own errors are the
 /// producer's bounds and enter the row band separately.
-fn chaos_operations(order: usize) -> usize {
+pub(crate) fn chaos_operations(order: usize) -> usize {
     3 * order + 3
 }
 
