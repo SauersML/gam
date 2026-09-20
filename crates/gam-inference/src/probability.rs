@@ -783,9 +783,9 @@ pub fn tweedie_moment_matched_interval(
 }
 
 /// Both regularized incomplete gamma tails at once, `(P(a, x), Q(a, x))`, each
-/// accurate to a relative ulp across the whole domain. `P(a, x) = γ(a, x) / Γ(a)`
-/// is the CDF of a unit-scale `Gamma(shape = a)` variate and `Q = 1 − P` is its
-/// survival function.
+/// accurate to a relative ulp times the problem's own conditioning. `P(a, x) =
+/// γ(a, x) / Γ(a)` is the CDF of a unit-scale `Gamma(shape = a)` variate and
+/// `Q = 1 − P` is its survival function.
 ///
 /// The pair is returned rather than `P` alone because the two are not
 /// interchangeable in `f64`: whichever of them is small carries information the
@@ -799,40 +799,69 @@ pub fn tweedie_moment_matched_interval(
 /// own it rather than borrowing `statrs::gamma_lr`. That routine hard-clamps to
 /// `0.0` for every `x ≤ 1.11e-15` (its `almost_eq(x, 0)` guard, with accuracy
 /// `DEFAULT_F64_ACC`), which silently zeroes the residual `P(a, x) − p` in the
-/// small-shape lower tail: the Halley iterate is then driven *up* — away from a
-/// good sub-`1e-15` seed — until `x` crosses that clamp around `~1.6e-15`, where
-/// the returned point carries far more mass than `p` (#1018). The Numerical
-/// Recipes split — a power series for `x < a + 1`, the modified-Lentz continued
-/// fraction for the complement `Q = 1 − P` otherwise — keeps the leading
-/// `exp(a·ln x − x − ln Γ(a))` factor in logs, so the value stays finite and
-/// nonzero for arguments far below that clamp, and always evaluates the *smaller*
-/// tail directly (no catastrophic cancellation near either edge).
+/// small-shape lower tail (#1018).
+///
+/// Three evaluations, each used exactly where it is certified (#4068):
+///
+/// * Temme's uniform asymptotic expansion ([`temme_incomplete_gamma_pair`]),
+///   whenever its `1/a` correction series certifies convergence to `ε`. Its
+///   cost does not grow with `a`, and its accuracy is uniform in `x / a`, so it
+///   carries the transition region `x ≈ a` where the other two need `O(√a)`
+///   terms (and, once `a + 1 == a`, stall outright).
+/// * Otherwise the Numerical Recipes split: a power series for `x < a + 1`, the
+///   modified-Lentz continued fraction for the complement `Q = 1 − P` otherwise.
+///   Each runs to its own stopping test — no term cap, whose silent truncation
+///   used to hand back a partial sum as a converged value — and returns NaN if
+///   that test can never be met, which the band code already reads as "no band".
+///
+/// All three share the prefactor `x^a e^{−x} / Γ(a)` in the form
+/// `e^{−a·h} √(a/2π) / Γ*(a)`, `h = λ − 1 − ln λ`, `λ = x / a`
+/// ([`incomplete_gamma_prefactor`]): the textbook `exp(a·ln x − x − ln Γ(a))`
+/// is a difference of terms of size `a·ln a` and loses that many ulp of it.
 fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
-    use statrs::function::gamma::ln_gamma;
-    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream; a
-    // non-positive `a` would only mis-feed `ln_gamma`, never UB.
+    // Callers (`inverse_regularized_lower_gamma`) validate `a > 0` upstream.
+    if x.is_nan() || a.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
     if x <= 0.0 {
         return (0.0, 1.0);
     }
-    let gln = ln_gamma(a);
+    if x == f64::INFINITY {
+        return (1.0, 0.0);
+    }
+    if let Some(pair) = temme_incomplete_gamma_pair(a, x) {
+        return pair;
+    }
+    let prefactor = incomplete_gamma_prefactor(a, x);
     if x < a + 1.0 {
-        // Power series: P(a,x) = exp(a·ln x − x − ln Γ(a)) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
+        // Power series: P(a,x) = x^a e^{−x}/Γ(a) · Σ_{n≥0} xⁿ / Π_{k=0}^{n}(a+k).
         // The running term `del` is the ratio form, so no factorial overflows.
+        // The terms after `del` are bounded by the geometric series of ratio
+        // `x / (ap + 1)`, so once that bound is below `ε·sum` every digit the
+        // sum can hold is in it. The ratio falls below 1 after at most `x − a`
+        // terms and the bound then only shrinks, so the loop ends unless the
+        // denominator itself stops advancing (`ap + 1 == ap`, i.e. `a ≥ 2^53`
+        // with `x` so close to `a` that Temme would have taken it): then the
+        // test can never be met, and the answer is NaN, not a partial sum.
         let mut ap = a;
         let mut del = 1.0 / a;
         let mut sum = del;
-        for _ in 0..1000 {
-            ap += 1.0;
-            del *= x / ap;
-            sum += del;
-            if del.abs() <= sum.abs() * f64::EPSILON {
+        loop {
+            let next = ap + 1.0;
+            if next > x && del * x <= f64::EPSILON * sum * (next - x) {
                 break;
             }
+            if next == ap || !sum.is_finite() {
+                return (f64::NAN, f64::NAN);
+            }
+            ap = next;
+            del *= x / ap;
+            sum += del;
         }
         // The series branch is entered only for `x < a + 1`, where `P` is bounded
         // by `P(a, a+1) < 3/4`, so the complement is a subtraction of unequal
         // magnitudes and keeps every digit `P` has.
-        let p = (sum.ln() + a * x.ln() - x - gln).exp();
+        let p = prefactor * sum;
         (p, 1.0 - p)
     } else {
         // Modified-Lentz continued fraction for Q(a,x) = 1 − P(a,x); P = 1 − Q.
@@ -845,12 +874,21 @@ fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
         // depend on it, so it is the arithmetic's own smallest normal, not a
         // chosen magnitude (#2469).
         const LENTZ_TINY: f64 = f64::MIN_POSITIVE;
+        // Each factor `del = d·c` is a product of two quotients, each a
+        // correctly rounded division of a correctly rounded sum: four roundings,
+        // so `|del − 1| ≤ 4ε` is as close to 1 as a computed factor can be
+        // certified. The fraction has converged once a factor reaches `ε` (the
+        // Numerical Recipes test) or, inside that rounding band, stops getting
+        // closer to 1 — further factors are rounding noise, not convergence.
+        const FACTOR_ROUNDING: f64 = 4.0 * f64::EPSILON;
         let mut b = x + 1.0 - a;
         let mut c = 1.0 / LENTZ_TINY;
         let mut d = 1.0 / b;
         let mut h = d;
-        for i in 1..1000 {
-            let an = -(i as f64) * (i as f64 - a);
+        let mut previous_distance = f64::INFINITY;
+        let mut i = 1.0_f64;
+        loop {
+            let an = -i * (i - a);
             b += 2.0;
             d = an * d + b;
             if d.abs() < LENTZ_TINY {
@@ -863,12 +901,290 @@ fn regularized_incomplete_gamma_pair(a: f64, x: f64) -> (f64, f64) {
             d = 1.0 / d;
             let del = d * c;
             h *= del;
-            if (del - 1.0).abs() <= f64::EPSILON {
+            let distance = (del - 1.0).abs();
+            if !distance.is_finite() || !h.is_finite() {
+                return (f64::NAN, f64::NAN);
+            }
+            if distance <= f64::EPSILON
+                || (distance <= FACTOR_ROUNDING && distance >= previous_distance)
+            {
                 break;
             }
+            previous_distance = distance;
+            i += 1.0;
         }
-        let q = (a * x.ln() - x - gln + h.ln()).exp();
+        let q = prefactor * h;
         (1.0 - q, q)
+    }
+}
+
+/// Taylor degree, in `ζ`, of the function `f(ζ) = ζ / (μ(ζ) − 1)` the Temme
+/// coefficient table is derived from. The table's size decides only where the
+/// expansion is *used*: [`temme_correction`] certifies each evaluation against
+/// the truncation of the table and declines where it does not suffice, and the
+/// series or continued fraction then take the point.
+const TEMME_TAYLOR_DEGREE: usize = 64;
+
+/// Number of `1/a` orders in the Temme table. Each order differentiates the
+/// previous one, costing two Taylor degrees, so this spends most of
+/// [`TEMME_TAYLOR_DEGREE`].
+const TEMME_ORDERS: usize = 25;
+
+/// Radius of convergence, in `η`, of the Temme coefficients `C_k(η)`. With
+/// `½η² = λ − 1 − ln λ`, the map `η ↦ λ` branches where `dη/dλ` is infinite,
+/// i.e. at `λ = 1` on the other sheets of the logarithm, `ln λ = 2πik`:
+/// `η² = ∓4πi`, four square-root branch points on the circle `|η| = 2√π`.
+const TEMME_ETA_RADIUS: f64 = 3.544_907_701_811_032;
+
+/// The Temme expansion's coefficients, derived once from their defining
+/// recurrences rather than transcribed.
+struct TemmeTable {
+    /// `γ_k` in Stirling's series `Γ*(a) = Σ_k γ_k a^{−k}`, where
+    /// `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`.
+    stirling: Vec<f64>,
+    /// Taylor coefficients in `η` of `C_k(η)`, `k = 0, 1, …`, the coefficients
+    /// of Temme's correction series `S(a, η) = Σ_k C_k(η) a^{−k}`.
+    orders: Vec<Vec<f64>>,
+    /// Per order, the Darboux envelope `max |c_j| ρ^j` over the last full
+    /// period of the kept coefficients, `ρ = TEMME_ETA_RADIUS`. The four branch
+    /// points share the modulus `ρ` at angles `±π/4, ±3π/4`, so `|c_j| ρ^j`
+    /// oscillates with period 8 in `j` (dipping near zero on some `j`) about an
+    /// envelope that grows at most like `j^k`; one full period recovers it where
+    /// the last coefficient alone can sit on a dip.
+    envelopes: Vec<f64>,
+}
+
+/// Derive [`TemmeTable`] (Temme 1979; DiDonato & Morris 1986, §4).
+///
+/// Substituting `t = aμ` with `μ − 1 − ln μ = ½ζ²` in `Γ(a, x)` gives
+/// `Q(a, x) = √(a/2π)/Γ*(a) ∫_η^∞ e^{−aζ²/2} f(ζ) dζ` with `f(ζ) = ζ/(μ − 1)`
+/// (the `1/ζ` and `1/(μ − 1)` poles cancel). Integrating by parts repeatedly,
+/// `f_0 = f`, `f_k = γ'_k + ζ g_k`, `f_{k+1} = g_k'`, peels off
+/// `γ'_k = f_k(0)` against the Gaussian integral and leaves
+/// `Q = ½ erfc(η√(a/2)) + e^{−aη²/2}/√(2πa) · S` with
+/// `S = (Σ g_k(η) a^{−k}) / (Σ γ'_k a^{−k})`. The `γ'_k` are Stirling's `γ_k`
+/// (the `η = x`-free case of the same integral is `Γ(a)` itself), so the
+/// denominator is `Γ*(a)` and `C_k` follows by dividing the two series.
+///
+/// `μ − 1 = u(ζ) = Σ m_j ζ^j` is the reversion of `u − ln(1 + u) = ½ζ²`. Its
+/// power-series reversion is catastrophically ill-conditioned in `f64`;
+/// differentiating instead gives `u·u′ = ζ(1 + u)`, whose `ζⁿ` coefficient is
+/// `(n+1) m_n + Σ_{i=2}^{n−1} m_i (n+1−i) m_{n+1−i} = m_{n−1}` — a forward
+/// recurrence with `m_1 = 1` (the branch on which `μ` increases with `ζ`) and
+/// coefficients accurate to a few ulp of their row.
+fn temme_table() -> &'static TemmeTable {
+    static TABLE: std::sync::OnceLock<TemmeTable> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let degree = TEMME_TAYLOR_DEGREE;
+        let mut m = vec![0.0_f64; degree + 2];
+        m[1] = 1.0;
+        for n in 2..degree + 2 {
+            let mut s = m[n - 1];
+            for i in 2..n {
+                s -= m[i] * (n + 1 - i) as f64 * m[n + 1 - i];
+            }
+            m[n] = s / (n + 1) as f64;
+        }
+        // f = ζ/u = 1 / (Σ_j m_{j+1} ζ^j), by series division.
+        let mut f = vec![0.0_f64; degree + 1];
+        f[0] = 1.0;
+        for n in 1..=degree {
+            let mut s = 0.0;
+            for j in 1..=n {
+                s += m[j + 1] * f[n - j];
+            }
+            f[n] = -s;
+        }
+        let mut stirling = Vec::with_capacity(TEMME_ORDERS);
+        let mut numerators: Vec<Vec<f64>> = Vec::with_capacity(TEMME_ORDERS);
+        let mut fk = f;
+        for _ in 0..TEMME_ORDERS {
+            stirling.push(fk[0]);
+            let gk: Vec<f64> = fk[1..].to_vec();
+            fk = (1..gk.len()).map(|n| gk[n] * n as f64).collect();
+            numerators.push(gk);
+        }
+        // C_k = g_k − Σ_{j=1}^{k} γ_j C_{k−j}, on the Taylor degrees all of
+        // them carry.
+        let mut orders: Vec<Vec<f64>> = Vec::with_capacity(TEMME_ORDERS);
+        for k in 0..TEMME_ORDERS {
+            let len = if k == 0 {
+                numerators[0].len()
+            } else {
+                numerators[k].len().min(orders[k - 1].len())
+            };
+            let mut row = numerators[k][..len].to_vec();
+            for j in 1..=k {
+                for (n, entry) in row.iter_mut().enumerate() {
+                    *entry -= stirling[j] * orders[k - j][n];
+                }
+            }
+            orders.push(row);
+        }
+        const DARBOUX_PERIOD: usize = 8;
+        let envelopes = orders
+            .iter()
+            .map(|row| {
+                let start = row.len().saturating_sub(DARBOUX_PERIOD);
+                (start..row.len())
+                    .map(|j| row[j].abs() * TEMME_ETA_RADIUS.powi(j as i32))
+                    .fold(0.0, f64::max)
+            })
+            .collect();
+        TemmeTable {
+            stirling,
+            orders,
+            envelopes,
+        }
+    })
+}
+
+/// `ln(1 + μ) − μ` for `μ > −1`, without the cancellation of forming it
+/// directly near `μ = 0`. With `t = μ / (2 + μ)`,
+/// `ln(1 + μ) = 2 artanh t = 2 Σ_{n odd} tⁿ/n` and `μ = 2t / (1 − t) =
+/// 2 Σ_{n≥1} tⁿ`, so `ln(1 + μ) − μ = −Σ_{n≥2} c_n tⁿ` with `c_n = 2` for even
+/// `n` and `2 − 2/n` for odd `n`. The terms share a sign and `c_n ≤ 2`, so the
+/// tail after `tⁿ` is at most `2|t|^{n+1}/(1 − |t|)`: the sum stops on that
+/// bound. For `|t| > ½` (`μ` outside `(−⅔, 2)`) the direct form subtracts
+/// unequal magnitudes and is used as is.
+fn ln_1p_minus(mu: f64) -> f64 {
+    let t = mu / (2.0 + mu);
+    if t.abs() > 0.5 {
+        return mu.ln_1p() - mu;
+    }
+    let mut power = t;
+    let mut sum = 0.0;
+    let mut n = 1_u32;
+    loop {
+        n += 1;
+        power *= t;
+        let c = if n % 2 == 0 { 2.0 } else { 2.0 - 2.0 / f64::from(n) };
+        sum += c * power;
+        if 2.0 * (power * t).abs() <= f64::EPSILON * sum.abs() * (1.0 - t.abs()) {
+            return -sum;
+        }
+    }
+}
+
+/// `a·h ≥ 0`, `h = λ − 1 − ln λ` at `λ = x / a`: the exponent of the gamma
+/// prefactor. Near `λ = 1` it is formed as `−a·(ln(1 + μ) − μ)` from
+/// `μ = (x − a)/a` — exact subtraction there by Sterbenz — through
+/// [`ln_1p_minus`]. Away from it, as `(x − a) − a·ln λ`, whose logarithm keeps
+/// its relative accuracy however small `λ` is (`1 + μ` would not); where `λ`
+/// itself leaves the floating range (a subnormal `a`), `ln λ = ln x − ln a`.
+fn gamma_exponent(a: f64, x: f64) -> f64 {
+    let lambda = x / a;
+    if (1.0 / 3.0..=3.0).contains(&lambda) {
+        -a * ln_1p_minus((x - a) / a)
+    } else {
+        let ln_lambda = if lambda.is_normal() {
+            lambda.ln()
+        } else {
+            x.ln() - a.ln()
+        };
+        (x - a) - a * ln_lambda
+    }
+}
+
+/// `ln Γ*(a)`, `Γ*(a) = Γ(a) / (√(2π) a^{a−½} e^{−a})`. Stirling's series from
+/// [`temme_table`] where its terms reach `ε` before the table ends (the series
+/// is asymptotic: its terms fall until `k ≈ 2πa`, and the first omitted term
+/// bounds the error); otherwise `a` is small enough that `ln Γ(a)` and
+/// `(a − ½) ln a − a` are of the size of `ln Γ*(a)` itself and the difference
+/// loses nothing.
+fn ln_gamma_star(a: f64) -> f64 {
+    let stirling = &temme_table().stirling;
+    let mut sum = 0.0;
+    let mut scale = 1.0;
+    for &gamma_k in stirling {
+        let term = gamma_k * scale;
+        sum += term;
+        if term.abs() <= f64::EPSILON * sum.abs() {
+            return sum.ln();
+        }
+        scale /= a;
+    }
+    statrs::function::gamma::ln_gamma(a) - (a - 0.5) * a.ln() + a
+        - 0.5 * (2.0 * std::f64::consts::PI).ln()
+}
+
+/// The gamma prefactor `x^a e^{−x} / Γ(a) = e^{−a·h} √(a/2π) / Γ*(a)`,
+/// `h = λ − 1 − ln λ`. The exponent `a·h` ([`gamma_exponent`]) is never formed
+/// as `a·ln x − x − ln Γ(a)`, which cancels to it from terms of size `a·ln a`;
+/// its rounding is `h`'s own, which is the conditioning of `e^{−a·h}` itself.
+fn incomplete_gamma_prefactor(a: f64, x: f64) -> f64 {
+    let exponent = -gamma_exponent(a, x) + 0.5 * (a / (2.0 * std::f64::consts::PI)).ln()
+        - ln_gamma_star(a);
+    exponent.exp()
+}
+
+/// Temme's correction series `S(a, η) = Σ_k C_k(η) a^{−k}`, or `None` where it
+/// is not certified to `ε`.
+///
+/// Each `C_k` is a truncated Taylor series of degree `d`. Its coefficients
+/// follow the Darboux envelope `|c_j| ≤ M_k (j/d)^k ρ^{−j}` beyond the table
+/// (`M_k` from [`TemmeTable::envelopes`]; each order is one more derivative of
+/// a square-root singularity, so the growth exponent is below `k`). With
+/// `r = |η|/ρ` and `(1 + i/d)^k ≤ e^{ik/d}`, the omitted tail is at most
+/// `M_k r^d · q/(1 − q)`, `q = r e^{k/d}`, and the order is declined where
+/// `q ≥ 1`. The series
+/// in `1/a` is asymptotic, so it is accepted at the first order whose term is
+/// below `ε·|S|` — provided the accumulated Taylor truncation is too — and
+/// declined as soon as a term grows (the series has begun to diverge) or the
+/// table runs out.
+fn temme_correction(a: f64, eta: f64) -> Option<f64> {
+    let table = temme_table();
+    let r = eta.abs() / TEMME_ETA_RADIUS;
+    let mut sum = 0.0_f64;
+    let mut truncation = 0.0_f64;
+    let mut scale = 1.0_f64;
+    let mut previous_term = f64::INFINITY;
+    for (k, (row, &envelope)) in table.orders.iter().zip(&table.envelopes).enumerate() {
+        let degree = row.len().checked_sub(1)?;
+        let q = r * (k as f64 / degree as f64).exp();
+        if q >= 1.0 {
+            return None;
+        }
+        let value = row.iter().rev().fold(0.0, |acc, &c| acc * eta + c);
+        let term = value * scale;
+        sum += term;
+        truncation += envelope * r.powi(degree as i32) * q / (1.0 - q) * scale;
+        if k > 0 && term.abs() <= f64::EPSILON * sum.abs() {
+            return (truncation <= f64::EPSILON * sum.abs()).then_some(sum);
+        }
+        if k > 0 && term.abs() >= previous_term {
+            return None;
+        }
+        previous_term = term.abs();
+        scale /= a;
+    }
+    None
+}
+
+/// `(P(a, x), Q(a, x))` from Temme's uniform asymptotic expansion, or `None`
+/// where [`temme_correction`] does not certify it.
+///
+/// `Q = ½ erfc(η√(a/2)) + e^{−aη²/2}/√(2πa) · S(a, η)` with
+/// `½η² = h = λ − 1 − ln λ`, `sign η = sign(λ − 1)`, and `P = 1 − Q` is the
+/// same expansion reflected: `P = ½ erfc(−η√(a/2)) − e^{−aη²/2}/√(2πa) · S`.
+/// Each tail is evaluated where it is the small one — `Q` for `x ≥ a`, `P`
+/// below — through `erfc(y) = e^{−y²} erfcx(y)` with `y = √(a·h) ≥ 0`, so the
+/// common factor `e^{−a·h}` is taken out once and nothing underflows before
+/// the result does.
+fn temme_incomplete_gamma_pair(a: f64, x: f64) -> Option<(f64, f64)> {
+    let exponent = gamma_exponent(a, x);
+    let eta = (2.0 * exponent / a).sqrt().copysign(x - a);
+    let correction = temme_correction(a, eta)?;
+    let y = exponent.sqrt();
+    let envelope = (-exponent).exp();
+    let erfc_half = 0.5 * erfcx_nonnegative(y);
+    let gaussian = correction / (2.0 * std::f64::consts::PI * a).sqrt();
+    if x >= a {
+        let q = envelope * (erfc_half + gaussian);
+        Some((1.0 - q, q))
+    } else {
+        let p = envelope * (erfc_half - gaussian);
+        Some((p, 1.0 - p))
     }
 }
 
@@ -894,9 +1210,9 @@ fn regularized_lower_gamma(a: f64, x: f64) -> f64 {
 /// iteration itself. Both tails come from the crate's own
 /// [`regularized_incomplete_gamma_pair`] (NOT `statrs::gamma_lr`, which clamps the
 /// residual to `−p` for tiny `x`; see that fn's note); the density
-/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is evaluated through the same overflow-safe
-/// log factorization Numerical Recipes uses (`invgammp`), so the iteration stays
-/// finite across a wide range of `a`. A positivity step-halving guard keeps the
+/// `f(x) = x^{a−1} e^{−x} / Γ(a)` is the same pair's prefactor
+/// ([`incomplete_gamma_prefactor`]) over `x`, finite and free of the `a·ln a`
+/// cancellation for every `a`. A positivity step-halving guard keeps the
 /// iterate inside the support.
 fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
     use statrs::function::gamma::ln_gamma;
@@ -911,7 +1227,6 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         return f64::INFINITY;
     }
 
-    let gln = ln_gamma(a);
     let a1 = a - 1.0;
 
     // Initial estimate. For `a > 1` a Wilson–Hilferty transform of a normal
@@ -962,14 +1277,6 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         }
     };
 
-    // Density factorization constants for `a > 1` (kept overflow-safe in logs).
-    let (lna1, afac) = if a > 1.0 {
-        let lna1 = a1.ln();
-        (lna1, (a1 * (lna1 - 1.0) - gln).exp())
-    } else {
-        (0.0, 0.0)
-    };
-
     // Halley refinement of the seeded quantile. Halley's cubic convergence
     // shrinks the step geometrically from the standard Wilson-Hilferty /
     // asymptotic seed; once a step is no smaller than the one before it, or no
@@ -995,11 +1302,7 @@ fn inverse_regularized_lower_gamma(p: f64, a: f64) -> f64 {
         } else {
             p_at_x - p
         };
-        let dens = if a > 1.0 {
-            afac * (-(x - a1) + a1 * (x.ln() - lna1)).exp()
-        } else {
-            (-x + a1 * x.ln() - gln).exp()
-        };
+        let dens = incomplete_gamma_prefactor(a, x) / x;
         if !(dens.is_finite() && dens > 0.0) {
             break;
         }
@@ -1289,6 +1592,162 @@ mod tests {
             assert!(
                 rel <= 8.0 * f64::EPSILON * mu,
                 "P(Y<={k} | mu={mu}) = {got:e}, want {want:e}, relative {rel:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_gamma_is_accurate_from_small_to_huge_shape() {
+        // #4068: the series and continued fraction were capped at 1000 terms and
+        // returned the partial sum as converged. Near `x ≈ a` the series needs
+        // about `8.5·√a` terms, so for `a ≳ 1.4e4` the "converged" value was a
+        // truncation (P(1e6, 999500) came out 0.2419 against 0.3086).
+        //
+        // References: 60-digit mpmath sums, independent of every routine here —
+        // the power series for `P` when `x < a`, the Legendre continued fraction
+        // for `Q` otherwise, each run to its own tail bound, times
+        // `exp(a ln x − x − ln Γ(a))` at that precision. Each row is
+        // `(a, x, whether the small tail is P, that tail)`; the last four are the
+        // issue's own cases.
+        //
+        // Bar: the small tail carries the prefactor `e^{−a·h}`, `h = λ − 1 − ln λ`,
+        // whose relative error is `a·h` times the relative error of `h` — the
+        // conditioning of the function in `x` itself, since a one-ulp change of
+        // `x` moves `a·h` by `a·|λ − 1|/λ·ε`. So the error is measured in units
+        // of `(1 + a·h)·ε`; the old truncated sums were off by up to 22% here.
+        // Beyond that, the series and the continued fraction round once per
+        // term, and at small shapes near `x ≈ a` they take a few dozen terms:
+        // the bar is 32 units, against a measured worst of 19 (`a = x = 3`).
+        const UNIT_BAR: f64 = 32.0;
+        const ROWS: [(f64, f64, bool, f64); 66] = [
+            (0.7, 0.013999999999999999, true, 5.51313485464876e-2),
+            (0.7, 0.13999999999999999, true, 2.62568501634967e-1),
+            (0.7, 0.42, true, 5.0834813308743318e-1),
+            (0.7, 0.7, false, 3.4341093974049586e-1),
+            (0.7, 1.19, false, 1.9102554172690131e-1),
+            (0.7, 1.5366600265340755, false, 1.2825810179184002e-1),
+            (0.7, 2.4499999999999997, false, 4.6443606389297197e-2),
+            (0.7, 4.0466401061363015, false, 8.3388697938738817e-3),
+            (0.7, 4.199999999999999, false, 7.0868634681294926e-3),
+            (3.0, 0.06, true, 3.441824024472021e-5),
+            (3.0, 0.6000000000000001, true, 2.3115287752632959e-2),
+            (3.0, 1.2679491924311224, true, 1.3557137117993433e-1),
+            (3.0, 1.7999999999999998, true, 2.6937891406058745e-1),
+            (3.0, 3.0, false, 4.2319008112684352e-1),
+            (3.0, 4.732050807568877, false, 1.4911018549049089e-1),
+            (3.0, 5.1, false, 1.1647834313417626e-1),
+            (3.0, 9.92820323027551, false, 2.9371426399812767e-3),
+            (3.0, 10.5, false, 1.8346159379269044e-3),
+            (3.0, 18.0, false, 2.7566263337929857e-6),
+            (12.0, 0.24, true, 6.1101098698737629e-17),
+            (12.0, 2.4000000000000004, true, 8.4535131100734353e-6),
+            (12.0, 7.199999999999999, true, 6.2905833907867146e-2),
+            (12.0, 8.535898384862247, true, 1.5441621106288932e-1),
+            (12.0, 12.0, false, 4.615973330636182e-1),
+            (12.0, 15.464101615137753, false, 1.5586364364312884e-1),
+            (12.0, 20.4, false, 1.7518317615758892e-2),
+            (12.0, 25.856406460551018, false, 8.5271811759288256e-4),
+            (12.0, 42.0, false, 1.3852814835795081e-8),
+            (12.0, 72.0, false, 4.2762823157007119e-19),
+            (150.0, 3.0, true, 3.2894660604843632e-193),
+            (150.0, 30.0, true, 7.5592303464840563e-55),
+            (150.0, 90.0, true, 4.7953023275883495e-9),
+            (150.0, 101.01020514433644, true, 3.1572477177059796e-6),
+            (150.0, 137.7525512860841, true, 1.5836977907217069e-1),
+            (150.0, 150.0, false, 4.8914177025064032e-1),
+            (150.0, 162.2474487139159, false, 1.5840111742024859e-1),
+            (150.0, 198.98979485566355, false, 1.2664172915402692e-4),
+            (150.0, 255.0, false, 4.2105749324015774e-13),
+            (150.0, 525.0, false, 7.2920290967798446e-84),
+            (150.0, 900.0, false, 6.5280919022324705e-212),
+            (3000.0, 1800.0, true, 7.359801195156802e-147),
+            (3000.0, 2780.9109769979336, true, 2.1051974788722459e-5),
+            (3000.0, 2945.2277442494837, true, 1.5864163418646316e-1),
+            (3000.0, 3000.0, false, 4.9757211010594567e-1),
+            (3000.0, 3054.7722557505167, false, 1.5864198330967965e-1),
+            (3000.0, 3219.0890230020664, false, 4.5649067881116096e-5),
+            (3000.0, 5100.0, false, 2.2135555968387508e-223),
+            (100000.0, 98735.08893593265, true, 2.9605184180992645e-5),
+            (100000.0, 99683.77223398315, true, 1.5865484973789696e-1),
+            (100000.0, 100000.0, false, 4.9957947788963482e-1),
+            (100000.0, 100316.22776601683, false, 1.5865485155167504e-1),
+            (100000.0, 101264.91106406735, false, 3.3838116386882088e-5),
+            (1000000.0, 996000.0, true, 3.1007118211082967e-5),
+            (1000000.0, 999000.0, true, 1.5865521357430365e-1),
+            (1000000.0, 1000000.0, false, 4.9986701923912741e-1),
+            (1000000.0, 1000999.9999999999, false, 1.5865521363168786e-1),
+            (1000000.0, 1004000.0, false, 3.234544731347768e-5),
+            (100000000.0, 99960000.0, true, 3.1604377116199155e-5),
+            (100000000.0, 99990000.0, true, 1.5865525352814383e-1),
+            (100000000.0, 100000000.0, false, 4.9998670192398588e-1),
+            (100000000.0, 100010000.0, false, 1.5865525352820119e-1),
+            (100000000.0, 100040000.0, false, 3.1738207368808895e-5),
+            (100000.0, 99700.0, true, 1.7141731451450292e-1),
+            (1000000.0, 999500.0, true, 3.0862555689081532e-1),
+            (1000001.0, 1000000.0, true, 4.9973403851371635e-1),
+            (100000000.0, 100000001.5, false, 4.9992686058264875e-1),
+        ];
+        for (a, x, small_is_p, want) in ROWS {
+            let (p, q) = regularized_incomplete_gamma_pair(a, x);
+            let got = if small_is_p { p } else { q };
+            let lambda = x / a;
+            let ah = a * (lambda - 1.0 - lambda.ln()).abs();
+            let units = ((got - want) / want).abs() / ((1.0 + ah) * f64::EPSILON);
+            assert!(
+                units <= UNIT_BAR,
+                "a={a} x={x}: got {got:e}, want {want:e} ({units:.1} units of (1+a·h)ε)"
+            );
+            assert!(
+                (p + q - 1.0).abs() <= 2.0 * f64::EPSILON,
+                "a={a} x={x}: P + Q = {}",
+                p + q
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_gamma_at_its_mean_holds_past_the_integer_limit() {
+        // `Q(a, a) = ½ − 1/(3·√(2πa)) + O(a^{−3/2})`, and the next term is
+        // `(1/(540a))/√(2πa)`, below `1e−21` at these shapes. At `a = 1e16`,
+        // `a + 1 == a`: the old series/fraction split at `x < a + 1` and its
+        // capped sums are both gone here.
+        for a in [1e12_f64, 1e16] {
+            let want = 0.5 - 1.0 / (3.0 * (2.0 * std::f64::consts::PI * a).sqrt());
+            let (p, q) = regularized_incomplete_gamma_pair(a, a);
+            assert!(
+                ((q - want) / want).abs() <= 4.0 * f64::EPSILON,
+                "Q({a:e}, {a:e}) = {q:e}, want {want:e}"
+            );
+            assert!((p + q - 1.0).abs() <= 2.0 * f64::EPSILON, "P + Q = {}", p + q);
+        }
+    }
+
+    #[test]
+    fn count_and_gamma_quantiles_are_exact_at_large_means() {
+        // #4068: the capped sums moved these quantiles by thousands. The
+        // references are 60-digit mpmath inversions of the same laws
+        // (`P(Y ≤ k) = Q(k + 1, μ)` for the Poisson), independent of this file.
+        for (p, mu, want) in [
+            (0.975, 1e6, 1_001_960.0),
+            (0.025, 1e6, 998_041.0),
+            (0.975, 1e7, 10_006_198.0),
+            (0.025, 1e7, 9_993_803.0),
+        ] {
+            assert_eq!(poisson_quantile(p, mu), want, "poisson_quantile(p={p}, μ={mu:e})");
+        }
+        // The quantile's own conditioning is `ΔP/(x·f(x))`: a relative error
+        // `(1 + a·h)ε` in the tail moves `x` by far less than an ulp here, so the
+        // bar is the rounding of `x` itself.
+        for (p, a, want) in [
+            (0.025, 1e6, 998_040.983_340_293_9),
+            (0.025, 1e7, 9_993_802.996_884_267),
+            (0.975, 1e7, 10_006_198.897_421_6),
+        ] {
+            let got = gamma_quantile(p, a, 1.0);
+            let rel = ((got - want) / want).abs();
+            assert!(
+                rel <= 4.0 * f64::EPSILON,
+                "gamma_quantile(p={p}, a={a:e}) = {got}, want {want} (relative {rel:e})"
             );
         }
     }
