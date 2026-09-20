@@ -981,7 +981,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Vec<Array2<f64>>, String> {
         let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_baseline_psi_third_information_all_axes(
                 block_states,
                 axis,
@@ -1022,7 +1022,7 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Vec<Array2<f64>>, String> {
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_baseline_psi_pair_third_information_all_axes(
                 block_states,
                 axis,
@@ -1063,7 +1063,7 @@ impl SurvivalMarginalSlopeFamily {
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         let d_beta = self.finite_flat_direction(block_states, d_beta_flat)?;
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_design_psi_third_information_all_axes(
                 block_states,
                 derivative_blocks,
@@ -1100,7 +1100,7 @@ impl SurvivalMarginalSlopeFamily {
         options: &BlockwiseFitOptions,
     ) -> Result<Option<Vec<Array2<f64>>>, String> {
         let row_weights = self.rigid_third_row_weights(options);
-        if self.timewiggle_zeta_available() {
+        if self.timewiggle_zeta_fifth_available() {
             return self.timewiggle_design_psi_pair_third_information_all_axes(
                 block_states,
                 derivative_blocks,

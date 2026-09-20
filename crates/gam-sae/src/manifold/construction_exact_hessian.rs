@@ -862,6 +862,7 @@ pub(crate) struct EvidenceRootCounters {
     negative_curvature_no_steps: std::sync::atomic::AtomicUsize,
     unfactorable_no_steps: std::sync::atomic::AtomicUsize,
     uncertified_refinements: std::sync::atomic::AtomicUsize,
+    exact_refused_acceptances: std::sync::atomic::AtomicUsize,
     rounding_floor_stops: std::sync::atomic::AtomicUsize,
     band_refused_commits: std::sync::atomic::AtomicUsize,
 }
@@ -883,6 +884,9 @@ pub(crate) struct EvidenceRootCounts {
     /// A refinement moved the state and recurred, but the refined root did not certify, so
     /// the accepted state was priced.
     pub(crate) uncertified_refinements: usize,
+    /// #2933 F08 — a state admitted on the majorizer Newton decrement whose exact verdict
+    /// refused it, so it was not priced and the solve continued.
+    pub(crate) exact_refused_acceptances: usize,
     /// #2822 — the gate sat inside its formation band, so no root step was solved for.
     pub(crate) rounding_floor_stops: usize,
     /// #2822 — a trial the strict contraction would have committed, refused because the two
@@ -903,6 +907,7 @@ impl EvidenceRootTelemetry {
                 .load(Ordering::Relaxed),
             unfactorable_no_steps: self.0.unfactorable_no_steps.load(Ordering::Relaxed),
             uncertified_refinements: self.0.uncertified_refinements.load(Ordering::Relaxed),
+            exact_refused_acceptances: self.0.exact_refused_acceptances.load(Ordering::Relaxed),
             rounding_floor_stops: self.0.rounding_floor_stops.load(Ordering::Relaxed),
             band_refused_commits: self.0.band_refused_commits.load(Ordering::Relaxed),
         }
@@ -1311,11 +1316,26 @@ pub(crate) struct PreparedSoftmaxRowJets {
 struct PreparedSoftmaxRowJetTile {
     start: usize,
     q: usize,
-    path: crate::gpu_kernels::sae_rowjet::SaeRowJetPath,
+    executor: PreparedSoftmaxRowJetExecutor,
     inputs: Vec<crate::gpu_kernels::sae_rowjet::SaeSoftmaxRowJetInput>,
     probe: Vec<f64>,
-    /// The CPU tile's per-state contractions, when the governor admits them.
-    bilinear: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+}
+
+/// Which executor applies against one prepared tile. The CPU executor keeps
+/// the tile's per-state contractions when the governor admits them (`kept`);
+/// the device executor re-reads the tile's inputs on every apply.
+enum PreparedSoftmaxRowJetExecutor {
+    Cpu {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+    },
+    Device,
+    /// `auto` with a device and a shape it has not timed: every apply runs
+    /// both, and the state's CPU build plus applies are weighed against the
+    /// device's applies when the state drops (gam#3024).
+    Racing {
+        kept: Option<crate::gpu_kernels::sae_rowjet::bilinear::SaeRowJetBilinearContractions>,
+        race: gam_gpu::ReusedStateRace,
+    },
 }
 
 struct PreparedResidualCurvatureRow {
@@ -4299,16 +4319,6 @@ impl SaeManifoldTerm {
                 )));
             }
         }
-        // #2231 — the crosscoder block weights reach `½log|A|` through the scaled target
-        // (`crosscoder_block_logdet_traces`), which only the dense and arrow-orbit routes
-        // contract; the probe bundle holds no weight on the eliminated coordinates' blocks.
-        if evidence.is_some() && !rho.block_flat_range().is_empty() {
-            return Err(OuterGradientError::internal(format!(
-                "analytic_outer_rho_gradient_components_with_bundle: the streaming exact-A \
-                 route has no log-determinant trace for the {} crosscoder block weights",
-                rho.block_flat_range().len()
-            )));
-        }
         let n_params = rho.flat_coordinates().len();
         let mut explicit = Array1::<f64>::zeros(n_params);
         let mut logdet_trace = Array1::<f64>::zeros(n_params);
@@ -4343,18 +4353,6 @@ impl SaeManifoldTerm {
         // the route alone decides. Before, a dense ThresholdGate fit ranked ½log|A|
         // and returned `½tr(B⁻¹∂B)` channels from cached `B` geometry.
         let exact_a_logdet_route = logdet_derivative_bundle.is_none();
-        // #2822 — an output-scale coordinate moves `A` through the target
-        // (`crosscoder_block_logdet_traces`). The streaming route's probes are β-space `S⁻¹`
-        // solves, which hold no joint weight to contract that operator against.
-        if !exact_a_logdet_route && !rho.log_lambda_block.is_empty() {
-            return Err(OuterGradientError::internal(
-                "analytic_outer_rho_gradient_components_with_bundle: output-scale coordinates \
-                 (crosscoder blocks or the global dispersion) need ½tr(A⁻¹ ∂A/∂log λ), whose \
-                 ∂A moves with the target; the streaming route's β-space probes do not price \
-                 it, so these coordinates are fitted on the dense exact-A route only"
-                    .to_string(),
-            ));
-        }
 
         // #2087/#2330 ROUTE-COHERENCE GUARD. The VALUE's log-determinant route and
         // THIS gradient's are selected by two unrelated predicates:
@@ -4620,6 +4618,25 @@ impl SaeManifoldTerm {
                     logdet_trace[idx] += joint[k][axis];
                 }
             }
+        }
+        // #2231/#2822/#3270 — the output-scale coordinates (crosscoder blocks, the global
+        // dispersion) reach `½log|A|` through the scaled target.
+        // The dense and arrow-orbit routes contract their operator weight in
+        // `dense_exact_a_logdet_channels` / `arrow_orbit_logdet_channels`; this route contracts
+        // the bundle's selected inverse row by row.
+        if let Some((probes, sinv)) = logdet_derivative_bundle {
+            let traces = self
+                .crosscoder_block_logdet_traces_from_probes(
+                    rho,
+                    target,
+                    evidence_cache,
+                    probes,
+                    sinv,
+                    evidence_operator,
+                )
+                .map_err(OuterGradientError::internal)?;
+            Self::write_crosscoder_block_logdet_traces(rho, traces, &mut logdet_trace)
+                .map_err(OuterGradientError::internal)?;
         }
 
         // The scalar criterion adds the realised-rank charge to `½ log|H|`.
@@ -4976,7 +4993,27 @@ impl SaeManifoldTerm {
             }
             values.log_det_correction
         };
-        Ok((joint_pricing.log_det + orbit_correction, geometry))
+        // #2933 F07 — the periodic phases integrated on their circles. An orbit-stiffened
+        // block integrates its orbit coordinates exactly already, and the phase rows it
+        // stiffened are priced there, not here.
+        let phase_correction = if geometry.orbit_generators.is_empty() {
+            match self
+                .periodic_phase_marginal(cache)
+                .map_err(SaeCriterionError::Numerical)?
+            {
+                Some((correction, _)) => {
+                    log::debug!(
+                        "[SAE-EXACT-DENSE] periodic phase circle volume: ½Δlog|A|={:.6e}",
+                        0.5 * correction
+                    );
+                    correction
+                }
+                None => 0.0,
+            }
+        } else {
+            0.0
+        };
+        Ok((joint_pricing.log_det + orbit_correction + phase_correction, geometry))
     }
 
     /// The generalized eigensystem of one already-materialized exact-Hessian block in the
@@ -5924,18 +5961,7 @@ impl SaeManifoldTerm {
         let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
             return Ok(Vec::new());
         };
-        // An embedded-sphere row's `B` carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which
-        // reads the residual, so its `B` and `Φ` move with the target too. The probes hold
-        // the cache's `B`, so that leg is not priced here and the coordinate is refused.
-        if !self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
-            return Err(
-                "crosscoder_block_logdet_traces: an embedded-sphere row's B carries -c_g P_g \
-                 with c_g = <g_raw, x_g>, which moves with the target; that leg of \
-                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are \
-                 refused on sphere rows"
-                    .to_string(),
-            );
-        }
+        self.crosscoder_block_traces_refuse_sphere_rows(cache)?;
         enum Probed {
             Dense(Array2<f64>),
             Arrow(ArrowJointBlocks),
@@ -5995,6 +6021,16 @@ impl SaeManifoldTerm {
         logdet_trace: &mut Array1<f64>,
     ) -> Result<(), String> {
         let traces = self.crosscoder_block_logdet_traces(rho, target, cache, weight)?;
+        Self::write_crosscoder_block_logdet_traces(rho, traces, logdet_trace)
+    }
+
+    /// Write one trace per crosscoder output block into the block coordinates of a flat
+    /// log-determinant trace; `traces` is empty exactly when no crosscoder pricing is installed.
+    fn write_crosscoder_block_logdet_traces(
+        rho: &SaeManifoldRho,
+        traces: Vec<f64>,
+        logdet_trace: &mut Array1<f64>,
+    ) -> Result<(), String> {
         let range = rho.block_flat_range();
         if traces.is_empty() {
             return if range.is_empty() {
@@ -6019,6 +6055,232 @@ impl SaeManifoldTerm {
             logdet_trace[coord] += trace;
         }
         Ok(())
+    }
+
+    /// #2822/#3270 — the output-scale traces (a crosscoder block's or the global dispersion's)
+    /// read `∂A/∂log λ_ℓ` through the residual-curvature legs of `ΔC` alone. An embedded-sphere
+    /// row's `B` also carries `−c_g·P_g` with `c_g = ⟨g_raw, x_g⟩`, which reads the residual, so
+    /// on such a row `B`, `Φ(B)` and `A` all move with the target and no trace prices that leg;
+    /// every route refuses it rather than return a trace short by that leg.
+    fn crosscoder_block_traces_refuse_sphere_rows(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<(), String> {
+        if self.sphere_tangent_blocks(&cache.row_dims)?.is_empty() {
+            Ok(())
+        } else {
+            Err(
+                "output-scale log-determinant traces: an embedded-sphere row's B carries -c_g P_g \
+                 with c_g = <g_raw, x_g>, which moves with the target; that leg of \
+                 d log|A| / d log(lambda) is not priced, so output-scale coordinates are refused \
+                 on sphere rows"
+                    .to_string(),
+            )
+        }
+    }
+
+    /// #3270 — [`Self::crosscoder_block_logdet_traces`] on the streaming exact-A route: one
+    /// `½⟨W, ∂A/∂log λ_ℓ⟩` per output-scale coordinate (a crosscoder block, or the global
+    /// dispersion over every column), contracted row by row against the probe bundle's
+    /// selected inverse, so no `N`-sized operator is held.
+    ///
+    /// Block `ℓ` moves the scaled target along `½·Z̃_ℓ` on its own columns, so the row error
+    /// `√w·(f − Z̃)` moves along `δe = −½·√w·Z̃_ℓ`. At a fixed state the exact Hessian reads the
+    /// target only through the residual-curvature legs of `ΔC`, which are linear in the error:
+    /// `∂A_tt[a, b] = ⟨δe, ∂²f_ab⟩` and `∂A_tβ[a, β] = ⟨δe, ∂²f_aβ⟩` on the row, and
+    /// `∂A_ββ = 0` because `f` is linear in `β`. The error is whitened exactly as
+    /// [`Self::crosscoder_block_ift_rhs`] whitens it against the same row jets.
+    ///
+    /// The weight is the one every from-probes channel of this route contracts
+    /// ([`Self::logdet_theta_adjoint_from_probes`]): the row blocks
+    /// `(H⁻¹)_tt = A_i⁻¹ + G_i S⁻¹ G_iᵀ` and `(H⁻¹)_tβ = −G_i S⁻¹` from
+    /// [`row_selected_inverse_from_probes`], plus the reduced-Schur clamp-basin weights, the
+    /// Daleckii–Krein correction on a deflated row, and the row clamp-basin response. The clamp
+    /// does not read the target, so its explicit leg does not enter.
+    pub(crate) fn crosscoder_block_logdet_traces_from_probes(
+        &self,
+        rho: &SaeManifoldRho,
+        target: ArrayView2<'_, f64>,
+        cache: &ArrowFactorCache,
+        probes: &[Array1<f64>],
+        sinv_probes: &[Array1<f64>],
+        operator: EvidenceOperator,
+    ) -> Result<Vec<f64>, String> {
+        let Some((p_x, block_dims)) = self.crosscoder_pricing_spans.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if !operator.is_exact_a() {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: the traces differentiate ½log|A|, \
+                 but the bundle names {operator:?}"
+            ));
+        }
+        self.crosscoder_block_traces_refuse_sphere_rows(cache)?;
+        let n = self.n_obs();
+        let p = self.output_dim();
+        if target.nrows() != n || target.ncols() != p {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: target shape ({}, {}) != ({n}, {p})",
+                target.nrows(),
+                target.ncols()
+            ));
+        }
+        if p_x + block_dims.iter().sum::<usize>() != p {
+            return Err(format!(
+                "crosscoder_block_logdet_traces_from_probes: anchor width {p_x} plus block widths \
+                 {block_dims:?} do not tile the {p} target columns"
+            ));
+        }
+        let k_border = cache.k;
+        if k_border > 0 {
+            if probes.is_empty() || sinv_probes.len() != probes.len() {
+                return Err(format!(
+                    "crosscoder_block_logdet_traces_from_probes: need matching non-empty \
+                     probe/solve bundles, got {} probes and {} solves",
+                    probes.len(),
+                    sinv_probes.len()
+                ));
+            }
+            for (label, set) in [("probe", probes), ("solve", sinv_probes)] {
+                for (j, v) in set.iter().enumerate() {
+                    if v.len() != k_border {
+                        return Err(format!(
+                            "crosscoder_block_logdet_traces_from_probes: {label} {j} has length \
+                             {} != border dim {k_border}",
+                            v.len()
+                        ));
+                    }
+                }
+            }
+        }
+        // #2915 — the clamp-basin prices, built as `logdet_theta_adjoint_from_probes` builds
+        // them on this operator.
+        let clamp = self.materialize_ard_concave_clamp_diagonal_for_rows(rho, &cache.row_dims)?;
+        let border_remainder = if cache.beta_schur_conditioning.is_some() {
+            self.decoder_prior_border_remainder_op(cache.k, 1.0)?
+        } else {
+            None
+        };
+        let beta_basin = match Self::beta_schur_clamp_basin_operands(
+            cache,
+            clamp.view(),
+            border_remainder.as_ref().map(|op| op as &dyn BetaPenaltyOp),
+        )? {
+            Some(operands) => Some((
+                Self::beta_schur_basin_row_weights(cache, clamp.view(), &operands),
+                Self::beta_schur_basin_border_weights(cache, clamp.view(), &operands)?.0,
+            )),
+            None => None,
+        };
+        let second_jets = self.atom_second_jets()?;
+        let border = self.border_channels_for_cache(cache)?;
+        let whiten = self.whiten_logdet_row_jets();
+        let metric = if whiten {
+            Some(self.row_metric.as_ref().ok_or_else(|| {
+                "crosscoder_block_logdet_traces_from_probes: whitening metric absent".to_string()
+            })?)
+        } else {
+            None
+        };
+        let mut spans = Vec::with_capacity(block_dims.len());
+        let mut start = *p_x;
+        for &width in block_dims {
+            spans.push(start..start + width);
+            start += width;
+        }
+        let mut traces = vec![0.0_f64; block_dims.len()];
+        let mut jet_window: std::collections::VecDeque<SaeRowJets> =
+            std::collections::VecDeque::new();
+        let mut jet_window_next = 0usize;
+        for row in 0..n {
+            let q = cache.row_dims[row];
+            let base = cache.row_offsets[row];
+            if jet_window.is_empty() {
+                jet_window_next = self.refill_jet_window(
+                    jet_window_next,
+                    cache,
+                    &second_jets,
+                    &border,
+                    &mut jet_window,
+                )?;
+            }
+            let mut jets = jet_window.pop_front().ok_or_else(|| {
+                "crosscoder_block_logdet_traces_from_probes: empty jet window".to_string()
+            })?;
+            if whiten {
+                self.apply_whiten_to_logdet_row_jets(row, &mut jets)?;
+            }
+            let (mut inv_vv, mut inv_vbeta) = row_selected_inverse_from_probes(
+                cache,
+                row,
+                probes,
+                sinv_probes,
+                true,
+                "crosscoder_block_logdet_traces_from_probes",
+            )?;
+            if let Some((row_weights, border_weights)) = beta_basin.as_ref() {
+                inv_vv += &row_weights[row].0;
+                inv_vbeta += &border_weights[row];
+            }
+            let dirs = cache
+                .deflated_row_directions
+                .get(row)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            let deflation_live = Self::row_deflation_is_live(dirs, spectrum);
+            let price =
+                Self::clamp_basin_price_weights(&inv_vv, clamp.slice(s![base..base + q]), spectrum);
+            let sqrt_w = self
+                .row_loss_weights
+                .as_deref()
+                .map_or(1.0, |w| w[row].sqrt());
+            for (block, span) in spans.iter().enumerate() {
+                let mut error_step: Vec<f64> = (0..p)
+                    .map(|col| {
+                        if span.contains(&col) {
+                            -0.5 * sqrt_w * target[[row, col]]
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect();
+                if let Some(metric) = metric {
+                    Self::whiten_logdet_metric_vec(metric, row, p, &mut error_step)?;
+                }
+                let mut d_tt = Array2::<f64>::zeros((q, q));
+                for a in 0..q {
+                    for b in 0..q {
+                        d_tt[[a, b]] = sae_dot(jets.second(a, b), &error_step);
+                    }
+                }
+                let mut contraction = 0.0_f64;
+                for a in 0..q {
+                    for b in 0..q {
+                        contraction += inv_vv[[b, a]] * d_tt[[a, b]];
+                    }
+                }
+                if deflation_live {
+                    contraction -=
+                        Self::deflation_block_correction(&inv_vv, &d_tt, dirs, spectrum);
+                }
+                if let Some((_, response)) = price.as_ref() {
+                    contraction += (response * &d_tt).sum();
+                }
+                for a in 0..q {
+                    for (beta_pos, channel) in border.iter().enumerate() {
+                        contraction += 2.0
+                            * inv_vbeta[[a, channel.index]]
+                            * sae_dot(jets.beta_deriv(a, beta_pos), &error_step);
+                    }
+                }
+                traces[block] += 0.5 * contraction;
+            }
+        }
+        Ok(traces)
     }
 
     pub(crate) fn dense_exact_a_logdet_channels(
@@ -6120,11 +6382,19 @@ impl SaeManifoldTerm {
         )?;
         // #2933 F07 — in-band pencil directions are priced at `Φ`'s own curvature, so the
         // value moves with the evidence factor there as well.
+        // The periodic phases' circle volume moves with `B_raw` alone; see
+        // `periodic_phase_marginal`, which the value priced off the same cache.
+        let phase_weight = if geometry.orbit_generators.is_empty() {
+            self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
+        } else {
+            None
+        };
         let (metric_trace, metric_gamma) = self.evidence_metric_derivative_channels(
             rho,
             target,
             cache,
             &pricing.metric_derivative,
+            phase_weight.as_ref(),
         )?;
         logdet_trace += &metric_trace;
         gamma.t += &metric_gamma.t;
@@ -6169,10 +6439,13 @@ impl SaeManifoldTerm {
         target: ArrayView2<'_, f64>,
         cache: &ArrowFactorCache,
         weight: &Array2<f64>,
+        raw_addend: Option<&Array2<f64>>,
     ) -> Result<(Array1<f64>, SaeArrowVector), String> {
         let total_t = cache.delta_t_len();
         let mut trace = Array1::<f64>::zeros(rho.flat_coordinates().len());
-        if weight.iter().all(|&value| value == 0.0) {
+        if weight.iter().all(|&value| value == 0.0)
+            && raw_addend.is_none_or(|addend| addend.iter().all(|&value| value == 0.0))
+        {
             return Ok((
                 trace,
                 SaeArrowVector {
@@ -6181,7 +6454,17 @@ impl SaeManifoldTerm {
                 },
             ));
         }
-        let raw_weight = self.evidence_metric_raw_weight(cache, weight)?;
+        let mut raw_weight = self.evidence_metric_raw_weight(cache, weight)?;
+        if let Some(addend) = raw_addend {
+            if addend.dim() != raw_weight.dim() {
+                return Err(format!(
+                    "evidence_metric_derivative_channels: raw addend {:?} on weight {:?}",
+                    addend.dim(),
+                    raw_weight.dim()
+                ));
+            }
+            raw_weight += addend;
+        }
         for (flat, operator) in self.raw_penalty_curvature_operators_by_flat(rho, cache)? {
             trace[flat] = 0.5 * (&raw_weight * &operator).sum();
         }
@@ -6378,6 +6661,235 @@ impl SaeManifoldTerm {
             out.slice_mut(s![base..base + q, base..base + q]).assign(&folded);
         }
         Ok(out)
+    }
+
+    /// #2933 F07 — each periodic phase coordinate's posterior volume, integrated on its
+    /// circle instead of priced by the Gaussian factor `√(2π/κ)`.
+    ///
+    /// The ARD prior's periodic normalizer is exact on the circle
+    /// (`circle_log_marginal`), but `½log|A|` priced every row's phase as though it lived
+    /// on the line. The Gaussian factor has no ceiling: as the phase curvature `κ` falls
+    /// (a smaller ARD precision, a smaller decoder amplitude), `−log √(2π/κ)` falls
+    /// without bound while the phase's true volume stops at its period `P`, so the
+    /// criterion rewarded shrinking an atom towards nothing (N/2 per e-fold on e1, 64 rows).
+    ///
+    /// Per periodic local coordinate `j` of row `i`, with `v` the row's other coordinates,
+    /// `T` the row block of `Φ` and `B` the same block with its unit pins undone:
+    ///
+    /// ```text
+    ///   log|A| += −2·log M(Sᴮ_jj, P) − log Sᵀ_jj + log 2π
+    ///   Sᵀ = T_PP − T_Pv T_vv⁻¹ T_vP,     Sᴮ = B_PP − B_Pv T_vv⁻¹ B_vP
+    /// ```
+    ///
+    /// `Sᵀ_jj` is the conditional curvature the pricing gave the phase and `−log Sᵀ_jj +
+    /// log 2π` removes its Gaussian factor (the `−½log 2π` it paired with is the ARD
+    /// partition's, [`Self::ard_log_partition`]); `Sᴮ_jj` is the phase's curvature before
+    /// any pin, which can be zero or negative, and `circle_log_marginal_signed` integrates
+    /// it at any sign. With no pin the two agree and the correction is the von Mises
+    /// excess `−2·log(1 + 1/(8η) + …)`, which vanishes as `η → ∞`; as `κ → 0` it is
+    /// bounded by the period, `M ≤ P` for `κ ≥ 0`. A row with several periodic axes
+    /// integrates each one at its conditional curvature, which is exact when their
+    /// cross-curvature vanishes.
+    ///
+    /// The returned weight `X̃` is on `dB_raw` in the joint layout and in full log-det
+    /// units, `⟨X̃, dB_raw⟩ = d(correction)`, so it enters
+    /// [`Self::evidence_metric_derivative_channels`] as its raw addend. It is row-local in
+    /// `tt`, so it reaches the border through nothing: `T`'s border conditioning is
+    /// driven by `X_ββ`, which is zero here. A gauge-pinned row has `T = B_raw + Σvvᵀ`
+    /// with constant `v`, so both weights fold by identity; a spectrally pinned row folds
+    /// the `T` weight through its recorded spectrum and the `B` weight through the same
+    /// spectrum with its unit pins read raw.
+    ///
+    /// `None` when no row carries a periodic coordinate.
+    pub(crate) fn periodic_phase_marginal(
+        &self,
+        cache: &ArrowFactorCache,
+    ) -> Result<Option<(f64, Array2<f64>)>, String> {
+        use gam_linalg::faer_ndarray::FaerCholesky;
+        let periods = self.all_ard_axis_periods();
+        if !periods
+            .iter()
+            .any(|axes| axes.iter().any(Option::is_some))
+        {
+            return Ok(None);
+        }
+        let total_t = cache.delta_t_len();
+        let dim = total_t + cache.k;
+        let mut correction = 0.0_f64;
+        let mut raw_weight = Array2::<f64>::zeros((dim, dim));
+        let mut priced_any = false;
+        for row in 0..cache.n_rows() {
+            let vars = self.row_vars_for_cache_row(row, cache)?;
+            let q = vars.len();
+            let mut phase: Vec<(usize, f64)> = Vec::new();
+            for (local, variable) in vars.iter().enumerate() {
+                if let SaeLocalRowVar::Coord { atom, axis } = *variable
+                    && let Some(period) = periods
+                        .get(atom)
+                        .and_then(|axes| axes.get(axis))
+                        .copied()
+                        .flatten()
+                {
+                    if !(period.is_finite() && period > 0.0) {
+                        return Err(format!(
+                            "periodic_phase_marginal: atom {atom} axis {axis} has period {period}"
+                        ));
+                    }
+                    phase.push((local, period));
+                }
+            }
+            if phase.is_empty() {
+                continue;
+            }
+            priced_any = true;
+            let factor = cache.undamped_factor(row);
+            if factor.dim() != (q, q) {
+                return Err(format!(
+                    "periodic_phase_marginal: row {row} has {q} variables but a {:?} factor",
+                    factor.dim()
+                ));
+            }
+            let t_block = factor.dot(&factor.t());
+            let spectrum = cache
+                .deflation_row_spectra
+                .get(row)
+                .and_then(Option::as_ref);
+            // `B` and the spectrum its fold differentiates: the recorded one with every unit
+            // pin read at its raw curvature.
+            let (b_block, raw_spectrum) = match spectrum {
+                Some(spec) => {
+                    if spec.evecs.dim() != (q, q)
+                        || spec.raw_evals.len() != q
+                        || spec.cond_evals.len() != q
+                        || spec.conditioning.len() != q
+                    {
+                        return Err(format!(
+                            "periodic_phase_marginal: row {row} has dimension {q}, but its \
+                             spectral carrier is {:?}",
+                            spec.evecs.dim()
+                        ));
+                    }
+                    let mut unpinned = spec.cond_evals.clone();
+                    let mut conditioning = spec.conditioning.to_vec();
+                    for m in 0..q {
+                        if conditioning[m] == RowSpectralConditioning::UnitDeflated {
+                            unpinned[m] = spec.raw_evals[m];
+                            conditioning[m] = RowSpectralConditioning::Raw;
+                        }
+                    }
+                    let scaled = &spec.evecs * &unpinned.view().insert_axis(ndarray::Axis(0));
+                    let b = scaled.dot(&spec.evecs.t());
+                    (
+                        b,
+                        Some(RowDeflationSpectrum {
+                            evecs: spec.evecs.clone(),
+                            raw_evals: spec.raw_evals.clone(),
+                            cond_evals: unpinned,
+                            conditioning: conditioning.into(),
+                        }),
+                    )
+                }
+                None => {
+                    let mut b = t_block.clone();
+                    for direction in cache.deflated_row_directions.get(row).into_iter().flatten() {
+                        if direction.len() != q {
+                            return Err(format!(
+                                "periodic_phase_marginal: row {row} gauge direction has length {}, \
+                                 row dimension {q}",
+                                direction.len()
+                            ));
+                        }
+                        for a in 0..q {
+                            for b_index in 0..q {
+                                b[[a, b_index]] -= direction[a] * direction[b_index];
+                            }
+                        }
+                    }
+                    (b, None)
+                }
+            };
+            let is_phase = |local: usize| phase.iter().any(|&(index, _)| index == local);
+            let others: Vec<usize> = (0..q).filter(|&local| !is_phase(local)).collect();
+            // `T_vv⁻¹ T_vP` and `T_vv⁻¹ B_vP`, one phase column at a time.
+            let (t_graph, b_graph) = if others.is_empty() {
+                (
+                    Array2::<f64>::zeros((0, phase.len())),
+                    Array2::<f64>::zeros((0, phase.len())),
+                )
+            } else {
+                let t_vv = t_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &others);
+                let chol = t_vv.cholesky(Side::Lower).map_err(|error| {
+                    format!("periodic_phase_marginal: row {row} T_vv is not positive definite: {error}")
+                })?;
+                let columns: Vec<usize> = phase.iter().map(|&(local, _)| local).collect();
+                let t_vp = t_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &columns);
+                let b_vp = b_block.select(ndarray::Axis(0), &others).select(ndarray::Axis(1), &columns);
+                (chol.solve_mat(&t_vp), chol.solve_mat(&b_vp))
+            };
+            let mut t_weight = Array2::<f64>::zeros((q, q));
+            let mut b_weight = Array2::<f64>::zeros((q, q));
+            for (column, &(j, period)) in phase.iter().enumerate() {
+                let mut t_schur = t_block[[j, j]];
+                let mut b_schur = b_block[[j, j]];
+                for (slot, &other) in others.iter().enumerate() {
+                    t_schur -= t_block[[j, other]] * t_graph[[slot, column]];
+                    b_schur -= b_block[[j, other]] * b_graph[[slot, column]];
+                }
+                if !(t_schur.is_finite() && t_schur > 0.0) {
+                    return Err(format!(
+                        "periodic_phase_marginal: row {row} phase {j} has conditional evidence \
+                         curvature {t_schur:.3e}"
+                    ));
+                }
+                let (log_marginal, log_marginal_derivative) =
+                    super::construction_ard::circle_log_marginal_signed(b_schur, period);
+                if !(log_marginal.is_finite() && log_marginal_derivative.is_finite()) {
+                    return Err(format!(
+                        "periodic_phase_marginal: row {row} phase {j} curvature {b_schur:.3e} \
+                         on period {period} has no finite circle volume"
+                    ));
+                }
+                correction +=
+                    -2.0 * log_marginal - t_schur.ln() + std::f64::consts::TAU.ln();
+                // d Sᵀ_jj = wᵀ dT w with w = e_j − T_vv⁻¹T_vj.
+                let mut w = Array1::<f64>::zeros(q);
+                w[j] = 1.0;
+                for (slot, &other) in others.iter().enumerate() {
+                    w[other] = -t_graph[[slot, column]];
+                }
+                t_weight.scaled_add(
+                    -1.0 / t_schur,
+                    &w.view()
+                        .insert_axis(ndarray::Axis(1))
+                        .dot(&w.view().insert_axis(ndarray::Axis(0))),
+                );
+                // d Sᴮ_jj = ⟨e_jeⱼᵀ + e_jaᵀ + aeⱼᵀ, dB⟩ + aᵀ dT_vv a with a = −T_vv⁻¹B_vj.
+                let coefficient = -2.0 * log_marginal_derivative;
+                let mut a = Array1::<f64>::zeros(q);
+                for (slot, &other) in others.iter().enumerate() {
+                    a[other] = -b_graph[[slot, column]];
+                }
+                b_weight[[j, j]] += coefficient;
+                for &other in &others {
+                    b_weight[[j, other]] += coefficient * a[other];
+                    b_weight[[other, j]] += coefficient * a[other];
+                    for &second in &others {
+                        t_weight[[other, second]] += coefficient * a[other] * a[second];
+                    }
+                }
+            }
+            let row_raw = match (spectrum, raw_spectrum.as_ref()) {
+                (Some(spec), Some(unpinned)) => {
+                    Self::deflation_folded_trace_weight(&t_weight, &[], Some(spec))
+                        + Self::deflation_folded_trace_weight(&b_weight, &[], Some(unpinned))
+                }
+                _ => t_weight + b_weight,
+            };
+            let base = cache.row_offsets[row];
+            let mut block = raw_weight.slice_mut(s![base..base + q, base..base + q]);
+            block += &row_raw;
+        }
+        Ok(priced_any.then_some((correction, raw_weight)))
     }
 
     /// `Dφ_S[X] = Q(F ∘ QᵀXQ)Qᵀ` for the reduced-Schur spectral conditioning the evidence
@@ -7535,11 +8047,17 @@ mod test_support {
             gamma.beta += &self.decoder_prior_gap_theta_trace(
                 cache, pricing.clamp_border_derivative.view(),
             )?;
+            let phase_weight = if geometry.orbit_generators.is_empty() {
+                self.periodic_phase_marginal(cache)?.map(|(_, weight)| weight)
+            } else {
+                None
+            };
             let (_, metric_gamma) = self.evidence_metric_derivative_channels(
                 rho,
                 target,
                 cache,
                 &pricing.metric_derivative,
+                phase_weight.as_ref(),
             )?;
             gamma.t += &metric_gamma.t;
             gamma.beta += &metric_gamma.beta;

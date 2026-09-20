@@ -2010,11 +2010,11 @@ impl Default for FitOptions {
 /// `Normal { mean: 0, sd: 3 }`, so the shipped criterion was `REML + Σρ²/18` —
 /// MAP in ρ, with an underived `sd = 3.0` — for as long as nobody re-read the
 /// `Default` impl. The damage was not only statistical: a prior whose gradient
-/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and all three
-/// rail-reasoning paths (`try_certify_asymptote_rail`, `try_tail_snap_to_rail`,
+/// survives into the λ→∞ tail makes `ĉ = −e^ρ ∂V/∂ρ` divergent, and the
+/// measured rail-reasoning paths (`try_certify_asymptote_rail`,
 /// `detect_wrong_rail_pullback`) decide by testing that `ĉ` is CONSTANT. One
-/// `Default` disabled the face certificate, the tail snap, and the repair path
-/// for a coordinate stuck on the wrong bound.
+/// `Default` disabled the face certificate and the repair path for a
+/// coordinate stuck on the wrong bound.
 #[cfg(test)]
 mod tests_certification_refusal_2550 {
     use super::{
@@ -3228,7 +3228,10 @@ pub struct FitInference {
     /// Coefficient-space influence matrix F = H⁻¹ X'WX. Its trace is the total EDF.
     #[serde(default)]
     pub coefficient_influence: Option<Array2<f64>>,
-    /// Weighted Gram `X'WX = H − S(λ)` in the original coefficient basis —
+    /// Weighted Gram `X'WX = H − S(λ)`, in the penalized Hessian's frame (the
+    /// coefficient gauge's active frame when geometry is present; read it in
+    /// the saved frame through [`UnifiedFitResult::saved_frame_weighted_gram`],
+    /// gam#3346) —
     /// symmetric PSD by construction on the GLM lanes. Stored directly (issue #1027) so the
     /// Wood–Pya–Säfken corrected-EDF correction `tr(X'WX·Σ_ρ)` pairs the true
     /// PSD Gram with `Σ_ρ`, rather than reconstructing it as `H·F` from a
@@ -4658,15 +4661,198 @@ mod assembly_inner_status_gate_tests {
     fn lift_to_saved_frame_refuses_a_pullback_and_leaves_the_fit_3021() {
         let (mut fit, frame, _) = reduced_frame_fit();
         if let Some(inference) = fit.inference.as_mut() {
-            inference.weighted_gram = Some(Array2::eye(3));
+            inference.coefficient_influence = Some(Array2::eye(3));
         }
         let before = fit.beta.clone();
         let error = fit
             .lift_to_saved_frame(&frame)
-            .expect_err("a weighted Gram cannot be pushed forward");
-        assert!(error.to_string().contains("weighted Gram"), "{error}");
+            .expect_err("the influence matrix cannot be pushed forward");
+        assert!(error.to_string().contains("coefficient influence"), "{error}");
         assert_eq!(fit.beta, before);
         assert_eq!(fit.blocks[1].beta.len(), 1);
+    }
+
+    /// gam#3346: `X'WX` is covariant like `H`, so the lift keeps it beside `H`
+    /// in the active frame instead of refusing the fit. Under this rectangular
+    /// lift neither has a unique saved-frame form, and the saved-frame
+    /// accessors say so rather than hand back an active-frame matrix.
+    #[test]
+    fn lift_to_saved_frame_keeps_the_weighted_gram_beside_the_hessian_3346() {
+        let (mut fit, frame, _) = reduced_frame_fit();
+        let gram = ndarray::array![[3.0, 1.0, 0.0], [1.0, 2.0, 0.5], [0.0, 0.5, 2.0]];
+        if let Some(inference) = fit.inference.as_mut() {
+            inference.weighted_gram = Some(gram.clone());
+        }
+        fit.lift_to_saved_frame(&frame)
+            .expect("a weighted Gram stays in its active frame");
+        assert_eq!(fit.inference.as_ref().unwrap().weighted_gram.as_ref(), Some(&gram));
+        assert!(fit.saved_frame_weighted_gram().is_err());
+        assert!(fit.saved_frame_penalized_hessian().is_err());
+    }
+
+    /// A fit on blocks of widths `[2, 1]` whose active frame is the saved frame.
+    fn identity_frame_fit(
+        beta: &Array1<f64>,
+        hessian: &Array2<f64>,
+        gram: &Array2<f64>,
+    ) -> UnifiedFitResult {
+        let mut parts = parts_with_inner_status(PirlsStatus::Converged);
+        let block_betas = [
+            beta.slice(ndarray::s![0..2]).to_owned(),
+            beta.slice(ndarray::s![2..3]).to_owned(),
+        ];
+        parts.blocks[0].beta = block_betas[0].clone();
+        parts.blocks.push(FittedBlock {
+            beta: block_betas[1].clone(),
+            role: BlockRole::Scale,
+            edf: 1.0,
+            lambdas: Array1::zeros(0),
+        });
+        parts.block_states = block_betas
+            .iter()
+            .map(|beta| gam_problem::ParameterBlockState {
+                beta: beta.clone(),
+                eta: Array1::zeros(3),
+            })
+            .collect();
+        if let Some(inference) = parts.inference.as_mut() {
+            inference.penalized_hessian =
+                gam_problem::dispersion_cov::UnscaledPrecision::wrap(hessian.clone());
+            inference.weighted_gram = Some(gram.clone());
+        }
+        parts.geometry = Some(FitGeometry {
+            coefficient_gauge: gam_problem::Gauge::identity(&[2, 1]),
+            penalized_hessian: hessian.clone().into(),
+            constrained_posterior: None,
+            working: None,
+        });
+        UnifiedFitResult::try_from_parts(parts).expect("identity-frame fixture assembles")
+    }
+
+    fn score_test_p_value(fit: &UnifiedFitResult) -> f64 {
+        let hessian = fit.saved_frame_penalized_hessian().unwrap().unwrap();
+        let gram = fit.saved_frame_weighted_gram().unwrap().unwrap();
+        let beta = fit.beta_from_gauge_shift().unwrap();
+        gam_terms::inference::smooth_score_test::smooth_score_test(
+            gam_terms::inference::smooth_score_test::SmoothScoreTestInput {
+                beta: beta.view(),
+                penalized_hessian: &hessian,
+                weighted_gram: &gram,
+                coeff_range: 0..2,
+                structural_penalties: &[Array2::eye(2)],
+                covariance_scale: 1.0,
+                residual_df: Some(50.0),
+                scale: gam_terms::inference::smooth_test::SmoothTestScale::Known,
+            },
+        )
+        .expect("the term is testable")
+        .p_value
+    }
+
+    /// gam#3346 acceptance: under a square gauge (the mean-wiggle de-alias
+    /// shape `[[I, −A], [0, I]]`) the smooth score test of a lifted fit equals
+    /// the test of the same fit expressed in the saved frame, and under the
+    /// identity gauge the saved-frame curvatures are the stored ones.
+    #[test]
+    fn square_gauge_score_test_matches_the_saved_frame_fit_3346() {
+        let saved_gram = ndarray::array![[3.0, 0.5, 0.2], [0.5, 2.0, 0.1], [0.2, 0.1, 1.5]];
+        let mut saved_hessian = saved_gram.clone();
+        saved_hessian[[0, 0]] += 0.7;
+        saved_hessian[[1, 1]] += 0.7;
+        let saved_beta = ndarray::array![0.3, -0.2, 1.0];
+        let saved_fit = identity_frame_fit(&saved_beta, &saved_hessian, &saved_gram);
+        assert!(matches!(
+            saved_fit.saved_frame_weighted_gram(),
+            Ok(Some(std::borrow::Cow::Borrowed(gram))) if gram == &saved_gram
+        ));
+        assert!(matches!(
+            saved_fit.saved_frame_penalized_hessian(),
+            Ok(Some(std::borrow::Cow::Borrowed(hessian))) if hessian == &saved_hessian
+        ));
+
+        // `β_saved = M θ`, so the active fit carries `θ = M⁻¹ β_saved` and the
+        // pulled-back curvatures `MᵀAM`.
+        let de_alias = ndarray::array![[1.0, 0.0, -0.4], [0.0, 1.0, 0.3], [0.0, 0.0, 1.0]];
+        let frame = gam_problem::Gauge::from_t(de_alias, &[2, 1], &[2, 1]);
+        let active_beta = ndarray::array![0.3 + 0.4, -0.2 - 0.3, 1.0];
+        let mut active_fit = identity_frame_fit(
+            &active_beta,
+            &frame.restrict_penalty(&saved_hessian),
+            &frame.restrict_penalty(&saved_gram),
+        );
+        active_fit
+            .lift_to_saved_frame(&frame)
+            .expect("a square lift carries the weighted Gram");
+        // `M` has entries of magnitude ≤ 1 and κ(M) < 2, so the lifted β and
+        // the two QR solves are exact to a few ulps of the entries (≤ 3.7).
+        for (a, b) in active_fit.beta.iter().zip(saved_beta.iter()) {
+            assert!((a - b).abs() <= 1e-15, "{a} vs {b}");
+        }
+        let lifted_gram = active_fit.saved_frame_weighted_gram().unwrap().unwrap();
+        let lifted_hessian = active_fit.saved_frame_penalized_hessian().unwrap().unwrap();
+        for (lifted, saved) in [(&lifted_gram, &saved_gram), (&lifted_hessian, &saved_hessian)] {
+            for (a, b) in lifted.iter().zip(saved.iter()) {
+                assert!((a - b).abs() <= 1e-14, "{a} vs {b}");
+            }
+        }
+        let saved_p = score_test_p_value(&saved_fit);
+        let lifted_p = score_test_p_value(&active_fit);
+        assert!(saved_p > 0.0 && saved_p < 1.0);
+        assert!(
+            (saved_p - lifted_p).abs() <= 1e-12,
+            "the score test is frame-invariant: {saved_p} vs {lifted_p}"
+        );
+    }
+
+    /// gam#3346 review: under an affine gauge `β = Tθ + a` the active fit
+    /// carries the offset `X·a`, so the lifted `β̂` is the offset fit's
+    /// coefficients plus `a`. The score test measures `β̂` from the shift and
+    /// equals the test of the saved-frame fit with that offset; read off the
+    /// uncentred `H·β̂` it would test a different score.
+    #[test]
+    fn affine_gauge_score_test_measures_beta_from_the_shift_3346() {
+        let saved_gram = ndarray::array![[3.0, 0.5, 0.2], [0.5, 2.0, 0.1], [0.2, 0.1, 1.5]];
+        let mut saved_hessian = saved_gram.clone();
+        saved_hessian[[0, 0]] += 0.7;
+        saved_hessian[[1, 1]] += 0.7;
+        let offset_beta = ndarray::array![0.3, -0.2, 1.0];
+        let offset_fit = identity_frame_fit(&offset_beta, &saved_hessian, &saved_gram);
+
+        let de_alias = ndarray::array![[1.0, 0.0, -0.4], [0.0, 1.0, 0.3], [0.0, 0.0, 1.0]];
+        let mut frame = gam_problem::Gauge::from_t(de_alias, &[2, 1], &[2, 1]);
+        let shift = ndarray::array![0.25, -0.5, 0.75];
+        frame.affine_shift = shift.clone();
+        let active_beta = ndarray::array![0.3 + 0.4, -0.2 - 0.3, 1.0];
+        let mut active_fit = identity_frame_fit(
+            &active_beta,
+            &frame.restrict_penalty(&saved_hessian),
+            &frame.restrict_penalty(&saved_gram),
+        );
+        active_fit
+            .lift_to_saved_frame(&frame)
+            .expect("a square affine lift carries the weighted Gram");
+        let expected_beta = &offset_beta + &shift;
+        for (a, b) in active_fit.beta.iter().zip(expected_beta.iter()) {
+            assert!((a - b).abs() <= 1e-15, "{a} vs {b}");
+        }
+        let centred = active_fit.beta_from_gauge_shift().unwrap();
+        for (a, b) in centred.iter().zip(offset_beta.iter()) {
+            assert!((a - b).abs() <= 1e-15, "{a} vs {b}");
+        }
+
+        let offset_p = score_test_p_value(&offset_fit);
+        let lifted_p = score_test_p_value(&active_fit);
+        assert!(offset_p > 0.0 && offset_p < 1.0);
+        assert!(
+            (offset_p - lifted_p).abs() <= 1e-12,
+            "the score test keeps the shift as the null's offset: {offset_p} vs {lifted_p}"
+        );
+        let shifted_fit = identity_frame_fit(&expected_beta, &saved_hessian, &saved_gram);
+        let uncentred_p = score_test_p_value(&shifted_fit);
+        assert!(
+            (offset_p - uncentred_p).abs() > 1e-3,
+            "an uncentred score tests a different statistic: {offset_p} vs {uncentred_p}"
+        );
     }
 }
 
@@ -5740,6 +5926,20 @@ impl UnifiedFitResult {
                     p
                 );
             }
+            // `X'WX` is a covariant quadratic form exactly like `H`, so it lives
+            // in `H`'s active frame (gam#3346).
+            if let Some(gram) = inf.weighted_gram.as_ref()
+                && gram.dim() != (penalized_hessian_dim, penalized_hessian_dim)
+            {
+                bail_fit_result_invariant!(
+                    "UnifiedFitResult weighted Gram shape mismatch: got {}x{}, expected the \
+                     penalized Hessian's active frame {}x{}",
+                    gram.nrows(),
+                    gram.ncols(),
+                    penalized_hessian_dim,
+                    penalized_hessian_dim
+                );
+            }
             if let Some(f_mat) = inf.coefficient_influence.as_ref()
                 && (f_mat.nrows() != p || f_mat.ncols() != p)
             {
@@ -5927,13 +6127,81 @@ impl UnifiedFitResult {
             .and_then(|inf| inf.coefficient_influence.as_ref())
     }
 
-    /// Get the original-basis weighted Gram `X'WX = H − S(λ)` if available —
-    /// the symmetric PSD matrix the Wood–Pya–Säfken corrected-EDF correction
-    /// pairs with the smoothing-parameter uncertainty covariance (issue #1027).
-    pub fn weighted_gram(&self) -> Option<&Array2<f64>> {
+    /// The weighted Gram `X'WX = H − S(λ)` in the saved coefficient frame, the
+    /// frame of `beta`, the covariances and the smoothing corrections — the
+    /// matrix the Wood–Pya–Säfken corrected-EDF correction pairs with the
+    /// smoothing-parameter uncertainty covariance (issue #1027).
+    ///
+    /// `X'WX` is stored beside the penalized Hessian in its active frame, so
+    /// it is pushed forward through the coefficient gauge exactly like
+    /// [`Self::saved_frame_penalized_hessian`] (gam#3346). `Ok(None)` when the
+    /// fit carries no Gram; `Err` when it does but the gauge is rectangular,
+    /// so the Gram has no unique saved-frame form.
+    pub fn saved_frame_weighted_gram(
+        &self,
+    ) -> Result<Option<std::borrow::Cow<'_, Array2<f64>>>, String> {
         self.inference
             .as_ref()
             .and_then(|inf| inf.weighted_gram.as_ref())
+            .map(|gram| self.active_quadratic_form_in_saved_frame(gram))
+            .transpose()
+    }
+
+    /// The penalized Hessian in the saved coefficient frame. The stored
+    /// Hessian ([`Self::penalized_hessian`]) lives in the active frame of the
+    /// coefficient gauge; under a square gauge `β = Tθ + a` its saved-frame
+    /// form is `T⁻ᵀ H_θ T⁻¹`, and under a rectangular one it has none, which
+    /// is an `Err` rather than a Hessian of the wrong frame (gam#3346).
+    pub fn saved_frame_penalized_hessian(
+        &self,
+    ) -> Result<Option<std::borrow::Cow<'_, Array2<f64>>>, String> {
+        self.penalized_hessian()
+            .map(|hessian| self.active_quadratic_form_in_saved_frame(hessian))
+            .transpose()
+    }
+
+    /// `β̂ − a`: the saved-frame coefficients measured from the gauge's affine
+    /// shift `a` of `β = Tθ + a`.
+    ///
+    /// The active penalty `θᵀS_θθ` is centred at `a` in the saved frame,
+    /// `(β − a)ᵀ T⁻ᵀS_θT⁻¹ (β − a)`, so stationarity in θ pushes forward to
+    /// `H_saved·(β̂ − a) = X_savedᵀW(z − X_saved·a)`: a score read off `H·β`
+    /// must read it off `H·(β̂ − a)`, with the shift as the known offset every
+    /// `τ = 0` null keeps (gam#3346).
+    pub fn beta_from_gauge_shift(&self) -> Result<std::borrow::Cow<'_, Array1<f64>>, String> {
+        match self.geometry.as_ref() {
+            Some(geometry)
+                if geometry
+                    .coefficient_gauge
+                    .affine_shift
+                    .iter()
+                    .any(|&shift| shift != 0.0) =>
+            {
+                let shift = &geometry.coefficient_gauge.affine_shift;
+                if shift.len() != self.beta.len() {
+                    return Err(format!(
+                        "the coefficient gauge's affine shift has {} coordinates but beta has {}",
+                        shift.len(),
+                        self.beta.len()
+                    ));
+                }
+                Ok(std::borrow::Cow::Owned(&self.beta - shift))
+            }
+            _ => Ok(std::borrow::Cow::Borrowed(&self.beta)),
+        }
+    }
+
+    fn active_quadratic_form_in_saved_frame<'a>(
+        &self,
+        form: &'a Array2<f64>,
+    ) -> Result<std::borrow::Cow<'a, Array2<f64>>, String> {
+        match self.geometry.as_ref() {
+            Some(geometry) if !geometry.coefficient_gauge.is_identity() => geometry
+                .coefficient_gauge
+                .push_forward_quadratic_form(form)
+                .map(std::borrow::Cow::Owned),
+            _ => Ok(std::borrow::Cow::Borrowed(form)),
+        }
     }
 
     /// Dispersion used to scale covariance matrices.
@@ -5988,6 +6256,29 @@ impl UnifiedFitResult {
             )));
         }
         Ok(resolved.phi())
+    }
+
+    /// [`Self::dispersion_phi`] when the fit's scale contract has a scalar
+    /// response dispersion, and `None` exactly when it has none: a fit with no
+    /// engine-level family (a custom family), or a family whose resolved scale
+    /// is [`gam_problem::ResolvedLikelihoodScale::Unspecified`] (Royston-Parmar
+    /// survival). The answer is read from the resolved scale, so every other
+    /// dispersion failure is still an error (gam#3297).
+    pub fn scalar_dispersion_phi(&self) -> Result<Option<f64>, EstimationError> {
+        let Some(spec) = self.likelihood_family.as_ref() else {
+            return Ok(None);
+        };
+        let glm = GlmLikelihoodSpec {
+            spec: spec.clone(),
+            scale: self.likelihood_scale,
+        };
+        match glm
+            .resolved_scale()
+            .map_err(|error| EstimationError::InvalidInput(error.to_string()))?
+        {
+            gam_problem::ResolvedLikelihoodScale::Unspecified => Ok(None),
+            _ => self.dispersion_phi().map(Some),
+        }
     }
 
     /// Multiplier that turns the stored unscaled inverse penalized Hessian
@@ -6194,13 +6485,16 @@ impl UnifiedFitResult {
     ///   lifted by `J`; the linear predictors are unchanged, `X_saved·Jθ = X_fit·θ`;
     /// * the covariances (conditional, corrected, frequentist) and both
     ///   smoothing-parameter corrections push forward as `JΣJᵀ`;
-    /// * the penalized Hessian and its identified subspace are covariant and
-    ///   stay in their active frame, whose coefficient gauge becomes `J∘gauge`.
+    /// * the penalized Hessian, the weighted Gram `XᵀWX` and the identified
+    ///   subspace are covariant and stay in their active frame, whose
+    ///   coefficient gauge becomes `J∘gauge`; a consumer that pairs them with
+    ///   saved-frame objects reads them through
+    ///   [`Self::saved_frame_penalized_hessian`] and
+    ///   [`Self::saved_frame_weighted_gram`] (gam#3346).
     ///
     /// A quantity with no unique lift through a non-square `J` is refused, not
     /// dropped: standard errors published without their covariance, the
-    /// influence matrix `H⁻¹XᵀWX`, the weighted Gram `XᵀWX` (a pullback, which
-    /// cannot be pushed forward), and a stored reparameterization basis. The fit
+    /// influence matrix `H⁻¹XᵀWX`, and a stored reparameterization basis. The fit
     /// is rebuilt through the constructor's invariants before it replaces
     /// `self`, so a refused lift leaves the fit as it was.
     pub fn lift_to_saved_frame(
@@ -6285,7 +6579,6 @@ impl UnifiedFitResult {
                     inference.coefficient_influence.is_some(),
                     "coefficient influence matrix",
                 ),
-                (inference.weighted_gram.is_some(), "weighted Gram"),
                 (inference.reparam_qs.is_some(), "reparameterization basis"),
             ] {
                 if present {

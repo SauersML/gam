@@ -37,7 +37,6 @@ use crate::inference::model::{
     SavedTransformationNormalGeometry, TransformationNormalParameterization,
     TransformationScoreCalibration,
 };
-use crate::scale_design::{ScaleDeviationTransform, build_scale_deviation_transform};
 use crate::survival::construction::{
     SavedSurvivalTimeBasis, SurvivalBaselineConfig, survival_baseline_targetname,
 };
@@ -914,11 +913,12 @@ fn transformation_normal_geometry(
 }
 
 /// Which likelihood a (non-survival) location-scale model carries: Gaussian
-/// (residual response scale) or binomial (noise scale-deviation transform whose
-/// likelihood is resolved from the inverse link). The assembler resolves the
-/// `FittedFamily` from this once, rather than each save path stamping a
-/// (potentially wrong) likelihood and patching it afterwards.
-pub enum LocationScaleResponse<'a> {
+/// (residual response scale) or binomial (likelihood resolved from the inverse
+/// link). The assembler resolves the `FittedFamily` from this once, rather than
+/// each save path stamping a (potentially wrong) likelihood and patching it
+/// afterwards. No location-scale fit residualizes its noise design, so none
+/// persists a scale-deviation transform (#3015).
+pub enum LocationScaleResponse {
     /// Gaussian identity; `base_link` is the optional resolved base link the CLI
     /// may pass through from `link(...)` (the FFI leaves it `None`).
     Gaussian {
@@ -928,11 +928,8 @@ pub enum LocationScaleResponse<'a> {
         sigma_floor: f64,
         base_link: Option<InverseLink>,
     },
-    /// Binomial under `link`, with the encoded noise scale-deviation transform.
-    Binomial {
-        link: InverseLink,
-        noise_transform: &'a ScaleDeviationTransform,
-    },
+    /// Binomial under `link`.
+    Binomial { link: InverseLink },
     /// A genuine-dispersion mean family (NegativeBinomial / Gamma / Beta /
     /// Tweedie) whose log-precision channel carries `noise_formula` (#913). The
     /// `likelihood` is the family's own [`LikelihoodSpec`]; `base_link` is the
@@ -975,15 +972,14 @@ pub struct LocationScaleInputs {
 /// probit likelihood that a caller must patch afterwards.
 pub fn assemble_location_scale_payload(
     inputs: LocationScaleInputs,
-    response: LocationScaleResponse<'_>,
+    response: LocationScaleResponse,
     source: SavedModelSourceMetadata,
 ) -> Result<FittedModelPayload, String> {
     inputs
         .fit_result
         .require_posterior_mean("location-scale saved-model assembly")
         .map_err(|error| error.to_string())?;
-    let (family_tag, likelihood, base_link, link, gaussian_scales, noise_transform) = match response
-    {
+    let (family_tag, likelihood, base_link, link, gaussian_scales) = match response {
         LocationScaleResponse::Gaussian {
             response_scale,
             sigma_floor,
@@ -997,12 +993,8 @@ pub fn assemble_location_scale_payload(
             None,
             Some(base_link.unwrap_or(InverseLink::Standard(StandardLink::Identity))),
             Some((response_scale, sigma_floor)),
-            None,
         ),
-        LocationScaleResponse::Binomial {
-            link,
-            noise_transform,
-        } => {
+        LocationScaleResponse::Binomial { link } => {
             let likelihood = inverse_link_to_binomial_spec(&link).map_err(|e| {
                 format!("failed to resolve LikelihoodSpec for binomial location-scale link {link:?}: {e}")
             })?;
@@ -1012,7 +1004,6 @@ pub fn assemble_location_scale_payload(
                 Some(link.clone()),
                 Some(link),
                 None,
-                Some(noise_transform),
             )
         }
         LocationScaleResponse::Dispersion {
@@ -1024,7 +1015,6 @@ pub fn assemble_location_scale_payload(
             likelihood,
             Some(base_link.clone()),
             Some(base_link),
-            None,
             None,
         ),
     };
@@ -1047,20 +1037,6 @@ pub fn assemble_location_scale_payload(
     payload.beta_noise = inputs.beta_noise;
     payload.gaussian_response_scale = gaussian_scales.map(|(response_scale, _)| response_scale);
     payload.gaussian_sigma_floor = gaussian_scales.map(|(_, sigma_floor)| sigma_floor);
-    if let Some(transform) = noise_transform {
-        payload.noise_projection = Some(
-            transform
-                .projection_coef
-                .rows()
-                .into_iter()
-                .map(|row| row.to_vec())
-                .collect(),
-        );
-        payload.noise_center = Some(transform.weighted_column_mean.to_vec());
-        payload.noise_scale = Some(transform.rescale.to_vec());
-        payload.noise_non_intercept_start = Some(transform.non_intercept_start);
-        payload.noise_projection_ridge_alpha = Some(transform.projection_ridge_alpha);
-    }
     payload.resolved_termspec = Some(inputs.resolved_termspec);
     payload.resolved_termspec_noise = Some(inputs.resolved_termspec_noise);
     if let Some(wiggle) = inputs.wiggle {
@@ -1850,7 +1826,6 @@ fn fit_expanded_formula_to_payload(
             payload_for_gaussian_location_scale(formula, dataset, fit_config, ls_result)?
         }
         FitRequest::BinomialLocationScale(ls_request) => {
-            let weights = ls_request.spec.weights.clone();
             let link_kind = ls_request.spec.link_kind.clone();
             let fit_result = fit_model(FitRequest::BinomialLocationScale(ls_request))?;
             let ls_result = match fit_result {
@@ -1867,7 +1842,6 @@ fn fit_expanded_formula_to_payload(
                 dataset,
                 fit_config,
                 link_kind,
-                &weights,
                 ls_result,
             )?
         }
@@ -2599,7 +2573,6 @@ fn payload_for_binomial_location_scale(
     dataset: &EncodedDataset,
     fit_config: &FitConfig,
     link_kind: InverseLink,
-    weights: &Array1<f64>,
     ls_result: BinomialLocationScaleFitResult,
 ) -> Result<FittedModelPayload, String> {
     let frozen_meanspec = freeze_term_collection_from_design(
@@ -2618,26 +2591,6 @@ fn payload_for_binomial_location_scale(
         .clone()
         .ok_or_else(|| "binomial location-scale requires noise_formula".to_string())?;
 
-    let dense_mean = ls_result
-        .fit
-        .mean_design
-        .design
-        .try_to_dense_by_chunks("binomial location-scale mean design")?;
-    let dense_noise = ls_result
-        .fit
-        .noise_design
-        .design
-        .try_to_dense_by_chunks("binomial location-scale noise design")?;
-    let non_intercept_start = ls_result
-        .fit
-        .noise_design
-        .intercept_range
-        .end
-        .min(ls_result.fit.noise_design.design.ncols());
-    let binomial_noise_transform =
-        build_scale_deviation_transform(&dense_mean, &dense_noise, weights, non_intercept_start)
-            .map_err(|err| format!("failed to encode binomial noise transform: {err}"))?;
-
     let fit = ls_result.fit.fit;
     let scale_beta = fit
         .block_by_role(BlockRole::Scale)
@@ -2649,9 +2602,8 @@ fn payload_for_binomial_location_scale(
     );
 
     // Thin adapter over the shared core assembler; the FFI freezes the threshold
-    // and noise specs from their designs, encodes the binomial noise
-    // scale-deviation transform, and reads offset columns from the FitConfig.
-    // See `assemble_location_scale_payload`.
+    // and noise specs from their designs and reads offset columns from the
+    // FitConfig. See `assemble_location_scale_payload`.
     assemble_location_scale_payload(
         LocationScaleInputs {
             formula,
@@ -2663,10 +2615,7 @@ fn payload_for_binomial_location_scale(
             beta_noise: scale_beta,
             wiggle,
         },
-        LocationScaleResponse::Binomial {
-            link: link_kind,
-            noise_transform: &binomial_noise_transform,
-        },
+        LocationScaleResponse::Binomial { link: link_kind },
         SavedModelSourceMetadata {
             training_headers: dataset.headers.clone(),
             training_feature_ranges: Some(dataset.feature_ranges()),

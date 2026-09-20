@@ -51,6 +51,9 @@ mod decrement_bands;
 mod efs_fallback_routing_tests;
 mod hessian_operator;
 #[cfg(test)]
+#[path = "rho_optimizer/ladder_incumbent_resume_3306_tests.rs"]
+mod ladder_incumbent_resume_3306_tests;
+#[cfg(test)]
 #[path = "rho_optimizer/logdet_forward_error_1b_tests.rs"]
 mod logdet_forward_error_1b_tests;
 mod newton_polish;
