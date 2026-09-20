@@ -16,6 +16,15 @@ under a two-sided Kolmogorov-Smirnov test.
 
 `REPS` is the smallest count at which the band at 0.01 excludes a zero rate,
 `2 sqrt(0.01 * 0.99 / REPS) < 0.01`, so every level is tested from below.
+
+The Gaussian scale is profiled: `RSS / (n - edf)` with the smoothing
+parameters fit to the same residuals, which biases it low, so a t on
+`n - edf` rejected too often (x1 at 12000 null reps: +2.8 MCSE at 0.10). Each
+estimated-scale reference is now on `n - tau`, where `tau` charges the EDF for
+the uncertainty of the smoothing parameters the statistic depends on. An
+unpenalized coefficient depends on all of them, so its `tau` is the fit's
+smoothing-corrected EDF; a ridged one is conditioned on its own ridge, so its
+`tau` lies between the plain and the corrected EDF.
 """
 
 import json
@@ -132,3 +141,40 @@ def test_cli_and_python_read_the_same_parametric_pvalues(tmp_path):
         before = [float(r["p_value"]).hex() for r in getattr(fresh, table)]
         after = [float(r["p_value"]).hex() for r in payload[table]]
         assert before == after, table
+
+
+def test_gaussian_residual_df_charges_the_smoothing_parameters_the_statistic_depends_on():
+    frame = _null_frame("gaussian", 100, 2)
+    n = len(frame)
+    # An unpenalized coefficient's statistic depends on every smoothing
+    # parameter, so its residual df is n minus the smoothing-corrected EDF.
+    unpenalized = gamfit.fit(
+        frame, "y ~ linear(x1, double_penalty=false) + g + s(x2)"
+    ).summary()
+    rows = {r["name"]: r for r in unpenalized.parametric_terms}
+    assert rows["x1"]["penalized"] is False
+    corrected = n - unpenalized.edf_corrected
+    for name in ("Intercept", "x1"):
+        assert math.isclose(rows[name]["residual_df"], corrected, rel_tol=1e-9), (
+            name, rows[name]["residual_df"], corrected
+        )
+    # A ridged coefficient's own ridge is conditioned on: its residual df sits
+    # between n minus the corrected EDF and n minus the plain EDF.
+    ridged = gamfit.fit(frame, "y ~ x1 + g + s(x2)").summary()
+    rows = {r["name"]: r for r in ridged.parametric_terms}
+    tests = {r["name"]: r for r in ridged.parametric_term_tests}
+    assert rows["x1"]["penalized"] is True
+    for df in (rows["x1"]["residual_df"], tests["g"]["residual_df"]):
+        assert n - ridged.edf_corrected <= df <= n - ridged.edf_total, (
+            df, ridged.edf_corrected, ridged.edf_total
+        )
+    assert tests["x1"]["residual_df"] == rows["x1"]["residual_df"]
+    assert "t residual df, charged for the smoothing parameters" in str(ridged)
+
+
+def test_a_known_scale_reference_publishes_no_residual_df():
+    summary = gamfit.fit(
+        _null_frame("poisson", 200, 0), "y ~ x1 + g + s(x2)", family="poisson"
+    ).summary()
+    for table in (summary.parametric_terms, summary.parametric_term_tests):
+        assert all("residual_df" not in r or r["residual_df"] is None for r in table)

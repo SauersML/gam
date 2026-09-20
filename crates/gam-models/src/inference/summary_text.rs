@@ -191,8 +191,38 @@ fn parametric_table(summary: &SummaryPayload, out: &mut String) {
         )
         .expect("writing to a String cannot fail");
     }
+    residual_df_note(
+        summary
+            .parametric_terms
+            .iter()
+            .map(|row| (row_label(row.predictor, &row.name), row.residual_df)),
+        statistic,
+        out,
+    );
     out.push('\n');
     parametric_term_test_table(summary, out);
+}
+
+/// The residual degrees of freedom each estimated-scale reference is on, one
+/// per row: they differ between terms, since each charges only the smoothing
+/// parameters its own statistic depends on.
+fn residual_df_note(
+    rows: impl Iterator<Item = (String, Option<f64>)>,
+    statistic: &str,
+    out: &mut String,
+) {
+    let entries = rows
+        .filter_map(|(label, df)| df.map(|df| format!("{label} {}", format_significant(df))))
+        .collect::<Vec<_>>();
+    if !entries.is_empty() {
+        writeln!(
+            out,
+            "  {statistic} residual df, charged for the smoothing parameters each statistic \
+             depends on: {}",
+            entries.join(", ")
+        )
+        .expect("writing to a String cannot fail");
+    }
 }
 
 /// The joint Wald test of each parametric term, as `anova.gam` prints it: a
@@ -232,6 +262,15 @@ fn parametric_term_test_table(summary: &SummaryPayload, out: &mut String) {
                 .expect("writing to a String cannot fail");
         }
     }
+    residual_df_note(
+        summary
+            .parametric_term_tests
+            .iter()
+            .filter(|test| test.df > 1)
+            .map(|test| (row_label(test.predictor, &test.name), test.residual_df)),
+        summary.parametric_term_statistic.unwrap_or("statistic"),
+        out,
+    );
     out.push('\n');
 }
 
@@ -469,6 +508,7 @@ mod tests {
                     std_error: Some(0.05),
                     penalized: false,
                     statistic: Some(30.0),
+                    residual_df: Some(92.25),
                     p_value: Some(1e-50),
                     p_value_unavailable: None,
                 },
@@ -479,6 +519,7 @@ mod tests {
                     std_error: Some(0.125),
                     penalized: true,
                     statistic: Some(-2.0),
+                    residual_df: Some(92.75),
                     p_value: Some(0.0484),
                     p_value_unavailable: None,
                 },
@@ -489,6 +530,7 @@ mod tests {
                 predictor: None,
                 df: 1,
                 statistic: Some(4.0),
+                residual_df: Some(92.75),
                 p_value: Some(0.0484),
                 p_value_unavailable: None,
             }],
@@ -539,6 +581,7 @@ Parametric coefficients:
 Intercept       1.5        0.05       30  1.00e-50  ***
 x1            -0.25       0.125       -2    0.0484  *
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
+  t residual df, charged for the smoothing parameters each statistic depends on: Intercept 92.25, x1 92.75
 
 Approximate significance of smooth terms:
          edf  Ref.df  Score  p-value       lambda
@@ -609,6 +652,7 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
             std_error: Some(0.1),
             penalized: false,
             statistic: Some(6.0),
+            residual_df: None,
             p_value: Some(1e-8),
             p_value_unavailable: None,
         });
@@ -617,6 +661,7 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
             predictor: Some("slope"),
             df: 2,
             statistic: Some(3.5),
+            residual_df: None,
             p_value: Some(0.03),
             p_value_unavailable: None,
         });
@@ -674,6 +719,7 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
                 predictor: None,
                 df: 1,
                 statistic: None,
+                residual_df: None,
                 p_value: None,
                 p_value_unavailable: Some(ParametricPValueUnavailable::BoundedCoefficient),
             },
@@ -682,6 +728,7 @@ Convergence: certified; inner P-IRLS: Converged after 5 iterations; 7 outer iter
                 predictor: None,
                 df: 3,
                 statistic: Some(2.5),
+                residual_df: Some(92.5),
                 p_value: Some(0.0875),
                 p_value_unavailable: None,
             },
@@ -694,11 +741,13 @@ Intercept       1.5        0.05       30  1.00e-50  ***
 x1            -0.25       0.125       NA        NA
   x1: the coefficient is bounded, so the null can sit on the constraint boundary where the normal reference does not hold; no p-value is reported
   Ridge-penalized (x1): Std. Error is the estimate's sampling SD under the null, with the ridge prior's own variance removed
+  t residual df, charged for the smoothing parameters each statistic depends on: Intercept 92.25, x1 92.75
 
 Parametric terms:
     df    F  p-value
 x1   1   NA       NA
 g    3  2.5   0.0875  .
+  F residual df, charged for the smoothing parameters each statistic depends on: g 92.5
 
 ";
         assert!(text.contains(expected), "{text}");

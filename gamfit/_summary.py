@@ -291,17 +291,23 @@ class Summary:
         per coefficient with ``name``, ``estimate``, ``std_error``,
         ``penalized``, ``statistic`` and ``p_value``, plus
         ``p_value_unavailable`` (the reason label) when no valid p-value
-        exists. For a ``penalized`` (ridge-carrying) coefficient
-        ``std_error`` is the estimate's sampling SD under the null with the
-        ridge prior's own variance removed, which is what the Wald statistic
-        is scaled by.
+        exists and ``residual_df`` (the ``t`` reference's degrees of freedom)
+        when the scale is estimated. For a ``penalized`` (ridge-carrying)
+        coefficient ``std_error`` is the estimate's sampling SD under the null
+        with the ridge prior's own variance removed, which is what the Wald
+        statistic is scaled by. On a Gaussian fit the scale is profiled, so
+        ``residual_df`` is ``n`` minus the EDF corrected for the smoothing
+        parameters the statistic depends on, and it differs between rows;
+        ``std_error`` uses the scale estimate on that same ``residual_df``.
     parametric_term_statistic : str or None
         The reference of :attr:`parametric_term_tests`: ``"F"`` (on ``df``
         and the residual degrees of freedom) when the scale is estimated,
         ``"Chi.sq"`` (on ``df``) when it is known.
     parametric_term_tests : list of dict
         One joint Wald test per parametric term (not the intercept), with
-        ``name``, ``df``, ``statistic``, ``p_value`` and, when withheld,
+        ``name``, ``df``, ``statistic``, ``p_value``, ``residual_df`` (the
+        ``F`` denominator degrees of freedom, as on :attr:`parametric_terms`)
+        when the scale is estimated and, when withheld,
         ``p_value_unavailable``. A factor with ``L`` levels is tested once on
         ``L - 1`` degrees of freedom; ``statistic`` is referred to the
         distribution :attr:`parametric_term_statistic` names.

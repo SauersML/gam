@@ -2566,10 +2566,11 @@ pub struct FitArtifacts {
     pub rho_posterior_escalation: Option<gam_problem::rho_posterior::RhoPosteriorEscalation>,
     /// Regularized inverse REML/LAML outer Hessian over `rho = log(lambda)`,
     /// aligned with [`UnifiedFitResult::lambdas`]. This is the narrow #740
-    /// handoff consumed by estimated-lambda Lawley LR corrections; it is
-    /// computed from the same path as smoothing-parameter uncertainty and is
-    /// re-derivable, so it is not serialized.
-    #[serde(default, skip_serializing, skip_deserializing)]
+    /// handoff consumed by estimated-lambda Lawley LR corrections, and the
+    /// smoothing-parameter uncertainty the parametric summary charges to a
+    /// profiled Gaussian scale's residual degrees of freedom. It persists with
+    /// the fit, so a reloaded model's summary carries the same references.
+    #[serde(default)]
     pub rho_covariance: Option<Array2<f64>>,
     /// Selected per-component log-smoothing parameters of the full-width JOINT
     /// penalty (gam#1587/#561). Families whose smoothing is carried by a joint

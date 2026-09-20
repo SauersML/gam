@@ -42,7 +42,8 @@ use crate::estimate::summary::{
 };
 use crate::model_types::result_types::UnifiedFitResult;
 use gam_linalg::triangular::{
-    CholeskyGuard, cholesky_factor_in_place, forward_substitution_lower_vector,
+    CholeskyGuard, cholesky_factor_in_place, cholesky_solve_matrix,
+    forward_substitution_lower_vector,
 };
 use gam_math::probability::{
     chi_square_sf, fisher_snedecor_sf, normal_two_sided_probability,
@@ -52,7 +53,8 @@ use gam_terms::smooth::{
     BoundedCoefficientPriorSpec, LinearCoefficientGeometry, LinearTermSpec, TermCollectionDesign,
     TermCollectionSpec,
 };
-use ndarray::{Array2, s};
+use gam_spec::LikelihoodScaleMetadata;
+use ndarray::{Array2, Axis, s};
 use std::ops::Range;
 
 /// The parametric tables of a model summary: one row per coefficient, and one
@@ -90,22 +92,248 @@ enum TestedDirections {
     Contrasts,
 }
 
-/// The reference distribution of every parametric Wald statistic of one fit.
+/// The reference distribution of one parametric term's Wald statistics.
 #[derive(Clone, Copy)]
 enum WaldReference {
     /// Known scale: `N(0, 1)` for one coefficient, `χ²_q` for a block.
     Known,
-    /// Estimated scale: Student-t / `F(q, ·)` on the residual degrees of
-    /// freedom `n − edf_total`; `None` when the fit leaves none.
+    /// Estimated scale: Student-t / `F(q, ·)` on `residual_df`, with the
+    /// statistic's covariance multiplied by `scale_ratio`, the term's scale
+    /// over the fit's (1 unless the scale is the residual-sum-of-squares one;
+    /// see [`ResidualScale`]). `residual_df` is `None` when the fit leaves
+    /// none; `unavailable` names a reference that could not be formed at all.
+    Estimated {
+        residual_df: Option<f64>,
+        scale_ratio: f64,
+        unavailable: Option<ParametricPValueUnavailable>,
+    },
+}
+
+/// How the fit's scale enters each parametric term's reference.
+enum FitReference {
+    Known,
+    /// A scale estimated other than from the residual sum of squares (a Gamma
+    /// shape, a Pearson or deviance dispersion): the reference is on the fit's
+    /// Wald residual degrees of freedom `n − edf`.
     Estimated(Option<f64>),
+    /// The profiled Gaussian scale, whose per-term residual degrees of freedom
+    /// charge the smoothing parameters' uncertainty ([`ResidualScale`]).
+    ResidualScale(Result<ResidualScale, ParametricPValueUnavailable>),
 }
 
 impl WaldReference {
-    fn of(fit: &UnifiedFitResult) -> Self {
-        if fit.likelihood_scale.wald_scale_is_estimated() {
-            Self::Estimated(fit.wald_residual_degrees_of_freedom())
-        } else {
+    /// The Student-t / F denominator degrees of freedom, or why the estimated
+    /// scale leaves none. A known scale has no residual degrees of freedom and
+    /// never asks.
+    fn residual_df(self) -> Result<f64, ParametricPValueUnavailable> {
+        match self {
+            Self::Known => Err(ParametricPValueUnavailable::NoResidualDegreesOfFreedom),
+            Self::Estimated {
+                unavailable: Some(reason),
+                ..
+            } => Err(reason),
+            Self::Estimated { residual_df, .. } => {
+                residual_df.ok_or(ParametricPValueUnavailable::NoResidualDegreesOfFreedom)
+            }
+        }
+    }
+
+    /// The residual degrees of freedom the payload publishes: those of an
+    /// estimated-scale reference, absent on a known scale or when none exist.
+    fn published_residual_df(self) -> Option<f64> {
+        match self {
+            Self::Known => None,
+            Self::Estimated { residual_df, .. } => residual_df,
+        }
+    }
+}
+
+impl FitReference {
+    fn of(design: &TermCollectionDesign, fit: &UnifiedFitResult, offset: SummaryBlockOffset) -> Self {
+        if !fit.likelihood_scale.wald_scale_is_estimated() {
             Self::Known
+        } else if matches!(fit.likelihood_scale, LikelihoodScaleMetadata::ProfiledGaussian) {
+            Self::ResidualScale(ResidualScale::of(design, fit, offset))
+        } else {
+            Self::Estimated(fit.wald_residual_degrees_of_freedom())
+        }
+    }
+
+    fn for_term(&self, range: &Range<usize>) -> WaldReference {
+        match self {
+            Self::Known => WaldReference::Known,
+            Self::Estimated(residual_df) => WaldReference::Estimated {
+                residual_df: *residual_df,
+                scale_ratio: 1.0,
+                unavailable: None,
+            },
+            Self::ResidualScale(Ok(scale)) => scale.for_term(range),
+            Self::ResidualScale(Err(reason)) => WaldReference::Estimated {
+                residual_df: None,
+                scale_ratio: 1.0,
+                unavailable: Some(*reason),
+            },
+        }
+    }
+}
+
+/// The profiled Gaussian scale `σ̂² = RSS/(n − edf)` and the residual degrees
+/// of freedom each parametric term's statistic is referred to.
+///
+/// `n − edf` is the residual degrees of freedom at fixed smoothing parameters,
+/// but `ρ̂ = log λ̂` is itself fitted to the same residuals, and a fit that
+/// spends its smoothing freedom on them leaves a smaller RSS than `n − edf`
+/// accounts for: `σ̂²` is biased low and every estimated-scale reference built
+/// on it is anti-conservative. The first-order (Wood–Pya–Säfken) charge for
+/// that freedom is the corrected EDF `τ = edf + tr(X'WX · J V_ρ J')/s`, with
+/// `J = dβ̂/dρ`, `J[:,k] = −H⁻¹λ_kS_k(β̂ − a)`, `V_ρ` the fit's
+/// smoothing-parameter covariance and `s` the coefficient-covariance scale:
+/// `RSS/(n − τ)` is unbiased at the null.
+///
+/// A term that carries its own ridge `λ_J` is tested by the statistic of the
+/// fit with `J` unpenalized (module doc), which does not depend on `λ_J`, so
+/// its residual degrees of freedom charge only the other smoothing parameters,
+/// at their uncertainty given `ρ_J`: `τ_{−J} = edf + tr(G V_{o|J})` with
+/// `G = J'X'WXJ/s` and `V_{o|J}` the covariance `V_ρ` conditioned on `ρ_J`
+/// (which zeroes the rows and columns of `J`'s own coordinates). Charging `ρ_J`
+/// as well would inflate the scale exactly when the term looks non-null — `λ̂_J`
+/// is least certain there — and make its test conservative. A term without a
+/// penalty of its own conditions on nothing: `τ_{−J} = τ`. The term is
+/// referred to `n − τ_{−J}`, on the scale `σ̂²(n − edf)/(n − τ_{−J})`.
+struct ResidualScale {
+    n: f64,
+    edf: f64,
+    /// `G = J'X'WXJ/s`, one row and column per smoothing parameter.
+    gram: Array2<f64>,
+    /// `V_ρ`, aligned with `gram`.
+    rho_covariance: Array2<f64>,
+    /// The coefficient columns each smoothing parameter's penalty acts on.
+    penalty_columns: Vec<Range<usize>>,
+}
+
+impl ResidualScale {
+    fn of(
+        design: &TermCollectionDesign,
+        fit: &UnifiedFitResult,
+        offset: SummaryBlockOffset,
+    ) -> Result<Self, ParametricPValueUnavailable> {
+        use ParametricPValueUnavailable::{
+            NoResidualDegreesOfFreedom, SmoothingParameterUncertaintyUnavailable,
+        };
+        let edf = fit.edf_total().filter(|edf| edf.is_finite()).ok_or(NoResidualDegreesOfFreedom)?;
+        let n = fit.training_sample_size() as f64;
+        let m = fit.lambdas.len();
+        // Every smoothing parameter's penalty must be read off `design`, the
+        // one layout this summary knows, in `fit.lambdas` order.
+        if offset.coefficients != 0 || offset.penalties != 0 || design.penalties.len() != m {
+            return Err(SmoothingParameterUncertaintyUnavailable);
+        }
+        let penalty_columns: Vec<Range<usize>> =
+            design.penalties.iter().map(|block| block.col_range.clone()).collect();
+        if m == 0 {
+            return Ok(Self {
+                n,
+                edf,
+                gram: Array2::zeros((0, 0)),
+                rho_covariance: Array2::zeros((0, 0)),
+                penalty_columns,
+            });
+        }
+        let rho_covariance = fit
+            .artifacts
+            .rho_covariance
+            .as_ref()
+            .filter(|cov| cov.dim() == (m, m) && cov.iter().all(|v| v.is_finite()))
+            .ok_or(SmoothingParameterUncertaintyUnavailable)?
+            .clone();
+        let hessian = fit
+            .saved_frame_penalized_hessian()
+            .ok()
+            .flatten()
+            .ok_or(SmoothingParameterUncertaintyUnavailable)?;
+        let weighted_gram = fit
+            .saved_frame_weighted_gram()
+            .ok()
+            .flatten()
+            .ok_or(SmoothingParameterUncertaintyUnavailable)?;
+        let beta = fit
+            .beta_from_gauge_shift()
+            .map_err(|_| SmoothingParameterUncertaintyUnavailable)?;
+        let covariance_scale = fit
+            .coefficient_covariance_scale()
+            .ok()
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .ok_or(SmoothingParameterUncertaintyUnavailable)?;
+        let p = beta.len();
+        if hessian.dim() != (p, p) || weighted_gram.dim() != (p, p) {
+            return Err(SmoothingParameterUncertaintyUnavailable);
+        }
+        // `R[:,k] = λ_k S_k (β̂ − a)`, so `J = −H⁻¹R`.
+        let mut penalty_gradients = Array2::<f64>::zeros((p, m));
+        for (k, (block, lambda)) in design.penalties.iter().zip(&fit.lambdas).enumerate() {
+            let cols = block.col_range.clone();
+            let width = cols.len();
+            if cols.end > p {
+                return Err(SmoothingParameterUncertaintyUnavailable);
+            }
+            let local = if block.local.dim() == (width, width) {
+                std::borrow::Cow::Borrowed(&block.local)
+            } else {
+                match &block.op {
+                    Some(op) if op.dim() == width => std::borrow::Cow::Owned(op.as_dense()),
+                    _ => return Err(SmoothingParameterUncertaintyUnavailable),
+                }
+            };
+            let gradient = local.dot(&beta.slice(s![cols.clone()])) * *lambda;
+            penalty_gradients.slice_mut(s![cols, k]).assign(&gradient);
+        }
+        let factor = cholesky_factor_in_place(hessian.view(), CholeskyGuard::FiniteStrict)
+            .ok_or(SmoothingParameterUncertaintyUnavailable)?;
+        let jacobian = cholesky_solve_matrix(&factor, &penalty_gradients);
+        let gram = jacobian.t().dot(&weighted_gram.dot(&jacobian)) / covariance_scale;
+        if gram.iter().any(|v| !v.is_finite()) {
+            return Err(SmoothingParameterUncertaintyUnavailable);
+        }
+        Ok(Self {
+            n,
+            edf,
+            gram,
+            rho_covariance,
+            penalty_columns,
+        })
+    }
+
+    /// The reference of the term on `range`: `n − τ_{−J}` residual degrees of
+    /// freedom and the scale ratio `(n − edf)/(n − τ_{−J})`.
+    fn for_term(&self, range: &Range<usize>) -> WaldReference {
+        // Condition `V_ρ` on the term's own coordinates one at a time. A
+        // coordinate with no variance (a railed or unidentified `ρ_k`, which
+        // the certified pseudoinverse leaves at exactly zero, with its row)
+        // carries nothing to condition on.
+        let mut conditional = self.rho_covariance.clone();
+        for (k, cols) in self.penalty_columns.iter().enumerate() {
+            if cols.is_empty() || cols.start < range.start || cols.end > range.end {
+                continue;
+            }
+            let pivot = conditional[[k, k]];
+            if pivot > 0.0 {
+                let column = conditional.column(k).to_owned();
+                let outer = column
+                    .view()
+                    .insert_axis(Axis(1))
+                    .dot(&column.view().insert_axis(Axis(0)));
+                conditional.scaled_add(-1.0 / pivot, &outer);
+            }
+        }
+        let charge = (&self.gram * &conditional).sum();
+        let tau = self.edf + charge;
+        let residual_df = self.n - tau;
+        let scale_ratio = (self.n - self.edf) / residual_df;
+        let valid = residual_df.is_finite() && residual_df > 0.0 && scale_ratio.is_finite();
+        WaldReference::Estimated {
+            residual_df: valid.then_some(residual_df),
+            scale_ratio: if valid { scale_ratio } else { 1.0 },
+            unavailable: None,
         }
     }
 }
@@ -133,14 +361,20 @@ pub fn parametric_term_summary_rows(
     let uncertainty = fit.display_coefficient_uncertainty();
     let se = uncertainty.as_ref().map(|view| &view.standard_errors);
     let covariance = uncertainty.as_ref().and_then(|view| view.covariance);
-    let reference = WaldReference::of(fit);
+    let fit_reference = FitReference::of(design, fit, offset);
 
     let mut coefficients = Vec::new();
     let mut term_tests = Vec::new();
     for term in &terms {
         let own_penalty = own_penalty(design, fit, offset, &term.range);
         let penalized = own_penalty.is_some();
-        let null_covariance = null_sampling_covariance(fit, covariance, &term.range, own_penalty);
+        let reference = fit_reference.for_term(&term.range);
+        let scale_ratio = match reference {
+            WaldReference::Known => 1.0,
+            WaldReference::Estimated { scale_ratio, .. } => scale_ratio,
+        };
+        let null_covariance = null_sampling_covariance(fit, covariance, &term.range, own_penalty)
+            .map(|block| block * scale_ratio);
         let first = coefficients.len();
         let columns = match term.tested {
             TestedDirections::Coefficients => term.range.len(),
@@ -156,6 +390,7 @@ pub fn parametric_term_summary_rows(
                     .map(f64::sqrt)
             } else {
                 se.and_then(|s| s.get(idx).copied())
+                    .map(|s| s * scale_ratio.sqrt())
             };
             coefficients.push(coefficient_row(
                 label.clone(),
@@ -318,12 +553,14 @@ fn coefficient_row(
         .filter(|z| z.is_finite());
     // Both tails come from the function that computes them, never from
     // `1 - CDF`, which saturates to p = 0 above |z| ≈ 8.3 (#2562).
-    let pvalue = match (bounded, statistic, reference) {
-        (true, _, _) | (_, None, _) => None,
-        (false, Some(z), WaldReference::Known) => Some(normal_two_sided_probability(z)),
-        (false, Some(z), WaldReference::Estimated(df)) => {
-            df.map(|df| student_t_two_sided_probability(z, df))
+    let residual_df = reference.residual_df();
+    let pvalue = match (bounded, statistic, reference, residual_df) {
+        (true, ..) | (_, None, ..) => None,
+        (false, Some(z), WaldReference::Known, _) => Some(normal_two_sided_probability(z)),
+        (false, Some(z), WaldReference::Estimated { .. }, Ok(df)) => {
+            Some(student_t_two_sided_probability(z, df))
         }
+        (false, Some(_), WaldReference::Estimated { .. }, Err(_)) => None,
     }
     .filter(|p| p.is_finite());
     let pvalue_unavailable = pvalue.is_none().then(|| {
@@ -334,7 +571,10 @@ fn coefficient_row(
         } else if statistic.is_none() {
             ParametricPValueUnavailable::SingularCovariance
         } else {
-            ParametricPValueUnavailable::NoResidualDegreesOfFreedom
+            match (reference, residual_df) {
+                (WaldReference::Estimated { .. }, Err(reason)) => reason,
+                _ => ParametricPValueUnavailable::SingularCovariance,
+            }
         }
     });
     ParametricTermSummary {
@@ -345,6 +585,7 @@ fn coefficient_row(
         statistic,
         pvalue,
         pvalue_unavailable,
+        residual_df: reference.published_residual_df(),
     }
 }
 
@@ -364,10 +605,12 @@ fn term_test(
         TestedDirections::Coefficients => term.range.len(),
         TestedDirections::Contrasts => term.range.len().saturating_sub(1),
     };
+    let residual_df = reference.published_residual_df();
     if let [row] = rows {
         return ParametricTermTest {
             name: term.name.clone(),
             df,
+            residual_df,
             statistic: row.statistic.map(|z| z * z),
             pvalue: row.pvalue,
             pvalue_unavailable: row.pvalue_unavailable,
@@ -376,6 +619,7 @@ fn term_test(
     let unavailable = |reason| ParametricTermTest {
         name: term.name.clone(),
         df,
+        residual_df,
         statistic: None,
         pvalue: None,
         pvalue_unavailable: Some(reason),
@@ -407,15 +651,15 @@ fn term_test(
         return unavailable(ParametricPValueUnavailable::SingularCovariance);
     }
     let q = df as f64;
-    let (statistic, pvalue) = match reference {
-        WaldReference::Known => (wald, chi_square_sf(wald, q)),
-        WaldReference::Estimated(None) => {
+    let (statistic, pvalue) = match (reference, reference.residual_df()) {
+        (WaldReference::Known, _) => (wald, chi_square_sf(wald, q)),
+        (WaldReference::Estimated { .. }, Err(reason)) => {
             return ParametricTermTest {
                 statistic: Some(wald / q),
-                ..unavailable(ParametricPValueUnavailable::NoResidualDegreesOfFreedom)
+                ..unavailable(reason)
             };
         }
-        WaldReference::Estimated(Some(residual_df)) => {
+        (WaldReference::Estimated { .. }, Ok(residual_df)) => {
             let f = wald / q;
             (f, fisher_snedecor_sf(f, q, residual_df))
         }
@@ -423,6 +667,7 @@ fn term_test(
     ParametricTermTest {
         name: term.name.clone(),
         df,
+        residual_df,
         statistic: Some(statistic),
         pvalue: pvalue.is_finite().then_some(pvalue),
         pvalue_unavailable: (!pvalue.is_finite())

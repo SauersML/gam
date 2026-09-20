@@ -369,6 +369,7 @@ fn parametric_rows(
                 std_error: row.std_error,
                 penalized: row.penalized,
                 statistic: row.statistic,
+                residual_df: row.residual_df,
                 p_value: row.pvalue,
                 p_value_unavailable: row.pvalue_unavailable,
             })
@@ -381,6 +382,7 @@ fn parametric_rows(
                 predictor: predictor.predictor,
                 df: test.df,
                 statistic: test.statistic,
+                residual_df: test.residual_df,
                 p_value: test.pvalue,
                 p_value_unavailable: test.pvalue_unavailable,
             })
@@ -1003,6 +1005,12 @@ pub struct SummaryParametricTermRow {
     /// The coefficient carries its own REML ridge prior.
     pub penalized: bool,
     pub statistic: Option<f64>,
+    /// The residual degrees of freedom of the `t` reference, `None` when the
+    /// scale is known. On a profiled Gaussian fit it is `n − τ`, charged for
+    /// the smoothing parameters the statistic depends on; see
+    /// [`gam_solve::estimate::ParametricTermSummary::residual_df`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_df: Option<f64>,
     pub p_value: Option<f64>,
     /// Why `p_value` is absent, serialized as its label
     /// (`"bounded_coefficient"`, ...); `None` exactly when it is present. See
@@ -1016,7 +1024,7 @@ pub struct SummaryParametricTermRow {
 
 /// One joint Wald test of a parametric term: every coefficient of the term is
 /// zero, on `df` degrees of freedom. `statistic` is `F = W / df` referred to
-/// `F(df, n − edf)` when the scale is estimated, and `W` referred to `χ²_df`
+/// `F(df, residual_df)` when the scale is estimated, and `W` referred to `χ²_df`
 /// when it is known — the reference `SummaryPayload::parametric_term_statistic`
 /// names.
 #[derive(Serialize)]
@@ -1028,6 +1036,10 @@ pub struct SummaryParametricTermTestRow {
     pub predictor: Option<&'static str>,
     pub df: usize,
     pub statistic: Option<f64>,
+    /// The denominator degrees of freedom of the `F` reference, `None` when
+    /// the scale is known; as on [`SummaryParametricTermRow::residual_df`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_df: Option<f64>,
     pub p_value: Option<f64>,
     /// Why `p_value` is absent, serialized as its label
     /// (`"bounded_coefficient"`, ...); `None` exactly when it is present. See

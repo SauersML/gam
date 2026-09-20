@@ -10,13 +10,19 @@ pub struct ParametricTermSummary {
     /// function-mass penalty), so `std_error` is its null sampling standard
     /// deviation, not its posterior one.
     pub penalized: bool,
-    /// `estimate / std_error`, referred to Student-t on the fit's Wald residual
-    /// degrees of freedom when the fit's scale is estimated and to N(0, 1) when
-    /// it is known (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
+    /// `estimate / std_error`, referred to Student-t on `residual_df` when the
+    /// fit's scale is estimated and to N(0, 1) when it is known
+    /// (`LikelihoodScaleMetadata::wald_scale_is_estimated`).
     pub statistic: Option<f64>,
     pub pvalue: Option<f64>,
     /// Why `pvalue` is absent. `None` exactly when `pvalue` is present.
     pub pvalue_unavailable: Option<ParametricPValueUnavailable>,
+    /// The Student-t degrees of freedom of an estimated-scale fit, the same for
+    /// every coefficient of one term; `None` when the scale is known or the
+    /// fit leaves none. On a profiled Gaussian fit it is `n − τ_{−J}`, the
+    /// residual degrees of freedom charged for the smoothing parameters the
+    /// term's statistic depends on, and `std_error` is on the matching scale.
+    pub residual_df: Option<f64>,
 }
 
 /// The joint Wald test of one parametric term: every coefficient the term owns
@@ -30,6 +36,9 @@ pub struct ParametricTermTest {
     /// The number of coefficient directions tested, the numerator degrees of
     /// freedom: `L - 1` for a factor with `L` levels.
     pub df: usize,
+    /// The denominator degrees of freedom of an estimated-scale test, as on
+    /// [`ParametricTermSummary::residual_df`]; `None` when the scale is known.
+    pub residual_df: Option<f64>,
     /// `W / df` referred to `F(df, residual_df)` when the fit's scale is
     /// estimated; the Wald `W` referred to `χ²_df` when it is known, where
     /// `W = bᵀ V⁻¹ b` over the term's coefficients and the null sampling
@@ -49,8 +58,13 @@ pub enum ParametricPValueUnavailable {
     /// The fit carries no coefficient covariance of its display definition.
     NoCovariance,
     /// The scale is estimated, so the reference is Student-t or F on the
-    /// residual degrees of freedom `n - edf`, and the fit has none left.
+    /// residual degrees of freedom, and the fit has none left.
     NoResidualDegreesOfFreedom,
+    /// The scale is the profiled Gaussian `RSS/(n − edf)`, whose residual
+    /// degrees of freedom must be charged for the smoothing parameters fitted
+    /// to the same residuals, and the fit kept no smoothing-parameter
+    /// covariance or penalized curvature to charge them from.
+    SmoothingParameterUncertaintyUnavailable,
     /// The term's covariance block is not positive definite, so the Wald form
     /// `bᵀ V⁻¹ b` does not exist: the coefficients are not identified.
     SingularCovariance,
@@ -66,6 +80,9 @@ impl ParametricPValueUnavailable {
         match self {
             Self::NoCovariance => "no_covariance",
             Self::NoResidualDegreesOfFreedom => "no_residual_degrees_of_freedom",
+            Self::SmoothingParameterUncertaintyUnavailable => {
+                "smoothing_parameter_uncertainty_unavailable"
+            }
             Self::SingularCovariance => "singular_covariance",
             Self::BoundedCoefficient => "bounded_coefficient",
         }
@@ -76,8 +93,12 @@ impl ParametricPValueUnavailable {
         match self {
             Self::NoCovariance => "the fit carries no coefficient covariance; no p-value is reported",
             Self::NoResidualDegreesOfFreedom => {
-                "the scale is estimated and n - edf leaves no residual degrees of freedom for \
+                "the scale is estimated and the fit leaves no residual degrees of freedom for \
                  the t or F reference; no p-value is reported"
+            }
+            Self::SmoothingParameterUncertaintyUnavailable => {
+                "the residual scale's degrees of freedom cannot be charged for the fitted \
+                 smoothing parameters (no smoothing-parameter covariance); no p-value is reported"
             }
             Self::SingularCovariance => {
                 "the term's coefficient covariance is not positive definite, so its \
