@@ -2613,5 +2613,15 @@
     ],
     "reason": "Delete the outer BFGS per-axis step caps (#2902): hand step budgets of 5 in log-lambda and ln 2 / 0.5 on the psi axes, forbidden by SPEC (no caps). The config fields, builders and the helper that assembled the per-axis cap vector have no remaining use.",
     "evidence": "New test exact_joint_outer_step_budget_tests::a_distant_kernel_scale_is_reached_without_a_per_iteration_step_budget: separable quadratic with psi optimum 8 e-folds from the seed converges in 3 outer iterations uncapped; with the removed caps it took 11 and the test fails."
+  },
+  {
+    "base": "8a1bb26be771b07bb5a68f4651101a8a3cb57223",
+    "items": [
+      "crates/gam-gpu/src/policy.rs:enum:GpuMixedPrecisionPolicy",
+      "crates/gam-gpu/src/policy.rs:fn:never_policy_never_attempts_refinement",
+      "crates/gam-gpu/src/policy.rs:fn:off_policy_never_attempts_refinement"
+    ],
+    "reason": "#3548: GpuMixedPrecisionPolicy was the type of GpuDispatchPolicy::mixed_precision, a field no production code ever set to anything but its Default (Refinement); Never was documented as equivalent to Off, so both Off and Never were unreachable duplicate options (SPEC: unnecessary choices and options should be deleted). With the enum gone, iterative_refinement_should_attempt(p) is the size gate p >= REFINEMENT_MIN_P alone. The two removed tests asserted only the unreachable Off and Never branches; refinement_policy_admits_large_p and refinement_policy_rejects_small_p still pin the surviving gate on both sides of REFINEMENT_MIN_P.",
+    "evidence": "At base 8a1bb26be7, git grep -w GpuMixedPrecisionPolicy finds only its declaration and uses in crates/gam-gpu/src/policy.rs (the mixed_precision field, its Default, the match in iterative_refinement_should_attempt and the two removed tests), its re-export in crates/gam-gpu/src/mod.rs:44, and a CHANGELOG mention; no crate outside gam-gpu names it. git grep -w for off_policy_never_attempts_refinement and never_policy_never_attempts_refinement finds only their declarations. The only production caller of iterative_refinement_should_attempt, cholesky solve in crates/gam-gpu/src/solver.rs, now calls the associated function."
   }
 ]
